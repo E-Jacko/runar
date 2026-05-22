@@ -11,6 +11,7 @@ import RunarVerification.Stack.Eval
 import RunarVerification.Stack.Lower
 import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
+import RunarVerification.ANF.WellTyped
 import RunarVerification.Stack.AgreesA3
 import RunarVerification.Stack.AgreesA4
 import RunarVerification.Stack.AgreesA5
