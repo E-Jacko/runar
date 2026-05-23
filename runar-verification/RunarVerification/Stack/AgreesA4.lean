@@ -5269,6 +5269,150 @@ theorem smokeC_lowerBindingsP_bridge :
     (Stack.Lower.collectConstInts smokeCBody) smokeCBody smokeCTsm smokeCAnf 0
     smokeC_fragment smokeC_copyMode
 
+/-! ### Wave 49 — Deliverable A `AreRunarEmittable` conjunct + full op-shape
+
+This discharges the wave-48 `mathByte_areRunarEmittable_GAP` for the
+round-tripping math_byte chunks (`abs` / `bin2num` / `toByteString`), now that
+`OP_ABS` / `OP_SIZE` / `OP_BIN2NUM` are in `Script.Parse.isAllowedOpcodeName`.
+
+The `len` chunk (`[OP_SIZE, OP_NIP]`) is the ONE residual: `OP_NIP`'s emit byte
+0x77 is the short-form `.nip` byte, so `parseStackOp1? 0x77 = some .nip`, and
+`.opcode "OP_NIP"` does NOT round-trip — it cannot be allowlisted without
+breaking round-trip soundness (proved by the wave-49 byte-collision audit).  The
+`len` op-shape therefore needs a `.opcode "OP_NIP" ≡ .nip` byte-identity bridge,
+deferred to the retirement wave.  We scope the emittability conjunct to the
+`mathByteEmitNoNip` shape (every op is `.dup` / `OP_ABS` / `OP_SIZE` /
+`OP_BIN2NUM`) and combine it with the wave-48 peephole-identity (which holds for
+the full `mathByteEmitNoFuse` shape, NIP included). -/
+
+section MathByteOpShape
+
+open RunarVerification.Stack.Peephole
+
+/-- A single math_byte emit op that is NOT the non-round-tripping `OP_NIP`:
+`.dup` (the depth-0 copy load) or one of the three round-tripping opcodes the
+`abs` / `bin2num` / `toByteString` chunks lower to. -/
+def mathByteEmitOpNoNip : StackOp → Bool
+  | .dup => true
+  | .opcode c => c == "OP_ABS" || c == "OP_SIZE" || c == "OP_BIN2NUM"
+  | _ => false
+
+/-- An op list where every op is a round-tripping math_byte emit op
+(`mathByteEmitNoFuse` minus the `OP_NIP` chunk).  Exactly the `abs` /
+`bin2num` / `toByteString` lowering shape. -/
+def mathByteEmitNoNip : List StackOp → Bool
+  | [] => true
+  | op :: rest => mathByteEmitOpNoNip op && mathByteEmitNoNip rest
+
+/-- A `mathByteEmitOpNoNip` op is `.dup`, `OP_ABS`, `OP_SIZE`, or `OP_BIN2NUM`. -/
+theorem mathByteEmitOpNoNip_cases (op : StackOp) (h : mathByteEmitOpNoNip op = true) :
+    op = .dup ∨ op = .opcode "OP_ABS" ∨ op = .opcode "OP_SIZE"
+      ∨ op = .opcode "OP_BIN2NUM" := by
+  cases op with
+  | dup => exact Or.inl rfl
+  | opcode c =>
+      simp only [mathByteEmitOpNoNip, Bool.or_eq_true, beq_iff_eq] at h
+      rcases h with (h | h) | h
+      · exact Or.inr (Or.inl (by rw [h]))
+      · exact Or.inr (Or.inr (Or.inl (by rw [h])))
+      · exact Or.inr (Or.inr (Or.inr (by rw [h])))
+  | _ => exact absurd h (by simp only [mathByteEmitOpNoNip]; decide)
+
+/-- Such an op is `Parse.RunarEmittable`: the three opcodes via the wave-49
+allowlist extension, `.dup` directly. -/
+theorem runarEmittable_of_mathByteEmitOpNoNip
+    (op : StackOp) (h : mathByteEmitOpNoNip op = true) :
+    RunarVerification.Script.Parse.RunarEmittable op := by
+  rcases mathByteEmitOpNoNip_cases op h with hE | hE | hE | hE
+  · subst hE; exact .dup
+  · subst hE; exact .opcode _ (by decide)
+  · subst hE; exact .opcode _ (by decide)
+  · subst hE; exact .opcode _ (by decide)
+
+/-- The `AreRunarEmittable` conjunct: a no-NIP math_byte emit list is
+`Parse.AreRunarEmittable`.  This is the wave-49 discharge of the wave-48 GAP. -/
+theorem areRunarEmittable_of_mathByteEmitNoNip
+    (ops : List StackOp) (h : mathByteEmitNoNip ops = true) :
+    RunarVerification.Script.Parse.AreRunarEmittable ops := by
+  induction ops with
+  | nil => exact .nil
+  | cons op rest ih =>
+      obtain ⟨hOp, hRest⟩ :=
+        Bool.and_eq_true_iff.mp (by simpa only [mathByteEmitNoNip] using h)
+      exact .cons _ _ (runarEmittable_of_mathByteEmitOpNoNip op hOp) (ih hRest)
+
+/-- A `mathByteEmitNoNip` list is a fortiori `mathByteEmitNoFuse`, so the
+wave-48 peephole-identity applies. -/
+theorem mathByteEmitNoFuse_of_noNip
+    (ops : List StackOp) (h : mathByteEmitNoNip ops = true) :
+    mathByteEmitNoFuse ops = true := by
+  induction ops with
+  | nil => rfl
+  | cons op rest ih =>
+      obtain ⟨hOp, hRest⟩ :=
+        Bool.and_eq_true_iff.mp (by simpa only [mathByteEmitNoNip] using h)
+      have hHead : isMathByteEmitOp op = true := by
+        cases op with
+        | dup => rfl
+        | opcode c =>
+            simp only [mathByteEmitOpNoNip, Bool.or_eq_true, beq_iff_eq] at hOp
+            simp only [isMathByteEmitOp, Bool.or_eq_true, beq_iff_eq]
+            rcases hOp with (h | h) | h
+            · exact Or.inl (Or.inl (Or.inl h))
+            · exact Or.inl (Or.inl (Or.inr h))
+            · exact Or.inr h
+        | _ => exact absurd hOp (by simp only [mathByteEmitOpNoNip]; decide)
+      simp only [mathByteEmitNoFuse, hHead, ih hRest, Bool.and_self]
+
+/-- **Wave 49 — the full single-arg math_byte op-shape (round-tripping
+chunks).**  For any round-tripping math_byte emit shape (`mathByteEmitNoNip`:
+every op is `.dup` / `OP_ABS` / `OP_SIZE` / `OP_BIN2NUM`), BOTH op-shape
+conjuncts hold: `Parse.AreRunarEmittable` (M4, via the wave-49 allowlist
+extension) AND the 4-pass peephole pipeline is the literal identity (M3, via
+the wave-48 `mathByte_peephole_identity`).  Mirrors
+`loweredEmittableArithNoDblNeg_opShape`.  Discharges the GAP for the `abs` /
+`bin2num` / `toByteString` chunks; the `len` chunk needs the deferred
+`.opcode "OP_NIP" ≡ .nip` byte-identity bridge. -/
+theorem loweredMathByteSingleArg_opShape
+    (ops : List StackOp) (h : mathByteEmitNoNip ops = true) :
+    RunarVerification.Script.Parse.AreRunarEmittable ops
+    ∧ peepholeRollPickFold
+        (peepholeChainFold
+          (peepholePostFold
+            (peepholePassAll ops)))
+      = ops :=
+  ⟨areRunarEmittable_of_mathByteEmitNoNip ops h,
+   mathByte_peephole_identity ops (mathByteEmitNoFuse_of_noNip ops h)⟩
+
+/-! #### Wave 49 — MANDATORY op-shape smoke
+
+A concrete round-tripping math_byte lowered list:
+`[.dup, OP_BIN2NUM, .dup, OP_ABS, .dup]` (a `bin2num` chunk, an `abs` chunk,
+and a bare-`toByteString` `.dup`).  Both conjuncts close. -/
+
+private def mathByteOpShapeSmokeOps : List StackOp :=
+  [.dup, .opcode "OP_BIN2NUM", .dup, .opcode "OP_ABS", .dup]
+
+/-- **Wave 49 op-shape smoke — both conjuncts on a concrete single-arg
+math_byte body.** -/
+theorem loweredMathByteSingleArg_opShape_smoke :
+    RunarVerification.Script.Parse.AreRunarEmittable mathByteOpShapeSmokeOps
+    ∧ peepholeRollPickFold
+        (peepholeChainFold
+          (peepholePostFold
+            (peepholePassAll mathByteOpShapeSmokeOps)))
+      = mathByteOpShapeSmokeOps :=
+  loweredMathByteSingleArg_opShape mathByteOpShapeSmokeOps (by decide)
+
+/-- Anti-vacuity: the `len` chunk (`[OP_SIZE, OP_NIP]`) is REJECTED by the
+no-NIP predicate — the op-shape is honestly NOT claimed for the `OP_NIP`
+chunk (which does not round-trip). -/
+theorem mathByteOpShape_rejects_nip :
+    mathByteEmitNoNip [.dup, .opcode "OP_SIZE", .opcode "OP_NIP"] = false := by
+  decide
+
+end MathByteOpShape
+
 end MathByteSingleArgWalk
 
 end AgreesA4

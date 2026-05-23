@@ -669,6 +669,14 @@ def isAllowedOpcodeName (name : String) : Bool :=
     || name = "OP_HASH160" || name = "OP_SHA256"
     || name = "OP_CHECKSIG" || name = "OP_CHECKSIGVERIFY"
     || name = "OP_CAT" || name = "OP_SPLIT"
+    -- Wave 49: math_byte single-arg popping opcodes. These three round-trip
+    -- cleanly — their emit bytes (0x90 / 0x82 / 0x81) are decoded by
+    -- `parseStackOp1?` straight back to `.opcode "OP_ABS"` / `"OP_SIZE"` /
+    -- `"OP_BIN2NUM"` (none collides with a short-form constructor byte).
+    -- `OP_NIP` is deliberately EXCLUDED: its byte 0x77 is the short-form
+    -- `.nip` byte, so `parseStackOp1? 0x77 = some .nip` ≠ `.opcode "OP_NIP"` —
+    -- it does NOT round-trip and would break round-trip soundness.
+    || name = "OP_ABS" || name = "OP_SIZE" || name = "OP_BIN2NUM"
 
 /-- The list-level emittability predicate, threaded as a single
 inductive (no mutual recursion needed for the current covered subset
@@ -1265,6 +1273,21 @@ theorem parseStackOpFuel_OP_SPLIT (fuel : Nat) (rest : List UInt8) :
     parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_SPLIT") ++ rest)
       = .ok (.opcode "OP_SPLIT", rest) := rfl
 
+/-- Wave 49: `OP_ABS` (0x90) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_ABS (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_ABS") ++ rest)
+      = .ok (.opcode "OP_ABS", rest) := rfl
+
+/-- Wave 49: `OP_SIZE` (0x82) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_SIZE (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_SIZE") ++ rest)
+      = .ok (.opcode "OP_SIZE", rest) := rfl
+
+/-- Wave 49: `OP_BIN2NUM` (0x81) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_BIN2NUM (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_BIN2NUM") ++ rest)
+      = .ok (.opcode "OP_BIN2NUM", rest) := rfl
+
 /-- Allowed opcode names round-trip. Dispatches on the 14-way
 disjunction in `isAllowedOpcodeName`. -/
 theorem parseStackOpFuel_opcode_allowed (fuel : Nat) (rest : List UInt8)
@@ -1291,6 +1314,9 @@ theorem parseStackOpFuel_opcode_allowed (fuel : Nat) (rest : List UInt8)
   obtain h1 | h1 := h1
   obtain h1 | h1 := h1
   obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
   all_goals (subst h1; first
     | exact parseStackOpFuel_OP_VERIFY fuel rest
     | exact parseStackOpFuel_OP_NEGATE fuel rest
@@ -1305,7 +1331,10 @@ theorem parseStackOpFuel_opcode_allowed (fuel : Nat) (rest : List UInt8)
     | exact parseStackOpFuel_OP_CHECKSIG fuel rest
     | exact parseStackOpFuel_OP_CHECKSIGVERIFY fuel rest
     | exact parseStackOpFuel_OP_CAT fuel rest
-    | exact parseStackOpFuel_OP_SPLIT fuel rest)
+    | exact parseStackOpFuel_OP_SPLIT fuel rest
+    | exact parseStackOpFuel_OP_ABS fuel rest
+    | exact parseStackOpFuel_OP_SIZE fuel rest
+    | exact parseStackOpFuel_OP_BIN2NUM fuel rest)
 
 /-! ## Per-op round-trip — single op via `RunarEmittable` -/
 
@@ -1408,6 +1437,9 @@ theorem emitStackOpL_cons_of_RunarEmittable (op : StackOp)
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
       all_goals (subst hN; first
         | exact ⟨0x69, [], rfl⟩  -- VERIFY
         | exact ⟨0x8f, [], rfl⟩  -- NEGATE
@@ -1422,7 +1454,10 @@ theorem emitStackOpL_cons_of_RunarEmittable (op : StackOp)
         | exact ⟨0xac, [], rfl⟩  -- CHECKSIG
         | exact ⟨0xad, [], rfl⟩  -- CHECKSIGVERIFY
         | exact ⟨0x7e, [], rfl⟩  -- CAT
-        | exact ⟨0x7f, [], rfl⟩) -- SPLIT
+        | exact ⟨0x7f, [], rfl⟩  -- SPLIT
+        | exact ⟨0x90, [], rfl⟩  -- ABS  (wave 49)
+        | exact ⟨0x82, [], rfl⟩  -- SIZE (wave 49)
+        | exact ⟨0x81, [], rfl⟩) -- BIN2NUM (wave 49)
 
 /-! Helper: a single step lemma for `parseOpsFuel` when the head bytes
 parse cleanly. Avoids unfolding parseOpsFuel directly. -/
@@ -1677,6 +1712,9 @@ theorem emitStackOp_toList_of_RunarEmittable (op : StackOp)
       unfold isAllowedOpcodeName at hAllow
       simp only [Bool.or_eq_true, decide_eq_true_eq] at hAllow
       obtain hN | hN := hAllow
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
@@ -2073,6 +2111,9 @@ private theorem head_of_emitStackOpL_not_else_or_endif
       unfold isAllowedOpcodeName at hAllow
       simp only [Bool.or_eq_true, decide_eq_true_eq] at hAllow
       obtain hN | hN := hAllow
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN

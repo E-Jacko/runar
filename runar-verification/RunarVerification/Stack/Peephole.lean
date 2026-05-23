@@ -12187,43 +12187,35 @@ theorem mathByteSmoke_rejects_push :
     mathByteEmitNoFuse [.push (.bigint 0), .opcode "OP_ABS"] = false := by
   decide
 
-/-! ### Wave 48 — Deliverable A `AreRunarEmittable` conjunct: HONEST BLOCK
+/-! ### Wave 48 GAP — RESOLVED in wave 49 (for the round-tripping chunks)
 
-The arith op-shape's first conjunct is `Parse.AreRunarEmittable (lowered).1`.
-The math_byte analogue is BLOCKED, NOT by a missing proof, but by the closed
-`Script.Parse.isAllowedOpcodeName` allowlist (14 names): `OP_ABS`, `OP_SIZE`,
-`OP_BIN2NUM` are NOT in it (and `OP_NIP` is emitted by `builtinOpcode "len"` as
-the STRING `.opcode "OP_NIP"`, not the `.nip` constructor — also outside the
-allowlist).  So `Parse.RunarEmittable (.opcode "OP_SIZE")` is UNPROVABLE: the
-allowlist Bool decides `false`, so the `.opcode` constructor's `h :
-isAllowedOpcodeName name = true` premise cannot be met.
+The wave-48 `AreRunarEmittable` conjunct was BLOCKED by the closed
+`Script.Parse.isAllowedOpcodeName` allowlist (14 names).  **Wave 49 extends that
+allowlist** with `OP_ABS` (0x90), `OP_SIZE` (0x82), `OP_BIN2NUM` (0x81) — the
+three single-arg math_byte opcodes whose emit bytes round-trip cleanly through
+`parseStackOp1?` — and adds the matching `parseStackOpFuel_OP_*` round-trip
+lemmas + `RunarEmittable_roundtrip` case-split arms in `Script/Parse.lean`.
 
-Why this is a genuine architectural gap, not a scope-of-wave-48 omission:
+With those landed, the `AreRunarEmittable` conjunct + the full op-shape are
+discharged in `AgreesA4`'s `MathByteOpShape` section (which CAN import
+`Script.Parse`, unlike this module):
 
-* Extending `isAllowedOpcodeName` to add `OP_ABS/OP_SIZE/OP_NIP/OP_BIN2NUM`
-  modifies `Script/Parse.lean` — OUTSIDE this wave's add-only file set
-  (`AgreesA4` / `Peephole` / `WellTyped`).
-* It would ALSO require four new emit↔parse round-trip lemmas
-  (`parseStackOpFuel_OP_ABS` / `_OP_SIZE` / `_OP_NIP` / `_OP_BIN2NUM`) and
-  re-stamp the `RunarEmittable_roundtrip` proofs that case on the 14-name
-  disjunction (`Script/Parse.lean:1271`, `:1396`, `:1677`, `:2073`).
-* That allowlist + its round-trip set is load-bearing for `runParsedBytes
-  (Emit.emitFast p) = runOps m.ops` (`Pipeline.lean:1063-1074`), so the change
-  ripples into the pipeline's emit/parse layer — a Pipeline.lean-adjacent
-  edit the wave is explicitly forbidden from making (axioms must stay 85).
+* `AgreesA4.areRunarEmittable_of_mathByteEmitNoNip` — the `AreRunarEmittable`
+  conjunct, and
+* `AgreesA4.loweredMathByteSingleArg_opShape` — the full op-shape (this
+  `mathByte_peephole_identity` ∧ that emittability), assembled exactly as
+  `loweredEmittableArithNoDblNeg_opShape`.
 
-Precise sub-goal for the retirement wave (the ONE remaining piece of the
-op-shape): add `OP_ABS`, `OP_SIZE`, `OP_NIP`, `OP_BIN2NUM` to
-`Script.Parse.isAllowedOpcodeName`; add the four `parseStackOpFuel_OP_*`
-round-trip lemmas; re-run the `RunarEmittable_roundtrip` case-splits.  THEN the
-math_byte op-shape's `AreRunarEmittable` conjunct is a mechanical
-`AreRunarEmittable.cons` walk over the lowered chunk (`.dup` → `.opcode …`),
-and the full op-shape (this `mathByte_peephole_identity` ∧ that emittability)
-is assembled exactly as `loweredEmittableArithNoDblNeg_opShape`.
-
-We record the gap as an honest `True`-valued marker (body `trivial`, discharges
-nothing) rather than ship a placeholder theorem with a conclusion-restating
-hypothesis (PATH2_PLAN §2.1).  No `sorry`, no new axiom. -/
+ONE residual remains for the `len` chunk: `builtinOpcode "len" =
+["OP_SIZE", "OP_NIP"]` lowers (via `Lower.builtinOpcode`'s `opc`) to the STRING
+`.opcode "OP_NIP"`.  `OP_NIP`'s emit byte 0x77 is the short-form `.nip`
+constructor byte, so `parseStackOp1? 0x77 = some .nip ≠ .opcode "OP_NIP"` — it
+does NOT round-trip and CANNOT be allowlisted without breaking round-trip
+soundness (`parseStackOpFuel (emitStackOpL (.opcode "OP_NIP")) = .ok (.nip, _)`,
+not `.opcode "OP_NIP"`).  The `len` op-shape therefore needs a byte-identity
+bridge `.opcode "OP_NIP" ≡ .nip`, deferred to the retirement wave; the wave-49
+op-shape is scoped to the `mathByteEmitNoNip` shape (`abs` / `bin2num` /
+`toByteString` chunks).  No `sorry`, no new axiom; axioms stay 85. -/
 def mathByte_areRunarEmittable_GAP : True := trivial
 
 end Peephole
