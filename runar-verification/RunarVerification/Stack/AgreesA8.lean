@@ -1529,5 +1529,156 @@ theorem methodCall_leaf_const_successAgrees
       localBindings constInts sm body stk hStackLeaf
   rw [hAnf, hStack]
 
+/-! ## Wave 53 — the `method_call` M2 walk against `evalBindingsP`
+
+`methodCall_leaf_const_successAgrees` (above) is the wave-52 LEAF-CONST
+bridge: it pins the ANF success bit through the standalone
+`evalMethodCall` helper. The M2 walk needs the **body-level** iff stated
+against the program-aware whole-body evaluator `evalBindingsP` (added in
+`ANF/Eval.lean` this wave), so it slots into the next-wave omnibus
+re-statement (`evalBindings → evalBindingsP`) exactly like the
+arith/if_val/math_byte walks slot into the standard `evalBindings`
+omnibus.
+
+The connector is purely operational: on a SINGLETON body whose one
+binding is a `.methodCall`, `evalBindingsP` reduces to `evalValueP` on
+that value (then the trivial empty-tail `evalBindingsP _ [] = .ok`), and
+`evalValueP`'s `.methodCall` arm IS `evalMethodCall`. So the body-level
+`isSome` equals the `evalMethodCall` `isSome`, and the wave-52 leaf-const
+ANF half transfers verbatim. The Stack half is unchanged
+(`runOps_lowerBindingsP_singleton_methodCallLeaf_isSome`). -/
+
+/-- Connector: on a singleton `.methodCall` body, `evalBindingsP`'s
+success bit equals `evalMethodCall`'s. `evalBindingsP` on the singleton
+unfolds to `evalValueP methods s (.methodCall …)` (whose result it
+threads into the empty tail), and `evalValueP`'s `.methodCall` arm is
+definitionally `evalMethodCall`. -/
+theorem evalBindingsP_singleton_methodCall_isSome_eq
+    (methods : List ANFMethod) (s : State)
+    (bn obj method : String) (args : List String) (src : Option SourceLoc) :
+    (RunarVerification.ANF.Eval.evalBindingsP methods s
+        [ANFBinding.mk bn (.methodCall obj method args) src]).toOption.isSome
+      = (RunarVerification.ANF.Eval.evalMethodCall methods s obj method args).toOption.isSome := by
+  rw [RunarVerification.ANF.Eval.evalBindingsP,
+      RunarVerification.ANF.Eval.evalValueP]
+  cases hMc : RunarVerification.ANF.Eval.evalMethodCall methods s obj method args with
+  | error e => simp [bind, Except.bind, Except.toOption]
+  | ok p =>
+      obtain ⟨val, s'⟩ := p
+      simp only [bind, Except.bind, RunarVerification.ANF.Eval.evalBindingsP,
+                 Except.toOption, Option.isSome_some]
+
+/-- **Wave 53 DELIVERABLE — the `method_call` M2 walk.**
+
+For a singleton-`method_call` body whose callee is a leaf method (empty
+params, non-empty structurally-constant body) absent from the stack map
+with no call-site args, the program-aware whole-body evaluator
+`evalBindingsP`'s success bit matches the lowered Bitcoin-Script
+program's success bit. This is the body-level `successAgrees`-shaped iff
+the next-wave omnibus re-statement consumes.
+
+Both sides are `.isSome = true` (anti-vacuous):
+* ANF — the singleton connector
+  (`evalBindingsP_singleton_methodCall_isSome_eq`) reduces
+  `evalBindingsP` to `evalMethodCall`, then wave-52's
+  `evalMethodCall_leaf_const_isSome` fires;
+* Stack — `runOps_lowerBindingsP_singleton_methodCallLeaf_isSome`
+  (the A8 substrate).
+
+All hypotheses are input-side (no conclusion-restating): `hStackLeaf` is
+the Stack-side leaf predicate; `hLookup` / `hParams` / `hBodyNe` /
+`hConst` are the ANF-side callee-resolution facts; `hBodyEq` pins the
+outer body to the singleton shape so the connector applies. -/
+theorem successAgrees_methodCall_unconditional
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget' currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (body : List ANFBinding)
+    (s : State) (stk : Stack.Eval.StackState)
+    (bn obj method : String) (src : Option SourceLoc) (m : ANFMethod)
+    (hBodyEq : body = [ANFBinding.mk bn (.methodCall obj method []) src])
+    (hStackLeaf : singletonMethodCallLeafBody progMethods sm body)
+    (hLookup : RunarVerification.ANF.Eval.lookupMethod progMethods method = some m)
+    (hParams : m.params = [])
+    (hBodyNe : m.body ≠ [])
+    (hConst : structuralConstBody m.body) :
+    ((RunarVerification.ANF.Eval.evalBindingsP progMethods s body).toOption.isSome
+      ↔
+     (runOps (Stack.Lower.lowerBindingsP progMethods props (budget' + 1)
+                currentIndex lastUses outerProtected localBindings
+                constInts sm body).1 stk).toOption.isSome) := by
+  -- ANF half: reduce `evalBindingsP` on the singleton to `evalMethodCall`,
+  -- then fire the wave-52 leaf-const `.isSome`.
+  have hAnf :
+      (RunarVerification.ANF.Eval.evalBindingsP progMethods s body).toOption.isSome
+        = true := by
+    rw [hBodyEq, evalBindingsP_singleton_methodCall_isSome_eq]
+    exact evalMethodCall_leaf_const_isSome progMethods s obj method m
+      hLookup hParams hBodyNe hConst
+  -- Stack half: the A8 substrate's leaf success.
+  have hStack :
+      (runOps (Stack.Lower.lowerBindingsP progMethods props (budget' + 1)
+                currentIndex lastUses outerProtected localBindings
+                constInts sm body).1 stk).toOption.isSome = true :=
+    runOps_lowerBindingsP_singleton_methodCallLeaf_isSome
+      progMethods props budget' currentIndex lastUses outerProtected
+      localBindings constInts sm body stk hStackLeaf
+  rw [hAnf, hStack]
+
+/-! ### Wave 53 MANDATORY smoke — concrete `method_call` body, both sides
+`.isSome` via `evalBindingsP` (anti-vacuous). -/
+
+/-- Smoke program method: leaf callee `h` with empty params and a single
+const binding (structurally constant, non-empty). -/
+private def wave53SmokeCallee : ANFMethod :=
+  { name := "h", params := [],
+    body := [ANFBinding.mk "r0" (.loadConst (.int 7)) none],
+    isPublic := false }
+
+private def wave53SmokeMethods : List ANFMethod := [wave53SmokeCallee]
+
+/-- Smoke outer body: a single `.methodCall` of `h` (no args, `obj`
+absent from the empty stack map). -/
+private def wave53SmokeBody : List ANFBinding :=
+  [ANFBinding.mk "c0" (.methodCall "this" "h" []) none]
+
+/-- The smoke body satisfies the Stack-side leaf predicate against the
+empty stack map. -/
+theorem wave53_smoke_stackLeaf :
+    singletonMethodCallLeafBody wave53SmokeMethods [] wave53SmokeBody := by
+  refine ⟨rfl, rfl, ?_⟩
+  exact ⟨wave53SmokeCallee, rfl, rfl, by native_decide⟩
+
+/-- Wave-53 smoke: the M2 walk fires on the concrete `method_call` body —
+both sides `.isSome` through `evalBindingsP`, so the iff is `True ↔ True`
+(anti-vacuous; the standard `evalBindings` would error on this body). -/
+theorem wave53_smoke_methodCall_unconditional :
+    ((RunarVerification.ANF.Eval.evalBindingsP wave53SmokeMethods
+        (default : State) wave53SmokeBody).toOption.isSome
+      ↔
+     (runOps (Stack.Lower.lowerBindingsP wave53SmokeMethods [] (0 + 1)
+                0 [] [] [] [] [] wave53SmokeBody).1
+        (default : Stack.Eval.StackState)).toOption.isSome) :=
+  successAgrees_methodCall_unconditional
+    wave53SmokeMethods [] 0 0 [] [] [] [] []
+    wave53SmokeBody (default : State) (default : Stack.Eval.StackState)
+    "c0" "this" "h" none wave53SmokeCallee
+    rfl wave53_smoke_stackLeaf rfl rfl (by decide) (by native_decide)
+
+/-- Anti-vacuity confirmation: on the smoke body the program-aware
+`evalBindingsP` succeeds (`isSome = true`) where the standard
+`evalBindings` errors (`isSome = false`). -/
+theorem wave53_smoke_evalBindingsP_isSome :
+    (RunarVerification.ANF.Eval.evalBindingsP wave53SmokeMethods
+        (default : State) wave53SmokeBody).toOption.isSome = true := by
+  native_decide
+
+theorem wave53_smoke_evalBindings_isNone :
+    (RunarVerification.ANF.Eval.evalBindings
+        (default : State) wave53SmokeBody).toOption.isSome = false := by
+  native_decide
+
 end Agrees
 end RunarVerification.Stack

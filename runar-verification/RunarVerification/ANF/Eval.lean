@@ -1968,6 +1968,340 @@ def evalMethodCall (methods : List ANFMethod) (s : State)
           | none   => .error (.unsupported s!"method_call: last binding {b.name} not found in callee {method}")
       | none => .error (.unsupported s!"method_call: empty callee body {method}")
 
+/-! ### Program-aware evaluator variant `evalBindingsP` (Path 2 Tier 1 — wave 53)
+
+`evalValue`/`evalBindings`/`runLoop` form the **core** evaluator: their
+signatures are parameterised by `State` alone, their `.methodCall` arm
+returns `.error .unsupported`, and ~300 call sites (every `successAgrees`
+statement, every retired-family theorem) pattern-match on
+`evalBindings s body` literally. Threading a method table through that
+mutual block would cascade to all of them — an out-of-scope core change.
+
+`evalValueP` / `evalBindingsP` / `runLoopP` are the **additive**
+program-aware counterparts. They are a SEPARATE mutual block, defined
+after the core one, that carries an explicit `methods : List ANFMethod`
+argument. Every arm is byte-for-byte identical to the core evaluator
+EXCEPT `.methodCall`, which delegates to wave-52's `evalMethodCall`
+(itself reusing the unchanged `evalBindings` to evaluate the resolved
+callee body — so the callee is still scored by the core evaluator, never
+recursively by `evalBindingsP`). This mirrors the Stack side, where
+`Stack.Lower.lowerValueP` inlines `.methodCall` while `lowerBinding` does
+not.
+
+The core block is left UNTOUCHED. `evalBindingsP` is the program-aware
+entry point that the A8 substrate's body-level walk and the next-wave
+omnibus re-statement can target; the equality bridge
+`evalBindingsP_eq_evalBindings_of_noMethodCall` below transfers every
+already-retired (methodCall-free) family mechanically. -/
+
+mutual
+
+/-- Program-aware counterpart of `evalValue`. Identical to `evalValue`
+in every arm EXCEPT `.methodCall`, which resolves + inlines the callee
+via wave-52's `evalMethodCall` (carrying the explicit method table). -/
+def evalValueP (methods : List ANFMethod) (s : State) : ANFValue → EvalResult (Value × State)
+  | .loadParam name =>
+      match s.lookupParam name with
+      | some v => .ok (v, s)
+      | none   => .error (.unboundName name)
+  | .loadProp name =>
+      match s.lookupProp name with
+      | some v => .ok (v, s)
+      | none   => .error (.unboundProperty name)
+  | .loadConst (.int i)      => .ok (.vBigint i, s)
+  | .loadConst (.bool b)     => .ok (.vBool b, s)
+  | .loadConst (.bytes b)    => .ok (.vBytes b, s)
+  | .loadConst (.refAlias n) => do
+      let v ← lookupRef s n
+      return (v, s)
+  | .loadConst .thisRef       => .ok (.vThis, s)
+  | .binOp op l r rt => do
+      let lv ← lookupRef s l
+      let rv ← lookupRef s r
+      let res ← evalBinOp op lv rv rt
+      return (res, s)
+  | .unaryOp op operand rt => do
+      let ov ← lookupRef s operand
+      let res ← evalUnaryOp op ov rt
+      return (res, s)
+  | .call func args => do
+      let argVs ← args.mapM (lookupRef s)
+      match ← callBuiltin? func argVs with
+      | some v => return (v, s)
+      | none   => .error (.unsupported s!"builtin {func} (axiomatized — see Crypto)")
+  | .methodCall obj method args =>
+      -- The ONLY divergence from the core evaluator: resolve + inline the
+      -- callee via wave-52's `evalMethodCall` instead of erroring.
+      evalMethodCall methods s obj method args
+  | .ifVal cond thenBs elseBs => do
+      let cv ← lookupRef s cond
+      match cv with
+      | .vBool true  =>
+          let s' ← evalBindingsP methods s thenBs
+          match thenBs.getLast? with
+          | some b =>
+              match s'.lookupBinding b.name with
+              | some v => return (v, s')
+              | none   => .ok (.vBool true, s')
+          | none => .ok (.vBool true, s')
+      | .vBool false =>
+          let s' ← evalBindingsP methods s elseBs
+          match elseBs.getLast? with
+          | some b =>
+              match s'.lookupBinding b.name with
+              | some v => return (v, s')
+              | none   => .ok (.vBool false, s')
+          | none => .ok (.vBool false, s')
+      | _ => .error (.typeError "if expects boolean condition")
+  | .loop count body iterVar => do
+      let s' ← runLoopP methods count body iterVar s
+      .ok (.vBool true, s')
+  | .assert ref => do
+      let v ← lookupRef s ref
+      match v with
+      | .vBool true  => return (.vBool true, s)
+      | .vBool false => .error .assertFailed
+      | _            => .error (.typeError "assert expects boolean")
+  | .updateProp name ref => do
+      let v ← lookupRef s ref
+      return (v, s.setProp name v)
+  | .getStateScript =>
+      .ok (.vOpaque ByteArray.empty, s)
+  | .checkPreimage preimage => do
+      let pv ← lookupRef s preimage
+      match pv.asBytes? with
+      | some bytes => .ok (.vBool (Crypto.checkPreimage bytes), s)
+      | none => .error (.typeError "checkPreimage expects bytes")
+  | .deserializeState _preimage =>
+      .ok (.vOpaque ByteArray.empty, s)
+  | .addOutput sats sv pre => do
+      let sv' ← lookupInt s sats
+      let svs ← sv.mapM (lookupRef s)
+      let _preimage := pre
+      let s' := { s with outputs := s.outputs ++ [.state sv' svs] }
+      .ok (.vOpaque ByteArray.empty, s')
+  | .addRawOutput sats sb => do
+      let sv' ← lookupInt s sats
+      let bytes ← lookupBytes s sb
+      let s' := { s with outputs := s.outputs ++ [.rawScript sv' bytes] }
+      .ok (.vOpaque ByteArray.empty, s')
+  | .addDataOutput sats sb => do
+      let sv' ← lookupInt s sats
+      let bytes ← lookupBytes s sb
+      let s' := { s with outputs := s.outputs ++ [.dataOnly sv' bytes] }
+      .ok (.vOpaque ByteArray.empty, s')
+  | .arrayLiteral elems => do
+      let vs ← elems.mapM (lookupRef s)
+      let _ := vs
+      .ok (.vOpaque ByteArray.empty, s)
+  | .rawScript bytes _inArity _outArity =>
+      .ok (.vBytes bytes, s)
+
+/-- Program-aware counterpart of `evalBindings`. Threads state through
+the bindings exactly like `evalBindings`, dispatching each value through
+`evalValueP` (so `.methodCall` bindings inline rather than error). -/
+def evalBindingsP (methods : List ANFMethod) (s : State) : List ANFBinding → EvalResult State
+  | [] => .ok s
+  | .mk name v _ :: rest => do
+      let (val, s') ← evalValueP methods s v
+      evalBindingsP methods (s'.addBinding name val) rest
+
+/-- Program-aware counterpart of `runLoop`. Identical to `runLoop`,
+recursing through `evalBindingsP` so nested `.methodCall` bindings inside
+a loop body inline. -/
+def runLoopP (methods : List ANFMethod) (count : Nat) (body : List ANFBinding)
+    (iterVar : String) (s : State) : EvalResult State :=
+  match count with
+  | 0 => .ok s
+  | n + 1 =>
+      let withIter : State :=
+        { s with params := (iterVar, .vBigint n) :: s.params }
+      match evalBindingsP methods withIter body with
+      | .error e => .error e
+      | .ok s' =>
+          let stripped : State :=
+            { s' with params := s'.params.filter (·.fst != iterVar) }
+          runLoopP methods n body iterVar stripped
+
+end
+
+/-! ### The equality bridge: `evalBindingsP = evalBindings` on methodCall-free bodies
+
+`evalValueP` / `evalBindingsP` / `runLoopP` differ from the core
+evaluator ONLY at `.methodCall`. So on any value / body / loop that
+contains no `.methodCall` constructor (transitively, through `ifVal`
+branches and `loop` bodies), the two evaluators are pointwise equal.
+
+`noMethodCall*` are Boolean structural predicates capturing "this term
+has no `.methodCall` anywhere". The equality theorems are proved by
+mutual induction over the term, using `noMethodCall*` to rule out the
+one divergent arm and `rfl` / congruence on every other arm. -/
+
+mutual
+
+/-- `true` iff the `ANFValue` contains no `.methodCall` (transitively
+through `ifVal` branches and `loop` bodies). -/
+def noMethodCallValue : ANFValue → Bool
+  | .methodCall _ _ _ => false
+  | .ifVal _ thenBs elseBs => noMethodCallBindings thenBs && noMethodCallBindings elseBs
+  | .loop _ body _ => noMethodCallBindings body
+  | _ => true
+
+/-- `true` iff every binding in the list has a methodCall-free value. -/
+def noMethodCallBindings : List ANFBinding → Bool
+  | [] => true
+  | .mk _ v _ :: rest => noMethodCallValue v && noMethodCallBindings rest
+
+end
+
+mutual
+
+/-- Bridge (value level): on a methodCall-free `ANFValue`, the
+program-aware `evalValueP` agrees with the core `evalValue`. Mutually
+proved with the bindings-level bridge below. -/
+theorem evalValueP_eq_evalValue_of_noMethodCall
+    (methods : List ANFMethod) :
+    ∀ (s : State) (v : ANFValue),
+      noMethodCallValue v = true →
+      evalValueP methods s v = evalValue s v
+  | s, v => by
+    cases v with
+    | methodCall obj method args =>
+        intro hNo; simp only [noMethodCallValue] at hNo; exact absurd hNo (by decide)
+    | ifVal cond thenBs elseBs =>
+        intro hNo
+        simp only [noMethodCallValue, Bool.and_eq_true] at hNo
+        obtain ⟨hThen, hElse⟩ := hNo
+        rw [evalValueP, evalValue]
+        cases hc : lookupRef s cond with
+        | error e => rfl
+        | ok cv =>
+            simp only [bind, Except.bind]
+            cases cv with
+            | vBool b =>
+                cases b with
+                | true =>
+                    rw [evalBindingsP_eq_evalBindings_of_noMethodCall methods s thenBs hThen]
+                | false =>
+                    rw [evalBindingsP_eq_evalBindings_of_noMethodCall methods s elseBs hElse]
+            | vBigint _ => rfl
+            | vBytes _ => rfl
+            | vThis => rfl
+            | vOpaque _ => rfl
+    | loop count body iterVar =>
+        intro hNo
+        simp only [noMethodCallValue] at hNo
+        rw [evalValueP, evalValue]
+        rw [runLoopP_eq_runLoop_of_noMethodCall methods count body iterVar s hNo]
+    | loadParam name => intro _; rw [evalValueP, evalValue]
+    | loadProp name => intro _; rw [evalValueP, evalValue]
+    | loadConst c => intro _; cases c <;> rw [evalValueP, evalValue]
+    | binOp op l r rt => intro _; rw [evalValueP, evalValue]
+    | unaryOp op operand rt => intro _; rw [evalValueP, evalValue]
+    | call func args => intro _; rw [evalValueP, evalValue]
+    | assert ref => intro _; rw [evalValueP, evalValue]
+    | updateProp name ref => intro _; rw [evalValueP, evalValue]
+    | getStateScript => intro _; rw [evalValueP, evalValue]
+    | checkPreimage preimage => intro _; rw [evalValueP, evalValue]
+    | deserializeState preimage => intro _; rw [evalValueP, evalValue]
+    | addOutput sats sv pre => intro _; rw [evalValueP, evalValue]
+    | addRawOutput sats sb => intro _; rw [evalValueP, evalValue]
+    | addDataOutput sats sb => intro _; rw [evalValueP, evalValue]
+    | arrayLiteral elems => intro _; rw [evalValueP, evalValue]
+    | rawScript bytes ia oa => intro _; rw [evalValueP, evalValue]
+
+/-- Bridge (bindings level): on a methodCall-free body, the
+program-aware `evalBindingsP` agrees with the core `evalBindings`.
+**This is THE bridge** — it transfers every already-retired
+(methodCall-free) family's discharge from `evalBindings` to
+`evalBindingsP` mechanically when the omnibus is re-stated. -/
+theorem evalBindingsP_eq_evalBindings_of_noMethodCall
+    (methods : List ANFMethod) :
+    ∀ (s : State) (body : List ANFBinding),
+      noMethodCallBindings body = true →
+      evalBindingsP methods s body = evalBindings s body
+  | s, [] => by intro _; rw [evalBindingsP, evalBindings]
+  | s, .mk name v src :: rest => by
+      intro hNo
+      simp only [noMethodCallBindings, Bool.and_eq_true] at hNo
+      obtain ⟨hHead, hTail⟩ := hNo
+      rw [evalBindingsP, evalBindings]
+      rw [evalValueP_eq_evalValue_of_noMethodCall methods s v hHead]
+      cases hv : evalValue s v with
+      | error e => rfl
+      | ok p =>
+          obtain ⟨val, s'⟩ := p
+          simp only [bind, Except.bind]
+          exact evalBindingsP_eq_evalBindings_of_noMethodCall methods
+            (s'.addBinding name val) rest hTail
+
+/-- Bridge (loop level): on a methodCall-free loop body, `runLoopP`
+agrees with `runLoop`. Proved by induction on the iteration budget,
+reusing the bindings-level bridge for each iteration. -/
+theorem runLoopP_eq_runLoop_of_noMethodCall
+    (methods : List ANFMethod) :
+    ∀ (count : Nat) (body : List ANFBinding) (iterVar : String) (s : State),
+      noMethodCallBindings body = true →
+      runLoopP methods count body iterVar s = runLoop count body iterVar s
+  | 0, body, iterVar, s => by intro _; rw [runLoopP, runLoop]
+  | n + 1, body, iterVar, s => by
+      intro hNo
+      rw [runLoopP, runLoop]
+      rw [evalBindingsP_eq_evalBindings_of_noMethodCall methods _ body hNo]
+      cases evalBindings { s with params := (iterVar, .vBigint n) :: s.params } body with
+      | error e => rfl
+      | ok s' =>
+          exact runLoopP_eq_runLoop_of_noMethodCall methods n body iterVar
+            { s' with params := s'.params.filter (·.fst != iterVar) } hNo
+
+end
+
+/-! ### Smoke tests — the equality bridge holds on a methodCall-free body
+and the two evaluators DIFFER on a methodCall body. -/
+
+/-- Smoke method table: one helper `h` returning a constant `7`. -/
+private def smokeBridgeMethods : List ANFMethod :=
+  [{ name := "h", params := [],
+     body := [ANFBinding.mk "r0" (.loadConst (.int 7)) none],
+     isPublic := false }]
+
+/-- A methodCall-FREE body: two const loads + a binOp. -/
+private def smokeNoMethodCallBody : List ANFBinding :=
+  [ANFBinding.mk "t0" (.loadConst (.int 3)) none,
+   ANFBinding.mk "t1" (.loadConst (.int 4)) none,
+   ANFBinding.mk "t2" (.binOp "+" "t0" "t1" none) none]
+
+/-- Bridge smoke (HOLDS): on the methodCall-free body, `evalBindingsP`
+and `evalBindings` are literally equal — the predicate is satisfied and
+the equality theorem fires. -/
+theorem smoke_bridge_eq_on_noMethodCall :
+    evalBindingsP smokeBridgeMethods (default : State) smokeNoMethodCallBody
+      = evalBindings (default : State) smokeNoMethodCallBody := by
+  exact evalBindingsP_eq_evalBindings_of_noMethodCall smokeBridgeMethods
+    (default : State) smokeNoMethodCallBody (by native_decide)
+
+/-- A body whose single binding is a `.methodCall` of `h`. -/
+private def smokeMethodCallBody : List ANFBinding :=
+  [ANFBinding.mk "c0" (.methodCall "this" "h" []) none]
+
+/-- Bridge smoke (DIFFER): on the methodCall body the predicate is FALSE,
+so the bridge does not apply — and indeed the two evaluators disagree on
+their success bit. `evalBindingsP` inlines `h` (succeeds, `isSome = true`),
+`evalBindings` errors (`isSome = false`). This is the anti-vacuity
+witness: the bridge is non-trivially scoped to methodCall-free bodies.
+(`EvalResult State` has no `DecidableEq`, so we compare the decidable
+success bits rather than the raw results.) -/
+theorem smoke_bridge_differ_on_methodCall :
+    (evalBindingsP smokeBridgeMethods (default : State) smokeMethodCallBody).toOption.isSome
+      ≠ (evalBindings (default : State) smokeMethodCallBody).toOption.isSome := by
+  native_decide
+
+/-- The methodCall body's predicate is genuinely `false` (the bridge's
+hypothesis fails here, confirming the smoke above is non-vacuous). -/
+theorem smoke_methodCallBody_predicate_false :
+    noMethodCallBindings smokeMethodCallBody = false := by
+  native_decide
+
 /-! ### Concrete ANF byte / number samples
 
 Executable samples pin the ANF evaluator to the same bytewise and
