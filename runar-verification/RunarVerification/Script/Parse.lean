@@ -677,6 +677,16 @@ def isAllowedOpcodeName (name : String) : Bool :=
     -- `.nip` byte, so `parseStackOp1? 0x77 = some .nip` ≠ `.opcode "OP_NIP"` —
     -- it does NOT round-trip and would break round-trip soundness.
     || name = "OP_ABS" || name = "OP_SIZE" || name = "OP_BIN2NUM"
+    -- Wave 60: `count ± 1` peephole-fused increment/decrement opcodes.
+    -- `OP_1ADD` (0x8b) / `OP_1SUB` (0x8c) round-trip cleanly — both bytes
+    -- live in the arithmetic range 0x8b/0x8c, neither collides with a
+    -- short-form constructor byte, a structural byte (0x63/0x67/0x68/
+    -- 0x79/0x7a), nor a small-int / push-data prefix, so
+    -- `parseStackOp1?` decodes them straight back to
+    -- `.opcode "OP_1ADD"` / `.opcode "OP_1SUB"`. They are the fused image
+    -- of `count + 1` / `count - 1` and the foundation for the
+    -- update_prop post-peephole M4 round-trip.
+    || name = "OP_1ADD" || name = "OP_1SUB"
 
 /-- The list-level emittability predicate, threaded as a single
 inductive (no mutual recursion needed for the current covered subset
@@ -1214,6 +1224,12 @@ private theorem parseStackOp1?_CAT :
 private theorem parseStackOp1?_SPLIT :
     parseStackOp1? 0x7f = some (.opcode "OP_SPLIT") := rfl
 
+private theorem parseStackOp1?_1ADD :
+    parseStackOp1? 0x8b = some (.opcode "OP_1ADD") := rfl
+
+private theorem parseStackOp1?_1SUB :
+    parseStackOp1? 0x8c = some (.opcode "OP_1SUB") := rfl
+
 /-- For a fixed list of free opcode bytes, the parsePushVal?-then-IF
 fast-path returns the structured `.opcode` directly. We prove these
 by `rfl` (the parseStackOpFuel definition reduces). -/
@@ -1288,6 +1304,16 @@ theorem parseStackOpFuel_OP_BIN2NUM (fuel : Nat) (rest : List UInt8) :
     parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_BIN2NUM") ++ rest)
       = .ok (.opcode "OP_BIN2NUM", rest) := rfl
 
+/-- Wave 60: `OP_1ADD` (0x8b) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_1ADD (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_1ADD") ++ rest)
+      = .ok (.opcode "OP_1ADD", rest) := rfl
+
+/-- Wave 60: `OP_1SUB` (0x8c) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_1SUB (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_1SUB") ++ rest)
+      = .ok (.opcode "OP_1SUB", rest) := rfl
+
 /-- Allowed opcode names round-trip. Dispatches on the 14-way
 disjunction in `isAllowedOpcodeName`. -/
 theorem parseStackOpFuel_opcode_allowed (fuel : Nat) (rest : List UInt8)
@@ -1302,6 +1328,8 @@ theorem parseStackOpFuel_opcode_allowed (fuel : Nat) (rest : List UInt8)
   -- Process each of the 14 cases.
   -- Use a series of rcases with a left-associated pattern.
   obtain h1 | h1 := h
+  obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
   obtain h1 | h1 := h1
   obtain h1 | h1 := h1
   obtain h1 | h1 := h1
@@ -1334,7 +1362,9 @@ theorem parseStackOpFuel_opcode_allowed (fuel : Nat) (rest : List UInt8)
     | exact parseStackOpFuel_OP_SPLIT fuel rest
     | exact parseStackOpFuel_OP_ABS fuel rest
     | exact parseStackOpFuel_OP_SIZE fuel rest
-    | exact parseStackOpFuel_OP_BIN2NUM fuel rest)
+    | exact parseStackOpFuel_OP_BIN2NUM fuel rest
+    | exact parseStackOpFuel_OP_1ADD fuel rest
+    | exact parseStackOpFuel_OP_1SUB fuel rest)
 
 /-! ## Per-op round-trip — single op via `RunarEmittable` -/
 
@@ -1440,6 +1470,8 @@ theorem emitStackOpL_cons_of_RunarEmittable (op : StackOp)
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
       all_goals (subst hN; first
         | exact ⟨0x69, [], rfl⟩  -- VERIFY
         | exact ⟨0x8f, [], rfl⟩  -- NEGATE
@@ -1457,7 +1489,9 @@ theorem emitStackOpL_cons_of_RunarEmittable (op : StackOp)
         | exact ⟨0x7f, [], rfl⟩  -- SPLIT
         | exact ⟨0x90, [], rfl⟩  -- ABS  (wave 49)
         | exact ⟨0x82, [], rfl⟩  -- SIZE (wave 49)
-        | exact ⟨0x81, [], rfl⟩) -- BIN2NUM (wave 49)
+        | exact ⟨0x81, [], rfl⟩  -- BIN2NUM (wave 49)
+        | exact ⟨0x8b, [], rfl⟩  -- 1ADD (wave 60)
+        | exact ⟨0x8c, [], rfl⟩) -- 1SUB (wave 60)
 
 /-! Helper: a single step lemma for `parseOpsFuel` when the head bytes
 parse cleanly. Avoids unfolding parseOpsFuel directly. -/
@@ -1712,6 +1746,8 @@ theorem emitStackOp_toList_of_RunarEmittable (op : StackOp)
       unfold isAllowedOpcodeName at hAllow
       simp only [Bool.or_eq_true, decide_eq_true_eq] at hAllow
       obtain hN | hN := hAllow
+      obtain hN | hN := hN
+      obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
@@ -2111,6 +2147,8 @@ private theorem head_of_emitStackOpL_not_else_or_endif
       unfold isAllowedOpcodeName at hAllow
       simp only [Bool.or_eq_true, decide_eq_true_eq] at hAllow
       obtain hN | hN := hAllow
+      obtain hN | hN := hN
+      obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
@@ -4360,6 +4398,351 @@ theorem areRunarEmittableWithIfAndPatchesL_opcode_codesep_singleton :
 theorem areRunarEmittableWithIfAndPatchesL_codesep_then_push_singleton :
     areRunarEmittableWithIfAndPatchesL
       [.opcode "OP_CODESEPARATOR", .pushCodesepIndex] = true := rfl
+
+/-! ## Wave 60 — Phase 7.B `.push` round-trip emittability foundation
+
+This block delivers the foundational prerequisite for retiring the
+operational-M3 `update_prop` body. The general post-peephole image of an
+`update_prop` body contains *bare* small-int pushes (`count + 5` lowers
++ peepholes to `[dup, push 5, OP_ADD, nip]`; only `± 1` fuses to
+`OP_1ADD` / `OP_1SUB`). For the M4 parse-round-trip over that emittable
+image, `.push (.bigint i)` must be a round-trip target.
+
+### What already exists (built on, not re-derived)
+
+* `RunarEmittableNormalized` / `AreRunarEmittableNormalized` — the
+  list-level push-aware predicate (note the `hTail` look-ahead field on
+  `cons`: `isPushStackOp op = true → restNotPickOrRoll (emitOpsL rest)`).
+* `parseScript_emit_round_trip_normalized` / `parseOps_emit_round_trip_normalized`
+  — the general round-trip soundness, modulo `normalizeOps` (the parser
+  re-normalizes pushes to their canonical small-int form).
+* `NormalizedPushEmittable` witnesses for bool / small bigint / bytes.
+
+### What this block adds
+
+* A **decidable** push-aware list predicate `AreRunarEmittablePush`
+  (Bool mirror `areRunarEmittablePushBool` + `_iff`) covering the flat
+  `RunarEmittable` ops AND `.push (.bigint i)` for `i ∈ [-1, 16]`, with
+  the exact look-ahead side condition baked in.
+* The **round-trip soundness** lemma `parseScript_emit_round_trip_push`
+  that this predicate is normalize-stable (`normalizeOps ops = ops`), so
+  it round-trips to *itself* — the precise M4 peer of
+  `parseScript_emit_round_trip`.
+* The concrete C target-image lemmas for the update_prop post-peephole
+  shapes that wave 61's operational M3 routes through M4.
+
+### The EXACT side condition (for the operational-M3 wave)
+
+A list `op :: rest` is push-round-trippable iff:
+1. `op` is flat-`RunarEmittable` or `.push (.bigint i)` with `-1 ≤ i ≤ 16`,
+2. `rest` is itself push-round-trippable, AND
+3. **look-ahead**: if `op` is a push, the first byte of `emitOpsL rest`
+   is neither `0x79` (`OP_PICK`) nor `0x7a` (`OP_ROLL`) — otherwise the
+   push-then-`0x7a`/`0x79` byte pair collapses into a `.roll` / `.pick`
+   reconstruction.
+
+Note (for the operational-M3 wave): condition (3) NEVER fires within
+this predicate, because `.roll d` / `.pick d` emit their depth push
+prefix (`0x51..0x60`) FIRST — no clean push-emittable op produces a
+*leading* `0x7a`/`0x79` byte. The condition is carried purely so the
+round-trip soundness reduces to the general `Normalized` lemma; in
+practice every push-emittable list satisfies it automatically. The
+operational-M3 wave can therefore route any
+`areRunarEmittablePushBool ops = true` image straight through M4 with no
+extra side-goal beyond `decide`.
+
+The bigint range `[-1, 16]` is the single-byte fast-path window
+(`OP_1NEGATE`, `OP_0`, `OP_1..OP_16`); values outside it emit a literal-
+length push that parses back as `.bytes`, NOT `.bigint`, so they are not
+identity-round-trip targets (they normalize). The fused `± 1` case never
+needs a push at all — it routes through `OP_1ADD` / `OP_1SUB` (Deliverable
+A) — so the in-range push window plus the two fused arith opcodes cover
+the full update_prop image. -/
+
+/-! ### Deliverable A smoke tests — `OP_1ADD` / `OP_1SUB` fire by `rfl`. -/
+
+theorem smoke_parseStackOpFuel_OP_1ADD :
+    parseStackOpFuel 1 (emitStackOpL (.opcode "OP_1ADD")) = .ok (.opcode "OP_1ADD", []) :=
+  parseStackOpFuel_OP_1ADD 0 []
+
+theorem smoke_parseStackOpFuel_OP_1SUB :
+    parseStackOpFuel 1 (emitStackOpL (.opcode "OP_1SUB")) = .ok (.opcode "OP_1SUB", []) :=
+  parseStackOpFuel_OP_1SUB 0 []
+
+theorem smoke_OP_1ADD_in_allowlist : isAllowedOpcodeName "OP_1ADD" = true := rfl
+
+theorem smoke_OP_1SUB_in_allowlist : isAllowedOpcodeName "OP_1SUB" = true := rfl
+
+/-! ### Decidable look-ahead helper -/
+
+/-- Decidable Bool mirror of `restNotPickOrRoll`: a byte list does not
+begin with `0x79` (`OP_PICK`) or `0x7a` (`OP_ROLL`). -/
+def restNotPickOrRollB : List UInt8 → Bool
+  | []     => true
+  | b :: _ => b ≠ 0x7a && b ≠ 0x79
+
+theorem restNotPickOrRollB_iff (xs : List UInt8) :
+    restNotPickOrRollB xs = true ↔ restNotPickOrRoll xs := by
+  cases xs with
+  | nil => exact ⟨fun _ => trivial, fun _ => rfl⟩
+  | cons b bs =>
+      unfold restNotPickOrRollB restNotPickOrRoll
+      rw [Bool.and_eq_true]
+      constructor
+      · intro ⟨h1, h2⟩
+        exact ⟨by simpa using h1, by simpa using h2⟩
+      · intro ⟨h1, h2⟩
+        exact ⟨by simpa using h1, by simpa using h2⟩
+
+/-! ### Per-op push-emittability (decidable) -/
+
+/-- A single op is push-emittable iff it is flat-`RunarEmittable` or a
+small-int bigint push (`-1 ≤ i ≤ 16`, the single-byte fast-path window). -/
+def runarEmittablePushBool : StackOp → Bool
+  | .push (.bigint i) => decide (i = -1 ∨ (0 ≤ i ∧ i ≤ 16))
+  | op                => runarEmittableBool op
+
+/-! ### List-level push-emittability with the look-ahead side condition
+
+The Bool checker threads the look-ahead: when the head is a push, the
+emitted byte stream of the tail must not begin with `0x79`/`0x7a`. -/
+
+def areRunarEmittablePushBool : List StackOp → Bool
+  | []          => true
+  | op :: rest  =>
+      runarEmittablePushBool op
+        && areRunarEmittablePushBool rest
+        && (if isPushStackOp op = true then restNotPickOrRollB (emitOpsL rest) else true)
+
+/-- Prop form of the list-level push predicate. Decidable by reflection
+through `areRunarEmittablePushBool`. -/
+def AreRunarEmittablePush (ops : List StackOp) : Prop :=
+  areRunarEmittablePushBool ops = true
+
+instance areRunarEmittablePush_decidable (ops : List StackOp) :
+    Decidable (AreRunarEmittablePush ops) :=
+  inferInstanceAs (Decidable (areRunarEmittablePushBool ops = true))
+
+/-- Bool mirror `_iff` for the push predicate (trivial — the Prop is
+defined as the Bool equation, mirroring how `decide` decidability is
+exposed for the flat predicates). -/
+theorem areRunarEmittablePushBool_iff_AreRunarEmittablePush (ops : List StackOp) :
+    areRunarEmittablePushBool ops = true ↔ AreRunarEmittablePush ops :=
+  Iff.rfl
+
+/-! ### Soundness: push predicate ⇒ normalized predicate -/
+
+/-- A single push-emittable op is `RunarEmittableNormalized`. -/
+theorem runarEmittableNormalized_of_runarEmittablePushBool (op : StackOp)
+    (h : runarEmittablePushBool op = true) : RunarEmittableNormalized op := by
+  cases op with
+  | push v =>
+      cases v with
+      | bigint i =>
+          unfold runarEmittablePushBool at h
+          have hi : i = -1 ∨ (0 ≤ i ∧ i ≤ 16) := of_decide_eq_true h
+          exact .push (.bigint i) (normalizedPush_bigint_small i hi)
+      | bool b =>
+          -- `.bool` is not in the admitted push window: `runarEmittablePushBool`
+          -- falls through to `runarEmittableBool (.push (.bool b)) = false`.
+          -- (Admitting it would break normalize-stability: `.push (.bool b)`
+          -- normalizes to `.push (.bigint _)`, not to itself.)
+          simp [runarEmittablePushBool, runarEmittableBool] at h
+      | bytes bs =>
+          -- `.bytes` is not in the small-int push window: `runarEmittablePushBool`
+          -- falls through to `runarEmittableBool (.push (.bytes bs)) = false`.
+          simp [runarEmittablePushBool, runarEmittableBool] at h
+  | dup => exact .flat _ ((runarEmittableBool_iff_RunarEmittable _).mp h)
+  | swap => exact .flat _ ((runarEmittableBool_iff_RunarEmittable _).mp h)
+  | nip => exact .flat _ ((runarEmittableBool_iff_RunarEmittable _).mp h)
+  | over => exact .flat _ ((runarEmittableBool_iff_RunarEmittable _).mp h)
+  | rot => exact .flat _ ((runarEmittableBool_iff_RunarEmittable _).mp h)
+  | tuck => exact .flat _ ((runarEmittableBool_iff_RunarEmittable _).mp h)
+  | drop => exact .flat _ ((runarEmittableBool_iff_RunarEmittable _).mp h)
+  | roll d => exact .flat _ ((runarEmittableBool_iff_RunarEmittable _).mp h)
+  | pick d => exact .flat _ ((runarEmittableBool_iff_RunarEmittable _).mp h)
+  | opcode name => exact .flat _ ((runarEmittableBool_iff_RunarEmittable _).mp h)
+  | pickStruct d =>
+      have : runarEmittableBool (.pickStruct d) = true := h
+      simp [runarEmittableBool] at this
+  | ifOp t e =>
+      have : runarEmittableBool (.ifOp t e) = true := h
+      simp [runarEmittableBool] at this
+  | placeholder i n =>
+      have : runarEmittableBool (.placeholder i n) = true := h
+      simp [runarEmittableBool] at this
+  | pushCodesepIndex =>
+      have : runarEmittableBool .pushCodesepIndex = true := h
+      simp [runarEmittableBool] at this
+  | rawBytes b =>
+      have : runarEmittableBool (.rawBytes b) = true := h
+      simp [runarEmittableBool] at this
+
+/-- The push predicate implies the (non-decidable) normalized predicate. -/
+theorem areRunarEmittableNormalized_of_AreRunarEmittablePush :
+    ∀ (ops : List StackOp), AreRunarEmittablePush ops →
+      AreRunarEmittableNormalized ops
+  | [], _ => .nil
+  | op :: rest, h => by
+      unfold AreRunarEmittablePush areRunarEmittablePushBool at h
+      rw [Bool.and_eq_true, Bool.and_eq_true] at h
+      obtain ⟨⟨hOp, hRest⟩, hTail⟩ := h
+      refine .cons op rest
+        (runarEmittableNormalized_of_runarEmittablePushBool op hOp)
+        (areRunarEmittableNormalized_of_AreRunarEmittablePush rest hRest)
+        ?_
+      intro hPush
+      rw [if_pos hPush] at hTail
+      exact (restNotPickOrRollB_iff (emitOpsL rest)).mp hTail
+
+/-! ### Normalize-stability: push predicate ⇒ `normalizeOps = id` -/
+
+/-- A push-emittable op is normalize-stable. -/
+theorem normalizeStackOp_eq_self_of_runarEmittablePushBool (op : StackOp)
+    (h : runarEmittablePushBool op = true) : normalizeStackOp op = op := by
+  cases op with
+  | push v =>
+      cases v with
+      | bigint i =>
+          unfold runarEmittablePushBool at h
+          have hi : i = -1 ∨ (0 ≤ i ∧ i ≤ 16) := of_decide_eq_true h
+          show StackOp.push (normalizePushVal (PushVal.bigint i))
+              = StackOp.push (PushVal.bigint i)
+          rw [normalizePushVal_bigint_small_eq i hi]
+      | bool _ => simp [runarEmittablePushBool, runarEmittableBool] at h
+      | bytes bs => simp [runarEmittablePushBool, runarEmittableBool] at h
+  | dup => rfl
+  | swap => rfl
+  | nip => rfl
+  | over => rfl
+  | rot => rfl
+  | tuck => rfl
+  | drop => rfl
+  | roll d => rfl
+  | pick d => rfl
+  | opcode name => rfl
+  | pickStruct d => rfl
+  | ifOp t e =>
+      have : runarEmittableBool (.ifOp t e) = true := h
+      simp [runarEmittableBool] at this
+  | placeholder i n => rfl
+  | pushCodesepIndex => rfl
+  | rawBytes b => rfl
+
+/-- The push predicate makes `normalizeOps` the identity. -/
+theorem normalizeOps_eq_self_of_AreRunarEmittablePush :
+    ∀ (ops : List StackOp), AreRunarEmittablePush ops → normalizeOps ops = ops
+  | [], _ => rfl
+  | op :: rest, h => by
+      unfold AreRunarEmittablePush areRunarEmittablePushBool at h
+      rw [Bool.and_eq_true, Bool.and_eq_true] at h
+      obtain ⟨⟨hOp, hRest⟩, _⟩ := h
+      show normalizeStackOp op :: normalizeOps rest = op :: rest
+      rw [normalizeStackOp_eq_self_of_runarEmittablePushBool op hOp,
+        normalizeOps_eq_self_of_AreRunarEmittablePush rest hRest]
+
+/-! ### The M4 round-trip soundness lemmas (peers of the flat versions) -/
+
+/-- List-level round-trip: an `AreRunarEmittablePush` list parses back to
+*itself*. This is the M4 lemma the update_prop retirement needs — the
+push-aware peer of `parseOps_emit_round_trip`. -/
+theorem parseOps_emit_round_trip_push (ops : List StackOp)
+    (hOps : AreRunarEmittablePush ops) :
+    parseOps (emitOpsL ops) = .ok ops := by
+  have hNorm := areRunarEmittableNormalized_of_AreRunarEmittablePush ops hOps
+  rw [parseOps_emit_round_trip_normalized ops hNorm]
+  rw [normalizeOps_eq_self_of_AreRunarEmittablePush ops hOps]
+
+/-- ByteArray-level round-trip: the master M4 soundness lemma. The
+update_prop post-peephole emittable image parses back to itself. -/
+theorem parseScript_emit_round_trip_push (ops : List StackOp)
+    (hOps : AreRunarEmittablePush ops) :
+    parseScript (Emit.emitOps ops) = .ok ops := by
+  have hNorm := areRunarEmittableNormalized_of_AreRunarEmittablePush ops hOps
+  rw [parseScript_emit_round_trip_normalized ops hNorm]
+  rw [normalizeOps_eq_self_of_AreRunarEmittablePush ops hOps]
+
+/-! ### Deliverable B smoke tests -/
+
+theorem smoke_push_pred_dup_push5_add_nip :
+    AreRunarEmittablePush [.dup, .push (.bigint 5), .opcode "OP_ADD", .nip] := by
+  decide
+
+theorem smoke_push_roundtrip_dup_push5_add_nip :
+    parseScript (Emit.emitOps [.dup, .push (.bigint 5), .opcode "OP_ADD", .nip])
+      = .ok [.dup, .push (.bigint 5), .opcode "OP_ADD", .nip] :=
+  parseScript_emit_round_trip_push _ (by decide)
+
+theorem smoke_push_pred_bare_push5_push7_add :
+    AreRunarEmittablePush [.push (.bigint 5), .push (.bigint 7), .opcode "OP_ADD"] := by
+  decide
+
+theorem smoke_push_roundtrip_bare_push5_push7_add :
+    parseOps (emitOpsL [.push (.bigint 5), .push (.bigint 7), .opcode "OP_ADD"])
+      = .ok [.push (.bigint 5), .push (.bigint 7), .opcode "OP_ADD"] :=
+  parseOps_emit_round_trip_push _ (by decide)
+
+/-- A push immediately followed by a `.roll`/`.pick` op is still
+ACCEPTED and round-trips: `.roll d` / `.pick d` emit their depth push
+prefix FIRST (`0x51..0x60`), so the byte after the leading push is a
+small-int prefix, never the bare `0x7a`/`0x79` that the look-ahead
+guards against. The look-ahead condition fires only on tails whose
+emitted byte stream literally begins with `0x7a`/`0x79`, which no
+clean push-emittable op produces. The condition is nonetheless carried
+because the round-trip soundness proof needs it for the general
+`Normalized` lemma. -/
+theorem smoke_push_pred_accepts_push_then_roll :
+    AreRunarEmittablePush [.push (.bigint 5), .roll 1] := by
+  decide
+
+theorem smoke_push_roundtrip_push_then_roll :
+    parseOps (emitOpsL [.push (.bigint 5), .roll 1])
+      = .ok [.push (.bigint 5), .roll 1] :=
+  parseOps_emit_round_trip_push _ (by decide)
+
+/-! ### Deliverable C — update_prop post-peephole image shapes
+
+The three concrete M4 targets for wave 61's operational M3. Each is the
+emittable post-peephole image of an `update_prop` body and round-trips
+to itself under `parseScript_emit_round_trip_push`. -/
+
+/-- `count + 1` fuses to `[dup, OP_1ADD, nip]` (needs Deliverable A). -/
+theorem updateProp_image_inc_emittable :
+    AreRunarEmittablePush [.dup, .opcode "OP_1ADD", .nip] := by decide
+
+theorem updateProp_image_inc_roundtrip :
+    parseScript (Emit.emitOps [.dup, .opcode "OP_1ADD", .nip])
+      = .ok [.dup, .opcode "OP_1ADD", .nip] :=
+  parseScript_emit_round_trip_push _ (by decide)
+
+/-- `count - 1` fuses to `[dup, OP_1SUB, nip]` (needs Deliverable A). -/
+theorem updateProp_image_dec_emittable :
+    AreRunarEmittablePush [.dup, .opcode "OP_1SUB", .nip] := by decide
+
+theorem updateProp_image_dec_roundtrip :
+    parseScript (Emit.emitOps [.dup, .opcode "OP_1SUB", .nip])
+      = .ok [.dup, .opcode "OP_1SUB", .nip] :=
+  parseScript_emit_round_trip_push _ (by decide)
+
+/-- `count + i` for a non-fusing constant (`i = 5`) is
+`[dup, push i, OP_ADD, nip]` (needs Deliverable B). -/
+theorem updateProp_image_addConst_emittable :
+    AreRunarEmittablePush [.dup, .push (.bigint 5), .opcode "OP_ADD", .nip] := by decide
+
+theorem updateProp_image_addConst_roundtrip :
+    parseScript (Emit.emitOps [.dup, .push (.bigint 5), .opcode "OP_ADD", .nip])
+      = .ok [.dup, .push (.bigint 5), .opcode "OP_ADD", .nip] :=
+  parseScript_emit_round_trip_push _ (by decide)
+
+/-- `count - i` for a non-fusing constant (`i = 5`) is
+`[dup, push i, OP_SUB, nip]` (needs Deliverable B). -/
+theorem updateProp_image_subConst_emittable :
+    AreRunarEmittablePush [.dup, .push (.bigint 5), .opcode "OP_SUB", .nip] := by decide
+
+theorem updateProp_image_subConst_roundtrip :
+    parseScript (Emit.emitOps [.dup, .push (.bigint 5), .opcode "OP_SUB", .nip])
+      = .ok [.dup, .push (.bigint 5), .opcode "OP_SUB", .nip] :=
+  parseScript_emit_round_trip_push _ (by decide)
 
 end Parse
 end RunarVerification.Script
