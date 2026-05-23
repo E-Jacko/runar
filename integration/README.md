@@ -99,18 +99,18 @@ pnpm integration:all:run
 | FunctionPatterns | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Private methods, composition |
 | PostQuantumWallet | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Compile + Deploy [†] | WOTS+ (19KB script) |
 | SPHINCSWallet | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Compile + Deploy [†] | SLH-DSA (188KB script) |
-| SchnorrZKP | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Compile + Deploy [†] | EC operations, ZKP (877KB) |
+| SchnorrZKP | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | EC operations, ZKP (877KB) |
 | ConvergenceProof | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | EC point arithmetic |
 | EC Isolation | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | ecOnCurve, ecMulGen, ecAdd, ecNegate |
 
-[†] **Java post-quantum / Schnorr spend coverage is intentionally
+[†] **Java post-quantum spend coverage is intentionally
 deferred.** The compile + deploy + Java-surface parity tests are
 exhaustive for what they cover (the contract artifact itself, including
-the 188 KB SLH-DSA script and the 877 KB Schnorr-ZKP script, is bit-for-bit
+the 188 KB SLH-DSA script, is bit-for-bit
 identical to the TS-sourced artifact). The on-chain Bitcoin Script
-verification of these primitives is fully exercised by the **Go / Python
+verification of these post-quantum primitives is fully exercised by the **Go / Python
 / Ruby / Zig / Rust / TS** spend tests in the same row — those SDKs ship
-their own SLH-DSA / WOTS+ / Schnorr keygen + sign and round-trip an
+their own SLH-DSA / WOTS+ keygen + sign and round-trip an
 actual spend through the regtest VM. A Java spend would require either
 (a) a Java-side SLH-DSA / WOTS+ keygen+sign implementation (BouncyCastle
 ships SPHINCS+, but its parameter sets are the round-3 candidate, not
