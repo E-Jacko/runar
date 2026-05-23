@@ -4556,6 +4556,40 @@ def updatePropConsumeAdmissible (p : String) (op : String) (c : Int) : Bool :=
     && (-1 ≤ c) && (c ≤ 16)
     && (p != "c0") && (p != "c1") && (p != "t0") && (p != "u0")
 
+/-- **Wave 64 — the decidable BODY-only shape classifier for the update_prop
+consume fragment.**  Recognises EXACTLY the canonical 4-binding
+`prop ± small-const ; update_prop` shape over the fixed temp names
+`c0 / c1 / t0 / u0`, with admissibility folded in (op `∈ {"+","-"}`, const
+`∈ [-1,16]`, prop disjoint from the temps).  Body-only (no tsm); the wave-64
+omnibus dispatch `by_cases`-es on it and `updatePropConsumeShapeBool_extract`
+recovers the witnesses `prop / op / c` together with the body-equality and
+the admissibility flag.  VACUOUS for every non-consume body (the `_ => false`
+arm), so the keyed omnibus premise stays jointly satisfiable. -/
+def updatePropConsumeShapeBool : List ANFBinding → Bool
+  | [ .mk "c0" (.loadProp p) none,
+      .mk "c1" (.loadConst (.int c)) none,
+      .mk "t0" (.binOp op "c0" "c1" none) none,
+      .mk "u0" (.updateProp p' "t0") none ] =>
+      (p == p') && updatePropConsumeAdmissible p op c
+  | _ => false
+
+/-- **Wave 64 extraction.**  A `updatePropConsumeShapeBool`-true body is EXACTLY
+`updatePropConsumeBody prop op c` for the recovered witnesses, and that triple is
+admissible. -/
+theorem updatePropConsumeShapeBool_extract (body : List ANFBinding)
+    (h : updatePropConsumeShapeBool body = true) :
+    ∃ (prop op : String) (c : Int),
+      body = updatePropConsumeBody prop op c ∧
+      updatePropConsumeAdmissible prop op c = true := by
+  unfold updatePropConsumeShapeBool at h
+  split at h
+  next p c op p' =>
+    simp only [Bool.and_eq_true, beq_iff_eq] at h
+    obtain ⟨hpp, hAdmis⟩ := h
+    subst hpp
+    exact ⟨p, op, c, rfl, hAdmis⟩
+  next => exact absurd h (by decide)
+
 /-- **Wave 62 Deliverable 2 — the from-entry update_prop consume walk.**
 
 The §2.1-compliant M2 leg.  From ONLY input-side hypotheses —

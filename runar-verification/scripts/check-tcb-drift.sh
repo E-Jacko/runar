@@ -20,7 +20,33 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=84        # Breakdown (2026-05-23, Tier 1 wave 51 —
+TARGET_AXIOMS=83        # Breakdown (2026-05-23, Tier 1 wave 64 —
+                        # FOURTH TCB axiom retirement):
+                        # −1 in Pipeline.lean — the update_prop sub-omnibus
+                        #     `compileSafe_observational_correct_modulo_update_prop_codegen`
+                        #     RETIRED. Its omnibus dispatch branch is now
+                        #     discharged by the theorem
+                        #     `compileSafe_observational_correct_updateProp_consume`
+                        #     for the single-public canonical
+                        #     `prop ± small-const ; update_prop` consume fragment
+                        #     (decided by `Agrees.updatePropConsumeShapeBool`,
+                        #     op ∈ {"+","-"}, const ∈ [-1,16]), under the keyed
+                        #     `hUpdatePropFrag` premise (the entry tsm is the single
+                        #     prop slot `[(prop,.prop)]`, `.bigint`-typed). The
+                        #     4-leg discharge composes the wave-62 from-entry walk
+                        #     (M2 `successAgrees_updateProp_consume_unconditional`),
+                        #     the wave-63 emit-shape / op-shape bridges, and the
+                        #     push round-trip M4. Residual update_prop bodies fall
+                        #     through to the sound if_val / crypto_call cascade —
+                        #     NO new axiom. The omnibus #print axioms confirms the
+                        #     update_prop axiom is GONE (lists only propext /
+                        #     Classical.choice / Quot.sound + the 5 surviving
+                        #     sub-omnibus axioms crypto_call / dispatch / loop /
+                        #     method_call / stateful + crypto backends + native
+                        #     axioms).
+                        # Net delta: −1, 84 → 83.
+                        #
+                        # Breakdown (2026-05-23, Tier 1 wave 51 —
                         # THIRD TCB axiom retirement):
                         # −1 in Pipeline.lean — the math_byte sub-omnibus
                         #     `compileSafe_observational_correct_modulo_math_byte_call_codegen`

@@ -2649,7 +2649,11 @@ integration omnibus — planned split"):
   the math/byte fragment. Discharged after Phase B per-primitive
   codegen-to-spec + A4-crypto wrappers land.
 * `compileSafe_observational_correct_modulo_update_prop_codegen` —
-  bodies with `update_prop`. Discharged once A5 widening completes.
+  RETIRED (Wave 64, 2026-05-23): the single-public canonical
+  `prop ± small-const ; update_prop` consume fragment (decided by
+  `Agrees.updatePropConsumeShapeBool`) is discharged by the theorem
+  `compileSafe_observational_correct_updateProp_consume`; residual
+  update_prop bodies fall through to the sound if_val / crypto_call cascade.
 * `compileSafe_observational_correct_modulo_if_val_codegen` —
   RETIRED (Wave 45, 2026-05-23): the single-public, self-contained,
   arith-branch `if_val` fragment is discharged by the theorem
@@ -2740,37 +2744,20 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
-/-- **O1 sub-omnibus — update_prop family.**
-
-Phase D harness integration: codegen-soundness for ANF bodies with
-`update_prop` bindings (mutable property writes routed through the
-stack-side `OP_TOALTSTACK` / `OP_FROMALTSTACK` cleanup tail). The
-hypothesis `hUpdateProp` requires the body to satisfy
-`Agrees.structuralUpdatePropBodyBool`.
-
-Discharge path: this sub-omnibus retires once Stage C A5 widening
-completes; see `PATH2_PLAN.md` §5.23.
--/
-axiom compileSafe_observational_correct_modulo_update_prop_codegen (p : ANFProgram)
-    (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (_hMem : anfM ∈ p.methods) (_hPublic : anfM.isPublic = true)
-    (_hSafe : compileSafe p = .ok bytes)
-    (initialAnf : State) (initialStack : StackState)
-    (tsm : Agrees.TaggedStackMap)
-    (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hUpdateProp :
-      Agrees.structuralUpdatePropBodyBool
-        p.methods p.properties
-        Lower.defaultInlineBudget
-        (Lower.computeLastUses anfM.body) []
-        (anfM.body.map (·.name))
-        (Lower.collectConstInts anfM.body)
-        anfM.body
-        (List.reverse (anfM.params.map (·.name)))
-        0 = true) :
-    successAgrees
-      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
-      (runParsedBytes bytes initialStack)
+-- **O1 sub-omnibus — update_prop family — RETIRED (Tier 1 Wave 64, 2026-05-23).**
+-- The `compileSafe_observational_correct_modulo_update_prop_codegen` axiom is
+-- RETIRED.  Its omnibus branch is now discharged by the theorem
+-- `compileSafe_observational_correct_updateProp_consume` for the single-public
+-- canonical `prop ± small-const ; update_prop` consume fragment (decided by
+-- `Agrees.updatePropConsumeShapeBool`, op `∈ {"+","-"}`, const `∈ [-1,16]`),
+-- under the keyed `hUpdatePropFrag` premise (the entry tsm is the single prop
+-- slot `[(prop,.prop)]`, `.bigint`-typed).  The 4-leg discharge composes the
+-- wave-62 from-entry walk (M2 `successAgrees_updateProp_consume_unconditional`),
+-- the wave-63 emit-shape / op-shape bridges, and the push round-trip M4.  Bodies
+-- OUTSIDE this fragment fall through to the sound if_val / crypto_call cascade —
+-- NO new axiom is introduced.  The retired axiom's `#print axioms` on the
+-- omnibus lists only propext / Classical.choice / Quot.sound + the surviving
+-- sub-omnibus axioms (crypto_call, dispatch, loop, method_call, stateful).
 
 -- **O1 sub-omnibus — if_val family — RETIRED (Tier 1 Wave 45, 2026-05-23).**
 -- The `compileSafe_observational_correct_modulo_if_val_codegen` axiom is
@@ -4829,6 +4816,21 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
         AgreesA4.structuralCallBody (Lower.computeLastUses anfM.body) []
           anfM.body (anfM.params.map (fun pp => pp.name) |>.reverse) 0 ∧
         AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf)
+    -- **Wave 64 update_prop consume typed-entry premise (keyed).**  For a body
+    -- in the canonical `prop ± small-const ; update_prop` consume fragment
+    -- (decided by `updatePropConsumeShapeBool`) the entry tsm is the single
+    -- prop slot `[(prop, .prop)]` and is `.bigint`-typed (`entryTsmArithTyped`).
+    -- Keyed on the DECIDABLE Bool classifier, it is VACUOUS for every non-consume
+    -- body (the antecedent is `false`), so the omnibus stays jointly satisfiable.
+    -- The inner witness `prop` is pinned by the body-equality the classifier's
+    -- extraction supplies.  Its only consumer is the conformance harness, which
+    -- discharges it per fixture from the prop-typed entry.
+    (hUpdatePropFrag :
+      Agrees.updatePropConsumeShapeBool anfM.body = true →
+        ∀ (prop op : String) (c : Int),
+          anfM.body = Agrees.updatePropConsumeBody prop op c →
+          tsm = [(prop, Agrees.SlotKind.prop)] ∧
+          Agrees.entryTsmArithTyped Γ tsm)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
@@ -4891,14 +4893,32 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               hSinglePublic hNameMB hMathByteNoLen hStructCall hUntag hCoh hFrag
           · exact compileSafe_observational_correct_modulo_crypto_call_codegen
               p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
-        · by_cases hUpdateProp :
-              Agrees.structuralUpdatePropBodyBool
-                p.methods p.properties
-                Lower.defaultInlineBudget
-                lastUses [] localBindings constInts
-                anfM.body initialSm 0 = true
-          · exact compileSafe_observational_correct_modulo_update_prop_codegen
-              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hUpdateProp
+        · -- **Wave 64 consume-`update_prop` branch (replaces the retired
+          -- update_prop axiom).**  The decidable `updatePropConsumeShapeBool`
+          -- classifier pins the body to the canonical
+          -- `prop ± small-const ; update_prop` fragment; its extraction recovers
+          -- the witnesses `prop / op / c` + the body-equality + admissibility.
+          -- The keyed `hUpdatePropFrag` premise then forces `tsm = [(prop,.prop)]`
+          -- and its `.bigint`-typing, and `hSM` follows from `hUntag` after the
+          -- tsm rewrite.  Bodies OUTSIDE this fragment fall through to the sound
+          -- if_val / crypto_call cascade — NO new axiom is introduced.
+          by_cases hUpdatePropShape :
+              Agrees.updatePropConsumeShapeBool anfM.body = true
+          · obtain ⟨prop, op, c, hBodyEq, hAdmis⟩ :=
+              Agrees.updatePropConsumeShapeBool_extract anfM.body hUpdatePropShape
+            by_cases hNameUP : anfM.name ≠ "constructor"
+            · obtain ⟨hTsmEq, _hWt⟩ := hUpdatePropFrag hUpdatePropShape prop op c hBodyEq
+              subst hTsmEq
+              have hUntagUP : Agrees.untagSm [(prop, Agrees.SlotKind.prop)] = [prop] := rfl
+              have hSM : List.reverse (anfM.params.map (·.name)) = [prop] := by
+                rw [← hUntag, hUntagUP]
+              have hWtUP : Agrees.entryTsmArithTyped Γ [(prop, Agrees.SlotKind.prop)] := _hWt
+              exact compileSafe_observational_correct_updateProp_consume
+                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack Γ
+                hSinglePublic hNameUP prop op c hBodyEq hSM hAdmis hAgrees hUntagUP
+                hTypedEntry hWtUP hCoh
+            · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
           · -- **Wave 45 consume-`if_val` branch (replaces the retired if_val axiom).**
             -- The decidable `ifValArithBody` fragment pins the body to a single
             -- `.ifVal` with arith branches; the residual structural facts
@@ -5051,6 +5071,12 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
         AgreesA4.structuralCallBody (Lower.computeLastUses anfM.body) []
           anfM.body (anfM.params.map (fun pp => pp.name) |>.reverse) 0 ∧
         AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf)
+    (hUpdatePropFrag :
+      Agrees.updatePropConsumeShapeBool anfM.body = true →
+        ∀ (prop op : String) (c : Int),
+          anfM.body = Agrees.updatePropConsumeBody prop op c →
+          tsm = [(prop, Agrees.SlotKind.prop)] ∧
+          Agrees.entryTsmArithTyped Γ tsm)
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
     successAgrees
@@ -5058,7 +5084,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       (runParsedBytes bytes initialStack) :=
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
-    Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hCoh
+    Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag hCoh
 
 
 end Soundness

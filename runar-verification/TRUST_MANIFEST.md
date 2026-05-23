@@ -9,7 +9,7 @@ counts:
 
 | Item | Count | Meaning |
 |---|---:|---|
-| Project axioms | 84 | Named assumptions in Lean code |
+| Project axioms | 83 | Named assumptions in Lean code |
 | Opaque executable defaults | 0 | No executable bodies hidden from proofs |
 | Opaque defaults with bodies | 0 | No opaque declarations carry defaults |
 | `partial def` | 0 | No partial definitions under `RunarVerification/` |
@@ -54,6 +54,7 @@ that are preserved by design.
 | **Tier 1 wave 39: FIRST axiom retirement (arith)** | 2026-05-23 | **86** | **−1** | −1 (`compileSafe_observational_correct_modulo_arith_codegen` retired; its omnibus branch discharged by the theorem `compileSafe_observational_correct_arith_consume` for the single-public, no-double-negate, emittable consume-arith fragment under wave-34 typed-entry premises; residual arith bodies fall through to the sound `crypto_call` fallback — NO new axiom) | 0 |
 | **Tier 1 wave 45: SECOND axiom retirement (if_val)** | 2026-05-23 | **85** | **−1** | −1 (`compileSafe_observational_correct_modulo_if_val_codegen` retired; its omnibus branch discharged by the theorem `compileSafe_observational_correct_ifval_consume` for the single-public, self-contained, arith-branch `if_val` fragment — `ifValArithBody` + a `.bool`-typed head cond via `CondBoolTyped`; 4-leg discharge composes the wave-44 entry walk M2 + the wave-42 `.ifOp` op-shape M3/M4 — the M4 leg uses the WithIf parse round-trip `compileSafe_single_public_runOps_eq_with_if` — + the wave-21 shape derivation. The omnibus's typed-entry premises are keyed implications so the omnibus stays jointly satisfiable across the arith and if_val families. Residual if_val bodies — nested if_val, non-self-contained branches, non-arith branches — fall through to the sound `crypto_call` fallback — NO new axiom. `#print axioms compileSafe_observational_correct_ifval_consume` = propext / Classical.choice / Quot.sound + 3 crypto backends, NO sub-omnibus axiom) | 0 |
 | **Tier 1 wave 51: THIRD axiom retirement (math_byte)** | 2026-05-23 | **84** | **−1** | −1 (`compileSafe_observational_correct_modulo_math_byte_call_codegen` retired; its omnibus branch discharged by the theorem `compileSafe_observational_correct_mathByte_consume` for the single-public, NO-LEN single-arg math_byte fragment — `abs` / `bin2num` / `toByteString` chains at head slots, copy mode — `mathByteSingleArgShapeNoLenBool` + the keyed `hMathByteFrag` premise supplying the copy-mode structural-call obligation + the runtime `mathByteSingleArgBody` fragment derivable from the bytes-typed entry via `mathByteArgIs_of_entryTyped`. 4-leg discharge composes the wave-47 walk M2 `successAgrees_mathByteSingleArg_unconditional` + the wave-51 emit-shape bridge `mathByteEmitNoNip_of_noLenFragment` feeding the wave-49 op-shape M3/M4 — the M4 leg uses the plain `AreRunarEmittable` round-trip `compileSafe_single_public_runOps_eq` (math_byte ops carry no `.ifOp`) — + the wave-48 `lowerBindingsP=lowerBindings` collapse. The omnibus's typed-entry premises are keyed implications so the omnibus stays jointly satisfiable across all families. Residual math_byte bodies — `len`/`OP_NIP` chunks whose `[OP_SIZE, OP_NIP]` lowering fails the round-trip allowlist, 2-arg calls (`cat`/`num2bin`/`min`/`max`/`split`/`within`), and consume-mode chains — fall through to the sound `crypto_call` fallback — NO new axiom. `#print axioms compileSafe_observational_correct_mathByte_consume` = propext / Classical.choice / Quot.sound + 3 crypto backends (+ pre-existing `native_decide` ax from `lowerValueP_eq_lowerValue_structuralCall`), NO sub-omnibus axiom) | 0 |
+| **Tier 1 wave 64: FOURTH axiom retirement (update_prop)** | 2026-05-23 | **83** | **−1** | −1 (`compileSafe_observational_correct_modulo_update_prop_codegen` retired; its omnibus branch discharged by the theorem `compileSafe_observational_correct_updateProp_consume` for the single-public canonical `prop ± small-const ; update_prop` consume fragment — `Agrees.updatePropConsumeBody prop op c`, op ∈ {"+","-"}, const ∈ [-1,16] — decided by the new body-only Bool classifier `Agrees.updatePropConsumeShapeBool` (+ extraction lemma `updatePropConsumeShapeBool_extract` recovering the witnesses `prop / op / c` + body-equality + admissibility) and the keyed `hUpdatePropFrag` premise (keyed on the decidable classifier, VACUOUS for non-consume bodies, forcing `tsm = [(prop,.prop)]` `.bigint`-typed). 4-leg discharge composes the wave-62 from-entry walk M2 `successAgrees_updateProp_consume_unconditional` + the wave-63 emit-shape / op-shape bridges + the push round-trip M4 `compileSafe_single_public_runOps_eq_push`; `hSM` follows from `hUntag` after the tsm rewrite. The omnibus's typed-entry premises stay keyed implications so it remains jointly satisfiable across all families. Residual update_prop bodies — general `structuralUpdatePropBodyBool` shapes outside the consume fragment — fall through to the sound if_val / crypto_call cascade — NO new axiom. `#print axioms compileSafe_observational_correct_modulo_codegen_axioms` confirms the update_prop axiom is GONE: lists only propext / Classical.choice / Quot.sound + the 5 surviving sub-omnibus axioms (crypto_call / dispatch / loop / method_call / stateful) + crypto backends + pre-existing `native_decide` axioms, NO update_prop axiom) | 0 |
 
 **Net Tier 1 wave 2 (2026-05-17, omnibus-split inflation + Stage C widenings):** 78 → 86,
 Δ = +8 (intentional). The 9 per-family sub-omnibuses replace the single omnibus
@@ -171,8 +172,30 @@ planned sub-omnibus inventory:
   to crypto builtins. Discharged after Phase B per-primitive +
   A4-crypto.
 * `compileSafe_observational_correct_modulo_update_prop_codegen` —
-  for bodies with `update_prop`. Discharged once A5 widening
-  completes.
+  **RETIRED (Wave 64, 2026-05-23 — the FOURTH TCB axiom retirement).**
+  Its omnibus dispatch branch is now discharged by the theorem
+  `compileSafe_observational_correct_updateProp_consume` for the
+  single-public canonical `prop ± small-const ; update_prop` consume
+  fragment (`Agrees.updatePropConsumeBody prop op c`, op ∈ {"+","-"},
+  const ∈ [-1,16]), decided by the new body-only Bool classifier
+  `Agrees.updatePropConsumeShapeBool` (+ the extraction lemma
+  `updatePropConsumeShapeBool_extract` recovering the witnesses
+  `prop / op / c`, the body-equality, and admissibility). The keyed
+  `hUpdatePropFrag` premise — keyed on the decidable classifier, so
+  VACUOUS for non-consume bodies — forces the entry tsm to the single
+  prop slot `[(prop,.prop)]` and its `.bigint`-typing; `hSM` follows
+  from `hUntag` after the tsm rewrite. The 4-leg discharge composes the
+  wave-62 from-entry walk (M2
+  `successAgrees_updateProp_consume_unconditional`), the wave-63
+  emit-shape / op-shape bridges, and the push round-trip M4
+  (`compileSafe_single_public_runOps_eq_push`). The omnibus's
+  typed-entry premises stay keyed implications so it remains jointly
+  satisfiable across all families. Residual update_prop bodies
+  (general `structuralUpdatePropBodyBool` shapes outside the consume
+  fragment) fall through to the sound if_val / crypto_call cascade — no
+  replacement axiom. `#print axioms
+  compileSafe_observational_correct_modulo_codegen_axioms` confirms the
+  update_prop axiom is GONE.
 * `compileSafe_observational_correct_modulo_if_val_codegen` —
   **RETIRED (Wave 45, 2026-05-23 — the SECOND TCB axiom retirement).**
   Its omnibus dispatch branch is now discharged by the theorem
