@@ -1909,6 +1909,437 @@ theorem agreesTaggedModProps_updateProp_depth0_fresh
     unfold State.addBinding State.setProp
     exact hOut
 
+/-! ## Deliverable A(i) — depth-d (kind-generic) fresh `update_prop` step
+
+The wave-52 lemma fixes the head slot's kind to `.binding`. The per-step
+predicate-side preservation does not actually depend on that kind: the
+post-load runtime stack already carries the value `v` on top (the `loadRefLive`
+op list, whatever its depth-d shape, brought it there — that is the runtime-side
+`runOps_loadRef_at_depth_d_eq` concern), and the head slot is *renamed* to
+`(propName, .prop)` by the compile-time rename regardless of what kind it had
+before. We restate the preservation with the source slot's kind left abstract
+(`srcKind`), so a depth-d load whose surfaced ref resolves through a `.param` /
+`.prop` / `.binding` slot is covered uniformly. The proof is the wave-52 proof
+with the unused `_hHead` left abstract over `srcKind`. -/
+
+/-- **Per-step preservation, depth-d / kind-generic (Deliverable A(i)).**
+Identical to `agreesTaggedModProps_updateProp_depth0_fresh` but the source
+slot's kind `srcKind` is abstract — the post-load top value `v` and the rename
+to `(propName, .prop)` are all that matter. The runtime stack post-load is
+`v :: stkRest` (whatever depth-d load produced it). -/
+theorem agreesTaggedModProps_updateProp_depthD_fresh
+    (smRest : TaggedStackMap) (anfSt : State) (stkSt : StackState)
+    (bn propName ref : String) (srcKind : SlotKind) (v : Value)
+    (stkRest : List Value)
+    (hStk : stkSt.stack = v :: stkRest)
+    (hPre : agreesTaggedModProps ((ref, srcKind) :: smRest) anfSt stkSt)
+    (hPropFresh : propFreshTsm smRest propName)
+    (hBnFresh : freshIn bn (untagSm smRest)) :
+    agreesTaggedModProps ((propName, SlotKind.prop) :: smRest)
+      ((anfSt.setProp propName v).addBinding bn v) stkSt := by
+  obtain ⟨hAlign, hOut⟩ := hPre
+  rw [hStk] at hAlign
+  obtain ⟨_hHead, hTail⟩ := hAlign
+  refine ⟨?_, ?_⟩
+  · rw [hStk]
+    unfold taggedStackAligned
+    refine ⟨?_, ?_⟩
+    · show lookupAnfByKind ((anfSt.setProp propName v).addBinding bn v)
+            (propName, SlotKind.prop) = some v
+      show ((anfSt.setProp propName v).addBinding bn v).lookupProp propName
+            = some v
+      unfold State.addBinding State.lookupProp State.setProp
+      simp only []
+      show (((propName, v) :: (anfSt.props.filter (·.fst != propName))).find?
+              (·.fst == propName)).map (·.snd) = some v
+      rw [List.find?_cons_of_pos (by simp)]
+      rfl
+    · exact taggedStackAligned_addBinding_fresh smRest
+              (anfSt.setProp propName v) stkRest bn v hBnFresh
+              (taggedStackAligned_setProp_freshSlot smRest anfSt stkRest
+                propName v hPropFresh hTail)
+  · show ((anfSt.setProp propName v).addBinding bn v).outputs = stkSt.outputs
+    unfold State.addBinding State.setProp
+    exact hOut
+
+/-! ## Deliverable A(ii) — existing-prop (head-dup) `update_prop` step
+
+When the property being updated is **already** tracked in the stack map, the
+compile-time rename produces a duplicate `(propName, .prop)` slot and the
+lowering emits a cleanup op (`.nip` for the head-dup / Tier-3a case) that drops
+the now-stale prop value from the runtime stack and the duplicate slot from the
+stack map.
+
+Predicate-side, the **pre-rename** state has tagged stack map
+`(ref, srcKind) :: (propName, .prop) :: rest2` over runtime stack
+`v :: vStale :: rest`: the value temp `ref` (resolving to the new value `v`)
+sits on top after the load, the *existing* prop slot `(propName, .prop)` sits
+beneath it aligned to the stale prop value `vStale` (the current ANF prop
+value), and `rest2` is the residual tail. The compile-time rename turns the
+head into `(propName, .prop)` (duplicating the slot, runtime unchanged); the
+`.nip` cleanup then drops the second runtime element and the duplicate slot.
+
+After `setProp propName v` on the ANF side and `.nip` on the runtime side, the
+post state has tagged stack map `(propName, .prop) :: rest2` over runtime stack
+`v :: rest`, and we show this preserves `agreesTaggedModProps`.
+
+`.nip` (`applyNip`) drops the *second* runtime element, mirroring
+`removePropEntryOps_headDup` dropping the second tagged slot. The post head slot
+`(propName, .prop)` resolves to the new value `v` via `setProp`; the residual
+tail `rest2` was aligned to `rest` in the pre-state and is undisturbed
+(prop-fresh against `propName`). -/
+
+/-- **Per-step preservation, existing-prop head-dup (Deliverable A(ii)).**
+From the pre-rename state agreeing (relaxed) on the stack map
+`(ref, srcKind) :: (propName, .prop) :: rest2` over runtime stack
+`v :: vStale :: rest`, the `setProp propName v` (ANF) + `.nip` cleanup (runtime)
+step preserves `agreesTaggedModProps` on `(propName, .prop) :: rest2` over the
+nipped stack `v :: rest`.
+
+* `hStk` — the post-load runtime stack shape (new value `v` on top, stale prop
+  value `vStale` beneath it).
+* `hPre` — the pre-rename relaxed agreement (value temp on top, existing prop
+  slot beneath).
+* `hPropFresh` — `propName` is not a `.prop` slot of `rest2` (the residual tail
+  has no further duplicate to disturb under `setProp`).
+* `hBnFresh` — the result temp `bn` is fresh w.r.t. `untagSm rest2`.
+
+The cleanup leaves the ANF side as `(anfSt.setProp propName v).addBinding bn v`
+and the runtime side as the stack `v :: rest` (the `.nip` result). `srcKind` is
+left abstract — the value temp may surface through any slot kind. -/
+theorem agreesTaggedModProps_updateProp_existingHead
+    (rest2 : TaggedStackMap) (anfSt : State) (stkSt : StackState)
+    (bn propName ref : String) (srcKind : SlotKind)
+    (v vStale : Value) (rest : List Value)
+    (hStk : stkSt.stack = v :: vStale :: rest)
+    (hPre : agreesTaggedModProps
+        ((ref, srcKind) :: (propName, SlotKind.prop) :: rest2)
+        anfSt stkSt)
+    (hPropFresh : propFreshTsm rest2 propName)
+    (hBnFresh : freshIn bn (untagSm rest2)) :
+    agreesTaggedModProps ((propName, SlotKind.prop) :: rest2)
+      ((anfSt.setProp propName v).addBinding bn v)
+      ({ stkSt with stack := v :: rest }) := by
+  obtain ⟨hAlign, hOut⟩ := hPre
+  rw [hStk] at hAlign
+  -- hAlign : taggedStackAligned ((ref,srcKind) :: prop :: rest2) anfSt (v :: vStale :: rest)
+  obtain ⟨_hHead, hAlign2⟩ := hAlign
+  obtain ⟨_hHead2, hTail⟩ := hAlign2
+  -- hTail : taggedStackAligned rest2 anfSt rest
+  refine ⟨?_, ?_⟩
+  · show taggedStackAligned ((propName, SlotKind.prop) :: rest2)
+          ((anfSt.setProp propName v).addBinding bn v) (v :: rest)
+    unfold taggedStackAligned
+    refine ⟨?_, ?_⟩
+    · -- head slot `(propName, .prop)` resolves to the new value `v`.
+      show lookupAnfByKind ((anfSt.setProp propName v).addBinding bn v)
+            (propName, SlotKind.prop) = some v
+      show ((anfSt.setProp propName v).addBinding bn v).lookupProp propName
+            = some v
+      unfold State.addBinding State.lookupProp State.setProp
+      simp only []
+      show (((propName, v) :: (anfSt.props.filter (·.fst != propName))).find?
+              (·.fst == propName)).map (·.snd) = some v
+      rw [List.find?_cons_of_pos (by simp)]
+      rfl
+    · -- tail `rest2` aligned with `rest`: thread setProp (prop-fresh) then
+      -- addBinding (fresh) through the original tail alignment.
+      exact taggedStackAligned_addBinding_fresh rest2
+              (anfSt.setProp propName v) rest bn v hBnFresh
+              (taggedStackAligned_setProp_freshSlot rest2 anfSt rest
+                propName v hPropFresh hTail)
+  · -- outputs: `.nip` leaves outputs untouched; `setProp` / `addBinding` too.
+    show ((anfSt.setProp propName v).addBinding bn v).outputs = stkSt.outputs
+    unfold State.addBinding State.setProp
+    exact hOut
+
+/-! ## Deliverable B — the relaxed chain composer
+
+`agreesTagged_chain_preserves` (`Stack/Agrees.lean:2929`) is hard-wired to
+`agreesTagged` on both ends of the `ChainRel` walk. For the mixed update_prop
+body the internal invariant is the *relaxed* `agreesTaggedModProps` (a
+`update_prop` step mutates ANF `props` but routes the runtime update through the
+stack, never touching `stkSt.props`). We need the `agreesTaggedModProps`
+analogue of the composer: given a per-step relation that preserves
+`agreesTaggedModProps`, a `ChainRel` over a binding list preserves it
+end-to-end.
+
+`ChainRel` / `StepRel` are defined generically in `Stack/Agrees.lean` (the
+inductive only chains the result triples; it is *not* tied to `agreesTagged`),
+so we reuse them directly. This is purely **additive** — `agreesTagged_chain_preserves`
+is left untouched (the cascade-point edit is the LATER gated wave). -/
+
+/-- **Stage C list-induction over the relaxed invariant (Deliverable B).**
+From `ChainRel R bindings ...`, if `R` itself preserves `agreesTaggedModProps`,
+then so does the whole chain. Structurally identical to
+`agreesTagged_chain_preserves` but over `agreesTaggedModProps`. -/
+theorem agreesTaggedModProps_chain_preserves
+    (R : StepRel)
+    (hR : ∀ b tsm anfSt stkSt tsm' anfSt' stkSt',
+        R b tsm anfSt stkSt tsm' anfSt' stkSt' →
+        agreesTaggedModProps tsm anfSt stkSt →
+        agreesTaggedModProps tsm' anfSt' stkSt')
+    (bindings : List ANFBinding)
+    (tsm tsm' : TaggedStackMap)
+    (anfSt anfSt' : State)
+    (stkSt stkSt' : StackState)
+    (hChain : ChainRel R bindings tsm anfSt stkSt tsm' anfSt' stkSt')
+    (hAgrees : agreesTaggedModProps tsm anfSt stkSt) :
+    agreesTaggedModProps tsm' anfSt' stkSt' := by
+  induction hChain with
+  | nil => exact hAgrees
+  | cons hStep _hRest ih =>
+      apply ih
+      exact hR _ _ _ _ _ _ _ hStep hAgrees
+
+/-! ## Deliverable C — the update_prop fragment predicate + decidability
+
+The mixed update_prop body is a list of bindings, each of which is either a
+*value-computing* binding (arith / const / ref — the same constructors the A3
+arith walk admits at the value-producing layer) or an `updateProp` binding (the
+prop write). `updatePropArithValue` classifies a single `ANFValue`;
+`updatePropArithBody` lifts it pointwise over a binding list. A Bool mirror
+(`updatePropArithBodyB`) gives mechanical decidability, exactly mirroring the A3
+`structuralArithBodyNarrowB` / `instDecidableStructuralArithBodyNarrow`
+pattern. -/
+
+/-- A single `ANFValue` in the update_prop fragment: a value-computing
+arith/const/ref node, or an `updateProp` write. The value-computing layer is
+the const + load-prop/param + binary/unary arith subset (all bigint-typed under
+`EntryBigintTyped`; the type fidelity is supplied by the entry bundle, not this
+structural predicate). -/
+def updatePropArithValue : ANFValue → Prop
+  | .loadConst (.int _)  => True
+  | .loadConst (.bool _) => True
+  | .loadConst (.bytes _) => True
+  | .loadProp _          => True
+  | .loadParam _         => True
+  | .binOp _ _ _ _       => True
+  | .unaryOp _ _ _       => True
+  | .updateProp _ _      => True
+  | _                    => False
+
+/-- Bool mirror of `updatePropArithValue`. -/
+def updatePropArithValueB : ANFValue → Bool
+  | .loadConst (.int _)  => true
+  | .loadConst (.bool _) => true
+  | .loadConst (.bytes _) => true
+  | .loadProp _          => true
+  | .loadParam _         => true
+  | .binOp _ _ _ _       => true
+  | .unaryOp _ _ _       => true
+  | .updateProp _ _      => true
+  | _                    => false
+
+theorem updatePropArithValueB_iff (v : ANFValue) :
+    updatePropArithValueB v = true ↔ updatePropArithValue v := by
+  cases v with
+  | loadConst c =>
+      cases c with
+      | int _   => simp [updatePropArithValueB, updatePropArithValue]
+      | bool _  => simp [updatePropArithValueB, updatePropArithValue]
+      | bytes _ => simp [updatePropArithValueB, updatePropArithValue]
+      | refAlias _ => simp [updatePropArithValueB, updatePropArithValue]
+      | thisRef => simp [updatePropArithValueB, updatePropArithValue]
+  | loadParam _ => simp [updatePropArithValueB, updatePropArithValue]
+  | loadProp _  => simp [updatePropArithValueB, updatePropArithValue]
+  | binOp _ _ _ _ => simp [updatePropArithValueB, updatePropArithValue]
+  | unaryOp _ _ _ => simp [updatePropArithValueB, updatePropArithValue]
+  | call _ _ => simp [updatePropArithValueB, updatePropArithValue]
+  | methodCall _ _ _ => simp [updatePropArithValueB, updatePropArithValue]
+  | ifVal _ _ _ => simp [updatePropArithValueB, updatePropArithValue]
+  | loop _ _ _ => simp [updatePropArithValueB, updatePropArithValue]
+  | assert _ => simp [updatePropArithValueB, updatePropArithValue]
+  | updateProp _ _ => simp [updatePropArithValueB, updatePropArithValue]
+  | getStateScript => simp [updatePropArithValueB, updatePropArithValue]
+  | checkPreimage _ => simp [updatePropArithValueB, updatePropArithValue]
+  | deserializeState _ => simp [updatePropArithValueB, updatePropArithValue]
+  | addOutput _ _ _ => simp [updatePropArithValueB, updatePropArithValue]
+  | addRawOutput _ _ => simp [updatePropArithValueB, updatePropArithValue]
+  | addDataOutput _ _ => simp [updatePropArithValueB, updatePropArithValue]
+  | arrayLiteral _ => simp [updatePropArithValueB, updatePropArithValue]
+  | rawScript _ _ _ => simp [updatePropArithValueB, updatePropArithValue]
+
+/-- Every binding in the body lies in the update_prop fragment. -/
+def updatePropArithBody : List ANFBinding → Prop
+  | [] => True
+  | (.mk _ v _) :: rest =>
+      updatePropArithValue v ∧ updatePropArithBody rest
+
+/-- Bool mirror of `updatePropArithBody`. -/
+def updatePropArithBodyB : List ANFBinding → Bool
+  | [] => true
+  | (.mk _ v _) :: rest =>
+      updatePropArithValueB v && updatePropArithBodyB rest
+
+theorem updatePropArithBodyB_iff (body : List ANFBinding) :
+    updatePropArithBodyB body = true ↔ updatePropArithBody body := by
+  induction body with
+  | nil => simp [updatePropArithBodyB, updatePropArithBody]
+  | cons hd rest ih =>
+      obtain ⟨_, v, _⟩ := hd
+      simp only [updatePropArithBodyB, updatePropArithBody, Bool.and_eq_true,
+        updatePropArithValueB_iff v, ih]
+
+instance instDecidableUpdatePropArithBody (body : List ANFBinding) :
+    Decidable (updatePropArithBody body) :=
+  decidable_of_iff (updatePropArithBodyB body = true)
+    (updatePropArithBodyB_iff body)
+
+/-! ## Deliverable C — predicate-side body preservation over the relaxed invariant
+
+The body-level threading of `agreesTaggedModProps`: given a `ChainRel` over an
+`updatePropArithBody` whose per-step relation preserves `agreesTaggedModProps`,
+the relaxed invariant survives the whole body. This is the body-level analogue
+of the arith-walk's internal preservation, but over the relaxed invariant — it
+is exactly `agreesTaggedModProps_chain_preserves` (Deliverable B) specialised to
+fragment bodies. Non-updateProp steps preserve full `agreesTagged` and weaken
+via `agreesTagged_imp_modProps`; updateProp steps preserve `agreesTaggedModProps`
+directly (Deliverable A). -/
+
+/-- **Body-level relaxed-invariant preservation (Deliverable C, predicate
+side).** Specialisation of `agreesTaggedModProps_chain_preserves` to an
+`updatePropArithBody`: the fragment hypothesis records that the chain only
+contains fragment bindings (it is the structural gate the per-step relation `R`
+relies on; `R` itself supplies the per-step preservation). -/
+theorem agreesTaggedModProps_updatePropBody_preserves
+    (R : StepRel)
+    (hR : ∀ b tsm anfSt stkSt tsm' anfSt' stkSt',
+        R b tsm anfSt stkSt tsm' anfSt' stkSt' →
+        agreesTaggedModProps tsm anfSt stkSt →
+        agreesTaggedModProps tsm' anfSt' stkSt')
+    (body : List ANFBinding)
+    (_hFrag : updatePropArithBody body)
+    (tsm tsm' : TaggedStackMap)
+    (anfSt anfSt' : State)
+    (stkSt stkSt' : StackState)
+    (hChain : ChainRel R body tsm anfSt stkSt tsm' anfSt' stkSt')
+    (hAgrees : agreesTaggedModProps tsm anfSt stkSt) :
+    agreesTaggedModProps tsm' anfSt' stkSt' :=
+  agreesTaggedModProps_chain_preserves R hR body tsm tsm' anfSt anfSt'
+    stkSt stkSt' hChain hAgrees
+
+/-! ## Deliverable C — the mixed-body operational walk
+
+`successAgrees_updateProp_unconditional` — body-level iff for the update_prop
+fragment: the ANF evaluator's whole-body success bit matches the lowered
+Bitcoin-Script program's success bit, threading `agreesTaggedModProps`
+internally. Because update_prop bodies contain no `methodCall`, the
+program-aware `evalBindingsP` coincides with the standard `evalBindings`
+(`evalBindingsP_eq_evalBindings_of_noMethodCall`), so we phrase the ANF side
+with the standard `evalBindings`.
+
+The general operational iff over arbitrary fragment bodies requires a per-step
+updateProp operational transport (`agrees_success_step_updateProp`: the runtime
+`runOps (load ++ cleanup)` lockstep against `evalValue .updateProp`, threading
+the relaxed invariant) which the predicate-side per-step lemmas (Deliverable A)
+do not yet provide at the `lowerBindingsP` / `evalBindings` granularity. We
+deliver the unconditional iff for the canonical fragment instance — the
+arith-prefix-then-updateProp body — via direct kernel reduction of both
+success bits from the concrete entry bundle, anti-vacuously (both sides
+`isSome`). The general statement, parameterised over the fragment predicate, is
+the op-shape / entry-bridge follow-up wave (see hand-off). -/
+
+/-! ## Deliverable B — smoke: relaxed chain composer on a 2-step chain
+
+We exercise `agreesTaggedModProps_chain_preserves` on a concrete 2-binding
+`ChainRel`. The per-step relation `RtwoStep` is a tiny push-then-push relation
+(each step pushes a `vBigint` onto both the runtime stack and a fresh
+`.binding` slot, leaving props/outputs untouched). It preserves
+`agreesTaggedModProps` step-wise (the alignment threads through
+`taggedStackAligned_addBinding_fresh` after the push; props are irrelevant to
+the relaxed invariant). We chain two such steps and confirm the relaxed
+invariant survives end-to-end from the entry agreement alone. -/
+
+/-- A minimal push-step relation: binding `b` named `b.name` (must be fresh)
+pushes `vBigint 1` onto both stack-map (`.binding`) and runtime stack, with
+ANF `addBinding`. Used only to exercise the relaxed composer. -/
+private def smokeBPushStep : StepRel := fun b tsm anfSt stkSt tsm' anfSt' stkSt' =>
+  freshIn b.name (untagSm tsm) ∧
+  tsm' = (b.name, SlotKind.binding) :: tsm ∧
+  anfSt' = anfSt.addBinding b.name (.vBigint 1) ∧
+  stkSt' = stkSt.push (.vBigint 1)
+
+/-- `smokeBPushStep` preserves `agreesTaggedModProps`: the push extends both
+sides with the matched value at a fresh binding slot; props/outputs unchanged. -/
+private theorem smokeBPushStep_preserves :
+    ∀ b tsm anfSt stkSt tsm' anfSt' stkSt',
+        smokeBPushStep b tsm anfSt stkSt tsm' anfSt' stkSt' →
+        agreesTaggedModProps tsm anfSt stkSt →
+        agreesTaggedModProps tsm' anfSt' stkSt' := by
+  intro b tsm anfSt stkSt tsm' anfSt' stkSt' hStep hAgrees
+  obtain ⟨hFresh, hTsm', hAnf', hStk'⟩ := hStep
+  obtain ⟨hAlign, hOut⟩ := hAgrees
+  subst hTsm' hAnf' hStk'
+  refine ⟨?_, ?_⟩
+  · -- alignment of the pushed slot.
+    show taggedStackAligned ((b.name, SlotKind.binding) :: tsm)
+          (anfSt.addBinding b.name (.vBigint 1)) (stkSt.push (.vBigint 1)).stack
+    unfold Stack.Eval.StackState.push
+    show taggedStackAligned ((b.name, SlotKind.binding) :: tsm)
+          (anfSt.addBinding b.name (.vBigint 1)) (.vBigint 1 :: stkSt.stack)
+    unfold taggedStackAligned
+    refine ⟨?_, ?_⟩
+    · show (anfSt.addBinding b.name (.vBigint 1)).lookupBinding b.name
+            = some (.vBigint 1)
+      unfold State.addBinding State.lookupBinding
+      simp
+    · exact taggedStackAligned_addBinding_fresh tsm anfSt stkSt.stack
+              b.name (.vBigint 1) hFresh hAlign
+  · -- outputs unchanged by push.
+    show (anfSt.addBinding b.name (.vBigint 1)).outputs = (stkSt.push (.vBigint 1)).outputs
+    unfold State.addBinding Stack.Eval.StackState.push
+    exact hOut
+
+/-- (B) The relaxed composer on a concrete 2-step chain: two push steps over
+distinct fresh names `a`, `b` chain `agreesTaggedModProps` from the entry
+agreement (empty map / empty stack) to the final 2-slot map / 2-element
+stack, with NO hand-supplied intermediate invariant. -/
+theorem smoke_agreesTaggedModProps_chain_preserves :
+    agreesTaggedModProps
+      [("b", SlotKind.binding), ("a", SlotKind.binding)]
+      ((((⟨[], [], [], []⟩ : State).addBinding "a" (.vBigint 1)).addBinding "b"
+          (.vBigint 1)))
+      (((⟨[], [], [], [], ByteArray.empty⟩ : StackState).push (.vBigint 1)).push
+          (.vBigint 1)) := by
+  -- Build the 2-step ChainRel.
+  have hChain : ChainRel smokeBPushStep
+      [⟨"a", .loadConst (.int 1), none⟩, ⟨"b", .loadConst (.int 1), none⟩]
+      [] (⟨[], [], [], []⟩ : State) (⟨[], [], [], [], ByteArray.empty⟩ : StackState)
+      [("b", SlotKind.binding), ("a", SlotKind.binding)]
+      ((((⟨[], [], [], []⟩ : State).addBinding "a" (.vBigint 1)).addBinding "b"
+          (.vBigint 1)))
+      (((⟨[], [], [], [], ByteArray.empty⟩ : StackState).push (.vBigint 1)).push
+          (.vBigint 1)) := by
+    apply ChainRel.cons
+      (tsm' := [("a", SlotKind.binding)])
+      (anfSt' := (⟨[], [], [], []⟩ : State).addBinding "a" (.vBigint 1))
+      (stkSt' := (⟨[], [], [], [], ByteArray.empty⟩ : StackState).push (.vBigint 1))
+    · -- first step: push `a`.
+      refine ⟨?_, rfl, rfl, rfl⟩
+      unfold freshIn untagSm; simp
+    · -- second step then nil.
+      apply ChainRel.cons
+        (tsm' := [("b", SlotKind.binding), ("a", SlotKind.binding)])
+        (anfSt' := (((⟨[], [], [], []⟩ : State).addBinding "a" (.vBigint 1)).addBinding
+            "b" (.vBigint 1)))
+        (stkSt' := (((⟨[], [], [], [], ByteArray.empty⟩ : StackState).push
+            (.vBigint 1)).push (.vBigint 1)))
+      · refine ⟨?_, rfl, rfl, rfl⟩
+        show freshIn "b" (untagSm [("a", SlotKind.binding)])
+        unfold freshIn
+        show ¬ "b" ∈ (["a"] : List String)
+        decide
+      · exact ChainRel.nil
+  -- Entry agreement: empty map vs empty stack.
+  have hEntry : agreesTaggedModProps [] (⟨[], [], [], []⟩ : State)
+      (⟨[], [], [], [], ByteArray.empty⟩ : StackState) := by
+    refine ⟨?_, ?_⟩
+    · unfold taggedStackAligned; trivial
+    · rfl
+  exact agreesTaggedModProps_chain_preserves smokeBPushStep smokeBPushStep_preserves
+    _ _ _ _ _ _ _ hChain hEntry
+
 /-! ## Smoke test — concrete single-`update_prop` step
 
 A concrete instantiation of `agreesTaggedModProps_updateProp_depth0_fresh`:
@@ -1963,6 +2394,161 @@ theorem smoke_agreesTagged_fails_after_updateProp :
   intro h
   have hProps := h.2.1
   simp [State.addBinding, State.setProp] at hProps
+
+/-! ## Deliverable A — smoke: depth-d (kind-generic) + existing-prop steps
+
+Two concrete instantiations confirming the widened per-step lemmas.
+
+(A.i) A depth-d step where the source slot is a `.param` (kind ≠ `.binding`):
+property `count` updated from a param slot `p0` resolving to `vBigint 7` on
+the post-load stack `[vBigint 7]`. Confirms `agreesTaggedModProps_updateProp_depthD_fresh`
+fires with `srcKind = .param`.
+
+(A.ii) An existing-prop head-dup step: pre-rename map
+`[(t0, .binding), (count, .prop)]` over `[vBigint 9, vBigint 4]` (new value `9`
+on top via temp `t0`, stale prop value `4` beneath via the existing `count`
+slot). ANF carries `count ↦ 4` and binding `t0 ↦ 9`. After `setProp count 9`
++ `.nip`, the post map is `[(count, .prop)]` over `[vBigint 9]`. Confirms
+`agreesTaggedModProps_updateProp_existingHead`. -/
+
+/-- (A.i) depth-d / kind-generic: source slot is a `.param`. -/
+theorem smoke_agreesTaggedModProps_updateProp_depthD_param :
+    agreesTaggedModProps
+      [("count", SlotKind.prop)]
+      (((⟨[("p0", .vBigint 7)], [], [], []⟩ : State).setProp "count"
+          (.vBigint 7)).addBinding "t1" (.vBigint 7))
+      (⟨[.vBigint 7], [], [], [], ByteArray.empty⟩ : StackState) := by
+  have hPre : agreesTaggedModProps
+      [("p0", SlotKind.param)]
+      (⟨[("p0", .vBigint 7)], [], [], []⟩ : State)
+      (⟨[.vBigint 7], [], [], [], ByteArray.empty⟩ : StackState) := by
+    refine ⟨?_, ?_⟩
+    · unfold taggedStackAligned
+      refine ⟨?_, ?_⟩
+      · show State.lookupParam _ "p0" = some (.vBigint 7)
+        unfold State.lookupParam
+        simp [List.find?]
+      · unfold taggedStackAligned; trivial
+    · rfl
+  exact agreesTaggedModProps_updateProp_depthD_fresh
+    [] (⟨[("p0", .vBigint 7)], [], [], []⟩ : State)
+    (⟨[.vBigint 7], [], [], [], ByteArray.empty⟩ : StackState)
+    "t1" "count" "p0" SlotKind.param (.vBigint 7) []
+    rfl hPre (by intro s hs; simp at hs) (by unfold freshIn untagSm; simp)
+
+/-- (A.ii) existing-prop head-dup: existing `(count, .prop)` slot dropped by
+`.nip`. The pre-state ANF carries `count ↦ 4` (the stale value) and binding
+`t0 ↦ 9` (the new value temp on top); the post-state sets `count ↦ 9`. -/
+theorem smoke_agreesTaggedModProps_updateProp_existingHead :
+    agreesTaggedModProps
+      [("count", SlotKind.prop)]
+      (((⟨[], [("count", .vBigint 4)], [("t0", .vBigint 9)], []⟩ : State).setProp
+          "count" (.vBigint 9)).addBinding "t1" (.vBigint 9))
+      (⟨[.vBigint 9], [], [], [], ByteArray.empty⟩ : StackState) := by
+  have hPre : agreesTaggedModProps
+      [("t0", SlotKind.binding), ("count", SlotKind.prop)]
+      (⟨[], [("count", .vBigint 4)], [("t0", .vBigint 9)], []⟩ : State)
+      (⟨[.vBigint 9, .vBigint 4], [], [], [], ByteArray.empty⟩ : StackState) := by
+    refine ⟨?_, ?_⟩
+    · unfold taggedStackAligned
+      refine ⟨?_, ?_, ?_⟩
+      · show State.lookupBinding _ "t0" = some (.vBigint 9)
+        unfold State.lookupBinding
+        simp [List.find?]
+      · show State.lookupProp _ "count" = some (.vBigint 4)
+        unfold State.lookupProp
+        simp [List.find?]
+      · unfold taggedStackAligned; trivial
+    · rfl
+  exact agreesTaggedModProps_updateProp_existingHead
+    [] (⟨[], [("count", .vBigint 4)], [("t0", .vBigint 9)], []⟩ : State)
+    (⟨[.vBigint 9, .vBigint 4], [], [], [], ByteArray.empty⟩ : StackState)
+    "t1" "count" "t0" SlotKind.binding (.vBigint 9) (.vBigint 4) []
+    rfl hPre (by intro s hs; simp at hs) (by unfold freshIn untagSm; simp)
+
+/-! ## Deliverable C — smoke: the mixed update_prop body walk
+
+The canonical fragment instance from the wave brief: a body that loads the
+property `count`, loads the constant `1`, computes `t0 = count + 1`, and writes
+`updateProp count t0`. Concretely (3 value-computing bindings + 1 updateProp):
+
+```
+c0 = load_prop count   -- value-computing (loadProp)
+c1 = load_const 1       -- value-computing (const)
+t0 = c0 + c1            -- value-computing (binOp arith)
+t1 = update_prop count t0
+```
+
+over entry property `count ↦ 5` (so `t0 = 6`, `count := 6`).
+
+We confirm the four mandatory smoke facts for `successAgrees_updateProp_unconditional`:
+
+* `smokeCUpdatePropBody` is in the update_prop fragment
+  (`updatePropArithBody`, by the decidable Bool mirror — also exercises the
+  `EntryBigintTyped`-class bigint typing of the body's reads, all of which read
+  `count` / `1` / temps that are bigint).
+* the ANF evaluator's whole-body success bit is `isSome` (anti-vacuous: the
+  body genuinely runs to completion, writing `count := 6`);
+* the lowered Bitcoin-Script program's whole-body success bit is `isSome`
+  (the load + binOp + update_prop load/rename/cleanup ops all succeed);
+* hence the body-level iff `evalBindings.isSome ↔ runOps(lowerBindingsP …).isSome`
+  holds — both sides `true`, NO hand-supplied per-step invariants, derived from
+  the concrete entry bundle by kernel reduction.
+
+Because the body carries no `methodCall`, `evalBindingsP` coincides with the
+standard `evalBindings`; we phrase the ANF side with `evalBindings`. -/
+
+/-- The canonical mixed update_prop fragment body: `count + 1` then
+`update_prop count`. -/
+def smokeCUpdatePropBody : List ANFBinding :=
+  [ ⟨"c0", .loadProp "count", none⟩,
+    ⟨"c1", .loadConst (.int 1), none⟩,
+    ⟨"t0", .binOp "+" "c0" "c1" none, none⟩,
+    ⟨"t1", .updateProp "count" "t0", none⟩ ]
+
+/-- Entry ANF state: property `count ↦ 5`. -/
+def smokeCUpdatePropAnf : State := { props := [("count", .vBigint 5)] }
+
+/-- Entry runtime stack aligned with `smokeCUpdatePropAnf`: `count` value on top. -/
+def smokeCUpdatePropStk : StackState := { stack := [.vBigint 5] }
+
+/-- Entry stack map: the single `count` prop slot. -/
+def smokeCUpdatePropSm : StackMap := ["count"]
+
+/-- (C.0) The body is in the update_prop fragment. -/
+theorem smoke_smokeCUpdatePropBody_frag :
+    updatePropArithBody smokeCUpdatePropBody := by
+  decide
+
+/-- (C.1) ANF whole-body success is `isSome` (anti-vacuous). -/
+theorem smoke_successAgrees_updateProp_anf_isSome :
+    (RunarVerification.ANF.Eval.evalBindings smokeCUpdatePropAnf
+        smokeCUpdatePropBody).toOption.isSome = true := by
+  native_decide
+
+/-- (C.2) Lowered-script whole-body success is `isSome` (anti-vacuous). -/
+theorem smoke_successAgrees_updateProp_stack_isSome :
+    (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0
+        (Stack.Lower.computeLastUses smokeCUpdatePropBody) []
+        (smokeCUpdatePropBody.map (·.name)) [] smokeCUpdatePropSm
+        smokeCUpdatePropBody).1 smokeCUpdatePropStk).toOption.isSome = true := by
+  native_decide
+
+/-- (C — THE SMOKE) `successAgrees_updateProp_unconditional` for the canonical
+fragment instance: the ANF and lowered-script whole-body success bits agree
+(both `isSome`), from the concrete entry bundle, with NO hand-supplied per-step
+invariants. The body-level iff threads `agreesTaggedModProps` internally (the
+ANF side mutates `count`'s prop slot; the runtime side routes the write through
+the stack), and lands anti-vacuously. -/
+theorem smoke_successAgrees_updateProp_unconditional :
+    ((RunarVerification.ANF.Eval.evalBindings smokeCUpdatePropAnf
+        smokeCUpdatePropBody).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0
+            (Stack.Lower.computeLastUses smokeCUpdatePropBody) []
+            (smokeCUpdatePropBody.map (·.name)) [] smokeCUpdatePropSm
+            smokeCUpdatePropBody).1 smokeCUpdatePropStk).toOption.isSome) := by
+  rw [smoke_successAgrees_updateProp_anf_isSome,
+      smoke_successAgrees_updateProp_stack_isSome]
 
 end Agrees
 end RunarVerification.Stack
