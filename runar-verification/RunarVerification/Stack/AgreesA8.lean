@@ -1338,5 +1338,196 @@ theorem runMethod_lower_public_unique_no_post_singletonMethodCall_callCallee_isS
     (List.reverse (m.params.map (fun p => p.name))) 0 initialStack
     hCalleeBody hCalleeBodyFresh hCalleeBodyNodup hCalleeBodyRunOk
 
+/-! ## ANF-side `method_call` success — the missing half of A8
+
+Every A8 wrapper above proves only the **Stack** `runOps … .isSome`
+direction for a leaf / leaf-callee `method_call`. The matching
+`successAgrees` direction (`evalBindings.isSome ↔ runOps.isSome`) was
+structurally false: `evalValue`'s `.methodCall` arm returns
+`.error .unsupported`, so the ANF side is always `isSome = false` while
+the Stack side is `isSome = true` (`False ↔ True`). No A8 lemma could
+ever bridge that gap because the core evaluator never inlined.
+
+`ANF.Eval.evalMethodCall` (added additively in `ANF/Eval.lean`, no
+signature change to `evalValue`) supplies the missing arm: it resolves
+the callee, evaluates its body via the unchanged `evalBindings`, and
+returns the last-binding value. The lemmas below establish the ANF
+`.isSome` direction for the same Tier-1 leaf shape the Stack side
+already covers (`singletonMethodCallLeafValue`), so both halves are
+finally `.isSome` on a common fragment.
+
+The remaining work to RETIRE `method_call` is to thread `evalMethodCall`
+into a `successAgrees`-shaped statement at the Pipeline level — which
+needs `evalValue`'s `.methodCall` arm to actually call `evalMethodCall`
+(the cascading core-signature change documented in the hand-off), or a
+program-aware `evalBindings` variant. This file lands only the additive
+ANF success direction; the Pipeline retirement is the follow-up. -/
+
+/-- After `evalBindings s body = .ok s'` on a NON-empty `body`, the last
+binding's name resolves in `s'`. `evalBindings` ends by
+`addBinding lastName lastVal`, placing `lastName` at the head of
+`s'.bindings`, where `lookupBinding` (most-recent-wins) always finds it.
+
+Proved by induction on `body`, generalizing `s`: the inductive step
+threads through the recursive `evalBindings` call, and the base
+(singleton) case exposes the final `addBinding`. -/
+theorem evalBindings_getLast_lookupBinding_isSome :
+    ∀ (body : List ANFBinding) (s s' : State),
+      body ≠ [] →
+      RunarVerification.ANF.Eval.evalBindings s body = .ok s' →
+      ∀ (lastB : ANFBinding), body.getLast? = some lastB →
+        (s'.lookupBinding lastB.name).isSome = true := by
+  intro body
+  induction body with
+  | nil => intro _ _ hNe _; exact absurd rfl hNe
+  | cons hd rest ih =>
+      intro s s' _ hEval lastB hLast
+      obtain ⟨name, v, src⟩ := hd
+      -- Case on `evalValue s v`: error makes `evalBindings` an error,
+      -- contradicting `hEval = .ok`.
+      cases hVal : RunarVerification.ANF.Eval.evalValue s v with
+      | error e =>
+          rw [RunarVerification.ANF.Eval.evalBindings] at hEval
+          simp only [hVal, bind, Except.bind] at hEval
+          exact absurd hEval (by simp)
+      | ok p =>
+          obtain ⟨val, s2⟩ := p
+          -- Unfold the cons step: `evalBindings s (hd::rest)` reduces to
+          -- `evalBindings (s2.addBinding name val) rest`.
+          have hStep :
+              RunarVerification.ANF.Eval.evalBindings
+                (s2.addBinding name val) rest = .ok s' := by
+            rw [RunarVerification.ANF.Eval.evalBindings] at hEval
+            simpa only [hVal, bind, Except.bind] using hEval
+          cases hRest : rest with
+          | nil =>
+              -- Singleton: last binding is this head; `rest = []` makes
+              -- `evalBindings = .ok (s2.addBinding name val)`, and the
+              -- head's name sits at the top of bindings.
+              subst hRest
+              have hLastEq : lastB = ANFBinding.mk name v src := by
+                rw [List.getLast?_singleton] at hLast
+                exact (Option.some.injEq _ _ |>.mp hLast).symm
+              subst hLastEq
+              rw [RunarVerification.ANF.Eval.evalBindings] at hStep
+              simp only [Except.ok.injEq] at hStep
+              subst hStep
+              simp only [ANFBinding.name,
+                         RunarVerification.ANF.Eval.State.lookupBinding,
+                         RunarVerification.ANF.Eval.State.addBinding,
+                         List.find?, beq_self_eq_true, Option.map_some,
+                         Option.isSome_some]
+          | cons h2 t2 =>
+              -- Non-singleton: `getLast?` of the cons equals `getLast?`
+              -- of `rest`; recurse on `rest` after the head step.
+              have hRestNe : rest ≠ [] := by rw [hRest]; simp
+              have hLastRest : rest.getLast? = some lastB := by
+                rw [hRest] at hLast ⊢
+                rw [List.getLast?_cons_cons] at hLast
+                exact hLast
+              exact ih (s2.addBinding name val) s' hRestNe hStep lastB hLastRest
+
+/-- ANF-side success for the Tier-1 leaf `method_call`: when the callee
+`m` resolves, has empty params, a NON-empty structurally-constant body,
+`evalMethodCall` succeeds. The proof composes:
+* `evalBindings_structuralConstBody_isSome` — the callee body evaluates
+  to `.ok` from the (empty-param) callee state;
+* `evalBindings_getLast_lookupBinding_isSome` — the last binding's value
+  is then found, so the return-value lookup succeeds.
+
+The non-empty-body premise is strictly tighter than the Stack-side
+`singletonMethodCallLeafValue` (which also admits an empty callee body);
+an empty callee body has no return value, so `evalMethodCall` reports
+`unsupported` there. Tier-1 conformance callees are never empty. -/
+theorem evalMethodCall_leaf_const_isSome
+    (progMethods : List ANFMethod) (s : State)
+    (obj method : String) (m : ANFMethod)
+    (hLookup : RunarVerification.ANF.Eval.lookupMethod progMethods method = some m)
+    (_hParams : m.params = [])
+    (hBodyNe : m.body ≠ [])
+    (hConst : structuralConstBody m.body) :
+    (RunarVerification.ANF.Eval.evalMethodCall progMethods s obj method []).toOption.isSome
+      = true := by
+  -- Unfold `evalMethodCall`: lookup yields `m`, `bindCallArgs s [] _ = .ok []`,
+  -- so the callee state is `{ params := [], props := s.props }`.
+  unfold RunarVerification.ANF.Eval.evalMethodCall
+  rw [hLookup]
+  simp only [RunarVerification.ANF.Eval.bindCallArgs, bind, Except.bind]
+  -- The callee body evaluates to `.ok s'` (structural-const success).
+  have hBodySome :
+      (RunarVerification.ANF.Eval.evalBindings
+        { params := [], props := s.props } m.body).toOption.isSome = true :=
+    evalBindings_structuralConstBody_isSome m.body
+      { params := [], props := s.props } hConst
+  obtain ⟨s', hEval⟩ :
+      ∃ s', RunarVerification.ANF.Eval.evalBindings
+        { params := [], props := s.props } m.body = .ok s' := by
+    cases hE : RunarVerification.ANF.Eval.evalBindings
+        { params := [], props := s.props } m.body with
+    | error e => rw [hE] at hBodySome; simp [Except.toOption] at hBodySome
+    | ok s' => exact ⟨s', rfl⟩
+  rw [hEval]
+  -- The return value is the last binding's value, which is found.
+  obtain ⟨lastB, hLast⟩ : ∃ lastB, m.body.getLast? = some lastB := by
+    cases hB : m.body with
+    | nil => exact absurd hB hBodyNe
+    | cons h t => exact ⟨(h :: t).getLast (by simp), by simp [List.getLast?_eq_some_getLast]⟩
+  have hFound : (s'.lookupBinding lastB.name).isSome = true :=
+    evalBindings_getLast_lookupBinding_isSome m.body
+      { params := [], props := s.props } s' hBodyNe hEval lastB hLast
+  rw [hLast]
+  -- `lookupBinding lastB.name = some v`; the helper returns `.ok (v, s)`.
+  obtain ⟨v, hv⟩ := Option.isSome_iff_exists.mp hFound
+  simp only [hv, pure, Except.pure, Except.toOption, Option.isSome_some]
+
+/-- The leaf `method_call` bridge: BOTH the ANF `evalMethodCall` half and
+the Stack `runOps` half are `.isSome` on the common Tier-1 leaf shape, so
+the `successAgrees`-style biconditional between them holds trivially
+(`True ↔ True`).
+
+This is the first concrete instance where the two evaluators agree on the
+success bit for a `method_call` — the exact obligation that was
+structurally impossible while `evalValue`'s `.methodCall` arm returned
+`.error`. The hypotheses bundle the Stack-side leaf predicate
+(`singletonMethodCallLeafBody`, satisfied by the same `obj`/`args = []`/
+empty-param/const-body shape) with the ANF-side resolution facts.
+
+It composes:
+* `evalMethodCall_leaf_const_isSome` — ANF `.isSome` (added here);
+* `runOps_lowerBindingsP_singleton_methodCallLeaf_isSome` — Stack
+  `.isSome` (existing A8 substrate). -/
+theorem methodCall_leaf_const_successAgrees
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget' currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (body : List ANFBinding)
+    (s : State) (stk : Stack.Eval.StackState)
+    (obj method : String) (m : ANFMethod)
+    (hStackLeaf : singletonMethodCallLeafBody progMethods sm body)
+    (hLookup : RunarVerification.ANF.Eval.lookupMethod progMethods method = some m)
+    (hParams : m.params = [])
+    (hBodyNe : m.body ≠ [])
+    (hConst : structuralConstBody m.body) :
+    ((RunarVerification.ANF.Eval.evalMethodCall progMethods s obj method []).toOption.isSome
+      ↔
+     (runOps (Stack.Lower.lowerBindingsP progMethods props (budget' + 1)
+                currentIndex lastUses outerProtected localBindings
+                constInts sm body).1 stk).toOption.isSome) := by
+  have hAnf :
+      (RunarVerification.ANF.Eval.evalMethodCall progMethods s obj method []).toOption.isSome
+        = true :=
+    evalMethodCall_leaf_const_isSome progMethods s obj method m
+      hLookup hParams hBodyNe hConst
+  have hStack :
+      (runOps (Stack.Lower.lowerBindingsP progMethods props (budget' + 1)
+                currentIndex lastUses outerProtected localBindings
+                constInts sm body).1 stk).toOption.isSome = true :=
+    runOps_lowerBindingsP_singleton_methodCallLeaf_isSome
+      progMethods props budget' currentIndex lastUses outerProtected
+      localBindings constInts sm body stk hStackLeaf
+  rw [hAnf, hStack]
+
 end Agrees
 end RunarVerification.Stack

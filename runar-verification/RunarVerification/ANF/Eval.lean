@@ -1889,6 +1889,85 @@ def runLoop (count : Nat) (body : List ANFBinding)
 
 end
 
+/-! ### Additive `method_call` evaluator (Path 2 Tier 1 — A8 bridge)
+
+`evalValue`'s `.methodCall` arm returns `.error .unsupported` because the
+core mutual evaluator is parameterised by `State` alone — it has no
+access to the program's method table, so it cannot resolve a callee body
+to inline. Threading the method list through the whole mutual block
+(`evalValue` / `evalBindings` / `runLoop`) would cascade to every one of
+the 300+ `evalBindings` call sites and every `successAgrees` statement
+that pattern-matches `evalBindings s body`; that is an out-of-scope
+core-signature change.
+
+`evalMethodCall` is the **additive** alternative: a standalone helper,
+defined *after* the mutual block, that carries the method list as an
+explicit argument and reuses the unchanged `evalBindings` to evaluate the
+resolved callee body. It mirrors the Stack-side inlining performed by
+`Stack.Lower.lowerValueP`'s `.methodCall` arm:
+
+* resolve the argument refs against the caller `State`;
+* look up the callee by name (`lookupMethod`, mirroring the resolver
+  the Stack inliner `Stack.Lower.lookupMethod` uses);
+* construct a fresh callee `State` whose `params` are the call-site args
+  bound positionally to the callee's parameter names (extra args dropped,
+  matching `loadAndBindArgs`), inheriting the caller's `props`;
+* evaluate the callee body with `evalBindings`;
+* return the value of the callee body's **last** binding — the Stack
+  inliner renames the stack top to the call-site binding name exactly
+  when the top IS the callee's last binding name (`Stack/Lower.lean`
+  `inlineMethodCall`), so the ANF "return value" is that last binding.
+
+`evalValue`'s `.methodCall` arm is deliberately left untouched: this
+helper is a parallel entry point that the A8 substrate's ANF `.isSome`
+half can call, never a modification of the core evaluator's signature.
+-/
+
+/-- Find a method by name in the program's method list. Mirrors
+`Stack.Lower.lookupMethod` (we cannot import `Stack.Lower` here — it
+imports the ANF layer, so the dependency would be circular). -/
+def lookupMethod (methods : List ANFMethod) (name : String) : Option ANFMethod :=
+  methods.find? (fun m => m.name == name)
+
+/-- Resolve a call-site argument list against the caller `State`,
+producing the positional `(paramName, value)` pairs for the callee's
+`params`. Extra args without a matching param are dropped; missing args
+leave the corresponding params unbound (mirrors `loadAndBindArgs`). -/
+def bindCallArgs (s : State) :
+    List String → List String → EvalResult (List (String × Value))
+  | [], _ => .ok []
+  | _ :: _, [] => .ok []
+  | a :: rargs, p :: rparams => do
+      let v ← lookupRef s a
+      let rest ← bindCallArgs s rargs rparams
+      return (p, v) :: rest
+
+/-- Evaluate a `method_call` against an explicit program method table.
+
+Returns the callee body's last-binding value paired with the caller
+`State` (property mutations inside a private helper are not propagated
+back here — the present helper mirrors the Stack inliner's value-return
+contract, not its in-place property writes). Failure cases:
+* `unsupported` when the method name does not resolve;
+* `unsupported` when the callee body is empty (no return value);
+* any error raised by evaluating the callee body. -/
+def evalMethodCall (methods : List ANFMethod) (s : State)
+    (_object : String) (method : String) (args : List String) :
+    EvalResult (Value × State) := do
+  match lookupMethod methods method with
+  | none => .error (.unsupported s!"method_call: unresolved method {method}")
+  | some m =>
+      let paramNames := m.params.map (·.name)
+      let boundParams ← bindCallArgs s args paramNames
+      let calleeState : State := { params := boundParams, props := s.props }
+      let calleeOut ← evalBindings calleeState m.body
+      match m.body.getLast? with
+      | some b =>
+          match calleeOut.lookupBinding b.name with
+          | some v => return (v, s)
+          | none   => .error (.unsupported s!"method_call: last binding {b.name} not found in callee {method}")
+      | none => .error (.unsupported s!"method_call: empty callee body {method}")
+
 /-! ### Concrete ANF byte / number samples
 
 Executable samples pin the ANF evaluator to the same bytewise and
@@ -1990,6 +2069,66 @@ theorem evalValue_call_within_sample :
           bindings := [("hi", .vBigint 9), ("lo", .vBigint 3), ("x", .vBigint 7)] }
         (.call "within" ["x", "lo", "hi"]) with
      | .ok (.vBool b, _) => b == true
+     | _ => false) = true := by
+  native_decide
+
+/-! ### `method_call` additive-evaluator smoke (Path 2 Tier 1 — A8 bridge)
+
+The A8 Tier-1 leaf shape (`Stack/AgreesA8.lean`
+`singletonMethodCallLeafValue`): a `method_call` to a callee with empty
+params whose body is a flat sequence of literal loads. The Stack inliner
+reduces such a call to the structural lowering of the callee body, which
+`runOps` succeeds on (the `runOps_lowerBindingsP_singleton_methodCallLeaf_isSome`
+half). These smokes pin the **ANF** side of the same shape: `evalMethodCall`
+resolves the callee, evaluates its constant body, and returns the
+last-binding value — so the ANF result `.isSome` is now `true`, exactly
+the half the A8 substrate was missing. Both sides `.isSome` is what
+`successAgrees` needs to retire `method_call`. -/
+
+/-- A leaf callee `helper()` whose body returns the literal `42`. -/
+private def smokeLeafProgramMethods : List ANFMethod :=
+  [ { name := "helper", params := [], isPublic := false,
+      body := [ .mk "r" (.loadConst (.int 42)) none ] } ]
+
+/-- `evalMethodCall` resolves `helper`, evaluates its constant body, and
+returns the callee's last-binding value `42`. The ANF `.isSome` half of
+the A8 leaf bridge. -/
+theorem evalMethodCall_leaf_const_returns_callee_result :
+    (match evalMethodCall smokeLeafProgramMethods (default : State)
+        "this" "helper" [] with
+     | .ok (.vBigint n, _) => n == 42
+     | _ => false) = true := by
+  native_decide
+
+/-- The leaf `method_call` evaluates successfully: `.isSome = true`. This
+is precisely the half that `evalValue`'s `.methodCall := .error` arm
+denies (where `.isSome = false`), and the gap that made `successAgrees`
+structurally false for any lowering `method_call`. -/
+theorem evalMethodCall_leaf_const_isSome :
+    (evalMethodCall smokeLeafProgramMethods (default : State)
+      "this" "helper" []).toOption.isSome = true := by
+  native_decide
+
+/-- An unresolved method name fails, so callers can distinguish a real
+method-resolution miss from a successful inline. -/
+theorem evalMethodCall_unresolved_errors :
+    (evalMethodCall smokeLeafProgramMethods (default : State)
+      "this" "nonexistent" []).toOption.isSome = false := by
+  native_decide
+
+/-- A callee with one param: `evalMethodCall` binds the call-site arg to
+the param and returns the body's last binding (here the param itself),
+showing `bindCallArgs` threads positional args into the callee scope. -/
+private def smokeIdentityProgramMethods : List ANFMethod :=
+  [ { name := "ident", params := [{ name := "p", type := .bigint }],
+      isPublic := false,
+      body := [ .mk "r" (.loadParam "p") none ] } ]
+
+theorem evalMethodCall_identity_returns_arg :
+    (match evalMethodCall smokeIdentityProgramMethods
+        { (default : State) with bindings := [("a", .vBigint 7)] }
+        "this" "ident" ["a"] with
+     | .ok (.vBigint n, _) => n == 7
      | _ => false) = true := by
   native_decide
 

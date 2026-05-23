@@ -1687,5 +1687,282 @@ theorem runMethod_lower_public_unique_no_post_structuralUpdatePropFreshBytes_isS
   rw [hOps]
   simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Except.toOption]
 
+/-! ## Predicate-side relaxed invariant for `update_prop` (Wave 52)
+
+The base `agreesTagged` (`Stack/Agrees.lean`) bundles three conjuncts:
+stack alignment, `anfSt.props = stkSt.props`, and `anfSt.outputs =
+stkSt.outputs`. An `update_prop` step breaks the *second* conjunct: the
+ANF evaluator runs `State.setProp` (mutating `anfSt.props`), while the
+Stack lowering routes the new value through the runtime stack + a rename
+of the top stack-map slot from the value's binding name to the property
+name — `stkSt.props` is never touched. So after the step
+`anfSt'.props ≠ stkSt'.props` and `agreesTagged` cannot hold.
+
+This block adds — *additively*, touching no existing definition — a
+relaxed invariant `agreesTaggedModProps` that drops the props-equality
+conjunct, keeping stack-alignment + outputs-equality. We prove:
+
+* `agreesTagged_imp_modProps` — the relaxed invariant is implied by
+  `agreesTagged` (it coincides on non-`update_prop` bodies, where props
+  equality is maintained as an *extra* fact the relaxed invariant simply
+  forgets);
+* `taggedStackAligned_setProp_freshSlot` — `setProp propName` preserves
+  alignment of a tail stack-map provided `propName` is not a `.prop`
+  slot of that tail;
+* `agreesTaggedModProps_updateProp_depth0_fresh` — the per-step
+  preservation: a depth-0 fresh `update_prop` step preserves
+  `agreesTaggedModProps`.
+
+The relaxed invariant does NOT feed `agreesTagged_chain_preserves`
+directly (that composer is hard-wired to `agreesTagged` on both ends).
+A chain composer over `agreesTaggedModProps` is the next wave; this
+block lands the per-step half plus the coincidence lemma.
+
+`§2.4` isolation: everything here lives in `Stack/AgreesA5.lean`. No
+edit to `simpleStepRel` / `agreesTagged` / `agreesTagged_chain_preserves`
+in `Stack/Agrees.lean`. -/
+
+/-- Relaxed tagged agreement for `update_prop`: drops the
+`anfSt.props = stkSt.props` conjunct of `agreesTagged`, retaining stack
+alignment and output equality. Holds across an `update_prop` step (where
+ANF mutates `props` but the Stack side does not). -/
+def agreesTaggedModProps (tsm : TaggedStackMap) (anfSt : State)
+    (stkSt : StackState) : Prop :=
+  taggedStackAligned tsm anfSt stkSt.stack ∧
+  anfSt.outputs = stkSt.outputs
+
+/-- The relaxed invariant is implied by the base `agreesTagged`: it is
+the same conjunction minus the props-equality clause. This is the
+"coincides with `agreesTagged` when no `update_prop` occurred" direction
+(Q2.ii): on a non-`update_prop` body `agreesTagged` is maintained and
+hence so is its weakening. -/
+theorem agreesTagged_imp_modProps
+    (tsm : TaggedStackMap) (anfSt : State) (stkSt : StackState)
+    (h : agreesTagged tsm anfSt stkSt) :
+    agreesTaggedModProps tsm anfSt stkSt :=
+  ⟨h.1, h.2.2⟩
+
+/-- `setProp propName v` leaves a `.prop`-slot lookup for `q ≠ propName`
+unchanged, and leaves `.param` / `.binding` lookups entirely unchanged
+(those namespaces are disjoint from `props`). -/
+theorem lookupAnfByKind_setProp_other
+    (anfSt : State) (propName : String) (v : Value)
+    (s : String × SlotKind)
+    (hNe : ¬ (s.snd = SlotKind.prop ∧ s.fst = propName)) :
+    lookupAnfByKind (anfSt.setProp propName v) s = lookupAnfByKind anfSt s := by
+  obtain ⟨q, k⟩ := s
+  cases k with
+  | param =>
+      show (anfSt.setProp propName v).lookupParam q = anfSt.lookupParam q
+      unfold State.setProp State.lookupParam
+      rfl
+  | binding =>
+      show (anfSt.setProp propName v).lookupBinding q = anfSt.lookupBinding q
+      unfold State.setProp State.lookupBinding
+      rfl
+  | prop =>
+      show (anfSt.setProp propName v).lookupProp q = anfSt.lookupProp q
+      have hqne : q ≠ propName := by
+        intro hEq; exact hNe ⟨rfl, hEq⟩
+      unfold State.setProp State.lookupProp
+      simp only []
+      show (((propName, v) :: anfSt.props.filter (·.fst != propName)).find?
+              (·.fst == q)).map (·.snd)
+            = (anfSt.props.find? (·.fst == q)).map (·.snd)
+      have hHeadMiss : ((propName, v).fst == q) = false := by
+        simp only [beq_eq_false_iff_ne, ne_eq]
+        exact fun h => hqne h.symm
+      rw [List.find?_cons_of_neg (by simp [hHeadMiss])]
+      congr 1
+      induction anfSt.props with
+      | nil => rfl
+      | cons hd tl ih =>
+          by_cases hHd : (hd.fst != propName) = true
+          · by_cases hMatch : (hd.fst == q) = true
+            · simp only [List.filter, hHd, List.find?, hMatch]
+            · simp only [List.filter, hHd, List.find?, hMatch, Bool.false_eq_true,
+                if_false]
+              exact ih
+          · have hHdFalse : (hd.fst != propName) = false := by
+              simp only [Bool.not_eq_true] at hHd; exact hHd
+            have hHdProp : hd.fst = propName := by
+              have hbeq : (hd.fst == propName) = true := by
+                rw [bne, Bool.not_eq_false'] at hHdFalse; exact hHdFalse
+              exact eq_of_beq hbeq
+            have hHdMissQ : (hd.fst == q) = false := by
+              simp only [beq_eq_false_iff_ne, ne_eq]
+              rw [hHdProp]
+              exact fun h => hqne h.symm
+            simp only [List.filter, hHdFalse, List.find?, hHdMissQ,
+              Bool.false_eq_true, if_false]
+            exact ih
+
+/-- A tagged stack-map slot list is **prop-fresh** for `propName` when no
+slot is a `.prop` slot pointing at `propName`. Under this condition,
+`setProp propName` does not disturb any slot's kind-specific lookup. -/
+def propFreshTsm (tsm : TaggedStackMap) (propName : String) : Prop :=
+  ∀ s ∈ tsm, ¬ (s.snd = SlotKind.prop ∧ s.fst = propName)
+
+/-- `setProp propName v` preserves tagged alignment of a stack-map that is
+prop-fresh for `propName`. The runtime stack is unchanged; only ANF
+`props` is mutated, and prop-freshness guarantees no tracked slot reads
+the mutated entry. -/
+theorem taggedStackAligned_setProp_freshSlot
+    (tsm : TaggedStackMap) (anfSt : State) (stk : List Value)
+    (propName : String) (v : Value)
+    (hFresh : propFreshTsm tsm propName)
+    (h : taggedStackAligned tsm anfSt stk) :
+    taggedStackAligned tsm (anfSt.setProp propName v) stk := by
+  induction tsm generalizing stk with
+  | nil => unfold taggedStackAligned; trivial
+  | cons hd tl ih =>
+      cases stk with
+      | nil => simp [taggedStackAligned] at h
+      | cons hv tlv =>
+          obtain ⟨hHead, hTail⟩ := h
+          have hHdNe : ¬ (hd.snd = SlotKind.prop ∧ hd.fst = propName) :=
+            hFresh hd (by simp)
+          have hTlFresh : propFreshTsm tl propName := by
+            intro s hs; exact hFresh s (by simp [hs])
+          unfold taggedStackAligned
+          refine ⟨?_, ih tlv hTlFresh hTail⟩
+          rw [lookupAnfByKind_setProp_other anfSt propName v hd hHdNe]
+          exact hHead
+
+/-! ## Per-step preservation — depth-0 fresh `update_prop`
+
+The minimal sound first step (Wave 52). A depth-0, fresh `update_prop`
+binding takes a pre-state where the value's binding `ref` sits at the
+head of the tagged stack-map (tagged `.binding`), and produces a
+post-state where:
+
+* the runtime stack is **unchanged** (`stkSt' = stkSt` — the load and
+  cleanup op lists are both empty, see `runOps_removePropEntryOps_eq`
+  and the depth-0 `bringToTop` case);
+* the tagged stack-map head is renamed `(ref, .binding) → (propName,
+  .prop)`;
+* the ANF state is `(anfSt.setProp propName v).addBinding bn v`, where
+  `v` is the value sitting on top of the runtime stack (= `lookupAnf
+  ref` in the pre-state).
+
+We show this step preserves `agreesTaggedModProps`. The props-equality
+conjunct is the one that *cannot* hold (the ANF side mutated `props`, the
+Stack side did not) — which is precisely why the relaxed invariant is
+required. -/
+
+/-- **Per-step preservation (Q2.i).** A depth-0 fresh `update_prop` step
+preserves the relaxed invariant `agreesTaggedModProps`.
+
+Inputs encode the depth-0 fresh case structurally:
+* `hPre` : the pre-state agrees (relaxed) on `(ref, .binding) :: smRest`
+  with the runtime stack `v :: stkRest`;
+* `hTopVal` : the runtime top `v` is the value the head slot resolves to
+  (it is — `hPre.1` already gives `lookupBinding ref = some v`, surfaced
+  here for the post-state's prop slot);
+* `hPropFresh` : `propName` is not a `.prop` slot of `smRest` (the fresh-
+  prop narrowing — guarantees `setProp` does not disturb the tail);
+* `hBnFresh` : `bn` is fresh w.r.t. `untagSm smRest` (the SSA temp the IR
+  assigns to the result; `addBinding bn` must not collide with a tracked
+  binding slot).
+
+The post-state's head slot is `(propName, .prop)`; `addBinding bn v` is
+not tracked by the stack-map (the IR references the prop by name, not the
+temp `bn`), so the post tsm is `(propName, .prop) :: smRest`. -/
+theorem agreesTaggedModProps_updateProp_depth0_fresh
+    (smRest : TaggedStackMap) (anfSt : State) (stkSt : StackState)
+    (bn propName ref : String) (v : Value) (stkRest : List Value)
+    (hStk : stkSt.stack = v :: stkRest)
+    (hPre : agreesTaggedModProps ((ref, SlotKind.binding) :: smRest) anfSt stkSt)
+    (hPropFresh : propFreshTsm smRest propName)
+    (hBnFresh : freshIn bn (untagSm smRest)) :
+    agreesTaggedModProps ((propName, SlotKind.prop) :: smRest)
+      ((anfSt.setProp propName v).addBinding bn v) stkSt := by
+  obtain ⟨hAlign, hOut⟩ := hPre
+  rw [hStk] at hAlign
+  obtain ⟨_hHead, hTail⟩ := hAlign
+  refine ⟨?_, ?_⟩
+  · rw [hStk]
+    unfold taggedStackAligned
+    refine ⟨?_, ?_⟩
+    · -- head slot `(propName, .prop)` resolves to `v` in the post-state:
+      -- `setProp propName v` then `addBinding bn` (which leaves props
+      -- untouched).
+      show lookupAnfByKind ((anfSt.setProp propName v).addBinding bn v)
+            (propName, SlotKind.prop) = some v
+      show ((anfSt.setProp propName v).addBinding bn v).lookupProp propName
+            = some v
+      unfold State.addBinding State.lookupProp State.setProp
+      simp only []
+      show (((propName, v) :: (anfSt.props.filter (·.fst != propName))).find?
+              (·.fst == propName)).map (·.snd) = some v
+      rw [List.find?_cons_of_pos (by simp)]
+      rfl
+    · -- tail alignment: the outermost op in the goal is `addBinding bn`
+      -- (fresh), wrapping `setProp propName` (prop-fresh). Apply
+      -- `addBinding_fresh` outermost, then `setProp_freshSlot` inside.
+      exact taggedStackAligned_addBinding_fresh smRest
+              (anfSt.setProp propName v) stkRest bn v hBnFresh
+              (taggedStackAligned_setProp_freshSlot smRest anfSt stkRest
+                propName v hPropFresh hTail)
+  · -- outputs: neither `setProp` nor `addBinding` touches outputs.
+    show ((anfSt.setProp propName v).addBinding bn v).outputs = stkSt.outputs
+    unfold State.addBinding State.setProp
+    exact hOut
+
+/-! ## Smoke test — concrete single-`update_prop` step
+
+A concrete instantiation of `agreesTaggedModProps_updateProp_depth0_fresh`:
+contract property `count` is updated to `42` via the temp `t0` (resolved
+to `vBigint 42` on the runtime stack), with the result temp `t1`.
+
+Pre-state:
+* tagged stack-map `[(t0, .binding)]` — the value temp at depth 0;
+* ANF state: `bindings = [(t0, vBigint 42)]`, no props yet;
+* runtime stack `[vBigint 42]`, no outputs.
+
+The lemma yields `agreesTaggedModProps [(count, .prop)]` on the post-state
+`(anfSt.setProp "count" 42).addBinding "t1" 42` with the same runtime
+stack. We confirm the relaxed invariant holds — and that the *base*
+`agreesTagged` would NOT (the post ANF `props` carries `count ↦ 42` while
+the runtime `props` stayed empty), which is the entire point. -/
+theorem smoke_agreesTaggedModProps_updateProp_depth0_fresh :
+    agreesTaggedModProps
+      [("count", SlotKind.prop)]
+      (((⟨[], [], [("t0", .vBigint 42)], []⟩ : State).setProp "count"
+          (.vBigint 42)).addBinding "t1" (.vBigint 42))
+      (⟨[.vBigint 42], [], [], [], ByteArray.empty⟩ : StackState) := by
+  have hPre : agreesTaggedModProps
+      [("t0", SlotKind.binding)]
+      (⟨[], [], [("t0", .vBigint 42)], []⟩ : State)
+      (⟨[.vBigint 42], [], [], [], ByteArray.empty⟩ : StackState) := by
+    refine ⟨?_, ?_⟩
+    · unfold taggedStackAligned
+      refine ⟨?_, ?_⟩
+      · show State.lookupBinding _ "t0" = some (.vBigint 42)
+        unfold State.lookupBinding
+        simp [List.find?]
+      · unfold taggedStackAligned; trivial
+    · rfl
+  exact agreesTaggedModProps_updateProp_depth0_fresh
+    [] (⟨[], [], [("t0", .vBigint 42)], []⟩ : State)
+    (⟨[.vBigint 42], [], [], [], ByteArray.empty⟩ : StackState)
+    "t1" "count" "t0" (.vBigint 42) []
+    rfl hPre (by intro s hs; simp at hs) (by unfold freshIn untagSm; simp)
+
+/-- Smoke confirmation that the relaxed invariant is a strict relaxation:
+the base `agreesTagged` does NOT hold on the smoke-test post-state,
+because ANF `props` carries `count ↦ 42` while the runtime `props` is
+empty. This is the props-equality conjunct that `agreesTaggedModProps`
+deliberately drops. -/
+theorem smoke_agreesTagged_fails_after_updateProp :
+    ¬ agreesTagged
+      [("count", SlotKind.prop)]
+      (((⟨[], [], [("t0", .vBigint 42)], []⟩ : State).setProp "count"
+          (.vBigint 42)).addBinding "t1" (.vBigint 42))
+      (⟨[.vBigint 42], [], [], [], ByteArray.empty⟩ : StackState) := by
+  intro h
+  have hProps := h.2.1
+  simp [State.addBinding, State.setProp] at hProps
+
 end Agrees
 end RunarVerification.Stack
