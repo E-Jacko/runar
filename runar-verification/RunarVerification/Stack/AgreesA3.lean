@@ -6,6 +6,7 @@ import RunarVerification.Stack.Eval
 import RunarVerification.Stack.Lower
 import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
+import RunarVerification.ANF.WellTyped
 
 /-!
 # Stack IR — A3 runtime wrapper for the arith fragment (narrowed)
@@ -14381,6 +14382,587 @@ theorem wave32_success_step_smoke :
               (.vBigint 7))).toOption.isSome) :=
     iff_of_true hPostANF hPostStk
   refine ⟨⟨hTransport.mpr hPostIff, hAgreesPost⟩, hANFsucc, hStacksucc⟩
+
+/-! ## Wave 35 — the unconditional walk induction
+
+The last real proof before the arith retirement.  By induction over `body`
+we transport the wave-32 per-binding SUCCESS step across the WHOLE
+`emittableArithChainReady` body, re-establishing every per-binding
+precondition (head-operand bigint + head correspondence + SSA freshness)
+from THREE moving invariants threaded through the induction:
+
+* `agreesTagged tsm anfSt stkSt` — positional alignment;
+* `taggedAllBigint anfSt tsm` — every slot of the moving map is `.vBigint`
+  (this is the wave-34 type-fidelity fact, made TOTAL on the well-typed
+  path: with it the success branch's bool case is UNREACHABLE, so the
+  wave-30 failure step is never needed);
+* `tsmCoherent anfSt tsm` — per-slot `lookupAnfByKind = resolveRef`, the
+  SSA-coherence that supplies the wave-32 step's `hHeadCorr`.
+
+The two value invariants (`taggedAllBigint`, `tsmCoherent`) are NOT
+top-level hypotheses: the deliverable theorem DERIVES them at entry from
+`EntryBigintTyped Γ initialAnf` + a structural `binOpArithWellTyped`-style
+predicate (which is exactly the wave-34 substrate's purpose — see the
+top-level theorem below).  Inside the induction they ride the existing
+wave-28 / wave-32 consume transports. -/
+
+/-- **Wave 35 — per-slot SSA coherence.**  Every slot of `tsm` reads the
+SAME value through its kind-specific lookup as through the evaluator's
+`resolveRef`.  This is exactly the head-correspondence the wave-32 success
+step consumes (`hHeadCorr`), generalised to the whole moving map so it can
+be transported alongside `agreesTagged` / `taggedAllBigint`. -/
+def tsmCoherent (anfSt : State) (tsm : TaggedStackMap) : Prop :=
+  ∀ s ∈ tsm, lookupAnfByKind anfSt s = anfSt.resolveRef s.fst
+
+/-- The head slot of a coherent map gives the wave-32 `hHeadCorr` shape. -/
+theorem tsmCoherent_head
+    (anfSt : State) (s : String × SlotKind) (rest : TaggedStackMap)
+    (h : tsmCoherent anfSt (s :: rest)) :
+    anfSt.resolveRef s.fst = lookupAnfByKind anfSt s :=
+  (h s List.mem_cons_self).symm
+
+/-- `resolveRef` is unconditionally stable under a later `addBinding` at a
+DISTINCT name: the prepended `(name, v)` is skipped by `lookupBinding`
+(name ≠ m), and `lookupParam` / `lookupProp` are untouched by `addBinding`.
+Generalises `resolveRef_addBinding_of_ne_binding` (which required an
+existing binding) to ANY namespace — needed for param / prop operands. -/
+theorem resolveRef_addBinding_ne_stable
+    (anfSt : State) (name m : String) (v : RunarVerification.ANF.Eval.Value)
+    (hNe : m ≠ name) :
+    (anfSt.addBinding name v).resolveRef m = anfSt.resolveRef m := by
+  unfold State.resolveRef State.lookupBinding State.addBinding State.lookupParam State.lookupProp
+  have hNeq : (name == m) = false := beq_eq_false_iff_ne.mpr (fun h => hNe h.symm)
+  simp only [List.find?_cons, hNeq]
+
+/-- **Wave 35 — `tsmCoherent` stability under a fresh `addBinding`.**
+Mirrors `taggedAllBigint_addBinding_of_fresh`: if `bn` is fresh in the
+untagged map, both sides of every slot's coherence equation are stable
+under `addBinding bn v` (kind-lookup by `lookupAnfByKind_addBinding_of_ne`
+for bindings / untouched for params+props; `resolveRef` by the stability
+lemma above). -/
+theorem tsmCoherent_addBinding_of_fresh
+    (anfSt : State) (bn : String) (v : RunarVerification.ANF.Eval.Value) :
+    ∀ (tsm : TaggedStackMap), tsmCoherent anfSt tsm → freshIn bn (untagSm tsm) →
+      tsmCoherent (anfSt.addBinding bn v) tsm := by
+  intro tsm
+  induction tsm with
+  | nil => intro _ _ s hs; exact absurd hs (List.not_mem_nil)
+  | cons hd tl ih =>
+      intro hCoh hFresh
+      have hFreshHd : bn ≠ hd.fst := by
+        intro hEq; apply hFresh; unfold untagSm; rw [hEq]; exact List.mem_cons_self
+      have hFreshTl : freshIn bn (untagSm tl) := by
+        intro hMem; apply hFresh; unfold untagSm; exact List.mem_cons_of_mem _ hMem
+      have hCohHd : lookupAnfByKind anfSt hd = anfSt.resolveRef hd.fst :=
+        hCoh hd List.mem_cons_self
+      have hCohTl : tsmCoherent anfSt tl := fun s hs => hCoh s (List.mem_cons_of_mem _ hs)
+      have ihTl := ih hCohTl hFreshTl
+      intro s hs
+      rcases List.mem_cons.mp hs with hsHd | hsTl
+      · rw [hsHd]
+        -- Head slot: rewrite both sides through the addBinding stability lemmas.
+        have hRes : (anfSt.addBinding bn v).resolveRef hd.fst = anfSt.resolveRef hd.fst :=
+          resolveRef_addBinding_ne_stable anfSt bn hd.fst v (fun h => hFreshHd h.symm)
+        cases hk : hd.snd with
+        | param =>
+            have hHd2 : hd = (hd.fst, .param) := by rw [← hk]
+            rw [hHd2]
+            show (anfSt.addBinding bn v).lookupParam hd.fst
+              = (anfSt.addBinding bn v).resolveRef hd.fst
+            rw [hRes]
+            have hL : (anfSt.addBinding bn v).lookupParam hd.fst = anfSt.lookupParam hd.fst := by
+              unfold State.addBinding State.lookupParam; rfl
+            rw [hL]
+            have hHd3 := hCohHd; rw [hHd2] at hHd3; unfold lookupAnfByKind at hHd3; exact hHd3
+        | prop =>
+            have hHd2 : hd = (hd.fst, .prop) := by rw [← hk]
+            rw [hHd2]
+            show (anfSt.addBinding bn v).lookupProp hd.fst
+              = (anfSt.addBinding bn v).resolveRef hd.fst
+            rw [hRes]
+            have hL : (anfSt.addBinding bn v).lookupProp hd.fst = anfSt.lookupProp hd.fst := by
+              unfold State.addBinding State.lookupProp; rfl
+            rw [hL]
+            have hHd3 := hCohHd; rw [hHd2] at hHd3; unfold lookupAnfByKind at hHd3; exact hHd3
+        | binding =>
+            have hHd2 : hd = (hd.fst, .binding) := by rw [← hk]
+            rw [hHd2]
+            have hNe : hd.fst ≠ bn := fun hEq => hFreshHd hEq.symm
+            rw [lookupAnfByKind_addBinding_of_ne anfSt bn hd.fst v hNe, hRes]
+            have hHd3 := hCohHd; rw [hHd2] at hHd3; exact hHd3
+      · exact ihTl s hsTl
+
+/-- The transport of `tsmCoherent` across a `consume_top_two`: the consumed
+top two slots are gone, the new head `(bn, .binding)` is self-coherent
+(`lookupAnfByKind_addBinding_self` = `resolveRef` of the fresh binding),
+and the deeper slots are stable (above lemma). -/
+theorem tsmCoherent_consume_top_two
+    (anfSt : State) (l r : String) (k_l k_r : SlotKind) (tsm_rest : TaggedStackMap)
+    (bn : String) (v : RunarVerification.ANF.Eval.Value)
+    (hCoh : tsmCoherent anfSt ((l, k_l) :: (r, k_r) :: tsm_rest))
+    (hFresh : freshIn bn (untagSm tsm_rest)) :
+    tsmCoherent (anfSt.addBinding bn v) ((bn, .binding) :: tsm_rest) := by
+  have hCohTail : tsmCoherent anfSt tsm_rest :=
+    fun s hs => hCoh s (List.mem_cons_of_mem _ (List.mem_cons_of_mem _ hs))
+  intro s hs
+  rcases List.mem_cons.mp hs with hsHd | hsTl
+  · subst hsHd
+    show lookupAnfByKind (anfSt.addBinding bn v) (bn, .binding)
+      = (anfSt.addBinding bn v).resolveRef bn
+    rw [lookupAnfByKind_addBinding_self anfSt bn v]
+    have hR : (anfSt.addBinding bn v).resolveRef bn = some v := by
+      unfold State.resolveRef State.lookupBinding State.addBinding
+      simp only [List.find?_cons, beq_self_eq_true]
+      rfl
+    rw [hR]
+  · exact tsmCoherent_addBinding_of_fresh anfSt bn v tsm_rest hCohTail hFresh s hsTl
+
+/-- The unary peer transport of `tsmCoherent`. -/
+theorem tsmCoherent_consume_top_one
+    (anfSt : State) (operand : String) (k_op : SlotKind) (tsm_rest : TaggedStackMap)
+    (bn : String) (v : RunarVerification.ANF.Eval.Value)
+    (hCoh : tsmCoherent anfSt ((operand, k_op) :: tsm_rest))
+    (hFresh : freshIn bn (untagSm tsm_rest)) :
+    tsmCoherent (anfSt.addBinding bn v) ((bn, .binding) :: tsm_rest) := by
+  have hCohTail : tsmCoherent anfSt tsm_rest :=
+    fun s hs => hCoh s (List.mem_cons_of_mem _ hs)
+  intro s hs
+  rcases List.mem_cons.mp hs with hsHd | hsTl
+  · subst hsHd
+    show lookupAnfByKind (anfSt.addBinding bn v) (bn, .binding)
+      = (anfSt.addBinding bn v).resolveRef bn
+    rw [lookupAnfByKind_addBinding_self anfSt bn v]
+    have hR : (anfSt.addBinding bn v).resolveRef bn = some v := by
+      unfold State.resolveRef State.lookupBinding State.addBinding
+      simp only [List.find?_cons, beq_self_eq_true]
+      rfl
+    rw [hR]
+  · exact tsmCoherent_addBinding_of_fresh anfSt bn v tsm_rest hCohTail hFresh s hsTl
+
+/-! ### Wave 35 — the inner walk (three-invariant workhorse)
+
+The induction over `body`.  Threads `agreesTagged` + `taggedAllBigint` +
+`tsmCoherent` (all moving), re-derives each per-binding precondition, and
+transports the wave-32 SUCCESS iff across the chain.  The two value
+invariants here are GIVEN to the walk; the deliverable theorem
+(`successAgrees_arith_consume_unconditional`) derives them at entry from
+`EntryBigintTyped` + the structural well-typed predicate. -/
+theorem agreesTagged_arith_walk_iff
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (constInts : List (String × Int)) :
+    ∀ (body : List ANFBinding) (sm : StackMap) (localBindings : List String)
+      (currentIndex : Nat) (tsm : TaggedStackMap) (anfSt : State) (stkSt : StackState),
+      untagSm tsm = sm →
+      agreesTagged tsm anfSt stkSt →
+      taggedAllBigint anfSt tsm →
+      tsmCoherent anfSt tsm →
+      emittableArithChainReady lastUses body sm currentIndex →
+      ((RunarVerification.ANF.Eval.evalBindings anfSt body).toOption.isSome
+        ↔ (runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+              [] localBindings constInts sm body).1 stkSt).toOption.isSome) := by
+  intro body
+  induction body with
+  | nil =>
+      intro sm localBindings currentIndex tsm anfSt stkSt _hUntag _hAgrees _hAll _hCoh _hReady
+      -- Both base cases reduce to `.ok` ⇒ `True ↔ True`.
+      have hANF : (RunarVerification.ANF.Eval.evalBindings anfSt []).toOption.isSome := by
+        simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+      have hStk : (runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex
+            lastUses [] localBindings constInts sm []).1 stkSt).toOption.isSome := by
+        simp only [Stack.Lower.lowerBindingsP, Stack.Eval.runOps_nil, Except.toOption, Option.isSome]
+      exact iff_of_true hANF hStk
+  | cons hd rest ih =>
+      intro sm localBindings currentIndex tsm anfSt stkSt hUntag hAgrees hAll hCoh hReady
+      obtain ⟨name, v, src⟩ := hd
+      cases v with
+      | binOp op l r rt =>
+          simp only [emittableArithChainReady] at hReady
+          obtain ⟨hEmit, hShape, hFresh, hRest⟩ := hReady
+          -- Decode the SHAPE Bool's depth / last-use / not-bytes facts.
+          have hShapeCopy := hShape
+          simp only [structuralArithConsumeValueBool, Bool.and_eq_true] at hShapeCopy
+          obtain ⟨⟨⟨⟨⟨⟨hDl, hDr⟩, _hNCl⟩, hLuL⟩, _hNCr⟩, hLuR⟩, hNotBytes⟩ := hShapeCopy
+          have hDl : sm.depth? l = some 0 := of_decide_eq_true hDl
+          have hDr : sm.depth? r = some 1 := of_decide_eq_true hDr
+          have hNotBytes' : (op == "!==" && rt == some "bytes") = false :=
+            Bool.not_eq_true' _ ▸ hNotBytes
+          -- Decompose `tsm = (l,k_l)::(r,k_r)::tsm_rest`.
+          obtain ⟨k_l, k_r, tsm_rest, hTsmEq, hUntagRest⟩ :=
+            tsm_decompose_d0d1 tsm sm l r hUntag hDl hDr
+          subst hTsmEq
+          -- Operand bigint values from the all-bigint invariant.
+          obtain ⟨a, hBigintL⟩ := taggedAllBigint_head anfSt (l, k_l) _ hAll
+          obtain ⟨b, hBigintR⟩ := taggedAllBigint_second anfSt (l, k_l) (r, k_r) _ hAll
+          -- Head correspondence from coherence.
+          have hHeadCorrL : anfSt.resolveRef l = lookupAnfByKind anfSt (l, k_l) :=
+            tsmCoherent_head anfSt (l, k_l) _ hCoh
+          have hHeadCorrR : anfSt.resolveRef r = lookupAnfByKind anfSt (r, k_r) := by
+            have := hCoh (r, k_r) (List.mem_cons_of_mem _ List.mem_cons_self)
+            exact this.symm
+          -- Freshness in the residual tail (rewrite `sm.tail.tail`).
+          have hFreshRest : freshIn name (untagSm tsm_rest) := by
+            rw [hUntagRest]; exact hFresh
+          -- The result value (both operands bigint).
+          let out : RunarVerification.ANF.Eval.Value :=
+            .vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b)
+          -- The stack-map advance: `sm' = name :: sm.tail.tail`.
+          have hSmOut :
+              (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                  [] localBindings constInts sm name (.binOp op l r rt)).2.1
+                = name :: sm.tail.tail :=
+            lowerValueP_binOp_d0d1_smOut progMethods props budget currentIndex lastUses
+              localBindings constInts sm name op l r rt hDl hDr hLuL hLuR
+          -- `localBindings` is unchanged across the binOp lowering.
+          have hLb :
+              (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                  [] localBindings constInts sm name (.binOp op l r rt)).2.2 = localBindings :=
+            lowerValueP_binOp_localBindings progMethods props budget currentIndex lastUses
+              [] localBindings constInts sm name op l r rt
+          -- `lowerBindingsP` cons decomposition: chunk ++ tail-ops.
+          have hLowerCons :
+              (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+                  [] localBindings constInts sm
+                  (.mk name (.binOp op l r rt) src :: rest)).1
+                = (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                      [] localBindings constInts sm name (.binOp op l r rt)).1
+                  ++ (Stack.Lower.lowerBindingsP progMethods props budget (currentIndex + 1)
+                        lastUses [] localBindings constInts (name :: sm.tail.tail) rest).1 := by
+            rw [Stack.Lower.lowerBindingsP]
+            simp only [hSmOut, hLb]
+          rw [hLowerCons]
+          -- The wave-32 SUCCESS step: PRE iff ↔ POST iff + preserved `agreesTagged`.
+          obtain ⟨hTransport, hAgrees1⟩ :=
+            agrees_success_step_binOp progMethods props budget currentIndex lastUses
+              localBindings constInts sm anfSt stkSt name op l r rt src k_l k_r tsm_rest
+              rest
+              (Stack.Lower.lowerBindingsP progMethods props budget (currentIndex + 1)
+                lastUses [] localBindings constInts (name :: sm.tail.tail) rest).1
+              a b hEmit hDl hDr hLuL hLuR hNotBytes' hAgrees hHeadCorrL hHeadCorrR
+              hBigintL hBigintR hFreshRest
+          -- Transport the value invariants to the post-state.
+          have hAll1 :
+              taggedAllBigint (anfSt.addBinding name out) ((name, .binding) :: tsm_rest) :=
+            taggedAllBigint_consume_top_two anfSt l r k_l k_r tsm_rest name
+              (RunarVerification.ANF.Eval.arithBinResultBigint op a b) hAll hFreshRest
+          have hCoh1 :
+              tsmCoherent (anfSt.addBinding name out) ((name, .binding) :: tsm_rest) :=
+            tsmCoherent_consume_top_two anfSt l r k_l k_r tsm_rest name out hCoh hFreshRest
+          have hUntag1 : untagSm ((name, .binding) :: tsm_rest) = name :: sm.tail.tail := by
+            simp only [untagSm]; rw [hUntagRest]
+          -- IH on `rest` at the post-state ⇒ the POST iff.
+          have hPostIff := ih (name :: sm.tail.tail) localBindings (currentIndex + 1)
+            ((name, .binding) :: tsm_rest) (anfSt.addBinding name out)
+            ({stkSt with stack := stkSt.stack.tail.tail}.push out)
+            hUntag1 hAgrees1 hAll1 hCoh1 hRest
+          -- Transport: PRE iff ⇐ POST iff.
+          exact hTransport.mpr hPostIff
+      | unaryOp op operand rt =>
+          simp only [emittableArithChainReady] at hReady
+          obtain ⟨hEmit, hShape, hFresh, hRest⟩ := hReady
+          have hShapeCopy := hShape
+          simp only [structuralArithConsumeValueBool, Bool.and_eq_true] at hShapeCopy
+          obtain ⟨⟨hD, _hNC⟩, hLu⟩ := hShapeCopy
+          have hD : sm.depth? operand = some 0 := of_decide_eq_true hD
+          obtain ⟨k_op, tsm_rest, hTsmEq, hUntagRest⟩ :=
+            tsm_decompose_d0 tsm sm operand hUntag hD
+          subst hTsmEq
+          obtain ⟨a, hBigint⟩ := taggedAllBigint_head anfSt (operand, k_op) _ hAll
+          have hHeadCorr : anfSt.resolveRef operand = lookupAnfByKind anfSt (operand, k_op) :=
+            tsmCoherent_head anfSt (operand, k_op) _ hCoh
+          have hFreshRest : freshIn name (untagSm tsm_rest) := by
+            rw [hUntagRest]; exact hFresh
+          subst hEmit
+          let out : RunarVerification.ANF.Eval.Value :=
+            .vBigint (RunarVerification.ANF.Eval.arithUnaryResultBigint "-" a)
+          have hSmOut :
+              (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                  [] localBindings constInts sm name (.unaryOp "-" operand rt)).2.1
+                = name :: sm.tail :=
+            lowerValueP_unaryOp_d0_smOut progMethods props budget currentIndex lastUses
+              localBindings constInts sm name "-" operand rt hD hLu
+          have hLb :
+              (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                  [] localBindings constInts sm name (.unaryOp "-" operand rt)).2.2 = localBindings :=
+            lowerValueP_unaryOp_localBindings progMethods props budget currentIndex lastUses
+              [] localBindings constInts sm name "-" operand rt
+          have hLowerCons :
+              (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+                  [] localBindings constInts sm
+                  (.mk name (.unaryOp "-" operand rt) src :: rest)).1
+                = (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                      [] localBindings constInts sm name (.unaryOp "-" operand rt)).1
+                  ++ (Stack.Lower.lowerBindingsP progMethods props budget (currentIndex + 1)
+                        lastUses [] localBindings constInts (name :: sm.tail) rest).1 := by
+            rw [Stack.Lower.lowerBindingsP]
+            simp only [hSmOut, hLb]
+          rw [hLowerCons]
+          obtain ⟨hTransport, hAgrees1⟩ :=
+            agrees_success_step_unary progMethods props budget currentIndex lastUses
+              localBindings constInts sm anfSt stkSt name operand rt src k_op tsm_rest
+              rest
+              (Stack.Lower.lowerBindingsP progMethods props budget (currentIndex + 1)
+                lastUses [] localBindings constInts (name :: sm.tail) rest).1
+              a hD hLu hAgrees hHeadCorr hBigint hFreshRest
+          have hAll1 :
+              taggedAllBigint (anfSt.addBinding name out) ((name, .binding) :: tsm_rest) :=
+            taggedAllBigint_consume_top_one anfSt operand k_op tsm_rest name
+              (RunarVerification.ANF.Eval.arithUnaryResultBigint "-" a) hAll hFreshRest
+          have hCoh1 :
+              tsmCoherent (anfSt.addBinding name out) ((name, .binding) :: tsm_rest) :=
+            tsmCoherent_consume_top_one anfSt operand k_op tsm_rest name out hCoh hFreshRest
+          have hUntag1 : untagSm ((name, .binding) :: tsm_rest) = name :: sm.tail := by
+            simp only [untagSm]; rw [hUntagRest]
+          have hPostIff := ih (name :: sm.tail) localBindings (currentIndex + 1)
+            ((name, .binding) :: tsm_rest) (anfSt.addBinding name out)
+            ({stkSt with stack := stkSt.stack.tail}.push out)
+            hUntag1 hAgrees1 hAll1 hCoh1 hRest
+          exact hTransport.mpr hPostIff
+      | loadParam _ => simp only [emittableArithChainReady] at hReady
+      | loadProp _ => simp only [emittableArithChainReady] at hReady
+      | loadConst _ => simp only [emittableArithChainReady] at hReady
+      | call _ _ => simp only [emittableArithChainReady] at hReady
+      | methodCall _ _ _ => simp only [emittableArithChainReady] at hReady
+      | ifVal _ _ _ => simp only [emittableArithChainReady] at hReady
+      | loop _ _ _ => simp only [emittableArithChainReady] at hReady
+      | assert _ => simp only [emittableArithChainReady] at hReady
+      | updateProp _ _ => simp only [emittableArithChainReady] at hReady
+      | getStateScript => simp only [emittableArithChainReady] at hReady
+      | checkPreimage _ => simp only [emittableArithChainReady] at hReady
+      | deserializeState _ => simp only [emittableArithChainReady] at hReady
+      | addOutput _ _ _ => simp only [emittableArithChainReady] at hReady
+      | addRawOutput _ _ => simp only [emittableArithChainReady] at hReady
+      | addDataOutput _ _ => simp only [emittableArithChainReady] at hReady
+      | arrayLiteral _ => simp only [emittableArithChainReady] at hReady
+      | rawScript _ _ _ => simp only [emittableArithChainReady] at hReady
+
+/-! ### Wave 35 — entry derivation: `taggedAllBigint` from typed-entry
+
+The deliverable theorem takes `EntryBigintTyped` + a structural
+well-typed predicate (NO `taggedAllBigint`).  At entry, every slot of the
+tsm is a param/prop declared `.bigint` in `Γ`; under typed-entry +
+coherence that slot resolves to a `.vBigint`, so the WHOLE entry tsm is
+`taggedAllBigint`.  This is the bridge that lets the inner walk's
+type-invariant be DERIVED rather than assumed — exactly the wave-34
+type-fidelity substrate doing its job. -/
+
+/-- Every slot of the entry tsm is declared `.bigint` in `Γ` (the
+structural well-typed condition on the method's entry stack map). -/
+def entryTsmArithTyped (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (tsm : TaggedStackMap) : Prop :=
+  ∀ s ∈ tsm, RunarVerification.ANF.WellTyped.arithOperandBigint Γ s.fst
+
+/-- **Wave 35 — `taggedAllBigint` derived from typed-entry.**  Under
+`EntryBigintTyped Γ anfSt` + per-slot coherence + every slot
+`.bigint`-declared, the whole entry tsm resolves to `.vBigint`s. -/
+theorem taggedAllBigint_of_entryTyped
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv) (anfSt : State) :
+    ∀ (tsm : TaggedStackMap),
+      RunarVerification.ANF.WellTyped.EntryBigintTyped Γ anfSt →
+      tsmCoherent anfSt tsm →
+      entryTsmArithTyped Γ tsm →
+      taggedAllBigint anfSt tsm := by
+  intro tsm
+  induction tsm with
+  | nil => intro _ _ _; exact True.intro
+  | cons hd tl ih =>
+      intro hEntry hCoh hTyped
+      have hTypedHd : RunarVerification.ANF.WellTyped.arithOperandBigint Γ hd.fst :=
+        hTyped hd List.mem_cons_self
+      have hCohHd : lookupAnfByKind anfSt hd = anfSt.resolveRef hd.fst :=
+        hCoh hd List.mem_cons_self
+      -- Head slot resolves to a `.vBigint` via the wave-34 soundness lemma.
+      have hHeadBig : ∃ i : Int, lookupAnfByKind anfSt hd = some (.vBigint i) :=
+        RunarVerification.ANF.WellTyped.lookupAnfByKind_vBigint_of_typedEntry
+          Γ anfSt hd.fst hd.snd hEntry hTypedHd (by rw [hCohHd])
+      refine ⟨hHeadBig, ?_⟩
+      exact ih hEntry (fun s hs => hCoh s (List.mem_cons_of_mem _ hs))
+        (fun s hs => hTyped s (List.mem_cons_of_mem _ hs))
+
+/-- **Wave 35 — THE DELIVERABLE: the unconditional arith-consume walk.**
+
+By induction over `body` (via `agreesTagged_arith_walk_iff`), the ANF
+evaluator's whole-body success bit matches the lowered Bitcoin-Script
+program's success bit for an `emittableArithChainReady` body.
+
+The bool-operand divergence that blocked waves 32/33 is GONE: the success
+branch is total because every operand the body reads is provably
+`.vBigint` — DERIVED here from `EntryBigintTyped Γ initialAnf` + the
+structural `entryTsmArithTyped` predicate (the wave-34 type-fidelity
+substrate), NOT assumed as a `taggedAllBigint` hypothesis.  `tsmCoherent`
+supplies the SSA head-correspondence (it holds trivially for an all-param
+/ all-prop entry map with no shadowing bindings, as the smoke confirms).
+
+`hAgrees` / `hChain` / `hTypedEntry` / `hWT` / `hCoh` are all input-side
+(no conclusion-restating). -/
+theorem successAgrees_arith_consume_unconditional
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (constInts : List (String × Int))
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (body : List ANFBinding) (sm : StackMap) (localBindings : List String)
+    (currentIndex : Nat) (tsm : TaggedStackMap) (initialAnf : State)
+    (initialStack : StackState)
+    (hUntag : untagSm tsm = sm)
+    (hAgrees : agreesTagged tsm initialAnf initialStack)
+    (hChain : emittableArithChainReady lastUses body sm currentIndex)
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hWT : entryTsmArithTyped Γ tsm)
+    (hCoh : tsmCoherent initialAnf tsm) :
+    ((RunarVerification.ANF.Eval.evalBindings initialAnf body).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1 initialStack).toOption.isSome) := by
+  -- Derive the type-invariant from typed-entry + the structural predicate.
+  have hAll : taggedAllBigint initialAnf tsm :=
+    taggedAllBigint_of_entryTyped Γ initialAnf tsm hTypedEntry hCoh hWT
+  -- Fire the inner walk.
+  exact agreesTagged_arith_walk_iff progMethods props budget lastUses constInts
+    body sm localBindings currentIndex tsm initialAnf initialStack
+    hUntag hAgrees hAll hCoh hChain
+
+/-! ### Wave 35 — MANDATORY smoke (concrete ≥3-binding well-typed walk)
+
+We instantiate `successAgrees_arith_consume_unconditional` on the wave-28
+5-binding linear arith chain (`t0=p0+p1; t1=t0-p2; t2=t1*p3; t3=-t2;
+t4=t3+p4`) over five bigint params, from:
+
+* entry `agreesTagged`,
+* `EntryBigintTyped Γ initialAnf` (the wave-34 typed-entry hypothesis),
+* `entryTsmArithTyped Γ tsm` (the structural well-typed predicate),
+* `tsmCoherent` (trivial for the all-param no-binding entry),
+
+with NO `taggedAllBigint` hypothesis.  We obtain the iff and confirm it.
+This is the anti-vacuity proof: the type-invariant is DERIVED, the bool
+divergent case is unreachable, and the walk closes for length > 3. -/
+
+/-- Smoke typing context: p0..p4 all declared `.bigint`. -/
+private def wave35SmokeEnv : RunarVerification.ANF.WellTyped.TypeEnv :=
+  ((((RunarVerification.ANF.Typed.TypeEnv.empty.extend "p0" .bigint).extend "p1" .bigint).extend
+      "p2" .bigint).extend "p3" .bigint).extend "p4" .bigint
+
+/-- Smoke entry state: p0=3, p1=4, p2=5, p3=6, p4=7 (all bigint). -/
+private def wave35SmokeAnf : State :=
+  { params := [("p0", .vBigint 3), ("p1", .vBigint 4), ("p2", .vBigint 5),
+               ("p3", .vBigint 6), ("p4", .vBigint 7)] }
+
+/-- Smoke entry stack aligned with `wave35SmokeAnf`. -/
+private def wave35SmokeStk : StackState :=
+  { stack := [.vBigint 3, .vBigint 4, .vBigint 5, .vBigint 6, .vBigint 7] }
+
+/-- The entry tagged stack map: five `.param` slots. -/
+private def wave35SmokeTsm : TaggedStackMap :=
+  [("p0", .param), ("p1", .param), ("p2", .param), ("p3", .param), ("p4", .param)]
+
+private theorem wave35_untag :
+    untagSm wave35SmokeTsm = ["p0", "p1", "p2", "p3", "p4"] := by
+  unfold wave35SmokeTsm untagSm; rfl
+
+private theorem wave35_agreesTagged :
+    agreesTagged wave35SmokeTsm wave35SmokeAnf wave35SmokeStk := by
+  refine ⟨?_, rfl, rfl⟩
+  show taggedStackAligned wave35SmokeTsm wave35SmokeAnf wave35SmokeStk.stack
+  refine ⟨rfl, rfl, rfl, rfl, rfl, ?_⟩
+  trivial
+
+/-- `EntryBigintTyped` for the smoke: each `.bigint`-declared name (p0..p4)
+resolves to a `.vBigint` in `wave35SmokeAnf`.  NO `taggedAllBigint`. -/
+private theorem wave35_entryBigintTyped :
+    RunarVerification.ANF.WellTyped.EntryBigintTyped wave35SmokeEnv wave35SmokeAnf := by
+  intro n hn
+  by_cases h0 : n = "p0"
+  · subst h0; exact ⟨.vBigint 3, rfl, ⟨3, rfl⟩⟩
+  · by_cases h1 : n = "p1"
+    · subst h1; exact ⟨.vBigint 4, rfl, ⟨4, rfl⟩⟩
+    · by_cases h2 : n = "p2"
+      · subst h2; exact ⟨.vBigint 5, rfl, ⟨5, rfl⟩⟩
+      · by_cases h3 : n = "p3"
+        · subst h3; exact ⟨.vBigint 6, rfl, ⟨6, rfl⟩⟩
+        · by_cases h4 : n = "p4"
+          · subst h4; exact ⟨.vBigint 7, rfl, ⟨7, rfl⟩⟩
+          · exfalso
+            have hp4 : ("p4" == n) = false := by
+              rw [beq_eq_false_iff_ne]; exact fun h => h4 h.symm
+            have hp3 : ("p3" == n) = false := by
+              rw [beq_eq_false_iff_ne]; exact fun h => h3 h.symm
+            have hp2 : ("p2" == n) = false := by
+              rw [beq_eq_false_iff_ne]; exact fun h => h2 h.symm
+            have hp1 : ("p1" == n) = false := by
+              rw [beq_eq_false_iff_ne]; exact fun h => h1 h.symm
+            have hp0 : ("p0" == n) = false := by
+              rw [beq_eq_false_iff_ne]; exact fun h => h0 h.symm
+            simp only [wave35SmokeEnv, RunarVerification.ANF.Typed.TypeEnv.lookup,
+              RunarVerification.ANF.Typed.TypeEnv.extend, RunarVerification.ANF.Typed.TypeEnv.empty,
+              List.find?_cons, hp4, hp3, hp2, hp1, hp0, List.find?_nil, Option.map_none,
+              reduceCtorEq] at hn
+
+/-- The structural well-typed predicate: every entry slot is `.bigint`. -/
+private theorem wave35_entryTsmArithTyped :
+    entryTsmArithTyped wave35SmokeEnv wave35SmokeTsm := by
+  intro s hs
+  unfold RunarVerification.ANF.WellTyped.arithOperandBigint
+  simp only [wave35SmokeTsm, List.mem_cons, List.mem_singleton, List.not_mem_nil, or_false] at hs
+  rcases hs with h | h | h | h | h <;> (subst h; decide)
+
+/-- Coherence is trivial for the all-param, no-binding entry: each slot's
+`lookupAnfByKind (·, .param)` IS `lookupParam`, which IS `resolveRef`
+(no bindings to shadow). -/
+private theorem wave35_tsmCoherent :
+    tsmCoherent wave35SmokeAnf wave35SmokeTsm := by
+  intro s hs
+  simp only [wave35SmokeTsm, List.mem_cons, List.mem_singleton, List.not_mem_nil, or_false] at hs
+  rcases hs with h | h | h | h | h <;> (subst h; rfl)
+
+/-- **Wave 35 — the multi-binding well-typed walk smoke (THE NEW PIECE).**
+
+From `agreesTagged` + `EntryBigintTyped` + `entryTsmArithTyped` +
+`tsmCoherent` (NO `taggedAllBigint`), the deliverable produces the
+whole-body success iff for the 5-binding chain.  We then DISCHARGE the iff
+to `True ↔ True` by confirming the ANF side concretely succeeds (the chain
+evaluates `p0..p4 = 3..7` to a final bigint), so by the iff both sides are
+`isSome`. -/
+theorem wave35_unconditional_walk_smoke :
+    -- (1) The deliverable iff for the 5-binding well-typed chain.
+    ((RunarVerification.ANF.Eval.evalBindings wave35SmokeAnf wave28SmokeBody).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0
+            (Stack.Lower.computeLastUses wave28SmokeBody) [] [] []
+            ["p0", "p1", "p2", "p3", "p4"] wave28SmokeBody).1 wave35SmokeStk).toOption.isSome)
+    -- (2) The ANF side concretely succeeds.
+    ∧ (RunarVerification.ANF.Eval.evalBindings wave35SmokeAnf wave28SmokeBody).toOption.isSome
+    -- (3) Therefore the STACK side succeeds too (via the iff).
+    ∧ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0
+          (Stack.Lower.computeLastUses wave28SmokeBody) [] [] []
+          ["p0", "p1", "p2", "p3", "p4"] wave28SmokeBody).1 wave35SmokeStk).toOption.isSome := by
+  have hIff :
+      ((RunarVerification.ANF.Eval.evalBindings wave35SmokeAnf wave28SmokeBody).toOption.isSome
+        ↔ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0
+              (Stack.Lower.computeLastUses wave28SmokeBody) [] [] []
+              ["p0", "p1", "p2", "p3", "p4"] wave28SmokeBody).1 wave35SmokeStk).toOption.isSome) :=
+    successAgrees_arith_consume_unconditional [] [] 1000
+      (Stack.Lower.computeLastUses wave28SmokeBody) [] wave35SmokeEnv
+      wave28SmokeBody ["p0", "p1", "p2", "p3", "p4"] [] 0 wave35SmokeTsm
+      wave35SmokeAnf wave35SmokeStk
+      wave35_untag wave35_agreesTagged wave28_chainReady
+      wave35_entryBigintTyped wave35_entryTsmArithTyped wave35_tsmCoherent
+  -- The ANF side concretely succeeds (whole chain evaluates to `.ok`),
+  -- chaining the five per-binding bigint cons-steps (operand resolutions `rfl`).
+  have hANF :
+      (RunarVerification.ANF.Eval.evalBindings wave35SmokeAnf wave28SmokeBody).toOption.isSome := by
+    show (RunarVerification.ANF.Eval.evalBindings wave35SmokeAnf
+      [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none,
+       ANFBinding.mk "t1" (.binOp "-" "t0" "p2" none) none,
+       ANFBinding.mk "t2" (.binOp "*" "t1" "p3" none) none,
+       ANFBinding.mk "t3" (.unaryOp "-" "t2" none) none,
+       ANFBinding.mk "t4" (.binOp "+" "t3" "p4" none) none]).toOption.isSome
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          wave35SmokeAnf "t0" "+" "p0" "p1" none none 3 4 _ (Or.inl rfl) rfl rfl]
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          _ "t1" "-" "t0" "p2" none none 7 5 _ (Or.inr (Or.inl rfl)) rfl rfl]
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          _ "t2" "*" "t1" "p3" none none 2 6 _ (Or.inr (Or.inr rfl)) rfl rfl]
+    rw [RunarVerification.ANF.Eval.evalBindings_unary_bigint_cons_step
+          _ "t3" "t2" none none 12 _ rfl]
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          _ "t4" "+" "t3" "p4" none none (-12) 7 _ (Or.inl rfl) rfl rfl]
+    simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+  exact ⟨hIff, hANF, hIff.mp hANF⟩
 
 end Agrees
 end RunarVerification.Stack
