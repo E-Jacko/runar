@@ -2475,7 +2475,7 @@ lemmas.
   *prove* it (wave 24). Any new sub-omnibus must carry the
   `agreesTagged` premise from the start.
 
-### 11.6 Retirement status (through wave 55)
+### 11.6 Retirement status (through wave 64)
 
 **Retired (verified via `#print axioms`, removed from the omnibus's
 sub-omnibus list):**
@@ -2483,6 +2483,12 @@ sub-omnibus list):**
 * `if_val_codegen` — wave 45 (86→85). Self-contained arith-branch ifVal.
 * `math_byte_call_codegen` — wave 51 (85→84). Single-arg
   abs/bin2num/toByteString (no len — OP_NIP byte collides with `.nip`).
+* `update_prop_codegen` — wave 64 (84→83). The canonical
+  `loadProp p; loadConst c; p ± c; updateProp p` stateful-method fragment
+  (op∈{+,-}, c∈[-1,16]), via the **operational** M3 regime (not the arith
+  op-list-identity regime — the fragment fuses under the peephole). A
+  10-wave sub-effort (W52/56/57/58/59/60/61/62/63/64); see the resolved
+  note below.
 
 **Soundness fixes (the axioms were false-as-stated; now sound):**
 * wave 24/25 — independent-input `successAgrees` false → added the
@@ -2492,42 +2498,27 @@ sub-omnibus list):**
   program-aware evaluator that inlines methodCall), discharging the 8
   non-methodCall families via `evalBindingsP_eq_evalBindings_of_noMethodCall`.
 
+**update_prop — RESOLVED (retired wave 64).** The wave-59 finding (the
+fragment fuses under the peephole, so the arith op-list-identity M3 regime
+`peephole RAW = RAW` + `AreRunarEmittable RAW` is provably unavailable —
+`count + 1` lowers to `[dup, push 1, swap, swap, OP_ADD, nip]` and
+peepholes to `[dup, OP_1ADD, nip]`) was overcome by switching to the
+**operational `peepholePassAllFlat_sound` M3 regime**: prove the
+peephole-rewritten body runs to the same observation and route M4 through
+the POST-peephole image. The 10-wave path: relaxed invariant + per-step
+transports + from-entry walk (W52/56/57/58/62) → Phase 7.B `.push`
+round-trip emittability + OP_1ADD/OP_1SUB allowlist (W60) →
+operational-M3 consume theorem (W63) → keyed-premise dispatch surgery +
+axiom removal (W64). Restricted to op∈{+,-}, c∈[-1,16] (so no fused
+constant escapes the `[-1,16]` push window); broader prefixes
+(`prop ± param`, multi-updateProp) fall through to the sound crypto_call
+cascade. NB the general "peephole preserves `AreRunarEmittablePush`" lemma
+is FALSE (`applyPushPushAdd: [push 10, push 10, OP_ADD] → [push 20]`,
+20∉[-1,16]) — the consume theorem instead enumerates the post-peephole
+image over the finite admissible range.
+
 **Remaining families — all need model-level reconciliation (NOT the
 Stage-C template):**
-* `update_prop` — the M2 walk substrate is COMPLETE (waves 52/56/57/58:
-  relaxed invariant `agreesTaggedModProps`, the depth-d/existing-prop
-  per-step transports, the `agreesTaggedModProps_chain_preserves`
-  composer, the body-split, the loadProp/loadConst transports, the
-  typed-bundle entry-bridge, and `successAgrees_updateProp_unconditional`
-  / `_existingHead_unconditional` firing genuinely on the canonical
-  stateful-method body). The `simpleStepRel.updateProp` arm does NOT need
-  editing — the arith retirement template uses the walk directly, not
-  `simpleStepRel`. **BUT wave 59 found the op-shape (M3+M4) leg is
-  UNAVAILABLE via the arith regime.** The arith retirement uses the
-  op-list-identity M3 regime (`peephole_M3_unconditional_of_bodyId`:
-  `peephole RAW = RAW`) + `AreRunarEmittable RAW` (M4). The update_prop
-  fragment FUSES under the peephole and is non-emittable as RAW:
-  - the canonical body `loadProp count; loadConst 1; count+1;
-    updateProp count` lowers to RAW `[dup, push 1, swap, swap, OP_ADD,
-    nip]`;
-  - **M4 FALSE**: `.push` is deliberately NOT `RunarEmittable` (deferred);
-  - **M3 FALSE**: `peepholePassAllFlat` rewrites RAW to `[dup, OP_1ADD,
-    nip]` via `applyDoubleSwap` (the binOp d1d0 `[swap,swap]` cancels) +
-    `applyOneAdd` (`[push 1, OP_ADD] → OP_1ADD`, the `+1` fold).
-  The ONLY update_prop shape satisfying op-list-identity is the trivial
-  `[dup, nip]` (no arith) — vacuous for real contracts, since `count + 1`
-  (the most common stateful op) ALWAYS fuses to `OP_1ADD`. Retiring
-  update_prop for REAL stateful methods therefore requires switching M3
-  to the **operational `peepholePassAllFlat_sound` regime** (prove the
-  peephole-rewritten body runs to the same observation, route M4 through
-  the POST-peephole image), which needs: (a) a general characterization
-  of the post-peephole emittable image for the fragment; (b) **OP_1ADD
-  added to the parse allowlist + a round-trip lemma** (verified absent
-  from `Script/Parse.lean`); (c) the operational M3 substrate (analogue
-  of `Peephole.peepholePassAllFlat_sound`, Pipeline.lean:746-828,
-  specialised to the update_prop image). A ~2-4 wave sub-effort on a
-  harder M3 path than arith. The op-list-identity substrate is provably
-  unavailable for this fragment.
 * `method_call` — foundations landed (waves 52-54): `evalMethodCall`,
   `evalBindingsP` + equality bridge, the omnibus re-statement, the
   leaf-const M2 bridge. BUT wave 55 found a deeper blocker: **an
