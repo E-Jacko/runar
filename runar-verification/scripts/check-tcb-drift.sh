@@ -20,7 +20,27 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=87        # Breakdown (2026-05-17, Tier 1 wave 3 —
+TARGET_AXIOMS=86        # Breakdown (2026-05-23, Tier 1 wave 39 —
+                        # FIRST TCB axiom retirement):
+                        # −1 in Pipeline.lean — the arith sub-omnibus
+                        #     `compileSafe_observational_correct_modulo_arith_codegen`
+                        #     RETIRED. Its omnibus dispatch branch is now
+                        #     discharged by the theorem
+                        #     `compileSafe_observational_correct_arith_consume`
+                        #     for the single-public, no-double-negate,
+                        #     emittable consume-arith fragment under the
+                        #     wave-34 typed-entry premises (EntryBigintTyped
+                        #     + entryTsmArithTyped + tsmCoherent). The
+                        #     4-leg discharge composes the wave-35 walk
+                        #     (M2), the wave-38 unconditional op-shape (M3
+                        #     op-list-identity bypass + M4 emittability),
+                        #     and the wave-21 shape derivation. Residual
+                        #     arith bodies (copy-mode, consecutive
+                        #     double-negate, non-emittable) fall through to
+                        #     the sound crypto_call fallback — NO new axiom.
+                        # Net delta: −1, 87 → 86.
+                        #
+                        # Breakdown (2026-05-17, Tier 1 wave 3 —
                         # substrate widening + retries):
                         # +1 in ANF/Eval.lean — `sha256_compose` FIPS
                         #     180-4 §6.2 Merkle-Damgård composition

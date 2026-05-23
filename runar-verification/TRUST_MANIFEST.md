@@ -9,7 +9,7 @@ counts:
 
 | Item | Count | Meaning |
 |---|---:|---|
-| Project axioms | 87 | Named assumptions in Lean code |
+| Project axioms | 86 | Named assumptions in Lean code |
 | Opaque executable defaults | 0 | No executable bodies hidden from proofs |
 | Opaque defaults with bodies | 0 | No opaque declarations carry defaults |
 | `partial def` | 0 | No partial definitions under `RunarVerification/` |
@@ -51,6 +51,7 @@ that are preserved by design.
 | Tier 1 wave 3: B1 follow-up FIPS axiom | 2026-05-17 | 87 | +1 | 0 | +1 (FIPS 180-4 §6.2 composition axiom; `runOps_sha256CompressOps_eq` / `_FinalizeOps_eq` land in Stack/HashOps.lean as theorems via the composition) |
 | Tier 1 wave 25: alignment re-statement | 2026-05-21 | 87 | 0 | 0 (9 sub-omnibus axiom *signatures* gain an alignment premise; no axiom added or retired) | 0 |
 | Tier 1 waves 26–29: consume-arith retirement substrate | 2026-05-21 | 87 | 0 | 0 (M2 capstone + reflection + M3/M4/shape + operational lockstep all built; arith retirement gated on the `taggedAllBigint` typing bridge / both-fail leg — see the waves-26–29 section) | 0 |
+| **Tier 1 wave 39: FIRST axiom retirement (arith)** | 2026-05-23 | **86** | **−1** | −1 (`compileSafe_observational_correct_modulo_arith_codegen` retired; its omnibus branch discharged by the theorem `compileSafe_observational_correct_arith_consume` for the single-public, no-double-negate, emittable consume-arith fragment under wave-34 typed-entry premises; residual arith bodies fall through to the sound `crypto_call` fallback — NO new axiom) | 0 |
 
 **Net Tier 1 wave 2 (2026-05-17, omnibus-split inflation + Stage C widenings):** 78 → 86,
 Δ = +8 (intentional). The 9 per-family sub-omnibuses replace the single omnibus
@@ -125,10 +126,19 @@ classifier so the conformance harness can dispatch fixtures into
 per-family `VERIFIED-modulo-<family>-codegen-axioms` tiers. The
 planned sub-omnibus inventory:
 
-* `compileSafe_observational_correct_modulo_arith_codegen` — for
-  bodies whose only non-structural-const bindings are `binOp` /
-  `unaryOp` / `assert`. Discharged once Stage C A3 widening
-  completes.
+* `compileSafe_observational_correct_modulo_arith_codegen` —
+  **RETIRED (Wave 39, 2026-05-23 — the FIRST TCB axiom retirement).**
+  Its omnibus dispatch branch is now discharged by the theorem
+  `compileSafe_observational_correct_arith_consume` for the
+  single-public, no-double-negate, emittable consume-arith fragment
+  under the wave-34 typed-entry premises (`EntryBigintTyped` +
+  `entryTsmArithTyped` + `tsmCoherent`). The 4-leg discharge composes
+  the wave-35 walk (M2), the wave-38 unconditional op-shape (M3
+  op-list-identity bypass + M4 emittability), and the wave-21 shape
+  derivation. Residual arith bodies outside the discharged fragment
+  (copy-mode arith, consecutive double-negate, non-emittable arith)
+  fall through to the sound `crypto_call` fallback — no replacement
+  axiom.
 * `compileSafe_observational_correct_modulo_math_byte_call_codegen` —
   for bodies whose only non-structural-const bindings are `.call`
   to math/byte builtins. Discharged once Stage C A4-math/byte
@@ -169,7 +179,7 @@ permanent axiom inflation.
 | `RunarVerification/Stack/Wots.lean` | 1 | Phase B8 codegen-to-spec axiom (`runOps_wotsBodyOps_eq`) |
 | `RunarVerification/Stack/Rabin.lean` | 1 | Phase B10 codegen-to-spec axiom (`runOps_rabinBodyOps_eq`) |
 | `RunarVerification/Stack/TxContext.lean` | 0 | Concrete BIP-143 context/preimage model; no companion assumptions |
-| `RunarVerification/Pipeline.lean` | 4 | Phase D codegen-soundness axioms (multi-method dispatch, stateful continuation) + Phase D harness integration omnibus (`compileSafe_observational_correct_modulo_codegen_axioms`). Phase D3 (2026-05-17) discharged `terminal_assert_elision_residue_correct` and `nip_cleanup_residue_correct` as theorems (both had `P → P` shape; structural witnesses live in `Stack/Agrees.lean`); net −2 |
+| `RunarVerification/Pipeline.lean` | 10 | Phase D codegen-soundness axioms (`merkle_dispatch_selection_correct`, `auto_state_output_at_method_exit_correct`) + 8 O1 per-family sub-omnibus axioms (math/byte-call, crypto-call, update-prop, if-val, loop, method-call, dispatch, stateful). The harness omnibus `compileSafe_observational_correct_modulo_codegen_axioms` is a `theorem` (not an axiom) that dispatches into these. **Wave 39 (2026-05-23) retired the arith sub-omnibus** `compileSafe_observational_correct_modulo_arith_codegen` (9 → 8 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_arith_consume`; net −1 |
 
 Tier B11 (2026-05-16) replaced the `buildChangeOutput` and
 `computeStateOutput` axioms with concrete `def`s and exposed them —
@@ -618,6 +628,46 @@ and the count drops 87 → 86. Two further documented holes stay
 axiomatized until their own substrate lands: the `(≥2,≥2)` consume
 depth combo (needs a `loadRefLive`-consume depth-general singleton in
 `Stack/Agrees.lean`) and non-emittable arith ops (DIV/MOD/comparisons).
+
+### Tier 1 wave 39 — FIRST axiom retirement: LANDED (2026-05-23, 87 → 86)
+
+The arith sub-omnibus `compileSafe_observational_correct_modulo_arith_codegen`
+is **RETIRED**. Route taken: **(A)-style** — the omnibus signature gains
+the wave-34 typed-entry bundle (`Γ` / `hUntag` / `EntryBigintTyped` /
+`entryTsmArithTyped` / `tsmCoherent`) and forwards it to the discharged
+theorem `compileSafe_observational_correct_arith_consume`
+(`Pipeline.lean`, sited just before the omnibus). That theorem is a 4-leg
+transitivity over the single-public, no-double-negate, emittable
+consume-arith fragment:
+
+* **M2** — the wave-35 walk `successAgrees_arith_consume_unconditional`
+  (`Stack/AgreesA3.lean`) gives the body-level success iff; bridged to the
+  method level via `runMethod_lower_public_unique_no_post_eq_userRaw`
+  (`Stack/Agrees.lean`). `taggedAllBigint` is DERIVED inside the walk from
+  `EntryBigintTyped` (no `taggedAllBigint` hypothesis).
+* **M3** — the wave-38 op-shape `loweredEmittableArithNoDblNeg_opShape`'s
+  peephole-identity conjunct (= `peepholeMethodOps RAW = RAW`) feeds
+  `peephole_M3_unconditional_of_bodyId` (the wave-21 op-list-identity
+  bypass — no runtime preconditions).
+* **M4** — the op-shape's `AreRunarEmittable` conjunct feeds
+  `compileSafe_single_public_runOps_eq`.
+* **shape** — `peepholeProgram_single_public_shape` from `hSinglePublic`
+  (derived inside the omnibus from `¬(≥2 public) ∧ hMem ∧ hPublic`) and
+  `hName`.
+
+The no-implicit / no-postprocessing facts and `hUnique` are derived
+inline in `Pipeline.lean` from the chain predicate (via `arithOnlyBody`)
+and the single-public filter fact — no new substrate lemma was added to
+`Stack/AgreesA3.lean` / `ANF/WellTyped.lean` / `Stack/Agrees.lean`.
+
+**Residual holes stay axiomatized via the sound `crypto_call` fallback**
+(NO new axiom): copy-mode arith, consecutive double-negate arith, and
+non-emittable arith ops (DIV / MOD / comparisons). Bodies in these
+regimes do not match the decidable `emittableArithChainReadyNoDblNeg`
+branch and fall through the omnibus dispatch to
+`compileSafe_observational_correct_modulo_crypto_call_codegen` (hypothesis
+`True`). The omnibus remains a `theorem`, total and exhaustive over all
+inputs.
 
 ## External Hash Backend
 

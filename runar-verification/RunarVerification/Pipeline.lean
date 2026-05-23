@@ -4,6 +4,7 @@ import RunarVerification.ANF.Eval
 import RunarVerification.Stack.Lower
 import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
+import RunarVerification.Stack.AgreesA3
 import RunarVerification.Stack.Peephole
 import RunarVerification.Stack.Eval
 import RunarVerification.Stack.TxContext
@@ -2669,41 +2670,22 @@ takes the count back down. See `PATH2_PLAN.md` §5.23 and
 `TRUST_MANIFEST.md` for the per-sub-omnibus discharge plans.
 -/
 
-/-- **O1 sub-omnibus — arith family.**
+/-! **O1 sub-omnibus — arith family — RETIRED (Wave 39, 2026-05-23).**
 
-Phase D harness integration: codegen-soundness for ANF bodies whose
-non-structural-const bindings are `binOp` / `unaryOp` / `assert`.
-The hypothesis `hArith` requires the body to satisfy
-`Agrees.structuralArithBodyBool` (a decidable Bool checker reflecting
-`Agrees.structuralArithBody`). Soundness collapses the runtime-side
-Stage C `agreesTagged` / `ChainRel` composition for the arith family
-into a single trust footprint while A3 Stage C widening is still under
-construction.
+The arith sub-omnibus axiom `compileSafe_observational_correct_modulo_arith_codegen`
+was the FIRST TCB axiom retired on Path 2. It is replaced by the
+discharged theorem `compileSafe_observational_correct_arith_consume`
+(sited just before the omnibus), which covers the single-public,
+no-double-negate, emittable consume-arith fragment under the wave-34
+typed-entry premises (`EntryBigintTyped` + `entryTsmArithTyped` +
+`tsmCoherent`). The discharge composes the wave-35 walk (M2), the
+wave-38 op-shape (M3 via the op-list-identity bypass + M4 emittability),
+and the wave-21 shape derivation.
 
-Discharge path: this sub-omnibus retires when Stage C A3 narrowed
-wrappers (`Stack/AgreesA3.lean`) widen to full coverage of the arith
-fragment; see `PATH2_PLAN.md` §5.23.
--/
-axiom compileSafe_observational_correct_modulo_arith_codegen (p : ANFProgram)
-    (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (_hMem : anfM ∈ p.methods) (_hPublic : anfM.isPublic = true)
-    (_hSafe : compileSafe p = .ok bytes)
-    (initialAnf : State) (initialStack : StackState)
-    (tsm : Agrees.TaggedStackMap)
-    (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hArith :
-      Agrees.structuralArithBodyBool
-        p.methods p.properties
-        Lower.defaultInlineBudget
-        (Lower.computeLastUses anfM.body) []
-        (anfM.body.map (·.name))
-        (Lower.collectConstInts anfM.body)
-        anfM.body
-        (List.reverse (anfM.params.map (·.name)))
-        0 = true) :
-    successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
-      (runParsedBytes bytes initialStack)
+Residual arith bodies outside the discharged fragment — copy-mode arith,
+consecutive double-negate, non-emittable arith — fall through the omnibus
+dispatch to the sound `crypto_call` fallback. No replacement axiom is
+introduced. See `PATH2_PLAN.md` §5.23 and `TRUST_MANIFEST.md`. -/
 
 /-- **O1 sub-omnibus — math/byte call family.**
 
@@ -2946,155 +2928,6 @@ axiom compileSafe_observational_correct_modulo_stateful_codegen (p : ANFProgram)
     successAgrees
       (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
-
-/--
-**Harness-level codegen-soundness theorem (Phase D harness integration).**
-
-This theorem asserts that the entire `compileSafe` pipeline (ANF lowering
-→ peephole → byte emission → parse-back → `runOps`) is observationally
-correct on any well-formed ANF program that `compileSafe` accepts, for
-any of its public methods. The only premises are:
-
-* `WF.ANF p` — `p` is well-formed under the Lean ANF well-formedness
-  predicate;
-* `anfM ∈ p.methods` — the method under verification belongs to `p`;
-* `anfM.isPublic = true` — only public methods are deployed entry
-  points;
-* `compileSafe p = .ok bytes` — the compiler accepted `p` and produced
-  `bytes`.
-
-**Tier 1 milestone O1 split (2026-05-17).** This was previously a
-single omnibus axiom. It is now a `theorem` that case-splits on the
-body's family using the existing decidable Bool checkers in
-`Stack/Agrees.lean` and applies the matching per-family sub-omnibus
-axiom (see the section above). Programs that fall outside every
-named structural family land on the `crypto_call` sub-omnibus as the
-substrate-gap fallback (its hypothesis is `True` until a dedicated
-`structuralCryptoCallBody` predicate lands with A4-crypto).
-
-The signature is preserved (no extra hypotheses): every callsite that
-previously consumed the omnibus axiom continues to typecheck. The
-per-family classification is observable in the harness output
-(`tests/PipelineConformance.lean`) where fixtures are reported under
-per-family `VERIFIED-modulo-<family>-codegen-axioms` tiers.
-
-**Trust footprint.** This theorem is load-bearing for the
-`VERIFIED-modulo-*-codegen-axioms` classifications in
-`tests/PipelineConformance.lean`. Sub-omnibuses retire one at a time
-as their corresponding Stage C / Phase B / Phase D milestones land;
-see `PATH2_PLAN.md` §5.23 for the discharge plan.
--/
-theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
-    (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
-    (hSafe : compileSafe p = .ok bytes)
-    (initialAnf : State) (initialStack : StackState)
-    (tsm : Agrees.TaggedStackMap)
-    (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack) :
-    successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
-      (runParsedBytes bytes initialStack) := by
-  -- Per-family classifier inputs (shared by all Bool checkers).
-  let lastUses     := Lower.computeLastUses anfM.body
-  let localBindings := anfM.body.map (·.name)
-  let constInts    := Lower.collectConstInts anfM.body
-  let initialSm : Lower.StackMap :=
-    List.reverse (anfM.params.map (·.name))
-  -- Priority-ordered case-split. Stateful and dispatch take precedence
-  -- because they reflect program-level shape obligations that override
-  -- the structural body classification.
-  by_cases hStateful : Lower.bindingsUseCheckPreimage anfM.body = true
-  · exact compileSafe_observational_correct_modulo_stateful_codegen
-      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hStateful
-  · by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
-    · exact compileSafe_observational_correct_modulo_dispatch_codegen
-        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hDispatch
-    · -- Body-level structural classification (decidable Bool checkers).
-      by_cases hArith :
-          Agrees.structuralArithBodyBool
-            p.methods p.properties
-            Lower.defaultInlineBudget
-            lastUses [] localBindings constInts
-            anfM.body initialSm 0 = true
-      · exact compileSafe_observational_correct_modulo_arith_codegen
-          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hArith
-      · by_cases hMathByte :
-            Agrees.structuralCallBodyBool
-              p.methods p.properties
-              Lower.defaultInlineBudget
-              lastUses [] localBindings constInts
-              anfM.body initialSm 0 = true
-        · exact compileSafe_observational_correct_modulo_math_byte_call_codegen
-            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hMathByte
-        · by_cases hUpdateProp :
-              Agrees.structuralUpdatePropBodyBool
-                p.methods p.properties
-                Lower.defaultInlineBudget
-                lastUses [] localBindings constInts
-                anfM.body initialSm 0 = true
-          · exact compileSafe_observational_correct_modulo_update_prop_codegen
-              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hUpdateProp
-          · by_cases hIfVal :
-                Agrees.structuralIfValBodyBool
-                  p.methods p.properties
-                  Lower.defaultInlineBudget
-                  lastUses [] localBindings constInts
-                  anfM.body initialSm 0 = true
-            · exact compileSafe_observational_correct_modulo_if_val_codegen
-                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hIfVal
-            · by_cases hLoop :
-                  Agrees.structuralLoopBodyBool
-                    p.methods p.properties
-                    Lower.defaultInlineBudget
-                    lastUses [] localBindings constInts
-                    anfM.body initialSm 0 = true
-              · exact compileSafe_observational_correct_modulo_loop_codegen
-                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hLoop
-              · by_cases hMethodCall :
-                    Agrees.structuralMethodCallBodyBool
-                      p.methods p.properties
-                      Lower.defaultInlineBudget
-                      lastUses [] localBindings constInts
-                      anfM.body initialSm 0 = true
-                · exact compileSafe_observational_correct_modulo_method_call_codegen
-                    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hMethodCall
-                · -- Substrate-gap fallback: no structural classifier fires.
-                  -- This is the crypto-call family (no dedicated Bool checker
-                  -- until A4-crypto + Phase B per-primitive land). The
-                  -- sub-omnibus hypothesis is `True`.
-                  exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
-
-/--
-**Capstone variant consuming `SupportedANFBody`.**
-
-Identical conclusion to
-`compileSafe_observational_correct_modulo_codegen_axioms`, but takes an
-additional `_hSupported : SupportedANFBody anfM.body` hypothesis. The
-unified `SupportedANFBody` premise is `native_decide`-able from the
-Bool checker `supportedANFBodyB` via `supportedANFBodyB_iff`, so the
-per-fixture conformance harness can discharge it mechanically without
-needing to inspect the per-family classifier outputs.
-
-The proof simply forwards to the omnibus theorem above: the support
-witness is harness-side bookkeeping and does not refine the conclusion.
-This is parameter-free (no `progMethods` / `lastUses` / `sm` plumbing
-on the support witness) and adds zero axioms — it is a derived
-re-statement only. -/
-theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
-    (p : ANFProgram)
-    (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
-    (hSafe : compileSafe p = .ok bytes)
-    (initialAnf : State) (initialStack : StackState)
-    (tsm : Agrees.TaggedStackMap)
-    (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
-    successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
-      (runParsedBytes bytes initialStack) :=
-  compileSafe_observational_correct_modulo_codegen_axioms
-    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
 
 /-! ### Multi-method capstone
 
@@ -3566,6 +3399,529 @@ theorem wave21ArithOps_peephole_phases_id_modulo_chainFold :
     rfl
   · intro ops hNoIf hNoop
     exact Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop ops hNoIf hNoop
+
+/-! ### Path 2 Tier 1 Wave 39 — relocated omnibus + first axiom retirement
+
+The harness-integration omnibus and its `_via_support` re-statement are
+sited here (after the wave-21 M3/M4/shape derivations and the wave-39
+consume-arith dispatch theorem) so the omnibus's arith branch can call
+`compileSafe_observational_correct_arith_consume` without a forward
+reference. -/
+
+/-- Every binding in `body` is a `binOp` or a `unaryOp` (the only two
+arms `emittableArithChainReadyNoDblNeg` admits). This is the structural
+projection of the chain predicate that the no-implicit / no-postprocessing
+facts factor through. -/
+def arithOnlyBody : List ANFBinding → Prop
+  | [] => True
+  | (.mk _ (.binOp _ _ _ _) _) :: rest => arithOnlyBody rest
+  | (.mk _ (.unaryOp _ _ _) _) :: rest => arithOnlyBody rest
+  | _ :: _ => False
+
+/-- An `emittableArithChainReadyNoDblNeg` body is `arithOnlyBody`: every
+binding is a `binOp` or `unaryOp`. Induction on `body`, generalizing the
+stack-map / index / flag the chain predicate threads. -/
+theorem arithOnlyBody_of_emittableArithChainReadyNoDblNeg
+    (lastUses : List (String × Nat)) :
+    ∀ (body : List ANFBinding) (sm : Stack.Lower.StackMap)
+      (currentIndex : Nat) (prevWasNeg : Bool),
+      Agrees.emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg →
+      arithOnlyBody body := by
+  intro body
+  induction body with
+  | nil => intro _ _ _ _; exact True.intro
+  | cons hd rest ih =>
+      intro sm currentIndex prevWasNeg hChain
+      obtain ⟨name, v, src⟩ := hd
+      cases v with
+      | binOp op l r rt =>
+          simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+          obtain ⟨_, _, _, hRest⟩ := hChain
+          exact ih (name :: sm.tail.tail) (currentIndex + 1) false hRest
+      | unaryOp op operand rt =>
+          simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+          obtain ⟨_, _, _, _, hRest⟩ := hChain
+          exact ih (name :: sm.tail) (currentIndex + 1) true hRest
+      | loadParam _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | loadProp _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | loadConst _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | call _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | methodCall _ _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | ifVal _ _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | loop _ _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | assert _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | updateProp _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | getStateScript => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | checkPreimage _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | deserializeState _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | addOutput _ _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | addRawOutput _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | addDataOutput _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | arrayLiteral _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+      | rawScript _ _ _ => simp only [Agrees.emittableArithChainReadyNoDblNeg] at hChain
+
+/-- `bindingsUseCheckPreimage` is `false` on an `arithOnlyBody` (no
+`checkPreimage` / `ifVal` / `loop` arms exist). -/
+theorem bindingsUseCheckPreimage_false_of_arithOnly :
+    ∀ (body : List ANFBinding), arithOnlyBody body →
+      Lower.bindingsUseCheckPreimage body = false
+  | [], _ => by simp only [Lower.bindingsUseCheckPreimage]
+  | (.mk _ (.binOp _ _ _ _) _) :: rest, h => by
+      simp only [Lower.bindingsUseCheckPreimage, Bool.false_or]
+      exact bindingsUseCheckPreimage_false_of_arithOnly rest h
+  | (.mk _ (.unaryOp _ _ _) _) :: rest, h => by
+      simp only [Lower.bindingsUseCheckPreimage, Bool.false_or]
+      exact bindingsUseCheckPreimage_false_of_arithOnly rest h
+
+/-- `bindingsUseCodePart` is `false` on an `arithOnlyBody`. -/
+theorem bindingsUseCodePart_false_of_arithOnly :
+    ∀ (body : List ANFBinding), arithOnlyBody body →
+      Lower.bindingsUseCodePart body = false
+  | [], _ => by simp only [Lower.bindingsUseCodePart]
+  | (.mk _ (.binOp _ _ _ _) _) :: rest, h => by
+      simp only [Lower.bindingsUseCodePart, Bool.false_or]
+      exact bindingsUseCodePart_false_of_arithOnly rest h
+  | (.mk _ (.unaryOp _ _ _) _) :: rest, h => by
+      simp only [Lower.bindingsUseCodePart, Bool.false_or]
+      exact bindingsUseCodePart_false_of_arithOnly rest h
+
+/-- `bindingsUseDeserializeState` is `false` on an `arithOnlyBody`. -/
+theorem bindingsUseDeserializeState_false_of_arithOnly :
+    ∀ (body : List ANFBinding), arithOnlyBody body →
+      Lower.bindingsUseDeserializeState body = false
+  | [], _ => by simp only [Lower.bindingsUseDeserializeState]
+  | (.mk _ (.binOp _ _ _ _) _) :: rest, h => by
+      simp only [Lower.bindingsUseDeserializeState, Bool.false_or]
+      exact bindingsUseDeserializeState_false_of_arithOnly rest h
+  | (.mk _ (.unaryOp _ _ _) _) :: rest, h => by
+      simp only [Lower.bindingsUseDeserializeState, Bool.false_or]
+      exact bindingsUseDeserializeState_false_of_arithOnly rest h
+
+/-- `bodyEndsInAssert` is `false` on an `arithOnlyBody`: the last binding
+is a `binOp` / `unaryOp`, never an `assert`. -/
+theorem bodyEndsInAssert_false_of_arithOnly :
+    ∀ (body : List ANFBinding), arithOnlyBody body →
+      Lower.bodyEndsInAssert body = false
+  | [], _ => rfl
+  | [.mk _ (.binOp _ _ _ _) _], _ => rfl
+  | [.mk _ (.unaryOp _ _ _) _], _ => rfl
+  | (.mk _ (.binOp _ _ _ _) _) :: (b2 :: rest), h => by
+      have hTail : arithOnlyBody (b2 :: rest) := h
+      have := bodyEndsInAssert_false_of_arithOnly (b2 :: rest) hTail
+      simpa only [Lower.bodyEndsInAssert] using this
+  | (.mk _ (.unaryOp _ _ _) _) :: (b2 :: rest), h => by
+      have hTail : arithOnlyBody (b2 :: rest) := h
+      have := bodyEndsInAssert_false_of_arithOnly (b2 :: rest) hTail
+      simpa only [Lower.bodyEndsInAssert] using this
+
+/-- From `p.methods.filter (·.isPublic) = [anfM]`, the public method
+named `anfM.name` is unique: any public `m'` with that name equals `anfM`.
+This is the `hUnique` premise of the M2 method bridge, derived from the
+single-public filter fact. -/
+theorem unique_public_of_filter_singleton
+    (p : ANFProgram) (anfM : ANFMethod)
+    (hFilter : p.methods.filter (·.isPublic) = [anfM]) :
+    ∀ m', m' ∈ p.methods → m'.isPublic = true →
+      (m'.name == anfM.name) = true → m' = anfM := by
+  intro m' hMem' hPub' _hName'
+  have hMemFilter : m' ∈ p.methods.filter (·.isPublic) :=
+    List.mem_filter.mpr ⟨hMem', by simpa using hPub'⟩
+  rw [hFilter] at hMemFilter
+  simpa using hMemFilter
+
+/-- **Wave 39 Step 1 — the dispatch-level consume-arith correctness
+theorem.**
+
+For a single-public, no-double-negate emittable consume-arith method body
+under the wave-34 typed-entry premises, the deployed `compileSafe` bytes
+are observationally correct: running the parsed Script agrees (on its
+success bit) with evaluating the ANF body.
+
+This is the 4-leg transitivity that retires
+`compileSafe_observational_correct_modulo_arith_codegen`:
+
+* **M2** — the wave-35 unconditional walk gives the body-level success iff
+  between `evalBindings` and `runOps (lowerBindingsP …).1`, bridged to the
+  method level via `runMethod_lower_public_unique_no_post_eq_userRaw`.
+* **M3** — the wave-38 op-shape lemma's peephole-identity conjunct feeds
+  `peephole_M3_unconditional_of_bodyId` (op-list-identity regime: the
+  peephole rewrite is the literal identity on the lowered arith body).
+* **M4** — the op-shape lemma's `AreRunarEmittable` conjunct feeds
+  `compileSafe_single_public_runOps_eq`.
+* **shape** — `peepholeProgram_single_public_shape` from `hSinglePublic` /
+  `hName`.
+
+Hypothesis audit (all input-side; none restate the conclusion): the chain
+predicate `hChain`, the typed-entry bundle (`hTypedEntry` / `hTsmTyped` /
+`hCoh` / `hUntag`), the single-public filter fact `hSinglePublic`, the
+non-constructor name `hName`, and the standard `agreesTagged` alignment. -/
+theorem compileSafe_observational_correct_arith_consume
+    (p : ANFProgram) (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (tsm : Agrees.TaggedStackMap)
+    (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hChain :
+      Agrees.emittableArithChainReadyNoDblNeg
+        (Stack.Lower.computeLastUses anfM.body)
+        anfM.body
+        (List.reverse (anfM.params.map (·.name)))
+        0 false)
+    (hUntag :
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hTsmTyped : Agrees.entryTsmArithTyped Γ tsm)
+    (hCoh : Agrees.tsmCoherent initialAnf tsm) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  -- Abbreviation: the raw lowered op list of the method body.
+  let RAW :=
+      (Stack.Lower.lowerBindingsP p.methods p.properties
+        Stack.Lower.defaultInlineBudget 0
+        (Stack.Lower.computeLastUses anfM.body) []
+        (anfM.body.map (fun b => b.name))
+        (Stack.Lower.collectConstInts anfM.body)
+        (List.reverse (anfM.params.map (·.name)))
+        anfM.body).1
+  have hRAW :
+      RAW =
+        (Stack.Lower.lowerBindingsP p.methods p.properties
+          Stack.Lower.defaultInlineBudget 0
+          (Stack.Lower.computeLastUses anfM.body) []
+          (anfM.body.map (fun b => b.name))
+          (Stack.Lower.collectConstInts anfM.body)
+          (List.reverse (anfM.params.map (·.name)))
+          anfM.body).1 := rfl
+  -- The body is arith-only, so it triggers no implicit params / post-pass.
+  have hArithOnly : arithOnlyBody anfM.body :=
+    arithOnlyBody_of_emittableArithChainReadyNoDblNeg
+      (Stack.Lower.computeLastUses anfM.body) anfM.body
+      (List.reverse (anfM.params.map (·.name))) 0 false hChain
+  have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false :=
+    bindingsUseCheckPreimage_false_of_arithOnly anfM.body hArithOnly
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false :=
+    bindingsUseCodePart_false_of_arithOnly anfM.body hArithOnly
+  have hNoDeserialize : Lower.bindingsUseDeserializeState anfM.body = false :=
+    bindingsUseDeserializeState_false_of_arithOnly anfM.body hArithOnly
+  have hNoTerminalAssert : Lower.bodyEndsInAssert anfM.body = false :=
+    bodyEndsInAssert_false_of_arithOnly anfM.body hArithOnly
+  have hUnique :
+      ∀ m', m' ∈ p.methods → m'.isPublic = true →
+        (m'.name == anfM.name) = true → m' = anfM :=
+    unique_public_of_filter_singleton p anfM hSinglePublic
+  -- `emittableArithChainReady` (forget the no-double-negate flag) for M2.
+  have hReady :
+      Agrees.emittableArithChainReady
+        (Stack.Lower.computeLastUses anfM.body) anfM.body
+        (List.reverse (anfM.params.map (·.name))) 0 :=
+    Agrees.emittableArithChainReadyNoDblNeg_imp_ready
+      (Stack.Lower.computeLastUses anfM.body) anfM.body
+      (List.reverse (anfM.params.map (·.name))) 0 false hChain
+  -- The wave-38 op-shape: `AreRunarEmittable RAW` and `peepholeMethodOps RAW = RAW`.
+  have hShape :
+      Parse.AreRunarEmittable RAW
+      ∧ Peephole.peepholeRollPickFold
+          (Peephole.peepholeChainFold
+            (Peephole.peepholePostFold
+              (Peephole.peepholePassAll RAW)))
+        = RAW :=
+    Agrees.loweredEmittableArithNoDblNeg_opShape
+      p.methods p.properties Stack.Lower.defaultInlineBudget
+      (Stack.Lower.computeLastUses anfM.body)
+      (Stack.Lower.collectConstInts anfM.body)
+      anfM.body (anfM.body.map (fun b => b.name))
+      (List.reverse (anfM.params.map (·.name))) 0 false hChain
+  obtain ⟨hEmittable, hPeepId⟩ := hShape
+  -- `peepholeMethodOps RAW = RAW`.
+  have hMethodOpsId : peepholeMethodOps RAW = RAW := by
+    rw [peepholeMethodOps_eq]; exact hPeepId
+  -- The unique-public selection bridge: `findMethod (lower p) = some (lowerMethod …)`.
+  have hP : p =
+      { contractName := p.contractName,
+        properties := p.properties,
+        methods := p.methods } := rfl
+  -- `(lower p).bodyOf anfM.name = (lowerMethod …).ops = RAW`.
+  have hBodyOfRaw :
+      (Lower.lower p).bodyOf anfM.name
+        = (Lower.lowerMethod p.methods p.properties anfM).ops := by
+    unfold StackProgram.bodyOf
+    rw [hP, Agrees.findMethod_lower_public_unique
+          p.contractName p.properties p.methods anfM hMem hPublic hUnique]
+  have hMethodOpsRaw :
+      (Lower.lowerMethod p.methods p.properties anfM).ops = RAW := by
+    rw [Agrees.lowerMethod_ops_eq_userRaw_no_implicits_no_post
+          p.methods p.properties anfM hNoPreimage hNoCode hNoTerminalAssert
+          hNoDeserialize]
+    rw [hRAW]; rfl
+  have hBodyOfEqRaw : (Lower.lower p).bodyOf anfM.name = RAW := by
+    rw [hBodyOfRaw, hMethodOpsRaw]
+  -- Leg M2: ANF eval agrees with `runOps RAW`.
+  have hM2 :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+        (runOps RAW initialStack) := by
+    have hWalk :
+        ((RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body).toOption.isSome
+          ↔ (runOps RAW initialStack).toOption.isSome) := by
+      rw [hRAW]
+      exact Agrees.successAgrees_arith_consume_unconditional
+        p.methods p.properties Stack.Lower.defaultInlineBudget
+        (Stack.Lower.computeLastUses anfM.body)
+        (Stack.Lower.collectConstInts anfM.body) Γ
+        anfM.body (List.reverse (anfM.params.map (·.name)))
+        (anfM.body.map (fun b => b.name)) 0 tsm initialAnf initialStack
+        hUntag hAgrees hReady hTypedEntry hTsmTyped hCoh
+    exact hWalk
+  -- Leg M2→method: `runMethod (lower p) anfM.name = runOps RAW`.
+  have hM2Method :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+        (runMethod (Lower.lower p) anfM.name initialStack) := by
+    have hRunEq :
+        runMethod (Lower.lower p) anfM.name initialStack = runOps RAW initialStack := by
+      unfold runMethod
+      rw [hBodyOfEqRaw]
+    rw [hRunEq]; exact hM2
+  -- Leg M3: peephole preserves the run result (op-list-identity regime).
+  have hM3 :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runMethod (peepholeProgram (Lower.lower p)) anfM.name initialStack) := by
+    apply peephole_M3_unconditional_of_bodyId (Lower.lower p) anfM.name initialStack
+    rw [hBodyOfEqRaw]; exact hMethodOpsId
+  -- shape: the post-peephole program is single-public with body `RAW` (peepholed = RAW).
+  obtain ⟨hPubSingleton, hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  -- `(peepholedLoweredMethod p anfM).ops = RAW`.
+  have hPeepedOpsRaw : (peepholedLoweredMethod p anfM).ops = RAW := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = RAW
+    rw [hMethodOpsRaw]; exact hMethodOpsId
+  -- Leg shape: `(peepholeProgram (lower p)).bodyOf anfM.name = RAW`.
+  have hPeepBodyRaw :
+      (peepholeProgram (Lower.lower p)).bodyOf anfM.name = RAW := by
+    rw [hStackBody, hPeepedOpsRaw]
+  -- Leg M3→ops: bridge to `runOps RAW`.
+  have hM3Ops :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runOps RAW initialStack) := by
+    have hRunEq :
+        runMethod (peepholeProgram (Lower.lower p)) anfM.name initialStack
+          = runOps RAW initialStack := by
+      unfold runMethod
+      rw [hPeepBodyRaw]
+    rw [← hRunEq]; exact hM3
+  -- Leg M4: `runParsedBytes bytes = runOps RAW`.
+  have hM4 :
+      runParsedBytes bytes initialStack = runOps RAW initialStack := by
+    have hEq :
+        runParsedBytes bytes initialStack
+          = runOps (peepholedLoweredMethod p anfM).ops initialStack :=
+      compileSafe_single_public_runOps_eq p bytes (peepholedLoweredMethod p anfM)
+        initialStack hSafe hPubSingleton
+        (by rw [hPeepedOpsRaw]; exact hEmittable)
+    rw [hEq, hPeepedOpsRaw]
+  -- Compose: M2 ∘ M3 ∘ M4.
+  have hParsed :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runParsedBytes bytes initialStack) := by
+    rw [hM4]; exact hM3Ops
+  exact successAgrees_trans _ _ _ hM2Method hParsed
+
+/--
+**Harness-level codegen-soundness theorem (Phase D harness integration).**
+
+This theorem asserts that the entire `compileSafe` pipeline (ANF lowering
+→ peephole → byte emission → parse-back → `runOps`) is observationally
+correct on any well-formed ANF program that `compileSafe` accepts, for
+any of its public methods. The only premises are:
+
+* `WF.ANF p` — `p` is well-formed under the Lean ANF well-formedness
+  predicate;
+* `anfM ∈ p.methods` — the method under verification belongs to `p`;
+* `anfM.isPublic = true` — only public methods are deployed entry
+  points;
+* `compileSafe p = .ok bytes` — the compiler accepted `p` and produced
+  `bytes`.
+
+**Tier 1 milestone O1 split (2026-05-17).** This was previously a
+single omnibus axiom. It is now a `theorem` that case-splits on the
+body's family using the existing decidable Bool checkers in
+`Stack/Agrees.lean` and applies the matching per-family sub-omnibus
+axiom (see the section above). Programs that fall outside every
+named structural family land on the `crypto_call` sub-omnibus as the
+substrate-gap fallback (its hypothesis is `True` until a dedicated
+`structuralCryptoCallBody` predicate lands with A4-crypto).
+
+**Tier 1 Wave 39 — FIRST axiom retirement (2026-05-23).** The arith
+sub-omnibus axiom `compileSafe_observational_correct_modulo_arith_codegen`
+is RETIRED. Its branch is replaced by the discharged
+`compileSafe_observational_correct_arith_consume` theorem, which covers
+the single-public, no-double-negate, emittable consume-arith fragment
+under the wave-34 typed-entry premises. The omnibus therefore carries the
+typed-entry bundle (`Γ` / `hUntag` / `hTypedEntry` / `hTsmTyped` /
+`hCoh`) to forward to that branch. Bodies OUTSIDE the discharged fragment
+(copy-mode arith, consecutive double-negate, non-emittable arith) fall
+through to the sound `crypto_call` fallback — no new axiom is introduced.
+
+The per-family classification is observable in the harness output
+(`tests/PipelineConformance.lean`) where fixtures are reported under
+per-family `VERIFIED-modulo-<family>-codegen-axioms` tiers.
+
+**Trust footprint.** This theorem is load-bearing for the
+`VERIFIED-modulo-*-codegen-axioms` classifications in
+`tests/PipelineConformance.lean`. Sub-omnibuses retire one at a time
+as their corresponding Stage C / Phase B / Phase D milestones land;
+see `PATH2_PLAN.md` §5.23 for the discharge plan.
+-/
+theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
+    (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (tsm : Agrees.TaggedStackMap)
+    (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (hUntag :
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hTsmTyped : Agrees.entryTsmArithTyped Γ tsm)
+    (hCoh : Agrees.tsmCoherent initialAnf tsm) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  -- Per-family classifier inputs (shared by all Bool checkers).
+  let lastUses     := Lower.computeLastUses anfM.body
+  let localBindings := anfM.body.map (·.name)
+  let constInts    := Lower.collectConstInts anfM.body
+  let initialSm : Lower.StackMap :=
+    List.reverse (anfM.params.map (·.name))
+  -- Priority-ordered case-split. Stateful and dispatch take precedence
+  -- because they reflect program-level shape obligations that override
+  -- the structural body classification.
+  by_cases hStateful : Lower.bindingsUseCheckPreimage anfM.body = true
+  · exact compileSafe_observational_correct_modulo_stateful_codegen
+      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hStateful
+  · by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
+    · exact compileSafe_observational_correct_modulo_dispatch_codegen
+        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hDispatch
+    · -- In the `¬hDispatch` branch the public-method filter has length < 2;
+      -- since `anfM` is itself public it must be the SOLE public method, so
+      -- the filter is exactly `[anfM]`.  This `hSinglePublic` fact feeds the
+      -- wave-39 consume-arith branch (and is otherwise unused).
+      have hSinglePublic : p.methods.filter (·.isPublic) = [anfM] := by
+        have hAnfMem : anfM ∈ p.methods.filter (·.isPublic) :=
+          List.mem_filter.mpr ⟨hMem, by simpa using hPublic⟩
+        have hLenGe1 : 1 ≤ (p.methods.filter (·.isPublic)).length :=
+          List.length_pos_of_mem hAnfMem
+        have hLenLt2 : (p.methods.filter (·.isPublic)).length < 2 :=
+          Nat.lt_of_not_le hDispatch
+        have hLen1 : (p.methods.filter (·.isPublic)).length = 1 :=
+          Nat.le_antisymm (Nat.lt_succ_iff.mp hLenLt2) hLenGe1
+        obtain ⟨a, ha⟩ := List.length_eq_one_iff.mp hLen1
+        rw [ha] at hAnfMem ⊢
+        have : anfM = a := by simpa using hAnfMem
+        rw [this]
+      -- **Wave 39 consume-arith branch (replaces the retired arith axiom).**
+      by_cases hArithConsume :
+          anfM.name ≠ "constructor" ∧
+          Agrees.emittableArithChainReadyNoDblNeg
+            (Lower.computeLastUses anfM.body) anfM.body
+            (List.reverse (anfM.params.map (·.name))) 0 false
+      · exact compileSafe_observational_correct_arith_consume
+          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+          Γ hSinglePublic hArithConsume.1 hArithConsume.2 hUntag hTypedEntry hTsmTyped hCoh
+      · by_cases hMathByte :
+            Agrees.structuralCallBodyBool
+              p.methods p.properties
+              Lower.defaultInlineBudget
+              lastUses [] localBindings constInts
+              anfM.body initialSm 0 = true
+        · exact compileSafe_observational_correct_modulo_math_byte_call_codegen
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hMathByte
+        · by_cases hUpdateProp :
+              Agrees.structuralUpdatePropBodyBool
+                p.methods p.properties
+                Lower.defaultInlineBudget
+                lastUses [] localBindings constInts
+                anfM.body initialSm 0 = true
+          · exact compileSafe_observational_correct_modulo_update_prop_codegen
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hUpdateProp
+          · by_cases hIfVal :
+                Agrees.structuralIfValBodyBool
+                  p.methods p.properties
+                  Lower.defaultInlineBudget
+                  lastUses [] localBindings constInts
+                  anfM.body initialSm 0 = true
+            · exact compileSafe_observational_correct_modulo_if_val_codegen
+                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hIfVal
+            · by_cases hLoop :
+                  Agrees.structuralLoopBodyBool
+                    p.methods p.properties
+                    Lower.defaultInlineBudget
+                    lastUses [] localBindings constInts
+                    anfM.body initialSm 0 = true
+              · exact compileSafe_observational_correct_modulo_loop_codegen
+                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hLoop
+              · by_cases hMethodCall :
+                    Agrees.structuralMethodCallBodyBool
+                      p.methods p.properties
+                      Lower.defaultInlineBudget
+                      lastUses [] localBindings constInts
+                      anfM.body initialSm 0 = true
+                · exact compileSafe_observational_correct_modulo_method_call_codegen
+                    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hMethodCall
+                · -- Substrate-gap fallback: no structural classifier fires.
+                  -- This is the crypto-call family (no dedicated Bool checker
+                  -- until A4-crypto + Phase B per-primitive land). The
+                  -- sub-omnibus hypothesis is `True`.
+                  exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+
+/--
+**Capstone variant consuming `SupportedANFBody`.**
+
+Identical conclusion to
+`compileSafe_observational_correct_modulo_codegen_axioms`, but takes an
+additional `_hSupported : SupportedANFBody anfM.body` hypothesis. The
+unified `SupportedANFBody` premise is `native_decide`-able from the
+Bool checker `supportedANFBodyB` via `supportedANFBodyB_iff`, so the
+per-fixture conformance harness can discharge it mechanically without
+needing to inspect the per-family classifier outputs.
+
+The proof simply forwards to the omnibus theorem above: the support
+witness is harness-side bookkeeping and does not refine the conclusion.
+This is parameter-free (no `progMethods` / `lastUses` / `sm` plumbing
+on the support witness) and adds zero axioms — it is a derived
+re-statement only. -/
+theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
+    (p : ANFProgram)
+    (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (tsm : Agrees.TaggedStackMap)
+    (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (hUntag :
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hTsmTyped : Agrees.entryTsmArithTyped Γ tsm)
+    (hCoh : Agrees.tsmCoherent initialAnf tsm)
+    (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) :=
+  compileSafe_observational_correct_modulo_codegen_axioms
+    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+    Γ hUntag hTypedEntry hTsmTyped hCoh
+
 
 end Soundness
 
