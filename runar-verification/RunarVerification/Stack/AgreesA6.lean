@@ -1,4 +1,5 @@
 import RunarVerification.Stack.Agrees
+import RunarVerification.Stack.AgreesA3
 
 /-!
 # A6 — Runtime-side method-level wrapper for the `if_val` fragment
@@ -432,6 +433,337 @@ runtime wrapper, an **input-side** fact (talks only about the
 about `runMethod` or the ifOp-bearing tail). It is NOT a
 conclusion-restating premise.
 -/
+
+/-! ## Wave 40 — `if_val` foundational lemma: arith-branch iff transport
+
+The arith sub-omnibus (wave 39) was retired by the per-binding lockstep
+walk `agreesTagged_arith_walk_iff` (in `Stack/AgreesA3.lean`), which
+turns the all-bigint typed-entry invariant into a body-level
+`successAgrees` iff for an `emittableArithChainReady` body.  The walk is
+the value-dependent core that A6's earlier DEFERRED note flagged as the
+real blocker for `if_val` (the branch bodies need the same
+value-dependent success/failure discharge that arith just solved).
+
+This wave lands the FIRST reusable `if_val` piece on top of that walk:
+the **branch-selection iff transport**.  Given
+
+* the ANF condition resolves to a known `.vBool b`,
+* a Script-side cond-load witness that pushes a bool-coercible `condV`
+  with the SAME truth value `b` on top of the post-load branch stack
+  `branchStk`, and
+* the per-branch arith walk iffs (the exact output of
+  `agreesTagged_arith_walk_iff` applied to each branch body against
+  `branchStk`),
+
+the lemma transports the iff across Bitcoin's `OP_IF`: the ANF
+`evalValue (.ifVal cond thn els)` succeeds iff the lowered
+`loadRef sm cond ++ [.ifOp thnOps elsOps]` succeeds.  Only the ACTIVE
+branch's iff is consumed (the inactive branch is never run on either
+side), so the transport is `cases b` followed by the matching per-branch
+iff.
+
+The two per-branch iff premises are input-side (they are produced by the
+arith walk, never by inspecting the `.ifOp` conclusion) — no
+conclusion-restating hypothesis (PATH2_PLAN §2.1).  This is the analogue
+of the arith per-binding step, lifted to the conditional: the remaining
+A6 retirement pieces (the both-branch op-shape via `AreRunarEmittableWithIf`,
+the `agreesTagged` cond-load discharge, and the dispatch assembly) compose
+ON TOP of this transport, exactly as the arith walk + op-shape + shape
+composed for wave 39. -/
+
+/-- **ANF-side branch reduction.**  When the condition resolves to a known
+`.vBool b`, the success bit of `evalValue (.ifVal cond thn els)` is exactly
+the success bit of running the active branch's `evalBindings`.  The
+post-branch `getLast?` lookups never fail (every arm returns `.ok`), so
+they do not affect the `isSome` projection. -/
+theorem evalValue_ifVal_isSome_iff_activeBranch
+    (anfSt : State) (cond : String) (thn els : List ANFBinding) (b : Bool)
+    (hCond : anfSt.resolveRef cond = some (.vBool b)) :
+    (RunarVerification.ANF.Eval.evalValue anfSt (.ifVal cond thn els)).toOption.isSome ↔
+    (if b then (RunarVerification.ANF.Eval.evalBindings anfSt thn).toOption.isSome
+          else (RunarVerification.ANF.Eval.evalBindings anfSt els).toOption.isSome) := by
+  have hLk : RunarVerification.ANF.Eval.lookupRef anfSt cond
+      = .ok (.vBool b) := by
+    simp only [RunarVerification.ANF.Eval.lookupRef, hCond]
+  -- Reduce `evalValue (.ifVal …)` through the cond-lookup to the active
+  -- branch's `evalBindings`, then a getLast?-driven post-processing that
+  -- never fails.  The success bit equals the active branch's success bit.
+  have hEq :
+      (RunarVerification.ANF.Eval.evalValue anfSt (.ifVal cond thn els)).toOption.isSome
+        = (if b then (RunarVerification.ANF.Eval.evalBindings anfSt thn).toOption.isSome
+                else (RunarVerification.ANF.Eval.evalBindings anfSt els).toOption.isSome) := by
+    cases b with
+    | true =>
+        rw [if_pos (rfl : (true = true))]
+        simp only [RunarVerification.ANF.Eval.evalValue, hLk, bind, Except.bind]
+        cases hRun : RunarVerification.ANF.Eval.evalBindings anfSt thn with
+        | error e => simp only [Except.toOption, Option.isSome]
+        | ok s' =>
+            cases thn.getLast? with
+            | none => simp only [Except.toOption, Option.isSome]
+            | some lb =>
+                cases hLb : s'.lookupBinding lb.name with
+                | none => simp only [hLb, Except.toOption, Option.isSome]
+                | some v => simp only [hLb, pure, Except.pure, Except.toOption, Option.isSome]
+    | false =>
+        rw [if_neg (by decide : ¬ ((false : Bool) = true))]
+        simp only [RunarVerification.ANF.Eval.evalValue, hLk, bind, Except.bind]
+        cases hRun : RunarVerification.ANF.Eval.evalBindings anfSt els with
+        | error e => simp only [Except.toOption, Option.isSome]
+        | ok s' =>
+            cases els.getLast? with
+            | none => simp only [Except.toOption, Option.isSome]
+            | some lb =>
+                cases hLb : s'.lookupBinding lb.name with
+                | none => simp only [hLb, Except.toOption, Option.isSome]
+                | some v => simp only [hLb, pure, Except.pure, Except.toOption, Option.isSome]
+  rw [hEq]
+
+/-- **Script-side branch reduction.**  When the cond-load prefix runs to a
+stack whose new top `condV` is bool-coercible to `b`, the success bit of
+`condOps ++ [.ifOp thnOps elsOps]` is exactly the success bit of running
+the active branch's ops against the post-pop stack `branchStk`. -/
+theorem runOps_ifVal_isSome_iff_activeBranch
+    (condOps thnOps : List StackOp) (elsOps : Option (List StackOp))
+    (stk branchStk : StackState) (condV : Value) (b : Bool)
+    (hCondLoad :
+      runOps condOps stk = .ok { branchStk with stack := condV :: branchStk.stack })
+    (hBool : asBool? condV = some b) :
+    (runOps (condOps ++ [.ifOp thnOps elsOps]) stk).toOption.isSome ↔
+    (if b then (runOps thnOps branchStk).toOption.isSome
+          else (match elsOps with
+                | none => true
+                | some e => (runOps e branchStk).toOption.isSome)) := by
+  rw [Stack.Sim.runOps_append, hCondLoad]
+  simp only []
+  -- Goal: `(runOps [.ifOp thnOps elsOps] branchStk').toOption.isSome` where
+  -- `branchStk' = { branchStk with stack := condV :: branchStk.stack }`.
+  have hPop : ({ branchStk with stack := condV :: branchStk.stack } : StackState).pop?
+      = some (condV, branchStk) := by
+    show (match condV :: branchStk.stack with
+          | [] => none
+          | v :: vs => some (v, { branchStk with stack := vs })) = _
+    rfl
+  rw [runOps.eq_2 { branchStk with stack := condV :: branchStk.stack } thnOps elsOps []]
+  rw [hPop]
+  simp only []
+  rw [hBool]
+  cases b with
+  | true =>
+      dsimp only
+      rw [if_pos (rfl : (true = true))]
+      cases hT : runOps thnOps branchStk with
+      | error e =>
+          simp only [Except.toOption, Option.isSome]
+      | ok s'' =>
+          simp only [Stack.Eval.runOps_nil, Except.toOption, Option.isSome]
+  | false =>
+      dsimp only
+      rw [if_neg (by decide : ¬ ((false : Bool) = true))]
+      cases elsOps with
+      | none =>
+          dsimp only
+          simp only [Stack.Eval.runOps_nil, Except.toOption, Option.isSome]
+      | some e =>
+          dsimp only
+          cases hE : runOps e branchStk with
+          | error err =>
+              simp only [Except.toOption, Option.isSome]
+          | ok s'' =>
+              simp only [Stack.Eval.runOps_nil, Except.toOption, Option.isSome]
+
+/-- **Wave 40 foundational lemma — `if_val` arith-branch iff transport.**
+
+Composes the two branch reductions above with the per-branch arith walk
+iffs.  Under a matched cond resolution (ANF `.vBool b` ⇔ Script
+bool-coercible `condV`) and the per-branch arith walks, the
+`evalValue (.ifVal cond thn els)` success bit equals the lowered
+`condOps ++ [.ifOp thnOps elsOps]` success bit.  Only the active branch's
+walk iff is consumed.
+
+The `hThnIff` / `hElsIff` premises are precisely the iff that
+`agreesTagged_arith_walk_iff` returns for each branch body lowered against
+`branchStk`; the smoke test below feeds them from that walk. -/
+theorem agreesTagged_ifVal_arith_iff
+    (anfSt : State) (cond : String) (thn els : List ANFBinding)
+    (condOps thnOps : List StackOp) (elsOps : Option (List StackOp))
+    (stk branchStk : StackState) (condV : Value) (b : Bool)
+    (hCond : anfSt.resolveRef cond = some (.vBool b))
+    (hCondLoad :
+      runOps condOps stk = .ok { branchStk with stack := condV :: branchStk.stack })
+    (hBool : asBool? condV = some b)
+    (hThnIff :
+      (RunarVerification.ANF.Eval.evalBindings anfSt thn).toOption.isSome ↔
+      (runOps thnOps branchStk).toOption.isSome)
+    (hElsIff :
+      ∀ e, elsOps = some e →
+        ((RunarVerification.ANF.Eval.evalBindings anfSt els).toOption.isSome ↔
+         (runOps e branchStk).toOption.isSome))
+    (hElsNoneIff :
+      elsOps = none →
+        (RunarVerification.ANF.Eval.evalBindings anfSt els).toOption.isSome) :
+    (RunarVerification.ANF.Eval.evalValue anfSt (.ifVal cond thn els)).toOption.isSome ↔
+    (runOps (condOps ++ [.ifOp thnOps elsOps]) stk).toOption.isSome := by
+  rw [evalValue_ifVal_isSome_iff_activeBranch anfSt cond thn els b hCond]
+  rw [runOps_ifVal_isSome_iff_activeBranch condOps thnOps elsOps stk branchStk condV b
+        hCondLoad hBool]
+  cases b with
+  | true =>
+      rw [if_pos (rfl : (true = true))]
+      exact hThnIff
+  | false =>
+      rw [if_neg (by decide : ¬ ((false : Bool) = true))]
+      cases hE : elsOps with
+      | none =>
+          exact iff_of_true (hElsNoneIff hE) rfl
+      | some e =>
+          exact hElsIff e hE
+
+/-! ### Wave 40 — MANDATORY smoke: `if_val` arith-branch transport FIRES
+
+A concrete `if_val` whose THEN branch is the real single-binding arith
+chain `t0 = p0 + p1` (`p0 = 3`, `p1 = 4`, both `.bigint`) and whose ELSE
+branch is empty.  The THEN-branch iff is produced by the arith
+deliverable `successAgrees_arith_consume_unconditional` (the wave-39
+machinery, type-invariant DERIVED from typed entry — no `taggedAllBigint`
+hypothesis), and `agreesTagged_ifVal_arith_iff` transports it across the
+conditional.  We discharge both sides concretely (the THEN branch
+evaluates to a final bigint, so the active-branch ANF eval succeeds), so
+the transported iff is `True ↔ True` — anti-vacuous: the arith branch is
+genuinely run on both sides under the `OP_IF` selection. -/
+
+/-- Smoke ANF state: condition `c = true`, params `p0 = 3`, `p1 = 4`. -/
+private def w40SmokeAnf : State :=
+  { params := [("c", .vBool true), ("p0", .vBigint 3), ("p1", .vBigint 4)] }
+
+/-- Smoke branch stack (post cond-pop): `p0`, `p1` aligned. -/
+private def w40SmokeBranchStk : StackState :=
+  { stack := [.vBigint 3, .vBigint 4] }
+
+/-- Smoke THEN branch: the single-binding arith chain `t0 = p0 + p1`. -/
+private def w40SmokeThn : List ANFBinding :=
+  [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none]
+
+/-- Smoke tagged stack map for the branch entry: two `.param` slots. -/
+private def w40SmokeTsm : TaggedStackMap :=
+  [("p0", .param), ("p1", .param)]
+
+/-- Smoke typing context: `p0`, `p1` declared `.bigint`. -/
+private def w40SmokeEnv : RunarVerification.ANF.WellTyped.TypeEnv :=
+  (RunarVerification.ANF.Typed.TypeEnv.empty.extend "p0" .bigint).extend "p1" .bigint
+
+/-- The THEN-branch lowered ops (the real arith chunk under sm `["p0","p1"]`). -/
+private def w40SmokeThnOps : List StackOp :=
+  (Stack.Lower.lowerBindingsP [] [] 1000 0 (Stack.Lower.computeLastUses w40SmokeThn)
+      [] [] [] ["p0", "p1"] w40SmokeThn).1
+
+private theorem w40_untag : untagSm w40SmokeTsm = ["p0", "p1"] := by
+  unfold w40SmokeTsm untagSm; rfl
+
+private theorem w40_agreesTagged :
+    agreesTagged w40SmokeTsm w40SmokeAnf w40SmokeBranchStk := by
+  refine ⟨?_, rfl, rfl⟩
+  show taggedStackAligned w40SmokeTsm w40SmokeAnf w40SmokeBranchStk.stack
+  refine ⟨?_, ?_, ?_⟩
+  · show lookupAnfByKind w40SmokeAnf ("p0", .param) = some (.vBigint 3); rfl
+  · show lookupAnfByKind w40SmokeAnf ("p1", .param) = some (.vBigint 4); rfl
+  · trivial
+
+private theorem w40_chainReady :
+    emittableArithChainReady (Stack.Lower.computeLastUses w40SmokeThn) w40SmokeThn
+      ["p0", "p1"] 0 := by
+  unfold w40SmokeThn
+  exact ⟨Or.inl rfl, by decide, by unfold freshIn; decide, True.intro⟩
+
+private theorem w40_entryBigintTyped :
+    RunarVerification.ANF.WellTyped.EntryBigintTyped w40SmokeEnv w40SmokeAnf := by
+  intro n hn
+  by_cases h0 : n = "p0"
+  · subst h0; exact ⟨.vBigint 3, rfl, ⟨3, rfl⟩⟩
+  · by_cases h1 : n = "p1"
+    · subst h1; exact ⟨.vBigint 4, rfl, ⟨4, rfl⟩⟩
+    · exfalso
+      have hp1 : ("p1" == n) = false := by
+        rw [beq_eq_false_iff_ne]; exact fun h => h1 h.symm
+      have hp0 : ("p0" == n) = false := by
+        rw [beq_eq_false_iff_ne]; exact fun h => h0 h.symm
+      simp only [w40SmokeEnv, RunarVerification.ANF.Typed.TypeEnv.lookup,
+        RunarVerification.ANF.Typed.TypeEnv.extend, RunarVerification.ANF.Typed.TypeEnv.empty,
+        List.find?_cons, hp1, hp0, List.find?_nil, Option.map_none, reduceCtorEq] at hn
+
+private theorem w40_entryTsmArithTyped :
+    entryTsmArithTyped w40SmokeEnv w40SmokeTsm := by
+  intro s hs
+  unfold RunarVerification.ANF.WellTyped.arithOperandBigint
+  simp only [w40SmokeTsm, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with h | h <;> (subst h; decide)
+
+private theorem w40_tsmCoherent :
+    tsmCoherent w40SmokeAnf w40SmokeTsm := by
+  intro s hs
+  simp only [w40SmokeTsm, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with h | h <;> (subst h; rfl)
+
+/-- **Wave 40 smoke — the `if_val` arith-branch transport fires.**
+
+(1) The per-branch arith walk iff (from the wave-39 deliverable).
+(2) The transported `if_val` iff (from `agreesTagged_ifVal_arith_iff`).
+(3) The ANF `evalValue (.ifVal …)` side concretely succeeds.
+(4) Hence the Script `condOps ++ [.ifOp thnOps none]` side succeeds. -/
+theorem wave40_ifVal_arith_transport_smoke :
+    -- (2) the transported iff for the arith-then / empty-else if_val.
+    ((RunarVerification.ANF.Eval.evalValue w40SmokeAnf
+        (.ifVal "c" w40SmokeThn [])).toOption.isSome
+      ↔ (runOps ([] ++ [.ifOp w40SmokeThnOps none])
+            { w40SmokeBranchStk with stack := (.vBool true) :: w40SmokeBranchStk.stack
+            }).toOption.isSome)
+    -- (3) the ANF if_val side concretely succeeds.
+    ∧ (RunarVerification.ANF.Eval.evalValue w40SmokeAnf
+        (.ifVal "c" w40SmokeThn [])).toOption.isSome
+    -- (4) hence the Script side succeeds.
+    ∧ (runOps ([] ++ [.ifOp w40SmokeThnOps none])
+          { w40SmokeBranchStk with stack := (.vBool true) :: w40SmokeBranchStk.stack
+          }).toOption.isSome := by
+  -- (1) The per-branch arith walk iff: ANF branch eval ↔ Script branch run.
+  have hThnIff :
+      (RunarVerification.ANF.Eval.evalBindings w40SmokeAnf w40SmokeThn).toOption.isSome ↔
+      (runOps w40SmokeThnOps w40SmokeBranchStk).toOption.isSome :=
+    successAgrees_arith_consume_unconditional [] [] 1000
+      (Stack.Lower.computeLastUses w40SmokeThn) [] w40SmokeEnv
+      w40SmokeThn ["p0", "p1"] [] 0 w40SmokeTsm
+      w40SmokeAnf w40SmokeBranchStk
+      w40_untag w40_agreesTagged w40_chainReady
+      w40_entryBigintTyped w40_entryTsmArithTyped w40_tsmCoherent
+  -- (2) Transport across the conditional.  cond resolves to `.vBool true`;
+  -- the (trivial) cond-load runs `[]` to the bool-topped branch stack.
+  have hCond : w40SmokeAnf.resolveRef "c" = some (.vBool true) := rfl
+  have hCondLoad :
+      runOps [] { w40SmokeBranchStk with stack := (.vBool true) :: w40SmokeBranchStk.stack }
+        = .ok { w40SmokeBranchStk with
+            stack := (.vBool true) :: w40SmokeBranchStk.stack } :=
+    Stack.Eval.runOps_nil _
+  have hElsNone :
+      (none : Option (List StackOp)) = none →
+        (RunarVerification.ANF.Eval.evalBindings w40SmokeAnf []).toOption.isSome := by
+    intro _; simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+  have hIff :=
+    agreesTagged_ifVal_arith_iff w40SmokeAnf "c" w40SmokeThn [] [] w40SmokeThnOps none
+      { w40SmokeBranchStk with stack := (.vBool true) :: w40SmokeBranchStk.stack }
+      w40SmokeBranchStk (.vBool true) true
+      hCond hCondLoad rfl hThnIff (fun e he => absurd he (by simp)) hElsNone
+  -- (3) The ANF if_val side concretely succeeds (THEN branch evaluates the
+  -- arith chain `t0 = 3 + 4 = 7`).
+  have hANF :
+      (RunarVerification.ANF.Eval.evalValue w40SmokeAnf
+          (.ifVal "c" w40SmokeThn [])).toOption.isSome := by
+    rw [evalValue_ifVal_isSome_iff_activeBranch w40SmokeAnf "c" w40SmokeThn [] true hCond]
+    rw [if_pos (rfl : (true = true))]
+    show (RunarVerification.ANF.Eval.evalBindings w40SmokeAnf
+      [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none]).toOption.isSome
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          w40SmokeAnf "t0" "+" "p0" "p1" none none 3 4 _ (Or.inl rfl) rfl rfl]
+    simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+  exact ⟨hIff, hANF, hIff.mp hANF⟩
 
 section
 attribute [local irreducible] Peephole.peepholePassAll
