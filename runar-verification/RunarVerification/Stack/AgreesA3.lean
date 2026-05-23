@@ -13165,6 +13165,161 @@ instance instDecidableEmittableArithChainReady
   decidable_of_iff (emittableArithChainReadyBool lastUses body sm currentIndex = true)
     (emittableArithChainReadyBool_iff lastUses body sm currentIndex)
 
+/-! ### Wave 38 Step 1 — the refined (no-double-negate) fragment
+
+`emittableArithChainReady` admits two consecutive unary-negate bindings
+(`t' = -t; t'' = -t'`), whose lowered chunks `[OP_NEGATE] ++ [OP_NEGATE]`
+the peephole CORRECTLY fuses to `[]`. On that body the two phase
+identities (`peepholePassAllFlat (lowered).1 = (lowered).1` and the same
+for `peepholePostFold`) are FALSE, so the M3 op-shape conjunct of
+`loweredEmittableArith_opShape` cannot close unconditionally.
+
+`emittableArithChainReadyNoDblNeg` is `emittableArithChainReady` plus the
+single extra side-condition that a unary-negate binding never immediately
+follows another unary-negate binding. It threads a Bool flag `prevWasNeg`
+(true iff the previous binding was a unary-negate); a unary-negate binding
+is admitted only when `prevWasNeg = false`. Everything else is verbatim
+`emittableArithChainReady`'s arm. The lowered body of any such body then
+satisfies `Peephole.arithEmitNoFuse`, so both phase identities discharge
+unconditionally (wave-38 `Peephole` per-rule lemmas). -/
+def emittableArithChainReadyNoDblNeg
+    (lastUses : List (String × Nat)) :
+    List ANFBinding → StackMap → Nat → Bool → Prop
+  | [], _sm, _currentIndex, _prevWasNeg => True
+  | (.mk name (.binOp op l r rt) _) :: rest, sm, currentIndex, _prevWasNeg =>
+      (op = "+" ∨ op = "-" ∨ op = "*") ∧
+      structuralArithConsumeValueBool lastUses [] sm currentIndex (.binOp op l r rt) = true ∧
+      freshIn name sm.tail.tail ∧
+      emittableArithChainReadyNoDblNeg lastUses rest (name :: sm.tail.tail) (currentIndex + 1) false
+  | (.mk name (.unaryOp op operand rt) _) :: rest, sm, currentIndex, prevWasNeg =>
+      op = "-" ∧ prevWasNeg = false ∧
+      structuralArithConsumeValueBool lastUses [] sm currentIndex (.unaryOp op operand rt) = true ∧
+      freshIn name sm.tail ∧
+      emittableArithChainReadyNoDblNeg lastUses rest (name :: sm.tail) (currentIndex + 1) true
+  | _ :: _, _sm, _currentIndex, _prevWasNeg => False
+
+/-- **Wave 38 Step 1 — Bool mirror of `emittableArithChainReadyNoDblNeg`.** -/
+def emittableArithChainReadyNoDblNegBool
+    (lastUses : List (String × Nat)) :
+    List ANFBinding → StackMap → Nat → Bool → Bool
+  | [], _sm, _currentIndex, _prevWasNeg => true
+  | (.mk name (.binOp op l r rt) _) :: rest, sm, currentIndex, _prevWasNeg =>
+      (op == "+" || op == "-" || op == "*") &&
+      structuralArithConsumeValueBool lastUses [] sm currentIndex (.binOp op l r rt) &&
+      (!(name ∈ sm.tail.tail)) &&
+      emittableArithChainReadyNoDblNegBool lastUses rest (name :: sm.tail.tail) (currentIndex + 1) false
+  | (.mk name (.unaryOp op operand rt) _) :: rest, sm, currentIndex, prevWasNeg =>
+      (op == "-") && (prevWasNeg == false) &&
+      structuralArithConsumeValueBool lastUses [] sm currentIndex (.unaryOp op operand rt) &&
+      (!(name ∈ sm.tail)) &&
+      emittableArithChainReadyNoDblNegBool lastUses rest (name :: sm.tail) (currentIndex + 1) true
+  | _ :: _, _sm, _currentIndex, _prevWasNeg => false
+
+/-- **Wave 38 Step 1 — reflection: Bool mirror ↔ `Prop`.** -/
+theorem emittableArithChainReadyNoDblNegBool_iff
+    (lastUses : List (String × Nat)) :
+    ∀ (body : List ANFBinding) (sm : StackMap) (currentIndex : Nat) (prevWasNeg : Bool),
+      emittableArithChainReadyNoDblNegBool lastUses body sm currentIndex prevWasNeg = true ↔
+      emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg
+  | [], sm, currentIndex, prevWasNeg => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg]
+  | (.mk name (.binOp op l r rt) _) :: rest, sm, currentIndex, prevWasNeg => by
+      have ih := emittableArithChainReadyNoDblNegBool_iff lastUses rest
+        (name :: sm.tail.tail) (currentIndex + 1) false
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg,
+        Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, Bool.not_eq_true',
+        decide_eq_false_iff_not, freshIn, or_assoc, ih, and_assoc]
+  | (.mk name (.unaryOp op operand rt) _) :: rest, sm, currentIndex, prevWasNeg => by
+      have ih := emittableArithChainReadyNoDblNegBool_iff lastUses rest
+        (name :: sm.tail) (currentIndex + 1) true
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg,
+        Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true',
+        decide_eq_false_iff_not, freshIn, ih, and_assoc]
+  | (.mk _ (.loadParam _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.loadProp _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.loadConst _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.call _ _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.methodCall _ _ _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.ifVal _ _ _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.loop _ _ _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.assert _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.updateProp _ _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ .getStateScript _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.checkPreimage _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.deserializeState _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.addOutput _ _ _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.addRawOutput _ _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.addDataOutput _ _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.arrayLiteral _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+  | (.mk _ (.rawScript _ _ _) _) :: _, _sm, _currentIndex, _ => by
+      simp only [emittableArithChainReadyNoDblNegBool, emittableArithChainReadyNoDblNeg, reduceCtorEq]
+
+/-- **Wave 38 Step 1 — `Decidable` instance via the reflection.** -/
+instance instDecidableEmittableArithChainReadyNoDblNeg
+    (lastUses : List (String × Nat)) (body : List ANFBinding)
+    (sm : StackMap) (currentIndex : Nat) (prevWasNeg : Bool) :
+    Decidable (emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg) :=
+  decidable_of_iff (emittableArithChainReadyNoDblNegBool lastUses body sm currentIndex prevWasNeg = true)
+    (emittableArithChainReadyNoDblNegBool_iff lastUses body sm currentIndex prevWasNeg)
+
+/-- **Wave 38 Step 1 — the refined fragment refines the full fragment.**
+Dropping the `prevWasNeg` side-condition recovers `emittableArithChainReady`
+(forgetful map; confirms the refinement only ADDS the no-double-negate
+constraint). Proved by induction over `body`. -/
+theorem emittableArithChainReadyNoDblNeg_imp_ready
+    (lastUses : List (String × Nat)) :
+    ∀ (body : List ANFBinding) (sm : StackMap) (currentIndex : Nat) (prevWasNeg : Bool),
+      emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg →
+      emittableArithChainReady lastUses body sm currentIndex := by
+  intro body
+  induction body with
+  | nil => intro _ _ _ _; exact True.intro
+  | cons hd rest ih =>
+      intro sm currentIndex prevWasNeg hRef
+      obtain ⟨name, v, src⟩ := hd
+      cases v with
+      | binOp op l r rt =>
+          simp only [emittableArithChainReadyNoDblNeg] at hRef
+          obtain ⟨hEmit, hShape, hFresh, hRest⟩ := hRef
+          exact ⟨hEmit, hShape, hFresh, ih (name :: sm.tail.tail) (currentIndex + 1) false hRest⟩
+      | unaryOp op operand rt =>
+          simp only [emittableArithChainReadyNoDblNeg] at hRef
+          obtain ⟨hEmit, _hPrev, hShape, hFresh, hRest⟩ := hRef
+          exact ⟨hEmit, hShape, hFresh, ih (name :: sm.tail) (currentIndex + 1) true hRest⟩
+      | loadParam _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | loadProp _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | loadConst _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | call _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | methodCall _ _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | ifVal _ _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | loop _ _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | assert _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | updateProp _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | getStateScript => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | checkPreimage _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | deserializeState _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | addOutput _ _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | addRawOutput _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | addDataOutput _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | arrayLiteral _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | rawScript _ _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+
 /-! ### Wave 37 Stone 2 — whole-body op-shape (M3/M4 substrate)
 
 The wave-35 walk gives the runtime success-iff but nothing about the
@@ -13646,6 +13801,264 @@ the chain-fold `applyPushAddPush*_eq_self_of_pushFree` pair already in
 hypotheses; the retirement wave supplies them per-body (the Stone-2 smoke
 discharges both by `rfl` on a representative double-negate-free body). -/
 
+/-! ### Wave 38 Step 3 — closing the M3 gap for the refined fragment
+
+Route (a) executed. The lowered op list of an
+`emittableArithChainReadyNoDblNeg` body satisfies `Peephole.arithEmitNoFuse`
+(every op is `.swap` / `OP_ADD` / `OP_SUB` / `OP_MUL` / `OP_NEGATE`, with no
+`[swap,swap]` and — crucially — no `[OP_NEGATE,OP_NEGATE]` window). The
+wave-38 `Peephole.peepholePassAllFlat_eq_self_of_arithEmit` /
+`peepholePostFold_eq_self_of_arithEmit` then discharge BOTH phase
+identities unconditionally, so `loweredEmittableArith_opShape`'s two phase
+hypotheses are supplied internally. -/
+
+/-- Whether an op list begins with `.opcode "OP_NEGATE"` (the only op that
+can open a fusable `[OP_NEGATE,OP_NEGATE]` window from the right). -/
+def firstOpNeg : List StackOp → Bool
+  | .opcode "OP_NEGATE" :: _ => true
+  | _ => false
+
+/-- Whether a body's first binding is a unary-negate (the binding whose
+lowered chunk is `[.opcode "OP_NEGATE"]`). -/
+def firstBindingIsUnaryNeg : List ANFBinding → Bool
+  | (.mk _ (.unaryOp "-" _ _) _) :: _ => true
+  | _ => false
+
+/-- `binopOpcode` of an emittable binOp op (`+`/`-`/`*`) is one of the
+three arith opcodes — in particular it is never `"OP_NEGATE"` and is
+`isArithEmitOp`. -/
+private theorem binopOpcode_emittable_isArith (op : String) (rt : Option String)
+    (hEmit : op = "+" ∨ op = "-" ∨ op = "*") :
+    Peephole.isArithEmitOp (.opcode (Stack.Lower.binopOpcode op rt)) = true ∧
+    Stack.Lower.binopOpcode op rt ≠ "OP_NEGATE" := by
+  rcases hEmit with h | h | h <;> subst h <;>
+    refine ⟨?_, ?_⟩ <;>
+    simp only [Stack.Lower.binopOpcode, Peephole.isArithEmitOp, beq_iff_eq] <;>
+    decide
+
+/-- Prepending an emittable binOp chunk `[.swap, .opcode binop]` (binop ≠
+`OP_NEGATE`, arith) to an `arithEmitNoFuse` tail keeps it `arithEmitNoFuse`:
+`swap` is followed by `.opcode` (no `[swap,swap]`), and `.opcode binop` by
+the tail head (binop ≠ negate, no `[NEGATE,NEGATE]`). -/
+private theorem arithEmitNoFuse_binOpChunk (binop : String) (tail : List StackOp)
+    (hArith : Peephole.isArithEmitOp (.opcode binop) = true)
+    (hNotNeg : binop ≠ "OP_NEGATE")
+    (hTail : Peephole.arithEmitNoFuse tail = true) :
+    Peephole.arithEmitNoFuse (StackOp.swap :: .opcode binop :: tail) = true := by
+  rw [Peephole.arithEmitNoFuse_cons_swap_opcode,
+      Peephole.arithEmitNoFuse_cons_opcode_nonNeg binop tail hNotNeg, hArith, hTail]
+  rfl
+
+/-- Prepending a unary-negate chunk `[.opcode "OP_NEGATE"]` to an
+`arithEmitNoFuse` tail that does NOT begin with `OP_NEGATE` keeps it
+`arithEmitNoFuse` (no `[OP_NEGATE,OP_NEGATE]` window opens). -/
+private theorem arithEmitNoFuse_negChunk (tail : List StackOp)
+    (hHead : firstOpNeg tail = false)
+    (hTail : Peephole.arithEmitNoFuse tail = true) :
+    Peephole.arithEmitNoFuse (StackOp.opcode "OP_NEGATE" :: tail) = true := by
+  cases tail with
+  | nil => decide
+  | cons t0 trest =>
+      have hReduce : Peephole.arithEmitNoFuse (StackOp.opcode "OP_NEGATE" :: t0 :: trest)
+          = (Peephole.isArithEmitOp (.opcode "OP_NEGATE") && Peephole.arithEmitNoFuse (t0 :: trest)) := by
+        cases t0 with
+        | opcode c0 =>
+            by_cases hc0 : c0 = "OP_NEGATE"
+            · subst hc0; exact absurd hHead (by simp only [firstOpNeg]; decide)
+            · rw [Peephole.arithEmitNoFuse]
+              · intro tail2 heq _; exact absurd heq (by simp)
+              · intro tail2 _ heq2; injection heq2 with hcEq _; injection hcEq with hcc
+                exact hc0 hcc
+        | _ => rfl
+      rw [hReduce, hTail]
+      decide
+
+/-- A refined body threaded with `prevWasNeg = true` cannot begin with a
+unary-negate binding (the refined predicate's unaryOp arm requires
+`prevWasNeg = false`). -/
+private theorem refinedTrue_firstBindingNotNeg
+    (lastUses : List (String × Nat)) (body : List ANFBinding)
+    (sm : StackMap) (currentIndex : Nat)
+    (hRef : emittableArithChainReadyNoDblNeg lastUses body sm currentIndex true) :
+    firstBindingIsUnaryNeg body = false := by
+  cases body with
+  | nil => rfl
+  | cons hd rest =>
+      obtain ⟨name, v, src⟩ := hd
+      cases v with
+      | unaryOp op operand rt =>
+          by_cases hop : op = "-"
+          · subst hop
+            simp only [emittableArithChainReadyNoDblNeg] at hRef
+            obtain ⟨_, hPrev, _, _, _⟩ := hRef
+            exact absurd hPrev (by decide)
+          · rw [firstBindingIsUnaryNeg]
+            intro a b c d e heq
+            injection heq with hBindEq _
+            injection hBindEq with _ hValEq _
+            injection hValEq with hOpEq _ _
+            exact hop hOpEq
+      | binOp _ _ _ _ => rfl
+      | loadParam _ => rfl
+      | loadProp _ => rfl
+      | loadConst _ => rfl
+      | call _ _ => rfl
+      | methodCall _ _ _ => rfl
+      | ifVal _ _ _ => rfl
+      | loop _ _ _ => rfl
+      | assert _ => rfl
+      | updateProp _ _ => rfl
+      | getStateScript => rfl
+      | checkPreimage _ => rfl
+      | deserializeState _ => rfl
+      | addOutput _ _ _ => rfl
+      | addRawOutput _ _ => rfl
+      | addDataOutput _ _ => rfl
+      | arrayLiteral _ => rfl
+      | rawScript _ _ _ => rfl
+
+/-- **Wave 38 Step 3 — the M3 shape fact for the refined fragment.**
+The lowered op list of any `emittableArithChainReadyNoDblNeg` body is
+`Peephole.arithEmitNoFuse`, and its head is `OP_NEGATE` iff the body's
+first binding is a unary-negate (the second conjunct feeds the boundary
+check at the unary-negate cons step). -/
+theorem loweredEmittableArithNoDblNeg_arithEmitNoFuse
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (constInts : List (String × Int)) :
+    ∀ (body : List ANFBinding) (localBindings : List String)
+      (sm : StackMap) (currentIndex : Nat) (prevWasNeg : Bool),
+      emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg →
+      Peephole.arithEmitNoFuse
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1 = true
+      ∧ firstOpNeg
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1 = firstBindingIsUnaryNeg body := by
+  intro body
+  induction body with
+  | nil =>
+      intro localBindings sm currentIndex prevWasNeg _hRef
+      rw [Stack.Lower.lowerBindingsP]
+      exact ⟨rfl, rfl⟩
+  | cons hd rest ih =>
+      intro localBindings sm currentIndex prevWasNeg hRef
+      obtain ⟨name, v, src⟩ := hd
+      cases v with
+      | binOp op l r rt =>
+          simp only [emittableArithChainReadyNoDblNeg] at hRef
+          obtain ⟨hEmit, hShape, _hFresh, hRest⟩ := hRef
+          obtain ⟨hDl, hDr, hLuL, hLuR, hNB⟩ :=
+            emittableBinOpShapeBool_facts lastUses sm currentIndex op l r rt hShape
+          have hOps := lowerValueP_binOp_d0d1_ops progMethods props budget currentIndex
+            lastUses localBindings constInts sm name op l r rt hDl hDr hLuL hLuR hNB
+          have hSmOut := lowerValueP_binOp_d0d1_smOut progMethods props budget currentIndex
+            lastUses localBindings constInts sm name op l r rt hDl hDr hLuL hLuR
+          have hLb := lowerValueP_binOp_localBindings progMethods props budget currentIndex
+            lastUses [] localBindings constInts sm name op l r rt
+          simp only [Stack.Lower.lowerBindingsP, hOps, hSmOut, hLb]
+          obtain ⟨hArith, hNotNeg⟩ := binopOpcode_emittable_isArith op rt hEmit
+          obtain ⟨htNoFuse, _htHead⟩ := ih localBindings (name :: sm.tail.tail) (currentIndex + 1) false hRest
+          refine ⟨?_, ?_⟩
+          · simpa only [List.cons_append, List.nil_append] using
+              arithEmitNoFuse_binOpChunk (Stack.Lower.binopOpcode op rt) _ hArith hNotNeg htNoFuse
+          · simp only [List.cons_append, firstOpNeg, firstBindingIsUnaryNeg]
+      | unaryOp op operand rt =>
+          simp only [emittableArithChainReadyNoDblNeg] at hRef
+          obtain ⟨hEmit, _hPrev, hShape, _hFresh, hRest⟩ := hRef
+          subst hEmit
+          obtain ⟨hD, hLu⟩ :=
+            emittableUnaryOpShapeBool_facts lastUses sm currentIndex "-" operand rt hShape
+          have hOps := lowerValueP_unaryOp_d0_ops progMethods props budget currentIndex
+            lastUses localBindings constInts sm name "-" operand rt hD hLu
+          have hSmOut := lowerValueP_unaryOp_d0_smOut progMethods props budget currentIndex
+            lastUses localBindings constInts sm name "-" operand rt hD hLu
+          have hLb := lowerValueP_unaryOp_localBindings progMethods props budget currentIndex
+            lastUses [] localBindings constInts sm name "-" operand rt
+          simp only [Stack.Lower.lowerBindingsP, hOps, hSmOut, hLb]
+          obtain ⟨htNoFuse, htHead⟩ := ih localBindings (name :: sm.tail) (currentIndex + 1) true hRest
+          have hRestNotNeg : firstBindingIsUnaryNeg rest = false :=
+            refinedTrue_firstBindingNotNeg lastUses rest (name :: sm.tail) (currentIndex + 1) hRest
+          have hHead : firstOpNeg
+              (Stack.Lower.lowerBindingsP progMethods props budget (currentIndex + 1) lastUses
+                  [] localBindings constInts (name :: sm.tail) rest).1 = false := by
+            rw [htHead, hRestNotNeg]
+          refine ⟨?_, ?_⟩
+          · show Peephole.arithEmitNoFuse
+                ([StackOp.opcode (Stack.Lower.unaryOpcode "-")] ++ _) = true
+            simp only [Stack.Lower.unaryOpcode, List.cons_append, List.nil_append]
+            exact arithEmitNoFuse_negChunk _ hHead htNoFuse
+          · show firstOpNeg ([StackOp.opcode (Stack.Lower.unaryOpcode "-")] ++ _)
+                = firstBindingIsUnaryNeg ((ANFBinding.mk name (.unaryOp "-" operand rt) src) :: rest)
+            simp only [Stack.Lower.unaryOpcode, List.cons_append, List.nil_append,
+              firstOpNeg, firstBindingIsUnaryNeg]
+      | loadParam _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | loadProp _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | loadConst _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | call _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | methodCall _ _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | ifVal _ _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | loop _ _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | assert _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | updateProp _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | getStateScript => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | checkPreimage _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | deserializeState _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | addOutput _ _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | addRawOutput _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | addDataOutput _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | arrayLiteral _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+      | rawScript _ _ _ => simp only [emittableArithChainReadyNoDblNeg] at hRef
+
+/-- **Wave 38 Step 3 — the UNCONDITIONAL refined op-shape lemma.**
+
+For any `emittableArithChainReadyNoDblNeg` body, the lowered op list is
+`Parse.AreRunarEmittable` (M4, via the wave-37 unconditional lemma after
+forgetting the flag) AND the peephole pipeline is the literal identity on
+it (M3) — with NO phase-identity hypotheses. The two phase identities are
+discharged internally from `loweredEmittableArithNoDblNeg_arithEmitNoFuse`
+plus the wave-38 `Peephole` per-rule lemmas. -/
+theorem loweredEmittableArithNoDblNeg_opShape
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (constInts : List (String × Int))
+    (body : List ANFBinding) (localBindings : List String)
+    (sm : StackMap) (currentIndex : Nat) (prevWasNeg : Bool)
+    (hRef : emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg) :
+    Parse.AreRunarEmittable
+      (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          [] localBindings constInts sm body).1
+    ∧ Peephole.peepholeRollPickFold
+        (Peephole.peepholeChainFold
+          (Peephole.peepholePostFold
+            (Peephole.peepholePassAll
+              (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+                  [] localBindings constInts sm body).1)))
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          [] localBindings constInts sm body).1 := by
+  have hReady : emittableArithChainReady lastUses body sm currentIndex :=
+    emittableArithChainReadyNoDblNeg_imp_ready lastUses body sm currentIndex prevWasNeg hRef
+  obtain ⟨hNoFuse, _⟩ :=
+    loweredEmittableArithNoDblNeg_arithEmitNoFuse progMethods props budget lastUses constInts
+      body localBindings sm currentIndex prevWasNeg hRef
+  obtain ⟨hNoIf, _hPushFree, _hRpNoop⟩ :=
+    loweredEmittableArith_m3ShapeFacts progMethods props budget lastUses constInts
+      body localBindings sm currentIndex hReady
+  have hPassFlat :
+      Peephole.peepholePassAllFlat
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1 :=
+    Peephole.peepholePassAllFlat_eq_self_of_arithEmit _ hNoFuse
+  have hPostFold :
+      Peephole.peepholePostFold
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1 :=
+    Peephole.peepholePostFold_eq_self_of_arithEmit _ hNoIf hNoFuse
+  exact loweredEmittableArith_opShape progMethods props budget lastUses constInts
+    body localBindings sm currentIndex hReady hPassFlat hPostFold
+
 /-! ### Wave 37 Stone 2 — MANDATORY op-shape smoke
 
 Anti-vacuity for `loweredEmittableArith_opShape`.  We instantiate it on a
@@ -14058,6 +14471,104 @@ private theorem wave37_chainReady_decidable_usage :
       wave28SmokeBody ["p0", "p1", "p2", "p3", "p4"] 0
   · exact h
   · exact absurd wave37_chainReady_from_bool h
+
+/-! ### Wave 38 — MANDATORY refined-fragment op-shape smoke (Step 1 + Step 3)
+
+Smoke 1: the 5-binding wave-28 chain (`t0=p0+p1; t1=t0-p2; t2=t1*p3;
+t3=-t2; t4=t3+p4`) has exactly ONE unary-negate (`t3`), no two consecutive
+unary-negate bindings, so it is `emittableArithChainReadyNoDblNeg`. The
+UNCONDITIONAL `loweredEmittableArithNoDblNeg_opShape` closes BOTH conjuncts
+(`AreRunarEmittable` + the M3 peephole identity) with NO phase-identity
+hypotheses. -/
+
+/-- The refined Bool mirror evaluates to `true` on the 5-binding chain. -/
+private theorem wave38_chainReadyNoDblNegBool_true :
+    emittableArithChainReadyNoDblNegBool (Stack.Lower.computeLastUses wave28SmokeBody)
+      wave28SmokeBody ["p0", "p1", "p2", "p3", "p4"] 0 false = true := by
+  unfold wave28SmokeBody
+  decide
+
+/-- The 5-binding chain is in the refined (no-double-negate) fragment. -/
+private theorem wave38_chainReadyNoDblNeg :
+    emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses wave28SmokeBody)
+      wave28SmokeBody ["p0", "p1", "p2", "p3", "p4"] 0 false :=
+  (emittableArithChainReadyNoDblNegBool_iff _ _ _ _ _).mp wave38_chainReadyNoDblNegBool_true
+
+/-- **Wave 38 Step 3 smoke (positive).**  Both conjuncts of
+`loweredEmittableArithNoDblNeg_opShape` close UNCONDITIONALLY on the
+concrete 5-binding multi-binding emittable-arith body: the lowered list is
+`AreRunarEmittable`, and the peephole pipeline is the literal identity on
+it. No phase-identity hypotheses are supplied. -/
+private theorem wave38_opShape_smoke :
+    Parse.AreRunarEmittable
+      (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+          Stack.Lower.defaultInlineBudget 0 (Stack.Lower.computeLastUses wave28SmokeBody)
+          [] ["p0", "p1", "p2", "p3", "p4"]
+          (Stack.Lower.collectConstInts wave28SmokeBody)
+          ["p0", "p1", "p2", "p3", "p4"] wave28SmokeBody).1
+    ∧ Peephole.peepholeRollPickFold
+        (Peephole.peepholeChainFold
+          (Peephole.peepholePostFold
+            (Peephole.peepholePassAll
+              (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+                  Stack.Lower.defaultInlineBudget 0 (Stack.Lower.computeLastUses wave28SmokeBody)
+                  [] ["p0", "p1", "p2", "p3", "p4"]
+                  (Stack.Lower.collectConstInts wave28SmokeBody)
+                  ["p0", "p1", "p2", "p3", "p4"] wave28SmokeBody).1)))
+      = (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+          Stack.Lower.defaultInlineBudget 0 (Stack.Lower.computeLastUses wave28SmokeBody)
+          [] ["p0", "p1", "p2", "p3", "p4"]
+          (Stack.Lower.collectConstInts wave28SmokeBody)
+          ["p0", "p1", "p2", "p3", "p4"] wave28SmokeBody).1 :=
+  loweredEmittableArithNoDblNeg_opShape ([] : List ANFMethod) ([] : List ANFProperty)
+    Stack.Lower.defaultInlineBudget (Stack.Lower.computeLastUses wave28SmokeBody)
+    (Stack.Lower.collectConstInts wave28SmokeBody) wave28SmokeBody
+    ["p0", "p1", "p2", "p3", "p4"] ["p0", "p1", "p2", "p3", "p4"] 0 false
+    wave38_chainReadyNoDblNeg
+
+/-! Smoke 2: a body with TWO consecutive unary-negate bindings
+(`t0 = -p0; t1 = -t0`) is admitted by `emittableArithChainReady` but
+REJECTED by `emittableArithChainReadyNoDblNeg` — confirming the refinement
+genuinely excludes the fusable double-negate case. -/
+
+private def wave38DblNegBody : List ANFBinding :=
+  [ANFBinding.mk "t0" (.unaryOp "-" "p0" none) none,
+   ANFBinding.mk "t1" (.unaryOp "-" "t0" none) none]
+
+private def wave38DblNegLastUses : List (String × Nat) := [("p0", 0), ("t0", 1)]
+
+private def wave38DblNegSm : StackMap := ["p0"]
+
+/-- The double-negate body IS in the full `emittableArithChainReady`
+fragment (the unrefined predicate admits consecutive negates). -/
+private theorem wave38_dblNeg_inFullFragment :
+    emittableArithChainReady wave38DblNegLastUses wave38DblNegBody wave38DblNegSm 0 := by
+  unfold wave38DblNegBody wave38DblNegLastUses wave38DblNegSm
+  refine ⟨rfl, by decide, by unfold freshIn; decide, ?_⟩
+  refine ⟨rfl, by decide, by unfold freshIn; decide, ?_⟩
+  exact True.intro
+
+/-- **Wave 38 Step 1 smoke (negative).**  The SAME double-negate body is
+REJECTED by the refined fragment: `emittableArithChainReadyNoDblNeg`'s
+Bool mirror is `false` (the second `-t0` binding follows a unary-negate,
+violating the `prevWasNeg = false` side-condition). The refinement
+genuinely excludes the fusable case. -/
+private theorem wave38_dblNeg_excludedByRefinement :
+    emittableArithChainReadyNoDblNegBool wave38DblNegLastUses wave38DblNegBody
+      wave38DblNegSm 0 false = false := by
+  unfold wave38DblNegBody wave38DblNegLastUses wave38DblNegSm
+  decide
+
+/-- And the refined `Prop` is therefore NOT inhabited for the double-negate
+body (transported through the reflection). -/
+private theorem wave38_dblNeg_not_refined :
+    ¬ emittableArithChainReadyNoDblNeg wave38DblNegLastUses wave38DblNegBody
+        wave38DblNegSm 0 false := by
+  intro hRef
+  have hBool := (emittableArithChainReadyNoDblNegBool_iff
+    wave38DblNegLastUses wave38DblNegBody wave38DblNegSm 0 false).mpr hRef
+  rw [wave38_dblNeg_excludedByRefinement] at hBool
+  exact absurd hBool (by decide)
 
 /-- **Wave 28 Deliverable B — the length>3 lockstep capstone smoke.**
 

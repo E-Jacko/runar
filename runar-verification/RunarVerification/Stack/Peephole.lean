@@ -11141,5 +11141,513 @@ theorem peepholeRollPickFold_nil :
   peepholeRollPickFold_eq_self_of_noIfOp_flatNoop [] (by simp [noIfOp])
     (by intro op hOp; exact absurd hOp (by simp))
 
+/-! ### Wave 38 — `peepholePassAllFlat` / `peepholePostFold` identity on the
+refined (no-double-negate) emittable-arith op shape (M3 substrate)
+
+The (refined) emittable-arith fragment lowers each binding to either
+`[.swap, .opcode binop]` (binOp d0d1, `binop ∈ {OP_ADD,OP_SUB,OP_MUL}`)
+or `[.opcode "OP_NEGATE"]` (unaryOp d0). The whole lowered list is thus a
+list of `.swap` / `.opcode {OP_ADD,OP_SUB,OP_MUL,OP_NEGATE}` ops in which
+(after excluding two consecutive unary-negate bindings) no `[swap,swap]`
+window and no `[OP_NEGATE,OP_NEGATE]` window ever appears.
+
+`arithEmitNoFuse` is the structural Bool predicate that captures exactly
+that shape. On such a list every one of the 18 `peepholePassAllFlat`
+sub-rules is the identity: 11 fire only on a leading `.push` (absent
+here), 5 fire on opcode/constructor pairs absent from the arith op set
+(`OP_EQUAL/OP_VERIFY`, `OP_CHECKSIG/OP_VERIFY`, `OP_NUMEQUAL/OP_VERIFY`,
+`OP_SHA256/OP_SHA256`, `OP_NOT/OP_NOT`, `dup/drop`, `over/over`,
+`drop/drop`), and the remaining 2 (`applyDoubleSwap`, `applyDoubleNegate`)
+fire only on the two windows the predicate rules out. `peepholePostFold`
+likewise: `postFoldList` is the identity on `noIfOp` lists and the two
+flat post-fold rules (`applyPushOneAdd`/`applyPushOneSub`) fire only on a
+leading `.push`. -/
+
+/-- A single emittable-arith op: `.swap` or one of the four arith opcodes
+the refined fragment lowers to. -/
+def isArithEmitOp : StackOp → Bool
+  | .swap => true
+  | .opcode c => c == "OP_ADD" || c == "OP_SUB" || c == "OP_MUL" || c == "OP_NEGATE"
+  | _ => false
+
+/-- Structural shape of a lowered refined-emittable-arith op list: a list
+of `isArithEmitOp` ops with no fusable adjacency (`[swap,swap]` and
+`[OP_NEGATE,OP_NEGATE]` excluded). The two forbidden windows are pinned
+first; every other cons peels one op (re-checking adjacency at the next
+position) and recurses. -/
+def arithEmitNoFuse : List StackOp → Bool
+  | [] => true
+  | .swap :: .swap :: _ => false
+  | .opcode "OP_NEGATE" :: .opcode "OP_NEGATE" :: _ => false
+  | op :: rest => isArithEmitOp op && arithEmitNoFuse rest
+
+/-- From `arithEmitNoFuse (op :: rest)` (and `op` not opening a forbidden
+window with `rest`) recover `isArithEmitOp op` and `arithEmitNoFuse rest`.
+The two forbidden-window head shapes are handled by the caller's `cases`. -/
+private theorem arithEmitNoFuse_cons_tail
+    (op : StackOp) (rest : List StackOp)
+    (h : arithEmitNoFuse (op :: rest) = true) :
+    isArithEmitOp op = true ∧ arithEmitNoFuse rest = true := by
+  cases op with
+  | swap =>
+      cases rest with
+      | nil => exact ⟨rfl, rfl⟩
+      | cons op2 rest2 =>
+          cases op2 with
+          | swap => rw [show arithEmitNoFuse (StackOp.swap :: StackOp.swap :: rest2) = false from rfl] at h; exact absurd h (by decide)
+          | _ => exact Bool.and_eq_true_iff.mp h
+  | opcode c =>
+      cases rest with
+      | nil =>
+          refine ⟨?_, rfl⟩
+          simpa [arithEmitNoFuse] using h
+      | cons op2 rest2 =>
+          by_cases hc : c = "OP_NEGATE"
+          · subst hc
+            cases op2 with
+            | opcode c2 =>
+                by_cases hc2 : c2 = "OP_NEGATE"
+                · subst hc2
+                  rw [show arithEmitNoFuse (StackOp.opcode "OP_NEGATE" :: StackOp.opcode "OP_NEGATE" :: rest2) = false from rfl] at h
+                  exact absurd h (by decide)
+                · refine Bool.and_eq_true_iff.mp ?_
+                  simpa [arithEmitNoFuse, hc2] using h
+            | _ => exact Bool.and_eq_true_iff.mp (by simpa [arithEmitNoFuse] using h)
+          · exact Bool.and_eq_true_iff.mp (by simpa [arithEmitNoFuse, hc] using h)
+  | push _ => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | dup => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | roll _ => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | pick _ => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | pickStruct _ => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | drop => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | nip => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | over => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | rot => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | tuck => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | ifOp _ _ => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | placeholder _ _ => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | pushCodesepIndex => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+  | rawBytes _ => simp only [arithEmitNoFuse, isArithEmitOp, Bool.false_and, reduceCtorEq] at h
+
+/-- Reduction (constructor side): an `.opcode c` head with `c ≠ "OP_NEGATE"`
+never opens the `[OP_NEGATE,OP_NEGATE]` window, so `arithEmitNoFuse` peels
+it to `isArithEmitOp (.opcode c) && arithEmitNoFuse rest`. -/
+theorem arithEmitNoFuse_cons_opcode_nonNeg (c : String) (rest : List StackOp)
+    (hc : c ≠ "OP_NEGATE") :
+    arithEmitNoFuse (.opcode c :: rest) = (isArithEmitOp (.opcode c) && arithEmitNoFuse rest) := by
+  rw [arithEmitNoFuse]
+  · intro tail heq _; exact absurd heq (by simp)
+  · intro tail heq _; injection heq with hcEq; exact hc hcEq
+
+/-- Reduction (constructor side): a `.swap` head followed by a non-`.swap`
+op never opens the `[swap,swap]` window. Stated for the binOp chunk's
+`.swap :: .opcode binop :: tail` shape (second op is `.opcode`, never
+`.swap`), where the reduction is definitional. -/
+theorem arithEmitNoFuse_cons_swap_opcode (binop : String) (tail : List StackOp) :
+    arithEmitNoFuse (.swap :: .opcode binop :: tail)
+      = arithEmitNoFuse (.opcode binop :: tail) := rfl
+
+/-- `isArithEmitOp (.opcode c) = true` pins `c` to one of the four arith
+opcodes. -/
+private theorem arithEmitOpcode_cases (c : String)
+    (h : isArithEmitOp (.opcode c) = true) :
+    c = "OP_ADD" ∨ c = "OP_SUB" ∨ c = "OP_MUL" ∨ c = "OP_NEGATE" := by
+  simp only [isArithEmitOp, Bool.or_eq_true, beq_iff_eq] at h
+  rcases h with ((h | h) | h) | h
+  · exact Or.inl h
+  · exact Or.inr (Or.inl h)
+  · exact Or.inr (Or.inr (Or.inl h))
+  · exact Or.inr (Or.inr (Or.inr h))
+
+/-! ### Wave 38 — the per-rule identity lemmas on `arithEmitNoFuse` lists
+
+Each of the 18 `peepholePassAllFlat` rules + the 2 `peepholePostFold`
+flat rules is the identity on an `arithEmitNoFuse` list. The push-rooted
+rules never fire (no `.push`); the opcode/constructor-pair rules whose
+trigger ops are outside `{OP_ADD,OP_SUB,OP_MUL,OP_NEGATE,.swap}` never
+fire; `applyDoubleSwap`/`applyDoubleNegate` fire only on the two windows
+the predicate forbids. The proofs share one shape: induct on `ops`, peel
+the head with `arithEmitNoFuse_cons_tail`, pin a `.opcode` head to one of
+the four arith opcodes with `arithEmitOpcode_cases`, and (for the two
+window rules) case on the second op to expose the forbidden adjacency. -/
+
+private theorem applyDropAfterPush_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyDropAfterPush ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyDropAfterPush, ih hRest]
+      | opcode c => simp only [applyDropAfterPush, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyDupDrop_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyDupDrop ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyDupDrop, ih hRest]
+      | opcode c => simp only [applyDupDrop, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyDoubleSwap_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyDoubleSwap ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap =>
+          cases rest with
+          | nil => rfl
+          | cons op2 rest2 =>
+              obtain ⟨hOp2, _⟩ := arithEmitNoFuse_cons_tail op2 rest2 hRest
+              cases op2 with
+              | swap =>
+                  rw [show arithEmitNoFuse (StackOp.swap :: StackOp.swap :: rest2) = false from rfl] at h
+                  exact absurd h (by decide)
+              | opcode c =>
+                  rw [show applyDoubleSwap (StackOp.swap :: StackOp.opcode c :: rest2)
+                        = StackOp.swap :: applyDoubleSwap (StackOp.opcode c :: rest2) from rfl, ih hRest]
+              | _ => exact absurd hOp2 (by simp only [isArithEmitOp]; decide)
+      | opcode c => simp only [applyDoubleSwap, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyEqualVerifyFuse_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyEqualVerifyFuse ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyEqualVerifyFuse, ih hRest]
+      | opcode c =>
+          rcases arithEmitOpcode_cases c hOp with hc | hc | hc | hc <;> subst hc <;>
+            simp [applyEqualVerifyFuse, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyCheckSigVerifyFuse_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyCheckSigVerifyFuse ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyCheckSigVerifyFuse, ih hRest]
+      | opcode c =>
+          rcases arithEmitOpcode_cases c hOp with hc | hc | hc | hc <;> subst hc <;>
+            simp [applyCheckSigVerifyFuse, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyNumEqualVerifyFuse_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyNumEqualVerifyFuse ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyNumEqualVerifyFuse, ih hRest]
+      | opcode c =>
+          rcases arithEmitOpcode_cases c hOp with hc | hc | hc | hc <;> subst hc <;>
+            simp [applyNumEqualVerifyFuse, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyZeroNumEqual_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyZeroNumEqual ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyZeroNumEqual, ih hRest]
+      | opcode c => simp only [applyZeroNumEqual, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyDoubleSha256_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyDoubleSha256 ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyDoubleSha256, ih hRest]
+      | opcode c =>
+          rcases arithEmitOpcode_cases c hOp with hc | hc | hc | hc <;> subst hc <;>
+            simp [applyDoubleSha256, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyDoubleDrop_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyDoubleDrop ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyDoubleDrop, ih hRest]
+      | opcode c => simp only [applyDoubleDrop, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyDoubleOver_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyDoubleOver ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyDoubleOver, ih hRest]
+      | opcode c => simp only [applyDoubleOver, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyDoubleNot_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyDoubleNot ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyDoubleNot, ih hRest]
+      | opcode c =>
+          rcases arithEmitOpcode_cases c hOp with hc | hc | hc | hc <;> subst hc <;>
+            simp [applyDoubleNot, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyDoubleNegate_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyDoubleNegate ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyDoubleNegate, ih hRest]
+      | opcode c =>
+          rcases arithEmitOpcode_cases c hOp with hc | hc | hc | hc <;> subst hc
+          · rw [show applyDoubleNegate (StackOp.opcode "OP_ADD" :: rest)
+                  = StackOp.opcode "OP_ADD" :: applyDoubleNegate rest from rfl, ih hRest]
+          · rw [show applyDoubleNegate (StackOp.opcode "OP_SUB" :: rest)
+                  = StackOp.opcode "OP_SUB" :: applyDoubleNegate rest from rfl, ih hRest]
+          · rw [show applyDoubleNegate (StackOp.opcode "OP_MUL" :: rest)
+                  = StackOp.opcode "OP_MUL" :: applyDoubleNegate rest from rfl, ih hRest]
+          · cases rest with
+            | nil => rfl
+            | cons op2 rest2 =>
+                obtain ⟨hOp2, _⟩ := arithEmitNoFuse_cons_tail op2 rest2 hRest
+                cases op2 with
+                | swap =>
+                    rw [show applyDoubleNegate (StackOp.opcode "OP_NEGATE" :: StackOp.swap :: rest2)
+                          = StackOp.opcode "OP_NEGATE" :: applyDoubleNegate (StackOp.swap :: rest2) from rfl, ih hRest]
+                | opcode c2 =>
+                    by_cases hc2 : c2 = "OP_NEGATE"
+                    · subst hc2
+                      rw [show arithEmitNoFuse (StackOp.opcode "OP_NEGATE" :: StackOp.opcode "OP_NEGATE" :: rest2) = false from rfl] at h
+                      exact absurd h (by decide)
+                    · have hred : applyDoubleNegate (StackOp.opcode "OP_NEGATE" :: StackOp.opcode c2 :: rest2)
+                            = StackOp.opcode "OP_NEGATE" :: applyDoubleNegate (StackOp.opcode c2 :: rest2) := by
+                          rw [applyDoubleNegate]
+                          intro rest _ heq
+                          injection heq with hh _
+                          injection hh with hc
+                          exact hc2 hc
+                      rw [hred, ih hRest]
+                | _ => exact absurd hOp2 (by simp only [isArithEmitOp]; decide)
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyOneSub_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyOneSub ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyOneSub, ih hRest]
+      | opcode c => simp only [applyOneSub, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyOneAdd_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyOneAdd ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyOneAdd, ih hRest]
+      | opcode c => simp only [applyOneAdd, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applySubZero_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applySubZero ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applySubZero, ih hRest]
+      | opcode c => simp only [applySubZero, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyAddZero_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyAddZero ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyAddZero, ih hRest]
+      | opcode c => simp only [applyAddZero, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyPushPushMul_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyPushPushMul ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyPushPushMul, ih hRest]
+      | opcode c => simp only [applyPushPushMul, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyPushPushSub_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyPushPushSub ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyPushPushSub, ih hRest]
+      | opcode c => simp only [applyPushPushSub, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyPushPushAdd_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyPushPushAdd ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyPushPushAdd, ih hRest]
+      | opcode c => simp only [applyPushPushAdd, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyPushOneAdd_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyPushOneAdd ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyPushOneAdd, ih hRest]
+      | opcode c => simp only [applyPushOneAdd, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+private theorem applyPushOneSub_eq_self_of_arithEmit :
+    ∀ (ops : List StackOp), arithEmitNoFuse ops = true → applyPushOneSub ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := arithEmitNoFuse_cons_tail op rest h
+      cases op with
+      | swap => simp only [applyPushOneSub, ih hRest]
+      | opcode c => simp only [applyPushOneSub, ih hRest]
+      | _ => exact absurd hOp (by simp only [isArithEmitOp]; decide)
+
+/-- **Wave 38 — `peepholePassAllFlat` is the identity on the refined
+emittable-arith op shape.** All 18 sub-rules are the identity (above), so
+their composition is. -/
+theorem peepholePassAllFlat_eq_self_of_arithEmit
+    (ops : List StackOp) (h : arithEmitNoFuse ops = true) :
+    peepholePassAllFlat ops = ops := by
+  unfold peepholePassAllFlat
+  rw [applyDropAfterPush_eq_self_of_arithEmit ops h,
+      applyDupDrop_eq_self_of_arithEmit ops h,
+      applyDoubleSwap_eq_self_of_arithEmit ops h,
+      applyPushPushAdd_eq_self_of_arithEmit ops h,
+      applyPushPushSub_eq_self_of_arithEmit ops h,
+      applyPushPushMul_eq_self_of_arithEmit ops h,
+      applyAddZero_eq_self_of_arithEmit ops h,
+      applySubZero_eq_self_of_arithEmit ops h,
+      applyOneAdd_eq_self_of_arithEmit ops h,
+      applyOneSub_eq_self_of_arithEmit ops h,
+      applyDoubleNegate_eq_self_of_arithEmit ops h,
+      applyDoubleNot_eq_self_of_arithEmit ops h,
+      applyDoubleOver_eq_self_of_arithEmit ops h,
+      applyDoubleDrop_eq_self_of_arithEmit ops h,
+      applyDoubleSha256_eq_self_of_arithEmit ops h,
+      applyZeroNumEqual_eq_self_of_arithEmit ops h,
+      applyNumEqualVerifyFuse_eq_self_of_arithEmit ops h,
+      applyCheckSigVerifyFuse_eq_self_of_arithEmit ops h,
+      applyEqualVerifyFuse_eq_self_of_arithEmit ops h]
+
+/-- `postFoldList` is the identity on `noIfOp` lists: it only rewrites
+`.ifOp` branches, absent here. -/
+private theorem postFoldList_eq_self_of_noIfOp :
+    ∀ (ops : List StackOp), noIfOp ops → postFoldList ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; rfl
+  | cons op rest ih =>
+      intro hNo
+      cases op with
+      | ifOp _ _ => exact absurd hNo (by simp [noIfOp])
+      | _ =>
+          have hRest : noIfOp rest := by simpa only [noIfOp] using hNo
+          simp only [postFoldList, postFoldOp, ih hRest]
+
+/-- **Wave 38 — `peepholePostFold` is the identity on the refined
+emittable-arith op shape.** `postFoldList` is the identity (no `.ifOp`),
+and the two flat post-fold rules (`applyPushOneAdd`/`applyPushOneSub`)
+fire only on a leading `.push`, absent here. -/
+theorem peepholePostFold_eq_self_of_arithEmit
+    (ops : List StackOp) (hNoIf : noIfOp ops) (h : arithEmitNoFuse ops = true) :
+    peepholePostFold ops = ops := by
+  unfold peepholePostFold
+  rw [postFoldList_eq_self_of_noIfOp ops hNoIf,
+      applyPushOneAdd_eq_self_of_arithEmit ops h,
+      applyPushOneSub_eq_self_of_arithEmit ops h]
+
 end Peephole
 end RunarVerification.Stack
