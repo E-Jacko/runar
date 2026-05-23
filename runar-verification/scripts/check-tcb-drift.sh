@@ -20,7 +20,33 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=86        # Breakdown (2026-05-23, Tier 1 wave 39 —
+TARGET_AXIOMS=85        # Breakdown (2026-05-23, Tier 1 wave 45 —
+                        # SECOND TCB axiom retirement):
+                        # −1 in Pipeline.lean — the if_val sub-omnibus
+                        #     `compileSafe_observational_correct_modulo_if_val_codegen`
+                        #     RETIRED. Its omnibus dispatch branch is now
+                        #     discharged by the theorem
+                        #     `compileSafe_observational_correct_ifval_consume`
+                        #     for the single-public, self-contained,
+                        #     arith-branch `if_val` fragment (`ifValArithBody`
+                        #     + a `.bool`-typed head cond via `CondBoolTyped`).
+                        #     The 4-leg discharge composes the wave-44 entry
+                        #     walk (M2 `successAgrees_ifVal_arith_from_entry`),
+                        #     the wave-42 `.ifOp` op-shape (M3 op-list-identity
+                        #     bypass + M4 WithIf round-trip via
+                        #     `compileSafe_single_public_runOps_eq_with_if`),
+                        #     and the wave-21 shape derivation. The omnibus's
+                        #     keyed typed-entry premises keep it jointly
+                        #     satisfiable across both the arith and if_val
+                        #     families. Residual if_val bodies (nested if_val,
+                        #     non-self-contained branches, non-arith branches)
+                        #     fall through to the sound crypto_call fallback —
+                        #     NO new axiom. The retired theorem's #print axioms
+                        #     lists only propext / Classical.choice / Quot.sound
+                        #     + the 3 crypto backends (NO sub-omnibus axiom).
+                        # Net delta: −1, 86 → 85.
+                        #
+                        # Breakdown (2026-05-23, Tier 1 wave 39 —
                         # FIRST TCB axiom retirement):
                         # −1 in Pipeline.lean — the arith sub-omnibus
                         #     `compileSafe_observational_correct_modulo_arith_codegen`

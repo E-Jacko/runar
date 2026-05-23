@@ -9,7 +9,7 @@ counts:
 
 | Item | Count | Meaning |
 |---|---:|---|
-| Project axioms | 86 | Named assumptions in Lean code |
+| Project axioms | 85 | Named assumptions in Lean code |
 | Opaque executable defaults | 0 | No executable bodies hidden from proofs |
 | Opaque defaults with bodies | 0 | No opaque declarations carry defaults |
 | `partial def` | 0 | No partial definitions under `RunarVerification/` |
@@ -52,6 +52,7 @@ that are preserved by design.
 | Tier 1 wave 25: alignment re-statement | 2026-05-21 | 87 | 0 | 0 (9 sub-omnibus axiom *signatures* gain an alignment premise; no axiom added or retired) | 0 |
 | Tier 1 waves 26–29: consume-arith retirement substrate | 2026-05-21 | 87 | 0 | 0 (M2 capstone + reflection + M3/M4/shape + operational lockstep all built; arith retirement gated on the `taggedAllBigint` typing bridge / both-fail leg — see the waves-26–29 section) | 0 |
 | **Tier 1 wave 39: FIRST axiom retirement (arith)** | 2026-05-23 | **86** | **−1** | −1 (`compileSafe_observational_correct_modulo_arith_codegen` retired; its omnibus branch discharged by the theorem `compileSafe_observational_correct_arith_consume` for the single-public, no-double-negate, emittable consume-arith fragment under wave-34 typed-entry premises; residual arith bodies fall through to the sound `crypto_call` fallback — NO new axiom) | 0 |
+| **Tier 1 wave 45: SECOND axiom retirement (if_val)** | 2026-05-23 | **85** | **−1** | −1 (`compileSafe_observational_correct_modulo_if_val_codegen` retired; its omnibus branch discharged by the theorem `compileSafe_observational_correct_ifval_consume` for the single-public, self-contained, arith-branch `if_val` fragment — `ifValArithBody` + a `.bool`-typed head cond via `CondBoolTyped`; 4-leg discharge composes the wave-44 entry walk M2 + the wave-42 `.ifOp` op-shape M3/M4 — the M4 leg uses the WithIf parse round-trip `compileSafe_single_public_runOps_eq_with_if` — + the wave-21 shape derivation. The omnibus's typed-entry premises are keyed implications so the omnibus stays jointly satisfiable across the arith and if_val families. Residual if_val bodies — nested if_val, non-self-contained branches, non-arith branches — fall through to the sound `crypto_call` fallback — NO new axiom. `#print axioms compileSafe_observational_correct_ifval_consume` = propext / Classical.choice / Quot.sound + 3 crypto backends, NO sub-omnibus axiom) | 0 |
 
 **Net Tier 1 wave 2 (2026-05-17, omnibus-split inflation + Stage C widenings):** 78 → 86,
 Δ = +8 (intentional). The 9 per-family sub-omnibuses replace the single omnibus
@@ -151,7 +152,24 @@ planned sub-omnibus inventory:
   for bodies with `update_prop`. Discharged once A5 widening
   completes.
 * `compileSafe_observational_correct_modulo_if_val_codegen` —
-  Discharged once A6 widening completes.
+  **RETIRED (Wave 45, 2026-05-23 — the SECOND TCB axiom retirement).**
+  Its omnibus dispatch branch is now discharged by the theorem
+  `compileSafe_observational_correct_ifval_consume` for the
+  single-public, self-contained, arith-branch `if_val` fragment
+  (`ifValArithBody` + a `.bool`-typed head cond via `CondBoolTyped` +
+  the residual decidable structural facts: cond at the head slot, its
+  last use is the if, and `ifValInnerProtected = []`). The 4-leg
+  discharge composes the wave-44 entry walk
+  (M2 `successAgrees_ifVal_arith_from_entry`), the wave-42 `.ifOp`
+  op-shape (M3 op-list-identity bypass + M4 WithIf parse round-trip via
+  `compileSafe_single_public_runOps_eq_with_if`), and the wave-21 shape
+  derivation. The omnibus's typed-entry premises (`hTsmTyped`,
+  `hIfValTyped`) are keyed implications on the mutually-exclusive arith
+  / if_val body classifiers, so the omnibus stays jointly satisfiable
+  across both families (the if_val cond is `.bool`, the arith slots are
+  `.bigint`). Residual if_val bodies outside the discharged fragment
+  (nested if_val, non-self-contained branches, non-arith branches) fall
+  through to the sound `crypto_call` fallback — no replacement axiom.
 * `compileSafe_observational_correct_modulo_loop_codegen` —
   Discharged once A7 widening completes.
 * `compileSafe_observational_correct_modulo_method_call_codegen` —
@@ -179,7 +197,7 @@ permanent axiom inflation.
 | `RunarVerification/Stack/Wots.lean` | 1 | Phase B8 codegen-to-spec axiom (`runOps_wotsBodyOps_eq`) |
 | `RunarVerification/Stack/Rabin.lean` | 1 | Phase B10 codegen-to-spec axiom (`runOps_rabinBodyOps_eq`) |
 | `RunarVerification/Stack/TxContext.lean` | 0 | Concrete BIP-143 context/preimage model; no companion assumptions |
-| `RunarVerification/Pipeline.lean` | 10 | Phase D codegen-soundness axioms (`merkle_dispatch_selection_correct`, `auto_state_output_at_method_exit_correct`) + 8 O1 per-family sub-omnibus axioms (math/byte-call, crypto-call, update-prop, if-val, loop, method-call, dispatch, stateful). The harness omnibus `compileSafe_observational_correct_modulo_codegen_axioms` is a `theorem` (not an axiom) that dispatches into these. **Wave 39 (2026-05-23) retired the arith sub-omnibus** `compileSafe_observational_correct_modulo_arith_codegen` (9 → 8 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_arith_consume`; net −1 |
+| `RunarVerification/Pipeline.lean` | 9 | Phase D codegen-soundness axioms (`merkle_dispatch_selection_correct`, `auto_state_output_at_method_exit_correct`) + 7 O1 per-family sub-omnibus axioms (math/byte-call, crypto-call, update-prop, loop, method-call, dispatch, stateful). The harness omnibus `compileSafe_observational_correct_modulo_codegen_axioms` is a `theorem` (not an axiom) that dispatches into these. **Wave 39 (2026-05-23) retired the arith sub-omnibus** `compileSafe_observational_correct_modulo_arith_codegen` (9 → 8 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_arith_consume`. **Wave 45 (2026-05-23) retired the if_val sub-omnibus** `compileSafe_observational_correct_modulo_if_val_codegen` (8 → 7 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_ifval_consume`; net −1 |
 
 Tier B11 (2026-05-16) replaced the `buildChangeOutput` and
 `computeStateOutput` axioms with concrete `def`s and exposed them —

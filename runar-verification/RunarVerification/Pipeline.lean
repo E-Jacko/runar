@@ -5,6 +5,7 @@ import RunarVerification.Stack.Lower
 import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
 import RunarVerification.Stack.AgreesA3
+import RunarVerification.Stack.AgreesA6
 import RunarVerification.Stack.Peephole
 import RunarVerification.Stack.Eval
 import RunarVerification.Stack.TxContext
@@ -2648,7 +2649,10 @@ integration omnibus — planned split"):
 * `compileSafe_observational_correct_modulo_update_prop_codegen` —
   bodies with `update_prop`. Discharged once A5 widening completes.
 * `compileSafe_observational_correct_modulo_if_val_codegen` —
-  Discharged once A6 widening completes.
+  RETIRED (Wave 45, 2026-05-23): the single-public, self-contained,
+  arith-branch `if_val` fragment is discharged by the theorem
+  `compileSafe_observational_correct_ifval_consume`; residual if_val
+  bodies fall through to the sound `crypto_call` fallback.
 * `compileSafe_observational_correct_modulo_loop_codegen` —
   Discharged once A7 widening completes.
 * `compileSafe_observational_correct_modulo_method_call_codegen` —
@@ -2784,36 +2788,14 @@ axiom compileSafe_observational_correct_modulo_update_prop_codegen (p : ANFProgr
       (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
-/-- **O1 sub-omnibus — if_val family.**
-
-Phase D harness integration: codegen-soundness for ANF bodies with
-`ifVal` bindings (conditional value selection lowered to
-`OP_IF / OP_ELSE / OP_ENDIF`). The hypothesis `hIfVal` requires the
-body to satisfy `Agrees.structuralIfValBodyBool`.
-
-Discharge path: this sub-omnibus retires once Stage C A6 widening
-completes; see `PATH2_PLAN.md` §5.23.
--/
-axiom compileSafe_observational_correct_modulo_if_val_codegen (p : ANFProgram)
-    (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (_hMem : anfM ∈ p.methods) (_hPublic : anfM.isPublic = true)
-    (_hSafe : compileSafe p = .ok bytes)
-    (initialAnf : State) (initialStack : StackState)
-    (tsm : Agrees.TaggedStackMap)
-    (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hIfVal :
-      Agrees.structuralIfValBodyBool
-        p.methods p.properties
-        Lower.defaultInlineBudget
-        (Lower.computeLastUses anfM.body) []
-        (anfM.body.map (·.name))
-        (Lower.collectConstInts anfM.body)
-        anfM.body
-        (List.reverse (anfM.params.map (·.name)))
-        0 = true) :
-    successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
-      (runParsedBytes bytes initialStack)
+-- **O1 sub-omnibus — if_val family — RETIRED (Tier 1 Wave 45, 2026-05-23).**
+-- The `compileSafe_observational_correct_modulo_if_val_codegen` axiom is
+-- RETIRED.  Its omnibus branch is now discharged by the theorem
+-- `compileSafe_observational_correct_ifval_consume` for the single-public,
+-- self-contained, arith-branch `if_val` fragment (`ifValArithBody` + a
+-- `.bool`-typed head cond via `CondBoolTyped`).  Bodies OUTSIDE that fragment
+-- (nested if_val, non-self-contained branches, non-arith branches) fall
+-- through to the sound crypto_call fallback — NO new axiom is introduced.
 
 /-- **O1 sub-omnibus — loop family.**
 
@@ -3734,6 +3716,237 @@ theorem compileSafe_observational_correct_arith_consume
     rw [hM4]; exact hM3Ops
   exact successAgrees_trans _ _ _ hM2Method hParsed
 
+/-- **Wave 45 Step 1 — the dispatch-level consume-`if_val` correctness
+theorem.**
+
+For a single-public method whose body is exactly one `.ifVal` binding
+with arith branches (`ifValArithBody`), a bool-typed condition at the head
+slot (`CondBoolTyped`), and self-contained branches (the residual
+structural facts `hCondHead` / `hLast` / `hIPThn` / `hIPEls`), the deployed
+`compileSafe` bytes are observationally correct.
+
+This is the 4-leg transitivity that retires
+`compileSafe_observational_correct_modulo_if_val_codegen`, mirroring the
+wave-39 arith retirement exactly:
+
+* **M2** — the wave-44 entry-only `if_val` walk
+  `successAgrees_ifVal_arith_from_entry` gives the body-level success iff
+  between `evalBindings` and `runOps (lowerBindingsP …).1`, bridged to the
+  method level via `lowerMethod_ops_eq_userRaw_no_implicits_no_post` +
+  `findMethod_lower_public_unique` (same framing wave 39 used).
+* **M3** — the wave-42 op-shape's peephole-identity conjunct feeds
+  `peephole_M3_unconditional_of_bodyId` (the `.ifOp`-bearing op list is a
+  peephole fixpoint).
+* **M4** — the op-shape's `AreRunarEmittableWithIf` conjunct feeds the
+  WithIf parse round-trip `compileSafe_single_public_runOps_eq_with_if`.
+* **shape** — `peepholeProgram_single_public_shape` from `hSinglePublic` /
+  `hName`.
+
+All hypotheses are dispatch-suppliable: the typed bundle from the omnibus's
+new if_val premise, the residual structural facts by decidable `by_cases`,
+and the standard `agreesTagged` alignment. -/
+theorem compileSafe_observational_correct_ifval_consume
+    (p : ANFProgram) (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (bn cond : String) (k : Agrees.SlotKind)
+    (thn els : List ANFBinding) (src : Option SourceLoc)
+    (branchTsm : Agrees.TaggedStackMap)
+    (hBodyEq : anfM.body = [.mk bn (.ifVal cond thn els) src])
+    (hAgrees :
+      Agrees.agreesTagged ((cond, k) :: branchTsm) initialAnf initialStack)
+    (hFrag :
+      Agrees.ifValArithBody p.methods p.properties Lower.defaultInlineBudget 0
+        (Lower.computeLastUses anfM.body) []
+        (Lower.collectConstInts anfM.body)
+        (List.reverse (anfM.params.map (·.name)))
+        anfM.body)
+    (hUntag :
+      Agrees.untagSm ((cond, k) :: branchTsm)
+        = List.reverse (anfM.params.map (·.name)))
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hTsmTyped : Agrees.entryTsmArithTyped Γ branchTsm)
+    (hCoh : Agrees.tsmCoherent initialAnf ((cond, k) :: branchTsm))
+    (hCondBool : RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond)
+    (hCondHead :
+      Stack.Lower.StackMap.depth?
+        (List.reverse (anfM.params.map (·.name))) cond = some 0)
+    (hLast :
+      Stack.Lower.isLastUse (Lower.computeLastUses anfM.body) cond 0 = true)
+    (hIPThn :
+      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (·.name)))
+        cond 0 (Lower.computeLastUses anfM.body) [] = [])
+    (hIPEls :
+      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (·.name)))
+        cond 0 (Lower.computeLastUses anfM.body) [] = []) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  -- Pin every `anfM.body` occurrence to the single-`.ifVal` literal so the
+  -- fragment destructure, the residual structural facts, and the lowering
+  -- inputs all share one syntactic body.
+  rw [hBodyEq] at hFrag hLast hIPThn hIPEls
+  -- Local abbreviations matching the lowering inputs (keyed to the literal).
+  let BODY : List ANFBinding := [.mk bn (.ifVal cond thn els) src]
+  let lastUses     := Lower.computeLastUses BODY
+  let localBindings := BODY.map (·.name)
+  let constInts    := Lower.collectConstInts BODY
+  let SM : Stack.Lower.StackMap := List.reverse (anfM.params.map (·.name))
+  -- The fragment's branch-arith conjuncts.
+  obtain ⟨hThnChain, hElsChain, hClean⟩ := hFrag
+  -- Each branch is `arithOnlyBody` (head binding of branch is binOp/unaryOp).
+  have hThnArith : arithOnlyBody thn :=
+    arithOnlyBody_of_emittableArithChainReadyNoDblNeg
+      (Stack.Lower.computeLastUses thn) thn
+      (Agrees.ifValSmBranch SM cond 0 lastUses []) 0 false hThnChain
+  have hElsArith : arithOnlyBody els :=
+    arithOnlyBody_of_emittableArithChainReadyNoDblNeg
+      (Stack.Lower.computeLastUses els) els
+      (Agrees.ifValSmBranch SM cond 0 lastUses []) 0 false hElsChain
+  -- The single-`.ifVal` body uses no implicit params / post-pass: each
+  -- `bindingsUseX` recurses into both branches (both arith-only ⇒ false).
+  have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false := by
+    rw [hBodyEq]
+    simp only [Lower.bindingsUseCheckPreimage, Bool.or_false,
+      bindingsUseCheckPreimage_false_of_arithOnly thn hThnArith,
+      bindingsUseCheckPreimage_false_of_arithOnly els hElsArith]
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := by
+    rw [hBodyEq]
+    simp only [Lower.bindingsUseCodePart, Bool.or_false,
+      bindingsUseCodePart_false_of_arithOnly thn hThnArith,
+      bindingsUseCodePart_false_of_arithOnly els hElsArith]
+  have hNoDeserialize : Lower.bindingsUseDeserializeState anfM.body = false := by
+    rw [hBodyEq]
+    simp only [Lower.bindingsUseDeserializeState, Bool.or_false,
+      bindingsUseDeserializeState_false_of_arithOnly thn hThnArith,
+      bindingsUseDeserializeState_false_of_arithOnly els hElsArith]
+  have hNoTerminalAssert : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBodyEq]; rfl
+  -- The raw lowered op list of the single-`.ifVal` body.
+  let RAW :=
+      (Stack.Lower.lowerBindingsP p.methods p.properties
+        Lower.defaultInlineBudget 0 lastUses []
+        localBindings constInts SM
+        [.mk bn (.ifVal cond thn els) src]).1
+  have hRAW :
+      RAW =
+        (Stack.Lower.lowerBindingsP p.methods p.properties
+          Lower.defaultInlineBudget 0 lastUses []
+          localBindings constInts SM
+          [.mk bn (.ifVal cond thn els) src]).1 := rfl
+  -- The cond-load collapses to `[]` (head slot, last-use is the if).
+  have hCondEmpty :
+      (Stack.Lower.loadRefLive SM cond 0 lastUses []).1 = [] :=
+    Agrees.ifValCondLoad_empty SM cond 0 lastUses hCondHead hLast
+  -- Wave 42 op-shape: `AreRunarEmittableWithIf RAW` and `peepholeMethodOps RAW = RAW`.
+  have hShape :
+      RunarVerification.Script.Parse.AreRunarEmittableWithIf RAW
+      ∧ Peephole.peepholeRollPickFold
+          (Peephole.peepholeChainFold
+            (Peephole.peepholePostFold
+              (Peephole.peepholePassAll RAW)))
+        = RAW :=
+    Agrees.loweredIfValArith_opShape p.methods p.properties
+      Lower.defaultInlineBudget 0 lastUses localBindings constInts SM
+      bn cond thn els src hThnChain hElsChain hClean hIPThn hCondEmpty
+  obtain ⟨hEmittable, hPeepId⟩ := hShape
+  have hMethodOpsId : peepholeMethodOps RAW = RAW := by
+    rw [peepholeMethodOps_eq]; exact hPeepId
+  -- Unique-public selection bridge.
+  have hUnique :
+      ∀ m', m' ∈ p.methods → m'.isPublic = true →
+        (m'.name == anfM.name) = true → m' = anfM :=
+    unique_public_of_filter_singleton p anfM hSinglePublic
+  have hP : p =
+      { contractName := p.contractName,
+        properties := p.properties,
+        methods := p.methods } := rfl
+  have hBodyOfRaw :
+      (Lower.lower p).bodyOf anfM.name
+        = (Lower.lowerMethod p.methods p.properties anfM).ops := by
+    unfold StackProgram.bodyOf
+    rw [hP, Agrees.findMethod_lower_public_unique
+          p.contractName p.properties p.methods anfM hMem hPublic hUnique]
+  have hMethodOpsRaw :
+      (Lower.lowerMethod p.methods p.properties anfM).ops = RAW := by
+    rw [Agrees.lowerMethod_ops_eq_userRaw_no_implicits_no_post
+          p.methods p.properties anfM hNoPreimage hNoCode hNoTerminalAssert
+          hNoDeserialize]
+    unfold Agrees.lowerMethodUserRawOps
+    rw [hBodyEq, hRAW]
+  have hBodyOfEqRaw : (Lower.lower p).bodyOf anfM.name = RAW := by
+    rw [hBodyOfRaw, hMethodOpsRaw]
+  -- Leg M2: ANF eval agrees with `runOps RAW` (the wave-44 entry walk).
+  have hM2 :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+        (runOps RAW initialStack) := by
+    rw [hBodyEq, hRAW]
+    exact Agrees.successAgrees_ifVal_arith_from_entry
+      p.methods p.properties Lower.defaultInlineBudget lastUses
+      localBindings constInts Γ SM bn cond k thn els src branchTsm
+      initialAnf initialStack
+      ⟨hThnChain, hElsChain, hClean⟩
+      hAgrees hTypedEntry hTsmTyped hCoh hCondBool hUntag
+      hLast hIPThn hIPEls
+  -- Leg M2→method.
+  have hM2Method :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+        (runMethod (Lower.lower p) anfM.name initialStack) := by
+    have hRunEq :
+        runMethod (Lower.lower p) anfM.name initialStack = runOps RAW initialStack := by
+      unfold runMethod
+      rw [hBodyOfEqRaw]
+    rw [hRunEq]; exact hM2
+  -- Leg M3: peephole preserves the run result (op-list-identity regime).
+  have hM3 :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runMethod (peepholeProgram (Lower.lower p)) anfM.name initialStack) := by
+    apply peephole_M3_unconditional_of_bodyId (Lower.lower p) anfM.name initialStack
+    rw [hBodyOfEqRaw]; exact hMethodOpsId
+  -- shape: the post-peephole program is single-public with body `RAW`.
+  obtain ⟨hPubSingleton, hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hPeepedOpsRaw : (peepholedLoweredMethod p anfM).ops = RAW := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = RAW
+    rw [hMethodOpsRaw]; exact hMethodOpsId
+  have hPeepBodyRaw :
+      (peepholeProgram (Lower.lower p)).bodyOf anfM.name = RAW := by
+    rw [hStackBody, hPeepedOpsRaw]
+  have hM3Ops :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runOps RAW initialStack) := by
+    have hRunEq :
+        runMethod (peepholeProgram (Lower.lower p)) anfM.name initialStack
+          = runOps RAW initialStack := by
+      unfold runMethod
+      rw [hPeepBodyRaw]
+    rw [← hRunEq]; exact hM3
+  -- Leg M4: `runParsedBytes bytes = runOps RAW` via the WithIf round-trip.
+  have hM4 :
+      runParsedBytes bytes initialStack = runOps RAW initialStack := by
+    have hEq :
+        runParsedBytes bytes initialStack
+          = runOps (peepholedLoweredMethod p anfM).ops initialStack :=
+      compileSafe_single_public_runOps_eq_with_if p bytes (peepholedLoweredMethod p anfM)
+        initialStack hSafe hPubSingleton
+        (by rw [hPeepedOpsRaw]; exact hEmittable)
+    rw [hEq, hPeepedOpsRaw]
+  -- Compose: M2 ∘ M3 ∘ M4.
+  have hParsed :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runParsedBytes bytes initialStack) := by
+    rw [hM4]; exact hM3Ops
+  exact successAgrees_trans _ _ _ hM2Method hParsed
+
 /--
 **Harness-level codegen-soundness theorem (Phase D harness integration).**
 
@@ -3791,7 +4004,30 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     (hUntag :
       Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
-    (hTsmTyped : Agrees.entryTsmArithTyped Γ tsm)
+    -- **Wave 39 arith typed-entry premise (keyed).**  The arith branch needs
+    -- every entry slot `.bigint`-typed; this is only meaningful when the body
+    -- is the no-double-negate emittable arith fragment.  As an implication on
+    -- the (mutually exclusive) arith classifier it is vacuous for the if_val
+    -- family (whose cond is `.bool`), so the omnibus stays jointly
+    -- satisfiable across both families.
+    (hTsmTyped :
+      (anfM.name ≠ "constructor" ∧
+        Agrees.emittableArithChainReadyNoDblNeg
+          (Lower.computeLastUses anfM.body) anfM.body
+          (List.reverse (anfM.params.map (·.name))) 0 false) →
+      Agrees.entryTsmArithTyped Γ tsm)
+    -- **Wave 45 if_val typed-entry premise (keyed).**  For a single-`.ifVal`
+    -- arith-branch body the entry tsm is cond-headed (`tsm = (cond,k)::branchTsm`),
+    -- the cond is `.bool`-typed (`CondBoolTyped`), and the branch slots are
+    -- `.bigint`-typed (`entryTsmArithTyped branchTsm`).  As an implication on
+    -- the single-`.ifVal` body shape it is vacuous for non-if_val families.
+    (hIfValTyped :
+      ∀ (bn cond : String) (thn els : List ANFBinding) (src : Option SourceLoc),
+        anfM.body = [.mk bn (.ifVal cond thn els) src] →
+        ∃ (k : Agrees.SlotKind) (branchTsm : Agrees.TaggedStackMap),
+          tsm = (cond, k) :: branchTsm ∧
+          RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond ∧
+          Agrees.entryTsmArithTyped Γ branchTsm)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
@@ -3836,7 +4072,8 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
             (List.reverse (anfM.params.map (·.name))) 0 false
       · exact compileSafe_observational_correct_arith_consume
           p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
-          Γ hSinglePublic hArithConsume.1 hArithConsume.2 hUntag hTypedEntry hTsmTyped hCoh
+          Γ hSinglePublic hArithConsume.1 hArithConsume.2 hUntag hTypedEntry
+          (hTsmTyped hArithConsume) hCoh
       · by_cases hMathByte :
             Agrees.structuralCallBodyBool
               p.methods p.properties
@@ -3853,14 +4090,89 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                 anfM.body initialSm 0 = true
           · exact compileSafe_observational_correct_modulo_update_prop_codegen
               p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hUpdateProp
-          · by_cases hIfVal :
-                Agrees.structuralIfValBodyBool
-                  p.methods p.properties
-                  Lower.defaultInlineBudget
-                  lastUses [] localBindings constInts
-                  anfM.body initialSm 0 = true
-            · exact compileSafe_observational_correct_modulo_if_val_codegen
-                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hIfVal
+          · -- **Wave 45 consume-`if_val` branch (replaces the retired if_val axiom).**
+            -- The decidable `ifValArithBody` fragment pins the body to a single
+            -- `.ifVal` with arith branches; the residual structural facts
+            -- (cond at head, last-use is the if, self-contained branches) are
+            -- decided in turn.  When all hold the discharged Step-1 theorem
+            -- fires (consuming the keyed `hIfValTyped` typed bundle); otherwise
+            -- the displaced body falls through to the sound crypto_call cascade.
+            by_cases hIfValFrag :
+                anfM.name ≠ "constructor" ∧
+                Agrees.ifValArithBody p.methods p.properties
+                  Lower.defaultInlineBudget 0 lastUses []
+                  constInts initialSm anfM.body
+            · obtain ⟨hNameNe, hFrag⟩ := hIfValFrag
+              -- The fragment forces `anfM.body = [.mk bn (.ifVal cond thn els) src]`.
+              have hShape :
+                  ∃ (bn cond : String) (thn els : List ANFBinding)
+                    (src : Option SourceLoc),
+                    anfM.body = [.mk bn (.ifVal cond thn els) src] := by
+                revert hFrag
+                match h : anfM.body with
+                | [.mk bn (.ifVal cond thn els) src] =>
+                    intro _; exact ⟨bn, cond, thn, els, src, rfl⟩
+                | [] => intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.loadParam _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.loadProp _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.loadConst _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.binOp _ _ _ _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.unaryOp _ _ _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.call _ _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.methodCall _ _ _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.loop _ _ _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.assert _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.updateProp _ _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ .getStateScript _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.checkPreimage _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.deserializeState _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.addOutput _ _ _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.addRawOutput _ _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.addDataOutput _ _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.arrayLiteral _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | [.mk _ (.rawScript _ _ _) _] =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+                | _ :: _ :: _ =>
+                    intro hc; exact absurd hc (by simp [Agrees.ifValArithBody])
+              obtain ⟨bn, cond, thn, els, src, hBodyEq⟩ := hShape
+              -- Decide the residual structural facts on the extracted cond as a
+              -- single conjunction: cond at head, last-use is the if, and the
+              -- branches are self-contained (`ifValInnerProtected = []`).
+              by_cases hResidual :
+                  Stack.Lower.StackMap.depth?
+                      (List.reverse (anfM.params.map (·.name))) cond = some 0 ∧
+                  Stack.Lower.isLastUse (Lower.computeLastUses anfM.body) cond 0 = true ∧
+                  Agrees.ifValInnerProtected
+                      (List.reverse (anfM.params.map (·.name))) cond 0
+                      (Lower.computeLastUses anfM.body) [] = []
+              · obtain ⟨hCondHead, hLastU, hIPThn⟩ := hResidual
+                obtain ⟨k, branchTsm, hTsmEq, hCondBool, hBranchTyped⟩ :=
+                  hIfValTyped bn cond thn els src hBodyEq
+                exact compileSafe_observational_correct_ifval_consume
+                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
+                  Γ hSinglePublic hNameNe bn cond k thn els src branchTsm hBodyEq
+                  (hTsmEq ▸ hAgrees) hFrag
+                  (hTsmEq ▸ hUntag) hTypedEntry hBranchTyped (hTsmEq ▸ hCoh)
+                  hCondBool hCondHead hLastU hIPThn hIPThn
+              · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
             · by_cases hLoop :
                   Agrees.structuralLoopBodyBool
                     p.methods p.properties
@@ -3912,7 +4224,19 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     (hUntag :
       Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
-    (hTsmTyped : Agrees.entryTsmArithTyped Γ tsm)
+    (hTsmTyped :
+      (anfM.name ≠ "constructor" ∧
+        Agrees.emittableArithChainReadyNoDblNeg
+          (Lower.computeLastUses anfM.body) anfM.body
+          (List.reverse (anfM.params.map (·.name))) 0 false) →
+      Agrees.entryTsmArithTyped Γ tsm)
+    (hIfValTyped :
+      ∀ (bn cond : String) (thn els : List ANFBinding) (src : Option SourceLoc),
+        anfM.body = [.mk bn (.ifVal cond thn els) src] →
+        ∃ (k : Agrees.SlotKind) (branchTsm : Agrees.TaggedStackMap),
+          tsm = (cond, k) :: branchTsm ∧
+          RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond ∧
+          Agrees.entryTsmArithTyped Γ branchTsm)
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
     successAgrees
@@ -3920,7 +4244,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       (runParsedBytes bytes initialStack) :=
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
-    Γ hUntag hTypedEntry hTsmTyped hCoh
+    Γ hUntag hTypedEntry hTsmTyped hIfValTyped hCoh
 
 
 end Soundness
