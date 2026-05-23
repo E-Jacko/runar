@@ -5,6 +5,7 @@ import RunarVerification.Stack.Lower
 import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
 import RunarVerification.Stack.AgreesA3
+import RunarVerification.Stack.AgreesA4
 import RunarVerification.Stack.AgreesA6
 import RunarVerification.Stack.Peephole
 import RunarVerification.Stack.Eval
@@ -2691,38 +2692,20 @@ consecutive double-negate, non-emittable arith — fall through the omnibus
 dispatch to the sound `crypto_call` fallback. No replacement axiom is
 introduced. See `PATH2_PLAN.md` §5.23 and `TRUST_MANIFEST.md`. -/
 
-/-- **O1 sub-omnibus — math/byte call family.**
-
-Phase D harness integration: codegen-soundness for ANF bodies whose
-non-structural-const bindings are `.call` to math/byte builtins
-(`abs / len / bin2num / toByteString / cat / num2bin / min / max /
-split / within`). The hypothesis `hMathByteCall` requires the body
-to satisfy `Agrees.structuralCallBodyBool`, the per-builtin fragment
-predicate that captures math/byte call arms.
-
-Discharge path: this sub-omnibus retires when Stage C A4-math/byte
-narrowed wrappers widen to full coverage; see `PATH2_PLAN.md` §5.23.
--/
-axiom compileSafe_observational_correct_modulo_math_byte_call_codegen (p : ANFProgram)
-    (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (_hMem : anfM ∈ p.methods) (_hPublic : anfM.isPublic = true)
-    (_hSafe : compileSafe p = .ok bytes)
-    (initialAnf : State) (initialStack : StackState)
-    (tsm : Agrees.TaggedStackMap)
-    (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hMathByteCall :
-      Agrees.structuralCallBodyBool
-        p.methods p.properties
-        Lower.defaultInlineBudget
-        (Lower.computeLastUses anfM.body) []
-        (anfM.body.map (·.name))
-        (Lower.collectConstInts anfM.body)
-        anfM.body
-        (List.reverse (anfM.params.map (·.name)))
-        0 = true) :
-    successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
-      (runParsedBytes bytes initialStack)
+-- **O1 sub-omnibus — math/byte call family — RETIRED (Tier 1 Wave 51, 2026-05-23).**
+-- The `compileSafe_observational_correct_modulo_math_byte_call_codegen` axiom is
+-- RETIRED (the THIRD TCB axiom retirement, after wave-39 arith and wave-45
+-- if_val).  Its omnibus branch is now discharged by the theorem
+-- `compileSafe_observational_correct_mathByte_consume` for the single-public,
+-- NO-LEN single-arg math_byte fragment (`abs` / `bin2num` / `toByteString`
+-- chains at head slots, copy mode), under the keyed `hMathByteFrag` premise
+-- (the copy-mode structural-call obligation + the runtime fragment derivable
+-- from the bytes-typed entry).  Bodies OUTSIDE that fragment (`len` chunks
+-- whose `[OP_SIZE, OP_NIP]` lowering fails the round-trip allowlist, 2-arg
+-- calls, non-math-byte calls) fall through to the sound crypto_call fallback —
+-- NO new axiom is introduced.  The retired theorem's `#print axioms` lists only
+-- propext / Classical.choice / Quot.sound + the crypto backends (NO
+-- sub-omnibus axiom).
 
 /-- **O1 sub-omnibus — crypto call family.**
 
@@ -3947,6 +3930,175 @@ theorem compileSafe_observational_correct_ifval_consume
     rw [hM4]; exact hM3Ops
   exact successAgrees_trans _ _ _ hM2Method hParsed
 
+/-- **Wave 51 Step 1 — the dispatch-level consume-`math_byte` correctness
+theorem.**
+
+For a single-public method whose body is the NO-LEN single-arg math_byte
+fragment (`mathByteSingleArgShapeNoLenBool`: every binding is `.call func [arg]`
+with `func ∈ {abs, bin2num, toByteString}`, the arg at the head slot, depth 0),
+under the structural-call copy-mode obligation (`structuralCallBody`, decidable
+from `structuralCallBodyBool`) and the keyed runtime fragment
+(`mathByteSingleArgBody`, supplied by the omnibus's math_byte typed-entry
+premise), the deployed `compileSafe` bytes are observationally correct.
+
+This is the 4-leg transitivity that retires
+`compileSafe_observational_correct_modulo_math_byte_call_codegen`, mirroring the
+wave-39 arith retirement (math_byte ops carry NO `.ifOp`, so the M4 round-trip is
+the plain `AreRunarEmittable` path, exactly like arith):
+
+* **M2** — the wave-47 walk `successAgrees_mathByteSingleArg_unconditional` gives
+  the body-level success iff between `evalBindings` and
+  `runOps (lowerBindings (untagSm tsm) body).1`, bridged to the method level via
+  `lowerMethodUserRawOps_eq_lowerBindings_structuralCall` (the wave-48 copy-mode
+  collapse) + `lowerMethod_ops_eq_userRaw_no_implicits_no_post` +
+  `findMethod_lower_public_unique`.
+* **M3** — the wave-51 emit-shape bridge `mathByteEmitNoNip_of_noLenFragment`
+  feeds `loweredMathByteSingleArg_opShape`'s peephole-identity conjunct into
+  `peephole_M3_unconditional_of_bodyId`.
+* **M4** — the same op-shape's `AreRunarEmittable` conjunct feeds
+  `compileSafe_single_public_runOps_eq`.
+* **shape** — `peepholeProgram_single_public_shape` from `hSinglePublic` /
+  `hName`.
+
+All hypotheses are dispatch-suppliable: the no-len classifier and the
+structural-call classifier by decidable `by_cases`, the runtime fragment from the
+omnibus's keyed math_byte premise, and the standard `agreesTagged` alignment. -/
+theorem compileSafe_observational_correct_mathByte_consume
+    (p : ANFProgram) (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (tsm : Agrees.TaggedStackMap)
+    (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hShapeNoLen :
+      AgreesA4.mathByteSingleArgShapeNoLenBool anfM.body tsm = true)
+    (hStructCall :
+      AgreesA4.structuralCallBody (Stack.Lower.computeLastUses anfM.body) []
+        anfM.body (anfM.params.map (fun pp => pp.name) |>.reverse) 0)
+    (hUntag :
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+    (hCoh : Agrees.tsmCoherent initialAnf tsm)
+    (hFrag : AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  -- The no-implicits facts (no checkPreimage / codePart / deserialize / terminal
+  -- assert), derived from the no-len structural shape.
+  have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false :=
+    AgreesA4.bindingsUseCheckPreimage_false_of_noLen anfM.body tsm hShapeNoLen
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false :=
+    AgreesA4.bindingsUseCodePart_false_of_noLen anfM.body tsm hShapeNoLen
+  have hNoDeserialize : Lower.bindingsUseDeserializeState anfM.body = false :=
+    AgreesA4.bindingsUseDeserializeState_false_of_noLen anfM.body tsm hShapeNoLen
+  have hNoTerminalAssert : Lower.bodyEndsInAssert anfM.body = false :=
+    AgreesA4.bodyEndsInAssert_false_of_noLen anfM.body tsm hShapeNoLen
+  -- The raw lowered op list (method RAW = `lowerBindings (untagSm tsm) body` via
+  -- the copy-mode collapse + `hUntag`).
+  let RAW := (Stack.Lower.lowerBindings (Agrees.untagSm tsm) anfM.body).1
+  have hRAW : RAW = (Stack.Lower.lowerBindings (Agrees.untagSm tsm) anfM.body).1 := rfl
+  have hUnique :
+      ∀ m', m' ∈ p.methods → m'.isPublic = true →
+        (m'.name == anfM.name) = true → m' = anfM :=
+    unique_public_of_filter_singleton p anfM hSinglePublic
+  -- Method-level user-raw ops collapse to `lowerBindings (reverse params) body`,
+  -- and `untagSm tsm = reverse params`, so they are exactly `RAW`.
+  have hUserRaw :
+      Agrees.lowerMethodUserRawOps p.methods p.properties anfM = RAW := by
+    rw [AgreesA4.lowerMethodUserRawOps_eq_lowerBindings_structuralCall
+          p.methods p.properties anfM hStructCall, hRAW, hUntag]
+  -- The wave-51 emit-shape bridge: `RAW` is `mathByteEmitNoNip`.
+  have hEmitNoNip :
+      AgreesA4.mathByteEmitNoNip RAW = true := by
+    rw [hRAW]; exact AgreesA4.mathByteEmitNoNip_of_noLenFragment anfM.body tsm hShapeNoLen
+  -- The wave-49 op-shape: `AreRunarEmittable RAW` and the peephole-identity.
+  obtain ⟨hEmittable, hPeepId⟩ :=
+    AgreesA4.loweredMathByteSingleArg_opShape RAW hEmitNoNip
+  have hMethodOpsId : peepholeMethodOps RAW = RAW := by
+    rw [peepholeMethodOps_eq]; exact hPeepId
+  -- The unique-public selection bridge.
+  have hP : p =
+      { contractName := p.contractName,
+        properties := p.properties,
+        methods := p.methods } := rfl
+  have hBodyOfRaw :
+      (Lower.lower p).bodyOf anfM.name
+        = (Lower.lowerMethod p.methods p.properties anfM).ops := by
+    unfold StackProgram.bodyOf
+    rw [hP, Agrees.findMethod_lower_public_unique
+          p.contractName p.properties p.methods anfM hMem hPublic hUnique]
+  have hMethodOpsRaw :
+      (Lower.lowerMethod p.methods p.properties anfM).ops = RAW := by
+    rw [Agrees.lowerMethod_ops_eq_userRaw_no_implicits_no_post
+          p.methods p.properties anfM hNoPreimage hNoCode hNoTerminalAssert
+          hNoDeserialize]
+    exact hUserRaw
+  have hBodyOfEqRaw : (Lower.lower p).bodyOf anfM.name = RAW := by
+    rw [hBodyOfRaw, hMethodOpsRaw]
+  -- Leg M2: ANF eval agrees with `runOps RAW` (the wave-47 walk).
+  have hM2 :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+        (runOps RAW initialStack) := by
+    rw [hRAW]
+    exact AgreesA4.successAgrees_mathByteSingleArg_unconditional
+      anfM.body tsm (Agrees.untagSm tsm) initialAnf initialStack
+      rfl hAgrees hCoh hFrag
+  -- Leg M2→method.
+  have hM2Method :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+        (runMethod (Lower.lower p) anfM.name initialStack) := by
+    have hRunEq :
+        runMethod (Lower.lower p) anfM.name initialStack = runOps RAW initialStack := by
+      unfold runMethod
+      rw [hBodyOfEqRaw]
+    rw [hRunEq]; exact hM2
+  -- Leg M3: peephole preserves the run result (op-list-identity regime).
+  have hM3 :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runMethod (peepholeProgram (Lower.lower p)) anfM.name initialStack) := by
+    apply peephole_M3_unconditional_of_bodyId (Lower.lower p) anfM.name initialStack
+    rw [hBodyOfEqRaw]; exact hMethodOpsId
+  -- shape: the post-peephole program is single-public with body `RAW`.
+  obtain ⟨hPubSingleton, hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hPeepedOpsRaw : (peepholedLoweredMethod p anfM).ops = RAW := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = RAW
+    rw [hMethodOpsRaw]; exact hMethodOpsId
+  have hPeepBodyRaw :
+      (peepholeProgram (Lower.lower p)).bodyOf anfM.name = RAW := by
+    rw [hStackBody, hPeepedOpsRaw]
+  have hM3Ops :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runOps RAW initialStack) := by
+    have hRunEq :
+        runMethod (peepholeProgram (Lower.lower p)) anfM.name initialStack
+          = runOps RAW initialStack := by
+      unfold runMethod
+      rw [hPeepBodyRaw]
+    rw [← hRunEq]; exact hM3
+  -- Leg M4: `runParsedBytes bytes = runOps RAW`.
+  have hM4 :
+      runParsedBytes bytes initialStack = runOps RAW initialStack := by
+    have hEq :
+        runParsedBytes bytes initialStack
+          = runOps (peepholedLoweredMethod p anfM).ops initialStack :=
+      compileSafe_single_public_runOps_eq p bytes (peepholedLoweredMethod p anfM)
+        initialStack hSafe hPubSingleton
+        (by rw [hPeepedOpsRaw]; exact hEmittable)
+    rw [hEq, hPeepedOpsRaw]
+  -- Compose: M2 ∘ M3 ∘ M4.
+  have hParsedMB :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runParsedBytes bytes initialStack) := by
+    rw [hM4]; exact hM3Ops
+  exact successAgrees_trans _ _ _ hM2Method hParsedMB
+
 /--
 **Harness-level codegen-soundness theorem (Phase D harness integration).**
 
@@ -4028,6 +4180,20 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           tsm = (cond, k) :: branchTsm ∧
           RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond ∧
           Agrees.entryTsmArithTyped Γ branchTsm)
+    -- **Wave 51 math_byte typed-entry premise (keyed).**  For a body in the
+    -- NO-LEN single-arg math_byte fragment (`abs` / `bin2num` / `toByteString`
+    -- chains, head-slot args, copy mode) the entry is bytes/bigint-typed so the
+    -- per-binding `mathByteArgIs` are derivable (`mathByteArgIs_of_entryTyped`)
+    -- and the copy-mode obligation holds (`structuralCallBody`).  Stated as an
+    -- implication on the decidable no-len classifier, it is VACUOUS for every
+    -- other family, so the omnibus stays jointly satisfiable.  Its only consumer
+    -- is the syntactic conformance harness, which discharges it per fixture from
+    -- the bytes-typed entry.
+    (hMathByteFrag :
+      AgreesA4.mathByteSingleArgShapeNoLenBool anfM.body tsm = true →
+        AgreesA4.structuralCallBody (Lower.computeLastUses anfM.body) []
+          anfM.body (anfM.params.map (fun pp => pp.name) |>.reverse) 0 ∧
+        AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
@@ -4074,14 +4240,22 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
           Γ hSinglePublic hArithConsume.1 hArithConsume.2 hUntag hTypedEntry
           (hTsmTyped hArithConsume) hCoh
-      · by_cases hMathByte :
-            Agrees.structuralCallBodyBool
-              p.methods p.properties
-              Lower.defaultInlineBudget
-              lastUses [] localBindings constInts
-              anfM.body initialSm 0 = true
-        · exact compileSafe_observational_correct_modulo_math_byte_call_codegen
-            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hMathByte
+      · -- **Wave 51 consume-`math_byte` branch (replaces the retired math_byte
+        -- axiom).**  The decidable NO-LEN math_byte classifier pins the body to
+        -- `abs` / `bin2num` / `toByteString` chains at head slots; the keyed
+        -- premise `hMathByteFrag` then supplies the copy-mode structural-call
+        -- obligation + the runtime fragment.  Bodies OUTSIDE this fragment
+        -- (`len` chunks, 2-arg calls, non-math-byte calls) fall through to the
+        -- sound crypto_call cascade — NO new axiom is introduced.
+        by_cases hMathByteNoLen :
+            AgreesA4.mathByteSingleArgShapeNoLenBool anfM.body tsm = true
+        · by_cases hNameMB : anfM.name ≠ "constructor"
+          · obtain ⟨hStructCall, hFrag⟩ := hMathByteFrag hMathByteNoLen
+            exact compileSafe_observational_correct_mathByte_consume
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+              hSinglePublic hNameMB hMathByteNoLen hStructCall hUntag hCoh hFrag
+          · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
         · by_cases hUpdateProp :
               Agrees.structuralUpdatePropBodyBool
                 p.methods p.properties
@@ -4237,6 +4411,11 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           tsm = (cond, k) :: branchTsm ∧
           RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond ∧
           Agrees.entryTsmArithTyped Γ branchTsm)
+    (hMathByteFrag :
+      AgreesA4.mathByteSingleArgShapeNoLenBool anfM.body tsm = true →
+        AgreesA4.structuralCallBody (Lower.computeLastUses anfM.body) []
+          anfM.body (anfM.params.map (fun pp => pp.name) |>.reverse) 0 ∧
+        AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf)
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
     successAgrees
@@ -4244,7 +4423,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       (runParsedBytes bytes initialStack) :=
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
-    Γ hUntag hTypedEntry hTsmTyped hIfValTyped hCoh
+    Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hCoh
 
 
 end Soundness

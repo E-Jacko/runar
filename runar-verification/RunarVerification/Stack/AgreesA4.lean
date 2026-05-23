@@ -5411,6 +5411,425 @@ theorem mathByteOpShape_rejects_nip :
     mathByteEmitNoNip [.dup, .opcode "OP_SIZE", .opcode "OP_NIP"] = false := by
   decide
 
+/-! #### Wave 51 — the emit-shape bridge (`mathByteEmitNoNip RAW = true`)
+
+Wave 49's `loweredMathByteSingleArg_opShape` takes the hypothesis
+`mathByteEmitNoNip ops = true` over an ABSTRACT op list.  The retirement needs
+that hypothesis DISCHARGED for `RAW = (lowerBindings sm body).1` of an actual
+fragment body.  This is the no-len peer of arith's
+`loweredEmittableArithNoDblNeg_arithEmitNoFuse` (`Stack/AgreesA3.lean:13925`).
+
+`mathByteEmitNoNip` carries NO fusion window (each op stands alone), so the
+inductive step is purely an APPEND fact: a no-len chunk is `[.dup]` /
+`[.dup, OP_ABS]` / `[.dup, OP_BIN2NUM]` (all `mathByteEmitNoNip`), and appending
+a `mathByteEmitNoNip` head to a `mathByteEmitNoNip` tail stays `mathByteEmitNoNip`.
+The `len` chunk (`[OP_SIZE, OP_NIP]`) is excluded by the no-len fragment because
+its `OP_NIP` fails `mathByteEmitNoNip` (the wave-49 byte-collision finding). -/
+
+/-- The three round-tripping single-arg math_byte builtins — the wave-47
+`mathByteSingleFunc` allowlist MINUS `len` (whose `[OP_SIZE, OP_NIP]` chunk
+fails `mathByteEmitNoNip`). -/
+def mathByteSingleFuncNoLen (func : String) : Bool :=
+  func == "abs" || func == "bin2num" || func == "toByteString"
+
+/-- A no-len func is a fortiori a `mathByteSingleFunc` (drops the `len`
+disjunct). -/
+theorem mathByteSingleFunc_of_noLen (func : String)
+    (h : mathByteSingleFuncNoLen func = true) :
+    mathByteSingleFunc func = true := by
+  unfold mathByteSingleFuncNoLen at h
+  unfold mathByteSingleFunc
+  rcases Bool.or_eq_true _ _ |>.mp h with h | h
+  · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+    · rw [h]; rfl
+    · rw [h]; simp
+  · rw [h]; simp
+
+/-- A no-len func is `abs`, `bin2num`, or `toByteString`. -/
+theorem mathByteSingleFuncNoLen_cases (func : String)
+    (h : mathByteSingleFuncNoLen func = true) :
+    func = "abs" ∨ func = "bin2num" ∨ func = "toByteString" := by
+  unfold mathByteSingleFuncNoLen at h
+  rcases Bool.or_eq_true _ _ |>.mp h with h | h
+  · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+    · exact Or.inl (by simpa using h)
+    · exact Or.inr (Or.inl (by simpa using h))
+  · exact Or.inr (Or.inr (by simpa using h))
+
+/-- The decidable structural skeleton of the NO-LEN single-arg math_byte
+fragment: a twin of `mathByteSingleArgShapeBool` restricting the builtin to the
+three round-tripping funcs.  Every binding is `.call func [arg]` with `func` in
+the no-len allowlist and `arg` the head-slot name of the threaded tagged map
+(loads in copy mode at depth 0).  The map is threaded by prepending
+`(bn, .binding)` each step. -/
+def mathByteSingleArgShapeNoLenBool :
+    List ANFBinding → TaggedStackMap → Bool
+  | [], _tsm => true
+  | (.mk bn v _) :: rest, tsm =>
+      match v, tsm with
+      | .call func [arg], s :: tsm_rest =>
+          mathByteSingleFuncNoLen func && (s.fst == arg) &&
+          mathByteSingleArgShapeNoLenBool rest ((bn, .binding) :: s :: tsm_rest)
+      | _, _ => false
+
+/-- Appending a `mathByteEmitNoNip` head to a `mathByteEmitNoNip` tail keeps the
+list `mathByteEmitNoNip` (no fusion window, so the property is pointwise). -/
+theorem mathByteEmitNoNip_append (xs ys : List StackOp)
+    (hx : mathByteEmitNoNip xs = true) (hy : mathByteEmitNoNip ys = true) :
+    mathByteEmitNoNip (xs ++ ys) = true := by
+  induction xs with
+  | nil => simpa using hy
+  | cons x rest ih =>
+      obtain ⟨hHead, hTail⟩ :=
+        Bool.and_eq_true_iff.mp (by simpa only [mathByteEmitNoNip] using hx)
+      simp only [List.cons_append, mathByteEmitNoNip, hHead, ih hTail, Bool.and_self]
+
+/-- The lowered op chunk of a no-len single-arg math_byte call, when the
+argument is the head slot (depth 0), is `mathByteEmitNoNip`:
+`[.dup]` (`toByteString`), `[.dup, OP_ABS]` (`abs`), or `[.dup, OP_BIN2NUM]`
+(`bin2num`).  All three pass `mathByteEmitNoNip`. -/
+theorem mathByteEmitNoNip_chunk (func : String)
+    (s : String × SlotKind) (tsm_rest : TaggedStackMap) (bn : String)
+    (hFunc : mathByteSingleFuncNoLen func = true) :
+    mathByteEmitNoNip
+      (Stack.Lower.lowerValue (untagSm (s :: tsm_rest)) bn (.call func [s.fst])).1 = true := by
+  have hDup : loadRef (untagSm (s :: tsm_rest)) s.fst = [.dup] :=
+    loadRef_head_eq_dup s tsm_rest
+  rcases mathByteSingleFuncNoLen_cases func hFunc with hF | hF | hF
+  · subst hF
+    rw [congrArg Prod.fst (Stack.Sim.lower_call_abs (untagSm (s :: tsm_rest)) bn s.fst), hDup]
+    show mathByteEmitNoNip ([StackOp.dup] ++ [StackOp.opcode "OP_ABS"]) = true
+    decide
+  · subst hF
+    rw [congrArg Prod.fst (Stack.Sim.lower_call_bin2num (untagSm (s :: tsm_rest)) bn s.fst), hDup]
+    show mathByteEmitNoNip ([StackOp.dup] ++ [StackOp.opcode "OP_BIN2NUM"]) = true
+    decide
+  · subst hF
+    rw [congrArg Prod.fst (Stack.Sim.lower_call_toByteString (untagSm (s :: tsm_rest)) bn s.fst), hDup]
+    show mathByteEmitNoNip [StackOp.dup] = true
+    decide
+
+/-- The structural map advances by `sm.push bn` for every no-len builtin (so the
+recursion threads the prepended tagged map exactly). -/
+theorem mathByteSmOut_noLen (func : String)
+    (s : String × SlotKind) (tsm_rest : TaggedStackMap) (bn : String)
+    (hFunc : mathByteSingleFuncNoLen func = true) :
+    (Stack.Lower.lowerValue (untagSm (s :: tsm_rest)) bn (.call func [s.fst])).2
+      = untagSm ((bn, .binding) :: s :: tsm_rest) := by
+  have hPush :
+      (Stack.Lower.lowerValue (untagSm (s :: tsm_rest)) bn (.call func [s.fst])).2
+        = (untagSm (s :: tsm_rest)).push bn := by
+    rcases mathByteSingleFuncNoLen_cases func hFunc with hF | hF | hF
+    · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_abs _ bn s.fst)
+    · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_bin2num _ bn s.fst)
+    · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_toByteString _ bn s.fst)
+  rw [hPush]; rfl
+
+/-- **Wave 51 — the emit-shape bridge.**
+
+For any body in the NO-LEN single-arg math_byte structural fragment (head-slot
+argument at depth 0, map threaded by prepending), the lowered op list of
+`lowerBindings (untagSm tsm) body` is `mathByteEmitNoNip` — exactly the
+hypothesis `loweredMathByteSingleArg_opShape` requires.  Mirrors the structure
+of `loweredEmittableArithNoDblNeg_arithEmitNoFuse`, simplified because
+`mathByteEmitNoNip` carries no fusion window (the per-chunk fact is appended via
+`mathByteEmitNoNip_append`). -/
+theorem mathByteEmitNoNip_of_noLenFragment :
+    ∀ (body : List ANFBinding) (tsm : TaggedStackMap),
+      mathByteSingleArgShapeNoLenBool body tsm = true →
+      mathByteEmitNoNip (lowerBindings (untagSm tsm) body).1 = true := by
+  intro body
+  induction body with
+  | nil =>
+      intro tsm _hShape
+      simp only [lowerBindings, mathByteEmitNoNip]
+  | cons hd rest ih =>
+      intro tsm hShape
+      obtain ⟨bn, v, src⟩ := hd
+      -- Decode the head shape from the no-len Bool.
+      match hv : v with
+      | .call func [arg] =>
+          cases tsm with
+          | nil => simp [mathByteSingleArgShapeNoLenBool] at hShape
+          | cons s tsm_rest =>
+              have hShape' :
+                  (mathByteSingleFuncNoLen func && (s.fst == arg) &&
+                    mathByteSingleArgShapeNoLenBool rest ((bn, .binding) :: s :: tsm_rest)) = true := by
+                simpa only [mathByteSingleArgShapeNoLenBool] using hShape
+              obtain ⟨hHd2, hRest⟩ := Bool.and_eq_true_iff.mp hShape'
+              obtain ⟨hFunc, hSeq⟩ := Bool.and_eq_true_iff.mp hHd2
+              have hArgEq : s.fst = arg := by simpa using hSeq
+              subst hArgEq
+              -- `lowerBindings` cons decomposition.
+              have hLowerCons :
+                  (lowerBindings (untagSm (s :: tsm_rest))
+                      (.mk bn (.call func [s.fst]) src :: rest)).1
+                    = (lowerValue (untagSm (s :: tsm_rest)) bn (.call func [s.fst])).1
+                      ++ (lowerBindings
+                            (lowerValue (untagSm (s :: tsm_rest)) bn (.call func [s.fst])).2
+                            rest).1 := by
+                rw [lowerBindings]
+              rw [hLowerCons, mathByteSmOut_noLen func s tsm_rest bn hFunc]
+              exact mathByteEmitNoNip_append _ _
+                (mathByteEmitNoNip_chunk func s tsm_rest bn hFunc)
+                (ih ((bn, .binding) :: s :: tsm_rest) hRest)
+      | .call func [] =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .call func (a0 :: a1 :: aRest) =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadParam n =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadProp n =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadConst c =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .binOp op l r rt =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .unaryOp op o rt =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .methodCall n a r =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .ifVal c t e =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loop a b c =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .assert a =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .updateProp a b =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .getStateScript =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .checkPreimage a =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .deserializeState a =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addOutput a b c =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addRawOutput a b =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addDataOutput a b =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .arrayLiteral a =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .rawScript a b c =>
+          cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+
+/-! #### Wave 51 — no-implicits facts for the no-len math_byte fragment
+
+A no-len math_byte body is all `.call func [arg]` with `func ∈ {abs, bin2num,
+toByteString}`.  None of these trigger `checkPreimage` / `codePart` (the
+`computeStateOutput*` guard fails for these funcs) / `deserializeState`, and the
+last binding is a `.call` (never `.assert`).  These feed
+`lowerMethod_ops_eq_userRaw_no_implicits_no_post` in the retirement. -/
+
+/-- A no-len math_byte func is none of the implicit-triggering call names. -/
+private theorem mathByteSingleFuncNoLen_not_codePart (func : String)
+    (h : mathByteSingleFuncNoLen func = true) :
+    (func = "computeStateOutput" || func = "computeStateOutputHash") = false := by
+  rcases mathByteSingleFuncNoLen_cases func h with hF | hF | hF <;> subst hF <;> decide
+
+/-- `bindingsUseCheckPreimage` is `false` on a no-len math_byte body. -/
+theorem bindingsUseCheckPreimage_false_of_noLen :
+    ∀ (body : List ANFBinding) (tsm : TaggedStackMap),
+      mathByteSingleArgShapeNoLenBool body tsm = true →
+      Stack.Lower.bindingsUseCheckPreimage body = false := by
+  intro body
+  induction body with
+  | nil => intro _ _; simp only [Stack.Lower.bindingsUseCheckPreimage]
+  | cons hd rest ih =>
+      intro tsm hShape
+      obtain ⟨bn, v, src⟩ := hd
+      match hv : v with
+      | .call func [arg] =>
+          cases tsm with
+          | nil => simp [mathByteSingleArgShapeNoLenBool] at hShape
+          | cons s tsm_rest =>
+              have hShape' :
+                  (mathByteSingleFuncNoLen func && (s.fst == arg) &&
+                    mathByteSingleArgShapeNoLenBool rest ((bn, .binding) :: s :: tsm_rest)) = true := by
+                simpa only [mathByteSingleArgShapeNoLenBool] using hShape
+              obtain ⟨_, hRest⟩ := Bool.and_eq_true_iff.mp hShape'
+              simp only [Stack.Lower.bindingsUseCheckPreimage, Bool.false_or]
+              exact ih ((bn, .binding) :: s :: tsm_rest) hRest
+      | .call func [] => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .call func (a0 :: a1 :: aRest) => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadParam n => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadProp n => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadConst c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .binOp op l r rt => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .unaryOp op o rt => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .methodCall n a r => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .ifVal c t e => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loop a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .assert a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .updateProp a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .getStateScript => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .checkPreimage a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .deserializeState a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addOutput a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addRawOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addDataOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .arrayLiteral a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .rawScript a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+
+/-- `bindingsUseCodePart` is `false` on a no-len math_byte body (the
+`computeStateOutput*` guard fails for `abs`/`bin2num`/`toByteString`). -/
+theorem bindingsUseCodePart_false_of_noLen :
+    ∀ (body : List ANFBinding) (tsm : TaggedStackMap),
+      mathByteSingleArgShapeNoLenBool body tsm = true →
+      Stack.Lower.bindingsUseCodePart body = false := by
+  intro body
+  induction body with
+  | nil => intro _ _; simp only [Stack.Lower.bindingsUseCodePart]
+  | cons hd rest ih =>
+      intro tsm hShape
+      obtain ⟨bn, v, src⟩ := hd
+      match hv : v with
+      | .call func [arg] =>
+          cases tsm with
+          | nil => simp [mathByteSingleArgShapeNoLenBool] at hShape
+          | cons s tsm_rest =>
+              have hShape' :
+                  (mathByteSingleFuncNoLen func && (s.fst == arg) &&
+                    mathByteSingleArgShapeNoLenBool rest ((bn, .binding) :: s :: tsm_rest)) = true := by
+                simpa only [mathByteSingleArgShapeNoLenBool] using hShape
+              obtain ⟨hHd2, hRest⟩ := Bool.and_eq_true_iff.mp hShape'
+              obtain ⟨hFunc, _⟩ := Bool.and_eq_true_iff.mp hHd2
+              simp only [Stack.Lower.bindingsUseCodePart,
+                mathByteSingleFuncNoLen_not_codePart func hFunc, Bool.false_or]
+              exact ih ((bn, .binding) :: s :: tsm_rest) hRest
+      | .call func [] => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .call func (a0 :: a1 :: aRest) => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadParam n => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadProp n => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadConst c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .binOp op l r rt => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .unaryOp op o rt => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .methodCall n a r => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .ifVal c t e => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loop a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .assert a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .updateProp a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .getStateScript => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .checkPreimage a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .deserializeState a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addOutput a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addRawOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addDataOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .arrayLiteral a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .rawScript a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+
+/-- `bindingsUseDeserializeState` is `false` on a no-len math_byte body. -/
+theorem bindingsUseDeserializeState_false_of_noLen :
+    ∀ (body : List ANFBinding) (tsm : TaggedStackMap),
+      mathByteSingleArgShapeNoLenBool body tsm = true →
+      Stack.Lower.bindingsUseDeserializeState body = false := by
+  intro body
+  induction body with
+  | nil => intro _ _; simp only [Stack.Lower.bindingsUseDeserializeState]
+  | cons hd rest ih =>
+      intro tsm hShape
+      obtain ⟨bn, v, src⟩ := hd
+      match hv : v with
+      | .call func [arg] =>
+          cases tsm with
+          | nil => simp [mathByteSingleArgShapeNoLenBool] at hShape
+          | cons s tsm_rest =>
+              have hShape' :
+                  (mathByteSingleFuncNoLen func && (s.fst == arg) &&
+                    mathByteSingleArgShapeNoLenBool rest ((bn, .binding) :: s :: tsm_rest)) = true := by
+                simpa only [mathByteSingleArgShapeNoLenBool] using hShape
+              obtain ⟨_, hRest⟩ := Bool.and_eq_true_iff.mp hShape'
+              simp only [Stack.Lower.bindingsUseDeserializeState, Bool.false_or]
+              exact ih ((bn, .binding) :: s :: tsm_rest) hRest
+      | .call func [] => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .call func (a0 :: a1 :: aRest) => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadParam n => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadProp n => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadConst c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .binOp op l r rt => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .unaryOp op o rt => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .methodCall n a r => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .ifVal c t e => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loop a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .assert a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .updateProp a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .getStateScript => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .checkPreimage a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .deserializeState a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addOutput a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addRawOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addDataOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .arrayLiteral a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .rawScript a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+
+/-- `bodyEndsInAssert` is `false` on a no-len math_byte body: the last binding
+is a `.call`, never an `.assert`. -/
+theorem bodyEndsInAssert_false_of_noLen :
+    ∀ (body : List ANFBinding) (tsm : TaggedStackMap),
+      mathByteSingleArgShapeNoLenBool body tsm = true →
+      Stack.Lower.bodyEndsInAssert body = false := by
+  intro body
+  induction body with
+  | nil => intro _ _; rfl
+  | cons hd rest ih =>
+      intro tsm hShape
+      obtain ⟨bn, v, src⟩ := hd
+      match hv : v with
+      | .call func [arg] =>
+          cases tsm with
+          | nil => simp [mathByteSingleArgShapeNoLenBool] at hShape
+          | cons s tsm_rest =>
+              have hShape' :
+                  (mathByteSingleFuncNoLen func && (s.fst == arg) &&
+                    mathByteSingleArgShapeNoLenBool rest ((bn, .binding) :: s :: tsm_rest)) = true := by
+                simpa only [mathByteSingleArgShapeNoLenBool] using hShape
+              obtain ⟨_, hRest⟩ := Bool.and_eq_true_iff.mp hShape'
+              cases rest with
+              | nil => rfl
+              | cons b2 rest2 =>
+                  have hTail := ih ((bn, .binding) :: s :: tsm_rest) hRest
+                  simpa only [Stack.Lower.bodyEndsInAssert] using hTail
+      | .call func [] => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .call func (a0 :: a1 :: aRest) => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadParam n => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadProp n => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadConst c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .binOp op l r rt => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .unaryOp op o rt => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .methodCall n a r => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .ifVal c t e => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .loop a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .assert a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .updateProp a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .getStateScript => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .checkPreimage a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .deserializeState a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addOutput a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addRawOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .addDataOutput a b => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .arrayLiteral a => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+      | .rawScript a b c => cases tsm <;> simp [mathByteSingleArgShapeNoLenBool] at hShape
+
+/-! #### Wave 51 — MANDATORY emit-shape bridge smoke
+
+A concrete no-len chain body `t0 = toByteString(s0); t1 = bin2num(t0);
+t2 = abs(t1)`, giving `mathByteEmitNoNip RAW = true`. -/
+
+private def smokeNoLenBody : List ANFBinding :=
+  [.mk "t0" (.call "toByteString" ["s0"]) none,
+   .mk "t1" (.call "bin2num" ["t0"]) none,
+   .mk "t2" (.call "abs" ["t1"]) none]
+
+private def smokeNoLenTsm : TaggedStackMap := [("s0", .param)]
+
+/-- **Wave 51 emit-shape smoke — `mathByteEmitNoNip RAW = true` on a concrete
+no-len body.**  Anti-vacuity: a real `lowerBindings` output, not an abstract op
+list. -/
+theorem smokeNoLen_emitNoNip :
+    mathByteEmitNoNip (lowerBindings (untagSm smokeNoLenTsm) smokeNoLenBody).1 = true :=
+  mathByteEmitNoNip_of_noLenFragment smokeNoLenBody smokeNoLenTsm (by decide)
+
 end MathByteOpShape
 
 end MathByteSingleArgWalk

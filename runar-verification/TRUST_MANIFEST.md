@@ -9,7 +9,7 @@ counts:
 
 | Item | Count | Meaning |
 |---|---:|---|
-| Project axioms | 85 | Named assumptions in Lean code |
+| Project axioms | 84 | Named assumptions in Lean code |
 | Opaque executable defaults | 0 | No executable bodies hidden from proofs |
 | Opaque defaults with bodies | 0 | No opaque declarations carry defaults |
 | `partial def` | 0 | No partial definitions under `RunarVerification/` |
@@ -53,6 +53,7 @@ that are preserved by design.
 | Tier 1 waves 26–29: consume-arith retirement substrate | 2026-05-21 | 87 | 0 | 0 (M2 capstone + reflection + M3/M4/shape + operational lockstep all built; arith retirement gated on the `taggedAllBigint` typing bridge / both-fail leg — see the waves-26–29 section) | 0 |
 | **Tier 1 wave 39: FIRST axiom retirement (arith)** | 2026-05-23 | **86** | **−1** | −1 (`compileSafe_observational_correct_modulo_arith_codegen` retired; its omnibus branch discharged by the theorem `compileSafe_observational_correct_arith_consume` for the single-public, no-double-negate, emittable consume-arith fragment under wave-34 typed-entry premises; residual arith bodies fall through to the sound `crypto_call` fallback — NO new axiom) | 0 |
 | **Tier 1 wave 45: SECOND axiom retirement (if_val)** | 2026-05-23 | **85** | **−1** | −1 (`compileSafe_observational_correct_modulo_if_val_codegen` retired; its omnibus branch discharged by the theorem `compileSafe_observational_correct_ifval_consume` for the single-public, self-contained, arith-branch `if_val` fragment — `ifValArithBody` + a `.bool`-typed head cond via `CondBoolTyped`; 4-leg discharge composes the wave-44 entry walk M2 + the wave-42 `.ifOp` op-shape M3/M4 — the M4 leg uses the WithIf parse round-trip `compileSafe_single_public_runOps_eq_with_if` — + the wave-21 shape derivation. The omnibus's typed-entry premises are keyed implications so the omnibus stays jointly satisfiable across the arith and if_val families. Residual if_val bodies — nested if_val, non-self-contained branches, non-arith branches — fall through to the sound `crypto_call` fallback — NO new axiom. `#print axioms compileSafe_observational_correct_ifval_consume` = propext / Classical.choice / Quot.sound + 3 crypto backends, NO sub-omnibus axiom) | 0 |
+| **Tier 1 wave 51: THIRD axiom retirement (math_byte)** | 2026-05-23 | **84** | **−1** | −1 (`compileSafe_observational_correct_modulo_math_byte_call_codegen` retired; its omnibus branch discharged by the theorem `compileSafe_observational_correct_mathByte_consume` for the single-public, NO-LEN single-arg math_byte fragment — `abs` / `bin2num` / `toByteString` chains at head slots, copy mode — `mathByteSingleArgShapeNoLenBool` + the keyed `hMathByteFrag` premise supplying the copy-mode structural-call obligation + the runtime `mathByteSingleArgBody` fragment derivable from the bytes-typed entry via `mathByteArgIs_of_entryTyped`. 4-leg discharge composes the wave-47 walk M2 `successAgrees_mathByteSingleArg_unconditional` + the wave-51 emit-shape bridge `mathByteEmitNoNip_of_noLenFragment` feeding the wave-49 op-shape M3/M4 — the M4 leg uses the plain `AreRunarEmittable` round-trip `compileSafe_single_public_runOps_eq` (math_byte ops carry no `.ifOp`) — + the wave-48 `lowerBindingsP=lowerBindings` collapse. The omnibus's typed-entry premises are keyed implications so the omnibus stays jointly satisfiable across all families. Residual math_byte bodies — `len`/`OP_NIP` chunks whose `[OP_SIZE, OP_NIP]` lowering fails the round-trip allowlist, 2-arg calls (`cat`/`num2bin`/`min`/`max`/`split`/`within`), and consume-mode chains — fall through to the sound `crypto_call` fallback — NO new axiom. `#print axioms compileSafe_observational_correct_mathByte_consume` = propext / Classical.choice / Quot.sound + 3 crypto backends (+ pre-existing `native_decide` ax from `lowerValueP_eq_lowerValue_structuralCall`), NO sub-omnibus axiom) | 0 |
 
 **Net Tier 1 wave 2 (2026-05-17, omnibus-split inflation + Stage C widenings):** 78 → 86,
 Δ = +8 (intentional). The 9 per-family sub-omnibuses replace the single omnibus
@@ -141,9 +142,30 @@ planned sub-omnibus inventory:
   fall through to the sound `crypto_call` fallback — no replacement
   axiom.
 * `compileSafe_observational_correct_modulo_math_byte_call_codegen` —
-  for bodies whose only non-structural-const bindings are `.call`
-  to math/byte builtins. Discharged once Stage C A4-math/byte
-  completes.
+  **RETIRED (Wave 51, 2026-05-23 — the THIRD TCB axiom retirement).**
+  Its omnibus dispatch branch is now discharged by the theorem
+  `compileSafe_observational_correct_mathByte_consume` for the
+  single-public, NO-LEN single-arg math_byte fragment
+  (`mathByteSingleArgShapeNoLenBool`: `abs` / `bin2num` /
+  `toByteString` chains at head slots, copy mode) under the keyed
+  `hMathByteFrag` premise (the copy-mode `structuralCallBody`
+  obligation + the runtime `mathByteSingleArgBody` fragment derivable
+  from the bytes-typed entry via `mathByteArgIs_of_entryTyped`). The
+  4-leg discharge composes the wave-47 walk
+  (M2 `successAgrees_mathByteSingleArg_unconditional`), the wave-51
+  emit-shape bridge `mathByteEmitNoNip_of_noLenFragment` feeding the
+  wave-49 op-shape (M3 op-list-identity bypass + M4 `AreRunarEmittable`
+  via the plain parse round-trip `compileSafe_single_public_runOps_eq`
+  — math_byte ops carry no `.ifOp`), and the wave-48
+  `lowerBindingsP=lowerBindings` collapse. The omnibus's `hMathByteFrag`
+  premise is a keyed implication on the decidable no-len classifier, so
+  the omnibus stays jointly satisfiable across all families (vacuous
+  when the classifier is false). Residual math_byte bodies — the `len`
+  chunk (`[OP_SIZE, OP_NIP]`, where `OP_NIP`'s emit byte collides with
+  the short-form `.nip` byte so it does NOT round-trip; see the wave-49
+  byte-collision audit), 2-arg calls (`cat` / `num2bin` / `min` / `max`
+  / `split` / `within`), and consume-mode chains — fall through to the
+  sound `crypto_call` fallback — no replacement axiom.
 * `compileSafe_observational_correct_modulo_crypto_call_codegen` —
   for bodies whose only non-structural-const bindings are `.call`
   to crypto builtins. Discharged after Phase B per-primitive +
@@ -197,7 +219,7 @@ permanent axiom inflation.
 | `RunarVerification/Stack/Wots.lean` | 1 | Phase B8 codegen-to-spec axiom (`runOps_wotsBodyOps_eq`) |
 | `RunarVerification/Stack/Rabin.lean` | 1 | Phase B10 codegen-to-spec axiom (`runOps_rabinBodyOps_eq`) |
 | `RunarVerification/Stack/TxContext.lean` | 0 | Concrete BIP-143 context/preimage model; no companion assumptions |
-| `RunarVerification/Pipeline.lean` | 9 | Phase D codegen-soundness axioms (`merkle_dispatch_selection_correct`, `auto_state_output_at_method_exit_correct`) + 7 O1 per-family sub-omnibus axioms (math/byte-call, crypto-call, update-prop, loop, method-call, dispatch, stateful). The harness omnibus `compileSafe_observational_correct_modulo_codegen_axioms` is a `theorem` (not an axiom) that dispatches into these. **Wave 39 (2026-05-23) retired the arith sub-omnibus** `compileSafe_observational_correct_modulo_arith_codegen` (9 → 8 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_arith_consume`. **Wave 45 (2026-05-23) retired the if_val sub-omnibus** `compileSafe_observational_correct_modulo_if_val_codegen` (8 → 7 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_ifval_consume`; net −1 |
+| `RunarVerification/Pipeline.lean` | 8 | Phase D codegen-soundness axioms (`merkle_dispatch_selection_correct`, `auto_state_output_at_method_exit_correct`) + 6 O1 per-family sub-omnibus axioms (crypto-call, update-prop, loop, method-call, dispatch, stateful). The harness omnibus `compileSafe_observational_correct_modulo_codegen_axioms` is a `theorem` (not an axiom) that dispatches into these. **Wave 39 (2026-05-23) retired the arith sub-omnibus** `compileSafe_observational_correct_modulo_arith_codegen` (9 → 8 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_arith_consume`. **Wave 45 (2026-05-23) retired the if_val sub-omnibus** `compileSafe_observational_correct_modulo_if_val_codegen` (8 → 7 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_ifval_consume`. **Wave 51 (2026-05-23) retired the math_byte sub-omnibus** `compileSafe_observational_correct_modulo_math_byte_call_codegen` (7 → 6 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_mathByte_consume` for the NO-LEN single-arg math_byte fragment; residual `len`/`OP_NIP`, 2-arg, and consume-mode bodies fall to the sound crypto_call fallback; net −1 |
 
 Tier B11 (2026-05-16) replaced the `buildChangeOutput` and
 `computeStateOutput` axioms with concrete `def`s and exposed them —

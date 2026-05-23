@@ -20,7 +20,37 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=85        # Breakdown (2026-05-23, Tier 1 wave 45 —
+TARGET_AXIOMS=84        # Breakdown (2026-05-23, Tier 1 wave 51 —
+                        # THIRD TCB axiom retirement):
+                        # −1 in Pipeline.lean — the math_byte sub-omnibus
+                        #     `compileSafe_observational_correct_modulo_math_byte_call_codegen`
+                        #     RETIRED. Its omnibus dispatch branch is now
+                        #     discharged by the theorem
+                        #     `compileSafe_observational_correct_mathByte_consume`
+                        #     for the single-public, NO-LEN single-arg math_byte
+                        #     fragment (`abs` / `bin2num` / `toByteString` chains
+                        #     at head slots, copy mode), under the keyed
+                        #     `hMathByteFrag` premise (the copy-mode
+                        #     structural-call obligation + the runtime fragment
+                        #     derivable from the bytes-typed entry). The 4-leg
+                        #     discharge composes the wave-47 walk (M2
+                        #     `successAgrees_mathByteSingleArg_unconditional`),
+                        #     the wave-51 emit-shape bridge
+                        #     `mathByteEmitNoNip_of_noLenFragment` feeding the
+                        #     wave-49 op-shape (M3 op-list-identity + M4
+                        #     `AreRunarEmittable` via
+                        #     `compileSafe_single_public_runOps_eq`), and the
+                        #     wave-48 `lowerBindingsP=lowerBindings` collapse.
+                        #     Residual math_byte bodies (`len`/OP_NIP chunks
+                        #     which fail the round-trip allowlist, 2-arg calls,
+                        #     consume-mode chains) fall through to the sound
+                        #     crypto_call fallback — NO new axiom. The retired
+                        #     theorem's #print axioms lists only propext /
+                        #     Classical.choice / Quot.sound + the 3 crypto
+                        #     backends (NO sub-omnibus axiom).
+                        # Net delta: −1, 85 → 84.
+                        #
+                        # Breakdown (2026-05-23, Tier 1 wave 45 —
                         # SECOND TCB axiom retirement):
                         # −1 in Pipeline.lean — the if_val sub-omnibus
                         #     `compileSafe_observational_correct_modulo_if_val_codegen`
