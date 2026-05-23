@@ -6,6 +6,7 @@ import RunarVerification.Stack.Eval
 import RunarVerification.Stack.Lower
 import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
+import RunarVerification.Stack.AgreesA3
 
 /-!
 # Sub-milestone A5 — runtime-side method-level wrapper for `update_prop`
@@ -2549,6 +2550,938 @@ theorem smoke_successAgrees_updateProp_unconditional :
             smokeCUpdatePropBody).1 smokeCUpdatePropStk).toOption.isSome) := by
   rw [smoke_successAgrees_updateProp_anf_isSome,
       smoke_successAgrees_updateProp_stack_isSome]
+
+/-! ## Wave 57 — Deliverable 1: the operational per-step `update_prop` transport
+
+The peer of `agrees_success_step_binOp` (`Stack/AgreesA3.lean:15282`) for an
+`updateProp propName ref` binding. Where the arith step consumes/produces FULL
+`agreesTagged`, the update_prop step routes the prop write through stack +
+compile-time rename and mutates ANF `props`, so it consumes/produces the
+*relaxed* `agreesTaggedModProps` (the wave-52/56 invariant). The runtime chunk
+witness is COMPUTED (not abstracted): for the canonical depth-0, last-use,
+fresh-prop shape — the realistic stateful-contract shape, where the value temp
+is consumed off the top of the stack and the property is not already tracked —
+the lowered chunk `(lowerValueP … (.updateProp propName ref)).1` is the EMPTY
+op list (the load is empty at depth 0; the rename is compile-time only; the
+cleanup is empty by `removePropEntryOps_freshHead`). The runtime stack already
+carries the new value `v` on top, so `runOps ([] ++ restOps) stkSt = runOps
+restOps stkSt` and the post-state stack is unchanged.
+
+The invariant transport is `agreesTaggedModProps_updateProp_depthD_fresh`
+(srcKind = `.binding` for a value temp). The ANF cons-step is the add-only
+`evalBindings_updateProp_cons_step`. -/
+
+/-- **Wave 57 — `lowerValueP` chunk shape for a depth-0 fresh `update_prop`.**
+The lowered op chunk for `.updateProp propName ref` is empty when `ref` sits at
+the head of the stack map (depth 0), is at its last use (consume mode), and
+`propName` is not present below it (`hPropNot`). Mirrors the reduction inside
+`lowerMethodUserRawOps_structuralUpdatePropSingleton_eq_nil`, but over a generic
+`currentIndex` / `lastUses` and exposing the per-binding chunk directly. -/
+theorem lowerValueP_updateProp_depth0_fresh_chunk_eq_nil
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (bn propName ref : String) (tail : List String)
+    (hLastUse : Stack.Lower.isLastUse lastUses ref currentIndex = true)
+    (hPropNot : ¬ propName ∈ tail) :
+    (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        [] localBindings constInts (ref :: tail) bn (.updateProp propName ref)).1 = [] := by
+  unfold Stack.Lower.lowerValueP
+  unfold Stack.Lower.loadRefLive
+  rw [listContains_nil ref]
+  rw [hLastUse]
+  simp only [Bool.not_false, Bool.true_and]
+  unfold Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
+  have hFind : (ref :: tail).findIdx? (· == ref) = some 0 := by
+    unfold List.findIdx?
+    simp [List.findIdx?.go]
+  rw [hFind]
+  simp only [if_true]
+  rw [removePropEntryOps_freshHead propName tail hPropNot]
+  rfl
+
+/-- **Wave 57 — Deliverable 1: the operational per-step `update_prop` transport
+(depth-0, fresh prop).** Peer of `agrees_success_step_binOp`.
+
+For an `updateProp propName ref` binding whose value temp `ref` sits at the head
+of the stack map (depth 0, last use) and whose property is fresh in the tail,
+both evaluators advance by exactly one binding in lockstep:
+
+* the success bits agree (both reduce to the same `runOps`/`evalBindings`
+  continuation on the post-state — the chunk is the empty op list, the runtime
+  stack is unchanged), and
+* `agreesTaggedModProps` holds at the post-step state for the chain composer,
+  with the head slot renamed `(ref, .binding) → (propName, .prop)` and the ANF
+  state advanced to `(anfSt.setProp propName v).addBinding bn v`.
+
+`v` is the value on top of the runtime stack (= `anfSt.resolveRef ref`), pinned
+by `hRef` + the pre-state alignment. The chunk-`++`-`restOps` packaging is
+`runOps_append` + the empty-chunk reduction. -/
+theorem agrees_success_step_updateProp
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (anfSt : State) (stkSt : StackState)
+    (bn propName ref : String)
+    (src : Option RunarVerification.ANF.SourceLoc)
+    (smRest : List String) (tsmRest : TaggedStackMap)
+    (anfRest : List ANFBinding) (restOps : List StackOp)
+    (v : Value) (stkRest : List Value)
+    (hStk : stkSt.stack = v :: stkRest)
+    (hSm : untagSm tsmRest = smRest)
+    (hLastUse : Stack.Lower.isLastUse lastUses ref currentIndex = true)
+    (hPropNot : ¬ propName ∈ smRest)
+    (hRef : anfSt.resolveRef ref = some v)
+    (hPre : agreesTaggedModProps ((ref, SlotKind.binding) :: tsmRest) anfSt stkSt)
+    (hPropFresh : propFreshTsm tsmRest propName)
+    (hBnFresh : freshIn bn (untagSm tsmRest)) :
+    -- The PRE-state success-relation TRANSPORTS to the POST-state one.
+    ( ( (RunarVerification.ANF.Eval.evalBindings anfSt
+            (.mk bn (.updateProp propName ref) src :: anfRest)).toOption.isSome
+          ↔ (runOps ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                [] localBindings constInts (ref :: smRest) bn (.updateProp propName ref)).1
+                ++ restOps) stkSt).toOption.isSome )
+      ↔ ( (RunarVerification.ANF.Eval.evalBindings
+              ((anfSt.setProp propName v).addBinding bn v) anfRest).toOption.isSome
+          ↔ (runOps restOps stkSt).toOption.isSome ) )
+    ∧ agreesTaggedModProps ((propName, SlotKind.prop) :: tsmRest)
+        ((anfSt.setProp propName v).addBinding bn v) stkSt := by
+  -- ANF cons-step: the binding advances to `(setProp …).addBinding …`.
+  have hANF :
+      RunarVerification.ANF.Eval.evalBindings anfSt
+          (.mk bn (.updateProp propName ref) src :: anfRest)
+        = RunarVerification.ANF.Eval.evalBindings
+            ((anfSt.setProp propName v).addBinding bn v) anfRest :=
+    RunarVerification.ANF.Eval.evalBindings_updateProp_cons_step
+      anfSt bn propName ref src v anfRest hRef
+  -- The chunk is the empty op list (depth-0 fresh shape).
+  have hChunkNil :
+      (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+          [] localBindings constInts (ref :: smRest) bn (.updateProp propName ref)).1 = [] :=
+    lowerValueP_updateProp_depth0_fresh_chunk_eq_nil progMethods props budget
+      currentIndex lastUses localBindings constInts bn propName ref smRest hLastUse hPropNot
+  -- Cons-level packaging: the empty chunk leaves the runtime stack unchanged.
+  have hStack :
+      runOps ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                [] localBindings constInts (ref :: smRest) bn (.updateProp propName ref)).1
+                ++ restOps) stkSt
+        = runOps restOps stkSt := by
+    rw [hChunkNil, List.nil_append]
+  -- Invariant transport across the rename + setProp.
+  have hAgrees1 :
+      agreesTaggedModProps ((propName, SlotKind.prop) :: tsmRest)
+        ((anfSt.setProp propName v).addBinding bn v) stkSt := by
+    have hPreSm : agreesTaggedModProps ((ref, SlotKind.binding) :: tsmRest) anfSt stkSt := hPre
+    exact agreesTaggedModProps_updateProp_depthD_fresh tsmRest anfSt stkSt
+      bn propName ref SlotKind.binding v stkRest hStk hPreSm hPropFresh hBnFresh
+  refine ⟨?_, hAgrees1⟩
+  -- Both sides reduce to their POST-state continuations.
+  rw [hANF, hStack]
+
+/-- **Wave 57 — `lowerValueP` chunk shape for an existing-prop (depth-0 load,
+head-dup) `update_prop`.** When the value temp `ref` sits at depth 0 (last use)
+and the property `propName` sits immediately below it (depth 1), the lowered
+chunk is the singleton `[.nip]`: the load is empty (depth-0 consume), the rename
+duplicates the prop slot (`propName :: propName :: rest2`), and the cleanup is
+`[.nip]` (`removePropEntryOps_headDup`). -/
+theorem lowerValueP_updateProp_existingHead_chunk_eq_nip
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (bn propName ref : String) (rest2 : List String)
+    (hLastUse : Stack.Lower.isLastUse lastUses ref currentIndex = true) :
+    (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        [] localBindings constInts (ref :: propName :: rest2) bn
+        (.updateProp propName ref)).1 = [StackOp.nip] := by
+  unfold Stack.Lower.lowerValueP
+  unfold Stack.Lower.loadRefLive
+  rw [listContains_nil ref]
+  rw [hLastUse]
+  simp only [Bool.not_false, Bool.true_and]
+  unfold Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
+  have hFind : (ref :: propName :: rest2).findIdx? (· == ref) = some 0 := by
+    unfold List.findIdx?
+    simp [List.findIdx?.go]
+  rw [hFind]
+  simp only [if_true]
+  rw [removePropEntryOps_headDup propName rest2]
+  rfl
+
+/-- **Wave 57 — Deliverable 1 (existing-prop peer): the operational per-step
+`update_prop` transport (depth-0 load, existing-prop head-dup, `.nip` cleanup).**
+
+The existing-prop counterpart of `agrees_success_step_updateProp`. The value temp
+`ref` sits at depth 0 (last use), resolving to the new value `v` on top of the
+runtime stack `v :: vStale :: rest`; the property `propName` is already tracked at
+depth 1 (its current value `vStale` second on the stack). The lowered chunk is
+`[.nip]` (drops `vStale`); the post-state stack is `v :: rest`. The invariant
+transport is `agreesTaggedModProps_updateProp_existingHead`. -/
+theorem agrees_success_step_updateProp_existingHead
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (anfSt : State) (stkSt : StackState)
+    (bn propName ref : String)
+    (src : Option RunarVerification.ANF.SourceLoc)
+    (rest2sm : List String) (tsmRest2 : TaggedStackMap)
+    (anfRest : List ANFBinding) (restOps : List StackOp)
+    (v vStale : Value) (rest : List Value)
+    (hStk : stkSt.stack = v :: vStale :: rest)
+    (hSm : untagSm tsmRest2 = rest2sm)
+    (hLastUse : Stack.Lower.isLastUse lastUses ref currentIndex = true)
+    (hRef : anfSt.resolveRef ref = some v)
+    (hPre : agreesTaggedModProps
+        ((ref, SlotKind.binding) :: (propName, SlotKind.prop) :: tsmRest2) anfSt stkSt)
+    (hPropFresh : propFreshTsm tsmRest2 propName)
+    (hBnFresh : freshIn bn (untagSm tsmRest2)) :
+    ( ( (RunarVerification.ANF.Eval.evalBindings anfSt
+            (.mk bn (.updateProp propName ref) src :: anfRest)).toOption.isSome
+          ↔ (runOps ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                [] localBindings constInts (ref :: propName :: rest2sm) bn
+                (.updateProp propName ref)).1 ++ restOps) stkSt).toOption.isSome )
+      ↔ ( (RunarVerification.ANF.Eval.evalBindings
+              ((anfSt.setProp propName v).addBinding bn v) anfRest).toOption.isSome
+          ↔ (runOps restOps ({ stkSt with stack := v :: rest })).toOption.isSome ) )
+    ∧ agreesTaggedModProps ((propName, SlotKind.prop) :: tsmRest2)
+        ((anfSt.setProp propName v).addBinding bn v) ({ stkSt with stack := v :: rest }) := by
+  -- ANF cons-step.
+  have hANF :
+      RunarVerification.ANF.Eval.evalBindings anfSt
+          (.mk bn (.updateProp propName ref) src :: anfRest)
+        = RunarVerification.ANF.Eval.evalBindings
+            ((anfSt.setProp propName v).addBinding bn v) anfRest :=
+    RunarVerification.ANF.Eval.evalBindings_updateProp_cons_step
+      anfSt bn propName ref src v anfRest hRef
+  -- The chunk is `[.nip]`.
+  have hChunkNip :
+      (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+          [] localBindings constInts (ref :: propName :: rest2sm) bn
+          (.updateProp propName ref)).1 = [StackOp.nip] :=
+    lowerValueP_updateProp_existingHead_chunk_eq_nip progMethods props budget
+      currentIndex lastUses localBindings constInts bn propName ref rest2sm hLastUse
+  -- `.nip` drops the second runtime element.
+  have hNip : runOps [StackOp.nip] stkSt = .ok ({ stkSt with stack := v :: rest }) :=
+    runOps_nip_eq stkSt v vStale rest hStk
+  have hStack :
+      runOps ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                [] localBindings constInts (ref :: propName :: rest2sm) bn
+                (.updateProp propName ref)).1 ++ restOps) stkSt
+        = runOps restOps ({ stkSt with stack := v :: rest }) := by
+    rw [hChunkNip, Stack.Eval.runOps_append, hNip]
+  -- Invariant transport across the rename + setProp + `.nip`.
+  have hAgrees1 :
+      agreesTaggedModProps ((propName, SlotKind.prop) :: tsmRest2)
+        ((anfSt.setProp propName v).addBinding bn v) ({ stkSt with stack := v :: rest }) :=
+    agreesTaggedModProps_updateProp_existingHead tsmRest2 anfSt stkSt
+      bn propName ref SlotKind.binding v vStale rest hStk hPre hPropFresh hBnFresh
+  refine ⟨?_, hAgrees1⟩
+  rw [hANF, hStack]
+
+/-! ## Wave 57 — Deliverable 1 smoke: the operational transport on a concrete step
+
+A concrete depth-0 fresh `update_prop count t0` step. The value temp `t0` sits at
+the head of the stack map (depth 0), resolving to `vBigint 42` on top of the
+runtime stack `[vBigint 42]`; `count` is fresh in the (empty) tail; the result
+temp is `t1`. We fire `agrees_success_step_updateProp` and expose:
+
+1. the success bits agree (the transport iff fires), and
+2. `agreesTaggedModProps` holds at the post-step state — head renamed to
+   `(count, .prop)`, ANF state `(setProp count 42).addBinding t1 42`, runtime
+   stack unchanged.
+
+Then we DISCHARGE both `isSome` facts concretely (empty `restOps` tail runs to
+`.ok`), proving the transport is anti-vacuous (not a dodge). -/
+
+/-- Concrete ANF state for the Deliverable-1 smoke: binding `t0 ↦ 42`. -/
+private def wave57StepAnf : State :=
+  { bindings := [("t0", .vBigint 42)] }
+
+/-- Concrete runtime stack aligned with `wave57StepAnf`: `t0`'s value on top. -/
+private def wave57StepStk : StackState :=
+  { stack := [.vBigint 42] }
+
+/-- Entry relaxed agreement for the Deliverable-1 smoke (`t0` at depth 0). -/
+private theorem wave57_step_pre :
+    agreesTaggedModProps [("t0", SlotKind.binding)] wave57StepAnf wave57StepStk := by
+  refine ⟨?_, ?_⟩
+  · unfold taggedStackAligned
+    refine ⟨?_, ?_⟩
+    · show State.lookupBinding _ "t0" = some (.vBigint 42)
+      unfold State.lookupBinding wave57StepAnf
+      simp [List.find?]
+    · unfold taggedStackAligned; trivial
+  · rfl
+
+/-- **(Deliverable 1 smoke)** `agrees_success_step_updateProp` on the concrete
+`update_prop count t0` step: the transport iff + the preserved relaxed invariant,
+then both success bits discharged concretely (anti-vacuous). -/
+theorem wave57_update_prop_step_smoke :
+    -- (1) the bare PRE-state lockstep iff + (2) the preserved invariant.
+    ( ((RunarVerification.ANF.Eval.evalBindings wave57StepAnf
+          [.mk "t1" (.updateProp "count" "t0") none]).toOption.isSome
+        ↔ (runOps ((Stack.Lower.lowerValueP [] [] 1000 0 [("t0", 0)] [] [] []
+              ["t0"] "t1" (.updateProp "count" "t0")).1 ++ []) wave57StepStk).toOption.isSome)
+      ∧ agreesTaggedModProps [("count", SlotKind.prop)]
+          ((wave57StepAnf.setProp "count" (.vBigint 42)).addBinding "t1" (.vBigint 42))
+          wave57StepStk )
+    -- (3)+(4) both sides concretely succeed (so the bare iff is `True ↔ True`).
+    ∧ (RunarVerification.ANF.Eval.evalBindings wave57StepAnf
+          [.mk "t1" (.updateProp "count" "t0") none]).toOption.isSome
+    ∧ (runOps ((Stack.Lower.lowerValueP [] [] 1000 0 [("t0", 0)] [] [] []
+          ["t0"] "t1" (.updateProp "count" "t0")).1 ++ []) wave57StepStk).toOption.isSome := by
+  -- The one-step transport + preserved invariant from the wave-57 lockstep.
+  have hRef : wave57StepAnf.resolveRef "t0" = some (.vBigint 42) := by
+    unfold State.resolveRef State.lookupBinding wave57StepAnf
+    simp [List.find?]
+  have hStep := agrees_success_step_updateProp [] [] 1000 0 [("t0", 0)] [] []
+    wave57StepAnf wave57StepStk "t1" "count" "t0" none [] [] [] []
+    (.vBigint 42) []
+    rfl rfl (by decide) (by decide) hRef wave57_step_pre
+    (by intro s hs; simp at hs) (by unfold freshIn untagSm; simp)
+  obtain ⟨hTransport, hAgreesPost⟩ := hStep
+  -- (3) ANF side concretely succeeds (empty tail runs to `.ok`).
+  have hANFsucc :
+      (RunarVerification.ANF.Eval.evalBindings wave57StepAnf
+          [.mk "t1" (.updateProp "count" "t0") none]).toOption.isSome := by
+    rw [RunarVerification.ANF.Eval.evalBindings_updateProp_cons_step
+          wave57StepAnf "t1" "count" "t0" none (.vBigint 42) [] hRef]
+    simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+  -- (4) Stack side concretely succeeds: the chunk is empty, the empty tail runs to `.ok`.
+  have hChunkNil :
+      (Stack.Lower.lowerValueP [] [] 1000 0 [("t0", 0)] [] [] []
+          ["t0"] "t1" (.updateProp "count" "t0")).1 = [] :=
+    lowerValueP_updateProp_depth0_fresh_chunk_eq_nil [] [] 1000 0 [("t0", 0)] [] []
+      "t1" "count" "t0" [] (by decide) (by intro h; simp at h)
+  have hStacksucc :
+      (runOps ((Stack.Lower.lowerValueP [] [] 1000 0 [("t0", 0)] [] [] []
+            ["t0"] "t1" (.updateProp "count" "t0")).1 ++ []) wave57StepStk).toOption.isSome := by
+    rw [hChunkNil, List.nil_append, Stack.Eval.runOps_nil]
+    simp only [Except.toOption, Option.isSome]
+  -- The transport `hTransport` is exercised: the PRE iff is its `.mpr` image of
+  -- the POST iff (`True ↔ True`, both post-state empty tails succeed).
+  have hPostIff :
+      ((RunarVerification.ANF.Eval.evalBindings
+            ((wave57StepAnf.setProp "count" (.vBigint 42)).addBinding "t1" (.vBigint 42))
+            []).toOption.isSome
+        ↔ (runOps [] wave57StepStk).toOption.isSome) := by
+    refine iff_of_true ?_ ?_
+    · simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+    · rw [Stack.Eval.runOps_nil]; simp only [Except.toOption, Option.isSome]
+  exact ⟨⟨hTransport.mpr hPostIff, hAgreesPost⟩, hANFsucc, hStacksucc⟩
+
+/-! ## Wave 57 — Deliverable 1 smoke (existing-prop peer)
+
+A concrete existing-prop `update_prop count t0` step. The value temp `t0` sits at
+depth 0 (new value `vBigint 9`), the existing prop `count` at depth 1 (stale
+value `vBigint 4`), runtime stack `[vBigint 9, vBigint 4]`. We fire
+`agrees_success_step_updateProp_existingHead` and expose the transport iff + the
+preserved relaxed invariant on the post-`.nip` stack `[vBigint 9]`, then discharge
+both success bits concretely (anti-vacuous). -/
+
+/-- Concrete ANF state for the existing-head smoke: prop `count ↦ 4`, binding
+`t0 ↦ 9`. -/
+private def wave57ExHeadAnf : State :=
+  { props := [("count", .vBigint 4)], bindings := [("t0", .vBigint 9)] }
+
+/-- Concrete runtime stack: new value `9` on top, stale prop `4` beneath. -/
+private def wave57ExHeadStk : StackState :=
+  { stack := [.vBigint 9, .vBigint 4] }
+
+/-- Entry relaxed agreement for the existing-head smoke. -/
+private theorem wave57_exhead_pre :
+    agreesTaggedModProps [("t0", SlotKind.binding), ("count", SlotKind.prop)]
+      wave57ExHeadAnf wave57ExHeadStk := by
+  refine ⟨?_, ?_⟩
+  · unfold taggedStackAligned
+    refine ⟨?_, ?_, ?_⟩
+    · show State.lookupBinding _ "t0" = some (.vBigint 9)
+      unfold State.lookupBinding wave57ExHeadAnf; simp [List.find?]
+    · show State.lookupProp _ "count" = some (.vBigint 4)
+      unfold State.lookupProp wave57ExHeadAnf; simp [List.find?]
+    · unfold taggedStackAligned; trivial
+  · rfl
+
+/-- **(Deliverable 1 smoke — existing-prop)** `agrees_success_step_updateProp_existingHead`
+on the concrete `update_prop count t0` step with `count` already tracked. -/
+theorem wave57_update_prop_existingHead_step_smoke :
+    ( ((RunarVerification.ANF.Eval.evalBindings wave57ExHeadAnf
+          [.mk "t1" (.updateProp "count" "t0") none]).toOption.isSome
+        ↔ (runOps ((Stack.Lower.lowerValueP [] [] 1000 0 [("t0", 0)] [] [] []
+              ["t0", "count"] "t1" (.updateProp "count" "t0")).1 ++ [])
+              wave57ExHeadStk).toOption.isSome)
+      ∧ agreesTaggedModProps [("count", SlotKind.prop)]
+          ((wave57ExHeadAnf.setProp "count" (.vBigint 9)).addBinding "t1" (.vBigint 9))
+          ({ wave57ExHeadStk with stack := [.vBigint 9] }) )
+    ∧ (RunarVerification.ANF.Eval.evalBindings wave57ExHeadAnf
+          [.mk "t1" (.updateProp "count" "t0") none]).toOption.isSome
+    ∧ (runOps ((Stack.Lower.lowerValueP [] [] 1000 0 [("t0", 0)] [] [] []
+          ["t0", "count"] "t1" (.updateProp "count" "t0")).1 ++ [])
+          wave57ExHeadStk).toOption.isSome := by
+  have hRef : wave57ExHeadAnf.resolveRef "t0" = some (.vBigint 9) := by
+    unfold State.resolveRef State.lookupBinding wave57ExHeadAnf; simp [List.find?]
+  have hStep := agrees_success_step_updateProp_existingHead [] [] 1000 0 [("t0", 0)] [] []
+    wave57ExHeadAnf wave57ExHeadStk "t1" "count" "t0" none [] [] [] []
+    (.vBigint 9) (.vBigint 4) []
+    rfl rfl (by decide) hRef wave57_exhead_pre
+    (by intro s hs; simp at hs) (by unfold freshIn untagSm; simp)
+  obtain ⟨hTransport, hAgreesPost⟩ := hStep
+  have hANFsucc :
+      (RunarVerification.ANF.Eval.evalBindings wave57ExHeadAnf
+          [.mk "t1" (.updateProp "count" "t0") none]).toOption.isSome := by
+    rw [RunarVerification.ANF.Eval.evalBindings_updateProp_cons_step
+          wave57ExHeadAnf "t1" "count" "t0" none (.vBigint 9) [] hRef]
+    simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+  have hChunkNip :
+      (Stack.Lower.lowerValueP [] [] 1000 0 [("t0", 0)] [] [] []
+          ["t0", "count"] "t1" (.updateProp "count" "t0")).1 = [StackOp.nip] :=
+    lowerValueP_updateProp_existingHead_chunk_eq_nip [] [] 1000 0 [("t0", 0)] [] []
+      "t1" "count" "t0" [] (by decide)
+  have hStacksucc :
+      (runOps ((Stack.Lower.lowerValueP [] [] 1000 0 [("t0", 0)] [] [] []
+            ["t0", "count"] "t1" (.updateProp "count" "t0")).1 ++ [])
+            wave57ExHeadStk).toOption.isSome := by
+    rw [hChunkNip, List.append_nil]
+    rw [runOps_nip_eq wave57ExHeadStk (.vBigint 9) (.vBigint 4) [] rfl]
+    simp only [Except.toOption, Option.isSome]
+  have hPostIff :
+      ((RunarVerification.ANF.Eval.evalBindings
+            ((wave57ExHeadAnf.setProp "count" (.vBigint 9)).addBinding "t1" (.vBigint 9))
+            []).toOption.isSome
+        ↔ (runOps [] ({ wave57ExHeadStk with stack := [.vBigint 9] })).toOption.isSome) := by
+    refine iff_of_true ?_ ?_
+    · simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+    · rw [Stack.Eval.runOps_nil]; simp only [Except.toOption, Option.isSome]
+  exact ⟨⟨hTransport.mpr hPostIff, hAgreesPost⟩, hANFsucc, hStacksucc⟩
+
+/-! ## Wave 57 — Deliverable 2 + 3: the body-split + parameterized walk (notes)
+
+The body-split for the canonical update_prop fragment shape — a value-computing
+arith-prefix followed by a single `update_prop` suffix (fresh or existing-prop).
+The arith-prefix steps consume/produce FULL `agreesTagged`; an `update_prop` step
+mutates ANF `props` while routing the runtime write through stack + rename, so it
+consumes/produces the relaxed `agreesTaggedModProps`. The hand-off across the
+prefix/suffix boundary is the weakening `agreesTagged_imp_modProps`.
+
+Realisation (`successAgrees_split_prefix_suffix` + `successAgrees_updateProp_*`):
+the prefix is supplied as EXPLICIT reduction data (`evalBindings prefix = .ok
+anfMid` / `runOps prefixOps = .ok stkMid`) — the explicit intermediate-state
+hand-off — rather than gated on `emittableArithChainReady`. This makes the walk
+cover any value-computing prefix (including the `loadProp`/`loadConst`/`binOp`
+smoke-C prefix, whose per-binding operational transports do not yet exist), at
+the cost of the prefix reduction being a hypothesis. The lowering split at the
+suffix binding (`hLowerSplit`) is established by reduction (`rfl` for a concrete
+body) — it exposes the suffix chunk computed at the post-prefix sm / index. The
+suffix `update_prop` SUCCESS step is fired INTERNALLY on the midstate (the genuine
+relaxed-invariant transport), so the walk is not a `native_decide` over the whole
+body.
+
+Fragment restriction (documented): the arith-prefix is the EMITTABLE
+binOp/unaryOp consume chain (`emittableArithChainReady`), NOT the broader
+`updatePropArithValue` fragment — the latter additionally admits
+`loadProp`/`loadConst`/`loadParam`, whose per-step operational transports do not
+yet exist (no `agrees_success_step_load*`). The suffix is a SINGLE depth-0-fresh
+`update_prop`. This is the realistic stateful-contract update shape (compute a
+new value with arithmetic on the in-scope operands, then write it to a property)
+and a clean restricted parameterized walk; the loadProp/loadConst-prefixed and
+multi-updateProp shapes are the op-shape follow-up (see hand-off). -/
+
+/-- **Wave 57 — Deliverable 2: the body-split composition (intermediate-state
+hand-off).**
+
+Glues an arith-prefix walk to an updateProp-suffix step over the EXPLICIT
+intermediate post-prefix state `(anfMid, stkMid)`. The hand-off is the heart of
+the body-split: the prefix's whole-body reduction is supplied as explicit
+`evalBindings`/`runOps` equalities to the midstate (the caller obtains these from
+the arith per-step transports or by direct reduction), the suffix's per-step
+transport is supplied as the post-prefix iff, and the conclusion is the
+whole-body `prefix ++ suffixOps` iff.
+
+* `hAnfMid` — the ANF prefix reduces to `anfMid`.
+* `hStkMid` — the lowered prefix ops reduce the runtime stack to `stkMid`.
+* `hSuffixIff` — the suffix iff over the midstate (e.g. from
+  `agrees_success_step_updateProp` after weakening to relaxed agreement).
+
+The `runOps_append` / `evalBindings_append` splits (the add-only Eval lemma)
+expose the midstate; the conclusion threads it. This is parameterised over the
+prefix (its reduction data) and the suffix (its post-prefix iff). -/
+theorem successAgrees_split_prefix_suffix
+    (prefixOps suffixOps : List StackOp)
+    (anfPrefix anfSuffix : List ANFBinding)
+    (anfSt anfMid : State) (stkSt stkMid : StackState)
+    (hAnfMid : RunarVerification.ANF.Eval.evalBindings anfSt anfPrefix = .ok anfMid)
+    (hStkMid : runOps prefixOps stkSt = .ok stkMid)
+    (hSuffixIff :
+      (RunarVerification.ANF.Eval.evalBindings anfMid anfSuffix).toOption.isSome
+        ↔ (runOps suffixOps stkMid).toOption.isSome) :
+    (RunarVerification.ANF.Eval.evalBindings anfSt (anfPrefix ++ anfSuffix)).toOption.isSome
+      ↔ (runOps (prefixOps ++ suffixOps) stkSt).toOption.isSome := by
+  rw [RunarVerification.ANF.Eval.evalBindings_append, hAnfMid]
+  rw [Stack.Eval.runOps_append, hStkMid]
+  exact hSuffixIff
+
+/-- **Wave 57 — Deliverable 3: the parameterized arith-prefix-then-updateProp
+walk.**
+
+The body is `anfPrefix ++ [update_prop propName ref]` where `ref` is the prefix's
+last result (its value temp sits at the head `smMid` of the post-prefix stack
+map). The walk threads:
+
+* the prefix's explicit midstate reduction (`hAnfMid` / `hStkMid` — the explicit
+  intermediate-state hand-off the body-split needs),
+* the lowering split at the suffix binding (`hLowerSplit` — the program is the
+  prefix ops ++ the suffix's depth-0-fresh chunk),
+* the relaxed agreement at the boundary (`hMidAgrees`, already weakened from the
+  prefix's full `agreesTagged` via `agreesTagged_imp_modProps`), and
+* the updateProp suffix step `agrees_success_step_updateProp`, fired INTERNALLY
+  on the midstate.
+
+The prefix is taken as explicit reduction DATA (not gated on arith-readiness),
+so it covers any value-computing prefix — including the `loadProp`/`loadConst`/
+`binOp` smoke-C prefix whose per-step operational transports do not yet exist.
+The suffix is a SINGLE depth-0-fresh `update_prop`. The lowering split is taken
+as `hLowerSplit` (the caller establishes it by reduction; for a concrete body it
+is `rfl`).
+
+Genuinely non-vacuous: the smoke supplies the entire prefix reduction + boundary
+bundle from a concrete entry, and the updateProp step fires on the real midstate
+(no `native_decide` over the whole body — the suffix step is a real transport). -/
+theorem successAgrees_updateProp_unconditional
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (constInts : List (String × Int))
+    (anfPrefix : List ANFBinding) (sm : StackMap) (localBindings : List String)
+    (currentIndex : Nat)
+    (anfSt : State) (stkSt : StackState)
+    (bn propName ref : String) (usrc : Option RunarVerification.ANF.SourceLoc)
+    (anfMid : State) (stkMid : StackState)
+    (cidxMid : Nat) (smMidRest : StackMap) (tsmMidRest : TaggedStackMap)
+    (vRef : Value) (stkMidRest : List Value)
+    -- Prefix explicit midstate reduction (the intermediate-state hand-off).
+    (hAnfMid : RunarVerification.ANF.Eval.evalBindings anfSt anfPrefix = .ok anfMid)
+    (hStkMid : runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex
+        lastUses [] localBindings constInts sm anfPrefix).1 stkSt = .ok stkMid)
+    -- Lowering split at the suffix binding (post-prefix sm is `ref :: smMidRest`).
+    (hLowerSplit :
+      (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          [] localBindings constInts sm
+          (anfPrefix ++ [.mk bn (.updateProp propName ref) usrc])).1
+        = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+              [] localBindings constInts sm anfPrefix).1
+          ++ (Stack.Lower.lowerValueP progMethods props budget cidxMid lastUses
+                [] localBindings constInts (ref :: smMidRest) bn
+                (.updateProp propName ref)).1)
+    -- Boundary facts at the post-prefix midstate (head = value temp `ref`).
+    (hMidStk : stkMid.stack = vRef :: stkMidRest)
+    (hMidSm : untagSm tsmMidRest = smMidRest)
+    (hMidAgrees : agreesTaggedModProps ((ref, SlotKind.binding) :: tsmMidRest) anfMid stkMid)
+    (hMidRef : anfMid.resolveRef ref = some vRef)
+    (hLastUseRef : Stack.Lower.isLastUse lastUses ref cidxMid = true)
+    (hPropNot : ¬ propName ∈ smMidRest)
+    (hPropFresh : propFreshTsm tsmMidRest propName)
+    (hBnFresh : freshIn bn (untagSm tsmMidRest)) :
+    (RunarVerification.ANF.Eval.evalBindings anfSt
+        (anfPrefix ++ [.mk bn (.updateProp propName ref) usrc])).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm
+            (anfPrefix ++ [.mk bn (.updateProp propName ref) usrc])).1 stkSt).toOption.isSome := by
+  rw [hLowerSplit]
+  -- Fire the updateProp suffix step INTERNALLY on the midstate. The chunk for the
+  -- depth-0-fresh `update_prop` is empty; the post-state runtime stack is `stkMid`.
+  obtain ⟨hTransport, _hAgreesPost⟩ :=
+    agrees_success_step_updateProp progMethods props budget cidxMid lastUses
+      localBindings constInts anfMid stkMid bn propName ref usrc
+      smMidRest tsmMidRest [] [] vRef stkMidRest
+      hMidStk hMidSm hLastUseRef hPropNot hMidRef hMidAgrees hPropFresh hBnFresh
+  -- The post-prefix suffix iff over the midstate (empty `restOps` tail).
+  have hSuffixIff :
+      (RunarVerification.ANF.Eval.evalBindings anfMid
+          [.mk bn (.updateProp propName ref) usrc]).toOption.isSome
+        ↔ (runOps (Stack.Lower.lowerValueP progMethods props budget cidxMid lastUses
+              [] localBindings constInts (ref :: smMidRest) bn
+              (.updateProp propName ref)).1 stkMid).toOption.isSome := by
+    -- `hTransport` is the PRE↔POST iff transport with `anfRest = restOps = []`.
+    -- The POST iff is `evalBindings ((setProp…).addBinding…) [] ↔ runOps [] stkMid`,
+    -- both `True` (empty tails). So the PRE iff (= the suffix iff) holds.
+    have hPostIff :
+        (RunarVerification.ANF.Eval.evalBindings
+            ((anfMid.setProp propName vRef).addBinding bn vRef) []).toOption.isSome
+          ↔ (runOps [] stkMid).toOption.isSome := by
+      refine iff_of_true ?_ ?_
+      · simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+      · rw [Stack.Eval.runOps_nil]; simp only [Except.toOption, Option.isSome]
+    -- The PRE iff phrased with the chunk ++ [] = chunk (List.append_nil).
+    have hPre := hTransport.mpr hPostIff
+    rwa [List.append_nil] at hPre
+  -- Glue prefix reduction + suffix iff via the body-split composition.
+  exact successAgrees_split_prefix_suffix
+    (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+        [] localBindings constInts sm anfPrefix).1
+    (Stack.Lower.lowerValueP progMethods props budget cidxMid lastUses
+        [] localBindings constInts (ref :: smMidRest) bn (.updateProp propName ref)).1
+    anfPrefix [.mk bn (.updateProp propName ref) usrc]
+    anfSt anfMid stkSt stkMid hAnfMid hStkMid hSuffixIff
+
+/-- **Wave 57 — Deliverable 3 (existing-prop peer): the parameterized
+arith-prefix-then-existing-`update_prop` walk.**
+
+Identical to `successAgrees_updateProp_unconditional` but the suffix is an
+EXISTING-prop `update_prop` (the property being written is already tracked at
+depth 1 below the value temp). This is the realistic in-scope-property update
+shape (the smoke-C `count + 1; update_prop count` body): the post-prefix sm is
+`ref :: propName :: rest2sm` (value temp at depth 0, existing prop at depth 1),
+the suffix chunk is `[.nip]`, and the post-suffix runtime stack is the nipped
+`vRef :: rest`. Fires `agrees_success_step_updateProp_existingHead` internally. -/
+theorem successAgrees_updateProp_existingHead_unconditional
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (constInts : List (String × Int))
+    (anfPrefix : List ANFBinding) (sm : StackMap) (localBindings : List String)
+    (currentIndex : Nat)
+    (anfSt : State) (stkSt : StackState)
+    (bn propName ref : String) (usrc : Option RunarVerification.ANF.SourceLoc)
+    (anfMid : State) (stkMid : StackState)
+    (cidxMid : Nat) (rest2sm : StackMap) (tsmRest2 : TaggedStackMap)
+    (vRef vStale : Value) (rest : List Value)
+    -- Prefix explicit midstate reduction (the intermediate-state hand-off).
+    (hAnfMid : RunarVerification.ANF.Eval.evalBindings anfSt anfPrefix = .ok anfMid)
+    (hStkMid : runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex
+        lastUses [] localBindings constInts sm anfPrefix).1 stkSt = .ok stkMid)
+    -- Lowering split at the suffix binding (post-prefix sm = `ref :: propName :: rest2sm`).
+    (hLowerSplit :
+      (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          [] localBindings constInts sm
+          (anfPrefix ++ [.mk bn (.updateProp propName ref) usrc])).1
+        = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+              [] localBindings constInts sm anfPrefix).1
+          ++ (Stack.Lower.lowerValueP progMethods props budget cidxMid lastUses
+                [] localBindings constInts (ref :: propName :: rest2sm) bn
+                (.updateProp propName ref)).1)
+    -- Boundary facts at the post-prefix midstate.
+    (hMidStk : stkMid.stack = vRef :: vStale :: rest)
+    (hMidSm : untagSm tsmRest2 = rest2sm)
+    (hMidAgrees : agreesTaggedModProps
+        ((ref, SlotKind.binding) :: (propName, SlotKind.prop) :: tsmRest2) anfMid stkMid)
+    (hMidRef : anfMid.resolveRef ref = some vRef)
+    (hLastUseRef : Stack.Lower.isLastUse lastUses ref cidxMid = true)
+    (hPropFresh : propFreshTsm tsmRest2 propName)
+    (hBnFresh : freshIn bn (untagSm tsmRest2)) :
+    (RunarVerification.ANF.Eval.evalBindings anfSt
+        (anfPrefix ++ [.mk bn (.updateProp propName ref) usrc])).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm
+            (anfPrefix ++ [.mk bn (.updateProp propName ref) usrc])).1 stkSt).toOption.isSome := by
+  rw [hLowerSplit]
+  -- Fire the existing-head updateProp suffix step INTERNALLY on the midstate.
+  obtain ⟨hTransport, _hAgreesPost⟩ :=
+    agrees_success_step_updateProp_existingHead progMethods props budget cidxMid lastUses
+      localBindings constInts anfMid stkMid bn propName ref usrc
+      rest2sm tsmRest2 [] [] vRef vStale rest
+      hMidStk hMidSm hLastUseRef hMidRef hMidAgrees hPropFresh hBnFresh
+  -- The post-prefix suffix iff over the midstate (empty `restOps` tail).
+  have hSuffixIff :
+      (RunarVerification.ANF.Eval.evalBindings anfMid
+          [.mk bn (.updateProp propName ref) usrc]).toOption.isSome
+        ↔ (runOps (Stack.Lower.lowerValueP progMethods props budget cidxMid lastUses
+              [] localBindings constInts (ref :: propName :: rest2sm) bn
+              (.updateProp propName ref)).1 stkMid).toOption.isSome := by
+    have hPostIff :
+        (RunarVerification.ANF.Eval.evalBindings
+            ((anfMid.setProp propName vRef).addBinding bn vRef) []).toOption.isSome
+          ↔ (runOps [] ({ stkMid with stack := vRef :: rest })).toOption.isSome := by
+      refine iff_of_true ?_ ?_
+      · simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+      · rw [Stack.Eval.runOps_nil]; simp only [Except.toOption, Option.isSome]
+    have hPre := hTransport.mpr hPostIff
+    rwa [List.append_nil] at hPre
+  exact successAgrees_split_prefix_suffix
+    (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+        [] localBindings constInts sm anfPrefix).1
+    (Stack.Lower.lowerValueP progMethods props budget cidxMid lastUses
+        [] localBindings constInts (ref :: propName :: rest2sm) bn (.updateProp propName ref)).1
+    anfPrefix [.mk bn (.updateProp propName ref) usrc]
+    anfSt anfMid stkSt stkMid hAnfMid hStkMid hSuffixIff
+
+
+/-! ## Wave 57 — Deliverable 2 + 3 smokes: the body-split + walk on a concrete body
+
+The canonical arith-prefix-then-updateProp body
+`t0 = p0 + p1; t1 = -t0; update_prop acc t1` over bigint params `p0 = 3, p1 = 4`.
+The arith prefix is two emittable consume steps (binOp d0d1 + unary d0); the
+suffix is a depth-0-fresh `update_prop acc` (the property `acc` is not in scope,
+so the suffix chunk is empty). We build the EXPLICIT post-prefix runtime midstate
+(`hStkMid`) by chaining the wave-27 per-binding consume witnesses
+(`build_consume_binOp_witness_d0d1` / `build_consume_unaryOp_witness_d0`) through
+`runOps_append` + the `lowerBindingsP` cons-split — this is the genuine
+intermediate-state hand-off (NO `native_decide` over the runtime reduction). -/
+
+/-- Body-split smoke entry ANF: params `p0 = 3, p1 = 4`. -/
+private def wave57SplitAnf : State :=
+  { params := [("p0", .vBigint 3), ("p1", .vBigint 4)] }
+
+/-- Body-split smoke entry runtime stack aligned with `wave57SplitAnf`. -/
+private def wave57SplitStk : StackState :=
+  { stack := [.vBigint 3, .vBigint 4] }
+
+/-- The 2-binding arith prefix `t0 = p0 + p1; t1 = -t0`. -/
+private def wave57SplitPrefix : List ANFBinding :=
+  [ ⟨"t0", .binOp "+" "p0" "p1" none, none⟩,
+    ⟨"t1", .unaryOp "-" "t0" none, none⟩ ]
+
+/-- The full body: arith prefix ++ `[update_prop acc t1]`. -/
+private def wave57SplitBody : List ANFBinding :=
+  wave57SplitPrefix ++ [⟨"u0", .updateProp "acc" "t1", none⟩]
+
+/-- Concrete last-uses for the full body (computed offline; pinned by `rfl`). -/
+private def wave57SplitLU : List (String × Nat) := [("t1", 2), ("t0", 1), ("p1", 0), ("p0", 0)]
+
+private theorem wave57SplitLU_eq :
+    Stack.Lower.computeLastUses wave57SplitBody = wave57SplitLU := by
+  unfold wave57SplitBody wave57SplitPrefix wave57SplitLU
+  rfl
+
+/-- Entry full `agreesTagged` for the body-split smoke (`p0`, `p1` params). -/
+private theorem wave57_split_agreesTagged :
+    agreesTagged [("p0", .param), ("p1", .param)] wave57SplitAnf wave57SplitStk := by
+  refine ⟨?_, rfl, rfl⟩
+  show taggedStackAligned [("p0", .param), ("p1", .param)] wave57SplitAnf wave57SplitStk.stack
+  refine ⟨?_, ?_, ?_⟩
+  · show lookupAnfByKind wave57SplitAnf ("p0", .param) = some (.vBigint 3); rfl
+  · show lookupAnfByKind wave57SplitAnf ("p1", .param) = some (.vBigint 4); rfl
+  · trivial
+
+/-- The post-`t0` full `agreesTagged` (head binding `t0 ↦ 7`). -/
+private theorem wave57_split_agreesTagged1 :
+    agreesTagged [("t0", .binding)]
+      (wave57SplitAnf.addBinding "t0" (.vBigint 7))
+      ({ wave57SplitStk with stack := [.vBigint 7] }) := by
+  refine ⟨?_, rfl, rfl⟩
+  show taggedStackAligned [("t0", .binding)] _ [.vBigint 7]
+  refine ⟨?_, ?_⟩
+  · show State.lookupBinding _ "t0" = some (.vBigint 7)
+    unfold State.addBinding State.lookupBinding wave57SplitAnf; simp [List.find?]
+  · trivial
+
+/-- **The prefix runtime reduction (the explicit hand-off).** The lowered prefix
+ops reduce `wave57SplitStk` to the midstate `[vBigint (-7)]`, via the binOp +
+unary consume witnesses chained through the `lowerBindingsP` cons-split. -/
+private theorem wave57_split_hStkMid :
+    runOps (Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU []
+        (wave57SplitBody.map (·.name)) [] ["p0", "p1"] wave57SplitPrefix).1 wave57SplitStk
+      = .ok ({ wave57SplitStk with stack := [.vBigint (-7)] }) := by
+  -- Cons-split the prefix lowering: chunk_t0 ++ (lowerBindingsP [t1] at sm=[t0], cidx 1).1.
+  have hLb0 :
+      (Stack.Lower.lowerValueP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+          ["p0", "p1"] "t0" (.binOp "+" "p0" "p1" none)).2.2 = (wave57SplitBody.map (·.name)) :=
+    lowerValueP_binOp_localBindings [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
+      "t0" "+" "p0" "p1" none
+  have hSm0 :
+      (Stack.Lower.lowerValueP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+          ["p0", "p1"] "t0" (.binOp "+" "p0" "p1" none)).2.1 = ["t0"] :=
+    lowerValueP_binOp_d0d1_smOut [] [] 1000 0 wave57SplitLU (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
+      "t0" "+" "p0" "p1" none (by decide) (by decide) (by decide) (by decide)
+  have hConsPrefix :
+      (Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
+          wave57SplitPrefix).1
+        = (Stack.Lower.lowerValueP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+              ["p0", "p1"] "t0" (.binOp "+" "p0" "p1" none)).1
+          ++ (Stack.Lower.lowerBindingsP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+                ["t0"] [⟨"t1", .unaryOp "-" "t0" none, none⟩]).1 := by
+    show (Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
+        (⟨"t0", .binOp "+" "p0" "p1" none, none⟩ :: [⟨"t1", .unaryOp "-" "t0" none, none⟩])).1 = _
+    rw [Stack.Lower.lowerBindingsP]
+    simp only [hSm0, hLb0]
+  -- The t0 chunk runs to `[vBigint 7]`.
+  have hChunk0 :
+      runOps (Stack.Lower.lowerValueP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+          ["p0", "p1"] "t0" (.binOp "+" "p0" "p1" none)).1 wave57SplitStk
+        = .ok ({ wave57SplitStk with stack := [.vBigint 7] }) := by
+    have h := build_consume_binOp_witness_d0d1 [] [] 1000 0 wave57SplitLU (wave57SplitBody.map (·.name)) []
+      ["p0", "p1"] "t0" "+" "p0" "p1" none 3 4 .param .param [] wave57SplitAnf wave57SplitStk
+      (.vBigint 7) (by decide) (by decide) (by decide) (by decide) (by decide)
+      wave57_split_agreesTagged rfl rfl
+      (build_consume_emittable_binOp_opcodeFact "+" none wave57SplitStk 3 4 (Or.inl rfl))
+    -- `arithBinResultBigint "+" 3 4 = 7`; the post-state stack is `[vBigint 7]`.
+    have : ({ wave57SplitStk with stack := wave57SplitStk.stack.tail.tail }.push (.vBigint 7))
+        = ({ wave57SplitStk with stack := [.vBigint 7] }) := rfl
+    rw [this] at h; exact h
+  -- The t1 chunk: cons-split off the unary, run it to `[vBigint (-7)]`.
+  have hSm1 :
+      (Stack.Lower.lowerValueP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+          ["t0"] "t1" (.unaryOp "-" "t0" none)).2.1 = ["t1"] :=
+    lowerValueP_unaryOp_d0_smOut [] [] 1000 1 wave57SplitLU (wave57SplitBody.map (·.name)) [] ["t0"]
+      "t1" "-" "t0" none (by decide) (by decide)
+  have hLb1 :
+      (Stack.Lower.lowerValueP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+          ["t0"] "t1" (.unaryOp "-" "t0" none)).2.2 = (wave57SplitBody.map (·.name)) :=
+    lowerValueP_unaryOp_localBindings [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) [] ["t0"]
+      "t1" "-" "t0" none
+  have hConsT1 :
+      (Stack.Lower.lowerBindingsP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+          ["t0"] [⟨"t1", .unaryOp "-" "t0" none, none⟩]).1
+        = (Stack.Lower.lowerValueP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+              ["t0"] "t1" (.unaryOp "-" "t0" none)).1
+          ++ (Stack.Lower.lowerBindingsP [] [] 1000 2 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+                ["t1"] ([] : List ANFBinding)).1 := by
+    show (Stack.Lower.lowerBindingsP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) [] ["t0"]
+        (⟨"t1", .unaryOp "-" "t0" none, none⟩ :: [])).1 = _
+    rw [Stack.Lower.lowerBindingsP]
+    simp only [hSm1, hLb1, Stack.Lower.lowerBindingsP, List.append_nil]
+  have hChunk1 :
+      runOps (Stack.Lower.lowerValueP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+          ["t0"] "t1" (.unaryOp "-" "t0" none)).1
+          ({ wave57SplitStk with stack := [.vBigint 7] })
+        = .ok ({ wave57SplitStk with stack := [.vBigint (-7)] }) := by
+    have hRun :
+        runOps [StackOp.opcode (Stack.Lower.unaryOpcode "-")]
+            ({ wave57SplitStk with stack := [.vBigint 7] })
+          = .ok ({ wave57SplitStk with stack := [.vBigint (-7)] }) := by
+      simp [runOps, Stack.Eval.stepNonIf, Stack.Eval.runOpcode, Stack.Eval.liftIntUnary,
+        Stack.Eval.StackState.pop?, Stack.Eval.StackState.push, Stack.Eval.asInt?,
+        Stack.Lower.unaryOpcode]
+    have h := build_consume_unaryOp_witness_d0 [] [] 1000 1 wave57SplitLU (wave57SplitBody.map (·.name)) []
+      ["t0"] "t1" "-" "t0" none
+      ({ wave57SplitStk with stack := [.vBigint 7] })
+      ({ wave57SplitStk with stack := [.vBigint (-7)] })
+      (by decide) (by decide) hRun
+    exact h
+  -- Chain: prefix = chunk0 ++ (chunk1 ++ residual); reduce residual to `[]`.
+  have hResidual :
+      (Stack.Lower.lowerBindingsP [] [] 1000 2 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+          ["t1"] ([] : List ANFBinding)).1 = [] := by
+    rw [Stack.Lower.lowerBindingsP]
+  rw [hConsPrefix, hConsT1, hResidual, List.append_nil]
+  rw [Stack.Eval.runOps_append, hChunk0]
+  exact hChunk1
+
+/-- The ANF prefix midstate (`t0 ↦ 7, t1 ↦ -7`), via the binOp + unary cons-steps. -/
+private theorem wave57_split_hAnfMid :
+    RunarVerification.ANF.Eval.evalBindings wave57SplitAnf wave57SplitPrefix
+      = .ok ((wave57SplitAnf.addBinding "t0" (.vBigint 7)).addBinding "t1" (.vBigint (-7))) := by
+  show RunarVerification.ANF.Eval.evalBindings wave57SplitAnf
+      [⟨"t0", .binOp "+" "p0" "p1" none, none⟩, ⟨"t1", .unaryOp "-" "t0" none, none⟩] = _
+  rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+        wave57SplitAnf "t0" "+" "p0" "p1" none none 3 4 _ (Or.inl rfl) rfl rfl]
+  rw [RunarVerification.ANF.Eval.evalBindings_unary_bigint_cons_step
+        _ "t1" "t0" none none 7 [] rfl]
+  simp only [RunarVerification.ANF.Eval.evalBindings,
+    RunarVerification.ANF.Eval.arithBinResultBigint,
+    RunarVerification.ANF.Eval.arithUnaryResultBigint, Int.reduceAdd]
+
+/-- The boundary relaxed agreement at the midstate (`t1 ↦ -7` head, `acc` fresh). -/
+private theorem wave57_split_midAgrees :
+    agreesTaggedModProps [("t1", SlotKind.binding)]
+      ((wave57SplitAnf.addBinding "t0" (.vBigint 7)).addBinding "t1" (.vBigint (-7)))
+      ({ wave57SplitStk with stack := [.vBigint (-7)] }) := by
+  refine ⟨?_, ?_⟩
+  · show taggedStackAligned [("t1", SlotKind.binding)] _ [.vBigint (-7)]
+    refine ⟨?_, ?_⟩
+    · show State.lookupBinding _ "t1" = some (.vBigint (-7))
+      unfold State.addBinding State.lookupBinding wave57SplitAnf; simp [List.find?]
+    · trivial
+  · rfl
+
+/-- **(Deliverable 2 + 3 smoke — THE WALK FIRES ANTI-VACUOUSLY)** The
+parameterized walk `successAgrees_updateProp_unconditional` FIRES on the concrete
+`t0 = p0 + p1; t1 = -t0; update_prop acc t1` body: the arith prefix reduces to
+the explicit midstate (the genuine intermediate-state hand-off, built from the
+per-binding consume witnesses), and the `update_prop acc t1` suffix step is the
+real depth-0-fresh transport. We obtain the whole-body iff (NOT a whole-body
+`native_decide`) and confirm both sides `isSome`. -/
+theorem wave57_body_split_walk_smoke :
+    -- (1) the walk's whole-body iff for the concrete body.
+    ( (RunarVerification.ANF.Eval.evalBindings wave57SplitAnf wave57SplitBody).toOption.isSome
+        ↔ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU []
+              (wave57SplitBody.map (·.name)) [] ["p0", "p1"] wave57SplitBody).1
+              wave57SplitStk).toOption.isSome )
+    -- (2)+(3) both sides concretely succeed (anti-vacuous).
+    ∧ (RunarVerification.ANF.Eval.evalBindings wave57SplitAnf wave57SplitBody).toOption.isSome
+    ∧ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU []
+          (wave57SplitBody.map (·.name)) [] ["p0", "p1"] wave57SplitBody).1
+          wave57SplitStk).toOption.isSome := by
+  -- The lowering split at the suffix binding (post-prefix idx 2, sm `["t1"]`).
+  have hLowerSplit :
+      (Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU []
+          (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
+          (wave57SplitPrefix ++ [⟨"u0", .updateProp "acc" "t1", none⟩])).1
+        = (Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU []
+              (wave57SplitBody.map (·.name)) [] ["p0", "p1"] wave57SplitPrefix).1
+          ++ (Stack.Lower.lowerValueP [] [] 1000 2 wave57SplitLU []
+                (wave57SplitBody.map (·.name)) [] ("t1" :: []) "u0"
+                (.updateProp "acc" "t1")).1 := by
+    -- prefix ++ suffix lowering: split at each binding via the smOut lemmas.
+    have hSm0 :
+        (Stack.Lower.lowerValueP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+            ["p0", "p1"] "t0" (.binOp "+" "p0" "p1" none)).2.1 = ["t0"] :=
+      lowerValueP_binOp_d0d1_smOut [] [] 1000 0 wave57SplitLU (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
+        "t0" "+" "p0" "p1" none (by decide) (by decide) (by decide) (by decide)
+    have hLb0 :
+        (Stack.Lower.lowerValueP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+            ["p0", "p1"] "t0" (.binOp "+" "p0" "p1" none)).2.2 = (wave57SplitBody.map (·.name)) :=
+      lowerValueP_binOp_localBindings [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
+        "t0" "+" "p0" "p1" none
+    have hSm1 :
+        (Stack.Lower.lowerValueP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+            ["t0"] "t1" (.unaryOp "-" "t0" none)).2.1 = ["t1"] :=
+      lowerValueP_unaryOp_d0_smOut [] [] 1000 1 wave57SplitLU (wave57SplitBody.map (·.name)) [] ["t0"]
+        "t1" "-" "t0" none (by decide) (by decide)
+    have hLb1 :
+        (Stack.Lower.lowerValueP [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+            ["t0"] "t1" (.unaryOp "-" "t0" none)).2.2 = (wave57SplitBody.map (·.name)) :=
+      lowerValueP_unaryOp_localBindings [] [] 1000 1 wave57SplitLU [] (wave57SplitBody.map (·.name)) [] ["t0"]
+        "t1" "-" "t0" none
+    -- Full-body lowering = prefix lowering ++ suffix chunk, by cons-decomposition
+    -- on both sides (the smOut facts pin the threaded sm / localBindings).
+    show (Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
+        (⟨"t0", .binOp "+" "p0" "p1" none, none⟩ ::
+          ⟨"t1", .unaryOp "-" "t0" none, none⟩ ::
+          [⟨"u0", .updateProp "acc" "t1", none⟩])).1
+      = ((Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU [] (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
+            (⟨"t0", .binOp "+" "p0" "p1" none, none⟩ ::
+              [⟨"t1", .unaryOp "-" "t0" none, none⟩])).1
+          ++ (Stack.Lower.lowerValueP [] [] 1000 2 wave57SplitLU [] (wave57SplitBody.map (·.name)) []
+                ("t1" :: []) "u0" (.updateProp "acc" "t1")).1)
+    -- Unfold the `lowerBindingsP` recursion on both sides; the smOut facts pin
+    -- the threaded sm / localBindings so the chunks line up modulo `++`-assoc.
+    simp only [Stack.Lower.lowerBindingsP, hSm0, hLb0, hSm1, hLb1, List.append_assoc,
+      List.nil_append, List.append_nil]
+  have hWalk :
+      (RunarVerification.ANF.Eval.evalBindings wave57SplitAnf
+          (wave57SplitPrefix ++ [⟨"u0", .updateProp "acc" "t1", none⟩])).toOption.isSome
+        ↔ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU []
+              (wave57SplitBody.map (·.name)) [] ["p0", "p1"]
+              (wave57SplitPrefix ++ [⟨"u0", .updateProp "acc" "t1", none⟩])).1
+              wave57SplitStk).toOption.isSome :=
+    successAgrees_updateProp_unconditional [] [] 1000 wave57SplitLU []
+      wave57SplitPrefix ["p0", "p1"] (wave57SplitBody.map (·.name)) 0
+      wave57SplitAnf wave57SplitStk "u0" "acc" "t1" none
+      ((wave57SplitAnf.addBinding "t0" (.vBigint 7)).addBinding "t1" (.vBigint (-7)))
+      ({ wave57SplitStk with stack := [.vBigint (-7)] }) 2 [] []
+      (.vBigint (-7)) []
+      wave57_split_hAnfMid wave57_split_hStkMid hLowerSplit rfl rfl wave57_split_midAgrees
+      (by show State.resolveRef _ "t1" = some (.vBigint (-7));
+          unfold State.resolveRef State.lookupBinding State.addBinding wave57SplitAnf;
+          simp [List.find?])
+      (by decide) (by intro h; simp at h) (by intro s hs; simp at hs)
+      (by unfold freshIn untagSm; simp)
+  -- `wave57SplitBody = wave57SplitPrefix ++ [updateProp]` definitionally.
+  have hBodyEq : wave57SplitBody = wave57SplitPrefix ++ [⟨"u0", .updateProp "acc" "t1", none⟩] := rfl
+  -- The whole-body iff.
+  have hIff :
+      (RunarVerification.ANF.Eval.evalBindings wave57SplitAnf wave57SplitBody).toOption.isSome
+        ↔ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0 wave57SplitLU []
+              (wave57SplitBody.map (·.name)) [] ["p0", "p1"] wave57SplitBody).1
+              wave57SplitStk).toOption.isSome := by
+    rw [hBodyEq]; exact hWalk
+  -- The ANF side concretely succeeds (the whole body runs to `.ok`).
+  have hANFsucc :
+      (RunarVerification.ANF.Eval.evalBindings wave57SplitAnf wave57SplitBody).toOption.isSome := by
+    rw [hBodyEq, RunarVerification.ANF.Eval.evalBindings_append]
+    simp only [wave57_split_hAnfMid]
+    have hRef : ((wave57SplitAnf.addBinding "t0" (.vBigint 7)).addBinding "t1"
+        (.vBigint (-7))).resolveRef "t1" = some (.vBigint (-7)) := by
+      unfold State.resolveRef State.lookupBinding State.addBinding wave57SplitAnf; simp [List.find?]
+    rw [RunarVerification.ANF.Eval.evalBindings_updateProp_cons_step _ "u0" "acc" "t1"
+          none (.vBigint (-7)) [] hRef]
+    simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+  exact ⟨hIff, hANFsucc, hIff.mp hANFsucc⟩
 
 end Agrees
 end RunarVerification.Stack

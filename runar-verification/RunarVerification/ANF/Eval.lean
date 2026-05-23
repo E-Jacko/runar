@@ -2831,5 +2831,64 @@ theorem wave32_anf_cons_step_smoke :
         "t1" "t0" none none 7 [] rfl]
   simp only [evalBindings, arithUnaryResultBigint]
 
+/-! ### Add-only: `evalBindings` append split + `updateProp` cons-step
+
+These two lemmas are **add-only** (no edit to `evalBindings` / `evalValue`):
+
+* `evalBindings_append` — splits a body `xs ++ ys` into the prefix walk, then
+  (on success) the suffix walk from the post-prefix state. This is the
+  `evalBindings` peer of `Stack.Eval.runOps_append`; it exposes the
+  intermediate post-prefix ANF state needed by the body-split in `AgreesA5`.
+* `evalBindings_updateProp_cons_step` — the `update_prop` per-binding ANF
+  reduction: when `ref` resolves to `v`, an `update_prop propName ref` binding
+  advances `evalBindings` by one step, leaving the state
+  `(s.setProp propName v).addBinding bn v`. Peer of
+  `evalBindings_binOp_bigint_cons_step` for the `update_prop` value. -/
+
+/-- **Add-only — `evalBindings` append split.** The whole-body walk over a
+concatenated body `xs ++ ys` evaluates the prefix `xs`, then (on success)
+evaluates the suffix `ys` from the post-prefix state. The `evalBindings`
+analogue of `runOps_append`, exposing the intermediate state. -/
+theorem evalBindings_append : ∀ (xs ys : List ANFBinding) (s : State),
+    evalBindings s (xs ++ ys)
+      = match evalBindings s xs with
+        | .error e => .error e
+        | .ok s'   => evalBindings s' ys := by
+  intro xs
+  induction xs with
+  | nil =>
+      intro ys s
+      simp only [List.nil_append, evalBindings]
+  | cons hd rest ih =>
+      intro ys s
+      obtain ⟨name, v, src⟩ := hd
+      show evalBindings s (.mk name v src :: (rest ++ ys))
+            = match evalBindings s (.mk name v src :: rest) with
+              | .error e => .error e
+              | .ok s'   => evalBindings s' ys
+      simp only [evalBindings, bind, Except.bind]
+      cases hVal : evalValue s v with
+      | error e => rfl
+      | ok p =>
+          obtain ⟨val, s'⟩ := p
+          simp only []
+          exact ih ys (s'.addBinding name val)
+
+/-- **Add-only — `update_prop` ANF cons-step.** When `ref` resolves to `v`, an
+`update_prop propName ref` binding advances `evalBindings` by exactly one step,
+producing the post-state `(s.setProp propName v).addBinding bn v`. -/
+theorem evalBindings_updateProp_cons_step
+    (s : State) (bn propName ref : String)
+    (src : Option RunarVerification.ANF.SourceLoc)
+    (v : Value) (rest : List ANFBinding)
+    (hRef : s.resolveRef ref = some v) :
+    evalBindings s (.mk bn (.updateProp propName ref) src :: rest)
+      = evalBindings ((s.setProp propName v).addBinding bn v) rest := by
+  have hVal : evalValue s (.updateProp propName ref)
+      = .ok (v, s.setProp propName v) := by
+    simp only [evalValue, lookupRef, hRef, bind, Except.bind, pure, Except.pure]
+  show evalBindings s (.mk bn (.updateProp propName ref) src :: rest) = _
+  simp only [evalBindings, hVal, bind, Except.bind]
+
 end Eval
 end RunarVerification.ANF
