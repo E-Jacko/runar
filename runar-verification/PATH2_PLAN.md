@@ -2517,29 +2517,63 @@ is FALSE (`applyPushPushAdd: [push 10, push 10, OP_ADD] → [push 20]`,
 20∉[-1,16]) — the consume theorem instead enumerates the post-peephole
 image over the finite admissible range.
 
-**Remaining families — all need model-level reconciliation (NOT the
-Stage-C template):**
-* `method_call` — foundations landed (waves 52-54): `evalMethodCall`,
-  `evalBindingsP` + equality bridge, the omnibus re-statement, the
-  leaf-const M2 bridge. BUT wave 55 found a deeper blocker: **an
-  inlining-frame mismatch.** A const callee inlines to a non-emittable
-  `.push` (M4 wall); an arith callee is lowered by the A8 Stack
-  substrate against the *outer* method's params (caller frame), while
-  `evalMethodCall` evaluates the callee from its *own* param state
-  (callee frame) — so for the fragments the substrate admits, ANF and
-  Stack disagree on which frame the callee body's operands live in
-  (`False ↔ True`). Reconciling this needs a core `evalMethodCall`
-  semantics decision (does the inlined callee see the call-site stack,
-  and with which param names?) + a matching Stack-substrate fragment
-  where the callee references *its own* params bound from explicit args.
-  This is a model-level reconciliation, deeper than the template; the
-  feasible fragment (callee with own params + args, body referencing
-  callee params) was not the one the existing A8 substrate provides.
-* `dispatch` (D1 multi-method Merkle), `stateful` (D2
-  checkPreimage/state continuation) — separate axes.
-* `crypto_call` — the universal `True` fallback; needs Phase B
-  per-primitive codegen-to-spec. Now sound for methodCall bodies too
-  (wave 54).
+**Remaining 5 sub-omnibus axioms — wave-65 substrate sweep mapped all of
+them.** Two are RETIREMENT-REACHABLE (substrate landed, just the gated
+Pipeline dispatch remains); three are BLOCKED on a precise gap.
+
+* `method_call` — **retirement-reachable.** Wave 65 corrected the wave-55
+  finding: NO core `evalMethodCall` change is needed — the wave-52
+  `evalMethodCall` already binds call-site args into the callee frame; W55's
+  "frame mismatch" was a Stack-substrate gap. The from-entry M2 walk
+  `successAgrees_methodCall_passthrough_unconditional` (AgreesA8) now covers
+  the param-passthrough fragment (callee with its own param bound from an
+  explicit arg); the const-callee leaf walk (W53) covers the other. Remaining
+  to retire (→82): method-level wrappers (mirror the leaf wrappers) + a
+  decidable `methodCallPassthroughBool` classifier + the gated keyed-premise
+  dispatch. Wider fragments (arg at depth>0, multi-param, op-combining callee
+  bodies) fall through to crypto_call.
+* `loop` — **retirement-reachable.** Wave 65 closed Tier-3c (singleton arith
+  binOp body): per-iteration transport `runOps_push_i_binOp_drop_copyPath` +
+  from-entry walk `runOps_lowerValueP_loop_allCopyBody(_isSome)` (AgreesA7),
+  reusing the multi-loadRef+opcode witnesses. Remaining to retire (→82): the
+  final-iteration consume divergence (the last iter consumes operands via
+  ROLL/SWAP last-uses, diverging from the copy chunks — needs a
+  final-discriminating recursor), Tier-3d assemble, classifier widening, and
+  the gated dispatch.
+* `dispatch` (D1) — **BLOCKED on the if-cascade parse round-trip.** Full
+  lowering map + `dispatch2_select_branch0` selection PoC landed (AgreesD1).
+  M2/M3/M4 are 100% reusable from the single-public retirements; the only new
+  leg is branch-selection. The blocker: a multi-public program compiles to an
+  `OP_DUP/push/OP_NUMEQUAL/OP_IF` cascade that parses back into a nested
+  `.ifOp` tree, which is OUTSIDE the proven `AreRunarEmittable` round-trip
+  subset (no `.ifOp` constructor). Needs a `parseDispatchN_emit_round_trip`
+  lemma (composing the structural `parseStackOpFuel_ifOp_*` helpers per chain
+  link) — a substantial byte-level proof.
+* `stateful` (D2) — **BLOCKED on an open trust gap.** Full lowering map +
+  the genuine prologue transport `evalBindingsP_statefulPrologue_reduces`
+  landed (AgreesD2). CRITICAL FINDING: the ANF `checkPreimage` step routes
+  through `Crypto.preimageBackend` (returns a bool, never aborts) while the
+  Stack prologue routes through `Crypto.authBackend` (`OP_CHECKSIGVERIFY` /
+  `checkSig`, aborts on false) — DIFFERENT backends with different abort
+  semantics. The existing D2.a theorem's docstring claim of a "shared
+  backend" is FALSE. A genuine retirement needs a NEW verified
+  `checkSig(G, _opPushTxSig) ⟷ checkPreimage(preimage)` bridge under a
+  `ValidTxContext` (BIP-143) — a new shared-spec axiom/lemma, i.e. a real
+  trust-footprint decision, not a free discharge.
+* `crypto_call` — **the residual universal fallback; not wholesale-retirable.**
+  Hypothesis `True`; every body not matching a retired classifier (incl. all
+  crypto-builtin calls + the residual/non-canonical bodies of the retired
+  families) lands here. Scope map + the formalized M2 obstruction
+  `crypto_call_M2_disagreement` landed (AgreesCrypto). The most tractable
+  peel-off (`sha256`/`hash160`: single allowlisted opcode + Stack-side
+  codegen-to-spec already proven via `HashOps`) is BLOCKED at M2: the ANF
+  `callBuiltin?` deliberately returns `.unsupported` for crypto builtins, so
+  only the Stack side hits `Crypto.hashBackend` (`False ↔ True`). Unblock =
+  extend `ANF.Eval.callBuiltin?` with the hash arms (a shared-file model
+  change) so both sides hit the same backend; then a single-opcode crypto
+  fragment becomes retirable on the update_prop operational-M3 template.
+  Sound for methodCall bodies (wave 54). crypto_call stays as the catch-all
+  regardless of any peel-off.
 
 ---
 
