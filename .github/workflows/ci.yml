@@ -51,6 +51,59 @@ jobs:
       - name: Run allowlist audit (vitest)
         run: pnpm run conformance:allowlist-audit
 
+  sdk-envelope-fixtures:
+    # Guards the signed-envelope wire protocol's cross-tier fixture. The
+    # fixture is the frozen TS-reference bytes that all 6 non-TS SDKs validate
+    # against (canonicalJson + signEnvelope/verifyEnvelope). Two silent-failure
+    # modes this job closes:
+    #   1. TS drift — if TS's canonicalJson/signing path changes but the
+    #      committed fixtures.json does not, the consumers keep validating
+    #      against stale bytes and a real TS regression ships green. The
+    #      validator recomputes every canonical vector + re-verifies the
+    #      envelope signature against the committed fixture and fails on drift.
+    #   2. Dropped coverage — the per-tier interop tests run inside each SDK
+    #      job (go test, cargo test, ...), with no central re-run. If a tier's
+    #      test glob ever stops picking up its interop file, cross-tier parity
+    #      silently stops being checked.
+    name: Lint — SDK envelope fixture drift + interop coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Validate envelope fixture against the TS reference (drift guard)
+        run: cd conformance && npx tsx sdk-envelope/validate-fixtures.ts
+      - name: Assert every non-TS SDK has an envelope interop test wired to the fixture
+        run: |
+          set -euo pipefail
+          files=(
+            "packages/runar-go/sdk_envelope_interop_test.go"
+            "packages/runar-rs/tests/envelope_interop.rs"
+            "packages/runar-py/tests/test_envelope_interop.py"
+            "packages/runar-zig/src/sdk_envelope_interop_test.zig"
+            "packages/runar-rb/spec/runar/sdk/envelope_interop_spec.rb"
+            "packages/runar-java/src/test/java/runar/lang/sdk/EnvelopeInteropTest.java"
+          )
+          missing=0
+          for f in "${files[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing envelope interop test: $f"
+              missing=1
+            elif ! grep -q "sdk-envelope" "$f"; then
+              echo "::error::$f no longer references conformance/sdk-envelope/fixtures.json"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Cross-tier envelope interop coverage is incomplete. See conformance/sdk-envelope/."
+            exit 1
+          fi
+          echo "All 6 non-TS SDK envelope interop tests present and wired to the fixture."
+
   # ---------------------------------------------------------------------------
   # Compilers — build, unit test, upload artifacts
   # ---------------------------------------------------------------------------

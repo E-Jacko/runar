@@ -151,9 +151,7 @@ CI runs the multi-format conformance suite **twice**: once with `--disable-const
 
 A fixture (or a specific format variant of a fixture) that is known to fail the fold-ON cross-tier check must be listed in `conformance/fold-on-allowlist.json` with a per-entry `reason` (and ideally a `tracking` ref). The runner refuses to load entries that lack a non-empty `reason` — there is no "bare list" mode. The fold-OFF run is unaffected, so allowlisting only relaxes the dual-mode parity check, not the canonical golden coverage.
 
-| Entry | Format(s) | Why skipped |
-|---|---|---|
-| `if-without-else-multi-temp` | `.runar.rb` | Java daemon produces a 2-byte-shorter hex than the other 6 tiers under fold-ON for this source; one-shot Java CLI matches the others, so the divergence is a daemon request-sequence artifact (likely `AnfOptimize`'s static `FRESH_COUNTER`). Fold-OFF parity is still enforced. Fix tracked in `conformance/fold-on-allowlist.json`. |
+The allowlist is currently **empty** (`"skip": []`): there are no fold-ON exemptions, so every fixture is enforced across all 7 tiers under both fold modes. If a fold-ON-only divergence is ever introduced, add an entry here (with a `reason`) and to `conformance/fold-on-allowlist.json` in the same commit.
 
 ### File Roles
 
@@ -346,34 +344,36 @@ Golden file updates should always be reviewed carefully. An unexpected change in
 
 ---
 
-## Current Test Cases (42)
+## Current Test Cases
+
+The suite currently contains **60 fixtures** under `tests/` — that directory is the authoritative list (`find tests -name source.json | wc -l`). The table below describes the most commonly referenced ones. Tier scoping (which compilers run a fixture) is governed solely by the [Per-fixture compiler allowlist](#per-fixture-compiler-allowlist) above — do not infer it from this table.
 
 | Test | Exercises | Has Script Golden |
 |---|---|---|
-| `add-data-output` | `this.addDataOutput(satoshis, bytes)` intrinsic (TS-only fixture) | Yes |
-| `add-raw-output` | `this.addRawOutput(satoshis, scriptBytes)` intrinsic (TS-only fixture) | Yes |
+| `add-data-output` | `this.addDataOutput(satoshis, bytes)` intrinsic | Yes |
+| `add-raw-output` | `this.addRawOutput(satoshis, scriptBytes)` intrinsic | Yes |
 | `arithmetic` | Binary arithmetic operations (+, -, *, /, %) | Yes |
 | `auction` | Stateful auction with bidding and closing | Yes |
 | `babybear` | BabyBear prime-field arithmetic | Yes |
-| `babybear-ext4` | BabyBear Ext4 extension-field operations (TS-only fixture) | Yes |
+| `babybear-ext4` | BabyBear Ext4 extension-field operations | Yes |
 | `basic-p2pkh` | Property loading, hash160, checkSig, assert | Yes |
-| `bitwise-ops` | Bitwise operators (&, \|, ^, ~, <<, >>) on bigint + ByteString (TS-only fixture) | Yes |
+| `bitwise-ops` | Bitwise operators (&, \|, ^, ~, <<, >>) on bigint + ByteString | Yes |
 | `blake3` | BLAKE3 compression + full-hash builtins | Yes |
 | `boolean-logic` | Logical operators (&&, \|\|, !), short-circuit lowering | Yes |
 | `bounded-loop` | Loop unrolling in ANF IR | Yes |
 | `convergence-proof` | Convergence proof patterns | Yes |
 | `covenant-vault` | Covenant spending constraints | Yes |
-| `cross-covenant` | Cross-contract covenant validation (TS-only fixture) | Yes |
+| `cross-covenant` | Cross-contract covenant validation | Yes |
 | `ec-demo` | EC point operation demos | Yes |
 | `ec-primitives` | EC point operations (ecAdd, ecMul, ecMulGen, etc.) | Yes |
-| `ec-unit` | Fine-grained EC unit tests (TS-only fixture) | Yes |
+| `ec-unit` | Fine-grained EC unit tests | Yes |
 | `escrow` | Multi-party escrow with multiple spending paths | Yes |
 | `function-patterns` | Private helper methods and function call patterns | Yes |
-| `go-dsl-bytestring-literal` | `.runar.go` DSL `ByteString` literal grammar (Go-only fixture) | Yes |
+| `go-dsl-bytestring-literal` | `.runar.go` DSL `ByteString` literal grammar | Yes |
 | `if-else` | Conditional branches in ANF IR | Yes |
 | `if-without-else` | if-only conditionals | Yes |
 | `math-demo` | Built-in math functions (abs, min, max, sqrt, pow, etc.) | Yes |
-| `merkle-proof` | Merkle-root verification (TS-only fixture) | Yes |
+| `merkle-proof` | Merkle-root verification | Yes |
 | `multi-method` | Method dispatch table generation | Yes |
 | `oracle-price` | Rabin signature oracle price feed | Yes |
 | `p256-primitives` | NIST P-256 EC primitives | Yes |
@@ -386,7 +386,7 @@ Golden file updates should always be reviewed carefully. An unexpected change in
 | `property-initializers` | Default values on contract properties | Yes |
 | `schnorr-zkp` | Schnorr zero-knowledge proof (EC ops) | Yes |
 | `sphincs-wallet` | SLH-DSA wallet contract | Yes |
-| `state-covenant` | Stateful covenant constraints (TS-only fixture) | Yes |
+| `state-covenant` | Stateful covenant constraints | Yes |
 | `stateful` | State updates, checkPreimage, getStateScript | Yes |
 | `stateful-bytestring` | Stateful ByteString mutations | Yes |
 | `stateful-counter` | Stateful counter with increment | Yes |
