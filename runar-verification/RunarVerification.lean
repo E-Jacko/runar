@@ -18,6 +18,9 @@ import RunarVerification.Stack.AgreesA5
 import RunarVerification.Stack.AgreesA6
 import RunarVerification.Stack.AgreesA7
 import RunarVerification.Stack.AgreesA8
+import RunarVerification.Stack.AgreesD1
+import RunarVerification.Stack.AgreesD2
+import RunarVerification.Stack.AgreesCrypto
 import RunarVerification.Stack.OutputTrace
 import RunarVerification.Stack.Peephole
 import RunarVerification.Stack.TxContext

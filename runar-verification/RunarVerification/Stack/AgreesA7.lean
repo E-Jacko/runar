@@ -3547,8 +3547,493 @@ chain above). The remaining deferrals are:
   Wave 9 supplied the substrate for ONE `loadRef` only; a Tier 3c
   closure needs either a generalisation of `runOps_push_i_loadRef_drop`
   to multi-`loadRef` chunks or an `agrees`-style invariant on the
-  iter-shifted depths. Slated for a follow-up wave after the
-  consume-path chunks land. -/
+  iter-shifted depths. The Tier 3c section below (Wave 13) closes the
+  COPY-PATH binOp body case by composing the multi-`loadRef` substrate
+  that has since landed in `Stack/Agrees.lean`
+  (`runOps_loadRef_loadRef_opcode_depth_general` /
+  `runOps_lowerValue_binOp_depth_general`). -/
+
+/-! ## Tier 3c — singleton COPY-PATH `binOp` arith body (Wave 13)
+
+Wave 13 closes the deferred Tier 3c singleton-`binOp` case **for the
+copy-path body lowering** — the per-iteration shape that EVERY
+non-final iter of any binOp loop body takes, and that the final iter
+also takes whenever both operands stay copy-mode (e.g. the operands are
+read again after the loop, so `clampLastUsesForOuter` keeps their
+last-use beyond the body, or the loop's keyed dispatch supplies the
+copy-mode body lowering directly).
+
+### The per-iteration arith transport
+
+A binOp body `[.mk t (.binOp op l r none) none]` lowers (copy mode) to
+`lowerValue smInner t (.binOp op l r none)` ops — a chunk that loads `l`
+and `r` (each by a `loadRef` copy that leaves the originals in place),
+runs the opcode (pop 2 copies, push 1 result), and binds `t` on top.
+The iter var survives below the result (`consumedF = consumedNF =
+false`), so each iter is `[push i] ++ binOpOps ++ [.drop]`: push the
+iteration index, compute the result on top of it, then drop the result.
+Net per-iter effect: `s.push (.vBigint i)` — IDENTICAL to Tier 3a's
+const-body shape. So the closed-form post-state reuses Tier 3a's
+`loopConstPostState`.
+
+The load-bearing per-iteration transport is `runOps_push_i_binOp_drop`,
+which is fully GENERIC over the body's lowered op-list: it only requires
+that the body ops run from `s.push i` to `.ok ((s.push i).push out)` for
+some result value `out`. The arith / const / ref specialisations all
+feed this generic transport. The copy-path binOp instance composes
+`Stack.Agrees.runOps_lowerValue_binOp_depth_general` (the two-operand
+depth-general witness in `Stack/Agrees.lean`) to discharge that premise.
+
+### Honest deferrals (NOT discharged here)
+
+* **Final-iter consume divergence.** When the loop body's natural
+  last-uses make the FINAL iter consume `l` / `r` (the single-binding
+  case with no post-loop reads), the final per-iter chunk lowers to a
+  ROLL/SWAP consume path that differs from the copy chunks of the
+  non-final iters. Closing that needs a `final`-discriminating recursor
+  in the loadParam Wave-12 style, composed with two consume-path loads
+  (vs. Wave 12's single load). Out of scope for Wave 13; the copy-path
+  wrappers below are the substrate it composes against.
+* **`unaryOp` / `assert` arith bodies.** The unary case is a direct
+  one-load specialisation of the same generic transport
+  (`Stack.Agrees.runOps_lowerValue_unaryOp_*` once a depth-general
+  unary witness lands); `assert` ends in a verify opcode rather than a
+  pushed value, so it does not fit the "body pushes one value" shape.
+
+### Hard-rule compliance
+
+* No `sorry` / `admit` / new `axiom`. No new substrate in
+  `Stack/Agrees.lean`; this section only COMPOSES the public
+  `runOps_lowerValue_binOp_depth_general` /
+  `lowerValueP_binOp_copy_eq_lowerValue` lemmas already there.
+* No `hRunOk` / conclusion-restating hypothesis: the body-run premise of
+  the generic transport is the genuine operational fact
+  `runOps bodyOps (s.push i) = .ok ((s.push i).push out)`, supplied by
+  the depth-general binOp witness from the operand depth + value
+  hypotheses — NOT a restatement of the loop conclusion. -/
+
+/-- **Generic per-iteration arith transport.** For ANY body op-list
+`bodyOps` that runs from `s.push i` to `.ok ((s.push i).push out)` (the
+body pushes exactly one value on top of the pushed iter index), the
+per-iteration chunk `[push i] ++ bodyOps ++ [.drop]` runs from `s` back
+to `.ok (s.push i)`: the trailing drop pops the body's pushed value,
+leaving only the iter index. This is the arith analogue of Tier 3a's
+`runOps_push_i_emitConst_drop`, parametrised over an arbitrary
+result-pushing body. -/
+theorem runOps_push_i_bodyOps_drop
+    (i : Nat) (bodyOps : List StackOp) (out : ANF.Eval.Value)
+    (s : StackState)
+    (hBody : runOps bodyOps (s.push (.vBigint (Int.ofNat i)))
+              = .ok ((s.push (.vBigint (Int.ofNat i))).push out)) :
+    runOps ([.push (.bigint (Int.ofNat i))] ++ bodyOps ++ [.drop]) s
+      = .ok (s.push (.vBigint (Int.ofNat i))) := by
+  -- Outer split: prefix = `[push i] ++ bodyOps`, suffix = `[drop]`.
+  rw [Stack.Sim.runOps_append]
+  -- Reduce the prefix `[push i] ++ bodyOps`.
+  rw [Stack.Sim.runOps_append]
+  rw [show runOps [.push (.bigint (Int.ofNat i))] s
+        = .ok (s.push (.vBigint (Int.ofNat i))) from by
+      unfold runOps
+      rw [show stepNonIf (.push (.bigint (Int.ofNat i))) s
+            = .ok (s.push (.vBigint (Int.ofNat i))) from rfl]
+      exact Stack.Eval.runOps_nil _]
+  simp only []
+  rw [hBody]
+  simp only []
+  -- Final chunk: drop pops `out` off the top, leaving `s.push i`.
+  show runOps [.drop] ((s.push (.vBigint (Int.ofNat i))).push out)
+        = .ok (s.push (.vBigint (Int.ofNat i)))
+  unfold runOps
+  rw [show stepNonIf .drop ((s.push (.vBigint (Int.ofNat i))).push out)
+        = .ok (s.push (.vBigint (Int.ofNat i))) from by
+      show applyDrop ((s.push (.vBigint (Int.ofNat i))).push out)
+            = .ok (s.push (.vBigint (Int.ofNat i)))
+      unfold applyDrop StackState.push
+      simp]
+  exact Stack.Eval.runOps_nil _
+
+/-- **Per-iteration COPY-PATH binOp transport.** Specialises
+`runOps_push_i_bodyOps_drop` to the copy-path binOp body chunk
+`[push i] ++ (loadRef l ++ loadRef (sm.push l) r ++ [opcode]) ++ [.drop]`.
+The two operands resolve at depths `dl` / `dr'` against the
+iter-extended stack, and the opcode runs to `out`; the chunk runs back
+to `s.push i`. Composes `Stack.Agrees.runOps_loadRef_loadRef_opcode_depth_general`
+as the body-run witness. -/
+theorem runOps_push_i_binOp_drop_copyPath
+    (i : Nat) (sm : StackMap) (l r : String) (dl dr' : Nat)
+    (vl vr out : ANF.Eval.Value) (opcode : String) (s : StackState)
+    (hDl : sm.depth? l = some dl)
+    (hLenL : dl < (s.push (.vBigint (Int.ofNat i))).stack.length)
+    (hAtL : (s.push (.vBigint (Int.ofNat i))).stack[dl]! = vl)
+    (hDr : (sm.push l).depth? r = some dr')
+    (hLenR : dr' < ((s.push (.vBigint (Int.ofNat i))).push vl).stack.length)
+    (hAtR : ((s.push (.vBigint (Int.ofNat i))).push vl).stack[dr']! = vr)
+    (hOpcode :
+      Stack.Eval.runOpcode opcode
+        (((s.push (.vBigint (Int.ofNat i))).push vl).push vr)
+        = .ok ((s.push (.vBigint (Int.ofNat i))).push out)) :
+    runOps ([.push (.bigint (Int.ofNat i))]
+              ++ (Stack.Lower.loadRef sm l
+                    ++ Stack.Lower.loadRef (sm.push l) r
+                    ++ [.opcode opcode])
+              ++ [.drop]) s
+      = .ok (s.push (.vBigint (Int.ofNat i))) := by
+  refine runOps_push_i_bodyOps_drop i
+    (Stack.Lower.loadRef sm l ++ Stack.Lower.loadRef (sm.push l) r
+      ++ [.opcode opcode]) out s ?_
+  exact Stack.Agrees.runOps_loadRef_loadRef_opcode_depth_general
+    sm l r dl dr' vl vr ((s.push (.vBigint (Int.ofNat i))).push out)
+    opcode (s.push (.vBigint (Int.ofNat i)))
+    hDl hLenL hAtL hDr hLenR hAtR hOpcode
+
+/-! ### From-entry walk for an all-copy-iter binOp loop
+
+When EVERY iteration's per-iter ops are the SAME copy-path chunk
+`[push i] ++ bodyOps ++ [.drop]` (the body lowering is iteration-
+independent, i.e. `bodyOpsF = bodyOpsNF = bodyOps`), the loop's
+assembled op-list is exactly a chain of these chunks. Because each
+chunk leaves `s.push (.vBigint i)` (the body result is dropped), the
+post-state accumulates iteration indices in order — IDENTICAL to Tier
+3a's `loopConstPostState`. The recursor below mirrors Tier 3a's
+`loopConstAssemble` but holds the body ops abstract, threading the
+per-iter operational hypothesis through the index-shifted stack states
+via the generic `runOps_push_i_bodyOps_drop` transport. -/
+
+/-- Standalone Nat-recursive helper assembling an all-copy-iter loop's
+op list, holding the (iteration-independent) body ops abstract. The
+per-iter pattern is `[push i] ++ bodyOps ++ [.drop]`, mirroring
+`loopConstAssemble`'s shape with `emitConst c` replaced by an arbitrary
+`bodyOps`. -/
+def loopBodyOpsAssemble (count : Nat) (bodyOps : List StackOp) :
+    Nat → List StackOp
+  | 0     => []
+  | n + 1 =>
+      ([.push (.bigint (Int.ofNat (count - (n + 1))))]
+        ++ bodyOps ++ [.drop])
+        ++ loopBodyOpsAssemble count bodyOps n
+
+/-- `runOps` of a `loopBodyOpsAssemble` chain succeeds, leaving the
+iteration indices stacked in order on top of `s` (the same closed-form
+post-state as Tier 3a's const body — `loopConstPostState`). The body-run
+premise is universally quantified over the running stack state `s'`: each
+iter's body ops, when run from `s'.push i`, push exactly one value
+`outOf s' i`, which the trailing drop pops. Inductive on the recursion
+depth `n`. -/
+theorem runOps_loopBodyOpsAssemble_postState
+    (count : Nat) (bodyOps : List StackOp)
+    (hBody :
+      ∀ (i : Nat) (s' : StackState),
+        ∃ out : ANF.Eval.Value,
+          runOps bodyOps (s'.push (.vBigint (Int.ofNat i)))
+            = .ok ((s'.push (.vBigint (Int.ofNat i))).push out)) :
+    ∀ (n : Nat) (s : StackState),
+      runOps (loopBodyOpsAssemble count bodyOps n) s
+        = .ok (loopConstPostState count s n)
+  | 0, s => by
+      simp [loopBodyOpsAssemble, loopConstPostState]
+      exact Stack.Eval.runOps_nil s
+  | n + 1, s => by
+      unfold loopBodyOpsAssemble loopConstPostState
+      rw [Stack.Sim.runOps_append]
+      obtain ⟨out, hOut⟩ := hBody (count - (n + 1)) s
+      rw [runOps_push_i_bodyOps_drop (count - (n + 1)) bodyOps out s hOut]
+      simp only []
+      exact runOps_loopBodyOpsAssemble_postState count bodyOps hBody n
+        (s.push (.vBigint (Int.ofNat (count - (n + 1)))))
+
+/-- `.isSome` corollary: an all-copy-iter loop's assembled chain runs to
+`.ok`, so its `.toOption.isSome` is `true`. -/
+theorem runOps_loopBodyOpsAssemble_isSome
+    (count : Nat) (bodyOps : List StackOp)
+    (hBody :
+      ∀ (i : Nat) (s' : StackState),
+        ∃ out : ANF.Eval.Value,
+          runOps bodyOps (s'.push (.vBigint (Int.ofNat i)))
+            = .ok ((s'.push (.vBigint (Int.ofNat i))).push out))
+    (n : Nat) (s : StackState) :
+    (runOps (loopBodyOpsAssemble count bodyOps n) s).toOption.isSome := by
+  rw [runOps_loopBodyOpsAssemble_postState count bodyOps hBody n s]
+  simp [Except.toOption]
+
+/-- The inner `assemble` recursor applied to the all-copy-iter `mkIter`
+lambda equals `loopBodyOpsAssemble`. Pure induction on the recursion
+depth `n`, mirroring `assemble_constMkIter_eq`. -/
+theorem assemble_allCopyMkIter_eq (count : Nat) (bodyOps : List StackOp) :
+    ∀ (n : Nat),
+      Stack.Lower.lowerValueP.assemble count
+        (fun (i : Nat) (_final : Bool) =>
+          [StackOp.push (.bigint (Int.ofNat i))] ++ bodyOps ++ [StackOp.drop]) n
+        = loopBodyOpsAssemble count bodyOps n
+  | 0 => by
+      simp [Stack.Lower.lowerValueP.assemble, loopBodyOpsAssemble]
+  | n + 1 => by
+      simp only [Stack.Lower.lowerValueP.assemble, loopBodyOpsAssemble]
+      rw [assemble_allCopyMkIter_eq count bodyOps n]
+
+/-! ### Loop-level closed form for an all-copy-iter body
+
+The lemma below pins `lowerValueP (.loop count body iterVar)` to
+`loopBodyOpsAssemble count bodyOps count` from input-side hypotheses
+that the body's final + non-final lowerings BOTH produce `bodyOps` and
+a resulting stack map that still contains `iterVar` (so the per-iter
+drop fires). This is the generic loop-arm reduction; the binOp / arith
+specialisations supply `bodyOps` and discharge the body-lowering
+hypotheses from the copy-mode operand gates. Mirrors the structure of
+`lowerValueP_loop_singletonConst_ops_eq` with the const body generalised
+to an arbitrary all-copy-iter body. -/
+theorem lowerValueP_loop_allCopyBody_ops_eq
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (bindingName iterVar : String)
+    (count : Nat) (body : List ANFBinding) (bodyOps : List StackOp)
+    (smPost : StackMap)
+    (hBodyF :
+      Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.computeLastUses body)
+        ([] : List String) (body.map (·.name)) constInts
+        (sm.push iterVar) body
+        = (bodyOps, smPost))
+    (hBodyNF :
+      Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.clampLastUsesForOuter
+          (Stack.Lower.computeLastUses body)
+          (Stack.Lower.bodyOuterRefs body iterVar) body.length)
+        ([] : List String) (body.map (·.name)) constInts
+        (sm.push iterVar) body
+        = (bodyOps, smPost))
+    (hContains : (smPost.any (· == iterVar)) = true) :
+    (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName
+        (.loop count body iterVar)).1
+      = loopBodyOpsAssemble count bodyOps count := by
+  have hBodyOpsF :
+      (Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.computeLastUses body) ([] : List String) (body.map (·.name))
+        constInts (sm.push iterVar) body).1 = bodyOps := by rw [hBodyF]
+  have hBodySmF :
+      (Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.computeLastUses body) ([] : List String) (body.map (·.name))
+        constInts (sm.push iterVar) body).2 = smPost := by rw [hBodyF]
+  have hBodyOpsNF :
+      (Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.clampLastUsesForOuter (Stack.Lower.computeLastUses body)
+          (Stack.Lower.bodyOuterRefs body iterVar) body.length)
+        ([] : List String) (body.map (·.name)) constInts (sm.push iterVar) body).1
+        = bodyOps := by rw [hBodyNF]
+  have hBodySmNF :
+      (Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.clampLastUsesForOuter (Stack.Lower.computeLastUses body)
+          (Stack.Lower.bodyOuterRefs body iterVar) body.length)
+        ([] : List String) (body.map (·.name)) constInts (sm.push iterVar) body).2
+        = smPost := by rw [hBodyNF]
+  show
+      (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName
+        (.loop count body iterVar)).1 = loopBodyOpsAssemble count bodyOps count
+  unfold Stack.Lower.lowerValueP
+  simp only [hBodyOpsF, hBodySmF, hBodyOpsNF, hBodySmNF,
+             Stack.Lower.listContains, hContains,
+             Bool.not_true, Bool.false_eq_true, if_false]
+  -- The `mkIter` lambda collapses both `final` branches to the same
+  -- chunk because `bodyOpsF = bodyOpsNF = bodyOps` and both drops fire.
+  have hMkIter :
+      (fun (i : Nat) (final : Bool) =>
+        if final = true then
+          [StackOp.push (.bigint (Int.ofNat i))] ++ bodyOps ++ [StackOp.drop]
+        else
+          [StackOp.push (.bigint (Int.ofNat i))] ++ bodyOps ++ [StackOp.drop])
+      = (fun (i : Nat) (_final : Bool) =>
+          [StackOp.push (.bigint (Int.ofNat i))] ++ bodyOps ++ [StackOp.drop]) := by
+    funext i final
+    cases final <;> rfl
+  rw [hMkIter]
+  -- `assemble` over this collapsed lambda equals `loopBodyOpsAssemble`.
+  exact assemble_allCopyMkIter_eq count bodyOps count
+
+/-- Value-level runtime for an all-copy-iter loop: the lowered loop's op
+list runs from `s` to the closed-form `loopConstPostState count s count`
+(iteration indices accumulated). Composes the loop-arm reduction with the
+`loopBodyOpsAssemble` runtime. -/
+theorem runOps_lowerValueP_loop_allCopyBody
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (bindingName iterVar : String)
+    (count : Nat) (body : List ANFBinding) (bodyOps : List StackOp)
+    (smPost : StackMap)
+    (hBodyF :
+      Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.computeLastUses body)
+        ([] : List String) (body.map (·.name)) constInts
+        (sm.push iterVar) body
+        = (bodyOps, smPost))
+    (hBodyNF :
+      Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.clampLastUsesForOuter
+          (Stack.Lower.computeLastUses body)
+          (Stack.Lower.bodyOuterRefs body iterVar) body.length)
+        ([] : List String) (body.map (·.name)) constInts
+        (sm.push iterVar) body
+        = (bodyOps, smPost))
+    (hContains : (smPost.any (· == iterVar)) = true)
+    (hBody :
+      ∀ (i : Nat) (s' : StackState),
+        ∃ out : ANF.Eval.Value,
+          runOps bodyOps (s'.push (.vBigint (Int.ofNat i)))
+            = .ok ((s'.push (.vBigint (Int.ofNat i))).push out))
+    (s : StackState) :
+    runOps
+      (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName
+        (.loop count body iterVar)).1 s
+      = .ok (loopConstPostState count s count) := by
+  rw [lowerValueP_loop_allCopyBody_ops_eq progMethods props budget
+        currentIndex lastUses outerProtected localBindings constInts sm
+        bindingName iterVar count body bodyOps smPost hBodyF hBodyNF hContains]
+  exact runOps_loopBodyOpsAssemble_postState count bodyOps hBody count s
+
+/-- Value-level `.isSome` for an all-copy-iter loop. -/
+theorem runOps_lowerValueP_loop_allCopyBody_isSome
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (bindingName iterVar : String)
+    (count : Nat) (body : List ANFBinding) (bodyOps : List StackOp)
+    (smPost : StackMap)
+    (hBodyF :
+      Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.computeLastUses body)
+        ([] : List String) (body.map (·.name)) constInts
+        (sm.push iterVar) body
+        = (bodyOps, smPost))
+    (hBodyNF :
+      Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.clampLastUsesForOuter
+          (Stack.Lower.computeLastUses body)
+          (Stack.Lower.bodyOuterRefs body iterVar) body.length)
+        ([] : List String) (body.map (·.name)) constInts
+        (sm.push iterVar) body
+        = (bodyOps, smPost))
+    (hContains : (smPost.any (· == iterVar)) = true)
+    (hBody :
+      ∀ (i : Nat) (s' : StackState),
+        ∃ out : ANF.Eval.Value,
+          runOps bodyOps (s'.push (.vBigint (Int.ofNat i)))
+            = .ok ((s'.push (.vBigint (Int.ofNat i))).push out))
+    (s : StackState) :
+    (runOps
+      (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName
+        (.loop count body iterVar)).1 s).toOption.isSome := by
+  rw [runOps_lowerValueP_loop_allCopyBody progMethods props budget
+        currentIndex lastUses outerProtected localBindings constInts sm
+        bindingName iterVar count body bodyOps smPost hBodyF hBodyNF hContains
+        hBody s]
+  simp [Except.toOption]
+
+/-! ### MANDATORY smokes — Tier 3c
+
+Concrete instantiations proving the Wave-13 substrate fires
+non-vacuously. -/
+
+/-- **Smoke (per-iteration transport).** A CONCRETE copy-path binOp
+per-iter chunk for `t = l + r`:
+
+  smInner = ["i", "l", "r"]   -- iterVar `i` at depth 0, `l` at 1, `r` at 2
+  parent stack = [5, 7]       -- `l` = 5 (depth 1 after the iter push),
+                              -- `r` = 7 (depth 3 after pushing `l`'s copy)
+
+The chunk `[push 1] ++ (loadRef "l" ++ loadRef "r" ++ [OP_ADD]) ++ [drop]`
+runs from the parent stack back to `parent.push (.vBigint 1)`: the
+`5 + 7 = 12` result is computed on top, then dropped, leaving only the
+iteration index `1`. Anti-vacuous: the body genuinely loads + adds two
+distinct outer refs before the result is dropped. -/
+private theorem tier3c_per_iter_transport_smoke :
+    let parent : StackState := { stack := [.vBigint 5, .vBigint 7] }
+    runOps ([.push (.bigint (Int.ofNat 1))]
+              ++ (Stack.Lower.loadRef ["i", "l", "r"] "l"
+                    ++ Stack.Lower.loadRef
+                          (Stack.Lower.StackMap.push ["i", "l", "r"] "l") "r"
+                    ++ [.opcode "OP_ADD"])
+              ++ [.drop]) parent
+      = .ok (parent.push (.vBigint (Int.ofNat 1))) := by
+  intro parent
+  exact runOps_push_i_binOp_drop_copyPath 1 ["i", "l", "r"] "l" "r" 1 3
+    (.vBigint 5) (.vBigint 7) (.vBigint 12) "OP_ADD" parent
+    (by show Stack.Lower.StackMap.depth? ["i", "l", "r"] "l" = some 1; rfl)
+    (by show 1 < (parent.push (.vBigint (Int.ofNat 1))).stack.length; decide)
+    (by show (parent.push (.vBigint (Int.ofNat 1))).stack[1]! = .vBigint 5; rfl)
+    (by show Stack.Lower.StackMap.depth?
+            (Stack.Lower.StackMap.push ["i", "l", "r"] "l") "r" = some 3; rfl)
+    (by show 3 < ((parent.push (.vBigint (Int.ofNat 1))).push (.vBigint 5)).stack.length
+        decide)
+    (by show ((parent.push (.vBigint (Int.ofNat 1))).push (.vBigint 5)).stack[3]!
+            = .vBigint 7; rfl)
+    (by show Stack.Eval.runOpcode "OP_ADD"
+            (((parent.push (.vBigint (Int.ofNat 1))).push (.vBigint 5)).push (.vBigint 7))
+            = .ok ((parent.push (.vBigint (Int.ofNat 1))).push (.vBigint 12))
+        rfl)
+
+/-- **Smoke (from-entry walk).** The all-copy-iter from-entry walk
+(`runOps_lowerValueP_loop_allCopyBody`) fired on a CONCRETE loop whose
+body pushes one value per iteration (a `loadConst` literal body — the
+walk's `hBody` premise is stack-state-independent for a literal push, so
+this exercises the generic walk end-to-end). A 3-iteration loop over a
+singleton const body `[x = 42n]`:
+
+* Each iter lowers (final + non-final, copy-trivially) to
+  `emitConst (.int 42) = [push 42]`, sm = `x :: i :: parentSm`,
+  which still contains the iter var `i`.
+* `runOps` of the whole lowered loop leaves `loopConstPostState 3 s 3`
+  on the stack (iter indices `0, 1, 2` accumulated).
+
+Anti-vacuous: both the lowering (closed-form `loopBodyOpsAssemble`) and
+the runtime (`.ok` post-state) succeed; the body genuinely pushes a
+value that the per-iter drop pops each iteration. -/
+private theorem tier3c_from_entry_walk_smoke :
+    let s0 : StackState := { stack := [.vBigint 99] }
+    runOps
+      (Stack.Lower.lowerValueP [] [] Stack.Lower.defaultInlineBudget 0
+        [] [] [] [] ["a"] "loop0"
+        (.loop 3 [ANFBinding.mk "x" (.loadConst (.int 42)) none] "i")).1 s0
+      = .ok (loopConstPostState 3 s0 3) := by
+  intro s0
+  -- Body's per-iter stack map: parent `["a"]` extended with the iter var,
+  -- then the const binding `x`.
+  let smInner : StackMap := Stack.Lower.StackMap.push (["a"] : StackMap) "i"
+  let smPost : StackMap := Stack.Lower.StackMap.push smInner "x"
+  have hBodyEq :
+      Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+        Stack.Lower.defaultInlineBudget 0
+        (Stack.Lower.computeLastUses [ANFBinding.mk "x" (.loadConst (.int 42)) none])
+        ([] : List String)
+        ([ANFBinding.mk "x" (.loadConst (.int 42)) none].map (·.name)) []
+        smInner
+        [ANFBinding.mk "x" (.loadConst (.int 42)) none]
+        = (Stack.Lower.emitConst (.int 42), smPost) := by
+    simp only [List.map_cons, List.map_nil, ANFBinding.name]
+    exact lowerBindingsP_singletonConst [] [] Stack.Lower.defaultInlineBudget
+      _ [] ["x"] [] smInner "x" (.int 42)
+      (by show isPushConst (.int 42); exact True.intro)
+  exact runOps_lowerValueP_loop_allCopyBody [] [] Stack.Lower.defaultInlineBudget 0
+    [] [] [] [] (["a"] : StackMap) "loop0" "i" 3
+    [ANFBinding.mk "x" (.loadConst (.int 42)) none]
+    (Stack.Lower.emitConst (.int 42)) smPost
+    hBodyEq hBodyEq
+    (by show (smPost.any (· == "i")) = true
+        decide)
+    (by intro i s'
+        exact ⟨.vBigint 42, runOps_emitConst_isPushConst (.int 42)
+          (by show isPushConst (.int 42); exact True.intro)
+          (s'.push (.vBigint (Int.ofNat i)))⟩)
+    s0
 
 end A7
 end Agrees

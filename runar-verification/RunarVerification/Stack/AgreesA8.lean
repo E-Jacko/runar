@@ -1680,5 +1680,326 @@ theorem wave53_smoke_evalBindings_isNone :
         (default : State) wave53SmokeBody).toOption.isSome = false := by
   native_decide
 
+/-! ## Wave 65 — Tier 2 widening: single-param PASSTHROUGH `method_call`
+
+This is the W55-flagged *param-passing* fragment — the one the existing
+leaf-const substrate could NOT provide. The wave-55 finding: the const
+callee hits the M4 wall and the arith callee suffered a caller/callee
+**frame mismatch**, because the existing substrate kept `args = []` and
+`m.params = []`, so the callee never referenced its own params. To
+genuinely advance retirement we need a fragment where the callee
+references ITS OWN param, bound from an explicit call-site arg.
+
+The simplest non-vacuous such shape is the *identity passthrough helper*:
+
+  `helper(p) { return p }`  called as  `helper(a)`
+
+* outer body is a single binding `r := methodCall obj method [a]`;
+* `obj` is absent from the outer stack map (`objDropOps = []`);
+* the callee `m` has exactly one param `p` and body `[r' := loadParam p]`;
+* the call-site arg `a` is at depth 0 in the outer stack map AND is on
+  its last use there (so `loadAndBindArgsLive` emits NO op — `bringToTop`
+  at depth 0 consume is `[]` — and renames the top slot `a → p`);
+* `p` is not in `outerProtected` (so the callee's `loadParam p`, itself a
+  depth-0 last-use, also emits NO op — it renames the renamed slot
+  `p → r'`).
+
+So the WHOLE methodCall lowers to the EMPTY op list: the arg value already
+sits on the runtime stack (the outer method placed it there), and the
+inlined identity body leaves it in place. On the ANF side, `evalMethodCall`
+binds `a`'s value to the callee param `p`, evaluates `loadParam p`, and
+returns that value — exactly the same value. Caller and callee frames now
+**agree**: the value the callee sees under name `p` is the value the
+arg `a` denotes in the caller. This is the model-level reconciliation
+W55 asked for, on the feasible fragment.
+
+The value-level reduction is hypothesis-driven (no `agreesTagged` /
+freshness / Nodup premises): the EMPTY op list runs successfully from ANY
+initial stack, so `runOps … |>.isSome` is unconditional.
+
+Higher tiers (arg at depth > 0, multi-param callees, callee bodies that
+combine the param with operators) remain deferred — they need the
+operational `loadAndBindArgsLive` reductions for the swap/rot/roll shapes
+plus a `structuralRefBody` callee-body composition. -/
+
+/-- Value-level reduction for the Tier-2 passthrough: at the methodCall
+arm, with `obj` absent from `sm`, the single arg `a` at depth 0 and on
+its last use (consume), the callee `m` with one param `p` and body
+`[r' := loadParam p]`, and `p ∉ outerProtected`, the methodCall op list
+is EMPTY. Both the arg load and the callee body's param load reduce to
+`[]` (depth-0 consume `bringToTop`). -/
+theorem lowerValueP_methodCall_passthrough_ops
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget' currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (rest : StackMap) (bn obj method a p r' : String)
+    (psrc : Option SourceLoc) (ptype : RunarVerification.ANF.ANFType)
+    (m : ANFMethod)
+    (hLookup : Stack.Lower.lookupMethod progMethods method = some m)
+    (hObj : Stack.Lower.StackMap.depth? (a :: rest) obj = none)
+    (hParams : m.params = [{ name := p, type := ptype }])
+    (hBody : m.body = [ANFBinding.mk r' (.loadParam p) psrc])
+    (hArgLast : Stack.Lower.isLastUse lastUses a currentIndex = true)
+    (hArgUnprot : Stack.Lower.listContains outerProtected a = false)
+    (hParamUnprot : Stack.Lower.listContains outerProtected p = false) :
+    (Stack.Lower.lowerValueP progMethods props (budget' + 1) currentIndex
+        lastUses outerProtected localBindings constInts (a :: rest) bn
+        (.methodCall obj method [a])).1
+      = [] := by
+  -- Step 1: the callee-body lowering reduces to `[]`.
+  -- `smArgs = p :: rest` (top renamed a → p), callee `loadParam p` at
+  -- depth 0 with consume = true ⇒ `bringToTop (p::rest) p true = ([], …)`.
+  have hPDepth : Stack.Lower.StackMap.depth? (p :: rest) p = some 0 := by
+    unfold Stack.Lower.StackMap.depth? List.findIdx?
+    simp [List.findIdx?.go]
+  have hBodyLU : Stack.Lower.isLastUse
+      (Stack.Lower.computeLastUses (m.body)) p 0 = true := by
+    rw [hBody]
+    unfold Stack.Lower.computeLastUses Stack.Lower.isLastUse
+    simp [Stack.Lower.computeLastUses.go, Stack.Lower.collectRefs,
+      Stack.Lower.lastUsesUpdate, List.foldl, Stack.Lower.lastUsesLookup]
+  have hBodyOps :
+      (Stack.Lower.lowerBindingsP progMethods props budget' 0
+          (Stack.Lower.computeLastUses m.body) outerProtected
+          (m.body.map (fun b => b.name))
+          (constInts ++ Stack.Lower.collectConstInts m.body)
+          (p :: rest) m.body).1 = [] := by
+    rw [hBody]
+    unfold Stack.Lower.lowerBindingsP Stack.Lower.lowerValueP
+      Stack.Lower.loadRefLiveParam
+    rw [hBody] at hBodyLU
+    simp only [Stack.Lower.bringToTop, hPDepth, hParamUnprot, hBodyLU,
+      Bool.not_false, Bool.true_and, if_true,
+      Stack.Lower.lowerBindingsP, List.append_nil]
+  -- The single arg `a` at depth 0 consume loads with NO op and (with the
+  -- rename step) produces the arg stack map `p :: rest`.
+  have hADepth : Stack.Lower.StackMap.depth? (a :: rest) a = some 0 := by
+    unfold Stack.Lower.StackMap.depth? List.findIdx?
+    simp [List.findIdx?.go]
+  have hArgLoad :
+      Stack.Lower.loadAndBindArgsLive currentIndex lastUses outerProtected
+          (a :: rest) [a] [p]
+        = ([], p :: rest) := by
+    unfold Stack.Lower.loadAndBindArgsLive Stack.Lower.loadRefLive
+      Stack.Lower.bringToTop
+    simp only [hADepth, hArgUnprot, hArgLast, Bool.not_false, Bool.true_and,
+      if_true, Stack.Lower.loadAndBindArgsLive, List.append_nil]
+  -- Step 2: dispatch the methodCall arm with the above facts.
+  unfold Stack.Lower.lowerValueP
+  rw [hLookup]
+  -- objDropOps: obj absent ⇒ ([], a :: rest). args = [a], params = [p].
+  simp only [hObj, hParams, List.map_cons, List.map_nil, hArgLoad]
+  rw [hBodyOps]
+  simp only [List.append_nil]
+
+/-- Stack-side success of the Tier-2 passthrough fragment, from ANY
+initial stack: the singleton body `[bn := methodCall obj method [a]]`
+lowers to the EMPTY op list (by `lowerValueP_methodCall_passthrough_ops`),
+and `runOps [] stk = .ok stk` succeeds unconditionally. -/
+theorem runOps_lowerBindingsP_passthrough_methodCall_isSome
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget' currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (rest : StackMap) (bn obj method a p r' : String)
+    (src psrc : Option SourceLoc) (ptype : RunarVerification.ANF.ANFType)
+    (m : ANFMethod) (stk : Stack.Eval.StackState)
+    (hLookup : Stack.Lower.lookupMethod progMethods method = some m)
+    (hObj : Stack.Lower.StackMap.depth? (a :: rest) obj = none)
+    (hParams : m.params = [{ name := p, type := ptype }])
+    (hBody : m.body = [ANFBinding.mk r' (.loadParam p) psrc])
+    (hArgLast : Stack.Lower.isLastUse lastUses a currentIndex = true)
+    (hArgUnprot : Stack.Lower.listContains outerProtected a = false)
+    (hParamUnprot : Stack.Lower.listContains outerProtected p = false) :
+    (runOps (Stack.Lower.lowerBindingsP progMethods props (budget' + 1)
+              currentIndex lastUses outerProtected localBindings
+              constInts (a :: rest)
+              [ANFBinding.mk bn (.methodCall obj method [a]) src]).1 stk).toOption.isSome := by
+  -- The head's op contribution is the methodCall ops; the tail (empty
+  -- rest body) contributes `[]`. So the singleton-body op list equals the
+  -- head's, which the value-level lemma proves is `[]`.
+  have hHead :=
+    lowerValueP_methodCall_passthrough_ops progMethods props budget'
+      currentIndex lastUses outerProtected localBindings constInts rest
+      bn obj method a p r' psrc ptype m hLookup hObj hParams hBody
+      hArgLast hArgUnprot hParamUnprot
+  have hUnfold :
+      (Stack.Lower.lowerBindingsP progMethods props (budget' + 1)
+          currentIndex lastUses outerProtected localBindings constInts
+          (a :: rest)
+          [ANFBinding.mk bn (.methodCall obj method [a]) src]).1
+        = (Stack.Lower.lowerValueP progMethods props (budget' + 1)
+              currentIndex lastUses outerProtected localBindings constInts
+              (a :: rest) bn (.methodCall obj method [a])).1 := by
+    with_unfolding_all
+      simp [Stack.Lower.lowerBindingsP]
+  rw [hUnfold, hHead]
+  simp [Stack.Eval.runOps_nil, Except.toOption]
+
+/-- ANF-side success of the Tier-2 passthrough fragment: when the callee
+`m` resolves with one param `p` and body `[r' := loadParam p]`, and the
+call-site arg `a` resolves in the caller state, `evalMethodCall` binds
+`a`'s value to `p`, evaluates the identity body, and returns that value —
+so `.isSome = true`. This is the ANF half whose FRAME now MATCHES the
+Stack inliner: the value the callee body sees under name `p` is exactly
+the value the arg `a` denotes in the caller. -/
+theorem evalMethodCall_passthrough_isSome
+    (progMethods : List ANFMethod) (s : State)
+    (obj method a p r' : String) (psrc : Option SourceLoc)
+    (ptype : RunarVerification.ANF.ANFType) (m : ANFMethod)
+    (av : RunarVerification.ANF.Eval.Value)
+    (hLookup : RunarVerification.ANF.Eval.lookupMethod progMethods method = some m)
+    (hParams : m.params = [{ name := p, type := ptype }])
+    (hBody : m.body = [ANFBinding.mk r' (.loadParam p) psrc])
+    (hArg : s.resolveRef a = some av) :
+    (RunarVerification.ANF.Eval.evalMethodCall progMethods s obj method [a]).toOption.isSome
+      = true := by
+  -- `bindCallArgs s [a] [p] = .ok [(p, av)]` (lookupRef s a = .ok av via hArg).
+  have hBind : RunarVerification.ANF.Eval.bindCallArgs s [a] [p] = .ok [(p, av)] := by
+    unfold RunarVerification.ANF.Eval.bindCallArgs RunarVerification.ANF.Eval.lookupRef
+    rw [hArg]
+    simp only [RunarVerification.ANF.Eval.bindCallArgs, bind, Except.bind, pure, Except.pure]
+  unfold RunarVerification.ANF.Eval.evalMethodCall
+  simp only [hLookup, hParams, hBody, List.map_cons, List.map_nil, hBind, bind, Except.bind]
+  -- Callee state `{ params := [(p, av)], props := s.props }`; body
+  -- `[r' := loadParam p]` evaluates `loadParam p` ⇒ lookupParam p = some av,
+  -- then the last-binding `r'` lookup returns `av`. The residual term is a
+  -- concrete chain of `find?` / `getLast` reductions on singleton lists.
+  simp [RunarVerification.ANF.Eval.evalBindings, RunarVerification.ANF.Eval.evalValue,
+    RunarVerification.ANF.Eval.State.lookupParam, RunarVerification.ANF.Eval.State.lookupBinding,
+    RunarVerification.ANF.Eval.State.addBinding, ANFBinding.name, bind, Except.bind, pure,
+    Except.pure, Except.toOption]
+
+/-- **Wave 65 DELIVERABLE — the Tier-2 passthrough `method_call` M2 walk.**
+
+The body-level `successAgrees`-shaped iff for the *param-passing* fragment,
+stated against the program-aware whole-body evaluator `evalBindingsP`
+(the form the omnibus re-statement consumes). For the singleton body
+`[bn := methodCall obj method [a]]` whose callee is an identity-passthrough
+helper (`helper(p) { return p }`) called with the depth-0 last-use arg `a`:
+
+* ANF — the singleton connector
+  (`evalBindingsP_singleton_methodCall_isSome_eq`) reduces `evalBindingsP`
+  to `evalMethodCall`, then `evalMethodCall_passthrough_isSome` fires
+  (the arg resolves, binds to the callee param, identity body returns it);
+* Stack — `runOps_lowerBindingsP_passthrough_methodCall_isSome` (the
+  whole methodCall lowers to the EMPTY op list).
+
+Both sides `.isSome = true`, so the iff is `True ↔ True` — anti-vacuous,
+and the FIRST `method_call` instance where the callee references its OWN
+param bound from an explicit arg. The caller / callee frames agree: the
+value the callee sees under `p` is the value the caller's arg `a` denotes.
+This is the W55 frame reconciliation, on the feasible fragment.
+
+All hypotheses are input-side (no conclusion-restating): `hLookup` /
+`hParams` / `hBody` resolve the callee shape; `hArg` is the caller-frame
+arg resolution; `hArgLast` / `hArgUnprot` / `hParamUnprot` are the
+liveness/protection facts that make both arg- and param-loads consume
+in place; `hObj` keeps the object reference off the outer stack map. -/
+theorem successAgrees_methodCall_passthrough_unconditional
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget' currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (rest : StackMap) (bn obj method a p r' : String)
+    (src psrc : Option SourceLoc) (ptype : RunarVerification.ANF.ANFType)
+    (m : ANFMethod) (s : State) (stk : Stack.Eval.StackState)
+    (av : RunarVerification.ANF.Eval.Value)
+    (hLookupStack : Stack.Lower.lookupMethod progMethods method = some m)
+    (hLookupAnf : RunarVerification.ANF.Eval.lookupMethod progMethods method = some m)
+    (hObj : Stack.Lower.StackMap.depth? (a :: rest) obj = none)
+    (hParams : m.params = [{ name := p, type := ptype }])
+    (hBody : m.body = [ANFBinding.mk r' (.loadParam p) psrc])
+    (hArg : s.resolveRef a = some av)
+    (hArgLast : Stack.Lower.isLastUse lastUses a currentIndex = true)
+    (hArgUnprot : Stack.Lower.listContains outerProtected a = false)
+    (hParamUnprot : Stack.Lower.listContains outerProtected p = false) :
+    ((RunarVerification.ANF.Eval.evalBindingsP progMethods s
+        [ANFBinding.mk bn (.methodCall obj method [a]) src]).toOption.isSome
+      ↔
+     (runOps (Stack.Lower.lowerBindingsP progMethods props (budget' + 1)
+                currentIndex lastUses outerProtected localBindings
+                constInts (a :: rest)
+                [ANFBinding.mk bn (.methodCall obj method [a]) src]).1 stk).toOption.isSome) := by
+  have hAnf :
+      (RunarVerification.ANF.Eval.evalBindingsP progMethods s
+        [ANFBinding.mk bn (.methodCall obj method [a]) src]).toOption.isSome = true := by
+    rw [evalBindingsP_singleton_methodCall_isSome_eq]
+    exact evalMethodCall_passthrough_isSome progMethods s obj method a p r' psrc ptype m av
+      hLookupAnf hParams hBody hArg
+  have hStack :
+      (runOps (Stack.Lower.lowerBindingsP progMethods props (budget' + 1)
+                currentIndex lastUses outerProtected localBindings
+                constInts (a :: rest)
+                [ANFBinding.mk bn (.methodCall obj method [a]) src]).1 stk).toOption.isSome = true :=
+    runOps_lowerBindingsP_passthrough_methodCall_isSome
+      progMethods props budget' currentIndex lastUses outerProtected
+      localBindings constInts rest bn obj method a p r' src psrc ptype m stk
+      hLookupStack hObj hParams hBody hArgLast hArgUnprot hParamUnprot
+  rw [hAnf, hStack]
+
+/-! ### Wave 65 MANDATORY smoke — concrete passthrough `method_call`, both
+sides `.isSome` via `evalBindingsP` (anti-vacuous, param-passing). -/
+
+/-- Smoke program method: identity-passthrough callee `idfn(x) { return x }`. -/
+private def wave65SmokeCallee : ANFMethod :=
+  { name := "idfn", params := [{ name := "x", type := .bigint }],
+    body := [ANFBinding.mk "r0" (.loadParam "x") none],
+    isPublic := false }
+
+private def wave65SmokeMethods : List ANFMethod := [wave65SmokeCallee]
+
+/-- Smoke outer body: `c0 := idfn(a)`. `a` is the (sole) outer stack-map
+entry at depth 0; the object `this` is absent from `[a]`. -/
+private def wave65SmokeBody : List ANFBinding :=
+  [ANFBinding.mk "c0" (.methodCall "this" "idfn" ["a"]) none]
+
+/-- Smoke caller ANF state: the arg `a` resolves (bound as a param). -/
+private def wave65SmokeState : State :=
+  { (default : State) with params := [("a", .vBigint 99)] }
+
+/-- The smoke arg load lemma facts hold concretely. -/
+theorem wave65_smoke_arg_resolves :
+    wave65SmokeState.resolveRef "a" = some (.vBigint 99) := by
+  unfold wave65SmokeState RunarVerification.ANF.Eval.State.resolveRef
+    RunarVerification.ANF.Eval.State.lookupBinding RunarVerification.ANF.Eval.State.lookupParam
+    RunarVerification.ANF.Eval.State.lookupProp
+  rfl
+
+/-- Wave-65 smoke: the passthrough M2 walk fires on the concrete
+param-passing `method_call` body — both sides `.isSome` through
+`evalBindingsP`, so the iff is `True ↔ True` (anti-vacuous; the standard
+`evalBindings` would error on this body, and the callee references its OWN
+param `x` bound from the caller's arg `a`). -/
+theorem wave65_smoke_methodCall_passthrough_unconditional :
+    ((RunarVerification.ANF.Eval.evalBindingsP wave65SmokeMethods
+        wave65SmokeState wave65SmokeBody).toOption.isSome
+      ↔
+     (runOps (Stack.Lower.lowerBindingsP wave65SmokeMethods [] (0 + 1)
+                0 [("a", 0)] [] [] [] ["a"] wave65SmokeBody).1
+        (default : Stack.Eval.StackState)).toOption.isSome) :=
+  successAgrees_methodCall_passthrough_unconditional
+    wave65SmokeMethods [] 0 0 [("a", 0)] [] [] [] [] "c0" "this" "idfn" "a" "x" "r0"
+    none none .bigint wave65SmokeCallee wave65SmokeState
+    (default : Stack.Eval.StackState) (.vBigint 99)
+    rfl rfl (by decide) rfl rfl wave65_smoke_arg_resolves
+    (by decide) rfl rfl
+
+/-- Anti-vacuity confirmation: on the passthrough smoke body the
+program-aware `evalBindingsP` succeeds (`isSome = true`) where the
+standard `evalBindings` errors (`isSome = false`). -/
+theorem wave65_smoke_evalBindingsP_isSome :
+    (RunarVerification.ANF.Eval.evalBindingsP wave65SmokeMethods
+        wave65SmokeState wave65SmokeBody).toOption.isSome = true := by
+  native_decide
+
+theorem wave65_smoke_evalBindings_isNone :
+    (RunarVerification.ANF.Eval.evalBindings
+        wave65SmokeState wave65SmokeBody).toOption.isSome = false := by
+  native_decide
+
 end Agrees
 end RunarVerification.Stack
