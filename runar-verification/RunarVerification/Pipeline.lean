@@ -6,6 +6,7 @@ import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
 import RunarVerification.Stack.AgreesA3
 import RunarVerification.Stack.AgreesA4
+import RunarVerification.Stack.AgreesA5
 import RunarVerification.Stack.AgreesA6
 import RunarVerification.Stack.Peephole
 import RunarVerification.Stack.Eval
@@ -3783,6 +3784,534 @@ theorem compileSafe_observational_correct_arith_consume
         (runParsedBytes bytes initialStack) := by
     rw [hM4]; exact hM3Ops
   exact successAgrees_trans _ _ _ hM2Method hParsed
+
+/-! ## Path 2 Tier 1 Wave 63 — update_prop consume M4 image emittability
+
+The M4 leg of `compileSafe_observational_correct_updateProp_consume` needs the
+post-peephole image of the update_prop consume RAW to be push-emittable
+(`AreRunarEmittablePush`).  Unlike arith (where M3 is op-list-identity and the
+RAW shape is push-free), the update_prop image carries one literal `.push c`,
+so it must route through the wave-60 PUSH-aware round-trip rather than the flat
+one.  The image is `[.dup, .push c, .opcode (OP_ADD/OP_SUB), .nip]` (the d1d0
+`[swap, swap]` collapses under `peepholePassAll`; the chain/roll-pick folds are
+identity since there is no foldable 4-op window).  These helpers reduce the
+symbolic-`c` image and discharge its emittability from the classifier's
+`[-1, 16]` constant range. -/
+
+/-- **Wave 63 — the M4 image-emittability leg.**
+
+`AreRunarEmittablePush (peepholeMethodOps RAW)` for the update_prop consume
+fragment RAW = `(lowerBindingsP … (updatePropConsumeBody p op c)).1`, from the
+admissibility classifier facts (op additive, `-1 ≤ c ≤ 16`).  The prop name `p`
+DROPS OUT: RAW reduces (via `updatePropConsume_RAW_eq`) to the prop-name-free
+shape `[dup, push c, swap, swap, opcode, nip]`, whose `peepholeMethodOps` image
+is `[dup, push c, opcode, nip]`, push-emittable on the `[-1, 16]` window. -/
+theorem updatePropConsume_image_emittable
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (constInts : List (String × Int)) (p op : String) (c : Int)
+    (hOp : op = "+" ∨ op = "-") (hLo : -1 ≤ c) (hHi : c ≤ 16) :
+    Script.Parse.areRunarEmittablePushBool
+      (peepholeMethodOps
+        (Stack.Lower.lowerBindingsP progMethods props budget 0
+          (Stack.Lower.computeLastUses (Agrees.updatePropConsumeBody p op c)) []
+          ((Agrees.updatePropConsumeBody p op c).map (·.name)) constInts [p]
+          (Agrees.updatePropConsumeBody p op c)).1) = true := by
+  rw [Agrees.updatePropConsume_RAW_eq progMethods props budget constInts p op c hOp]
+  -- The image-emittability depends ONLY on `(op, c)`.  Case the additive opcode,
+  -- then enumerate `c ∈ [-1, 16]` (each CONCRETE), so the chain-fold
+  -- step-identity and the `decide` both see a closed term.  The chain-fold
+  -- collapses (no foldable 4-op window) and the roll/pick-fold is structural, so
+  -- `decide` evaluates the residual per concrete leaf.  `c = 0`/`c = 1` fold
+  -- further (`[dup, nip]` / `[dup, OP_1ADD, nip]`) but every leaf stays
+  -- push-emittable.
+  have hEnum : c = -1 ∨ c = 0 ∨ c = 1 ∨ c = 2 ∨ c = 3 ∨ c = 4 ∨ c = 5 ∨ c = 6
+      ∨ c = 7 ∨ c = 8 ∨ c = 9 ∨ c = 10 ∨ c = 11 ∨ c = 12 ∨ c = 13 ∨ c = 14
+      ∨ c = 15 ∨ c = 16 := by omega
+  rcases hOp with h | h <;> subst h
+  · rw [show Stack.Lower.binopOpcode "+" none = "OP_ADD" from rfl]
+    rcases hEnum
+      with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+         | rfl | rfl | rfl | rfl | rfl | rfl <;>
+      rw [peepholeMethodOps_eq,
+          Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ (by decide) (by rfl)] <;>
+      decide
+  · rw [show Stack.Lower.binopOpcode "-" none = "OP_SUB" from rfl]
+    rcases hEnum
+      with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+         | rfl | rfl | rfl | rfl | rfl | rfl <;>
+      rw [peepholeMethodOps_eq,
+          Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ (by decide) (by rfl)] <;>
+      decide
+
+/-! ## Path 2 Tier 1 Wave 63 — the PUSH-aware emit/parse round-trip chain
+
+The update_prop consume image carries a literal `.push c`, which the FLAT
+`AreRunarEmittable` predicate rejects (`runarEmittableBool (.push _) = false`).
+The wave-60 PUSH-aware round-trip (`parseScript_emit_round_trip_push`) accepts
+the small-int push window, so the M4 leg routes through these push-aware peers
+of `compileSafe_single_public_runOps_eq` / `emitFast_single_public_runOps_eq`.
+Each is the verbatim flat proof with the flat round-trip swapped for the push
+round-trip (which, like the flat one and unlike `_normalized`, returns the op
+list unchanged). -/
+
+/-- Push-aware peer of `Emit.parseScript_emitOpsFast_round_trip`. -/
+theorem parseScript_emitOpsFast_round_trip_push (ops : List StackOp)
+    (hOps : Parse.AreRunarEmittablePush ops) :
+    Parse.parseScript (Emit.emitOpsFast ops) = .ok ops := by
+  rw [← Emit.EmitFastProof.emitOps_eq_emitOpsFast ops]
+  exact Parse.parseScript_emit_round_trip_push ops hOps
+
+/-- Push-aware peer of `emitFast_single_public_parse_round_trip`. -/
+theorem emitFast_single_public_parse_round_trip_push
+    (p : StackProgram) (m : StackMethod)
+    (hPublic : Emit.publicMethodsOf p = [m])
+    (hOps : Parse.AreRunarEmittablePush m.ops) :
+    Parse.parseScript (Emit.emitFast p) = .ok m.ops := by
+  unfold Emit.emitFast
+  rw [hPublic]
+  simp only
+  exact parseScript_emitOpsFast_round_trip_push m.ops hOps
+
+/-- Push-aware peer of `emitFast_single_public_runOps_eq`. -/
+theorem emitFast_single_public_runOps_eq_push
+    (p : StackProgram) (m : StackMethod) (initialStack : StackState)
+    (hPublic : Emit.publicMethodsOf p = [m])
+    (hOps : Parse.AreRunarEmittablePush m.ops) :
+    runParsedBytes (Emit.emitFast p) initialStack = runOps m.ops initialStack := by
+  unfold runParsedBytes
+  rw [emitFast_single_public_parse_round_trip_push p m hPublic hOps]
+
+/-- Push-aware peer of `compileSafe_single_public_runOps_eq`. -/
+theorem compileSafe_single_public_runOps_eq_push
+    (p : ANFProgram) (bytes : ByteArray)
+    (m : StackMethod) (initialStack : StackState)
+    (hSafe : compileSafe p = .ok bytes)
+    (hPublic : Emit.publicMethodsOf (peepholeProgram (Lower.lower p)) = [m])
+    (hOps : Parse.AreRunarEmittablePush m.ops) :
+    runParsedBytes bytes initialStack = runOps m.ops initialStack := by
+  have hBytes := compileSafe_ok_implies_emitFast p bytes hSafe
+  rw [hBytes]
+  exact emitFast_single_public_runOps_eq_push
+    (peepholeProgram (Lower.lower p)) m initialStack hPublic hOps
+
+/-- **Wave 63 — the operational M3 run-equality for the update_prop consume
+image.**  The post-peephole image `[dup, push c, opcode, nip]` drops the d1d0
+`[swap, swap]` that RAW carries; on any entry stack the two swaps cancel (when
+`dup` succeeds the depth is ≥ 2, so `swap ∘ swap` is the identity; when `dup`
+fails both runs error identically).  Hence the two op lists `runOps`-agree on
+every state — the OPERATIONAL M3 regime (NOT op-list identity). -/
+theorem updateProp_M3_runEq (c : Int) (opc : String) (s : StackState) :
+    runOps [.dup, .push (.bigint c), .opcode opc, .nip] s
+      = runOps [.dup, .push (.bigint c), .swap, .swap, .opcode opc, .nip] s := by
+  have hNotIfDup : ∀ thn els, (StackOp.dup) ≠ .ifOp thn els := by intro _ _ h; cases h
+  have hNotIfPush : ∀ thn els, (StackOp.push (.bigint c)) ≠ .ifOp thn els := by
+    intro _ _ h; cases h
+  have hNotIfSwap : ∀ thn els, (StackOp.swap) ≠ .ifOp thn els := by intro _ _ h; cases h
+  rw [Stack.Eval.runOps_cons_nonIf_eq .dup _ s hNotIfDup,
+      Stack.Eval.runOps_cons_nonIf_eq .dup _ s hNotIfDup]
+  cases hs : s.stack with
+  | nil =>
+    simp only [Stack.Eval.stepNonIf_dup, Stack.Eval.applyDup, hs]
+  | cons v rest =>
+    simp only [Stack.Eval.stepNonIf_dup, Stack.Eval.applyDup, hs]
+    rw [Stack.Eval.runOps_cons_nonIf_eq (.push (.bigint c)) _ (s.push v) hNotIfPush,
+        Stack.Eval.runOps_cons_nonIf_eq (.push (.bigint c)) _ (s.push v) hNotIfPush]
+    simp only [Stack.Eval.stepNonIf_push_bigint]
+    have hStk : ((s.push v).push (.vBigint c)).stack = .vBigint c :: v :: v :: rest := by
+      simp only [Stack.Eval.StackState.push, hs]
+    rw [Stack.Eval.runOps_cons_nonIf_eq .swap _ ((s.push v).push (.vBigint c)) hNotIfSwap]
+    simp only [Stack.Eval.stepNonIf_swap, Stack.Eval.applySwap, hStk]
+    rw [Stack.Eval.runOps_cons_nonIf_eq .swap _
+          { (s.push v).push (.vBigint c) with stack := v :: .vBigint c :: v :: rest } hNotIfSwap]
+    simp only [Stack.Eval.stepNonIf_swap, Stack.Eval.applySwap]
+    congr 1
+    simp only [Stack.Eval.StackState.push, hs]
+
+/-- **Wave 63 — the full operational M3 for the update_prop consume RAW.**
+
+`runOps (peepholeMethodOps [dup, push c, swap, swap, opcode, nip]) s
+   = runOps [dup, push c, swap, swap, opcode, nip] s` for the additive opcode and
+`c ∈ [-1, 16]`, on a `bigint`-topped entry stack.  Enumerate `c` (concrete leaf):
+for `c ∉ {0, 1}` the post-peephole image is `[dup, push c, opcode, nip]` (the
+`[swap, swap]` collapses, no further fold), so the run-equality is the
+unconditional swap-fold `updateProp_M3_runEq`; for the OP-folding leaves
+`c = 0` (`OP_ADD`/`OP_SUB` vanishes ⇒ `[dup, nip]`) and `c = 1`
+(`⇒ [dup, OP_1ADD/OP_1SUB, nip]`) the images differ structurally and the
+run-equality holds only on the `bigint`-topped stack (`hs`), discharged by
+stepping. -/
+theorem updateProp_M3_full (c : Int) (opc : String)
+    (hOpc : opc = "OP_ADD" ∨ opc = "OP_SUB") (hLo : -1 ≤ c) (hHi : c ≤ 16)
+    (i : Int) (tail : List ANF.Eval.Value) (s : StackState)
+    (hs : s.stack = .vBigint i :: tail) :
+    runOps (peepholeMethodOps [.dup, .push (.bigint c), .swap, .swap, .opcode opc, .nip]) s
+      = runOps [.dup, .push (.bigint c), .swap, .swap, .opcode opc, .nip] s := by
+  -- The OP-folding leaves c ∈ {0,1}; everything else keeps `[dup, push c, opc, nip]`.
+  have hc01 : c = 0 ∨ c = 1 ∨ (c ≠ 0 ∧ c ≠ 1) := by omega
+  rcases hOpc with hopc | hopc <;> subst hopc <;>
+  rcases hc01 with rfl | rfl | ⟨hcn0, hcn1⟩
+  -- c = 0, OP_ADD  ⇒  image [dup, nip]
+  · rw [show peepholeMethodOps [.dup, .push (.bigint 0), .swap, .swap, .opcode "OP_ADD", .nip]
+          = [StackOp.dup, .nip] by
+        rw [peepholeMethodOps_eq,
+          Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ (by decide) (by rfl)]; rfl]
+    simp only [runOps, Stack.Eval.stepNonIf, Stack.Eval.applyDup, Stack.Eval.applySwap,
+      Stack.Eval.applyNip, Stack.Eval.runOpcode, Stack.Eval.liftIntBin, Stack.Eval.asInt?,
+      Stack.Eval.popN, Stack.Eval.StackState.push, Stack.Eval.StackState.pop?, hs, Int.add_zero]
+  -- c = 1, OP_ADD  ⇒  image [dup, OP_1ADD, nip]
+  · rw [show peepholeMethodOps [.dup, .push (.bigint 1), .swap, .swap, .opcode "OP_ADD", .nip]
+          = [StackOp.dup, .opcode "OP_1ADD", .nip] by
+        rw [peepholeMethodOps_eq,
+          Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ (by decide) (by rfl)]; rfl]
+    simp only [runOps, Stack.Eval.stepNonIf, Stack.Eval.applyDup, Stack.Eval.applySwap,
+      Stack.Eval.applyNip, Stack.Eval.runOpcode, Stack.Eval.liftIntBin, Stack.Eval.liftIntUnary,
+      Stack.Eval.asInt?, Stack.Eval.popN, Stack.Eval.StackState.push, Stack.Eval.StackState.pop?, hs]
+  -- c ∉ {0,1}, OP_ADD  ⇒  image [dup, push c, OP_ADD, nip] (swap-fold)
+  · have hImg : peepholeMethodOps [.dup, .push (.bigint c), .swap, .swap, .opcode "OP_ADD", .nip]
+          = [StackOp.dup, .push (.bigint c), .opcode "OP_ADD", .nip] := by
+      rcases (by omega : c = -1 ∨ c = 2 ∨ c = 3 ∨ c = 4 ∨ c = 5 ∨ c = 6 ∨ c = 7 ∨ c = 8
+                ∨ c = 9 ∨ c = 10 ∨ c = 11 ∨ c = 12 ∨ c = 13 ∨ c = 14 ∨ c = 15 ∨ c = 16)
+        with rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl <;>
+      (rw [peepholeMethodOps_eq,
+          Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ (by decide) (by rfl)]; rfl)
+    rw [hImg]
+    exact updateProp_M3_runEq c "OP_ADD" s
+  -- c = 0, OP_SUB  ⇒  image [dup, nip]
+  · rw [show peepholeMethodOps [.dup, .push (.bigint 0), .swap, .swap, .opcode "OP_SUB", .nip]
+          = [StackOp.dup, .nip] by
+        rw [peepholeMethodOps_eq,
+          Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ (by decide) (by rfl)]; rfl]
+    simp only [runOps, Stack.Eval.stepNonIf, Stack.Eval.applyDup, Stack.Eval.applySwap,
+      Stack.Eval.applyNip, Stack.Eval.runOpcode, Stack.Eval.liftIntBin, Stack.Eval.asInt?,
+      Stack.Eval.popN, Stack.Eval.StackState.push, Stack.Eval.StackState.pop?, hs, Int.sub_zero]
+  -- c = 1, OP_SUB  ⇒  image [dup, OP_1SUB, nip]
+  · rw [show peepholeMethodOps [.dup, .push (.bigint 1), .swap, .swap, .opcode "OP_SUB", .nip]
+          = [StackOp.dup, .opcode "OP_1SUB", .nip] by
+        rw [peepholeMethodOps_eq,
+          Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ (by decide) (by rfl)]; rfl]
+    simp only [runOps, Stack.Eval.stepNonIf, Stack.Eval.applyDup, Stack.Eval.applySwap,
+      Stack.Eval.applyNip, Stack.Eval.runOpcode, Stack.Eval.liftIntBin, Stack.Eval.liftIntUnary,
+      Stack.Eval.asInt?, Stack.Eval.popN, Stack.Eval.StackState.push, Stack.Eval.StackState.pop?, hs]
+  -- c ∉ {0,1}, OP_SUB  ⇒  image [dup, push c, OP_SUB, nip] (swap-fold)
+  · have hImg : peepholeMethodOps [.dup, .push (.bigint c), .swap, .swap, .opcode "OP_SUB", .nip]
+          = [StackOp.dup, .push (.bigint c), .opcode "OP_SUB", .nip] := by
+      rcases (by omega : c = -1 ∨ c = 2 ∨ c = 3 ∨ c = 4 ∨ c = 5 ∨ c = 6 ∨ c = 7 ∨ c = 8
+                ∨ c = 9 ∨ c = 10 ∨ c = 11 ∨ c = 12 ∨ c = 13 ∨ c = 14 ∨ c = 15 ∨ c = 16)
+        with rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl|rfl <;>
+      (rw [peepholeMethodOps_eq,
+          Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ (by decide) (by rfl)]; rfl)
+    rw [hImg]
+    exact updateProp_M3_runEq c "OP_SUB" s
+
+/-- **Path 2 Tier 1 Wave 63 — the dispatch-level consume-`update_prop`
+correctness theorem (OPERATIONAL M3 regime).**
+
+For a single-public stateful increment/decrement method whose body is exactly the
+canonical `prop ± small-const ; update_prop prop` fragment
+(`Agrees.updatePropConsumeBody prop op c`, op ∈ {+,-}, c ∈ [-1,16], classifier
+`Agrees.updatePropConsumeAdmissible`), with the single SM-slot carrying the
+property `prop` (`reverse (anfM.params.map name) = [prop]`), the deployed
+`compileSafe` bytes are observationally correct.
+
+This is the 4-leg transitivity the wave-64 dispatch surgery uses to retire
+`compileSafe_observational_correct_modulo_update_prop_codegen`:
+
+* **M2 (from-entry, wave 62)** — `successAgrees_updateProp_consume_unconditional`
+  gives the body-level success iff between `evalBindings` and `runOps RAW` from
+  ONLY the typed entry bundle + `agreesTagged [(prop,.prop)]` + the classifier.
+* **M3 (OPERATIONAL, wave 63)** — unlike arith's op-list identity,
+  `peepholeMethodOps RAW ≠ RAW` here.  `updatePropConsume_RAW_eq` reduces RAW to
+  the prop-name-free shape `[dup, push c, swap, swap, opcode, nip]`; the full
+  operational run-preservation `updateProp_M3_full` then proves
+  `runOps (peepholeMethodOps RAW) = runOps RAW` on the `bigint`-topped entry
+  stack (derived by `updatePropConsume_entry_stack_bigintTop`) — enumerating `c`
+  (the OP-folding leaves `c ∈ {0,1}` use the bigint fact; the rest reduce to the
+  unconditional swap-fold `updateProp_M3_runEq`).
+* **M4 (push round-trip, wave 60)** — `updatePropConsume_image_emittable`
+  (`AreRunarEmittablePush` of `peepholeMethodOps RAW`, c ∈ [-1,16], enumerated)
+  feeds the PUSH-aware `compileSafe_single_public_runOps_eq_push`.
+* **shape** — `peepholeProgram_single_public_shape` from `hSinglePublic` / `hName`.
+
+The conclusion matches the axiom `…_modulo_update_prop_codegen` modulo the
+fragment classifier.  `evalBindingsP_eq_evalBindings_of_noMethodCall` drops the
+program-aware `evalBindingsP` (the fragment is methodCall-free). -/
+theorem compileSafe_observational_correct_updateProp_consume
+    (p : ANFProgram) (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (prop op : String) (c : Int)
+    (hBodyEq : anfM.body = Agrees.updatePropConsumeBody prop op c)
+    (hSM : List.reverse (anfM.params.map (·.name)) = [prop])
+    (hAdmis : Agrees.updatePropConsumeAdmissible prop op c = true)
+    (hAgrees : Agrees.agreesTagged [(prop, Agrees.SlotKind.prop)] initialAnf initialStack)
+    (hUntag : Agrees.untagSm [(prop, Agrees.SlotKind.prop)] = [prop])
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hTsmTyped : Agrees.entryTsmArithTyped Γ [(prop, Agrees.SlotKind.prop)])
+    (hCoh : Agrees.tsmCoherent initialAnf [(prop, Agrees.SlotKind.prop)]) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  -- The admissibility classifier's atomic facts (op additive, c ∈ [-1,16]).
+  have hAdmisFacts := hAdmis
+  unfold Agrees.updatePropConsumeAdmissible at hAdmisFacts
+  simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq,
+    bne_iff_ne, ne_eq] at hAdmisFacts
+  obtain ⟨⟨⟨⟨⟨⟨hOp, hCLo⟩, hCHi⟩, _hPc0⟩, _hPc1⟩, _hPt0⟩, _hPu0⟩ := hAdmisFacts
+  have hOpc : Stack.Lower.binopOpcode op none = "OP_ADD" ∨ Stack.Lower.binopOpcode op none = "OP_SUB" := by
+    rcases hOp with h | h <;> subst h
+    · exact Or.inl rfl
+    · exact Or.inr rfl
+  -- The fragment is methodCall-free.
+  have hNoMC : RunarVerification.ANF.Eval.noMethodCallBindings anfM.body = true := by
+    rw [hBodyEq]; unfold Agrees.updatePropConsumeBody; rfl
+  rw [RunarVerification.ANF.Eval.evalBindingsP_eq_evalBindings_of_noMethodCall
+        p.methods initialAnf anfM.body hNoMC]
+  -- No implicit params / post-pass.
+  have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false := by
+    rw [hBodyEq]; simp [Agrees.updatePropConsumeBody, Lower.bindingsUseCheckPreimage]
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := by
+    rw [hBodyEq]; simp [Agrees.updatePropConsumeBody, Lower.bindingsUseCodePart]
+  have hNoDeserialize : Lower.bindingsUseDeserializeState anfM.body = false := by
+    rw [hBodyEq]; simp [Agrees.updatePropConsumeBody, Lower.bindingsUseDeserializeState]
+  have hNoTerminalAssert : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBodyEq]; simp [Agrees.updatePropConsumeBody, Lower.bodyEndsInAssert]
+  -- The raw lowered op list, keyed to the canonical body via the SM bridge.
+  let RAW :=
+      (Stack.Lower.lowerBindingsP p.methods p.properties
+        Stack.Lower.defaultInlineBudget 0
+        (Stack.Lower.computeLastUses (Agrees.updatePropConsumeBody prop op c)) []
+        ((Agrees.updatePropConsumeBody prop op c).map (·.name))
+        (Stack.Lower.collectConstInts (Agrees.updatePropConsumeBody prop op c))
+        [prop]
+        (Agrees.updatePropConsumeBody prop op c)).1
+  have hRAW :
+      RAW =
+        (Stack.Lower.lowerBindingsP p.methods p.properties
+          Stack.Lower.defaultInlineBudget 0
+          (Stack.Lower.computeLastUses (Agrees.updatePropConsumeBody prop op c)) []
+          ((Agrees.updatePropConsumeBody prop op c).map (·.name))
+          (Stack.Lower.collectConstInts (Agrees.updatePropConsumeBody prop op c))
+          [prop]
+          (Agrees.updatePropConsumeBody prop op c)).1 := rfl
+  have hUnique :
+      ∀ m', m' ∈ p.methods → m'.isPublic = true →
+        (m'.name == anfM.name) = true → m' = anfM :=
+    unique_public_of_filter_singleton p anfM hSinglePublic
+  have hP : p =
+      { contractName := p.contractName,
+        properties := p.properties,
+        methods := p.methods } := rfl
+  have hBodyOfRaw :
+      (Lower.lower p).bodyOf anfM.name
+        = (Lower.lowerMethod p.methods p.properties anfM).ops := by
+    unfold StackProgram.bodyOf
+    rw [hP, Agrees.findMethod_lower_public_unique
+          p.contractName p.properties p.methods anfM hMem hPublic hUnique]
+  have hMethodOpsRaw :
+      (Lower.lowerMethod p.methods p.properties anfM).ops = RAW := by
+    rw [Agrees.lowerMethod_ops_eq_userRaw_no_implicits_no_post
+          p.methods p.properties anfM hNoPreimage hNoCode hNoTerminalAssert
+          hNoDeserialize]
+    show Agrees.lowerMethodUserRawOps p.methods p.properties anfM = RAW
+    unfold Agrees.lowerMethodUserRawOps
+    rw [hSM, hBodyEq, hRAW]
+  have hBodyOfEqRaw : (Lower.lower p).bodyOf anfM.name = RAW := by
+    rw [hBodyOfRaw, hMethodOpsRaw]
+  -- RAW reduces to the prop-name-free shape.
+  have hRAWshape :
+      RAW = [.dup, .push (.bigint c), .swap, .swap,
+             .opcode (Stack.Lower.binopOpcode op none), .nip] := by
+    rw [hRAW]
+    exact Agrees.updatePropConsume_RAW_eq p.methods p.properties
+      Stack.Lower.defaultInlineBudget
+      (Stack.Lower.collectConstInts (Agrees.updatePropConsumeBody prop op c))
+      prop op c hOp
+  -- Entry runtime stack has a bigint on top (boundary fact for the M3 leaves).
+  obtain ⟨i, tail, hStkTop⟩ :=
+    Agrees.updatePropConsume_entry_stack_bigintTop Γ prop initialAnf initialStack
+      hAgrees hTypedEntry hTsmTyped hCoh
+  -- Leg M2: ANF eval agrees with `runOps RAW`.
+  have hM2 :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+        (runOps RAW initialStack) := by
+    rw [hBodyEq]
+    show (RunarVerification.ANF.Eval.evalBindings initialAnf
+            (Agrees.updatePropConsumeBody prop op c)).toOption.isSome
+        ↔ (runOps RAW initialStack).toOption.isSome
+    rw [hRAW]
+    exact Agrees.successAgrees_updateProp_consume_unconditional
+      p.methods p.properties Stack.Lower.defaultInlineBudget
+      (Stack.Lower.collectConstInts (Agrees.updatePropConsumeBody prop op c)) Γ
+      prop op c initialAnf initialStack hUntag hAgrees hAdmis hTypedEntry hTsmTyped hCoh
+  -- Leg M2→method.
+  have hM2Method :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+        (runMethod (Lower.lower p) anfM.name initialStack) := by
+    have hRunEq :
+        runMethod (Lower.lower p) anfM.name initialStack = runOps RAW initialStack := by
+      unfold runMethod
+      rw [hBodyOfEqRaw]
+    rw [hRunEq]; exact hM2
+  -- shape: post-peephole program is single-public with body `peepholeMethodOps RAW`.
+  obtain ⟨hPubSingleton, hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hPeepedOpsImg : (peepholedLoweredMethod p anfM).ops = peepholeMethodOps RAW := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops
+      = peepholeMethodOps RAW
+    rw [hMethodOpsRaw]
+  -- M4: `runParsedBytes bytes = runOps (peepholeMethodOps RAW)` (push round-trip).
+  have hEmitPush : Parse.AreRunarEmittablePush (peepholedLoweredMethod p anfM).ops := by
+    show Parse.areRunarEmittablePushBool (peepholedLoweredMethod p anfM).ops = true
+    rw [hPeepedOpsImg, hRAW]
+    exact updatePropConsume_image_emittable p.methods p.properties
+      Stack.Lower.defaultInlineBudget
+      (Stack.Lower.collectConstInts (Agrees.updatePropConsumeBody prop op c))
+      prop op c hOp hCLo hCHi
+  have hM4 :
+      runParsedBytes bytes initialStack = runOps (peepholeMethodOps RAW) initialStack := by
+    have hEq :
+        runParsedBytes bytes initialStack
+          = runOps (peepholedLoweredMethod p anfM).ops initialStack :=
+      compileSafe_single_public_runOps_eq_push p bytes (peepholedLoweredMethod p anfM)
+        initialStack hSafe hPubSingleton hEmitPush
+    rw [hEq, hPeepedOpsImg]
+  -- M3 (operational): `runOps (peepholeMethodOps RAW) = runOps RAW`.
+  have hM3 :
+      runOps (peepholeMethodOps RAW) initialStack = runOps RAW initialStack := by
+    rw [hRAWshape]
+    exact updateProp_M3_full c (Stack.Lower.binopOpcode op none) hOpc hCLo hCHi
+      i tail initialStack hStkTop
+  -- Compose: M2 ∘ M3 ∘ M4.
+  have hParsed :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runParsedBytes bytes initialStack) := by
+    rw [hM4, hM3]
+    have hMethodEq :
+        runMethod (Lower.lower p) anfM.name initialStack = runOps RAW initialStack := by
+      unfold runMethod; rw [hBodyOfEqRaw]
+    rw [hMethodEq]
+    exact successAgrees_refl _
+  exact successAgrees_trans _ _ _ hM2Method hParsed
+
+/-! ### Wave 63 — MANDATORY smoke: the consume theorem fires end-to-end
+
+The canonical single-public `count + 1 ; update_prop count` stateful-increment
+program, fired through `compileSafe_observational_correct_updateProp_consume`.
+Anti-vacuous: both the ANF eval and the deployed-bytes run succeed. -/
+
+private def wave63SmokeProg : ANF.ANFProgram :=
+  { contractName := "Counter"
+    properties := [ANF.ANFProperty.mk "count" .bigint false none]
+    methods :=
+      [ { name := "inc"
+          params := [ANF.ANFParam.mk "count" .bigint]
+          body := Agrees.updatePropConsumeBody "count" "+" 1
+          isPublic := true } ] }
+
+private def wave63SmokeMethod : ANF.ANFMethod :=
+  { name := "inc"
+    params := [ANF.ANFParam.mk "count" .bigint]
+    body := Agrees.updatePropConsumeBody "count" "+" 1
+    isPublic := true }
+
+private def wave63SmokeEnv : RunarVerification.ANF.WellTyped.TypeEnv :=
+  RunarVerification.ANF.Typed.TypeEnv.empty.extend "count" .bigint
+private def wave63SmokeAnf : State := { props := [("count", .vBigint 5)] }
+private def wave63SmokeStk : StackState :=
+  { stack := [.vBigint 5], props := [("count", .vBigint 5)] }
+private def wave63SmokeBytes : ByteArray :=
+  Emit.emitFast (peepholeProgram (Lower.lower wave63SmokeProg))
+
+private theorem wave63Smoke_validate :
+    validateStackProgram (peepholeProgram (Lower.lower wave63SmokeProg)) = .ok () := by
+  have h : (validateStackProgram (peepholeProgram (Lower.lower wave63SmokeProg))).toOption.isSome
+      = true := by native_decide
+  cases hv : validateStackProgram (peepholeProgram (Lower.lower wave63SmokeProg)) with
+  | ok u => cases u; rfl
+  | error e => rw [hv] at h; simp [Except.toOption] at h
+
+private theorem wave63Smoke_compileSafe :
+    compileSafe wave63SmokeProg = .ok wave63SmokeBytes := by
+  unfold compileSafe wave63SmokeBytes
+  change
+    (do
+      validateStackProgram (peepholeProgram (Lower.lower wave63SmokeProg))
+      Except.ok (Emit.emitFast (peepholeProgram (Lower.lower wave63SmokeProg))))
+      = Except.ok (Emit.emitFast (peepholeProgram (Lower.lower wave63SmokeProg)))
+  rw [wave63Smoke_validate]
+  rfl
+
+private theorem wave63Smoke_mem : wave63SmokeMethod ∈ wave63SmokeProg.methods := by
+  unfold wave63SmokeProg wave63SmokeMethod; simp
+
+private theorem wave63Smoke_filter :
+    wave63SmokeProg.methods.filter (·.isPublic) = [wave63SmokeMethod] := by
+  unfold wave63SmokeProg wave63SmokeMethod; rfl
+
+private theorem wave63Smoke_entryBigintTyped :
+    RunarVerification.ANF.WellTyped.EntryBigintTyped wave63SmokeEnv wave63SmokeAnf := by
+  intro nm hnm
+  by_cases h : nm = "count"
+  · subst h; exact ⟨.vBigint 5, rfl, ⟨5, rfl⟩⟩
+  · exfalso
+    have hc : ("count" == nm) = false := by
+      rw [beq_eq_false_iff_ne]; exact fun hh => h hh.symm
+    simp only [wave63SmokeEnv, RunarVerification.ANF.Typed.TypeEnv.lookup,
+      RunarVerification.ANF.Typed.TypeEnv.extend, RunarVerification.ANF.Typed.TypeEnv.empty,
+      List.find?_cons, hc, List.find?_nil, Option.map_none, reduceCtorEq] at hnm
+
+private theorem wave63Smoke_agreesTagged :
+    Agrees.agreesTagged [("count", Agrees.SlotKind.prop)] wave63SmokeAnf wave63SmokeStk := by
+  refine ⟨?_, rfl, rfl⟩
+  show Agrees.taggedStackAligned [("count", Agrees.SlotKind.prop)] wave63SmokeAnf wave63SmokeStk.stack
+  refine ⟨?_, ?_⟩
+  · show Agrees.lookupAnfByKind wave63SmokeAnf ("count", Agrees.SlotKind.prop) = some (.vBigint 5); rfl
+  · trivial
+
+private theorem wave63Smoke_coh :
+    Agrees.tsmCoherent wave63SmokeAnf [("count", Agrees.SlotKind.prop)] := by
+  intro st hs
+  simp only [List.mem_singleton] at hs
+  subst hs
+  show Agrees.lookupAnfByKind wave63SmokeAnf ("count", Agrees.SlotKind.prop)
+    = wave63SmokeAnf.resolveRef "count"
+  rfl
+
+private theorem wave63Smoke_wt :
+    Agrees.entryTsmArithTyped wave63SmokeEnv [("count", Agrees.SlotKind.prop)] := by
+  intro st hs
+  simp only [List.mem_singleton] at hs
+  subst hs
+  show wave63SmokeEnv.lookup "count" = some .bigint; decide
+
+/-- **Wave 63 smoke** — the consume theorem instantiated on the concrete
+`count + 1 ; update_prop count` program. -/
+theorem wave63_updateProp_consume_smoke :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP wave63SmokeProg.methods wave63SmokeAnf
+        wave63SmokeMethod.body)
+      (runParsedBytes wave63SmokeBytes wave63SmokeStk) :=
+  compileSafe_observational_correct_updateProp_consume
+    wave63SmokeProg (by native_decide) wave63SmokeMethod wave63SmokeBytes
+    wave63Smoke_mem rfl wave63Smoke_compileSafe wave63SmokeAnf wave63SmokeStk wave63SmokeEnv
+    wave63Smoke_filter (by decide) "count" "+" 1 rfl rfl (by decide)
+    wave63Smoke_agreesTagged rfl wave63Smoke_entryBigintTyped wave63Smoke_wt wave63Smoke_coh
+
+/-- **Wave 63 smoke — anti-vacuity.**  Both the ANF eval and the deployed-bytes
+run of the smoke program succeed. -/
+theorem wave63_updateProp_consume_smoke_anti_vacuous :
+    (RunarVerification.ANF.Eval.evalBindingsP wave63SmokeProg.methods wave63SmokeAnf
+        wave63SmokeMethod.body).toOption.isSome
+    ∧ (runParsedBytes wave63SmokeBytes wave63SmokeStk).toOption.isSome := by
+  have hAnf : (RunarVerification.ANF.Eval.evalBindingsP wave63SmokeProg.methods wave63SmokeAnf
+      wave63SmokeMethod.body).toOption.isSome := by native_decide
+  exact ⟨hAnf, (wave63_updateProp_consume_smoke).mp hAnf⟩
 
 /-- **Wave 45 Step 1 — the dispatch-level consume-`if_val` correctness
 theorem.**

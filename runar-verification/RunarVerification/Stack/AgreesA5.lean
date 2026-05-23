@@ -4889,6 +4889,133 @@ theorem successAgrees_updateProp_consume_unconditional
   rw [hBodySplit]
   exact hWalk
 
+/-- **Wave 63 — the RAW lowering of the update_prop consume fragment.**
+
+The raw lowered op list of `updatePropConsumeBody p op c` (the input to
+`peepholeMethodOps` in the M4 leg) is the closed, prop-name-INDEPENDENT
+list `[.dup, .push c, .swap, .swap, .opcode (binopOpcode op none), .nip]`.
+The four bindings lower positionally (head slot ⇒ `.dup`; const ⇒ `.push c`;
+d1d0 binOp ⇒ `[.swap, .swap, opcode]`; existing-head `update_prop` ⇒ `.nip`),
+so neither the prop name nor any disequality enters — the reduction is purely
+name-determined by `computeLastUses` / `findIdx?`.  Mirrors the per-step
+reductions `hLowerStep1/2/3` + the suffix `removePropEntryOps` collapse from
+`successAgrees_updateProp_consume_unconditional`. -/
+theorem updatePropConsume_RAW_eq (progMethods : List ANFMethod)
+    (props : List ANFProperty) (budget : Nat)
+    (constInts : List (String × Int)) (p op : String) (c : Int)
+    (hOp : op = "+" ∨ op = "-") :
+    (Stack.Lower.lowerBindingsP progMethods props budget 0
+        (Stack.Lower.computeLastUses (updatePropConsumeBody p op c)) []
+        ((updatePropConsumeBody p op c).map (·.name)) constInts [p]
+        (updatePropConsumeBody p op c)).1
+      = [.dup, .push (.bigint c), .swap, .swap,
+         .opcode (Stack.Lower.binopOpcode op none), .nip] := by
+  have hNames : (updatePropConsumeBody p op c).map (·.name) = ["c0", "c1", "t0", "u0"] := by
+    unfold updatePropConsumeBody; rfl
+  have hLUeq : Stack.Lower.computeLastUses (updatePropConsumeBody p op c)
+      = [("t0", 3), ("c1", 2), ("c0", 2)] := by
+    unfold updatePropConsumeBody Stack.Lower.computeLastUses
+    simp only [Stack.Lower.computeLastUses.go, Stack.Lower.collectRefs,
+      Stack.Lower.lastUsesUpdate, List.foldl, List.filter]
+    decide
+  rw [hNames, hLUeq]
+  unfold updatePropConsumeBody
+  have hLU_c0 : Stack.Lower.isLastUse [("t0", 3), ("c1", 2), ("c0", 2)] "c0" 2 = true := by decide
+  have hLU_c1 : Stack.Lower.isLastUse [("t0", 3), ("c1", 2), ("c0", 2)] "c1" 2 = true := by decide
+  have hLU_t0 : Stack.Lower.isLastUse [("t0", 3), ("c1", 2), ("c0", 2)] "t0" 3 = true := by decide
+  -- Step 1: loadProp p at depth 0 ⇒ [dup], sm -> ["c0", p].
+  have hStep1 :
+      Stack.Lower.lowerValueP progMethods props budget 0
+          [("t0", 3), ("c1", 2), ("c0", 2)] [] ["c0", "c1", "t0", "u0"] constInts [p] "c0"
+          (ANFValue.loadProp p)
+        = ([StackOp.dup], ["c0", p], ["c0", "c1", "t0", "u0"]) := by
+    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveCopy Stack.Lower.bringToTop
+      Stack.Lower.StackMap.depth?
+    have hFind : ([p] : Stack.Lower.StackMap).findIdx? (· == p) = some 0 := by
+      unfold List.findIdx?; simp [List.findIdx?.go]
+    rw [hFind]; rfl
+  -- Step 2: loadConst c at depth 1 ⇒ [push c], sm -> ["c1", "c0", p].
+  have hStep2 :
+      Stack.Lower.lowerValueP progMethods props budget 1
+          [("t0", 3), ("c1", 2), ("c0", 2)] [] ["c0", "c1", "t0", "u0"] constInts ["c0", p] "c1"
+          (ANFValue.loadConst (.int c))
+        = ([StackOp.push (.bigint c)], ["c1", "c0", p], ["c0", "c1", "t0", "u0"]) := by
+    unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
+  -- Step 3: binOp d1d0 ⇒ [swap, swap, opcode], sm -> ["t0", p].
+  have hStep3 :
+      Stack.Lower.lowerValueP progMethods props budget 2
+          [("t0", 3), ("c1", 2), ("c0", 2)] [] ["c0", "c1", "t0", "u0"] constInts ["c1", "c0", p] "t0"
+          (ANFValue.binOp op "c0" "c1" none)
+        = ([StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)], ["t0", p],
+           ["c0", "c1", "t0", "u0"]) := by
+    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+      Stack.Lower.StackMap.depth?
+    have hF0 : (["c1", "c0", p] : Stack.Lower.StackMap).findIdx? (· == "c0") = some 1 := by
+      unfold List.findIdx?; simp [List.findIdx?.go]
+    have hF1 : (["c0", "c1", p] : Stack.Lower.StackMap).findIdx? (· == "c1") = some 1 := by
+      unfold List.findIdx?; simp [List.findIdx?.go]
+    simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
+      hLU_c0, hLU_c1, hF0, hF1, if_true]
+    have hNB : (op == "!==" && none == some "bytes") = false := by
+      rcases hOp with h | h <;> subst h <;> rfl
+    simp only [hNB, Bool.false_eq_true, if_false, List.cons_append,
+      List.nil_append, Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push]
+  -- Step 4: updateProp p t0 at depth 3 ⇒ [nip], sm -> [p].
+  have hStep4 :
+      (Stack.Lower.lowerValueP progMethods props budget 3
+          [("t0", 3), ("c1", 2), ("c0", 2)] [] ["c0", "c1", "t0", "u0"] constInts ["t0", p] "u0"
+          (ANFValue.updateProp p "t0")).1
+        = [StackOp.nip] := by
+    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+      Stack.Lower.StackMap.depth? Stack.Lower.removePropEntryOps
+    have hFind : (["t0", p] : Stack.Lower.StackMap).findIdx? (· == "t0") = some 0 := by
+      unfold List.findIdx?; simp [List.findIdx?.go]
+    rw [hFind]
+    simp only [hLU_t0, Stack.Lower.listContains, List.any_nil, Bool.not_false,
+      Bool.true_and, if_true]
+    unfold Stack.Lower.removePropEntryAux
+    rw [if_pos rfl, if_pos rfl]
+    rfl
+  -- Chain the four steps through lowerBindingsP.
+  simp only [Stack.Lower.lowerBindingsP, hStep1, hStep2, hStep3]
+  simp only [hStep4]
+  rfl
+
+/-- **Wave 63 — entry runtime-stack shape for the update_prop consume fragment.**
+
+From the entry `agreesTagged [(p,.prop)]` plus the typed entry bundle
+(`EntryBigintTyped` + `tsmCoherent` + `entryTsmArithTyped`), the runtime stack at
+method entry has a `bigint` value on top: `initialStack.stack = .vBigint i :: tail`.
+This is the boundary fact the OPERATIONAL M3 leg needs (the `c = 0` / `c = 1`
+post-peephole images drop the `OP_ADD`, so their `runOps` agrees with RAW's only on
+a bigint-topped stack).  Mirrors the opening of
+`successAgrees_updateProp_consume_unconditional`. -/
+theorem updatePropConsume_entry_stack_bigintTop
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv) (p : String)
+    (initialAnf : State) (initialStack : StackState)
+    (hAgrees : agreesTagged [(p, SlotKind.prop)] initialAnf initialStack)
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hWT : entryTsmArithTyped Γ [(p, SlotKind.prop)])
+    (hCoh : tsmCoherent initialAnf [(p, SlotKind.prop)]) :
+    ∃ (i : Int) (tail : List Value), initialStack.stack = .vBigint i :: tail := by
+  have hTypedP : RunarVerification.ANF.WellTyped.arithOperandBigint Γ p :=
+    hWT (p, SlotKind.prop) (by simp)
+  have hHeadCorr : initialAnf.resolveRef p = lookupAnfByKind initialAnf (p, SlotKind.prop) :=
+    (hCoh (p, SlotKind.prop) (by simp)).symm
+  obtain ⟨i, hPropVal⟩ :=
+    entryBridge_loadProp_resolves_vBigint Γ initialAnf p hTypedEntry hTypedP hHeadCorr
+  have hAlign : taggedStackAligned [(p, SlotKind.prop)] initialAnf initialStack.stack := hAgrees.1
+  obtain ⟨topV, restStk, hStkCases⟩ : ∃ topV restStk, initialStack.stack = topV :: restStk := by
+    match hCases : initialStack.stack with
+    | [] => rw [hCases] at hAlign; unfold taggedStackAligned at hAlign; exact absurd hAlign (by simp)
+    | topV :: restStk => exact ⟨topV, restStk, rfl⟩
+  have hHead : lookupAnfByKind initialAnf (p, SlotKind.prop) = some topV := by
+    rw [hStkCases] at hAlign; unfold taggedStackAligned at hAlign; exact hAlign.1
+  have hLkProp : lookupAnfByKind initialAnf (p, SlotKind.prop) = some (.vBigint i) := hPropVal
+  rw [hLkProp] at hHead
+  have hTopEq : topV = .vBigint i := (Option.some.inj hHead).symm
+  exact ⟨i, restStk, by rw [hStkCases, hTopEq]⟩
+
 /-! ## Wave 62 — MANDATORY smoke 2: the from-entry walk on the canonical body
 
 The canonical `count + 1 ; update_prop count` body, fired through the from-entry

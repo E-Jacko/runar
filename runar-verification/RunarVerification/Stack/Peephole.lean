@@ -8863,6 +8863,18 @@ theorem peepholePostFold_preserves_noIfOp
   exact applyPushOneSub_preserves_noIfOp _
     (applyPushOneAdd_preserves_noIfOp ops hNoIf)
 
+/-- On an if-free op list, `peepholePostFold` is exactly the two flat
+`applyPushOneSub ∘ applyPushOneAdd` consolidations (the `.ifOp`-descending
+`postFoldList` collapses to the identity).  Public so downstream callers
+(`Pipeline`'s update_prop consume image reduction) can drive a fast
+`simp`-based reduction of the post-fold shape without unfolding the private
+`postFoldList`. -/
+theorem peepholePostFold_eq_applyPushOne_of_noIfOp
+    (ops : List StackOp) (hNoIf : noIfOp ops) :
+    peepholePostFold ops = applyPushOneSub (applyPushOneAdd ops) := by
+  unfold peepholePostFold
+  rw [postFoldList_eq_of_noIfOp ops hNoIf]
+
 /-- `peepholePostFold` is the identity on the empty op list. Used by the
 absent-method case of `Pipeline.peepholeProgram_bodyOf`. -/
 theorem peepholePostFold_nil : peepholePostFold ([] : List StackOp) = [] := by
@@ -11095,6 +11107,39 @@ theorem peepholeChainFold_eq_self_of_noIfOp_pushFree
   unfold peepholeChainFold
   rw [chainFoldListTRgo_nil_acc_of_noIfOp ops hNoIf]
   exact chainFoldFixpointFlat_eq_self_of_pushFree 64 ops hPushFree
+
+/-- `chainFoldFixpointFlat` is the identity on any op list on which the
+composed chain-fold step (`applyPushAddPushSub ∘ applyPushAddPushAdd`)
+is already the identity: the length check stabilises on the first
+iteration. Strictly more general than the `pushFree` variant — a list
+with a single `[push, OP_ADD]` (no foldable 4-op window) satisfies the
+step-identity hypothesis but is NOT push-free. -/
+theorem chainFoldFixpointFlat_eq_self_of_stepId :
+    ∀ (fuel : Nat) (ops : List StackOp),
+        applyPushAddPushSub (applyPushAddPushAdd ops) = ops →
+        chainFoldFixpointFlat fuel ops = ops := by
+  intro fuel
+  cases fuel with
+  | zero => intro ops _; simp [chainFoldFixpointFlat]
+  | succ k =>
+      intro ops hStep
+      unfold chainFoldFixpointFlat
+      simp [hStep]
+
+/-- Pure syntactic identity: `peepholeChainFold` is the identity on op
+lists that are if-free and on which the chain-fold step is already the
+identity (no foldable `[push a, OP_ADD, push b, OP_ADD]` /
+`[push a, OP_SUB, push b, OP_SUB]` 4-op window). The update_prop consume
+post-peephole image `[.dup, .push c, OP_ADD/OP_SUB, .nip]` carries one
+`[push, op]` pair (no foldable window), so this fires where the
+`pushFree` variant cannot. -/
+theorem peepholeChainFold_eq_self_of_noIfOp_stepId
+    (ops : List StackOp) (hNoIf : noIfOp ops)
+    (hStep : applyPushAddPushSub (applyPushAddPushAdd ops) = ops) :
+    peepholeChainFold ops = ops := by
+  unfold peepholeChainFold
+  rw [chainFoldListTRgo_nil_acc_of_noIfOp ops hNoIf]
+  exact chainFoldFixpointFlat_eq_self_of_stepId 64 ops hStep
 
 /-! ### Smoke test — `peepholeChainFold_eq_self_of_noIfOp_pushFree`.
 
