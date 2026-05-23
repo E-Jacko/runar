@@ -11649,5 +11649,244 @@ theorem peepholePostFold_eq_self_of_arithEmit
       applyPushOneAdd_eq_self_of_arithEmit ops h,
       applyPushOneSub_eq_self_of_arithEmit ops h]
 
+/-! ### Wave 42 — per-pass `.ifOp` identity on arith-fixed branches (M3 substrate)
+
+The four production peephole passes (`peepholePassAll`, `peepholePostFold`,
+`peepholeChainFold`, `peepholeRollPickFold`) each recurse into `.ifOp`
+branches via a private mutual recursor (`preprocessOp` / `postFoldOp` /
+`chainFoldOp` / `rollPickOp`).  For the `if_val` op-shape we need each pass
+to be the literal identity on a singleton `[.ifOp thn (some els)]` whose
+branches are themselves fixpoints of that pass.
+
+The branch fixpoints are supplied as hypotheses (the caller derives them
+from the wave-38 arith identities on the emittable-arith branch lowerings).
+The `.ifOp`-arm of each recursor rebuilds the node from the per-branch pass
+applied to each branch, so the singleton-`.ifOp` reduction + the branch
+fixpoints close each identity. -/
+
+/-- `peepholePassAllFlat` is the identity on a singleton `.ifOp`: the
+`.ifOp` head matches none of the 19 flat rewrite rules (each rule's
+catch-all arm peels the head and recurses on `[]`). -/
+private theorem peepholePassAllFlat_singleton_ifOp
+    (thn : List StackOp) (els : Option (List StackOp)) :
+    peepholePassAllFlat [.ifOp thn els] = [.ifOp thn els] := by
+  unfold peepholePassAllFlat
+  simp only [applyDropAfterPush, applyDupDrop, applyDoubleSwap,
+    applyPushPushAdd, applyPushPushSub, applyPushPushMul, applyAddZero,
+    applySubZero, applyOneAdd, applyOneSub, applyDoubleNegate,
+    applyDoubleNot, applyDoubleOver, applyDoubleDrop, applyDoubleSha256,
+    applyZeroNumEqual, applyNumEqualVerifyFuse, applyCheckSigVerifyFuse,
+    applyEqualVerifyFuse]
+
+/-- `preprocessOp` on an `.ifOp` rebuilds the node from `peepholePassAll`
+applied to each branch (the `.ifOp` arm runs the same flat-pass-after-
+forward-preprocess pipeline that `peepholePassAll` is). -/
+private theorem preprocessOp_ifOp_eq
+    (thn : List StackOp) (els : List StackOp) :
+    preprocessOp (.ifOp thn (some els))
+      = .ifOp (peepholePassAll thn) (some (peepholePassAll els)) := by
+  unfold preprocessOp peepholePassAll preprocessIfOps
+  rfl
+
+/-- `peepholePassAll` is the identity on a singleton `[.ifOp thn (some els)]`
+whose branches are each `peepholePassAll`-fixpoints. -/
+theorem peepholePassAll_singleton_ifOp_id
+    (thn els : List StackOp)
+    (hThn : peepholePassAll thn = thn)
+    (hEls : peepholePassAll els = els) :
+    peepholePassAll [.ifOp thn (some els)] = [.ifOp thn (some els)] := by
+  unfold peepholePassAll preprocessIfOps
+  show peepholePassAllFlat ((preprocessOpListReversedAux [.ifOp thn (some els)] []).reverse)
+    = [.ifOp thn (some els)]
+  have hAux : (preprocessOpListReversedAux [.ifOp thn (some els)] []).reverse
+      = [preprocessOp (.ifOp thn (some els))] := by
+    unfold preprocessOpListReversedAux preprocessOpListReversedAux
+    simp
+  rw [hAux, preprocessOp_ifOp_eq thn els, hThn, hEls]
+  exact peepholePassAllFlat_singleton_ifOp thn (some els)
+
+/-- `postFoldOp` on an `.ifOp` rebuilds the node from `peepholePostFold`
+applied to each branch. -/
+private theorem postFoldOp_ifOp_eq
+    (thn : List StackOp) (els : List StackOp) :
+    postFoldOp (.ifOp thn (some els))
+      = .ifOp (peepholePostFold thn) (some (peepholePostFold els)) := by
+  unfold postFoldOp peepholePostFold
+  rfl
+
+/-- `peepholePostFold` is the identity on a singleton `[.ifOp thn (some els)]`
+whose branches are each `peepholePostFold`-fixpoints. -/
+theorem peepholePostFold_singleton_ifOp_id
+    (thn els : List StackOp)
+    (hThn : peepholePostFold thn = thn)
+    (hEls : peepholePostFold els = els) :
+    peepholePostFold [.ifOp thn (some els)] = [.ifOp thn (some els)] := by
+  unfold peepholePostFold
+  show applyPushOneSub (applyPushOneAdd (postFoldList [.ifOp thn (some els)]))
+    = [.ifOp thn (some els)]
+  have hList : postFoldList [.ifOp thn (some els)]
+      = [.ifOp (peepholePostFold thn) (some (peepholePostFold els))] := by
+    show postFoldOp (.ifOp thn (some els)) :: postFoldList [] = _
+    rw [postFoldOp_ifOp_eq thn els]
+    rfl
+  rw [hList, hThn, hEls]
+  simp only [applyPushOneAdd, applyPushOneSub]
+
+/-- `chainFoldOp` on an `.ifOp` rebuilds the node from `peepholeChainFold`
+applied to each branch. -/
+private theorem chainFoldOp_ifOp_eq
+    (thn : List StackOp) (els : List StackOp) :
+    chainFoldOp (.ifOp thn (some els))
+      = .ifOp (peepholeChainFold thn) (some (peepholeChainFold els)) := by
+  unfold chainFoldOp peepholeChainFold
+  rfl
+
+/-- `chainFoldFixpointFlat` is the identity on a singleton `[.ifOp a b]`:
+the two 4-op chain-fold rules only fire on `.push`-led windows, so the step
+returns the input and the fixpoint stabilises immediately. -/
+private theorem chainFoldFixpointFlat_singleton_ifOp
+    (a : List StackOp) (b : Option (List StackOp)) :
+    ∀ (fuel : Nat), chainFoldFixpointFlat fuel [.ifOp a b] = [.ifOp a b] := by
+  intro fuel
+  cases fuel with
+  | zero => simp [chainFoldFixpointFlat]
+  | succ k =>
+      unfold chainFoldFixpointFlat
+      have hStep : applyPushAddPushSub (applyPushAddPushAdd [.ifOp a b])
+          = [.ifOp a b] := by
+        simp only [applyPushAddPushAdd, applyPushAddPushSub]
+      simp [hStep]
+
+/-- `peepholeChainFold` is the identity on a singleton `[.ifOp thn (some els)]`
+whose branches are each `peepholeChainFold`-fixpoints. -/
+theorem peepholeChainFold_singleton_ifOp_id
+    (thn els : List StackOp)
+    (hThn : peepholeChainFold thn = thn)
+    (hEls : peepholeChainFold els = els) :
+    peepholeChainFold [.ifOp thn (some els)] = [.ifOp thn (some els)] := by
+  unfold peepholeChainFold
+  have hList : chainFoldListTRgo [.ifOp thn (some els)] []
+      = [.ifOp (peepholeChainFold thn) (some (peepholeChainFold els))] := by
+    rw [chainFoldListTRgo, chainFoldListTRgo]
+    show ([chainFoldOp (.ifOp thn (some els))]).reverse = _
+    rw [chainFoldOp_ifOp_eq thn els]
+    rfl
+  rw [hList, hThn, hEls]
+  exact chainFoldFixpointFlat_singleton_ifOp thn (some els) 64
+
+/-- `rollPickOp` on an `.ifOp` rebuilds the node from `peepholeRollPickFold`
+applied to each branch. -/
+private theorem rollPickOp_ifOp_eq
+    (thn : List StackOp) (els : List StackOp) :
+    rollPickOp (.ifOp thn (some els))
+      = .ifOp (peepholeRollPickFold thn) (some (peepholeRollPickFold els)) := by
+  unfold rollPickOp peepholeRollPickFold
+  rfl
+
+/-- `rollPickFixpointFlat` is the identity on a singleton `[.ifOp a b]`:
+the five roll/pick rules only fire on `.roll`/`.pick` heads, so the step
+returns the input. -/
+private theorem rollPickFixpointFlat_singleton_ifOp
+    (a : List StackOp) (b : Option (List StackOp)) :
+    rollPickFixpointFlat 64 [.ifOp a b] = [.ifOp a b] := by
+  unfold rollPickFixpointFlat
+  apply applyRollPickFold_eq_self_of_flatNoop
+  intro op hOp
+  rw [List.mem_singleton] at hOp
+  subst hOp
+  exact True.intro
+
+/-- `peepholeRollPickFold` is the identity on a singleton `[.ifOp thn (some els)]`
+whose branches are each `peepholeRollPickFold`-fixpoints. -/
+theorem peepholeRollPickFold_singleton_ifOp_id
+    (thn els : List StackOp)
+    (hThn : peepholeRollPickFold thn = thn)
+    (hEls : peepholeRollPickFold els = els) :
+    peepholeRollPickFold [.ifOp thn (some els)] = [.ifOp thn (some els)] := by
+  unfold peepholeRollPickFold
+  have hList : rollPickListTRgo [.ifOp thn (some els)] []
+      = [.ifOp (peepholeRollPickFold thn) (some (peepholeRollPickFold els))] := by
+    rw [rollPickListTRgo, rollPickListTRgo]
+    show ([rollPickOp (.ifOp thn (some els))]).reverse = _
+    rw [rollPickOp_ifOp_eq thn els]
+    rfl
+  rw [hList, hThn, hEls]
+  exact rollPickFixpointFlat_singleton_ifOp thn (some els)
+
+/-! ### Wave 42 — smoke tests for the four `.ifOp` per-pass identities
+
+Each pass is the identity on `[.ifOp arithBranch1 (some arithBranch2)]`
+where both branches are concrete emittable-arith op lists (no `.push`,
+no `.ifOp`, no fusable adjacency), so each branch is a per-pass fixpoint
+discharged by the wave-38 / earlier identities. -/
+
+private def wave42IfOpBranchA : List StackOp :=
+  [.swap, .opcode "OP_ADD"]
+
+private def wave42IfOpBranchB : List StackOp :=
+  [.opcode "OP_NEGATE"]
+
+private theorem wave42_branchA_arithEmit : arithEmitNoFuse wave42IfOpBranchA = true := by
+  unfold wave42IfOpBranchA; decide
+
+private theorem wave42_branchB_arithEmit : arithEmitNoFuse wave42IfOpBranchB = true := by
+  unfold wave42IfOpBranchB; decide
+
+private theorem wave42_branchA_noIf : noIfOp wave42IfOpBranchA := by
+  unfold wave42IfOpBranchA; decide
+
+private theorem wave42_branchB_noIf : noIfOp wave42IfOpBranchB := by
+  unfold wave42IfOpBranchB; decide
+
+private theorem wave42_branchA_pushFree : pushFree wave42IfOpBranchA := by
+  unfold wave42IfOpBranchA; decide
+
+private theorem wave42_branchB_pushFree : pushFree wave42IfOpBranchB := by
+  unfold wave42IfOpBranchB; decide
+
+private theorem wave42_branchA_rpNoop : rollPickFoldFlatNoop wave42IfOpBranchA := by
+  intro op hOp; unfold wave42IfOpBranchA at hOp
+  rcases List.mem_cons.mp hOp with h | h
+  · subst h; exact True.intro
+  · rw [List.mem_singleton] at h; subst h; exact True.intro
+
+private theorem wave42_branchB_rpNoop : rollPickFoldFlatNoop wave42IfOpBranchB := by
+  intro op hOp; unfold wave42IfOpBranchB at hOp
+  rw [List.mem_singleton] at hOp; subst hOp; exact True.intro
+
+-- PassAll smoke.
+example :
+    peepholePassAll [.ifOp wave42IfOpBranchA (some wave42IfOpBranchB)]
+      = [.ifOp wave42IfOpBranchA (some wave42IfOpBranchB)] :=
+  peepholePassAll_singleton_ifOp_id wave42IfOpBranchA wave42IfOpBranchB
+    (by rw [peepholePassAll_eq_flat_of_noIfOp _ wave42_branchA_noIf];
+        exact peepholePassAllFlat_eq_self_of_arithEmit _ wave42_branchA_arithEmit)
+    (by rw [peepholePassAll_eq_flat_of_noIfOp _ wave42_branchB_noIf];
+        exact peepholePassAllFlat_eq_self_of_arithEmit _ wave42_branchB_arithEmit)
+
+-- PostFold smoke.
+example :
+    peepholePostFold [.ifOp wave42IfOpBranchA (some wave42IfOpBranchB)]
+      = [.ifOp wave42IfOpBranchA (some wave42IfOpBranchB)] :=
+  peepholePostFold_singleton_ifOp_id wave42IfOpBranchA wave42IfOpBranchB
+    (peepholePostFold_eq_self_of_arithEmit _ wave42_branchA_noIf wave42_branchA_arithEmit)
+    (peepholePostFold_eq_self_of_arithEmit _ wave42_branchB_noIf wave42_branchB_arithEmit)
+
+-- ChainFold smoke.
+example :
+    peepholeChainFold [.ifOp wave42IfOpBranchA (some wave42IfOpBranchB)]
+      = [.ifOp wave42IfOpBranchA (some wave42IfOpBranchB)] :=
+  peepholeChainFold_singleton_ifOp_id wave42IfOpBranchA wave42IfOpBranchB
+    (peepholeChainFold_eq_self_of_noIfOp_pushFree _ wave42_branchA_noIf wave42_branchA_pushFree)
+    (peepholeChainFold_eq_self_of_noIfOp_pushFree _ wave42_branchB_noIf wave42_branchB_pushFree)
+
+-- RollPickFold smoke.
+example :
+    peepholeRollPickFold [.ifOp wave42IfOpBranchA (some wave42IfOpBranchB)]
+      = [.ifOp wave42IfOpBranchA (some wave42IfOpBranchB)] :=
+  peepholeRollPickFold_singleton_ifOp_id wave42IfOpBranchA wave42IfOpBranchB
+    (peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ wave42_branchA_noIf wave42_branchA_rpNoop)
+    (peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ wave42_branchB_noIf wave42_branchB_rpNoop)
+
 end Peephole
 end RunarVerification.Stack

@@ -5387,6 +5387,331 @@ theorem wave41_loweredIfValArith_areEmittable_smoke :
     sA_clean sA_ip hCondEmit
   exact h
 
+/-! ### D (peephole-identity half) — the four-pass identity on the lowered
+`ifValArithBody`
+
+Mirror of `loweredEmittableArithNoDblNeg_opShape`'s M3 conjunct for the
+`.ifOp`-bearing lowering.  The lowered op-list collapses (clean shape) to
+`condOps ++ [.ifOp thnOps (some elsOps)]`; with an empty cond-load
+(`hCondEmpty`, supplied by the Deliverable-C cond-load derivation) the list
+IS the singleton `[.ifOp thnOps (some elsOps)]`.  Each of the four passes is
+the identity on that singleton because each branch op-list is a per-pass
+fixpoint (wave-38 arith identities) and the wave-42 `.ifOp` per-pass
+identities lift each branch fixpoint to the node. -/
+
+/-- A lowered emittable-arith branch op-list is a fixpoint of all four
+peephole passes.  All four facts are discharged from the wave-38 shape
+lemmas (`arithEmitNoFuse`, `noIfOp`, `pushFree`, `rollPickFoldFlatNoop`). -/
+theorem loweredArithBranch_peephole_fixpoints
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (constInts : List (String × Int))
+    (body : List ANFBinding) (localBindings : List String)
+    (sm : StackMap) (currentIndex : Nat) (prevWasNeg : Bool)
+    (hRef : emittableArithChainReadyNoDblNeg lastUses body sm currentIndex prevWasNeg) :
+    Peephole.peepholePassAll
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+    ∧ Peephole.peepholePostFold
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+    ∧ Peephole.peepholeChainFold
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+    ∧ Peephole.peepholeRollPickFold
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1 := by
+  have hReady : emittableArithChainReady lastUses body sm currentIndex :=
+    emittableArithChainReadyNoDblNeg_imp_ready lastUses body sm currentIndex prevWasNeg hRef
+  obtain ⟨hNoFuse, _⟩ :=
+    loweredEmittableArithNoDblNeg_arithEmitNoFuse progMethods props budget lastUses constInts
+      body localBindings sm currentIndex prevWasNeg hRef
+  obtain ⟨hNoIf, hPushFree, hRpNoop⟩ :=
+    loweredEmittableArith_m3ShapeFacts progMethods props budget lastUses constInts
+      body localBindings sm currentIndex hReady
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
+    exact Peephole.peepholePassAllFlat_eq_self_of_arithEmit _ hNoFuse
+  · exact Peephole.peepholePostFold_eq_self_of_arithEmit _ hNoIf hNoFuse
+  · exact Peephole.peepholeChainFold_eq_self_of_noIfOp_pushFree _ hNoIf hPushFree
+  · exact Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIf hRpNoop
+
+/-- **Wave 42 D (peephole-identity half) — `if_val` arith op-shape.**
+
+For an `ifValArithBody` whose cond-load `condOps` is empty (`hCondEmpty`),
+the four-pass `peepholeMethodOps` is the literal identity on the lowered
+op-list: the clean-shape collapse exposes `[] ++ [.ifOp thnOps (some elsOps)]`,
+each branch is a per-pass fixpoint (`loweredArithBranch_peephole_fixpoints`),
+and the wave-42 `.ifOp` per-pass identities lift those to the singleton. -/
+theorem loweredIfValArith_peepholeId
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (sm : StackMap) (bn cond : String) (thn els : List ANFBinding) (src : Option SourceLoc)
+    (hThnChain : emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses thn) thn
+      (ifValSmBranch sm cond currentIndex lastUses []) 0 false)
+    (hElsChain : emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses els) els
+      (ifValSmBranch sm cond currentIndex lastUses []) 0 false)
+    (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
+                [] constInts sm cond thn els)
+    (hInnerEmpty : ifValInnerProtected sm cond currentIndex lastUses [] = [])
+    (hCondEmpty : (Stack.Lower.loadRefLive sm cond currentIndex lastUses []).1 = []) :
+    Peephole.peepholeRollPickFold
+        (Peephole.peepholeChainFold
+          (Peephole.peepholePostFold
+            (Peephole.peepholePassAll
+              (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+                [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1)))
+    = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+        [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1 := by
+  -- Script bridge + clean-shape collapse, then drop the empty cond prefix.
+  have hScriptBridge :
+      (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1
+        = [StackOp.ifOp
+              (ifValThnRes progMethods props budget currentIndex lastUses
+                [] constInts sm cond thn).1
+              (some (ifValElsRes progMethods props budget currentIndex lastUses
+                [] constInts sm cond els).1)] := by
+    rw [Stack.Lower.lowerBindingsP.eq_2]
+    rcases h : Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        [] localBindings constInts sm bn (.ifVal cond thn els) with ⟨o, s, l⟩
+    simp only [Stack.Lower.lowerBindingsP, List.append_nil]
+    have hcs := lowerValueP_ifVal_clean_shape progMethods props budget currentIndex lastUses
+      [] localBindings constInts sm bn cond thn els hClean
+    rw [h] at hcs
+    simp only [hCondEmpty, List.nil_append] at hcs
+    exact hcs
+  rw [hScriptBridge]
+  -- Both branches are per-pass fixpoints (after rewriting innerProtected → []).
+  have hThnEq :
+      (ifValThnRes progMethods props budget currentIndex lastUses [] constInts sm cond thn).1
+      = (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses thn)
+          [] (List.map (fun b => b.name) thn) constInts
+          (ifValSmBranch sm cond currentIndex lastUses []) thn).1 := by
+    show (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses thn)
+        (ifValInnerProtected sm cond currentIndex lastUses [])
+        (List.map (fun b => b.name) thn) constInts
+        (ifValSmBranch sm cond currentIndex lastUses []) thn).1 = _
+    rw [hInnerEmpty]
+  have hElsEq :
+      (ifValElsRes progMethods props budget currentIndex lastUses [] constInts sm cond els).1
+      = (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses els)
+          [] (List.map (fun b => b.name) els) constInts
+          (ifValSmBranch sm cond currentIndex lastUses []) els).1 := by
+    show (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses els)
+        (ifValInnerProtected sm cond currentIndex lastUses [])
+        (List.map (fun b => b.name) els) constInts
+        (ifValSmBranch sm cond currentIndex lastUses []) els).1 = _
+    rw [hInnerEmpty]
+  obtain ⟨hThnPassAll, hThnPostFold, hThnChainF, hThnRollP⟩ :=
+    loweredArithBranch_peephole_fixpoints progMethods props budget
+      (Stack.Lower.computeLastUses thn) constInts thn (List.map (fun b => b.name) thn)
+      (ifValSmBranch sm cond currentIndex lastUses []) 0 false hThnChain
+  obtain ⟨hElsPassAll, hElsPostFold, hElsChainF, hElsRollP⟩ :=
+    loweredArithBranch_peephole_fixpoints progMethods props budget
+      (Stack.Lower.computeLastUses els) constInts els (List.map (fun b => b.name) els)
+      (ifValSmBranch sm cond currentIndex lastUses []) 0 false hElsChain
+  rw [hThnEq, hElsEq]
+  -- Apply the four-pass composition inside-out via the wave-42 `.ifOp` identities.
+  rw [Peephole.peepholePassAll_singleton_ifOp_id _ _ hThnPassAll hElsPassAll]
+  rw [Peephole.peepholePostFold_singleton_ifOp_id _ _ hThnPostFold hElsPostFold]
+  rw [Peephole.peepholeChainFold_singleton_ifOp_id _ _ hThnChainF hElsChainF]
+  rw [Peephole.peepholeRollPickFold_singleton_ifOp_id _ _ hThnRollP hElsRollP]
+
+/-- **Wave 42 D — full `if_val` arith op-shape (both conjuncts).**
+
+Combines the wave-41 emittability half (`loweredIfValArith_areEmittable`)
+with the wave-42 peephole-identity half (`loweredIfValArith_peepholeId`)
+into the `.ifOp`-bearing analogue of `loweredEmittableArithNoDblNeg_opShape`:
+the lowered op-list is `AreRunarEmittableWithIf` AND `peepholeMethodOps` is
+the literal identity on it — unconditional for the fragment (modulo the
+`hCondEmpty` / `hInnerEmpty` derivations supplied by Deliverable C). -/
+theorem loweredIfValArith_opShape
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (sm : StackMap) (bn cond : String) (thn els : List ANFBinding) (src : Option SourceLoc)
+    (hThnChain : emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses thn) thn
+      (ifValSmBranch sm cond currentIndex lastUses []) 0 false)
+    (hElsChain : emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses els) els
+      (ifValSmBranch sm cond currentIndex lastUses []) 0 false)
+    (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
+                [] constInts sm cond thn els)
+    (hInnerEmpty : ifValInnerProtected sm cond currentIndex lastUses [] = [])
+    (hCondEmpty : (Stack.Lower.loadRefLive sm cond currentIndex lastUses []).1 = []) :
+    RunarVerification.Script.Parse.AreRunarEmittableWithIf
+      (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+        [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1
+    ∧ Peephole.peepholeRollPickFold
+        (Peephole.peepholeChainFold
+          (Peephole.peepholePostFold
+            (Peephole.peepholePassAll
+              (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+                [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1)))
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1 := by
+  have hCondEmit : RunarVerification.Script.Parse.AreRunarEmittableWithIf
+      (Stack.Lower.loadRefLive sm cond currentIndex lastUses []).1 := by
+    rw [hCondEmpty]; exact RunarVerification.Script.Parse.AreRunarEmittableWithIf.nil
+  exact ⟨loweredIfValArith_areEmittable progMethods props budget currentIndex lastUses
+      localBindings constInts sm bn cond thn els src hThnChain hElsChain hClean hInnerEmpty hCondEmit,
+    loweredIfValArith_peepholeId progMethods props budget currentIndex lastUses
+      localBindings constInts sm bn cond thn els src hThnChain hElsChain hClean hInnerEmpty hCondEmpty⟩
+
+/-- **Wave 42 D smoke — the full `if_val` op-shape fires (both conjuncts).**
+Instantiated on the concrete `sA_body`: the lowered op-list is
+`AreRunarEmittableWithIf` and `peepholeMethodOps` is the identity on it. -/
+theorem wave42_loweredIfValArith_opShape_smoke :
+    RunarVerification.Script.Parse.AreRunarEmittableWithIf
+      (Stack.Lower.lowerBindingsP [] [] 8 0 sA_lu []
+        (List.map (fun b => b.name) sA_body) [] sA_sm sA_body).1
+    ∧ Peephole.peepholeRollPickFold
+        (Peephole.peepholeChainFold
+          (Peephole.peepholePostFold
+            (Peephole.peepholePassAll
+              (Stack.Lower.lowerBindingsP [] [] 8 0 sA_lu []
+                (List.map (fun b => b.name) sA_body) [] sA_sm sA_body).1)))
+      = (Stack.Lower.lowerBindingsP [] [] 8 0 sA_lu []
+          (List.map (fun b => b.name) sA_body) [] sA_sm sA_body).1 := by
+  have hCondEmpty : (Stack.Lower.loadRefLive sA_sm "c" 0 sA_lu []).1 = [] := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop sA_sm sA_lu sA_body sA_thn sA_els
+    decide
+  exact loweredIfValArith_opShape [] [] 8 0 sA_lu
+    (List.map (fun b => b.name) sA_body) [] sA_sm "r" "c" sA_thn sA_els none
+    (by rw [sA_smBranch]; unfold sA_thn; decide)
+    (by rw [sA_smBranch]; unfold sA_els; decide)
+    sA_clean sA_ip hCondEmpty
+
+/-! ### C — method-level `condOps` / `ifValInnerProtected` derivation
+
+The wave-41 / wave-42 op-shape lemmas take `hInnerEmpty` and `hCondEmpty`
+as hypotheses.  For the retirement these are DERIVED from the fragment +
+single-public-method entry:
+
+* `hCondEmpty` — the `if_val` condition is the **head** slot (`sm.depth?
+  cond = some 0`) and its last use is the if itself (`isLastUse` at
+  `currentIndex`); the consume path of `bringToTop` at depth 0 emits `[]`.
+* `hInnerEmpty` — the branches are self-contained: no ref in the branch
+  stackmap is alive after the if (`isLastUse … = true` for every entry),
+  and the parent-protected set is empty (top-level entry), so
+  `computeBranchProtected` never appends and stays `[]`. -/
+
+/-- **Wave 42 C — empty cond-load derivation.**  When the cond is the head
+slot and its last use is the if, `loadRefLive` (consume at depth 0) emits no
+ops.  This supplies `hCondEmpty` for `loweredIfValArith_opShape`. -/
+theorem ifValCondLoad_empty
+    (sm : StackMap) (cond : String) (currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (hHead : sm.depth? cond = some 0)
+    (hLast : Stack.Lower.isLastUse lastUses cond currentIndex = true) :
+    (Stack.Lower.loadRefLive sm cond currentIndex lastUses []).1 = [] := by
+  unfold Stack.Lower.loadRefLive
+  have hConsume : (!Stack.Lower.listContains [] cond
+      && Stack.Lower.isLastUse lastUses cond currentIndex) = true := by
+    simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and, hLast]
+  rw [hConsume]
+  unfold Stack.Lower.bringToTop
+  rw [hHead]
+  simp only [if_true]
+
+/-- `computeBranchProtected smBranch lastUses currentIndex []` is `[]` when no
+entry is alive after `currentIndex` (every entry's `isLastUse` is `true`) and
+the parent-protected set is empty.  The foldl accumulator never grows: at the
+empty initial accumulator each step's `aliveAfter` and `parentProtected` are
+both false, so the `acc ++ [ref]` arm is never taken. -/
+private theorem computeBranchProtected_nil_of_allLastUse
+    (smBranch : List String) (lastUses : List (String × Nat)) (currentIndex : Nat)
+    (hAll : ∀ ref ∈ smBranch, Stack.Lower.isLastUse lastUses ref currentIndex = true) :
+    Stack.Lower.computeBranchProtected smBranch lastUses currentIndex [] = [] := by
+  unfold Stack.Lower.computeBranchProtected
+  -- The accumulator stays `[]`: prove the foldl-invariant `acc = []`.
+  suffices h : ∀ (acc : List String), acc = [] →
+      List.foldl
+        (fun acc ref =>
+          if Stack.Lower.listContains acc ref then acc
+          else
+            let aliveAfter :=
+              match Stack.Lower.lastUsesLookup lastUses ref with
+              | some idx => decide (idx > currentIndex)
+              | none => false
+            let parentProtected := Stack.Lower.listContains [] ref
+            if aliveAfter || parentProtected then acc ++ [ref] else acc)
+        acc smBranch = [] by
+    exact h [] rfl
+  induction smBranch with
+  | nil => intro acc hacc; simp [hacc]
+  | cons hd rest ih =>
+      intro acc hacc
+      subst hacc
+      have hHd : Stack.Lower.isLastUse lastUses hd currentIndex = true :=
+        hAll hd (List.mem_cons_self)
+      have hAlive :
+          (match Stack.Lower.lastUsesLookup lastUses hd with
+           | some idx => decide (idx > currentIndex)
+           | none => false) = false := by
+        unfold Stack.Lower.isLastUse at hHd
+        cases hLk : Stack.Lower.lastUsesLookup lastUses hd with
+        | none => rfl
+        | some last =>
+            rw [hLk] at hHd
+            simp only [decide_eq_true_eq] at hHd
+            simp only [decide_eq_false_iff_not, Nat.not_lt]
+            exact hHd
+      simp only [List.foldl_cons, Stack.Lower.listContains, List.any_nil,
+        Bool.false_eq_true, if_false, hAlive, Bool.or_self, if_false]
+      exact ih (fun ref hRef => hAll ref (List.mem_cons_of_mem hd hRef)) [] rfl
+
+/-- **Wave 42 C — empty `ifValInnerProtected` derivation.**  Self-contained
+branches (no branch-stackmap entry alive after the if) at a top-level entry
+(`outerProtected = []`) yield an empty protected set.  This supplies
+`hInnerEmpty` for `loweredIfValArith_opShape`. -/
+theorem ifValInnerProtected_empty
+    (sm : StackMap) (cond : String) (currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (hAll : ∀ ref ∈ ifValSmBranch sm cond currentIndex lastUses [],
+      Stack.Lower.isLastUse lastUses ref currentIndex = true) :
+    ifValInnerProtected sm cond currentIndex lastUses [] = [] := by
+  unfold ifValInnerProtected
+  exact computeBranchProtected_nil_of_allLastUse
+    (ifValSmBranch sm cond currentIndex lastUses []) lastUses currentIndex hAll
+
+/-! ### Wave 42 C smoke — the derivations fire on the concrete `sA_*` method.
+
+The single-public if-cond method `sA_body` has cond `"c"` at the head slot
+(`sA_sm = ["c", "p0", "p1", "p2"]`) with its last use at index 0, so the
+cond-load is `[]`; and every branch-stackmap entry's last use is ≤ 0, so the
+inner-protected set is `[]`. -/
+
+private theorem sA_cond_head : sA_sm.depth? "c" = some 0 := by
+  unfold sA_sm; decide
+
+private theorem sA_cond_lastUse :
+    Stack.Lower.isLastUse sA_lu "c" 0 = true := by
+  unfold sA_lu sA_body sA_thn sA_els
+  decide
+
+example : (Stack.Lower.loadRefLive sA_sm "c" 0 sA_lu []).1 = [] :=
+  ifValCondLoad_empty sA_sm "c" 0 sA_lu sA_cond_head sA_cond_lastUse
+
+example : ifValInnerProtected sA_sm "c" 0 sA_lu [] = [] := by
+  apply ifValInnerProtected_empty
+  rw [sA_smBranch]
+  intro ref hRef
+  unfold sA_lu sA_body sA_thn sA_els
+  rcases List.mem_cons.mp hRef with h | h
+  · subst h; decide
+  rcases List.mem_cons.mp h with h | h
+  · subst h; decide
+  · rw [List.mem_singleton] at h; subst h; decide
+
 end -- attribute [local irreducible] section
 
 end Agrees
