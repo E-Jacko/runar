@@ -1,10 +1,12 @@
 import RunarVerification.ANF.Syntax
 import RunarVerification.ANF.Eval
+import RunarVerification.ANF.WellTyped
 import RunarVerification.Stack.Syntax
 import RunarVerification.Stack.Eval
 import RunarVerification.Stack.Lower
 import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
+import RunarVerification.Stack.AgreesA3
 
 /-!
 # Stack IR — A4 structural-call wrapper (narrowed)
@@ -4049,6 +4051,904 @@ theorem runMethod_num2bin_singleton_d0d1_isSome
   simp [Except.toOption]
 
 end MathByteWaveEightWrappers
+
+/-! ## A4 wave 47 — the single-arg math_byte call walk (M2)
+
+The analogue of the arith consume walk
+(`RunarVerification.Stack.Agrees.successAgrees_arith_consume_unconditional`)
+for the single-arg math_byte builtin fragment
+(`abs`, `len`, `bin2num`, `toByteString`).  Unlike the arith chain — which
+runs each operand at **last-use** (consume) so the stack shrinks — the
+math_byte call fragment runs each argument in **copy mode** at depth 0
+(`loadRef = [.dup]`), so each binding PUSHES its result on top while the
+argument stays below.  The threaded tagged map therefore GROWS by
+prepending `(bn, .binding)` each step (`agreesTagged_push_value` shape),
+which is the post-tsm the stage-C call witnesses
+(`stageC_simpleStep_call_<builtin>_d0`) already produce.
+
+### Divergence audit (the arith bool lesson)
+
+For each of the four single-arg builtins we checked whether the ANF
+evaluator (`ANF.Eval.callBuiltin?`) and the Script VM
+(`Stack.Eval.runOpcode`) AGREE on success/failure for every argument tag:
+
+* `len`  (`OP_SIZE` then `OP_NIP`) and `bin2num` (`OP_BIN2NUM`): both
+  sides gate on `asBytes?` (accepts `.vBytes` / `.vOpaque`, rejects
+  `.vBigint` / `.vBool` / `.vThis`).  **AGREE on every tag.**
+* `abs`  (`OP_ABS`): Script's `liftIntUnary` uses `asInt?`, which COERCES
+  `.vBool` to `0/1` and SUCCEEDS; the ANF `abs` arm matches only
+  `[.vBigint i]` and ERRORS on `.vBool`.  **DIVERGES on `.vBool`** — the
+  exact bool-coercion divergence that blocked the arith retirement.
+* `toByteString`: Script lowers to a bare `loadRef` (a copy, no opcode),
+  so it SUCCEEDS for ANY argument tag; the ANF `toByteString` arm uses
+  `asBytes?` and ERRORS on `.vBigint` / `.vBool`.  **DIVERGES on every
+  non-bytes tag.**
+
+The fragment is therefore restricted to the WELL-TYPED slice: each
+argument is provably the type the builtin expects (`.vBytes` for
+`len` / `bin2num` / `toByteString`, `.vBigint` for `abs`), supplied by the
+wave-46 type-fidelity substrate (`EntryBytesTyped` / `EntryBigintTyped`).
+On that slice the divergent wrong-type cases are UNREACHABLE — the
+failure leg is `False ↔ False` and never fires — exactly as the arith
+walk made the bool operand unreachable via its all-bigint invariant.
+-/
+
+section MathByteSingleArgWalk
+
+open RunarVerification.Stack.Agrees
+
+/-- The four single-arg math_byte builtins this walk discharges.  This is
+the `isStructuralCallFunc` allowlist MINUS `pack` (no stage-C Script
+witness exists for `pack`). -/
+def mathByteSingleFunc (func : String) : Bool :=
+  func == "abs" || func == "len" || func == "bin2num" || func == "toByteString"
+
+/-- A bytes-input builtin (consumes `.vBytes`). -/
+def mathByteBytesInput (func : String) : Bool :=
+  func == "len" || func == "bin2num" || func == "toByteString"
+
+/-- The post-binding ANF value a single-arg math_byte call produces, given
+the builtin and the resolved argument value.  Matches the stage-C
+witnesses' result values exactly: `abs (.vBigint i) → .vBigint i.natAbs`,
+`len (.vBytes b) → .vBigint b.size`,
+`bin2num (.vBytes b) → .vBigint (decodeMinimalLE b)`,
+`toByteString (.vBytes b) → .vBytes b`.  The off-fragment fall-through is
+never reached on the well-typed slice. -/
+def mathByteResult (func : String) (av : Value) : Value :=
+  match func, av with
+  | "abs", .vBigint i => .vBigint i.natAbs
+  | "len", .vBytes b => .vBigint b.size
+  | "bin2num", .vBytes b => .vBigint (RunarVerification.Stack.decodeMinimalLE b)
+  | "toByteString", .vBytes b => .vBytes b
+  | _, _ => .vBool false
+
+/-- The argument value (resolved by `lookupAnfByKind` at the head slot) is
+of the builtin's expected input tag: `.vBytes` for the three bytes-input
+builtins, `.vBigint` for `abs`.  Returned existentially as the explicit
+argument value `av` the per-call step transports. -/
+def mathByteArgIs (anfSt : State) (func : String)
+    (s : String × SlotKind) (av : Value) : Prop :=
+  lookupAnfByKind anfSt s = some av ∧
+  (if mathByteBytesInput func = true then
+      ∃ b : ByteArray, av = .vBytes b
+   else
+      ∃ i : Int, av = .vBigint i)
+
+/-- A body in the single-arg math_byte fragment: every binding is a
+`.call func [arg]` with `func` in the four-builtin allowlist, the argument
+read in copy mode at depth 0 (`loadRef = [.dup]`), the head slot of the
+threaded tagged map carrying the builtin's expected input value, and `bn`
+fresh.  The map is threaded by PREPENDING the new `(bn, .binding)` slot
+each step (the copy-mode push discipline); `anfSt` is threaded by
+`addBinding` so each per-binding type fact is stated against the live
+state.  The argument value `av` and result `mathByteResult func av` are
+existentially pinned at each binding. -/
+def mathByteSingleArgBody :
+    List ANFBinding → TaggedStackMap → State → Prop
+  | [], _tsm, _anfSt => True
+  | (.mk bn v _) :: rest, tsm, anfSt =>
+      ∃ (func arg : String) (s : String × SlotKind)
+        (tsm_rest : TaggedStackMap) (av : Value),
+        v = .call func [arg] ∧
+        mathByteSingleFunc func = true ∧
+        tsm = s :: tsm_rest ∧
+        s.fst = arg ∧
+        mathByteArgIs anfSt func s av ∧
+        freshIn bn (untagSm (s :: tsm_rest)) ∧
+        mathByteSingleArgBody rest ((bn, .binding) :: s :: tsm_rest)
+          (anfSt.addBinding bn (mathByteResult func av))
+
+/-- The copy-mode depth-0 load shape is UNCONDITIONAL when the argument is
+the head slot of the tagged map: `findIdx?` returns the first match, so the
+head name sits at depth 0 regardless of any deeper shadowing.  This is what
+lets the per-call step discharge the stage-C `hLoadRefShape` premise
+without carrying it in the fragment. -/
+theorem loadRef_head_eq_dup
+    (s : String × SlotKind) (tsm_rest : TaggedStackMap) :
+    loadRef (untagSm (s :: tsm_rest)) s.fst = [.dup] := by
+  have hDepth : (untagSm (s :: tsm_rest)).depth? s.fst = some 0 := by
+    show (s.fst :: untagSm tsm_rest).findIdx? (· == s.fst) = some 0
+    rw [List.findIdx?_cons]
+    simp only [beq_self_eq_true, if_pos]
+  unfold loadRef
+  rw [hDepth]
+
+/-! ### Deliverable A — the purely-structural skeleton + decidable Bool
+
+`mathByteSingleArgBody` mixes the (decidable) structural shape with the
+(non-decidable) runtime-value typing `mathByteArgIs`.  Mirroring the arith
+split — where `emittableArithChainReady` is the decidable structural
+predicate and `EntryBigintTyped` supplies the typing — we factor the
+decidable half here.  The typing half is DERIVED in the deliverable walk
+(C) from the wave-46 entry-typing substrate. -/
+
+/-- The decidable structural skeleton of the single-arg math_byte fragment:
+every binding is `.call func [arg]` with `func` in the four-builtin
+allowlist and `arg` the head-slot name of the threaded tagged map (so it
+loads in copy mode at depth 0).  The map is threaded by prepending
+`(bn, .binding)` each step.  No runtime-value typing — that lives in
+`mathByteSingleArgBody`. -/
+def mathByteSingleArgShapeBool :
+    List ANFBinding → TaggedStackMap → Bool
+  | [], _tsm => true
+  | (.mk bn v _) :: rest, tsm =>
+      match v, tsm with
+      | .call func [arg], s :: tsm_rest =>
+          mathByteSingleFunc func && (s.fst == arg) &&
+          mathByteSingleArgShapeBool rest ((bn, .binding) :: s :: tsm_rest)
+      | _, _ => false
+
+/-- The `Prop` form of the structural skeleton (for the soundness link). -/
+def mathByteSingleArgShape :
+    List ANFBinding → TaggedStackMap → Prop
+  | [], _tsm => True
+  | (.mk bn v _) :: rest, tsm =>
+      ∃ (func arg : String) (s : String × SlotKind) (tsm_rest : TaggedStackMap),
+        v = .call func [arg] ∧
+        mathByteSingleFunc func = true ∧
+        tsm = s :: tsm_rest ∧
+        s.fst = arg ∧
+        mathByteSingleArgShape rest ((bn, .binding) :: s :: tsm_rest)
+
+/-- For a non-`.call`-with-single-arg head value, both the Bool checker and
+the Prop skeleton are false, so the iff holds vacuously.  Used to discharge
+every non-fragment head shape uniformly. -/
+private theorem mathByteShape_false_of_notSingleCall
+    (bn : String) (v : ANFValue) (src : Option RunarVerification.ANF.SourceLoc)
+    (rest : List ANFBinding) (tsm : TaggedStackMap)
+    (hBool : mathByteSingleArgShapeBool (.mk bn v src :: rest) tsm = false)
+    (hNoCall : ∀ (func arg : String), v ≠ .call func [arg]) :
+    (mathByteSingleArgShapeBool (.mk bn v src :: rest) tsm = true ↔
+      mathByteSingleArgShape (.mk bn v src :: rest) tsm) := by
+  rw [hBool]
+  simp only [false_iff, Bool.false_eq_true, not_false_iff]
+  intro hShape
+  obtain ⟨func, arg, s, tsm_rest, hVeq, _, _, _, _⟩ := hShape
+  exact hNoCall func arg hVeq
+
+/-- **Deliverable A — decidable Bool ↔ Prop for the structural skeleton.** -/
+theorem mathByteSingleArgShapeBool_iff :
+    ∀ (body : List ANFBinding) (tsm : TaggedStackMap),
+      mathByteSingleArgShapeBool body tsm = true ↔
+      mathByteSingleArgShape body tsm := by
+  intro body
+  induction body with
+  | nil =>
+      intro tsm
+      simp only [mathByteSingleArgShapeBool, mathByteSingleArgShape]
+  | cons hd rest ih =>
+      intro tsm
+      obtain ⟨bn, v, src⟩ := hd
+      match hv : v with
+      | .call func args =>
+          match hargs : args with
+          | [arg] =>
+              cases tsm with
+              | nil =>
+                  simp only [mathByteSingleArgShapeBool, mathByteSingleArgShape, reduceCtorEq,
+                    false_iff, Bool.false_eq_true, not_false_iff]
+                  rintro ⟨_, _, _, _, _, _, hEq, _⟩
+                  exact absurd hEq (by simp)
+              | cons s tsm_rest =>
+                  simp only [mathByteSingleArgShapeBool, mathByteSingleArgShape,
+                    Bool.and_eq_true, beq_iff_eq]
+                  constructor
+                  · rintro ⟨⟨hFunc, hHd⟩, hRest⟩
+                    exact ⟨func, arg, s, tsm_rest, rfl, hFunc, rfl, hHd,
+                      (ih ((bn, .binding) :: s :: tsm_rest)).mp hRest⟩
+                  · rintro ⟨func', arg', s', tsm_rest', hVeq, hFunc, hTeq, hHd, hRest⟩
+                    have hFe : func' = func := by
+                      simp only [ANFValue.call.injEq, List.cons.injEq] at hVeq; exact hVeq.1.symm
+                    have hAe : arg' = arg := by
+                      simp only [ANFValue.call.injEq, List.cons.injEq] at hVeq; exact hVeq.2.1.symm
+                    have hSe : s' = s := by
+                      simp only [List.cons.injEq] at hTeq; exact hTeq.1.symm
+                    have hTre : tsm_rest' = tsm_rest := by
+                      simp only [List.cons.injEq] at hTeq; exact hTeq.2.symm
+                    refine ⟨⟨hFe ▸ hFunc, ?_⟩, ?_⟩
+                    · rw [← hSe, ← hAe]; exact hHd
+                    · rw [← hSe, ← hTre]
+                      exact (ih ((bn, .binding) :: s' :: tsm_rest')).mpr hRest
+          | [] =>
+              apply mathByteShape_false_of_notSingleCall bn (.call func []) src rest tsm
+              · cases tsm <;> simp [mathByteSingleArgShapeBool]
+              · intro f a hEq; simp only [ANFValue.call.injEq] at hEq; exact absurd hEq.2 (by simp)
+          | a0 :: a1 :: aRest =>
+              apply mathByteShape_false_of_notSingleCall bn (.call func (a0 :: a1 :: aRest)) src
+                rest tsm
+              · cases tsm <;> simp [mathByteSingleArgShapeBool]
+              · intro f a hEq; simp only [ANFValue.call.injEq] at hEq; exact absurd hEq.2 (by simp)
+      | .loadParam n =>
+          apply mathByteShape_false_of_notSingleCall bn (.loadParam n) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .loadProp n =>
+          apply mathByteShape_false_of_notSingleCall bn (.loadProp n) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .loadConst c =>
+          apply mathByteShape_false_of_notSingleCall bn (.loadConst c) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .binOp op l r rt =>
+          apply mathByteShape_false_of_notSingleCall bn (.binOp op l r rt) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .unaryOp op o rt =>
+          apply mathByteShape_false_of_notSingleCall bn (.unaryOp op o rt) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .methodCall o me ar =>
+          apply mathByteShape_false_of_notSingleCall bn (.methodCall o me ar) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .ifVal c t e =>
+          apply mathByteShape_false_of_notSingleCall bn (.ifVal c t e) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .loop c b iv =>
+          apply mathByteShape_false_of_notSingleCall bn (.loop c b iv) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .assert r =>
+          apply mathByteShape_false_of_notSingleCall bn (.assert r) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .updateProp n r =>
+          apply mathByteShape_false_of_notSingleCall bn (.updateProp n r) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .getStateScript =>
+          apply mathByteShape_false_of_notSingleCall bn .getStateScript src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .checkPreimage p =>
+          apply mathByteShape_false_of_notSingleCall bn (.checkPreimage p) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .deserializeState p =>
+          apply mathByteShape_false_of_notSingleCall bn (.deserializeState p) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .addOutput s sv pre =>
+          apply mathByteShape_false_of_notSingleCall bn (.addOutput s sv pre) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .addRawOutput s sb =>
+          apply mathByteShape_false_of_notSingleCall bn (.addRawOutput s sb) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .addDataOutput s sb =>
+          apply mathByteShape_false_of_notSingleCall bn (.addDataOutput s sb) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .arrayLiteral es =>
+          apply mathByteShape_false_of_notSingleCall bn (.arrayLiteral es) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+      | .rawScript b ia oa =>
+          apply mathByteShape_false_of_notSingleCall bn (.rawScript b ia oa) src rest tsm
+          · cases tsm <;> simp [mathByteSingleArgShapeBool]
+          · intro f a hEq; exact absurd hEq (by simp)
+
+/-- The full typed fragment refines the structural skeleton: dropping the
+runtime-value typing field leaves exactly `mathByteSingleArgShape`. -/
+theorem mathByteSingleArgShape_of_body :
+    ∀ (body : List ANFBinding) (tsm : TaggedStackMap) (anfSt : State),
+      mathByteSingleArgBody body tsm anfSt →
+      mathByteSingleArgShape body tsm := by
+  intro body
+  induction body with
+  | nil => intro tsm anfSt _; exact True.intro
+  | cons hd rest ih =>
+      intro tsm anfSt h
+      obtain ⟨bn, v, src⟩ := hd
+      obtain ⟨func, arg, s, tsm_rest, av, hVeq, hFunc, hTeq, hHd, _hArg, _hFresh, hRest⟩ := h
+      exact ⟨func, arg, s, tsm_rest, hVeq, hFunc, hTeq, hHd,
+        ih ((bn, .binding) :: s :: tsm_rest) _ hRest⟩
+
+instance (body : List ANFBinding) (tsm : TaggedStackMap) :
+    Decidable (mathByteSingleArgShape body tsm) :=
+  decidable_of_iff (mathByteSingleArgShapeBool body tsm = true)
+    (mathByteSingleArgShapeBool_iff body tsm)
+
+/-! ### Deliverable A — MANDATORY smoke
+
+A concrete structural skeleton: `t0 = toByteString(s0); t1 = len(t0)` over
+a tagged map whose head is `s0` at depth 0; the second call's argument `t0`
+is the prior binding (re-headed at depth 0 by the push discipline).  The
+Bool checker decides `true`, and the iff lifts it to the `Prop` skeleton —
+no hand-supplied per-binding shape facts. -/
+
+/-- Smoke skeleton body: a 2-binding single-arg call chain. -/
+def smokeShapeBody : List ANFBinding :=
+  [ANFBinding.mk "t0" (.call "toByteString" ["s0"]) none,
+   ANFBinding.mk "t1" (.call "len" ["t0"]) none]
+
+/-- Smoke skeleton entry map: `s0` at depth 0 (one param slot). -/
+def smokeShapeTsm : TaggedStackMap := [("s0", .param)]
+
+/-- The Bool checker accepts the smoke skeleton. -/
+theorem smoke_shapeBool_true :
+    mathByteSingleArgShapeBool smokeShapeBody smokeShapeTsm = true := by
+  decide
+
+/-- **Deliverable A smoke — the structural skeleton holds via the iff.** -/
+theorem smoke_shape :
+    mathByteSingleArgShape smokeShapeBody smokeShapeTsm :=
+  (mathByteSingleArgShapeBool_iff smokeShapeBody smokeShapeTsm).mp smoke_shapeBool_true
+
+/-- Anti-vacuity: a non-call binding is REJECTED by the skeleton checker. -/
+theorem smoke_shape_rejects_binOp :
+    mathByteSingleArgShapeBool
+      [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none] [("p0", .param), ("p1", .param)]
+      = false := by
+  decide
+
+/-! ### Deliverable B — the per-call lockstep step (success)
+
+The analogue of the arith per-binding success step
+(`RunarVerification.Stack.Agrees.agrees_success_step_unary`) for a single-arg
+math_byte call.  Under `agreesTagged`, head correspondence, the head-slot
+right-type fact, and freshness, BOTH:
+
+* the ANF `evalBindings` advances by exactly one binding to the post-state
+  carrying `bn ↦ mathByteResult func av`; and
+* the Script `runOps` of the lowered chunk advances to `push result`,
+
+so the PRE-state success iff transports to the POST-state iff, and
+`agreesTagged` is re-established at the post (push) state.  No
+wrong-type / failure leg is needed: on the well-typed fragment the head
+slot is provably of the builtin's input tag (the divergent bool /
+non-bytes cases are unreachable), exactly as the arith walk's all-bigint
+invariant made its bool case unreachable.
+
+#### ANF cons-step (one binding) -/
+
+/-- The ANF evaluator advances one single-arg math_byte call binding,
+provided the argument resolves with the builtin's expected tag.  Local
+sibling of `evalBindings_unary_bigint_cons_step` — proved via the A4
+`evalValue_structuralCallValue_ok` ANF-success lemma. -/
+theorem evalBindings_mathByteCall_cons_step
+    (anfSt : State) (bn func arg : String)
+    (src : Option RunarVerification.ANF.SourceLoc)
+    (av : Value) (rest : List ANFBinding)
+    (hFunc : mathByteSingleFunc func = true)
+    (hRes : anfSt.resolveRef arg = some av)
+    (hTy : if mathByteBytesInput func = true then ∃ b : ByteArray, av = .vBytes b
+           else ∃ i : Int, av = .vBigint i) :
+    RunarVerification.ANF.Eval.evalBindings anfSt (.mk bn (.call func [arg]) src :: rest)
+      = RunarVerification.ANF.Eval.evalBindings
+          (anfSt.addBinding bn (mathByteResult func av)) rest := by
+  -- The structural-call value predicate holds vacuously enough for the
+  -- ANF-success lemma: we only need its `func`/single-arg shape and the
+  -- `argShapeOk` premise.  Build both directly.
+  have hStructFunc : isStructuralCallFunc func = true := by
+    unfold mathByteSingleFunc at hFunc
+    unfold isStructuralCallFunc
+    rcases (by
+      rcases Bool.or_eq_true _ _ |>.mp hFunc with h | h
+      · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+        · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+          · exact Or.inl h
+          · exact Or.inr (Or.inl h)
+        · exact Or.inr (Or.inr (Or.inl h))
+      · exact Or.inr (Or.inr (Or.inr h))
+      : (func == "abs") = true ∨ (func == "len") = true ∨
+          (func == "bin2num") = true ∨ (func == "toByteString") = true) with h | h | h | h
+    · rw [h]; rfl
+    · rw [h]; simp
+    · rw [h]; simp
+    · rw [h]; simp
+  -- `evalValue` succeeds on the call with the resolved arg.
+  have hEval : ∃ val, RunarVerification.ANF.Eval.evalValue anfSt (.call func [arg])
+      = .ok (val, anfSt) ∧ val = mathByteResult func av := by
+    have hStructFuncCases := structuralCallFunc_cases hStructFunc
+    rcases hStructFuncCases with hF | hF | hF | hF | hF
+    · -- abs : bigint
+      subst hF
+      have hBig : ∃ i : Int, av = .vBigint i := by
+        simpa only [mathByteBytesInput, show ("abs" == "len") = false from rfl,
+          show ("abs" == "bin2num") = false from rfl,
+          show ("abs" == "toByteString") = false from rfl, Bool.or_self, Bool.false_eq_true,
+          if_false] using hTy
+      obtain ⟨i, hi⟩ := hBig; subst hi
+      have hArgs := args_mapM_lookupRef_single anfSt arg (.vBigint i) hRes
+      refine ⟨.vBigint i.natAbs, ?_, rfl⟩
+      simp [RunarVerification.ANF.Eval.evalValue, hArgs,
+        RunarVerification.ANF.Eval.callBuiltin?, Bind.bind, pure, Except.bind, Except.pure]
+    · -- len : bytes
+      subst hF
+      have hBytes : ∃ b : ByteArray, av = .vBytes b := by
+        simpa only [mathByteBytesInput, show ("len" == "len") = true from rfl, Bool.true_or,
+          if_true] using hTy
+      obtain ⟨b, hb⟩ := hBytes; subst hb
+      have hArgs := args_mapM_lookupRef_single anfSt arg (.vBytes b) hRes
+      have hCall : RunarVerification.ANF.Eval.callBuiltin? "len" [.vBytes b]
+          = .ok (some (.vBigint b.size)) := by
+        simp [RunarVerification.ANF.Eval.callBuiltin?]; rfl
+      refine ⟨.vBigint b.size, ?_, rfl⟩
+      simp [RunarVerification.ANF.Eval.evalValue, hArgs, hCall,
+        Bind.bind, pure, Except.bind, Except.pure]
+    · -- bin2num : bytes
+      subst hF
+      have hBytes : ∃ b : ByteArray, av = .vBytes b := by
+        simpa only [mathByteBytesInput, show ("bin2num" == "len") = false from rfl,
+          show ("bin2num" == "bin2num") = true from rfl, Bool.or_true, if_true] using hTy
+      obtain ⟨b, hb⟩ := hBytes; subst hb
+      have hArgs := args_mapM_lookupRef_single anfSt arg (.vBytes b) hRes
+      have hCall : RunarVerification.ANF.Eval.callBuiltin? "bin2num" [.vBytes b]
+          = .ok (some (.vBigint (RunarVerification.Stack.decodeMinimalLE b))) := by
+        simp [RunarVerification.ANF.Eval.callBuiltin?]; rfl
+      refine ⟨.vBigint (RunarVerification.Stack.decodeMinimalLE b), ?_, rfl⟩
+      simp [RunarVerification.ANF.Eval.evalValue, hArgs, hCall,
+        Bind.bind, pure, Except.bind, Except.pure]
+    · -- toByteString : bytes
+      subst hF
+      have hBytes : ∃ b : ByteArray, av = .vBytes b := by
+        simpa only [mathByteBytesInput, show ("toByteString" == "len") = false from rfl,
+          show ("toByteString" == "bin2num") = false from rfl,
+          show ("toByteString" == "toByteString") = true from rfl, Bool.or_true,
+          if_true] using hTy
+      obtain ⟨b, hb⟩ := hBytes; subst hb
+      have hArgs := args_mapM_lookupRef_single anfSt arg (.vBytes b) hRes
+      have hCall : RunarVerification.ANF.Eval.callBuiltin? "toByteString" [.vBytes b]
+          = .ok (some (.vBytes b)) := by
+        simp [RunarVerification.ANF.Eval.callBuiltin?]; rfl
+      refine ⟨.vBytes b, ?_, rfl⟩
+      simp [RunarVerification.ANF.Eval.evalValue, hArgs, hCall,
+        Bind.bind, pure, Except.bind, Except.pure]
+    · -- pack : excluded from mathByteSingleFunc
+      exfalso
+      subst hF
+      simp only [mathByteSingleFunc, show ("pack" == "abs") = false from rfl,
+        show ("pack" == "len") = false from rfl, show ("pack" == "bin2num") = false from rfl,
+        show ("pack" == "toByteString") = false from rfl, Bool.or_self,
+        Bool.false_eq_true] at hFunc
+  obtain ⟨val, hEvalOk, hValEq⟩ := hEval
+  show RunarVerification.ANF.Eval.evalBindings anfSt (.mk bn (.call func [arg]) src :: rest) = _
+  simp only [RunarVerification.ANF.Eval.evalBindings, hEvalOk, bind, Except.bind, hValEq]
+
+/-! #### Script chunk witness (one binding)
+
+`runOps` of the lowered single-arg call chunk advances to `push result`,
+dispatched to the matching stage-C witness
+(`stageC_simpleStep_call_<builtin>_d0`) by `func`. -/
+
+/-- The lowered single-arg call chunk runs to `push (mathByteResult func av)`
+on `stkSt`.  The head slot `(arg, k)` carries `av` (the builtin's input
+tag); `loadRef` is the depth-0 copy `[.dup]` (head-slot lemma). -/
+theorem runOps_mathByteCall_chunk
+    (bn func arg : String) (k : SlotKind) (tsm_rest : TaggedStackMap)
+    (anfSt : State) (stkSt : StackState) (av : Value)
+    (hFunc : mathByteSingleFunc func = true)
+    (hAgrees : agreesTagged ((arg, k) :: tsm_rest) anfSt stkSt)
+    (hLookup : lookupAnfByKind anfSt (arg, k) = some av)
+    (hFresh : freshIn bn (arg :: untagSm tsm_rest))
+    (hTy : if mathByteBytesInput func = true then ∃ b : ByteArray, av = .vBytes b
+           else ∃ i : Int, av = .vBigint i) :
+    runOps (lowerValue (untagSm ((arg, k) :: tsm_rest)) bn (.call func [arg])).1 stkSt
+      = .ok (stkSt.push (mathByteResult func av)) := by
+  have hLoadRefShape : loadRef (untagSm ((arg, k) :: tsm_rest)) arg = [.dup] := by
+    have h := loadRef_head_eq_dup (arg, k) tsm_rest
+    simpa using h
+  -- Dispatch on the builtin to its stage-C witness.
+  unfold mathByteSingleFunc at hFunc
+  rcases (by
+    rcases Bool.or_eq_true _ _ |>.mp hFunc with h | h
+    · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+      · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+        · exact Or.inl (by simpa using h)
+        · exact Or.inr (Or.inl (by simpa using h))
+      · exact Or.inr (Or.inr (Or.inl (by simpa using h)))
+    · exact Or.inr (Or.inr (Or.inr (by simpa using h)))
+    : func = "abs" ∨ func = "len" ∨ func = "bin2num" ∨ func = "toByteString")
+    with hF | hF | hF | hF
+  · subst hF
+    have hBig : ∃ i : Int, av = .vBigint i := by
+      simpa only [mathByteBytesInput, show ("abs" == "len") = false from rfl,
+        show ("abs" == "bin2num") = false from rfl,
+        show ("abs" == "toByteString") = false from rfl, Bool.or_self, Bool.false_eq_true,
+        if_false] using hTy
+    obtain ⟨i, hi⟩ := hBig; subst hi
+    have hStageC := RunarVerification.Stack.Agrees.stageC_simpleStep_call_abs_d0
+      bn arg k tsm_rest anfSt stkSt i hAgrees hLookup hFresh hLoadRefShape
+    show runOps _ stkSt = .ok (stkSt.push (.vBigint i.natAbs))
+    exact hStageC.1
+  · subst hF
+    have hBytes : ∃ b : ByteArray, av = .vBytes b := by
+      simpa only [mathByteBytesInput, show ("len" == "len") = true from rfl, Bool.true_or,
+        if_true] using hTy
+    obtain ⟨b, hb⟩ := hBytes; subst hb
+    have hStageC := RunarVerification.Stack.Agrees.stageC_simpleStep_call_len_d0
+      bn arg k tsm_rest anfSt stkSt b hAgrees hLookup hFresh hLoadRefShape
+    show runOps _ stkSt = .ok (stkSt.push (.vBigint b.size))
+    exact hStageC.1
+  · subst hF
+    have hBytes : ∃ b : ByteArray, av = .vBytes b := by
+      simpa only [mathByteBytesInput, show ("bin2num" == "len") = false from rfl,
+        show ("bin2num" == "bin2num") = true from rfl, Bool.or_true, if_true] using hTy
+    obtain ⟨b, hb⟩ := hBytes; subst hb
+    have hStageC := RunarVerification.Stack.Agrees.stageC_simpleStep_call_bin2num_d0
+      bn arg k tsm_rest anfSt stkSt b hAgrees hLookup hFresh hLoadRefShape
+    show runOps _ stkSt = .ok (stkSt.push (.vBigint (RunarVerification.Stack.decodeMinimalLE b)))
+    exact hStageC.1
+  · subst hF
+    have hBytes : ∃ b : ByteArray, av = .vBytes b := by
+      simpa only [mathByteBytesInput, show ("toByteString" == "len") = false from rfl,
+        show ("toByteString" == "bin2num") = false from rfl,
+        show ("toByteString" == "toByteString") = true from rfl, Bool.or_true, if_true] using hTy
+    obtain ⟨b, hb⟩ := hBytes; subst hb
+    have hStageC := RunarVerification.Stack.Agrees.stageC_simpleStep_call_toByteString_d0
+      bn arg k tsm_rest anfSt stkSt b hAgrees hLookup hFresh hLoadRefShape
+    show runOps _ stkSt = .ok (stkSt.push (.vBytes b))
+    exact hStageC.1
+
+/-! #### The per-call lockstep success step -/
+
+/-- **Deliverable B — single-arg math_byte call SUCCESS lockstep step.**
+
+The analogue of `agrees_success_step_unary`, in the COPY-mode push regime:
+the argument is retained at depth 0 and the result is pushed on top.  Under
+`agreesTagged`, head correspondence, the head-slot right-type fact, and
+freshness, the PRE-state success iff transports to the POST-state iff and
+`agreesTagged` is re-established at the post (push) state. -/
+theorem agrees_success_step_mathByteCall
+    (bn func arg : String) (k : SlotKind) (tsm_rest : TaggedStackMap)
+    (src : Option RunarVerification.ANF.SourceLoc)
+    (anfSt : State) (stkSt : StackState) (av : Value)
+    (anfRest : List ANFBinding) (restOps : List StackOp)
+    (hFunc : mathByteSingleFunc func = true)
+    (hAgrees : agreesTagged ((arg, k) :: tsm_rest) anfSt stkSt)
+    (hHeadCorr : anfSt.resolveRef arg = lookupAnfByKind anfSt (arg, k))
+    (hLookup : lookupAnfByKind anfSt (arg, k) = some av)
+    (hFresh : freshIn bn (arg :: untagSm tsm_rest))
+    (hTy : if mathByteBytesInput func = true then ∃ b : ByteArray, av = .vBytes b
+           else ∃ i : Int, av = .vBigint i) :
+    ( ( (RunarVerification.ANF.Eval.evalBindings anfSt
+            (.mk bn (.call func [arg]) src :: anfRest)).toOption.isSome
+          ↔ (runOps ((lowerValue (untagSm ((arg, k) :: tsm_rest)) bn (.call func [arg])).1
+                ++ restOps) stkSt).toOption.isSome )
+      ↔ ( (RunarVerification.ANF.Eval.evalBindings
+              (anfSt.addBinding bn (mathByteResult func av)) anfRest).toOption.isSome
+          ↔ (runOps restOps (stkSt.push (mathByteResult func av))).toOption.isSome ) )
+    ∧ agreesTagged ((bn, .binding) :: (arg, k) :: tsm_rest)
+        (anfSt.addBinding bn (mathByteResult func av))
+        (stkSt.push (mathByteResult func av)) := by
+  -- ANF head resolution (correspondence).
+  have hResolve : anfSt.resolveRef arg = some av := by rw [hHeadCorr]; exact hLookup
+  -- ANF cons-step.
+  have hANF : RunarVerification.ANF.Eval.evalBindings anfSt
+        (.mk bn (.call func [arg]) src :: anfRest)
+      = RunarVerification.ANF.Eval.evalBindings
+          (anfSt.addBinding bn (mathByteResult func av)) anfRest :=
+    evalBindings_mathByteCall_cons_step anfSt bn func arg src av anfRest hFunc hResolve hTy
+  -- Script chunk witness.
+  have hChunk : runOps (lowerValue (untagSm ((arg, k) :: tsm_rest)) bn (.call func [arg])).1 stkSt
+      = .ok (stkSt.push (mathByteResult func av)) :=
+    runOps_mathByteCall_chunk bn func arg k tsm_rest anfSt stkSt av hFunc hAgrees hLookup
+      hFresh hTy
+  have hStack : runOps ((lowerValue (untagSm ((arg, k) :: tsm_rest)) bn (.call func [arg])).1
+        ++ restOps) stkSt
+      = runOps restOps (stkSt.push (mathByteResult func av)) := by
+    rw [Stack.Eval.runOps_append, hChunk]
+  -- `agreesTagged` preserved by the push transport.
+  have hFreshFull : freshIn bn (untagSm ((arg, k) :: tsm_rest)) := by
+    show ¬ bn ∈ untagSm ((arg, k) :: tsm_rest)
+    show ¬ bn ∈ arg :: untagSm tsm_rest
+    exact hFresh
+  have hAgrees1 : agreesTagged ((bn, .binding) :: (arg, k) :: tsm_rest)
+      (anfSt.addBinding bn (mathByteResult func av))
+      (stkSt.push (mathByteResult func av)) :=
+    agreesTagged_push_value ((arg, k) :: tsm_rest) bn anfSt stkSt
+      (mathByteResult func av) hAgrees hFreshFull
+  refine ⟨?_, hAgrees1⟩
+  rw [hANF, hStack]
+
+/-! ### Deliverable B — MANDATORY smoke (single-binding success lockstep)
+
+A concrete single `len(s0)` binding over a bytes-valued param `s0`.  From
+entry `agreesTagged` + head-slot bytes-ness, `agrees_success_step_mathByteCall`
+yields BOTH: the one-step transport, AND `agreesTagged` at the post (push)
+state with the new binding `t0 ↦ .vBigint s0.size`.  We then DISCHARGE both
+sides concretely (empty tail runs to `.ok`), so the iff is `True ↔ True`. -/
+
+/-- Smoke entry state for B: param `s0 = #[0x01, 0x02]` (bytes). -/
+def smokeBStepAnf : State :=
+  { params := [("s0", .vBytes (ByteArray.mk #[0x01, 0x02]))] }
+
+/-- Smoke runtime stack aligned with `smokeBStepAnf`. -/
+def smokeBStepStk : StackState :=
+  { stack := [.vBytes (ByteArray.mk #[0x01, 0x02])] }
+
+/-- Entry alignment for B (param `s0`). -/
+theorem smoke_B_agreesTagged :
+    agreesTagged [("s0", .param)] smokeBStepAnf smokeBStepStk := by
+  refine ⟨?_, rfl, rfl⟩
+  show taggedStackAligned [("s0", .param)] smokeBStepAnf smokeBStepStk.stack
+  refine ⟨?_, ?_⟩
+  · show lookupAnfByKind smokeBStepAnf ("s0", .param)
+        = some (.vBytes (ByteArray.mk #[0x01, 0x02])); rfl
+  · trivial
+
+/-- **Deliverable B smoke — the single-binding SUCCESS lockstep.** -/
+theorem smoke_B_step :
+    -- (1) the one-step transport + (2) the preserved `agreesTagged`.
+    ( ( (RunarVerification.ANF.Eval.evalBindings smokeBStepAnf
+            [.mk "t0" (.call "len" ["s0"]) none]).toOption.isSome
+          ↔ (runOps ((lowerValue (untagSm [("s0", .param)]) "t0" (.call "len" ["s0"])).1 ++ [])
+              smokeBStepStk).toOption.isSome )
+      ↔ ( (RunarVerification.ANF.Eval.evalBindings
+              (smokeBStepAnf.addBinding "t0"
+                (mathByteResult "len" (.vBytes (ByteArray.mk #[0x01, 0x02])))) []).toOption.isSome
+          ↔ (runOps [] (smokeBStepStk.push
+                (mathByteResult "len" (.vBytes (ByteArray.mk #[0x01, 0x02]))))).toOption.isSome ) )
+    ∧ agreesTagged [("t0", .binding), ("s0", .param)]
+        (smokeBStepAnf.addBinding "t0"
+          (mathByteResult "len" (.vBytes (ByteArray.mk #[0x01, 0x02]))))
+        (smokeBStepStk.push (mathByteResult "len" (.vBytes (ByteArray.mk #[0x01, 0x02])))) := by
+  apply agrees_success_step_mathByteCall "t0" "len" "s0" .param [] none
+    smokeBStepAnf smokeBStepStk (.vBytes (ByteArray.mk #[0x01, 0x02])) [] []
+  · decide
+  · exact smoke_B_agreesTagged
+  · rfl
+  · rfl
+  · show ¬ "t0" ∈ ["s0"]; decide
+  · show (if mathByteBytesInput "len" = true then
+            ∃ b : ByteArray, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBytes b
+          else ∃ i : Int, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBigint i)
+    simp only [mathByteBytesInput, show ("len" == "len") = true from rfl, Bool.true_or, if_true]
+    exact ⟨_, rfl⟩
+
+/-! ### Deliverable C — the body-level walk
+
+By induction over `mathByteSingleArgBody`, the ANF evaluator's whole-body
+success bit matches the lowered Bitcoin-Script program's success bit.  Each
+call binding is peeled via `agrees_success_step_mathByteCall` (the B step)
+under the threaded `agreesTagged` + `tsmCoherent` invariants; the head-slot
+right-type fact is read from the fragment at each step.  Mirrors
+`RunarVerification.Stack.Agrees.successAgrees_arith_consume_unconditional`'s
+inner walk, in the COPY-mode push regime (so the tagged map GROWS each step
+and `tsmCoherent` is transported by the fresh-binding stability lemma). -/
+
+/-- **Deliverable C — the unconditional single-arg math_byte call walk.**
+
+For a `mathByteSingleArgBody`, the ANF whole-body success bit matches the
+lowered `lowerBindings` program's success bit.  The well-typedness is read
+from the fragment (each binding pins its argument value `av` and the
+builtin's input tag), so the divergent wrong-type cases are unreachable. -/
+theorem successAgrees_mathByteSingleArg_unconditional :
+    ∀ (body : List ANFBinding) (tsm : TaggedStackMap) (sm : StackMap)
+      (anfSt : State) (stkSt : StackState),
+      untagSm tsm = sm →
+      agreesTagged tsm anfSt stkSt →
+      tsmCoherent anfSt tsm →
+      mathByteSingleArgBody body tsm anfSt →
+      ((RunarVerification.ANF.Eval.evalBindings anfSt body).toOption.isSome
+        ↔ (runOps (lowerBindings sm body).1 stkSt).toOption.isSome) := by
+  intro body
+  induction body with
+  | nil =>
+      intro tsm sm anfSt stkSt _hUntag _hAgrees _hCoh _hFrag
+      have hANF : (RunarVerification.ANF.Eval.evalBindings anfSt []).toOption.isSome := by
+        simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+      have hStk : (runOps (lowerBindings sm []).1 stkSt).toOption.isSome := by
+        simp only [lowerBindings, Stack.Eval.runOps_nil, Except.toOption, Option.isSome]
+      exact iff_of_true hANF hStk
+  | cons hd rest ih =>
+      intro tsm sm anfSt stkSt hUntag hAgrees hCoh hFrag
+      obtain ⟨bn, v, src⟩ := hd
+      obtain ⟨func, arg, s, tsm_rest, av, hVeq, hFunc, hTeq, hHd, hArg, hFresh, hRest⟩ := hFrag
+      obtain ⟨sName, sKind⟩ := s
+      subst hVeq; subst hTeq
+      simp only at hHd
+      subst sName
+      -- Decode the head-slot type fact.
+      obtain ⟨hLookup, hTy⟩ := hArg
+      -- Head correspondence from coherence.
+      have hHeadCorr : anfSt.resolveRef arg = lookupAnfByKind anfSt (arg, sKind) :=
+        tsmCoherent_head anfSt (arg, sKind) tsm_rest hCoh
+      -- The B step.
+      have hStep := agrees_success_step_mathByteCall bn func arg sKind tsm_rest src
+        anfSt stkSt av rest
+        (lowerBindings (untagSm ((bn, .binding) :: (arg, sKind) :: tsm_rest))
+          rest).1
+        hFunc hAgrees hHeadCorr hLookup hFresh hTy
+      obtain ⟨hTransport, hAgrees1⟩ := hStep
+      -- The `lowerBindings` cons decomposition (sm = untagSm ((arg, sKind) :: tsm_rest)).
+      have hSmEq : sm = untagSm ((arg, sKind) :: tsm_rest) := hUntag.symm
+      subst hSmEq
+      have hLowerCons :
+          (lowerBindings (untagSm ((arg, sKind) :: tsm_rest))
+              (.mk bn (.call func [arg]) src :: rest)).1
+            = (lowerValue (untagSm ((arg, sKind) :: tsm_rest)) bn (.call func [arg])).1
+              ++ (lowerBindings
+                    (lowerValue (untagSm ((arg, sKind) :: tsm_rest)) bn (.call func [arg])).2
+                    rest).1 := by
+        rw [lowerBindings]
+      -- The structural map advances by pushing `bn` (all four builtins).
+      have hSmOut :
+          (lowerValue (untagSm ((arg, sKind) :: tsm_rest)) bn (.call func [arg])).2
+            = untagSm ((bn, .binding) :: (arg, sKind) :: tsm_rest) := by
+        have hPush :
+            (lowerValue (untagSm ((arg, sKind) :: tsm_rest)) bn (.call func [arg])).2
+              = (untagSm ((arg, sKind) :: tsm_rest)).push bn := by
+          unfold mathByteSingleFunc at hFunc
+          rcases (by
+            rcases Bool.or_eq_true _ _ |>.mp hFunc with h | h
+            · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+              · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+                · exact Or.inl (by simpa using h)
+                · exact Or.inr (Or.inl (by simpa using h))
+              · exact Or.inr (Or.inr (Or.inl (by simpa using h)))
+            · exact Or.inr (Or.inr (Or.inr (by simpa using h)))
+            : func = "abs" ∨ func = "len" ∨ func = "bin2num" ∨ func = "toByteString")
+            with hF | hF | hF | hF
+          · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_abs _ bn arg)
+          · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_len _ bn arg)
+          · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_bin2num _ bn arg)
+          · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_toByteString _ bn arg)
+        rw [hPush]; rfl
+      rw [hLowerCons, hSmOut]
+      -- Transport the coherence to the post-state.
+      have hFreshRest : freshIn bn (untagSm ((arg, sKind) :: tsm_rest)) := by
+        show ¬ bn ∈ untagSm ((arg, sKind) :: tsm_rest)
+        show ¬ bn ∈ arg :: untagSm tsm_rest
+        exact hFresh
+      have hCoh1 : tsmCoherent (anfSt.addBinding bn (mathByteResult func av))
+          ((bn, .binding) :: (arg, sKind) :: tsm_rest) := by
+        intro slot hSlot
+        rcases List.mem_cons.mp hSlot with hHead | hTail
+        · subst hHead
+          show lookupAnfByKind (anfSt.addBinding bn (mathByteResult func av)) (bn, .binding)
+            = (anfSt.addBinding bn (mathByteResult func av)).resolveRef bn
+          rw [lookupAnfByKind_addBinding_self anfSt bn (mathByteResult func av)]
+          unfold State.resolveRef State.lookupBinding State.addBinding
+          simp only [List.find?_cons, beq_self_eq_true]
+          rfl
+        · exact tsmCoherent_addBinding_of_fresh anfSt bn (mathByteResult func av)
+            ((arg, sKind) :: tsm_rest) hCoh hFreshRest slot hTail
+      -- IH on `rest` at the post-state ⇒ the POST iff.
+      have hUntag1 :
+          untagSm ((bn, .binding) :: (arg, sKind) :: tsm_rest)
+            = untagSm ((bn, .binding) :: (arg, sKind) :: tsm_rest) := rfl
+      have hPostIff := ih ((bn, .binding) :: (arg, sKind) :: tsm_rest)
+        (untagSm ((bn, .binding) :: (arg, sKind) :: tsm_rest))
+        (anfSt.addBinding bn (mathByteResult func av))
+        (stkSt.push (mathByteResult func av))
+        hUntag1 hAgrees1 hCoh1 hRest
+      -- Transport: PRE iff ⇐ POST iff.
+      exact hTransport.mpr hPostIff
+
+/-! ### Deliverable C — MANDATORY smoke (multi-binding mixed-type walk)
+
+A concrete 3-binding mixed-type chain
+`t0 = toByteString(s0); t1 = len(t0); t2 = abs(t1)` over a single bytes
+param `s0 = #[0x01, 0x02]`.  Each call's argument is the immediately-prior
+binding at depth 0 (the copy-mode push discipline), so the chain stays in
+the fragment.  The types thread: `toByteString : bytes → bytes`,
+`len : bytes → bigint`, `abs : bigint → bigint` — exercising both an
+`abs` (bigint-input) and two bytes-input builtins.  We instantiate
+`successAgrees_mathByteSingleArg_unconditional` from `agreesTagged` +
+`tsmCoherent` + the fragment, with NO hand-supplied per-call iffs, then
+discharge the iff to `True ↔ True`. -/
+
+private def smokeCBody : List ANFBinding :=
+  [ANFBinding.mk "t0" (.call "toByteString" ["s0"]) none,
+   ANFBinding.mk "t1" (.call "len" ["t0"]) none,
+   ANFBinding.mk "t2" (.call "abs" ["t1"]) none]
+
+private def smokeCAnf : State :=
+  { params := [("s0", .vBytes (ByteArray.mk #[0x01, 0x02]))] }
+
+private def smokeCStk : StackState :=
+  { stack := [.vBytes (ByteArray.mk #[0x01, 0x02])] }
+
+private def smokeCTsm : TaggedStackMap := [("s0", .param)]
+
+private theorem smokeC_untag : untagSm smokeCTsm = ["s0"] := rfl
+
+private theorem smokeC_agreesTagged :
+    agreesTagged smokeCTsm smokeCAnf smokeCStk := by
+  refine ⟨?_, rfl, rfl⟩
+  show taggedStackAligned smokeCTsm smokeCAnf smokeCStk.stack
+  refine ⟨?_, ?_⟩
+  · show lookupAnfByKind smokeCAnf ("s0", .param)
+        = some (.vBytes (ByteArray.mk #[0x01, 0x02])); rfl
+  · trivial
+
+private theorem smokeC_tsmCoherent : tsmCoherent smokeCAnf smokeCTsm := by
+  intro slot hSlot
+  simp only [smokeCTsm, List.mem_singleton] at hSlot
+  subst hSlot; rfl
+
+/-- The fragment holds for the concrete 3-binding chain.  Each
+`mathByteArgIs` lookup is discharged by `rfl` against the threaded state. -/
+private theorem smokeC_fragment :
+    mathByteSingleArgBody smokeCBody smokeCTsm smokeCAnf := by
+  -- t0 = toByteString(s0)
+  refine ⟨"toByteString", "s0", ("s0", .param), [],
+    .vBytes (ByteArray.mk #[0x01, 0x02]), rfl, by decide, rfl, rfl, ⟨rfl, ?_⟩,
+    (by show ¬ "t0" ∈ untagSm (("s0", .param) :: ([] : TaggedStackMap)); decide), ?_⟩
+  · show (if mathByteBytesInput "toByteString" = true then
+            ∃ b : ByteArray, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBytes b
+          else ∃ i : Int, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBigint i)
+    simp only [mathByteBytesInput, show ("toByteString" == "len") = false from rfl,
+      show ("toByteString" == "bin2num") = false from rfl,
+      show ("toByteString" == "toByteString") = true from rfl, Bool.or_true, if_true]
+    exact ⟨_, rfl⟩
+  -- t1 = len(t0)
+  refine ⟨"len", "t0", ("t0", .binding), [("s0", .param)],
+    .vBytes (ByteArray.mk #[0x01, 0x02]), rfl, by decide, rfl, rfl, ⟨rfl, ?_⟩,
+    (by show ¬ "t1" ∈ untagSm (("t0", .binding) :: [("s0", .param)]); decide), ?_⟩
+  · show (if mathByteBytesInput "len" = true then
+            ∃ b : ByteArray, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBytes b
+          else ∃ i : Int, (Value.vBytes (ByteArray.mk #[0x01, 0x02])) = .vBigint i)
+    simp only [mathByteBytesInput, show ("len" == "len") = true from rfl, Bool.true_or, if_true]
+    exact ⟨_, rfl⟩
+  -- t2 = abs(t1)
+  refine ⟨"abs", "t1", ("t1", .binding), [("t0", .binding), ("s0", .param)],
+    .vBigint 2, rfl, by decide, rfl, rfl, ⟨rfl, ?_⟩,
+    (by show ¬ "t2" ∈ untagSm (("t1", .binding) :: [("t0", .binding), ("s0", .param)]); decide),
+    ?_⟩
+  · show (if mathByteBytesInput "abs" = true then
+            ∃ b : ByteArray, (Value.vBigint 2) = .vBytes b
+          else ∃ i : Int, (Value.vBigint 2) = .vBigint i)
+    simp only [mathByteBytesInput, show ("abs" == "len") = false from rfl,
+      show ("abs" == "bin2num") = false from rfl,
+      show ("abs" == "toByteString") = false from rfl, Bool.or_self, Bool.false_eq_true, if_false]
+    exact ⟨_, rfl⟩
+  · -- empty tail
+    show mathByteSingleArgBody [] _ _; trivial
+
+/-- **Deliverable C smoke — the multi-binding mixed-type walk (THE NEW PIECE).**
+
+From `agreesTagged` + `tsmCoherent` + the fragment (NO per-call iffs), the
+deliverable produces the whole-body success iff for the 3-binding chain.
+We then DISCHARGE the iff to `True ↔ True` by confirming the ANF side
+concretely succeeds (the chain evaluates `s0 = #[01,02]` to a final
+bigint), so by the iff both sides are `isSome`. -/
+theorem smokeC_unconditional_walk_smoke :
+    -- (1) The deliverable iff for the 3-binding mixed-type chain.
+    ((RunarVerification.ANF.Eval.evalBindings smokeCAnf smokeCBody).toOption.isSome
+      ↔ (runOps (lowerBindings ["s0"] smokeCBody).1 smokeCStk).toOption.isSome)
+    -- (2) The ANF side concretely succeeds.
+    ∧ (RunarVerification.ANF.Eval.evalBindings smokeCAnf smokeCBody).toOption.isSome
+    -- (3) Therefore the STACK side succeeds too (via the iff).
+    ∧ (runOps (lowerBindings ["s0"] smokeCBody).1 smokeCStk).toOption.isSome := by
+  have hIff :
+      ((RunarVerification.ANF.Eval.evalBindings smokeCAnf smokeCBody).toOption.isSome
+        ↔ (runOps (lowerBindings ["s0"] smokeCBody).1 smokeCStk).toOption.isSome) :=
+    successAgrees_mathByteSingleArg_unconditional smokeCBody smokeCTsm ["s0"]
+      smokeCAnf smokeCStk smokeC_untag smokeC_agreesTagged smokeC_tsmCoherent
+      smokeC_fragment
+  -- The ANF side concretely succeeds (whole chain evaluates to `.ok`).
+  have hANF :
+      (RunarVerification.ANF.Eval.evalBindings smokeCAnf smokeCBody).toOption.isSome := by
+    native_decide
+  exact ⟨hIff, hANF, hIff.mp hANF⟩
+
+end MathByteSingleArgWalk
 
 end AgreesA4
 end RunarVerification.Stack
