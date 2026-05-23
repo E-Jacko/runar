@@ -4948,6 +4948,327 @@ theorem smokeC_unconditional_walk_smoke :
     native_decide
   exact ⟨hIff, hANF, hIff.mp hANF⟩
 
+/-! ### Deliverable B — the entry-bridge (per-binding `mathByteArgIs` from entry typing)
+
+The wave-47 fragment pins each binding's `mathByteArgIs` (the head-slot value +
+the builtin's input tag) explicitly.  For a binding whose argument is an ENTRY
+slot, that typing is DERIVED — the analogue of arith's
+`taggedAllBigint_of_entryTyped` — from the omnibus entry bundle:
+
+* `EntryBytesTyped Γ anfSt` — `.byteString`-declared names resolve to `.vBytes`
+  (the wave-46 substrate);
+* `EntryBigintTyped Γ anfSt` — `.bigint`-declared names resolve to `.vBigint`;
+* head-correspondence `resolveRef arg = lookupAnfByKind anfSt (arg, k)` (from
+  `tsmCoherent`);
+* a structural entry-typed predicate keying the operand's DECLARED type to the
+  builtin's input tag (`abs` ↦ bigint; `len`/`bin2num`/`toByteString` ↦ bytes).
+
+The output is exactly the `mathByteArgIs` field the fragment carries, so the
+retirement dispatch can supply the walk's typing from the entry bundle. -/
+
+/-- Structural entry-typed predicate for a single-arg math_byte call: the
+operand `arg`'s DECLARED type in `Γ` matches the builtin's expected input tag
+(`abs` ↦ `.bigint`; the bytes-input builtins ↦ `.byteString`).  The decidable
+twin of `mathByteArgIs`'s runtime-tag disjunction, keyed at the type layer. -/
+def mathByteArgTyped
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv) (func arg : String) : Prop :=
+  if mathByteBytesInput func = true then
+    RunarVerification.ANF.WellTyped.byteOperandBytes Γ arg
+  else
+    RunarVerification.ANF.WellTyped.arithOperandBigint Γ arg
+
+/-- **Deliverable B — per-binding `mathByteArgIs` DERIVED from entry typing.**
+
+Under the omnibus entry bundle (`EntryBytesTyped` + `EntryBigintTyped` +
+head-correspondence) and the structural entry-typed predicate, the head slot
+`(arg, k)` resolves to a value of the builtin's input tag — exactly the
+`mathByteArgIs` field the wave-47 fragment carries.  The argument value `av` is
+returned existentially. -/
+theorem mathByteArgIs_of_entryTyped
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv) (anfSt : State)
+    (func arg : String) (k : SlotKind)
+    (hEntryBytes : RunarVerification.ANF.WellTyped.EntryBytesTyped Γ anfSt)
+    (hEntryBigint : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ anfSt)
+    (hHeadCorr : anfSt.resolveRef arg = lookupAnfByKind anfSt (arg, k))
+    (hTyped : mathByteArgTyped Γ func arg) :
+    ∃ av : Value, mathByteArgIs anfSt func (arg, k) av := by
+  unfold mathByteArgTyped at hTyped
+  by_cases hBytes : mathByteBytesInput func = true
+  · -- bytes-input builtin
+    rw [if_pos hBytes] at hTyped
+    obtain ⟨b, hRes⟩ :=
+      RunarVerification.ANF.WellTyped.arg_resolveRef_vBytes_of_typedEntry Γ anfSt arg
+        hEntryBytes hTyped
+    refine ⟨.vBytes b, ?_⟩
+    refine ⟨?_, ?_⟩
+    · rw [← hHeadCorr]; exact hRes
+    · rw [if_pos hBytes]; exact ⟨b, rfl⟩
+  · -- bigint-input builtin (abs)
+    rw [if_neg hBytes] at hTyped
+    obtain ⟨i, hRes⟩ :=
+      RunarVerification.ANF.WellTyped.operand_resolveRef_vBigint_of_typedEntry Γ anfSt arg
+        hEntryBigint hTyped
+    refine ⟨.vBigint i, ?_⟩
+    refine ⟨?_, ?_⟩
+    · rw [← hHeadCorr]; exact hRes
+    · rw [if_neg hBytes]; exact ⟨i, rfl⟩
+
+/-! ### Deliverable B — MANDATORY smoke (per-binding typing derived from entry)
+
+A concrete well-typed entry: `s0` declared `.byteString`, `p0` declared
+`.bigint`.  We derive `mathByteArgIs` for BOTH a bytes-input binding
+(`len(s0)`) and the bigint-input `abs(p0)` from the entry bundle — NO
+hand-supplied per-binding tag. -/
+
+/-- Smoke B entry typing context: `s0 : byteString`, `p0 : bigint`. -/
+private def smokeBEntryEnv : RunarVerification.ANF.WellTyped.TypeEnv :=
+  (RunarVerification.ANF.Typed.TypeEnv.empty.extend "s0" .byteString).extend "p0" .bigint
+
+/-- Smoke B runtime state: `s0 = #[0x01,0x02]` (bytes), `p0 = 7` (bigint). -/
+private def smokeBEntryAnf : State :=
+  { params := [("s0", .vBytes (ByteArray.mk #[0x01, 0x02])), ("p0", .vBigint 7)] }
+
+private theorem smokeB_entryBytes :
+    RunarVerification.ANF.WellTyped.EntryBytesTyped smokeBEntryEnv smokeBEntryAnf := by
+  intro n hn
+  by_cases hs : n = "s0"
+  · subst hs; exact ⟨.vBytes (ByteArray.mk #[0x01, 0x02]), rfl, ⟨_, rfl⟩⟩
+  · exfalso
+    by_cases h0 : n = "p0"
+    · subst h0
+      have hp0 : smokeBEntryEnv.lookup "p0" = some .bigint := rfl
+      rw [hp0] at hn; exact absurd hn (by decide)
+    · have hp0 : ("p0" == n) = false := by
+        rw [beq_eq_false_iff_ne]; exact fun h => h0 h.symm
+      have hss : ("s0" == n) = false := by
+        rw [beq_eq_false_iff_ne]; exact fun h => hs h.symm
+      simp only [smokeBEntryEnv, RunarVerification.ANF.Typed.TypeEnv.lookup,
+        RunarVerification.ANF.Typed.TypeEnv.extend, RunarVerification.ANF.Typed.TypeEnv.empty,
+        List.find?_cons, hp0, hss, List.find?_nil, Option.map_none, reduceCtorEq] at hn
+
+private theorem smokeB_entryBigint :
+    RunarVerification.ANF.WellTyped.EntryBigintTyped smokeBEntryEnv smokeBEntryAnf := by
+  intro n hn
+  by_cases h0 : n = "p0"
+  · subst h0; exact ⟨.vBigint 7, rfl, ⟨7, rfl⟩⟩
+  · exfalso
+    by_cases hs : n = "s0"
+    · subst hs
+      have hs0 : smokeBEntryEnv.lookup "s0" = some .byteString := rfl
+      rw [hs0] at hn; exact absurd hn (by decide)
+    · have hp0 : ("p0" == n) = false := by
+        rw [beq_eq_false_iff_ne]; exact fun h => h0 h.symm
+      have hss : ("s0" == n) = false := by
+        rw [beq_eq_false_iff_ne]; exact fun h => hs h.symm
+      simp only [smokeBEntryEnv, RunarVerification.ANF.Typed.TypeEnv.lookup,
+        RunarVerification.ANF.Typed.TypeEnv.extend, RunarVerification.ANF.Typed.TypeEnv.empty,
+        List.find?_cons, hp0, hss, List.find?_nil, Option.map_none, reduceCtorEq] at hn
+
+/-- **Deliverable B smoke — `mathByteArgIs` for `len(s0)` DERIVED from entry.** -/
+theorem smokeB_len_argIs_from_entry :
+    ∃ av : Value, mathByteArgIs smokeBEntryAnf "len" ("s0", .param) av :=
+  mathByteArgIs_of_entryTyped smokeBEntryEnv smokeBEntryAnf "len" "s0" .param
+    smokeB_entryBytes smokeB_entryBigint
+    (show smokeBEntryAnf.resolveRef "s0" = smokeBEntryAnf.lookupParam "s0" from rfl)
+    (by show mathByteArgTyped smokeBEntryEnv "len" "s0"
+        unfold mathByteArgTyped
+        rw [if_pos (by decide : mathByteBytesInput "len" = true)]
+        show smokeBEntryEnv.lookup "s0" = some .byteString; decide)
+
+/-- **Deliverable B smoke — `mathByteArgIs` for `abs(p0)` DERIVED from entry.** -/
+theorem smokeB_abs_argIs_from_entry :
+    ∃ av : Value, mathByteArgIs smokeBEntryAnf "abs" ("p0", .param) av :=
+  mathByteArgIs_of_entryTyped smokeBEntryEnv smokeBEntryAnf "abs" "p0" .param
+    smokeB_entryBytes smokeB_entryBigint
+    (show smokeBEntryAnf.resolveRef "p0" = smokeBEntryAnf.lookupParam "p0" from rfl)
+    (by show mathByteArgTyped smokeBEntryEnv "abs" "p0"
+        unfold mathByteArgTyped
+        rw [if_neg (by decide : ¬ mathByteBytesInput "abs" = true)]
+        show smokeBEntryEnv.lookup "p0" = some .bigint; decide)
+
+/-! ### Deliverable C — the `lowerBindingsP` bridge
+
+The wave-47 walk (`successAgrees_mathByteSingleArg_unconditional`) is stated
+over `lowerBindings` (the un-parameterized structural lowerer).  The method-level
+retirement dispatch lowers via `lowerBindingsP` (the program-aware lowerer with
+liveness / inline budget / const-int threading).  The existing
+`lowerBindingsP_eq_lowerBindings_structuralCall` collapses the two ON the
+`structuralCallBody` fragment.
+
+`mathByteSingleArgBody` ⊆ `structuralCallBody` (copy mode at the program-aware
+layer): `mathByteSingleFunc ⊆ isStructuralCallFunc` (math_byte is the structural
+allowlist minus `pack`), the head slot sits at depth 0 (so `sm.depth? arg =
+some 0`), and the copy-mode disjunct is supplied per binding by
+`mathByteCopyMode` (the args are outer-protected or non-last-use).  We thread
+the copy-mode obligation the SAME way `structuralCallBody` threads its structural
+map + index, then apply the existing narrowing.
+
+This bridges the walk's `lowerBindings sm body` to the method-level
+`lowerBindingsP … sm body`. -/
+
+/-- Per-binding copy-mode obligation for the single-arg math_byte fragment,
+threaded with the structural stack map + binding index exactly as
+`structuralCallBody` threads them.  Each binding's argument is the head slot of
+`sm` (depth 0) and is loaded in COPY mode (`!outerProtected ∧ lastUse` is
+false). -/
+def mathByteCopyMode
+    (lastUses : List (String × Nat)) (outerProtected : List String) :
+    List ANFBinding → StackMap → Nat → Prop
+  | [], _sm, _currentIndex => True
+  | (.mk name v _) :: rest, sm, currentIndex =>
+      (∀ (func arg : String), v = .call func [arg] →
+        (!listContains outerProtected arg && isLastUse lastUses arg currentIndex) = false) ∧
+      mathByteCopyMode lastUses outerProtected rest
+        (Stack.Lower.lowerValue sm name v).2 (currentIndex + 1)
+
+/-- **Deliverable C — `mathByteSingleArgBody ⇒ structuralCallBody`.**
+
+Under the per-binding copy-mode obligation, the single-arg math_byte fragment
+(at a tagged map whose untagging is `sm`) refines the program-aware
+`structuralCallBody`.  The argument is the head slot at depth 0; the structural
+map threads identically (`(lowerValue sm bn (.call func [arg])).2 = sm.push bn`
+matches the prepend in `mathByteSingleArgBody`). -/
+theorem structuralCallBody_of_mathByteSingleArgBody
+    (lastUses : List (String × Nat)) (outerProtected : List String) :
+    ∀ (body : List ANFBinding) (tsm : TaggedStackMap) (anfSt : State)
+      (currentIndex : Nat),
+      mathByteSingleArgBody body tsm anfSt →
+      mathByteCopyMode lastUses outerProtected body (untagSm tsm) currentIndex →
+      structuralCallBody lastUses outerProtected body (untagSm tsm) currentIndex
+  | [], _tsm, _anfSt, _ci, _hFrag, _hCopy => True.intro
+  | (.mk name v src) :: rest, tsm, anfSt, currentIndex, hFrag, hCopy => by
+      obtain ⟨func, arg, s, tsm_rest, av, hVeq, hFunc, hTeq, hHd, _hArg, _hFresh, hRest⟩ := hFrag
+      obtain ⟨sName, sKind⟩ := s
+      subst hVeq; subst hTeq
+      simp only at hHd
+      subst sName
+      obtain ⟨hCopyHead, hCopyRest⟩ := hCopy
+      -- Head: structuralCallValue at `untagSm ((arg, sKind) :: tsm_rest)`.
+      have hStructFunc : isStructuralCallFunc func = true := by
+        unfold mathByteSingleFunc at hFunc
+        unfold isStructuralCallFunc
+        rcases (by
+          rcases Bool.or_eq_true _ _ |>.mp hFunc with h | h
+          · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+            · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+              · exact Or.inl h
+              · exact Or.inr (Or.inl h)
+            · exact Or.inr (Or.inr (Or.inl h))
+          · exact Or.inr (Or.inr (Or.inr h))
+          : (func == "abs") = true ∨ (func == "len") = true ∨
+              (func == "bin2num") = true ∨ (func == "toByteString") = true) with h | h | h | h
+        · rw [h]; rfl
+        · rw [h]; simp
+        · rw [h]; simp
+        · rw [h]; simp
+      have hDepth : (untagSm ((arg, sKind) :: tsm_rest)).depth? arg = some 0 := by
+        show (arg :: untagSm tsm_rest).findIdx? (· == arg) = some 0
+        rw [List.findIdx?_cons]; simp only [beq_self_eq_true, if_pos]
+      have hCopyArg :
+          (!listContains outerProtected arg && isLastUse lastUses arg currentIndex) = false :=
+        hCopyHead func arg rfl
+      have hHead : structuralCallValue lastUses outerProtected
+          (untagSm ((arg, sKind) :: tsm_rest)) currentIndex (.call func [arg]) := by
+        refine ⟨hStructFunc, ⟨0, hDepth⟩, hCopyArg⟩
+      -- The structural map advances by `sm.push name` (all four builtins).
+      have hSmOut :
+          (Stack.Lower.lowerValue (untagSm ((arg, sKind) :: tsm_rest)) name
+              (.call func [arg])).2
+            = untagSm ((name, .binding) :: (arg, sKind) :: tsm_rest) := by
+        have hPush :
+            (Stack.Lower.lowerValue (untagSm ((arg, sKind) :: tsm_rest)) name
+                (.call func [arg])).2
+              = (untagSm ((arg, sKind) :: tsm_rest)).push name := by
+          unfold mathByteSingleFunc at hFunc
+          rcases (by
+            rcases Bool.or_eq_true _ _ |>.mp hFunc with h | h
+            · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+              · rcases Bool.or_eq_true _ _ |>.mp h with h | h
+                · exact Or.inl (by simpa using h)
+                · exact Or.inr (Or.inl (by simpa using h))
+              · exact Or.inr (Or.inr (Or.inl (by simpa using h)))
+            · exact Or.inr (Or.inr (Or.inr (by simpa using h)))
+            : func = "abs" ∨ func = "len" ∨ func = "bin2num" ∨ func = "toByteString")
+            with hF | hF | hF | hF
+          · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_abs _ name arg)
+          · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_len _ name arg)
+          · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_bin2num _ name arg)
+          · subst hF; exact congrArg Prod.snd (Stack.Sim.lower_call_toByteString _ name arg)
+        rw [hPush]; rfl
+      -- The copy-mode obligation on `rest` re-stated against the matching map.
+      have hCopyRest' :
+          mathByteCopyMode lastUses outerProtected rest
+            (untagSm ((name, .binding) :: (arg, sKind) :: tsm_rest)) (currentIndex + 1) := by
+        rw [← hSmOut]; exact hCopyRest
+      -- Tail via the recursive call (`untagSm` of the prepended map).
+      have hTail :
+          structuralCallBody lastUses outerProtected rest
+            (untagSm ((name, .binding) :: (arg, sKind) :: tsm_rest)) (currentIndex + 1) :=
+        structuralCallBody_of_mathByteSingleArgBody lastUses outerProtected rest
+          ((name, .binding) :: (arg, sKind) :: tsm_rest)
+          (anfSt.addBinding name (mathByteResult func av)) (currentIndex + 1)
+          hRest hCopyRest'
+      -- Assemble `structuralCallBody`.
+      refine ⟨hHead, ?_⟩
+      rw [hSmOut]; exact hTail
+
+/-- **Deliverable C — the `lowerBindingsP = lowerBindings` collapse on the
+single-arg math_byte fragment.**  Composing the refinement above with the
+existing structural-call narrowing. -/
+theorem lowerBindingsP_eq_lowerBindings_mathByteSingleArg
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String) (constInts : List (String × Int))
+    (body : List ANFBinding) (tsm : TaggedStackMap) (anfSt : State)
+    (currentIndex : Nat)
+    (hFrag : mathByteSingleArgBody body tsm anfSt)
+    (hCopy : mathByteCopyMode lastUses outerProtected body (untagSm tsm) currentIndex) :
+    Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts (untagSm tsm) body
+      = Stack.Lower.lowerBindings (untagSm tsm) body :=
+  lowerBindingsP_eq_lowerBindings_structuralCall progMethods props budget lastUses
+    outerProtected localBindings constInts body (untagSm tsm) currentIndex
+    (structuralCallBody_of_mathByteSingleArgBody lastUses outerProtected body tsm anfSt
+      currentIndex hFrag hCopy)
+
+/-! ### Deliverable C — MANDATORY smoke (the lowerBindingsP bridge)
+
+The concrete 3-binding chain from the wave-47 walk smoke
+(`t0 = toByteString(s0); t1 = len(t0); t2 = abs(t1)`).  We supply the fragment
+(reuse `smokeC_fragment`) + the copy-mode obligation (all args non-last-use:
+`lastUses = []` ⇒ `lastUsesLookup = none` ⇒ `isLastUse = true`… so we instead
+mark every arg outer-protected) and obtain `lowerBindingsP = lowerBindings`. -/
+
+/-- Smoke copy-mode context: every arg outer-protected, so the copy disjunct
+`!listContains outerProtected arg = false` fires for each binding. -/
+private def smokeC_outerProtected : List String := ["s0", "t0", "t1"]
+
+private theorem smokeC_copyMode :
+    mathByteCopyMode [] smokeC_outerProtected smokeCBody (untagSm smokeCTsm) 0 := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro func arg hEq
+    simp only [ANFValue.call.injEq, List.cons.injEq, and_true] at hEq
+    obtain ⟨_, hArg⟩ := hEq; subst hArg; decide
+  · intro func arg hEq
+    simp only [ANFValue.call.injEq, List.cons.injEq, and_true] at hEq
+    obtain ⟨_, hArg⟩ := hEq; subst hArg; decide
+  · intro func arg hEq
+    simp only [ANFValue.call.injEq, List.cons.injEq, and_true] at hEq
+    obtain ⟨_, hArg⟩ := hEq; subst hArg; decide
+  · trivial
+
+/-- **Deliverable C smoke — `lowerBindingsP = lowerBindings` on the 3-binding
+mixed-type chain.** -/
+theorem smokeC_lowerBindingsP_bridge :
+    Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+        Stack.Lower.defaultInlineBudget 0 [] smokeC_outerProtected []
+        (Stack.Lower.collectConstInts smokeCBody) (untagSm smokeCTsm) smokeCBody
+      = Stack.Lower.lowerBindings (untagSm smokeCTsm) smokeCBody :=
+  lowerBindingsP_eq_lowerBindings_mathByteSingleArg ([] : List ANFMethod)
+    ([] : List ANFProperty) Stack.Lower.defaultInlineBudget [] smokeC_outerProtected []
+    (Stack.Lower.collectConstInts smokeCBody) smokeCBody smokeCTsm smokeCAnf 0
+    smokeC_fragment smokeC_copyMode
+
 end MathByteSingleArgWalk
 
 end AgreesA4

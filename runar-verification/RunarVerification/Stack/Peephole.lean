@@ -11888,5 +11888,343 @@ example :
     (peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ wave42_branchA_noIf wave42_branchA_rpNoop)
     (peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ wave42_branchB_noIf wave42_branchB_rpNoop)
 
+/-! ### Wave 48 — `mathByteEmitNoFuse`: the peephole-identity substrate for the
+single-arg math_byte fragment (M3 substrate)
+
+The single-arg math_byte fragment (`abs`/`len`/`bin2num`/`toByteString` in the
+depth-0 copy regime) lowers each binding to `loadRef ++ builtinOpcode`:
+* `abs` → `[.dup, .opcode "OP_ABS"]`
+* `len` → `[.dup, .opcode "OP_SIZE", .opcode "OP_NIP"]`
+* `bin2num` → `[.dup, .opcode "OP_BIN2NUM"]`
+* `toByteString` → `[.dup]`  (bare `loadRef`, no opcode)
+
+So the whole lowered body is a list drawn from
+`{.dup, OP_ABS, OP_SIZE, OP_NIP, OP_BIN2NUM}`.  Checking every flat
+`peepholePassAllFlat` rule + the two `peepholePostFold` flat rules against
+this op set:
+
+* the 11 push-rooted rules (`applyDropAfterPush`, `applyAddZero`,
+  `applySubZero`, `applyOneAdd`, `applyOneSub`, `applyPushOneAdd`,
+  `applyPushOneSub`, `applyPushPushAdd/Sub/Mul`, `applyZeroNumEqual`) never
+  fire — no `.push` op is present;
+* the opcode/constructor-pair rules (`applyDupDrop` `[dup,drop]`,
+  `applyDoubleSwap` `[swap,swap]`, `applyDoubleNot` `[OP_NOT,OP_NOT]`,
+  `applyDoubleNegate` `[OP_NEGATE,OP_NEGATE]`, `applyDoubleSha256`
+  `[OP_SHA256,OP_SHA256]`, `applyDoubleOver` `[over,over]`, `applyDoubleDrop`
+  `[drop,drop]`, the three verify-fuses) never fire — their trigger ops
+  (`.drop`, `.swap`, `.over`, `OP_NOT`, `OP_NEGATE`, `OP_SHA256`, `OP_EQUAL`,
+  `OP_VERIFY`, `OP_CHECKSIG`, `OP_NUMEQUAL`) are all OUTSIDE the math_byte op
+  set.  In particular the only fusable two-op window that COULD arise from a
+  bare-`toByteString` chunk followed by another chunk is `[.dup, .dup]`, and
+  NO rule has a `.dup :: .dup` head (`applyDupDrop` needs `.dup :: .drop`).
+
+So — UNLIKE arith — `mathByteEmitNoFuse` needs no forbidden-window exclusion:
+"every op is a math_byte emit op" suffices.  The four production passes are
+each the literal identity. -/
+
+/-- A single math_byte emit op: `.dup` (the depth-0 copy load) or one of the
+four opcodes the single-arg math_byte fragment lowers to. -/
+def isMathByteEmitOp : StackOp → Bool
+  | .dup => true
+  | .opcode c => c == "OP_ABS" || c == "OP_SIZE" || c == "OP_NIP" || c == "OP_BIN2NUM"
+  | _ => false
+
+/-- Structural shape of a lowered single-arg math_byte op list: every op is
+`isMathByteEmitOp`.  No fusable-adjacency exclusion is needed (no peephole
+rule fires on this op set). -/
+def mathByteEmitNoFuse : List StackOp → Bool
+  | [] => true
+  | op :: rest => isMathByteEmitOp op && mathByteEmitNoFuse rest
+
+/-- From `mathByteEmitNoFuse (op :: rest)` recover `isMathByteEmitOp op` and
+`mathByteEmitNoFuse rest`. -/
+private theorem mathByteEmitNoFuse_cons_tail
+    (op : StackOp) (rest : List StackOp)
+    (h : mathByteEmitNoFuse (op :: rest) = true) :
+    isMathByteEmitOp op = true ∧ mathByteEmitNoFuse rest = true :=
+  Bool.and_eq_true_iff.mp (by simpa only [mathByteEmitNoFuse] using h)
+
+/-- A math_byte emit op is `.dup` or one of the four named opcodes. -/
+private theorem isMathByteEmitOp_cases (op : StackOp) (h : isMathByteEmitOp op = true) :
+    op = .dup ∨ op = .opcode "OP_ABS" ∨ op = .opcode "OP_SIZE"
+      ∨ op = .opcode "OP_NIP" ∨ op = .opcode "OP_BIN2NUM" := by
+  cases op with
+  | dup => exact Or.inl rfl
+  | opcode c =>
+      simp only [isMathByteEmitOp, Bool.or_eq_true, beq_iff_eq] at h
+      rcases h with ((h | h) | h) | h
+      · exact Or.inr (Or.inl (by rw [h]))
+      · exact Or.inr (Or.inr (Or.inl (by rw [h])))
+      · exact Or.inr (Or.inr (Or.inr (Or.inl (by rw [h]))))
+      · exact Or.inr (Or.inr (Or.inr (Or.inr (by rw [h]))))
+  | _ => exact absurd h (by simp only [isMathByteEmitOp]; decide)
+
+/-- Generic per-rule peeler.  A flat rewrite rule `r` that
+* is the identity on `[]` (`hNil`), and
+* peels a `.opcode c` head with `c ∈ {OP_ABS,OP_SIZE,OP_NIP,OP_BIN2NUM}`
+  (`hOpcode`), and
+* peels a `.dup` head whenever the next op (if any) is itself a math_byte emit
+  op (`hDup` — the `.dup`-followed-by-math_byte case never opens a fusion
+  window since no rule has a `.dup`-after-math_byte trigger),
+is the identity on a `mathByteEmitNoFuse` list. -/
+private theorem mathByteFlatRule_id
+    (r : List StackOp → List StackOp)
+    (hNil : r [] = [])
+    (hOpcode : ∀ (c : String) (rest : List StackOp),
+      (c = "OP_ABS" ∨ c = "OP_SIZE" ∨ c = "OP_NIP" ∨ c = "OP_BIN2NUM") →
+      r (.opcode c :: rest) = .opcode c :: r rest)
+    (hDup : ∀ (rest : List StackOp),
+      mathByteEmitNoFuse rest = true → r (.dup :: rest) = .dup :: r rest) :
+    ∀ (ops : List StackOp), mathByteEmitNoFuse ops = true → r ops = ops := by
+  intro ops
+  induction ops with
+  | nil => intro _; exact hNil
+  | cons op rest ih =>
+      intro h
+      obtain ⟨hOp, hRest⟩ := mathByteEmitNoFuse_cons_tail op rest h
+      rcases isMathByteEmitOp_cases op hOp with hE | hE | hE | hE | hE
+      · subst hE; rw [hDup rest hRest, ih hRest]
+      · subst hE; rw [hOpcode "OP_ABS" rest (Or.inl rfl), ih hRest]
+      · subst hE; rw [hOpcode "OP_SIZE" rest (Or.inr (Or.inl rfl)), ih hRest]
+      · subst hE; rw [hOpcode "OP_NIP" rest (Or.inr (Or.inr (Or.inl rfl))), ih hRest]
+      · subst hE; rw [hOpcode "OP_BIN2NUM" rest (Or.inr (Or.inr (Or.inr rfl))), ih hRest]
+
+/-- The `.dup` peeler for `applyDupDrop`: a `.dup` head followed by a
+math_byte emit op never opens the `[dup,drop]` window (`.drop` is not
+math_byte). -/
+private theorem applyDupDrop_dup_peel
+    (rest : List StackOp) (h : mathByteEmitNoFuse rest = true) :
+    applyDupDrop (.dup :: rest) = .dup :: applyDupDrop rest := by
+  cases rest with
+  | nil => rfl
+  | cons o2 r2 =>
+      obtain ⟨hO2, _⟩ := mathByteEmitNoFuse_cons_tail o2 r2 h
+      cases o2 with
+      | drop => exact absurd hO2 (by simp only [isMathByteEmitOp]; decide)
+      | _ => rfl
+
+/-- **Wave 48 — `peepholePassAllFlat` is the identity on the math_byte emit op
+shape.** All 18 sub-rules peel a math_byte head — every rule's `.opcode`-head
+peel is definitional (no rule fuses `OP_ABS/OP_SIZE/OP_NIP/OP_BIN2NUM` heads),
+and the `.dup` head only risks `applyDupDrop` (`[dup,drop]`), excluded by the
+math_byte tail. -/
+theorem peepholePassAllFlat_eq_self_of_mathByteEmit
+    (ops : List StackOp) (h : mathByteEmitNoFuse ops = true) :
+    peepholePassAllFlat ops = ops := by
+  -- `.dup` peeler used by 17 rules (all but `applyDupDrop`): definitional.
+  have dupId : ∀ (r : List StackOp → List StackOp),
+      (∀ (rest : List StackOp), r (.dup :: rest) = .dup :: r rest) →
+      ∀ (rest : List StackOp), mathByteEmitNoFuse rest = true →
+        r (.dup :: rest) = .dup :: r rest := fun _ hr rest _ => hr rest
+  unfold peepholePassAllFlat
+  rw [mathByteFlatRule_id applyDropAfterPush rfl
+        (by intro c rest _; rfl) (dupId applyDropAfterPush (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyDupDrop rfl
+        (by intro c rest _; rfl) applyDupDrop_dup_peel ops h,
+      mathByteFlatRule_id applyDoubleSwap rfl
+        (by intro c rest _; rfl) (dupId applyDoubleSwap (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyPushPushAdd rfl
+        (by intro c rest _; rfl) (dupId applyPushPushAdd (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyPushPushSub rfl
+        (by intro c rest _; rfl) (dupId applyPushPushSub (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyPushPushMul rfl
+        (by intro c rest _; rfl) (dupId applyPushPushMul (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyAddZero rfl
+        (by intro c rest _; rfl) (dupId applyAddZero (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applySubZero rfl
+        (by intro c rest _; rfl) (dupId applySubZero (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyOneAdd rfl
+        (by intro c rest _; rfl) (dupId applyOneAdd (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyOneSub rfl
+        (by intro c rest _; rfl) (dupId applyOneSub (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyDoubleNegate rfl
+        (by intro c rest hc; rcases hc with h|h|h|h <;> subst h <;> rfl)
+        (dupId applyDoubleNegate (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyDoubleNot rfl
+        (by intro c rest hc; rcases hc with h|h|h|h <;> subst h <;> rfl)
+        (dupId applyDoubleNot (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyDoubleOver rfl
+        (by intro c rest _; rfl) (dupId applyDoubleOver (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyDoubleDrop rfl
+        (by intro c rest _; rfl) (dupId applyDoubleDrop (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyDoubleSha256 rfl
+        (by intro c rest hc; rcases hc with h|h|h|h <;> subst h <;> rfl)
+        (dupId applyDoubleSha256 (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyZeroNumEqual rfl
+        (by intro c rest _; rfl) (dupId applyZeroNumEqual (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyNumEqualVerifyFuse rfl
+        (by intro c rest hc; rcases hc with h|h|h|h <;> subst h <;> rfl)
+        (dupId applyNumEqualVerifyFuse (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyCheckSigVerifyFuse rfl
+        (by intro c rest hc; rcases hc with h|h|h|h <;> subst h <;> rfl)
+        (dupId applyCheckSigVerifyFuse (by intro rest; rfl)) ops h,
+      mathByteFlatRule_id applyEqualVerifyFuse rfl
+        (by intro c rest hc; rcases hc with h|h|h|h <;> subst h <;> rfl)
+        (dupId applyEqualVerifyFuse (by intro rest; rfl)) ops h]
+
+/-- A `mathByteEmitNoFuse` list is `noIfOp`: no math_byte emit op is `.ifOp`. -/
+theorem noIfOp_of_mathByteEmit (ops : List StackOp)
+    (h : mathByteEmitNoFuse ops = true) : noIfOp ops := by
+  induction ops with
+  | nil => exact True.intro
+  | cons op rest ih =>
+      obtain ⟨hOp, hRest⟩ := mathByteEmitNoFuse_cons_tail op rest h
+      cases op with
+      | ifOp _ _ => exact absurd hOp (by simp only [isMathByteEmitOp]; decide)
+      | _ => exact ih hRest
+
+/-- A `mathByteEmitNoFuse` list is `pushFree`: no math_byte emit op is
+`.push`. -/
+theorem pushFree_of_mathByteEmit (ops : List StackOp)
+    (h : mathByteEmitNoFuse ops = true) : pushFree ops := by
+  induction ops with
+  | nil => exact True.intro
+  | cons op rest ih =>
+      obtain ⟨hOp, hRest⟩ := mathByteEmitNoFuse_cons_tail op rest h
+      cases op with
+      | push _ => exact absurd hOp (by simp only [isMathByteEmitOp]; decide)
+      | _ => exact ih hRest
+
+/-- A `mathByteEmitNoFuse` list is `rollPickFoldFlatNoop`: no math_byte emit op
+is a foldable roll/pick. -/
+theorem rollPickFoldFlatNoop_of_mathByteEmit (ops : List StackOp)
+    (h : mathByteEmitNoFuse ops = true) : rollPickFoldFlatNoop ops := by
+  intro op hMem
+  induction ops with
+  | nil => exact absurd hMem (by simp)
+  | cons hd tl ih =>
+      obtain ⟨hHd, hRest⟩ := mathByteEmitNoFuse_cons_tail hd tl h
+      rcases List.mem_cons.mp hMem with hEq | hTail
+      · subst hEq
+        cases op with
+        | roll d => exact absurd hHd (by simp only [isMathByteEmitOp]; decide)
+        | pick d => exact absurd hHd (by simp only [isMathByteEmitOp]; decide)
+        | _ => exact True.intro
+      · exact ih hRest hTail
+
+/-- `applyPushOneAdd` is the identity on a `pushFree` list: it fires only on a
+leading `.push (.bigint _)`, absent here. -/
+private theorem applyPushOneAdd_eq_self_of_pushFree
+    (ops : List StackOp) (h : pushFree ops) : applyPushOneAdd ops = ops := by
+  induction ops with
+  | nil => rfl
+  | cons op rest ih =>
+      cases op with
+      | push _ => exact (show False from h).elim
+      | _ => simp only [applyPushOneAdd, ih (by simpa only [pushFree] using h)]
+
+/-- `applyPushOneSub` is the identity on a `pushFree` list (symmetric). -/
+private theorem applyPushOneSub_eq_self_of_pushFree
+    (ops : List StackOp) (h : pushFree ops) : applyPushOneSub ops = ops := by
+  induction ops with
+  | nil => rfl
+  | cons op rest ih =>
+      cases op with
+      | push _ => exact (show False from h).elim
+      | _ => simp only [applyPushOneSub, ih (by simpa only [pushFree] using h)]
+
+/-- **Wave 48 — `peepholePostFold` is the identity on the math_byte emit op
+shape.** `postFoldList` is the identity (no `.ifOp`), and the two flat
+post-fold rules (`applyPushOneAdd`/`applyPushOneSub`) fire only on a leading
+`.push`, absent here. -/
+theorem peepholePostFold_eq_self_of_mathByteEmit
+    (ops : List StackOp) (h : mathByteEmitNoFuse ops = true) :
+    peepholePostFold ops = ops := by
+  have hNoIf := noIfOp_of_mathByteEmit ops h
+  have hPushFree := pushFree_of_mathByteEmit ops h
+  unfold peepholePostFold
+  rw [postFoldList_eq_self_of_noIfOp ops hNoIf,
+      applyPushOneAdd_eq_self_of_pushFree ops hPushFree,
+      applyPushOneSub_eq_self_of_pushFree ops hPushFree]
+
+/-- **Wave 48 — the math_byte peephole-identity (the M3 half of the
+op-shape).** All four production passes are the literal identity on a
+`mathByteEmitNoFuse` op list — discharged from `mathByteEmitNoFuse` via the
+per-pass identities above (PassAllFlat directly; PostFold/ChainFold/RollPick
+via the `noIfOp` / `pushFree` / `flatNoop` shape facts). -/
+theorem mathByte_peephole_identity
+    (ops : List StackOp) (h : mathByteEmitNoFuse ops = true) :
+    peepholeRollPickFold
+        (peepholeChainFold
+          (peepholePostFold
+            (peepholePassAll ops)))
+      = ops := by
+  have hNoIf := noIfOp_of_mathByteEmit ops h
+  have hPushFree := pushFree_of_mathByteEmit ops h
+  have hRpNoop := rollPickFoldFlatNoop_of_mathByteEmit ops h
+  -- peepholePassAll = peepholePassAllFlat on noIfOp; identity on the shape.
+  have hPassAll : peepholePassAll ops = ops := by
+    rw [peepholePassAll_eq_flat_of_noIfOp ops hNoIf]
+    exact peepholePassAllFlat_eq_self_of_mathByteEmit ops h
+  rw [hPassAll, peepholePostFold_eq_self_of_mathByteEmit ops h,
+      peepholeChainFold_eq_self_of_noIfOp_pushFree ops hNoIf hPushFree,
+      peepholeRollPickFold_eq_self_of_noIfOp_flatNoop ops hNoIf hRpNoop]
+
+/-! ### Wave 48 — MANDATORY smoke (Deliverable A peephole-identity)
+
+A concrete math_byte lowered list: `[.dup, OP_SIZE, OP_NIP, .dup, OP_ABS]`
+(a `len` chunk followed by an `abs` chunk).  The Bool predicate accepts it
+and all four passes are the literal identity. -/
+
+private def mathByteSmokeOps : List StackOp :=
+  [.dup, .opcode "OP_SIZE", .opcode "OP_NIP", .dup, .opcode "OP_ABS"]
+
+private theorem mathByteSmoke_noFuse : mathByteEmitNoFuse mathByteSmokeOps = true := by
+  unfold mathByteSmokeOps; decide
+
+/-- **Wave 48 Deliverable A smoke — the 4-pass peephole identity.** -/
+theorem mathByte_peephole_identity_smoke :
+    peepholeRollPickFold
+        (peepholeChainFold
+          (peepholePostFold
+            (peepholePassAll mathByteSmokeOps)))
+      = mathByteSmokeOps :=
+  mathByte_peephole_identity mathByteSmokeOps mathByteSmoke_noFuse
+
+/-- Anti-vacuity: a list with a `.push` (or any non-math_byte op) is REJECTED
+by `mathByteEmitNoFuse`. -/
+theorem mathByteSmoke_rejects_push :
+    mathByteEmitNoFuse [.push (.bigint 0), .opcode "OP_ABS"] = false := by
+  decide
+
+/-! ### Wave 48 — Deliverable A `AreRunarEmittable` conjunct: HONEST BLOCK
+
+The arith op-shape's first conjunct is `Parse.AreRunarEmittable (lowered).1`.
+The math_byte analogue is BLOCKED, NOT by a missing proof, but by the closed
+`Script.Parse.isAllowedOpcodeName` allowlist (14 names): `OP_ABS`, `OP_SIZE`,
+`OP_BIN2NUM` are NOT in it (and `OP_NIP` is emitted by `builtinOpcode "len"` as
+the STRING `.opcode "OP_NIP"`, not the `.nip` constructor — also outside the
+allowlist).  So `Parse.RunarEmittable (.opcode "OP_SIZE")` is UNPROVABLE: the
+allowlist Bool decides `false`, so the `.opcode` constructor's `h :
+isAllowedOpcodeName name = true` premise cannot be met.
+
+Why this is a genuine architectural gap, not a scope-of-wave-48 omission:
+
+* Extending `isAllowedOpcodeName` to add `OP_ABS/OP_SIZE/OP_NIP/OP_BIN2NUM`
+  modifies `Script/Parse.lean` — OUTSIDE this wave's add-only file set
+  (`AgreesA4` / `Peephole` / `WellTyped`).
+* It would ALSO require four new emit↔parse round-trip lemmas
+  (`parseStackOpFuel_OP_ABS` / `_OP_SIZE` / `_OP_NIP` / `_OP_BIN2NUM`) and
+  re-stamp the `RunarEmittable_roundtrip` proofs that case on the 14-name
+  disjunction (`Script/Parse.lean:1271`, `:1396`, `:1677`, `:2073`).
+* That allowlist + its round-trip set is load-bearing for `runParsedBytes
+  (Emit.emitFast p) = runOps m.ops` (`Pipeline.lean:1063-1074`), so the change
+  ripples into the pipeline's emit/parse layer — a Pipeline.lean-adjacent
+  edit the wave is explicitly forbidden from making (axioms must stay 85).
+
+Precise sub-goal for the retirement wave (the ONE remaining piece of the
+op-shape): add `OP_ABS`, `OP_SIZE`, `OP_NIP`, `OP_BIN2NUM` to
+`Script.Parse.isAllowedOpcodeName`; add the four `parseStackOpFuel_OP_*`
+round-trip lemmas; re-run the `RunarEmittable_roundtrip` case-splits.  THEN the
+math_byte op-shape's `AreRunarEmittable` conjunct is a mechanical
+`AreRunarEmittable.cons` walk over the lowered chunk (`.dup` → `.opcode …`),
+and the full op-shape (this `mathByte_peephole_identity` ∧ that emittability)
+is assembled exactly as `loweredEmittableArithNoDblNeg_opShape`.
+
+We record the gap as an honest `True`-valued marker (body `trivial`, discharges
+nothing) rather than ship a placeholder theorem with a conclusion-restating
+hypothesis (PATH2_PLAN §2.1).  No `sorry`, no new axiom. -/
+def mathByte_areRunarEmittable_GAP : True := trivial
+
 end Peephole
 end RunarVerification.Stack
