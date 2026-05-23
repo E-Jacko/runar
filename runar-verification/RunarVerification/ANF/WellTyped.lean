@@ -435,5 +435,170 @@ theorem smoke_condBool_predicate_fails :
   rw [hC] at hLk
   exact absurd hLk (by decide)
 
+/-! ## Deliverable (Wave 46) — bytes typing for the `math_byte_call` family
+
+The `math_byte_call` retirement family is method bodies built from builtin
+`.call func args` bindings whose operand/return types are MIXED — unlike the
+all-`.bigint` arith fragment.  The single-arg slice of this family is already
+structurally landed in `Stack/AgreesA4.lean` (`structuralCallValue` over
+`abs`/`len`/`bin2num`/`toByteString`/`pack`); its ANF-side success lemma
+(`evalValue_structuralCallValue_ok`) consumes a per-call `argShapeOk`
+hypothesis of shape `∃ b, resolveRef arg = some (.vBytes b)` for the
+bytes-input builtins (`len : bytes → bigint`, `bin2num : bytes → bigint`,
+`toByteString`, …).
+
+That `argShapeOk` premise is, for the `.byteString`-input builtins, exactly
+the bytes analogue of what `EntryBigintTyped` already supplies for arith
+operands.  This deliverable lands the type-fidelity bridge that DISCHARGES it
+from a single declared-type ⇒ runtime-tag hypothesis — `EntryBytesTyped` —
+generalising `EntryBigintTyped` from the all-bigint surface to the
+bytes-typed entries the mixed `math_byte_call` family needs.  No new axioms;
+this is the foundational lemma whose soundness output (`∃ b, resolveRef arg =
+some (.vBytes b)`) is byte-shape-identical to the `argShapeOk` field A4's
+walk already consumes, so the next wave can drop the ad-hoc premise.
+-/
+
+/-- A runtime value is a byte string. -/
+def Value.IsBytes (v : Value) : Prop := ∃ b : ByteArray, v = .vBytes b
+
+/-- A bytes value is not a bool. -/
+theorem Value.IsBytes.not_vBool {v : Value} (h : Value.IsBytes v) :
+    ∀ b : Bool, v ≠ .vBool b := by
+  obtain ⟨ba, hba⟩ := h
+  intro b hEq
+  rw [hba] at hEq
+  exact absurd hEq (by simp)
+
+/-- A bytes value is not a bigint. -/
+theorem Value.IsBytes.not_vBigint {v : Value} (h : Value.IsBytes v) :
+    ∀ i : Int, v ≠ .vBigint i := by
+  obtain ⟨ba, hba⟩ := h
+  intro i hEq
+  rw [hba] at hEq
+  exact absurd hEq (by simp)
+
+/-- The typed-entry hypothesis for byte strings.  Every `.byteString`-declared
+name in `Γ` resolves to a `.vBytes` runtime value in `anfSt`.  This is the
+bytes analogue of `EntryBigintTyped`: the declared-type ⇒ runtime-value-tag
+bridge for the `byteString` slot. -/
+def EntryBytesTyped (Γ : TypeEnv) (anfSt : State) : Prop :=
+  ∀ n : String, Γ.lookup n = some .byteString →
+    ∃ v : Value, anfSt.resolveRef n = some v ∧ Value.IsBytes v
+
+/-- The operand `ref` is declared `.byteString` in `Γ` (structural rule for
+the bytes-input builtins: `len`, `bin2num`, `toByteString`, `cat`'s operands,
+…).  Sibling of `arithOperandBigint`. -/
+def byteOperandBytes (Γ : TypeEnv) (ref : String) : Prop :=
+  Γ.lookup ref = some .byteString
+
+/-- **Bytes operand soundness.**  A `.byteString`-declared operand resolves to
+a `.vBytes` runtime value under the bytes typed-entry hypothesis.  Sibling of
+`operand_isBigint_of_typedEntry`. -/
+theorem arg_isBytes_of_typedEntry
+    (Γ : TypeEnv) (anfSt : State) (ref : String)
+    (hEntry : EntryBytesTyped Γ anfSt)
+    (hTyped : byteOperandBytes Γ ref) :
+    ∃ v : Value, anfSt.resolveRef ref = some v ∧ Value.IsBytes v :=
+  hEntry ref hTyped
+
+/-- **Bytes operand resolves to an explicit `.vBytes b`.**  This is exactly the
+`argShapeOk` field A4's `evalValue_structuralCallValue_ok` consumes for the
+bytes-input builtins (`∃ b, resolveRef arg = some (.vBytes b)`).  Sibling of
+`operand_resolveRef_vBigint_of_typedEntry`. -/
+theorem arg_resolveRef_vBytes_of_typedEntry
+    (Γ : TypeEnv) (anfSt : State) (ref : String)
+    (hEntry : EntryBytesTyped Γ anfSt)
+    (hTyped : byteOperandBytes Γ ref) :
+    ∃ b : ByteArray, anfSt.resolveRef ref = some (.vBytes b) := by
+  obtain ⟨v, hRes, hBytes⟩ := arg_isBytes_of_typedEntry Γ anfSt ref hEntry hTyped
+  obtain ⟨b, hb⟩ := hBytes
+  exact ⟨b, by rw [hRes, hb]⟩
+
+/-- **Bytes `hNonBool` discharge.**  Under the bytes typed-entry, a
+`.byteString`-declared operand's runtime value is never a `.vBool`.  Mirrors
+`lookupAnfByKind_nonBool_of_typedEntry` for the bytes slot — needed so a
+mixed bytes/bool body's failure-step `hNonBool` is also discharged from the
+entry hypothesis. -/
+theorem arg_nonBool_of_typedEntry
+    (Γ : TypeEnv) (anfSt : State) (ref : String)
+    (hEntry : EntryBytesTyped Γ anfSt)
+    (hTyped : byteOperandBytes Γ ref) :
+    ∀ (b : Bool) (v : Value),
+      anfSt.resolveRef ref = some v → v ≠ .vBool b := by
+  obtain ⟨v0, hRes, hBytes⟩ := arg_isBytes_of_typedEntry Γ anfSt ref hEntry hTyped
+  intro b v hResv
+  rw [hRes] at hResv
+  have hvEq : v = v0 := (Option.some.inj hResv).symm
+  rw [hvEq]
+  exact hBytes.not_vBool b
+
+/-! ## Deliverable (Wave 46) — MANDATORY smoke
+
+A concrete WELL-TYPED entry where `s0` is declared `.byteString` and resolves
+to a `.vBytes`, so `arg_resolveRef_vBytes_of_typedEntry` FIRES (this is the
+`argShapeOk` premise for `len(s0)` / `bin2num(s0)`); and a concrete entry
+where `s0` is declared `.bigint` (not bytes), so `EntryBytesTyped` cannot
+supply the bytes resolution — confirming the predicate genuinely pins the
+operand to `.vBytes` and is not vacuously true. -/
+
+/-- Smoke (bytes well-typed) — `s0` declared `.byteString`, `p0` `.bigint`. -/
+def smokeBytesEnv : TypeEnv :=
+  (Typed.TypeEnv.empty.extend "s0" .byteString).extend "p0" .bigint
+
+/-- Smoke (bytes well-typed) — runtime state: `s0 = #[0x01, 0x02]`, `p0 = 7`. -/
+def smokeBytesAnf : State :=
+  { params := [("s0", .vBytes (ByteArray.mk #[0x01, 0x02])), ("p0", .vBigint 7)] }
+
+/-- The bytes typed-entry hypothesis holds for `smokeBytesAnf` under
+`smokeBytesEnv`: the only `.byteString`-declared name (`s0`) resolves to a
+`.vBytes`. -/
+theorem smoke_bytes_entryBytesTyped :
+    EntryBytesTyped smokeBytesEnv smokeBytesAnf := by
+  intro n hn
+  by_cases hs : n = "s0"
+  · subst hs; exact ⟨.vBytes (ByteArray.mk #[0x01, 0x02]), rfl, ⟨_, rfl⟩⟩
+  · exfalso
+    by_cases h0 : n = "p0"
+    · subst h0
+      have hp0 : smokeBytesEnv.lookup "p0" = some .bigint := rfl
+      rw [hp0] at hn; exact absurd hn (by decide)
+    · have hp0 : ("p0" == n) = false := by
+        rw [beq_eq_false_iff_ne]; exact fun h => h0 h.symm
+      have hss : ("s0" == n) = false := by
+        rw [beq_eq_false_iff_ne]; exact fun h => hs h.symm
+      simp only [smokeBytesEnv, Typed.TypeEnv.lookup, Typed.TypeEnv.extend,
+        Typed.TypeEnv.empty, List.find?_cons, hp0, hss, List.find?_nil,
+        Option.map_none, reduceCtorEq] at hn
+
+/-- `s0` is declared `.byteString` in `smokeBytesEnv`. -/
+theorem smoke_bytes_operandBytes :
+    byteOperandBytes smokeBytesEnv "s0" := by
+  show smokeBytesEnv.lookup "s0" = some .byteString; decide
+
+/-- **Smoke (bytes well-typed) — the soundness FIRES.**  The bytes operand `s0`
+resolves to an explicit `.vBytes b` — exactly the `argShapeOk` shape A4's
+single-arg walk consumes for `len`/`bin2num`. -/
+theorem smoke_bytes_soundness_fires :
+    ∃ b : ByteArray, smokeBytesAnf.resolveRef "s0" = some (.vBytes b) :=
+  arg_resolveRef_vBytes_of_typedEntry smokeBytesEnv smokeBytesAnf "s0"
+    smoke_bytes_entryBytesTyped smoke_bytes_operandBytes
+
+/-- Smoke (bytes ill-typed) — `s0` declared `.bigint` (not bytes). -/
+def smokeBytesITEnv : TypeEnv :=
+  (Typed.TypeEnv.empty.extend "s0" .bigint).extend "p0" .bigint
+
+/-- **Smoke (bytes ill-typed) — the structural predicate FAILS.**  `s0` is not
+declared `.byteString`, so `byteOperandBytes` cannot hold — the predicate
+genuinely pins the operand to `.byteString` (had we admitted a `.bigint` `s0`,
+a `.vBigint` runtime value would make a `len(s0)` body diverge between the
+bytes-consuming Script op and the ANF evaluator). -/
+theorem smoke_bytes_predicate_fails :
+    ¬ byteOperandBytes smokeBytesITEnv "s0" := by
+  intro h
+  unfold byteOperandBytes at h
+  have hS0 : smokeBytesITEnv.lookup "s0" = some .bigint := rfl
+  rw [hS0] at h
+  exact absurd h (by decide)
+
 end WellTyped
 end RunarVerification.ANF
