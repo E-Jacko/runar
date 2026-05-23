@@ -2890,5 +2890,54 @@ theorem evalBindings_updateProp_cons_step
   show evalBindings s (.mk bn (.updateProp propName ref) src :: rest) = _
   simp only [evalBindings, hVal, bind, Except.bind]
 
+/-- **Add-only — `loadProp` ANF cons-step (Wave 58).** When the property `n`
+resolves via `lookupProp` to `v`, a `loadProp n` binding advances `evalBindings`
+by exactly one step, leaving the state extended with `bn ↦ v` (the property slot
+itself is unchanged — `loadProp` is a value-COMPUTING read, not a mutation).
+Peer of `evalBindings_binOp_bigint_cons_step` for the `loadProp` value. -/
+theorem evalBindings_loadProp_cons_step
+    (s : State) (bn n : String)
+    (src : Option RunarVerification.ANF.SourceLoc)
+    (v : Value) (rest : List ANFBinding)
+    (hProp : s.lookupProp n = some v) :
+    evalBindings s (.mk bn (.loadProp n) src :: rest)
+      = evalBindings (s.addBinding bn v) rest := by
+  have hVal : evalValue s (.loadProp n) = .ok (v, s) := by
+    simp only [evalValue, hProp]
+  show evalBindings s (.mk bn (.loadProp n) src :: rest) = _
+  simp only [evalBindings, hVal, bind, Except.bind]
+
+/-- **Add-only — `loadConst (.int i)` ANF cons-step (Wave 58).** A
+`loadConst (.int i)` binding advances `evalBindings` by exactly one step,
+unconditionally, leaving the state extended with `bn ↦ .vBigint i` (a constant
+push computes a value and never mutates state). Peer of
+`evalBindings_loadProp_cons_step` for the integer-constant value. -/
+theorem evalBindings_loadConst_int_cons_step
+    (s : State) (bn : String)
+    (src : Option RunarVerification.ANF.SourceLoc)
+    (i : Int) (rest : List ANFBinding) :
+    evalBindings s (.mk bn (.loadConst (.int i)) src :: rest)
+      = evalBindings (s.addBinding bn (.vBigint i)) rest := by
+  have hVal : evalValue s (.loadConst (.int i)) = .ok (.vBigint i, s) := by
+    simp only [evalValue]
+  show evalBindings s (.mk bn (.loadConst (.int i)) src :: rest) = _
+  simp only [evalBindings, hVal, bind, Except.bind]
+
+/-- **Add-only — generic `evalBindings` cons-step from an `evalValue` reduction
+(Wave 58).** When `evalValue s v` succeeds with `(val, s')`, the binding
+`(name, v)` advances `evalBindings` by exactly one step, leaving the state
+`s'.addBinding name val`. This is the value-AGNOSTIC peer of the per-construct
+cons-step lemmas (binOp / unary / updateProp / loadProp / loadConst), exposing the
+generic threading the prefix-reduction builder chains. -/
+theorem evalBindings_cons_of_evalValue
+    (s s' : State) (name : String) (v : ANFValue)
+    (src : Option RunarVerification.ANF.SourceLoc)
+    (val : Value) (rest : List ANFBinding)
+    (hVal : evalValue s v = .ok (val, s')) :
+    evalBindings s (.mk name v src :: rest)
+      = evalBindings (s'.addBinding name val) rest := by
+  show evalBindings s (.mk name v src :: rest) = _
+  simp only [evalBindings, hVal, bind, Except.bind]
+
 end Eval
 end RunarVerification.ANF
