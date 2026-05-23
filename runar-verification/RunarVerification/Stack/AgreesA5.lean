@@ -4505,5 +4505,489 @@ theorem wave58_canonical_body_walk_smoke :
     simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
   exact ⟨hIff, hANFsucc, hIff.mp hANFsucc⟩
 
+/-! ## Wave 62 — Deliverable 2: the from-entry update_prop consume walk (§2.1 M2 leg)
+
+The genuine §2.1-compliant from-entry analogue of `successAgrees_arith_consume_unconditional`
+(AgreesA3) for the canonical `update_prop` fragment.  The wave-57 walk
+(`successAgrees_updateProp_existingHead_unconditional`) is PARAMETERIZED — it takes
+the prefix reduction (`hStkMid` / `hAnfMid`) as DATA hypotheses, which the wave-58
+smoke supplied per-instance.  Supplying them violates §2.1 hypothesis hygiene
+(assuming prefix success).  This wave DERIVES the prefix reduction INTERNALLY from
+the typed entry bundle, so the walk takes ONLY input-side hypotheses.
+
+### Fragment restriction (REQUIRED — wave-61 finding)
+
+The peephole optimiser does NOT preserve `AreRunarEmittablePush` in general
+(`applyPushPushAdd` fuses `[push 10, push 10, OP_ADD] → [push 20]`, and `20 ∉
+[-1,16]`).  So the walk's fragment classifier `updatePropConsumeBody` restricts the
+loaded constant to `[-1, 16]` — keeping the post-peephole image emittable for the
+later M4 leg — and the binary op to the additive emittable pair `{"+", "-"}`.  The
+shape is the canonical stateful-method increment/decrement/add-small-const/
+sub-small-const body:
+
+```
+c0 = load_prop count          -- live property copy at depth 0
+c1 = load_const c   (-1 ≤ c ≤ 16)
+t0 = c0 ± c1                   -- d1d0: c0 at depth 1, c1 at depth 0  ⇒  [swap, swap, opcode]
+u0 = update_prop count t0     -- existing-head: count at depth 1 below t0  ⇒  [nip]
+```
+
+The `prop ± const` value temp is the bulk of real stateful methods (Counter,
+balance updates, fee accumulators).  The `prop ± param` variant is left for later
+(it needs a `loadParam` per-step transport / a param entry-slot, off the canonical
+single-prop entry path). -/
+
+/-- **Wave 62 — the decidable fragment classifier for the from-entry update_prop
+walk.**  Recognises EXACTLY the canonical 4-binding `prop ± small-const ; update_prop`
+shape over the fixed temp names `c0 / c1 / t0 / u0` and a prop `p`, with the op
+restricted to `{"+","-"}` and the constant restricted to `[-1, 16]` (so the
+post-peephole image stays push-emittable).  Decidable Bool — the wave-64 dispatch
+must be able to `decide` it. -/
+def updatePropConsumeBody (p : String) (op : String) (c : Int) : List ANFBinding :=
+  [ ⟨"c0", .loadProp p, none⟩,
+    ⟨"c1", .loadConst (.int c), none⟩,
+    ⟨"t0", .binOp op "c0" "c1" none, none⟩,
+    ⟨"u0", .updateProp p "t0", none⟩ ]
+
+/-- The classifier's admissibility predicate (decidable): op additive-emittable,
+const in `[-1,16]`, and the prop name disjoint from the fixed temp names. -/
+def updatePropConsumeAdmissible (p : String) (op : String) (c : Int) : Bool :=
+  (op == "+" || op == "-")
+    && (-1 ≤ c) && (c ≤ 16)
+    && (p != "c0") && (p != "c1") && (p != "t0") && (p != "u0")
+
+/-- **Wave 62 Deliverable 2 — the from-entry update_prop consume walk.**
+
+The §2.1-compliant M2 leg.  From ONLY input-side hypotheses —
+
+* `agreesTagged [(p, .prop)] initialAnf initialStack` (the runtime-stack alignment
+  the VM decode at method entry provides: the property `p` is on the stack at
+  depth 0),
+* the typed entry bundle (`EntryBigintTyped Γ initialAnf` + `tsmCoherent` +
+  `entryTsmArithTyped`),
+* `untagSm [(p,.prop)] = [p]`,
+* the admissibility classifier (`updatePropConsumeAdmissible p op c = true`),
+
+— it DERIVES the body-level success iff for the canonical `updatePropConsumeBody p op c`.
+The prop value `i` is DERIVED from the typed bundle (via the entry bridge), NOT
+hand-supplied; the prefix reduction (loadProp → loadConst → binOp_d1d0) is DERIVED
+internally by chaining `prefixReduce_cons`, NOT taken as a hypothesis.  The
+existing-head `update_prop` suffix is fired through the parameterized walk.
+
+This is exactly the iff shape `compileSafe_observational_correct_arith_consume`
+consumes (`(evalBindings initialAnf body).isSome ↔ (runOps RAW initialStack).isSome`,
+`RAW = (lowerBindingsP …).1`). -/
+theorem successAgrees_updateProp_consume_unconditional
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (constInts : List (String × Int))
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (p op : String) (c : Int)
+    (initialAnf : State) (initialStack : StackState)
+    (hUntag : untagSm [(p, SlotKind.prop)] = [p])
+    (hAgrees : agreesTagged [(p, SlotKind.prop)] initialAnf initialStack)
+    (hAdmis : updatePropConsumeAdmissible p op c = true)
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hWT : entryTsmArithTyped Γ [(p, SlotKind.prop)])
+    (hCoh : tsmCoherent initialAnf [(p, SlotKind.prop)]) :
+    ((RunarVerification.ANF.Eval.evalBindings initialAnf (updatePropConsumeBody p op c)).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP progMethods props budget 0
+            (Stack.Lower.computeLastUses (updatePropConsumeBody p op c)) []
+            (updatePropConsumeBody p op c |>.map (·.name)) constInts [p]
+            (updatePropConsumeBody p op c)).1 initialStack).toOption.isSome) := by
+  -- Unpack the admissibility classifier into its atomic facts.
+  have hAdmisFacts := hAdmis
+  unfold updatePropConsumeAdmissible at hAdmisFacts
+  simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq,
+    bne_iff_ne, ne_eq] at hAdmisFacts
+  obtain ⟨⟨⟨⟨⟨⟨hOp, hCLo⟩, hCHi⟩, _hPc0⟩, _hPc1⟩, _hPt0⟩, _hPu0⟩ := hAdmisFacts
+  have hEmit : op = "+" ∨ op = "-" := hOp
+  have hEmit3 : op = "+" ∨ op = "-" ∨ op = "*" := by
+    rcases hEmit with h | h
+    · exact Or.inl h
+    · exact Or.inr (Or.inl h)
+  -- The op's opcode is OP_ADD / OP_SUB.
+  have hOpcodeName : Stack.Lower.binopOpcode op none = (if op = "+" then "OP_ADD" else "OP_SUB") := by
+    rcases hEmit with h | h <;> subst h <;> rfl
+  -- DERIVE the prop value `i` from the typed entry bundle.
+  -- `p` is declared `.bigint` in `Γ` (from the structural well-typed predicate).
+  have hTypedP : RunarVerification.ANF.WellTyped.arithOperandBigint Γ p :=
+    hWT (p, SlotKind.prop) (by simp [List.mem_singleton])
+  -- The prop head-correspondence at entry (no binding shadows the prop).
+  have hHeadCorr : initialAnf.resolveRef p = lookupAnfByKind initialAnf (p, SlotKind.prop) :=
+    (hCoh (p, SlotKind.prop) (by simp [List.mem_singleton])).symm
+  obtain ⟨i, hPropVal⟩ :=
+    entryBridge_loadProp_resolves_vBigint Γ initialAnf p hTypedEntry hTypedP hHeadCorr
+  -- Stack-shape: `p` at depth 0 ⇒ the runtime top is `.vBigint i`.
+  have hAlign : taggedStackAligned [(p, SlotKind.prop)] initialAnf initialStack.stack := hAgrees.1
+  obtain ⟨topV, restStk, hStkCases⟩ : ∃ topV restStk, initialStack.stack = topV :: restStk := by
+    match hCases : initialStack.stack with
+    | [] => rw [hCases] at hAlign; unfold taggedStackAligned at hAlign; exact absurd hAlign (by simp)
+    | topV :: restStk => exact ⟨topV, restStk, rfl⟩
+  have hHead : lookupAnfByKind initialAnf (p, SlotKind.prop) = some topV := by
+    rw [hStkCases] at hAlign; unfold taggedStackAligned at hAlign; exact hAlign.1
+  have hLkProp : lookupAnfByKind initialAnf (p, SlotKind.prop) = some (.vBigint i) := hPropVal
+  rw [hLkProp] at hHead
+  have hTopEq : topV = .vBigint i := (Option.some.inj hHead).symm
+  have hStkTop : initialStack.stack = .vBigint i :: initialStack.stack.tail := by
+    rw [hStkCases, hTopEq]; rfl
+  -- Names / last-uses are name-determined, independent of the prop VALUE.
+  let body := updatePropConsumeBody p op c
+  have hBodyDef : body = updatePropConsumeBody p op c := rfl
+  let names := body.map (·.name)
+  have hNamesDef : names = body.map (·.name) := rfl
+  let lastUses := Stack.Lower.computeLastUses body
+  have hLUDef : lastUses = Stack.Lower.computeLastUses body := rfl
+  have hNamesEq : names = ["c0", "c1", "t0", "u0"] := by
+    rw [hNamesDef, hBodyDef]; rfl
+  -- The prefix (first three bindings) and the canonical states.
+  let prefix3 : List ANFBinding :=
+    [ ⟨"c0", .loadProp p, none⟩, ⟨"c1", .loadConst (.int c), none⟩,
+      ⟨"t0", .binOp op "c0" "c1" none, none⟩ ]
+  have hPrefixDef : prefix3 =
+    [ ⟨"c0", .loadProp p, none⟩, ⟨"c1", .loadConst (.int c), none⟩,
+      ⟨"t0", .binOp op "c0" "c1" none, none⟩ ] := rfl
+  have hBodySplit : body = prefix3 ++ [⟨"u0", .updateProp p "t0", none⟩] := by
+    rw [hBodyDef, hPrefixDef]; rfl
+  -- Intermediate ANF states (slot maps unchanged by `evalValue`; `addBinding` in chainer).
+  let anf1 : State := initialAnf.addBinding "c0" (.vBigint i)
+  have hAnf1Def : anf1 = initialAnf.addBinding "c0" (.vBigint i) := rfl
+  let anf2 : State := anf1.addBinding "c1" (.vBigint c)
+  have hAnf2Def : anf2 = anf1.addBinding "c1" (.vBigint c) := rfl
+  let anfMid : State := anf2.addBinding "t0"
+    (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c))
+  have hAnfMidDef : anfMid = anf2.addBinding "t0"
+    (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c)) := rfl
+  -- Runtime midstates over the entry stack's tail `rest = initialStack.stack.tail`
+  -- (the entry alignment fixes only the prop value on top; the rest is unconstrained,
+  -- so the chunk reductions thread it through value-agnostically).
+  let rest : List Value := initialStack.stack.tail
+  have hRestDef : rest = initialStack.stack.tail := rfl
+  let stk1 : StackState := { initialStack with stack := .vBigint i :: .vBigint i :: rest }
+  have hStk1Def : stk1 = { initialStack with stack := .vBigint i :: .vBigint i :: rest } := rfl
+  let stk2 : StackState := { initialStack with stack := .vBigint c :: .vBigint i :: .vBigint i :: rest }
+  have hStk2Def : stk2 = { initialStack with stack := .vBigint c :: .vBigint i :: .vBigint i :: rest } := rfl
+  let stkMid : StackState := { initialStack with
+    stack := .vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c) :: .vBigint i :: rest }
+  have hStkMidDef : stkMid = { initialStack with
+    stack := .vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c) :: .vBigint i :: rest } := rfl
+  -- ===== Last-use facts (name-determined; INDEPENDENT of `p` / `op` / `c`). =====
+  -- `collectRefs (loadProp p) = []` and `collectRefs (updateProp p t0) = [t0]`, so
+  -- the prop name `p` never enters the last-use map; it reduces to a closed list.
+  have hLUeq : lastUses = [("t0", 3), ("c1", 2), ("c0", 2)] := by
+    rw [hLUDef, hBodyDef]
+    unfold updatePropConsumeBody Stack.Lower.computeLastUses
+    simp only [Stack.Lower.computeLastUses.go, Stack.Lower.collectRefs,
+      Stack.Lower.lastUsesUpdate, List.foldl, List.filter]
+    decide
+  have hLU_c0 : Stack.Lower.isLastUse lastUses "c0" 2 = true := by rw [hLUeq]; decide
+  have hLU_c1 : Stack.Lower.isLastUse lastUses "c1" 2 = true := by rw [hLUeq]; decide
+  have hLU_t0 : Stack.Lower.isLastUse lastUses "t0" 3 = true := by rw [hLUeq]; decide
+  -- ===== Step 3 (binOp d1d0) reduction. =====
+  -- lowerValueP for the binOp step: sm = ["c1","c0",p], op d1d0 ⇒ [swap,swap,opcode].
+  have hLowerStep3 :
+      Stack.Lower.lowerValueP progMethods props budget 2 lastUses [] names constInts
+          ["c1", "c0", p] "t0" (.binOp op "c0" "c1" none)
+        = ([StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)], ["t0", p], names) := by
+    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+      Stack.Lower.StackMap.depth?
+    have hF0 : (["c1", "c0", p] : StackMap).findIdx? (· == "c0") = some 1 := by
+      unfold List.findIdx?; simp [List.findIdx?.go]
+    have hF1 : (["c0", "c1", p] : StackMap).findIdx? (· == "c1") = some 1 := by
+      unfold List.findIdx?; simp [List.findIdx?.go]
+    simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
+      hLU_c0, hLU_c1, hF0, hF1, if_true]
+    have hNB : (op == "!==" && none == some "bytes") = false := by
+      rcases hEmit with h | h <;> subst h <;> rfl
+    simp only [hNB, Bool.false_eq_true, if_false, List.append_assoc, List.cons_append,
+      List.nil_append, Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push]
+  -- The d1d0 chunk runs on stk2 (= [c, i, i]) value-agnostically.
+  have hChunk3 :
+      runOps [StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)] stk2 = .ok stkMid := by
+    rw [hOpcodeName]
+    rcases hEmit with h | h <;> subst h <;>
+      (rw [hStk2Def, hStkMidDef]
+       simp only [runOps, Stack.Eval.stepNonIf, Stack.Eval.applySwap, Stack.Eval.runOpcode,
+         Stack.Eval.liftIntBin, Stack.Eval.asInt?, Stack.Eval.popN, Stack.Eval.StackState.push,
+         Stack.Eval.StackState.pop?, RunarVerification.ANF.Eval.arithBinResultBigint]
+       rfl)
+  -- ANF operand resolutions for the binOp step.
+  have hC0res : anf2.resolveRef "c0" = some (.vBigint i) := by
+    rw [hAnf2Def, hAnf1Def]; unfold State.resolveRef State.lookupBinding State.addBinding
+    simp [List.find?]
+  have hC1res : anf2.resolveRef "c1" = some (.vBigint c) := by
+    rw [hAnf2Def, hAnf1Def]; unfold State.resolveRef State.lookupBinding State.addBinding
+    simp [List.find?]
+  have hStep3 :
+      runOps (Stack.Lower.lowerBindingsP progMethods props budget 2 lastUses [] names constInts
+          ["c1", "c0", p] [⟨"t0", .binOp op "c0" "c1" none, none⟩]).1 stk2 = .ok stkMid
+      ∧ RunarVerification.ANF.Eval.evalBindings anf2 [⟨"t0", .binOp op "c0" "c1" none, none⟩]
+        = .ok anfMid :=
+    prefixReduce_cons progMethods props budget 2 lastUses names names constInts
+      ["c1", "c0", p] ["t0", p] anf2 anf2 anfMid stk2 stkMid stkMid
+      "t0" (.binOp op "c0" "c1" none) none
+      (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c)) []
+      [StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)]
+      hLowerStep3 hChunk3
+      (by
+        show RunarVerification.ANF.Eval.evalValue anf2 (.binOp op "c0" "c1" none)
+          = .ok (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c), anf2)
+        simp only [RunarVerification.ANF.Eval.evalValue, RunarVerification.ANF.Eval.lookupRef,
+          hC0res, hC1res, bind, Except.bind,
+          RunarVerification.ANF.Eval.evalBinOp_emittable_bigint op i c none hEmit3]
+        rfl)
+      (by rw [Stack.Lower.lowerBindingsP]; exact Stack.Eval.runOps_nil _)
+      (by rw [hAnfMidDef]; simp only [RunarVerification.ANF.Eval.evalBindings])
+  -- ===== Step 2 (loadConst). =====
+  have hLowerStep2 :
+      Stack.Lower.lowerValueP progMethods props budget 1 lastUses [] names constInts
+          ["c0", p] "c1" (.loadConst (.int c))
+        = ([StackOp.push (.bigint c)], ["c1", "c0", p], names) := by
+    unfold Stack.Lower.lowerValueP Stack.Lower.emitConst Stack.Lower.StackMap.push; rfl
+  have hStep2 :
+      runOps (Stack.Lower.lowerBindingsP progMethods props budget 1 lastUses [] names constInts
+          ["c0", p] (⟨"c1", .loadConst (.int c), none⟩ ::
+            [⟨"t0", .binOp op "c0" "c1" none, none⟩])).1 stk1 = .ok stkMid
+      ∧ RunarVerification.ANF.Eval.evalBindings anf1
+          (⟨"c1", .loadConst (.int c), none⟩ :: [⟨"t0", .binOp op "c0" "c1" none, none⟩])
+        = .ok anfMid :=
+    prefixReduce_cons progMethods props budget 1 lastUses names names constInts
+      ["c0", p] ["c1", "c0", p] anf1 anf1 anfMid stk1 stk2 stkMid
+      "c1" (.loadConst (.int c)) none (.vBigint c) [⟨"t0", .binOp op "c0" "c1" none, none⟩]
+      [StackOp.push (.bigint c)]
+      hLowerStep2
+      (by
+        show runOps [StackOp.push (.bigint c)] stk1 = _
+        rw [hStk1Def, hStk2Def]
+        unfold runOps; rw [Stack.Eval.stepNonIf_push_bigint]
+        simp only [Stack.Eval.runOps_nil, Stack.Eval.StackState.push])
+      (by simp only [RunarVerification.ANF.Eval.evalValue])
+      (by rw [hAnf2Def] at hStep3; exact hStep3.1)
+      (by rw [hAnf2Def] at hStep3; exact hStep3.2)
+  -- ===== Step 1 (loadProp). =====
+  have hLowerStep1 :
+      Stack.Lower.lowerValueP progMethods props budget 0 lastUses [] names constInts
+          [p] "c0" (.loadProp p)
+        = ([StackOp.dup], ["c0", p], names) := by
+    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLiveCopy Stack.Lower.bringToTop
+      Stack.Lower.StackMap.depth?
+    have hFind : ([p] : StackMap).findIdx? (· == p) = some 0 := by
+      unfold List.findIdx?; simp [List.findIdx?.go]
+    rw [hFind]; rfl
+  have hPropLkInitial : initialAnf.lookupProp p = some (.vBigint i) := hPropVal
+  have hStep1 :
+      runOps (Stack.Lower.lowerBindingsP progMethods props budget 0 lastUses [] names constInts
+          [p] prefix3).1 initialStack = .ok stkMid
+      ∧ RunarVerification.ANF.Eval.evalBindings initialAnf prefix3 = .ok anfMid := by
+    rw [hPrefixDef]
+    exact prefixReduce_cons progMethods props budget 0 lastUses names names constInts
+      [p] ["c0", p] initialAnf initialAnf anfMid initialStack stk1 stkMid
+      "c0" (.loadProp p) none (.vBigint i)
+      [⟨"c1", .loadConst (.int c), none⟩, ⟨"t0", .binOp op "c0" "c1" none, none⟩]
+      [StackOp.dup]
+      hLowerStep1
+      (by
+        show runOps [StackOp.dup] initialStack = .ok stk1
+        rw [hStk1Def]
+        have hDup := Stack.Sim.run_dup_nonEmpty initialStack (.vBigint i) initialStack.stack.tail hStkTop
+        rw [hDup]
+        have hPushEq : (initialStack.push (.vBigint i) : StackState)
+          = { initialStack with stack := .vBigint i :: .vBigint i :: rest } := by
+          unfold Stack.Eval.StackState.push
+          rw [hRestDef, ← hStkTop]
+        rw [hPushEq])
+      (by
+        show RunarVerification.ANF.Eval.evalValue initialAnf (.loadProp p)
+          = .ok (.vBigint i, initialAnf)
+        simp only [RunarVerification.ANF.Eval.evalValue, hPropLkInitial])
+      (by rw [hAnf1Def] at hStep2; exact hStep2.1)
+      (by rw [hAnf1Def] at hStep2; exact hStep2.2)
+  obtain ⟨hStkMidRun, hAnfMidRun⟩ := hStep1
+  -- ===== The lowering split at the suffix binding. =====
+  have hLowerSplit :
+      (Stack.Lower.lowerBindingsP progMethods props budget 0 lastUses [] names constInts [p]
+          (prefix3 ++ [⟨"u0", .updateProp p "t0", none⟩])).1
+        = (Stack.Lower.lowerBindingsP progMethods props budget 0 lastUses [] names constInts [p]
+              prefix3).1
+          ++ (Stack.Lower.lowerValueP progMethods props budget 3 lastUses [] names constInts
+                ("t0" :: p :: []) "u0" (.updateProp p "t0")).1 := by
+    have hSm0 : (Stack.Lower.lowerValueP progMethods props budget 0 lastUses [] names constInts
+        [p] "c0" (.loadProp p)).2.1 = ["c0", p] := by rw [hLowerStep1]
+    have hLb0 : (Stack.Lower.lowerValueP progMethods props budget 0 lastUses [] names constInts
+        [p] "c0" (.loadProp p)).2.2 = names := by rw [hLowerStep1]
+    have hSm1 : (Stack.Lower.lowerValueP progMethods props budget 1 lastUses [] names constInts
+        ["c0", p] "c1" (.loadConst (.int c))).2.1 = ["c1", "c0", p] := by rw [hLowerStep2]
+    have hLb1 : (Stack.Lower.lowerValueP progMethods props budget 1 lastUses [] names constInts
+        ["c0", p] "c1" (.loadConst (.int c))).2.2 = names := by rw [hLowerStep2]
+    have hSm2 : (Stack.Lower.lowerValueP progMethods props budget 2 lastUses [] names constInts
+        ["c1", "c0", p] "t0" (.binOp op "c0" "c1" none)).2.1 = ["t0", p] := by rw [hLowerStep3]
+    have hLb2 : (Stack.Lower.lowerValueP progMethods props budget 2 lastUses [] names constInts
+        ["c1", "c0", p] "t0" (.binOp op "c0" "c1" none)).2.2 = names := by rw [hLowerStep3]
+    rw [hPrefixDef]
+    show (Stack.Lower.lowerBindingsP progMethods props budget 0 lastUses [] names constInts [p]
+        (⟨"c0", .loadProp p, none⟩ :: ⟨"c1", .loadConst (.int c), none⟩ ::
+          ⟨"t0", .binOp op "c0" "c1" none, none⟩ :: [⟨"u0", .updateProp p "t0", none⟩])).1
+      = ((Stack.Lower.lowerBindingsP progMethods props budget 0 lastUses [] names constInts [p]
+            (⟨"c0", .loadProp p, none⟩ :: ⟨"c1", .loadConst (.int c), none⟩ ::
+              [⟨"t0", .binOp op "c0" "c1" none, none⟩])).1
+          ++ (Stack.Lower.lowerValueP progMethods props budget 3 lastUses [] names constInts
+                ("t0" :: p :: []) "u0" (.updateProp p "t0")).1)
+    simp only [Stack.Lower.lowerBindingsP, hSm0, hLb0, hSm1, hLb1, hSm2, hLb2, List.append_assoc,
+      List.append_nil]
+  -- ===== Boundary facts at the canonical midstate. =====
+  have hMidRef : anfMid.resolveRef "t0"
+      = some (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c)) := by
+    rw [hAnfMidDef]; unfold State.resolveRef State.lookupBinding State.addBinding; simp [List.find?]
+  have hMidStk : stkMid.stack
+      = .vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c) :: .vBigint i :: rest := by
+    rw [hStkMidDef]
+  -- The prop slot at the midstate still resolves to `i` (binOp does not touch props).
+  -- `lookupProp p` reads `initialAnf.props` (addBinding leaves `props` unchanged).
+  have hMidPropLk : State.lookupProp anfMid p = some (.vBigint i) := by
+    show State.lookupProp anfMid p = some (.vBigint i)
+    have : State.lookupProp anfMid p = State.lookupProp initialAnf p := rfl
+    rw [this]; exact hPropLkInitial
+  -- The midstate outputs equal the entry outputs (addBinding doesn't touch them),
+  -- which equal the runtime outputs via the entry agreement.
+  have hOutEq : anfMid.outputs = stkMid.outputs := by
+    show anfMid.outputs = stkMid.outputs
+    have hA : anfMid.outputs = initialAnf.outputs := rfl
+    have hS : stkMid.outputs = initialStack.outputs := rfl
+    rw [hA, hS]; exact hAgrees.2.2
+  have hMidAgrees : agreesTaggedModProps
+      [("t0", SlotKind.binding), (p, SlotKind.prop)] anfMid stkMid := by
+    refine ⟨?_, ?_⟩
+    · show taggedStackAligned [("t0", SlotKind.binding), (p, SlotKind.prop)] anfMid
+        (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c) :: .vBigint i :: rest)
+      refine ⟨?_, ?_, ?_⟩
+      · show State.lookupBinding anfMid "t0"
+          = some (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c))
+        rw [hAnfMidDef]; unfold State.addBinding State.lookupBinding; simp [List.find?]
+      · show State.lookupProp anfMid p = some (.vBigint i); exact hMidPropLk
+      · trivial
+    · exact hOutEq
+  -- ===== Fire the wave-57 existing-head walk on the DERIVED midstate. =====
+  have hWalk :
+      (RunarVerification.ANF.Eval.evalBindings initialAnf
+          (prefix3 ++ [⟨"u0", .updateProp p "t0", none⟩])).toOption.isSome
+        ↔ (runOps (Stack.Lower.lowerBindingsP progMethods props budget 0 lastUses [] names constInts
+              [p] (prefix3 ++ [⟨"u0", .updateProp p "t0", none⟩])).1
+              initialStack).toOption.isSome :=
+    successAgrees_updateProp_existingHead_unconditional progMethods props budget lastUses constInts
+      prefix3 [p] names 0
+      initialAnf initialStack "u0" p "t0" none
+      anfMid stkMid 3 [] []
+      (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op i c)) (.vBigint i) rest
+      hAnfMidRun hStkMidRun hLowerSplit hMidStk rfl hMidAgrees hMidRef
+      (by rw [hLUeq]; decide)
+      (by intro s hs; simp at hs)
+      (by unfold freshIn untagSm; simp)
+  -- Fold the goal into the `body` / `names` / `lastUses` `let`-terms (all defeq),
+  -- then re-fold `body = prefix3 ++ [updateProp]` and discharge by the walk.
+  show (RunarVerification.ANF.Eval.evalBindings initialAnf body).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP progMethods props budget 0 lastUses [] names constInts
+            [p] body).1 initialStack).toOption.isSome
+  rw [hBodySplit]
+  exact hWalk
+
+/-! ## Wave 62 — MANDATORY smoke 2: the from-entry walk on the canonical body
+
+The canonical `count + 1 ; update_prop count` body, fired through the from-entry
+walk `successAgrees_updateProp_consume_unconditional` — DERIVING the iff FROM the
+typed entry bundle (NO hand-supplied prefix reduction, NO `native_decide` over the
+iff).  Anti-vacuous: both sides `isSome`. -/
+
+/-- Smoke typing context: `count` declared `.bigint`. -/
+private def wave62WalkEnv : RunarVerification.ANF.WellTyped.TypeEnv :=
+  RunarVerification.ANF.Typed.TypeEnv.empty.extend "count" .bigint
+
+/-- Smoke entry ANF: property `count ↦ 5`. -/
+private def wave62WalkAnf : State := { props := [("count", .vBigint 5)] }
+
+/-- Smoke entry runtime stack (props mirror the ANF). -/
+private def wave62WalkStk : StackState :=
+  { stack := [.vBigint 5], props := [("count", .vBigint 5)] }
+
+private theorem wave62_walk_entryBigintTyped :
+    RunarVerification.ANF.WellTyped.EntryBigintTyped wave62WalkEnv wave62WalkAnf := by
+  intro nm hnm
+  by_cases h : nm = "count"
+  · subst h; exact ⟨.vBigint 5, rfl, ⟨5, rfl⟩⟩
+  · exfalso
+    have hc : ("count" == nm) = false := by
+      rw [beq_eq_false_iff_ne]; exact fun hh => h hh.symm
+    simp only [wave62WalkEnv, RunarVerification.ANF.Typed.TypeEnv.lookup,
+      RunarVerification.ANF.Typed.TypeEnv.extend, RunarVerification.ANF.Typed.TypeEnv.empty,
+      List.find?_cons, hc, List.find?_nil, Option.map_none, reduceCtorEq] at hnm
+
+private theorem wave62_walk_agreesTagged :
+    agreesTagged [("count", SlotKind.prop)] wave62WalkAnf wave62WalkStk := by
+  refine ⟨?_, rfl, rfl⟩
+  show taggedStackAligned [("count", SlotKind.prop)] wave62WalkAnf wave62WalkStk.stack
+  refine ⟨?_, ?_⟩
+  · show lookupAnfByKind wave62WalkAnf ("count", SlotKind.prop) = some (.vBigint 5); rfl
+  · trivial
+
+private theorem wave62_walk_coh : tsmCoherent wave62WalkAnf [("count", SlotKind.prop)] := by
+  intro s hs
+  simp only [List.mem_singleton] at hs
+  subst hs
+  show lookupAnfByKind wave62WalkAnf ("count", SlotKind.prop) = wave62WalkAnf.resolveRef "count"
+  rfl
+
+private theorem wave62_walk_wt : entryTsmArithTyped wave62WalkEnv [("count", SlotKind.prop)] := by
+  intro s hs
+  simp only [List.mem_singleton] at hs
+  subst hs
+  show wave62WalkEnv.lookup "count" = some .bigint; decide
+
+/-- **Wave 62 — the from-entry walk smoke (DELIVERABLE 2, §2.1-COMPLIANT).**
+
+The canonical `count + 1 ; update_prop count` body fired through
+`successAgrees_updateProp_consume_unconditional` — DERIVING the body iff FROM the
+typed entry bundle (entry `agreesTagged` + `EntryBigintTyped` + `tsmCoherent` +
+`entryTsmArithTyped` + the admissibility classifier), with NO hand-supplied prefix
+reduction.  We obtain the iff and confirm both sides `isSome` (anti-vacuous). -/
+theorem wave62_from_entry_walk_smoke :
+    ( (RunarVerification.ANF.Eval.evalBindings wave62WalkAnf
+          (updatePropConsumeBody "count" "+" 1)).toOption.isSome
+        ↔ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0
+              (Stack.Lower.computeLastUses (updatePropConsumeBody "count" "+" 1)) []
+              (updatePropConsumeBody "count" "+" 1 |>.map (·.name)) [] ["count"]
+              (updatePropConsumeBody "count" "+" 1)).1 wave62WalkStk).toOption.isSome )
+    ∧ (RunarVerification.ANF.Eval.evalBindings wave62WalkAnf
+          (updatePropConsumeBody "count" "+" 1)).toOption.isSome
+    ∧ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0
+          (Stack.Lower.computeLastUses (updatePropConsumeBody "count" "+" 1)) []
+          (updatePropConsumeBody "count" "+" 1 |>.map (·.name)) [] ["count"]
+          (updatePropConsumeBody "count" "+" 1)).1 wave62WalkStk).toOption.isSome := by
+  have hIff :
+      ( (RunarVerification.ANF.Eval.evalBindings wave62WalkAnf
+            (updatePropConsumeBody "count" "+" 1)).toOption.isSome
+          ↔ (runOps (Stack.Lower.lowerBindingsP [] [] 1000 0
+                (Stack.Lower.computeLastUses (updatePropConsumeBody "count" "+" 1)) []
+                (updatePropConsumeBody "count" "+" 1 |>.map (·.name)) [] ["count"]
+                (updatePropConsumeBody "count" "+" 1)).1 wave62WalkStk).toOption.isSome ) :=
+    successAgrees_updateProp_consume_unconditional [] [] 1000 [] wave62WalkEnv
+      "count" "+" 1 wave62WalkAnf wave62WalkStk
+      rfl wave62_walk_agreesTagged (by decide)
+      wave62_walk_entryBigintTyped wave62_walk_wt wave62_walk_coh
+  -- The ANF side concretely succeeds (the whole body runs to `.ok`).
+  have hANFsucc :
+      (RunarVerification.ANF.Eval.evalBindings wave62WalkAnf
+          (updatePropConsumeBody "count" "+" 1)).toOption.isSome := by
+    show (RunarVerification.ANF.Eval.evalBindings wave62WalkAnf
+      [ ⟨"c0", .loadProp "count", none⟩, ⟨"c1", .loadConst (.int 1), none⟩,
+        ⟨"t0", .binOp "+" "c0" "c1" none, none⟩,
+        ⟨"u0", .updateProp "count" "t0", none⟩ ]).toOption.isSome
+    rw [RunarVerification.ANF.Eval.evalBindings_loadProp_cons_step wave62WalkAnf "c0" "count"
+          none (.vBigint 5) _ rfl]
+    rw [RunarVerification.ANF.Eval.evalBindings_loadConst_int_cons_step _ "c1" none 1 _]
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          _ "t0" "+" "c0" "c1" none none 5 1 _ (Or.inl rfl) rfl rfl]
+    rw [RunarVerification.ANF.Eval.evalBindings_updateProp_cons_step
+          _ "u0" "count" "t0" none (.vBigint 6) [] rfl]
+    simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+  exact ⟨hIff, hANFsucc, hIff.mp hANFsucc⟩
+
 end Agrees
 end RunarVerification.Stack

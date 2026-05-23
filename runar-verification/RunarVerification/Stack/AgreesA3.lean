@@ -16165,5 +16165,322 @@ theorem wave35_unconditional_walk_smoke :
     simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
   exact ⟨hIff, hANF, hIff.mp hANF⟩
 
+/-! ### Wave 62 — Deliverable 1: the d1d0 binOp consume transport
+
+The d1d0 PEER of the d0d1 `agrees_success_step_binOp` / `build_consume_binOp_witness_d0d1`.
+
+In the d0d1 layout the LEFT operand sits at depth 0 (stack top) and the RIGHT at
+depth 1, so the per-binding consume chunk is `[.swap, .opcode]`.  In the d1d0
+layout — which the canonical `update_prop` body `count + 1` lowers (the live
+property copy `count` ends up at depth 1, the freshly-pushed const `1` at depth 0,
+so `binOp + count 1` has its LEFT operand `count` at depth 1 and its RIGHT operand
+`1` at depth 0) — the per-binding consume chunk is `[.swap, .swap, .opcode]`.
+
+`build_consume_binOp_witness_d1d0` derives that `[.swap, .swap, .opcode]` shape
+INTERNALLY from the stack-map shape `sm = r :: l :: smRest` (right operand at
+depth 0, left at depth 1) plus the two last-use consume flags, then dispatches to
+the `Agrees.lean` core `stageC_simpleStep_binOp_d1d0_consume_core`.  The two swaps
+are a runtime identity, so the opcode runs against the ORIGINAL stack `b :: a ::
+rest` (right `b` on top, left `a` at depth 1), pushing `emittableBinOpResult op a b
+= a op b` — the correct left-op-right result. -/
+
+/-- **Wave 62 Deliverable 1 — per-binding consume `runOps` witness for a binOp
+whose operands sit at depths (1, 0)** (left `l` at depth 1, right `r` at depth 0).
+
+Derives `(lowerValueP …).1 = [.swap, .swap, .opcode (binopOpcode op rt)]`
+INTERNALLY from `sm = r :: l :: smRest` (so `l` is at depth 1 and, after the first
+swap loads it, `r` is at depth 1 in the swapped map) + the last-use consume flags,
+then dispatches to `stageC_simpleStep_binOp_d1d0_consume_core`.
+
+`outerProtected` is `[]`; the consume flags reduce to `isLastUse`.  The two swaps
+form a runtime identity, so the supplied opcode fact (`hOpcode`) runs against the
+original `stkSt` whose top two are `b :: a` (right-on-top), discharged per-opcode
+via `runOpcode_emittableBinOp`. -/
+theorem build_consume_binOp_witness_d1d0
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (smRest : StackMap) (name : String)
+    (op l r : String) (rt : Option String) (a b : Int)
+    (k_l k_r : SlotKind) (tsm_rest : TaggedStackMap)
+    (anfSt : State) (stkSt : StackState) (out : RunarVerification.ANF.Eval.Value)
+    (hNeq : (r == l) = false)
+    (hLastUseL : Stack.Lower.isLastUse lastUses l currentIndex = true)
+    (hLastUseR : Stack.Lower.isLastUse lastUses r currentIndex = true)
+    (hNotBytes : (op == "!==" && rt == some "bytes") = false)
+    (hAgrees : agreesTagged ((r, k_r) :: (l, k_l) :: tsm_rest) anfSt stkSt)
+    (hLookupL : lookupAnfByKind anfSt (l, k_l) = some (.vBigint a))
+    (hLookupR : lookupAnfByKind anfSt (r, k_r) = some (.vBigint b))
+    (hOpcode :
+      Stack.Eval.runOpcode (Stack.Lower.binopOpcode op rt) stkSt
+        = .ok ({stkSt with stack := stkSt.stack.tail.tail}.push out)) :
+    runOps (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+              [] localBindings constInts (r :: l :: smRest) name (.binOp op l r rt)).1 stkSt
+      = .ok ({stkSt with stack := stkSt.stack.tail.tail}.push out) := by
+  -- `findIdx?` facts: `l` is at depth 1 in `r :: l :: smRest`, and `r` is at
+  -- depth 1 in the post-first-swap map `l :: r :: smRest`.
+  have hFindL : (r :: l :: smRest).findIdx? (· == l) = some 1 := by
+    unfold List.findIdx?; simp [List.findIdx?.go, hNeq]
+  have hLrNeq : (l == r) = false := by
+    rw [beq_eq_false_iff_ne]; rw [beq_eq_false_iff_ne] at hNeq; exact fun h => hNeq h.symm
+  have hFindR : (l :: r :: smRest).findIdx? (· == r) = some 1 := by
+    unfold List.findIdx?; simp [List.findIdx?.go, hLrNeq]
+  -- Derive the lowered-ops shape `[.swap, .swap, .opcode (binopOpcode op rt)]`.
+  have hOps :
+      (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+          [] localBindings constInts (r :: l :: smRest) name (.binOp op l r rt)).1
+        = [StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op rt)] := by
+    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+      Stack.Lower.StackMap.depth?
+    simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
+      hLastUseL, hLastUseR, hFindL, hFindR, if_true, hNotBytes, Bool.false_eq_true, if_false,
+      List.append_assoc, List.cons_append, List.nil_append]
+  rw [hOps]
+  exact stageC_simpleStep_binOp_d1d0_consume_core
+    r l k_r k_l tsm_rest anfSt stkSt a b
+    (Stack.Lower.binopOpcode op rt) out
+    [StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op rt)]
+    hAgrees hLookupL hLookupR rfl hOpcode
+
+/-- **Wave 62 Deliverable 1 — per-binding SUCCESS lockstep at a d1d0 binOp.**
+The d1d0 peer of `agrees_success_step_binOp` (which is d0d1).  Operands: LEFT `l`
+at depth 1, RIGHT `r` at depth 0, both consumed on last use.  The per-binding
+lowered chunk is `[.swap, .swap, .opcode (binopOpcode op rt)]` ++ `restOps`.
+
+Under `agreesTagged` over `(r, k_r) :: (l, k_l) :: tsm_rest` (the d1d0 stack order:
+right on top, left at depth 1), with BOTH operands resolving to `.vBigint` and the
+head-correspondence facts, both evaluators advance by exactly one binding:
+
+* the success bits agree (both reduce to the same continuation on the post-state),
+  and
+* FULL `agreesTagged` holds at the post-consume state, with the new binding
+  `name ↦ .vBigint (arithBinResultBigint op a b)`.
+
+The chunk-`++`-`restOps` packaging is `runOps_append` + the d1d0 chunk witness
+`build_consume_binOp_witness_d1d0`. -/
+theorem agrees_success_step_binOp_d1d0
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (smRest : StackMap)
+    (anfSt : State) (stkSt : StackState)
+    (name op l r : String) (rt : Option String)
+    (src : Option RunarVerification.ANF.SourceLoc)
+    (k_l k_r : SlotKind) (tsm_rest : TaggedStackMap)
+    (anfRest : List ANFBinding) (restOps : List StackOp)
+    (a b : Int)
+    (hEmit : op = "+" ∨ op = "-" ∨ op = "*")
+    (hNeq : (r == l) = false)
+    (hLastUseL : Stack.Lower.isLastUse lastUses l currentIndex = true)
+    (hLastUseR : Stack.Lower.isLastUse lastUses r currentIndex = true)
+    (hAgrees : agreesTagged ((r, k_r) :: (l, k_l) :: tsm_rest) anfSt stkSt)
+    (hHeadCorrL : anfSt.resolveRef l = lookupAnfByKind anfSt (l, k_l))
+    (hHeadCorrR : anfSt.resolveRef r = lookupAnfByKind anfSt (r, k_r))
+    (hBigintL : lookupAnfByKind anfSt (l, k_l) = some (.vBigint a))
+    (hBigintR : lookupAnfByKind anfSt (r, k_r) = some (.vBigint b))
+    (hFresh : freshIn name (untagSm tsm_rest)) :
+    ( ( (RunarVerification.ANF.Eval.evalBindings anfSt
+            (.mk name (.binOp op l r rt) src :: anfRest)).toOption.isSome
+          ↔ (runOps ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                [] localBindings constInts (r :: l :: smRest) name (.binOp op l r rt)).1 ++ restOps)
+              stkSt).toOption.isSome )
+      ↔ ( (RunarVerification.ANF.Eval.evalBindings
+              (anfSt.addBinding name
+                (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b)))
+              anfRest).toOption.isSome
+          ↔ (runOps restOps
+                ({stkSt with stack := stkSt.stack.tail.tail}.push
+                  (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b)))).toOption.isSome ) )
+    ∧ agreesTagged ((name, .binding) :: tsm_rest)
+        (anfSt.addBinding name (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b)))
+        ({stkSt with stack := stkSt.stack.tail.tail}.push
+          (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b))) := by
+  -- ANF operand resolutions (head correspondence).
+  have hResolveL : anfSt.resolveRef l = some (.vBigint a) := by rw [hHeadCorrL]; exact hBigintL
+  have hResolveR : anfSt.resolveRef r = some (.vBigint b) := by rw [hHeadCorrR]; exact hBigintR
+  -- ANF cons-step (`out := .vBigint (arithBinResultBigint op a b)`).
+  have hANF :
+      RunarVerification.ANF.Eval.evalBindings anfSt
+          (.mk name (.binOp op l r rt) src :: anfRest)
+        = RunarVerification.ANF.Eval.evalBindings (anfSt.addBinding name
+            (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b))) anfRest :=
+    RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+      anfSt name op l r rt src a b anfRest hEmit hResolveL hResolveR
+  -- The runtime top two are `b :: a :: rest` (right on top at depth 0, left at
+  -- depth 1), from `agreesTagged` + the operand lookups.
+  have hAlign : taggedStackAligned ((r, k_r) :: (l, k_l) :: tsm_rest) anfSt stkSt.stack :=
+    hAgrees.1
+  obtain ⟨v0, v1, restStk, hStk⟩ :
+      ∃ v0 v1 restStk, stkSt.stack = v0 :: v1 :: restStk := by
+    match hCases : stkSt.stack with
+    | [] =>
+        rw [hCases] at hAlign; unfold taggedStackAligned at hAlign
+        exact absurd hAlign (by simp)
+    | [_] =>
+        rw [hCases] at hAlign; unfold taggedStackAligned at hAlign
+        obtain ⟨_, hTail⟩ := hAlign
+        unfold taggedStackAligned at hTail
+        exact absurd hTail (by simp)
+    | v0 :: v1 :: restStk => exact ⟨v0, v1, restStk, rfl⟩
+  rw [hStk] at hAlign
+  unfold taggedStackAligned at hAlign
+  obtain ⟨hHeadR, hAlign1⟩ := hAlign
+  unfold taggedStackAligned at hAlign1
+  obtain ⟨hHeadL, _⟩ := hAlign1
+  have hV0 : v0 = .vBigint b := by
+    have : some v0 = some (.vBigint b) := hHeadR.symm.trans hBigintR
+    exact Option.some.inj this
+  have hV1 : v1 = .vBigint a := by
+    have : some v1 = some (.vBigint a) := hHeadL.symm.trans hBigintL
+    exact Option.some.inj this
+  have hStk' : stkSt.stack = .vBigint b :: .vBigint a :: restStk := by
+    rw [hStk, hV0, hV1]
+  -- The emittable opcode fact at the d1d0 stack `b :: a :: rest`.
+  have hOpcode :
+      Stack.Eval.runOpcode (Stack.Lower.binopOpcode op rt) stkSt
+        = .ok ({stkSt with stack := stkSt.stack.tail.tail}.push
+            (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b))) := by
+    have hOp := runOpcode_emittableBinOp op rt stkSt a b restStk hStk' hEmit
+    have hRes : emittableBinOpResult op a b
+        = RunarVerification.ANF.Eval.arithBinResultBigint op a b := by
+      rcases hEmit with h | h | h <;> subst h <;> rfl
+    have hTailTail : stkSt.stack.tail.tail = restStk := by rw [hStk']; rfl
+    rw [hRes] at hOp; rw [hTailTail]; exact hOp
+  -- The d1d0 chunk witness.
+  have hChunk :
+      runOps (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                [] localBindings constInts (r :: l :: smRest) name (.binOp op l r rt)).1 stkSt
+        = .ok ({stkSt with stack := stkSt.stack.tail.tail}.push
+            (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b))) :=
+    build_consume_binOp_witness_d1d0 progMethods props budget currentIndex lastUses
+      localBindings constInts smRest name op l r rt a b k_l k_r tsm_rest anfSt stkSt
+      (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b))
+      hNeq hLastUseL hLastUseR
+      (by rcases hEmit with h | h | h <;> subst h <;> rfl)
+      hAgrees hBigintL hBigintR hOpcode
+  have hStack :
+      runOps ((Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+                [] localBindings constInts (r :: l :: smRest) name (.binOp op l r rt)).1 ++ restOps)
+              stkSt
+        = runOps restOps ({stkSt with stack := stkSt.stack.tail.tail}.push
+            (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b))) := by
+    rw [Stack.Eval.runOps_append, hChunk]
+  -- `agreesTagged` transport across the consume-and-push (head order `r :: l`).
+  have hAgrees1 :
+      agreesTagged ((name, .binding) :: tsm_rest) (anfSt.addBinding name
+          (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b)))
+        ({stkSt with stack := stkSt.stack.tail.tail}.push
+          (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b))) :=
+    agreesTagged_consume_top_two r l k_r k_l tsm_rest name anfSt stkSt
+      (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint op a b)) hAgrees hFresh
+  refine ⟨?_, hAgrees1⟩
+  rw [hANF, hStack]
+
+/-! ### Wave 62 — MANDATORY smoke 1: the d1d0 binOp transport on `c0 + c1`
+
+A CONCRETE single d1d0 binOp binding `t0 = c0 + c1` where `c0` is at depth 1 and
+`c1` at depth 0 (the canonical `count + 1` shape: live operand at depth 1, fresh
+const at depth 0).  From entry `agreesTagged` + head-operand bigint-ness,
+`agrees_success_step_binOp_d1d0` yields BOTH the success-bits agreement and the
+post-consume `agreesTagged` with `t0 ↦ .vBigint 7`.  We then discharge both
+`isSome` facts CONCRETELY (the chunk `[swap, swap, OP_ADD]` runs to `.ok`). -/
+
+/-- Concrete ANF state for d1d0 smoke: bindings `c0 = 3` (left, depth 1),
+`c1 = 4` (right, depth 0). -/
+private def wave62D1d0Anf : State :=
+  { params := [("c0", .vBigint 3), ("c1", .vBigint 4)] }
+
+/-- Concrete runtime stack aligned with `wave62D1d0Anf`: top `.vBigint 4` (= `c1`,
+right, depth 0), second `.vBigint 3` (= `c0`, left, depth 1). -/
+private def wave62D1d0Stk : StackState :=
+  { stack := [.vBigint 4, .vBigint 3] }
+
+/-- Entry alignment for the d1d0 smoke (head order `c1 :: c0`, the stack order). -/
+private theorem wave62_d1d0_agreesTagged :
+    agreesTagged [("c1", .param), ("c0", .param)] wave62D1d0Anf wave62D1d0Stk := by
+  refine ⟨?_, rfl, rfl⟩
+  show taggedStackAligned [("c1", .param), ("c0", .param)] wave62D1d0Anf wave62D1d0Stk.stack
+  refine ⟨?_, ?_, ?_⟩
+  · show lookupAnfByKind wave62D1d0Anf ("c1", .param) = some (.vBigint 4); rfl
+  · show lookupAnfByKind wave62D1d0Anf ("c0", .param) = some (.vBigint 3); rfl
+  · trivial
+
+/-- The single-binding body for the d1d0 smoke. -/
+private def wave62D1d0Body : List ANFBinding :=
+  [ANFBinding.mk "t0" (.binOp "+" "c0" "c1" none) none]
+
+/-- The per-binding lowered chunk for the d1d0 smoke (sm = `["c1","c0"]`,
+currentIndex 0). -/
+private def wave62D1d0Chunk : List StackOp :=
+  (Stack.Lower.lowerValueP [] [] 1000 0 (Stack.Lower.computeLastUses wave62D1d0Body)
+      [] [] [] ["c1", "c0"] "t0" (.binOp "+" "c0" "c1" none)).1
+
+/-- **Wave 62 — the d1d0 single-binding SUCCESS lockstep smoke (DELIVERABLE 1).**
+
+`t0 = c0 + c1` with `c0` at depth 1, `c1` at depth 0, run over the REAL d1d0
+per-binding lowered chunk (`(lowerValueP …).1 = [.swap, .swap, OP_ADD]`).  We fire
+`agrees_success_step_binOp_d1d0` and expose (1) the success-bits agreement and
+(2) `agreesTagged` at the post-consume state with `t0 ↦ .vBigint 7`, then discharge
+both `isSome` facts concretely. -/
+theorem wave62_d1d0_step_smoke :
+    ( ((RunarVerification.ANF.Eval.evalBindings wave62D1d0Anf
+          [.mk "t0" (.binOp "+" "c0" "c1" none) none]).toOption.isSome
+        ↔ (runOps (wave62D1d0Chunk ++ []) wave62D1d0Stk).toOption.isSome)
+      ∧ agreesTagged [("t0", .binding)]
+          (wave62D1d0Anf.addBinding "t0" (.vBigint 7))
+          ({wave62D1d0Stk with stack := wave62D1d0Stk.stack.tail.tail}.push (.vBigint 7)) )
+    ∧ (RunarVerification.ANF.Eval.evalBindings wave62D1d0Anf
+          [.mk "t0" (.binOp "+" "c0" "c1" none) none]).toOption.isSome
+    ∧ (runOps (wave62D1d0Chunk ++ []) wave62D1d0Stk).toOption.isSome := by
+  have hStep := agrees_success_step_binOp_d1d0 [] [] 1000 0
+    (Stack.Lower.computeLastUses wave62D1d0Body) [] [] []
+    wave62D1d0Anf wave62D1d0Stk "t0" "+" "c0" "c1" none none .param .param []
+    [] [] 3 4
+    (Or.inl rfl)
+    (by decide) (by decide) (by decide)
+    wave62_d1d0_agreesTagged rfl rfl rfl rfl
+    (by unfold freshIn untagSm; decide)
+  have hResult : RunarVerification.ANF.Eval.arithBinResultBigint "+" 3 4 = 7 := rfl
+  rw [hResult] at hStep
+  obtain ⟨hTransport, hAgreesPost⟩ := hStep
+  have hChunkEq :
+      wave62D1d0Chunk =
+        (Stack.Lower.lowerValueP [] [] 1000 0 (Stack.Lower.computeLastUses wave62D1d0Body)
+            [] [] [] ["c1", "c0"] "t0" (.binOp "+" "c0" "c1" none)).1 := rfl
+  rw [hChunkEq]
+  have hANFsucc :
+      (RunarVerification.ANF.Eval.evalBindings wave62D1d0Anf
+          [.mk "t0" (.binOp "+" "c0" "c1" none) none]).toOption.isSome := by
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          wave62D1d0Anf "t0" "+" "c0" "c1" none none 3 4 [] (Or.inl rfl) rfl rfl]
+    simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+  have hChunk :
+      runOps ((Stack.Lower.lowerValueP [] [] 1000 0
+                (Stack.Lower.computeLastUses wave62D1d0Body)
+                [] [] [] ["c1", "c0"] "t0" (.binOp "+" "c0" "c1" none)).1) wave62D1d0Stk
+        = .ok ({wave62D1d0Stk with stack := wave62D1d0Stk.stack.tail.tail}.push (.vBigint 7)) :=
+    build_consume_binOp_witness_d1d0 [] [] 1000 0
+      (Stack.Lower.computeLastUses wave62D1d0Body) [] [] [] "t0"
+      "+" "c0" "c1" none 3 4 .param .param [] wave62D1d0Anf wave62D1d0Stk (.vBigint 7)
+      (by decide) (by decide) (by decide) (by decide)
+      wave62_d1d0_agreesTagged rfl rfl
+      (by
+        show Stack.Eval.runOpcode (Stack.Lower.binopOpcode "+" none) wave62D1d0Stk = _
+        simp only [Stack.Lower.binopOpcode, Stack.Eval.runOpcode, Stack.Eval.liftIntBin,
+          Stack.Eval.asInt?, Stack.Eval.popN, Stack.Eval.StackState.push,
+          Stack.Eval.StackState.pop?, wave62D1d0Stk]
+        rfl)
+  have hStacksucc :
+      (runOps ((Stack.Lower.lowerValueP [] [] 1000 0
+                (Stack.Lower.computeLastUses wave62D1d0Body)
+                [] [] [] ["c1", "c0"] "t0" (.binOp "+" "c0" "c1" none)).1 ++ [])
+          wave62D1d0Stk).toOption.isSome := by
+    rw [List.append_nil, hChunk]
+    simp only [Except.toOption, Option.isSome]
+  refine ⟨⟨?_, hAgreesPost⟩, hANFsucc, hStacksucc⟩
+  exact hTransport.mpr (iff_of_true
+    (by simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome])
+    (by rw [Stack.Eval.runOps_nil]; simp only [Except.toOption, Option.isSome]))
+
 end Agrees
 end RunarVerification.Stack
