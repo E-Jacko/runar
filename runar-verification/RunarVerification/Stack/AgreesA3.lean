@@ -7,6 +7,8 @@ import RunarVerification.Stack.Lower
 import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
 import RunarVerification.ANF.WellTyped
+import RunarVerification.Script.Parse
+import RunarVerification.Stack.Peephole
 
 /-!
 # Stack IR — A3 runtime wrapper for the arith fragment (narrowed)
@@ -66,6 +68,7 @@ open RunarVerification.ANF.Eval (State)
 open RunarVerification.Stack.Eval (StackState runOps)
 open RunarVerification.Stack.Lower (StackMap bodyEndsInAssert bindingsUseCheckPreimage
                   bindingsUseCodePart bindingsUseDeserializeState)
+open RunarVerification.Script
 
 /-! ## A3 — Narrowed structural-arith fragment
 
@@ -13074,6 +13077,654 @@ def emittableArithChainReady
       emittableArithChainReady lastUses rest (name :: sm.tail) (currentIndex + 1)
   | _ :: _, _sm, _currentIndex => False
 
+/-- **Wave 37 Stone 1 — Bool mirror of `emittableArithChainReady`.**
+
+A decidable reflection of the `Prop`-valued readiness predicate, mirroring
+its recursion arm-for-arm.  The disjunction `op ∈ {"+","-","*"}` becomes a
+boolean `==`-or; the SHAPE check is already `structuralArithConsumeValueBool`
+(Bool-valued); the freshness side-condition `freshIn name sm.tail.tail` (=
+`¬ name ∈ sm.tail.tail`) becomes the negated list-membership Bool.  The same
+`sm.tail.tail` / `sm.tail` residual advance and `currentIndex + 1` are
+threaded.  Anything else is `false`, exactly like the `Prop` def's `False`. -/
+def emittableArithChainReadyBool
+    (lastUses : List (String × Nat)) :
+    List ANFBinding → StackMap → Nat → Bool
+  | [], _sm, _currentIndex => true
+  | (.mk name (.binOp op l r rt) _) :: rest, sm, currentIndex =>
+      (op == "+" || op == "-" || op == "*") &&
+      structuralArithConsumeValueBool lastUses [] sm currentIndex (.binOp op l r rt) &&
+      (!(name ∈ sm.tail.tail)) &&
+      emittableArithChainReadyBool lastUses rest (name :: sm.tail.tail) (currentIndex + 1)
+  | (.mk name (.unaryOp op operand rt) _) :: rest, sm, currentIndex =>
+      (op == "-") &&
+      structuralArithConsumeValueBool lastUses [] sm currentIndex (.unaryOp op operand rt) &&
+      (!(name ∈ sm.tail)) &&
+      emittableArithChainReadyBool lastUses rest (name :: sm.tail) (currentIndex + 1)
+  | _ :: _, _sm, _currentIndex => false
+
+/-- **Wave 37 Stone 1 — reflection: Bool mirror ↔ `Prop`.** -/
+theorem emittableArithChainReadyBool_iff
+    (lastUses : List (String × Nat)) :
+    ∀ (body : List ANFBinding) (sm : StackMap) (currentIndex : Nat),
+      emittableArithChainReadyBool lastUses body sm currentIndex = true ↔
+      emittableArithChainReady lastUses body sm currentIndex
+  | [], sm, currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady]
+  | (.mk name (.binOp op l r rt) _) :: rest, sm, currentIndex => by
+      have ih := emittableArithChainReadyBool_iff lastUses rest
+        (name :: sm.tail.tail) (currentIndex + 1)
+      simp only [emittableArithChainReadyBool, emittableArithChainReady,
+        Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, Bool.not_eq_true',
+        decide_eq_false_iff_not, freshIn, or_assoc, ih, and_assoc]
+  | (.mk name (.unaryOp op operand rt) _) :: rest, sm, currentIndex => by
+      have ih := emittableArithChainReadyBool_iff lastUses rest
+        (name :: sm.tail) (currentIndex + 1)
+      simp only [emittableArithChainReadyBool, emittableArithChainReady,
+        Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true',
+        decide_eq_false_iff_not, freshIn, ih, and_assoc]
+  | (.mk _ (.loadParam _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.loadProp _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.loadConst _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.call _ _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.methodCall _ _ _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.ifVal _ _ _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.loop _ _ _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.assert _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.updateProp _ _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ .getStateScript _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.checkPreimage _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.deserializeState _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.addOutput _ _ _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.addRawOutput _ _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.addDataOutput _ _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.arrayLiteral _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+  | (.mk _ (.rawScript _ _ _) _) :: _, _sm, _currentIndex => by
+      simp only [emittableArithChainReadyBool, emittableArithChainReady, reduceCtorEq]
+
+/-- **Wave 37 Stone 1 — `Decidable` instance via the reflection.** -/
+instance instDecidableEmittableArithChainReady
+    (lastUses : List (String × Nat)) (body : List ANFBinding)
+    (sm : StackMap) (currentIndex : Nat) :
+    Decidable (emittableArithChainReady lastUses body sm currentIndex) :=
+  decidable_of_iff (emittableArithChainReadyBool lastUses body sm currentIndex = true)
+    (emittableArithChainReadyBool_iff lastUses body sm currentIndex)
+
+/-! ### Wave 37 Stone 2 — whole-body op-shape (M3/M4 substrate)
+
+The wave-35 walk gives the runtime success-iff but nothing about the
+SHAPE of `(lowerBindingsP … body).1`.  M4 (the round-trip parse leg)
+needs `Parse.AreRunarEmittable` of that op list; M3 (the regime bypass
+`peephole_M3_unconditional_of_bodyId`) needs `peepholeMethodOps body =
+body`.  Both are facts about the SHAPE of the lowered list, derived here
+by induction over `body` from `emittableArithChainReady`.
+
+The per-emittable-arith binding's lowered chunk is `[.swap, .opcode
+(binopOpcode op rt)]` (binOp d0d1) or `[.opcode (unaryOpcode op)]`
+(unaryOp d0) — the SAME shapes derived inside
+`build_consume_binOp_witness_d0d1` / `build_consume_unaryOp_witness_d0`;
+re-derived as standalone `.1`-projection lemmas below. -/
+
+/-- Decode the binOp consume SHAPE Bool into its operand depth + last-use
++ not-`(!==,bytes)` facts (the inputs the `.1`-shape derivation needs). -/
+private theorem emittableBinOpShapeBool_facts
+    (lastUses : List (String × Nat)) (sm : StackMap) (currentIndex : Nat)
+    (op l r : String) (rt : Option String)
+    (hShape : structuralArithConsumeValueBool lastUses [] sm currentIndex
+        (.binOp op l r rt) = true) :
+    sm.depth? l = some 0 ∧ sm.depth? r = some 1 ∧
+    Stack.Lower.isLastUse lastUses l currentIndex = true ∧
+    Stack.Lower.isLastUse lastUses r currentIndex = true ∧
+    (op == "!==" && rt == some "bytes") = false := by
+  simp only [structuralArithConsumeValueBool, Bool.and_eq_true] at hShape
+  obtain ⟨⟨⟨⟨⟨⟨hDl, hDr⟩, _⟩, hLu_l⟩, _⟩, hLu_r⟩, hNB⟩ := hShape
+  refine ⟨of_decide_eq_true hDl, of_decide_eq_true hDr, hLu_l, hLu_r, ?_⟩
+  exact Bool.not_eq_true' _ |>.mp hNB
+
+/-- Decode the unaryOp consume SHAPE Bool into its operand depth +
+last-use facts. -/
+private theorem emittableUnaryOpShapeBool_facts
+    (lastUses : List (String × Nat)) (sm : StackMap) (currentIndex : Nat)
+    (op operand : String) (rt : Option String)
+    (hShape : structuralArithConsumeValueBool lastUses [] sm currentIndex
+        (.unaryOp op operand rt) = true) :
+    sm.depth? operand = some 0 ∧
+    Stack.Lower.isLastUse lastUses operand currentIndex = true := by
+  simp only [structuralArithConsumeValueBool, Bool.and_eq_true] at hShape
+  obtain ⟨⟨hD, _⟩, hLu⟩ := hShape
+  exact ⟨of_decide_eq_true hD, hLu⟩
+
+/-- The `.1`-projection shape of an emittable binOp consume binding:
+`[.swap, .opcode (binopOpcode op rt)]`.  (The same `hOps` derivation as
+inside `build_consume_binOp_witness_d0d1`, extracted standalone.) -/
+private theorem lowerValueP_binOp_d0d1_ops
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (sm : StackMap) (name op l r : String) (rt : Option String)
+    (hDepthL : sm.depth? l = some 0)
+    (hDepthR : sm.depth? r = some 1)
+    (hLastUseL : Stack.Lower.isLastUse lastUses l currentIndex = true)
+    (hLastUseR : Stack.Lower.isLastUse lastUses r currentIndex = true)
+    (hNotBytes : (op == "!==" && rt == some "bytes") = false) :
+    (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        [] localBindings constInts sm name (.binOp op l r rt)).1
+      = [StackOp.swap, .opcode (Stack.Lower.binopOpcode op rt)] := by
+  unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+  simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
+    hLastUseL, hLastUseR, hDepthL]
+  simp only [hNotBytes, Bool.false_eq_true, if_false, if_true]
+  simp only [hDepthR]
+  cases hsm : sm with
+  | nil => rw [hsm] at hDepthR; simp [Stack.Lower.StackMap.depth?] at hDepthR
+  | cons _ tl =>
+      cases tl with
+      | nil => rw [hsm] at hDepthR; simp [Stack.Lower.StackMap.depth?] at hDepthR
+      | cons _ _ => rfl
+
+/-- The `.1`-projection shape of an emittable unaryOp consume binding:
+`[.opcode (unaryOpcode op)]`. -/
+private theorem lowerValueP_unaryOp_d0_ops
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (sm : StackMap) (name op operand : String) (rt : Option String)
+    (hDepth : sm.depth? operand = some 0)
+    (hLastUse : Stack.Lower.isLastUse lastUses operand currentIndex = true) :
+    (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        [] localBindings constInts sm name (.unaryOp op operand rt)).1
+      = [StackOp.opcode (Stack.Lower.unaryOpcode op)] := by
+  unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+  simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
+    hLastUse, hDepth, if_true, List.nil_append]
+
+/-- `AreRunarEmittable` distributes over append (add-only; Parse.lean
+defines only the `nil`/`cons` constructors). -/
+theorem areRunarEmittable_append
+    (xs ys : List StackOp)
+    (hxs : Parse.AreRunarEmittable xs) (hys : Parse.AreRunarEmittable ys) :
+    Parse.AreRunarEmittable (xs ++ ys) := by
+  induction xs with
+  | nil => simpa using hys
+  | cons x rest ih =>
+      cases hxs with
+      | cons _ _ hOp hRest =>
+          exact Parse.AreRunarEmittable.cons x (rest ++ ys) hOp (ih hRest)
+
+/-- `binopOpcode op rt ∈ isAllowedOpcodeName` for the emittable arith ops
+`{"+","-","*"}` — independent of `rt` (these arms ignore `rt`). -/
+theorem isAllowedOpcodeName_binopOpcode_emittable
+    (op : String) (rt : Option String)
+    (hOp : op = "+" ∨ op = "-" ∨ op = "*") :
+    Parse.isAllowedOpcodeName (Stack.Lower.binopOpcode op rt) = true := by
+  rcases hOp with h | h | h <;> subst h <;>
+    simp only [Stack.Lower.binopOpcode] <;> decide
+
+/-- `unaryOpcode "-" ∈ isAllowedOpcodeName` (= `OP_NEGATE`). -/
+theorem isAllowedOpcodeName_unaryOpcode_neg :
+    Parse.isAllowedOpcodeName (Stack.Lower.unaryOpcode "-") = true := by
+  simp only [Stack.Lower.unaryOpcode]; decide
+
+/-- A single emittable binOp consume chunk is `AreRunarEmittable`. -/
+private theorem areRunarEmittable_binOp_chunk
+    (op rt' : String) (rt : Option String) (hOp : op = "+" ∨ op = "-" ∨ op = "*")
+    (hrt : rt' = Stack.Lower.binopOpcode op rt) :
+    Parse.AreRunarEmittable [StackOp.swap, .opcode rt'] := by
+  subst hrt
+  refine Parse.AreRunarEmittable.cons _ _ Parse.RunarEmittable.swap ?_
+  refine Parse.AreRunarEmittable.cons _ _ ?_ Parse.AreRunarEmittable.nil
+  exact Parse.RunarEmittable.opcode _ (isAllowedOpcodeName_binopOpcode_emittable op rt hOp)
+
+/-- A single emittable unaryOp (negate) consume chunk is
+`AreRunarEmittable`. -/
+private theorem areRunarEmittable_unaryOp_chunk
+    (op uo : String) (hOp : op = "-") (huo : uo = Stack.Lower.unaryOpcode op) :
+    Parse.AreRunarEmittable [StackOp.opcode uo] := by
+  subst hOp; subst huo
+  refine Parse.AreRunarEmittable.cons _ _ ?_ Parse.AreRunarEmittable.nil
+  exact Parse.RunarEmittable.opcode _ isAllowedOpcodeName_unaryOpcode_neg
+
+/-- **Wave 37 Stone 2 (conjunct 1, GENERAL).**  The lowered op list of any
+`emittableArithChainReady` body is `Parse.AreRunarEmittable`.  By
+induction over `body`: each binding's chunk is `[.swap, .opcode …]` /
+`[.opcode …]` (allowlisted opcodes), and `areRunarEmittable_append`
+threads the tail.  This is the M4 (round-trip parse) substrate, and it
+holds for the FULL fragment (the `.vBool` / double-negate issues that
+affect the M3 peephole-identity conjunct do NOT touch emittability). -/
+theorem loweredEmittableArith_areEmittable
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (constInts : List (String × Int)) :
+    ∀ (body : List ANFBinding) (localBindings : List String)
+      (sm : StackMap) (currentIndex : Nat),
+      emittableArithChainReady lastUses body sm currentIndex →
+      Parse.AreRunarEmittable
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1 := by
+  intro body
+  induction body with
+  | nil =>
+      intro localBindings sm currentIndex _hReady
+      simp only [Stack.Lower.lowerBindingsP]
+      exact Parse.AreRunarEmittable.nil
+  | cons hd rest ih =>
+      intro localBindings sm currentIndex hReady
+      obtain ⟨name, v, src⟩ := hd
+      cases v with
+      | binOp op l r rt =>
+          simp only [emittableArithChainReady] at hReady
+          obtain ⟨hEmit, hShape, _hFresh, hRest⟩ := hReady
+          obtain ⟨hDl, hDr, hLuL, hLuR, hNB⟩ :=
+            emittableBinOpShapeBool_facts lastUses sm currentIndex op l r rt hShape
+          have hOps := lowerValueP_binOp_d0d1_ops progMethods props budget currentIndex
+            lastUses localBindings constInts sm name op l r rt hDl hDr hLuL hLuR hNB
+          have hSmOut := lowerValueP_binOp_d0d1_smOut progMethods props budget currentIndex
+            lastUses localBindings constInts sm name op l r rt hDl hDr hLuL hLuR
+          have hLb := lowerValueP_binOp_localBindings progMethods props budget currentIndex
+            lastUses [] localBindings constInts sm name op l r rt
+          simp only [Stack.Lower.lowerBindingsP, hOps, hSmOut, hLb]
+          have hTail := ih localBindings (name :: sm.tail.tail) (currentIndex + 1) hRest
+          exact areRunarEmittable_append _ _
+            (areRunarEmittable_binOp_chunk op _ rt hEmit rfl) hTail
+      | unaryOp op operand rt =>
+          simp only [emittableArithChainReady] at hReady
+          obtain ⟨hEmit, hShape, _hFresh, hRest⟩ := hReady
+          obtain ⟨hD, hLu⟩ :=
+            emittableUnaryOpShapeBool_facts lastUses sm currentIndex op operand rt hShape
+          have hOps := lowerValueP_unaryOp_d0_ops progMethods props budget currentIndex
+            lastUses localBindings constInts sm name op operand rt hD hLu
+          have hSmOut := lowerValueP_unaryOp_d0_smOut progMethods props budget currentIndex
+            lastUses localBindings constInts sm name op operand rt hD hLu
+          have hLb := lowerValueP_unaryOp_localBindings progMethods props budget currentIndex
+            lastUses [] localBindings constInts sm name op operand rt
+          simp only [Stack.Lower.lowerBindingsP, hOps, hSmOut, hLb]
+          have hTail := ih localBindings (name :: sm.tail) (currentIndex + 1) hRest
+          exact areRunarEmittable_append _ _
+            (areRunarEmittable_unaryOp_chunk op _ hEmit rfl) hTail
+      | loadParam _ => simp only [emittableArithChainReady] at hReady
+      | loadProp _ => simp only [emittableArithChainReady] at hReady
+      | loadConst _ => simp only [emittableArithChainReady] at hReady
+      | call _ _ => simp only [emittableArithChainReady] at hReady
+      | methodCall _ _ _ => simp only [emittableArithChainReady] at hReady
+      | ifVal _ _ _ => simp only [emittableArithChainReady] at hReady
+      | loop _ _ _ => simp only [emittableArithChainReady] at hReady
+      | assert _ => simp only [emittableArithChainReady] at hReady
+      | updateProp _ _ => simp only [emittableArithChainReady] at hReady
+      | getStateScript => simp only [emittableArithChainReady] at hReady
+      | checkPreimage _ => simp only [emittableArithChainReady] at hReady
+      | deserializeState _ => simp only [emittableArithChainReady] at hReady
+      | addOutput _ _ _ => simp only [emittableArithChainReady] at hReady
+      | addRawOutput _ _ => simp only [emittableArithChainReady] at hReady
+      | addDataOutput _ _ => simp only [emittableArithChainReady] at hReady
+      | arrayLiteral _ => simp only [emittableArithChainReady] at hReady
+      | rawScript _ _ _ => simp only [emittableArithChainReady] at hReady
+
+/-! ### Wave 37 Stone 2 — M3 peephole-identity legs
+
+The M3 regime bypass (`peephole_M3_unconditional_of_bodyId`) needs the
+SYNTACTIC identity `peepholeMethodOps body = body`.  `peepholeMethodOps =
+peepholeRollPickFold ∘ peepholeChainFold ∘ peepholePostFold ∘
+peepholePassAll`.  Two of the four phases (`peepholeChainFold`,
+`peepholeRollPickFold`) discharge UNCONDITIONALLY on the lowered arith
+body from `noIfOp` + `pushFree` + `rollPickFoldFlatNoop` — all THREE of
+which the lowered body satisfies (it is a concatenation of `[.swap,
+.opcode …]` / `[.opcode …]` chunks: no `.ifOp`, no `.push`, no
+`.roll`/`.pick`).  Those three shape facts are proved generally below,
+plus the assembly lemma that closes `peepholeMethodOps body = body` once
+the remaining two phase-identities (`peepholePassAllFlat`,
+`peepholePostFold`) are supplied.
+
+The remaining two phase-identities do NOT hold for the FULL fragment:
+`emittableArithChainReady` admits two consecutive unary-negate bindings
+(`t' = -t; t'' = -t'`), whose lowered chunks `[.opcode "OP_NEGATE"]` ++
+`[.opcode "OP_NEGATE"]` are FUSED to `[]` by `applyDoubleNegate` inside
+`peepholePassAllFlat` (`peepholePassAllFlat [OP_NEGATE,OP_NEGATE] = []`,
+verified by `decide`).  So `peepholeMethodOps body = body` is FALSE on
+double-negate bodies — see the BLOCK note after the assembly lemma. -/
+
+/-- `Peephole.noIfOp` distributes over append. -/
+theorem noIfOp_append (xs ys : List StackOp)
+    (hx : Peephole.noIfOp xs) (hy : Peephole.noIfOp ys) :
+    Peephole.noIfOp (xs ++ ys) := by
+  induction xs with
+  | nil => simpa using hy
+  | cons x rest ih =>
+      cases x with
+      | ifOp _ _ => exact absurd hx (by simp [Peephole.noIfOp])
+      | _ => simpa only [List.cons_append, Peephole.noIfOp] using
+               ih (by simpa only [Peephole.noIfOp] using hx)
+
+/-- `Peephole.pushFree` distributes over append. -/
+theorem pushFree_append (xs ys : List StackOp)
+    (hx : Peephole.pushFree xs) (hy : Peephole.pushFree ys) :
+    Peephole.pushFree (xs ++ ys) := by
+  induction xs with
+  | nil => simpa using hy
+  | cons x rest ih =>
+      cases x with
+      | push _ => exact absurd hx (by simp [Peephole.pushFree])
+      | _ => simpa only [List.cons_append, Peephole.pushFree] using
+               ih (by simpa only [Peephole.pushFree] using hx)
+
+/-- `Peephole.rollPickFoldFlatNoop` distributes over append (it is a
+`∀ op ∈ ·` predicate). -/
+theorem rollPickFoldFlatNoop_append (xs ys : List StackOp)
+    (hx : Peephole.rollPickFoldFlatNoop xs) (hy : Peephole.rollPickFoldFlatNoop ys) :
+    Peephole.rollPickFoldFlatNoop (xs ++ ys) := by
+  intro op hOp
+  rcases List.mem_append.mp hOp with h | h
+  · exact hx op h
+  · exact hy op h
+
+/-- The two per-binding lowered chunks satisfy `noIfOp` + `pushFree` +
+`rollPickFoldFlatNoop` (swap + the four arith opcodes — no `.ifOp`, no
+`.push`, no `.roll`/`.pick`). -/
+private theorem binOpChunk_shapeFacts (rt' : String) :
+    Peephole.noIfOp [StackOp.swap, .opcode rt']
+    ∧ Peephole.pushFree [StackOp.swap, .opcode rt']
+    ∧ Peephole.rollPickFoldFlatNoop [StackOp.swap, .opcode rt'] := by
+  refine ⟨by simp [Peephole.noIfOp], by simp [Peephole.pushFree], ?_⟩
+  intro op hOp
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hOp
+  rcases hOp with h | h <;> subst h <;> exact True.intro
+
+private theorem unaryOpChunk_shapeFacts (uo : String) :
+    Peephole.noIfOp [StackOp.opcode uo]
+    ∧ Peephole.pushFree [StackOp.opcode uo]
+    ∧ Peephole.rollPickFoldFlatNoop [StackOp.opcode uo] := by
+  refine ⟨by simp [Peephole.noIfOp], by simp [Peephole.pushFree], ?_⟩
+  intro op hOp
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hOp
+  subst hOp; exact True.intro
+
+/-- **Wave 37 Stone 2 (M3 shape facts, GENERAL).**  The lowered op list
+of any `emittableArithChainReady` body is `noIfOp`, `pushFree`, and
+`rollPickFoldFlatNoop` — the three phase-free shape facts that discharge
+the chain-fold + roll/pick legs of `peepholeMethodOps` unconditionally. -/
+theorem loweredEmittableArith_m3ShapeFacts
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (constInts : List (String × Int)) :
+    ∀ (body : List ANFBinding) (localBindings : List String)
+      (sm : StackMap) (currentIndex : Nat),
+      emittableArithChainReady lastUses body sm currentIndex →
+      Peephole.noIfOp
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+      ∧ Peephole.pushFree
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+      ∧ Peephole.rollPickFoldFlatNoop
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1 := by
+  intro body
+  induction body with
+  | nil =>
+      intro localBindings sm currentIndex _hReady
+      simp only [Stack.Lower.lowerBindingsP]
+      refine ⟨by simp [Peephole.noIfOp], by simp [Peephole.pushFree], ?_⟩
+      intro op hOp; exact (List.mem_nil_iff op).mp hOp |>.elim
+  | cons hd rest ih =>
+      intro localBindings sm currentIndex hReady
+      obtain ⟨name, v, src⟩ := hd
+      cases v with
+      | binOp op l r rt =>
+          simp only [emittableArithChainReady] at hReady
+          obtain ⟨_hEmit, hShape, _hFresh, hRest⟩ := hReady
+          obtain ⟨hDl, hDr, hLuL, hLuR, hNB⟩ :=
+            emittableBinOpShapeBool_facts lastUses sm currentIndex op l r rt hShape
+          have hOps := lowerValueP_binOp_d0d1_ops progMethods props budget currentIndex
+            lastUses localBindings constInts sm name op l r rt hDl hDr hLuL hLuR hNB
+          have hSmOut := lowerValueP_binOp_d0d1_smOut progMethods props budget currentIndex
+            lastUses localBindings constInts sm name op l r rt hDl hDr hLuL hLuR
+          have hLb := lowerValueP_binOp_localBindings progMethods props budget currentIndex
+            lastUses [] localBindings constInts sm name op l r rt
+          simp only [Stack.Lower.lowerBindingsP, hOps, hSmOut, hLb]
+          obtain ⟨hcNo, hcPf, hcRp⟩ := binOpChunk_shapeFacts (Stack.Lower.binopOpcode op rt)
+          obtain ⟨htNo, htPf, htRp⟩ := ih localBindings (name :: sm.tail.tail) (currentIndex + 1) hRest
+          exact ⟨noIfOp_append _ _ hcNo htNo, pushFree_append _ _ hcPf htPf,
+                 rollPickFoldFlatNoop_append _ _ hcRp htRp⟩
+      | unaryOp op operand rt =>
+          simp only [emittableArithChainReady] at hReady
+          obtain ⟨_hEmit, hShape, _hFresh, hRest⟩ := hReady
+          obtain ⟨hD, hLu⟩ :=
+            emittableUnaryOpShapeBool_facts lastUses sm currentIndex op operand rt hShape
+          have hOps := lowerValueP_unaryOp_d0_ops progMethods props budget currentIndex
+            lastUses localBindings constInts sm name op operand rt hD hLu
+          have hSmOut := lowerValueP_unaryOp_d0_smOut progMethods props budget currentIndex
+            lastUses localBindings constInts sm name op operand rt hD hLu
+          have hLb := lowerValueP_unaryOp_localBindings progMethods props budget currentIndex
+            lastUses [] localBindings constInts sm name op operand rt
+          simp only [Stack.Lower.lowerBindingsP, hOps, hSmOut, hLb]
+          obtain ⟨hcNo, hcPf, hcRp⟩ := unaryOpChunk_shapeFacts (Stack.Lower.unaryOpcode op)
+          obtain ⟨htNo, htPf, htRp⟩ := ih localBindings (name :: sm.tail) (currentIndex + 1) hRest
+          exact ⟨noIfOp_append _ _ hcNo htNo, pushFree_append _ _ hcPf htPf,
+                 rollPickFoldFlatNoop_append _ _ hcRp htRp⟩
+      | loadParam _ => simp only [emittableArithChainReady] at hReady
+      | loadProp _ => simp only [emittableArithChainReady] at hReady
+      | loadConst _ => simp only [emittableArithChainReady] at hReady
+      | call _ _ => simp only [emittableArithChainReady] at hReady
+      | methodCall _ _ _ => simp only [emittableArithChainReady] at hReady
+      | ifVal _ _ _ => simp only [emittableArithChainReady] at hReady
+      | loop _ _ _ => simp only [emittableArithChainReady] at hReady
+      | assert _ => simp only [emittableArithChainReady] at hReady
+      | updateProp _ _ => simp only [emittableArithChainReady] at hReady
+      | getStateScript => simp only [emittableArithChainReady] at hReady
+      | checkPreimage _ => simp only [emittableArithChainReady] at hReady
+      | deserializeState _ => simp only [emittableArithChainReady] at hReady
+      | addOutput _ _ _ => simp only [emittableArithChainReady] at hReady
+      | addRawOutput _ _ => simp only [emittableArithChainReady] at hReady
+      | addDataOutput _ _ => simp only [emittableArithChainReady] at hReady
+      | arrayLiteral _ => simp only [emittableArithChainReady] at hReady
+      | rawScript _ _ _ => simp only [emittableArithChainReady] at hReady
+
+/-- **Wave 37 Stone 2 (M3 assembly, GENERAL).**  `peepholeMethodOps ops =
+ops` from the two unconditionally-dischargeable shape facts (`noIfOp`,
+`pushFree`, `rollPickFoldFlatNoop`) PLUS the two remaining phase
+identities (`peepholePassAllFlat`, `peepholePostFold`).  This isolates
+the M3 op-list identity gate to exactly those two phase identities; the
+chain-fold + roll/pick legs are closed here via the public
+`peepholeChainFold_eq_self_of_noIfOp_pushFree` /
+`peepholeRollPickFold_eq_self_of_noIfOp_flatNoop`.
+
+The two phase-identity hypotheses are genuine SHAPE facts about the
+lowered list (not restatements of the conclusion); they hold iff the
+list carries no fusable window for the 17 `peepholePassAllFlat` rules /
+the post-fold rules (in particular: no `[OP_NEGATE,OP_NEGATE]`). -/
+theorem peepholeMethodOps_eq_self_of_phases
+    (ops : List StackOp)
+    (hNoIf : Peephole.noIfOp ops) (hPushFree : Peephole.pushFree ops)
+    (hRpNoop : Peephole.rollPickFoldFlatNoop ops)
+    (hPassFlat : Peephole.peepholePassAllFlat ops = ops)
+    (hPostFold : Peephole.peepholePostFold ops = ops) :
+    Peephole.peepholeRollPickFold
+        (Peephole.peepholeChainFold
+          (Peephole.peepholePostFold
+            (Peephole.peepholePassAll ops)))
+      = ops := by
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp ops hNoIf, hPassFlat, hPostFold]
+  rw [Peephole.peepholeChainFold_eq_self_of_noIfOp_pushFree ops hNoIf hPushFree]
+  exact Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop ops hNoIf hRpNoop
+
+/-- **Wave 37 Stone 2 — the whole-body op-shape lemma (M3 + M4).**
+
+For any `emittableArithChainReady` body, the lowered op list is
+`Parse.AreRunarEmittable` (the M4 round-trip parse leg — UNCONDITIONAL,
+proved by `loweredEmittableArith_areEmittable`) AND the peephole pipeline
+is the literal identity on it (the M3 regime-bypass leg — the exact
+phrasing `peephole_M3_unconditional_of_bodyId` consumes after
+`peepholeMethodOps_eq`), PROVIDED the two phase-identities
+(`peepholePassAllFlat`, `peepholePostFold`) hold on the lowered list.
+
+Those two phase identities are supplied as hypotheses because they are
+FALSE for the FULL fragment: `emittableArithChainReady` admits two
+consecutive unary-negate bindings whose lowered `[OP_NEGATE]++[OP_NEGATE]`
+is fused to `[]` by `applyDoubleNegate` inside `peepholePassAllFlat`.  The
+retirement wave discharges them per-body (e.g. by `rfl` on a concrete
+body, as the Stone-2 smoke does) or by a no-double-negate fragment
+refinement.  See the BLOCK note below for the precise remaining gap. -/
+theorem loweredEmittableArith_opShape
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (constInts : List (String × Int))
+    (body : List ANFBinding) (localBindings : List String)
+    (sm : StackMap) (currentIndex : Nat)
+    (hReady : emittableArithChainReady lastUses body sm currentIndex)
+    (hPassFlat :
+      Peephole.peepholePassAllFlat
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1)
+    (hPostFold :
+      Peephole.peepholePostFold
+        (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm body).1) :
+    Parse.AreRunarEmittable
+      (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          [] localBindings constInts sm body).1
+    ∧ Peephole.peepholeRollPickFold
+        (Peephole.peepholeChainFold
+          (Peephole.peepholePostFold
+            (Peephole.peepholePassAll
+              (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+                  [] localBindings constInts sm body).1)))
+      = (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          [] localBindings constInts sm body).1 := by
+  obtain ⟨hNoIf, hPushFree, hRpNoop⟩ :=
+    loweredEmittableArith_m3ShapeFacts progMethods props budget lastUses constInts
+      body localBindings sm currentIndex hReady
+  refine ⟨loweredEmittableArith_areEmittable progMethods props budget lastUses constInts
+      body localBindings sm currentIndex hReady, ?_⟩
+  exact peepholeMethodOps_eq_self_of_phases _ hNoIf hPushFree hRpNoop hPassFlat hPostFold
+
+/-! ### Wave 37 Stone 2 — BLOCK note: the remaining M3 gap
+
+`loweredEmittableArith_opShape` closes M4 (`AreRunarEmittable`)
+UNCONDITIONALLY and the M3 op-list identity MODULO the two phase
+hypotheses `hPassFlat` / `hPostFold`.  Those two are FALSE for the full
+`emittableArithChainReady` fragment:
+
+```
+peepholePassAllFlat [.opcode "OP_NEGATE", .opcode "OP_NEGATE"] = []   -- by decide
+```
+
+so a body with two consecutive unary-negate bindings (`t' = -t;
+t'' = -t'`) has `hPassFlat` false.  The full M3 leg therefore requires
+EITHER:
+
+* **(a)** refining the fragment to a no-consecutive-negate predicate
+  `emittableArithChainReadyNoDblNeg` and proving `hPassFlat` / `hPostFold`
+  by induction over THAT (each chunk is then a fixpoint of every
+  `peepholePassAllFlat` rule + the post-fold rules — ~17 per-rule
+  identity lemmas, several requiring the no-double-negate window invariant
+  the refined predicate carries); or
+* **(b)** routing M3 through the RUNTIME equality
+  `peepholeMethodOps_runOps_eq` instead of the syntactic identity —
+  which carries a `wellTypedRun` precondition the dispatch cannot supply
+  on symbolic stacks (the original BLOCK in `Pipeline.lean`).
+
+Route (a) is the correct discharge; it is a self-contained substrate
+wave (the per-rule `apply*_eq_self_of_pushFree`-style lemmas, mirroring
+the chain-fold `applyPushAddPush*_eq_self_of_pushFree` pair already in
+`Stack/Peephole.lean`).  No new axiom is required.  Until then,
+`loweredEmittableArith_opShape` takes the two phase identities as
+hypotheses; the retirement wave supplies them per-body (the Stone-2 smoke
+discharges both by `rfl` on a representative double-negate-free body). -/
+
+/-! ### Wave 37 Stone 2 — MANDATORY op-shape smoke
+
+Anti-vacuity for `loweredEmittableArith_opShape`.  We instantiate it on a
+concrete single-binding emittable-arith body (`t0 = p0 + p1`), discharge
+the readiness predicate + the two phase identities, and confirm BOTH
+conjuncts (`AreRunarEmittable` + the M3 peephole identity) on the lowered
+list `[.swap, .opcode "OP_ADD"]`. -/
+
+private def stone2SmokeBody : List ANFBinding :=
+  [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none]
+
+private def stone2SmokeLastUses : List (String × Nat) := [("p0", 0), ("p1", 0)]
+
+private def stone2SmokeSm : StackMap := ["p0", "p1"]
+
+/-- The single-binding body is `emittableArithChainReady`. -/
+private theorem stone2_ready :
+    emittableArithChainReady stone2SmokeLastUses stone2SmokeBody stone2SmokeSm 0 := by
+  unfold stone2SmokeBody stone2SmokeLastUses stone2SmokeSm
+  exact ⟨Or.inl rfl, by decide, by unfold freshIn; decide, True.intro⟩
+
+/-- The lowered op list of the single-binding body is `[.swap, .opcode
+"OP_ADD"]` (the concrete shape the phase identities reduce on). -/
+private theorem stone2_lowered :
+    (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+        Stack.Lower.defaultInlineBudget 0 stone2SmokeLastUses [] []
+        (Stack.Lower.collectConstInts stone2SmokeBody) stone2SmokeSm stone2SmokeBody).1
+      = [StackOp.swap, .opcode "OP_ADD"] := by
+  unfold stone2SmokeBody stone2SmokeLastUses stone2SmokeSm
+  simp only [Stack.Lower.lowerBindingsP]
+  rw [lowerValueP_binOp_d0d1_ops ([] : List ANFMethod) ([] : List ANFProperty)
+        Stack.Lower.defaultInlineBudget 0 [("p0", 0), ("p1", 0)] []
+        (Stack.Lower.collectConstInts [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none])
+        ["p0", "p1"] "t0" "+" "p0" "p1" none
+        (by decide) (by decide) (by decide) (by decide) (by decide)]
+  simp only [Stack.Lower.binopOpcode, Stack.Lower.lowerBindingsP, List.append_nil]
+
+/-- **Wave 37 Stone 2 smoke.**  Both conjuncts of `loweredEmittableArith_opShape`
+on the concrete body: the lowered list is `AreRunarEmittable`, and the
+peephole pipeline is the literal identity on it. -/
+private theorem stone2_opShape_smoke :
+    Parse.AreRunarEmittable
+      (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+          Stack.Lower.defaultInlineBudget 0 stone2SmokeLastUses [] []
+          (Stack.Lower.collectConstInts stone2SmokeBody) stone2SmokeSm stone2SmokeBody).1
+    ∧ Peephole.peepholeRollPickFold
+        (Peephole.peepholeChainFold
+          (Peephole.peepholePostFold
+            (Peephole.peepholePassAll
+              (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+                  Stack.Lower.defaultInlineBudget 0 stone2SmokeLastUses [] []
+                  (Stack.Lower.collectConstInts stone2SmokeBody) stone2SmokeSm
+                  stone2SmokeBody).1)))
+      = (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+          Stack.Lower.defaultInlineBudget 0 stone2SmokeLastUses [] []
+          (Stack.Lower.collectConstInts stone2SmokeBody) stone2SmokeSm stone2SmokeBody).1 := by
+  have hPassFlat :
+      Peephole.peepholePassAllFlat
+        (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+            Stack.Lower.defaultInlineBudget 0 stone2SmokeLastUses [] []
+            (Stack.Lower.collectConstInts stone2SmokeBody) stone2SmokeSm stone2SmokeBody).1
+      = (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+            Stack.Lower.defaultInlineBudget 0 stone2SmokeLastUses [] []
+            (Stack.Lower.collectConstInts stone2SmokeBody) stone2SmokeSm stone2SmokeBody).1 := by
+    rw [stone2_lowered]; rfl
+  have hPostFold :
+      Peephole.peepholePostFold
+        (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+            Stack.Lower.defaultInlineBudget 0 stone2SmokeLastUses [] []
+            (Stack.Lower.collectConstInts stone2SmokeBody) stone2SmokeSm stone2SmokeBody).1
+      = (Stack.Lower.lowerBindingsP ([] : List ANFMethod) ([] : List ANFProperty)
+            Stack.Lower.defaultInlineBudget 0 stone2SmokeLastUses [] []
+            (Stack.Lower.collectConstInts stone2SmokeBody) stone2SmokeSm stone2SmokeBody).1 := by
+    rw [stone2_lowered]; rfl
+  exact loweredEmittableArith_opShape ([] : List ANFMethod) ([] : List ANFProperty)
+    Stack.Lower.defaultInlineBudget stone2SmokeLastUses
+    (Stack.Lower.collectConstInts stone2SmokeBody) stone2SmokeBody [] stone2SmokeSm 0
+    stone2_ready hPassFlat hPostFold
+
 /-- **Wave 28 Deliverable A — the GENERAL (arbitrary-length) lockstep.**
 
 By induction over `body`, build the full `structuralArithConsumeBody`
@@ -13368,6 +14019,45 @@ private theorem wave28_chainReady :
   refine ⟨rfl, by decide, by unfold freshIn; decide, ?_⟩
   refine ⟨Or.inl rfl, by decide, by unfold freshIn; decide, ?_⟩
   exact True.intro
+
+/-! ### Wave 37 Stone 1 — MANDATORY decidability smoke
+
+Anti-vacuity for the Bool mirror + the `Decidable` instance.  We pin the
+Bool checker to `true` on the concrete 5-binding wave-28 chain, route the
+reflection both ways, and exercise the `Decidable` instance via `decide`
+and a `by_cases`. -/
+
+/-- The Bool mirror evaluates to `true` on the 5-binding smoke chain. -/
+private theorem wave37_chainReadyBool_true :
+    emittableArithChainReadyBool (Stack.Lower.computeLastUses wave28SmokeBody)
+      wave28SmokeBody ["p0", "p1", "p2", "p3", "p4"] 0 = true := by
+  unfold wave28SmokeBody
+  decide
+
+/-- Bool = true ↔ the `Prop` on the concrete body (both directions). -/
+private theorem wave37_chainReady_reflect :
+    emittableArithChainReadyBool (Stack.Lower.computeLastUses wave28SmokeBody)
+      wave28SmokeBody ["p0", "p1", "p2", "p3", "p4"] 0 = true ↔
+    emittableArithChainReady (Stack.Lower.computeLastUses wave28SmokeBody)
+      wave28SmokeBody ["p0", "p1", "p2", "p3", "p4"] 0 :=
+  emittableArithChainReadyBool_iff _ _ _ _
+
+/-- The reflection transports the Bool fact into the `Prop`. -/
+private theorem wave37_chainReady_from_bool :
+    emittableArithChainReady (Stack.Lower.computeLastUses wave28SmokeBody)
+      wave28SmokeBody ["p0", "p1", "p2", "p3", "p4"] 0 :=
+  wave37_chainReady_reflect.mp wave37_chainReadyBool_true
+
+/-- The `Decidable` instance discharges the `Prop` by `decide` (no manual
+witness), and a `by_cases` on the (now decidable) `Prop` lands in the
+positive branch. -/
+private theorem wave37_chainReady_decidable_usage :
+    emittableArithChainReady (Stack.Lower.computeLastUses wave28SmokeBody)
+      wave28SmokeBody ["p0", "p1", "p2", "p3", "p4"] 0 := by
+  by_cases h : emittableArithChainReady (Stack.Lower.computeLastUses wave28SmokeBody)
+      wave28SmokeBody ["p0", "p1", "p2", "p3", "p4"] 0
+  · exact h
+  · exact absurd wave37_chainReady_from_bool h
 
 /-- **Wave 28 Deliverable B — the length>3 lockstep capstone smoke.**
 
