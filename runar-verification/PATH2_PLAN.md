@@ -2475,6 +2475,53 @@ lemmas.
   *prove* it (wave 24). Any new sub-omnibus must carry the
   `agreesTagged` premise from the start.
 
+### 11.6 Retirement status (through wave 55)
+
+**Retired (verified via `#print axioms`, removed from the omnibus's
+sub-omnibus list):**
+* `arith_codegen` — wave 39 (87→86). Emittable consume-arith fragment.
+* `if_val_codegen` — wave 45 (86→85). Self-contained arith-branch ifVal.
+* `math_byte_call_codegen` — wave 51 (85→84). Single-arg
+  abs/bin2num/toByteString (no len — OP_NIP byte collides with `.nip`).
+
+**Soundness fixes (the axioms were false-as-stated; now sound):**
+* wave 24/25 — independent-input `successAgrees` false → added the
+  `agreesTagged` alignment premise.
+* wave 54 — `evalBindings` errors on `.methodCall` while the Stack
+  inlines → restated the omnibus against `evalBindingsP` (the
+  program-aware evaluator that inlines methodCall), discharging the 8
+  non-methodCall families via `evalBindingsP_eq_evalBindings_of_noMethodCall`.
+
+**Remaining families — all need model-level reconciliation (NOT the
+Stage-C template):**
+* `update_prop` — foundation landed (wave 52): relaxed invariant
+  `agreesTaggedModProps` (the `props` conjunct of `agreesTagged` breaks
+  across a `setProp` step) + the depth-0 step. ~5-7 waves: depth-d step,
+  a NEW `agreesTaggedModProps_chain_preserves` composer, the mixed-body
+  walk, op-shape, and a final gated `simpleStepRel.updateProp` arm edit
+  (the one genuine cascade point).
+* `method_call` — foundations landed (waves 52-54): `evalMethodCall`,
+  `evalBindingsP` + equality bridge, the omnibus re-statement, the
+  leaf-const M2 bridge. BUT wave 55 found a deeper blocker: **an
+  inlining-frame mismatch.** A const callee inlines to a non-emittable
+  `.push` (M4 wall); an arith callee is lowered by the A8 Stack
+  substrate against the *outer* method's params (caller frame), while
+  `evalMethodCall` evaluates the callee from its *own* param state
+  (callee frame) — so for the fragments the substrate admits, ANF and
+  Stack disagree on which frame the callee body's operands live in
+  (`False ↔ True`). Reconciling this needs a core `evalMethodCall`
+  semantics decision (does the inlined callee see the call-site stack,
+  and with which param names?) + a matching Stack-substrate fragment
+  where the callee references *its own* params bound from explicit args.
+  This is a model-level reconciliation, deeper than the template; the
+  feasible fragment (callee with own params + args, body referencing
+  callee params) was not the one the existing A8 substrate provides.
+* `dispatch` (D1 multi-method Merkle), `stateful` (D2
+  checkPreimage/state continuation) — separate axes.
+* `crypto_call` — the universal `True` fallback; needs Phase B
+  per-primitive codegen-to-spec. Now sound for methodCall bodies too
+  (wave 54).
+
 ---
 
 End of plan. When this is fully executed, the omnibus axiom is
