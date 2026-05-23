@@ -333,5 +333,107 @@ theorem smoke_it_predicate_fails :
   rw [hP1] at hR
   exact absurd hR (by decide)
 
+/-! ## Deliverable A (Wave 44) — cond-bool typing (entry route)
+
+The `if_val` arith fragment (`ifValArithBody`) is a method body of EXACTLY
+one `.ifVal cond thn els` binding.  There are no prior bindings, so the
+condition ref `cond` is an **entry value** (a `.bool`-typed param or prop),
+NOT a body-produced comparison-result temp.  Its bool-ness therefore CANNOT
+be derived from the body — it is an entry fact, the bool analogue of
+`EntryBigintTyped`.  This is route **(i)**: a new entry premise.
+
+`CondBoolTyped Γ anfSt cond` says: the cond ref is declared `.bool` in `Γ`
+AND every `.bool`-declared name resolves to a `.vBool` runtime value in
+`anfSt`.  The soundness lemma extracts the explicit witness bool for the
+cond, exactly the `∃ b, resolveRef cond = some (.vBool b)` the `if_val` walk
+consumes (`hCond` of `successAgrees_ifVal_arith_unconditional`).
+
+This mirrors `EntryBigintTyped`'s shape: a declared-type ⇒ runtime-value-tag
+bridge that `agreesTagged` / `WF` cannot supply (the omnibus quantifies
+`initialAnf` freely; nothing structural pins the cond's runtime tag), so it
+is supplied as a hypothesis (input-side, never restating the conclusion). -/
+
+/-- A runtime value is a bool. -/
+def Value.IsBool (v : Value) : Prop := ∃ b : Bool, v = .vBool b
+
+/-- The cond-bool entry hypothesis.  The cond ref `cond` is declared `.bool`
+in `Γ`, and every `.bool`-declared name in `Γ` resolves to a `.vBool` value
+in `anfSt`.  The first conjunct is the structural typing rule (the cond is a
+bool); the second is the declared-type ⇒ runtime-tag bridge for bools. -/
+def CondBoolTyped (Γ : TypeEnv) (anfSt : State) (cond : String) : Prop :=
+  Γ.lookup cond = some .bool ∧
+    (∀ n : String, Γ.lookup n = some .bool →
+      ∃ b : Bool, anfSt.resolveRef n = some (.vBool b))
+
+/-- **A.0 — cond soundness.**  Under `CondBoolTyped`, the cond ref resolves
+to an explicit `.vBool b` runtime value.  This is exactly the `hCond`
+premise (`resolveRef cond = some (.vBool b)`) of the wave-41 `if_val`
+walk. -/
+theorem condBool_of_typedEntry
+    (Γ : TypeEnv) (anfSt : State) (cond : String)
+    (hCond : CondBoolTyped Γ anfSt cond) :
+    ∃ b : Bool, anfSt.resolveRef cond = some (.vBool b) :=
+  hCond.2 cond hCond.1
+
+/-! ## Deliverable A (Wave 44) — MANDATORY smoke
+
+A concrete WELL-TYPED entry where the cond `c` is declared `.bool` and
+resolves to `.vBool true`, so `condBool_of_typedEntry` FIRES; and a concrete
+entry where `c` is declared `.bigint` (not a bool), so `CondBoolTyped`
+FAILS — confirming the predicate is real (it pins the cond to a bool). -/
+
+/-- Smoke (cond-bool) — typing context: `c` is `.bool`, `p0`/`p1` `.bigint`. -/
+def smokeCondEnv : TypeEnv :=
+  ((Typed.TypeEnv.empty.extend "c" .bool).extend "p0" .bigint).extend "p1" .bigint
+
+/-- Smoke (cond-bool) — runtime state: `c = true`, `p0 = 3`, `p1 = 4`. -/
+def smokeCondAnf : State :=
+  { params := [("c", .vBool true), ("p0", .vBigint 3), ("p1", .vBigint 4)] }
+
+/-- `CondBoolTyped` holds for `smokeCondAnf` under `smokeCondEnv`: `c` is the
+only `.bool`-declared name, and it resolves to `.vBool true`. -/
+theorem smoke_condBoolTyped :
+    CondBoolTyped smokeCondEnv smokeCondAnf "c" := by
+  refine ⟨rfl, ?_⟩
+  intro n hn
+  by_cases hc : n = "c"
+  · subst hc; exact ⟨true, rfl⟩
+  · -- Any other name is `.bigint` (or absent), never `.bool`.
+    exfalso
+    by_cases h0 : n = "p0"
+    · subst h0
+      have hp0 : smokeCondEnv.lookup "p0" = some .bigint := rfl
+      rw [hp0] at hn; exact absurd hn (by decide)
+    · by_cases h1 : n = "p1"
+      · subst h1
+        have hp1 : smokeCondEnv.lookup "p1" = some .bigint := rfl
+        rw [hp1] at hn; exact absurd hn (by decide)
+      · have hp1 : ("p1" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h1 h.symm
+        have hp0 : ("p0" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h0 h.symm
+        have hcc : ("c" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => hc h.symm
+        simp only [smokeCondEnv, Typed.TypeEnv.lookup, Typed.TypeEnv.extend,
+          Typed.TypeEnv.empty, List.find?_cons, hp1, hp0, hcc, List.find?_nil,
+          Option.map_none, reduceCtorEq] at hn
+
+/-- **Smoke (cond-bool) — the soundness FIRES.**  The cond `c` resolves to an
+explicit `.vBool b` (here `true`). -/
+theorem smoke_condBool_fires :
+    ∃ b : Bool, smokeCondAnf.resolveRef "c" = some (.vBool b) :=
+  condBool_of_typedEntry smokeCondEnv smokeCondAnf "c" smoke_condBoolTyped
+
+/-- Smoke (cond-not-bool) — `c` declared `.bigint` (not a bool). -/
+def smokeCondITEnv : TypeEnv :=
+  (Typed.TypeEnv.empty.extend "c" .bigint).extend "p0" .bigint
+
+/-- **Smoke (cond-not-bool) — the predicate FAILS.**  `c` is not declared
+`.bool`, so the structural conjunct of `CondBoolTyped` cannot hold — the
+predicate genuinely pins the cond to a bool. -/
+theorem smoke_condBool_predicate_fails :
+    ¬ CondBoolTyped smokeCondITEnv smokeCondAnf "c" := by
+  rintro ⟨hLk, _hRes⟩
+  have hC : smokeCondITEnv.lookup "c" = some .bigint := rfl
+  rw [hC] at hLk
+  exact absurd hLk (by decide)
+
 end WellTyped
 end RunarVerification.ANF

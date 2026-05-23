@@ -5021,6 +5021,87 @@ theorem wave41_ifValArithCondLoad_smoke :
       [("c", 0)] 0 sB_agrees rfl sB_coh rfl (by decide)
   exact ⟨hRes, hOps, hBool⟩
 
+/-! ### B (Wave 44) — branch-pop transport (the entry bridge)
+
+`ifValArithCondLoad` (wave 41) takes the full method entry alignment but
+its `hStk` premise (`stkSt.stack = .vBool b :: restStk`) already encodes
+the cond being on top of the entry stack.  Wave 44's bridge closes the last
+gap the omnibus entry bundle leaves open: from the SAME entry alignment
+`agreesTagged ((cond, k) :: branchTsm) initialAnf initialStack` plus the
+cond resolving to a `.vBool b` runtime value, it
+**transports the branch-level entry alignment** — `agreesTagged branchTsm
+initialAnf branchStk` for the cond-popped branch stack `branchStk` — and
+re-derives the cond-load facts, so each branch's
+`successAgrees_arith_consume_unconditional` fires against `branchStk`.
+
+The cond is consumed (popped) for the branch's purposes: the cond-load at
+depth 0 + last use emits `[]` (the cond is already on top), and the
+structural `OP_IF` pops it.  So `branchStk = { initialStack with stack :=
+restStk }` and `branchTsm` (the tail of the entry tsm) aligns with it.
+
+The transported `EntryBigintTyped` / `CondBoolTyped` are facts about
+`initialAnf` (unchanged across the pop) and ride along unchanged; the
+branch's `entryTsmArithTyped` is the omnibus's branch-slot premise; the
+branch's `tsmCoherent` is the tail of the entry coherence.  This lemma
+supplies the stack-side branch transport (`agreesTagged`) + the cond-load
+witnesses — never the `.ifOp` conclusion. -/
+theorem agreesTagged_ifVal_pop_cond
+    (cond : String) (k : SlotKind) (branchTsm : TaggedStackMap)
+    (initialAnf : State) (initialStack : StackState) (restStk : List Value)
+    (b : Bool) (lastUses : List (String × Nat)) (currentIndex : Nat)
+    (hAgrees : agreesTagged ((cond, k) :: branchTsm) initialAnf initialStack)
+    (hCondVal : lookupAnfByKind initialAnf (cond, k) = some (.vBool b))
+    (hCoh : tsmCoherent initialAnf ((cond, k) :: branchTsm))
+    (hStk : initialStack.stack = (.vBool b) :: restStk)
+    (hLast : Stack.Lower.isLastUse lastUses cond currentIndex = true) :
+    ∃ branchStk : StackState,
+      -- The branch stack is the entry stack with the cond head popped.
+      branchStk = { initialStack with stack := restStk }
+      -- The branch-level entry alignment (cond-popped).
+      ∧ agreesTagged branchTsm initialAnf branchStk
+      -- The branch-level coherence (tail of the entry coherence).
+      ∧ tsmCoherent initialAnf branchTsm
+      -- ANF side: cond resolves to the known bool.
+      ∧ initialAnf.resolveRef cond = some (.vBool b)
+      -- Script side: the cond-load runs to the bool-topped branch stack.
+      ∧ runOps (Stack.Lower.loadRefLive (Agrees.untagSm ((cond, k) :: branchTsm)) cond
+            currentIndex lastUses []).1 initialStack
+          = .ok { branchStk with stack := (.vBool b) :: branchStk.stack }
+      -- Script side: the cond top is bool-coercible to the same `b`.
+      ∧ asBool? (.vBool b) = some b := by
+  -- The wave-41 cond-load lemma supplies the ANF / cond-load / asBool? facts.
+  obtain ⟨hRes, _hOps, hRun, hBool⟩ :=
+    ifValArithCondLoad cond k branchTsm initialAnf initialStack restStk b
+      lastUses currentIndex hAgrees hCondVal hCoh hStk hLast
+  refine ⟨{ initialStack with stack := restStk }, rfl, ?_, ?_, hRes, ?_, hBool⟩
+  · -- Branch alignment: pop the cond head off `taggedStackAligned`.
+    obtain ⟨hAlign, hProps, hOuts⟩ := hAgrees
+    refine ⟨?_, hProps, hOuts⟩
+    rw [hStk] at hAlign
+    -- `taggedStackAligned ((cond,k) :: branchTsm) anf (v :: restStk)` ⇒ tail.
+    exact hAlign.2
+  · -- Branch coherence: tail of the entry coherence.
+    intro s hs
+    exact hCoh s (List.mem_cons_of_mem _ hs)
+  · -- The cond-load result, rewritten to the branch-stack record.
+    exact hRun
+
+/-! ### B (Wave 44) — MANDATORY smoke: the branch-pop transport fires
+
+Same concrete `c=true` head over `[p0=3,p1=4]`.  From the entry alignment,
+the transport produces the cond-popped branch stack `[p0,p1]`, the branch
+alignment, the branch coherence, and the cond-load running to the
+bool-topped stack — anti-vacuous (the branch alignment genuinely holds). -/
+theorem wave44_agreesTagged_ifVal_pop_cond_smoke :
+    ∃ branchStk : StackState,
+      branchStk = { sB_stk with stack := [.vBigint 3, .vBigint 4] }
+      ∧ agreesTagged sB_rest sB_anf branchStk
+      ∧ sB_anf.resolveRef "c" = some (.vBool true) := by
+  obtain ⟨branchStk, hEq, hAgr, _hCoh, hRes, _hRun, _hBool⟩ :=
+    agreesTagged_ifVal_pop_cond "c" .param sB_rest sB_anf sB_stk
+      [.vBigint 3, .vBigint 4] true [("c", 0)] 0 sB_agrees rfl sB_coh rfl (by decide)
+  exact ⟨branchStk, hEq, hAgr, hRes⟩
+
 /-! ### C — the body-level walk wrapper
 
 `successAgrees_ifVal_arith_unconditional` lifts the wave-39 arith walk to a
@@ -5251,6 +5332,262 @@ theorem wave41_successAgrees_ifVal_arith_smoke :
       simp only [Except.toOption, Option.isSome, reduceCtorEq] at hThnEval
   | ok p =>
       simp only [bind, Except.bind, RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+
+/-! ### C (Wave 44) — the genuinely-entry-level `if_val` walk
+
+`successAgrees_ifVal_arith_unconditional` (wave 41) is the body-level walk,
+but it takes FIVE hand-supplied hypotheses the omnibus entry bundle cannot
+directly produce: the cond resolving to a `.vBool`, the cond-load, the
+`asBool?` coercion, and the two per-branch arith iffs.  Wave 44 closes that
+gap: `successAgrees_ifVal_arith_from_entry` takes ONLY the omnibus entry
+bundle (`EntryBigintTyped`, `agreesTagged`, `entryTsmArithTyped`,
+`tsmCoherent`) + `CondBoolTyped` (Deliverable A, route (i): the cond is a
+bool-typed ENTRY value — `ifValArithBody` is a single `.ifVal` binding with
+no prior bindings, so the cond cannot be a derived comparison temp) + the
+`ifValArithBody` fragment.
+
+The five wave-41 premises are DERIVED inside, not assumed:
+
+* `CondBoolTyped` + the head coherence → the cond resolves to `.vBool b`
+  and `lookupAnfByKind initialAnf (cond, k) = some (.vBool b)`;
+* `agreesTagged` head alignment → the cond sits on top of `initialStack`
+  (`initialStack.stack = .vBool b :: restStk`);
+* Deliverable B (`agreesTagged_ifVal_pop_cond`) → the cond-popped branch
+  stack `branchStk`, the branch alignment, the branch coherence, the
+  cond-load, and the `asBool?` coercion;
+* the two per-branch arith iffs → the wave-35
+  `successAgrees_arith_consume_unconditional` fired against `branchStk`,
+  fed `ifValArithBody`'s `emittableArithChainReadyNoDblNeg` conjuncts (via
+  `_imp_ready`) and the branch-slot omnibus typing.
+
+The residual input-side facts (`hUntag`, `hLast`, the two
+`ifValInnerProtected = []` rewrites) are decidable STRUCTURAL facts about
+the tsm / cond-load shape — not cond/branch correctness hypotheses, and
+never restatements of the `.ifOp` conclusion.  They hold for the
+self-contained-branch (`ifValCleanShape`) clean path the fragment pins (no
+parent-ref carried alive past the single `.ifVal`); the smoke discharges
+them concretely by `decide` / `unfold`. -/
+theorem successAgrees_ifVal_arith_from_entry
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (lastUses : List (String × Nat)) (localBindings : List String)
+    (constInts : List (String × Int))
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (sm : StackMap) (bn cond : String) (k : SlotKind) (thn els : List ANFBinding)
+    (src : Option SourceLoc)
+    (branchTsm : TaggedStackMap) (initialAnf : State) (initialStack : StackState)
+    -- The `ifValArithBody` fragment (input-side; pins the branches + clean shape).
+    (hBody : ifValArithBody progMethods props budget 0 lastUses [] constInts sm
+      [.mk bn (.ifVal cond thn els) src])
+    -- Omnibus entry bundle (parallel to the arith retirement's M2 leg).
+    (hAgrees : agreesTagged ((cond, k) :: branchTsm) initialAnf initialStack)
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hTsmTyped : entryTsmArithTyped Γ branchTsm)
+    (hCoh : tsmCoherent initialAnf ((cond, k) :: branchTsm))
+    -- Cond-bool entry premise (Deliverable A, route (i)).
+    (hCondBool : RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond)
+    -- Structural input-side facts (decidable; the smoke discharges them).
+    (hUntag : Agrees.untagSm ((cond, k) :: branchTsm) = sm)
+    (hLast : Stack.Lower.isLastUse lastUses cond 0 = true)
+    (hIPThn : ifValInnerProtected sm cond 0 lastUses [] = [])
+    (hIPEls : ifValInnerProtected sm cond 0 lastUses [] = []) :
+    (RunarVerification.ANF.Eval.evalBindings initialAnf
+        [.mk bn (.ifVal cond thn els) src]).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP progMethods props budget 0 lastUses
+            [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1
+            initialStack).toOption.isSome := by
+  -- Destructure the fragment: the two arith branches + the clean shape.
+  obtain ⟨hChainThn, hChainEls, hClean⟩ := hBody
+  -- Cond resolves to a `.vBool b` (Deliverable A soundness).
+  obtain ⟨b, hCondRes⟩ :=
+    RunarVerification.ANF.WellTyped.condBool_of_typedEntry Γ initialAnf cond hCondBool
+  -- Head coherence: `resolveRef cond = lookupAnfByKind initialAnf (cond, k)`.
+  have hHeadCorr : initialAnf.resolveRef cond
+      = lookupAnfByKind initialAnf (cond, k) := tsmCoherent_head initialAnf (cond, k) branchTsm hCoh
+  have hCondKind : lookupAnfByKind initialAnf (cond, k) = some (.vBool b) := by
+    rw [← hHeadCorr]; exact hCondRes
+  -- Stack head alignment: the cond sits on top of `initialStack`.
+  obtain ⟨hAlign, hProps, hOuts⟩ := hAgrees
+  have hStkShape : ∃ restStk, initialStack.stack = (.vBool b) :: restStk := by
+    cases hstk : initialStack.stack with
+    | nil => rw [hstk] at hAlign; exact absurd hAlign (by simp [taggedStackAligned])
+    | cons v rest =>
+        rw [hstk] at hAlign
+        have hHead : lookupAnfByKind initialAnf (cond, k) = some v := hAlign.1
+        rw [hCondKind] at hHead
+        have hv : v = .vBool b := (Option.some.inj hHead).symm
+        exact ⟨rest, by rw [hv]⟩
+  obtain ⟨restStk, hStk⟩ := hStkShape
+  -- Re-bundle the entry alignment for Deliverable B.
+  have hAgrees' : agreesTagged ((cond, k) :: branchTsm) initialAnf initialStack :=
+    ⟨hAlign, hProps, hOuts⟩
+  -- Deliverable B: pop the cond → the branch entry alignment + cond-load.
+  obtain ⟨branchStk, hBranchStkEq, hBranchAgrees, hBranchCoh, hCondRes2, hCondRun, hCondBoolCoerce⟩ :=
+    agreesTagged_ifVal_pop_cond cond k branchTsm initialAnf initialStack restStk b
+      lastUses 0 hAgrees' hCondKind hCoh hStk hLast
+  -- The cond-load runs through `sm` (= `untagSm ((cond,k)::branchTsm)`).
+  rw [hUntag] at hCondRun
+  -- `untagSm branchTsm = ifValSmBranch sm cond …` (cond-at-head + consume).
+  have hSmBranch : ifValSmBranch sm cond 0 lastUses []
+      = Agrees.untagSm branchTsm := by
+    rw [← hUntag]
+    unfold ifValSmBranch Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and, hLast,
+      untagSm, Stack.Lower.StackMap.depth?, List.findIdx?_cons, beq_self_eq_true, if_true,
+      Stack.Lower.StackMap.popN]
+  -- Fire the per-branch wave-35 arith walks against `branchStk`.
+  have hBranchWalk : ∀ (branch : List ANFBinding),
+      emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses branch) branch
+        (ifValSmBranch sm cond 0 lastUses []) 0 false →
+      ifValInnerProtected sm cond 0 lastUses [] = [] →
+      ((RunarVerification.ANF.Eval.evalBindings initialAnf branch).toOption.isSome ↔
+      (runOps (ifValThnRes progMethods props budget 0 lastUses [] constInts sm cond branch).1
+          branchStk).toOption.isSome) := by
+    intro branch hChain hIP
+    have hRes : ifValThnRes progMethods props budget 0 lastUses [] constInts sm cond branch
+        = Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses branch) []
+            (List.map (fun bnd => bnd.name) branch) constInts
+            (ifValSmBranch sm cond 0 lastUses []) branch := by
+      unfold ifValThnRes; rw [hIP]
+    rw [hRes]
+    exact successAgrees_arith_consume_unconditional progMethods props budget
+      (Stack.Lower.computeLastUses branch) constInts Γ branch
+      (ifValSmBranch sm cond 0 lastUses []) (List.map (fun bnd => bnd.name) branch) 0
+      branchTsm initialAnf branchStk hSmBranch.symm hBranchAgrees
+      (emittableArithChainReadyNoDblNeg_imp_ready _ branch
+        (ifValSmBranch sm cond 0 lastUses []) 0 false hChain)
+      hTypedEntry hTsmTyped hBranchCoh
+  have hThnIff := hBranchWalk thn hChainThn hIPThn
+  have hElsIff := hBranchWalk els hChainEls hIPEls
+  -- `ifValThnRes … els = ifValElsRes … els` (same lowering shape).
+  have hElsConv :
+      (RunarVerification.ANF.Eval.evalBindings initialAnf els).toOption.isSome ↔
+      (runOps (ifValElsRes progMethods props budget 0 lastUses [] constInts sm cond els).1
+          branchStk).toOption.isSome := hElsIff
+  -- Compose via the wave-41 body-level walk.
+  exact successAgrees_ifVal_arith_unconditional progMethods props budget 0 lastUses
+    localBindings constInts sm bn cond thn els src initialAnf initialStack branchStk
+    (.vBool b) b hClean hCondRes2 hCondRun hCondBoolCoerce hThnIff hElsConv
+
+/-! ### C (Wave 44) — MANDATORY smoke: the entry-level walk fires
+
+The same `if (c) { t0=p0+p1; t1=t0+p2 } else { u0=p0-p1; u1=u0-p2 }`
+(c a bool) instantiated from ONLY the omnibus entry bundle + `CondBoolTyped`
++ the `ifValArithBody` fragment — NO hand-supplied per-branch iffs, NO
+hand-supplied cond/branch hypotheses (those are all DERIVED).  We obtain the
+body-level iff and confirm the ANF side concretely succeeds, so the Script
+side succeeds — anti-vacuous (the bridge is real). -/
+private def sD_env : RunarVerification.ANF.WellTyped.TypeEnv :=
+  ((((RunarVerification.ANF.Typed.TypeEnv.empty.extend "c" .bool).extend "p0" .bigint).extend
+      "p1" .bigint).extend "p2" .bigint)
+
+private theorem sD_typedEntry :
+    RunarVerification.ANF.WellTyped.EntryBigintTyped sD_env sC_anf := by
+  intro n hn
+  by_cases h0 : n = "p0"
+  · subst h0; exact ⟨.vBigint 3, rfl, ⟨3, rfl⟩⟩
+  · by_cases h1 : n = "p1"
+    · subst h1; exact ⟨.vBigint 4, rfl, ⟨4, rfl⟩⟩
+    · by_cases h2 : n = "p2"
+      · subst h2; exact ⟨.vBigint 5, rfl, ⟨5, rfl⟩⟩
+      · exfalso
+        by_cases hc : n = "c"
+        · subst hc
+          have hcb : sD_env.lookup "c" = some .bool := rfl
+          rw [hcb] at hn; exact absurd hn (by decide)
+        · have hp2 : ("p2" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h2 h.symm
+          have hp1 : ("p1" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h1 h.symm
+          have hp0 : ("p0" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h0 h.symm
+          have hcc : ("c" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => hc h.symm
+          simp only [sD_env, RunarVerification.ANF.Typed.TypeEnv.lookup,
+            RunarVerification.ANF.Typed.TypeEnv.extend, RunarVerification.ANF.Typed.TypeEnv.empty,
+            List.find?_cons, hp2, hp1, hp0, hcc, List.find?_nil, Option.map_none, reduceCtorEq] at hn
+
+private theorem sD_tsmTyped : entryTsmArithTyped sD_env sC_branchTsm := by
+  intro s hs
+  unfold RunarVerification.ANF.WellTyped.arithOperandBigint
+  simp only [sC_branchTsm, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with h | h | h <;> (subst h; decide)
+
+private theorem sD_condBool :
+    RunarVerification.ANF.WellTyped.CondBoolTyped sD_env sC_anf "c" := by
+  refine ⟨rfl, ?_⟩
+  intro n hn
+  by_cases hc : n = "c"
+  · subst hc; exact ⟨true, rfl⟩
+  · exfalso
+    by_cases h0 : n = "p0"
+    · subst h0; have h : sD_env.lookup "p0" = some .bigint := rfl
+      rw [h] at hn; exact absurd hn (by decide)
+    · by_cases h1 : n = "p1"
+      · subst h1; have h : sD_env.lookup "p1" = some .bigint := rfl
+        rw [h] at hn; exact absurd hn (by decide)
+      · by_cases h2 : n = "p2"
+        · subst h2; have h : sD_env.lookup "p2" = some .bigint := rfl
+          rw [h] at hn; exact absurd hn (by decide)
+        · have hp2 : ("p2" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h2 h.symm
+          have hp1 : ("p1" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h1 h.symm
+          have hp0 : ("p0" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h0 h.symm
+          have hcc : ("c" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => hc h.symm
+          simp only [sD_env, RunarVerification.ANF.Typed.TypeEnv.lookup,
+            RunarVerification.ANF.Typed.TypeEnv.extend, RunarVerification.ANF.Typed.TypeEnv.empty,
+            List.find?_cons, hp2, hp1, hp0, hcc, List.find?_nil, Option.map_none, reduceCtorEq] at hn
+
+/-- **Wave 44 C smoke — the entry-level walk fires from ONLY the bundle.**
+The body-level iff holds, and the ANF `if_val` side concretely succeeds
+(THEN branch `t0=3+4=7; t1=7+5=12`), so the Script side succeeds. -/
+theorem wave44_successAgrees_ifVal_arith_from_entry_smoke :
+    ((RunarVerification.ANF.Eval.evalBindings sC_anf sA_body).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP [] [] 8 0 sA_lu []
+            (List.map (fun b => b.name) sA_body) (Stack.Lower.collectConstInts sA_body)
+            sA_sm sA_body).1 sC_stk).toOption.isSome)
+    ∧ (RunarVerification.ANF.Eval.evalBindings sC_anf sA_body).toOption.isSome := by
+  have hCCI : Stack.Lower.collectConstInts sA_body = [] := by
+    unfold sA_body sA_thn sA_els
+    simp only [Stack.Lower.collectConstInts, List.append_nil]
+  rw [hCCI]
+  have hCondAgrees : agreesTagged (("c", .param) :: sC_branchTsm) sC_anf sC_stk := by
+    refine ⟨?_, rfl, rfl⟩
+    show taggedStackAligned (("c", .param) :: sC_branchTsm) sC_anf sC_stk.stack
+    refine ⟨rfl, rfl, rfl, rfl, ?_⟩; trivial
+  have hCondCoh : tsmCoherent sC_anf (("c", .param) :: sC_branchTsm) := by
+    intro s hs
+    simp only [sC_branchTsm, List.mem_cons, List.not_mem_nil, or_false] at hs
+    rcases hs with h | h | h | h <;> (subst h; rfl)
+  -- The fragment (Deliverable A smoke shape) — note `constInts = []`.
+  have hBodyFrag : ifValArithBody [] [] 8 0 sA_lu [] [] sA_sm sA_body := wave41_ifValArithBody_smoke
+  have hUntagSm : Agrees.untagSm (("c", .param) :: sC_branchTsm) = sA_sm := by
+    unfold sC_branchTsm untagSm sA_sm; rfl
+  have hIP : ifValInnerProtected sA_sm "c" 0 sA_lu [] = [] := sA_ip
+  -- Fire C from ONLY the bundle + cond-bool + fragment.
+  have hIff := successAgrees_ifVal_arith_from_entry [] [] 8 sA_lu
+    (List.map (fun b => b.name) sA_body) [] sD_env sA_sm "r" "c" .param sA_thn sA_els none
+    sC_branchTsm sC_anf sC_stk hBodyFrag hCondAgrees sD_typedEntry sD_tsmTyped hCondCoh
+    sD_condBool hUntagSm (by decide) hIP hIP
+  refine ⟨hIff, ?_⟩
+  -- ANF side concretely succeeds: THEN branch evaluates `t0=3+4=7; t1=7+5=12`.
+  show (RunarVerification.ANF.Eval.evalBindings sC_anf sA_body).toOption.isSome
+  unfold sA_body
+  simp only [RunarVerification.ANF.Eval.evalBindings]
+  have hCondRes2 : sC_anf.resolveRef "c" = some (.vBool true) := rfl
+  have hThnEval :
+      (RunarVerification.ANF.Eval.evalValue sC_anf (.ifVal "c" sA_thn sA_els)).toOption.isSome := by
+    rw [evalValue_ifVal_isSome_iff_activeBranch sC_anf "c" sA_thn sA_els true hCondRes2]
+    rw [if_pos (rfl : (true = true))]
+    show (RunarVerification.ANF.Eval.evalBindings sC_anf sA_thn).toOption.isSome
+    unfold sA_thn
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          sC_anf "t0" "+" "p0" "p1" none none 3 4 _ (Or.inl rfl) rfl rfl]
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          (sC_anf.addBinding "t0" (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint "+" 3 4)))
+          "t1" "+" "t0" "p2" none none
+          (RunarVerification.ANF.Eval.arithBinResultBigint "+" 3 4) 5 _ (Or.inl rfl) rfl rfl]
+    simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+  cases h : RunarVerification.ANF.Eval.evalValue sC_anf (.ifVal "c" sA_thn sA_els) with
+  | error e =>
+      exfalso; rw [h] at hThnEval
+      simp only [Except.toOption, Option.isSome, reduceCtorEq] at hThnEval
+  | ok p =>
+      simp only [bind, Except.bind, Except.toOption, Option.isSome]
 
 /-! ### D — the `if_val` op-shape (emittability half)
 
