@@ -4616,6 +4616,777 @@ theorem runMethod_lower_public_unique_no_post_ifVal_consumeRefThenCopyRef_preser
   rw [hRun]
   simp [Except.toOption]
 
+/-! ## Wave 41 — the `if_val` retirement substrate
+
+This wave lands the four reusable substrate pieces the `if_val` codegen
+retirement (86→85) assembles from, mirroring the wave-39 arith framework
+(`successAgrees_arith_consume_unconditional` + `loweredEmittableArithNoDblNeg_opShape`
++ `instDecidableEmittableArithChainReadyNoDblNeg` →
+`compileSafe_observational_correct_arith_consume`).
+
+The fragment is a single `.ifVal` binding whose `thn` / `els` are each
+`emittableArithChainReadyNoDblNeg` arith bodies, restricted to
+**self-contained branches** (`ifValCleanShape`, the wave-13 substrate in
+`Stack/Agrees.lean`): no parent-ref consumption, so the cleanup-tail /
+shadow-rebind of `lowerValueP .ifVal` is empty and the lowering collapses
+to `condOps ++ [.ifOp thnOps (some elsOps)]` via
+`lowerValueP_ifVal_clean_shape`.
+
+* **A** — `ifValArithBody` fragment predicate + Bool + decidability
+  (`instDecidableIfValArithBody`).
+* **B** — `ifValArithCondLoad` cond-load lemma (cond resolves to a `.vBool`
+  on the ANF side and a bool-coercible Script value on top of the post-load
+  stack, from `agreesTagged` + the cond being a bool-typed tagged slot).
+* **C** — `successAgrees_ifVal_arith_unconditional` the body-level walk
+  wrapper, composing `agreesTagged_ifVal_arith_iff` (wave 40) with the
+  per-branch wave-35 arith walks + the clean-shape collapse.
+* **D** — `loweredIfValArith_opShape` the `.ifOp`-bearing op-shape
+  (`AreRunarEmittableWithIf` + the peephole-identity), the analogue of
+  `loweredEmittableArithNoDblNeg_opShape`.
+-/
+
+/-! ### A — the `if_val` arith body fragment predicate + decidability -/
+
+/-- `ifValCleanShape` is a conjunction of decidable atoms (a `Nat` ≤, two
+list-equalities of `ifValDrops`, a length equality, and a `≠ []`); decide it
+by unfolding to that conjunction. -/
+instance instDecidableIfValCleanShape
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (constInts : List (String × Int))
+    (sm : StackMap) (cond : String) (thn els : List ANFBinding) :
+    Decidable (ifValCleanShape progMethods props budget currentIndex lastUses
+      outerProtected constInts sm cond thn els) := by
+  unfold ifValCleanShape
+  infer_instance
+
+/-- **Wave 41 A — `if_val` arith body fragment.**
+
+A method body that is exactly one `.ifVal` binding whose condition is a
+ref, and whose THEN / ELSE bodies are each `emittableArithChainReadyNoDblNeg`
+arith chains lowered against the post-cond-pop branch stack
+(`ifValSmBranch`), under the self-contained-branch `ifValCleanShape`
+(so the lowering collapses to `condOps ++ [.ifOp thnOps (some elsOps)]`).
+
+The `ifValCleanShape` conjunct is the wave-13 substrate predicate (decidable
+and input-side: it talks only about the branch lowerings, never the
+conclusion). The two arith-readiness conjuncts pin each branch to the
+wave-38 emittable no-double-negate fragment, so each branch's per-binding
+walk iff and op-shape are exactly the wave-35 / wave-38 deliverables. -/
+def ifValArithBody
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (constInts : List (String × Int))
+    (sm : StackMap) :
+    List ANFBinding → Prop
+  | [.mk _bn (.ifVal cond thn els) _src] =>
+      emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses thn) thn
+        (ifValSmBranch sm cond currentIndex lastUses outerProtected) 0 false ∧
+      emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses els) els
+        (ifValSmBranch sm cond currentIndex lastUses outerProtected) 0 false ∧
+      ifValCleanShape progMethods props budget currentIndex lastUses
+        outerProtected constInts sm cond thn els
+  | _ => False
+
+/-- **Wave 41 A — Bool mirror of `ifValArithBody`.**  Mirrors the predicate
+arm-for-arm: the `emittableArithChainReadyNoDblNeg` conjuncts become their
+Bool mirrors (`emittableArithChainReadyNoDblNegBool`) and `ifValCleanShape`
+becomes a `decide` (it is `Decidable` via its conjuncts). -/
+def ifValArithBodyBool
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (constInts : List (String × Int))
+    (sm : StackMap) :
+    List ANFBinding → Bool
+  | [.mk _bn (.ifVal cond thn els) _src] =>
+      emittableArithChainReadyNoDblNegBool (Stack.Lower.computeLastUses thn) thn
+        (ifValSmBranch sm cond currentIndex lastUses outerProtected) 0 false &&
+      emittableArithChainReadyNoDblNegBool (Stack.Lower.computeLastUses els) els
+        (ifValSmBranch sm cond currentIndex lastUses outerProtected) 0 false &&
+      decide (ifValCleanShape progMethods props budget currentIndex lastUses
+        outerProtected constInts sm cond thn els)
+  | _ => false
+
+/-- **Wave 41 A — reflection: Bool mirror ↔ `Prop`.** -/
+theorem ifValArithBodyBool_iff
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (constInts : List (String × Int))
+    (sm : StackMap) :
+    ∀ (body : List ANFBinding),
+      ifValArithBodyBool progMethods props budget currentIndex lastUses
+        outerProtected constInts sm body = true ↔
+      ifValArithBody progMethods props budget currentIndex lastUses
+        outerProtected constInts sm body
+  | [] => by
+      simp only [ifValArithBodyBool, ifValArithBody, Bool.false_eq_true]
+  | [.mk _bn (.ifVal cond thn els) _src] => by
+      simp only [ifValArithBodyBool, ifValArithBody, Bool.and_eq_true,
+        emittableArithChainReadyNoDblNegBool_iff, decide_eq_true_eq, and_assoc]
+  | [.mk _ (.loadParam _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.loadProp _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.loadConst _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.binOp _ _ _ _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.unaryOp _ _ _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.call _ _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.methodCall _ _ _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.loop _ _ _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.assert _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.updateProp _ _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ .getStateScript _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.checkPreimage _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.deserializeState _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.addOutput _ _ _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.addRawOutput _ _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.addDataOutput _ _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.arrayLiteral _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | [.mk _ (.rawScript _ _ _) _] => by simp only [ifValArithBodyBool, ifValArithBody, reduceCtorEq]
+  | _ :: _ :: _ => by
+      simp only [ifValArithBodyBool, ifValArithBody, Bool.false_eq_true]
+
+/-- **Wave 41 A — `Decidable` instance via the reflection.** -/
+instance instDecidableIfValArithBody
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (constInts : List (String × Int))
+    (sm : StackMap) (body : List ANFBinding) :
+    Decidable (ifValArithBody progMethods props budget currentIndex lastUses
+      outerProtected constInts sm body) :=
+  decidable_of_iff
+    (ifValArithBodyBool progMethods props budget currentIndex lastUses
+      outerProtected constInts sm body = true)
+    (ifValArithBodyBool_iff progMethods props budget currentIndex lastUses
+      outerProtected constInts sm body)
+
+/-! ### A — MANDATORY smoke: a concrete `ifValArithBody`
+
+`if (c) { t0 = p0 + p1; t1 = t0 + p2 } else { u0 = p0 - p1; u1 = u0 - p2 }`,
+with cond `c` a bool param, both branches genuine two-binding arith chains
+consuming the parent operands `p0`,`p1`,`p2`.  The branches are
+depth-balanced (both net `["p0","p1","p2"]` → a single result), neither
+consumes a parent slot the other keeps, so `ifValCleanShape` holds and
+`ifValArithBody` is inhabited — anti-vacuous (both branches are genuinely
+arith, neither empty nor const). -/
+
+/-- Helper: the `.2` (stack-map + local-bindings) projection of a binOp
+`lowerValueP` consuming depth-0 / depth-1, from the public smOut +
+localBindings lemmas (the private `.1`-ops lemma is not needed here). -/
+private theorem lvp_binOp_snd
+    (pm : List ANFMethod) (pr : List ANFProperty) (bud ci : Nat)
+    (lu : List (String × Nat)) (lb : List String) (cs : List (String × Int))
+    (smm : StackMap) (nm op l r : String) (rt : Option String)
+    (hl : smm.depth? l = some 0) (hr : smm.depth? r = some 1)
+    (hll : Stack.Lower.isLastUse lu l ci = true)
+    (hlr : Stack.Lower.isLastUse lu r ci = true) :
+    (Stack.Lower.lowerValueP pm pr bud ci lu [] lb cs smm nm (.binOp op l r rt)).2
+      = (nm :: smm.tail.tail, lb) :=
+  Prod.ext
+    (lowerValueP_binOp_d0d1_smOut pm pr bud ci lu lb cs smm nm op l r rt hl hr hll hlr)
+    (lowerValueP_binOp_localBindings pm pr bud ci lu [] lb cs smm nm op l r rt)
+
+private def sA_thn : List ANFBinding :=
+  [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none,
+   ANFBinding.mk "t1" (.binOp "+" "t0" "p2" none) none]
+private def sA_els : List ANFBinding :=
+  [ANFBinding.mk "u0" (.binOp "-" "p0" "p1" none) none,
+   ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]
+private def sA_body : List ANFBinding :=
+  [ANFBinding.mk "r" (.ifVal "c" sA_thn sA_els) none]
+private def sA_sm : StackMap := ["c", "p0", "p1", "p2"]
+private def sA_lu : List (String × Nat) := Stack.Lower.computeLastUses sA_body
+
+private theorem sA_smBranch :
+    ifValSmBranch sA_sm "c" 0 sA_lu [] = ["p0", "p1", "p2"] := by
+  unfold ifValSmBranch Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    sA_sm sA_lu sA_body sA_thn sA_els
+  decide
+
+private theorem sA_ip :
+    ifValInnerProtected sA_sm "c" 0 sA_lu [] = [] := by
+  unfold ifValInnerProtected ifValSmBranch Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    Stack.Lower.computeBranchProtected sA_sm sA_lu sA_body sA_thn sA_els
+  decide
+
+private theorem sA_thnSm :
+    (ifValThnRes [] [] 8 0 sA_lu [] [] sA_sm "c" sA_thn).2 = ["t1"] := by
+  unfold ifValThnRes; rw [sA_smBranch, sA_ip, sA_thn]
+  simp only [List.map_cons, List.map_nil, ANFBinding.name]
+  rw [Stack.Lower.lowerBindingsP.eq_2]
+  rcases h1 : Stack.Lower.lowerValueP [] [] 8 0 (Stack.Lower.computeLastUses
+      [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none,
+       ANFBinding.mk "t1" (.binOp "+" "t0" "p2" none) none]) []
+      ["t0", "t1"] [] ["p0", "p1", "p2"] "t0" (.binOp "+" "p0" "p1" none)
+    with ⟨o1, s1, l1⟩
+  have e1 : (s1, l1) = (["t0", "p2"], ["t0", "t1"]) := by
+    have := lvp_binOp_snd [] [] 8 0 (Stack.Lower.computeLastUses
+      [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none,
+       ANFBinding.mk "t1" (.binOp "+" "t0" "p2" none) none]) ["t0", "t1"] []
+      ["p0", "p1", "p2"] "t0" "+" "p0" "p1" none (by decide) (by decide) (by decide) (by decide)
+    rw [h1] at this; exact this
+  obtain ⟨hs1, hl1⟩ := Prod.mk.injEq .. ▸ e1
+  subst hs1; subst hl1
+  simp only []
+  rw [Stack.Lower.lowerBindingsP.eq_2]
+  rcases h2 : Stack.Lower.lowerValueP [] [] 8 1 (Stack.Lower.computeLastUses
+      [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none,
+       ANFBinding.mk "t1" (.binOp "+" "t0" "p2" none) none]) []
+      ["t0", "t1"] [] ["t0", "p2"] "t1" (.binOp "+" "t0" "p2" none)
+    with ⟨o2, s2, l2⟩
+  have e2 : (s2, l2) = (["t1"], ["t0", "t1"]) := by
+    have := lvp_binOp_snd [] [] 8 1 (Stack.Lower.computeLastUses
+      [ANFBinding.mk "t0" (.binOp "+" "p0" "p1" none) none,
+       ANFBinding.mk "t1" (.binOp "+" "t0" "p2" none) none]) ["t0", "t1"] []
+      ["t0", "p2"] "t1" "+" "t0" "p2" none (by decide) (by decide) (by decide) (by decide)
+    rw [h2] at this; exact this
+  obtain ⟨hs2, hl2⟩ := Prod.mk.injEq .. ▸ e2
+  subst hs2; subst hl2
+  simp only [Stack.Lower.lowerBindingsP]
+
+private theorem sA_elsSm :
+    (ifValElsRes [] [] 8 0 sA_lu [] [] sA_sm "c" sA_els).2 = ["u1"] := by
+  unfold ifValElsRes; rw [sA_smBranch, sA_ip, sA_els]
+  simp only [List.map_cons, List.map_nil, ANFBinding.name]
+  rw [Stack.Lower.lowerBindingsP.eq_2]
+  rcases h1 : Stack.Lower.lowerValueP [] [] 8 0 (Stack.Lower.computeLastUses
+      [ANFBinding.mk "u0" (.binOp "-" "p0" "p1" none) none,
+       ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]) []
+      ["u0", "u1"] [] ["p0", "p1", "p2"] "u0" (.binOp "-" "p0" "p1" none)
+    with ⟨o1, s1, l1⟩
+  have e1 : (s1, l1) = (["u0", "p2"], ["u0", "u1"]) := by
+    have := lvp_binOp_snd [] [] 8 0 (Stack.Lower.computeLastUses
+      [ANFBinding.mk "u0" (.binOp "-" "p0" "p1" none) none,
+       ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]) ["u0", "u1"] []
+      ["p0", "p1", "p2"] "u0" "-" "p0" "p1" none (by decide) (by decide) (by decide) (by decide)
+    rw [h1] at this; exact this
+  obtain ⟨hs1, hl1⟩ := Prod.mk.injEq .. ▸ e1
+  subst hs1; subst hl1
+  simp only []
+  rw [Stack.Lower.lowerBindingsP.eq_2]
+  rcases h2 : Stack.Lower.lowerValueP [] [] 8 1 (Stack.Lower.computeLastUses
+      [ANFBinding.mk "u0" (.binOp "-" "p0" "p1" none) none,
+       ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]) []
+      ["u0", "u1"] [] ["u0", "p2"] "u1" (.binOp "-" "u0" "p2" none)
+    with ⟨o2, s2, l2⟩
+  have e2 : (s2, l2) = (["u1"], ["u0", "u1"]) := by
+    have := lvp_binOp_snd [] [] 8 1 (Stack.Lower.computeLastUses
+      [ANFBinding.mk "u0" (.binOp "-" "p0" "p1" none) none,
+       ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]) ["u0", "u1"] []
+      ["u0", "p2"] "u1" "-" "u0" "p2" none (by decide) (by decide) (by decide) (by decide)
+    rw [h2] at this; exact this
+  obtain ⟨hs2, hl2⟩ := Prod.mk.injEq .. ▸ e2
+  subst hs2; subst hl2
+  simp only [Stack.Lower.lowerBindingsP]
+
+private theorem sA_elsOps :
+    (ifValElsRes [] [] 8 0 sA_lu [] [] sA_sm "c" sA_els).1 ≠ [] := by
+  unfold ifValElsRes; rw [sA_smBranch, sA_ip, sA_els]
+  simp only [List.map_cons, List.map_nil, ANFBinding.name]
+  rw [Stack.Lower.lowerBindingsP.eq_2]
+  rcases h1 : Stack.Lower.lowerValueP [] [] 8 0 (Stack.Lower.computeLastUses
+      [ANFBinding.mk "u0" (.binOp "-" "p0" "p1" none) none,
+       ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]) []
+      ["u0", "u1"] [] ["p0", "p1", "p2"] "u0" (.binOp "-" "p0" "p1" none)
+    with ⟨o1, s1, l1⟩
+  have ho1 : o1 ≠ [] := by
+    have hfst : o1 = (Stack.Lower.lowerValueP [] [] 8 0 (Stack.Lower.computeLastUses
+        [ANFBinding.mk "u0" (.binOp "-" "p0" "p1" none) none,
+         ANFBinding.mk "u1" (.binOp "-" "u0" "p2" none) none]) []
+        ["u0", "u1"] [] ["p0", "p1", "p2"] "u0" (.binOp "-" "p0" "p1" none)).1 :=
+      (congrArg Prod.fst h1).symm
+    rw [hfst]
+    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    decide
+  simp only []
+  intro hcontra
+  exact ho1 (List.append_eq_nil_iff.mp hcontra).1
+
+private theorem sA_clean :
+    ifValCleanShape [] [] 8 0 sA_lu [] [] sA_sm "c" sA_thn sA_els := by
+  refine ⟨by decide, ?_, ?_, ?_, sA_elsOps⟩
+  · rw [sA_smBranch, sA_elsSm, sA_thnSm]; decide
+  · rw [sA_smBranch, sA_thnSm, sA_elsSm]; decide
+  · rw [sA_thnSm, sA_elsSm]; rfl
+
+/-- **Wave 41 A smoke — `ifValArithBody` is inhabited.**  Both branches
+genuinely two-binding arith chains consuming the same parent operands; the
+predicate (arith-readiness ×2 + `ifValCleanShape`) discharges. -/
+theorem wave41_ifValArithBody_smoke :
+    ifValArithBody [] [] 8 0 sA_lu [] [] sA_sm sA_body := by
+  show emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses sA_thn) sA_thn
+        (ifValSmBranch sA_sm "c" 0 sA_lu []) 0 false ∧
+      emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses sA_els) sA_els
+        (ifValSmBranch sA_sm "c" 0 sA_lu []) 0 false ∧
+      ifValCleanShape [] [] 8 0 sA_lu [] [] sA_sm "c" sA_thn sA_els
+  refine ⟨?_, ?_, sA_clean⟩
+  · rw [sA_smBranch]; unfold sA_thn; decide
+  · rw [sA_smBranch]; unfold sA_els; decide
+
+/-! ### B — the cond-load lemma
+
+When the `if_val` condition `cond` is the **head** tagged slot — a bool-typed
+slot whose ANF value is a known `.vBool b` (a prior comparison result or a
+bool param sitting on top of the branch stack at the if) — both sides agree:
+
+* ANF: `anfSt.resolveRef cond = some (.vBool b)` (head correspondence of
+  `agreesTagged` + the slot resolving to its tagged value via `tsmCoherent`);
+* Script: the cond is on top of `stkSt.stack` (head alignment), bool-coercible
+  to the same `b`, and the cond-load `loadRefLive (cond :: rest) cond …` at
+  depth 0 with a last-use consume emits no ops (`[]`) — the cond is already on
+  top, and the structural `OP_IF` pops it.
+
+This is the input-side cond-load witness `agreesTagged_ifVal_arith_iff`
+(wave 40) consumes: `condOps = []`, `condV = .vBool b`, `branchStk = stkSt`
+with the cond head popped.  It is NOT a restatement of the conclusion (it
+talks only about the cond head + the load prefix, never about the `.ifOp`
+tail). -/
+theorem ifValArithCondLoad
+    (cond : String) (k : SlotKind) (rest : TaggedStackMap)
+    (anfSt : State) (stkSt : StackState) (restStk : List Value) (b : Bool)
+    (lastUses : List (String × Nat)) (currentIndex : Nat)
+    (hAgrees : agreesTagged ((cond, k) :: rest) anfSt stkSt)
+    (hCondVal : lookupAnfByKind anfSt (cond, k) = some (.vBool b))
+    (hCoh : tsmCoherent anfSt ((cond, k) :: rest))
+    (hStk : stkSt.stack = (.vBool b) :: restStk)
+    (hLast : Stack.Lower.isLastUse lastUses cond currentIndex = true) :
+    -- ANF side: cond resolves to the known bool.
+    anfSt.resolveRef cond = some (.vBool b)
+    -- Script side: the cond-load runs to the bool-topped branch stack with
+    -- `condOps = []`, and the top is bool-coercible to the same `b`.
+    ∧ (Stack.Lower.loadRefLive (Agrees.untagSm ((cond, k) :: rest)) cond
+          currentIndex lastUses []).1 = []
+    ∧ runOps (Stack.Lower.loadRefLive (Agrees.untagSm ((cond, k) :: rest)) cond
+          currentIndex lastUses []).1 stkSt
+        = .ok { stkSt with stack := (.vBool b) :: { stkSt with stack := restStk }.stack }
+    ∧ asBool? (.vBool b) = some b := by
+  refine ⟨?_, ?_, ?_, rfl⟩
+  · -- ANF: head correspondence of `agreesTagged` identifies the cond value;
+    -- `tsmCoherent` transports `lookupAnfByKind` to `resolveRef`.
+    have hc := hCoh (cond, k) (List.mem_cons_self)
+    rw [← hc]; exact hCondVal
+  · -- The cond-load shape: cond at depth 0, last use → `loadRefLive` emits `[]`.
+    show (Stack.Lower.loadRefLive (cond :: Agrees.untagSm rest) cond currentIndex lastUses []).1 = []
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and, hLast,
+      Stack.Lower.StackMap.depth?, List.findIdx?_cons, beq_self_eq_true, if_true]
+  · -- The cond-load runs to the same stack (`[]` ops); rewrite the top via hStk.
+    have hOps : (Stack.Lower.loadRefLive (Agrees.untagSm ((cond, k) :: rest)) cond
+          currentIndex lastUses []).1 = [] := by
+      show (Stack.Lower.loadRefLive (cond :: Agrees.untagSm rest) cond currentIndex lastUses []).1 = []
+      unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+      simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and, hLast,
+        Stack.Lower.StackMap.depth?, List.findIdx?_cons, beq_self_eq_true, if_true]
+    rw [hOps, Stack.Eval.runOps_nil]
+    cases stkSt with
+    | mk stack altstack outputs props preimage =>
+        simp only at hStk
+        subst hStk
+        rfl
+
+/-! ### B — MANDATORY smoke: the cond-load fires on a concrete bool head
+
+cond `c` is the head `.param` slot resolving to `.vBool true`, sitting on
+top of the branch stack `[.vBool true, .vBigint 3, .vBigint 4]`.  Both
+sides agree (`resolveRef c = some (.vBool true)`, the cond-load runs `[]`,
+the top is bool-coercible to `true`). -/
+private def sB_anf : State :=
+  { params := [("c", .vBool true), ("p0", .vBigint 3), ("p1", .vBigint 4)] }
+private def sB_stk : StackState :=
+  { stack := [.vBool true, .vBigint 3, .vBigint 4] }
+private def sB_rest : TaggedStackMap := [("p0", .param), ("p1", .param)]
+
+private theorem sB_agrees :
+    agreesTagged (("c", .param) :: sB_rest) sB_anf sB_stk := by
+  refine ⟨?_, rfl, rfl⟩
+  show taggedStackAligned (("c", .param) :: sB_rest) sB_anf sB_stk.stack
+  refine ⟨rfl, ?_, ?_, ?_⟩
+  · show lookupAnfByKind sB_anf ("p0", .param) = some (.vBigint 3); rfl
+  · show lookupAnfByKind sB_anf ("p1", .param) = some (.vBigint 4); rfl
+  · trivial
+
+private theorem sB_coh : tsmCoherent sB_anf (("c", .param) :: sB_rest) := by
+  intro s hs
+  simp only [sB_rest, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with h | h | h <;> (subst h; rfl)
+
+/-- **Wave 41 B smoke — the cond-load fires.**  The cond `c` resolves to
+`.vBool true` on both sides, the cond-load runs to the bool-topped branch
+stack with no ops, and the top is bool-coercible to `true`. -/
+theorem wave41_ifValArithCondLoad_smoke :
+    sB_anf.resolveRef "c" = some (.vBool true)
+    ∧ (Stack.Lower.loadRefLive (Agrees.untagSm (("c", .param) :: sB_rest)) "c"
+          0 [("c", 0)] []).1 = []
+    ∧ asBool? (.vBool true) = some true := by
+  obtain ⟨hRes, hOps, _hRun, hBool⟩ :=
+    ifValArithCondLoad "c" .param sB_rest sB_anf sB_stk [.vBigint 3, .vBigint 4] true
+      [("c", 0)] 0 sB_agrees rfl sB_coh rfl (by decide)
+  exact ⟨hRes, hOps, hBool⟩
+
+/-! ### C — the body-level walk wrapper
+
+`successAgrees_ifVal_arith_unconditional` lifts the wave-39 arith walk to a
+single self-contained `ifValArithBody`.  It composes:
+
+* the ANF / Script singleton-body bridges
+  (`evalBindings [ifVal] ↔ evalValue (.ifVal)`,
+   `lowerBindingsP [ifVal] = (lowerValueP (.ifVal)).1`),
+* the clean-shape collapse `lowerValueP_ifVal_clean_shape` (so the lowered
+  op-list is `condOps ++ [.ifOp thnOps (some elsOps)]` — the analogue of the
+  arith chunk-split), and
+* the wave-40 transport `agreesTagged_ifVal_arith_iff`, fed the cond-load
+  (Deliverable B's `condV` / `branchStk` / `asBool?` facts) and the two
+  per-branch arith walk iffs (each the output of the wave-39
+  `successAgrees_arith_consume_unconditional` against `branchStk`).
+
+The branch iffs and the cond facts are taken as input-side premises (each is
+produced by the arith walk / Deliverable B against the cond-popped branch
+stack `branchStk`, never by inspecting the `.ifOp` conclusion).  The smoke
+below feeds them from the real wave-39 walk + Deliverable B. -/
+theorem successAgrees_ifVal_arith_unconditional
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (sm : StackMap) (bn cond : String) (thn els : List ANFBinding)
+    (src : Option SourceLoc)
+    (initialAnf : State) (initialStack : StackState) (branchStk : StackState)
+    (condV : Value) (b : Bool)
+    (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
+                [] constInts sm cond thn els)
+    (hCond : initialAnf.resolveRef cond = some (.vBool b))
+    (hCondLoad :
+      runOps (Stack.Lower.loadRefLive sm cond currentIndex lastUses []).1 initialStack
+        = .ok { branchStk with stack := condV :: branchStk.stack })
+    (hBool : asBool? condV = some b)
+    (hThnIff :
+      (RunarVerification.ANF.Eval.evalBindings initialAnf thn).toOption.isSome ↔
+      (runOps (ifValThnRes progMethods props budget currentIndex lastUses
+                [] constInts sm cond thn).1 branchStk).toOption.isSome)
+    (hElsIff :
+      (RunarVerification.ANF.Eval.evalBindings initialAnf els).toOption.isSome ↔
+      (runOps (ifValElsRes progMethods props budget currentIndex lastUses
+                [] constInts sm cond els).1 branchStk).toOption.isSome) :
+    (RunarVerification.ANF.Eval.evalBindings initialAnf
+        [.mk bn (.ifVal cond thn els) src]).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+            [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1
+            initialStack).toOption.isSome := by
+  -- ANF bridge: evalBindings of the singleton ifVal ↔ evalValue (.ifVal).
+  have hAnfBridge :
+      (RunarVerification.ANF.Eval.evalBindings initialAnf
+          [.mk bn (.ifVal cond thn els) src]).toOption.isSome
+        ↔ (RunarVerification.ANF.Eval.evalValue initialAnf (.ifVal cond thn els)).toOption.isSome := by
+    simp only [RunarVerification.ANF.Eval.evalBindings]
+    cases h : RunarVerification.ANF.Eval.evalValue initialAnf (.ifVal cond thn els) with
+    | error e => simp only [bind, Except.bind, Except.toOption, Option.isSome]
+    | ok p => simp only [bind, Except.bind, Except.toOption, Option.isSome]
+  -- Script bridge: lowerBindingsP of the singleton ifVal = (lowerValueP).1,
+  -- then clean-shape collapse to `condOps ++ [.ifOp thnOps (some elsOps)]`.
+  have hScriptBridge :
+      (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1
+        = (Stack.Lower.loadRefLive sm cond currentIndex lastUses []).1
+          ++ [StackOp.ifOp
+                (ifValThnRes progMethods props budget currentIndex lastUses
+                  [] constInts sm cond thn).1
+                (some (ifValElsRes progMethods props budget currentIndex lastUses
+                  [] constInts sm cond els).1)] := by
+    rw [Stack.Lower.lowerBindingsP.eq_2]
+    rcases h : Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        [] localBindings constInts sm bn (.ifVal cond thn els) with ⟨o, s, l⟩
+    simp only [Stack.Lower.lowerBindingsP, List.append_nil]
+    have hcs := lowerValueP_ifVal_clean_shape progMethods props budget currentIndex lastUses
+      [] localBindings constInts sm bn cond thn els hClean
+    rw [h] at hcs
+    exact hcs
+  rw [hAnfBridge, hScriptBridge]
+  -- Transport across the conditional via the wave-40 lemma.
+  exact agreesTagged_ifVal_arith_iff initialAnf cond thn els
+    (Stack.Lower.loadRefLive sm cond currentIndex lastUses []).1
+    (ifValThnRes progMethods props budget currentIndex lastUses [] constInts sm cond thn).1
+    (some (ifValElsRes progMethods props budget currentIndex lastUses [] constInts sm cond els).1)
+    initialStack branchStk condV b hCond hCondLoad hBool hThnIff
+    (fun e he => by rw [Option.some.injEq] at he; subst he; exact hElsIff)
+    (fun he => by exact absurd he (by simp))
+
+/-! ### C — MANDATORY smoke: the body-level walk wrapper fires
+
+The same `if (c) { t0=p0+p1; t1=t0+p2 } else { u0=p0-p1; u1=u0-p2 }`, now
+with a full ANF state (`c=true`, `p0=3`,`p1=4`,`p2=5`) and aligned stacks.
+The two branch iffs come from the REAL wave-39
+`successAgrees_arith_consume_unconditional` (NO `taggedAllBigint`
+hypothesis — DERIVED from typed entry), the cond-load from Deliverable B,
+and the clean-shape from the Deliverable-A smoke machinery.  We obtain the
+body-level iff and confirm the ANF side concretely succeeds, so the Script
+side succeeds — anti-vacuous (both branches genuinely arith). -/
+private def sC_anf : State :=
+  { params := [("c", .vBool true), ("p0", .vBigint 3), ("p1", .vBigint 4), ("p2", .vBigint 5)] }
+private def sC_stk : StackState :=
+  { stack := [.vBool true, .vBigint 3, .vBigint 4, .vBigint 5] }
+private def sC_branchStk : StackState :=
+  { stack := [.vBigint 3, .vBigint 4, .vBigint 5] }
+private def sC_branchTsm : TaggedStackMap :=
+  [("p0", .param), ("p1", .param), ("p2", .param)]
+private def sC_env : RunarVerification.ANF.WellTyped.TypeEnv :=
+  (((RunarVerification.ANF.Typed.TypeEnv.empty.extend "p0" .bigint).extend "p1" .bigint).extend "p2" .bigint)
+
+private theorem sC_branchAgrees : agreesTagged sC_branchTsm sC_anf sC_branchStk := by
+  refine ⟨?_, rfl, rfl⟩
+  show taggedStackAligned sC_branchTsm sC_anf sC_branchStk.stack
+  refine ⟨rfl, rfl, rfl, ?_⟩; trivial
+
+private theorem sC_entryTyped :
+    RunarVerification.ANF.WellTyped.EntryBigintTyped sC_env sC_anf := by
+  intro n hn
+  by_cases h0 : n = "p0"
+  · subst h0; exact ⟨.vBigint 3, rfl, ⟨3, rfl⟩⟩
+  · by_cases h1 : n = "p1"
+    · subst h1; exact ⟨.vBigint 4, rfl, ⟨4, rfl⟩⟩
+    · by_cases h2 : n = "p2"
+      · subst h2; exact ⟨.vBigint 5, rfl, ⟨5, rfl⟩⟩
+      · exfalso
+        have hp2 : ("p2" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h2 h.symm
+        have hp1 : ("p1" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h1 h.symm
+        have hp0 : ("p0" == n) = false := by rw [beq_eq_false_iff_ne]; exact fun h => h0 h.symm
+        simp only [sC_env, RunarVerification.ANF.Typed.TypeEnv.lookup,
+          RunarVerification.ANF.Typed.TypeEnv.extend, RunarVerification.ANF.Typed.TypeEnv.empty,
+          List.find?_cons, hp2, hp1, hp0, List.find?_nil, Option.map_none, reduceCtorEq] at hn
+
+private theorem sC_tsmTyped : entryTsmArithTyped sC_env sC_branchTsm := by
+  intro s hs
+  unfold RunarVerification.ANF.WellTyped.arithOperandBigint
+  simp only [sC_branchTsm, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with h | h | h <;> (subst h; decide)
+
+private theorem sC_coh : tsmCoherent sC_anf sC_branchTsm := by
+  intro s hs
+  simp only [sC_branchTsm, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with h | h | h <;> (subst h; rfl)
+
+/-- Branch walk iff (the exact shape Deliverable C's `hThnIff` / `hElsIff`
+demand), produced by the wave-39 walk + the `ifValInnerProtected = []` /
+`ifValSmBranch` rewrites from the Deliverable-A smoke. -/
+private theorem sC_branchWalk (branch : List ANFBinding)
+    (hChain : emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses branch) branch
+      ["p0", "p1", "p2"] 0 false)
+    (hRes :
+      ifValThnRes [] [] 8 0 sA_lu [] (Stack.Lower.collectConstInts sA_body) sA_sm "c" branch
+        = Stack.Lower.lowerBindingsP [] [] 8 0 (Stack.Lower.computeLastUses branch) []
+            (List.map (fun b => b.name) branch) (Stack.Lower.collectConstInts sA_body)
+            ["p0", "p1", "p2"] branch) :
+    (RunarVerification.ANF.Eval.evalBindings sC_anf branch).toOption.isSome ↔
+    (runOps (ifValThnRes [] [] 8 0 sA_lu [] (Stack.Lower.collectConstInts sA_body) sA_sm "c" branch).1
+        sC_branchStk).toOption.isSome := by
+  rw [hRes]
+  exact successAgrees_arith_consume_unconditional [] [] 8
+    (Stack.Lower.computeLastUses branch) (Stack.Lower.collectConstInts sA_body) sC_env
+    branch ["p0", "p1", "p2"] (List.map (fun b => b.name) branch) 0 sC_branchTsm sC_anf sC_branchStk
+    (by unfold sC_branchTsm untagSm; rfl) sC_branchAgrees
+    (emittableArithChainReadyNoDblNeg_imp_ready _ branch ["p0", "p1", "p2"] 0 false hChain)
+    sC_entryTyped sC_tsmTyped sC_coh
+
+/-- **Wave 41 C smoke — the body-level walk wrapper fires.**  The body-level
+iff holds, and the ANF `if_val` side concretely succeeds (THEN branch
+evaluates `t0 = 3+4 = 7`, `t1 = 7+5 = 12`), so the Script side succeeds. -/
+theorem wave41_successAgrees_ifVal_arith_smoke :
+    ((RunarVerification.ANF.Eval.evalBindings sC_anf sA_body).toOption.isSome
+      ↔ (runOps (Stack.Lower.lowerBindingsP [] [] 8 0 sA_lu []
+            (List.map (fun b => b.name) sA_body) (Stack.Lower.collectConstInts sA_body)
+            sA_sm sA_body).1 sC_stk).toOption.isSome)
+    ∧ (RunarVerification.ANF.Eval.evalBindings sC_anf sA_body).toOption.isSome := by
+  -- `collectConstInts sA_body = []` (pure-param arith, no const ints).
+  have hCCI : Stack.Lower.collectConstInts sA_body = [] := by
+    unfold sA_body sA_thn sA_els
+    simp only [Stack.Lower.collectConstInts, List.append_nil]
+  rw [hCCI]
+  have hCondAgrees : agreesTagged (("c", .param) :: sC_branchTsm) sC_anf sC_stk := by
+    refine ⟨?_, rfl, rfl⟩
+    show taggedStackAligned (("c", .param) :: sC_branchTsm) sC_anf sC_stk.stack
+    refine ⟨rfl, rfl, rfl, rfl, ?_⟩; trivial
+  have hCondCoh : tsmCoherent sC_anf (("c", .param) :: sC_branchTsm) := by
+    intro s hs
+    simp only [sC_branchTsm, List.mem_cons, List.not_mem_nil, or_false] at hs
+    rcases hs with h | h | h | h <;> (subst h; rfl)
+  obtain ⟨hCondRes, _hCondOps, hCondRun, hCondBool⟩ :=
+    ifValArithCondLoad "c" .param sC_branchTsm sC_anf sC_stk
+      [.vBigint 3, .vBigint 4, .vBigint 5] true sA_lu 0
+      hCondAgrees rfl hCondCoh rfl (by decide)
+  have hUntagSm : Agrees.untagSm (("c", .param) :: sC_branchTsm) = sA_sm := by
+    unfold sC_branchTsm untagSm sA_sm; rfl
+  rw [hUntagSm] at hCondRun
+  have hThn := sC_branchWalk sA_thn (by unfold sA_thn; decide)
+    (by unfold ifValThnRes; rw [sA_smBranch, sA_ip, hCCI])
+  have hEls := sC_branchWalk sA_els (by unfold sA_els; decide)
+    (by unfold ifValThnRes; rw [sA_smBranch, sA_ip, hCCI])
+  rw [hCCI] at hThn hEls
+  -- `ifValThnRes … sA_els = ifValElsRes … sA_els` definitionally (same lowering).
+  have hElsConv :
+      (RunarVerification.ANF.Eval.evalBindings sC_anf sA_els).toOption.isSome ↔
+      (runOps (ifValElsRes [] [] 8 0 sA_lu [] [] sA_sm "c" sA_els).1
+          sC_branchStk).toOption.isSome := hEls
+  have hIff := successAgrees_ifVal_arith_unconditional [] [] 8 0 sA_lu
+    (List.map (fun b => b.name) sA_body) []
+    sA_sm "r" "c" sA_thn sA_els none sC_anf sC_stk sC_branchStk (.vBool true) true
+    sA_clean hCondRes hCondRun hCondBool hThn hElsConv
+  refine ⟨hIff, ?_⟩
+  -- ANF side concretely succeeds: THEN branch evaluates `t0=3+4=7; t1=7+5=12`.
+  show (RunarVerification.ANF.Eval.evalBindings sC_anf sA_body).toOption.isSome
+  unfold sA_body
+  simp only [RunarVerification.ANF.Eval.evalBindings]
+  have hCondRes2 : sC_anf.resolveRef "c" = some (.vBool true) := rfl
+  have hThnEval :
+      (RunarVerification.ANF.Eval.evalValue sC_anf (.ifVal "c" sA_thn sA_els)).toOption.isSome := by
+    rw [evalValue_ifVal_isSome_iff_activeBranch sC_anf "c" sA_thn sA_els true hCondRes2]
+    rw [if_pos (rfl : (true = true))]
+    show (RunarVerification.ANF.Eval.evalBindings sC_anf sA_thn).toOption.isSome
+    unfold sA_thn
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          sC_anf "t0" "+" "p0" "p1" none none 3 4 _ (Or.inl rfl) rfl rfl]
+    rw [RunarVerification.ANF.Eval.evalBindings_binOp_bigint_cons_step
+          (sC_anf.addBinding "t0" (.vBigint (RunarVerification.ANF.Eval.arithBinResultBigint "+" 3 4)))
+          "t1" "+" "t0" "p2" none none
+          (RunarVerification.ANF.Eval.arithBinResultBigint "+" 3 4) 5 _ (Or.inl rfl) rfl rfl]
+    simp only [RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+  cases h : RunarVerification.ANF.Eval.evalValue sC_anf (.ifVal "c" sA_thn sA_els) with
+  | error e =>
+      exfalso; rw [h] at hThnEval
+      simp only [Except.toOption, Option.isSome, reduceCtorEq] at hThnEval
+  | ok p =>
+      simp only [bind, Except.bind, RunarVerification.ANF.Eval.evalBindings, Except.toOption, Option.isSome]
+
+/-! ### D — the `if_val` op-shape (emittability half)
+
+The `.ifOp`-bearing analogue of `loweredEmittableArithNoDblNeg_opShape`'s
+`AreRunarEmittable` conjunct.  Under `ifValCleanShape` the lowering collapses
+(via `lowerValueP_ifVal_clean_shape`) to `condOps ++ [.ifOp thnOps (some elsOps)]`,
+where the branch op-lists are emittable-arith (wave-38
+`loweredEmittableArith_areEmittable` per branch) and the `.ifOp` node is
+emittable via `AreRunarEmittableWithIf.if_some_cons`.  `condOps`
+(`loadRefLive`) emittability is supplied as an input-side hypothesis
+(`hCondEmit`); the smoke discharges it from the empty cond-load.
+
+The peephole-identity conjunct of a full op-shape (`peepholeRollPickFold
+(peepholeChainFold (peepholePostFold (peepholePassAll …))) = …`) for an
+`.ifOp`-bearing list is NOT included here: it requires per-pass `.ifOp`
+identity lemmas (each pass recurses into the branches via `postFoldOp` /
+`chainFoldOp` / `rollPickOp` and the branches are `arithEmitNoFuse`-fixed,
+but the outer-pass `.ifOp`-arm fixpoint needs dedicated lemmas added inside
+`Stack/Peephole.lean` with access to its private mutual recursors).  See the
+hand-off note. -/
+
+/-- WithIf-emittability is closed under list append (the `.ifOp`-aware
+analogue of `areRunarEmittable_append`). -/
+theorem areRunarEmittableWithIf_append (a b : List StackOp)
+    (ha : RunarVerification.Script.Parse.AreRunarEmittableWithIf a) (hb : RunarVerification.Script.Parse.AreRunarEmittableWithIf b) :
+    RunarVerification.Script.Parse.AreRunarEmittableWithIf (a ++ b) := by
+  induction a with
+  | nil => simpa using hb
+  | cons op rest ih =>
+      cases ha with
+      | cons _ _ hOp hRest =>
+          exact RunarVerification.Script.Parse.AreRunarEmittableWithIf.cons op (rest ++ b) hOp (ih hRest)
+
+/-- **Wave 41 D (emittability half) — `if_val` arith op-shape.**
+
+For an `ifValArithBody` whose cond-load `condOps` is itself WithIf-emittable,
+the lowered op-list is `AreRunarEmittableWithIf`: the clean-shape collapse
+exposes `condOps ++ [.ifOp thnOps (some elsOps)]`, the branches are
+emittable-arith (wave-38), and the `.ifOp` node is WithIf-emittable. -/
+theorem loweredIfValArith_areEmittable
+    (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (localBindings : List String) (constInts : List (String × Int))
+    (sm : StackMap) (bn cond : String) (thn els : List ANFBinding) (src : Option SourceLoc)
+    (hThnChain : emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses thn) thn
+      (ifValSmBranch sm cond currentIndex lastUses []) 0 false)
+    (hElsChain : emittableArithChainReadyNoDblNeg (Stack.Lower.computeLastUses els) els
+      (ifValSmBranch sm cond currentIndex lastUses []) 0 false)
+    (hClean : ifValCleanShape progMethods props budget currentIndex lastUses
+                [] constInts sm cond thn els)
+    (hInnerEmpty : ifValInnerProtected sm cond currentIndex lastUses [] = [])
+    (hCondEmit : RunarVerification.Script.Parse.AreRunarEmittableWithIf
+      (Stack.Lower.loadRefLive sm cond currentIndex lastUses []).1) :
+    RunarVerification.Script.Parse.AreRunarEmittableWithIf
+      (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+        [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1 := by
+  -- Script bridge + clean-shape collapse.
+  have hScriptBridge :
+      (Stack.Lower.lowerBindingsP progMethods props budget currentIndex lastUses
+          [] localBindings constInts sm [.mk bn (.ifVal cond thn els) src]).1
+        = (Stack.Lower.loadRefLive sm cond currentIndex lastUses []).1
+          ++ [StackOp.ifOp
+                (ifValThnRes progMethods props budget currentIndex lastUses
+                  [] constInts sm cond thn).1
+                (some (ifValElsRes progMethods props budget currentIndex lastUses
+                  [] constInts sm cond els).1)] := by
+    rw [Stack.Lower.lowerBindingsP.eq_2]
+    rcases h : Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        [] localBindings constInts sm bn (.ifVal cond thn els) with ⟨o, s, l⟩
+    simp only [Stack.Lower.lowerBindingsP, List.append_nil]
+    have hcs := lowerValueP_ifVal_clean_shape progMethods props budget currentIndex lastUses
+      [] localBindings constInts sm bn cond thn els hClean
+    rw [h] at hcs; exact hcs
+  rw [hScriptBridge]
+  -- Branch op-lists are emittable-arith.
+  have hThnEmit : RunarVerification.Script.Parse.AreRunarEmittable
+      (ifValThnRes progMethods props budget currentIndex lastUses [] constInts sm cond thn).1 := by
+    show RunarVerification.Script.Parse.AreRunarEmittable
+      (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses thn)
+        (ifValInnerProtected sm cond currentIndex lastUses [])
+        (List.map (fun b => b.name) thn) constInts
+        (ifValSmBranch sm cond currentIndex lastUses []) thn).1
+    rw [hInnerEmpty]
+    exact loweredEmittableArith_areEmittable progMethods props budget
+      (Stack.Lower.computeLastUses thn)
+      constInts thn (List.map (fun b => b.name) thn)
+      (ifValSmBranch sm cond currentIndex lastUses []) 0
+      (emittableArithChainReadyNoDblNeg_imp_ready _ thn
+        (ifValSmBranch sm cond currentIndex lastUses []) 0 false hThnChain)
+  have hElsEmit : RunarVerification.Script.Parse.AreRunarEmittable
+      (ifValElsRes progMethods props budget currentIndex lastUses [] constInts sm cond els).1 := by
+    show RunarVerification.Script.Parse.AreRunarEmittable
+      (Stack.Lower.lowerBindingsP progMethods props budget 0 (Stack.Lower.computeLastUses els)
+        (ifValInnerProtected sm cond currentIndex lastUses [])
+        (List.map (fun b => b.name) els) constInts
+        (ifValSmBranch sm cond currentIndex lastUses []) els).1
+    rw [hInnerEmpty]
+    exact loweredEmittableArith_areEmittable progMethods props budget
+      (Stack.Lower.computeLastUses els)
+      constInts els (List.map (fun b => b.name) els)
+      (ifValSmBranch sm cond currentIndex lastUses []) 0
+      (emittableArithChainReadyNoDblNeg_imp_ready _ els
+        (ifValSmBranch sm cond currentIndex lastUses []) 0 false hElsChain)
+  -- ELSE op-list non-empty (from clean-shape).
+  obtain ⟨_, _, _, _, hElsNE⟩ := hClean
+  -- Assemble: condOps emittable ++ [.ifOp node emittable].
+  apply areRunarEmittableWithIf_append _ _ hCondEmit
+  cases hE : (ifValElsRes progMethods props budget currentIndex lastUses [] constInts sm cond els).1 with
+  | nil => exact absurd hE hElsNE
+  | cons eh et =>
+      refine RunarVerification.Script.Parse.AreRunarEmittableWithIf.cons _ [] ?_ RunarVerification.Script.Parse.AreRunarEmittableWithIf.nil
+      exact RunarVerification.Script.Parse.RunarEmittableWithIf.if_some_cons _ eh et
+        (RunarVerification.Script.Parse.AreRunarEmittable.toWithIf _ hThnEmit)
+        (RunarVerification.Script.Parse.AreRunarEmittable.toWithIf (eh :: et) (hE ▸ hElsEmit))
+
+/-- **Wave 41 D smoke (emittability half) — the `if_val` op-shape fires.**
+The lowered op-list of the concrete `sA_body` is `AreRunarEmittableWithIf`
+(both branches emittable-arith, the `.ifOp` node WithIf-emittable, the empty
+cond-load trivially emittable). -/
+theorem wave41_loweredIfValArith_areEmittable_smoke :
+    RunarVerification.Script.Parse.AreRunarEmittableWithIf
+      (Stack.Lower.lowerBindingsP [] [] 8 0 sA_lu []
+        (List.map (fun b => b.name) sA_body) [] sA_sm sA_body).1 := by
+  have hCondEmit : RunarVerification.Script.Parse.AreRunarEmittableWithIf
+      (Stack.Lower.loadRefLive sA_sm "c" 0 sA_lu []).1 := by
+    have hEmpty : (Stack.Lower.loadRefLive sA_sm "c" 0 sA_lu []).1 = [] := by
+      unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop sA_sm sA_lu sA_body sA_thn sA_els
+      decide
+    rw [hEmpty]; exact RunarVerification.Script.Parse.AreRunarEmittableWithIf.nil
+  have h := loweredIfValArith_areEmittable [] [] 8 0 sA_lu
+    (List.map (fun b => b.name) sA_body) [] sA_sm "r" "c" sA_thn sA_els none
+    (by rw [sA_smBranch]; unfold sA_thn; decide)
+    (by rw [sA_smBranch]; unfold sA_els; decide)
+    sA_clean sA_ip hCondEmit
+  exact h
+
 end -- attribute [local irreducible] section
 
 end Agrees
