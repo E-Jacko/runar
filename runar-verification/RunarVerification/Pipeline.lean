@@ -2736,7 +2736,7 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
     (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
     (_hCryptoCall : True) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
 /-- **O1 sub-omnibus — update_prop family.**
@@ -2768,7 +2768,7 @@ axiom compileSafe_observational_correct_modulo_update_prop_codegen (p : ANFProgr
         (List.reverse (anfM.params.map (·.name)))
         0 = true) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
 -- **O1 sub-omnibus — if_val family — RETIRED (Tier 1 Wave 45, 2026-05-23).**
@@ -2809,7 +2809,7 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
         (List.reverse (anfM.params.map (·.name)))
         0 = true) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
 /-- **O1 sub-omnibus — method_call family.**
@@ -2840,7 +2840,7 @@ axiom compileSafe_observational_correct_modulo_method_call_codegen (p : ANFProgr
         (List.reverse (anfM.params.map (·.name)))
         0 = true) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
 /-- **O1 sub-omnibus — dispatch family.**
@@ -2865,7 +2865,7 @@ axiom compileSafe_observational_correct_modulo_dispatch_codegen (p : ANFProgram)
     (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
     (_hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
 /-- **O1 sub-omnibus — stateful family.**
@@ -2891,7 +2891,7 @@ axiom compileSafe_observational_correct_modulo_stateful_codegen (p : ANFProgram)
     (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
     (_hStateful : Lower.bindingsUseCheckPreimage anfM.body = true) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
 /-! ### Multi-method capstone
@@ -3479,6 +3479,81 @@ theorem bodyEndsInAssert_false_of_arithOnly :
       have := bodyEndsInAssert_false_of_arithOnly (b2 :: rest) hTail
       simpa only [Lower.bodyEndsInAssert] using this
 
+/-- An `arithOnlyBody` is methodCall-free: every binding is a `binOp` /
+`unaryOp`, neither of which is a `.methodCall` (so `noMethodCallValue`
+hits its catch-all `true` arm at every binding).  This is the
+`noMethodCallBindings = true` discharge the wave-54 omnibus re-statement
+needs to transfer the arith family's `evalBindings` proof to
+`evalBindingsP` via the wave-53 equality bridge. -/
+theorem noMethodCallBindings_true_of_arithOnly :
+    ∀ (body : List ANFBinding), arithOnlyBody body →
+      RunarVerification.ANF.Eval.noMethodCallBindings body = true
+  | [], _ => rfl
+  | (.mk _ (.binOp _ _ _ _) _) :: rest, h => by
+      simp only [RunarVerification.ANF.Eval.noMethodCallBindings,
+        RunarVerification.ANF.Eval.noMethodCallValue, Bool.true_and]
+      exact noMethodCallBindings_true_of_arithOnly rest h
+  | (.mk _ (.unaryOp _ _ _) _) :: rest, h => by
+      simp only [RunarVerification.ANF.Eval.noMethodCallBindings,
+        RunarVerification.ANF.Eval.noMethodCallValue, Bool.true_and]
+      exact noMethodCallBindings_true_of_arithOnly rest h
+
+/-- A NO-LEN single-arg math_byte body is methodCall-free: the classifier
+`mathByteSingleArgShapeNoLenBool` admits ONLY `.call func [arg]` bindings
+(every other head — including `.methodCall` — hits its `false` arm), and a
+`.call` value is not a `.methodCall`.  Mirrors the induction in
+`AgreesA4.mathByteEmitNoNip_of_noLenFragment`.  This is the
+`noMethodCallBindings = true` discharge for the math_byte family. -/
+theorem noMethodCallBindings_true_of_mathByteNoLen :
+    ∀ (body : List ANFBinding) (tsm : Agrees.TaggedStackMap),
+      AgreesA4.mathByteSingleArgShapeNoLenBool body tsm = true →
+      RunarVerification.ANF.Eval.noMethodCallBindings body = true := by
+  intro body
+  induction body with
+  | nil => intro _ _; rfl
+  | cons hd rest ih =>
+      intro tsm hShape
+      obtain ⟨bn, v, src⟩ := hd
+      match hv : v with
+      | .call func [arg] =>
+          cases tsm with
+          | nil => simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+          | cons s tsm_rest =>
+              have hRest :
+                  AgreesA4.mathByteSingleArgShapeNoLenBool rest
+                    ((bn, .binding) :: s :: tsm_rest) = true := by
+                have hShape' :
+                    (AgreesA4.mathByteSingleFuncNoLen func && (s.fst == arg) &&
+                      AgreesA4.mathByteSingleArgShapeNoLenBool rest
+                        ((bn, .binding) :: s :: tsm_rest)) = true := by
+                  simpa only [AgreesA4.mathByteSingleArgShapeNoLenBool] using hShape
+                exact (Bool.and_eq_true_iff.mp hShape').2
+              simp only [RunarVerification.ANF.Eval.noMethodCallBindings,
+                RunarVerification.ANF.Eval.noMethodCallValue, Bool.true_and]
+              exact ih ((bn, .binding) :: s :: tsm_rest) hRest
+      | .call func [] =>
+          cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .call func (a0 :: a1 :: aRest) =>
+          cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadParam n => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadProp n => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .loadConst c => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .binOp op l r rt => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .unaryOp op o rt => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .methodCall n a r => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .ifVal c t e => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .loop a b c => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .assert r => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .updateProp n r => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .getStateScript => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .checkPreimage pr => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .deserializeState pr => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .addOutput sa sv pre => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .addRawOutput sa sb => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .addDataOutput sa sb => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .arrayLiteral es => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+      | .rawScript b ia oa => cases tsm <;> simp [AgreesA4.mathByteSingleArgShapeNoLenBool] at hShape
+
 /-- From `p.methods.filter (·.isPublic) = [anfM]`, the public method
 named `anfM.name` is unique: any public `m'` with that name equals `anfM`.
 This is the `hUnique` premise of the M2 method bridge, derived from the
@@ -3542,8 +3617,18 @@ theorem compileSafe_observational_correct_arith_consume
     (hTsmTyped : Agrees.entryTsmArithTyped Γ tsm)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
+  -- **Wave 54 equality bridge.** The conclusion is now stated against the
+  -- program-aware `evalBindingsP`; an arith body is methodCall-free, so the
+  -- wave-53 bridge rewrites it back to the core `evalBindings` and the
+  -- existing 4-leg transitivity proof below discharges it unchanged.
+  rw [RunarVerification.ANF.Eval.evalBindingsP_eq_evalBindings_of_noMethodCall
+        p.methods initialAnf anfM.body
+        (noMethodCallBindings_true_of_arithOnly anfM.body
+          (arithOnlyBody_of_emittableArithChainReadyNoDblNeg
+            (Stack.Lower.computeLastUses anfM.body) anfM.body
+            (List.reverse (anfM.params.map (·.name))) 0 false hChain))]
   -- Abbreviation: the raw lowered op list of the method body.
   let RAW :=
       (Stack.Lower.lowerBindingsP p.methods p.properties
@@ -3767,7 +3852,7 @@ theorem compileSafe_observational_correct_ifval_consume
       Agrees.ifValInnerProtected (List.reverse (anfM.params.map (·.name)))
         cond 0 (Lower.computeLastUses anfM.body) [] = []) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
   -- Pin every `anfM.body` occurrence to the single-`.ifVal` literal so the
   -- fragment destructure, the residual structural facts, and the lowering
@@ -3790,6 +3875,19 @@ theorem compileSafe_observational_correct_ifval_consume
     arithOnlyBody_of_emittableArithChainReadyNoDblNeg
       (Stack.Lower.computeLastUses els) els
       (Agrees.ifValSmBranch SM cond 0 lastUses []) 0 false hElsChain
+  -- **Wave 54 equality bridge.** The single-`.ifVal` body is methodCall-free:
+  -- both branches are arith-only (hence methodCall-free), so `noMethodCallValue`
+  -- of the `.ifVal` is `true`.  The wave-53 bridge rewrites the conclusion's
+  -- `evalBindingsP` back to the core `evalBindings`, and the 4-leg transitivity
+  -- proof below discharges it unchanged.
+  have hNoMC : RunarVerification.ANF.Eval.noMethodCallBindings anfM.body = true := by
+    rw [hBodyEq]
+    simp only [RunarVerification.ANF.Eval.noMethodCallBindings,
+      RunarVerification.ANF.Eval.noMethodCallValue,
+      noMethodCallBindings_true_of_arithOnly thn hThnArith,
+      noMethodCallBindings_true_of_arithOnly els hElsArith, Bool.and_self]
+  rw [RunarVerification.ANF.Eval.evalBindingsP_eq_evalBindings_of_noMethodCall
+        p.methods initialAnf anfM.body hNoMC]
   -- The single-`.ifVal` body uses no implicit params / post-pass: each
   -- `bindingsUseX` recurses into both branches (both arith-only ⇒ false).
   have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false := by
@@ -3982,8 +4080,16 @@ theorem compileSafe_observational_correct_mathByte_consume
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (hFrag : AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
+  -- **Wave 54 equality bridge.** A NO-LEN single-arg math_byte body is
+  -- methodCall-free (the classifier admits only `.call func [arg]` bindings),
+  -- so the wave-53 bridge rewrites the conclusion's `evalBindingsP` back to the
+  -- core `evalBindings` and the 4-leg transitivity proof below discharges it
+  -- unchanged.
+  rw [RunarVerification.ANF.Eval.evalBindingsP_eq_evalBindings_of_noMethodCall
+        p.methods initialAnf anfM.body
+        (noMethodCallBindings_true_of_mathByteNoLen anfM.body tsm hShapeNoLen)]
   -- The no-implicits facts (no checkPreimage / codePart / deserialize / terminal
   -- assert), derived from the no-len structural shape.
   have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false :=
@@ -4196,7 +4302,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
         AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
   -- Per-family classifier inputs (shared by all Bool checkers).
   let lastUses     := Lower.computeLastUses anfM.body
@@ -4419,7 +4525,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
     successAgrees
-      (RunarVerification.ANF.Eval.evalBindings initialAnf anfM.body)
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) :=
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
