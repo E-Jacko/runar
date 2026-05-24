@@ -2001,5 +2001,268 @@ theorem wave65_smoke_evalBindings_isNone :
         wave65SmokeState wave65SmokeBody).toOption.isSome = false := by
   native_decide
 
+/-! ## Wave 66 — the decidable method-level `method_call` consume classifier
+
+Step 1 of 2 toward retiring the `method_call` sub-omnibus axiom
+(`Pipeline.compileSafe_observational_correct_modulo_method_call_codegen`).
+This wave is ADD-ONLY: the classifier + its extraction + a method-level
+passthrough wrapper are introduced here, and the consume theorem + smoke
+land in `Pipeline.lean`. NO wiring into the omnibus dispatch, NO axiom
+removal — those are the next wave's gated dispatch (see the consume
+theorem's docstring in `Pipeline.lean`).
+
+### The retirable fragment
+
+The classifier recognises the **param-passthrough** `method_call`
+fragment — the genuinely RAW = `[]` shape the wave-65 M2 walk
+(`successAgrees_methodCall_passthrough_unconditional`) already covers at
+the body level. A method `m` is in the fragment when:
+
+* `m` has exactly one param `a` (so the method's initial stack map
+  `(m.params.map name).reverse = [a]`);
+* `m.body` is a single binding `[bn := methodCall obj method [a]]`;
+* the object reference `obj ≠ a` (so `obj` is absent from `[a]` and the
+  `objDropOps` branch reduces to `[]`);
+* the call-site arg `a` is on its last use at index `0`
+  (`isLastUse (computeLastUses m.body) a 0`), so the arg load consumes
+  in place with NO op;
+* the callee `method` resolves to a one-param identity helper
+  `helper(p) { return p }` (`m'.params = [{p,_}]`, `m'.body =
+  [r' := loadParam p]`).
+
+The whole methodCall then lowers to the EMPTY op list, so the M3 / M4
+legs of the consume theorem are TRIVIAL (`peephole [] = []`,
+`AreRunarEmittablePush []`). The classifier is BODY-only in the sense
+the omnibus needs (no tsm), but — like the leaf predicates already in
+this file (`methodSingletonMethodCallLeafBody`) and unlike the
+methodCall-free `update_prop` classifier — it must carry `progMethods`
+to resolve the callee shape.
+
+VACUOUS for every non-passthrough method (the `_ => false` arms), so a
+keyed omnibus premise on it stays jointly satisfiable.
+
+The wider const-leaf shape (`successAgrees_methodCall_unconditional`,
+non-empty `structuralConstBody` callee) is a DEFERRED widening: it does
+NOT lower to `[]` (the callee's const pushes survive), so its M4 leg
+needs the non-trivial push-emittability argument for const pushes rather
+than the empty-ops identity. That widening is left for a follow-up. -/
+
+/-- Identity-callee check: the resolved callee `m'` is a one-param
+identity helper `helper(p) { return p }`. Factored out so the
+classifier's outer `split` stays shallow. -/
+def methodCallConsumeCalleeBool (m' : ANFMethod) : Bool :=
+  match m'.params, m'.body with
+  | [pp], [ANFBinding.mk _r' (.loadParam q) _psrc] => pp.name == q
+  | _, _ => false
+
+/-- Bool checker for the method-level passthrough `method_call` consume
+fragment. `decide`-able on closed terms. -/
+def methodCallConsumeShapeBool
+    (progMethods : List ANFMethod) (m : ANFMethod) : Bool :=
+  match m.params, m.body with
+  | [pa], [ANFBinding.mk _bn (.methodCall obj method [arg]) _src] =>
+      (arg == pa.name)
+        && (obj != pa.name)
+        && (Stack.Lower.isLastUse (Stack.Lower.computeLastUses m.body) pa.name 0)
+        && (match Stack.Lower.lookupMethod progMethods method with
+            | none => false
+            | some m' => methodCallConsumeCalleeBool m')
+  | _, _ => false
+
+/-- Callee extraction: a `methodCallConsumeCalleeBool`-true callee is
+EXACTLY a one-param identity helper. -/
+theorem methodCallConsumeCalleeBool_extract (m' : ANFMethod)
+    (h : methodCallConsumeCalleeBool m' = true) :
+    ∃ (p r' : String) (psrc : Option SourceLoc)
+      (ptype : RunarVerification.ANF.ANFType),
+      m'.params = [{ name := p, type := ptype }] ∧
+      m'.body = [ANFBinding.mk r' (.loadParam p) psrc] := by
+  unfold methodCallConsumeCalleeBool at h
+  -- Destructure the param list and body via `cases` on the spine so the
+  -- callee match in `h` reduces; non-matching shapes contradict `h = true`.
+  cases hP : m'.params with
+  | nil => rw [hP] at h; simp at h
+  | cons pp ptl =>
+      cases ptl with
+      | cons _ _ => rw [hP] at h; simp at h
+      | nil =>
+          cases hB : m'.body with
+          | nil => rw [hP, hB] at h; simp at h
+          | cons b btl =>
+              cases btl with
+              | cons _ _ => rw [hP, hB] at h; simp at h
+              | nil =>
+                  obtain ⟨r', bv, bsrc⟩ := b
+                  cases bv with
+                  | loadParam q =>
+                      rw [hP, hB] at h
+                      simp only [beq_iff_eq] at h
+                      exact ⟨pp.name, r', bsrc, pp.type, rfl, by rw [h]⟩
+                  | _ => rw [hP, hB] at h; simp at h
+
+/-- **Wave 66 extraction.**  A `methodCallConsumeShapeBool`-true method
+yields ALL the witnesses + facts the wave-65 passthrough M2 walk
+(`successAgrees_methodCall_passthrough_unconditional`) and the
+method-level passthrough wrapper consume: the outer-method shape
+(single param `a`, singleton methodCall body), the object disjointness,
+the arg last-use, and the callee identity shape — together with the
+derived facts (`obj` absent from `[a]`, the param-name equality). -/
+theorem methodCallConsumeShapeBool_extract
+    (progMethods : List ANFMethod) (m : ANFMethod)
+    (h : methodCallConsumeShapeBool progMethods m = true) :
+    ∃ (a bn obj method p r' : String)
+      (src psrc : Option SourceLoc) (atype ptype : RunarVerification.ANF.ANFType)
+      (m' : ANFMethod),
+      m.params = [{ name := a, type := atype }] ∧
+      m.body = [ANFBinding.mk bn (.methodCall obj method [a]) src] ∧
+      obj ≠ a ∧
+      Stack.Lower.isLastUse (Stack.Lower.computeLastUses m.body) a 0 = true ∧
+      Stack.Lower.lookupMethod progMethods method = some m' ∧
+      m'.params = [{ name := p, type := ptype }] ∧
+      m'.body = [ANFBinding.mk r' (.loadParam p) psrc] := by
+  unfold methodCallConsumeShapeBool at h
+  cases hPa : m.params with
+  | nil => rw [hPa] at h; simp at h
+  | cons pa ptl =>
+      cases ptl with
+      | cons _ _ => rw [hPa] at h; simp at h
+      | nil =>
+          cases hBd : m.body with
+          | nil => rw [hPa, hBd] at h; simp at h
+          | cons b btl =>
+              cases btl with
+              | cons _ _ => rw [hPa, hBd] at h; simp at h
+              | nil =>
+                  obtain ⟨bn, bv, bsrc⟩ := b
+                  cases bv with
+                  | methodCall obj method args =>
+                      cases args with
+                      | nil => rw [hPa, hBd] at h; simp at h
+                      | cons arg atl =>
+                          cases atl with
+                          | cons _ _ => rw [hPa, hBd] at h; simp at h
+                          | nil =>
+                              rw [hPa, hBd] at h
+                              simp only [Bool.and_eq_true, beq_iff_eq,
+                                bne_iff_ne, ne_eq] at h
+                              obtain ⟨⟨⟨hArgEq, hObjNe⟩, hLast⟩, hCallee⟩ := h
+                              subst hArgEq
+                              match hLk : Stack.Lower.lookupMethod progMethods method with
+                              | none =>
+                                  rw [hLk] at hCallee; exact absurd hCallee (by simp)
+                              | some m' =>
+                                  rw [hLk] at hCallee
+                                  obtain ⟨p, r', psrc, ptype, hP, hB⟩ :=
+                                    methodCallConsumeCalleeBool_extract m' hCallee
+                                  exact ⟨pa.name, bn, obj, method, p, r', bsrc,
+                                    psrc, pa.type, ptype, m',
+                                    by cases pa; rfl, rfl,
+                                    hObjNe, hLast, hLk, hP, hB⟩
+                  | loadParam _   => rw [hPa, hBd] at h; simp at h
+                  | loadProp _    => rw [hPa, hBd] at h; simp at h
+                  | loadConst _   => rw [hPa, hBd] at h; simp at h
+                  | binOp _ _ _ _ => rw [hPa, hBd] at h; simp at h
+                  | unaryOp _ _ _ => rw [hPa, hBd] at h; simp at h
+                  | call _ _      => rw [hPa, hBd] at h; simp at h
+                  | ifVal _ _ _   => rw [hPa, hBd] at h; simp at h
+                  | loop _ _ _    => rw [hPa, hBd] at h; simp at h
+                  | assert _      => rw [hPa, hBd] at h; simp at h
+                  | updateProp _ _ => rw [hPa, hBd] at h; simp at h
+                  | getStateScript => rw [hPa, hBd] at h; simp at h
+                  | checkPreimage _ => rw [hPa, hBd] at h; simp at h
+                  | deserializeState _ => rw [hPa, hBd] at h; simp at h
+                  | addOutput _ _ _ => rw [hPa, hBd] at h; simp at h
+                  | addRawOutput _ _ => rw [hPa, hBd] at h; simp at h
+                  | addDataOutput _ _ => rw [hPa, hBd] at h; simp at h
+                  | arrayLiteral _ => rw [hPa, hBd] at h; simp at h
+                  | rawScript _ _ _ => rw [hPa, hBd] at h; simp at h
+
+/-! ## Wave 66 — method-level passthrough wrapper: `lowerMethodUserRawOps = []`
+
+The missing peer of `lowerMethodUserRawOps_methodCall_leafEmpty`: for a
+method `m` satisfying `methodCallConsumeShapeBool`, the whole method
+lowers to the EMPTY op list. This is the method-level lift that makes the
+M3 / M4 legs of the `Pipeline.lean` consume theorem trivial. -/
+
+/-- Bindings-level passthrough op reduction: the singleton passthrough
+body lowers to `[]` (lifts `lowerValueP_methodCall_passthrough_ops` to the
+`lowerBindingsP` singleton). -/
+theorem lowerBindingsP_singleton_passthrough_methodCall_ops
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget' currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (rest : StackMap) (bn obj method a p r' : String)
+    (src psrc : Option SourceLoc) (ptype : RunarVerification.ANF.ANFType)
+    (m' : ANFMethod)
+    (hLookup : Stack.Lower.lookupMethod progMethods method = some m')
+    (hObj : Stack.Lower.StackMap.depth? (a :: rest) obj = none)
+    (hParams : m'.params = [{ name := p, type := ptype }])
+    (hBody : m'.body = [ANFBinding.mk r' (.loadParam p) psrc])
+    (hArgLast : Stack.Lower.isLastUse lastUses a currentIndex = true)
+    (hArgUnprot : Stack.Lower.listContains outerProtected a = false)
+    (hParamUnprot : Stack.Lower.listContains outerProtected p = false) :
+    (Stack.Lower.lowerBindingsP progMethods props (budget' + 1)
+        currentIndex lastUses outerProtected localBindings constInts
+        (a :: rest)
+        [ANFBinding.mk bn (.methodCall obj method [a]) src]).1 = [] := by
+  have hHead :=
+    lowerValueP_methodCall_passthrough_ops progMethods props budget'
+      currentIndex lastUses outerProtected localBindings constInts rest
+      bn obj method a p r' psrc ptype m' hLookup hObj hParams hBody
+      hArgLast hArgUnprot hParamUnprot
+  have hUnfold :
+      (Stack.Lower.lowerBindingsP progMethods props (budget' + 1)
+          currentIndex lastUses outerProtected localBindings constInts
+          (a :: rest)
+          [ANFBinding.mk bn (.methodCall obj method [a]) src]).1
+        = (Stack.Lower.lowerValueP progMethods props (budget' + 1)
+              currentIndex lastUses outerProtected localBindings constInts
+              (a :: rest) bn (.methodCall obj method [a])).1 := by
+    with_unfolding_all
+      simp [Stack.Lower.lowerBindingsP]
+  rw [hUnfold, hHead]
+
+/-- Method-level passthrough wrapper: `lowerMethodUserRawOps` of a method
+satisfying `methodCallConsumeShapeBool` is the EMPTY op list. The
+extraction pins the outer method to the single-param passthrough shape,
+so the method's initial stack map is `[a]` (`rest = []`), `currentIndex`
+is `0`, `outerProtected` is `[]` (both `listContains` checks vacuous), and
+the arg last-use comes straight from the classifier. -/
+theorem lowerMethodUserRawOps_methodCall_passthrough
+    (progMethods : List ANFMethod) (props : List ANFProperty) (m : ANFMethod)
+    (h : methodCallConsumeShapeBool progMethods m = true) :
+    lowerMethodUserRawOps progMethods props m = [] := by
+  obtain ⟨a, bn, obj, method, p, r', src, psrc, atype, ptype, m',
+    hPa, hBd, hObjNe, hLast, hLk, hP, hB⟩ :=
+    methodCallConsumeShapeBool_extract progMethods m h
+  unfold lowerMethodUserRawOps
+  -- `defaultInlineBudget = 8 = 7 + 1`.
+  have hBudget : Stack.Lower.defaultInlineBudget = 7 + 1 := rfl
+  rw [hBudget]
+  -- The method's reversed param-name stack map is `[a]`.
+  have hSm : (m.params.map (fun pp => pp.name) |>.reverse) = [a] := by
+    rw [hPa]; rfl
+  rw [hSm, hBd]
+  -- `obj` is absent from `[a]` (since `obj ≠ a`).
+  have hObj : Stack.Lower.StackMap.depth? (a :: []) obj = none := by
+    unfold Stack.Lower.StackMap.depth? List.findIdx?
+    have hne : (a == obj) = false := beq_eq_false_iff_ne.mpr (fun hh => hObjNe hh.symm)
+    simp [List.findIdx?.go, hne]
+  -- The arg last-use, retargeted onto the body shape pinned by `hBd`.
+  have hArgLast :
+      Stack.Lower.isLastUse
+        (Stack.Lower.computeLastUses
+          [ANFBinding.mk bn (.methodCall obj method [a]) src]) a 0 = true := by
+    rw [← hBd]; exact hLast
+  exact lowerBindingsP_singleton_passthrough_methodCall_ops
+    progMethods props 7 0
+    (Stack.Lower.computeLastUses [ANFBinding.mk bn (.methodCall obj method [a]) src])
+    [] ([ANFBinding.mk bn (.methodCall obj method [a]) src].map (fun b => b.name))
+    (Stack.Lower.collectConstInts [ANFBinding.mk bn (.methodCall obj method [a]) src])
+    [] bn obj method a p r' src psrc ptype m'
+    hLk hObj hP hB hArgLast rfl rfl
+
 end Agrees
 end RunarVerification.Stack

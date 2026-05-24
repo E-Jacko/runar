@@ -8,6 +8,7 @@ import RunarVerification.Stack.AgreesA3
 import RunarVerification.Stack.AgreesA4
 import RunarVerification.Stack.AgreesA5
 import RunarVerification.Stack.AgreesA6
+import RunarVerification.Stack.AgreesA8
 import RunarVerification.Stack.Peephole
 import RunarVerification.Stack.Eval
 import RunarVerification.Stack.TxContext
@@ -4299,6 +4300,323 @@ theorem wave63_updateProp_consume_smoke_anti_vacuous :
   have hAnf : (RunarVerification.ANF.Eval.evalBindingsP wave63SmokeProg.methods wave63SmokeAnf
       wave63SmokeMethod.body).toOption.isSome := by native_decide
   exact ⟨hAnf, (wave63_updateProp_consume_smoke).mp hAnf⟩
+
+/-! ### Wave 66 — the `method_call` consume theorem (Step 1 of 2)
+
+The dispatch-level consume theorem that — once the next wave wires it into
+the omnibus `by_cases` cascade — retires the `method_call` sub-omnibus
+axiom `compileSafe_observational_correct_modulo_method_call_codegen`.
+
+This wave is ADD-ONLY: the theorem lands here but is NOT wired into the
+dispatch and the axiom is NOT removed (axioms stay 83). The next wave
+does the gated dispatch (see the hand-off in the wave-66 report).
+
+The retirable fragment is the **param-passthrough** `method_call` shape
+(`Agrees.methodCallConsumeShapeBool`): a single-public method whose body
+is one `methodCall` of a one-param identity helper `helper(p){return p}`,
+with the call-site arg at depth-0 last-use. The whole method lowers to
+the EMPTY op list (`Agrees.lowerMethodUserRawOps_methodCall_passthrough`),
+so the M3 / M4 legs are TRIVIAL (`peephole [] = []`,
+`AreRunarEmittablePush []`).
+
+Composition (same conclusion as the axiom):
+* **M2** — the wave-65 from-entry passthrough walk
+  `Agrees.successAgrees_methodCall_passthrough_unconditional` gives the
+  body-level success iff between `evalBindingsP` and `runOps RAW`, with
+  `RAW = lowerMethodUserRawOps p.methods p.properties anfM = []`.
+* **M2→method** — `runMethod = runOps RAW` via
+  `runMethod_lower_public_unique_no_post_eq_userRaw`.
+* **M3 / M4** — `runParsedBytes bytes = runOps (peepholeMethodOps []) =
+  runOps [] = .ok stk`, succeeding unconditionally.
+
+The arg value `av` + the caller-frame arg resolution `hArg` are DERIVED
+from the typed/agreement entry bundle (`agreesTagged [(a,.param)]` +
+`tsmCoherent`), NOT hand-supplied — §2.1-compliant input-side
+hypotheses only. -/
+theorem compileSafe_observational_correct_methodCall_consume
+    (p : ANFProgram) (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (a : String)
+    (hShape : Agrees.methodCallConsumeShapeBool p.methods anfM = true)
+    (hAgrees : Agrees.agreesTagged [(a, Agrees.SlotKind.param)] initialAnf initialStack)
+    (hAName : (Agrees.methodCallConsumeShapeBool p.methods anfM = true) →
+        (anfM.params.map (·.name)).reverse = [a])
+    (hCoh : Agrees.tsmCoherent initialAnf [(a, Agrees.SlotKind.param)]) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  -- Extract the passthrough witnesses + facts from the classifier.
+  obtain ⟨a', bn, obj, method, pp, r', src, psrc, atype, ptype, m',
+    hPa, hBd, hObjNe, hLast, hLk, hMP, hMB⟩ :=
+    Agrees.methodCallConsumeShapeBool_extract p.methods anfM hShape
+  -- The classifier's reversed param name is `a` (from the keyed premise),
+  -- and the extraction's `a'` is the same param name; reconcile them.
+  have hSm : (anfM.params.map (·.name)).reverse = [a] := hAName hShape
+  have hAeq : a' = a := by
+    rw [hPa] at hSm
+    simp only [List.map_cons, List.map_nil, List.reverse_cons,
+      List.reverse_nil, List.nil_append] at hSm
+    exact (List.cons.injEq .. ▸ hSm).1
+  subst hAeq
+  -- The ANF lookup of the callee (needed by the ANF half of the walk).
+  have hLkAnf : RunarVerification.ANF.Eval.lookupMethod p.methods method = some m' := by
+    rw [show (RunarVerification.ANF.Eval.lookupMethod p.methods method)
+          = Stack.Lower.lookupMethod p.methods method from rfl]
+    exact hLk
+  -- DERIVE the caller-frame arg resolution `hArg` from the entry bundle.
+  -- A non-empty tagged map forces a non-empty runtime stack; the head
+  -- aligns the param `a'` (= `lookupParam a'`), and `tsmCoherent`
+  -- equates it with `resolveRef a'`.
+  have hAlign : Agrees.taggedStackAligned [(a', Agrees.SlotKind.param)]
+      initialAnf initialStack.stack := hAgrees.1
+  obtain ⟨topV, restStk, hStkCases⟩ :
+      ∃ topV restStk, initialStack.stack = topV :: restStk := by
+    match hCases : initialStack.stack with
+    | [] => rw [hCases] at hAlign; unfold Agrees.taggedStackAligned at hAlign
+            exact absurd hAlign (by simp)
+    | topV :: restStk => exact ⟨topV, restStk, rfl⟩
+  have hHead : Agrees.lookupAnfByKind initialAnf (a', Agrees.SlotKind.param) = some topV := by
+    rw [hStkCases] at hAlign; unfold Agrees.taggedStackAligned at hAlign; exact hAlign.1
+  have hArg : initialAnf.resolveRef a' = some topV := by
+    have hC := hCoh (a', Agrees.SlotKind.param) (by simp)
+    rw [← hC]; exact hHead
+  -- The method's raw op list is EMPTY.
+  have hRawNil : Agrees.lowerMethodUserRawOps p.methods p.properties anfM = [] :=
+    Agrees.lowerMethodUserRawOps_methodCall_passthrough p.methods p.properties anfM hShape
+  -- Unique-public selection fact for the runtime / shape bridges.
+  have hUnique :
+      ∀ m'', m'' ∈ p.methods → m''.isPublic = true →
+        (m''.name == anfM.name) = true → m'' = anfM :=
+    unique_public_of_filter_singleton p anfM hSinglePublic
+  -- No implicit params / post-pass (the passthrough body is pure).
+  have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false := by
+    rw [hBd]; simp [Lower.bindingsUseCheckPreimage]
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := by
+    rw [hBd]; simp [Lower.bindingsUseCodePart]
+  have hNoDeserialize : Lower.bindingsUseDeserializeState anfM.body = false := by
+    rw [hBd]; simp [Lower.bindingsUseDeserializeState]
+  have hNoTerminalAssert : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBd]; simp [Lower.bodyEndsInAssert]
+  -- M2: the from-entry passthrough walk, instantiated at the method-level
+  -- lowering parameters so its RAW is `lowerMethodUserRawOps`.
+  have hM2 :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+        (runOps (Agrees.lowerMethodUserRawOps p.methods p.properties anfM) initialStack) := by
+    have hWalk :=
+      Agrees.successAgrees_methodCall_passthrough_unconditional
+        p.methods p.properties 7 0
+        (Stack.Lower.computeLastUses anfM.body) []
+        (anfM.body.map (·.name))
+        (Stack.Lower.collectConstInts anfM.body)
+        [] bn obj method a' pp r' src psrc ptype m'
+        initialAnf initialStack topV
+        hLk hLkAnf
+        (by
+          unfold Stack.Lower.StackMap.depth? List.findIdx?
+          have hne : (a' == obj) = false :=
+            beq_eq_false_iff_ne.mpr (fun hh => hObjNe hh.symm)
+          simp [List.findIdx?.go, hne])
+        hMP hMB hArg hLast
+        rfl rfl
+    -- Turn the walk's literal-singleton body back into `anfM.body` so it
+    -- references the method's own body throughout.
+    rw [← hBd] at hWalk
+    -- `lowerMethodUserRawOps` IS the walk's RAW (budget 8 = 7+1, sm = [a']).
+    have hRawEq :
+        Agrees.lowerMethodUserRawOps p.methods p.properties anfM
+          = (Stack.Lower.lowerBindingsP p.methods p.properties (7 + 1)
+              0 (Stack.Lower.computeLastUses anfM.body) []
+              (anfM.body.map (·.name))
+              (Stack.Lower.collectConstInts anfM.body) [a']
+              anfM.body).1 := by
+      unfold Agrees.lowerMethodUserRawOps
+      have hBudget : Stack.Lower.defaultInlineBudget = 7 + 1 := rfl
+      have hSmRev : (anfM.params.map (fun pp' => pp'.name)).reverse = [a'] := by
+        rw [hPa]; rfl
+      rw [hBudget, hSmRev]
+    rw [hRawEq]
+    exact hWalk
+  -- M2→method: `runMethod = runOps RAW`.
+  have hM2Method :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+        (runMethod (Lower.lower p) anfM.name initialStack) := by
+    have hRunEq :
+        runMethod (Lower.lower p) anfM.name initialStack
+          = runOps (Agrees.lowerMethodUserRawOps p.methods p.properties anfM) initialStack := by
+      have hP : p =
+          { contractName := p.contractName,
+            properties := p.properties,
+            methods := p.methods } := rfl
+      rw [hP]
+      exact Agrees.runMethod_lower_public_unique_no_post_eq_userRaw
+        p.contractName p.properties p.methods anfM initialStack hMem hPublic hUnique
+        hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize
+    rw [hRunEq]; exact hM2
+  -- `peepholeMethodOps [] = []` (each pass maps the empty op list to
+  -- itself, via the `_nil` lemmas).
+  have hPeepNil : peepholeMethodOps ([] : List StackOp) = [] := by
+    unfold peepholeMethodOps
+    have hNoIfNil : Peephole.noIfOp ([] : List StackOp) := by simp [Peephole.noIfOp]
+    have h1 : Peephole.peepholePassAll [] = ([] : List StackOp) := by
+      rw [Peephole.peepholePassAll_eq_flat_of_noIfOp [] hNoIfNil]; rfl
+    rw [h1, Peephole.peepholePostFold_nil, Peephole.peepholeChainFold_nil,
+      Peephole.peepholeRollPickFold_nil]
+  -- shape: the post-peephole program is single-public with body
+  -- `peepholeMethodOps RAW = peepholeMethodOps [] = []`.
+  obtain ⟨hPubSingleton, _hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hPeepedOpsImg :
+      (peepholedLoweredMethod p anfM).ops = [] := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = []
+    rw [Agrees.lowerMethod_ops_eq_userRaw_no_implicits_no_post
+          p.methods p.properties anfM hNoPreimage hNoCode hNoTerminalAssert
+          hNoDeserialize, hRawNil, hPeepNil]
+  -- M4: `runParsedBytes bytes = runOps [] = .ok stk`.
+  have hEmitPush : Parse.AreRunarEmittablePush (peepholedLoweredMethod p anfM).ops := by
+    show Parse.areRunarEmittablePushBool (peepholedLoweredMethod p anfM).ops = true
+    rw [hPeepedOpsImg]; rfl
+  have hM4 :
+      runParsedBytes bytes initialStack = runOps [] initialStack := by
+    have hEq :
+        runParsedBytes bytes initialStack
+          = runOps (peepholedLoweredMethod p anfM).ops initialStack :=
+      compileSafe_single_public_runOps_eq_push p bytes (peepholedLoweredMethod p anfM)
+        initialStack hSafe hPubSingleton hEmitPush
+    rw [hEq, hPeepedOpsImg]
+  have hParsed :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runParsedBytes bytes initialStack) := by
+    rw [hM4]
+    have hMethodEq :
+        runMethod (Lower.lower p) anfM.name initialStack = runOps [] initialStack := by
+      have hRunEq :
+          runMethod (Lower.lower p) anfM.name initialStack
+            = runOps (Agrees.lowerMethodUserRawOps p.methods p.properties anfM) initialStack := by
+        have hP : p =
+            { contractName := p.contractName,
+              properties := p.properties,
+              methods := p.methods } := rfl
+        rw [hP]
+        exact Agrees.runMethod_lower_public_unique_no_post_eq_userRaw
+          p.contractName p.properties p.methods anfM initialStack hMem hPublic hUnique
+          hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize
+      rw [hRunEq, hRawNil]
+    rw [hMethodEq]
+    exact successAgrees_refl _
+  exact successAgrees_trans _ _ _ hM2Method hParsed
+
+/-! ### Wave 66 — MANDATORY smoke: the method_call consume theorem fires
+
+The canonical single-public passthrough program — public `entry(a)` whose
+body is `return idfn(a)`, calling the private identity helper
+`idfn(x) { return x }` — fired through
+`compileSafe_observational_correct_methodCall_consume`. Anti-vacuous: both
+the ANF eval and the deployed-bytes run succeed. -/
+
+private def wave66SmokeCallee : ANF.ANFMethod :=
+  { name := "idfn"
+    params := [ANF.ANFParam.mk "x" .bigint]
+    body := [ANF.ANFBinding.mk "r0" (.loadParam "x") none]
+    isPublic := false }
+
+private def wave66SmokeEntry : ANF.ANFMethod :=
+  { name := "entry"
+    params := [ANF.ANFParam.mk "a" .bigint]
+    body := [ANF.ANFBinding.mk "c0" (.methodCall "self" "idfn" ["a"]) none]
+    isPublic := true }
+
+-- `self` is a contract property used as the (resolvable, non-param)
+-- object reference of the inlined call; it is absent from the method's
+-- param stack map `[a]`, so the passthrough lowering still drops it.
+private def wave66SmokeProg : ANF.ANFProgram :=
+  { contractName := "Passthrough"
+    properties := [ANF.ANFProperty.mk "self" .bigint false none]
+    methods := [wave66SmokeEntry, wave66SmokeCallee] }
+
+private def wave66SmokeAnf : State := { params := [("a", .vBigint 99)] }
+private def wave66SmokeStk : StackState :=
+  { stack := [.vBigint 99] }
+private def wave66SmokeBytes : ByteArray :=
+  Emit.emitFast (peepholeProgram (Lower.lower wave66SmokeProg))
+
+private theorem wave66Smoke_validate :
+    validateStackProgram (peepholeProgram (Lower.lower wave66SmokeProg)) = .ok () := by
+  have h : (validateStackProgram (peepholeProgram (Lower.lower wave66SmokeProg))).toOption.isSome
+      = true := by native_decide
+  cases hv : validateStackProgram (peepholeProgram (Lower.lower wave66SmokeProg)) with
+  | ok u => cases u; rfl
+  | error e => rw [hv] at h; simp [Except.toOption] at h
+
+private theorem wave66Smoke_compileSafe :
+    compileSafe wave66SmokeProg = .ok wave66SmokeBytes := by
+  unfold compileSafe wave66SmokeBytes
+  change
+    (do
+      validateStackProgram (peepholeProgram (Lower.lower wave66SmokeProg))
+      Except.ok (Emit.emitFast (peepholeProgram (Lower.lower wave66SmokeProg))))
+      = Except.ok (Emit.emitFast (peepholeProgram (Lower.lower wave66SmokeProg)))
+  rw [wave66Smoke_validate]
+  rfl
+
+private theorem wave66Smoke_mem : wave66SmokeEntry ∈ wave66SmokeProg.methods := by
+  unfold wave66SmokeProg wave66SmokeEntry; simp
+
+private theorem wave66Smoke_filter :
+    wave66SmokeProg.methods.filter (·.isPublic) = [wave66SmokeEntry] := by
+  unfold wave66SmokeProg wave66SmokeEntry wave66SmokeCallee; rfl
+
+private theorem wave66Smoke_shape :
+    Agrees.methodCallConsumeShapeBool wave66SmokeProg.methods wave66SmokeEntry = true := by
+  native_decide
+
+private theorem wave66Smoke_agreesTagged :
+    Agrees.agreesTagged [("a", Agrees.SlotKind.param)] wave66SmokeAnf wave66SmokeStk := by
+  refine ⟨?_, rfl, rfl⟩
+  show Agrees.taggedStackAligned [("a", Agrees.SlotKind.param)] wave66SmokeAnf
+    wave66SmokeStk.stack
+  refine ⟨?_, ?_⟩
+  · show Agrees.lookupAnfByKind wave66SmokeAnf ("a", Agrees.SlotKind.param)
+      = some (.vBigint 99); rfl
+  · trivial
+
+private theorem wave66Smoke_coh :
+    Agrees.tsmCoherent wave66SmokeAnf [("a", Agrees.SlotKind.param)] := by
+  intro st hs
+  simp only [List.mem_singleton] at hs
+  subst hs
+  show Agrees.lookupAnfByKind wave66SmokeAnf ("a", Agrees.SlotKind.param)
+    = wave66SmokeAnf.resolveRef "a"
+  rfl
+
+/-- **Wave 66 smoke** — the method_call consume theorem instantiated on the
+concrete passthrough `entry(a) = idfn(a)` program. -/
+theorem wave66_methodCall_consume_smoke :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP wave66SmokeProg.methods wave66SmokeAnf
+        wave66SmokeEntry.body)
+      (runParsedBytes wave66SmokeBytes wave66SmokeStk) :=
+  compileSafe_observational_correct_methodCall_consume
+    wave66SmokeProg (by native_decide) wave66SmokeEntry wave66SmokeBytes
+    wave66Smoke_mem rfl wave66Smoke_compileSafe wave66SmokeAnf wave66SmokeStk
+    wave66Smoke_filter (by decide) "a" wave66Smoke_shape wave66Smoke_agreesTagged
+    (fun _ => rfl) wave66Smoke_coh
+
+/-- **Wave 66 smoke — anti-vacuity.**  Both the ANF eval and the
+deployed-bytes run of the passthrough smoke program succeed. -/
+theorem wave66_methodCall_consume_smoke_anti_vacuous :
+    (RunarVerification.ANF.Eval.evalBindingsP wave66SmokeProg.methods wave66SmokeAnf
+        wave66SmokeEntry.body).toOption.isSome
+    ∧ (runParsedBytes wave66SmokeBytes wave66SmokeStk).toOption.isSome := by
+  have hAnf : (RunarVerification.ANF.Eval.evalBindingsP wave66SmokeProg.methods
+      wave66SmokeAnf wave66SmokeEntry.body).toOption.isSome := by native_decide
+  exact ⟨hAnf, (wave66_methodCall_consume_smoke).mp hAnf⟩
 
 /-- **Wave 45 Step 1 — the dispatch-level consume-`if_val` correctness
 theorem.**
