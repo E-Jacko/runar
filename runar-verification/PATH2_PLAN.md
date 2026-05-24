@@ -2571,23 +2571,50 @@ multi-thousand-line Stage-C / Parse substrate. The wave-68/69/70 sweep mapped
   params on top, not the method-index witness — only nullary methods admit a
   clean witness, so a faithful dispatch discharge also needs a dispatched-stack
   alignment premise.
-* `stateful` (D2) — **BLOCKED: retiring it is a LATERAL move (82-style →
-  no net reduction), needs a trust decision.** Wave 68 confirmed the verdict:
-  the ANF `checkPreimage` step routes through `Crypto.preimageBackend` (a bool,
-  never aborts) while the Stack prologue routes through `Crypto.authBackend`
-  (`OP_CHECKSIGVERIFY`/`checkSig`, aborts on false) — DIFFERENT, independent
-  backend axioms with NO connecting lemma (the D2.a docstring's "shared
-  backend" claim is FALSE). A genuine retirement needs a NEW BIP-143
-  `opPushTx_checkSig_iff_checkPreimage` axiom — i.e. remove `modulo_stateful_codegen`
-  (−1) + add the bridge axiom (+1) = NET ZERO unless the bridge is itself
-  discharged (modelling secp256k1 signing + the BIP-143 sighash — a major
-  undertaking). Wave 68 landed real EPILOGUE substrate
-  (`statefulEpilogue_outputs_agree`: Output-record byte-identity at the shared
-  `Output` type) + the prologue transport, but the D2.b epilogue axiom as
-  STATED is also not dischargeable until the Stack VM's output emission is
-  modelled inside `runOps` (today it lives only in the separate `OutputTrace`).
-  **Recommendation: do NOT retire stateful as a "TCB win" — it is not one
-  until the OP_PUSH_TX fact is discharged; this is a project trust decision.**
+* `stateful` (D2) — **BLOCKED: false-as-stated; needs a valid-path
+  re-statement + full leg composition (NOT just the BIP-143 axiom).** The
+  BIP-143 decision IS made (accept `bip143_opPushTx_checkSig_iff_checkPreimage`
+  as a named scoped crypto axiom). A wave-71 probe LANDED that axiom + the
+  proved, axiom-free prologue agreement (`statefulPrologue_successAgrees_of_bridge`)
+  — but it also PROVED the deeper blocker: the omnibus stateful branch fires
+  UNCONDITIONALLY on `bindingsUseCheckPreimage = true`, and `successAgrees` is
+  genuinely FALSE on the invalid-spend path (ANF `checkPreimage` is value-only,
+  ALWAYS succeeds; Stack `OP_CHECKSIGVERIFY` ABORTS on a bad sig) —
+  `statefulPrologue_successAgrees_false_on_invalid` is the mechanical witness.
+  So, exactly like `dispatch`, the sub-omnibus is false without a valid-path
+  (`ValidTxContext`/valid-witness) alignment premise (the wave-24/25 pattern).
+  The epilogue is NOT the blocker: `successAgrees` is success-bit only, so
+  output emission is irrelevant to it. Retiring stateful needs: (1) the BIP-143
+  axiom [done in probe], (2) a keyed valid-path premise threaded through the
+  omnibus signature (soundness fix), (3) the full prologue+body+epilogue
+  M2/M3/M4 leg composition for a canonical stateful fragment. A large multi-wave
+  effort (peer of the dispatch sub-omnibus), net codegen-axiom −1 at the end.
+  The probe was NOT integrated (it added the axiom without retiring → +1 count);
+  it re-lands as part of the full retirement.
+* `EC` (secp256k1, IN SCOPE) — **sizing (wave 71): 8 of 10 ops tractable,
+  `ecMul`/`ecMulGen` are a research-grade WALL.** EC currently falls through to
+  `crypto_call` (the ANF `callBuiltin?` has NO `ec*` arm — same pre-wave-68
+  situation as hashes; the Lean Stack codegen is `Stack/Ec.lean`, the spec is
+  `Crypto/Secp256k1.lean`, the codegen-to-spec targets are the 10
+  `emitEc*_runOps_eq` axioms in `Crypto/Spec.lean §7`). Shared prerequisites for
+  ANY EC discharge: (a) extend `isAllowedOpcodeName` with the EC opcodes
+  (OP_2DUP/OP_MOD/OP_NUM2BIN/OP_0/OP_2MUL/OP_2DIV/OP_RSHIFTNUM/OP_TOALTSTACK/
+  OP_FROMALTSTACK), each with a byte-non-collision round-trip proof (the wave-49/60
+  pattern) — without this NO EC op passes M4; (b) wire `ec*` into ANF
+  `callBuiltin?` (wave-68 hash pattern); (c) fix the `m ≠ 0`/divByZero gap in the
+  field-arithmetic axioms (Stack `OP_MOD` errors at 0; affects every OP_MOD op).
+  Tiers: **EASY** — `ecModReduce` (PoC `ecModReduce_step_transport` LANDED in
+  `Stack/AgreesEC.lean`, 8-op transport, axiom-clean), `ecEncodeCompressed`;
+  **MEDIUM** (need a reusable `reverse32` loop lemma) — `ecPointX/Y`,
+  `ecMakePoint`, `ecNegate`, `ecOnCurve`; **HARD bounded** — `ecAdd` (256-bit
+  modular-inverse correctness, ~8k ops); **WALL/research-grade** —
+  `ecMul`/`ecMulGen` (~60k ops; the Stack codegen is Jacobian/257-iter/`k+3n`
+  while the spec is affine/256-iter — proving them equal is a Jacobian≡affine
+  group-law equivalence in Script semantics). The `ecMul` wall collapses to
+  "merely large" ONLY if the EC-mul **codegen is rewritten to affine-256-iter**
+  to match the spec (changes the real compiler + goldens across all 7 tiers) —
+  otherwise `ecMul`/`ecMulGen` must be scoped out (axiomatized with the
+  documented structural-mismatch justification, like the Go-only families).
 * `crypto_call` — **the IRREDUCIBLE residual universal fallback; cannot be
   removed.** Hypothesis `True`; every body not matching a retired classifier
   (incl. all crypto-builtin calls + the residual/non-canonical bodies of the
