@@ -2004,12 +2004,14 @@ theorem wave65_smoke_evalBindings_isNone :
 /-! ## Wave 66 — the decidable method-level `method_call` consume classifier
 
 Step 1 of 2 toward retiring the `method_call` sub-omnibus axiom
-(`Pipeline.compileSafe_observational_correct_modulo_method_call_codegen`).
+(`Pipeline.compileSafe_observational_correct_modulo_method_call_codegen`,
+since REMOVED in wave 66 step 2, 2026-05-24).
 This wave is ADD-ONLY: the classifier + its extraction + a method-level
 passthrough wrapper are introduced here, and the consume theorem + smoke
-land in `Pipeline.lean`. NO wiring into the omnibus dispatch, NO axiom
-removal — those are the next wave's gated dispatch (see the consume
-theorem's docstring in `Pipeline.lean`).
+land in `Pipeline.lean`. The gated dispatch + axiom removal landed in
+step 2 (the omnibus now classifies on `methodCallConsumeShapeBool` and
+discharges the TRUE case with the consume theorem; see its docstring in
+`Pipeline.lean`).
 
 ### The retirable fragment
 

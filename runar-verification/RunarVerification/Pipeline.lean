@@ -2663,7 +2663,12 @@ integration omnibus — planned split"):
 * `compileSafe_observational_correct_modulo_loop_codegen` —
   Discharged once A7 widening completes.
 * `compileSafe_observational_correct_modulo_method_call_codegen` —
-  Discharged once A8 widening completes.
+  RETIRED (Wave 66, 2026-05-24): the single-public param-passthrough
+  `method_call` fragment (decided by `Agrees.methodCallConsumeShapeBool`)
+  is discharged by the theorem
+  `compileSafe_observational_correct_methodCall_consume`; residual
+  non-passthrough method_call bodies fall through to the sound
+  `crypto_call` fallback.
 * `compileSafe_observational_correct_modulo_dispatch_codegen` —
   Discharged once D1 lands (multi-public-method Merkle dispatch
   selection).
@@ -2801,36 +2806,16 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
-/-- **O1 sub-omnibus — method_call family.**
-
-Phase D harness integration: codegen-soundness for ANF bodies with
-`methodCall` bindings (private-helper inlining or recursive method
-references). The hypothesis `hMethodCall` requires the body to satisfy
-`Agrees.structuralMethodCallBodyBool`.
-
-Discharge path: this sub-omnibus retires once Stage C A8 widening
-completes; see `PATH2_PLAN.md` §5.23.
--/
-axiom compileSafe_observational_correct_modulo_method_call_codegen (p : ANFProgram)
-    (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (_hMem : anfM ∈ p.methods) (_hPublic : anfM.isPublic = true)
-    (_hSafe : compileSafe p = .ok bytes)
-    (initialAnf : State) (initialStack : StackState)
-    (tsm : Agrees.TaggedStackMap)
-    (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hMethodCall :
-      Agrees.structuralMethodCallBodyBool
-        p.methods p.properties
-        Lower.defaultInlineBudget
-        (Lower.computeLastUses anfM.body) []
-        (anfM.body.map (·.name))
-        (Lower.collectConstInts anfM.body)
-        anfM.body
-        (List.reverse (anfM.params.map (·.name)))
-        0 = true) :
-    successAgrees
-      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
-      (runParsedBytes bytes initialStack)
+-- **O1 sub-omnibus — method_call family — RETIRED (Tier 1 wave 66, 2026-05-24).**
+-- The axiom `compileSafe_observational_correct_modulo_method_call_codegen` is
+-- GONE.  Its omnibus dispatch branch is now discharged by the theorem
+-- `compileSafe_observational_correct_methodCall_consume` for the single-public
+-- param-passthrough `method_call` consume fragment (decided by
+-- `Agrees.methodCallConsumeShapeBool`: one `methodCall` of a one-param identity
+-- helper, call-site arg at depth-0 last-use), under the keyed `hMethodCallFrag`
+-- premise (the entry tsm is the single param slot `[(a,.param)]`).  Residual
+-- method_call bodies — anything the narrower `methodCallConsumeShapeBool` does
+-- NOT recognise — fall through to the sound crypto_call cascade, NO new axiom.
 
 /-- **O1 sub-omnibus — dispatch family.**
 
@@ -4301,15 +4286,14 @@ theorem wave63_updateProp_consume_smoke_anti_vacuous :
       wave63SmokeMethod.body).toOption.isSome := by native_decide
   exact ⟨hAnf, (wave63_updateProp_consume_smoke).mp hAnf⟩
 
-/-! ### Wave 66 — the `method_call` consume theorem (Step 1 of 2)
+/-! ### Wave 66 — the `method_call` consume theorem
 
-The dispatch-level consume theorem that — once the next wave wires it into
-the omnibus `by_cases` cascade — retires the `method_call` sub-omnibus
-axiom `compileSafe_observational_correct_modulo_method_call_codegen`.
-
-This wave is ADD-ONLY: the theorem lands here but is NOT wired into the
-dispatch and the axiom is NOT removed (axioms stay 83). The next wave
-does the gated dispatch (see the hand-off in the wave-66 report).
+The dispatch-level consume theorem that retires the `method_call`
+sub-omnibus axiom `compileSafe_observational_correct_modulo_method_call_codegen`
+(REMOVED in wave 66 step 2, 2026-05-24). The omnibus `by_cases` cascade
+now classifies on `Agrees.methodCallConsumeShapeBool` and discharges the
+TRUE case with this theorem; non-passthrough method_call bodies fall
+through the unchanged else cascade to the sound crypto_call fallback.
 
 The retirable fragment is the **param-passthrough** `method_call` shape
 (`Agrees.methodCallConsumeShapeBool`): a single-public method whose body
@@ -5149,6 +5133,20 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           anfM.body = Agrees.updatePropConsumeBody prop op c →
           tsm = [(prop, Agrees.SlotKind.prop)] ∧
           Agrees.entryTsmArithTyped Γ tsm)
+    -- **Wave 66 method_call consume premise (keyed).**  For a body in the
+    -- param-passthrough `method_call` fragment (decided by
+    -- `methodCallConsumeShapeBool` — a single-public method whose body is one
+    -- `methodCall` of a one-param identity helper, the call-site arg at depth-0
+    -- last-use) the single param is `a`, the reversed param-name list is `[a]`,
+    -- and the entry tsm is the single param slot `[(a, .param)]`.  Keyed on the
+    -- DECIDABLE Bool classifier, it is VACUOUS for every non-passthrough body
+    -- (the antecedent is `false`), so the omnibus stays jointly satisfiable.
+    -- Its only consumer is the conformance harness, which discharges it per
+    -- fixture from the param-typed entry.
+    (hMethodCallFrag :
+      Agrees.methodCallConsumeShapeBool p.methods anfM = true →
+        ∃ a, (anfM.params.map (·.name)).reverse = [a] ∧
+             tsm = [(a, Agrees.SlotKind.param)])
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
@@ -5328,14 +5326,28 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                     anfM.body initialSm 0 = true
               · exact compileSafe_observational_correct_modulo_loop_codegen
                   p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hLoop
-              · by_cases hMethodCall :
-                    Agrees.structuralMethodCallBodyBool
-                      p.methods p.properties
-                      Lower.defaultInlineBudget
-                      lastUses [] localBindings constInts
-                      anfM.body initialSm 0 = true
-                · exact compileSafe_observational_correct_modulo_method_call_codegen
-                    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hMethodCall
+              · -- **Wave 66 consume-`method_call` branch (replaces the retired
+                -- method_call axiom).**  The decidable `methodCallConsumeShapeBool`
+                -- classifier pins the body to the param-passthrough fragment
+                -- (single param `a`, one `methodCall` of a one-param identity
+                -- helper, arg at depth-0 last-use).  The keyed `hMethodCallFrag`
+                -- premise then supplies the reversed param-name list `[a]` and
+                -- forces `tsm = [(a,.param)]`.  Non-passthrough method_call bodies
+                -- (which used to match the broader `structuralMethodCallBodyBool`)
+                -- are NOT recognised here and fall through to the sound
+                -- crypto_call fallback — NO new axiom is introduced.
+                by_cases hMethodCallShape :
+                    Agrees.methodCallConsumeShapeBool p.methods anfM = true
+                · obtain ⟨a, hSm, hTsmEq⟩ := hMethodCallFrag hMethodCallShape
+                  subst hTsmEq
+                  by_cases hNameMC : anfM.name ≠ "constructor"
+                  · exact compileSafe_observational_correct_methodCall_consume
+                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
+                      hSinglePublic hNameMC a hMethodCallShape hAgrees
+                      (fun _ => hSm) hCoh
+                  · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
+                      [(a, Agrees.SlotKind.param)] hAgrees trivial
                 · -- Substrate-gap fallback: no structural classifier fires.
                   -- This is the crypto-call family (no dedicated Bool checker
                   -- until A4-crypto + Phase B per-primitive land). The
@@ -5395,6 +5407,10 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           anfM.body = Agrees.updatePropConsumeBody prop op c →
           tsm = [(prop, Agrees.SlotKind.prop)] ∧
           Agrees.entryTsmArithTyped Γ tsm)
+    (hMethodCallFrag :
+      Agrees.methodCallConsumeShapeBool p.methods anfM = true →
+        ∃ a, (anfM.params.map (·.name)).reverse = [a] ∧
+             tsm = [(a, Agrees.SlotKind.param)])
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
     successAgrees
@@ -5402,7 +5418,8 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       (runParsedBytes bytes initialStack) :=
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
-    Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag hCoh
+    Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
+    hMethodCallFrag hCoh
 
 
 end Soundness
