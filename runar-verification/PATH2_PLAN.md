@@ -2475,7 +2475,7 @@ lemmas.
   *prove* it (wave 24). Any new sub-omnibus must carry the
   `agreesTagged` premise from the start.
 
-### 11.6 Retirement status (through wave 64)
+### 11.6 Retirement status (through wave 66)
 
 **Retired (verified via `#print axioms`, removed from the omnibus's
 sub-omnibus list):**
@@ -2489,6 +2489,12 @@ sub-omnibus list):**
   op-list-identity regime — the fragment fuses under the peephole). A
   10-wave sub-effort (W52/56/57/58/59/60/61/62/63/64); see the resolved
   note below.
+* `method_call_codegen` — wave 66 (83→82). The param-passthrough fragment
+  (`helper(p){return p}` called `helper(a)`) which lowers to the EMPTY op
+  list (RAW = []), making M3/M4 trivial. Consume theorem W66a + gated
+  dispatch W66b. NB wave 65 corrected the wave-55 fear: NO core
+  `evalMethodCall` change was needed (W55 was a Stack-substrate gap). The
+  const-leaf shape + all other method_call bodies fall through to crypto_call.
 
 **Soundness fixes (the axioms were false-as-stated; now sound):**
 * wave 24/25 — independent-input `successAgrees` false → added the
@@ -2517,29 +2523,30 @@ is FALSE (`applyPushPushAdd: [push 10, push 10, OP_ADD] → [push 20]`,
 20∉[-1,16]) — the consume theorem instead enumerates the post-peephole
 image over the finite admissible range.
 
-**Remaining 5 sub-omnibus axioms — wave-65 substrate sweep mapped all of
-them.** Two are RETIREMENT-REACHABLE (substrate landed, just the gated
-Pipeline dispatch remains); three are BLOCKED on a precise gap.
+**Remaining 4 sub-omnibus axioms (after the wave-66 method_call retirement):
+`crypto_call`, `dispatch`, `loop`, `stateful` — all BLOCKED on a precise gap.**
 
-* `method_call` — **retirement-reachable.** Wave 65 corrected the wave-55
-  finding: NO core `evalMethodCall` change is needed — the wave-52
-  `evalMethodCall` already binds call-site args into the callee frame; W55's
-  "frame mismatch" was a Stack-substrate gap. The from-entry M2 walk
-  `successAgrees_methodCall_passthrough_unconditional` (AgreesA8) now covers
-  the param-passthrough fragment (callee with its own param bound from an
-  explicit arg); the const-callee leaf walk (W53) covers the other. Remaining
-  to retire (→82): method-level wrappers (mirror the leaf wrappers) + a
-  decidable `methodCallPassthroughBool` classifier + the gated keyed-premise
-  dispatch. Wider fragments (arg at depth>0, multi-param, op-combining callee
-  bodies) fall through to crypto_call.
-* `loop` — **retirement-reachable.** Wave 65 closed Tier-3c (singleton arith
-  binOp body): per-iteration transport `runOps_push_i_binOp_drop_copyPath` +
-  from-entry walk `runOps_lowerValueP_loop_allCopyBody(_isSome)` (AgreesA7),
-  reusing the multi-loadRef+opcode witnesses. Remaining to retire (→82): the
-  final-iteration consume divergence (the last iter consumes operands via
-  ROLL/SWAP last-uses, diverging from the copy chunks — needs a
-  final-discriminating recursor), Tier-3d assemble, classifier widening, and
-  the gated dispatch.
+* `loop` — **BLOCKED (wave-67a finding; my wave-65 "reachable" call was
+  wrong).** Wave 65 landed only the RUNTIME half of the loop walk
+  (`runOps_lowerValueP_loop_allCopyBody_isSome`); two independent blockers
+  stop a retirement:
+  1. **M4 fails for the all-copy fragment.** The unrolled image's `loadRef`
+     emits `pickStruct` for depth ≥ 2 (not `AreRunarEmittablePush`); even
+     depth-1 bodies (`over, over`) peephole-fuse into a non-emittable op. The
+     ONLY all-copy body surviving both `AreRunarEmittablePush RAW` and
+     `AreRunarEmittablePush (peephole RAW)` is `t = i + i` (count ≤ 17, so
+     push-indices stay in `[-1,16]`) — a loop that reads neither state nor
+     params and DROPS its result, i.e. **dead-code loops**. Not meaningful.
+  2. **No ANF-side M2 walk.** There is no `runLoop`/`evalBindings` loop-success
+     `successAgrees` lemma anywhere (the AgreesA7 header says the ANF `Prop`
+     half is undischarged). The retirement needs a new count-induction loop
+     walk (peer of `successAgrees_updateProp_consume_unconditional`).
+  The meaningful (consuming) loop case additionally needs the deferred
+  final-iteration-discriminating recursor (two consume-path loads) — and its
+  image must then pass a FRESH Step-0 emittability check (likely needs
+  `pickStruct` added to `AreRunarEmittablePush` round-trip in Parse.lean, or a
+  depth≤1 classifier restriction + a peephole-stability proof). A multi-wave
+  effort; NOT a clean near-term retirement.
 * `dispatch` (D1) — **BLOCKED on the if-cascade parse round-trip.** Full
   lowering map + `dispatch2_select_branch0` selection PoC landed (AgreesD1).
   M2/M3/M4 are 100% reusable from the single-public retirements; the only new
