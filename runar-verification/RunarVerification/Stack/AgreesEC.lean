@@ -4860,4 +4860,469 @@ theorem smoke_emitEcNegate_value_concrete :
       ∧ Crypto.Secp256k1.pointY (Crypto.Secp256k1.ecNegate smokeDpPt)
           = Crypto.Secp256k1.fieldSub 0 22 := by native_decide
 
+/-! ## Part 15 — `fieldInv` square-and-multiply correctness (the `emitEcAdd` crux)
+
+`Crypto.Secp256k1.fieldInv a = fieldPowNat (fieldMod a) (FIELD_P − 2).toNat` (Fermat:
+`a^(p−2) ≡ a⁻¹ mod p`).  The codegen unrolls a square-and-multiply over the
+COMPILE-TIME-CONSTANT exponent `p − 2`, whose bit pattern is fixed:
+
+* bit 255 = 1  (start `r := a`),
+* bits 254..33 = 222 ones  (`fieldInvHighLoop 222`: each step `r := (r² · a)`),
+* bit 32 = 0  (one square),
+* bits 31..0 = `0xFFFFFC2D`  (`fieldInvLowLoop 32`: each step `r := r²`, ×a if bit set).
+
+This section proves the **spec-level** square-and-multiply correctness: the accumulator
+the codegen builds (mirrored by `fieldInvAccum`) equals `fieldInv a`.  The proof is a
+GENUINE structural induction over the loop structure (`samHigh_pow` / `samLow_pow`),
+NOT `native_decide` — the only `decide`/rewrite-to-numeral steps are the
+closed-form exponent identities (`final_exp_eq`, `fieldPm2_toNat`), which are concrete
+arithmetic facts about the constant exponent's bit pattern, not the correctness claim.
+
+The genuine algebra (`fpow_add`, the loop inductions) is `propext`/`Quot.sound`-clean
+and kernel-checkable.  The runtime threading that lands `fieldInvAccum a` on the Script
+VM stack across the ~2 k unrolled ops is the remaining `emitEcAdd` gap (documented at
+the section end). -/
+
+namespace FieldInvSpec
+
+open Crypto.Secp256k1 (fieldMod fieldMul fieldPowNat fieldInv FIELD_P)
+
+/-- `fieldMod a = a % p` (the canonical-residue normaliser collapses to `Int.emod`). -/
+theorem fmod_eq_emod (a : Int) : fieldMod a = a % FIELD_P := by
+  unfold fieldMod
+  rw [Int.add_emod_right, Int.emod_emod_of_dvd _ (Int.dvd_refl _)]
+
+/-- `fieldMod 1 = 1`. -/
+theorem fmod_one : fieldMod 1 = 1 := by rw [fmod_eq_emod]; decide
+
+/-- `fieldMod` is idempotent. -/
+theorem fmod_emod (a : Int) : fieldMod (fieldMod a) = fieldMod a := by
+  rw [fmod_eq_emod, fmod_eq_emod, Int.emod_emod_of_dvd _ (Int.dvd_refl _)]
+
+/-- `fieldMul` is commutative. -/
+theorem fmul_comm (a b : Int) : fieldMul a b = fieldMul b a := by
+  unfold fieldMul; rw [Int.mul_comm]
+
+/-- `fieldMod (fieldMod a · b) = fieldMod (a · b)` — left-arg `fieldMod` absorbs. -/
+theorem fmod_mul_left (a b : Int) :
+    fieldMod (fieldMod a * b) = fieldMod (a * b) := by
+  rw [fmod_eq_emod, fmod_eq_emod a, fmod_eq_emod (a*b), Int.mul_emod,
+      Int.emod_emod_of_dvd _ (Int.dvd_refl _), ← Int.mul_emod]
+
+/-- `fieldMod (a · fieldMod b) = fieldMod (a · b)` — right-arg `fieldMod` absorbs. -/
+theorem fmod_mul_right (a b : Int) :
+    fieldMod (a * fieldMod b) = fieldMod (a * b) := by
+  rw [Int.mul_comm a, fmod_mul_left, Int.mul_comm]
+
+/-- `fieldMul` is associative (mod p). -/
+theorem fmul_assoc (a b c : Int) :
+    fieldMul (fieldMul a b) c = fieldMul a (fieldMul b c) := by
+  unfold fieldMul
+  rw [fmod_mul_left (a*b) c, fmod_mul_right a (b*c), Int.mul_assoc]
+
+/-- `fieldMul a b` is already a canonical residue. -/
+theorem fmod_fmul (a b : Int) : fieldMod (fieldMul a b) = fieldMul a b := by
+  unfold fieldMul; rw [fmod_emod]
+
+/-- `fieldPowNat a n` is already a canonical residue. -/
+theorem fmod_fpow (a : Int) (n : Nat) :
+    fieldMod (fieldPowNat a n) = fieldPowNat a n := by
+  cases n with
+  | zero => exact fmod_one
+  | succ k => exact fmod_fmul a (fieldPowNat a k)
+
+/-- `fieldMul x 1 = fieldMod x`. -/
+theorem fmul_one_right (x : Int) : fieldMul x 1 = fieldMod x := by
+  unfold fieldMul; rw [Int.mul_one]
+
+/-- `fieldMul (fieldMod a) b = fieldMul a b`. -/
+theorem fmul_left_fieldMod (a b : Int) :
+    fieldMul (fieldMod a) b = fieldMul a b := by
+  unfold fieldMul; rw [fmod_mul_left]
+
+/-- `fieldMul a (fieldMod b) = fieldMul a b`. -/
+theorem fmul_right_fieldMod (a b : Int) :
+    fieldMul a (fieldMod b) = fieldMul a b := by
+  unfold fieldMul; rw [fmod_mul_right]
+
+/-- **Exponent addition law:** `a^(m+n) = a^m · a^n` (mod p).  Genuine induction on `n`. -/
+theorem fpow_add (a : Int) (m n : Nat) :
+    fieldPowNat a (m + n) = fieldMul (fieldPowNat a m) (fieldPowNat a n) := by
+  induction n with
+  | zero =>
+    show fieldPowNat a m = _
+    show _ = fieldMul (fieldPowNat a m) 1
+    rw [fmul_one_right, fmod_fpow]
+  | succ k ih =>
+    show fieldPowNat a (m+k+1) = _
+    show fieldMul a (fieldPowNat a (m+k)) = _
+    rw [ih]
+    show _ = fieldMul (fieldPowNat a m) (fieldMul a (fieldPowNat a k))
+    rw [← fmul_assoc, fmul_comm a (fieldPowNat a m), fmul_assoc]
+
+/-- `a^1 = fieldMod a`. -/
+theorem fpow_one (a : Int) : fieldPowNat a 1 = fieldMod a := by
+  show fieldMul a (fieldPowNat a 0) = _
+  show fieldMul a 1 = _
+  rw [fmul_one_right]
+
+/-- `(fieldMod a)^n = a^n` — the spec's `fieldInv` `fieldMod`s its input first; the
+codegen multiplies by the raw input.  Both yield the same power. -/
+theorem fpow_fieldMod (a : Int) (n : Nat) :
+    fieldPowNat (fieldMod a) n = fieldPowNat a n := by
+  induction n with
+  | zero => rfl
+  | succ k ih =>
+    show fieldMul (fieldMod a) (fieldPowNat (fieldMod a) k) = fieldMul a (fieldPowNat a k)
+    rw [ih, fmul_left_fieldMod]
+
+/-- **One square-and-multiply step:** `(a^e)² · a = a^(2e+1)`. -/
+theorem one_high_step (a : Int) (e : Nat) :
+    fieldMul (fieldMul (fieldPowNat a e) (fieldPowNat a e)) a = fieldPowNat a (2*e + 1) := by
+  rw [show 2*e+1 = 1 + (e+e) from by omega, fpow_add, fpow_add]
+  show _ = fieldMul (fieldPowNat a 1) (fieldMul (fieldPowNat a e) (fieldPowNat a e))
+  rw [fmul_comm (fieldPowNat a 1), fpow_one, fmul_right_fieldMod]
+
+/-- **One square step:** `(a^e)² = a^(2e)`. -/
+theorem one_sqr_step (a : Int) (e : Nat) :
+    fieldMul (fieldPowNat a e) (fieldPowNat a e) = fieldPowNat a (2*e) := by
+  rw [show 2*e = e + e from by omega, fpow_add]
+
+/-- Spec-level high loop: `n` iterations of `r := (r² · a)` (each bit = 1).  Mirrors
+`Stack.Ec.fieldInvHighLoop`'s value transformation. -/
+def samHigh (a : Int) : Nat → Int → Int
+  | 0,     r => r
+  | n + 1, r => samHigh a n (fieldMul (fieldMul r r) a)
+
+/-- Exponent after `n` high iters from start exp `e` (each step `e ↦ 2e+1`). -/
+def highExpN : Nat → Nat → Nat
+  | 0,     e => e
+  | n + 1, e => highExpN n (2*e + 1)
+
+/-- **High-loop correctness:** from `r = a^e`, `n` iters give `a^(highExpN n e)`.
+Genuine induction on `n` via `one_high_step`. -/
+theorem samHigh_pow (a : Int) (n : Nat) :
+    ∀ e : Nat, samHigh a n (fieldPowNat a e) = fieldPowNat a (highExpN n e) := by
+  induction n with
+  | zero => intro e; rfl
+  | succ k ih =>
+    intro e
+    show samHigh a k (fieldMul (fieldMul (fieldPowNat a e) (fieldPowNat a e)) a) = _
+    rw [one_high_step, ih]; rfl
+
+/-- Spec-level low loop: `steps` iters, MSB-first over `lowBits`; each iter squares,
+and multiplies by `a` when the current bit is set.  Mirrors `fieldInvLowLoop`. -/
+def samLow (a lowBits : Int) : Nat → Int → Int
+  | 0,     r => r
+  | k + 1, r =>
+    let r2 := fieldMul r r
+    let r' := if ((lowBits / (2 ^ k)) % 2) = 1 then fieldMul r2 a else r2
+    samLow a lowBits k r'
+
+/-- Exponent after `steps` low iters (each `e ↦ 2e + bit_k`). -/
+def lowExpN (lowBits : Int) : Nat → Nat → Nat
+  | 0,     e => e
+  | k + 1, e => lowExpN lowBits k (2*e + (if ((lowBits / (2 ^ k)) % 2) = 1 then 1 else 0))
+
+/-- **Low-loop correctness:** from `r = a^e`, `steps` iters give `a^(lowExpN …)`.
+Genuine induction on `steps` (case-split on each bit) via `one_high_step`/`one_sqr_step`. -/
+theorem samLow_pow (a lowBits : Int) (steps : Nat) :
+    ∀ e : Nat, samLow a lowBits steps (fieldPowNat a e)
+      = fieldPowNat a (lowExpN lowBits steps e) := by
+  induction steps with
+  | zero => intro e; rfl
+  | succ k ih =>
+    intro e
+    show samLow a lowBits k
+          (if ((lowBits / (2 ^ k)) % 2) = 1
+           then fieldMul (fieldMul (fieldPowNat a e) (fieldPowNat a e)) a
+           else fieldMul (fieldPowNat a e) (fieldPowNat a e)) = _
+    by_cases hb : ((lowBits / (2 ^ k)) % 2) = 1
+    · rw [if_pos hb, one_high_step, ih]
+      show fieldPowNat a (lowExpN lowBits k (2*e+1)) = fieldPowNat a (lowExpN lowBits (k+1) e)
+      congr 1
+      show _ = lowExpN lowBits k (2*e + (if ((lowBits / (2 ^ k)) % 2) = 1 then 1 else 0))
+      rw [if_pos hb]
+    · rw [if_neg hb, one_sqr_step, ih]
+      show fieldPowNat a (lowExpN lowBits k (2*e)) = fieldPowNat a (lowExpN lowBits (k+1) e)
+      congr 1
+      show lowExpN lowBits k (2*e)
+            = lowExpN lowBits k (2*e + (if ((lowBits / (2 ^ k)) % 2) = 1 then 1 else 0))
+      rw [if_neg hb, Nat.add_zero]
+
+/-- Closed form for `highExpN` (avoids `Nat` subtraction): `highExpN n e + 1 = 2^n·(e+1)`. -/
+theorem highExpN_succ_closed (n e : Nat) : highExpN n e + 1 = 2^n * (e+1) := by
+  induction n generalizing e with
+  | zero => show e + 1 = 2^0 * (e+1); rw [Nat.pow_zero, Nat.one_mul]
+  | succ k ih =>
+    show highExpN k (2*e+1) + 1 = 2^(k+1) * (e+1)
+    rw [ih (2*e+1), Nat.pow_succ, show 2*e+1+1 = 2*(e+1) from by omega,
+        ← Nat.mul_assoc, Nat.mul_comm (2^k) 2, Nat.mul_assoc]
+
+/-- `lowExpN` splits its start exponent: `lowExpN bits s e = 2^s·e + lowExpN bits s 0`. -/
+theorem lowExpN_split (lowBits : Int) (steps e : Nat) :
+    lowExpN lowBits steps e = 2^steps * e + (lowExpN lowBits steps 0) := by
+  induction steps generalizing e with
+  | zero => show e = 2^0 * e + 0; rw [Nat.pow_zero, Nat.one_mul, Nat.add_zero]
+  | succ k ih =>
+    show lowExpN lowBits k (2*e + (if ((lowBits / (2 ^ k)) % 2) = 1 then 1 else 0))
+          = 2^(k+1) * e + lowExpN lowBits k (2*0 + (if ((lowBits / (2 ^ k)) % 2) = 1 then 1 else 0))
+    rw [ih (2*e + (if ((lowBits / (2 ^ k)) % 2) = 1 then 1 else 0))]
+    rw [ih (2*0 + (if ((lowBits / (2 ^ k)) % 2) = 1 then 1 else 0))]
+    rw [Nat.pow_succ, Nat.mul_zero, Nat.zero_add, Nat.mul_add,
+        show 2^k * (2*e) = 2^k * 2 * e from by rw [← Nat.mul_assoc]]
+    omega
+
+/-- `highExpN 222 1 = 2^223 − 1` (the 223 high bits 255..33). -/
+theorem highExpN_222_1 : highExpN 222 1 = 2^223 - 1 := by
+  have h := highExpN_succ_closed 222 1
+  rw [show (1:Nat)+1 = 2 from rfl] at h
+  rw [show 2^222 * 2 = 2^223 from by rw [Nat.pow_succ]] at h
+  omega
+
+set_option maxRecDepth 2048 in
+/-- `lowExpN 0xFFFFFC2D 32 0 = 0xFFFFFC2D` — the low 32 bits decode to their value.
+`decide` is a kernel reduction of a 32-step recursion (concrete, no `ofReduceBool`). -/
+theorem lowExpN_val : lowExpN 0xFFFFFC2D 32 0 = 0xFFFFFC2D := by decide
+
+set_option maxRecDepth 4096 in
+/-- `(FIELD_P − 2).toNat = 2^256 − 2^33 + 0xFFFFFC2D` — the constant exponent's value
+in power form.  `decide` on a concrete numeral identity (no `ofReduceBool`). -/
+theorem fieldPm2_toNat : (FIELD_P - 2).toNat = 2^256 - 2^33 + 0xFFFFFC2D := by decide
+
+set_option maxRecDepth 4096 in
+/-- **The constant exponent assembles:** `lowExpN 0xFFFFFC2D 32 (2 · highExpN 222 1)
+= (FIELD_P − 2).toNat`.  Concrete arithmetic on the constant exponent's bit pattern. -/
+theorem final_exp_eq :
+    lowExpN 0xFFFFFC2D 32 (2 * highExpN 222 1) = (FIELD_P - 2).toNat := by
+  rw [lowExpN_split, lowExpN_val, highExpN_222_1, fieldPm2_toNat]
+
+/-- `a³ = (a · a) · a` (the codegen's first high step from the RAW input `a`, whose
+`fieldMod` only kicks in from the first `fieldMul`). -/
+theorem cube_eq (a : Int) : fieldMul (fieldMul a a) a = fieldPowNat a 3 := by
+  rw [show (3:Nat) = 1 + (1 + 1) from rfl, fpow_add, fpow_add]
+  show fieldMul (fieldMul a a) a
+        = fieldMul (fieldPowNat a 1) (fieldMul (fieldPowNat a 1) (fieldPowNat a 1))
+  rw [fpow_one, fmul_right_fieldMod, fmul_left_fieldMod, fmul_left_fieldMod,
+      fmul_comm (fieldMul a a) a]
+
+/-- `highExpN (n+1) 1 = highExpN n 3` (the first high step takes exp 1 → 3). -/
+theorem highExpN_succ_one (n : Nat) : highExpN (n+1) 1 = highExpN n 3 := rfl
+
+/-- **High loop from the raw input:** `samHigh a (n+1) a = a^(highExpN (n+1) 1)`.
+Bridges the RAW-`a` start (codegen) to the `fieldPowNat a 1` start (`samHigh_pow`). -/
+theorem samHigh_from_a (a : Int) (n : Nat) :
+    samHigh a (n+1) a = fieldPowNat a (highExpN (n+1) 1) := by
+  show samHigh a n (fieldMul (fieldMul a a) a) = _
+  rw [cube_eq, samHigh_pow, highExpN_succ_one]
+
+/-- The full square-and-multiply accumulator the codegen builds, as a spec value:
+start `a` → high loop 222 → one square (bit 32 = 0) → low loop 32 over `0xFFFFFC2D`. -/
+def fieldInvAccum (a : Int) : Int :=
+  samLow a 0xFFFFFC2D 32 (fieldMul (samHigh a 222 a) (samHigh a 222 a))
+
+set_option maxRecDepth 4096 in
+/-- **THE CRUX — `fieldInvAccum a = fieldInv a`.**  The unrolled square-and-multiply over
+the constant exponent `FIELD_P − 2` computes the field inverse.  A GENUINE structural
+induction over the loop structure (`samHigh_pow` / `samLow_pow` / `one_high_step` /
+`one_sqr_step`) — NOT `native_decide`; the only kernel-`decide` steps are the closed-form
+exponent identities for the constant exponent's bit pattern.  `propext`/`Quot.sound`
+-clean, no `sorryAx`, no `ofReduceBool`. -/
+theorem fieldInvAccum_eq (a : Int) : fieldInvAccum a = fieldInv a := by
+  unfold fieldInvAccum
+  rw [show (222:Nat) = 221+1 from rfl, samHigh_from_a, one_sqr_step, samLow_pow,
+      show (221:Nat)+1 = 222 from rfl, final_exp_eq]
+  unfold fieldInv
+  rw [fpow_fieldMod]
+
+/-! ### MANDATORY smokes for the `fieldInv` square-and-multiply crux
+
+NOTE: `fieldInv a = fieldPowNat (fieldMod a) (FIELD_P − 2).toNat` is a NAIVE
+exponent recursion (≈ 2²⁵⁶ steps), so it CANNOT be reduced numerically by
+`native_decide`/`decide` — every smoke is therefore SYMBOLIC (firing the proven
+equation) or a closed concrete fact about the loop machinery / exponent. -/
+
+/-- SMOKE (the crux FIRES on a concrete value).  `fieldInvAccum 7 = fieldInv 7`
+(symbolic — instantiates the proven equation, no exponent reduction). -/
+theorem smoke_fieldInvAccum_eq : fieldInvAccum 7 = fieldInv 7 := fieldInvAccum_eq 7
+
+/-- SMOKE (anti-vacuity of the exponent — the constant exponent is genuinely the FULL
+`FIELD_P − 2`, ≈ 2²⁵⁶, not a degenerate small value).  Concrete closed fact. -/
+theorem smoke_final_exp_huge : (2 : Nat) ^ 255 < lowExpN 0xFFFFFC2D 32 (2 * highExpN 222 1) := by
+  rw [final_exp_eq, fieldPm2_toNat]
+  have h : (2:Nat)^255 ≤ 2^256 := Nat.pow_le_pow_right (by omega) (by omega)
+  rw [show (2:Nat)^256 = 2 * 2^255 from by rw [Nat.pow_succ, Nat.mul_comm],
+      show (2:Nat)^33 = 2 * 2^32 from by rw [Nat.pow_succ, Nat.mul_comm]]
+  have h32 : (2:Nat)^32 ≤ 2^255 := Nat.pow_le_pow_right (by omega) (by omega)
+  omega
+
+/-- SMOKE (anti-vacuity — the accumulator is one-square-and-multiply chain, not a no-op:
+the high loop alone applies a genuine `2e+1` per step).  `highExpN 1 0 = 1`,
+`highExpN 2 0 = 3` (square-and-multiply doubles-plus-one). -/
+theorem smoke_highExpN_nontrivial : highExpN 1 0 = 1 ∧ highExpN 2 0 = 3 := by
+  constructor <;> rfl
+
+/-- SMOKE (loop value firing — one high step on `a = 7` from exp 0 lands `7³`). -/
+theorem smoke_samHigh_one : samHigh 7 1 7 = fieldPowNat 7 3 := samHigh_from_a 7 0
+
+end FieldInvSpec
+
+/-! ### `rename` (`set!`) `TrackerSim` transport — the runtime-threading building block
+
+The codegen's `fieldInvHighLoop`/`fieldInvLowLoop` re-`rename` the freshly-produced
+`_inv_r2` / `_inv_m` scratch slot back to `_inv_r` each iteration.  Crucially the PRIOR
+`_inv_r` is already CONSUMED by the `fieldSqr`/`fieldMul` `rawBlock`s before the rename
+fires, so the rename targets the (locally) FRESH top slot — `Tracker.rename` is
+`nm.set! (nm.size - 1)`, a top-slot relabel with the runtime stack UNCHANGED.  Part 13
+shipped `roll`/`pick` (`toTop`/`copyToTop`) `TrackerSim` preservation but no `set!`
+(rename) peer; these three lemmas fill that gap and are the first concrete step of the
+`fieldInv_runOps_sim` runtime transport (the remaining gap, documented below). -/
+
+/-- `(nm.push x).set! (size-1) y = nm.push y` — relabel the top slot. -/
+theorem push_set_top (nm : Array (Option String)) (x y : Option String) :
+    (nm.push x).set! ((nm.push x).size - 1) y = nm.push y := by
+  unfold Array.set!
+  apply Array.ext
+  · rw [Array.size_setIfInBounds, Array.size_push, Array.size_push]
+  · intro i h1 h2
+    rw [Array.size_setIfInBounds, Array.size_push] at h1
+    have hib : i < (nm.push x).size := by rw [Array.size_push]; omega
+    rw [Array.getElem_setIfInBounds hib]
+    by_cases ht : i = nm.size
+    · subst ht
+      have he : (nm.push x).size - 1 = nm.size := by rw [Array.size_push]; omega
+      simp only [he, ite_true]
+      rw [Array.getElem_push_eq]
+    · have hlt : i < nm.size := by omega
+      have hne : ((nm.push x).size - 1 = i) = False := by
+        rw [Array.size_push]; simp; omega
+      simp only [hne, ite_false]
+      rw [Array.getElem_push_lt hlt, Array.getElem_push_lt hlt]
+
+/-- **`TrackerSim` drops a top slot.**  A push-then-`TrackerSim` reduces to a
+`TrackerSim` on the base name array + the popped runtime stack. -/
+theorem TrackerSim_pop (nm : Array (Option String)) (σ : String → Value)
+    (stk : List Value) (top : Value) (old : String)
+    (hSim : TrackerSim (nm.push (some old)) σ (top :: stk)) :
+    TrackerSim nm σ stk := by
+  obtain ⟨hlen, hslot⟩ := hSim
+  rw [Array.size_push] at hlen
+  refine ⟨by simp at hlen ⊢; omega, ?_⟩
+  intro i hi
+  have hi' : i < (nm.push (some old)).size := by rw [Array.size_push]; omega
+  have hag := hslot i hi'
+  rw [Array.getElem_push_lt hi] at hag
+  have hsz : (nm.push (some old)).size = nm.size + 1 := Array.size_push ..
+  rw [hsz] at hag
+  have hcons : nm.size + 1 - 1 - i = (nm.size - 1 - i) + 1 := by omega
+  rw [hcons, List.getElem!_cons_succ] at hag
+  exact hag
+
+/-- **`rename` `TrackerSim` transport (the missing `set!` peer).**  `Tracker.rename n`
+relabels the top slot to `n` (fresh in the base array) and emits NO runtime op, so the
+stack is unchanged; the model `σ` is updated at `n` to the top value.  Reduces to
+`TrackerSim_pop` + `TrackerSim_push` via `push_set_top`. -/
+theorem TrackerSim_rename (nm : Array (Option String)) (σ : String → Value)
+    (stk : List Value) (top : Value) (old n : String)
+    (hSim : TrackerSim (nm.push (some old)) σ (top :: stk))
+    (hfresh : some n ∉ nm.toList) :
+    TrackerSim ((nm.push (some old)).set! ((nm.push (some old)).size - 1) (some n))
+      (fun u => if u = n then top else σ u) (top :: stk) := by
+  rw [push_set_top]
+  exact TrackerSim_push nm σ stk n top (TrackerSim_pop nm σ stk top old hSim) hfresh
+
+/-! ### MANDATORY smokes for the `rename` transport -/
+
+/-- Concrete base valuation for the rename smoke: `"a" ↦ 10`, `"b" ↦ 20`. -/
+private def rnσ : String → Value
+  | "a" => .vBigint 10
+  | "b" => .vBigint 20
+  | _   => .vBigint 0
+
+/-- The pre-rename `TrackerSim`: nm `#[a, b]`, runtime `[20, 10]` (top = b = 20). -/
+theorem smoke_rnSim_pre :
+    TrackerSim (#[some "a"].push (some "b")) rnσ [.vBigint 20, .vBigint 10] := by
+  refine ⟨rfl, ?_⟩
+  intro i hi
+  have hsz : (#[some "a"].push (some "b")).size = 2 := rfl
+  rw [hsz] at hi
+  match i, hi with
+  | 0, _ =>
+    show slotAgrees rnσ (some "a") (Value.vBigint 10)
+    unfold slotAgrees rnσ; rfl
+  | 1, _ =>
+    show slotAgrees rnσ (some "b") (Value.vBigint 20)
+    unfold slotAgrees rnσ; rfl
+
+/-- SMOKE (rename transport FIRES).  Relabel the top `"b"` to fresh `"c"`: the model
+`σ' "c" = 20` (the top value), `σ'` unchanged on `"a"`; runtime stack unchanged. -/
+theorem smoke_TrackerSim_rename :
+    TrackerSim ((#[some "a"].push (some "b")).set! ((#[some "a"].push (some "b")).size - 1) (some "c"))
+      (fun u => if u = "c" then (.vBigint 20) else rnσ u) [.vBigint 20, .vBigint 10] :=
+  TrackerSim_rename #[some "a"] rnσ [.vBigint 10] (.vBigint 20) "b" "c" smoke_rnSim_pre (by decide)
+
+/-- SMOKE (`push_set_top` value anti-vacuity).  Relabel really replaces the top name. -/
+theorem smoke_push_set_top :
+    (#[some "a"].push (some "b")).set! ((#[some "a"].push (some "b")).size - 1) (some "c")
+      = #[some "a", some "c"] := by rw [push_set_top]; rfl
+
+/-! ## Part 15 (cont.) — `fieldInv` runtime threading + `emitEcAdd` discharge: HONEST BLOCK
+
+The spec-level square-and-multiply crux (`FieldInvSpec.fieldInvAccum_eq`) is PROVEN: the
+codegen's unrolled accumulator equals `Crypto.Secp256k1.fieldInv a`.  The remaining
+`emitEcAdd_runOps_eq` discharge needs the RUNTIME side wired on top:
+
+1. **`fieldInv_runOps_sim`** — the runtime transport landing `fieldInvAccum a` (= `fieldInv a`)
+   on the Script-VM stack.  The codegen `Stack.Ec.fieldInv` unrolls `fieldInvHighLoop 222`
+   + one square + `fieldInvLowLoop 32` — ≈ 254 iterations, each a `fieldSqr` (copyToTop +
+   `fieldMul`) + a `rename` + (high / low-bit-set) a `copyToTop aName` + `fieldMul` + `rename`,
+   ≈ 2 k Script ops after the `fieldModOps` tails.  The transport is a STRUCTURAL induction
+   over `fieldInvHighLoop`/`fieldInvLowLoop` maintaining the `TrackerSimT nm σ tracked rest`
+   invariant (Part 13 substrate) across each iteration, with `σ` mapping `_inv_r ↦ a^(running
+   exp)` and `aName ↦ a`, threading the `samHigh`/`samLow` value-recursion proven above
+   (`samHigh_pow`/`samLow_pow`).
+
+   The `rename` (`set!`) `TrackerSim` transport — which the Part 13 substrate lacked — is
+   now LANDED above (`TrackerSim_rename`, via `push_set_top` + `TrackerSim_pop`): the prior
+   `_inv_r` is CONSUMED by the `fieldSqr`/`fieldMul` `rawBlock`s before the rename, so the
+   relabel targets a (locally) fresh top slot, reducing to `TrackerSim_push` on the base
+   array.
+
+   **EXACT REMAINING BLOCKING SUB-GOAL:** the per-iteration `TrackerSimT` preservation step
+   `fieldInvHighLoop_runOps_step` — `runOps (oneHighIterOps t.nm) s
+     = .ok { s with stack := fieldMul (fieldMul rTop rTop) a :: keptTail }` together with the
+   matching `TrackerSimT (oneHighIter t).nm σ' …` — has TWO genuinely-new pieces beyond the
+   per-helper sims (`fieldSqr_runOps_sim`/`fieldMul_runOps_sim`) already shipped:
+   (a) the `copyToTop aName` inside each iteration resolves to a DEEP, ITERATION-DEPENDENT
+   `findDepthList` depth (the `aName` slot sinks further from TOS as `_inv_r`/scratch slots
+   churn above it), so the determined-increment op-lists used by the existing
+   `fieldSqr_runOps_sim` (which hard-code `dup`/`swap` at depths 0/1) DO NOT apply — each
+   iteration needs the GENERAL `runOps_copyToTop_extraOps_simT` at the live `findDepthList`
+   depth, and a lemma that this depth stays in range across all 254 iterations; and
+   (b) the induction must carry the `TrackerSimT` invariant THROUGH the `fieldModOps` tail of
+   every `fieldMul`/`fieldSqr` (the helper sims land a single value but the loop induction
+   needs the full name-array + `σ` lock-step re-established after each helper, including the
+   freshness side-conditions for the next iteration's renames).  Proving (a)+(b) as a single
+   structural recursion over `fieldInvHighLoop n`/`fieldInvLowLoop steps` is the precise next
+   deliverable — ≈ several hundred lines, and the reason `fieldInv_runOps_sim` is BLOCKED here.
+
+2. **affineAdd field-chain threading** — once `fieldInv_runOps_sim` lands, thread the ~50
+   `fieldSub`/`fieldMul`/`fieldSqr` + the one `fieldInv` through `Stack.Ec.affineAdd`'s op
+   sequence to `Crypto.Secp256k1.affineAdd`'s non-degenerate branch (`s_num = qy−py`,
+   `s_den = qx−px`, `s = s_num·s_den⁻¹`, `rx = s²−px−qx`, `ry = s·(px−rx)−py`), reusing the
+   `fieldSub/Mul/Sqr_runOps_sim` peers off the (depth-resolved) `decomposePoint` base.
+
+3. **`emitEcAdd_runOps_eq` discharge** — `emitEcAdd_ops` (determined concat via the
+   intermediate-nm chain, mirroring `emitEcOnCurve_ops`) + the runtime threading
+   (`decomposePoint` ×2 → affineAdd field chain incl. `fieldInv` → `composePoint`), reduced
+   to `Crypto.Secp256k1.ecAdd`.  Honest INPUT-side wf hyps: both points 64-byte + on-curve +
+   `FIELD_P ≠ 0`, PLUS the non-degenerate case split `pointX p ≢ pointX q (mod p)` (the
+   affine formula's `pxm ≠ qxm` branch — the `P = ±Q` / doubling cases route through
+   `affineDouble`, a SEPARATE codegen path not exercised by `emitEcAdd`'s straight-line
+   affine-add and so must be excluded by hypothesis or handled in a follow-up).
+
+The `Crypto.Spec.emitEcAdd_runOps_eq` axiom therefore REMAINS for now; drift stays at 74.
+The crux (the genuinely hard square-and-multiply correctness) is discharged above as
+`FieldInvSpec.fieldInvAccum_eq`. -/
+
 end RunarVerification.Stack.AgreesEC
