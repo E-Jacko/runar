@@ -296,6 +296,34 @@ private theorem runOpcode_EQUAL_def_local (s : StackState) :
                .ok (s'.push (.vBool eq))
            | _ => .error (.unsupported "OP_EQUAL popN bug")) := rfl
 
+/-- The OP_EQUAL coercion cascade, specialized to operand `a = .vBigint x`
+(the modular residue) and `b = .vBytes h` (the SHA-256 digest), still collapses
+to `decide (encodeMinimalLE x = h)` under the Bitcoin-faithful
+`asBytes? (vBigint 0) = some empty`.  For `x = 0` the leading bytes/bytes branch
+fires (`empty = h`) and `encodeMinimalLE 0 = empty` makes it agree; for `x ≠ 0`
+control falls through the (now-`none`) `asBytes? a` exactly as in B10-prep. -/
+private theorem equal_intBytes_cascade (x : Int) (h : ByteArray) :
+    (match asBytes? (.vBigint x), asBytes? (.vBytes h) with
+     | some ab, some bb => decide (ab.toList = bb.toList)
+     | _, _ =>
+         match asInt? (.vBigint x), asInt? (.vBytes h) with
+         | some ai, some bi => decide (ai = bi)
+         | _, _ =>
+             match asInt? (.vBigint x), asBytes? (.vBytes h) with
+             | some ai, some bb =>
+                 decide ((encodeMinimalLE ai).toList = bb.toList)
+             | _, _ =>
+                 match asBytes? (.vBigint x), asInt? (.vBytes h) with
+                 | some ab, some bi =>
+                     decide (ab.toList = (encodeMinimalLE bi).toList)
+                 | _, _ => false)
+    = decide ((encodeMinimalLE x).toList = h.toList) := by
+  by_cases hx : x = 0
+  · subst hx
+    simp only [asBytes?, encodeMinimalLE_zero, ByteArray.toList_empty]
+  · rw [asBytes?_vBigint_ne_zero hx]
+    simp only [asBytes?, asInt?]
+
 /-- The terminal `OP_EQUAL` step in the Rabin body: comparing
 `.vBytes h` (TOS, the SHA-256 digest) against `.vBigint x` (the
 modular residue) reduces to the int↔bytes coercion arm widened in
@@ -310,7 +338,8 @@ private theorem runOpcode_EQUAL_intBytes
                 ((encodeMinimalLE x).toList = h.toList)))) := by
   rw [runOpcode_EQUAL_def_local]
   rw [popN_two_local s _ _ rest hStk]
-  simp [asBytes?, asInt?]
+  simp only []
+  rw [equal_intBytes_cascade x h]
 
 /-! ### `runOps` cons reduction for the Rabin body
 

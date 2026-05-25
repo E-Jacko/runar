@@ -342,22 +342,18 @@ The loop `emitReverse32Loop n` iterates this `n` times; over a full-size value i
 reverses the byte order into the accumulator (verified empirically: a length-3
 value `[10,20,30]` with acc `[99]` becomes `[30,20,10,99]`).
 
-**BLOCK (the OP_0 wrapper).** `emitReverse32Ops = [.opcode "OP_0", .swap] ++ loop ++ [.drop]`
-initializes the accumulator with `OP_0`. The Lean Stack VM models `OP_0` as
-`.vBigint 0` (`Stack.Eval.runOpcode "OP_0" = s.push (.vBigint 0)`), NOT an empty
-byte-vector. The very first loop step's `OP_CAT` then rejects the `vBigint 0`
-accumulator (`liftBytesBin` requires both operands `asBytes?`), so
-`runOps Stack.Ec.emitReverse32Ops s = .error (.typeError "binary bytes op …")`
-for EVERY input — the wrapper transport is FALSE as stated in the current VM.
-The obstacle is a VM model-fidelity gap (real Script `OP_0` pushes the empty
-byte-vector, which `OP_CAT` treats as empty bytes), reconcilable only by either
-(a) the codegen emitting `.push (.bytes ByteArray.empty)` instead of `.opcode "OP_0"`
-(byte-identical on the wire — all three emit `[0x00]` — but distinct in the VM),
-or (b) a VM change making `OP_0` push a bytes-coercible empty value. Both are out
-of scope this wave (codegen / VM dispatch edits are forbidden without a BLOCK).
-The loop body lemma below is therefore proved over the SEMANTICALLY-CORRECT
-bytes-accumulator form; it is the reusable substrate the medium-EC-op discharge
-waves consume once the OP_0 init is reconciled. No new axiom. -/
+**UNBLOCKED (the OP_0 wrapper).** `emitReverse32Ops = [.opcode "OP_0", .swap] ++ loop ++ [.drop]`
+initializes the accumulator with `OP_0`. The Stack VM models `OP_0` as `.vBigint 0`
+(`Stack.Eval.runOpcode "OP_0" = s.push (.vBigint 0)`); the parser likewise turns the
+wire byte `0x00` into `vBigint 0`. Wave 72 BLOCKED here because the first loop step's
+`OP_CAT` rejected the `vBigint 0` accumulator. That was a Bitcoin-faithfulness GAP in
+`asBytes?`: on a real Script stack the number 0 IS the empty byte vector
+(`encodeMinimalLE 0 = ByteArray.empty`) and `OP_CAT(empty, x) = x`. This wave closes
+the gap by making `Stack.Eval.asBytes? (.vBigint 0) = some ByteArray.empty` (the narrow,
+fully-faithful zero coercion; see `Stack/Eval.lean`). The wrapper transport
+`reverse32_ops_transport` below is now a THEOREM (proved via
+`reverse32_step_transport_accV` for the seeded first step + `reverse32_loop_transport`
+for the rest + `drop`), with a concrete 32-byte success smoke. No new axiom. -/
 
 /-- **reverse32 single-step transport.**  One `emitReverse32Step` on
 `[value, acc] ++ rest` (value on TOS, `1 ≤ value.size`) peels the head byte of
@@ -441,6 +437,109 @@ theorem reverse32_step_transport
         = .ok { stack := .vBytes (value.extract 0 1 ++ acc)
                           :: .vBytes (value.extract 1 value.size) :: rest, altstack := alt,
                 outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- Step 7: swap → final layout.
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBytes (value.extract 0 1 ++ acc)
+                    :: .vBytes (value.extract 1 value.size) :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (value.extract 1 value.size)
+                          :: .vBytes (value.extract 0 1 ++ acc) :: rest, altstack := alt,
+                outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps, runOps_nil]
+
+/-- **reverse32 single-step transport with a coercible non-`vBytes` accumulator.**
+Identical to `reverse32_step_transport` but the accumulator slot holds an arbitrary
+`accV : Value` whose Bitcoin-faithful byte view is `acc` (`asBytes? accV = some acc`).
+This is what lets the FIRST loop step run against the `OP_0`-initialized accumulator
+(`accV = .vBigint 0`, `acc = ByteArray.empty`): on a real Script stack `OP_0` is the
+empty byte vector, and `OP_CAT(x, empty) = x`.  Only step 6 (`OP_CAT`) differs from
+the `vBytes` form — every other op (`OP_SPLIT`, `rot`, `swap`) is value-agnostic. -/
+theorem reverse32_step_transport_accV
+    (s : StackState) (value acc : ByteArray) (accV : Value) (rest : List Value)
+    (hStk : s.stack = .vBytes value :: accV :: rest)
+    (hAcc : asBytes? accV = some acc)
+    (hSize : 1 ≤ value.size) :
+    runOps Stack.Ec.emitReverse32Step s
+      = .ok { s with
+              stack := .vBytes (value.extract 1 value.size)
+                        :: .vBytes (value.extract 0 1 ++ acc) :: rest } := by
+  obtain ⟨stk, alt, out, props, pre⟩ := s
+  subst hStk
+  have niRot : ∀ t e, StackOp.rot ≠ .ifOp t e := by intro t e h; cases h
+  have niSwap : ∀ t e, StackOp.swap ≠ .ifOp t e := by intro t e h; cases h
+  have niOp : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by
+    intro c t e h; cases h
+  have niPush : ∀ (pv : PushVal) t e, StackOp.push pv ≠ .ifOp t e := by
+    intro pv t e h; cases h
+  have stepNonIf_rot : ∀ (st : StackState), stepNonIf .rot st = applyRot st := by
+    intro st; rfl
+  show runOps
+      ([ StackOp.push (.bigint 1), StackOp.opcode "OP_SPLIT", StackOp.rot,
+         StackOp.rot, StackOp.swap, StackOp.opcode "OP_CAT", StackOp.swap ])
+      { stack := .vBytes value :: accV :: rest, altstack := alt,
+        outputs := out, props := props, preimage := pre } = _
+  -- Step 1: push 1.
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint 1)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- Step 2: OP_SPLIT at index 1.  Guard discharged by hSize.
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_SPLIT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_SPLIT"
+        { stack := .vBigint 1 :: .vBytes value :: accV :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (value.extract 1 value.size)
+                          :: .vBytes (value.extract 0 1) :: accV :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } by
+      unfold runOpcode
+      simp only [popN, StackState.pop?, asBytes?, asNonNegativeNat?, asInt?,
+                 StackState.push, Int.reduceLT, reduceIte, Int.toNat_one]
+      rw [if_neg (by omega : ¬ (1 : Nat) > value.size)] ]
+  simp only [match_Except_ok_runOps]
+  -- Step 3: rot.
+  rw [runOps_cons_nonIf_eq _ _ _ niRot, stepNonIf_rot]
+  rw [show applyRot
+        { stack := .vBytes (value.extract 1 value.size) :: .vBytes (value.extract 0 1)
+                    :: accV :: rest, altstack := alt, outputs := out,
+          props := props, preimage := pre }
+        = .ok { stack := accV :: .vBytes (value.extract 1 value.size)
+                          :: .vBytes (value.extract 0 1) :: rest, altstack := alt,
+                outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- Step 4: rot.
+  rw [runOps_cons_nonIf_eq _ _ _ niRot, stepNonIf_rot]
+  rw [show applyRot
+        { stack := accV :: .vBytes (value.extract 1 value.size)
+                    :: .vBytes (value.extract 0 1) :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (value.extract 0 1) :: accV
+                          :: .vBytes (value.extract 1 value.size) :: rest, altstack := alt,
+                outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- Step 5: swap.
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBytes (value.extract 0 1) :: accV
+                    :: .vBytes (value.extract 1 value.size) :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := accV :: .vBytes (value.extract 0 1)
+                          :: .vBytes (value.extract 1 value.size) :: rest, altstack := alt,
+                outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- Step 6: OP_CAT → extract 0 1 ++ acc.  This is the only arm that inspects the
+  -- accumulator value; the coercion `asBytes? accV = some acc` feeds `liftBytesBin`.
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_CAT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_CAT"
+        { stack := accV :: .vBytes (value.extract 0 1)
+                    :: .vBytes (value.extract 1 value.size) :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (value.extract 0 1 ++ acc)
+                          :: .vBytes (value.extract 1 value.size) :: rest, altstack := alt,
+                outputs := out, props := props, preimage := pre } by
+      unfold runOpcode liftBytesBin
+      simp only [popN, StackState.pop?]
+      rw [hAcc]
+      simp only [asBytes?, StackState.push]]
   simp only [match_Except_ok_runOps]
   -- Step 7: swap → final layout.
   rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
@@ -555,14 +654,110 @@ theorem smoke_reverse32_loop_succeeds :
         (ByteArray.mk #[99]) [] rfl (by decide)]
   rfl
 
-/-- BLOCK WITNESS (deliverable 3 honest block).  The production `emitReverse32Ops`
-wrapper (which initializes the accumulator with `.opcode "OP_0"` → `vBigint 0`)
-ERRORS under the current Stack VM: the first loop step's `OP_CAT` rejects the
-non-bytes accumulator.  This is the precise sub-goal that blocks lifting the loop
-transport to `emitReverse32Ops` (and thus to `ecPointX/Y`, `ecMakePoint`,
-`ecNegate`, `ecOnCurve`, `ecAdd`). -/
-theorem smoke_reverse32_ops_blocked_on_OP_0 :
-    (runOps Stack.Ec.emitReverse32Ops smokeRevStk).toOption.isSome = false := by
+/-! ### The `emitReverse32Ops` wrapper transport (UNBLOCKED by the faithful `asBytes?`)
+
+`emitReverse32Ops = [OP_0, swap] ++ emitReverse32Loop 32 ++ [drop]`.  Wave-72 BLOCKED
+here because `OP_0` pushes `vBigint 0` and the first loop step's `OP_CAT` rejected the
+non-`vBytes` accumulator.  With the Bitcoin-faithful `asBytes? (vBigint 0) = some empty`
+(the number 0 IS the empty byte vector; `OP_CAT(empty, x) = x`) the wrapper now RUNS:
+* `OP_0` seeds `vBigint 0`, `swap` puts it under the value;
+* the FIRST loop step runs via `reverse32_step_transport_accV` (accumulator `vBigint 0`,
+  byte view `empty`), turning the accumulator into `.vBytes (value.extract 0 1 ++ empty)`;
+* the remaining 31 steps run via `reverse32_loop_transport`;
+* `drop` removes the empty value residue, leaving `.vBytes (reverseAcc 32 value empty)`
+  — the byte-reversed `value`.  This is the substrate the 5 medium EC ops consume. -/
+theorem reverse32_ops_transport
+    (s : StackState) (value : ByteArray) (rest : List Value)
+    (hStk : s.stack = .vBytes value :: rest)
+    (hSize : 32 ≤ value.size) :
+    runOps Stack.Ec.emitReverse32Ops s
+      = .ok { s with stack := .vBytes (reverseAcc 32 value ByteArray.empty) :: rest } := by
+  have niSwap : ∀ t e, StackOp.swap ≠ .ifOp t e := by intro t e h; cases h
+  have niDrop : ∀ t e, StackOp.drop ≠ .ifOp t e := by intro t e h; cases h
+  have niOp : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by
+    intro c t e h; cases h
+  -- emitReverse32Ops = [OP_0, swap] ++ (emitReverse32Loop 32 ++ [drop]).
+  have hUnfold : Stack.Ec.emitReverse32Ops
+      = StackOp.opcode "OP_0" :: StackOp.swap
+          :: (Stack.Ec.emitReverse32Loop 32 ++ [StackOp.drop]) := rfl
+  rw [hUnfold]
+  -- Step A: OP_0 pushes vBigint 0.
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_0"), stepNonIf_opcode]
+  rw [show runOpcode "OP_0" s = .ok (s.push (.vBigint 0)) from rfl]
+  simp only [match_Except_ok_runOps]
+  -- Step B: swap → [value, vBigint 0] ++ rest.
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  obtain ⟨stk, alt, out, props, pre⟩ := s
+  simp only [StackState.push] at hStk ⊢
+  subst hStk
+  rw [show applySwap
+        { stack := .vBigint 0 :: .vBytes value :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes value :: .vBigint 0 :: rest, altstack := alt,
+                outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- The loop+drop on [value, vBigint 0].  Split the loop's first step out.
+  rw [runOps_append]
+  -- emitReverse32Loop 32 = emitReverse32Step ++ emitReverse32Loop 31.
+  have hLoop : Stack.Ec.emitReverse32Loop 32
+      = Stack.Ec.emitReverse32Step ++ Stack.Ec.emitReverse32Loop 31 := rfl
+  rw [hLoop, runOps_append]
+  -- First step against the vBigint-0 accumulator (byte view = empty).
+  rw [reverse32_step_transport_accV
+        { stack := .vBytes value :: .vBigint 0 :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        value ByteArray.empty (.vBigint 0) rest rfl asBytes?_vBigint_zero (by omega)]
+  simp only [match_Except_ok_runOps]
+  -- Remaining 31 steps via the bytes-accumulator loop transport.
+  have hTailSize : (value.extract 1 value.size).size = value.size - 1 := by
+    rw [ByteArray.size_extract]; omega
+  rw [reverse32_loop_transport 31
+        { stack := .vBytes (value.extract 1 value.size)
+                    :: .vBytes (value.extract 0 1 ++ ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        (value.extract 1 value.size) (value.extract 0 1 ++ ByteArray.empty) rest rfl
+        (by rw [hTailSize]; omega)]
+  simp only [match_Except_ok_runOps]
+  -- drop removes the residue (reverseTail 32 value).
+  rw [runOps_cons_nonIf_eq _ _ _ niDrop, stepNonIf_drop]
+  rw [show applyDrop
+        { stack := .vBytes (reverseTail 31 (value.extract 1 value.size))
+                    :: .vBytes (reverseAcc 31 (value.extract 1 value.size)
+                                  (value.extract 0 1 ++ ByteArray.empty)) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (reverseAcc 31 (value.extract 1 value.size)
+                                    (value.extract 0 1 ++ ByteArray.empty)) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps, runOps_nil]
+  -- reverseAcc 32 value empty = reverseAcc 31 (extract 1..) (extract 0 1 ++ empty)
+  -- by one unfold of reverseAcc.
+  rfl
+
+/-- SMOKE (the headline — UNBLOCKED).  On a concrete 32-byte input the full
+production `emitReverse32Ops` wrapper now SUCCEEDS (was BLOCKED in wave 72) and
+lands the byte-reversed value.  The reversed bytes match the closed-form
+`reverseAcc` spec, confirmed by `native_decide`.  `OP_0`'s `vBigint 0` is now
+consumed by `OP_CAT` exactly as the empty byte vector on a real Script stack. -/
+private def smokeRev32Val : ByteArray :=
+  ByteArray.mk #[ 1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,
+                 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+
+private def smokeRev32Stk : StackState :=
+  { (default : StackState) with stack := [.vBytes smokeRev32Val] }
+
+theorem smoke_reverse32_ops_succeeds :
+    runOps Stack.Ec.emitReverse32Ops smokeRev32Stk
+      = .ok { smokeRev32Stk with
+              stack := [.vBytes (reverseAcc 32 smokeRev32Val ByteArray.empty)] } :=
+  reverse32_ops_transport smokeRev32Stk smokeRev32Val [] rfl (by decide)
+
+/-- SMOKE (anti-vacuity).  The reversed accumulator really is `value` byte-reversed:
+`[32, 31, …, 2, 1]`.  `reverseAcc` is a closed-form computable `ByteArray` function,
+so `native_decide` legitimately runs it. -/
+theorem smoke_reverse32_ops_value_concrete :
+    (reverseAcc 32 smokeRev32Val ByteArray.empty).toList
+      = [32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
+         16, 15, 14, 13, 12, 11, 10,  9,  8,  7,  6,  5,  4,  3,  2,  1] := by
   native_decide
 
 /-! ## Part 6 — DISCHARGED `Crypto/Spec.lean §7` axioms (this wave)
