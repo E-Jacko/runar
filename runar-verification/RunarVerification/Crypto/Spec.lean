@@ -652,13 +652,12 @@ and the output is `vBytes (Crypto.ecAdd pa pb) :: rest`.
 
 ### TCB impact
 
-This section carries **5** axioms (one per still-axiomatized emit builder):
+This section carries **4** axioms (one per still-axiomatized emit builder):
 
 * `emitEcAdd_runOps_eq`
 * `emitEcMul_runOps_eq`
 * `emitEcMulGen_runOps_eq`
 * `emitEcNegate_runOps_eq`
-* `emitEcOnCurve_runOps_eq`
 
 **Discharged** (moved to theorems in `Stack/AgreesEC.lean`, no longer axioms):
 
@@ -674,20 +673,20 @@ This section carries **5** axioms (one per still-axiomatized emit builder):
 * `emitEcMakePoint_runOps_eq` — `Stack.AgreesEC.emitEcMakePoint_runOps_eq`
   (two `num2binEncode? · 33` hypotheses + size guards + the BE-encoding bridges
   `hBeX`/`hBeY`).
+* `emitEcOnCurve_runOps_eq` — `Stack.AgreesEC.emitEcOnCurve_runOps_eq`
+  (split-range `64 ≤ pt.size` + the two canonical-decode bridges `hDecX`/`hDecY`).
+  The whole-program discharge: op-list-equals-determined-concatenation
+  (`emitEcOnCurve_ops`, folding the codegen `findDepth`s via the wave-77 bridge) +
+  runtime threading through the tail-general `TrackerSim` per-field-helper composed
+  sims off the `decomposePoint_runOps` base.
 
-**Still axiomatized** — `emitEcNegate_runOps_eq` and `emitEcOnCurve_runOps_eq`
-remain axioms, but the wave-76 kernel BLOCKER is now cleared.  Wave-77 (a) refactored
-`Stack/Ec.lean`'s `Tracker.findDepth` from the `Id.run … while …` (`Lean.Loop.forIn`,
-unreducible) form to a kernel-reducible structural fold — OUTPUT-PRESERVING (the EC
-conformance goldens recompile byte-exact) — (b) proved the bridge
-`Tracker.findDepth t name = findDepthList name t.nm.toList.reverse`
-(`Stack.AgreesEC.findDepth_eq_findDepthList`, structural induction, NOT
-`native_decide`), and (c) landed the per-helper transports
-(`fieldModOps_transport`, `field{Add,Sub,Mul}_optail_transport`,
-`applyPickStruct_findDepth_sim`).  What remains for the per-op discharge is the
-whole-program assembly: per-helper ops-append lemmas + `toTop`/`copyToTop` runtime
-transports threading the `TrackerSim` invariant across the 945- and 518-op chains.
-See the updated BLOCK note in `Stack/AgreesEC.lean` Part 9 for the precise sub-goal.
+**Still axiomatized** — `emitEcNegate_runOps_eq` remains an axiom.  The wave-76 kernel
+BLOCKER is cleared and the full `TrackerSim` whole-program machinery now lands the
+`emitEcOnCurve` discharge.  `emitEcNegate` follows the SAME template (same
+`decomposePoint` base, then `composePoint` instead of the `fieldSqr`/`OP_EQUAL` chain):
+its discharge reuses the Part-12 tail-general `TrackerSim` + the `fieldSub` composed
+sim + a `composePoint` runtime transport (the `decomposePoint` peer for the build-back).
+See `Stack/AgreesEC.lean` Part 9 / Part 12 for the substrate and the hand-off.
 -/
 
 open RunarVerification.Stack
@@ -728,17 +727,23 @@ axiom emitEcNegate_runOps_eq (stkSt : StackState) (pt : ByteArray)
     runOps Stack.Ec.emitEcNegate stkSt
       = .ok { stkSt with stack := .vBytes (Crypto.ecNegate pt) :: rest }
 
-/-- `Stack.Ec.emitEcOnCurve`: check `y² ≡ x³ + 7 mod p`. Output is a
-bool. The Stack VM models the boolean as a script number (`OP_EQUAL`'s
-result), but we expose it as a `vBool` for downstream proofs since the
-spec axiom returns `Bool`.
+/- `Stack.Ec.emitEcOnCurve`: check `y² ≡ x³ + 7 mod p`. Output is a
+bool (the Stack VM models the boolean as `OP_EQUAL`'s `vBool` result).
 
-Mirrors `emitEcOnCurve` in `ec-codegen.ts:687-703`. -/
-axiom emitEcOnCurve_runOps_eq (stkSt : StackState) (pt : ByteArray)
-    (rest : List Value)
-    (hStk : stkSt.stack = .vBytes pt :: rest) :
-    runOps Stack.Ec.emitEcOnCurve stkSt
-      = .ok { stkSt with stack := .vBool (Crypto.ecOnCurve pt) :: rest }
+**DISCHARGED** (no longer an axiom): proved as a theorem in
+`Stack/AgreesEC.lean` as `RunarVerification.Stack.AgreesEC.emitEcOnCurve_runOps_eq`.
+The codegen op-list is `t.ops.toList` after the 10-step `decomposePoint` →
+`fieldSqr`/`fieldSqr`/`fieldMul`/`fieldAdd` → `OP_EQUAL` Tracker chain; the discharge
+(a) proves the op-list equals a determined concatenation (`emitEcOnCurve_ops`, folding
+the codegen `findDepth`s via the wave-77 bridge), then (b) threads the runtime through
+the tail-general `TrackerSim` per-field-helper composed sims (`fieldSqr_runOps_sim`,
+`fieldSqrX_runOps_sim`, `fieldMul_runOps_sim`, `fieldAdd_runOps_sim`) off the
+`decomposePoint_runOps` base, reducing to `Crypto.Secp256k1.ecOnCurve`'s closed form.
+It carries the SAME INPUT-side wf hypotheses the discharged `emitEcPointX/Y_runOps_eq`
+carry (`64 ≤ pt.size` + the two canonical-decode bridges `hDecX`/`hDecY`), which the
+bare axiom lacked.  `#print axioms` confirms: `propext` / `Classical.choice` /
+`Quot.sound` + the inherited backend opaques only — no `sorryAx`, no `Lean.ofReduceBool`,
+no new axiom.  Mirrors `emitEcOnCurve` in `ec-codegen.ts:687-703`. -/
 
 /- `Stack.Ec.emitEcModReduce`: `((value % mod) + mod) % mod`.
 Stack `[value, mod]` (mod on TOS) → `[result]`. Mirrors

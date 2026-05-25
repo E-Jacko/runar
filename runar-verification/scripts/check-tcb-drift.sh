@@ -20,7 +20,39 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=76        # Breakdown (2026-05-25, Tier 3 EC wave —
+TARGET_AXIOMS=75        # Breakdown (2026-05-25, Tier 3 EC wave —
+                        # emitEcOnCurve codegen-to-spec axiom discharge):
+                        # −1 in Crypto/Spec.lean §7 — `emitEcOnCurve_runOps_eq`
+                        #     RETIRED, moved to a THEOREM in Stack/AgreesEC.lean
+                        #     (Part 12/13). The codegen op-list is `t.ops.toList`
+                        #     after the 10-step `decomposePoint` → `fieldSqr` /
+                        #     `fieldSqr` / `fieldMul` / `fieldAdd` → `OP_EQUAL`
+                        #     Tracker chain. The discharge: (a) `emitEcOnCurve_ops`
+                        #     proves the op-list equals a determined concatenation,
+                        #     folding the codegen `findDepth`s via the wave-77 bridge
+                        #     + the per-helper ops-append leaves; (b) the runtime
+                        #     threads through the NEW tail-general `TrackerSim`
+                        #     (`TrackerSimT`) per-field-helper composed sims
+                        #     (`fieldSqr_runOps_sim` / `fieldSqrX_runOps_sim` /
+                        #     `fieldMul_runOps_sim` / `fieldAdd_runOps_sim`) off the
+                        #     wave-80 `decomposePoint_runOps` base + the final
+                        #     `opEqual_int_transport`, reducing to
+                        #     `Crypto.Secp256k1.ecOnCurve`'s closed form. Carries the
+                        #     SAME INPUT-side wf hyps as `emitEcPointX/Y` (`64 ≤
+                        #     pt.size` + the two canonical-decode bridges hDecX/hDecY),
+                        #     witnessed by `smoke_emitEcOnCurve_wf_satisfiable`.
+                        #     `#print axioms emitEcOnCurve_runOps_eq` = propext /
+                        #     Classical.choice / Quot.sound + the 2 pre-existing crypto
+                        #     backends (authBackend / hashBackend) only — NO sorryAx,
+                        #     NO Lean.ofReduceBool, NO new axiom, NOT depending on the
+                        #     removed axiom. native_decide ONLY in the smokes.
+                        #     STILL AXIOMATIZED: `emitEcNegate_runOps_eq` — same
+                        #     decomposePoint base, then composePoint; reuses the
+                        #     Part-12 TrackerSim + a fieldSub sim + a composePoint
+                        #     transport (next wave).
+                        # Net delta: −1, 76 → 75.
+                        #
+                        # Breakdown (2026-05-25, Tier 3 EC wave —
                         # THREE MORE EC codegen-to-spec axiom discharges):
                         # −3 in Crypto/Spec.lean §7 — the three `reverse32`-routed
                         #     "medium" coordinate ops RETIRED, moved to THEOREMS in

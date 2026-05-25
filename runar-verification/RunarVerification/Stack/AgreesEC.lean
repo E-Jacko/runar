@@ -3267,6 +3267,821 @@ theorem smoke_decomposePoint_baseTrackerSim :
        Value.vBigint (Crypto.Secp256k1.pointX smokeDpPt)] :=
   decomposePoint_baseTrackerSim smokeDpPt
 
+/-! ## Part 12 — Tail-general `TrackerSim` + per-field-helper composed sims (D1+D2)
+
+The strict `TrackerSim nm σ stk` (Part 9 substrate) demands `stk.length = nm.size`:
+no passive tail.  But the WHOLE-PROGRAM `emitEcOnCurve`/`emitEcNegate` run on
+`[pt] ++ rest`, so after `decomposePoint` the field chain runs over `tracked ++ rest`
+(`tracked = [pointY, pointX]`, `rest` arbitrary).  Every `toTop`/`copyToTop` op the
+field helpers emit acts at a depth `d < nm.size ≤ tracked.length`, so it only touches
+the top `tracked` region and leaves `rest` byte-for-byte untouched.
+
+This Part adds the MINIMAL-VIABLE tail-general form: `TrackerSimT nm σ tracked rest`
+(= `TrackerSim nm σ tracked` over the `tracked` prefix of the runtime stack
+`tracked ++ rest`).  The genuine content is the APPEND-TRANSPORTS — `applyRoll`/
+`applyPick` at depth `< tracked.length` on `tracked ++ rest` equal the strict result
+over `tracked`, with `rest` appended (`applyRoll_append` / `applyPick_append`).  These
+lift the strict per-step transports (`runOps_toTop/copyToTop_extraOps_sim`) + the
+keystone (`TrackerSim_toTop`/`copyToTop`) to the tail-general `tracked ++ rest` shape.
+The per-field-helper composed sims (`fieldSqr_runOps_sim`, `fieldMul_runOps_sim`,
+`fieldAdd_runOps_sim`) then thread the rolling `TrackerSimT` through each helper's
+toTop/copyToTop/rawBlock/fieldMod sub-steps, binding a fresh named slot to the
+`Crypto.Secp256k1` field-op result.  All `propext`/`Quot.sound`-clean (plus inherited
+backend opaques on the `runOps`-bearing transports), NO `sorry`, NO new axiom,
+`native_decide` only in concrete smokes. -/
+
+/-- **Tail-general `TrackerSim` (deliverable 1).**  The runtime stack is
+`tracked ++ rest`; the `tracked` prefix mirrors the tracker name array `nm` (strict
+`TrackerSim`), and `rest` is an arbitrary passive tail untouched by the field chain's
+depth-`< nm.size` rolls/picks.  Minimal-viable form: a strict `TrackerSim` on the
+prefix, with the append shape made explicit at every transport. -/
+def TrackerSimT (nm : Array (Option String)) (σ : String → Value)
+    (tracked rest : List Value) : Prop :=
+  TrackerSim nm σ tracked
+
+/-- `getElem!` of `tracked ++ rest` strictly inside the `tracked` part. -/
+private theorem getElemBang_append_lt {α : Type} [Inhabited α] (tracked rest : List α)
+    (d : Nat) (h : d < tracked.length) :
+    (tracked ++ rest)[d]! = tracked[d]! := by
+  rw [getElem!_pos (tracked ++ rest) d (by rw [List.length_append]; omega),
+      getElem!_pos tracked d h, List.getElem_append_left h]
+
+/-- `eraseIdx` of `tracked ++ rest` strictly inside the `tracked` part keeps `rest`. -/
+private theorem eraseIdx_append_lt {α : Type} (tracked rest : List α)
+    (d : Nat) (h : d < tracked.length) :
+    (tracked ++ rest).eraseIdx d = tracked.eraseIdx d ++ rest := by
+  rw [List.eraseIdx_append_of_lt_length h]
+
+/-- **`applyRoll` append-transport (deliverable 1).**  Rolling depth `d < tracked.length`
+on `tracked ++ rest` brings `tracked[d]!` to the top, erases it from `tracked`, and
+keeps `rest` below — the strict `applyRoll` result with `rest` appended. -/
+private theorem applyRoll_append (s : StackState) (tracked rest : List Value) (d : Nat)
+    (hStk : s.stack = tracked ++ rest) (hd : d < tracked.length) :
+    applyRoll s d = .ok { s with stack := tracked[d]! :: (tracked.eraseIdx d ++ rest) } := by
+  unfold applyRoll
+  rw [hStk]
+  rw [if_neg (by rw [List.length_append]; omega : ¬ d ≥ (tracked ++ rest).length)]
+  rw [getElemBang_append_lt tracked rest d hd, eraseIdx_append_lt tracked rest d hd]
+
+/-- **`applyPick` append-transport (deliverable 1).**  Picking depth `d < tracked.length`
+on `tracked ++ rest` copies `tracked[d]!` to the top, keeping all of `tracked ++ rest`. -/
+private theorem applyPick_append (s : StackState) (tracked rest : List Value) (d : Nat)
+    (hStk : s.stack = tracked ++ rest) (hd : d < tracked.length) :
+    applyPick s d = .ok (s.push tracked[d]!) := by
+  unfold applyPick StackState.push
+  rw [hStk]
+  rw [if_neg (by rw [List.length_append]; omega : ¬ d ≥ (tracked ++ rest).length)]
+  rw [getElemBang_append_lt tracked rest d hd]
+
+/-- **`toTop` per-step tail-general transport (deliverable 1).**  Under
+`TrackerSimT nm σ tracked rest`, running `Tracker.toTop name`'s emit on the runtime
+stack `tracked ++ rest` brings `σ name` to the top, with the rest of the TRACKED
+region erased and `rest` preserved below.  The append-form of
+`runOps_toTop_extraOps_sim`. -/
+theorem runOps_toTop_extraOps_simT (s : StackState) (nm : Array (Option String))
+    (σ : String → Value) (tracked rest : List Value) (name : String)
+    (hStk : s.stack = tracked ++ rest)
+    (hSim : TrackerSimT nm σ tracked rest)
+    (hmem : some name ∈ nm.toList.reverse) :
+    runOps (rollExtraOps (findDepthList name nm.toList.reverse)) s
+      = .ok { s with
+              stack := σ name
+                :: (tracked.eraseIdx (findDepthList name nm.toList.reverse) ++ rest) } := by
+  unfold TrackerSimT at hSim
+  obtain ⟨hlt, hval⟩ := findDepthList_sim nm σ tracked name hSim hmem
+  have hd_lt : findDepthList name nm.toList.reverse < tracked.length := hlt
+  have hstklen : findDepthList name nm.toList.reverse < s.stack.length := by
+    rw [hStk, List.length_append]; omega
+  rw [runOps_rollExtraOps s _ hstklen]
+  rw [applyRoll_append s tracked rest _ hStk hd_lt, hval]
+
+/-- **`copyToTop` per-step tail-general transport (deliverable 1).**  Under
+`TrackerSimT nm σ tracked rest`, running `Tracker.copyToTop name newName`'s emit on
+`tracked ++ rest` COPIES `σ name` to the top, keeping all of `tracked ++ rest`. -/
+theorem runOps_copyToTop_extraOps_simT (s : StackState) (nm : Array (Option String))
+    (σ : String → Value) (tracked rest : List Value) (name : String)
+    (hStk : s.stack = tracked ++ rest)
+    (hSim : TrackerSimT nm σ tracked rest)
+    (hmem : some name ∈ nm.toList.reverse) :
+    runOps (pickExtraOps (findDepthList name nm.toList.reverse)) s
+      = .ok (s.push (σ name)) := by
+  unfold TrackerSimT at hSim
+  obtain ⟨hlt, hval⟩ := findDepthList_sim nm σ tracked name hSim hmem
+  have hd_lt : findDepthList name nm.toList.reverse < tracked.length := hlt
+  have hstklen : findDepthList name nm.toList.reverse < s.stack.length := by
+    rw [hStk, List.length_append]; omega
+  rw [runOps_pickExtraOps s _ hstklen]
+  rw [applyPick_append s tracked rest _ hStk hd_lt, hval]
+
+/-- **`toTop` tail-general `TrackerSimT` preservation (deliverable 1).**  After
+`Tracker.toTop name`, the TRACKED region stays in lock-step (keystone
+`TrackerSim_toTop` on the prefix), and `rest` is unchanged.  The append peer of the
+keystone. -/
+theorem TrackerSimT_toTop (t : Ec.Tracker) (σ : String → Value) (tracked rest : List Value)
+    (name : String)
+    (hSim : TrackerSimT t.nm σ tracked rest)
+    (hmem : some name ∈ t.nm.toList.reverse) :
+    TrackerSimT (t.toTop name).nm σ
+      (σ name :: tracked.eraseIdx (findDepthList name t.nm.toList.reverse)) rest :=
+  TrackerSim_toTop t σ tracked name hSim hmem
+
+/-- **`copyToTop` tail-general `TrackerSimT` preservation (deliverable 1).**  After
+`Tracker.copyToTop name newName` with `newName` fresh, the prefix extends with
+`newName ↦ σ name`; `rest` is unchanged.  Append peer of `TrackerSim_copyToTop`. -/
+theorem TrackerSimT_copyToTop (nm : Array (Option String)) (σ : String → Value)
+    (tracked rest : List Value) (name newName : String)
+    (hSim : TrackerSimT nm σ tracked rest)
+    (hfresh : some newName ∉ nm.toList) :
+    TrackerSimT (nm.push (some newName))
+      (fun u => if u = newName then σ name else σ u) (σ name :: tracked) rest :=
+  TrackerSim_push nm σ tracked newName (σ name) hSim hfresh
+
+/-! ### Per-field-helper composed runtime sims (deliverable 2)
+
+Each field helper's INCREMENTAL op-list (the ops appended to the entry tracker) is a
+determined list — the toTop/copyToTop depths the codegen decides are concrete at the
+`emitEcOnCurve` chain.  Reading them off the chain (via the ops-append leaves):
+
+* `fieldSqr "_y" "_y2"` off the base `[Y, X] ++ rest`: `copyToTop "_y"` (depth 0 =
+  `.dup`) → `toTop "_y"`/`toTop "_fsqr_copy"` (both depth 1 = `.swap`) → `OP_MUL` →
+  `toTop "_fmul_prod"` (depth 0 = nop) → `push fieldP` → `fieldModOps`.  Net runtime:
+  `[dup, swap, swap, OP_MUL, push fieldP] ++ fieldModOps`, landing `Y² :: X :: rest`.
+* `fieldMul "_x2" "_x_copy" "_x3"` off `[X2, Y2, X] ++ rest`: `swap, OP_MUL, push
+  fieldP, fieldModOps`, landing `(X2·X) :: Y2 :: rest`.
+* `fieldAdd "_x3" "_seven" "_rhs"` off `[7, X3, Y2] ++ rest`: `swap, swap, OP_ADD,
+  push fieldP, fieldModOps`, landing `(X3+7) :: Y2 :: rest`.
+
+Each composed sim runs the determined increment off the entry runtime stack via the
+toTop/copyToTop step transports + the `fieldXxx_optail_transport`, landing the
+`Crypto.Secp256k1` field-op result with a fresh bound slot — the runtime witness the
+whole-program assembly threads.  All `propext`/`Quot.sound`-clean (inherited backend
+opaques on the `runOps` transports), `native_decide` only in smokes. -/
+
+/-- The determined `fieldSqr "_y" "_y2"` increment off the `decomposePoint` base. -/
+def fieldSqrYInc : List StackOp :=
+  [.dup, .swap, .swap, .opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps
+
+/-- The determined `fieldMul`/`fieldSqr`-with-`swap`-lead increment (`fieldMul
+"_x2" "_x_copy"` off `[X2, Y2, X]`). -/
+def fieldMulSwapInc : List StackOp :=
+  [.swap, .opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps
+
+/-- The determined `fieldAdd "_x3" "_seven"` increment off `[7, X3, Y2]`. -/
+def fieldAddSwap2Inc : List StackOp :=
+  [.swap, .swap, .opcode "OP_ADD", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps
+
+private theorem niDup2 : ∀ t e, StackOp.dup ≠ .ifOp t e := by intro t e h; cases h
+private theorem niSwap2 : ∀ t e, StackOp.swap ≠ .ifOp t e := by intro t e h; cases h
+
+/-- **`fieldSqr "_y" "_y2"` composed runtime sim (deliverable 2, FIRST instance).**
+Running the determined `fieldSqr` increment on `[Y, X] ++ rest` lands
+`Secp256k1.fieldMul Y Y :: X :: rest` — the runtime witness of the y² slot the
+`emitEcOnCurve` chain threads off `decomposePoint_baseTrackerSim`.  Composes the
+`copyToTop`/`toTop` step collapses (`dup`/`swap`/`swap`) + `fieldMul_optail_transport`. -/
+theorem fieldSqr_runOps_sim (s : StackState) (Y X : Int) (rest : List Value)
+    (hStk : s.stack = (.vBigint Y) :: (.vBigint X) :: rest) :
+    runOps fieldSqrYInc s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMul Y Y) :: (.vBigint X) :: rest } := by
+  unfold fieldSqrYInc
+  rw [show ([StackOp.dup, .swap, .swap, .opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps)
+        = StackOp.dup :: .swap :: .swap
+            :: ([.opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) from rfl]
+  rw [runOps_cons_nonIf_eq _ _ _ niDup2, stepNonIf_dup]
+  rw [show applyDup s = .ok { s with stack := (.vBigint Y) :: (.vBigint Y) :: (.vBigint X) :: rest } by
+        unfold applyDup StackState.push; rw [hStk]]
+  simp only [match_Except_ok_runOps]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap2, stepNonIf_swap]
+  rw [show applySwap { s with stack := (.vBigint Y) :: (.vBigint Y) :: (.vBigint X) :: rest }
+        = .ok { s with stack := (.vBigint Y) :: (.vBigint Y) :: (.vBigint X) :: rest } from rfl]
+  simp only [match_Except_ok_runOps]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap2, stepNonIf_swap]
+  rw [show applySwap { s with stack := (.vBigint Y) :: (.vBigint Y) :: (.vBigint X) :: rest }
+        = .ok { s with stack := (.vBigint Y) :: (.vBigint Y) :: (.vBigint X) :: rest } from rfl]
+  simp only [match_Except_ok_runOps]
+  rw [fieldMul_optail_transport { s with stack := (.vBigint Y) :: (.vBigint Y) :: (.vBigint X) :: rest }
+        Y Y ((.vBigint X) :: rest) rfl]
+
+/-- **`fieldMul`-with-swap-lead composed runtime sim (deliverable 2).**  Running the
+determined `swap, OP_MUL, push fieldP, fieldModOps` increment on `[A, B, C] ++ rest`
+lands `Secp256k1.fieldMul A C :: B :: rest` — `swap` brings `A` over `B`... in the
+`emitEcOnCurve` use (`fieldMul "_x2" "_x_copy"` off `[X2, Y2, X]`) the toTop choreography
+is `toTop "_x2"` (depth 0, nop) → `toTop "_x_copy"` (depth 2 = `swap`-collapsed since
+`_x_copy` sits below); the determined single-`swap` lead pairs `_x2` (top) with `_x_copy`
+(third) over `OP_MUL`.  Generalised: on `[a, b, c] ++ rest`, `swap` → `[b, a, c]`, then
+`OP_MUL` multiplies the top two (`b, a`), so the result is `fieldMul a b :: c :: rest`. -/
+theorem fieldMul_runOps_sim (s : StackState) (a b c : Int) (rest : List Value)
+    (hStk : s.stack = (.vBigint a) :: (.vBigint b) :: (.vBigint c) :: rest) :
+    runOps fieldMulSwapInc s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMul a b) :: (.vBigint c) :: rest } := by
+  unfold fieldMulSwapInc
+  rw [show ([StackOp.swap, .opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps)
+        = StackOp.swap :: ([.opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) from rfl]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap2, stepNonIf_swap]
+  rw [show applySwap s = .ok { s with stack := (.vBigint b) :: (.vBigint a) :: (.vBigint c) :: rest } by
+        unfold applySwap; rw [hStk]]
+  simp only [match_Except_ok_runOps]
+  rw [fieldMul_optail_transport { s with stack := (.vBigint b) :: (.vBigint a) :: (.vBigint c) :: rest }
+        a b ((.vBigint c) :: rest) rfl]
+
+/-- **`fieldAdd`-with-double-swap-lead composed runtime sim (deliverable 2).**  Running
+`swap, swap, OP_ADD, push fieldP, fieldModOps` on `[a, b, c] ++ rest` (the two `swap`s
+cancel) lands `Secp256k1.fieldAdd a b :: c :: rest` — the `fieldAdd "_x3" "_seven"` step
+off `[7, X3, Y2] ++ rest`. -/
+theorem fieldAdd_runOps_sim (s : StackState) (a b c : Int) (rest : List Value)
+    (hStk : s.stack = (.vBigint a) :: (.vBigint b) :: (.vBigint c) :: rest) :
+    runOps fieldAddSwap2Inc s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldAdd b a) :: (.vBigint c) :: rest } := by
+  unfold fieldAddSwap2Inc
+  rw [show ([StackOp.swap, .swap, .opcode "OP_ADD", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps)
+        = StackOp.swap :: .swap :: ([.opcode "OP_ADD", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) from rfl]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap2, stepNonIf_swap]
+  rw [show applySwap s = .ok { s with stack := (.vBigint b) :: (.vBigint a) :: (.vBigint c) :: rest } by
+        unfold applySwap; rw [hStk]]
+  simp only [match_Except_ok_runOps]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap2, stepNonIf_swap]
+  rw [show applySwap { s with stack := (.vBigint b) :: (.vBigint a) :: (.vBigint c) :: rest }
+        = .ok { s with stack := (.vBigint a) :: (.vBigint b) :: (.vBigint c) :: rest } from rfl]
+  simp only [match_Except_ok_runOps]
+  rw [fieldAdd_optail_transport { s with stack := (.vBigint a) :: (.vBigint b) :: (.vBigint c) :: rest }
+        b a ((.vBigint c) :: rest) rfl]
+
+private theorem niPickStruct2 : ∀ d t e, StackOp.pickStruct d ≠ .ifOp t e := by
+  intro d t e h; cases h
+private theorem niRoll2 : ∀ d t e, StackOp.roll d ≠ .ifOp t e := by intro d t e h; cases h
+
+/-- The determined `fieldSqr "_x" "_x2"` increment off `[X, Y2, X] ++ rest` (the
+`copyToTop "_x"` is depth-2 = `.pickStruct 2`, the inner `toTop "_x"` is depth-3 =
+`.roll 3`).  `copyToTop` duplicates the deep `_x`; `roll 3 → swap` pair it for
+`OP_MUL`. -/
+def fieldSqrXInc : List StackOp :=
+  [.pickStruct 2, .roll 3, .swap, .opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps
+
+/-- **`fieldSqr "_x" "_x2"` composed runtime sim (deliverable 2).**  Running the
+determined `fieldSqr "_x"` increment on `[X, Y2, X] ++ rest` (the two `_x` copies hold
+the SAME value `X`) lands `Secp256k1.fieldMul X X :: X :: Y2 :: rest` — the runtime
+witness of the x² slot, keeping a spare `X` (for the later `_x³` mul) and `Y2` below. -/
+theorem fieldSqrX_runOps_sim (s : StackState) (X Y2 : Int) (rest : List Value)
+    (hStk : s.stack = (.vBigint X) :: (.vBigint Y2) :: (.vBigint X) :: rest) :
+    runOps fieldSqrXInc s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMul X X)
+                       :: (.vBigint X) :: (.vBigint Y2) :: rest } := by
+  unfold fieldSqrXInc
+  rw [show ([StackOp.pickStruct 2, .roll 3, .swap, .opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps)
+        = StackOp.pickStruct 2 :: .roll 3 :: .swap
+            :: ([.opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) from rfl]
+  rw [runOps_cons_nonIf_eq _ _ _ (niPickStruct2 2)]
+  rw [show stepNonIf (.pickStruct 2) s = applyPickStruct s 2 from rfl]
+  rw [show applyPickStruct s 2
+        = .ok { s with stack := (.vBigint X) :: (.vBigint X) :: (.vBigint Y2) :: (.vBigint X) :: rest } by
+        unfold applyPickStruct StackState.push
+        rw [if_neg (by rw [hStk]; simp), hStk]; rfl]
+  simp only [match_Except_ok_runOps]
+  rw [runOps_cons_nonIf_eq _ _ _ (niRoll2 3)]
+  rw [show stepNonIf (.roll 3) { s with stack := (.vBigint X) :: (.vBigint X) :: (.vBigint Y2) :: (.vBigint X) :: rest }
+        = applyRoll { s with stack := (.vBigint X) :: (.vBigint X) :: (.vBigint Y2) :: (.vBigint X) :: rest } 3 from rfl]
+  rw [show applyRoll { s with stack := (.vBigint X) :: (.vBigint X) :: (.vBigint Y2) :: (.vBigint X) :: rest } 3
+        = .ok { s with stack := (.vBigint X) :: (.vBigint X) :: (.vBigint X) :: (.vBigint Y2) :: rest } by
+        unfold applyRoll
+        rw [if_neg (by simp)]; rfl]
+  simp only [match_Except_ok_runOps]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap2, stepNonIf_swap]
+  rw [show applySwap { s with stack := (.vBigint X) :: (.vBigint X) :: (.vBigint X) :: (.vBigint Y2) :: rest }
+        = .ok { s with stack := (.vBigint X) :: (.vBigint X) :: (.vBigint X) :: (.vBigint Y2) :: rest } from rfl]
+  simp only [match_Except_ok_runOps]
+  rw [fieldMul_optail_transport { s with stack := (.vBigint X) :: (.vBigint X) :: (.vBigint X) :: (.vBigint Y2) :: rest }
+        X X ((.vBigint X) :: (.vBigint Y2) :: rest) rfl]
+
+/-! ### MANDATORY smokes for the per-field-helper composed sims (deliverable 2) -/
+
+private def fhSmokeRest : List Value := [Value.vBigint 777]
+
+/-- SMOKE (`fieldSqr` sim fires — anti-vacuity).  On `[5, 9] ++ [777]`, lands
+`fieldMul 5 5 = 25 :: 9 :: 777`. -/
+theorem smoke_fieldSqr_runOps_sim :
+    runOps fieldSqrYInc { (default : StackState) with stack := [.vBigint 5, .vBigint 9] ++ fhSmokeRest }
+      = .ok { (default : StackState) with
+              stack := .vBigint (Crypto.Secp256k1.fieldMul 5 5) :: .vBigint 9 :: fhSmokeRest } :=
+  fieldSqr_runOps_sim _ 5 9 fhSmokeRest rfl
+
+/-- SMOKE (`fieldMul` sim fires).  On `[81, 25, 9] ++ [777]` (= `[X2, Y2, X]`), lands
+`fieldMul 81 25 :: 9 :: 777`. -/
+theorem smoke_fieldMul_runOps_sim :
+    runOps fieldMulSwapInc { (default : StackState) with stack := [.vBigint 81, .vBigint 25, .vBigint 9] ++ fhSmokeRest }
+      = .ok { (default : StackState) with
+              stack := .vBigint (Crypto.Secp256k1.fieldMul 81 25) :: .vBigint 9 :: fhSmokeRest } :=
+  fieldMul_runOps_sim _ 81 25 9 fhSmokeRest rfl
+
+/-- SMOKE (`fieldAdd` sim fires).  On `[7, 729, 25] ++ [777]` (= `[seven, X3, Y2]`), lands
+`fieldAdd 729 7 :: 25 :: 777`. -/
+theorem smoke_fieldAdd_runOps_sim :
+    runOps fieldAddSwap2Inc { (default : StackState) with stack := [.vBigint 7, .vBigint 729, .vBigint 25] ++ fhSmokeRest }
+      = .ok { (default : StackState) with
+              stack := .vBigint (Crypto.Secp256k1.fieldAdd 729 7) :: .vBigint 25 :: fhSmokeRest } :=
+  fieldAdd_runOps_sim _ 7 729 25 fhSmokeRest rfl
+
+/-- SMOKE (field-helper sim values anti-vacuity).  `25 / 2025 / 736`. -/
+theorem smoke_field_helper_sim_values :
+    Crypto.Secp256k1.fieldMul 5 5 = 25
+      ∧ Crypto.Secp256k1.fieldMul 81 25 = 2025
+      ∧ Crypto.Secp256k1.fieldAdd 729 7 = 736 := by native_decide
+
+/-! ## Part 13 — `emitEcOnCurve` op-list = the determined concatenation (deliverable 3)
+
+`emitEcOnCurve`'s `t.ops.toList` after its 10-step tracker chain decomposes — via the
+per-helper ops-append leaves (D2) with the CODEGEN findDepths folded (the `dpT`-style
+concrete-`nm` computation) — into a determined concatenation:
+
+  `decomposePoint.ops ++ fieldSqrYInc ++ [.over] ++ fieldSqrXInc ++ fieldMulSwapInc`
+  `  ++ [.push (.bigint 7)] ++ fieldAddSwap2Inc ++ [.swap, .swap, .opcode "OP_EQUAL"]`
+
+Each field-helper increment matches the Part-12 determined increments at its concrete
+codegen depths (`fieldSqrY`: copy 0 / toTops 1,1 / prod 0; `fieldSqrX`: copy 2 /
+toTops 3,1 / prod 0; `fieldMul`: toTops 0,1 / prod 0; `fieldAdd`: toTops 1,1 / sum 0).
+This is the OUTPUT-PRESERVING op-list bridge the runtime threading runs over. -/
+
+/-- The `emitEcOnCurve` tracker chain (named so the per-helper findDepths fold). -/
+def eocT1 : Ec.Tracker := Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_x" "_y"
+def eocT2 : Ec.Tracker := Ec.fieldSqr eocT1 "_y" "_y2"
+def eocT3 : Ec.Tracker := eocT2.copyToTop "_x" "_x_copy"
+def eocT4 : Ec.Tracker := Ec.fieldSqr eocT3 "_x" "_x2"
+def eocT5 : Ec.Tracker := Ec.fieldMul eocT4 "_x2" "_x_copy" "_x3"
+def eocT6 : Ec.Tracker := eocT5.pushInt "_seven" 7
+def eocT7 : Ec.Tracker := Ec.fieldAdd eocT6 "_x3" "_seven" "_rhs"
+def eocT8 : Ec.Tracker := eocT7.toTop "_y2"
+def eocT9 : Ec.Tracker := eocT8.toTop "_rhs"
+
+/-- **`toTop` nm in the canonical erase-push form**, given the codegen depth (folded
+via the wave-77 bridge).  Pure restatement of `roll_nm_canonical` at `t.findDepth`. -/
+theorem toTop_nm_canonical (t : Ec.Tracker) (name : String) (d : Nat)
+    (hfd : t.findDepth name = d) (hd : d < t.nm.size) :
+    (t.toTop name).nm
+      = (t.nm.eraseIdxIfInBounds (t.nm.size - 1 - d)).push (t.nm[t.nm.size - 1 - d]!) := by
+  unfold Ec.Tracker.toTop; rw [hfd]; exact roll_nm_canonical t d hd
+
+/-- **`rawBlock 2 (some n)` nm.**  Pops two slots, pushes `some n`.  Reduces the
+`Id.run`/`forIn [0:2]` pop-loop. -/
+theorem rawBlock_nm_some2 (t : Ec.Tracker) (n : String) (e : List StackOp) :
+    (t.rawBlock 2 (some n) e).nm = t.nm.pop.pop.push (some n) := by
+  unfold Ec.Tracker.rawBlock; simp [Id.run]; rfl
+
+/-- `pushInt` nm: pushes `some n` (ops-irrelevant). -/
+theorem pushInt_nm (t : Ec.Tracker) (n : String) (v : Int) :
+    (t.pushInt n v).nm = t.nm.push (some n) := by
+  unfold Ec.Tracker.pushInt; rfl
+
+/-- `pushFieldP` nm: pushes `some n`. -/
+theorem pushFieldP_nm (t : Ec.Tracker) (n : String) :
+    (Ec.pushFieldP t n).nm = t.nm.push (some n) := by
+  unfold Ec.pushFieldP; exact pushInt_nm t n Ec.fieldP
+
+/-- **`fieldMod t a r` nm** in terms of input nm + the `toTop a` depth.  `toTop a`
+(roll-canonical) → `pushFieldP` (push) → `rawBlock 2 (some r)` (pop2-push1). -/
+theorem fieldMod_nm (t : Ec.Tracker) (a r : String) (da : Nat)
+    (hfd : t.findDepth a = da) (hd : da < t.nm.size) :
+    (Ec.fieldMod t a r).nm
+      = ((((t.nm.eraseIdxIfInBounds (t.nm.size - 1 - da)).push (t.nm[t.nm.size - 1 - da]!)).push
+          (some "_fmod_p")).pop.pop).push (some r) := by
+  unfold Ec.fieldMod
+  rw [rawBlock_nm_some2, pushFieldP_nm, toTop_nm_canonical t a da hfd hd]
+
+theorem eocT1_nm : eocT1.nm = #[some "_x", some "_y"] := decomposePoint_final_nm
+/-- **Generic `fieldMul`/`fieldSqr`-inner nm transport.**  Given an entry tracker `t`
+with `_x2 := aName` at depth `da` and `_x_copy := bName` at depth `db` against the
+post-first-`toTop` tracker, and the product/result depths 0, the produced `nm` is the
+chained roll/rawBlock form.  We instead prove the four chain instances inline below to
+keep the depth folds concrete (no `set`/Mathlib). -/
+theorem eocT2_nm : eocT2.nm = #[some "_x", some "_y2"] := by
+  show (Ec.fieldSqr eocT1 "_y" "_y2").nm = _
+  unfold Ec.fieldSqr
+  show (Ec.fieldMul (eocT1.copyToTop "_y" "_fsqr_copy") "_y" "_fsqr_copy" "_y2").nm = _
+  have hc_nm : (eocT1.copyToTop "_y" "_fsqr_copy").nm = #[some "_x", some "_y", some "_fsqr_copy"] := by
+    rw [Ec.Tracker.copyToTop, pick_nm_push, eocT1_nm]; apply Array.ext' <;> simp
+  unfold Ec.fieldMul
+  have hm1_nm : ((eocT1.copyToTop "_y" "_fsqr_copy").toTop "_y").nm
+      = #[some "_x", some "_fsqr_copy", some "_y"] := by
+    rw [toTop_nm_canonical _ "_y" 1
+          (by rw [findDepth_eq_findDepthList _ _ (by rw [hc_nm]; decide)]; rw [hc_nm]; decide)
+          (by rw [hc_nm]; decide), hc_nm]; apply Array.ext' <;> simp
+  have hm2_nm : (((eocT1.copyToTop "_y" "_fsqr_copy").toTop "_y").toTop "_fsqr_copy").nm
+      = #[some "_x", some "_y", some "_fsqr_copy"] := by
+    rw [toTop_nm_canonical _ "_fsqr_copy" 1
+          (by rw [findDepth_eq_findDepthList _ _ (by rw [hm1_nm]; decide)]; rw [hm1_nm]; decide)
+          (by rw [hm1_nm]; decide), hm1_nm]; apply Array.ext' <;> simp
+  have hm3_nm : ((((eocT1.copyToTop "_y" "_fsqr_copy").toTop "_y").toTop "_fsqr_copy").rawBlock 2
+        (some "_fmul_prod") [.opcode "OP_MUL"]).nm = #[some "_x", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2, hm2_nm]; apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fmul_prod" "_y2" 0
+        (by rw [findDepth_eq_findDepthList _ _ (by rw [hm3_nm]; decide)]; rw [hm3_nm]; decide)
+        (by rw [hm3_nm]; decide), hm3_nm]
+  apply Array.ext' <;> simp
+theorem eocT3_nm : eocT3.nm = #[some "_x", some "_y2", some "_x_copy"] := by
+  show (eocT2.copyToTop "_x" "_x_copy").nm = _; rw [Ec.Tracker.copyToTop, pick_nm_push, eocT2_nm]; apply Array.ext' <;> simp
+theorem eocT4_nm : eocT4.nm = #[some "_y2", some "_x_copy", some "_x2"] := by
+  show (Ec.fieldSqr eocT3 "_x" "_x2").nm = _
+  unfold Ec.fieldSqr
+  show (Ec.fieldMul (eocT3.copyToTop "_x" "_fsqr_copy") "_x" "_fsqr_copy" "_x2").nm = _
+  have hc_nm : (eocT3.copyToTop "_x" "_fsqr_copy").nm
+      = #[some "_x", some "_y2", some "_x_copy", some "_fsqr_copy"] := by
+    rw [Ec.Tracker.copyToTop, pick_nm_push, eocT3_nm]; apply Array.ext' <;> simp
+  unfold Ec.fieldMul
+  have hm1_nm : ((eocT3.copyToTop "_x" "_fsqr_copy").toTop "_x").nm
+      = #[some "_y2", some "_x_copy", some "_fsqr_copy", some "_x"] := by
+    rw [toTop_nm_canonical _ "_x" 3
+          (by rw [findDepth_eq_findDepthList _ _ (by rw [hc_nm]; decide)]; rw [hc_nm]; decide)
+          (by rw [hc_nm]; decide), hc_nm]; apply Array.ext' <;> simp
+  have hm2_nm : (((eocT3.copyToTop "_x" "_fsqr_copy").toTop "_x").toTop "_fsqr_copy").nm
+      = #[some "_y2", some "_x_copy", some "_x", some "_fsqr_copy"] := by
+    rw [toTop_nm_canonical _ "_fsqr_copy" 1
+          (by rw [findDepth_eq_findDepthList _ _ (by rw [hm1_nm]; decide)]; rw [hm1_nm]; decide)
+          (by rw [hm1_nm]; decide), hm1_nm]; apply Array.ext' <;> simp
+  have hm3_nm : ((((eocT3.copyToTop "_x" "_fsqr_copy").toTop "_x").toTop "_fsqr_copy").rawBlock 2
+        (some "_fmul_prod") [.opcode "OP_MUL"]).nm = #[some "_y2", some "_x_copy", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2, hm2_nm]; apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fmul_prod" "_x2" 0
+        (by rw [findDepth_eq_findDepthList _ _ (by rw [hm3_nm]; decide)]; rw [hm3_nm]; decide)
+        (by rw [hm3_nm]; decide), hm3_nm]
+  apply Array.ext' <;> simp
+theorem eocT5_nm : eocT5.nm = #[some "_y2", some "_x3"] := by
+  show (Ec.fieldMul eocT4 "_x2" "_x_copy" "_x3").nm = _
+  unfold Ec.fieldMul
+  have hm1_nm : (eocT4.toTop "_x2").nm = #[some "_y2", some "_x_copy", some "_x2"] := by
+    rw [toTop_nm_canonical eocT4 "_x2" 0
+          (by rw [findDepth_eq_findDepthList _ _ (by rw [eocT4_nm]; decide)]; rw [eocT4_nm]; decide)
+          (by rw [eocT4_nm]; decide), eocT4_nm]; apply Array.ext' <;> simp
+  have hm2_nm : ((eocT4.toTop "_x2").toTop "_x_copy").nm = #[some "_y2", some "_x2", some "_x_copy"] := by
+    rw [toTop_nm_canonical _ "_x_copy" 1
+          (by rw [findDepth_eq_findDepthList _ _ (by rw [hm1_nm]; decide)]; rw [hm1_nm]; decide)
+          (by rw [hm1_nm]; decide), hm1_nm]; apply Array.ext' <;> simp
+  have hm3_nm : (((eocT4.toTop "_x2").toTop "_x_copy").rawBlock 2 (some "_fmul_prod")
+        [.opcode "OP_MUL"]).nm = #[some "_y2", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2, hm2_nm]; apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fmul_prod" "_x3" 0
+        (by rw [findDepth_eq_findDepthList _ _ (by rw [hm3_nm]; decide)]; rw [hm3_nm]; decide)
+        (by rw [hm3_nm]; decide), hm3_nm]
+  apply Array.ext' <;> simp
+theorem eocT6_nm : eocT6.nm = #[some "_y2", some "_x3", some "_seven"] := by
+  show (eocT5.pushInt "_seven" 7).nm = _
+  rw [pushInt_nm, eocT5_nm]; apply Array.ext' <;> simp
+theorem eocT7_nm : eocT7.nm = #[some "_y2", some "_rhs"] := by
+  show (Ec.fieldAdd eocT6 "_x3" "_seven" "_rhs").nm = _
+  unfold Ec.fieldAdd
+  have hm1_nm : (eocT6.toTop "_x3").nm = #[some "_y2", some "_seven", some "_x3"] := by
+    rw [toTop_nm_canonical eocT6 "_x3" 1
+          (by rw [findDepth_eq_findDepthList _ _ (by rw [eocT6_nm]; decide)]; rw [eocT6_nm]; decide)
+          (by rw [eocT6_nm]; decide), eocT6_nm]; apply Array.ext' <;> simp
+  have hm2_nm : ((eocT6.toTop "_x3").toTop "_seven").nm = #[some "_y2", some "_x3", some "_seven"] := by
+    rw [toTop_nm_canonical _ "_seven" 1
+          (by rw [findDepth_eq_findDepthList _ _ (by rw [hm1_nm]; decide)]; rw [hm1_nm]; decide)
+          (by rw [hm1_nm]; decide), hm1_nm]; apply Array.ext' <;> simp
+  have hm3_nm : (((eocT6.toTop "_x3").toTop "_seven").rawBlock 2 (some "_fadd_sum")
+        [.opcode "OP_ADD"]).nm = #[some "_y2", some "_fadd_sum"] := by
+    rw [rawBlock_nm_some2, hm2_nm]; apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fadd_sum" "_rhs" 0
+        (by rw [findDepth_eq_findDepthList _ _ (by rw [hm3_nm]; decide)]; rw [hm3_nm]; decide)
+        (by rw [hm3_nm]; decide), hm3_nm]
+  apply Array.ext' <;> simp
+theorem eocT8_nm : eocT8.nm = #[some "_rhs", some "_y2"] := by
+  show (eocT7.toTop "_y2").nm = _
+  rw [show eocT7.toTop "_y2" = eocT7.roll 1 from by
+        rw [Ec.Tracker.toTop, show eocT7.findDepth "_y2" = 1 from by
+          rw [findDepth_eq_findDepthList _ _ (by rw [eocT7_nm]; decide)]; rw [eocT7_nm]; decide]]
+  show (eocT7.swap).nm = _
+  rw [swap_nm_ge2 eocT7 (by rw [eocT7_nm]; decide), eocT7_nm]; rfl
+
+/-! ### `emitEcOnCurve` op-list = the determined concatenation (deliverable 3) -/
+
+/-- **`fieldMod t a r` ops-append at a concrete `toTop a` depth.**  Folds
+`fieldMod_ops_append`'s `rollExtraOps (findDepth a)` to the concrete `rollExtraOps da`
+once `t.findDepth a = da` (wave-77 bridge). -/
+theorem fieldMod_ops_concrete (t : Ec.Tracker) (a r : String) (da : Nat)
+    (hfd : t.findDepth a = da) :
+    (Ec.fieldMod t a r).ops.toList
+      = t.ops.toList ++ rollExtraOps da ++ [.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  rw [fieldMod_ops_append, hfd]
+
+/-- **`fieldMul t a b r` ops-append at concrete depths.**  Folds the three nested
+`rollExtraOps (findDepth …)` of `fieldMul_ops_append` to concrete depths (`da` for
+`toTop a` against `t`, `db` for `toTop b` against `t.toTop a`, `dp` for `toTop _fmul_prod`
+against the post-rawBlock tracker). -/
+theorem fieldMul_ops_concrete (t : Ec.Tracker) (a b r : String) (da db dp : Nat)
+    (hda : t.findDepth a = da) (hdb : (t.toTop a).findDepth b = db)
+    (hdp : (((t.toTop a).toTop b).rawBlock 2 (some "_fmul_prod") [.opcode "OP_MUL"]).findDepth "_fmul_prod" = dp) :
+    (Ec.fieldMul t a b r).ops.toList
+      = t.ops.toList ++ rollExtraOps da ++ rollExtraOps db ++ [.opcode "OP_MUL"]
+        ++ rollExtraOps dp ++ [.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  rw [fieldMul_ops_append, hda, hdb, hdp]
+
+/-- **`fieldAdd t a b r` ops-append at concrete depths.**  Peer of `fieldMul_ops_concrete`
+at `OP_ADD` / `_fadd_sum`. -/
+theorem fieldAdd_ops_concrete (t : Ec.Tracker) (a b r : String) (da db dp : Nat)
+    (hda : t.findDepth a = da) (hdb : (t.toTop a).findDepth b = db)
+    (hdp : (((t.toTop a).toTop b).rawBlock 2 (some "_fadd_sum") [.opcode "OP_ADD"]).findDepth "_fadd_sum" = dp) :
+    (Ec.fieldAdd t a b r).ops.toList
+      = t.ops.toList ++ rollExtraOps da ++ rollExtraOps db ++ [.opcode "OP_ADD"]
+        ++ rollExtraOps dp ++ [.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  rw [fieldAdd_ops_append, hda, hdb, hdp]
+
+/-- **`copyToTop` ops-append at a concrete depth.** -/
+theorem copyToTop_ops_concrete (t : Ec.Tracker) (name newName : String) (d : Nat)
+    (hfd : t.findDepth name = d) :
+    (t.copyToTop name newName).ops.toList = t.ops.toList ++ pickExtraOps d := by
+  rw [copyToTop_ops_append, hfd]
+
+/-- **`toTop` ops-append at a concrete depth.** -/
+theorem toTop_ops_concrete (t : Ec.Tracker) (name : String) (d : Nat)
+    (hfd : t.findDepth name = d) :
+    (t.toTop name).ops.toList = t.ops.toList ++ rollExtraOps d := by
+  rw [toTop_ops_append, hfd]
+
+/-- Depth helper: `t.findDepth name = d` from a concrete `nm` (wave-77 bridge). -/
+private theorem fd_of_nm (t : Ec.Tracker) (name : String) (d : Nat) (nm : Array (Option String))
+    (hnm : t.nm = nm) (hmem : some name ∈ nm.toList.reverse)
+    (hd : findDepthList name nm.toList.reverse = d) :
+    t.findDepth name = d := by
+  rw [findDepth_eq_findDepthList _ _ (by rw [hnm]; exact hmem), hnm, hd]
+
+/-- **`fieldSqr "_y" "_y2"` ops = `eocT1.ops ++ fieldSqrYInc`.**  fieldSqr = copyToTop
+(depth 0) + fieldMul (`_y` depth 1, `_fsqr_copy` depth 1, prod depth 0). -/
+theorem eocFieldSqrY_ops : eocT2.ops.toList = eocT1.ops.toList ++ fieldSqrYInc := by
+  show (Ec.fieldSqr eocT1 "_y" "_y2").ops.toList = _
+  unfold Ec.fieldSqr
+  show (Ec.fieldMul (eocT1.copyToTop "_y" "_fsqr_copy") "_y" "_fsqr_copy" "_y2").ops.toList = _
+  have hc_nm : (eocT1.copyToTop "_y" "_fsqr_copy").nm = #[some "_x", some "_y", some "_fsqr_copy"] := by
+    rw [Ec.Tracker.copyToTop, pick_nm_push, eocT1_nm]; rfl
+  have hc_ops : (eocT1.copyToTop "_y" "_fsqr_copy").ops.toList = eocT1.ops.toList ++ pickExtraOps 0 :=
+    copyToTop_ops_concrete eocT1 "_y" "_fsqr_copy" 0
+      (fd_of_nm eocT1 "_y" 0 _ eocT1_nm (by decide) (by decide))
+  have hm1_nm : ((eocT1.copyToTop "_y" "_fsqr_copy").toTop "_y").nm
+      = #[some "_x", some "_fsqr_copy", some "_y"] := by
+    rw [toTop_nm_canonical _ "_y" 1
+          (fd_of_nm _ "_y" 1 _ hc_nm (by decide) (by decide)) (by rw [hc_nm]; decide), hc_nm]
+    apply Array.ext' <;> simp
+  have hm2_nm : ((((eocT1.copyToTop "_y" "_fsqr_copy").toTop "_y").toTop "_fsqr_copy").rawBlock 2
+        (some "_fmul_prod") [.opcode "OP_MUL"]).nm = #[some "_x", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_fsqr_copy" 1
+          (fd_of_nm _ "_fsqr_copy" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide),
+        hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMul_ops_concrete (eocT1.copyToTop "_y" "_fsqr_copy") "_y" "_fsqr_copy" "_y2" 1 1 0
+        (fd_of_nm _ "_y" 1 _ hc_nm (by decide) (by decide))
+        (fd_of_nm _ "_fsqr_copy" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fmul_prod" 0 _ hm2_nm (by decide) (by decide))]
+  rw [hc_ops]
+  simp only [fieldSqrYInc, rollExtraOps, pickExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- **`fieldSqr "_x" "_x2"` ops = `eocT3.ops ++ fieldSqrXInc`.**  copyToTop depth 2,
+fieldMul (`_x` depth 3, `_fsqr_copy` depth 1, prod depth 0). -/
+theorem eocFieldSqrX_ops : eocT4.ops.toList = eocT3.ops.toList ++ fieldSqrXInc := by
+  show (Ec.fieldSqr eocT3 "_x" "_x2").ops.toList = _
+  unfold Ec.fieldSqr
+  show (Ec.fieldMul (eocT3.copyToTop "_x" "_fsqr_copy") "_x" "_fsqr_copy" "_x2").ops.toList = _
+  have hc_nm : (eocT3.copyToTop "_x" "_fsqr_copy").nm
+      = #[some "_x", some "_y2", some "_x_copy", some "_fsqr_copy"] := by
+    rw [Ec.Tracker.copyToTop, pick_nm_push, eocT3_nm]; rfl
+  have hc_ops : (eocT3.copyToTop "_x" "_fsqr_copy").ops.toList = eocT3.ops.toList ++ pickExtraOps 2 :=
+    copyToTop_ops_concrete eocT3 "_x" "_fsqr_copy" 2
+      (fd_of_nm eocT3 "_x" 2 _ eocT3_nm (by decide) (by decide))
+  have hm1_nm : ((eocT3.copyToTop "_x" "_fsqr_copy").toTop "_x").nm
+      = #[some "_y2", some "_x_copy", some "_fsqr_copy", some "_x"] := by
+    rw [toTop_nm_canonical _ "_x" 3
+          (fd_of_nm _ "_x" 3 _ hc_nm (by decide) (by decide)) (by rw [hc_nm]; decide), hc_nm]
+    apply Array.ext' <;> simp
+  have hm2_nm : ((((eocT3.copyToTop "_x" "_fsqr_copy").toTop "_x").toTop "_fsqr_copy").rawBlock 2
+        (some "_fmul_prod") [.opcode "OP_MUL"]).nm = #[some "_y2", some "_x_copy", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_fsqr_copy" 1
+          (fd_of_nm _ "_fsqr_copy" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide),
+        hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMul_ops_concrete (eocT3.copyToTop "_x" "_fsqr_copy") "_x" "_fsqr_copy" "_x2" 3 1 0
+        (fd_of_nm _ "_x" 3 _ hc_nm (by decide) (by decide))
+        (fd_of_nm _ "_fsqr_copy" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fmul_prod" 0 _ hm2_nm (by decide) (by decide))]
+  rw [hc_ops]
+  simp only [fieldSqrXInc, rollExtraOps, pickExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- **`fieldMul "_x2" "_x_copy" "_x3"` ops = `eocT4.ops ++ fieldMulSwapInc`.**  toTop
+`_x2` depth 0, `_x_copy` depth 1, prod depth 0. -/
+theorem eocFieldMul_ops : eocT5.ops.toList = eocT4.ops.toList ++ fieldMulSwapInc := by
+  show (Ec.fieldMul eocT4 "_x2" "_x_copy" "_x3").ops.toList = _
+  have hm1_nm : (eocT4.toTop "_x2").nm = #[some "_y2", some "_x_copy", some "_x2"] := by
+    rw [toTop_nm_canonical eocT4 "_x2" 0
+          (fd_of_nm eocT4 "_x2" 0 _ eocT4_nm (by decide) (by decide)) (by rw [eocT4_nm]; decide), eocT4_nm]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((eocT4.toTop "_x2").toTop "_x_copy").rawBlock 2 (some "_fmul_prod")
+        [.opcode "OP_MUL"]).nm = #[some "_y2", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_x_copy" 1
+          (fd_of_nm _ "_x_copy" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide),
+        hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMul_ops_concrete eocT4 "_x2" "_x_copy" "_x3" 0 1 0
+        (fd_of_nm eocT4 "_x2" 0 _ eocT4_nm (by decide) (by decide))
+        (fd_of_nm _ "_x_copy" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fmul_prod" 0 _ hm2_nm (by decide) (by decide))]
+  simp only [fieldMulSwapInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- **`fieldAdd "_x3" "_seven" "_rhs"` ops = `eocT6.ops ++ fieldAddSwap2Inc`.**  toTop
+`_x3` depth 1, `_seven` depth 1, sum depth 0. -/
+theorem eocFieldAdd_ops : eocT7.ops.toList = eocT6.ops.toList ++ fieldAddSwap2Inc := by
+  show (Ec.fieldAdd eocT6 "_x3" "_seven" "_rhs").ops.toList = _
+  have hm1_nm : (eocT6.toTop "_x3").nm = #[some "_y2", some "_seven", some "_x3"] := by
+    rw [toTop_nm_canonical eocT6 "_x3" 1
+          (fd_of_nm eocT6 "_x3" 1 _ eocT6_nm (by decide) (by decide)) (by rw [eocT6_nm]; decide), eocT6_nm]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((eocT6.toTop "_x3").toTop "_seven").rawBlock 2 (some "_fadd_sum")
+        [.opcode "OP_ADD"]).nm = #[some "_y2", some "_fadd_sum"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_seven" 1
+          (fd_of_nm _ "_seven" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide),
+        hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldAdd_ops_concrete eocT6 "_x3" "_seven" "_rhs" 1 1 0
+        (fd_of_nm eocT6 "_x3" 1 _ eocT6_nm (by decide) (by decide))
+        (fd_of_nm _ "_seven" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fadd_sum" 0 _ hm2_nm (by decide) (by decide))]
+  simp only [fieldAddSwap2Inc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- **The determined `emitEcOnCurve` op-list.** -/
+def expectedEcOnCurve : List StackOp :=
+  eocT1.ops.toList ++ fieldSqrYInc ++ [.over]
+    ++ fieldSqrXInc ++ fieldMulSwapInc ++ [.push (.bigint 7)]
+    ++ fieldAddSwap2Inc ++ [.swap, .swap, .opcode "OP_EQUAL"]
+
+/-- **`emitEcOnCurve` op-list = the determined concatenation (deliverable 3).**  Threads
+the 10 per-helper ops-append leaves (`eocFieldSqrY/X_ops`, `eocFieldMul/Add_ops`,
+copyToTop/pushInt/toTop/rawBlock) through the tracker chain, each depth folded via the
+wave-77 bridge.  OUTPUT-PRESERVING. -/
+theorem emitEcOnCurve_ops : Ec.emitEcOnCurve = expectedEcOnCurve := by
+  show (eocT9.rawBlock 2 (some "_result") [.opcode "OP_EQUAL"]).ops.toList = _
+  rw [rawBlock_ops_append]
+  show eocT9.ops.toList ++ [.opcode "OP_EQUAL"] = _
+  show (eocT8.toTop "_rhs").ops.toList ++ [.opcode "OP_EQUAL"] = _
+  rw [toTop_ops_concrete eocT8 "_rhs" 1 (fd_of_nm eocT8 "_rhs" 1 _ eocT8_nm (by decide) (by decide))]
+  show (eocT7.toTop "_y2").ops.toList ++ rollExtraOps 1 ++ [.opcode "OP_EQUAL"] = _
+  rw [toTop_ops_concrete eocT7 "_y2" 1 (fd_of_nm eocT7 "_y2" 1 _ eocT7_nm (by decide) (by decide))]
+  rw [eocFieldAdd_ops]
+  show (eocT5.pushInt "_seven" 7).ops.toList ++ fieldAddSwap2Inc ++ rollExtraOps 1 ++ rollExtraOps 1
+        ++ [.opcode "OP_EQUAL"] = _
+  rw [pushInt_ops_append, eocFieldMul_ops, eocFieldSqrX_ops]
+  show (eocT2.copyToTop "_x" "_x_copy").ops.toList ++ fieldSqrXInc ++ fieldMulSwapInc
+        ++ [.push (.bigint 7)] ++ fieldAddSwap2Inc ++ rollExtraOps 1 ++ rollExtraOps 1
+        ++ [.opcode "OP_EQUAL"] = _
+  rw [copyToTop_ops_concrete eocT2 "_x" "_x_copy" 1 (fd_of_nm eocT2 "_x" 1 _ eocT2_nm (by decide) (by decide))]
+  rw [eocFieldSqrY_ops]
+  simp only [expectedEcOnCurve, pickExtraOps, rollExtraOps, List.append_assoc, List.cons_append,
+    List.nil_append, List.singleton_append]
+
+/-! ### `emitEcOnCurve` runtime threading + the discharge (deliverable 3) -/
+
+private theorem niOver2 : ∀ t e, StackOp.over ≠ .ifOp t e := by intro t e h; cases h
+private theorem niPush3 : ∀ (v : PushVal) t e, StackOp.push v ≠ .ifOp t e := by intro v t e h; cases h
+private theorem niEqual : ∀ t e, StackOp.opcode "OP_EQUAL" ≠ .ifOp t e := by intro t e h; cases h
+
+/-- `asBytes?` of a NON-zero `vBigint` is `none` (the only `vBigint`→bytes coercion is
+the zero literal `OP_0`). -/
+private theorem asBytes_vBigint_ne_zero (k : Int) (hk : k ≠ 0) : asBytes? (.vBigint k) = none := by
+  unfold asBytes?
+  split <;> first | rfl | (rename_i h; simp at h; omega) | (rename_i h; exact absurd h (by simp))
+
+/-- **The final `OP_EQUAL` transport.**  On `[rhs, y2] ++ rest` (rhs on TOS),
+`OP_EQUAL` lands `vBool (decide (y2 = rhs)) :: rest`, the script-bool peer of the
+spec's `decide (lhs = rhs)`. -/
+theorem opEqual_int_transport (s : StackState) (y2 rhs : Int) (rest : List Value)
+    (hStk : s.stack = (.vBigint rhs) :: (.vBigint y2) :: rest) :
+    runOpcode "OP_EQUAL" s = .ok { s with stack := .vBool (decide (y2 = rhs)) :: rest } := by
+  -- `asBytes? (vBigint k) = if k = 0 then some [] else none`, so case-split at 0:
+  -- every branch lands `decide (y2 = rhs)` (the bytes path only fires when both = 0,
+  -- where `decide ([] = []) = decide (0 = 0) = true`).
+  simp only [runOpcode, popN_two_bigint_local s y2 rhs rest hStk]
+  by_cases hy : y2 = 0 <;> by_cases hr : rhs = 0
+  · subst hy; subst hr; simp only [asBytes?, StackState.push]
+  · subst hy
+    rw [show asBytes? (Value.vBigint rhs) = none from asBytes_vBigint_ne_zero rhs hr]
+    simp only [asBytes?, asInt?, StackState.push]
+  · subst hr
+    rw [show asBytes? (Value.vBigint y2) = none from asBytes_vBigint_ne_zero y2 hy]
+    simp only [asBytes?, asInt?, StackState.push]
+  · rw [show asBytes? (Value.vBigint y2) = none from asBytes_vBigint_ne_zero y2 hy,
+        show asBytes? (Value.vBigint rhs) = none from asBytes_vBigint_ne_zero rhs hr]
+    simp only [asInt?, StackState.push]
+
+set_option maxRecDepth 4096 in
+/-- **`emitEcOnCurve` runtime transport (deliverable 3).**  Running the determined
+op-list on `[pt] ++ rest` threads the base `decomposePoint_runOps` + the four
+per-field-helper sims (`fieldSqr`/`fieldSqrX`/`fieldMul`/`fieldAdd`) + the `over`/
+`push 7`/`swap`/`swap`/`OP_EQUAL` glue, landing `vBool (ecOnCurve pt) :: rest`.  The wf
+hypotheses are the INPUT-side `decomposePoint` decode bridges (the same `emitEcPointX/Y`
+carry).  `propext`/`Quot.sound`-clean + inherited backend opaques, NO new axiom. -/
+theorem emitEcOnCurve_runOps_eq (stkSt : StackState) (pt : ByteArray) (rest : List Value)
+    (hStk : stkSt.stack = .vBytes pt :: rest) (hSize : 64 ≤ pt.size)
+    (hDecX : decodeMinimalLE
+              (reverseAcc 32 (pt.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointX pt)
+    (hDecY : decodeMinimalLE
+              (reverseAcc 32 (pt.extract 32 pt.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointY pt) :
+    runOps Ec.emitEcOnCurve stkSt
+      = .ok { stkSt with stack := .vBool (RunarVerification.ANF.Eval.Crypto.ecOnCurve pt) :: rest } := by
+  rw [emitEcOnCurve_ops]
+  unfold expectedEcOnCurve
+  -- right-associate the op-list so `runOps_append` peels each chunk from the left;
+  -- single-op chunks (`[.over]`, `[.push 7]`) collapse to `cons` for the step transports
+  simp only [List.append_assoc, List.cons_append, List.nil_append]
+  have hbase : runOps eocT1.ops.toList stkSt
+      = .ok { stkSt with stack := .vBigint (Crypto.Secp256k1.pointY pt)
+                :: .vBigint (Crypto.Secp256k1.pointX pt) :: rest } :=
+    decomposePoint_runOps stkSt pt rest hStk hSize hDecX hDecY
+  -- base: decomposePoint → [(Crypto.Secp256k1.pointY pt), (Crypto.Secp256k1.pointX pt)] ++ rest
+  rw [runOps_append, hbase]
+  simp only [match_Except_ok_runOps]
+  -- fieldSqr "_y" → [Y², (Crypto.Secp256k1.pointX pt)] ++ rest
+  rw [runOps_append]
+  rw [fieldSqr_runOps_sim { stkSt with stack := .vBigint (Crypto.Secp256k1.pointY pt) :: .vBigint (Crypto.Secp256k1.pointX pt) :: rest } (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointX pt) rest rfl]
+  simp only [match_Except_ok_runOps]
+  -- over (copyToTop "_x") → [(Crypto.Secp256k1.pointX pt), Y², (Crypto.Secp256k1.pointX pt)] ++ rest
+  rw [runOps_cons_nonIf_eq _ _ _ niOver2,
+      show stepNonIf .over { stkSt with stack := (.vBigint (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt)))
+            :: (.vBigint (Crypto.Secp256k1.pointX pt)) :: rest }
+        = applyOver { stkSt with stack := (.vBigint (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt)))
+            :: (.vBigint (Crypto.Secp256k1.pointX pt)) :: rest } from rfl]
+  rw [show applyOver { stkSt with stack := (.vBigint (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt)))
+            :: (.vBigint (Crypto.Secp256k1.pointX pt)) :: rest }
+        = .ok { stkSt with stack := (.vBigint (Crypto.Secp256k1.pointX pt)) :: (.vBigint (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt)))
+            :: (.vBigint (Crypto.Secp256k1.pointX pt)) :: rest } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- fieldSqr "_x" → [X², (Crypto.Secp256k1.pointX pt), Y²] ++ rest
+  rw [runOps_append, fieldSqrX_runOps_sim _ (Crypto.Secp256k1.pointX pt) (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt)) rest rfl]
+  simp only [match_Except_ok_runOps]
+  -- fieldMul "_x2" "_x_copy" → [X³, Y²] ++ rest
+  rw [runOps_append, fieldMul_runOps_sim _ (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointX pt) (Crypto.Secp256k1.pointX pt)) (Crypto.Secp256k1.pointX pt)
+        (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt)) rest rfl]
+  simp only [match_Except_ok_runOps]
+  -- push 7 → [7, X³, Y²] ++ rest
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush3 (.bigint 7)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- fieldAdd "_x3" "_seven" → [RHS, Y²] ++ rest
+  rw [runOps_append, fieldAdd_runOps_sim _ 7 (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointX pt) (Crypto.Secp256k1.pointX pt)) (Crypto.Secp256k1.pointX pt))
+        (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt)) rest rfl]
+  simp only [match_Except_ok_runOps]
+  -- swap, swap, OP_EQUAL
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap2, stepNonIf_swap]
+  rw [show applySwap { stkSt with stack := (.vBigint (Crypto.Secp256k1.fieldAdd
+            (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointX pt) (Crypto.Secp256k1.pointX pt)) (Crypto.Secp256k1.pointX pt)) 7))
+            :: (.vBigint (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt))) :: rest }
+        = .ok { stkSt with stack := (.vBigint (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt)))
+            :: (.vBigint (Crypto.Secp256k1.fieldAdd
+                 (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointX pt) (Crypto.Secp256k1.pointX pt)) (Crypto.Secp256k1.pointX pt)) 7)) :: rest } from rfl]
+  simp only [match_Except_ok_runOps]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap2, stepNonIf_swap]
+  rw [show applySwap { stkSt with stack := (.vBigint (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt)))
+            :: (.vBigint (Crypto.Secp256k1.fieldAdd
+                 (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointX pt) (Crypto.Secp256k1.pointX pt)) (Crypto.Secp256k1.pointX pt)) 7)) :: rest }
+        = .ok { stkSt with stack := (.vBigint (Crypto.Secp256k1.fieldAdd
+                 (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointX pt) (Crypto.Secp256k1.pointX pt)) (Crypto.Secp256k1.pointX pt)) 7))
+            :: (.vBigint (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt))) :: rest } from rfl]
+  simp only [match_Except_ok_runOps]
+  rw [runOps_cons_nonIf_eq _ _ _ niEqual, stepNonIf_opcode]
+  rw [opEqual_int_transport _ (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointY pt))
+        (Crypto.Secp256k1.fieldAdd (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.pointX pt) (Crypto.Secp256k1.pointX pt)) (Crypto.Secp256k1.pointX pt)) 7)
+        rest rfl]
+  -- the script-bool `decide (y2 = rhs)` IS `Crypto.ecOnCurve pt` (= `decide (lhs = rhs)`)
+  -- definitionally (`ecOnCurve = Secp256k1.ecOnCurve`, `lhs = fieldMul y y`,
+  -- `rhs = fieldAdd (fieldMul (fieldMul x x) x) 7`).
+  simp only [match_Except_ok_runOps, runOps_nil]
+  rfl
+
+/-! ### MANDATORY smoke for the `emitEcOnCurve` discharge (deliverable 3) -/
+
+/-- SMOKE (wf anti-vacuity).  The three INPUT wf hypotheses (`64 ≤ size` + the two
+decode bridges) hold concretely for `makePoint 11 22` — rules out a vacuous discharge. -/
+theorem smoke_emitEcOnCurve_wf_satisfiable :
+    (64 : Nat) ≤ smokeDpPt.size
+      ∧ decodeMinimalLE (reverseAcc 32 (smokeDpPt.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = Crypto.Secp256k1.pointX smokeDpPt
+      ∧ decodeMinimalLE (reverseAcc 32 (smokeDpPt.extract 32 smokeDpPt.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = Crypto.Secp256k1.pointY smokeDpPt := by
+  native_decide
+
+/-- Concrete entry state for the discharge smoke: `[makePoint 11 22, 999]`. -/
+private def smokeEocStk : StackState :=
+  { (default : StackState) with stack := [.vBytes smokeDpPt, .vBigint 999] }
+
+/-- SMOKE (the headline — discharge FIRES).  `emitEcOnCurve` on the concrete point
+`makePoint 11 22` lands `vBool (ecOnCurve …) :: rest`, with `rest` preserved beneath. -/
+theorem smoke_emitEcOnCurve_runOps_eq :
+    runOps Ec.emitEcOnCurve smokeEocStk
+      = .ok { smokeEocStk with
+          stack := .vBool (RunarVerification.ANF.Eval.Crypto.ecOnCurve smokeDpPt) :: [.vBigint 999] } :=
+  emitEcOnCurve_runOps_eq smokeEocStk smokeDpPt [.vBigint 999] rfl (by native_decide)
+    (by native_decide) (by native_decide)
+
+/-- SMOKE (value anti-vacuity).  `makePoint 11 22` is NOT on the curve
+(`22² ≠ 11³ + 7 mod p`), so the discharge yields `vBool false` — a non-trivial result. -/
+theorem smoke_emitEcOnCurve_value_concrete :
+    RunarVerification.ANF.Eval.Crypto.ecOnCurve smokeDpPt = false := by native_decide
+
 /-! ## Part 9 — BLOCKED `Crypto/Spec.lean §7` axioms: `ecNegate`, `ecOnCurve`
 
 The remaining two "medium" EC ops are NOT plain op-lists.  Unlike `ecPointX/Y`
