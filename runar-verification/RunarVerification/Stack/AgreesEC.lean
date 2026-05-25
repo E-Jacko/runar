@@ -2934,6 +2934,339 @@ theorem smoke_fieldAdd_ops_append :
         ++ [StackOp.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
   rw [fieldAdd_ops_append]
 
+/-! ## Part 10 — `decomposePoint` runtime base step (deliverable 1)
+
+`decomposePoint t "_pt" "_x" "_y"` is the FIRST helper `emitEcOnCurve`/`emitEcNegate`
+run; it is the base TrackerSim over `[_x, _y]` the rest of the chain threads off.  It
+is built from `Tracker.init [some "_pt"]`, so its `nm` is fully concrete at every
+step and its op-list reduces to a determined list (`decomposePoint_ops`); the
+runtime transport (`decomposePoint_op_transport`) then runs that determined list
+on `[pt] ++ rest` symbolically in `pt`'s bytes — same shape as the discharged
+`emitEcPointX/Y_runOps_eq` but with the single-split-convert-BOTH ordering
+(`OP_SPLIT` at 32 → convert y-half → swap → convert x-half → swap), reusing
+`reverse32_ops_transport` twice via the shared `convTail_transport` leaf.  The
+spec bridge (`decomposePoint_runOps`) lifts the two byte-decodes to
+`Crypto.Secp256k1.pointX`/`pointY` under the SAME two canonical-decode hypotheses
+(`hDecX`/`hDecY`) the pointX/pointY discharges carry, plus `64 ≤ p.size` (a 64-byte
+point).  All `propext`/`Quot.sound`-clean (plus the inherited backend opaques on
+the `runOps`-bearing transports), NO `sorry`, NO new axiom, `native_decide` only in
+the concrete smokes. -/
+
+/-- **`swap` ops-append.**  `(t.swap).ops = t.ops ++ [.swap]` (both `if`-branches
+push the op). -/
+theorem swap_ops_append (t : Ec.Tracker) :
+    (t.swap).ops.toList = t.ops.toList ++ [StackOp.swap] := by
+  unfold Ec.Tracker.swap Ec.Tracker.emit
+  simp only [ge_iff_le]
+  split <;> simp
+
+/-- **`rawBlock` nm at `consumeCnt = 1`, `produce = some n`.**  Pops one slot,
+pushes `some n`.  Reduces the `Id.run`/`forIn [0:1]` pop-loop. -/
+theorem rawBlock_nm_some1 (t : Ec.Tracker) (n : String) (e : List StackOp) :
+    (t.rawBlock 1 (some n) e).nm = t.nm.pop.push (some n) := by
+  unfold Ec.Tracker.rawBlock; simp [Id.run]; rfl
+
+/-- **`rawBlock` nm at `consumeCnt = 1`, `produce = none`.**  Pops one slot. -/
+theorem rawBlock_nm_none1 (t : Ec.Tracker) (e : List StackOp) :
+    (t.rawBlock 1 none e).nm = t.nm.pop := by
+  unfold Ec.Tracker.rawBlock; simp [Id.run]; rfl
+
+/-- The LE-decode conversion tail `emitReverse32Ops ++ [push 0x00, OP_CAT, OP_BIN2NUM]`
+shared by both `decomposePoint` coordinate conversions. -/
+def dpConvTail : List StackOp :=
+  [StackOp.push (.bytes (ByteArray.mk #[0x00])), StackOp.opcode "OP_CAT", StackOp.opcode "OP_BIN2NUM"]
+
+/-- The intermediate `decomposePoint` trackers (named so the `findDepth` of the
+inner `toTop "_dp_xb"` can be folded). -/
+def dpT1 : Ec.Tracker := (Ec.Tracker.init [some "_pt"]).toTop "_pt"
+def dpT2 : Ec.Tracker := dpT1.rawBlock 1 none [.push (.bigint 32), .opcode "OP_SPLIT"]
+def dpT3 : Ec.Tracker := { dpT2 with nm := (dpT2.nm.push (some "_dp_xb")).push (some "_dp_yb") }
+def dpT4 : Ec.Tracker := dpT3.rawBlock 1 (some "_y") (Ec.emitReverse32Ops ++ dpConvTail)
+
+theorem dpT1_nm : dpT1.nm = #[some "_pt"] := by
+  unfold dpT1 Ec.Tracker.toTop
+  rw [show (Ec.Tracker.init [some "_pt"]).findDepth "_pt" = 0 from by
+    rw [findDepth_eq_findDepthList _ _ (by unfold Ec.Tracker.init; decide)]
+    unfold Ec.Tracker.init; decide]
+  rfl
+
+theorem dpT2_nm : dpT2.nm = #[] := by rw [dpT2, rawBlock_nm_none1, dpT1_nm]; rfl
+
+theorem dpT4_nm : dpT4.nm = #[some "_dp_xb", some "_y"] := by
+  rw [dpT4, rawBlock_nm_some1]
+  show (dpT3.nm.pop.push (some "_y")) = _
+  rw [dpT3]
+  show ((((dpT2.nm.push (some "_dp_xb")).push (some "_dp_yb")).pop).push (some "_y")) = _
+  rw [dpT2_nm]; rfl
+
+theorem dpT1_fd0 : dpT1.findDepth "_pt" = 0 := by
+  unfold dpT1 Ec.Tracker.toTop
+  rw [findDepth_eq_findDepthList _ _ (by unfold Ec.Tracker.init; decide)]
+  unfold Ec.Tracker.init; decide
+
+theorem dpT4_fd1 : dpT4.findDepth "_dp_xb" = 1 := by
+  rw [findDepth_eq_findDepthList _ _ (by rw [dpT4_nm]; decide)]
+  rw [dpT4_nm]; decide
+
+/-- The determined `decomposePoint` op-list (split + 2× convert + 2× swap). -/
+def expectedDecomposePoint : List StackOp :=
+  [StackOp.push (.bigint 32), StackOp.opcode "OP_SPLIT"]
+  ++ (Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]
+  ++ (Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]
+
+set_option maxRecDepth 8192 in
+/-- **`decomposePoint` op-list = the determined list.**  Threads the four ops-append
+leaf lemmas through the (concrete-`nm`) tracker, folding the two `findDepth` depths
+(0 for `_pt`, 1 for `_dp_xb`) via the wave-77 bridge. -/
+theorem decomposePoint_ops :
+    (Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_x" "_y").ops.toList
+      = expectedDecomposePoint := by
+  show (dpT4.toTop "_dp_xb" |>.rawBlock 1 (some "_x")
+        (Ec.emitReverse32Ops ++ dpConvTail) |>.swap).ops.toList = _
+  rw [swap_ops_append, rawBlock_ops_append, toTop_ops_append, dpT4_fd1]
+  show (dpT4.ops.toList ++ rollExtraOps 1 ++ (Ec.emitReverse32Ops ++ dpConvTail)
+        ++ [StackOp.swap]) = _
+  rw [dpT4, rawBlock_ops_append]
+  show ((dpT3.ops.toList ++ (Ec.emitReverse32Ops ++ dpConvTail)) ++ rollExtraOps 1
+        ++ (Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]) = _
+  rw [dpT3]
+  show ((dpT2.ops.toList ++ (Ec.emitReverse32Ops ++ dpConvTail)) ++ rollExtraOps 1
+        ++ (Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]) = _
+  rw [dpT2, rawBlock_ops_append, dpT1, toTop_ops_append]
+  rw [show (Ec.Tracker.init [some "_pt"]).findDepth "_pt" = 0 from dpT1_fd0]
+  simp only [rollExtraOps, Ec.Tracker.init, dpConvTail, expectedDecomposePoint]
+  rfl
+
+/-- **The shared LE-decode conversion leaf.**  On `[b] ++ rest` with `32 ≤ b.size`,
+`emitReverse32Ops ++ [push 0x00, OP_CAT, OP_BIN2NUM]` lands
+`decodeMinimalLE (reverseAcc 32 b empty ++ 0x00)` (reuses `reverse32_ops_transport`). -/
+theorem dpConvTail_transport (s : StackState) (b : ByteArray) (rest : List Value)
+    (hStk : s.stack = .vBytes b :: rest) (hSize : 32 ≤ b.size) :
+    runOps (Ec.emitReverse32Ops ++ dpConvTail) s
+      = .ok { s with stack := .vBigint (decodeMinimalLE (reverseAcc 32 b ByteArray.empty ++ ByteArray.mk #[0x00])) :: rest } := by
+  obtain ⟨stk, alt, out, props, pre⟩ := s
+  subst hStk
+  have niOp : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by intro c t e h; cases h
+  have niPush : ∀ (pv : PushVal) t e, StackOp.push pv ≠ .ifOp t e := by intro pv t e h; cases h
+  rw [runOps_append, reverse32_ops_transport
+        { stack := .vBytes b :: rest, altstack := alt, outputs := out, props := props,
+          preimage := pre } b rest rfl hSize]
+  simp only [match_Except_ok_runOps]
+  unfold dpConvTail
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bytes (ByteArray.mk #[0x00]))), stepNonIf_push_bytes]
+  simp only [match_Except_ok_runOps, StackState.push]
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_CAT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_CAT"
+        { stack := .vBytes (ByteArray.mk #[0x00]) :: .vBytes (reverseAcc 32 b ByteArray.empty)
+                    :: rest, altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (reverseAcc 32 b ByteArray.empty ++ ByteArray.mk #[0x00]) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_BIN2NUM"), stepNonIf_opcode]
+  rw [show runOpcode "OP_BIN2NUM"
+        { stack := .vBytes (reverseAcc 32 b ByteArray.empty ++ ByteArray.mk #[0x00]) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBigint
+                  (decodeMinimalLE (reverseAcc 32 b ByteArray.empty ++ ByteArray.mk #[0x00])) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps, runOps_nil]
+
+set_option maxRecDepth 8192 in
+/-- **Operational transport for the determined `decomposePoint` list.**  On `[p] ++ rest`
+with `64 ≤ p.size`, lands `[y_num, x_num] ++ rest` (y on TOS), where each coord is the
+LE-decode of the byte-reversed half — the same `decodeMinimalLE … ++ 0x00` shape as
+`ec_pointX/Y_op_transport`, but produced by the single-split-both-convert ordering. -/
+theorem decomposePoint_op_transport (s : StackState) (p : ByteArray) (rest : List Value)
+    (hStk : s.stack = .vBytes p :: rest) (hSize : 64 ≤ p.size) :
+    runOps expectedDecomposePoint s
+      = .ok { s with stack := .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00])) :: .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])) :: rest } := by
+  obtain ⟨stk, alt, out, props, pre⟩ := s
+  subst hStk
+  have niOp : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by intro c t e h; cases h
+  have niPush : ∀ (pv : PushVal) t e, StackOp.push pv ≠ .ifOp t e := by intro pv t e h; cases h
+  have niSwap : ∀ t e, StackOp.swap ≠ .ifOp t e := by intro t e h; cases h
+  have hXsize : (p.extract 0 32).size = 32 := by rw [ByteArray.size_extract]; omega
+  have hYsize : (p.extract 32 p.size).size = p.size - 32 := by rw [ByteArray.size_extract]; omega
+  have hXle : 32 ≤ (p.extract 0 32).size := by omega
+  rw [show expectedDecomposePoint = StackOp.push (.bigint 32) :: StackOp.opcode "OP_SPLIT"
+        :: ((Ec.emitReverse32Ops ++ dpConvTail) ++ ([StackOp.swap]
+            ++ ((Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]))) from rfl]
+  -- push 32
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint 32)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- OP_SPLIT at 32 → [y_bytes, x_bytes]
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_SPLIT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_SPLIT"
+        { stack := .vBigint 32 :: .vBytes p :: rest, altstack := alt, outputs := out,
+          props := props, preimage := pre }
+        = .ok { stack := .vBytes (p.extract 32 p.size) :: .vBytes (p.extract 0 32) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } by
+      unfold runOpcode
+      simp only [popN, StackState.pop?, asBytes?, asNonNegativeNat?, asInt?, StackState.push,
+                 Int.reduceLT, reduceIte]
+      rw [if_neg (by omega : ¬ (32 : Int).toNat > p.size)]; rfl]
+  simp only [match_Except_ok_runOps]
+  -- convert y-half
+  rw [runOps_append]
+  rw [dpConvTail_transport
+        { stack := .vBytes (p.extract 32 p.size) :: .vBytes (p.extract 0 32) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        (p.extract 32 p.size) (.vBytes (p.extract 0 32) :: rest) rfl (by rw [hYsize]; omega)]
+  simp only [match_Except_ok_runOps, List.singleton_append]
+  -- swap → [x_bytes, y_num]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00])) :: .vBytes (p.extract 0 32) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (p.extract 0 32) :: .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00])) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- convert x-half
+  rw [runOps_append]
+  rw [dpConvTail_transport
+        { stack := .vBytes (p.extract 0 32) :: .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00])) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        (p.extract 0 32) (.vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00])) :: rest) rfl hXle]
+  simp only [match_Except_ok_runOps, List.singleton_append]
+  -- final swap → [y_num, x_num]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])) :: .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00])) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00])) :: .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps, runOps_nil]
+
+open RunarVerification.Crypto.Secp256k1 (pointX pointY) in
+/-- **DISCHARGED base step (deliverable 1) — `decomposePoint` ↔ `(pointX, pointY)`.**
+Running `Stack.Ec.decomposePoint (Tracker.init [some "_pt"]) "_pt" "_x" "_y"` on
+`[p] ++ rest` lands `[pointY p, pointX p] ++ rest` (y on TOS, matching the produced
+`nm = #[_x, _y]`), under `64 ≤ p.size` plus the two canonical-decode bridges
+`hDecX`/`hDecY` — the SAME hypotheses the discharged `emitEcPointX/Y_runOps_eq`
+carry, restated here for `decomposePoint`'s split-convert-both ordering.  This is
+the base `TrackerSim`-bearing transport the wave-79 hand-off named as Part-9
+sub-goal (c); it establishes the runtime stack the `ecOnCurve`/`ecNegate` field
+chain threads off. -/
+theorem decomposePoint_runOps (s : StackState) (p : ByteArray) (rest : List Value)
+    (hStk : s.stack = .vBytes p :: rest) (hSize : 64 ≤ p.size)
+    (hDecX : decodeMinimalLE
+              (reverseAcc 32 (p.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00]) = pointX p)
+    (hDecY : decodeMinimalLE
+              (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00]) = pointY p) :
+    runOps (Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_x" "_y").ops.toList s
+      = .ok { s with stack := .vBigint (pointY p) :: .vBigint (pointX p) :: rest } := by
+  rw [decomposePoint_ops, decomposePoint_op_transport s p rest hStk hSize, hDecX, hDecY]
+
+/-! ### MANDATORY smokes for the decomposePoint base step (deliverable 1) -/
+
+private def smokeDpPt : ByteArray := RunarVerification.Crypto.Secp256k1.makePoint 11 22
+private def smokeDpStk : StackState :=
+  { (default : StackState) with stack := [.vBytes smokeDpPt] }
+
+/-- SMOKE (wf anti-vacuity).  The `64 ≤ size` + two decode bridges hold concretely
+for `makePoint 11 22`.  Rules out a vacuous discharge. -/
+theorem smoke_decomposePoint_wf_satisfiable :
+    (64 : Nat) ≤ smokeDpPt.size
+      ∧ decodeMinimalLE (reverseAcc 32 (smokeDpPt.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = RunarVerification.Crypto.Secp256k1.pointX smokeDpPt
+      ∧ decodeMinimalLE (reverseAcc 32 (smokeDpPt.extract 32 smokeDpPt.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = RunarVerification.Crypto.Secp256k1.pointY smokeDpPt := by
+  native_decide
+
+/-- SMOKE (the headline).  The discharged `decomposePoint_runOps` FIRES on the
+concrete point, landing `[pointY, pointX] = [22, 11]`. -/
+theorem smoke_decomposePoint_runOps :
+    runOps (Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_x" "_y").ops.toList smokeDpStk
+      = .ok { smokeDpStk with stack := .vBigint (RunarVerification.Crypto.Secp256k1.pointY smokeDpPt) :: .vBigint (RunarVerification.Crypto.Secp256k1.pointX smokeDpPt) :: [] } :=
+  decomposePoint_runOps smokeDpStk smokeDpPt [] rfl (by native_decide) (by native_decide) (by native_decide)
+
+/-- SMOKE (value anti-vacuity).  The decoded coords are concretely `(11, 22)`. -/
+theorem smoke_decomposePoint_value_concrete :
+    RunarVerification.Crypto.Secp256k1.pointX smokeDpPt = 11
+      ∧ RunarVerification.Crypto.Secp256k1.pointY smokeDpPt = 22 := by
+  native_decide
+
+/-! ## Part 11 — `ecOnCurve` base `TrackerSim` (deliverable 2, first threading step)
+
+The base step (`decomposePoint_runOps`, Part 10) lands the runtime stack
+`[pointY p, pointX p]` and the tracker `nm = #[_x, _y]`.  This Part packages that
+into the rolling `TrackerSim` the field chain threads off — the FIRST step of the
+whole-program assembly, demonstrating the threading composes off deliverable 1.
+
+`decomposePoint_final_nm` computes the produced `nm` (via the `dpT5`/`dpT6` nm-chain,
+the `toTop "_dp_xb"` = `roll 1` = `swap`, the `swap`/`rawBlock` nm lemmas + the
+wave-77 `findDepth` bridge).  `decomposePoint_baseTrackerSim` then exhibits the base
+`TrackerSim` over the produced `nm` under the canonical base valuation
+`ecOnCurveBaseσ` (`_x ↦ pointX p`, `_y ↦ pointY p`) — the entry invariant for the
+`fieldSqr`/`fieldMul`/`fieldAdd`/`OP_EQUAL` chain.  All `propext`/`Quot.sound`-clean,
+NO `sorry`, NO new axiom.  (See the Part-9 BLOCK note for the precise next step that
+gates the full `emitEcOnCurve` discharge.) -/
+
+/-- **`swap` nm at size ≥ 2.**  Swaps the top two name slots. -/
+theorem swap_nm_ge2 (t : Ec.Tracker) (h : t.nm.size ≥ 2) :
+    (t.swap).nm
+      = (t.nm.set! (t.nm.size - 1) t.nm[t.nm.size - 2]!).set! (t.nm.size - 2) t.nm[t.nm.size - 1]! := by
+  unfold Ec.Tracker.swap Ec.Tracker.emit; simp only [ge_iff_le]; rw [if_pos h]
+
+/-- Continued `decomposePoint` tracker chain (past `dpT4`): `toTop "_dp_xb"` (depth 1
+= `swap`), then the x-coordinate `rawBlock`. -/
+def dpT5 : Ec.Tracker := dpT4.toTop "_dp_xb"
+def dpT6 : Ec.Tracker := dpT5.rawBlock 1 (some "_x") (Ec.emitReverse32Ops ++ dpConvTail)
+
+theorem dpT5_nm : dpT5.nm = #[some "_y", some "_dp_xb"] := by
+  unfold dpT5 Ec.Tracker.toTop
+  rw [dpT4_fd1]
+  show (dpT4.swap).nm = _
+  rw [swap_nm_ge2 dpT4 (by rw [dpT4_nm]; decide), dpT4_nm]; rfl
+
+theorem dpT6_nm : dpT6.nm = #[some "_y", some "_x"] := by
+  unfold dpT6; rw [rawBlock_nm_some1, dpT5_nm]; rfl
+
+/-- **`decomposePoint` produced `nm` = `#[_x, _y]`.**  The codegen name array the
+`ecOnCurve`/`ecNegate` field chain reads its slots from. -/
+theorem decomposePoint_final_nm :
+    (Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_x" "_y").nm
+      = #[some "_x", some "_y"] := by
+  show (dpT6.swap).nm = _
+  rw [swap_nm_ge2 dpT6 (by rw [dpT6_nm]; decide), dpT6_nm]; rfl
+
+/-- Canonical base valuation for the `ecOnCurve` field chain: the two decomposed
+coordinates. -/
+def ecOnCurveBaseσ (p : ByteArray) : String → Value
+  | "_x" => Value.vBigint (Crypto.Secp256k1.pointX p)
+  | "_y" => Value.vBigint (Crypto.Secp256k1.pointY p)
+  | _    => Value.vBigint 0
+
+/-- **The base `TrackerSim` (deliverable 2, first threading step).**  After
+`decomposePoint`, the runtime stack `[pointY p, pointX p]` mirrors the produced
+`nm = #[_x, _y]` under `ecOnCurveBaseσ` — the entry invariant the `fieldSqr`/
+`fieldMul`/`fieldAdd`/`OP_EQUAL` chain threads.  Composes `decomposePoint_final_nm`
+with the slot-by-slot agreement.  This is the first step of the Part-9 sub-goal (b)
+whole-program assembly that COMPOSES off deliverable 1. -/
+theorem decomposePoint_baseTrackerSim (p : ByteArray) :
+    TrackerSim (Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_x" "_y").nm
+      (ecOnCurveBaseσ p)
+      [Value.vBigint (Crypto.Secp256k1.pointY p), Value.vBigint (Crypto.Secp256k1.pointX p)] := by
+  rw [decomposePoint_final_nm]
+  refine ⟨rfl, ?_⟩
+  intro i hi
+  rw [getElem!_pos _ i hi |>.symm]
+  have hsz : (#[some "_x", some "_y"] : Array (Option String)).size = 2 := by decide
+  have hi2 : i = 0 ∨ i = 1 := by omega
+  unfold slotAgrees ecOnCurveBaseσ
+  rcases hi2 with rfl | rfl <;> simp <;> rfl
+
+/-! ### MANDATORY smoke for the base `TrackerSim` (deliverable 2) -/
+
+/-- SMOKE (base sim fires — anti-vacuity).  On the concrete `makePoint 11 22`, the
+base `TrackerSim` holds: produced `nm = #[_x, _y]`, runtime stack `[22, 11]`. -/
+theorem smoke_decomposePoint_baseTrackerSim :
+    TrackerSim (Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_x" "_y").nm
+      (ecOnCurveBaseσ smokeDpPt)
+      [Value.vBigint (Crypto.Secp256k1.pointY smokeDpPt),
+       Value.vBigint (Crypto.Secp256k1.pointX smokeDpPt)] :=
+  decomposePoint_baseTrackerSim smokeDpPt
+
 /-! ## Part 9 — BLOCKED `Crypto/Spec.lean §7` axioms: `ecNegate`, `ecOnCurve`
 
 The remaining two "medium" EC ops are NOT plain op-lists.  Unlike `ecPointX/Y`
@@ -3037,44 +3370,68 @@ NO new axiom:
   instances `fieldMul_ops_append` / `fieldAdd_ops_append` (the nested-`toTop`
   decomposition the wave-78 note left to the assembly site), each with a smoke.
 
-**PRECISE REMAINING SUB-GOAL (deliverable 3 — the whole-program assembly, BLOCKED).**
-With (1)+(2)+(a)+the field-binop ops-append now landed, the model-preservation
-layer is COMPLETE; what remains is the genuine multi-helper RUNTIME assembly, NOT a
-kernel wall:
+**LANDED THIS WAVE (wave-80 — sub-goal (c) DISCHARGED + the base `TrackerSim`).**
+The wave-79 hand-off named sub-goal (c) (`decomposePoint`'s runtime transport) as
+"the one remaining helper-step whose `TrackerSim`-bearing runtime transport is
+unwritten."  It is now WRITTEN and DISCHARGED (Part 10 + Part 11), all
+`propext`/`Quot.sound`-clean (plus the inherited backend opaques on the
+`runOps`-bearing transports), NO `sorry`, NO new axiom, `native_decide` only in the
+concrete smokes:
 
-  (b) **Whole-program symbolic-`nm` threading.**  `emitEcOnCurve` (518 ops) /
-      `emitEcNegate` (945 ops) are `t_final.ops.toList` after ~12–30 helper calls;
-      with `runOps_append` chunking the op-list via the ops-append lemmas, each
-      `toTop`/`copyToTop` step is now transported by `TrackerSim_toTop` /
-      `TrackerSim_copyToTop` — but each step's `findDepth` must still be evaluated
-      against the concrete *cumulative* `nm` at that step (membership + the wave-77
-      bridge per step), threaded under a single rolling `TrackerSim`, with the
-      field-arith leaves (`fieldAdd/Sub/Mul`-`optail` transports) composed to match
-      the spec closed form `Crypto.Secp256k1.ecOnCurve` (`x:=pointX`, `y:=pointY`,
-      `lhs:=fieldMul y y`, `rhs:=fieldAdd (fieldMul (fieldMul x x) x) 7`, then
-      `OP_EQUAL` ↔ `decide (lhs = rhs)`).  The unfinished helper-step is the FIRST
-      one: `decomposePoint`'s runtime ↔ `(pointX p, pointY p)` (see (c)) — once that
-      lands as the base `TrackerSim` over `[_x, _y]`, the keystone + field transports
-      thread the remaining `fieldSqr`/`fieldMul`/`fieldAdd`/`OP_EQUAL` steps
-      mechanically.
+  (c) **`decomposePoint` ↔ `(pointX p, pointY p)` — `decomposePoint_runOps` (Part 10).**
+      The op-list `decomposePoint_ops` (via the four ops-append leaves + the two
+      concrete `findDepth` folds `dpT1_fd0`/`dpT4_fd1`; the new `rawBlock_nm_some1/
+      none1` reduce the `Id.run`/`forIn [0:1]` pop-loop so the cumulative `nm` is
+      kernel-computable), the runtime transport `decomposePoint_op_transport`
+      (single `OP_SPLIT` at 32 → `dpConvTail_transport` on the y-half → `swap` →
+      `dpConvTail_transport` on the x-half → `swap`, reusing `reverse32_ops_transport`
+      twice via the shared `dpConvTail` leaf), and the spec bridge `decomposePoint_runOps`
+      lifting both decodes to `Secp256k1.pointX`/`pointY` under `64 ≤ p.size` + the two
+      `hDecX`/`hDecY` canonical-decode hypotheses (the SAME ones `emitEcPointX/Y_runOps_eq`
+      carry).  Lands `[pointY p, pointX p]` (y on TOS, matching produced `nm = #[_x,_y]`).
 
-  (c) **`decomposePoint` ↔ `(pointX p, pointY p)` (the unfinished base step).**
-      `decomposePoint t "_pt" "_x" "_y"` runs `toTop _pt` → `rawBlock 1 none
-      [push 32, OP_SPLIT]` → manual `nm.push _dp_xb/_dp_yb` → `rawBlock 1 (some _y)
-      (emitReverse32Ops ++ [push 0x00, OP_CAT, OP_BIN2NUM])` → `toTop _dp_xb` →
-      `rawBlock 1 (some _x) (same conv)` → `swap`.  Its 2× `emitReverse32Ops`
-      reuse `reverse32_ops_transport`, and the `OP_SPLIT`/`OP_CAT`/`OP_BIN2NUM`
-      legs need fresh BE-decode bridges to `Secp256k1.pointX`/`pointY` carrying the
-      INPUT-side wf hypotheses (64-byte point ⇒ 32-byte coords; on-curve;
-      `OP_MOD` divisors `fieldP ≠ 0`).  This is the same shape as the DISCHARGED
-      `emitEcPointX_runOps_eq`/`emitEcPointY_runOps_eq` but for `decomposePoint`'s
-      single-split-convert-both ordering rather than split-drop.  It is the one
-      remaining helper-step whose `TrackerSim`-bearing runtime transport is unwritten.
+  (b-first) **The base `TrackerSim` — `decomposePoint_baseTrackerSim` (Part 11).**
+      `decomposePoint_final_nm` (the `dpT5`/`dpT6` nm-chain: `toTop "_dp_xb"` = `roll 1`
+      = `swap` via the new `swap_nm_ge2`, then the x `rawBlock`) gives produced
+      `nm = #[_x, _y]`; the base sim then mirrors the runtime `[pointY p, pointX p]`
+      against it under `ecOnCurveBaseσ`.  This is the FIRST step of the (b)
+      whole-program assembly, demonstrating the threading COMPOSES off (c).
+
+**PRECISE REMAINING SUB-GOAL (deliverable 3 — the per-field-helper RUNTIME sim, BLOCKED).**
+With (c)+(b-first) landed, the entry `TrackerSim` for the field chain is in hand.  The
+ONE remaining gap before `emitEcOnCurve` discharges is the **per-field-helper composed
+runtime-sim transport** — the substrate ships the LEAVES (`runOps_toTop_extraOps_sim`,
+`runOps_copyToTop_extraOps_sim`, `TrackerSim_toTop`/`copyToTop`, the `field*_optail`
+transports) but NOT a lemma composing a WHOLE field helper end-to-end at runtime, e.g.
+
+    fieldSqr_runOps_sim :
+      TrackerSim t.nm σ stk → some a ∈ t.nm.toList.reverse →
+        runOps (fieldSqr-ops-chunk) { stk } =
+          .ok { σ a-squared :: stk-extended } ∧ TrackerSim (fieldSqr t a r).nm σ' …
+
+  Each field helper internally runs 3–4 `toTop`/`copyToTop`/`rawBlock`/`fieldMod`
+  sub-steps; the composed lemma must thread the rolling `TrackerSim` through ALL of
+  them (each sub-step's `findDepth` evaluated against the cumulative non-literal `nm`
+  via the wave-77 bridge + a per-step `nm`-toList lemma in the `dpT*_nm` style) and
+  land the spec field value via the `*_optail` transport.  The FIRST concrete instance
+  the `emitEcOnCurve` chain needs is `fieldSqr "_y" "_y2"` off the base sim
+  (`decomposePoint_baseTrackerSim`).  This composed-helper sim lemma is unwritten for
+  every field helper (`fieldSqr`/`fieldMul`/`fieldAdd`) and is the genuine bulk of the
+  discharge; the final `OP_EQUAL` ↔ `decide (lhs = rhs)` comparison is the closing leaf.
+
+  Secondary gap (orthogonal): the substrate `TrackerSim` requires `stk.length = nm.size`
+  (no passive tail), so the chain currently threads only for `rest = []`.  The axiom
+  carries arbitrary `rest`; discharging it needs either a tail-generalized `TrackerSim`
+  (re-deriving the keystone + transports modulo a fixed suffix) or a `rest`-erasure
+  argument.  The base step `decomposePoint_runOps` itself is already `rest`-polymorphic
+  (Part 10); only the field-chain TrackerSim threading needs the generalization.
 
 The discharge is all-or-nothing per axiom (partial threading discharges neither
 axiom), so per the task BLOCK protocol the two axioms are LEFT IN PLACE and the
-drift stays `76 → 76` (0 axioms discharged this wave; THE KEYSTONE landed).  The
-same model-preservation layer ((1)+(2)+(a)) immediately unblocks
-`emitEcAdd`/`emitEcMul` (the wave-76 hand-off). -/
+drift stays `76 → 76` (0 axioms discharged this wave; sub-goal (c) + the base
+`TrackerSim` landed).  The same Part 10/11 base + the model-preservation layer
+((1)+(2)+(a)) feed `emitEcNegate` (same `decomposePoint` base, then `composePoint`)
+on the identical per-field-helper-sim template, and unblock `emitEcAdd`/`emitEcMul`
+(the wave-76 hand-off). -/
 
 end RunarVerification.Stack.AgreesEC
