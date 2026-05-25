@@ -687,6 +687,28 @@ def isAllowedOpcodeName (name : String) : Bool :=
     -- of `count + 1` / `count - 1` and the foundation for the
     -- update_prop post-peephole M4 round-trip.
     || name = "OP_1ADD" || name = "OP_1SUB"
+    -- Wave 72: secp256k1 EC-codegen opcodes. The eight bytes below all
+    -- decode straight back to their named opcode via `parseStackOp1?`
+    -- (none is a push prefix, a structural control byte, a short-form
+    -- constructor byte, or a small-int byte):
+    --   OP_2DUP 0x6e, OP_MOD 0x97, OP_NUM2BIN 0x80, OP_2MUL 0x8d,
+    --   OP_2DIV 0x8e, OP_RSHIFTNUM 0xb7, OP_TOALTSTACK 0x6b,
+    --   OP_FROMALTSTACK 0x6c.
+    -- These unblock the parse round-trip for `ecModReduce` (OP_2DUP/
+    -- OP_MOD) and `ecEncodeCompressed` (OP_SIZE/OP_SUB/OP_SPLIT/
+    -- OP_BIN2NUM/OP_MOD/OP_CAT, all now allowlisted).
+    -- `OP_0` (byte 0x00) is deliberately EXCLUDED: 0x00 is read by
+    -- `parsePushVal?` as the small-int push `.push (.bigint 0)`, so
+    -- `.opcode "OP_0"` does NOT round-trip (same collision class as the
+    -- small-int / OP_NIP exclusions documented above). The EC ops that
+    -- emit `.opcode "OP_0"` (everything routed through `emitReverse32Ops`
+    -- — `ecPointX/Y`, `ecMakePoint`, `ecNegate`, `ecOnCurve`, `ecAdd`)
+    -- therefore remain BLOCKED at the M4 round-trip layer until codegen
+    -- emits `.push (.bigint 0)` (or the parser gains a disambiguating
+    -- next-byte hypothesis for bare OP_0).
+    || name = "OP_2DUP" || name = "OP_MOD" || name = "OP_NUM2BIN"
+    || name = "OP_2MUL" || name = "OP_2DIV" || name = "OP_RSHIFTNUM"
+    || name = "OP_TOALTSTACK" || name = "OP_FROMALTSTACK"
 
 /-- The list-level emittability predicate, threaded as a single
 inductive (no mutual recursion needed for the current covered subset
@@ -1314,20 +1336,67 @@ theorem parseStackOpFuel_OP_1SUB (fuel : Nat) (rest : List UInt8) :
     parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_1SUB") ++ rest)
       = .ok (.opcode "OP_1SUB", rest) := rfl
 
-/-- Allowed opcode names round-trip. Dispatches on the 14-way
+/-- Wave 72: `OP_2DUP` (0x6e) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_2DUP (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_2DUP") ++ rest)
+      = .ok (.opcode "OP_2DUP", rest) := rfl
+
+/-- Wave 72: `OP_MOD` (0x97) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_MOD (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_MOD") ++ rest)
+      = .ok (.opcode "OP_MOD", rest) := rfl
+
+/-- Wave 72: `OP_NUM2BIN` (0x80) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_NUM2BIN (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_NUM2BIN") ++ rest)
+      = .ok (.opcode "OP_NUM2BIN", rest) := rfl
+
+/-- Wave 72: `OP_2MUL` (0x8d) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_2MUL (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_2MUL") ++ rest)
+      = .ok (.opcode "OP_2MUL", rest) := rfl
+
+/-- Wave 72: `OP_2DIV` (0x8e) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_2DIV (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_2DIV") ++ rest)
+      = .ok (.opcode "OP_2DIV", rest) := rfl
+
+/-- Wave 72: `OP_RSHIFTNUM` (0xb7) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_RSHIFTNUM (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_RSHIFTNUM") ++ rest)
+      = .ok (.opcode "OP_RSHIFTNUM", rest) := rfl
+
+/-- Wave 72: `OP_TOALTSTACK` (0x6b) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_TOALTSTACK (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_TOALTSTACK") ++ rest)
+      = .ok (.opcode "OP_TOALTSTACK", rest) := rfl
+
+/-- Wave 72: `OP_FROMALTSTACK` (0x6c) round-trips — not a short-form byte. -/
+theorem parseStackOpFuel_OP_FROMALTSTACK (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_FROMALTSTACK") ++ rest)
+      = .ok (.opcode "OP_FROMALTSTACK", rest) := rfl
+
+/-- Allowed opcode names round-trip. Dispatches on the
 disjunction in `isAllowedOpcodeName`. -/
 theorem parseStackOpFuel_opcode_allowed (fuel : Nat) (rest : List UInt8)
     (name : String) (h : isAllowedOpcodeName name = true) :
     parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode name) ++ rest)
       = .ok (.opcode name, rest) := by
   unfold isAllowedOpcodeName at h
-  -- isAllowedOpcodeName is a Bool with 14 || disjuncts.
+  -- isAllowedOpcodeName is a Bool with a chain of || disjuncts.
   -- Decompose via Bool.or_eq_true then case split.
   simp only [Bool.or_eq_true, decide_eq_true_eq] at h
-  -- After simp, h : name = "..." ∨ ... ∨ name = "..." (14 disjuncts)
-  -- Process each of the 14 cases.
+  -- After simp, h : name = "..." ∨ ... ∨ name = "..." (27 disjuncts).
   -- Use a series of rcases with a left-associated pattern.
   obtain h1 | h1 := h
+  obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
   obtain h1 | h1 := h1
   obtain h1 | h1 := h1
   obtain h1 | h1 := h1
@@ -1364,7 +1433,15 @@ theorem parseStackOpFuel_opcode_allowed (fuel : Nat) (rest : List UInt8)
     | exact parseStackOpFuel_OP_SIZE fuel rest
     | exact parseStackOpFuel_OP_BIN2NUM fuel rest
     | exact parseStackOpFuel_OP_1ADD fuel rest
-    | exact parseStackOpFuel_OP_1SUB fuel rest)
+    | exact parseStackOpFuel_OP_1SUB fuel rest
+    | exact parseStackOpFuel_OP_2DUP fuel rest
+    | exact parseStackOpFuel_OP_MOD fuel rest
+    | exact parseStackOpFuel_OP_NUM2BIN fuel rest
+    | exact parseStackOpFuel_OP_2MUL fuel rest
+    | exact parseStackOpFuel_OP_2DIV fuel rest
+    | exact parseStackOpFuel_OP_RSHIFTNUM fuel rest
+    | exact parseStackOpFuel_OP_TOALTSTACK fuel rest
+    | exact parseStackOpFuel_OP_FROMALTSTACK fuel rest)
 
 /-! ## Per-op round-trip — single op via `RunarEmittable` -/
 
@@ -1472,6 +1549,14 @@ theorem emitStackOpL_cons_of_RunarEmittable (op : StackOp)
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
       all_goals (subst hN; first
         | exact ⟨0x69, [], rfl⟩  -- VERIFY
         | exact ⟨0x8f, [], rfl⟩  -- NEGATE
@@ -1491,7 +1576,15 @@ theorem emitStackOpL_cons_of_RunarEmittable (op : StackOp)
         | exact ⟨0x82, [], rfl⟩  -- SIZE (wave 49)
         | exact ⟨0x81, [], rfl⟩  -- BIN2NUM (wave 49)
         | exact ⟨0x8b, [], rfl⟩  -- 1ADD (wave 60)
-        | exact ⟨0x8c, [], rfl⟩) -- 1SUB (wave 60)
+        | exact ⟨0x8c, [], rfl⟩  -- 1SUB (wave 60)
+        | exact ⟨0x6e, [], rfl⟩  -- 2DUP (wave 72)
+        | exact ⟨0x97, [], rfl⟩  -- MOD (wave 72)
+        | exact ⟨0x80, [], rfl⟩  -- NUM2BIN (wave 72)
+        | exact ⟨0x8d, [], rfl⟩  -- 2MUL (wave 72)
+        | exact ⟨0x8e, [], rfl⟩  -- 2DIV (wave 72)
+        | exact ⟨0xb7, [], rfl⟩  -- RSHIFTNUM (wave 72)
+        | exact ⟨0x6b, [], rfl⟩  -- TOALTSTACK (wave 72)
+        | exact ⟨0x6c, [], rfl⟩) -- FROMALTSTACK (wave 72)
 
 /-! Helper: a single step lemma for `parseOpsFuel` when the head bytes
 parse cleanly. Avoids unfolding parseOpsFuel directly. -/
@@ -1746,6 +1839,14 @@ theorem emitStackOp_toList_of_RunarEmittable (op : StackOp)
       unfold isAllowedOpcodeName at hAllow
       simp only [Bool.or_eq_true, decide_eq_true_eq] at hAllow
       obtain hN | hN := hAllow
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
@@ -2147,6 +2248,14 @@ private theorem head_of_emitStackOpL_not_else_or_endif
       unfold isAllowedOpcodeName at hAllow
       simp only [Bool.or_eq_true, decide_eq_true_eq] at hAllow
       obtain hN | hN := hAllow
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
+      obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
@@ -5668,6 +5777,59 @@ theorem smoke_parseStackOpFuel_OP_1SUB :
 theorem smoke_OP_1ADD_in_allowlist : isAllowedOpcodeName "OP_1ADD" = true := rfl
 
 theorem smoke_OP_1SUB_in_allowlist : isAllowedOpcodeName "OP_1SUB" = true := rfl
+
+/-! ### Wave 72 smoke tests — the eight EC opcodes fire by `rfl`.
+
+Each EC opcode's emit byte round-trips cleanly through `parseStackOpFuel`
+(no collision with a push / structural / short-form byte), and each name is
+in `isAllowedOpcodeName`. `OP_0` is the documented exclusion (see the comment
+in `isAllowedOpcodeName`); a contrapositive smoke witnesses it stays out. -/
+
+theorem smoke_parseStackOpFuel_OP_2DUP :
+    parseStackOpFuel 1 (emitStackOpL (.opcode "OP_2DUP")) = .ok (.opcode "OP_2DUP", []) :=
+  parseStackOpFuel_OP_2DUP 0 []
+
+theorem smoke_parseStackOpFuel_OP_MOD :
+    parseStackOpFuel 1 (emitStackOpL (.opcode "OP_MOD")) = .ok (.opcode "OP_MOD", []) :=
+  parseStackOpFuel_OP_MOD 0 []
+
+theorem smoke_parseStackOpFuel_OP_NUM2BIN :
+    parseStackOpFuel 1 (emitStackOpL (.opcode "OP_NUM2BIN")) = .ok (.opcode "OP_NUM2BIN", []) :=
+  parseStackOpFuel_OP_NUM2BIN 0 []
+
+theorem smoke_parseStackOpFuel_OP_2MUL :
+    parseStackOpFuel 1 (emitStackOpL (.opcode "OP_2MUL")) = .ok (.opcode "OP_2MUL", []) :=
+  parseStackOpFuel_OP_2MUL 0 []
+
+theorem smoke_parseStackOpFuel_OP_2DIV :
+    parseStackOpFuel 1 (emitStackOpL (.opcode "OP_2DIV")) = .ok (.opcode "OP_2DIV", []) :=
+  parseStackOpFuel_OP_2DIV 0 []
+
+theorem smoke_parseStackOpFuel_OP_RSHIFTNUM :
+    parseStackOpFuel 1 (emitStackOpL (.opcode "OP_RSHIFTNUM")) = .ok (.opcode "OP_RSHIFTNUM", []) :=
+  parseStackOpFuel_OP_RSHIFTNUM 0 []
+
+theorem smoke_parseStackOpFuel_OP_TOALTSTACK :
+    parseStackOpFuel 1 (emitStackOpL (.opcode "OP_TOALTSTACK")) = .ok (.opcode "OP_TOALTSTACK", []) :=
+  parseStackOpFuel_OP_TOALTSTACK 0 []
+
+theorem smoke_parseStackOpFuel_OP_FROMALTSTACK :
+    parseStackOpFuel 1 (emitStackOpL (.opcode "OP_FROMALTSTACK")) = .ok (.opcode "OP_FROMALTSTACK", []) :=
+  parseStackOpFuel_OP_FROMALTSTACK 0 []
+
+theorem smoke_OP_2DUP_in_allowlist : isAllowedOpcodeName "OP_2DUP" = true := rfl
+theorem smoke_OP_MOD_in_allowlist : isAllowedOpcodeName "OP_MOD" = true := rfl
+theorem smoke_OP_NUM2BIN_in_allowlist : isAllowedOpcodeName "OP_NUM2BIN" = true := rfl
+theorem smoke_OP_2MUL_in_allowlist : isAllowedOpcodeName "OP_2MUL" = true := rfl
+theorem smoke_OP_2DIV_in_allowlist : isAllowedOpcodeName "OP_2DIV" = true := rfl
+theorem smoke_OP_RSHIFTNUM_in_allowlist : isAllowedOpcodeName "OP_RSHIFTNUM" = true := rfl
+theorem smoke_OP_TOALTSTACK_in_allowlist : isAllowedOpcodeName "OP_TOALTSTACK" = true := rfl
+theorem smoke_OP_FROMALTSTACK_in_allowlist : isAllowedOpcodeName "OP_FROMALTSTACK" = true := rfl
+
+/-- The documented exclusion: `OP_0` is NOT in the allowlist (byte 0x00
+collides with the small-int push fast path). EC ops that emit `.opcode "OP_0"`
+via `emitReverse32Ops` stay blocked at the M4 round-trip layer. -/
+theorem smoke_OP_0_excluded : isAllowedOpcodeName "OP_0" = false := rfl
 
 /-! ### Decidable look-ahead helper -/
 

@@ -1708,6 +1708,65 @@ def callBuiltin? (func : String) (args : List Value) : EvalResult (Option Value)
           | some b => return some (.vBytes (Crypto.hash256 b))
           | none => return none
       | _ => return none
+  -- secp256k1 EC primitives (in-scope wave-71/72). Each arm routes through
+  -- the concrete `Crypto.Secp256k1.*` backend defs already exposed at the top
+  -- of this file (`ecAdd` … `ecPointY`, lines ~400-432). Wiring these makes
+  -- ANF `call ec*(args)` SUCCEED instead of falling through to `.ok none` →
+  -- `crypto_call`, exactly as the hash arms did in wave 68. Arities and return
+  -- types match each op's spec def. Introduces NO new axiom — the backend defs
+  -- are concrete `def`s. `ecMul` / `ecMulGen` are deliberately NOT wired: they
+  -- are SCOPED OUT this wave (kept as named codegen-discharge axioms), so their
+  -- ANF calls intentionally keep falling through to the `crypto_call` residual.
+  | "ecAdd" =>
+      match args with
+      | [pv, qv] =>
+          match pv.asBytes?, qv.asBytes? with
+          | some p, some q => return some (.vBytes (Crypto.ecAdd p q))
+          | _, _ => return none
+      | _ => return none
+  | "ecNegate" =>
+      match args with
+      | [v] =>
+          match v.asBytes? with
+          | some p => return some (.vBytes (Crypto.ecNegate p))
+          | none => return none
+      | _ => return none
+  | "ecOnCurve" =>
+      match args with
+      | [v] =>
+          match v.asBytes? with
+          | some p => return some (.vBool (Crypto.ecOnCurve p))
+          | none => return none
+      | _ => return none
+  | "ecModReduce" =>
+      match args with
+      | [.vBigint a, .vBigint m] => return some (.vBigint (Crypto.ecModReduce a m))
+      | _ => return none
+  | "ecEncodeCompressed" =>
+      match args with
+      | [v] =>
+          match v.asBytes? with
+          | some p => return some (.vBytes (Crypto.ecEncodeCompressed p))
+          | none => return none
+      | _ => return none
+  | "ecMakePoint" =>
+      match args with
+      | [.vBigint x, .vBigint y] => return some (.vBytes (Crypto.ecMakePoint x y))
+      | _ => return none
+  | "ecPointX" =>
+      match args with
+      | [v] =>
+          match v.asBytes? with
+          | some p => return some (.vBigint (Crypto.ecPointX p))
+          | none => return none
+      | _ => return none
+  | "ecPointY" =>
+      match args with
+      | [v] =>
+          match v.asBytes? with
+          | some p => return some (.vBigint (Crypto.ecPointY p))
+          | none => return none
+      | _ => return none
   | _ => return none
 
 /-! ## The (skeleton) evaluator -/
