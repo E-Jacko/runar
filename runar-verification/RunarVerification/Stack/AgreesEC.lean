@@ -2407,6 +2407,275 @@ theorem TrackerSim_copyToTop (s : StackState) (nm : Array (Option String))
       (fun t => if t = newName then σ name else σ t) (σ name :: s.stack) :=
   TrackerSim_push nm σ s.stack newName (σ name) hSim hfresh
 
+/-! ### THE KEYSTONE — `toTop` nm-side `TrackerSim` preservation (deliverable 1)
+
+The wave-78 hand-off (Part-9 sub-goal (a)) named this as the ONE remaining
+model-preservation lemma: the `copyToTop` peer is `TrackerSim_copyToTop`
+(= `TrackerSim_push`); the `toTop` peer (`Tracker.roll`) erases the slot at array
+index `nm.size-1-d` and pushes it back on top, while the runtime erases the slot at
+structural depth `d` and conses `σ name` on top.  The genuine content is the
+slot-reindexing across "array-erase-then-push vs list-cons-after-erase" under the
+`size-1-i ↔ i` reverse correspondence, split at the erase point `d`
+(`TrackerSim_canonical`); the per-`roll`-branch reduction to that canonical
+erase-push array shape is `roll_nm_canonical` (the `d=0` identity-of-`eraseLast`,
+`d=1` swap-as-erase-push, `d=2`/`d≥3` definitional cases).  All `propext`/
+`Quot.sound`-clean, NO `native_decide`, NO `sorry`, NO new axiom. -/
+
+/-- `getElem!` peer of `List.getElem_set`. -/
+private theorem getElemBang_set {α : Type} [Inhabited α] (l : List α) (i j : Nat) (v : α)
+    (hj : j < l.length) :
+    (l.set i v)[j]! = if i = j then v else l[j]! := by
+  rw [getElem!_pos (l.set i v) j (by rw [List.length_set]; exact hj),
+      getElem!_pos l j hj, List.getElem_set]
+
+/-- `getElem!`-level list extensionality (equal lengths + per-index `[·]!` agreement). -/
+private theorem list_ext_getElemBang {α : Type} [Inhabited α] (a b : List α)
+    (hlen : a.length = b.length) (h : ∀ n, n < a.length → a[n]! = b[n]!) : a = b := by
+  apply List.ext_getElem hlen
+  intro n h1 h2
+  have := h n h1
+  rwa [getElem!_pos a n h1, getElem!_pos b n h2] at this
+
+/-- `getElem!` of `eraseIdx` below the erase point. -/
+private theorem getElemBang_eraseIdx_lt {α : Type} [Inhabited α] (l : List α) (e j : Nat)
+    (hj : j < e) (he : e < l.length) :
+    (l.eraseIdx e)[j]! = l[j]! := by
+  have hjlen : j < (l.eraseIdx e).length := by rw [List.length_eraseIdx_of_lt he]; omega
+  rw [getElem!_pos (l.eraseIdx e) j hjlen, getElem!_pos l j (by omega)]
+  exact List.getElem_eraseIdx_of_lt hjlen hj
+
+/-- `getElem!` of `eraseIdx` at/above the erase point (shifts the index up by one). -/
+private theorem getElemBang_eraseIdx_ge {α : Type} [Inhabited α] (l : List α) (e j : Nat)
+    (hge : e ≤ j) (he : e < l.length) (hjlen : j < (l.eraseIdx e).length) :
+    (l.eraseIdx e)[j]! = l[j+1]! := by
+  rw [getElem!_pos (l.eraseIdx e) j hjlen]
+  have hj1 : j + 1 < l.length := by rw [List.length_eraseIdx_of_lt he] at hjlen; omega
+  rw [getElem!_pos l (j+1) hj1]
+  exact List.getElem_eraseIdx_of_ge hjlen hge
+
+/-- `getElem!` of `xs ++ [x]` strictly inside the `xs` part. -/
+private theorem getElemBang_append_left {α : Type} [Inhabited α] (xs : List α) (x : α)
+    (i : Nat) (h : i < xs.length) :
+    (xs ++ [x])[i]! = xs[i]! := by
+  rw [getElem!_pos (xs ++ [x]) i (by simp; omega), getElem!_pos xs i h, List.getElem_append_left h]
+
+/-- `getElem!` of `xs ++ [x]` at the appended slot. -/
+private theorem getElemBang_append_right {α : Type} [Inhabited α] (xs : List α) (x : α) :
+    (xs ++ [x])[xs.length]! = x := by
+  rw [getElem!_pos (xs ++ [x]) xs.length (by simp)]; simp
+
+/-- `getElem!` bridge `Array → toList`, in range. -/
+private theorem arr_getElemBang_toList {α : Type} [Inhabited α] (a : Array α) (i : Nat)
+    (h : i < a.size) : a[i]! = a.toList[i]! := by
+  rw [getElem!_pos a i h, getElem!_pos a.toList i (by rw [Array.length_toList]; exact h),
+      Array.getElem_toList]
+
+/-- The `d=1` swap nm-update at the list level is exactly the canonical
+erase-second-then-append (`e = length-2`): both produce the same list pointwise
+(proved by `getElem!` extensionality, three index cases). -/
+private theorem swap_toList_canonical {α : Type} [Inhabited α] (l : List α) (h : 2 ≤ l.length) :
+    (l.set (l.length - 1) (l[l.length - 2]!)).set (l.length - 2) (l[l.length - 1]!)
+      = (l.eraseIdx (l.length - 2)) ++ [l[l.length - 2]!] := by
+  have herasel : (l.eraseIdx (l.length - 2)).length = l.length - 1 := by
+    rw [List.length_eraseIdx_of_lt (by omega)]
+  apply list_ext_getElemBang
+  · rw [List.length_set, List.length_set, List.length_append, List.length_singleton, herasel]
+    omega
+  · intro n hn
+    rw [List.length_set, List.length_set] at hn
+    rw [getElemBang_set (l.set (l.length - 1) (l[l.length - 2]!)) (l.length - 2) n
+          (l[l.length - 1]!) (by rw [List.length_set]; exact hn)]
+    rw [getElemBang_set l (l.length - 1) n (l[l.length - 2]!) hn]
+    by_cases h2 : l.length - 2 = n
+    · subst h2
+      simp only [if_pos]
+      have hbelow : l.length - 2 < (l.eraseIdx (l.length - 2)).length := by rw [herasel]; omega
+      rw [getElemBang_append_left (l.eraseIdx (l.length - 2)) (l[l.length - 2]!) (l.length - 2)
+            hbelow]
+      rw [getElemBang_eraseIdx_ge l (l.length - 2) (l.length - 2) (Nat.le_refl _) (by omega)
+            (by rw [herasel]; omega)]
+      congr 1; omega
+    · by_cases h1 : l.length - 1 = n
+      · subst h1
+        rw [if_neg h2, if_pos rfl]
+        have hidx : l.length - 1 = (l.eraseIdx (l.length - 2)).length := by rw [herasel]
+        rw [hidx]
+        exact (getElemBang_append_right (l.eraseIdx (l.length - 2)) (l[l.length - 2]!)).symm
+      · simp only [if_neg h2, if_neg h1]
+        have hnlt : n < l.length - 2 := by omega
+        have hbelow : n < (l.eraseIdx (l.length - 2)).length := by rw [herasel]; omega
+        rw [getElemBang_append_left (l.eraseIdx (l.length - 2)) (l[l.length - 2]!) n hbelow]
+        rw [getElemBang_eraseIdx_lt l (l.length - 2) n hnlt (by omega)]
+
+/-- The `d=0` nm-update is identity: erasing the last slot and pushing it back
+yields the original list. -/
+private theorem eraseLast_append {α : Type} [Inhabited α] (l : List α) (h : 0 < l.length) :
+    (l.eraseIdx (l.length - 1)) ++ [l[l.length - 1]!] = l := by
+  rw [List.eraseIdx_length_sub_one]
+  have hne : l ≠ [] := by intro hc; rw [hc] at h; simp at h
+  have hgl : l[l.length - 1]! = l.getLast hne := by
+    rw [List.getLast_eq_getElem, getElem!_pos l (l.length - 1) (by omega)]
+  rw [hgl, List.dropLast_concat_getLast]
+
+/-- **Canonical erase-push `TrackerSim` preservation (the slot-reindexing core).**
+Erasing the array slot at index `nm.size-1-d` and pushing it on top mirrors the
+runtime erasing structural depth `d` and consing `stk[d]!` on top.  Length: off
+`Array.toList_eraseIdxIfInBounds` + `List.length_eraseIdx`.  Slots: per-index
+reindexing across array-erase-then-push vs list-cons-after-erase, split at the
+erase point `d` (top slot / below-`d` / at-or-above-`d`). -/
+private theorem TrackerSim_canonical (nm : Array (Option String)) (σ : String → Value)
+    (stk : List Value) (d : Nat) (hd : d < nm.size) (hSim : TrackerSim nm σ stk) :
+    TrackerSim ((nm.eraseIdxIfInBounds (nm.size - 1 - d)).push (nm[nm.size - 1 - d]!))
+      σ (stk[d]! :: stk.eraseIdx d) := by
+  obtain ⟨hlen, hslot⟩ := hSim
+  generalize he_def : nm.size - 1 - d = e at *
+  have he_lt : e < nm.size := by omega
+  have herase_tl : (nm.eraseIdxIfInBounds e).toList = nm.toList.eraseIdx e :=
+    Array.toList_eraseIdxIfInBounds
+  have hnm_tllen : nm.toList.length = nm.size := Array.length_toList
+  have herase_size : (nm.eraseIdxIfInBounds e).size = nm.size - 1 := by
+    rw [← Array.length_toList, herase_tl,
+        List.length_eraseIdx_of_lt (by rw [hnm_tllen]; exact he_lt), hnm_tllen]
+  have hnm'_size : ((nm.eraseIdxIfInBounds e).push (nm[e]!)).size = nm.size := by
+    rw [Array.size_push, herase_size]; omega
+  have hnm'_tl : ((nm.eraseIdxIfInBounds e).push (nm[e]!)).toList
+      = nm.toList.eraseIdx e ++ [nm[e]!] := by rw [Array.toList_push, herase_tl]
+  refine ⟨?_, ?_⟩
+  · rw [List.length_cons, List.length_eraseIdx_of_lt (by omega : d < stk.length), hnm'_size]
+    omega
+  · intro i hi
+    have hi' : i < nm.size := by rwa [hnm'_size] at hi
+    have hnm'_get : ((nm.eraseIdxIfInBounds e).push (nm[e]!))[i]
+        = ((nm.eraseIdxIfInBounds e).push (nm[e]!)).toList[i]! :=
+      Eq.symm (getElem!_pos ((nm.eraseIdxIfInBounds e).push (nm[e]!)).toList i
+        (by rw [Array.length_toList, hnm'_size]; exact hi'))
+    rw [hnm'_get, hnm'_tl, hnm'_size]
+    have herasel : (nm.toList.eraseIdx e).length = nm.size - 1 := by
+      rw [List.length_eraseIdx_of_lt (by rw [hnm_tllen]; exact he_lt), hnm_tllen]
+    by_cases htop : i = nm.size - 1
+    · subst htop
+      have hsizeerasel : (nm.toList.eraseIdx e).length = nm.size - 1 := herasel
+      have happend_top : (nm.toList.eraseIdx e ++ [nm[e]!])[nm.size - 1]! = nm[e]! := by
+        rw [← hsizeerasel]; exact getElemBang_append_right (nm.toList.eraseIdx e) (nm[e]!)
+      rw [happend_top]
+      have hidx0 : nm.size - 1 - (nm.size - 1) = 0 := by omega
+      rw [hidx0, List.getElem!_cons_zero]
+      have horig := hslot e he_lt
+      have hed : nm.size - 1 - e = d := by omega
+      rw [hed] at horig
+      have hnmebang : nm[e]! = nm[e]'he_lt := by rw [getElem!_pos nm e he_lt]
+      rw [hnmebang]
+      exact horig
+    · have hilt : i < nm.size - 1 := by omega
+      have happend_low : (nm.toList.eraseIdx e ++ [nm[e]!])[i]! = (nm.toList.eraseIdx e)[i]! :=
+        getElemBang_append_left (nm.toList.eraseIdx e) (nm[e]!) i (by rw [herasel]; omega)
+      rw [happend_low]
+      have hrt_succ : nm.size - 1 - i = (nm.size - 2 - i) + 1 := by omega
+      rw [hrt_succ, List.getElem!_cons_succ]
+      have he_lt_tl : e < nm.toList.length := by rw [hnm_tllen]; exact he_lt
+      by_cases hsplit : i < e
+      · rw [getElemBang_eraseIdx_lt nm.toList e i hsplit he_lt_tl]
+        have hnmi : nm.toList[i]! = nm[i]'hi' := by
+          rw [getElem!_pos nm.toList i (by rw [hnm_tllen]; exact hi'), Array.getElem_toList]
+        rw [hnmi]
+        have horig := hslot i hi'
+        have hge_d : d ≤ nm.size - 2 - i := by omega
+        have hd_stk : d < stk.length := by omega
+        have herasestk : (stk.eraseIdx d)[nm.size - 2 - i]! = stk[(nm.size - 2 - i) + 1]! := by
+          apply getElemBang_eraseIdx_ge stk d (nm.size - 2 - i) hge_d hd_stk
+          rw [List.length_eraseIdx_of_lt hd_stk]; omega
+        rw [herasestk]
+        have hh : (nm.size - 2 - i) + 1 = nm.size - 1 - i := by omega
+        rw [hh]
+        exact horig
+      · have hsplit' : e ≤ i := Nat.le_of_not_lt hsplit
+        rw [getElemBang_eraseIdx_ge nm.toList e i hsplit' he_lt_tl
+              (by rw [List.length_eraseIdx_of_lt he_lt_tl, hnm_tllen]; omega)]
+        have hi1 : i + 1 < nm.size := by omega
+        have hnmi1 : nm.toList[i+1]! = nm[i+1]'hi1 := by
+          rw [getElem!_pos nm.toList (i+1) (by rw [hnm_tllen]; exact hi1), Array.getElem_toList]
+        rw [hnmi1]
+        have horig := hslot (i+1) hi1
+        have hlt_d : nm.size - 2 - i < d := by omega
+        have hd_stk : d < stk.length := by omega
+        have herasestk : (stk.eraseIdx d)[nm.size - 2 - i]! = stk[nm.size - 2 - i]! :=
+          getElemBang_eraseIdx_lt stk d (nm.size - 2 - i) hlt_d hd_stk
+        rw [herasestk]
+        have hidxeq : nm.size - 1 - (i + 1) = nm.size - 2 - i := by omega
+        rw [hidxeq] at horig
+        exact horig
+
+/-- **`Tracker.roll d` nm = the canonical erase-push form**, all four `roll`
+branches (`d=0` identity, `d=1` swap, `d=2` rot, `d≥3` bare roll), for `d` in
+range.  Bridges the concrete `roll`/`swap`/`rot` nm-updates to the single
+`TrackerSim_canonical` shape. -/
+private theorem roll_nm_canonical (t : Ec.Tracker) (d : Nat) (hd : d < t.nm.size) :
+    (t.roll d).nm = (t.nm.eraseIdxIfInBounds (t.nm.size - 1 - d)).push (t.nm[t.nm.size - 1 - d]!) := by
+  match d with
+  | 0 =>
+    show t.nm = _
+    apply Array.ext'
+    rw [Array.toList_push, Array.toList_eraseIdxIfInBounds]
+    have ht : t.nm.size - 1 - 0 = t.nm.toList.length - 1 := by rw [Array.length_toList]; omega
+    rw [ht, arr_getElemBang_toList t.nm (t.nm.toList.length - 1)
+          (by rw [Array.length_toList] at *; omega)]
+    exact (eraseLast_append t.nm.toList (by rw [Array.length_toList]; omega)).symm
+  | 1 =>
+    unfold Ec.Tracker.roll Ec.Tracker.swap
+    simp only [Ec.Tracker.emit]
+    rw [if_pos (by omega : t.nm.size ≥ 2)]
+    apply Array.ext'
+    rw [Array.toList_push, Array.toList_eraseIdxIfInBounds]
+    show ((t.nm.set! (t.nm.size - 1) (t.nm[t.nm.size - 2]!)).set! (t.nm.size - 2)
+            (t.nm[t.nm.size - 1]!)).toList = _
+    rw [Array.set!, Array.set!, Array.toList_setIfInBounds, Array.toList_setIfInBounds]
+    have hl : t.nm.toList.length = t.nm.size := Array.length_toList
+    rw [arr_getElemBang_toList t.nm (t.nm.size - 2) (by omega),
+        arr_getElemBang_toList t.nm (t.nm.size - 1) (by omega),
+        arr_getElemBang_toList t.nm (t.nm.size - 1 - 1) (by omega)]
+    have he1 : t.nm.size - 1 = t.nm.toList.length - 1 := by rw [hl]
+    have he2 : t.nm.size - 2 = t.nm.toList.length - 2 := by rw [hl]
+    have he3 : t.nm.size - 1 - 1 = t.nm.toList.length - 2 := by rw [hl]; omega
+    rw [he3, he2, he1]
+    exact swap_toList_canonical t.nm.toList (by rw [hl]; omega)
+  | 2 =>
+    unfold Ec.Tracker.roll Ec.Tracker.rot
+    simp only [Ec.Tracker.emit]
+    rw [if_pos (by omega : t.nm.size ≥ 3)]
+    have he : t.nm.size - 1 - 2 = t.nm.size - 3 := by omega
+    rw [he]
+  | n + 3 =>
+    unfold Ec.Tracker.roll
+    simp only [Ec.Tracker.emit]
+    rw [if_pos (by omega : t.nm.size ≥ (n + 3) + 1)]
+
+/-- **THE KEYSTONE (deliverable 1) — `toTop` nm-side `TrackerSim` preservation.**
+After `Tracker.toTop name` (= `roll (findDepth name)`), the tracker's name array and
+the runtime stack stay in lock-step: the runtime brings `σ name` to the top
+(remainder `stk.eraseIdx d`, the `runOps_toTop_extraOps_sim` witness), and the
+tracker's `nm` becomes the canonical erase-push form (`roll_nm_canonical`), which
+preserves `TrackerSim` by the slot-reindexing core (`TrackerSim_canonical`), since
+`stk[d]! = σ name` (`findDepthList_sim`).  `d := findDepthList name nm.toList.reverse`
+is the codegen depth via the wave-77 bridge `findDepth_eq_findDepthList`.  This is
+the `toTop` peer of `TrackerSim_copyToTop` and the last model-preservation lemma the
+Part-9 hand-off named. -/
+theorem TrackerSim_toTop (t : Ec.Tracker) (σ : String → Value) (stk : List Value)
+    (name : String)
+    (hSim : TrackerSim t.nm σ stk)
+    (hmem : some name ∈ t.nm.toList.reverse) :
+    TrackerSim (t.toTop name).nm σ
+      (σ name :: stk.eraseIdx (findDepthList name t.nm.toList.reverse)) := by
+  have hbridge : t.findDepth name = findDepthList name t.nm.toList.reverse :=
+    findDepth_eq_findDepthList t name hmem
+  have hsim := findDepthList_sim t.nm σ stk name hSim hmem
+  obtain ⟨hlt, hval⟩ := hsim
+  have hd_lt : findDepthList name t.nm.toList.reverse < t.nm.size := by
+    obtain ⟨hlen, _⟩ := hSim; omega
+  unfold Ec.Tracker.toTop
+  rw [hbridge, roll_nm_canonical t (findDepthList name t.nm.toList.reverse) hd_lt]
+  have hcanon := TrackerSim_canonical t.nm σ stk (findDepthList name t.nm.toList.reverse) hd_lt hSim
+  rwa [hval] at hcanon
+
 /-! ### MANDATORY smokes for the `toTop`/`copyToTop` transports (deliverable 1) -/
 
 /-- SMOKE (`roll` ops-append fires).  `(simTracker.roll 2).ops = simTracker.ops ++ [.rot]`. -/
@@ -2467,6 +2736,24 @@ theorem smoke_TrackerSim_copyToTop :
       (fun t => if t = "d" then simσ "a" else simσ t) (simσ "a" :: simStk) := by
   apply TrackerSim_copyToTop { (default : StackState) with stack := simStk }
   · exact smoke_TrackerSim_satisfiable
+  · decide
+
+/-- SMOKE (the KEYSTONE fires — anti-vacuity).  `simTracker.nm = [a,b,c]`; bringing
+`"a"` (codegen depth 2) to the top via `toTop` keeps `TrackerSim`: the new name
+array is `[b,c,a]` and the runtime is `σ "a" :: simStk.eraseIdx 2 = [10, 30, 20]`.
+Discharged through the keystone `TrackerSim_toTop` on the concrete tracker. -/
+theorem smoke_TrackerSim_toTop :
+    TrackerSim (simTracker.toTop "a").nm simσ
+      (simσ "a" :: simStk.eraseIdx (findDepthList "a" simTracker.nm.toList.reverse)) := by
+  apply TrackerSim_toTop simTracker simσ simStk "a"
+  · refine ⟨by decide, ?_⟩
+    intro i hi
+    rw [getElem!_pos simTracker.nm i hi |>.symm]
+    have hsz : simTracker.nm.size = 3 := by decide
+    have h3 : i = 0 ∨ i = 1 ∨ i = 2 := by omega
+    clear hi
+    unfold slotAgrees
+    rcases h3 with rfl | rfl | rfl <;> (unfold simTracker simStk simσ; rfl)
   · decide
 
 /-! ### Per-helper ops-append lemmas (wave-78 deliverable 2)
@@ -2544,6 +2831,46 @@ theorem fieldMod_ops_append (t : Ec.Tracker) (a r : String) :
   unfold Ec.fieldMod
   rw [rawBlock_ops_append, pushFieldP_ops_append, toTop_ops_append]
 
+/-- **Generic field-binop ops-append (deliverable 2 — the nested helper template).**
+`fieldAdd`/`fieldSub`/`fieldMul` all share the shape `toTop a → toTop b →
+rawBlock 2 prod [binop] → fieldMod prod r`.  Each nested `toTop`/`fieldMod` depth
+is `Tracker.findDepth` against the *cumulative* tracker at that step, so the
+appended op-blocks name the intermediate trackers explicitly (`t1 = toTop a`,
+`t2 = toTop b t1`, `t3 = rawBlock … t2`).  This is the leaf-level decomposition the
+whole-program assembly threads, mirroring the codegen's left-to-right helper order. -/
+theorem fieldBinop_ops_append (t : Ec.Tracker) (a b prod r : String) (binop : StackOp) :
+    (Ec.fieldMod (((t.toTop a).toTop b).rawBlock 2 (some prod) [binop]) prod r).ops.toList
+      = t.ops.toList ++ rollExtraOps (t.findDepth a)
+        ++ rollExtraOps ((t.toTop a).findDepth b)
+        ++ [binop]
+        ++ rollExtraOps ((((t.toTop a).toTop b).rawBlock 2 (some prod) [binop]).findDepth prod)
+        ++ [.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  rw [fieldMod_ops_append, rawBlock_ops_append, toTop_ops_append, toTop_ops_append]
+
+/-- **`fieldMul` ops-append.**  Instantiates `fieldBinop_ops_append` at `OP_MUL`. -/
+theorem fieldMul_ops_append (t : Ec.Tracker) (a b r : String) :
+    (Ec.fieldMul t a b r).ops.toList
+      = t.ops.toList ++ rollExtraOps (t.findDepth a)
+        ++ rollExtraOps ((t.toTop a).findDepth b)
+        ++ [.opcode "OP_MUL"]
+        ++ rollExtraOps ((((t.toTop a).toTop b).rawBlock 2 (some "_fmul_prod")
+              [.opcode "OP_MUL"]).findDepth "_fmul_prod")
+        ++ [.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  unfold Ec.fieldMul
+  exact fieldBinop_ops_append t a b "_fmul_prod" r (.opcode "OP_MUL")
+
+/-- **`fieldAdd` ops-append.**  Instantiates `fieldBinop_ops_append` at `OP_ADD`. -/
+theorem fieldAdd_ops_append (t : Ec.Tracker) (a b r : String) :
+    (Ec.fieldAdd t a b r).ops.toList
+      = t.ops.toList ++ rollExtraOps (t.findDepth a)
+        ++ rollExtraOps ((t.toTop a).findDepth b)
+        ++ [.opcode "OP_ADD"]
+        ++ rollExtraOps ((((t.toTop a).toTop b).rawBlock 2 (some "_fadd_sum")
+              [.opcode "OP_ADD"]).findDepth "_fadd_sum")
+        ++ [.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  unfold Ec.fieldAdd
+  exact fieldBinop_ops_append t a b "_fadd_sum" r (.opcode "OP_ADD")
+
 /-! ### MANDATORY smokes for the per-helper ops-append lemmas (deliverable 2) -/
 
 /-- SMOKE (`rawBlock` ops-append fires).  Appending `[OP_ADD]` to `simTracker.ops`. -/
@@ -2582,6 +2909,30 @@ theorem smoke_fieldMod_ops_append :
       = simTracker.ops.toList ++ rollExtraOps (simTracker.findDepth "a")
         ++ [StackOp.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
   rw [fieldMod_ops_append]
+
+/-- SMOKE (`fieldMul` ops-append fires).  Full nested decomposition of
+`fieldMul "a" "b" "r"` on `simTracker`: two `toTop`s (against the cumulative
+trackers), `OP_MUL`, the result `toTop`, push prime, then `fieldModOps`. -/
+theorem smoke_fieldMul_ops_append :
+    (Ec.fieldMul simTracker "a" "b" "r").ops.toList
+      = simTracker.ops.toList ++ rollExtraOps (simTracker.findDepth "a")
+        ++ rollExtraOps ((simTracker.toTop "a").findDepth "b")
+        ++ [StackOp.opcode "OP_MUL"]
+        ++ rollExtraOps ((((simTracker.toTop "a").toTop "b").rawBlock 2 (some "_fmul_prod")
+              [.opcode "OP_MUL"]).findDepth "_fmul_prod")
+        ++ [StackOp.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  rw [fieldMul_ops_append]
+
+/-- SMOKE (`fieldAdd` ops-append fires).  Same nested shape at `OP_ADD`. -/
+theorem smoke_fieldAdd_ops_append :
+    (Ec.fieldAdd simTracker "a" "b" "r").ops.toList
+      = simTracker.ops.toList ++ rollExtraOps (simTracker.findDepth "a")
+        ++ rollExtraOps ((simTracker.toTop "a").findDepth "b")
+        ++ [StackOp.opcode "OP_ADD"]
+        ++ rollExtraOps ((((simTracker.toTop "a").toTop "b").rawBlock 2 (some "_fadd_sum")
+              [.opcode "OP_ADD"]).findDepth "_fadd_sum")
+        ++ [StackOp.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  rw [fieldAdd_ops_append]
 
 /-! ## Part 9 — BLOCKED `Crypto/Spec.lean §7` axioms: `ecNegate`, `ecOnCurve`
 
@@ -2663,37 +3014,67 @@ an anti-vacuity smoke:
      `fieldMod_ops_append`.  These let `runOps_append` decompose the 945/518-op list
      helper-by-helper at the leaf level.
 
-**PRECISE REMAINING SUB-GOAL (deliverable 3 — the whole-program assembly, BLOCKED).**
-With (1)+(2) landed, what remains to discharge the two axioms is genuine
-multi-helper assembly, NOT a kernel wall:
+**LANDED THIS WAVE (wave-79 — THE KEYSTONE + field-binop ops-append template).**
+The Part-9 sub-goal (a) the wave-78 hand-off named as "the one remaining
+model-preservation lemma" is now CLOSED, all `propext`/`Classical.choice`/
+`Quot.sound`-clean, NO `sorry`, NO `native_decide` (only in the concrete smokes),
+NO new axiom:
 
-  (a) **`toTop` `nm`-side `TrackerSim` preservation.**  The copyToTop preservation
-      is `TrackerSim_copyToTop`; the `toTop` peer (`Tracker.roll`) does
-      `nm := (nm.eraseIdxIfInBounds (size-1-d)).push nm[size-1-d]!` against the
-      runtime `σ name :: stk.eraseIdx d`.  The *length* goal of the resulting
-      `TrackerSim` is discharged off `Array.toList_eraseIdxIfInBounds` +
-      `List.length_eraseIdx`; the *slot* goal is a per-index reindexing across the
-      array-erase-then-push vs the list-cons-after-erase under the reverse
-      correspondence (`size-1-i ↔ i`, split at the erase point `d`) — provable, but
-      a sizeable case analysis with no off-the-shelf lemma.  This is the one
-      remaining model-preservation lemma.
+  (a) **`toTop` `nm`-side `TrackerSim` preservation — `TrackerSim_toTop`** (the
+      slot-reindexing keystone).  Proved via `TrackerSim_canonical` (the genuine
+      slot-reindexing core: length off `Array.toList_eraseIdxIfInBounds` +
+      `List.length_eraseIdx`; slots a three-way index split — top / below-`d` /
+      at-or-above-`d` — across array-erase-then-push vs list-cons-after-erase under
+      the `size-1-i ↔ i` reverse correspondence) + `roll_nm_canonical` (the four
+      `roll` branches reduced to the single canonical erase-push array shape:
+      `d=0` via `eraseLast_append`, `d=1` via `swap_toList_canonical`, `d=2`/`d≥3`
+      definitional).  Composed with `findDepth_eq_findDepthList` (bridge) +
+      `findDepthList_sim` (`stk[d]! = σ name`).  This is the `toTop` peer of
+      `TrackerSim_copyToTop`.  Smoke: `smoke_TrackerSim_toTop`
+      (`[a,b,c]`, `toTop "a"` → `[b,c,a]` / runtime `[10,30,20]`).
+
+  Plus the field-binop ops-append template `fieldBinop_ops_append` and its
+  instances `fieldMul_ops_append` / `fieldAdd_ops_append` (the nested-`toTop`
+  decomposition the wave-78 note left to the assembly site), each with a smoke.
+
+**PRECISE REMAINING SUB-GOAL (deliverable 3 — the whole-program assembly, BLOCKED).**
+With (1)+(2)+(a)+the field-binop ops-append now landed, the model-preservation
+layer is COMPLETE; what remains is the genuine multi-helper RUNTIME assembly, NOT a
+kernel wall:
 
   (b) **Whole-program symbolic-`nm` threading.**  `emitEcOnCurve` (518 ops) /
       `emitEcNegate` (945 ops) are `t_final.ops.toList` after ~12–30 helper calls;
-      each `toTop`/`copyToTop`'s `findDepth` must be evaluated against the concrete
-      *cumulative* `nm` at that step (membership + bridge per step), threaded under a
-      single `TrackerSim`, with the field-arith leaves (`fieldAdd/Sub/Mul`-`optail`
-      transports above) composed to match the spec closed forms
-      `Crypto.Secp256k1.ecOnCurve`/`ecNegate`.
+      with `runOps_append` chunking the op-list via the ops-append lemmas, each
+      `toTop`/`copyToTop` step is now transported by `TrackerSim_toTop` /
+      `TrackerSim_copyToTop` — but each step's `findDepth` must still be evaluated
+      against the concrete *cumulative* `nm` at that step (membership + the wave-77
+      bridge per step), threaded under a single rolling `TrackerSim`, with the
+      field-arith leaves (`fieldAdd/Sub/Mul`-`optail` transports) composed to match
+      the spec closed form `Crypto.Secp256k1.ecOnCurve` (`x:=pointX`, `y:=pointY`,
+      `lhs:=fieldMul y y`, `rhs:=fieldAdd (fieldMul (fieldMul x x) x) 7`, then
+      `OP_EQUAL` ↔ `decide (lhs = rhs)`).  The unfinished helper-step is the FIRST
+      one: `decomposePoint`'s runtime ↔ `(pointX p, pointY p)` (see (c)) — once that
+      lands as the base `TrackerSim` over `[_x, _y]`, the keystone + field transports
+      thread the remaining `fieldSqr`/`fieldMul`/`fieldAdd`/`OP_EQUAL` steps
+      mechanically.
 
-  (c) **`decomposePoint`/`composePoint` threading.**  Their ops wrap the 295-op
-      `emitReverse32Ops` (via `reverse32_ops_transport`) inside the Tracker's
-      `rawBlock`, plus the BE-decode bridges with INPUT-side wf hypotheses (on-curve
-      / 32-byte coords; `OP_MOD` divisors `fieldP ≠ 0`).
+  (c) **`decomposePoint` ↔ `(pointX p, pointY p)` (the unfinished base step).**
+      `decomposePoint t "_pt" "_x" "_y"` runs `toTop _pt` → `rawBlock 1 none
+      [push 32, OP_SPLIT]` → manual `nm.push _dp_xb/_dp_yb` → `rawBlock 1 (some _y)
+      (emitReverse32Ops ++ [push 0x00, OP_CAT, OP_BIN2NUM])` → `toTop _dp_xb` →
+      `rawBlock 1 (some _x) (same conv)` → `swap`.  Its 2× `emitReverse32Ops`
+      reuse `reverse32_ops_transport`, and the `OP_SPLIT`/`OP_CAT`/`OP_BIN2NUM`
+      legs need fresh BE-decode bridges to `Secp256k1.pointX`/`pointY` carrying the
+      INPUT-side wf hypotheses (64-byte point ⇒ 32-byte coords; on-curve;
+      `OP_MOD` divisors `fieldP ≠ 0`).  This is the same shape as the DISCHARGED
+      `emitEcPointX_runOps_eq`/`emitEcPointY_runOps_eq` but for `decomposePoint`'s
+      single-split-convert-both ordering rather than split-drop.  It is the one
+      remaining helper-step whose `TrackerSim`-bearing runtime transport is unwritten.
 
 The discharge is all-or-nothing per axiom (partial threading discharges neither
 axiom), so per the task BLOCK protocol the two axioms are LEFT IN PLACE and the
-drift stays `76 → 76` (0 axioms discharged this wave).  The same (1)+(2)+(a)
-scaffolding immediately unblocks `emitEcAdd`/`emitEcMul` (the wave-76 hand-off). -/
+drift stays `76 → 76` (0 axioms discharged this wave; THE KEYSTONE landed).  The
+same model-preservation layer ((1)+(2)+(a)) immediately unblocks
+`emitEcAdd`/`emitEcMul` (the wave-76 hand-off). -/
 
 end RunarVerification.Stack.AgreesEC
