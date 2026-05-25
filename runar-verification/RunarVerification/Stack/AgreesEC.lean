@@ -6100,6 +6100,69 @@ private theorem fieldInv_ops_depth0 (t : Ec.Tracker) (baseL : List (Option Strin
   rw [hbit_ops, hhi_ops, hp_ops]
   simp only [fieldInvCoreInc, List.append_assoc, List.cons_append, List.nil_append, List.singleton_append]
 
+/-- **General `rename` nm at the `toList` level.**  `Tracker.rename n` rewrites the TOP
+slot to `some n` (the `_inv_r` peer `rename_invr_nm` specialised to `"_inv_r"`). -/
+private theorem rename_nm_general (t : Ec.Tracker) (L : List (Option String)) (x : Option String)
+    (n : String) (hnm : t.nm.toList = L ++ [x]) :
+    (t.rename n).nm.toList = L ++ [some n] := by
+  unfold Ec.Tracker.rename
+  have hsz : t.nm.size > 0 := by rw [← Array.length_toList, hnm, List.length_append]; simp
+  rw [if_pos hsz]
+  rw [Array.set!, Array.toList_setIfInBounds, hnm]
+  rw [show t.nm.size - 1 = L.length from by rw [← Array.length_toList, hnm, List.length_append]; simp]
+  rw [List.set_append_right (s := L) (t := [x]) L.length (some n) (Nat.le_refl _)]; simp
+
+/-- **THE `fieldInv` NM BRIDGE (depth-0 entry).**  Peer of `fieldInv_ops_depth0` for `nm`:
+for an entry with `aName` on TOS (`t.nm.toList = baseL ++ [some aName]`), running `fieldInv`
+lands `nm.toList = baseL ++ [some resultName]` (the input slot consumed, the result on TOS).
+Mirrors the nm-flow already computed inside `fieldInv_ops_depth0`. -/
+private theorem fieldInv_nm_depth0 (t : Ec.Tracker) (baseL : List (Option String))
+    (aName resultName : String)
+    (hnm : t.nm.toList = baseL ++ [some aName]) (hne : aName ≠ "_inv_r") :
+    (Ec.fieldInv t aName resultName).nm.toList = baseL ++ [some resultName] := by
+  rw [show Ec.fieldInv t aName resultName
+        = (((((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+              (((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+                "_inv_r" "_inv_r2").rename "_inv_r")) aName).toTop aName).drop).toTop "_inv_r").rename
+              resultName) from rfl]
+  -- prelude
+  have hp_nm : (t.copyToTop aName "_inv_r").nm.toList = baseL ++ [some aName, some "_inv_r"] := by
+    rw [copyToTop_nm_toList, hnm]; simp
+  -- high loop preserves
+  obtain ⟨_, hhi_nm⟩ :=
+    fieldInvHighLoop_ops 222 (t.copyToTop aName "_inv_r") baseL aName hp_nm hne
+  -- bit-32 fieldSqr
+  have hbit_nm : (Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+        "_inv_r" "_inv_r2").nm.toList = baseL ++ [some aName, some "_inv_r2"] :=
+    invFieldSqr_nm _ baseL aName hhi_nm hne
+  -- rename
+  have hren_nm : ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+        "_inv_r" "_inv_r2").rename "_inv_r").nm.toList = baseL ++ [some aName, some "_inv_r"] := by
+    rw [rename_invr_nm _ (baseL ++ [some aName]) (some "_inv_r2") (by rw [hbit_nm]; simp)]; simp
+  -- low loop preserves
+  obtain ⟨_, hlo_nm⟩ :=
+    fieldInvLowLoop_ops 32 0xFFFFFC2D _ baseL aName hren_nm hne
+  -- cleanup: toTop aName (depth 1) → baseL ++ [_inv_r, aName]
+  have hcl1_nm : ((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+        ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+          "_inv_r" "_inv_r2").rename "_inv_r") aName).toTop aName).nm.toList
+      = baseL ++ [some "_inv_r", some aName] :=
+    toTop_second_nm _ baseL aName "_inv_r" hlo_nm hne
+  -- drop → baseL ++ [_inv_r]
+  have hcl2_nm : (((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+        ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+          "_inv_r" "_inv_r2").rename "_inv_r") aName).toTop aName).drop).nm.toList
+      = baseL ++ [some "_inv_r"] := by
+    rw [drop_nm_toList, hcl1_nm]; simp
+  -- toTop "_inv_r" (depth 0) preserves nm
+  have hcl3_nm : ((((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+        ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+          "_inv_r" "_inv_r2").rename "_inv_r") aName).toTop aName).drop).toTop "_inv_r").nm.toList
+      = baseL ++ [some "_inv_r"] := by
+    rw [toTop_top_nm _ baseL "_inv_r" hcl2_nm, hcl2_nm]
+  -- final rename → baseL ++ [resultName]
+  rw [rename_nm_general _ baseL (some "_inv_r") resultName hcl3_nm]
+
 /-! ### MANDATORY smokes for the `fieldInv` op-list bridge (deliverable 1) -/
 
 /-- Concrete loop-entry tracker for the bridge smokes: `nm = [_pa, aBase, _inv_r]`. -/
@@ -6470,6 +6533,976 @@ theorem aaT7_ops :
   fieldInv_ops_depth0 aaT6 [some "px", some "py", some "qx", some "qy", some "_s_num"]
     "_s_den" "_s_den_inv"
     (by rw [aaT6_nm]; rfl) (by decide) (by decide) (by decide)
+
+/-- Step 7 (the fieldInv splice) as a named tracker: `aaT7 = fieldInv aaT6 _s_den _s_den_inv`.
+nm collapses to `[px, py, qx, qy, _s_num, _s_den_inv]` (input `_s_den` consumed, inverse on TOS). -/
+def aaT7 : Ec.Tracker := Ec.fieldInv aaT6 "_s_den" "_s_den_inv"
+
+theorem aaT7_nm :
+    aaT7.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_num", some "_s_den_inv"] :=
+  fieldInv_nm_depth0 aaT6 [some "px", some "py", some "qx", some "qy", some "_s_num"]
+    "_s_den" "_s_den_inv" (by rw [aaT6_nm]; rfl) (by decide)
+
+theorem aaT7_nm_arr :
+    aaT7.nm = #[some "px", some "py", some "qx", some "qy", some "_s_num", some "_s_den_inv"] :=
+  Array.ext' (by rw [aaT7_nm])
+
+/-- Step 8: `fieldMul aaT7 "_s_num" "_s_den_inv" "_s"` — `_s_num` depth 1, `_s_den_inv` depth 1
+(after `toTop _s_num`), product depth 0.  Op-list appends `fieldBinopGenInc 1 1 "OP_MUL"`;
+nm collapses to `[px,py,qx,qy,_s]`. -/
+def aaT8 : Ec.Tracker := Ec.fieldMul aaT7 "_s_num" "_s_den_inv" "_s"
+
+theorem aaT8_nm_arr :
+    aaT8.nm = #[some "px", some "py", some "qx", some "qy", some "_s"] := by
+  rw [aaT8]
+  unfold Ec.fieldMul
+  have hm1_nm : (aaT7.toTop "_s_num").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_den_inv", some "_s_num"] := by
+    rw [toTop_nm_canonical aaT7 "_s_num" 1
+          (fd_of_nm aaT7 "_s_num" 1 _ aaT7_nm_arr (by decide) (by decide)) (by rw [aaT7_nm_arr]; decide),
+        aaT7_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT7.toTop "_s_num").toTop "_s_den_inv").rawBlock 2 (some "_fmul_prod")
+        [.opcode "OP_MUL"]).nm = #[some "px", some "py", some "qx", some "qy", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_s_den_inv" 1
+          (fd_of_nm _ "_s_den_inv" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fmul_prod" "_s" 0
+        (fd_of_nm _ "_fmul_prod" 0 _ hm2_nm (by decide) (by decide)) (by rw [hm2_nm]; decide), hm2_nm]
+  apply Array.ext' <;> simp
+
+theorem aaT8_nm :
+    aaT8.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s"] := by
+  rw [aaT8_nm_arr]
+
+theorem aaT8_ops : aaT8.ops.toList = aaT7.ops.toList ++ fieldBinopGenInc 1 1 "OP_MUL" := by
+  have hm1_nm : (aaT7.toTop "_s_num").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_den_inv", some "_s_num"] := by
+    rw [toTop_nm_canonical aaT7 "_s_num" 1
+          (fd_of_nm aaT7 "_s_num" 1 _ aaT7_nm_arr (by decide) (by decide)) (by rw [aaT7_nm_arr]; decide),
+        aaT7_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT7.toTop "_s_num").toTop "_s_den_inv").rawBlock 2 (some "_fmul_prod")
+        [.opcode "OP_MUL"]).nm = #[some "px", some "py", some "qx", some "qy", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_s_den_inv" 1
+          (fd_of_nm _ "_s_den_inv" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [aaT8, fieldMul_ops_concrete aaT7 "_s_num" "_s_den_inv" "_s" 1 1 0
+        (fd_of_nm aaT7 "_s_num" 1 _ aaT7_nm_arr (by decide) (by decide))
+        (fd_of_nm _ "_s_den_inv" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fmul_prod" 0 _ hm2_nm (by decide) (by decide))]
+  simp only [fieldBinopGenInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- Step 9: `copyToTop "_s" "_s_keep"` (depth 0 = `.dup`). nm appends `_s_keep`. -/
+def aaT9 : Ec.Tracker := aaT8.copyToTop "_s" "_s_keep"
+
+theorem aaT9_nm :
+    aaT9.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s", some "_s_keep"] := by
+  rw [aaT9, copyToTop_nm_toList, aaT8_nm]; rfl
+
+theorem aaT9_nm_arr :
+    aaT9.nm = #[some "px", some "py", some "qx", some "qy", some "_s", some "_s_keep"] :=
+  Array.ext' (by rw [aaT9_nm])
+
+theorem aaT9_ops : aaT9.ops.toList = aaT8.ops.toList ++ pickExtraOps 0 :=
+  copyToTop_ops_concrete aaT8 "_s" "_s_keep" 0 (fd_of_nm aaT8 "_s" 0 _ aaT8_nm_arr (by decide) (by decide))
+
+/-- Step 10: `fieldSqr aaT9 "_s" "_s2"` = `copyToTop "_s" "_fsqr_copy"` then
+`fieldMul "_s" "_fsqr_copy" "_s2"`.  `_s` is at depth 1 (under `_s_keep`).  After the copy,
+the inner fieldMul squares the two `_s` copies.  nm collapses to `[px,py,qx,qy,_s_keep,_s2]`. -/
+def aaT10 : Ec.Tracker := Ec.fieldSqr aaT9 "_s" "_s2"
+
+theorem aaT10_nm_arr :
+    aaT10.nm = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_s2"] := by
+  rw [aaT10]
+  unfold Ec.fieldSqr Ec.fieldMul
+  -- copyToTop "_s" "_fsqr_copy": _s at depth 1 → push _fsqr_copy
+  have hc_nm : (aaT9.copyToTop "_s" "_fsqr_copy").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s", some "_s_keep", some "_fsqr_copy"] := by
+    rw [Ec.Tracker.copyToTop, pick_nm_push, aaT9_nm_arr]; apply Array.ext' <;> simp
+  -- toTop "_s" (depth 2) → bring _s up
+  have hm1_nm : ((aaT9.copyToTop "_s" "_fsqr_copy").toTop "_s").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_fsqr_copy", some "_s"] := by
+    rw [toTop_nm_canonical _ "_s" 2
+          (fd_of_nm _ "_s" 2 _ hc_nm (by decide) (by decide)) (by rw [hc_nm]; decide), hc_nm]
+    apply Array.ext' <;> simp
+  -- toTop "_fsqr_copy" (depth 1) → bring copy up over _s
+  have hm2_nm : (((aaT9.copyToTop "_s" "_fsqr_copy").toTop "_s").toTop "_fsqr_copy").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_s", some "_fsqr_copy"] := by
+    rw [toTop_nm_canonical _ "_fsqr_copy" 1
+          (fd_of_nm _ "_fsqr_copy" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  -- rawBlock 2 _fmul_prod → consume two, append _fmul_prod
+  have hm3_nm : ((((aaT9.copyToTop "_s" "_fsqr_copy").toTop "_s").toTop "_fsqr_copy").rawBlock 2
+        (some "_fmul_prod") [.opcode "OP_MUL"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2, hm2_nm]; apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fmul_prod" "_s2" 0
+        (fd_of_nm _ "_fmul_prod" 0 _ hm3_nm (by decide) (by decide)) (by rw [hm3_nm]; decide), hm3_nm]
+  apply Array.ext' <;> simp
+
+theorem aaT10_nm :
+    aaT10.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_keep", some "_s2"] := by
+  rw [aaT10_nm_arr]
+
+theorem aaT10_ops : aaT10.ops.toList = aaT9.ops.toList ++ fieldSqrGenInc 1 2 1 := by
+  rw [aaT10]
+  unfold Ec.fieldSqr
+  have hc_nm : (aaT9.copyToTop "_s" "_fsqr_copy").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s", some "_s_keep", some "_fsqr_copy"] := by
+    rw [Ec.Tracker.copyToTop, pick_nm_push, aaT9_nm_arr]; apply Array.ext' <;> simp
+  have hc_ops : (aaT9.copyToTop "_s" "_fsqr_copy").ops.toList = aaT9.ops.toList ++ pickExtraOps 1 :=
+    copyToTop_ops_concrete aaT9 "_s" "_fsqr_copy" 1
+      (fd_of_nm aaT9 "_s" 1 _ aaT9_nm_arr (by decide) (by decide))
+  have hm1_nm : ((aaT9.copyToTop "_s" "_fsqr_copy").toTop "_s").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_fsqr_copy", some "_s"] := by
+    rw [toTop_nm_canonical _ "_s" 2
+          (fd_of_nm _ "_s" 2 _ hc_nm (by decide) (by decide)) (by rw [hc_nm]; decide), hc_nm]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT9.copyToTop "_s" "_fsqr_copy").toTop "_s").toTop "_fsqr_copy").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_s", some "_fsqr_copy"] := by
+    rw [toTop_nm_canonical _ "_fsqr_copy" 1
+          (fd_of_nm _ "_fsqr_copy" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMul_ops_concrete (aaT9.copyToTop "_s" "_fsqr_copy") "_s" "_fsqr_copy" "_s2" 2 1 0
+        (fd_of_nm _ "_s" 2 _ hc_nm (by decide) (by decide))
+        (fd_of_nm _ "_fsqr_copy" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fmul_prod" 0 _
+          (by rw [rawBlock_nm_some2, hm2_nm]) (by decide) (by decide))]
+  rw [hc_ops]
+  simp only [fieldSqrGenInc, fieldBinopGenInc, rollExtraOps, pickExtraOps,
+    List.append_assoc, List.nil_append, List.cons_append]
+
+/-- Step 11: `copyToTop "px" "_px2"` (depth 5). -/
+def aaT11 : Ec.Tracker := aaT10.copyToTop "px" "_px2"
+
+theorem aaT11_nm :
+    aaT11.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_keep", some "_s2", some "_px2"] := by
+  rw [aaT11, copyToTop_nm_toList, aaT10_nm]; rfl
+
+theorem aaT11_nm_arr :
+    aaT11.nm = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_s2", some "_px2"] :=
+  Array.ext' (by rw [aaT11_nm])
+
+theorem aaT11_ops : aaT11.ops.toList = aaT10.ops.toList ++ pickExtraOps 5 :=
+  copyToTop_ops_concrete aaT10 "px" "_px2" 5 (fd_of_nm aaT10 "px" 5 _ aaT10_nm_arr (by decide) (by decide))
+
+/-- Step 12: `fieldSub aaT11 "_s2" "_px2" "_rx1"` — `_s2` depth 1, `_px2` depth 1, diff depth 0. -/
+def aaT12 : Ec.Tracker := Ec.fieldSub aaT11 "_s2" "_px2" "_rx1"
+
+theorem aaT12_nm_arr :
+    aaT12.nm = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_rx1"] := by
+  rw [aaT12]; unfold Ec.fieldSub
+  have hm1_nm : (aaT11.toTop "_s2").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_px2", some "_s2"] := by
+    rw [toTop_nm_canonical aaT11 "_s2" 1
+          (fd_of_nm aaT11 "_s2" 1 _ aaT11_nm_arr (by decide) (by decide)) (by rw [aaT11_nm_arr]; decide),
+        aaT11_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT11.toTop "_s2").toTop "_px2").rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_px2" 1
+          (fd_of_nm _ "_px2" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fsub_diff" "_rx1" 0
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide)) (by rw [hm2_nm]; decide), hm2_nm]
+  apply Array.ext' <;> simp
+
+theorem aaT12_nm :
+    aaT12.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_keep", some "_rx1"] := by
+  rw [aaT12_nm_arr]
+
+theorem aaT12_ops : aaT12.ops.toList = aaT11.ops.toList ++ fieldBinopGenInc 1 1 "OP_SUB" := by
+  have hm1_nm : (aaT11.toTop "_s2").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_px2", some "_s2"] := by
+    rw [toTop_nm_canonical aaT11 "_s2" 1
+          (fd_of_nm aaT11 "_s2" 1 _ aaT11_nm_arr (by decide) (by decide)) (by rw [aaT11_nm_arr]; decide),
+        aaT11_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT11.toTop "_s2").toTop "_px2").rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_px2" 1
+          (fd_of_nm _ "_px2" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [aaT12, fieldSub_ops_concrete aaT11 "_s2" "_px2" "_rx1" 1 1 0
+        (fd_of_nm aaT11 "_s2" 1 _ aaT11_nm_arr (by decide) (by decide))
+        (fd_of_nm _ "_px2" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide))]
+  simp only [fieldBinopGenInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- Step 13: `copyToTop "qx" "_qx2"` (depth 3). -/
+def aaT13 : Ec.Tracker := aaT12.copyToTop "qx" "_qx2"
+
+theorem aaT13_nm :
+    aaT13.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_keep", some "_rx1", some "_qx2"] := by
+  rw [aaT13, copyToTop_nm_toList, aaT12_nm]; rfl
+
+theorem aaT13_nm_arr :
+    aaT13.nm = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_rx1", some "_qx2"] :=
+  Array.ext' (by rw [aaT13_nm])
+
+theorem aaT13_ops : aaT13.ops.toList = aaT12.ops.toList ++ pickExtraOps 3 :=
+  copyToTop_ops_concrete aaT12 "qx" "_qx2" 3 (fd_of_nm aaT12 "qx" 3 _ aaT12_nm_arr (by decide) (by decide))
+
+/-- Step 14: `fieldSub aaT13 "_rx1" "_qx2" "rx"` — `_rx1` depth 1, `_qx2` depth 1, diff depth 0. -/
+def aaT14 : Ec.Tracker := Ec.fieldSub aaT13 "_rx1" "_qx2" "rx"
+
+theorem aaT14_nm_arr :
+    aaT14.nm = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx"] := by
+  rw [aaT14]; unfold Ec.fieldSub
+  have hm1_nm : (aaT13.toTop "_rx1").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_qx2", some "_rx1"] := by
+    rw [toTop_nm_canonical aaT13 "_rx1" 1
+          (fd_of_nm aaT13 "_rx1" 1 _ aaT13_nm_arr (by decide) (by decide)) (by rw [aaT13_nm_arr]; decide),
+        aaT13_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT13.toTop "_rx1").toTop "_qx2").rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_qx2" 1
+          (fd_of_nm _ "_qx2" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fsub_diff" "rx" 0
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide)) (by rw [hm2_nm]; decide), hm2_nm]
+  apply Array.ext' <;> simp
+
+theorem aaT14_nm :
+    aaT14.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx"] := by
+  rw [aaT14_nm_arr]
+
+theorem aaT14_ops : aaT14.ops.toList = aaT13.ops.toList ++ fieldBinopGenInc 1 1 "OP_SUB" := by
+  have hm1_nm : (aaT13.toTop "_rx1").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_qx2", some "_rx1"] := by
+    rw [toTop_nm_canonical aaT13 "_rx1" 1
+          (fd_of_nm aaT13 "_rx1" 1 _ aaT13_nm_arr (by decide) (by decide)) (by rw [aaT13_nm_arr]; decide),
+        aaT13_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT13.toTop "_rx1").toTop "_qx2").rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_qx2" 1
+          (fd_of_nm _ "_qx2" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [aaT14, fieldSub_ops_concrete aaT13 "_rx1" "_qx2" "rx" 1 1 0
+        (fd_of_nm aaT13 "_rx1" 1 _ aaT13_nm_arr (by decide) (by decide))
+        (fd_of_nm _ "_qx2" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide))]
+  simp only [fieldBinopGenInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- Step 15: `copyToTop "px" "_px3"` (depth 5). -/
+def aaT15 : Ec.Tracker := aaT14.copyToTop "px" "_px3"
+
+theorem aaT15_nm :
+    aaT15.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx", some "_px3"] := by
+  rw [aaT15, copyToTop_nm_toList, aaT14_nm]; rfl
+
+theorem aaT15_nm_arr :
+    aaT15.nm = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx", some "_px3"] :=
+  Array.ext' (by rw [aaT15_nm])
+
+theorem aaT15_ops : aaT15.ops.toList = aaT14.ops.toList ++ pickExtraOps 5 :=
+  copyToTop_ops_concrete aaT14 "px" "_px3" 5 (fd_of_nm aaT14 "px" 5 _ aaT14_nm_arr (by decide) (by decide))
+
+/-- Step 16: `copyToTop "rx" "_rx2"` (depth 1). -/
+def aaT16 : Ec.Tracker := aaT15.copyToTop "rx" "_rx2"
+
+theorem aaT16_nm :
+    aaT16.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx", some "_px3", some "_rx2"] := by
+  rw [aaT16, copyToTop_nm_toList, aaT15_nm]; rfl
+
+theorem aaT16_nm_arr :
+    aaT16.nm = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx", some "_px3", some "_rx2"] :=
+  Array.ext' (by rw [aaT16_nm])
+
+theorem aaT16_ops : aaT16.ops.toList = aaT15.ops.toList ++ pickExtraOps 1 :=
+  copyToTop_ops_concrete aaT15 "rx" "_rx2" 1 (fd_of_nm aaT15 "rx" 1 _ aaT15_nm_arr (by decide) (by decide))
+
+/-- Step 17: `fieldSub aaT16 "_px3" "_rx2" "_px_rx"` — `_px3` depth 1, `_rx2` depth 1, diff depth 0. -/
+def aaT17 : Ec.Tracker := Ec.fieldSub aaT16 "_px3" "_rx2" "_px_rx"
+
+theorem aaT17_nm_arr :
+    aaT17.nm = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx", some "_px_rx"] := by
+  rw [aaT17]; unfold Ec.fieldSub
+  have hm1_nm : (aaT16.toTop "_px3").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx", some "_rx2", some "_px3"] := by
+    rw [toTop_nm_canonical aaT16 "_px3" 1
+          (fd_of_nm aaT16 "_px3" 1 _ aaT16_nm_arr (by decide) (by decide)) (by rw [aaT16_nm_arr]; decide),
+        aaT16_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT16.toTop "_px3").toTop "_rx2").rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_rx2" 1
+          (fd_of_nm _ "_rx2" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fsub_diff" "_px_rx" 0
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide)) (by rw [hm2_nm]; decide), hm2_nm]
+  apply Array.ext' <;> simp
+
+theorem aaT17_nm :
+    aaT17.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx", some "_px_rx"] := by
+  rw [aaT17_nm_arr]
+
+theorem aaT17_ops : aaT17.ops.toList = aaT16.ops.toList ++ fieldBinopGenInc 1 1 "OP_SUB" := by
+  have hm1_nm : (aaT16.toTop "_px3").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx", some "_rx2", some "_px3"] := by
+    rw [toTop_nm_canonical aaT16 "_px3" 1
+          (fd_of_nm aaT16 "_px3" 1 _ aaT16_nm_arr (by decide) (by decide)) (by rw [aaT16_nm_arr]; decide),
+        aaT16_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT16.toTop "_px3").toTop "_rx2").rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_keep", some "rx", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_rx2" 1
+          (fd_of_nm _ "_rx2" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [aaT17, fieldSub_ops_concrete aaT16 "_px3" "_rx2" "_px_rx" 1 1 0
+        (fd_of_nm aaT16 "_px3" 1 _ aaT16_nm_arr (by decide) (by decide))
+        (fd_of_nm _ "_rx2" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide))]
+  simp only [fieldBinopGenInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- Step 18: `fieldMul aaT17 "_s_keep" "_px_rx" "_s_px_rx"` — `_s_keep` depth 2, `_px_rx` depth 1
+(after `toTop _s_keep`), product depth 0. -/
+def aaT18 : Ec.Tracker := Ec.fieldMul aaT17 "_s_keep" "_px_rx" "_s_px_rx"
+
+theorem aaT18_nm_arr :
+    aaT18.nm = #[some "px", some "py", some "qx", some "qy", some "rx", some "_s_px_rx"] := by
+  rw [aaT18]; unfold Ec.fieldMul
+  have hm1_nm : (aaT17.toTop "_s_keep").nm
+      = #[some "px", some "py", some "qx", some "qy", some "rx", some "_px_rx", some "_s_keep"] := by
+    rw [toTop_nm_canonical aaT17 "_s_keep" 2
+          (fd_of_nm aaT17 "_s_keep" 2 _ aaT17_nm_arr (by decide) (by decide)) (by rw [aaT17_nm_arr]; decide),
+        aaT17_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT17.toTop "_s_keep").toTop "_px_rx").rawBlock 2 (some "_fmul_prod") [.opcode "OP_MUL"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "rx", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_px_rx" 1
+          (fd_of_nm _ "_px_rx" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fmul_prod" "_s_px_rx" 0
+        (fd_of_nm _ "_fmul_prod" 0 _ hm2_nm (by decide) (by decide)) (by rw [hm2_nm]; decide), hm2_nm]
+  apply Array.ext' <;> simp
+
+theorem aaT18_nm :
+    aaT18.nm.toList = [some "px", some "py", some "qx", some "qy", some "rx", some "_s_px_rx"] := by
+  rw [aaT18_nm_arr]
+
+theorem aaT18_ops : aaT18.ops.toList = aaT17.ops.toList ++ fieldBinopGenInc 2 1 "OP_MUL" := by
+  have hm1_nm : (aaT17.toTop "_s_keep").nm
+      = #[some "px", some "py", some "qx", some "qy", some "rx", some "_px_rx", some "_s_keep"] := by
+    rw [toTop_nm_canonical aaT17 "_s_keep" 2
+          (fd_of_nm aaT17 "_s_keep" 2 _ aaT17_nm_arr (by decide) (by decide)) (by rw [aaT17_nm_arr]; decide),
+        aaT17_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT17.toTop "_s_keep").toTop "_px_rx").rawBlock 2 (some "_fmul_prod") [.opcode "OP_MUL"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "rx", some "_fmul_prod"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_px_rx" 1
+          (fd_of_nm _ "_px_rx" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [aaT18, fieldMul_ops_concrete aaT17 "_s_keep" "_px_rx" "_s_px_rx" 2 1 0
+        (fd_of_nm aaT17 "_s_keep" 2 _ aaT17_nm_arr (by decide) (by decide))
+        (fd_of_nm _ "_px_rx" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fmul_prod" 0 _ hm2_nm (by decide) (by decide))]
+  simp only [fieldBinopGenInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- Step 19: `copyToTop "py" "_py2"` (depth 4). -/
+def aaT19 : Ec.Tracker := aaT18.copyToTop "py" "_py2"
+
+theorem aaT19_nm :
+    aaT19.nm.toList = [some "px", some "py", some "qx", some "qy", some "rx", some "_s_px_rx", some "_py2"] := by
+  rw [aaT19, copyToTop_nm_toList, aaT18_nm]; rfl
+
+theorem aaT19_nm_arr :
+    aaT19.nm = #[some "px", some "py", some "qx", some "qy", some "rx", some "_s_px_rx", some "_py2"] :=
+  Array.ext' (by rw [aaT19_nm])
+
+theorem aaT19_ops : aaT19.ops.toList = aaT18.ops.toList ++ pickExtraOps 4 :=
+  copyToTop_ops_concrete aaT18 "py" "_py2" 4 (fd_of_nm aaT18 "py" 4 _ aaT18_nm_arr (by decide) (by decide))
+
+/-- Step 20: `fieldSub aaT19 "_s_px_rx" "_py2" "ry"` — `_s_px_rx` depth 1, `_py2` depth 1, diff depth 0. -/
+def aaT20 : Ec.Tracker := Ec.fieldSub aaT19 "_s_px_rx" "_py2" "ry"
+
+theorem aaT20_nm_arr :
+    aaT20.nm = #[some "px", some "py", some "qx", some "qy", some "rx", some "ry"] := by
+  rw [aaT20]; unfold Ec.fieldSub
+  have hm1_nm : (aaT19.toTop "_s_px_rx").nm
+      = #[some "px", some "py", some "qx", some "qy", some "rx", some "_py2", some "_s_px_rx"] := by
+    rw [toTop_nm_canonical aaT19 "_s_px_rx" 1
+          (fd_of_nm aaT19 "_s_px_rx" 1 _ aaT19_nm_arr (by decide) (by decide)) (by rw [aaT19_nm_arr]; decide),
+        aaT19_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT19.toTop "_s_px_rx").toTop "_py2").rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "rx", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_py2" 1
+          (fd_of_nm _ "_py2" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fsub_diff" "ry" 0
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide)) (by rw [hm2_nm]; decide), hm2_nm]
+  apply Array.ext' <;> simp
+
+theorem aaT20_nm :
+    aaT20.nm.toList = [some "px", some "py", some "qx", some "qy", some "rx", some "ry"] := by
+  rw [aaT20_nm_arr]
+
+theorem aaT20_ops : aaT20.ops.toList = aaT19.ops.toList ++ fieldBinopGenInc 1 1 "OP_SUB" := by
+  have hm1_nm : (aaT19.toTop "_s_px_rx").nm
+      = #[some "px", some "py", some "qx", some "qy", some "rx", some "_py2", some "_s_px_rx"] := by
+    rw [toTop_nm_canonical aaT19 "_s_px_rx" 1
+          (fd_of_nm aaT19 "_s_px_rx" 1 _ aaT19_nm_arr (by decide) (by decide)) (by rw [aaT19_nm_arr]; decide),
+        aaT19_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT19.toTop "_s_px_rx").toTop "_py2").rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "rx", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_py2" 1
+          (fd_of_nm _ "_py2" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [aaT20, fieldSub_ops_concrete aaT19 "_s_px_rx" "_py2" "ry" 1 1 0
+        (fd_of_nm aaT19 "_s_px_rx" 1 _ aaT19_nm_arr (by decide) (by decide))
+        (fd_of_nm _ "_py2" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide))]
+  simp only [fieldBinopGenInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-! ### Cleanup steps 21-24: drop the four original input coords.  `toTop X |>.drop` for
+`X ∈ {px, py, qx, qy}` (each at the live depth), leaving `nm = [rx, ry]`. -/
+
+/-- Step 21: `toTop "px" |>.drop` — px at depth 5 → drop → `[py,qx,qy,rx,ry]`. -/
+def aaT21 : Ec.Tracker := (aaT20.toTop "px").drop
+
+theorem aaT21_nm_arr :
+    aaT21.nm = #[some "py", some "qx", some "qy", some "rx", some "ry"] := by
+  rw [aaT21]
+  have hup : (aaT20.toTop "px").nm = #[some "py", some "qx", some "qy", some "rx", some "ry", some "px"] := by
+    rw [toTop_nm_canonical aaT20 "px" 5
+          (fd_of_nm aaT20 "px" 5 _ aaT20_nm_arr (by decide) (by decide)) (by rw [aaT20_nm_arr]; decide),
+        aaT20_nm_arr]
+    apply Array.ext' <;> simp
+  apply Array.ext'
+  rw [drop_nm_toList, hup]; rfl
+
+theorem aaT21_nm :
+    aaT21.nm.toList = [some "py", some "qx", some "qy", some "rx", some "ry"] := by
+  rw [aaT21_nm_arr]
+
+theorem aaT21_ops : aaT21.ops.toList = aaT20.ops.toList ++ rollExtraOps 5 ++ [StackOp.drop] := by
+  rw [aaT21, drop_ops_append, toTop_ops_concrete aaT20 "px" 5
+        (fd_of_nm aaT20 "px" 5 _ aaT20_nm_arr (by decide) (by decide))]
+
+/-- Step 22: `toTop "py" |>.drop` — py at depth 4 → drop → `[qx,qy,rx,ry]`. -/
+def aaT22 : Ec.Tracker := (aaT21.toTop "py").drop
+
+theorem aaT22_nm_arr :
+    aaT22.nm = #[some "qx", some "qy", some "rx", some "ry"] := by
+  rw [aaT22]
+  have hup : (aaT21.toTop "py").nm = #[some "qx", some "qy", some "rx", some "ry", some "py"] := by
+    rw [toTop_nm_canonical aaT21 "py" 4
+          (fd_of_nm aaT21 "py" 4 _ aaT21_nm_arr (by decide) (by decide)) (by rw [aaT21_nm_arr]; decide),
+        aaT21_nm_arr]
+    apply Array.ext' <;> simp
+  apply Array.ext'
+  rw [drop_nm_toList, hup]; rfl
+
+theorem aaT22_nm :
+    aaT22.nm.toList = [some "qx", some "qy", some "rx", some "ry"] := by
+  rw [aaT22_nm_arr]
+
+theorem aaT22_ops : aaT22.ops.toList = aaT21.ops.toList ++ rollExtraOps 4 ++ [StackOp.drop] := by
+  rw [aaT22, drop_ops_append, toTop_ops_concrete aaT21 "py" 4
+        (fd_of_nm aaT21 "py" 4 _ aaT21_nm_arr (by decide) (by decide))]
+
+/-- Step 23: `toTop "qx" |>.drop` — qx at depth 3 → drop → `[qy,rx,ry]`. -/
+def aaT23 : Ec.Tracker := (aaT22.toTop "qx").drop
+
+theorem aaT23_nm_arr :
+    aaT23.nm = #[some "qy", some "rx", some "ry"] := by
+  rw [aaT23]
+  have hup : (aaT22.toTop "qx").nm = #[some "qy", some "rx", some "ry", some "qx"] := by
+    rw [toTop_nm_canonical aaT22 "qx" 3
+          (fd_of_nm aaT22 "qx" 3 _ aaT22_nm_arr (by decide) (by decide)) (by rw [aaT22_nm_arr]; decide),
+        aaT22_nm_arr]
+    apply Array.ext' <;> simp
+  apply Array.ext'
+  rw [drop_nm_toList, hup]; rfl
+
+theorem aaT23_nm :
+    aaT23.nm.toList = [some "qy", some "rx", some "ry"] := by
+  rw [aaT23_nm_arr]
+
+theorem aaT23_ops : aaT23.ops.toList = aaT22.ops.toList ++ rollExtraOps 3 ++ [StackOp.drop] := by
+  rw [aaT23, drop_ops_append, toTop_ops_concrete aaT22 "qx" 3
+        (fd_of_nm aaT22 "qx" 3 _ aaT22_nm_arr (by decide) (by decide))]
+
+/-- Step 24: `toTop "qy" |>.drop` — qy at depth 2 → drop → `[rx,ry]` (the affineAdd result). -/
+def aaT24 : Ec.Tracker := (aaT23.toTop "qy").drop
+
+theorem aaT24_nm_arr :
+    aaT24.nm = #[some "rx", some "ry"] := by
+  rw [aaT24]
+  have hup : (aaT23.toTop "qy").nm = #[some "rx", some "ry", some "qy"] := by
+    rw [toTop_nm_canonical aaT23 "qy" 2
+          (fd_of_nm aaT23 "qy" 2 _ aaT23_nm_arr (by decide) (by decide)) (by rw [aaT23_nm_arr]; decide),
+        aaT23_nm_arr]
+    apply Array.ext' <;> simp
+  apply Array.ext'
+  rw [drop_nm_toList, hup]; rfl
+
+theorem aaT24_nm :
+    aaT24.nm.toList = [some "rx", some "ry"] := by
+  rw [aaT24_nm_arr]
+
+theorem aaT24_ops : aaT24.ops.toList = aaT23.ops.toList ++ rollExtraOps 2 ++ [StackOp.drop] := by
+  rw [aaT24, drop_ops_append, toTop_ops_concrete aaT23 "qy" 2
+        (fd_of_nm aaT23 "qy" 2 _ aaT23_nm_arr (by decide) (by decide))]
+
+/-- **`Ec.affineAdd t = aaT24` when `t` is the entry tracker `aaT0`.**  The codegen
+`affineAdd` is exactly the chained 24-step tracker — definitional unfolding establishes
+`Ec.affineAdd aaT0 = aaT24`. -/
+theorem affineAdd_eq_aaT24 : Ec.affineAdd aaT0 = aaT24 := by
+  show Ec.affineAdd aaT0 = _
+  rfl
+
+/-- **The determined `affineAdd` op-list increment** (= `aaT24.ops.toList`, since `aaT0.ops = []`).
+The 24-step concat: scratch copies (`pickExtraOps`), field ops (`fieldBinopGenInc`/`fieldSqrGenInc`),
+the `fieldInv` core (`fieldInvCoreInc`, step 7), and the four cleanup drops. -/
+def affineAddInc : List StackOp :=
+  pickExtraOps 0 ++ pickExtraOps 3 ++ fieldBinopGenInc 1 1 "OP_SUB"
+    ++ pickExtraOps 2 ++ pickExtraOps 5 ++ fieldBinopGenInc 1 1 "OP_SUB"
+    ++ fieldInvCoreInc
+    ++ fieldBinopGenInc 1 1 "OP_MUL" ++ pickExtraOps 0 ++ fieldSqrGenInc 1 2 1
+    ++ pickExtraOps 5 ++ fieldBinopGenInc 1 1 "OP_SUB"
+    ++ pickExtraOps 3 ++ fieldBinopGenInc 1 1 "OP_SUB"
+    ++ pickExtraOps 5 ++ pickExtraOps 1 ++ fieldBinopGenInc 1 1 "OP_SUB"
+    ++ fieldBinopGenInc 2 1 "OP_MUL" ++ pickExtraOps 4 ++ fieldBinopGenInc 1 1 "OP_SUB"
+    ++ (rollExtraOps 5 ++ [StackOp.drop]) ++ (rollExtraOps 4 ++ [StackOp.drop])
+    ++ (rollExtraOps 3 ++ [StackOp.drop]) ++ (rollExtraOps 2 ++ [StackOp.drop])
+
+/-- **`aaT24.ops.toList = affineAddInc`** — the concrete 24-step op-list increment off the
+empty-ops entry `aaT0`.  Chains the 24 per-step ops lemmas. -/
+theorem aaT24_ops_full : aaT24.ops.toList = affineAddInc := by
+  have aaT7_ops' : aaT7.ops.toList = aaT6.ops.toList ++ fieldInvCoreInc := by
+    rw [aaT7]; exact aaT7_ops
+  rw [aaT24_ops, aaT23_ops, aaT22_ops, aaT21_ops, aaT20_ops, aaT19_ops, aaT18_ops, aaT17_ops,
+      aaT16_ops, aaT15_ops, aaT14_ops, aaT13_ops, aaT12_ops, aaT11_ops, aaT10_ops, aaT9_ops,
+      aaT8_ops, aaT7_ops', aaT6_ops, aaT5_ops, aaT4_ops, aaT3_ops, aaT2_ops, aaT1_ops]
+  show ([] ++ _ : List StackOp) = _
+  simp only [aaT0, List.nil_append]
+  unfold affineAddInc
+  simp only [List.append_assoc, List.append_eq, List.nil_append, List.append_nil,
+    List.cons_append, List.singleton_append,
+    fieldSqrGenInc, fieldBinopGenInc, pickExtraOps, rollExtraOps]
+
+/-! ### MANDATORY smokes for the affineAdd op-list deliverable -/
+
+/-- SMOKE (the affineAdd result tracker FIRES).  Running the codegen `affineAdd` off the entry
+`aaT0` (`nm = [px,py,qx,qy]`) lands the result `nm = [rx, ry]` — the two output coords, all four
+inputs and scratch consumed.  Anti-vacuity: the result is exactly the two named result slots. -/
+theorem smoke_affineAdd_result_nm :
+    (Ec.affineAdd aaT0).nm.toList = [some "rx", some "ry"] := by
+  rw [affineAdd_eq_aaT24, aaT24_nm]
+
+/-- SMOKE (the affineAdd op-list is NON-EMPTY and determined).  The 24-step increment
+`affineAddInc` is a genuine non-trivial Bitcoin-Script op-list (anti-vacuity: it begins with the
+step-1 `copyToTop qy` = `.dup`). -/
+theorem smoke_affineAddInc_head :
+    (Ec.affineAdd aaT0).ops.toList.head? = some StackOp.dup := by
+  rw [affineAdd_eq_aaT24, aaT24_ops_full]
+  unfold affineAddInc
+  simp only [pickExtraOps, List.append_assoc, List.cons_append, List.nil_append, List.head?_cons]
+
+/-- SMOKE (`fieldInv_nm_depth0` FIRES).  On a concrete depth-0 entry (`nm = [_pa, a]`, `a` on
+TOS), `fieldInv` lands `nm = [_pa, r]` — input consumed, inverse on TOS. -/
+theorem smoke_fieldInv_nm_depth0 :
+    (Ec.fieldInv ⟨#[some "_pa", some "_s_den"], #[]⟩ "_s_den" "_s_den_inv").nm.toList
+      = [some "_pa", some "_s_den_inv"] :=
+  fieldInv_nm_depth0 ⟨#[some "_pa", some "_s_den"], #[]⟩ [some "_pa"] "_s_den" "_s_den_inv"
+    (by decide) (by decide)
+
+/-! ### Ops-rebasing meta-lemma (entry-ops irrelevance for nm; append-only for ops).
+
+Every Tracker primitive reads only `t.nm` for its nm transform and appends to `t.ops`.  So any
+composite `f` "factors through" the empty-ops entry: `(f t).nm = (f (clearOps t)).nm` and
+`(f t).ops = t.ops ++ (f (clearOps t)).ops`.  This is exactly what transports the concrete
+`affineAdd_eq_aaT24` (anchored on `aaT0`, ops `#[]`) to a GENERAL entry tracker. -/
+
+/-- Reset a tracker's ops to empty (nm preserved). -/
+def clearOps (t : Ec.Tracker) : Ec.Tracker := { t with ops := #[] }
+
+/-- A tracker transform `f` is **ops-rebasable**: nm output is entry-ops-independent and ops is
+extended by append from the entry. -/
+def Rebasable (f : Ec.Tracker → Ec.Tracker) : Prop :=
+  ∀ t, (f t).nm = (f (clearOps t)).nm
+    ∧ (f t).ops.toList = t.ops.toList ++ (f (clearOps t)).ops.toList
+
+/-- `clearOps` of trackers with equal nm are equal (ops both `#[]`). -/
+private theorem clearOps_eq_of_nm {t₁ t₂ : Ec.Tracker} (h : t₁.nm = t₂.nm) :
+    clearOps t₁ = clearOps t₂ := by
+  unfold clearOps; rw [h]
+
+/-- `clearOps t` has empty ops. -/
+private theorem clearOps_ops (t : Ec.Tracker) : (clearOps t).ops.toList = [] := by
+  unfold clearOps; simp
+
+/-- `findDepth` is ops-independent. -/
+private theorem findDepth_clearOps (t : Ec.Tracker) (name : String) :
+    (clearOps t).findDepth name = t.findDepth name := rfl
+
+/-- `findDepth` depends only on `nm`. -/
+private theorem findDepth_of_nm_eq {t₁ t₂ : Ec.Tracker} (h : t₁.nm = t₂.nm) (name : String) :
+    t₁.findDepth name = t₂.findDepth name := by
+  unfold Ec.Tracker.findDepth; rw [h]
+
+theorem rebasable_id : Rebasable id := by
+  intro t; exact ⟨rfl, by simp [clearOps]⟩
+
+/-- Rebasable is closed under (diagrammatic) composition `g ∘ f` (apply `f`, then `g`). -/
+theorem rebasable_comp {f g : Ec.Tracker → Ec.Tracker} (hf : Rebasable f) (hg : Rebasable g) :
+    Rebasable (fun t => g (f t)) := by
+  intro t
+  obtain ⟨hf_nm, hf_ops⟩ := hf t
+  obtain ⟨hg_nm1, hg_ops1⟩ := hg (f t)
+  obtain ⟨hg_nm0, hg_ops0⟩ := hg (f (clearOps t))
+  have hcl_eq : clearOps (f t) = clearOps (f (clearOps t)) := clearOps_eq_of_nm hf_nm
+  refine ⟨?_, ?_⟩
+  · rw [hg_nm1, hcl_eq, ← hg_nm0]
+  · rw [hg_ops1, hf_ops, hcl_eq, hg_ops0]
+    simp only [List.append_assoc]
+
+/-- `roll`'s nm output is entry-ops-independent (case on the depth `d`; each branch's nm
+transform reads only `t.nm`).  These `op_nm_clearOps_*` lemmas establish that every primitive's
+nm transform reads only `t.nm`, so `(op t).nm = (op (clearOps t)).nm`. -/
+private theorem roll_nm_clearOps (nm : Array (Option String)) (o₁ o₂ : Array StackOp) (d : Nat) :
+    (Ec.Tracker.roll ⟨nm, o₁⟩ d).nm = (Ec.Tracker.roll ⟨nm, o₂⟩ d).nm := by
+  unfold Ec.Tracker.roll
+  match d with
+  | 0 => rfl
+  | 1 => unfold Ec.Tracker.swap Ec.Tracker.emit; dsimp only; split <;> rfl
+  | 2 => unfold Ec.Tracker.rot Ec.Tracker.emit; dsimp only; split <;> rfl
+  | n + 3 => unfold Ec.Tracker.emit; dsimp only; split <;> rfl
+
+private theorem pick_nm_clearOps (nm : Array (Option String)) (o₁ o₂ : Array StackOp)
+    (d : Nat) (n : String) :
+    (Ec.Tracker.pick ⟨nm, o₁⟩ d n).nm = (Ec.Tracker.pick ⟨nm, o₂⟩ d n).nm := by
+  unfold Ec.Tracker.pick
+  match d with
+  | 0 => unfold Ec.Tracker.dup Ec.Tracker.emit; rfl
+  | 1 => unfold Ec.Tracker.over Ec.Tracker.emit; rfl
+  | k + 2 => unfold Ec.Tracker.emit; rfl
+
+private theorem op_nm_clearOps_toTop (t : Ec.Tracker) (name : String) :
+    (t.toTop name).nm = ((clearOps t).toTop name).nm := by
+  obtain ⟨nm, ops⟩ := t
+  show (Ec.Tracker.roll ⟨nm, ops⟩ (Ec.Tracker.findDepth ⟨nm, ops⟩ name)).nm
+      = (Ec.Tracker.roll ⟨nm, #[]⟩ (Ec.Tracker.findDepth ⟨nm, #[]⟩ name)).nm
+  rw [show Ec.Tracker.findDepth ⟨nm, #[]⟩ name = Ec.Tracker.findDepth ⟨nm, ops⟩ name from rfl]
+  exact roll_nm_clearOps nm ops #[] _
+
+private theorem op_nm_clearOps_copyToTop (t : Ec.Tracker) (name newName : String) :
+    (t.copyToTop name newName).nm = ((clearOps t).copyToTop name newName).nm := by
+  obtain ⟨nm, ops⟩ := t
+  show (Ec.Tracker.pick ⟨nm, ops⟩ (Ec.Tracker.findDepth ⟨nm, ops⟩ name) newName).nm
+      = (Ec.Tracker.pick ⟨nm, #[]⟩ (Ec.Tracker.findDepth ⟨nm, #[]⟩ name) newName).nm
+  rw [show Ec.Tracker.findDepth ⟨nm, #[]⟩ name = Ec.Tracker.findDepth ⟨nm, ops⟩ name from rfl]
+  exact pick_nm_clearOps nm ops #[] _ newName
+
+private theorem op_nm_clearOps_drop (t : Ec.Tracker) :
+    (t.drop).nm = ((clearOps t).drop).nm := by
+  obtain ⟨nm, ops⟩ := t; simp only [clearOps]; rfl
+
+/-- The pop-loop inside `rawBlock` (over `[0:cnt]`) reads only `nm` — captured as a helper so the
+ops-independence of `rawBlock.nm` follows.  Proven by induction on `cnt`. -/
+private theorem rawBlock_popLoop_eq (nm : Array (Option String)) (o₁ o₂ : Array StackOp)
+    (cnt : Nat) (prod : Option String) (e : List StackOp) :
+    (Ec.Tracker.rawBlock ⟨nm, o₁⟩ cnt prod e).nm = (Ec.Tracker.rawBlock ⟨nm, o₂⟩ cnt prod e).nm := by
+  unfold Ec.Tracker.rawBlock
+  simp only [Id.run]
+  -- the nm-output is the `[0:cnt]` pop-fold over `nm`, then optional push; ops-fold is irrelevant
+  cases prod <;> rfl
+
+private theorem op_nm_clearOps_rawBlock (t : Ec.Tracker) (cnt : Nat) (prod : Option String)
+    (e : List StackOp) :
+    (t.rawBlock cnt prod e).nm = ((clearOps t).rawBlock cnt prod e).nm := by
+  obtain ⟨nm, ops⟩ := t
+  show (Ec.Tracker.rawBlock ⟨nm, ops⟩ cnt prod e).nm = (Ec.Tracker.rawBlock ⟨nm, #[]⟩ cnt prod e).nm
+  exact rawBlock_popLoop_eq nm ops #[] cnt prod e
+
+private theorem op_nm_clearOps_pushInt (t : Ec.Tracker) (name : String) (v : Int) :
+    (t.pushInt name v).nm = ((clearOps t).pushInt name v).nm := by
+  obtain ⟨nm, ops⟩ := t; simp only [clearOps]; rfl
+
+private theorem op_nm_clearOps_rename (t : Ec.Tracker) (name : String) :
+    (t.rename name).nm = ((clearOps t).rename name).nm := by
+  obtain ⟨nm, ops⟩ := t; simp only [clearOps]
+  unfold Ec.Tracker.rename; dsimp only; split <;> rfl
+
+/-- `findDepth` after `toTop` is ops-independent (nm-independence of `toTop` + findDepth-of-nm). -/
+private theorem op_findDepth_clearOps_toTop (t : Ec.Tracker) (a b : String) :
+    ((clearOps t).toTop a).findDepth b = (t.toTop a).findDepth b :=
+  findDepth_of_nm_eq (op_nm_clearOps_toTop t a).symm b
+
+/-- nm after `toTop a` then `toTop b` is ops-independent. -/
+private theorem op_nm_clearOps_toTop2 (t : Ec.Tracker) (a b : String) :
+    (((clearOps t).toTop a).toTop b).nm = ((t.toTop a).toTop b).nm := by
+  have h1 : ((clearOps t).toTop a).nm = (t.toTop a).nm := (op_nm_clearOps_toTop t a).symm
+  -- bring the inner toTop nm into agreement, then toTop b is nm-determined
+  have key : ∀ (s₁ s₂ : Ec.Tracker), s₁.nm = s₂.nm → (s₁.toTop b).nm = (s₂.toTop b).nm := by
+    intro s₁ s₂ hs
+    rw [op_nm_clearOps_toTop s₁ b, op_nm_clearOps_toTop s₂ b, clearOps_eq_of_nm hs]
+  exact key _ _ h1
+
+/-- `findDepth` after the binop `rawBlock 2` is ops-independent. -/
+private theorem op_findDepth_clearOps_rawBlock2 (t : Ec.Tracker) (a b prod r : String)
+    (binop : StackOp) :
+    ((((clearOps t).toTop a).toTop b).rawBlock 2 (some prod) [binop]).findDepth r
+      = (((t.toTop a).toTop b).rawBlock 2 (some prod) [binop]).findDepth r := by
+  apply findDepth_of_nm_eq
+  have key : ∀ (s₁ s₂ : Ec.Tracker), s₁.nm = s₂.nm →
+      (s₁.rawBlock 2 (some prod) [binop]).nm = (s₂.rawBlock 2 (some prod) [binop]).nm := by
+    intro s₁ s₂ hs
+    rw [op_nm_clearOps_rawBlock s₁, op_nm_clearOps_rawBlock s₂, clearOps_eq_of_nm hs]
+  exact key _ _ (op_nm_clearOps_toTop2 t a b)
+
+/-! nm-congruence of the primitives: equal entry nm ⟹ equal output nm. -/
+
+private theorem toTop_nmCongr {t₁ t₂ : Ec.Tracker} (h : t₁.nm = t₂.nm) (name : String) :
+    (t₁.toTop name).nm = (t₂.toTop name).nm := by
+  obtain ⟨nm₁, o₁⟩ := t₁; obtain ⟨nm₂, o₂⟩ := t₂
+  simp only [Ec.Tracker.mk.injEq] at h; subst h
+  show (Ec.Tracker.roll ⟨nm₁, o₁⟩ _).nm = (Ec.Tracker.roll ⟨nm₁, o₂⟩ _).nm
+  rw [show Ec.Tracker.findDepth ⟨nm₁, o₂⟩ name = Ec.Tracker.findDepth ⟨nm₁, o₁⟩ name from rfl]
+  exact roll_nm_clearOps nm₁ o₁ o₂ _
+
+private theorem copyToTop_nmCongr {t₁ t₂ : Ec.Tracker} (h : t₁.nm = t₂.nm) (name newName : String) :
+    (t₁.copyToTop name newName).nm = (t₂.copyToTop name newName).nm := by
+  obtain ⟨nm₁, o₁⟩ := t₁; obtain ⟨nm₂, o₂⟩ := t₂
+  simp only [Ec.Tracker.mk.injEq] at h; subst h
+  show (Ec.Tracker.pick ⟨nm₁, o₁⟩ _ newName).nm = (Ec.Tracker.pick ⟨nm₁, o₂⟩ _ newName).nm
+  rw [show Ec.Tracker.findDepth ⟨nm₁, o₂⟩ name = Ec.Tracker.findDepth ⟨nm₁, o₁⟩ name from rfl]
+  exact pick_nm_clearOps nm₁ o₁ o₂ _ newName
+
+private theorem rawBlock_nmCongr {t₁ t₂ : Ec.Tracker} (h : t₁.nm = t₂.nm)
+    (cnt : Nat) (prod : Option String) (e : List StackOp) :
+    (t₁.rawBlock cnt prod e).nm = (t₂.rawBlock cnt prod e).nm := by
+  obtain ⟨nm₁, o₁⟩ := t₁; obtain ⟨nm₂, o₂⟩ := t₂
+  simp only [Ec.Tracker.mk.injEq] at h; subst h
+  exact rawBlock_popLoop_eq nm₁ o₁ o₂ cnt prod e
+
+private theorem pushInt_nmCongr {t₁ t₂ : Ec.Tracker} (h : t₁.nm = t₂.nm) (name : String) (v : Int) :
+    (t₁.pushInt name v).nm = (t₂.pushInt name v).nm := by
+  obtain ⟨nm₁, o₁⟩ := t₁; obtain ⟨nm₂, o₂⟩ := t₂
+  simp only [Ec.Tracker.mk.injEq] at h; subst h; rfl
+
+private theorem fieldMod_nmCongr {t₁ t₂ : Ec.Tracker} (h : t₁.nm = t₂.nm) (a r : String) :
+    (Ec.fieldMod t₁ a r).nm = (Ec.fieldMod t₂ a r).nm := by
+  show (Ec.Tracker.rawBlock (Ec.pushFieldP (t₁.toTop a) "_fmod_p") 2 (some r) Ec.fieldModOps).nm
+      = (Ec.Tracker.rawBlock (Ec.pushFieldP (t₂.toTop a) "_fmod_p") 2 (some r) Ec.fieldModOps).nm
+  apply rawBlock_nmCongr
+  show (Ec.Tracker.pushInt (t₁.toTop a) "_fmod_p" Ec.fieldP).nm
+      = (Ec.Tracker.pushInt (t₂.toTop a) "_fmod_p" Ec.fieldP).nm
+  exact pushInt_nmCongr (toTop_nmCongr h a) "_fmod_p" Ec.fieldP
+
+private theorem fieldBinop_nmCongr {t₁ t₂ : Ec.Tracker} (h : t₁.nm = t₂.nm)
+    (a b prod r : String) (binop : StackOp) :
+    (Ec.fieldMod (((t₁.toTop a).toTop b).rawBlock 2 (some prod) [binop]) prod r).nm
+      = (Ec.fieldMod (((t₂.toTop a).toTop b).rawBlock 2 (some prod) [binop]) prod r).nm := by
+  apply fieldMod_nmCongr
+  apply rawBlock_nmCongr
+  exact toTop_nmCongr (toTop_nmCongr h a) b
+
+theorem rebasable_toTop (name : String) : Rebasable (fun t => t.toTop name) := by
+  intro t
+  refine ⟨op_nm_clearOps_toTop t name, ?_⟩
+  rw [toTop_ops_concrete t name (t.findDepth name) rfl,
+      toTop_ops_concrete (clearOps t) name ((clearOps t).findDepth name) rfl,
+      findDepth_clearOps, clearOps_ops]
+  simp
+
+theorem rebasable_copyToTop (name newName : String) :
+    Rebasable (fun t => t.copyToTop name newName) := by
+  intro t
+  refine ⟨op_nm_clearOps_copyToTop t name newName, ?_⟩
+  rw [copyToTop_ops_concrete t name newName (t.findDepth name) rfl,
+      copyToTop_ops_concrete (clearOps t) name newName ((clearOps t).findDepth name) rfl,
+      findDepth_clearOps, clearOps_ops]
+  simp
+
+theorem rebasable_drop : Rebasable (fun t => t.drop) := by
+  intro t
+  refine ⟨op_nm_clearOps_drop t, ?_⟩
+  rw [drop_ops_append t, drop_ops_append (clearOps t), clearOps_ops]; simp
+
+theorem rebasable_rawBlock (cnt : Nat) (prod : Option String) (e : List StackOp) :
+    Rebasable (fun t => t.rawBlock cnt prod e) := by
+  intro t
+  refine ⟨op_nm_clearOps_rawBlock t cnt prod e, ?_⟩
+  rw [rawBlock_ops_append, rawBlock_ops_append, clearOps_ops]; simp
+
+theorem rebasable_pushInt (name : String) (v : Int) :
+    Rebasable (fun t => t.pushInt name v) := by
+  intro t
+  refine ⟨op_nm_clearOps_pushInt t name v, ?_⟩
+  unfold Ec.Tracker.pushInt Ec.Tracker.emit clearOps; simp
+
+theorem rebasable_rename (name : String) : Rebasable (fun t => t.rename name) := by
+  intro t
+  refine ⟨op_nm_clearOps_rename t name, ?_⟩
+  rw [show (t.rename name).ops = t.ops from rename_ops t name,
+      show ((clearOps t).rename name).ops = (clearOps t).ops from rename_ops (clearOps t) name,
+      clearOps_ops]
+  simp
+
+/-- Rebasable transports along function equality. -/
+theorem rebasable_congr {f g : Ec.Tracker → Ec.Tracker} (h : ∀ t, f t = g t)
+    (hg : Rebasable g) : Rebasable f := by
+  intro t
+  obtain ⟨hnm, hops⟩ := hg t
+  refine ⟨?_, ?_⟩
+  · rw [h t, hnm, h (clearOps t)]
+  · rw [h t, hops, h (clearOps t)]
+
+/-- `pushFieldP` is Rebasable (it IS `pushInt _ fieldP`). -/
+theorem rebasable_pushFieldP (name : String) : Rebasable (fun t => Ec.pushFieldP t name) :=
+  rebasable_pushInt name Ec.fieldP
+
+/-- `fieldMod` is Rebasable (toTop ∘ pushFieldP ∘ rawBlock).  Proved via the per-conjunct
+direct route (nm ops-independence by destructure; ops via `fieldMod_ops_append`) to dodge the
+`@[inline]` reduction battle that `rebasable_comp`'s unifier hits on `pushInt`/`rawBlock`. -/
+theorem rebasable_fieldMod (a r : String) : Rebasable (fun t => Ec.fieldMod t a r) := by
+  intro t
+  simp only []
+  refine ⟨fieldMod_nmCongr (t₁ := t) (t₂ := clearOps t) rfl a r, ?_⟩
+  rw [fieldMod_ops_append t a r, fieldMod_ops_append (clearOps t) a r, clearOps_ops,
+      findDepth_clearOps]
+  simp
+
+theorem rebasable_fieldSub (a b r : String) : Rebasable (fun t => Ec.fieldSub t a b r) := by
+  intro t
+  simp only []
+  refine ⟨fieldBinop_nmCongr (t₁ := t) (t₂ := clearOps t) rfl a b "_fsub_diff" r (.opcode "OP_SUB"), ?_⟩
+  rw [show Ec.fieldSub t a b r
+          = Ec.fieldMod (((t.toTop a).toTop b).rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]) "_fsub_diff" r
+        from rfl,
+      show Ec.fieldSub (clearOps t) a b r
+          = Ec.fieldMod ((((clearOps t).toTop a).toTop b).rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]) "_fsub_diff" r
+        from rfl,
+      fieldBinop_ops_append t a b "_fsub_diff" r (.opcode "OP_SUB"),
+      fieldBinop_ops_append (clearOps t) a b "_fsub_diff" r (.opcode "OP_SUB"),
+      show (clearOps t).findDepth a = t.findDepth a from rfl,
+      op_findDepth_clearOps_toTop t a b,
+      op_findDepth_clearOps_rawBlock2 t a b "_fsub_diff" "_fsub_diff" (.opcode "OP_SUB"),
+      clearOps_ops]
+  simp
+
+theorem rebasable_fieldMul (a b r : String) : Rebasable (fun t => Ec.fieldMul t a b r) := by
+  intro t
+  simp only []
+  refine ⟨fieldBinop_nmCongr (t₁ := t) (t₂ := clearOps t) rfl a b "_fmul_prod" r (.opcode "OP_MUL"), ?_⟩
+  rw [show Ec.fieldMul t a b r
+          = Ec.fieldMod (((t.toTop a).toTop b).rawBlock 2 (some "_fmul_prod") [.opcode "OP_MUL"]) "_fmul_prod" r
+        from rfl,
+      show Ec.fieldMul (clearOps t) a b r
+          = Ec.fieldMod ((((clearOps t).toTop a).toTop b).rawBlock 2 (some "_fmul_prod") [.opcode "OP_MUL"]) "_fmul_prod" r
+        from rfl,
+      fieldBinop_ops_append t a b "_fmul_prod" r (.opcode "OP_MUL"),
+      fieldBinop_ops_append (clearOps t) a b "_fmul_prod" r (.opcode "OP_MUL"),
+      show (clearOps t).findDepth a = t.findDepth a from rfl,
+      op_findDepth_clearOps_toTop t a b,
+      op_findDepth_clearOps_rawBlock2 t a b "_fmul_prod" "_fmul_prod" (.opcode "OP_MUL"),
+      clearOps_ops]
+  simp
+
+theorem rebasable_fieldSqr (a r : String) : Rebasable (fun t => Ec.fieldSqr t a r) :=
+  rebasable_congr (f := fun t => Ec.fieldSqr t a r)
+    (g := fun t => Ec.fieldMul (t.copyToTop a "_fsqr_copy") a "_fsqr_copy" r)
+    (fun t => by unfold Ec.fieldSqr; rfl)
+    (rebasable_comp (rebasable_copyToTop a "_fsqr_copy") (rebasable_fieldMul a "_fsqr_copy" r))
+
+/-- `hiIterBody · aName` is Rebasable (fieldSqr; rename; copyToTop; fieldMul; rename). -/
+theorem rebasable_hiIterBody (aName : String) : Rebasable (fun t => hiIterBody t aName) := by
+  refine rebasable_congr
+    (g := fun t => Ec.Tracker.rename (Ec.fieldMul (Ec.Tracker.copyToTop
+            (Ec.Tracker.rename (Ec.fieldSqr t "_inv_r" "_inv_r2") "_inv_r") aName "_inv_a")
+            "_inv_r" "_inv_a" "_inv_m") "_inv_r")
+    (fun t => by unfold hiIterBody; rfl) ?_
+  exact rebasable_comp
+    (rebasable_comp
+      (rebasable_comp
+        (rebasable_comp (rebasable_fieldSqr "_inv_r" "_inv_r2") (rebasable_rename "_inv_r"))
+        (rebasable_copyToTop aName "_inv_a"))
+      (rebasable_fieldMul "_inv_r" "_inv_a" "_inv_m"))
+    (rebasable_rename "_inv_r")
+
+/-- `fieldInvHighLoop n · aName` is Rebasable (induction on `n`; each step is a fixed
+square-and-multiply composition of Rebasable primitives). -/
+theorem rebasable_fieldInvHighLoop (n : Nat) (aName : String) :
+    Rebasable (fun t => Ec.fieldInvHighLoop n t aName) := by
+  induction n with
+  | zero =>
+    have h : (fun t => Ec.fieldInvHighLoop 0 t aName) = id := by funext t; rfl
+    rw [h]; exact rebasable_id
+  | succ k ih =>
+    have h : (fun t => Ec.fieldInvHighLoop (k+1) t aName)
+        = (fun t => Ec.fieldInvHighLoop k (hiIterBody t aName) aName) := by
+      funext t; exact fieldInvHighLoop_succ k t aName
+    rw [h]
+    exact rebasable_comp (rebasable_hiIterBody aName) ih
+
+/-- `fieldInvLowLoop steps lowBits · aName` is Rebasable (induction on `steps`; each step is a
+`by_cases` on the bit — both branches Rebasable). -/
+theorem rebasable_fieldInvLowLoop (steps : Nat) (lowBits : Int) (aName : String) :
+    Rebasable (fun t => Ec.fieldInvLowLoop steps lowBits t aName) := by
+  induction steps with
+  | zero =>
+    have h : (fun t => Ec.fieldInvLowLoop 0 lowBits t aName) = id := by funext t; rfl
+    rw [h]; exact rebasable_id
+  | succ k ih =>
+    have h : (fun t => Ec.fieldInvLowLoop (k+1) lowBits t aName)
+        = (fun t => Ec.fieldInvLowLoop k lowBits (loIterBody lowBits k t aName) aName) := by
+      funext t; exact fieldInvLowLoop_succ k lowBits t aName
+    rw [h]
+    have hbody : Rebasable (fun t => loIterBody lowBits k t aName) := by
+      by_cases hbit : ((lowBits / (2 ^ k)) % 2) = 1
+      · refine rebasable_congr (g := fun t => hiIterBody t aName)
+          (fun t => by unfold loIterBody hiIterBody; simp only [hbit, decide_true, if_true]) ?_
+        exact rebasable_hiIterBody aName
+      · refine rebasable_congr (g := fun t => Ec.Tracker.rename (Ec.fieldSqr t "_inv_r" "_inv_r2") "_inv_r")
+          (fun t => by unfold loIterBody; simp only [hbit, decide_false, Bool.false_eq_true, if_false]) ?_
+        exact rebasable_comp (rebasable_fieldSqr "_inv_r" "_inv_r2") (rebasable_rename "_inv_r")
+    exact rebasable_comp hbody ih
+
+/-- SMOKE (the ops-rebasing substrate FIRES, anti-vacuity).  `fieldSub` is Rebasable: on a
+concrete entry with extra entry-ops, the nm output is entry-ops-independent and the ops output is
+the entry ops with the determined `fieldSub` increment appended.  Probes a tracker carrying a
+non-empty entry-ops list, so the `++ entry.ops` factorization is genuinely exercised. -/
+theorem smoke_rebasable_fieldSub :
+    let t : Ec.Tracker := ⟨#[some "x", some "y"], #[StackOp.opcode "OP_NOP"]⟩
+    (Ec.fieldSub t "x" "y" "z").nm = (Ec.fieldSub (clearOps t) "x" "y" "z").nm
+      ∧ (Ec.fieldSub t "x" "y" "z").ops.toList
+          = t.ops.toList ++ (Ec.fieldSub (clearOps t) "x" "y" "z").ops.toList :=
+  rebasable_fieldSub "x" "y" "z" ⟨#[some "x", some "y"], #[StackOp.opcode "OP_NOP"]⟩
+
+/-! ### HONEST BLOCK — general-entry affineAdd transport (`rebasable_fieldInv` / `rebasable_affineAdd`
+/ `affineAdd_nm_ops`) REMAINS.
+
+The op-list deliverable is LANDED: `aaT0`…`aaT24` (every affineAdd step's nm + ops increment),
+`affineAdd_eq_aaT24`, `aaT24_ops_full` (= `affineAddInc`), and the ops-rebasing meta-substrate
+(`Rebasable` + `rebasable_comp`/`rebasable_congr` + the primitive/field-op/loop rebasables
+`rebasable_{toTop,copyToTop,rawBlock,pushInt,drop,rename,fieldMod,fieldSub,fieldMul,fieldSqr,
+hiIterBody,fieldInvHighLoop,fieldInvLowLoop}` and the nm-congruence lemmas).
+
+What REMAINS is the final assembly: `rebasable_fieldInv` (compose the loop rebasables — blocked on a
+`whnf`/parse interaction folding the 222/32 `fieldInv` loops during the congr unfold), then
+`rebasable_affineAdd` (24-step comp) and `affineAdd_nm_ops` (transport `affineAdd_eq_aaT24` to a
+general entry via the factorization).  All the pieces exist; the gap is mechanical Lean elaboration
+plumbing, NOT new mathematics.  The `emitEcAdd_runOps_eq` axiom therefore REMAINS; drift stays 74. -/
+
 
 /-! ## Part 15 (cont.) — `fieldInv` op-list bridge + affineAdd + `emitEcAdd` discharge: HONEST BLOCK
 
