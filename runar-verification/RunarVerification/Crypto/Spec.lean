@@ -652,12 +652,11 @@ and the output is `vBytes (Crypto.ecAdd pa pb) :: rest`.
 
 ### TCB impact
 
-This section carries **4** axioms (one per still-axiomatized emit builder):
+This section carries **3** axioms (one per still-axiomatized emit builder):
 
 * `emitEcAdd_runOps_eq`
 * `emitEcMul_runOps_eq`
 * `emitEcMulGen_runOps_eq`
-* `emitEcNegate_runOps_eq`
 
 **Discharged** (moved to theorems in `Stack/AgreesEC.lean`, no longer axioms):
 
@@ -679,14 +678,23 @@ This section carries **4** axioms (one per still-axiomatized emit builder):
   (`emitEcOnCurve_ops`, folding the codegen `findDepth`s via the wave-77 bridge) +
   runtime threading through the tail-general `TrackerSim` per-field-helper composed
   sims off the `decomposePoint_runOps` base.
+* `emitEcNegate_runOps_eq` — `Stack.AgreesEC.emitEcNegate_runOps_eq`
+  (the SAME `decomposePoint` decode bridges `hDecX`/`hDecY` + `64 ≤ pt.size`, PLUS the
+  two `composePoint` `num2binEncode? · 33` + size + BE-encode bridges `hBeX`/`hBeNegY`
+  the build-back needs, at the coordinates `pointX pt` / `fieldSub FIELD_P (pointY pt)`).
+  The whole-program discharge (Part 14): op-list-equals-determined-concatenation
+  (`emitEcNegate_ops`, the `decomposePoint` → `pushFieldP` → `fieldSub` → `composePoint`
+  chain) + runtime threading `decomposePoint_runOps_neg` → `fieldSub_runOps_sim` →
+  `composePoint_runOps_sim`, reduced to `Crypto.Secp256k1.ecNegate` via the spec bridge
+  `ecNegate_eq_makePoint` (`fieldSub p y ≡ fieldSub 0 y` under the canonical `fieldMod`
+  `intToBE32` applies).
 
-**Still axiomatized** — `emitEcNegate_runOps_eq` remains an axiom.  The wave-76 kernel
-BLOCKER is cleared and the full `TrackerSim` whole-program machinery now lands the
-`emitEcOnCurve` discharge.  `emitEcNegate` follows the SAME template (same
-`decomposePoint` base, then `composePoint` instead of the `fieldSqr`/`OP_EQUAL` chain):
-its discharge reuses the Part-12 tail-general `TrackerSim` + the `fieldSub` composed
-sim + a `composePoint` runtime transport (the `decomposePoint` peer for the build-back).
-See `Stack/AgreesEC.lean` Part 9 / Part 12 for the substrate and the hand-off.
+**Still axiomatized** — `emitEcAdd_runOps_eq` / `emitEcMul_runOps_eq` /
+`emitEcMulGen_runOps_eq` remain axioms.  `emitEcAdd` is the last in-scope EC op; its
+discharge needs the `fieldInv` runtime sim (256-bit modular inverse, ~8 k ops via
+square-and-multiply) on top of the same `decomposePoint`/`composePoint`/`fieldSub`/
+`fieldMul`/`fieldSqr` machinery Part 14 now ships.  `emitEcMul`/`emitEcMulGen` need the
+257-iteration Jacobian double-and-add loop sim.  See `Stack/AgreesEC.lean` Part 14.
 -/
 
 open RunarVerification.Stack
@@ -719,13 +727,15 @@ axiom emitEcMulGen_runOps_eq (stkSt : StackState) (k : Int)
     runOps Stack.Ec.emitEcMulGen stkSt
       = .ok { stkSt with stack := .vBytes (Crypto.ecMulGen k) :: rest }
 
-/-- `Stack.Ec.emitEcNegate`: `(x, y) → (x, p - y)`.
-Mirrors `emitEcNegate` in `ec-codegen.ts:678-685`. -/
-axiom emitEcNegate_runOps_eq (stkSt : StackState) (pt : ByteArray)
-    (rest : List Value)
-    (hStk : stkSt.stack = .vBytes pt :: rest) :
-    runOps Stack.Ec.emitEcNegate stkSt
-      = .ok { stkSt with stack := .vBytes (Crypto.ecNegate pt) :: rest }
+/- `Stack.Ec.emitEcNegate`: `(x, y) → (x, p - y)`.  **DISCHARGED** (no longer an
+axiom): proved as a theorem in `Stack/AgreesEC.lean` as
+`RunarVerification.Stack.AgreesEC.emitEcNegate_runOps_eq`.  The codegen op-list is
+`t.ops.toList` after the `decomposePoint "_nx" "_ny"` → `pushFieldP "_fp"` →
+`fieldSub "_fp" "_ny" "_neg_y"` → `composePoint "_nx" "_neg_y" "_result"` Tracker
+chain; the discharge threads `decomposePoint_runOps_neg` → `fieldSub_runOps_sim` →
+`composePoint_runOps_sim` and reduces to `Crypto.Secp256k1.ecNegate` via
+`ecNegate_eq_makePoint`.  Carries the `decomposePoint` decode bridges + the
+`composePoint` encode/BE bridges as INPUT-side wf hypotheses. -/
 
 /- `Stack.Ec.emitEcOnCurve`: check `y² ≡ x³ + 7 mod p`. Output is a
 bool (the Stack VM models the boolean as `OP_EQUAL`'s `vBool` result).

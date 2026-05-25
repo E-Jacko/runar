@@ -20,7 +20,49 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=75        # Breakdown (2026-05-25, Tier 3 EC wave —
+TARGET_AXIOMS=74        # Breakdown (2026-05-25, Tier 3 EC wave —
+                        # emitEcNegate codegen-to-spec axiom discharge):
+                        # −1 in Crypto/Spec.lean §7 — `emitEcNegate_runOps_eq`
+                        #     RETIRED, moved to a THEOREM in Stack/AgreesEC.lean
+                        #     (Part 14). Same `decomposePoint` base as
+                        #     `emitEcOnCurve`, then `composePoint` (the build-back).
+                        #     The codegen op-list is `t.ops.toList` after the 4-step
+                        #     `decomposePoint "_nx" "_ny"` → `pushFieldP "_fp"` →
+                        #     `fieldSub "_fp" "_ny" "_neg_y"` → `composePoint
+                        #     "_nx" "_neg_y" "_result"` Tracker chain. The discharge:
+                        #     (a) `emitEcNegate_ops` proves the op-list equals the
+                        #     determined concat `expectedDecomposePoint ++ [push
+                        #     fieldP] ++ fieldSubSwapInc ++ composeInc`, folding the
+                        #     codegen findDepths via the wave-77 bridge + the
+                        #     intermediate-nm chain (enT1..enT3_nm); (b) the runtime
+                        #     threads `decomposePoint_runOps_neg` →
+                        #     `fieldSub_runOps_sim` (the NEW field-sub composed sim,
+                        #     deliverable 1) → `composePoint_runOps_sim` (the NEW
+                        #     build-back transport, deliverable 2 — the
+                        #     `decomposePoint_runOps` peer, encoding both coords via
+                        #     the `coordEncode_transport` leaf + OP_CAT), reduced to
+                        #     `Crypto.Secp256k1.ecNegate` via the spec bridge
+                        #     `ecNegate_eq_makePoint` (`fieldSub p y ≡ fieldSub 0 y`
+                        #     under the canonical `fieldMod` that `intToBE32`
+                        #     applies). Carries the SAME `decomposePoint` decode
+                        #     bridges as `emitEcPointX/Y` (`64 ≤ pt.size` + hDecX /
+                        #     hDecY) PLUS the two `composePoint` num2binEncode? +
+                        #     size + BE-encode bridges (`emitEcMakePoint`-style) at
+                        #     the coordinates `pointX pt` / `fieldSub FIELD_P
+                        #     (pointY pt)`, witnessed by
+                        #     `smoke_emitEcNegate_wf_satisfiable`.
+                        #     `#print axioms emitEcNegate_runOps_eq` = propext /
+                        #     Classical.choice / Quot.sound + the 2 pre-existing
+                        #     crypto backends (authBackend / hashBackend) only — NO
+                        #     sorryAx, NO Lean.ofReduceBool, NO new axiom, NOT
+                        #     depending on the removed axiom. native_decide ONLY in
+                        #     the smokes. STILL AXIOMATIZED: `emitEcAdd_runOps_eq`
+                        #     (last in-scope EC op — needs the fieldInv runtime sim,
+                        #     ~8k-op modular inverse) + `emitEcMul`/`emitEcMulGen`
+                        #     (Jacobian double-and-add loop).
+                        # Net delta: −1, 75 → 74.
+                        #
+                        # Breakdown (2026-05-25, Tier 3 EC wave —
                         # emitEcOnCurve codegen-to-spec axiom discharge):
                         # −1 in Crypto/Spec.lean §7 — `emitEcOnCurve_runOps_eq`
                         #     RETIRED, moved to a THEOREM in Stack/AgreesEC.lean

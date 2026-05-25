@@ -4249,4 +4249,615 @@ drift stays `76 → 76` (0 axioms discharged this wave; sub-goal (c) + the base
 on the identical per-field-helper-sim template, and unblock `emitEcAdd`/`emitEcMul`
 (the wave-76 hand-off). -/
 
+/-! ## Part 14 — `emitEcNegate` discharge (deliverables 1-3)
+
+`emitEcNegate` reuses the IDENTICAL machinery the `emitEcOnCurve` discharge proved
+(Part 10-13): the `decomposePoint_runOps` base, the determined per-helper increment
+sims, the op-list-equals-determined-concatenation bridge, and the runtime threading.
+The codegen (`Stack.Ec.emitEcNegate`) runs the 4-step tracker chain
+`decomposePoint "_pt" "_nx" "_ny"` → `pushFieldP "_fp"` →
+`fieldSub "_fp" "_ny" "_neg_y"` → `composePoint "_nx" "_neg_y" "_result"`, computing
+`(x, y) ↦ (x, p − y)`.
+
+Deliverables landed here:
+  1. **`fieldSub_runOps_sim`** — the composed-helper sim for field subtraction (the
+     `fieldMul_runOps_sim` peer at `OP_SUB`, off `fieldSub_optail_transport`).
+  2. **`composePoint_runOps_sim`** — the build-back runtime transport (the
+     `decomposePoint_runOps` peer): on the post-`fieldSub` runtime stack
+     `[neg_y, x] ++ rest`, encodes both coords (`OP_NUM2BIN`/`OP_SPLIT`/`reverse32`
+     per coord, the same encode leaf as `emitEcMakePoint`) and concatenates to the
+     64-byte point `intToBE32 x ++ intToBE32 neg_y = makePoint x neg_y`.
+  3. **`emitEcNegate_runOps_eq`** — the discharge: `emitEcNegate_ops` (op-list =
+     determined concat via the intermediate-nm chain, mirroring `emitEcOnCurve_ops`)
+     + the runtime threading (`decomposePoint_runOps` base → `fieldSub_runOps_sim`
+     on y → `composePoint_runOps_sim`), reduced to `Crypto.Secp256k1.ecNegate` via
+     the spec bridge `ecNegate_eq_makePoint` (`fieldSub p y` ≡ `fieldSub 0 y` under
+     `fieldMod`, the canonical form `intToBE32` applies).
+
+All `propext`/`Quot.sound`-clean (plus the inherited backend opaques on the
+`runOps`-bearing transports), NO `sorry`, NO new axiom, `native_decide` only in the
+concrete smokes. -/
+
+/-! ### Deliverable 1 — `fieldSub_runOps_sim` -/
+
+/-- The determined `fieldSub "_fp" "_ny"` increment off `[fp, ny, nx] ++ rest`
+(the `toTop "_fp"` is depth 0 = nop, the `toTop "_ny"` is depth 1 = `swap`).  Peer of
+`fieldMulSwapInc` at `OP_SUB`. -/
+def fieldSubSwapInc : List StackOp :=
+  [.swap, .opcode "OP_SUB", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps
+
+/-- **`fieldSub`-with-swap-lead composed runtime sim (deliverable 1).**  Running the
+determined `swap, OP_SUB, push fieldP, fieldModOps` increment on `[a, b, c] ++ rest`
+lands `Secp256k1.fieldSub a b :: c :: rest` — `swap` pairs `a` (top) over `b` for
+`OP_SUB`.  The `emitEcNegate` use is `fieldSub "_fp" "_ny"` off `[fp, ny, nx] ++ rest`
+(`a = fp`, `b = ny`, `c = nx`), landing `(p − y) :: x :: rest`.  Peer of
+`fieldMul_runOps_sim`. -/
+theorem fieldSub_runOps_sim (s : StackState) (a b c : Int) (rest : List Value)
+    (hStk : s.stack = (.vBigint a) :: (.vBigint b) :: (.vBigint c) :: rest) :
+    runOps fieldSubSwapInc s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldSub a b) :: (.vBigint c) :: rest } := by
+  unfold fieldSubSwapInc
+  rw [show ([StackOp.swap, .opcode "OP_SUB", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps)
+        = StackOp.swap :: ([.opcode "OP_SUB", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) from rfl]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap2, stepNonIf_swap]
+  rw [show applySwap s = .ok { s with stack := (.vBigint b) :: (.vBigint a) :: (.vBigint c) :: rest } by
+        unfold applySwap; rw [hStk]]
+  simp only [match_Except_ok_runOps]
+  rw [fieldSub_optail_transport { s with stack := (.vBigint b) :: (.vBigint a) :: (.vBigint c) :: rest }
+        a b ((.vBigint c) :: rest) rfl]
+
+/-- SMOKE (`fieldSub` sim fires).  On `[10, 7, 9] ++ [777]` (= `[fp, ny, nx]`), lands
+`fieldSub 10 7 = 3 :: 9 :: 777`. -/
+theorem smoke_fieldSub_runOps_sim :
+    runOps fieldSubSwapInc { (default : StackState) with stack := [.vBigint 10, .vBigint 7, .vBigint 9] ++ fhSmokeRest }
+      = .ok { (default : StackState) with
+              stack := .vBigint (Crypto.Secp256k1.fieldSub 10 7) :: .vBigint 9 :: fhSmokeRest } :=
+  fieldSub_runOps_sim _ 10 7 9 fhSmokeRest rfl
+
+/-- SMOKE (`fieldSub` sim value anti-vacuity).  `fieldSub 10 7 = 3`. -/
+theorem smoke_fieldSub_runOps_sim_value :
+    Crypto.Secp256k1.fieldSub 10 7 = 3 := by native_decide
+
+/-! ### Deliverable 2 — `composePoint_runOps_sim` (the build-back transport) -/
+
+/-- The single-coordinate big-endian encode op-list (the per-coord chunk
+`composePoint`/`emitEcMakePoint` share): `OP_NUM2BIN` to 33 LE bytes, split to the
+low 32, drop the high byte, then `emitReverse32Ops` to big-endian. -/
+def coordEncodeOps : List StackOp :=
+  [.push (.bigint 33), .opcode "OP_NUM2BIN", .push (.bigint 32), .opcode "OP_SPLIT", .drop]
+  ++ Ec.emitReverse32Ops
+
+/-- **Single-coordinate encode leaf (deliverable 2 sub-step).**  Running `coordEncodeOps`
+on `[v] ++ rest` encodes `v` to 33 LE bytes (`OP_NUM2BIN`), splits to the low 32, drops
+the high byte, and byte-reverses to big-endian — landing
+`reverseAcc 32 (enc.extract 0 32) empty :: rest`, where `enc = num2binEncode? v 33`.
+This is the first chunk of `ec_makePoint_op_transport`, extracted as a reusable leaf. -/
+theorem coordEncode_transport (s : StackState) (v : Int) (enc : ByteArray) (rest : List Value)
+    (hStk : s.stack = .vBigint v :: rest)
+    (hEnc : num2binEncode? v 33 = some enc)
+    (hSz : (32 : Nat) ≤ enc.size) :
+    runOps coordEncodeOps s
+      = .ok { s with stack := .vBytes (reverseAcc 32 (enc.extract 0 32) ByteArray.empty) :: rest } := by
+  obtain ⟨stk, alt, out, props, pre⟩ := s
+  subst hStk
+  have niOp : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by intro c t e h; cases h
+  have niDrop : ∀ t e, StackOp.drop ≠ .ifOp t e := by intro t e h; cases h
+  have niPush : ∀ (pv : PushVal) t e, StackOp.push pv ≠ .ifOp t e := by intro pv t e h; cases h
+  have hSzExtract : (enc.extract 0 32).size = 32 := by rw [ByteArray.size_extract]; omega
+  rw [show coordEncodeOps = StackOp.push (.bigint 33) :: StackOp.opcode "OP_NUM2BIN"
+        :: StackOp.push (.bigint 32) :: StackOp.opcode "OP_SPLIT" :: StackOp.drop
+        :: Ec.emitReverse32Ops from rfl]
+  -- push 33
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint 33)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- OP_NUM2BIN → enc
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_NUM2BIN"), stepNonIf_opcode]
+  rw [show runOpcode "OP_NUM2BIN"
+        { stack := .vBigint 33 :: .vBigint v :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes enc :: rest, altstack := alt,
+                outputs := out, props := props, preimage := pre } by
+      unfold runOpcode
+      simp only [popN, StackState.pop?, asInt?, StackState.push, Int.reduceLT, reduceIte]
+      rw [show (33 : Int).toNat = 33 from rfl, hEnc]]
+  simp only [match_Except_ok_runOps]
+  -- push 32
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint 32)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- OP_SPLIT at 32
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_SPLIT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_SPLIT"
+        { stack := .vBigint 32 :: .vBytes enc :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (enc.extract 32 enc.size) :: .vBytes (enc.extract 0 32) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } by
+      unfold runOpcode
+      simp only [popN, StackState.pop?, asBytes?, asNonNegativeNat?, asInt?,
+                 StackState.push, Int.reduceLT, reduceIte]
+      rw [if_neg (by omega : ¬ (32 : Int).toNat > enc.size)]; rfl]
+  simp only [match_Except_ok_runOps]
+  -- drop → [enc.extract 0 32]
+  rw [runOps_cons_nonIf_eq _ _ _ niDrop, stepNonIf_drop]
+  rw [show applyDrop
+        { stack := .vBytes (enc.extract 32 enc.size) :: .vBytes (enc.extract 0 32) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (enc.extract 0 32) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- emitReverse32Ops on the 32-byte low half
+  rw [reverse32_ops_transport
+        { stack := .vBytes (enc.extract 0 32) :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        (enc.extract 0 32) rest rfl (by rw [hSzExtract]; omega)]
+
+/-- The determined `composePoint "_nx" "_neg_y"` increment off the post-`fieldSub`
+runtime stack `[neg_y, x] ++ rest`: `toTop "_nx"` (depth 1 = `swap`) → encode x →
+`toTop "_neg_y"` (depth 1 = `swap`) → encode neg_y → `toTop "_cp_xb"`/`toTop "_cp_yb"`
+(both depth 1 = `swap`) → `OP_CAT`. -/
+def composeInc : List StackOp :=
+  [.swap] ++ coordEncodeOps ++ [.swap] ++ coordEncodeOps ++ [.swap, .swap, .opcode "OP_CAT"]
+
+set_option maxRecDepth 8192 in
+/-- **`composePoint` build-back composed runtime sim (deliverable 2).**  The
+`decomposePoint_runOps` peer: running the determined `composePoint` increment on
+`[Y, X] ++ rest` (Y on TOS, mirroring the post-`fieldSub` nm `#[_nx, _neg_y]`) encodes
+each coordinate to 32-byte big-endian (the `coordEncode_transport` leaf) and `OP_CAT`s
+`X ‖ Y`, landing `makePoint X Y :: rest`.  Carries the SAME INPUT-side hypotheses as
+`emitEcMakePoint` (two `num2binEncode?` encodings, two size guards, two BE-encode
+bridges `hBeX`/`hBeY`). -/
+theorem composePoint_runOps_sim (s : StackState) (X Y : Int) (encX encY : ByteArray)
+    (rest : List Value)
+    (hStk : s.stack = .vBigint Y :: .vBigint X :: rest)
+    (hEncX : num2binEncode? X 33 = some encX)
+    (hEncY : num2binEncode? Y 33 = some encY)
+    (hSzX : (32 : Nat) ≤ encX.size)
+    (hSzY : (32 : Nat) ≤ encY.size)
+    (hBeX : reverseAcc 32 (encX.extract 0 32) ByteArray.empty = Crypto.Secp256k1.intToBE32 X)
+    (hBeY : reverseAcc 32 (encY.extract 0 32) ByteArray.empty = Crypto.Secp256k1.intToBE32 Y) :
+    runOps composeInc s
+      = .ok { s with stack := .vBytes (Crypto.Secp256k1.makePoint X Y) :: rest } := by
+  obtain ⟨stk, alt, out, props, pre⟩ := s
+  subst hStk
+  have niSwap : ∀ t e, StackOp.swap ≠ .ifOp t e := by intro t e h; cases h
+  have niOp : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by intro c t e h; cases h
+  rw [show composeInc = StackOp.swap
+        :: (coordEncodeOps ++ ([StackOp.swap] ++ (coordEncodeOps
+            ++ [StackOp.swap, StackOp.swap, StackOp.opcode "OP_CAT"]))) from by
+      simp only [composeInc, List.append_assoc, List.cons_append, List.nil_append]]
+  -- swap → [X, Y]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBigint Y :: .vBigint X :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBigint X :: .vBigint Y :: rest, altstack := alt,
+                outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- encode X → [enc_x_be, Y]
+  rw [runOps_append, coordEncode_transport
+        { stack := .vBigint X :: .vBigint Y :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        X encX (.vBigint Y :: rest) rfl hEncX hSzX]
+  simp only [match_Except_ok_runOps, List.singleton_append]
+  -- swap → [Y, enc_x_be]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty) :: .vBigint Y :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBigint Y :: .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- encode Y → [enc_y_be, enc_x_be]
+  rw [runOps_append, coordEncode_transport
+        { stack := .vBigint Y :: .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        Y encY (.vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty) :: rest) rfl hEncY hSzY]
+  simp only [match_Except_ok_runOps]
+  -- swap → [enc_x_be, enc_y_be]
+  rw [show ([StackOp.swap, StackOp.swap, StackOp.opcode "OP_CAT"])
+        = StackOp.swap :: StackOp.swap :: [StackOp.opcode "OP_CAT"] from rfl]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty)
+                    :: .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty)
+                          :: .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- swap → [enc_y_be, enc_x_be]
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty)
+                    :: .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty)
+                          :: .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- OP_CAT → enc_x_be ++ enc_y_be (below ++ top)
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_CAT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_CAT"
+        { stack := .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty)
+                    :: .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty
+                                    ++ reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps, runOps_nil]
+  rw [hBeX, hBeY]
+  rfl
+
+/-! ### MANDATORY smokes for `composePoint_runOps_sim` (deliverable 2) -/
+
+private def smokeCpX : Int := 11
+private def smokeCpY : Int := 22
+private def smokeCpEncX : ByteArray := (num2binEncode? smokeCpX 33).getD ByteArray.empty
+private def smokeCpEncY : ByteArray := (num2binEncode? smokeCpY 33).getD ByteArray.empty
+
+/-- SMOKE (wf anti-vacuity).  All six `composePoint_runOps_sim` hypotheses are
+SATISFIABLE for `X = 11, Y = 22`.  `native_decide` is legitimate (closed-form). -/
+theorem smoke_composePoint_wf_satisfiable :
+    num2binEncode? smokeCpX 33 = some smokeCpEncX
+      ∧ num2binEncode? smokeCpY 33 = some smokeCpEncY
+      ∧ (32 : Nat) ≤ smokeCpEncX.size
+      ∧ (32 : Nat) ≤ smokeCpEncY.size
+      ∧ reverseAcc 32 (smokeCpEncX.extract 0 32) ByteArray.empty
+          = Crypto.Secp256k1.intToBE32 smokeCpX
+      ∧ reverseAcc 32 (smokeCpEncY.extract 0 32) ByteArray.empty
+          = Crypto.Secp256k1.intToBE32 smokeCpY := by
+  native_decide
+
+/-- SMOKE (the headline — build-back FIRES).  `composePoint`'s increment on
+`[22, 11] ++ [999]` (Y on TOS) lands `makePoint 11 22 :: [999]`. -/
+theorem smoke_composePoint_runOps_sim :
+    runOps composeInc
+        { (default : StackState) with stack := [.vBigint smokeCpY, .vBigint smokeCpX, .vBigint 999] }
+      = .ok { (default : StackState) with
+              stack := .vBytes (Crypto.Secp256k1.makePoint smokeCpX smokeCpY) :: [.vBigint 999] } :=
+  composePoint_runOps_sim _ smokeCpX smokeCpY smokeCpEncX smokeCpEncY [.vBigint 999] rfl
+    (by native_decide) (by native_decide) (by native_decide) (by native_decide)
+    (by native_decide) (by native_decide)
+
+/-- SMOKE (value anti-vacuity).  The composed point round-trips: x = 11, y = 22. -/
+theorem smoke_composePoint_value_concrete :
+    Crypto.Secp256k1.pointX (Crypto.Secp256k1.makePoint smokeCpX smokeCpY) = 11
+      ∧ Crypto.Secp256k1.pointY (Crypto.Secp256k1.makePoint smokeCpX smokeCpY) = 22 := by
+  native_decide
+
+/-! ### Deliverable 3a — `decomposePoint` with the `emitEcNegate` output names
+
+`emitEcNegate` decomposes into `"_nx"`/`"_ny"` (vs `emitEcOnCurve`'s `"_x"`/`"_y"`).
+The op-list and runtime transport are name-independent (the produced names only label
+`nm` slots, not ops), but the depth `decide`s need a concrete output name, so we
+re-derive the negate-named peers of `decomposePoint_ops` / `decomposePoint_runOps`. -/
+
+/-- The `decomposePoint` x-coordinate `rawBlock` tracker for the negate output name. -/
+def endpT4 : Ec.Tracker := dpT3.rawBlock 1 (some "_ny") (Ec.emitReverse32Ops ++ dpConvTail)
+
+theorem endpT4_nm : endpT4.nm = #[some "_dp_xb", some "_ny"] := by
+  rw [endpT4, rawBlock_nm_some1]
+  show (dpT3.nm.pop.push (some "_ny")) = _
+  rw [dpT3]
+  show ((((dpT2.nm.push (some "_dp_xb")).push (some "_dp_yb")).pop).push (some "_ny")) = _
+  rw [dpT2_nm]; rfl
+
+theorem endpT4_fd1 : endpT4.findDepth "_dp_xb" = 1 := by
+  rw [findDepth_eq_findDepthList _ _ (by rw [endpT4_nm]; decide)]
+  rw [endpT4_nm]; decide
+
+set_option maxRecDepth 8192 in
+/-- **`decomposePoint "_pt" "_nx" "_ny"` op-list = the determined list.**  The
+negate-named peer of `decomposePoint_ops` (same `expectedDecomposePoint`; ops are
+output-name-independent). -/
+theorem decomposePoint_ops_neg :
+    (Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_nx" "_ny").ops.toList
+      = expectedDecomposePoint := by
+  show (endpT4.toTop "_dp_xb" |>.rawBlock 1 (some "_nx")
+        (Ec.emitReverse32Ops ++ dpConvTail) |>.swap).ops.toList = _
+  rw [swap_ops_append, rawBlock_ops_append, toTop_ops_append, endpT4_fd1]
+  show (endpT4.ops.toList ++ rollExtraOps 1 ++ (Ec.emitReverse32Ops ++ dpConvTail)
+        ++ [StackOp.swap]) = _
+  rw [endpT4, rawBlock_ops_append]
+  show ((dpT3.ops.toList ++ (Ec.emitReverse32Ops ++ dpConvTail)) ++ rollExtraOps 1
+        ++ (Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]) = _
+  rw [dpT3]
+  show ((dpT2.ops.toList ++ (Ec.emitReverse32Ops ++ dpConvTail)) ++ rollExtraOps 1
+        ++ (Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]) = _
+  rw [dpT2, rawBlock_ops_append, dpT1, toTop_ops_append]
+  rw [show (Ec.Tracker.init [some "_pt"]).findDepth "_pt" = 0 from dpT1_fd0]
+  simp only [rollExtraOps, Ec.Tracker.init, dpConvTail, expectedDecomposePoint]
+  rfl
+
+open RunarVerification.Crypto.Secp256k1 (pointX pointY) in
+/-- **`decomposePoint "_pt" "_nx" "_ny"` runtime transport.**  Negate-named peer of
+`decomposePoint_runOps`: lands `[pointY p, pointX p] ++ rest` under the same wf hyps. -/
+theorem decomposePoint_runOps_neg (s : StackState) (p : ByteArray) (rest : List Value)
+    (hStk : s.stack = .vBytes p :: rest) (hSize : 64 ≤ p.size)
+    (hDecX : decodeMinimalLE
+              (reverseAcc 32 (p.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00]) = pointX p)
+    (hDecY : decodeMinimalLE
+              (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00]) = pointY p) :
+    runOps (Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_nx" "_ny").ops.toList s
+      = .ok { s with stack := .vBigint (pointY p) :: .vBigint (pointX p) :: rest } := by
+  rw [decomposePoint_ops_neg, decomposePoint_op_transport s p rest hStk hSize, hDecX, hDecY]
+
+/-- **`decomposePoint "_pt" "_nx" "_ny"` produced `nm` = `#[_nx, _ny]`.**  Negate-named
+peer of `decomposePoint_final_nm` (the `endpT5`/`endpT6` nm-chain). -/
+def endpT5 : Ec.Tracker := endpT4.toTop "_dp_xb"
+def endpT6 : Ec.Tracker := endpT5.rawBlock 1 (some "_nx") (Ec.emitReverse32Ops ++ dpConvTail)
+
+theorem endpT5_nm : endpT5.nm = #[some "_ny", some "_dp_xb"] := by
+  unfold endpT5 Ec.Tracker.toTop
+  rw [endpT4_fd1]
+  show (endpT4.swap).nm = _
+  rw [swap_nm_ge2 endpT4 (by rw [endpT4_nm]; decide), endpT4_nm]; rfl
+
+theorem endpT6_nm : endpT6.nm = #[some "_ny", some "_nx"] := by
+  unfold endpT6; rw [rawBlock_nm_some1, endpT5_nm]; rfl
+
+theorem decomposePoint_final_nm_neg :
+    (Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_nx" "_ny").nm
+      = #[some "_nx", some "_ny"] := by
+  show (endpT6.swap).nm = _
+  rw [swap_nm_ge2 endpT6 (by rw [endpT6_nm]; decide), endpT6_nm]; rfl
+
+/-! ### Deliverable 3b — the `emitEcNegate` tracker chain + op-list bridge -/
+
+/-- The `emitEcNegate` tracker chain (named so the per-helper findDepths fold). -/
+def enT1 : Ec.Tracker := Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_nx" "_ny"
+def enT2 : Ec.Tracker := Ec.pushFieldP enT1 "_fp"
+def enT3 : Ec.Tracker := Ec.fieldSub enT2 "_fp" "_ny" "_neg_y"
+
+theorem enT1_nm : enT1.nm = #[some "_nx", some "_ny"] := decomposePoint_final_nm_neg
+
+theorem enT2_nm : enT2.nm = #[some "_nx", some "_ny", some "_fp"] := by
+  show (Ec.pushFieldP enT1 "_fp").nm = _
+  rw [pushFieldP_nm, enT1_nm]; rfl
+
+theorem enT3_nm : enT3.nm = #[some "_nx", some "_neg_y"] := by
+  show (Ec.fieldSub enT2 "_fp" "_ny" "_neg_y").nm = _
+  unfold Ec.fieldSub
+  have hm1_nm : (enT2.toTop "_fp").nm = #[some "_nx", some "_ny", some "_fp"] := by
+    rw [toTop_nm_canonical enT2 "_fp" 0
+          (fd_of_nm enT2 "_fp" 0 _ enT2_nm (by decide) (by decide)) (by rw [enT2_nm]; decide), enT2_nm]
+    apply Array.ext' <;> simp
+  have hm2_nm : ((enT2.toTop "_fp").toTop "_ny").nm = #[some "_nx", some "_fp", some "_ny"] := by
+    rw [toTop_nm_canonical _ "_ny" 1
+          (fd_of_nm _ "_ny" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  have hm3_nm : (((enT2.toTop "_fp").toTop "_ny").rawBlock 2 (some "_fsub_diff")
+        [.opcode "OP_SUB"]).nm = #[some "_nx", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2, hm2_nm]; apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fsub_diff" "_neg_y" 0
+        (fd_of_nm _ "_fsub_diff" 0 _ hm3_nm (by decide) (by decide)) (by rw [hm3_nm]; decide), hm3_nm]
+  apply Array.ext' <;> simp
+
+/-- **`fieldSub "_fp" "_ny" "_neg_y"` ops = `enT2.ops ++ fieldSubSwapInc`.**  toTop
+`_fp` depth 0, `_ny` depth 1, diff depth 0 (peer of `eocFieldMul_ops` at `OP_SUB`). -/
+theorem enFieldSub_ops : enT3.ops.toList = enT2.ops.toList ++ fieldSubSwapInc := by
+  show (Ec.fieldSub enT2 "_fp" "_ny" "_neg_y").ops.toList = _
+  unfold Ec.fieldSub
+  have hm1_nm : (enT2.toTop "_fp").nm = #[some "_nx", some "_ny", some "_fp"] := by
+    rw [toTop_nm_canonical enT2 "_fp" 0
+          (fd_of_nm enT2 "_fp" 0 _ enT2_nm (by decide) (by decide)) (by rw [enT2_nm]; decide), enT2_nm]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((enT2.toTop "_fp").toTop "_ny").rawBlock 2 (some "_fsub_diff")
+        [.opcode "OP_SUB"]).nm = #[some "_nx", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_ny" 1
+          (fd_of_nm _ "_ny" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [show (Ec.fieldMod (((enT2.toTop "_fp").toTop "_ny").rawBlock 2 (some "_fsub_diff")
+        [.opcode "OP_SUB"]) "_fsub_diff" "_neg_y").ops.toList
+        = _ from fieldBinop_ops_append enT2 "_fp" "_ny" "_fsub_diff" "_neg_y" (.opcode "OP_SUB")]
+  rw [fd_of_nm enT2 "_fp" 0 _ enT2_nm (by decide) (by decide),
+      fd_of_nm _ "_ny" 1 _ hm1_nm (by decide) (by decide),
+      fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide)]
+  simp only [fieldSubSwapInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- **`composePoint "_nx" "_neg_y" "_result"` ops = `enT3.ops ++ composeInc`.**  All four
+internal toTops are depth 1 (the post-`fieldSub` nm `#[_nx, _neg_y]` then the two encode
+slots).  The body's per-coord conv-ops literal is definitionally `coordEncodeOps`. -/
+theorem enComposePoint_ops :
+    (Ec.composePoint enT3 "_nx" "_neg_y" "_result").ops.toList = enT3.ops.toList ++ composeInc := by
+  rw [show Ec.composePoint enT3 "_nx" "_neg_y" "_result"
+        = ((((((enT3.toTop "_nx").rawBlock 1 (some "_cp_xb") coordEncodeOps).toTop "_neg_y").rawBlock
+            1 (some "_cp_yb") coordEncodeOps).toTop "_cp_xb").toTop "_cp_yb").rawBlock 2 (some "_result")
+            [.opcode "OP_CAT"] from rfl]
+  -- name the four-toTop/two-rawBlock chain explicitly to fold each depth-1 findDepth
+  have hc1_nm : (enT3.toTop "_nx").nm = #[some "_neg_y", some "_nx"] := by
+    rw [toTop_nm_canonical enT3 "_nx" 1
+          (fd_of_nm enT3 "_nx" 1 _ enT3_nm (by decide) (by decide)) (by rw [enT3_nm]; decide), enT3_nm]
+    apply Array.ext' <;> simp
+  have hc2_nm : ((enT3.toTop "_nx").rawBlock 1 (some "_cp_xb") coordEncodeOps).nm
+      = #[some "_neg_y", some "_cp_xb"] := by
+    rw [rawBlock_nm_some1, hc1_nm]; rfl
+  have hc3_nm : (((enT3.toTop "_nx").rawBlock 1 (some "_cp_xb") coordEncodeOps).toTop "_neg_y").nm
+      = #[some "_cp_xb", some "_neg_y"] := by
+    rw [toTop_nm_canonical _ "_neg_y" 1
+          (fd_of_nm _ "_neg_y" 1 _ hc2_nm (by decide) (by decide)) (by rw [hc2_nm]; decide), hc2_nm]
+    apply Array.ext' <;> simp
+  have hc4_nm : ((((enT3.toTop "_nx").rawBlock 1 (some "_cp_xb") coordEncodeOps).toTop "_neg_y").rawBlock
+        1 (some "_cp_yb") coordEncodeOps).nm = #[some "_cp_xb", some "_cp_yb"] := by
+    rw [rawBlock_nm_some1, hc3_nm]; rfl
+  have hc5_nm : (((((enT3.toTop "_nx").rawBlock 1 (some "_cp_xb") coordEncodeOps).toTop "_neg_y").rawBlock
+        1 (some "_cp_yb") coordEncodeOps).toTop "_cp_xb").nm = #[some "_cp_yb", some "_cp_xb"] := by
+    rw [toTop_nm_canonical _ "_cp_xb" 1
+          (fd_of_nm _ "_cp_xb" 1 _ hc4_nm (by decide) (by decide)) (by rw [hc4_nm]; decide), hc4_nm]
+    apply Array.ext' <;> simp
+  rw [rawBlock_ops_append, toTop_ops_append, toTop_ops_append, rawBlock_ops_append,
+      toTop_ops_append, rawBlock_ops_append, toTop_ops_append]
+  rw [fd_of_nm enT3 "_nx" 1 _ enT3_nm (by decide) (by decide),
+      fd_of_nm _ "_neg_y" 1 _ hc2_nm (by decide) (by decide),
+      fd_of_nm _ "_cp_xb" 1 _ hc4_nm (by decide) (by decide),
+      fd_of_nm _ "_cp_yb" 1 _ hc5_nm (by decide) (by decide)]
+  simp only [composeInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append,
+    List.singleton_append]
+
+/-- **The determined `emitEcNegate` op-list.** -/
+def expectedEcNegate : List StackOp :=
+  expectedDecomposePoint ++ [.push (.bigint Ec.fieldP)] ++ fieldSubSwapInc ++ composeInc
+
+/-- **`emitEcNegate` op-list = the determined concatenation (deliverable 3).**  Threads
+the decomposePoint ops + `pushFieldP` + the `fieldSub` increment + the `composePoint`
+increment, each depth folded via the wave-77 bridge.  OUTPUT-PRESERVING. -/
+theorem emitEcNegate_ops : Ec.emitEcNegate = expectedEcNegate := by
+  show (Ec.composePoint enT3 "_nx" "_neg_y" "_result").ops.toList = _
+  rw [enComposePoint_ops, enFieldSub_ops]
+  show enT2.ops.toList ++ fieldSubSwapInc ++ composeInc = _
+  show (Ec.pushFieldP enT1 "_fp").ops.toList ++ fieldSubSwapInc ++ composeInc = _
+  rw [pushFieldP_ops_append]
+  show enT1.ops.toList ++ [.push (.bigint Ec.fieldP)] ++ fieldSubSwapInc ++ composeInc = _
+  show (Ec.decomposePoint (Ec.Tracker.init [some "_pt"]) "_pt" "_nx" "_ny").ops.toList
+        ++ [.push (.bigint Ec.fieldP)] ++ fieldSubSwapInc ++ composeInc = _
+  rw [decomposePoint_ops_neg]
+  simp only [expectedEcNegate, List.append_assoc]
+
+/-! ### Deliverable 3c — the spec bridge `ecNegate = makePoint x (fieldSub p y)` -/
+
+/-- **`fieldMod` collapses `fieldSub p y` to `fieldSub 0 y`.**  `p − y ≡ −y (mod p)`,
+so the two land the SAME canonical residue.  Pure `Int.emod` arithmetic. -/
+theorem fieldMod_fieldSub_p_eq (y : Int) :
+    Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P y)
+      = Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.fieldSub 0 y) := by
+  unfold Crypto.Secp256k1.fieldSub Crypto.Secp256k1.fieldMod
+  rw [show ((Crypto.Secp256k1.FIELD_P - y) % Crypto.Secp256k1.FIELD_P + Crypto.Secp256k1.FIELD_P)
+            % Crypto.Secp256k1.FIELD_P % Crypto.Secp256k1.FIELD_P
+        = ((0 - y) % Crypto.Secp256k1.FIELD_P + Crypto.Secp256k1.FIELD_P)
+            % Crypto.Secp256k1.FIELD_P % Crypto.Secp256k1.FIELD_P from by
+      rw [Int.sub_emod Crypto.Secp256k1.FIELD_P y Crypto.Secp256k1.FIELD_P,
+          Int.sub_emod 0 y Crypto.Secp256k1.FIELD_P, Int.emod_self, Int.zero_emod]]
+
+/-- `intToBE32` depends only on `fieldMod` of its argument. -/
+theorem intToBE32_fieldMod_congr (a b : Int)
+    (h : Crypto.Secp256k1.fieldMod a = Crypto.Secp256k1.fieldMod b) :
+    Crypto.Secp256k1.intToBE32 a = Crypto.Secp256k1.intToBE32 b := by
+  unfold Crypto.Secp256k1.intToBE32; rw [h]
+
+/-- **`ecNegate p = makePoint (pointX p) (fieldSub p (pointY p))`.**  The spec
+`ecNegate p = makePoint x (fieldSub 0 y)` computes the negated y as `fieldSub 0 y`;
+the codegen pushes `fieldP` and computes `fieldSub fieldP y`.  Both encode to the same
+big-endian bytes via `intToBE32` (which `fieldMod`s first).  This is the bridge that
+lets the runtime output `makePoint x (fieldSub FIELD_P y)` close to `ecNegate p`. -/
+theorem ecNegate_eq_makePoint (p : ByteArray) :
+    Crypto.Secp256k1.ecNegate p
+      = Crypto.Secp256k1.makePoint (Crypto.Secp256k1.pointX p)
+          (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P (Crypto.Secp256k1.pointY p)) := by
+  show Crypto.Secp256k1.intToBE32 (Crypto.Secp256k1.pointX p)
+        ++ Crypto.Secp256k1.intToBE32 (Crypto.Secp256k1.fieldSub 0 (Crypto.Secp256k1.pointY p))
+      = Crypto.Secp256k1.intToBE32 (Crypto.Secp256k1.pointX p)
+        ++ Crypto.Secp256k1.intToBE32 (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P (Crypto.Secp256k1.pointY p))
+  rw [intToBE32_fieldMod_congr (Crypto.Secp256k1.fieldSub 0 (Crypto.Secp256k1.pointY p))
+        (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P (Crypto.Secp256k1.pointY p))
+        (fieldMod_fieldSub_p_eq (Crypto.Secp256k1.pointY p)).symm]
+
+/-! ### Deliverable 3 — the `emitEcNegate` runtime threading + discharge -/
+
+set_option maxRecDepth 4096 in
+/-- **DISCHARGED — `emitEcNegate` agrees with `Crypto.Secp256k1.ecNegate`.**  Running the
+determined op-list on `[pt] ++ rest` threads the `decomposePoint_runOps_neg` base →
+`fieldSub_runOps_sim` on y (pushing `fieldP` first) → `composePoint_runOps_sim`, landing
+`vBytes (ecNegate pt) :: rest`.  The wf hypotheses are the INPUT-side `decomposePoint`
+decode bridges (the same `emitEcPointX/Y` carry) PLUS the two `composePoint`
+`OP_NUM2BIN`-encode + BE-bridge hypotheses (the same `emitEcMakePoint` carries), here at
+the coordinates `pointX pt` and `fieldSub FIELD_P (pointY pt)`.  `propext`/`Quot.sound`
+-clean + inherited backend opaques, NO new axiom.  Replaces the
+`Crypto.Spec.emitEcNegate_runOps_eq` axiom. -/
+theorem emitEcNegate_runOps_eq (stkSt : StackState) (pt : ByteArray) (rest : List Value)
+    (hStk : stkSt.stack = .vBytes pt :: rest) (hSize : 64 ≤ pt.size)
+    (hDecX : decodeMinimalLE
+              (reverseAcc 32 (pt.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointX pt)
+    (hDecY : decodeMinimalLE
+              (reverseAcc 32 (pt.extract 32 pt.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointY pt)
+    (encX encNegY : ByteArray)
+    (hEncX : num2binEncode? (Crypto.Secp256k1.pointX pt) 33 = some encX)
+    (hEncNegY : num2binEncode? (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P (Crypto.Secp256k1.pointY pt)) 33
+                  = some encNegY)
+    (hSzX : (32 : Nat) ≤ encX.size)
+    (hSzNegY : (32 : Nat) ≤ encNegY.size)
+    (hBeX : reverseAcc 32 (encX.extract 0 32) ByteArray.empty
+              = Crypto.Secp256k1.intToBE32 (Crypto.Secp256k1.pointX pt))
+    (hBeNegY : reverseAcc 32 (encNegY.extract 0 32) ByteArray.empty
+              = Crypto.Secp256k1.intToBE32 (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P (Crypto.Secp256k1.pointY pt))) :
+    runOps Ec.emitEcNegate stkSt
+      = .ok { stkSt with stack := .vBytes (Crypto.Secp256k1.ecNegate pt) :: rest } := by
+  rw [emitEcNegate_ops]
+  unfold expectedEcNegate
+  simp only [List.append_assoc]
+  -- base: decomposePoint → [pointY pt, pointX pt] ++ rest
+  have hbase : runOps enT1.ops.toList stkSt
+      = .ok { stkSt with stack := .vBigint (Crypto.Secp256k1.pointY pt)
+                :: .vBigint (Crypto.Secp256k1.pointX pt) :: rest } :=
+    decomposePoint_runOps_neg stkSt pt rest hStk hSize hDecX hDecY
+  rw [runOps_append, show enT1.ops.toList = expectedDecomposePoint from decomposePoint_ops_neg] at *
+  rw [hbase]
+  simp only [match_Except_ok_runOps, List.singleton_append]
+  -- push fieldP → [fieldP, pointY pt, pointX pt] ++ rest
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint Ec.fieldP)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- fieldSub "_fp" "_ny" → [fieldSub fieldP (pointY pt), pointX pt] ++ rest
+  rw [runOps_append, fieldSub_runOps_sim _ Ec.fieldP (Crypto.Secp256k1.pointY pt) (Crypto.Secp256k1.pointX pt) rest rfl]
+  simp only [match_Except_ok_runOps]
+  -- composePoint → [makePoint (pointX pt) (fieldSub fieldP (pointY pt))] ++ rest
+  rw [show Ec.fieldP = Crypto.Secp256k1.FIELD_P from ec_fieldP_eq_spec]
+  rw [composePoint_runOps_sim
+        { stkSt with stack := .vBigint (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P (Crypto.Secp256k1.pointY pt))
+            :: .vBigint (Crypto.Secp256k1.pointX pt) :: rest }
+        (Crypto.Secp256k1.pointX pt)
+        (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P (Crypto.Secp256k1.pointY pt))
+        encX encNegY rest rfl hEncX hEncNegY hSzX hSzNegY hBeX hBeNegY]
+  rw [← ecNegate_eq_makePoint pt]
+
+/-! ### MANDATORY smoke for the `emitEcNegate` discharge (deliverable 3) -/
+
+/-- Concrete `OP_NUM2BIN` encodings for the discharge smoke at `makePoint 11 22`. -/
+private def smokeNegEncX : ByteArray :=
+  (num2binEncode? (Crypto.Secp256k1.pointX smokeDpPt) 33).getD ByteArray.empty
+private def smokeNegEncNegY : ByteArray :=
+  (num2binEncode? (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P (Crypto.Secp256k1.pointY smokeDpPt)) 33).getD ByteArray.empty
+
+/-- SMOKE (wf anti-vacuity).  ALL discharge hypotheses are SATISFIABLE for
+`makePoint 11 22`: the two decode bridges, the two `num2binEncode?` encodings, the two
+size guards, and the two BE bridges all hold concretely.  Rules out a vacuous discharge. -/
+theorem smoke_emitEcNegate_wf_satisfiable :
+    (64 : Nat) ≤ smokeDpPt.size
+      ∧ decodeMinimalLE (reverseAcc 32 (smokeDpPt.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = Crypto.Secp256k1.pointX smokeDpPt
+      ∧ decodeMinimalLE (reverseAcc 32 (smokeDpPt.extract 32 smokeDpPt.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = Crypto.Secp256k1.pointY smokeDpPt
+      ∧ num2binEncode? (Crypto.Secp256k1.pointX smokeDpPt) 33 = some smokeNegEncX
+      ∧ num2binEncode? (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P (Crypto.Secp256k1.pointY smokeDpPt)) 33
+          = some smokeNegEncNegY
+      ∧ (32 : Nat) ≤ smokeNegEncX.size
+      ∧ (32 : Nat) ≤ smokeNegEncNegY.size
+      ∧ reverseAcc 32 (smokeNegEncX.extract 0 32) ByteArray.empty
+          = Crypto.Secp256k1.intToBE32 (Crypto.Secp256k1.pointX smokeDpPt)
+      ∧ reverseAcc 32 (smokeNegEncNegY.extract 0 32) ByteArray.empty
+          = Crypto.Secp256k1.intToBE32 (Crypto.Secp256k1.fieldSub Crypto.Secp256k1.FIELD_P (Crypto.Secp256k1.pointY smokeDpPt)) := by
+  native_decide
+
+/-- Concrete entry state for the discharge smoke: `[makePoint 11 22, 999]`. -/
+private def smokeNegStk : StackState :=
+  { (default : StackState) with stack := [.vBytes smokeDpPt, .vBigint 999] }
+
+/-- SMOKE (the headline — discharge FIRES).  `emitEcNegate` on the concrete point
+`makePoint 11 22` lands `vBytes (ecNegate …) :: rest`, with `rest` preserved beneath. -/
+theorem smoke_emitEcNegate_runOps_eq :
+    runOps Ec.emitEcNegate smokeNegStk
+      = .ok { smokeNegStk with
+          stack := .vBytes (Crypto.Secp256k1.ecNegate smokeDpPt) :: [.vBigint 999] } :=
+  emitEcNegate_runOps_eq smokeNegStk smokeDpPt [.vBigint 999] rfl (by native_decide)
+    (by native_decide) (by native_decide) smokeNegEncX smokeNegEncNegY
+    (by native_decide) (by native_decide) (by native_decide) (by native_decide)
+    (by native_decide) (by native_decide)
+
+/-- SMOKE (value anti-vacuity).  `ecNegate (makePoint 11 22)` keeps x = 11 and negates
+y to `fieldSub 0 22 = p − 22` (≠ 22), so the discharge yields a non-trivial result. -/
+theorem smoke_emitEcNegate_value_concrete :
+    Crypto.Secp256k1.pointX (Crypto.Secp256k1.ecNegate smokeDpPt) = 11
+      ∧ Crypto.Secp256k1.pointY (Crypto.Secp256k1.ecNegate smokeDpPt)
+          = Crypto.Secp256k1.fieldSub 0 22 := by native_decide
+
 end RunarVerification.Stack.AgreesEC
