@@ -5480,6 +5480,94 @@ open FieldInvSpec (samLow) in
 (`samLow 5 1 1 2 = 20`); bit clear → square-only (`samLow 5 0 1 2 = 4`). -/
 theorem smoke_samLow_cond : samLow 5 1 1 2 = 20 ∧ samLow 5 0 1 2 = 4 := by native_decide
 
+/-! ### Deliverable 1 — `fieldInv` runtime sim (the determined op-list, depth-0 entry)
+
+The codegen `fieldInv` (`Stack/Ec.lean:356`) on a depth-0 input (`aName` at TOS, the
+affineAdd entry: `_s_den` was just produced) runs:
+
+* prelude `copyToTop aName "_inv_r"` at depth 0 = `.dup`  →  `[a, a] ++ rest`,
+* `fieldInvHighLoop 222`  =  `highLoopInc 222`,
+* bit 32: `fieldSqr "_inv_r" "_inv_r2"` (depth 0)  =  `fieldSqrYInc`,
+* `fieldInvLowLoop 32 0xFFFFFC2D`  =  `lowLoopInc 32 0xFFFFFC2D`,
+* cleanup `toTop aName` (depth 1 = `.swap`) → `.drop` → `toTop "_inv_r"` (depth 0 = nop)
+  → `rename` (no op)  =  `[.swap, .drop]`.
+
+The two loop runtime inductions (`highLoopInc_runOps_sim` / `lowLoopInc_runOps_sim`) thread
+the spec accumulators `samHigh`/`samLow`, whose composition is `fieldInvAccum a = fieldInv a`
+(the proven crux `fieldInvAccum_eq`), reduced to `Crypto.Secp256k1.fieldInv a`. -/
+
+private theorem niDupInv : ∀ t e, StackOp.dup ≠ .ifOp t e := by intro t e h; cases h
+private theorem niDropInv : ∀ t e, StackOp.drop ≠ .ifOp t e := by intro t e h; cases h
+
+open Crypto.Secp256k1 (fieldMul) in
+open FieldInvSpec (samHigh samLow fieldInvAccum) in
+/-- The determined runtime op-list of `Stack.Ec.fieldInv` at a depth-0 input. -/
+def fieldInvCoreInc : List StackOp :=
+  [.dup] ++ highLoopInc 222 ++ fieldSqrYInc ++ lowLoopInc 32 0xFFFFFC2D ++ [.swap, .drop]
+
+set_option maxRecDepth 4096 in
+open Crypto.Secp256k1 (fieldMul fieldInv) in
+open FieldInvSpec (samHigh samLow fieldInvAccum fieldInvAccum_eq) in
+/-- **`fieldInv` runtime sim (deliverable 1).**  Running the determined depth-0 `fieldInv`
+op-list on `[a] ++ rest` lands `Crypto.Secp256k1.fieldInv a :: rest` — the runtime witness
+of the modular inverse the affineAdd chain threads.  Composes the prelude `dup`, the
+222-iter high loop (`highLoopInc_runOps_sim`), the bit-32 square (`fieldSqr_runOps_sim`),
+the 32-iter low loop (`lowLoopInc_runOps_sim`), and the `swap, drop` cleanup, reduced to
+`fieldInv a` via the proven crux `fieldInvAccum_eq`.  No `native_decide`; `propext`/
+`Quot.sound`-clean. -/
+theorem fieldInv_runOps_sim (s : StackState) (a : Int) (rest : List Value)
+    (hStk : s.stack = (.vBigint a) :: rest) :
+    runOps fieldInvCoreInc s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldInv a) :: rest } := by
+  unfold fieldInvCoreInc
+  simp only [List.append_assoc, List.cons_append, List.nil_append]
+  -- prelude: dup → [a, a] ++ rest
+  rw [runOps_cons_nonIf_eq _ _ _ niDupInv, stepNonIf_dup]
+  rw [show applyDup s = .ok { s with stack := (.vBigint a) :: (.vBigint a) :: rest } by
+        unfold applyDup StackState.push; rw [hStk]]
+  simp only [match_Except_ok_runOps]
+  -- high loop 222: [a, a] ++ rest → [samHigh a 222 a, a] ++ rest
+  rw [runOps_append, highLoopInc_runOps_sim 222 a a
+        { s with stack := (.vBigint a) :: (.vBigint a) :: rest } rest rfl]
+  simp only [match_Except_ok_runOps]
+  -- bit 32 square: [samHigh a 222 a, a] ++ rest → [(samHigh a 222 a)², a] ++ rest
+  rw [runOps_append, fieldSqr_runOps_sim
+        { s with stack := .vBigint (FieldInvSpec.samHigh a 222 a) :: (.vBigint a) :: rest }
+        (FieldInvSpec.samHigh a 222 a) a rest rfl]
+  simp only [match_Except_ok_runOps]
+  -- low loop 32: [(samHigh a 222 a)², a] ++ rest → [samLow a 0xFFFFFC2D 32 ((samHigh a 222 a)²), a] ++ rest
+  rw [runOps_append, lowLoopInc_runOps_sim 32 a 0xFFFFFC2D
+        (Crypto.Secp256k1.fieldMul (FieldInvSpec.samHigh a 222 a) (FieldInvSpec.samHigh a 222 a))
+        { s with stack := .vBigint (Crypto.Secp256k1.fieldMul (FieldInvSpec.samHigh a 222 a) (FieldInvSpec.samHigh a 222 a)) :: (.vBigint a) :: rest } rest rfl]
+  simp only [match_Except_ok_runOps]
+  -- cleanup: swap → [a, fieldInvAccum a] ++ rest
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap2, stepNonIf_swap]
+  rw [show applySwap
+        { s with stack := .vBigint (FieldInvSpec.samLow a 0xFFFFFC2D 32 (Crypto.Secp256k1.fieldMul (FieldInvSpec.samHigh a 222 a) (FieldInvSpec.samHigh a 222 a))) :: (.vBigint a) :: rest }
+        = .ok { s with stack := (.vBigint a) :: .vBigint (FieldInvSpec.samLow a 0xFFFFFC2D 32 (Crypto.Secp256k1.fieldMul (FieldInvSpec.samHigh a 222 a) (FieldInvSpec.samHigh a 222 a))) :: rest } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- cleanup: drop → [fieldInvAccum a] ++ rest
+  rw [runOps_cons_nonIf_eq _ _ _ niDropInv, stepNonIf_drop]
+  rw [show applyDrop
+        { s with stack := (.vBigint a) :: .vBigint (FieldInvSpec.samLow a 0xFFFFFC2D 32 (Crypto.Secp256k1.fieldMul (FieldInvSpec.samHigh a 222 a) (FieldInvSpec.samHigh a 222 a))) :: rest }
+        = .ok { s with stack := .vBigint (FieldInvSpec.samLow a 0xFFFFFC2D 32 (Crypto.Secp256k1.fieldMul (FieldInvSpec.samHigh a 222 a) (FieldInvSpec.samHigh a 222 a))) :: rest } from rfl]
+  simp only [match_Except_ok_runOps, runOps_nil]
+  -- the accumulator IS fieldInv a (the proven crux)
+  rw [show FieldInvSpec.samLow a 0xFFFFFC2D 32 (Crypto.Secp256k1.fieldMul (FieldInvSpec.samHigh a 222 a) (FieldInvSpec.samHigh a 222 a))
+        = FieldInvSpec.fieldInvAccum a from rfl, FieldInvSpec.fieldInvAccum_eq a]
+
+/-! ### MANDATORY smoke for the `fieldInv` runtime sim (deliverable 1) -/
+
+/-- SMOKE (the `fieldInv` runtime sim FIRES, anti-vacuity).  On `[7] ++ rest`, the
+determined `fieldInv` op-list lands `fieldInv 7 :: rest`, with `rest` preserved.
+Symbolic — the value `fieldInv 7` is a 2²⁵⁶-step exponent recursion, so the headline is
+the runtime transport itself, not a numeric reduction. -/
+theorem smoke_fieldInv_runOps_sim :
+    runOps fieldInvCoreInc { (default : StackState) with stack := [.vBigint 7] ++ invSmokeRest }
+      = .ok { (default : StackState) with
+              stack := .vBigint (Crypto.Secp256k1.fieldInv 7) :: invSmokeRest } :=
+  fieldInv_runOps_sim _ 7 invSmokeRest rfl
+
 /-! ## Part 15 (cont.) — `fieldInv` op-list bridge + affineAdd + `emitEcAdd` discharge: HONEST BLOCK
 
 The spec-level square-and-multiply crux (`FieldInvSpec.fieldInvAccum_eq`) is PROVEN, AND
