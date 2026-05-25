@@ -6148,6 +6148,329 @@ theorem smoke_fieldInv_ops_depth0 :
   fieldInv_ops_depth0 invBridgeD0 [some "_pa"] "_s_den" "_s_den_inv"
     (by decide) (by decide) (by decide) (by decide)
 
+/-! ## Part 16 — Depth-general field-binop runtime sims (affineAdd deliverable 1)
+
+The Part-12 per-field-helper sims (`fieldSub_runOps_sim`, `fieldMul_runOps_sim`, …) are
+SHALLOW: they assume the operands sit at fixed depths 0/1 and collapse the `toTop`s to
+literal `swap`/`dup`/nop.  `affineAdd` keeps `px/py/qx/qy` at DEEP, step-varying depths as
+scratch churns above, so its `toTop aName`/`toTop bName` resolve to arbitrary
+`findDepthList` depths.  This Part adds the DEPTH-GENERAL form: a single
+`fieldBinop_runOps_simT` that runs the determined `fieldSub`/`fieldMul` increment
+(`rollExtraOps da ++ rollExtraOps db ++ [binop, push fieldP] ++ fieldModOps`) at the LIVE
+depths via the tail-general step transport `runOps_toTop_extraOps_simT` (the same general
+transport the proof corpus uses for varying depths), landing the `Crypto.Secp256k1`
+field-op result.  Each ships a smoke.  All `propext`/`Quot.sound`-clean (plus inherited
+backend opaques on the `runOps` transports), NO new axiom, `native_decide` only in smokes. -/
+
+private theorem niOpBinop : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by
+  intro c t e h; cases h
+private theorem niPushBinop : ∀ (v : PushVal) t e, StackOp.push v ≠ .ifOp t e := by
+  intro v t e h; cases h
+
+/-- The determined DEPTH-GENERAL field-binop increment: roll `aName` to top (depth `da`),
+roll `bName` to top (depth `db`, resolved in the post-first-roll stack), apply the binop,
+push the field prime, reduce mod p.  `da`/`db` are the live roll depths the codegen decides
+per affineAdd step. -/
+def fieldBinopGenInc (da db : Nat) (binop : String) : List StackOp :=
+  rollExtraOps da ++ rollExtraOps db ++ ([.opcode binop, .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps)
+
+/-- **Depth-general field-binop runtime sim (deliverable 1).**  Running the determined
+two-roll + opcode-tail increment at arbitrary depths `da`/`db` lands
+`Secp256k1.fieldMod (f av bv)` on top.
+
+The runtime model is given DIRECTLY (not via an nm valuation): `da` is the depth at which
+`av` sits in `s.stack`, and after rolling it up, `db` is the depth at which `bv` sits in the
+post-first-roll stack.  Both rolls use the GENERAL `runOps_rollExtraOps` (NOT the depth-0/1
+special cases), so the lemma serves the deep, step-varying affineAdd depths.  `mid`/`out`
+are the residual stacks each roll leaves; the codegen's nm bookkeeping (Part 17) supplies
+the concrete `da`/`db`/`mid`/`out` per affineAdd step. -/
+theorem fieldBinop_runOps_simT
+    (binop : String) (f : Int → Int → Int)
+    (s : StackState) (av bv : Int) (da db : Nat)
+    (mid out : List Value)
+    (hda : da < s.stack.length)
+    (hRoll1 : applyRoll s da = .ok { s with stack := .vBigint av :: mid })
+    (hdb : db < (.vBigint av :: mid).length)
+    (hRoll2 : applyRoll { s with stack := .vBigint av :: mid } db
+                = .ok { s with stack := .vBigint bv :: .vBigint av :: out })
+    (hBinop : ∀ (t : StackState), t.stack = .vBigint bv :: .vBigint av :: out
+        → runOpcode binop t = .ok ({ t with stack := out }.push (.vBigint (f av bv)))) :
+    runOps (fieldBinopGenInc da db binop) s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMod (f av bv)) :: out } := by
+  unfold fieldBinopGenInc
+  simp only [List.append_assoc]
+  -- roll 1: brings av to top
+  rw [runOps_append, runOps_rollExtraOps s da hda, hRoll1]
+  simp only [match_Except_ok_runOps]
+  -- roll 2: brings bv to top (over av)
+  rw [runOps_append, runOps_rollExtraOps { s with stack := .vBigint av :: mid } db hdb, hRoll2]
+  simp only [match_Except_ok_runOps]
+  -- opcode tail: f av bv mod p
+  rw [fieldBinop_optail_transport binop f { s with stack := .vBigint bv :: .vBigint av :: out }
+        av bv out (hBinop _ rfl)]
+
+/-- SMOKE (depth-general field-binop sim FIRES).  With `OP_SUB` at depths 2 then 1 on
+`[x, y, av, z] ++ rest` (av at depth 2), then `[av, x, y, z]` (... bv = y at depth 2 in the
+post-roll stack), the increment lands `fieldMod (av - bv)` on top.  Here concrete:
+`s = [9, 7, 5, 3]`, `da = 2` (rolls 5 up), `db = 2` (rolls 7 up over 5), `out = [9, 3]`,
+landing `fieldSub 5 7`. -/
+theorem smoke_fieldBinop_runOps_simT :
+    runOps (fieldBinopGenInc 2 2 "OP_SUB")
+        { (default : StackState) with stack := [.vBigint 9, .vBigint 7, .vBigint 5, .vBigint 3] }
+      = .ok { (default : StackState) with
+              stack := .vBigint (Crypto.Secp256k1.fieldMod (5 - 7)) :: [.vBigint 9, .vBigint 3] } :=
+  fieldBinop_runOps_simT "OP_SUB" (· - ·) _ 5 7 2 2
+    [.vBigint 9, .vBigint 7, .vBigint 3] [.vBigint 9, .vBigint 3]
+    (by decide) (by rfl) (by decide) (by rfl)
+    (fun t ht => runOpcode_SUB_bigint_local t 5 7 [.vBigint 9, .vBigint 3] ht)
+
+/-- The determined DEPTH-GENERAL `fieldSqr` increment: copy `aName` to top (pick depth
+`dp`), then square via `fieldMul aName "_fsqr_copy"` — roll the now-deeper `aName` up
+(`dm1`), roll the fresh copy up (`dm2`), `OP_MUL`, mod p.  `dp`/`dm1`/`dm2` are the live
+depths the codegen decides per affineAdd step. -/
+def fieldSqrGenInc (dp dm1 dm2 : Nat) : List StackOp :=
+  pickExtraOps dp ++ fieldBinopGenInc dm1 dm2 "OP_MUL"
+
+/-- **Depth-general `fieldSqr` runtime sim (deliverable 1).**  Running the determined
+copy-then-multiply increment at arbitrary depths lands `Secp256k1.fieldMul av av` on top.
+The `copyToTop` (`runOps_pickExtraOps` at depth `dp`) duplicates `av`; the inner `fieldMul`
+then pairs the two copies via the general two-roll transport (`fieldBinop_runOps_simT`).
+`mid`/`out` are the residual stacks; the codegen nm bookkeeping (Part 17) supplies the
+concrete depths per affineAdd step. -/
+theorem fieldSqr_runOps_simT
+    (s : StackState) (av : Int) (dp dm1 dm2 : Nat)
+    (mid out : List Value)
+    (hdp : dp < s.stack.length)
+    (hPick : applyPick s dp = .ok (s.push (.vBigint av)))
+    (hdm1 : dm1 < (s.push (.vBigint av)).stack.length)
+    (hRoll1 : applyRoll (s.push (.vBigint av)) dm1 = .ok { s with stack := .vBigint av :: mid })
+    (hdm2 : dm2 < (.vBigint av :: mid).length)
+    (hRoll2 : applyRoll { s with stack := .vBigint av :: mid } dm2
+                = .ok { s with stack := .vBigint av :: .vBigint av :: out }) :
+    runOps (fieldSqrGenInc dp dm1 dm2) s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMul av av) :: out } := by
+  unfold fieldSqrGenInc
+  rw [runOps_append, runOps_pickExtraOps s dp hdp, hPick]
+  simp only [match_Except_ok_runOps]
+  rw [fieldBinop_runOps_simT "OP_MUL" (· * ·) (s.push (.vBigint av)) av av dm1 dm2 mid out
+        hdm1 hRoll1 hdm2 hRoll2
+        (fun t ht => runOpcode_MUL_bigint_local t av av out ht)]
+  show Except.ok { (s.push (.vBigint av)) with stack := .vBigint (Crypto.Secp256k1.fieldMod (av * av)) :: out }
+    = Except.ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMul av av) :: out }
+  rfl
+
+/-- SMOKE (depth-general `fieldSqr` sim FIRES).  On `[5, 9, 3]`, copy `5` (depth 0) →
+`[5, 5, 9, 3]`, then square the two `5`s (rolls at depth 0/1), landing `fieldMul 5 5`
+on top with `[9, 3]` beneath. -/
+theorem smoke_fieldSqr_runOps_simT :
+    runOps (fieldSqrGenInc 0 1 1)
+        { (default : StackState) with stack := [.vBigint 5, .vBigint 9, .vBigint 3] }
+      = .ok { (default : StackState) with
+              stack := .vBigint (Crypto.Secp256k1.fieldMul 5 5) :: [.vBigint 9, .vBigint 3] } :=
+  fieldSqr_runOps_simT _ 5 0 1 1
+    [.vBigint 5, .vBigint 9, .vBigint 3] [.vBigint 9, .vBigint 3]
+    (by decide) (by rfl) (by decide) (by rfl) (by decide) (by rfl)
+
+/-! ## Part 17 — `affineAdd` op-list bridge: entry scaffolding + first steps (deliverable 2)
+
+`affineAdd` runs on the post-decompose tracker `nm = [px, py, qx, qy]` (qy on TOS), a ~18-step
+field chain whose persistent base `[px, py, qx, qy]` stays at the BOTTOM throughout (verified
+by probe: every step's `nm` begins `[px, py, qx, qy, …]`).  The chain:
+
+  `copyToTop qy/py` → `fieldSub _qy1 _py1 _s_num` → `copyToTop qx/px` →
+  `fieldSub _qx1 _px1 _s_den` (lands `_s_den` at DEPTH 0 = TOS, the `fieldInv` entry) →
+  `fieldInv _s_den _s_den_inv` (the proven `fieldInv_ops_depth0` splice) →
+  `fieldMul _s_num _s_den_inv _s` → `copyToTop _s _s_keep` → `fieldSqr _s _s2` →
+  `copyToTop px` → `fieldSub _s2 _px2 _rx1` → `copyToTop qx` → `fieldSub _rx1 _qx2 rx` →
+  `copyToTop px/rx` → `fieldSub _px3 _rx2 _px_rx` → `fieldMul _s_keep _px_rx _s_px_rx` →
+  `copyToTop py` → `fieldSub _s_px_rx _py2 ry` → 4× cleanup `toTop`/`drop`.
+
+This Part lands the entry scaffolding + the first chain steps' nm + op-list increments
+(each composing with the depth-general field sims of Part 16).  The op-list bridge is the
+`emitEcNegate_ops` pattern extended to ~18 steps; the runtime threading is the matching
+Part-16 sim chain.  See the HONEST BLOCK below for the precise remaining step. -/
+
+/-- The `affineAdd` entry tracker after `decomposePoint ×2`: `nm = [px, py, qx, qy]`. -/
+def aaT0 : Ec.Tracker := { nm := #[some "px", some "py", some "qx", some "qy"], ops := #[] }
+
+theorem aaT0_nm : aaT0.nm.toList = [some "px", some "py", some "qx", some "qy"] := rfl
+
+/-- Step 1: `copyToTop "qy" "_qy1"` (depth 0 = `.dup`).  nm appends `_qy1`. -/
+def aaT1 : Ec.Tracker := aaT0.copyToTop "qy" "_qy1"
+
+theorem aaT1_nm : aaT1.nm.toList = [some "px", some "py", some "qx", some "qy", some "_qy1"] := by
+  rw [aaT1, copyToTop_nm_toList, aaT0_nm]; rfl
+
+theorem aaT1_ops : aaT1.ops.toList = aaT0.ops.toList ++ pickExtraOps 0 :=
+  copyToTop_ops_concrete aaT0 "qy" "_qy1" 0 (fd_of_nm aaT0 "qy" 0 _ rfl (by decide) (by decide))
+
+/-- Step 2: `copyToTop "py" "_py1"` (depth `py` = 3 in `[px,py,qx,qy,_qy1]` reversed). -/
+def aaT2 : Ec.Tracker := aaT1.copyToTop "py" "_py1"
+
+theorem aaT2_nm :
+    aaT2.nm.toList = [some "px", some "py", some "qx", some "qy", some "_qy1", some "_py1"] := by
+  rw [aaT2, copyToTop_nm_toList, aaT1_nm]; rfl
+
+theorem aaT1_nm_arr : aaT1.nm = #[some "px", some "py", some "qx", some "qy", some "_qy1"] :=
+  Array.ext' (by rw [aaT1_nm])
+
+theorem aaT2_ops : aaT2.ops.toList = aaT1.ops.toList ++ pickExtraOps 3 :=
+  copyToTop_ops_concrete aaT1 "py" "_py1" 3 (fd_of_nm aaT1 "py" 3 _ aaT1_nm_arr (by decide) (by decide))
+
+theorem aaT2_nm_arr :
+    aaT2.nm = #[some "px", some "py", some "qx", some "qy", some "_qy1", some "_py1"] :=
+  Array.ext' (by rw [aaT2_nm])
+
+/-- **`fieldSub t a b r` ops-append at concrete depths.**  The missing peer of
+`fieldMul_ops_concrete`/`fieldAdd_ops_concrete` at `OP_SUB` / `_fsub_diff`; the affineAdd
+fieldSub steps reuse it.  The increment equals `fieldBinopGenInc da db "OP_SUB"` once the
+product depth `dp` folds to 0 (the diff always lands on TOS). -/
+theorem fieldSub_ops_concrete (t : Ec.Tracker) (a b r : String) (da db dp : Nat)
+    (hda : t.findDepth a = da) (hdb : (t.toTop a).findDepth b = db)
+    (hdp : (((t.toTop a).toTop b).rawBlock 2 (some "_fsub_diff") [.opcode "OP_SUB"]).findDepth "_fsub_diff" = dp) :
+    (Ec.fieldSub t a b r).ops.toList
+      = t.ops.toList ++ rollExtraOps da ++ rollExtraOps db ++ [.opcode "OP_SUB"]
+        ++ rollExtraOps dp ++ [.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  unfold Ec.fieldSub
+  rw [fieldBinop_ops_append t a b "_fsub_diff" r (.opcode "OP_SUB"), hda, hdb, hdp]
+
+/-- Step 3: `fieldSub aaT2 "_qy1" "_py1" "_s_num"` — `_qy1` depth 1, `_py1` depth 1, diff
+depth 0.  Op-list appends `fieldBinopGenInc 1 1 "OP_SUB"`; nm collapses to
+`[px,py,qx,qy,_s_num]` (the two scratch operands consumed). -/
+def aaT3 : Ec.Tracker := Ec.fieldSub aaT2 "_qy1" "_py1" "_s_num"
+
+theorem aaT3_nm_arr :
+    aaT3.nm = #[some "px", some "py", some "qx", some "qy", some "_s_num"] := by
+  rw [aaT3]
+  unfold Ec.fieldSub
+  have hm1_nm : (aaT2.toTop "_qy1").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_py1", some "_qy1"] := by
+    rw [toTop_nm_canonical aaT2 "_qy1" 1
+          (fd_of_nm aaT2 "_qy1" 1 _ aaT2_nm_arr (by decide) (by decide)) (by rw [aaT2_nm_arr]; decide),
+        aaT2_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT2.toTop "_qy1").toTop "_py1").rawBlock 2 (some "_fsub_diff")
+        [.opcode "OP_SUB"]).nm = #[some "px", some "py", some "qx", some "qy", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_py1" 1
+          (fd_of_nm _ "_py1" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fsub_diff" "_s_num" 0
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide)) (by rw [hm2_nm]; decide), hm2_nm]
+  apply Array.ext' <;> simp
+
+theorem aaT3_nm :
+    aaT3.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_num"] := by
+  rw [aaT3_nm_arr]
+
+theorem aaT3_ops : aaT3.ops.toList = aaT2.ops.toList ++ fieldBinopGenInc 1 1 "OP_SUB" := by
+  have hm1_nm : (aaT2.toTop "_qy1").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_py1", some "_qy1"] := by
+    rw [toTop_nm_canonical aaT2 "_qy1" 1
+          (fd_of_nm aaT2 "_qy1" 1 _ aaT2_nm_arr (by decide) (by decide)) (by rw [aaT2_nm_arr]; decide),
+        aaT2_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT2.toTop "_qy1").toTop "_py1").rawBlock 2 (some "_fsub_diff")
+        [.opcode "OP_SUB"]).nm = #[some "px", some "py", some "qx", some "qy", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_py1" 1
+          (fd_of_nm _ "_py1" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [aaT3, fieldSub_ops_concrete aaT2 "_qy1" "_py1" "_s_num" 1 1 0
+        (fd_of_nm aaT2 "_qy1" 1 _ aaT2_nm_arr (by decide) (by decide))
+        (fd_of_nm _ "_py1" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide))]
+  simp only [fieldBinopGenInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- Step 4: `copyToTop "qx" "_qx1"` (depth 2). -/
+def aaT4 : Ec.Tracker := aaT3.copyToTop "qx" "_qx1"
+
+theorem aaT4_nm :
+    aaT4.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_num", some "_qx1"] := by
+  rw [aaT4, copyToTop_nm_toList, aaT3_nm]; rfl
+
+theorem aaT4_ops : aaT4.ops.toList = aaT3.ops.toList ++ pickExtraOps 2 :=
+  copyToTop_ops_concrete aaT3 "qx" "_qx1" 2 (fd_of_nm aaT3 "qx" 2 _ aaT3_nm_arr (by decide) (by decide))
+
+theorem aaT4_nm_arr :
+    aaT4.nm = #[some "px", some "py", some "qx", some "qy", some "_s_num", some "_qx1"] :=
+  Array.ext' (by rw [aaT4_nm])
+
+/-- Step 5: `copyToTop "px" "_px1"` (depth 5). -/
+def aaT5 : Ec.Tracker := aaT4.copyToTop "px" "_px1"
+
+theorem aaT5_nm :
+    aaT5.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_num", some "_qx1", some "_px1"] := by
+  rw [aaT5, copyToTop_nm_toList, aaT4_nm]; rfl
+
+theorem aaT5_ops : aaT5.ops.toList = aaT4.ops.toList ++ pickExtraOps 5 :=
+  copyToTop_ops_concrete aaT4 "px" "_px1" 5 (fd_of_nm aaT4 "px" 5 _ aaT4_nm_arr (by decide) (by decide))
+
+theorem aaT5_nm_arr :
+    aaT5.nm = #[some "px", some "py", some "qx", some "qy", some "_s_num", some "_qx1", some "_px1"] :=
+  Array.ext' (by rw [aaT5_nm])
+
+/-- Step 6: `fieldSub aaT5 "_qx1" "_px1" "_s_den"` — `_qx1` depth 1, `_px1` depth 1, diff
+depth 0.  CRUCIAL: lands `_s_den` at depth 0 (TOS) — the exact depth-0 entry the proven
+`fieldInv_ops_depth0` / `fieldInv_runOps_sim` bridge requires for the next step. -/
+def aaT6 : Ec.Tracker := Ec.fieldSub aaT5 "_qx1" "_px1" "_s_den"
+
+theorem aaT6_nm_arr :
+    aaT6.nm = #[some "px", some "py", some "qx", some "qy", some "_s_num", some "_s_den"] := by
+  rw [aaT6]
+  unfold Ec.fieldSub
+  have hm1_nm : (aaT5.toTop "_qx1").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_num", some "_px1", some "_qx1"] := by
+    rw [toTop_nm_canonical aaT5 "_qx1" 1
+          (fd_of_nm aaT5 "_qx1" 1 _ aaT5_nm_arr (by decide) (by decide)) (by rw [aaT5_nm_arr]; decide),
+        aaT5_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT5.toTop "_qx1").toTop "_px1").rawBlock 2 (some "_fsub_diff")
+        [.opcode "OP_SUB"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_num", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_px1" 1
+          (fd_of_nm _ "_px1" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [fieldMod_nm _ "_fsub_diff" "_s_den" 0
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide)) (by rw [hm2_nm]; decide), hm2_nm]
+  apply Array.ext' <;> simp
+
+theorem aaT6_nm :
+    aaT6.nm.toList = [some "px", some "py", some "qx", some "qy", some "_s_num", some "_s_den"] := by
+  rw [aaT6_nm_arr]
+
+theorem aaT6_ops : aaT6.ops.toList = aaT5.ops.toList ++ fieldBinopGenInc 1 1 "OP_SUB" := by
+  have hm1_nm : (aaT5.toTop "_qx1").nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_num", some "_px1", some "_qx1"] := by
+    rw [toTop_nm_canonical aaT5 "_qx1" 1
+          (fd_of_nm aaT5 "_qx1" 1 _ aaT5_nm_arr (by decide) (by decide)) (by rw [aaT5_nm_arr]; decide),
+        aaT5_nm_arr]
+    apply Array.ext' <;> simp
+  have hm2_nm : (((aaT5.toTop "_qx1").toTop "_px1").rawBlock 2 (some "_fsub_diff")
+        [.opcode "OP_SUB"]).nm
+      = #[some "px", some "py", some "qx", some "qy", some "_s_num", some "_fsub_diff"] := by
+    rw [rawBlock_nm_some2,
+        toTop_nm_canonical _ "_px1" 1
+          (fd_of_nm _ "_px1" 1 _ hm1_nm (by decide) (by decide)) (by rw [hm1_nm]; decide), hm1_nm]
+    apply Array.ext' <;> simp
+  rw [aaT6, fieldSub_ops_concrete aaT5 "_qx1" "_px1" "_s_den" 1 1 0
+        (fd_of_nm aaT5 "_qx1" 1 _ aaT5_nm_arr (by decide) (by decide))
+        (fd_of_nm _ "_px1" 1 _ hm1_nm (by decide) (by decide))
+        (fd_of_nm _ "_fsub_diff" 0 _ hm2_nm (by decide) (by decide))]
+  simp only [fieldBinopGenInc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- **The `fieldInv` splice (step 7) fires at the depth-0 `_s_den` entry.**  `aaT6` lands
+`_s_den` on TOS (`aaT6_nm` ends `…, some "_s_den"`), so `fieldInv aaT6 "_s_den" "_s_den_inv"`
+appends EXACTLY `fieldInvCoreInc` (the op-list the proven runtime sim `fieldInv_runOps_sim`
+consumes) — the proven `fieldInv_ops_depth0` bridge applies directly.  This is the join point
+the affineAdd op-list bridge needs at the modular-inverse step. -/
+theorem aaT7_ops :
+    (Ec.fieldInv aaT6 "_s_den" "_s_den_inv").ops.toList = aaT6.ops.toList ++ fieldInvCoreInc :=
+  fieldInv_ops_depth0 aaT6 [some "px", some "py", some "qx", some "qy", some "_s_num"]
+    "_s_den" "_s_den_inv"
+    (by rw [aaT6_nm]; rfl) (by decide) (by decide) (by decide)
+
 /-! ## Part 15 (cont.) — `fieldInv` op-list bridge + affineAdd + `emitEcAdd` discharge: HONEST BLOCK
 
 The spec-level square-and-multiply crux (`FieldInvSpec.fieldInvAccum_eq`) is PROVEN, AND
@@ -6180,37 +6503,67 @@ Script-VM stack by genuine structural induction on the loop count.  What REMAINS
    `smoke_fieldInvLowLoop_ops`, `smoke_fieldInv_ops_depth0` — all `propext`/`Classical.choice`/
    `Quot.sound`-clean (NO `sorryAx`, NO new axiom, NO `native_decide`).
 
-2. **affineAdd field-chain threading (REMAINS — the next EXACT SUB-GOAL).**  `Stack.Ec.affineAdd`
-   is ~20 deep-depth tracker ops: `copyToTop "qy"/"py"` → `fieldSub _qy1 _py1 _s_num` →
-   `copyToTop "qx"/"px"` → `fieldSub _qx1 _px1 _s_den` → `fieldInv _s_den _s_den_inv` (depth-0
-   entry: `fieldInv_ops_depth0` now LANDED above) → `fieldMul _s_num _s_den_inv _s` →
-   `copyToTop _s _s_keep` → `fieldSqr _s _s2` → `copyToTop "px"` → `fieldSub _s2 _px2 _rx1` →
-   `copyToTop "qx"` → `fieldSub _rx1 _qx2 "rx"` → `copyToTop "px"/"rx"` →
-   `fieldSub _px3 _rx2 _px_rx` → `fieldMul _s_keep _px_rx _s_px_rx` → `copyToTop "py"` →
-   `fieldSub _s_px_rx _py2 "ry"` → 4× cleanup `toTop`/`drop`.  Unlike the `fieldInv` loop the
-   slot depths here VARY (px/py/qx/qy stay deep while scratch churns above), so an `affineAdd_ops`
-   determined-concat needs a per-op `nm`-shape `toList` chain (mirror the eocT chain, but ~20
-   steps with the `fieldInv` bridge spliced at the `_s_den` step) PLUS the matching runtime
-   threading (generic depth-general `fieldSub/Mul/Sqr_runOps_simT` off a `TrackerSimT`, NOT the
-   shallow `fieldSqr_runOps_sim` peers).  These generic composed field sims do not yet exist;
-   build them first (toTop+toTop+OP+fieldMod at arbitrary depth via `runOps_toTop_extraOps_simT`),
-   then thread.
+2. **Depth-general field sims — LANDED (this wave, Part 16, axiom-clean).**  The shallow
+   Part-12 sims (`fieldSub_runOps_sim` etc.) assume operands at fixed depth 0/1; affineAdd
+   keeps `px/py/qx/qy` at deep VARYING depths.  Part 16 adds the DEPTH-GENERAL form:
+   * `fieldBinop_runOps_simT binop f s av bv da db mid out …` — runs the determined
+     `fieldBinopGenInc da db binop` (`rollExtraOps da ++ rollExtraOps db ++ [binop, push fieldP]
+     ++ fieldModOps`) at ARBITRARY roll depths via the GENERAL `runOps_rollExtraOps` (NOT the
+     depth-0/1 special cases), landing `Secp256k1.fieldMod (f av bv)`.  The runtime model is
+     given directly as `applyRoll` hypotheses (`hRoll1`/`hRoll2`) so the codegen nm bookkeeping
+     supplies the concrete depths per affineAdd step.  Smoke `smoke_fieldBinop_runOps_simT`.
+   * `fieldSqr_runOps_simT s av dp dm1 dm2 mid out …` — copy-then-multiply at general depths
+     (`fieldSqrGenInc dp dm1 dm2`), landing `Secp256k1.fieldMul av av`.  Smoke
+     `smoke_fieldSqr_runOps_simT`.
+   Both `propext`/`Quot.sound` + inherited-backend clean, `native_decide`-free (`decide`/`rfl`
+   smokes).
 
-3. **`emitEcAdd_runOps_eq` discharge (REMAINS).**  `emitEcAdd_ops` (determined concat:
-   `decomposePoint` ×2 → affineAdd → `composePoint`, via the intermediate-nm chain mirroring
-   `emitEcOnCurve_ops`) + the runtime threading, reduced to `Crypto.Secp256k1.ecAdd`.  Honest
-   INPUT-side wf hyps: both points 64-byte + on-curve + `FIELD_P ≠ 0`, PLUS the non-degenerate
-   case split `pointX p ≢ pointX q (mod p)` (the affine formula's `pxm ≠ qxm` branch — the
-   `P = ±Q` / doubling cases route through `affineDouble`, a SEPARATE codegen path not
-   exercised by `emitEcAdd`'s straight-line affine-add and so must be excluded by hypothesis
-   or handled in a follow-up).
+3. **affineAdd op-list bridge — STARTED (this wave, Part 17): entry → fieldInv splice LANDED.**
+   The entry scaffolding + first SEVEN steps of the ~18-step `affineAdd_ops` determined-concat
+   are LANDED and verified, INCLUDING the `fieldInv` splice:
+   * `aaT0`…`aaT6` (entry `nm = [px,py,qx,qy]` → `copyToTop qy`/`py` → `fieldSub → _s_num` →
+     `copyToTop qx`/`px` → `fieldSub → _s_den`), each with its `_nm`/`_nm_arr` + ops-increment
+     theorem (`aaT{1,2,4,5}_ops` = `pickExtraOps {0,3,2,5}`; `aaT{3,6}_ops` =
+     `…ops ++ fieldBinopGenInc 1 1 "OP_SUB"`).  `aaT6` lands `_s_den` at depth 0 = TOS (proven).
+   * `aaT7_ops` — THE `fieldInv` SPLICE: `(Ec.fieldInv aaT6 "_s_den" "_s_den_inv").ops.toList
+     = aaT6.ops.toList ++ fieldInvCoreInc`, via the proven depth-0 bridge `fieldInv_ops_depth0`.
+     This JOINS the affineAdd assembly to the END-TO-END-verified `fieldInv` (op-list ⟷ runtime
+     ⟷ spec) — the architecturally hardest junction of the whole discharge.
+   * `fieldSub_ops_concrete` — the missing peer of `fieldMul_ops_concrete`/`fieldAdd_ops_concrete`
+     at `OP_SUB`/`_fsub_diff`, reused by every affineAdd fieldSub step.
+   THE PRECISE REMAINING SUB-GOAL (steps 8-20, STRAIGHT-LINE continuation of the aaT6 pattern):
+   `fieldMul _s_num _s_den_inv _s` → `copyToTop _s _s_keep` → `fieldSqr _s _s2` →
+   `copyToTop px` → `fieldSub _s2 _px2 _rx1` → `copyToTop qx` → `fieldSub _rx1 _qx2 rx` →
+   `copyToTop px`/`copyToTop rx` → `fieldSub _px3 _rx2 _px_rx` → `fieldMul _s_keep _px_rx
+   _s_px_rx` → `copyToTop py` → `fieldSub _s_px_rx _py2 ry` → 4× cleanup `toTop`/`.drop`.  Each
+   step's depths are CONCRETE (every nm begins `[px,py,qx,qy,…]`, base persists at bottom —
+   probed), so each is one `fieldSub_ops_concrete`/`fieldMul_ops_concrete`/`fieldSqr` +
+   `copyToTop_ops_concrete` application with its inline `nm`-shape lemma (the aaT6 pattern).
+   Then `affineAdd_ops` = the determined concat (the ~18 increments + `fieldInvCoreInc` spliced
+   at step 7).
+
+4. **affineAdd runtime threading + `emitEcAdd_runOps_eq` discharge (REMAINS).**  Off the entry
+   runtime stack `[qy, qx, py, px] ++ rest` (nm bottom→top `px,py,qx,qy`), thread each step's
+   determined increment via the Part-16 depth-general sims (the `applyRoll` hypotheses computed
+   from the concrete per-step nm) + the proven `fieldInv_runOps_sim` at the `_s_den` site, then
+   `composePoint_runOps_sim` (Part 14) to build the result point, reduced to the non-degenerate
+   branch of `Crypto.Secp256k1.affineAdd`.  `emitEcAdd_ops` (determined concat:
+   `decomposePoint` ×2 → `affineAdd_ops` → `composePoint`, via the intermediate-nm chain) +
+   that threading → `Crypto.Secp256k1.ecAdd`.  Honest INPUT-side wf hyps: both points 64-byte
+   + on-curve + `FIELD_P ≠ 0`, PLUS the non-degenerate case split `pointX p ≢ pointX q (mod p)`
+   (the affine formula's `pxm ≠ qxm` branch — the `P = ±Q` / doubling cases route through
+   `affineDouble`, a SEPARATE codegen path NOT exercised by `emitEcAdd`'s straight-line
+   affine-add, so excluded by hypothesis).
 
 The `Crypto.Spec.emitEcAdd_runOps_eq` axiom therefore REMAINS for now; drift stays at 74.
-LANDED this wave: the ENTIRE `fieldInv` op-list bridge (sub-goal 1 — high loop, low loop, and
-the full depth-0 `fieldInv_ops_depth0`), joining the codegen `fieldInv` to the proven runtime
-sim `fieldInv_runOps_sim`.  Combined with the prior crux (`FieldInvSpec.fieldInvAccum_eq`) and
-the runtime loop inductions (`highLoopInc_runOps_sim`/`lowLoopInc_runOps_sim`), `fieldInv` is now
-verified END-TO-END (op-list ⟷ runtime ⟷ spec).  REMAINING for the ecAdd discharge: sub-goals
-2 + 3 (affineAdd op-list + runtime threading at varying depths, then the discharge). -/
+LANDED this wave: (sub-goal 2) the depth-general field sims `fieldBinop_runOps_simT` /
+`fieldSqr_runOps_simT` the affineAdd threading needs, each with a smoke; and (sub-goal 3,
+entry → fieldInv splice) the `affineAdd_ops` entry scaffolding `aaT0…aaT6` + the `fieldInv`
+splice `aaT7_ops` (the depth-0 `_s_den` junction joining affineAdd to the END-TO-END-verified
+`fieldInv`) + the missing `fieldSub_ops_concrete` peer.  REMAINING for the ecAdd discharge:
+complete sub-goal 3 (steps 8-20 — straight-line continuation of the aaT6 pattern, no new
+machinery) and sub-goal 4 (the runtime threading through all steps via the Part-16 sims + the
+discharge to `Crypto.Secp256k1.ecAdd`).  The `fieldInv` END-TO-END verification (op-list ⟷
+runtime ⟷ spec) from the prior wave is unchanged and is now WIRED into the affineAdd chain. -/
 
 end RunarVerification.Stack.AgreesEC
