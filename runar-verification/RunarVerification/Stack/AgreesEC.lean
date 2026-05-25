@@ -5568,6 +5568,586 @@ theorem smoke_fieldInv_runOps_sim :
               stack := .vBigint (Crypto.Secp256k1.fieldInv 7) :: invSmokeRest } :=
   fieldInv_runOps_sim _ 7 invSmokeRest rfl
 
+/-! ### Deliverable 1 (cont.) — `fieldInv` op-list bridge: per-iteration ops + nm fixed-point
+
+The runtime loop INDUCTIONS (`highLoopInc_runOps_sim` / `lowLoopInc_runOps_sim`) consume the
+determined op-lists `highLoopInc n` / `lowLoopInc steps lowBits`.  The codegen loops
+`fieldInvHighLoop` / `fieldInvLowLoop` emit those exact lists provided the per-iteration
+tracker `nm` is a FIXED POINT — `_inv_r` at depth 0, `aName` at depth 1 for every iteration.
+That fixed-point is established here, abstractly, off a `toList` shape hypothesis
+`t.nm.toList = baseL ++ [some aName, some "_inv_r"]` with the six scratch names + `aName`
++ `_inv_r` fresh in `baseL`.  Each step's `nm` is tracked at the `toList` level
+(`Array.ext'`), so the body returns the entry `nm` and appends exactly `oneHighIterInc`. -/
+
+/-- The six scratch slot names the `fieldInv` body produces/consumes, plus the two
+persistent slots `aName`/`"_inv_r"`. -/
+def invScratch : List String :=
+  ["_inv_r2", "_inv_a", "_inv_m", "_fsqr_copy", "_fmul_prod", "_fmod_p"]
+
+/-- One high-loop iteration as a standalone `Tracker → Tracker` (mirrors the body of
+`fieldInvHighLoop (n+1)`). -/
+def hiIterBody (t : Ec.Tracker) (aName : String) : Ec.Tracker :=
+  let t := Ec.fieldSqr t "_inv_r" "_inv_r2"
+  let t := t.rename "_inv_r"
+  let t := t.copyToTop aName "_inv_a"
+  let t := Ec.fieldMul t "_inv_r" "_inv_a" "_inv_m"
+  t.rename "_inv_r"
+
+/-- The shape predicate for a `fieldInv` loop-entry tracker: `_inv_r` on top, `aName`
+just below, the six scratch names + `aName` + `_inv_r` pairwise distinct, expressed at
+the `toList` level so depth folds are concrete. -/
+def InvLoopShape (t : Ec.Tracker) (baseL : List (Option String)) (aName : String) : Prop :=
+  t.nm.toList = baseL ++ [some aName, some "_inv_r"]
+    ∧ aName ≠ "_inv_r"
+    ∧ (∀ s ∈ invScratch, some s ∉ baseL ∧ s ≠ aName ∧ s ≠ "_inv_r")
+    ∧ some aName ∉ baseL ∧ some "_inv_r" ∉ baseL
+
+/-! #### `toList`-level nm transforms (push / pop / rename / toTop-depth-0/1 / rawBlock2) -/
+
+/-- `push` at the `toList` level: append the new slot. -/
+private theorem nm_push_toList (t : Ec.Tracker) (n : Option String) :
+    (t.nm.push n).toList = t.nm.toList ++ [n] := by rw [Array.toList_push]
+
+/-- `findDepth` of the TOP slot is `0` (depth-0 fold off a `toList` ending in `some r`). -/
+private theorem findDepth_top0 (t : Ec.Tracker) (L : List (Option String)) (r : String)
+    (hnm : t.nm.toList = L ++ [some r]) : t.findDepth r = 0 := by
+  rw [findDepth_eq_findDepthList t r
+        (by rw [show t.nm.toList.reverse = some r :: L.reverse from by rw [hnm]; simp];
+            exact List.mem_cons_self ..)]
+  rw [show t.nm.toList.reverse = some r :: L.reverse from by rw [hnm]; simp]
+  unfold findDepthList; rw [if_pos rfl]
+
+/-- `findDepth` of the second-from-top slot is `1`, when the top slot differs. -/
+private theorem findDepth_second1 (t : Ec.Tracker) (L : List (Option String)) (a r : String)
+    (hnm : t.nm.toList = L ++ [some a, some r]) (hne : a ≠ r) : t.findDepth a = 1 := by
+  have hrev : t.nm.toList.reverse = some r :: some a :: L.reverse := by
+    rw [hnm]; simp
+  rw [findDepth_eq_findDepthList t a
+        (by rw [hrev]; exact List.mem_cons_of_mem _ (List.mem_cons_self ..))]
+  rw [hrev]; unfold findDepthList
+  rw [if_neg (by intro h; exact hne (Option.some.inj h).symm)]
+  unfold findDepthList
+  rw [if_pos rfl]
+
+/-- `toTop` of the TOP slot is a no-op on `nm` (depth 0 = `roll 0`). -/
+private theorem toTop_top_nm (t : Ec.Tracker) (L : List (Option String)) (r : String)
+    (hnm : t.nm.toList = L ++ [some r]) : (t.toTop r).nm.toList = t.nm.toList := by
+  have hsz : 0 < t.nm.size := by
+    rw [← Array.length_toList, hnm, List.length_append]; simp
+  rw [toTop_nm_canonical t r 0 (findDepth_top0 t L r hnm) hsz]
+  rw [Array.toList_push, Array.toList_eraseIdxIfInBounds]
+  rw [show t.nm.size - 1 - 0 = t.nm.toList.length - 1 from by rw [Array.length_toList]; omega,
+      arr_getElemBang_toList t.nm (t.nm.toList.length - 1) (by rw [Array.length_toList] at *; omega)]
+  exact eraseLast_append t.nm.toList (by rw [Array.length_toList]; omega)
+
+/-- `toTop` of the second-from-top slot swaps the top two (depth 1). -/
+private theorem toTop_second_nm (t : Ec.Tracker) (L : List (Option String)) (a r : String)
+    (hnm : t.nm.toList = L ++ [some a, some r]) (hne : a ≠ r) :
+    (t.toTop a).nm.toList = L ++ [some r, some a] := by
+  have hsz1 : 1 < t.nm.size := by
+    rw [← Array.length_toList, hnm, List.length_append]; simp
+  rw [toTop_nm_canonical t a 1 (findDepth_second1 t L a r hnm hne) hsz1]
+  rw [Array.toList_push, Array.toList_eraseIdxIfInBounds]
+  have hlen : t.nm.toList.length = L.length + 2 := by rw [hnm, List.length_append]; simp
+  rw [show t.nm.size - 1 - 1 = t.nm.toList.length - 2 from by rw [Array.length_toList]; omega]
+  rw [arr_getElemBang_toList t.nm (t.nm.toList.length - 2) (by rw [Array.length_toList]; omega)]
+  rw [hnm]
+  rw [show (L ++ [some a, some r]).length - 2 = L.length from by rw [List.length_append]; simp]
+  rw [show (L ++ [some a, some r])[L.length]! = some a from by
+        rw [getElem!_pos _ L.length (by rw [List.length_append]; simp),
+            List.getElem_append_right (by omega)]; simp]
+  rw [List.eraseIdx_append_of_length_le (by omega)]
+  simp
+
+/-- `rename "_inv_r"` of a top slot relabels the last entry to `some "_inv_r"`. -/
+private theorem rename_invr_nm (t : Ec.Tracker) (L : List (Option String)) (x : Option String)
+    (hnm : t.nm.toList = L ++ [x]) :
+    (t.rename "_inv_r").nm.toList = L ++ [some "_inv_r"] := by
+  unfold Ec.Tracker.rename
+  have hsz : t.nm.size > 0 := by rw [← Array.length_toList, hnm, List.length_append]; simp
+  rw [if_pos hsz]
+  rw [Array.set!, Array.toList_setIfInBounds, hnm]
+  rw [show t.nm.size - 1 = L.length from by rw [← Array.length_toList, hnm, List.length_append]; simp]
+  rw [List.set_append_right (s := L) (t := [x]) L.length (some "_inv_r") (Nat.le_refl _)]; simp
+
+/-- `rawBlock 2 (some n)` at the `toList` level: drop the last two, append `some n`. -/
+private theorem rawBlock2_nm_toList (t : Ec.Tracker) (n : String) (e : List StackOp)
+    (L : List (Option String)) (x y : Option String) (hnm : t.nm.toList = L ++ [x, y]) :
+    (t.rawBlock 2 (some n) e).nm.toList = L ++ [some n] := by
+  rw [rawBlock_nm_some2, Array.toList_push, Array.toList_pop, Array.toList_pop, hnm]
+  simp
+
+/-- `copyToTop name n'` at the `toList` level (push, depth-uniform). -/
+private theorem copyToTop_nm_toList (t : Ec.Tracker) (name n' : String) :
+    (t.copyToTop name n').nm.toList = t.nm.toList ++ [some n'] := by
+  rw [Ec.Tracker.copyToTop, pick_nm_push, Array.toList_push]
+
+/-- `rename` preserves `ops`. -/
+private theorem rename_ops (t : Ec.Tracker) (n : String) :
+    (t.rename n).ops = t.ops := by
+  unfold Ec.Tracker.rename; dsimp only; split <;> rfl
+
+/-- `copyToTop` preserves `ops` up to the depth-`d` pick increment, folded concretely. -/
+private theorem copyToTop_ops_d (t : Ec.Tracker) (name n' : String) (L : List (Option String))
+    (hnm : t.nm.toList = L ++ [some name]) :
+    (t.copyToTop name n').ops.toList = t.ops.toList ++ pickExtraOps 0 := by
+  rw [copyToTop_ops_concrete t name n' 0 (findDepth_top0 t L name hnm)]
+
+/-- `copyToTop` at depth 1 (second-from-top). -/
+private theorem copyToTop_ops_d1 (t : Ec.Tracker) (name n' : String) (L : List (Option String))
+    (a : String) (hnm : t.nm.toList = L ++ [some name, some a]) (hne : a ≠ name) :
+    (t.copyToTop name n').ops.toList = t.ops.toList ++ pickExtraOps 1 := by
+  rw [copyToTop_ops_concrete t name n' 1 (findDepth_second1 t L name a hnm (Ne.symm hne))]
+
+/-- **`fieldSqr "_inv_r" "_inv_r2"` nm (loop-shape).**  Off `L ++ [a, "_inv_r"]`, lands
+`L ++ [a, "_inv_r2"]` — `aName` stays at depth 1, the result slot replaces `_inv_r`. -/
+private theorem invFieldSqr_nm (t : Ec.Tracker) (L : List (Option String)) (a : String)
+    (hnm : t.nm.toList = L ++ [some a, some "_inv_r"]) (hne : a ≠ "_inv_r") :
+    (Ec.fieldSqr t "_inv_r" "_inv_r2").nm.toList = L ++ [some a, some "_inv_r2"] := by
+  unfold Ec.fieldSqr Ec.fieldMul Ec.fieldMod
+  -- copyToTop "_inv_r" "_fsqr_copy" (depth 0) → L ++ [a, _inv_r, _fsqr_copy]
+  have h1 : (t.copyToTop "_inv_r" "_fsqr_copy").nm.toList
+      = (L ++ [some a]) ++ [some "_inv_r", some "_fsqr_copy"] := by
+    rw [copyToTop_nm_toList, hnm]; simp
+  -- toTop "_inv_r" (depth 1) → L ++ [a, _fsqr_copy, _inv_r]
+  have h2 : ((t.copyToTop "_inv_r" "_fsqr_copy").toTop "_inv_r").nm.toList
+      = (L ++ [some a]) ++ [some "_fsqr_copy", some "_inv_r"] :=
+    toTop_second_nm _ (L ++ [some a]) "_inv_r" "_fsqr_copy" h1 (by decide)
+  -- toTop "_fsqr_copy" (depth 1) → L ++ [a, _inv_r, _fsqr_copy]
+  have h3 : (((t.copyToTop "_inv_r" "_fsqr_copy").toTop "_inv_r").toTop "_fsqr_copy").nm.toList
+      = (L ++ [some a]) ++ [some "_inv_r", some "_fsqr_copy"] :=
+    toTop_second_nm _ (L ++ [some a]) "_fsqr_copy" "_inv_r" h2 (by decide)
+  -- rawBlock 2 "_fmul_prod" → L ++ [a, _fmul_prod]
+  have h4 : ((((t.copyToTop "_inv_r" "_fsqr_copy").toTop "_inv_r").toTop "_fsqr_copy").rawBlock 2
+        (some "_fmul_prod") [.opcode "OP_MUL"]).nm.toList = (L ++ [some a]) ++ [some "_fmul_prod"] :=
+    rawBlock2_nm_toList _ "_fmul_prod" _ (L ++ [some a]) (some "_inv_r") (some "_fsqr_copy") h3
+  -- fieldMod "_fmul_prod" "_inv_r2": toTop "_fmul_prod" (depth 0, noop) → push _fmod_p → rawBlock2
+  have h5 : (((((t.copyToTop "_inv_r" "_fsqr_copy").toTop "_inv_r").toTop "_fsqr_copy").rawBlock 2
+        (some "_fmul_prod") [.opcode "OP_MUL"]).toTop "_fmul_prod").nm.toList
+      = (L ++ [some a]) ++ [some "_fmul_prod"] := by
+    rw [toTop_top_nm _ (L ++ [some a]) "_fmul_prod" (by rw [h4]), h4]
+  have h6 : (Ec.pushFieldP ((((((t.copyToTop "_inv_r" "_fsqr_copy").toTop "_inv_r").toTop "_fsqr_copy").rawBlock 2
+        (some "_fmul_prod") [.opcode "OP_MUL"]).toTop "_fmul_prod")) "_fmod_p").nm.toList
+      = (L ++ [some a, some "_fmul_prod"]) ++ [some "_fmod_p"] := by
+    rw [Ec.pushFieldP, pushInt_nm, Array.toList_push, h5]; simp
+  rw [rawBlock2_nm_toList _ "_inv_r2" _ (L ++ [some a]) (some "_fmul_prod") (some "_fmod_p")
+    (by rw [h6]; simp)]
+  simp
+
+/-- **`fieldMul "_inv_r" "_inv_a" "_inv_m"` nm (loop-shape).**  Off `L ++ [a, "_inv_r",
+"_inv_a"]`, lands `L ++ [a, "_inv_m"]` — both inputs consumed, product slot on top. -/
+private theorem invFieldMul_nm (t : Ec.Tracker) (L : List (Option String)) (a : String)
+    (hnm : t.nm.toList = L ++ [some a, some "_inv_r", some "_inv_a"]) :
+    (Ec.fieldMul t "_inv_r" "_inv_a" "_inv_m").nm.toList = L ++ [some a, some "_inv_m"] := by
+  unfold Ec.fieldMul Ec.fieldMod
+  -- toTop "_inv_r" (depth 1) → L ++ [a, _inv_a, _inv_r]
+  have h1 : (t.toTop "_inv_r").nm.toList = (L ++ [some a]) ++ [some "_inv_a", some "_inv_r"] :=
+    toTop_second_nm t (L ++ [some a]) "_inv_r" "_inv_a" (by rw [hnm]; simp) (by decide)
+  -- toTop "_inv_a" (depth 1) → L ++ [a, _inv_r, _inv_a]
+  have h2 : ((t.toTop "_inv_r").toTop "_inv_a").nm.toList
+      = (L ++ [some a]) ++ [some "_inv_r", some "_inv_a"] :=
+    toTop_second_nm _ (L ++ [some a]) "_inv_a" "_inv_r" h1 (by decide)
+  -- rawBlock 2 "_fmul_prod" → L ++ [a, _fmul_prod]
+  have h3 : (((t.toTop "_inv_r").toTop "_inv_a").rawBlock 2 (some "_fmul_prod")
+        [.opcode "OP_MUL"]).nm.toList = (L ++ [some a]) ++ [some "_fmul_prod"] :=
+    rawBlock2_nm_toList _ "_fmul_prod" _ (L ++ [some a]) (some "_inv_r") (some "_inv_a") h2
+  -- fieldMod: toTop "_fmul_prod" (depth 0) → push _fmod_p → rawBlock2
+  have h4 : ((((t.toTop "_inv_r").toTop "_inv_a").rawBlock 2 (some "_fmul_prod")
+        [.opcode "OP_MUL"]).toTop "_fmul_prod").nm.toList = (L ++ [some a]) ++ [some "_fmul_prod"] := by
+    rw [toTop_top_nm _ (L ++ [some a]) "_fmul_prod" (by rw [h3]), h3]
+  have h5 : (Ec.pushFieldP (((((t.toTop "_inv_r").toTop "_inv_a").rawBlock 2 (some "_fmul_prod")
+        [.opcode "OP_MUL"]).toTop "_fmul_prod")) "_fmod_p").nm.toList
+      = (L ++ [some a, some "_fmul_prod"]) ++ [some "_fmod_p"] := by
+    rw [Ec.pushFieldP, pushInt_nm, Array.toList_push, h4]; simp
+  rw [rawBlock2_nm_toList _ "_inv_m" _ (L ++ [some a]) (some "_fmul_prod") (some "_fmod_p")
+    (by rw [h5]; simp)]
+  simp
+
+/-- **`fieldSqr "_inv_r" "_inv_r2"` ops (loop-shape) = `t.ops ++ fieldSqrYInc`.**  Depths:
+`copyToTop "_inv_r"` 0, `toTop "_inv_r"` 1, `toTop "_fsqr_copy"` 1, prod 0. -/
+private theorem invFieldSqr_ops (t : Ec.Tracker) (L : List (Option String)) (a : String)
+    (hnm : t.nm.toList = L ++ [some a, some "_inv_r"]) (hne : a ≠ "_inv_r") :
+    (Ec.fieldSqr t "_inv_r" "_inv_r2").ops.toList = t.ops.toList ++ fieldSqrYInc := by
+  unfold Ec.fieldSqr
+  -- copyToTop "_inv_r" "_fsqr_copy" depth 0
+  have hc_nm : (t.copyToTop "_inv_r" "_fsqr_copy").nm.toList
+      = (L ++ [some a, some "_inv_r"]) ++ [some "_fsqr_copy"] := by
+    rw [copyToTop_nm_toList, hnm]
+  have hc_ops : (t.copyToTop "_inv_r" "_fsqr_copy").ops.toList = t.ops.toList ++ pickExtraOps 0 :=
+    copyToTop_ops_concrete t "_inv_r" "_fsqr_copy" 0 (findDepth_top0 t (L ++ [some a]) "_inv_r" (by rw [hnm]; simp))
+  -- toTop "_inv_r" depth 1 (against the copyToTop tracker, nm = L++[a,_inv_r,_fsqr_copy])
+  have hm1_nm : ((t.copyToTop "_inv_r" "_fsqr_copy").toTop "_inv_r").nm.toList
+      = (L ++ [some a]) ++ [some "_fsqr_copy", some "_inv_r"] :=
+    toTop_second_nm _ (L ++ [some a]) "_inv_r" "_fsqr_copy" (by rw [hc_nm]; simp) (by decide)
+  -- toTop "_fsqr_copy" depth 1 → then rawBlock prod depth 0
+  have hm2_nm : ((((t.copyToTop "_inv_r" "_fsqr_copy").toTop "_inv_r").toTop "_fsqr_copy").rawBlock 2
+        (some "_fmul_prod") [.opcode "OP_MUL"]).nm.toList = (L ++ [some a]) ++ [some "_fmul_prod"] :=
+    rawBlock2_nm_toList _ "_fmul_prod" _ (L ++ [some a]) (some "_inv_r") (some "_fsqr_copy")
+      (toTop_second_nm _ (L ++ [some a]) "_fsqr_copy" "_inv_r" hm1_nm (by decide))
+  rw [fieldMul_ops_concrete (t.copyToTop "_inv_r" "_fsqr_copy") "_inv_r" "_fsqr_copy" "_inv_r2" 1 1 0
+        (findDepth_second1 _ (L ++ [some a]) "_inv_r" "_fsqr_copy" (by rw [hc_nm]; simp) (by decide))
+        (findDepth_second1 _ (L ++ [some a]) "_fsqr_copy" "_inv_r" hm1_nm (by decide))
+        (findDepth_top0 _ (L ++ [some a]) "_fmul_prod" hm2_nm)]
+  rw [hc_ops]
+  simp only [fieldSqrYInc, rollExtraOps, pickExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- **`fieldMul "_inv_r" "_inv_a" "_inv_m"` ops (loop-shape) = `t.ops ++ fieldMulSwap2Inc`.**
+Depths: `toTop "_inv_r"` 1, `toTop "_inv_a"` 1, prod 0. -/
+private theorem invFieldMul_ops (t : Ec.Tracker) (L : List (Option String)) (a : String)
+    (hnm : t.nm.toList = L ++ [some a, some "_inv_r", some "_inv_a"]) :
+    (Ec.fieldMul t "_inv_r" "_inv_a" "_inv_m").ops.toList = t.ops.toList ++ fieldMulSwap2Inc := by
+  -- toTop "_inv_r" depth 1
+  have hm1_nm : (t.toTop "_inv_r").nm.toList = (L ++ [some a]) ++ [some "_inv_a", some "_inv_r"] :=
+    toTop_second_nm t (L ++ [some a]) "_inv_r" "_inv_a" (by rw [hnm]; simp) (by decide)
+  have hm2_nm : (((t.toTop "_inv_r").toTop "_inv_a").rawBlock 2 (some "_fmul_prod")
+        [.opcode "OP_MUL"]).nm.toList = (L ++ [some a]) ++ [some "_fmul_prod"] :=
+    rawBlock2_nm_toList _ "_fmul_prod" _ (L ++ [some a]) (some "_inv_r") (some "_inv_a")
+      (toTop_second_nm _ (L ++ [some a]) "_inv_a" "_inv_r" hm1_nm (by decide))
+  rw [fieldMul_ops_concrete t "_inv_r" "_inv_a" "_inv_m" 1 1 0
+        (findDepth_second1 t (L ++ [some a]) "_inv_r" "_inv_a" (by rw [hnm]; simp) (by decide))
+        (findDepth_second1 _ (L ++ [some a]) "_inv_a" "_inv_r" hm1_nm (by decide))
+        (findDepth_top0 _ (L ++ [some a]) "_fmul_prod" hm2_nm)]
+  simp only [fieldMulSwap2Inc, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append]
+
+/-- **One high-loop iteration ops increment = `oneHighIterInc`.**  Threads `invFieldSqr_ops`
+→ `rename` (no op) → `copyToTop a` (depth 1 = `.over`) → `invFieldMul_ops` → `rename` (no op),
+using `hiIterBody_nm`'s intermediate shapes for the depth folds. -/
+private theorem hiIterBody_ops (t : Ec.Tracker) (L : List (Option String)) (a : String)
+    (hnm : t.nm.toList = L ++ [some a, some "_inv_r"]) (hne : a ≠ "_inv_r") :
+    (hiIterBody t a).ops.toList = t.ops.toList ++ oneHighIterInc := by
+  unfold hiIterBody
+  -- shapes (mirror hiIterBody_nm)
+  have h1nm : (Ec.fieldSqr t "_inv_r" "_inv_r2").nm.toList = L ++ [some a, some "_inv_r2"] :=
+    invFieldSqr_nm t L a hnm hne
+  have h2nm : ((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").nm.toList
+      = L ++ [some a, some "_inv_r"] := by
+    rw [rename_invr_nm _ (L ++ [some a]) (some "_inv_r2") (by rw [h1nm]; simp)]; simp
+  have h3nm : (((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").copyToTop a "_inv_a").nm.toList
+      = L ++ [some a, some "_inv_r", some "_inv_a"] := by
+    rw [copyToTop_nm_toList, h2nm]; simp
+  -- ops chain
+  -- fieldSqr ops
+  have h1ops : (Ec.fieldSqr t "_inv_r" "_inv_r2").ops.toList = t.ops.toList ++ fieldSqrYInc :=
+    invFieldSqr_ops t L a hnm hne
+  -- rename preserves ops
+  have h2ops : ((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").ops.toList
+      = t.ops.toList ++ fieldSqrYInc := by
+    rw [show ((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").ops
+          = (Ec.fieldSqr t "_inv_r" "_inv_r2").ops from rename_ops _ "_inv_r", h1ops]
+  -- copyToTop a "_inv_a" depth 1 = .over
+  have h3ops : (((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").copyToTop a "_inv_a").ops.toList
+      = t.ops.toList ++ fieldSqrYInc ++ [.over] := by
+    rw [copyToTop_ops_concrete _ a "_inv_a" 1
+          (findDepth_second1 _ L a "_inv_r" h2nm hne), h2ops]
+    simp only [pickExtraOps]
+  -- fieldMul "_inv_r" "_inv_a" "_inv_m" ops
+  have h4ops : (Ec.fieldMul (((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").copyToTop a "_inv_a")
+        "_inv_r" "_inv_a" "_inv_m").ops.toList
+      = t.ops.toList ++ fieldSqrYInc ++ [.over] ++ fieldMulSwap2Inc := by
+    rw [invFieldMul_ops _ L a h3nm, h3ops]
+  -- final rename preserves ops
+  rw [show ((Ec.fieldMul (((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").copyToTop a "_inv_a")
+        "_inv_r" "_inv_a" "_inv_m").rename "_inv_r").ops
+        = (Ec.fieldMul (((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").copyToTop a "_inv_a")
+            "_inv_r" "_inv_a" "_inv_m").ops from rename_ops _ "_inv_r", h4ops]
+  simp only [oneHighIterInc, List.append_assoc]
+
+/-- **One high-loop iteration is an `nm` FIXED POINT.**  `hiIterBody` off `L ++ [a, "_inv_r"]`
+returns to `L ++ [a, "_inv_r"]` (the documented loop invariant: `_inv_r` depth 0, `aName`
+depth 1 for every iteration).  Threads `invFieldSqr_nm` → `rename` → `copyToTop` →
+`invFieldMul_nm` → `rename` at the `toList` level. -/
+private theorem hiIterBody_nm (t : Ec.Tracker) (L : List (Option String)) (a : String)
+    (hnm : t.nm.toList = L ++ [some a, some "_inv_r"]) (hne : a ≠ "_inv_r") :
+    (hiIterBody t a).nm.toList = L ++ [some a, some "_inv_r"] := by
+  unfold hiIterBody
+  -- fieldSqr "_inv_r" "_inv_r2" → L ++ [a, _inv_r2]
+  have h1 : (Ec.fieldSqr t "_inv_r" "_inv_r2").nm.toList = L ++ [some a, some "_inv_r2"] :=
+    invFieldSqr_nm t L a hnm hne
+  -- rename "_inv_r" → L ++ [a, _inv_r]
+  have h2 : ((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").nm.toList
+      = L ++ [some a, some "_inv_r"] := by
+    rw [rename_invr_nm _ (L ++ [some a]) (some "_inv_r2") (by rw [h1]; simp)]; simp
+  -- copyToTop a "_inv_a" (depth 1) → L ++ [a, _inv_r, _inv_a]
+  have h3 : (((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").copyToTop a "_inv_a").nm.toList
+      = L ++ [some a, some "_inv_r", some "_inv_a"] := by
+    rw [copyToTop_nm_toList, h2]; simp
+  -- fieldMul "_inv_r" "_inv_a" "_inv_m" → L ++ [a, _inv_m]
+  have h4 : (Ec.fieldMul (((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").copyToTop a "_inv_a")
+        "_inv_r" "_inv_a" "_inv_m").nm.toList = L ++ [some a, some "_inv_m"] :=
+    invFieldMul_nm _ L a h3
+  -- rename "_inv_r" → L ++ [a, _inv_r]
+  rw [rename_invr_nm _ (L ++ [some a]) (some "_inv_m") (by rw [h4]; simp)]; simp
+
+/-- `fieldInvHighLoop (n+1)` peels one `hiIterBody` then recurses (definitional). -/
+private theorem fieldInvHighLoop_succ (n : Nat) (t : Ec.Tracker) (aName : String) :
+    Ec.fieldInvHighLoop (n+1) t aName = Ec.fieldInvHighLoop n (hiIterBody t aName) aName := by
+  show Ec.fieldInvHighLoop n (hiIterBody t aName) aName = _
+  rfl
+
+/-- **THE HIGH-LOOP OP-LIST BRIDGE (deliverable 1).**  `fieldInvHighLoop n` emits exactly
+`highLoopInc n` (= `n` copies of `oneHighIterInc`), with the entry `nm` preserved.  A
+structural induction on `n`: each step peels one `hiIterBody` (`fieldInvHighLoop_succ`),
+appends `oneHighIterInc` (`hiIterBody_ops`) over the FIXED-POINT `nm` (`hiIterBody_nm`),
+then recurses on the preserved shape.  This is the op-list the runtime induction
+`highLoopInc_runOps_sim` consumes. -/
+private theorem fieldInvHighLoop_ops (n : Nat) :
+    ∀ (t : Ec.Tracker) (L : List (Option String)) (a : String),
+      t.nm.toList = L ++ [some a, some "_inv_r"] → a ≠ "_inv_r" →
+      (Ec.fieldInvHighLoop n t a).ops.toList = t.ops.toList ++ highLoopInc n
+        ∧ (Ec.fieldInvHighLoop n t a).nm.toList = L ++ [some a, some "_inv_r"] := by
+  induction n with
+  | zero =>
+    intro t L a hnm hne
+    refine ⟨?_, ?_⟩
+    · show (Ec.fieldInvHighLoop 0 t a).ops.toList = _
+      unfold Ec.fieldInvHighLoop highLoopInc
+      simp only [List.replicate, List.flatten, List.append_nil]
+    · show (Ec.fieldInvHighLoop 0 t a).nm.toList = _
+      unfold Ec.fieldInvHighLoop; exact hnm
+  | succ k ih =>
+    intro t L a hnm hne
+    rw [fieldInvHighLoop_succ k t a]
+    have hbody_nm : (hiIterBody t a).nm.toList = L ++ [some a, some "_inv_r"] :=
+      hiIterBody_nm t L a hnm hne
+    have hbody_ops : (hiIterBody t a).ops.toList = t.ops.toList ++ oneHighIterInc :=
+      hiIterBody_ops t L a hnm hne
+    obtain ⟨hrec_ops, hrec_nm⟩ := ih (hiIterBody t a) L a hbody_nm hne
+    refine ⟨?_, hrec_nm⟩
+    rw [hrec_ops, hbody_ops]
+    show t.ops.toList ++ oneHighIterInc ++ highLoopInc k = t.ops.toList ++ highLoopInc (k+1)
+    unfold highLoopInc
+    rw [show List.replicate (k+1) oneHighIterInc = oneHighIterInc :: List.replicate k oneHighIterInc from rfl,
+        List.flatten_cons]
+    simp only [List.append_assoc]
+
+/-- One low-loop iteration as a standalone `Tracker → Tracker` (mirrors the body of
+`fieldInvLowLoop (k+1)`): square always, multiply iff the current bit is set. -/
+def loIterBody (lowBits : Int) (k : Nat) (t : Ec.Tracker) (aName : String) : Ec.Tracker :=
+  let t := Ec.fieldSqr t "_inv_r" "_inv_r2"
+  let t := t.rename "_inv_r"
+  let bitSet : Bool := ((lowBits / (2 ^ k)) % 2) = 1
+  if bitSet then
+    let t := t.copyToTop aName "_inv_a"
+    let t := Ec.fieldMul t "_inv_r" "_inv_a" "_inv_m"
+    t.rename "_inv_r"
+  else t
+
+/-- `fieldInvLowLoop (k+1)` peels one `loIterBody` then recurses (definitional). -/
+private theorem fieldInvLowLoop_succ (k : Nat) (lowBits : Int) (t : Ec.Tracker) (aName : String) :
+    Ec.fieldInvLowLoop (k+1) lowBits t aName
+      = Ec.fieldInvLowLoop k lowBits (loIterBody lowBits k t aName) aName := by
+  show Ec.fieldInvLowLoop k lowBits (loIterBody lowBits k t aName) aName = _
+  rfl
+
+/-- **One low-loop iteration: `nm` FIXED POINT + ops increment = `oneLowIterInc bit`.**
+`by_cases` on the bit: set ⇒ `hiIterBody` (square-and-multiply, already proven); clear ⇒
+`fieldSqr`+`rename` (square-only). -/
+private theorem loIterBody_nm_ops (lowBits : Int) (k : Nat) (t : Ec.Tracker)
+    (L : List (Option String)) (a : String)
+    (hnm : t.nm.toList = L ++ [some a, some "_inv_r"]) (hne : a ≠ "_inv_r") :
+    (loIterBody lowBits k t a).nm.toList = L ++ [some a, some "_inv_r"]
+      ∧ (loIterBody lowBits k t a).ops.toList
+          = t.ops.toList ++ oneLowIterInc (((lowBits / (2 ^ k)) % 2) = 1) := by
+  unfold oneLowIterInc
+  by_cases hbit : ((lowBits / (2 ^ k)) % 2) = 1
+  · -- set: body = hiIterBody
+    rw [show loIterBody lowBits k t a = hiIterBody t a from by
+          unfold loIterBody hiIterBody; simp only [hbit, decide_true, if_true]]
+    rw [if_pos hbit]
+    exact ⟨hiIterBody_nm t L a hnm hne, hiIterBody_ops t L a hnm hne⟩
+  · -- clear: body = fieldSqr + rename (square-only)
+    rw [show loIterBody lowBits k t a = (Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r" from by
+          unfold loIterBody; simp only [hbit, decide_false, Bool.false_eq_true, if_false]]
+    rw [if_neg hbit]
+    have h1nm : (Ec.fieldSqr t "_inv_r" "_inv_r2").nm.toList = L ++ [some a, some "_inv_r2"] :=
+      invFieldSqr_nm t L a hnm hne
+    have h1ops : (Ec.fieldSqr t "_inv_r" "_inv_r2").ops.toList = t.ops.toList ++ fieldSqrYInc :=
+      invFieldSqr_ops t L a hnm hne
+    refine ⟨?_, ?_⟩
+    · rw [rename_invr_nm _ (L ++ [some a]) (some "_inv_r2") (by rw [h1nm]; simp)]; simp
+    · rw [show ((Ec.fieldSqr t "_inv_r" "_inv_r2").rename "_inv_r").ops
+            = (Ec.fieldSqr t "_inv_r" "_inv_r2").ops from rename_ops _ "_inv_r", h1ops]
+
+/-- **THE LOW-LOOP OP-LIST BRIDGE (deliverable 1).**  `fieldInvLowLoop steps lowBits` emits
+exactly `lowLoopInc steps lowBits`, `nm` preserved.  Structural induction on `steps`
+mirroring `fieldInvHighLoop_ops`, each step `loIterBody_nm_ops` (per-bit `by_cases`). -/
+private theorem fieldInvLowLoop_ops (steps : Nat) (lowBits : Int) :
+    ∀ (t : Ec.Tracker) (L : List (Option String)) (a : String),
+      t.nm.toList = L ++ [some a, some "_inv_r"] → a ≠ "_inv_r" →
+      (Ec.fieldInvLowLoop steps lowBits t a).ops.toList = t.ops.toList ++ lowLoopInc steps lowBits
+        ∧ (Ec.fieldInvLowLoop steps lowBits t a).nm.toList = L ++ [some a, some "_inv_r"] := by
+  induction steps with
+  | zero =>
+    intro t L a hnm hne
+    refine ⟨?_, ?_⟩
+    · show (Ec.fieldInvLowLoop 0 lowBits t a).ops.toList = _
+      show t.ops.toList = t.ops.toList ++ lowLoopInc 0 lowBits
+      show t.ops.toList = t.ops.toList ++ []
+      rw [List.append_nil]
+    · show (Ec.fieldInvLowLoop 0 lowBits t a).nm.toList = _
+      exact hnm
+  | succ k ih =>
+    intro t L a hnm hne
+    rw [fieldInvLowLoop_succ k lowBits t a]
+    obtain ⟨hbody_nm, hbody_ops⟩ := loIterBody_nm_ops lowBits k t L a hnm hne
+    obtain ⟨hrec_ops, hrec_nm⟩ := ih (loIterBody lowBits k t a) L a hbody_nm hne
+    refine ⟨?_, hrec_nm⟩
+    rw [hrec_ops, hbody_ops]
+    rw [show lowLoopInc (k+1) lowBits
+          = oneLowIterInc (((lowBits / (2 ^ k)) % 2) = 1) ++ lowLoopInc k lowBits from rfl]
+    simp only [List.append_assoc]
+
+/-- `drop` ops-append. -/
+private theorem drop_ops_append (t : Ec.Tracker) :
+    (t.drop).ops.toList = t.ops.toList ++ [StackOp.drop] := by
+  unfold Ec.Tracker.drop Ec.Tracker.emit; simp
+
+/-- `drop` nm at the `toList` level: pop the last slot. -/
+private theorem drop_nm_toList (t : Ec.Tracker) :
+    (t.drop).nm.toList = t.nm.toList.dropLast := by
+  unfold Ec.Tracker.drop Ec.Tracker.emit; rw [Array.toList_pop]
+
+/-- **THE FULL `fieldInv` OP-LIST BRIDGE (deliverable 1 — depth-0 entry).**  For an entry
+tracker with `aName` on TOS (`t.nm.toList = baseL ++ [some aName]`, the affineAdd
+`fieldInv "_s_den" …` site), `(Stack.Ec.fieldInv t aName resultName).ops.toList
+  = t.ops.toList ++ fieldInvCoreInc` — exactly the op-list the proven runtime sim
+`fieldInv_runOps_sim` consumes.  Chains: prelude `copyToTop aName "_inv_r"` (depth 0 =
+`.dup`) → high loop (`fieldInvHighLoop_ops`) → bit-32 `fieldSqr` (`invFieldSqr_ops`) →
+`rename` → low loop (`fieldInvLowLoop_ops`) → cleanup `toTop aName`(depth 1=`.swap`)/`.drop`/
+`toTop "_inv_r"`(depth 0=nop)/`rename` = `[.swap, .drop]`.  All bridges over the `nm`
+FIXED POINT. -/
+private theorem fieldInv_ops_depth0 (t : Ec.Tracker) (baseL : List (Option String))
+    (aName resultName : String)
+    (hnm : t.nm.toList = baseL ++ [some aName]) (hne : aName ≠ "_inv_r")
+    (hbaseR : some "_inv_r" ∉ baseL) (hbaseA : some aName ∉ baseL) :
+    (Ec.fieldInv t aName resultName).ops.toList = t.ops.toList ++ fieldInvCoreInc := by
+  -- the explicit composed form (definitional, avoids unfolding the recursive loops to WHNF)
+  rw [show Ec.fieldInv t aName resultName
+        = (((((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+              (((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+                "_inv_r" "_inv_r2").rename "_inv_r")) aName).toTop aName).drop).toTop "_inv_r").rename
+              resultName) from rfl]
+  -- prelude: copyToTop aName "_inv_r" (depth 0) → baseL ++ [aName, _inv_r]
+  have hp_nm : (t.copyToTop aName "_inv_r").nm.toList = baseL ++ [some aName, some "_inv_r"] := by
+    rw [copyToTop_nm_toList, hnm]; simp
+  have hp_ops : (t.copyToTop aName "_inv_r").ops.toList = t.ops.toList ++ [StackOp.dup] := by
+    rw [copyToTop_ops_concrete t aName "_inv_r" 0 (findDepth_top0 t baseL aName hnm)]
+    simp only [pickExtraOps]
+  -- high loop
+  obtain ⟨hhi_ops, hhi_nm⟩ :=
+    fieldInvHighLoop_ops 222 (t.copyToTop aName "_inv_r") baseL aName hp_nm hne
+  -- bit-32 fieldSqr
+  have hbit_ops : (Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+        "_inv_r" "_inv_r2").ops.toList
+      = (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName).ops.toList ++ fieldSqrYInc :=
+    invFieldSqr_ops _ baseL aName hhi_nm hne
+  have hbit_nm : (Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+        "_inv_r" "_inv_r2").nm.toList = baseL ++ [some aName, some "_inv_r2"] :=
+    invFieldSqr_nm _ baseL aName hhi_nm hne
+  -- rename "_inv_r"
+  have hren_ops : ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+        "_inv_r" "_inv_r2").rename "_inv_r").ops
+      = (Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+        "_inv_r" "_inv_r2").ops := rename_ops _ "_inv_r"
+  have hren_nm : ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+        "_inv_r" "_inv_r2").rename "_inv_r").nm.toList = baseL ++ [some aName, some "_inv_r"] := by
+    rw [rename_invr_nm _ (baseL ++ [some aName]) (some "_inv_r2") (by rw [hbit_nm]; simp)]; simp
+  -- low loop
+  obtain ⟨hlo_ops, hlo_nm⟩ :=
+    fieldInvLowLoop_ops 32 0xFFFFFC2D _ baseL aName hren_nm hne
+  -- cleanup: toTop aName (depth 1) → swap
+  have hcl1_nm : ((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+        ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+          "_inv_r" "_inv_r2").rename "_inv_r") aName).toTop aName).nm.toList
+      = baseL ++ [some "_inv_r", some aName] :=
+    toTop_second_nm _ baseL aName "_inv_r" hlo_nm hne
+  have hcl1_ops : ((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+        ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+          "_inv_r" "_inv_r2").rename "_inv_r") aName).toTop aName).ops.toList
+      = (Ec.fieldInvLowLoop 32 0xFFFFFC2D
+          ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+            "_inv_r" "_inv_r2").rename "_inv_r") aName).ops.toList ++ [StackOp.swap] := by
+    rw [toTop_ops_concrete _ aName 1 (findDepth_second1 _ baseL aName "_inv_r" hlo_nm hne)]
+    simp only [rollExtraOps]
+  -- .drop → baseL ++ [_inv_r]
+  have hcl2_nm : (((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+        ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+          "_inv_r" "_inv_r2").rename "_inv_r") aName).toTop aName).drop).nm.toList
+      = baseL ++ [some "_inv_r"] := by
+    rw [drop_nm_toList, hcl1_nm]; simp
+  -- toTop "_inv_r" (depth 0) → nop
+  have hcl3_ops : ((((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+        ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+          "_inv_r" "_inv_r2").rename "_inv_r") aName).toTop aName).drop).toTop "_inv_r").ops.toList
+      = (((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+            ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+              "_inv_r" "_inv_r2").rename "_inv_r") aName).toTop aName).drop).ops.toList := by
+    rw [toTop_ops_concrete _ "_inv_r" 0 (findDepth_top0 _ baseL "_inv_r" hcl2_nm)]
+    simp only [rollExtraOps, List.append_nil]
+  -- assemble the ops chain.  the final `rename resultName` preserves ops.
+  rw [show (((((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+        ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+          "_inv_r" "_inv_r2").rename "_inv_r") aName).toTop aName).drop).toTop "_inv_r").rename resultName).ops
+        = ((((Ec.fieldInvLowLoop 32 0xFFFFFC2D
+            ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+              "_inv_r" "_inv_r2").rename "_inv_r") aName).toTop aName).drop).toTop "_inv_r").ops
+        from rename_ops _ resultName]
+  rw [hcl3_ops, drop_ops_append, hcl1_ops, hlo_ops]
+  rw [show ((Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+          "_inv_r" "_inv_r2").rename "_inv_r").ops.toList
+        = (Ec.fieldSqr (Ec.fieldInvHighLoop 222 (t.copyToTop aName "_inv_r") aName)
+            "_inv_r" "_inv_r2").ops.toList from by rw [hren_ops]]
+  rw [hbit_ops, hhi_ops, hp_ops]
+  simp only [fieldInvCoreInc, List.append_assoc, List.cons_append, List.nil_append, List.singleton_append]
+
+/-! ### MANDATORY smokes for the `fieldInv` op-list bridge (deliverable 1) -/
+
+/-- Concrete loop-entry tracker for the bridge smokes: `nm = [_pa, aBase, _inv_r]`. -/
+private def invBridgeT0 : Ec.Tracker :=
+  { nm := #[some "_pa", some "_inv_a_base", some "_inv_r"], ops := #[] }
+
+/-- SMOKE (per-iteration `nm` FIXED POINT fires).  One `hiIterBody` returns the entry `nm`. -/
+theorem smoke_hiIterBody_nm :
+    (hiIterBody invBridgeT0 "_inv_a_base").nm.toList
+      = [some "_pa", some "_inv_a_base", some "_inv_r"] :=
+  hiIterBody_nm invBridgeT0 [some "_pa"] "_inv_a_base" (by decide) (by decide)
+
+/-- SMOKE (per-iteration ops increment fires).  One `hiIterBody` appends `oneHighIterInc`. -/
+theorem smoke_hiIterBody_ops :
+    (hiIterBody invBridgeT0 "_inv_a_base").ops.toList = invBridgeT0.ops.toList ++ oneHighIterInc :=
+  hiIterBody_ops invBridgeT0 [some "_pa"] "_inv_a_base" (by decide) (by decide)
+
+/-- SMOKE (high-loop op-list bridge fires).  3 iterations emit `highLoopInc 3`, `nm` fixed. -/
+theorem smoke_fieldInvHighLoop_ops :
+    (Ec.fieldInvHighLoop 3 invBridgeT0 "_inv_a_base").ops.toList
+        = invBridgeT0.ops.toList ++ highLoopInc 3
+      ∧ (Ec.fieldInvHighLoop 3 invBridgeT0 "_inv_a_base").nm.toList
+        = [some "_pa", some "_inv_a_base", some "_inv_r"] :=
+  fieldInvHighLoop_ops 3 invBridgeT0 [some "_pa"] "_inv_a_base" (by decide) (by decide)
+
+/-- SMOKE (low-loop op-list bridge fires).  4 iters over `lowBits = 10` emit
+`lowLoopInc 4 10`, `nm` fixed. -/
+theorem smoke_fieldInvLowLoop_ops :
+    (Ec.fieldInvLowLoop 4 10 invBridgeT0 "_inv_a_base").ops.toList
+        = invBridgeT0.ops.toList ++ lowLoopInc 4 10
+      ∧ (Ec.fieldInvLowLoop 4 10 invBridgeT0 "_inv_a_base").nm.toList
+        = [some "_pa", some "_inv_a_base", some "_inv_r"] :=
+  fieldInvLowLoop_ops 4 10 invBridgeT0 [some "_pa"] "_inv_a_base" (by decide) (by decide)
+
+/-- Concrete DEPTH-0 entry tracker for the full-bridge smoke: `aName` on TOS. -/
+private def invBridgeD0 : Ec.Tracker :=
+  { nm := #[some "_pa", some "_s_den"], ops := #[] }
+
+/-- SMOKE (the FULL `fieldInv` op-list bridge fires).  Off a depth-0 `_s_den` entry (the
+affineAdd site), `fieldInv "_s_den" "_s_den_inv"` emits exactly `fieldInvCoreInc` — the
+op-list the proven runtime sim `fieldInv_runOps_sim` consumes.  This is the join point
+that connects the codegen `fieldInv` to its runtime correctness. -/
+theorem smoke_fieldInv_ops_depth0 :
+    (Ec.fieldInv invBridgeD0 "_s_den" "_s_den_inv").ops.toList
+      = invBridgeD0.ops.toList ++ fieldInvCoreInc :=
+  fieldInv_ops_depth0 invBridgeD0 [some "_pa"] "_s_den" "_s_den_inv"
+    (by decide) (by decide) (by decide) (by decide)
+
 /-! ## Part 15 (cont.) — `fieldInv` op-list bridge + affineAdd + `emitEcAdd` discharge: HONEST BLOCK
 
 The spec-level square-and-multiply crux (`FieldInvSpec.fieldInvAccum_eq`) is PROVEN, AND
@@ -5576,53 +6156,61 @@ crux the hand-off flagged) are now LANDED above — landing `samHigh`/`samLow` o
 Script-VM stack by genuine structural induction on the loop count.  What REMAINS for the
 `emitEcAdd_runOps_eq` discharge:
 
-1. **`fieldInv` op-list bridge (mechanical bookkeeping, NOT yet landed).**  The runtime
-   loop INDUCTIONS are proven (`highLoopInc_runOps_sim` / `lowLoopInc_runOps_sim`); what
-   they consume is the determined op-lists `highLoopInc 222` / `lowLoopInc 32 0xFFFFFC2D`.
-   The bridge `(Stack.Ec.fieldInv t aName resultName).ops.toList
-     = t.ops.toList ++ pickExtraOps dA ++ highLoopInc 222 ++ fieldSqrYInc
-       ++ lowLoopInc 32 0xFFFFFC2D ++ [.swap, .drop]` (where `dA = t.findDepth aName` for the
-   `copyToTop aName "_inv_r"` prelude) closes the gap between the codegen `fieldInv` op-list
-   and the inductions' input.  The KEY enabling FACT — and the correction of the earlier
-   hand-off's mis-diagnosis — is now established by direct computation and by the proved
-   inductions: **the per-iteration tracker `nm` is a FIXED POINT** (`_inv_r` stays depth 0,
-   `aName` depth 1 for all 254 iterations), so each iteration's `ops` delta is the CONSTANT
-   `oneHighIterInc` (resp. `oneLowIterInc bit`) — NOT a depth-varying list.  The remaining
-   work is a STRUCTURAL induction `fieldInvHighLoop_ops` :
-   `(fieldInvHighLoop n t aName).ops.toList = t.ops.toList ++ highLoopInc n` proved alongside
-   the nm fixed-point `(fieldInvHighLoop n t aName).nm = t.nm`, both off the per-iteration nm
-   transform (`fieldSqr`/`rename`/`copyToTop`/`fieldMul`/`rename` returning the same `nm`),
-   plus the peer `fieldInvLowLoop_ops` (case-split per bit), plus the prelude/cleanup folds.
-   This is mechanical `Array.ext'` bookkeeping over a FIXED shape (≈ 150 LOC), with no
-   remaining mathematical content — the genuinely hard induction (the crux) is DONE.
+1. **`fieldInv` op-list bridge — FULLY LANDED (this wave), axiom-clean.**  The runtime loop
+   INDUCTIONS were proven (`highLoopInc_runOps_sim` / `lowLoopInc_runOps_sim`); what they
+   consume is the determined op-lists `highLoopInc 222` / `lowLoopInc 32 0xFFFFFC2D`.  This
+   wave closes the codegen-op-list ↔ inductions gap COMPLETELY:
+   * `InvLoopShape` + the `toList`-level nm transforms (`toTop_top_nm`/`toTop_second_nm`/
+     `rename_invr_nm`/`rawBlock2_nm_toList`/`copyToTop_nm_toList` + depth folds
+     `findDepth_top0`/`findDepth_second1`).
+   * `invFieldSqr_nm`/`_ops`, `invFieldMul_nm`/`_ops` — the loop-body field helpers.
+   * `hiIterBody_nm`/`_ops` — one high iteration is an `nm` FIXED POINT + appends
+     `oneHighIterInc`; `loIterBody_nm_ops` — one low iteration (`by_cases` on the bit)
+     appends `oneLowIterInc bit`, nm fixed.
+   * `fieldInvHighLoop_ops` / `fieldInvLowLoop_ops` — structural inductions:
+     `(fieldInvHighLoop n …).ops = …  ++ highLoopInc n` (resp. low), nm preserved.
+   * **`fieldInv_ops_depth0`** — THE FULL BRIDGE: for a DEPTH-0 entry (`aName` on TOS, the
+     affineAdd `fieldInv "_s_den" …` site) `(Stack.Ec.fieldInv t aName r).ops.toList
+       = t.ops.toList ++ fieldInvCoreInc`, EXACTLY the op-list `fieldInv_runOps_sim` consumes.
+     Chains prelude `dup` → high loop → bit-32 `fieldSqr` → `rename` → low loop → cleanup
+     `[.swap, .drop]`.  (Uses `show … = <explicit composed form> from rfl` instead of
+     `unfold Ec.fieldInv` — the latter triggers KERNEL deep-recursion by forcing the 222/32
+     recursive loops to WHNF; the `show` keeps the loop applications opaque on both sides.)
+   Smokes: `smoke_hiIterBody_nm`/`_ops`, `smoke_fieldInvHighLoop_ops`,
+   `smoke_fieldInvLowLoop_ops`, `smoke_fieldInv_ops_depth0` — all `propext`/`Classical.choice`/
+   `Quot.sound`-clean (NO `sorryAx`, NO new axiom, NO `native_decide`).
 
-   **EXACT REMAINING SUB-GOAL:** the one-high-iteration nm fixed-point
-   `(hiIter t aName).nm = t.nm` for a tracker with `t.nm = pre.push (some aName) |>.push
-   (some "_inv_r")` and the scratch names (`_inv_r2`/`_inv_a`/`_inv_m`/`_fsqr_copy`/
-   `_fmul_prod`/`_fmod_p`) fresh in `pre`, then induct.  (Scaffolded: the `findDepth
-   "_inv_r" = 0` / `findDepth aName = 1` folds off the abstract shape already check out via
-   `findDepth_eq_findDepthList` on the reversed `nm`; what remains is chaining the ~10
-   `pick_nm_push`/`toTop_nm_canonical`/`rawBlock_nm_some2`/`rename` `set!` array transforms
-   through `Array.ext'`.)
+2. **affineAdd field-chain threading (REMAINS — the next EXACT SUB-GOAL).**  `Stack.Ec.affineAdd`
+   is ~20 deep-depth tracker ops: `copyToTop "qy"/"py"` → `fieldSub _qy1 _py1 _s_num` →
+   `copyToTop "qx"/"px"` → `fieldSub _qx1 _px1 _s_den` → `fieldInv _s_den _s_den_inv` (depth-0
+   entry: `fieldInv_ops_depth0` now LANDED above) → `fieldMul _s_num _s_den_inv _s` →
+   `copyToTop _s _s_keep` → `fieldSqr _s _s2` → `copyToTop "px"` → `fieldSub _s2 _px2 _rx1` →
+   `copyToTop "qx"` → `fieldSub _rx1 _qx2 "rx"` → `copyToTop "px"/"rx"` →
+   `fieldSub _px3 _rx2 _px_rx` → `fieldMul _s_keep _px_rx _s_px_rx` → `copyToTop "py"` →
+   `fieldSub _s_px_rx _py2 "ry"` → 4× cleanup `toTop`/`drop`.  Unlike the `fieldInv` loop the
+   slot depths here VARY (px/py/qx/qy stay deep while scratch churns above), so an `affineAdd_ops`
+   determined-concat needs a per-op `nm`-shape `toList` chain (mirror the eocT chain, but ~20
+   steps with the `fieldInv` bridge spliced at the `_s_den` step) PLUS the matching runtime
+   threading (generic depth-general `fieldSub/Mul/Sqr_runOps_simT` off a `TrackerSimT`, NOT the
+   shallow `fieldSqr_runOps_sim` peers).  These generic composed field sims do not yet exist;
+   build them first (toTop+toTop+OP+fieldMod at arbitrary depth via `runOps_toTop_extraOps_simT`),
+   then thread.
 
-2. **affineAdd field-chain threading** — thread the ~50 `fieldSub`/`fieldMul`/`fieldSqr` +
-   the one `fieldInv` (now backed by the loop inductions + bridge) through `Stack.Ec.affineAdd`'s
-   op sequence to `Crypto.Secp256k1.affineAdd`'s non-degenerate branch (`s_num = qy−py`,
-   `s_den = qx−px`, `s = s_num·s_den⁻¹`, `rx = s²−px−qx`, `ry = s·(px−rx)−py`), reusing the
-   `fieldSub/Mul/Sqr_runOps_sim` peers off the (depth-resolved) `decomposePoint` base.
-
-3. **`emitEcAdd_runOps_eq` discharge** — `emitEcAdd_ops` (determined concat via the
-   intermediate-nm chain, mirroring `emitEcOnCurve_ops`) + the runtime threading
-   (`decomposePoint` ×2 → affineAdd field chain incl. `fieldInv` → `composePoint`), reduced
-   to `Crypto.Secp256k1.ecAdd`.  Honest INPUT-side wf hyps: both points 64-byte + on-curve +
-   `FIELD_P ≠ 0`, PLUS the non-degenerate case split `pointX p ≢ pointX q (mod p)` (the
-   affine formula's `pxm ≠ qxm` branch — the `P = ±Q` / doubling cases route through
-   `affineDouble`, a SEPARATE codegen path not exercised by `emitEcAdd`'s straight-line
-   affine-add and so must be excluded by hypothesis or handled in a follow-up).
+3. **`emitEcAdd_runOps_eq` discharge (REMAINS).**  `emitEcAdd_ops` (determined concat:
+   `decomposePoint` ×2 → affineAdd → `composePoint`, via the intermediate-nm chain mirroring
+   `emitEcOnCurve_ops`) + the runtime threading, reduced to `Crypto.Secp256k1.ecAdd`.  Honest
+   INPUT-side wf hyps: both points 64-byte + on-curve + `FIELD_P ≠ 0`, PLUS the non-degenerate
+   case split `pointX p ≢ pointX q (mod p)` (the affine formula's `pxm ≠ qxm` branch — the
+   `P = ±Q` / doubling cases route through `affineDouble`, a SEPARATE codegen path not
+   exercised by `emitEcAdd`'s straight-line affine-add and so must be excluded by hypothesis
+   or handled in a follow-up).
 
 The `Crypto.Spec.emitEcAdd_runOps_eq` axiom therefore REMAINS for now; drift stays at 74.
-The crux (the genuinely hard square-and-multiply correctness — spec-level
-`FieldInvSpec.fieldInvAccum_eq` AND the runtime 222/32-iter loop inductions
-`highLoopInc_runOps_sim`/`lowLoopInc_runOps_sim`) is discharged above. -/
+LANDED this wave: the ENTIRE `fieldInv` op-list bridge (sub-goal 1 — high loop, low loop, and
+the full depth-0 `fieldInv_ops_depth0`), joining the codegen `fieldInv` to the proven runtime
+sim `fieldInv_runOps_sim`.  Combined with the prior crux (`FieldInvSpec.fieldInvAccum_eq`) and
+the runtime loop inductions (`highLoopInc_runOps_sim`/`lowLoopInc_runOps_sim`), `fieldInv` is now
+verified END-TO-END (op-list ⟷ runtime ⟷ spec).  REMAINING for the ecAdd discharge: sub-goals
+2 + 3 (affineAdd op-list + runtime threading at varying depths, then the discharge). -/
 
 end RunarVerification.Stack.AgreesEC
