@@ -2187,6 +2187,402 @@ theorem smoke_applyPickStruct_findDepth_sim :
   · exact smoke_TrackerSim_satisfiable
   · decide
 
+/-! ### `toTop` / `copyToTop` runtime transports (wave-78 deliverable 1)
+
+`Tracker.toTop name` emits `Tracker.roll d` and `Tracker.copyToTop name newName`
+emits `Tracker.pick d newName`, with `d = Tracker.findDepth name` decided at
+codegen time.  Both emit a DEPTH-DEPENDENT op:
+
+  * `roll d` :  0 → nop, 1 → `.swap`, 2 → `.rot`, `n+3` → `.roll (n+3)`.
+  * `pick d` :  0 → `.dup`, 1 → `.over`, `k+2` → `.pickStruct (k+2)`.
+
+To thread `runOps` over the whole codegen op-list we need, for each, (a) the
+ops-append lemma `(helper t).ops = t.ops ++ extraOps d` and (b) the runtime
+transport `runOps (extraOps d) s = applyRoll/applyPick s d` (in range).  Composing
+(b) with the wave-76 `applyRoll_findDepth_sim` / `applyPick_findDepth_sim` and the
+wave-77 `findDepth_eq_findDepthList` bridge yields the per-step `toTop`/`copyToTop`
+transport that lands `σ name` on top under `TrackerSim`. -/
+
+/-- The op-list `Tracker.roll d` appends to `t.ops` (depth-case-uniform). -/
+def rollExtraOps (d : Nat) : List StackOp :=
+  match d with
+  | 0     => []
+  | 1     => [.swap]
+  | 2     => [.rot]
+  | n + 3 => [.roll (n + 3)]
+
+/-- The op-list `Tracker.pick d n` appends to `t.ops` (depth-case-uniform). -/
+def pickExtraOps (d : Nat) : List StackOp :=
+  match d with
+  | 0     => [.dup]
+  | 1     => [.over]
+  | k + 2 => [.pickStruct (k + 2)]
+
+/-- **`roll` ops-append.**  `(t.roll d).ops = t.ops ++ rollExtraOps d`.  Both
+branches of the internal `if L ≥ …` mutate only `nm`, leaving `ops` identical. -/
+theorem roll_ops_append (t : Ec.Tracker) (d : Nat) :
+    (t.roll d).ops.toList = t.ops.toList ++ rollExtraOps d := by
+  unfold Ec.Tracker.roll rollExtraOps
+  match d with
+  | 0     => simp
+  | 1     => simp only []; unfold Ec.Tracker.swap Ec.Tracker.emit; dsimp only; split <;> simp
+  | 2     => simp only []; unfold Ec.Tracker.rot Ec.Tracker.emit; dsimp only; split <;> simp
+  | n + 3 => simp only []; unfold Ec.Tracker.emit; dsimp only; split <;> simp
+
+/-- **`pick` ops-append.**  `(t.pick d n).ops = t.ops ++ pickExtraOps d`. -/
+theorem pick_ops_append (t : Ec.Tracker) (d : Nat) (n : String) :
+    (t.pick d n).ops.toList = t.ops.toList ++ pickExtraOps d := by
+  unfold Ec.Tracker.pick pickExtraOps
+  match d with
+  | 0     => unfold Ec.Tracker.dup Ec.Tracker.emit; simp
+  | 1     => unfold Ec.Tracker.over Ec.Tracker.emit; simp
+  | k + 2 => unfold Ec.Tracker.emit; simp
+
+/-- **`pick` always pushes `some n`** to `nm` (depth-case-uniform).  The runtime
+peer pushes the copied value, so `copyToTop` preservation is exactly
+`TrackerSim_push`. -/
+theorem pick_nm_push (t : Ec.Tracker) (d : Nat) (n : String) :
+    (t.pick d n).nm = t.nm.push (some n) := by
+  unfold Ec.Tracker.pick
+  match d with
+  | 0     => unfold Ec.Tracker.dup Ec.Tracker.emit; rfl
+  | 1     => unfold Ec.Tracker.over Ec.Tracker.emit; rfl
+  | k + 2 => unfold Ec.Tracker.emit; rfl
+
+/-- `applySwap = applyRoll · 1` when the stack has ≥2 elements. -/
+theorem applySwap_eq_applyRoll1 (s : StackState) (h : 2 ≤ s.stack.length) :
+    applySwap s = applyRoll s 1 := by
+  unfold applyRoll applySwap; rw [if_neg (by omega)]
+  cases hs : s.stack with
+  | nil => rw [hs] at h; simp at h
+  | cons a rest =>
+    cases hr : rest with
+    | nil => rw [hs, hr] at h; simp at h
+    | cons b rest2 => simp [List.eraseIdx]
+
+/-- `applyRot = applyRoll · 2` when the stack has ≥3 elements. -/
+theorem applyRot_eq_applyRoll2 (s : StackState) (h : 3 ≤ s.stack.length) :
+    applyRot s = applyRoll s 2 := by
+  unfold applyRoll applyRot; rw [if_neg (by omega)]
+  cases hs : s.stack with
+  | nil => rw [hs] at h; simp at h
+  | cons a rest =>
+    cases hr : rest with
+    | nil => rw [hs, hr] at h; simp at h
+    | cons b rest2 =>
+      cases hr2 : rest2 with
+      | nil => rw [hs, hr, hr2] at h; simp at h
+      | cons c rest3 => simp [List.eraseIdx]
+
+/-- `applyDup = applyPick · 0` when the stack is nonempty. -/
+theorem applyDup_eq_applyPick0 (s : StackState) (h : 1 ≤ s.stack.length) :
+    applyDup s = applyPick s 0 := by
+  unfold applyPick applyDup StackState.push; rw [if_neg (by omega)]
+  cases hs : s.stack with
+  | nil => rw [hs] at h; simp at h
+  | cons a rest => simp
+
+/-- `applyOver = applyPick · 1` when the stack has ≥2 elements. -/
+theorem applyOver_eq_applyPick1 (s : StackState) (h : 2 ≤ s.stack.length) :
+    applyOver s = applyPick s 1 := by
+  unfold applyPick applyOver StackState.push; rw [if_neg (by omega)]
+  cases hs : s.stack with
+  | nil => rw [hs] at h; simp at h
+  | cons a rest =>
+    cases hr : rest with
+    | nil => rw [hs, hr] at h; simp at h
+    | cons b rest2 => simp
+
+private theorem niSwap' : ∀ t e, StackOp.swap ≠ .ifOp t e := by intro t e h; cases h
+private theorem niRot' : ∀ t e, StackOp.rot ≠ .ifOp t e := by intro t e h; cases h
+private theorem niRoll' : ∀ d t e, StackOp.roll d ≠ .ifOp t e := by intro d t e h; cases h
+private theorem niDup' : ∀ t e, StackOp.dup ≠ .ifOp t e := by intro t e h; cases h
+private theorem niOver' : ∀ t e, StackOp.over ≠ .ifOp t e := by intro t e h; cases h
+private theorem niPickStruct' : ∀ d t e, StackOp.pickStruct d ≠ .ifOp t e := by
+  intro d t e h; cases h
+
+/-- **`roll` runtime transport.**  Running the depth-`d` op-list `Tracker.roll`
+emits equals `applyRoll s d` whenever `d` is in range — the depth-0/1/2 special
+cases (`nop`/`.swap`/`.rot`) collapse to `applyRoll · d` via the conditional
+`applySwap/applyRot = applyRoll` bridges; the `≥3` case is the bare `.roll d`. -/
+theorem runOps_rollExtraOps (s : StackState) (d : Nat) (h : d < s.stack.length) :
+    runOps (rollExtraOps d) s = applyRoll s d := by
+  unfold rollExtraOps
+  match d with
+  | 0 =>
+    simp only [runOps_nil]
+    unfold applyRoll; rw [if_neg (by omega)]
+    cases hs : s.stack with
+    | nil => rw [hs] at h; simp at h
+    | cons a rest =>
+      simp only [hs, List.getElem!_cons_zero, List.eraseIdx_cons_zero]
+      cases s; simp_all
+  | 1 =>
+    rw [runOps_cons_nonIf_eq _ _ _ niSwap',
+        show stepNonIf .swap s = applySwap s from rfl, applySwap_eq_applyRoll1 s (by omega)]
+    cases happ : applyRoll s 1 with
+    | error e => exfalso; unfold applyRoll at happ; rw [if_neg (by omega)] at happ; simp at happ
+    | ok s' => simp [runOps_nil]
+  | 2 =>
+    rw [runOps_cons_nonIf_eq _ _ _ niRot',
+        show stepNonIf .rot s = applyRot s from rfl, applyRot_eq_applyRoll2 s (by omega)]
+    cases happ : applyRoll s 2 with
+    | error e => exfalso; unfold applyRoll at happ; rw [if_neg (by omega)] at happ; simp at happ
+    | ok s' => simp [runOps_nil]
+  | n + 3 =>
+    rw [runOps_cons_nonIf_eq _ _ _ (niRoll' (n+3)),
+        show stepNonIf (.roll (n+3)) s = applyRoll s (n+3) from rfl]
+    cases happ : applyRoll s (n+3) with
+    | error e => exfalso; unfold applyRoll at happ; rw [if_neg (by omega)] at happ; simp at happ
+    | ok s' => simp [runOps_nil]
+
+/-- **`pick` runtime transport.**  Running the depth-`d` op-list `Tracker.pick`
+emits equals `applyPick s d` whenever `d` is in range — depth-0/1 (`.dup`/`.over`)
+collapse to `applyPick · d` via the conditional bridges; `≥2` is `.pickStruct d`
+(= `applyPick` in range, the wave-77 `applyPickStruct_eq_applyPick`). -/
+theorem runOps_pickExtraOps (s : StackState) (d : Nat) (h : d < s.stack.length) :
+    runOps (pickExtraOps d) s = applyPick s d := by
+  unfold pickExtraOps
+  match d with
+  | 0 =>
+    rw [runOps_cons_nonIf_eq _ _ _ niDup',
+        show stepNonIf .dup s = applyDup s from rfl, applyDup_eq_applyPick0 s (by omega)]
+    cases happ : applyPick s 0 with
+    | error e => exfalso; unfold applyPick at happ; rw [if_neg (by omega)] at happ; simp at happ
+    | ok s' => simp [runOps_nil]
+  | 1 =>
+    rw [runOps_cons_nonIf_eq _ _ _ niOver',
+        show stepNonIf .over s = applyOver s from rfl, applyOver_eq_applyPick1 s (by omega)]
+    cases happ : applyPick s 1 with
+    | error e => exfalso; unfold applyPick at happ; rw [if_neg (by omega)] at happ; simp at happ
+    | ok s' => simp [runOps_nil]
+  | k + 2 =>
+    rw [runOps_cons_nonIf_eq _ _ _ (niPickStruct' (k+2)),
+        show stepNonIf (.pickStruct (k+2)) s = applyPickStruct s (k+2) from rfl,
+        applyPickStruct_eq_applyPick s (k+2) (by omega)]
+    cases happ : applyPick s (k+2) with
+    | error e => exfalso; unfold applyPick at happ; rw [if_neg (by omega)] at happ; simp at happ
+    | ok s' => simp [runOps_nil]
+
+/-- **`toTop` per-step runtime transport (deliverable 1).**  Under `TrackerSim`,
+running the op-list `Tracker.toTop name` emits (= `rollExtraOps (findDepthList …)`,
+via the wave-77 bridge) brings exactly `σ name` to the top of the runtime stack,
+leaving the rest as `s.stack.eraseIdx d`.  This is the runtime witness of
+`Tracker.toTop` the field-arith helpers compose. -/
+theorem runOps_toTop_extraOps_sim (s : StackState) (nm : Array (Option String))
+    (σ : String → Value) (name : String)
+    (hSim : TrackerSim nm σ s.stack)
+    (hmem : some name ∈ nm.toList.reverse) :
+    runOps (rollExtraOps (findDepthList name nm.toList.reverse)) s
+      = .ok { s with
+              stack := σ name :: s.stack.eraseIdx (findDepthList name nm.toList.reverse) } := by
+  have hlt := (findDepthList_sim nm σ s.stack name hSim hmem).1
+  rw [runOps_rollExtraOps s _ (by omega)]
+  exact applyRoll_findDepth_sim s nm σ name hSim hmem
+
+/-- **`copyToTop` per-step runtime transport (deliverable 1).**  Under
+`TrackerSim`, running the op-list `Tracker.copyToTop name newName` emits
+(= `pickExtraOps (findDepthList …)`) COPIES exactly `σ name` to the top, without
+removing it.  Runtime witness of `Tracker.copyToTop`. -/
+theorem runOps_copyToTop_extraOps_sim (s : StackState) (nm : Array (Option String))
+    (σ : String → Value) (name : String)
+    (hSim : TrackerSim nm σ s.stack)
+    (hmem : some name ∈ nm.toList.reverse) :
+    runOps (pickExtraOps (findDepthList name nm.toList.reverse)) s
+      = .ok (s.push (σ name)) := by
+  have hlt := (findDepthList_sim nm σ s.stack name hSim hmem).1
+  rw [runOps_pickExtraOps s _ (by omega)]
+  exact applyPick_findDepth_sim s nm σ name hSim hmem
+
+/-- **`copyToTop` `TrackerSim` preservation (deliverable 1).**  After
+`Tracker.copyToTop name newName`, the tracker pushes `some newName` to `nm` and the
+runtime pushes `σ name`.  Provided `newName` is fresh (the codegen always picks
+fresh copy-target names) the invariant is preserved under the valuation updated to
+`newName ↦ σ name`.  Reduces to `TrackerSim_push`. -/
+theorem TrackerSim_copyToTop (s : StackState) (nm : Array (Option String))
+    (σ : String → Value) (name newName : String)
+    (hSim : TrackerSim nm σ s.stack)
+    (hfresh : some newName ∉ nm.toList) :
+    TrackerSim (nm.push (some newName))
+      (fun t => if t = newName then σ name else σ t) (σ name :: s.stack) :=
+  TrackerSim_push nm σ s.stack newName (σ name) hSim hfresh
+
+/-! ### MANDATORY smokes for the `toTop`/`copyToTop` transports (deliverable 1) -/
+
+/-- SMOKE (`roll` ops-append fires).  `(simTracker.roll 2).ops = simTracker.ops ++ [.rot]`. -/
+theorem smoke_roll_ops_append :
+    (simTracker.roll 2).ops.toList = simTracker.ops.toList ++ [StackOp.rot] := by
+  rw [roll_ops_append]; rfl
+
+/-- SMOKE (`pick` ops-append fires).  `(simTracker.pick 3 "z").ops = … ++ [.pickStruct 3]`. -/
+theorem smoke_pick_ops_append :
+    (simTracker.pick 3 "z").ops.toList = simTracker.ops.toList ++ [StackOp.pickStruct 3] := by
+  rw [pick_ops_append]; rfl
+
+/-- SMOKE (`pick` nm-push fires).  `(simTracker.pick 3 "z").nm = simTracker.nm.push (some "z")`. -/
+theorem smoke_pick_nm_push :
+    (simTracker.pick 3 "z").nm = simTracker.nm.push (some "z") := by
+  rw [pick_nm_push]
+
+/-- SMOKE (`roll` runtime transport fires).  `rollExtraOps 1 = [.swap]` on
+`[30, 20, 10]` swaps the top two: `[20, 30, 10]` = `applyRoll · 1`. -/
+theorem smoke_runOps_rollExtraOps :
+    runOps (rollExtraOps 1) { (default : StackState) with stack := simStk }
+      = applyRoll { (default : StackState) with stack := simStk } 1 := by
+  apply runOps_rollExtraOps; decide
+
+/-- SMOKE (`pick` runtime transport fires).  `pickExtraOps 2 = [.pickStruct 2]` on
+`[30, 20, 10]` copies depth-2 (= 10): `[10, 30, 20, 10]` = `applyPick · 2`. -/
+theorem smoke_runOps_pickExtraOps :
+    runOps (pickExtraOps 2) { (default : StackState) with stack := simStk }
+      = applyPick { (default : StackState) with stack := simStk } 2 := by
+  apply runOps_pickExtraOps; decide
+
+/-- SMOKE (`toTop` transport fires under the concrete `TrackerSim`).  Bringing
+`"a"` (depth 2) to the top lands `σ "a" = 10` over the erased remainder. -/
+theorem smoke_runOps_toTop_extraOps_sim :
+    runOps (rollExtraOps (findDepthList "a" simNm.toList.reverse))
+        { (default : StackState) with stack := simStk }
+      = .ok { (default : StackState) with
+              stack := simσ "a"
+                :: simStk.eraseIdx (findDepthList "a" simNm.toList.reverse) } := by
+  apply runOps_toTop_extraOps_sim
+  · exact smoke_TrackerSim_satisfiable
+  · decide
+
+/-- SMOKE (`copyToTop` transport fires under the concrete `TrackerSim`).  Copying
+`"a"` (depth 2) lands `σ "a" = 10` on top without removing it. -/
+theorem smoke_runOps_copyToTop_extraOps_sim :
+    runOps (pickExtraOps (findDepthList "a" simNm.toList.reverse))
+        { (default : StackState) with stack := simStk }
+      = .ok (({ (default : StackState) with stack := simStk }).push (simσ "a")) := by
+  apply runOps_copyToTop_extraOps_sim
+  · exact smoke_TrackerSim_satisfiable
+  · decide
+
+/-- SMOKE (`copyToTop` preservation fires).  Copying `"a"` to a fresh `"d"` extends
+the concrete `TrackerSim` with `"d" ↦ σ "a" = 10`. -/
+theorem smoke_TrackerSim_copyToTop :
+    TrackerSim (simNm.push (some "d"))
+      (fun t => if t = "d" then simσ "a" else simσ t) (simσ "a" :: simStk) := by
+  apply TrackerSim_copyToTop { (default : StackState) with stack := simStk }
+  · exact smoke_TrackerSim_satisfiable
+  · decide
+
+/-! ### Per-helper ops-append lemmas (wave-78 deliverable 2)
+
+Each Tracker helper APPENDS a determined op-list to `t.ops`, so `runOps_append`
+decomposes the 945/518-op codegen list helper-by-helper.  The leaf primitives —
+`rawBlock`, `pushInt`/`pushBytes`/`pushFieldP`, `toTop`, `copyToTop` — append a
+list expressible via `rollExtraOps`/`pickExtraOps` (D1) at the depth the codegen
+decides (`Tracker.findDepth`).  The field helpers compose those leaves; we ship
+`fieldMod` as the worked non-nested example (the binop helpers nest a second
+`toTop` whose depth is taken against the post-first-`toTop` tracker — provable by
+the same `rw` chain, but the conclusion is a nested-tracker term, so we leave the
+binop expansions to the assembly site rather than pre-baking a verbose lemma). -/
+
+/-- **Id-monad `forIn`-push fold = append.**  The `rawBlock` ops loop folds
+`Array.push` over the extra-ops list; its `toList` is `arr.toList ++ e`. -/
+theorem forIn_id_push_toList :
+    ∀ (e : List StackOp) (arr : Array StackOp),
+      (forIn (m := Id) e arr fun op r => ForInStep.yield (r.push op)).toList
+        = arr.toList ++ e := by
+  intro e
+  induction e with
+  | nil => intro arr; rw [List.forIn_nil]; show arr.toList = arr.toList ++ []; simp
+  | cons hd tl ih =>
+    intro arr
+    rw [List.forIn_cons]
+    show (forIn (m := Id) tl (arr.push hd) fun op r => ForInStep.yield (r.push op)).toList = _
+    rw [ih (arr.push hd)]; simp
+
+/-- The `.ops` field of `rawBlock` is the `forIn`-push fold of the extra ops over
+`t.ops`, independent of `produce` and the (ops-irrelevant) `nm` pop loop. -/
+theorem rawBlock_ops_eq (t : Ec.Tracker) (c : Nat) (p : Option String) (e : List StackOp) :
+    (t.rawBlock c p e).ops
+      = forIn (m := Id) e t.ops fun op r => ForInStep.yield (r.push op) := by
+  unfold Ec.Tracker.rawBlock; cases p <;> rfl
+
+/-- **`rawBlock` ops-append.**  `(t.rawBlock c p e).ops = t.ops ++ e`. -/
+theorem rawBlock_ops_append (t : Ec.Tracker) (c : Nat) (p : Option String) (e : List StackOp) :
+    (t.rawBlock c p e).ops.toList = t.ops.toList ++ e := by
+  rw [rawBlock_ops_eq]; exact forIn_id_push_toList e t.ops
+
+/-- **`pushInt` ops-append.** -/
+theorem pushInt_ops_append (t : Ec.Tracker) (n : String) (v : Int) :
+    (t.pushInt n v).ops.toList = t.ops.toList ++ [.push (.bigint v)] := by
+  unfold Ec.Tracker.pushInt Ec.Tracker.emit; simp
+
+/-- **`pushBytes` ops-append.** -/
+theorem pushBytes_ops_append (t : Ec.Tracker) (n : String) (v : ByteArray) :
+    (t.pushBytes n v).ops.toList = t.ops.toList ++ [.push (.bytes v)] := by
+  unfold Ec.Tracker.pushBytes Ec.Tracker.emit; simp
+
+/-- **`pushFieldP` ops-append.**  Pushes the field prime literal. -/
+theorem pushFieldP_ops_append (t : Ec.Tracker) (n : String) :
+    (Ec.pushFieldP t n).ops.toList = t.ops.toList ++ [.push (.bigint Ec.fieldP)] := by
+  unfold Ec.pushFieldP; exact pushInt_ops_append t n Ec.fieldP
+
+/-- **`toTop` ops-append.**  `(t.toTop name).ops = t.ops ++ rollExtraOps (findDepth name)`.
+The appended op is the depth-`Tracker.findDepth name` `roll` op (D1 `rollExtraOps`). -/
+theorem toTop_ops_append (t : Ec.Tracker) (name : String) :
+    (t.toTop name).ops.toList = t.ops.toList ++ rollExtraOps (t.findDepth name) := by
+  unfold Ec.Tracker.toTop; exact roll_ops_append t (t.findDepth name)
+
+/-- **`copyToTop` ops-append.**  `(t.copyToTop name newName).ops = t.ops ++
+pickExtraOps (findDepth name)` (D1 `pickExtraOps`, depth-`Tracker.findDepth name`). -/
+theorem copyToTop_ops_append (t : Ec.Tracker) (name newName : String) :
+    (t.copyToTop name newName).ops.toList = t.ops.toList ++ pickExtraOps (t.findDepth name) := by
+  unfold Ec.Tracker.copyToTop; exact pick_ops_append t (t.findDepth name) newName
+
+/-- **`fieldMod` ops-append (worked field-helper example).**  `fieldMod` is
+`toTop a → pushFieldP → rawBlock 2 r fieldModOps`; its ops append in that order. -/
+theorem fieldMod_ops_append (t : Ec.Tracker) (a r : String) :
+    (Ec.fieldMod t a r).ops.toList
+      = t.ops.toList ++ rollExtraOps (t.findDepth a)
+        ++ [.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  unfold Ec.fieldMod
+  rw [rawBlock_ops_append, pushFieldP_ops_append, toTop_ops_append]
+
+/-! ### MANDATORY smokes for the per-helper ops-append lemmas (deliverable 2) -/
+
+/-- SMOKE (`rawBlock` ops-append fires).  Appending `[OP_ADD]` to `simTracker.ops`. -/
+theorem smoke_rawBlock_ops_append :
+    (simTracker.rawBlock 2 (some "s") [.opcode "OP_ADD"]).ops.toList
+      = simTracker.ops.toList ++ [StackOp.opcode "OP_ADD"] := by
+  rw [rawBlock_ops_append]
+
+/-- SMOKE (`pushFieldP` ops-append fires).  Appends the field-prime push. -/
+theorem smoke_pushFieldP_ops_append :
+    (Ec.pushFieldP simTracker "p").ops.toList
+      = simTracker.ops.toList ++ [StackOp.push (.bigint Ec.fieldP)] := by
+  rw [pushFieldP_ops_append]
+
+/-- SMOKE (`toTop` ops-append fires + concrete depth).  `simTracker` has `nm =
+[a,b,c]`; `toTop "a"` rolls depth 2, appending `rollExtraOps 2 = [.rot]`. -/
+theorem smoke_toTop_ops_append :
+    (simTracker.toTop "a").ops.toList = simTracker.ops.toList ++ [StackOp.rot] := by
+  rw [toTop_ops_append]
+  have : simTracker.findDepth "a" = 2 := by decide
+  rw [this]; rfl
+
+/-- SMOKE (`copyToTop` ops-append fires + concrete depth).  `copyToTop "a"` picks
+depth 2, appending `pickExtraOps 2 = [.pickStruct 2]`. -/
+theorem smoke_copyToTop_ops_append :
+    (simTracker.copyToTop "a" "z").ops.toList
+      = simTracker.ops.toList ++ [StackOp.pickStruct 2] := by
+  rw [copyToTop_ops_append]
+  have : simTracker.findDepth "a" = 2 := by decide
+  rw [this]; rfl
+
+/-- SMOKE (`fieldMod` ops-append fires).  Full decomposition of `fieldMod "a" "r"`
+on `simTracker`: `toTop` (depth 2 → `.rot`), push prime, then `fieldModOps`. -/
+theorem smoke_fieldMod_ops_append :
+    (Ec.fieldMod simTracker "a" "r").ops.toList
+      = simTracker.ops.toList ++ rollExtraOps (simTracker.findDepth "a")
+        ++ [StackOp.push (.bigint Ec.fieldP)] ++ Ec.fieldModOps := by
+  rw [fieldMod_ops_append]
+
 /-! ## Part 9 — BLOCKED `Crypto/Spec.lean §7` axioms: `ecNegate`, `ecOnCurve`
 
 The remaining two "medium" EC ops are NOT plain op-lists.  Unlike `ecPointX/Y`
@@ -2231,7 +2627,7 @@ the overflow is pre-existing and independent of this change).  The bridge
 `findDepth_eq_findDepthList` (above) is now proved by structural induction
 (`findDepthAux_eq_findDepthList`), NOT `native_decide`, `propext`/`Quot.sound`-clean.
 
-**LANDED THIS WAVE (deliverables 1-3).**
+**LANDED WAVE-77 (the bridge + field-helper transports).**
   * The `findDepth` refactor (output-preserving) + the bridge.
   * The per-helper transports: `fieldModOps_transport`,
     `fieldBinop_optail_transport` + `fieldAdd/fieldSub/fieldMul_optail_transport`
@@ -2241,36 +2637,63 @@ the overflow is pre-existing and independent of this change).  The bridge
     the pre-existing `authBackend`/`hashBackend` opaques inherited via
     `ecModReduce_step_transport`), each with an anti-vacuity smoke.
 
-**PRECISE REMAINING SUB-GOAL (deliverable 4 — the per-op assembly, BLOCKED here).**
-`emitEcNegate` (945 ops) and `emitEcOnCurve` (518 ops) are `t.ops.toList` of the
-FINAL tracker after a chain of helper calls
-(`decomposePoint`/`fieldSub`/`composePoint` for negate;
-`decomposePoint`/`fieldSqr`/`fieldMul`/`fieldAdd`/`OP_EQUAL` for on-curve).  To run
-`runOps` over the whole list and land the spec, two scaffolding pieces remain:
+**LANDED THIS WAVE (wave-78 — deliverables 1 & 2, the per-op assembly scaffolding).**
+The two scaffolding pieces the wave-77 hand-off named as the remaining gap are now
+in place above, all `propext`/`Quot.sound`-clean (plus the inherited
+`authBackend`/`hashBackend` opaques on the `runOps`-bearing transports), each with
+an anti-vacuity smoke:
 
-  1. **Per-helper ops-append lemmas** — each helper APPENDS a determined op-list to
-     `t.ops` (so `(helper t).ops = t.ops ++ helperOps t`), letting `runOps_append`
-     decompose the 945/518-op list helper-by-helper.  `decomposePoint` /
-     `composePoint` additionally wrap the 295-op `emitReverse32Ops` (each
-     dischargeable via the wave-74 `reverse32_ops_transport`, but threaded through
-     the Tracker's `rawBlock`).
+  1. **`toTop` / `copyToTop` runtime transports** — `rollExtraOps`/`pickExtraOps`
+     model the depth-dependent op the Tracker emits; `runOps_rollExtraOps` /
+     `runOps_pickExtraOps` collapse the depth-0/1/2 special cases (`nop`/`.swap`/
+     `.rot` and `.dup`/`.over`) to `applyRoll`/`applyPick` via the conditional
+     bridges `applySwap_eq_applyRoll1` / `applyRot_eq_applyRoll2` /
+     `applyDup_eq_applyPick0` / `applyOver_eq_applyPick1` (the `applySwap`/`applyRot`/
+     `applyDup`/`applyOver` peers the hand-off asked for), and the `≥3`/`≥2` cases to
+     the bare `.roll d`/`.pickStruct d`.  Composed with the wave-76 model lemmas +
+     the wave-77 bridge: `runOps_toTop_extraOps_sim` brings `σ name` to the TOS
+     (remainder `eraseIdx d`), `runOps_copyToTop_extraOps_sim` copies it.
+     `TrackerSim_copyToTop` (= `TrackerSim_push`) is the copyToTop invariant
+     preservation.
 
-  2. **`toTop` / `copyToTop` runtime transports** — the depth-dependent op the
-     Tracker emits (`roll d`: 0→nop, 1→swap, 2→rot, ≥3→`.roll d`;
-     `pick d`: 0→dup, 1→over, ≥2→`.pickStruct d`) must be shown, under `TrackerSim`
-     + the bridge, to bring/copy `σ name` to the top while preserving `TrackerSim`
-     with the matching `nm`-mutation.  The depth-0/1/2 cases need `applySwap`/
-     `applyRot` peers of `applyRoll_findDepth_sim`; the ≥3 case is exactly
-     `applyRoll_findDepth_sim ∘ bridge`.
+  2. **Per-helper ops-append lemmas** — `forIn_id_push_toList` →
+     `rawBlock_ops_eq`/`rawBlock_ops_append`, `pushInt`/`pushBytes`/`pushFieldP_ops_append`,
+     `toTop_ops_append` (`= … ++ rollExtraOps (findDepth name)`),
+     `copyToTop_ops_append` (`= … ++ pickExtraOps (findDepth name)`), and the worked
+     `fieldMod_ops_append`.  These let `runOps_append` decompose the 945/518-op list
+     helper-by-helper at the leaf level.
 
-Once (1)+(2) land, the per-op discharge of BOTH ops is the field-arith leaves
-(above) composed along the helper chain under a single threaded `TrackerSim`
-invariant — and the same scaffolding immediately unblocks `emitEcAdd`/`emitEcMul`
-(the wave-76 hand-off).  This is multi-helper assembly work, not a kernel wall; per
-the task BLOCK protocol the two axioms are LEFT IN PLACE and the drift stays
-`76 → 76` (0 axioms discharged this wave — the discharge is gated on the per-helper
-ops-append + `toTop` scaffolding, NOT on any out-of-scope edit), while the
-output-preserving refactor + bridge + field-helper transports land as the
-genuinely-hard reusable substrate. -/
+**PRECISE REMAINING SUB-GOAL (deliverable 3 — the whole-program assembly, BLOCKED).**
+With (1)+(2) landed, what remains to discharge the two axioms is genuine
+multi-helper assembly, NOT a kernel wall:
+
+  (a) **`toTop` `nm`-side `TrackerSim` preservation.**  The copyToTop preservation
+      is `TrackerSim_copyToTop`; the `toTop` peer (`Tracker.roll`) does
+      `nm := (nm.eraseIdxIfInBounds (size-1-d)).push nm[size-1-d]!` against the
+      runtime `σ name :: stk.eraseIdx d`.  The *length* goal of the resulting
+      `TrackerSim` is discharged off `Array.toList_eraseIdxIfInBounds` +
+      `List.length_eraseIdx`; the *slot* goal is a per-index reindexing across the
+      array-erase-then-push vs the list-cons-after-erase under the reverse
+      correspondence (`size-1-i ↔ i`, split at the erase point `d`) — provable, but
+      a sizeable case analysis with no off-the-shelf lemma.  This is the one
+      remaining model-preservation lemma.
+
+  (b) **Whole-program symbolic-`nm` threading.**  `emitEcOnCurve` (518 ops) /
+      `emitEcNegate` (945 ops) are `t_final.ops.toList` after ~12–30 helper calls;
+      each `toTop`/`copyToTop`'s `findDepth` must be evaluated against the concrete
+      *cumulative* `nm` at that step (membership + bridge per step), threaded under a
+      single `TrackerSim`, with the field-arith leaves (`fieldAdd/Sub/Mul`-`optail`
+      transports above) composed to match the spec closed forms
+      `Crypto.Secp256k1.ecOnCurve`/`ecNegate`.
+
+  (c) **`decomposePoint`/`composePoint` threading.**  Their ops wrap the 295-op
+      `emitReverse32Ops` (via `reverse32_ops_transport`) inside the Tracker's
+      `rawBlock`, plus the BE-decode bridges with INPUT-side wf hypotheses (on-curve
+      / 32-byte coords; `OP_MOD` divisors `fieldP ≠ 0`).
+
+The discharge is all-or-nothing per axiom (partial threading discharges neither
+axiom), so per the task BLOCK protocol the two axioms are LEFT IN PLACE and the
+drift stays `76 → 76` (0 axioms discharged this wave).  The same (1)+(2)+(a)
+scaffolding immediately unblocks `emitEcAdd`/`emitEcMul` (the wave-76 hand-off). -/
 
 end RunarVerification.Stack.AgreesEC
