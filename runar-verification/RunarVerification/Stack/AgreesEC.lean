@@ -1675,7 +1675,283 @@ theorem smoke_ecMakePoint_value_concrete :
         (RunarVerification.Crypto.Secp256k1.ecMakePoint smokeMkX smokeMkY) = 22 := by
   native_decide
 
-/-! ## Part 8 — BLOCKED `Crypto/Spec.lean §7` axioms: `ecNegate`, `ecOnCurve`
+/-! ## Part 8 — the Tracker simulation invariant + model substrate (deliverable 1)
+
+`emitEcNegate` / `emitEcOnCurve` are produced by RUNNING the `Stack.Ec.Tracker`
+state machine: their `.roll d` / `.pickStruct d` ops carry depths `d =
+Tracker.findDepth nm name`, picked at codegen time against the threaded name array
+`nm`.  An honest `runOps` transport for either op list needs a *Tracker-to-runtime
+simulation invariant*: the runtime stack `stk` (head = TOS) must mirror the
+tracker name array `nm` (bottom→top) slot-for-slot, so that each `.roll`/`.pick`
+depth lands on the value of the named slot it addresses.
+
+This Part lands that invariant (`TrackerSim`) plus the reusable model substrate it
+needs — all `sorry`-free, all axiom-clean (`propext`/`Quot.sound` only).  See the
+BLOCK note in Part 9 for the ONE remaining kernel-level obstacle that gates the
+final per-op discharge (`Tracker.findDepth` is built on the `partial`
+`Lean.Loop.forIn`, which the kernel cannot reduce or induct over, so the bridge
+`Tracker.findDepth = findDepthList ∘ reverse` cannot be proven without editing
+`Stack/Ec.lean` — explicitly out of scope). -/
+
+/-- Resolve a tracker slot against valuation `σ`; `none` slots are unconstrained. -/
+def slotAgrees (σ : String → Value) (slot : Option String) (v : Value) : Prop :=
+  match slot with
+  | some n => v = σ n
+  | none   => True
+
+/-- **Tracker simulation invariant (deliverable 1).**  Runtime stack `stk`
+(head = TOS) mirrors the tracker name array `nm` (bottom→top).  Reversing `nm` to
+top→bottom, every named slot holds its `σ`-value; `none` slots are free.  Lengths
+agree (so every `findDepth` depth lands in range).  `Tracker.findDepth nm name`
+(the codegen `.roll`/`.pick` depth) is asserted-equal to the runtime structural
+depth of `name`'s slot via the `findDepthList` model below (`findDepthList_sim`). -/
+def TrackerSim (nm : Array (Option String)) (σ : String → Value) (stk : List Value) : Prop :=
+  stk.length = nm.size ∧
+  ∀ i (h : i < nm.size), slotAgrees σ (nm[i]) (stk[nm.size - 1 - i]!)
+
+/-- Recursive model of `Tracker.findDepth` over the TOP-first name list
+(`nm.toList.reverse`): index of the first matching name, else list length.  This
+is the kernel-reducible counterpart the opaque `Loop.forIn`-based
+`Tracker.findDepth` lacks (see Part 9). -/
+def findDepthList (name : String) : List (Option String) → Nat
+  | []      => 0
+  | x :: xs => if x = some name then 0 else findDepthList name xs + 1
+
+/-- The model depth is `< length` when the name is present. -/
+theorem findDepthList_lt (name : String) :
+    ∀ (l : List (Option String)), some name ∈ l → findDepthList name l < l.length := by
+  intro l
+  induction l with
+  | nil => intro h; cases h
+  | cons x xs ih =>
+      intro hmem
+      unfold findDepthList
+      by_cases hx : x = some name
+      · simp [hx]
+      · simp only [hx, if_false]
+        rw [List.length_cons]
+        have hmem' : some name ∈ xs := by
+          rcases List.mem_cons.mp hmem with h | h
+          · exact absurd h.symm hx
+          · exact h
+        have := ih hmem'
+        omega
+
+/-- The model depth points at a slot actually named `name` (in the TOP-first list). -/
+theorem findDepthList_get (name : String) :
+    ∀ (l : List (Option String)), some name ∈ l →
+      l[findDepthList name l]! = some name := by
+  intro l
+  induction l with
+  | nil => intro h; cases h
+  | cons x xs ih =>
+      intro hmem
+      unfold findDepthList
+      by_cases hx : x = some name
+      · simp [hx]
+      · simp only [hx, if_false]
+        have hmem' : some name ∈ xs := by
+          rcases List.mem_cons.mp hmem with h | h
+          · exact absurd h.symm hx
+          · exact h
+        rw [show findDepthList name xs + 1 = (findDepthList name xs).succ from rfl]
+        rw [List.getElem!_cons_succ]
+        exact ih hmem'
+
+/-- Reverse-index bridge: the `d`-th element (top-first) of `nm.toList.reverse`
+is the `(size-1-d)`-th element of `nm` (bottom-first), for `d < size`. -/
+theorem reverse_getElem_bridge (nm : Array (Option String)) (d : Nat) (hd : d < nm.size) :
+    (nm.toList.reverse)[d]! = nm[nm.size - 1 - d]! := by
+  have hlen : nm.toList.length = nm.size := by simp
+  have hd' : d < nm.toList.reverse.length := by rw [List.length_reverse, hlen]; omega
+  rw [getElem!_pos (nm.toList.reverse) d hd', List.getElem_reverse]
+  rw [getElem!_pos nm (nm.size - 1 - d) (show nm.size - 1 - d < nm.size by omega)]
+  rw [← Array.getElem_toList]
+  congr 1
+
+/-- **`findDepth` model correctness under `TrackerSim` (keystone).**  When `name`
+is present in the tracker, the runtime stack value at structural depth
+`d := findDepthList name nm.toList.reverse` is exactly `σ name`, and `d` is in
+range.  This is the lemma that — once a kernel-reducible
+`Tracker.findDepth = findDepthList ∘ reverse` bridge exists (Part 9) — lets every
+`toTop`/`copyToTop` step land on the correctly-named runtime slot. -/
+theorem findDepthList_sim (nm : Array (Option String)) (σ : String → Value)
+    (stk : List Value) (name : String)
+    (hSim : TrackerSim nm σ stk)
+    (hmem : some name ∈ nm.toList.reverse) :
+    let d := findDepthList name nm.toList.reverse
+    d < stk.length ∧ stk[d]! = σ name := by
+  intro d
+  obtain ⟨hlen, hslot⟩ := hSim
+  have hrevlen : nm.toList.reverse.length = nm.size := by rw [List.length_reverse]; simp
+  have hd_lt : d < nm.size := by
+    have := findDepthList_lt name nm.toList.reverse hmem
+    rwa [hrevlen] at this
+  refine ⟨by omega, ?_⟩
+  have hget : nm.toList.reverse[d]! = some name := findDepthList_get name nm.toList.reverse hmem
+  rw [reverse_getElem_bridge nm d hd_lt] at hget
+  have hidx : nm.size - 1 - d < nm.size := by omega
+  have hslotd := hslot (nm.size - 1 - d) hidx
+  have heq : nm.size - 1 - (nm.size - 1 - d) = d := by omega
+  rw [heq] at hslotd
+  have hgetbang : nm[nm.size - 1 - d] = some name := by
+    rw [← hget, getElem!_pos nm (nm.size - 1 - d) hidx]
+  unfold slotAgrees at hslotd
+  rw [hgetbang] at hslotd
+  exact hslotd
+
+/-- Updating the valuation at a fresh name preserves agreement at all OTHER names. -/
+theorem slotAgrees_update_ne (σ : String → Value) (name : String) (v : Value)
+    (slot : Option String) (w : Value) (hne : slot ≠ some name) :
+    slotAgrees σ slot w → slotAgrees (fun s => if s = name then v else σ s) slot w := by
+  intro h
+  cases slot with
+  | none => exact h
+  | some n =>
+      unfold slotAgrees at h ⊢
+      have : n ≠ name := by intro hc; exact hne (by rw [hc])
+      simp only [this, if_false]
+      exact h
+
+/-- **Push preservation.**  Pushing a value `v` for a fresh `some name` slot
+(`nm.push (some name)`, runtime `v :: stk`) preserves `TrackerSim` under the
+valuation updated to map `name ↦ v`, PROVIDED `name` does not already occur in
+`nm` (the codegen always pushes fresh intermediate names — `pushInt`/`pushBytes`).
+This is the `push`/`rawBlock`-produce preservation lemma the helpers compose. -/
+theorem TrackerSim_push (nm : Array (Option String)) (σ : String → Value)
+    (stk : List Value) (name : String) (v : Value)
+    (hSim : TrackerSim nm σ stk)
+    (hfresh : some name ∉ nm.toList) :
+    TrackerSim (nm.push (some name)) (fun s => if s = name then v else σ s) (v :: stk) := by
+  obtain ⟨hlen, hslot⟩ := hSim
+  constructor
+  · simp [hlen]
+  · intro i hi
+    rw [Array.size_push] at hi
+    by_cases htop : i = nm.size
+    · subst htop
+      have hidx : (nm.push (some name))[nm.size] = some name := by
+        simp [Array.getElem_push_eq]
+      rw [hidx]
+      have : (nm.push (some name)).size - 1 - nm.size = 0 := by rw [Array.size_push]; omega
+      rw [this]
+      show slotAgrees _ (some name) ((v :: stk)[0]!)
+      unfold slotAgrees
+      simp
+    · have hi' : i < nm.size := by omega
+      have hpushlow : (nm.push (some name))[i] = nm[i]'hi' := by
+        rw [Array.getElem_push_lt]
+      rw [hpushlow]
+      have hszp : (nm.push (some name)).size = nm.size + 1 := by rw [Array.size_push]
+      rw [hszp]
+      have hcons : (nm.size + 1 - 1 - i) = (nm.size - 1 - i) + 1 := by omega
+      rw [hcons]
+      rw [List.getElem!_cons_succ]
+      have horig := hslot i hi'
+      have hne : nm[i]'hi' ≠ some name := by
+        intro hc
+        exact hfresh (by rw [← hc]; exact Array.getElem_mem_toList hi')
+      exact slotAgrees_update_ne σ name v (nm[i]'hi') (stk[nm.size - 1 - i]!) hne horig
+
+/-- **`applyRoll`-at-model-depth transport (`roll`/`toTop` preservation).**  Under
+`TrackerSim`, rolling the slot named `name` (at structural depth
+`d := findDepthList name nm.toList.reverse`) to the top puts exactly `σ name` on
+top — the runtime witness of `Tracker.toTop name`.  The remaining stack is
+`s.stack.eraseIdx d`.  This is the `roll` preservation lemma the field-arith
+helpers (`fieldMod`/`fieldAdd`/`fieldSub`/`fieldMul`/`fieldSqr`) compose, once the
+kernel `findDepth = findDepthList` bridge (Part 9) lands. -/
+theorem applyRoll_findDepth_sim (s : StackState) (nm : Array (Option String))
+    (σ : String → Value) (name : String)
+    (hSim : TrackerSim nm σ s.stack)
+    (hmem : some name ∈ nm.toList.reverse) :
+    applyRoll s (findDepthList name nm.toList.reverse)
+      = .ok { s with stack := σ name :: s.stack.eraseIdx (findDepthList name nm.toList.reverse) } := by
+  obtain ⟨hlt, hval⟩ := findDepthList_sim nm σ s.stack name hSim hmem
+  unfold applyRoll
+  rw [if_neg (by omega : ¬ findDepthList name nm.toList.reverse ≥ s.stack.length)]
+  rw [hval]
+
+/-- **`applyPick`-at-model-depth transport (`pick`/`copyToTop` preservation).**
+Under `TrackerSim`, structurally picking the slot named `name` (at depth
+`d := findDepthList name nm.toList.reverse`) COPIES exactly `σ name` to the top
+without removing it — the runtime witness of `Tracker.copyToTop name`. -/
+theorem applyPick_findDepth_sim (s : StackState) (nm : Array (Option String))
+    (σ : String → Value) (name : String)
+    (hSim : TrackerSim nm σ s.stack)
+    (hmem : some name ∈ nm.toList.reverse) :
+    applyPick s (findDepthList name nm.toList.reverse)
+      = .ok (s.push (σ name)) := by
+  obtain ⟨hlt, hval⟩ := findDepthList_sim nm σ s.stack name hSim hmem
+  unfold applyPick
+  rw [if_neg (by omega : ¬ findDepthList name nm.toList.reverse ≥ s.stack.length)]
+  rw [hval]
+
+/-! ### MANDATORY smokes for the Tracker simulation substrate (deliverable 1) -/
+
+/-- Concrete tracker name array `[some "a", some "b", some "c"]` (bottom→top). -/
+private def simNm : Array (Option String) := #[some "a", some "b", some "c"]
+
+/-- Concrete valuation. -/
+private def simσ : String → Value
+  | "a" => .vBigint 10
+  | "b" => .vBigint 20
+  | "c" => .vBigint 30
+  | _   => .vBigint 0
+
+/-- Runtime stack mirroring `simNm` (TOS = c = 30). -/
+private def simStk : List Value := [.vBigint 30, .vBigint 20, .vBigint 10]
+
+/-- SMOKE (invariant satisfiability — anti-vacuity).  `TrackerSim` is inhabited:
+the concrete stack `[c,b,a]` mirrors the name array `[a,b,c]` under `simσ`. -/
+theorem smoke_TrackerSim_satisfiable : TrackerSim simNm simσ simStk := by
+  refine ⟨by decide, ?_⟩
+  intro i hi
+  rw [getElem!_pos simNm i hi |>.symm]
+  have hsz : simNm.size = 3 := by decide
+  have h3 : i = 0 ∨ i = 1 ∨ i = 2 := by omega
+  clear hi
+  unfold slotAgrees
+  rcases h3 with rfl | rfl | rfl <;>
+    (unfold simNm simStk simσ; rfl)
+
+/-- SMOKE (keystone fires).  Under the concrete `TrackerSim`, the model depth of
+`"a"` is 2 and the runtime stack value there is `σ "a" = 10`. -/
+theorem smoke_findDepthList_sim :
+    (findDepthList "a" simNm.toList.reverse = 2)
+      ∧ simStk[findDepthList "a" simNm.toList.reverse]! = simσ "a" := by
+  refine ⟨by decide, ?_⟩
+  exact (findDepthList_sim simNm simσ simStk "a" smoke_TrackerSim_satisfiable (by decide)).2
+
+/-- SMOKE (roll transport fires).  Rolling `"a"` (depth 2) to the top of the
+concrete state lands `σ "a" = 10` on top, with that slot erased from the rest. -/
+theorem smoke_applyRoll_findDepth_sim :
+    applyRoll { (default : StackState) with stack := simStk }
+        (findDepthList "a" simNm.toList.reverse)
+      = .ok { (default : StackState) with
+              stack := simσ "a"
+                :: simStk.eraseIdx (findDepthList "a" simNm.toList.reverse) } := by
+  apply applyRoll_findDepth_sim
+  · exact smoke_TrackerSim_satisfiable
+  · decide
+
+/-- SMOKE (pick transport fires).  Picking `"a"` (depth 2) COPIES `σ "a" = 10` to
+the top, leaving the rest intact. -/
+theorem smoke_applyPick_findDepth_sim :
+    applyPick { (default : StackState) with stack := simStk }
+        (findDepthList "a" simNm.toList.reverse)
+      = .ok (({ (default : StackState) with stack := simStk }).push (simσ "a")) := by
+  apply applyPick_findDepth_sim
+  · exact smoke_TrackerSim_satisfiable
+  · decide
+
+/-- SMOKE (push preservation fires).  Pushing a fresh `"d" ↦ 40` extends the
+concrete `TrackerSim`. -/
+theorem smoke_TrackerSim_push :
+    TrackerSim (simNm.push (some "d"))
+      (fun s => if s = "d" then .vBigint 40 else simσ s) (.vBigint 40 :: simStk) :=
+  TrackerSim_push simNm simσ simStk "d" (.vBigint 40) smoke_TrackerSim_satisfiable (by decide)
+
+/-! ## Part 9 — BLOCKED `Crypto/Spec.lean §7` axioms: `ecNegate`, `ecOnCurve`
 
 The remaining two "medium" EC ops are NOT plain op-lists.  Unlike `ecPointX/Y`
 and `ecMakePoint` (whose only non-trivial sub-block is `emitReverse32Ops`), both
@@ -1691,30 +1967,51 @@ computed at CODEGEN TIME against the threaded name array `nm`.
 * `emitEcOnCurve` : 518 ops — 1 `.roll`, 1 `.pickStruct`, 132 `.rot`, 8 `OP_MOD`,
   3 `OP_MUL` (two `fieldSqr`, one `fieldMul`, one `fieldAdd`) + a final `OP_EQUAL`.
 
-**PRECISE BLOCKER (the missing substrate).**  An honest `runOps` transport for
-either op list requires a *Tracker-to-runtime-stack simulation invariant* that
-does NOT exist in the base:
+**SUBSTRATE LANDED (Part 8).**  The Tracker-to-runtime simulation invariant
+`TrackerSim` and its model substrate are now in place, all `sorry`-free /
+axiom-clean:
 
-  for every codegen step, `Tracker.findDepth nm name` (the `while`-loop search the
-  codegen used to pick each `.roll`/`.pickStruct` depth) must equal the runtime
-  structural depth of that named value on `StackState.stack`, and this invariant
-  must be PRESERVED across `roll` / `pickStruct` / `rot` / `swap` / `drop` /
-  `over` / `rawBlock` — through the ~15–20 named field intermediates each op
-  threads.  No `decomposePoint_transport`, `composePoint_transport`,
-  `fieldSub_transport`, `fieldMul_transport`, `fieldSqr_transport`,
-  `fieldAdd_transport`, nor any `Tracker.findDepth`/runtime-depth agreement lemma
-  is present in the wave-74 base.  The wave-73/74 substrate
-  (`reverse32_ops_transport`, the `ec_encode_op_transport` step-chain) covers
-  ONLY plain op-lists; it does not lift the Tracker's `nm`-driven addressing.
+  * `TrackerSim nm σ stk` — the runtime stack mirrors the tracker name array.
+  * `findDepthList` — the kernel-reducible recursive model of `Tracker.findDepth`,
+    with `findDepthList_lt`, `findDepthList_get`, `reverse_getElem_bridge`.
+  * `findDepthList_sim` (KEYSTONE) — under `TrackerSim`, the runtime stack value at
+    structural depth `findDepthList name (nm.toList.reverse)` is exactly `σ name`.
+  * `TrackerSim_push` (push/rawBlock-produce preservation),
+    `applyRoll_findDepth_sim` (`roll`/`toTop` preservation),
+    `applyPick_findDepth_sim` (`pick`/`copyToTop` preservation).
 
-Building that simulation library (a `Tracker.findDepth`↔runtime-depth invariant +
-per-helper transports for `decompose`/`compose`/`fieldMod`/`fieldAdd`/`fieldSub`/
-`fieldMul`/`fieldSqr`) is a standalone multi-hundred-line effort, well beyond
-"compose `reverse32_ops_transport` with the field-arith opcode reductions".  Per
-the task's BLOCK protocol these two are reported with the precise sub-goal above
-and their `Crypto/Spec.lean §7` axioms are LEFT IN PLACE (the field-arith opcode
-reductions are individually fine — `OP_MOD` by the positive constant `fieldP` ≠ 0,
-`OP_MUL`/`OP_ADD`/`OP_SUB` are total — but the codegen-output op LIST cannot be
-run without the Tracker addressing invariant). -/
+**PRECISE REMAINING BLOCKER (a KERNEL-LEVEL wall, sharper than wave-75).**  The
+keystone `findDepthList_sim` is stated against the *model* depth
+`findDepthList name (nm.toList.reverse)`.  To apply it to the ACTUAL codegen
+output one needs the bridge
+
+  `Tracker.findDepth t name = findDepthList name t.nm.toList.reverse`  (when present)
+
+so that each emitted `.roll (Tracker.findDepth …)` / `.pickStruct (…)` rewrites to
+`.roll (findDepthList …)`, the form the preservation lemmas address.  **This bridge
+is NOT PROVABLE without editing `Stack/Ec.lean`.**  `Tracker.findDepth` is an
+`Id.run do … while …` whose `while` desugars to `Lean.Loop.forIn` (`Init.While`).
+`Lean.Loop.forIn` is a `partial def`: it has NO equational lemma, NO `.induct`
+principle, and the kernel CANNOT reduce it (verified: `Tracker.findDepth t0 "a"`
+does NOT close by `rfl`/`decide` even on a fully concrete tracker — only the
+COMPILED `native_decide` evaluates it, which is forbidden as a transport faker and
+would inject `Lean.ofReduceBool` into the TCB).  So `Tracker.findDepth` cannot be
+unfolded, reduced, or inducted-over in any kernel-checked proof.  Bridging it to
+`findDepthList` would require giving `findDepth` a *structurally recursive*
+(kernel-reducible) definition in `Stack/Ec.lean` — explicitly out of scope
+("do NOT edit Stack/Ec.lean codegen").
+
+Consequently both `emitEcNegate` and `emitEcOnCurve` remain `Crypto/Spec.lean §7`
+axioms.  The field-arith opcode reductions themselves are individually fine
+(`OP_MOD` by the positive constant `fieldP` ≠ 0; `OP_MUL`/`OP_ADD`/`OP_SUB`
+total), and the Tracker simulation substrate above is the genuinely-hard, reusable
+half of the discharge — it composes immediately for ecNegate, ecOnCurve, ecAdd and
+ecMul the moment the one-line `findDepth = findDepthList ∘ reverse` bridge becomes
+available (a future `Stack/Ec.lean` refactor of `findDepth` to a structural fold,
+or a sanctioned `native_decide`-TCB decision for that single bridge).  Per the
+task's BLOCK protocol the two axioms are LEFT IN PLACE; the drift moves `76 → 76`
+(0 axioms discharged this wave — the discharge is gated on the out-of-scope
+`Stack/Ec.lean` change), while deliverable 1 (the invariant + preservation lemmas)
+lands as reusable substrate. -/
 
 end RunarVerification.Stack.AgreesEC
