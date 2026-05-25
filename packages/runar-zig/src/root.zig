@@ -27,6 +27,7 @@ pub const sdk_ordinals = @import("sdk_ordinals.zig");
 pub const sdk_script_utils = @import("sdk_script_utils.zig");
 pub const sdk_anf_interpreter = @import("sdk_anf_interpreter.zig");
 pub const sdk_envelope = @import("sdk_envelope.zig");
+pub const sdk_envelope_sign = @import("sdk_envelope_sign.zig");
 pub const sdk_wallet = @import("sdk_wallet.zig");
 pub const sdk_http_client = @import("sdk_http_client.zig");
 pub const analyzer = @import("analyzer.zig");

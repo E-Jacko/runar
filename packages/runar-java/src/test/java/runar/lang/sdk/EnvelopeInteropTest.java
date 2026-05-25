@@ -1,11 +1,19 @@
 package runar.lang.sdk;
 
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.security.MessageDigest;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.bouncycastle.crypto.digests.SHA256Digest;
+import org.bouncycastle.crypto.params.ECPrivateKeyParameters;
+import org.bouncycastle.crypto.signers.ECDSASigner;
+import org.bouncycastle.crypto.signers.HMacDSAKCalculator;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -83,6 +91,74 @@ class EnvelopeInteropTest {
             Envelope.VerifyEnvelopeResult r = Envelope.verify(vo);
             assertFalse(r.ok, "rejection " + reasonWire + " should be ok=false");
             assertEquals(reasonWire, r.reason.wire, "rejection " + reasonWire);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // GAP-064 signing vectors
+    // -------------------------------------------------------------------
+
+    private static byte[] sha256(byte[] in) throws Exception {
+        return MessageDigest.getInstance("SHA-256").digest(in);
+    }
+
+    /** RFC 6979 deterministic ECDSA (plain-SHA-256 nonce) -> low-S DER. */
+    private static byte[] signDeterministic(BigInteger priv, byte[] digest) {
+        ECDSASigner signer = new ECDSASigner(new HMacDSAKCalculator(new SHA256Digest()));
+        signer.init(true, new ECPrivateKeyParameters(priv, LocalSigner.DOMAIN));
+        BigInteger[] rs = signer.generateSignature(digest);
+        BigInteger r = rs[0];
+        BigInteger s = rs[1];
+        BigInteger halfN = LocalSigner.DOMAIN.getN().shiftRight(1);
+        if (s.compareTo(halfN) > 0) {
+            s = LocalSigner.DOMAIN.getN().subtract(s);
+        }
+        try {
+            org.bouncycastle.asn1.ASN1EncodableVector v = new org.bouncycastle.asn1.ASN1EncodableVector();
+            v.add(new org.bouncycastle.asn1.ASN1Integer(r));
+            v.add(new org.bouncycastle.asn1.ASN1Integer(s));
+            return new org.bouncycastle.asn1.DERSequence(v).getEncoded();
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static String toHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) sb.append(String.format("%02x", b & 0xff));
+        return sb.toString();
+    }
+
+    /**
+     * GAP-064 cross-tier signing reproduction. Signing the SAME payload with
+     * the SAME key (priv=1) via RFC 6979 deterministic ECDSA (plain-SHA-256
+     * nonce, low-S) MUST yield the byte-identical DER signature the TS
+     * reference committed.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void signingVectors() throws Exception {
+        Map<String, Object> fixture = loadFixture();
+        List<Map<String, Object>> vectors = (List<Map<String, Object>>) fixture.get("signing_vectors");
+        if (vectors == null || vectors.isEmpty()) {
+            throw new AssertionError("signing_vectors missing or empty");
+        }
+        BigInteger alicePriv = BigInteger.ONE;
+        for (Map<String, Object> v : vectors) {
+            String id = (String) v.get("_vector_id");
+            String expectedPayload = (String) v.get("expected_payload");
+            String expectedSig = (String) v.get("expected_sig");
+
+            // Drift guard: re-derive the canonical payload from data + lifetime.
+            Map<String, Object> merged = new LinkedHashMap<>((Map<String, Object>) v.get("data"));
+            merged.put("nonce", v.get("nonce"));
+            merged.put("expiresAt", v.get("expiresAt"));
+            String payload = Envelope.canonicalJson(merged);
+            assertEquals(expectedPayload, payload, "vector " + id + ": payload");
+
+            byte[] digest = sha256(payload.getBytes(StandardCharsets.UTF_8));
+            String der = toHex(signDeterministic(alicePriv, digest));
+            assertEquals(expectedSig, der, "vector " + id + ": signature divergence");
         }
     }
 

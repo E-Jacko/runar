@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const envelope = @import("sdk_envelope.zig");
+const envelope_sign = @import("sdk_envelope_sign.zig");
 
 const FIXTURE_REL_PATH = "../../conformance/sdk-envelope/fixtures.json";
 
@@ -130,6 +131,114 @@ test "interop: every rejection vector returns the listed reason" {
         try std.testing.expect(!r.ok);
         try std.testing.expectEqualStrings(reason_wire, r.reason.?.wire());
     }
+}
+
+// GAP-064 cross-tier signing reproduction. Signing the SAME payload with the
+// SAME key (priv=1) via RFC 6979 deterministic ECDSA whose nonce uses PLAIN
+// SHA-256 (sdk_envelope_sign.signDigestLowSDer) MUST yield the byte-identical
+// low-S DER signature the TS reference committed. This is the Zig fix: the
+// envelope signing path no longer routes through bsvz's SHA-256d-nonce
+// signDigest256 (which diverges), but through Zig stdlib's plain-SHA-256-nonce
+// EcdsaSecp256k1Sha256.
+test "interop: signing vectors reproduce the reference DER byte-for-byte" {
+    const allocator = std.testing.allocator;
+    const bytes = try loadFixtureBytes(allocator);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+
+    // Alice private key = 1 (32-byte big-endian).
+    var priv: [32]u8 = [_]u8{0} ** 32;
+    priv[31] = 1;
+
+    const svs = parsed.value.object.get("signing_vectors").?.array;
+    try std.testing.expect(svs.items.len > 0);
+    for (svs.items) |sv| {
+        const data_obj = sv.object.get("data").?.object;
+        const nonce = sv.object.get("nonce").?.integer;
+        const expires_at = sv.object.get("expiresAt").?.integer;
+        const expected_payload = sv.object.get("expected_payload").?.string;
+        const expected_sig = sv.object.get("expected_sig").?.string;
+
+        // Build merged object: { ...data, nonce, expiresAt } as our Value tree.
+        const merged = try allocator.alloc(envelope.Value.KeyValue, data_obj.count() + 2);
+        defer {
+            for (merged) |kv| {
+                allocator.free(kv.key);
+                freeValue(allocator, kv.value);
+            }
+            allocator.free(merged);
+        }
+        var it = data_obj.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            merged[i] = .{
+                .key = try allocator.dupe(u8, entry.key_ptr.*),
+                .value = try jsonToValue(allocator, entry.value_ptr.*),
+            };
+        }
+        merged[i] = .{ .key = try allocator.dupe(u8, "nonce"), .value = .{ .Int = nonce } };
+        merged[i + 1] = .{ .key = try allocator.dupe(u8, "expiresAt"), .value = .{ .Int = expires_at } };
+
+        const payload = try envelope.canonicalJson(allocator, .{ .Object = merged });
+        defer allocator.free(payload);
+        try std.testing.expectEqualStrings(expected_payload, payload);
+
+        // Sign sha256(payload) with priv=1 deterministic ECDSA (plain SHA-256
+        // nonce) -> low-S DER, hex-encode, compare byte-for-byte.
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+        var der_buf: [72]u8 = undefined;
+        const der = try envelope_sign.signDigestLowSDer(priv, digest, &der_buf);
+
+        const der_hex = try envelope.bytesToHex(allocator, der);
+        defer allocator.free(der_hex);
+        try std.testing.expectEqualStrings(expected_sig, der_hex);
+    }
+}
+
+// The SDK convenience path `signEnvelopeWithKey` must produce the same
+// cross-tier sv1 signature AND self-verify — proving overlay apps get
+// byte-identical, verifiable envelopes without hand-rolling a sign_fn.
+test "interop: signEnvelopeWithKey reproduces sv1 + self-verifies" {
+    const allocator = std.testing.allocator;
+    const bytes = try loadFixtureBytes(allocator);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+
+    // Locate sv1 in the fixture.
+    const svs = parsed.value.object.get("signing_vectors").?.array;
+    var sv1: ?std.json.ObjectMap = null;
+    for (svs.items) |sv| {
+        if (std.mem.eql(u8, sv.object.get("_vector_id").?.string, "sv1-ascii")) sv1 = sv.object;
+    }
+    const v = sv1.?;
+    const nonce = v.get("nonce").?.integer;
+    const expires_at = v.get("expiresAt").?.integer;
+    const expected_sig = v.get("expected_sig").?.string;
+
+    var priv: [32]u8 = [_]u8{0} ** 32;
+    priv[31] = 1;
+
+    // sv1 data = { kind: "order", qty: 3 }.
+    const data = [_]envelope.Value.KeyValue{
+        .{ .key = "kind", .value = .{ .String = "order" } },
+        .{ .key = "qty", .value = .{ .Int = 3 } },
+    };
+    const env = try envelope.signEnvelopeWithKey(allocator, .{
+        .data = &data,
+        .private_key = priv,
+        .ttl_ms = expires_at - nonce,
+        .now_ms = nonce,
+    });
+    defer env.deinit(allocator);
+
+    try std.testing.expectEqualStrings(expected_sig, env.sig);
+
+    var r = try envelope.verifyEnvelope(allocator, .{ .envelope = &env, .now_ms = nonce + 500 });
+    defer r.deinit();
+    try std.testing.expect(r.ok);
 }
 
 // RFC 8785 §3.2.2.2 — canonical_json MUST reject malformed Unicode (lone
