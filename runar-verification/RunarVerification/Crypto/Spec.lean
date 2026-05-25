@@ -652,18 +652,24 @@ and the output is `vBytes (Crypto.ecAdd pa pb) :: rest`.
 
 ### TCB impact
 
-This section adds **10** new axioms (one per emit builder):
+This section carries **8** axioms (one per still-axiomatized emit builder):
 
 * `emitEcAdd_runOps_eq`
 * `emitEcMul_runOps_eq`
 * `emitEcMulGen_runOps_eq`
 * `emitEcNegate_runOps_eq`
 * `emitEcOnCurve_runOps_eq`
-* `emitEcModReduce_runOps_eq`
-* `emitEcEncodeCompressed_runOps_eq`
 * `emitEcMakePoint_runOps_eq`
 * `emitEcPointX_runOps_eq`
 * `emitEcPointY_runOps_eq`
+
+**Discharged** (moved to theorems in `Stack/AgreesEC.lean`, no longer axioms):
+
+* `emitEcModReduce_runOps_eq` — `Stack.AgreesEC.emitEcModReduce_runOps_eq`
+  (added `m ≠ 0`).
+* `emitEcEncodeCompressed_runOps_eq` —
+  `Stack.AgreesEC.emitEcEncodeCompressed_runOps_eq` (added split-range + canonical
+  -encoding wf hypotheses).
 -/
 
 open RunarVerification.Stack
@@ -716,25 +722,29 @@ axiom emitEcOnCurve_runOps_eq (stkSt : StackState) (pt : ByteArray)
     runOps Stack.Ec.emitEcOnCurve stkSt
       = .ok { stkSt with stack := .vBool (Crypto.ecOnCurve pt) :: rest }
 
-/-- `Stack.Ec.emitEcModReduce`: `((value % mod) + mod) % mod`.
+/- `Stack.Ec.emitEcModReduce`: `((value % mod) + mod) % mod`.
 Stack `[value, mod]` (mod on TOS) → `[result]`. Mirrors
-`emitEcModReduce` in `ec-codegen.ts:705-715`. -/
-axiom emitEcModReduce_runOps_eq (stkSt : StackState) (value m : Int)
-    (rest : List Value)
-    (hStk : stkSt.stack = .vBigint m :: .vBigint value :: rest) :
-    runOps Stack.Ec.emitEcModReduce stkSt
-      = .ok { stkSt with
-              stack := .vBigint (Crypto.ecModReduce value m) :: rest }
+`emitEcModReduce` in `ec-codegen.ts:705-715`.
 
-/-- `Stack.Ec.emitEcEncodeCompressed`: 64-byte point → 33-byte
+**DISCHARGED** (no longer an axiom): proved as a theorem in
+`Stack/AgreesEC.lean` as `RunarVerification.Stack.AgreesEC.emitEcModReduce_runOps_eq`,
+off the wave-71 `ecModReduce_step_transport`.  The axiom was FALSE at `m = 0`
+(Stack `OP_MOD` errors with `divByZero`; the spec returns `0`), so the discharged
+theorem carries the honest extra hypothesis `m ≠ 0` (harmless: the axiom had no
+consumers). -/
+
+/- `Stack.Ec.emitEcEncodeCompressed`: 64-byte point → 33-byte
 compressed pubkey. Mirrors `emitEcEncodeCompressed` in
-`ec-codegen.ts:717-738`. -/
-axiom emitEcEncodeCompressed_runOps_eq (stkSt : StackState) (pt : ByteArray)
-    (rest : List Value)
-    (hStk : stkSt.stack = .vBytes pt :: rest) :
-    runOps Stack.Ec.emitEcEncodeCompressed stkSt
-      = .ok { stkSt with
-              stack := .vBytes (Crypto.ecEncodeCompressed pt) :: rest }
+`ec-codegen.ts:717-738`.
+
+**DISCHARGED** (no longer an axiom): proved as a theorem in
+`Stack/AgreesEC.lean` as
+`RunarVerification.Stack.AgreesEC.emitEcEncodeCompressed_runOps_eq` by an honest
+14-op step-chain (`ec_encode_op_transport`) lifted to the spec under input-level
+canonical-encoding well-formedness (`hX` round-trips the x-half; `hPar` ties the
+last y-byte parity to `pointY p % 2`) plus the two `OP_SPLIT` range guards
+(`32 ≤ p.size`, `1 ≤ (p.extract 32 p.size).size`).  The bare axiom carried none
+of these and was therefore not dischargeable verbatim. -/
 
 /-- `Stack.Ec.emitEcMakePoint`: `(x : Int, y : Int) → Point`. Stack
 `[x, y]` (y on TOS) → `[point_bytes]`. Mirrors `emitEcMakePoint` in

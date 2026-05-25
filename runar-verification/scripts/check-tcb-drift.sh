@@ -20,7 +20,44 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=81        # Breakdown (2026-05-24, Tier 1 wave 69 —
+TARGET_AXIOMS=79        # Breakdown (2026-05-25, Tier 3 EC wave —
+                        # TWO EC codegen-to-spec axiom discharges):
+                        # −2 in Crypto/Spec.lean §7 — the two EASIEST of the ten
+                        #     `emitEc*_runOps_eq` codegen-to-spec links RETIRED,
+                        #     moved to THEOREMS in Stack/AgreesEC.lean:
+                        #   • `emitEcModReduce_runOps_eq` — the 8-op
+                        #     `OP_2DUP/OP_MOD/…` fragment. The bare axiom was
+                        #     FALSE at `m = 0` (Stack `OP_MOD` errors divByZero;
+                        #     spec returns 0). Restated WITH `m ≠ 0` (honest fix;
+                        #     the axiom had no proof-term consumers, only doc
+                        #     refs) and discharged off the wave-71
+                        #     `ecModReduce_step_transport`.
+                        #   • `emitEcEncodeCompressed_runOps_eq` — the
+                        #     `OP_SPLIT/OP_SIZE/OP_SUB/OP_BIN2NUM/OP_MOD/OP_CAT`
+                        #     + `.ifOp` fragment. Discharged by an honest 14-op
+                        #     step-chain (`ec_encode_op_transport`, incl. a
+                        #     `pop?`/`asBool?` branch split on the ifOp), lifted
+                        #     to the spec `Crypto.Secp256k1.ecEncodeCompressed`
+                        #     under input-level wf hypotheses: `32 ≤ p.size`,
+                        #     `1 ≤ (p.extract 32 p.size).size` (both OP_SPLIT
+                        #     indices in range — a 64-byte point satisfies both);
+                        #     `hX` (x-half round-trips: `p.extract 0 32 =
+                        #     intToBE32 (pointX p)`); `hPar` (last y-byte parity =
+                        #     `pointY p % 2`). All four are honest INPUT-level
+                        #     invariants of every canonically-encoded point
+                        #     (witnessed by `smoke_ecEncodeCompressed_wf_satisfiable`
+                        #     on `makePoint 5 6`), NOT assumptions about the output.
+                        #   `#print axioms` on both discharged theorems: NO
+                        #   sorryAx, NO new axiom, NOT depending on the axioms
+                        #   they replace — only propext / Quot.sound + the
+                        #   pre-existing crypto backends. Remaining EC axioms:
+                        #   the 5 medium ops (`ecNegate/ecOnCurve/ecMakePoint/
+                        #   ecPointX/ecPointY`) blocked on the OP_0→empty-bytes VM
+                        #   gap (reverse32 init), plus `ecAdd/ecMul/ecMulGen`
+                        #   (Jacobian group law, M4-walled) — separate waves.
+                        # Net delta: −2, 81 → 79.
+                        #
+                        # Breakdown (2026-05-24, Tier 1 wave 69 —
                         # SIXTH TCB axiom retirement — D1 DISPATCH SELECTION):
                         # −1 in Pipeline.lean — the Phase D multi-method
                         #     Merkle-dispatch selection axiom
