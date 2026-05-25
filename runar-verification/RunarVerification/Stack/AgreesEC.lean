@@ -1769,6 +1769,51 @@ theorem reverse_getElem_bridge (nm : Array (Option String)) (d : Nat) (hd : d < 
   rw [← Array.getElem_toList]
   congr 1
 
+/-- **`findDepthAux`-to-`findDepthList` agreement (wave-77).**  The structural
+`Stack.Ec.Tracker.findDepthAux` (the kernel-reducible scan introduced by the
+`Stack/Ec.lean` `findDepth` refactor) returns `some (findDepthList name l)`
+whenever `name` is present in the top-first list `l`.  The two differ only in the
+NOT-found case (`findDepthAux ⇒ none`, `findDepthList ⇒ l.length`); under presence
+they coincide.  Proven by structural induction, `propext`/`Quot.sound`-clean. -/
+theorem findDepthAux_eq_findDepthList (name : String) :
+    ∀ (l : List (Option String)), some name ∈ l →
+      Ec.Tracker.findDepthAux name l = some (findDepthList name l) := by
+  intro l
+  induction l with
+  | nil => intro h; cases h
+  | cons x xs ih =>
+      intro hmem
+      unfold Ec.Tracker.findDepthAux findDepthList
+      by_cases hx : x = some name
+      · simp [hx]
+      · have hbeq : (x == some name) = false := by
+          simp [beq_eq_false_iff_ne, hx]
+        rw [hbeq]
+        simp only [Bool.false_eq_true, if_false, hx]
+        have hmem' : some name ∈ xs := by
+          rcases List.mem_cons.mp hmem with h | h
+          · exact absurd h.symm hx
+          · exact h
+        rw [ih hmem']
+        rfl
+
+/-- **The Part-9 BRIDGE (wave-77, was the wave-76 BLOCKER).**
+`Tracker.findDepth t name = findDepthList name t.nm.toList.reverse` whenever
+`name` is present in the (top-first) name list.  This is the one-line bridge the
+wave-76 substrate was gated on.  It is now provable — NOT by `native_decide` — but
+by unfolding the refactored structural `Stack.Ec.Tracker.findDepth`
+(`(findDepthAux name t.nm.toList.reverse).getD 0`) and discharging via
+`findDepthAux_eq_findDepthList` (structural induction).  This rewrites every
+codegen-emitted `.roll (Tracker.findDepth …)` / `.pickStruct (Tracker.findDepth …)`
+into the `findDepthList` form the wave-76 preservation lemmas
+(`applyRoll_findDepth_sim` / `applyPick_findDepth_sim`) address. -/
+theorem findDepth_eq_findDepthList (t : Ec.Tracker) (name : String)
+    (hmem : some name ∈ t.nm.toList.reverse) :
+    t.findDepth name = findDepthList name t.nm.toList.reverse := by
+  unfold Ec.Tracker.findDepth
+  rw [findDepthAux_eq_findDepthList name t.nm.toList.reverse hmem]
+  rfl
+
 /-- **`findDepth` model correctness under `TrackerSim` (keystone).**  When `name`
 is present in the tracker, the runtime stack value at structural depth
 `d := findDepthList name nm.toList.reverse` is exactly `σ name`, and `d` is in
@@ -1951,6 +1996,197 @@ theorem smoke_TrackerSim_push :
       (fun s => if s = "d" then .vBigint 40 else simσ s) (.vBigint 40 :: simStk) :=
   TrackerSim_push simNm simσ simStk "d" (.vBigint 40) smoke_TrackerSim_satisfiable (by decide)
 
+/-- Concrete tracker whose name array is `simNm = [a, b, c]` (bottom→top). -/
+private def simTracker : Ec.Tracker := Ec.Tracker.init [some "a", some "b", some "c"]
+
+/-- SMOKE (bridge fires — anti-vacuity).  On the concrete `simTracker`, the
+refactored structural `Tracker.findDepth "a"` equals the model
+`findDepthList "a" simTracker.nm.toList.reverse` (both `= 2`).  Discharged via the
+BRIDGE THEOREM `findDepth_eq_findDepthList` (proved by structural induction, never
+`native_decide`); the only `decide` is the concrete membership side-goal. -/
+theorem smoke_findDepth_eq_findDepthList :
+    simTracker.findDepth "a" = findDepthList "a" simTracker.nm.toList.reverse := by
+  apply findDepth_eq_findDepthList
+  decide
+
+/-- SMOKE (bridge produces the right concrete value).  The bridged depth on
+`simTracker` is exactly `2`, matching the topmost match's depth-from-TOS. -/
+theorem smoke_findDepth_bridge_value :
+    simTracker.findDepth "a" = 2 := by
+  rw [smoke_findDepth_eq_findDepthList]; decide
+
+/-! ### Per-helper transports (wave-77 deliverable 3)
+
+The wave-76 substrate (`TrackerSim`, `findDepthList_sim`, `applyRoll/applyPick`
+preservation) + the wave-77 bridge (`findDepth_eq_findDepthList`) compose into the
+reusable per-helper transports below.  Three families are landed here, each with a
+smoke:
+
+* **`pickStruct` peer** — `applyPickStruct_findDepth_sim` (the codegen emits
+  `.pickStruct d`, not the `.pick d` the substrate addressed; the two ops are
+  in-bounds-equivalent, so the substrate's `applyPick_findDepth_sim` lifts).
+* **`fieldMod` opcode-sequence transport** — `fieldModOps_transport`.  The 8-op
+  `fieldModOps` block is byte-identical to `emitEcModReduce`, so the wave-71
+  `ecModReduce_step_transport` lifts to `Secp256k1.fieldMod` (divisor `fieldP ≠ 0`).
+* **`fieldAdd/fieldSub/fieldMul` opcode-tail transports** — the
+  `[OP_BINOP, push fieldP] ++ fieldModOps` tail each composing the corresponding
+  `runOpcode_{ADD,SUB,MUL}_bigint_local` into `Secp256k1.field{Add,Sub,Mul}`.
+
+These are the field-arith leaves the per-op discharge of `emitEcNegate` /
+`emitEcOnCurve` consumes.  See the Part-9 BLOCK note for the remaining whole-program
+ops-append scaffolding that gates the final per-op assembly. -/
+
+/-- `applyPickStruct = applyPick` whenever the depth is in range (the two differ
+only in the out-of-range error string). -/
+theorem applyPickStruct_eq_applyPick (s : StackState) (d : Nat)
+    (hd : ¬ d ≥ s.stack.length) :
+    applyPickStruct s d = applyPick s d := by
+  unfold applyPickStruct applyPick
+  rw [if_neg hd, if_neg hd]
+
+/-- **`pickStruct`-at-model-depth transport (the codegen-faithful `copyToTop`
+witness).**  Under `TrackerSim`, the `.pickStruct (findDepthList …)` op the Tracker
+emits for `pick (k+2)` COPIES exactly `σ name` to the top — the `applyPick` peer for
+the op the codegen actually emits. -/
+theorem applyPickStruct_findDepth_sim (s : StackState) (nm : Array (Option String))
+    (σ : String → Value) (name : String)
+    (hSim : TrackerSim nm σ s.stack)
+    (hmem : some name ∈ nm.toList.reverse) :
+    applyPickStruct s (findDepthList name nm.toList.reverse)
+      = .ok (s.push (σ name)) := by
+  have hlt := (findDepthList_sim nm σ s.stack name hSim hmem).1
+  rw [applyPickStruct_eq_applyPick s _ (by omega)]
+  exact applyPick_findDepth_sim s nm σ name hSim hmem
+
+/-- The codegen field modulus `Ec.fieldP` equals the spec modulus
+`Secp256k1.FIELD_P` (same literal; kernel-checkable, NOT `native_decide`). -/
+theorem ec_fieldP_eq_spec : Ec.fieldP = Crypto.Secp256k1.FIELD_P := rfl
+
+/-- `Ec.fieldP ≠ 0` — the `OP_MOD` divisor guard for every `fieldMod` (kernel
+`decide`, NOT `native_decide`, so the transports stay free of `Lean.ofReduceBool`). -/
+theorem ec_fieldP_ne_zero : Ec.fieldP ≠ 0 := by decide
+
+/-- `fieldModOps` is the same 8-op list as `emitEcModReduce`. -/
+theorem fieldModOps_eq_emitEcModReduce :
+    Ec.fieldModOps = Stack.Ec.emitEcModReduce := rfl
+
+/-- **`fieldMod` opcode-sequence transport.**  Running `fieldModOps` on
+`[a, fieldP]` (fieldP on TOS) lands `Secp256k1.fieldMod a`.  Lifts the wave-71
+`ecModReduce_step_transport` (divisor `fieldP ≠ 0`). -/
+theorem fieldModOps_transport
+    (s : StackState) (a : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint Ec.fieldP :: .vBigint a :: rest) :
+    runOps Ec.fieldModOps s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMod a) :: rest } := by
+  rw [fieldModOps_eq_emitEcModReduce]
+  rw [ecModReduce_step_transport s a Ec.fieldP rest hStk ec_fieldP_ne_zero]
+  have hSpec : Crypto.Secp256k1.ecModReduce a Ec.fieldP = Crypto.Secp256k1.fieldMod a := by
+    unfold Crypto.Secp256k1.ecModReduce Crypto.Secp256k1.fieldMod
+    rw [if_neg ec_fieldP_ne_zero, ec_fieldP_eq_spec]
+  rw [hSpec]
+
+private theorem niOpcode : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by
+  intro c t e h; cases h
+private theorem niPush : ∀ (v : PushVal) t e, StackOp.push v ≠ .ifOp t e := by
+  intro v t e h; cases h
+
+/-- **Generic field-binop opcode-tail transport.**  For a binop opcode reducing the
+top-two ints by `f`, the tail `[OP_BINOP, push fieldP] ++ fieldModOps` run on
+`[a, b]` (b on TOS) lands `Secp256k1.fieldMod (f a b)`. -/
+theorem fieldBinop_optail_transport
+    (binop : String) (f : Int → Int → Int)
+    (s : StackState) (a b : Int) (rest : List Value)
+    (hBinop : runOpcode binop s = .ok ({ s with stack := rest }.push (.vBigint (f a b)))) :
+    runOps ([.opcode binop, .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMod (f a b)) :: rest } := by
+  rw [show ([.opcode binop, .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps)
+        = (.opcode binop :: .push (.bigint Ec.fieldP) :: Ec.fieldModOps) from rfl]
+  rw [runOps_cons_nonIf_eq _ _ _ (niOpcode binop), stepNonIf_opcode, hBinop]
+  simp only [match_Except_ok_runOps]
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint Ec.fieldP)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps]
+  rw [fieldModOps_transport _ (f a b) rest rfl]
+  simp only [StackState.push]
+
+/-- `fieldAdd` opcode-tail transport: `(a + b) mod p = Secp256k1.fieldAdd a b`. -/
+theorem fieldAdd_optail_transport
+    (s : StackState) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    runOps ([.opcode "OP_ADD", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldAdd a b) :: rest } :=
+  fieldBinop_optail_transport "OP_ADD" (· + ·) s a b rest
+    (runOpcode_ADD_bigint_local s a b rest hStk)
+
+/-- `fieldSub` opcode-tail transport: `(a - b) mod p = Secp256k1.fieldSub a b`. -/
+theorem fieldSub_optail_transport
+    (s : StackState) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    runOps ([.opcode "OP_SUB", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldSub a b) :: rest } :=
+  fieldBinop_optail_transport "OP_SUB" (· - ·) s a b rest
+    (runOpcode_SUB_bigint_local s a b rest hStk)
+
+/-- `fieldMul` opcode-tail transport: `(a * b) mod p = Secp256k1.fieldMul a b`. -/
+theorem fieldMul_optail_transport
+    (s : StackState) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    runOps ([.opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMul a b) :: rest } :=
+  fieldBinop_optail_transport "OP_MUL" (· * ·) s a b rest
+    (runOpcode_MUL_bigint_local s a b rest hStk)
+
+/-! ### MANDATORY smokes for the per-helper transports (deliverable 3) -/
+
+/-- Concrete state for the field-helper smokes: `[a=10, b=7]` (b on TOS). -/
+private def fieldSmokeStk : StackState :=
+  { (default : StackState) with stack := [.vBigint 7, .vBigint 10] }
+
+/-- SMOKE (`fieldMod` fires).  `fieldModOps` on `[42, p]` lands
+`Secp256k1.fieldMod 42 = 42`. -/
+theorem smoke_fieldModOps_transport :
+    runOps Ec.fieldModOps
+        { (default : StackState) with stack := [.vBigint Ec.fieldP, .vBigint 42] }
+      = .ok { (default : StackState) with
+              stack := [.vBigint (Crypto.Secp256k1.fieldMod 42)] } :=
+  fieldModOps_transport _ 42 [] rfl
+
+/-- SMOKE (`fieldMod` value anti-vacuity).  The reduced value is concretely `42`. -/
+theorem smoke_fieldMod_value : Crypto.Secp256k1.fieldMod 42 = 42 := by native_decide
+
+/-- SMOKE (`fieldAdd` fires).  `[10, 7]` ⇒ `Secp256k1.fieldAdd 10 7 = 17`. -/
+theorem smoke_fieldAdd_optail_transport :
+    runOps ([.opcode "OP_ADD", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) fieldSmokeStk
+      = .ok { fieldSmokeStk with stack := [.vBigint (Crypto.Secp256k1.fieldAdd 10 7)] } :=
+  fieldAdd_optail_transport fieldSmokeStk 10 7 [] rfl
+
+/-- SMOKE (`fieldSub` fires).  `[10, 7]` ⇒ `Secp256k1.fieldSub 10 7 = 3`. -/
+theorem smoke_fieldSub_optail_transport :
+    runOps ([.opcode "OP_SUB", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) fieldSmokeStk
+      = .ok { fieldSmokeStk with stack := [.vBigint (Crypto.Secp256k1.fieldSub 10 7)] } :=
+  fieldSub_optail_transport fieldSmokeStk 10 7 [] rfl
+
+/-- SMOKE (`fieldMul` fires).  `[10, 7]` ⇒ `Secp256k1.fieldMul 10 7 = 70`. -/
+theorem smoke_fieldMul_optail_transport :
+    runOps ([.opcode "OP_MUL", .push (.bigint Ec.fieldP)] ++ Ec.fieldModOps) fieldSmokeStk
+      = .ok { fieldSmokeStk with stack := [.vBigint (Crypto.Secp256k1.fieldMul 10 7)] } :=
+  fieldMul_optail_transport fieldSmokeStk 10 7 [] rfl
+
+/-- SMOKE (field-arith value anti-vacuity).  The three field ops land `17 / 3 / 70`. -/
+theorem smoke_field_values :
+    Crypto.Secp256k1.fieldAdd 10 7 = 17
+      ∧ Crypto.Secp256k1.fieldSub 10 7 = 3
+      ∧ Crypto.Secp256k1.fieldMul 10 7 = 70 := by native_decide
+
+/-- SMOKE (`pickStruct` peer fires).  Under the concrete `TrackerSim`, the
+codegen-faithful `.pickStruct (depth "a")` COPIES `σ "a" = 10` to the top. -/
+theorem smoke_applyPickStruct_findDepth_sim :
+    applyPickStruct { (default : StackState) with stack := simStk }
+        (findDepthList "a" simNm.toList.reverse)
+      = .ok (({ (default : StackState) with stack := simStk }).push (simσ "a")) := by
+  apply applyPickStruct_findDepth_sim
+  · exact smoke_TrackerSim_satisfiable
+  · decide
+
 /-! ## Part 9 — BLOCKED `Crypto/Spec.lean §7` axioms: `ecNegate`, `ecOnCurve`
 
 The remaining two "medium" EC ops are NOT plain op-lists.  Unlike `ecPointX/Y`
@@ -1980,38 +2216,61 @@ axiom-clean:
     `applyRoll_findDepth_sim` (`roll`/`toTop` preservation),
     `applyPick_findDepth_sim` (`pick`/`copyToTop` preservation).
 
-**PRECISE REMAINING BLOCKER (a KERNEL-LEVEL wall, sharper than wave-75).**  The
-keystone `findDepthList_sim` is stated against the *model* depth
-`findDepthList name (nm.toList.reverse)`.  To apply it to the ACTUAL codegen
-output one needs the bridge
+**WAVE-76 BLOCKER CLEARED (wave-77).**  The wave-76 BLOCK was the kernel wall that
+`Tracker.findDepth` was an `Id.run do … while …` (→ `Lean.Loop.forIn`, a
+`partial def` with no equational lemma / no `.induct` / no kernel reduction), so
+the bridge `Tracker.findDepth t name = findDepthList name t.nm.toList.reverse` was
+unprovable without editing `Stack/Ec.lean`.  Wave-77 PERFORMS that sanctioned,
+OUTPUT-PRESERVING refactor: `findDepth` is now a structural fold
+(`(Ec.Tracker.findDepthAux name t.nm.toList.reverse).getD 0`), kernel-reducible,
+computing byte-identical depths (verified: the EC conformance goldens
+`convergence-proof`/`ec-demo`/`ec-primitives`/`ec-unit` recompile byte-exact via
+the Lean `compileHex`; `schnorr-zkp` overflows the macOS 64 MB native stack in the
+DOWNSTREAM peephole pass identically under both the old and new `findDepth`, i.e.
+the overflow is pre-existing and independent of this change).  The bridge
+`findDepth_eq_findDepthList` (above) is now proved by structural induction
+(`findDepthAux_eq_findDepthList`), NOT `native_decide`, `propext`/`Quot.sound`-clean.
 
-  `Tracker.findDepth t name = findDepthList name t.nm.toList.reverse`  (when present)
+**LANDED THIS WAVE (deliverables 1-3).**
+  * The `findDepth` refactor (output-preserving) + the bridge.
+  * The per-helper transports: `fieldModOps_transport`,
+    `fieldBinop_optail_transport` + `fieldAdd/fieldSub/fieldMul_optail_transport`
+    (each → `Crypto.Secp256k1.field*`, divisor `fieldP ≠ 0` via kernel `decide`),
+    and `applyPickStruct_findDepth_sim` (the codegen-emitted-op peer of the
+    substrate's `applyPick_findDepth_sim`).  All `propext`/`Quot.sound`-clean (plus
+    the pre-existing `authBackend`/`hashBackend` opaques inherited via
+    `ecModReduce_step_transport`), each with an anti-vacuity smoke.
 
-so that each emitted `.roll (Tracker.findDepth …)` / `.pickStruct (…)` rewrites to
-`.roll (findDepthList …)`, the form the preservation lemmas address.  **This bridge
-is NOT PROVABLE without editing `Stack/Ec.lean`.**  `Tracker.findDepth` is an
-`Id.run do … while …` whose `while` desugars to `Lean.Loop.forIn` (`Init.While`).
-`Lean.Loop.forIn` is a `partial def`: it has NO equational lemma, NO `.induct`
-principle, and the kernel CANNOT reduce it (verified: `Tracker.findDepth t0 "a"`
-does NOT close by `rfl`/`decide` even on a fully concrete tracker — only the
-COMPILED `native_decide` evaluates it, which is forbidden as a transport faker and
-would inject `Lean.ofReduceBool` into the TCB).  So `Tracker.findDepth` cannot be
-unfolded, reduced, or inducted-over in any kernel-checked proof.  Bridging it to
-`findDepthList` would require giving `findDepth` a *structurally recursive*
-(kernel-reducible) definition in `Stack/Ec.lean` — explicitly out of scope
-("do NOT edit Stack/Ec.lean codegen").
+**PRECISE REMAINING SUB-GOAL (deliverable 4 — the per-op assembly, BLOCKED here).**
+`emitEcNegate` (945 ops) and `emitEcOnCurve` (518 ops) are `t.ops.toList` of the
+FINAL tracker after a chain of helper calls
+(`decomposePoint`/`fieldSub`/`composePoint` for negate;
+`decomposePoint`/`fieldSqr`/`fieldMul`/`fieldAdd`/`OP_EQUAL` for on-curve).  To run
+`runOps` over the whole list and land the spec, two scaffolding pieces remain:
 
-Consequently both `emitEcNegate` and `emitEcOnCurve` remain `Crypto/Spec.lean §7`
-axioms.  The field-arith opcode reductions themselves are individually fine
-(`OP_MOD` by the positive constant `fieldP` ≠ 0; `OP_MUL`/`OP_ADD`/`OP_SUB`
-total), and the Tracker simulation substrate above is the genuinely-hard, reusable
-half of the discharge — it composes immediately for ecNegate, ecOnCurve, ecAdd and
-ecMul the moment the one-line `findDepth = findDepthList ∘ reverse` bridge becomes
-available (a future `Stack/Ec.lean` refactor of `findDepth` to a structural fold,
-or a sanctioned `native_decide`-TCB decision for that single bridge).  Per the
-task's BLOCK protocol the two axioms are LEFT IN PLACE; the drift moves `76 → 76`
-(0 axioms discharged this wave — the discharge is gated on the out-of-scope
-`Stack/Ec.lean` change), while deliverable 1 (the invariant + preservation lemmas)
-lands as reusable substrate. -/
+  1. **Per-helper ops-append lemmas** — each helper APPENDS a determined op-list to
+     `t.ops` (so `(helper t).ops = t.ops ++ helperOps t`), letting `runOps_append`
+     decompose the 945/518-op list helper-by-helper.  `decomposePoint` /
+     `composePoint` additionally wrap the 295-op `emitReverse32Ops` (each
+     dischargeable via the wave-74 `reverse32_ops_transport`, but threaded through
+     the Tracker's `rawBlock`).
+
+  2. **`toTop` / `copyToTop` runtime transports** — the depth-dependent op the
+     Tracker emits (`roll d`: 0→nop, 1→swap, 2→rot, ≥3→`.roll d`;
+     `pick d`: 0→dup, 1→over, ≥2→`.pickStruct d`) must be shown, under `TrackerSim`
+     + the bridge, to bring/copy `σ name` to the top while preserving `TrackerSim`
+     with the matching `nm`-mutation.  The depth-0/1/2 cases need `applySwap`/
+     `applyRot` peers of `applyRoll_findDepth_sim`; the ≥3 case is exactly
+     `applyRoll_findDepth_sim ∘ bridge`.
+
+Once (1)+(2) land, the per-op discharge of BOTH ops is the field-arith leaves
+(above) composed along the helper chain under a single threaded `TrackerSim`
+invariant — and the same scaffolding immediately unblocks `emitEcAdd`/`emitEcMul`
+(the wave-76 hand-off).  This is multi-helper assembly work, not a kernel wall; per
+the task BLOCK protocol the two axioms are LEFT IN PLACE and the drift stays
+`76 → 76` (0 axioms discharged this wave — the discharge is gated on the per-helper
+ops-append + `toTop` scaffolding, NOT on any out-of-scope edit), while the
+output-preserving refactor + bridge + field-helper transports land as the
+genuinely-hard reusable substrate. -/
 
 end RunarVerification.Stack.AgreesEC

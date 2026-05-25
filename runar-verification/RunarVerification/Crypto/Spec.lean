@@ -676,11 +676,18 @@ This section carries **5** axioms (one per still-axiomatized emit builder):
   `hBeX`/`hBeY`).
 
 **Still axiomatized** — `emitEcNegate_runOps_eq` and `emitEcOnCurve_runOps_eq`
-remain axioms: their codegen runs the `Stack.Ec.Tracker` state machine (whose
-`.roll`/`.pickStruct` depths come from `Tracker.findDepth` over the threaded name
-array), so an honest `runOps` transport needs a Tracker-to-runtime-stack
-simulation invariant that the wave-74 substrate does not provide. See the BLOCK
-note in `Stack/AgreesEC.lean` Part 8 for the precise missing-lemma sub-goal.
+remain axioms, but the wave-76 kernel BLOCKER is now cleared.  Wave-77 (a) refactored
+`Stack/Ec.lean`'s `Tracker.findDepth` from the `Id.run … while …` (`Lean.Loop.forIn`,
+unreducible) form to a kernel-reducible structural fold — OUTPUT-PRESERVING (the EC
+conformance goldens recompile byte-exact) — (b) proved the bridge
+`Tracker.findDepth t name = findDepthList name t.nm.toList.reverse`
+(`Stack.AgreesEC.findDepth_eq_findDepthList`, structural induction, NOT
+`native_decide`), and (c) landed the per-helper transports
+(`fieldModOps_transport`, `field{Add,Sub,Mul}_optail_transport`,
+`applyPickStruct_findDepth_sim`).  What remains for the per-op discharge is the
+whole-program assembly: per-helper ops-append lemmas + `toTop`/`copyToTop` runtime
+transports threading the `TrackerSim` invariant across the 945- and 518-op chains.
+See the updated BLOCK note in `Stack/AgreesEC.lean` Part 9 for the precise sub-goal.
 -/
 
 open RunarVerification.Stack
