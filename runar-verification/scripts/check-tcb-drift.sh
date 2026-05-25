@@ -20,7 +20,44 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=79        # Breakdown (2026-05-25, Tier 3 EC wave —
+TARGET_AXIOMS=76        # Breakdown (2026-05-25, Tier 3 EC wave —
+                        # THREE MORE EC codegen-to-spec axiom discharges):
+                        # −3 in Crypto/Spec.lean §7 — the three `reverse32`-routed
+                        #     "medium" coordinate ops RETIRED, moved to THEOREMS in
+                        #     Stack/AgreesEC.lean (Part 7):
+                        #   • `emitEcPointX_runOps_eq` — `[push 32, OP_SPLIT, drop]`
+                        #     + `emitReverse32Ops` + `[push 0x00, OP_CAT, OP_BIN2NUM]`.
+                        #     Discharged by an honest op-chain composing the wave-74
+                        #     `reverse32_ops_transport` on the 32-byte x-half, lifted
+                        #     to `Crypto.Secp256k1.ecPointX` under the split-range
+                        #     guard `32 ≤ p.size` + the canonical-decode bridge
+                        #     `hDec` (byte-reversed x-half decodes to `ecPointX p`).
+                        #   • `emitEcPointY_runOps_eq` — same shape with
+                        #     `[push 32, OP_SPLIT, swap, drop]` on the y-half;
+                        #     split-range guard `64 ≤ p.size` + bridge `hDec`.
+                        #   • `emitEcMakePoint_runOps_eq` — per-coordinate
+                        #     `[push 33, OP_NUM2BIN, push 32, OP_SPLIT, drop]` +
+                        #     `emitReverse32Ops` then `OP_CAT`. Discharged under two
+                        #     `num2binEncode? · 33 = some enc` hypotheses + size
+                        #     guards + the BE-encoding bridges `hBeX`/`hBeY` (each
+                        #     byte-reversed low-32 half = spec `intToBE32`).
+                        #   All wf hypotheses are INPUT-level (constrain `p` / the
+                        #   coordinates, never the output), witnessed concretely by
+                        #   `smoke_ecPointX/Y/MakePoint_wf_satisfiable`. `#print
+                        #   axioms` on all three: NO sorryAx, NO new axiom, NOT
+                        #   depending on the axioms they replace — only propext /
+                        #   Quot.sound + the pre-existing crypto backends.
+                        #   STILL AXIOMATIZED: `emitEcNegate_runOps_eq` and
+                        #   `emitEcOnCurve_runOps_eq` — their codegen runs the
+                        #   `Stack.Ec.Tracker` state machine (`.roll`/`.pickStruct`
+                        #   depths from `Tracker.findDepth` over the threaded name
+                        #   array), so an honest `runOps` transport needs a
+                        #   Tracker-to-runtime-stack simulation invariant absent from
+                        #   the wave-74 substrate (BLOCKED; see AgreesEC.lean Part 8).
+                        #   `ecAdd/ecMul/ecMulGen` remain M4-walled (Jacobian).
+                        # Net delta: −3, 79 → 76.
+                        #
+                        # Breakdown (2026-05-25, Tier 3 EC wave —
                         # TWO EC codegen-to-spec axiom discharges):
                         # −2 in Crypto/Spec.lean §7 — the two EASIEST of the ten
                         #     `emitEc*_runOps_eq` codegen-to-spec links RETIRED,

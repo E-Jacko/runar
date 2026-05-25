@@ -652,16 +652,13 @@ and the output is `vBytes (Crypto.ecAdd pa pb) :: rest`.
 
 ### TCB impact
 
-This section carries **8** axioms (one per still-axiomatized emit builder):
+This section carries **5** axioms (one per still-axiomatized emit builder):
 
 * `emitEcAdd_runOps_eq`
 * `emitEcMul_runOps_eq`
 * `emitEcMulGen_runOps_eq`
 * `emitEcNegate_runOps_eq`
 * `emitEcOnCurve_runOps_eq`
-* `emitEcMakePoint_runOps_eq`
-* `emitEcPointX_runOps_eq`
-* `emitEcPointY_runOps_eq`
 
 **Discharged** (moved to theorems in `Stack/AgreesEC.lean`, no longer axioms):
 
@@ -670,6 +667,20 @@ This section carries **8** axioms (one per still-axiomatized emit builder):
 * `emitEcEncodeCompressed_runOps_eq` —
   `Stack.AgreesEC.emitEcEncodeCompressed_runOps_eq` (added split-range + canonical
   -encoding wf hypotheses).
+* `emitEcPointX_runOps_eq` — `Stack.AgreesEC.emitEcPointX_runOps_eq`
+  (split-range `32 ≤ p.size` + canonical-decode bridge `hDec`).
+* `emitEcPointY_runOps_eq` — `Stack.AgreesEC.emitEcPointY_runOps_eq`
+  (split-range `64 ≤ p.size` + canonical-decode bridge `hDec`).
+* `emitEcMakePoint_runOps_eq` — `Stack.AgreesEC.emitEcMakePoint_runOps_eq`
+  (two `num2binEncode? · 33` hypotheses + size guards + the BE-encoding bridges
+  `hBeX`/`hBeY`).
+
+**Still axiomatized** — `emitEcNegate_runOps_eq` and `emitEcOnCurve_runOps_eq`
+remain axioms: their codegen runs the `Stack.Ec.Tracker` state machine (whose
+`.roll`/`.pickStruct` depths come from `Tracker.findDepth` over the threaded name
+array), so an honest `runOps` transport needs a Tracker-to-runtime-stack
+simulation invariant that the wave-74 substrate does not provide. See the BLOCK
+note in `Stack/AgreesEC.lean` Part 8 for the precise missing-lemma sub-goal.
 -/
 
 open RunarVerification.Stack
@@ -746,31 +757,39 @@ last y-byte parity to `pointY p % 2`) plus the two `OP_SPLIT` range guards
 (`32 ≤ p.size`, `1 ≤ (p.extract 32 p.size).size`).  The bare axiom carried none
 of these and was therefore not dischargeable verbatim. -/
 
-/-- `Stack.Ec.emitEcMakePoint`: `(x : Int, y : Int) → Point`. Stack
+/- `Stack.Ec.emitEcMakePoint`: `(x : Int, y : Int) → Point`. Stack
 `[x, y]` (y on TOS) → `[point_bytes]`. Mirrors `emitEcMakePoint` in
-`ec-codegen.ts:740-760`. -/
-axiom emitEcMakePoint_runOps_eq (stkSt : StackState) (x y : Int)
-    (rest : List Value)
-    (hStk : stkSt.stack = .vBigint y :: .vBigint x :: rest) :
-    runOps Stack.Ec.emitEcMakePoint stkSt
-      = .ok { stkSt with
-              stack := .vBytes (Crypto.ecMakePoint x y) :: rest }
+`ec-codegen.ts:740-760`.
 
-/-- `Stack.Ec.emitEcPointX`: extract x-coordinate (Int) from Point.
-Mirrors `emitEcPointX` in `ec-codegen.ts:762-770`. -/
-axiom emitEcPointX_runOps_eq (stkSt : StackState) (pt : ByteArray)
-    (rest : List Value)
-    (hStk : stkSt.stack = .vBytes pt :: rest) :
-    runOps Stack.Ec.emitEcPointX stkSt
-      = .ok { stkSt with stack := .vBigint (Crypto.ecPointX pt) :: rest }
+**DISCHARGED** (no longer an axiom): proved as a theorem in
+`Stack/AgreesEC.lean` as
+`RunarVerification.Stack.AgreesEC.emitEcMakePoint_runOps_eq` by an honest op-by-op
+step-chain composing the wave-74 `reverse32_ops_transport` on each coordinate
+half, under input-level well-formedness: both coordinates `OP_NUM2BIN`-encode at
+width 33 (`num2binEncode? x 33 = some encX`, idem y), the encodings are ≥32 bytes,
+and each byte-reversed low-32 half equals the spec's big-endian `intToBE32`
+(`hBeX`/`hBeY`). The bare axiom carried none of these and was therefore not
+dischargeable verbatim. -/
 
-/-- `Stack.Ec.emitEcPointY`: extract y-coordinate (Int) from Point.
-Mirrors `emitEcPointY` in `ec-codegen.ts:772-781`. -/
-axiom emitEcPointY_runOps_eq (stkSt : StackState) (pt : ByteArray)
-    (rest : List Value)
-    (hStk : stkSt.stack = .vBytes pt :: rest) :
-    runOps Stack.Ec.emitEcPointY stkSt
-      = .ok { stkSt with stack := .vBigint (Crypto.ecPointY pt) :: rest }
+/- `Stack.Ec.emitEcPointX`: extract x-coordinate (Int) from Point.
+Mirrors `emitEcPointX` in `ec-codegen.ts:762-770`.
+
+**DISCHARGED** (no longer an axiom): proved as a theorem in
+`Stack/AgreesEC.lean` as
+`RunarVerification.Stack.AgreesEC.emitEcPointX_runOps_eq` (compose
+`reverse32_ops_transport` on the 32-byte x-half + `OP_BIN2NUM`), under the
+split-range guard `32 ≤ p.size` plus the canonical-decode bridge `hDec`
+(the byte-reversed x-half decodes to `ecPointX p`). -/
+
+/- `Stack.Ec.emitEcPointY`: extract y-coordinate (Int) from Point.
+Mirrors `emitEcPointY` in `ec-codegen.ts:772-781`.
+
+**DISCHARGED** (no longer an axiom): proved as a theorem in
+`Stack/AgreesEC.lean` as
+`RunarVerification.Stack.AgreesEC.emitEcPointY_runOps_eq` (compose
+`reverse32_ops_transport` on the 32-byte y-half + `OP_BIN2NUM`), under the
+split-range guard `64 ≤ p.size` plus the canonical-decode bridge `hDec`
+(the byte-reversed y-half decodes to `ecPointY p`). -/
 
 /-! ## 8. BabyBear prime field + degree-4 extension specifications
    (Phase B6, 2026-05-16)

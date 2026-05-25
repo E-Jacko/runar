@@ -1128,4 +1128,593 @@ theorem smoke_ecEncodeCompressed_value_concrete :
       = (0x02 :: (List.replicate 31 (0 : UInt8)) ++ [(5 : UInt8)]) := by
   native_decide
 
+/-! ## Part 7 — DISCHARGED `Crypto/Spec.lean §7` axioms: the four
+`reverse32`-routed "medium" coordinate ops
+
+`ecPointX`, `ecPointY`, and `ecMakePoint` are plain op-lists whose only
+non-trivial sub-block is `emitReverse32Ops` (now a theorem, Part 5).  Each runs:
+* a 32-byte `OP_SPLIT` (range-guarded by `32 ≤ p.size`),
+* `drop`/`swap+drop` to isolate the wanted half,
+* `emitReverse32Ops` to byte-reverse it (LE) — discharged by
+  `reverse32_ops_transport`,
+* (X/Y) `push 0x00 ; OP_CAT ; OP_BIN2NUM` to decode the LE run as a non-negative
+  `Int`, or
+* (MakePoint) `push 33 ; OP_NUM2BIN ; push 32 ; OP_SPLIT ; drop ; reverse` per
+  coordinate then `OP_CAT`.
+
+Each lands the codegen output expressed in `p`'s byte extracts (or the
+`num2binEncode?` of the inputs); the discharge then lifts it to the spec
+(`Crypto.Secp256k1.ecPointX / ecPointY / ecMakePoint`) under input-level
+canonical-encoding well-formedness — the byte-arith bridge that
+`decodeMinimalLE`/`num2binEncode?` round-trip the spec's big-endian `be32At` /
+`intToBE32`.  These are NOT output assumptions: they constrain only the input
+`p` (or the relation between the `OP_NUM2BIN` encoding and `intToBE32`), exactly
+as the wave-73 `hX`/`hPar` did for `ecEncodeCompressed`.  Both `OP_SPLIT` index
+guards (`32 ≤ p.size`) are honest input wf (a 64-byte point satisfies them). -/
+
+/-- **Operational transport for `emitEcPointX`.**  Running the
+`[push 32, OP_SPLIT, drop] ++ emitReverse32Ops ++ [push 0x00, OP_CAT, OP_BIN2NUM]`
+fragment on `[p] ++ rest` lands `decodeMinimalLE (revLE ++ 0x00)`, where
+`revLE = reverseAcc 32 (p.extract 0 32) empty` is the byte-reversed (little-endian)
+x-half.  Precondition `32 ≤ p.size` keeps the `OP_SPLIT` index in range and makes
+the x-half exactly 32 bytes (so `reverse32_ops_transport` applies). -/
+theorem ec_pointX_op_transport
+    (s : StackState) (p : ByteArray) (rest : List Value)
+    (hStk : s.stack = .vBytes p :: rest)
+    (hSplit : (32 : Nat) ≤ p.size) :
+    runOps Stack.Ec.emitEcPointX s
+      = .ok { s with
+          stack := .vBigint (decodeMinimalLE
+            (reverseAcc 32 (p.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00]))
+            :: rest } := by
+  obtain ⟨stk, alt, out, props, pre⟩ := s
+  subst hStk
+  have niOp : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by
+    intro c t e h; cases h
+  have niDrop : ∀ t e, StackOp.drop ≠ .ifOp t e := by intro t e h; cases h
+  have niPush : ∀ (pv : PushVal) t e, StackOp.push pv ≠ .ifOp t e := by
+    intro pv t e h; cases h
+  have hXsize : (p.extract 0 32).size = 32 := by rw [ByteArray.size_extract]; omega
+  -- emitEcPointX = [push 32, OP_SPLIT, drop] ++ emitReverse32Ops ++ [push 0x00, OP_CAT, OP_BIN2NUM]
+  have hUnfold : Stack.Ec.emitEcPointX
+      = StackOp.push (.bigint 32) :: StackOp.opcode "OP_SPLIT" :: StackOp.drop
+          :: (Stack.Ec.emitReverse32Ops
+              ++ [StackOp.push (.bytes (ByteArray.mk #[0x00])), StackOp.opcode "OP_CAT",
+                  StackOp.opcode "OP_BIN2NUM"]) := rfl
+  rw [hUnfold]
+  -- Step 1: push 32.
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint 32)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- Step 2: OP_SPLIT at index 32 → [x_high(=p.extract 32 size), p.extract 0 32].
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_SPLIT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_SPLIT"
+        { stack := .vBigint 32 :: .vBytes p :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (p.extract 32 p.size) :: .vBytes (p.extract 0 32) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } by
+      unfold runOpcode
+      simp only [popN, StackState.pop?, asBytes?, asNonNegativeNat?, asInt?,
+                 StackState.push, Int.reduceLT, reduceIte]
+      rw [if_neg (by omega : ¬ (32 : Int).toNat > p.size)]
+      rfl ]
+  simp only [match_Except_ok_runOps]
+  -- Step 3: drop → [p.extract 0 32].
+  rw [runOps_cons_nonIf_eq _ _ _ niDrop, stepNonIf_drop]
+  rw [show applyDrop
+        { stack := .vBytes (p.extract 32 p.size) :: .vBytes (p.extract 0 32) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (p.extract 0 32) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- emitReverse32Ops ++ tail.
+  rw [runOps_append]
+  -- The reverse32 wrapper transport on the 32-byte x-half.
+  rw [reverse32_ops_transport
+        { stack := .vBytes (p.extract 0 32) :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        (p.extract 0 32) rest rfl (by rw [hXsize]; omega)]
+  simp only [match_Except_ok_runOps]
+  -- Step: push 0x00.
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bytes (ByteArray.mk #[0x00]))), stepNonIf_push_bytes]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- Step: OP_CAT → revLE ++ 0x00.
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_CAT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_CAT"
+        { stack := .vBytes (ByteArray.mk #[0x00])
+                    :: .vBytes (reverseAcc 32 (p.extract 0 32) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (reverseAcc 32 (p.extract 0 32) ByteArray.empty
+                                    ++ ByteArray.mk #[0x00]) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- Step: OP_BIN2NUM → decodeMinimalLE (revLE ++ 0x00).
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_BIN2NUM"), stepNonIf_opcode]
+  rw [show runOpcode "OP_BIN2NUM"
+        { stack := .vBytes (reverseAcc 32 (p.extract 0 32) ByteArray.empty
+                              ++ ByteArray.mk #[0x00]) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 0 32)
+                            ByteArray.empty ++ ByteArray.mk #[0x00])) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps, runOps_nil]
+
+open RunarVerification.Crypto.Secp256k1 (ecPointX) in
+/-- **DISCHARGED.**  `Stack.Ec.emitEcPointX` agrees with `Crypto.Secp256k1.ecPointX`,
+under the split-range guard `32 ≤ p.size` plus the canonical-decode bridge
+`hDec`: the little-endian byte-reversed x-half (with the `0x00` sign byte the
+codegen appends) decodes to the spec x-coordinate.  `hDec` is an honest invariant
+of every canonically big-endian-encoded 64-byte point the EC codegen emits — it
+constrains only the input `p`, not the output, mirroring wave-73's `hX`.  This is
+the theorem that replaces the `Crypto.Spec.emitEcPointX_runOps_eq` axiom. -/
+theorem emitEcPointX_runOps_eq
+    (stkSt : StackState) (pt : ByteArray) (rest : List Value)
+    (hStk : stkSt.stack = .vBytes pt :: rest)
+    (hSplit : (32 : Nat) ≤ pt.size)
+    (hDec : decodeMinimalLE
+              (reverseAcc 32 (pt.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = ecPointX pt) :
+    runOps Stack.Ec.emitEcPointX stkSt
+      = .ok { stkSt with stack := .vBigint (ecPointX pt) :: rest } := by
+  rw [ec_pointX_op_transport stkSt pt rest hStk hSplit, hDec]
+
+/-! ### MANDATORY smokes for the ecPointX discharge -/
+
+/-- A concrete canonically-encoded point `p = makePoint 11 22`, so `p.size = 64`
+and the decode bridge holds by computation. -/
+private def smokePtX : ByteArray :=
+  RunarVerification.Crypto.Secp256k1.makePoint 11 22
+
+private def smokePtXStk : StackState :=
+  { (default : StackState) with stack := [.vBytes smokePtX] }
+
+/-- SMOKE (wf anti-vacuity).  The split-range and decode-bridge hypotheses of
+`emitEcPointX_runOps_eq` are SATISFIABLE — they hold concretely for the
+canonically-encoded `makePoint 11 22`.  `native_decide` is legitimate (every
+function involved is closed-form computable).  Rules out a vacuous discharge. -/
+theorem smoke_ecPointX_wf_satisfiable :
+    (32 : Nat) ≤ smokePtX.size
+      ∧ decodeMinimalLE
+          (reverseAcc 32 (smokePtX.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = RunarVerification.Crypto.Secp256k1.ecPointX smokePtX := by
+  native_decide
+
+/-- SMOKE (the headline).  The discharged `emitEcPointX_runOps_eq` FIRES on the
+concrete point: the fragment lands exactly `ecPointX (makePoint 11 22) = 11`. -/
+theorem smoke_emitEcPointX_runOps_eq :
+    runOps Stack.Ec.emitEcPointX smokePtXStk
+      = .ok { smokePtXStk with
+              stack := .vBigint (RunarVerification.Crypto.Secp256k1.ecPointX smokePtX) :: [] } :=
+  emitEcPointX_runOps_eq smokePtXStk smokePtX [] rfl (by native_decide) (by native_decide)
+
+/-- SMOKE (value anti-vacuity).  The extracted x is concretely `11`.
+`native_decide` is legitimate (the spec is closed-form). -/
+theorem smoke_ecPointX_value_concrete :
+    RunarVerification.Crypto.Secp256k1.ecPointX smokePtX = 11 := by
+  native_decide
+
+/-- **Operational transport for `emitEcPointY`.**  Running the
+`[push 32, OP_SPLIT, swap, drop] ++ emitReverse32Ops ++ [push 0x00, OP_CAT, OP_BIN2NUM]`
+fragment on `[p] ++ rest` lands `decodeMinimalLE (revLE ++ 0x00)`, where
+`revLE = reverseAcc 32 (p.extract 32 p.size) empty` is the byte-reversed
+(little-endian) y-half.  Precondition `64 ≤ p.size` keeps the `OP_SPLIT` index in
+range AND makes the y-half ≥ 32 bytes (so `reverse32_ops_transport` applies). -/
+theorem ec_pointY_op_transport
+    (s : StackState) (p : ByteArray) (rest : List Value)
+    (hStk : s.stack = .vBytes p :: rest)
+    (hSplit : (64 : Nat) ≤ p.size) :
+    runOps Stack.Ec.emitEcPointY s
+      = .ok { s with
+          stack := .vBigint (decodeMinimalLE
+            (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00]))
+            :: rest } := by
+  obtain ⟨stk, alt, out, props, pre⟩ := s
+  subst hStk
+  have niOp : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by
+    intro c t e h; cases h
+  have niDrop : ∀ t e, StackOp.drop ≠ .ifOp t e := by intro t e h; cases h
+  have niSwap : ∀ t e, StackOp.swap ≠ .ifOp t e := by intro t e h; cases h
+  have niPush : ∀ (pv : PushVal) t e, StackOp.push pv ≠ .ifOp t e := by
+    intro pv t e h; cases h
+  have hYsize : (p.extract 32 p.size).size = p.size - 32 := by rw [ByteArray.size_extract]; omega
+  -- emitEcPointY = [push 32, OP_SPLIT, swap, drop] ++ emitReverse32Ops ++ tail
+  have hUnfold : Stack.Ec.emitEcPointY
+      = StackOp.push (.bigint 32) :: StackOp.opcode "OP_SPLIT" :: StackOp.swap :: StackOp.drop
+          :: (Stack.Ec.emitReverse32Ops
+              ++ [StackOp.push (.bytes (ByteArray.mk #[0x00])), StackOp.opcode "OP_CAT",
+                  StackOp.opcode "OP_BIN2NUM"]) := rfl
+  rw [hUnfold]
+  -- Step 1: push 32.
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint 32)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- Step 2: OP_SPLIT at index 32 → [p.extract 32 size, p.extract 0 32].
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_SPLIT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_SPLIT"
+        { stack := .vBigint 32 :: .vBytes p :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (p.extract 32 p.size) :: .vBytes (p.extract 0 32) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } by
+      unfold runOpcode
+      simp only [popN, StackState.pop?, asBytes?, asNonNegativeNat?, asInt?,
+                 StackState.push, Int.reduceLT, reduceIte]
+      rw [if_neg (by omega : ¬ (32 : Int).toNat > p.size)]
+      rfl ]
+  simp only [match_Except_ok_runOps]
+  -- Step 3: swap → [p.extract 0 32, p.extract 32 size].
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBytes (p.extract 32 p.size) :: .vBytes (p.extract 0 32) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (p.extract 0 32) :: .vBytes (p.extract 32 p.size) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- Step 4: drop → [p.extract 32 size].
+  rw [runOps_cons_nonIf_eq _ _ _ niDrop, stepNonIf_drop]
+  rw [show applyDrop
+        { stack := .vBytes (p.extract 0 32) :: .vBytes (p.extract 32 p.size) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (p.extract 32 p.size) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- emitReverse32Ops ++ tail.
+  rw [runOps_append]
+  rw [reverse32_ops_transport
+        { stack := .vBytes (p.extract 32 p.size) :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        (p.extract 32 p.size) rest rfl (by rw [hYsize]; omega)]
+  simp only [match_Except_ok_runOps]
+  -- Step: push 0x00.
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bytes (ByteArray.mk #[0x00]))), stepNonIf_push_bytes]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- Step: OP_CAT → revLE ++ 0x00.
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_CAT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_CAT"
+        { stack := .vBytes (ByteArray.mk #[0x00])
+                    :: .vBytes (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty
+                                    ++ ByteArray.mk #[0x00]) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- Step: OP_BIN2NUM → decodeMinimalLE (revLE ++ 0x00).
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_BIN2NUM"), stepNonIf_opcode]
+  rw [show runOpcode "OP_BIN2NUM"
+        { stack := .vBytes (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty
+                              ++ ByteArray.mk #[0x00]) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBigint (decodeMinimalLE (reverseAcc 32 (p.extract 32 p.size)
+                            ByteArray.empty ++ ByteArray.mk #[0x00])) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps, runOps_nil]
+
+open RunarVerification.Crypto.Secp256k1 (ecPointY) in
+/-- **DISCHARGED.**  `Stack.Ec.emitEcPointY` agrees with `Crypto.Secp256k1.ecPointY`,
+under the split-range guard `64 ≤ p.size` plus the canonical-decode bridge `hDec`:
+the little-endian byte-reversed y-half (with the `0x00` sign byte the codegen
+appends) decodes to the spec y-coordinate.  `hDec` constrains only the input `p`
+(honest invariant of canonically-encoded points), mirroring wave-73's `hX`.
+Replaces the `Crypto.Spec.emitEcPointY_runOps_eq` axiom. -/
+theorem emitEcPointY_runOps_eq
+    (stkSt : StackState) (pt : ByteArray) (rest : List Value)
+    (hStk : stkSt.stack = .vBytes pt :: rest)
+    (hSplit : (64 : Nat) ≤ pt.size)
+    (hDec : decodeMinimalLE
+              (reverseAcc 32 (pt.extract 32 pt.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = ecPointY pt) :
+    runOps Stack.Ec.emitEcPointY stkSt
+      = .ok { stkSt with stack := .vBigint (ecPointY pt) :: rest } := by
+  rw [ec_pointY_op_transport stkSt pt rest hStk hSplit, hDec]
+
+/-! ### MANDATORY smokes for the ecPointY discharge -/
+
+private def smokePtY : ByteArray :=
+  RunarVerification.Crypto.Secp256k1.makePoint 11 22
+
+private def smokePtYStk : StackState :=
+  { (default : StackState) with stack := [.vBytes smokePtY] }
+
+/-- SMOKE (wf anti-vacuity).  The split-range and decode-bridge hypotheses of
+`emitEcPointY_runOps_eq` hold concretely for `makePoint 11 22`. -/
+theorem smoke_ecPointY_wf_satisfiable :
+    (64 : Nat) ≤ smokePtY.size
+      ∧ decodeMinimalLE
+          (reverseAcc 32 (smokePtY.extract 32 smokePtY.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = RunarVerification.Crypto.Secp256k1.ecPointY smokePtY := by
+  native_decide
+
+/-- SMOKE (the headline).  The discharged `emitEcPointY_runOps_eq` FIRES,
+landing `ecPointY (makePoint 11 22) = 22`. -/
+theorem smoke_emitEcPointY_runOps_eq :
+    runOps Stack.Ec.emitEcPointY smokePtYStk
+      = .ok { smokePtYStk with
+              stack := .vBigint (RunarVerification.Crypto.Secp256k1.ecPointY smokePtY) :: [] } :=
+  emitEcPointY_runOps_eq smokePtYStk smokePtY [] rfl (by native_decide) (by native_decide)
+
+/-- SMOKE (value anti-vacuity).  The extracted y is concretely `22`. -/
+theorem smoke_ecPointY_value_concrete :
+    RunarVerification.Crypto.Secp256k1.ecPointY smokePtY = 22 := by
+  native_decide
+
+set_option maxRecDepth 8192 in
+/-- **Operational transport for `emitEcMakePoint`.**  Input stack `[y, x] ++ rest`
+(y on TOS, per the spec arg order — the deepest input is the leftmost spec arg).
+Each coordinate is `OP_NUM2BIN`-encoded to 33 LE bytes, split to its low 32 bytes,
+then byte-reversed to big-endian; the two BE halves are concatenated `x ‖ y`.
+Output: `revBE encX ++ revBE encY`, where `encX`/`encY` are the `num2binEncode?`
+images of `x`/`y` at width 33.  Preconditions: both encodings succeed and are ≥32
+bytes (honest input wf — every in-field coordinate fits in 33 bytes). -/
+theorem ec_makePoint_op_transport
+    (s : StackState) (x y : Int) (encX encY : ByteArray) (rest : List Value)
+    (hStk : s.stack = .vBigint y :: .vBigint x :: rest)
+    (hEncX : num2binEncode? x 33 = some encX)
+    (hEncY : num2binEncode? y 33 = some encY)
+    (hSzX : (32 : Nat) ≤ encX.size)
+    (hSzY : (32 : Nat) ≤ encY.size) :
+    runOps Stack.Ec.emitEcMakePoint s
+      = .ok { s with
+          stack := .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty
+                            ++ reverseAcc 32 (encY.extract 0 32) ByteArray.empty)
+            :: rest } := by
+  obtain ⟨stk, alt, out, props, pre⟩ := s
+  subst hStk
+  have niOp : ∀ (c : String) t e, StackOp.opcode c ≠ .ifOp t e := by
+    intro c t e h; cases h
+  have niDrop : ∀ t e, StackOp.drop ≠ .ifOp t e := by intro t e h; cases h
+  have niSwap : ∀ t e, StackOp.swap ≠ .ifOp t e := by intro t e h; cases h
+  have niPush : ∀ (pv : PushVal) t e, StackOp.push pv ≠ .ifOp t e := by
+    intro pv t e h; cases h
+  -- Reusable OP_NUM2BIN reduction at width 33.
+  have hNum2Bin : ∀ (n : Int) (enc : ByteArray) (r : List Value),
+      num2binEncode? n 33 = some enc →
+      runOpcode "OP_NUM2BIN"
+        { stack := .vBigint 33 :: .vBigint n :: r, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes enc :: r, altstack := alt,
+                outputs := out, props := props, preimage := pre } := by
+    intro n enc r hEnc
+    unfold runOpcode
+    simp only [popN, StackState.pop?, asInt?, StackState.push, Int.reduceLT, reduceIte]
+    rw [show (33 : Int).toNat = 33 from rfl, hEnc]
+  have hSzXextract : (encX.extract 0 32).size = 32 := by rw [ByteArray.size_extract]; omega
+  have hSzYextract : (encY.extract 0 32).size = 32 := by rw [ByteArray.size_extract]; omega
+  -- emitEcMakePoint as the literal op list.
+  have hUnfold : Stack.Ec.emitEcMakePoint
+      = StackOp.push (.bigint 33) :: StackOp.opcode "OP_NUM2BIN" :: StackOp.push (.bigint 32)
+          :: StackOp.opcode "OP_SPLIT" :: StackOp.drop
+          :: (Stack.Ec.emitReverse32Ops
+              ++ (StackOp.swap :: StackOp.push (.bigint 33) :: StackOp.opcode "OP_NUM2BIN"
+                  :: StackOp.push (.bigint 32) :: StackOp.opcode "OP_SPLIT" :: StackOp.drop
+                  :: (Stack.Ec.emitReverse32Ops
+                      ++ [StackOp.swap, StackOp.opcode "OP_CAT"]))) := rfl
+  rw [hUnfold]
+  -- y-branch.  push 33.
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint 33)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- OP_NUM2BIN → encY.
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_NUM2BIN"), stepNonIf_opcode]
+  rw [hNum2Bin y encY (.vBigint x :: rest) hEncY]
+  simp only [match_Except_ok_runOps]
+  -- push 32.
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint 32)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- OP_SPLIT at 32.
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_SPLIT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_SPLIT"
+        { stack := .vBigint 32 :: .vBytes encY :: .vBigint x :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (encY.extract 32 encY.size) :: .vBytes (encY.extract 0 32)
+                          :: .vBigint x :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } by
+      unfold runOpcode
+      simp only [popN, StackState.pop?, asBytes?, asNonNegativeNat?, asInt?,
+                 StackState.push, Int.reduceLT, reduceIte]
+      rw [if_neg (by omega : ¬ (32 : Int).toNat > encY.size)]
+      rfl ]
+  simp only [match_Except_ok_runOps]
+  -- drop → [encY.extract 0 32, x].
+  rw [runOps_cons_nonIf_eq _ _ _ niDrop, stepNonIf_drop]
+  rw [show applyDrop
+        { stack := .vBytes (encY.extract 32 encY.size) :: .vBytes (encY.extract 0 32)
+                    :: .vBigint x :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (encY.extract 0 32) :: .vBigint x :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- reverse32 (y-half) ++ tail.
+  rw [runOps_append]
+  rw [reverse32_ops_transport
+        { stack := .vBytes (encY.extract 0 32) :: .vBigint x :: rest, altstack := alt,
+          outputs := out, props := props, preimage := pre }
+        (encY.extract 0 32) (.vBigint x :: rest) rfl (by rw [hSzYextract]; omega)]
+  simp only [match_Except_ok_runOps]
+  -- swap → [x, revY_be].
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty)
+                    :: .vBigint x :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBigint x
+                          :: .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- x-branch.  push 33.
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint 33)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- OP_NUM2BIN → encX.
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_NUM2BIN"), stepNonIf_opcode]
+  rw [hNum2Bin x encX (.vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest) hEncX]
+  simp only [match_Except_ok_runOps]
+  -- push 32.
+  rw [runOps_cons_nonIf_eq _ _ _ (niPush (.bigint 32)), stepNonIf_push_bigint]
+  simp only [match_Except_ok_runOps, StackState.push]
+  -- OP_SPLIT at 32.
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_SPLIT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_SPLIT"
+        { stack := .vBigint 32 :: .vBytes encX
+                    :: .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (encX.extract 32 encX.size) :: .vBytes (encX.extract 0 32)
+                          :: .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } by
+      unfold runOpcode
+      simp only [popN, StackState.pop?, asBytes?, asNonNegativeNat?, asInt?,
+                 StackState.push, Int.reduceLT, reduceIte]
+      rw [if_neg (by omega : ¬ (32 : Int).toNat > encX.size)]
+      rfl ]
+  simp only [match_Except_ok_runOps]
+  -- drop.
+  rw [runOps_cons_nonIf_eq _ _ _ niDrop, stepNonIf_drop]
+  rw [show applyDrop
+        { stack := .vBytes (encX.extract 32 encX.size) :: .vBytes (encX.extract 0 32)
+                    :: .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (encX.extract 0 32)
+                          :: .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- reverse32 (x-half) ++ [swap, OP_CAT].
+  rw [runOps_append]
+  rw [reverse32_ops_transport
+        { stack := .vBytes (encX.extract 0 32)
+                    :: .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        (encX.extract 0 32) (.vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest)
+        rfl (by rw [hSzXextract]; omega)]
+  simp only [match_Except_ok_runOps]
+  -- swap → [revY_be, revX_be].
+  rw [runOps_cons_nonIf_eq _ _ _ niSwap, stepNonIf_swap]
+  rw [show applySwap
+        { stack := .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty)
+                    :: .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty)
+                          :: .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps]
+  -- OP_CAT → revX_be ++ revY_be (popN gives [top, below] = [revY_be, revX_be]; f a b = a++b).
+  rw [runOps_cons_nonIf_eq _ _ _ (niOp "OP_CAT"), stepNonIf_opcode]
+  rw [show runOpcode "OP_CAT"
+        { stack := .vBytes (reverseAcc 32 (encY.extract 0 32) ByteArray.empty)
+                    :: .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty) :: rest,
+          altstack := alt, outputs := out, props := props, preimage := pre }
+        = .ok { stack := .vBytes (reverseAcc 32 (encX.extract 0 32) ByteArray.empty
+                                    ++ reverseAcc 32 (encY.extract 0 32) ByteArray.empty) :: rest,
+                altstack := alt, outputs := out, props := props, preimage := pre } from rfl]
+  simp only [match_Except_ok_runOps, runOps_nil]
+
+set_option maxRecDepth 8192 in
+open RunarVerification.Crypto.Secp256k1 (ecMakePoint intToBE32) in
+/-- **DISCHARGED.**  `Stack.Ec.emitEcMakePoint` agrees with
+`Crypto.Secp256k1.ecMakePoint`, under the two `OP_NUM2BIN`-encoding hypotheses
+(`hEncX`/`hEncY` — the coordinates fit in 33 bytes), the two size guards, and the
+canonical-encoding bridges `hBeX`/`hBeY`: each byte-reversed low-32 `OP_NUM2BIN`
+half equals the spec's big-endian `intToBE32`.  All hypotheses constrain only the
+INPUTS `x`/`y` (and their canonical encodings), not the output — honest invariants
+of every in-field coordinate.  Replaces the `Crypto.Spec.emitEcMakePoint_runOps_eq`
+axiom. -/
+theorem emitEcMakePoint_runOps_eq
+    (stkSt : StackState) (x y : Int) (encX encY : ByteArray) (rest : List Value)
+    (hStk : stkSt.stack = .vBigint y :: .vBigint x :: rest)
+    (hEncX : num2binEncode? x 33 = some encX)
+    (hEncY : num2binEncode? y 33 = some encY)
+    (hSzX : (32 : Nat) ≤ encX.size)
+    (hSzY : (32 : Nat) ≤ encY.size)
+    (hBeX : reverseAcc 32 (encX.extract 0 32) ByteArray.empty = intToBE32 x)
+    (hBeY : reverseAcc 32 (encY.extract 0 32) ByteArray.empty = intToBE32 y) :
+    runOps Stack.Ec.emitEcMakePoint stkSt
+      = .ok { stkSt with stack := .vBytes (ecMakePoint x y) :: rest } := by
+  rw [ec_makePoint_op_transport stkSt x y encX encY rest hStk hEncX hEncY hSzX hSzY,
+      hBeX, hBeY]
+  rfl
+
+/-! ### MANDATORY smokes for the ecMakePoint discharge -/
+
+private def smokeMkX : Int := 11
+private def smokeMkY : Int := 22
+
+private def smokeMkStk : StackState :=
+  { (default : StackState) with stack := [.vBigint smokeMkY, .vBigint smokeMkX] }
+
+/-- Concrete `OP_NUM2BIN` encodings of the two coordinates at width 33. -/
+private def smokeMkEncX : ByteArray :=
+  (num2binEncode? smokeMkX 33).getD ByteArray.empty
+private def smokeMkEncY : ByteArray :=
+  (num2binEncode? smokeMkY 33).getD ByteArray.empty
+
+/-- SMOKE (wf anti-vacuity).  All six discharge hypotheses are SATISFIABLE for
+`x = 11, y = 22`: both coordinates encode at width 33 (size 33 ≥ 32) and each
+byte-reversed low-32 half equals the spec `intToBE32`.  `native_decide` is
+legitimate (every function is closed-form). -/
+theorem smoke_ecMakePoint_wf_satisfiable :
+    num2binEncode? smokeMkX 33 = some smokeMkEncX
+      ∧ num2binEncode? smokeMkY 33 = some smokeMkEncY
+      ∧ (32 : Nat) ≤ smokeMkEncX.size
+      ∧ (32 : Nat) ≤ smokeMkEncY.size
+      ∧ reverseAcc 32 (smokeMkEncX.extract 0 32) ByteArray.empty
+          = RunarVerification.Crypto.Secp256k1.intToBE32 smokeMkX
+      ∧ reverseAcc 32 (smokeMkEncY.extract 0 32) ByteArray.empty
+          = RunarVerification.Crypto.Secp256k1.intToBE32 smokeMkY := by
+  native_decide
+
+/-- SMOKE (the headline).  The discharged `emitEcMakePoint_runOps_eq` FIRES on
+`[22, 11]`, landing exactly `ecMakePoint 11 22 = makePoint 11 22`. -/
+theorem smoke_emitEcMakePoint_runOps_eq :
+    runOps Stack.Ec.emitEcMakePoint smokeMkStk
+      = .ok { smokeMkStk with
+              stack := .vBytes
+                (RunarVerification.Crypto.Secp256k1.ecMakePoint smokeMkX smokeMkY) :: [] } :=
+  emitEcMakePoint_runOps_eq smokeMkStk smokeMkX smokeMkY smokeMkEncX smokeMkEncY [] rfl
+    (by native_decide) (by native_decide) (by native_decide) (by native_decide)
+    (by native_decide) (by native_decide)
+
+/-- SMOKE (value anti-vacuity).  The packed point round-trips: its x-coordinate is
+`11` and y-coordinate is `22`. -/
+theorem smoke_ecMakePoint_value_concrete :
+    RunarVerification.Crypto.Secp256k1.ecPointX
+        (RunarVerification.Crypto.Secp256k1.ecMakePoint smokeMkX smokeMkY) = 11
+      ∧ RunarVerification.Crypto.Secp256k1.ecPointY
+        (RunarVerification.Crypto.Secp256k1.ecMakePoint smokeMkX smokeMkY) = 22 := by
+  native_decide
+
+/-! ## Part 8 — BLOCKED `Crypto/Spec.lean §7` axioms: `ecNegate`, `ecOnCurve`
+
+The remaining two "medium" EC ops are NOT plain op-lists.  Unlike `ecPointX/Y`
+and `ecMakePoint` (whose only non-trivial sub-block is `emitReverse32Ops`), both
+`emitEcNegate` and `emitEcOnCurve` are produced by RUNNING the `Stack.Ec.Tracker`
+state machine: their op lists are `t.ops.toList` after a chain of
+`decomposePoint` / `composePoint` / `fieldSub` / `fieldSqr` / `fieldMul` /
+`fieldAdd`, each of which interleaves `t.toTop` / `t.copyToTop` operations that
+emit `.roll d` / `.pickStruct d` whose depth `d = Tracker.findDepth name` is
+computed at CODEGEN TIME against the threaded name array `nm`.
+
+* `emitEcNegate`  : 945 ops — 257 `.rot`, 2 `OP_MOD` (one `fieldSub`, no
+  `OP_MUL`), routed through two `emitReverse32Ops` blocks in `decompose`/`compose`.
+* `emitEcOnCurve` : 518 ops — 1 `.roll`, 1 `.pickStruct`, 132 `.rot`, 8 `OP_MOD`,
+  3 `OP_MUL` (two `fieldSqr`, one `fieldMul`, one `fieldAdd`) + a final `OP_EQUAL`.
+
+**PRECISE BLOCKER (the missing substrate).**  An honest `runOps` transport for
+either op list requires a *Tracker-to-runtime-stack simulation invariant* that
+does NOT exist in the base:
+
+  for every codegen step, `Tracker.findDepth nm name` (the `while`-loop search the
+  codegen used to pick each `.roll`/`.pickStruct` depth) must equal the runtime
+  structural depth of that named value on `StackState.stack`, and this invariant
+  must be PRESERVED across `roll` / `pickStruct` / `rot` / `swap` / `drop` /
+  `over` / `rawBlock` — through the ~15–20 named field intermediates each op
+  threads.  No `decomposePoint_transport`, `composePoint_transport`,
+  `fieldSub_transport`, `fieldMul_transport`, `fieldSqr_transport`,
+  `fieldAdd_transport`, nor any `Tracker.findDepth`/runtime-depth agreement lemma
+  is present in the wave-74 base.  The wave-73/74 substrate
+  (`reverse32_ops_transport`, the `ec_encode_op_transport` step-chain) covers
+  ONLY plain op-lists; it does not lift the Tracker's `nm`-driven addressing.
+
+Building that simulation library (a `Tracker.findDepth`↔runtime-depth invariant +
+per-helper transports for `decompose`/`compose`/`fieldMod`/`fieldAdd`/`fieldSub`/
+`fieldMul`/`fieldSqr`) is a standalone multi-hundred-line effort, well beyond
+"compose `reverse32_ops_transport` with the field-arith opcode reductions".  Per
+the task's BLOCK protocol these two are reported with the precise sub-goal above
+and their `Crypto/Spec.lean §7` axioms are LEFT IN PLACE (the field-arith opcode
+reductions are individually fine — `OP_MOD` by the positive constant `fieldP` ≠ 0,
+`OP_MUL`/`OP_ADD`/`OP_SUB` are total — but the codegen-output op LIST cannot be
+run without the Tracker addressing invariant). -/
+
 end RunarVerification.Stack.AgreesEC
