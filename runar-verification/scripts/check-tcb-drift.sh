@@ -20,7 +20,51 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=74        # Breakdown (2026-05-25, Tier 3 EC wave —
+TARGET_AXIOMS=73        # Breakdown (2026-05-26, Tier 3 EC wave —
+                        # emitEcAdd codegen-to-spec axiom discharge, the LAST
+                        # in-scope EC straight-line op):
+                        # −1 in Crypto/Spec.lean §7 — `emitEcAdd_runOps_eq`
+                        #     RETIRED, moved to a THEOREM in Stack/AgreesEC.lean
+                        #     (Part 18 + Part 19). The codegen op-list is
+                        #     `expectedEcAdd = ecaDp2.ops ++ affineAddInc ++
+                        #     composeRxRyInc`. The discharge: (a) `emitEcAdd_ops`
+                        #     proves the op-list equals that determined concat;
+                        #     (b) the runtime threads the two `decomposePoint`
+                        #     bases (`ecaDp2_runOps`, the depth-1/depth-2 roll-
+                        #     prefixed decodes of pa/pb) → the 24-step affineAdd
+                        #     field chain (`affineAddInc_runOps`, via the depth-
+                        #     general `fieldBinop_runOps_simT` /
+                        #     `fieldSqr_runOps_simT` sims at each step's probed
+                        #     `da`/`db` + the proven `fieldInv_runOps_sim` at the
+                        #     `_s_den` modular-inverse step + the 4 cleanup roll-
+                        #     drops) → the `composePoint_runOps_sim` build-back,
+                        #     reduced to `Crypto.Secp256k1.ecAdd`'s non-degenerate
+                        #     branch via `aaRx_aaRy_eq_affineAdd`. Carries INPUT-
+                        #     side wf hyps the bare axiom lacked: both points
+                        #     64-byte + the four `decomposePoint` decode bridges,
+                        #     the two `composePoint` num2binEncode? + BE bridges at
+                        #     the result coords, the two non-sentinel guards, and
+                        #     the non-degenerate case split `fieldMod (pointX pa) ≠
+                        #     fieldMod (pointX pb)` (the `pxm ≠ qxm` branch; the
+                        #     `P = ±Q` / doubling case routes through
+                        #     `affineDouble`, a SEPARATE codegen path NOT exercised
+                        #     by `emitEcAdd`'s straight-line affine-add). Anti-
+                        #     vacuity: `smoke_emitEcAdd_wf_satisfiable` (the
+                        #     fieldInv-free hyps on two distinct on-curve points
+                        #     G / 2G) + `smoke_emitEcAdd_runOps_eq_applies` (the
+                        #     discharge specialised to symbolic inputs FIRES).
+                        #     `#print axioms emitEcAdd_runOps_eq` = propext /
+                        #     Classical.choice / Quot.sound + the 2 pre-existing
+                        #     crypto backends (authBackend / hashBackend) only — NO
+                        #     sorryAx, NO Lean.ofReduceBool, NO new axiom, NOT
+                        #     depending on the removed axiom. native_decide ONLY in
+                        #     the wf-satisfiable smoke (fieldInv-free hyps).
+                        #     STILL AXIOMATIZED: `emitEcMul`/`emitEcMulGen`
+                        #     (257-iter Jacobian double-and-add loop, out of scope
+                        #     for the EC straight-line ops). EC IN-SCOPE COMPLETE.
+                        # Net delta: −1, 74 → 73.
+                        #
+                        # Breakdown (2026-05-25, Tier 3 EC wave —
                         # emitEcNegate codegen-to-spec axiom discharge):
                         # −1 in Crypto/Spec.lean §7 — `emitEcNegate_runOps_eq`
                         #     RETIRED, moved to a THEOREM in Stack/AgreesEC.lean

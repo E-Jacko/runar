@@ -7117,6 +7117,406 @@ theorem smoke_affineAddInc_head :
   unfold affineAddInc
   simp only [pickExtraOps, List.append_assoc, List.cons_append, List.nil_append, List.head?_cons]
 
+/-! ## Part 18 — affineAdd RUNTIME threading (deliverable 1)
+
+Off the post-decompose entry runtime stack `[qy, qx, py, px] ++ rest` (nm bottom→top
+`px,py,qx,qy`), thread the 24 determined `affineAddInc` steps to land the affine-add result
+`[ry, rx] ++ rest` (nm `[rx, ry]`, `ry` on TOS).  Each `copyToTop`/`toTop` step uses the
+depth-general `runOps_pickExtraOps` / `runOps_rollExtraOps` transports; each field-arith step
+uses the Part-16 depth-general sims (`fieldBinop_runOps_simT` / `fieldSqr_runOps_simT`) at the
+per-step `da`/`db` read off the matching `aaT{i}_ops` fact; the modular-inverse step uses the
+proven `fieldInv_runOps_sim`.  The result coordinates equal the non-degenerate (`pxm ≠ qxm`)
+branch of `Crypto.Secp256k1.affineAdd`.  All `propext`/`Quot.sound`(/`Classical.choice`)-clean
++ inherited backend opaques; NO new axiom, NO `native_decide` (smokes only). -/
+
+private theorem niDropAA : ∀ t e, StackOp.drop ≠ .ifOp t e := by intro t e h; cases h
+
+/-- **Pick step on an explicit `tracked ++ rest` stack.**  Running `pickExtraOps d`
+(`d < tracked.length`) copies `tracked[d]!` to the top, keeping all of `tracked ++ rest`. -/
+private theorem aaPickStep (s : StackState) (tracked rest : List Value) (d : Nat)
+    (hStk : s.stack = tracked ++ rest) (hd : d < tracked.length) :
+    runOps (pickExtraOps d) s = .ok { s with stack := tracked[d]! :: (tracked ++ rest) } := by
+  rw [runOps_pickExtraOps s d (by rw [hStk, List.length_append]; omega),
+      applyPick_append s tracked rest d hStk hd]
+  rw [show s.push tracked[d]! = { s with stack := tracked[d]! :: (tracked ++ rest) } by
+        unfold StackState.push; rw [hStk]]
+
+/-- **Field-binop step on an explicit `tracked ++ rest` stack.**  Running
+`fieldBinopGenInc da db binop` where the first operand `av` sits at depth `da` of `tracked`,
+and (after rolling it up so the stack becomes `av :: mid'`) the second operand `bv` sits at
+depth `db` of `av :: mid'` over the residual `av :: out`, lands `fieldMod (f av bv)` on top,
+over `out ++ rest`.  The two roll witnesses are discharged by `applyRoll_append` off the
+explicit prefixes `tracked` / `av :: mid'`. -/
+private theorem aaBinopStep (binop : String) (f : Int → Int → Int)
+    (s : StackState) (tracked rest mid' : List Value) (av bv : Int) (da db : Nat)
+    (out : List Value)
+    (hStk : s.stack = tracked ++ rest)
+    (hda : da < tracked.length)
+    (havDepth : tracked[da]! = Value.vBigint av)
+    (hmid : tracked.eraseIdx da = mid')
+    (hdb : db < (Value.vBigint av :: mid').length)
+    (hbvDepth : (Value.vBigint av :: mid')[db]! = Value.vBigint bv)
+    (hout : (Value.vBigint av :: mid').eraseIdx db = Value.vBigint av :: out)
+    (hBinop : ∀ (t : StackState), t.stack = .vBigint bv :: .vBigint av :: (out ++ rest)
+        → runOpcode binop t = .ok ({ t with stack := out ++ rest }.push (.vBigint (f av bv)))) :
+    runOps (fieldBinopGenInc da db binop) s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMod (f av bv)) :: (out ++ rest) } := by
+  have hRoll1 : applyRoll s da = .ok { s with stack := .vBigint av :: (mid' ++ rest) } := by
+    rw [applyRoll_append s tracked rest da hStk hda, havDepth, hmid]
+  have hRoll2 : applyRoll { s with stack := .vBigint av :: (mid' ++ rest) } db
+      = .ok { s with stack := .vBigint bv :: .vBigint av :: (out ++ rest) } := by
+    rw [applyRoll_append { s with stack := .vBigint av :: (mid' ++ rest) }
+          (.vBigint av :: mid') rest db (by rfl) hdb]
+    rw [hbvDepth]
+    congr 1
+    rw [hout]
+    simp only [List.cons_append]
+  exact fieldBinop_runOps_simT binop f s av bv da db (mid' ++ rest) (out ++ rest)
+    (by rw [hStk, List.length_append]; omega) hRoll1
+    (by simp only [List.length_cons, List.length_append] at hdb ⊢; omega) hRoll2 hBinop
+
+/-- **Field-square step on an explicit `tracked ++ rest` stack.**  Running
+`fieldSqrGenInc dp dm1 dm2` where the value `av` sits at depth `dp` of `tracked`: the pick
+copies `av`, then the inner mul squares the two copies.  After the copy push the stack prefix
+is `av :: tracked`; `dm1` rolls one `av` up (lands `av :: mid'`), `dm2` rolls the second `av`
+over it (lands `av :: av :: out`).  Both roll witnesses are discharged by `applyRoll_append`
+off the explicit prefixes `av :: tracked` / `av :: mid'`. -/
+private theorem aaSqrStep (s : StackState) (tracked rest : List Value) (av : Int)
+    (dp dm1 dm2 : Nat) (mid' out : List Value)
+    (hStk : s.stack = tracked ++ rest)
+    (hdp : dp < tracked.length)
+    (havDepth : tracked[dp]! = Value.vBigint av)
+    (hdm1 : dm1 < (Value.vBigint av :: tracked).length)
+    (hav1 : (Value.vBigint av :: tracked)[dm1]! = Value.vBigint av)
+    (hmid : (Value.vBigint av :: tracked).eraseIdx dm1 = mid')
+    (hdm2 : dm2 < (Value.vBigint av :: mid').length)
+    (hav2 : (Value.vBigint av :: mid')[dm2]! = Value.vBigint av)
+    (hout : (Value.vBigint av :: mid').eraseIdx dm2 = Value.vBigint av :: out) :
+    runOps (fieldSqrGenInc dp dm1 dm2) s
+      = .ok { s with stack := .vBigint (Crypto.Secp256k1.fieldMul av av) :: (out ++ rest) } := by
+  have hPick : applyPick s dp = .ok (s.push (Value.vBigint av)) := by
+    rw [applyPick_append s tracked rest dp hStk hdp, havDepth]
+  have hPushStk : (s.push (Value.vBigint av)).stack = (Value.vBigint av :: tracked) ++ rest := by
+    unfold StackState.push; rw [hStk]; rfl
+  have hRoll1 : applyRoll (s.push (Value.vBigint av)) dm1
+      = .ok { s with stack := .vBigint av :: (mid' ++ rest) } := by
+    rw [applyRoll_append (s.push (Value.vBigint av)) (Value.vBigint av :: tracked) rest dm1
+          hPushStk hdm1, hav1, hmid]
+    rfl
+  have hRoll2 : applyRoll { s with stack := .vBigint av :: (mid' ++ rest) } dm2
+      = .ok { s with stack := .vBigint av :: .vBigint av :: (out ++ rest) } := by
+    rw [applyRoll_append { s with stack := .vBigint av :: (mid' ++ rest) }
+          (Value.vBigint av :: mid') rest dm2 (by rfl) hdm2, hav2]
+    congr 1
+    rw [hout]; simp only [List.cons_append]
+  exact fieldSqr_runOps_simT s av dp dm1 dm2 (mid' ++ rest) (out ++ rest)
+    (by rw [hStk, List.length_append]; omega) hPick
+    (by rw [hPushStk, List.length_append] at *; simp only [List.length_cons] at hdm1 ⊢; omega)
+    hRoll1
+    (by simp only [List.length_cons, List.length_append] at hdm2 ⊢; omega) hRoll2
+
+/-- **Cleanup step transport (roll-then-drop) on a right-associated `(rollExtraOps d ++
+[.drop]) ++ tail` op-list.**  Rolls the depth-`d` element to the top, drops it, then continues
+with `tail` from the residual stack.  `tail`-general so it threads the four right-associated
+affineAdd cleanup drops without re-grouping. -/
+private theorem aaRollDropStepT (s : StackState) (tracked rest : List Value) (d : Nat)
+    (tail : List StackOp)
+    (hStk : s.stack = tracked ++ rest) (hd : d < tracked.length) :
+    runOps (rollExtraOps d ++ ([StackOp.drop] ++ tail)) s
+      = runOps tail { s with stack := tracked.eraseIdx d ++ rest } := by
+  rw [runOps_append, runOps_rollExtraOps s d (by rw [hStk, List.length_append]; omega),
+      applyRoll_append s tracked rest d hStk hd]
+  simp only [match_Except_ok_runOps, List.singleton_append]
+  rw [runOps_cons_nonIf_eq _ _ _ niDropAA, stepNonIf_drop]
+  rw [show applyDrop { s with stack := tracked[d]! :: (tracked.eraseIdx d ++ rest) }
+        = .ok { s with stack := tracked.eraseIdx d ++ rest } from rfl]
+
+open Crypto.Secp256k1 (fieldSub fieldMul fieldInv) in
+/-- The codegen affine-add `s` slope: `num · den⁻¹` with `num = qy − py`, `den = qx − px`. -/
+def aaSlope (px py qx qy : Int) : Int :=
+  fieldMul (fieldSub qy py) (fieldInv (fieldSub qx px))
+
+open Crypto.Secp256k1 (fieldSub fieldMul) in
+/-- The codegen affine-add `rx` result: `s² − px − qx`. -/
+def aaRx (px py qx qy : Int) : Int :=
+  fieldSub (fieldSub (fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy)) px) qx
+
+open Crypto.Secp256k1 (fieldSub fieldMul) in
+/-- The codegen affine-add `ry` result: `s · (px − rx) − py`. -/
+def aaRy (px py qx qy : Int) : Int :=
+  fieldSub (fieldMul (aaSlope px py qx qy) (fieldSub px (aaRx px py qx qy))) py
+
+set_option maxRecDepth 4096 in
+/-- **affineAdd runtime threading (deliverable 1).**  Running the determined 24-step
+`affineAddInc` increment on the post-decompose entry `[qy, qx, py, px] ++ rest` lands
+`[ry, rx] ++ rest` (`ry` on TOS, matching nm `[rx, ry]`), where `aaRx`/`aaRy` are the codegen
+affine-add result coordinates.  Threads each step via the depth-general sims
+(`fieldBinop_runOps_simT` / `fieldSqr_runOps_simT`) + the `fieldInv` sim + the four cleanup
+roll-then-drops.  These coords coincide with `Crypto.Secp256k1.affineAdd`'s non-degenerate
+branch (see `aaRx_aaRy_eq_affineAdd`). -/
+theorem affineAddInc_runOps (s : StackState) (px py qx qy : Int) (rest : List Value)
+    (hStk : s.stack = Value.vBigint qy :: Value.vBigint qx :: Value.vBigint py :: Value.vBigint px :: rest) :
+    runOps affineAddInc s
+      = .ok { s with stack :=
+          Value.vBigint (aaRy px py qx qy) :: Value.vBigint (aaRx px py qx qy) :: rest } := by
+  -- the codegen field-chain values, written as the `fieldMod (binop)` forms the sims land.
+  -- num = qy − py
+  have hn : Crypto.Secp256k1.fieldMod (qy - py) = Crypto.Secp256k1.fieldSub qy py := rfl
+  -- den = qx − px
+  have hd : Crypto.Secp256k1.fieldMod (qx - px) = Crypto.Secp256k1.fieldSub qx px := rfl
+  unfold affineAddInc
+  simp only [List.append_assoc]
+  have subOp : ∀ (bv av : Int) (o : List Value) (t : StackState),
+      t.stack = Value.vBigint bv :: Value.vBigint av :: o
+        → runOpcode "OP_SUB" t = .ok ({ t with stack := o }.push (Value.vBigint (av - bv))) :=
+    fun bv av o t ht => runOpcode_SUB_bigint_local t av bv o ht
+  have mulOp : ∀ (bv av : Int) (o : List Value) (t : StackState),
+      t.stack = Value.vBigint bv :: Value.vBigint av :: o
+        → runOpcode "OP_MUL" t = .ok ({ t with stack := o }.push (Value.vBigint (av * bv))) :=
+    fun bv av o t ht => runOpcode_MUL_bigint_local t av bv o ht
+  -- step 1: copyToTop qy (pick 0) → [qy, qy, qx, py, px] ++ rest
+  rw [runOps_append, aaPickStep s [Value.vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 0
+        hStk (by simp)]
+  simp only [List.getElem!_cons_zero, match_Except_ok_runOps]
+  -- step 2: copyToTop py (pick 3) → [py, qy, qy, qx, py, px] ++ rest
+  rw [runOps_append, aaPickStep _ [Value.vBigint qy, .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 3
+        rfl (by simp)]
+  simp only [show ([Value.vBigint qy, .vBigint qy, .vBigint qx, .vBigint py, .vBigint px][3]!) = Value.vBigint py from rfl,
+    match_Except_ok_runOps]
+  -- step 3: fieldSub _qy1 _py1 → num=fieldSub qy py.  da=1, db=1.
+  rw [runOps_append,
+      aaBinopStep "OP_SUB" (fun a b => a - b) _
+        [Value.vBigint py, .vBigint qy, .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest
+        [Value.vBigint py, .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        qy py 1 1 [Value.vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        rfl (by simp) rfl rfl (by simp) rfl rfl
+        (fun t ht => subOp py qy _ t ht)]
+  simp only [hn, match_Except_ok_runOps]
+  -- step 4: copyToTop qx (pick 2) → [qx, N, qy, qx, py, px] ++ rest
+  rw [runOps_append, aaPickStep _
+        [Value.vBigint (Crypto.Secp256k1.fieldSub qy py), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 2
+        rfl (by simp)]
+  simp only [show ([Value.vBigint (Crypto.Secp256k1.fieldSub qy py), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px][2]!) = Value.vBigint qx from rfl,
+    match_Except_ok_runOps]
+  -- step 5: copyToTop px (pick 5) → [px, qx, N, qy, qx, py, px] ++ rest
+  rw [runOps_append, aaPickStep _
+        [Value.vBigint qx, .vBigint (Crypto.Secp256k1.fieldSub qy py), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 5
+        rfl (by simp)]
+  simp only [show ([Value.vBigint qx, .vBigint (Crypto.Secp256k1.fieldSub qy py), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px][5]!) = Value.vBigint px from rfl,
+    match_Except_ok_runOps]
+  -- step 6: fieldSub _qx1 _px1 → D=fieldSub qx px.  da=1, db=1.
+  rw [runOps_append,
+      aaBinopStep "OP_SUB" (fun a b => a - b) _
+        [Value.vBigint px, .vBigint qx, .vBigint (Crypto.Secp256k1.fieldSub qy py), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest
+        [Value.vBigint px, .vBigint (Crypto.Secp256k1.fieldSub qy py), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        qx px 1 1 [Value.vBigint (Crypto.Secp256k1.fieldSub qy py), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        rfl (by simp) rfl rfl (by simp) rfl rfl
+        (fun t ht => subOp px qx _ t ht)]
+  simp only [hd, match_Except_ok_runOps]
+  -- step 7: fieldInv _s_den (depth 0, TOS) → DI=fieldInv D
+  rw [runOps_append, fieldInv_runOps_sim _ (Crypto.Secp256k1.fieldSub qx px)
+        (Value.vBigint (Crypto.Secp256k1.fieldSub qy py) :: .vBigint qy :: .vBigint qx :: .vBigint py :: .vBigint px :: rest) rfl]
+  simp only [match_Except_ok_runOps]
+  -- step 8: fieldMul _s_num _s_den_inv → SL=fieldMul N DI.  da=1, db=1.
+  rw [runOps_append,
+      aaBinopStep "OP_MUL" (fun a b => a * b) _
+        [Value.vBigint (Crypto.Secp256k1.fieldInv (Crypto.Secp256k1.fieldSub qx px)),
+          .vBigint (Crypto.Secp256k1.fieldSub qy py), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest
+        [Value.vBigint (Crypto.Secp256k1.fieldInv (Crypto.Secp256k1.fieldSub qx px)),
+          .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        (Crypto.Secp256k1.fieldSub qy py) (Crypto.Secp256k1.fieldInv (Crypto.Secp256k1.fieldSub qx px)) 1 1
+        [Value.vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        rfl (by simp) rfl rfl (by simp) rfl rfl
+        (fun t ht => mulOp (Crypto.Secp256k1.fieldInv (Crypto.Secp256k1.fieldSub qx px)) (Crypto.Secp256k1.fieldSub qy py) _ t ht)]
+  simp only [show Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.fieldSub qy py * Crypto.Secp256k1.fieldInv (Crypto.Secp256k1.fieldSub qx px))
+        = Crypto.Secp256k1.fieldMul (Crypto.Secp256k1.fieldSub qy py) (Crypto.Secp256k1.fieldInv (Crypto.Secp256k1.fieldSub qx px)) from rfl,
+    match_Except_ok_runOps]
+  -- abbreviate the slope SL = aaSlope (the result of step 8 on TOS)
+  -- step 9: copyToTop _s (pick 0, dup) → [SL, SL, qy, qx, py, px] ++ rest
+  rw [runOps_append, aaPickStep _
+        [Value.vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 0
+        rfl (by simp)]
+  simp only [List.getElem!_cons_zero, match_Except_ok_runOps]
+  -- step 10: fieldSqr _s (dp=1, dm1=2, dm2=1) → SQ = fieldMul SL SL
+  rw [runOps_append,
+      aaSqrStep _
+        [Value.vBigint (aaSlope px py qx qy), .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest
+        (aaSlope px py qx qy) 1 2 1
+        [Value.vBigint (aaSlope px py qx qy), .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        [Value.vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        rfl (by simp) rfl (by simp) rfl rfl (by simp) rfl rfl]
+  simp only [match_Except_ok_runOps]
+  -- step 11: copyToTop px (pick 5) → [px, SQ, SL, qy, qx, py, px] ++ rest
+  rw [runOps_append, aaPickStep _
+        [Value.vBigint (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy)),
+          .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 5
+        rfl (by simp)]
+  simp only [show ([Value.vBigint (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy)),
+          .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px][5]!) = Value.vBigint px from rfl,
+    match_Except_ok_runOps]
+  -- step 12: fieldSub _s2 _px2 → R1 = fieldSub SQ px.  da=1, db=1.
+  rw [runOps_append,
+      aaBinopStep "OP_SUB" (fun a b => a - b) _
+        [Value.vBigint px, .vBigint (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy)),
+          .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest
+        [Value.vBigint px, .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy)) px 1 1
+        [Value.vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        rfl (by simp) rfl rfl (by simp) rfl rfl
+        (fun t ht => subOp px (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy)) _ t ht)]
+  simp only [match_Except_ok_runOps]
+  -- step 13: copyToTop qx (pick 3) → [qx, R1, SL, qy, qx, py, px] ++ rest
+  rw [runOps_append, aaPickStep _
+        [Value.vBigint (Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy) - px)),
+          .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 3
+        rfl (by simp)]
+  simp only [show ([Value.vBigint (Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy) - px)),
+          .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px][3]!) = Value.vBigint qx from rfl,
+    match_Except_ok_runOps]
+  -- step 14: fieldSub _rx1 _qx2 → RX = fieldSub R1 qx = aaRx.  da=1, db=1.
+  rw [runOps_append,
+      aaBinopStep "OP_SUB" (fun a b => a - b) _
+        [Value.vBigint qx,
+          .vBigint (Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy) - px)),
+          .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest
+        [Value.vBigint qx, .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        (Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy) - px)) qx 1 1
+        [Value.vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        rfl (by simp) rfl rfl (by simp) rfl rfl
+        (fun t ht => subOp qx (Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy) - px)) _ t ht)]
+  simp only [match_Except_ok_runOps]
+  -- fold the step-14 result to `aaRx`
+  rw [show Crypto.Secp256k1.fieldMod
+        (Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (aaSlope px py qx qy) - px) - qx)
+        = aaRx px py qx qy from rfl]
+  -- step 15: copyToTop px (pick 5) → [px, RX, SL, qy, qx, py, px] ++ rest
+  rw [runOps_append, aaPickStep _
+        [Value.vBigint (aaRx px py qx qy), .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 5
+        rfl (by simp)]
+  simp only [show ([Value.vBigint (aaRx px py qx qy), .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px][5]!) = Value.vBigint px from rfl,
+    match_Except_ok_runOps]
+  -- step 16: copyToTop rx (pick 1) → [RX, px, RX, SL, qy, qx, py, px] ++ rest
+  rw [runOps_append, aaPickStep _
+        [Value.vBigint px, .vBigint (aaRx px py qx qy), .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 1
+        rfl (by simp)]
+  simp only [show ([Value.vBigint px, .vBigint (aaRx px py qx qy), .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px][1]!) = Value.vBigint (aaRx px py qx qy) from rfl,
+    match_Except_ok_runOps]
+  -- step 17: fieldSub _px3 _rx2 → PR = fieldSub px RX.  da=1, db=1.
+  rw [runOps_append,
+      aaBinopStep "OP_SUB" (fun a b => a - b) _
+        [Value.vBigint (aaRx px py qx qy), .vBigint px, .vBigint (aaRx px py qx qy), .vBigint (aaSlope px py qx qy),
+          .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest
+        [Value.vBigint (aaRx px py qx qy), .vBigint (aaRx px py qx qy), .vBigint (aaSlope px py qx qy),
+          .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        px (aaRx px py qx qy) 1 1
+        [Value.vBigint (aaRx px py qx qy), .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        rfl (by simp) rfl rfl (by simp) rfl rfl
+        (fun t ht => subOp (aaRx px py qx qy) px _ t ht)]
+  simp only [show Crypto.Secp256k1.fieldMod (px - aaRx px py qx qy) = Crypto.Secp256k1.fieldSub px (aaRx px py qx qy) from rfl,
+    match_Except_ok_runOps]
+  -- step 18: fieldMul _s_keep _px_rx → SP = fieldMul SL PR.  da=2, db=1.
+  rw [runOps_append,
+      aaBinopStep "OP_MUL" (fun a b => a * b) _
+        [Value.vBigint (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy)), .vBigint (aaRx px py qx qy),
+          .vBigint (aaSlope px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest
+        [Value.vBigint (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy)), .vBigint (aaRx px py qx qy),
+          .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        (aaSlope px py qx qy) (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy)) 2 1
+        [Value.vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        rfl (by simp) rfl rfl (by simp) rfl rfl
+        (fun t ht => mulOp (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy)) (aaSlope px py qx qy) _ t ht)]
+  simp only [show Crypto.Secp256k1.fieldMod (aaSlope px py qx qy * Crypto.Secp256k1.fieldSub px (aaRx px py qx qy))
+        = Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy)) from rfl,
+    match_Except_ok_runOps]
+  -- step 19: copyToTop py (pick 4) → [py, SP, RX, qy, qx, py, px] ++ rest
+  rw [runOps_append, aaPickStep _
+        [Value.vBigint (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy))),
+          .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 4
+        rfl (by simp)]
+  simp only [show ([Value.vBigint (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy))),
+          .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px][4]!) = Value.vBigint py from rfl,
+    match_Except_ok_runOps]
+  -- step 20: fieldSub _s_px_rx _py2 → RY = fieldSub SP py = aaRy.  da=1, db=1.
+  rw [runOps_append,
+      aaBinopStep "OP_SUB" (fun a b => a - b) _
+        [Value.vBigint py,
+          .vBigint (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy))),
+          .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest
+        [Value.vBigint py, .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy))) py 1 1
+        [Value.vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px]
+        rfl (by simp) rfl rfl (by simp) rfl rfl
+        (fun t ht => subOp py (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy))) _ t ht)]
+  simp only [show Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.fieldMul (aaSlope px py qx qy) (Crypto.Secp256k1.fieldSub px (aaRx px py qx qy)) - py)
+        = aaRy px py qx qy from rfl,
+    match_Except_ok_runOps]
+  -- cleanup steps 21-24: drop px, py, qx, qy → [RY, RX] ++ rest (right-associated drops).
+  -- step 21: drop px (roll 5, drop)
+  rw [aaRollDropStepT _
+        [Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px] rest 5 _
+        rfl (by simp)]
+  simp only [show ([Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py, .vBigint px].eraseIdx 5)
+        = [Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py] from rfl]
+  -- step 22: drop py (roll 4, drop)
+  rw [aaRollDropStepT _
+        [Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py] rest 4 _
+        rfl (by simp)]
+  simp only [show ([Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx, .vBigint py].eraseIdx 4)
+        = [Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx] from rfl]
+  -- step 23: drop qx (roll 3, drop)
+  rw [aaRollDropStepT _
+        [Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx] rest 3 _
+        rfl (by simp)]
+  simp only [show ([Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy, .vBigint qx].eraseIdx 3)
+        = [Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy] from rfl]
+  -- step 24: drop qy (rot, drop) → [RY, RX] ++ rest
+  rw [show (rollExtraOps 2 ++ [StackOp.drop] : List StackOp)
+        = rollExtraOps 2 ++ ([StackOp.drop] ++ []) from by simp]
+  rw [aaRollDropStepT _
+        [Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy] rest 2 []
+        rfl (by simp)]
+  rw [runOps_nil,
+      show ([Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy), .vBigint qy].eraseIdx 2)
+        = [Value.vBigint (aaRy px py qx qy), .vBigint (aaRx px py qx qy)] from rfl]
+  simp only [List.cons_append, List.nil_append]
+
+/-- **The codegen affine-add coords equal `Crypto.Secp256k1.affineAdd`'s non-degenerate branch.**
+Under the non-degenerate hypotheses — neither input is the sentinel zero-point and
+`fieldMod px ≠ fieldMod qx` (so the affine formula takes the `pxm ≠ qxm` branch, NOT the
+`affineDouble` fallback) — `affineAdd px py qx qy = (aaRx px py qx qy, aaRy px py qx qy)`.
+The codegen names mirror the spec's `num`/`den`/`s`/`rx`/`ry` exactly (definitional). -/
+theorem aaRx_aaRy_eq_affineAdd (px py qx qy : Int)
+    (hp : ¬ (px = 0 ∧ py = 0)) (hq : ¬ (qx = 0 ∧ qy = 0))
+    (hne : Crypto.Secp256k1.fieldMod px ≠ Crypto.Secp256k1.fieldMod qx) :
+    Crypto.Secp256k1.affineAdd px py qx qy = (aaRx px py qx qy, aaRy px py qx qy) := by
+  unfold Crypto.Secp256k1.affineAdd
+  rw [if_neg hp, if_neg hq, if_neg hne]
+  rfl
+
+/-! ### MANDATORY smokes for the affineAdd runtime threading (deliverable 1) -/
+
+/-- Concrete entry stack for the affineAdd-threading smoke: `[qy, qx, py, px]` = `[44, 33, 22, 11]`
+with a passive tail `[999]` beneath. -/
+private def smokeAAStk : StackState :=
+  { (default : StackState) with
+    stack := [.vBigint 44, .vBigint 33, .vBigint 22, .vBigint 11, .vBigint 999] }
+
+/-- SMOKE (the affineAdd runtime threading FIRES, anti-vacuity).  Running `affineAddInc` on the
+concrete post-decompose entry `[44, 33, 22, 11] ++ [999]` lands `[aaRy, aaRx] ++ [999]` (`aaRy`
+on TOS), with the passive tail `[999]` preserved beneath — the whole 24-step chain reduces. -/
+theorem smoke_affineAddInc_runOps :
+    runOps affineAddInc smokeAAStk
+      = .ok { smokeAAStk with
+          stack := .vBigint (aaRy 11 22 33 44) :: .vBigint (aaRx 11 22 33 44) :: [.vBigint 999] } :=
+  affineAddInc_runOps smokeAAStk 11 22 33 44 [.vBigint 999] rfl
+
+/-- SMOKE (the affineAdd↔spec bridge FIRES, anti-vacuity).  On two distinct concrete
+non-sentinel coords with `fieldMod 11 ≠ fieldMod 33`, the spec `affineAdd` equals the codegen
+`(aaRx, aaRy)` pair — the non-degenerate branch is genuinely taken. -/
+theorem smoke_aaRx_aaRy_eq_affineAdd :
+    Crypto.Secp256k1.affineAdd 11 22 33 44 = (aaRx 11 22 33 44, aaRy 11 22 33 44) :=
+  aaRx_aaRy_eq_affineAdd 11 22 33 44 (by decide) (by decide) (by decide)
+
 /-- SMOKE (`fieldInv_nm_depth0` FIRES).  On a concrete depth-0 entry (`nm = [_pa, a]`, `a` on
 TOS), `fieldInv` lands `nm = [_pa, r]` — input consumed, inverse on TOS. -/
 theorem smoke_fieldInv_nm_depth0 :
@@ -7517,9 +7917,9 @@ computed from each step's nm) + the proven `fieldInv_runOps_sim` at the `_s_den`
 `decomposePoint_runOps` bases and the `composePoint_runOps_sim` build-back, reduced to the
 non-degenerate (`pxm ≠ qxm`) branch of `Crypto.Secp256k1.affineAdd` → `Crypto.Secp256k1.ecAdd`.  The
 OP-LIST half (`emitEcAdd_ops`) and the affineAdd transport are now WIRED; the runtime per-step
-threading (≈24 sequential `runOps` reductions at probed depths) is the unstarted remainder.  The
-`Crypto.Spec.emitEcAdd_runOps_eq` axiom therefore REMAINS; drift stays 74 until the runtime threading
-lands. -/
+threading (24 sequential `runOps` reductions at probed depths) is LANDED in Part 18-19
+(`affineAddInc_runOps` / `ecaDp2_runOps` / `emitEcAdd_runOps_eq`).  The
+`Crypto.Spec.emitEcAdd_runOps_eq` axiom is therefore DISCHARGED (drift 74 → 73). -/
 
 
 /-! ## Part 15 (cont.) — `fieldInv` op-list bridge + affineAdd + `emitEcAdd` discharge: HONEST BLOCK
@@ -7606,16 +8006,13 @@ Script-VM stack by genuine structural induction on the loop count.  What REMAINS
    `affineDouble`, a SEPARATE codegen path NOT exercised by `emitEcAdd`'s straight-line
    affine-add, so excluded by hypothesis).
 
-The `Crypto.Spec.emitEcAdd_runOps_eq` axiom therefore REMAINS for now; drift stays at 74.
-LANDED this wave: (sub-goal 2) the depth-general field sims `fieldBinop_runOps_simT` /
-`fieldSqr_runOps_simT` the affineAdd threading needs, each with a smoke; and (sub-goal 3,
-entry → fieldInv splice) the `affineAdd_ops` entry scaffolding `aaT0…aaT6` + the `fieldInv`
-splice `aaT7_ops` (the depth-0 `_s_den` junction joining affineAdd to the END-TO-END-verified
-`fieldInv`) + the missing `fieldSub_ops_concrete` peer.  REMAINING for the ecAdd discharge:
-complete sub-goal 3 (steps 8-20 — straight-line continuation of the aaT6 pattern, no new
-machinery) and sub-goal 4 (the runtime threading through all steps via the Part-16 sims + the
-discharge to `Crypto.Secp256k1.ecAdd`).  The `fieldInv` END-TO-END verification (op-list ⟷
-runtime ⟷ spec) from the prior wave is unchanged and is now WIRED into the affineAdd chain. -/
+The `Crypto.Spec.emitEcAdd_runOps_eq` axiom is now DISCHARGED (drift 74 → 73): Part 18 lands the
+full 24-step affineAdd runtime threading (`affineAddInc_runOps`) via the Part-16 depth-general
+sims + the proven `fieldInv_runOps_sim`, and Part 19 lands the two-decompose runtime
+(`ecaDp2_runOps`) + the `composePoint_runOps_sim` build-back, composed into
+`emitEcAdd_runOps_eq` and reduced to `Crypto.Secp256k1.ecAdd`'s non-degenerate branch via
+`aaRx_aaRy_eq_affineAdd`.  The `fieldInv` END-TO-END verification (op-list ⟷ runtime ⟷ spec) from
+the prior wave is WIRED into the affineAdd chain at the `_s_den` modular-inverse step. -/
 
 /-! ### General-entry affineAdd transport — `rebasable_fieldInv` (route 1: local-irreducible loops).
 
@@ -8068,5 +8465,302 @@ theorem emitEcAdd_ops : Ec.emitEcAdd = expectedEcAdd := by
 determined `emitEcAdd` op-list's head is the first `decomposePoint` op (`OP_SPLIT`-prep `push 32`). -/
 theorem smoke_emitEcAdd_ops_head :
     Ec.emitEcAdd.head? = (expectedEcAdd).head? := by rw [emitEcAdd_ops]
+
+/-! ## Part 19 — `emitEcAdd` two-decompose runtime + the `emitEcAdd_runOps_eq` discharge
+
+The op-list is `expectedEcAdd = ecaDp2.ops.toList ++ affineAddInc ++ composeRxRyInc`.  This Part
+threads the runtime: the two decomposes (off the entry `[pb, pa] ++ rest`) land
+`[qy, qx, py, px] ++ rest` (= `[pointY pb, pointX pb, pointY pa, pointX pa] ++ rest`), the proven
+`affineAddInc_runOps` (Part 18) lands `[ry, rx] ++ rest`, and `composePoint_runOps_sim` (Part 14)
+builds back `[makePoint rx ry] ++ rest = [ecAdd pa pb] ++ rest`. -/
+
+set_option maxRecDepth 8192 in
+/-- **`ecaDp1` op-list** = the leading `toTop _pa` roll (`[.swap]`, depth 1) ++ the determined
+single-decompose body `expectedDecomposePoint` (name-free).  Mirrors `decomposePoint_ops` with the
+first `findDepth` folding to 1 (`_pa` at depth 1 in `[_pa, _pb]`). -/
+theorem ecaDp1_ops : ecaDp1.ops.toList = rollExtraOps 1 ++ expectedDecomposePoint := by
+  show (daT4.toTop "_dp_xb" |>.rawBlock 1 (some "px")
+        (Ec.emitReverse32Ops ++ dpConvTail) |>.swap).ops.toList = _
+  rw [swap_ops_append, rawBlock_ops_append, toTop_ops_append, daT4_fd1]
+  show (daT4.ops.toList ++ rollExtraOps 1 ++ (Ec.emitReverse32Ops ++ dpConvTail)
+        ++ [StackOp.swap]) = _
+  rw [daT4, rawBlock_ops_append]
+  show ((daT3.ops.toList ++ (Ec.emitReverse32Ops ++ dpConvTail)) ++ rollExtraOps 1
+        ++ (Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]) = _
+  rw [daT3]
+  show ((daT2.ops.toList ++ (Ec.emitReverse32Ops ++ dpConvTail)) ++ rollExtraOps 1
+        ++ (Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]) = _
+  rw [daT2, rawBlock_ops_append, daT1, toTop_ops_append]
+  rw [show (Ec.Tracker.init [some "_pa", some "_pb"]).findDepth "_pa" = 1 from by
+    rw [findDepth_eq_findDepthList _ _ (by unfold Ec.Tracker.init; decide)]
+    unfold Ec.Tracker.init; decide]
+  simp only [rollExtraOps, Ec.Tracker.init, dpConvTail, expectedDecomposePoint]
+  rfl
+
+set_option maxRecDepth 8192 in
+/-- **`ecaDp2` op-list** = `ecaDp1.ops ++ ([.rot] ++ expectedDecomposePoint)`.  The second
+decompose's leading `toTop _pb` rolls from depth 2 (`rollExtraOps 2 = [.rot]`), then the same
+determined body. -/
+theorem ecaDp2_ops :
+    ecaDp2.ops.toList = ecaDp1.ops.toList ++ (rollExtraOps 2 ++ expectedDecomposePoint) := by
+  show (dbT4.toTop "_dp_xb" |>.rawBlock 1 (some "qx")
+        (Ec.emitReverse32Ops ++ dpConvTail) |>.swap).ops.toList = _
+  rw [swap_ops_append, rawBlock_ops_append, toTop_ops_append, dbT4_fd1]
+  show (dbT4.ops.toList ++ rollExtraOps 1 ++ (Ec.emitReverse32Ops ++ dpConvTail)
+        ++ [StackOp.swap]) = _
+  rw [dbT4, rawBlock_ops_append]
+  show ((dbT3.ops.toList ++ (Ec.emitReverse32Ops ++ dpConvTail)) ++ rollExtraOps 1
+        ++ (Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]) = _
+  rw [dbT3]
+  show ((dbT2.ops.toList ++ (Ec.emitReverse32Ops ++ dpConvTail)) ++ rollExtraOps 1
+        ++ (Ec.emitReverse32Ops ++ dpConvTail) ++ [StackOp.swap]) = _
+  rw [dbT2, rawBlock_ops_append, dbT1, toTop_ops_append]
+  rw [show ecaDp1.findDepth "_pb" = 2 from by
+    rw [findDepth_eq_findDepthList _ _ (by rw [ecaDp1_nm]; decide)]; rw [ecaDp1_nm]; decide]
+  simp only [rollExtraOps, dpConvTail, expectedDecomposePoint, List.append_assoc]
+
+set_option maxRecDepth 8192 in
+/-- **Roll-prefixed decompose runtime transport.**  Running `rollExtraOps d ++ expectedDecomposePoint`
+on `tracked ++ rest` where the depth-`d` element is the point blob `vBytes p` (`64 ≤ p.size`):
+the roll brings the blob to the top, then `decomposePoint_op_transport` decodes it, landing
+`[pointY p, pointX p] ++ (tracked.eraseIdx d ++ rest)`.  The two `emitEcAdd` decomposes use this. -/
+private theorem rollDecompose_runOps (s : StackState) (tracked rest : List Value) (d : Nat) (p : ByteArray)
+    (hStk : s.stack = tracked ++ rest) (hd : d < tracked.length)
+    (hBlob : tracked[d]! = Value.vBytes p) (hSize : 64 ≤ p.size)
+    (hDecX : decodeMinimalLE (reverseAcc 32 (p.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointX p)
+    (hDecY : decodeMinimalLE (reverseAcc 32 (p.extract 32 p.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointY p) :
+    runOps (rollExtraOps d ++ expectedDecomposePoint) s
+      = .ok { s with stack := Value.vBigint (Crypto.Secp256k1.pointY p) :: Value.vBigint (Crypto.Secp256k1.pointX p)
+                :: (tracked.eraseIdx d ++ rest) } := by
+  rw [runOps_append, runOps_rollExtraOps s d (by rw [hStk, List.length_append]; omega),
+      applyRoll_append s tracked rest d hStk hd, hBlob]
+  simp only [match_Except_ok_runOps]
+  rw [decomposePoint_op_transport
+        { s with stack := .vBytes p :: (tracked.eraseIdx d ++ rest) } p (tracked.eraseIdx d ++ rest) rfl hSize,
+      hDecX, hDecY]
+
+set_option maxRecDepth 8192 in
+/-- **`emitEcAdd` two-decompose runtime.**  Running `ecaDp2.ops.toList` on the entry
+`[pb, pa] ++ rest` lands `[pointY pb, pointX pb, pointY pa, pointX pa] ++ rest` — the affineAdd
+entry stack.  Threads the two `rollDecompose_runOps` (depth-1 `_pa`, then depth-2 `_pb`). -/
+theorem ecaDp2_runOps (s : StackState) (pa pb : ByteArray) (rest : List Value)
+    (hStk : s.stack = .vBytes pb :: .vBytes pa :: rest)
+    (hSizeA : 64 ≤ pa.size) (hSizeB : 64 ≤ pb.size)
+    (hDecXa : decodeMinimalLE (reverseAcc 32 (pa.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointX pa)
+    (hDecYa : decodeMinimalLE (reverseAcc 32 (pa.extract 32 pa.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointY pa)
+    (hDecXb : decodeMinimalLE (reverseAcc 32 (pb.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointX pb)
+    (hDecYb : decodeMinimalLE (reverseAcc 32 (pb.extract 32 pb.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointY pb) :
+    runOps ecaDp2.ops.toList s
+      = .ok { s with stack :=
+          Value.vBigint (Crypto.Secp256k1.pointY pb) :: Value.vBigint (Crypto.Secp256k1.pointX pb)
+            :: Value.vBigint (Crypto.Secp256k1.pointY pa) :: Value.vBigint (Crypto.Secp256k1.pointX pa) :: rest } := by
+  rw [ecaDp2_ops, ecaDp1_ops]
+  -- decompose 1: roll _pa (depth 1, swap) → decode pa → [pointY pa, pointX pa, pb] ++ rest
+  rw [runOps_append,
+      rollDecompose_runOps s [Value.vBytes pb, .vBytes pa] rest 1 pa hStk (by simp) rfl
+        hSizeA hDecXa hDecYa]
+  simp only [show ([Value.vBytes pb, .vBytes pa].eraseIdx 1) = [Value.vBytes pb] from rfl,
+    List.cons_append, List.nil_append, match_Except_ok_runOps]
+  -- decompose 2: roll _pb (depth 2, rot) → decode pb → [pointY pb, pointX pb, pointY pa, pointX pa] ++ rest
+  rw [rollDecompose_runOps _
+        [Value.vBigint (Crypto.Secp256k1.pointY pa), .vBigint (Crypto.Secp256k1.pointX pa), .vBytes pb] rest 2 pb
+        rfl (by simp) rfl hSizeB hDecXb hDecYb]
+  simp only [show ([Value.vBigint (Crypto.Secp256k1.pointY pa), .vBigint (Crypto.Secp256k1.pointX pa), .vBytes pb].eraseIdx 2)
+        = [Value.vBigint (Crypto.Secp256k1.pointY pa), .vBigint (Crypto.Secp256k1.pointX pa)] from rfl,
+    List.cons_append, List.nil_append]
+
+/-- **`composeRxRyInc = composeInc`.**  The determined `composePoint "rx" "ry" "_result"` increment
+off the `[rx, ry]`-nm anchor is the same name-free build-back op-list `composePoint_runOps_sim`
+consumes (mirrors `enComposePoint_ops` for the `[_nx, _neg_y]` anchor). -/
+theorem composeRxRyInc_eq : composeRxRyInc = composeInc := by
+  unfold composeRxRyInc
+  rw [show Ec.composePoint ⟨#[some "rx", some "ry"], #[]⟩ "rx" "ry" "_result"
+        = ((((((((⟨#[some "rx", some "ry"], #[]⟩ : Ec.Tracker).toTop "rx").rawBlock 1 (some "_cp_xb") coordEncodeOps).toTop "ry").rawBlock
+            1 (some "_cp_yb") coordEncodeOps).toTop "_cp_xb").toTop "_cp_yb").rawBlock 2 (some "_result")
+            [.opcode "OP_CAT"]) from rfl]
+  have hc1_nm : ((⟨#[some "rx", some "ry"], #[]⟩ : Ec.Tracker).toTop "rx").nm = #[some "ry", some "rx"] := by
+    rw [toTop_nm_canonical ⟨#[some "rx", some "ry"], #[]⟩ "rx" 1
+          (fd_of_nm ⟨#[some "rx", some "ry"], #[]⟩ "rx" 1 _ rfl (by decide) (by decide)) (by decide)]
+    apply Array.ext' <;> simp
+  have hc2_nm : (((⟨#[some "rx", some "ry"], #[]⟩ : Ec.Tracker).toTop "rx").rawBlock 1 (some "_cp_xb") coordEncodeOps).nm
+      = #[some "ry", some "_cp_xb"] := by
+    rw [rawBlock_nm_some1, hc1_nm]; rfl
+  have hc3_nm : ((((⟨#[some "rx", some "ry"], #[]⟩ : Ec.Tracker).toTop "rx").rawBlock 1 (some "_cp_xb") coordEncodeOps).toTop "ry").nm
+      = #[some "_cp_xb", some "ry"] := by
+    rw [toTop_nm_canonical _ "ry" 1
+          (fd_of_nm _ "ry" 1 _ hc2_nm (by decide) (by decide)) (by rw [hc2_nm]; decide), hc2_nm]
+    apply Array.ext' <;> simp
+  have hc4_nm : (((((⟨#[some "rx", some "ry"], #[]⟩ : Ec.Tracker).toTop "rx").rawBlock 1 (some "_cp_xb") coordEncodeOps).toTop "ry").rawBlock
+        1 (some "_cp_yb") coordEncodeOps).nm = #[some "_cp_xb", some "_cp_yb"] := by
+    rw [rawBlock_nm_some1, hc3_nm]; rfl
+  have hc5_nm : ((((((⟨#[some "rx", some "ry"], #[]⟩ : Ec.Tracker).toTop "rx").rawBlock 1 (some "_cp_xb") coordEncodeOps).toTop "ry").rawBlock
+        1 (some "_cp_yb") coordEncodeOps).toTop "_cp_xb").nm = #[some "_cp_yb", some "_cp_xb"] := by
+    rw [toTop_nm_canonical _ "_cp_xb" 1
+          (fd_of_nm _ "_cp_xb" 1 _ hc4_nm (by decide) (by decide)) (by rw [hc4_nm]; decide), hc4_nm]
+    apply Array.ext' <;> simp
+  rw [rawBlock_ops_append, toTop_ops_append, toTop_ops_append, rawBlock_ops_append,
+      toTop_ops_append, rawBlock_ops_append, toTop_ops_append]
+  rw [fd_of_nm ⟨#[some "rx", some "ry"], #[]⟩ "rx" 1 _ rfl (by decide) (by decide),
+      fd_of_nm _ "ry" 1 _ hc2_nm (by decide) (by decide),
+      fd_of_nm _ "_cp_xb" 1 _ hc4_nm (by decide) (by decide),
+      fd_of_nm _ "_cp_yb" 1 _ hc5_nm (by decide) (by decide)]
+  simp only [composeInc, coordEncodeOps, rollExtraOps, List.append_assoc, List.nil_append, List.cons_append,
+    List.singleton_append]
+
+set_option maxRecDepth 8192 in
+/-- **DISCHARGED — `emitEcAdd` agrees with `Crypto.Secp256k1.ecAdd` (non-degenerate branch).**
+Running the determined op-list on `[pb, pa] ++ rest` threads the two `decomposePoint` bases
+(`ecaDp2_runOps`) → the 24-step `affineAddInc` field chain (`affineAddInc_runOps`) →
+`composePoint_runOps_sim` build-back, landing `vBytes (ecAdd pa pb) :: rest`.
+
+INPUT-side wf hypotheses (the honest hypotheses the bare axiom lacked):
+* both points 64 bytes + the four `decomposePoint` canonical-decode bridges (the
+  `emitEcPointX/Y` carry, here for `pa` and `pb`);
+* the two `composePoint` `OP_NUM2BIN`-encode + BE bridges at the result coords `aaRx`/`aaRy`;
+* **non-degeneracy**: neither input is the sentinel zero-point and `pointX pa ≢ pointX pb (mod p)`
+  — so the affine formula takes the `pxm ≠ qxm` branch.  The `P = ±Q` / doubling case routes
+  through `Crypto.Secp256k1.affineDouble`, a SEPARATE codegen path NOT exercised by `emitEcAdd`'s
+  straight-line affine-add, hence excluded by hypothesis.
+
+`propext`/`Quot.sound`(/`Classical.choice`)-clean + inherited backend opaques, NO new axiom,
+NO `sorryAx`, NO `native_decide`.  Replaces the `Crypto.Spec.emitEcAdd_runOps_eq` axiom. -/
+theorem emitEcAdd_runOps_eq (stkSt : StackState) (pa pb : ByteArray) (rest : List Value)
+    (hStk : stkSt.stack = .vBytes pb :: .vBytes pa :: rest)
+    (hSizeA : 64 ≤ pa.size) (hSizeB : 64 ≤ pb.size)
+    (hDecXa : decodeMinimalLE (reverseAcc 32 (pa.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointX pa)
+    (hDecYa : decodeMinimalLE (reverseAcc 32 (pa.extract 32 pa.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointY pa)
+    (hDecXb : decodeMinimalLE (reverseAcc 32 (pb.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointX pb)
+    (hDecYb : decodeMinimalLE (reverseAcc 32 (pb.extract 32 pb.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointY pb)
+    (encRx encRy : ByteArray)
+    (hEncRx : num2binEncode? (aaRx (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa)
+                (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb)) 33 = some encRx)
+    (hEncRy : num2binEncode? (aaRy (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa)
+                (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb)) 33 = some encRy)
+    (hSzRx : (32 : Nat) ≤ encRx.size) (hSzRy : (32 : Nat) ≤ encRy.size)
+    (hBeRx : reverseAcc 32 (encRx.extract 0 32) ByteArray.empty
+              = Crypto.Secp256k1.intToBE32 (aaRx (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa)
+                  (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb)))
+    (hBeRy : reverseAcc 32 (encRy.extract 0 32) ByteArray.empty
+              = Crypto.Secp256k1.intToBE32 (aaRy (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa)
+                  (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb)))
+    (hPa : ¬ (Crypto.Secp256k1.pointX pa = 0 ∧ Crypto.Secp256k1.pointY pa = 0))
+    (hPb : ¬ (Crypto.Secp256k1.pointX pb = 0 ∧ Crypto.Secp256k1.pointY pb = 0))
+    (hNonDeg : Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.pointX pa)
+                ≠ Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.pointX pb)) :
+    runOps Ec.emitEcAdd stkSt
+      = .ok { stkSt with stack := .vBytes (Crypto.Secp256k1.ecAdd pa pb) :: rest } := by
+  rw [emitEcAdd_ops]
+  unfold expectedEcAdd
+  simp only [List.append_assoc]
+  -- two decomposes → [qy, qx, py, px] ++ rest (q = pb, p = pa)
+  rw [runOps_append, ecaDp2_runOps stkSt pa pb rest hStk hSizeA hSizeB hDecXa hDecYa hDecXb hDecYb]
+  simp only [match_Except_ok_runOps]
+  -- affineAdd field chain → [aaRy, aaRx] ++ rest
+  rw [runOps_append,
+      affineAddInc_runOps _ (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa)
+        (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb) rest rfl]
+  simp only [match_Except_ok_runOps]
+  -- composePoint build-back → [makePoint aaRx aaRy] ++ rest
+  rw [composeRxRyInc_eq,
+      composePoint_runOps_sim _
+        (aaRx (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa) (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb))
+        (aaRy (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa) (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb))
+        encRx encRy rest rfl hEncRx hEncRy hSzRx hSzRy hBeRx hBeRy]
+  -- makePoint aaRx aaRy = ecAdd pa pb (non-degenerate affineAdd branch)
+  rw [show Crypto.Secp256k1.ecAdd pa pb
+        = Crypto.Secp256k1.makePoint
+            (aaRx (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa) (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb))
+            (aaRy (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa) (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb)) from by
+      unfold Crypto.Secp256k1.ecAdd
+      rw [aaRx_aaRy_eq_affineAdd (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa)
+            (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb) hPa hPb hNonDeg]]
+
+/-! ### MANDATORY smokes for the `emitEcAdd` discharge (deliverable 2)
+
+NOTE ON `native_decide`: the result coords `aaRx`/`aaRy` contain `Crypto.Secp256k1.fieldInv`,
+which is `fieldPowNat _ (FIELD_P − 2).toNat` — a ~2²⁵⁶-iteration Fermat-exponent recursion that
+is NOT machine-computable (it crashes the compiler).  So the two `num2binEncode?` / BE encode
+bridges (which evaluate `aaRx`/`aaRy`) cannot be discharged by `native_decide` for a concrete
+input; they are the SAME `num2binEncode?`-totality bridges the discharged `emitEcNegate` carries
+(satisfiable for any in-range coord).  The anti-vacuity smoke below therefore exercises the
+`fieldInv`-FREE wf hypotheses on two genuine, distinct on-curve points — the load-bearing
+non-vacuity (real on-curve inputs, the four decode bridges, the non-sentinel guards, and the
+non-degenerate `pointX G ≠ pointX 2G (mod p)` case split). -/
+
+/-- Two distinct concrete on-curve secp256k1 points for the discharge smoke: `pa = G`
+(the generator) and `pb = 2G` (its double).  Their x-coords differ mod p (non-degenerate). -/
+private def smokeEcAddPa : ByteArray :=
+  Crypto.Secp256k1.makePoint Crypto.Secp256k1.GEN_X Crypto.Secp256k1.GEN_Y
+private def smokeEcAddPb : ByteArray :=
+  Crypto.Secp256k1.makePoint
+    0xc6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5
+    0x1ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a
+
+/-- SMOKE (wf anti-vacuity, `fieldInv`-free hypotheses).  The discharge's INPUT-side hypotheses
+that do NOT depend on `fieldInv` are SATISFIABLE for two distinct on-curve points `G` and `2G`:
+both are 64-byte, the four `decomposePoint` canonical-decode bridges hold, neither is the sentinel
+zero-point, and `pointX G ≠ pointX 2G (mod p)` — so the non-degenerate (`pxm ≠ qxm`) branch is
+genuinely taken.  Rules out a vacuous discharge on the input side. -/
+theorem smoke_emitEcAdd_wf_satisfiable :
+    (64 : Nat) ≤ smokeEcAddPa.size ∧ (64 : Nat) ≤ smokeEcAddPb.size
+      ∧ decodeMinimalLE (reverseAcc 32 (smokeEcAddPa.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = Crypto.Secp256k1.pointX smokeEcAddPa
+      ∧ decodeMinimalLE (reverseAcc 32 (smokeEcAddPa.extract 32 smokeEcAddPa.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = Crypto.Secp256k1.pointY smokeEcAddPa
+      ∧ decodeMinimalLE (reverseAcc 32 (smokeEcAddPb.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = Crypto.Secp256k1.pointX smokeEcAddPb
+      ∧ decodeMinimalLE (reverseAcc 32 (smokeEcAddPb.extract 32 smokeEcAddPb.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+          = Crypto.Secp256k1.pointY smokeEcAddPb
+      ∧ ¬ (Crypto.Secp256k1.pointX smokeEcAddPa = 0 ∧ Crypto.Secp256k1.pointY smokeEcAddPa = 0)
+      ∧ ¬ (Crypto.Secp256k1.pointX smokeEcAddPb = 0 ∧ Crypto.Secp256k1.pointY smokeEcAddPb = 0)
+      ∧ Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.pointX smokeEcAddPa)
+          ≠ Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.pointX smokeEcAddPb) := by
+  native_decide
+
+/-- SMOKE (the discharge FIRES symbolically, anti-vacuity).  Specialising `emitEcAdd_runOps_eq`
+to two symbolic 64-byte points whose decode/encode/non-degeneracy bridges are taken as hypotheses
+yields the headline equation `runOps emitEcAdd = ecAdd pa pb` — confirming the discharge is a
+genuine, applicable theorem (not vacuously typed).  The `fieldInv`-bearing encode bridges are
+passed as hypotheses (not `native_decide`d, per the note above). -/
+theorem smoke_emitEcAdd_runOps_eq_applies (stkSt : StackState) (pa pb : ByteArray) (rest : List Value)
+    (hStk : stkSt.stack = .vBytes pb :: .vBytes pa :: rest)
+    (hSizeA : 64 ≤ pa.size) (hSizeB : 64 ≤ pb.size)
+    (hDecXa : decodeMinimalLE (reverseAcc 32 (pa.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointX pa)
+    (hDecYa : decodeMinimalLE (reverseAcc 32 (pa.extract 32 pa.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointY pa)
+    (hDecXb : decodeMinimalLE (reverseAcc 32 (pb.extract 0 32) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointX pb)
+    (hDecYb : decodeMinimalLE (reverseAcc 32 (pb.extract 32 pb.size) ByteArray.empty ++ ByteArray.mk #[0x00])
+              = Crypto.Secp256k1.pointY pb)
+    (encRx encRy : ByteArray)
+    (hEncRx : num2binEncode? (aaRx (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa)
+                (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb)) 33 = some encRx)
+    (hEncRy : num2binEncode? (aaRy (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa)
+                (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb)) 33 = some encRy)
+    (hSzRx : (32 : Nat) ≤ encRx.size) (hSzRy : (32 : Nat) ≤ encRy.size)
+    (hBeRx : reverseAcc 32 (encRx.extract 0 32) ByteArray.empty
+              = Crypto.Secp256k1.intToBE32 (aaRx (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa)
+                  (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb)))
+    (hBeRy : reverseAcc 32 (encRy.extract 0 32) ByteArray.empty
+              = Crypto.Secp256k1.intToBE32 (aaRy (Crypto.Secp256k1.pointX pa) (Crypto.Secp256k1.pointY pa)
+                  (Crypto.Secp256k1.pointX pb) (Crypto.Secp256k1.pointY pb)))
+    (hPa : ¬ (Crypto.Secp256k1.pointX pa = 0 ∧ Crypto.Secp256k1.pointY pa = 0))
+    (hPb : ¬ (Crypto.Secp256k1.pointX pb = 0 ∧ Crypto.Secp256k1.pointY pb = 0))
+    (hNonDeg : Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.pointX pa)
+                ≠ Crypto.Secp256k1.fieldMod (Crypto.Secp256k1.pointX pb)) :
+    runOps Ec.emitEcAdd stkSt = .ok { stkSt with stack := .vBytes (Crypto.Secp256k1.ecAdd pa pb) :: rest } :=
+  emitEcAdd_runOps_eq stkSt pa pb rest hStk hSizeA hSizeB hDecXa hDecYa hDecXb hDecYb
+    encRx encRy hEncRx hEncRy hSzRx hSzRy hBeRx hBeRy hPa hPb hNonDeg
 
 end RunarVerification.Stack.AgreesEC

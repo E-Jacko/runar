@@ -652,9 +652,8 @@ and the output is `vBytes (Crypto.ecAdd pa pb) :: rest`.
 
 ### TCB impact
 
-This section carries **3** axioms (one per still-axiomatized emit builder):
+This section carries **2** axioms (one per still-axiomatized emit builder):
 
-* `emitEcAdd_runOps_eq`
 * `emitEcMul_runOps_eq`
 * `emitEcMulGen_runOps_eq`
 
@@ -688,26 +687,42 @@ This section carries **3** axioms (one per still-axiomatized emit builder):
   `composePoint_runOps_sim`, reduced to `Crypto.Secp256k1.ecNegate` via the spec bridge
   `ecNegate_eq_makePoint` (`fieldSub p y ≡ fieldSub 0 y` under the canonical `fieldMod`
   `intToBE32` applies).
+* `emitEcAdd_runOps_eq` — `Stack.AgreesEC.emitEcAdd_runOps_eq` (Part 18 + Part 19).  The
+  whole-program discharge: op-list-equals-determined-concatenation (`emitEcAdd_ops` =
+  `ecaDp2.ops ++ affineAddInc ++ composeRxRyInc`) + runtime threading the two `decomposePoint`
+  bases (`ecaDp2_runOps`) → the 24-step affineAdd field chain (`affineAddInc_runOps`, via the
+  depth-general `fieldBinop_runOps_simT` / `fieldSqr_runOps_simT` sims + the proven
+  `fieldInv_runOps_sim` at the modular-inverse step) → `composePoint_runOps_sim`, reduced to
+  `Crypto.Secp256k1.ecAdd`'s non-degenerate branch via `aaRx_aaRy_eq_affineAdd`.  Carries the
+  four `decomposePoint` decode bridges + the two `composePoint` encode/BE bridges + the two
+  non-sentinel guards + the non-degenerate case split `fieldMod (pointX pa) ≠ fieldMod (pointX pb)`.
 
-**Still axiomatized** — `emitEcAdd_runOps_eq` / `emitEcMul_runOps_eq` /
-`emitEcMulGen_runOps_eq` remain axioms.  `emitEcAdd` is the last in-scope EC op; its
-discharge needs the `fieldInv` runtime sim (256-bit modular inverse, ~8 k ops via
-square-and-multiply) on top of the same `decomposePoint`/`composePoint`/`fieldSub`/
-`fieldMul`/`fieldSqr` machinery Part 14 now ships.  `emitEcMul`/`emitEcMulGen` need the
-257-iteration Jacobian double-and-add loop sim.  See `Stack/AgreesEC.lean` Part 14.
+**Still axiomatized** — `emitEcMul_runOps_eq` / `emitEcMulGen_runOps_eq` remain axioms.
+`emitEcMul`/`emitEcMulGen` need the 257-iteration Jacobian double-and-add loop sim (out of
+scope for the EC straight-line ops).  See `Stack/AgreesEC.lean` Part 18-19.
 -/
 
 open RunarVerification.Stack
 open RunarVerification.Stack.Eval (StackState runOps)
 open RunarVerification.ANF.Eval (Value)
 
-/-- `Stack.Ec.emitEcAdd`: stack in `[pa, pb]` (pb on TOS) → `[ecAdd pa pb]`.
-Mirrors `emitEcAdd` in `ec-codegen.ts:583-591`. -/
-axiom emitEcAdd_runOps_eq (stkSt : StackState) (pa pb : ByteArray)
-    (rest : List Value)
-    (hStk : stkSt.stack = .vBytes pb :: .vBytes pa :: rest) :
-    runOps Stack.Ec.emitEcAdd stkSt
-      = .ok { stkSt with stack := .vBytes (Crypto.ecAdd pa pb) :: rest }
+/- `Stack.Ec.emitEcAdd`: stack in `[pa, pb]` (pb on TOS) → `[ecAdd pa pb]`.
+**DISCHARGED** (no longer an axiom): proved as a theorem in `Stack/AgreesEC.lean` as
+`RunarVerification.Stack.AgreesEC.emitEcAdd_runOps_eq` (Part 18 + Part 19).  The codegen
+op-list is `expectedEcAdd = ecaDp2.ops ++ affineAddInc ++ composeRxRyInc`; the discharge
+(a) proves the op-list equals that determined concatenation (`emitEcAdd_ops`), then (b) threads
+the runtime through the two `decomposePoint` bases (`ecaDp2_runOps`), the 24-step affineAdd field
+chain (`affineAddInc_runOps`, via the depth-general `fieldBinop_runOps_simT` /
+`fieldSqr_runOps_simT` sims + the proven `fieldInv_runOps_sim` at the `_s_den` site), and the
+`composePoint_runOps_sim` build-back, reduced to `Crypto.Secp256k1.ecAdd`'s non-degenerate branch
+via `aaRx_aaRy_eq_affineAdd`.  Carries INPUT-side wf hypotheses the bare axiom lacked: both points
+64-byte + the four `decomposePoint` decode bridges, the two `composePoint` `num2binEncode? · 33` +
+BE bridges at the result coords, the two non-sentinel guards, and the non-degenerate case split
+`fieldMod (pointX pa) ≠ fieldMod (pointX pb)` (the `pxm ≠ qxm` branch; the `P = ±Q` / doubling case
+routes through `Crypto.Secp256k1.affineDouble`, a separate codegen path NOT exercised by
+`emitEcAdd`'s straight-line affine-add).  `#print axioms` confirms: `propext` / `Classical.choice`
+/ `Quot.sound` + the inherited backend opaques only — no `sorryAx`, no `Lean.ofReduceBool`, no new
+axiom.  Mirrors `emitEcAdd` in `ec-codegen.ts:583-591`. -/
 
 /-- `Stack.Ec.emitEcMul`: stack in `[pt, k]` (k on TOS) → `[ecMul pt k]`.
 Mirrors `emitEcMul` in `ec-codegen.ts:601-665` (257-iter MSB-first
