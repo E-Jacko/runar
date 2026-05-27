@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { compile } from '../index.js';
+// @ts-expect-error vitest resolves this via alias
 import { ScriptVM } from 'runar-testing';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -143,7 +144,7 @@ describe('BUG-009: checkMultiSig stack layout', () => {
     // against a real pubkey by the callback. Here we use a strict callback
     // that returns false for empty sigs (mimicking real ECDSA).
     const vm = new ScriptVM({
-      checkSigCallback: (sig) => sig.length > 0,
+      checkSigCallback: (sig: Uint8Array) => sig.length > 0,
     });
     const r = vm.execute(hexToBytes(unlocking), hexToBytes(locking));
     expect(r.success).toBe(false);

@@ -262,7 +262,7 @@ describe.skipIf(!runSlowTests)('SLH-DSA adversarial bound-violation tests (all 6
         // the signature was authored for the *original* indices, so the
         // verifier reaches the wrong root and rejects.
         const tampered = new Uint8Array(sig);
-        for (let i = 0; i < tc.params.n; i++) tampered[i] ^= 0xff;
+        for (let i = 0; i < tc.params.n; i++) tampered[i] = (tampered[i] ?? 0) ^ 0xff;
         const contract = TestContract.fromSource(tc.source, { pubkey: pkHex });
         const r = contract.call('spend', { msg: toHex(msg), sig: toHex(tampered) });
         expect(r.success).toBe(false);
@@ -290,7 +290,8 @@ describe.skipIf(!runSlowTests)('SLH-DSA adversarial bound-violation tests (all 6
         const tampered = new Uint8Array(sig);
         const forsLen = tc.params.k * (1 + tc.params.a) * tc.params.n;
         // First byte of the first XMSS layer (immediately after FORS).
-        tampered[tc.params.n + forsLen] ^= 0xff;
+        const idx = tc.params.n + forsLen;
+        tampered[idx] = (tampered[idx] ?? 0) ^ 0xff;
         const contract = TestContract.fromSource(tc.source, { pubkey: pkHex });
         const r = contract.call('spend', { msg: toHex(msg), sig: toHex(tampered) });
         expect(r.success).toBe(false);
