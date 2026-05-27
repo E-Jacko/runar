@@ -85,6 +85,12 @@ def main() -> None:
         action="store_true",
         help="Disable the ANF constant folding pass",
     )
+    parser.add_argument(
+        "--emit-source-map",
+        dest="emit_source_map",
+        metavar="PATH",
+        help="After a successful compile, write artifact.sourceMap JSON to this path",
+    )
 
     args = parser.parse_args()
 
@@ -185,6 +191,34 @@ def main() -> None:
         output = artifact.asm
     else:
         output = artifact_to_json(artifact)
+
+    # --emit-source-map: write the artifact's sourceMap field as canonical
+    # JSON ({"mappings":[...]}) to the requested path. Always emit the
+    # wrapper object so downstream tooling sees a uniform shape even when
+    # the underlying mapping table is empty.
+    if args.emit_source_map:
+        import os
+        sm = artifact.source_map  # list of SourceMapping or None
+        if sm:
+            from runar_compiler.codegen.emit import SourceMapping
+            mappings = [
+                {
+                    "opcodeIndex": m.opcode_index,
+                    "sourceFile": m.source_file,
+                    "line": m.line,
+                    "column": m.column,
+                }
+                if isinstance(m, SourceMapping)
+                else m
+                for m in sm
+            ]
+        else:
+            mappings = []
+        os.makedirs(os.path.dirname(os.path.abspath(args.emit_source_map)) or ".", exist_ok=True)
+        with open(args.emit_source_map, "w") as f:
+            json.dump({"mappings": mappings}, f, indent=2)
+            f.write("\n")
+        print(f"Source map written to {args.emit_source_map}", file=sys.stderr)
 
     # Write output
     if args.output:

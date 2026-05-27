@@ -48,6 +48,10 @@ struct Args {
     /// Disable the ANF constant folding pass
     #[arg(long)]
     disable_constant_folding: bool,
+
+    /// After a successful compile, write artifact.sourceMap JSON to this path.
+    #[arg(long)]
+    emit_source_map: Option<PathBuf>,
 }
 
 fn main() {
@@ -168,6 +172,37 @@ fn main() {
             }
         }
     };
+
+    // --emit-source-map: write the artifact's sourceMap field as canonical
+    // JSON ({"mappings":[...]}) to the requested path. Always emit the
+    // wrapper object so downstream tooling sees a uniform shape even when
+    // the underlying mapping table is empty.
+    if let Some(sm_path) = &args.emit_source_map {
+        // SourceMapData serializes via its derived Serialize impl which
+        // already produces {"mappings":[...]}.
+        let payload = match &artifact.source_map {
+            Some(sm) => serde_json::to_string_pretty(sm),
+            None => Ok("{\n  \"mappings\": []\n}".to_string()),
+        };
+        match payload {
+            Ok(s) => {
+                if let Some(parent) = sm_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
+                if let Err(e) = std::fs::write(sm_path, format!("{}\n", s)) {
+                    eprintln!("Error writing source map: {}", e);
+                    process::exit(1);
+                }
+                eprintln!("Source map written to {}", sm_path.display());
+            }
+            Err(e) => {
+                eprintln!("Source map serialization error: {}", e);
+                process::exit(1);
+            }
+        }
+    }
 
     // Determine output content
     let output = if args.hex {

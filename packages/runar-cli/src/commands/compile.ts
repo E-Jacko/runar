@@ -15,6 +15,7 @@ interface CompileOptions {
   fromIr?: string;
   hex?: boolean;
   parseOnly?: boolean;
+  emitSourceMap?: string;
 }
 
 interface CompilerDiagnosticLike {
@@ -313,6 +314,22 @@ export async function compileCommand(
       jsonWithBigInt(artifact) + '\n',
     );
     console.log(`  Artifact written: ${artifactPath}`);
+
+    // --emit-source-map: write artifact.sourceMap to the requested path.
+    // Emits the canonical {"mappings":[...]} object; if the artifact has
+    // no sourceMap (e.g. fold-on path with no source-loc tracking), emit
+    // an empty {"mappings":[]} object so downstream tooling can rely on a
+    // uniform shape.
+    if (options.emitSourceMap) {
+      const smPath = path.resolve(process.cwd(), options.emitSourceMap);
+      fs.mkdirSync(path.dirname(smPath), { recursive: true });
+      const sm = (artifact as { sourceMap?: unknown }).sourceMap;
+      const payload = sm && typeof sm === 'object' && 'mappings' in (sm as Record<string, unknown>)
+        ? sm
+        : { mappings: [] };
+      fs.writeFileSync(smPath, JSON.stringify(payload, null, 2) + '\n');
+      console.log(`  Source map written: ${smPath}`);
+    }
 
     // Print ASM if requested
     if (options.asm && typeof artifact['asm'] === 'string') {

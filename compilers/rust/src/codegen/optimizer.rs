@@ -24,6 +24,101 @@ pub fn optimize_stack_ops(ops: &[StackOp]) -> Vec<StackOp> {
     current
 }
 
+/// Peephole-optimize a parallel `(ops, source_locs)` pair, preserving the
+/// source location of the FIRST input op in every collapsed window. The
+/// returned `source_locs` is the same length as the returned ops — callers
+/// can drop the old `method.source_locs` and replace it wholesale.
+///
+/// GAP-002: previously the source_locs array was wiped to all-`None` after
+/// the peephole pass because there was no parallel-tracking variant of
+/// `optimize_stack_ops`. The wipe meant `artifact.sourceMap` was always
+/// empty on the Rust tier. This wrapper restores that mapping.
+pub fn optimize_stack_ops_with_locs(
+    ops: &[StackOp],
+    source_locs: &[Option<crate::ir::SourceLocation>],
+) -> (Vec<StackOp>, Vec<Option<crate::ir::SourceLocation>>) {
+    // Recursive nested-if optimization: inside an If, we keep the outer
+    // location for the IfOp itself; nested ops are optimised without their
+    // own locs (the analyzer treats nested-if peephole as best-effort).
+    let mut current_ops: Vec<StackOp> = ops.iter().map(optimize_nested_if).collect();
+    let mut current_locs: Vec<Option<crate::ir::SourceLocation>> =
+        if source_locs.len() == ops.len() { source_locs.to_vec() } else { vec![None; ops.len()] };
+
+    for _ in 0..MAX_ITERATIONS {
+        let (result_ops, result_locs, changed) = apply_one_pass_with_locs(&current_ops, &current_locs);
+        if !changed {
+            break;
+        }
+        current_ops = result_ops;
+        current_locs = result_locs;
+    }
+
+    (current_ops, current_locs)
+}
+
+fn apply_one_pass_with_locs(
+    ops: &[StackOp],
+    source_locs: &[Option<crate::ir::SourceLocation>],
+) -> (Vec<StackOp>, Vec<Option<crate::ir::SourceLocation>>, bool) {
+    let mut result_ops = Vec::new();
+    let mut result_locs = Vec::new();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < ops.len() {
+        // 4-op window
+        if i + 3 < ops.len() {
+            if let Some(replacement) =
+                match_window_4(&ops[i], &ops[i + 1], &ops[i + 2], &ops[i + 3])
+            {
+                let head_loc = source_locs.get(i).cloned().flatten();
+                let n = replacement.len();
+                result_ops.extend(replacement);
+                for _ in 0..n {
+                    result_locs.push(head_loc.clone());
+                }
+                i += 4;
+                changed = true;
+                continue;
+            }
+        }
+        // 3-op window
+        if i + 2 < ops.len() {
+            if let Some(replacement) = match_window_3(&ops[i], &ops[i + 1], &ops[i + 2]) {
+                let head_loc = source_locs.get(i).cloned().flatten();
+                let n = replacement.len();
+                result_ops.extend(replacement);
+                for _ in 0..n {
+                    result_locs.push(head_loc.clone());
+                }
+                i += 3;
+                changed = true;
+                continue;
+            }
+        }
+        // 2-op window
+        if i + 1 < ops.len() {
+            if let Some(replacement) = match_window_2(&ops[i], &ops[i + 1]) {
+                let head_loc = source_locs.get(i).cloned().flatten();
+                let n = replacement.len();
+                result_ops.extend(replacement);
+                for _ in 0..n {
+                    result_locs.push(head_loc.clone());
+                }
+                i += 2;
+                changed = true;
+                continue;
+            }
+        }
+
+        result_ops.push(ops[i].clone());
+        result_locs.push(source_locs.get(i).cloned().flatten());
+        i += 1;
+    }
+
+    (result_ops, result_locs, changed)
+}
+
 fn optimize_nested_if(op: &StackOp) -> StackOp {
     match op {
         StackOp::If {

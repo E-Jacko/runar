@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/icellan/runar/compilers/go/codegen"
 	"github.com/icellan/runar/compilers/go/compiler"
 )
 
@@ -50,10 +51,14 @@ func main() {
 	emitIR := flag.Bool("emit-ir", false, "output only the ANF IR JSON (requires --source)")
 	parseOnly := flag.Bool("parse-only", false, "stop after parse + validate; exits 0 with 'parser ok' marker (requires --source)")
 	disableConstFold := flag.Bool("disable-constant-folding", false, "disable ANF constant folding pass")
+	emitSourceMap := flag.String("emit-source-map", "", "after a successful compile, write artifact.sourceMap JSON to this path")
 	flag.Parse()
 
 	opts := compiler.CompileOptions{
 		DisableConstantFolding: *disableConstFold,
+		// IncludeSourceMap is auto-enabled when --emit-source-map is requested
+		// so the artifact carries the mapping table the user just asked for.
+		IncludeSourceMap: *emitSourceMap != "",
 	}
 
 	if *irFile == "" && *sourceFile == "" {
@@ -135,6 +140,27 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Compilation error: %v\n", err)
 		os.Exit(1)
+	}
+
+	// --emit-source-map: write the artifact's SourceMap field as
+	// canonical JSON ({"mappings":[...]}) to the requested path. Always
+	// emits the wrapper object so downstream tooling sees a uniform shape
+	// even when the underlying mapping table is empty.
+	if *emitSourceMap != "" {
+		sm := artifact.SourceMapData
+		if sm == nil {
+			sm = &compiler.SourceMap{Mappings: []codegen.SourceMapping{}}
+		}
+		smBytes, smErr := json.MarshalIndent(sm, "", "  ")
+		if smErr != nil {
+			fmt.Fprintf(os.Stderr, "Source map serialization error: %v\n", smErr)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(*emitSourceMap, append(smBytes, '\n'), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing source map: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Source map written to %s\n", *emitSourceMap)
 	}
 
 	// Determine output

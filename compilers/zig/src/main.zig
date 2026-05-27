@@ -25,16 +25,20 @@ const CompileOptions = struct {
     hex_only: bool = false,
     disable_constant_folding: bool = false,
     parse_only: bool = false,
+    emit_source_map_path: ?[]const u8 = null,
 };
 
 const ParseOptionsError = error{
     UnknownFlag,
     UnsupportedFlag,
+    MissingFlagValue,
 };
 
 fn parseCompileOptions(args: []const []const u8, allow_disable_constant_folding: bool) ParseOptionsError!CompileOptions {
     var opts = CompileOptions{};
-    for (args) |arg| {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--emit-ir")) {
             opts.emit_ir = true;
             continue;
@@ -50,6 +54,18 @@ fn parseCompileOptions(args: []const []const u8, allow_disable_constant_folding:
         }
         if (std.mem.eql(u8, arg, "--parse-only")) {
             opts.parse_only = true;
+            continue;
+        }
+        // --emit-source-map <PATH> writes the artifact's sourceMap field as
+        // canonical {"mappings":[...]} JSON to the specified path.
+        if (std.mem.eql(u8, arg, "--emit-source-map")) {
+            if (i + 1 >= args.len) return error.MissingFlagValue;
+            i += 1;
+            opts.emit_source_map_path = args[i];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--emit-source-map=")) {
+            opts.emit_source_map_path = arg["--emit-source-map=".len..];
             continue;
         }
         return error.UnknownFlag;
@@ -86,6 +102,7 @@ pub fn main(init: std.process.Init) !void {
             const message = switch (err) {
                 error.UnknownFlag => "error: unknown compile-ir flag\n",
                 error.UnsupportedFlag => "error: --disable-constant-folding is only valid for source compilation\n",
+                error.MissingFlagValue => "error: --emit-source-map requires a path argument\n",
             };
             std.debug.print("{s}", .{message});
             std.process.exit(1);
@@ -105,6 +122,7 @@ pub fn main(init: std.process.Init) !void {
             const message = switch (err) {
                 error.UnknownFlag => "error: unknown compile flag\n",
                 error.UnsupportedFlag => "error: unsupported compile flag\n",
+                error.MissingFlagValue => "error: --emit-source-map requires a path argument\n",
             };
             std.debug.print("{s}", .{message});
             std.process.exit(1);
@@ -131,6 +149,7 @@ pub fn main(init: std.process.Init) !void {
             const message = switch (err) {
                 error.UnknownFlag => "error: unknown source flag\n",
                 error.UnsupportedFlag => "error: unsupported source flag\n",
+                error.MissingFlagValue => "error: --emit-source-map requires a path argument\n",
             };
             std.debug.print("{s}", .{message});
             std.process.exit(1);
@@ -425,9 +444,60 @@ fn compileFromSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8,
     // Pass 6: Emit full artifact
     const artifact = try emit.emitArtifact(work_allocator, optimized_stack_program, program);
 
+    // --emit-source-map: extract the artifact's sourceMap object (or emit
+    // the empty {"mappings":[]} wrapper if absent) and write it to PATH.
+    if (opts.emit_source_map_path) |sm_path| {
+        try writeSourceMapToPath(work_allocator, io, artifact, sm_path);
+    }
+
     try writeStdoutLn(io, artifact);
 
     std.debug.print("Compiled: {s}\n", .{path});
+}
+
+/// Extract the `"sourceMap":{...}` substring from the emitted artifact JSON
+/// (or fall back to the empty `{"mappings":[]}` wrapper) and write it to
+/// `sm_path`.
+fn writeSourceMapToPath(allocator: std.mem.Allocator, io: std.Io, artifact_json: []const u8, sm_path: []const u8) !void {
+    _ = allocator;
+    const marker = "\"sourceMap\":";
+    var payload: []const u8 = "{\"mappings\":[]}";
+    if (std.mem.indexOf(u8, artifact_json, marker)) |idx| {
+        const after = idx + marker.len;
+        if (after < artifact_json.len and artifact_json[after] == '{') {
+            // Walk to the matching close brace, respecting string literals.
+            var depth: i32 = 0;
+            var p: usize = after;
+            var in_string = false;
+            var escape = false;
+            while (p < artifact_json.len) : (p += 1) {
+                const c = artifact_json[p];
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (in_string) {
+                    if (c == '\\') { escape = true; continue; }
+                    if (c == '"') { in_string = false; continue; }
+                    continue;
+                }
+                if (c == '"') { in_string = true; continue; }
+                if (c == '{') depth += 1;
+                if (c == '}') {
+                    depth -= 1;
+                    if (depth == 0) { p += 1; break; }
+                }
+            }
+            payload = artifact_json[after..p];
+        }
+    }
+    var file = try std.Io.Dir.cwd().createFile(io, sm_path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(io, &buf);
+    try w.interface.writeAll(payload);
+    try w.interface.writeAll("\n");
+    try w.interface.flush();
 }
 
 const UnsupportedFormat = error{UnsupportedFormat};
