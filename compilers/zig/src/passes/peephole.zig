@@ -909,7 +909,13 @@ test "optimize methods" {
 
     const result = try optimize(alloc, &methods);
     defer {
-        for (result) |m| alloc.free(m.instructions);
+        for (result) |m| {
+            alloc.free(m.instructions);
+            // GAP-002: optimize now allocates a parallel
+            // instruction_source_locs slice — free it too to avoid the
+            // test-runner leak detector flagging it as a leak.
+            if (m.instruction_source_locs.len > 0) alloc.free(m.instruction_source_locs);
+        }
         alloc.free(result);
     }
 
