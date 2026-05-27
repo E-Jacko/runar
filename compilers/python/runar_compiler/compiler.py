@@ -203,6 +203,17 @@ def _optimize_ec(program: ANFProgram) -> ANFProgram:
     return optimize_ec(program)
 
 
+def _eliminate_dead_code(program: ANFProgram) -> ANFProgram:
+    """Dead Code Elimination (Pass 4.75) -- discrete named pass.
+
+    See frontend/dce.py. Idempotent w.r.t. the EC optimizer's internal DCE;
+    runs as a safety net for any post-EC residual dead bindings and to
+    mirror the standalone DCE pass shape used by the Zig reference compiler.
+    """
+    from runar_compiler.frontend.dce import eliminate_dead_code
+    return eliminate_dead_code(program)
+
+
 def _lower_to_stack(program: ANFProgram) -> list[Any]:
     """Stack lowering: ANF -> Stack IR."""
     from runar_compiler.codegen.stack import lower_to_stack
@@ -265,7 +276,8 @@ def compile_from_program(program: ANFProgram, disable_constant_folding: bool = F
     if not disable_constant_folding:
         program = _fold_constants(program)
 
-    # Pass 4.5: EC optimization
+    # Pass 4.5: EC optimization. Delegates internally to frontend/dce.py for
+    # dead-binding cleanup -- see anf_optimize._eliminate_dead_bindings.
     program = _optimize_ec(program)
 
     # Pass 5: Stack lowering
@@ -374,7 +386,7 @@ def compile_source_to_ir(
     if not disable_constant_folding:
         program = _fold_constants(program)
 
-    # Pass 4.5: EC optimization
+    # Pass 4.5: EC optimization (delegates internally to frontend/dce.py).
     program = _optimize_ec(program)
 
     return program
@@ -1080,7 +1092,7 @@ def _compile_from_source_str_with_result(
             )
             return result
 
-    # Pass 4.5: EC optimization
+    # Pass 4.5: EC optimization (delegates internally to frontend/dce.py).
     try:
         result.anf = _optimize_ec(result.anf)
     except Exception as e:

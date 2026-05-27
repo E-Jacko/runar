@@ -211,7 +211,8 @@ pub fn compile_from_source_str_with_options(
         anf_program = frontend::constant_fold::fold_constants(&anf_program);
     }
 
-    // Pass 4.5: EC optimization
+    // Pass 4.5: EC optimization. Delegates internally to frontend::dce
+    // for dead-binding cleanup after any EC rewrite.
     let anf_program = frontend::anf_optimize::optimize_ec(anf_program);
 
     // Passes 5-6: Backend (stack lowering + emit)
@@ -332,7 +333,8 @@ pub fn compile_from_program_with_options(program: &ir::ANFProgram, opts: &Compil
         program = frontend::constant_fold::fold_constants(&program);
     }
 
-    // Pass 4.5: EC optimization (in case we receive unoptimized ANF from IR)
+    // Pass 4.5: EC optimization (in case we receive unoptimized ANF from IR).
+    // Delegates internally to frontend::dce for dead-binding cleanup.
     let optimized = frontend::anf_optimize::optimize_ec(program);
 
     // Pass 5: Stack lowering
@@ -459,7 +461,7 @@ pub fn compile_from_source_str_with_result(
         anf_program = frontend::constant_fold::fold_constants(&anf_program);
     }
 
-    // Pass 4.5: EC optimization
+    // Pass 4.5: EC optimization (delegates internally to frontend::dce)
     anf_program = frontend::anf_optimize::optimize_ec(anf_program);
     result.anf = Some(anf_program.clone());
 

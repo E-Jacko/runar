@@ -226,6 +226,16 @@ module RunarCompiler
   end
   private_class_method :_optimize_ec
 
+  # Dead Code Elimination -- discrete named pass (Pass 4.75).
+  # See frontend/dce.rb. Idempotent w.r.t. the EC optimizer's internal DCE;
+  # runs as a safety net for any post-EC residual dead bindings and to
+  # mirror the standalone DCE pass shape used by the Zig reference compiler.
+  def self._eliminate_dead_code(program)
+    require_relative "frontend/dce"
+    Frontend::DCE.eliminate_dead_code(program)
+  end
+  private_class_method :_eliminate_dead_code
+
   # Stack lowering: ANF -> Stack IR.
   def self._lower_to_stack(program)
     require_relative "codegen/stack"
@@ -305,7 +315,8 @@ module RunarCompiler
     # Pass 4.25: Constant folding (on by default)
     program = _fold_constants(program) unless disable_constant_folding
 
-    # Pass 4.5: EC optimization
+    # Pass 4.5: EC optimization (delegates internally to frontend/dce.rb
+    # for dead-binding cleanup — see Frontend::ANFOptimize.eliminate_dead_bindings).
     program = _optimize_ec(program)
 
     # Pass 5: Stack lowering
@@ -425,7 +436,8 @@ module RunarCompiler
     # Pass 4.25: Constant folding (on by default)
     program = _fold_constants(program) unless disable_constant_folding
 
-    # Pass 4.5: EC optimization
+    # Pass 4.5: EC optimization (delegates internally to frontend/dce.rb
+    # for dead-binding cleanup).
     program = _optimize_ec(program)
 
     program

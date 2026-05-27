@@ -165,7 +165,9 @@ func CompileFromProgram(program *ir.ANFProgram, opts ...CompileOptions) (*Artifa
 		program = frontend.FoldConstants(program)
 	}
 
-	// EC optimization — algebraic simplification of EC calls
+	// EC optimization — algebraic simplification of EC calls.
+	// Delegates internally to frontend/dce.go for dead-binding cleanup
+	// after any EC rewrite (see eliminateDeadBindings in anf_optimize.go).
 	program = frontend.OptimizeEC(program)
 
 	// Mode 3: when CompileOptions.Groth16WAVKey is set, load the SP1
