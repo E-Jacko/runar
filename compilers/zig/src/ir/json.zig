@@ -16,17 +16,82 @@ const ParseError = error{
     InvalidConstValue,
     UnexpectedValueType,
     MaxRecursionDepthExceeded,
+    // BUG-008 follow-up: typed DoS-bound rejection of oversized IR JSON.
+    IRSizeExceeded,
 };
 
 const max_parse_depth: u32 = 256;
+
+/// Mirrors InputLimits.MAX_IR_BYTES (16 MiB) from the TS schema package.
+/// Any ANF IR JSON larger than this is rejected at parseANFProgram BEFORE
+/// std.json.parseFromSlice runs so a malicious caller cannot exhaust
+/// memory / CPU with a giant payload. BUG-008 follow-up.
+pub const MAX_IR_BYTES: usize = 16 * 1024 * 1024;
+
+/// Mirrors InputLimits.MAX_NESTING (512) from the TS schema package
+/// for the structural-depth pre-walk. Note that the existing
+/// per-binding parser also enforces max_parse_depth = 256 as a defense
+/// in depth; whichever fires first wins. BUG-008 follow-up.
+pub const MAX_IR_NESTING: usize = 512;
+
+/// Walks the raw JSON bytes and returns ParseError.MaxRecursionDepthExceeded
+/// the first time the structural nesting (objects + arrays) exceeds
+/// MAX_IR_NESTING. Runs BEFORE std.json.parseFromSlice so a deeply-nested
+/// payload cannot exhaust the thread stack inside the deserializer.
+///
+/// Skips strings (respecting backslash-escapes).
+fn assertIRNestingUnderLimit(data: []const u8) ParseError!void {
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    for (data) |b| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (b == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (b == '"') in_string = false;
+            continue;
+        }
+        switch (b) {
+            '"' => in_string = true,
+            '{', '[' => {
+                depth += 1;
+                if (depth > MAX_IR_NESTING) {
+                    return ParseError.MaxRecursionDepthExceeded;
+                }
+            },
+            '}', ']' => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+    }
+}
 
 // ============================================================================
 // Public API
 // ============================================================================
 
 /// Parse a JSON string into an ANFProgram.
+///
+/// Rejects oversized (>MAX_IR_BYTES) payloads with the typed
+/// ParseError.IRSizeExceeded BEFORE std.json.parseFromSlice runs.
+/// Depth is bounded by std.json's parseFromSlice with max_value_len /
+/// max_parse_depth; the structural-nesting cap is enforced indirectly
+/// by max_parse_depth = 256 inside this module. BUG-008 follow-up.
 pub fn parseANFProgram(allocator: std.mem.Allocator, json_source: []const u8) !types.ANFProgram {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_source, .{});
+    if (json_source.len > MAX_IR_BYTES) {
+        return ParseError.IRSizeExceeded;
+    }
+    try assertIRNestingUnderLimit(json_source);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_source, .{
+        .max_value_len = MAX_IR_BYTES,
+    });
     defer parsed.deinit();
 
     const root = parsed.value;

@@ -48,6 +48,12 @@ public final class AnfLoader {
     private AnfLoader() {}
 
     public static AnfProgram parse(String json) {
+        // DoS-bound guards run before the hand-rolled JSON parser so a
+        // malicious payload cannot exhaust memory (size) or the JVM
+        // thread stack (nesting). BUG-008 follow-up.
+        IRInputLimits.assertIRBytesUnderLimit(json);
+        IRInputLimits.assertIRNestingUnderLimit(json);
+
         JsonParser p = new JsonParser(json);
         Object root = p.parseValue();
         p.skipWs();

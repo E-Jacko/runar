@@ -4,8 +4,15 @@ use std::fs;
 use std::path::Path;
 
 use super::{ANFBinding, ANFProgram, ANFValue};
+use super::input_limits::{
+    assert_ir_bytes_under_limit, assert_ir_nesting_under_limit,
+};
 
 /// Load an ANF IR program from a JSON file on disk.
+///
+/// Rejects oversized (>MAX_IR_BYTES) or deeply-nested (>MAX_IR_NESTING)
+/// payloads with a typed-error-derived error string BEFORE `serde_json`
+/// runs. BUG-008 follow-up.
 pub fn load_ir(path: &Path) -> Result<ANFProgram, String> {
     let data = fs::read_to_string(path)
         .map_err(|e| format!("reading IR file: {}", e))?;
@@ -13,12 +20,66 @@ pub fn load_ir(path: &Path) -> Result<ANFProgram, String> {
 }
 
 /// Load an ANF IR program from a JSON string.
+///
+/// Rejects oversized (>MAX_IR_BYTES) or deeply-nested (>MAX_IR_NESTING)
+/// payloads BEFORE `serde_json::from_str` runs. BUG-008 follow-up.
 pub fn load_ir_from_str(json_str: &str) -> Result<ANFProgram, String> {
+    // DoS-bound guards run before serde_json::from_str so a malicious
+    // payload cannot exhaust memory (size) or the thread stack (nesting)
+    // inside the deserializer.
+    if let Some(e) = assert_ir_bytes_under_limit(json_str.as_bytes()) {
+        return Err(e.to_string());
+    }
+    if let Some(e) = assert_ir_nesting_under_limit(json_str.as_bytes()) {
+        return Err(e.to_string());
+    }
     let program: ANFProgram = serde_json::from_str(json_str)
         .map_err(|e| format!("invalid IR JSON: {}", e))?;
     validate_ir(&program)?;
     Ok(program)
 }
+
+/// Load an ANF IR program from a JSON string, returning typed errors on
+/// DoS-bound rejection. Wraps `load_ir_from_str`; callers wanting
+/// `errors.As`-style typed inspection use this entry point. BUG-008
+/// follow-up.
+pub fn load_ir_from_str_typed(
+    json_str: &str,
+) -> Result<ANFProgram, IRLoaderError> {
+    if let Some(e) = assert_ir_bytes_under_limit(json_str.as_bytes()) {
+        return Err(IRLoaderError::Size(e));
+    }
+    if let Some(e) = assert_ir_nesting_under_limit(json_str.as_bytes()) {
+        return Err(IRLoaderError::Nesting(e));
+    }
+    serde_json::from_str::<ANFProgram>(json_str)
+        .map_err(|e| IRLoaderError::Other(format!("invalid IR JSON: {}", e)))
+        .and_then(|p| {
+            validate_ir(&p).map_err(IRLoaderError::Other)?;
+            Ok(p)
+        })
+}
+
+/// Typed-error variant returned by `load_ir_from_str_typed`. BUG-008
+/// follow-up.
+#[derive(Debug)]
+pub enum IRLoaderError {
+    Size(super::input_limits::IRSizeExceededError),
+    Nesting(super::input_limits::IRNestingExceededError),
+    Other(String),
+}
+
+impl std::fmt::Display for IRLoaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IRLoaderError::Size(e) => write!(f, "{}", e),
+            IRLoaderError::Nesting(e) => write!(f, "{}", e),
+            IRLoaderError::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for IRLoaderError {}
 
 // ---------------------------------------------------------------------------
 // Validation

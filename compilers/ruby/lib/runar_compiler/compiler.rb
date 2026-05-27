@@ -121,6 +121,12 @@ module RunarCompiler
   #
   # Returns a ParseResult-like object (from the frontend package).
   def self._parse_source(source, file_name)
+    # DoS-bound size guard. Reject oversized source BEFORE any
+    # format-specific parser touches the input. Raises
+    # InputLimits::SourceSizeExceededError on rejection. BUG-008 follow-up.
+    require_relative "frontend/input_limits"
+    Frontend::InputLimits.assert_source_bytes_under_limit(source)
+
     lower = file_name.downcase
     if lower.end_with?(".runar.py")
       require_relative "frontend/parser_python"

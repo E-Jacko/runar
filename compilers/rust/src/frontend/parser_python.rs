@@ -55,7 +55,7 @@ pub fn parse_python(source: &str, file_name: Option<&str>) -> ParseResult {
 
     let contract = parser.parse_contract();
 
-    ParseResult { contract, errors }
+    ParseResult { contract, errors, source_size_err: None }
 }
 
 // ---------------------------------------------------------------------------

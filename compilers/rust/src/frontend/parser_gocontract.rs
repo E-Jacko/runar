@@ -57,7 +57,7 @@ pub fn parse_go_contract(source: &str, file_name: Option<&str>) -> ParseResult {
 
     let contract = parser.parse();
 
-    ParseResult { contract, errors }
+    ParseResult { contract, errors, source_size_err: None }
 }
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,10 @@ const ec_optimizer = @import("passes/ec_optimizer.zig");
 const stack_lower = @import("passes/stack_lower.zig");
 const peephole = @import("passes/peephole.zig");
 const emit = @import("codegen/emit.zig");
+const input_limits = @import("frontend/input_limits.zig");
+
+pub const SourceSizeExceededError = input_limits.SourceSizeError;
+pub const MAX_SOURCE_BYTES = input_limits.MAX_SOURCE_BYTES;
 
 pub const CompileError = error{
     ParseFailed,
@@ -26,6 +30,8 @@ pub const CompileError = error{
     ANFLowerFailed,
     StackLowerFailed,
     EmitFailed,
+    // BUG-008 follow-up: typed DoS-bound rejection of oversized source.
+    SourceSizeExceeded,
 };
 
 pub const CompileResult = struct {
@@ -108,6 +114,10 @@ pub fn compileSource(
     source: []const u8,
     file_name: []const u8,
 ) CompileError!CompileResult {
+    // Pass 0: DoS-bound size guard. Reject oversized source BEFORE any
+    // tokenizer / arena allocator touches the input. BUG-008 follow-up.
+    input_limits.assertSourceBytesUnderLimit(source) catch return error.SourceSizeExceeded;
+
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const work = arena.allocator();

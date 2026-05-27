@@ -378,7 +378,7 @@ impl RustDslParser {
 
         if contract_name.is_empty() {
             self.errors.push(Diagnostic::error("No Rúnar contract struct found", None));
-            return ParseResult { contract: None, errors: self.errors };
+            return ParseResult { contract: None, errors: self.errors, source_size_err: None };
         }
 
         // Extract init() method as property initializers, if present.
@@ -454,7 +454,7 @@ impl RustDslParser {
             source_file: self.file.clone(),
         };
 
-        ParseResult { contract: Some(contract), errors: self.errors }
+        ParseResult { contract: Some(contract), errors: self.errors, source_size_err: None }
     }
 
     /// Parse a bare `impl ContractName { ... }` block and return its methods.

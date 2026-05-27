@@ -11,6 +11,12 @@ import "fmt"
 // conformance is ~2 MiB (Mode 3 STARK contracts); 16 MiB is 8x headroom.
 const MaxIRBytes = 16 * 1024 * 1024
 
+// MaxSourceBytes mirrors InputLimits.MAX_SOURCE_BYTES (4 MiB) from the TS
+// schema package. Any Rúnar source file larger than this is rejected at
+// the parser entry point (frontend.ParseSource) BEFORE the tokenizer
+// touches the input. BUG-008 follow-up.
+const MaxSourceBytes = 4 * 1024 * 1024
+
 // MaxIRNesting mirrors InputLimits.MAX_NESTING (512) from the TS schema
 // package. ANF IR JSON whose structural nesting (objects + arrays)
 // exceeds this is rejected. Prevents stack-exhaustion DoS via deeply

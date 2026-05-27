@@ -61,7 +61,7 @@ pub fn parse_java(source: &str, file_name: Option<&str>) -> ParseResult {
     let mut parser = JavaParser::new(tokens, file, &mut errors);
     let contract = parser.parse();
 
-    ParseResult { contract, errors }
+    ParseResult { contract, errors, source_size_err: None }
 }
 
 // ---------------------------------------------------------------------------
