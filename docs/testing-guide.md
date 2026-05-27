@@ -71,7 +71,7 @@ pnpm test -- --watch
 
 `TestContract` is the primary test helper. It compiles a contract from source, uses the **interpreter** (not the Script VM) to execute methods, and tracks state changes.
 
-> **Important:** `TestContract` uses mocked cryptographic operations — `checkSig`, `checkPreimage`, `verifyWOTS`, and all signature-related builtins always return `true`. This is intentional: it lets you test business logic (state transitions, assertions, arithmetic) without managing real keys or signatures. For tests that verify actual compiled Script execution, use `TestSmartContract` or `ScriptExecutionContract` instead.
+> **Important:** `TestContract` uses mocked ECDSA cryptographic operations — `checkSig`, `checkMultiSig`, and `checkPreimage` always return `true`. This is intentional: it lets you test business logic (state transitions, assertions, arithmetic) without managing real keys or signatures. The post-quantum (`verifyWOTS`, `verifySLHDSA_SHA2_*`) and Schnorr / EC-arithmetic builtins are **not** mocked — they execute the real algorithm in the interpreter. See [Cryptographic verification in tests](#cryptographic-verification-in-tests) below for the full mocked-vs-real list and the escape hatches for exercising real ECDSA / preimage rejection.
 
 ### Creating an Instance
 
@@ -149,6 +149,81 @@ expect(result.success).toBe(true);
 
 ---
 
+## Cryptographic verification in tests
+
+`TestContract` runs contracts through the ANF interpreter, not a Bitcoin Script VM. The interpreter mocks the ECDSA / preimage builtins so you can write business-logic tests without managing real keys, signatures, or transaction sighashes. The trade-off: a `TestContract` test that "rejects a bad signature" by passing a malformed `sig` value **does not actually exercise ECDSA verification** — `checkSig` returned `true` either way. The rejection in such a test, if there is one, comes from some *other* assertion in the method (a hash mismatch, a state check, etc.), not from the signature being invalid.
+
+This applies symmetrically to every native-tier mock package: `runar` (Go), `runar::prelude` (Rust), `runar` (Python), `runar` (Zig), `runar` (Ruby), and `runar.lang` (Java) all ship `MockSig` / `mock_sig` / `MockPubKey` / `MockPreimage` helpers plus mock `CheckSig` / `CheckPreimage` that always return `true`. Native-tier tests are running the contract as plain code in the host language — they verify business logic, not on-chain cryptographic acceptance.
+
+### What is mocked vs. real in the interpreter
+
+| Builtin | Behavior in interpreter | Notes |
+|---------|------------------------|-------|
+| `checkSig` | **Mocked → always `true`** | Real ECDSA verification requires a transaction sighash that the interpreter does not synthesize. |
+| `checkMultiSig` | **Mocked → always `true`** | Same reason as `checkSig`. |
+| `checkPreimage` | **Mocked → always `true`** | The interpreter does not synthesize a BIP-143 preimage; use `setMockPreimage` to control the *fields* the contract reads. |
+| `verifyRabinSig` | **Mocked → always `true`** | Rabin verification is not implemented in the interpreter. |
+| `verifyWOTS` | **Real** | Runs the actual WOTS+ verification (hash-chain replay). A bad WOTS+ signature *does* fail this check. |
+| `verifySLHDSA_SHA2_*` | **Real** (all 6 parameter sets) | Runs the actual FIPS 205 verifier. |
+| `sha256`, `hash160`, `hash256`, `ripemd160` | **Real** | Standard hash functions. |
+| `sha256Compress`, `sha256Finalize` | **Real** | Partial-block SHA-256 primitives. |
+| `ecAdd`, `ecMul`, `ecMulGen`, `ecNegate`, `ecOnCurve`, `ecModReduce`, `ecEncodeCompressed`, `ecMakePoint`, `ecPointX`, `ecPointY` | **Real** | secp256k1 field/group arithmetic. Schnorr-ZKP and other EC-arithmetic contracts therefore *do* fail the interpreter when the math is wrong. |
+| All math / bitwise / preimage-extractor builtins | **Real** (or fixed test values for preimage extractors) | See the `TestContract` mock-preimage table for the configurable subset. |
+
+The pattern: **mocked = anything whose real implementation needs an ECDSA / Bitcoin sighash context the interpreter does not own**; **real = anything that's a pure function of its inputs** (hashes, EC arithmetic, hash-based PQ signatures, modular arithmetic). PQ and Schnorr-ZKP contracts are exempt from BUG-005's caveats for exactly this reason.
+
+### Escape hatches for real-crypto rejection
+
+If you genuinely need to assert that *the on-chain signature check would reject this input*, `TestContract` is not the right tool. Pick one of:
+
+1. **`ScriptVM` (TypeScript, Go, Rust, Python).** Each of these tiers wraps an upstream BSV SDK's Bitcoin Script interpreter (see CLAUDE.md ⇒ "Off-chain Script VM (`ScriptVM`)" for the exact wrapper and per-tier capabilities). `ScriptVM` executes the *compiled* locking + unlocking scripts and runs real `OP_CHECKSIG` / `OP_CHECKSIGVERIFY` against the supplied signature, pubkey, and sighash. This is the only off-chain path that exercises real ECDSA verification. **Zig, Ruby, and Java have no `ScriptVM`** — by documented project policy, no canonical upstream BSV SDK script interpreter is usable for those tiers (Ruby/Java have no `bsv-blockchain` SDK; the Zig `bsvz` engine does not compile on the repo's Zig 0.16 toolchain).
+2. **Regtest integration tests (all 7 tiers).** `integration/{ts,go,rust,python,ruby,zig,java}` ship end-to-end harnesses that deploy the compiled contract to a local BSV regtest node and spend it for real. Real keys, real ECDSA, real preimage. This is the canonical real-crypto rejection path for Zig, Ruby, and Java.
+3. **Conformance byte-parity (all 7 tiers).** The conformance suite verifies all 7 compilers produce byte-identical Stack IR + script hex for every fixture (subject to the per-fixture `compilers` allowlist). If the TS compiler's compiled hex passes a real-crypto ScriptVM test, and the Zig/Ruby/Java compilers produce the same bytes, the on-chain behavior is the same — but byte-parity is *semantic* assurance, not a VM-level rejection test in those tiers.
+
+### Concrete example: this test does NOT prove signature rejection
+
+```typescript
+import { TestContract } from 'runar-testing';
+
+const contract = TestContract.fromSource(p2pkhSource, { pubKeyHash });
+
+it('rejects a bad signature', () => {
+  // This test fails for the WRONG reason. `checkSig` is mocked to return true,
+  // so the rejection (if any) comes from the assert(hash160(pubKey) === this.pubKeyHash)
+  // line, not from the signature being malformed.
+  const result = contract.call('unlock', {
+    sig: '00'.repeat(70),       // intentionally garbage
+    pubKey: validCompressedPk,  // hash160 still matches pubKeyHash
+  });
+  expect(result.success).toBe(false); // FAILS — the interpreter accepts this.
+});
+```
+
+To actually exercise ECDSA rejection, use `ScriptVM` (TS/Go/Rust/Python) or a regtest integration test (all 7 tiers):
+
+```typescript
+import { ScriptVM, hexToBytes } from 'runar-testing';
+import { compile } from 'runar-compiler';
+
+const vm = new ScriptVM();
+const artifact = compile(p2pkhSource, { fileName: 'P2PKH.runar.ts' });
+
+it('on-chain script rejects a bad signature', () => {
+  const lockingScript = hexToBytes(artifact.script);
+  // Build an unlocking script that pushes a garbage signature + a valid pubkey.
+  const unlockingScript = buildUnlockingScript({
+    sig: '00'.repeat(70),
+    pubKey: validCompressedPk,
+  });
+  const result = vm.execute(unlockingScript, lockingScript, sighashCtx);
+  expect(result.success).toBe(false); // PASSES — OP_CHECKSIG genuinely rejects.
+});
+```
+
+For Zig, Ruby, and Java contracts, drop the `ScriptVM` step and write the equivalent rejection test in `integration/{zig,ruby,java}` against regtest. The Java SDK additionally exposes `runar.lang.runtime.ContractSimulator`, which runs compiled artifacts against real hashes and real secp256k1 with mocked signature-verify — useful for shape/round-trip assertions on the compiled artifact, but **not** a substitute for real-ECDSA rejection (it still mocks the sig check).
+
+---
+
 ## Script VM Testing (Compiled Script Execution)
 
 The `ScriptVM` class can be used directly for lower-level testing without the `TestSmartContract` wrapper. Unlike `TestContract` (which interprets ANF IR with mocked crypto), `ScriptVM` executes actual compiled Bitcoin Script opcodes.
@@ -190,6 +265,20 @@ const decoded = decodeScriptNumber(encoded); // 42n
 isTruthy(new Uint8Array([0x01])); // true
 isTruthy(new Uint8Array([]));     // false (OP_FALSE)
 ```
+
+### Interactive step-through debugger: `runar debug`
+
+`runar debug <artifact>` opens an interactive REPL that runs the compiled Bitcoin Script one opcode at a time, with breakpoints, stack inspection, and source-map mapping back to the original Rúnar source line. It is the step-mode counterpart to `ScriptVM` — built on the same per-tier upstream BSV script interpreter wrapper.
+
+**Available in: TypeScript, Go, Rust, Python.** **Not available in: Zig, Ruby, Java.**
+
+The reason mirrors the [Off-chain Script VM (`ScriptVM`)](../CLAUDE.md) policy: `runar debug` needs the same underlying script interpreter that `ScriptVM` wraps, and no canonical upstream BSV SDK script interpreter is currently usable for the Zig, Ruby, or Java tiers (no `bsv-blockchain` SDK exists for Ruby or Java; the Zig `bsvz` script engine does not compile on the repo's Zig 0.16 toolchain). Per project policy, those three tiers do **not** ship a hand-written Script VM, and therefore do not ship a `runar debug` CLI. See CLAUDE.md ⇒ "Off-chain Script VM (`ScriptVM`)" for the authoritative explanation — this guide does not duplicate it.
+
+**Recommended workflow for Zig, Ruby, Java users who need step-level inspection:**
+
+1. **ANF interpreter** — write the test against the `runar-testing`-style harness in your tier (the native `runar` package's `CompileCheck` + the contract-as-native-code pattern shown earlier in this guide). The interpreter does not single-step opcodes, but it does evaluate the same ANF IR the compiler emits, so you can pinpoint the *line* of contract logic that fails — just not the *opcode* it lowered to.
+2. **Regtest** — deploy the compiled artifact to a local BSV regtest node via `integration/{zig,ruby,java}`. You can rebuild the locking + unlocking scripts by hand, run them through `bitcoin-cli`'s script-decoding tools, and step the failing path that way. Slower than `runar debug`, but it's the canonical real-VM path for these tiers.
+3. **Cross-tier `runar debug`** — for any contract written in a format the TS / Go / Rust / Python frontends accept (every format does — frontend parity is a hard project invariant), you can compile the contract with the Java/Ruby/Zig frontend, then re-compile the same source with `runar` (TS) and run `runar debug` on the TS-tier artifact. Because all 7 compilers produce byte-identical Stack IR + script hex for non-allowlisted fixtures, stepping the TS artifact tells you what the Java/Ruby/Zig artifact does on-chain.
 
 ---
 
