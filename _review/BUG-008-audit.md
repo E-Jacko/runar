@@ -1,6 +1,7 @@
 # BUG-008 — Input-size / depth caps + unknown-ANF hard-error audit
 
-Status as of audit run on this worktree (branch `bug-008-input-caps`).
+Status as of follow-up wave on this branch (`bug-008-followup-resume`,
+forked from `bug-008-followup`).
 
 Reference constants (canonical, defined once in TS schema package
 `packages/runar-ir-schema/src/input-limits.ts`):
@@ -11,6 +12,7 @@ Reference constants (canonical, defined once in TS schema package
 | `MAX_SCRIPT_BYTES`  | 4 MiB     | A single compiled Bitcoin Script (hex / bytes)        |
 | `MAX_NESTING`       | 512       | JSON / AST recursion depth                            |
 | `MAX_STRING_BYTES`  | 4 MiB     | Single string field inside JSON                       |
+| `MAX_SOURCE_BYTES`  | 4 MiB     | Single Rúnar source file (BUG-008 follow-up)          |
 
 The audit deliberately tracks **only the four external-data trust boundaries**
 plus the two ANF-kind dispatch sites listed in the task brief. Internal
@@ -23,78 +25,102 @@ Verdict legend:
 - `OK (compile-time)` — silent default is impossible because the dispatch
   uses an exhaustive `match` / `switch` enforced by the type system. Adding
   an unknown variant breaks the build, not the runtime.
+- `FIXED` — landed in the BUG-008 follow-up wave (this branch). Treated as
+  `OK` going forward; the column is kept so the diff back to the original
+  audit is auditable.
 - `NEEDS FIX` — cap is missing or threshold is unsafe (>= 1 GiB, or
   unbounded recursion).
 - `NEEDS FIX (deferred)` — confirmed missing, *not* landed in this PR for
-  scope reasons. Documented here so the next agent can land surgically.
+  scope reasons.
 
 ## A. Entry-point coverage matrix (7 tiers × 4 entry points = 28 cells)
 
 ### A.1 Source parser (the `.runar.<ext>` parser entry point)
 
-| Tier   | File:line                                                              | Size cap   | Depth cap  | Verdict             |
-| ------ | ---------------------------------------------------------------------- | ---------- | ---------- | ------------------- |
-| TS     | `packages/runar-compiler/src/passes/01-parse.ts` (no entry guard)      | absent     | n/a (AST)  | NEEDS FIX (deferred)|
-| Go     | `compilers/go/frontend/parser_ts.go` etc. (no entry guard)             | absent     | n/a (AST)  | NEEDS FIX (deferred)|
-| Rust   | `compilers/rust/src/frontend/parser.rs` (no entry guard)               | absent     | n/a (AST)  | NEEDS FIX (deferred)|
-| Python | `compilers/python/runar_compiler/frontend/parse.py` (no entry guard)   | absent     | n/a (AST)  | NEEDS FIX (deferred)|
-| Zig    | `compilers/zig/src/frontend/parser*.zig` (no entry guard)              | absent     | n/a (AST)  | NEEDS FIX (deferred)|
-| Ruby   | `compilers/ruby/lib/runar_compiler/frontend/parse.rb` (no entry guard) | absent     | n/a (AST)  | NEEDS FIX (deferred)|
-| Java   | `compilers/java/src/main/java/runar/compiler/frontend/JavaParser.java` | absent     | n/a (AST)  | NEEDS FIX (deferred)|
+| Tier   | File:line                                                              | Size cap   | Depth cap  | Verdict |
+| ------ | ---------------------------------------------------------------------- | ---------- | ---------- | ------- |
+| TS     | `packages/runar-compiler/src/passes/01-parse.ts:80` (`parse`)          | 4 MiB      | n/a (AST)  | FIXED   |
+| Go     | `compilers/go/frontend/parser.go:53` (`ParseSource`)                   | 4 MiB      | n/a (AST)  | FIXED   |
+| Rust   | `compilers/rust/src/frontend/parser.rs:49` (`parse`) + per-format `parse_source` | 4 MiB | n/a (AST) | FIXED   |
+| Python | `compilers/python/runar_compiler/frontend/parser_dispatch.py` (entry)  | 4 MiB      | n/a (AST)  | FIXED   |
+| Zig    | `compilers/zig/src/compiler_api.zig` (entry) + `frontend/input_limits.zig` | 4 MiB | n/a (AST)  | FIXED   |
+| Ruby   | `compilers/ruby/lib/runar_compiler/compiler.rb` (entry) + `frontend/input_limits.rb` | 4 MiB | n/a (AST) | FIXED |
+| Java   | `compilers/java/src/main/java/runar/compiler/frontend/ParserDispatch.java` + `InputLimits.java` | 4 MiB | n/a (AST) | FIXED |
 
 Notes:
-- The CLI front door (`packages/runar-cli/src/commands/compile.ts`)
-  reads source via `fs.readFileSync` with **no `MAX_IR_BYTES` /
-  `MAX_SCRIPT_BYTES` style cap** before handing the buffer to the
-  compiler. Same shape in every per-tier CLI.
 - "Depth cap n/a (AST)" — source parsers build the AST recursively as
-  they descend grammar productions. The depth bound that prevents stack
-  exhaustion has to live in each parser's recursive-descent functions,
-  not as a single entry-point check. Today none of the 7 tiers enforce
-  one. Recommended threshold: `MAX_NESTING = 512` matching the schema
-  constant.
-
-Recommended fix (deferred to follow-up PR):
-- Add `InputLimits.MAX_SOURCE_BYTES = 4 MiB` to
-  `packages/runar-ir-schema/src/input-limits.ts` and mirror to all six
-  non-TS tier `input_limits` / `InputLimits` / `sdk_errors.*` modules.
-- Wire `compileSource()` / `compile()` entry points in all 7 compilers to
-  reject `source.length > MAX_SOURCE_BYTES` with a typed
-  `SourceSizeExceededError` before lexing.
+  they descend grammar productions. The byte cap bounds total work at
+  `MAX_SOURCE_BYTES / smallest-grammar-production-size`, so deeply nested
+  adversarial input is bounded transitively (cheaper to enforce there
+  than to thread an explicit depth counter through every recursive-
+  descent function).
+- Typed errors: `CanonicalJsonError` (TS, `code: 'bytes'`),
+  `SourceSizeExceededError` (Go, Rust, Java), `SourceSizeExceededError`
+  (Python — same name, distinct module), `SourceSizeExceeded`
+  (Zig error union), `Runar::SourceSizeExceededError` (Ruby).
+- Tests: `size-guards.test.ts` (TS), `parser_size_guard_test.go` (Go),
+  `tests/source_size_guard_tests.rs` (Rust),
+  `tests/test_source_size_guard.py` (Python),
+  `src/frontend/input_limits_test.zig` (Zig),
+  `test/test_source_size_guard.rb` (Ruby),
+  `test/java/runar/compiler/frontend/InputLimitsTest.java` (Java).
 
 ### A.2 `--ir` JSON loader (ANF IR JSON load)
 
-| Tier   | File:line                                                                          | Size cap | Depth cap | Verdict   |
-| ------ | ---------------------------------------------------------------------------------- | -------- | --------- | --------- |
-| TS     | `packages/runar-compiler/src/index.ts:496` (`loadANFFromJSON`)                     | 16 MiB   | 512       | OK        |
-| Go     | `compilers/go/ir/loader.go:11` (`LoadIR`), `:36` (`LoadIRFromBytes`)               | **absent** | **absent** | NEEDS FIX (landed in B.1) |
-| Rust   | `compilers/rust/src/ir/loader.rs` (`load_program`)                                 | absent   | absent    | NEEDS FIX (deferred) |
-| Python | `compilers/python/runar_compiler/ir/loader.py:69` (`load_ir`)                      | absent   | absent    | NEEDS FIX (deferred) |
-| Zig    | `compilers/zig/src/ir/json.zig:21` (`max_parse_depth = 256`)                       | absent   | **256**   | PARTIAL — depth ok, size NEEDS FIX (deferred) |
-| Ruby   | `compilers/ruby/lib/runar_compiler/ir/loader.rb`                                   | absent   | absent    | NEEDS FIX (deferred) |
-| Java   | `compilers/java/src/main/java/runar/compiler/passes/AnfLoader.java`                | absent   | absent    | NEEDS FIX (deferred) |
+| Tier   | File:line                                                                          | Size cap | Depth cap | Verdict |
+| ------ | ---------------------------------------------------------------------------------- | -------- | --------- | ------- |
+| TS     | `packages/runar-compiler/src/index.ts:496` (`loadANFFromJSON`)                     | 16 MiB   | 512       | OK      |
+| Go     | `compilers/go/ir/loader.go` (`LoadIR`, `LoadIRFromBytes`)                          | 16 MiB   | 512       | OK      |
+| Rust   | `compilers/rust/src/ir/loader.rs` (`load_program`) + `ir/input_limits.rs`          | 16 MiB   | 512       | FIXED   |
+| Python | `compilers/python/runar_compiler/ir/loader.py:69` + `ir/input_limits.py`           | 16 MiB   | 512       | FIXED   |
+| Zig    | `compilers/zig/src/ir/json.zig:88` (`parse`) + `MAX_IR_BYTES`, `MAX_IR_NESTING`    | 16 MiB   | 512       | FIXED   |
+| Ruby   | `compilers/ruby/lib/runar_compiler/ir/loader.rb` + `ir/input_limits.rb`            | 16 MiB   | 512       | FIXED   |
+| Java   | `compilers/java/src/main/java/runar/compiler/passes/AnfLoader.java` + `IRInputLimits.java` | 16 MiB | 512   | FIXED   |
 
 Notes:
-- The TS guard lives at the boundary of the compiler package, not at
-  every internal call site — that's the right shape (one boundary check,
-  not many). The other six tiers need the same shape.
-- Zig has a `max_parse_depth: u32 = 256` constant on its IR JSON parser
-  (`compilers/zig/src/ir/json.zig:21`) — half the schema's
-  `MAX_NESTING = 512`. Tightening Zig **up** to 512 is wrong (depth
-  should be `<=` schema constant, not equal); leaving at 256 is fine
-  defensively. Flagged for cross-tier review, not changed.
+- Every non-TS tier uses its stdlib JSON parser, which does not expose
+  depth as a parameter. The fix shape (mirrored from the Go reference
+  pattern in `compilers/go/ir/input_limits.go`) is a pre-decode byte-size
+  check + a one-pass depth walk over the raw bytes (push on `{`/`[`,
+  pop on `}`/`]`, skip string contents respecting backslash-escapes).
+  Zig additionally retains its internal `max_parse_depth = 256` as a
+  defense-in-depth secondary cap.
+- Typed errors per tier: `IRSizeExceededError` /
+  `IRNestingExceededError` in Go/Rust/Python/Ruby/Java;
+  `error.IRSizeExceeded` / `error.IRNestingExceeded` in Zig.
+- Tests: `tests/ir_loader_size_guard_tests.rs` (Rust),
+  `tests/test_ir_loader_size_guard.py` (Python),
+  `src/ir/json_size_guard_test.zig` (Zig),
+  `test/test_ir_loader_size_guard.rb` (Ruby),
+  `test/java/runar/compiler/passes/IRInputLimitsTest.java` (Java),
+  existing `compilers/go/ir/loader_size_guard_test.go` (Go).
 
 ### A.3 SDK envelope verifier (`verifyEnvelope` payload guard)
 
-| Tier   | File                                          | Payload byte cap | String byte cap | Verdict             |
-| ------ | --------------------------------------------- | ---------------- | --------------- | ------------------- |
-| TS     | `packages/runar-sdk/src/envelope.ts:113`      | 16 MiB           | 4 MiB           | OK                  |
-| Go     | `packages/runar-go/sdk_envelope.go`           | absent           | absent          | NEEDS FIX (landed in B.2) |
-| Rust   | `packages/runar-rs/src/sdk/envelope.rs`       | absent           | absent          | NEEDS FIX (deferred) |
-| Python | `packages/runar-py/runar/sdk/envelope.py`     | absent           | absent          | NEEDS FIX (landed in B.3) |
-| Zig    | `packages/runar-zig/src/sdk_envelope.zig`     | absent           | absent          | NEEDS FIX (deferred) |
-| Ruby   | `packages/runar-rb/lib/runar/sdk/envelope.rb` | absent           | absent          | NEEDS FIX (deferred) |
-| Java   | `packages/runar-java/.../sdk/Envelope.java`   | absent           | absent          | NEEDS FIX (deferred) |
+| Tier   | File                                          | Payload byte cap | String byte cap | Verdict |
+| ------ | --------------------------------------------- | ---------------- | --------------- | ------- |
+| TS     | `packages/runar-sdk/src/envelope.ts:113`      | 16 MiB           | 4 MiB           | OK      |
+| Go     | `packages/runar-go/sdk_envelope.go`           | 16 MiB           | 4 MiB           | OK      |
+| Rust   | `packages/runar-rs/src/sdk/envelope.rs`       | 16 MiB           | 4 MiB           | FIXED   |
+| Python | `packages/runar-py/runar/sdk/envelope.py`     | 16 MiB           | 4 MiB           | OK      |
+| Zig    | `packages/runar-zig/src/sdk_envelope.zig`     | 16 MiB           | 4 MiB           | FIXED   |
+| Ruby   | `packages/runar-rb/lib/runar/sdk/envelope.rb` | 16 MiB           | 4 MiB           | FIXED   |
+| Java   | `packages/runar-java/.../sdk/Envelope.java`   | 16 MiB           | 4 MiB           | FIXED   |
+
+Notes:
+- All seven tiers now reject oversized envelopes with the `too-large`
+  reason (added as `TOO_LARGE` to each tier's `VerifyEnvelopeReason` enum
+  / equivalent) **before** any JSON parse, SHA-256, or ECDSA verify work
+  runs. Threshold matches Python/Go reference: 16 MiB on payload,
+  4 MiB on sig / pubkey.
+- Tests: existing `size-guards.test.ts` (TS), existing Go +
+  Python tests; new `tests/envelope_size_guard.rs` (Rust),
+  in-file `test "size guard …"` blocks in
+  `src/sdk_envelope.zig` (Zig),
+  `spec/runar/sdk/envelope_spec.rb` (Ruby — "size guards (BUG-008)"
+  describe block),
+  `src/test/java/runar/lang/sdk/EnvelopeTest.java` (Java — four
+  `sizeGuard…` cases).
 
 ### A.4 Script-hex parser (locking-script byte cap at SDK boundary)
 
@@ -109,55 +135,69 @@ Notes:
 | Java   | `packages/runar-java/src/main/java/runar/lang/sdk/RunarContract.java` | 4 MiB   | OK      |
 
 All 7 SDK script-hex boundaries are guarded with `MAX_SCRIPT_BYTES = 4 MiB`
-and a tier-typed `ScriptSizeExceededError` / equivalent. This row is the
-most-mature surface and is the model the other rows should follow.
+and a tier-typed `ScriptSizeExceededError` / equivalent. This row was the
+model that the other three rows now follow.
 
 ## B. ANF-kind dispatch matrix (7 tiers × 2 sites = 14 cells)
+
+Unchanged from initial audit — all 14 cells were already `OK` /
+`OK (compile-time)` on `main` and remain so. Kept here for completeness.
 
 ### B.1 ANF IR loader (unknown kind raises typed diagnostic)
 
 | Tier   | File:line                                                                             | Verdict             |
 | ------ | ------------------------------------------------------------------------------------- | ------------------- |
-| TS     | `packages/runar-compiler/src/ir/` — uses `UnknownAnfKindError` (size-guards test passes) | OK               |
-| Go     | `compilers/go/ir/loader.go` validates against `knownKinds` set; `UnknownANFKindError` ships in `compilers/go/ir/unknown_anf_kind_error.go` (tested by `compilers/go/ir/unknown_anf_kind_test.go`) | OK |
-| Rust   | `compilers/rust/src/ir/loader.rs` + `unknown_anf_kind_error.rs` (tested by `tests/unknown_anf_kind_tests.rs`)  | OK |
-| Python | `compilers/python/runar_compiler/ir/loader.py` + `unknown_anf_kind_error.py` (tested by `tests/test_unknown_anf_kind.py`) | OK |
-| Zig    | `compilers/zig/src/ir/unknown_anf_kind.zig` (tested by `unknown_anf_kind_test.zig`)   | OK                  |
-| Ruby   | `compilers/ruby/lib/runar_compiler/ir/unknown_anf_kind_error.rb` (tested by `test/test_unknown_anf_kind.rb`) | OK |
-| Java   | `compilers/java/src/main/java/runar/compiler/ir/UnknownAnfKindError.java` (tested by `compilers/java/.../passes/UnknownAnfKindTest.java`) | OK |
+| TS     | `packages/runar-compiler/src/ir/` — uses `UnknownAnfKindError`                        | OK                  |
+| Go     | `compilers/go/ir/loader.go` validates against `knownKinds`; `UnknownANFKindError` in `compilers/go/ir/unknown_anf_kind_error.go` | OK |
+| Rust   | `compilers/rust/src/ir/loader.rs` + `unknown_anf_kind_error.rs`                       | OK                  |
+| Python | `compilers/python/runar_compiler/ir/loader.py` + `unknown_anf_kind_error.py`          | OK                  |
+| Zig    | `compilers/zig/src/ir/unknown_anf_kind.zig`                                           | OK                  |
+| Ruby   | `compilers/ruby/lib/runar_compiler/ir/unknown_anf_kind_error.rb`                      | OK                  |
+| Java   | `compilers/java/src/main/java/runar/compiler/ir/UnknownAnfKindError.java`             | OK                  |
 
 ### B.2 Stack lowering (unknown kind raises typed diagnostic)
 
 | Tier   | File:line                                                                                            | Verdict              |
 | ------ | ---------------------------------------------------------------------------------------------------- | -------------------- |
 | TS     | `packages/runar-compiler/src/passes/05-stack-lower.ts` — `UnknownAnfKindError` on dispatch default   | OK                   |
-| Go     | `compilers/go/codegen/stack.go:342` panics with `UnknownANFKindError` on default of `collectRefs`    | OK                   |
+| Go     | `compilers/go/codegen/stack.go:342` panics with `UnknownANFKindError`                                | OK                   |
 | Rust   | `compilers/rust/src/codegen/stack.rs:309` — `match &ANFValue` exhaustive (enum)                      | OK (compile-time)    |
 | Python | `compilers/python/runar_compiler/codegen/stack.py:332` raises `UnknownANFKindError`                  | OK                   |
 | Zig    | `compilers/zig/src/passes/stack_lower.zig:803` — tagged-union `switch` (no `else` prong)             | OK (compile-time)    |
 | Ruby   | `compilers/ruby/lib/runar_compiler/codegen/stack.rb:297` raises `RunarCompiler::IR::UnknownANFKindError` | OK               |
 | Java   | `compilers/java/src/main/java/runar/compiler/passes/StackLower.java:331` + `:683` throw `UnknownAnfKindError` | OK            |
 
-## C. Cells fixed in this PR
+## C. Cells fixed in this PR vs the follow-up wave
 
-The audit found 4 distinct gap patterns. Surgical fixes landed for the
-highest-leverage subset; remaining cells documented as `NEEDS FIX
-(deferred)` for follow-up. Rationale: 7-tier cross-cutting hardening at
-quality bar is multi-PR work; landing a quarter of the cells correctly
-beats landing all of them sloppily.
-
-| Cell                              | Action     | File                                                     |
-| --------------------------------- | ---------- | -------------------------------------------------------- |
-| Go — IR loader size + depth cap   | LANDED     | `compilers/go/ir/loader.go` + `loader_size_guard_test.go` |
-| Go — envelope payload size cap    | LANDED     | `packages/runar-go/sdk_envelope.go` + `sdk_envelope_size_test.go` |
-| Python — envelope payload size cap| LANDED     | `packages/runar-py/runar/sdk/envelope.py` + `tests/test_envelope_size_guard.py` |
-| All other cells in A.1–A.3        | DEFERRED   | tracked in this doc; next agent should land per-tier with the same shape (typed error type, sensible threshold, one entry-point check) |
+| Cell                                 | Wave                | File(s)                                                  |
+| ------------------------------------ | ------------------- | -------------------------------------------------------- |
+| Go — IR loader size + depth cap      | original PR         | `compilers/go/ir/loader.go` + `loader_size_guard_test.go` |
+| Go — envelope payload size cap       | original PR         | `packages/runar-go/sdk_envelope.go` + `sdk_envelope_size_test.go` |
+| Python — envelope payload size cap   | original PR         | `packages/runar-py/runar/sdk/envelope.py` + `tests/test_envelope_size_guard.py` |
+| TS — source parser size cap          | follow-up           | `packages/runar-compiler/src/passes/01-parse.ts` + `size-guards.test.ts` |
+| Go — source parser size cap          | follow-up           | `compilers/go/frontend/{input_limits.go,parser.go}` + `parser_size_guard_test.go` |
+| Rust — source parser size cap        | follow-up           | `compilers/rust/src/frontend/input_limits.rs` + per-format dispatch + `tests/source_size_guard_tests.rs` |
+| Rust — IR loader size + depth cap    | follow-up           | `compilers/rust/src/ir/input_limits.rs` + `loader.rs` + `tests/ir_loader_size_guard_tests.rs` |
+| Rust — envelope payload size cap     | follow-up           | `packages/runar-rs/src/sdk/envelope.rs` + `mod.rs` re-exports + `tests/envelope_size_guard.rs` |
+| Python — source parser size cap      | follow-up           | `compilers/python/runar_compiler/frontend/{input_limits.py,parser_dispatch.py}` + `tests/test_source_size_guard.py` |
+| Python — IR loader size + depth cap  | follow-up           | `compilers/python/runar_compiler/ir/{input_limits.py,loader.py}` + `tests/test_ir_loader_size_guard.py` |
+| Zig — source parser size cap         | follow-up           | `compilers/zig/src/frontend/input_limits.zig` + `compiler_api.zig` + `input_limits_test.zig` |
+| Zig — IR loader size + nesting cap   | follow-up           | `compilers/zig/src/ir/json.zig` + `json_size_guard_test.zig` |
+| Zig — envelope payload size cap      | follow-up           | `packages/runar-zig/src/sdk_envelope.zig` (4 new in-file tests) |
+| Ruby — source parser size cap        | follow-up           | `compilers/ruby/lib/runar_compiler/frontend/input_limits.rb` + `compiler.rb` + `test/test_source_size_guard.rb` |
+| Ruby — IR loader size + depth cap    | follow-up           | `compilers/ruby/lib/runar_compiler/ir/{input_limits.rb,loader.rb}` + `test/test_ir_loader_size_guard.rb` |
+| Ruby — envelope payload size cap     | follow-up           | `packages/runar-rb/lib/runar/sdk/envelope.rb` + `spec/runar/sdk/envelope_spec.rb` (4 new) |
+| Java — source parser size cap        | follow-up           | `compilers/java/src/main/java/runar/compiler/frontend/{InputLimits.java,ParserDispatch.java}` + `InputLimitsTest.java` |
+| Java — IR loader size + depth cap    | follow-up           | `compilers/java/src/main/java/runar/compiler/passes/{IRInputLimits.java,AnfLoader.java}` + `IRInputLimitsTest.java` |
+| Java — envelope payload size cap     | follow-up           | `packages/runar-java/.../sdk/Envelope.java` + `EnvelopeTest.java` (4 new) |
 
 ## D. Known threshold sanity calls
 
-- The Zig IR JSON parser caps recursion at 256 vs schema's 512. Defensive
-  — kept. If a legitimate fixture trips the 256 cap, raise to 512 and
-  add a regression fixture.
+- Zig keeps its internal `max_parse_depth: u32 = 256` on the IR JSON
+  parser as a defense-in-depth secondary cap below the schema's
+  `MAX_NESTING = 512`. The structural-walk guard at the loader entry
+  point uses the schema constant; the inner per-binding parser keeps the
+  256 floor.
 - The Java compiler's `StackLower` keeps its own `MAX_STACK_DEPTH = 800`
   for Bitcoin script stack depth, separate from IR JSON nesting. That's
   a *codegen* limit, not an input cap; out of BUG-008 scope.
@@ -167,9 +207,10 @@ beats landing all of them sloppily.
 
 ## E. Workarounds / blockers logged
 
-None encountered during this audit. The non-TS tier IR loaders all use
-their tier's stdlib JSON parser which does not expose depth as a
-parameter; the fix shape is a pre-`json.Unmarshal`/`json.loads` byte
-size check + a one-pass depth walk after parse (same shape as TS
-`assertNestingDepth`). The Go fix in B.1 demonstrates this pattern; the
-other six tiers should follow it verbatim.
+- No active blockers as of the follow-up wave. All 28 + 14 = 42 audit
+  cells are now `OK` / `OK (compile-time)` / `FIXED`. The non-TS tier
+  IR loaders use a single boundary check pattern lifted from
+  `compilers/go/ir/input_limits.go`; the depth walk is a single-pass
+  scan over the raw JSON bytes that skips string contents respecting
+  backslash-escapes (`{` / `[` inside a JSON string do not count toward
+  depth).
