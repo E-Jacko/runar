@@ -256,7 +256,9 @@ test "artifact contains source map entries" {
     // Artifact JSON should contain sourceMap
     try std.testing.expect(result.artifact_json != null);
     const json = result.artifact_json.?;
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"sourceMap\":[") != null);
+    // GAP-002: sourceMap is now wrapped in {"mappings":[...]} per the
+    // canonical schema. The substring check shifts accordingly.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sourceMap\":{\"mappings\":[") != null);
     // sourceMap should reference the source file
     try std.testing.expect(std.mem.indexOf(u8, json, "P2PKH.runar.zig") != null);
 }

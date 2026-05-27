@@ -1,0 +1,14 @@
+{
+  "mappings": [
+    {"opcodeIndex": 32, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 33, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 34, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 164, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 165, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 166, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 167, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 168, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 169, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 170, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/stateful-counter/Counter.runar.java", "line": 0, "column": 0}
+  ]
+}

@@ -84,6 +84,10 @@ module RunarCompiler
         opts.on("--disable-constant-folding", "Disable the ANF constant folding pass") do
           options[:disable_constant_folding] = true
         end
+
+        opts.on("--emit-source-map PATH", "After a successful compile, write artifact.sourceMap JSON to PATH") do |path|
+          options[:emit_source_map] = path
+        end
       end
 
       parser.parse!(argv)
@@ -173,6 +177,35 @@ module RunarCompiler
         output = artifact.asm
       else
         output = RunarCompiler.artifact_to_json(artifact)
+      end
+
+      # --emit-source-map: write the artifact's sourceMap field as canonical
+      # JSON ({"mappings":[...]}) to the requested path. Always emit the
+      # wrapper object so downstream tooling sees a uniform shape even when
+      # the underlying mapping table is empty.
+      if options[:emit_source_map]
+        sm_path = options[:emit_source_map]
+        sm = artifact.source_map
+        mappings = if sm && !sm.empty?
+          sm.map do |m|
+            if m.is_a?(RunarCompiler::Codegen::SourceMapping)
+              {
+                "opcodeIndex" => m.opcode_index,
+                "sourceFile" => m.source_file,
+                "line" => m.line,
+                "column" => m.column,
+              }
+            else
+              m
+            end
+          end
+        else
+          []
+        end
+        require "fileutils"
+        FileUtils.mkdir_p(File.dirname(sm_path)) if File.dirname(sm_path) != ""
+        File.write(sm_path, JSON.pretty_generate({ "mappings" => mappings }) + "\n")
+        $stderr.puts "Source map written to #{sm_path}"
       end
 
       # Write output

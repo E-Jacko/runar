@@ -109,8 +109,20 @@ public final class AnfLoader {
     private static AnfBinding toBinding(Map<?, ?> obj) {
         String name = asString(obj.get("name"));
         AnfValue v = toValue(asObject(obj.get("value")));
-        return new AnfBinding(name, v, null);
+        // GAP-002: round-trip the optional `sourceLoc` field. Used for
+        // source-map plumbing; omitted (null) for legacy / hand-written
+        // ANF inputs.
+        runar.compiler.ir.ast.SourceLocation loc = null;
+        Object locRaw = obj.get("sourceLoc");
+        if (locRaw instanceof Map<?, ?> locObj) {
+            String file = asString(locObj.get("file"));
+            int line = asInt(locObj.get("line"));
+            int col = asInt(locObj.get("column"));
+            loc = new runar.compiler.ir.ast.SourceLocation(file, line, col);
+        }
+        return new AnfBinding(name, v, loc);
     }
+
 
     private static AnfValue toValue(Map<?, ?> obj) {
         String kind = asString(obj.get("kind"));

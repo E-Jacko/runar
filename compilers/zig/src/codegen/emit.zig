@@ -674,9 +674,11 @@ pub fn emitArtifact(
         try w.writeAll("]");
     }
 
-    // sourceMap — opcode-to-source-location mappings
+    // sourceMap — opcode-to-source-location mappings.
+    // Wrapped in {"mappings":[...]} to match the canonical schema declared
+    // in packages/runar-ir-schema/src/schemas/artifact.schema.json#SourceMap.
     if (ctx.source_map.items.len > 0) {
-        try w.writeAll(",\"sourceMap\":[");
+        try w.writeAll(",\"sourceMap\":{\"mappings\":[");
         for (ctx.source_map.items, 0..) |mapping, i| {
             if (i > 0) try w.writeByte(',');
             try w.writeAll("{\"opcodeIndex\":");
@@ -689,7 +691,7 @@ pub fn emitArtifact(
             try w.print("{d}", .{mapping.column});
             try w.writeByte('}');
         }
-        try w.writeAll("]");
+        try w.writeAll("]}");
     }
 
     // anf — full ANF IR for SDK auto-state computation

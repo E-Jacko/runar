@@ -467,6 +467,10 @@ public final class StackLower {
         Map<String, Integer> arrayLengths = new HashMap<>();
         // Element refs for array_literal bindings (used by checkMultiSig).
         Map<String, List<String>> arrayElements = new HashMap<>();
+        // GAP-002: current AnfBinding's sourceLoc, threaded onto every
+        // StackOp emitted while that binding lowers. The Emit pass walks
+        // op.sourceLoc() to build the artifact's sourceMap.
+        runar.compiler.ir.ast.SourceLocation currentSourceLoc;
 
         LoweringContext(List<String> params, List<AnfProperty> properties) {
             this.sm = new StackMap(params);
@@ -484,14 +488,88 @@ public final class StackLower {
         }
 
         void emitOp(StackOp op) {
-            ops.add(op);
+            // GAP-002: re-stamp the op with the current source loc so the
+            // Emit pass can read it back. Only re-stamp ops that don't
+            // already carry one (e.g. those produced by upstream passes
+            // before this LoweringContext was active).
+            ops.add(stampSourceLoc(op, currentSourceLoc));
             trackDepth();
+        }
+
+        private static runar.compiler.ir.stack.StackOp stampSourceLoc(
+            runar.compiler.ir.stack.StackOp op,
+            runar.compiler.ir.ast.SourceLocation loc
+        ) {
+            if (loc == null) return op;
+            runar.compiler.ir.stack.StackSourceLoc sl =
+                new runar.compiler.ir.stack.StackSourceLoc(loc.file(), loc.line(), loc.column());
+            if (op instanceof runar.compiler.ir.stack.OpcodeOp o) {
+                if (o.sourceLoc() != null) return o;
+                return new runar.compiler.ir.stack.OpcodeOp(o.code(), sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.DupOp d) {
+                if (d.sourceLoc() != null) return d;
+                return new runar.compiler.ir.stack.DupOp(sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.SwapOp d) {
+                if (d.sourceLoc() != null) return d;
+                return new runar.compiler.ir.stack.SwapOp(sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.DropOp d) {
+                if (d.sourceLoc() != null) return d;
+                return new runar.compiler.ir.stack.DropOp(sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.NipOp d) {
+                if (d.sourceLoc() != null) return d;
+                return new runar.compiler.ir.stack.NipOp(sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.OverOp d) {
+                if (d.sourceLoc() != null) return d;
+                return new runar.compiler.ir.stack.OverOp(sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.RotOp d) {
+                if (d.sourceLoc() != null) return d;
+                return new runar.compiler.ir.stack.RotOp(sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.TuckOp d) {
+                if (d.sourceLoc() != null) return d;
+                return new runar.compiler.ir.stack.TuckOp(sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.PushOp p) {
+                if (p.sourceLoc() != null) return p;
+                return new runar.compiler.ir.stack.PushOp(p.value(), sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.PickOp p) {
+                if (p.sourceLoc() != null) return p;
+                return new runar.compiler.ir.stack.PickOp(p.depth(), sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.RollOp p) {
+                if (p.sourceLoc() != null) return p;
+                return new runar.compiler.ir.stack.RollOp(p.depth(), sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.IfOp i) {
+                if (i.sourceLoc() != null) return i;
+                return new runar.compiler.ir.stack.IfOp(i.thenBranch(), i.elseBranch(), sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.PlaceholderOp p) {
+                if (p.sourceLoc() != null) return p;
+                return new runar.compiler.ir.stack.PlaceholderOp(p.paramIndex(), p.paramName(), sl);
+            }
+            if (op instanceof runar.compiler.ir.stack.PushCodeSepIndexOp p) {
+                if (p.sourceLoc() != null) return p;
+                return new runar.compiler.ir.stack.PushCodeSepIndexOp(sl);
+            }
+            // RawBytesOp has no sourceLoc field — skip.
+            return op;
         }
 
         LoweringContext subContext() {
             LoweringContext c = new LoweringContext(null, properties);
             c.sm.slots.addAll(this.sm.slots);
             c.privateMethods = this.privateMethods;
+            // GAP-002: nested branches keep the outer statement's loc by
+            // default; the inner binding loop will override on each step.
+            c.currentSourceLoc = this.currentSourceLoc;
             return c;
         }
 
@@ -626,12 +704,25 @@ public final class StackLower {
 
             for (int i = 0; i < bindings.size(); i++) {
                 AnfBinding b = bindings.get(i);
-                if (b.value() instanceof Assert a && i == lastAssertIdx) {
-                    lowerAssert(a.value(), i, lastUses, true);
-                } else if (b.value() instanceof If iv && i == terminalIfIdx) {
-                    lowerIf(b.name(), iv.cond(), iv.thenBranch(), iv.elseBranch(), i, lastUses, true);
-                } else {
-                    lowerBinding(b, i, lastUses);
+                // GAP-002: stamp the binding's sourceLoc onto every StackOp
+                // emitted while it lowers. We deliberately keep the loc
+                // sticky AFTER the binding closes — nothing reads it until
+                // the next binding overwrites it — so peephole-survivable
+                // ops get a deterministic anchor.
+                runar.compiler.ir.ast.SourceLocation prev = currentSourceLoc;
+                if (b.sourceLoc() != null) {
+                    currentSourceLoc = b.sourceLoc();
+                }
+                try {
+                    if (b.value() instanceof Assert a && i == lastAssertIdx) {
+                        lowerAssert(a.value(), i, lastUses, true);
+                    } else if (b.value() instanceof If iv && i == terminalIfIdx) {
+                        lowerIf(b.name(), iv.cond(), iv.thenBranch(), iv.elseBranch(), i, lastUses, true);
+                    } else {
+                        lowerBinding(b, i, lastUses);
+                    }
+                } finally {
+                    currentSourceLoc = prev;
                 }
             }
         }
