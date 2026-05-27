@@ -447,7 +447,7 @@ fn compileFromSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8,
     // --emit-source-map: extract the artifact's sourceMap object (or emit
     // the empty {"mappings":[]} wrapper if absent) and write it to PATH.
     if (opts.emit_source_map_path) |sm_path| {
-        try writeSourceMapToPath(work_allocator, io, artifact, sm_path);
+        try writeSourceMapToPath(work_allocator, io, artifact, sm_path, path);
     }
 
     try writeStdoutLn(io, artifact);
@@ -455,13 +455,54 @@ fn compileFromSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8,
     std.debug.print("Compiled: {s}\n", .{path});
 }
 
+/// GAP-011: source-map sourceFile values must be repo-relative (POSIX) so
+/// goldens stay stable across worktree paths and developer machines. Walk
+/// up from `src_path` looking for pnpm-workspace.yaml (the canonical repo
+/// root marker); fall back to the basename if no marker is found. Returns
+/// allocator-owned bytes.
+///
+/// Only handles absolute paths — relative paths are returned unchanged
+/// (the runner always invokes the compiler with an absolute --source).
+fn repoRelativeFileName(allocator: std.mem.Allocator, io: std.Io, src_path: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsolute(src_path)) {
+        return try allocator.dupe(u8, src_path);
+    }
+
+    var dir_opt: ?[]const u8 = std.fs.path.dirname(src_path);
+    while (dir_opt) |dir| {
+        const marker = try std.fs.path.join(allocator, &.{ dir, "pnpm-workspace.yaml" });
+        defer allocator.free(marker);
+        const exists = blk: {
+            const f = std.Io.Dir.cwd().openFile(io, marker, .{}) catch break :blk false;
+            f.close(io);
+            break :blk true;
+        };
+        if (exists) {
+            // dir is the repo root — strip it from src_path plus the leading sep.
+            if (src_path.len > dir.len + 1 and std.mem.startsWith(u8, src_path, dir) and src_path[dir.len] == std.fs.path.sep) {
+                const rel = src_path[dir.len + 1 ..];
+                // Normalize to POSIX separators.
+                const out = try allocator.dupe(u8, rel);
+                for (out) |*c| {
+                    if (c.* == std.fs.path.sep_windows) c.* = '/';
+                }
+                return out;
+            }
+            break;
+        }
+        dir_opt = std.fs.path.dirname(dir);
+    }
+    return try allocator.dupe(u8, std.fs.path.basename(src_path));
+}
+
 /// Extract the `"sourceMap":{...}` substring from the emitted artifact JSON
 /// (or fall back to the empty `{"mappings":[]}` wrapper) and write it to
-/// `sm_path`.
-fn writeSourceMapToPath(allocator: std.mem.Allocator, io: std.Io, artifact_json: []const u8, sm_path: []const u8) !void {
-    _ = allocator;
+/// `sm_path`. Replaces the absolute sourceFile string (path passed via
+/// `src_path`) with its repo-relative POSIX form to keep goldens stable
+/// across worktree paths.
+fn writeSourceMapToPath(allocator: std.mem.Allocator, io: std.Io, artifact_json: []const u8, sm_path: []const u8, src_path: []const u8) !void {
     const marker = "\"sourceMap\":";
-    var payload: []const u8 = "{\"mappings\":[]}";
+    var payload_raw: []const u8 = "{\"mappings\":[]}";
     if (std.mem.indexOf(u8, artifact_json, marker)) |idx| {
         const after = idx + marker.len;
         if (after < artifact_json.len and artifact_json[after] == '{') {
@@ -488,9 +529,26 @@ fn writeSourceMapToPath(allocator: std.mem.Allocator, io: std.Io, artifact_json:
                     if (depth == 0) { p += 1; break; }
                 }
             }
-            payload = artifact_json[after..p];
+            payload_raw = artifact_json[after..p];
         }
     }
+
+    // GAP-011: rewrite each `"sourceFile":"<abs>"` to its repo-relative form.
+    // All mappings in a single compile share the same sourceFile, so a simple
+    // string replace is sound.
+    const rel_name = try repoRelativeFileName(allocator, io, src_path);
+    defer allocator.free(rel_name);
+
+    const needle = try std.fmt.allocPrint(allocator, "\"sourceFile\":\"{s}\"", .{src_path});
+    defer allocator.free(needle);
+    const replacement = try std.fmt.allocPrint(allocator, "\"sourceFile\":\"{s}\"", .{rel_name});
+    defer allocator.free(replacement);
+
+    const size = std.mem.replacementSize(u8, payload_raw, needle, replacement);
+    const payload = try allocator.alloc(u8, size);
+    defer allocator.free(payload);
+    _ = std.mem.replace(u8, payload_raw, needle, replacement, payload);
+
     var file = try std.Io.Dir.cwd().createFile(io, sm_path, .{});
     defer file.close(io);
     var buf: [4096]u8 = undefined;
