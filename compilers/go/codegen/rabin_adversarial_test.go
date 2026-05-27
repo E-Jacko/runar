@@ -279,12 +279,11 @@ func TestEmitVerifyRabinSig_RejectsForgedSignature(t *testing.T) {
 	//
 	// The conventional Rabin-in-Bitcoin-Script defense against this is to
 	// require `0 <= padding < SOMETHING_SMALL` (typically padding < 2^k for
-	// some small k, enforced by OP_BIN2NUM / OP_SIZE in the calling contract)
-	// so an attacker cannot freely choose a multi-hundred-bit padding to
-	// cancel out an arbitrary sig^2. The Rúnar `EmitVerifyRabinSig` primitive
-	// does NOT enforce that range — it's intentionally a low-level building
-	// block, and the caller (the contract author) is responsible for bounding
-	// padding before passing it in.
+	// some small k). As of BUG-010, `EmitVerifyRabinSig` itself enforces
+	// `0 <= padding < 65536` on-chain via OP_WITHIN, so a multi-hundred-bit
+	// attacker-chosen padding can no longer cancel out an arbitrary sig^2.
+	// See `_review/BUG-010-rfc.md` and the `RejectsForgedPaddingExploit`
+	// regression test below.
 	//
 	// We therefore split the assertion into two cases that BOTH must hold:
 	//
@@ -462,3 +461,76 @@ func TestEmitVerifyRabinSig_RejectsMalleatedSignature(t *testing.T) {
 		}
 	})
 }
+
+// TestEmitVerifyRabinSig_RejectsForgedPaddingExploit is the BUG-010 regression
+// test: it constructs the canonical forgery from `_review/BUG-004-finding.md`
+// — attacker-chosen `sig` plus `padding := SHA256(msg)_LE - sig^2 mod n` —
+// and asserts the emitted script REJECTS it. The forged padding is a
+// multi-hundred-bit value, far above the on-chain 65536 bound, so OP_WITHIN
+// must fail and OP_VERIFY must abort.
+//
+// Before BUG-010 the script accepted this forgery (the modular equation
+// holds by construction); after BUG-010 the padding range check fails first.
+func TestEmitVerifyRabinSig_RejectsForgedPaddingExploit(t *testing.T) {
+	_, _, n := rabinAdvTestKey(t)
+	msg := scriptSafeMsg(t)
+
+	// Attacker picks any sig — the BUG-004 finding used sig = 12345.
+	forgedSig := big.NewInt(12345)
+
+	// Solve: padding ≡ SHA256(msg)_LE − forgedSig^2  (mod n).
+	h := sha256.Sum256(msg)
+	hashLE := new(big.Int)
+	for i := 0; i < len(h); i++ {
+		hashLE.Add(hashLE, new(big.Int).Lsh(big.NewInt(int64(h[i])), uint(i*8)))
+	}
+	forgedSigSq := new(big.Int).Mul(forgedSig, forgedSig)
+	forgedPadding := new(big.Int).Sub(hashLE, forgedSigSq)
+	forgedPadding.Mod(forgedPadding, n)
+	if forgedPadding.Sign() < 0 {
+		forgedPadding.Add(forgedPadding, n)
+	}
+
+	// Sanity: the forged padding is gigantic (≈ n, ≈ 2^260) — vastly above 65536.
+	if forgedPadding.Cmp(big.NewInt(65536)) < 0 {
+		t.Fatalf("forged padding %v is below the 65536 bound — test would be vacuous",
+			forgedPadding)
+	}
+
+	// Sanity: the modular equation DOES hold (this is the whole point of the
+	// exploit). If it didn't, the script would reject for the wrong reason.
+	if !rabinAdvVerify(msg, forgedSig, forgedPadding, n) {
+		t.Fatalf("forged (sig, padding) does not satisfy the modular equation — test setup broken")
+	}
+
+	ops := buildRabinVerifyScript(msg, forgedSig, forgedPadding, n)
+	if err := BuildAndExecuteOps(ops); err == nil {
+		t.Fatalf("emitted Rabin script ACCEPTED the BUG-004 forgery exploit " +
+			"(sig=12345, padding ≈ 2^260). The on-chain 0<=padding<65536 bound is missing or broken.")
+	}
+}
+
+// TestEmitVerifyRabinSig_AcceptsRealSmallPadding is the BUG-010 positive
+// regression: a genuine signature with `padding < 1000` (as produced by
+// `packages/runar-go/rabin.go::RabinSign`) must still verify under the new
+// emission. This pins that the 0<=padding<65536 range check does not regress
+// legitimate signatures.
+func TestEmitVerifyRabinSig_AcceptsRealSmallPadding(t *testing.T) {
+	p, q, n := rabinAdvTestKey(t)
+	msg := scriptSafeMsg(t)
+	sig, padding := rabinAdvSign(t, msg, p, q)
+
+	// Confirm the property the RFC promises: the legitimate signer always
+	// stays under 1000 (well within the 65536 ceiling).
+	if padding.Cmp(big.NewInt(1000)) >= 0 {
+		t.Fatalf("legitimate signer produced padding=%v >= 1000 — invariant from "+
+			"packages/runar-go/rabin.go violated", padding)
+	}
+
+	ops := buildRabinVerifyScript(msg, sig, padding, n)
+	if err := BuildAndExecuteOps(ops); err != nil {
+		t.Fatalf("emitted Rabin script rejected a real RabinSign signature "+
+			"with padding=%v (< 1000): %v", padding, err)
+	}
+}
+
