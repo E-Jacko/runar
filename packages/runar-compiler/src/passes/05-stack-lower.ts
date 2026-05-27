@@ -1184,6 +1184,18 @@ class LoweringContext {
     // Handle @ref: aliases (ANF variable aliasing)
     if (typeof value === 'string' && value.startsWith('@ref:')) {
       const refName = value.slice(5);
+      // Special case: aliasing an array_literal (metadata-only binding,
+      // not present in the stack-map). Copy the array metadata under the
+      // new binding name and emit no stack moves.
+      const refElems = this.arrayElements.get(refName);
+      if (refElems !== undefined) {
+        this.arrayElements.set(bindingName, [...refElems]);
+        const refLen = this.arrayLengths.get(refName);
+        if (refLen !== undefined) {
+          this.arrayLengths.set(bindingName, refLen);
+        }
+        return;
+      }
       if (this.stackMap.has(refName)) {
         // Only consume (ROLL) if the ref target is a local binding in the
         // current scope. Outer-scope refs must be copied (PICK) so that the

@@ -1126,6 +1126,16 @@ impl LoweringContext {
         if let Some(ConstValue::Str(ref s)) = value.const_value() {
             if s.len() > 5 && &s[..5] == "@ref:" {
                 let ref_name = &s[5..];
+                // Special case: aliasing an array_literal (metadata-only
+                // binding, not present in the stack-map). Copy the array
+                // metadata under the new binding name and emit no stack moves.
+                if let Some(refs) = self.array_elements.get(ref_name).cloned() {
+                    self.array_elements.insert(binding_name.to_string(), refs);
+                    if let Some(len) = self.array_lengths.get(ref_name).copied() {
+                        self.array_lengths.insert(binding_name.to_string(), len);
+                    }
+                    return;
+                }
                 if self.sm.has(ref_name) {
                     // Only consume (ROLL) if the ref target is a local binding in the
                     // current scope. Outer-scope refs must be copied (PICK) so that the

@@ -1058,6 +1058,20 @@ func (ctx *loweringContext) lowerLoadConst(bindingName string, value *ir.ANFValu
 	// unless this is the last use, in which case we consume it via ROLL.
 	if value.ConstString != nil && len(*value.ConstString) > 5 && (*value.ConstString)[:5] == "@ref:" {
 		refName := (*value.ConstString)[5:]
+		// Special case: aliasing an array_literal (metadata-only binding,
+		// not present in the stack-map). Copy the array metadata under the
+		// new binding name and emit no stack moves.
+		if refElems, ok := ctx.arrayElements[refName]; ok {
+			copy := make([]string, len(refElems))
+			for i, e := range refElems {
+				copy[i] = e
+			}
+			ctx.arrayElements[bindingName] = copy
+			if refLen, ok2 := ctx.arrayLengths[refName]; ok2 {
+				ctx.arrayLengths[bindingName] = refLen
+			}
+			return
+		}
 		if ctx.sm.has(refName) {
 			// Only consume (ROLL) if the ref target is a local binding in the
 			// current scope. Outer-scope refs must be copied (PICK) so that the

@@ -266,9 +266,31 @@ public final class StackLower {
 
     static Map<String, Integer> computeLastUses(List<AnfBinding> bindings) {
         Map<String, Integer> lastUse = new HashMap<>();
+        // Pre-scan: map each array_literal binding to its element refs. Used to
+        // propagate last-use across the array indirection (the array binding is
+        // pure metadata in lowerArrayLiteral — its elements must remain live
+        // until the array's consumer, not until the array_literal binding itself).
+        Map<String, List<String>> arrayElems = new HashMap<>();
+        for (AnfBinding b : bindings) {
+            if (b.value() instanceof ArrayLiteral al) {
+                arrayElems.put(b.name(), new ArrayList<>(al.elements()));
+            }
+        }
         for (int i = 0; i < bindings.size(); i++) {
-            for (String r : collectRefs(bindings.get(i).value())) {
+            AnfValue v = bindings.get(i).value();
+            // array_literal is metadata-only — do NOT advance its elements'
+            // last-use to here; defer to the array's consumer.
+            if (v instanceof ArrayLiteral) {
+                continue;
+            }
+            for (String r : collectRefs(v)) {
                 lastUse.put(r, i);
+                List<String> elems = arrayElems.get(r);
+                if (elems != null) {
+                    for (String e : elems) {
+                        lastUse.put(e, i);
+                    }
+                }
             }
         }
         return lastUse;
@@ -462,6 +484,8 @@ public final class StackLower {
         boolean insideBranch;
         // Element counts for array_literal bindings (used by checkMultiSig).
         Map<String, Integer> arrayLengths = new HashMap<>();
+        // Element refs for array_literal bindings (used by checkMultiSig).
+        Map<String, List<String>> arrayElements = new HashMap<>();
 
         LoweringContext(List<String> params, List<AnfProperty> properties) {
             this.sm = new StackMap(params);
@@ -740,6 +764,16 @@ public final class StackLower {
                 String raw = bc.hex();
                 if (raw != null && raw.length() > 5 && raw.startsWith("@ref:")) {
                     String refName = raw.substring(5);
+                    // Special case: aliasing an array_literal (metadata-only
+                    // binding, not present in the stack-map). Copy the array
+                    // metadata under the new binding name and emit no stack moves.
+                    List<String> refElems = arrayElements.get(refName);
+                    if (refElems != null) {
+                        arrayElements.put(bindingName, new ArrayList<>(refElems));
+                        Integer refLen = arrayLengths.get(refName);
+                        if (refLen != null) arrayLengths.put(bindingName, refLen);
+                        return;
+                    }
                     if (sm.has(refName)) {
                         boolean consume = Boolean.TRUE.equals(localBindings.get(refName))
                             && isLastUse(refName, idx, lastUses);
@@ -1133,35 +1167,51 @@ public final class StackLower {
             trackDepth();
         }
 
-        // checkMultiSig(sigs, pks):
-        //   OP_0 <sig1> ... <sigN> <nSigs> <pk1> ... <pkM> <nPKs> OP_CHECKMULTISIG
-        // Element counts come from arrayLengths, populated by lowerArrayLiteral.
+        // Lower checkMultiSig([sig1..sigN], [pk1..pkM]).
+        //
+        // OP_CHECKMULTISIG expects the stack (bottom -> top):
+        //   <dummy=OP_0> <sig1> ... <sigN> <N> <pk1> ... <pkM> <M>
+        //
+        // args[0] and args[1] are bindings produced by array_literal. Those
+        // bindings are NOT physical stack slots — their element refs live on
+        // the stack-map as individual named bindings. We pull each element to
+        // TOS via bringToTop. computeLastUses propagates each element's
+        // last-use through the array indirection to THIS binding.
         void lowerCheckMultiSig(String bindingName, List<String> args, int idx, Map<String, Integer> lastUses) {
             String sigsRef = args.get(0);
             String pksRef = args.get(1);
-            int nSigs = arrayLengths.getOrDefault(sigsRef, 1);
-            int nPks = arrayLengths.getOrDefault(pksRef, 1);
+            List<String> sigElems = arrayElements.get(sigsRef);
+            List<String> pkElems = arrayElements.get(pksRef);
+            if (sigElems == null || pkElems == null) {
+                throw new RuntimeException(
+                    "checkMultiSig: array_literal metadata missing (sigs=" + sigsRef + ", pks=" + pksRef + ")");
+            }
 
-            // Push OP_0 dummy (Bitcoin CHECKMULTISIG off-by-one bug workaround)
+            // Dummy OP_0 (historical CHECKMULTISIG off-by-one).
             emitOp(new PushOp(PushValue.of(0)));
             sm.push("");
 
-            // Bring sigs array ref to top (the individual elements are treated as one item)
-            bringToTop(sigsRef, isLastUse(sigsRef, idx, lastUses));
+            // Bring each sig element to TOS in declaration order.
+            for (String sig : sigElems) {
+                bringToTop(sig, isLastUse(sig, idx, lastUses));
+            }
 
-            // Push nSigs count
-            emitOp(new PushOp(PushValue.of(nSigs)));
+            // Push nSigs.
+            emitOp(new PushOp(PushValue.of(sigElems.size())));
             sm.push("");
 
-            // Bring pubkeys array ref to top
-            bringToTop(pksRef, isLastUse(pksRef, idx, lastUses));
+            // Bring each pubkey element to TOS in declaration order.
+            for (String pk : pkElems) {
+                bringToTop(pk, isLastUse(pk, idx, lastUses));
+            }
 
-            // Push nPKs count
-            emitOp(new PushOp(PushValue.of(nPks)));
+            // Push nPKs.
+            emitOp(new PushOp(PushValue.of(pkElems.size())));
             sm.push("");
 
-            // Pop everything: OP_0 + sigs + nSigs + pks + nPKs = 5 stack-map entries.
-            for (int i = 0; i < 5; i++) {
+            // OP_CHECKMULTISIG consumes: dummy + N sigs + nSigs + M pks + nPKs.
+            int consumed = 1 + sigElems.size() + 1 + pkElems.size() + 1;
+            for (int i = 0; i < consumed; i++) {
                 sm.pop();
             }
 
@@ -2917,22 +2967,14 @@ public final class StackLower {
         // ---------------- array_literal ----------------
 
         void lowerArrayLiteral(String bindingName, List<String> elements, int idx, Map<String, Integer> lastUses) {
-            // Bring each element to TOS in order; on the stack-map collapse the
-            // N entries into a single logical slot labelled with the binding
-            // name. Consumers (e.g. checkMultiSig) treat the whole array as
-            // one stack item and read the element count from arrayLengths.
-            for (String el : elements) {
-                bringToTop(el, isLastUse(el, idx, lastUses));
-            }
-            // Pop all elements from the stack map (consumed into the array)
-            for (int i = 0; i < elements.size(); i++) {
-                sm.pop();
-            }
-            // Push a single entry representing the whole array
-            sm.push(bindingName);
-            // Record the array length so checkMultiSig can emit nSigs/nPKs.
+            // Metadata-only. Array literals in Rúnar today only feed into
+            // checkMultiSig. Pre-laying the elements onto the runtime stack
+            // here would desync the stack-map from the runtime stack (the
+            // map can only model one slot per binding, but an array binding
+            // spans N runtime slots). lowerCheckMultiSig pulls each element
+            // to TOS at the use site.
             arrayLengths.put(bindingName, elements.size());
-            trackDepth();
+            arrayElements.put(bindingName, new ArrayList<>(elements));
         }
 
         // ---------------- helpers: varint encoding, push-data encoding ----------------
