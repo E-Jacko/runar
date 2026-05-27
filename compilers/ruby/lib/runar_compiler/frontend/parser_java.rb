@@ -1632,13 +1632,15 @@ module RunarCompiler
         # 'new' use is rejected.
         if tok.kind == TOK_NEW
           advance
-          # Consume the type tokens until '{' or ';' or ')'
-          # Simple form: new <Type>[] { expr, ... }
-          # Consume dotted type name.
-          expect(TOK_IDENT, "type name after 'new'")
+          # `new T[] { expr, ... }` array literal OR
+          # `new BigInteger("decimal" [, radix])` oversize-bigint escape hatch.
+          first_name_tok = expect(TOK_IDENT, "type name after 'new'")
+          final_name = first_name_tok.value
           while check(TOK_DOT) && peek_next.kind == TOK_IDENT
-            advance
-            advance
+            advance # '.'
+            seg = peek
+            advance # ident
+            final_name = seg.value
           end
           # Optional generic <...>
           if match_tok(TOK_LT)
@@ -1650,6 +1652,46 @@ module RunarCompiler
               end
               advance
             end
+          end
+          # `new BigInteger("decimal" [, radix])` — fold to BigIntLiteral so
+          # contracts can express 256-bit constants (e.g. secp256k1 group
+          # order) that don't fit in a Java `long`.
+          if final_name == "BigInteger" && check(TOK_LPAREN)
+            advance
+            if peek.kind == TOK_STRING
+              str_tok = peek
+              advance
+              radix = 10
+              if match_tok(TOK_COMMA)
+                if peek.kind == TOK_NUMBER
+                  num_tok = peek
+                  advance
+                  begin
+                    radix = Integer(num_tok.value, 0)
+                  rescue ArgumentError
+                    radix = 10
+                  end
+                end
+              end
+              match_tok(TOK_RPAREN)
+              cleaned = str_tok.value.tr("_", "")
+              begin
+                value = Integer(cleaned, radix)
+              rescue ArgumentError => e
+                fatal("cannot parse 'new BigInteger(#{str_tok.value.inspect}, #{radix})': #{e.message} in #{@file_name}")
+              end
+              return BigIntLiteral.new(value: value)
+            end
+            # Skip balanced parens for diagnostic purposes.
+            depth = 1
+            while depth > 0 && !check(TOK_EOF)
+              case peek.kind
+              when TOK_LPAREN then depth += 1
+              when TOK_RPAREN then depth -= 1
+              end
+              advance
+            end
+            fatal("`new BigInteger(...)` only supports string-literal forms in #{@file_name}")
           end
           # Array markers []
           while check(TOK_LBRACKET)

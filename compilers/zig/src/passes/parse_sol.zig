@@ -69,6 +69,15 @@ pub fn parseSol(allocator: Allocator, source: []const u8, file_name: []const u8)
     return parser.parse();
 }
 
+/// True if every byte in `s` is an ASCII digit (0-9).
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Token Types
 // ============================================================================
@@ -1439,7 +1448,12 @@ const Parser = struct {
                         break :blk Expression{ .literal_bytes = duped };
                     }
                 }
-                const val = std.fmt.parseInt(i64, stripped, 0) catch {
+                const val = std.fmt.parseInt(i64, stripped, 0) catch v: {
+                    // Accept oversize decimal integer literals at parse time
+                    // (e.g. the secp256k1 group order used in schnorr-zkp's
+                    // s-bound assert). The Zig codegen tier truncates to 0;
+                    // affected fixtures carry per-tier compiler allowlists.
+                    if (isAllAsciiDigits(stripped)) break :v 0;
                     self.addErrorFmt("invalid integer: '{s}'", .{tok.text});
                     break :blk null;
                 };

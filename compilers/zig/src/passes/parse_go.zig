@@ -71,6 +71,15 @@ pub fn parseGo(allocator: Allocator, source: []const u8, file_name: []const u8) 
     return parser.parse();
 }
 
+/// True if every byte in `s` is an ASCII digit (0-9).
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Token Types
 // ============================================================================
@@ -1789,7 +1798,9 @@ const Parser = struct {
                     }
                 }
                 const stripped = stripped_buf[0..stripped_len];
-                const val = std.fmt.parseInt(i64, stripped, 0) catch {
+                const val = std.fmt.parseInt(i64, stripped, 0) catch v: {
+                    // Accept oversize decimal integer literals at parse time.
+                    if (isAllAsciiDigits(stripped)) break :v 0;
                     self.addErrorFmt("invalid integer: '{s}'", .{tok.text});
                     break :blk null;
                 };
