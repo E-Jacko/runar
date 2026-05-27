@@ -146,33 +146,14 @@ public final class StackLower {
         "~", List.of("OP_INVERT")
     );
 
-    // Builtins whose Stack-IR codegen ships in the Go tier ONLY by design.
-    // These power Mode-3 STARK / FRI / Groth16 verification flows that have
-    // not been ported to the other six compiler tiers. The Java stack lowerer
-    // intentionally rejects them — see CLAUDE.md ("Go-only crypto codegen
-    // modules") and conformance/README.md ("Per-fixture compiler allowlist").
-    private static final Set<String> GO_ONLY_BUILTINS = Set.of(
-        // BabyBear field
-        "bbFieldAdd", "bbFieldSub", "bbFieldMul", "bbFieldInv",
-        "bbExt4Mul0", "bbExt4Mul1", "bbExt4Mul2", "bbExt4Mul3",
-        "bbExt4Inv0", "bbExt4Inv1", "bbExt4Inv2", "bbExt4Inv3",
-        // KoalaBear field
-        "kbFieldAdd", "kbFieldSub", "kbFieldMul", "kbFieldInv",
-        "kbExt4Mul0", "kbExt4Mul1", "kbExt4Mul2", "kbExt4Mul3",
-        "kbExt4Inv0", "kbExt4Inv1", "kbExt4Inv2", "kbExt4Inv3",
-        // Poseidon2 + Merkle (Poseidon2-KB)
-        "merkleRootPoseidon2KB",
-        // BN254 field + curve + pairing
-        "bn254FieldAdd", "bn254FieldSub", "bn254FieldMul",
-        "bn254FieldInv", "bn254FieldNeg",
-        "bn254G1Add", "bn254G1ScalarMul", "bn254G1Negate", "bn254G1OnCurve",
-        "bn254Pairing", "bn254MultiPairing3", "bn254MultiPairing4",
-        // Groth16 witness-assisted helpers
-        "assertGroth16WitnessAssisted", "assertGroth16WitnessAssistedWithMSM",
-        "groth16PublicInput",
-        // SP1 FRI verifier
-        "verifySP1FRI"
-    );
+    // Go-only Mode-3 STARK / FRI / Groth16 verifier builtins are now routed
+    // through dedicated stub codegen modules (BabyBear, KoalaBear,
+    // Poseidon2KoalaBear, Poseidon2Merkle, Bn254, Merkle, FiatShamirKb) in
+    // runar.compiler.codegen — each module's dispatch() throws
+    // UnsupportedOperationException with a CLAUDE.md pointer. See the
+    // dispatch chain in lowerBuiltinCall(). The old GO_ONLY_BUILTINS Set
+    // was removed in favour of module-presence parity with the other 5
+    // non-Go tiers (TS / Rust / Python / Zig / Ruby).
 
     // ------------------------------------------------------------------
     // StackMap: tracks named values on the stack
@@ -898,6 +879,45 @@ public final class StackLower {
             }
 
             // ------------------------------------------------------------------
+            // Go-only Mode-3 STARK / FRI / Groth16 verifier families:
+            // BabyBear, KoalaBear, Poseidon2-KB, Poseidon2-Merkle, BN254/Groth16,
+            // sha256-Merkle, FiatShamir-KB. Java tier carries presence-only stubs
+            // for parity with the other 5 non-Go tiers; the dispatch methods
+            // throw UnsupportedOperationException with a CLAUDE.md pointer.
+            // Fixtures that exercise these primitives MUST carry a
+            // "compilers": ["go"] allowlist in source.json. See CLAUDE.md
+            // ("Go-only crypto codegen modules") and conformance/README.md.
+            // ------------------------------------------------------------------
+            if (runar.compiler.codegen.BabyBear.isBabyBearBuiltin(funcName)) {
+                runar.compiler.codegen.BabyBear.dispatch(funcName, this::emitOp);
+                return; // unreachable — dispatch always throws
+            }
+            if (runar.compiler.codegen.KoalaBear.isKoalaBearBuiltin(funcName)) {
+                runar.compiler.codegen.KoalaBear.dispatch(funcName, this::emitOp);
+                return; // unreachable
+            }
+            if (runar.compiler.codegen.Poseidon2KoalaBear.isPoseidon2KoalaBearBuiltin(funcName)) {
+                runar.compiler.codegen.Poseidon2KoalaBear.dispatch(funcName, this::emitOp);
+                return; // unreachable
+            }
+            if (runar.compiler.codegen.Poseidon2Merkle.isPoseidon2MerkleBuiltin(funcName)) {
+                runar.compiler.codegen.Poseidon2Merkle.dispatch(funcName, this::emitOp);
+                return; // unreachable
+            }
+            if (runar.compiler.codegen.Bn254.isBn254Builtin(funcName)) {
+                runar.compiler.codegen.Bn254.dispatch(funcName, this::emitOp);
+                return; // unreachable
+            }
+            if (runar.compiler.codegen.Merkle.isMerkleBuiltin(funcName)) {
+                runar.compiler.codegen.Merkle.dispatch(funcName, this::emitOp);
+                return; // unreachable
+            }
+            if (runar.compiler.codegen.FiatShamirKb.isFiatShamirKbBuiltin(funcName)) {
+                runar.compiler.codegen.FiatShamirKb.dispatch(funcName, this::emitOp);
+                return; // unreachable
+            }
+
+            // ------------------------------------------------------------------
             // Math + ByteString builtins: substr, safediv, safemod, percentOf.
             // Each emits a small fixed opcode sequence; mirror Python/Rust exactly.
             // ------------------------------------------------------------------
@@ -954,15 +974,11 @@ public final class StackLower {
 
             List<String> opcodes = BUILTIN_OPCODES.get(funcName);
             if (opcodes == null) {
-                if (GO_ONLY_BUILTINS.contains(funcName)) {
-                    throw new IllegalStateException(
-                        "builtin '" + funcName + "' is Go-tier only by design — "
-                        + "its Stack-IR codegen ships in the Go compiler only "
-                        + "(BabyBear/KoalaBear/Poseidon2/BN254/Groth16/SP1-FRI/FiatShamir-KB modules). "
-                        + "Compile this contract with the Go compiler, or opt the fixture out of the Java tier "
-                        + "via source.json's \"compilers\" allowlist. "
-                        + "See CLAUDE.md (\"Go-only crypto codegen modules\") and conformance/README.md.");
-                }
+                // Go-only builtins are intercepted above via the BabyBear /
+                // KoalaBear / Poseidon2KoalaBear / Poseidon2Merkle / Bn254 /
+                // Merkle / FiatShamirKb dispatch chain, which throws
+                // UnsupportedOperationException with a CLAUDE.md pointer.
+                // Anything that reaches here is a genuinely unknown builtin.
                 throw new IllegalStateException(
                     "unknown builtin: '" + funcName + "' is not a known Rúnar builtin. "
                     + "If this is a Rúnar built-in function, add it to StackLower.BUILTIN_OPCODES "
