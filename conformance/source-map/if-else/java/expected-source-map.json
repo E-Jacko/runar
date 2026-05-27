@@ -1,0 +1,12 @@
+{
+  "mappings": [
+    {"opcodeIndex": 0, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/if-else/IfElse.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 1, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/if-else/IfElse.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 3, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/if-else/IfElse.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 4, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/if-else/IfElse.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 6, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/if-else/IfElse.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 7, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/if-else/IfElse.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 9, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/if-else/IfElse.runar.java", "line": 0, "column": 0},
+    {"opcodeIndex": 10, "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/java/src/main/java/runar/examples/if-else/IfElse.runar.java", "line": 0, "column": 0}
+  ]
+}
