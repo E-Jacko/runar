@@ -384,6 +384,18 @@ const (
 	ReasonEnvelopeMismatch VerifyEnvelopeReason = "envelope-mismatch"
 	ReasonBadSig          VerifyEnvelopeReason = "bad-sig"
 	ReasonPubkeyNotAllowed VerifyEnvelopeReason = "pubkey-not-allowed"
+	// ReasonTooLarge mirrors the TS 'too-large' reason. Returned BEFORE
+	// any JSON parse / ECDSA verify work when an envelope string field
+	// exceeds its InputLimits cap (DoS-bound).
+	ReasonTooLarge VerifyEnvelopeReason = "too-large"
+)
+
+// Envelope DoS-bound caps. Mirror InputLimits.{MAX_IR_BYTES, MAX_STRING_BYTES}
+// from the TS schema package. Public so callers and tests can reference
+// them directly.
+const (
+	MaxEnvelopePayloadBytes = MaxScriptBytes * 4 // 16 MiB — matches MAX_IR_BYTES
+	MaxEnvelopeFieldBytes   = MaxScriptBytes     // 4 MiB — matches MAX_STRING_BYTES
 )
 
 // VerifyEnvelopeOpts captures the input to VerifyEnvelope.
@@ -413,6 +425,21 @@ func VerifyEnvelope(opts VerifyEnvelopeOpts) VerifyEnvelopeResult {
 	now := opts.NowMs
 	if now == 0 {
 		now = time.Now().UnixMilli()
+	}
+
+	// 0. DoS-bound size guard. Reject envelopes whose string fields exceed
+	//    their InputLimits cap BEFORE running JSON parse, hashing, or
+	//    ECDSA verify — those operations are linear in input size and a
+	//    pathological 100 MB payload would otherwise pin the goroutine.
+	//    Mirrors the TS 'too-large' rejection at sdk/envelope.ts:104.
+	if len(env.Payload) > MaxEnvelopePayloadBytes {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonTooLarge}
+	}
+	if len(env.Sig) > MaxEnvelopeFieldBytes {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonTooLarge}
+	}
+	if len(env.Pubkey) > MaxEnvelopeFieldBytes {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonTooLarge}
 	}
 
 	// 1. Field presence + types.
