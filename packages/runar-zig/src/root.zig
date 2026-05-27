@@ -29,6 +29,7 @@ pub const sdk_anf_interpreter = @import("sdk_anf_interpreter.zig");
 pub const sdk_envelope = @import("sdk_envelope.zig");
 pub const sdk_wallet = @import("sdk_wallet.zig");
 pub const sdk_http_client = @import("sdk_http_client.zig");
+pub const analyzer = @import("analyzer.zig");
 pub const CurlHttpTransport = sdk_http_client.CurlHttpTransport;
 pub const StdHttpTransport = sdk_http_client.StdHttpTransport;
 
@@ -248,6 +249,13 @@ test {
     _ = @import("sdk_codegen_conformance_test.zig");
     _ = @import("sdk_wallet.zig");
     _ = @import("sdk_http_client.zig");
+    _ = @import("analyzer.zig");
+    _ = @import("analyzer_script_parser.zig");
+    _ = @import("analyzer_stack.zig");
+    _ = @import("analyzer_path.zig");
+    _ = @import("analyzer_sig.zig");
+    _ = @import("analyzer_opcode_concerns.zig");
+    _ = @import("analyzer_conformance_test.zig");
     _ = @import("runtime_vectors_test.zig");
     if (build_options.has_bsvz_runar_harness) {
         _ = @import("script_integration_test.zig");
