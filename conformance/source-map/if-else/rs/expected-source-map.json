@@ -2,85 +2,85 @@
   "mappings": [
     {
       "opcodeIndex": 0,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 11,
       "column": 9
     },
     {
       "opcodeIndex": 1,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 12,
       "column": 9
     },
     {
       "opcodeIndex": 2,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 12,
       "column": 9
     },
     {
       "opcodeIndex": 3,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 12,
       "column": 9
     },
     {
       "opcodeIndex": 4,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 12,
       "column": 9
     },
     {
       "opcodeIndex": 5,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 12,
       "column": 9
     },
     {
       "opcodeIndex": 6,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 12,
       "column": 9
     },
     {
       "opcodeIndex": 7,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 12,
       "column": 9
     },
     {
       "opcodeIndex": 8,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 12,
       "column": 9
     },
     {
       "opcodeIndex": 9,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 12,
       "column": 9
     },
     {
       "opcodeIndex": 10,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 12,
       "column": 9
     },
     {
       "opcodeIndex": 11,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 17,
       "column": 9
     },
     {
       "opcodeIndex": 12,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 17,
       "column": 9
     },
     {
       "opcodeIndex": 13,
-      "sourceFile": "IfElse.runar.rs",
+      "sourceFile": "examples/rust/if-else/IfElse.runar.rs",
       "line": 17,
       "column": 9
     }

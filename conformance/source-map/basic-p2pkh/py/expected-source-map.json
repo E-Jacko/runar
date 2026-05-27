@@ -2,31 +2,31 @@
   "mappings": [
     {
       "opcodeIndex": 0,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/python/p2pkh/P2PKH.runar.py",
+      "sourceFile": "examples/python/p2pkh/P2PKH.runar.py",
       "line": 40,
       "column": 8
     },
     {
       "opcodeIndex": 1,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/python/p2pkh/P2PKH.runar.py",
+      "sourceFile": "examples/python/p2pkh/P2PKH.runar.py",
       "line": 40,
       "column": 8
     },
     {
       "opcodeIndex": 2,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/python/p2pkh/P2PKH.runar.py",
+      "sourceFile": "examples/python/p2pkh/P2PKH.runar.py",
       "line": 40,
       "column": 8
     },
     {
       "opcodeIndex": 3,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/python/p2pkh/P2PKH.runar.py",
+      "sourceFile": "examples/python/p2pkh/P2PKH.runar.py",
       "line": 40,
       "column": 8
     },
     {
       "opcodeIndex": 4,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/python/p2pkh/P2PKH.runar.py",
+      "sourceFile": "examples/python/p2pkh/P2PKH.runar.py",
       "line": 42,
       "column": 8
     }

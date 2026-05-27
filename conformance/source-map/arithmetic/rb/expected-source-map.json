@@ -2,169 +2,169 @@
   "mappings": [
     {
       "opcodeIndex": 0,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 13,
       "column": 5
     },
     {
       "opcodeIndex": 1,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 13,
       "column": 5
     },
     {
       "opcodeIndex": 2,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 14,
       "column": 5
     },
     {
       "opcodeIndex": 3,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 14,
       "column": 5
     },
     {
       "opcodeIndex": 4,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 14,
       "column": 5
     },
     {
       "opcodeIndex": 5,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 14,
       "column": 5
     },
     {
       "opcodeIndex": 6,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 14,
       "column": 5
     },
     {
       "opcodeIndex": 7,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 15,
       "column": 5
     },
     {
       "opcodeIndex": 8,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 15,
       "column": 5
     },
     {
       "opcodeIndex": 9,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 15,
       "column": 5
     },
     {
       "opcodeIndex": 10,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 15,
       "column": 5
     },
     {
       "opcodeIndex": 11,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 15,
       "column": 5
     },
     {
       "opcodeIndex": 12,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 16,
       "column": 5
     },
     {
       "opcodeIndex": 13,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 16,
       "column": 5
     },
     {
       "opcodeIndex": 14,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 16,
       "column": 5
     },
     {
       "opcodeIndex": 15,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 16,
       "column": 5
     },
     {
       "opcodeIndex": 16,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 16,
       "column": 5
     },
     {
       "opcodeIndex": 17,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 17,
       "column": 5
     },
     {
       "opcodeIndex": 18,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 17,
       "column": 5
     },
     {
       "opcodeIndex": 19,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 17,
       "column": 5
     },
     {
       "opcodeIndex": 20,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 17,
       "column": 5
     },
     {
       "opcodeIndex": 21,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 17,
       "column": 5
     },
     {
       "opcodeIndex": 22,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 17,
       "column": 5
     },
     {
       "opcodeIndex": 23,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 17,
       "column": 5
     },
     {
       "opcodeIndex": 24,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 17,
       "column": 5
     },
     {
       "opcodeIndex": 25,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 17,
       "column": 5
     },
     {
       "opcodeIndex": 26,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 18,
       "column": 5
     },
     {
       "opcodeIndex": 27,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/arithmetic/Arithmetic.runar.rb",
+      "sourceFile": "examples/ruby/arithmetic/Arithmetic.runar.rb",
       "line": 18,
       "column": 5
     }

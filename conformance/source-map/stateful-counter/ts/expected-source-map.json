@@ -2,49 +2,49 @@
   "mappings": [
     {
       "opcodeIndex": 32,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ts/stateful-counter/Counter.runar.ts",
+      "sourceFile": "examples/ts/stateful-counter/Counter.runar.ts",
       "line": 39,
       "column": 4
     },
     {
       "opcodeIndex": 34,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ts/stateful-counter/Counter.runar.ts",
+      "sourceFile": "examples/ts/stateful-counter/Counter.runar.ts",
       "line": 39,
       "column": 4
     },
     {
       "opcodeIndex": 164,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ts/stateful-counter/Counter.runar.ts",
+      "sourceFile": "examples/ts/stateful-counter/Counter.runar.ts",
       "line": 47,
       "column": 4
     },
     {
       "opcodeIndex": 165,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ts/stateful-counter/Counter.runar.ts",
+      "sourceFile": "examples/ts/stateful-counter/Counter.runar.ts",
       "line": 47,
       "column": 4
     },
     {
       "opcodeIndex": 166,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ts/stateful-counter/Counter.runar.ts",
+      "sourceFile": "examples/ts/stateful-counter/Counter.runar.ts",
       "line": 47,
       "column": 4
     },
     {
       "opcodeIndex": 167,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ts/stateful-counter/Counter.runar.ts",
+      "sourceFile": "examples/ts/stateful-counter/Counter.runar.ts",
       "line": 47,
       "column": 4
     },
     {
       "opcodeIndex": 168,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ts/stateful-counter/Counter.runar.ts",
+      "sourceFile": "examples/ts/stateful-counter/Counter.runar.ts",
       "line": 48,
       "column": 4
     },
     {
       "opcodeIndex": 170,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ts/stateful-counter/Counter.runar.ts",
+      "sourceFile": "examples/ts/stateful-counter/Counter.runar.ts",
       "line": 48,
       "column": 4
     }
