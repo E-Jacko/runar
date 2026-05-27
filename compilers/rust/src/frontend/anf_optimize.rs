@@ -5,7 +5,7 @@
 //!
 //! Mirrors the TypeScript optimizer in `packages/runar-compiler/src/optimizer/anf-ec.ts`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::ir::{ANFBinding, ANFMethod, ANFProgram, ANFValue};
 
@@ -366,145 +366,11 @@ fn try_rewrite(
 // ---------------------------------------------------------------------------
 // Dead binding elimination
 // ---------------------------------------------------------------------------
-
-/// Collect all referenced binding names from a value.
-fn collect_refs_from_value(value: &ANFValue, refs: &mut HashSet<String>) {
-    match value {
-        ANFValue::LoadParam { .. } => {
-            // Do NOT track @ref: targets here — matches TS collectRefsFromValue
-            // which breaks on load_param without collecting refs.
-        }
-        ANFValue::LoadProp { .. } | ANFValue::GetStateScript {} => {}
-        // raw_script — opaque byte span, no SSA operand refs. Stack effect is
-        // declared via in_arity / out_arity.
-        ANFValue::RawScript { .. } => {}
-        ANFValue::LoadConst { value } => {
-            // Track @ref: aliases as references to prevent DCE
-            if let serde_json::Value::String(s) = value {
-                if let Some(target) = s.strip_prefix("@ref:") {
-                    refs.insert(target.to_string());
-                }
-            }
-        }
-        ANFValue::BinOp { left, right, .. } => {
-            refs.insert(left.clone());
-            refs.insert(right.clone());
-        }
-        ANFValue::UnaryOp { operand, .. } => {
-            refs.insert(operand.clone());
-        }
-        ANFValue::Call { args, .. } => {
-            for arg in args {
-                refs.insert(arg.clone());
-            }
-        }
-        ANFValue::MethodCall { object, args, .. } => {
-            refs.insert(object.clone());
-            for arg in args {
-                refs.insert(arg.clone());
-            }
-        }
-        ANFValue::If {
-            cond,
-            then: then_branch,
-            else_branch,
-        } => {
-            refs.insert(cond.clone());
-            for b in then_branch {
-                collect_refs_from_value(&b.value, refs);
-            }
-            for b in else_branch {
-                collect_refs_from_value(&b.value, refs);
-            }
-        }
-        ANFValue::Loop { body, .. } => {
-            for b in body {
-                collect_refs_from_value(&b.value, refs);
-            }
-        }
-        ANFValue::Assert { value } => {
-            refs.insert(value.clone());
-        }
-        ANFValue::UpdateProp { value, .. } => {
-            refs.insert(value.clone());
-        }
-        ANFValue::CheckPreimage { preimage } => {
-            refs.insert(preimage.clone());
-        }
-        ANFValue::DeserializeState { preimage } => {
-            refs.insert(preimage.clone());
-        }
-        ANFValue::AddOutput {
-            satoshis,
-            state_values,
-            preimage,
-        } => {
-            refs.insert(satoshis.clone());
-            for sv in state_values {
-                refs.insert(sv.clone());
-            }
-            if !preimage.is_empty() {
-                refs.insert(preimage.clone());
-            }
-        }
-        ANFValue::AddRawOutput { satoshis, script_bytes } => {
-            refs.insert(satoshis.clone());
-            refs.insert(script_bytes.clone());
-        }
-        ANFValue::AddDataOutput { satoshis, script_bytes } => {
-            refs.insert(satoshis.clone());
-            refs.insert(script_bytes.clone());
-        }
-        ANFValue::ArrayLiteral { elements } => {
-            for elem in elements {
-                refs.insert(elem.clone());
-            }
-        }
-    }
-}
-
-/// Returns true if the binding has side effects and must not be eliminated.
-fn has_side_effect(value: &ANFValue) -> bool {
-    matches!(
-        value,
-        ANFValue::Assert { .. }
-            | ANFValue::UpdateProp { .. }
-            | ANFValue::CheckPreimage { .. }
-            | ANFValue::DeserializeState { .. }
-            | ANFValue::AddOutput { .. }
-            | ANFValue::AddRawOutput { .. }
-            | ANFValue::AddDataOutput { .. }
-            | ANFValue::MethodCall { .. }
-            | ANFValue::Call { .. }
-            // opaque byte span — DCE must never eliminate it
-            | ANFValue::RawScript { .. }
-    )
-}
-
-/// Eliminate dead (unreferenced, side-effect-free) bindings, iterating to fixed point.
-fn eliminate_dead_bindings_method(method: &ANFMethod) -> ANFMethod {
-    let mut body = method.body.clone();
-    loop {
-        let mut refs = HashSet::new();
-        for binding in &body {
-            collect_refs_from_value(&binding.value, &mut refs);
-        }
-
-        let before_len = body.len();
-        body.retain(|b| refs.contains(&b.name) || has_side_effect(&b.value));
-
-        if body.len() == before_len {
-            break;
-        }
-    }
-
-    ANFMethod {
-        name: method.name.clone(),
-        params: method.params.clone(),
-        body,
-        is_public: method.is_public,
-    }
-}
+//
+// The DCE pass lives in its own discrete module now (`frontend::dce`).
+// This re-export preserves the legacy intra-crate symbols so existing
+// call sites in this file keep compiling unchanged.
+use super::dce::eliminate_dead_bindings_method;
 
 // ---------------------------------------------------------------------------
 // Method optimizer

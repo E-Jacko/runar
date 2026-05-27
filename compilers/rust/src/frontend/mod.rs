@@ -9,6 +9,7 @@
 pub mod anf_lower;
 pub mod anf_optimize;
 pub mod constant_fold;
+pub mod dce;
 pub mod ast;
 pub mod diagnostic;
 pub mod expand_fixed_arrays;
