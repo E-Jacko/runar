@@ -1576,7 +1576,17 @@ func (ctx *lowerCtx) lowerDecrementExpr(e DecrementExpr) string {
 // ---------------------------------------------------------------------------
 
 func makeLoadConstInt(val *big.Int) ir.ANFValue {
-	raw, _ := json.Marshal(val)
+	// big.Int's default JSON marshaler emits the value as a JSON number,
+	// which Go's encoding/json prints in scientific notation for magnitudes
+	// > ~1e15 — silently losing precision for 256-bit constants like the
+	// secp256k1 group order used in schnorr-zkp's s-bound assert. Emit as
+	// a quoted decimal string so the IR round-trips losslessly across tiers.
+	var raw json.RawMessage
+	if val.IsInt64() {
+		raw, _ = json.Marshal(val.Int64())
+	} else {
+		raw, _ = json.Marshal(val.String())
+	}
 	v := ir.ANFValue{
 		Kind:        "load_const",
 		RawValue:    raw,
