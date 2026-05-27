@@ -298,8 +298,28 @@ impl StackMap {
 
 fn compute_last_uses(bindings: &[ANFBinding]) -> HashMap<String, usize> {
     let mut last_use = HashMap::new();
+    // Pre-scan: map each array_literal binding to its element refs. Used to
+    // propagate last-use across the array indirection (the array binding is
+    // pure metadata in lower_array_literal — its elements must remain live
+    // until the array's consumer, not until the array_literal binding itself).
+    let mut array_elems: HashMap<String, Vec<String>> = HashMap::new();
+    for b in bindings {
+        if let ANFValue::ArrayLiteral { elements } = &b.value {
+            array_elems.insert(b.name.clone(), elements.clone());
+        }
+    }
     for (i, binding) in bindings.iter().enumerate() {
+        // array_literal is metadata-only — do NOT advance its elements'
+        // last-use to here; defer to the array's consumer.
+        if matches!(&binding.value, ANFValue::ArrayLiteral { .. }) {
+            continue;
+        }
         for r in collect_refs(&binding.value) {
+            if let Some(elems) = array_elems.get(&r) {
+                for e in elems {
+                    last_use.insert(e.clone(), i);
+                }
+            }
             last_use.insert(r, i);
         }
     }
@@ -422,6 +442,8 @@ struct LoweringContext {
     const_values: HashMap<String, ConstValue>,
     /// Element counts for array_literal bindings (used by checkMultiSig).
     array_lengths: HashMap<String, usize>,
+    /// Element refs for array_literal bindings (used by checkMultiSig).
+    array_elements: HashMap<String, Vec<String>>,
 }
 
 impl LoweringContext {
@@ -439,6 +461,7 @@ impl LoweringContext {
             current_source_loc: None,
             const_values: HashMap::new(),
             array_lengths: HashMap::new(),
+            array_elements: HashMap::new(),
         };
         ctx.track_depth();
         ctx
@@ -1103,6 +1126,16 @@ impl LoweringContext {
         if let Some(ConstValue::Str(ref s)) = value.const_value() {
             if s.len() > 5 && &s[..5] == "@ref:" {
                 let ref_name = &s[5..];
+                // Special case: aliasing an array_literal (metadata-only
+                // binding, not present in the stack-map). Copy the array
+                // metadata under the new binding name and emit no stack moves.
+                if let Some(refs) = self.array_elements.get(ref_name).cloned() {
+                    self.array_elements.insert(binding_name.to_string(), refs);
+                    if let Some(len) = self.array_lengths.get(ref_name).copied() {
+                        self.array_lengths.insert(binding_name.to_string(), len);
+                    }
+                    return;
+                }
                 if self.sm.has(ref_name) {
                     // Only consume (ROLL) if the ref target is a local binding in the
                     // current scope. Outer-scope refs must be copied (PICK) so that the
@@ -2439,28 +2472,18 @@ impl LoweringContext {
         &mut self,
         binding_name: &str,
         elements: &[String],
-        binding_index: usize,
-        last_uses: &HashMap<String, usize>,
+        _binding_index: usize,
+        _last_uses: &HashMap<String, usize>,
     ) {
-        // An array_literal brings each element to the top of the stack in order.
-        // On the stack-map we collapse the N elements into a single logical slot
-        // labelled with the binding name; consumers (e.g. checkMultiSig) treat
-        // the whole array as one stack item so depths line up with TS.
-        for elem in elements {
-            let is_last = self.is_last_use(elem, binding_index, last_uses);
-            self.bring_to_top(elem, is_last);
-        }
-        // Pop all elements from the stack map (they're consumed into the array)
-        for _ in 0..elements.len() {
-            self.sm.pop();
-        }
-        // Push a single entry representing the whole array
-        self.sm.push(binding_name);
-        // Record the array length so checkMultiSig can emit the correct
-        // nSigs/nPKs count pushes between bringing the sigs and pks arrays.
+        // Metadata-only. Array literals in Rúnar today only feed into
+        // checkMultiSig. Pre-laying the elements onto the runtime stack here
+        // would desync the stack-map from the runtime stack (the map can only
+        // model one slot per binding, but an array binding spans N runtime
+        // slots). lower_check_multi_sig pulls each element to TOS at the use site.
         self.array_lengths
             .insert(binding_name.to_string(), elements.len());
-        self.track_depth();
+        self.array_elements
+            .insert(binding_name.to_string(), elements.to_vec());
     }
 
     /// Lower a `raw_script` ANF node to a single opaque `raw_bytes` StackOp.
@@ -2517,40 +2540,56 @@ impl LoweringContext {
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
-        // checkMultiSig(sigs, pks) — emits the OP_CHECKMULTISIG sequence.
-        // Bitcoin Script stack layout:
-        //   OP_0 <sig1> ... <sigN> <nSigs> <pk1> ... <pkM> <nPKs> OP_CHECKMULTISIG
+        // Lower checkMultiSig([sig1..sigN], [pk1..pkM]).
         //
-        // The two args reference array_literal bindings whose individual elements
-        // are already on the stack.
-
+        // OP_CHECKMULTISIG expects the stack (bottom -> top):
+        //   <dummy=OP_0> <sig1> ... <sigN> <N> <pk1> ... <pkM> <M>
+        //
+        // args[0] and args[1] are bindings produced by array_literal. Those
+        // bindings are NOT physical stack slots — their element refs live on
+        // the stack-map as individual named bindings. We pull each element to
+        // TOS via bring_to_top. compute_last_uses propagates each element's
+        // last-use through the array indirection to THIS binding.
         let sigs_ref = &args[0];
         let pks_ref = &args[1];
-        let n_sigs = *self.array_lengths.get(sigs_ref).unwrap_or(&1);
-        let n_pks = *self.array_lengths.get(pks_ref).unwrap_or(&1);
+        let sig_elems = self
+            .array_elements
+            .get(sigs_ref)
+            .cloned()
+            .unwrap_or_else(|| panic!("checkMultiSig: array_literal metadata missing for sigs={}", sigs_ref));
+        let pk_elems = self
+            .array_elements
+            .get(pks_ref)
+            .cloned()
+            .unwrap_or_else(|| panic!("checkMultiSig: array_literal metadata missing for pks={}", pks_ref));
 
-        // Push OP_0 dummy (Bitcoin CHECKMULTISIG off-by-one bug workaround)
+        // Dummy OP_0 (historical CHECKMULTISIG off-by-one).
         self.emit_op(StackOp::Push(PushValue::Int(0)));
         self.sm.push("");
 
-        // Bring sigs array ref to top (the individual elements are treated as one item)
-        let sigs_is_last = self.is_last_use(sigs_ref, binding_index, last_uses);
-        self.bring_to_top(sigs_ref, sigs_is_last);
+        // Bring each sig element to TOS in declaration order.
+        for sig in &sig_elems {
+            let is_last = self.is_last_use(sig, binding_index, last_uses);
+            self.bring_to_top(sig, is_last);
+        }
 
-        // Push nSigs count
-        self.emit_op(StackOp::Push(PushValue::Int(n_sigs as i128)));
+        // Push nSigs.
+        self.emit_op(StackOp::Push(PushValue::Int(sig_elems.len() as i128)));
         self.sm.push("");
 
-        // Bring pubkeys array ref to top
-        let pks_is_last = self.is_last_use(pks_ref, binding_index, last_uses);
-        self.bring_to_top(pks_ref, pks_is_last);
+        // Bring each pubkey element to TOS in declaration order.
+        for pk in &pk_elems {
+            let is_last = self.is_last_use(pk, binding_index, last_uses);
+            self.bring_to_top(pk, is_last);
+        }
 
-        // Push nPKs count
-        self.emit_op(StackOp::Push(PushValue::Int(n_pks as i128)));
+        // Push nPKs.
+        self.emit_op(StackOp::Push(PushValue::Int(pk_elems.len() as i128)));
         self.sm.push("");
 
-        // Pop everything: OP_0 + sigs + nSigs + pks + nPKs = 5 stack-map entries.
-        for _ in 0..5 {
+        // OP_CHECKMULTISIG consumes: dummy + N sigs + nSigs + M pks + nPKs.
+        let consumed = 1 + sig_elems.len() + 1 + pk_elems.len() + 1;
+        for _ in 0..consumed {
             self.sm.pop();
         }
 
