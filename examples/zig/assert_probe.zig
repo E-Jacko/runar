@@ -70,6 +70,11 @@ fn runCase(probe_case: []const u8) !void {
     if (std.mem.eql(u8, probe_case, "auction-close-wrong-sig")) return probeAuctionCloseWrongSig();
     if (std.mem.eql(u8, probe_case, "covenant-vault-wrong-output")) return probeCovenantVaultWrongOutput();
     if (std.mem.eql(u8, probe_case, "covenant-vault-wrong-sig")) return probeCovenantVaultWrongSig();
+    if (std.mem.eql(u8, probe_case, "covenant-vault-zero-outputs")) return probeCovenantVaultZeroOutputs();
+    if (std.mem.eql(u8, probe_case, "covenant-vault-extra-output")) return probeCovenantVaultExtraOutput();
+    if (std.mem.eql(u8, probe_case, "covenant-vault-reordered")) return probeCovenantVaultReordered();
+    if (std.mem.eql(u8, probe_case, "covenant-vault-amount-minus-one")) return probeCovenantVaultAmountMinusOne();
+    if (std.mem.eql(u8, probe_case, "covenant-vault-amount-plus-one")) return probeCovenantVaultAmountPlusOne();
     if (std.mem.eql(u8, probe_case, "oracle-price-wrong-rabin-proof")) return probeOraclePriceWrongRabinProof();
     if (std.mem.eql(u8, probe_case, "oracle-price-below-threshold")) return probeOraclePriceBelowThreshold();
     if (std.mem.eql(u8, probe_case, "oracle-price-wrong-receiver-sig")) return probeOraclePriceWrongReceiverSig();
@@ -282,6 +287,74 @@ fn probeCovenantVaultWrongSig() !void {
         .outputHash = runar.hash256(expected_output),
     });
     vault.spend(runar.signTestMessage(runar.BOB), preimage);
+}
+
+// -- Adversarial output-shape probes ----------------------------------------
+//
+// These build the *contract-shaped* expected output (ASCII-bytes 1976a914 ‖
+// pkh ‖ 88ac — matching how `runar.cat("1976a914", recipient)` evaluates
+// natively in Zig). The happy-path test in CovenantVault_test.zig uses the
+// same helper, so the adversarial cases differ from it in exactly the
+// attacker-controlled dimension (count / order / value).
+fn covenantExpectedOutput(recipient: []const u8, amount: i64) []const u8 {
+    const script_prefix = runar.cat("1976a914", recipient);
+    const p2pkh_script = runar.cat(script_prefix, "88ac");
+    return runar.cat(runar.num2bin(amount, 8), p2pkh_script);
+}
+
+fn probeCovenantVaultZeroOutputs() !void {
+    const recipient = runar.BOB.pubKeyHash;
+    const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
+    // hashOutputs commits to *no* outputs at all (n-1).
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(""),
+    });
+    vault.spend(runar.signTestMessage(runar.ALICE), preimage);
+}
+
+fn probeCovenantVaultExtraOutput() !void {
+    const recipient = runar.BOB.pubKeyHash;
+    const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
+    const required = covenantExpectedOutput(recipient, 5000);
+    const extra_pkh = [_]u8{0xcc} ** 20;
+    const extra = covenantExpectedOutput(&extra_pkh, 1000);
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(runar.cat(required, extra)),
+    });
+    vault.spend(runar.signTestMessage(runar.ALICE), preimage);
+}
+
+fn probeCovenantVaultReordered() !void {
+    const recipient = runar.BOB.pubKeyHash;
+    const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
+    const required = covenantExpectedOutput(recipient, 5000);
+    const other_pkh = [_]u8{0xcc} ** 20;
+    const other = covenantExpectedOutput(&other_pkh, 5000);
+    // Place the unauthorised output BEFORE the required one.
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(runar.cat(other, required)),
+    });
+    vault.spend(runar.signTestMessage(runar.ALICE), preimage);
+}
+
+fn probeCovenantVaultAmountMinusOne() !void {
+    const recipient = runar.BOB.pubKeyHash;
+    const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
+    const candidate = covenantExpectedOutput(recipient, 4999);
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(candidate),
+    });
+    vault.spend(runar.signTestMessage(runar.ALICE), preimage);
+}
+
+fn probeCovenantVaultAmountPlusOne() !void {
+    const recipient = runar.BOB.pubKeyHash;
+    const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
+    const candidate = covenantExpectedOutput(recipient, 5001);
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(candidate),
+    });
+    vault.spend(runar.signTestMessage(runar.ALICE), preimage);
 }
 
 fn probeOraclePriceWrongRabinProof() !void {
