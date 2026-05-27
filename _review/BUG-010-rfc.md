@@ -133,3 +133,8 @@ Untouched (per scope discipline):
 - `packages/runar-go/rabin.go` and peer signers — already produce `padding < 1000`.
 - `examples/*/oracle-price/*` — contract source is unchanged; only its
   compiled artifact differs.
+- `runar-verification/RunarVerification/Stack/{Rabin,Lower}.lean` — formal
+  Lean spec still models the original 10-opcode body. The differential
+  workflow exercises the *real* compiler hex through the Lean stack VM, so
+  on-chain behavior is still cross-validated; only the Lean spec lemmas
+  about `rabinBodyOps` are stale. Re-deriving them is a Phase B10 follow-up.

@@ -11,6 +11,17 @@ Rabin signature verification checks the modular identity
 `(sig² + padding) mod pubKey == SHA256(msg)` using a fixed 10-opcode
 script body.
 
+⚠️ BUG-010 follow-up (see `_review/BUG-010-rfc.md`). The user-facing
+compiler now emits an additional 5-opcode `OP_WITHIN` range check that
+enforces `0 ≤ padding < 65536` on-chain (closing a forgery exploit
+documented in `_review/BUG-004-finding.md`). The Lean spec below still
+models the original 10-opcode body. Re-modeling the 15-opcode body and
+re-deriving every dependent theorem is tracked as a Phase B10 follow-up
+in `RunarVerification/PATH2_PLAN.md`. The differential workflow exercises
+the *real* compiler hex through the Lean stack VM, so the on-chain
+behavior is still cross-validated — only the Lean spec lemmas are
+stale until the follow-up lands.
+
 Mirrors the TypeScript reference one-to-one. The dispatch arm in
 `Stack.Lower` (`lowerVerifyRabinSigOpsLive`) brings the four args to the
 top of the stack via `loadRefLive` — yielding the layout
