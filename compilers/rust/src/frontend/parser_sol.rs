@@ -597,10 +597,11 @@ impl<'a> SolParser<'a> {
                     }
                 };
                 self.expect(&Token::Gt);
-                return TypeNode::FixedArray {
+                let base = TypeNode::FixedArray {
                     element: Box::new(element),
                     length,
                 };
+                return self.parse_sol_fixed_array_suffix(base);
             }
         }
 
@@ -613,11 +614,39 @@ impl<'a> SolParser<'a> {
             _ => &name,
         };
 
-        if let Some(prim) = PrimitiveTypeName::from_str(mapped) {
+        let base = if let Some(prim) = PrimitiveTypeName::from_str(mapped) {
             TypeNode::Primitive(prim)
         } else {
             TypeNode::Custom(mapped.to_string())
+        };
+
+        self.parse_sol_fixed_array_suffix(base)
+    }
+
+    // Consume any number of trailing `[N]` bracket suffixes, wrapping the
+    // type as `FixedArray<previous, N>` per Solidity's left-to-right
+    // outer-to-inner declaration order. `T[A][B]` ⇒ outer B of inner A of T.
+    fn parse_sol_fixed_array_suffix(&mut self, base: TypeNode) -> TypeNode {
+        let mut result = base;
+        while *self.peek() == Token::LBracket {
+            self.advance(); // [
+            let length = match self.advance() {
+                Token::NumberLit(n) if n >= 0 => n as usize,
+                other => {
+                    self.errors.push(Diagnostic::error(
+                        &format!("FixedArray length must be a non-negative integer literal, got {:?}", other),
+                        None,
+                    ));
+                    0
+                }
+            };
+            self.expect(&Token::RBracket);
+            result = TypeNode::FixedArray {
+                element: Box::new(result),
+                length,
+            };
         }
+        result
     }
 
     // -----------------------------------------------------------------------
