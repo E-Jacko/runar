@@ -336,7 +336,16 @@ pub const ANFCall = struct { func: []const u8, args: []const []const u8 };
 pub const ANFMethodCall = struct { object: []const u8, method: []const u8, args: []const []const u8 };
 pub const ANFIf = struct { cond: []const u8, then: []ANFBinding, @"else": []ANFBinding };
 pub const ANFLoop = struct { count: u32, body: []ANFBinding, iter_var: []const u8 };
-pub const ANFAssert = struct { value: []const u8 };
+pub const ANFAssert = struct {
+    value: []const u8,
+    /// Optional marker: `true` only on the auto-injected
+    /// `hash256(continuationOutputs) === extractOutputHash(txPreimage)`
+    /// assert emitted by the StatefulSmartContract lowering. Off-chain
+    /// SDK interpreters use this to skip the equality check without
+    /// resorting to structural / taint heuristics that misfire on
+    /// developer covenant asserts whose IR shape is identical.
+    is_auto_injected_state_check: bool = false,
+};
 pub const UpdateProp = struct { name: []const u8, value: []const u8 };
 pub const CheckPreimage = struct { preimage: []const u8 };
 pub const DeserializeState = struct { preimage: []const u8 };

@@ -1422,6 +1422,24 @@ def _make_assert(value_ref: str) -> ANFValue:
     )
 
 
+def _make_auto_injected_state_check_assert(value_ref: str) -> ANFValue:
+    """Build the auto-injected stateful-continuation hash-equality assert.
+
+    Carries ``is_auto_injected_state_check=True`` so off-chain SDK
+    interpreters can skip the equality check via a direct marker lookup
+    instead of structural / taint heuristics that misfire on developer
+    code with identical IR shape (covenant rules, e.g.
+    ``examples/rust/covenant-vault``).
+    """
+    raw = json.dumps(value_ref)
+    return ANFValue(
+        kind="assert",
+        raw_value=raw,
+        value_ref=value_ref,
+        is_auto_injected_state_check=True,
+    )
+
+
 def _make_update_prop(name: str, value_ref: str) -> ANFValue:
     raw = json.dumps(value_ref)
     return ANFValue(

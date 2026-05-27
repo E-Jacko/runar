@@ -28,6 +28,7 @@ module RunarCompiler
       "initial_value" => "initialValue",
       "script_bytes" => "scriptBytes",
       "else_" => "else",
+      "is_auto_injected_state_check" => "isAutoInjectedStateCheck",
       # These stay as snake_case to match Go/TS IR format
       "result_type" => "result_type",
       # Both raw_value and value_ref map to "value" in Go JSON (they never coexist)
@@ -268,9 +269,11 @@ module RunarCompiler
           object method cond then else_ count iter_var body value_ref
           preimage satoshis state_values script_bytes elements
           bytes in_arity out_arity
+          is_auto_injected_state_check
           const_string const_big_int const_bool const_int
         ]
 
+        kind_val = obj.kind
         ivars.each do |ivar_name|
           name_str = ivar_name.to_s
           next if IR_EXCLUDED_FIELDS.include?(name_str)
@@ -289,6 +292,13 @@ module RunarCompiler
           end
 
           next if name_str == "value_ref" && has_raw_value
+
+          # Auto-injected stateful-continuation marker: emit only on
+          # +assert+ nodes and only when true so checked-in fold-OFF
+          # goldens stay stable for developer asserts.
+          if name_str == "is_auto_injected_state_check"
+            next unless v == true && kind_val == "assert"
+          end
 
           key = _snake_key(name_str)
           d[key] = _anf_to_camel_dict(v)

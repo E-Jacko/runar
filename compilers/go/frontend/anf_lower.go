@@ -300,7 +300,7 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 					preimageRef2 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
 					outputHashRef := methodCtx.emit(makeCall("extractOutputHash", []string{preimageRef2}))
 					eqRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: hashRef, Right: outputHashRef, ResultType: "bytes"})
-					methodCtx.emit(makeAssert(eqRef))
+					methodCtx.emit(makeAutoInjectedStateCheckAssert(eqRef))
 				} else {
 					// Single-output continuation: build raw output bytes, then
 					// splice in any declared data outputs, then concat with
@@ -318,7 +318,7 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 					preimageRef4 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
 					outputHashRef := methodCtx.emit(makeCall("extractOutputHash", []string{preimageRef4}))
 					eqRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: hashRef, Right: outputHashRef, ResultType: "bytes"})
-					methodCtx.emit(makeAssert(eqRef))
+					methodCtx.emit(makeAutoInjectedStateCheckAssert(eqRef))
 				}
 			}
 
@@ -1623,6 +1623,22 @@ func makeAssert(valueRef string) ir.ANFValue {
 		Kind:     "assert",
 		RawValue: raw,
 		ValueRef: valueRef,
+	}
+}
+
+// makeAutoInjectedStateCheckAssert builds the auto-injected
+// stateful-continuation hash-equality assert with the
+// IsAutoInjectedStateCheck marker set. Off-chain SDK interpreters use
+// this marker to skip the equality check via a direct lookup instead of
+// structural / taint heuristics that misfire on developer covenant
+// asserts whose IR shape is identical.
+func makeAutoInjectedStateCheckAssert(valueRef string) ir.ANFValue {
+	raw, _ := json.Marshal(valueRef)
+	return ir.ANFValue{
+		Kind:                     "assert",
+		RawValue:                 raw,
+		ValueRef:                 valueRef,
+		IsAutoInjectedStateCheck: true,
 	}
 }
 

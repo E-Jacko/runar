@@ -236,7 +236,7 @@ public final class AnfLower {
                         String preimageRef2 = ctx.emit(new LoadParam("txPreimage"));
                         String outputHashRef = ctx.emit(new Call("extractOutputHash", List.of(preimageRef2)));
                         String eqRef = ctx.emit(new BinOp("===", hashRef, outputHashRef, "bytes"));
-                        ctx.emit(new Assert(eqRef));
+                        ctx.emit(new Assert(eqRef, true));
                     } else {
                         String stateScriptRef = ctx.emit(new GetStateScript());
                         String preimageRef2 = ctx.emit(new LoadParam("txPreimage"));
@@ -251,7 +251,7 @@ public final class AnfLower {
                         String preimageRef4 = ctx.emit(new LoadParam("txPreimage"));
                         String outputHashRef = ctx.emit(new Call("extractOutputHash", List.of(preimageRef4)));
                         String eqRef = ctx.emit(new BinOp("===", hashRef, outputHashRef, "bytes"));
-                        ctx.emit(new Assert(eqRef));
+                        ctx.emit(new Assert(eqRef, true));
                     }
                 }
 
