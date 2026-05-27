@@ -254,7 +254,7 @@ module RunarCompiler
                 v.right = output_hash_ref
                 v.result_type = "bytes"
               end)
-              method_ctx.emit(_make_assert(eq_ref))
+              method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
             else
               # Single-output continuation: build raw output bytes, then
               # splice in any declared data outputs, then concat with
@@ -277,7 +277,7 @@ module RunarCompiler
                 v.right = output_hash_ref
                 v.result_type = "bytes"
               end)
-              method_ctx.emit(_make_assert(eq_ref))
+              method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
             end
           end
 

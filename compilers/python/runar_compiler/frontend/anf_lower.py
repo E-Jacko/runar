@@ -343,7 +343,7 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                         left=hash_ref, right=output_hash_ref,
                         result_type="bytes",
                     ))
-                    method_ctx.emit(_make_assert(eq_ref))
+                    method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
                 else:
                     # Single-output continuation: build raw output bytes, then
                     # splice in any declared data outputs, then concat with
@@ -364,7 +364,7 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                         left=hash_ref, right=output_hash_ref,
                         result_type="bytes",
                     ))
-                    method_ctx.emit(_make_assert(eq_ref))
+                    method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
 
             # Build augmented params list for ABI
             augmented_params = _lower_params(method.params)

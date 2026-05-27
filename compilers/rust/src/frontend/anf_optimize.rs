@@ -522,6 +522,7 @@ mod tests {
             name: name.to_string(),
             value: ANFValue::Assert {
                 value: value_ref.to_string(),
+                is_auto_injected_state_check: false,
             },
             source_loc: None,
         }

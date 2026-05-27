@@ -124,7 +124,7 @@ pub fn collect_refs_from_value(value: &ANFValue, refs: &mut HashSet<String>) {
                 collect_refs_from_value(&b.value, refs);
             }
         }
-        ANFValue::Assert { value } => {
+        ANFValue::Assert { value, .. } => {
             refs.insert(value.clone());
         }
         ANFValue::UpdateProp { value, .. } => {

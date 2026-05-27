@@ -171,7 +171,22 @@ pub enum ANFValue {
     },
 
     #[serde(rename = "assert")]
-    Assert { value: String },
+    Assert {
+        value: String,
+        // Optional marker: set to `true` only on the auto-injected
+        // `hash256(continuationOutputs) === extractOutputHash(txPreimage)`
+        // assert emitted by the StatefulSmartContract lowering. Off-chain
+        // SDK interpreters use this to skip the equality check without
+        // resorting to positional or structural heuristics that misfire on
+        // developer-written covenant asserts whose IR shape is identical.
+        // Absent => developer code.
+        #[serde(
+            rename = "isAutoInjectedStateCheck",
+            default,
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        is_auto_injected_state_check: bool,
+    },
 
     #[serde(rename = "update_prop")]
     UpdateProp { name: String, value: String },

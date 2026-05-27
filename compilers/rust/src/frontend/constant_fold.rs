@@ -1042,7 +1042,7 @@ mod tests {
     fn test_assert_unchanged() {
         let p = make_program(vec![make_method("m", vec![
             b("t0", mk_bool(true)),
-            b("t1", ANFValue::Assert { value: "t0".to_string() }),
+            b("t1", ANFValue::Assert { value: "t0".to_string(), is_auto_injected_state_check: false }),
         ])]);
         let r = fold_constants_only(&p);
         match &r.methods[0].body[1].value {
