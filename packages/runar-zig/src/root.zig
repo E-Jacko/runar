@@ -165,6 +165,7 @@ pub const cat = builtins.cat;
 pub const substr = builtins.substr;
 pub const num2bin = builtins.num2bin;
 pub const bin2num = builtins.bin2num;
+pub const within = builtins.within;
 pub const clamp = builtins.clamp;
 pub const safediv = builtins.safediv;
 pub const safemod = builtins.safemod;
