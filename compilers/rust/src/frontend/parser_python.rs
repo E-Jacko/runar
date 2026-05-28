@@ -35,6 +35,7 @@
 //! - snake_case identifiers -> camelCase in AST
 
 use num_bigint::BigInt;
+use num_traits::{Num, ToPrimitive};
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -227,7 +228,7 @@ enum Token {
 
     // Identifiers and literals
     Ident(String),
-    NumberLit(i128),
+    NumberLit(BigInt),
     HexStringLit(String),
     StringLit(String),
 
@@ -684,9 +685,11 @@ fn tokenize(source: &str) -> Vec<Token> {
                     }
                 }
                 let val = if num_str.starts_with("0x") || num_str.starts_with("0X") {
-                    i128::from_str_radix(&num_str[2..], 16).unwrap_or(0)
+                    <BigInt as Num>::from_str_radix(&num_str[2..], 16)
+                        .unwrap_or_else(|_| BigInt::from(0))
                 } else {
-                    num_str.parse::<i128>().unwrap_or(0)
+                    <BigInt as Num>::from_str_radix(&num_str, 10)
+                        .unwrap_or_else(|_| BigInt::from(0))
                 };
                 tokens.push(Token::NumberLit(val));
                 continue;
@@ -1043,7 +1046,7 @@ impl<'a> PyParser<'a> {
             let element = self.parse_type();
             self.expect(&Token::Comma);
             let length = match self.advance() {
-                Token::NumberLit(n) => n as usize,
+                Token::NumberLit(n) => n.to_usize().unwrap_or(0),
                 _ => {
                     self.errors
                         .push(Diagnostic::error("FixedArray requires numeric length", None));
@@ -2040,7 +2043,7 @@ impl<'a> PyParser<'a> {
 
     fn parse_primary(&mut self) -> Expression {
         match self.advance() {
-            Token::NumberLit(v) => Expression::BigIntLiteral { value: BigInt::from(v) },
+            Token::NumberLit(v) => Expression::BigIntLiteral { value: v },
             Token::TrueLit => Expression::BoolLiteral { value: true },
             Token::FalseLit => Expression::BoolLiteral { value: false },
             Token::NoneLit => Expression::BigIntLiteral { value: BigInt::from(0) },
