@@ -143,24 +143,34 @@ final class PathAnalyzer {
             return new PathResult(List.of(path), findings, false);
         }
 
-        // JS 32-bit signed left-shift semantics: shift count masked to 5 bits.
-        int shiftBy = numBranches & 31;
-        long requested = ((long) 1) << shiftBy; // [0, 2^31] as unsigned-ish
-        int loopBound = (int) Math.min(requested, (long) MAX_PATHS);
+        // Spec v1.2 §5.1: render the path count symbolically when
+        // 2^numBranches overflows the canonical TS reference's
+        // safe-integer range.
+        final int LARGE_BRANCH_THRESHOLD = 53;
+        boolean useExactCount = numBranches < LARGE_BRANCH_THRESHOLD;
+        int loopBound;
+        boolean truncated;
+        long exactCount = 0L;
+        if (useExactCount) {
+            exactCount = 1L << numBranches;
+            loopBound = (int) Math.min(exactCount, (long) MAX_PATHS);
+            truncated = exactCount > MAX_PATHS;
+        } else {
+            loopBound = MAX_PATHS;
+            truncated = true;
+        }
 
         List<ExecutionPath> paths = new ArrayList<>();
         List<Finding> perPathFindings = new ArrayList<>();
         for (int combo = 0; combo < loopBound; combo++) {
             List<Boolean> choices = new ArrayList<>(numBranches);
             for (int b = 0; b < numBranches; b++) {
-                // JS 32-bit shift semantics: the shift count is masked to
-                // 5 bits. Java's `int` shift does the same masking — so
-                // `combo >> b` for b >= 32 wraps to `combo >> (b & 31)`,
-                // matching JS. This is intentional: the TS reference uses
-                // (combo >> b) & 1 directly, and the goldens depend on
-                // this quirk (verify against schnorr-zkp path id 1, where
-                // choices[32], [64], ... are true because of the wrap).
-                boolean bit = ((combo >> b) & 1) == 1;
+                // `combo` is bounded by MAX_PATHS = 256, so bits at
+                // positions >= 8 are mathematically always 0. We clamp to
+                // b < 31 to match the canonical TS reference, where JS
+                // `>>` (and Java `>>` on int) would otherwise mask the
+                // shift count to 5 bits and wrap.
+                boolean bit = (b < 31) && (((combo >> b) & 1) == 1);
                 choices.add(bit);
             }
             String desc = describePath(ops, ifIndices, choices);
@@ -176,13 +186,14 @@ final class PathAnalyzer {
                 combo, desc, choices, true, hasCheck, lr.depthAtEnd));
         }
 
-        if (requested > MAX_PATHS) {
-            int requestedRender = (int) requested;
+        if (truncated) {
+            String pathsClause = useExactCount
+                ? ("2^" + numBranches + " = " + exactCount + " paths")
+                : ("more than 2^" + LARGE_BRANCH_THRESHOLD + " paths");
             findings.add(new Finding(
                 "warning", "PATHS_TRUNCATED",
-                "Script has " + numBranches + " branch points (2^"
-                    + numBranches + " = " + requestedRender
-                    + " paths); analysis truncated to the first 256. "
+                "Script has " + numBranches + " branch points ("
+                    + pathsClause + "); analysis truncated to the first 256. "
                     + "Consider reducing branching or splitting the contract"
                     + " into smaller spending paths.",
                 null, null, null));
