@@ -17,6 +17,7 @@ Before you begin, make sure you have the following installed:
 | **Python** | 3.13+           | Only needed if you want to build/use the Python compiler |
 | **Zig** | 0.15.x           | Only needed if you want to build/use the Zig compiler |
 | **Ruby** | 3.2+            | Only needed if you want to build/use the Ruby compiler |
+| **Java** | 17+             | Only needed if you want to build/use the Java compiler (Gradle wrapper pinned at 8.5 is committed and downloads automatically on first run) |
 
 Verify your installations:
 
@@ -25,6 +26,7 @@ node --version   # v20.x.x or higher
 pnpm --version   # 9.x.x or higher
 go version       # go1.26.x or higher (optional)
 zig version      # 0.15.x (optional)
+java --version   # 17 or higher (optional)
 ```
 
 ---

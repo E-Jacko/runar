@@ -41,17 +41,6 @@ describe('P2PKH', () => {
 });
 ```
 
-## Native Example Test Runners
-
-The maintained native frontends use their own language test runners for the example trees:
-
-- Go: `cd examples/go && go test ./...`
-- Rust: `cd examples/rust && cargo test`
-- Python: `cd examples/python && PYTHONPATH=../../packages/runar-py python3 -m pytest`
-- Zig: `cd examples/zig && zig build test`
-
-The Zig example suite is backed by `packages/runar-zig`, which provides the `runar` module, compile-check helpers, fixtures, and the native helper/runtime surface used by `examples/zig/*/*_test.zig`. Some Zig examples now execute the real contract module directly; others still rely on mirror coverage where the current Zig execution model is not yet natural enough.
-
 ### Running Tests
 
 ```bash
@@ -64,6 +53,27 @@ pnpm test -- P2PKH.test.ts
 # Run in watch mode
 pnpm test -- --watch
 ```
+
+---
+
+## Native-Language Unit Testing
+
+Each of the six native frontends ships its own example tree that uses the host language's test runner. The native `runar` package/crate/gem/jar provides type aliases, mock crypto, real hash functions, and a `CompileCheck` / `compile_check` entry point that re-runs the contract through the frontend (parse → validate → typecheck).
+
+The quick-reference commands per CLAUDE.md ⇒ "Build & Test":
+
+- **Go** — `cd examples/go && go test ./...`
+- **Rust** — `cd examples/rust && cargo test`
+- **Python** — `cd examples/python && PYTHONPATH=../../packages/runar-py python3 -m pytest`
+- **Zig** — `cd examples/zig && zig build test`
+- **Ruby** — `cd examples/ruby && bundle exec rspec` (the compiler itself is exercised via `cd compilers/ruby && rake test`)
+- **Java** — `cd examples/java && ./gradlew test`
+
+The Zig example suite is backed by `packages/runar-zig`, which provides the `runar` module, compile-check helpers, fixtures, and the native helper/runtime surface used by `examples/zig/*/*_test.zig`. Some Zig examples now execute the real contract module directly; others still rely on mirror coverage where the current Zig execution model is not yet natural enough.
+
+The Java example suite uses JUnit 5 via the committed Gradle wrapper. `runar.lang.sdk.CompileCheck` invokes the real compiler frontend (composite-built from `compilers/java`), and `runar.lang.runtime.ContractSimulator` lets Java tests run the compiled artifact against real hashes + real secp256k1 with mocked sig-verify — a Java-only off-chain capability covered in detail under [Cryptographic verification in tests](#cryptographic-verification-in-tests).
+
+The full per-tier tooling for Go, Rust, Python, Zig, Ruby, and Java is documented in [Testing Go Contracts](#testing-go-contracts) and [Testing Rust Contracts](#testing-rust-contracts) below, plus the comparison table under [Cross-Language Testing Comparison](#cross-language-testing-comparison).
 
 ---
 
@@ -730,18 +740,23 @@ cargo test --test counter -- --nocapture  # Verbose output
 
 ## Cross-Language Testing Comparison
 
-| Aspect | TypeScript | Go | Rust |
-|--------|-----------|----|----|
-| **Test framework** | vitest | `testing.T` | `#[test]` |
-| **Failure assertion** | `expectScriptFailure(result)` (see note below) | `defer/recover` | `#[should_panic]` |
-| **Contract loading** | `TestContract.fromSource(source, state)` | Struct literal in same package | `#[path = "..."] mod contract;` |
-| **Type imports** | `import { ... } from 'runar-testing'` | `import runar "github.com/icellan/runar/packages/runar-go"` | `use runar::prelude::*;` |
-| **Byte types** | Hex strings / `Uint8Array` | `string` (for `==`) | `Vec<u8>` (for `==` via `PartialEq`) |
-| **Scalar types** | `bigint` | `int64` aliases | `i64` aliases |
-| **Output tracking** | `contract.state` after `call()` | `c.Outputs()` method | Manual `Vec<Output>` field |
-| **Compile check** | Built into `fromArtifact` / `fromSource` | `runar.CompileCheck("file.runar.go")` | `runar::compile_check(include_str!("file"), "file")` |
-| **Borrow workarounds** | N/A | None needed | `.clone()` for owned fields in `add_output` |
-| **Run command** | `npx vitest run` | `go test ./...` | `cargo test` |
+All seven tiers run native unit tests with their language's standard test runner, plus a `CompileCheck` / `compile_check` entry point that re-runs the contract through the frontend.
+
+| Aspect | TypeScript | Go | Rust | Python | Zig | Ruby | Java |
+|--------|-----------|----|------|--------|-----|------|------|
+| **Test framework** | vitest | `testing.T` | `#[test]` | pytest | `zig build test` | rspec | JUnit 5 |
+| **Failure assertion** | `expectScriptFailure(result)` (see note below) | `defer/recover` | `#[should_panic]` | `pytest.raises(AssertionError)` | `testing.expectError` | `expect { ... }.to raise_error` | `assertThrows(...)` |
+| **Contract loading** | `TestContract.fromSource(source, state)` | Struct literal in same package | `#[path = "..."] mod contract;` | `load_contract("File.runar.py")` (conftest helper) | `@import("./contract.zig")` + struct literal | `require_relative` + class instantiation | Class instantiation in same package |
+| **Type imports** | `import { ... } from 'runar-testing'` | `import runar "github.com/icellan/runar/packages/runar-go"` | `use runar::prelude::*;` | `from runar import ...` | `const runar = @import("runar");` | `require "runar"` | `import runar.lang.*;` |
+| **Byte types** | Hex strings / `Uint8Array` | `string` (for `==`) | `Vec<u8>` (for `==` via `PartialEq`) | `bytes` | `[]const u8` | `String` (binary-encoded) | `byte[]` / `ByteString` wrapper |
+| **Scalar types** | `bigint` | `int64` aliases | `i64` aliases | `int` (arbitrary precision) | `i64` aliases | `Integer` | `long` / `BigInteger` |
+| **Output tracking** | `contract.state` after `call()` | `c.Outputs()` method | Manual `Vec<Output>` field | `c.outputs` list | `c.outputs` slice | `c.outputs` array | `c.outputs()` accessor |
+| **Compile check** | Built into `fromArtifact` / `fromSource` | `runar.CompileCheck("file.runar.go")` | `runar::compile_check(include_str!("file"), "file")` | `runar.compile_check("file.runar.py")` | `runar.compileCheck("file.runar.zig")` | `Runar.compile_check("file.runar.rb")` | `CompileCheck.run(Path.of("File.runar.java"))` |
+| **Borrow workarounds** | N/A | None needed | `.clone()` for owned fields in `add_output` | None needed | Explicit slice/allocator handling | None needed | None needed |
+| **Off-chain real-crypto harness** | `ScriptVM` | `ScriptVM` | `ScriptVM` (execute-only) | `ScriptVM` (optional `bsv-sdk` dep) | None (regtest only) | None (regtest only) | `ContractSimulator` (real hashes + real secp256k1 + mocked sig-verify) |
+| **Run command** | `npx vitest run` | `go test ./...` | `cargo test` | `python3 -m pytest` | `zig build test` | `bundle exec rspec` | `./gradlew test` |
+
+Identifier-casing note: Python and Ruby contracts use snake_case in source; the parser converts to camelCase in the AST (`pub_key_hash` → `pubKeyHash`, `check_sig` → `checkSig`). Native tests in those tiers reference the snake_case names that the host language uses.
 
 > **`expectScriptFailure`**: A convenience assertion exported from `runar-testing`. It takes a `VMResult` from `TestSmartContract.call()` or `ScriptVM.execute()` and throws if the script execution succeeded (i.e., it asserts that the script failed). Its counterpart is `expectScriptSuccess`. Both are imported from `runar-testing`:
 >
@@ -789,7 +804,7 @@ Both paths must agree on valid signatures (accept) and invalid signatures (rejec
 
 ### Conformance Golden Files
 
-`conformance/tests/post-quantum-wots/` and `conformance/tests/post-quantum-slhdsa/` contain golden `expected-script.hex` files. The maintained compilers with post-quantum support (TS, Go, Rust, Python, Zig) target byte-identical output.
+`conformance/tests/post-quantum-wots/` and `conformance/tests/post-quantum-slhdsa/` contain golden `expected-script.hex` files. WOTS+ and SLH-DSA codegen ship in **all 7 maintained compilers** (TS, Go, Rust, Python, Zig, Ruby, Java), and all 7 target byte-identical output against these goldens.
 
 ---
 
@@ -893,7 +908,16 @@ pnpm run conformance:rust
 pnpm run conformance:python
 
 # Test the Zig compiler
-cd compilers/zig && zig build conformance
+pnpm run conformance:zig
+
+# Test the Ruby compiler
+pnpm run conformance:ruby
+
+# Test the Java compiler
+pnpm run conformance:java
+
+# Run every conformance suite end-to-end (all 7 compilers + cross-tier + SDK + ANF parity)
+pnpm run conformance:all
 ```
 
 The runner compiles each source file, serializes the ANF IR using canonical JSON (RFC 8785), and compares the SHA-256 hash against the expected output. Byte-identical output is required.
