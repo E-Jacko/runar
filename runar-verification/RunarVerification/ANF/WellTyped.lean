@@ -600,5 +600,63 @@ theorem smoke_bytes_predicate_fails :
   rw [hS0] at h
   exact absurd h (by decide)
 
+/-! ## Bool reflections of the atomic operand predicates (WS0a Task 1)
+
+Decidable `Bool`-valued checkers for the four atomic predicates, plus their
+`_iff` equivalence lemmas.  These enable `native_decide` in downstream
+harness code without any `sorry` or new `axiom`.
+
+Implementation note: `ANFType` derives `BEq` but not `LawfulBEq`, so
+`(a == b) = true ↔ a = b` does not hold via `beq_iff_eq` here.  We use
+`decide` instead so each checker is definitionally the `Prop`-as-`Bool`,
+and `simp` closes the `_iff` goals directly. -/
+
+def arithOperandBigintBool (Γ : TypeEnv) (ref : String) : Bool :=
+  decide (Γ.lookup ref = some .bigint)
+
+def byteOperandBytesBool (Γ : TypeEnv) (ref : String) : Bool :=
+  decide (Γ.lookup ref = some .byteString)
+
+def binOpArithWellTypedBool (Γ : TypeEnv) (op l r : String) : Bool :=
+  (op == "+" || op == "-" || op == "*") &&
+    arithOperandBigintBool Γ l && arithOperandBigintBool Γ r
+
+def unaryOpArithWellTypedBool (Γ : TypeEnv) (operand : String) : Bool :=
+  arithOperandBigintBool Γ operand
+
+theorem arithOperandBigintBool_iff (Γ : TypeEnv) (ref : String) :
+    arithOperandBigintBool Γ ref = true ↔ arithOperandBigint Γ ref := by
+  simp [arithOperandBigintBool, arithOperandBigint]
+
+theorem byteOperandBytesBool_iff (Γ : TypeEnv) (ref : String) :
+    byteOperandBytesBool Γ ref = true ↔ byteOperandBytes Γ ref := by
+  simp [byteOperandBytesBool, byteOperandBytes]
+
+theorem binOpArithWellTypedBool_iff (Γ : TypeEnv) (op l r : String) :
+    binOpArithWellTypedBool Γ op l r = true ↔ binOpArithWellTyped Γ op l r := by
+  simp [binOpArithWellTypedBool, binOpArithWellTyped, arithOperandBigintBool,
+    arithOperandBigint, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq]
+  constructor
+  · rintro ⟨⟨(h | h) | h, hL⟩, hR⟩
+    · exact ⟨Or.inl h, hL, hR⟩
+    · exact ⟨Or.inr (Or.inl h), hL, hR⟩
+    · exact ⟨Or.inr (Or.inr h), hL, hR⟩
+  · rintro ⟨h | h | h, hL, hR⟩
+    · exact ⟨⟨Or.inl (Or.inl h), hL⟩, hR⟩
+    · exact ⟨⟨Or.inl (Or.inr h), hL⟩, hR⟩
+    · exact ⟨⟨Or.inr h, hL⟩, hR⟩
+
+theorem unaryOpArithWellTypedBool_iff (Γ : TypeEnv) (operand : String) :
+    unaryOpArithWellTypedBool Γ operand = true ↔ unaryOpArithWellTyped Γ operand := by
+  simp [unaryOpArithWellTypedBool, unaryOpArithWellTyped, arithOperandBigintBool_iff]
+
+private def Γ_t1_smoke : TypeEnv :=
+  (((Typed.TypeEnv.empty.extend "a" .bigint).extend "b" .bigint).extend "f" .bool)
+
+example : arithOperandBigintBool Γ_t1_smoke "a" = true := by native_decide
+example : arithOperandBigintBool Γ_t1_smoke "f" = false := by native_decide
+example : binOpArithWellTypedBool Γ_t1_smoke "+" "a" "b" = true := by native_decide
+example : binOpArithWellTypedBool Γ_t1_smoke "+" "a" "f" = false := by native_decide
+
 end WellTyped
 end RunarVerification.ANF
