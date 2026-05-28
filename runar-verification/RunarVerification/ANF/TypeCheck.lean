@@ -204,6 +204,215 @@ def builtinTable : List (String × (List ANFType × ANFType)) :=
 def builtinSig (name : String) : Option (List ANFType × ANFType) :=
   (builtinTable.find? (·.1 == name)).map (·.2)
 
+/-! ## The functional whole-program type checker
+
+This is THE typing judgment for Rúnar ANF programs: a decidable, executable
+`Bool`-valued whole-program checker. There is no relational `HasType` to match
+against here — `Typed.lean`'s `HasType` only covers a starter fragment, while
+this checker handles every `ANFValue` constructor the corpus emits.
+
+The design mirrors the *operational* `Eval.lean` evaluator so that the typing
+rules and the dynamic semantics agree shape-for-shape:
+
+* a single non-recursive `typeOfValue` types every leaf / one-level value
+  (`ifVal` / `loop` return `none` — they need binding-list recursion, handled
+  by `checkBody`);
+* `checkBody` threads a `TypeEnv` through a binding list exactly like
+  `Eval.evalBindings` threads a `State`, recursing into `ifVal` branches and
+  `loop` bodies. The "value" of an `ifVal` binding is the type of the last
+  binding of the active branch (mirroring `Eval.evalValue`'s
+  `thenBs.getLast?` convention); both branches must agree.
+
+`checkBody` is structurally recursive on the mutual `ANFValue` / `List
+ANFBinding` term — the same recursion `Eval.evalBindings` / `Eval.evalValue`
+use — so no `partial def` and no explicit `termination_by` are required.
+-/
+
+open RunarVerification.ANF
+  (ANFValue ANFBinding ConstValue ANFParam ANFProperty ANFMethod ANFProgram)
+open RunarVerification.ANF.Typed (TypeEnv)
+
+/-- Build the initial typing context for a method body: contract properties
+first, then method parameters (parameters shadow same-named properties, which
+matches the most-recent-wins `TypeEnv.extend` discipline). -/
+def TypeEnv.ofParamsProps (props : List ANFProperty) (params : List ANFParam) : TypeEnv :=
+  let g := props.foldl (fun Γ p => Γ.extend p.name p.type) Typed.TypeEnv.empty
+  params.foldl (fun Γ pp => Γ.extend pp.name pp.type) g
+
+/-- Is `op` an arithmetic binary operator (`+ - * / %`)? Result type `.bigint`. -/
+def isArithOp (op : String) : Bool :=
+  op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+
+/-- Is `op` a comparison / logical binary operator? Result type `.bool`.
+Mirrors `03-typecheck.ts`: numeric comparisons + `&&` / `||`. -/
+def isBoolBinOp (op : String) : Bool :=
+  op == "==" || op == "===" || op == "!=" || op == "!==" ||
+  op == "<"  || op == "<="  || op == ">"  || op == ">=" ||
+  op == "&&" || op == "||"
+
+/--
+Type a single `ANFValue` in environment `Γ`. Returns the result type when the
+value is well-typed, `none` otherwise.
+
+`retEnv` maps each method name to the result type of its body (the type of its
+last binding); it is consulted only by `.methodCall`. Built only once per
+program by `programWellTypedBool`.
+
+`ifVal` / `loop` are NOT typed here (they return `none`) — they require
+binding-list recursion and are handled by `checkBody`.
+-/
+def typeOfValue (retEnv : List (String × ANFType)) (Γ : TypeEnv) : ANFValue → Option ANFType
+  | .loadParam name => Γ.lookup name
+  | .loadProp name  => Γ.lookup name
+  | .loadConst (.int _)      => some .bigint
+  | .loadConst (.bool _)     => some .bool
+  | .loadConst (.bytes _)    => some .byteString
+  | .loadConst (.refAlias n) => Γ.lookup n
+  | .loadConst .thisRef      => some .addr
+  | .binOp op l r _ =>
+      match Γ.lookup l, Γ.lookup r with
+      | some .bigint, some .bigint =>
+          if isArithOp op then some .bigint
+          else if isBoolBinOp op then some .bool
+          else none
+      | _, _ => none
+  | .unaryOp op operand _ =>
+      match Γ.lookup operand with
+      | some .bigint => if op == "-" || op == "~" then some .bigint else none
+      | some .bool   => if op == "!" then some .bool else none
+      | _            => none
+  | .call func args =>
+      match builtinSig func with
+      | some (ptys, rty) =>
+          if args.map Γ.lookup == ptys.map some then some rty else none
+      | none => none
+  | .methodCall _obj method _args =>
+      (retEnv.find? (·.1 == method)).map (·.2)
+  | .ifVal _ _ _ => none   -- handled in `checkBody`
+  | .loop _ _ _  => none    -- handled in `checkBody`
+  | .assert ref =>
+      if Γ.lookup ref == some .bool then some .bool else none
+  | .updateProp name src =>
+      match Γ.lookup name, Γ.lookup src with
+      | some τprop, some τsrc => if τprop == τsrc then some τprop else none
+      | _, _ => none
+  | .getStateScript => some .byteString
+  | .checkPreimage preimage =>
+      if Γ.lookup preimage == some .sigHashPreimage then some .bool else none
+  | .deserializeState preimage =>
+      if Γ.lookup preimage == some .sigHashPreimage then some .bool else none
+  | .addOutput sats stateValues preimage =>
+      if Γ.lookup sats == some .bigint
+         && Γ.lookup preimage == some .sigHashPreimage
+         && stateValues.all (fun r => (Γ.lookup r).isSome)
+      then some .bool else none
+  | .addRawOutput sats scriptBytes =>
+      if Γ.lookup sats == some .bigint && Γ.lookup scriptBytes == some .byteString
+      then some .bool else none
+  | .addDataOutput sats scriptBytes =>
+      if Γ.lookup sats == some .bigint && Γ.lookup scriptBytes == some .byteString
+      then some .bool else none
+  -- Fixed-length arrays carry no scalar `ANFType` (the closed `ANFType` sum has
+  -- no array constructor — same gap as `checkMultiSig`). Left un-typeable.
+  | .arrayLiteral _ => none
+  | .rawScript _ _ _ => some .byteString
+
+/--
+Type-check a binding list, threading the environment. Returns the final
+environment (the input `Γ` extended with one entry per binding) on success, or
+`none` if any binding is ill-typed.
+
+Mirrors `Eval.evalBindings`: structurally recursive on the binding-list spine,
+descending into `ifVal` branches and `loop` bodies (which are structural
+sub-terms of the head binding's value). `bodyWellTypedBool` is its `isSome`
+projection.
+
+`ifVal` rule: the condition must be `.bool`; both branches must type-check;
+their last-binding types must agree (empty branch ⇒ `.bool`, matching
+`Eval.evalValue`'s `vBool` convention); that joined type is bound to the
+if-binding's name. `loop` rule: the body type-checks with `iterVar : bigint`
+in scope; the loop binding itself is `.bool` (matching `Eval`'s `vBool true`).
+-/
+def checkBody (retEnv : List (String × ANFType)) (Γ : TypeEnv) :
+    List ANFBinding → Option TypeEnv
+  | [] => some Γ
+  | .mk name v _ :: rest =>
+    match v with
+    | .ifVal cond thenBranch elseBranch =>
+        if Γ.lookup cond == some .bool then
+          match checkBody retEnv Γ thenBranch, checkBody retEnv Γ elseBranch with
+          | some envT, some envE =>
+              let τThen := match thenBranch.getLast? with
+                | some b => envT.lookup b.name
+                | none   => some .bool
+              let τElse := match elseBranch.getLast? with
+                | some b => envE.lookup b.name
+                | none   => some .bool
+              match τThen, τElse with
+              | some t, some e =>
+                  if t == e then checkBody retEnv (Γ.extend name t) rest else none
+              | _, _ => none
+          | _, _ => none
+        else none
+    | .loop _count body iterVar =>
+        match checkBody retEnv (Γ.extend iterVar .bigint) body with
+        | some _ => checkBody retEnv (Γ.extend name .bool) rest
+        | none   => none
+    | other =>
+        match typeOfValue retEnv Γ other with
+        | some τ => checkBody retEnv (Γ.extend name τ) rest
+        | none   => none
+
+/-- `true` iff `bs` type-checks in `Γ` (the decidable body-typing judgment). -/
+def bodyWellTypedBool (retEnv : List (String × ANFType)) (Γ : TypeEnv)
+    (bs : List ANFBinding) : Bool :=
+  (checkBody retEnv Γ bs).isSome
+
+/-- The result type a method body produces: the type of its last binding in the
+fully-threaded environment (`none` if the body is ill-typed or empty). Used to
+populate `retEnv` so `methodCall`s can be typed by the callee's result. -/
+def methodResultType (retEnv : List (String × ANFType)) (props : List ANFProperty)
+    (m : ANFMethod) : Option ANFType :=
+  match checkBody retEnv (TypeEnv.ofParamsProps props m.params) m.body with
+  | some env =>
+      match m.body.getLast? with
+      | some b => env.lookup b.name
+      | none   => none
+  | none => none
+
+/-- `true` iff method `m` type-checks against contract `props` and the
+program-level method-return environment `retEnv`. -/
+def methodWellTypedBool (retEnv : List (String × ANFType)) (props : List ANFProperty)
+    (m : ANFMethod) : Bool :=
+  bodyWellTypedBool retEnv (TypeEnv.ofParamsProps props m.params) m.body
+
+/--
+The program-level method-return environment: each method name mapped to the
+type of its body's last binding. Methods whose body is empty or ill-typed
+contribute no entry (so a `methodCall` to them stays un-typeable).
+
+Note: this is computed with an empty `retEnv` for the inner `methodResultType`,
+i.e. methods are typed without resolving *other* methods' return types. This is
+sufficient for the v0.x corpus (the conformance ANF inlines private-method
+calls before this checker would run on cross-method `methodCall`s), and keeps
+the construction non-recursive. A program that genuinely needs callee return
+types for a surviving `methodCall` is out of scope here and would simply fail
+to type that node.
+-/
+def programReturnEnv (p : ANFProgram) : List (String × ANFType) :=
+  p.methods.foldr
+    (fun m acc =>
+      match methodResultType [] p.properties m with
+      | some τ => (m.name, τ) :: acc
+      | none   => acc)
+    []
+
+/-- THE whole-program typing judgment: `true` iff every method of `p`
+type-checks. Decidable and executable (`native_decide`-friendly). -/
+def programWellTypedBool (p : ANFProgram) : Bool :=
+  let retEnv := programReturnEnv p
+  p.methods.all (fun m => methodWellTypedBool retEnv p.properties m)
+
 end RunarVerification.ANF.TypeCheck
 
 -- Smoke tests (elaborated by `lake build`)
@@ -211,3 +420,31 @@ example : RunarVerification.ANF.TypeCheck.builtinSig "sha256" = some ([.byteStri
 example : RunarVerification.ANF.TypeCheck.builtinSig "ecMul" = some ([.point, .bigint], .point) := by native_decide
 example : RunarVerification.ANF.TypeCheck.builtinSig "within" = some ([.bigint, .bigint, .bigint], .bool) := by native_decide
 example : RunarVerification.ANF.TypeCheck.builtinSig "not_a_builtin" = none := by native_decide
+
+/-! ## Whole-program checker smoke tests -/
+
+open RunarVerification.ANF in
+/-- A well-typed program: `add(a : bigint, b : bigint) { let t = a + b }`. -/
+def smokeWellTyped : ANFProgram :=
+  { contractName := "Adder"
+  , properties := []
+  , methods :=
+      [ { name := "add"
+        , params := [⟨"a", .bigint⟩, ⟨"b", .bigint⟩]
+        , body := [ANFBinding.mk "t" (.binOp "+" "a" "b" none)]
+        , isPublic := true } ] }
+
+open RunarVerification.ANF in
+/-- An ill-typed program: `bad(f : boolean, a : bigint) { let t = f + a }`.
+A `bool` operand to `+` is rejected (both operands must be `bigint`). -/
+def smokeIllTyped : ANFProgram :=
+  { contractName := "BadAdder"
+  , properties := []
+  , methods :=
+      [ { name := "bad"
+        , params := [⟨"f", .bool⟩, ⟨"a", .bigint⟩]
+        , body := [ANFBinding.mk "t" (.binOp "+" "f" "a" none)]
+        , isPublic := true } ] }
+
+example : RunarVerification.ANF.TypeCheck.programWellTypedBool smokeWellTyped = true := by native_decide
+example : RunarVerification.ANF.TypeCheck.programWellTypedBool smokeIllTyped = false := by native_decide
