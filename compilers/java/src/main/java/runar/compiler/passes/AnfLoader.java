@@ -241,8 +241,47 @@ public final class AnfLoader {
         if (v instanceof BigInteger bi) return new BigIntConst(bi);
         if (v instanceof Long l) return new BigIntConst(BigInteger.valueOf(l));
         if (v instanceof Integer i) return new BigIntConst(BigInteger.valueOf(i));
-        if (v instanceof String s) return new BytesConst(s);
+        if (v instanceof String s) {
+            // A JSON string in the load_const value position is either:
+            //   1. A decimal-encoded BigInt with the canonical JS BigInt
+            //      `n` suffix (e.g. "115792...41n") — the only way to
+            //      round-trip oversize 256-bit constants through JSON
+            //      without losing precision.
+            //   2. A hex-encoded ByteString literal (never carries the
+            //      `n` suffix; an `n` would not be a hex character).
+            // The trailing `n` is the discriminator — matches the rule
+            // in compilers/go/ir/types.go::isDecimalBigIntLiteral and
+            // packages/runar-compiler/src/__tests__/cross-compiler.test.ts.
+            if (isDecimalBigIntLiteral(s)) {
+                String body = s.substring(0, s.length() - 1);
+                return new BigIntConst(new BigInteger(body, 10));
+            }
+            return new BytesConst(s);
+        }
         throw new RuntimeException("unexpected const type: " + (v == null ? "null" : v.getClass()));
+    }
+
+    /**
+     * Returns whether {@code s} is a JS-style decimal BigInt literal:
+     * optional leading {@code -}, one or more ASCII digits, REQUIRED
+     * trailing {@code n} marker. Mirrors Go's
+     * {@code isDecimalBigIntLiteral} so the IR round-trips losslessly
+     * across tiers. Without the {@code n} discriminator a hex string
+     * like {@code "3030"} would be ambiguously decodable as either the
+     * integer 3030 or the 2-byte bytestring {@code 0x30 0x30}.
+     */
+    static boolean isDecimalBigIntLiteral(String s) {
+        if (s == null || s.length() < 2) return false;
+        if (s.charAt(s.length() - 1) != 'n') return false;
+        int start = 0;
+        if (s.charAt(0) == '-') start = 1;
+        int body = s.length() - 1;
+        if (body - start < 1) return false;
+        for (int i = start; i < body; i++) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') return false;
+        }
+        return true;
     }
 
     private static List<AnfBinding> toBindingList(Object v) {
