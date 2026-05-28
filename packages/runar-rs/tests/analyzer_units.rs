@@ -151,9 +151,9 @@ fn paths_truncated_emits_finding_at_nine_branches() {
 }
 
 #[test]
-fn paths_truncated_replicates_js_shift_quirk() {
-    // For numBranches = 33: 1 << 33 in JS == 1 << 1 == 2 (not 8589934592).
-    // So requested = 2, no truncation finding.
+fn paths_truncated_emits_for_large_branches() {
+    // Spec v1.2: numBranches=33 has 2^33 true paths, so PATHS_TRUNCATED
+    // MUST fire with the exact-decimal message form (33 < 53).
     let mut script = String::new();
     for _ in 0..33 {
         script.push_str("63"); // OP_IF
@@ -162,9 +162,34 @@ fn paths_truncated_replicates_js_shift_quirk() {
         script.push_str("68"); // OP_ENDIF
     }
     let r = analyze_script(&script).unwrap();
-    let has_pt = r.findings.iter().any(|f| f.code == "PATHS_TRUNCATED");
-    assert!(!has_pt, "PATHS_TRUNCATED MUST NOT fire when 1<<(33&31) = 2");
-    assert_eq!(r.paths.len(), 2);
+    let pt = r
+        .findings
+        .iter()
+        .find(|f| f.code == "PATHS_TRUNCATED")
+        .expect("PATHS_TRUNCATED expected");
+    assert!(pt.message.contains("2^33 = 8589934592 paths"));
+    assert_eq!(r.paths.len(), 256);
+}
+
+#[test]
+fn paths_truncated_renders_symbolic_for_very_large_branches() {
+    // Spec v1.2: numBranches >= 53 renders "more than 2^53 paths"
+    // symbolically.
+    let mut script = String::new();
+    for _ in 0..53 {
+        script.push_str("63");
+    }
+    for _ in 0..53 {
+        script.push_str("68");
+    }
+    let r = analyze_script(&script).unwrap();
+    let pt = r
+        .findings
+        .iter()
+        .find(|f| f.code == "PATHS_TRUNCATED")
+        .expect("PATHS_TRUNCATED expected");
+    assert!(pt.message.contains("Script has 53 branch points (more than 2^53 paths)"));
+    assert_eq!(r.paths.len(), 256);
 }
 
 #[test]
