@@ -67,7 +67,7 @@ describe('rabin-codegen module extraction (GAP-M1)', () => {
     expect(ops).toHaveLength(15);
     for (let i = 0; i < ops.length; i++) {
       const expected = RABIN_OPCODES[i];
-      const op = ops[i];
+      const op = ops[i]!;
       if (expected === null) {
         expect(op.op).toBe('push');
         expect((op as Extract<StackOp, { op: 'push' }>).value).toBe(
