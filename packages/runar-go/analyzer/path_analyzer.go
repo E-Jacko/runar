@@ -137,14 +137,21 @@ func analyzePaths(ops []Opcode) pathAnalysisResult {
 		return pathAnalysisResult{paths: []ExecutionPath{path}, findings: findings}
 	}
 
-	// Compute requestedCombinations using JS 32-bit shift semantics.
-	requested := int32(1) << uint(numBranches&31)
-	// Bound combo count by min(requested, maxPaths). requested is
-	// always positive here (1 << 0..31), so a plain conversion to int
-	// is safe.
-	cap := int(requested)
-	if cap > maxPaths {
-		cap = maxPaths
+	// Compute the requested combination count. For numBranches >= 53,
+	// 2^numBranches overflows the JS safe-integer range used by the
+	// canonical TS reference, so we render the count symbolically as
+	// "more than 2^53 paths" instead of an exact decimal. (Spec v1.2.)
+	const largeBranchThreshold = 53
+	useExactCount := numBranches < largeBranchThreshold
+	// Bound combo count by min(requested, maxPaths). When useExactCount
+	// is false, the requested count is effectively infinite, so cap to
+	// maxPaths directly.
+	cap := maxPaths
+	if useExactCount {
+		exact := uint64(1) << uint(numBranches)
+		if exact < uint64(maxPaths) {
+			cap = int(exact)
+		}
 	}
 
 	var findings []Finding
@@ -153,13 +160,25 @@ func analyzePaths(ops []Opcode) pathAnalysisResult {
 	// per-path findings) to match the canonical goldens — see
 	// ec-demo where it sorts first among warnings without an
 	// offset.
-	if int(requested) > maxPaths {
+	truncated := !useExactCount
+	if useExactCount {
+		exact := uint64(1) << uint(numBranches)
+		truncated = exact > uint64(maxPaths)
+	}
+	if truncated {
+		var pathsClause string
+		if useExactCount {
+			exact := uint64(1) << uint(numBranches)
+			pathsClause = fmt.Sprintf("2^%d = %d paths", numBranches, exact)
+		} else {
+			pathsClause = fmt.Sprintf("more than 2^%d paths", largeBranchThreshold)
+		}
 		findings = append(findings, Finding{
 			Severity: SeverityWarning,
 			Code:     "PATHS_TRUNCATED",
 			Message: fmt.Sprintf(
-				"Script has %d branch points (2^%d = %d paths); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths.",
-				numBranches, numBranches, requested,
+				"Script has %d branch points (%s); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths.",
+				numBranches, pathsClause,
 			),
 		})
 	}
@@ -168,11 +187,15 @@ func analyzePaths(ops []Opcode) pathAnalysisResult {
 	for combo := 0; combo < cap; combo++ {
 		choices := make([]bool, numBranches)
 		for b := 0; b < numBranches; b++ {
-			// JS 32-bit signed shift semantics: the shift count is
-			// masked to 5 bits, so for b >= 32 the bit pattern wraps
-			// modulo 32. Reproducing the TS reference quirk per
-			// spec §7.2.
-			choices[b] = ((int32(combo) >> uint(b&31)) & 1) == 1
+			// `combo` is bounded by maxPaths = 256, so bits at positions
+			// >= 8 are mathematically always 0. We explicitly clamp to
+			// b < 31 to match the canonical TS reference, where JS `>>`
+			// would otherwise mask the shift count to 5 bits and wrap.
+			if b < 31 {
+				choices[b] = ((int32(combo) >> uint(b)) & 1) == 1
+			} else {
+				choices[b] = false
+			}
 		}
 		desc := buildPathDescription(bps, choices)
 		collected := collectPathOps(ops, closed, choices)
