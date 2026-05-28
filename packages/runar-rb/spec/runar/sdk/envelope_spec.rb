@@ -134,4 +134,46 @@ RSpec.describe Runar::SDK::Envelope do
       expect(r[:ok]).to be(true)
     end
   end
+
+  # BUG-008 follow-up: DoS-bound size guards on verify_envelope.
+  describe 'size guards (BUG-008)' do
+    let(:now_ms) { 1_700_000_000_000 }
+    let(:verify_now_ms) { now_ms + 500 }
+
+    def base_envelope
+      described_class.sign_envelope(
+        data: { 'ok' => 1 }, signer: alice_signer, pubkey: alice_pubkey, now_ms: now_ms
+      )
+    end
+
+    it 'rejects oversized payload as too-large before bad-json' do
+      env = base_envelope
+      env.payload = 'x' * (Runar::SDK::Envelope::MAX_ENVELOPE_PAYLOAD_BYTES + 1)
+      r = described_class.verify_envelope(envelope: env, now_ms: verify_now_ms)
+      expect(r[:ok]).to be(false)
+      expect(r[:reason]).to eq('too-large')
+    end
+
+    it 'rejects oversized sig hex as too-large before bad-sig' do
+      env = base_envelope
+      env.sig = 'a' * (Runar::SDK::Envelope::MAX_ENVELOPE_FIELD_BYTES + 1)
+      r = described_class.verify_envelope(envelope: env, now_ms: verify_now_ms)
+      expect(r[:ok]).to be(false)
+      expect(r[:reason]).to eq('too-large')
+    end
+
+    it 'rejects oversized pubkey hex as too-large before bad-sig' do
+      env = base_envelope
+      env.pubkey = 'b' * (Runar::SDK::Envelope::MAX_ENVELOPE_FIELD_BYTES + 1)
+      r = described_class.verify_envelope(envelope: env, now_ms: verify_now_ms)
+      expect(r[:ok]).to be(false)
+      expect(r[:reason]).to eq('too-large')
+    end
+
+    it 'accepts a normally-sized envelope without tripping the size guard' do
+      env = base_envelope
+      r = described_class.verify_envelope(envelope: env, now_ms: verify_now_ms)
+      expect(r[:ok]).to be(true)
+    end
+  end
 end

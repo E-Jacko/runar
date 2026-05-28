@@ -198,4 +198,59 @@ class EnvelopeTest {
         Envelope.VerifyEnvelopeResult r = Envelope.verify(vo);
         assertTrue(r.ok);
     }
+
+    // -------------------------------------------------------------------
+    // BUG-008 size guards: oversized payload / sig / pubkey return TOO_LARGE
+    // BEFORE any JSON parse or ECDSA verify work runs.
+    // -------------------------------------------------------------------
+
+    @Test
+    void sizeGuardOversizedPayload() {
+        StringBuilder big = new StringBuilder(Envelope.MAX_ENVELOPE_PAYLOAD_BYTES + 1);
+        for (int i = 0; i < Envelope.MAX_ENVELOPE_PAYLOAD_BYTES + 1; i++) big.append('x');
+        Envelope.SignedEnvelope env = new Envelope.SignedEnvelope(
+            big.toString(), "deadbeef", pubkeyHex(ALICE_PRIV), 1L, 2L);
+        Envelope.VerifyEnvelopeOpts vo = new Envelope.VerifyEnvelopeOpts();
+        vo.envelope = env; vo.nowMs = 1_000_000_000_500L;
+        Envelope.VerifyEnvelopeResult r = Envelope.verify(vo);
+        assertFalse(r.ok);
+        assertEquals(Envelope.VerifyEnvelopeReason.TOO_LARGE, r.reason);
+    }
+
+    @Test
+    void sizeGuardOversizedSig() {
+        StringBuilder bigSig = new StringBuilder(Envelope.MAX_ENVELOPE_FIELD_BYTES + 1);
+        for (int i = 0; i < Envelope.MAX_ENVELOPE_FIELD_BYTES + 1; i++) bigSig.append('a');
+        Envelope.SignedEnvelope env = new Envelope.SignedEnvelope(
+            "{}", bigSig.toString(), pubkeyHex(ALICE_PRIV), 1L, 2L);
+        Envelope.VerifyEnvelopeOpts vo = new Envelope.VerifyEnvelopeOpts();
+        vo.envelope = env; vo.nowMs = 1_000_000_000_500L;
+        Envelope.VerifyEnvelopeResult r = Envelope.verify(vo);
+        assertFalse(r.ok);
+        assertEquals(Envelope.VerifyEnvelopeReason.TOO_LARGE, r.reason);
+    }
+
+    @Test
+    void sizeGuardOversizedPubkey() {
+        StringBuilder bigPk = new StringBuilder(Envelope.MAX_ENVELOPE_FIELD_BYTES + 1);
+        for (int i = 0; i < Envelope.MAX_ENVELOPE_FIELD_BYTES + 1; i++) bigPk.append('b');
+        Envelope.SignedEnvelope env = new Envelope.SignedEnvelope(
+            "{}", "deadbeef", bigPk.toString(), 1L, 2L);
+        Envelope.VerifyEnvelopeOpts vo = new Envelope.VerifyEnvelopeOpts();
+        vo.envelope = env; vo.nowMs = 1_000_000_000_500L;
+        Envelope.VerifyEnvelopeResult r = Envelope.verify(vo);
+        assertFalse(r.ok);
+        assertEquals(Envelope.VerifyEnvelopeReason.TOO_LARGE, r.reason);
+    }
+
+    @Test
+    void sizeGuardNormalSizedEnvelopeNotTrigerred() {
+        Map<String, Object> data = new LinkedHashMap<>(); data.put("ok", 1);
+        Envelope.SignedEnvelope env = sign(ALICE_PRIV, data, 1_000_000_000_000L);
+        Envelope.VerifyEnvelopeOpts vo = new Envelope.VerifyEnvelopeOpts();
+        vo.envelope = env;
+        vo.nowMs = 1_000_000_000_500L;
+        Envelope.VerifyEnvelopeResult r = Envelope.verify(vo);
+        assertTrue(r.ok);
+    }
 }

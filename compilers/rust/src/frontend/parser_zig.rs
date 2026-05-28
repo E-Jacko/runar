@@ -71,7 +71,7 @@ pub fn parse_zig(source: &str, file_name: Option<&str>) -> ParseResult {
         .map(|msg| Diagnostic::error(msg, None))
         .collect();
 
-    ParseResult { contract, errors }
+    ParseResult { contract, errors, source_size_err: None }
 }
 
 // ---------------------------------------------------------------------------

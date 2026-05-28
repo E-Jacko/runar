@@ -51,6 +51,7 @@ pub fn parse_move(source: &str, file_name: Option<&str>) -> ParseResult {
     ParseResult {
         contract,
         errors,
+        source_size_err: None,
     }
 }
 

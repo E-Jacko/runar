@@ -53,6 +53,7 @@ pub fn parse_solidity(source: &str, file_name: Option<&str>) -> ParseResult {
     ParseResult {
         contract,
         errors,
+        source_size_err: None,
     }
 }
 

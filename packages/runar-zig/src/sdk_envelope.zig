@@ -364,6 +364,10 @@ pub const VerifyEnvelopeReason = enum {
     envelope_mismatch,
     bad_sig,
     pubkey_not_allowed,
+    /// Mirrors the TS 'too-large' reason. Returned BEFORE any JSON parse /
+    /// ECDSA verify work when an envelope string field exceeds its
+    /// InputLimits cap (DoS-bound). BUG-008 follow-up.
+    too_large,
 
     pub fn wire(self: VerifyEnvelopeReason) []const u8 {
         return switch (self) {
@@ -373,9 +377,15 @@ pub const VerifyEnvelopeReason = enum {
             .envelope_mismatch => "envelope-mismatch",
             .bad_sig => "bad-sig",
             .pubkey_not_allowed => "pubkey-not-allowed",
+            .too_large => "too-large",
         };
     }
 };
+
+/// Envelope DoS-bound caps. Mirror InputLimits.{MAX_IR_BYTES,
+/// MAX_STRING_BYTES} from the TS schema package. BUG-008 follow-up.
+pub const MAX_ENVELOPE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_ENVELOPE_FIELD_BYTES: usize = 4 * 1024 * 1024;
 
 pub const VerifyEnvelopeOpts = struct {
     envelope: *const SignedEnvelope,
@@ -401,6 +411,19 @@ pub const VerifyEnvelopeResult = struct {
 
 pub fn verifyEnvelope(allocator: std.mem.Allocator, opts: VerifyEnvelopeOpts) !VerifyEnvelopeResult {
     const env = opts.envelope;
+
+    // 0. DoS-bound size guard. Reject envelopes whose string fields exceed
+    //    their InputLimits cap BEFORE running JSON parse, hashing, or
+    //    ECDSA verify -- those operations are linear in input size and a
+    //    pathological 100 MB payload would otherwise pin the worker.
+    //    Mirrors the TS 'too-large' rejection at sdk/envelope.ts:104.
+    //    BUG-008 follow-up.
+    if (env.payload.len > MAX_ENVELOPE_PAYLOAD_BYTES
+        or env.sig.len > MAX_ENVELOPE_FIELD_BYTES
+        or env.pubkey.len > MAX_ENVELOPE_FIELD_BYTES)
+    {
+        return .{ .ok = false, .reason = .too_large };
+    }
 
     // 1. Field presence + types.
     if (env.payload.len == 0 or env.sig.len == 0 or env.pubkey.len == 0
@@ -776,6 +799,90 @@ test "accepts pubkey in allowlist" {
     var r = try verifyEnvelope(testing.allocator, .{
         .envelope = &env,
         .expected_keys = &keys,
+        .now_ms = 1_000_000_000_500,
+    });
+    defer r.deinit();
+    try testing.expect(r.ok);
+}
+
+// ---------------------------------------------------------------------------
+// BUG-008 size guards: oversized payload / sig / pubkey return TOO_LARGE
+// BEFORE any JSON parse or ECDSA verify work runs.
+// ---------------------------------------------------------------------------
+
+test "size guard rejects oversized payload" {
+    const big_payload = try testing.allocator.alloc(u8, MAX_ENVELOPE_PAYLOAD_BYTES + 1);
+    defer testing.allocator.free(big_payload);
+    @memset(big_payload, 'x');
+    const env = SignedEnvelope{
+        .payload = big_payload,
+        .sig = "deadbeef",
+        .pubkey = "02deadbeef",
+        .nonce = 1,
+        .expiresAt = 2,
+    };
+    var r = try verifyEnvelope(testing.allocator, .{
+        .envelope = &env,
+        .now_ms = 1_000_000_000_500,
+    });
+    defer r.deinit();
+    try testing.expect(!r.ok);
+    try testing.expectEqual(VerifyEnvelopeReason.too_large, r.reason.?);
+}
+
+test "size guard rejects oversized sig" {
+    const big_sig = try testing.allocator.alloc(u8, MAX_ENVELOPE_FIELD_BYTES + 1);
+    defer testing.allocator.free(big_sig);
+    @memset(big_sig, 'a');
+    const env = SignedEnvelope{
+        .payload = "{}",
+        .sig = big_sig,
+        .pubkey = "02deadbeef",
+        .nonce = 1,
+        .expiresAt = 2,
+    };
+    var r = try verifyEnvelope(testing.allocator, .{
+        .envelope = &env,
+        .now_ms = 1_000_000_000_500,
+    });
+    defer r.deinit();
+    try testing.expect(!r.ok);
+    try testing.expectEqual(VerifyEnvelopeReason.too_large, r.reason.?);
+}
+
+test "size guard rejects oversized pubkey" {
+    const big_pk = try testing.allocator.alloc(u8, MAX_ENVELOPE_FIELD_BYTES + 1);
+    defer testing.allocator.free(big_pk);
+    @memset(big_pk, 'b');
+    const env = SignedEnvelope{
+        .payload = "{}",
+        .sig = "deadbeef",
+        .pubkey = big_pk,
+        .nonce = 1,
+        .expiresAt = 2,
+    };
+    var r = try verifyEnvelope(testing.allocator, .{
+        .envelope = &env,
+        .now_ms = 1_000_000_000_500,
+    });
+    defer r.deinit();
+    try testing.expect(!r.ok);
+    try testing.expectEqual(VerifyEnvelopeReason.too_large, r.reason.?);
+}
+
+test "size guard accepts normal-sized envelope" {
+    var signer = signerForFn(alicePriv());
+    const data = [_]Value.KeyValue{ .{ .key = "ok", .value = .{ .Int = 1 } } };
+    var env = try signEnvelope(testing.allocator, .{
+        .data = &data,
+        .sign_fn = TestSigner.signCallback,
+        .sign_ctx = &signer.ctx,
+        .pubkey_hex = &signer.pubkey_hex,
+        .now_ms = 1_000_000_000_000,
+    });
+    defer env.deinit(testing.allocator);
+    var r = try verifyEnvelope(testing.allocator, .{
+        .envelope = &env,
         .now_ms = 1_000_000_000_500,
     });
     defer r.deinit();

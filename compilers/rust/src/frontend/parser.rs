@@ -27,9 +27,15 @@ use super::diagnostic::Diagnostic;
 // ---------------------------------------------------------------------------
 
 /// Result of parsing a source file.
+#[derive(Default)]
 pub struct ParseResult {
     pub contract: Option<ContractNode>,
     pub errors: Vec<Diagnostic>,
+    /// Non-`None` iff [`parse_source`]/[`parse`] rejected the input via the
+    /// DoS-bound source-size guard. Callers wanting typed detection can
+    /// inspect this field instead of string-matching the diagnostic
+    /// message. BUG-008 follow-up.
+    pub source_size_err: Option<super::input_limits::SourceSizeExceededError>,
 }
 
 impl ParseResult {
@@ -41,6 +47,15 @@ impl ParseResult {
 
 /// Parse a TypeScript source string and extract the Rúnar contract AST.
 pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
+    // DoS-bound size guard. Reject oversized source BEFORE the tokenizer
+    // touches the input. BUG-008 follow-up.
+    if let Some(sse) = super::input_limits::assert_source_bytes_under_limit(source) {
+        return ParseResult {
+            contract: None,
+            errors: vec![Diagnostic::error(sse.to_string(), None)],
+            source_size_err: Some(sse),
+        };
+    }
     let mut errors: Vec<Diagnostic> = Vec::new();
     let file = file_name.unwrap_or("contract.ts");
 
@@ -63,10 +78,7 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
         Ok(m) => m,
         Err(e) => {
             errors.push(Diagnostic::error(format!("Parse error: {:?}", e), None));
-            return ParseResult {
-                contract: None,
-                errors,
-            };
+            return ParseResult { contract: None, errors, source_size_err: None };
         }
     };
 
@@ -118,10 +130,7 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
         Some(c) => c,
         None => {
             errors.push(Diagnostic::error("No class extending SmartContract, StatefulSmartContract, or UnsafeSmartContract found", None));
-            return ParseResult {
-                contract: None,
-                errors,
-            };
+            return ParseResult { contract: None, errors, source_size_err: None };
         }
     };
 
@@ -146,10 +155,7 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
         source_file: file.to_string(),
     };
 
-    ParseResult {
-        contract: Some(contract),
-        errors,
-    }
+    ParseResult { contract: Some(contract), errors, source_size_err: None }
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,6 +1625,15 @@ fn bigint_to_i128(bigint_lit: &swc::BigInt) -> i128 {
 /// - `.runar.java` -> Java parser
 /// - anything else (including `.runar.ts`) -> TypeScript parser (default)
 pub fn parse_source(source: &str, file_name: Option<&str>) -> ParseResult {
+    // DoS-bound size guard. Reject oversized source BEFORE any
+    // format-specific parser touches the input. BUG-008 follow-up.
+    if let Some(sse) = super::input_limits::assert_source_bytes_under_limit(source) {
+        return ParseResult {
+            contract: None,
+            errors: vec![Diagnostic::error(sse.to_string(), None)],
+            source_size_err: Some(sse),
+        };
+    }
     let name = file_name.unwrap_or("contract.ts");
     if name.ends_with(".runar.sol") {
         return super::parser_sol::parse_solidity(source, file_name);
