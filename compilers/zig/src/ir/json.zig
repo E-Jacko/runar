@@ -167,7 +167,16 @@ fn parseProperties(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]typ
                 break :blk @as(?types.ConstValue, .{ .integer = int_val });
             },
             .bool => |b| @as(?types.ConstValue, .{ .boolean = b }),
-            .string => |s| @as(?types.ConstValue, .{ .string = try allocator.dupe(u8, s) }),
+            .string => |s| blk: {
+                // Same `n`-suffix discriminator used by parseLoadConst —
+                // oversize bigint initializers (e.g. property defaults) round
+                // through the same encoding as inline literals.
+                if (isDecimalBigIntLiteral(s)) {
+                    const decimal = try allocator.dupe(u8, s[0 .. s.len - 1]);
+                    break :blk @as(?types.ConstValue, .{ .big_integer = decimal });
+                }
+                break :blk @as(?types.ConstValue, .{ .string = try allocator.dupe(u8, s) });
+            },
             else => return ParseError.InvalidConstValue,
         } else null;
         result[i] = .{
@@ -365,9 +374,38 @@ fn parseLoadConst(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.
             return .{ .load_const = .{ .value = .{ .integer = int_val } } };
         },
         .bool => |b| return .{ .load_const = .{ .value = .{ .boolean = b } } },
-        .string => |s| return .{ .load_const = .{ .value = .{ .string = try allocator.dupe(u8, s) } } },
+        .string => |s| {
+            // Cross-tier IR producers (TS / Go / Python) emit oversize bigints
+            // as a quoted decimal string with the canonical JS BigInt `n`
+            // suffix so the value survives JSON precision loss. Distinguish
+            // this shape from hex-encoded ByteString literals (which never
+            // carry the suffix) before falling back to `string`.
+            if (isDecimalBigIntLiteral(s)) {
+                const decimal = try allocator.dupe(u8, s[0 .. s.len - 1]);
+                return .{ .load_const = .{ .value = .{ .big_integer = decimal } } };
+            }
+            return .{ .load_const = .{ .value = .{ .string = try allocator.dupe(u8, s) } } };
+        },
         else => return ParseError.InvalidConstValue,
     }
+}
+
+/// True if `s` matches the canonical JS BigInt decimal-literal encoding used
+/// by the TS / Go / Python IR emitters for oversize values: optional leading
+/// `-`, one or more ASCII digits, and a REQUIRED trailing `n` marker. The
+/// trailing `n` is the discriminator that separates a decimal-encoded BigInt
+/// from a hex-encoded ByteString literal (which never carries the suffix),
+/// so a hex string like "3030" is not mis-decoded as the integer 3030.
+fn isDecimalBigIntLiteral(s: []const u8) bool {
+    if (s.len < 2 or s[s.len - 1] != 'n') return false;
+    var start: usize = 0;
+    if (s[0] == '-') start = 1;
+    const body = s[start .. s.len - 1];
+    if (body.len == 0) return false;
+    for (body) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
 }
 
 fn parseBinOp(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.ANFValue {
@@ -1200,6 +1238,16 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
 fn writeConstValue(writer: anytype, value: types.ConstValue) !void {
     switch (value) {
         .integer => |i| try writer.print("{d}", .{i}),
+        .big_integer => |s| {
+            // Canonical JS BigInt encoding: quoted decimal string with the
+            // trailing `n` discriminator. Matches the TS / Go / Python
+            // emitters so the IR JSON is byte-identical across tiers for
+            // oversize literals (e.g. the 256-bit secp256k1 group order in
+            // schnorr-zkp).
+            try writer.writeByte('"');
+            try writer.writeAll(s);
+            try writer.writeAll("n\"");
+        },
         .boolean => |b| {
             if (b) {
                 try writer.writeAll("true");

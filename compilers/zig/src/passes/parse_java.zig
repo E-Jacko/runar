@@ -1675,8 +1675,8 @@ const Parser = struct {
         return switch (self.current.kind) {
             .number => blk: {
                 const tok = self.bump();
-                const val = parseNumberLiteral(tok.text);
-                break :blk Expression{ .literal_int = val };
+                if (self.parseNumberExpr(tok.text)) |expr| break :blk expr;
+                break :blk null;
             },
             .string_literal => blk: {
                 const tok = self.bump();
@@ -1800,19 +1800,21 @@ const Parser = struct {
         // Optional generic args on the element type: `Foo<...>`
         if (self.current.kind == .lt) self.skipTypeArgs();
 
-        // `new BigInteger("decimal" [, radix])` — fold to literal_int so the
-        // 256-bit secp256k1 group order in schnorr-zkp parses cleanly.
-        // The Zig codegen tier currently stores literal_int as i64, so the
-        // value is truncated; affected fixtures carry per-tier allowlists.
+        // `new BigInteger("decimal" [, radix])` — fold to a literal whose
+        // precision matches the source text. Small values keep `literal_int`
+        // for codegen-fast-path parity; oversize values (e.g. the 256-bit
+        // secp256k1 group order in schnorr-zkp) flow through `literal_bigint`
+        // so codegen emits the correct 32-byte push.
         if (std.mem.eql(u8, final_name, "BigInteger") and self.current.kind == .lparen) {
             _ = self.bump();
             if (self.current.kind == .string_literal) {
-                _ = self.bump();
+                const str_tok = self.bump();
                 if (self.current.kind == .comma) {
                     _ = self.bump();
                     if (self.current.kind == .number) _ = self.bump();
                 }
                 _ = self.expect(.rparen);
+                if (self.parseNumberExpr(str_tok.text)) |expr| return expr;
                 return Expression{ .literal_int = 0 };
             }
             // Unknown shape — consume balanced parens for tolerance.
@@ -1929,11 +1931,46 @@ const Parser = struct {
             .assignments = assignments,
         };
     }
+
+    /// Strip Java `_` separators + `L`/`l` long suffix from a numeric token,
+    /// then route to either `literal_int` (fits `i64`) or `literal_bigint`
+    /// (overflows). Used by parsePrimary's `.number` arm so the 256-bit
+    /// secp256k1 group order survives the Java surface parser intact.
+    fn parseNumberExpr(self: *Parser, text: []const u8) ?Expression {
+        var buf: [128]u8 = undefined;
+        var len: usize = 0;
+        for (text) |ch| {
+            if (ch == 'L' or ch == 'l') break;
+            if (ch != '_' and len < buf.len) {
+                buf[len] = ch;
+                len += 1;
+            }
+        }
+        const stripped = buf[0..len];
+        if (std.fmt.parseInt(i64, stripped, 0)) |val| {
+            return Expression{ .literal_int = val };
+        } else |_| {
+            if (isAllAsciiDigitsJava(stripped)) {
+                const decimal = self.allocator.dupe(u8, stripped) catch return null;
+                return Expression{ .literal_bigint = decimal };
+            }
+            self.addErrorFmt("invalid integer: '{s}'", .{text});
+            return null;
+        }
+    }
 };
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+fn isAllAsciiDigitsJava(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
 
 fn parseNumberLiteral(text: []const u8) i64 {
     var buf: [64]u8 = undefined;

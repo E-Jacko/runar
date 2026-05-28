@@ -1181,14 +1181,17 @@ const Parser = struct {
             },
             .number => blk: {
                 const tok = self.bump();
-                const val = std.fmt.parseInt(i64, tok.text, 10) catch v: {
-                    // Accept oversize decimal integer literals at parse time
-                    // (truncates to 0; codegen tier requires per-tier allowlist).
-                    if (isAllAsciiDigits(tok.text)) break :v 0;
+                if (std.fmt.parseInt(i64, tok.text, 10)) |val| {
+                    break :blk Expression{ .literal_int = val };
+                } else |_| {
+                    // Oversize decimal literal — carry as `literal_bigint`.
+                    if (isAllAsciiDigits(tok.text)) {
+                        const decimal = self.allocator.dupe(u8, tok.text) catch break :blk null;
+                        break :blk Expression{ .literal_bigint = decimal };
+                    }
                     self.addErrorFmt("invalid integer: '{s}'", .{tok.text});
                     break :blk null;
-                };
-                break :blk Expression{ .literal_int = val };
+                }
             },
             .kw_true => blk: { _ = self.bump(); break :blk Expression{ .literal_bool = true }; },
             .kw_false => blk: { _ = self.bump(); break :blk Expression{ .literal_bool = false }; },
