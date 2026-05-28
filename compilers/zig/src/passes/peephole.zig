@@ -17,10 +17,11 @@ const max_iterations = 100;
 // Matching helpers
 // ============================================================================
 
-/// Returns true if the instruction is any push variant (push_int, push_data, push_bool).
+/// Returns true if the instruction is any push variant (push_int, push_data,
+/// push_bool, push_big_int_decimal).
 fn isPush(inst: Inst) bool {
     return switch (inst) {
-        .push_int, .push_data, .push_bool, .push_codesep_index, .placeholder => true,
+        .push_int, .push_data, .push_bool, .push_big_int_decimal, .push_codesep_index, .placeholder => true,
         .op, .raw_bytes => false,
     };
 }
@@ -71,6 +72,7 @@ fn instEql(a: Inst, b: Inst) bool {
         .push_int => |va| va == b.push_int,
         .push_bool => |ba| ba == b.push_bool,
         .push_data => |da| std.mem.eql(u8, da, b.push_data),
+        .push_big_int_decimal => |sa| std.mem.eql(u8, sa, b.push_big_int_decimal),
         .push_codesep_index => true,
         .placeholder => |pa| pa.param_index == b.placeholder.param_index,
         // raw_bytes is opaque; we never compare or rewrite across it, so

@@ -254,6 +254,13 @@ const LowerCtx = struct {
         try self.emit(.{ .push_int = n });
     }
 
+    /// Emit a push for a decimal-string-encoded big integer (overflows `i64`).
+    /// The decoder side handles converting the canonical decimal text into
+    /// little-endian sign-magnitude bytes; see `encodeScriptNumberFromDecimal`.
+    fn emitPushBigIntDecimal(self: *LowerCtx, decimal: []const u8) !void {
+        try self.emit(.{ .push_big_int_decimal = decimal });
+    }
+
     fn emitPushBool(self: *LowerCtx, b: bool) !void {
         try self.emit(.{ .push_bool = b });
     }
@@ -1096,6 +1103,7 @@ const LowerCtx = struct {
         switch (value) {
             .boolean => |b| try self.emitPushBool(b),
             .integer => |n| try self.emitPushInt(@intCast(n)),
+            .big_integer => |s| try self.emitPushBigIntDecimal(s),
             .string => |s| {
                 if (std.mem.startsWith(u8, s, "@ref:")) {
                     const ref_name = s[5..];
@@ -1155,6 +1163,7 @@ const LowerCtx = struct {
                     switch (iv) {
                         .boolean => |b| try self.emitPushBool(b),
                         .integer => |n| try self.emitPushInt(@intCast(n)),
+                        .big_integer => |s| try self.emitPushBigIntDecimal(s),
                         .string => |s| try self.emitPushHexString(s),
                     }
                     try self.stack.push(self.allocator, bind_name);
@@ -2830,6 +2839,7 @@ const LowerCtx = struct {
                 switch (iv) {
                     .boolean => |b| try self.emitPushBool(b),
                     .integer => |n| try self.emitPushInt(@intCast(n)),
+                    .big_integer => |s| try self.emitPushBigIntDecimal(s),
                     .string => |s| try self.emitPushData(s),
                 }
                 try self.stack.push(self.allocator, null);
