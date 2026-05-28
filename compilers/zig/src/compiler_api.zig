@@ -447,15 +447,13 @@ test "verifyRabinSig end-to-end source compiles and emits Rabin opcode sequence"
 }
 
 test "verifyRabinSig hex contains contiguous Rabin opcode subsequence" {
-    // Stronger pin: assert the EXACT 10-byte Rabin opcode subsequence
-    // appears contiguously in the emitted hex. The expected substring is
-    // the byte concatenation of:
-    //   SWAP=7c ROT=7b DUP=76 MUL=95 ADD=93 SWAP=7c MOD=97 SWAP=7c
-    //   SHA256=a8 EQUAL=87
-    // = "7c7b76959 37c977ca887" -- but note we must pre-compute the contiguous
-    // string without spaces. This guards against opcode reordering inside the
-    // Rabin emitter that would still satisfy the per-opcode count check above
-    // but produce a non-conforming hex relative to the other 6 compilers.
+    // Stronger pin: assert the EXACT Rabin opcode subsequence appears
+    // contiguously in the emitted hex. The expected substring is the
+    // byte concatenation of (post BUG-010, 15 opcodes / 18 hex bytes):
+    //   SWAP=7c DUP=76 OP_0=00 PUSH3(65536)=03000001 WITHIN=a5 VERIFY=69
+    //   ROT=7b DUP=76 MUL=95 ADD=93 SWAP=7c MOD=97 SWAP=7c SHA256=a8 EQUAL=87
+    // The leading 5-opcode prefix (DUP OP_0 PUSH3 65536 WITHIN VERIFY) is
+    // the BUG-010 padding range check (0 <= padding < 65536).
     const source =
         \\const runar = @import("runar");
         \\
@@ -482,8 +480,16 @@ test "verifyRabinSig hex contains contiguous Rabin opcode subsequence" {
     const hex = try compileSourceToHex(std.testing.allocator, source, "RabinOnly.runar.zig");
     defer std.testing.allocator.free(hex);
 
-    // Contiguous Rabin opcode subsequence (10 single-byte opcodes, 20 hex chars).
-    const rabin_subseq = "7c7b769593" ++ "7c977ca887";
+    // Contiguous Rabin opcode subsequence (15 ops post-BUG-010; the PUSH 65536
+    // contributes 1 length byte + 3 data bytes = 4 hex octets in the middle).
+    // Bytes:
+    //   7c          OP_SWAP
+    //   76 00       OP_DUP OP_0           (BUG-010 range check)
+    //   03 00 00 01 PUSH 65536 (LE)
+    //   a5 69       OP_WITHIN OP_VERIFY
+    //   7b          OP_ROT
+    //   76 95 93 7c 97 7c a8 87           original tail
+    const rabin_subseq = "7c7600" ++ "03000001" ++ "a5697b" ++ "769593" ++ "7c977ca887";
     const found = std.mem.indexOf(u8, hex, rabin_subseq);
     if (found == null) {
         std.debug.print(
@@ -494,12 +500,10 @@ test "verifyRabinSig hex contains contiguous Rabin opcode subsequence" {
     try std.testing.expect(found != null);
 }
 
-test "verifyRabinSig appendVerifyRabinSig emits exactly 10 opcodes" {
+test "verifyRabinSig appendVerifyRabinSig emits exactly 15 opcodes" {
     // Direct emitter pin: the appendVerifyRabinSig builder helper must
-    // emit exactly 10 instructions (matching the cross-tier reference).
-    // Complements the existing crypto_emitters.zig:191 test ("implemented
-    // crypto emitters append instructions") by pinning the exact count
-    // rather than just non-emptiness.
+    // emit exactly 15 instructions (matching the cross-tier reference,
+    // post BUG-010: 10 original + 5 padding-range-check ops).
     const crypto_emitters = @import("passes/helpers/crypto_emitters.zig");
     const registry = @import("passes/helpers/crypto_builtins.zig");
 
@@ -507,11 +511,17 @@ test "verifyRabinSig appendVerifyRabinSig emits exactly 10 opcodes" {
     defer list.deinit(std.testing.allocator);
 
     try crypto_emitters.appendBuiltinInstructions(&list, std.testing.allocator, registry.CryptoBuiltin.verify_rabin_sig);
-    try std.testing.expectEqual(@as(usize, 10), list.items.len);
+    try std.testing.expectEqual(@as(usize, 15), list.items.len);
 
-    // Pin the exact opcode order (the cross-compiler reference).
-    const expected = [_][]const u8{
+    // Pin the exact opcode order (the cross-compiler reference). Position 3
+    // is a push of the BUG-010 padding limit (65536) — checked separately.
+    const expected_opcodes = [_]?[]const u8{
         "OP_SWAP",
+        "OP_DUP",
+        "OP_0",
+        null, // push_int(65536)
+        "OP_WITHIN",
+        "OP_VERIFY",
         "OP_ROT",
         "OP_DUP",
         "OP_MUL",
@@ -522,10 +532,17 @@ test "verifyRabinSig appendVerifyRabinSig emits exactly 10 opcodes" {
         "OP_SHA256",
         "OP_EQUAL",
     };
-    for (expected, 0..) |name, i| {
-        switch (list.items[i]) {
-            .op_name => |op| try std.testing.expectEqualStrings(name, op),
-            else => return error.UnexpectedInstructionKind,
+    for (expected_opcodes, 0..) |maybe_name, i| {
+        if (maybe_name) |name| {
+            switch (list.items[i]) {
+                .op_name => |op| try std.testing.expectEqualStrings(name, op),
+                else => return error.UnexpectedInstructionKind,
+            }
+        } else {
+            switch (list.items[i]) {
+                .push_int => |v| try std.testing.expectEqual(@as(i64, 65536), v),
+                else => return error.UnexpectedInstructionKind,
+            }
         }
     }
 }
