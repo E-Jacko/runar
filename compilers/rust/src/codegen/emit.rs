@@ -4,6 +4,7 @@
 //! Script opcodes, producing both a hex-encoded script and a human-readable
 //! ASM representation.
 
+use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 
 use super::opcodes::opcode_byte;
@@ -211,21 +212,20 @@ impl EmitContext {
 // Script number encoding
 // ---------------------------------------------------------------------------
 
-/// Encode an i128 as a Bitcoin Script number (little-endian, sign-magnitude).
-/// Bitcoin Script numbers can be up to 2^252, so i128 is needed.
-pub fn encode_script_number(n: i128) -> Vec<u8> {
-    if n == 0 {
+/// Encode a `BigInt` as a Bitcoin Script number (little-endian,
+/// sign-magnitude with the sign bit in the MSB).
+///
+/// Widened from `i128` so 256-bit constants (e.g. the secp256k1 group
+/// order in schnorr-zkp's s-bound assert) survive without truncation.
+/// Mirrors `compilers/go/codegen/emit.go::encodeScriptNumber`.
+pub fn encode_script_number(n: &num_bigint::BigInt) -> Vec<u8> {
+    use num_bigint::Sign;
+    if n.sign() == Sign::NoSign {
         return Vec::new();
     }
 
-    let negative = n < 0;
-    let mut abs = if negative { (-n) as u128 } else { n as u128 };
-
-    let mut bytes = Vec::new();
-    while abs > 0 {
-        bytes.push((abs & 0xff) as u8);
-        abs >>= 8;
-    }
+    let negative = n.sign() == Sign::Minus;
+    let mut bytes = n.magnitude().to_bytes_le(); // little-endian byte representation of |n|
 
     let last_byte = *bytes.last().unwrap();
     if last_byte & 0x80 != 0 {
@@ -302,7 +302,7 @@ fn encode_push_value(value: &PushValue) -> (String, String) {
                 ("00".to_string(), "OP_FALSE".to_string())
             }
         }
-        PushValue::Int(n) => encode_push_int(*n),
+        PushValue::Int(n) => encode_push_int(n),
         PushValue::Bytes(bytes) => {
             let encoded = encode_push_data(bytes);
             let h = hex::encode(&encoded);
@@ -316,18 +316,24 @@ fn encode_push_value(value: &PushValue) -> (String, String) {
 }
 
 /// Encode an integer push, using small-integer opcodes where possible.
-pub fn encode_push_int(n: i128) -> (String, String) {
-    if n == 0 {
+pub fn encode_push_int(n: &num_bigint::BigInt) -> (String, String) {
+    use num_bigint::Sign;
+    use num_traits::ToPrimitive;
+
+    if n.sign() == Sign::NoSign {
         return ("00".to_string(), "OP_0".to_string());
     }
 
-    if n == -1 {
-        return ("4f".to_string(), "OP_1NEGATE".to_string());
-    }
-
-    if n >= 1 && n <= 16 {
-        let opcode = 0x50 + n as u8;
-        return (format!("{:02x}", opcode), format!("OP_{}", n));
+    // Check for OP_1NEGATE / OP_1..OP_16 — these all fit in i8 so a cheap
+    // to_i64() guard suffices before falling through to general encoding.
+    if let Some(small) = n.to_i64() {
+        if small == -1 {
+            return ("4f".to_string(), "OP_1NEGATE".to_string());
+        }
+        if (1..=16).contains(&small) {
+            let opcode = 0x50 + small as u8;
+            return (format!("{:02x}", opcode), format!("OP_{}", small));
+        }
     }
 
     let num_bytes = encode_script_number(n);
@@ -491,13 +497,13 @@ fn emit_method_dispatch(
 
         if !is_last {
             ctx.emit_opcode("OP_DUP")?;
-            ctx.emit_push(&PushValue::Int(i as i128));
+            ctx.emit_push(&PushValue::Int(BigInt::from(i as i128)));
             ctx.emit_opcode("OP_NUMEQUAL")?;
             ctx.emit_opcode("OP_IF")?;
             ctx.emit_opcode("OP_DROP")?;
         } else {
             // Last method — verify the index matches (fail-closed for invalid selectors)
-            ctx.emit_push(&PushValue::Int(i as i128));
+            ctx.emit_push(&PushValue::Int(BigInt::from(i as i128)));
             ctx.emit_opcode("OP_NUMEQUALVERIFY")?;
         }
 
@@ -613,7 +619,7 @@ mod tests {
         let method = StackMethod {
             name: "test".to_string(),
             ops: vec![
-                StackOp::Push(PushValue::Int(42)), // some bytes before
+                StackOp::Push(PushValue::Int(BigInt::from(42))), // some bytes before
                 StackOp::Placeholder {
                     param_index: 0,
                     param_name: "x".to_string(),
@@ -645,7 +651,7 @@ mod tests {
         let method = StackMethod {
             name: "check".to_string(),
             ops: vec![
-                StackOp::Push(PushValue::Int(42)),
+                StackOp::Push(PushValue::Int(BigInt::from(42))),
                 StackOp::Opcode("OP_NUMEQUAL".to_string()),
                 StackOp::Opcode("OP_VERIFY".to_string()),
             ],
@@ -723,7 +729,7 @@ mod tests {
         let method = StackMethod {
             name: "check".to_string(),
             ops: vec![
-                StackOp::Push(PushValue::Int(17)), // 2 bytes: 01 11
+                StackOp::Push(PushValue::Int(BigInt::from(17))), // 2 bytes: 01 11
                 StackOp::Placeholder {
                     param_index: 0,
                     param_name: "x".to_string(),
@@ -1089,7 +1095,7 @@ mod tests {
     fn test_m10_integer_17_uses_push_prefix_not_op17() {
         let method = StackMethod {
             name: "test".to_string(),
-            ops: vec![StackOp::Push(PushValue::Int(17))],
+            ops: vec![StackOp::Push(PushValue::Int(BigInt::from(17)))],
             max_stack_depth: 1,
             source_locs: vec![],
         };
@@ -1355,7 +1361,7 @@ mod tests {
         ];
 
         for &(val, expected_hex) in cases {
-            let raw = encode_script_number(val);
+            let raw = encode_script_number(&BigInt::from(val as i128));
             let got_hex = hex::encode(&raw);
             assert_eq!(
                 got_hex, expected_hex,

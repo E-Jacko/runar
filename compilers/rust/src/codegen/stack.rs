@@ -12,6 +12,7 @@
 //! - @this is a compile-time placeholder (push 0)
 //! - super() is a no-op at stack level
 
+use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::{ANFBinding, ANFMethod, ANFProgram, ANFProperty, ANFValue, ConstValue};
@@ -64,7 +65,14 @@ pub enum StackOp {
 #[derive(Debug, Clone)]
 pub enum PushValue {
     Bool(bool),
-    Int(i128),
+    /// Arbitrary-precision integer push.
+    ///
+    /// Widened from `i128` to `num_bigint::BigInt` so 256-bit constants
+    /// (e.g. the secp256k1 group order in schnorr-zkp's s-bound assert)
+    /// round-trip through the stack-IR and into the final push-encoded
+    /// Bitcoin Script bytes without truncation. Mirrors Go's
+    /// `PushValue.Kind="bigint"` (carries `*big.Int`).
+    Int(num_bigint::BigInt),
     Bytes(Vec<u8>),
 }
 
@@ -507,13 +515,13 @@ impl LoweringContext {
         // emit_num_to_low_bytes: [..., len] -> [..., low_n_bytes]. Uses
         // NUM2BIN(n+1) then SPLIT(n) DROP to drop the sign byte.
         fn emit_num_to_low_bytes(ctx: &mut LoweringContext, n_bytes: i128) {
-            ctx.emit_op(StackOp::Push(PushValue::Int(n_bytes + 1)));
+            ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(n_bytes + 1))));
             ctx.sm.push("");
             ctx.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
             ctx.sm.pop();
             ctx.sm.pop();
             ctx.sm.push("");
-            ctx.emit_op(StackOp::Push(PushValue::Int(n_bytes)));
+            ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(n_bytes))));
             ctx.sm.push("");
             ctx.emit_op(StackOp::Opcode("OP_SPLIT".into()));
             ctx.sm.pop();
@@ -539,7 +547,7 @@ impl LoweringContext {
         // IF len < 253: 1-byte varint.
         self.emit_op(StackOp::Dup);
         self.sm.dup();
-        self.emit_op(StackOp::Push(PushValue::Int(253)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(253))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop();
@@ -555,7 +563,7 @@ impl LoweringContext {
         // ELSE-IF len <= 0xffff: 0xfd + 2-byte LE.
         self.emit_op(StackOp::Dup);
         self.sm.dup();
-        self.emit_op(StackOp::Push(PushValue::Int(0x10000)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0x10000i64))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop();
@@ -572,7 +580,7 @@ impl LoweringContext {
         // ELSE-IF len <= 0xffffffff: 0xfe + 4-byte LE.
         self.emit_op(StackOp::Dup);
         self.sm.dup();
-        self.emit_op(StackOp::Push(PushValue::Int(0x100000000)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0x100000000i64))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop();
@@ -606,7 +614,7 @@ impl LoweringContext {
         self.sm.push("");
         self.emit_op(StackOp::Dup);
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(76)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(76))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop(); self.sm.pop();
@@ -617,12 +625,12 @@ impl LoweringContext {
         let sm_after_outer_if = self.sm.clone();
 
         // THEN: len <= 75
-        self.emit_op(StackOp::Push(PushValue::Int(2)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(2))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
         self.sm.pop(); self.sm.pop();
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -639,7 +647,7 @@ impl LoweringContext {
 
         self.emit_op(StackOp::Dup);
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(256)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(256))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop(); self.sm.pop();
@@ -650,12 +658,12 @@ impl LoweringContext {
         let sm_after_inner_if = self.sm.clone();
 
         // THEN: 76-255 → 0x4c + 1-byte
-        self.emit_op(StackOp::Push(PushValue::Int(2)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(2))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
         self.sm.pop(); self.sm.pop();
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -676,12 +684,12 @@ impl LoweringContext {
         self.sm = sm_after_inner_if;
 
         // ELSE: >= 256 → 0x4d + 2-byte LE
-        self.emit_op(StackOp::Push(PushValue::Int(4)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
         self.sm.pop(); self.sm.pop();
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(2)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(2))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -708,7 +716,7 @@ impl LoweringContext {
     /// Expects stack: [..., state_bytes]
     /// Leaves stack:  [..., data, remaining_state]
     fn emit_push_data_decode(&mut self) {
-        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -717,7 +725,7 @@ impl LoweringContext {
         self.emit_op(StackOp::Opcode("OP_BIN2NUM".into()));
         self.emit_op(StackOp::Dup);
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(76)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(76))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop(); self.sm.pop();
@@ -738,7 +746,7 @@ impl LoweringContext {
 
         self.emit_op(StackOp::Dup);
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(77)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(77))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUMEQUAL".into()));
         self.sm.pop(); self.sm.pop();
@@ -750,7 +758,7 @@ impl LoweringContext {
 
         // THEN: fb == 77 → 2-byte LE
         self.emit_op(StackOp::Drop); self.sm.pop();
-        self.emit_op(StackOp::Push(PushValue::Int(2)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(2))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -766,7 +774,7 @@ impl LoweringContext {
 
         // ELSE: fb == 76 → 1-byte
         self.emit_op(StackOp::Drop); self.sm.pop();
-        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -815,7 +823,7 @@ impl LoweringContext {
                 let removed = self.sm.remove_at_depth(2);
                 self.sm.push(&removed);
             } else {
-                self.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
                 self.sm.push(""); // temporary depth literal
                 self.emit_op(StackOp::Roll { depth });
                 self.sm.pop(); // remove depth literal
@@ -828,7 +836,7 @@ impl LoweringContext {
                 let picked = self.sm.peek_at_depth(1).to_string();
                 self.sm.push(&picked);
             } else {
-                self.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
                 self.sm.push(""); // temporary
                 self.emit_op(StackOp::Pick { depth });
                 self.sm.pop(); // remove depth literal
@@ -873,7 +881,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Nip);
                 self.sm.remove_at_depth(1);
             } else {
-                self.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
                 self.sm.push("");
                 self.emit_op(StackOp::Roll { depth });
                 self.sm.pop();
@@ -1052,7 +1060,7 @@ impl LoweringContext {
             self.sm.pop();
             self.sm.push(binding_name);
         } else {
-            self.emit_op(StackOp::Push(PushValue::Int(0)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
             self.sm.push(binding_name);
         }
     }
@@ -1106,14 +1114,14 @@ impl LoweringContext {
             }
             serde_json::Value::Number(n) => {
                 let i = n.as_i64().map(|v| v as i128).unwrap_or(0);
-                self.emit_op(StackOp::Push(PushValue::Int(i)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(i))));
             }
             serde_json::Value::String(s) => {
                 let bytes = hex_to_bytes(s);
                 self.emit_op(StackOp::Push(PushValue::Bytes(bytes)));
             }
             _ => {
-                self.emit_op(StackOp::Push(PushValue::Int(0)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
             }
         }
     }
@@ -1148,14 +1156,14 @@ impl LoweringContext {
                     self.sm.push(binding_name);
                 } else {
                     // Referenced value not on stack -- push a placeholder
-                    self.emit_op(StackOp::Push(PushValue::Int(0)));
+                    self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
                     self.sm.push(binding_name);
                 }
                 return;
             }
             // Handle @this marker -- compile-time concept, not a runtime value
             if s == "@this" {
-                self.emit_op(StackOp::Push(PushValue::Int(0)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
                 self.sm.push(binding_name);
                 return;
             }
@@ -1167,14 +1175,14 @@ impl LoweringContext {
                 self.emit_op(StackOp::Push(PushValue::Bool(*b)));
             }
             Some(ConstValue::Int(n)) => {
-                self.emit_op(StackOp::Push(PushValue::Int(*n)));
+                self.emit_op(StackOp::Push(PushValue::Int(n.clone())));
             }
             Some(ConstValue::Str(s)) => {
                 let bytes = hex_to_bytes(s);
                 self.emit_op(StackOp::Push(PushValue::Bytes(bytes)));
             }
             None => {
-                self.emit_op(StackOp::Push(PushValue::Int(0)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
             }
         }
         // Track constant values for compile-time extraction (e.g., Merkle depth)
@@ -1497,7 +1505,7 @@ impl LoweringContext {
             }
         } else {
             // Unknown function -- push a placeholder
-            self.emit_op(StackOp::Push(PushValue::Int(0)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
             self.sm.push(binding_name);
             return;
         }
@@ -1715,7 +1723,7 @@ impl LoweringContext {
                     else_ctx.emit_op(StackOp::Nip);
                     else_ctx.sm.remove_at_depth(1);
                 } else {
-                    else_ctx.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
+                    else_ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
                     else_ctx.sm.push("");
                     else_ctx.emit_op(StackOp::Roll { depth });
                     else_ctx.sm.pop();
@@ -1740,7 +1748,7 @@ impl LoweringContext {
                     then_ctx.emit_op(StackOp::Nip);
                     then_ctx.sm.remove_at_depth(1);
                 } else {
-                    then_ctx.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
+                    then_ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
                     then_ctx.sm.push("");
                     then_ctx.emit_op(StackOp::Roll { depth });
                     then_ctx.sm.pop();
@@ -1764,7 +1772,7 @@ impl LoweringContext {
                 if var_depth == 0 {
                     else_ctx.emit_op(StackOp::Dup);
                 } else {
-                    else_ctx.emit_op(StackOp::Push(PushValue::Int(var_depth as i128)));
+                    else_ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(var_depth as i128))));
                     else_ctx.sm.push("");
                     else_ctx.emit_op(StackOp::Pick { depth: var_depth });
                     else_ctx.sm.pop();
@@ -1821,7 +1829,7 @@ impl LoweringContext {
                             self.emit_op(StackOp::Nip);
                             self.sm.remove_at_depth(1);
                         } else {
-                            self.emit_op(StackOp::Push(PushValue::Int(d as i128)));
+                            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(d as i128))));
                             self.sm.push("");
                             self.emit_op(StackOp::Roll { depth: d + 1 });
                             self.sm.pop();
@@ -1846,7 +1854,7 @@ impl LoweringContext {
                             self.emit_op(StackOp::Nip);
                             self.sm.remove_at_depth(1);
                         } else {
-                            self.emit_op(StackOp::Push(PushValue::Int(d as i128)));
+                            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(d as i128))));
                             self.sm.push("");
                             self.emit_op(StackOp::Roll { depth: d + 1 });
                             self.sm.pop();
@@ -1912,7 +1920,7 @@ impl LoweringContext {
         self.local_bindings = self.local_bindings.union(&body_binding_names).cloned().collect();
 
         for i in 0..count {
-            self.emit_op(StackOp::Push(PushValue::Int(i as i128)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(i as i128))));
             self.sm.push(iter_var);
 
             let mut last_uses = compute_last_uses(body);
@@ -1990,7 +1998,7 @@ impl LoweringContext {
                         self.emit_op(StackOp::Nip);
                         self.sm.remove_at_depth(1);
                     } else {
-                        self.emit_op(StackOp::Push(PushValue::Int(d as i128)));
+                        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(d as i128))));
                         self.sm.push("");
                         self.emit_op(StackOp::Roll { depth: d + 1 });
                         self.sm.pop();
@@ -2029,18 +2037,18 @@ impl LoweringContext {
                 self.push_json_value(val);
                 self.sm.push("");
             } else {
-                self.emit_op(StackOp::Push(PushValue::Int(0)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
                 self.sm.push("");
             }
 
             // Convert numeric/boolean values to fixed-width bytes via OP_NUM2BIN
             if prop.prop_type == "bigint" {
-                self.emit_op(StackOp::Push(PushValue::Int(8)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
                 self.sm.pop(); // pop the width
             } else if prop.prop_type == "boolean" {
-                self.emit_op(StackOp::Push(PushValue::Int(1)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
                 self.sm.pop(); // pop the width
@@ -2088,7 +2096,7 @@ impl LoweringContext {
         // Extract amount: last 52 bytes, take 8 bytes at offset 0.
         self.emit_op(StackOp::Opcode("OP_SIZE".into()));
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(52))); // 8 (amount) + 44 (tail)
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(52)))); // 8 (amount) + 44 (tail)
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SUB".into()));
         self.sm.pop();
@@ -2103,7 +2111,7 @@ impl LoweringContext {
         self.sm.pop();
         self.sm.pop();
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into())); // [amount(8), tail(44)]
         self.sm.pop();
@@ -2193,7 +2201,7 @@ impl LoweringContext {
         // Step 1: Convert _newAmount to 8-byte LE and save to altstack.
         let amount_last = self.is_last_use(new_amount_ref, binding_index, last_uses);
         self.bring_to_top(new_amount_ref, amount_last);
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
         self.sm.pop();
@@ -2296,7 +2304,7 @@ impl LoweringContext {
         // Step 2: Prepend amount as 8-byte LE.
         let amount_last = self.is_last_use(amount_ref, binding_index, last_uses);
         self.bring_to_top(amount_ref, amount_last);
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
         self.sm.pop(); // pop width
@@ -2360,12 +2368,12 @@ impl LoweringContext {
             self.bring_to_top(value_ref, is_last);
 
             if prop.prop_type == "bigint" {
-                self.emit_op(StackOp::Push(PushValue::Int(8)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
                 self.sm.pop();
             } else if prop.prop_type == "boolean" {
-                self.emit_op(StackOp::Push(PushValue::Int(1)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
                 self.sm.pop();
@@ -2399,7 +2407,7 @@ impl LoweringContext {
         // Step 6: Prepend satoshis as 8-byte LE.
         let is_last_satoshis = self.is_last_use(satoshis, binding_index, last_uses);
         self.bring_to_top(satoshis, is_last_satoshis);
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
         self.sm.pop(); // pop the width
@@ -2450,7 +2458,7 @@ impl LoweringContext {
         // Step 4: Prepend satoshis as 8-byte LE
         let sat_is_last = self.is_last_use(satoshis, binding_index, last_uses);
         self.bring_to_top(satoshis, sat_is_last);
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
         self.sm.pop(); // pop width
@@ -2564,7 +2572,7 @@ impl LoweringContext {
             .unwrap_or_else(|| panic!("checkMultiSig: array_literal metadata missing for pks={}", pks_ref));
 
         // Dummy OP_0 (historical CHECKMULTISIG off-by-one).
-        self.emit_op(StackOp::Push(PushValue::Int(0)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
         self.sm.push("");
 
         // Bring each sig element to TOS in declaration order.
@@ -2574,7 +2582,7 @@ impl LoweringContext {
         }
 
         // Push nSigs.
-        self.emit_op(StackOp::Push(PushValue::Int(sig_elems.len() as i128)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(sig_elems.len()))));
         self.sm.push("");
 
         // Bring each pubkey element to TOS in declaration order.
@@ -2584,7 +2592,7 @@ impl LoweringContext {
         }
 
         // Push nPKs.
-        self.emit_op(StackOp::Push(PushValue::Int(pk_elems.len() as i128)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(pk_elems.len()))));
         self.sm.push("");
 
         // OP_CHECKMULTISIG consumes: dummy + N sigs + nSigs + M pks + nPKs.
@@ -2734,7 +2742,7 @@ impl LoweringContext {
         self.bring_to_top(preimage_ref, is_last);
 
         // 1. Skip first 104 bytes (header), drop prefix.
-        self.emit_op(StackOp::Push(PushValue::Int(104)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(104))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
         self.sm.pop(); self.sm.pop();
@@ -2746,7 +2754,7 @@ impl LoweringContext {
         // 2. Drop tail 44 bytes.
         self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(44)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(44))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
         self.sm.pop(); self.sm.pop();
@@ -2760,7 +2768,7 @@ impl LoweringContext {
         // 3. Drop amount (last 8 bytes).
         self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
         self.sm.pop(); self.sm.pop();
@@ -2777,7 +2785,7 @@ impl LoweringContext {
             // 4. Extract last stateLen bytes.
             self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
             self.sm.push("");
-            self.emit_op(StackOp::Push(PushValue::Int(state_len)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(state_len))));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
             self.sm.pop(); self.sm.pop();
@@ -2810,7 +2818,7 @@ impl LoweringContext {
             // strip too few varint bytes and corrupt the subsequent
             // state-extraction OP_SPLITs (this is the bug fixed here — see
             // `integration/go/contracts/RollupBug.runar.go`).
-            self.emit_op(StackOp::Push(PushValue::Int(1)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
             self.sm.pop(); self.sm.pop();
@@ -2832,7 +2840,7 @@ impl LoweringContext {
             // from the top-of-stack `rest`. Stack in: [..., rest], stack out:
             // [..., rest_minus_n].
             fn emit_drop_more_varint_bytes(ctx: &mut LoweringContext, n: i128) {
-                ctx.emit_op(StackOp::Push(PushValue::Int(n)));
+                ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(n))));
                 ctx.sm.push("");
                 ctx.emit_op(StackOp::Opcode("OP_SPLIT".into()));
                 ctx.sm.pop();
@@ -2849,7 +2857,7 @@ impl LoweringContext {
             self.emit_op(StackOp::Dup);
             let top0 = self.sm.peek_at_depth(0).to_string();
             self.sm.push(&top0);
-            self.emit_op(StackOp::Push(PushValue::Int(253)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(253))));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
             self.sm.pop(); self.sm.pop();
@@ -2866,7 +2874,7 @@ impl LoweringContext {
             self.emit_op(StackOp::Dup);
             let top1 = self.sm.peek_at_depth(0).to_string();
             self.sm.push(&top1);
-            self.emit_op(StackOp::Push(PushValue::Int(254)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(254))));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_NUMEQUAL".into()));
             self.sm.pop(); self.sm.pop();
@@ -2884,7 +2892,7 @@ impl LoweringContext {
             self.emit_op(StackOp::Dup);
             let top2 = self.sm.peek_at_depth(0).to_string();
             self.sm.push(&top2);
-            self.emit_op(StackOp::Push(PushValue::Int(255)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(255))));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_NUMEQUAL".into()));
             self.sm.pop(); self.sm.pop();
@@ -2951,7 +2959,7 @@ impl LoweringContext {
             for i in 0..num_props {
                 let sz = prop_sizes[i];
                 if i < num_props - 1 {
-                    self.emit_op(StackOp::Push(PushValue::Int(sz)));
+                    self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(sz))));
                     self.sm.push("");
                     self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                     self.sm.pop(); self.sm.pop();
@@ -3004,7 +3012,7 @@ impl LoweringContext {
                         self.sm.push(&prop_names[i]);
                         self.sm.push(""); // rest on top
                     } else {
-                        self.emit_op(StackOp::Push(PushValue::Int(prop_sizes[i])));
+                        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(prop_sizes[i]))));
                         self.sm.push("");
                         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
                         self.sm.pop(); self.sm.pop();
@@ -3068,7 +3076,7 @@ impl LoweringContext {
         match func_name {
             "extractVersion" => {
                 // <preimage> 4 OP_SPLIT OP_DROP OP_BIN2NUM
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -3080,7 +3088,7 @@ impl LoweringContext {
             }
             "extractHashPrevouts" => {
                 // <preimage> 4 OP_SPLIT OP_NIP 32 OP_SPLIT OP_DROP
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -3090,7 +3098,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(32)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(32))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (32)
@@ -3102,7 +3110,7 @@ impl LoweringContext {
             }
             "extractHashSequence" => {
                 // <preimage> 36 OP_SPLIT OP_NIP 32 OP_SPLIT OP_DROP
-                self.emit_op(StackOp::Push(PushValue::Int(36)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(36))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -3112,7 +3120,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(32)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(32))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (32)
@@ -3124,7 +3132,7 @@ impl LoweringContext {
             }
             "extractOutpoint" => {
                 // <preimage> 68 OP_SPLIT OP_NIP 36 OP_SPLIT OP_DROP
-                self.emit_op(StackOp::Push(PushValue::Int(68)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(68))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -3134,7 +3142,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(36)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(36))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (36)
@@ -3150,7 +3158,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -3173,7 +3181,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(8)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -3188,7 +3196,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (4)
@@ -3205,7 +3213,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(40)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(40))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -3220,7 +3228,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(32)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(32))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (32)
@@ -3236,7 +3244,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(52)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(52))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -3251,7 +3259,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(8)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (8)
@@ -3268,7 +3276,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(44)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(44))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -3283,7 +3291,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (4)
@@ -3297,7 +3305,7 @@ impl LoweringContext {
             "extractScriptCode" => {
                 // Variable-length field at offset 104. End-relative tail = 52 bytes.
                 // <preimage> 104 OP_SPLIT OP_NIP OP_SIZE 52 OP_SUB OP_SPLIT OP_DROP
-                self.emit_op(StackOp::Push(PushValue::Int(104)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(104))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -3309,7 +3317,7 @@ impl LoweringContext {
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(52)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(52))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -3326,7 +3334,7 @@ impl LoweringContext {
             "extractInputIndex" => {
                 // Input index = vout field of outpoint, at offset 100, 4 bytes.
                 // <preimage> 100 OP_SPLIT OP_NIP 4 OP_SPLIT OP_DROP OP_BIN2NUM
-                self.emit_op(StackOp::Push(PushValue::Int(100)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(100))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -3336,7 +3344,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (4)
@@ -3403,7 +3411,7 @@ impl LoweringContext {
         self.sm.push(&right_part);
 
         // Push 1 for the next split (extract 1 byte)
-        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
         self.sm.push("");
 
         // OP_SPLIT: split off first byte: stack = [..., firstByte, rest]
@@ -3444,7 +3452,7 @@ impl LoweringContext {
         self.sm.pop();
 
         // Push empty result (OP_0), swap so data is on top
-        self.emit_op(StackOp::Push(PushValue::Int(0)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
         self.emit_op(StackOp::Swap);
 
         // 520 iterations (max BSV element size)
@@ -3455,7 +3463,7 @@ impl LoweringContext {
             self.emit_op(StackOp::Nip);
             self.emit_op(StackOp::If {
                 then_ops: vec![
-                    StackOp::Push(PushValue::Int(1)),
+                    StackOp::Push(PushValue::Int(BigInt::from(1))),
                     StackOp::Opcode("OP_SPLIT".to_string()),
                     StackOp::Swap,
                     StackOp::Rot,
@@ -4044,7 +4052,12 @@ impl LoweringContext {
         let depth_arg = &args[3];
         let depth_value = self.const_values.get(depth_arg).cloned();
         let depth = match depth_value {
-            Some(ConstValue::Int(n)) => n as usize,
+            Some(ConstValue::Int(n)) => {
+                use num_traits::ToPrimitive;
+                n.to_usize().unwrap_or_else(|| panic!(
+                    "{}: depth (4th argument) must fit in usize, got {}", func_name, n
+                ))
+            }
             _ => panic!(
                 "{}: depth (4th argument) must be a compile-time constant integer literal. \
                  Got a runtime value for '{}'.",
@@ -4203,13 +4216,13 @@ impl LoweringContext {
 
         // Stack: base exp
         self.emit_op(StackOp::Swap);                                  // exp base
-        self.emit_op(StackOp::Push(PushValue::Int(1)));               // exp base 1(acc)
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));               // exp base 1(acc)
 
         for i in 0..32 {
             // Stack: exp base acc
-            self.emit_op(StackOp::Push(PushValue::Int(2)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(2))));
             self.emit_op(StackOp::Opcode("OP_PICK".to_string()));     // exp base acc exp
-            self.emit_op(StackOp::Push(PushValue::Int(i)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(i))));
             self.emit_op(StackOp::Opcode("OP_GREATERTHAN".to_string())); // exp base acc (exp > i)
             self.emit_op(StackOp::If {
                 then_ops: vec![
@@ -4281,7 +4294,7 @@ impl LoweringContext {
         self.sm.pop();
 
         self.emit_op(StackOp::Opcode("OP_MUL".to_string()));
-        self.emit_op(StackOp::Push(PushValue::Int(10000)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(10000))));
         self.emit_op(StackOp::Opcode("OP_DIV".to_string()));
 
         self.sm.push(binding_name);
@@ -4324,7 +4337,7 @@ impl LoweringContext {
             newton_ops.push(StackOp::Over);                               // n guess n guess
             newton_ops.push(StackOp::Opcode("OP_DIV".to_string()));      // n guess (n/guess)
             newton_ops.push(StackOp::Opcode("OP_ADD".to_string()));      // n (guess + n/guess)
-            newton_ops.push(StackOp::Push(PushValue::Int(2)));            // n (guess + n/guess) 2
+            newton_ops.push(StackOp::Push(PushValue::Int(BigInt::from(2))));            // n (guess + n/guess) 2
             newton_ops.push(StackOp::Opcode("OP_DIV".to_string()));      // n new_guess
         }
 
@@ -4457,7 +4470,7 @@ impl LoweringContext {
 
         // Stack: <n>
         // Push counter = 0
-        self.emit_op(StackOp::Push(PushValue::Int(0))); // n 0
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0)))); // n 0
 
         // 64 iterations (sufficient for Bitcoin Script bigint range)
         const LOG2_ITERATIONS: usize = 64;
@@ -4465,11 +4478,11 @@ impl LoweringContext {
             // Stack: input counter
             self.emit_op(StackOp::Swap);                                     // counter input
             self.emit_op(StackOp::Opcode("OP_DUP".to_string()));            // counter input input
-            self.emit_op(StackOp::Push(PushValue::Int(1)));                  // counter input input 1
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));                  // counter input input 1
             self.emit_op(StackOp::Opcode("OP_GREATERTHAN".to_string()));     // counter input (input>1)
             self.emit_op(StackOp::If {
                 then_ops: vec![
-                    StackOp::Push(PushValue::Int(2)),                        // counter input 2
+                    StackOp::Push(PushValue::Int(BigInt::from(2))),                        // counter input 2
                     StackOp::Opcode("OP_DIV".to_string()),                   // counter (input/2)
                     StackOp::Swap,                                           // (input/2) counter
                     StackOp::Opcode("OP_1ADD".to_string()),                  // (input/2) (counter+1)
@@ -5431,20 +5444,21 @@ mod tests {
 
     #[test]
     fn test_push_value_int_large_values() {
+        use num_traits::ToPrimitive;
         // Verify that PushValue::Int can hold values larger than i64::MAX
         let large_val: i128 = (i64::MAX as i128) + 1;
-        let push = PushValue::Int(large_val);
+        let push = PushValue::Int(BigInt::from(large_val));
         if let PushValue::Int(v) = push {
-            assert_eq!(v, large_val, "PushValue::Int should store values > i64::MAX without truncation");
+            assert_eq!(v.to_i128(), Some(large_val), "PushValue::Int should store values > i64::MAX without truncation");
         } else {
             panic!("expected PushValue::Int");
         }
 
         // Also test negative extreme
         let neg_val: i128 = (i64::MIN as i128) - 1;
-        let push_neg = PushValue::Int(neg_val);
+        let push_neg = PushValue::Int(BigInt::from(neg_val));
         if let PushValue::Int(v) = push_neg {
-            assert_eq!(v, neg_val, "PushValue::Int should store values < i64::MIN without truncation");
+            assert_eq!(v.to_i128(), Some(neg_val), "PushValue::Int should store values < i64::MIN without truncation");
         } else {
             panic!("expected PushValue::Int");
         }
@@ -5456,7 +5470,7 @@ mod tests {
         use crate::codegen::emit::encode_push_int;
 
         let large_val: i128 = 1i128 << 100;
-        let (hex, _asm) = encode_push_int(large_val);
+        let (hex, _asm) = encode_push_int(&BigInt::from(large_val));
         // Should produce a valid hex encoding, not panic or truncate
         assert!(!hex.is_empty(), "encoding of 2^100 should produce non-empty hex");
 

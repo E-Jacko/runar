@@ -16,6 +16,7 @@
 //! The caller must bring the 4 arguments to the top of the stack in
 //! argument order (msg sig padding pubKey, pubKey on top) before calling.
 
+use num_bigint::BigInt;
 use super::stack::{PushValue, StackOp};
 
 /// Exclusive upper bound on the Rabin `padding` parameter, enforced on-chain.
@@ -33,7 +34,7 @@ pub fn emit_verify_rabin_sig(emit: &mut dyn FnMut(StackOp)) {
     // BUG-010 padding range check: assert 0 <= padding < 65536.
     emit(StackOp::Opcode("OP_DUP".to_string()));
     emit(StackOp::Opcode("OP_0".to_string()));
-    emit(StackOp::Push(PushValue::Int(RABIN_PADDING_LIMIT)));
+    emit(StackOp::Push(PushValue::Int(BigInt::from(RABIN_PADDING_LIMIT))));
     emit(StackOp::Opcode("OP_WITHIN".to_string()));
     emit(StackOp::Opcode("OP_VERIFY".to_string()));
     emit(StackOp::Opcode("OP_ROT".to_string())); // msg pubKey padding sig
@@ -87,7 +88,7 @@ mod tests {
 
         match &ops[3] {
             StackOp::Push(PushValue::Int(v)) => {
-                assert_eq!(*v, RABIN_PADDING_LIMIT, "padding-limit push");
+                assert_eq!(v, &BigInt::from(RABIN_PADDING_LIMIT), "padding-limit push");
             }
             other => panic!("op 3: expected Push(Int(65536)), got {other:?}"),
         }

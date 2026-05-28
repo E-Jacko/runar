@@ -27,6 +27,8 @@
 //! - snake_case identifiers -> camelCase in AST
 //! - Move builtins mapped: `check_sig` -> `checkSig`, `hash160` -> `hash160`, etc.
 
+use num_bigint::BigInt;
+use num_traits::{Num, ToPrimitive};
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -169,7 +171,7 @@ enum Token {
 
     // Identifiers and literals
     Ident(String),
-    NumberLit(i128),
+    NumberLit(BigInt),
     StringLit(String),
 
     // Operators
@@ -410,7 +412,8 @@ fn tokenize(source: &str) -> Vec<Token> {
                 .iter()
                 .filter(|c| **c != '_' && **c != 'n')
                 .collect();
-            let val = num_str.parse::<i128>().unwrap_or(0);
+            let val = <BigInt as Num>::from_str_radix(&num_str, 10)
+                .unwrap_or_else(|_| BigInt::from(0));
             tokens.push(Token::NumberLit(val));
             continue;
         }
@@ -837,7 +840,7 @@ impl<'a> MoveParser<'a> {
                 let element = self.parse_type();
                 self.expect(&Token::Comma);
                 let length = match self.advance() {
-                    Token::NumberLit(n) => n as usize,
+                    Token::NumberLit(n) => n.to_usize().unwrap_or(0),
                     _ => {
                         self.errors
                             .push(Diagnostic::error("FixedArray requires numeric length", None));
@@ -1286,12 +1289,12 @@ impl<'a> MoveParser<'a> {
                 name: "_w".to_string(),
                 var_type: None,
                 mutable: true,
-                init: Expression::BigIntLiteral { value: 0 },
+                init: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             }),
             condition,
             update: Box::new(Statement::ExpressionStatement {
-                expression: Expression::BigIntLiteral { value: 0 },
+                expression: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             }),
             body,
@@ -1738,7 +1741,7 @@ impl<'a> MoveParser<'a> {
             other => {
                 self.errors
                     .push(Diagnostic::error(format!("Unexpected token in expression: {:?}", other), None));
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             }
         }
     }

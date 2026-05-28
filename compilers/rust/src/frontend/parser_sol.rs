@@ -29,6 +29,8 @@
 //! - `!=` -> StrictNe (!==)
 //! - Types before names (Solidity convention)
 
+use num_bigint::{BigInt, Sign};
+use num_traits::{Num, ToPrimitive};
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -83,7 +85,7 @@ enum Token {
 
     // Identifiers and literals
     Ident(String),
-    NumberLit(i128),
+    NumberLit(BigInt),
     HexLit(String),
     StringLit(String),
 
@@ -325,7 +327,8 @@ fn tokenize(source: &str) -> Vec<Token> {
             }
             let num_str: String = chars[start..i].iter().collect();
             let num_str = num_str.trim_end_matches('n');
-            let val = num_str.parse::<i128>().unwrap_or(0);
+            let val = <BigInt as Num>::from_str_radix(num_str, 10)
+                .unwrap_or_else(|_| BigInt::from(0));
             tokens.push(Token::NumberLit(val));
             continue;
         }
@@ -590,7 +593,7 @@ impl<'a> SolParser<'a> {
                 let element = self.parse_type();
                 self.expect(&Token::Comma);
                 let length = match self.advance() {
-                    Token::NumberLit(n) => n as usize,
+                    Token::NumberLit(n) => n.to_usize().unwrap_or(0),
                     _ => {
                         self.errors
                             .push(Diagnostic::error("FixedArray requires numeric length", None));
@@ -632,7 +635,7 @@ impl<'a> SolParser<'a> {
         while *self.peek() == Token::LBracket {
             self.advance(); // [
             let length = match self.advance() {
-                Token::NumberLit(n) if n >= 0 => n as usize,
+                Token::NumberLit(n) if n.sign() != Sign::Minus => n.to_usize().unwrap_or(0),
                 other => {
                     self.errors.push(Diagnostic::error(
                         &format!("FixedArray length must be a non-negative integer literal, got {:?}", other),
@@ -995,7 +998,7 @@ impl<'a> SolParser<'a> {
             self.parse_expression()
         } else {
             // Type name; — declaration without initializer, default to 0
-            Expression::BigIntLiteral { value: 0 }
+            Expression::BigIntLiteral { value: BigInt::from(0) }
         };
 
         self.expect(&Token::Semicolon);
@@ -1076,7 +1079,7 @@ impl<'a> SolParser<'a> {
                 name: "_i".to_string(),
                 var_type: None,
                 mutable: true,
-                init: Expression::BigIntLiteral { value: 0 },
+                init: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             }
         };
@@ -1590,7 +1593,7 @@ impl<'a> SolParser<'a> {
             other => {
                 self.errors
                     .push(Diagnostic::error(format!("Unexpected token in expression: {:?}", other), None));
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             }
         }
     }

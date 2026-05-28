@@ -23,6 +23,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
+
 use super::ast::*;
 use super::side_effect_summary::{
     compute_side_effect_summary, ContinuationShape, SideEffectSummary,
@@ -83,13 +86,27 @@ fn lower_properties(contract: &ContractNode) -> Vec<ANFProperty> {
 /// Convert an i128 to a serde_json::Value. Values within i64 range use
 /// Number; larger values fall back to a JSON number via string parsing so
 /// precision is preserved in the IR.
-fn i128_to_json(v: i128) -> serde_json::Value {
-    if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
-        serde_json::Value::Number(serde_json::Number::from(v as i64))
+
+/// Serialise a `num_bigint::BigInt` to a `serde_json::Value` for IR-JSON.
+///
+/// Values within `i64` range serialise as JSON numbers. Larger values
+/// serialise as a JS-style decimal `BigInt` literal — the decimal digits
+/// followed by a literal `n` suffix, quoted as a JSON string. The `n`
+/// suffix is the cross-tier discriminator that distinguishes a decimal
+/// `BigInt` from a hex-encoded `ByteString` literal (both are JSON
+/// strings made of ASCII digits in the all-decimal case, e.g. `"3030"`
+/// is both a valid decimal and a valid hex bytestring).
+///
+/// Mirrors:
+///   - Go: `compilers/go/frontend/anf_lower.go::makeLoadConstInt`
+///   - Python: `compilers/python/runar_compiler/frontend/anf_lower.py::_make_load_const_int`
+///   - TS: `conformance/runner/runner.ts` BigInt canonicalisation
+fn bigint_to_json(v: &num_bigint::BigInt) -> serde_json::Value {
+    use num_traits::ToPrimitive;
+    if let Some(i) = v.to_i64() {
+        serde_json::Value::Number(serde_json::Number::from(i))
     } else {
-        // serde_json can parse arbitrarily large integer strings into Number
-        let s = v.to_string();
-        serde_json::from_str(&s).unwrap_or_else(|_| serde_json::Value::Number(serde_json::Number::from(0)))
+        serde_json::Value::String(format!("{}n", v))
     }
 }
 
@@ -113,7 +130,7 @@ fn flatten_add_output_args(args: &[Expression]) -> Vec<Expression> {
 
 fn extract_literal_value(expr: &Expression) -> Option<serde_json::Value> {
     match expr {
-        Expression::BigIntLiteral { value } => Some(i128_to_json(*value)),
+        Expression::BigIntLiteral { value } => Some(bigint_to_json(value)),
         Expression::BoolLiteral { value } => Some(serde_json::Value::Bool(*value)),
         Expression::ByteStringLiteral { value } => {
             Some(serde_json::Value::String(value.clone()))
@@ -123,7 +140,7 @@ fn extract_literal_value(expr: &Expression) -> Option<serde_json::Value> {
             operand,
         } => {
             if let Expression::BigIntLiteral { value } = operand.as_ref() {
-                Some(i128_to_json(-*value))
+                Some(bigint_to_json(&(-value)))
             } else {
                 None
             }
@@ -1029,7 +1046,7 @@ fn extract_loop_count(init: &Statement, condition: &Expression) -> usize {
 
 fn extract_bigint_value(expr: &Expression) -> Option<i128> {
     match expr {
-        Expression::BigIntLiteral { value } => Some(*value),
+        Expression::BigIntLiteral { value } => value.to_i128(),
         Expression::UnaryExpr { op, operand } if *op == UnaryOp::Neg => {
             extract_bigint_value(operand).map(|v| -v)
         }
@@ -1048,7 +1065,7 @@ fn extract_bigint_value(expr: &Expression) -> Option<i128> {
 fn lower_expr_to_ref(expr: &Expression, ctx: &mut LoweringContext) -> String {
     match expr {
         Expression::BigIntLiteral { value } => ctx.emit(ANFValue::LoadConst {
-            value: i128_to_json(*value),
+            value: bigint_to_json(value),
         }),
 
         Expression::BoolLiteral { value } => ctx.emit(ANFValue::LoadConst {
@@ -1327,7 +1344,14 @@ fn lower_call_expr(
                 });
             }
             let idx = match &args[0] {
-                Expression::BigIntLiteral { value } => *value,
+                Expression::BigIntLiteral { value } => match value.to_i128() {
+                    Some(v) => v,
+                    None => {
+                        return ctx.emit(ANFValue::LoadConst {
+                            value: serde_json::Value::String(String::new()),
+                        });
+                    }
+                },
                 _ => {
                     return ctx.emit(ANFValue::LoadConst {
                         value: serde_json::Value::String(String::new()),
@@ -1349,7 +1373,14 @@ fn lower_call_expr(
             // literal prefixLen is baked into the emitted Stack-IR.
             let bytes_to_hash_ref = if args.len() == 3 {
                 let prefix_len = match &args[2] {
-                    Expression::BigIntLiteral { value } => *value,
+                    Expression::BigIntLiteral { value } => match value.to_i128() {
+                        Some(v) => v,
+                        None => {
+                            return ctx.emit(ANFValue::LoadConst {
+                                value: serde_json::Value::String(String::new()),
+                            });
+                        }
+                    },
                     _ => {
                         return ctx.emit(ANFValue::LoadConst {
                             value: serde_json::Value::String(String::new()),
@@ -1407,7 +1438,14 @@ fn lower_call_expr(
                 });
             }
             let idx = match &args[0] {
-                Expression::BigIntLiteral { value } => *value,
+                Expression::BigIntLiteral { value } => match value.to_i128() {
+                    Some(v) => v,
+                    None => {
+                        return ctx.emit(ANFValue::LoadConst {
+                            value: serde_json::Value::String(String::new()),
+                        });
+                    }
+                },
                 _ => {
                     return ctx.emit(ANFValue::LoadConst {
                         value: serde_json::Value::String(String::new()),
@@ -1680,10 +1718,10 @@ fn lower_call_expr(
                 bytes = value.clone();
             }
             if let Some(Expression::BigIntLiteral { value }) = args.get(1) {
-                in_arity = (*value).max(0) as usize;
+                in_arity = value.to_usize().unwrap_or(0);
             }
             if let Some(Expression::BigIntLiteral { value }) = args.get(2) {
-                out_arity = (*value).max(0) as usize;
+                out_arity = value.to_usize().unwrap_or(1);
             }
             return ctx.emit(ANFValue::RawScript {
                 bytes,
