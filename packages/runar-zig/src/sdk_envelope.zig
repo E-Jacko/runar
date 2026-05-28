@@ -609,6 +609,79 @@ test "canonicalJson order independent" {
     try testing.expectEqualStrings("{\"a\":1,\"b\":2}", out_a);
 }
 
+test "canonicalJson rejects duplicate object keys (audit D3)" {
+    // Value.Object is a slice of KeyValue, so duplicates are structurally
+    // expressible. RFC 8785 §3.2.3 disallows them; we reject with
+    // error.DuplicateObjectKey rather than silently emitting both.
+    const dup = [_]Value.KeyValue{
+        .{ .key = "x", .value = .{ .Int = 1 } },
+        .{ .key = "x", .value = .{ .Int = 2 } },
+    };
+    const result = canonicalJson(testing.allocator, .{ .Object = &dup });
+    try testing.expectError(error.DuplicateObjectKey, result);
+}
+
+test "canonicalJson rejects lone surrogate in string (audit D6)" {
+    // 0xED 0xA0 0x80 is the UTF-8 encoding of U+D800 (high surrogate). RFC
+    // 8785 §3.2.2.2 says input MUST be well-formed Unicode; the canonical
+    // serializer must refuse such sequences.
+    const lone_surrogate = "\xED\xA0\x80";
+    const out = canonicalJson(testing.allocator, .{ .String = lone_surrogate });
+    try testing.expectError(error.LoneSurrogate, out);
+}
+
+test "canonicalJson rejects invalid UTF-8 in string (audit D6)" {
+    // 0xC0 is not a legal UTF-8 lead byte. The codepoint-aware escape loop
+    // (audit D2) flags it.
+    const bad = "\xC0\x80";
+    const out = canonicalJson(testing.allocator, .{ .String = bad });
+    try testing.expectError(error.InvalidUtf8, out);
+}
+
+test "canonicalJson preserves valid astral codepoint (😀, U+1F600)" {
+    // The codepoint-aware escape loop must emit the full 4-byte UTF-8
+    // sequence verbatim (audit D2). A bytewise loop with a 0x80-range
+    // escape entry would corrupt it.
+    const smiley = "\xF0\x9F\x98\x80";
+    const out = try canonicalJson(testing.allocator, .{ .String = smiley });
+    defer testing.allocator.free(out);
+    // Output is a JSON string literal: opening quote + 4 UTF-8 bytes +
+    // closing quote.
+    try testing.expectEqualStrings("\"\xF0\x9F\x98\x80\"", out);
+}
+
+test "canonicalJson sorts astral key before BMP key (UTF-16 order, audit D1)" {
+    // U+1F600 ("😀") UTF-16 = 0xD83D 0xDE00. U+E000 () UTF-16 = 0xE000.
+    // In UTF-16 code-unit order, 0xD83D < 0xE000, so "😀" sorts first.
+    // A naive byte-compare would put "" first (0xEE < 0xF0). This vector
+    // would have silently broken cross-tier sigs once a non-ASCII key
+    // landed in any envelope.
+    const obj = [_]Value.KeyValue{
+        .{ .key = "\xEE\x80\x80", .value = .{ .Int = 1 } }, // U+E000
+        .{ .key = "\xF0\x9F\x98\x80", .value = .{ .Int = 2 } }, // U+1F600
+    };
+    const out = try canonicalJson(testing.allocator, .{ .Object = &obj });
+    defer testing.allocator.free(out);
+    // Astral key sorts first, then BMP private-use key.
+    try testing.expectEqualStrings("{\"\xF0\x9F\x98\x80\":2,\"\xEE\x80\x80\":1}", out);
+}
+
+test "canonicalJson formats floats per ECMA-262 (audit D5)" {
+    // Re-derived (digits, k) re-emission. These match the TS reference
+    // String(x) / JSON.stringify(x).
+    const cases = [_]struct { in: f64, want: []const u8 }{
+        .{ .in = 0.1, .want = "0.1" },
+        .{ .in = 1e21, .want = "1e+21" },
+        .{ .in = 1e-7, .want = "1e-7" },
+        .{ .in = 1e-300, .want = "1e-300" },
+    };
+    for (cases) |c| {
+        const out = try canonicalJson(testing.allocator, .{ .Float = c.in });
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
 test "round trip" {
     var signer = signerForFn(alicePriv());
     const data = [_]Value.KeyValue{

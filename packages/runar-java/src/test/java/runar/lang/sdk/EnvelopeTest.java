@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EnvelopeTest {
@@ -86,6 +87,33 @@ class EnvelopeTest {
         assertEquals(
             "{\"b\":true,\"list\":[{\"x\":2,\"y\":1}],\"n\":null,\"outer\":{\"a\":[3,2,1],\"z\":1},\"s\":\"hi\"}",
             got);
+    }
+
+    @Test
+    void canonicalJsonRejectsLoneSurrogate() {
+        // Audit D6. Java strings are UTF-16; a high surrogate without a low
+        // partner must be rejected, not emitted as a bare 0xD800..0xDBFF code
+        // unit. Same for an unpaired low surrogate.
+        IllegalArgumentException hi = assertThrows(IllegalArgumentException.class,
+            () -> Envelope.canonicalJson("\uD800"));
+        assertTrue(hi.getMessage().toLowerCase().contains("surrogate"),
+            "expected surrogate error, got: " + hi.getMessage());
+        IllegalArgumentException lo = assertThrows(IllegalArgumentException.class,
+            () -> Envelope.canonicalJson("\uDC00"));
+        assertTrue(lo.getMessage().toLowerCase().contains("surrogate"),
+            "expected surrogate error, got: " + lo.getMessage());
+        // Valid surrogate pair must round-trip.
+        assertEquals("\"😀\"", Envelope.canonicalJson("😀"));
+    }
+
+    @Test
+    void canonicalJsonFormatsFloatsPerEcma262() {
+        // Audit D5. Double.toString emits "1.0E21" / "1.0E-300"; ES emits
+        // "1e+21" / "1e-300". formatEcma262Double bridges the gap.
+        assertEquals("{\"v\":0.1}", Envelope.canonicalJson(Map.of("v", 0.1)));
+        assertEquals("{\"v\":1e+21}", Envelope.canonicalJson(Map.of("v", 1e21)));
+        assertEquals("{\"v\":1e-7}", Envelope.canonicalJson(Map.of("v", 1e-7)));
+        assertEquals("{\"v\":1e-300}", Envelope.canonicalJson(Map.of("v", 1e-300)));
     }
 
     // -------------------------------------------------------------------

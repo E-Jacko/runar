@@ -52,6 +52,32 @@ RSpec.describe Runar::SDK::Envelope do
       expect(described_class.canonical_json(42)).to eq('42')
       expect(described_class.canonical_json('hi')).to eq('"hi"')
     end
+
+    # Audit D4 — symbol/string key coexistence must not silently rewrite
+    # falsy values via `||`.
+    it 'preserves falsy string-keyed values even when a symbol shadow exists' do
+      got = described_class.canonical_json({ 'active' => false, 'count' => 0 })
+      expect(got).to eq('{"active":false,"count":0}')
+    end
+
+    # Audit D5 — Float formatting must follow ECMA-262 Number::toString.
+    it 'formats finite floats per ECMA-262 Number::toString' do
+      expect(described_class.canonical_json({ 'v' => 0.1 })).to eq('{"v":0.1}')
+      expect(described_class.canonical_json({ 'v' => 1e21 })).to eq('{"v":1e+21}')
+      expect(described_class.canonical_json({ 'v' => 1e-7 })).to eq('{"v":1e-7}')
+      expect(described_class.canonical_json({ 'v' => 1e-300 })).to eq('{"v":1e-300}')
+    end
+
+    # Audit D6 — lone surrogates are not valid Unicode scalar values. Ruby
+    # rejects `"\u{D800}"` at parse time, so construct the WTF-8 sequence
+    # by hand (0xED 0xA0 0x80 = U+D800) and force UTF-8 encoding to mirror
+    # what a malicious or buggy caller could pass.
+    it 'rejects a string containing a lone surrogate' do
+      wtf8 = [0xED, 0xA0, 0x80].pack('C*').force_encoding(Encoding::UTF_8)
+      expect {
+        described_class.canonical_json(wtf8)
+      }.to raise_error(ArgumentError, /lone surrogate|malformed Unicode/i)
+    end
   end
 
   describe 'sign + verify' do
