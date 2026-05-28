@@ -114,9 +114,9 @@ def test_inconsistent_branch_depth_no_else():
     )
 
 
-def test_paths_truncated_jss_shift_quirk():
-    # 9 OP_IFs without bodies — 2^9 = 512 > 256, so PATHS_TRUNCATED fires.
-    # Each IF needs an ENDIF too — pair them as 63...63 ... 68...68 nested.
+def test_paths_truncated_exact_count():
+    # 9 OP_IFs without bodies — 2^9 = 512 > 256, so PATHS_TRUNCATED fires
+    # with the exact-decimal message form (numBranches < 53).
     hex_str = ("63" * 9) + ("68" * 9)
     report = analyze_script(hex_str)
     pt = [f for f in report.findings if f.code == "PATHS_TRUNCATED"]
@@ -124,13 +124,15 @@ def test_paths_truncated_jss_shift_quirk():
     assert "2^9 = 512 paths" in pt[0].message
 
 
-def test_paths_truncated_uses_js_shift_at_785():
-    # 785 OP_IF/OP_ENDIF pairs — JS shift quirk: 1 << (785 & 31) = 1 << 17 = 131072.
+def test_paths_truncated_symbolic_for_large_branches():
+    # Spec v1.2: numBranches >= 53 renders "more than 2^53 paths"
+    # symbolically (the count overflows the canonical TS reference's
+    # safe-integer range).
     hex_str = ("63" * 785) + ("68" * 785)
     report = analyze_script(hex_str)
     pt = [f for f in report.findings if f.code == "PATHS_TRUNCATED"]
     assert len(pt) == 1
-    assert "2^785 = 131072 paths" in pt[0].message
+    assert "Script has 785 branch points (more than 2^53 paths)" in pt[0].message
 
 
 def test_large_script_threshold_kb_formatting():

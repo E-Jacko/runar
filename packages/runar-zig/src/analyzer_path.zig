@@ -147,16 +147,40 @@ pub fn analyzePaths(allocator: std.mem.Allocator, ops: []const Opcode) !PathAnal
             .stack_depth_at_end = linres.depth,
         });
     } else {
-        // 1 << (num_branches & 31), JS-shift semantics.
-        const shift_amount: u5 = @intCast(num_branches & 31);
-        const requested_combinations: u32 = @as(u32, 1) << shift_amount;
-        const num_paths: usize = @min(@as(usize, requested_combinations), MAX_PATHS);
+        // Spec v1.2 §5.1: render symbolically when 2^num_branches
+        // overflows the canonical TS reference's safe-integer range.
+        const LARGE_BRANCH_THRESHOLD: u32 = 53;
+        const use_exact_count: bool = num_branches < LARGE_BRANCH_THRESHOLD;
+        const num_paths: usize = blk: {
+            if (use_exact_count) {
+                const exact: u64 = @as(u64, 1) << @as(u6, @intCast(num_branches));
+                break :blk @min(@as(usize, @intCast(exact)), MAX_PATHS);
+            } else {
+                break :blk MAX_PATHS;
+            }
+        };
 
-        if (requested_combinations > MAX_PATHS) {
-            const msg = try std.fmt.allocPrint(
+        const truncated: bool = blk: {
+            if (use_exact_count) {
+                const exact: u64 = @as(u64, 1) << @as(u6, @intCast(num_branches));
+                break :blk exact > MAX_PATHS;
+            } else {
+                break :blk true;
+            }
+        };
+
+        if (truncated) {
+            const msg = if (use_exact_count) blk: {
+                const exact: u64 = @as(u64, 1) << @as(u6, @intCast(num_branches));
+                break :blk try std.fmt.allocPrint(
+                    allocator,
+                    "Script has {d} branch points (2^{d} = {d} paths); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths.",
+                    .{ num_branches, num_branches, exact },
+                );
+            } else try std.fmt.allocPrint(
                 allocator,
-                "Script has {d} branch points (2^{d} = {d} paths); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths.",
-                .{ num_branches, num_branches, requested_combinations },
+                "Script has {d} branch points (more than 2^{d} paths); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths.",
+                .{ num_branches, LARGE_BRANCH_THRESHOLD },
             );
             try findings.append(allocator, Finding{
                 .severity = Code.PATHS_TRUNCATED.severity(),
@@ -171,12 +195,17 @@ pub fn analyzePaths(allocator: std.mem.Allocator, ops: []const Opcode) !PathAnal
             errdefer allocator.free(choices);
             var b: u32 = 0;
             while (b < num_branches) : (b += 1) {
-                // Spec §7.2: choices[b] = ((combo >> b) & 1) == 1, using JS
-                // 32-bit signed-shift semantics — shift count is masked
-                // mod 32. For b ≥ 32 this aliases back to bit (b & 31).
-                // Goldens depend on this quirk (see spec §5.1 PATHS_TRUNCATED).
-                const shift: u5 = @intCast(b & 31);
-                choices[b] = ((combo >> shift) & 1) == 1;
+                // `combo` is bounded by MAX_PATHS = 256, so bits at
+                // positions >= 8 are mathematically always 0. Clamp to
+                // b < 31 to match the canonical TS reference, where JS
+                // `>>` would otherwise mask the shift count to 5 bits
+                // and wrap.
+                if (b < 31) {
+                    const shift: u5 = @intCast(b);
+                    choices[b] = ((combo >> shift) & 1) == 1;
+                } else {
+                    choices[b] = false;
+                }
             }
             const desc = try formatPathDescription(allocator, ops, if_indices.items, choices);
             errdefer allocator.free(desc);

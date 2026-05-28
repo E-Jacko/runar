@@ -5,30 +5,31 @@ tiers. They do NOT block the GAP-008 work (the spec faithfully reproduces TS
 reference behavior, including quirks, so the cross-tier goldens stay
 byte-identical), but they SHOULD be addressed in dedicated follow-up issues.
 
-## 1. `PATHS_TRUNCATED` message arithmetic — 32-bit shift overflow
+## 1. `PATHS_TRUNCATED` message arithmetic — 32-bit shift overflow — RESOLVED (spec v1.2)
 
-**Location:** `packages/runar-testing/src/analyzer/path-analyzer.ts` line ~283:
+**Status:** Fixed in spec v1.2 (2026-05-28). All 7 tiers updated;
+goldens regenerated; conformance 56/56.
 
-```ts
-const requestedCombinations = 1 << numBranches;
-```
+The PATHS_TRUNCATED message now renders the count as
+`Script has <N> branch points (2^<N> = <X> paths)` for `numBranches < 53`
+(exact decimal) and `Script has <N> branch points (more than 2^53 paths)`
+for `numBranches >= 53`. The path-enumeration loop bound is
+`min(2^numBranches, MAX_PATHS)` computed in 64-bit arithmetic, so the
+truncation finding now fires whenever there are truly more than 256
+paths (previously skipped for `numBranches & 31 < 9 && numBranches >= 32`
+due to JS 5-bit shift mask). The per-path `choices[b]` extraction now
+clamps `b < 31` to avoid JS / Java shift-mask aliasing.
 
-For `numBranches >= 32`, this produces nonsense values because JS bitwise
-left-shift masks the shift count to 5 bits (`numBranches & 31`). The
-PATHS_TRUNCATED message then claims e.g. `2^785 = 131072 paths`, which is
-visibly wrong to any reader.
+Spec sections updated: §5.1, §7.2, §15. Goldens for `ec-demo` and
+`schnorr-zkp` changed (the latter went from 4 paths to 256 paths +
+PATHS_TRUNCATED added).
 
-**Observed in:** `ec-demo` golden (`numBranches = 785`, "requested" = 131072).
+## 2. `MAX_PATHS = 256` may be too small — DEFERRED
 
-**Suggested fix:** use a saturating computation:
-```ts
-const requestedCombinations = numBranches >= 53
-  ? Number.MAX_SAFE_INTEGER
-  : 2 ** numBranches;
-```
-and reword the message to e.g. `Script has 785 branch points (more than 2^53 paths); ...`. **Cross-tier:** if this fix lands, ALL 7 analyzer tiers must apply the same fix and the goldens must be regenerated in a single commit.
-
-## 2. `MAX_PATHS = 256` may be too small
+**Status:** Deferred. Aesthetic tuning (not a correctness bug). Bumping
+the cap to 4096/8192 would inflate goldens roughly linearly with
+`numBranches`; cross-tier coordination cost is real but not urgent.
+Revisit in a dedicated spec bump.
 
 In the TS reference, the cap is 256. `ec-demo` enumerates exactly 256 of
 its >> 2^53 spending paths — almost certainly hiding analysis-relevant
@@ -39,7 +40,13 @@ description string grows with `numBranches`, so for `numBranches >= 32`
 the per-path description is ~30 KB — bumping `MAX_PATHS` to 4096 would
 inflate goldens roughly linearly.
 
-## 3. `LARGE_SCRIPT` threshold (500_000 bytes)
+## 3. `LARGE_SCRIPT` threshold (500_000 bytes) — DEFERRED
+
+**Status:** Deferred. None of the 8 canonical fixtures triggers this
+finding, so the threshold has no observable effect on the goldens.
+Aesthetic only. Raising to ~5 MB for BSV reality is reasonable, but
+requires cross-tier coordination and an updated unit test for each tier
+(currently every tier hardcodes `500_001` bytes as a unit-test trigger).
 
 The threshold is hardcoded and chosen for traditional Bitcoin. For BSV
 (which Rúnar targets) scripts up to several MB are routinely deployed;

@@ -42,12 +42,9 @@ class PathAnalysisResult:
     findings: List[Finding]
 
 
-def _js_shift_left_1(num_branches: int) -> int:
-    """Replicate JS `1 << numBranches` with 32-bit signed semantics.
-
-    Spec §5.1: shift count masked to 5 bits before shifting.
-    """
-    return 1 << (num_branches & 31)
+# Spec v1.2 §5.1: render symbolically when 2^num_branches overflows the
+# canonical TS reference's safe-integer range.
+_LARGE_BRANCH_THRESHOLD = 53
 
 
 def _match_branches(
@@ -369,16 +366,25 @@ def analyze_paths(opcodes: List[ParsedOpcode]) -> PathAnalysisResult:
                 )
             )
     else:
-        requested = _js_shift_left_1(num_branches)
-        # PATHS_TRUNCATED finding when too many paths.
-        if requested > MAX_PATHS:
+        use_exact_count = num_branches < _LARGE_BRANCH_THRESHOLD
+        if use_exact_count:
+            exact = 1 << num_branches
+            truncated = exact > MAX_PATHS
+            n_paths = min(exact, MAX_PATHS)
+            paths_clause = f"2^{num_branches} = {exact} paths"
+        else:
+            truncated = True
+            n_paths = MAX_PATHS
+            paths_clause = f"more than 2^{_LARGE_BRANCH_THRESHOLD} paths"
+
+        if truncated:
             structural_findings_extra.append(
                 Finding(
                     severity="warning",
                     code="PATHS_TRUNCATED",
                     message=(
                         f"Script has {num_branches} branch points "
-                        f"(2^{num_branches} = {requested} paths); "
+                        f"({paths_clause}); "
                         f"analysis truncated to the first {MAX_PATHS}. "
                         "Consider reducing branching or splitting the "
                         "contract into smaller spending paths."
@@ -386,14 +392,14 @@ def analyze_paths(opcodes: List[ParsedOpcode]) -> PathAnalysisResult:
                 )
             )
 
-        n_paths = min(requested, MAX_PATHS)
         for combo in range(n_paths):
-            # JS shift semantics: `combo >> b` masks shift count to 5 bits.
-            # For b >= 32, this means `combo >> (b & 31)` — so bit b
-            # equals bit (b & 31) of combo. Replicate this since the
-            # goldens depend on it (ec-demo has 785 IF/NOTIFs).
+            # `combo` is bounded by MAX_PATHS = 256, so bits at positions
+            # >= 8 are mathematically always 0. We explicitly clamp to
+            # b < 31 to match the canonical TS reference, where JS `>>`
+            # would otherwise mask the shift count to 5 bits and wrap.
             choices = [
-                ((combo >> (b & 31)) & 1) == 1 for b in range(num_branches)
+                (((combo >> b) & 1) == 1) if b < 31 else False
+                for b in range(num_branches)
             ]
             desc = _path_description(choices, if_opcodes)
             collected = _collect_path_opcodes(opcodes, choices)

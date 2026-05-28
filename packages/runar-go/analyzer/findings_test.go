@@ -15,6 +15,17 @@ func containsCode(r AnalyzerReport, code string) bool {
 	return false
 }
 
+// hasFindingMessage reports whether the report has at least one finding with the
+// given code whose Message contains substr.
+func hasFindingMessage(r AnalyzerReport, code, substr string) bool {
+	for _, f := range r.Findings {
+		if f.Code == code && strings.Contains(f.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestInvalidTerminalStack_EmptyScript(t *testing.T) {
 	r, err := AnalyzeScript("")
 	if err != nil {
@@ -288,10 +299,10 @@ func TestNormalizeHex(t *testing.T) {
 	}
 }
 
-func TestJSShiftQuirk_PathsTruncated_LargeBranches(t *testing.T) {
-	// numBranches = 33, so requested = 1 << (33 & 31) = 1 << 1 = 2.
-	// 2 < 256, so PATHS_TRUNCATED should NOT be emitted even though
-	// the true path count is astronomical. (Spec §7.2 quirk.)
+func TestPathsTruncated_LargeBranches(t *testing.T) {
+	// Spec v1.2: numBranches=33 has 2^33 true paths, so PATHS_TRUNCATED
+	// MUST be emitted (the prior 1.1 JS-shift quirk silently skipped it).
+	// numBranches < 53 → exact-count message form.
 	var sb strings.Builder
 	for i := 0; i < 33; i++ {
 		sb.WriteString("63") // OP_IF
@@ -300,10 +311,34 @@ func TestJSShiftQuirk_PathsTruncated_LargeBranches(t *testing.T) {
 		sb.WriteString("68") // OP_ENDIF
 	}
 	r, _ := AnalyzeScript(sb.String())
-	if containsCode(r, "PATHS_TRUNCATED") {
-		t.Errorf("with numBranches=33, JS-shift quirk means requested<256, no truncation")
+	if !containsCode(r, "PATHS_TRUNCATED") {
+		t.Errorf("with numBranches=33, expected PATHS_TRUNCATED finding")
 	}
-	if r.Summary.TotalPaths != 2 {
-		t.Errorf("expected totalPaths=2 (1<<1), got %d", r.Summary.TotalPaths)
+	if r.Summary.TotalPaths != 256 {
+		t.Errorf("expected totalPaths=256 (capped at MAX_PATHS), got %d", r.Summary.TotalPaths)
+	}
+	wantSubstr := "Script has 33 branch points (2^33 = 8589934592 paths)"
+	if !hasFindingMessage(r, "PATHS_TRUNCATED", wantSubstr) {
+		t.Errorf("PATHS_TRUNCATED message missing substring %q", wantSubstr)
+	}
+}
+
+func TestPathsTruncated_VeryLargeBranches_Symbolic(t *testing.T) {
+	// Spec v1.2: numBranches >= 53 renders the count symbolically as
+	// "more than 2^53 paths" to avoid overflowing JS safe integers.
+	var sb strings.Builder
+	for i := 0; i < 53; i++ {
+		sb.WriteString("63")
+	}
+	for i := 0; i < 53; i++ {
+		sb.WriteString("68")
+	}
+	r, _ := AnalyzeScript(sb.String())
+	if !containsCode(r, "PATHS_TRUNCATED") {
+		t.Errorf("with numBranches=53, expected PATHS_TRUNCATED finding")
+	}
+	wantSubstr := "Script has 53 branch points (more than 2^53 paths)"
+	if !hasFindingMessage(r, "PATHS_TRUNCATED", wantSubstr) {
+		t.Errorf("PATHS_TRUNCATED message missing substring %q", wantSubstr)
 	}
 }

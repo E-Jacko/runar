@@ -127,18 +127,37 @@ pub fn analyze_paths(opcodes: &[ParsedOp]) -> PathAnalysis {
         emit_path_findings(&path, &collected, &mut per_path_findings);
         paths.push(path);
     } else {
-        // JS 32-bit signed left-shift: shift count masked to 5 bits.
-        let shift = (num_branches & 31) as u32;
-        let requested: u64 = 1u64 << shift;
-        let limit = requested.min(256);
+        // For num_branches >= 53, 2^num_branches overflows the JS
+        // safe-integer range used by the canonical TS reference, so we
+        // render the count symbolically as "more than 2^53 paths" instead
+        // of an exact decimal. (Spec v1.2.)
+        const LARGE_BRANCH_THRESHOLD: usize = 53;
+        let use_exact_count = num_branches < LARGE_BRANCH_THRESHOLD;
+        let limit: u64 = if use_exact_count {
+            let exact: u64 = 1u64 << num_branches;
+            exact.min(256)
+        } else {
+            256
+        };
 
-        if requested > 256 {
+        let truncated = if use_exact_count {
+            (1u64 << num_branches) > 256
+        } else {
+            true
+        };
+        if truncated {
+            let paths_clause = if use_exact_count {
+                let exact: u64 = 1u64 << num_branches;
+                format!("2^{} = {} paths", num_branches, exact)
+            } else {
+                format!("more than 2^{} paths", LARGE_BRANCH_THRESHOLD)
+            };
             per_path_findings.push(Finding {
                 severity: Severity::Warning,
                 code: "PATHS_TRUNCATED".to_string(),
                 message: format!(
-                    "Script has {} branch points (2^{} = {} paths); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths.",
-                    num_branches, num_branches, requested
+                    "Script has {} branch points ({}); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths.",
+                    num_branches, paths_clause
                 ),
                 offset: None,
                 opcode: None,
@@ -147,15 +166,13 @@ pub fn analyze_paths(opcodes: &[ParsedOp]) -> PathAnalysis {
         }
 
         for combo in 0..limit {
-            // JS 32-bit signed right-shift semantics: the shift count is
-            // masked to 5 bits (mod 32). So for b >= 32 the same bit
-            // recurs every 32 positions. This is observable in the
-            // schnorr-zkp golden (514 branches → choices[b] true at
-            // b ∈ {0, 32, 64, ..., 512} for combo=1).
+            // `combo` is bounded by 256, so bits at positions >= 8 are
+            // mathematically always 0. We explicitly clamp to b < 31 to
+            // match the canonical TS reference, where JS `>>` would
+            // otherwise mask the shift count to 5 bits and wrap.
             let mut choices: Vec<bool> = Vec::with_capacity(num_branches);
             for b in 0..num_branches {
-                let shift = (b as u32) & 31;
-                let bit = (combo >> shift) & 1;
+                let bit = if b < 31 { (combo >> (b as u32)) & 1 } else { 0 };
                 choices.push(bit == 1);
             }
             let description = describe_path(&choices, &if_indices, opcodes);

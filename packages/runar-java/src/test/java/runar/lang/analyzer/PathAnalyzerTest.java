@@ -98,15 +98,30 @@ class PathAnalyzerTest {
     }
 
     @Test
-    void pathsTruncatedUsesJsShiftQuirkForLargeBranches() {
-        // 32 branches: 2^32 wraps under JS 32-bit shift semantics to 1.
-        // 1 < 256 so PATHS_TRUNCATED is NOT emitted, and the loop bound is 1.
+    void pathsTruncatedForLargeBranches() {
+        // Spec v1.2: 32 branches → 2^32 = 4_294_967_296 true paths,
+        // PATHS_TRUNCATED is emitted with the exact-decimal message form.
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 32; i++) sb.append("6368");
         ScriptParser.Parsed p = ScriptParser.parse(sb.toString());
         PathAnalyzer.PathResult r = PathAnalyzer.analyze(p.opcodes);
-        // 32 & 31 = 0; 1 << 0 = 1. Loop iterates once.
-        assertEquals(1, r.paths.size());
-        assertFalse(r.findings.stream().anyMatch(f -> "PATHS_TRUNCATED".equals(f.code)));
+        assertEquals(256, r.paths.size());
+        assertTrue(r.findings.stream().anyMatch(
+            f -> "PATHS_TRUNCATED".equals(f.code)
+                && f.message.contains("32 branch points (2^32 = 4294967296 paths)")));
+    }
+
+    @Test
+    void pathsTruncatedRendersSymbolicallyForVeryLargeBranches() {
+        // Spec v1.2: numBranches >= 53 renders "more than 2^53 paths" to
+        // avoid overflowing the canonical TS reference's safe-integer range.
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 53; i++) sb.append("6368");
+        ScriptParser.Parsed p = ScriptParser.parse(sb.toString());
+        PathAnalyzer.PathResult r = PathAnalyzer.analyze(p.opcodes);
+        assertEquals(256, r.paths.size());
+        assertTrue(r.findings.stream().anyMatch(
+            f -> "PATHS_TRUNCATED".equals(f.code)
+                && f.message.contains("53 branch points (more than 2^53 paths)")));
     }
 }
