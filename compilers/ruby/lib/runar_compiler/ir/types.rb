@@ -131,7 +131,14 @@ module RunarCompiler
                     #    stack arity (emitted by the asm() intrinsic).
                     :bytes,
                     :in_arity,
-                    :out_arity
+                    :out_arity,
+                    # -- assert (auto-injected stateful-continuation marker) --
+                    # +true+ only on the compiler-emitted
+                    # +hash256(continuationOutputs) === extractOutputHash(txPreimage)+
+                    # assert. Off-chain SDK interpreters skip this assert via a
+                    # direct marker lookup instead of structural / taint
+                    # heuristics that misfire on developer covenant asserts.
+                    :is_auto_injected_state_check
 
       def initialize(kind: "", **_opts)
         @kind = kind
@@ -165,6 +172,7 @@ module RunarCompiler
         @bytes = nil
         @in_arity = nil
         @out_arity = nil
+        @is_auto_injected_state_check = false
       end
     end
 
@@ -283,6 +291,7 @@ module RunarCompiler
       v.bytes       = d["bytes"]
       v.in_arity    = d["in_arity"]
       v.out_arity   = d["out_arity"]
+      v.is_auto_injected_state_check = d["isAutoInjectedStateCheck"] == true
 
       # Nested bindings
       if d.key?("then") && !d["then"].nil?

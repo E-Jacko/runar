@@ -162,6 +162,16 @@ type ANFValue struct {
 	Bytes    string `json:"bytes,omitempty"`
 	InArity  int    `json:"in_arity,omitempty"`
 	OutArity int    `json:"out_arity,omitempty"`
+
+	// assert (auto-injected stateful-continuation marker).
+	// True only on the compiler-emitted
+	// `hash256(continuationOutputs) === extractOutputHash(txPreimage)`
+	// assert. Off-chain SDK interpreters use this to skip the equality
+	// check without resorting to structural / taint heuristics that
+	// misfire on developer covenant asserts whose IR shape is identical.
+	// Custom MarshalJSON elides this when false to keep fold-OFF goldens
+	// stable for developer asserts.
+	IsAutoInjectedStateCheck bool `json:"isAutoInjectedStateCheck,omitempty"`
 }
 
 // MarshalJSON emits only the fields relevant to v.Kind so the byte-level
@@ -243,6 +253,9 @@ func (v ANFValue) MarshalJSON() ([]byte, error) {
 			out["value"] = v.RawValue
 		} else {
 			out["value"] = ""
+		}
+		if v.IsAutoInjectedStateCheck {
+			out["isAutoInjectedStateCheck"] = true
 		}
 	case "update_prop":
 		out["name"] = v.Name

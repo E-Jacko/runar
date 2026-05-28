@@ -560,6 +560,7 @@ mod tests {
                         name: "_t1".to_string(),
                         value: ANFValue::Assert {
                             value: "_t0".to_string(),
+                            is_auto_injected_state_check: false,
                         },
                         source_loc: None,
                     },

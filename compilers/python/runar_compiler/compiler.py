@@ -786,6 +786,8 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
             d["body"] = [_ser_binding(b) for b in v.body]
         if v.value_ref is not None:
             d["value"] = v.value_ref
+        if v.kind == "assert" and v.is_auto_injected_state_check:
+            d["isAutoInjectedStateCheck"] = True
         if v.preimage is not None:
             d["preimage"] = v.preimage
         if v.satoshis is not None:

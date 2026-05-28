@@ -343,7 +343,7 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                         left=hash_ref, right=output_hash_ref,
                         result_type="bytes",
                     ))
-                    method_ctx.emit(_make_assert(eq_ref))
+                    method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
                 else:
                     # Single-output continuation: build raw output bytes, then
                     # splice in any declared data outputs, then concat with
@@ -364,7 +364,7 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                         left=hash_ref, right=output_hash_ref,
                         result_type="bytes",
                     ))
-                    method_ctx.emit(_make_assert(eq_ref))
+                    method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
 
             # Build augmented params list for ABI
             augmented_params = _lower_params(method.params)
@@ -1419,6 +1419,24 @@ def _make_assert(value_ref: str) -> ANFValue:
         kind="assert",
         raw_value=raw,
         value_ref=value_ref,
+    )
+
+
+def _make_auto_injected_state_check_assert(value_ref: str) -> ANFValue:
+    """Build the auto-injected stateful-continuation hash-equality assert.
+
+    Carries ``is_auto_injected_state_check=True`` so off-chain SDK
+    interpreters can skip the equality check via a direct marker lookup
+    instead of structural / taint heuristics that misfire on developer
+    code with identical IR shape (covenant rules, e.g.
+    ``examples/rust/covenant-vault``).
+    """
+    raw = json.dumps(value_ref)
+    return ANFValue(
+        kind="assert",
+        raw_value=raw,
+        value_ref=value_ref,
+        is_auto_injected_state_check=True,
     )
 
 

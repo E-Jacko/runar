@@ -195,6 +195,7 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
             });
             method_ctx.emit(ANFValue::Assert {
                 value: check_result,
+                is_auto_injected_state_check: false,
             });
 
             // Deserialize mutable state from the preimage's scriptCode.
@@ -289,7 +290,7 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                         right: output_hash_ref,
                         result_type: Some("bytes".to_string()),
                     });
-                    method_ctx.emit(ANFValue::Assert { value: eq_ref });
+                    method_ctx.emit(ANFValue::Assert { value: eq_ref, is_auto_injected_state_check: true });
                 } else {
                     // Single-output continuation: build raw state output bytes,
                     // then splice in any declared data outputs, then concat
@@ -333,7 +334,7 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                         right: output_hash_ref,
                         result_type: Some("bytes".to_string()),
                     });
-                    method_ctx.emit(ANFValue::Assert { value: eq_ref });
+                    method_ctx.emit(ANFValue::Assert { value: eq_ref, is_auto_injected_state_check: true });
                 }
             }
 
@@ -1283,12 +1284,12 @@ fn lower_call_expr(
         if name == "assert" {
             if !args.is_empty() {
                 let value_ref = lower_expr_to_ref(&args[0], ctx);
-                return ctx.emit(ANFValue::Assert { value: value_ref });
+                return ctx.emit(ANFValue::Assert { value: value_ref, is_auto_injected_state_check: false });
             }
             let false_ref = ctx.emit(ANFValue::LoadConst {
                 value: serde_json::Value::Bool(false),
             });
-            return ctx.emit(ANFValue::Assert { value: false_ref });
+            return ctx.emit(ANFValue::Assert { value: false_ref, is_auto_injected_state_check: false });
         }
     }
 
@@ -1381,7 +1382,7 @@ fn lower_call_expr(
                 right: expected_hash_ref,
                 result_type: Some("bytes".to_string()),
             });
-            ctx.emit(ANFValue::Assert { value: eq_ref });
+            ctx.emit(ANFValue::Assert { value: eq_ref, is_auto_injected_state_check: false });
             return witness_ref;
         }
     }
@@ -1450,7 +1451,7 @@ fn lower_call_expr(
                     right: expected_out_hash_ref,
                     result_type: Some("bytes".to_string()),
                 });
-                ctx.emit(ANFValue::Assert { value: hash_eq_ref });
+                ctx.emit(ANFValue::Assert { value: hash_eq_ref, is_auto_injected_state_check: false });
             }
 
             // Lower the user-supplied args (pubkeyHash, amount).
@@ -1507,7 +1508,7 @@ fn lower_call_expr(
                 right: expected_output_ref,
                 result_type: Some("bytes".to_string()),
             });
-            return ctx.emit(ANFValue::Assert { value: out_eq_ref });
+            return ctx.emit(ANFValue::Assert { value: out_eq_ref, is_auto_injected_state_check: false });
         }
     }
 
@@ -2143,7 +2144,7 @@ fn is_assert_false_else(bindings: &[ANFBinding]) -> bool {
         return false;
     }
     let last = &bindings[bindings.len() - 1];
-    if let ANFValue::Assert { value: assert_ref } = &last.value {
+    if let ANFValue::Assert { value: assert_ref, .. } = &last.value {
         // Find the binding that assert_ref references
         for b in bindings {
             if b.name == *assert_ref {
@@ -2258,7 +2259,7 @@ fn remap_value_refs(value: &ANFValue, map: &HashMap<String, String>) -> ANFValue
             method: method.clone(),
             args: args.iter().map(|a| r(a)).collect(),
         },
-        ANFValue::Assert { value: v } => ANFValue::Assert { value: r(v) },
+        ANFValue::Assert { value: v, is_auto_injected_state_check } => ANFValue::Assert { value: r(v), is_auto_injected_state_check: *is_auto_injected_state_check },
         ANFValue::UpdateProp { name, value: v } => ANFValue::UpdateProp {
             name: name.clone(),
             value: r(v),

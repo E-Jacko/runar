@@ -402,9 +402,14 @@ fn parseLoop(allocator: std.mem.Allocator, obj: std.json.ObjectMap, depth: u32) 
 
 fn parseAssert(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.ANFValue {
     const val_ref = try getString(obj, "value");
+    const marker = if (obj.get("isAutoInjectedStateCheck")) |v|
+        v == .bool and v.bool
+    else
+        false;
 
     return .{ .assert = .{
         .value = try allocator.dupe(u8, val_ref),
+        .is_auto_injected_state_check = marker,
     } };
 }
 
@@ -909,7 +914,15 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
         },
         .assert => |a| {
             try writer.writeAll("{\n");
-            // Sorted keys: kind, value
+            // Sorted keys: isAutoInjectedStateCheck (when true), kind, value
+            // The marker is omitted entirely when false to keep the
+            // checked-in fold-OFF goldens stable for developer asserts.
+            if (a.is_auto_injected_state_check) {
+                try writeIndent(writer, depth + 1);
+                try writeJsonString(writer, "isAutoInjectedStateCheck");
+                try writer.writeAll(": true,\n");
+            }
+
             try writeIndent(writer, depth + 1);
             try writeJsonString(writer, "kind");
             try writer.writeAll(": ");

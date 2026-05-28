@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use runar::prelude::*;
 use runar::sdk::anf_interpreter::{
-    execute_with_witness, ANFBinding, ANFProgram, IntentInterpreterError, IntentWitnessContext,
+    execute_with_witness, ANFProgram, IntentInterpreterError, IntentWitnessContext,
 };
 use runar::sdk::types::SdkValue;
 
@@ -32,26 +32,7 @@ fn load_program() -> ANFProgram {
     let ir = runar_compiler_rust::compile_source_str_to_ir(SOURCE, Some(FILE_NAME))
         .expect("compile_source_str_to_ir");
     let json = serde_json::to_string(&ir).expect("ANFProgram -> json");
-    let mut program: ANFProgram =
-        serde_json::from_str(&json).expect("json -> sdk ANFProgram");
-
-    // The SDK's anf_interpreter::execute_with_witness unconditionally pops the
-    // final `assert(hash256(...) === extractOutputHash(...))` binding when it
-    // matches the auto-injected stateful-continuation pattern (see
-    // packages/runar-rs/src/sdk/anf_interpreter.rs around line 594). The
-    // CovenantVault covenant rule is hand-written by the developer but has the
-    // identical IR shape, so the strip would silently drop the assertion we
-    // explicitly want to exercise. Append a trailing no-op binding so the
-    // covenant assert is no longer `body.last()`.
-    for m in program.methods.iter_mut() {
-        if m.name == "spend" {
-            m.body.push(ANFBinding {
-                name: "__keep_covenant_assert".to_string(),
-                value: serde_json::json!({ "kind": "load_const", "value": true }),
-            });
-        }
-    }
-    program
+    serde_json::from_str(&json).expect("json -> sdk ANFProgram")
 }
 
 /// Build the same byte string the on-chain covenant builds for its expected

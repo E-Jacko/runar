@@ -152,6 +152,14 @@ class ANFValue:
     # -- assert, update_prop (value ref), check_preimage -------------------
     value_ref: str | None = None
 
+    # -- assert (auto-injected stateful-continuation marker) ---------------
+    # ``True`` only on the compiler-emitted
+    # ``hash256(continuationOutputs) === extractOutputHash(txPreimage)``
+    # assert in 04-anf-lower. Off-chain SDK interpreters skip this assert
+    # without resorting to structural / taint heuristics that misfire on
+    # developer-written covenant asserts whose IR shape is identical.
+    is_auto_injected_state_check: bool = False
+
     # -- check_preimage, deserialize_state ---------------------------------
     preimage: str | None = None
 
@@ -284,6 +292,7 @@ def _anf_value_from_dict(d: dict[str, Any]) -> ANFValue:
     v.bytes = d.get("bytes")
     v.in_arity = d.get("in_arity")
     v.out_arity = d.get("out_arity")
+    v.is_auto_injected_state_check = bool(d.get("isAutoInjectedStateCheck", False))
 
     # Nested bindings
     if "then" in d and d["then"] is not None:

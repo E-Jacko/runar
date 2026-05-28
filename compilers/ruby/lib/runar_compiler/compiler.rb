@@ -907,6 +907,7 @@ module RunarCompiler
       d["iterVar"] = v.iter_var unless v.iter_var.nil?
       d["body"] = v.body.map { |b| ser_binding.call(b) } unless v.body.nil?
       d["value"] = v.value_ref unless v.value_ref.nil?
+      d["isAutoInjectedStateCheck"] = true if v.kind == "assert" && v.is_auto_injected_state_check
       d["preimage"] = v.preimage unless v.preimage.nil?
       d["satoshis"] = v.satoshis unless v.satoshis.nil?
       d["stateValues"] = v.state_values unless v.state_values.nil?

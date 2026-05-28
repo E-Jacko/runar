@@ -257,6 +257,7 @@ _SNAKE_TO_CAMEL = {
     "initial_value": "initialValue",
     "script_bytes": "scriptBytes",
     "else_": "else",
+    "is_auto_injected_state_check": "isAutoInjectedStateCheck",
     # These stay as snake_case to match Go/TS IR format
     "result_type": "result_type",
     # Both raw_value and value_ref map to "value" in Go JSON (they never coexist)
@@ -288,6 +289,7 @@ def _anf_to_camel_dict(obj: object) -> object:
     if is_dataclass(obj) and not isinstance(obj, type):
         d: dict = {}
         has_raw_value = False
+        kind_val = getattr(obj, "kind", None)
         for f in fields(obj):
             if f.name in _IR_EXCLUDED_FIELDS:
                 continue
@@ -305,6 +307,12 @@ def _anf_to_camel_dict(obj: object) -> object:
             # Skip value_ref if raw_value was already emitted as "value"
             if f.name == "value_ref" and has_raw_value:
                 continue
+            # Auto-injected stateful-continuation marker: emit only on
+            # `assert` nodes and only when True so checked-in fold-OFF
+            # goldens stay stable for developer asserts.
+            if f.name == "is_auto_injected_state_check":
+                if not v or kind_val != "assert":
+                    continue
             key = _snake_key(f.name)
             d[key] = _anf_to_camel_dict(v)
         return d

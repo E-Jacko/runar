@@ -82,6 +82,7 @@ fn assert_binding(name: &str, val_ref: &str) -> ANFBinding {
         name: name.to_string(),
         value: ANFValue::Assert {
             value: val_ref.to_string(),
+            is_auto_injected_state_check: false,
         },
         source_loc: None,
     }

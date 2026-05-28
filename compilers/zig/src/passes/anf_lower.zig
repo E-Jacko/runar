@@ -476,7 +476,7 @@ fn lowerStatefulPublicMethod(
                 .right = output_hash_ref,
                 .result_type = "bytes",
             } });
-            _ = try ctx.emit(.{ .assert = .{ .value = eq_ref } });
+            _ = try ctx.emit(.{ .assert = .{ .value = eq_ref, .is_auto_injected_state_check = true } });
         } else {
             // Single-output continuation: build raw state output bytes, then
             // splice in declared data outputs, then concat with change,
@@ -514,7 +514,7 @@ fn lowerStatefulPublicMethod(
                 .right = output_hash_ref,
                 .result_type = "bytes",
             } });
-            _ = try ctx.emit(.{ .assert = .{ .value = eq_ref } });
+            _ = try ctx.emit(.{ .assert = .{ .value = eq_ref, .is_auto_injected_state_check = true } });
         }
     }
 }

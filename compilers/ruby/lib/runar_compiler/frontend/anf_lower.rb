@@ -254,7 +254,7 @@ module RunarCompiler
                 v.right = output_hash_ref
                 v.result_type = "bytes"
               end)
-              method_ctx.emit(_make_assert(eq_ref))
+              method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
             else
               # Single-output continuation: build raw output bytes, then
               # splice in any declared data outputs, then concat with
@@ -277,7 +277,7 @@ module RunarCompiler
                 v.right = output_hash_ref
                 v.result_type = "bytes"
               end)
-              method_ctx.emit(_make_assert(eq_ref))
+              method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
             end
           end
 
@@ -1483,6 +1483,22 @@ module RunarCompiler
       IR::ANFValue.new(kind: "assert").tap do |v|
         v.raw_value = raw
         v.value_ref = value_ref
+      end
+    end
+
+    # Build the auto-injected stateful-continuation hash-equality assert.
+    # Carries +is_auto_injected_state_check = true+ so off-chain SDK
+    # interpreters can skip the equality check via a direct marker lookup
+    # instead of structural / taint heuristics that misfire on developer
+    # code with identical IR shape (covenant rules).
+    # @param value_ref [String]
+    # @return [IR::ANFValue]
+    def self._make_auto_injected_state_check_assert(value_ref)
+      raw = JSON.generate(value_ref)
+      IR::ANFValue.new(kind: "assert").tap do |v|
+        v.raw_value = raw
+        v.value_ref = value_ref
+        v.is_auto_injected_state_check = true
       end
     end
 

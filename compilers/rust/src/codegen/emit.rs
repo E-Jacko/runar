@@ -863,7 +863,7 @@ mod tests {
                         },
                         ANFBinding {
                             name: "t3".to_string(),
-                            value: ANFValue::Assert { value: "t2".to_string() },
+                            value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                             source_loc: None,
                         },
                     ],
@@ -900,7 +900,7 @@ mod tests {
                         },
                         ANFBinding {
                             name: "t3".to_string(),
-                            value: ANFValue::Assert { value: "t2".to_string() },
+                            value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                             source_loc: None,
                         },
                     ],
@@ -1037,7 +1037,7 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t4".to_string(),
-                        value: ANFValue::Assert { value: "t3".to_string() },
+                        value: ANFValue::Assert { value: "t3".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                     ANFBinding {
@@ -1060,7 +1060,7 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t8".to_string(),
-                        value: ANFValue::Assert { value: "t7".to_string() },
+                        value: ANFValue::Assert { value: "t7".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
@@ -1166,7 +1166,7 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t2".to_string(),
-                        value: ANFValue::Assert { value: "t1".to_string() },
+                        value: ANFValue::Assert { value: "t1".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
@@ -1310,7 +1310,7 @@ mod tests {
                         },
                         ANFBinding {
                             name: "t3".to_string(),
-                            value: ANFValue::Assert { value: "t2".to_string() },
+                            value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                             source_loc: None,
                         },
                     ],

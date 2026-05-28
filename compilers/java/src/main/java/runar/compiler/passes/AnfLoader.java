@@ -157,7 +157,11 @@ public final class AnfLoader {
                 toBindingList(obj.get("body")),
                 asString(obj.get("iterVar"))
             );
-            case "assert" -> new Assert(asString(obj.get("value")));
+            case "assert" -> new Assert(
+                asString(obj.get("value")),
+                obj.containsKey("isAutoInjectedStateCheck")
+                    && Boolean.TRUE.equals(obj.get("isAutoInjectedStateCheck"))
+            );
             case "update_prop" -> new UpdateProp(asString(obj.get("name")), asString(obj.get("value")));
             case "get_state_script" -> new GetStateScript();
             case "check_preimage" -> new CheckPreimage(asString(obj.get("preimage")));
