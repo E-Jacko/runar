@@ -1283,6 +1283,18 @@ pub fn emit_verify_slh_dsa(emit: &mut dyn FnMut(StackOp), param_key: &str) {
 
     let mut t = SLHTracker::new(&["msg", "sig", "pubkey"], emit);
 
+    // ---- 0. BUG-011: enforce exact signature length on-chain ----
+    // Each parameter set has a canonical sig length: n + k*(1+a)*n + d*(len+hp)*n.
+    // Without this guard the d xmss-layer split loop silently dropped trailing
+    // bytes past layer d-1.
+    let expected_sig_len = n + fors_sig_len + d * xmss_sig_len;
+    t.to_top("sig");
+    t.raw_block(&["sig"], "sig", |e| {
+        e(StackOp::Opcode("OP_SIZE".into()));
+        e(StackOp::Push(PushValue::Int(expected_sig_len as i128)));
+        e(StackOp::Opcode("OP_EQUALVERIFY".into()));
+    });
+
     // ---- 1. Parse pubkey -> pkSeed, pkRoot ----
     t.to_top("pubkey");
     t.push_int("", n as i128);

@@ -235,14 +235,7 @@ describe.skipIf(!runSlowTests)('SLH-DSA adversarial bound-violation tests (all 6
         expect(r.success).toBe(false);
       });
 
-      // TODO(BUG-007-followup): `slhVerify` in `packages/runar-testing/src/crypto/slh-dsa.ts`
-      // does NOT length-check the input signature — trailing bytes after the
-      // d-th hypertree layer are silently dropped, so oversize sigs verify as
-      // true. See `_review/BUG-007-finding.md`. Until the off-chain verifier
-      // (and all 7 SDK ports) get an exact-length guard, this test asserts the
-      // CURRENT (buggy) behaviour so the regression is captured but the suite
-      // stays green. Invert the assertion when the fix lands.
-      it('CURRENTLY ACCEPTS oversize signature (BUG-007: missing trailing-bytes bound check)', () => {
+      it('rejects oversize signature (BUG-011: exact-length guard enforced)', () => {
         const xmssLen = (tc.params.len + tc.params.hp) * tc.params.n;
         const over = new Uint8Array(expectedLen + xmssLen);
         over.set(sig, 0);
@@ -250,9 +243,66 @@ describe.skipIf(!runSlowTests)('SLH-DSA adversarial bound-violation tests (all 6
         over.set(sig.slice(expectedLen - xmssLen, expectedLen), expectedLen);
         const contract = TestContract.fromSource(tc.source, { pubkey: pkHex });
         const r = contract.call('spend', { msg: toHex(msg), sig: toHex(over) });
-        // BUG: this should be `expect(r.success).toBe(false)` once slhVerify
-        // gains an exact-length guard.
-        expect(r.success).toBe(true);
+        expect(r.success).toBe(false);
+      });
+
+      it('rejects oversize signature (single trailing byte)', () => {
+        const over = new Uint8Array(expectedLen + 1);
+        over.set(sig, 0);
+        over[expectedLen] = 0x00;
+        const contract = TestContract.fromSource(tc.source, { pubkey: pkHex });
+        const r = contract.call('spend', { msg: toHex(msg), sig: toHex(over) });
+        expect(r.success).toBe(false);
+      });
+
+      // BUG-011 followup: tree-index out-of-range. The tree_idx derived from
+      // Hmsg is masked to (h-hp) bits in the verifier. A signature whose XMSS
+      // layer-0 path was authored for a *different* tree_idx must be rejected.
+      // We can't craft an "out-of-bounds" tree_idx directly because Hmsg
+      // re-derives it from R, but we *can* tamper bytes that feed the FORS
+      // tree-address (which is the absolute tree_idx for layer 0). Zeroing
+      // the FORS auth path forces the FORS root to a non-canonical value,
+      // which propagates a wrong xmss leaf message and the layer-0 walk lands
+      // at the wrong tree node — verifier rejects.
+      it('rejects FORS auth-path zero (tree-index path corruption)', () => {
+        const tampered = new Uint8Array(sig);
+        // Zero just the FORS auth path (skip the FORS leaf secrets at offset n,
+        // wipe the (1+a)*n - n = a*n auth bytes following each leaf).
+        const forsAuthStart = tc.params.n + tc.params.n; // R + first FORS leaf
+        const authBytesPerTree = tc.params.a * tc.params.n;
+        const treeStride = (1 + tc.params.a) * tc.params.n;
+        for (let i = 0; i < tc.params.k; i++) {
+          const base = tc.params.n + i * treeStride + tc.params.n;
+          for (let j = 0; j < authBytesPerTree; j++) tampered[base + j] = 0;
+        }
+        // Verify we actually changed bytes
+        let differed = false;
+        for (let i = 0; i < tampered.length; i++) {
+          if (tampered[i] !== sig[i]) { differed = true; break; }
+        }
+        expect(differed).toBe(true);
+        void forsAuthStart; // intentionally unused (loop above computes base directly)
+        const contract = TestContract.fromSource(tc.source, { pubkey: pkHex });
+        const r = contract.call('spend', { msg: toHex(msg), sig: toHex(tampered) });
+        expect(r.success).toBe(false);
+      });
+
+      // BUG-011 followup: leaf-index out-of-range. The verifier walks the
+      // first XMSS layer authentication path using leaf_idx derived from
+      // Hmsg. Zeroing all but the first n bytes of XMSS layer 0 (the WOTS+
+      // chains) leaves a structurally-malformed signature whose WOTS+ chain
+      // sums no longer match the FORS-derived msgHash; the walk reaches a
+      // root that disagrees with PK.root.
+      it('rejects XMSS layer-0 WOTS+ chains zeroed (leaf-index path corruption)', () => {
+        const tampered = new Uint8Array(sig);
+        const forsLen = tc.params.k * (1 + tc.params.a) * tc.params.n;
+        const xmssStart = tc.params.n + forsLen;
+        const wotsLen = tc.params.len * tc.params.n;
+        // Zero all WOTS+ chain bytes of layer 0
+        for (let i = xmssStart; i < xmssStart + wotsLen; i++) tampered[i] = 0;
+        const contract = TestContract.fromSource(tc.source, { pubkey: pkHex });
+        const r = contract.call('spend', { msg: toHex(msg), sig: toHex(tampered) });
+        expect(r.success).toBe(false);
       });
 
       it('rejects R-prefix tamper (re-derives tree_idx/leaf_idx outside the path baked into sig)', () => {

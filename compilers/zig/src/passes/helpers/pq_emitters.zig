@@ -1187,6 +1187,18 @@ pub fn appendVerifySLHDSA(
         }
     };
 
+    // ---- 0. BUG-011: enforce exact signature length on-chain ----
+    // Each parameter set has a canonical sig length: n + k*(1+a)*n + d*(len+hp)*n.
+    // Without this guard the d xmss-layer split loop silently dropped trailing
+    // bytes past layer d-1.
+    const expected_sig_len: i64 = @intCast(n + fors_sig_len + d * xmss_sig_len);
+    try tracker.toTop("sig");
+    try builder.emitOp("OP_SIZE");
+    try builder.emitPushInt(expected_sig_len);
+    try builder.emitOp("OP_EQUALVERIFY");
+    // Net stack effect: 0 (OP_SIZE +1, push +1, OP_EQUALVERIFY -2). Tracker
+    // names unchanged — "sig" stays on top.
+
     try tracker.toTop("pubkey");
     try tracker.pushInt(null, @intCast(n));
     try tracker.split("pkSeed", "pkRoot");
