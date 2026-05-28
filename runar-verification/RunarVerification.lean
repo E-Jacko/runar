@@ -2,6 +2,7 @@ import RunarVerification.ANF.Syntax
 import RunarVerification.ANF.Json
 import RunarVerification.ANF.WF
 import RunarVerification.ANF.Typed
+import RunarVerification.ANF.TypeCheck
 import RunarVerification.ANF.Eval
 import RunarVerification.Crypto.Secp256k1
 import RunarVerification.Crypto.NistEC
