@@ -9,10 +9,55 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/icellan/runar/compilers/go/codegen"
 	"github.com/icellan/runar/compilers/go/compiler"
 )
+
+// GAP-011: source-map sourceFile values must be repo-relative (POSIX) so
+// goldens stay stable across worktree paths and developer machines. Walk up
+// from the source file looking for pnpm-workspace.yaml (the canonical repo
+// root marker); fall back to the basename if no marker is found. Strings
+// that aren't absolute paths are returned unchanged.
+func repoRelativeFileName(srcPath string) string {
+	if !filepath.IsAbs(srcPath) {
+		return srcPath
+	}
+	dir := filepath.Dir(srcPath)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "pnpm-workspace.yaml")); err == nil {
+			rel, err := filepath.Rel(dir, srcPath)
+			if err == nil {
+				return filepath.ToSlash(rel)
+			}
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return filepath.Base(srcPath)
+}
+
+// rewriteSourceMapPaths replaces SourceFile on each mapping with its
+// repo-relative POSIX form. Pure serialization-time normalization; the
+// in-memory artifact is unchanged.
+func rewriteSourceMapPaths(sm *compiler.SourceMap) *compiler.SourceMap {
+	if sm == nil {
+		return nil
+	}
+	out := &compiler.SourceMap{Mappings: make([]codegen.SourceMapping, len(sm.Mappings))}
+	for i, m := range sm.Mappings {
+		nm := m
+		nm.SourceFile = repoRelativeFileName(m.SourceFile)
+		out.Mappings[i] = nm
+	}
+	return out
+}
+
 
 func main() {
 	// Subcommand dispatch: if the first arg looks like a subcommand
@@ -151,6 +196,8 @@ func main() {
 		if sm == nil {
 			sm = &compiler.SourceMap{Mappings: []codegen.SourceMapping{}}
 		}
+		// GAP-011: normalize sourceFile to repo-relative POSIX.
+		sm = rewriteSourceMapPaths(sm)
 		smBytes, smErr := json.MarshalIndent(sm, "", "  ")
 		if smErr != nil {
 			fmt.Fprintf(os.Stderr, "Source map serialization error: %v\n", smErr)

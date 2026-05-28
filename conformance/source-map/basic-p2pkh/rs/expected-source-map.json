@@ -2,31 +2,31 @@
   "mappings": [
     {
       "opcodeIndex": 0,
-      "sourceFile": "P2PKH.runar.rs",
+      "sourceFile": "examples/rust/p2pkh/P2PKH.runar.rs",
       "line": 40,
       "column": 9
     },
     {
       "opcodeIndex": 1,
-      "sourceFile": "P2PKH.runar.rs",
+      "sourceFile": "examples/rust/p2pkh/P2PKH.runar.rs",
       "line": 40,
       "column": 9
     },
     {
       "opcodeIndex": 2,
-      "sourceFile": "P2PKH.runar.rs",
+      "sourceFile": "examples/rust/p2pkh/P2PKH.runar.rs",
       "line": 40,
       "column": 9
     },
     {
       "opcodeIndex": 3,
-      "sourceFile": "P2PKH.runar.rs",
+      "sourceFile": "examples/rust/p2pkh/P2PKH.runar.rs",
       "line": 40,
       "column": 9
     },
     {
       "opcodeIndex": 4,
-      "sourceFile": "P2PKH.runar.rs",
+      "sourceFile": "examples/rust/p2pkh/P2PKH.runar.rs",
       "line": 42,
       "column": 9
     }

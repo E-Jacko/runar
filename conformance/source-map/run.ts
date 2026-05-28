@@ -255,6 +255,10 @@ function checkStructural(sm: SourceMap, opcodeCount: number): StructuralResult {
     if (typeof m.opcodeIndex !== 'number' || m.opcodeIndex < 0) reasons.push(`mappings[${i}].opcodeIndex invalid: ${m.opcodeIndex}`);
     if (typeof m.opcodeIndex === 'number' && m.opcodeIndex >= opcodeCount) reasons.push(`mappings[${i}].opcodeIndex=${m.opcodeIndex} >= opcodeCount=${opcodeCount}`);
     if (typeof m.sourceFile !== 'string' || m.sourceFile.length === 0) reasons.push(`mappings[${i}].sourceFile invalid`);
+    // GAP-011: sourceFile must NOT be an absolute path (would bake the
+    // developer's worktree directory into the goldens). Allow repo-relative
+    // POSIX paths (e.g. examples/ts/p2pkh/P2PKH.runar.ts) or basenames.
+    else if (m.sourceFile.startsWith('/') || /^[A-Za-z]:[\\/]/.test(m.sourceFile)) reasons.push(`mappings[${i}].sourceFile is absolute: ${m.sourceFile}`);
     if (typeof m.line !== 'number' || m.line < 0) reasons.push(`mappings[${i}].line invalid: ${m.line}`);
     if (typeof m.column !== 'number' || m.column < 0) reasons.push(`mappings[${i}].column invalid: ${m.column}`);
   }

@@ -201,6 +201,28 @@ public final class Cli {
      * source map JSON to {@code path}. The path's parent directory is
      * created on demand. Returns 0 on success, non-zero on failure.
      */
+    /**
+     * GAP-011: source-map sourceFile values must be repo-relative (POSIX) so
+     * goldens stay stable across worktree paths and developer machines. Walks
+     * up from the source file looking for {@code pnpm-workspace.yaml} (the
+     * canonical repo root marker); falls back to the basename if no marker is
+     * found. Strings that aren't absolute paths are returned unchanged.
+     */
+    static String repoRelativeFileName(String srcPath) {
+        if (srcPath == null || srcPath.isEmpty()) return srcPath;
+        Path p = Path.of(srcPath);
+        if (!p.isAbsolute()) return srcPath;
+        Path dir = p.getParent();
+        while (dir != null) {
+            if (Files.exists(dir.resolve("pnpm-workspace.yaml"))) {
+                String rel = dir.relativize(p).toString();
+                return rel.replace(java.io.File.separatorChar, '/');
+            }
+            dir = dir.getParent();
+        }
+        return p.getFileName() == null ? srcPath : p.getFileName().toString();
+    }
+
     private int writeSourceMap(AnfProgram anf, String path) {
         try {
             StackProgram stack = StackLower.run(anf);
@@ -211,8 +233,10 @@ public final class Cli {
             for (int i = 0; i < result.sourceMap().size(); i++) {
                 Emit.SourceMapping m = result.sourceMap().get(i);
                 if (i > 0) b.append(',');
+                // GAP-011: normalize sourceFile to repo-relative POSIX so
+                // goldens stay stable across worktree paths.
                 b.append("\n    {\"opcodeIndex\": ").append(m.opcodeIndex())
-                    .append(", \"sourceFile\": ").append(jsonString(m.sourceFile()))
+                    .append(", \"sourceFile\": ").append(jsonString(repoRelativeFileName(m.sourceFile())))
                     .append(", \"line\": ").append(m.line())
                     .append(", \"column\": ").append(m.column())
                     .append('}');

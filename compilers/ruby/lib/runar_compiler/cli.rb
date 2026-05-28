@@ -44,6 +44,26 @@ module RunarCompiler
 
     module_function
 
+    # GAP-011: source-map sourceFile values must be repo-relative (POSIX) so
+    # goldens stay stable across worktree paths and developer machines. Walk
+    # up from the source file looking for pnpm-workspace.yaml (the canonical
+    # repo root marker); fall back to the basename if no marker is found.
+    # Strings that aren't absolute paths are returned unchanged.
+    def repo_relative_file_name(src_path)
+      return src_path unless src_path.is_a?(String) && File.absolute_path(src_path) == src_path
+      d = File.dirname(src_path)
+      loop do
+        if File.exist?(File.join(d, "pnpm-workspace.yaml"))
+          rel = src_path.sub(/\A#{Regexp.escape(d)}#{Regexp.escape(File::SEPARATOR)}?/, "")
+          return rel.tr(File::SEPARATOR, "/")
+        end
+        parent = File.dirname(d)
+        break if parent == d
+        d = parent
+      end
+      File.basename(src_path)
+    end
+
     def run(argv = ARGV)
       options = {}
 
@@ -191,10 +211,13 @@ module RunarCompiler
             if m.is_a?(RunarCompiler::Codegen::SourceMapping)
               {
                 "opcodeIndex" => m.opcode_index,
-                "sourceFile" => m.source_file,
+                # GAP-011: normalize sourceFile to repo-relative POSIX.
+                "sourceFile" => repo_relative_file_name(m.source_file),
                 "line" => m.line,
                 "column" => m.column,
               }
+            elsif m.is_a?(Hash) && m["sourceFile"]
+              m.merge("sourceFile" => repo_relative_file_name(m["sourceFile"]))
             else
               m
             end

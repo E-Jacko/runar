@@ -2,61 +2,61 @@
   "mappings": [
     {
       "opcodeIndex": 32,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/stateful-counter/Counter.runar.rb",
+      "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 13,
       "column": 5
     },
     {
       "opcodeIndex": 33,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/stateful-counter/Counter.runar.rb",
+      "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 13,
       "column": 5
     },
     {
       "opcodeIndex": 34,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/stateful-counter/Counter.runar.rb",
+      "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 13,
       "column": 5
     },
     {
       "opcodeIndex": 164,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/stateful-counter/Counter.runar.rb",
+      "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 18,
       "column": 5
     },
     {
       "opcodeIndex": 165,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/stateful-counter/Counter.runar.rb",
+      "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 18,
       "column": 5
     },
     {
       "opcodeIndex": 166,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/stateful-counter/Counter.runar.rb",
+      "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 18,
       "column": 5
     },
     {
       "opcodeIndex": 167,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/stateful-counter/Counter.runar.rb",
+      "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 18,
       "column": 5
     },
     {
       "opcodeIndex": 168,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/stateful-counter/Counter.runar.rb",
+      "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 19,
       "column": 5
     },
     {
       "opcodeIndex": 169,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/stateful-counter/Counter.runar.rb",
+      "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 19,
       "column": 5
     },
     {
       "opcodeIndex": 170,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/ruby/stateful-counter/Counter.runar.rb",
+      "sourceFile": "examples/ruby/stateful-counter/Counter.runar.rb",
       "line": 19,
       "column": 5
     }

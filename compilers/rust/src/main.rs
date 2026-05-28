@@ -5,10 +5,34 @@
 //!   --source <path> Compile from .runar.ts source to Bitcoin Script (full pipeline)
 
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 mod debug_subcommand;
+
+/// GAP-011: source-map sourceFile values must be repo-relative (POSIX) so
+/// goldens stay stable across worktree paths and developer machines. Walk
+/// up from the source file looking for pnpm-workspace.yaml (the canonical
+/// repo root marker); fall back to the basename if no marker is found.
+fn repo_relative_file_name(src_path: &Path) -> String {
+    if !src_path.is_absolute() {
+        return src_path.to_string_lossy().into_owned();
+    }
+    let mut dir = src_path.parent();
+    while let Some(d) = dir {
+        if d.join("pnpm-workspace.yaml").exists() {
+            if let Ok(rel) = src_path.strip_prefix(d) {
+                return rel.to_string_lossy().replace('\\', "/");
+            }
+            break;
+        }
+        dir = d.parent();
+    }
+    src_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
 
 /// Rúnar Compiler (Rust implementation)
 #[derive(Parser, Debug)]
@@ -154,8 +178,8 @@ fn main() {
         }
     }
 
-    let artifact = if let Some(source_path) = args.source {
-        match runar_compiler_rust::compile_from_source_with_options(&source_path, &opts) {
+    let artifact = if let Some(ref source_path) = args.source {
+        match runar_compiler_rust::compile_from_source_with_options(source_path, &opts) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("Compilation error: {}", e);
@@ -178,10 +202,25 @@ fn main() {
     // wrapper object so downstream tooling sees a uniform shape even when
     // the underlying mapping table is empty.
     if let Some(sm_path) = &args.emit_source_map {
-        // SourceMapData serializes via its derived Serialize impl which
-        // already produces {"mappings":[...]}.
+        // GAP-011: normalize sourceFile to repo-relative POSIX. Rust's
+        // parser only sees the basename, so we recompute the repo-relative
+        // form from the original --source path and rewrite every mapping's
+        // source_file at serialization time. The in-memory artifact is
+        // unchanged.
+        let rel_name = args
+            .source
+            .as_ref()
+            .map(|p| repo_relative_file_name(p.as_path()));
         let payload = match &artifact.source_map {
-            Some(sm) => serde_json::to_string_pretty(sm),
+            Some(sm) => {
+                let mut sm_norm = sm.clone();
+                if let Some(name) = &rel_name {
+                    for m in sm_norm.mappings.iter_mut() {
+                        m.source_file = name.clone();
+                    }
+                }
+                serde_json::to_string_pretty(&sm_norm)
+            }
             None => Ok("{\n  \"mappings\": []\n}".to_string()),
         };
         match payload {

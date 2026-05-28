@@ -2,25 +2,25 @@
   "mappings": [
     {
       "opcodeIndex": 0,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/go/p2pkh/P2PKH.runar.go",
+      "sourceFile": "examples/go/p2pkh/P2PKH.runar.go",
       "line": 40,
       "column": 2
     },
     {
       "opcodeIndex": 1,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/go/p2pkh/P2PKH.runar.go",
+      "sourceFile": "examples/go/p2pkh/P2PKH.runar.go",
       "line": 40,
       "column": 2
     },
     {
       "opcodeIndex": 2,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/go/p2pkh/P2PKH.runar.go",
+      "sourceFile": "examples/go/p2pkh/P2PKH.runar.go",
       "line": 40,
       "column": 2
     },
     {
       "opcodeIndex": 4,
-      "sourceFile": "/Users/siggioskarsson/gitcheckout/runar/.claude/worktrees/agent-a2e3549e262301920/examples/go/p2pkh/P2PKH.runar.go",
+      "sourceFile": "examples/go/p2pkh/P2PKH.runar.go",
       "line": 42,
       "column": 2
     }

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from runar_compiler.compiler import (
@@ -23,6 +24,25 @@ from runar_compiler.compiler import (
     compile_from_source,
     compile_source_to_ir,
 )
+
+
+# GAP-011: source-map sourceFile values must be repo-relative (POSIX) so
+# goldens stay stable across worktree paths and developer machines. Walk up
+# from the source file looking for pnpm-workspace.yaml (the canonical repo
+# root marker); fall back to the basename if no marker is found. Strings
+# that aren't absolute paths are returned unchanged.
+def _repo_relative_file_name(src_path: str) -> str:
+    if not os.path.isabs(src_path):
+        return src_path
+    d = os.path.dirname(src_path)
+    while True:
+        if os.path.exists(os.path.join(d, "pnpm-workspace.yaml")):
+            return os.path.relpath(src_path, d).replace(os.sep, "/")
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return os.path.basename(src_path)
 
 
 def main() -> None:
@@ -197,19 +217,19 @@ def main() -> None:
     # wrapper object so downstream tooling sees a uniform shape even when
     # the underlying mapping table is empty.
     if args.emit_source_map:
-        import os
         sm = artifact.source_map  # list of SourceMapping or None
         if sm:
             from runar_compiler.codegen.emit import SourceMapping
             mappings = [
                 {
                     "opcodeIndex": m.opcode_index,
-                    "sourceFile": m.source_file,
+                    # GAP-011: normalize sourceFile to repo-relative POSIX.
+                    "sourceFile": _repo_relative_file_name(m.source_file),
                     "line": m.line,
                     "column": m.column,
                 }
                 if isinstance(m, SourceMapping)
-                else m
+                else {**m, "sourceFile": _repo_relative_file_name(m.get("sourceFile", ""))}
                 for m in sm
             ]
         else:
