@@ -506,6 +506,10 @@ const Parser = struct {
 
         const type_tok = self.bump();
         const type_name = type_tok.text;
+        // Wrap with any trailing `[N]` bracket suffixes — Solidity native
+        // outer-to-inner declaration order, so `T[A][B]` lowers to
+        // FixedArray<FixedArray<T, A>, B>.
+        const type_node = self.parseSolFixedArraySuffix(.{ .primitive_type = .void }, type_name);
 
         // Check for immutable keyword
         var is_readonly = false;
@@ -534,11 +538,81 @@ const Parser = struct {
         // For SmartContract, all fields are readonly
         const readonly = if (parent_class == .smart_contract or parent_class == .unsafe_smart_contract) true else is_readonly;
 
+        // Capture FixedArray shape (outer + nested) so expand_fixed_arrays
+        // can see the property after typecheck.
+        var fa_len: u32 = 0;
+        var fa_elem: RunarType = .unknown;
+        var fa_nested_len: u32 = 0;
+        if (type_node == .fixed_array_type) {
+            fa_len = type_node.fixed_array_type.length;
+            const inner = type_node.fixed_array_type.element.*;
+            fa_elem = types.typeNodeToRunarType(inner);
+            if (inner == .fixed_array_type) {
+                fa_nested_len = inner.fixed_array_type.length;
+            }
+        }
+
         return .{
             .name = name_tok.text,
-            .type_info = resolveSolType(type_name),
+            .type_info = types.typeNodeToRunarType(type_node),
             .readonly = readonly,
             .initializer = initializer,
+            .fixed_array_length = fa_len,
+            .fixed_array_element = fa_elem,
+            .fixed_array_nested_length = fa_nested_len,
+        };
+    }
+
+    /// Wrap the base type (named by `type_name`) with any trailing `[N]`
+    /// bracket suffixes, producing a `TypeNode` that may be a nested
+    /// `FixedArrayType`. The first call passes a dummy base; the real
+    /// base is computed from `type_name` so we can resolve the inner
+    /// primitive lazily and avoid heap-allocating when no brackets follow.
+    fn parseSolFixedArraySuffix(self: *Parser, _: TypeNode, type_name: []const u8) TypeNode {
+        const base_runar = resolveSolType(type_name);
+        var base: TypeNode = if (base_runar == .unknown)
+            .{ .custom_type = type_name }
+        else
+            runarTypeToTypeNode(base_runar);
+        while (self.current.kind == .lbracket) {
+            _ = self.bump();
+            if (self.current.kind != .number) {
+                self.addError("FixedArray length must be a non-negative integer literal");
+                while (self.current.kind != .rbracket and self.current.kind != .eof) _ = self.bump();
+                _ = self.match(.rbracket);
+                return base;
+            }
+            const size_tok = self.bump();
+            const size = std.fmt.parseInt(u32, size_tok.text, 10) catch 0;
+            _ = self.expect(.rbracket);
+            const elem_ptr = self.allocator.create(TypeNode) catch return base;
+            elem_ptr.* = base;
+            base = .{ .fixed_array_type = .{ .element = elem_ptr, .length = size } };
+        }
+        return base;
+    }
+
+    /// Inverse of typeNodeToRunarType for the primitive subset — we need
+    /// this so the FixedArray suffix wrapper can lift a primitive RunarType
+    /// back into a TypeNode for `element` storage.
+    fn runarTypeToTypeNode(rt: RunarType) TypeNode {
+        return switch (rt) {
+            .bigint => .{ .primitive_type = .bigint },
+            .boolean => .{ .primitive_type = .boolean },
+            .byte_string => .{ .primitive_type = .byte_string },
+            .pub_key => .{ .primitive_type = .pub_key },
+            .sig => .{ .primitive_type = .sig },
+            .sha256 => .{ .primitive_type = .sha256 },
+            .ripemd160 => .{ .primitive_type = .ripemd160 },
+            .addr => .{ .primitive_type = .addr },
+            .sig_hash_preimage => .{ .primitive_type = .sig_hash_preimage },
+            .rabin_sig => .{ .primitive_type = .rabin_sig },
+            .rabin_pub_key => .{ .primitive_type = .rabin_pub_key },
+            .point => .{ .primitive_type = .point },
+            .p256_point => .{ .primitive_type = .p256_point },
+            .p384_point => .{ .primitive_type = .p384_point },
+            .void => .{ .primitive_type = .void },
+            else => .{ .custom_type = "unknown" },
         };
     }
 

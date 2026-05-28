@@ -536,6 +536,30 @@ fn mapMoveType(name: []const u8) RunarType {
     return .unknown;
 }
 
+/// Inverse of `typeNodeToRunarType` for the primitive subset. Lifts a
+/// primitive `RunarType` back into a `TypeNode` so the FixedArray inner
+/// element can carry a real recursive `TypeNode`.
+fn runarTypeToTypeNodeMove(rt: RunarType) TypeNode {
+    return switch (rt) {
+        .bigint => .{ .primitive_type = .bigint },
+        .boolean => .{ .primitive_type = .boolean },
+        .byte_string => .{ .primitive_type = .byte_string },
+        .pub_key => .{ .primitive_type = .pub_key },
+        .sig => .{ .primitive_type = .sig },
+        .sha256 => .{ .primitive_type = .sha256 },
+        .ripemd160 => .{ .primitive_type = .ripemd160 },
+        .addr => .{ .primitive_type = .addr },
+        .sig_hash_preimage => .{ .primitive_type = .sig_hash_preimage },
+        .rabin_sig => .{ .primitive_type = .rabin_sig },
+        .rabin_pub_key => .{ .primitive_type = .rabin_pub_key },
+        .point => .{ .primitive_type = .point },
+        .p256_point => .{ .primitive_type = .p256_point },
+        .p384_point => .{ .primitive_type = .p384_point },
+        .void => .{ .primitive_type = .void },
+        else => .{ .custom_type = "unknown" },
+    };
+}
+
 fn runarTypeToTypeName(t: RunarType) []const u8 {
     return types.runarTypeToString(t);
 }
@@ -763,7 +787,21 @@ const Parser = struct {
                 }
             }
 
-            const type_info = self.parseMoveTypeName();
+            const type_node = self.parseMoveTypeNode();
+            const type_info = types.typeNodeToRunarType(type_node);
+
+            // Capture FixedArray shape (outer + nested).
+            var fa_len: u32 = 0;
+            var fa_elem: RunarType = .unknown;
+            var fa_nested_len: u32 = 0;
+            if (type_node == .fixed_array_type) {
+                fa_len = type_node.fixed_array_type.length;
+                const inner = type_node.fixed_array_type.element.*;
+                fa_elem = types.typeNodeToRunarType(inner);
+                if (inner == .fixed_array_type) {
+                    fa_nested_len = inner.fixed_array_type.length;
+                }
+            }
 
             // Determine readonly based on parent class and mutability markers
             const readonly = if (parent_class == .smart_contract or parent_class == .unsafe_smart_contract)
@@ -785,6 +823,9 @@ const Parser = struct {
                 .type_info = type_info,
                 .readonly = readonly,
                 .initializer = initializer,
+                .fixed_array_length = fa_len,
+                .fixed_array_element = fa_elem,
+                .fixed_array_nested_length = fa_nested_len,
             }) catch {};
 
             _ = self.match(.comma);
@@ -843,10 +884,109 @@ const Parser = struct {
         _ = self.bump();
         var depth_count: i32 = 1;
         while (depth_count > 0 and self.current.kind != .eof) {
-            if (self.current.kind == .lt) depth_count += 1;
-            if (self.current.kind == .gt) depth_count -= 1;
+            if (self.current.kind == .lt) {
+                depth_count += 1;
+                _ = self.bump();
+                continue;
+            }
+            if (self.current.kind == .gt) {
+                depth_count -= 1;
+                _ = self.bump();
+                continue;
+            }
+            if (self.current.kind == .rshift) {
+                // `>>` closes two nested generic argument lists at once.
+                depth_count -= 2;
+                if (depth_count < 0) depth_count = 0;
+                _ = self.bump();
+                continue;
+            }
             _ = self.bump();
         }
+    }
+
+    /// Move-style type parser that returns a `TypeNode`, with full
+    /// nested `FixedArray<T, N>` support. The lexer eagerly forms `>>`
+    /// as a shift token; `consumeMoveGenericClose` splits it back into
+    /// two `>` when closing a nested generic argument list.
+    fn parseMoveTypeNode(self: *Parser) TypeNode {
+        // Handle & references — discard
+        if (self.current.kind == .ampersand) {
+            _ = self.bump();
+            _ = self.matchIdent("mut");
+        }
+
+        if (self.current.kind != .ident) {
+            self.addError("expected type name");
+            if (self.current.kind != .eof) _ = self.bump();
+            return .{ .custom_type = "unknown" };
+        }
+
+        const name_tok = self.bump();
+        var name = name_tok.text;
+
+        // Path types: module::Type — keep final component
+        while (self.current.kind == .colon_colon) {
+            _ = self.bump();
+            if (self.current.kind == .ident) {
+                name = self.bump().text;
+            }
+        }
+
+        // FixedArray<T, N> — nestable
+        if (std.mem.eql(u8, name, "FixedArray") and self.current.kind == .lt) {
+            _ = self.bump(); // <
+            const inner = self.parseMoveTypeNode();
+            _ = self.expect(.comma);
+            if (self.current.kind != .number) {
+                self.addError("FixedArray length must be a non-negative integer literal");
+                while (self.current.kind != .gt and self.current.kind != .rshift and self.current.kind != .eof) _ = self.bump();
+                self.consumeMoveGenericClose();
+                return .{ .custom_type = "FixedArray" };
+            }
+            const size_tok = self.bump();
+            const size = std.fmt.parseInt(u32, size_tok.text, 10) catch 0;
+            self.consumeMoveGenericClose();
+            const elem_ptr = self.allocator.create(TypeNode) catch return .{ .custom_type = "FixedArray" };
+            elem_ptr.* = inner;
+            return .{ .fixed_array_type = .{ .element = elem_ptr, .length = size } };
+        }
+
+        // vector<T> → ByteString (legacy)
+        if (std.mem.eql(u8, name, "vector") and self.current.kind == .lt) {
+            self.skipTypeArgs();
+            return .{ .primitive_type = .byte_string };
+        }
+
+        // Other generics: skip args
+        if (self.current.kind == .lt) {
+            self.skipTypeArgs();
+        }
+
+        const rt = mapMoveType(name);
+        if (rt == .unknown) return .{ .custom_type = name };
+        return runarTypeToTypeNodeMove(rt);
+    }
+
+    /// Close a generic-argument list. Accepts either a plain `>` or splits
+    /// a `>>` shift token in place into two `>`.
+    fn consumeMoveGenericClose(self: *Parser) void {
+        if (self.current.kind == .gt) {
+            _ = self.bump();
+            return;
+        }
+        if (self.current.kind == .rshift) {
+            // Mutate the current `>>` into `>` in place so the outer
+            // close consumes the remaining half.
+            self.current = .{
+                .kind = .gt,
+                .text = ">",
+                .line = self.current.line,
+                .col = self.current.col + 1,
+            };
+            return;
+        }
+        _ = self.expect(.gt);
     }
 
     // ---- Function parsing ----

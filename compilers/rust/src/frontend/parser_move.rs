@@ -497,6 +497,27 @@ impl<'a> MoveParser<'a> {
         t
     }
 
+    /// Close a generic-argument list. Accepts either a plain `>` or splits
+    /// a `>>` shift token in place into two `>` so an enclosing close can
+    /// consume the remaining half.
+    fn consume_generic_close(&mut self) {
+        match self.peek() {
+            Token::Gt => {
+                self.advance();
+            }
+            Token::Shr => {
+                // Replace the current `>>` with a single `>` without
+                // advancing — the outer close will then consume it.
+                if let Some(slot) = self.tokens.get_mut(self.pos) {
+                    *slot = Token::Gt;
+                }
+            }
+            _ => {
+                self.expect(&Token::Gt);
+            }
+        }
+    }
+
     fn expect(&mut self, expected: &Token) -> bool {
         if self.peek() == expected {
             self.advance();
@@ -806,7 +827,9 @@ impl<'a> MoveParser<'a> {
         let name = self.expect_ident();
         let mapped = map_type_name(&name);
 
-        // Check for FixedArray<T, N>
+        // Check for FixedArray<T, N>. The lexer eagerly forms `>>` as a
+        // shift token, so we split it back into two `>` when closing a
+        // nested generic argument list (see consume_generic_close).
         if mapped == "FixedArray" || name == "FixedArray" {
             if *self.peek() == Token::Lt {
                 self.advance();
@@ -820,7 +843,7 @@ impl<'a> MoveParser<'a> {
                         0
                     }
                 };
-                self.expect(&Token::Gt);
+                self.consume_generic_close();
                 return TypeNode::FixedArray {
                     element: Box::new(element),
                     length,
