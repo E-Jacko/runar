@@ -7,10 +7,10 @@ module Runar
   module Analyzer
     # Path enumeration + per-path stack/sig analysis. See spec §7.
     module PathAnalyzer
-      # JS 32-bit signed left-shift: `1 << (n & 31)`.
-      def self.js_shift1(n)
-        1 << (n & 31)
-      end
+      # Spec v1.2 §5.1: render the path count symbolically when
+      # 2^num_branches overflows the canonical TS reference's safe-integer
+      # range.
+      LARGE_BRANCH_THRESHOLD = 53
 
       # Match IF/NOTIF/ELSE/ENDIF. Returns {branches:, findings:, structural_error:}.
       # branches: [{if_idx:, else_idx:, endif_idx:, is_notif:}]
@@ -296,23 +296,35 @@ module Runar
           return { paths: [path], findings: all_findings }
         end
 
-        requested = js_shift1(num_branches)
-        if requested > MAX_PATHS
+        use_exact_count = num_branches < LARGE_BRANCH_THRESHOLD
+        if use_exact_count
+          exact = 1 << num_branches
+          truncated = exact > MAX_PATHS
+          loop_bound = [exact, MAX_PATHS].min
+          paths_clause = "2^#{num_branches} = #{exact} paths"
+        else
+          truncated = true
+          loop_bound = MAX_PATHS
+          paths_clause = "more than 2^#{LARGE_BRANCH_THRESHOLD} paths"
+        end
+
+        if truncated
           all_findings << {
             severity: 'warning',
             code: 'PATHS_TRUNCATED',
-            message: "Script has #{num_branches} branch points (2^#{num_branches} = #{requested} paths); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths."
+            message: "Script has #{num_branches} branch points (#{paths_clause}); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths."
           }
         end
 
-        loop_bound = [requested, MAX_PATHS].min
         paths = []
         per_path_findings = []
 
         loop_bound.times do |combo|
-          # JS 32-bit shift semantics: shift count is masked to 5 bits.
-          # For numBranches >= 32, bit b with b >= 32 reads bit (b & 31).
-          choices = Array.new(num_branches) { |b| ((combo >> (b & 31)) & 1) == 1 }
+          # `combo` is bounded by MAX_PATHS = 256, so bits at positions
+          # >= 8 are mathematically always 0. Clamp to b < 31 to match
+          # the canonical TS reference, where JS `>>` would otherwise
+          # mask the shift count to 5 bits and wrap.
+          choices = Array.new(num_branches) { |b| b < 31 ? ((combo >> b) & 1) == 1 : false }
           collected = collect_path_opcodes(ops, choices)
           desc = describe_path(ops, if_indices, choices)
           findings, depth = analyze_single_path(collected, desc)

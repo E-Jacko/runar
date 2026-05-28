@@ -42,12 +42,16 @@ RSpec.describe Runar::Analyzer::PathAnalyzer do
     expect(res[:paths][1][:description]).to eq('IF[true] at 1')
   end
 
-  it 'js_shift1 implements JS 32-bit shift semantics' do
-    expect(described_class.js_shift1(0)).to eq(1)
-    expect(described_class.js_shift1(8)).to eq(256)
-    expect(described_class.js_shift1(31)).to eq(1 << 31)
-    # The trademark quirk: 785 & 31 = 17 -> 1 << 17 = 131072
-    expect(described_class.js_shift1(785)).to eq(131_072)
+  it 'renders symbolic path count for large numBranches (spec v1.2)' do
+    # Spec v1.2: numBranches >= 53 renders "more than 2^53 paths" instead
+    # of an exact decimal (would overflow JS safe-integer range).
+    # Use 53 OP_IF / OP_ENDIF pairs.
+    hex = ('6368' * 53)
+    ops = Runar::Analyzer::ScriptParser.parse(hex)
+    res = described_class.analyze(ops)
+    truncated = res[:findings].find { |f| f[:code] == 'PATHS_TRUNCATED' }
+    expect(truncated).not_to be_nil
+    expect(truncated[:message]).to include('Script has 53 branch points (more than 2^53 paths)')
   end
 
   it 'emits PATHS_TRUNCATED when requested combinations > 256' do
