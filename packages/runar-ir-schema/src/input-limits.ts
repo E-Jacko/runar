@@ -38,12 +38,12 @@ export type InputLimitsKey = keyof typeof InputLimits;
  * RangeError / SyntaxError.
  */
 export class CanonicalJsonError extends Error {
-  readonly code: 'depth' | 'bytes' | 'string-bytes' | 'circular' | 'invalid';
+  readonly code: 'depth' | 'bytes' | 'string-bytes' | 'circular' | 'invalid' | 'lone-surrogate';
   readonly limit?: number;
   readonly actual?: number;
 
   constructor(
-    code: 'depth' | 'bytes' | 'string-bytes' | 'circular' | 'invalid',
+    code: 'depth' | 'bytes' | 'string-bytes' | 'circular' | 'invalid' | 'lone-surrogate',
     message: string,
     info?: { limit?: number; actual?: number },
   ) {

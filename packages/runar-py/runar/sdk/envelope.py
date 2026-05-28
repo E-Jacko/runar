@@ -70,7 +70,18 @@ def _canonical_append(out: List[str], value: Any) -> None:
         return
     if isinstance(value, dict):
         # Sort keys by UTF-16 code-unit order to match JS default sort().
-        keys = sorted(value.keys(), key=lambda k: k.encode("utf-16-be"))
+        # `.encode('utf-16-be')` raises UnicodeEncodeError on lone surrogates;
+        # surface that as the typed canonical-JSON ValueError so callers can
+        # catch a single error class (RFC 8785 §3.2.2.2 / audit D6).
+        def _utf16be(k: str) -> bytes:
+            try:
+                return k.encode("utf-16-be")
+            except UnicodeEncodeError as e:
+                raise ValueError(
+                    f"canonical JSON: lone surrogate in object key ({e})"
+                ) from e
+
+        keys = sorted(value.keys(), key=_utf16be)
         out.append("{")
         first = True
         for k in keys:

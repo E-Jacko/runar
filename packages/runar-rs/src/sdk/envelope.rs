@@ -481,6 +481,18 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_formats_floats_per_ecma262() {
+        // Audit D5. serde_json::Value::from(f64) preserves the int-vs-float
+        // distinction; the canonical serializer must run the ECMA-262 §6.1.6.1.13
+        // Number::toString algorithm rather than relying on Rust's default
+        // Display impl.
+        assert_eq!(canonical_json(&json!({"v": 0.1})).unwrap(), r#"{"v":0.1}"#);
+        assert_eq!(canonical_json(&json!({"v": 1e21})).unwrap(), r#"{"v":1e+21}"#);
+        assert_eq!(canonical_json(&json!({"v": 1e-7})).unwrap(), r#"{"v":1e-7}"#);
+        assert_eq!(canonical_json(&json!({"v": 1e-300})).unwrap(), r#"{"v":1e-300}"#);
+    }
+
+    #[test]
     fn canonical_json_nested() {
         let out = canonical_json(&json!({
             "outer": {"z": 1, "a": [3, 2, 1]},
