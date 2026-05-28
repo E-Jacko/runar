@@ -44,6 +44,7 @@
 //! - Compound assignment desugaring (`+=`, `-=`, etc.)
 
 use num_bigint::BigInt;
+use num_traits::{Num, ToPrimitive};
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -137,7 +138,7 @@ enum Token {
 
     // Identifiers and literals
     Ident(String),
-    NumberLit(i128),
+    NumberLit(BigInt),
     StringLit(String),
 
     // Operators
@@ -317,9 +318,11 @@ fn tokenize(source: &str) -> Vec<Token> {
                 }
             }
             let val = if num_str.starts_with("0x") || num_str.starts_with("0X") {
-                i128::from_str_radix(&num_str[2..], 16).unwrap_or(0)
+                <BigInt as Num>::from_str_radix(&num_str[2..], 16)
+                    .unwrap_or_else(|_| BigInt::from(0))
             } else {
-                num_str.parse::<i128>().unwrap_or(0)
+                <BigInt as Num>::from_str_radix(&num_str, 10)
+                    .unwrap_or_else(|_| BigInt::from(0))
             };
             tokens.push(Token::NumberLit(val));
             continue;
@@ -713,7 +716,7 @@ impl<'a> ZigParser<'a> {
         if *self.peek() == Token::LBracket {
             self.advance(); // [
             let length = match self.advance() {
-                Token::NumberLit(n) => n as usize,
+                Token::NumberLit(n) => n.to_usize().unwrap_or(0),
                 _ => {
                     self.errors.push("Expected array length".to_string());
                     0
@@ -1651,7 +1654,7 @@ impl<'a> ZigParser<'a> {
         // Number literal
         if matches!(self.peek(), Token::NumberLit(_)) {
             if let Token::NumberLit(v) = self.advance() {
-                return Expression::BigIntLiteral { value: BigInt::from(v) };
+                return Expression::BigIntLiteral { value: v };
             }
         }
 
