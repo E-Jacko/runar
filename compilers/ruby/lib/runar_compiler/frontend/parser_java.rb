@@ -1753,11 +1753,9 @@ module RunarCompiler
         rescue ArgumentError
           0
         end
-        if val > INT64_MAX || val < INT64_MIN
-          # Runar script integers are 64-bit; larger values clamp to 0 to
-          # match other parsers' defensive behaviour.
-          return BigIntLiteral.new(value: 0)
-        end
+        # No int64 clamp: BigIntLiteral carries arbitrary-precision Integer
+        # values end-to-end. _make_load_const_int promotes oversize values to
+        # a `"...n"` decimal-string for cross-tier JSON round-trip parity.
         BigIntLiteral.new(value: val)
       end
     end
