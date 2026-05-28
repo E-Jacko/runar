@@ -40,6 +40,7 @@
 //! - `unless` -> if with negated condition
 //! - snake_case identifiers -> camelCase in AST
 
+use num_bigint::BigInt;
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -2095,10 +2096,10 @@ impl<'a> RbParser<'a> {
 
     fn parse_primary(&mut self) -> Expression {
         match self.advance() {
-            Token::NumberLit(v) => Expression::BigIntLiteral { value: v },
+            Token::NumberLit(v) => Expression::BigIntLiteral { value: BigInt::from(v) },
             Token::TrueLit => Expression::BoolLiteral { value: true },
             Token::FalseLit => Expression::BoolLiteral { value: false },
-            Token::NilLit => Expression::BigIntLiteral { value: 0 },
+            Token::NilLit => Expression::BigIntLiteral { value: BigInt::from(0) },
             Token::HexStringLit(v) => Expression::ByteStringLiteral { value: v },
             Token::StringLit(v) => Expression::ByteStringLiteral { value: v },
             Token::Ivar(name) => {
@@ -2143,7 +2144,7 @@ impl<'a> RbParser<'a> {
             other => {
                 self.errors
                     .push(format!("Unexpected token in expression: {:?}", other));
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             }
         }
     }

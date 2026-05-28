@@ -3,6 +3,7 @@
 //! Parses Rust-style contract definitions using a hand-written tokenizer
 //! and recursive descent parser. Produces the same AST as the TypeScript parser.
 
+use num_bigint::BigInt;
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName,
     PropertyNode, SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -1056,7 +1057,7 @@ impl RustDslParser {
             TokenType::Number(val) => {
                 self.advance_clone();
                 let n: i128 = val.parse().unwrap_or(0);
-                Expression::BigIntLiteral { value: n }
+                Expression::BigIntLiteral { value: BigInt::from(n) }
             }
             TokenType::HexString(val) => {
                 self.advance_clone();

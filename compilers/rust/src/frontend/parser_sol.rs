@@ -29,6 +29,7 @@
 //! - `!=` -> StrictNe (!==)
 //! - Types before names (Solidity convention)
 
+use num_bigint::BigInt;
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -995,7 +996,7 @@ impl<'a> SolParser<'a> {
             self.parse_expression()
         } else {
             // Type name; — declaration without initializer, default to 0
-            Expression::BigIntLiteral { value: 0 }
+            Expression::BigIntLiteral { value: BigInt::from(0) }
         };
 
         self.expect(&Token::Semicolon);
@@ -1076,7 +1077,7 @@ impl<'a> SolParser<'a> {
                 name: "_i".to_string(),
                 var_type: None,
                 mutable: true,
-                init: Expression::BigIntLiteral { value: 0 },
+                init: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             }
         };
@@ -1538,7 +1539,7 @@ impl<'a> SolParser<'a> {
 
     fn parse_primary(&mut self) -> Expression {
         match self.advance() {
-            Token::NumberLit(v) => Expression::BigIntLiteral { value: v },
+            Token::NumberLit(v) => Expression::BigIntLiteral { value: BigInt::from(v) },
             Token::HexLit(v) => Expression::ByteStringLiteral { value: v },
             Token::True => Expression::BoolLiteral { value: true },
             Token::False => Expression::BoolLiteral { value: false },
@@ -1590,7 +1591,7 @@ impl<'a> SolParser<'a> {
             other => {
                 self.errors
                     .push(Diagnostic::error(format!("Unexpected token in expression: {:?}", other), None));
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             }
         }
     }

@@ -36,6 +36,7 @@
 //! - `:=` -> VariableDecl (mutable)
 //! - standalone functions (no receiver) -> private helper methods
 
+use num_bigint::BigInt;
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -1430,7 +1431,7 @@ impl<'a> GoParser<'a> {
                 name: "_i".to_string(),
                 var_type: None,
                 mutable: true,
-                init: Expression::BigIntLiteral { value: 0 },
+                init: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: loc.clone(),
             };
             let dummy_update = Statement::ExpressionStatement {
@@ -1736,7 +1737,7 @@ impl<'a> GoParser<'a> {
         match self.current().typ.clone() {
             TokenType::Number(n) => {
                 self.advance();
-                Some(Expression::BigIntLiteral { value: n })
+                Some(Expression::BigIntLiteral { value: BigInt::from(n) })
             }
 
             TokenType::True => {

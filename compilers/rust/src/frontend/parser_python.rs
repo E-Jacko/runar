@@ -34,6 +34,7 @@
 //! - `for i in range(n):` -> ForStatement
 //! - snake_case identifiers -> camelCase in AST
 
+use num_bigint::BigInt;
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -1312,7 +1313,7 @@ impl<'a> PyParser<'a> {
             let second_arg = self.parse_expression();
             (first_arg, second_arg)
         } else {
-            (Expression::BigIntLiteral { value: 0 }, first_arg)
+            (Expression::BigIntLiteral { value: BigInt::from(0) }, first_arg)
         };
 
         self.expect(&Token::RParen);
@@ -1528,7 +1529,7 @@ impl<'a> PyParser<'a> {
             let init = if self.match_tok(&Token::Eq) {
                 self.parse_expression()
             } else {
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             };
 
             return Statement::VariableDecl {
@@ -2039,10 +2040,10 @@ impl<'a> PyParser<'a> {
 
     fn parse_primary(&mut self) -> Expression {
         match self.advance() {
-            Token::NumberLit(v) => Expression::BigIntLiteral { value: v },
+            Token::NumberLit(v) => Expression::BigIntLiteral { value: BigInt::from(v) },
             Token::TrueLit => Expression::BoolLiteral { value: true },
             Token::FalseLit => Expression::BoolLiteral { value: false },
-            Token::NoneLit => Expression::BigIntLiteral { value: 0 },
+            Token::NoneLit => Expression::BigIntLiteral { value: BigInt::from(0) },
             Token::HexStringLit(v) => Expression::ByteStringLiteral { value: v },
             Token::StringLit(v) => Expression::ByteStringLiteral { value: v },
             Token::SelfKw => {
@@ -2105,7 +2106,7 @@ impl<'a> PyParser<'a> {
             other => {
                 self.errors
                     .push(Diagnostic::error(format!("Unexpected token in expression: {:?}", other), None));
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             }
         }
     }

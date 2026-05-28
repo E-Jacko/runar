@@ -43,6 +43,7 @@
 //! - `.{ ... }` -> ArrayLiteral
 //! - Compound assignment desugaring (`+=`, `-=`, etc.)
 
+use num_bigint::BigInt;
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -1257,7 +1258,7 @@ impl<'a> ZigParser<'a> {
         } else {
             // No continue expression -- synthesize a no-op
             update = Statement::ExpressionStatement {
-                expression: Expression::BigIntLiteral { value: 0 },
+                expression: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             };
         }
@@ -1271,7 +1272,7 @@ impl<'a> ZigParser<'a> {
                 name: "__while_no_init".to_string(),
                 var_type: None,
                 mutable: true,
-                init: Expression::BigIntLiteral { value: 0 },
+                init: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             }),
             condition,
@@ -1650,7 +1651,7 @@ impl<'a> ZigParser<'a> {
         // Number literal
         if matches!(self.peek(), Token::NumberLit(_)) {
             if let Token::NumberLit(v) = self.advance() {
-                return Expression::BigIntLiteral { value: v };
+                return Expression::BigIntLiteral { value: BigInt::from(v) };
             }
         }
 
@@ -1729,7 +1730,7 @@ impl<'a> ZigParser<'a> {
 
         // Fallback
         self.advance();
-        Expression::BigIntLiteral { value: 0 }
+        Expression::BigIntLiteral { value: BigInt::from(0) }
     }
 
     fn parse_at_builtin(&mut self, name: &str) -> Expression {
