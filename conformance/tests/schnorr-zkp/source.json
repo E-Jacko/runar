@@ -1,10 +1,4 @@
 {
-  "compilers": [
-    "ts",
-    "go",
-    "python"
-  ],
-  "compilersJustification": "BUG-001 added an `assert(within(s, 1n, EC_N))` malleability gate where the upper bound is the secp256k1 group order (256 bits). Only the TS / Go / Python compilers carry an arbitrary-precision integer through parse → ANF → codegen; the Rust / Zig / Ruby / Java tiers truncate to their native int width (i128 / i64) and emit `OP_0` instead of the 32-byte little-endian EC_N push. Widening those tiers to a decimal-string-backed BigIntLiteral is a separate cross-tier refactor (tracked as follow-up). Parser-only coverage is universal — every tier parses every format cleanly.",
   "sources": {
     ".runar.ts": "../../../examples/ts/schnorr-zkp/SchnorrZKP.runar.ts",
     ".runar.sol": "../../../examples/sol/schnorr-zkp/SchnorrZKP.runar.sol",
