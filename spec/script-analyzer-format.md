@@ -283,18 +283,27 @@ including punctuation (em dashes `—` are U+2014).
   canonical formula is: `k = round_half_to_even(n * 10 / 1024) / 10`,
   rendered as `<integer>.<digit>`. (Implementations may choose any
   algorithm equivalent to JS `(n / 1024).toFixed(1)`.)
-- `PATHS_TRUNCATED`: `Script has <numBranches> branch points (2^<numBranches> = <requested> paths); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths.`
+- `PATHS_TRUNCATED`: two message forms, selected by `numBranches`:
+  - For `numBranches < 53` (an exact 2^N fits in a JS safe integer):
+    `Script has <numBranches> branch points (2^<numBranches> = <requested> paths); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths.`
+    where `<requested>` is the exact `2 ** numBranches` as a decimal
+    integer.
+  - For `numBranches >= 53`:
+    `Script has <numBranches> branch points (more than 2^53 paths); analysis truncated to the first 256. Consider reducing branching or splitting the contract into smaller spending paths.`
+    rendered with the literal phrase `more than 2^53 paths` (no
+    `<requested>` substitution). The threshold 53 matches JavaScript's
+    safe-integer bound (`Number.MAX_SAFE_INTEGER == 2^53 - 1`).
 
-  **IMPORTANT — replicating a TS reference quirk.** `<requested>` is
-  computed as `1 << numBranches` using **JavaScript 32-bit signed
-  left-shift semantics**: the shift count is masked to 5 bits (modulo 32)
-  before shifting. So for `numBranches >= 32`, `<requested>` is
-  `1 << (numBranches & 31)`, NOT a mathematically correct power of two.
-  E.g. `numBranches = 785` produces `<requested> = 131072` (because
-  `785 & 31 = 17`, and `1 << 17 = 131072`). All tiers MUST replicate
-  this exact formula — the goldens depend on it. The `<numBranches>`
-  field is the true branch count and is rendered as a normal decimal
-  integer.
+  The `<numBranches>` field is the true branch count, rendered as a
+  normal decimal integer. The finding is emitted iff the true count of
+  paths (`2^numBranches`) exceeds `MAX_PATHS = 256`, i.e. iff
+  `numBranches >= 9`.
+
+  *(Spec ≤ 1.1 specified a `1 << numBranches` formula using JS 32-bit
+  signed-shift semantics; this was a TS-reference bug that printed
+  nonsense values for large branch counts and caused the truncation
+  finding to be skipped when `numBranches & 31 < 9` AND
+  `numBranches >= 32`. Spec 1.2 drops the quirk; see §15.)*
 
 When a code's message references an opcode name, the canonical name
 (§4) is used.
@@ -369,20 +378,17 @@ script.
   enumeration stops.
 - If `numBranches == 0`: a single linear path is produced
   (`id: 0, description: "linear (no branches)", branchChoices: []`).
-- Else: enumerate `min(requestedCombinations, 256)` paths, where
-  `requestedCombinations = 1 << numBranches` using JS 32-bit
-  signed-left-shift semantics (shift count `numBranches & 31`). When
-  `requestedCombinations > 256`, emit a `PATHS_TRUNCATED` finding (see
-  §5.1 for message). Note: because of the JS-shift quirk, when
-  `numBranches >= 32`, `requestedCombinations` is a small power of two
-  (`1 << (numBranches & 31)`) that can be either above or below 256;
-  in particular, if `numBranches & 31 < 9` AND `numBranches >= 32`,
-  `requestedCombinations` is `< 256`, so the truncation finding is
-  NOT emitted even though there are millions of true paths. The
-  reference compiler's `combo` loop is bounded by
-  `min(requestedCombinations, 256)`, so the same loop bound applies
-  here. (This is a TS-reference quirk; goldens were generated against
-  it, so all tiers MUST match.)
+- Else: enumerate `min(2^numBranches, 256)` paths. Implementations
+  MUST treat `numBranches >= 9` as the truncation condition (every
+  such script has at least 512 true paths, exceeding `MAX_PATHS = 256`)
+  and unconditionally bound the `combo` loop to `MAX_PATHS = 256`
+  in that case. When the loop is bounded, emit a `PATHS_TRUNCATED`
+  finding using the message form specified in §5.1 (the exact-decimal
+  branch is used for `numBranches < 53`, the symbolic `more than 2^53`
+  branch otherwise). The `2^N` count must not be computed via 32-bit
+  shift arithmetic — use a 64-bit shift (safe up to `numBranches = 63`)
+  or BigInt; for `numBranches >= 53` no exact count is rendered, so
+  no arithmetic past the safe-integer bound is required.
 
 The choices array for path index `combo` (0..N-1) is built as:
 ```text
@@ -394,23 +400,25 @@ I.e., bit `b` of `combo` (LSB = first IF/NOTIF in source order)
 determines that branch's choice. Path id is the running index
 (`0..N-1`), and paths are emitted in this combo order.
 
-**IMPORTANT — replicating a TS reference quirk (JS 32-bit right-shift
-mask).** Mirroring the left-shift quirk in §5.1, the JavaScript `>>`
-operator masks the shift amount to 5 bits before shifting, so for
-`b >= 32` the bit extracted by `(combo >> b) & 1` is the bit at
-position `(b & 31)` — i.e. the pattern recurs every 32 positions in
-`combo`. The canonical formula all tiers MUST replicate is:
+**Bit-extraction (spec 1.2).** Since `combo < MAX_PATHS = 256`, only
+the low 8 bits of `combo` are ever non-zero. The canonical formula
+all tiers MUST use is:
 
 ```text
-choices[b] = ((combo >> (b & 31)) & 1) == 1
+choices[b] = (b < 31) ? (((combo >> b) & 1) == 1) : false
 ```
 
-In non-JS languages (Rust, Go, etc.) a raw `combo >> b` for `b >= 32`
-is undefined behavior, a panic, or a saturating zero — none of which
-match the goldens. The mask-to-5-bits is the contract. Verified by the
-`schnorr-zkp` golden (`numBranches = 514`, e.g. `combo = 1` produces
-`true` at b ∈ {0, 32, 64, …, 512}, 17 entries) and the `ec-demo`
-golden (`numBranches = 785`).
+The `b < 31` clamp avoids relying on language-specific behavior for
+out-of-range shifts (JS / Java mask the shift count to 5 bits;
+Rust panics; C is undefined). Mathematically, bits 8..(numBranches-1)
+of `combo` are zero, so the clamp does not alter any reachable choice.
+
+*(Spec ≤ 1.1 used `choices[b] = ((combo >> (b & 31)) & 1) == 1`,
+deliberately replicating the JS shift-mask quirk so that bits at
+positions ≥ 32 aliased back to bits at position `b & 31`. That made
+the per-path `branchChoices` vectors for fixtures with `numBranches
+≥ 32` (`schnorr-zkp`, `ec-demo`) artificially dense and
+non-monotonic. Spec 1.2 drops the alias; goldens were regenerated.)*
 
 ### 7.3 Path description
 
@@ -839,10 +847,26 @@ avoid them:
 
 ## 15. Version
 
-Spec version: 1.1 (2026-05-27). All goldens at
+Spec version: 1.2 (2026-05-28). All goldens at
 `conformance/analyzer/*/expected-analyzer-report.json` were produced
-under this version. Version 1.1 is a documentation-only refresh that
-patches three ambiguities surfaced by the 6 GAP-008 tier ports
-(maxStackDepth floor at 0 in §8.3 + §3.6 + §14; split-interpretation
-of `choices` in §7.4; JS 32-bit right-shift mask in §7.2). The
-analyzer output, finding codes, and goldens are unchanged from 1.0.
+under this version.
+
+**1.2 (2026-05-28).** Drops the JS-32-bit-shift quirk in `PATHS_TRUNCATED`
+arithmetic (§5.1) and path enumeration (§7.2). The `<requested>` field
+is now rendered as `2^<numBranches> = <X> paths` for
+`numBranches < 53` (exact decimal) and the symbolic phrase
+`more than 2^53 paths` for `numBranches >= 53`. Path enumeration
+correctly emits `PATHS_TRUNCATED` whenever the true count of paths
+exceeds `MAX_PATHS = 256` (the previous wrap-mod-32 formula caused
+`schnorr-zkp` — 514 branches → wrapped to 4 paths — to skip the
+finding entirely). The per-path `choices` vector is built with
+`choices[b] = (b < 31) ? ((combo >> b) & 1 == 1) : false`, removing
+the prior aliasing that made bits at positions ≥ 32 mirror bits at
+position `b & 31`. The goldens for `schnorr-zkp` and `ec-demo` are
+regenerated under this version.
+
+**1.1 (2026-05-27).** Documentation-only refresh that patched three
+ambiguities surfaced by the 6 GAP-008 tier ports (maxStackDepth floor
+at 0 in §8.3 + §3.6 + §14; split-interpretation of `choices` in §7.4;
+JS 32-bit right-shift mask in §7.2). Analyzer output, finding codes,
+and goldens were unchanged from 1.0.
