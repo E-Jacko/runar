@@ -1463,7 +1463,16 @@ test "verifySLHDSA emits sequences for every SHA2 parameter family" {
         try appendVerifySLHDSA(&list, allocator, param_key);
 
         try std.testing.expect(list.items.len > 500);
-        try std.testing.expectEqualDeep(CryptoInstruction{ .push_int = @intCast(lookupSLHParams(param_key).?.n) }, list.items[0]);
+
+        // BUG-011 prologue: toTop("sig") (OP_SWAP), OP_SIZE, push expected_sig_len,
+        // OP_EQUALVERIFY. Assert the exact-length signature guard is emitted up front
+        // for every parameter family.
+        const p = lookupSLHParams(param_key).?;
+        const expected_sig_len: i64 = @intCast(p.n + p.k * (1 + p.a) * p.n + p.d * (p.len + p.hp) * p.n);
+        try std.testing.expectEqualDeep(CryptoInstruction{ .op_name = "OP_SWAP" }, list.items[0]);
+        try std.testing.expectEqualDeep(CryptoInstruction{ .op_name = "OP_SIZE" }, list.items[1]);
+        try std.testing.expectEqualDeep(CryptoInstruction{ .push_int = expected_sig_len }, list.items[2]);
+        try std.testing.expectEqualDeep(CryptoInstruction{ .op_name = "OP_EQUALVERIFY" }, list.items[3]);
 
         var saw_equal = false;
         for (list.items) |inst| {
