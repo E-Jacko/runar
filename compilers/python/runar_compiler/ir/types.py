@@ -229,6 +229,20 @@ def _decode_value(v: ANFValue, method_name: str, binding_name: str) -> None:
             pass
 
 
+def _is_decimal_bigint_literal(s: str) -> bool:
+    """True if ``s`` is a JS-style decimal BigInt literal: optional ``-``,
+    one or more ASCII digits, and a required trailing ``n``. Mirrors the
+    discriminator used by the Go IR decoder (compilers/go/ir/types.go).
+    """
+    if len(s) < 2 or s[-1] != "n":
+        return False
+    start = 1 if s[0] == "-" else 0
+    body = s[start:-1]
+    if not body:
+        return False
+    return all("0" <= c <= "9" for c in body)
+
+
 def _decode_const_value(
     v: ANFValue, method_name: str, binding_name: str
 ) -> None:
@@ -244,8 +258,17 @@ def _decode_const_value(
         v.const_bool = raw
         return
 
-    # String (hex-encoded bytes)
+    # String. Either a JS-style oversize BigInt literal ('123...n' with the
+    # canonical 'n' suffix) or a hex-encoded ByteString literal. The 'n'
+    # suffix is the discriminator — without it the two cases are
+    # indistinguishable when the literal is all-digit (e.g. '3030' is
+    # both a valid decimal integer AND a valid hex bytestring).
     if isinstance(raw, str):
+        if _is_decimal_bigint_literal(raw):
+            int_val = int(raw[:-1])
+            v.const_big_int = int_val
+            v.const_int = int_val
+            return
         v.const_string = raw
         return
 

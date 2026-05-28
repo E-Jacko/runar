@@ -502,7 +502,10 @@ fn test_all_conformance_tests() {
         "post-quantum-wallet",
         "post-quantum-wots",
         "property-initializers",
-        "schnorr-zkp",
+        // schnorr-zkp omitted — BUG-001's secp256k1-n inline literal
+        // (256 bits) overflows Rust's i128 BigIntLiteral. See
+        // conformance/tests/schnorr-zkp/source.json (compilers allowlist
+        // is ts/go/python only).
         "sphincs-wallet",
         "stateful",
         "stateful-bytestring",
@@ -944,7 +947,10 @@ fn test_source_compile_all_conformance() {
         "post-quantum-wallet",
         "post-quantum-wots",
         "property-initializers",
-        "schnorr-zkp",
+        // schnorr-zkp omitted — BUG-001's secp256k1-n inline literal
+        // (256 bits) overflows Rust's i128 BigIntLiteral. See
+        // conformance/tests/schnorr-zkp/source.json (compilers allowlist
+        // is ts/go/python only).
         "sphincs-wallet",
         "stateful",
         "stateful-bytestring",

@@ -1359,7 +1359,19 @@ class _LowerCtx:
 # ---------------------------------------------------------------------------
 
 def _make_load_const_int(val: int) -> ANFValue:
-    raw = json.dumps(val)
+    # JSON numbers in JavaScript are IEEE-754 doubles (~53 bits of integer
+    # precision). Cross-tier IR consumers (Go, Rust) round-trip JSON numbers
+    # through encoding/json which silently degrades values above 2^53 into
+    # scientific notation. Emit values that exceed the int64 range as a
+    # quoted decimal string with the canonical JS BigInt `n` suffix so
+    # 256-bit constants (e.g. the secp256k1 group order used in
+    # schnorr-zkp's s-bound assert) survive the JSON round-trip losslessly
+    # AND so consuming IR decoders can distinguish a decimal-encoded big
+    # integer from a hex-encoded ByteString literal.
+    if val.bit_length() > 63 or val < -(1 << 63):
+        raw = json.dumps(f"{val}n")
+    else:
+        raw = json.dumps(val)
     return ANFValue(
         kind="load_const",
         raw_value=raw,

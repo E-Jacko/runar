@@ -52,7 +52,7 @@
     "post-quantum-wots": 19582,
     "private-helper-outputs": 644,
     "property-initializers": 388,
-    "schnorr-zkp": 872248,
+    "schnorr-zkp": 872289,
     "sha256-compress": 23145,
     "sha256-finalize": 69507,
     "shift-ops": 27,

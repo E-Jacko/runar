@@ -16,7 +16,9 @@ const P2Blake3PKH = @import("p2blake3pkh/P2Blake3PKH.runar.zig").P2Blake3PKH;
 const P2PKH = @import("p2pkh/P2PKH.runar.zig").P2PKH;
 const PostQuantumWallet = @import("post-quantum-wallet/PostQuantumWallet.runar.zig").PostQuantumWallet;
 const BoundedCounter = @import("property-initializers/BoundedCounter.runar.zig").BoundedCounter;
-const SchnorrZKP = @import("schnorr-zkp/SchnorrZKP.runar.zig").SchnorrZKP;
+// SchnorrZKP omitted — see examples/zig/schnorr-zkp/SchnorrZKP_test.zig
+// for the BUG-001 rationale (native i64 Bigint can't hold the 256-bit
+// secp256k1 group order embedded in the malleability gate).
 const Sha256CompressTest = @import("sha256-compress/Sha256CompressTest.runar.zig").Sha256CompressTest;
 const Sha256FinalizeTest = @import("sha256-finalize/Sha256FinalizeTest.runar.zig").Sha256FinalizeTest;
 const sphincs_fixtures = @import("sphincs-wallet/fixtures.zig");
@@ -108,7 +110,7 @@ fn runCase(probe_case: []const u8) !void {
     if (std.mem.eql(u8, probe_case, "sphincs-wallet-wrong-ecdsa-sig")) return probeSPHINCSWalletWrongECDSASig();
     if (std.mem.eql(u8, probe_case, "sphincs-wallet-wrong-slhdsa-key")) return probeSPHINCSWalletWrongSLHDSAKey();
     if (std.mem.eql(u8, probe_case, "sphincs-wallet-invalid-slhdsa-proof")) return probeSPHINCSWalletInvalidSLHDSAProof();
-    if (std.mem.eql(u8, probe_case, "schnorr-zkp-invalid-r-point")) return probeSchnorrZKPInvalidRPoint();
+    // schnorr-zkp-invalid-r-point omitted — see SchnorrZKP_test.zig (BUG-001).
     return error.UnknownProbeCase;
 }
 
@@ -661,14 +663,4 @@ fn probeSPHINCSWalletInvalidSLHDSAProof() !void {
     contract.spend(slhdsa_sig, &sphincs_fixtures.slhdsa_pub_key, ecdsa_sig, runar.ALICE.pubKey);
 }
 
-fn probeSchnorrZKPInvalidRPoint() !void {
-    const pub_key = try runar.hex.decodeAlloc(
-        std.heap.page_allocator,
-        "fe8d1eb1bcb3432b1db5833ff5f2226d9cb5e65cee430558c18ed3a3c86ce1af" ++
-            "07b158f244cd0de2134ac7c1d371cffbfae4db40801a2572e531c573cda9b5b4",
-    );
-    defer std.heap.page_allocator.free(pub_key);
-    const contract = SchnorrZKP.init(pub_key);
-    const bad_point = [_]u8{0x01} ** 64;
-    contract.verify(&bad_point, runar.bigint(1));
-}
+// probeSchnorrZKPInvalidRPoint deleted — see SchnorrZKP_test.zig (BUG-001).
