@@ -227,6 +227,24 @@ module RunarCompiler
     end
     private_class_method :_decode_value
 
+    # True if +s+ is a JS-style decimal BigInt literal: optional leading
+    # +-+, one or more ASCII digits, and a REQUIRED trailing +n+ marker.
+    # Mirrors the discriminator used by compilers/go/ir/types.go and
+    # compilers/python/runar_compiler/ir/types.py. The trailing +n+ is the
+    # discriminator that separates a decimal-encoded BigInt from a hex-
+    # encoded ByteString literal (which never carries the suffix), so a
+    # hex string like "3030" is not mis-decoded as the integer 3030.
+    def self.decimal_bigint_literal?(s)
+      return false unless s.is_a?(String)
+      return false if s.length < 2 || s[-1] != "n"
+
+      start = s[0] == "-" ? 1 : 0
+      body = s[start..-2]
+      return false if body.empty?
+
+      body.each_char.all? { |c| c >= "0" && c <= "9" }
+    end
+
     def self._decode_const_value(v, method_name, binding_name)
       if v.raw_value.nil?
         raise ArgumentError,
@@ -242,8 +260,18 @@ module RunarCompiler
         return
       end
 
-      # String (hex-encoded bytes)
+      # String. Either a JS-style oversize BigInt literal ('123...n' with the
+      # canonical 'n' suffix) or a hex-encoded ByteString literal. The 'n'
+      # suffix is the discriminator -- without it the two cases are
+      # indistinguishable when the literal is all-digit (e.g. '3030' is
+      # both a valid decimal integer AND a valid hex bytestring).
       if raw.is_a?(String)
+        if decimal_bigint_literal?(raw)
+          int_val = raw[0..-2].to_i
+          v.const_big_int = int_val
+          v.const_int = int_val
+          return
+        end
         v.const_string = raw
         return
       end
