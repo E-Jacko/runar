@@ -31,16 +31,6 @@ const APPROVED_ALLOWLISTS: Record<string, string[]> = {
   'babybear-ext4': ['go'],
   'merkle-proof': ['go'],
   'state-covenant': ['go'],
-  // BUG-001: the schnorr-zkp s-bound malleability gate embeds the
-  // secp256k1 group order (256 bits) as an inline bigint literal in
-  // `assert(within(s, 1, n))`. Only TS / Go / Python currently carry
-  // an arbitrary-precision integer through parse → ANF → codegen; the
-  // Rust / Zig / Ruby / Java tiers truncate to their native int width
-  // (i128 / i64) and emit OP_0 instead of the 32-byte little-endian
-  // EC_N push. Widening those tiers to a decimal-string-backed
-  // BigIntLiteral is a separate cross-tier refactor (tracked as
-  // follow-up). Parser-only coverage stays universal.
-  'schnorr-zkp': ['ts', 'go', 'python'],
 };
 
 function listFixtureDirs(): string[] {
