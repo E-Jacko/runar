@@ -658,5 +658,150 @@ example : arithOperandBigintBool Γ_t1_smoke "f" = false := by native_decide
 example : binOpArithWellTypedBool Γ_t1_smoke "+" "a" "b" = true := by native_decide
 example : binOpArithWellTypedBool Γ_t1_smoke "+" "a" "f" = false := by native_decide
 
+/-! ## Bool reflections of the ENTRY typing predicates (WS0a Task 2)
+
+Decidable `Bool`-valued checkers for the three ENTRY-shaped predicates
+(`EntryBigintTyped`, `EntryBytesTyped`, `CondBoolTyped`), plus their `_iff`
+equivalence lemmas.  Unlike the atomic operand predicates (Task 1), these
+quantify over names via `Γ.lookup n`, so a sound checker must range over the
+binding names and test each name's CANONICAL type (`Γ.lookup b.1`), NOT the
+entry's own stored type (`b.2`).  Under shadowing those differ — e.g.
+`Γ = [("a",.bool),("a",.bigint)]` has `lookup "a" = .bool`, so
+`EntryBigintTyped` does NOT constrain `"a"`, but a `b.2`-based checker would
+(via the second entry), breaking the reverse `_iff` direction.  Testing
+`Γ.lookup b.1` ranges over exactly the names where `lookup = some ty` can
+hold (a name absent from `bindings` has `lookup = none`, making the predicate
+vacuous), so it is equivalent to the `∀`-quantified `Prop`.
+
+No `sorry`, no new `axiom`. -/
+
+/-- **Lookup-membership bridge.**  If `Γ.lookup n = some ty`, then the entry
+that `find?` returned is a member of `Γ.bindings` whose name is `n` (and whose
+stored type is `ty`).  This is the witness used to instantiate the `List.all`
+in the forward `_iff` direction; the looked-up name is exactly a binding
+name.  (Not a new axiom — a small reusable structural lemma.) -/
+theorem lookup_mem_name (Γ : TypeEnv) (n : String) (ty : ANFType)
+    (h : Γ.lookup n = some ty) :
+    ∃ e : String × ANFType, e ∈ Γ.bindings ∧ e.1 = n ∧ e.2 = ty := by
+  unfold Typed.TypeEnv.lookup at h
+  cases hf : Γ.bindings.find? (·.fst == n) with
+  | none => rw [hf] at h; simp at h
+  | some e =>
+    rw [hf] at h
+    simp only [Option.map_some, Option.some.injEq] at h
+    have hmem : e ∈ Γ.bindings := List.mem_of_find?_eq_some hf
+    have hp : ((·.fst == n) e : Bool) = true :=
+      @List.find?_some _ (·.fst == n) e Γ.bindings hf
+    have hname : e.1 = n := eq_of_beq hp
+    exact ⟨e, hmem, hname, h⟩
+
+/-- Bool reflection of `EntryBigintTyped`.  Ranges over binding names; for each
+name whose CANONICAL type is `.bigint`, requires `resolveRef` to be a
+`.vBigint`. -/
+def entryBigintTypedBool (Γ : TypeEnv) (anfSt : State) : Bool :=
+  Γ.bindings.all (fun b =>
+    !decide (Γ.lookup b.1 = some ANFType.bigint) ||
+      (match anfSt.resolveRef b.1 with | some (.vBigint _) => true | _ => false))
+
+theorem entryBigintTypedBool_iff (Γ : TypeEnv) (anfSt : State) :
+    entryBigintTypedBool Γ anfSt = true ↔ EntryBigintTyped Γ anfSt := by
+  unfold entryBigintTypedBool EntryBigintTyped
+  rw [List.all_eq_true]
+  constructor
+  · -- Bool ⇒ Prop: a `.bigint`-looked-up name is a binding name; apply `all`.
+    intro hAll n hn
+    obtain ⟨e, hmem, hename, _⟩ := lookup_mem_name Γ n .bigint hn
+    have hb := hAll e hmem
+    have hlook : Γ.lookup e.1 = some ANFType.bigint := by rw [hename]; exact hn
+    simp only [hlook, decide_true, Bool.not_true, Bool.false_or] at hb
+    rw [hename] at hb
+    split at hb
+    · next i heq => exact ⟨.vBigint i, heq, ⟨i, rfl⟩⟩
+    · exact absurd hb (by simp)
+  · -- Prop ⇒ Bool: per binding, case on whether its canonical type is `.bigint`.
+    intro hProp b _hb
+    by_cases hlook : Γ.lookup b.1 = some ANFType.bigint
+    · obtain ⟨v, hres, hbig⟩ := hProp b.1 hlook
+      obtain ⟨i, hi⟩ := hbig
+      simp only [hlook, decide_true, Bool.not_true, Bool.false_or]
+      rw [hres, hi]
+    · simp only [hlook, decide_false, Bool.not_false, Bool.true_or]
+
+/-- Bool reflection of `EntryBytesTyped`. -/
+def entryBytesTypedBool (Γ : TypeEnv) (anfSt : State) : Bool :=
+  Γ.bindings.all (fun b =>
+    !decide (Γ.lookup b.1 = some ANFType.byteString) ||
+      (match anfSt.resolveRef b.1 with | some (.vBytes _) => true | _ => false))
+
+theorem entryBytesTypedBool_iff (Γ : TypeEnv) (anfSt : State) :
+    entryBytesTypedBool Γ anfSt = true ↔ EntryBytesTyped Γ anfSt := by
+  unfold entryBytesTypedBool EntryBytesTyped
+  rw [List.all_eq_true]
+  constructor
+  · intro hAll n hn
+    obtain ⟨e, hmem, hename, _⟩ := lookup_mem_name Γ n .byteString hn
+    have hb := hAll e hmem
+    have hlook : Γ.lookup e.1 = some ANFType.byteString := by rw [hename]; exact hn
+    simp only [hlook, decide_true, Bool.not_true, Bool.false_or] at hb
+    rw [hename] at hb
+    split at hb
+    · next ba heq => exact ⟨.vBytes ba, heq, ⟨ba, rfl⟩⟩
+    · exact absurd hb (by simp)
+  · intro hProp b _hb
+    by_cases hlook : Γ.lookup b.1 = some ANFType.byteString
+    · obtain ⟨v, hres, hbytes⟩ := hProp b.1 hlook
+      obtain ⟨ba, hba⟩ := hbytes
+      simp only [hlook, decide_true, Bool.not_true, Bool.false_or]
+      rw [hres, hba]
+    · simp only [hlook, decide_false, Bool.not_false, Bool.true_or]
+
+/-- Bool reflection of `CondBoolTyped`.  Leading conjunct: the cond ref is
+declared `.bool`.  Second conjunct: every `.bool`-canonical-typed binding name
+resolves to a `.vBool`. -/
+def condBoolTypedBool (Γ : TypeEnv) (anfSt : State) (cond : String) : Bool :=
+  decide (Γ.lookup cond = some ANFType.bool) &&
+    Γ.bindings.all (fun b =>
+      !decide (Γ.lookup b.1 = some ANFType.bool) ||
+        (match anfSt.resolveRef b.1 with | some (.vBool _) => true | _ => false))
+
+theorem condBoolTypedBool_iff (Γ : TypeEnv) (anfSt : State) (cond : String) :
+    condBoolTypedBool Γ anfSt cond = true ↔ CondBoolTyped Γ anfSt cond := by
+  unfold condBoolTypedBool CondBoolTyped
+  rw [Bool.and_eq_true, decide_eq_true_iff, List.all_eq_true]
+  apply and_congr_right
+  intro _
+  constructor
+  · intro hAll n hn
+    obtain ⟨e, hmem, hename, _⟩ := lookup_mem_name Γ n .bool hn
+    have hb := hAll e hmem
+    have hlook : Γ.lookup e.1 = some ANFType.bool := by rw [hename]; exact hn
+    simp only [hlook, decide_true, Bool.not_true, Bool.false_or] at hb
+    rw [hename] at hb
+    split at hb
+    · next bb heq => exact ⟨bb, heq⟩
+    · exact absurd hb (by simp)
+  · intro hProp b _hb
+    by_cases hlook : Γ.lookup b.1 = some ANFType.bool
+    · obtain ⟨bb, hres⟩ := hProp b.1 hlook
+      simp only [hlook, decide_true, Bool.not_true, Bool.false_or]
+      rw [hres]
+    · simp only [hlook, decide_false, Bool.not_false, Bool.true_or]
+
+/-! ## WS0a Task 2 — MANDATORY smoke tests
+
+A concrete entry (`a ↦ vBigint 3`, `f ↦ vBool true`) typed by `Γ` (a:bigint,
+f:bool): the bigint-entry checker holds (the only `.bigint` name `a` resolves
+to a `.vBigint`), and the cond-bool checker holds at cond `"f"` (declared
+`.bool`, resolves to `.vBool`). -/
+
+private def Γ_t2_smoke : TypeEnv :=
+  ((Typed.TypeEnv.empty.extend "a" .bigint).extend "f" .bool)
+
+private def st_t2_smoke : State :=
+  { params := [("a", .vBigint 3), ("f", .vBool true)] }
+
+example : entryBigintTypedBool Γ_t2_smoke st_t2_smoke = true := by native_decide
+example : condBoolTypedBool Γ_t2_smoke st_t2_smoke "f" = true := by native_decide
+
 end WellTyped
 end RunarVerification.ANF
