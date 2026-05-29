@@ -39,10 +39,11 @@ Two TS return types do not have `ANFType` constructors:
   as `.bool` — the same convention used in `Typed.lean` — so the table
   remains total and downstream typing rules can assign a uniform type to
   these nodes when they do appear as bindings.
-* `'Sig[]'` / `'PubKey[]'` — used only by `checkMultiSig`. No array
-  type is modelled in the closed `ANFType` sum. `checkMultiSig` is
-  omitted from this table (124 out of 125 TS entries are present); the
-  one absent entry is documented by the `checkMultiSig_omitted` comment.
+* `'Sig[]'` / `'PubKey[]'` — used only by `checkMultiSig`. These map to
+  the recursive `ANFType.array` constructor (`.array .sig` / `.array
+  .pubKey`); the entry is present (all 125 TS entries are represented).
+  An `array_literal` ANF value is typed in `typeOfValue` to `.array τ`
+  for homogeneous element type `τ`.
 -/
 
 namespace RunarVerification.ANF.TypeCheck
@@ -51,17 +52,17 @@ open RunarVerification.ANF (ANFType)
 
 /-- Per-builtin (paramTypes, returnType). Row-for-row mirror of
 `packages/runar-compiler/src/passes/03-typecheck.ts` `BUILTIN_FUNCTIONS`
-(125 entries; 124 represented here — see module-level note for the one
-omitted entry). -/
+(125 entries, all represented here — `checkMultiSig`'s `Sig[]` / `PubKey[]`
+operands map to `ANFType.array`; see module-level note). -/
 def builtinTable : List (String × (List ANFType × ANFType)) :=
   [ -- Hashes
     ("sha256",                  ([.byteString],                                                               .sha256)),
     ("ripemd160",               ([.byteString],                                                               .ripemd160)),
     ("hash160",                 ([.byteString],                                                               .ripemd160)),
     ("hash256",                 ([.byteString],                                                               .sha256)),
-    -- Signature / preimage
+    -- Signature / preimage / multisig
     ("checkSig",                ([.sig, .pubKey],                                                             .bool)),
-    -- "checkMultiSig" omitted: params are Sig[]/PubKey[] — no array ANFType
+    ("checkMultiSig",           ([.array .sig, .array .pubKey],                                               .bool)),
     ("assert",                  ([.bool],                                                                     .bool)),
     -- Byte-string primitives
     ("len",                     ([.byteString],                                                               .bigint)),
@@ -312,9 +313,22 @@ def typeOfValue (retEnv : List (String × ANFType)) (Γ : TypeEnv) : ANFValue �
   | .addDataOutput sats scriptBytes =>
       if Γ.lookup sats == some .bigint && Γ.lookup scriptBytes == some .byteString
       then some .bool else none
-  -- Fixed-length arrays carry no scalar `ANFType` (the closed `ANFType` sum has
-  -- no array constructor — same gap as `checkMultiSig`). Left un-typeable.
-  | .arrayLiteral _ => none
+  -- A homogeneous `array_literal` of elements all of type `τ` has type
+  -- `.array τ`. Mirrors `03-typecheck.ts`'s `array_literal` rule: the element
+  -- type is taken from the first element and every other element must agree
+  -- (TS allows a subtype; Lean has no subtyping, so we require strict
+  -- equality — which holds for every conformance fixture, whose arrays are
+  -- homogeneous, e.g. `checkMultiSig`'s `Sig[]` / `PubKey[]`). An empty array
+  -- has no inferable element type and is left un-typeable (`none`).
+  | .arrayLiteral elements =>
+      match elements with
+      | []      => none
+      | e :: es =>
+          match Γ.lookup e with
+          | none   => none
+          | some τ =>
+              if es.all (fun r => Γ.lookup r == some τ)
+              then some (.array τ) else none
   | .rawScript _ _ _ => some .byteString
 
 /--
