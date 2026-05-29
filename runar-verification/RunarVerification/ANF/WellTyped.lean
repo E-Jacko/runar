@@ -1367,5 +1367,89 @@ theorem smoke_t6_final_wellTyped :
       smoke_t6_guardFree hChk smoke_t6_stateWellTyped
   exact ⟨Γ', anfSt', hChk, hEv, hStW⟩
 
+/-! ## WS0a Task 7 — Keystone soundness lemmas
+
+These two theorems are the keystone results that make the wave-33 `.vBool + int`
+divergence unreachable for well-typed programs.
+
+* `wellTyped_arith_operands_vBigint`: in a state that satisfies `StateWellTyped`,
+  a Bool-checked arith binOp's operands resolve to `.vBigint` values.
+* `wellTyped_cond_vBool`: in a state where `condBoolTypedBool` holds, the
+  condition ref resolves to a `.vBool` value.
+
+Both are small corollaries assembling lemmas already proven above.  No new axioms. -/
+
+/-- **Keystone 1 — arith operands are `.vBigint` in a well-typed state.**
+
+Given `binOpArithWellTypedBool Γ op l r = true` (the Bool-checked arith
+well-typedness from Task 1) and a well-typed runtime state `StateWellTyped Γ anfSt`
+(Task 6), both operands `l` and `r` resolve to explicit `.vBigint` values.
+
+Route: `binOpArithWellTypedBool_iff` → `binOpArithWellTyped` → both
+`arithOperandBigint` (i.e., `Γ.lookup l/r = some .bigint`) → `StateWellTyped`
+→ `ValueHasKind v .bigint` = `Value.IsBigint v` → witness `i` with `v = .vBigint i`. -/
+theorem wellTyped_arith_operands_vBigint
+    (Γ : TypeEnv) (anfSt : State) (op l r : String)
+    (hWT : binOpArithWellTypedBool Γ op l r = true)
+    (hSt : StateWellTyped Γ anfSt) :
+    (∃ a : Int, anfSt.resolveRef l = some (.vBigint a)) ∧
+    (∃ b : Int, anfSt.resolveRef r = some (.vBigint b)) := by
+  -- Step 1: translate the Bool checker to the Prop predicate.
+  have hWT' : binOpArithWellTyped Γ op l r := (binOpArithWellTypedBool_iff Γ op l r).mp hWT
+  obtain ⟨_hOp, hTL, hTR⟩ := hWT'
+  -- hTL : arithOperandBigint Γ l, i.e. Γ.lookup l = some .bigint
+  -- hTR : arithOperandBigint Γ r, i.e. Γ.lookup r = some .bigint
+  -- Step 2: left operand — apply StateWellTyped, unfold ValueHasKind, extract witness.
+  obtain ⟨vL, hResL, hvkL⟩ := hSt l .bigint hTL
+  rw [ValueHasKind_bigint] at hvkL
+  obtain ⟨a, haEq⟩ := hvkL
+  -- Step 3: right operand — same route.
+  obtain ⟨vR, hResR, hvkR⟩ := hSt r .bigint hTR
+  rw [ValueHasKind_bigint] at hvkR
+  obtain ⟨b, hbEq⟩ := hvkR
+  exact ⟨⟨a, by rw [hResL, haEq]⟩, ⟨b, by rw [hResR, hbEq]⟩⟩
+
+/-- **Keystone 2 — condition ref is `.vBool` in a cond-bool-typed state.**
+
+Given `condBoolTypedBool Γ anfSt cond = true` (the Bool-checked cond-bool
+predicate from Task 2), the condition ref `cond` resolves to an explicit `.vBool b`.
+
+Route: `condBoolTypedBool_iff` → `CondBoolTyped` → 1st conjunct gives
+`Γ.lookup cond = some .bool`; feed that to 2nd conjunct (the `∀` witnesses
+a `.vBool`) at `n := cond` to extract the `∃ b` directly. -/
+theorem wellTyped_cond_vBool
+    (Γ : TypeEnv) (anfSt : State) (cond : String)
+    (hWT : condBoolTypedBool Γ anfSt cond = true) :
+    ∃ b : Bool, anfSt.resolveRef cond = some (.vBool b) := by
+  -- Step 1: translate the Bool checker to the Prop predicate.
+  have hWT' : CondBoolTyped Γ anfSt cond := (condBoolTypedBool_iff Γ anfSt cond).mp hWT
+  obtain ⟨hLk, hRes⟩ := hWT'
+  -- hLk : Γ.lookup cond = some .bool
+  -- hRes : ∀ n, Γ.lookup n = some .bool → ∃ b, anfSt.resolveRef n = some (.vBool b)
+  -- Step 2: instantiate the universal at n := cond using its own lookup.
+  exact hRes cond hLk
+
+/-! ### Task 7 — MANDATORY smoke tests
+
+Reuse `Γ_t6_smoke`/`st_t6_smoke` (a:bigint, b:bigint) for the arith keystone,
+and `Γ_t2_smoke`/`st_t2_smoke` (a:bigint, f:bool) for the cond keystone. -/
+
+/-- **Smoke arith keystone — `wellTyped_arith_operands_vBigint` FIRES.**
+In the well-typed state `st_t6_smoke` (a=3, b=4), both operands `a` and `b`
+of `a + b` resolve to `.vBigint` values. -/
+theorem smoke_t7_arith_operands_vBigint :
+    (∃ a : Int, st_t6_smoke.resolveRef "a" = some (.vBigint a)) ∧
+    (∃ b : Int, st_t6_smoke.resolveRef "b" = some (.vBigint b)) :=
+  wellTyped_arith_operands_vBigint Γ_t6_smoke st_t6_smoke "+" "a" "b"
+    (by native_decide) smoke_t6_stateWellTyped
+
+/-- **Smoke cond keystone — `wellTyped_cond_vBool` FIRES.**
+In the well-typed state `st_t2_smoke` (f=true), the cond ref `f` (declared
+`.bool` in `Γ_t2_smoke`) resolves to a `.vBool` value. -/
+theorem smoke_t7_cond_vBool :
+    ∃ b : Bool, st_t2_smoke.resolveRef "f" = some (.vBool b) :=
+  wellTyped_cond_vBool Γ_t2_smoke st_t2_smoke "f"
+    (by native_decide)
+
 end WellTyped
 end RunarVerification.ANF
