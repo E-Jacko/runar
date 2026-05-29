@@ -72,6 +72,9 @@ open RunarVerification.ANF.WellTyped (EntryBigintTyped EntryBytesTyped StateWell
   ValueHasKind)
 open RunarVerification.ANF.Typed (TypeEnv)
 open RunarVerification.ANF.TypeCheck (TypeEnv.ofParamsProps)
+open RunarVerification.Stack.Agrees (SlotKind TaggedStackMap agreesTagged taggedStackAligned
+  untagSm lookupAnfByKind)
+open RunarVerification.Stack.Eval (StackState)
 
 /-! ## General list helpers (reusable, no axioms) -/
 
@@ -533,6 +536,157 @@ theorem mkEntryState_entryBytesTyped_noProps
   mkEntryState_entryBytesTyped [] params propsVals witness hnd
     (entryPropsWellTyped_of_noProps params propsVals witness)
 
+/-! ## Stack-side entry model — `agreesTagged` BY CONSTRUCTION
+
+This is the wave-25 *alignment* leg.  The omnibus discharge path needs,
+alongside the ANF-side well-typedness above, a **stack-side** entry: a
+concrete `StackState` whose stack mirrors the type-directed entry, plus
+the `agreesTagged` relating the two AND the `hUntag` premise the
+`arith_consume` chain consumes.
+
+`mkTsm` is the tagged stack-map for the entry: every parameter is a
+`.param` slot, in **stack order** (top = last param).  Because the
+Bitcoin Script stack pushes params in declaration order, the *top* of the
+stack is the *last*-declared param, so the stack-order list is
+`params.reverse`.
+
+`mkStackEntry` is the matching `StackState`: its `.stack` is the coerced
+param values in that same reversed order, with `props`/`outputs` shared
+with the ANF entry.  `agreesTagged_mkEntry` then proves alignment **by
+construction** — no hypothesis beyond parameter-name distinctness. -/
+
+/-- The tagged stack-map for the type-directed entry: each parameter
+becomes a `.param` slot, ordered top-of-stack-first (i.e. `params`
+reversed, since the last-declared param sits on top of the Script
+stack). -/
+def mkTsm (params : List ANFParam) : TaggedStackMap :=
+  (params.reverse).map (fun p => (p.name, SlotKind.param))
+
+/-- **`hUntag` by construction.**  Stripping the kind tags off `mkTsm`
+yields exactly `params.reverse.map (·.name)` — which is the `StackMap`
+the codegen lowers parameters to (stack order), and precisely the
+`hUntag` premise the `arith_consume` chain requires. -/
+theorem untagSm_mkTsm (params : List ANFParam) :
+    untagSm (mkTsm params) = List.reverse (params.map ANFParam.name) := by
+  unfold mkTsm
+  rw [← List.map_reverse]
+  -- `untagSm (xs.map (fun p => (p.name, .param))) = xs.map (·.name)`, here `xs = params.reverse`.
+  generalize params.reverse = xs
+  induction xs with
+  | nil => rfl
+  | cons hd tl ih => simp only [List.map_cons, untagSm]; rw [ih]
+
+/-- The matching stack-side entry `StackState`.  Its `.stack` holds the
+coerced parameter values in `mkTsm` order (reversed, top-first); `props`
+and `outputs` are shared with the ANF entry (`mkEntryState` leaves
+`outputs := []`, so the stack entry does too).  `altstack`/`preimage`
+take their structure defaults — the `SimpleANF` subset does not constrain
+them (see `Agrees.agrees` doc). -/
+def mkStackEntry (params : List ANFParam) (propsVals : List (String × Value))
+    (witness : List Value) : StackState :=
+  { stack   := (mkEntryParams params witness).reverse.map (·.2)
+    props   := propsVals
+    outputs := [] }
+
+/-! ### Alignment plumbing
+
+The general lemma `taggedStackAligned_param_self` aligns a `.param`-tagged
+map built from *any* entry-param list with the value-projection of that
+same list, given only that each slot is `lookupParam`-findable.  Both
+`mkTsm` and `mkStackEntry.stack` come from `(mkEntryParams …).reverse`, so
+they instantiate it directly. -/
+
+/-- For a fixed ANF state, if every `(n, v)` in a slot list `sub` is
+`lookupParam`-findable (`lookupParam n = some v`), then the
+`.param`-tagged map of `sub` aligns with the value-projection of `sub`.
+Pure induction on `sub`; the per-slot findability is supplied as a
+`∀ _ ∈ sub` hypothesis (so reversal of `sub` is irrelevant). -/
+theorem taggedStackAligned_param_self
+    (anfSt : State) (sub : List (String × Value))
+    (hfind : ∀ e ∈ sub, anfSt.lookupParam e.1 = some e.2) :
+    taggedStackAligned (sub.map (fun e => (e.1, SlotKind.param))) anfSt
+      (sub.map (·.2)) := by
+  induction sub with
+  | nil => exact True.intro
+  | cons hd tl ih =>
+    rw [List.map_cons, List.map_cons]
+    refine ⟨?_, ?_⟩
+    · -- head slot: `lookupAnfByKind (hd.1, .param) = lookupParam hd.1 = some hd.2`.
+      show lookupAnfByKind anfSt (hd.1, SlotKind.param) = some hd.2
+      unfold lookupAnfByKind
+      exact hfind hd (List.mem_cons_self)
+    · exact ih (fun e he => hfind e (List.mem_cons_of_mem _ he))
+
+/-- The names of `mkEntryParams params witness` are exactly
+`params.map (·.name)` (the `coerceToType` value side is irrelevant to the
+key projection). -/
+theorem mkEntryParams_map_fst (params : List ANFParam) (witness : List Value) :
+    (mkEntryParams params witness).map (·.1) = params.map ANFParam.name := by
+  unfold mkEntryParams
+  rw [List.map_map]
+  -- `((fun pi => (pi.1.name, …)) >>> (·.1)) = (·.1.name)`, then `zipIdx`'s fst-projection.
+  show (params.zipIdx.map (fun pi => pi.1.name)) = params.map ANFParam.name
+  rw [show (fun pi : ANFParam × Nat => pi.1.name)
+        = (ANFParam.name ∘ (·.1)) from rfl, ← List.map_map, List.zipIdx_map_fst]
+
+/-- Each slot of `mkEntryParams` is `lookupParam`-findable in the entry
+state, given distinct parameter names.  (`find?` is unique under the
+`Nodup` key projection.) -/
+theorem lookupParam_mkEntryState_of_mem
+    {params : List ANFParam} {propsVals : List (String × Value)} {witness : List Value}
+    (hnd : (params.map ANFParam.name).Nodup)
+    {e : String × Value} (hmem : e ∈ mkEntryParams params witness) :
+    (mkEntryState params propsVals witness).lookupParam e.1 = some e.2 := by
+  unfold State.lookupParam mkEntryState
+  -- `find? (·.fst == e.1)` over `mkEntryParams` hits `e` (membership + nodup keys).
+  have hndKeys : ((mkEntryParams params witness).map Prod.fst).Nodup := by
+    show ((mkEntryParams params witness).map (·.1)).Nodup
+    rw [mkEntryParams_map_fst]; exact hnd
+  have hpair : e = (e.1, e.2) := rfl
+  rw [find_eq_of_mem_nodup_fst (mkEntryParams params witness) e.1 e.2 (hpair ▸ hmem) hndKeys]
+  rfl
+
+/-! ### The headline — `agreesTagged` by construction -/
+
+/-- **Headline — the stack-side entry agrees with the ANF entry BY
+CONSTRUCTION.**
+
+Under parameter-name distinctness, the type-directed ANF entry
+`mkEntryState` and the matching stack entry `mkStackEntry` satisfy
+`agreesTagged (mkTsm params)`: the tagged param-stack aligns positionally,
+and `props`/`outputs` coincide (both sides share those fields).  No
+hypothesis on the witness or on agreement is needed — alignment is fixed
+by the shared construction over `(mkEntryParams …).reverse`. -/
+theorem agreesTagged_mkEntry
+    (params : List ANFParam) (propsVals : List (String × Value)) (witness : List Value)
+    (hnd : (params.map ANFParam.name).Nodup) :
+    agreesTagged (mkTsm params) (mkEntryState params propsVals witness)
+      (mkStackEntry params propsVals witness) := by
+  refine ⟨?_, rfl, rfl⟩
+  -- Alignment: rewrite `mkTsm` and the stack as `.param`-map / value-map of
+  -- the SAME list `sub = (mkEntryParams …).reverse`, then apply the general lemma.
+  show taggedStackAligned (mkTsm params) (mkEntryState params propsVals witness)
+    ((mkStackEntry params propsVals witness).stack)
+  unfold mkStackEntry
+  show taggedStackAligned (mkTsm params) (mkEntryState params propsVals witness)
+    ((mkEntryParams params witness).reverse.map (·.2))
+  -- `mkTsm params = (mkEntryParams …).reverse.map (fun e => (e.1, .param))`.
+  have hTsm : mkTsm params
+      = (mkEntryParams params witness).reverse.map (fun e => (e.1, SlotKind.param)) := by
+    unfold mkTsm
+    -- Pull `reverse` outside both maps, then compare the un-reversed maps.
+    rw [List.map_reverse, List.map_reverse]
+    congr 1
+    -- `params.map (fun p => (p.name, .param)) = (mkEntryParams …).map (fun e => (e.1, .param))`.
+    rw [show (fun e : String × Value => (e.1, SlotKind.param))
+          = (fun n : String => (n, SlotKind.param)) ∘ (·.1) from rfl,
+        ← List.map_map, mkEntryParams_map_fst, List.map_map]
+    rfl
+  rw [hTsm]
+  exact taggedStackAligned_param_self (mkEntryState params propsVals witness)
+    ((mkEntryParams params witness).reverse)
+    (fun e he => lookupParam_mkEntryState_of_mem hnd (List.mem_reverse.mp he))
+
 /-! ## MANDATORY smoke tests
 
 A concrete stateless contract: params `a : bigint`, `f : bool`, and a raw
@@ -584,5 +738,25 @@ the WRONG kind, `coerceToType .bigint` still yields a `.vBigint` (here the
 fallback `0`, since `(.vBool true).asInt? = none`).  This is exactly why
 `EntryBigintTyped` is a theorem and not a hope about the witness. -/
 example : coerceToType .bigint (.vBool true) = .vBigint 0 := rfl
+
+/-- **Smoke — `agreesTagged` holds via the by-construction theorem.**  On
+the real smoke params/witness, the type-directed ANF entry and the
+matching stack entry agree under `mkTsm smokeParams` — proved THROUGH
+`agreesTagged_mkEntry`, not re-asserted. -/
+theorem smoke_agreesTagged_mkEntry :
+    agreesTagged (mkTsm smokeParams) (mkEntryState smokeParams [] smokeWitness)
+      (mkStackEntry smokeParams [] smokeWitness) :=
+  agreesTagged_mkEntry smokeParams [] smokeWitness smoke_params_nodup
+
+/-- **Smoke — `hUntag` holds concretely.**  `untagSm (mkTsm smokeParams)`
+reduces to the reversed parameter-name list `["f", "a"]`, confirming the
+`untagSm_mkTsm` shape fires on real data (the stack-order `StackMap`). -/
+example : untagSm (mkTsm smokeParams) = ["f", "a"] := by decide
+
+/-- **Smoke — the stack entry is non-vacuous.**  Its stack carries the two
+coerced param values in stack order (top = last param `f`'s flag, then
+`a`'s number).  This is what `agreesTagged` aligns `mkTsm` against. -/
+example : (mkStackEntry smokeParams [] smokeWitness).stack
+    = [.vBool true, .vBigint 7] := rfl
 
 end RunarVerification.ANF.EntryModel
