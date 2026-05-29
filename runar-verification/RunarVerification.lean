@@ -28,6 +28,7 @@ import RunarVerification.Stack.AgreesEC
 import RunarVerification.Stack.OutputTrace
 import RunarVerification.Stack.Peephole
 import RunarVerification.Stack.TxContext
+import RunarVerification.Stack.StatefulBridge
 import RunarVerification.Stack.NumEncoding
 import RunarVerification.Stack.BabyBear
 import RunarVerification.Stack.Blake3

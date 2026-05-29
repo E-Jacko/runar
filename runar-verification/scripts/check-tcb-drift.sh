@@ -20,7 +20,21 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=73        # Breakdown (2026-05-26, Tier 3 EC wave —
+TARGET_AXIOMS=74        # +1 (2026-05-30, WS0a/T8 — the BIP-143
+                        # preimage⟷signature bridge
+                        # `checkPreimage_iff_checkSig_under_validTxContext`
+                        # in Stack/StatefulBridge.lean: ONE new CRYPTO
+                        # assumption (sibling of authBackend / preimageBackend),
+                        # NOT a codegen-soundness axiom. It RETIRES the §11.6
+                        # split-backend wall for the stateful prologue —
+                        # equating the AUTH backend's synthetic-key
+                        # OP_CHECKSIGVERIFY verdict with the PREIMAGE backend's
+                        # verdict under a valid BIP-143 context, the
+                        # external-primitive agreement the stateful-prologue
+                        # `successAgrees` correspondence needs. See
+                        # TRUST_MANIFEST.md §3.
+                        #
+                        # Prior breakdown (2026-05-26, Tier 3 EC wave —
                         # emitEcAdd codegen-to-spec axiom discharge, the LAST
                         # in-scope EC straight-line op):
                         # −1 in Crypto/Spec.lean §7 — `emitEcAdd_runOps_eq`
