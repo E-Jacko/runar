@@ -283,6 +283,17 @@ def typeOfValue (retEnv : List (String × ANFType)) (Γ : TypeEnv) : ANFValue �
       | some .bool   => if op == "!" then some .bool else none
       | _            => none
   | .call func args =>
+      -- `super(...)` is special-cased exactly as in `03-typecheck.ts`
+      -- (`checkCallExpr`): a constructor's `super(...)` call is NOT matched
+      -- against any signature — a separate validator guarantees it passes all
+      -- properties. The TS checker only `inferExprType`s each argument (i.e.
+      -- requires each arg to be in scope) and returns `VOID`. We mirror that:
+      -- every arg ref must resolve in `Γ`, and the result is `.bool` (the
+      -- file's void convention). This is the only ANF `.call` whose `func` is
+      -- not a `BUILTIN_FUNCTIONS` entry.
+      if func == "super" then
+        if args.all (fun r => (Γ.lookup r).isSome) then some .bool else none
+      else
       match builtinSig func with
       | some (ptys, rty) =>
           if args.map Γ.lookup == ptys.map some then some rty else none
@@ -462,3 +473,27 @@ def smokeIllTyped : ANFProgram :=
 
 example : RunarVerification.ANF.TypeCheck.programWellTypedBool smokeWellTyped = true := by native_decide
 example : RunarVerification.ANF.TypeCheck.programWellTypedBool smokeIllTyped = false := by native_decide
+
+open RunarVerification.ANF in
+/-- A program with a `constructor` that calls `super(...)` with an in-scope
+property value — mirrors the canonical conformance shape (e.g. `arithmetic`).
+`super` type-checks unconditionally (returns the `.bool` void marker) without
+matching its argument against any signature. -/
+def smokeSuper : ANFProgram :=
+  { contractName := "Ctor"
+  , properties := [⟨"target", .bigint, false, none⟩]
+  , methods :=
+      [ { name := "constructor"
+        , params := [⟨"target", .bigint⟩]
+        , body :=
+            [ ANFBinding.mk "t0" (.loadProp "target")
+            , ANFBinding.mk "t1" (.call "super" ["t0"]) ]
+        , isPublic := true } ] }
+
+example : RunarVerification.ANF.TypeCheck.programWellTypedBool smokeSuper = true := by native_decide
+-- `super` with an out-of-scope argument is rejected (the arg-in-scope check,
+-- the analog of the TS `inferExprType(arg)`, fails).
+example :
+    RunarVerification.ANF.TypeCheck.typeOfValue []
+      RunarVerification.ANF.Typed.TypeEnv.empty
+      (.call "super" ["nope"]) = none := by native_decide
