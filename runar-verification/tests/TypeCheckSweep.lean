@@ -108,20 +108,19 @@ partial def firstFailure (retEnv : List (String × ANFType)) (Γ : TypeEnv) :
           match firstFailure retEnv Γ elseBranch with
           | some f => some f
           | none =>
-            -- Both branches type-check internally; replicate the join rule.
+            -- Both branches type-check internally; replicate the (relaxed)
+            -- if-as-statement join: no branch-type agreement required, bind the
+            -- if-name to THEN's last type (then ELSE, then `.bool`).
             match checkBody retEnv Γ thenBranch, checkBody retEnv Γ elseBranch with
             | some envT, some envE =>
                 let τThen := match thenBranch.getLast? with
                   | some b => envT.lookup b.name
-                  | none   => some .bool
+                  | none   => none
                 let τElse := match elseBranch.getLast? with
                   | some b => envE.lookup b.name
-                  | none   => some .bool
-                match τThen, τElse with
-                | some t, some e =>
-                    if t == e then firstFailure retEnv (Γ.extend name t) rest
-                    else some (name, "if (branch types disagree)")
-                | _, _ => some (name, "if (branch result un-typeable)")
+                  | none   => none
+                let τIf := τThen.orElse (fun _ => τElse) |>.getD .bool
+                firstFailure retEnv (Γ.extend name τIf) rest
             | _, _ => some (name, "if (branch failed to check)")
     | .loop _count body iterVar =>
         match firstFailure retEnv (Γ.extend iterVar .bigint) body with
