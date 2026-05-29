@@ -1,5 +1,6 @@
 import RunarVerification.ANF.WellTyped
 import RunarVerification.ANF.TypeCheck   -- for TypeEnv.ofParamsProps
+import RunarVerification.Stack.AgreesA3  -- piece 2b: entryTsmArithTyped / tsmCoherent / taggedAllBigint
 
 /-!
 # ANF IR — Type-directed entry model (WS0a Task 8, piece 1)
@@ -73,7 +74,8 @@ open RunarVerification.ANF.WellTyped (EntryBigintTyped EntryBytesTyped StateWell
 open RunarVerification.ANF.Typed (TypeEnv)
 open RunarVerification.ANF.TypeCheck (TypeEnv.ofParamsProps)
 open RunarVerification.Stack.Agrees (SlotKind TaggedStackMap agreesTagged taggedStackAligned
-  untagSm lookupAnfByKind)
+  untagSm lookupAnfByKind entryTsmArithTyped tsmCoherent taggedAllBigint
+  taggedAllBigint_of_entryTyped)
 open RunarVerification.Stack.Eval (StackState)
 
 /-! ## General list helpers (reusable, no axioms) -/
@@ -687,6 +689,139 @@ theorem agreesTagged_mkEntry
     ((mkEntryParams params witness).reverse)
     (fun e he => lookupParam_mkEntryState_of_mem hnd (List.mem_reverse.mp he))
 
+/-! ## Type-directed `entryTsmArithTyped` + `tsmCoherent` BY CONSTRUCTION
+    (WS0a Task 8, piece 2b)
+
+The wave-35 deliverable `successAgrees_arith_consume_unconditional`
+(`Stack/AgreesA3.lean`) consumes, alongside the `agreesTagged` /
+`hUntag` legs proved above, two further entry premises:
+
+* `Agrees.entryTsmArithTyped Γ tsm` — every slot of the entry tagged
+  stack-map is declared `.bigint` in `Γ` (the structural arith-rule
+  side), and
+* `Agrees.tsmCoherent anfSt tsm` — every slot reads the same value
+  through its kind-specific `lookupAnfByKind` as through the
+  evaluator's `resolveRef` (SSA head-correspondence).
+
+This section discharges BOTH for the type-directed entry built by
+`mkEntryState` / `mkTsm`, closing the last two §11.5-wall entry premises.
+
+The single subtlety the task flagged — `resolveRef = lookupParam` at
+entry — is resolved structurally from `State.resolveRef`'s definition
+(`lookupBinding <|> lookupParam <|> lookupProp`): `mkEntryState` sets
+ONLY `params`/`props`, so `bindings = []` (the structure default),
+whence `lookupBinding n = none` and `resolveRef n = lookupParam n <|>
+lookupProp n`.  For a parameter name `lookupParam` ALREADY succeeds
+(`lookupParam_mkEntryState_of_mem`), so the `<|>` short-circuits to
+`lookupParam` — params win over props *because the param leg resolves*,
+NOT by any disjointness assumption.  Hence NO prop/param disjointness
+hypothesis is needed even if a property shares a parameter's name. -/
+
+/-- Membership in `mkTsm params` is exactly a `.param`-tagged parameter
+name: `s ∈ mkTsm params ↔ ∃ p ∈ params, s = (p.name, .param)`.  (The
+internal `params.reverse` is erased by `List.mem_reverse`.) -/
+theorem mem_mkTsm {params : List ANFParam} {s : String × SlotKind}
+    (hs : s ∈ mkTsm params) :
+    ∃ p : ANFParam, p ∈ params ∧ s = (p.name, SlotKind.param) := by
+  unfold mkTsm at hs
+  rw [List.mem_map] at hs
+  obtain ⟨p, hpMem, hpe⟩ := hs
+  exact ⟨p, List.mem_reverse.mp hpMem, hpe.symm⟩
+
+/-- **`resolveRef = lookupParam` at entry (for a parameter).**  Because
+`mkEntryState` has no bindings, and a parameter name resolves under
+`lookupParam`, the evaluator's `resolveRef` returns exactly the param
+slot — regardless of any property of the same name (the param `<|>` leg
+short-circuits before the prop leg is consulted). -/
+theorem resolveRef_eq_lookupParam_mkEntryState
+    {params : List ANFParam} {propsVals : List (String × Value)} {witness : List Value}
+    (hnd : (params.map ANFParam.name).Nodup)
+    {p : ANFParam} (hp : p ∈ params) :
+    (mkEntryState params propsVals witness).resolveRef p.name
+      = (mkEntryState params propsVals witness).lookupParam p.name := by
+  -- `p` keys a concrete slot of `mkEntryParams`, so `lookupParam p.name = some _`.
+  obtain ⟨i, hpi⟩ := mem_zipIdx_of_mem params p 0 hp
+  have hMemMk : (p.name, coerceToType p.type (witness.getD i default))
+      ∈ mkEntryParams params witness := by
+    unfold mkEntryParams; rw [List.mem_map]; exact ⟨(p, i), hpi, rfl⟩
+  have hLP : (mkEntryState params propsVals witness).lookupParam p.name
+      = some (coerceToType p.type (witness.getD i default)) :=
+    lookupParam_mkEntryState_of_mem hnd hMemMk
+  -- Both sides equal `some (coerceToType …)`: the RHS by `hLP`; the LHS because
+  -- `mkEntryState` has empty `bindings`, so `lookupBinding = none` and the
+  -- `none <|> some _ <|> _` of `resolveRef` reduces (definitionally) to `some _`.
+  rw [hLP]
+  show (mkEntryState params propsVals witness).resolveRef p.name
+    = some (coerceToType p.type (witness.getD i default))
+  unfold State.resolveRef State.lookupBinding mkEntryState
+  -- `lookupBinding` over `[]` is `none`; rewriting the param leg via `hLP` then
+  -- collapses the orElse chain by `rfl`.
+  simp only [List.find?_nil, Option.map_none]
+  show (none <|> (mkEntryState params propsVals witness).lookupParam p.name <|>
+      (mkEntryState params propsVals witness).lookupProp p.name)
+    = some (coerceToType p.type (witness.getD i default))
+  rw [hLP]; rfl
+
+/-- **Piece 2b (1) — `entryTsmArithTyped` by construction.**  When every
+parameter is declared `.bigint`, the type-directed entry's tagged
+stack-map `mkTsm params` is `entryTsmArithTyped` over the method's typing
+context `ofParamsProps props params`: each slot `(p.name, .param)` looks
+up to `some .bigint` (via `ofParamsProps_lookup_param` + the all-bigint
+hypothesis).  This is the structural arith-rule premise the wave-35
+deliverable consumes. -/
+theorem entryTsmArithTyped_mkEntry
+    (props : List ANFProperty) (params : List ANFParam)
+    (hnd : (params.map ANFParam.name).Nodup)
+    (hAllBigint : ∀ p ∈ params, p.type = ANFType.bigint) :
+    entryTsmArithTyped (TypeEnv.ofParamsProps props params) (mkTsm params) := by
+  intro s hs
+  obtain ⟨p, hp, hse⟩ := mem_mkTsm hs
+  -- `arithOperandBigint Γ s.fst` is `Γ.lookup s.fst = some .bigint`; `s.fst = p.name`.
+  show (TypeEnv.ofParamsProps props params).lookup s.fst = some ANFType.bigint
+  rw [hse]
+  show (TypeEnv.ofParamsProps props params).lookup p.name = some ANFType.bigint
+  rw [ofParamsProps_lookup_param props params hnd hp, hAllBigint p hp]
+
+/-- **Piece 2b (2) — `tsmCoherent` by construction.**  The type-directed
+entry's tagged stack-map is coherent with the entry state: every slot
+`(p.name, .param)` reads the same value through `lookupAnfByKind` (which
+IS `lookupParam` for a `.param` slot) as through `resolveRef`
+(`resolveRef_eq_lookupParam_mkEntryState`).  No hypothesis beyond
+parameter-name distinctness — in particular NO prop/param disjointness,
+since the param leg of `resolveRef` short-circuits. -/
+theorem tsmCoherent_mkEntry
+    (props : List ANFProperty) (params : List ANFParam)
+    (propsVals : List (String × Value)) (witness : List Value)
+    (hnd : (params.map ANFParam.name).Nodup) :
+    tsmCoherent (mkEntryState params propsVals witness) (mkTsm params) := by
+  intro s hs
+  obtain ⟨p, hp, hse⟩ := mem_mkTsm hs
+  subst hse
+  -- `lookupAnfByKind (p.name, .param) = lookupParam p.name`; equate to `resolveRef`.
+  show lookupAnfByKind (mkEntryState params propsVals witness) (p.name, SlotKind.param)
+    = (mkEntryState params propsVals witness).resolveRef p.name
+  unfold lookupAnfByKind
+  exact (resolveRef_eq_lookupParam_mkEntryState hnd hp).symm
+
+/-- **Piece 2b (3) — corollary: `taggedAllBigint` at the type-directed
+entry.**  Composing piece-1 `mkEntryState_entryBigintTyped_noProps` (the
+`EntryBigintTyped` leg, unconditional for a stateless contract) with the
+two premises above through `Agrees.taggedAllBigint_of_entryTyped` yields
+the whole entry tagged stack-map's `.vBigint` invariant — exactly what
+the wave-35 inner walk needs DERIVED rather than assumed.  Holds for an
+all-bigint-param stateless entry, given only parameter-name
+distinctness. -/
+theorem taggedAllBigint_mkEntry_noProps
+    (params : List ANFParam) (propsVals : List (String × Value)) (witness : List Value)
+    (hnd : (params.map ANFParam.name).Nodup)
+    (hAllBigint : ∀ p ∈ params, p.type = ANFType.bigint) :
+    taggedAllBigint (mkEntryState params propsVals witness) (mkTsm params) :=
+  taggedAllBigint_of_entryTyped (TypeEnv.ofParamsProps [] params)
+    (mkEntryState params propsVals witness) (mkTsm params)
+    (mkEntryState_entryBigintTyped_noProps params propsVals witness hnd)
+    (tsmCoherent_mkEntry [] params propsVals witness hnd)
+    (entryTsmArithTyped_mkEntry [] params hnd hAllBigint)
+
 /-! ## MANDATORY smoke tests
 
 A concrete stateless contract: params `a : bigint`, `f : bool`, and a raw
@@ -758,5 +893,56 @@ coerced param values in stack order (top = last param `f`'s flag, then
 `a`'s number).  This is what `agreesTagged` aligns `mkTsm` against. -/
 example : (mkStackEntry smokeParams [] smokeWitness).stack
     = [.vBool true, .vBigint 7] := rfl
+
+/-! ### Piece 2b smokes
+
+`entryTsmArithTyped` REQUIRES every param `.bigint`, so it does NOT hold
+for `smokeParams` (the `f : bool` param fails the arith rule).  We use an
+all-bigint params list `bigintSmokeParams = [a : bigint, b : bigint]` for
+the `entryTsmArithTyped` / `taggedAllBigint` smokes; `tsmCoherent` (a pure
+resolution fact, type-agnostic) fires on the existing `smokeParams`. -/
+
+/-- All-bigint smoke params: `a : bigint`, `b : bigint` (distinct names). -/
+private def bigintSmokeParams : List ANFParam :=
+  [⟨"a", .bigint⟩, ⟨"b", .bigint⟩]
+
+/-- All-bigint smoke witness. -/
+private def bigintSmokeWitness : List Value :=
+  [.vBigint 7, .vBigint 9]
+
+/-- The all-bigint smoke params have distinct names. -/
+theorem bigint_smoke_params_nodup : (bigintSmokeParams.map ANFParam.name).Nodup := by decide
+
+/-- Every all-bigint smoke param is declared `.bigint`. -/
+theorem bigint_smoke_allBigint :
+    ∀ p ∈ bigintSmokeParams, p.type = ANFType.bigint := by decide
+
+/-- **Smoke — `entryTsmArithTyped` holds via the by-construction theorem.**
+Every slot of `mkTsm bigintSmokeParams` is declared `.bigint` in
+`ofParamsProps [] bigintSmokeParams` — proved THROUGH
+`entryTsmArithTyped_mkEntry`, not re-asserted. -/
+theorem smoke_entryTsmArithTyped :
+    entryTsmArithTyped (TypeEnv.ofParamsProps [] bigintSmokeParams)
+      (mkTsm bigintSmokeParams) :=
+  entryTsmArithTyped_mkEntry [] bigintSmokeParams bigint_smoke_params_nodup
+    bigint_smoke_allBigint
+
+/-- **Smoke — `tsmCoherent` holds via the by-construction theorem.**  On the
+original mixed-type `smokeParams` (coherence is type-agnostic), every slot
+of `mkTsm smokeParams` reads the same value through `lookupAnfByKind` as
+through `resolveRef` — proved THROUGH `tsmCoherent_mkEntry`. -/
+theorem smoke_tsmCoherent :
+    tsmCoherent (mkEntryState smokeParams [] smokeWitness) (mkTsm smokeParams) :=
+  tsmCoherent_mkEntry [] smokeParams [] smokeWitness smoke_params_nodup
+
+/-- **Smoke — `taggedAllBigint` at the type-directed entry, via the
+corollary.**  The whole entry tagged stack-map resolves to `.vBigint`s,
+DERIVED (not assumed) by composing the piece-1 typed-entry with piece-2b's
+two premises through `taggedAllBigint_of_entryTyped`. -/
+theorem smoke_taggedAllBigint :
+    taggedAllBigint (mkEntryState bigintSmokeParams [] bigintSmokeWitness)
+      (mkTsm bigintSmokeParams) :=
+  taggedAllBigint_mkEntry_noProps bigintSmokeParams [] bigintSmokeWitness
+    bigint_smoke_params_nodup bigint_smoke_allBigint
 
 end RunarVerification.ANF.EntryModel
