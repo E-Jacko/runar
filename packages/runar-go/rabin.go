@@ -17,6 +17,10 @@ var (
 	rabinQ, _ = new(big.Int).SetString("1361129467683753853853498429727082846007", 10)
 )
 
+// rabinPaddingLimit mirrors the on-chain RABIN_PADDING_LIMIT used by the
+// generated Bitcoin Script, which enforces 0 <= padding < 65536 via OP_WITHIN.
+const rabinPaddingLimit = 65536
+
 // RabinTestKeyN is the Rabin modulus n = p * q, stored as raw LE bytes (ByteString).
 var RabinTestKeyN RabinPubKey
 
@@ -39,6 +43,15 @@ func rabinVerifyImpl(msg, sig, padding, pubkey []byte) bool {
 	pkInt := leBytesToBigInt(pubkey)
 
 	if pkInt.Sign() == 0 {
+		return false
+	}
+
+	// Enforce the padding bound 0 <= padding < 65536, mirroring the on-chain
+	// RABIN_PADDING_LIMIT OP_WITHIN check in the generated script. Without this,
+	// the off-chain verifier accepts a universal forgery the deployed script
+	// rejects: sig=0, padding=SHA256(msg) yields (0^2 + SHA256(msg)) mod n ==
+	// SHA256(msg) mod n for any message.
+	if padInt.Sign() < 0 || padInt.Cmp(big.NewInt(rabinPaddingLimit)) >= 0 {
 		return false
 	}
 

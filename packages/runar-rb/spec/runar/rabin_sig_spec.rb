@@ -62,6 +62,25 @@ RSpec.describe Runar::RabinSig do
       end
     end
 
+    context 'padding bound (mirrors on-chain OP_WITHIN 0..65536)' do
+      # Universal forgery: set sig = 0 and padding = SHA256(msg). Then
+      # (0^2 + SHA256(msg)) mod n == SHA256(msg) mod n is trivially true for
+      # ANY message/key. The on-chain script rejects this via OP_WITHIN, and so
+      # must the off-chain verifier. SHA256(msg) as an LE integer is ~256 bits,
+      # far above the 65536 limit.
+      it 'rejects the sig=0 / padding=SHA256(msg) forgery' do
+        sig_zero = '00000000'
+        # SHA256("hello") bytes, as the LE-interpreted padding integer.
+        forged_padding = Digest::SHA256.digest(['68656c6c6f'].pack('H*')).unpack1('H*')
+        expect(described_class.rabin_verify(MSG_HEX, sig_zero, forged_padding, PUBKEY_HEX)).to be false
+      end
+
+      it 'still accepts an honest signature with in-bounds padding' do
+        # Same valid vector as above: sig_int = 10, padding = 0, n = 209.
+        expect(described_class.rabin_verify(MSG_HEX, SIG_HEX, PADDING_HEX, PUBKEY_HEX)).to be true
+      end
+    end
+
     context 'edge cases' do
       it 'returns false for an empty (zero-byte) pubkey' do
         expect(described_class.rabin_verify(MSG_HEX, SIG_HEX, PADDING_HEX, '')).to be false

@@ -114,8 +114,49 @@ public final class MockCrypto {
         return sigs != null && pubKeys != null && sigs.length <= pubKeys.length;
     }
 
+    /**
+     * Exclusive upper bound on the Rabin {@code padding} parameter. Mirrors the
+     * on-chain {@code RABIN_PADDING_LIMIT} OP_WITHIN check
+     * ({@code compilers/java/.../codegen/Rabin.java}: {@code 0 <= padding < 65536}).
+     * Without this bound the off-chain verifier accepts a universal forgery the
+     * deployed script rejects: with {@code sig = 0} and {@code padding = SHA256(msg)},
+     * {@code (0^2 + SHA256(msg)) mod n == SHA256(msg) mod n} holds for every message.
+     */
+    private static final BigInteger RABIN_PADDING_LIMIT = BigInteger.valueOf(65536);
+
+    /**
+     * Real Rabin signature verification, mirroring the TypeScript reference
+     * runtime ({@code packages/runar-lang/src/runtime/builtins.ts:verifyRabinSig})
+     * and the Go reference ({@code packages/runar-go/rabin.go:rabinVerifyImpl}).
+     *
+     * <p>Verification equation: {@code (sig^2 + padding) mod pubkey == SHA256(msg) mod pubkey}.
+     * {@code padding} bytes are interpreted as an unsigned little-endian integer,
+     * matching Bitcoin Script's number encoding; the SHA-256 digest is likewise
+     * read as unsigned little-endian.
+     */
     public static boolean verifyRabinSig(ByteString msg, BigInteger sig, ByteString padding, BigInteger pubKey) {
-        return true;
+        if (pubKey == null || pubKey.signum() <= 0) return false;
+
+        BigInteger padBN = bytesToUnsignedLE(padding.toByteArray());
+
+        // Padding range check: 0 <= padding < 65536. Mirrors the on-chain
+        // OP_WITHIN bound and blocks the sig=0 / padding=SHA256(msg) forgery.
+        if (padBN.signum() < 0 || padBN.compareTo(RABIN_PADDING_LIMIT) >= 0) return false;
+
+        BigInteger hashBN = bytesToUnsignedLE(sha256(msg.toByteArray()));
+
+        BigInteger lhs = sig.multiply(sig).add(padBN).mod(pubKey);
+        BigInteger rhs = hashBN.mod(pubKey);
+        return lhs.equals(rhs);
+    }
+
+    /** Interprets a byte array as an unsigned little-endian integer (Rabin encoding). */
+    private static BigInteger bytesToUnsignedLE(byte[] bytes) {
+        byte[] be = new byte[bytes.length];
+        for (int i = 0; i < bytes.length; i++) {
+            be[bytes.length - 1 - i] = bytes[i];
+        }
+        return new BigInteger(1, be);
     }
 
     /**
