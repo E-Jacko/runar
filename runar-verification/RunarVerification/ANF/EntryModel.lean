@@ -418,6 +418,165 @@ theorem entryPropsWellTyped_of_noProps
   obtain ⟨q, hqmem, hqe⟩ := hmem
   exact hNotParam q (List.mem_reverse.mp hqmem) (by rw [← hename, ← hqe])
 
+/-! ## Type-directed PROPERTY slots — `EntryPropsWellTyped` BY CONSTRUCTION
+    (WS0a Task 8, props side)
+
+The param-side machinery above leaves `EntryPropsWellTyped` as an explicit
+hypothesis: the property slots `propsVals` were taken as GIVEN, so their
+well-typedness had to be assumed.  For a STATEFUL contract the on-chain
+deserialized state is itself interpreted PER DECLARED PROPERTY TYPE — a
+`bigint` property is decoded as a number, a `ByteString` property as
+bytes, exactly as for parameters.  We model that decode with the SAME
+`coerceToType` and DISCHARGE `EntryPropsWellTyped` by construction.
+
+`mkEntryProps` mirrors `mkEntryParams`: each declared property is zipped
+with the `coerceToType`-decode of the corresponding `stateWitness` value.
+The headline `entryPropsWellTyped_mkEntryProps` then proves the props-side
+obligation outright (no hypothesis on the witness), so the props-bearing
+entry headlines below need only parameter- AND property-name distinctness
+— no free well-typedness premise survives even for stateful contracts. -/
+
+/-- Build the type-directed PROPERTY slots from the declared `props` and a
+raw `stateWitness` value list.  Property `i` gets `coerceToType
+props[i].type (stateWitness[i])`, with a `default` raw value when the
+witness is shorter than the property list.  Mirror of `mkEntryParams`. -/
+def mkEntryProps (props : List ANFProperty) (stateWitness : List Value) :
+    List (String × Value) :=
+  props.zipIdx.map
+    (fun pi => (pi.1.name, coerceToType pi.1.type (stateWitness.getD pi.2 default)))
+
+/-- The names of `mkEntryProps props sw` are exactly `props.map (·.name)`
+(the `coerceToType` value side is irrelevant to the key projection).
+Mirror of `mkEntryParams_map_fst`. -/
+theorem mkEntryProps_map_fst (props : List ANFProperty) (stateWitness : List Value) :
+    (mkEntryProps props stateWitness).map (·.1) = props.map ANFProperty.name := by
+  unfold mkEntryProps
+  rw [List.map_map]
+  show (props.zipIdx.map (fun pi => pi.1.name)) = props.map ANFProperty.name
+  rw [show (fun pi : ANFProperty × Nat => pi.1.name)
+        = (ANFProperty.name ∘ (·.1)) from rfl, ← List.map_map, List.zipIdx_map_fst]
+
+/-- Each slot of `mkEntryProps` is `lookupProp`-findable in the entry
+state, given distinct property names.  (`find?` is unique under the
+`Nodup` key projection.)  Mirror of `lookupParam_mkEntryState_of_mem`. -/
+theorem lookupProp_mkEntryProps_of_mem
+    {params : List ANFParam} {props : List ANFProperty}
+    {stateWitness witness : List Value}
+    (hndP : (props.map ANFProperty.name).Nodup)
+    {e : String × Value} (hmem : e ∈ mkEntryProps props stateWitness) :
+    (mkEntryState params (mkEntryProps props stateWitness) witness).lookupProp e.1
+      = some e.2 := by
+  unfold State.lookupProp mkEntryState
+  have hndKeys : ((mkEntryProps props stateWitness).map Prod.fst).Nodup := by
+    show ((mkEntryProps props stateWitness).map (·.1)).Nodup
+    rw [mkEntryProps_map_fst]; exact hndP
+  have hpair : e = (e.1, e.2) := rfl
+  rw [find_eq_of_mem_nodup_fst (mkEntryProps props stateWitness) e.1 e.2 (hpair ▸ hmem) hndKeys]
+  rfl
+
+/-- **Property-side lookup.**  A name that `ofParamsProps` looks up AND that
+is NOT a parameter name resolves to its declared PROPERTY type, and pins a
+member property `q ∈ props` carrying that name and type.  This is the
+delicate step the task flagged: `hNotParam` makes the param segment miss
+(`find?_paramSeg_none_of_not_param`), so `find?` falls to the prop segment,
+where the looked-up `(n, ty)` is a member — i.e. a property of name `n` and
+declared type `ty`. -/
+theorem ofParamsProps_lookup_prop
+    (props : List ANFProperty) (params : List ANFParam) (n : String) (ty : ANFType)
+    (hLk : (TypeEnv.ofParamsProps props params).lookup n = some ty)
+    (hNotParam : ∀ p : ANFParam, p ∈ params → p.name ≠ n) :
+    ∃ q : ANFProperty, q ∈ props ∧ q.name = n ∧ q.type = ty := by
+  -- A looked-up name is a binding member of name `n` and type `ty`.
+  obtain ⟨e, hemem, hename, hetype⟩ := WellTyped.lookup_mem_name _ n ty hLk
+  -- Split that membership across the param / prop segments of `ofParamsProps`.
+  rw [ofParamsProps_bindings, List.mem_append] at hemem
+  rcases hemem with hParamSeg | hPropSeg
+  · -- Param segment: contradicts `hNotParam` (the member's name is `n = e.1`).
+    exfalso
+    rw [List.mem_map] at hParamSeg
+    obtain ⟨p, hpMem, hpe⟩ := hParamSeg
+    have hpName : p.name = n := by rw [← hename, ← hpe]
+    exact hNotParam p (List.mem_reverse.mp hpMem) hpName
+  · -- Prop segment: the member is a property of name `n` and type `ty`.
+    rw [List.mem_map] at hPropSeg
+    obtain ⟨q, hqMem, hqe⟩ := hPropSeg
+    have hqName : q.name = n := by rw [← hename, ← hqe]
+    have hqType : q.type = ty := by rw [← hetype, ← hqe]
+    exact ⟨q, List.mem_reverse.mp hqMem, hqName, hqType⟩
+
+/-- **`resolveRef = lookupProp` at entry (for a non-parameter name).**
+Because `mkEntryState` has no bindings AND `n` is not a parameter name (so
+`lookupParam n = none`), the evaluator's `resolveRef` falls through both
+prefixes of the `<|>` chain to `lookupProp`.  Mirror — on the OTHER branch
+— of `resolveRef_eq_lookupParam_mkEntryState`. -/
+theorem resolveRef_eq_lookupProp_of_not_param
+    {params : List ANFParam} {propsVals : List (String × Value)} {witness : List Value}
+    {n : String}
+    (hNotParam : ∀ p : ANFParam, p ∈ params → p.name ≠ n) :
+    (mkEntryState params propsVals witness).resolveRef n
+      = (mkEntryState params propsVals witness).lookupProp n := by
+  -- `lookupParam n = none`: no param slot is keyed at `n` (param keys are
+  -- `params.map name`, and `hNotParam` forbids any equal to `n`).
+  have hLPnone : (mkEntryState params propsVals witness).lookupParam n = none := by
+    unfold State.lookupParam mkEntryState
+    have hfind : (mkEntryParams params witness).find? (·.fst == n) = none := by
+      rw [List.find?_eq_none]
+      intro x hx hpx
+      obtain ⟨p, raw, hpMem, hpe⟩ := mem_mkEntryParams_shape hx
+      have hxName : x.fst = p.name := by rw [hpe]
+      rw [hxName] at hpx
+      exact hNotParam p hpMem (eq_of_beq hpx)
+    rw [hfind]; rfl
+  -- bindings empty ⇒ lookupBinding = none; then the orElse chain collapses to lookupProp.
+  unfold State.resolveRef State.lookupBinding mkEntryState
+  simp only [List.find?_nil, Option.map_none]
+  show (none <|> (mkEntryState params propsVals witness).lookupParam n <|>
+      (mkEntryState params propsVals witness).lookupProp n)
+    = (mkEntryState params propsVals witness).lookupProp n
+  rw [hLPnone]; rfl
+
+/-- **The props-side headline — `EntryPropsWellTyped` BY CONSTRUCTION.**
+
+When the property slots are built type-directed by `mkEntryProps`, the
+props-side obligation is DISCHARGED outright (no hypothesis on the witness).
+For every non-parameter name `n` that `ofParamsProps` declares at type
+`ty`, the entry resolves `n` (through `lookupProp`, since `n` is not a
+param) to the `coerceToType ty`-coerced property value — whose runtime
+kind is `ty` by the master invariant `coerceToType_valueHasKind`.
+
+Proof: `n` non-param + lookup ⇒ `n` is a property of declared type `ty`
+(`ofParamsProps_lookup_prop`); that property's `mkEntryProps` slot is
+`lookupProp`-found under `hndP` (`lookupProp_mkEntryProps_of_mem`), and
+`resolveRef` reaches it because the param leg misses
+(`resolveRef_eq_lookupProp_of_not_param`).  The resolved value is
+`coerceToType ty raw`, kind `ty`. -/
+theorem entryPropsWellTyped_mkEntryProps
+    (props : List ANFProperty) (params : List ANFParam)
+    (stateWitness witness : List Value)
+    (hndP : (props.map ANFProperty.name).Nodup) :
+    EntryPropsWellTyped props params (mkEntryProps props stateWitness) witness := by
+  intro n ty hLk hNotParam
+  -- `n` is a property name with declared type `ty`.
+  obtain ⟨q, hqMem, hqName, hqType⟩ := ofParamsProps_lookup_prop props params n ty hLk hNotParam
+  -- Its type-directed slot is in `mkEntryProps`, keyed at `q.name = n`.
+  obtain ⟨i, hqi⟩ := mem_zipIdx_of_mem props q 0 hqMem
+  have hMemMk : (q.name, coerceToType q.type (stateWitness.getD i default))
+      ∈ mkEntryProps props stateWitness := by
+    unfold mkEntryProps; rw [List.mem_map]; exact ⟨(q, i), hqi, rfl⟩
+  -- `lookupProp` finds that slot (distinct property names).
+  have hLP : (mkEntryState params (mkEntryProps props stateWitness) witness).lookupProp n
+      = some (coerceToType q.type (stateWitness.getD i default)) := by
+    have := lookupProp_mkEntryProps_of_mem (params := params) (witness := witness)
+      hndP hMemMk
+    -- `e = (q.name, …)`, and `q.name = n`.
+    simpa only [hqName] using this
+  -- `resolveRef n = lookupProp n` (n is not a param), so resolveRef hits the coerced value.
+  refine ⟨coerceToType q.type (stateWitness.getD i default), ?_, ?_⟩
+  · rw [resolveRef_eq_lookupProp_of_not_param hNotParam, hLP]
+  · -- kind: `coerceToType q.type _` has kind `q.type = ty`.
+    rw [hqType] at *
+    exact coerceToType_valueHasKind ty (stateWitness.getD i default)
+
 /-! ## Headline theorems — entry well-typedness BY CONSTRUCTION
 
 The master result is `mkEntryState_stateWellTyped`: under
@@ -501,6 +660,56 @@ theorem mkEntryState_entryBytesTyped
   obtain ⟨v, hres, hvk⟩ :=
     mkEntryState_stateWellTyped props params propsVals witness hnd hProps n .byteString hLk
   exact ⟨v, hres, hvk⟩
+
+/-! ## Stateful-contract headlines (type-directed PROPERTY slots)
+
+These are the full props-bearing analogues: the property slots are built
+type-directed by `mkEntryProps`, so the props-side hypothesis is
+discharged INTERNALLY by `entryPropsWellTyped_mkEntryProps`.  Given only
+parameter-name distinctness (`hnd`) AND property-name distinctness
+(`hndP`), a stateful contract's type-directed entry is well-typed — no
+free well-typedness premise survives.  This is the props-side counterpart
+of the `_noProps` stateless corollaries below. -/
+
+/-- **Stateful `StateWellTyped` by construction.**  With type-directed
+property slots, the full method context `ofParamsProps props params` is
+satisfied given only param- and property-name distinctness. -/
+theorem mkEntryState_stateWellTyped_props
+    (props : List ANFProperty) (params : List ANFParam)
+    (stateWitness witness : List Value)
+    (hnd : (params.map ANFParam.name).Nodup)
+    (hndP : (props.map ANFProperty.name).Nodup) :
+    StateWellTyped (TypeEnv.ofParamsProps props params)
+      (mkEntryState params (mkEntryProps props stateWitness) witness) :=
+  mkEntryState_stateWellTyped props params (mkEntryProps props stateWitness) witness hnd
+    (entryPropsWellTyped_mkEntryProps props params stateWitness witness hndP)
+
+/-- **Stateful `EntryBigintTyped` by construction.**  Every
+`.bigint`-declared name — parameter OR property — resolves to a `.vBigint`
+in the type-directed stateful entry.  Discharges the props hypothesis via
+`entryPropsWellTyped_mkEntryProps`. -/
+theorem mkEntryState_entryBigintTyped_props
+    (props : List ANFProperty) (params : List ANFParam)
+    (stateWitness witness : List Value)
+    (hnd : (params.map ANFParam.name).Nodup)
+    (hndP : (props.map ANFProperty.name).Nodup) :
+    EntryBigintTyped (TypeEnv.ofParamsProps props params)
+      (mkEntryState params (mkEntryProps props stateWitness) witness) :=
+  mkEntryState_entryBigintTyped props params (mkEntryProps props stateWitness) witness hnd
+    (entryPropsWellTyped_mkEntryProps props params stateWitness witness hndP)
+
+/-- **Stateful `EntryBytesTyped` by construction.**  The `.byteString`
+analogue: every `.byteString`-declared name (param OR property) resolves
+to a `.vBytes` in the type-directed stateful entry. -/
+theorem mkEntryState_entryBytesTyped_props
+    (props : List ANFProperty) (params : List ANFParam)
+    (stateWitness witness : List Value)
+    (hnd : (params.map ANFParam.name).Nodup)
+    (hndP : (props.map ANFProperty.name).Nodup) :
+    EntryBytesTyped (TypeEnv.ofParamsProps props params)
+      (mkEntryState params (mkEntryProps props stateWitness) witness) :=
+  mkEntryState_entryBytesTyped props params (mkEntryProps props stateWitness) witness hnd
+    (entryPropsWellTyped_mkEntryProps props params stateWitness witness hndP)
 
 /-! ## Stateless-contract corollaries (no property slots)
 
@@ -944,5 +1153,96 @@ theorem smoke_taggedAllBigint :
       (mkTsm bigintSmokeParams) :=
   taggedAllBigint_mkEntry_noProps bigintSmokeParams [] bigintSmokeWitness
     bigint_smoke_params_nodup bigint_smoke_allBigint
+
+/-! ### Stateful-contract smokes (type-directed PROPERTY slots)
+
+A concrete STATEFUL contract: one parameter `a : bigint` and one property
+`count : bigint` (the canonical counter shape), with a property
+state-witness `[.vBigint 42]`.  We fire the props-bearing headline
+`mkEntryState_entryBigintTyped_props` THROUGH the by-construction
+machinery (NOT by re-asserting), and confirm the `count` PROPERTY slot
+concretely resolves to a `.vBigint` — demonstrating the props side is
+type-directed and non-vacuous (the env genuinely declares a property name
+that is NOT a parameter). -/
+
+/-- Stateful smoke params: a single `a : bigint`. -/
+private def statefulSmokeParams : List ANFParam :=
+  [⟨"a", .bigint⟩]
+
+/-- Stateful smoke properties: a single mutable `count : bigint`. -/
+private def statefulSmokeProps : List ANFProperty :=
+  [⟨"count", .bigint, false, none⟩]
+
+/-- Stateful smoke property state-witness (the deserialized `count`). -/
+private def statefulSmokeStateWitness : List Value :=
+  [.vBigint 42]
+
+/-- Stateful smoke parameter witness. -/
+private def statefulSmokeWitness : List Value :=
+  [.vBigint 7]
+
+/-- The stateful smoke params have distinct names. -/
+theorem stateful_smoke_params_nodup :
+    (statefulSmokeParams.map ANFParam.name).Nodup := by decide
+
+/-- The stateful smoke properties have distinct names. -/
+theorem stateful_smoke_props_nodup :
+    (statefulSmokeProps.map ANFProperty.name).Nodup := by decide
+
+/-- **Smoke — props-side `EntryPropsWellTyped` holds via the
+by-construction theorem.**  The `count` property (the only non-parameter
+name) is well-typed in the type-directed stateful entry — proved THROUGH
+`entryPropsWellTyped_mkEntryProps`, NOT re-asserted. -/
+theorem stateful_smoke_entryPropsWellTyped :
+    EntryPropsWellTyped statefulSmokeProps statefulSmokeParams
+      (mkEntryProps statefulSmokeProps statefulSmokeStateWitness) statefulSmokeWitness :=
+  entryPropsWellTyped_mkEntryProps statefulSmokeProps statefulSmokeParams
+    statefulSmokeStateWitness statefulSmokeWitness stateful_smoke_props_nodup
+
+/-- **Smoke — stateful `EntryBigintTyped` via the props-bearing headline.**
+Every `.bigint`-declared name — the parameter `a` AND the property `count`
+— resolves to a `.vBigint` in the type-directed stateful entry, proved
+THROUGH `mkEntryState_entryBigintTyped_props` (props hypothesis discharged
+internally). -/
+theorem stateful_smoke_entryBigintTyped :
+    EntryBigintTyped (TypeEnv.ofParamsProps statefulSmokeProps statefulSmokeParams)
+      (mkEntryState statefulSmokeParams
+        (mkEntryProps statefulSmokeProps statefulSmokeStateWitness) statefulSmokeWitness) :=
+  mkEntryState_entryBigintTyped_props statefulSmokeProps statefulSmokeParams
+    statefulSmokeStateWitness statefulSmokeWitness
+    stateful_smoke_params_nodup stateful_smoke_props_nodup
+
+/-- **Smoke — the full stateful entry is `StateWellTyped`.** -/
+theorem stateful_smoke_stateWellTyped :
+    StateWellTyped (TypeEnv.ofParamsProps statefulSmokeProps statefulSmokeParams)
+      (mkEntryState statefulSmokeParams
+        (mkEntryProps statefulSmokeProps statefulSmokeStateWitness) statefulSmokeWitness) :=
+  mkEntryState_stateWellTyped_props statefulSmokeProps statefulSmokeParams
+    statefulSmokeStateWitness statefulSmokeWitness
+    stateful_smoke_params_nodup stateful_smoke_props_nodup
+
+/-- **Smoke — the `count` PROPERTY slot concretely resolves to a
+`.vBigint`** (and the parameter `a` to its own `.vBigint`).  This is the
+non-vacuity check: the property name is genuinely present in the entry and
+carries the type-directed runtime value decoded from the state-witness. -/
+example :
+    (mkEntryState statefulSmokeParams
+        (mkEntryProps statefulSmokeProps statefulSmokeStateWitness)
+        statefulSmokeWitness).resolveRef "count" = some (.vBigint 42) ∧
+    (mkEntryState statefulSmokeParams
+        (mkEntryProps statefulSmokeProps statefulSmokeStateWitness)
+        statefulSmokeWitness).resolveRef "a" = some (.vBigint 7) := by
+  constructor <;> rfl
+
+/-- **Smoke — props are type-directed, not pass-through.**  A `count`
+state-witness of the WRONG kind (`.vBool true`) STILL coerces to a
+`.vBigint` (the fallback `0`), exactly as for parameters — so
+`EntryPropsWellTyped` is a theorem, not a hope about the deserialized
+state. -/
+example :
+    (mkEntryState statefulSmokeParams
+        (mkEntryProps statefulSmokeProps [.vBool true])
+        statefulSmokeWitness).resolveRef "count" = some (.vBigint 0) := by
+  rfl
 
 end RunarVerification.ANF.EntryModel
