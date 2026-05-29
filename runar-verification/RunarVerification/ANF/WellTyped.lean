@@ -1,6 +1,7 @@
 import RunarVerification.ANF.Syntax
 import RunarVerification.ANF.Eval
 import RunarVerification.ANF.Typed
+import RunarVerification.ANF.TypeCheck
 import RunarVerification.Stack.Agrees
 
 /-!
@@ -802,6 +803,569 @@ private def st_t2_smoke : State :=
 
 example : entryBigintTypedBool Γ_t2_smoke st_t2_smoke = true := by native_decide
 example : condBoolTypedBool Γ_t2_smoke st_t2_smoke "f" = true := by native_decide
+
+/-! ## WS0a Task 6 — Type preservation through `evalBindings` (arith fragment)
+
+This section proves **type preservation** through the big-step evaluator for
+the ARITH-relevant value fragment only:
+
+* `loadConst (.int / .bool / .bytes)`, `loadParam`, `loadProp`,
+  `loadConst (.refAlias)`,
+* `binOp` with an arithmetic op (`+ - * / %`),
+* `unaryOp` with an arith op (`-`, `~`).
+
+Preservation for the crypto / output / `ifVal` / `loop` / `methodCall`
+constructors is intentionally DEFERRED to later WS1 work — this slice is what
+unblocks the keystone (Task 7) and the WS1 arith retirement.
+
+The statement is the standard one: if a binding's value type-checks to `τ`
+under `Γ` (`TypeCheck.typeOfValue`), and the runtime state is well-typed w.r.t.
+`Γ` (`StateWellTyped`), then `evalValue` succeeds with a value of kind `τ`, and
+the post-binding state stays well-typed w.r.t. the extended environment
+`Γ.extend name τ`.
+
+No new `axiom`, no `sorry`: the proofs are by direct case analysis on the
+fragment's `ANFValue` constructors, reusing `Eval.evalBinOp` / `Eval.evalValue`
+reductions and the two `State.addBinding` lookup helpers below. -/
+
+open RunarVerification.ANF.Eval (EvalError EvalResult)
+open RunarVerification.ANF.TypeCheck (typeOfValue isArithOp)
+
+/-! ### `ValueHasKind` — the runtime-value side of a type
+
+Dispatches to the three concrete runtime kinds the arith fragment produces
+(`IsBigint` / `IsBool` / `IsBytes`); every other `ANFType` (the crypto /
+preimage / point kinds the arith fragment never produces) maps to `True`.
+This keeps the invariant minimal while remaining sound: the fragment only ever
+*reads* refs of those other types (transported verbatim through
+`StateWellTyped`) and only ever *produces* bigint / bool / bytes values. -/
+def ValueHasKind (v : Value) (ty : ANFType) : Prop :=
+  match ty with
+  | .bigint     => Value.IsBigint v
+  | .bool       => Value.IsBool v
+  | .byteString => Value.IsBytes v
+  | _           => True
+
+@[simp] theorem ValueHasKind_bigint (v : Value) :
+    ValueHasKind v .bigint = Value.IsBigint v := rfl
+@[simp] theorem ValueHasKind_bool (v : Value) :
+    ValueHasKind v .bool = Value.IsBool v := rfl
+@[simp] theorem ValueHasKind_byteString (v : Value) :
+    ValueHasKind v .byteString = Value.IsBytes v := rfl
+
+/-! ### `StateWellTyped` — the runtime state respects the typing context
+
+Every name `Γ` declares at `ty` resolves, in the runtime ANF state, to a value
+of kind `ty`.  This is the multi-type generalisation of `EntryBigintTyped`
+(which is exactly its `.bigint`-only specialisation). -/
+def StateWellTyped (Γ : TypeEnv) (anfSt : State) : Prop :=
+  ∀ name ty, Γ.lookup name = some ty →
+    ∃ v, anfSt.resolveRef name = some v ∧ ValueHasKind v ty
+
+/-! ### State-extension lemmas (the binding leg)
+
+Two small structural facts about `State.resolveRef` after `State.addBinding`.
+Not axioms — direct `simp`/`rfl` proofs over `List.find?`. -/
+
+/-- After binding `name ↦ v`, resolving `name` yields exactly `v`. -/
+theorem resolveRef_addBinding_self (s : State) (name : String) (v : Value) :
+    (s.addBinding name v).resolveRef name = some v := by
+  unfold State.resolveRef State.addBinding State.lookupBinding
+  simp only [List.find?_cons, beq_self_eq_true, Option.map_some]
+  rfl
+
+/-- After binding `name ↦ v`, resolving any other name `m ≠ name` is
+unchanged. -/
+theorem resolveRef_addBinding_ne (s : State) (name m : String) (v : Value)
+    (h : name ≠ m) :
+    (s.addBinding name v).resolveRef m = s.resolveRef m := by
+  unfold State.resolveRef State.addBinding State.lookupBinding
+  have hbeq : ((name, v).fst == m) = false := beq_false_of_ne h
+  simp only [List.find?_cons, hbeq]
+  rfl
+
+/-- **State-extension preservation.**  If the current state is well-typed under
+`Γ` and the freshly produced value `v` has kind `τ`, then after binding
+`name ↦ v` the state is well-typed under `Γ.extend name τ`.  The new name carries
+the new kind; every other name inherits `StateWellTyped Γ`. -/
+theorem stateWellTyped_addBinding
+    (Γ : TypeEnv) (anfSt : State) (name : String) (v : Value) (τ : ANFType)
+    (hSt : StateWellTyped Γ anfSt) (hVK : ValueHasKind v τ) :
+    StateWellTyped (Γ.extend name τ) (anfSt.addBinding name v) := by
+  intro m ty hLk
+  by_cases hm : name = m
+  · -- new name: lookup gives τ, resolve gives v.
+    subst hm
+    rw [Typed.TypeEnv.lookup_extend_self] at hLk
+    have hty : ty = τ := (Option.some.inj hLk).symm
+    subst hty
+    exact ⟨v, resolveRef_addBinding_self anfSt name v, hVK⟩
+  · -- other name: inherit from `hSt`.
+    rw [Typed.TypeEnv.lookup_extend_other Γ name m τ hm] at hLk
+    obtain ⟨v', hres, hvk⟩ := hSt m ty hLk
+    exact ⟨v', by rw [resolveRef_addBinding_ne anfSt name m v hm]; exact hres, hvk⟩
+
+/-! ### The arith fragment selector -/
+
+/-- `arithFragmentValue b = true` exactly for the scoped value constructors:
+the three scalar literals (`int` / `bool` / `bytes`), `refAlias`, `loadParam`,
+`loadProp`, an arithmetic `binOp` (`+ - * / %`), and the arith negate `unaryOp`
+(`-`).  `thisRef` is OUT of scope (it produces `.addr`, deferred).
+
+**`~` deliberately excluded** (see the `unaryOp` divergence note on
+`evalArithBinding_preserves`): `typeOfValue` types `unaryOp "~" : bigint →
+bigint` (matching `03-typecheck.ts`'s bitwise-NOT-over-bigint rule), but the
+ANF evaluator's `Eval.evalUnaryOp "~"` is the *byte*-inversion path
+(`invertBytesValue`), which ERRORS on a `.vBigint` operand.  A `~`-on-bigint
+binding therefore type-checks but does NOT evaluate to a value — so a
+"`evalValue` succeeds with kind `τ`" preservation claim would be FALSE for it.
+Excluding `~` keeps this lemma sound and non-vacuous; the `~` row is a genuine
+evaluator/type-checker divergence flagged for WS1 (it does not affect the
+arith chain the keystone consumes, which is `+ - * / %` plus negate). -/
+def arithFragmentValue : ANFValue → Bool
+  | .loadConst (.int _)      => true
+  | .loadConst (.bool _)     => true
+  | .loadConst (.bytes _)    => true
+  | .loadConst (.refAlias _) => true
+  | .loadConst .thisRef      => false
+  | .loadParam _             => true
+  | .loadProp _              => true
+  | .binOp op _ _ _          => isArithOp op
+  | .unaryOp op _ _          => op == "-"
+  | _                        => false
+
+/-- **Evaluation-safety side condition.**  For the partial arith ops `/` and
+`%`, `evalBinOp` errors on a zero divisor; every other fragment value evaluates
+unconditionally.  This guard pins exactly the divisor-nonzero precondition so
+the preservation claim stays both TOTAL and honest (never vacuous): for
+`+ - *`, negate, and the literals/refs it is `True`. -/
+def arithBindingEvalSafe (v : ANFValue) (s : State) : Prop :=
+  match v with
+  | .binOp "/" _ r _ => ∀ b : Int, s.resolveRef r = some (.vBigint b) → b ≠ 0
+  | .binOp "%" _ r _ => ∀ b : Int, s.resolveRef r = some (.vBigint b) → b ≠ 0
+  | _                => True
+
+/-- **Read-correspondence side condition (entry slots).**  `evalValue` reads a
+`loadParam pn` via `lookupParam` and a `loadProp pn` via `lookupProp`, whereas
+both `typeOfValue` and `StateWellTyped` index those names through `Γ.lookup` /
+`resolveRef`.  Since `resolveRef = lookupBinding <|> lookupParam <|> lookupProp`,
+the two agree exactly when no binding (or, for `loadParam`, no binding *and* no
+property) shadows the name.  This guard pins that agreement for the two entry
+constructors; for `refAlias` / `binOp` / `unaryOp` / literals (which already
+read through `resolveRef`) it is `True`.  Mirrors the head-correspondence
+hypothesis the wave-32 / wave-33 success steps already consume (see
+`smoke_wt_soundness_fires`). -/
+def arithBindingReadCorr (v : ANFValue) (s : State) : Prop :=
+  match v with
+  | .loadParam pn => s.lookupParam pn = s.resolveRef pn
+  | .loadProp pn  => s.lookupProp pn = s.resolveRef pn
+  | _             => True
+
+/-! ### `evalValue` reduction helpers (binOp / unaryOp)
+
+Given the operands' resolved `.vBigint` values and the corresponding
+`evalBinOp` / `evalUnaryOp` *result* equation, these reduce the full
+`evalValue` of the binding to `Except.ok (res, anfSt)` (the state is
+unchanged).  Factored out so the five arith binOps and the negate unaryOp share
+one reduction line.  Pure `simp`/`rfl` — no axioms. -/
+
+private theorem binOp_evalValue_of_binOpEq (anfSt : State) (op l r : String)
+    (a c : Int) (rt : Option String) (res : Value)
+    (hRa : anfSt.resolveRef l = some (.vBigint a))
+    (hRc : anfSt.resolveRef r = some (.vBigint c))
+    (hb : Eval.evalBinOp op (.vBigint a) (.vBigint c) rt = Except.ok res) :
+    Eval.evalValue anfSt (.binOp op l r rt) = Except.ok (res, anfSt) := by
+  rw [show Eval.evalValue anfSt (.binOp op l r rt)
+        = (Eval.evalBinOp op (.vBigint a) (.vBigint c) rt) >>= (fun res => pure (res, anfSt)) by
+      simp only [Eval.evalValue, Eval.lookupRef, hRa, hRc]; rfl]
+  rw [hb]; rfl
+
+private theorem unaryOp_evalValue_of_eq (anfSt : State) (op o : String)
+    (a : Int) (rt : Option String) (res : Value)
+    (hRa : anfSt.resolveRef o = some (.vBigint a))
+    (hu : Eval.evalUnaryOp op (.vBigint a) rt = Except.ok res) :
+    Eval.evalValue anfSt (.unaryOp op o rt) = Except.ok (res, anfSt) := by
+  rw [show Eval.evalValue anfSt (.unaryOp op o rt)
+        = (Eval.evalUnaryOp op (.vBigint a) rt) >>= (fun res => pure (res, anfSt)) by
+      simp only [Eval.evalValue, Eval.lookupRef, hRa]; rfl]
+  rw [hu]; rfl
+
+/-! ### Per-binding preservation (the key lemma) -/
+
+/-- **Per-binding type preservation.**  For a binding whose value is in the
+arith fragment, type-checks to `τ` under `Γ`, with a well-typed state, the
+divisor-nonzero side condition (`hSafe`) and the entry-read correspondence
+(`hCorr`): `evalValue` succeeds with a value of kind `τ`, and the post-binding
+state is well-typed under `Γ.extend b.name τ`. -/
+theorem evalArithBinding_preserves
+    (retEnv : List (String × ANFType)) (Γ : TypeEnv) (anfSt : State)
+    (b : ANFBinding) (τ : ANFType)
+    (hFrag : arithFragmentValue b.value = true)
+    (hTy : typeOfValue retEnv Γ b.value = some τ)
+    (hSt : StateWellTyped Γ anfSt)
+    (hSafe : arithBindingEvalSafe b.value anfSt)
+    (hCorr : arithBindingReadCorr b.value anfSt) :
+    ∃ v, Eval.evalValue anfSt b.value = Except.ok (v, anfSt) ∧ ValueHasKind v τ ∧
+      StateWellTyped (Γ.extend b.name τ) (anfSt.addBinding b.name v) := by
+  -- `evalValue` returns `(value, state)` with the state unchanged on every
+  -- fragment constructor, so the binding leg uses `addBinding b.name (value)`.
+  obtain ⟨name, value, sl⟩ := b
+  simp only [ANFBinding.value, ANFBinding.name] at *
+  cases value with
+  | loadConst c =>
+    cases c with
+    | int i =>
+      simp only [typeOfValue] at hTy
+      have hτ : τ = .bigint := (Option.some.inj hTy).symm
+      subst hτ
+      exact ⟨.vBigint i, by simp only [Eval.evalValue], ⟨i, rfl⟩,
+        stateWellTyped_addBinding Γ anfSt name (.vBigint i) .bigint hSt ⟨i, rfl⟩⟩
+    | bool bb =>
+      simp only [typeOfValue] at hTy
+      have hτ : τ = .bool := (Option.some.inj hTy).symm
+      subst hτ
+      exact ⟨.vBool bb, by simp only [Eval.evalValue], ⟨bb, rfl⟩,
+        stateWellTyped_addBinding Γ anfSt name (.vBool bb) .bool hSt ⟨bb, rfl⟩⟩
+    | bytes by_ =>
+      simp only [typeOfValue] at hTy
+      have hτ : τ = .byteString := (Option.some.inj hTy).symm
+      subst hτ
+      exact ⟨.vBytes by_, by simp only [Eval.evalValue], ⟨by_, rfl⟩,
+        stateWellTyped_addBinding Γ anfSt name (.vBytes by_) .byteString hSt ⟨by_, rfl⟩⟩
+    | refAlias n =>
+      -- `typeOfValue (.loadConst (.refAlias n)) = Γ.lookup n`; eval reads via
+      -- `lookupRef = resolveRef`, so `hSt` connects directly.
+      simp only [typeOfValue] at hTy
+      obtain ⟨v, hres, hvk⟩ := hSt n τ hTy
+      refine ⟨v, ?_, hvk, stateWellTyped_addBinding Γ anfSt name v τ hSt hvk⟩
+      simp only [Eval.evalValue, Eval.lookupRef, hres]; rfl
+    | thisRef =>
+      simp only [arithFragmentValue, Bool.false_eq_true] at hFrag   -- out of fragment
+  | loadParam pn =>
+    -- `typeOfValue (.loadParam pn) = Γ.lookup pn`; eval reads via `lookupParam`,
+    -- which `hCorr` equates to `resolveRef pn`, so `hSt` connects.
+    simp only [typeOfValue] at hTy
+    obtain ⟨v, hres, hvk⟩ := hSt pn τ hTy
+    refine ⟨v, ?_, hvk, stateWellTyped_addBinding Γ anfSt name v τ hSt hvk⟩
+    simp only [arithBindingReadCorr] at hCorr
+    have hLp : anfSt.lookupParam pn = some v := by rw [hCorr]; exact hres
+    simp only [Eval.evalValue, hLp]
+  | loadProp pn =>
+    simp only [typeOfValue] at hTy
+    obtain ⟨v, hres, hvk⟩ := hSt pn τ hTy
+    refine ⟨v, ?_, hvk, stateWellTyped_addBinding Γ anfSt name v τ hSt hvk⟩
+    simp only [arithBindingReadCorr] at hCorr
+    have hLp : anfSt.lookupProp pn = some v := by rw [hCorr]; exact hres
+    simp only [Eval.evalValue, hLp]
+  | binOp op l r rt =>
+    -- `typeOfValue` forces both operands `.bigint`; `hSt` ⇒ both resolve to a
+    -- `.vBigint`; `evalBinOp` on two `.vBigint` produces a `.vBigint` for the
+    -- arith ops (`/`,`%` need the nonzero divisor supplied by `hSafe`).
+    simp only [arithFragmentValue] at hFrag   -- hFrag : isArithOp op = true
+    simp only [typeOfValue] at hTy
+    -- `hTy` shape: `match Γ.lookup l, Γ.lookup r with | some .bigint, some .bigint => …`.
+    have hLR : Γ.lookup l = some .bigint ∧ Γ.lookup r = some .bigint := by
+      revert hTy
+      cases hl : Γ.lookup l with
+      | none => intro h; simp only [reduceCtorEq] at h
+      | some tl =>
+        cases tl <;> intro hTy <;>
+          first
+          | (cases hr : Γ.lookup r with
+             | none => rw [hr] at hTy; simp only [reduceCtorEq] at hTy
+             | some tr => cases tr <;> simp_all)
+          | simp_all
+    obtain ⟨hLb, hRb⟩ := hLR
+    obtain ⟨a, hRa⟩ := operand_resolveRef_vBigint_of_typedEntry Γ anfSt l
+      (fun _ hh => hSt _ _ hh) hLb
+    obtain ⟨c, hRc⟩ := operand_resolveRef_vBigint_of_typedEntry Γ anfSt r
+      (fun _ hh => hSt _ _ hh) hRb
+    -- `typeOfValue` returns `.bigint` for an arith op on two bigints.
+    have hτ : τ = .bigint := by
+      rw [hLb, hRb] at hTy; rw [hFrag] at hTy; exact (Option.some.inj hTy).symm
+    subst hτ
+    -- The five arith ops, splitting `/` `%` on the nonzero-divisor guard.
+    -- (`rcases` directly on the left-associated `isArithOp` disjunction — no
+    -- `tauto`, which is unavailable in this project.)
+    unfold isArithOp at hFrag
+    simp only [Bool.or_eq_true, beq_iff_eq] at hFrag
+    rcases hFrag with (((h|h)|h)|h)|h <;> subst h
+    · -- "+"
+      exact ⟨.vBigint (a + c),
+        binOp_evalValue_of_binOpEq anfSt "+" l r a c rt _ hRa hRc (by simp only [Eval.evalBinOp]; rfl),
+        ⟨a + c, rfl⟩,
+        stateWellTyped_addBinding Γ anfSt name (.vBigint (a + c)) .bigint hSt ⟨_, rfl⟩⟩
+    · -- "-"
+      exact ⟨.vBigint (a - c),
+        binOp_evalValue_of_binOpEq anfSt "-" l r a c rt _ hRa hRc (by simp only [Eval.evalBinOp]; rfl),
+        ⟨a - c, rfl⟩,
+        stateWellTyped_addBinding Γ anfSt name (.vBigint (a - c)) .bigint hSt ⟨_, rfl⟩⟩
+    · -- "*"
+      exact ⟨.vBigint (a * c),
+        binOp_evalValue_of_binOpEq anfSt "*" l r a c rt _ hRa hRc (by simp only [Eval.evalBinOp]; rfl),
+        ⟨a * c, rfl⟩,
+        stateWellTyped_addBinding Γ anfSt name (.vBigint (a * c)) .bigint hSt ⟨_, rfl⟩⟩
+    · -- "/": nonzero divisor from `hSafe`.
+      have hc0 : c ≠ 0 := by simp only [arithBindingEvalSafe] at hSafe; exact hSafe c hRc
+      have hb : Eval.evalBinOp "/" (.vBigint a) (.vBigint c) rt = Except.ok (.vBigint (a / c)) := by
+        simp only [Eval.evalBinOp]; rw [if_neg (by simpa using hc0)]; rfl
+      exact ⟨.vBigint (a / c),
+        binOp_evalValue_of_binOpEq anfSt "/" l r a c rt _ hRa hRc hb,
+        ⟨a / c, rfl⟩,
+        stateWellTyped_addBinding Γ anfSt name (.vBigint (a / c)) .bigint hSt ⟨_, rfl⟩⟩
+    · -- "%": nonzero divisor from `hSafe`.
+      have hc0 : c ≠ 0 := by simp only [arithBindingEvalSafe] at hSafe; exact hSafe c hRc
+      have hb : Eval.evalBinOp "%" (.vBigint a) (.vBigint c) rt = Except.ok (.vBigint (a % c)) := by
+        simp only [Eval.evalBinOp]; rw [if_neg (by simpa using hc0)]; rfl
+      exact ⟨.vBigint (a % c),
+        binOp_evalValue_of_binOpEq anfSt "%" l r a c rt _ hRa hRc hb,
+        ⟨a % c, rfl⟩,
+        stateWellTyped_addBinding Γ anfSt name (.vBigint (a % c)) .bigint hSt ⟨_, rfl⟩⟩
+  | unaryOp op operand rt =>
+    -- `arithFragmentValue` admits only `op = "-"` here.  `typeOfValue` forces
+    -- the operand `.bigint`; negate produces a `.vBigint` on a `.vBigint`.
+    simp only [arithFragmentValue, beq_iff_eq] at hFrag
+    subst hFrag
+    simp only [typeOfValue] at hTy
+    have hOb : Γ.lookup operand = some .bigint := by
+      revert hTy
+      cases hl : Γ.lookup operand with
+      | none => intro h; simp only [reduceCtorEq] at h
+      | some tl => cases tl <;> intro hTy <;> simp_all
+    obtain ⟨a, hRa⟩ := operand_resolveRef_vBigint_of_typedEntry Γ anfSt operand
+      (fun _ hh => hSt _ _ hh) hOb
+    have hτ : τ = .bigint := by
+      rw [hOb] at hTy; exact (Option.some.inj hTy).symm
+    subst hτ
+    exact ⟨.vBigint (-a),
+      unaryOp_evalValue_of_eq anfSt "-" operand a rt _ hRa (by simp only [Eval.evalUnaryOp]; rfl),
+      ⟨-a, rfl⟩,
+      stateWellTyped_addBinding Γ anfSt name (.vBigint (-a)) .bigint hSt ⟨_, rfl⟩⟩
+  | _ =>
+    -- All remaining constructors are out of the arith fragment:
+    -- `arithFragmentValue` is `false`, contradicting `hFrag`.
+    simp only [arithFragmentValue, Bool.false_eq_true] at hFrag
+
+/-! ### Body-level preservation (induction over the binding list)
+
+The per-binding lemma above carries two per-state side conditions
+(`arithBindingEvalSafe` for `/`,`%` and `arithBindingReadCorr` for `loadParam`,
+`loadProp`).  Those depend on the *running* state, which changes as bindings
+accumulate, so they cannot be hoisted to the initial state for a uniform
+binding-list sweep.  The body-level lemma therefore ranges over the
+**guard-free arith fragment** — the scoped values for which BOTH side
+conditions are unconditionally `True`:
+
+* the three scalar literals (`int` / `bool` / `bytes`),
+* `refAlias` (reads through `resolveRef`, so no read-correspondence needed),
+* `binOp` with `+`, `-`, `*` (total — no zero-divisor obligation),
+* `unaryOp` with `-` (negate).
+
+`/`, `%`, `loadParam`, `loadProp` are excluded here (they remain covered by the
+per-binding lemma when their side conditions are supplied).  This guard-free
+fragment is exactly the arith chain the keystone (Task 7) and the WS1 arith
+retirement consume: a sequence of `+ - *`-binOps / negate over operand refs. -/
+
+/-- The guard-free arith fragment: literals, `refAlias`, `binOp (+,-,*)`,
+`unaryOp (-)`.  Excludes `/`, `%`, `loadParam`, `loadProp` (whose per-binding
+preservation carries a running-state side condition). -/
+def arithFragmentValueGuardFree : ANFValue → Bool
+  | .loadConst (.int _)      => true
+  | .loadConst (.bool _)     => true
+  | .loadConst (.bytes _)    => true
+  | .loadConst (.refAlias _) => true
+  | .binOp op _ _ _          => op == "+" || op == "-" || op == "*"
+  | .unaryOp op _ _          => op == "-"
+  | _                        => false
+
+/-- The guard-free fragment is a sub-fragment of the full arith fragment. -/
+theorem arithFragmentValue_of_guardFree {v : ANFValue}
+    (h : arithFragmentValueGuardFree v = true) : arithFragmentValue v = true := by
+  cases v with
+  | loadConst c => cases c <;> simp_all [arithFragmentValueGuardFree, arithFragmentValue]
+  | binOp op l r rt =>
+      simp only [arithFragmentValueGuardFree, Bool.or_eq_true, beq_iff_eq] at h
+      simp only [arithFragmentValue, isArithOp, Bool.or_eq_true, beq_iff_eq]
+      rcases h with (h|h)|h <;> subst h <;> simp
+  | unaryOp op o rt => simpa [arithFragmentValueGuardFree, arithFragmentValue] using h
+  | _ => simp_all [arithFragmentValueGuardFree]
+
+/-- The guard-free fragment never triggers the divisor-nonzero obligation. -/
+theorem evalSafe_of_guardFree {v : ANFValue} (s : State)
+    (h : arithFragmentValueGuardFree v = true) : arithBindingEvalSafe v s := by
+  cases v with
+  | loadConst c => cases c <;> trivial
+  | binOp op l r rt =>
+      -- `op ∈ {+,-,*}`, so the `arithBindingEvalSafe` match takes the `_` arm.
+      simp only [arithFragmentValueGuardFree, Bool.or_eq_true, beq_iff_eq] at h
+      rcases h with (h|h)|h <;> subst h <;> trivial
+  | _ => trivial
+
+/-- The guard-free fragment never triggers the entry-read-correspondence
+obligation (it has no `loadParam` / `loadProp`). -/
+theorem readCorr_of_guardFree {v : ANFValue} (s : State)
+    (h : arithFragmentValueGuardFree v = true) : arithBindingReadCorr v s := by
+  cases v with
+  | loadConst c => cases c <;> trivial
+  | _ => trivial
+
+/-- **`checkBody` head reduction (guard-free).**  For a guard-free head (never
+`ifVal` / `loop`), `checkBody` of a `cons` reduces to the `typeOfValue` branch:
+type the head, then continue with the extended environment.  Discharges the
+`v ≠ ifVal` / `v ≠ loop` side goals the `checkBody` match raises. -/
+private theorem checkBody_cons_guardFree
+    (retEnv : List (String × ANFType)) (Γ : TypeEnv)
+    (name : String) (v : ANFValue) (sl : Option SourceLoc) (rest : List ANFBinding)
+    (hgf : arithFragmentValueGuardFree v = true) :
+    TypeCheck.checkBody retEnv Γ (.mk name v sl :: rest)
+      = (match typeOfValue retEnv Γ v with
+         | some τ => TypeCheck.checkBody retEnv (Γ.extend name τ) rest
+         | none => none) := by
+  cases v with
+  | loadConst c =>
+      cases c <;>
+        first
+        | (rw [TypeCheck.checkBody] <;> first | rfl | (intro _ _ _ h; cases h))
+        | simp [arithFragmentValueGuardFree] at hgf
+  | binOp op l r rt => rw [TypeCheck.checkBody] <;> first | rfl | (intro _ _ _ h; cases h)
+  | unaryOp op o rt => rw [TypeCheck.checkBody] <;> first | rfl | (intro _ _ _ h; cases h)
+  | _ => simp [arithFragmentValueGuardFree] at hgf
+
+/-- **Body-level type preservation (strong form).**  For a binding list whose
+values are all in the guard-free arith fragment and which type-checks under `Γ`
+(`checkBody` succeeds with final environment `Γ'`), starting from a well-typed
+state: `evalBindings` succeeds with a final state well-typed under `Γ'`.  Proven
+by induction on the binding list, each step discharged by
+`evalArithBinding_preserves` (its side conditions supplied by the guard-free
+lemmas). -/
+theorem evalArithBindings_preserves_strong
+    (retEnv : List (String × ANFType)) :
+    ∀ (body : List ANFBinding) (Γ Γ' : TypeEnv) (anfSt : State),
+      body.all (arithFragmentValueGuardFree ·.value) = true →
+      TypeCheck.checkBody retEnv Γ body = some Γ' →
+      StateWellTyped Γ anfSt →
+      ∃ anfSt', Eval.evalBindings anfSt body = Except.ok anfSt' ∧ StateWellTyped Γ' anfSt'
+  | [], Γ, Γ', anfSt, _, hChk, hSt => by
+      -- empty body: `checkBody … [] = some Γ`, so `Γ' = Γ`; `evalBindings … [] = ok anfSt`.
+      simp only [TypeCheck.checkBody, Option.some.injEq] at hChk
+      subst hChk
+      exact ⟨anfSt, by simp only [Eval.evalBindings], hSt⟩
+  | .mk name v sl :: rest, Γ, Γ', anfSt, hAll, hChk, hSt => by
+      -- Head is guard-free; peel the `body.all`.
+      rw [List.all_cons, Bool.and_eq_true] at hAll
+      obtain ⟨hHeadFrag, hRestFrag⟩ := hAll
+      simp only [ANFBinding.value] at hHeadFrag
+      -- `checkBody` on a guard-free head goes through the `typeOfValue` branch.
+      rw [checkBody_cons_guardFree retEnv Γ name v sl rest hHeadFrag] at hChk
+      -- Extract `typeOfValue … v = some τ` and the type-checked tail.
+      obtain ⟨τ, hTyV, hChkRest⟩ :
+          ∃ τ, typeOfValue retEnv Γ v = some τ ∧
+            TypeCheck.checkBody retEnv (Γ.extend name τ) rest = some Γ' := by
+        revert hChk
+        cases hT : typeOfValue retEnv Γ v with
+        | none => intro hChk; simp only [hT] at hChk; exact absurd hChk (by simp)
+        | some τ => intro hChk; simp only [hT] at hChk; exact ⟨τ, rfl, hChk⟩
+      -- Apply the per-binding lemma (side conditions from the guard-free lemmas).
+      obtain ⟨vval, hEvV, _hvk, hStExt⟩ :=
+        evalArithBinding_preserves retEnv Γ anfSt (.mk name v sl) τ
+          (by simp only [ANFBinding.value]; exact arithFragmentValue_of_guardFree hHeadFrag)
+          (by simp only [ANFBinding.value]; exact hTyV)
+          hSt
+          (by simp only [ANFBinding.value]; exact evalSafe_of_guardFree anfSt hHeadFrag)
+          (by simp only [ANFBinding.value]; exact readCorr_of_guardFree anfSt hHeadFrag)
+      simp only [ANFBinding.value, ANFBinding.name] at hEvV hStExt
+      -- Step the evaluator past the head, then recurse on `rest`.
+      have hStep : Eval.evalBindings anfSt (.mk name v sl :: rest)
+          = Eval.evalBindings (anfSt.addBinding name vval) rest := by
+        simp only [Eval.evalBindings, hEvV]; rfl
+      rw [hStep]
+      exact evalArithBindings_preserves_strong retEnv rest (Γ.extend name τ) Γ'
+        (anfSt.addBinding name vval) hRestFrag hChkRest hStExt
+
+/-- **Body-level preservation (`isSome` form).**  The corollary the keystone
+consumes: a guard-free arith body that type-checks runs to completion (no
+evaluation error) from any well-typed state. -/
+theorem evalArithBindings_preserves
+    (retEnv : List (String × ANFType)) (Γ Γ' : TypeEnv) (anfSt : State)
+    (body : List ANFBinding)
+    (hAllFrag : body.all (arithFragmentValueGuardFree ·.value) = true)
+    (hBodyTy : TypeCheck.checkBody retEnv Γ body = some Γ')
+    (hSt0 : StateWellTyped Γ anfSt) :
+    (Eval.evalBindings anfSt body).toOption.isSome = true := by
+  obtain ⟨anfSt', hEv, _⟩ :=
+    evalArithBindings_preserves_strong retEnv body Γ Γ' anfSt hAllFrag hBodyTy hSt0
+  rw [hEv]; rfl
+
+/-! ### MANDATORY smoke test
+
+A concrete 2-binding arith body `t1 = a + b ; t2 = t1 * a` over an entry where
+`a`, `b` are `.bigint` params.  We exhibit a well-typed entry state, show the
+body type-checks and is guard-free, and fire `evalArithBindings_preserves` —
+demonstrating the body runs to completion (and, via the strong form, lands in a
+well-typed final state binding `t1 = 7`, `t2 = 21`). -/
+
+/-- Smoke env: `a : bigint`, `b : bigint`. -/
+private def Γ_t6_smoke : TypeEnv :=
+  (Typed.TypeEnv.empty.extend "a" .bigint).extend "b" .bigint
+
+/-- Smoke entry state: `a = 3`, `b = 4`. -/
+private def st_t6_smoke : State :=
+  { params := [("a", .vBigint 3), ("b", .vBigint 4)] }
+
+/-- Smoke body: `t1 = a + b ; t2 = t1 * a`. -/
+private def body_t6_smoke : List ANFBinding :=
+  [ .mk "t1" (.binOp "+" "a" "b" none) none,
+    .mk "t2" (.binOp "*" "t1" "a" none) none ]
+
+/-- The smoke body is entirely in the guard-free arith fragment. -/
+theorem smoke_t6_guardFree :
+    body_t6_smoke.all (arithFragmentValueGuardFree ·.value) = true := by native_decide
+
+/-- The smoke entry is well-typed under `Γ_t6_smoke`. -/
+theorem smoke_t6_stateWellTyped : StateWellTyped Γ_t6_smoke st_t6_smoke := by
+  intro nm ty hLk
+  by_cases ha : nm = "a"
+  · subst ha
+    have : ty = .bigint := by
+      have : Γ_t6_smoke.lookup "a" = some .bigint := rfl
+      rw [this] at hLk; exact (Option.some.inj hLk).symm
+    subst this; exact ⟨.vBigint 3, rfl, ⟨3, rfl⟩⟩
+  · by_cases hb : nm = "b"
+    · subst hb
+      have : ty = .bigint := by
+        have : Γ_t6_smoke.lookup "b" = some .bigint := rfl
+        rw [this] at hLk; exact (Option.some.inj hLk).symm
+      subst this; exact ⟨.vBigint 4, rfl, ⟨4, rfl⟩⟩
+    · exfalso
+      have hbb : ("b" == nm) = false := by rw [beq_eq_false_iff_ne]; exact fun h => hb h.symm
+      have haa : ("a" == nm) = false := by rw [beq_eq_false_iff_ne]; exact fun h => ha h.symm
+      simp only [Γ_t6_smoke, Typed.TypeEnv.lookup, Typed.TypeEnv.extend, Typed.TypeEnv.empty,
+        List.find?_cons, hbb, haa, List.find?_nil, Option.map_none, reduceCtorEq] at hLk
+
+/-- **Smoke — `evalArithBindings_preserves` FIRES.**  The 2-binding arith body
+type-checks (witnessed by `checkBody … = some _`) and runs to completion from the
+well-typed entry. -/
+theorem smoke_t6_body_runs :
+    (Eval.evalBindings st_t6_smoke body_t6_smoke).toOption.isSome = true := by
+  -- `checkBody` succeeds (decidable `isSome`); extract its final env, then feed
+  -- the discharge through the body lemma.
+  obtain ⟨Γ', hChk⟩ : ∃ Γ', TypeCheck.checkBody [] Γ_t6_smoke body_t6_smoke = some Γ' :=
+    Option.isSome_iff_exists.mp (by native_decide)
+  exact evalArithBindings_preserves [] Γ_t6_smoke Γ' st_t6_smoke body_t6_smoke
+    smoke_t6_guardFree hChk smoke_t6_stateWellTyped
+
+/-- Smoke — the strong form lands in a well-typed final state (sanity: the body
+evaluates without error and the final env types every bound temp). -/
+theorem smoke_t6_final_wellTyped :
+    ∃ Γ' anfSt', TypeCheck.checkBody [] Γ_t6_smoke body_t6_smoke = some Γ' ∧
+      Eval.evalBindings st_t6_smoke body_t6_smoke = Except.ok anfSt' ∧
+      StateWellTyped Γ' anfSt' := by
+  obtain ⟨Γ', hChk⟩ : ∃ Γ', TypeCheck.checkBody [] Γ_t6_smoke body_t6_smoke = some Γ' :=
+    Option.isSome_iff_exists.mp (by native_decide)
+  obtain ⟨anfSt', hEv, hStW⟩ :=
+    evalArithBindings_preserves_strong [] body_t6_smoke Γ_t6_smoke Γ' st_t6_smoke
+      smoke_t6_guardFree hChk smoke_t6_stateWellTyped
+  exact ⟨Γ', anfSt', hChk, hEv, hStW⟩
 
 end WellTyped
 end RunarVerification.ANF
