@@ -14,6 +14,7 @@ import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
 import RunarVerification.ANF.WellTyped
 import RunarVerification.ANF.EntryModel
+import RunarVerification.ANF.EntryDischarge
 import RunarVerification.Stack.AgreesA3
 import RunarVerification.Stack.AgreesA4
 import RunarVerification.Stack.AgreesA5
