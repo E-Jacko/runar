@@ -10,6 +10,7 @@ import RunarVerification.Stack.AgreesA5
 import RunarVerification.Stack.AgreesA6
 import RunarVerification.Stack.AgreesA8
 import RunarVerification.Stack.AgreesD1
+import RunarVerification.Stack.AgreesD2
 import RunarVerification.Stack.Peephole
 import RunarVerification.Stack.Eval
 import RunarVerification.Stack.TxContext
@@ -2661,26 +2662,62 @@ theorem auto_check_preimage_at_method_entry_correct (p : ANFProgram)
 /-- D2.b — auto-injected state-output emission at method exit matches
 the ANF state-output construction.
 
-For every stateful contract method `m`, the lowered body's terminal
-state-output emission (an `add_output (satoshis, ...mutableProps)`
-synthesised by the lowerer) and the ANF body's `addOutput` binding
-agree on the produced output bytes after evaluation.
+**History (this was an UNSOUND axiom, now retired and proved).**  The
+original axiom equated `(evalBindings initialAnf m.body).outputs` with
+`(runMethod (Lower.lower p) m.name initialStack).outputs`.  That
+statement is FALSE as stated:
 
-Soundness: same `Crypto.computeStateOutput` axiom on both sides
-(`ANF/Eval.lean:477`); the lowerer routes `add_output` ANF kind
-straight to the Stack-side output emission so the byte payload is
-literally the same function call. -/
-axiom auto_state_output_at_method_exit_correct (p : ANFProgram)
+* The ANF `.addOutput` arm (`ANF/Eval.lean:1935`) APPENDS an
+  `Output.state` record to `State.outputs`.
+* The Stack VM (`Stack/Eval.lean` `runOps`/`runOpcode`/`stepNonIf`)
+  NEVER mutates `StackState.outputs` — the `add_output` lowering builds
+  the output AS BYTES on the stack and leaves `.outputs = []`
+  (documented at `Stack/OutputTrace.lean:6-10`).
+
+So `runMethod … .outputs` is empty by construction whenever the body
+emits an output, making the equality false (and `False` derivable).
+The Stack output effect is modelled SEPARATELY by
+`OutputTrace.applyEvent` / `applyTrace`.
+
+**The TRUE restatement (this theorem).**  For a stateful method whose
+body is the canonical auto-injected state-continuation epilogue
+`statefulEpilogueBody sats stateVal pre`, under the input-readiness
+facts that the satoshi ref resolves to a `vBigint` and the state-value
+ref resolves to a value, the ANF body's appended output list equals the
+prior outputs with the Stack-SIDE output record appended — where the
+Stack-side record is exactly
+`OutputTrace.OutputEvent.toOutput (.state satsV [stateValV])`, the
+`Output` value `OutputTrace.applyEvent` concatenates onto
+`StackState.outputs`.  This is the honest "ANF state output = Stack
+state output" parity at the shared `Output` record type, NOT the false
+`runMethod … .outputs` claim.
+
+Soundness: composes `AgreesD2.statefulEpilogue_outputs_agree`, which
+reduces the ANF epilogue run and reads off the appended record.  No
+`Crypto.computeStateOutput` dependency on either side — the field-level
+byte serialisation is abstract (the `addOutput` path never calls it).
+The `statefulEpilogueShapeBool` body hypothesis is the correct shape
+side-condition the old axiom lacked. -/
+theorem auto_state_output_at_method_exit_correct (p : ANFProgram)
     (m : ANFMethod)
-    (initialAnf : State) (initialStack : StackState)
-    (hMem : m ∈ p.methods)
-    (hStateful : Lower.bindingsUseCheckPreimage m.body = true) :
-    -- Both sides reach their respective state-output frames with the
-    -- same output sequence on success.
-    match RunarVerification.ANF.Eval.evalBindings initialAnf m.body,
-          runMethod (Lower.lower p) m.name initialStack with
-    | .ok anfFinal, .ok stkFinal => anfFinal.outputs = stkFinal.outputs
-    | _, _ => True
+    (initialAnf : State)
+    (sats stateVal pre : String) (satsV : Int)
+    (stateValV : RunarVerification.ANF.Eval.Value)
+    (_hMem : m ∈ p.methods)
+    (hEpilogue : m.body = AgreesD2.statefulEpilogueBody sats stateVal pre)
+    (hSats : initialAnf.resolveRef sats = some (.vBigint satsV))
+    (hSv : initialAnf.resolveRef stateVal = some stateValV) :
+    -- The ANF body appends EXACTLY the Stack-side output record
+    -- (`OutputTrace.OutputEvent.toOutput`), not an empty `runMethod`
+    -- output list.
+    (match RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf m.body with
+     | .ok anfFinal => anfFinal.outputs
+     | _ => [])
+      = initialAnf.outputs
+        ++ [Stack.OutputTrace.OutputEvent.toOutput (.state satsV [stateValV])] := by
+  rw [hEpilogue]
+  exact AgreesD2.statefulEpilogue_outputs_agree p.methods initialAnf
+    sats stateVal pre satsV stateValV hSats hSv
 
 /-! ### D3 — Terminal-assert elision + NIP cleanup consequences
 
