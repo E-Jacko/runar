@@ -9,6 +9,7 @@ import RunarVerification.Stack.AgreesA4
 import RunarVerification.Stack.AgreesA5
 import RunarVerification.Stack.AgreesA6
 import RunarVerification.Stack.AgreesA8
+import RunarVerification.Stack.AgreesHashCall
 import RunarVerification.Stack.AgreesD1
 import RunarVerification.Stack.AgreesD2
 import RunarVerification.Stack.Peephole
@@ -4673,6 +4674,230 @@ theorem compileSafe_observational_correct_methodCall_consume
     exact successAgrees_refl _
   exact successAgrees_trans _ _ _ hM2Method hParsed
 
+/-! ## crypto_call peel-off — single-hash-call method consume theorem
+
+Peels the single-`sha256`/`hash160`-call method fragment off the residual
+`crypto_call` fallback. The body is one `bn = func(param)` call whose param is
+consumed (RAW = the bare `[OP_SHA256]` / `[OP_HASH160]`, both M4-allowlisted);
+the substrate lives in `Stack/AgreesHashCall.lean`. Composes the same
+M2∘M3∘M4 spine as `methodCall_consume` with `RAW = [opcode]`. The arg's
+bytes-typing at entry is supplied by the keyed `hHashCallFrag` omnibus premise
+(vacuous on non-hash bodies, like `hMathByteFrag`), so NO new axiom and NO
+`crypto_call` axiom appear in the discharged fragment. -/
+
+/-- The 4-pass peephole pipeline is the identity on any single-opcode method
+body: every fusion pass needs ≥2 ops, so a singleton `[.opcode op]` is stable. -/
+theorem peepholeMethodOps_single_opcode (op : String) :
+    peepholeMethodOps [StackOp.opcode op] = [StackOp.opcode op] := by
+  unfold peepholeMethodOps
+  have hNoIf : Peephole.noIfOp [StackOp.opcode op] := by simp [Peephole.noIfOp]
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
+  have hFlat : Peephole.peepholePassAllFlat [StackOp.opcode op] = [StackOp.opcode op] := by
+    simp [Peephole.peepholePassAllFlat, Peephole.applyEqualVerifyFuse,
+      Peephole.applyCheckSigVerifyFuse, Peephole.applyNumEqualVerifyFuse,
+      Peephole.applyZeroNumEqual, Peephole.applyDoubleSha256, Peephole.applyDoubleDrop,
+      Peephole.applyDoubleOver, Peephole.applyDoubleNot, Peephole.applyDoubleNegate,
+      Peephole.applyOneSub, Peephole.applyOneAdd, Peephole.applySubZero,
+      Peephole.applyAddZero, Peephole.applyPushPushMul, Peephole.applyPushPushSub,
+      Peephole.applyPushPushAdd, Peephole.applyDoubleSwap, Peephole.applyDupDrop,
+      Peephole.applyDropAfterPush]
+  rw [hFlat, Peephole.peepholePostFold_eq_applyPushOne_of_noIfOp _ hNoIf]
+  have hPost : Peephole.applyPushOneSub (Peephole.applyPushOneAdd [StackOp.opcode op])
+      = [StackOp.opcode op] := by
+    simp [Peephole.applyPushOneAdd, Peephole.applyPushOneSub]
+  rw [hPost, Peephole.peepholeChainFold_eq_self_of_noIfOp_pushFree _ hNoIf
+        (by simp [Peephole.pushFree]),
+    Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIf
+        (by simp [Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])]
+
+/-- **Func-agnostic consume core.** Given the method's RAW reduction to a single
+allowlisted opcode and the M2 success agreement, the full pipeline is
+observationally correct. The no-implicit-pass facts are derived from the
+call-body shape; `hNoCodeArg` (the call is not a state-output builder) and
+`hEmit` (the opcode is push-emittable) are func-specific and supplied by the
+concrete wrappers. -/
+theorem hashCall_consume_core
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray) (op : String)
+    (bn arg func : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hBody : anfM.body = [ANFBinding.mk bn (.call func [arg]) src])
+    (hRaw : Agrees.lowerMethodUserRawOps p.methods p.properties anfM = [StackOp.opcode op])
+    (hNoCodeArg : Lower.bindingsUseCodePart anfM.body = false)
+    (hEmit : Parse.areRunarEmittablePushBool [StackOp.opcode op] = true)
+    (hM2 : successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+        (runOps [StackOp.opcode op] initialStack)) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hUnique :
+      ∀ m'', m'' ∈ p.methods → m''.isPublic = true →
+        (m''.name == anfM.name) = true → m'' = anfM :=
+    unique_public_of_filter_singleton p anfM hSinglePublic
+  have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseCheckPreimage]
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := hNoCodeArg
+  have hNoDeserialize : Lower.bindingsUseDeserializeState anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseDeserializeState]
+  have hNoTerminalAssert : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBody]; simp [Lower.bodyEndsInAssert]
+  have hM2Method :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+        (runMethod (Lower.lower p) anfM.name initialStack) := by
+    have hRunEq :
+        runMethod (Lower.lower p) anfM.name initialStack
+          = runOps (Agrees.lowerMethodUserRawOps p.methods p.properties anfM) initialStack := by
+      have hP : p = { contractName := p.contractName, properties := p.properties, methods := p.methods } := rfl
+      rw [hP]
+      exact Agrees.runMethod_lower_public_unique_no_post_eq_userRaw
+        p.contractName p.properties p.methods anfM initialStack hMem hPublic hUnique
+        hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize
+    rw [hRunEq, hRaw]; exact hM2
+  obtain ⟨hPubSingleton, _hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hPeepedOpsImg : (peepholedLoweredMethod p anfM).ops = [StackOp.opcode op] := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = [StackOp.opcode op]
+    rw [Agrees.lowerMethod_ops_eq_userRaw_no_implicits_no_post
+          p.methods p.properties anfM hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize,
+        hRaw, peepholeMethodOps_single_opcode]
+  have hEmitPush : Parse.AreRunarEmittablePush (peepholedLoweredMethod p anfM).ops := by
+    show Parse.areRunarEmittablePushBool (peepholedLoweredMethod p anfM).ops = true
+    rw [hPeepedOpsImg]; exact hEmit
+  have hM4 :
+      runParsedBytes bytes initialStack = runOps [StackOp.opcode op] initialStack := by
+    have hEq :
+        runParsedBytes bytes initialStack
+          = runOps (peepholedLoweredMethod p anfM).ops initialStack :=
+      compileSafe_single_public_runOps_eq_push p bytes (peepholedLoweredMethod p anfM)
+        initialStack hSafe hPubSingleton hEmitPush
+    rw [hEq, hPeepedOpsImg]
+  have hParsed :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runParsedBytes bytes initialStack) := by
+    rw [hM4]
+    have hMethodEq :
+        runMethod (Lower.lower p) anfM.name initialStack = runOps [StackOp.opcode op] initialStack := by
+      have hRunEq :
+          runMethod (Lower.lower p) anfM.name initialStack
+            = runOps (Agrees.lowerMethodUserRawOps p.methods p.properties anfM) initialStack := by
+        have hP : p = { contractName := p.contractName, properties := p.properties, methods := p.methods } := rfl
+        rw [hP]
+        exact Agrees.runMethod_lower_public_unique_no_post_eq_userRaw
+          p.contractName p.properties p.methods anfM initialStack hMem hPublic hUnique
+          hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize
+      rw [hRunEq, hRaw]
+    rw [hMethodEq]; exact successAgrees_refl _
+  exact successAgrees_trans _ _ _ hM2Method hParsed
+
+/-- **sha256 single-call consume.** Discharges the omnibus obligation for a
+single-public `h(x) = sha256(x)` method, given the bytes-typed entry fragment. -/
+theorem hashCall_consume_sha256
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (bn arg : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "sha256" [arg]) src])
+    (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: rest)
+    (hLen : argBytes.size ≤ 520) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hRaw := RunarVerification.Stack.AgreesHashCall.lowerMethodUserRawOps_single_sha256
+    p.methods p.properties anfM bn arg src hParams hBody
+  have hM2 : successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runOps [StackOp.opcode "OP_SHA256"] initialStack) := by
+    rw [hBody]
+    exact RunarVerification.Stack.AgreesHashCall.hashCall_M2_sha256
+      p.methods initialAnf initialStack bn arg src argBytes rest hArg hStk hLen
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseCodePart]
+  exact hashCall_consume_core p anfM bytes "OP_SHA256" bn arg "sha256" src
+    hMem hPublic hSafe initialAnf initialStack hSinglePublic hName hBody hRaw
+    hNoCode (by rfl) hM2
+
+/-- **hash160 single-call consume.** -/
+theorem hashCall_consume_hash160
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (bn arg : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "hash160" [arg]) src])
+    (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: rest)
+    (hLen : argBytes.size ≤ 520) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hRaw := RunarVerification.Stack.AgreesHashCall.lowerMethodUserRawOps_single_hash160
+    p.methods p.properties anfM bn arg src hParams hBody
+  have hM2 : successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runOps [StackOp.opcode "OP_HASH160"] initialStack) := by
+    rw [hBody]
+    exact RunarVerification.Stack.AgreesHashCall.hashCall_M2_hash160
+      p.methods initialAnf initialStack bn arg src argBytes rest hArg hStk hLen
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseCodePart]
+  exact hashCall_consume_core p anfM bytes "OP_HASH160" bn arg "hash160" src
+    hMem hPublic hSafe initialAnf initialStack hSinglePublic hName hBody hRaw
+    hNoCode (by rfl) hM2
+
+/-! ### MANDATORY smoke: the hash-call consume theorem fires
+
+The canonical single-public sha256 contract `H` with public `h(x) = sha256(x)`,
+fired end-to-end through `hashCall_consume_sha256`: `compileSafe` accepts it, and
+on a concrete bytes entry (`x ↦ #[01,02,03]`, the same bytes on the deployed
+stack) the ANF eval and the deployed-bytes run AGREE on their success bit.
+Anti-vacuous — the fragment is reachable and the consume theorem is non-trivially
+applicable (the `compileSafe` success bit is the only `native_decide`, on the
+deployed bytes; the agreement fires on the shared backend's success bit). -/
+
+private def hashSmokeProg : ANFProgram :=
+  { contractName := "H", properties := [],
+    methods := [RunarVerification.Stack.AgreesHashCall.smokeMethod] }
+
+private def hashSmokeAnf : State :=
+  { (default : State) with bindings := [("x", .vBytes (ByteArray.mk #[1, 2, 3]))] }
+
+private def hashSmokeStk : StackState :=
+  { (default : StackState) with stack := [.vBytes (ByteArray.mk #[1, 2, 3])] }
+
+/-- SMOKE — `hashCall_consume_sha256` fires on the canonical sha256 contract. -/
+theorem smoke_hashCall_consume_fires :
+    ∃ bytes, compileSafe hashSmokeProg = .ok bytes ∧
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP hashSmokeProg.methods hashSmokeAnf
+          RunarVerification.Stack.AgreesHashCall.smokeMethod.body)
+        (runParsedBytes bytes hashSmokeStk) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe hashSmokeProg = .ok b := by
+    have h : (compileSafe hashSmokeProg).toOption.isSome = true := by native_decide
+    cases hc : compileSafe hashSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  exact hashCall_consume_sha256 hashSmokeProg
+    RunarVerification.Stack.AgreesHashCall.smokeMethod bytes "c0" "x" none
+    (by simp [hashSmokeProg]) rfl hSafe hashSmokeAnf hashSmokeStk rfl (by decide)
+    rfl rfl (ByteArray.mk #[1, 2, 3]) [] rfl rfl (by decide)
+
 /-! ### Wave 66 — MANDATORY smoke: the method_call consume theorem fires
 
 The canonical single-public passthrough program — public `entry(a)` whose
@@ -5324,6 +5549,23 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
       Agrees.methodCallConsumeShapeBool p.methods anfM = true →
         ∃ a, (anfM.params.map (·.name)).reverse = [a] ∧
              tsm = [(a, Agrees.SlotKind.param)])
+    -- **crypto_call hash-peel premise (keyed).**  For a body in the single-hash-call
+    -- consume fragment (decided by `hashCallConsumeShapeBool` — one param, one
+    -- binding `bn = sha256/hash160(param)`) the shape witnesses plus the bytes-typed
+    -- entry fragment (the param resolves to bytes on both sides) are recovered.
+    -- Keyed on the DECIDABLE classifier, it is VACUOUS for every non-hash body, so
+    -- the omnibus stays jointly satisfiable; its only consumer is the conformance
+    -- harness, which discharges it per fixture from the bytes-typed entry.
+    (hHashCallFrag :
+      RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true →
+        ∃ (bn arg func : String) (src : Option SourceLoc)
+          (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          (anfM.params.map (·.name)).reverse = [arg] ∧
+          anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
+          (func = "sha256" ∨ func = "hash160") ∧
+          initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
+          initialStack.stack = .vBytes argBytes :: rest ∧
+          argBytes.size ≤ 520)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
@@ -5525,12 +5767,35 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                   · exact compileSafe_observational_correct_modulo_crypto_call_codegen
                       p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
                       [(a, Agrees.SlotKind.param)] hAgrees trivial
-                · -- Substrate-gap fallback: no structural classifier fires.
-                  -- This is the crypto-call family (no dedicated Bool checker
-                  -- until A4-crypto + Phase B per-primitive land). The
-                  -- sub-omnibus hypothesis is `True`.
-                  exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+                · -- **crypto_call hash-peel branch.**  Before the universal
+                  -- fallback, the decidable `hashCallConsumeShapeBool` classifier
+                  -- peels the single-`sha256`/`hash160`-call method fragment: the
+                  -- keyed `hHashCallFrag` premise recovers the shape witnesses + the
+                  -- bytes-typed entry, and the discharged consume theorem fires
+                  -- (RAW = the bare allowlisted opcode).  Non-hash bodies fall
+                  -- through to the sound crypto_call fallback — NO new axiom.
+                  by_cases hHashShape :
+                      RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true
+                  · by_cases hHashName : anfM.name ≠ "constructor"
+                    · obtain ⟨bn, harg, hfunc, hsrc, hargBytes, hrestV,
+                        hHParams, hHBody, hHFunc, hHArg, hHStk, hHLen⟩ := hHashCallFrag hHashShape
+                      rcases hHFunc with hF | hF
+                      · subst hF
+                        exact hashCall_consume_sha256 p anfM bytes bn harg hsrc hMem hPublic hSafe
+                          initialAnf initialStack hSinglePublic hHashName hHParams hHBody
+                          hargBytes hrestV hHArg hHStk hHLen
+                      · subst hF
+                        exact hashCall_consume_hash160 p anfM bytes bn harg hsrc hMem hPublic hSafe
+                          initialAnf initialStack hSinglePublic hHashName hHParams hHBody
+                          hargBytes hrestV hHArg hHStk hHLen
+                    · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+                  · -- Substrate-gap fallback: no structural classifier fires.
+                    -- This is the crypto-call family (no dedicated Bool checker
+                    -- until A4-crypto + Phase B per-primitive land). The
+                    -- sub-omnibus hypothesis is `True`.
+                    exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
 
 /--
 **Capstone variant consuming `SupportedANFBody`.**
@@ -5588,6 +5853,23 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       Agrees.methodCallConsumeShapeBool p.methods anfM = true →
         ∃ a, (anfM.params.map (·.name)).reverse = [a] ∧
              tsm = [(a, Agrees.SlotKind.param)])
+    -- **crypto_call hash-peel premise (keyed).**  For a body in the single-hash-call
+    -- consume fragment (decided by `hashCallConsumeShapeBool` — one param, one
+    -- binding `bn = sha256/hash160(param)`) the shape witnesses plus the bytes-typed
+    -- entry fragment (the param resolves to bytes on both sides) are recovered.
+    -- Keyed on the DECIDABLE classifier, it is VACUOUS for every non-hash body, so
+    -- the omnibus stays jointly satisfiable; its only consumer is the conformance
+    -- harness, which discharges it per fixture from the bytes-typed entry.
+    (hHashCallFrag :
+      RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true →
+        ∃ (bn arg func : String) (src : Option SourceLoc)
+          (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          (anfM.params.map (·.name)).reverse = [arg] ∧
+          anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
+          (func = "sha256" ∨ func = "hash160") ∧
+          initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
+          initialStack.stack = .vBytes argBytes :: rest ∧
+          argBytes.size ≤ 520)
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
     successAgrees
@@ -5596,7 +5878,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
     Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
-    hMethodCallFrag hCoh
+    hMethodCallFrag hHashCallFrag hCoh
 
 
 end Soundness
