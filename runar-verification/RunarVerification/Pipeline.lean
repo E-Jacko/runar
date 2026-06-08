@@ -2910,6 +2910,15 @@ discharges in Phase B (`Stack.HashOps`, `Stack.Blake3`, `Stack.Ec`,
 `Stack.P256P384`, `Stack.Wots`, `Stack.SlhDsa`, `Stack.Rabin`) supply
 the runtime-side composition once they land.
 
+**Partial peel (single-hash-call methods).** The fallback's effective
+scope is already NARROWED: whole single-public `sha256`/`hash160`-call
+method bodies (decided by `Stack.AgreesHashCall.hashCallConsumeShapeBool`)
+are discharged by the PROVEN theorems `hashCall_consume_{sha256,hash160}`
+in the dispatch BEFORE this axiom is reached — through the real
+`Stack.HashOps` codegen-to-spec, with NO dependence on this axiom. The
+axiom survives only as the residual for crypto bodies OUTSIDE that
+fragment (multi-binding, non-hash primitives, chained calls).
+
 Discharge path: this sub-omnibus retires after Phase B per-primitive
 codegen-to-spec discharges + A4-crypto Stage C wrappers land; the
 hypothesis tightens to a dedicated `structuralCryptoCallBody`
