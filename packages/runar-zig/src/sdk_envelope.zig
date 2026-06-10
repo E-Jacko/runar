@@ -9,6 +9,7 @@
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
+const envelope_sign = @import("sdk_envelope_sign.zig");
 
 // ---------------------------------------------------------------------------
 // Value tree — minimal JSON-shaped value used by the canonical serializer.
@@ -343,6 +344,59 @@ pub fn signEnvelope(allocator: std.mem.Allocator, opts: SignEnvelopeOpts) !Signe
     errdefer allocator.free(sig_hex);
 
     const pubkey_copy = try allocator.dupe(u8, opts.pubkey_hex);
+
+    return SignedEnvelope{
+        .payload = payload,
+        .sig = sig_hex,
+        .pubkey = pubkey_copy,
+        .nonce = nonce,
+        .expiresAt = expires_at,
+    };
+}
+
+pub const SignEnvelopeWithKeyOpts = struct {
+    data: []const Value.KeyValue,
+    /// 32-byte big-endian secp256k1 private key.
+    private_key: [32]u8,
+    ttl_ms: i64 = 30_000,
+    /// Wall-clock ms used as the nonce (see SignEnvelopeOpts.now_ms).
+    now_ms: i64,
+};
+
+/// Convenience: sign an envelope directly from a private key using canonical
+/// RFC 6979 deterministic ECDSA whose nonce HMAC uses PLAIN SHA-256 (GAP-064).
+/// This is the cross-tier-correct signing path for overlay apps — it produces
+/// byte-identical signatures to the other six Rúnar SDKs, unlike a `sign_fn`
+/// routed through bsvz (SHA-256d nonce) or Zig stdlib's additional-randomness
+/// ECDSA. The compressed pubkey is derived from the key.
+pub fn signEnvelopeWithKey(allocator: std.mem.Allocator, opts: SignEnvelopeWithKeyOpts) !SignedEnvelope {
+    const nonce: i64 = opts.now_ms;
+    const expires_at = nonce + opts.ttl_ms;
+
+    var merged: std.ArrayListUnmanaged(Value.KeyValue) = .empty;
+    defer merged.deinit(allocator);
+    try merged.appendSlice(allocator, opts.data);
+    try merged.append(allocator, .{ .key = "nonce", .value = .{ .Int = nonce } });
+    try merged.append(allocator, .{ .key = "expiresAt", .value = .{ .Int = expires_at } });
+
+    const payload = try canonicalJson(allocator, .{ .Object = merged.items });
+    errdefer allocator.free(payload);
+
+    var digest: [32]u8 = undefined;
+    Sha256.hash(payload, &digest, .{});
+
+    var der_buf: [72]u8 = undefined;
+    const der = try envelope_sign.signDigestLowSDer(opts.private_key, digest, &der_buf);
+    const sig_hex = try bytesToHex(allocator, der);
+    errdefer allocator.free(sig_hex);
+
+    // Derive compressed pubkey hex from the private key. Note:
+    // KeyPair.generateDeterministic derives a key FROM a seed (it is NOT the
+    // private key), so we build the key pair directly from the secret scalar.
+    const secret = try Ecdsa.SecretKey.fromBytes(opts.private_key);
+    const kp = try Ecdsa.KeyPair.fromSecretKey(secret);
+    const compressed = kp.public_key.toCompressedSec1();
+    const pubkey_copy = try bytesToHex(allocator, &compressed);
 
     return SignedEnvelope{
         .payload = payload,

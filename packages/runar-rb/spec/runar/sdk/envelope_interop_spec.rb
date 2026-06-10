@@ -7,8 +7,10 @@
 # See CLAUDE.md §"Seven SDKs Must Stay in Sync".
 
 require 'spec_helper'
+require 'digest'
 require 'json'
 require 'runar/sdk'
+require 'runar/ecdsa'
 
 FIXTURE_PATH = File.expand_path('../../../../../../conformance/sdk-envelope/fixtures.json', __FILE__)
 
@@ -34,6 +36,25 @@ RSpec.describe 'Runar::SDK::Envelope cross-tier interop' do
       r = Runar::SDK::Envelope.verify_envelope(envelope: env, now_ms: fixture['verify_now_ms'])
       expect(r[:ok]).to be(false), "rejection #{v['reason']} should be ok=false"
       expect(r[:reason]).to eq(v['reason']), "rejection #{v['reason']}: got #{r[:reason]}"
+    end
+  end
+
+  # GAP-064 cross-tier signing reproduction. Signing the SAME payload with the
+  # SAME key (priv=1) via RFC 6979 deterministic ECDSA (plain-SHA-256 nonce,
+  # low-S) MUST yield the byte-identical DER signature the TS reference
+  # committed. ecdsa_sign signs the 32-byte digest directly.
+  it 'reproduces every signing vector byte-identically' do
+    alice_priv = 1
+    fixture['signing_vectors'].each do |v|
+      vid = v['_vector_id'] || '?'
+      # Drift guard: re-derive the canonical payload from data + lifetime.
+      merged = v['data'].merge('nonce' => v['nonce'], 'expiresAt' => v['expiresAt'])
+      payload = Runar::SDK::Envelope.canonical_json(merged)
+      expect(payload).to eq(v['expected_payload']), "vector #{vid}: payload"
+
+      digest = Digest::SHA256.digest(payload)
+      der = Runar::ECDSA.ecdsa_sign(alice_priv, digest).unpack1('H*')
+      expect(der).to eq(v['expected_sig']), "vector #{vid}: signature divergence"
     end
   end
 

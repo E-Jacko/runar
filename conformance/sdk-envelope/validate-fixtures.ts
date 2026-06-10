@@ -30,7 +30,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BigNumber, Hash, PrivateKey, PublicKey, Signature, Utils } from '@bsv/sdk';
-import { verify as ecdsaVerifyRaw } from '@bsv/sdk/primitives/ECDSA';
+import { verify as ecdsaVerifyRaw, sign as ecdsaSign } from '@bsv/sdk/primitives/ECDSA';
 // The SDK's wire `canonicalJson` (runar-sdk/src/envelope.ts) is a literal
 // re-export of this `canonicalJsonStringify`, so importing the source here
 // tests the identical function while avoiding a build of runar-ir-schema's
@@ -89,7 +89,41 @@ function main(): void {
     fail('valid_envelope.sig does not verify for its payload under the TS reference (canonicalJson/sha256/ECDSA drift)');
   }
 
-  console.log(`OK: ${vectors.length} canonical-JSON vectors + valid envelope signature validate against the TS reference.`);
+  // 3. GAP-064 signing vectors: re-derive payload + deterministic low-S DER
+  //    signature from the TS reference and assert byte-identity. This is the
+  //    drift guard for the cross-tier signing-reproduction matrix — if TS's
+  //    canonicalJson or its RFC 6979 (plain-SHA-256-nonce) ECDSA path drifts
+  //    from the committed bytes, this fails before any non-TS tier replays
+  //    against a stale expected_sig.
+  const alicePriv = new PrivateKey(1n);
+  const signingVectors = fixture.signing_vectors as Array<{
+    _vector_id?: string;
+    data: Record<string, unknown>;
+    nonce: number;
+    expiresAt: number;
+    expected_payload: string;
+    expected_sig: string;
+  }>;
+  if (!Array.isArray(signingVectors) || signingVectors.length === 0) {
+    fail('signing_vectors missing or empty');
+  }
+  for (const [i, v] of signingVectors.entries()) {
+    const id = v._vector_id ? ` (${v._vector_id})` : '';
+    const payload = canonicalJson({ ...v.data, nonce: v.nonce, expiresAt: v.expiresAt });
+    if (payload !== v.expected_payload) {
+      fail(`signing_vectors[${i}]${id}: expected_payload ${JSON.stringify(v.expected_payload)}, got ${JSON.stringify(payload)}`);
+    }
+    const d = Hash.sha256(Utils.toArray(payload, 'utf8'));
+    // forceLowS=true ⇒ canonical low-S form; the digest IS the message
+    // representative (sign the prehash directly, never re-hash).
+    const sig = ecdsaSign(new BigNumber(d), alicePriv, true);
+    const der = Utils.toHex(sig.toDER() as number[]);
+    if (der !== v.expected_sig) {
+      fail(`signing_vectors[${i}]${id}: expected_sig\n  committed:  ${v.expected_sig}\n  recomputed: ${der}`);
+    }
+  }
+
+  console.log(`OK: ${vectors.length} canonical-JSON vectors + valid envelope signature + ${signingVectors.length} signing vectors validate against the TS reference.`);
 }
 
 main();
