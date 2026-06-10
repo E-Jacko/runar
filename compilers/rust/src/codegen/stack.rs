@@ -797,6 +797,38 @@ impl LoweringContext {
         }
     }
 
+    /// Consume-vs-copy decision for one operand of a multi-operand ANF value.
+    ///
+    /// `operands` is the FULL operand-ref list of the value (including
+    /// `operand_ref` itself). The load may consume (ROLL / move) the ref only
+    /// when this binding is the ref's last use AND the ref occurs exactly
+    /// once in the operand list. A ref that is read at more than one operand
+    /// position of the same value must be copied (PICK / DUP) at EVERY
+    /// position: each operand position needs its own stack slot, and a
+    /// consume-mode load of a ref that is already on top of the stack is a
+    /// no-op (see `bring_to_top`), so two consume-mode loads of the same ref
+    /// would leave a single slot for an opcode that pops one item per operand
+    /// (e.g. `t := x + x` underflowing OP_ADD), or — when the ref sits below
+    /// other live slots — silently pair the opcode with the wrong slot. The
+    /// original value then simply stays on the stack, exactly like any ref
+    /// whose last use is a later binding.
+    ///
+    /// Unreachable from the frontend (ANF lowering gives every operand a
+    /// fresh temp); reachable via `compile_from_ir` / CLI `--ir` hand-written
+    /// ANF.
+    fn operand_consume<S: AsRef<str>>(
+        &self,
+        operand_ref: &str,
+        operands: &[S],
+        current_index: usize,
+        last_uses: &HashMap<String, usize>,
+    ) -> bool {
+        if !self.is_last_use(operand_ref, current_index, last_uses) {
+            return false;
+        }
+        operands.iter().filter(|o| o.as_ref() == operand_ref).count() <= 1
+    }
+
     fn bring_to_top(&mut self, name: &str, consume: bool) {
         let depth = self
             .sm
@@ -1202,11 +1234,11 @@ impl LoweringContext {
         last_uses: &HashMap<String, usize>,
         result_type: Option<&str>,
     ) {
-        let left_is_last = self.is_last_use(left, binding_index, last_uses);
-        self.bring_to_top(left, left_is_last);
+        let left_consume = self.operand_consume(left, &[left, right], binding_index, last_uses);
+        self.bring_to_top(left, left_consume);
 
-        let right_is_last = self.is_last_use(right, binding_index, last_uses);
-        self.bring_to_top(right, right_is_last);
+        let right_consume = self.operand_consume(right, &[left, right], binding_index, last_uses);
+        self.bring_to_top(right, right_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -1491,8 +1523,8 @@ impl LoweringContext {
 
         // General builtin: push args in order, then emit opcodes
         for arg in args {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
 
         for _ in args {
@@ -1576,8 +1608,8 @@ impl LoweringContext {
         // Bind call arguments to private method params.
         for (i, arg) in args.iter().enumerate() {
             if i < method.params.len() {
-                let is_last = self.is_last_use(arg, binding_index, last_uses);
-                self.bring_to_top(arg, is_last);
+                let consume = self.operand_consume(arg, args, binding_index, last_uses);
+                self.bring_to_top(arg, consume);
                 self.sm.pop();
 
                 let param_name = &method.params[i].name;
@@ -2086,12 +2118,14 @@ impl LoweringContext {
         let state_bytes_ref = &args[1];
 
         // Bring stateBytes to stack first.
-        let sb_last = self.is_last_use(state_bytes_ref, binding_index, last_uses);
-        self.bring_to_top(state_bytes_ref, sb_last);
+        let sb_consume =
+            self.operand_consume(state_bytes_ref, &[preimage_ref, state_bytes_ref], binding_index, last_uses);
+        self.bring_to_top(state_bytes_ref, sb_consume);
 
         // Extract amount from preimage for the continuation output.
-        let pre_last = self.is_last_use(preimage_ref, binding_index, last_uses);
-        self.bring_to_top(preimage_ref, pre_last);
+        let pre_consume =
+            self.operand_consume(preimage_ref, &[preimage_ref, state_bytes_ref], binding_index, last_uses);
+        self.bring_to_top(preimage_ref, pre_consume);
 
         // Extract amount: last 52 bytes, take 8 bytes at offset 0.
         self.emit_op(StackOp::Opcode("OP_SIZE".into()));
@@ -2192,15 +2226,17 @@ impl LoweringContext {
         let state_bytes_ref = &args[1];
         let new_amount_ref = &args[2];
 
+        let cso_operands = [preimage_ref, state_bytes_ref, new_amount_ref];
+
         // Consume preimage ref (no longer needed — we use _codePart and _newAmount).
-        let pre_last = self.is_last_use(preimage_ref, binding_index, last_uses);
-        self.bring_to_top(preimage_ref, pre_last);
+        let pre_consume = self.operand_consume(preimage_ref, &cso_operands, binding_index, last_uses);
+        self.bring_to_top(preimage_ref, pre_consume);
         self.emit_op(StackOp::Drop);
         self.sm.pop();
 
         // Step 1: Convert _newAmount to 8-byte LE and save to altstack.
-        let amount_last = self.is_last_use(new_amount_ref, binding_index, last_uses);
-        self.bring_to_top(new_amount_ref, amount_last);
+        let amount_consume = self.operand_consume(new_amount_ref, &cso_operands, binding_index, last_uses);
+        self.bring_to_top(new_amount_ref, amount_consume);
         self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
@@ -2211,8 +2247,8 @@ impl LoweringContext {
         self.sm.pop();
 
         // Step 2: Bring stateBytes to stack.
-        let sb_last = self.is_last_use(state_bytes_ref, binding_index, last_uses);
-        self.bring_to_top(state_bytes_ref, sb_last);
+        let sb_consume = self.operand_consume(state_bytes_ref, &cso_operands, binding_index, last_uses);
+        self.bring_to_top(state_bytes_ref, sb_consume);
 
         // Step 3: Bring _codePart to top (PICK — never consume, reused across outputs)
         self.bring_to_top("_codePart", false);
@@ -2283,8 +2319,8 @@ impl LoweringContext {
         self.sm.push("");
 
         // Push the 20-byte PKH
-        let pkh_last = self.is_last_use(pkh_ref, binding_index, last_uses);
-        self.bring_to_top(pkh_ref, pkh_last);
+        let pkh_consume = self.operand_consume(pkh_ref, &[pkh_ref, amount_ref], binding_index, last_uses);
+        self.bring_to_top(pkh_ref, pkh_consume);
         // CAT: prefix || pkh
         self.emit_op(StackOp::Opcode("OP_CAT".into()));
         self.sm.pop();
@@ -2302,8 +2338,8 @@ impl LoweringContext {
         // --- Stack: [..., 0x1976a914{pkh}88ac] ---
 
         // Step 2: Prepend amount as 8-byte LE.
-        let amount_last = self.is_last_use(amount_ref, binding_index, last_uses);
-        self.bring_to_top(amount_ref, amount_last);
+        let amount_consume = self.operand_consume(amount_ref, &[pkh_ref, amount_ref], binding_index, last_uses);
+        self.bring_to_top(amount_ref, amount_consume);
         self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
@@ -2343,6 +2379,9 @@ impl LoweringContext {
             .filter(|p| !p.readonly)
             .cloned()
             .collect();
+        let output_operands: Vec<&str> = std::iter::once(satoshis)
+            .chain(state_values.iter().map(|s| s.as_str()))
+            .collect();
 
         // Step 1: Bring _codePart to top (PICK — never consume, reused across outputs)
         self.bring_to_top("_codePart", false);
@@ -2364,8 +2403,8 @@ impl LoweringContext {
             }
             let prop = &state_props[i];
 
-            let is_last = self.is_last_use(value_ref, binding_index, last_uses);
-            self.bring_to_top(value_ref, is_last);
+            let consume = self.operand_consume(value_ref, &output_operands, binding_index, last_uses);
+            self.bring_to_top(value_ref, consume);
 
             if prop.prop_type == "bigint" {
                 self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
@@ -2405,8 +2444,8 @@ impl LoweringContext {
         // --- Stack: [..., varint+script] ---
 
         // Step 6: Prepend satoshis as 8-byte LE.
-        let is_last_satoshis = self.is_last_use(satoshis, binding_index, last_uses);
-        self.bring_to_top(satoshis, is_last_satoshis);
+        let satoshis_consume = self.operand_consume(satoshis, &output_operands, binding_index, last_uses);
+        self.bring_to_top(satoshis, satoshis_consume);
         self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
@@ -2438,8 +2477,9 @@ impl LoweringContext {
         last_uses: &HashMap<String, usize>,
     ) {
         // Step 1: Bring scriptBytes to top
-        let script_is_last = self.is_last_use(script_bytes, binding_index, last_uses);
-        self.bring_to_top(script_bytes, script_is_last);
+        let script_consume =
+            self.operand_consume(script_bytes, &[satoshis, script_bytes], binding_index, last_uses);
+        self.bring_to_top(script_bytes, script_consume);
 
         // Step 2: Compute varint prefix for script length
         self.emit_op(StackOp::Opcode("OP_SIZE".to_string())); // [script, len]
@@ -2456,8 +2496,9 @@ impl LoweringContext {
         self.sm.push("");
 
         // Step 4: Prepend satoshis as 8-byte LE
-        let sat_is_last = self.is_last_use(satoshis, binding_index, last_uses);
-        self.bring_to_top(satoshis, sat_is_last);
+        let sat_consume =
+            self.operand_consume(satoshis, &[satoshis, script_bytes], binding_index, last_uses);
+        self.bring_to_top(satoshis, sat_consume);
         self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
@@ -2575,10 +2616,18 @@ impl LoweringContext {
         self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
         self.sm.push("");
 
+        // A ref repeated across the combined element list (e.g. the same
+        // pubkey twice) must be copied at every position — see operand_consume.
+        let msig_operands: Vec<&str> = sig_elems
+            .iter()
+            .map(|s| s.as_str())
+            .chain(pk_elems.iter().map(|s| s.as_str()))
+            .collect();
+
         // Bring each sig element to TOS in declaration order.
         for sig in &sig_elems {
-            let is_last = self.is_last_use(sig, binding_index, last_uses);
-            self.bring_to_top(sig, is_last);
+            let consume = self.operand_consume(sig, &msig_operands, binding_index, last_uses);
+            self.bring_to_top(sig, consume);
         }
 
         // Push nSigs.
@@ -2587,8 +2636,8 @@ impl LoweringContext {
 
         // Bring each pubkey element to TOS in declaration order.
         for pk in &pk_elems {
-            let is_last = self.is_last_use(pk, binding_index, last_uses);
-            self.bring_to_top(pk, is_last);
+            let consume = self.operand_consume(pk, &msig_operands, binding_index, last_uses);
+            self.bring_to_top(pk, consume);
         }
 
         // Push nPKs.
@@ -3390,12 +3439,12 @@ impl LoweringContext {
         let index = &args[1];
 
         // Push the data (ByteString) onto the stack
-        let obj_is_last = self.is_last_use(obj, binding_index, last_uses);
-        self.bring_to_top(obj, obj_is_last);
+        let obj_consume = self.operand_consume(obj, args, binding_index, last_uses);
+        self.bring_to_top(obj, obj_consume);
 
         // Push the index onto the stack
-        let index_is_last = self.is_last_use(index, binding_index, last_uses);
-        self.bring_to_top(index, index_is_last);
+        let index_consume = self.operand_consume(index, args, binding_index, last_uses);
+        self.bring_to_top(index, index_consume);
 
         // OP_SPLIT at index: stack = [..., left, right]
         self.sm.pop();  // index consumed
@@ -3494,11 +3543,11 @@ impl LoweringContext {
         let start = &args[1];
         let length = &args[2];
 
-        let data_is_last = self.is_last_use(data, binding_index, last_uses);
-        self.bring_to_top(data, data_is_last);
+        let data_consume = self.operand_consume(data, args, binding_index, last_uses);
+        self.bring_to_top(data, data_consume);
 
-        let start_is_last = self.is_last_use(start, binding_index, last_uses);
-        self.bring_to_top(start, start_is_last);
+        let start_consume = self.operand_consume(start, args, binding_index, last_uses);
+        self.bring_to_top(start, start_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -3511,8 +3560,8 @@ impl LoweringContext {
         let right_part = self.sm.pop();
         self.sm.push(&right_part);
 
-        let len_is_last = self.is_last_use(length, binding_index, last_uses);
-        self.bring_to_top(length, len_is_last);
+        let len_consume = self.operand_consume(length, args, binding_index, last_uses);
+        self.bring_to_top(length, len_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -3543,8 +3592,8 @@ impl LoweringContext {
 
         // Bring all 4 args to the top in argument order: msg sig padding pubKey
         for arg in args {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
 
         // Pop all 4 args from stack map
@@ -3603,11 +3652,11 @@ impl LoweringContext {
         let data = &args[0];
         let length = &args[1];
 
-        let data_is_last = self.is_last_use(data, binding_index, last_uses);
-        self.bring_to_top(data, data_is_last);
+        let data_consume = self.operand_consume(data, args, binding_index, last_uses);
+        self.bring_to_top(data, data_consume);
 
-        let length_is_last = self.is_last_use(length, binding_index, last_uses);
-        self.bring_to_top(length, length_is_last);
+        let length_consume = self.operand_consume(length, args, binding_index, last_uses);
+        self.bring_to_top(length, length_consume);
 
         self.sm.pop(); // len
         self.sm.pop(); // data
@@ -3636,8 +3685,8 @@ impl LoweringContext {
         assert!(args.len() >= 3, "verifyWOTS requires 3 arguments: msg, sig, pubkey");
 
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..3 { self.sm.pop(); }
 
@@ -3666,8 +3715,8 @@ impl LoweringContext {
 
         // Bring args to top in order: msg, sig, pubkey
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..3 {
             self.sm.pop();
@@ -3696,8 +3745,8 @@ impl LoweringContext {
             "sha256Compress requires 2 arguments: state, block"
         );
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..2 {
             self.sm.pop();
@@ -3721,8 +3770,8 @@ impl LoweringContext {
             "sha256Finalize requires 3 arguments: state, remaining, msgBitLen"
         );
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..3 {
             self.sm.pop();
@@ -3746,8 +3795,8 @@ impl LoweringContext {
             "blake3Compress requires 2 arguments: chainingValue, block"
         );
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..2 {
             self.sm.pop();
@@ -3771,8 +3820,8 @@ impl LoweringContext {
             "blake3Hash requires 1 argument: message"
         );
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..1 {
             self.sm.pop();
@@ -3794,8 +3843,8 @@ impl LoweringContext {
     ) {
         // Bring args to top in order
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in args {
             self.sm.pop();
@@ -3835,8 +3884,8 @@ impl LoweringContext {
     ) {
         // Bring args to top in order
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in args {
             self.sm.pop();
@@ -3883,8 +3932,8 @@ impl LoweringContext {
         );
         // Bring all 3 args to top in order: msg, sig, pubkey
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         self.sm.pop(); // pubkey
         self.sm.pop(); // sig
@@ -3916,8 +3965,8 @@ impl LoweringContext {
     ) {
         // Bring all args to stack top
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in args {
             self.sm.pop();
@@ -3959,8 +4008,8 @@ impl LoweringContext {
     ) {
         // Bring all args to stack top
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in args {
             self.sm.pop();
@@ -4002,8 +4051,8 @@ impl LoweringContext {
     ) {
         // Bring all args to stack top in order
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in args {
             self.sm.pop();
@@ -4080,8 +4129,8 @@ impl LoweringContext {
         // Bring leaf, proof, index to stack top for the codegen
         for i in 0..3 {
             let arg = &args[i];
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         // Pop the 3 args -- the codegen consumes them and produces 1 result
         for _ in 0..3 {
@@ -4112,11 +4161,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "safediv requires 2 arguments");
 
-        let a_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], a_is_last);
+        let a_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], a_consume);
 
-        let b_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], b_is_last);
+        let b_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], b_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -4141,11 +4190,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "safemod requires 2 arguments");
 
-        let a_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], a_is_last);
+        let a_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], a_consume);
 
-        let b_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], b_is_last);
+        let b_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], b_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -4170,19 +4219,19 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 3, "clamp requires 3 arguments");
 
-        let val_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], val_is_last);
+        let val_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], val_consume);
 
-        let lo_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], lo_is_last);
+        let lo_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], lo_consume);
 
         self.sm.pop();
         self.sm.pop();
         self.emit_op(StackOp::Opcode("OP_MAX".to_string()));
         self.sm.push(""); // intermediate result
 
-        let hi_is_last = self.is_last_use(&args[2], binding_index, last_uses);
-        self.bring_to_top(&args[2], hi_is_last);
+        let hi_consume = self.operand_consume(&args[2], args, binding_index, last_uses);
+        self.bring_to_top(&args[2], hi_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -4205,11 +4254,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "pow requires 2 arguments");
 
-        let base_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], base_is_last);
+        let base_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], base_consume);
 
-        let exp_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], exp_is_last);
+        let exp_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], exp_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -4251,19 +4300,19 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 3, "mulDiv requires 3 arguments");
 
-        let a_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], a_is_last);
+        let a_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], a_consume);
 
-        let b_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], b_is_last);
+        let b_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], b_consume);
 
         self.sm.pop();
         self.sm.pop();
         self.emit_op(StackOp::Opcode("OP_MUL".to_string()));
         self.sm.push(""); // a*b
 
-        let c_is_last = self.is_last_use(&args[2], binding_index, last_uses);
-        self.bring_to_top(&args[2], c_is_last);
+        let c_consume = self.operand_consume(&args[2], args, binding_index, last_uses);
+        self.bring_to_top(&args[2], c_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -4284,11 +4333,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "percentOf requires 2 arguments");
 
-        let amount_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], amount_is_last);
+        let amount_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], amount_consume);
 
-        let bps_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], bps_is_last);
+        let bps_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], bps_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -4365,11 +4414,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "gcd requires 2 arguments");
 
-        let a_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], a_is_last);
+        let a_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], a_consume);
 
-        let b_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], b_is_last);
+        let b_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], b_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -4421,11 +4470,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "divmod requires 2 arguments");
 
-        let a_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], a_is_last);
+        let a_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], a_consume);
 
-        let b_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], b_is_last);
+        let b_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], b_consume);
 
         self.sm.pop();
         self.sm.pop();
