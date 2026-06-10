@@ -184,6 +184,76 @@ theorem single_sha256_body_successAgrees
       (runOps [.opcode "OP_SHA256"] sStk) :=
   crypto_call_M2_agreement s x bytes hx sStk rest hStk hLen
 
+/-! ## Part 4b — the `hash160` peer (the second allowlisted single-op hash)
+
+`hash160` is the other single-arg hash whose lowered op (`OP_HASH160`) is in
+`Script.Parse.isAllowedOpcodeName`, so it is the second round-trippable
+crypto-call fragment named by the peel-off scope. The ANF side now computes
+`Crypto.hash160 = ripemd160 ∘ sha256` through the SAME backend the Stack VM hits
+via `OP_HASH160`, so the M2 leg agrees exactly as for `sha256`. These lemmas
+mirror Part 2/3/4 against `hash160_step_transport` (Part 1). -/
+
+/-- `callBuiltin?` `hash160` arm: on a single bytes value it returns
+`some (.vBytes (Crypto.hash160 b))` through the shared backend (peer of
+`callBuiltin_sha256_bytes`). -/
+theorem callBuiltin_hash160_bytes (b : ByteArray) :
+    callBuiltin? "hash160" [.vBytes b] = .ok (some (.vBytes (hash160 b))) := rfl
+
+/-- `evalValue` on a `.call "hash160"` binding SUCCEEDS, producing
+`.vBytes (Crypto.hash160 b)` against the SAME backend the Stack side uses (peer
+of `evalValue_call_sha256_eq`). -/
+theorem evalValue_call_hash160_eq
+    (s : State) (x : String) (bytes : ByteArray)
+    (hx : s.resolveRef x = some (.vBytes bytes)) :
+    evalValue s (.call "hash160" [x]) = .ok (.vBytes (hash160 bytes), s) := by
+  show evalValue s (RunarVerification.ANF.ANFValue.call "hash160" [x])
+      = .ok (.vBytes (hash160 bytes), s)
+  unfold evalValue
+  simp only [List.mapM_cons, List.mapM_nil, RunarVerification.ANF.Eval.lookupRef, hx,
+    bind, Except.bind, pure, Except.pure]
+  rw [callBuiltin_hash160_bytes]
+
+/-- The success bit of the ANF eval is `true` (peer of
+`evalValue_call_sha256_isSome`). -/
+theorem evalValue_call_hash160_isSome
+    (s : State) (x : String) (bytes : ByteArray)
+    (hx : s.resolveRef x = some (.vBytes bytes)) :
+    (evalValue s (.call "hash160" [x])).toOption.isSome = true := by
+  rw [evalValue_call_hash160_eq s x bytes hx]; rfl
+
+/-- **The crypto_call M2 step agreement (hash160).**  For a state `s` resolving
+`x` to `bytes`, and the matching stack `sStk` with `bytes` on top, the ANF eval
+of `.call "hash160" [x]` and the Stack run of `[OP_HASH160]` SHARE their success
+bit (`successAgrees`). Both succeed, against the same backend (peer of
+`crypto_call_M2_agreement`). -/
+theorem crypto_call_M2_agreement_hash160
+    (s : State) (x : String) (bytes : ByteArray)
+    (hx : s.resolveRef x = some (.vBytes bytes))
+    (sStk : StackState) (rest : List Value)
+    (hStk : sStk.stack = .vBytes bytes :: rest)
+    (hLen : bytes.size ≤ 520) :
+    successAgrees (evalValue s (.call "hash160" [x]))
+      (runOps [.opcode "OP_HASH160"] sStk) := by
+  have hAnf : (evalValue s (.call "hash160" [x])).toOption.isSome = true :=
+    evalValue_call_hash160_isSome s x bytes hx
+  have hStack : (runOps [.opcode "OP_HASH160"] sStk).toOption.isSome = true := by
+    rw [hash160_step_transport sStk bytes rest hStk hLen]; rfl
+  show (evalValue s (.call "hash160" [x])).toOption.isSome
+      ↔ (runOps [.opcode "OP_HASH160"] sStk).toOption.isSome
+  rw [hAnf, hStack]
+
+/-- **Body-level `successAgrees` for the single-`hash160`-call fragment** (peer of
+`single_sha256_body_successAgrees`). -/
+theorem single_hash160_body_successAgrees
+    (s : State) (x : String) (bytes : ByteArray)
+    (hx : s.resolveRef x = some (.vBytes bytes))
+    (sStk : StackState) (rest : List Value)
+    (hStk : sStk.stack = .vBytes bytes :: rest)
+    (hLen : bytes.size ≤ 520) :
+    successAgrees (evalValue s (.call "hash160" [x]))
+      (runOps [.opcode "OP_HASH160"] sStk) :=
+  crypto_call_M2_agreement_hash160 s x bytes hx sStk rest hStk hLen
+
 /-! ## Part 5 — MANDATORY in-file smokes (anti-vacuous, concrete)
 
 The smokes fire on the SUCCESS BIT, which is observable without forcing the
@@ -246,5 +316,40 @@ theorem smoke_M2_bits_concrete :
     (evalValue smokeState (.call "sha256" ["x"])).toOption.isSome = true
     ∧ (runOps [.opcode "OP_SHA256"] smokeStk).toOption.isSome = true :=
   ⟨smoke_anf_sha256_succeeds, smoke_stack_sha256_succeeds⟩
+
+/-- SMOKE (Part 4b — hash160).  The ANF eval of `.call "hash160" ["x"]` on the
+concrete state SUCCEEDS — the hash160 model arm computes through the shared
+backend. -/
+theorem smoke_anf_hash160_succeeds :
+    (evalValue smokeState (.call "hash160" ["x"])).toOption.isSome = true :=
+  evalValue_call_hash160_isSome smokeState "x" (ByteArray.mk #[1, 2, 3]) smoke_resolve
+
+/-- SMOKE (Part 4b — hash160).  The Stack run of `[OP_HASH160]` on the concrete
+stack really succeeds, firing the shared backend through `OP_HASH160`. -/
+theorem smoke_stack_hash160_succeeds :
+    (runOps [.opcode "OP_HASH160"] smokeStk).toOption.isSome = true := by
+  have h :
+      runOps [.opcode "OP_HASH160"] smokeStk
+        = .ok ({ smokeStk with
+                  stack := .vBytes (hash160 (ByteArray.mk #[1, 2, 3])) :: [] }) :=
+    hash160_step_transport smokeStk (ByteArray.mk #[1, 2, 3]) [] rfl (by decide)
+  rw [h]; rfl
+
+/-- SMOKE (Part 4b — the hash160 headline).  The M2 AGREEMENT lemma FIRES on the
+concrete state/stack pair for hash160: ANF (true) / Stack (true) success bits ARE
+equivalent — the anti-fraud witness that the hash160 M2 leg genuinely agrees. -/
+theorem smoke_crypto_call_M2_agreement_hash160 :
+    successAgrees (evalValue smokeState (.call "hash160" ["x"]))
+      (runOps [.opcode "OP_HASH160"] smokeStk) :=
+  crypto_call_M2_agreement_hash160 smokeState "x" (ByteArray.mk #[1, 2, 3]) smoke_resolve
+    smokeStk [] rfl (by decide)
+
+/-- SMOKE (Part 4b).  The hash160 body-level `successAgrees` fires on the concrete
+pair — the single-`hash160`-call fragment's body agrees with its deployed script. -/
+theorem smoke_single_hash160_body_successAgrees :
+    successAgrees (evalValue smokeState (.call "hash160" ["x"]))
+      (runOps [.opcode "OP_HASH160"] smokeStk) :=
+  single_hash160_body_successAgrees smokeState "x" (ByteArray.mk #[1, 2, 3])
+    smoke_resolve smokeStk [] rfl (by decide)
 
 end RunarVerification.Stack.AgreesCrypto

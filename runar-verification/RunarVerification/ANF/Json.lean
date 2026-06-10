@@ -131,18 +131,41 @@ instance : ToJson SourceLoc where
     ("column", .num ⟨s.column, 0⟩)
   ]
 
-/-! ## ANFType -/
+/-! ## ANFType
 
-instance : FromJson ANFType where
-  fromJson? j := match j with
+Scalar (non-array) types serialize as their canonical type-string (`"bigint"`,
+`"Sig"`, …). Array types — which never appear as a serialized param/property
+type in any conformance fixture, only as the inferred type of an in-body
+`array_literal` — serialize structurally as a JSON object
+`{"array": <element-type>}` so they round-trip losslessly without forcing the
+flat-String channel to parse the `elem[]` form. -/
+
+private def jsonRecFuelTy : Nat := 64
+
+private def fromJsonANFTypeAux? (fuel : Nat) (j : Json) : Except String ANFType := do
+  match fuel with
+  | 0 => .error "ANFType: nesting too deep"
+  | f + 1 =>
+    match j with
     | .str s =>
         match ANFType.fromString? s with
         | some t => .ok t
         | none   => .error s!"ANFType: unknown type string {s}"
-    | _ => .error "ANFType: expected string"
+    | .obj _ =>
+        match j.getObjVal? "array" with
+        | .ok elemJ => (fromJsonANFTypeAux? f elemJ).map ANFType.array
+        | .error _  => .error "ANFType: object form must carry an \"array\" field"
+    | _ => .error "ANFType: expected string or {\"array\": …} object"
+
+instance : FromJson ANFType where
+  fromJson? j := fromJsonANFTypeAux? jsonRecFuelTy j
+
+private def toJsonANFType : ANFType → Json
+  | .array elem => mkObj [("array", toJsonANFType elem)]
+  | t           => .str t.toString
 
 instance : ToJson ANFType where
-  toJson t := .str t.toString
+  toJson t := toJsonANFType t
 
 /-! ## ANFParam -/
 

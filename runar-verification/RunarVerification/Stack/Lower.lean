@@ -1251,6 +1251,7 @@ def propTypeFixedSize : ANFType → Nat
   | .sig             => 0   -- not used in fixed-state serialization
   | .sigHashPreimage => 0   -- not used
   | .byteString      => 0   -- variable-length sentinel
+  | .array _         => 0   -- arrays are never fixed-size state fields
 
 /-- True iff the property type's stored representation is a script
 number (bigint, boolean, RabinSig, RabinPubKey). Such props go through

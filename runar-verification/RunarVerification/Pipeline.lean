@@ -9,7 +9,10 @@ import RunarVerification.Stack.AgreesA4
 import RunarVerification.Stack.AgreesA5
 import RunarVerification.Stack.AgreesA6
 import RunarVerification.Stack.AgreesA8
+import RunarVerification.Stack.AgreesHashCall
+import RunarVerification.Stack.AgreesStateful
 import RunarVerification.Stack.AgreesD1
+import RunarVerification.Stack.AgreesD2
 import RunarVerification.Stack.Peephole
 import RunarVerification.Stack.Eval
 import RunarVerification.Stack.TxContext
@@ -2661,26 +2664,62 @@ theorem auto_check_preimage_at_method_entry_correct (p : ANFProgram)
 /-- D2.b — auto-injected state-output emission at method exit matches
 the ANF state-output construction.
 
-For every stateful contract method `m`, the lowered body's terminal
-state-output emission (an `add_output (satoshis, ...mutableProps)`
-synthesised by the lowerer) and the ANF body's `addOutput` binding
-agree on the produced output bytes after evaluation.
+**History (this was an UNSOUND axiom, now retired and proved).**  The
+original axiom equated `(evalBindings initialAnf m.body).outputs` with
+`(runMethod (Lower.lower p) m.name initialStack).outputs`.  That
+statement is FALSE as stated:
 
-Soundness: same `Crypto.computeStateOutput` axiom on both sides
-(`ANF/Eval.lean:477`); the lowerer routes `add_output` ANF kind
-straight to the Stack-side output emission so the byte payload is
-literally the same function call. -/
-axiom auto_state_output_at_method_exit_correct (p : ANFProgram)
+* The ANF `.addOutput` arm (`ANF/Eval.lean:1935`) APPENDS an
+  `Output.state` record to `State.outputs`.
+* The Stack VM (`Stack/Eval.lean` `runOps`/`runOpcode`/`stepNonIf`)
+  NEVER mutates `StackState.outputs` — the `add_output` lowering builds
+  the output AS BYTES on the stack and leaves `.outputs = []`
+  (documented at `Stack/OutputTrace.lean:6-10`).
+
+So `runMethod … .outputs` is empty by construction whenever the body
+emits an output, making the equality false (and `False` derivable).
+The Stack output effect is modelled SEPARATELY by
+`OutputTrace.applyEvent` / `applyTrace`.
+
+**The TRUE restatement (this theorem).**  For a stateful method whose
+body is the canonical auto-injected state-continuation epilogue
+`statefulEpilogueBody sats stateVal pre`, under the input-readiness
+facts that the satoshi ref resolves to a `vBigint` and the state-value
+ref resolves to a value, the ANF body's appended output list equals the
+prior outputs with the Stack-SIDE output record appended — where the
+Stack-side record is exactly
+`OutputTrace.OutputEvent.toOutput (.state satsV [stateValV])`, the
+`Output` value `OutputTrace.applyEvent` concatenates onto
+`StackState.outputs`.  This is the honest "ANF state output = Stack
+state output" parity at the shared `Output` record type, NOT the false
+`runMethod … .outputs` claim.
+
+Soundness: composes `AgreesD2.statefulEpilogue_outputs_agree`, which
+reduces the ANF epilogue run and reads off the appended record.  No
+`Crypto.computeStateOutput` dependency on either side — the field-level
+byte serialisation is abstract (the `addOutput` path never calls it).
+The `statefulEpilogueShapeBool` body hypothesis is the correct shape
+side-condition the old axiom lacked. -/
+theorem auto_state_output_at_method_exit_correct (p : ANFProgram)
     (m : ANFMethod)
-    (initialAnf : State) (initialStack : StackState)
-    (hMem : m ∈ p.methods)
-    (hStateful : Lower.bindingsUseCheckPreimage m.body = true) :
-    -- Both sides reach their respective state-output frames with the
-    -- same output sequence on success.
-    match RunarVerification.ANF.Eval.evalBindings initialAnf m.body,
-          runMethod (Lower.lower p) m.name initialStack with
-    | .ok anfFinal, .ok stkFinal => anfFinal.outputs = stkFinal.outputs
-    | _, _ => True
+    (initialAnf : State)
+    (sats stateVal pre : String) (satsV : Int)
+    (stateValV : RunarVerification.ANF.Eval.Value)
+    (_hMem : m ∈ p.methods)
+    (hEpilogue : m.body = AgreesD2.statefulEpilogueBody sats stateVal pre)
+    (hSats : initialAnf.resolveRef sats = some (.vBigint satsV))
+    (hSv : initialAnf.resolveRef stateVal = some stateValV) :
+    -- The ANF body appends EXACTLY the Stack-side output record
+    -- (`OutputTrace.OutputEvent.toOutput`), not an empty `runMethod`
+    -- output list.
+    (match RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf m.body with
+     | .ok anfFinal => anfFinal.outputs
+     | _ => [])
+      = initialAnf.outputs
+        ++ [Stack.OutputTrace.OutputEvent.toOutput (.state satsV [stateValV])] := by
+  rw [hEpilogue]
+  exact AgreesD2.statefulEpilogue_outputs_agree p.methods initialAnf
+    sats stateVal pre satsV stateValV hSats hSv
 
 /-! ### D3 — Terminal-assert elision + NIP cleanup consequences
 
@@ -2810,11 +2849,21 @@ integration omnibus — planned split"):
   non-passthrough method_call bodies fall through to the sound
   `crypto_call` fallback.
 * `compileSafe_observational_correct_modulo_dispatch_codegen` —
-  Discharged once D1 lands (multi-public-method Merkle dispatch
-  selection).
+  RETIRED (2026-06-08): the canonical multi-public passthrough fragment
+  (decided by `dispatchConsumeShapeBool`, 2–17 public single-param
+  passthrough methods) is discharged by the theorem
+  `compileSafe_observational_correct_dispatch_consume` composing the
+  wave-69 D1 selection theorem with the multi-public shape lemma;
+  residual multi-public programs fall through to the sound crypto_call
+  fallback.
 * `compileSafe_observational_correct_modulo_stateful_codegen` —
-  Discharged once D2.a + D2.b land (auto-injected `checkPreimage` at
-  method entry + auto-injected state output at method exit).
+  RETIRED (2026-06-08): the single-public canonical gated-prologue
+  fragment (decided by `AgreesStateful.statefulConsumeShapeBool`) is
+  discharged by the theorem
+  `compileSafe_observational_correct_stateful_consume` through the
+  pre-existing BIP-143 bridge axiom (D2.a) + the proved D2.b epilogue;
+  residual stateful bodies fall through to the sound crypto_call /
+  dispatch cascade.
 
 **Trust footprint.** Each sub-omnibus is load-bearing for its
 corresponding `VERIFIED-modulo-<family>-codegen-axioms` classification
@@ -2858,6 +2907,85 @@ introduced. See `PATH2_PLAN.md` §5.23 and `TRUST_MANIFEST.md`. -/
 -- propext / Classical.choice / Quot.sound + the crypto backends (NO
 -- sub-omnibus axiom).
 
+/-! ## Aliased-operand soundness guard (2026-06-08)
+
+**A COUNTEREXAMPLE was found to the unguarded sub-omnibus axioms.**  For a
+hand-written ANF binding whose value reads the SAME ref twice in consume
+position — e.g. `t := x + x` with `x` a last-use param — the liveness
+lowerer double-consumes the single stack copy: each `bringToTop` d0-consume
+emits `[]` (the TS reference `05-stack-lower.ts:828` behaves identically),
+so the lowered ops are a bare `[OP_ADD]` that UNDERFLOWS at runtime, while
+the ANF interpreter evaluates the binding fine.  `compileSafe` accepts the
+program (`WF.ANF` holds), so `successAgrees` is `true ↔ false` = False —
+the unguarded axioms (`hypothesis True` crypto_call; loop) were REFUTABLE.
+The counterexample theorems below pin this permanently.
+
+**Production impact: none from any frontend** — the ANF lowering pass gives
+every operand a fresh temp (`x + x` becomes `t0 := load_param x; t1 :=
+load_param x; t2 := t0 + t1`, which lowers correctly to `DUP SWAP ADD`,
+verified against the real TS compiler output `767c93009c`), and zero
+conformance fixtures contain a repeated-operand value.  The pattern is
+reachable ONLY through hand-written IR fed to `compileFromANF` / `--ir`
+(a separate compiler-side hardening concern).
+
+The guard: `noAliasedOperandsB` decides that every binding's value reads
+pairwise-distinct refs (recursing into branch and loop bodies).  Every
+frontend-produced program satisfies it by construction.  Both surviving
+sub-omnibus axioms now REQUIRE it; the omnibus theorem threads it. -/
+
+/-- No duplicate names within one operand list. -/
+def nodupRefsB : List String → Bool
+  | [] => true
+  | r :: rest => !rest.contains r && nodupRefsB rest
+
+mutual
+/-- The value's operand refs are pairwise distinct (branch/loop bodies
+recursively). Single-ref and ref-free values are trivially fine. -/
+def valueOperandsNodupB : ANFValue → Bool
+  | .binOp _ l r _ => l != r
+  | .call _ args => nodupRefsB args
+  | .methodCall obj _ args => nodupRefsB (obj :: args)
+  | .arrayLiteral elems => nodupRefsB elems
+  | .addOutput sat vals pre => nodupRefsB ((sat :: vals) ++ [pre])
+  | .addRawOutput a b => a != b
+  | .addDataOutput a b => a != b
+  | .ifVal _ thn els => noAliasedOperandsB thn && noAliasedOperandsB els
+  | .loop _ body _ => noAliasedOperandsB body
+  | _ => true
+
+/-- Every binding in the body reads pairwise-distinct refs per value. -/
+def noAliasedOperandsB : List ANFBinding → Bool
+  | [] => true
+  | .mk _ v _ :: rest => valueOperandsNodupB v && noAliasedOperandsB rest
+end
+
+/-- The counterexample method: `double(x) { t := x + x }` (repeated operand,
+hand-written ANF — NOT producible by any frontend). -/
+private def aliasCxM : ANFMethod :=
+  { name := "double", params := [ANFParam.mk "x" .bigint],
+    body := [ANFBinding.mk "t" (.binOp "+" "x" "x" none) none], isPublic := true }
+
+private def aliasCxProg : ANFProgram :=
+  { contractName := "Dbl", properties := [], methods := [aliasCxM] }
+
+/-- COUNTEREXAMPLE (ANF half): the repeated-operand body EVALUATES fine. -/
+theorem aliasCx_anf_succeeds :
+    (RunarVerification.ANF.Eval.evalBindingsP aliasCxProg.methods
+      { params := [("x", .vBigint 5)] } aliasCxM.body).toOption.isSome = true := by
+  native_decide
+
+/-- COUNTEREXAMPLE (Stack half): the deployed bytes UNDERFLOW — the compiled
+script of the same accepted program fails on the matching entry. Together
+with the ANF half this REFUTES the unguarded `successAgrees` claim. -/
+theorem aliasCx_stack_fails :
+    (match compileSafe aliasCxProg with
+     | .ok bytes => (runParsedBytes bytes { stack := [.vBigint 5] }).toOption.isSome
+     | .error _ => true) = false := by
+  native_decide
+
+/-- The guard REJECTS the counterexample (the narrowing is effective). -/
+theorem aliasCx_guard_rejects : noAliasedOperandsB aliasCxM.body = false := by decide
+
 /-- **O1 sub-omnibus — crypto call family.**
 
 Phase D harness integration: codegen-soundness for ANF bodies whose
@@ -2872,6 +3000,15 @@ discharges in Phase B (`Stack.HashOps`, `Stack.Blake3`, `Stack.Ec`,
 `Stack.P256P384`, `Stack.Wots`, `Stack.SlhDsa`, `Stack.Rabin`) supply
 the runtime-side composition once they land.
 
+**Partial peel (single-hash-call methods).** The fallback's effective
+scope is already NARROWED: whole single-public `sha256`/`hash160`-call
+method bodies (decided by `Stack.AgreesHashCall.hashCallConsumeShapeBool`)
+are discharged by the PROVEN theorems `hashCall_consume_{sha256,hash160}`
+in the dispatch BEFORE this axiom is reached — through the real
+`Stack.HashOps` codegen-to-spec, with NO dependence on this axiom. The
+axiom survives only as the residual for crypto bodies OUTSIDE that
+fragment (multi-binding, non-hash primitives, chained calls).
+
 Discharge path: this sub-omnibus retires after Phase B per-primitive
 codegen-to-spec discharges + A4-crypto Stage C wrappers land; the
 hypothesis tightens to a dedicated `structuralCryptoCallBody`
@@ -2885,7 +3022,10 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hCryptoCall : True) :
+    -- Aliased-operand guard (2026-06-08): the previously-`True` hypothesis is
+    -- NARROWED after the `t := x + x` counterexample (see the soundness-guard
+    -- section above) — without it this axiom was refutable.
+    (_hNoAlias : noAliasedOperandsB anfM.body = true) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
@@ -2941,7 +3081,12 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
         (Lower.collectConstInts anfM.body)
         anfM.body
         (List.reverse (anfM.params.map (·.name)))
-        0 = true) :
+        0 = true)
+    -- Aliased-operand guard (2026-06-08): NARROWED after the `i + i` loop-body
+    -- counterexample (see the soundness-guard section above) — the unguarded
+    -- form was refutable for loop bodies reading the iteration variable twice
+    -- in one binding.
+    (_hNoAlias : noAliasedOperandsB anfM.body = true) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
@@ -2957,56 +3102,39 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
 -- method_call bodies — anything the narrower `methodCallConsumeShapeBool` does
 -- NOT recognise — fall through to the sound crypto_call cascade, NO new axiom.
 
-/-- **O1 sub-omnibus — dispatch family.**
+-- **O1 sub-omnibus — dispatch family — RETIRED (2026-06-08).**
+-- The axiom `compileSafe_observational_correct_modulo_dispatch_codegen` is
+-- GONE.  Its omnibus dispatch branch is now discharged by the theorem
+-- `compileSafe_observational_correct_dispatch_consume` for the CANONICAL
+-- multi-public passthrough fragment (decided by `dispatchConsumeShapeBool`:
+-- 2–17 public methods, each a non-constructor-named single-param passthrough
+-- whose body is one `loadParam`), under the keyed `hDispatchFrag` premise
+-- (the selector witness + index + param-resolution entry bundle).  Every
+-- fragment method lowers to the EMPTY op list, so the deployed script is the
+-- bare Merkle dispatch chain; the discharge composes the wave-69 D1 theorem
+-- `merkle_dispatch_selection_correct` (parse round-trip + branch selection)
+-- with the multi-public shape lemma `peepholeProgram_multi_public_shape`.
+-- Residual multi-public programs — non-passthrough bodies, > 17 methods —
+-- fall through to the sound crypto_call fallback, NO new axiom is introduced.
 
-Phase D harness integration: codegen-soundness for ANF programs with
-two or more public methods, exercising the multi-method Merkle
-dispatch chain (`OP_DUP push(i) OP_NUMEQUAL OP_IF OP_DROP body_i
-OP_ELSE …` per `Script/Emit.lean:312-336`). The hypothesis
-`hDispatch` requires `p` to have ≥ 2 public methods.
-
-Discharge path: this sub-omnibus retires once D1
-(`merkle_dispatch_selection_correct`) lands as a theorem (rather than
-an axiom) — i.e. when the dispatch-head selection rewrite is itself a
-verified rewrite. See `PATH2_PLAN.md` §5.23.
--/
-axiom compileSafe_observational_correct_modulo_dispatch_codegen (p : ANFProgram)
-    (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (_hMem : anfM ∈ p.methods) (_hPublic : anfM.isPublic = true)
-    (_hSafe : compileSafe p = .ok bytes)
-    (initialAnf : State) (initialStack : StackState)
-    (tsm : Agrees.TaggedStackMap)
-    (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2) :
-    successAgrees
-      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
-      (runParsedBytes bytes initialStack)
-
-/-- **O1 sub-omnibus — stateful family.**
-
-Phase D harness integration: codegen-soundness for ANF methods on
-stateful contracts (`parentClass = StatefulSmartContract`), which the
-lowerer threads through an auto-injected `checkPreimage` at method
-entry and an auto-injected state-output at method exit. The hypothesis
-`hStateful` requires `Lower.bindingsUseCheckPreimage anfM.body = true`.
-
-Discharge path: this sub-omnibus retires once D2.a
-(`auto_check_preimage_at_method_entry_correct`) and D2.b
-(`auto_state_output_at_method_exit_correct`) land as theorems —
-i.e. when both auto-injected wrappers are themselves verified
-rewrites. See `PATH2_PLAN.md` §5.23.
--/
-axiom compileSafe_observational_correct_modulo_stateful_codegen (p : ANFProgram)
-    (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (_hMem : anfM ∈ p.methods) (_hPublic : anfM.isPublic = true)
-    (_hSafe : compileSafe p = .ok bytes)
-    (initialAnf : State) (initialStack : StackState)
-    (tsm : Agrees.TaggedStackMap)
-    (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hStateful : Lower.bindingsUseCheckPreimage anfM.body = true) :
-    successAgrees
-      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
-      (runParsedBytes bytes initialStack)
+-- **O1 sub-omnibus — stateful family — RETIRED (2026-06-08).**
+-- The axiom `compileSafe_observational_correct_modulo_stateful_codegen` is
+-- GONE.  Its omnibus dispatch branch is now discharged by the theorem
+-- `compileSafe_observational_correct_stateful_consume` for the single-public
+-- CANONICAL stateful fragment (decided by
+-- `AgreesStateful.statefulConsumeShapeBool`: one param `pre`, body exactly the
+-- auto-injected gated prologue `_cp0 := check_preimage pre ; assert _cp0`),
+-- under the keyed `hStatefulFrag` premise (the valid-BIP-143-context entry
+-- bundle).  The discharge composes the constant-lowering reduction
+-- (`AgreesStateful.lowerMethod_ops_statefulPrologue`), the runtime walk
+-- (`runOps_statefulPrologueOps_isSome`), the M3 peephole-identity, the M4
+-- concrete parse round-trip, and the pre-existing BIP-143 bridge axiom
+-- (`StatefulBridge.checkPreimage_iff_checkSig_under_validTxContext` — D2.a's
+-- designed external-crypto assumption, already in the TCB).  Residual stateful
+-- bodies — user logic after the prologue, state-output epilogues
+-- (D2.b's `auto_state_output_at_method_exit_correct` is ALREADY a theorem),
+-- multi-public stateful programs — fall through to the sound crypto_call /
+-- dispatch cascade, NO new axiom is introduced.
 
 /-! ### Multi-method capstone
 
@@ -4636,6 +4764,668 @@ theorem compileSafe_observational_correct_methodCall_consume
     exact successAgrees_refl _
   exact successAgrees_trans _ _ _ hM2Method hParsed
 
+/-! ## crypto_call peel-off — single-hash-call method consume theorem
+
+Peels the single-`sha256`/`hash160`-call method fragment off the residual
+`crypto_call` fallback. The body is one `bn = func(param)` call whose param is
+consumed (RAW = the bare `[OP_SHA256]` / `[OP_HASH160]`, both M4-allowlisted);
+the substrate lives in `Stack/AgreesHashCall.lean`. Composes the same
+M2∘M3∘M4 spine as `methodCall_consume` with `RAW = [opcode]`. The arg's
+bytes-typing at entry is supplied by the keyed `hHashCallFrag` omnibus premise
+(vacuous on non-hash bodies, like `hMathByteFrag`), so NO new axiom and NO
+`crypto_call` axiom appear in the discharged fragment. -/
+
+/-- The 4-pass peephole pipeline is the identity on any single-opcode method
+body: every fusion pass needs ≥2 ops, so a singleton `[.opcode op]` is stable. -/
+theorem peepholeMethodOps_single_opcode (op : String) :
+    peepholeMethodOps [StackOp.opcode op] = [StackOp.opcode op] := by
+  unfold peepholeMethodOps
+  have hNoIf : Peephole.noIfOp [StackOp.opcode op] := by simp [Peephole.noIfOp]
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
+  have hFlat : Peephole.peepholePassAllFlat [StackOp.opcode op] = [StackOp.opcode op] := by
+    simp [Peephole.peepholePassAllFlat, Peephole.applyEqualVerifyFuse,
+      Peephole.applyCheckSigVerifyFuse, Peephole.applyNumEqualVerifyFuse,
+      Peephole.applyZeroNumEqual, Peephole.applyDoubleSha256, Peephole.applyDoubleDrop,
+      Peephole.applyDoubleOver, Peephole.applyDoubleNot, Peephole.applyDoubleNegate,
+      Peephole.applyOneSub, Peephole.applyOneAdd, Peephole.applySubZero,
+      Peephole.applyAddZero, Peephole.applyPushPushMul, Peephole.applyPushPushSub,
+      Peephole.applyPushPushAdd, Peephole.applyDoubleSwap, Peephole.applyDupDrop,
+      Peephole.applyDropAfterPush]
+  rw [hFlat, Peephole.peepholePostFold_eq_applyPushOne_of_noIfOp _ hNoIf]
+  have hPost : Peephole.applyPushOneSub (Peephole.applyPushOneAdd [StackOp.opcode op])
+      = [StackOp.opcode op] := by
+    simp [Peephole.applyPushOneAdd, Peephole.applyPushOneSub]
+  rw [hPost, Peephole.peepholeChainFold_eq_self_of_noIfOp_pushFree _ hNoIf
+        (by simp [Peephole.pushFree]),
+    Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIf
+        (by simp [Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])]
+
+/-- **Func-agnostic consume core.** Given the method's RAW reduction to a single
+allowlisted opcode and the M2 success agreement, the full pipeline is
+observationally correct. The no-implicit-pass facts are derived from the
+call-body shape; `hNoCodeArg` (the call is not a state-output builder) and
+`hEmit` (the opcode is push-emittable) are func-specific and supplied by the
+concrete wrappers. -/
+theorem hashCall_consume_core
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray) (op : String)
+    (bn arg func : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hBody : anfM.body = [ANFBinding.mk bn (.call func [arg]) src])
+    (hRaw : Agrees.lowerMethodUserRawOps p.methods p.properties anfM = [StackOp.opcode op])
+    (hNoCodeArg : Lower.bindingsUseCodePart anfM.body = false)
+    (hEmit : Parse.areRunarEmittablePushBool [StackOp.opcode op] = true)
+    (hM2 : successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+        (runOps [StackOp.opcode op] initialStack)) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hUnique :
+      ∀ m'', m'' ∈ p.methods → m''.isPublic = true →
+        (m''.name == anfM.name) = true → m'' = anfM :=
+    unique_public_of_filter_singleton p anfM hSinglePublic
+  have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseCheckPreimage]
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := hNoCodeArg
+  have hNoDeserialize : Lower.bindingsUseDeserializeState anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseDeserializeState]
+  have hNoTerminalAssert : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBody]; simp [Lower.bodyEndsInAssert]
+  have hM2Method :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+        (runMethod (Lower.lower p) anfM.name initialStack) := by
+    have hRunEq :
+        runMethod (Lower.lower p) anfM.name initialStack
+          = runOps (Agrees.lowerMethodUserRawOps p.methods p.properties anfM) initialStack := by
+      have hP : p = { contractName := p.contractName, properties := p.properties, methods := p.methods } := rfl
+      rw [hP]
+      exact Agrees.runMethod_lower_public_unique_no_post_eq_userRaw
+        p.contractName p.properties p.methods anfM initialStack hMem hPublic hUnique
+        hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize
+    rw [hRunEq, hRaw]; exact hM2
+  obtain ⟨hPubSingleton, _hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hPeepedOpsImg : (peepholedLoweredMethod p anfM).ops = [StackOp.opcode op] := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = [StackOp.opcode op]
+    rw [Agrees.lowerMethod_ops_eq_userRaw_no_implicits_no_post
+          p.methods p.properties anfM hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize,
+        hRaw, peepholeMethodOps_single_opcode]
+  have hEmitPush : Parse.AreRunarEmittablePush (peepholedLoweredMethod p anfM).ops := by
+    show Parse.areRunarEmittablePushBool (peepholedLoweredMethod p anfM).ops = true
+    rw [hPeepedOpsImg]; exact hEmit
+  have hM4 :
+      runParsedBytes bytes initialStack = runOps [StackOp.opcode op] initialStack := by
+    have hEq :
+        runParsedBytes bytes initialStack
+          = runOps (peepholedLoweredMethod p anfM).ops initialStack :=
+      compileSafe_single_public_runOps_eq_push p bytes (peepholedLoweredMethod p anfM)
+        initialStack hSafe hPubSingleton hEmitPush
+    rw [hEq, hPeepedOpsImg]
+  have hParsed :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runParsedBytes bytes initialStack) := by
+    rw [hM4]
+    have hMethodEq :
+        runMethod (Lower.lower p) anfM.name initialStack = runOps [StackOp.opcode op] initialStack := by
+      have hRunEq :
+          runMethod (Lower.lower p) anfM.name initialStack
+            = runOps (Agrees.lowerMethodUserRawOps p.methods p.properties anfM) initialStack := by
+        have hP : p = { contractName := p.contractName, properties := p.properties, methods := p.methods } := rfl
+        rw [hP]
+        exact Agrees.runMethod_lower_public_unique_no_post_eq_userRaw
+          p.contractName p.properties p.methods anfM initialStack hMem hPublic hUnique
+          hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize
+      rw [hRunEq, hRaw]
+    rw [hMethodEq]; exact successAgrees_refl _
+  exact successAgrees_trans _ _ _ hM2Method hParsed
+
+/-- **sha256 single-call consume.** Discharges the omnibus obligation for a
+single-public `h(x) = sha256(x)` method, given the bytes-typed entry fragment. -/
+theorem hashCall_consume_sha256
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (bn arg : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "sha256" [arg]) src])
+    (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: rest)
+    (hLen : argBytes.size ≤ 520) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hRaw := RunarVerification.Stack.AgreesHashCall.lowerMethodUserRawOps_single_sha256
+    p.methods p.properties anfM bn arg src hParams hBody
+  have hM2 : successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runOps [StackOp.opcode "OP_SHA256"] initialStack) := by
+    rw [hBody]
+    exact RunarVerification.Stack.AgreesHashCall.hashCall_M2_sha256
+      p.methods initialAnf initialStack bn arg src argBytes rest hArg hStk hLen
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseCodePart]
+  exact hashCall_consume_core p anfM bytes "OP_SHA256" bn arg "sha256" src
+    hMem hPublic hSafe initialAnf initialStack hSinglePublic hName hBody hRaw
+    hNoCode (by rfl) hM2
+
+/-- **hash160 single-call consume.** -/
+theorem hashCall_consume_hash160
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (bn arg : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "hash160" [arg]) src])
+    (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: rest)
+    (hLen : argBytes.size ≤ 520) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hRaw := RunarVerification.Stack.AgreesHashCall.lowerMethodUserRawOps_single_hash160
+    p.methods p.properties anfM bn arg src hParams hBody
+  have hM2 : successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runOps [StackOp.opcode "OP_HASH160"] initialStack) := by
+    rw [hBody]
+    exact RunarVerification.Stack.AgreesHashCall.hashCall_M2_hash160
+      p.methods initialAnf initialStack bn arg src argBytes rest hArg hStk hLen
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseCodePart]
+  exact hashCall_consume_core p anfM bytes "OP_HASH160" bn arg "hash160" src
+    hMem hPublic hSafe initialAnf initialStack hSinglePublic hName hBody hRaw
+    hNoCode (by rfl) hM2
+
+/-! ### MANDATORY smoke: the hash-call consume theorem fires
+
+The canonical single-public sha256 contract `H` with public `h(x) = sha256(x)`,
+fired end-to-end through `hashCall_consume_sha256`: `compileSafe` accepts it, and
+on a concrete bytes entry (`x ↦ #[01,02,03]`, the same bytes on the deployed
+stack) the ANF eval and the deployed-bytes run AGREE on their success bit.
+Anti-vacuous — the fragment is reachable and the consume theorem is non-trivially
+applicable (the `compileSafe` success bit is the only `native_decide`, on the
+deployed bytes; the agreement fires on the shared backend's success bit). -/
+
+private def hashSmokeProg : ANFProgram :=
+  { contractName := "H", properties := [],
+    methods := [RunarVerification.Stack.AgreesHashCall.smokeMethod] }
+
+private def hashSmokeAnf : State :=
+  { (default : State) with bindings := [("x", .vBytes (ByteArray.mk #[1, 2, 3]))] }
+
+private def hashSmokeStk : StackState :=
+  { (default : StackState) with stack := [.vBytes (ByteArray.mk #[1, 2, 3])] }
+
+/-- SMOKE — `hashCall_consume_sha256` fires on the canonical sha256 contract. -/
+theorem smoke_hashCall_consume_fires :
+    ∃ bytes, compileSafe hashSmokeProg = .ok bytes ∧
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP hashSmokeProg.methods hashSmokeAnf
+          RunarVerification.Stack.AgreesHashCall.smokeMethod.body)
+        (runParsedBytes bytes hashSmokeStk) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe hashSmokeProg = .ok b := by
+    have h : (compileSafe hashSmokeProg).toOption.isSome = true := by native_decide
+    cases hc : compileSafe hashSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  exact hashCall_consume_sha256 hashSmokeProg
+    RunarVerification.Stack.AgreesHashCall.smokeMethod bytes "c0" "x" none
+    (by simp [hashSmokeProg]) rfl hSafe hashSmokeAnf hashSmokeStk rfl (by decide)
+    rfl rfl (ByteArray.mk #[1, 2, 3]) [] rfl rfl (by decide)
+
+/-! ## Stateful sub-omnibus retirement — the canonical stateful consume theorem
+
+Discharges the stateful family's omnibus branch for the CANONICAL stateful
+fragment: a single-public, single-param method whose body is exactly the
+auto-injected gated prologue `_cp0 := check_preimage pre ; assert _cp0`
+(decided by `AgreesStateful.statefulConsumeShapeBool`).  The whole method
+lowers to the CONSTANT `[OP_CODESEPARATOR, .swap, .push G, OP_CHECKSIGVERIFY]`
+(`AgreesStateful.lowerMethod_ops_statefulPrologue`), whose Stack success bit
+is the AUTH backend's verdict (`runOps_statefulPrologueOps_isSome`); the ANF
+success bit is the PREIMAGE backend's verdict
+(`StatefulBridge.gatedStatefulPrologue_isSome_eq`); the two agree under a
+valid BIP-143 context via the pre-existing bridge axiom
+(`checkPreimage_iff_checkSig_under_validTxContext`).  No sub-omnibus axiom
+appears in the discharge. -/
+
+/-- The 4-pass peephole pipeline is the identity on the constant stateful
+prologue ops (no fusable adjacency: the only push is the 33-byte key `G`
+followed by `OP_CHECKSIGVERIFY`). -/
+theorem peepholeMethodOps_statefulPrologue :
+    peepholeMethodOps AgreesStateful.statefulPrologueOps
+      = AgreesStateful.statefulPrologueOps := by
+  unfold peepholeMethodOps
+  have hNoIf : Peephole.noIfOp AgreesStateful.statefulPrologueOps := by
+    simp [AgreesStateful.statefulPrologueOps, Peephole.noIfOp]
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
+  have hFlat : Peephole.peepholePassAllFlat AgreesStateful.statefulPrologueOps
+      = AgreesStateful.statefulPrologueOps := by
+    simp +decide [AgreesStateful.statefulPrologueOps, AgreesStateful.stG,
+      Peephole.peepholePassAllFlat, Peephole.applyEqualVerifyFuse,
+      Peephole.applyCheckSigVerifyFuse, Peephole.applyNumEqualVerifyFuse,
+      Peephole.applyZeroNumEqual, Peephole.applyDoubleSha256,
+      Peephole.applyDoubleDrop, Peephole.applyDoubleOver, Peephole.applyDoubleNot,
+      Peephole.applyDoubleNegate, Peephole.applyOneSub, Peephole.applyOneAdd,
+      Peephole.applySubZero, Peephole.applyAddZero, Peephole.applyPushPushMul,
+      Peephole.applyPushPushSub, Peephole.applyPushPushAdd,
+      Peephole.applyDoubleSwap, Peephole.applyDupDrop, Peephole.applyDropAfterPush]
+  rw [hFlat, Peephole.peepholePostFold_eq_applyPushOne_of_noIfOp _ hNoIf]
+  have hPost : Peephole.applyPushOneSub
+      (Peephole.applyPushOneAdd AgreesStateful.statefulPrologueOps)
+      = AgreesStateful.statefulPrologueOps := by
+    simp +decide [AgreesStateful.statefulPrologueOps, Peephole.applyPushOneAdd,
+      Peephole.applyPushOneSub]
+  rw [hPost,
+    Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ hNoIf (by
+      simp +decide [AgreesStateful.statefulPrologueOps,
+        Peephole.applyPushAddPushAdd, Peephole.applyPushAddPushSub]),
+    Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIf (by
+      simp +decide [AgreesStateful.statefulPrologueOps,
+        Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])]
+
+/-- **Canonical stateful consume theorem (the stateful sub-omnibus discharge).**
+
+The success-bit chain is direct (no runMethod leg needed): the ANF side is
+`Crypto.checkPreimage preimage` (gated prologue), the Stack side is
+`authBackend.checkSig sigV G` (constant prologue ops, M3 peephole-identity,
+M4 concrete parse round-trip), and the BIP-143 bridge equates the two. -/
+theorem compileSafe_observational_correct_stateful_consume
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (_hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (pre : String) (ty : ANFType)
+    (hParams : anfM.params = [ANFParam.mk pre ty])
+    (hBody : anfM.body = StatefulBridge.gatedStatefulPrologueBody pre)
+    (hne1 : pre ≠ "_cp0") (hne2 : pre ≠ "_opPushTxSig")
+    (ctx : TxContext) (sigV preimage : ByteArray)
+    (rest : List RunarVerification.ANF.Eval.Value)
+    (hValid : ValidTxContext ctx)
+    (hPreLink : preimage = TxContext.buildPreimage ctx)
+    (hAnfPre : initialAnf.resolveRef pre = some (.vBytes preimage))
+    (hStk : initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome
+      = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage := by
+    rw [hBody]
+    exact StatefulBridge.gatedStatefulPrologue_isSome_eq p.methods initialAnf
+      pre preimage hAnfPre
+  obtain ⟨hPubSingleton, _hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hOps : (Lower.lowerMethod p.methods p.properties anfM).ops
+      = AgreesStateful.statefulPrologueOps :=
+    AgreesStateful.lowerMethod_ops_statefulPrologue p.methods p.properties anfM
+      pre ty hParams hBody hPublic hne1 hne2
+  have hPeeped : (peepholedLoweredMethod p anfM).ops
+      = AgreesStateful.statefulPrologueOps := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = _
+    rw [hOps]
+    exact peepholeMethodOps_statefulPrologue
+  have hM4 : runParsedBytes bytes initialStack
+      = runOps AgreesStateful.statefulPrologueOps initialStack := by
+    have hBytes := compileSafe_ok_implies_emitFast p bytes hSafe
+    rw [hBytes]
+    unfold runParsedBytes RunarVerification.Script.Emit.emitFast
+    rw [hPubSingleton]
+    simp only
+    rw [hPeeped, AgreesStateful.parseScript_emitOpsFast_statefulPrologue]
+  have hStack : (runOps AgreesStateful.statefulPrologueOps initialStack).toOption.isSome
+      = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV AgreesStateful.stG :=
+    AgreesStateful.runOps_statefulPrologueOps_isSome initialStack preimage sigV rest hStk
+  have hBridge : RunarVerification.ANF.Eval.Crypto.checkPreimage preimage
+      = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV AgreesStateful.stG :=
+    StatefulBridge.checkPreimage_iff_checkSig_under_validTxContext ctx sigV
+      AgreesStateful.stG preimage hValid hPreLink
+  show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome
+      ↔ (runParsedBytes bytes initialStack).toOption.isSome
+  rw [hM4, hANF, hStack, hBridge]
+
+/-! ### MANDATORY smoke: the stateful consume theorem fires
+
+The canonical single-public stateful contract `S` with public `verify(pre)`
+whose body is the auto-injected gated prologue, fired end-to-end:
+`compileSafe` accepts it, and on the sample BIP-143 context's canonical
+preimage (the same bytes threaded on the ANF param and the deployed stack)
+the ANF eval and the deployed-bytes run AGREE on their success bit (both are
+the SAME backend verdict, via the bridge). -/
+
+private def stSmokeProg : ANFProgram :=
+  { contractName := "S", properties := [],
+    methods := [AgreesStateful.smokeMethod] }
+
+private def stSmokePreimage : ByteArray :=
+  Stack.TxContext.buildPreimage Stack.TxContext.sampleCtx
+
+private def stSmokeAnf : State := { params := [("pre", .vBytes stSmokePreimage)] }
+
+private def stSmokeStk : StackState :=
+  { stack := [.vBytes stSmokePreimage, .vBytes (ByteArray.mk #[0x30])] }
+
+/-- SMOKE — `compileSafe` accepts the canonical stateful contract and the
+consume theorem fires on the sample-context entry. -/
+theorem smoke_stateful_consume_fires :
+    ∃ bytes, compileSafe stSmokeProg = .ok bytes ∧
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP stSmokeProg.methods stSmokeAnf
+          AgreesStateful.smokeMethod.body)
+        (runParsedBytes bytes stSmokeStk) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe stSmokeProg = .ok b := by
+    have h : (compileSafe stSmokeProg).toOption.isSome = true := by native_decide
+    cases hc : compileSafe stSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  exact compileSafe_observational_correct_stateful_consume
+    stSmokeProg AgreesStateful.smokeMethod bytes
+    (by simp [stSmokeProg]) rfl hSafe stSmokeAnf stSmokeStk rfl (by decide)
+    "pre" .byteString rfl rfl (by decide) (by decide)
+    Stack.TxContext.sampleCtx (ByteArray.mk #[0x30]) stSmokePreimage []
+    RunarVerification.Stack.ValidTxContext.sampleCtx_valid rfl rfl rfl
+
+/-! ## Dispatch sub-omnibus retirement — the multi-public passthrough consume
+
+Discharges the dispatch family's omnibus branch for the CANONICAL
+multi-public fragment: 2–17 public methods, EACH a non-constructor-named
+single-param passthrough (`m(x) { return x; }`-shaped, body one `loadParam`),
+decided by `dispatchConsumeShapeBool`.  Every method lowers to the EMPTY op
+list (the param is consumed in place), so the deployed script is the bare
+Merkle dispatch chain; the wave-69 theorem
+`merkle_dispatch_selection_correct` then gives the parsed-bytes run as
+`runOps [] (witness-popped stack) = .ok`, and the ANF side succeeds when the
+selected method's param resolves.  No sub-omnibus axiom appears. -/
+
+/-- One dispatch-passthrough method: not constructor-named, single param,
+body exactly one `loadParam` of that param. -/
+def dispatchPassthroughMethodBool (m : ANFMethod) : Bool :=
+  (m.name != "constructor") &&
+  match m.params, m.body with
+  | [prm], [ANFBinding.mk _ (.loadParam x) _] => prm.name == x
+  | _, _ => false
+
+/-- Decides the canonical multi-public dispatch consume fragment: 2–17
+public methods, all passthroughs. -/
+def dispatchConsumeShapeBool (p : ANFProgram) : Bool :=
+  let pubs := p.methods.filter (·.isPublic)
+  decide (2 ≤ pubs.length) && decide (pubs.length ≤ 17) &&
+  pubs.all dispatchPassthroughMethodBool
+
+theorem dispatchPassthroughMethodBool_extract (m : ANFMethod)
+    (h : dispatchPassthroughMethodBool m = true) :
+    m.name ≠ "constructor" ∧
+    ∃ (x bn : String) (ty : ANFType) (src : Option SourceLoc),
+      m.params = [ANFParam.mk x ty] ∧
+      m.body = [ANFBinding.mk bn (.loadParam x) src] := by
+  unfold dispatchPassthroughMethodBool at h
+  obtain ⟨hName, hShape⟩ := Bool.and_eq_true_iff.mp h
+  refine ⟨bne_iff_ne.mp hName, ?_⟩
+  split at hShape
+  case _ =>
+    rename_i prm bn x src hP hB
+    have hx : x = prm.name := (beq_iff_eq.mp hShape).symm
+    subst hx
+    exact ⟨prm.name, bn, prm.type, src, by rw [hP], by rw [hB]⟩
+  next => exact absurd hShape (by decide)
+
+theorem dispatchConsumeShapeBool_extract (p : ANFProgram)
+    (h : dispatchConsumeShapeBool p = true) :
+    2 ≤ (p.methods.filter (·.isPublic)).length ∧
+    (p.methods.filter (·.isPublic)).length ≤ 17 ∧
+    (∀ m ∈ p.methods.filter (·.isPublic), m.name ≠ "constructor") ∧
+    (∀ m ∈ p.methods.filter (·.isPublic),
+      ∃ (x bn : String) (ty : ANFType) (src : Option SourceLoc),
+        m.params = [ANFParam.mk x ty] ∧
+        m.body = [ANFBinding.mk bn (.loadParam x) src]) := by
+  unfold dispatchConsumeShapeBool at h
+  simp only [Bool.and_eq_true_iff, decide_eq_true_eq, List.all_eq_true] at h
+  obtain ⟨⟨h2, h17⟩, hAll⟩ := h
+  exact ⟨h2, h17,
+    fun m hm => (dispatchPassthroughMethodBool_extract m (hAll m hm)).1,
+    fun m hm => (dispatchPassthroughMethodBool_extract m (hAll m hm)).2⟩
+
+/-- A passthrough method lowers to the EMPTY op list: its single use of the
+param is a depth-0 last-use, so the liveness loader consumes it in place. -/
+theorem lowerMethod_ops_passthrough
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (anfM : ANFMethod) (x bn : String) (ty : ANFType) (src : Option SourceLoc)
+    (hParams : anfM.params = [ANFParam.mk x ty])
+    (hBody : anfM.body = [ANFBinding.mk bn (.loadParam x) src])
+    (hPub : anfM.isPublic = true) :
+    (Lower.lowerMethod progMethods props anfM).ops = [] := by
+  unfold Lower.lowerMethod
+  rw [hParams, hBody, hPub]
+  have hWit : Lower.lowerValueP progMethods props Lower.defaultInlineBudget 0
+      (Lower.computeLastUses [ANFBinding.mk bn (.loadParam x) src]) [] [bn]
+      (Lower.collectConstInts [ANFBinding.mk bn (.loadParam x) src])
+      [x] bn (.loadParam x)
+      = ([], [bn], [bn]) := by
+    unfold Lower.lowerValueP
+    simp [Lower.loadRefLiveParam, Lower.bringToTop, Lower.StackMap.depth?,
+      Lower.isLastUse, Lower.lastUsesLookup, Lower.listContains,
+      List.findIdx?, List.findIdx?.go, Lower.computeLastUses,
+      Lower.computeLastUses.go, Lower.collectRefs, Lower.lastUsesUpdate]
+  simp only [List.map_cons, List.map_nil, List.reverse_cons, List.reverse_nil,
+    List.nil_append, ANFBinding.name]
+  have hUsesPre : Lower.bindingsUseCheckPreimage
+      [ANFBinding.mk bn (.loadParam x) src] = false := by
+    simp [Lower.bindingsUseCheckPreimage]
+  have hEnds : Lower.bodyEndsInAssert [ANFBinding.mk bn (.loadParam x) src] = false := by
+    simp [Lower.bodyEndsInAssert]
+  have hNoDeser : Lower.bindingsUseDeserializeState
+      [ANFBinding.mk bn (.loadParam x) src] = false := by
+    simp [Lower.bindingsUseDeserializeState]
+  rw [hUsesPre]
+  simp only [Bool.false_eq_true, if_false]
+  rw [Lower.lowerBindingsP.eq_def]
+  simp only [hWit]
+  rw [Lower.lowerBindingsP.eq_def]
+  simp [hEnds, hNoDeser]
+
+/-- The passthrough ANF body succeeds when the param resolves. -/
+theorem evalBindingsP_passthrough_isSome
+    (progMethods : List ANFMethod) (s : State)
+    (bn x : String) (src : Option SourceLoc) (v : RunarVerification.ANF.Eval.Value)
+    (hx : s.lookupParam x = some v) :
+    (RunarVerification.ANF.Eval.evalBindingsP progMethods s
+      [ANFBinding.mk bn (.loadParam x) src]).toOption.isSome = true := by
+  unfold RunarVerification.ANF.Eval.evalBindingsP RunarVerification.ANF.Eval.evalValueP
+  simp [hx, bind, Except.bind, RunarVerification.ANF.Eval.evalBindingsP, Except.toOption]
+
+private theorem filter_isPublic_map_peeped
+    (p : ANFProgram) :
+    ∀ (ms : List ANFMethod),
+      (∀ m ∈ ms, m.name ≠ "constructor") →
+      (ms.map (peepholedLoweredMethod p)).filter Emit.isPublicStackMethod
+        = ms.map (peepholedLoweredMethod p)
+  | [], _ => rfl
+  | m :: rest, hNames => by
+      have hmName : m.name ≠ "constructor" := hNames m (List.mem_cons_self ..)
+      have hIsPub : Emit.isPublicStackMethod (peepholedLoweredMethod p m) = true := by
+        unfold Emit.isPublicStackMethod
+        have hN : (peepholedLoweredMethod p m).name = m.name := rfl
+        rw [hN]
+        exact bne_iff_ne.mpr hmName
+      simp only [List.map_cons, List.filter, hIsPub]
+      rw [filter_isPublic_map_peeped p rest
+            (fun m' hm' => hNames m' (List.mem_cons_of_mem _ hm'))]
+
+/-- **Multi-public shape.**  The post-peephole public-method list is exactly
+the per-method image of the ANF public filter (when no public method is
+constructor-named). The multi-method peer of
+`peepholeProgram_single_public_shape`. -/
+theorem peepholeProgram_multi_public_shape
+    (p : ANFProgram)
+    (hNames : ∀ m ∈ p.methods.filter (·.isPublic), m.name ≠ "constructor") :
+    Emit.publicMethodsOf (peepholeProgram (Lower.lower p))
+      = (p.methods.filter (·.isPublic)).map (peepholedLoweredMethod p) := by
+  have hPeepMethods :
+      (peepholeProgram (Lower.lower p)).methods
+        = (p.methods.filter (·.isPublic)).map (peepholedLoweredMethod p) := by
+    show ((p.methods.filter (·.isPublic)).map
+        (Lower.lowerMethod p.methods p.properties)).map
+        (fun mm => { mm with ops := peepholeMethodOps mm.ops }) = _
+    rw [List.map_map]
+    rfl
+  unfold Emit.publicMethodsOf
+  rw [hPeepMethods]
+  exact filter_isPublic_map_peeped p (p.methods.filter (·.isPublic)) hNames
+
+/-- **Canonical dispatch consume theorem (the dispatch sub-omnibus
+discharge).**  Composes the wave-69 `merkle_dispatch_selection_correct`
+(the deployed dispatch chain selects branch `i` and discards the witness)
+with the passthrough lowering (`ops = []`, run `.ok`) and the ANF-side
+param resolution. -/
+theorem compileSafe_observational_correct_dispatch_consume
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (_hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (i : Nat) (rest : List RunarVerification.ANF.Eval.Value)
+    (hIdx : (p.methods.filter (·.isPublic))[i]? = some anfM)
+    (hWitness : initialStack.stack = .vBigint (Int.ofNat i) :: rest)
+    (hNames : ∀ m ∈ p.methods.filter (·.isPublic), m.name ≠ "constructor")
+    (hAllPass : ∀ m ∈ p.methods.filter (·.isPublic),
+        ∃ (x bn : String) (ty : ANFType) (src : Option SourceLoc),
+          m.params = [ANFParam.mk x ty] ∧
+          m.body = [ANFBinding.mk bn (.loadParam x) src])
+    (hLen2 : 2 ≤ (p.methods.filter (·.isPublic)).length)
+    (hLen17 : (p.methods.filter (·.isPublic)).length ≤ 17)
+    (x bn : String) (ty : ANFType) (src : Option SourceLoc)
+    (_hParams : anfM.params = [ANFParam.mk x ty])
+    (hBody : anfM.body = [ANFBinding.mk bn (.loadParam x) src])
+    (v : RunarVerification.ANF.Eval.Value)
+    (hX : initialAnf.lookupParam x = some v) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome = true := by
+    rw [hBody]
+    exact evalBindingsP_passthrough_isSome p.methods initialAnf bn x src v hX
+  have hShape := peepholeProgram_multi_public_shape p hNames
+  have hPeepNil : peepholeMethodOps ([] : List StackOp) = [] := by
+    unfold peepholeMethodOps
+    have hNoIfNil : Peephole.noIfOp ([] : List StackOp) := by simp [Peephole.noIfOp]
+    have h1 : Peephole.peepholePassAll [] = ([] : List StackOp) := by
+      rw [Peephole.peepholePassAll_eq_flat_of_noIfOp [] hNoIfNil]; rfl
+    rw [h1, Peephole.peepholePostFold_nil, Peephole.peepholeChainFold_nil,
+      Peephole.peepholeRollPickFold_nil]
+  have hOpsNil : ∀ m ∈ p.methods.filter (·.isPublic),
+      (peepholedLoweredMethod p m).ops = [] := by
+    intro m hm
+    obtain ⟨x', bn', ty', src', hP', hB'⟩ := hAllPass m hm
+    have hPub' : m.isPublic = true := by
+      have := (List.mem_filter.mp hm).2
+      simpa using this
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties m).ops = []
+    rw [lowerMethod_ops_passthrough p.methods p.properties m x' bn' ty' src'
+          hP' hB' hPub', hPeepNil]
+  have hIdxPeep :
+      (Emit.publicMethodsOf (peepholeProgram (Lower.lower p)))[i]?
+        = some (peepholedLoweredMethod p anfM) := by
+    rw [hShape, List.getElem?_map, hIdx]; rfl
+  have hSelOps : (peepholedLoweredMethod p anfM).ops = [] :=
+    hOpsNil anfM (List.mem_of_getElem? hIdx)
+  have hAllEmit : ∀ m' ∈ Emit.publicMethodsOf (peepholeProgram (Lower.lower p)),
+      Parse.AreRunarEmittable m'.ops := by
+    intro m' hm'
+    rw [hShape] at hm'
+    obtain ⟨m, hm, rfl⟩ := List.mem_map.mp hm'
+    rw [hOpsNil m hm]
+    exact .nil
+  have hLen2' : 2 ≤ (Emit.publicMethodsOf (peepholeProgram (Lower.lower p))).length := by
+    rw [hShape, List.length_map]; exact hLen2
+  have hLen17' : (Emit.publicMethodsOf (peepholeProgram (Lower.lower p))).length ≤ 17 := by
+    rw [hShape, List.length_map]; exact hLen17
+  have hSel := merkle_dispatch_selection_correct p bytes
+    (peepholedLoweredMethod p anfM) initialStack i rest hSafe hIdxPeep hWitness
+    (by rw [hSelOps]; exact .nil) hAllEmit hLen2' hLen17'
+  have hStack : (runParsedBytes bytes initialStack).toOption.isSome = true := by
+    rw [hSel, hSelOps, RunarVerification.Stack.Eval.runOps_nil]
+    rfl
+  show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome
+      ↔ (runParsedBytes bytes initialStack).toOption.isSome
+  rw [hANF, hStack]
+
+/-! ### MANDATORY smoke: the dispatch consume theorem fires
+
+The canonical 2-method passthrough contract `D` (`ma(x){return x}`,
+`mb(y){return y}`), fired end-to-end with selector `0` choosing `ma`:
+`compileSafe` accepts it (deploying the bare 2-branch Merkle dispatch
+chain), and on a concrete entry (`x ↦ 7` on the ANF side, witness `0` over
+`7` on the deployed stack) the ANF eval and the deployed-bytes run AGREE on
+their success bit. -/
+
+private def dpSmokeA : ANFMethod :=
+  { name := "ma", params := [ANFParam.mk "x" .bigint],
+    body := [ANFBinding.mk "t0" (.loadParam "x") none], isPublic := true }
+
+private def dpSmokeB : ANFMethod :=
+  { name := "mb", params := [ANFParam.mk "y" .bigint],
+    body := [ANFBinding.mk "t0" (.loadParam "y") none], isPublic := true }
+
+private def dpSmokeProg : ANFProgram :=
+  { contractName := "D", properties := [], methods := [dpSmokeA, dpSmokeB] }
+
+private def dpSmokeAnf : State := { params := [("x", .vBigint 7)] }
+
+private def dpSmokeStk : StackState := { stack := [.vBigint 0, .vBigint 7] }
+
+/-- SMOKE — `compileSafe` accepts the canonical 2-passthrough contract and
+the dispatch consume theorem fires with selector 0. -/
+theorem smoke_dispatch_consume_fires :
+    ∃ bytes, compileSafe dpSmokeProg = .ok bytes ∧
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP dpSmokeProg.methods dpSmokeAnf
+          dpSmokeA.body)
+        (runParsedBytes bytes dpSmokeStk) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe dpSmokeProg = .ok b := by
+    have h : (compileSafe dpSmokeProg).toOption.isSome = true := by native_decide
+    cases hc : compileSafe dpSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  exact compileSafe_observational_correct_dispatch_consume
+    dpSmokeProg dpSmokeA bytes rfl hSafe dpSmokeAnf dpSmokeStk 0 [.vBigint 7]
+    (by rfl) (by rfl)
+    (by intro m hm
+        simp only [dpSmokeProg, List.filter] at hm
+        rcases List.mem_cons.mp hm with h | h
+        · subst h; decide
+        · rcases List.mem_cons.mp h with h2 | h2
+          · subst h2; decide
+          · exact absurd h2 (by simp))
+    (by intro m hm
+        simp only [dpSmokeProg, List.filter] at hm
+        rcases List.mem_cons.mp hm with h | h
+        · subst h; exact ⟨"x", "t0", .bigint, none, rfl, rfl⟩
+        · rcases List.mem_cons.mp h with h2 | h2
+          · subst h2; exact ⟨"y", "t0", .bigint, none, rfl, rfl⟩
+          · exact absurd h2 (by simp))
+    (by decide) (by decide)
+    "x" "t0" .bigint none rfl rfl (.vBigint 7) rfl
+
 /-! ### Wave 66 — MANDATORY smoke: the method_call consume theorem fires
 
 The canonical single-public passthrough program — public `entry(a)` whose
@@ -5216,6 +6006,10 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    -- Aliased-operand guard (2026-06-08): threads to the narrowed crypto_call /
+    -- loop sub-omnibus axioms.  Decidable; every frontend-produced program
+    -- satisfies it by construction (operands are fresh temps).
+    (hNoAlias : noAliasedOperandsB anfM.body = true)
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
     (hUntag :
       Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
@@ -5287,6 +6081,60 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
       Agrees.methodCallConsumeShapeBool p.methods anfM = true →
         ∃ a, (anfM.params.map (·.name)).reverse = [a] ∧
              tsm = [(a, Agrees.SlotKind.param)])
+    -- **crypto_call hash-peel premise (keyed).**  For a body in the single-hash-call
+    -- consume fragment (decided by `hashCallConsumeShapeBool` — one param, one
+    -- binding `bn = sha256/hash160(param)`) the shape witnesses plus the bytes-typed
+    -- entry fragment (the param resolves to bytes on both sides) are recovered.
+    -- Keyed on the DECIDABLE classifier, it is VACUOUS for every non-hash body, so
+    -- the omnibus stays jointly satisfiable; its only consumer is the conformance
+    -- harness, which discharges it per fixture from the bytes-typed entry.
+    (hHashCallFrag :
+      RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true →
+        ∃ (bn arg func : String) (src : Option SourceLoc)
+          (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          (anfM.params.map (·.name)).reverse = [arg] ∧
+          anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
+          (func = "sha256" ∨ func = "hash160") ∧
+          initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
+          initialStack.stack = .vBytes argBytes :: rest ∧
+          argBytes.size ≤ 520)
+    -- **Stateful consume premise (keyed).**  For a body in the canonical
+    -- stateful fragment (decided by `AgreesStateful.statefulConsumeShapeBool` —
+    -- one param `pre`, body exactly the auto-injected gated prologue) the shape
+    -- witnesses plus the valid-BIP-143-context entry bundle are recovered: the
+    -- preimage param resolves to the canonical preimage of a valid context, and
+    -- the runtime stack carries that preimage over the `_opPushTxSig`-derived
+    -- signature.  Keyed on the DECIDABLE classifier, it is VACUOUS for every
+    -- non-canonical body, so the omnibus stays jointly satisfiable.  Its only
+    -- consumer is the conformance harness, which discharges it per fixture from
+    -- the deployment context.
+    (hStatefulFrag :
+      RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
+        ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
+          (sigV preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk pre ty] ∧
+          anfM.body = Stack.StatefulBridge.gatedStatefulPrologueBody pre ∧
+          pre ≠ "_cp0" ∧ pre ≠ "_opPushTxSig" ∧
+          Stack.ValidTxContext ctx ∧
+          preimage = Stack.TxContext.buildPreimage ctx ∧
+          initialAnf.resolveRef pre = some (.vBytes preimage) ∧
+          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest)
+    -- **Dispatch consume premise (keyed).**  For a multi-public program in the
+    -- canonical passthrough fragment (decided by `dispatchConsumeShapeBool`)
+    -- the entry bundle is recovered: the unlocking caller pushed the selector
+    -- index `i` of `anfM` within the public filter, and `anfM`'s single param
+    -- resolves on the ANF side.  Keyed on the DECIDABLE classifier, it is
+    -- VACUOUS for every non-fragment program, so the omnibus stays jointly
+    -- satisfiable.  Its only consumer is the conformance harness, which
+    -- discharges it per fixture from the call context.
+    (hDispatchFrag :
+      dispatchConsumeShapeBool p = true →
+        ∃ (i : Nat) (rest : List RunarVerification.ANF.Eval.Value)
+          (v : RunarVerification.ANF.Eval.Value),
+          (p.methods.filter (·.isPublic))[i]? = some anfM ∧
+          initialStack.stack = .vBigint (Int.ofNat i) :: rest ∧
+          ∀ (x : String) (ty : ANFType), anfM.params = [ANFParam.mk x ty] →
+            initialAnf.lookupParam x = some v)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
@@ -5301,11 +6149,65 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
   -- because they reflect program-level shape obligations that override
   -- the structural body classification.
   by_cases hStateful : Lower.bindingsUseCheckPreimage anfM.body = true
-  · exact compileSafe_observational_correct_modulo_stateful_codegen
-      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hStateful
+  · -- **Stateful consume branch (replaces the retired stateful axiom).**
+    -- The decidable `statefulConsumeShapeBool` classifier peels the canonical
+    -- gated-prologue fragment for single-public methods; the keyed
+    -- `hStatefulFrag` premise recovers the shape witnesses + the valid-context
+    -- entry bundle, and the discharged consume theorem fires.  Residual
+    -- stateful bodies (user logic, epilogues, multi-public programs, or
+    -- constructor-named methods) fall through to the sound crypto_call
+    -- fallback — NO new axiom is introduced.
+    by_cases hStMulti : (p.methods.filter (·.isPublic)).length ≥ 2
+    · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+    · have hStSingle : p.methods.filter (·.isPublic) = [anfM] := by
+        have hAnfMem : anfM ∈ p.methods.filter (·.isPublic) :=
+          List.mem_filter.mpr ⟨hMem, by simpa using hPublic⟩
+        have hLenGe1 : 1 ≤ (p.methods.filter (·.isPublic)).length :=
+          List.length_pos_of_mem hAnfMem
+        have hLenLt2 : (p.methods.filter (·.isPublic)).length < 2 :=
+          Nat.lt_of_not_le hStMulti
+        have hLen1 : (p.methods.filter (·.isPublic)).length = 1 :=
+          Nat.le_antisymm (Nat.lt_succ_iff.mp hLenLt2) hLenGe1
+        obtain ⟨a, ha⟩ := List.length_eq_one_iff.mp hLen1
+        rw [ha] at hAnfMem ⊢
+        have : anfM = a := by simpa using hAnfMem
+        rw [this]
+      by_cases hStShape :
+          RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true
+      · by_cases hStName : anfM.name ≠ "constructor"
+        · obtain ⟨pre, ty, ctx, sigV, preimage, restV, hStParams, hStBody,
+            hStNe1, hStNe2, hStValid, hStPreLink, hStAnfPre, hStStk⟩ :=
+            hStatefulFrag hStShape
+          exact compileSafe_observational_correct_stateful_consume
+            p anfM bytes hMem hPublic hSafe initialAnf initialStack
+            hStSingle hStName pre ty hStParams hStBody hStNe1 hStNe2
+            ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk
+        · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+      · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
   · by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
-    · exact compileSafe_observational_correct_modulo_dispatch_codegen
-        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hDispatch
+    · -- **Dispatch consume branch (replaces the retired dispatch axiom).**
+      -- The decidable `dispatchConsumeShapeBool` classifier peels the
+      -- canonical multi-public passthrough fragment; the keyed
+      -- `hDispatchFrag` premise recovers the selector witness + index +
+      -- param resolution, and the discharged consume theorem fires.
+      -- Residual multi-public programs fall through to the sound
+      -- crypto_call fallback — NO new axiom is introduced.
+      by_cases hDpShape : dispatchConsumeShapeBool p = true
+      · obtain ⟨_h2, _h17, hDpNames, hDpAllPass⟩ :=
+          dispatchConsumeShapeBool_extract p hDpShape
+        obtain ⟨i, restW, v, hIdxW, hWitnessW, hResW⟩ := hDispatchFrag hDpShape
+        have hMemPub : anfM ∈ p.methods.filter (·.isPublic) :=
+          List.mem_filter.mpr ⟨hMem, by simpa using hPublic⟩
+        obtain ⟨x, bn, ty, src, hParamsW, hBodyW⟩ := hDpAllPass anfM hMemPub
+        exact compileSafe_observational_correct_dispatch_consume
+          p anfM bytes hPublic hSafe initialAnf initialStack i restW
+          hIdxW hWitnessW hDpNames hDpAllPass _h2 _h17
+          x bn ty src hParamsW hBodyW v (hResW x ty hParamsW)
+      · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
     · -- In the `¬hDispatch` branch the public-method filter has length < 2;
       -- since `anfM` is itself public it must be the SOLE public method, so
       -- the filter is exactly `[anfM]`.  This `hSinglePublic` fact feeds the
@@ -5348,7 +6250,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
               hSinglePublic hNameMB hMathByteNoLen hStructCall hUntag hCoh hFrag
           · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
         · -- **Wave 64 consume-`update_prop` branch (replaces the retired
           -- update_prop axiom).**  The decidable `updatePropConsumeShapeBool`
           -- classifier pins the body to the canonical
@@ -5374,7 +6276,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                 hSinglePublic hNameUP prop op c hBodyEq hSM hAdmis hAgrees hUntagUP
                 hTypedEntry hWtUP hCoh
             · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
           · -- **Wave 45 consume-`if_val` branch (replaces the retired if_val axiom).**
             -- The decidable `ifValArithBody` fragment pins the body to a single
             -- `.ifVal` with arith branches; the residual structural facts
@@ -5457,7 +6359,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                   (hTsmEq ▸ hUntag) hTypedEntry hBranchTyped (hTsmEq ▸ hCoh)
                   hCondBool hCondHead hLastU hIPThn hIPThn
               · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
             · by_cases hLoop :
                   Agrees.structuralLoopBodyBool
                     p.methods p.properties
@@ -5466,6 +6368,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                     anfM.body initialSm 0 = true
               · exact compileSafe_observational_correct_modulo_loop_codegen
                   p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hLoop
+                  hNoAlias
               · -- **Wave 66 consume-`method_call` branch (replaces the retired
                 -- method_call axiom).**  The decidable `methodCallConsumeShapeBool`
                 -- classifier pins the body to the param-passthrough fragment
@@ -5487,13 +6390,36 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                       (fun _ => hSm) hCoh
                   · exact compileSafe_observational_correct_modulo_crypto_call_codegen
                       p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
-                      [(a, Agrees.SlotKind.param)] hAgrees trivial
-                · -- Substrate-gap fallback: no structural classifier fires.
-                  -- This is the crypto-call family (no dedicated Bool checker
-                  -- until A4-crypto + Phase B per-primitive land). The
-                  -- sub-omnibus hypothesis is `True`.
-                  exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+                      [(a, Agrees.SlotKind.param)] hAgrees hNoAlias
+                · -- **crypto_call hash-peel branch.**  Before the universal
+                  -- fallback, the decidable `hashCallConsumeShapeBool` classifier
+                  -- peels the single-`sha256`/`hash160`-call method fragment: the
+                  -- keyed `hHashCallFrag` premise recovers the shape witnesses + the
+                  -- bytes-typed entry, and the discharged consume theorem fires
+                  -- (RAW = the bare allowlisted opcode).  Non-hash bodies fall
+                  -- through to the sound crypto_call fallback — NO new axiom.
+                  by_cases hHashShape :
+                      RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true
+                  · by_cases hHashName : anfM.name ≠ "constructor"
+                    · obtain ⟨bn, harg, hfunc, hsrc, hargBytes, hrestV,
+                        hHParams, hHBody, hHFunc, hHArg, hHStk, hHLen⟩ := hHashCallFrag hHashShape
+                      rcases hHFunc with hF | hF
+                      · subst hF
+                        exact hashCall_consume_sha256 p anfM bytes bn harg hsrc hMem hPublic hSafe
+                          initialAnf initialStack hSinglePublic hHashName hHParams hHBody
+                          hargBytes hrestV hHArg hHStk hHLen
+                      · subst hF
+                        exact hashCall_consume_hash160 p anfM bytes bn harg hsrc hMem hPublic hSafe
+                          initialAnf initialStack hSinglePublic hHashName hHParams hHBody
+                          hargBytes hrestV hHArg hHStk hHLen
+                    · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+                  · -- Substrate-gap fallback: no structural classifier fires.
+                    -- This is the crypto-call family (no dedicated Bool checker
+                    -- until A4-crypto + Phase B per-primitive land). The
+                    -- sub-omnibus hypothesis is `True`.
+                    exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
 
 /--
 **Capstone variant consuming `SupportedANFBody`.**
@@ -5519,6 +6445,10 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    -- Aliased-operand guard (2026-06-08): threads to the narrowed crypto_call /
+    -- loop sub-omnibus axioms.  Decidable; every frontend-produced program
+    -- satisfies it by construction (operands are fresh temps).
+    (hNoAlias : noAliasedOperandsB anfM.body = true)
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
     (hUntag :
       Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
@@ -5551,6 +6481,60 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       Agrees.methodCallConsumeShapeBool p.methods anfM = true →
         ∃ a, (anfM.params.map (·.name)).reverse = [a] ∧
              tsm = [(a, Agrees.SlotKind.param)])
+    -- **crypto_call hash-peel premise (keyed).**  For a body in the single-hash-call
+    -- consume fragment (decided by `hashCallConsumeShapeBool` — one param, one
+    -- binding `bn = sha256/hash160(param)`) the shape witnesses plus the bytes-typed
+    -- entry fragment (the param resolves to bytes on both sides) are recovered.
+    -- Keyed on the DECIDABLE classifier, it is VACUOUS for every non-hash body, so
+    -- the omnibus stays jointly satisfiable; its only consumer is the conformance
+    -- harness, which discharges it per fixture from the bytes-typed entry.
+    (hHashCallFrag :
+      RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true →
+        ∃ (bn arg func : String) (src : Option SourceLoc)
+          (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          (anfM.params.map (·.name)).reverse = [arg] ∧
+          anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
+          (func = "sha256" ∨ func = "hash160") ∧
+          initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
+          initialStack.stack = .vBytes argBytes :: rest ∧
+          argBytes.size ≤ 520)
+    -- **Stateful consume premise (keyed).**  For a body in the canonical
+    -- stateful fragment (decided by `AgreesStateful.statefulConsumeShapeBool` —
+    -- one param `pre`, body exactly the auto-injected gated prologue) the shape
+    -- witnesses plus the valid-BIP-143-context entry bundle are recovered: the
+    -- preimage param resolves to the canonical preimage of a valid context, and
+    -- the runtime stack carries that preimage over the `_opPushTxSig`-derived
+    -- signature.  Keyed on the DECIDABLE classifier, it is VACUOUS for every
+    -- non-canonical body, so the omnibus stays jointly satisfiable.  Its only
+    -- consumer is the conformance harness, which discharges it per fixture from
+    -- the deployment context.
+    (hStatefulFrag :
+      RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
+        ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
+          (sigV preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk pre ty] ∧
+          anfM.body = Stack.StatefulBridge.gatedStatefulPrologueBody pre ∧
+          pre ≠ "_cp0" ∧ pre ≠ "_opPushTxSig" ∧
+          Stack.ValidTxContext ctx ∧
+          preimage = Stack.TxContext.buildPreimage ctx ∧
+          initialAnf.resolveRef pre = some (.vBytes preimage) ∧
+          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest)
+    -- **Dispatch consume premise (keyed).**  For a multi-public program in the
+    -- canonical passthrough fragment (decided by `dispatchConsumeShapeBool`)
+    -- the entry bundle is recovered: the unlocking caller pushed the selector
+    -- index `i` of `anfM` within the public filter, and `anfM`'s single param
+    -- resolves on the ANF side.  Keyed on the DECIDABLE classifier, it is
+    -- VACUOUS for every non-fragment program, so the omnibus stays jointly
+    -- satisfiable.  Its only consumer is the conformance harness, which
+    -- discharges it per fixture from the call context.
+    (hDispatchFrag :
+      dispatchConsumeShapeBool p = true →
+        ∃ (i : Nat) (rest : List RunarVerification.ANF.Eval.Value)
+          (v : RunarVerification.ANF.Eval.Value),
+          (p.methods.filter (·.isPublic))[i]? = some anfM ∧
+          initialStack.stack = .vBigint (Int.ofNat i) :: rest ∧
+          ∀ (x : String) (ty : ANFType), anfM.params = [ANFParam.mk x ty] →
+            initialAnf.lookupParam x = some v)
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
     successAgrees
@@ -5558,8 +6542,8 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       (runParsedBytes bytes initialStack) :=
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
-    Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
-    hMethodCallFrag hCoh
+    hNoAlias Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
+    hMethodCallFrag hHashCallFrag hStatefulFrag hDispatchFrag hCoh
 
 
 end Soundness

@@ -81,6 +81,12 @@ inductive ANFType where
   | p384Point
   | rabinPubKey
   | rabinSig
+  /-- Homogeneous fixed-length array `elem[]`. The only producer is the
+  `array_literal` ANF value (used by `checkMultiSig`'s `Sig[]` / `PubKey[]`
+  operands); no conformance fixture carries an array-typed *param* or
+  *property*, so this constructor never reaches the flat-String
+  param/property serialization channel (`fromString?` / `toString`). -/
+  | array (elem : ANFType)
   deriving Repr, BEq, DecidableEq, Inhabited
 
 namespace ANFType
@@ -103,7 +109,9 @@ def fromString? : String → Option ANFType
   | "RabinSig"        => some .rabinSig
   | _                 => none
 
-/-- Round-trip back to the canonical type-string. -/
+/-- Round-trip back to the canonical type-string. Array types render in the
+TS `elem[]` convention (e.g. `Sig[]`, `PubKey[]`); see `fromString?` for why
+the array form is intentionally *not* parsed back through this scalar channel. -/
 def toString : ANFType → String
   | .bigint          => "bigint"
   | .bool            => "boolean"
@@ -119,11 +127,27 @@ def toString : ANFType → String
   | .p384Point       => "P384Point"
   | .rabinPubKey     => "RabinPubKey"
   | .rabinSig        => "RabinSig"
+  | .array elem      => toString elem ++ "[]"
 
 instance : ToString ANFType := ⟨ANFType.toString⟩
 
-theorem fromString_toString (t : ANFType) : fromString? t.toString = some t := by
-  cases t <;> rfl
+/-- `t` is one of the 14 scalar (non-array) constructors. The flat type-string
+channel (`fromString?` / `toString`) is lossless exactly on this fragment; the
+array form is carried structurally at the JSON layer instead (see
+`Json.lean`'s `ANFType` object encoding), because no conformance fixture ever
+serializes an array-typed param or property. -/
+def IsScalar : ANFType → Prop
+  | .array _ => False
+  | _        => True
+
+/-- The flat type-string serialization round-trips on every scalar `ANFType`.
+Arrays are excluded by hypothesis: they are never written to this channel (no
+fixture has array-typed params/props), and `toString (.array e) = "…[]"` is
+deliberately *not* re-parsed by `fromString?` (which returns `none` for the
+`[]` form). -/
+theorem fromString_toString (t : ANFType) (h : IsScalar t) :
+    fromString? t.toString = some t := by
+  cases t <;> first | rfl | exact absurd h (by simp [IsScalar])
 
 end ANFType
 
