@@ -2907,6 +2907,85 @@ introduced. See `PATH2_PLAN.md` §5.23 and `TRUST_MANIFEST.md`. -/
 -- propext / Classical.choice / Quot.sound + the crypto backends (NO
 -- sub-omnibus axiom).
 
+/-! ## Aliased-operand soundness guard (2026-06-08)
+
+**A COUNTEREXAMPLE was found to the unguarded sub-omnibus axioms.**  For a
+hand-written ANF binding whose value reads the SAME ref twice in consume
+position — e.g. `t := x + x` with `x` a last-use param — the liveness
+lowerer double-consumes the single stack copy: each `bringToTop` d0-consume
+emits `[]` (the TS reference `05-stack-lower.ts:828` behaves identically),
+so the lowered ops are a bare `[OP_ADD]` that UNDERFLOWS at runtime, while
+the ANF interpreter evaluates the binding fine.  `compileSafe` accepts the
+program (`WF.ANF` holds), so `successAgrees` is `true ↔ false` = False —
+the unguarded axioms (`hypothesis True` crypto_call; loop) were REFUTABLE.
+The counterexample theorems below pin this permanently.
+
+**Production impact: none from any frontend** — the ANF lowering pass gives
+every operand a fresh temp (`x + x` becomes `t0 := load_param x; t1 :=
+load_param x; t2 := t0 + t1`, which lowers correctly to `DUP SWAP ADD`,
+verified against the real TS compiler output `767c93009c`), and zero
+conformance fixtures contain a repeated-operand value.  The pattern is
+reachable ONLY through hand-written IR fed to `compileFromANF` / `--ir`
+(a separate compiler-side hardening concern).
+
+The guard: `noAliasedOperandsB` decides that every binding's value reads
+pairwise-distinct refs (recursing into branch and loop bodies).  Every
+frontend-produced program satisfies it by construction.  Both surviving
+sub-omnibus axioms now REQUIRE it; the omnibus theorem threads it. -/
+
+/-- No duplicate names within one operand list. -/
+def nodupRefsB : List String → Bool
+  | [] => true
+  | r :: rest => !rest.contains r && nodupRefsB rest
+
+mutual
+/-- The value's operand refs are pairwise distinct (branch/loop bodies
+recursively). Single-ref and ref-free values are trivially fine. -/
+def valueOperandsNodupB : ANFValue → Bool
+  | .binOp _ l r _ => l != r
+  | .call _ args => nodupRefsB args
+  | .methodCall obj _ args => nodupRefsB (obj :: args)
+  | .arrayLiteral elems => nodupRefsB elems
+  | .addOutput sat vals pre => nodupRefsB ((sat :: vals) ++ [pre])
+  | .addRawOutput a b => a != b
+  | .addDataOutput a b => a != b
+  | .ifVal _ thn els => noAliasedOperandsB thn && noAliasedOperandsB els
+  | .loop _ body _ => noAliasedOperandsB body
+  | _ => true
+
+/-- Every binding in the body reads pairwise-distinct refs per value. -/
+def noAliasedOperandsB : List ANFBinding → Bool
+  | [] => true
+  | .mk _ v _ :: rest => valueOperandsNodupB v && noAliasedOperandsB rest
+end
+
+/-- The counterexample method: `double(x) { t := x + x }` (repeated operand,
+hand-written ANF — NOT producible by any frontend). -/
+private def aliasCxM : ANFMethod :=
+  { name := "double", params := [ANFParam.mk "x" .bigint],
+    body := [ANFBinding.mk "t" (.binOp "+" "x" "x" none) none], isPublic := true }
+
+private def aliasCxProg : ANFProgram :=
+  { contractName := "Dbl", properties := [], methods := [aliasCxM] }
+
+/-- COUNTEREXAMPLE (ANF half): the repeated-operand body EVALUATES fine. -/
+theorem aliasCx_anf_succeeds :
+    (RunarVerification.ANF.Eval.evalBindingsP aliasCxProg.methods
+      { params := [("x", .vBigint 5)] } aliasCxM.body).toOption.isSome = true := by
+  native_decide
+
+/-- COUNTEREXAMPLE (Stack half): the deployed bytes UNDERFLOW — the compiled
+script of the same accepted program fails on the matching entry. Together
+with the ANF half this REFUTES the unguarded `successAgrees` claim. -/
+theorem aliasCx_stack_fails :
+    (match compileSafe aliasCxProg with
+     | .ok bytes => (runParsedBytes bytes { stack := [.vBigint 5] }).toOption.isSome
+     | .error _ => true) = false := by
+  native_decide
+
+/-- The guard REJECTS the counterexample (the narrowing is effective). -/
+theorem aliasCx_guard_rejects : noAliasedOperandsB aliasCxM.body = false := by decide
+
 /-- **O1 sub-omnibus — crypto call family.**
 
 Phase D harness integration: codegen-soundness for ANF bodies whose
@@ -2943,7 +3022,10 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hCryptoCall : True) :
+    -- Aliased-operand guard (2026-06-08): the previously-`True` hypothesis is
+    -- NARROWED after the `t := x + x` counterexample (see the soundness-guard
+    -- section above) — without it this axiom was refutable.
+    (_hNoAlias : noAliasedOperandsB anfM.body = true) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
@@ -2999,7 +3081,12 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
         (Lower.collectConstInts anfM.body)
         anfM.body
         (List.reverse (anfM.params.map (·.name)))
-        0 = true) :
+        0 = true)
+    -- Aliased-operand guard (2026-06-08): NARROWED after the `i + i` loop-body
+    -- counterexample (see the soundness-guard section above) — the unguarded
+    -- form was refutable for loop bodies reading the iteration variable twice
+    -- in one binding.
+    (_hNoAlias : noAliasedOperandsB anfM.body = true) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
@@ -5919,6 +6006,10 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    -- Aliased-operand guard (2026-06-08): threads to the narrowed crypto_call /
+    -- loop sub-omnibus axioms.  Decidable; every frontend-produced program
+    -- satisfies it by construction (operands are fresh temps).
+    (hNoAlias : noAliasedOperandsB anfM.body = true)
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
     (hUntag :
       Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
@@ -6068,7 +6159,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- fallback — NO new axiom is introduced.
     by_cases hStMulti : (p.methods.filter (·.isPublic)).length ≥ 2
     · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
     · have hStSingle : p.methods.filter (·.isPublic) = [anfM] := by
         have hAnfMem : anfM ∈ p.methods.filter (·.isPublic) :=
           List.mem_filter.mpr ⟨hMem, by simpa using hPublic⟩
@@ -6093,9 +6184,9 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
             hStSingle hStName pre ty hStParams hStBody hStNe1 hStNe2
             ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk
         · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
       · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
   · by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
     · -- **Dispatch consume branch (replaces the retired dispatch axiom).**
       -- The decidable `dispatchConsumeShapeBool` classifier peels the
@@ -6116,7 +6207,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           hIdxW hWitnessW hDpNames hDpAllPass _h2 _h17
           x bn ty src hParamsW hBodyW v (hResW x ty hParamsW)
       · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
     · -- In the `¬hDispatch` branch the public-method filter has length < 2;
       -- since `anfM` is itself public it must be the SOLE public method, so
       -- the filter is exactly `[anfM]`.  This `hSinglePublic` fact feeds the
@@ -6159,7 +6250,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
               hSinglePublic hNameMB hMathByteNoLen hStructCall hUntag hCoh hFrag
           · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
         · -- **Wave 64 consume-`update_prop` branch (replaces the retired
           -- update_prop axiom).**  The decidable `updatePropConsumeShapeBool`
           -- classifier pins the body to the canonical
@@ -6185,7 +6276,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                 hSinglePublic hNameUP prop op c hBodyEq hSM hAdmis hAgrees hUntagUP
                 hTypedEntry hWtUP hCoh
             · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
           · -- **Wave 45 consume-`if_val` branch (replaces the retired if_val axiom).**
             -- The decidable `ifValArithBody` fragment pins the body to a single
             -- `.ifVal` with arith branches; the residual structural facts
@@ -6268,7 +6359,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                   (hTsmEq ▸ hUntag) hTypedEntry hBranchTyped (hTsmEq ▸ hCoh)
                   hCondBool hCondHead hLastU hIPThn hIPThn
               · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
             · by_cases hLoop :
                   Agrees.structuralLoopBodyBool
                     p.methods p.properties
@@ -6277,6 +6368,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                     anfM.body initialSm 0 = true
               · exact compileSafe_observational_correct_modulo_loop_codegen
                   p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hLoop
+                  hNoAlias
               · -- **Wave 66 consume-`method_call` branch (replaces the retired
                 -- method_call axiom).**  The decidable `methodCallConsumeShapeBool`
                 -- classifier pins the body to the param-passthrough fragment
@@ -6298,7 +6390,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                       (fun _ => hSm) hCoh
                   · exact compileSafe_observational_correct_modulo_crypto_call_codegen
                       p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
-                      [(a, Agrees.SlotKind.param)] hAgrees trivial
+                      [(a, Agrees.SlotKind.param)] hAgrees hNoAlias
                 · -- **crypto_call hash-peel branch.**  Before the universal
                   -- fallback, the decidable `hashCallConsumeShapeBool` classifier
                   -- peels the single-`sha256`/`hash160`-call method fragment: the
@@ -6321,13 +6413,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                           initialAnf initialStack hSinglePublic hHashName hHParams hHBody
                           hargBytes hrestV hHArg hHStk hHLen
                     · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+                        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
                   · -- Substrate-gap fallback: no structural classifier fires.
                     -- This is the crypto-call family (no dedicated Bool checker
                     -- until A4-crypto + Phase B per-primitive land). The
                     -- sub-omnibus hypothesis is `True`.
                     exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
 
 /--
 **Capstone variant consuming `SupportedANFBody`.**
@@ -6353,6 +6445,10 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    -- Aliased-operand guard (2026-06-08): threads to the narrowed crypto_call /
+    -- loop sub-omnibus axioms.  Decidable; every frontend-produced program
+    -- satisfies it by construction (operands are fresh temps).
+    (hNoAlias : noAliasedOperandsB anfM.body = true)
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
     (hUntag :
       Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
@@ -6446,7 +6542,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       (runParsedBytes bytes initialStack) :=
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
-    Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
+    hNoAlias Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
     hMethodCallFrag hHashCallFrag hStatefulFrag hDispatchFrag hCoh
 
 
