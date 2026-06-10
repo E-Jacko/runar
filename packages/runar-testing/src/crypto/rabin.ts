@@ -10,6 +10,17 @@
 
 import { createHash } from 'node:crypto';
 
+/**
+ * Upper bound (exclusive) on the Rabin `padding` parameter.
+ *
+ * MUST stay in sync with `RABIN_PADDING_LIMIT` in
+ * `runar-compiler/src/passes/rabin-codegen.ts` (and its 6 peer-tier codegen
+ * modules), which emit an on-chain `OP_WITHIN` check enforcing the same bound.
+ * The off-chain verifier below mirrors it so the interpreter stays sound with
+ * respect to the deployed locking script.
+ */
+export const RABIN_PADDING_LIMIT = 65536n;
+
 // ---------------------------------------------------------------------------
 // Key generation
 // ---------------------------------------------------------------------------
@@ -93,9 +104,13 @@ export function rabinVerify(
   pubkey: bigint,
 ): boolean {
   if (pubkey <= 0n) return false;
+  const padBN = bytesToUnsignedLE(padding);
+  // Padding bound — mirrors the on-chain OP_WITHIN check (RABIN_PADDING_LIMIT).
+  // Without it, an attacker forges any message with sig=0 and
+  // padding=SHA256(msg), since (0²+SHA256(msg)) mod n == SHA256(msg) mod n.
+  if (padBN >= RABIN_PADDING_LIMIT) return false;
   const hash = createHash('sha256').update(msg).digest();
   const hashBN = bytesToUnsignedLE(hash);
-  const padBN = bytesToUnsignedLE(padding);
   const lhs = ((sig * sig + padBN) % pubkey + pubkey) % pubkey;
   const rhs = (hashBN % pubkey + pubkey) % pubkey;
   return lhs === rhs;

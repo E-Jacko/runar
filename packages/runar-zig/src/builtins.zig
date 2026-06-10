@@ -587,6 +587,12 @@ pub fn blake3Hash(message: base.ByteString) base.ByteString {
     return blake3Compress(blake3_iv_bytes[0..], &block);
 }
 
+// Mirrors the on-chain Rabin codegen's OP_WITHIN bound (0 <= padding < 65536).
+// Without it the off-chain verifier accepts a universal forgery the deployed
+// script rejects: sig=0, padding=SHA256(msg) gives (0^2 + SHA256(msg)) mod n
+// == SHA256(msg) mod n, validating against any message/modulus.
+const RABIN_PADDING_LIMIT: u64 = 65536;
+
 pub fn verifyRabinSig(message: base.ByteString, sig: base.RabinSig, padding: base.ByteString, pub_key: base.RabinPubKey) bool {
     var modulus = BigUint.fromLeBytes(std.heap.page_allocator, pub_key) catch return false;
     defer modulus.deinit();
@@ -601,6 +607,11 @@ pub fn verifyRabinSig(message: base.ByteString, sig: base.RabinSig, padding: bas
     defer sig_bn.deinit();
     var pad_bn = BigUint.fromLeBytes(std.heap.page_allocator, padding) catch return false;
     defer pad_bn.deinit();
+
+    // Enforce 0 <= padding < 65536 (padding is unsigned, so the lower bound is free).
+    var pad_limit = BigUint.fromU64(std.heap.page_allocator, RABIN_PADDING_LIMIT) catch return false;
+    defer pad_limit.deinit();
+    if (pad_bn.cmp(&pad_limit) != .lt) return false;
 
     var sig_sq = sig_bn.mul(&sig_bn) catch return false;
     defer sig_sq.deinit();
@@ -2238,6 +2249,42 @@ test "verifyRabinSig accepts a trivial valid signature construction" {
 
     try std.testing.expect(verifyRabinSig("oracle-message", &[_]u8{0x00}, padding, &modulus));
     try std.testing.expect(!verifyRabinSig("wrong-message", &[_]u8{0x00}, padding, &modulus));
+}
+
+test "verifyRabinSig rejects the sig=0/padding=SHA256(msg) forgery via the padding bound" {
+    // Realistic ~256-bit modulus (the shared oracle test key); for a typical
+    // message SHA256(msg) < n, so the forged padding = SHA256(msg) >= 65536.
+    const modulus = [_]u8{
+        0x95, 0x0b, 0x36, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x63,
+        0x62, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+    };
+    const message = "oracle-price:60000";
+
+    // Forgery: sig=0, padding = SHA256(message). (0^2 + SHA256(msg)) mod n
+    // == SHA256(msg) mod n trivially, so the only thing rejecting it is the
+    // 0 <= padding < 65536 bound that mirrors the on-chain OP_WITHIN check.
+    var hash_bytes: [32]u8 = undefined;
+    Sha256Hasher.hash(message, &hash_bytes, .{});
+    // SHA256 output is 32 bytes; as a number it is far above 65536, so the
+    // guard must reject this forgery.
+    try std.testing.expect(!verifyRabinSig(message, &[_]u8{0x00}, &hash_bytes, &modulus));
+
+    // Honest small-padding signature (tiny modulus, padding < 65536) is still
+    // accepted: sig=0, padding = SHA256(msg) mod 251, which fits in one byte.
+    const small_mod = [_]u8{0xfb}; // 251, little-endian
+    var honest_hash: [32]u8 = undefined;
+    Sha256Hasher.hash(message, &honest_hash, .{});
+    var honest_hash_bn = try BigUint.fromLeBytes(std.heap.page_allocator, &honest_hash);
+    defer honest_hash_bn.deinit();
+    var small_mod_bn = try BigUint.fromLeBytes(std.heap.page_allocator, &small_mod);
+    defer small_mod_bn.deinit();
+    var honest_pad_bn = try honest_hash_bn.rem(&small_mod_bn);
+    defer honest_pad_bn.deinit();
+    const honest_pad = try honest_pad_bn.toLeBytes();
+    defer std.heap.page_allocator.free(honest_pad);
+    try std.testing.expect(verifyRabinSig(message, &[_]u8{0x00}, honest_pad, &small_mod));
 }
 
 test "SLH SHA2 parameter sizes stay aligned with the published script matrix" {

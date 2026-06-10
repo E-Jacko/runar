@@ -194,6 +194,16 @@ impl BigUint {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Upper bound (exclusive) on the Rabin padding value.
+///
+/// Mirrors the on-chain OP_WITHIN bound `0 <= padding < 65536` enforced by the
+/// Rabin codegen. Without this guard the off-chain verifier accepts a universal
+/// forgery the deployed script rejects: setting `sig = 0` and
+/// `padding = SHA256(msg)` trivially satisfies
+/// `(0^2 + SHA256(msg)) mod n == SHA256(msg) mod n`. The on-chain script blocks
+/// it because SHA256(msg) is a 256-bit value far larger than 65536.
+const RABIN_PADDING_LIMIT: u64 = 65536;
+
 /// Verify a Rabin signature.
 ///
 /// Equation: `(sig^2 + padding) mod n == SHA256(msg) mod n`
@@ -215,6 +225,15 @@ pub fn rabin_verify(msg: &[u8], sig: &[u8], padding: &[u8], pubkey: &[u8]) -> bo
     let hash_bn = BigUint::from_le_bytes(&hash);
     let sig_bn = BigUint::from_le_bytes(sig);
     let pad_bn = BigUint::from_le_bytes(padding);
+
+    // Enforce the on-chain OP_WITHIN bound `0 <= padding < 65536`. BigUint is
+    // unsigned so the lower bound is automatic; reject any padding at/above the
+    // limit (more than one limb, or a single limb >= RABIN_PADDING_LIMIT). This
+    // blocks the sig=0 / padding=SHA256(msg) universal forgery.
+    let pad_limit = BigUint::from_le_bytes(&RABIN_PADDING_LIMIT.to_le_bytes());
+    if pad_bn.cmp(&pad_limit) != std::cmp::Ordering::Less {
+        return false;
+    }
 
     let sig_sq = sig_bn.mul(&sig_bn);
     let lhs_sum = sig_sq.add(&pad_bn);
@@ -320,6 +339,59 @@ mod tests {
 
         let sig_bytes = [0u8; 1]; // sig = 0
         assert!(rabin_verify(msg, &sig_bytes, &pad_bytes, &n_bytes));
+    }
+
+    #[test]
+    fn test_rabin_verify_rejects_padding_forgery() {
+        // Universal forgery: sig = 0, padding = SHA256(msg) (the *raw* 256-bit
+        // hash, not reduced mod n). It satisfies the bare equation
+        // (0^2 + SHA256(msg)) mod n == SHA256(msg) mod n, but SHA256(msg) is a
+        // 256-bit value far above the on-chain OP_WITHIN limit of 65536, so the
+        // off-chain verifier must reject it just like the deployed script does.
+        let msg = b"test message";
+        let hash = Sha256::digest(msg);
+
+        let n_val: u64 = 997; // prime, same modulus family as other tests
+        let n_bytes = n_val.to_le_bytes();
+
+        let sig_bytes = [0u8; 1]; // sig = 0
+        let pad_bytes = hash.to_vec(); // padding = raw SHA256(msg), >= 65536
+
+        assert!(
+            !rabin_verify(msg, &sig_bytes, &pad_bytes, &n_bytes),
+            "padding=SHA256(msg) forgery must be rejected by the off-chain verifier"
+        );
+    }
+
+    #[test]
+    fn test_rabin_verify_accepts_honest_sig_under_padding_bound() {
+        // An honestly-signed signature whose padding is within [0, 65536) must
+        // still verify true. We search for a (sig, padding) pair satisfying
+        // (sig^2 + padding) mod n == SHA256(msg) mod n with 0 <= padding < 65536.
+        let msg = b"test message";
+        let hash = Sha256::digest(msg);
+
+        let n_val: u64 = 997;
+        let n_bytes = n_val.to_le_bytes();
+
+        let n_bn = BigUint::from_le_bytes(&n_bytes);
+        let rhs = BigUint::from_le_bytes(&hash).rem(&n_bn).limbs[0];
+
+        // Find sig such that padding = (rhs - sig^2 mod n) mod n stays < 65536.
+        // With n = 997 every residue is < 997 < 65536, so any sig works; pick a
+        // nonzero one to exercise the sig^2 term.
+        let sig_val: u64 = 42;
+        let sig_sq_mod = (sig_val * sig_val) % n_val;
+        let padding_val = (rhs + n_val - sig_sq_mod) % n_val; // (rhs - sig^2) mod n
+        assert!(padding_val < RABIN_PADDING_LIMIT);
+
+        let sig_bytes = sig_val.to_le_bytes();
+        let pad_bytes = padding_val.to_le_bytes();
+
+        assert!(
+            rabin_verify(msg, &sig_bytes, &pad_bytes, &n_bytes),
+            "honestly-signed signature with padding < 65536 must verify true"
+        );
     }
 
     #[test]
