@@ -792,6 +792,27 @@ class _LoweringContext:
             return True
         return last <= current_index
 
+    def _operand_consume(self, ref: str, operands: list[str], binding_index: int,
+                         last_uses: dict[str, int]) -> bool:
+        """Consume-vs-copy decision for one operand of a multi-operand ANF value.
+
+        ``operands`` is the FULL operand-ref list of the value (including
+        ``ref`` itself). The load may consume (ROLL / move) the ref only when
+        this binding is the ref's last use AND the ref occurs exactly once in
+        the operand list. A ref read at more than one operand position of the
+        same value must be copied (PICK / DUP) at EVERY position: a
+        consume-mode bring_to_top of a ref already on top of the stack is a
+        no-op, so two consume-mode loads of the same ref would leave a single
+        slot for an opcode that pops one item per operand (e.g. ``t := x + x``
+        underflowing OP_ADD), or silently pair the opcode with the wrong slot.
+        The original then stays on the stack and the existing method epilogue
+        cleans it up. Unreachable from the frontend (pass 04 gives every
+        operand a fresh temp); reachable via compile_from_ir hand-written ANF.
+        """
+        if not self._is_last_use(ref, binding_index, last_uses):
+            return False
+        return operands.count(ref) <= 1
+
     # -----------------------------------------------------------------
     # lower_bindings
     # -----------------------------------------------------------------
@@ -1014,11 +1035,11 @@ class _LoweringContext:
 
     def _lower_bin_op(self, binding_name: str, op: str, left: str, right: str,
                       binding_index: int, last_uses: dict[str, int], result_type: str) -> None:
-        left_is_last = self._is_last_use(left, binding_index, last_uses)
-        self.bring_to_top(left, left_is_last)
+        left_consume = self._operand_consume(left, [left, right], binding_index, last_uses)
+        self.bring_to_top(left, left_consume)
 
-        right_is_last = self._is_last_use(right, binding_index, last_uses)
-        self.bring_to_top(right, right_is_last)
+        right_consume = self._operand_consume(right, [left, right], binding_index, last_uses)
+        self.bring_to_top(right, right_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -1242,8 +1263,8 @@ class _LoweringContext:
 
         # General builtin: push args in order, then emit opcodes
         for arg in args:
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
 
         # Pop all args
         for _ in args:
@@ -1313,8 +1334,8 @@ class _LoweringContext:
         for i, arg in enumerate(args):
             if i < len(method.params):
                 param_name = method.params[i].name
-                is_last = self._is_last_use(arg, binding_index, last_uses)
-                self.bring_to_top(arg, is_last)
+                consume = self._operand_consume(arg, args, binding_index, last_uses)
+                self.bring_to_top(arg, consume)
                 self.sm.pop()
 
                 # If param_name already exists on the stack, temporarily rename
@@ -1727,12 +1748,14 @@ class _LoweringContext:
         state_bytes_ref = args[1]
 
         # Bring stateBytes to stack first.
-        state_last = self._is_last_use(state_bytes_ref, binding_index, last_uses)
-        self.bring_to_top(state_bytes_ref, state_last)
+        state_consume = self._operand_consume(
+            state_bytes_ref, [preimage_ref, state_bytes_ref], binding_index, last_uses)
+        self.bring_to_top(state_bytes_ref, state_consume)
 
         # Extract amount from preimage for the continuation output.
-        pre_last = self._is_last_use(preimage_ref, binding_index, last_uses)
-        self.bring_to_top(preimage_ref, pre_last)
+        pre_consume = self._operand_consume(
+            preimage_ref, [preimage_ref, state_bytes_ref], binding_index, last_uses)
+        self.bring_to_top(preimage_ref, pre_consume)
 
         # Extract amount: last 52 bytes, take 8 bytes at offset 0.
         self.emit_op(StackOp(op="opcode", code="OP_SIZE"))
@@ -1833,15 +1856,17 @@ class _LoweringContext:
         state_bytes_ref = args[1]
         new_amount_ref = args[2]
 
+        cso_operands = [preimage_ref, state_bytes_ref, new_amount_ref]
+
         # Consume preimage ref (no longer needed -- we use _codePart and _newAmount).
-        pre_last = self._is_last_use(preimage_ref, binding_index, last_uses)
-        self.bring_to_top(preimage_ref, pre_last)
+        pre_consume = self._operand_consume(preimage_ref, cso_operands, binding_index, last_uses)
+        self.bring_to_top(preimage_ref, pre_consume)
         self.emit_op(StackOp(op="drop"))
         self.sm.pop()
 
         # Step 1: Convert _newAmount to 8-byte LE and save to altstack.
-        amount_last = self._is_last_use(new_amount_ref, binding_index, last_uses)
-        self.bring_to_top(new_amount_ref, amount_last)
+        amount_consume = self._operand_consume(new_amount_ref, cso_operands, binding_index, last_uses)
+        self.bring_to_top(new_amount_ref, amount_consume)
         self.emit_op(StackOp(op="push", value=big_int_push(8)))
         self.sm.push("")
         self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
@@ -1852,8 +1877,8 @@ class _LoweringContext:
         self.sm.pop()
 
         # Step 2: Bring stateBytes to stack.
-        state_last = self._is_last_use(state_bytes_ref, binding_index, last_uses)
-        self.bring_to_top(state_bytes_ref, state_last)
+        state_consume = self._operand_consume(state_bytes_ref, cso_operands, binding_index, last_uses)
+        self.bring_to_top(state_bytes_ref, state_consume)
 
         # Step 3: Bring _codePart to top (PICK -- never consume, reused across outputs)
         self.bring_to_top("_codePart", False)
@@ -1921,7 +1946,9 @@ class _LoweringContext:
         self.sm.push("")
 
         # Push the 20-byte PKH
-        self.bring_to_top(pkh_ref, self._is_last_use(pkh_ref, binding_index, last_uses))
+        self.bring_to_top(
+            pkh_ref,
+            self._operand_consume(pkh_ref, [pkh_ref, amount_ref], binding_index, last_uses))
         # CAT: prefix || pkh
         self.emit_op(StackOp(op="opcode", code="OP_CAT"))
         self.sm.pop()
@@ -1939,7 +1966,9 @@ class _LoweringContext:
         # --- Stack: [..., 0x1976a914{pkh}88ac] ---
 
         # Step 2: Prepend amount as 8-byte LE.
-        self.bring_to_top(amount_ref, self._is_last_use(amount_ref, binding_index, last_uses))
+        self.bring_to_top(
+            amount_ref,
+            self._operand_consume(amount_ref, [pkh_ref, amount_ref], binding_index, last_uses))
         self.emit_op(StackOp(op="push", value=big_int_push(8)))
         self.sm.push("")
         self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
@@ -2291,6 +2320,7 @@ class _LoweringContext:
         # Uses _codePart implicit parameter (passed by SDK) instead of extracting
         # codePart from the preimage. This is simpler and works with OP_CODESEPARATOR.
         state_props = [p for p in self.properties if not p.readonly]
+        output_operands = [satoshis, *state_values]
 
         # Step 1: Bring _codePart to top (PICK -- never consume, reused across outputs)
         self.bring_to_top("_codePart", False)
@@ -2310,8 +2340,8 @@ class _LoweringContext:
             value_ref = state_values[i]
             prop = state_props[i]
 
-            is_last = self._is_last_use(value_ref, binding_index, last_uses)
-            self.bring_to_top(value_ref, is_last)
+            consume = self._operand_consume(value_ref, output_operands, binding_index, last_uses)
+            self.bring_to_top(value_ref, consume)
 
             # Convert numeric/boolean values to fixed-width bytes
             if prop.type == "bigint":
@@ -2353,8 +2383,8 @@ class _LoweringContext:
         # --- Stack: [..., varint+script] ---
 
         # Step 6: Prepend satoshis as 8-byte LE.
-        is_last_sat = self._is_last_use(satoshis, binding_index, last_uses)
-        self.bring_to_top(satoshis, is_last_sat)
+        satoshis_consume = self._operand_consume(satoshis, output_operands, binding_index, last_uses)
+        self.bring_to_top(satoshis, satoshis_consume)
         self.emit_op(StackOp(op="push", value=big_int_push(8)))
         self.sm.push("")
         self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
@@ -2385,8 +2415,9 @@ class _LoweringContext:
         The scriptBytes are used as-is (no codePart/state insertion).
         """
         # Step 1: Bring scriptBytes to top
-        script_is_last = self._is_last_use(script_bytes, binding_index, last_uses)
-        self.bring_to_top(script_bytes, script_is_last)
+        script_consume = self._operand_consume(
+            script_bytes, [satoshis, script_bytes], binding_index, last_uses)
+        self.bring_to_top(script_bytes, script_consume)
 
         # Step 2: Compute varint prefix for script length
         self.emit_op(StackOp(op="opcode", code="OP_SIZE"))
@@ -2403,8 +2434,9 @@ class _LoweringContext:
         self.sm.push("")
 
         # Step 4: Prepend satoshis as 8-byte LE
-        sat_is_last = self._is_last_use(satoshis, binding_index, last_uses)
-        self.bring_to_top(satoshis, sat_is_last)
+        sat_consume = self._operand_consume(
+            satoshis, [satoshis, script_bytes], binding_index, last_uses)
+        self.bring_to_top(satoshis, sat_consume)
         self.emit_op(StackOp(op="push", value=big_int_push(8)))
         self.sm.push("")
         self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
@@ -2510,10 +2542,14 @@ class _LoweringContext:
         self.emit_op(StackOp(op="push", value=big_int_push(0)))
         self.sm.push("")
 
+        # A ref repeated across the combined element list (e.g. the same
+        # pubkey twice) must be copied at every position -- see _operand_consume.
+        msig_operands = [*sig_elems, *pk_elems]
+
         # Bring each sig element to TOS in declaration order.
         for sig in sig_elems:
-            is_last = self._is_last_use(sig, binding_index, last_uses)
-            self.bring_to_top(sig, is_last)
+            consume = self._operand_consume(sig, msig_operands, binding_index, last_uses)
+            self.bring_to_top(sig, consume)
 
         # Push nSigs.
         self.emit_op(StackOp(op="push", value=big_int_push(len(sig_elems))))
@@ -2521,8 +2557,8 @@ class _LoweringContext:
 
         # Bring each pubkey element to TOS in declaration order.
         for pk in pk_elems:
-            is_last = self._is_last_use(pk, binding_index, last_uses)
-            self.bring_to_top(pk, is_last)
+            consume = self._operand_consume(pk, msig_operands, binding_index, last_uses)
+            self.bring_to_top(pk, consume)
 
         # Push nPKs.
         self.emit_op(StackOp(op="push", value=big_int_push(len(pk_elems))))
@@ -2915,11 +2951,11 @@ class _LoweringContext:
 
         obj, index = args[0], args[1]
 
-        obj_is_last = self._is_last_use(obj, binding_index, last_uses)
-        self.bring_to_top(obj, obj_is_last)
+        obj_consume = self._operand_consume(obj, args, binding_index, last_uses)
+        self.bring_to_top(obj, obj_consume)
 
-        index_is_last = self._is_last_use(index, binding_index, last_uses)
-        self.bring_to_top(index, index_is_last)
+        index_consume = self._operand_consume(index, args, binding_index, last_uses)
+        self.bring_to_top(index, index_consume)
 
         # OP_SPLIT at index
         self.sm.pop()
@@ -2969,11 +3005,11 @@ class _LoweringContext:
 
         data, start, length = args[0], args[1], args[2]
 
-        data_is_last = self._is_last_use(data, binding_index, last_uses)
-        self.bring_to_top(data, data_is_last)
+        data_consume = self._operand_consume(data, args, binding_index, last_uses)
+        self.bring_to_top(data, data_consume)
 
-        start_is_last = self._is_last_use(start, binding_index, last_uses)
-        self.bring_to_top(start, start_is_last)
+        start_consume = self._operand_consume(start, args, binding_index, last_uses)
+        self.bring_to_top(start, start_consume)
 
         # Split at start position
         self.sm.pop()
@@ -2989,8 +3025,8 @@ class _LoweringContext:
         self.sm.push(right_part)
 
         # Push length
-        len_is_last = self._is_last_use(length, binding_index, last_uses)
-        self.bring_to_top(length, len_is_last)
+        len_consume = self._operand_consume(length, args, binding_index, last_uses)
+        self.bring_to_top(length, len_consume)
 
         # Split at length
         self.sm.pop()
@@ -3023,7 +3059,7 @@ class _LoweringContext:
 
         # Bring all 4 args to the top in argument order: msg sig padding pubKey
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
 
         # Pop all 4 args
         for _ in range(4):
@@ -3073,11 +3109,11 @@ class _LoweringContext:
             raise RuntimeError("right requires 2 arguments")
         data, length = args[0], args[1]
 
-        data_is_last = self._is_last_use(data, binding_index, last_uses)
-        self.bring_to_top(data, data_is_last)
+        data_consume = self._operand_consume(data, args, binding_index, last_uses)
+        self.bring_to_top(data, data_consume)
 
-        length_is_last = self._is_last_use(length, binding_index, last_uses)
-        self.bring_to_top(length, length_is_last)
+        length_consume = self._operand_consume(length, args, binding_index, last_uses)
+        self.bring_to_top(length, length_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -3103,11 +3139,11 @@ class _LoweringContext:
             raise RuntimeError(f"{func_name} requires 2 arguments")
         a, b = args[0], args[1]
 
-        a_is_last = self._is_last_use(a, binding_index, last_uses)
-        self.bring_to_top(a, a_is_last)
+        a_consume = self._operand_consume(a, args, binding_index, last_uses)
+        self.bring_to_top(a, a_consume)
 
-        b_is_last = self._is_last_use(b, binding_index, last_uses)
-        self.bring_to_top(b, b_is_last)
+        b_consume = self._operand_consume(b, args, binding_index, last_uses)
+        self.bring_to_top(b, b_consume)
 
         # DUP b, check non-zero, then divide/mod
         self.emit_op(StackOp(op="opcode", code="OP_DUP"))
@@ -3130,19 +3166,19 @@ class _LoweringContext:
             raise RuntimeError("clamp requires 3 arguments")
         val, lo, hi = args[0], args[1], args[2]
 
-        val_is_last = self._is_last_use(val, binding_index, last_uses)
-        self.bring_to_top(val, val_is_last)
+        val_consume = self._operand_consume(val, args, binding_index, last_uses)
+        self.bring_to_top(val, val_consume)
 
-        lo_is_last = self._is_last_use(lo, binding_index, last_uses)
-        self.bring_to_top(lo, lo_is_last)
+        lo_consume = self._operand_consume(lo, args, binding_index, last_uses)
+        self.bring_to_top(lo, lo_consume)
 
         self.sm.pop()
         self.sm.pop()
         self.emit_op(StackOp(op="opcode", code="OP_MAX"))
         self.sm.push("")
 
-        hi_is_last = self._is_last_use(hi, binding_index, last_uses)
-        self.bring_to_top(hi, hi_is_last)
+        hi_consume = self._operand_consume(hi, args, binding_index, last_uses)
+        self.bring_to_top(hi, hi_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -3157,11 +3193,11 @@ class _LoweringContext:
             raise RuntimeError("pow requires 2 arguments")
         base, exp = args[0], args[1]
 
-        base_is_last = self._is_last_use(base, binding_index, last_uses)
-        self.bring_to_top(base, base_is_last)
+        base_consume = self._operand_consume(base, args, binding_index, last_uses)
+        self.bring_to_top(base, base_consume)
 
-        exp_is_last = self._is_last_use(exp, binding_index, last_uses)
-        self.bring_to_top(exp, exp_is_last)
+        exp_consume = self._operand_consume(exp, args, binding_index, last_uses)
+        self.bring_to_top(exp, exp_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -3195,18 +3231,18 @@ class _LoweringContext:
             raise RuntimeError("mulDiv requires 3 arguments")
         a, b, c = args[0], args[1], args[2]
 
-        a_is_last = self._is_last_use(a, binding_index, last_uses)
-        self.bring_to_top(a, a_is_last)
-        b_is_last = self._is_last_use(b, binding_index, last_uses)
-        self.bring_to_top(b, b_is_last)
+        a_consume = self._operand_consume(a, args, binding_index, last_uses)
+        self.bring_to_top(a, a_consume)
+        b_consume = self._operand_consume(b, args, binding_index, last_uses)
+        self.bring_to_top(b, b_consume)
 
         self.sm.pop()
         self.sm.pop()
         self.emit_op(StackOp(op="opcode", code="OP_MUL"))
         self.sm.push("")
 
-        c_is_last = self._is_last_use(c, binding_index, last_uses)
-        self.bring_to_top(c, c_is_last)
+        c_consume = self._operand_consume(c, args, binding_index, last_uses)
+        self.bring_to_top(c, c_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -3221,10 +3257,10 @@ class _LoweringContext:
             raise RuntimeError("percentOf requires 2 arguments")
         amount, bps = args[0], args[1]
 
-        amount_is_last = self._is_last_use(amount, binding_index, last_uses)
-        self.bring_to_top(amount, amount_is_last)
-        bps_is_last = self._is_last_use(bps, binding_index, last_uses)
-        self.bring_to_top(bps, bps_is_last)
+        amount_consume = self._operand_consume(amount, args, binding_index, last_uses)
+        self.bring_to_top(amount, amount_consume)
+        bps_consume = self._operand_consume(bps, args, binding_index, last_uses)
+        self.bring_to_top(bps, bps_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -3279,10 +3315,10 @@ class _LoweringContext:
             raise RuntimeError("gcd requires 2 arguments")
         a, b = args[0], args[1]
 
-        a_is_last = self._is_last_use(a, binding_index, last_uses)
-        self.bring_to_top(a, a_is_last)
-        b_is_last = self._is_last_use(b, binding_index, last_uses)
-        self.bring_to_top(b, b_is_last)
+        a_consume = self._operand_consume(a, args, binding_index, last_uses)
+        self.bring_to_top(a, a_consume)
+        b_consume = self._operand_consume(b, args, binding_index, last_uses)
+        self.bring_to_top(b, b_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -3316,10 +3352,10 @@ class _LoweringContext:
             raise RuntimeError("divmod requires 2 arguments")
         a, b = args[0], args[1]
 
-        a_is_last = self._is_last_use(a, binding_index, last_uses)
-        self.bring_to_top(a, a_is_last)
-        b_is_last = self._is_last_use(b, binding_index, last_uses)
-        self.bring_to_top(b, b_is_last)
+        a_consume = self._operand_consume(a, args, binding_index, last_uses)
+        self.bring_to_top(a, a_consume)
+        b_consume = self._operand_consume(b, args, binding_index, last_uses)
+        self.bring_to_top(b, b_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -3384,7 +3420,7 @@ class _LoweringContext:
 
         # Bring args to top
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(3):
             self.sm.pop()
 
@@ -3406,7 +3442,7 @@ class _LoweringContext:
             raise RuntimeError("verifySLHDSA requires 3 arguments: msg, sig, pubkey")
 
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(3):
             self.sm.pop()
 
@@ -3432,7 +3468,7 @@ class _LoweringContext:
         if len(args) < 2:
             raise RuntimeError("sha256Compress requires 2 arguments: state, block")
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(2):
             self.sm.pop()
 
@@ -3447,7 +3483,7 @@ class _LoweringContext:
         if len(args) < 3:
             raise RuntimeError("sha256Finalize requires 3 arguments: state, remaining, msgBitLen")
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(3):
             self.sm.pop()
 
@@ -3466,7 +3502,7 @@ class _LoweringContext:
         if len(args) < 2:
             raise RuntimeError("blake3Compress requires 2 arguments: chainingValue, block")
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(2):
             self.sm.pop()
 
@@ -3481,7 +3517,7 @@ class _LoweringContext:
         if len(args) < 1:
             raise RuntimeError("blake3Hash requires 1 argument: message")
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(1):
             self.sm.pop()
 
@@ -3500,8 +3536,8 @@ class _LoweringContext:
                           last_uses: dict[str, int]) -> None:
         # Bring args to top in order
         for arg in args:
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
         for _ in args:
             self.sm.pop()
 
@@ -3545,8 +3581,8 @@ class _LoweringContext:
                                args: list[str], binding_index: int,
                                last_uses: dict[str, int]) -> None:
         for arg in args:
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
         for _ in args:
             self.sm.pop()
 
@@ -3579,8 +3615,8 @@ class _LoweringContext:
                             args: list[str], binding_index: int,
                             last_uses: dict[str, int]) -> None:
         for arg in args:
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
         for _ in args:
             self.sm.pop()
 
@@ -3604,8 +3640,8 @@ class _LoweringContext:
                           last_uses: dict[str, int]) -> None:
         # Bring args to top in order
         for arg in args:
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
         for _ in args:
             self.sm.pop()
 
@@ -3626,8 +3662,8 @@ class _LoweringContext:
                           last_uses: dict[str, int]) -> None:
         # Bring args to top in order
         for arg in args:
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
         for _ in args:
             self.sm.pop()
 
@@ -3648,8 +3684,8 @@ class _LoweringContext:
                              last_uses: dict[str, int]) -> None:
         # Bring args to top in order
         for arg in args:
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
         for _ in args:
             self.sm.pop()
 
@@ -3708,8 +3744,8 @@ class _LoweringContext:
         runtime_arg_count = n_args - 1  # all except depth
         for i in range(runtime_arg_count):
             arg = args[i]
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
         # Pop all runtime args -- the codegen consumes them and produces 8 results
         for _ in range(runtime_arg_count):
             self.sm.pop()
@@ -3763,8 +3799,8 @@ class _LoweringContext:
         # Bring leaf, proof, index to stack top for the codegen
         for i in range(3):
             arg = args[i]
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
         # Pop the 3 args -- the codegen consumes them and produces 1 result
         for _ in range(3):
             self.sm.pop()

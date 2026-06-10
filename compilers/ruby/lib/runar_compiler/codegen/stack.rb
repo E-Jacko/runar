@@ -1139,6 +1139,26 @@ module RunarCompiler::Codegen
       last <= current_index
     end
 
+    # Consume-vs-copy decision for one operand of a multi-operand ANF value.
+    #
+    # `operands` is the FULL operand-ref list of the value (including `ref`
+    # itself). The load may consume (ROLL / move) the ref only when this
+    # binding is the ref's last use AND the ref occurs exactly once in the
+    # operand list. A ref read at more than one operand position of the same
+    # value must be copied (PICK / DUP) at EVERY position: a consume-mode
+    # bring_to_top of a ref already on top of the stack is a no-op, so two
+    # consume-mode loads of the same ref would leave a single slot for an
+    # opcode that pops one item per operand (e.g. `t := x + x` underflowing
+    # OP_ADD), or silently pair the opcode with the wrong slot. The original
+    # then stays on the stack and the existing method epilogue cleans it up.
+    # Unreachable from the frontend (every operand gets a fresh temp);
+    # reachable via compile_from_ir hand-written ANF.
+    def _operand_consume(ref, operands, binding_index, last_uses)
+      return false unless _is_last_use(ref, binding_index, last_uses)
+
+      operands.count(ref) <= 1
+    end
+
     # -----------------------------------------------------------------
     # load_param
     # -----------------------------------------------------------------
@@ -1266,11 +1286,11 @@ module RunarCompiler::Codegen
     # -----------------------------------------------------------------
 
     def _lower_bin_op(binding_name, op, left, right, binding_index, last_uses, result_type)
-      left_is_last = _is_last_use(left, binding_index, last_uses)
-      bring_to_top(left, left_is_last)
+      left_consume = _operand_consume(left, [left, right], binding_index, last_uses)
+      bring_to_top(left, left_consume)
 
-      right_is_last = _is_last_use(right, binding_index, last_uses)
-      bring_to_top(right, right_is_last)
+      right_consume = _operand_consume(right, [left, right], binding_index, last_uses)
+      bring_to_top(right, right_consume)
 
       @sm.pop
       @sm.pop
@@ -1535,8 +1555,8 @@ module RunarCompiler::Codegen
 
       # General builtin: push args in order, then emit opcodes
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
 
       # Pop all args
@@ -1608,8 +1628,8 @@ module RunarCompiler::Codegen
         next unless i < method.params.length
 
         param_name = method.params[i].name
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
         @sm.pop
 
         # If param_name already exists on the stack, temporarily rename
@@ -2051,9 +2071,13 @@ module RunarCompiler::Codegen
       @sm.push(nil)
 
       # Bring each sig element to TOS in declaration order.
+      # A ref repeated across the combined element list (e.g. the same
+      # pubkey twice) must be copied at every position -- see _operand_consume.
+      msig_operands = sig_elems + pk_elems
+
       sig_elems.each do |sig|
-        is_last = _is_last_use(sig, binding_index, last_uses)
-        bring_to_top(sig, is_last)
+        consume = _operand_consume(sig, msig_operands, binding_index, last_uses)
+        bring_to_top(sig, consume)
       end
 
       # Push nSigs.
@@ -2062,8 +2086,8 @@ module RunarCompiler::Codegen
 
       # Bring each pubkey element to TOS in declaration order.
       pk_elems.each do |pk|
-        is_last = _is_last_use(pk, binding_index, last_uses)
-        bring_to_top(pk, is_last)
+        consume = _operand_consume(pk, msig_operands, binding_index, last_uses)
+        bring_to_top(pk, consume)
       end
 
       # Push nPKs.
@@ -2127,8 +2151,8 @@ module RunarCompiler::Codegen
 
       data, start, length = args[0], args[1], args[2]
 
-      bring_to_top(data, _is_last_use(data, binding_index, last_uses))
-      bring_to_top(start, _is_last_use(start, binding_index, last_uses))
+      bring_to_top(data, _operand_consume(data, args, binding_index, last_uses))
+      bring_to_top(start, _operand_consume(start, args, binding_index, last_uses))
 
       # Split at start position
       @sm.pop; @sm.pop
@@ -2143,7 +2167,7 @@ module RunarCompiler::Codegen
       @sm.push(right_part)
 
       # Push length
-      bring_to_top(length, _is_last_use(length, binding_index, last_uses))
+      bring_to_top(length, _operand_consume(length, args, binding_index, last_uses))
 
       # Split at length
       @sm.pop; @sm.pop
@@ -2162,8 +2186,8 @@ module RunarCompiler::Codegen
     def _lower_verify_wots(binding_name, args, binding_index, last_uses)
       require_relative "wots"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -2175,8 +2199,8 @@ module RunarCompiler::Codegen
     def _lower_verify_slh_dsa(binding_name, param_key, args, binding_index, last_uses)
       require_relative "slh_dsa"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -2188,8 +2212,8 @@ module RunarCompiler::Codegen
     def _lower_sha256_compress(binding_name, args, binding_index, last_uses)
       require_relative "sha256"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -2201,8 +2225,8 @@ module RunarCompiler::Codegen
     def _lower_sha256_finalize(binding_name, args, binding_index, last_uses)
       require_relative "sha256"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -2214,8 +2238,8 @@ module RunarCompiler::Codegen
     def _lower_blake3_compress(binding_name, args, binding_index, last_uses)
       require_relative "blake3"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -2227,8 +2251,8 @@ module RunarCompiler::Codegen
     def _lower_blake3_hash(binding_name, args, binding_index, last_uses)
       require_relative "blake3"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -2240,8 +2264,8 @@ module RunarCompiler::Codegen
     def _lower_ec_builtin(binding_name, func_name, args, binding_index, last_uses)
       require_relative "ec"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
 
@@ -2255,8 +2279,8 @@ module RunarCompiler::Codegen
     def _lower_nist_ec_builtin(binding_name, func_name, args, binding_index, last_uses)
       require_relative "p256_p384"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
 
@@ -2274,8 +2298,8 @@ module RunarCompiler::Codegen
       end
       # Bring all 3 args to top in order: msg, sig, pubkey
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       @sm.pop # pubkey
       @sm.pop # sig
@@ -2291,8 +2315,8 @@ module RunarCompiler::Codegen
     def _lower_bb_builtin(binding_name, func_name, args, binding_index, last_uses)
       require_relative "babybear"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
 
@@ -2306,8 +2330,8 @@ module RunarCompiler::Codegen
     def _lower_kb_builtin(binding_name, func_name, args, binding_index, last_uses)
       require_relative "koalabear"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
 
@@ -2321,8 +2345,8 @@ module RunarCompiler::Codegen
     def _lower_bn254_builtin(binding_name, func_name, args, binding_index, last_uses)
       require_relative "bn254"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
 
@@ -2370,8 +2394,8 @@ module RunarCompiler::Codegen
       runtime_arg_count = n_args - 1 # all except depth
       runtime_arg_count.times do |i|
         arg = args[i]
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       # Pop all runtime args — the codegen consumes them and produces 8 results
       runtime_arg_count.times { @sm.pop }
@@ -2416,8 +2440,8 @@ module RunarCompiler::Codegen
       # Bring leaf, proof, index to stack top for the codegen
       3.times do |i|
         arg = args[i]
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       # Pop the 3 args -- the codegen consumes them and produces 1 result
       3.times { @sm.pop }
@@ -2438,10 +2462,10 @@ module RunarCompiler::Codegen
       # safediv(a, b) / safemod(a, b): assert b != 0, then div/mod
       raise "#{func_name} requires 2 arguments" if args.length < 2
 
-      is_last_a = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_a)
-      is_last_b = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_b)
+      consume_a = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_a)
+      consume_b = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_b)
 
       # DUP b, check non-zero, then divide/mod
       emit_opcode("OP_DUP"); @sm.push("")
@@ -2460,13 +2484,13 @@ module RunarCompiler::Codegen
       # clamp(val, lo, hi) -> min(max(val, lo), hi)
       raise "clamp requires 3 arguments" if args.length < 3
 
-      bring_to_top(args[0], _is_last_use(args[0], binding_index, last_uses))
-      bring_to_top(args[1], _is_last_use(args[1], binding_index, last_uses))
+      bring_to_top(args[0], _operand_consume(args[0], args, binding_index, last_uses))
+      bring_to_top(args[1], _operand_consume(args[1], args, binding_index, last_uses))
 
       @sm.pop; @sm.pop
       emit_opcode("OP_MAX"); @sm.push("")
 
-      bring_to_top(args[2], _is_last_use(args[2], binding_index, last_uses))
+      bring_to_top(args[2], _operand_consume(args[2], args, binding_index, last_uses))
 
       @sm.pop; @sm.pop
       emit_opcode("OP_MIN")
@@ -2478,10 +2502,10 @@ module RunarCompiler::Codegen
     def _lower_pow(binding_name, args, binding_index, last_uses)
       raise "pow requires 2 arguments" if args.length < 2
 
-      is_last_base = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_base)
-      is_last_exp = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_exp)
+      consume_base = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_base)
+      consume_exp = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_exp)
 
       @sm.pop; @sm.pop
 
@@ -2509,16 +2533,16 @@ module RunarCompiler::Codegen
     def _lower_mul_div(binding_name, args, binding_index, last_uses)
       raise "mulDiv requires 3 arguments" if args.length < 3
 
-      is_last_a = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_a)
-      is_last_b = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_b)
+      consume_a = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_a)
+      consume_b = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_b)
 
       @sm.pop; @sm.pop
       emit_opcode("OP_MUL"); @sm.push("")
 
-      is_last_c = _is_last_use(args[2], binding_index, last_uses)
-      bring_to_top(args[2], is_last_c)
+      consume_c = _operand_consume(args[2], args, binding_index, last_uses)
+      bring_to_top(args[2], consume_c)
 
       @sm.pop; @sm.pop
       emit_opcode("OP_DIV")
@@ -2531,10 +2555,10 @@ module RunarCompiler::Codegen
       # percentOf(amount, bps) -> (amount * bps) / 10000
       raise "percentOf requires 2 arguments" if args.length < 2
 
-      is_last_a = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_a)
-      is_last_b = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_b)
+      consume_a = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_a)
+      consume_b = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_b)
 
       @sm.pop; @sm.pop
       emit_opcode("OP_MUL"); @sm.push("")
@@ -2582,10 +2606,10 @@ module RunarCompiler::Codegen
     def _lower_gcd(binding_name, args, binding_index, last_uses)
       raise "gcd requires 2 arguments" if args.length < 2
 
-      is_last_a = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_a)
-      is_last_b = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_b)
+      consume_a = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_a)
+      consume_b = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_b)
 
       @sm.pop; @sm.pop
 
@@ -2614,10 +2638,10 @@ module RunarCompiler::Codegen
     def _lower_divmod(binding_name, args, binding_index, last_uses)
       raise "divmod requires 2 arguments" if args.length < 2
 
-      is_last_a = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_a)
-      is_last_b = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_b)
+      consume_a = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_a)
+      consume_b = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_b)
 
       @sm.pop; @sm.pop
 
@@ -2687,10 +2711,10 @@ module RunarCompiler::Codegen
     def _lower_right(binding_name, args, binding_index, last_uses)
       # right(bs, n) -> last n bytes of bs
       if args.length >= 2
-        is_last_bs = _is_last_use(args[0], binding_index, last_uses)
-        bring_to_top(args[0], is_last_bs)
-        is_last_n = _is_last_use(args[1], binding_index, last_uses)
-        bring_to_top(args[1], is_last_n)
+        consume_bs = _operand_consume(args[0], args, binding_index, last_uses)
+        bring_to_top(args[0], consume_bs)
+        consume_n = _operand_consume(args[1], args, binding_index, last_uses)
+        bring_to_top(args[1], consume_n)
 
         # Stack: [bs, n]
         # Compute skip = SIZE - n, then SPLIT, NIP
@@ -3164,6 +3188,7 @@ module RunarCompiler::Codegen
 
     def _lower_add_output(binding_name, satoshis, state_values, _preimage, binding_index, last_uses)
       state_props = @properties.reject(&:readonly)
+      output_operands = [satoshis] + state_values
 
       # Step 1: Bring _codePart to top (PICK -- never consume)
       bring_to_top("_codePart", false)
@@ -3178,8 +3203,8 @@ module RunarCompiler::Codegen
         value_ref = state_values[i]
         prop = state_props[i]
 
-        is_last = _is_last_use(value_ref, binding_index, last_uses)
-        bring_to_top(value_ref, is_last)
+        consume = _operand_consume(value_ref, output_operands, binding_index, last_uses)
+        bring_to_top(value_ref, consume)
 
         if prop.type == "bigint"
           emit_push_int(8); @sm.push("")
@@ -3205,8 +3230,8 @@ module RunarCompiler::Codegen
       emit_opcode("OP_CAT"); @sm.push("")
 
       # Step 6: Prepend satoshis as 8-byte LE
-      is_last_sat = _is_last_use(satoshis, binding_index, last_uses)
-      bring_to_top(satoshis, is_last_sat)
+      sat_consume = _operand_consume(satoshis, output_operands, binding_index, last_uses)
+      bring_to_top(satoshis, sat_consume)
       emit_push_int(8); @sm.push("")
       emit_opcode("OP_NUM2BIN"); @sm.pop
       emit_op({ op: "swap" }); @sm.swap
@@ -3224,8 +3249,8 @@ module RunarCompiler::Codegen
 
     def _lower_add_raw_output(binding_name, satoshis, script_bytes, binding_index, last_uses)
       # Step 1: Bring scriptBytes to top
-      script_is_last = _is_last_use(script_bytes, binding_index, last_uses)
-      bring_to_top(script_bytes, script_is_last)
+      script_consume = _operand_consume(script_bytes, [satoshis, script_bytes], binding_index, last_uses)
+      bring_to_top(script_bytes, script_consume)
 
       # Step 2: Compute varint prefix for script length
       emit_opcode("OP_SIZE"); @sm.push("")
@@ -3237,8 +3262,8 @@ module RunarCompiler::Codegen
       emit_opcode("OP_CAT"); @sm.push("")
 
       # Step 4: Prepend satoshis as 8-byte LE
-      sat_is_last = _is_last_use(satoshis, binding_index, last_uses)
-      bring_to_top(satoshis, sat_is_last)
+      sat_consume = _operand_consume(satoshis, [satoshis, script_bytes], binding_index, last_uses)
+      bring_to_top(satoshis, sat_consume)
       emit_push_int(8); @sm.push("")
       emit_opcode("OP_NUM2BIN"); @sm.pop
       emit_op({ op: "swap" }); @sm.swap
@@ -3302,12 +3327,12 @@ module RunarCompiler::Codegen
       state_bytes_ref = args[1]
 
       # Bring stateBytes to stack first
-      state_last = _is_last_use(state_bytes_ref, binding_index, last_uses)
-      bring_to_top(state_bytes_ref, state_last)
+      state_consume = _operand_consume(state_bytes_ref, [preimage_ref, state_bytes_ref], binding_index, last_uses)
+      bring_to_top(state_bytes_ref, state_consume)
 
       # Extract amount from preimage for the continuation output
-      pre_last = _is_last_use(preimage_ref, binding_index, last_uses)
-      bring_to_top(preimage_ref, pre_last)
+      pre_consume = _operand_consume(preimage_ref, [preimage_ref, state_bytes_ref], binding_index, last_uses)
+      bring_to_top(preimage_ref, pre_consume)
 
       # Extract amount: last 52 bytes, take 8 bytes at offset 0
       emit_opcode("OP_SIZE"); @sm.push("")
@@ -3363,21 +3388,23 @@ module RunarCompiler::Codegen
       state_bytes_ref = args[1]
       new_amount_ref = args[2]
 
+      cso_operands = [preimage_ref, state_bytes_ref, new_amount_ref]
+
       # Consume preimage ref (no longer needed)
-      pre_last = _is_last_use(preimage_ref, binding_index, last_uses)
-      bring_to_top(preimage_ref, pre_last)
+      pre_consume = _operand_consume(preimage_ref, cso_operands, binding_index, last_uses)
+      bring_to_top(preimage_ref, pre_consume)
       emit_op({ op: "drop" }); @sm.pop
 
       # Step 1: Convert _newAmount to 8-byte LE and save to altstack
-      amount_last = _is_last_use(new_amount_ref, binding_index, last_uses)
-      bring_to_top(new_amount_ref, amount_last)
+      amount_consume = _operand_consume(new_amount_ref, cso_operands, binding_index, last_uses)
+      bring_to_top(new_amount_ref, amount_consume)
       emit_push_int(8); @sm.push("")
       emit_opcode("OP_NUM2BIN"); @sm.pop; @sm.pop; @sm.push("")
       emit_opcode("OP_TOALTSTACK"); @sm.pop
 
       # Step 2: Bring stateBytes to stack
-      state_last = _is_last_use(state_bytes_ref, binding_index, last_uses)
-      bring_to_top(state_bytes_ref, state_last)
+      state_consume = _operand_consume(state_bytes_ref, cso_operands, binding_index, last_uses)
+      bring_to_top(state_bytes_ref, state_consume)
 
       # Step 3: Bring _codePart to top (PICK -- never consume)
       bring_to_top("_codePart", false)
@@ -3421,7 +3448,7 @@ module RunarCompiler::Codegen
       @sm.push("")
 
       # Push the 20-byte PKH
-      bring_to_top(pkh_ref, _is_last_use(pkh_ref, binding_index, last_uses))
+      bring_to_top(pkh_ref, _operand_consume(pkh_ref, [pkh_ref, amount_ref], binding_index, last_uses))
       # CAT: prefix || pkh
       emit_opcode("OP_CAT"); @sm.pop; @sm.pop; @sm.push("")
 
@@ -3432,7 +3459,7 @@ module RunarCompiler::Codegen
       emit_opcode("OP_CAT"); @sm.pop; @sm.pop; @sm.push("")
 
       # Step 2: Prepend amount as 8-byte LE
-      bring_to_top(amount_ref, _is_last_use(amount_ref, binding_index, last_uses))
+      bring_to_top(amount_ref, _operand_consume(amount_ref, [pkh_ref, amount_ref], binding_index, last_uses))
       emit_push_int(8); @sm.push("")
       emit_opcode("OP_NUM2BIN"); @sm.pop
       emit_op({ op: "swap" }); @sm.swap
@@ -3453,7 +3480,7 @@ module RunarCompiler::Codegen
       require_relative "rabin"
 
       args.each do |arg|
-        bring_to_top(arg, _is_last_use(arg, binding_index, last_uses))
+        bring_to_top(arg, _operand_consume(arg, args, binding_index, last_uses))
       end
 
       4.times { @sm.pop }

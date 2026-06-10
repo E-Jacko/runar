@@ -477,6 +477,34 @@ const LowerCtx = struct {
         try self.bringToTop(name, consume);
     }
 
+    /// Consume-vs-copy decision for one operand of a multi-operand ANF value.
+    ///
+    /// `operands` is the FULL operand-ref list of the value (including `name`
+    /// itself). The load may consume (ROLL / move) the ref only when this
+    /// binding is the ref's last use AND the ref occurs exactly once in the
+    /// operand list. A ref read at more than one operand position of the same
+    /// value must be copied (PICK / DUP) at EVERY position: a consume-mode
+    /// bringToTop of a ref already on top of the stack is a no-op, so two
+    /// consume-mode loads of the same ref would leave a single slot for an
+    /// opcode that pops one item per operand (e.g. `t := x + x` underflowing
+    /// OP_ADD), or silently pair the opcode with the wrong slot. The original
+    /// then stays on the stack and the existing method epilogue cleans it up.
+    /// Unreachable from the frontend (every operand gets a fresh temp);
+    /// reachable via compile-ir hand-written ANF.
+    fn operandConsume(self: *const LowerCtx, name: []const u8, operands: []const []const u8) bool {
+        if (!self.isLastUse(name)) return false;
+        var occurrences: usize = 0;
+        for (operands) |o| {
+            if (std.mem.eql(u8, o, name)) occurrences += 1;
+        }
+        return occurrences <= 1;
+    }
+
+    /// bringToTop with the repeated-operand-aware consume decision.
+    fn bringToTopOperand(self: *LowerCtx, name: []const u8, operands: []const []const u8) !void {
+        try self.bringToTop(name, self.operandConsume(name, operands));
+    }
+
     /// Drain branch-private residue from below TOS at the end of a branch
     /// body, so both branches converge to a layout the parent stack model can
     /// faithfully describe before OP_ENDIF (issue #36).
@@ -1032,7 +1060,7 @@ const LowerCtx = struct {
         for (args, 0..) |arg, idx| {
             if (idx >= method.params.len) break;
             const param_name = method.params[idx].name;
-            const consume = self.isLastUse(arg);
+            const consume = self.operandConsume(arg, args);
             try self.bringToTop(arg, consume);
             _ = self.stack.pop();
 
@@ -1224,8 +1252,9 @@ const LowerCtx = struct {
     }
 
     fn lowerBinaryOp(self: *LowerCtx, bind_name: []const u8, bop: types.ANFBinaryOp) !void {
-        try self.bringToTopAuto(bop.left);
-        try self.bringToTopAuto(bop.right);
+        const bin_operands = [_][]const u8{ bop.left, bop.right };
+        try self.bringToTopOperand(bop.left, &bin_operands);
+        try self.bringToTopOperand(bop.right, &bin_operands);
 
         const is_bytes = if (bop.result_type) |t| std.mem.eql(u8, t, "bytes") else false;
 
@@ -1674,7 +1703,7 @@ const LowerCtx = struct {
             // Wave 3 placeholders — consume args and push placeholder
             .ecPairing, .schnorrVerify => {
                 for (args) |arg| {
-                    try self.bringToTopAuto(arg);
+                    try self.bringToTopOperand(arg, args);
                     _ = self.stack.pop();
                 }
                 try self.emitPushInt(0);
@@ -1688,7 +1717,7 @@ const LowerCtx = struct {
         if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1720,7 +1749,7 @@ const LowerCtx = struct {
         if (args.len < sha256_emitters.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1758,7 +1787,7 @@ const LowerCtx = struct {
         if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1790,7 +1819,7 @@ const LowerCtx = struct {
         if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1867,7 +1896,7 @@ const LowerCtx = struct {
         if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1892,7 +1921,7 @@ const LowerCtx = struct {
         if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1922,7 +1951,7 @@ const LowerCtx = struct {
         if (args.len < required) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1952,7 +1981,7 @@ const LowerCtx = struct {
         if (args.len < required) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1980,7 +2009,7 @@ const LowerCtx = struct {
         if (args.len < required) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -2024,7 +2053,7 @@ const LowerCtx = struct {
         // Bring remaining args to the stack top.
         const runtime_args = args[0 .. args.len - 1];
         for (runtime_args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (runtime_args) |_| {
             _ = self.stack.pop();
@@ -2070,7 +2099,7 @@ const LowerCtx = struct {
 
         // Bring leaf, proof, index to stack top for the codegen
         for (0..3) |i| {
-            try self.bringToTopAuto(args[i]);
+            try self.bringToTopOperand(args[i], args);
         }
         // Pop the 3 args -- the codegen consumes them and produces 1 result
         for (0..3) |_| {
@@ -2122,8 +2151,8 @@ const LowerCtx = struct {
 
     fn lowerSimpleBinaryBuiltin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, op: Opcode) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         try self.emitOp(op);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -2162,9 +2191,14 @@ const LowerCtx = struct {
         try self.emitPushInt(0);
         try self.stack.push(self.allocator, null);
 
+        // A ref repeated across the combined element list (e.g. the same
+        // pubkey twice) must be copied at every position — see operandConsume.
+        const msig_operands = try std.mem.concat(self.allocator, []const u8, &.{ sig_elems, pk_elems });
+        defer self.allocator.free(msig_operands);
+
         // Bring each sig element to TOS in declaration order.
         for (sig_elems) |sig| {
-            const consume = self.isLastUse(sig);
+            const consume = self.operandConsume(sig, msig_operands);
             try self.bringToTop(sig, consume);
         }
 
@@ -2174,7 +2208,7 @@ const LowerCtx = struct {
 
         // Bring each pubkey element to TOS in declaration order.
         for (pk_elems) |pk| {
-            const consume = self.isLastUse(pk);
+            const consume = self.operandConsume(pk, msig_operands);
             try self.bringToTop(pk, consume);
         }
 
@@ -2213,9 +2247,9 @@ const LowerCtx = struct {
 
     fn lowerWithin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 3) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
-        try self.bringToTopAuto(args[2]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
+        try self.bringToTopOperand(args[2], args);
         try self.emitOp(.op_within);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -2234,8 +2268,8 @@ const LowerCtx = struct {
 
     fn lowerSplit(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]); // data
-        try self.bringToTopAuto(args[1]); // position
+        try self.bringToTopOperand(args[0], args); // data
+        try self.bringToTopOperand(args[1], args); // position
         try self.emitOp(.op_split);
         // OP_SPLIT consumes data + position, produces left + right (two outputs)
         _ = self.stack.pop();
@@ -2247,8 +2281,8 @@ const LowerCtx = struct {
 
     fn lowerLeft(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]); // data
-        try self.bringToTopAuto(args[1]); // length
+        try self.bringToTopOperand(args[0], args); // data
+        try self.bringToTopOperand(args[1], args); // length
         try self.emitOp(.op_split);
         try self.emitOp(.op_drop); // drop right, keep left
         _ = self.stack.pop();
@@ -2259,8 +2293,8 @@ const LowerCtx = struct {
 
     fn lowerSubstr(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 3) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]); // s
-        try self.bringToTopAuto(args[1]); // start
+        try self.bringToTopOperand(args[0], args); // s
+        try self.bringToTopOperand(args[1], args); // start
         try self.emitOp(.op_split);
         try self.emitOp(.op_nip); // drop left, keep right
         _ = self.stack.pop();
@@ -2268,7 +2302,7 @@ const LowerCtx = struct {
         try self.stack.push(self.allocator, null);
         self.trackDepth();
 
-        try self.bringToTopAuto(args[2]); // length
+        try self.bringToTopOperand(args[2], args); // length
         try self.emitOp(.op_split);
         try self.emitOp(.op_drop); // drop rest, keep substr
         _ = self.stack.pop();
@@ -2289,8 +2323,8 @@ const LowerCtx = struct {
 
     fn lowerSafeDivMod(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, final_op: Opcode) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         try self.emitOp(.op_dup);
         try self.emitOp(.op_0notequal);
         try self.emitOp(.op_verify);
@@ -2311,8 +2345,8 @@ const LowerCtx = struct {
 
     fn lowerPow(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         _ = self.stack.pop();
         _ = self.stack.pop();
 
@@ -2338,14 +2372,14 @@ const LowerCtx = struct {
 
     fn lowerMulDiv(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 3) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         try self.emitOp(.op_mul);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
         self.trackDepth();
-        try self.bringToTopAuto(args[2]);
+        try self.bringToTopOperand(args[2], args);
         try self.emitOp(.op_div);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -2355,8 +2389,8 @@ const LowerCtx = struct {
 
     fn lowerPercentOf(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.emitOp(.op_mul);
@@ -2392,8 +2426,8 @@ const LowerCtx = struct {
 
     fn lowerGcd(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.emitOp(.op_abs);
@@ -2442,8 +2476,8 @@ const LowerCtx = struct {
         // different intermediate stack shape, breaking byte-level parity
         // with the other 6 tiers (caught by the math-demo conformance
         // fixture once the divmod method was added).
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.emitOp(.op_2dup);
@@ -2483,14 +2517,14 @@ const LowerCtx = struct {
 
     fn lowerClamp(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 3) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         try self.emitOp(.op_max);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
         self.trackDepth();
-        try self.bringToTopAuto(args[2]);
+        try self.bringToTopOperand(args[2], args);
         try self.emitOp(.op_min);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -2784,7 +2818,7 @@ const LowerCtx = struct {
         if (args.len < 2) return LowerError.InvalidBuiltin;
         try self.emitPushData(&stateful_templates.p2pkh_prefix_with_len);
         try self.stack.push(self.allocator, null);
-        try self.bringToTopAuto(args[0]);
+        try self.bringToTopOperand(args[0], args);
         try self.emitOp(.op_cat);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -2797,7 +2831,7 @@ const LowerCtx = struct {
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
 
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[1], args);
         try self.emitPushInt(8);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
@@ -3333,11 +3367,11 @@ const LowerCtx = struct {
     fn lowerComputeStateOutput(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 3) return LowerError.InvalidBuiltin;
 
-        try self.bringToTopAuto(args[0]);
+        try self.bringToTopOperand(args[0], args);
         try self.emitOp(.op_drop);
         _ = self.stack.pop();
 
-        try self.bringToTopAuto(args[2]);
+        try self.bringToTopOperand(args[2], args);
         try self.emitPushInt(8);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
@@ -3347,7 +3381,7 @@ const LowerCtx = struct {
         try self.emitOp(.op_toaltstack);
         _ = self.stack.pop();
 
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[1], args);
         try self.bringToTop("_codePart", false);
 
         try self.emitPushData(&stateful_templates.op_return_byte);
@@ -3398,8 +3432,8 @@ const LowerCtx = struct {
     fn lowerComputeStateOutputHash(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
 
-        try self.bringToTopAuto(args[1]);
-        try self.bringToTopAuto(args[0]);
+        try self.bringToTopOperand(args[1], args);
+        try self.bringToTopOperand(args[0], args);
 
         try self.emitOp(.op_size);
         try self.stack.push(self.allocator, null);
@@ -4054,6 +4088,13 @@ const LowerCtx = struct {
     // ========================================================================
 
     fn lowerAddOutput(self: *LowerCtx, bind_name: []const u8, ao: types.ANFAddOutput) !void {
+        const output_operands = try std.mem.concat(
+            self.allocator,
+            []const u8,
+            &.{ &.{ao.satoshis}, ao.state_values },
+        );
+        defer self.allocator.free(output_operands);
+
         var state_prop_count: usize = 0;
         for (self.program.properties) |prop| {
             if (!prop.readonly) state_prop_count += 1;
@@ -4075,7 +4116,7 @@ const LowerCtx = struct {
             const value_ref = ao.state_values[state_index];
             state_index += 1;
 
-            try self.bringToTopAuto(value_ref);
+            try self.bringToTopOperand(value_ref, output_operands);
             if (isNumericStateType(prop.type_info)) {
                 const width: i64 = if (prop.type_info == .boolean) 1 else 8;
                 try self.emitPushInt(width);
@@ -4108,7 +4149,7 @@ const LowerCtx = struct {
         try self.stack.push(self.allocator, null);
         self.trackDepth();
 
-        try self.bringToTopAuto(ao.satoshis);
+        try self.bringToTopOperand(ao.satoshis, output_operands);
         try self.emitPushInt(8);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
@@ -4126,7 +4167,7 @@ const LowerCtx = struct {
     }
 
     fn lowerAddRawOutput(self: *LowerCtx, bind_name: []const u8, aro: types.ANFAddRawOutput) !void {
-        try self.bringToTopAuto(aro.script_bytes);
+        try self.bringToTopOperand(aro.script_bytes, &.{ aro.satoshis, aro.script_bytes });
         try self.emitOp(.op_size);
         try self.stack.push(self.allocator, null);
         try self.emitVarintEncoding();
@@ -4141,7 +4182,7 @@ const LowerCtx = struct {
         try self.stack.push(self.allocator, null);
         self.trackDepth();
 
-        try self.bringToTopAuto(aro.satoshis);
+        try self.bringToTopOperand(aro.satoshis, &.{ aro.satoshis, aro.script_bytes });
         try self.emitPushInt(8);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
