@@ -165,11 +165,16 @@ jobs:
 
       - name: Emit summary
         if: always()
+        # This step only writes a cosmetic job summary; a malformed/empty
+        # report (or a missing jq) must never fail an otherwise-green fuzz
+        # run, so the whole block is best-effort (`set +e`) and the jq has a
+        # fallback. The Fuzz step itself is the real pass/fail signal.
         env:
           SEED: ${{ steps.params.outputs.seed }}
           NUM: ${{ steps.params.outputs.num }}
           BUDGET: ${{ steps.params.outputs.budget }}
         run: |
+          set +e
           {
             printf '## ANF differential fuzzer\n\n'
             printf '- Seed: `%s`\n' "$SEED"
@@ -186,9 +191,11 @@ jobs:
                 earlyStop,
                 durationMs,
                 perTierAvailable
-              }' /tmp/anf-fuzz-report.json
+              }' /tmp/anf-fuzz-report.json 2>/dev/null \
+                || printf '_report present but could not be summarised_\n'
               printf '\n```\n'
             else
               printf '_no report produced_\n'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
