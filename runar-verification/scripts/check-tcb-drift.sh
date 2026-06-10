@@ -20,7 +20,14 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=72        # −1 (2026-06-08 — stateful sub-omnibus RETIRED:
+TARGET_AXIOMS=71        # −1 (2026-06-08 — dispatch sub-omnibus RETIRED:
+                        # `compileSafe_observational_correct_modulo_dispatch_codegen`
+                        # is GONE; its branch is discharged by the theorem
+                        # `compileSafe_observational_correct_dispatch_consume` for the
+                        # canonical multi-public passthrough fragment via the wave-69
+                        # D1 selection theorem; residual multi-public programs fall to
+                        # the sound crypto_call fallback).
+                        # Previous: 72 — −1 (2026-06-08 — stateful sub-omnibus RETIRED:
                         # `compileSafe_observational_correct_modulo_stateful_codegen`
                         # is GONE; its omnibus branch is discharged by the theorem
                         # `compileSafe_observational_correct_stateful_consume` for

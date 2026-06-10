@@ -1762,7 +1762,7 @@ Tier 1 Stage C / Phase D landings.
   `_modulo_math_byte_call_codegen`, `_modulo_crypto_call_codegen`,
   `_modulo_update_prop_codegen`, `_modulo_if_val_codegen`,
   `_modulo_loop_codegen`, `_modulo_method_call_codegen`,
-  `_modulo_dispatch_codegen`. (`_modulo_stateful_codegen` RETIRED 2026-06-08 via the canonical gated-prologue consume theorem.)
+  (`_modulo_dispatch_codegen` RETIRED 2026-06-08 via the multi-public passthrough consume theorem; `_modulo_stateful_codegen` RETIRED 2026-06-08 via the canonical gated-prologue consume theorem.)
 * Each sub-omnibus carries the corresponding structural-predicate
   hypothesis from `Stack/Agrees.lean`, so dispatching the harness
   on the per-family Bool checker classifies fixtures into the
