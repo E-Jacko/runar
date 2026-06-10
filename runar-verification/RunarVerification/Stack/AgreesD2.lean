@@ -6,10 +6,13 @@ import RunarVerification.Stack.OutputTrace
 /-!
 # Stage D2 — stateful-prologue substrate (investigation PoC)
 
-This file is the **map substrate** for retiring the omnibus sub-axiom
+This file is the **map substrate** that retired the omnibus sub-axiom
 `compileSafe_observational_correct_modulo_stateful_codegen`
-(`Pipeline.lean`), the FIRST branch in the omnibus dispatch — it fires
-when `Lower.bindingsUseCheckPreimage anfM.body = true`.
+(`Pipeline.lean`) — RETIRED 2026-06-08 by the theorem
+`compileSafe_observational_correct_stateful_consume` (canonical
+gated-prologue fragment via `Stack/AgreesStateful.lean` + the
+`StatefulBridge` BIP-143 bridge); residual stateful bodies fall through
+to the sound crypto_call fallback.
 
 It mirrors, for the auto-injected stateful prologue, the decidable
 fragment-classifier + extraction pattern that the RETIRED `update_prop`

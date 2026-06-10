@@ -1,6 +1,9 @@
 package runar.integration;
 
+import java.io.IOException;
 import java.math.BigInteger;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 import org.junit.jupiter.api.DisplayName;
@@ -29,6 +32,36 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  * tests for the same contract.
  */
 class PrivateHelperOutputsIntegrationTest extends IntegrationBase {
+
+    // Inline private-helper variant whose record() helper emits a 1-satoshi
+    // (not 0) data output. The CI regtest node runs with acceptnonstdtxn=0
+    // (oracle hardening, PR #49) and rejects 0-satoshi OP_RETURN outputs as
+    // "dust" at sendrawtransaction. The shared conformance contract
+    // (examples/ts/private-helper-outputs/PrivateHelperOutputs.runar.ts) is
+    // deliberately left at 0n so its cross-tier hex goldens stay frozen; this
+    // inline source preserves the exact "data output routed through a private
+    // helper, broadcast to a live node" assertion without that golden churn.
+    private static final String LOG_SOURCE = """
+        import { StatefulSmartContract, ByteString, assert } from 'runar-lang';
+
+        export class PrivateHelperLog extends StatefulSmartContract {
+            counter: bigint;
+
+            constructor(counter: bigint) {
+                super(counter);
+                this.counter = counter;
+            }
+
+            private record(payload: ByteString): void {
+                this.addDataOutput(1n, payload);
+            }
+
+            public log(payload: ByteString): void {
+                this.record(payload);
+                assert(true);
+            }
+        }
+        """;
 
     @Test
     @DisplayName("commit chain: three sequential calls each spend the previous continuation")
@@ -60,9 +93,14 @@ class PrivateHelperOutputsIntegrationTest extends IntegrationBase {
     @Test
     @DisplayName("log() routes a data output through a private helper")
     void logEmitsDataOutput() {
-        RunarArtifact artifact = ContractCompiler.compileRelative(
-            "examples/ts/private-helper-outputs/PrivateHelperOutputs.runar.ts"
-        );
+        Path tmp;
+        try {
+            tmp = Files.createTempFile("runar-private-helper-log-", "PrivateHelperLog.runar.ts");
+            Files.writeString(tmp, LOG_SOURCE);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        RunarArtifact artifact = ContractCompiler.compileAbsolute(tmp);
 
         RpcProvider provider = new RpcProvider(rpc);
         IntegrationWallet wallet = IntegrationWallet.createFunded(rpc, 1.0);

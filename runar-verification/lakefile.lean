@@ -30,3 +30,7 @@ lean_exe differential where
 lean_exe pipelineConformance where
   root := `tests.PipelineConformance
   supportInterpreter := true
+
+lean_exe typecheckSweep where
+  root := `tests.TypeCheckSweep
+  supportInterpreter := true

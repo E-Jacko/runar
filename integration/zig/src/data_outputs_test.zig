@@ -28,9 +28,13 @@ test "DataOutput_Deploy_Publish" {
 
     helpers.requireNodeAvailable(allocator);
 
+    // Integration-only 1-sat data-output variant (see contract file header):
+    // the CI regtest node (acceptnonstdtxn=0, PR #49) rejects 0-sat OP_RETURN
+    // as dust. The conformance-linked example contract stays at 0; the
+    // DataOutput_Compile test above still exercises it for parity coverage.
     var artifact = try compile.compileContract(
         allocator,
-        "examples/zig/add-data-output/DataOutputTest.runar.zig",
+        "integration/zig/contracts/DataOutputTestLive.runar.zig",
     );
     defer artifact.deinit();
 

@@ -20,7 +20,64 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=73        # Breakdown (2026-05-26, Tier 3 EC wave —
+TARGET_AXIOMS=71        # −1 (2026-06-08 — dispatch sub-omnibus RETIRED:
+                        # `compileSafe_observational_correct_modulo_dispatch_codegen`
+                        # is GONE; its branch is discharged by the theorem
+                        # `compileSafe_observational_correct_dispatch_consume` for the
+                        # canonical multi-public passthrough fragment via the wave-69
+                        # D1 selection theorem; residual multi-public programs fall to
+                        # the sound crypto_call fallback).
+                        # Previous: 72 — −1 (2026-06-08 — stateful sub-omnibus RETIRED:
+                        # `compileSafe_observational_correct_modulo_stateful_codegen`
+                        # is GONE; its omnibus branch is discharged by the theorem
+                        # `compileSafe_observational_correct_stateful_consume` for
+                        # the canonical gated-prologue fragment via the pre-existing
+                        # BIP-143 bridge; residual stateful bodies fall to the
+                        # sound crypto_call fallback).
+                        # Previous: 73 — −1 (2026-05-30, WS0a/T8 — D2.b auto_state_output
+                        # RETIRED). `auto_state_output_at_method_exit_correct`
+                        # in Pipeline.lean was UNSOUND as stated: it equated
+                        # `(evalBindings initialAnf m.body).outputs` with
+                        # `(runMethod (Lower.lower p) m.name initialStack).outputs`,
+                        # but the ANF `.addOutput` arm APPENDS an `Output.state`
+                        # record to `State.outputs` while the Stack VM
+                        # (`runOps`/`runOpcode`/`stepNonIf`) NEVER mutates
+                        # `StackState.outputs` (the `add_output` lowering builds
+                        # the output AS BYTES on the stack), so `runMethod …
+                        # .outputs = []` and the equality is False (derivable).
+                        # The axiom had NO proof-term consumers (only doc refs at
+                        # Pipeline.lean ~2994 / ~3039). It is now a THEOREM with
+                        # the TRUE `OutputTrace`-mediated conclusion: for a
+                        # stateful method whose body is the canonical epilogue
+                        # `AgreesD2.statefulEpilogueBody sats stateVal pre`,
+                        # under the input-readiness facts, the ANF body's appended
+                        # output list equals the prior outputs with the
+                        # Stack-SIDE record
+                        # `OutputTrace.OutputEvent.toOutput (.state satsV
+                        # [stateValV])` appended — proved by composing
+                        # `AgreesD2.statefulEpilogue_outputs_agree` (no
+                        # `Crypto.computeStateOutput` dependency; the byte
+                        # serialisation is abstract). `#print axioms` confirms it
+                        # is now a theorem: propext / Classical.choice /
+                        # Quot.sound + the pre-existing crypto/eval backends only
+                        # — NO sorryAx, NO new axiom, and it no longer lists
+                        # itself. See TRUST_MANIFEST.md §3.
+                        #
+                        # Prior breakdown (+1, 2026-05-30, WS0a/T8 — the BIP-143
+                        # preimage⟷signature bridge
+                        # `checkPreimage_iff_checkSig_under_validTxContext`
+                        # in Stack/StatefulBridge.lean: ONE new CRYPTO
+                        # assumption (sibling of authBackend / preimageBackend),
+                        # NOT a codegen-soundness axiom. It RETIRES the §11.6
+                        # split-backend wall for the stateful prologue —
+                        # equating the AUTH backend's synthetic-key
+                        # OP_CHECKSIGVERIFY verdict with the PREIMAGE backend's
+                        # verdict under a valid BIP-143 context, the
+                        # external-primitive agreement the stateful-prologue
+                        # `successAgrees` correspondence needs. See
+                        # TRUST_MANIFEST.md §3.):
+                        #
+                        # Prior breakdown (2026-05-26, Tier 3 EC wave —
                         # emitEcAdd codegen-to-spec axiom discharge, the LAST
                         # in-scope EC straight-line op):
                         # −1 in Crypto/Spec.lean §7 — `emitEcAdd_runOps_eq`

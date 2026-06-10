@@ -13,6 +13,58 @@
 
 require 'spec_helper'
 
+# Compile an inline TypeScript source string to a RunarArtifact via the
+# reference TS compiler (Node.js). Mirrors data_outputs_spec.rb.
+def compile_source_inline(source, file_name)
+  script = <<~JS
+    (async () => {
+      const { compile } = await import('#{PROJECT_ROOT}/packages/runar-compiler/dist/index.js');
+      const result = compile(#{source.inspect}, { fileName: #{file_name.inspect} });
+      if (!result.success) { console.error(JSON.stringify(result.diagnostics)); process.exit(1); }
+      const json = JSON.stringify(result.artifact, (k, v) => typeof v === 'bigint' ? v.toString() + 'n' : v);
+      process.stdout.write(json);
+    })();
+  JS
+
+  node_bin = ENV['NODE_BIN'] || `which node 2>/dev/null`.strip
+  node_bin = 'node' if node_bin.empty?
+  output = `#{node_bin} -e #{Shellwords.escape(script)} 2>&1`
+  status = Process.last_status
+  raise "Compilation failed for #{file_name}:\n#{output}" unless status&.success?
+
+  Runar::SDK::RunarArtifact.from_json(output)
+end
+
+# Inline private-helper variant whose `record()` helper emits a 1-satoshi
+# (not 0) data output. The CI regtest node runs with acceptnonstdtxn=0
+# (oracle hardening, PR #49) and rejects 0-satoshi OP_RETURN outputs as
+# "dust" at sendrawtransaction. The shared conformance contract
+# (examples/ts/private-helper-outputs/PrivateHelperOutputs.runar.ts) is
+# deliberately left at 0n so its cross-tier hex goldens stay frozen; this
+# inline source preserves the exact "data output routed through a private
+# helper, broadcast to a live node" assertion without that golden churn.
+PRIVATE_HELPER_LOG_SOURCE = <<~TS.freeze
+  import { StatefulSmartContract, ByteString, assert } from 'runar-lang';
+
+  export class PrivateHelperLog extends StatefulSmartContract {
+      counter: bigint;
+
+      constructor(counter: bigint) {
+          super(counter);
+          this.counter = counter;
+      }
+
+      private record(payload: ByteString): void {
+          this.addDataOutput(1n, payload);
+      }
+
+      public log(payload: ByteString): void {
+          this.record(payload);
+          assert(true);
+      }
+  }
+TS
+
 RSpec.describe 'PrivateHelperOutputs' do # rubocop:disable RSpec/DescribeClass
   let(:source_path) { 'examples/ts/private-helper-outputs/PrivateHelperOutputs.runar.ts' }
 
@@ -39,7 +91,7 @@ RSpec.describe 'PrivateHelperOutputs' do # rubocop:disable RSpec/DescribeClass
   end
 
   it 'log() routes a data output through a private helper' do
-    artifact = compile_contract(source_path)
+    artifact = compile_source_inline(PRIVATE_HELPER_LOG_SOURCE, 'PrivateHelperLog.runar.ts')
     contract = Runar::SDK::RunarContract.new(artifact, [0])
 
     provider = create_provider
