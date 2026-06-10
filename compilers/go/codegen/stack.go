@@ -855,6 +855,37 @@ func (ctx *loweringContext) isLastUse(ref string, currentIndex int, lastUses map
 	return !ok || last <= currentIndex
 }
 
+// operandConsume is the consume-vs-copy decision for one operand of a
+// multi-operand ANF value.
+//
+// operands is the FULL operand-ref list of the value (including ref itself).
+// The load may consume (ROLL / move) the ref only when this binding is the
+// ref's last use AND the ref occurs exactly once in the operand list. A ref
+// that is read at more than one operand position of the same value must be
+// copied (PICK / DUP) at EVERY position: each operand position needs its own
+// stack slot, and a consume-mode load of a ref that is already on top of the
+// stack is a no-op (see bringToTop), so two consume-mode loads of the same
+// ref would leave a single slot for an opcode that pops one item per operand
+// (e.g. `t := x + x` underflowing OP_ADD), or — when the ref sits below
+// other live slots — silently pair the opcode with the wrong slot. The
+// original value then simply stays on the stack, exactly like any ref whose
+// last use is a later binding.
+//
+// Unreachable from the frontend (ANF lowering gives every operand a fresh
+// temp); reachable via CompileFromIR / CLI --ir hand-written ANF.
+func (ctx *loweringContext) operandConsume(ref string, operands []string, currentIndex int, lastUses map[string]int) bool {
+	if !ctx.isLastUse(ref, currentIndex, lastUses) {
+		return false
+	}
+	occurrences := 0
+	for _, o := range operands {
+		if o == ref {
+			occurrences++
+		}
+	}
+	return occurrences <= 1
+}
+
 // ---------------------------------------------------------------------------
 // Lower bindings
 // ---------------------------------------------------------------------------
@@ -1110,11 +1141,11 @@ func (ctx *loweringContext) lowerLoadConst(bindingName string, value *ir.ANFValu
 }
 
 func (ctx *loweringContext) lowerBinOp(bindingName, op, left, right string, bindingIndex int, lastUses map[string]int, resultType string) {
-	leftIsLast := ctx.isLastUse(left, bindingIndex, lastUses)
-	ctx.bringToTop(left, leftIsLast)
+	leftConsume := ctx.operandConsume(left, []string{left, right}, bindingIndex, lastUses)
+	ctx.bringToTop(left, leftConsume)
 
-	rightIsLast := ctx.isLastUse(right, bindingIndex, lastUses)
-	ctx.bringToTop(right, rightIsLast)
+	rightConsume := ctx.operandConsume(right, []string{left, right}, bindingIndex, lastUses)
+	ctx.bringToTop(right, rightConsume)
 
 	ctx.sm.pop()
 	ctx.sm.pop()
@@ -1466,8 +1497,8 @@ func (ctx *loweringContext) lowerCall(bindingName, funcName string, args []strin
 
 	// General builtin: push args in order, then emit opcodes
 	for _, arg := range args {
-		isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
-		ctx.bringToTop(arg, isLast)
+		consume := ctx.operandConsume(arg, args, bindingIndex, lastUses)
+		ctx.bringToTop(arg, consume)
 	}
 
 	// Pop all args
@@ -1539,8 +1570,8 @@ func (ctx *loweringContext) inlineMethodCall(bindingName string, method *ir.ANFM
 	// Bind call arguments to private method params.
 	for i, arg := range args {
 		if i < len(method.Params) {
-			isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
-			ctx.bringToTop(arg, isLast)
+			consume := ctx.operandConsume(arg, args, bindingIndex, lastUses)
+			ctx.bringToTop(arg, consume)
 			ctx.sm.pop()
 
 			paramName := method.Params[i].Name
@@ -2030,12 +2061,12 @@ func (ctx *loweringContext) lowerComputeStateOutputHash(bindingName string, args
 	stateBytesRef := args[1]
 
 	// Bring stateBytes to stack first.
-	stateLast := ctx.isLastUse(stateBytesRef, bindingIndex, lastUses)
-	ctx.bringToTop(stateBytesRef, stateLast)
+	stateConsume := ctx.operandConsume(stateBytesRef, []string{preimageRef, stateBytesRef}, bindingIndex, lastUses)
+	ctx.bringToTop(stateBytesRef, stateConsume)
 
 	// Extract amount from preimage for the continuation output.
-	preLast := ctx.isLastUse(preimageRef, bindingIndex, lastUses)
-	ctx.bringToTop(preimageRef, preLast)
+	preConsume := ctx.operandConsume(preimageRef, []string{preimageRef, stateBytesRef}, bindingIndex, lastUses)
+	ctx.bringToTop(preimageRef, preConsume)
 
 	// Extract amount: last 52 bytes from end, take 8 bytes at offset 0.
 	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"})
@@ -2137,15 +2168,17 @@ func (ctx *loweringContext) lowerComputeStateOutput(bindingName string, args []s
 	stateBytesRef := args[1]
 	newAmountRef := args[2]
 
+	csoOperands := []string{preimageRef, stateBytesRef, newAmountRef}
+
 	// Consume preimage ref (no longer needed — we use _codePart and _newAmount).
-	preLast := ctx.isLastUse(preimageRef, bindingIndex, lastUses)
-	ctx.bringToTop(preimageRef, preLast)
+	preConsume := ctx.operandConsume(preimageRef, csoOperands, bindingIndex, lastUses)
+	ctx.bringToTop(preimageRef, preConsume)
 	ctx.emitOp(StackOp{Op: "drop"})
 	ctx.sm.pop()
 
 	// Step 1: Convert _newAmount to 8-byte LE and save to altstack.
-	amountLast := ctx.isLastUse(newAmountRef, bindingIndex, lastUses)
-	ctx.bringToTop(newAmountRef, amountLast)
+	amountConsume := ctx.operandConsume(newAmountRef, csoOperands, bindingIndex, lastUses)
+	ctx.bringToTop(newAmountRef, amountConsume)
 	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
 	ctx.sm.push("")
 	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
@@ -2156,8 +2189,8 @@ func (ctx *loweringContext) lowerComputeStateOutput(bindingName string, args []s
 	ctx.sm.pop()
 
 	// Step 2: Bring stateBytes to stack.
-	stateLast := ctx.isLastUse(stateBytesRef, bindingIndex, lastUses)
-	ctx.bringToTop(stateBytesRef, stateLast)
+	stateConsume := ctx.operandConsume(stateBytesRef, csoOperands, bindingIndex, lastUses)
+	ctx.bringToTop(stateBytesRef, stateConsume)
 
 	// Step 3: Bring _codePart to top (PICK — never consume, reused across outputs)
 	ctx.bringToTop("_codePart", false)
@@ -2225,7 +2258,7 @@ func (ctx *loweringContext) lowerBuildChangeOutput(bindingName string, args []st
 	ctx.sm.push("")
 
 	// Push the 20-byte PKH
-	ctx.bringToTop(pkhRef, ctx.isLastUse(pkhRef, bindingIndex, lastUses))
+	ctx.bringToTop(pkhRef, ctx.operandConsume(pkhRef, []string{pkhRef, amountRef}, bindingIndex, lastUses))
 	// CAT: prefix || pkh
 	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_CAT"})
 	ctx.sm.pop()
@@ -2243,7 +2276,7 @@ func (ctx *loweringContext) lowerBuildChangeOutput(bindingName string, args []st
 	// --- Stack: [..., 0x1976a914{pkh}88ac] ---
 
 	// Step 2: Prepend amount as 8-byte LE.
-	ctx.bringToTop(amountRef, ctx.isLastUse(amountRef, bindingIndex, lastUses))
+	ctx.bringToTop(amountRef, ctx.operandConsume(amountRef, []string{pkhRef, amountRef}, bindingIndex, lastUses))
 	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
 	ctx.sm.push("")
 	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
@@ -2665,6 +2698,7 @@ func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateVa
 			stateProps = append(stateProps, p)
 		}
 	}
+	outputOperands := append([]string{satoshis}, stateValues...)
 
 	// Step 1: Bring _codePart to top (PICK — never consume, reused across outputs)
 	ctx.bringToTop("_codePart", false)
@@ -2684,8 +2718,8 @@ func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateVa
 		valueRef := stateValues[i]
 		prop := stateProps[i]
 
-		isLast := ctx.isLastUse(valueRef, bindingIndex, lastUses)
-		ctx.bringToTop(valueRef, isLast)
+		consume := ctx.operandConsume(valueRef, outputOperands, bindingIndex, lastUses)
+		ctx.bringToTop(valueRef, consume)
 
 		// Convert numeric/boolean values to fixed-width bytes
 		if prop.Type == "bigint" {
@@ -2728,8 +2762,8 @@ func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateVa
 	// --- Stack: [..., varint+script] ---
 
 	// Step 6: Prepend satoshis as 8-byte LE.
-	isLastSatoshis := ctx.isLastUse(satoshis, bindingIndex, lastUses)
-	ctx.bringToTop(satoshis, isLastSatoshis)
+	satoshisConsume := ctx.operandConsume(satoshis, outputOperands, bindingIndex, lastUses)
+	ctx.bringToTop(satoshis, satoshisConsume)
 	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
 	ctx.sm.push("")
 	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
@@ -2756,8 +2790,8 @@ func (ctx *loweringContext) lowerAddOutput(bindingName, satoshis string, stateVa
 // The scriptBytes are used as-is (no codePart/state insertion).
 func (ctx *loweringContext) lowerAddRawOutput(bindingName, satoshis, scriptBytes string, bindingIndex int, lastUses map[string]int) {
 	// Step 1: Bring scriptBytes to top
-	scriptIsLast := ctx.isLastUse(scriptBytes, bindingIndex, lastUses)
-	ctx.bringToTop(scriptBytes, scriptIsLast)
+	scriptConsume := ctx.operandConsume(scriptBytes, []string{satoshis, scriptBytes}, bindingIndex, lastUses)
+	ctx.bringToTop(scriptBytes, scriptConsume)
 
 	// Step 2: Compute varint prefix for script length
 	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_SIZE"}) // [script, len]
@@ -2774,8 +2808,8 @@ func (ctx *loweringContext) lowerAddRawOutput(bindingName, satoshis, scriptBytes
 	ctx.sm.push("")
 
 	// Step 4: Prepend satoshis as 8-byte LE
-	satIsLast := ctx.isLastUse(satoshis, bindingIndex, lastUses)
-	ctx.bringToTop(satoshis, satIsLast)
+	satConsume := ctx.operandConsume(satoshis, []string{satoshis, scriptBytes}, bindingIndex, lastUses)
+	ctx.bringToTop(satoshis, satConsume)
 	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(8)})
 	ctx.sm.push("")
 	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_NUM2BIN"})
@@ -2864,10 +2898,16 @@ func (ctx *loweringContext) lowerCheckMultiSig(bindingName string, args []string
 	ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(0)})
 	ctx.sm.push("")
 
+	// A ref repeated across the combined element list (e.g. the same pubkey
+	// twice) must be copied at every position — see operandConsume.
+	msigOperands := make([]string, 0, len(sigElems)+len(pkElems))
+	msigOperands = append(msigOperands, sigElems...)
+	msigOperands = append(msigOperands, pkElems...)
+
 	// Bring each sig element to TOS in declaration order.
 	for _, sig := range sigElems {
-		isLast := ctx.isLastUse(sig, bindingIndex, lastUses)
-		ctx.bringToTop(sig, isLast)
+		consume := ctx.operandConsume(sig, msigOperands, bindingIndex, lastUses)
+		ctx.bringToTop(sig, consume)
 	}
 
 	// Push nSigs.
@@ -2876,8 +2916,8 @@ func (ctx *loweringContext) lowerCheckMultiSig(bindingName string, args []string
 
 	// Bring each pubkey element to TOS in declaration order.
 	for _, pk := range pkElems {
-		isLast := ctx.isLastUse(pk, bindingIndex, lastUses)
-		ctx.bringToTop(pk, isLast)
+		consume := ctx.operandConsume(pk, msigOperands, bindingIndex, lastUses)
+		ctx.bringToTop(pk, consume)
 	}
 
 	// Push nPKs.
@@ -3333,12 +3373,12 @@ func (ctx *loweringContext) lowerArrayAccess(bindingName string, args []string, 
 	obj, index := args[0], args[1]
 
 	// Push the data (ByteString) onto the stack
-	objIsLast := ctx.isLastUse(obj, bindingIndex, lastUses)
-	ctx.bringToTop(obj, objIsLast)
+	objConsume := ctx.operandConsume(obj, args, bindingIndex, lastUses)
+	ctx.bringToTop(obj, objConsume)
 
 	// Push the index onto the stack
-	indexIsLast := ctx.isLastUse(index, bindingIndex, lastUses)
-	ctx.bringToTop(index, indexIsLast)
+	indexConsume := ctx.operandConsume(index, args, bindingIndex, lastUses)
+	ctx.bringToTop(index, indexConsume)
 
 	// OP_SPLIT at index: stack = [..., left, right]
 	ctx.sm.pop()  // index consumed
@@ -3385,11 +3425,11 @@ func (ctx *loweringContext) lowerSubstr(bindingName string, args []string, bindi
 
 	data, start, length := args[0], args[1], args[2]
 
-	dataIsLast := ctx.isLastUse(data, bindingIndex, lastUses)
-	ctx.bringToTop(data, dataIsLast)
+	dataConsume := ctx.operandConsume(data, args, bindingIndex, lastUses)
+	ctx.bringToTop(data, dataConsume)
 
-	startIsLast := ctx.isLastUse(start, bindingIndex, lastUses)
-	ctx.bringToTop(start, startIsLast)
+	startConsume := ctx.operandConsume(start, args, bindingIndex, lastUses)
+	ctx.bringToTop(start, startConsume)
 
 	// Split at start position.
 	// Before: stack map has [..., data, start]. Pop both because OP_SPLIT
@@ -3413,8 +3453,8 @@ func (ctx *loweringContext) lowerSubstr(bindingName string, args []string, bindi
 	ctx.sm.push(rightPart)
 
 	// Push length
-	lenIsLast := ctx.isLastUse(length, bindingIndex, lastUses)
-	ctx.bringToTop(length, lenIsLast)
+	lenConsume := ctx.operandConsume(length, args, bindingIndex, lastUses)
+	ctx.bringToTop(length, lenConsume)
 
 	// Split at length to extract the substring.
 	// Before: stack map has [..., rightPart, length]. Pop both for OP_SPLIT.
@@ -3448,7 +3488,7 @@ func (ctx *loweringContext) lowerVerifyRabinSig(bindingName string, args []strin
 
 	// Bring all 4 args to the top in argument order: msg sig padding pubKey
 	for _, arg := range args {
-		ctx.bringToTop(arg, ctx.isLastUse(arg, bindingIndex, lastUses))
+		ctx.bringToTop(arg, ctx.operandConsume(arg, args, bindingIndex, lastUses))
 	}
 
 	// Pop all 4 args from stack map
@@ -3502,11 +3542,11 @@ func (ctx *loweringContext) lowerRight(bindingName string, args []string, bindin
 	}
 	data, length := args[0], args[1]
 
-	dataIsLast := ctx.isLastUse(data, bindingIndex, lastUses)
-	ctx.bringToTop(data, dataIsLast)
+	dataConsume := ctx.operandConsume(data, args, bindingIndex, lastUses)
+	ctx.bringToTop(data, dataConsume)
 
-	lengthIsLast := ctx.isLastUse(length, bindingIndex, lastUses)
-	ctx.bringToTop(length, lengthIsLast)
+	lengthConsume := ctx.operandConsume(length, args, bindingIndex, lastUses)
+	ctx.bringToTop(length, lengthConsume)
 
 	ctx.sm.pop() // len
 	ctx.sm.pop() // data
@@ -3535,11 +3575,11 @@ func (ctx *loweringContext) lowerSafeDivMod(bindingName, funcName string, args [
 	}
 	a, b := args[0], args[1]
 
-	aIsLast := ctx.isLastUse(a, bindingIndex, lastUses)
-	ctx.bringToTop(a, aIsLast)
+	aConsume := ctx.operandConsume(a, args, bindingIndex, lastUses)
+	ctx.bringToTop(a, aConsume)
 
-	bIsLast := ctx.isLastUse(b, bindingIndex, lastUses)
-	ctx.bringToTop(b, bIsLast)
+	bConsume := ctx.operandConsume(b, args, bindingIndex, lastUses)
+	ctx.bringToTop(b, bConsume)
 
 	// Stack: ... a b
 	// DUP b, check non-zero, then divide/mod
@@ -3570,11 +3610,11 @@ func (ctx *loweringContext) lowerClamp(bindingName string, args []string, bindin
 	}
 	val, lo, hi := args[0], args[1], args[2]
 
-	valIsLast := ctx.isLastUse(val, bindingIndex, lastUses)
-	ctx.bringToTop(val, valIsLast)
+	valConsume := ctx.operandConsume(val, args, bindingIndex, lastUses)
+	ctx.bringToTop(val, valConsume)
 
-	loIsLast := ctx.isLastUse(lo, bindingIndex, lastUses)
-	ctx.bringToTop(lo, loIsLast)
+	loConsume := ctx.operandConsume(lo, args, bindingIndex, lastUses)
+	ctx.bringToTop(lo, loConsume)
 
 	// Stack: ... val lo -> OP_MAX -> max(val, lo)
 	ctx.sm.pop()
@@ -3582,8 +3622,8 @@ func (ctx *loweringContext) lowerClamp(bindingName string, args []string, bindin
 	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_MAX"})
 	ctx.sm.push("") // intermediate
 
-	hiIsLast := ctx.isLastUse(hi, bindingIndex, lastUses)
-	ctx.bringToTop(hi, hiIsLast)
+	hiConsume := ctx.operandConsume(hi, args, bindingIndex, lastUses)
+	ctx.bringToTop(hi, hiConsume)
 
 	// Stack: ... max(val,lo) hi -> OP_MIN -> min(max(val,lo), hi)
 	ctx.sm.pop()
@@ -3607,11 +3647,11 @@ func (ctx *loweringContext) lowerPow(bindingName string, args []string, bindingI
 	}
 	base, exp := args[0], args[1]
 
-	baseIsLast := ctx.isLastUse(base, bindingIndex, lastUses)
-	ctx.bringToTop(base, baseIsLast)
+	baseConsume := ctx.operandConsume(base, args, bindingIndex, lastUses)
+	ctx.bringToTop(base, baseConsume)
 
-	expIsLast := ctx.isLastUse(exp, bindingIndex, lastUses)
-	ctx.bringToTop(exp, expIsLast)
+	expConsume := ctx.operandConsume(exp, args, bindingIndex, lastUses)
+	ctx.bringToTop(exp, expConsume)
 
 	// Pop both args from stack map
 	ctx.sm.pop() // exp
@@ -3652,18 +3692,18 @@ func (ctx *loweringContext) lowerMulDiv(bindingName string, args []string, bindi
 	}
 	a, b, c := args[0], args[1], args[2]
 
-	aIsLast := ctx.isLastUse(a, bindingIndex, lastUses)
-	ctx.bringToTop(a, aIsLast)
-	bIsLast := ctx.isLastUse(b, bindingIndex, lastUses)
-	ctx.bringToTop(b, bIsLast)
+	aConsume := ctx.operandConsume(a, args, bindingIndex, lastUses)
+	ctx.bringToTop(a, aConsume)
+	bConsume := ctx.operandConsume(b, args, bindingIndex, lastUses)
+	ctx.bringToTop(b, bConsume)
 
 	ctx.sm.pop()
 	ctx.sm.pop()
 	ctx.emitOp(StackOp{Op: "opcode", Code: "OP_MUL"})
 	ctx.sm.push("") // intermediate
 
-	cIsLast := ctx.isLastUse(c, bindingIndex, lastUses)
-	ctx.bringToTop(c, cIsLast)
+	cConsume := ctx.operandConsume(c, args, bindingIndex, lastUses)
+	ctx.bringToTop(c, cConsume)
 
 	ctx.sm.pop()
 	ctx.sm.pop()
@@ -3681,10 +3721,10 @@ func (ctx *loweringContext) lowerPercentOf(bindingName string, args []string, bi
 	}
 	amount, bps := args[0], args[1]
 
-	amountIsLast := ctx.isLastUse(amount, bindingIndex, lastUses)
-	ctx.bringToTop(amount, amountIsLast)
-	bpsIsLast := ctx.isLastUse(bps, bindingIndex, lastUses)
-	ctx.bringToTop(bps, bpsIsLast)
+	amountConsume := ctx.operandConsume(amount, args, bindingIndex, lastUses)
+	ctx.bringToTop(amount, amountConsume)
+	bpsConsume := ctx.operandConsume(bps, args, bindingIndex, lastUses)
+	ctx.bringToTop(bps, bpsConsume)
 
 	ctx.sm.pop()
 	ctx.sm.pop()
@@ -3758,10 +3798,10 @@ func (ctx *loweringContext) lowerGcd(bindingName string, args []string, bindingI
 	}
 	a, b := args[0], args[1]
 
-	aIsLast := ctx.isLastUse(a, bindingIndex, lastUses)
-	ctx.bringToTop(a, aIsLast)
-	bIsLast := ctx.isLastUse(b, bindingIndex, lastUses)
-	ctx.bringToTop(b, bIsLast)
+	aConsume := ctx.operandConsume(a, args, bindingIndex, lastUses)
+	ctx.bringToTop(a, aConsume)
+	bConsume := ctx.operandConsume(b, args, bindingIndex, lastUses)
+	ctx.bringToTop(b, bConsume)
 
 	ctx.sm.pop()
 	ctx.sm.pop()
@@ -3804,10 +3844,10 @@ func (ctx *loweringContext) lowerDivmod(bindingName string, args []string, bindi
 	}
 	a, b := args[0], args[1]
 
-	aIsLast := ctx.isLastUse(a, bindingIndex, lastUses)
-	ctx.bringToTop(a, aIsLast)
-	bIsLast := ctx.isLastUse(b, bindingIndex, lastUses)
-	ctx.bringToTop(b, bIsLast)
+	aConsume := ctx.operandConsume(a, args, bindingIndex, lastUses)
+	ctx.bringToTop(a, aConsume)
+	bConsume := ctx.operandConsume(b, args, bindingIndex, lastUses)
+	ctx.bringToTop(b, bConsume)
 
 	ctx.sm.pop()
 	ctx.sm.pop()
@@ -4313,7 +4353,7 @@ func (ctx *loweringContext) lowerVerifyWOTS(bindingName string, args []string, b
 
 	// Bring args to top: msg, sig, pubkey
 	for _, arg := range args {
-		ctx.bringToTop(arg, ctx.isLastUse(arg, bindingIndex, lastUses))
+		ctx.bringToTop(arg, ctx.operandConsume(arg, args, bindingIndex, lastUses))
 	}
 	for i := 0; i < 3; i++ {
 		ctx.sm.pop()
@@ -4333,7 +4373,7 @@ func (ctx *loweringContext) lowerVerifySLHDSA(bindingName, paramKey string, args
 
 	// Bring args to top: msg, sig, pubkey
 	for _, arg := range args {
-		ctx.bringToTop(arg, ctx.isLastUse(arg, bindingIndex, lastUses))
+		ctx.bringToTop(arg, ctx.operandConsume(arg, args, bindingIndex, lastUses))
 	}
 	for i := 0; i < 3; i++ {
 		ctx.sm.pop()
@@ -4354,7 +4394,7 @@ func (ctx *loweringContext) lowerSha256Compress(bindingName string, args []strin
 		panic("sha256Compress requires 2 arguments: state, block")
 	}
 	for _, arg := range args {
-		ctx.bringToTop(arg, ctx.isLastUse(arg, bindingIndex, lastUses))
+		ctx.bringToTop(arg, ctx.operandConsume(arg, args, bindingIndex, lastUses))
 	}
 	for i := 0; i < 2; i++ {
 		ctx.sm.pop()
@@ -4371,7 +4411,7 @@ func (ctx *loweringContext) lowerSha256Finalize(bindingName string, args []strin
 		panic("sha256Finalize requires 3 arguments: state, remaining, msgBitLen")
 	}
 	for _, arg := range args {
-		ctx.bringToTop(arg, ctx.isLastUse(arg, bindingIndex, lastUses))
+		ctx.bringToTop(arg, ctx.operandConsume(arg, args, bindingIndex, lastUses))
 	}
 	for i := 0; i < 3; i++ {
 		ctx.sm.pop()
@@ -4392,7 +4432,7 @@ func (ctx *loweringContext) lowerBlake3Compress(bindingName string, args []strin
 		panic("blake3Compress requires 2 arguments: chainingValue, block")
 	}
 	for _, arg := range args {
-		ctx.bringToTop(arg, ctx.isLastUse(arg, bindingIndex, lastUses))
+		ctx.bringToTop(arg, ctx.operandConsume(arg, args, bindingIndex, lastUses))
 	}
 	for i := 0; i < 2; i++ {
 		ctx.sm.pop()
@@ -4409,7 +4449,7 @@ func (ctx *loweringContext) lowerBlake3Hash(bindingName string, args []string, b
 		panic("blake3Hash requires 1 argument: message")
 	}
 	for _, arg := range args {
-		ctx.bringToTop(arg, ctx.isLastUse(arg, bindingIndex, lastUses))
+		ctx.bringToTop(arg, ctx.operandConsume(arg, args, bindingIndex, lastUses))
 	}
 	ctx.sm.pop()
 
@@ -4437,8 +4477,8 @@ func isEcBuiltin(name string) bool {
 func (ctx *loweringContext) lowerEcBuiltin(bindingName, funcName string, args []string, bindingIndex int, lastUses map[string]int) {
 	// Bring args to top in order
 	for _, arg := range args {
-		isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
-		ctx.bringToTop(arg, isLast)
+		consume := ctx.operandConsume(arg, args, bindingIndex, lastUses)
+		ctx.bringToTop(arg, consume)
 	}
 	for range args {
 		ctx.sm.pop()
@@ -4493,8 +4533,8 @@ func isNistEcBuiltin(name string) bool {
 func (ctx *loweringContext) lowerNistEcBuiltin(bindingName, funcName string, args []string, bindingIndex int, lastUses map[string]int) {
 	// Bring args to top in order
 	for _, arg := range args {
-		isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
-		ctx.bringToTop(arg, isLast)
+		consume := ctx.operandConsume(arg, args, bindingIndex, lastUses)
+		ctx.bringToTop(arg, consume)
 	}
 	for range args {
 		ctx.sm.pop()
@@ -4541,8 +4581,8 @@ func (ctx *loweringContext) lowerVerifyECDSA(bindingName, funcName string, args 
 	}
 	// Bring all 3 args to top in order: msg, sig, pubkey
 	for _, arg := range args {
-		isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
-		ctx.bringToTop(arg, isLast)
+		consume := ctx.operandConsume(arg, args, bindingIndex, lastUses)
+		ctx.bringToTop(arg, consume)
 	}
 	ctx.sm.pop() // pubkey
 	ctx.sm.pop() // sig
@@ -4580,8 +4620,8 @@ func isBBFieldBuiltin(name string) bool {
 func (ctx *loweringContext) lowerBBFieldBuiltin(bindingName, funcName string, args []string, bindingIndex int, lastUses map[string]int) {
 	// Bring all args to stack top in order
 	for _, arg := range args {
-		isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
-		ctx.bringToTop(arg, isLast)
+		consume := ctx.operandConsume(arg, args, bindingIndex, lastUses)
+		ctx.bringToTop(arg, consume)
 	}
 	for range args {
 		ctx.sm.pop()
@@ -4642,8 +4682,8 @@ func isKBFieldBuiltin(name string) bool {
 func (ctx *loweringContext) lowerKBFieldBuiltin(bindingName, funcName string, args []string, bindingIndex int, lastUses map[string]int) {
 	// Bring all args to stack top in order
 	for _, arg := range args {
-		isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
-		ctx.bringToTop(arg, isLast)
+		consume := ctx.operandConsume(arg, args, bindingIndex, lastUses)
+		ctx.bringToTop(arg, consume)
 	}
 	for range args {
 		ctx.sm.pop()
@@ -4705,8 +4745,8 @@ func isBN254Builtin(name string) bool {
 
 func (ctx *loweringContext) lowerBN254Builtin(bindingName, funcName string, args []string, bindingIndex int, lastUses map[string]int) {
 	for _, arg := range args {
-		isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
-		ctx.bringToTop(arg, isLast)
+		consume := ctx.operandConsume(arg, args, bindingIndex, lastUses)
+		ctx.bringToTop(arg, consume)
 	}
 	for range args {
 		ctx.sm.pop()
@@ -4782,8 +4822,8 @@ func (ctx *loweringContext) lowerMerkleRoot(bindingName, funcName string, args [
 	// Bring leaf, proof, index to stack top for the codegen
 	for i := 0; i < 3; i++ {
 		arg := args[i]
-		isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
-		ctx.bringToTop(arg, isLast)
+		consume := ctx.operandConsume(arg, args, bindingIndex, lastUses)
+		ctx.bringToTop(arg, consume)
 	}
 	// Pop the 3 args — the codegen consumes them and produces 1 result
 	for i := 0; i < 3; i++ {
@@ -4842,8 +4882,8 @@ func (ctx *loweringContext) lowerMerkleRootPoseidon2KB(bindingName string, args 
 	runtimeArgCount := nArgs - 1 // all except depth
 	for i := 0; i < runtimeArgCount; i++ {
 		arg := args[i]
-		isLast := ctx.isLastUse(arg, bindingIndex, lastUses)
-		ctx.bringToTop(arg, isLast)
+		consume := ctx.operandConsume(arg, args, bindingIndex, lastUses)
+		ctx.bringToTop(arg, consume)
 	}
 	// Pop all runtime args — the codegen consumes them and produces 8 results
 	for i := 0; i < runtimeArgCount; i++ {
