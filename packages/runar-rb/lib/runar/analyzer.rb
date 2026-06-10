@@ -171,7 +171,32 @@ module Runar
       top['findings'] = result[:findings].map { |f| finding_to_h(f) }
       top['paths'] = result[:paths].map { |p| path_to_h(p) }
       top['summary'] = summary_to_h(result[:summary])
-      JSON.pretty_generate(top) + "\n"
+      pretty_json(top) + "\n"
+    end
+
+    # Pretty-print per spec §3.5: 2-space indent, '": "' key separator,
+    # empty arrays/objects as '[]'/'{}' (no inner newline). We cannot use
+    # JSON.pretty_generate here: json gem < 2.8.0 (bundled with Ruby 3.3)
+    # renders empty containers with an inner newline, which diverges from
+    # the cross-tier golden byte format.
+    def pretty_json(value, depth = 0)
+      case value
+      when Hash
+        return '{}' if value.empty?
+        pad = '  ' * (depth + 1)
+        inner = value.map { |k, v| "#{pad}#{JSON.generate(k.to_s)}: #{pretty_json(v, depth + 1)}" }
+        "{\n#{inner.join(",\n")}\n#{'  ' * depth}}"
+      when Array
+        return '[]' if value.empty?
+        pad = '  ' * (depth + 1)
+        inner = value.map { |v| "#{pad}#{pretty_json(v, depth + 1)}" }
+        "[\n#{inner.join(",\n")}\n#{'  ' * depth}]"
+      else
+        # Scalars: String (RFC 8259 escaping, non-ASCII verbatim),
+        # Integer, true/false. JSON.generate handles all identically
+        # across json gem versions.
+        JSON.generate(value)
+      end
     end
 
     def finding_to_h(f)
