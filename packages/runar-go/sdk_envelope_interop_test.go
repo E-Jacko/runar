@@ -12,6 +12,8 @@ package runar
 // SDKs Must Stay in Sync" for the rationale.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -200,4 +202,66 @@ func mustFixturePath(t *testing.T) string {
 	t.Helper()
 	_, thisFile, _, _ := runtime.Caller(0)
 	return filepath.Join(filepath.Dir(thisFile), "..", "..", "conformance", "sdk-envelope", "fixtures.json")
+}
+
+// TestEnvelopeInterop_SigningVectors is the GAP-064 cross-tier signing
+// reproduction: signing the SAME payload with the SAME key (priv=1) via RFC
+// 6979 deterministic ECDSA (plain-SHA-256 nonce, low-S) MUST yield the
+// byte-identical DER signature the TS reference committed. The testSigner's
+// SignHash signs the 32-byte digest directly (go-sdk PrivateKey.Sign) and
+// serializes low-S DER.
+func TestEnvelopeInterop_SigningVectors(t *testing.T) {
+	path := mustFixturePath(t)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var top map[string]any
+	dec := json.NewDecoder(stringReader(string(raw)))
+	dec.UseNumber()
+	if err := dec.Decode(&top); err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	svs, _ := top["signing_vectors"].([]any)
+	if len(svs) == 0 {
+		t.Fatal("signing_vectors missing or empty")
+	}
+	alice := newAliceSigner(t)
+	for _, e := range svs {
+		v := e.(map[string]any)
+		id, _ := v["_vector_id"].(string)
+		expectedPayload := v["expected_payload"].(string)
+		expectedSig := v["expected_sig"].(string)
+
+		// Drift guard: re-derive the canonical payload from data + lifetime
+		// fields and confirm it matches the committed expected_payload.
+		data := normalizeJSON(v["data"]).(map[string]any)
+		merged := make(map[string]any, len(data)+2)
+		for k, val := range data {
+			merged[k] = val
+		}
+		merged["nonce"] = normalizeJSON(v["nonce"])
+		merged["expiresAt"] = normalizeJSON(v["expiresAt"])
+		payload, err := CanonicalJSON(merged)
+		if err != nil {
+			t.Errorf("vector %s: CanonicalJSON error: %v", id, err)
+			continue
+		}
+		if payload != expectedPayload {
+			t.Errorf("vector %s: payload\n  got:  %s\n want:  %s", id, payload, expectedPayload)
+			continue
+		}
+
+		// Sign sha256(expected_payload) with priv=1 deterministic ECDSA -> DER.
+		d := sha256.Sum256([]byte(expectedPayload))
+		der, err := alice.SignHash(d[:])
+		if err != nil {
+			t.Errorf("vector %s: sign: %v", id, err)
+			continue
+		}
+		got := hex.EncodeToString(der)
+		if got != expectedSig {
+			t.Errorf("vector %s: signature divergence\n  got:  %s\n want:  %s", id, got, expectedSig)
+		}
+	}
 }

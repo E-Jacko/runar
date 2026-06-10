@@ -6,10 +6,12 @@
 
 use std::path::PathBuf;
 
+use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 use runar_lang::sdk::{
     canonical_json, verify_envelope, SignedEnvelope, VerifyEnvelopeOpts, VerifyEnvelopeReason,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 fn fixture_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -20,6 +22,14 @@ fn fixture_path() -> PathBuf {
 fn load_fixture() -> Value {
     let bytes = std::fs::read(fixture_path()).expect("read fixture");
     serde_json::from_slice(&bytes).expect("parse fixture")
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 #[test]
@@ -81,6 +91,47 @@ fn rejection_vectors() {
             other => panic!("unknown reason {other}"),
         };
         assert_eq!(r.reason, Some(expected), "rejection {}", rv["reason"]);
+    }
+}
+
+/// GAP-064 cross-tier signing reproduction. Signing the SAME payload with the
+/// SAME key (priv=1) via RFC 6979 deterministic ECDSA (plain-SHA-256 nonce,
+/// low-S) MUST yield the byte-identical DER signature the TS reference
+/// committed. k256's `sign_prehash` signs the 32-byte digest directly and is
+/// deterministic + low-S, matching @bsv/sdk's `primitives/ECDSA` sign.
+#[test]
+fn signing_vectors() {
+    let fixture = load_fixture();
+    let alice = SigningKey::from_bytes(
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1,
+        ]
+        .into(),
+    )
+    .unwrap();
+
+    let svs = fixture["signing_vectors"]
+        .as_array()
+        .expect("signing_vectors missing");
+    assert!(!svs.is_empty(), "signing_vectors empty");
+    for v in svs {
+        let id = v["_vector_id"].as_str().unwrap_or("?");
+        let expected_payload = v["expected_payload"].as_str().unwrap();
+        let expected_sig = v["expected_sig"].as_str().unwrap();
+
+        // Drift guard: re-derive the canonical payload from data + lifetime.
+        let mut merged: Map<String, Value> = v["data"].as_object().unwrap().clone();
+        merged.insert("nonce".into(), v["nonce"].clone());
+        merged.insert("expiresAt".into(), v["expiresAt"].clone());
+        let payload = canonical_json(&Value::Object(merged)).expect("canonical_json");
+        assert_eq!(payload, expected_payload, "vector {id}: payload");
+
+        // Sign sha256(expected_payload) with priv=1 deterministic ECDSA -> DER.
+        let digest = Sha256::digest(expected_payload.as_bytes());
+        let (sig, _): (Signature, _) = alice.sign_prehash(&digest).expect("sign_prehash");
+        let der = to_hex(sig.to_der().as_bytes());
+        assert_eq!(der, expected_sig, "vector {id}: signature divergence");
     }
 }
 
