@@ -158,6 +158,9 @@ module RunarCompiler
 
       # Lower constructor
       ctor_ctx = LoweringContext.new(contract)
+      contract.constructor.params.each do |p|
+        ctor_ctx.register_param_type(p.name, _type_node_to_string(p.type))
+      end
       ctor_ctx.lower_statements(contract.constructor.body)
       result << IR::ANFMethod.new(
         name: "constructor",
@@ -169,6 +172,13 @@ module RunarCompiler
       # Lower each method
       contract.methods.each do |method|
         method_ctx = LoweringContext.new(contract)
+
+        # Register the developer-declared param types scoped to this method
+        # before lowering its body, so byte-type analysis sees only this
+        # method's params (issue #34).
+        method.params.each do |p|
+          method_ctx.register_param_type(p.name, _type_node_to_string(p.type))
+        end
 
         if contract.parent_class == "StatefulSmartContract" && method.visibility == "public"
           # Determine if this method verifies hashOutputs (needs change output support).
@@ -185,6 +195,8 @@ module RunarCompiler
           if needs_change_output
             method_ctx.add_param("_changePKH")
             method_ctx.add_param("_changeAmount")
+            method_ctx.register_param_type("_changePKH", "Ripemd160")
+            method_ctx.register_param_type("_changeAmount", "bigint")
           end
           # Single-output continuation needs _newAmount to allow changing the UTXO satoshis.
           # Methods that emit only data outputs (no addOutput) still run the
@@ -194,8 +206,10 @@ module RunarCompiler
                              !_method_has_add_output(method, contract)
           if needs_new_amount
             method_ctx.add_param("_newAmount")
+            method_ctx.register_param_type("_newAmount", "bigint")
           end
           method_ctx.add_param("txPreimage")
+          method_ctx.register_param_type("txPreimage", "SigHashPreimage")
 
           # Inject checkPreimage(txPreimage) at the start
           preimage_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
@@ -390,6 +404,12 @@ module RunarCompiler
         @contract = contract
         @local_names = Set.new
         @param_names = Set.new
+        # Method-scoped parameter types: name => type string. Populated once
+        # per method/constructor before its body is lowered, and shared into
+        # if/else sub-contexts. The byte-type analysis reads ONLY this hash so
+        # a local in one method never matches a same-named param of a DIFFERENT
+        # method. Mirrors the per-method scoping of the TS reference compiler.
+        @param_types = {}
         @add_output_refs = []
         @add_data_output_refs = []
         @local_aliases = {}
@@ -530,6 +550,12 @@ module RunarCompiler
         @param_names.add(name)
       end
 
+      # Register the type of a parameter scoped to the current method/constructor.
+      # Read back by get_param_type for byte-type analysis.
+      def register_param_type(name, type)
+        @param_types[name] = type
+      end
+
       # @return [Boolean]
       def param?(name)
         @param_names.include?(name)
@@ -593,18 +619,13 @@ module RunarCompiler
         end
       end
 
-      # Look up a parameter type by name across constructor and methods.
+      # Look up a parameter type by name. METHOD-SCOPED: only the current
+      # method's (or constructor's) parameters are visible, so a local named
+      # `x` in one method never matches a same-named param of a DIFFERENT
+      # method. Populated via register_param_type before the body is lowered.
       # @return [String, nil]
       def get_param_type(name)
-        @contract.constructor.params.each do |p|
-          return Frontend._type_node_to_string(p.type) if p.name == name
-        end
-        @contract.methods.each do |m|
-          m.params.each do |p|
-            return Frontend._type_node_to_string(p.type) if p.name == name
-          end
-        end
-        nil
+        @param_types[name]
       end
 
       # Look up a property type by name.
@@ -631,6 +652,7 @@ module RunarCompiler
         sub.instance_variable_set(:@counter, @counter)
         sub.instance_variable_set(:@local_names, @local_names.dup)
         sub.instance_variable_set(:@param_names, @param_names.dup)
+        sub.instance_variable_set(:@param_types, @param_types.dup)
         sub.instance_variable_set(:@local_aliases, @local_aliases.dup)
         sub.instance_variable_set(:@local_byte_vars, @local_byte_vars.dup)
         # Share the per-method intent-intrinsic bookkeeping so witness-param
@@ -1040,6 +1062,7 @@ module RunarCompiler
           param_name = "_prevOutScript_#{idx}"
           @method_scope.record_auto_injected_param(param_name, "ByteString")
           add_param(param_name)
+          register_param_type(param_name, "ByteString")
           witness_ref = emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = param_name })
           expected_hash_ref = lower_expr_to_ref(e.args[1])
 
@@ -1091,6 +1114,7 @@ module RunarCompiler
 
           @method_scope.record_auto_injected_param("_serialisedOutputs", "ByteString")
           add_param("_serialisedOutputs")
+          register_param_type("_serialisedOutputs", "ByteString")
 
           # Emit the hashOutputs(preimage) check exactly once per method.
           unless @method_scope.did_emit_hash_outputs_check

@@ -164,6 +164,9 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
 
     // Lower constructor (the TS reference includes the constructor in output)
     let mut ctor_ctx = LoweringContext::with_effects(contract, Some(side_effects.clone()));
+    for p in &contract.constructor.params {
+        ctor_ctx.register_param_type(&p.name, &type_node_to_string(&p.param_type));
+    }
     lower_statements(&contract.constructor.body, &mut ctor_ctx);
     result.push(ANFMethod {
         name: "constructor".to_string(),
@@ -175,6 +178,12 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
     // Lower each method (including private methods as separate entries)
     for method in &contract.methods {
         let mut method_ctx = LoweringContext::with_effects(contract, Some(side_effects.clone()));
+        // Register THIS method's declared params for method-scoped byte-type
+        // analysis (issue #34). Auto-injected continuation params register
+        // their types below, next to their add_param calls.
+        for p in &method.params {
+            method_ctx.register_param_type(&p.name, &type_node_to_string(&p.param_type));
+        }
 
         if contract.parent_class == "StatefulSmartContract"
             && method.visibility == Visibility::Public
@@ -196,12 +205,16 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
             // Register implicit parameters
             if needs_change_output {
                 method_ctx.add_param("_changePKH");
+                method_ctx.register_param_type("_changePKH", "Ripemd160");
                 method_ctx.add_param("_changeAmount");
+                method_ctx.register_param_type("_changeAmount", "bigint");
             }
             if needs_new_amount {
                 method_ctx.add_param("_newAmount");
+                method_ctx.register_param_type("_newAmount", "bigint");
             }
             method_ctx.add_param("txPreimage");
+            method_ctx.register_param_type("txPreimage", "SigHashPreimage");
 
             // Inject checkPreimage(txPreimage) at the start
             let preimage_ref = method_ctx.emit(ANFValue::LoadParam {
@@ -494,6 +507,12 @@ struct LoweringContext<'a> {
     local_aliases: HashMap<String, String>,
     /// Tracks local variables known to be byte-typed.
     local_byte_vars: HashSet<String>,
+    /// Maps the CURRENT method's (or constructor's) parameter names to their
+    /// declared type strings. Populated once per method/constructor before
+    /// lowering its body and shared into if/else sub-contexts. Method-scoped
+    /// so a local named `x` in one method cannot falsely match a same-named
+    /// parameter of a DIFFERENT method during byte-type analysis (issue #34).
+    param_types: HashMap<String, String>,
     /// Current source location for debug source maps. Set from each AST statement's
     /// source_location and propagated to emitted ANF bindings.
     current_source_loc: Option<SourceLocation>,
@@ -534,6 +553,7 @@ impl<'a> LoweringContext<'a> {
             add_data_output_refs: Vec::new(),
             local_aliases: HashMap::new(),
             local_byte_vars: HashSet::new(),
+            param_types: HashMap::new(),
             current_source_loc: None,
             param_alias_stack: HashMap::new(),
             side_effects,
@@ -634,6 +654,13 @@ impl<'a> LoweringContext<'a> {
         self.param_names.insert(name.to_string());
     }
 
+    /// Register the declared type of a parameter belonging to the CURRENT
+    /// method/constructor scope. Read back by `get_param_type` for byte-type
+    /// analysis. Auto-injected continuation params register here too.
+    fn register_param_type(&mut self, name: &str, ty: &str) {
+        self.param_types.insert(name.to_string(), ty.to_string());
+    }
+
     fn is_param(&self, name: &str) -> bool {
         self.param_names.contains(name)
     }
@@ -682,6 +709,10 @@ impl<'a> LoweringContext<'a> {
         sub.local_names = self.local_names.clone();
         sub.local_aliases = self.local_aliases.clone();
         sub.local_byte_vars = self.local_byte_vars.clone();
+        // Share the current method's parameter types so byte-type analysis
+        // inside nested blocks resolves params against the SAME method scope
+        // the parent reads from (issue #34).
+        sub.param_types = self.param_types.clone();
         sub.current_source_loc = self.current_source_loc.clone();
         sub.param_alias_stack = self.param_alias_stack.clone();
         // Share the per-method scope so intrinsic auto-injection from
@@ -1971,23 +2002,12 @@ fn is_byte_typed_expr(expr: &Expression, ctx: &LoweringContext) -> bool {
     }
 }
 
-/// Look up the type of a method parameter by name across all contract methods.
+/// Look up the type of a parameter by name within the CURRENT method scope.
+/// Method-scoped (issue #34): reads only the params registered for the method
+/// (or constructor) currently being lowered, so a local in one method cannot
+/// falsely match a same-named parameter of a different method.
 fn get_param_type(name: &str, ctx: &LoweringContext) -> Option<String> {
-    // Check constructor params
-    for p in &ctx.contract.constructor.params {
-        if p.name == name {
-            return Some(type_node_to_string(&p.param_type));
-        }
-    }
-    // Check method params
-    for method in &ctx.contract.methods {
-        for p in &method.params {
-            if p.name == name {
-                return Some(type_node_to_string(&p.param_type));
-            }
-        }
-    }
-    None
+    ctx.param_types.get(name).cloned()
 }
 
 /// Look up the type of a contract property by name.
