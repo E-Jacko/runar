@@ -1,0 +1,363 @@
+{
+  "contractName": "StackTrackerRepro",
+  "methods": [
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "args": [],
+            "func": "super",
+            "kind": "call"
+          }
+        }
+      ],
+      "isPublic": false,
+      "name": "constructor",
+      "params": []
+    },
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "kind": "load_const",
+            "value": 0
+          }
+        },
+        {
+          "name": "p",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t0"
+          }
+        },
+        {
+          "name": "t1",
+          "value": {
+            "kind": "load_const",
+            "value": false
+          }
+        },
+        {
+          "name": "found",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t1"
+          }
+        },
+        {
+          "name": "t2",
+          "value": {
+            "kind": "load_const",
+            "value": 0
+          }
+        },
+        {
+          "name": "t3",
+          "value": {
+            "kind": "load_param",
+            "name": "count"
+          }
+        },
+        {
+          "name": "t4",
+          "value": {
+            "kind": "bin_op",
+            "left": "t2",
+            "op": "<",
+            "right": "t3"
+          }
+        },
+        {
+          "name": "t24",
+          "value": {
+            "cond": "t4",
+            "else": [],
+            "kind": "if",
+            "then": [
+              {
+                "name": "t5",
+                "value": {
+                  "kind": "load_param",
+                  "name": "buf"
+                }
+              },
+              {
+                "name": "t6",
+                "value": {
+                  "kind": "load_const",
+                  "value": 1
+                }
+              },
+              {
+                "name": "t7",
+                "value": {
+                  "args": [
+                    "t5",
+                    "p",
+                    "t6"
+                  ],
+                  "func": "substr",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "t8",
+                "value": {
+                  "kind": "load_const",
+                  "value": 0
+                }
+              },
+              {
+                "name": "t9",
+                "value": {
+                  "kind": "load_const",
+                  "value": 1
+                }
+              },
+              {
+                "name": "t10",
+                "value": {
+                  "args": [
+                    "t8",
+                    "t9"
+                  ],
+                  "func": "num2bin",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "t11",
+                "value": {
+                  "args": [
+                    "t7",
+                    "t10"
+                  ],
+                  "func": "cat",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "t12",
+                "value": {
+                  "args": [
+                    "t11"
+                  ],
+                  "func": "bin2num",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "x",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t12"
+                }
+              },
+              {
+                "name": "t13",
+                "value": {
+                  "kind": "load_param",
+                  "name": "buf"
+                }
+              },
+              {
+                "name": "t14",
+                "value": {
+                  "kind": "load_const",
+                  "value": 1
+                }
+              },
+              {
+                "name": "t15",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "t14",
+                  "op": "+",
+                  "right": "x"
+                }
+              },
+              {
+                "name": "t16",
+                "value": {
+                  "args": [
+                    "t13",
+                    "p",
+                    "t15"
+                  ],
+                  "func": "substr",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "blob",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t16"
+                }
+              },
+              {
+                "name": "t17",
+                "value": {
+                  "kind": "load_param",
+                  "name": "target"
+                }
+              },
+              {
+                "name": "t18",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "blob",
+                  "op": "===",
+                  "result_type": "bytes",
+                  "right": "t17"
+                }
+              },
+              {
+                "name": "t20",
+                "value": {
+                  "cond": "t18",
+                  "else": [],
+                  "kind": "if",
+                  "then": [
+                    {
+                      "name": "t19",
+                      "value": {
+                        "kind": "load_const",
+                        "value": true
+                      }
+                    },
+                    {
+                      "name": "found",
+                      "value": {
+                        "kind": "load_const",
+                        "value": "@ref:t19"
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "t21",
+                "value": {
+                  "kind": "load_const",
+                  "value": 1
+                }
+              },
+              {
+                "name": "t22",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "p",
+                  "op": "+",
+                  "right": "t21"
+                }
+              },
+              {
+                "name": "t23",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "t22",
+                  "op": "+",
+                  "right": "x"
+                }
+              },
+              {
+                "name": "p",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t23"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "t25",
+          "value": {
+            "kind": "unary_op",
+            "op": "!",
+            "operand": "found"
+          }
+        },
+        {
+          "name": "t26",
+          "value": {
+            "kind": "bin_op",
+            "left": "found",
+            "op": "||",
+            "right": "t25"
+          }
+        },
+        {
+          "name": "t27",
+          "value": {
+            "kind": "assert",
+            "value": "t26"
+          }
+        }
+      ],
+      "isPublic": true,
+      "name": "walk",
+      "params": [
+        {
+          "name": "buf",
+          "type": "ByteString"
+        },
+        {
+          "name": "count",
+          "type": "bigint"
+        },
+        {
+          "name": "target",
+          "type": "ByteString"
+        }
+      ]
+    },
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "kind": "load_param",
+            "name": "x"
+          }
+        },
+        {
+          "name": "t1",
+          "value": {
+            "kind": "load_param",
+            "name": "x"
+          }
+        },
+        {
+          "name": "t2",
+          "value": {
+            "kind": "bin_op",
+            "left": "t0",
+            "op": "===",
+            "result_type": "bytes",
+            "right": "t1"
+          }
+        },
+        {
+          "name": "t3",
+          "value": {
+            "kind": "assert",
+            "value": "t2"
+          }
+        }
+      ],
+      "isPublic": true,
+      "name": "other",
+      "params": [
+        {
+          "name": "x",
+          "type": "ByteString"
+        }
+      ]
+    }
+  ],
+  "properties": []
+}
