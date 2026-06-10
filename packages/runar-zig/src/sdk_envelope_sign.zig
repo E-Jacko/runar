@@ -60,30 +60,44 @@ fn hmac(key: []const u8, msgs: []const []const u8) [32]u8 {
     return out;
 }
 
-/// Derive the canonical RFC 6979 nonce `k` (as a valid scalar in [1, N-1]).
-/// `x_oct` = int2octets(privkey), `h1_oct` = bits2octets(digest).
-fn rfc6979Nonce(x_oct: [32]u8, h1_oct: [32]u8) Scalar {
-    var v: [32]u8 = [_]u8{0x01} ** 32;
-    var k: [32]u8 = [_]u8{0x00} ** 32;
+/// RFC 6979 §3.2 HMAC-DRBG nonce generator. Stateful so that a caller which
+/// rejects a candidate's *signature* (r == 0 or s == 0, §3.2 final paragraph)
+/// draws a NEW `k` on the next call instead of re-deriving the same one.
+const Rfc6979Drbg = struct {
+    k: [32]u8,
+    v: [32]u8,
 
-    // K = HMAC_K(V || 0x00 || int2octets(x) || bits2octets(h1)); V = HMAC_K(V)
-    k = hmac(&k, &.{ &v, &[_]u8{0x00}, &x_oct, &h1_oct });
-    v = hmac(&k, &.{&v});
-    // K = HMAC_K(V || 0x01 || int2octets(x) || bits2octets(h1)); V = HMAC_K(V)
-    k = hmac(&k, &.{ &v, &[_]u8{0x01}, &x_oct, &h1_oct });
-    v = hmac(&k, &.{&v});
-
-    while (true) {
-        // T = V (single block, since hlen == qlen == 256).
-        v = hmac(&k, &.{&v});
-        if (Scalar.fromBytes(v, .big)) |s| {
-            if (!s.isZero()) return s;
-        } else |_| {}
-        // Retry: K = HMAC_K(V || 0x00); V = HMAC_K(V).
-        k = hmac(&k, &.{ &v, &[_]u8{0x00} });
-        v = hmac(&k, &.{&v});
+    /// Steps b–g: `x_oct` = int2octets(privkey), `h1_oct` = bits2octets(digest).
+    fn init(x_oct: [32]u8, h1_oct: [32]u8) Rfc6979Drbg {
+        var st: Rfc6979Drbg = .{ .v = [_]u8{0x01} ** 32, .k = [_]u8{0x00} ** 32 };
+        // K = HMAC_K(V || 0x00 || int2octets(x) || bits2octets(h1)); V = HMAC_K(V)
+        st.k = hmac(&st.k, &.{ &st.v, &[_]u8{0x00}, &x_oct, &h1_oct });
+        st.v = hmac(&st.k, &.{&st.v});
+        // K = HMAC_K(V || 0x01 || int2octets(x) || bits2octets(h1)); V = HMAC_K(V)
+        st.k = hmac(&st.k, &.{ &st.v, &[_]u8{0x01}, &x_oct, &h1_oct });
+        st.v = hmac(&st.k, &.{&st.v});
+        return st;
     }
-}
+
+    /// Step h: next candidate `k` in [1, N-1]. The retry update
+    /// (K = HMAC_K(V || 0x00); V = HMAC_K(V)) is applied eagerly after every
+    /// emitted candidate — the update is deterministic in (K, V), so this
+    /// yields the exact same candidate sequence as the lazy on-reject update
+    /// the RFC describes, while leaving the state ready for a re-draw.
+    fn next(self: *Rfc6979Drbg) Scalar {
+        while (true) {
+            // T = V (single block, since hlen == qlen == 256).
+            self.v = hmac(&self.k, &.{&self.v});
+            const t = self.v;
+            // K = HMAC_K(V || 0x00); V = HMAC_K(V).
+            self.k = hmac(&self.k, &.{ &self.v, &[_]u8{0x00} });
+            self.v = hmac(&self.k, &.{&self.v});
+            if (Scalar.fromBytes(t, .big)) |s| {
+                if (!s.isZero()) return s;
+            } else |_| {}
+        }
+    }
+};
 
 /// Sign `digest` (a 32-byte hash, e.g. sha256(payload)) with `priv_key_be`
 /// (32-byte big-endian secp256k1 scalar) using canonical RFC 6979 deterministic
@@ -101,8 +115,9 @@ pub fn signDigestLowSDer(
     const z = bits2octets(digest); // message representative, reduced mod N
     const z_scalar = Scalar.fromBytes(z, .big) catch return error.SigningFailed;
 
+    var drbg = Rfc6979Drbg.init(priv_key_be, z);
     while_k: while (true) {
-        const k = rfc6979Nonce(priv_key_be, z);
+        const k = drbg.next();
 
         // R = k*G; r = R.x mod N.
         const rp = Secp256k1.basePoint.mul(k.toBytes(.big), .big) catch continue :while_k;
@@ -171,4 +186,36 @@ fn minimalInt(be: []const u8, out: *[33]u8) []u8 {
     }
     @memcpy(out[0..body.len], body);
     return out[0..body.len];
+}
+
+// ---------------------------------------------------------------------------
+// Tests — canonical public RFC 6979 secp256k1 vector.
+// ---------------------------------------------------------------------------
+
+test "RFC 6979 canonical vector: priv=1, msg=\"Satoshi Nakamoto\" — nonce k and low-S DER signature" {
+    // The widely published secp256k1 RFC 6979 (plain-SHA-256 nonce) vector:
+    //   priv = 0x...01, h1 = sha256("Satoshi Nakamoto")
+    //   k = 8F8A276C19F4149656B280621E358CCE24F5F52542772691EE69063B74F15D15
+    //   r = 934b1ea10a4b3c1757e2b0c017d0b6143ce3c9a7e6a4a49860d7a6ab210ee3d8
+    //   s = 2442ce9d2b916064108014783e923ec36b49743e2ffa1c4496f01a512aafd9e5 (low-S)
+    var priv: [32]u8 = [_]u8{0} ** 32;
+    priv[31] = 0x01;
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("Satoshi Nakamoto", &digest, .{});
+
+    // Nonce check (private path: k must match the published vector exactly).
+    var drbg = Rfc6979Drbg.init(priv, bits2octets(digest));
+    const k = drbg.next();
+    var expected_k: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_k, "8F8A276C19F4149656B280621E358CCE24F5F52542772691EE69063B74F15D15");
+    try std.testing.expectEqualSlices(u8, &expected_k, &k.toBytes(.big));
+
+    // Full signature check (r and s in minimal low-S DER). r's high bit is
+    // set (0x93...), so DER prefixes its INTEGER body with 0x00 (33 bytes).
+    var der_buf: [72]u8 = undefined;
+    const der = try signDigestLowSDer(priv, digest, &der_buf);
+    var expected_der: [71]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_der, "3045022100934b1ea10a4b3c1757e2b0c017d0b6143ce3c9a7e6a4a49860d7a6ab210ee3d802202442ce9d2b916064108014783e923ec36b49743e2ffa1c4496f01a512aafd9e5");
+    try std.testing.expectEqualSlices(u8, &expected_der, der);
 }

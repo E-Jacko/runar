@@ -244,6 +244,7 @@ test {
     _ = @import("sdk_anf_interpreter.zig");
     _ = @import("sdk_anf_interpreter_intent_test.zig");
     _ = @import("sdk_envelope.zig");
+    _ = @import("sdk_envelope_sign.zig");
     _ = @import("sdk_envelope_interop_test.zig");
     _ = @import("sdk_rpc_provider.zig");
     _ = @import("sdk_token_wallet.zig");
