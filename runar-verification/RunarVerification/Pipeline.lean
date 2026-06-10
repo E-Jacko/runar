@@ -10,6 +10,7 @@ import RunarVerification.Stack.AgreesA5
 import RunarVerification.Stack.AgreesA6
 import RunarVerification.Stack.AgreesA8
 import RunarVerification.Stack.AgreesHashCall
+import RunarVerification.Stack.AgreesStateful
 import RunarVerification.Stack.AgreesD1
 import RunarVerification.Stack.AgreesD2
 import RunarVerification.Stack.Peephole
@@ -2851,8 +2852,13 @@ integration omnibus — planned split"):
   Discharged once D1 lands (multi-public-method Merkle dispatch
   selection).
 * `compileSafe_observational_correct_modulo_stateful_codegen` —
-  Discharged once D2.a + D2.b land (auto-injected `checkPreimage` at
-  method entry + auto-injected state output at method exit).
+  RETIRED (2026-06-08): the single-public canonical gated-prologue
+  fragment (decided by `AgreesStateful.statefulConsumeShapeBool`) is
+  discharged by the theorem
+  `compileSafe_observational_correct_stateful_consume` through the
+  pre-existing BIP-143 bridge axiom (D2.a) + the proved D2.b epilogue;
+  residual stateful bodies fall through to the sound crypto_call /
+  dispatch cascade.
 
 **Trust footprint.** Each sub-omnibus is load-bearing for its
 corresponding `VERIFIED-modulo-<family>-codegen-axioms` classification
@@ -3029,31 +3035,24 @@ axiom compileSafe_observational_correct_modulo_dispatch_codegen (p : ANFProgram)
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
-/-- **O1 sub-omnibus — stateful family.**
-
-Phase D harness integration: codegen-soundness for ANF methods on
-stateful contracts (`parentClass = StatefulSmartContract`), which the
-lowerer threads through an auto-injected `checkPreimage` at method
-entry and an auto-injected state-output at method exit. The hypothesis
-`hStateful` requires `Lower.bindingsUseCheckPreimage anfM.body = true`.
-
-Discharge path: this sub-omnibus retires once D2.a
-(`auto_check_preimage_at_method_entry_correct`) and D2.b
-(`auto_state_output_at_method_exit_correct`) land as theorems —
-i.e. when both auto-injected wrappers are themselves verified
-rewrites. See `PATH2_PLAN.md` §5.23.
--/
-axiom compileSafe_observational_correct_modulo_stateful_codegen (p : ANFProgram)
-    (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (_hMem : anfM ∈ p.methods) (_hPublic : anfM.isPublic = true)
-    (_hSafe : compileSafe p = .ok bytes)
-    (initialAnf : State) (initialStack : StackState)
-    (tsm : Agrees.TaggedStackMap)
-    (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    (_hStateful : Lower.bindingsUseCheckPreimage anfM.body = true) :
-    successAgrees
-      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
-      (runParsedBytes bytes initialStack)
+-- **O1 sub-omnibus — stateful family — RETIRED (2026-06-08).**
+-- The axiom `compileSafe_observational_correct_modulo_stateful_codegen` is
+-- GONE.  Its omnibus dispatch branch is now discharged by the theorem
+-- `compileSafe_observational_correct_stateful_consume` for the single-public
+-- CANONICAL stateful fragment (decided by
+-- `AgreesStateful.statefulConsumeShapeBool`: one param `pre`, body exactly the
+-- auto-injected gated prologue `_cp0 := check_preimage pre ; assert _cp0`),
+-- under the keyed `hStatefulFrag` premise (the valid-BIP-143-context entry
+-- bundle).  The discharge composes the constant-lowering reduction
+-- (`AgreesStateful.lowerMethod_ops_statefulPrologue`), the runtime walk
+-- (`runOps_statefulPrologueOps_isSome`), the M3 peephole-identity, the M4
+-- concrete parse round-trip, and the pre-existing BIP-143 bridge axiom
+-- (`StatefulBridge.checkPreimage_iff_checkSig_under_validTxContext` — D2.a's
+-- designed external-crypto assumption, already in the TCB).  Residual stateful
+-- bodies — user logic after the prologue, state-output epilogues
+-- (D2.b's `auto_state_output_at_method_exit_correct` is ALREADY a theorem),
+-- multi-public stateful programs — fall through to the sound crypto_call /
+-- dispatch cascade, NO new axiom is introduced.
 
 /-! ### Multi-method capstone
 
@@ -4907,6 +4906,161 @@ theorem smoke_hashCall_consume_fires :
     (by simp [hashSmokeProg]) rfl hSafe hashSmokeAnf hashSmokeStk rfl (by decide)
     rfl rfl (ByteArray.mk #[1, 2, 3]) [] rfl rfl (by decide)
 
+/-! ## Stateful sub-omnibus retirement — the canonical stateful consume theorem
+
+Discharges the stateful family's omnibus branch for the CANONICAL stateful
+fragment: a single-public, single-param method whose body is exactly the
+auto-injected gated prologue `_cp0 := check_preimage pre ; assert _cp0`
+(decided by `AgreesStateful.statefulConsumeShapeBool`).  The whole method
+lowers to the CONSTANT `[OP_CODESEPARATOR, .swap, .push G, OP_CHECKSIGVERIFY]`
+(`AgreesStateful.lowerMethod_ops_statefulPrologue`), whose Stack success bit
+is the AUTH backend's verdict (`runOps_statefulPrologueOps_isSome`); the ANF
+success bit is the PREIMAGE backend's verdict
+(`StatefulBridge.gatedStatefulPrologue_isSome_eq`); the two agree under a
+valid BIP-143 context via the pre-existing bridge axiom
+(`checkPreimage_iff_checkSig_under_validTxContext`).  No sub-omnibus axiom
+appears in the discharge. -/
+
+/-- The 4-pass peephole pipeline is the identity on the constant stateful
+prologue ops (no fusable adjacency: the only push is the 33-byte key `G`
+followed by `OP_CHECKSIGVERIFY`). -/
+theorem peepholeMethodOps_statefulPrologue :
+    peepholeMethodOps AgreesStateful.statefulPrologueOps
+      = AgreesStateful.statefulPrologueOps := by
+  unfold peepholeMethodOps
+  have hNoIf : Peephole.noIfOp AgreesStateful.statefulPrologueOps := by
+    simp [AgreesStateful.statefulPrologueOps, Peephole.noIfOp]
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
+  have hFlat : Peephole.peepholePassAllFlat AgreesStateful.statefulPrologueOps
+      = AgreesStateful.statefulPrologueOps := by
+    simp +decide [AgreesStateful.statefulPrologueOps, AgreesStateful.stG,
+      Peephole.peepholePassAllFlat, Peephole.applyEqualVerifyFuse,
+      Peephole.applyCheckSigVerifyFuse, Peephole.applyNumEqualVerifyFuse,
+      Peephole.applyZeroNumEqual, Peephole.applyDoubleSha256,
+      Peephole.applyDoubleDrop, Peephole.applyDoubleOver, Peephole.applyDoubleNot,
+      Peephole.applyDoubleNegate, Peephole.applyOneSub, Peephole.applyOneAdd,
+      Peephole.applySubZero, Peephole.applyAddZero, Peephole.applyPushPushMul,
+      Peephole.applyPushPushSub, Peephole.applyPushPushAdd,
+      Peephole.applyDoubleSwap, Peephole.applyDupDrop, Peephole.applyDropAfterPush]
+  rw [hFlat, Peephole.peepholePostFold_eq_applyPushOne_of_noIfOp _ hNoIf]
+  have hPost : Peephole.applyPushOneSub
+      (Peephole.applyPushOneAdd AgreesStateful.statefulPrologueOps)
+      = AgreesStateful.statefulPrologueOps := by
+    simp +decide [AgreesStateful.statefulPrologueOps, Peephole.applyPushOneAdd,
+      Peephole.applyPushOneSub]
+  rw [hPost,
+    Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ hNoIf (by
+      simp +decide [AgreesStateful.statefulPrologueOps,
+        Peephole.applyPushAddPushAdd, Peephole.applyPushAddPushSub]),
+    Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIf (by
+      simp +decide [AgreesStateful.statefulPrologueOps,
+        Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])]
+
+/-- **Canonical stateful consume theorem (the stateful sub-omnibus discharge).**
+
+The success-bit chain is direct (no runMethod leg needed): the ANF side is
+`Crypto.checkPreimage preimage` (gated prologue), the Stack side is
+`authBackend.checkSig sigV G` (constant prologue ops, M3 peephole-identity,
+M4 concrete parse round-trip), and the BIP-143 bridge equates the two. -/
+theorem compileSafe_observational_correct_stateful_consume
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (_hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (pre : String) (ty : ANFType)
+    (hParams : anfM.params = [ANFParam.mk pre ty])
+    (hBody : anfM.body = StatefulBridge.gatedStatefulPrologueBody pre)
+    (hne1 : pre ≠ "_cp0") (hne2 : pre ≠ "_opPushTxSig")
+    (ctx : TxContext) (sigV preimage : ByteArray)
+    (rest : List RunarVerification.ANF.Eval.Value)
+    (hValid : ValidTxContext ctx)
+    (hPreLink : preimage = TxContext.buildPreimage ctx)
+    (hAnfPre : initialAnf.resolveRef pre = some (.vBytes preimage))
+    (hStk : initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome
+      = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage := by
+    rw [hBody]
+    exact StatefulBridge.gatedStatefulPrologue_isSome_eq p.methods initialAnf
+      pre preimage hAnfPre
+  obtain ⟨hPubSingleton, _hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hOps : (Lower.lowerMethod p.methods p.properties anfM).ops
+      = AgreesStateful.statefulPrologueOps :=
+    AgreesStateful.lowerMethod_ops_statefulPrologue p.methods p.properties anfM
+      pre ty hParams hBody hPublic hne1 hne2
+  have hPeeped : (peepholedLoweredMethod p anfM).ops
+      = AgreesStateful.statefulPrologueOps := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = _
+    rw [hOps]
+    exact peepholeMethodOps_statefulPrologue
+  have hM4 : runParsedBytes bytes initialStack
+      = runOps AgreesStateful.statefulPrologueOps initialStack := by
+    have hBytes := compileSafe_ok_implies_emitFast p bytes hSafe
+    rw [hBytes]
+    unfold runParsedBytes RunarVerification.Script.Emit.emitFast
+    rw [hPubSingleton]
+    simp only
+    rw [hPeeped, AgreesStateful.parseScript_emitOpsFast_statefulPrologue]
+  have hStack : (runOps AgreesStateful.statefulPrologueOps initialStack).toOption.isSome
+      = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV AgreesStateful.stG :=
+    AgreesStateful.runOps_statefulPrologueOps_isSome initialStack preimage sigV rest hStk
+  have hBridge : RunarVerification.ANF.Eval.Crypto.checkPreimage preimage
+      = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV AgreesStateful.stG :=
+    StatefulBridge.checkPreimage_iff_checkSig_under_validTxContext ctx sigV
+      AgreesStateful.stG preimage hValid hPreLink
+  show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome
+      ↔ (runParsedBytes bytes initialStack).toOption.isSome
+  rw [hM4, hANF, hStack, hBridge]
+
+/-! ### MANDATORY smoke: the stateful consume theorem fires
+
+The canonical single-public stateful contract `S` with public `verify(pre)`
+whose body is the auto-injected gated prologue, fired end-to-end:
+`compileSafe` accepts it, and on the sample BIP-143 context's canonical
+preimage (the same bytes threaded on the ANF param and the deployed stack)
+the ANF eval and the deployed-bytes run AGREE on their success bit (both are
+the SAME backend verdict, via the bridge). -/
+
+private def stSmokeProg : ANFProgram :=
+  { contractName := "S", properties := [],
+    methods := [AgreesStateful.smokeMethod] }
+
+private def stSmokePreimage : ByteArray :=
+  Stack.TxContext.buildPreimage Stack.TxContext.sampleCtx
+
+private def stSmokeAnf : State := { params := [("pre", .vBytes stSmokePreimage)] }
+
+private def stSmokeStk : StackState :=
+  { stack := [.vBytes stSmokePreimage, .vBytes (ByteArray.mk #[0x30])] }
+
+/-- SMOKE — `compileSafe` accepts the canonical stateful contract and the
+consume theorem fires on the sample-context entry. -/
+theorem smoke_stateful_consume_fires :
+    ∃ bytes, compileSafe stSmokeProg = .ok bytes ∧
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP stSmokeProg.methods stSmokeAnf
+          AgreesStateful.smokeMethod.body)
+        (runParsedBytes bytes stSmokeStk) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe stSmokeProg = .ok b := by
+    have h : (compileSafe stSmokeProg).toOption.isSome = true := by native_decide
+    cases hc : compileSafe stSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  exact compileSafe_observational_correct_stateful_consume
+    stSmokeProg AgreesStateful.smokeMethod bytes
+    (by simp [stSmokeProg]) rfl hSafe stSmokeAnf stSmokeStk rfl (by decide)
+    "pre" .byteString rfl rfl (by decide) (by decide)
+    Stack.TxContext.sampleCtx (ByteArray.mk #[0x30]) stSmokePreimage []
+    RunarVerification.Stack.ValidTxContext.sampleCtx_valid rfl rfl rfl
+
 /-! ### Wave 66 — MANDATORY smoke: the method_call consume theorem fires
 
 The canonical single-public passthrough program — public `entry(a)` whose
@@ -5575,6 +5729,27 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
           initialStack.stack = .vBytes argBytes :: rest ∧
           argBytes.size ≤ 520)
+    -- **Stateful consume premise (keyed).**  For a body in the canonical
+    -- stateful fragment (decided by `AgreesStateful.statefulConsumeShapeBool` —
+    -- one param `pre`, body exactly the auto-injected gated prologue) the shape
+    -- witnesses plus the valid-BIP-143-context entry bundle are recovered: the
+    -- preimage param resolves to the canonical preimage of a valid context, and
+    -- the runtime stack carries that preimage over the `_opPushTxSig`-derived
+    -- signature.  Keyed on the DECIDABLE classifier, it is VACUOUS for every
+    -- non-canonical body, so the omnibus stays jointly satisfiable.  Its only
+    -- consumer is the conformance harness, which discharges it per fixture from
+    -- the deployment context.
+    (hStatefulFrag :
+      RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
+        ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
+          (sigV preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk pre ty] ∧
+          anfM.body = Stack.StatefulBridge.gatedStatefulPrologueBody pre ∧
+          pre ≠ "_cp0" ∧ pre ≠ "_opPushTxSig" ∧
+          Stack.ValidTxContext ctx ∧
+          preimage = Stack.TxContext.buildPreimage ctx ∧
+          initialAnf.resolveRef pre = some (.vBytes preimage) ∧
+          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
@@ -5589,8 +5764,44 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
   -- because they reflect program-level shape obligations that override
   -- the structural body classification.
   by_cases hStateful : Lower.bindingsUseCheckPreimage anfM.body = true
-  · exact compileSafe_observational_correct_modulo_stateful_codegen
-      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hStateful
+  · -- **Stateful consume branch (replaces the retired stateful axiom).**
+    -- The decidable `statefulConsumeShapeBool` classifier peels the canonical
+    -- gated-prologue fragment for single-public methods; the keyed
+    -- `hStatefulFrag` premise recovers the shape witnesses + the valid-context
+    -- entry bundle, and the discharged consume theorem fires.  Residual
+    -- stateful bodies (user logic, epilogues, multi-public programs, or
+    -- constructor-named methods) fall through to the sound crypto_call
+    -- fallback — NO new axiom is introduced.
+    by_cases hStMulti : (p.methods.filter (·.isPublic)).length ≥ 2
+    · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+    · have hStSingle : p.methods.filter (·.isPublic) = [anfM] := by
+        have hAnfMem : anfM ∈ p.methods.filter (·.isPublic) :=
+          List.mem_filter.mpr ⟨hMem, by simpa using hPublic⟩
+        have hLenGe1 : 1 ≤ (p.methods.filter (·.isPublic)).length :=
+          List.length_pos_of_mem hAnfMem
+        have hLenLt2 : (p.methods.filter (·.isPublic)).length < 2 :=
+          Nat.lt_of_not_le hStMulti
+        have hLen1 : (p.methods.filter (·.isPublic)).length = 1 :=
+          Nat.le_antisymm (Nat.lt_succ_iff.mp hLenLt2) hLenGe1
+        obtain ⟨a, ha⟩ := List.length_eq_one_iff.mp hLen1
+        rw [ha] at hAnfMem ⊢
+        have : anfM = a := by simpa using hAnfMem
+        rw [this]
+      by_cases hStShape :
+          RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true
+      · by_cases hStName : anfM.name ≠ "constructor"
+        · obtain ⟨pre, ty, ctx, sigV, preimage, restV, hStParams, hStBody,
+            hStNe1, hStNe2, hStValid, hStPreLink, hStAnfPre, hStStk⟩ :=
+            hStatefulFrag hStShape
+          exact compileSafe_observational_correct_stateful_consume
+            p anfM bytes hMem hPublic hSafe initialAnf initialStack
+            hStSingle hStName pre ty hStParams hStBody hStNe1 hStNe2
+            ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk
+        · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
+      · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees trivial
   · by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
     · exact compileSafe_observational_correct_modulo_dispatch_codegen
         p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hDispatch
@@ -5879,6 +6090,27 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
           initialStack.stack = .vBytes argBytes :: rest ∧
           argBytes.size ≤ 520)
+    -- **Stateful consume premise (keyed).**  For a body in the canonical
+    -- stateful fragment (decided by `AgreesStateful.statefulConsumeShapeBool` —
+    -- one param `pre`, body exactly the auto-injected gated prologue) the shape
+    -- witnesses plus the valid-BIP-143-context entry bundle are recovered: the
+    -- preimage param resolves to the canonical preimage of a valid context, and
+    -- the runtime stack carries that preimage over the `_opPushTxSig`-derived
+    -- signature.  Keyed on the DECIDABLE classifier, it is VACUOUS for every
+    -- non-canonical body, so the omnibus stays jointly satisfiable.  Its only
+    -- consumer is the conformance harness, which discharges it per fixture from
+    -- the deployment context.
+    (hStatefulFrag :
+      RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
+        ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
+          (sigV preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk pre ty] ∧
+          anfM.body = Stack.StatefulBridge.gatedStatefulPrologueBody pre ∧
+          pre ≠ "_cp0" ∧ pre ≠ "_opPushTxSig" ∧
+          Stack.ValidTxContext ctx ∧
+          preimage = Stack.TxContext.buildPreimage ctx ∧
+          initialAnf.resolveRef pre = some (.vBytes preimage) ∧
+          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest)
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
     successAgrees
@@ -5887,7 +6119,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
     Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
-    hMethodCallFrag hHashCallFrag hCoh
+    hMethodCallFrag hHashCallFrag hStatefulFrag hCoh
 
 
 end Soundness

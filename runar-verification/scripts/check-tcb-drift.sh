@@ -20,7 +20,14 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=73        # −1 (2026-05-30, WS0a/T8 — D2.b auto_state_output
+TARGET_AXIOMS=72        # −1 (2026-06-08 — stateful sub-omnibus RETIRED:
+                        # `compileSafe_observational_correct_modulo_stateful_codegen`
+                        # is GONE; its omnibus branch is discharged by the theorem
+                        # `compileSafe_observational_correct_stateful_consume` for
+                        # the canonical gated-prologue fragment via the pre-existing
+                        # BIP-143 bridge; residual stateful bodies fall to the
+                        # sound crypto_call fallback).
+                        # Previous: 73 — −1 (2026-05-30, WS0a/T8 — D2.b auto_state_output
                         # RETIRED). `auto_state_output_at_method_exit_correct`
                         # in Pipeline.lean was UNSOUND as stated: it equated
                         # `(evalBindings initialAnf m.body).outputs` with
