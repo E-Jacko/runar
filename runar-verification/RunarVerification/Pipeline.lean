@@ -2861,7 +2861,10 @@ integration omnibus — planned split"):
   fragment (decided by `AgreesStateful.statefulConsumeShapeBool`) is
   discharged by the theorem
   `compileSafe_observational_correct_stateful_consume` through the
-  pre-existing BIP-143 bridge axiom (D2.a) + the proved D2.b epilogue;
+  keyed `hStatefulFrag` sig-provenance hypothesis (TIGHTENED
+  2026-06-10 — formerly D2.a's universal bridge axiom, which forced
+  `checkSig` constant; the surviving axiom only asserts witness
+  EXISTENCE per valid context) + the proved D2.b epilogue;
   residual stateful bodies fall through to the sound crypto_call /
   dispatch cascade.
 
@@ -3125,12 +3128,17 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
 -- `AgreesStateful.statefulConsumeShapeBool`: one param `pre`, body exactly the
 -- auto-injected gated prologue `_cp0 := check_preimage pre ; assert _cp0`),
 -- under the keyed `hStatefulFrag` premise (the valid-BIP-143-context entry
--- bundle).  The discharge composes the constant-lowering reduction
+-- bundle, including — TIGHTENED 2026-06-10 — the per-deployment
+-- sig-provenance fact `authBackend.checkSig sigV G = Crypto.checkPreimage
+-- preimage`).  The discharge composes the constant-lowering reduction
 -- (`AgreesStateful.lowerMethod_ops_statefulPrologue`), the runtime walk
 -- (`runOps_statefulPrologueOps_isSome`), the M3 peephole-identity, the M4
--- concrete parse round-trip, and the pre-existing BIP-143 bridge axiom
--- (`StatefulBridge.checkPreimage_iff_checkSig_under_validTxContext` — D2.a's
--- designed external-crypto assumption, already in the TCB).  Residual stateful
+-- concrete parse round-trip, and that provenance hypothesis (formerly D2.a's
+-- universal bridge axiom `checkPreimage_iff_checkSig_under_validTxContext`,
+-- which forced `checkSig` constant; the surviving TCB entry is the
+-- witness-existence axiom
+-- `StatefulBridge.exists_checkSig_witness_under_validTxContext`, which only
+-- powers the smoke).  Residual stateful
 -- bodies — user logic after the prologue, state-output epilogues
 -- (D2.b's `auto_state_output_at_method_exit_correct` is ALREADY a theorem),
 -- multi-public stateful programs — fall through to the sound crypto_call /
@@ -4998,10 +5006,13 @@ lowers to the CONSTANT `[OP_CODESEPARATOR, .swap, .push G, OP_CHECKSIGVERIFY]`
 (`AgreesStateful.lowerMethod_ops_statefulPrologue`), whose Stack success bit
 is the AUTH backend's verdict (`runOps_statefulPrologueOps_isSome`); the ANF
 success bit is the PREIMAGE backend's verdict
-(`StatefulBridge.gatedStatefulPrologue_isSome_eq`); the two agree under a
-valid BIP-143 context via the pre-existing bridge axiom
-(`checkPreimage_iff_checkSig_under_validTxContext`).  No sub-omnibus axiom
-appears in the discharge. -/
+(`StatefulBridge.gatedStatefulPrologue_isSome_eq`); the two agree via the
+per-deployment sig-provenance hypothesis `hSig` carried by the keyed
+`hStatefulFrag` premise (TIGHTENED 2026-06-10 — previously a universal
+bridge axiom that forced `authBackend.checkSig` constant; the surviving
+axiom `StatefulBridge.exists_checkSig_witness_under_validTxContext` only
+asserts a witness EXISTS per valid context, and powers the smoke).  No
+sub-omnibus axiom appears in the discharge. -/
 
 /-- The 4-pass peephole pipeline is the identity on the constant stateful
 prologue ops (no fusable adjacency: the only push is the 33-byte key `G`
@@ -5043,7 +5054,12 @@ theorem peepholeMethodOps_statefulPrologue :
 The success-bit chain is direct (no runMethod leg needed): the ANF side is
 `Crypto.checkPreimage preimage` (gated prologue), the Stack side is
 `authBackend.checkSig sigV G` (constant prologue ops, M3 peephole-identity,
-M4 concrete parse round-trip), and the BIP-143 bridge equates the two. -/
+M4 concrete parse round-trip), and the per-deployment sig-provenance
+hypothesis `hSig` (the spender's `_opPushTxSig` witness verifies against the
+synthetic key exactly when the preimage backend accepts — discharged per
+fixture by the conformance harness, and for the smoke by the witness
+`StatefulBridge.exists_checkSig_witness_under_validTxContext` provides)
+equates the two. -/
 theorem compileSafe_observational_correct_stateful_consume
     (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
     (_hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
@@ -5057,10 +5073,13 @@ theorem compileSafe_observational_correct_stateful_consume
     (hne1 : pre ≠ "_cp0") (hne2 : pre ≠ "_opPushTxSig")
     (ctx : TxContext) (sigV preimage : ByteArray)
     (rest : List RunarVerification.ANF.Eval.Value)
-    (hValid : ValidTxContext ctx)
-    (hPreLink : preimage = TxContext.buildPreimage ctx)
+    (_hValid : ValidTxContext ctx)
+    (_hPreLink : preimage = TxContext.buildPreimage ctx)
     (hAnfPre : initialAnf.resolveRef pre = some (.vBytes preimage))
-    (hStk : initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest) :
+    (hStk : initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest)
+    (hSig : RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
+          AgreesStateful.stG
+        = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
@@ -5092,14 +5111,10 @@ theorem compileSafe_observational_correct_stateful_consume
   have hStack : (runOps AgreesStateful.statefulPrologueOps initialStack).toOption.isSome
       = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV AgreesStateful.stG :=
     AgreesStateful.runOps_statefulPrologueOps_isSome initialStack preimage sigV rest hStk
-  have hBridge : RunarVerification.ANF.Eval.Crypto.checkPreimage preimage
-      = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV AgreesStateful.stG :=
-    StatefulBridge.checkPreimage_iff_checkSig_under_validTxContext ctx sigV
-      AgreesStateful.stG preimage hValid hPreLink
   show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
       anfM.body).toOption.isSome
       ↔ (runParsedBytes bytes initialStack).toOption.isSome
-  rw [hM4, hANF, hStack, hBridge]
+  rw [hM4, hANF, hStack, hSig]
 
 /-! ### MANDATORY smoke: the stateful consume theorem fires
 
@@ -5119,11 +5134,30 @@ private def stSmokePreimage : ByteArray :=
 
 private def stSmokeAnf : State := { params := [("pre", .vBytes stSmokePreimage)] }
 
-private def stSmokeStk : StackState :=
-  { stack := [.vBytes stSmokePreimage, .vBytes (ByteArray.mk #[0x30])] }
+/-- The sample context's spend witness, from the witness-existence axiom
+(`Classical.choose` — the backends are opaque, so no concrete signature
+bytes are derivable in-model). -/
+private noncomputable def stSmokeSig : ByteArray :=
+  Classical.choose
+    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
+      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
+
+/-- The witness property — discharges the consume theorem's `hSig`
+sig-provenance hypothesis for the smoke. -/
+private theorem stSmokeSig_spec :
+    RunarVerification.ANF.Eval.Crypto.authBackend.checkSig stSmokeSig
+        AgreesStateful.stG
+      = RunarVerification.ANF.Eval.Crypto.checkPreimage stSmokePreimage :=
+  Classical.choose_spec
+    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
+      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
+
+private noncomputable def stSmokeStk : StackState :=
+  { stack := [.vBytes stSmokePreimage, .vBytes stSmokeSig] }
 
 /-- SMOKE — `compileSafe` accepts the canonical stateful contract and the
-consume theorem fires on the sample-context entry. -/
+consume theorem fires on the sample-context entry (with the chosen witness
+signature on the deployed stack). -/
 theorem smoke_stateful_consume_fires :
     ∃ bytes, compileSafe stSmokeProg = .ok bytes ∧
       successAgrees
@@ -5140,8 +5174,9 @@ theorem smoke_stateful_consume_fires :
     stSmokeProg AgreesStateful.smokeMethod bytes
     (by simp [stSmokeProg]) rfl hSafe stSmokeAnf stSmokeStk rfl (by decide)
     "pre" .byteString rfl rfl (by decide) (by decide)
-    Stack.TxContext.sampleCtx (ByteArray.mk #[0x30]) stSmokePreimage []
+    Stack.TxContext.sampleCtx stSmokeSig stSmokePreimage []
     RunarVerification.Stack.ValidTxContext.sampleCtx_valid rfl rfl rfl
+    stSmokeSig_spec
 
 /-! ## Dispatch sub-omnibus retirement — the multi-public passthrough consume
 
@@ -6102,12 +6137,18 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- stateful fragment (decided by `AgreesStateful.statefulConsumeShapeBool` —
     -- one param `pre`, body exactly the auto-injected gated prologue) the shape
     -- witnesses plus the valid-BIP-143-context entry bundle are recovered: the
-    -- preimage param resolves to the canonical preimage of a valid context, and
-    -- the runtime stack carries that preimage over the `_opPushTxSig`-derived
-    -- signature.  Keyed on the DECIDABLE classifier, it is VACUOUS for every
+    -- preimage param resolves to the canonical preimage of a valid context, the
+    -- runtime stack carries that preimage over the `_opPushTxSig`-derived
+    -- signature, and (TIGHTENED 2026-06-10) the spender's signature is a
+    -- genuine spend witness — its AUTH-backend verdict against the synthetic
+    -- key `G` equals the PREIMAGE backend's verdict (previously supplied by an
+    -- over-strong universal bridge axiom that forced `checkSig` constant).
+    -- Keyed on the DECIDABLE classifier, it is VACUOUS for every
     -- non-canonical body, so the omnibus stays jointly satisfiable.  Its only
     -- consumer is the conformance harness, which discharges it per fixture from
-    -- the deployment context.
+    -- the deployment context (the witness-existence axiom
+    -- `StatefulBridge.exists_checkSig_witness_under_validTxContext` shows the
+    -- bundle satisfiable for every valid context).
     (hStatefulFrag :
       RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
         ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
@@ -6118,7 +6159,10 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           Stack.ValidTxContext ctx ∧
           preimage = Stack.TxContext.buildPreimage ctx ∧
           initialAnf.resolveRef pre = some (.vBytes preimage) ∧
-          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest)
+          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest ∧
+          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
+              Stack.AgreesStateful.stG
+            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
     -- **Dispatch consume premise (keyed).**  For a multi-public program in the
     -- canonical passthrough fragment (decided by `dispatchConsumeShapeBool`)
     -- the entry bundle is recovered: the unlocking caller pushed the selector
@@ -6177,12 +6221,12 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true
       · by_cases hStName : anfM.name ≠ "constructor"
         · obtain ⟨pre, ty, ctx, sigV, preimage, restV, hStParams, hStBody,
-            hStNe1, hStNe2, hStValid, hStPreLink, hStAnfPre, hStStk⟩ :=
+            hStNe1, hStNe2, hStValid, hStPreLink, hStAnfPre, hStStk, hStSig⟩ :=
             hStatefulFrag hStShape
           exact compileSafe_observational_correct_stateful_consume
             p anfM bytes hMem hPublic hSafe initialAnf initialStack
             hStSingle hStName pre ty hStParams hStBody hStNe1 hStNe2
-            ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk
+            ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk hStSig
         · exact compileSafe_observational_correct_modulo_crypto_call_codegen
             p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
       · exact compileSafe_observational_correct_modulo_crypto_call_codegen
@@ -6502,12 +6546,14 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     -- stateful fragment (decided by `AgreesStateful.statefulConsumeShapeBool` —
     -- one param `pre`, body exactly the auto-injected gated prologue) the shape
     -- witnesses plus the valid-BIP-143-context entry bundle are recovered: the
-    -- preimage param resolves to the canonical preimage of a valid context, and
-    -- the runtime stack carries that preimage over the `_opPushTxSig`-derived
-    -- signature.  Keyed on the DECIDABLE classifier, it is VACUOUS for every
-    -- non-canonical body, so the omnibus stays jointly satisfiable.  Its only
-    -- consumer is the conformance harness, which discharges it per fixture from
-    -- the deployment context.
+    -- preimage param resolves to the canonical preimage of a valid context, the
+    -- runtime stack carries that preimage over the `_opPushTxSig`-derived
+    -- signature, and (TIGHTENED 2026-06-10) the spender's signature is a
+    -- genuine spend witness — its AUTH-backend verdict against the synthetic
+    -- key `G` equals the PREIMAGE backend's verdict.  Keyed on the DECIDABLE
+    -- classifier, it is VACUOUS for every non-canonical body, so the omnibus
+    -- stays jointly satisfiable.  Its only consumer is the conformance
+    -- harness, which discharges it per fixture from the deployment context.
     (hStatefulFrag :
       RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
         ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
@@ -6518,7 +6564,10 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           Stack.ValidTxContext ctx ∧
           preimage = Stack.TxContext.buildPreimage ctx ∧
           initialAnf.resolveRef pre = some (.vBytes preimage) ∧
-          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest)
+          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest ∧
+          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
+              Stack.AgreesStateful.stG
+            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
     -- **Dispatch consume premise (keyed).**  For a multi-public program in the
     -- canonical passthrough fragment (decided by `dispatchConsumeShapeBool`)
     -- the entry bundle is recovered: the unlocking caller pushed the selector

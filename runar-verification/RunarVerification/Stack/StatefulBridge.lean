@@ -33,30 +33,48 @@ backends** and have **different abort semantics**:
 So the prologue's success bit on the ANF side (folding in the downstream
 `assert _cp0`) is `Crypto.checkPreimage bytes`, and on the Stack side it is
 `authBackend.checkSig sig pk`.  These agree only under a BIP-143 / ECDSA
-fact about the two external primitives — that is the bridge axiom below.
+fact about the two external primitives — carried below as the
+per-deployment `hSig` provenance hypothesis plus the witness-existence
+axiom.
 
 ## What this file ships
 
-1. `checkPreimage_iff_checkSig_under_validTxContext` — the ONE new
-   (pre-authorized) crypto axiom: under a well-formed BIP-143 context, the
-   PREIMAGE backend's verdict on the preimage equals the AUTH backend's
-   verdict on the synthetic-key signature check the Stack prologue performs.
-   It is a sibling of the existing `hashBackend` / `authBackend` /
-   `preimageBackend` assumptions — an external-primitive agreement, NOT a
-   codegen-soundness axiom (it RETIRES the split-backend blocker, it does
-   not introduce a fresh soundness claim).
-2. `statefulPrologue_successAgrees_under_validTxContext` — the genuine
-   correspondence theorem: composing the bridge with the two `AgreesD2`
-   substrate lemmas (ANF side) and `runOpcode_CHECKSIGVERIFY_ValidTxContext`
-   (Stack side), it proves the GATED ANF stateful-prologue success bit (the
-   `check_preimage` binding followed by its downstream `assert _cp0`) equals
-   the Stack prologue's `OP_CHECKSIGVERIFY` success bit.  This is the
-   cleanest `successAgrees`-shaped statement for the prologue.
-3. In-file smokes firing the correspondence on a concrete VALID context
+1. `stG` — the compiler's synthetic BIP-143 key (the secp256k1 generator
+   `G` in compressed SEC form), the shared constant the Stack prologue
+   pushes (`Lower.lowerCheckPreimageOpsLive`).  `AgreesStateful` re-exports
+   it.
+2. `exists_checkSig_witness_under_validTxContext` — the ONE crypto axiom
+   (TIGHTENED 2026-06-10): for every well-formed BIP-143 context there
+   EXISTS a signature whose AUTH-backend verdict against the synthetic key
+   `G` equals the PREIMAGE backend's verdict on the canonical preimage.
+   The previous shape (`checkPreimage_iff_checkSig_under_validTxContext`)
+   equated the two verdicts for UNIVERSALLY quantified `sig`/`pk` — which
+   forced `authBackend.checkSig` to be a CONSTANT function (one valid
+   context pins the same boolean for all `sig`,`pk`), a cryptographically
+   unfaithful assumption (false for real ECDSA).  The existential shape is
+   TRUE under the real-world reading: when the preimage backend accepts,
+   the deterministic ECDSA signature over the BIP-143 digest with the
+   synthetic key is a verifying witness; when it rejects, any garbage
+   byte-string is a non-verifying one.  It constrains NOTHING about
+   `checkSig` off the witness, so the backend can be non-constant.
+3. `statefulPrologue_successAgrees_under_validTxContext` — the genuine
+   correspondence theorem.  The per-deployment sig-provenance fact is now a
+   HYPOTHESIS (`hSig : authBackend.checkSig sig stG = Crypto.checkPreimage
+   preimage` — "the spender's `_opPushTxSig` witness verifies exactly when
+   the preimage backend accepts"), discharged per fixture by the
+   conformance harness and, for the in-file smokes, by the witness the
+   existence axiom provides (`Classical.choose`).  Composing it with the
+   two `AgreesD2` substrate lemmas (ANF side) and the
+   `OP_CHECKSIGVERIFY` reduction (Stack side) proves the GATED ANF
+   stateful-prologue success bit (the `check_preimage` binding followed by
+   its downstream `assert _cp0`) equals the Stack prologue's
+   `OP_CHECKSIGVERIFY` success bit.
+4. In-file smokes firing the correspondence on a concrete VALID context
    (success on both sides) and exercising the gated-ANF abort path on a
    concrete FALSE preimage verdict.
 
-No `sorry`/`admit`; exactly one new `axiom` (the bridge).
+No `sorry`/`admit`; exactly one `axiom` (the witness existence — count-
+neutral with the shape it replaced).
 -/
 
 namespace RunarVerification
@@ -67,44 +85,59 @@ open RunarVerification.ANF
 open RunarVerification.ANF.Eval
 open RunarVerification.Stack.Eval
 
-/-! ## 1 — The BIP-143 preimage⟷signature bridge axiom -/
+/-! ## 1 — The synthetic key + the BIP-143 witness-existence axiom -/
 
-/-- **BIP-143 preimage⟷signature bridge (crypto assumption).**
+/-- The compiler's synthetic BIP-143 key: the secp256k1 generator point `G`
+in compressed SEC form (33 bytes).  Byte-identical to the local constant in
+`Lower.lowerCheckPreimageOpsLive`; `AgreesStateful.stG` re-exports it. -/
+def stG : ByteArray := ByteArray.mk #[
+  0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB,
+  0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+  0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28,
+  0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98]
 
-Under a well-formed BIP-143 context (`ValidTxContext ctx`) whose preimage is
-the canonical `TxContext.buildPreimage ctx`, the synthetic-key signature
-check the Stack stateful prologue performs — `OP_CHECKSIGVERIFY` over the
-`_opPushTxSig`-derived signature `sig` against the secp256k1 generator `pk`
-(`G`) — succeeds iff the PREIMAGE backend accepts the preimage.
+/-- **BIP-143 witness existence (crypto assumption — TIGHTENED 2026-06-10).**
 
-Concretely it equates the two external primitives the §11.6 wall keeps
-apart: `Crypto.checkPreimage preimage` (the PREIMAGE backend, used by the
-ANF `check_preimage` binding) and `authBackend.checkSig sig pk` (the AUTH
-backend, used by the Stack `OP_CHECKSIGVERIFY`).  The operand names match
-`runOpcode_CHECKSIGVERIFY_ValidTxContext` exactly: `sig`/`pk` are the two
-byte-values on the prologue stack (pk on top, sig below), `preimage` is the
-`StackState.preimage` field the lowering threads as `buildPreimage ctx`.
+For every well-formed BIP-143 context there exists a signature whose
+AUTH-backend verdict against the compiler's synthetic key `G` (`stG`)
+equals the PREIMAGE backend's verdict on the canonical preimage
+`TxContext.buildPreimage ctx`.
 
-This is the documented external-primitive AGREEMENT between `authBackend`
-and `preimageBackend` under a valid context.  It is a sibling of the
-existing `hashBackend` / `authBackend` / `preimageBackend` crypto
-assumptions — NOT a codegen-soundness axiom.  It REPLACES the split-backend
-blocker (`AgreesD2.lean` documented remaining blocker for the stateful
-sub-omnibus): one external-crypto fact in, one codegen-soundness obligation
-discharged.
+History: the previous shape
+(`checkPreimage_iff_checkSig_under_validTxContext`) asserted
+`Crypto.checkPreimage preimage = authBackend.checkSig sig pk` for
+UNIVERSALLY quantified `sig pk : ByteArray`.  That forced
+`authBackend.checkSig` to be a CONSTANT function — for any one valid
+context, every `(sig, pk)` pair was pinned to the same boolean — an
+assumption whose real-world (ECDSA) reading is FALSE: some signatures
+verify, most don't.  It was tightened to this existential on 2026-06-10.
 
-Cryptographic justification: BIP-143 fixes the exact bytes the stateful
-locking script signs (`buildPreimage ctx`); the compiler's synthetic key is
-`G`, and a valid spending witness for that script is, by the ECDSA
-verification equation over those bytes, exactly a witness the preimage
-backend accepts.  Both backends are opaque in this development, so the
-agreement is assumed, not derived. -/
-axiom checkPreimage_iff_checkSig_under_validTxContext (ctx : TxContext)
-    (sig pk preimage : ByteArray)
-    (_hValid : ValidTxContext ctx)
-    (_hPre : preimage = TxContext.buildPreimage ctx) :
-    RunarVerification.ANF.Eval.Crypto.checkPreimage preimage
-      = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sig pk
+Real-world reading (TRUE for ECDSA over BIP-143): the synthetic key is the
+generator `G`, whose discrete log (1) is public, so a deterministic ECDSA
+signature over the digest of `buildPreimage ctx` is constructible by every
+spender.  If the preimage backend accepts the canonical preimage, that
+constructed signature is a verifying witness (`true = true`); if it
+rejects, any non-signature byte-string fails verification (`false =
+false`).  Either way a witness exists.  Crucially the existential
+constrains NOTHING about `checkSig` away from the witness — the backend is
+free to be non-constant, as real ECDSA is.
+
+Consumers: the per-deployment AGREEMENT for the specific `_opPushTxSig`
+witness the spender supplies is now a HYPOTHESIS of
+`statefulPrologue_successAgrees_under_validTxContext` (and of the keyed
+`hStatefulFrag` omnibus premise in `Pipeline.lean`), discharged per fixture
+by the conformance harness.  This axiom's role is anti-vacuity: it supplies
+the witness (`Classical.choose`) that lets the in-file smokes and
+`Pipeline.smoke_stateful_consume_fires` fire the correspondence end-to-end
+on concrete contexts.  It is a sibling of the existing `hashBackend` /
+`authBackend` / `preimageBackend` crypto assumptions — NOT a
+codegen-soundness axiom. -/
+axiom exists_checkSig_witness_under_validTxContext (ctx : TxContext)
+    (_hValid : ValidTxContext ctx) :
+    ∃ sig : ByteArray,
+      RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sig stG
+        = RunarVerification.ANF.Eval.Crypto.checkPreimage
+            (TxContext.buildPreimage ctx)
 
 /-! ## 2 — ANF-side gated prologue reduction (the downstream `assert _cp0`)
 
@@ -174,12 +207,19 @@ bit equals the Stack prologue's `OP_CHECKSIGVERIFY` success bit.
 Concretely, with:
 * `ValidTxContext ctx` and `stkSt.preimage = buildPreimage ctx` — the
   well-formed-context facts the Stack `OP_CHECKSIGVERIFY` lemma needs;
-* `stkSt.stack = pk :: sig :: rest` — the prologue's signature-check stack
-  shape (pk = `G` on top, sig = `_opPushTxSig`-derived below), matching
-  `runOpcode_CHECKSIGVERIFY_ValidTxContext`;
+* `stkSt.stack = stG :: sig :: rest` — the prologue's signature-check stack
+  shape (the synthetic key `G` on top, the `_opPushTxSig`-derived witness
+  below), matching `runOpcode_CHECKSIGVERIFY_ValidTxContext`;
 * `s.resolveRef pre = some (.vBytes preimage)` and `preimage = buildPreimage
   ctx` — the ANF-side input readiness, linking the ANF preimage bytes to the
   Stack-threaded preimage;
+* `hSig : authBackend.checkSig sig stG = Crypto.checkPreimage preimage` —
+  the per-deployment sig-provenance fact (TIGHTENED 2026-06-10; previously
+  supplied by the over-strong universal bridge axiom, which forced
+  `checkSig` constant): the spender's witness verifies against the
+  synthetic key exactly when the preimage backend accepts.  Discharged per
+  fixture by the conformance harness; for the smokes, by the witness
+  `exists_checkSig_witness_under_validTxContext` provides;
 
 we have
 
@@ -189,10 +229,9 @@ we have
 Composition:
 * ANF half — `gatedStatefulPrologue_isSome_eq`: the LHS isSome is
   `Crypto.checkPreimage preimage`.
-* bridge — `checkPreimage_iff_checkSig_under_validTxContext`: that equals
-  `authBackend.checkSig sig pk`.
+* provenance — `hSig`: that equals `authBackend.checkSig sig stG`.
 * Stack half — `runOpcode_CHECKSIGVERIFY` definitional shape: the RHS isSome
-  is `authBackend.checkSig sig pk` (success ↦ `.ok`, failure ↦
+  is `authBackend.checkSig sig stG` (success ↦ `.ok`, failure ↦
   `.assertFailed`, both branches case-split through the same bool).
 
 NON-VACUOUS: smokes below fire it on a concrete VALID context where the
@@ -200,29 +239,31 @@ preimage verdict is forced `true` (both sides succeed) and exercise the
 gated-ANF abort on a `false` verdict. -/
 theorem statefulPrologue_successAgrees_under_validTxContext
     (methods : List ANFMethod) (s : State)
-    (ctx : TxContext) (sig pk preimage : ByteArray) (rest : List Value)
+    (ctx : TxContext) (sig preimage : ByteArray) (rest : List Value)
     (stkSt : StackState) (pre : String)
-    (hValid : ValidTxContext ctx)
-    (hStkPre : stkSt.preimage = TxContext.buildPreimage ctx)
-    (hStk : stkSt.stack = .vBytes pk :: .vBytes sig :: rest)
-    (hPreLink : preimage = TxContext.buildPreimage ctx)
-    (hAnfPre : s.resolveRef pre = some (.vBytes preimage)) :
+    (_hValid : ValidTxContext ctx)
+    (_hStkPre : stkSt.preimage = TxContext.buildPreimage ctx)
+    (hStk : stkSt.stack = .vBytes stG :: .vBytes sig :: rest)
+    (_hPreLink : preimage = TxContext.buildPreimage ctx)
+    (hAnfPre : s.resolveRef pre = some (.vBytes preimage))
+    (hSig : RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sig stG
+        = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage) :
     (evalBindingsP methods s (gatedStatefulPrologueBody pre)).toOption.isSome
       ↔ (Eval.runOpcode "OP_CHECKSIGVERIFY" stkSt).toOption.isSome := by
   -- ANF half: LHS isSome = Crypto.checkPreimage preimage.
   rw [gatedStatefulPrologue_isSome_eq methods s pre preimage hAnfPre]
-  -- Bridge: Crypto.checkPreimage preimage = authBackend.checkSig sig pk.
-  rw [checkPreimage_iff_checkSig_under_validTxContext ctx sig pk preimage hValid hPreLink]
+  -- Provenance: Crypto.checkPreimage preimage = authBackend.checkSig sig stG.
+  rw [← hSig]
   -- Stack half: reduce `runOpcode "OP_CHECKSIGVERIFY"` to its bool branch.
-  -- `popN stkSt 2` peels `[pk, sig]` off `hStk`; the arm then branches on
-  -- `checkSig sigB pkB = authBackend.checkSig sig pk`.
+  -- `popN stkSt 2` peels `[stG, sig]` off `hStk`; the arm then branches on
+  -- `checkSig sigB pkB = authBackend.checkSig sig stG`.
   simp only [Eval.runOpcode, Eval.popN, StackState.pop?, hStk, asBytes?,
     RunarVerification.ANF.Eval.Crypto.checkSig]
   -- Both sides are now `<bool> = true ↔ (if <bool> then .ok _ else .error _).isSome`.
   -- The `if` carries a `Decidable (<bool> = true)` instance that depends on the
   -- term, so `simp only [h]` (not `rw`) discharges each branch.
   rcases Bool.eq_false_or_eq_true
-      (RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sig pk) with h | h <;>
+      (RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sig stG) with h | h <;>
     simp only [h] <;> simp [Except.toOption, Option.isSome]
 
 /-! ## 4 — In-file smokes (non-vacuity)
@@ -239,17 +280,35 @@ def smokePreimage : ByteArray := TxContext.buildPreimage TxContext.sampleCtx
 def smokeState : State :=
   { params := [("pre", .vBytes smokePreimage)] }
 
-/-- A concrete Stack state in the prologue's `OP_CHECKSIGVERIFY` shape, with
-the sample context's preimage threaded and `[pk, sig]` on top.  The byte
-values of `pk`/`sig` are irrelevant to the success bit (they are opaque to
-the AUTH backend), so any placeholders do. -/
-def smokeStkSt : StackState :=
-  { stack := [.vBytes (ByteArray.mk #[0x01]), .vBytes (ByteArray.mk #[0x02])],
-    preimage := TxContext.buildPreimage TxContext.sampleCtx }
-
 /-- Smoke: the sample context is a `ValidTxContext` (the bridge precondition). -/
 theorem smoke_sampleCtx_valid : ValidTxContext TxContext.sampleCtx :=
   Stack.ValidTxContext.sampleCtx_valid
+
+/-- The sample context's spend witness, obtained from the witness-existence
+axiom (noncomputable — the backends are opaque, so no concrete signature
+bytes are derivable in-model; `Classical.choose` names the one the axiom
+provides). -/
+noncomputable def smokeSig : ByteArray :=
+  Classical.choose
+    (exists_checkSig_witness_under_validTxContext TxContext.sampleCtx
+      smoke_sampleCtx_valid)
+
+/-- The witness property: `smokeSig`'s AUTH verdict against `stG` equals the
+PREIMAGE backend's verdict on the sample preimage — the `hSig` provenance
+hypothesis of the correspondence, discharged by construction. -/
+theorem smokeSig_spec :
+    RunarVerification.ANF.Eval.Crypto.authBackend.checkSig smokeSig stG
+      = RunarVerification.ANF.Eval.Crypto.checkPreimage smokePreimage :=
+  Classical.choose_spec
+    (exists_checkSig_witness_under_validTxContext TxContext.sampleCtx
+      smoke_sampleCtx_valid)
+
+/-- A concrete Stack state in the prologue's `OP_CHECKSIGVERIFY` shape, with
+the sample context's preimage threaded and `[stG, smokeSig]` on top (the
+synthetic key over the chosen spend witness). -/
+noncomputable def smokeStkSt : StackState :=
+  { stack := [.vBytes stG, .vBytes smokeSig],
+    preimage := TxContext.buildPreimage TxContext.sampleCtx }
 
 /-- Smoke: the ANF entry state resolves `pre` to the canonical preimage.
 (`Value` has no `DecidableEq` — `ByteArray` blocks it — so this is `rfl`, a
@@ -260,16 +319,17 @@ theorem smoke_resolveRef :
 /-- **THE SMOKE.**  The correspondence FIRES on the concrete valid context:
 the gated-ANF prologue success bit ↔ the Stack `OP_CHECKSIGVERIFY` success
 bit.  Exercises `statefulPrologue_successAgrees_under_validTxContext`
-end-to-end through the bridge axiom — non-vacuous (both `isSome` sides are
-the SAME `authBackend.checkSig` bit, not `True`). -/
+end-to-end — the `hSig` provenance hypothesis is discharged by the witness
+the existence axiom provides (`smokeSig_spec`) — non-vacuous (both `isSome`
+sides are the SAME `authBackend.checkSig` bit, not `True`). -/
 theorem smoke_statefulPrologue_successAgrees :
     (evalBindingsP [] smokeState (gatedStatefulPrologueBody "pre")).toOption.isSome
       ↔ (Eval.runOpcode "OP_CHECKSIGVERIFY" smokeStkSt).toOption.isSome :=
   statefulPrologue_successAgrees_under_validTxContext
     [] smokeState TxContext.sampleCtx
-    (ByteArray.mk #[0x02]) (ByteArray.mk #[0x01]) smokePreimage
+    smokeSig smokePreimage
     [] smokeStkSt "pre"
-    smoke_sampleCtx_valid rfl rfl rfl smoke_resolveRef
+    smoke_sampleCtx_valid rfl rfl rfl smoke_resolveRef smokeSig_spec
 
 /-- Smoke (abort-path exercise): the GATED ANF prologue success bit reduces
 to the raw preimage verdict — i.e. it ABORTS exactly when

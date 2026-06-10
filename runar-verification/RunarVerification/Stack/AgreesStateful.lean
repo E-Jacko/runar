@@ -46,13 +46,11 @@ open RunarVerification.ANF.Eval (Value)
 open RunarVerification.ANF.Eval.Crypto
 
 /-- The compiler's synthetic BIP-143 key: the secp256k1 generator point `G`
-in compressed SEC form (33 bytes).  Byte-identical to the local constant in
+in compressed SEC form (33 bytes).  The byte literal now lives in
+`StatefulBridge.stG` (the witness-existence axiom is stated over it); this
+is a definitional alias, byte-identical to the local constant in
 `Lower.lowerCheckPreimageOpsLive`. -/
-def stG : ByteArray := ByteArray.mk #[
-  0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB,
-  0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
-  0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28,
-  0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98]
+def stG : ByteArray := StatefulBridge.stG
 
 /-- The canonical stateful method's CONSTANT lowered op list. -/
 def statefulPrologueOps : List StackOp :=
@@ -83,7 +81,7 @@ theorem lowerValueP_checkPreimage_statefulPrologue
   simp [Lower.lowerCheckPreimageOpsLive, Lower.loadRefLive, Lower.bringToTop,
     Lower.StackMap.depth?, Lower.StackMap.popN, Lower.isLastUse,
     Lower.lastUsesLookup, Lower.listContains, List.findIdx?, List.findIdx?.go,
-    hne2, Ne.symm hne1, statefulPrologueOps, stG]
+    hne2, Ne.symm hne1, statefulPrologueOps, stG, StatefulBridge.stG]
 
 /-- The auto-injected `assert _cp0` lowers to the bare `OP_VERIFY` (the
 `_cp0` slot is consumed in place at d0 last-use). -/
@@ -237,7 +235,7 @@ open RunarVerification.Script RunarVerification.Script.Parse in
 theorem parseOps_emit_statefulPrologue :
     parseOps (emitOpsL statefulPrologueOps) = .ok statefulPrologueOps := by
   simp +decide [statefulPrologueOps, emitOpsL, emitStackOpL, encodePushValL,
-    encodePushBytesL, encodePushDataL, stG, opcodeByName?,
+    encodePushBytesL, encodePushDataL, stG, StatefulBridge.stG, opcodeByName?,
     ByteArray.toList_eq_data_toList, ByteArray.size]
   rfl
 
@@ -248,7 +246,7 @@ theorem emitOps_toList_statefulPrologue :
   simp +decide [Emit.emitOps, Emit.emitStackOp, Emit.encodePushVal,
     Emit.encodePushBytes, Emit.encodePushData, statefulPrologueOps, emitOpsL,
     emitStackOpL, encodePushValL, encodePushBytesL, encodePushDataL, stG,
-    opcodeByName?, ByteArray.size, ByteArray.toList_append,
+    StatefulBridge.stG, opcodeByName?, ByteArray.size, ByteArray.toList_append,
     ByteArray.toList_mk_singleton, ByteArray.toList_eq_data_toList]
 
 open RunarVerification.Script RunarVerification.Script.Parse in

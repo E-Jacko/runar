@@ -67,6 +67,7 @@ that are preserved by design.
 | **Stateful sub-omnibus retired — canonical gated-prologue consume** | 2026-06-08 | **72** | **−1** | −1 (the stateful O1 sub-omnibus codegen-soundness axiom is GONE) | 0 | `compileSafe_observational_correct_modulo_stateful_codegen` retired (the SIXTH sub-omnibus retirement, 4 → 3 surviving: crypto_call / loop / dispatch). Its omnibus branch is discharged by the theorem `compileSafe_observational_correct_stateful_consume` for the single-public CANONICAL stateful fragment (decided by `AgreesStateful.statefulConsumeShapeBool`: one param `pre`, body exactly the auto-injected gated prologue `_cp0 := check_preimage pre ; assert _cp0`, name-collision exclusions). The whole method lowers to the CONSTANT `[OP_CODESEPARATOR, .swap, .push G, OP_CHECKSIGVERIFY]` (`AgreesStateful.lowerMethod_ops_statefulPrologue` — terminal `OP_VERIFY` elided); the Stack success bit is `authBackend.checkSig sig G` (`runOps_statefulPrologueOps_isSome`), the ANF success bit is `Crypto.checkPreimage preimage` (`StatefulBridge.gatedStatefulPrologue_isSome_eq`), and the pre-existing BIP-143 bridge axiom equates them under a valid context. M3 = peephole identity on the constant list; M4 = concrete `parseScript ∘ emitOpsFast` round-trip (`parseScript_emitOpsFast_statefulPrologue`). The keyed `hStatefulFrag` omnibus premise (vacuous off-fragment) supplies the valid-context entry bundle. Residual stateful bodies (user logic, epilogues, multi-public) fall through to the sound crypto_call cascade. `#print axioms` on the consume theorem: propext / Classical.choice / Quot.sound + the crypto backends + the bridge — NO sub-omnibus axiom, NO sorry. End-to-end smoke `smoke_stateful_consume_fires` (compileSafe accepts the canonical contract; the theorem fires on the sample-context entry). New substrate module `Stack/AgreesStateful.lean` (0 axioms). |
 | **Dispatch sub-omnibus retired — multi-public passthrough consume** | 2026-06-08 | **71** | **−1** | −1 (the dispatch O1 sub-omnibus codegen-soundness axiom is GONE) | 0 | `compileSafe_observational_correct_modulo_dispatch_codegen` retired (the SEVENTH sub-omnibus retirement, 3 → 2 surviving: crypto_call / loop). Its omnibus branch is discharged by the theorem `compileSafe_observational_correct_dispatch_consume` for the CANONICAL multi-public fragment (decided by `dispatchConsumeShapeBool`: 2–17 public methods, each a non-constructor-named single-param passthrough whose body is one `loadParam`). Every fragment method lowers to the EMPTY op list (`lowerMethod_ops_passthrough` — the param is consumed in place at depth-0 last-use), so the deployed script is the bare Merkle dispatch chain; the discharge composes the wave-69 D1 theorem `merkle_dispatch_selection_correct` (parse round-trip + branch-`i` selection) with the NEW multi-public shape lemma `peepholeProgram_multi_public_shape` (`publicMethodsOf (peephole (lower p)) = (filter public).map (peepholedLoweredMethod p)` when no public method is constructor-named). The keyed `hDispatchFrag` omnibus premise (vacuous off-fragment) supplies the selector witness, the index fact, and the param resolution. Residual multi-public programs (non-passthrough bodies, > 17 methods) fall through to the sound crypto_call cascade. `#print axioms` on the consume theorem: propext / Classical.choice / Quot.sound + the crypto backends — NO sub-omnibus axiom, NO bridge, NO sorry. End-to-end smoke `smoke_dispatch_consume_fires` (compileSafe accepts the canonical 2-passthrough contract; selector 0 fires the theorem on a concrete entry). |
 | **Aliased-operand counterexample found — surviving sub-omnibus axioms NARROWED** | 2026-06-08 | **71** | **0** | 0 (no axiom added or removed — 2 axioms narrowed with a decidable guard) | 0 | **The unguarded crypto_call (`hypothesis True`) and loop sub-omnibus axioms were REFUTABLE.** Counterexample: the hand-written ANF binding `t := x + x` (repeated operand, both reads consume-mode last-use). The liveness lowerer double-consumes the single stack copy (`bringToTop` d0-consume emits `[]` twice — the TS reference `05-stack-lower.ts:828` behaves identically), emitting a bare `[OP_ADD]` that UNDERFLOWS at runtime, while the ANF interpreter evaluates the binding fine; `compileSafe` accepts the program, so the unguarded `successAgrees` claim was `true ↔ false` = False. Pinned permanently by `aliasCx_anf_succeeds` / `aliasCx_stack_fails` / `aliasCx_guard_rejects` in `Pipeline.lean`. **Production impact: none from any frontend** — the ANF lowering pass gives every operand a fresh temp (the real TS compiler emits the correct `DUP SWAP ADD` = `767c93009c` for `x + x` source), and zero conformance fixtures contain a repeated-operand value; the pattern is reachable only via hand-written IR through `compileFromANF` / `--ir` (flagged as a compiler-side hardening follow-up). REPAIR: the decidable guard `noAliasedOperandsB` (every binding's value reads pairwise-distinct refs, recursing into branch/loop bodies) is now a REQUIRED hypothesis of both surviving sub-omnibus axioms, and the omnibus theorem threads it (`hNoAlias`). Every frontend-produced program satisfies the guard by construction. This is the second unsoundness repair after D2.b (2026-05-30). |
+| **BIP-143 bridge TIGHTENED — universal `checkSig` equality forced the auth backend constant** | 2026-06-10 | **71** | **0** | 0 (no axiom added or removed — the bridge axiom is REPLACED by a strictly weaker existential, count-neutral) | 0 | **The 2026-05-30 bridge axiom `checkPreimage_iff_checkSig_under_validTxContext` was over-strong.** It asserted `Crypto.checkPreimage preimage = authBackend.checkSig sig pk` for UNIVERSALLY quantified `sig pk : ByteArray` under any one valid context — so `authBackend.checkSig` was pinned to the SAME boolean for ALL `(sig, pk)` pairs, i.e. the axiom forced the auth backend to be a CONSTANT function. Consistent in-model (both backends are opaque), but cryptographically UNFAITHFUL: for real ECDSA some signatures verify and most do not, so the assumption's real-world reading is false. TIGHTENED (in `Stack/StatefulBridge.lean`): (a) the universal equality is GONE; (b) the surviving axiom is `exists_checkSig_witness_under_validTxContext` — for every valid context ∃ sig with `authBackend.checkSig sig stG = Crypto.checkPreimage (buildPreimage ctx)` (`stG` = the compiler's synthetic key `G`, now defined in `StatefulBridge` and aliased by `AgreesStateful.stG`). The existential is TRUE under the real-ECDSA reading (the synthetic key's discrete log is public, so the deterministic signature over the digest is a verifying witness when the preimage backend accepts; any garbage is a non-verifying one when it rejects) and constrains nothing about `checkSig` off the witness — the backend may be non-constant. (c) The per-deployment agreement for the spender's SPECIFIC `_opPushTxSig` witness is now a HYPOTHESIS (`hSig : authBackend.checkSig sig stG = Crypto.checkPreimage preimage`) of `statefulPrologue_successAgrees_under_validTxContext`, of `compileSafe_observational_correct_stateful_consume`, and of the keyed `hStatefulFrag` omnibus premise (one new conjunct) — discharged per fixture by the conformance harness, exactly like the other keyed entry bundles. (d) Anti-vacuity preserved: the smokes (`smoke_statefulPrologue_successAgrees`, `Pipeline.smoke_stateful_consume_fires`) obtain the witness via `Classical.choose` of the existence axiom and fire end-to-end on the sample context. `#print axioms` after: the consume theorem and the correspondence theorem now depend only on propext / Classical.choice / Quot.sound + the crypto backends (the bridge content moved into their hypotheses); the smokes additionally list `exists_checkSig_witness_under_validTxContext`. Net 0, 71 → 71. |
 
 **Net Tier 1 wave 2 (2026-05-17, omnibus-split inflation + Stage C widenings):** 78 → 86,
 Δ = +8 (intentional). The 9 per-family sub-omnibuses replace the single omnibus
@@ -101,7 +102,7 @@ proofs; Path 2 discharges them.
 |---|---:|---:|---:|---|
 | `ANF/Eval.lean` | 6 | 6 | 0 | 3 backend assumptions (`hashBackend`, `authBackend`, `preimageBackend`); 2 partial-SHA-256 ops (`sha256Compress`, `sha256Finalize`); 1 residual (`merkleRootHash256`-style outliers). Tier 1 wave 1 (2026-05-17) converted the 10 secp256k1, 12 P-256/P-384, and 6 SLH-DSA primitive symbols to delegating `def`s into new `Crypto/Secp256k1.lean`, `Crypto/NistEC.lean`, and inline `SlhDsa` namespace (net −28 from this file). `verifyWOTS` was deferred pending the `Crypto/SpecCore.lean` refactor (import-cycle blocker). |
 | `Crypto/Spec.lean` | 41 | 36 | 5 | **Preserved (36):** 10 secp256k1 group laws §1; 10 P-256/P-384 group laws §2.5 (the 2 `pXNegate` function symbols are now concrete `def`s per Tier 1 pXNegate-derivable); 5 auxiliary key functions; 11 EUF-CMA companions. **Target (5):** Phase B4 secp256k1 codegen-to-spec — `emitEcAdd/Mul/MulGen/Negate/OnCurve_runOps_eq`. **(`emitEcModReduce_runOps_eq` + `emitEcEncodeCompressed_runOps_eq` DISCHARGED 2026-05-25; `emitEcPointX_runOps_eq` + `emitEcPointY_runOps_eq` + `emitEcMakePoint_runOps_eq` DISCHARGED 2026-05-25 → theorems in `Stack/AgreesEC.lean`; net −5 from the original 10. `emitEcNegate/OnCurve_runOps_eq` BLOCKED on the Tracker-addressing simulation invariant; `emitEcAdd/Mul/MulGen` M4-walled.)** The 20 group-law axioms in §1 + §2.5 become *derivable* once Tier 2 group-law audit lands against the concrete `Crypto.ecAdd` / `Crypto.p256Add` / etc. defs (now in `Crypto/Secp256k1.lean` and `Crypto/NistEC.lean`). |
-| `Pipeline.lean` | 2 | 0 | 2 | 2 O1 sub-omnibus axioms (crypto_call / loop). **Dispatch sub-omnibus RETIRED (2026-06-08)** — discharged by `compileSafe_observational_correct_dispatch_consume` (canonical multi-public passthrough fragment, via the wave-69 D1 selection theorem + the multi-public shape lemma); residual multi-public programs fall to the sound crypto_call fallback; net −1. **Stateful sub-omnibus RETIRED (2026-06-08)** — `compileSafe_observational_correct_modulo_stateful_codegen` is GONE; its branch is discharged by the theorem `compileSafe_observational_correct_stateful_consume` (canonical gated-prologue fragment, via the pre-existing BIP-143 bridge), residual stateful bodies fall to the sound crypto_call fallback; net −1. The omnibus `compileSafe_observational_correct_modulo_codegen_axioms` is a `theorem`. **D2.b `auto_state_output_at_method_exit_correct` RETIRED (WS0a/T8, 2026-05-30)** — it was UNSOUND as stated (ANF `.addOutput` appends to `State.outputs`; Stack `runOps` leaves `StackState.outputs` empty), now a `theorem` restated via `OutputTrace.applyTrace` and proved from `AgreesD2.statefulEpilogue_outputs_agree`; it had no proof-term consumers. **D1 `merkle_dispatch_selection_correct` RETIRED (Wave 69, 2026-05-24)** — now a `theorem` proved from the wave-69a substrate (`parseScript_emitDispatch_eq_dispatchReconL` + `dispatchReconOps_select_branch`); it had no proof-term consumers. |
+| `Pipeline.lean` | 2 | 0 | 2 | 2 O1 sub-omnibus axioms (crypto_call / loop). **Dispatch sub-omnibus RETIRED (2026-06-08)** — discharged by `compileSafe_observational_correct_dispatch_consume` (canonical multi-public passthrough fragment, via the wave-69 D1 selection theorem + the multi-public shape lemma); residual multi-public programs fall to the sound crypto_call fallback; net −1. **Stateful sub-omnibus RETIRED (2026-06-08)** — `compileSafe_observational_correct_modulo_stateful_codegen` is GONE; its branch is discharged by the theorem `compileSafe_observational_correct_stateful_consume` (canonical gated-prologue fragment, via the keyed `hStatefulFrag` sig-provenance hypothesis — TIGHTENED 2026-06-10, formerly the universal BIP-143 bridge axiom), residual stateful bodies fall to the sound crypto_call fallback; net −1. The omnibus `compileSafe_observational_correct_modulo_codegen_axioms` is a `theorem`. **D2.b `auto_state_output_at_method_exit_correct` RETIRED (WS0a/T8, 2026-05-30)** — it was UNSOUND as stated (ANF `.addOutput` appends to `State.outputs`; Stack `runOps` leaves `StackState.outputs` empty), now a `theorem` restated via `OutputTrace.applyTrace` and proved from `AgreesD2.statefulEpilogue_outputs_agree`; it had no proof-term consumers. **D1 `merkle_dispatch_selection_correct` RETIRED (Wave 69, 2026-05-24)** — now a `theorem` proved from the wave-69a substrate (`parseScript_emitDispatch_eq_dispatchReconL` + `dispatchReconOps_select_branch`); it had no proof-term consumers. |
 | `Stack/Blake3.lean` | 2 | 0 | 2 | `runOps_b3HashOps_eq`, `runOps_b3CompressOps_eq` — codegen-to-spec. |
 | `Stack/P256P384.lean` | 14 | 0 | 14 | Codegen-to-spec for `emitP256/P384*` and `emitVerifyECDSA_P256/P384`. |
 | `Stack/SlhDsa.lean` | 6 | 0 | 6 | One codegen-to-spec link per FIPS 205 SHA-2 parameter set. |
@@ -262,8 +263,11 @@ planned sub-omnibus inventory:
   RETIRED (2026-06-08): the single-public canonical gated-prologue
   fragment (decided by `AgreesStateful.statefulConsumeShapeBool`) is
   discharged by `compileSafe_observational_correct_stateful_consume`
-  through the pre-existing BIP-143 bridge axiom; residual stateful
-  bodies fall through to the sound crypto_call cascade.
+  through the keyed `hStatefulFrag` sig-provenance hypothesis
+  (TIGHTENED 2026-06-10 — formerly the universal BIP-143 bridge
+  axiom, which forced `checkSig` constant; the surviving axiom is the
+  witness-existence form); residual stateful bodies fall through to
+  the sound crypto_call cascade.
 
 The split temporarily inflates the axiom count by ~8 (9 sub-omnibuses
 replace 1 omnibus). Each sub-omnibus retires as the corresponding
@@ -283,8 +287,8 @@ permanent axiom inflation.
 | `RunarVerification/Stack/Wots.lean` | 1 | Phase B8 codegen-to-spec axiom (`runOps_wotsBodyOps_eq`) |
 | `RunarVerification/Stack/Rabin.lean` | 1 | Phase B10 codegen-to-spec axiom (`runOps_rabinBodyOps_eq`) |
 | `RunarVerification/Stack/TxContext.lean` | 0 | Concrete BIP-143 context/preimage model; no companion assumptions |
-| `RunarVerification/Stack/StatefulBridge.lean` | 1 | **WS0a/T8 (2026-05-30):** the BIP-143 preimage⟷signature bridge `checkPreimage_iff_checkSig_under_validTxContext` — a preserved CRYPTO assumption (sibling of `authBackend` / `preimageBackend`), NOT codegen-soundness. Under a valid BIP-143 context it equates the PREIMAGE backend's `checkPreimage preimage` with the AUTH backend's synthetic-key `checkSig sig pk` (the `OP_CHECKSIGVERIFY` against `G` the stateful prologue performs). It RETIRES the §11.6 split-backend wall and powers the genuine theorem `statefulPrologue_successAgrees_under_validTxContext`. See "BIP-143 Preimage⟷Signature Bridge" above |
-| `RunarVerification/Pipeline.lean` | 2 | 2 O1 per-family sub-omnibus axioms (crypto-call, loop). **(2026-06-08) retired the dispatch sub-omnibus** `compileSafe_observational_correct_modulo_dispatch_codegen` (3 → 2 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_dispatch_consume` for the canonical multi-public passthrough fragment (`dispatchConsumeShapeBool`, 2–17 public single-param passthrough methods, each lowering to the EMPTY op list), composing the wave-69 D1 selection theorem `merkle_dispatch_selection_correct` with the new multi-public shape lemma `peepholeProgram_multi_public_shape`; residual multi-public programs fall to the sound crypto_call fallback; net −1. **(2026-06-08) retired the stateful sub-omnibus** `compileSafe_observational_correct_modulo_stateful_codegen` (4 → 3 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_stateful_consume` for the single-public canonical gated-prologue fragment (`AgreesStateful.statefulConsumeShapeBool`), composing the constant-lowering reduction, the runtime walk, the M3 peephole-identity, the M4 concrete parse round-trip, and the pre-existing BIP-143 bridge axiom; residual stateful bodies fall to the sound crypto_call fallback; net −1. The harness omnibus `compileSafe_observational_correct_modulo_codegen_axioms` is a `theorem` (not an axiom) that dispatches into these. **WS0a/T8 (2026-05-30) retired the D2.b state-output axiom** `auto_state_output_at_method_exit_correct` — it was UNSOUND as stated (ANF `.addOutput` appends to `State.outputs`; Stack `runOps` leaves `StackState.outputs` empty), now a `theorem` restated via `OutputTrace.applyTrace` and proved from `AgreesD2.statefulEpilogue_outputs_agree`; it had no proof-term consumers, so net −1. **Wave 69 (2026-05-24) retired the D1 dispatch-selection axiom** `merkle_dispatch_selection_correct` — now a `theorem` proved from the wave-69a substrate (`parseScript_emitDispatch_eq_dispatchReconL` + `dispatchReconOps_select_branch`); it had no proof-term consumers, so net −1. **Wave 39 (2026-05-23) retired the arith sub-omnibus** `compileSafe_observational_correct_modulo_arith_codegen` (9 → 8 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_arith_consume`. **Wave 45 (2026-05-23) retired the if_val sub-omnibus** `compileSafe_observational_correct_modulo_if_val_codegen` (8 → 7 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_ifval_consume`. **Wave 51 (2026-05-23) retired the math_byte sub-omnibus** `compileSafe_observational_correct_modulo_math_byte_call_codegen` (7 → 6 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_mathByte_consume` for the NO-LEN single-arg math_byte fragment; residual `len`/`OP_NIP`, 2-arg, and consume-mode bodies fall to the sound crypto_call fallback; net −1. **Wave 64 (2026-05-23) retired the update_prop sub-omnibus** `compileSafe_observational_correct_modulo_update_prop_codegen` (6 → 5 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_updateProp_consume` for the canonical `prop ± small-const ; update_prop` consume fragment; net −1. **Wave 66 (2026-05-24) retired the method_call sub-omnibus** `compileSafe_observational_correct_modulo_method_call_codegen` (5 → 4 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_methodCall_consume` for the param-passthrough method_call fragment; residual non-passthrough method_call bodies fall to the sound crypto_call fallback; net −1 |
+| `RunarVerification/Stack/StatefulBridge.lean` | 1 | **WS0a/T8 (2026-05-30), TIGHTENED 2026-06-10:** the BIP-143 witness-existence axiom `exists_checkSig_witness_under_validTxContext` — a preserved CRYPTO assumption (sibling of `authBackend` / `preimageBackend`), NOT codegen-soundness. For every valid BIP-143 context it asserts ∃ sig with `authBackend.checkSig sig stG = Crypto.checkPreimage (buildPreimage ctx)` (the synthetic key `G` = `StatefulBridge.stG`). The PREVIOUS shape (`checkPreimage_iff_checkSig_under_validTxContext`) stated that equality for UNIVERSALLY quantified `sig pk`, which forced `authBackend.checkSig` to be a CONSTANT function — false under the real-ECDSA reading; it was tightened 2026-06-10 (count-neutral). The per-deployment agreement for the spender's specific `_opPushTxSig` witness is now the `hSig` HYPOTHESIS of `statefulPrologue_successAgrees_under_validTxContext` and of the keyed `hStatefulFrag` omnibus premise (harness-discharged); the existence axiom's role is anti-vacuity — it supplies the `Classical.choose` witness the smokes fire on. See "BIP-143 Preimage⟷Signature Bridge" above |
+| `RunarVerification/Pipeline.lean` | 2 | 2 O1 per-family sub-omnibus axioms (crypto-call, loop). **(2026-06-08) retired the dispatch sub-omnibus** `compileSafe_observational_correct_modulo_dispatch_codegen` (3 → 2 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_dispatch_consume` for the canonical multi-public passthrough fragment (`dispatchConsumeShapeBool`, 2–17 public single-param passthrough methods, each lowering to the EMPTY op list), composing the wave-69 D1 selection theorem `merkle_dispatch_selection_correct` with the new multi-public shape lemma `peepholeProgram_multi_public_shape`; residual multi-public programs fall to the sound crypto_call fallback; net −1. **(2026-06-08) retired the stateful sub-omnibus** `compileSafe_observational_correct_modulo_stateful_codegen` (4 → 3 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_stateful_consume` for the single-public canonical gated-prologue fragment (`AgreesStateful.statefulConsumeShapeBool`), composing the constant-lowering reduction, the runtime walk, the M3 peephole-identity, the M4 concrete parse round-trip, and the keyed `hStatefulFrag` sig-provenance hypothesis (TIGHTENED 2026-06-10 — formerly the universal BIP-143 bridge axiom, which forced `checkSig` constant; the surviving `StatefulBridge` axiom is the witness-existence form powering the smoke); residual stateful bodies fall to the sound crypto_call fallback; net −1. The harness omnibus `compileSafe_observational_correct_modulo_codegen_axioms` is a `theorem` (not an axiom) that dispatches into these. **WS0a/T8 (2026-05-30) retired the D2.b state-output axiom** `auto_state_output_at_method_exit_correct` — it was UNSOUND as stated (ANF `.addOutput` appends to `State.outputs`; Stack `runOps` leaves `StackState.outputs` empty), now a `theorem` restated via `OutputTrace.applyTrace` and proved from `AgreesD2.statefulEpilogue_outputs_agree`; it had no proof-term consumers, so net −1. **Wave 69 (2026-05-24) retired the D1 dispatch-selection axiom** `merkle_dispatch_selection_correct` — now a `theorem` proved from the wave-69a substrate (`parseScript_emitDispatch_eq_dispatchReconL` + `dispatchReconOps_select_branch`); it had no proof-term consumers, so net −1. **Wave 39 (2026-05-23) retired the arith sub-omnibus** `compileSafe_observational_correct_modulo_arith_codegen` (9 → 8 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_arith_consume`. **Wave 45 (2026-05-23) retired the if_val sub-omnibus** `compileSafe_observational_correct_modulo_if_val_codegen` (8 → 7 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_ifval_consume`. **Wave 51 (2026-05-23) retired the math_byte sub-omnibus** `compileSafe_observational_correct_modulo_math_byte_call_codegen` (7 → 6 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_mathByte_consume` for the NO-LEN single-arg math_byte fragment; residual `len`/`OP_NIP`, 2-arg, and consume-mode bodies fall to the sound crypto_call fallback; net −1. **Wave 64 (2026-05-23) retired the update_prop sub-omnibus** `compileSafe_observational_correct_modulo_update_prop_codegen` (6 → 5 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_updateProp_consume` for the canonical `prop ± small-const ; update_prop` consume fragment; net −1. **Wave 66 (2026-05-24) retired the method_call sub-omnibus** `compileSafe_observational_correct_modulo_method_call_codegen` (5 → 4 sub-omnibuses): its branch is discharged by the theorem `compileSafe_observational_correct_methodCall_consume` for the param-passthrough method_call fragment; residual non-passthrough method_call bodies fall to the sound crypto_call fallback; net −1 |
 
 Tier B11 (2026-05-16) replaced the `buildChangeOutput` and
 `computeStateOutput` axioms with concrete `def`s and exposed them —
@@ -834,23 +838,67 @@ environment-provided. Lean code generation uses a fail-fast backend via
 `implemented_by`, so execution aborts instead of accepting the previous
 unconditional success behavior.
 
-## BIP-143 Preimage⟷Signature Bridge (the single new crypto axiom, WS0a/T8)
+## BIP-143 Preimage⟷Signature Bridge (the single bridge crypto axiom, WS0a/T8 — TIGHTENED 2026-06-10)
 
 `RunarVerification/Stack/StatefulBridge.lean` carries exactly one axiom,
-`checkPreimage_iff_checkSig_under_validTxContext`. It is a **preserved
-CRYPTO assumption** — a sibling of the `AuthBackend` / `PreimageBackend`
-existence assumptions above, NOT a codegen-soundness axiom — and it RETIRES
-the §11.6 split-backend wall for the auto-injected stateful prologue.
+`exists_checkSig_witness_under_validTxContext`. It is a **preserved CRYPTO
+assumption** — a sibling of the `AuthBackend` / `PreimageBackend` existence
+assumptions above, NOT a codegen-soundness axiom — and it (together with the
+per-deployment `hSig` provenance hypothesis described below) RETIRES the
+§11.6 split-backend wall for the auto-injected stateful prologue.
 
-Statement: for any `TxContext ctx` with `ValidTxContext ctx` and any
-`sig pk preimage : ByteArray` with `preimage = TxContext.buildPreimage ctx`,
+Statement: for any `TxContext ctx` with `ValidTxContext ctx`,
 
 ```
-Crypto.checkPreimage preimage = Crypto.authBackend.checkSig sig pk
+∃ sig : ByteArray,
+  Crypto.authBackend.checkSig sig stG
+    = Crypto.checkPreimage (TxContext.buildPreimage ctx)
 ```
 
-Why it is needed. The stateful prologue is checked through two DIFFERENT
-backends with DIFFERENT abort semantics:
+where `stG` (defined in the same file; `AgreesStateful.stG` is a definitional
+alias) is the compiler's synthetic key — the secp256k1 generator `G` in
+compressed SEC form, byte-identical to the constant
+`Lower.lowerCheckPreimageOpsLive` pushes.
+
+**History (the tightening).** The original 2026-05-30 shape,
+`checkPreimage_iff_checkSig_under_validTxContext`, asserted
+`Crypto.checkPreimage preimage = authBackend.checkSig sig pk` for
+UNIVERSALLY quantified `sig pk : ByteArray`. For any one valid context this
+pinned `authBackend.checkSig sig pk` to the SAME boolean for ALL `(sig, pk)`
+pairs — the axiom forced the auth backend to be a CONSTANT function. That is
+consistent in-model (both backends are opaque axioms) but cryptographically
+unfaithful: for real ECDSA some signatures verify and others do not, so the
+assumption's real-world reading is FALSE. The TCB must not contain an
+assumption that is false under its intended reading; it was tightened on
+2026-06-10, count-neutral (one axiom out, one in).
+
+The tightened existential is TRUE under the real-ECDSA reading: the synthetic
+key is `G`, whose discrete log (1) is public, so every spender can construct
+the deterministic ECDSA signature over the BIP-143 digest — a verifying
+witness when the preimage backend accepts the canonical preimage; when it
+rejects, any non-signature byte-string is a non-verifying witness. Either way
+the existential holds, and it constrains NOTHING about `checkSig` away from
+the witness — the backend is free to be non-constant.
+
+**The per-deployment provenance hypothesis.** The agreement for the SPECIFIC
+`_opPushTxSig` witness the spender supplies is no longer an axiom; it is the
+hypothesis
+
+```
+hSig : Crypto.authBackend.checkSig sig stG = Crypto.checkPreimage preimage
+```
+
+of `statefulPrologue_successAgrees_under_validTxContext`, of
+`Pipeline.compileSafe_observational_correct_stateful_consume`, and (as one
+new conjunct) of the keyed `hStatefulFrag` premise in both omnibus
+signatures. Like the other keyed entry bundles it is discharged per fixture
+by the conformance harness from the deployment context — "the spender's
+witness verifies against the synthetic key exactly when the preimage backend
+accepts" — and the existence axiom shows the bundle satisfiable for every
+valid context (the smokes discharge it by `Classical.choose`).
+
+Why a bridge is needed at all. The stateful prologue is checked through two
+DIFFERENT backends with DIFFERENT abort semantics:
 
 * **ANF side** (`ANF/Eval.lean:2186`). The auto-injected
   `_cp0 := check_preimage(pre)` binding runs the PREIMAGE backend and
@@ -865,25 +913,30 @@ backends with DIFFERENT abort semantics:
   ABORTS with `.assertFailed` unless `authBackend.checkSig sig pk = true`.
 
 So the prologue's success bit is `Crypto.checkPreimage bytes` on the ANF
-side (folding in `assert _cp0`) and `authBackend.checkSig sig pk` on the
+side (folding in `assert _cp0`) and `authBackend.checkSig sig stG` on the
 Stack side. These agree only under a BIP-143/ECDSA fact about the two
 external primitives. Both backends are opaque in this development, so the
-agreement is ASSUMED, not derived — exactly as "ECDSA satisfies EUF-CMA" is
-assumed. It is intended and permanent (NOT slated for discharge); it
-REPLACES a codegen-soundness obligation (the stateful sub-omnibus's
-documented split-backend blocker) with one external-crypto assumption.
+agreement cannot be derived: the witness EXISTENCE is assumed (the axiom,
+intended and permanent — exactly as "ECDSA satisfies EUF-CMA" is assumed),
+and the per-witness agreement is a harness-discharged hypothesis. Together
+they REPLACE a codegen-soundness obligation (the stateful sub-omnibus's
+documented split-backend blocker) without forcing the auth backend constant.
 
-The genuine theorem it powers,
-`statefulPrologue_successAgrees_under_validTxContext`, composes this bridge
-with the wave-65 `AgreesD2` ANF substrate
+The genuine theorem this powers,
+`statefulPrologue_successAgrees_under_validTxContext`, composes the `hSig`
+provenance hypothesis with the wave-65 `AgreesD2` ANF substrate
 (`evalBindingsP_statefulPrologue_reduces`) and the Phase-E Stack lemma
 `runOpcode_CHECKSIGVERIFY_ValidTxContext` to prove the gated-ANF
 stateful-prologue success bit ↔ the Stack `OP_CHECKSIGVERIFY` success bit.
-`#print axioms` on that theorem lists only `propext` / `Classical.choice` /
-`Quot.sound` + this bridge + the pre-existing `authBackend` /
-`preimageBackend`; NO `sorryAx`, NO codegen-soundness axiom. In-file smokes
-fire it on the sample valid context (both sides reduce to the SAME
-`authBackend.checkSig` bit — non-vacuous) and exercise the gated-ANF abort.
+`#print axioms` on that theorem (and on the Pipeline consume theorem) lists
+only `propext` / `Classical.choice` / `Quot.sound` + the pre-existing
+`authBackend` / `preimageBackend` (+ `hashBackend` via the pipeline); NO
+`sorryAx`, NO codegen-soundness axiom — the bridge content rides the
+hypothesis. The in-file smokes and `Pipeline.smoke_stateful_consume_fires`
+additionally list `exists_checkSig_witness_under_validTxContext` (they
+obtain the witness by `Classical.choose`), fire on the sample valid context
+(both sides reduce to the SAME `authBackend.checkSig` bit — non-vacuous),
+and exercise the gated-ANF abort.
 
 ## Opaque Executable Defaults
 
