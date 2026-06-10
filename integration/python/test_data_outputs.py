@@ -34,7 +34,14 @@ export class DataEmitter extends StatefulSmartContract {
 
     public emit(payload: ByteString) {
         this.counter = this.counter + 1n;
-        this.addDataOutput(0n, payload);
+        // 1 satoshi (not 0): the CI regtest node runs with
+        // acceptnonstdtxn=0 (oracle hardening, PR #49), whose dust policy
+        // rejects 0-satoshi OP_RETURN outputs as "dust" at
+        // sendrawtransaction. A 1-sat data output is still a valid
+        // OP_RETURN data carrier and exercises the same declaration-order
+        // continuation-hash layout. The 0-sat form remains valid on
+        // mainnet/ARC and is covered by the cross-tier conformance suite.
+        this.addDataOutput(1n, payload);
     }
 }
 """
@@ -126,8 +133,8 @@ class TestDataOutputs:
         outs = _parse_outputs(raw_hex)
         assert len(outs) >= 2, f"expected >=2 outputs, got {len(outs)}"
 
-        # Output[1] is the data output: 0 satoshis, exact payload script.
-        assert outs[1][0] == 0
+        # Output[1] is the data output: 1 satoshi, exact payload script.
+        assert outs[1][0] == 1
         assert outs[1][1] == payload
 
     def test_chain_two_emits_accumulates_state(self):
@@ -159,4 +166,4 @@ class TestDataOutputs:
         raw2 = rpc_call("getrawtransaction", t2)
         outs2 = _parse_outputs(raw2)
         assert outs2[1][1] == payload2
-        assert outs2[1][0] == 0
+        assert outs2[1][0] == 1

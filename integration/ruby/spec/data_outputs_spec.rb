@@ -50,7 +50,14 @@ DATA_EMITTER_SOURCE = <<~TS.freeze
 
       public emit(payload: ByteString) {
           this.counter = this.counter + 1n;
-          this.addDataOutput(0n, payload);
+          // 1 satoshi (not 0): the CI regtest node runs with
+          // acceptnonstdtxn=0 (oracle hardening, PR #49), whose dust policy
+          // rejects 0-satoshi OP_RETURN outputs as "dust" at
+          // sendrawtransaction. A 1-sat data output is still a valid
+          // OP_RETURN data carrier and exercises the same declaration-order
+          // continuation-hash layout. The 0-sat form remains valid on
+          // mainnet/ARC and is covered by the cross-tier conformance suite.
+          this.addDataOutput(1n, payload);
       }
   }
 TS

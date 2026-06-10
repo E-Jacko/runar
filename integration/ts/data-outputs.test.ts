@@ -37,7 +37,14 @@ export class DataEmitter extends StatefulSmartContract {
 
     public emit(payload: ByteString) {
         this.counter = this.counter + 1n;
-        this.addDataOutput(0n, payload);
+        // 1 satoshi (not 0): the CI regtest node runs with
+        // acceptnonstdtxn=0 (oracle hardening, PR #49), whose dust policy
+        // rejects 0-satoshi OP_RETURN outputs as "dust" at
+        // sendrawtransaction. A 1-sat data output is still a valid
+        // OP_RETURN data carrier and exercises the same declaration-order
+        // continuation-hash layout. The 0-sat form remains valid on
+        // mainnet/ARC and is covered by the cross-tier conformance suite.
+        this.addDataOutput(1n, payload);
     }
 }
 `;
@@ -64,13 +71,13 @@ describe('DataOutputs (addDataOutput)', () => {
     const rawTxHex = (await rpcCall('getrawtransaction', callTxid)) as string;
     const tx = Transaction.fromHex(rawTxHex);
 
-    // Expected output order: [0]=state, [1]=data (OP_RETURN payload, 0 sats),
+    // Expected output order: [0]=state, [1]=data (OP_RETURN payload, 1 sat),
     // [2]=change (P2PKH). The state-continuation hash must match this exact
     // ordering for the spend to validate on-chain.
     expect(tx.outputs.length).toBeGreaterThanOrEqual(2);
 
     const dataOutput = tx.outputs[1]!;
-    expect(dataOutput.satoshis).toBe(0);
+    expect(dataOutput.satoshis).toBe(1);
     expect(dataOutput.lockingScript.toHex()).toBe(payload);
   });
 
@@ -97,6 +104,6 @@ describe('DataOutputs (addDataOutput)', () => {
     const raw2 = (await rpcCall('getrawtransaction', t2)) as string;
     const tx2 = Transaction.fromHex(raw2);
     expect(tx2.outputs[1]!.lockingScript.toHex()).toBe(payload2);
-    expect(tx2.outputs[1]!.satoshis).toBe(0);
+    expect(tx2.outputs[1]!.satoshis).toBe(1);
   });
 });
