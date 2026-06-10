@@ -1121,6 +1121,39 @@ class LoweringContext {
     return last === undefined || last <= currentIndex;
   }
 
+  /**
+   * Consume-vs-copy decision for one operand of a multi-operand ANF value.
+   *
+   * `operands` is the FULL operand-ref list of the value (including `ref`
+   * itself). The load may consume (ROLL / move) the ref only when this
+   * binding is the ref's last use AND the ref occurs exactly once in the
+   * operand list. A ref that is read at more than one operand position of
+   * the same value must be copied (PICK / DUP) at EVERY position: each
+   * operand position needs its own stack slot, and a consume-mode load of a
+   * ref that is already on top of the stack is a no-op (see `bringToTop`),
+   * so two consume-mode loads of the same ref would leave a single slot for
+   * an opcode that pops one item per operand (e.g. `t := x + x` underflowing
+   * OP_ADD), or — when the ref sits below other live slots — silently pair
+   * the opcode with the wrong slot. The original value then simply stays on
+   * the stack, exactly like any ref whose last use is a later binding.
+   *
+   * Unreachable from the frontend (pass 04 gives every operand a fresh
+   * temp); reachable via `compileFromANF` / CLI `--ir` hand-written ANF.
+   */
+  private operandConsume(
+    ref: string,
+    operands: readonly string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): boolean {
+    if (!this.isLastUse(ref, bindingIndex, lastUses)) return false;
+    let occurrences = 0;
+    for (const o of operands) {
+      if (o === ref) occurrences++;
+    }
+    return occurrences <= 1;
+  }
+
   // -----------------------------------------------------------------------
   // Individual lowering methods
   // -----------------------------------------------------------------------
@@ -1253,12 +1286,12 @@ class LoweringContext {
     resultType?: string,
   ): void {
     // Get left operand to stack first
-    const leftIsLast = this.isLastUse(left, bindingIndex, lastUses);
-    this.bringToTop(left, leftIsLast);
+    const leftConsume = this.operandConsume(left, [left, right], bindingIndex, lastUses);
+    this.bringToTop(left, leftConsume);
 
     // Get right operand to stack
-    const rightIsLast = this.isLastUse(right, bindingIndex, lastUses);
-    this.bringToTop(right, rightIsLast);
+    const rightConsume = this.operandConsume(right, [left, right], bindingIndex, lastUses);
+    this.bringToTop(right, rightConsume);
 
     // Pop both operands (the opcode consumes them)
     this.stackMap.pop();
@@ -1587,8 +1620,8 @@ class LoweringContext {
 
     // General builtin call: push args in order, then emit opcode(s)
     for (const arg of args) {
-      const isLast = this.isLastUse(arg, bindingIndex, lastUses);
-      this.bringToTop(arg, isLast);
+      const consume = this.operandConsume(arg, args, bindingIndex, lastUses);
+      this.bringToTop(arg, consume);
     }
 
     // Pop all args
@@ -1688,10 +1721,14 @@ class LoweringContext {
     this.emitOp({ op: 'push', value: 0n });
     this.stackMap.push(null);
 
+    // A ref repeated across the combined element list (e.g. the same pubkey
+    // twice) must be copied at every position — see operandConsume.
+    const msigOperands = [...sigElems, ...pkElems];
+
     // Bring each sig element to TOS in declaration order (sig1, sig2, ...).
     for (const sig of sigElems) {
-      const isLast = this.isLastUse(sig, bindingIndex, lastUses);
-      this.bringToTop(sig, isLast);
+      const consume = this.operandConsume(sig, msigOperands, bindingIndex, lastUses);
+      this.bringToTop(sig, consume);
     }
 
     // Push nSigs.
@@ -1700,8 +1737,8 @@ class LoweringContext {
 
     // Bring each pubkey element to TOS in declaration order (pk1, pk2, ...).
     for (const pk of pkElems) {
-      const isLast = this.isLastUse(pk, bindingIndex, lastUses);
-      this.bringToTop(pk, isLast);
+      const consume = this.operandConsume(pk, msigOperands, bindingIndex, lastUses);
+      this.bringToTop(pk, consume);
     }
 
     // Push nPKs.
@@ -1775,8 +1812,8 @@ class LoweringContext {
       if (i < method.params.length) {
         const arg = args[i]!;
         const paramName = method.params[i]!.name;
-        const isLast = this.isLastUse(arg, bindingIndex, lastUses);
-        this.bringToTop(arg, isLast);
+        const consume = this.operandConsume(arg, args, bindingIndex, lastUses);
+        this.bringToTop(arg, consume);
         this.stackMap.pop();
 
         // If paramName already exists on the stack, temporarily rename
@@ -2286,8 +2323,9 @@ class LoweringContext {
     const stateBytesRef = args[1]!;
 
     // Bring stateBytes to stack first.
-    const stateLast = this.isLastUse(stateBytesRef, bindingIndex, lastUses);
-    this.bringToTop(stateBytesRef, stateLast);
+    const stateConsume = this.operandConsume(
+      stateBytesRef, [preimageRef, stateBytesRef], bindingIndex, lastUses);
+    this.bringToTop(stateBytesRef, stateConsume);
 
     // Extract amount from preimage for the continuation output.
     // We still need the amount from the current UTXO. Extract from preimage:
@@ -2295,8 +2333,9 @@ class LoweringContext {
     // Since the varint+scriptCode length varies, use end-relative:
     // Last 44 bytes = nSeq(4) + hashOutputs(32) + nLocktime(4) + sighashType(4).
     // Amount(8) is right before that.
-    const preLast = this.isLastUse(preimageRef, bindingIndex, lastUses);
-    this.bringToTop(preimageRef, preLast);
+    const preConsume = this.operandConsume(
+      preimageRef, [preimageRef, stateBytesRef], bindingIndex, lastUses);
+    this.bringToTop(preimageRef, preConsume);
 
     // Extract amount: last 52 bytes, take 8 bytes at offset 0.
     this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
@@ -2404,15 +2443,17 @@ class LoweringContext {
     const stateBytesRef = args[1]!;
     const newAmountRef = args[2]!;
 
+    const csoOperands = [preimageRef, stateBytesRef, newAmountRef];
+
     // Consume preimage ref (no longer needed — we use _codePart and _newAmount).
-    const preLast = this.isLastUse(preimageRef, bindingIndex, lastUses);
-    this.bringToTop(preimageRef, preLast);
+    const preConsume = this.operandConsume(preimageRef, csoOperands, bindingIndex, lastUses);
+    this.bringToTop(preimageRef, preConsume);
     this.emitOp({ op: 'drop' });
     this.stackMap.pop();
 
     // Step 1: Convert _newAmount to 8-byte LE and save to altstack.
-    const amountLast = this.isLastUse(newAmountRef, bindingIndex, lastUses);
-    this.bringToTop(newAmountRef, amountLast);
+    const amountConsume = this.operandConsume(newAmountRef, csoOperands, bindingIndex, lastUses);
+    this.bringToTop(newAmountRef, amountConsume);
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -2422,8 +2463,8 @@ class LoweringContext {
     this.stackMap.pop();
 
     // Step 2: Bring stateBytes to stack.
-    const stateLast = this.isLastUse(stateBytesRef, bindingIndex, lastUses);
-    this.bringToTop(stateBytesRef, stateLast);
+    const stateConsume = this.operandConsume(stateBytesRef, csoOperands, bindingIndex, lastUses);
+    this.bringToTop(stateBytesRef, stateConsume);
 
     // Step 3: Bring _codePart to top (PICK — never consume, reused across outputs)
     this.bringToTop('_codePart', false);
@@ -2495,8 +2536,8 @@ class LoweringContext {
     this.stackMap.push(null);
 
     // Push the 20-byte PKH
-    const pkhLast = this.isLastUse(pkhRef, bindingIndex, lastUses);
-    this.bringToTop(pkhRef, pkhLast);
+    const pkhConsume = this.operandConsume(pkhRef, [pkhRef, amountRef], bindingIndex, lastUses);
+    this.bringToTop(pkhRef, pkhConsume);
     // CAT: prefix || pkh
     this.emitOp({ op: 'opcode', code: 'OP_CAT' });
     this.stackMap.pop(); this.stackMap.pop();
@@ -2512,8 +2553,8 @@ class LoweringContext {
     // --- Stack: [..., 0x1976a914{pkh}88ac] ---
 
     // Step 2: Prepend amount as 8-byte LE.
-    const amountLast = this.isLastUse(amountRef, bindingIndex, lastUses);
-    this.bringToTop(amountRef, amountLast);
+    const amountConsume = this.operandConsume(amountRef, [pkhRef, amountRef], bindingIndex, lastUses);
+    this.bringToTop(amountRef, amountConsume);
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -2546,6 +2587,7 @@ class LoweringContext {
     // codePart from the preimage. This is simpler and works with OP_CODESEPARATOR.
 
     const stateProps = this._properties.filter(p => !p.readonly);
+    const outputOperands = [satoshis, ...stateValues];
 
     // Step 1: Bring _codePart to top (PICK — never consume, reused across outputs)
     this.bringToTop('_codePart', false);
@@ -2565,8 +2607,8 @@ class LoweringContext {
       const valueRef = stateValues[i]!;
       const prop = stateProps[i]!;
 
-      const isLast = this.isLastUse(valueRef, bindingIndex, lastUses);
-      this.bringToTop(valueRef, isLast);
+      const consume = this.operandConsume(valueRef, outputOperands, bindingIndex, lastUses);
+      this.bringToTop(valueRef, consume);
 
       // Convert numeric/boolean values to fixed-width bytes.
       // RabinSig / RabinPubKey are bigint aliases and share the 8-byte layout.
@@ -2611,8 +2653,8 @@ class LoweringContext {
     // --- Stack: [..., varint+script] ---
 
     // Step 6: Prepend satoshis as 8-byte LE.
-    const isLastSatoshis = this.isLastUse(satoshis, bindingIndex, lastUses);
-    this.bringToTop(satoshis, isLastSatoshis);
+    const satoshisConsume = this.operandConsume(satoshis, outputOperands, bindingIndex, lastUses);
+    this.bringToTop(satoshis, satoshisConsume);
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -2645,8 +2687,9 @@ class LoweringContext {
     lastUses: Map<string, number>,
   ): void {
     // Step 1: Bring scriptBytes to top
-    const scriptIsLast = this.isLastUse(scriptBytes, bindingIndex, lastUses);
-    this.bringToTop(scriptBytes, scriptIsLast);
+    const scriptConsume = this.operandConsume(
+      scriptBytes, [satoshis, scriptBytes], bindingIndex, lastUses);
+    this.bringToTop(scriptBytes, scriptConsume);
 
     // Step 2: Compute varint prefix for script length
     this.emitOp({ op: 'opcode', code: 'OP_SIZE' }); // [script, len]
@@ -2663,8 +2706,9 @@ class LoweringContext {
     this.stackMap.push(null);
 
     // Step 4: Prepend satoshis as 8-byte LE
-    const satIsLast = this.isLastUse(satoshis, bindingIndex, lastUses);
-    this.bringToTop(satoshis, satIsLast);
+    const satConsume = this.operandConsume(
+      satoshis, [satoshis, scriptBytes], bindingIndex, lastUses);
+    this.bringToTop(satoshis, satConsume);
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -3511,11 +3555,11 @@ class LoweringContext {
     if (args.length < 2) throw new Error(`${func} requires 2 arguments`);
     const [a, b] = args as [string, string];
 
-    const aIsLast = this.isLastUse(a, bindingIndex, lastUses);
-    this.bringToTop(a, aIsLast);
+    const aConsume = this.operandConsume(a, args, bindingIndex, lastUses);
+    this.bringToTop(a, aConsume);
 
-    const bIsLast = this.isLastUse(b, bindingIndex, lastUses);
-    this.bringToTop(b, bIsLast);
+    const bConsume = this.operandConsume(b, args, bindingIndex, lastUses);
+    this.bringToTop(b, bConsume);
 
     // Stack: ... a b
     // DUP b, check non-zero, then divide/mod
@@ -3548,11 +3592,11 @@ class LoweringContext {
     if (args.length < 3) throw new Error('clamp requires 3 arguments');
     const [val, lo, hi] = args as [string, string, string];
 
-    const valIsLast = this.isLastUse(val, bindingIndex, lastUses);
-    this.bringToTop(val, valIsLast);
+    const valConsume = this.operandConsume(val, args, bindingIndex, lastUses);
+    this.bringToTop(val, valConsume);
 
-    const loIsLast = this.isLastUse(lo, bindingIndex, lastUses);
-    this.bringToTop(lo, loIsLast);
+    const loConsume = this.operandConsume(lo, args, bindingIndex, lastUses);
+    this.bringToTop(lo, loConsume);
 
     // Stack: ... val lo → OP_MAX → max(val, lo)
     this.stackMap.pop();
@@ -3560,8 +3604,8 @@ class LoweringContext {
     this.emitOp({ op: 'opcode', code: 'OP_MAX' });
     this.stackMap.push(null); // intermediate
 
-    const hiIsLast = this.isLastUse(hi, bindingIndex, lastUses);
-    this.bringToTop(hi, hiIsLast);
+    const hiConsume = this.operandConsume(hi, args, bindingIndex, lastUses);
+    this.bringToTop(hi, hiConsume);
 
     // Stack: ... max(val,lo) hi → OP_MIN → min(max(val,lo), hi)
     this.stackMap.pop();
@@ -3586,11 +3630,11 @@ class LoweringContext {
     if (args.length < 2) throw new Error('pow requires 2 arguments');
     const [base, exp] = args as [string, string];
 
-    const baseIsLast = this.isLastUse(base, bindingIndex, lastUses);
-    this.bringToTop(base, baseIsLast);
+    const baseConsume = this.operandConsume(base, args, bindingIndex, lastUses);
+    this.bringToTop(base, baseConsume);
 
-    const expIsLast = this.isLastUse(exp, bindingIndex, lastUses);
-    this.bringToTop(exp, expIsLast);
+    const expConsume = this.operandConsume(exp, args, bindingIndex, lastUses);
+    this.bringToTop(exp, expConsume);
 
     this.stackMap.pop(); // exp
     this.stackMap.pop(); // base
@@ -3669,18 +3713,18 @@ class LoweringContext {
     if (args.length < 3) throw new Error('mulDiv requires 3 arguments');
     const [a, b, c] = args as [string, string, string];
 
-    const aIsLast = this.isLastUse(a, bindingIndex, lastUses);
-    this.bringToTop(a, aIsLast);
-    const bIsLast = this.isLastUse(b, bindingIndex, lastUses);
-    this.bringToTop(b, bIsLast);
+    const aConsume = this.operandConsume(a, args, bindingIndex, lastUses);
+    this.bringToTop(a, aConsume);
+    const bConsume = this.operandConsume(b, args, bindingIndex, lastUses);
+    this.bringToTop(b, bConsume);
 
     this.stackMap.pop();
     this.stackMap.pop();
     this.emitOp({ op: 'opcode', code: 'OP_MUL' });
     this.stackMap.push(null);
 
-    const cIsLast = this.isLastUse(c, bindingIndex, lastUses);
-    this.bringToTop(c, cIsLast);
+    const cConsume = this.operandConsume(c, args, bindingIndex, lastUses);
+    this.bringToTop(c, cConsume);
 
     this.stackMap.pop();
     this.stackMap.pop();
@@ -3703,10 +3747,10 @@ class LoweringContext {
     if (args.length < 2) throw new Error('percentOf requires 2 arguments');
     const [amount, bps] = args as [string, string];
 
-    const amountIsLast = this.isLastUse(amount, bindingIndex, lastUses);
-    this.bringToTop(amount, amountIsLast);
-    const bpsIsLast = this.isLastUse(bps, bindingIndex, lastUses);
-    this.bringToTop(bps, bpsIsLast);
+    const amountConsume = this.operandConsume(amount, args, bindingIndex, lastUses);
+    this.bringToTop(amount, amountConsume);
+    const bpsConsume = this.operandConsume(bps, args, bindingIndex, lastUses);
+    this.bringToTop(bps, bpsConsume);
 
     this.stackMap.pop();
     this.stackMap.pop();
@@ -3796,10 +3840,10 @@ class LoweringContext {
     if (args.length < 2) throw new Error('gcd requires 2 arguments');
     const [a, b] = args as [string, string];
 
-    const aIsLast = this.isLastUse(a, bindingIndex, lastUses);
-    this.bringToTop(a, aIsLast);
-    const bIsLast = this.isLastUse(b, bindingIndex, lastUses);
-    this.bringToTop(b, bIsLast);
+    const aConsume = this.operandConsume(a, args, bindingIndex, lastUses);
+    this.bringToTop(a, aConsume);
+    const bConsume = this.operandConsume(b, args, bindingIndex, lastUses);
+    this.bringToTop(b, bConsume);
 
     this.stackMap.pop();
     this.stackMap.pop();
@@ -3855,10 +3899,10 @@ class LoweringContext {
     if (args.length < 2) throw new Error('divmod requires 2 arguments');
     const [a, b] = args as [string, string];
 
-    const aIsLast = this.isLastUse(a, bindingIndex, lastUses);
-    this.bringToTop(a, aIsLast);
-    const bIsLast = this.isLastUse(b, bindingIndex, lastUses);
-    this.bringToTop(b, bIsLast);
+    const aConsume = this.operandConsume(a, args, bindingIndex, lastUses);
+    this.bringToTop(a, aConsume);
+    const bConsume = this.operandConsume(b, args, bindingIndex, lastUses);
+    this.bringToTop(b, bConsume);
 
     this.stackMap.pop();
     this.stackMap.pop();
@@ -4009,12 +4053,12 @@ class LoweringContext {
     const [data, len] = args as [string, string];
 
     // Push data onto the stack
-    const dataIsLast = this.isLastUse(data, bindingIndex, lastUses);
-    this.bringToTop(data, dataIsLast);
+    const dataConsume = this.operandConsume(data, args, bindingIndex, lastUses);
+    this.bringToTop(data, dataConsume);
 
     // Push len onto the stack
-    const lenIsLast = this.isLastUse(len, bindingIndex, lastUses);
-    this.bringToTop(len, lenIsLast);
+    const lenConsume = this.operandConsume(len, args, bindingIndex, lastUses);
+    this.bringToTop(len, lenConsume);
 
     // Stack: <data> <len>
     this.stackMap.pop(); // len
@@ -4058,7 +4102,7 @@ class LoweringContext {
 
     // Bring all 4 args to the top: msg, sig, padding, pubKey
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
 
     // Pop all 4 args from stack map
@@ -4084,7 +4128,7 @@ class LoweringContext {
       throw new Error('verifyWOTS requires 3 arguments: msg, sig, pubkey');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 3; i++) this.stackMap.pop();
 
@@ -4108,7 +4152,7 @@ class LoweringContext {
       throw new Error('sha256Compress requires 2 arguments: state, block');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 2; i++) this.stackMap.pop();
 
@@ -4128,7 +4172,7 @@ class LoweringContext {
       throw new Error('sha256Finalize requires 3 arguments: state, remaining, msgBitLen');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 3; i++) this.stackMap.pop();
 
@@ -4152,7 +4196,7 @@ class LoweringContext {
       throw new Error('blake3Compress requires 2 arguments: chainingValue, block');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 2; i++) this.stackMap.pop();
 
@@ -4172,7 +4216,7 @@ class LoweringContext {
       throw new Error('blake3Hash requires 1 argument: message');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     this.stackMap.pop();
 
@@ -4197,7 +4241,7 @@ class LoweringContext {
       throw new Error('verifySLHDSA requires 3 arguments: msg, sig, pubkey');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 3; i++) this.stackMap.pop();
 
@@ -4220,7 +4264,7 @@ class LoweringContext {
   ): void {
     // Bring all args to stack top
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < args.length; i++) this.stackMap.pop();
 
@@ -4257,7 +4301,7 @@ class LoweringContext {
   ): void {
     // Bring all args to stack top
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < args.length; i++) this.stackMap.pop();
 
@@ -4292,9 +4336,9 @@ class LoweringContext {
   ): void {
     if (args.length < 3) throw new Error(`${func} requires 3 arguments: msg, sig, pubkey`);
     const [msg, sig, pubkey] = args as [string, string, string];
-    this.bringToTop(msg, this.isLastUse(msg, bindingIndex, lastUses));
-    this.bringToTop(sig, this.isLastUse(sig, bindingIndex, lastUses));
-    this.bringToTop(pubkey, this.isLastUse(pubkey, bindingIndex, lastUses));
+    this.bringToTop(msg, this.operandConsume(msg, args, bindingIndex, lastUses));
+    this.bringToTop(sig, this.operandConsume(sig, args, bindingIndex, lastUses));
+    this.bringToTop(pubkey, this.operandConsume(pubkey, args, bindingIndex, lastUses));
     this.stackMap.pop(); // pubkey
     this.stackMap.pop(); // sig
     this.stackMap.pop(); // msg
@@ -4318,7 +4362,7 @@ class LoweringContext {
   ): void {
     // Bring all args to stack top
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < args.length; i++) this.stackMap.pop();
 
@@ -4354,7 +4398,7 @@ class LoweringContext {
   ): void {
     // Bring all args to stack top
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < args.length; i++) this.stackMap.pop();
 
@@ -4393,7 +4437,7 @@ class LoweringContext {
   ): void {
     // Bring all args to stack top
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < args.length; i++) this.stackMap.pop();
 
@@ -4440,7 +4484,7 @@ class LoweringContext {
     }
 
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < args.length; i++) this.stackMap.pop();
 
@@ -4499,7 +4543,7 @@ class LoweringContext {
     // Bring leaf, proof, index to stack top
     for (let i = 0; i < 3; i++) {
       const arg = args[i]!;
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 3; i++) this.stackMap.pop();
 
@@ -4553,7 +4597,7 @@ class LoweringContext {
     // Now bring leaf, proof, index to stack top for the codegen
     for (let i = 0; i < 3; i++) {
       const arg = args[i]!;
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     // Pop the 3 args — the codegen consumes them and produces 1 result
     for (let i = 0; i < 3; i++) this.stackMap.pop();
@@ -4635,12 +4679,12 @@ class LoweringContext {
     const [data, start, length] = args as [string, string, string];
 
     // Push data
-    const dataIsLast = this.isLastUse(data, bindingIndex, lastUses);
-    this.bringToTop(data, dataIsLast);
+    const dataConsume = this.operandConsume(data, args, bindingIndex, lastUses);
+    this.bringToTop(data, dataConsume);
 
     // Push start offset
-    const startIsLast = this.isLastUse(start, bindingIndex, lastUses);
-    this.bringToTop(start, startIsLast);
+    const startConsume = this.operandConsume(start, args, bindingIndex, lastUses);
+    this.bringToTop(start, startConsume);
 
     // Split at start: [left, right]
     this.stackMap.pop(); // start consumed
@@ -4656,8 +4700,8 @@ class LoweringContext {
     this.stackMap.push(rightPart);
 
     // Push length
-    const lenIsLast = this.isLastUse(length, bindingIndex, lastUses);
-    this.bringToTop(length, lenIsLast);
+    const lenConsume = this.operandConsume(length, args, bindingIndex, lastUses);
+    this.bringToTop(length, lenConsume);
 
     // Split at length: [result, remainder]
     this.stackMap.pop(); // length consumed
@@ -4703,12 +4747,12 @@ class LoweringContext {
     const [obj, index] = args as [string, string];
 
     // Push the data (ByteString) onto the stack
-    const objIsLast = this.isLastUse(obj, bindingIndex, lastUses);
-    this.bringToTop(obj, objIsLast);
+    const objConsume = this.operandConsume(obj, args, bindingIndex, lastUses);
+    this.bringToTop(obj, objConsume);
 
     // Push the index onto the stack
-    const indexIsLast = this.isLastUse(index, bindingIndex, lastUses);
-    this.bringToTop(index, indexIsLast);
+    const indexConsume = this.operandConsume(index, args, bindingIndex, lastUses);
+    this.bringToTop(index, indexConsume);
 
     // OP_SPLIT at index: stack = [..., left, right]
     this.stackMap.pop();  // index consumed
