@@ -1,4 +1,5 @@
 import RunarVerification.Stack.StatefulBridge
+import RunarVerification.Stack.Accept
 import RunarVerification.Script.Parse
 import RunarVerification.Script.Emit
 import RunarVerification.Script.EmitCorrect
@@ -229,6 +230,53 @@ theorem runOps_statefulPrologueOps_isSome
   rcases Bool.eq_false_or_eq_true (authBackend.checkSig sigV stG) with h | h <;>
     simp only [h] <;>
     simp [Except.toOption, Option.isSome, runOps]
+
+/-- **The Stack half of the prologue's ACCEPTANCE bit (truthy-top semantics,
+2026-06-11 success-bit repair).**  Running the constant prologue ops on the
+method-entry stack is *accepted* (completes with a truthy top) iff the AUTH
+backend accepts the signature against the synthetic key `G`: on success
+`OP_CHECKSIGVERIFY` pops the sig + key and the (nonempty) preimage bytes are
+left on top — truthy under `asBool?` — while on failure the run errors.
+The nonemptiness premise `hPre` is discharged from
+`buildPreimage`'s structure by the consume theorem (`Pipeline.lean`). -/
+theorem runOps_statefulPrologueOps_scriptAccepts
+    (stkSt : StackState) (preV sigV : ByteArray) (rest : List Value)
+    (hStk : stkSt.stack = .vBytes preV :: .vBytes sigV :: rest)
+    (hPre : 0 < preV.size) :
+    scriptAccepts (runOps statefulPrologueOps stkSt)
+      = authBackend.checkSig sigV stG := by
+  show scriptAccepts (runOps (.opcode "OP_CODESEPARATOR"
+      :: .swap :: .push (.bytes stG) :: .opcode "OP_CHECKSIGVERIFY" :: [])
+      stkSt) = authBackend.checkSig sigV stG
+  unfold runOps
+  rw [stepNonIf_opcode]
+  have hCS : runOpcode "OP_CODESEPARATOR" stkSt = .ok stkSt := rfl
+  rw [hCS]
+  show scriptAccepts (runOps (.swap :: .push (.bytes stG) :: .opcode "OP_CHECKSIGVERIFY" :: [])
+      stkSt) = _
+  unfold runOps
+  rw [stepNonIf_swap]
+  have hSwap : applySwap stkSt
+      = .ok { stkSt with stack := .vBytes sigV :: .vBytes preV :: rest } := by
+    unfold applySwap
+    rw [hStk]
+  rw [hSwap]
+  show scriptAccepts (runOps (.push (.bytes stG) :: .opcode "OP_CHECKSIGVERIFY" :: [])
+      { stkSt with stack := .vBytes sigV :: .vBytes preV :: rest }) = _
+  unfold runOps
+  rw [stepNonIf_push_bytes]
+  show scriptAccepts (runOps (.opcode "OP_CHECKSIGVERIFY" :: [])
+      (StackState.push { stkSt with stack := .vBytes sigV :: .vBytes preV :: rest }
+        (.vBytes stG))) = _
+  unfold runOps
+  rw [stepNonIf_opcode]
+  rw [runOpcode_CHECKSIGVERIFY_reduce
+        (StackState.push { stkSt with stack := .vBytes sigV :: .vBytes preV :: rest }
+          (.vBytes stG))
+        stG sigV (.vBytes preV :: rest) rfl]
+  rcases Bool.eq_false_or_eq_true (authBackend.checkSig sigV stG) with h | h <;>
+    simp only [h] <;>
+    simp [scriptAccepts, topTruthy, asBool?, runOps, hPre]
 
 /-! ## Part 3 — the parse round-trip (M4, fully concrete) -/
 
