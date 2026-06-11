@@ -35,9 +35,17 @@ repositories {
     mavenCentral()
 }
 
+// Lock all configurations so the resolved dependency graph is committed as
+// gradle.lockfile. The Dependency Audit CI workflow scans that lockfile with
+// osv-scanner; regenerate with `gradle dependencies --write-locks` whenever
+// a dependency version changes.
+dependencyLocking {
+    lockAllConfigurations()
+}
+
 dependencies {
     // secp256k1 ECDSA + SHA-256 / RIPEMD-160 / BIP-143 sighash.
-    api("org.bouncycastle:bcprov-jdk18on:1.78")
+    api("org.bouncycastle:bcprov-jdk18on:1.84")
 
     // Frontend-only access to the Rúnar Java compiler so CompileCheck can
     // run parse → validate → expand-fixed-arrays → typecheck without

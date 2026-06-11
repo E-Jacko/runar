@@ -43,7 +43,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          # Must match (or exceed) the `go` directive in the workspace's
+          # go.mod files (currently go 1.26). govulncheck refuses to scan
+          # packages that require a newer Go version than it was built with,
+          # so a stale pin here fails every scan step with "package requires
+          # newer Go version".
+          go-version: '1.26'
           cache: false
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -110,49 +115,40 @@ jobs:
         run: cd integration/python && pip-audit -r requirements.txt
 
   # ---------------------------------------------------------------------------
-  # Java - OWASP Dependency-Check (gradle plugin). The plugin is declared
-  # in compilers/java/build.gradle.kts and packages/runar-java/build.gradle.kts
-  # with failBuildOnCVSS = 7.0 (= HIGH/CRITICAL), which is exactly the
-  # severity gate this workflow promises. MEDIUM/LOW findings still land in
-  # the HTML/JSON report uploaded as a CI artifact.
+  # Java - osv-scanner against committed Gradle dependency lockfiles.
   #
-  # The NVD API key is optional but strongly recommended (anonymous downloads
-  # are heavily throttled and frequently 403 in CI). If NVD_API_KEY is set
-  # in the repo's secrets it's wired through; otherwise the plugin falls back
-  # to anonymous polling and the job is best-effort for that run.
+  # We deliberately do NOT use the OWASP Dependency-Check Gradle plugin here.
+  # Since NVD moved to its API-key model, anonymous NVD database mirroring is
+  # heavily throttled and routinely fails in CI, and this repo has no
+  # NVD_API_KEY secret configured — a dependencyCheckAnalyze job would be
+  # flaky-by-design. osv-scanner queries OSV.dev (which mirrors the GitHub
+  # Advisory Database's Maven ecosystem — the primary advisory source for
+  # JVM dependencies) headlessly, with no API key required.
+  #
+  # Both Gradle projects enable dependencyLocking and commit gradle.lockfile.
+  # With lock state present, Gradle fails any normal build (compile/test in
+  # ci.yml) if build.gradle.kts dependency versions change without
+  # regenerating the lockfile (`gradle dependencies --write-locks`), so the
+  # scanned lockfile cannot silently drift from the real dependency graph.
+  # osv-scanner exits non-zero on any known vulnerability, matching the
+  # fail-on-any-advisory behaviour of the Rust / Python / Ruby jobs above.
   # ---------------------------------------------------------------------------
   java-audit:
-    name: Java - OWASP dep-check
+    name: Java - osv-scanner (Gradle lockfiles)
     runs-on: ubuntu-latest
-    env:
-      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - uses: gradle/actions/setup-gradle@v4
-      - name: Cache OWASP NVD database
-        uses: actions/cache@v4
-        with:
-          path: ~/.gradle/dependency-check-data
-          key: owasp-nvd-${{ runner.os }}-${{ hashFiles('compilers/java/build.gradle.kts', 'packages/runar-java/build.gradle.kts') }}
-          restore-keys: |
-            owasp-nvd-${{ runner.os }}-
+      - name: Install osv-scanner
+        run: |
+          curl -fsSL -o osv-scanner \
+            https://github.com/google/osv-scanner/releases/download/v2.3.8/osv-scanner_linux_amd64
+          chmod +x osv-scanner
+          sudo mv osv-scanner /usr/local/bin/osv-scanner
+          osv-scanner --version
       - name: Scan compilers/java
-        run: cd compilers/java && gradle dependencyCheckAnalyze --no-daemon
+        run: osv-scanner scan --lockfile compilers/java/gradle.lockfile
       - name: Scan packages/runar-java
-        run: cd packages/runar-java && gradle dependencyCheckAnalyze --no-daemon
-      - name: Upload dep-check reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: java-owasp-dep-check-reports
-          path: |
-            compilers/java/build/reports/dependency-check-report.*
-            packages/runar-java/build/reports/dependency-check-report.*
-          if-no-files-found: ignore
+        run: osv-scanner scan --lockfile packages/runar-java/gradle.lockfile
 
   # ---------------------------------------------------------------------------
   # Ruby - bundler-audit (rubysec). Runs against every Gemfile in the repo
