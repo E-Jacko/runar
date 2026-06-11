@@ -6020,6 +6020,210 @@ theorem smoke_stateful_consume_fires :
     RunarVerification.Stack.ValidTxContext.sampleCtx_valid rfl rfl rfl
     stSmokeSig_spec
 
+/-! ## Stateful WIDENED fragment — prologue + state-output epilogue (2026-06-11)
+
+The discharged stateful surface widens from the bare gated prologue to the
+composed prologue+epilogue shape `AgreesStateful.statefulFullBody`
+(decided by `AgreesStateful.statefulFullConsumeShapeBool`): a single-public
+3-param method over a one-mutable-bigint-prop contract whose body is the
+auto-injected entry wrapper followed by the canonical one-state-value
+`add_output` continuation.  The whole method lowers to the CONSTANT
+`AgreesStateful.statefulFullOps`; its deployed bytes parse to the
+structurally distinct `statefulFullParsedOps` (flat varint `OP_IF`s
+reconstruct as `.ifOp`s; int pushes above OP_16 come back as byte pushes —
+handled by the consensus CScriptNum coercion `Eval.asNum?` on
+`OP_LESSTHAN`).  No sub-omnibus axiom appears in the discharge. -/
+
+set_option maxRecDepth 8192 in
+/-- The 4-pass peephole pipeline is the identity on the composed constant
+ops (the flat `OP_IF` chain is named-opcode-only, so `noIfOp` holds and
+no fusable adjacency exists). -/
+theorem peepholeMethodOps_statefulFull :
+    peepholeMethodOps AgreesStateful.statefulFullOps
+      = AgreesStateful.statefulFullOps := by
+  unfold peepholeMethodOps
+  have hNoIf : Peephole.noIfOp AgreesStateful.statefulFullOps := by
+    simp [AgreesStateful.statefulFullOps, AgreesStateful.statefulFullEpilogueOps,
+      Lower.varintEncodingOps, Peephole.noIfOp]
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
+  have hFlat : Peephole.peepholePassAllFlat AgreesStateful.statefulFullOps
+      = AgreesStateful.statefulFullOps := by
+    with_unfolding_all rfl
+  rw [hFlat, Peephole.peepholePostFold_eq_applyPushOne_of_noIfOp _ hNoIf]
+  have hPost : Peephole.applyPushOneSub
+      (Peephole.applyPushOneAdd AgreesStateful.statefulFullOps)
+      = AgreesStateful.statefulFullOps := by
+    with_unfolding_all rfl
+  rw [hPost,
+    Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ hNoIf (by
+      with_unfolding_all rfl),
+    Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIf (by
+      simp +decide [AgreesStateful.statefulFullOps,
+        AgreesStateful.statefulFullEpilogueOps, Lower.varintEncodingOps,
+        Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])]
+
+/-- **Widened stateful consume theorem (prologue + state-output epilogue,
+acceptance bit).**
+
+For a single-public method in the WIDENED canonical fragment, under the
+valid-BIP-143-context entry bundle (preimage param = the canonical
+preimage, runtime stack `[pre, stateVal, sats, sig, codePart]`, the
+`num2binEncode?` readiness facts for the three serialized numbers, the
+`codePart` size bound selecting the 1-byte-varint branch) and the
+per-deployment sig-provenance hypothesis `hSig`, the ANF eval and the
+deployed-bytes run AGREE on the consensus acceptance bit — both are the
+preimage/auth verdict.  On acceptance the deployed run leaves the
+serialized next-state output bytes on top (truthy); the ANF run appends
+the SAME `Output.state` record (`AgreesD2.statefulEpilogue_outputs_agree`
+pins the byte-identity of the appended record). -/
+theorem compileSafe_observational_correct_statefulFull_consume
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (_hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (pre sats stateVal pn : String) (tyS tyV tyP : ANFType)
+    (hParams : anfM.params
+        = [ANFParam.mk sats tyS, ANFParam.mk stateVal tyV, ANFParam.mk pre tyP])
+    (hBody : anfM.body = AgreesStateful.statefulFullBody pre sats stateVal)
+    (hProps : p.properties.filter (fun pp => !pp.readonly)
+        = [{ name := pn, type := .bigint, readonly := false }])
+    (hNames : AgreesStateful.statefulFullNamesOk pre sats stateVal = true)
+    (ctx : TxContext) (sigV preimage cpV sv8 var2 sats8 : ByteArray)
+    (svV satsV : Int)
+    (rest : List RunarVerification.ANF.Eval.Value)
+    (_hValid : ValidTxContext ctx)
+    (hPreLink : preimage = TxContext.buildPreimage ctx)
+    (hAnfPre : initialAnf.resolveRef pre = some (.vBytes preimage))
+    (hAnfSats : initialAnf.resolveRef sats = some (.vBigint satsV))
+    (hAnfSv : initialAnf.resolveRef stateVal = some (.vBigint svV))
+    (hStk : initialStack.stack = .vBytes preimage :: .vBigint svV
+        :: .vBigint satsV :: .vBytes sigV :: .vBytes cpV :: rest)
+    (hSv8 : Stack.num2binEncode? svV 8 = some sv8)
+    (hSv8sz : sv8.size = 8)
+    (hLt : cpV.size + 9 < 253)
+    (hVar : Stack.num2binEncode?
+        ((AgreesStateful.epiAcc cpV sv8).size : Int) 2 = some var2)
+    (hVar2 : 1 ≤ var2.size)
+    (hSats8 : Stack.num2binEncode? satsV 8 = some sats8)
+    (hSig : RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
+          AgreesStateful.stG
+        = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  obtain ⟨hPE, hPC, _hPv1, _hPso, hPO, _hPcp,
+    hSE, hSC, hS2, _hSso, hSO, hSCp, hSA,
+    hVE, hVC, hV2, _hVso, hVO, hVCp, hVA,
+    hPS, hPV, hSV⟩ := AgreesStateful.statefulFullNamesOk_unpack pre sats stateVal hNames
+  have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome
+      = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage := by
+    rw [hBody]
+    exact AgreesStateful.evalBindingsP_statefulFull_isSome_eq p.methods initialAnf
+      pre sats stateVal preimage satsV (.vBigint svV)
+      hAnfPre hAnfSats hAnfSv hSC hS2 hVC hV2
+  obtain ⟨hPubSingleton, _hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hOps : (Lower.lowerMethod p.methods p.properties anfM).ops
+      = AgreesStateful.statefulFullOps :=
+    AgreesStateful.lowerMethod_ops_statefulFull p.methods p.properties anfM
+      pre sats stateVal pn tyS tyV tyP hParams hBody hPublic hProps
+      hPE hPS hPV hPC hPO hSE hVE hSV hSC hVC hSO hVO hVCp hSCp hVA hSA
+  have hPeeped : (peepholedLoweredMethod p anfM).ops
+      = AgreesStateful.statefulFullOps := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = _
+    rw [hOps]
+    exact peepholeMethodOps_statefulFull
+  have hM4 : runParsedBytes bytes initialStack
+      = runOps AgreesStateful.statefulFullParsedOps initialStack := by
+    have hBytes := compileSafe_ok_implies_emitFast p bytes hSafe
+    rw [hBytes]
+    unfold runParsedBytes RunarVerification.Script.Emit.emitFast
+    rw [hPubSingleton]
+    simp only
+    rw [hPeeped, AgreesStateful.parseScript_emitOpsFast_statefulFull]
+  have hPreSize : 0 < preimage.size := by
+    rw [hPreLink]; exact buildPreimage_size_pos ctx
+  have hStack : scriptAccepts
+      (runOps AgreesStateful.statefulFullParsedOps initialStack)
+      = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
+          AgreesStateful.stG :=
+    AgreesStateful.runOps_statefulFullParsedOps_scriptAccepts
+      initialStack preimage sigV cpV sv8 var2 sats8 svV satsV rest
+      hStk hPreSize hSv8 hSv8sz hLt hVar hVar2 hSats8
+  show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome
+      ↔ scriptAccepts (runParsedBytes bytes initialStack) = true
+  rw [hM4, hANF, hStack, hSig]
+
+/-! ### MANDATORY smoke: the WIDENED stateful consume theorem fires
+
+The canonical widened stateful contract `SF` (one mutable bigint prop,
+public `verify(sats, stateVal, pre)` with the composed body), fired
+end-to-end: `compileSafe` accepts it, and on the sample BIP-143 context
+the ANF eval and the deployed-bytes run AGREE on the acceptance bit. -/
+
+private def stfSmokeProg : ANFProgram :=
+  { contractName := "SF",
+    properties := AgreesStateful.smokeFullProps,
+    methods := [AgreesStateful.smokeFullMethod] }
+
+private def stfSmokePreimage : ByteArray :=
+  Stack.TxContext.buildPreimage Stack.TxContext.sampleCtx
+
+private def stfSmokeAnf : State :=
+  { params := [("sats", .vBigint 1000), ("stateVal", .vBigint 7),
+               ("pre", .vBytes stfSmokePreimage)] }
+
+private def stfSmokeCp : ByteArray := ByteArray.mk #[0xAA, 0xBB, 0xCC]
+
+private noncomputable def stfSmokeSig : ByteArray :=
+  Classical.choose
+    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
+      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
+
+private theorem stfSmokeSig_spec :
+    RunarVerification.ANF.Eval.Crypto.authBackend.checkSig stfSmokeSig
+        AgreesStateful.stG
+      = RunarVerification.ANF.Eval.Crypto.checkPreimage stfSmokePreimage :=
+  Classical.choose_spec
+    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
+      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
+
+private noncomputable def stfSmokeStk : StackState :=
+  { stack := [.vBytes stfSmokePreimage, .vBigint 7, .vBigint 1000,
+              .vBytes stfSmokeSig, .vBytes stfSmokeCp] }
+
+/-- SMOKE — `compileSafe` accepts the widened stateful contract and the
+consume theorem fires on the sample-context entry. -/
+theorem smoke_statefulFull_consume_fires :
+    ∃ bytes, compileSafe stfSmokeProg = .ok bytes ∧
+      acceptAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP stfSmokeProg.methods stfSmokeAnf
+          AgreesStateful.smokeFullMethod.body)
+        (runParsedBytes bytes stfSmokeStk) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe stfSmokeProg = .ok b := by
+    have h : (compileSafe stfSmokeProg).toOption.isSome = true := by native_decide
+    cases hc : compileSafe stfSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  exact compileSafe_observational_correct_statefulFull_consume
+    stfSmokeProg AgreesStateful.smokeFullMethod bytes
+    (by simp [stfSmokeProg]) rfl hSafe stfSmokeAnf stfSmokeStk rfl (by decide)
+    "pre" "sats" "stateVal" "count" .bigint .bigint .byteString rfl rfl
+    rfl (by native_decide)
+    Stack.TxContext.sampleCtx stfSmokeSig stfSmokePreimage stfSmokeCp
+    (ByteArray.mk #[7, 0, 0, 0, 0, 0, 0, 0]) (ByteArray.mk #[12, 0])
+    (ByteArray.mk #[0xE8, 0x03, 0, 0, 0, 0, 0, 0])
+    7 1000 []
+    RunarVerification.Stack.ValidTxContext.sampleCtx_valid rfl rfl rfl rfl rfl
+    (by native_decide) (by native_decide) (by native_decide)
+    (by native_decide) (by native_decide) (by native_decide)
+    stfSmokeSig_spec
+
 /-! ## Dispatch sub-omnibus retirement — the multi-public passthrough consume
 
 Discharges the dispatch family's omnibus branch for the CANONICAL
@@ -7179,6 +7383,48 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
               Stack.AgreesStateful.stG
             = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
+    -- **WIDENED stateful consume premise (keyed; 2026-06-11 stateful
+    -- widening).**  For a body in the widened prologue+epilogue fragment
+    -- (decided by `AgreesStateful.statefulFullConsumeShapeBool`) the shape
+    -- witnesses plus the valid-BIP-143-context entry bundle are recovered,
+    -- extended with the epilogue's serialization readiness facts: the
+    -- satoshi / state-value params resolve to ints on the ANF side, the
+    -- runtime stack carries `[pre, stateVal, sats, sig, codePart]`, the
+    -- three `num2binEncode?` encodings exist (8-byte state value, 8-byte
+    -- amount, 2-byte varint source), and the codePart size bound selects
+    -- the 1-byte-varint branch.  Keyed on the DECIDABLE classifier, it is
+    -- VACUOUS for every non-fragment body, so the omnibus stays jointly
+    -- satisfiable.  Its only consumer is the conformance harness, which
+    -- discharges it per fixture from the deployment context.
+    (hStatefulFullFrag :
+      RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
+          p.properties anfM = true →
+        ∃ (pre sats stateVal pn : String) (tyS tyV tyP : ANFType)
+          (ctx : Stack.TxContext)
+          (sigV preimage cpV sv8 var2 sats8 : ByteArray) (svV satsV : Int)
+          (rest : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk sats tyS, ANFParam.mk stateVal tyV,
+            ANFParam.mk pre tyP] ∧
+          anfM.body = Stack.AgreesStateful.statefulFullBody pre sats stateVal ∧
+          p.properties.filter (fun pp => !pp.readonly)
+            = [{ name := pn, type := .bigint, readonly := false }] ∧
+          Stack.AgreesStateful.statefulFullNamesOk pre sats stateVal = true ∧
+          Stack.ValidTxContext ctx ∧
+          preimage = Stack.TxContext.buildPreimage ctx ∧
+          initialAnf.resolveRef pre = some (.vBytes preimage) ∧
+          initialAnf.resolveRef sats = some (.vBigint satsV) ∧
+          initialAnf.resolveRef stateVal = some (.vBigint svV) ∧
+          initialStack.stack = .vBytes preimage :: .vBigint svV
+            :: .vBigint satsV :: .vBytes sigV :: .vBytes cpV :: rest ∧
+          Stack.num2binEncode? svV 8 = some sv8 ∧ sv8.size = 8 ∧
+          cpV.size + 9 < 253 ∧
+          Stack.num2binEncode?
+            ((Stack.AgreesStateful.epiAcc cpV sv8).size : Int) 2 = some var2 ∧
+          1 ≤ var2.size ∧
+          Stack.num2binEncode? satsV 8 = some sats8 ∧
+          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
+              Stack.AgreesStateful.stG
+            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
     -- **Dispatch consume premise (keyed).**  For a multi-public program in the
     -- canonical passthrough fragment (decided by `dispatchConsumeShapeBool`)
     -- the entry bundle is recovered: the unlocking caller pushed the selector
@@ -7251,20 +7497,39 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
         rw [ha] at hAnfMem ⊢
         have : anfM = a := by simpa using hAnfMem
         rw [this]
-      by_cases hStShape :
-          RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true
-      · by_cases hStName : anfM.name ≠ "constructor"
-        · obtain ⟨pre, ty, ctx, sigV, preimage, restV, hStParams, hStBody,
-            hStNe1, hStNe2, hStValid, hStPreLink, hStAnfPre, hStStk, hStSig⟩ :=
-            hStatefulFrag hStShape
-          exact compileSafe_observational_correct_stateful_consume
+      -- WIDENED fragment first: prologue + state-output epilogue.
+      by_cases hStFullShape :
+          RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
+            p.properties anfM = true
+      · by_cases hStFullName : anfM.name ≠ "constructor"
+        · obtain ⟨preF, satsF, stateValF, pnF, tySF, tyVF, tyPF, ctxF, sigVF,
+            preimageF, cpVF, sv8F, var2F, sats8F, svVF, satsVF, restF,
+            hFParams, hFBody, hFProps, hFNames, hFValid, hFPreLink, hFAnfPre,
+            hFAnfSats, hFAnfSv, hFStk, hFSv8, hFSv8sz, hFLt, hFVar, hFVar2,
+            hFSats8, hFSig⟩ := hStatefulFullFrag hStFullShape
+          exact compileSafe_observational_correct_statefulFull_consume
             p anfM bytes hMem hPublic hSafe initialAnf initialStack
-            hStSingle hStName pre ty hStParams hStBody hStNe1 hStNe2
-            ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk hStSig
+            hStSingle hStFullName preF satsF stateValF pnF tySF tyVF tyPF
+            hFParams hFBody hFProps hFNames ctxF sigVF preimageF cpVF sv8F
+            var2F sats8F svVF satsVF restF hFValid hFPreLink hFAnfPre
+            hFAnfSats hFAnfSv hFStk hFSv8 hFSv8sz hFLt hFVar hFVar2
+            hFSats8 hFSig
         · exact compileSafe_observational_correct_modulo_crypto_call_codegen
             p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
-      · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+      · by_cases hStShape :
+            RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true
+        · by_cases hStName : anfM.name ≠ "constructor"
+          · obtain ⟨pre, ty, ctx, sigV, preimage, restV, hStParams, hStBody,
+              hStNe1, hStNe2, hStValid, hStPreLink, hStAnfPre, hStStk, hStSig⟩ :=
+              hStatefulFrag hStShape
+            exact compileSafe_observational_correct_stateful_consume
+              p anfM bytes hMem hPublic hSafe initialAnf initialStack
+              hStSingle hStName pre ty hStParams hStBody hStNe1 hStNe2
+              ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk hStSig
+          · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+        · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
   · by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
     · -- **Dispatch consume branch (replaces the retired dispatch axiom).**
       -- The decidable `dispatchConsumeShapeBool` classifier peels the
@@ -7614,6 +7879,48 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
               Stack.AgreesStateful.stG
             = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
+    -- **WIDENED stateful consume premise (keyed; 2026-06-11 stateful
+    -- widening).**  For a body in the widened prologue+epilogue fragment
+    -- (decided by `AgreesStateful.statefulFullConsumeShapeBool`) the shape
+    -- witnesses plus the valid-BIP-143-context entry bundle are recovered,
+    -- extended with the epilogue's serialization readiness facts: the
+    -- satoshi / state-value params resolve to ints on the ANF side, the
+    -- runtime stack carries `[pre, stateVal, sats, sig, codePart]`, the
+    -- three `num2binEncode?` encodings exist (8-byte state value, 8-byte
+    -- amount, 2-byte varint source), and the codePart size bound selects
+    -- the 1-byte-varint branch.  Keyed on the DECIDABLE classifier, it is
+    -- VACUOUS for every non-fragment body, so the omnibus stays jointly
+    -- satisfiable.  Its only consumer is the conformance harness, which
+    -- discharges it per fixture from the deployment context.
+    (hStatefulFullFrag :
+      RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
+          p.properties anfM = true →
+        ∃ (pre sats stateVal pn : String) (tyS tyV tyP : ANFType)
+          (ctx : Stack.TxContext)
+          (sigV preimage cpV sv8 var2 sats8 : ByteArray) (svV satsV : Int)
+          (rest : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk sats tyS, ANFParam.mk stateVal tyV,
+            ANFParam.mk pre tyP] ∧
+          anfM.body = Stack.AgreesStateful.statefulFullBody pre sats stateVal ∧
+          p.properties.filter (fun pp => !pp.readonly)
+            = [{ name := pn, type := .bigint, readonly := false }] ∧
+          Stack.AgreesStateful.statefulFullNamesOk pre sats stateVal = true ∧
+          Stack.ValidTxContext ctx ∧
+          preimage = Stack.TxContext.buildPreimage ctx ∧
+          initialAnf.resolveRef pre = some (.vBytes preimage) ∧
+          initialAnf.resolveRef sats = some (.vBigint satsV) ∧
+          initialAnf.resolveRef stateVal = some (.vBigint svV) ∧
+          initialStack.stack = .vBytes preimage :: .vBigint svV
+            :: .vBigint satsV :: .vBytes sigV :: .vBytes cpV :: rest ∧
+          Stack.num2binEncode? svV 8 = some sv8 ∧ sv8.size = 8 ∧
+          cpV.size + 9 < 253 ∧
+          Stack.num2binEncode?
+            ((Stack.AgreesStateful.epiAcc cpV sv8).size : Int) 2 = some var2 ∧
+          1 ≤ var2.size ∧
+          Stack.num2binEncode? satsV 8 = some sats8 ∧
+          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
+              Stack.AgreesStateful.stG
+            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
     -- **Dispatch consume premise (keyed).**  For a multi-public program in the
     -- canonical passthrough fragment (decided by `dispatchConsumeShapeBool`)
     -- the entry bundle is recovered: the unlocking caller pushed the selector
@@ -7644,7 +7951,8 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
     hNoLoop Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
-    hMethodCallFrag hHashCallFrag hStatefulFrag hDispatchFrag hValueTruthy hCoh
+    hMethodCallFrag hHashCallFrag hStatefulFrag hStatefulFullFrag hDispatchFrag
+    hValueTruthy hCoh
 
 
 end Soundness

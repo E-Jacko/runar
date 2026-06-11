@@ -1634,8 +1634,11 @@ consumes the value's stack slot, applies the type-aware width prefix,
 then OP_CATs onto the accumulator (which is below the value on the
 runtime stack but unnamed in the stack map — we model it with a
 single `_acc` placeholder pushed by the caller).
+
+(De-`private`d 2026-06-11 so the stateful-widening lowering reduction in
+`Stack/AgreesStateful.lean` can unfold it by name — no semantic change.)
 -/
-private def addOutputStateValuesLive (currentIndex : Nat)
+def addOutputStateValuesLive (currentIndex : Nat)
     (lastUses : List (String × Nat)) (outerProtected : List String)
     (allOperands : List String) :
     StackMap → List String → List ANFProperty → (List StackOp × StackMap)
