@@ -7187,6 +7187,454 @@ theorem smoke_dispatch_consume_fires :
     "x" "t0" .bigint none rfl rfl (.vBigint 7) rfl
     (fun _ => Stack.Eval.truthy_of_scriptAccepts hAccept)
 
+/-! ## Dispatch widening (2026-06-11) — mixed passthrough + hash-lock branches
+
+Widens the multi-public dispatch fragment from passthrough-only bodies to
+REAL per-branch bodies drawn from already-proven families: each of the 2–17
+public methods is EITHER a single-param passthrough (branch ops `[]`) OR a
+hash-then-assert hash-lock (`(expected, arg)` params, body
+`d := func(arg) ; ok := (d === expected : bytes) ; assert ok` with
+`func ∈ {sha256, hash160}` — branch ops `AgreesHashCall.hashAssertOps op =
+[op, .swap, OP_EQUAL]`, terminal `OP_VERIFY` elided).  This is a realistic
+multi-spending-path hash-lock contract.  The deployed script is the bare
+Merkle dispatch chain over those branch bodies; the wave-69 selection
+theorem `merkle_dispatch_selection_correct` picks branch `i` (every branch's
+ops are `AreRunarEmittable`: `[]` trivially, `hashAssertOps` because `.swap`
+plus the allowlisted `OP_SHA256`/`OP_HASH160`/`OP_EQUAL` are all in
+`RunarEmittable`), and the per-branch acceptance walks are the existing
+passthrough completion (value-terminated, keyed truthiness) and the PR-#75
+hash-lock equality-verdict walks (assert-terminated, agreement is the SAME
+decidable verdict on both sides — no truthiness needed).  No sub-omnibus
+axiom appears. -/
+
+/-- One dispatch hash-lock branch method: not constructor-named, in the W1
+hash-then-assert fragment. -/
+def dispatchHashLockMethodBool (m : ANFMethod) : Bool :=
+  (m.name != "constructor") && AgreesHashCall.hashAssertConsumeShapeBool m
+
+/-- One mixed dispatch branch method: passthrough OR hash-lock. -/
+def dispatchMixedMethodBool (m : ANFMethod) : Bool :=
+  dispatchPassthroughMethodBool m || dispatchHashLockMethodBool m
+
+/-- Decides the WIDENED multi-public dispatch consume fragment: 2–17 public
+methods, each a passthrough or a hash-lock.  Strictly contains the
+passthrough-only `dispatchConsumeShapeBool` fragment. -/
+def dispatchMixedConsumeShapeBool (p : ANFProgram) : Bool :=
+  let pubs := p.methods.filter (·.isPublic)
+  decide (2 ≤ pubs.length) && decide (pubs.length ≤ 17) &&
+  pubs.all dispatchMixedMethodBool
+
+theorem dispatchMixedMethodBool_extract (m : ANFMethod)
+    (h : dispatchMixedMethodBool m = true) :
+    m.name ≠ "constructor" ∧
+    ((∃ (x bn : String) (ty : ANFType) (src : Option SourceLoc),
+        m.params = [ANFParam.mk x ty] ∧
+        m.body = [ANFBinding.mk bn (.loadParam x) src]) ∨
+     (∃ (d ok anm arg expected func : String) (tyE tyA : ANFType)
+        (s1 s2 s3 : Option SourceLoc),
+        m.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA] ∧
+        m.body = AgreesHashCall.hashAssertBody d ok anm arg expected func
+          s1 s2 s3 ∧
+        (func = "sha256" ∨ func = "hash160") ∧
+        AgreesHashCall.hashAssertNamesOk d ok arg expected = true)) := by
+  unfold dispatchMixedMethodBool at h
+  rcases Bool.or_eq_true_iff.mp h with hP | hH
+  · obtain ⟨hName, hShape⟩ := dispatchPassthroughMethodBool_extract m hP
+    exact ⟨hName, .inl hShape⟩
+  · unfold dispatchHashLockMethodBool at hH
+    obtain ⟨hName, hShape⟩ := Bool.and_eq_true_iff.mp hH
+    exact ⟨bne_iff_ne.mp hName,
+      .inr (AgreesHashCall.hashAssertConsumeShapeBool_extract m hShape)⟩
+
+theorem dispatchMixedConsumeShapeBool_extract (p : ANFProgram)
+    (h : dispatchMixedConsumeShapeBool p = true) :
+    2 ≤ (p.methods.filter (·.isPublic)).length ∧
+    (p.methods.filter (·.isPublic)).length ≤ 17 ∧
+    ∀ m ∈ p.methods.filter (·.isPublic), dispatchMixedMethodBool m = true := by
+  unfold dispatchMixedConsumeShapeBool at h
+  simp only [Bool.and_eq_true_iff, decide_eq_true_eq, List.all_eq_true] at h
+  obtain ⟨⟨h2, h17⟩, hAll⟩ := h
+  exact ⟨h2, h17, hAll⟩
+
+/-- The elided hash-lock branch ops are emittable: `.swap` plus the
+allowlisted `OP_SHA256` / `OP_EQUAL` opcode names. -/
+private theorem hashAssertOps_emittable_sha256 :
+    Parse.AreRunarEmittable (AgreesHashCall.hashAssertOps "OP_SHA256") :=
+  (Parse.areRunarEmittableBool_iff_AreRunarEmittable _).mp (by decide +kernel)
+
+private theorem hashAssertOps_emittable_hash160 :
+    Parse.AreRunarEmittable (AgreesHashCall.hashAssertOps "OP_HASH160") :=
+  (Parse.areRunarEmittableBool_iff_AreRunarEmittable _).mp (by decide +kernel)
+
+/-- The 4-pass peephole pipeline is the identity on the empty op list
+(factored out of `dispatch_consume_completion`'s inline proof). -/
+private theorem peepholeMethodOps_nil : peepholeMethodOps ([] : List StackOp) = [] := by
+  unfold peepholeMethodOps
+  have hNoIfNil : Peephole.noIfOp ([] : List StackOp) := by simp [Peephole.noIfOp]
+  have h1 : Peephole.peepholePassAll [] = ([] : List StackOp) := by
+    rw [Peephole.peepholePassAll_eq_flat_of_noIfOp [] hNoIfNil]; rfl
+  rw [h1, Peephole.peepholePostFold_nil, Peephole.peepholeChainFold_nil,
+    Peephole.peepholeRollPickFold_nil]
+
+/-- A sha256 hash-lock branch method's post-peephole ops are
+`hashAssertOps "OP_SHA256"` (lowering reduction + peephole identity). -/
+private theorem peepholedLoweredMethod_ops_hashLock_sha256
+    (p : ANFProgram) (m : ANFMethod)
+    (d ok anm arg expected : String) (tyE tyA : ANFType)
+    (s1 s2 s3 : Option SourceLoc)
+    (hPub : m.isPublic = true)
+    (hParams : m.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA])
+    (hBody : m.body
+      = AgreesHashCall.hashAssertBody d ok anm arg expected "sha256" s1 s2 s3)
+    (hNames : AgreesHashCall.hashAssertNamesOk d ok arg expected = true) :
+    (peepholedLoweredMethod p m).ops
+      = AgreesHashCall.hashAssertOps "OP_SHA256" := by
+  show peepholeMethodOps (Lower.lowerMethod p.methods p.properties m).ops = _
+  rw [AgreesHashCall.lowerMethod_ops_hashAssert p.methods p.properties m
+        d ok anm arg expected "sha256" "OP_SHA256" tyE tyA s1 s2 s3
+        hParams hBody hPub hNames (Or.inl rfl)
+        (AgreesHashCall.lowerValueP_call_sha256_consume_d0_full p.methods
+          p.properties Lower.defaultInlineBudget 0
+          [(ok, 2), (expected, 1), (d, 1), (arg, 0)]
+          [d, ok, anm] (Lower.collectConstInts
+            (AgreesHashCall.hashAssertBody d ok anm arg expected "sha256"
+              s1 s2 s3))
+          d arg [expected]
+          (AgreesHashCall.hashAssert_arg_consume_fact d ok arg expected hNames))]
+  exact peepholeMethodOps_hashAssert_sha256
+
+/-- The `hash160` peer. -/
+private theorem peepholedLoweredMethod_ops_hashLock_hash160
+    (p : ANFProgram) (m : ANFMethod)
+    (d ok anm arg expected : String) (tyE tyA : ANFType)
+    (s1 s2 s3 : Option SourceLoc)
+    (hPub : m.isPublic = true)
+    (hParams : m.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA])
+    (hBody : m.body
+      = AgreesHashCall.hashAssertBody d ok anm arg expected "hash160" s1 s2 s3)
+    (hNames : AgreesHashCall.hashAssertNamesOk d ok arg expected = true) :
+    (peepholedLoweredMethod p m).ops
+      = AgreesHashCall.hashAssertOps "OP_HASH160" := by
+  show peepholeMethodOps (Lower.lowerMethod p.methods p.properties m).ops = _
+  rw [AgreesHashCall.lowerMethod_ops_hashAssert p.methods p.properties m
+        d ok anm arg expected "hash160" "OP_HASH160" tyE tyA s1 s2 s3
+        hParams hBody hPub hNames (Or.inr rfl)
+        (AgreesHashCall.lowerValueP_call_hash160_consume_d0_full p.methods
+          p.properties Lower.defaultInlineBudget 0
+          [(ok, 2), (expected, 1), (d, 1), (arg, 0)]
+          [d, ok, anm] (Lower.collectConstInts
+            (AgreesHashCall.hashAssertBody d ok anm arg expected "hash160"
+              s1 s2 s3))
+          d arg [expected]
+          (AgreesHashCall.hashAssert_arg_consume_fact d ok arg expected hNames))]
+  exact peepholeMethodOps_hashAssert_hash160
+
+/-- Per-branch ops of a mixed-classified public method: empty (passthrough)
+or `hashAssertOps op` (hash-lock). -/
+private theorem dispatchMixed_branch_ops
+    (p : ANFProgram) (m : ANFMethod)
+    (hm : m ∈ p.methods.filter (·.isPublic))
+    (hMixed : dispatchMixedMethodBool m = true) :
+    (peepholedLoweredMethod p m).ops = [] ∨
+    ∃ op, (op = "OP_SHA256" ∨ op = "OP_HASH160") ∧
+      (peepholedLoweredMethod p m).ops = AgreesHashCall.hashAssertOps op := by
+  have hPub : m.isPublic = true := by
+    have := (List.mem_filter.mp hm).2
+    simpa using this
+  obtain ⟨_, hShape⟩ := dispatchMixedMethodBool_extract m hMixed
+  rcases hShape with ⟨x, bn, ty, src, hP, hB⟩ |
+    ⟨d, ok, anm, arg, expected, func, tyE, tyA, s1, s2, s3, hP, hB, hFunc, hNm⟩
+  · left
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties m).ops = []
+    rw [lowerMethod_ops_passthrough p.methods p.properties m x bn ty src hP hB hPub]
+    exact peepholeMethodOps_nil
+  · right
+    rcases hFunc with hF | hF
+    · subst hF
+      exact ⟨"OP_SHA256", Or.inl rfl,
+        peepholedLoweredMethod_ops_hashLock_sha256 p m d ok anm arg expected
+          tyE tyA s1 s2 s3 hPub hP hB hNm⟩
+    · subst hF
+      exact ⟨"OP_HASH160", Or.inr rfl,
+        peepholedLoweredMethod_ops_hashLock_hash160 p m d ok anm arg expected
+          tyE tyA s1 s2 s3 hPub hP hB hNm⟩
+
+/-- Every mixed-classified public branch is emittable. -/
+private theorem dispatchMixed_branch_emittable
+    (p : ANFProgram) (m : ANFMethod)
+    (hm : m ∈ p.methods.filter (·.isPublic))
+    (hMixed : dispatchMixedMethodBool m = true) :
+    Parse.AreRunarEmittable (peepholedLoweredMethod p m).ops := by
+  rcases dispatchMixed_branch_ops p m hm hMixed with hNil | ⟨op, hOp, hOps⟩
+  · rw [hNil]; exact .nil
+  · rw [hOps]
+    rcases hOp with h | h <;> subst h
+    · exact hashAssertOps_emittable_sha256
+    · exact hashAssertOps_emittable_hash160
+
+/-- **Mixed dispatch consume theorem (HEADLINE, acceptance bit).**  The
+widened multi-public discharge: 2–17 public methods, each passthrough or
+hash-lock, selector witness `i` choosing `anfM`.  Composes the wave-69
+selection theorem with the per-branch acceptance walks:
+
+* passthrough branch — branch ops `[]`, the run completes on the popped
+  stack with the caller's param value on top (VALUE-terminated: consumes
+  the keyed `hTopTruthy` premise, exactly like the passthrough-only
+  theorem);
+* hash-lock branch — branch ops `hashAssertOps op`, the acceptance bit IS
+  the equality verdict `decide ((H arg).toList = expected.toList)` on BOTH
+  sides (assert-terminated: `hTopTruthy` is vacuous).
+
+The per-shape entry facts (`hPassEntry` / `hHashEntry`) are keyed on the
+SELECTED method's per-shape Bool classifier (the established W1 keyed-premise
+style: the premise SUPPLIES the shape witnesses), so each is vacuous when the
+other shape is selected. -/
+theorem compileSafe_observational_correct_dispatchMixed_consume
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (i : Nat) (rest : List RunarVerification.ANF.Eval.Value)
+    (hIdx : (p.methods.filter (·.isPublic))[i]? = some anfM)
+    (hWitness : initialStack.stack = .vBigint (Int.ofNat i) :: rest)
+    (hShape : dispatchMixedConsumeShapeBool p = true)
+    (hPassEntry : dispatchPassthroughMethodBool anfM = true →
+        ∃ (x bn : String) (ty : ANFType) (src : Option SourceLoc)
+          (v : RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk x ty] ∧
+          anfM.body = [ANFBinding.mk bn (.loadParam x) src] ∧
+          initialAnf.lookupParam x = some v)
+    (hHashEntry : dispatchHashLockMethodBool anfM = true →
+        ∃ (d ok anm arg expected func : String) (tyE tyA : ANFType)
+          (s1 s2 s3 : Option SourceLoc) (argB expB : ByteArray)
+          (rest' : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA] ∧
+          anfM.body
+            = AgreesHashCall.hashAssertBody d ok anm arg expected func s1 s2 s3 ∧
+          (func = "sha256" ∨ func = "hash160") ∧
+          AgreesHashCall.hashAssertNamesOk d ok arg expected = true ∧
+          initialAnf.resolveRef arg = some (.vBytes argB) ∧
+          initialAnf.resolveRef expected = some (.vBytes expB) ∧
+          rest = .vBytes argB :: .vBytes expB :: rest' ∧
+          argB.size ≤ 520)
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  obtain ⟨hLen2, hLen17, hAllMixed⟩ := dispatchMixedConsumeShapeBool_extract p hShape
+  have hNames : ∀ m ∈ p.methods.filter (·.isPublic), m.name ≠ "constructor" :=
+    fun m hm => (dispatchMixedMethodBool_extract m (hAllMixed m hm)).1
+  have hShapePub := peepholeProgram_multi_public_shape p hNames
+  have hMemPub : anfM ∈ p.methods.filter (·.isPublic) :=
+    List.mem_of_getElem? hIdx
+  have hIdxPeep :
+      (Emit.publicMethodsOf (peepholeProgram (Lower.lower p)))[i]?
+        = some (peepholedLoweredMethod p anfM) := by
+    rw [hShapePub, List.getElem?_map, hIdx]; rfl
+  have hAllEmit : ∀ m' ∈ Emit.publicMethodsOf (peepholeProgram (Lower.lower p)),
+      Parse.AreRunarEmittable m'.ops := by
+    intro m' hm'
+    rw [hShapePub] at hm'
+    obtain ⟨m, hm, rfl⟩ := List.mem_map.mp hm'
+    exact dispatchMixed_branch_emittable p m hm (hAllMixed m hm)
+  have hLen2' : 2 ≤ (Emit.publicMethodsOf (peepholeProgram (Lower.lower p))).length := by
+    rw [hShapePub, List.length_map]; exact hLen2
+  have hLen17' : (Emit.publicMethodsOf (peepholeProgram (Lower.lower p))).length ≤ 17 := by
+    rw [hShapePub, List.length_map]; exact hLen17
+  -- Wave-69 selection: the deployed run is the selected branch's run on the
+  -- witness-popped stack.
+  have hSel := merkle_dispatch_selection_correct p bytes
+    (peepholedLoweredMethod p anfM) initialStack i rest hSafe hIdxPeep hWitness
+    (dispatchMixed_branch_emittable p anfM hMemPub (hAllMixed anfM hMemPub))
+    hAllEmit hLen2' hLen17'
+  -- Per-branch case split on the SELECTED method's per-shape Bool.
+  have hSelMixed : dispatchMixedMethodBool anfM = true := hAllMixed anfM hMemPub
+  rcases Bool.or_eq_true_iff.mp hSelMixed with hSelPass | hSelHash
+  · -- Passthrough branch: ops `[]`, value-terminated.
+    obtain ⟨x, bn, ty, src, v, hP, hB, hv⟩ := hPassEntry hSelPass
+    have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+        anfM.body).toOption.isSome = true := by
+      rw [hB]
+      exact evalBindingsP_passthrough_isSome p.methods initialAnf bn x src v hv
+    have hOpsNil : (peepholedLoweredMethod p anfM).ops = [] := by
+      show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = []
+      rw [lowerMethod_ops_passthrough p.methods p.properties anfM x bn ty src
+            hP hB hPublic]
+      exact peepholeMethodOps_nil
+    have hStack : (runParsedBytes bytes initialStack).toOption.isSome = true := by
+      rw [hSel, hOpsNil, RunarVerification.Stack.Eval.runOps_nil]
+      rfl
+    have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+      rw [hB]; simp [Lower.bodyEndsInAssert]
+    exact Stack.Eval.acceptAgrees_of_completion_of_truthy
+      (by rw [hANF, hStack]) (hTopTruthy hNoTA)
+  · -- Hash-lock branch: ops `hashAssertOps op`, assert-terminated — both
+    -- bits ARE the equality verdict.
+    obtain ⟨d, ok, anm, arg, expected, func, tyE, tyA, s1, s2, s3, argB, expB,
+      rest', hP, hB, hFunc, hNm, hArg, hExp, hRestEq, hLen520⟩ :=
+      hHashEntry hSelHash
+    have hPoppedStk :
+        ({ initialStack with stack := rest } : StackState).stack
+          = .vBytes argB :: .vBytes expB :: rest' := hRestEq
+    rcases hFunc with hF | hF
+    · subst hF
+      have hOps := peepholedLoweredMethod_ops_hashLock_sha256 p anfM
+        d ok anm arg expected tyE tyA s1 s2 s3 hPublic hP hB hNm
+      have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+          anfM.body).toOption.isSome
+          = decide ((RunarVerification.ANF.Eval.Crypto.sha256 argB).toList
+              = expB.toList) := by
+        rw [hB]
+        exact AgreesHashCall.evalBindingsP_hashAssert_isSome_eq p.methods initialAnf
+          d ok anm arg expected "sha256" s1 s2 s3
+          (RunarVerification.ANF.Eval.Crypto.sha256 argB) expB hNm
+          (AgreesHashCall.evalValue_call_sha256_eq_local initialAnf arg argB hArg)
+          hExp
+      have hHashStep := Stack.HashOps.runOps_sha256Ops_eq
+        ({ initialStack with stack := rest } : StackState) argB
+        (.vBytes expB :: rest') hPoppedStk hLen520
+      have hStackBit := AgreesHashCall.runOps_hashAssertOps_scriptAccepts
+        ({ initialStack with stack := rest } : StackState) "OP_SHA256"
+        argB (RunarVerification.ANF.Eval.Crypto.sha256 argB) expB rest'
+        hPoppedStk hHashStep
+      show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+          anfM.body).toOption.isSome
+          ↔ scriptAccepts (runParsedBytes bytes initialStack) = true
+      rw [hSel, hOps, hANF, hStackBit]
+    · subst hF
+      have hOps := peepholedLoweredMethod_ops_hashLock_hash160 p anfM
+        d ok anm arg expected tyE tyA s1 s2 s3 hPublic hP hB hNm
+      have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+          anfM.body).toOption.isSome
+          = decide ((RunarVerification.ANF.Eval.Crypto.hash160 argB).toList
+              = expB.toList) := by
+        rw [hB]
+        exact AgreesHashCall.evalBindingsP_hashAssert_isSome_eq p.methods initialAnf
+          d ok anm arg expected "hash160" s1 s2 s3
+          (RunarVerification.ANF.Eval.Crypto.hash160 argB) expB hNm
+          (AgreesHashCall.evalValue_call_hash160_eq_local initialAnf arg argB hArg)
+          hExp
+      have hHashStep := Stack.HashOps.runOps_hash160Ops_eq
+        ({ initialStack with stack := rest } : StackState) argB
+        (.vBytes expB :: rest') hPoppedStk hLen520
+      have hStackBit := AgreesHashCall.runOps_hashAssertOps_scriptAccepts
+        ({ initialStack with stack := rest } : StackState) "OP_HASH160"
+        argB (RunarVerification.ANF.Eval.Crypto.hash160 argB) expB rest'
+        hPoppedStk hHashStep
+      show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+          anfM.body).toOption.isSome
+          ↔ scriptAccepts (runParsedBytes bytes initialStack) = true
+      rw [hSel, hOps, hANF, hStackBit]
+
+/-! ### MANDATORY smokes: the mixed dispatch consume theorem fires
+
+The canonical mixed 2-method contract `MX` — `ma(x) { return x; }`
+(passthrough) plus `unlock(expected, h) { d := sha256(h); ok := d ===
+expected; assert ok }` (hash-lock) — fired end-to-end on BOTH selectors:
+
+* selector `0` → the passthrough branch, concrete `native_decide`
+  acceptance (witness `0` over truthy `7`);
+* selector `1` → the hash-lock branch, symbolic agreement (both bits ARE
+  `decide ((sha256 [1,2,3]).toList = [4,5].toList)`, never evaluated). -/
+
+private def mxSmokeMa : ANFMethod :=
+  { name := "ma", params := [ANFParam.mk "x" .bigint],
+    body := [ANFBinding.mk "t0" (.loadParam "x") none], isPublic := true }
+
+private def mxSmokeUnlock : ANFMethod :=
+  { name := "unlock"
+    params := [ANFParam.mk "expected" .byteString, ANFParam.mk "h" .byteString]
+    body := AgreesHashCall.hashAssertBody "d" "ok" "a0" "h" "expected" "sha256"
+      none none none
+    isPublic := true }
+
+private def mxSmokeProg : ANFProgram :=
+  { contractName := "MX", properties := [],
+    methods := [mxSmokeMa, mxSmokeUnlock] }
+
+private theorem mxSmoke_filter :
+    mxSmokeProg.methods.filter (·.isPublic) = [mxSmokeMa, mxSmokeUnlock] := rfl
+
+/-- SMOKE — the mixed classifier fires on `MX`, and the passthrough-only
+classifier does NOT (the widening is strict). -/
+theorem smoke_dispatchMixed_classifier_fires :
+    dispatchMixedConsumeShapeBool mxSmokeProg = true ∧
+    dispatchConsumeShapeBool mxSmokeProg = false := by
+  constructor <;> native_decide
+
+-- Selector 0: the passthrough branch, concrete entry (`x ↦ 7`).
+private def mxSmokeAnf0 : State := { params := [("x", .vBigint 7)] }
+private def mxSmokeStk0 : StackState := { stack := [.vBigint 0, .vBigint 7] }
+
+private theorem mxSmoke0_accepted :
+    (match compileSafe mxSmokeProg with
+     | .ok bytes => scriptAccepts (runParsedBytes bytes mxSmokeStk0)
+     | .error _ => false) = true := by
+  native_decide
+
+/-- SMOKE — the mixed consume theorem fires on selector 0 (the passthrough
+branch), end-to-end concrete. -/
+theorem smoke_dispatchMixed_consume_fires_passthrough :
+    ∃ bytes, compileSafe mxSmokeProg = .ok bytes ∧
+      acceptAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP mxSmokeProg.methods mxSmokeAnf0
+          mxSmokeMa.body)
+        (runParsedBytes bytes mxSmokeStk0) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe mxSmokeProg = .ok b := by
+    have h : (compileSafe mxSmokeProg).toOption.isSome = true := by native_decide
+    cases hc : compileSafe mxSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  have hAccept := mxSmoke0_accepted
+  rw [hSafe] at hAccept
+  exact compileSafe_observational_correct_dispatchMixed_consume
+    mxSmokeProg mxSmokeMa bytes rfl hSafe mxSmokeAnf0 mxSmokeStk0 0 [.vBigint 7]
+    (by rw [mxSmoke_filter]; rfl) (by rfl) (by native_decide)
+    (fun _ => ⟨"x", "t0", .bigint, none, .vBigint 7, rfl, rfl, rfl⟩)
+    (by intro hF; exact absurd hF (by native_decide))
+    (fun _ => Stack.Eval.truthy_of_scriptAccepts hAccept)
+
+-- Selector 1: the hash-lock branch, symbolic entry (`h ↦ [1,2,3]`,
+-- `expected ↦ [4,5]` — the verdict is never evaluated).
+private def mxSmokeArgB : ByteArray := ByteArray.mk #[1, 2, 3]
+private def mxSmokeExpB : ByteArray := ByteArray.mk #[4, 5]
+
+private def mxSmokeAnf1 : State :=
+  { (default : State) with
+    bindings := [("h", .vBytes mxSmokeArgB), ("expected", .vBytes mxSmokeExpB)] }
+
+private def mxSmokeStk1 : StackState :=
+  { stack := [.vBigint 1, .vBytes mxSmokeArgB, .vBytes mxSmokeExpB] }
+
+/-- SMOKE — the mixed consume theorem fires on selector 1 (the hash-lock
+branch) with NO truthiness hypothesis (assert-terminated agreement is the
+symbolic equality verdict on both sides). -/
+theorem smoke_dispatchMixed_consume_fires_hashLock :
+    ∃ bytes, compileSafe mxSmokeProg = .ok bytes ∧
+      acceptAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP mxSmokeProg.methods mxSmokeAnf1
+          mxSmokeUnlock.body)
+        (runParsedBytes bytes mxSmokeStk1) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe mxSmokeProg = .ok b := by
+    have h : (compileSafe mxSmokeProg).toOption.isSome = true := by native_decide
+    cases hc : compileSafe mxSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  exact compileSafe_observational_correct_dispatchMixed_consume
+    mxSmokeProg mxSmokeUnlock bytes rfl hSafe mxSmokeAnf1 mxSmokeStk1 1
+    [.vBytes mxSmokeArgB, .vBytes mxSmokeExpB]
+    (by rw [mxSmoke_filter]; rfl) (by rfl) (by native_decide)
+    (by intro hF; exact absurd hF (by native_decide))
+    (fun _ => ⟨"d", "ok", "a0", "h", "expected", "sha256", .byteString,
+      .byteString, none, none, none, mxSmokeArgB, mxSmokeExpB, [],
+      rfl, rfl, Or.inl rfl, by decide, rfl, rfl, rfl, by decide⟩)
+    (by intro hNoTA
+        exact absurd hNoTA (by native_decide))
+
 /-! ### Wave 66 — MANDATORY smoke: the method_call consume theorem fires
 
 The canonical single-public passthrough program — public `entry(a)` whose
@@ -8111,6 +8559,43 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           initialStack.stack = .vBigint (Int.ofNat i) :: rest ∧
           ∀ (x : String) (ty : ANFType), anfM.params = [ANFParam.mk x ty] →
             initialAnf.lookupParam x = some v)
+    -- **WIDENED mixed dispatch consume premise (keyed; 2026-06-11 dispatch
+    -- widening).**  For a multi-public program in the WIDENED mixed fragment
+    -- (decided by `dispatchMixedConsumeShapeBool` — every public method a
+    -- passthrough OR a hash-then-assert hash-lock) the entry bundle is
+    -- recovered: the selector index `i` of `anfM`, the witness-headed stack,
+    -- and the per-shape entry facts for the SELECTED method (shape witnesses
+    -- + param resolution for a passthrough; shape witnesses + bytes-typed
+    -- `(expected, arg)` resolution + witness-stack alignment + the 520-size
+    -- bound for a hash-lock — each keyed on the respective per-method Bool
+    -- classifier, hence vacuous for the other shape).  Keyed on the
+    -- DECIDABLE classifier, it is VACUOUS for every non-fragment program;
+    -- its only consumer is the conformance harness.
+    (hDispatchMixedFrag :
+      dispatchMixedConsumeShapeBool p = true →
+        ∃ (i : Nat) (rest : List RunarVerification.ANF.Eval.Value),
+          (p.methods.filter (·.isPublic))[i]? = some anfM ∧
+          initialStack.stack = .vBigint (Int.ofNat i) :: rest ∧
+          (dispatchPassthroughMethodBool anfM = true →
+            ∃ (x bn : String) (ty : ANFType) (src : Option SourceLoc)
+              (v : RunarVerification.ANF.Eval.Value),
+              anfM.params = [ANFParam.mk x ty] ∧
+              anfM.body = [ANFBinding.mk bn (.loadParam x) src] ∧
+              initialAnf.lookupParam x = some v) ∧
+          (dispatchHashLockMethodBool anfM = true →
+            ∃ (d ok anm arg expected func : String) (tyE tyA : ANFType)
+              (s1 s2 s3 : Option SourceLoc) (argB expB : ByteArray)
+              (rest' : List RunarVerification.ANF.Eval.Value),
+              anfM.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA] ∧
+              anfM.body = RunarVerification.Stack.AgreesHashCall.hashAssertBody
+                d ok anm arg expected func s1 s2 s3 ∧
+              (func = "sha256" ∨ func = "hash160") ∧
+              RunarVerification.Stack.AgreesHashCall.hashAssertNamesOk
+                d ok arg expected = true ∧
+              initialAnf.resolveRef arg = some (.vBytes argB) ∧
+              initialAnf.resolveRef expected = some (.vBytes expB) ∧
+              rest = .vBytes argB :: .vBytes expB :: rest' ∧
+              argB.size ≤ 520))
     -- **Value-terminated-body truthiness premise (keyed; 2026-06-11
     -- truthy-top success-bit repair).**  For a method body that does NOT
     -- end in `assert` (hand-IR corner cases only — the TS validator
@@ -8201,26 +8686,42 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
         · exact compileSafe_observational_correct_modulo_crypto_call_codegen
             p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
   · by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
-    · -- **Dispatch consume branch (replaces the retired dispatch axiom).**
-      -- The decidable `dispatchConsumeShapeBool` classifier peels the
-      -- canonical multi-public passthrough fragment; the keyed
-      -- `hDispatchFrag` premise recovers the selector witness + index +
-      -- param resolution, and the discharged consume theorem fires.
-      -- Residual multi-public programs fall through to the sound
-      -- crypto_call fallback — NO new axiom is introduced.
-      by_cases hDpShape : dispatchConsumeShapeBool p = true
-      · obtain ⟨_h2, _h17, hDpNames, hDpAllPass⟩ :=
-          dispatchConsumeShapeBool_extract p hDpShape
-        obtain ⟨i, restW, v, hIdxW, hWitnessW, hResW⟩ := hDispatchFrag hDpShape
-        have hMemPub : anfM ∈ p.methods.filter (·.isPublic) :=
-          List.mem_filter.mpr ⟨hMem, by simpa using hPublic⟩
-        obtain ⟨x, bn, ty, src, hParamsW, hBodyW⟩ := hDpAllPass anfM hMemPub
-        exact compileSafe_observational_correct_dispatch_consume
+    · -- **WIDENED mixed dispatch consume branch (2026-06-11 dispatch
+      -- widening; tried BEFORE the passthrough-only classifier — the mixed
+      -- fragment strictly contains it, so this branch subsumes the legacy
+      -- one below, which is kept for signature stability).**  The decidable
+      -- `dispatchMixedConsumeShapeBool` classifier peels the multi-public
+      -- passthrough-or-hash-lock fragment; the keyed `hDispatchMixedFrag`
+      -- premise recovers the selector witness + per-shape entry facts, and
+      -- the discharged consume theorem fires.  Residual multi-public
+      -- programs fall through to the passthrough-only classifier and then
+      -- to the sound crypto_call fallback — NO new axiom is introduced.
+      by_cases hDpMixedShape : dispatchMixedConsumeShapeBool p = true
+      · obtain ⟨i, restW, hIdxW, hWitnessW, hPassW, hHashW⟩ :=
+          hDispatchMixedFrag hDpMixedShape
+        exact compileSafe_observational_correct_dispatchMixed_consume
           p anfM bytes hPublic hSafe initialAnf initialStack i restW
-          hIdxW hWitnessW hDpNames hDpAllPass _h2 _h17
-          x bn ty src hParamsW hBodyW v (hResW x ty hParamsW) hValueTruthy
-      · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+          hIdxW hWitnessW hDpMixedShape hPassW hHashW hValueTruthy
+      · -- **Dispatch consume branch (replaces the retired dispatch axiom).**
+        -- The decidable `dispatchConsumeShapeBool` classifier peels the
+        -- canonical multi-public passthrough fragment; the keyed
+        -- `hDispatchFrag` premise recovers the selector witness + index +
+        -- param resolution, and the discharged consume theorem fires.
+        -- Residual multi-public programs fall through to the sound
+        -- crypto_call fallback — NO new axiom is introduced.
+        by_cases hDpShape : dispatchConsumeShapeBool p = true
+        · obtain ⟨_h2, _h17, hDpNames, hDpAllPass⟩ :=
+            dispatchConsumeShapeBool_extract p hDpShape
+          obtain ⟨i, restW, v, hIdxW, hWitnessW, hResW⟩ := hDispatchFrag hDpShape
+          have hMemPub : anfM ∈ p.methods.filter (·.isPublic) :=
+            List.mem_filter.mpr ⟨hMem, by simpa using hPublic⟩
+          obtain ⟨x, bn, ty, src, hParamsW, hBodyW⟩ := hDpAllPass anfM hMemPub
+          exact compileSafe_observational_correct_dispatch_consume
+            p anfM bytes hPublic hSafe initialAnf initialStack i restW
+            hIdxW hWitnessW hDpNames hDpAllPass _h2 _h17
+            x bn ty src hParamsW hBodyW v (hResW x ty hParamsW) hValueTruthy
+        · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
     · -- In the `¬hDispatch` branch the public-method filter has length < 2;
       -- since `anfM` is itself public it must be the SOLE public method, so
       -- the filter is exactly `[anfM]`.  This `hSinglePublic` fact feeds the
@@ -8705,6 +9206,33 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           initialStack.stack = .vBigint (Int.ofNat i) :: rest ∧
           ∀ (x : String) (ty : ANFType), anfM.params = [ANFParam.mk x ty] →
             initialAnf.lookupParam x = some v)
+    -- **WIDENED mixed dispatch consume premise (keyed; 2026-06-11 dispatch
+    -- widening).**  Forwarded verbatim to the omnibus; see the comment there.
+    (hDispatchMixedFrag :
+      dispatchMixedConsumeShapeBool p = true →
+        ∃ (i : Nat) (rest : List RunarVerification.ANF.Eval.Value),
+          (p.methods.filter (·.isPublic))[i]? = some anfM ∧
+          initialStack.stack = .vBigint (Int.ofNat i) :: rest ∧
+          (dispatchPassthroughMethodBool anfM = true →
+            ∃ (x bn : String) (ty : ANFType) (src : Option SourceLoc)
+              (v : RunarVerification.ANF.Eval.Value),
+              anfM.params = [ANFParam.mk x ty] ∧
+              anfM.body = [ANFBinding.mk bn (.loadParam x) src] ∧
+              initialAnf.lookupParam x = some v) ∧
+          (dispatchHashLockMethodBool anfM = true →
+            ∃ (d ok anm arg expected func : String) (tyE tyA : ANFType)
+              (s1 s2 s3 : Option SourceLoc) (argB expB : ByteArray)
+              (rest' : List RunarVerification.ANF.Eval.Value),
+              anfM.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA] ∧
+              anfM.body = RunarVerification.Stack.AgreesHashCall.hashAssertBody
+                d ok anm arg expected func s1 s2 s3 ∧
+              (func = "sha256" ∨ func = "hash160") ∧
+              RunarVerification.Stack.AgreesHashCall.hashAssertNamesOk
+                d ok arg expected = true ∧
+              initialAnf.resolveRef arg = some (.vBytes argB) ∧
+              initialAnf.resolveRef expected = some (.vBytes expB) ∧
+              rest = .vBytes argB :: .vBytes expB :: rest' ∧
+              argB.size ≤ 520))
     -- **Value-terminated-body truthiness premise (keyed; 2026-06-11
     -- truthy-top success-bit repair).**  Forwarded verbatim to the omnibus;
     -- see the comment there.
@@ -8720,7 +9248,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
     hNoLoop Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
     hMethodCallFrag hHashCallFrag hHashAssertFrag hHashChainFrag hStatefulFrag hStatefulFullFrag hDispatchFrag
-    hValueTruthy hCoh
+    hDispatchMixedFrag hValueTruthy hCoh
 
 
 end Soundness
