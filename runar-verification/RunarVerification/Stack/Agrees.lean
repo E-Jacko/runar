@@ -13473,11 +13473,16 @@ theorem lowerMethod_ops_eq_userRaw_no_implicits_no_post
     (hNoPreimage : bindingsUseCheckPreimage m.body = false)
     (_hNoCode : bindingsUseCodePart m.body = false)
     (hNoTerminalAssert : bodyEndsInAssert m.body = false)
-    (hNoDeserialize : bindingsUseDeserializeState m.body = false) :
+    (_hNoDeserialize : bindingsUseDeserializeState m.body = false) :
     (lowerMethod progMethods props m).ops =
       lowerMethodUserRawOps progMethods props m := by
+  -- Post-gate note: the epilogue NIP gate is now
+  -- `isPublic && bodyEndsInAssert && depth > 1` (TS parity for the
+  -- repeated-operand fix), so `hNoTerminalAssert` alone kills both the
+  -- terminal-assert elision and the NIP epilogue; `_hNoDeserialize` is
+  -- retained for caller compatibility (it used to gate the epilogue).
   unfold lowerMethodUserRawOps lowerMethod
-  simp [hNoPreimage, hNoTerminalAssert, hNoDeserialize]
+  simp [hNoPreimage, hNoTerminalAssert]
 
 /-- If `m` is the unique public method in `methods` with its name, then
 the public-method lookup in `methods` selects `m`, regardless of its
@@ -17721,6 +17726,26 @@ private theorem loadRefLive_copy_eq
   simp only [Bool.false_eq_true, not_true, decide_false, Bool.not_false]
   exact bringToTop_copy_eq_loadRef_of_depth sm name dl hDepth
 
+/-- Copy-mode collapse for the operand-gated loader: when the legacy
+copy condition (`outerProtected` / not-last-use) already forces
+`consume = false`, the repeated-operand clause is irrelevant — the
+gated load equals the plain PICK-style `loadRef` for ANY operand list.
+Companion to `loadRefLive_copy_eq` after the `operandConsume` port
+(PRs #62/#67/#68). -/
+private theorem loadRefOperand_copy_eq
+    (sm : StackMap) (name : String) (operands : List String) (currentIndex : Nat)
+    (lastUses : List (String × Nat)) (outerProtected : List String)
+    (dl : Nat) (hDepth : sm.depth? name = some dl)
+    (hCopy : (!Stack.Lower.listContains outerProtected name &&
+                Stack.Lower.isLastUse lastUses name currentIndex) = false) :
+    Stack.Lower.loadRefOperand sm name operands currentIndex lastUses outerProtected
+      = (Stack.Lower.loadRef sm name, sm.push name) := by
+  unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
+  rw [show (!Stack.Lower.listContains outerProtected name &&
+               Stack.Lower.isLastUse lastUses name currentIndex) = false from hCopy]
+  simp only [Bool.false_and]
+  exact bringToTop_copy_eq_loadRef_of_depth sm name dl hDepth
+
 /-- The depth of `r` in `sm.push l` is `Some` whenever `sm.depth? r` is
 `Some` (the depth increases by 1 if `r ≠ l`, or is 0 if `r = l`). -/
 private theorem depth?_isSome_of_push_left
@@ -17806,9 +17831,9 @@ theorem lowerValueP_binOp_copy_eq_lowerValue
   obtain ⟨dr', hdr'⟩ := hdrPushed
   -- Unfold lowerValueP for binOp
   unfold Stack.Lower.lowerValueP
-  -- Rewrite both loadRefLive calls to copy-mode form using simp (works under binders)
-  simp only [loadRefLive_copy_eq sm l currentIndex lastUses outerProtected dl hdl hl_copy,
-             loadRefLive_copy_eq (sm.push l) r currentIndex lastUses outerProtected dr' hdr' hr_copy]
+  -- Rewrite both operand-gated loads to copy-mode form using simp (works under binders)
+  simp only [loadRefOperand_copy_eq sm l [l, r] currentIndex lastUses outerProtected dl hdl hl_copy,
+             loadRefOperand_copy_eq (sm.push l) r [l, r] currentIndex lastUses outerProtected dr' hdr' hr_copy]
   -- Simplify sm2.popN 2 = sm
   simp only [Stack.Lower.StackMap.push, Stack.Lower.StackMap.popN]
   -- Now match lowerValue
@@ -19140,12 +19165,12 @@ private theorem lowerArgsLive_singleton_copy_sm_push_eq
     (dl : Nat) (hdl : sm.depth? x = some dl)
     (hcl : (!Stack.Lower.listContains outerProtected x &&
             Stack.Lower.isLastUse lastUses x currentIndex) = false) :
-    ((Stack.Lower.lowerArgsLive currentIndex lastUses outerProtected sm [x]).2.popN 1).push name
+    ((Stack.Lower.lowerArgsLive currentIndex lastUses outerProtected [x] sm [x]).2.popN 1).push name
       = sm.push name := by
-  -- Step 1: unfold lowerArgsLive and apply loadRefLive_copy_eq (do NOT include push/popN yet
-  --         to avoid sm.push l being reduced to l :: sm before the second loadRefLive fires)
+  -- Step 1: unfold lowerArgsLive and apply loadRefOperand_copy_eq (do NOT include push/popN yet
+  --         to avoid sm.push l being reduced to l :: sm before the second load fires)
   simp only [Stack.Lower.lowerArgsLive,
-             loadRefLive_copy_eq sm x currentIndex lastUses outerProtected dl hdl hcl]
+             loadRefOperand_copy_eq sm x [x] currentIndex lastUses outerProtected dl hdl hcl]
   -- Step 2: now reduce push/popN
   simp only [Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push]
 
@@ -19160,13 +19185,13 @@ private theorem lowerArgsLive_pair_copy_sm_push_eq
     (dr : Nat) (hdr : (sm.push l).depth? r = some dr)
     (hcr : (!Stack.Lower.listContains outerProtected r &&
             Stack.Lower.isLastUse lastUses r currentIndex) = false) :
-    ((Stack.Lower.lowerArgsLive currentIndex lastUses outerProtected sm [l, r]).2.popN 2).push name
+    ((Stack.Lower.lowerArgsLive currentIndex lastUses outerProtected [l, r] sm [l, r]).2.popN 2).push name
       = sm.push name := by
-  -- Step 1: apply both loadRefLive_copy_eq rules before unfolding push
+  -- Step 1: apply both loadRefOperand_copy_eq rules before unfolding push
   --         (sm.push l must stay syntactically as sm.push l so the second rule fires)
   simp only [Stack.Lower.lowerArgsLive,
-             loadRefLive_copy_eq sm l currentIndex lastUses outerProtected dl hdl hcl,
-             loadRefLive_copy_eq (sm.push l) r currentIndex lastUses outerProtected dr hdr hcr]
+             loadRefOperand_copy_eq sm l [l, r] currentIndex lastUses outerProtected dl hdl hcl,
+             loadRefOperand_copy_eq (sm.push l) r [l, r] currentIndex lastUses outerProtected dr hdr hcr]
   -- Step 2: now reduce push/popN
   simp only [Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push]
 
@@ -19184,13 +19209,13 @@ private theorem lowerArgsLive_triple_copy_sm_push_eq
     (dhi : Nat) (hdhi : ((sm.push x).push lo).depth? hi = some dhi)
     (hchi : (!Stack.Lower.listContains outerProtected hi &&
              Stack.Lower.isLastUse lastUses hi currentIndex) = false) :
-    ((Stack.Lower.lowerArgsLive currentIndex lastUses outerProtected sm [x, lo, hi]).2.popN 3).push name
+    ((Stack.Lower.lowerArgsLive currentIndex lastUses outerProtected [x, lo, hi] sm [x, lo, hi]).2.popN 3).push name
       = sm.push name := by
-  -- Step 1: apply all three loadRefLive_copy_eq rules before unfolding push
+  -- Step 1: apply all three loadRefOperand_copy_eq rules before unfolding push
   simp only [Stack.Lower.lowerArgsLive,
-             loadRefLive_copy_eq sm x currentIndex lastUses outerProtected dx hdx hcx,
-             loadRefLive_copy_eq (sm.push x) lo currentIndex lastUses outerProtected dlo hdlo hclo,
-             loadRefLive_copy_eq ((sm.push x).push lo) hi currentIndex lastUses outerProtected
+             loadRefOperand_copy_eq sm x [x, lo, hi] currentIndex lastUses outerProtected dx hdx hcx,
+             loadRefOperand_copy_eq (sm.push x) lo [x, lo, hi] currentIndex lastUses outerProtected dlo hdlo hclo,
+             loadRefOperand_copy_eq ((sm.push x).push lo) hi [x, lo, hi] currentIndex lastUses outerProtected
                dhi hdhi hchi]
   -- Step 2: now reduce push/popN
   simp only [Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push]
@@ -23925,7 +23950,8 @@ theorem wave18_consume_chain_smoke
           wave18SmokeLU [] [] ([] : List (String × Int)) ["p0", "p1", "p2"] "t0"
           (.binOp "+" "p0" "p1" none)).1 = [.swap, .opcode "OP_ADD"] := by
     unfold Stack.Lower.lowerValueP; simp only []
-    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
+    unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
+      Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
       wave18SmokeLU Stack.Lower.isLastUse Stack.Lower.listContains Stack.Lower.binopOpcode
     rfl
   have hSm0 :
@@ -23933,7 +23959,8 @@ theorem wave18_consume_chain_smoke
           wave18SmokeLU [] [] ([] : List (String × Int)) ["p0", "p1", "p2"] "t0"
           (.binOp "+" "p0" "p1" none)).2.1 = ["t0", "p2"] := by
     unfold Stack.Lower.lowerValueP; simp only []
-    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
+    unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
+      Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
       Stack.Lower.StackMap.popN Stack.Lower.StackMap.push wave18SmokeLU
       Stack.Lower.isLastUse Stack.Lower.listContains
     rfl
@@ -23972,7 +23999,8 @@ theorem wave18_consume_chain_smoke
           wave18SmokeLU [] [] ([] : List (String × Int)) ["t0", "p2"] "t1"
           (.binOp "-" "t0" "p2" none)).1 = [.swap, .opcode "OP_SUB"] := by
     unfold Stack.Lower.lowerValueP; simp only []
-    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
+    unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
+      Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
       wave18SmokeLU Stack.Lower.isLastUse Stack.Lower.listContains Stack.Lower.binopOpcode
     rfl
   have hSm1 :
@@ -23980,7 +24008,8 @@ theorem wave18_consume_chain_smoke
           wave18SmokeLU [] [] ([] : List (String × Int)) ["t0", "p2"] "t1"
           (.binOp "-" "t0" "p2" none)).2.1 = ["t1"] := by
     unfold Stack.Lower.lowerValueP; simp only []
-    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
+    unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
+      Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
       Stack.Lower.StackMap.popN Stack.Lower.StackMap.push wave18SmokeLU
       Stack.Lower.isLastUse Stack.Lower.listContains
     rfl

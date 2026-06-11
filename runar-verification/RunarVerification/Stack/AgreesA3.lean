@@ -1592,6 +1592,17 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap
   -- Step 2: reduce the binOp arm of lowerValueP. Use the two precomputed
   -- loadRefLive equalities to discharge both operand loads in one go.
   unfold Stack.Lower.lowerValueP
+  -- Bridge the operand-gated loads (PRs #62/#67/#68) back to `loadRefLive`:
+  -- the two operands are distinct, so `operandConsume` reduces to the old form.
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne
+  simp only [hOperandL, hOperandR]
   rw [hLoadN1]
   simp only [hLoadN2]
   -- Discharge the `op == "!==" && rt == some "bytes"` guard.
@@ -3331,6 +3342,17 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
   -- Step 2: reduce the binOp arm of lowerValueP. Use the two precomputed
   -- loadRefLive equalities to discharge both operand loads.
   unfold Stack.Lower.lowerValueP
+  -- Bridge the operand-gated loads (PRs #62/#67/#68) back to `loadRefLive`:
+  -- the two operands are distinct, so `operandConsume` reduces to the old form.
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne
+  simp only [hOperandL, hOperandR]
   rw [hLoadN1]
   simp only [hLoadN2]
   -- Discharge the `op == "!==" && rt == some "bytes"` guard.
@@ -4828,6 +4850,17 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
     simp
   unfold Stack.Lower.lowerBindingsP
   unfold Stack.Lower.lowerValueP
+  -- Bridge the operand-gated loads (PRs #62/#67/#68) back to `loadRefLive`:
+  -- the two operands are distinct, so `operandConsume` reduces to the old form.
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  simp only [hOperandL, hOperandR]
   rw [hLoadN1]
   simp only [hLoadN2]
   rw [hNotNeqBytes]
@@ -6309,6 +6342,17 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
     simp [Stack.Lower.StackMap.removeAtDepth, Stack.Lower.StackMap.push]
   unfold Stack.Lower.lowerBindingsP
   unfold Stack.Lower.lowerValueP
+  -- Bridge the operand-gated loads (PRs #62/#67/#68) back to `loadRefLive`:
+  -- the two operands are distinct, so `operandConsume` reduces to the old form.
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  simp only [hOperandL, hOperandR]
   rw [hLoadN1]
   simp only [hLoadN2]
   rw [hNotNeqBytes]
@@ -7877,6 +7921,17 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
     simp
   unfold Stack.Lower.lowerBindingsP
   unfold Stack.Lower.lowerValueP
+  -- Bridge the operand-gated loads (PRs #62/#67/#68) back to `loadRefLive`:
+  -- the two operands are distinct, so `operandConsume` reduces to the old form.
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  simp only [hOperandL, hOperandR]
   rw [hLoadN1]
   simp only [hLoadN2]
   rw [hNotNeqBytes]
@@ -9405,6 +9460,17 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
     rfl
   unfold Stack.Lower.lowerBindingsP
   unfold Stack.Lower.lowerValueP
+  -- Bridge the operand-gated loads (PRs #62/#67/#68) back to `loadRefLive`:
+  -- the two operands are distinct, so `operandConsume` reduces to the old form.
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  simp only [hOperandL, hOperandR]
   rw [hLoadN1]
   simp only [hLoadN2]
   rw [hNotNeqBytes]
@@ -11205,7 +11271,8 @@ private theorem wave19_ops0
       = [StackOp.swap, .opcode "OP_ADD"] := by
   rw [wave19_computeLastUses, wave19_collectConstInts]
   unfold Stack.Lower.lowerValueP; simp only []
-  unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
+  unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
+    Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
     Stack.Lower.isLastUse Stack.Lower.lastUsesLookup Stack.Lower.listContains
     Stack.Lower.binopOpcode
   rfl
@@ -11222,7 +11289,8 @@ private theorem wave19_sm0
       = ["t0", "p2"] := by
   rw [wave19_computeLastUses, wave19_collectConstInts]
   unfold Stack.Lower.lowerValueP; simp only []
-  unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
+  unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
+    Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
     Stack.Lower.StackMap.popN Stack.Lower.StackMap.push
     Stack.Lower.isLastUse Stack.Lower.lastUsesLookup Stack.Lower.listContains
   rfl
@@ -11252,7 +11320,8 @@ private theorem wave19_ops1
       = [StackOp.swap, .opcode "OP_SUB"] := by
   rw [wave19_computeLastUses, wave19_collectConstInts]
   unfold Stack.Lower.lowerValueP; simp only []
-  unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
+  unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
+    Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
     Stack.Lower.isLastUse Stack.Lower.lastUsesLookup Stack.Lower.listContains
     Stack.Lower.binopOpcode
   rfl
@@ -11268,7 +11337,8 @@ private theorem wave19_sm1
       = ["t1"] := by
   rw [wave19_computeLastUses, wave19_collectConstInts]
   unfold Stack.Lower.lowerValueP; simp only []
-  unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
+  unfold Stack.Lower.loadRefOperand Stack.Lower.operandConsume
+    Stack.Lower.bringToTop Stack.Lower.StackMap.depth?
     Stack.Lower.StackMap.popN Stack.Lower.StackMap.push
     Stack.Lower.isLastUse Stack.Lower.lastUsesLookup Stack.Lower.listContains
   rfl
@@ -11563,11 +11633,26 @@ theorem build_consume_binOp_witness_d0d1
       = .ok ({stkSt with stack := stkSt.stack.tail.tail}.push out) := by
   -- Derive the lowered-ops shape `[.swap, .opcode (binopOpcode op rt)]`
   -- from the depth + consume facts.
+  have hne : l ≠ r := by
+    intro h
+    rw [h] at hDepthL
+    rw [hDepthL] at hDepthR
+    simp at hDepthR
+  have hOpL : ∀ smx : StackMap,
+      Stack.Lower.loadRefOperand smx l [l, r] currentIndex lastUses []
+        = Stack.Lower.loadRefLive smx l currentIndex lastUses [] :=
+    fun smx => Stack.Lower.loadRefOperand_pair_left smx l r currentIndex lastUses [] hne
+  have hOpR : ∀ smx : StackMap,
+      Stack.Lower.loadRefOperand smx r [l, r] currentIndex lastUses []
+        = Stack.Lower.loadRefLive smx r currentIndex lastUses [] :=
+    fun smx => Stack.Lower.loadRefOperand_pair_right smx l r currentIndex lastUses [] hne
   have hOps :
       (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
           [] localBindings constInts sm name (.binOp op l r rt)).1
         = [StackOp.swap, .opcode (Stack.Lower.binopOpcode op rt)] := by
-    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    unfold Stack.Lower.lowerValueP
+    simp only [hOpL, hOpR]
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
       hLastUseL, hLastUseR, hDepthL]
     simp only [hNotBytes, Bool.false_eq_true, if_false, if_true]
@@ -12932,7 +13017,22 @@ theorem lowerValueP_binOp_d0d1_smOut
   | [], hDepthL, _ => simp [Stack.Lower.StackMap.depth?] at hDepthL
   | [_a], _, hDepthR => simp [Stack.Lower.StackMap.depth?] at hDepthR
   | a :: b :: rest, hDepthL, hDepthR =>
-      unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+      have hne : l ≠ r := by
+        intro h
+        rw [h] at hDepthL
+        rw [hDepthL] at hDepthR
+        simp at hDepthR
+      have hOpL : ∀ smx : StackMap,
+          Stack.Lower.loadRefOperand smx l [l, r] currentIndex lastUses []
+            = Stack.Lower.loadRefLive smx l currentIndex lastUses [] :=
+        fun smx => Stack.Lower.loadRefOperand_pair_left smx l r currentIndex lastUses [] hne
+      have hOpR : ∀ smx : StackMap,
+          Stack.Lower.loadRefOperand smx r [l, r] currentIndex lastUses []
+            = Stack.Lower.loadRefLive smx r currentIndex lastUses [] :=
+        fun smx => Stack.Lower.loadRefOperand_pair_right smx l r currentIndex lastUses [] hne
+      unfold Stack.Lower.lowerValueP
+      simp only [hOpL, hOpR]
+      unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
       simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
         hLastUseL, hLastUseR, hDepthL, hDepthR, if_true]
       show ((Stack.Lower.StackMap.popN (b :: a :: rest) 2).push name : StackMap)
@@ -13380,7 +13480,22 @@ private theorem lowerValueP_binOp_d0d1_ops
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
         [] localBindings constInts sm name (.binOp op l r rt)).1
       = [StackOp.swap, .opcode (Stack.Lower.binopOpcode op rt)] := by
-  unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+  have hne : l ≠ r := by
+    intro h
+    rw [h] at hDepthL
+    rw [hDepthL] at hDepthR
+    simp at hDepthR
+  have hOpL : ∀ smx : StackMap,
+      Stack.Lower.loadRefOperand smx l [l, r] currentIndex lastUses []
+        = Stack.Lower.loadRefLive smx l currentIndex lastUses [] :=
+    fun smx => Stack.Lower.loadRefOperand_pair_left smx l r currentIndex lastUses [] hne
+  have hOpR : ∀ smx : StackMap,
+      Stack.Lower.loadRefOperand smx r [l, r] currentIndex lastUses []
+        = Stack.Lower.loadRefLive smx r currentIndex lastUses [] :=
+    fun smx => Stack.Lower.loadRefOperand_pair_right smx l r currentIndex lastUses [] hne
+  unfold Stack.Lower.lowerValueP
+  simp only [hOpL, hOpR]
+  unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
   simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
     hLastUseL, hLastUseR, hDepthL]
   simp only [hNotBytes, Bool.false_eq_true, if_false, if_true]
@@ -16230,7 +16345,19 @@ theorem build_consume_binOp_witness_d1d0
       (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
           [] localBindings constInts (r :: l :: smRest) name (.binOp op l r rt)).1
         = [StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op rt)] := by
-    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    have hne : l ≠ r := by
+      rw [beq_eq_false_iff_ne] at hNeq; exact fun h => hNeq h.symm
+    have hOpL : ∀ smx : StackMap,
+        Stack.Lower.loadRefOperand smx l [l, r] currentIndex lastUses []
+          = Stack.Lower.loadRefLive smx l currentIndex lastUses [] :=
+      fun smx => Stack.Lower.loadRefOperand_pair_left smx l r currentIndex lastUses [] hne
+    have hOpR : ∀ smx : StackMap,
+        Stack.Lower.loadRefOperand smx r [l, r] currentIndex lastUses []
+          = Stack.Lower.loadRefLive smx r currentIndex lastUses [] :=
+      fun smx => Stack.Lower.loadRefOperand_pair_right smx l r currentIndex lastUses [] hne
+    unfold Stack.Lower.lowerValueP
+    simp only [hOpL, hOpR]
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
       Stack.Lower.StackMap.depth?
     simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
       hLastUseL, hLastUseR, hFindL, hFindR, if_true, hNotBytes, Bool.false_eq_true, if_false,

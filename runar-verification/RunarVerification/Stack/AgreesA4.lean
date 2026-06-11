@@ -202,13 +202,14 @@ theorem lowerValueP_eq_lowerValue_structuralCall
                     bringToTop sm arg false = (loadRef sm arg, sm.push arg) :=
                   bringToTop_copy_eq_loadRef_of_depth sm arg d hDepth
                 have hLowerArgsLiveSingleton :
-                    Stack.Lower.lowerArgsLive currentIndex lastUses outerProtected sm [arg]
+                    Stack.Lower.lowerArgsLive currentIndex lastUses outerProtected [arg] sm [arg]
                       = (loadRef sm arg, sm.push arg) := by
                   show (let (load, sm1) :=
-                          Stack.Lower.loadRefLive sm arg currentIndex lastUses outerProtected;
+                          Stack.Lower.loadRefOperand sm arg [arg] currentIndex lastUses outerProtected;
                         let (restOps, sm2) :=
-                          Stack.Lower.lowerArgsLive currentIndex lastUses outerProtected sm1 [];
+                          Stack.Lower.lowerArgsLive currentIndex lastUses outerProtected [arg] sm1 [];
                         (load ++ restOps, sm2)) = (loadRef sm arg, sm.push arg)
+                  rw [Stack.Lower.loadRefOperand_singleton]
                   unfold Stack.Lower.loadRefLive
                   simp [hNoConsume, hLoadRef, Stack.Lower.lowerArgsLive]
                 -- Now `lowerValueP` on `.call ("abs"/"len"/.../"pack") [arg]`.

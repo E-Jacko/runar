@@ -1779,11 +1779,12 @@ theorem lowerValueP_methodCall_passthrough_ops
     unfold Stack.Lower.StackMap.depth? List.findIdx?
     simp [List.findIdx?.go]
   have hArgLoad :
-      Stack.Lower.loadAndBindArgsLive currentIndex lastUses outerProtected
+      Stack.Lower.loadAndBindArgsLive currentIndex lastUses outerProtected [a]
           (a :: rest) [a] [p]
         = ([], p :: rest) := by
-    unfold Stack.Lower.loadAndBindArgsLive Stack.Lower.loadRefLive
-      Stack.Lower.bringToTop
+    unfold Stack.Lower.loadAndBindArgsLive
+    simp only [Stack.Lower.loadRefOperand_singleton]
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     simp only [hADepth, hArgUnprot, hArgLast, Bool.not_false, Bool.true_and,
       if_true, Stack.Lower.loadAndBindArgsLive, List.append_nil]
   -- Step 2: dispatch the methodCall arm with the above facts.

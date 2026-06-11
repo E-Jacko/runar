@@ -99,19 +99,21 @@ theorem lowerValueP_assert_statefulPrologue
 
 /-- The gated prologue body lowers (program-aware, liveness-on) to the 4-op
 prologue followed by the terminal `OP_VERIFY` (elided later by
-`lowerMethod`'s terminal-assert pass). -/
+`lowerMethod`'s terminal-assert pass). Stated on the FULL `(ops, sm)`
+pair — the post-body stack map is EMPTY, which the depth-gated epilogue
+in `lowerMethod` (TS `cleanupExcessStack` parity) now inspects. -/
 theorem lowerBindingsP_statefulPrologue
     (progMethods : List ANFMethod) (props : List ANFProperty)
     (budget : Nat) (localBindings : List String) (pre : String)
     (hne1 : pre ≠ "_cp0") (hne2 : pre ≠ "_opPushTxSig") :
     (Lower.lowerBindingsP progMethods props budget 0 [("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre, "_opPushTxSig"]
-        (StatefulBridge.gatedStatefulPrologueBody pre)).1
-      = statefulPrologueOps ++ [.opcode "OP_VERIFY"] := by
+        (StatefulBridge.gatedStatefulPrologueBody pre))
+      = (statefulPrologueOps ++ [.opcode "OP_VERIFY"], []) := by
   show (Lower.lowerBindingsP progMethods props budget 0 [("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre, "_opPushTxSig"]
-        [⟨"_cp0", .checkPreimage pre, none⟩, ⟨"_v", .assert "_cp0", none⟩]).1
-      = statefulPrologueOps ++ [.opcode "OP_VERIFY"]
+        [⟨"_cp0", .checkPreimage pre, none⟩, ⟨"_v", .assert "_cp0", none⟩])
+      = (statefulPrologueOps ++ [.opcode "OP_VERIFY"], [])
   rw [Lower.lowerBindingsP.eq_def]
   simp only [lowerValueP_checkPreimage_statefulPrologue progMethods props budget
     localBindings pre hne1 hne2]

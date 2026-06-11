@@ -220,6 +220,35 @@ the parent scope's stack map still expects them). Mirrors the TS
 def listContains (xs : List String) (x : String) : Bool :=
   xs.any (· == x)
 
+/--
+Consume-vs-copy decision for one operand of a multi-operand ANF value.
+Mirrors TS `operandConsume` (`05-stack-lower.ts:1143-1156`, PRs
+#62/#67/#68, implemented identically in all 7 production compilers):
+
+> consume = isLastUse(ref, bindingIndex) AND ref occurs exactly once in
+> the value's FULL operand list.
+
+`operands` is the full operand-ref list of the value (including `ref`
+itself). A ref that is read at more than one operand position of the
+same value must be copied (PICK / DUP) at EVERY position: a consume-mode
+load of a ref already on top of the stack is a no-op (`bringToTop` d0
+consume = `[]`), so two consume-mode loads of the same ref would leave a
+single slot for an opcode that pops one item per operand (e.g.
+`t := x + x` underflowing OP_ADD). The original value then simply stays
+on the stack, like any ref whose last use is a later binding. Reduces
+exactly to the old `isLastUse` form when `ref` occurs at most once.
+
+The Lean model additionally keeps the `outerProtected` gate that
+`loadRefLive` applies (the TS equivalent lives in `bringToTop`'s caller
+context). The repeated-operand clause is deliberately LAST so that
+copy-mode proofs (first conjuncts `false`) short-circuit without
+needing operand-distinctness facts.
+-/
+def operandConsume (lastUses : List (String × Nat)) (outerProtected : List String)
+    (ref : String) (operands : List String) (currentIndex : Nat) : Bool :=
+  !listContains outerProtected ref && isLastUse lastUses ref currentIndex
+    && ((operands.filter (· == ref)).length ≤ 1)
+
 /-- Names bound by a binding sequence — i.e. the LHS of every binding
 plus, for `update_prop`, the property name (which the binding writes to). -/
 def collectBoundNames : List ANFBinding → List String
@@ -452,39 +481,116 @@ def loadRefLiveCopy (sm : StackMap) (name : String) :
   bringToTop sm name false
 
 /--
+Liveness-aware single-operand load for MULTI-operand ANF values.
+Identical to `loadRefLive` except the consume decision goes through
+`operandConsume` against the value's FULL operand list (TS
+`operandConsume` call sites: binOp, generic call args, checkMultiSig,
+methodCall arg binding, computeStateOutput*/buildChangeOutput,
+addOutput/addRawOutput, math helpers, crypto builtins). Single-operand
+sites (loadParam, unaryOp, assert, if-cond, updateProp,
+deserializeState, extractors, checkPreimage, blake3Hash, sqrt, log2,
+sign) keep `loadRefLive` — TS uses bare `isLastUse` there.
+-/
+def loadRefOperand (sm : StackMap) (name : String) (operands : List String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  bringToTop sm name
+    (operandConsume lastUses outerProtected name operands currentIndex)
+
+/-- When `name` occurs at most once in `operands`, the repeated-operand
+clause is vacuous and `operandConsume` reduces to the old
+`loadRefLive` consume decision. -/
+theorem operandConsume_eq_of_unique (lastUses : List (String × Nat))
+    (outerProtected : List String) (ref : String) (operands : List String)
+    (currentIndex : Nat)
+    (h : (operands.filter (· == ref)).length ≤ 1) :
+    operandConsume lastUses outerProtected ref operands currentIndex
+      = (!listContains outerProtected ref && isLastUse lastUses ref currentIndex) := by
+  unfold operandConsume
+  simp [h]
+
+/-- `loadRefOperand` collapses to `loadRefLive` whenever the ref occurs
+at most once in the operand list (i.e. for every non-aliased value). -/
+theorem loadRefOperand_eq_of_unique (sm : StackMap) (name : String)
+    (operands : List String) (currentIndex : Nat)
+    (lastUses : List (String × Nat)) (outerProtected : List String)
+    (h : (operands.filter (· == name)).length ≤ 1) :
+    loadRefOperand sm name operands currentIndex lastUses outerProtected
+      = loadRefLive sm name currentIndex lastUses outerProtected := by
+  unfold loadRefOperand loadRefLive
+  rw [operandConsume_eq_of_unique _ _ _ _ _ h]
+
+/-- Distinct-pair bridge, left operand: `loadRefOperand` over `[l, r]`
+with `l ≠ r` equals the old `loadRefLive`. -/
+theorem loadRefOperand_pair_left (sm : StackMap) (l r : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (hne : l ≠ r) :
+    loadRefOperand sm l [l, r] currentIndex lastUses outerProtected
+      = loadRefLive sm l currentIndex lastUses outerProtected := by
+  apply loadRefOperand_eq_of_unique
+  have h : (r == l) = false := beq_eq_false_iff_ne.mpr (Ne.symm hne)
+  simp [List.filter, h]
+
+/-- Distinct-pair bridge, right operand. -/
+theorem loadRefOperand_pair_right (sm : StackMap) (l r : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (hne : l ≠ r) :
+    loadRefOperand sm r [l, r] currentIndex lastUses outerProtected
+      = loadRefLive sm r currentIndex lastUses outerProtected := by
+  apply loadRefOperand_eq_of_unique
+  have h : (l == r) = false := beq_eq_false_iff_ne.mpr hne
+  simp [List.filter, h]
+
+/-- Singleton bridge: a one-element operand list never repeats. -/
+@[simp] theorem loadRefOperand_singleton (sm : StackMap) (x : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) :
+    loadRefOperand sm x [x] currentIndex lastUses outerProtected
+      = loadRefLive sm x currentIndex lastUses outerProtected := by
+  apply loadRefOperand_eq_of_unique
+  simp [List.filter]
+
+/--
 Liveness-aware multi-arg loader. Threads `sm` through each load (so
 later args observe the depth-shifts caused by earlier consumes) and
 uses the same `(currentIndex, lastUses, outerProtected)` triple for
 every arg (mirroring TS `lowerCall` / `lowerBinOp`, which compute all
 `isLast*` flags at the same `bindingIndex`).
+
+`allOperands` is the FULL operand list of the value (TS passes the
+complete `args` list to `operandConsume` for every element, so each
+element is checked against ALL operands, not just the unprocessed
+tail). Callers pass the same list twice at the top level.
 -/
 def lowerArgsLive (currentIndex : Nat) (lastUses : List (String × Nat))
-    (outerProtected : List String) :
+    (outerProtected : List String) (allOperands : List String) :
     StackMap → List String → (List StackOp × StackMap)
   | sm, [] => ([], sm)
   | sm, a :: rest =>
-      let (load, sm1) := loadRefLive sm a currentIndex lastUses outerProtected
-      let (restOps, sm2) := lowerArgsLive currentIndex lastUses outerProtected sm1 rest
+      let (load, sm1) := loadRefOperand sm a allOperands currentIndex lastUses outerProtected
+      let (restOps, sm2) := lowerArgsLive currentIndex lastUses outerProtected allOperands sm1 rest
       (load ++ restOps, sm2)
 
 /--
 Liveness-aware variant of `loadAndBindArgs` for `methodCall` inlining.
 Loads each arg via `bringToTop` (consume on last use, modulo
-`outerProtected`) and renames the new top-of-stack slot to the
-corresponding callee param name.
+`outerProtected` and the repeated-operand clause — TS `inlineMethodCall`
+calls `operandConsume(arg, args, …)` per arg) and renames the new
+top-of-stack slot to the corresponding callee param name. `allOperands`
+is the full call arg list (the `obj` ref is NOT part of it, matching TS).
 -/
 def loadAndBindArgsLive (currentIndex : Nat) (lastUses : List (String × Nat))
-    (outerProtected : List String) :
+    (outerProtected : List String) (allOperands : List String) :
     StackMap → List String → List String → (List StackOp × StackMap)
   | sm, [], _ => ([], sm)
   | sm, _ :: _, [] => ([], sm)
   | sm, a :: rargs, p :: rparams =>
-      let (load, sm1) := loadRefLive sm a currentIndex lastUses outerProtected
+      let (load, sm1) := loadRefOperand sm a allOperands currentIndex lastUses outerProtected
       -- Rename the new top entry from `a` to `p` (the callee's param name).
       let sm2 := match sm1 with
                  | _ :: rest => p :: rest
                  | []        => [p]
-      let (rest, sm3) := loadAndBindArgsLive currentIndex lastUses outerProtected sm2 rargs rparams
+      let (rest, sm3) := loadAndBindArgsLive currentIndex lastUses outerProtected allOperands sm2 rargs rparams
       (load ++ rest, sm3)
 
 /-! ## Operator name → Bitcoin Script opcode -/
@@ -872,8 +978,11 @@ def lowerAddRawOutputOpsLive (sm : StackMap) (bindingName : String)
     (outerProtected : List String) : (List StackOp × StackMap) :=
   let opc (s : String) : StackOp := .opcode s
   let push (n : Int) : StackOp := .push (.bigint n)
+  -- Full operand list for the repeated-operand consume gate (TS
+  -- `lowerAddRawOutput` passes `[satoshis, scriptBytes]`).
+  let rawOperands : List String := [satoshis, scriptBytes]
   -- Step 1: bring scriptBytes to top, consuming on last use.
-  let (s1, sm1) := loadRefLive sm scriptBytes currentIndex lastUses outerProtected
+  let (s1, sm1) := loadRefOperand sm scriptBytes rawOperands currentIndex lastUses outerProtected
   -- Step 2: OP_SIZE, then varint encoding -> [..., script, varint]
   let s2 := [opc "OP_SIZE"] ++ varintEncodingOps
   -- After s2, the top entry on the stack map is the unnamed varint slot
@@ -885,7 +994,7 @@ def lowerAddRawOutputOpsLive (sm : StackMap) (bindingName : String)
   let s3 := [.swap, opc "OP_CAT"]
   let smAfterS3 := smAfterVarint.popN 1
   -- Step 4: bring satoshis to top, NUM2BIN(8), SWAP, OP_CAT.
-  let (s4Load, sm4) := loadRefLive smAfterS3 satoshis currentIndex lastUses outerProtected
+  let (s4Load, sm4) := loadRefOperand smAfterS3 satoshis rawOperands currentIndex lastUses outerProtected
   let s4 := s4Load ++ [push 8, opc "OP_NUM2BIN", .swap, opc "OP_CAT"]
   -- The final SWAP+CAT pair fuses the satoshis slot with the varint+script
   -- accumulator left on top after step 3 into a single output-bytes slot.
@@ -1015,9 +1124,10 @@ def lowerBuildChangeOutputOps (sm : StackMap) (bindingName : String)
   let s1 : List StackOp :=
     [.push (.bytes (ByteArray.mk #[0x19, 0x76, 0xa9, 0x14]))]
   let smAfterPrefix := sm.push "_prefix"
-  -- Step 2: bring pkh to top (consume on last use), CAT prefix||pkh.
+  -- Step 2: bring pkh to top (consume on last use, modulo the repeated-
+  -- operand gate over `[pkh, amount]`), CAT prefix||pkh.
   let (s2Load, sm2) :=
-    loadRefLive smAfterPrefix pkh currentIndex lastUses outerProtected
+    loadRefOperand smAfterPrefix pkh [pkh, amount] currentIndex lastUses outerProtected
   let s2 : List StackOp := s2Load ++ [opc "OP_CAT"]
   let smAfterPkhCat := (sm2.popN 2).push "_acc"
   -- Step 3: push suffix (OP_EQUALVERIFY + OP_CHECKSIG = 0x88ac), CAT.
@@ -1026,7 +1136,7 @@ def lowerBuildChangeOutputOps (sm : StackMap) (bindingName : String)
   let smAfterSuffix := (smAfterPkhCat.push "_suffix").popN 2 |>.push "_acc"
   -- Step 4: bring amount to top, NUM2BIN(8), SWAP, CAT (prepend).
   let (s4Load, sm4) :=
-    loadRefLive smAfterSuffix amount currentIndex lastUses outerProtected
+    loadRefOperand smAfterSuffix amount [pkh, amount] currentIndex lastUses outerProtected
   let s4 : List StackOp :=
     s4Load ++ [push 8, opc "OP_NUM2BIN", .swap, opc "OP_CAT"]
   -- Net stack-map effect: the SWAP+CAT pair fuses the amount slot with the
@@ -1051,16 +1161,19 @@ def lowerComputeStateOutputOps (sm : StackMap) (bindingName : String)
     (outerProtected : List String) : (List StackOp × StackMap) :=
   let opc (s : String) : StackOp := .opcode s
   let push (n : Int) : StackOp := .push (.bigint n)
+  -- Full operand list (TS `csoOperands = [preimageRef, stateBytesRef,
+  -- newAmountRef]`) for the repeated-operand consume gate.
+  let csoOperands : List String := [preimage, stateBytes, newAmount]
   -- Step A: bring preimage to top (consume on last use), then DROP it.
   --         The preimage is unused — `_codePart` and `_newAmount` carry
   --         all the information needed for the continuation output.
   let (sA, smA) :=
-    loadRefLive sm preimage currentIndex lastUses outerProtected
+    loadRefOperand sm preimage csoOperands currentIndex lastUses outerProtected
   let sA' : List StackOp := sA ++ [.drop]
   let smA' := smA.popN 1
   -- Step B: bring newAmount to top, NUM2BIN(8), TOALTSTACK.
   let (sB, smB) :=
-    loadRefLive smA' newAmount currentIndex lastUses outerProtected
+    loadRefOperand smA' newAmount csoOperands currentIndex lastUses outerProtected
   let sB' : List StackOp :=
     sB ++ [push 8, opc "OP_NUM2BIN", opc "OP_TOALTSTACK"]
   -- Net stack-map after step B: the named amount slot is replaced by
@@ -1068,7 +1181,7 @@ def lowerComputeStateOutputOps (sm : StackMap) (bindingName : String)
   let smB' := smB.popN 1
   -- Step C: bring stateBytes to top.
   let (sC, smC) :=
-    loadRefLive smB' stateBytes currentIndex lastUses outerProtected
+    loadRefOperand smB' stateBytes csoOperands currentIndex lastUses outerProtected
   -- Step D: bring _codePart to top (PICK, never consume).
   let (sD, smD) := bringToTop smC "_codePart" false
   -- Stack: [..., stateBytes, codePart]
@@ -1114,12 +1227,13 @@ def lowerComputeStateOutputHashOps (sm : StackMap) (bindingName : String)
     (List StackOp × StackMap) :=
   let opc (s : String) : StackOp := .opcode s
   let push (n : Int) : StackOp := .push (.bigint n)
-  -- Step A: bring stateBytes to top.
+  -- Step A: bring stateBytes to top (operand gate over the TS list
+  -- `[preimageRef, stateBytesRef]`).
   let (sA, smA) :=
-    loadRefLive sm stateBytes currentIndex lastUses outerProtected
+    loadRefOperand sm stateBytes [preimage, stateBytes] currentIndex lastUses outerProtected
   -- Step B: bring preimage to top.
   let (sB, smB) :=
-    loadRefLive smA preimage currentIndex lastUses outerProtected
+    loadRefOperand smA preimage [preimage, stateBytes] currentIndex lastUses outerProtected
   -- Step C: extract amount from preimage. End-relative: SIZE - 52 → split
   -- off prefix; then DROP prefix, take 8 bytes, drop tail.
   -- TS sequence (verbatim, modulo stack-map bookkeeping):
@@ -1184,14 +1298,15 @@ def lowerVerifyRabinSigOpsLive (sm : StackMap) (bindingName : String)
     (msg sig padding pubKey : String) (currentIndex : Nat)
     (lastUses : List (String × Nat)) (outerProtected : List String) :
     (List StackOp × StackMap) :=
+  let rabinOperands : List String := [msg, sig, padding, pubKey]
   let (loadMsg, sm1) :=
-    loadRefLive sm msg currentIndex lastUses outerProtected
+    loadRefOperand sm msg rabinOperands currentIndex lastUses outerProtected
   let (loadSig, sm2) :=
-    loadRefLive sm1 sig currentIndex lastUses outerProtected
+    loadRefOperand sm1 sig rabinOperands currentIndex lastUses outerProtected
   let (loadPad, sm3) :=
-    loadRefLive sm2 padding currentIndex lastUses outerProtected
+    loadRefOperand sm2 padding rabinOperands currentIndex lastUses outerProtected
   let (loadPk, sm4) :=
-    loadRefLive sm3 pubKey currentIndex lastUses outerProtected
+    loadRefOperand sm3 pubKey rabinOperands currentIndex lastUses outerProtected
   -- Stack bottom→top: msg sig padding pubKey
   let body : List StackOp :=
     [ StackOp.swap                    -- msg sig pubKey padding
@@ -1496,14 +1611,15 @@ runtime stack but unnamed in the stack map — we model it with a
 single `_acc` placeholder pushed by the caller).
 -/
 private def addOutputStateValuesLive (currentIndex : Nat)
-    (lastUses : List (String × Nat)) (outerProtected : List String) :
+    (lastUses : List (String × Nat)) (outerProtected : List String)
+    (allOperands : List String) :
     StackMap → List String → List ANFProperty → (List StackOp × StackMap)
   | sm, [], _ => ([], sm)
   | sm, _, [] => ([], sm)
   | sm, v :: vs, p :: ps =>
       let opc (s : String) : StackOp := .opcode s
       let push (n : Int) : StackOp := .push (.bigint n)
-      let (load, sm1) := loadRefLive sm v currentIndex lastUses outerProtected
+      let (load, sm1) := loadRefOperand sm v allOperands currentIndex lastUses outerProtected
       let conv : List StackOp :=
         if propTypeIsNumeric p.type then
           [push (Int.ofNat (propTypeFixedSize p.type)), opc "OP_NUM2BIN"]
@@ -1520,7 +1636,7 @@ private def addOutputStateValuesLive (currentIndex : Nat)
       let smAfterCat := (smAfterConv.popN 2).push "_acc"
       let (restOps, smRest) :=
         addOutputStateValuesLive currentIndex lastUses outerProtected
-          smAfterCat vs ps
+          allOperands smAfterCat vs ps
       (load ++ conv ++ [opc "OP_CAT"] ++ restOps, smRest)
 
 /--
@@ -1540,6 +1656,9 @@ def lowerAddOutputOpsLive (sm : StackMap) (bindingName : String)
   let opc (s : String) : StackOp := .opcode s
   let push (n : Int) : StackOp := .push (.bigint n)
   let stateProps := props.filter (fun p => !p.readonly)
+  -- Full operand list (TS `outputOperands = [satoshis, ...stateValues]`)
+  -- for the repeated-operand consume gate.
+  let outputOperands : List String := satoshis :: stateValues
   -- Step 1: bring _codePart to top (PICK — never consume, reused).
   let (s1, sm1) := bringToTop sm "_codePart" false
   -- Step 2: append OP_RETURN byte (0x6a). Push pops 0 / pushes 1, then
@@ -1552,7 +1671,7 @@ def lowerAddOutputOpsLive (sm : StackMap) (bindingName : String)
   -- Step 3: serialize each state value.
   let (s3, sm3) :=
     addOutputStateValuesLive currentIndex lastUses outerProtected
-      smAcc stateValues stateProps
+      outputOperands smAcc stateValues stateProps
   -- Step 4: compute varint prefix.
   let s4 : List StackOp := [opc "OP_SIZE"] ++ varintEncodingOps
   -- After s4: top is the unnamed varint slot.
@@ -1562,7 +1681,7 @@ def lowerAddOutputOpsLive (sm : StackMap) (bindingName : String)
   let smAfterS5 := smAfterVarint.popN 1
   -- Step 6: prepend satoshis as 8-byte LE.
   let (s6Load, sm6) :=
-    loadRefLive smAfterS5 satoshis currentIndex lastUses outerProtected
+    loadRefOperand smAfterS5 satoshis outputOperands currentIndex lastUses outerProtected
   let s6Ops : List StackOp :=
     [push 8, opc "OP_NUM2BIN", .swap, opc "OP_CAT"]
   -- The final SWAP+CAT pair fuses the satoshis slot with the varint+script
@@ -2251,8 +2370,8 @@ def lowerSha256CompressOpsLive (sm : StackMap) (bindingName : String)
     (state block : String)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) : (List StackOp × StackMap) :=
-  let (loadState, sm1) := loadRefLive sm state currentIndex lastUses outerProtected
-  let (loadBlock, sm2) := loadRefLive sm1 block currentIndex lastUses outerProtected
+  let (loadState, sm1) := loadRefOperand sm state [state, block] currentIndex lastUses outerProtected
+  let (loadBlock, sm2) := loadRefOperand sm1 block [state, block] currentIndex lastUses outerProtected
   -- After compress: pop state+block (2 slots) and push the new state
   -- (named under `bindingName`). The compress body is depth-neutral: -1.
   let smFinal := (sm2.popN 2).push bindingName
@@ -2271,9 +2390,10 @@ def lowerSha256FinalizeOpsLive (sm : StackMap) (bindingName : String)
     (state remaining msgBitLen : String)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) : (List StackOp × StackMap) :=
-  let (loadState, sm1) := loadRefLive sm state currentIndex lastUses outerProtected
-  let (loadRem, sm2)   := loadRefLive sm1 remaining currentIndex lastUses outerProtected
-  let (loadBits, sm3)  := loadRefLive sm2 msgBitLen currentIndex lastUses outerProtected
+  let finOperands : List String := [state, remaining, msgBitLen]
+  let (loadState, sm1) := loadRefOperand sm state finOperands currentIndex lastUses outerProtected
+  let (loadRem, sm2)   := loadRefOperand sm1 remaining finOperands currentIndex lastUses outerProtected
+  let (loadBits, sm3)  := loadRefOperand sm2 msgBitLen finOperands currentIndex lastUses outerProtected
   -- After finalize: pop 3 args, push 1 result.
   let smFinal := (sm3.popN 3).push bindingName
   (loadState ++ loadRem ++ loadBits ++ shaEmitFinalize, smFinal)
@@ -2306,8 +2426,8 @@ def lowerBlake3CompressOpsLive (sm : StackMap) (bindingName : String)
     (chainingValue block : String)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) : (List StackOp × StackMap) :=
-  let (loadCV, sm1) := loadRefLive sm chainingValue currentIndex lastUses outerProtected
-  let (loadBlock, sm2) := loadRefLive sm1 block currentIndex lastUses outerProtected
+  let (loadCV, sm1) := loadRefOperand sm chainingValue [chainingValue, block] currentIndex lastUses outerProtected
+  let (loadBlock, sm2) := loadRefOperand sm1 block [chainingValue, block] currentIndex lastUses outerProtected
   let smFinal := (sm2.popN 2).push bindingName
   (loadCV ++ loadBlock ++ b3CompressOps, smFinal)
 
@@ -2337,9 +2457,9 @@ def lowerVerifyWotsOpsLive (sm : StackMap) (bindingName : String)
     (msg sig pubkey : String)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) : (List StackOp × StackMap) :=
-  let (loadMsg, sm1) := loadRefLive sm msg currentIndex lastUses outerProtected
-  let (loadSig, sm2) := loadRefLive sm1 sig currentIndex lastUses outerProtected
-  let (loadPk,  sm3) := loadRefLive sm2 pubkey currentIndex lastUses outerProtected
+  let (loadMsg, sm1) := loadRefOperand sm msg [msg, sig, pubkey] currentIndex lastUses outerProtected
+  let (loadSig, sm2) := loadRefOperand sm1 sig [msg, sig, pubkey] currentIndex lastUses outerProtected
+  let (loadPk,  sm3) := loadRefOperand sm2 pubkey [msg, sig, pubkey] currentIndex lastUses outerProtected
   let smFinal := (sm3.popN 3).push bindingName
   (loadMsg ++ loadSig ++ loadPk ++ wotsBodyOps, smFinal)
 
@@ -2364,7 +2484,7 @@ def lowerEcBuiltinOpsLive (sm : StackMap) (bindingName : String)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) : (List StackOp × StackMap) :=
   -- Load all args to TOS
-  let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected sm args
+  let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected args sm args
   -- Pick the right op list
   let body : List StackOp :=
     if func = "ecAdd" then emitEcAdd
@@ -2396,7 +2516,7 @@ def lowerP256P384BuiltinOpsLive (sm : StackMap) (bindingName : String)
     (func : String) (args : List String)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) : (List StackOp × StackMap) :=
-  let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected sm args
+  let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected args sm args
   let body : List StackOp :=
     if func = "p256Add" then emitP256Add
     else if func = "p256Mul" then emitP256Mul
@@ -2430,9 +2550,9 @@ def lowerVerifySlhDsaOpsLive (sm : StackMap) (bindingName : String)
     (paramKey : String) (msg sig pubkey : String)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) : (List StackOp × StackMap) :=
-  let (loadMsg, sm1) := loadRefLive sm  msg    currentIndex lastUses outerProtected
-  let (loadSig, sm2) := loadRefLive sm1 sig    currentIndex lastUses outerProtected
-  let (loadPk,  sm3) := loadRefLive sm2 pubkey currentIndex lastUses outerProtected
+  let (loadMsg, sm1) := loadRefOperand sm  msg    [msg, sig, pubkey] currentIndex lastUses outerProtected
+  let (loadSig, sm2) := loadRefOperand sm1 sig    [msg, sig, pubkey] currentIndex lastUses outerProtected
+  let (loadPk,  sm3) := loadRefOperand sm2 pubkey [msg, sig, pubkey] currentIndex lastUses outerProtected
   let smFinal := (sm3.popN 3).push bindingName
   (loadMsg ++ loadSig ++ loadPk ++ emitVerifySLHDSABody paramKey, smFinal)
 
@@ -2451,7 +2571,7 @@ def lowerBabyBearBuiltinOpsLive (sm : StackMap) (bindingName : String)
     (func : String) (args : List String)
     (currentIndex : Nat) (lastUses : List (String × Nat))
     (outerProtected : List String) : (List StackOp × StackMap) :=
-  let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected sm args
+  let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected args sm args
   let body : List StackOp :=
     if func = "bbFieldAdd" then emitBBFieldAdd
     else if func = "bbFieldSub" then emitBBFieldSub
@@ -2526,10 +2646,13 @@ def lowerMerkleRootOpsLive (sm : StackMap) (bindingName : String)
               | none   => ([], sm)
             -- Step 2: bring leaf, proof, index to TOS via the standard
             -- liveness-aware load helper. Each call updates `sm` so the
-            -- next bringToTop sees the prior arg sitting on top.
-            let (loadLeaf,  sm2) := loadRefLive smPostDepth leaf  currentIndex lastUses outerProtected
-            let (loadProof, sm3) := loadRefLive sm2        proof currentIndex lastUses outerProtected
-            let (loadIndex, sm4) := loadRefLive sm3        index currentIndex lastUses outerProtected
+            -- next bringToTop sees the prior arg sitting on top. The
+            -- repeated-operand gate checks against the FULL 4-element
+            -- arg list (TS `operandConsume(arg, args, …)` — `args`
+            -- includes the compile-time `depth` ref).
+            let (loadLeaf,  sm2) := loadRefOperand smPostDepth leaf  args currentIndex lastUses outerProtected
+            let (loadProof, sm3) := loadRefOperand sm2        proof args currentIndex lastUses outerProtected
+            let (loadIndex, sm4) := loadRefOperand sm3        index args currentIndex lastUses outerProtected
             -- Step 3: splice the precomputed body. Body net: pop 3, push 1.
             let body : List StackOp :=
               if func = "merkleRootSha256" then merkleRootSha256Ops depth
@@ -2573,14 +2696,16 @@ def lowerCheckMultiSigOpsLive (sm : StackMap) (bindingName : String)
   -- Dummy `0` required by Bitcoin's OP_CHECKMULTISIG off-by-one bug.
   let dummy : List StackOp := [StackOp.push (.bigint 0)]
   let sm0 : StackMap := sm.push "_checkmultisig_dummy"
-  -- Bring sigs array to TOS.
-  let (loadSigs, sm1) := loadRefLive sm0 sigs currentIndex lastUses outerProtected
+  -- Bring sigs array to TOS. The repeated-operand gate checks against
+  -- the combined operand list (TS `msigOperands = [...sigElems,
+  -- ...pkElems]`; the Lean model operates on the two array refs).
+  let (loadSigs, sm1) := loadRefOperand sm0 sigs [sigs, pubkeys] currentIndex lastUses outerProtected
   -- Placeholder nSigs count. Byte-exact emit requires `arrayLengths`
   -- tracking which is not yet threaded through `lowerValueP`.
   let nSigs : List StackOp := [StackOp.push (.bigint 0)]
   let sm2 : StackMap := sm1.push "_checkmultisig_nsigs"
   -- Bring pubkeys array to TOS.
-  let (loadPks, sm3) := loadRefLive sm2 pubkeys currentIndex lastUses outerProtected
+  let (loadPks, sm3) := loadRefOperand sm2 pubkeys [sigs, pubkeys] currentIndex lastUses outerProtected
   -- Placeholder nPKs count (same reason as nSigs).
   let nPks : List StackOp := [StackOp.push (.bigint 0)]
   let sm4 : StackMap := sm3.push "_checkmultisig_npks"
@@ -2811,8 +2936,11 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
   | .loadConst c =>
       (emitConst c, sm.push bindingName, localBindings)
   | .binOp op l r rt =>
-      let (lOps, sm1) := loadRefLive sm l currentIndex lastUses outerProtected
-      let (rOps, sm2) := loadRefLive sm1 r currentIndex lastUses outerProtected
+      -- Repeated-operand gate (PRs #62/#67/#68): a ref reading BOTH
+      -- operand positions (`t := x + x`) is COPIED at every position;
+      -- consume only when the ref occurs exactly once in `[l, r]`.
+      let (lOps, sm1) := loadRefOperand sm l [l, r] currentIndex lastUses outerProtected
+      let (rOps, sm2) := loadRefOperand sm1 r [l, r] currentIndex lastUses outerProtected
       let base := lOps ++ rOps ++ [.opcode (binopOpcode op rt)]
       let ops := if op == "!==" && rt == some "bytes" then base ++ [.opcode "OP_NOT"] else base
       -- Binop pops 2, pushes 1 (the named result).
@@ -2840,7 +2968,7 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         | _ =>
             -- Malformed extractor (wrong arity) — fall back to builtin path.
             let (argOps, sm1) :=
-              lowerArgsLive currentIndex lastUses outerProtected sm args
+              lowerArgsLive currentIndex lastUses outerProtected args sm args
             let opcodeOps := (builtinOpcode func).map (.opcode)
             let sm2 := (sm1.popN args.length).push bindingName
             (argOps ++ opcodeOps, sm2, localBindings)
@@ -2879,12 +3007,12 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         -- top before the first SPLIT — corrupting the byte sequence.
         match args with
         | [data, start, length] =>
-            let (loadData, sm1) := loadRefLive sm data currentIndex lastUses outerProtected
-            let (loadStart, sm2) := loadRefLive sm1 start currentIndex lastUses outerProtected
+            let (loadData, sm1) := loadRefOperand sm data [data, start, length] currentIndex lastUses outerProtected
+            let (loadStart, sm2) := loadRefOperand sm1 start [data, start, length] currentIndex lastUses outerProtected
             -- After SPLIT NIP we've popped (data, start) and pushed `right`.
             let smAfterFirst : StackMap := (sm2.popN 2).push "_substr_right"
             let (loadLen, sm3) :=
-              loadRefLive smAfterFirst length currentIndex lastUses outerProtected
+              loadRefOperand smAfterFirst length [data, start, length] currentIndex lastUses outerProtected
             -- After SPLIT DROP we've popped (right, length) and pushed
             -- the substr result under `bindingName`.
             let smFinal : StackMap := (sm3.popN 2).push bindingName
@@ -2901,8 +3029,8 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         -- pop 2 args, push 1 result.
         match args with
         | [amount, bps] =>
-            let (loadA, sm1) := loadRefLive sm amount currentIndex lastUses outerProtected
-            let (loadB, sm2) := loadRefLive sm1 bps currentIndex lastUses outerProtected
+            let (loadA, sm1) := loadRefOperand sm amount [amount, bps] currentIndex lastUses outerProtected
+            let (loadB, sm2) := loadRefOperand sm1 bps [amount, bps] currentIndex lastUses outerProtected
             let smFinal : StackMap := (sm2.popN 2).push bindingName
             (loadA ++ loadB ++
               [StackOp.opcode "OP_MUL",
@@ -2918,11 +3046,11 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         -- before `c` is pushed.
         match args with
         | [a, b, c] =>
-            let (loadA, sm1) := loadRefLive sm a currentIndex lastUses outerProtected
-            let (loadB, sm2) := loadRefLive sm1 b currentIndex lastUses outerProtected
+            let (loadA, sm1) := loadRefOperand sm a [a, b, c] currentIndex lastUses outerProtected
+            let (loadB, sm2) := loadRefOperand sm1 b [a, b, c] currentIndex lastUses outerProtected
             let smPostMul : StackMap := (sm2.popN 2).push "_mulDiv_intermediate"
             let (loadC, sm3) :=
-              loadRefLive smPostMul c currentIndex lastUses outerProtected
+              loadRefOperand smPostMul c [a, b, c] currentIndex lastUses outerProtected
             let smFinal : StackMap := (sm3.popN 2).push bindingName
             (loadA ++ loadB
               ++ [StackOp.opcode "OP_MUL"]
@@ -2937,8 +3065,8 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         -- `b == 0` before the division/mod.
         match args with
         | [a, b] =>
-            let (loadA, sm1) := loadRefLive sm a currentIndex lastUses outerProtected
-            let (loadB, sm2) := loadRefLive sm1 b currentIndex lastUses outerProtected
+            let (loadA, sm1) := loadRefOperand sm a [a, b] currentIndex lastUses outerProtected
+            let (loadB, sm2) := loadRefOperand sm1 b [a, b] currentIndex lastUses outerProtected
             let opc := if func = "safediv" then "OP_DIV" else "OP_MOD"
             let smFinal : StackMap := (sm2.popN 2).push bindingName
             (loadA ++ loadB ++
@@ -2955,11 +3083,11 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         -- between the two opcode emissions.
         match args with
         | [val, lo, hi] =>
-            let (loadV, sm1) := loadRefLive sm val currentIndex lastUses outerProtected
-            let (loadL, sm2) := loadRefLive sm1 lo currentIndex lastUses outerProtected
+            let (loadV, sm1) := loadRefOperand sm val [val, lo, hi] currentIndex lastUses outerProtected
+            let (loadL, sm2) := loadRefOperand sm1 lo [val, lo, hi] currentIndex lastUses outerProtected
             let smPostMax : StackMap := (sm2.popN 2).push "_clamp_intermediate"
             let (loadH, sm3) :=
-              loadRefLive smPostMax hi currentIndex lastUses outerProtected
+              loadRefOperand smPostMax hi [val, lo, hi] currentIndex lastUses outerProtected
             let smFinal : StackMap := (sm3.popN 2).push bindingName
             (loadV ++ loadL
               ++ [StackOp.opcode "OP_MAX"]
@@ -2983,8 +3111,8 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         --   OP_NIP OP_NIP                       -- result
         match args with
         | [base, exp] =>
-            let (loadB, sm1) := loadRefLive sm base currentIndex lastUses outerProtected
-            let (loadE, sm2) := loadRefLive sm1 exp currentIndex lastUses outerProtected
+            let (loadB, sm1) := loadRefOperand sm base [base, exp] currentIndex lastUses outerProtected
+            let (loadE, sm2) := loadRefOperand sm1 exp [base, exp] currentIndex lastUses outerProtected
             let smFinal : StackMap := (sm2.popN 2).push bindingName
             let header : List StackOp :=
               [StackOp.swap, StackOp.push (.bigint 1)]
@@ -3043,8 +3171,8 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         --   OP_DROP                                   -- result
         match args with
         | [a, b] =>
-            let (loadA, sm1) := loadRefLive sm a currentIndex lastUses outerProtected
-            let (loadB, sm2) := loadRefLive sm1 b currentIndex lastUses outerProtected
+            let (loadA, sm1) := loadRefOperand sm a [a, b] currentIndex lastUses outerProtected
+            let (loadB, sm2) := loadRefOperand sm1 b [a, b] currentIndex lastUses outerProtected
             let smFinal : StackMap := (sm2.popN 2).push bindingName
             let header : List StackOp :=
               [ StackOp.opcode "OP_ABS"
@@ -3126,8 +3254,8 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         -- stack effect: pop 2, push 1.
         match args with
         | [a, b] =>
-            let (loadA, sm1) := loadRefLive sm a currentIndex lastUses outerProtected
-            let (loadB, sm2) := loadRefLive sm1 b currentIndex lastUses outerProtected
+            let (loadA, sm1) := loadRefOperand sm a [a, b] currentIndex lastUses outerProtected
+            let (loadB, sm2) := loadRefOperand sm1 b [a, b] currentIndex lastUses outerProtected
             let smFinal : StackMap := (sm2.popN 2).push bindingName
             (loadA ++ loadB ++
               [StackOp.opcode "OP_2DUP",
@@ -3270,7 +3398,7 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
         | _ =>
             ([.opcode "OP_RUNAR_CHECKMULTISIG_ARITY"], sm.push bindingName, localBindings)
       else
-        let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected sm args
+        let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected args sm args
         let opcodeOps := (builtinOpcode func).map (.opcode)
         -- Most builtins are pop-N push-1; we approximate with that shape.
         let sm2 := (sm1.popN args.length).push bindingName
@@ -3283,7 +3411,7 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
           match lookupMethod progMethods method with
           | none =>
               -- Unresolved method — fall back to a builtin-style call.
-              let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected sm args
+              let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected args sm args
               let opcodeOps := (builtinOpcode method).map (.opcode)
               let sm2 := (sm1.popN args.length).push bindingName
               (argOps ++ opcodeOps, sm2, localBindings)
@@ -3301,7 +3429,7 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
                 | none   => ([], sm)
               let paramNames := m.params.map (·.name)
               let (argLoads, smArgs) :=
-                loadAndBindArgsLive currentIndex lastUses outerProtected smPostObj args paramNames
+                loadAndBindArgsLive currentIndex lastUses outerProtected args smPostObj args paramNames
               -- TS `inlineMethodCall` (`05-stack-lower.ts:1591-1644`) reuses
               -- the SAME `LoweringContext` (and thus the same
               -- `outerProtectedRefs`) when it calls `lowerBindings` on the
@@ -3783,10 +3911,29 @@ def lowerMethod (progMethods : List ANFMethod) (props : List ANFProperty) (m : A
       rawOps.dropLast
     else
       rawOps
-  -- Excess-stack cleanup. Mirrors TS `lowerMethod`'s post-pass at
-  -- `05-stack-lower.ts:4937-4942`: public methods whose body deserialized
-  -- state must emit `OP_NIP` repeatedly until only the truthy boolean (the
+  -- Excess-stack cleanup. Mirrors TS `lowerMethod`'s post-pass
+  -- (`05-stack-lower.ts:4920-4935` + `cleanupExcessStack`): public
+  -- methods emit `OP_NIP` repeatedly until only the truthy boolean (the
   -- terminal assert's residue) remains on top of the runtime stack.
+  -- The TS reference runs `cleanupExcessStack()` UNCONDITIONALLY for
+  -- public methods (the old `hasDeserializeState` gate missed the
+  -- readonly-field-binding path and failed mainnet CLEANSTACK; it also
+  -- removes refs left behind by the repeated-operand COPY rule of PRs
+  -- #62/#67/#68 — the canonical `t := x + x` fixtures end with a NIP
+  -- that removes the lingering `x`).
+  --
+  -- The Lean gate is `isPublic && bodyEndsInAssert && depth > 1`. The
+  -- extra `bodyEndsInAssert` conjunct is byte-IDENTICAL to TS on every
+  -- validator-accepted program: `02-validate.ts:325-344` REQUIRES public
+  -- methods to end with `assert()` (stateful contracts auto-inject it),
+  -- so `bodyEndsInAssert = true` whenever the TS epilogue can differ
+  -- from a no-op. The conjunct exists so the `*_no_post` bridge lemmas
+  -- (keyed on `bodyEndsInAssert = false` — shapes reachable only via
+  -- hand-written `--ir` input) remain true as stated. Known residual
+  -- model-vs-TS divergence: a hand-written public IR body that does NOT
+  -- end in assert and leaves ≥ 2 stack slots gets TS NIPs but no model
+  -- NIPs — degenerate (validator-rejected) and outside every pinned
+  -- fixture.
   --
   -- The TS reference computes `excess = stackMap.depth - 1` against the
   -- depth *after* the body has run, including the terminal assert's
@@ -3800,7 +3947,7 @@ def lowerMethod (progMethods : List ANFMethod) (props : List ANFProperty) (m : A
   let depthAfterBody : Nat :=
     finalSm.length + (if droppedTerminalVerify then 1 else 0)
   let nipCount : Nat :=
-    if m.isPublic && bindingsUseDeserializeState m.body && depthAfterBody > 1 then
+    if m.isPublic && bodyEndsInAssert m.body && depthAfterBody > 1 then
       depthAfterBody - 1
     else
       0
