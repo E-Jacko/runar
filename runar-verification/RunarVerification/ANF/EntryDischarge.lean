@@ -104,8 +104,14 @@ theorem arith_consume_from_witness
         0 false)
     (witness : List Value)
     (hnd : (anfM.params.map ANFParam.name).Nodup)
-    (hAllBigint : ∀ pr ∈ anfM.params, pr.type = ANFType.bigint) :
-    successAgrees
+    (hAllBigint : ∀ pr ∈ anfM.params, pr.type = ANFType.bigint)
+    -- 2026-06-11 truthy-top success-bit repair: the arith fragment is
+    -- value-terminated, so the acceptance restatement carries the keyed
+    -- truthiness premise (see the consume theorem's docstring).
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes (mkStackEntry anfM.params [] witness) = .ok s →
+        RunarVerification.Stack.Eval.topTruthy s.stack = true) :
+    RunarVerification.Stack.Eval.acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods
         (mkEntryState anfM.params [] witness) anfM.body)
       (runParsedBytes bytes (mkStackEntry anfM.params [] witness)) :=
@@ -121,6 +127,7 @@ theorem arith_consume_from_witness
     (mkEntryState_entryBigintTyped_noProps anfM.params [] witness hnd)
     (entryTsmArithTyped_mkEntry [] anfM.params hnd hAllBigint)
     (tsmCoherent_mkEntry [] anfM.params [] witness hnd)
+    hTopTruthy
 
 /-! ## WS0a Task 8-A — the arith discharge is harness-instantiable
 
@@ -233,8 +240,11 @@ theorem arith_family_verified
     (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
     (hReady : arithFamilyReady p anfM bytes = true)
     (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
-    (witness : List Value) :
-    successAgrees
+    (witness : List Value)
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes (mkStackEntry anfM.params [] witness) = .ok s →
+        RunarVerification.Stack.Eval.topTruthy s.stack = true) :
+    RunarVerification.Stack.Eval.acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods
         (mkEntryState anfM.params [] witness) anfM.body)
       (runParsedBytes bytes (mkStackEntry anfM.params [] witness)) := by
@@ -258,7 +268,7 @@ theorem arith_family_verified
       rw [hSinglePublic]; exact List.mem_singleton_self anfM
     exact (List.mem_filter.mp hmem).1
   exact arith_consume_from_witness p hWF anfM bytes hMem hPub hSafe hSinglePublic
-    hName hChain witness hnd hAllBigint
+    hName hChain witness hnd hAllBigint hTopTruthy
 
 /-! ## Non-vacuity smoke
 
@@ -318,12 +328,19 @@ private theorem smoke_filter :
 /-- **Smoke — `arith_family_verified` fires for the concrete program.**
 The bundled discharge holds on `Add3Sub` for an arbitrary runtime
 `witness`, so the bundle is non-vacuous. -/
-theorem smoke_arith_family_verified (witness : List Value) :
-    successAgrees
+theorem smoke_arith_family_verified (witness : List Value)
+    -- The witness is ARBITRARY, so the final arith value's truthiness is
+    -- genuinely input-dependent — carried as the keyed premise, exactly as
+    -- on the headline theorem (2026-06-11 truthy-top repair).
+    (hTopTruthy : Lower.bodyEndsInAssert smokeArithMethod.body = false →
+      ∀ s, runParsedBytes smokeArithBytes
+          (mkStackEntry smokeArithMethod.params [] witness) = .ok s →
+        RunarVerification.Stack.Eval.topTruthy s.stack = true) :
+    RunarVerification.Stack.Eval.acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP smokeArithProg.methods
         (mkEntryState smokeArithMethod.params [] witness) smokeArithMethod.body)
       (runParsedBytes smokeArithBytes (mkStackEntry smokeArithMethod.params [] witness)) :=
   arith_family_verified smokeArithProg smokeArithMethod smokeArithBytes
-    smoke_arithFamilyReady smoke_filter witness
+    smoke_arithFamilyReady smoke_filter witness hTopTruthy
 
 end RunarVerification.ANF.EntryDischarge

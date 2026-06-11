@@ -15,6 +15,7 @@ import RunarVerification.Stack.AgreesD1
 import RunarVerification.Stack.AgreesD2
 import RunarVerification.Stack.Peephole
 import RunarVerification.Stack.Eval
+import RunarVerification.Stack.Accept
 import RunarVerification.Stack.TxContext
 import RunarVerification.Script.Emit
 import RunarVerification.Script.EmitCorrect
@@ -300,15 +301,28 @@ peephole, emit/parse, and VM-agreement lemmas.
 namespace Soundness
 
 open RunarVerification.ANF.Eval (State EvalResult)
-open RunarVerification.Stack.Eval (StackState runOps runMethod)
+open RunarVerification.Stack.Eval (StackState runOps runMethod
+  scriptAccepts topTruthy acceptAgrees)
 open RunarVerification.ANF.Eval (EvalError)
 
-/-- Two `EvalResult` values agree on the **success bit** — i.e. both
-succeeded, or both failed. This is the weakest-but-still-meaningful
-notion of observational equivalence: cryptographic primitives are
-opaque axioms, so we cannot in general compare their concrete payloads,
-but the pass/fail outcome of a Bitcoin Script is exactly what
-consensus checks. -/
+/-- Two `EvalResult` values agree on the **completion bit** — i.e. both
+ran to completion without a VM error, or both failed.
+
+**TRUST-MODEL NOTE (2026-06-11 truthy-top success-bit repair).** This
+is NOT the consensus bit on the bytes side: Bitcoin consensus accepts a
+script run only when it completes AND leaves a truthy top-of-stack, and
+the compiler's terminal-assert elision (`lowerMethod` drops a public
+method's trailing `OP_VERIFY`) is designed around exactly that rule —
+the deployed bytes of an assert-terminated method COMPLETE with the
+falsy bool on top when the assert fails, while the ANF evaluator
+errors (pinned by `termCx_*` below). Every HEADLINE theorem (the
+omnibus, both surviving sub-omnibus axioms, all discharged consume
+theorems, and the agreement smokes) is therefore stated over
+`Stack.Eval.acceptAgrees` (ANF completion ⟷ bytes ACCEPTANCE,
+`scriptAccepts` = completes-with-truthy-top). `successAgrees` survives
+only as internal plumbing for the M2/M3/M4 walk legs (which genuinely
+relate completion bits of intermediate artifacts) and for the
+conditional skeletons. -/
 def successAgrees {α β : Type} (a : EvalResult α) (b : EvalResult β) : Prop :=
   a.toOption.isSome ↔ b.toOption.isSome
 
@@ -3132,17 +3146,27 @@ theorem aliasCx_stack_succeeds :
      | .error _ => false) = true := by
   native_decide
 
-/-- Agreement smoke for the former counterexample: the ANF evaluation and
-the deployed bytes now AGREE on the success bit (both succeed). -/
-theorem aliasCx_successAgrees (bytes : ByteArray)
+/-- The deployed bytes are ACCEPTED on the matching entry (the doubled
+value `10` lands on top — truthy). Acceptance-bit companion to
+`aliasCx_stack_succeeds` (2026-06-11 truthy-top success-bit repair). -/
+theorem aliasCx_bytes_accepted :
+    (match compileSafe aliasCxProg with
+     | .ok bytes => scriptAccepts (runParsedBytes bytes { stack := [.vBigint 5] })
+     | .error _ => false) = true := by
+  native_decide
+
+/-- Agreement smoke for the former counterexample, RESTATED on the
+consensus acceptance bit (2026-06-11): the ANF evaluation completes and
+the deployed bytes are accepted. -/
+theorem aliasCx_acceptAgrees (bytes : ByteArray)
     (hSafe : compileSafe aliasCxProg = .ok bytes) :
-    successAgrees
+    acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP aliasCxProg.methods
         { params := [("x", .vBigint 5)] } aliasCxM.body)
       (runParsedBytes bytes { stack := [.vBigint 5] }) := by
-  have hStack := aliasCx_stack_succeeds
-  rw [hSafe] at hStack
-  exact iff_of_true (by simpa using aliasCx_anf_succeeds) (by simpa using hStack)
+  have hAccept := aliasCx_bytes_accepted
+  rw [hSafe] at hAccept
+  exact Stack.Eval.acceptAgrees_of_bits_true aliasCx_anf_succeeds hAccept
 
 /-- The guard rejects the repeated-operand shape (kept as a regression pin
 for the guard definition itself). -/
@@ -3332,37 +3356,112 @@ theorem loopOk_stack_succeeds :
      | .error _ => false) = true := by
   native_decide
 
-/-- Agreement smoke for the fixed class: ANF and deployed bytes agree on
-the success bit (both succeed) on the satisfying entry. -/
-theorem loopOk_successAgrees (bytes : ByteArray)
+/-- The deployed bytes are ACCEPTED on the satisfying entry: the elided
+terminal assert's `OP_NUMEQUAL` result (`true`) survives the epilogue
+NIPs on top. -/
+theorem loopOk_bytes_accepted :
+    (match compileSafe loopOkProg with
+     | .ok bytes => scriptAccepts (runParsedBytes bytes { stack := [.vBigint 0] })
+     | .error _ => false) = true := by
+  native_decide
+
+/-- Agreement smoke for the fixed class, RESTATED on the consensus
+acceptance bit (2026-06-11): ANF completes and the bytes are accepted on
+the satisfying entry. -/
+theorem loopOk_acceptAgrees (bytes : ByteArray)
     (hSafe : compileSafe loopOkProg = .ok bytes) :
-    successAgrees
+    acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP loopOkProg.methods
         { params := [("start", .vBigint 0)]
         , props := [("expectedSum", .vBigint 0)] } loopOkM.body)
       (runParsedBytes bytes { stack := [.vBigint 0] }) := by
-  have hStack := loopOk_stack_succeeds
-  rw [hSafe] at hStack
-  exact iff_of_true (by simpa using loopOk_anf_succeeds) (by simpa using hStack)
+  have hAccept := loopOk_bytes_accepted
+  rw [hSafe] at hAccept
+  exact Stack.Eval.acceptAgrees_of_bits_true loopOk_anf_succeeds hAccept
 
-/-! ### termCx — pre-existing terminal-assert success-bit gap (KNOWN OPEN)
+/-! ### loopOk @ start = 7 — the guard-re-evaluation probe (2026-06-11)
 
-Discovered 2026-06-11 by the loop-widening probes, but LOOP-FREE and
-PRE-EXISTING: a public method body ending in `assert` has its trailing
-`OP_VERIFY` elided (Bitcoin's truthy-top contract), so the deployed
-bytes COMPLETE even when the asserted condition is FALSE — the falsy
-boolean is simply left on top — while the ANF evaluator's `assert`
-errors. `runParsedBytes`-based `successAgrees` therefore DISAGREES on
-any non-satisfying entry of an assert-terminated body. The program
-below is WF, loop-free, and rejected by every structural classifier, so
-it lands on the `crypto_call` fallback axiom: the axiom's statement is
-REFUTABLE for this (program, entry) pair as pinned here. This gap is
-NOT introduced or enlarged by the loop-fidelity rewrite (it reproduces
-identically on the parent commit); the honest fix is a truthy-top-aware
-bytes-side success bit (consensus checks the final stack top), which
-touches every discharged successAgrees theorem and is tracked as an
-URGENT follow-up. Until then the crypto_call guard set is NOT widened
-(admitting loop bodies would add more instances of the same class). -/
+This (program, entry) pair was the NAMED falsifier class that kept the
+crypto_call `_hNoLoop` guard after the loop-fidelity rewrite: under the
+OLD completion-based bit the ANF assert errors while the deployed bytes
+complete (success bits DISAGREE). Under the consensus acceptance bit the
+bytes leave the falsy `OP_NUMEQUAL` result on top — NOT accepted — so the
+bits AGREE. Probed here as the formal record that the termCx-class
+falsifiers are RESOLVED by the success-bit repair; the crypto_call
+`_hNoLoop` guard is removed on this basis (see the axiom comment). -/
+
+/-- ANF half: the accumulator's terminal assert FAILS on the
+non-satisfying entry (`start = 7` ⇒ `sum = 21 ≠ 0 = expectedSum`). -/
+theorem loopOk_start7_anf_fails :
+    (RunarVerification.ANF.Eval.evalBindingsP loopOkProg.methods
+      { params := [("start", .vBigint 7)]
+      , props := [("expectedSum", .vBigint 0)] } loopOkM.body).toOption.isSome
+      = false := by
+  native_decide
+
+/-- Bytes half (OLD bit): the deployed bytes COMPLETE on the same entry —
+the completion bits disagree (the historical falsifier). -/
+theorem loopOk_start7_bytes_complete :
+    (match compileSafe loopOkProg with
+     | .ok bytes => (runParsedBytes bytes { stack := [.vBigint 7] }).toOption.isSome
+     | .error _ => false) = true := by
+  native_decide
+
+/-- Bytes half (NEW bit): the same run is NOT accepted (falsy top) — the
+acceptance bits AGREE. -/
+theorem loopOk_start7_bytes_rejected :
+    (match compileSafe loopOkProg with
+     | .ok bytes => scriptAccepts (runParsedBytes bytes { stack := [.vBigint 7] })
+     | .error _ => true) = false := by
+  native_decide
+
+/-- Agreement smoke on the historical falsifier entry: under the
+acceptance bit, ANF failure and bytes rejection AGREE. -/
+theorem loopOk_start7_acceptAgrees (bytes : ByteArray)
+    (hSafe : compileSafe loopOkProg = .ok bytes) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP loopOkProg.methods
+        { params := [("start", .vBigint 7)]
+        , props := [("expectedSum", .vBigint 0)] } loopOkM.body)
+      (runParsedBytes bytes { stack := [.vBigint 7] }) := by
+  have hReject := loopOk_start7_bytes_rejected
+  rw [hSafe] at hReject
+  exact Stack.Eval.acceptAgrees_of_bits_false loopOk_start7_anf_fails hReject
+
+/-! ### termCx — terminal-assert success-bit gap (RESOLVED 2026-06-11 by
+the truthy-top success-bit repair)
+
+History of the headline trust-model event of this wave:
+
+1. **Found (2026-06-11, loop-widening probes).** A public method body
+   ending in `assert` has its trailing `OP_VERIFY` elided by
+   `lowerMethod` (Bitcoin's truthy-top contract), so the deployed bytes
+   COMPLETE even when the asserted condition is FALSE — the falsy
+   boolean is simply left on top — while the ANF evaluator's `assert`
+   errors. The OLD `runParsedBytes`-completion-based `successAgrees`
+   therefore DISAGREED on any non-satisfying entry of an
+   assert-terminated body (`termCx_anf_fails` + `termCx_bytes_complete`
+   below), REFUTING the then-stated completion-based `crypto_call`
+   fallback axiom (the program is WF, loop-free, and rejected by every
+   structural classifier).
+
+2. **Bit redefined (this commit).** The bytes-side observational bit is
+   now `Stack.Eval.scriptAccepts` — completion AND truthy top-of-stack,
+   mirroring exactly the `OP_VERIFY` arm of `runOpcode` — and every
+   headline theorem is stated over `acceptAgrees`. The keystone elision
+   lemma `runOps_append_verify_isSome_iff_scriptAccepts`
+   (`Stack/Accept.lean`) formalizes why the elision is sound under the
+   new bit.
+
+3. **Agreement.** On the very entry that refuted the old statement
+   (`x = 1`), the bytes run is now REJECTED (`termCx_bytes_rejected`),
+   so ANF failure and bytes rejection AGREE
+   (`termCx_acceptAgrees`).
+
+The completion-based pins (`termCx_bytes_complete`,
+`termCx_wf_and_loopfree`) are KEPT as the formal record of the old
+bit's failure mode — they are facts about the model, not claims of the
+trust surface. -/
 
 private def termCxM : ANFMethod :=
   { name := "verify", params := [ANFParam.mk "x" .bigint],
@@ -3392,11 +3491,54 @@ theorem termCx_bytes_complete :
      | .error _ => false) = true := by
   native_decide
 
-/-- The program is WF and LOOP-FREE — the crypto_call axiom's `_hNoLoop`
-guard does NOT exclude it. -/
+/-- The program is WF and LOOP-FREE — under the OLD bit no guard excluded
+it from the crypto_call fallback (the refutation pin; kept as history). -/
 theorem termCx_wf_and_loopfree :
     (WF.programIsWF termCxProg && !programUsesLoopB termCxProg) = true := by
   native_decide
+
+/-- NEW bit: the same bytes run is NOT accepted (the falsy `OP_NUMEQUAL`
+result is on top), matching the ANF failure. -/
+theorem termCx_bytes_rejected :
+    (match compileSafe termCxProg with
+     | .ok bytes => scriptAccepts (runParsedBytes bytes { stack := [.vBigint 1] })
+     | .error _ => true) = false := by
+  native_decide
+
+/-- Acceptance-bit agreement smoke on the historical refutation entry:
+ANF failure ⟷ bytes rejection. -/
+theorem termCx_acceptAgrees (bytes : ByteArray)
+    (hSafe : compileSafe termCxProg = .ok bytes) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP termCxProg.methods
+        { params := [("x", .vBigint 1)] } termCxM.body)
+      (runParsedBytes bytes { stack := [.vBigint 1] }) := by
+  have hReject := termCx_bytes_rejected
+  rw [hSafe] at hReject
+  exact Stack.Eval.acceptAgrees_of_bits_false termCx_anf_fails hReject
+
+/-- Positive companion: on the SATISFYING entry (`x = 5`) the bytes are
+accepted and the ANF completes — agreement on the other side of the bit. -/
+theorem termCx_bytes_accepted_satisfying :
+    (match compileSafe termCxProg with
+     | .ok bytes => scriptAccepts (runParsedBytes bytes { stack := [.vBigint 5] })
+     | .error _ => false) = true := by
+  native_decide
+
+theorem termCx_anf_succeeds_satisfying :
+    (RunarVerification.ANF.Eval.evalBindingsP termCxProg.methods
+      { params := [("x", .vBigint 5)] } termCxM.body).toOption.isSome = true := by
+  native_decide
+
+theorem termCx_acceptAgrees_satisfying (bytes : ByteArray)
+    (hSafe : compileSafe termCxProg = .ok bytes) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP termCxProg.methods
+        { params := [("x", .vBigint 5)] } termCxM.body)
+      (runParsedBytes bytes { stack := [.vBigint 5] }) := by
+  have hAccept := termCx_bytes_accepted_satisfying
+  rw [hSafe] at hAccept
+  exact Stack.Eval.acceptAgrees_of_bits_true termCx_anf_succeeds_satisfying hAccept
 
 /-- **O1 sub-omnibus — crypto call family.**
 
@@ -3434,22 +3576,33 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    -- Loop-exclusion guard (2026-06-11; RE-EVALUATED after the loop-arm
-    -- fidelity rewrite, same date): the loop-arm divergence (`loopCx*`)
-    -- is FIXED — per-iteration re-lowering, depth-0 drop gate, union
-    -- localBindings, narrowed bodyOuterRefs; byte-parity pinned against
-    -- the TS reference (`loopOk_hex_matches_ts`, bounded-loop golden,
-    -- nested probe). The guard is nevertheless KEPT, NOT widened: the
-    -- widening probes surfaced the PRE-EXISTING loop-independent
-    -- terminal-assert success-bit gap (`termCx*` above) — admitting loop
-    -- bodies here would add KNOWN agreement falsifiers of that class
-    -- (assert-terminated loop programs on non-satisfying entries, e.g.
-    -- `loopOkProg` with `start = 7`). Re-widening is blocked on the
-    -- truthy-top success-bit follow-up. Program-level (not body-level)
-    -- because private-method inlining can splice a loop into a loop-free
-    -- public body.
-    (_hNoLoop : programUsesLoopB p = false) :
-    successAgrees
+    -- GUARD RE-EVALUATION (2026-06-11, truthy-top success-bit repair):
+    -- the `_hNoLoop : programUsesLoopB p = false` guard is REMOVED. It
+    -- was retained (after the loop-arm fidelity rewrite of the same
+    -- date) SOLELY because the widening probes had surfaced the
+    -- loop-INDEPENDENT terminal-assert success-bit gap (`termCx*`):
+    -- under the old completion bit, assert-terminated programs on
+    -- non-satisfying entries were KNOWN falsifiers (e.g. `loopOkProg`
+    -- @ `start = 7`). Under the acceptance bit those very instances
+    -- AGREE (`termCx_acceptAgrees`, `loopOk_start7_acceptAgrees` —
+    -- native_decide probes), the loop arm itself is byte-faithful
+    -- (`loopOk_hex_matches_ts`, bounded-loop golden), and the divergent
+    -- `loopCx` shape is rejected by `compileSafe` outright
+    -- (`loopCx_ts_aligned_rejects`). No known falsifier class remains.
+    --
+    -- Value-terminated-body guard (NEW, same repair): for a body that
+    -- does NOT end in assert (hand-IR corner cases only — the TS
+    -- validator `02-validate.ts:325-344` REQUIRES public methods to end
+    -- in `assert()`, auto-injects it for stateful contracts), the
+    -- lowered ops leave the body's final VALUE on top, so acceptance ≠
+    -- completion exactly when that value is falsy. The keyed premise
+    -- below supplies the truthiness fact for such bodies (vacuous for
+    -- every frontend-reachable program); WITHOUT it the acceptance
+    -- restatement would be refutable by e.g. a body computing `0`.
+    (_hValueTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
@@ -3505,23 +3658,24 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
         anfM.body
         (List.reverse (anfM.params.map (·.name)))
         0 = true)
-    -- Loop map-neutrality guard (2026-06-11; RE-EVALUATED after the
-    -- loop-arm fidelity rewrite, same date): the divergence that
-    -- motivated this guard (`loopCx*` — the old arm's misplaced
-    -- per-iteration drop) is FIXED; the faithful arm's byte parity is
-    -- pinned against the TS reference (`loopOk_hex_matches_ts`,
-    -- bounded-loop golden). The guard is nevertheless KEPT, NOT widened:
-    -- (a) methodCall-spliced loop bodies remain byte-UNVERIFIED (TS's
-    -- localBindings pollution persists ACROSS iterations after an inlined
-    -- call, while the model resets the union per loop entry), and
-    -- (b) the pre-existing terminal-assert success-bit gap (`termCx*`
-    -- above) means any widening that admits assert-terminated bodies
-    -- through `_hLoop` would add known agreement falsifiers. The retained
-    -- fragment (iteration-identical map-neutral loop bodies that consume
-    -- their iteration variable, per `bodyLoopMapNeutralB`) is the class
-    -- whose per-iteration chunks are provably iteration-invariant under
-    -- the faithful arm (see `AgreesA7.lowerLoopItersP_neutral_eq`).
-    -- Re-widening is blocked on the truthy-top success-bit follow-up.
+    -- Loop map-neutrality guard (RE-EVALUATED 2026-06-11, twice: after
+    -- the loop-arm fidelity rewrite, then after the truthy-top
+    -- success-bit repair): the divergence that motivated this guard
+    -- (`loopCx*` — the old arm's misplaced per-iteration drop) is FIXED;
+    -- the faithful arm's byte parity is pinned against the TS reference
+    -- (`loopOk_hex_matches_ts`, bounded-loop golden); and the
+    -- terminal-assert success-bit falsifier class (reason (b) of the
+    -- previous retention) is RESOLVED by the acceptance restatement
+    -- (`loopOk_start7_acceptAgrees`). The guard is KEPT for the one
+    -- SURVIVING reason: (a) methodCall-spliced loop bodies remain
+    -- byte-UNVERIFIED (TS's localBindings pollution persists ACROSS
+    -- iterations after an inlined call, while the model resets the union
+    -- per loop entry). The retained fragment (iteration-identical
+    -- map-neutral loop bodies that consume their iteration variable, per
+    -- `bodyLoopMapNeutralB`) is the class whose per-iteration chunks are
+    -- provably iteration-invariant under the faithful arm (see
+    -- `AgreesA7.lowerLoopItersP_neutral_eq`). Widening is blocked on a
+    -- byte-parity probe of the methodCall-in-loop class.
     (_hLoopNeutral :
       bodyLoopMapNeutralB
         p.methods p.properties
@@ -3531,8 +3685,18 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
         (Lower.collectConstInts anfM.body)
         anfM.body
         (List.reverse (anfM.params.map (·.name)))
-        0 = true) :
-    successAgrees
+        0 = true)
+    -- Value-terminated-body keyed truthiness premise (2026-06-11
+    -- truthy-top success-bit repair; same role as on the crypto_call
+    -- axiom): for a loop body that does not end in assert the lowered
+    -- ops leave the final value on top, and acceptance = completion only
+    -- under this explicit (input-side) truthiness fact. Vacuous for
+    -- every frontend-reachable program (the TS validator forces public
+    -- methods to end in assert).
+    (_hValueTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
 
@@ -4286,8 +4450,12 @@ This is the 4-leg transitivity that retires
 Hypothesis audit (all input-side; none restate the conclusion): the chain
 predicate `hChain`, the typed-entry bundle (`hTypedEntry` / `hTsmTyped` /
 `hCoh` / `hUntag`), the single-public filter fact `hSinglePublic`, the
-non-constructor name `hName`, and the standard `agreesTagged` alignment. -/
-theorem compileSafe_observational_correct_arith_consume
+non-constructor name `hName`, and the standard `agreesTagged` alignment.
+
+(2026-06-11 truthy-top repair: this is now the PRIVATE completion-bit
+leg; the headline theorem is the `acceptAgrees` restatement
+`compileSafe_observational_correct_arith_consume` below.) -/
+private theorem arith_consume_completion
     (p : ANFProgram) (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
     (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
     (hSafe : compileSafe p = .ok bytes)
@@ -4475,6 +4643,55 @@ theorem compileSafe_observational_correct_arith_consume
         (runParsedBytes bytes initialStack) := by
     rw [hM4]; exact hM3Ops
   exact successAgrees_trans _ _ _ hM2Method hParsed
+
+/-- **Arith consume theorem (HEADLINE, acceptance bit).** The wave-39
+discharge restated over `acceptAgrees` (2026-06-11 truthy-top
+success-bit repair). The arith fragment is VALUE-terminated (the chain's
+final integer is the script's top-of-stack; `bodyEndsInAssert = false`
+by `bodyEndsInAssert_false_of_arithOnly`), so the acceptance bit equals
+the completion bit exactly under the keyed truthiness premise
+`hTopTruthy` — an explicit, input-side fact (FLAGGED: new hypothesis vs.
+the completion-era statement; it is genuinely required, since an arith
+chain evaluating to `0` completes but is NOT accepted). Discharged per
+fixture by the harness from the concrete run; vacuous for
+frontend-reachable programs (the TS validator forces assert-terminated
+public methods, which this fragment is not). -/
+theorem compileSafe_observational_correct_arith_consume
+    (p : ANFProgram) (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (tsm : Agrees.TaggedStackMap)
+    (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hChain :
+      Agrees.emittableArithChainReadyNoDblNeg
+        (Stack.Lower.computeLastUses anfM.body)
+        anfM.body
+        (List.reverse (anfM.params.map (·.name)))
+        0 false)
+    (hUntag :
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hTsmTyped : Agrees.entryTsmArithTyped Γ tsm)
+    (hCoh : Agrees.tsmCoherent initialAnf tsm)
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hOld := arith_consume_completion
+    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+    Γ hSinglePublic hName hChain hUntag hTypedEntry hTsmTyped hCoh
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false :=
+    bodyEndsInAssert_false_of_arithOnly anfM.body
+      (arithOnlyBody_of_emittableArithChainReadyNoDblNeg
+        (Stack.Lower.computeLastUses anfM.body) anfM.body
+        (List.reverse (anfM.params.map (·.name))) 0 false hChain)
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
 
 /-! ## Path 2 Tier 1 Wave 63 — update_prop consume M4 image emittability
 
@@ -4725,7 +4942,7 @@ This is the 4-leg transitivity the wave-64 dispatch surgery uses to retire
 The conclusion matches the axiom `…_modulo_update_prop_codegen` modulo the
 fragment classifier.  `evalBindingsP_eq_evalBindings_of_noMethodCall` drops the
 program-aware `evalBindingsP` (the fragment is methodCall-free). -/
-theorem compileSafe_observational_correct_updateProp_consume
+private theorem updateProp_consume_completion
     (p : ANFProgram) (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
     (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
     (hSafe : compileSafe p = .ok bytes)
@@ -4890,6 +5107,43 @@ theorem compileSafe_observational_correct_updateProp_consume
     exact successAgrees_refl _
   exact successAgrees_trans _ _ _ hM2Method hParsed
 
+/-- **update_prop consume theorem (HEADLINE, acceptance bit).** The wave-64
+discharge restated over `acceptAgrees` (2026-06-11 truthy-top success-bit
+repair). The fragment is VALUE-terminated (`prop ± c ; update_prop` — the
+last binding is `update_prop`, not `assert`), so the restatement carries
+the keyed truthiness premise `hTopTruthy` (FLAGGED: new hypothesis vs. the
+completion-era statement; required — the updated value can be `0`). -/
+theorem compileSafe_observational_correct_updateProp_consume
+    (p : ANFProgram) (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (prop op : String) (c : Int)
+    (hBodyEq : anfM.body = Agrees.updatePropConsumeBody prop op c)
+    (hSM : List.reverse (anfM.params.map (·.name)) = [prop])
+    (hAdmis : Agrees.updatePropConsumeAdmissible prop op c = true)
+    (hAgrees : Agrees.agreesTagged [(prop, Agrees.SlotKind.prop)] initialAnf initialStack)
+    (hUntag : Agrees.untagSm [(prop, Agrees.SlotKind.prop)] = [prop])
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hTsmTyped : Agrees.entryTsmArithTyped Γ [(prop, Agrees.SlotKind.prop)])
+    (hCoh : Agrees.tsmCoherent initialAnf [(prop, Agrees.SlotKind.prop)])
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hOld := updateProp_consume_completion
+    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack Γ
+    hSinglePublic hName prop op c hBodyEq hSM hAdmis hAgrees hUntag
+    hTypedEntry hTsmTyped hCoh
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBodyEq]; simp [Agrees.updatePropConsumeBody, Lower.bodyEndsInAssert]
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
+
 /-! ### Wave 63 — MANDATORY smoke: the consume theorem fires end-to-end
 
 The canonical single-public `count + 1 ; update_prop count` stateful-increment
@@ -4982,9 +5236,11 @@ private theorem wave63Smoke_wt :
   show wave63SmokeEnv.lookup "count" = some .bigint; decide
 
 /-- **Wave 63 smoke** — the consume theorem instantiated on the concrete
-`count + 1 ; update_prop count` program. -/
+`count + 1 ; update_prop count` program (RESTATED on the acceptance bit
+2026-06-11; the keyed truthiness premise is discharged by `native_decide`
+on the concrete run — the incremented `6` on top is truthy). -/
 theorem wave63_updateProp_consume_smoke :
-    successAgrees
+    acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP wave63SmokeProg.methods wave63SmokeAnf
         wave63SmokeMethod.body)
       (runParsedBytes wave63SmokeBytes wave63SmokeStk) :=
@@ -4993,16 +5249,19 @@ theorem wave63_updateProp_consume_smoke :
     wave63Smoke_mem rfl wave63Smoke_compileSafe wave63SmokeAnf wave63SmokeStk wave63SmokeEnv
     wave63Smoke_filter (by decide) "count" "+" 1 rfl rfl (by decide)
     wave63Smoke_agreesTagged rfl wave63Smoke_entryBigintTyped wave63Smoke_wt wave63Smoke_coh
+    (fun _ => Stack.Eval.truthy_of_scriptAccepts (by native_decide))
 
 /-- **Wave 63 smoke — anti-vacuity.**  Both the ANF eval and the deployed-bytes
-run of the smoke program succeed. -/
+run of the smoke program succeed (the latter is ACCEPTED, which implies
+completion). -/
 theorem wave63_updateProp_consume_smoke_anti_vacuous :
     (RunarVerification.ANF.Eval.evalBindingsP wave63SmokeProg.methods wave63SmokeAnf
         wave63SmokeMethod.body).toOption.isSome
     ∧ (runParsedBytes wave63SmokeBytes wave63SmokeStk).toOption.isSome := by
   have hAnf : (RunarVerification.ANF.Eval.evalBindingsP wave63SmokeProg.methods wave63SmokeAnf
       wave63SmokeMethod.body).toOption.isSome := by native_decide
-  exact ⟨hAnf, (wave63_updateProp_consume_smoke).mp hAnf⟩
+  exact ⟨hAnf,
+    Stack.Eval.isSome_of_scriptAccepts ((wave63_updateProp_consume_smoke).mp hAnf)⟩
 
 /-! ### Wave 66 — the `method_call` consume theorem
 
@@ -5035,7 +5294,7 @@ The arg value `av` + the caller-frame arg resolution `hArg` are DERIVED
 from the typed/agreement entry bundle (`agreesTagged [(a,.param)]` +
 `tsmCoherent`), NOT hand-supplied — §2.1-compliant input-side
 hypotheses only. -/
-theorem compileSafe_observational_correct_methodCall_consume
+private theorem methodCall_consume_completion
     (p : ANFProgram) (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
     (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
     (hSafe : compileSafe p = .ok bytes)
@@ -5214,6 +5473,42 @@ theorem compileSafe_observational_correct_methodCall_consume
     exact successAgrees_refl _
   exact successAgrees_trans _ _ _ hM2Method hParsed
 
+/-- **method_call consume theorem (HEADLINE, acceptance bit).** The wave-66
+discharge restated over `acceptAgrees` (2026-06-11 truthy-top success-bit
+repair). The passthrough fragment is VALUE-terminated (the passed-through
+param lands on top; the body's single binding is a `methodCall`), so the
+restatement carries the keyed truthiness premise `hTopTruthy` (FLAGGED:
+new hypothesis vs. the completion-era statement; required — a passthrough
+of `0` completes but is NOT accepted). -/
+theorem compileSafe_observational_correct_methodCall_consume
+    (p : ANFProgram) (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (a : String)
+    (hShape : Agrees.methodCallConsumeShapeBool p.methods anfM = true)
+    (hAgrees : Agrees.agreesTagged [(a, Agrees.SlotKind.param)] initialAnf initialStack)
+    (hAName : (Agrees.methodCallConsumeShapeBool p.methods anfM = true) →
+        (anfM.params.map (·.name)).reverse = [a])
+    (hCoh : Agrees.tsmCoherent initialAnf [(a, Agrees.SlotKind.param)])
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hOld := methodCall_consume_completion
+    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
+    hSinglePublic hName a hShape hAgrees hAName hCoh
+  obtain ⟨a', bn, obj, method, pp, r', src, psrc, atype, ptype, m',
+    hPa, hBd, _, _, _, _, _⟩ :=
+    Agrees.methodCallConsumeShapeBool_extract p.methods anfM hShape
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBd]; simp [Lower.bodyEndsInAssert]
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
+
 /-! ## crypto_call peel-off — single-hash-call method consume theorem
 
 Peels the single-`sha256`/`hash160`-call method fragment off the residual
@@ -5335,9 +5630,11 @@ theorem hashCall_consume_core
     rw [hMethodEq]; exact successAgrees_refl _
   exact successAgrees_trans _ _ _ hM2Method hParsed
 
-/-- **sha256 single-call consume.** Discharges the omnibus obligation for a
-single-public `h(x) = sha256(x)` method, given the bytes-typed entry fragment. -/
-theorem hashCall_consume_sha256
+/-- **sha256 single-call consume (completion-bit leg).** Discharges the
+omnibus obligation for a single-public `h(x) = sha256(x)` method, given the
+bytes-typed entry fragment. (2026-06-11: PRIVATE leg; headline is the
+`acceptAgrees` restatement below.) -/
+private theorem hashCall_consume_sha256_completion
     (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
     (bn arg : String) (src : Option SourceLoc)
     (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
@@ -5368,8 +5665,43 @@ theorem hashCall_consume_sha256
     hMem hPublic hSafe initialAnf initialStack hSinglePublic hName hBody hRaw
     hNoCode (by rfl) hM2
 
-/-- **hash160 single-call consume.** -/
-theorem hashCall_consume_hash160
+/-- **sha256 single-call consume (HEADLINE, acceptance bit).** Restated over
+`acceptAgrees` (2026-06-11 truthy-top success-bit repair). The fragment is
+VALUE-terminated (the digest bytes land on top). Under the VM's `asBool?` a
+NONEMPTY byte string is truthy, so the truthiness fact is morally automatic
+for a 32-byte digest — but the hash backends are OPAQUE in-model (no
+digest-size axiom), so it is carried as the keyed `hTopTruthy` premise
+(FLAGGED: new hypothesis vs. the completion-era statement; discharged per
+fixture by `native_decide` on the concrete run). -/
+theorem hashCall_consume_sha256
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (bn arg : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "sha256" [arg]) src])
+    (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: rest)
+    (hLen : argBytes.size ≤ 520)
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hOld := hashCall_consume_sha256_completion
+    p anfM bytes bn arg src hMem hPublic hSafe initialAnf initialStack
+    hSinglePublic hName hParams hBody argBytes rest hArg hStk hLen
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBody]; simp [Lower.bodyEndsInAssert]
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
+
+/-- **hash160 single-call consume (completion-bit leg).** -/
+private theorem hashCall_consume_hash160_completion
     (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
     (bn arg : String) (src : Option SourceLoc)
     (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
@@ -5400,6 +5732,35 @@ theorem hashCall_consume_hash160
     hMem hPublic hSafe initialAnf initialStack hSinglePublic hName hBody hRaw
     hNoCode (by rfl) hM2
 
+/-- **hash160 single-call consume (HEADLINE, acceptance bit).** See the
+sha256 peer for the truthiness-premise rationale. -/
+theorem hashCall_consume_hash160
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (bn arg : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "hash160" [arg]) src])
+    (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: rest)
+    (hLen : argBytes.size ≤ 520)
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hOld := hashCall_consume_hash160_completion
+    p anfM bytes bn arg src hMem hPublic hSafe initialAnf initialStack
+    hSinglePublic hName hParams hBody argBytes rest hArg hStk hLen
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBody]; simp [Lower.bodyEndsInAssert]
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
+
 /-! ### MANDATORY smoke: the hash-call consume theorem fires
 
 The canonical single-public sha256 contract `H` with public `h(x) = sha256(x)`,
@@ -5420,10 +5781,20 @@ private def hashSmokeAnf : State :=
 private def hashSmokeStk : StackState :=
   { (default : StackState) with stack := [.vBytes (ByteArray.mk #[1, 2, 3])] }
 
-/-- SMOKE — `hashCall_consume_sha256` fires on the canonical sha256 contract. -/
-theorem smoke_hashCall_consume_fires :
+/-- SMOKE — `hashCall_consume_sha256` fires on the canonical sha256 contract
+(RESTATED on the acceptance bit 2026-06-11). The digest-truthiness fact is
+carried as the hypothesis `hTopTruthy`: the hash backends are OPAQUE
+in-model (`native_decide` cannot evaluate `Crypto.sha256`, and no
+digest-size axiom exists), so the smoke cannot decide the final top's
+truthiness — in reality a sha256 digest is 32 nonempty bytes, truthy under
+`asBool?`. The fragment's REACHABILITY (compileSafe succeeds) remains
+unconditional. -/
+theorem smoke_hashCall_consume_fires
+    (hTopTruthy : ∀ bytes s, compileSafe hashSmokeProg = .ok bytes →
+        runParsedBytes bytes hashSmokeStk = .ok s →
+        topTruthy s.stack = true) :
     ∃ bytes, compileSafe hashSmokeProg = .ok bytes ∧
-      successAgrees
+      acceptAgrees
         (RunarVerification.ANF.Eval.evalBindingsP hashSmokeProg.methods hashSmokeAnf
           RunarVerification.Stack.AgreesHashCall.smokeMethod.body)
         (runParsedBytes bytes hashSmokeStk) := by
@@ -5437,6 +5808,7 @@ theorem smoke_hashCall_consume_fires :
     RunarVerification.Stack.AgreesHashCall.smokeMethod bytes "c0" "x" none
     (by simp [hashSmokeProg]) rfl hSafe hashSmokeAnf hashSmokeStk rfl (by decide)
     rfl rfl (ByteArray.mk #[1, 2, 3]) [] rfl rfl (by decide)
+    (fun _ s hRun => hTopTruthy bytes s hSafe hRun)
 
 /-! ## Stateful sub-omnibus retirement — the canonical stateful consume theorem
 
@@ -5491,15 +5863,40 @@ theorem peepholeMethodOps_statefulPrologue :
       simp +decide [AgreesStateful.statefulPrologueOps,
         Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])]
 
-/-- **Canonical stateful consume theorem (the stateful sub-omnibus discharge).**
+/-- Helper for the stateful acceptance bit: the 4-byte LE encoding has
+size 4 (definitional). -/
+private theorem encodeUInt32LE_size (n : UInt32) :
+    (Stack.encodeUInt32LE n).size = 4 := rfl
 
-The success-bit chain is direct (no runMethod leg needed): the ANF side is
-`Crypto.checkPreimage preimage` (gated prologue), the Stack side is
-`authBackend.checkSig sigV G` (constant prologue ops, M3 peephole-identity,
-M4 concrete parse round-trip), and the per-deployment sig-provenance
-hypothesis `hSig` (the spender's `_opPushTxSig` witness verifies against the
-synthetic key exactly when the preimage backend accepts — discharged per
-fixture by the conformance harness, and for the smoke by the witness
+/-- The BIP-143 preimage is never empty (its first field is the 4-byte LE
+version). Discharges the nonemptiness premise of
+`AgreesStateful.runOps_statefulPrologueOps_scriptAccepts` — the preimage
+bytes left on top of the accepted prologue run are truthy under `asBool?`. -/
+private theorem buildPreimage_size_pos (ctx : Stack.TxContext) :
+    0 < (Stack.TxContext.buildPreimage ctx).size := by
+  unfold Stack.TxContext.buildPreimage
+  simp only [ByteArray.size_append, encodeUInt32LE_size]
+  omega
+
+/-- **Canonical stateful consume theorem (the stateful sub-omnibus
+discharge — HEADLINE, acceptance bit).**
+
+RESTATED over `acceptAgrees` (2026-06-11 truthy-top success-bit repair)
+with NO new hypothesis: this is the one discharged family that is
+ASSERT-terminated (the gated prologue ends in `assert _cp0`, lowered to
+the fused `OP_CHECKSIGVERIFY` — the verify survives fusion, so the run
+ERRORS on a bad witness, and on success the nonempty preimage bytes are
+left on top, truthy under `asBool?` via `buildPreimage_size_pos`).
+
+The bit chain is direct (no runMethod leg needed): the ANF side is
+`Crypto.checkPreimage preimage` (gated prologue), the Stack ACCEPTANCE
+side is `authBackend.checkSig sigV G`
+(`AgreesStateful.runOps_statefulPrologueOps_scriptAccepts`, constant
+prologue ops, M3 peephole-identity, M4 concrete parse round-trip), and
+the per-deployment sig-provenance hypothesis `hSig` (the spender's
+`_opPushTxSig` witness verifies against the synthetic key exactly when
+the preimage backend accepts — discharged per fixture by the conformance
+harness, and for the smoke by the witness
 `StatefulBridge.exists_checkSig_witness_under_validTxContext` provides)
 equates the two. -/
 theorem compileSafe_observational_correct_stateful_consume
@@ -5516,13 +5913,13 @@ theorem compileSafe_observational_correct_stateful_consume
     (ctx : TxContext) (sigV preimage : ByteArray)
     (rest : List RunarVerification.ANF.Eval.Value)
     (_hValid : ValidTxContext ctx)
-    (_hPreLink : preimage = TxContext.buildPreimage ctx)
+    (hPreLink : preimage = TxContext.buildPreimage ctx)
     (hAnfPre : initialAnf.resolveRef pre = some (.vBytes preimage))
     (hStk : initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest)
     (hSig : RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
           AgreesStateful.stG
         = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage) :
-    successAgrees
+    acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
   have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
@@ -5550,12 +5947,15 @@ theorem compileSafe_observational_correct_stateful_consume
     rw [hPubSingleton]
     simp only
     rw [hPeeped, AgreesStateful.parseScript_emitOpsFast_statefulPrologue]
-  have hStack : (runOps AgreesStateful.statefulPrologueOps initialStack).toOption.isSome
+  have hPreSize : 0 < preimage.size := by
+    rw [hPreLink]; exact buildPreimage_size_pos ctx
+  have hStack : scriptAccepts (runOps AgreesStateful.statefulPrologueOps initialStack)
       = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV AgreesStateful.stG :=
-    AgreesStateful.runOps_statefulPrologueOps_isSome initialStack preimage sigV rest hStk
+    AgreesStateful.runOps_statefulPrologueOps_scriptAccepts
+      initialStack preimage sigV rest hStk hPreSize
   show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
       anfM.body).toOption.isSome
-      ↔ (runParsedBytes bytes initialStack).toOption.isSome
+      ↔ scriptAccepts (runParsedBytes bytes initialStack) = true
   rw [hM4, hANF, hStack, hSig]
 
 /-! ### MANDATORY smoke: the stateful consume theorem fires
@@ -5602,7 +6002,7 @@ consume theorem fires on the sample-context entry (with the chosen witness
 signature on the deployed stack). -/
 theorem smoke_stateful_consume_fires :
     ∃ bytes, compileSafe stSmokeProg = .ok bytes ∧
-      successAgrees
+      acceptAgrees
         (RunarVerification.ANF.Eval.evalBindingsP stSmokeProg.methods stSmokeAnf
           AgreesStateful.smokeMethod.body)
         (runParsedBytes bytes stSmokeStk) := by
@@ -5772,7 +6172,7 @@ discharge).**  Composes the wave-69 `merkle_dispatch_selection_correct`
 (the deployed dispatch chain selects branch `i` and discards the witness)
 with the passthrough lowering (`ops = []`, run `.ok`) and the ANF-side
 param resolution. -/
-theorem compileSafe_observational_correct_dispatch_consume
+private theorem dispatch_consume_completion
     (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
     (_hPublic : anfM.isPublic = true)
     (hSafe : compileSafe p = .ok bytes)
@@ -5845,6 +6245,47 @@ theorem compileSafe_observational_correct_dispatch_consume
       ↔ (runParsedBytes bytes initialStack).toOption.isSome
   rw [hANF, hStack]
 
+/-- **Dispatch consume theorem (HEADLINE, acceptance bit).** The wave-69/70
+discharge restated over `acceptAgrees` (2026-06-11 truthy-top success-bit
+repair). The passthrough fragment is VALUE-terminated (every method's body
+is one `loadParam`; after the Merkle dispatch chain pops the selector, the
+caller's param value heads the stack), so the restatement carries the keyed
+truthiness premise `hTopTruthy` (FLAGGED: new hypothesis vs. the
+completion-era statement; required — passing through `0` completes but is
+NOT accepted). -/
+theorem compileSafe_observational_correct_dispatch_consume
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (i : Nat) (rest : List RunarVerification.ANF.Eval.Value)
+    (hIdx : (p.methods.filter (·.isPublic))[i]? = some anfM)
+    (hWitness : initialStack.stack = .vBigint (Int.ofNat i) :: rest)
+    (hNames : ∀ m ∈ p.methods.filter (·.isPublic), m.name ≠ "constructor")
+    (hAllPass : ∀ m ∈ p.methods.filter (·.isPublic),
+        ∃ (x bn : String) (ty : ANFType) (src : Option SourceLoc),
+          m.params = [ANFParam.mk x ty] ∧
+          m.body = [ANFBinding.mk bn (.loadParam x) src])
+    (hLen2 : 2 ≤ (p.methods.filter (·.isPublic)).length)
+    (hLen17 : (p.methods.filter (·.isPublic)).length ≤ 17)
+    (x bn : String) (ty : ANFType) (src : Option SourceLoc)
+    (hParams : anfM.params = [ANFParam.mk x ty])
+    (hBody : anfM.body = [ANFBinding.mk bn (.loadParam x) src])
+    (v : RunarVerification.ANF.Eval.Value)
+    (hX : initialAnf.lookupParam x = some v)
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hOld := dispatch_consume_completion
+    p anfM bytes hPublic hSafe initialAnf initialStack i rest
+    hIdx hWitness hNames hAllPass hLen2 hLen17 x bn ty src hParams hBody v hX
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBody]; simp [Lower.bodyEndsInAssert]
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
+
 /-! ### MANDATORY smoke: the dispatch consume theorem fires
 
 The canonical 2-method passthrough contract `D` (`ma(x){return x}`,
@@ -5869,11 +6310,21 @@ private def dpSmokeAnf : State := { params := [("x", .vBigint 7)] }
 
 private def dpSmokeStk : StackState := { stack := [.vBigint 0, .vBigint 7] }
 
+/-- The deployed dispatch smoke bytes are ACCEPTED on the concrete entry
+(selector `0` over passthrough value `7` — the `7` heads the final stack,
+truthy). -/
+private theorem dpSmoke_accepted :
+    (match compileSafe dpSmokeProg with
+     | .ok bytes => scriptAccepts (runParsedBytes bytes dpSmokeStk)
+     | .error _ => false) = true := by
+  native_decide
+
 /-- SMOKE — `compileSafe` accepts the canonical 2-passthrough contract and
-the dispatch consume theorem fires with selector 0. -/
+the dispatch consume theorem fires with selector 0 (RESTATED on the
+acceptance bit 2026-06-11). -/
 theorem smoke_dispatch_consume_fires :
     ∃ bytes, compileSafe dpSmokeProg = .ok bytes ∧
-      successAgrees
+      acceptAgrees
         (RunarVerification.ANF.Eval.evalBindingsP dpSmokeProg.methods dpSmokeAnf
           dpSmokeA.body)
         (runParsedBytes bytes dpSmokeStk) := by
@@ -5883,6 +6334,8 @@ theorem smoke_dispatch_consume_fires :
     | ok b => exact ⟨b, rfl⟩
     | error e => rw [hc] at h; simp [Except.toOption] at h
   refine ⟨bytes, hSafe, ?_⟩
+  have hAccept := dpSmoke_accepted
+  rw [hSafe] at hAccept
   exact compileSafe_observational_correct_dispatch_consume
     dpSmokeProg dpSmokeA bytes rfl hSafe dpSmokeAnf dpSmokeStk 0 [.vBigint 7]
     (by rfl) (by rfl)
@@ -5902,6 +6355,7 @@ theorem smoke_dispatch_consume_fires :
           · exact absurd h2 (by simp))
     (by decide) (by decide)
     "x" "t0" .bigint none rfl rfl (.vBigint 7) rfl
+    (fun _ => Stack.Eval.truthy_of_scriptAccepts hAccept)
 
 /-! ### Wave 66 — MANDATORY smoke: the method_call consume theorem fires
 
@@ -5987,9 +6441,11 @@ private theorem wave66Smoke_coh :
   rfl
 
 /-- **Wave 66 smoke** — the method_call consume theorem instantiated on the
-concrete passthrough `entry(a) = idfn(a)` program. -/
+concrete passthrough `entry(a) = idfn(a)` program (RESTATED on the
+acceptance bit 2026-06-11; the truthiness premise is `native_decide`d on
+the concrete run — the passed-through `99` on top is truthy). -/
 theorem wave66_methodCall_consume_smoke :
-    successAgrees
+    acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP wave66SmokeProg.methods wave66SmokeAnf
         wave66SmokeEntry.body)
       (runParsedBytes wave66SmokeBytes wave66SmokeStk) :=
@@ -5998,16 +6454,19 @@ theorem wave66_methodCall_consume_smoke :
     wave66Smoke_mem rfl wave66Smoke_compileSafe wave66SmokeAnf wave66SmokeStk
     wave66Smoke_filter (by decide) "a" wave66Smoke_shape wave66Smoke_agreesTagged
     (fun _ => rfl) wave66Smoke_coh
+    (fun _ => Stack.Eval.truthy_of_scriptAccepts (by native_decide))
 
 /-- **Wave 66 smoke — anti-vacuity.**  Both the ANF eval and the
-deployed-bytes run of the passthrough smoke program succeed. -/
+deployed-bytes run of the passthrough smoke program succeed (the latter is
+ACCEPTED, which implies completion). -/
 theorem wave66_methodCall_consume_smoke_anti_vacuous :
     (RunarVerification.ANF.Eval.evalBindingsP wave66SmokeProg.methods wave66SmokeAnf
         wave66SmokeEntry.body).toOption.isSome
     ∧ (runParsedBytes wave66SmokeBytes wave66SmokeStk).toOption.isSome := by
   have hAnf : (RunarVerification.ANF.Eval.evalBindingsP wave66SmokeProg.methods
       wave66SmokeAnf wave66SmokeEntry.body).toOption.isSome := by native_decide
-  exact ⟨hAnf, (wave66_methodCall_consume_smoke).mp hAnf⟩
+  exact ⟨hAnf,
+    Stack.Eval.isSome_of_scriptAccepts ((wave66_methodCall_consume_smoke).mp hAnf)⟩
 
 /-- **Wave 45 Step 1 — the dispatch-level consume-`if_val` correctness
 theorem.**
@@ -6038,7 +6497,7 @@ wave-39 arith retirement exactly:
 All hypotheses are dispatch-suppliable: the typed bundle from the omnibus's
 new if_val premise, the residual structural facts by decidable `by_cases`,
 and the standard `agreesTagged` alignment. -/
-theorem compileSafe_observational_correct_ifval_consume
+private theorem ifval_consume_completion
     (p : ANFProgram) (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
     (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
     (hSafe : compileSafe p = .ok bytes)
@@ -6253,6 +6712,65 @@ theorem compileSafe_observational_correct_ifval_consume
     rw [hM4]; exact hM3Ops
   exact successAgrees_trans _ _ _ hM2Method hParsed
 
+/-- **if_val consume theorem (HEADLINE, acceptance bit).** The wave-45
+discharge restated over `acceptAgrees` (2026-06-11 truthy-top success-bit
+repair). The fragment is VALUE-terminated (the body's single binding is an
+`if_val` whose selected arith branch leaves its value on top), so the
+restatement carries the keyed truthiness premise `hTopTruthy` (FLAGGED:
+new hypothesis vs. the completion-era statement; required — a branch
+evaluating to `0` completes but is NOT accepted). -/
+theorem compileSafe_observational_correct_ifval_consume
+    (p : ANFProgram) (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (bn cond : String) (k : Agrees.SlotKind)
+    (thn els : List ANFBinding) (src : Option SourceLoc)
+    (branchTsm : Agrees.TaggedStackMap)
+    (hBodyEq : anfM.body = [.mk bn (.ifVal cond thn els) src])
+    (hAgrees :
+      Agrees.agreesTagged ((cond, k) :: branchTsm) initialAnf initialStack)
+    (hFrag :
+      Agrees.ifValArithBody p.methods p.properties Lower.defaultInlineBudget 0
+        (Lower.computeLastUses anfM.body) []
+        (Lower.collectConstInts anfM.body)
+        (List.reverse (anfM.params.map (·.name)))
+        anfM.body)
+    (hUntag :
+      Agrees.untagSm ((cond, k) :: branchTsm)
+        = List.reverse (anfM.params.map (·.name)))
+    (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
+    (hTsmTyped : Agrees.entryTsmArithTyped Γ branchTsm)
+    (hCoh : Agrees.tsmCoherent initialAnf ((cond, k) :: branchTsm))
+    (hCondBool : RunarVerification.ANF.WellTyped.CondBoolTyped Γ initialAnf cond)
+    (hCondHead :
+      Stack.Lower.StackMap.depth?
+        (List.reverse (anfM.params.map (·.name))) cond = some 0)
+    (hLast :
+      Stack.Lower.isLastUse (Lower.computeLastUses anfM.body) cond 0 = true)
+    (hIPThn :
+      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (·.name)))
+        cond 0 (Lower.computeLastUses anfM.body) [] = [])
+    (hIPEls :
+      Agrees.ifValInnerProtected (List.reverse (anfM.params.map (·.name)))
+        cond 0 (Lower.computeLastUses anfM.body) [] = [])
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hOld := ifval_consume_completion
+    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack Γ
+    hSinglePublic hName bn cond k thn els src branchTsm hBodyEq hAgrees hFrag
+    hUntag hTypedEntry hTsmTyped hCoh hCondBool hCondHead hLast hIPThn hIPEls
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBodyEq]; simp [Lower.bodyEndsInAssert]
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
+
 /-- **Wave 51 Step 1 — the dispatch-level consume-`math_byte` correctness
 theorem.**
 
@@ -6286,7 +6804,7 @@ the plain `AreRunarEmittable` path, exactly like arith):
 All hypotheses are dispatch-suppliable: the no-len classifier and the
 structural-call classifier by decidable `by_cases`, the runtime fragment from the
 omnibus's keyed math_byte premise, and the standard `agreesTagged` alignment. -/
-theorem compileSafe_observational_correct_mathByte_consume
+private theorem mathByte_consume_completion
     (p : ANFProgram) (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
     (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
     (hSafe : compileSafe p = .ok bytes)
@@ -6430,6 +6948,45 @@ theorem compileSafe_observational_correct_mathByte_consume
     rw [hM4]; exact hM3Ops
   exact successAgrees_trans _ _ _ hM2Method hParsedMB
 
+/-- **math_byte consume theorem (HEADLINE, acceptance bit).** The wave-51
+discharge restated over `acceptAgrees` (2026-06-11 truthy-top success-bit
+repair). The fragment is VALUE-terminated (`abs`/`bin2num`/`toByteString`
+chains leave the final value on top; `bodyEndsInAssert = false` by
+`AgreesA4.bodyEndsInAssert_false_of_noLen`), so the restatement carries the
+keyed truthiness premise `hTopTruthy` (FLAGGED: new hypothesis vs. the
+completion-era statement; required — `abs` of `0` completes but is NOT
+accepted). -/
+theorem compileSafe_observational_correct_mathByte_consume
+    (p : ANFProgram) (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (tsm : Agrees.TaggedStackMap)
+    (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hShapeNoLen :
+      AgreesA4.mathByteSingleArgShapeNoLenBool anfM.body tsm = true)
+    (hStructCall :
+      AgreesA4.structuralCallBody (Stack.Lower.computeLastUses anfM.body) []
+        anfM.body (anfM.params.map (fun pp => pp.name) |>.reverse) 0)
+    (hUntag :
+      Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
+    (hCoh : Agrees.tsmCoherent initialAnf tsm)
+    (hFrag : AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf)
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hOld := mathByte_consume_completion
+    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+    hSinglePublic hName hShapeNoLen hStructCall hUntag hCoh hFrag
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false :=
+    AgreesA4.bodyEndsInAssert_false_of_noLen anfM.body tsm hShapeNoLen
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
+
 /--
 **Harness-level codegen-soundness theorem (Phase D harness integration).**
 
@@ -6475,6 +7032,17 @@ per-family `VERIFIED-modulo-<family>-codegen-axioms` tiers.
 `tests/PipelineConformance.lean`. Sub-omnibuses retire one at a time
 as their corresponding Stage C / Phase B / Phase D milestones land;
 see `PATH2_PLAN.md` §5.23 for the discharge plan.
+
+**Truthy-top success-bit repair (2026-06-11).** The conclusion is now
+`acceptAgrees` — ANF completion ⟷ bytes ACCEPTANCE (`scriptAccepts`,
+completion AND truthy top) — replacing the completion-vs-completion
+`successAgrees`, which disagreed with consensus on assert-terminated
+bodies (`termCx_*`). One new keyed premise `hValueTruthy` (truthiness of
+the completed run's top, keyed on `bodyEndsInAssert = false`) is
+forwarded to every value-terminated family branch and both surviving
+axioms; it is vacuous for assert-terminated bodies and for every
+frontend-reachable program (the TS validator forces public methods to
+end in assert).
 -/
 theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
@@ -6627,8 +7195,26 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           initialStack.stack = .vBigint (Int.ofNat i) :: rest ∧
           ∀ (x : String) (ty : ANFType), anfM.params = [ANFParam.mk x ty] →
             initialAnf.lookupParam x = some v)
+    -- **Value-terminated-body truthiness premise (keyed; 2026-06-11
+    -- truthy-top success-bit repair).**  For a method body that does NOT
+    -- end in `assert` (hand-IR corner cases only — the TS validator
+    -- `02-validate.ts:325-344` REQUIRES public methods to end in
+    -- `assert()`), the lowered ops leave the body's final VALUE on top of
+    -- the deployed run's stack, so the consensus acceptance bit equals the
+    -- completion bit exactly when that value is truthy.  This single keyed
+    -- premise is forwarded VERBATIM to every value-terminated family's
+    -- consume theorem (arith, if_val, math_byte, update_prop, method_call,
+    -- hash_call, dispatch) and to the crypto_call / loop sub-omnibus
+    -- axioms; it is VACUOUS (antecedent false) for assert-terminated
+    -- bodies — in particular for the stateful family and for every
+    -- frontend-reachable program.  Its only consumer is the conformance
+    -- harness, which discharges it per fixture by `native_decide` on the
+    -- concrete run.
+    (hValueTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
-    successAgrees
+    acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
   -- Per-family classifier inputs (shared by all Bool checkers).
@@ -6651,7 +7237,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- fallback — NO new axiom is introduced.
     by_cases hStMulti : (p.methods.filter (·.isPublic)).length ≥ 2
     · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
+        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
     · have hStSingle : p.methods.filter (·.isPublic) = [anfM] := by
         have hAnfMem : anfM ∈ p.methods.filter (·.isPublic) :=
           List.mem_filter.mpr ⟨hMem, by simpa using hPublic⟩
@@ -6676,9 +7262,9 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
             hStSingle hStName pre ty hStParams hStBody hStNe1 hStNe2
             ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk hStSig
         · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
       · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
+          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
   · by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
     · -- **Dispatch consume branch (replaces the retired dispatch axiom).**
       -- The decidable `dispatchConsumeShapeBool` classifier peels the
@@ -6697,9 +7283,9 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
         exact compileSafe_observational_correct_dispatch_consume
           p anfM bytes hPublic hSafe initialAnf initialStack i restW
           hIdxW hWitnessW hDpNames hDpAllPass _h2 _h17
-          x bn ty src hParamsW hBodyW v (hResW x ty hParamsW)
+          x bn ty src hParamsW hBodyW v (hResW x ty hParamsW) hValueTruthy
       · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
+          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
     · -- In the `¬hDispatch` branch the public-method filter has length < 2;
       -- since `anfM` is itself public it must be the SOLE public method, so
       -- the filter is exactly `[anfM]`.  This `hSinglePublic` fact feeds the
@@ -6726,7 +7312,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
       · exact compileSafe_observational_correct_arith_consume
           p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
           Γ hSinglePublic hArithConsume.1 hArithConsume.2 hUntag hTypedEntry
-          (hTsmTyped hArithConsume) hCoh
+          (hTsmTyped hArithConsume) hCoh hValueTruthy
       · -- **Wave 51 consume-`math_byte` branch (replaces the retired math_byte
         -- axiom).**  The decidable NO-LEN math_byte classifier pins the body to
         -- `abs` / `bin2num` / `toByteString` chains at head slots; the keyed
@@ -6741,8 +7327,9 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
             exact compileSafe_observational_correct_mathByte_consume
               p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
               hSinglePublic hNameMB hMathByteNoLen hStructCall hUntag hCoh hFrag
+              hValueTruthy
           · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
         · -- **Wave 64 consume-`update_prop` branch (replaces the retired
           -- update_prop axiom).**  The decidable `updatePropConsumeShapeBool`
           -- classifier pins the body to the canonical
@@ -6766,9 +7353,9 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               exact compileSafe_observational_correct_updateProp_consume
                 p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack Γ
                 hSinglePublic hNameUP prop op c hBodyEq hSM hAdmis hAgrees hUntagUP
-                hTypedEntry hWtUP hCoh
+                hTypedEntry hWtUP hCoh hValueTruthy
             · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
+                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
           · -- **Wave 45 consume-`if_val` branch (replaces the retired if_val axiom).**
             -- The decidable `ifValArithBody` fragment pins the body to a single
             -- `.ifVal` with arith branches; the residual structural facts
@@ -6849,9 +7436,9 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                   Γ hSinglePublic hNameNe bn cond k thn els src branchTsm hBodyEq
                   (hTsmEq ▸ hAgrees) hFrag
                   (hTsmEq ▸ hUntag) hTypedEntry hBranchTyped (hTsmEq ▸ hCoh)
-                  hCondBool hCondHead hLastU hIPThn hIPThn
+                  hCondBool hCondHead hLastU hIPThn hIPThn hValueTruthy
               · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
+                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
             · by_cases hLoop :
                   Agrees.structuralLoopBodyBool
                     p.methods p.properties
@@ -6865,6 +7452,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                     (anfM.body.map (·.name)) (Lower.collectConstInts anfM.body)
                     anfM.body (List.reverse (anfM.params.map (·.name))) 0
                     (bindingsUseLoopB_false_of_program p anfM hMem hNoLoop))
+                  hValueTruthy
               · -- **Wave 66 consume-`method_call` branch (replaces the retired
                 -- method_call axiom).**  The decidable `methodCallConsumeShapeBool`
                 -- classifier pins the body to the param-passthrough fragment
@@ -6883,10 +7471,10 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                   · exact compileSafe_observational_correct_methodCall_consume
                       p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
                       hSinglePublic hNameMC a hMethodCallShape hAgrees
-                      (fun _ => hSm) hCoh
+                      (fun _ => hSm) hCoh hValueTruthy
                   · exact compileSafe_observational_correct_modulo_crypto_call_codegen
                       p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
-                      [(a, Agrees.SlotKind.param)] hAgrees hNoLoop
+                      [(a, Agrees.SlotKind.param)] hAgrees hValueTruthy
                 · -- **crypto_call hash-peel branch.**  Before the universal
                   -- fallback, the decidable `hashCallConsumeShapeBool` classifier
                   -- peels the single-`sha256`/`hash160`-call method fragment: the
@@ -6903,19 +7491,19 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                       · subst hF
                         exact hashCall_consume_sha256 p anfM bytes bn harg hsrc hMem hPublic hSafe
                           initialAnf initialStack hSinglePublic hHashName hHParams hHBody
-                          hargBytes hrestV hHArg hHStk hHLen
+                          hargBytes hrestV hHArg hHStk hHLen hValueTruthy
                       · subst hF
                         exact hashCall_consume_hash160 p anfM bytes bn harg hsrc hMem hPublic hSafe
                           initialAnf initialStack hSinglePublic hHashName hHParams hHBody
-                          hargBytes hrestV hHArg hHStk hHLen
+                          hargBytes hrestV hHArg hHStk hHLen hValueTruthy
                     · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
+                        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
                   · -- Substrate-gap fallback: no structural classifier fires.
                     -- This is the crypto-call family (no dedicated Bool checker
                     -- until A4-crypto + Phase B per-primitive land). The
                     -- sub-omnibus hypothesis is `True`.
                     exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
+                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
 
 /--
 **Capstone variant consuming `SupportedANFBody`.**
@@ -7042,15 +7630,21 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           initialStack.stack = .vBigint (Int.ofNat i) :: rest ∧
           ∀ (x : String) (ty : ANFType), anfM.params = [ANFParam.mk x ty] →
             initialAnf.lookupParam x = some v)
+    -- **Value-terminated-body truthiness premise (keyed; 2026-06-11
+    -- truthy-top success-bit repair).**  Forwarded verbatim to the omnibus;
+    -- see the comment there.
+    (hValueTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true)
     (hCoh : Agrees.tsmCoherent initialAnf tsm)
     (_hSupported : RunarVerification.Stack.Agrees.SupportedANFBody anfM.body) :
-    successAgrees
+    acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) :=
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
     hNoLoop Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
-    hMethodCallFrag hHashCallFrag hStatefulFrag hDispatchFrag hCoh
+    hMethodCallFrag hHashCallFrag hStatefulFrag hDispatchFrag hValueTruthy hCoh
 
 
 end Soundness
