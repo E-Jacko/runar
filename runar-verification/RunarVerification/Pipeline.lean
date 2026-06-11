@@ -2827,7 +2827,10 @@ integration omnibus — planned split"):
   ripemd160 / hash160 / hash256 / blake3 / ec* / p256* / verifyECDSA*
   / verifyWOTS / verifySLHDSA / verifyRabin / etc.) that do not fit
   the math/byte fragment. Discharged after Phase B per-primitive
-  codegen-to-spec + A4-crypto wrappers land.
+  codegen-to-spec + A4-crypto wrappers land. GUARDED (2026-06-11) by
+  `programUsesLoopB p = false` — loop bodies reach this fallback when
+  they fail the loop fragment classifier, and the model loop arm is
+  unfaithful (`loopCx*`).
 * `compileSafe_observational_correct_modulo_update_prop_codegen` —
   RETIRED (Wave 64, 2026-05-23): the single-public canonical
   `prop ± small-const ; update_prop` consume fragment (decided by
@@ -2840,7 +2843,11 @@ integration omnibus — planned split"):
   `compileSafe_observational_correct_ifval_consume`; residual if_val
   bodies fall through to the sound `crypto_call` fallback.
 * `compileSafe_observational_correct_modulo_loop_codegen` —
-  Discharged once A7 widening completes.
+  Discharged once A7 widening completes. GUARDED (2026-06-11) by
+  `bodyLoopMapNeutralB` after the `loopCx*` counterexample showed a
+  `structuralLoopBodyBool`-accepted, non-aliased accumulator-loop shape
+  diverging (the model loop arm's per-iteration drop is misplaced for
+  bodies whose iteration variable survives the body).
 * `compileSafe_observational_correct_modulo_method_call_codegen` —
   RETIRED (Wave 66, 2026-05-24): the single-public param-passthrough
   `method_call` fragment (decided by `Agrees.methodCallConsumeShapeBool`)
@@ -2910,31 +2917,50 @@ introduced. See `PATH2_PLAN.md` §5.23 and `TRUST_MANIFEST.md`. -/
 -- propext / Classical.choice / Quot.sound + the crypto backends (NO
 -- sub-omnibus axiom).
 
-/-! ## Aliased-operand soundness guard (2026-06-08)
+/-! ## Aliased-operand divergence — found, fixed in 7 compilers, model aligned
 
-**A COUNTEREXAMPLE was found to the unguarded sub-omnibus axioms.**  For a
-hand-written ANF binding whose value reads the SAME ref twice in consume
-position — e.g. `t := x + x` with `x` a last-use param — the liveness
-lowerer double-consumes the single stack copy: each `bringToTop` d0-consume
-emits `[]` (the TS reference `05-stack-lower.ts:828` behaves identically),
-so the lowered ops are a bare `[OP_ADD]` that UNDERFLOWS at runtime, while
-the ANF interpreter evaluates the binding fine.  `compileSafe` accepts the
-program (`WF.ANF` holds), so `successAgrees` is `true ↔ false` = False —
-the unguarded axioms (`hypothesis True` crypto_call; loop) were REFUTABLE.
-The counterexample theorems below pin this permanently.
+**History (the full trajectory):**
 
-**Production impact: none from any frontend** — the ANF lowering pass gives
-every operand a fresh temp (`x + x` becomes `t0 := load_param x; t1 :=
-load_param x; t2 := t0 + t1`, which lowers correctly to `DUP SWAP ADD`,
-verified against the real TS compiler output `767c93009c`), and zero
-conformance fixtures contain a repeated-operand value.  The pattern is
-reachable ONLY through hand-written IR fed to `compileFromANF` / `--ir`
-(a separate compiler-side hardening concern).
+1. **2026-06-08 — counterexample found.**  For a hand-written ANF binding
+   whose value reads the SAME ref twice in consume position — e.g.
+   `t := x + x` with `x` a last-use param — the liveness lowerer
+   double-consumed the single stack copy: each `bringToTop` d0-consume
+   emits `[]`, so the lowered ops were a bare `[OP_ADD]` that UNDERFLOWED
+   at runtime, while the ANF interpreter evaluated the binding fine.
+   `compileSafe` accepted the program, so `successAgrees` was
+   `true ↔ false` = False — the unguarded sub-omnibus axioms
+   (`hypothesis True` crypto_call; loop) were REFUTABLE.  The repair at
+   the time was the decidable guard `noAliasedOperandsB`, REQUIRED by
+   both surviving axioms and threaded through the omnibus as `hNoAlias`.
+   The TS reference behaved identically (the model was faithfully
+   modelling a real compiler bug).
 
-The guard: `noAliasedOperandsB` decides that every binding's value reads
-pairwise-distinct refs (recursing into branch and loop bodies).  Every
-frontend-produced program satisfies it by construction.  Both surviving
-sub-omnibus axioms now REQUIRE it; the omnibus theorem threads it. -/
+2. **All 7 production compilers fixed** (PRs #62/#67/#68): the rule
+   `operandConsume` — consume(ref) = isLastUse AND ref occurs exactly
+   once in the value's FULL operand list — landed identically in TS, Go,
+   Rust, Python, Zig, Ruby, and Java.  Repeated refs are COPIED at every
+   position; the lingering original is removed by the public-method
+   epilogue cleanup.  Canonical pinned hex (all 7 tiers):
+   `t := x + x` → `767693009c77` (DUP DUP ADD OP_0 NUMEQUAL NIP).
+
+3. **Model aligned** (this wave): `Stack.Lower.operandConsume` /
+   `loadRefOperand` now mirror the fix at every multi-operand load site
+   (binOp, generic call args, methodCall arg binding, checkMultiSig,
+   computeStateOutput*/buildChangeOutput, addOutput/addRawOutput, math
+   helpers, crypto builtins), and `lowerMethod`'s epilogue NIP gate is
+   depth-only (matching TS `cleanupExcessStack`).  The divergence is
+   GONE: the former counterexample program now compiles to underflow-free
+   bytes and agrees with the ANF interpreter on the success bit —
+   pinned below by `aliasCx_stack_succeeds` / `aliasCx_successAgrees`
+   (replacing the retired `aliasCx_stack_fails`).  Model output verified
+   byte-identical to the 7-tier pinned constants for all three canonical
+   shapes (`767693009c77`, `7676a3009c77`, `7876937c93009c77`) plus the
+   distinct-ref regression shape (`767c93009c`).
+
+`noAliasedOperandsB` (every binding's value reads pairwise-distinct refs,
+recursing into branch and loop bodies) is retained below as the decidable
+guard definition; see the surviving sub-omnibus axioms for which guards
+remain required after the re-evaluation. -/
 
 /-- No duplicate names within one operand list. -/
 def nodupRefsB : List String → Bool
@@ -2962,6 +2988,126 @@ def noAliasedOperandsB : List ANFBinding → Bool
   | .mk _ v _ :: rest => valueOperandsNodupB v && noAliasedOperandsB rest
 end
 
+mutual
+/-- The value contains a `loop` anywhere (recursing into branch bodies). -/
+def valueUsesLoopB : ANFValue → Bool
+  | .loop _ _ _ => true
+  | .ifVal _ thn els => bindingsUseLoopB thn || bindingsUseLoopB els
+  | _ => false
+
+/-- Some binding in the body contains a `loop`. NOTE: does NOT chase
+`method_call` targets; use `programUsesLoopB` for the program-level form
+that also covers loops reached through private-method inlining. -/
+def bindingsUseLoopB : List ANFBinding → Bool
+  | [] => false
+  | .mk _ v _ :: rest => valueUsesLoopB v || bindingsUseLoopB rest
+end
+
+/-- Some method anywhere in the program contains a `loop` (covers loops
+reached through `method_call` inlining of private methods — the
+`lowerValueP` `.methodCall` arm splices callee bodies, so a loop-free
+public body can still lower a loop). -/
+def programUsesLoopB (p : ANFProgram) : Bool :=
+  p.methods.any (fun m => bindingsUseLoopB m.body)
+
+/-- Per-value loop **map-neutrality** check (the honest residual guard for
+the loop sub-omnibus axiom after the 2026-06-11 loop-arm counterexample,
+`loopCx*` below).
+
+The model's `.loop` arm lowers the body ONCE per liveness mode and replays
+it per iteration, emitting a per-iteration `.drop` whenever the iteration
+variable SURVIVES the body on the stack map. That drop removes the runtime
+top-of-stack — which is the body's last produced value, NOT the buried
+iteration variable — so any loop whose body (a) leaves the iter var alive,
+or (b) ends with a stack-map shape different from the parent map, runs the
+subsequent iterations (and the post-loop code) against a stack that has
+drifted from the map. `loopCx_stack_fails` pins the resulting success-bit
+divergence.
+
+A loop value passes only when BOTH lowered variants (non-final clamped /
+final natural) consume the iteration variable AND return the stack map to
+EXACTLY the parent shape (`smNF == sm && smF == sm`) — then every
+iteration starts and ends aligned, no per-iter drop is emitted, and the
+replayed ops are depth-consistent. Nested loops are conservatively
+rejected. `ifVal` values are accepted only when their branches are
+loop-free. Designed to be required ALONGSIDE `structuralLoopBodyBool`
+(which already excludes top-level `methodCall` values, so loops cannot
+sneak in through private-method inlining within the loop fragment). -/
+def valueLoopMapNeutralB (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (constInts : List (String × Int)) (sm : Lower.StackMap) :
+    ANFValue → Bool
+  | .loop _count body iterVar =>
+      let smInner := sm.push iterVar
+      let naturalLU := Lower.computeLastUses body
+      let outerRefs := Lower.bodyOuterRefs body iterVar
+      let nonFinalLU := Lower.clampLastUsesForOuter naturalLU outerRefs body.length
+      let bodyLocal := body.map (fun b => b.name)
+      let smNF := (Lower.lowerBindingsP progMethods props budget 0 nonFinalLU []
+        bodyLocal constInts smInner body).2
+      let smF := (Lower.lowerBindingsP progMethods props budget 0 naturalLU []
+        bodyLocal constInts smInner body).2
+      !bindingsUseLoopB body
+        && !Lower.listContains smNF iterVar && !Lower.listContains smF iterVar
+        && smNF == sm && smF == sm
+  | .ifVal _ thn els => !(bindingsUseLoopB thn || bindingsUseLoopB els)
+  | _ => true
+
+/-- Body-level loop map-neutrality: every binding's value passes
+`valueLoopMapNeutralB` against the stack map threaded through the actual
+lowering (mirrors `structuralLoopBodyBool`'s threading exactly). -/
+def bodyLoopMapNeutralB (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) :
+    List ANFBinding → Lower.StackMap → Nat → Bool
+  | [], _sm, _ci => true
+  | (.mk name v _) :: rest, sm, ci =>
+      valueLoopMapNeutralB progMethods props budget constInts sm v &&
+      bodyLoopMapNeutralB progMethods props budget lastUses outerProtected
+        localBindings constInts rest
+        (Lower.lowerValueP progMethods props budget ci lastUses
+            outerProtected localBindings constInts sm name v).2.1
+        (ci + 1)
+
+/-- A loop-free value is trivially map-neutral. -/
+theorem valueLoopMapNeutralB_of_no_loop
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (constInts : List (String × Int)) (sm : Lower.StackMap)
+    (v : ANFValue) (h : valueUsesLoopB v = false) :
+    valueLoopMapNeutralB progMethods props budget constInts sm v = true := by
+  cases v with
+  | loop count body iterVar => simp [valueUsesLoopB] at h
+  | ifVal cond thn els =>
+      simp only [valueUsesLoopB] at h
+      simp [valueLoopMapNeutralB, h]
+  | _ => rfl
+
+/-- A loop-free body is trivially map-neutral (any threading inputs). -/
+theorem bodyLoopMapNeutralB_of_noLoop
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) :
+    ∀ (body : List ANFBinding) (sm : Lower.StackMap) (ci : Nat),
+      bindingsUseLoopB body = false →
+      bodyLoopMapNeutralB progMethods props budget lastUses outerProtected
+        localBindings constInts body sm ci = true
+  | [], _sm, _ci, _h => rfl
+  | (.mk name v _) :: rest, sm, ci, h => by
+      simp only [bindingsUseLoopB, Bool.or_eq_false_iff] at h
+      simp only [bodyLoopMapNeutralB, Bool.and_eq_true]
+      exact ⟨valueLoopMapNeutralB_of_no_loop progMethods props budget constInts sm v h.1,
+             bodyLoopMapNeutralB_of_noLoop progMethods props budget lastUses
+               outerProtected localBindings constInts rest _ (ci + 1) h.2⟩
+
+/-- Program-level loop-freedom restricts to each member method's body. -/
+theorem bindingsUseLoopB_false_of_program (p : ANFProgram) (m : ANFMethod)
+    (hMem : m ∈ p.methods) (h : programUsesLoopB p = false) :
+    bindingsUseLoopB m.body = false := by
+  unfold programUsesLoopB at h
+  rw [List.any_eq_false] at h
+  exact Bool.eq_false_iff.mpr (h m hMem)
+
 /-- The counterexample method: `double(x) { t := x + x }` (repeated operand,
 hand-written ANF — NOT producible by any frontend). -/
 private def aliasCxM : ANFMethod :=
@@ -2971,23 +3117,132 @@ private def aliasCxM : ANFMethod :=
 private def aliasCxProg : ANFProgram :=
   { contractName := "Dbl", properties := [], methods := [aliasCxM] }
 
-/-- COUNTEREXAMPLE (ANF half): the repeated-operand body EVALUATES fine. -/
+/-- The repeated-operand body EVALUATES fine on the ANF side (unchanged
+since the counterexample era). -/
 theorem aliasCx_anf_succeeds :
     (RunarVerification.ANF.Eval.evalBindingsP aliasCxProg.methods
       { params := [("x", .vBigint 5)] } aliasCxM.body).toOption.isSome = true := by
   native_decide
 
-/-- COUNTEREXAMPLE (Stack half): the deployed bytes UNDERFLOW — the compiled
-script of the same accepted program fails on the matching entry. Together
-with the ANF half this REFUTES the unguarded `successAgrees` claim. -/
-theorem aliasCx_stack_fails :
+/-- DIVERGENCE GONE (replaces the retired `aliasCx_stack_fails`): under the
+`operandConsume` lowering the compiled bytes of the former counterexample
+program run to completion on the matching entry — both reads of `x` are
+COPIED (`DUP DUP ADD`), so OP_ADD no longer underflows, and the epilogue
+NIP removes the lingering `x`. -/
+theorem aliasCx_stack_succeeds :
     (match compileSafe aliasCxProg with
+     | .ok bytes => (runParsedBytes bytes { stack := [.vBigint 5] }).toOption.isSome
+     | .error _ => false) = true := by
+  native_decide
+
+/-- Agreement smoke for the former counterexample: the ANF evaluation and
+the deployed bytes now AGREE on the success bit (both succeed). -/
+theorem aliasCx_successAgrees (bytes : ByteArray)
+    (hSafe : compileSafe aliasCxProg = .ok bytes) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP aliasCxProg.methods
+        { params := [("x", .vBigint 5)] } aliasCxM.body)
+      (runParsedBytes bytes { stack := [.vBigint 5] }) := by
+  have hStack := aliasCx_stack_succeeds
+  rw [hSafe] at hStack
+  exact iff_of_true (by simpa using aliasCx_anf_succeeds) (by simpa using hStack)
+
+/-- The guard rejects the repeated-operand shape (kept as a regression pin
+for the guard definition itself). -/
+theorem aliasCx_guard_rejects : noAliasedOperandsB aliasCxM.body = false := by decide
+
+/-! ## Loop-arm divergence counterexample (2026-06-11)
+
+Found by the MANDATORY pre-removal probes when re-evaluating the
+`hNoAlias` guard after the operandConsume alignment: the model's `.loop`
+arm (Lower.lean) is unfaithful for bodies whose iteration variable
+survives the body — the per-iteration `.drop` targets the runtime
+top-of-stack (the body's last value) instead of the buried iteration
+variable, so the accumulator slot carries the stale iteration index into
+the next iteration. The probe program below is WF, NON-ALIASED
+(`noAliasedOperandsB = true`), accepted by `compileSafe`, and ACCEPTED by
+the loop axiom's structural hypothesis (`structuralLoopBodyBool = true`):
+its ANF evaluation succeeds while the deployed bytes abort at the
+second iteration's `OP_VERIFY` (the in-loop range check reads the
+corrupted accumulator slot). The previously-`hNoAlias`-guarded loop and
+crypto_call sub-omnibus axioms were therefore STILL refutable — the
+aliasing guard never excluded this class. Both axioms are re-guarded
+below (`bodyLoopMapNeutralB` for loop; `programUsesLoopB = false` for
+crypto_call); the theorems here pin the counterexample permanently.
+
+**Production impact**: the loop arm is a MODEL-side infidelity (the TS
+reference drops the iteration variable it tracks, not blindly the top);
+fixing the model loop arm (tracked as the loop-fidelity follow-up) will
+allow re-widening `bodyLoopMapNeutralB`. -/
+
+private def loopCxM : ANFMethod :=
+  { name := "unlock", params := [ANFParam.mk "p" .bigint],
+    body :=
+      [ ANFBinding.mk "c50" (.loadConst (.int 50)) none
+      , ANFBinding.mk "sum" (.loadConst (.int 100)) none
+      , ANFBinding.mk "tL" (.loop 2
+          [ ANFBinding.mk "tge" (.binOp ">=" "sum" "c50" none) none
+          , ANFBinding.mk "tv" (.assert "tge") none
+          , ANFBinding.mk "t1" (.binOp "+" "sum" "p" none) none
+          , ANFBinding.mk "sum" (.loadConst (.refAlias "t1")) none ] "i") none ],
+    isPublic := true }
+
+private def loopCxProg : ANFProgram :=
+  { contractName := "LoopCx", properties := [], methods := [loopCxM] }
+
+/-- COUNTEREXAMPLE (ANF half): the accumulator loop EVALUATES fine
+(`sum` stays ≥ 50 in both iterations). -/
+theorem loopCx_anf_succeeds :
+    (RunarVerification.ANF.Eval.evalBindingsP loopCxProg.methods
+      { params := [("p", .vBigint 5)] } loopCxM.body).toOption.isSome = true := by
+  native_decide
+
+/-- COUNTEREXAMPLE (Stack half): the deployed bytes FAIL — the misplaced
+per-iteration drop leaves the iteration index in the accumulator slot, so
+the second iteration's `OP_VERIFY` sees `0 >= 50 = false`. -/
+theorem loopCx_stack_fails :
+    (match compileSafe loopCxProg with
      | .ok bytes => (runParsedBytes bytes { stack := [.vBigint 5] }).toOption.isSome
      | .error _ => true) = false := by
   native_decide
 
-/-- The guard REJECTS the counterexample (the narrowing is effective). -/
-theorem aliasCx_guard_rejects : noAliasedOperandsB aliasCxM.body = false := by decide
+/-- The program is WF and NON-ALIASED — the old `hNoAlias` guard does NOT
+exclude it. -/
+theorem loopCx_wf_and_nonaliased :
+    (WF.programIsWF loopCxProg && noAliasedOperandsB loopCxM.body) = true := by
+  native_decide
+
+/-- The loop axiom's structural hypothesis ACCEPTS the counterexample —
+which is why the axiom needed the NEW `bodyLoopMapNeutralB` guard. -/
+theorem loopCx_structural_accepts :
+    Agrees.structuralLoopBodyBool loopCxProg.methods loopCxProg.properties
+      Lower.defaultInlineBudget
+      (Lower.computeLastUses loopCxM.body) []
+      (loopCxM.body.map (·.name))
+      (Lower.collectConstInts loopCxM.body)
+      loopCxM.body
+      (List.reverse (loopCxM.params.map (·.name)))
+      0 = true := by
+  native_decide
+
+/-- The NEW guard REJECTS the counterexample (the narrowing is effective):
+the loop body leaves the iteration variable alive on the lowered map. -/
+theorem loopCx_guard_rejects :
+    bodyLoopMapNeutralB loopCxProg.methods loopCxProg.properties
+      Lower.defaultInlineBudget
+      (Lower.computeLastUses loopCxM.body) []
+      (loopCxM.body.map (·.name))
+      (Lower.collectConstInts loopCxM.body)
+      loopCxM.body
+      (List.reverse (loopCxM.params.map (·.name)))
+      0 = false := by
+  native_decide
+
+/-- The crypto_call axiom's NEW guard also rejects it (the program uses a
+loop), so loop bodies that fail the structural classifier and fall to the
+crypto_call fallback are excluded there too. -/
+theorem loopCx_program_guard_rejects :
+    programUsesLoopB loopCxProg = true := by decide
 
 /-- **O1 sub-omnibus — crypto call family.**
 
@@ -3025,10 +3280,16 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    -- Aliased-operand guard (2026-06-08): the previously-`True` hypothesis is
-    -- NARROWED after the `t := x + x` counterexample (see the soundness-guard
-    -- section above) — without it this axiom was refutable.
-    (_hNoAlias : noAliasedOperandsB anfM.body = true) :
+    -- Loop-exclusion guard (2026-06-11, replaces the 2026-06-08 `hNoAlias`):
+    -- the aliased-operand divergence is FIXED (operandConsume port — see the
+    -- aliasCx section above; `aliasCx_stack_succeeds`), so the aliasing guard
+    -- is no longer needed. The loop-arm divergence (`loopCx*` above) remains:
+    -- loop bodies can reach this fallback (e.g. when `structuralLoopBodyBool`
+    -- rejects a post-loop binding — probe shapes A/D), so without a loop
+    -- exclusion this axiom is refutable. Program-level (not body-level)
+    -- because private-method inlining can splice a loop into a loop-free
+    -- public body.
+    (_hNoLoop : programUsesLoopB p = false) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
@@ -3085,11 +3346,28 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
         anfM.body
         (List.reverse (anfM.params.map (·.name)))
         0 = true)
-    -- Aliased-operand guard (2026-06-08): NARROWED after the `i + i` loop-body
-    -- counterexample (see the soundness-guard section above) — the unguarded
-    -- form was refutable for loop bodies reading the iteration variable twice
-    -- in one binding.
-    (_hNoAlias : noAliasedOperandsB anfM.body = true) :
+    -- Loop map-neutrality guard (2026-06-11, replaces the 2026-06-08
+    -- `hNoAlias`): the aliased-operand divergence is FIXED (operandConsume
+    -- port), but the probes that gated the guard removal produced a NEW
+    -- counterexample (`loopCx*` above) that SATISFIES `_hLoop` and is
+    -- non-aliased: the model loop arm's per-iteration drop is misplaced for
+    -- bodies whose iteration variable survives the body, so the previous
+    -- guard set left this axiom refutable. The residual believed-true
+    -- fragment requires every loop body to CONSUME its iteration variable
+    -- and return the stack map to the parent shape in both lowering modes
+    -- (`bodyLoopMapNeutralB`); `loopCx_guard_rejects` shows the
+    -- counterexample is excluded. Re-widening is tracked with the loop-arm
+    -- fidelity follow-up.
+    (_hLoopNeutral :
+      bodyLoopMapNeutralB
+        p.methods p.properties
+        Lower.defaultInlineBudget
+        (Lower.computeLastUses anfM.body) []
+        (anfM.body.map (·.name))
+        (Lower.collectConstInts anfM.body)
+        anfM.body
+        (List.reverse (anfM.params.map (·.name)))
+        0 = true) :
     successAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
@@ -6041,10 +6319,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    -- Aliased-operand guard (2026-06-08): threads to the narrowed crypto_call /
-    -- loop sub-omnibus axioms.  Decidable; every frontend-produced program
-    -- satisfies it by construction (operands are fresh temps).
-    (hNoAlias : noAliasedOperandsB anfM.body = true)
+    -- Loop-exclusion guard (2026-06-11, replaces the 2026-06-08 `hNoAlias`):
+    -- threads to the re-guarded crypto_call / loop sub-omnibus axioms. The
+    -- aliased-operand divergence is FIXED in the model (operandConsume port),
+    -- so the aliasing guard is gone; the model loop arm remains unfaithful
+    -- (`loopCx*`), so the omnibus currently covers LOOP-FREE programs only.
+    -- Decidable; every loop-free frontend program satisfies it trivially.
+    (hNoLoop : programUsesLoopB p = false)
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
     (hUntag :
       Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
@@ -6203,7 +6484,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- fallback — NO new axiom is introduced.
     by_cases hStMulti : (p.methods.filter (·.isPublic)).length ≥ 2
     · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
     · have hStSingle : p.methods.filter (·.isPublic) = [anfM] := by
         have hAnfMem : anfM ∈ p.methods.filter (·.isPublic) :=
           List.mem_filter.mpr ⟨hMem, by simpa using hPublic⟩
@@ -6228,9 +6509,9 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
             hStSingle hStName pre ty hStParams hStBody hStNe1 hStNe2
             ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk hStSig
         · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
       · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
   · by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
     · -- **Dispatch consume branch (replaces the retired dispatch axiom).**
       -- The decidable `dispatchConsumeShapeBool` classifier peels the
@@ -6251,7 +6532,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           hIdxW hWitnessW hDpNames hDpAllPass _h2 _h17
           x bn ty src hParamsW hBodyW v (hResW x ty hParamsW)
       · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
     · -- In the `¬hDispatch` branch the public-method filter has length < 2;
       -- since `anfM` is itself public it must be the SOLE public method, so
       -- the filter is exactly `[anfM]`.  This `hSinglePublic` fact feeds the
@@ -6294,7 +6575,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
               hSinglePublic hNameMB hMathByteNoLen hStructCall hUntag hCoh hFrag
           · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
         · -- **Wave 64 consume-`update_prop` branch (replaces the retired
           -- update_prop axiom).**  The decidable `updatePropConsumeShapeBool`
           -- classifier pins the body to the canonical
@@ -6320,7 +6601,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                 hSinglePublic hNameUP prop op c hBodyEq hSM hAdmis hAgrees hUntagUP
                 hTypedEntry hWtUP hCoh
             · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
           · -- **Wave 45 consume-`if_val` branch (replaces the retired if_val axiom).**
             -- The decidable `ifValArithBody` fragment pins the body to a single
             -- `.ifVal` with arith branches; the residual structural facts
@@ -6403,7 +6684,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                   (hTsmEq ▸ hUntag) hTypedEntry hBranchTyped (hTsmEq ▸ hCoh)
                   hCondBool hCondHead hLastU hIPThn hIPThn
               · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
             · by_cases hLoop :
                   Agrees.structuralLoopBodyBool
                     p.methods p.properties
@@ -6412,7 +6693,11 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                     anfM.body initialSm 0 = true
               · exact compileSafe_observational_correct_modulo_loop_codegen
                   p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hLoop
-                  hNoAlias
+                  (bodyLoopMapNeutralB_of_noLoop p.methods p.properties
+                    Lower.defaultInlineBudget (Lower.computeLastUses anfM.body) []
+                    (anfM.body.map (·.name)) (Lower.collectConstInts anfM.body)
+                    anfM.body (List.reverse (anfM.params.map (·.name))) 0
+                    (bindingsUseLoopB_false_of_program p anfM hMem hNoLoop))
               · -- **Wave 66 consume-`method_call` branch (replaces the retired
                 -- method_call axiom).**  The decidable `methodCallConsumeShapeBool`
                 -- classifier pins the body to the param-passthrough fragment
@@ -6434,7 +6719,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                       (fun _ => hSm) hCoh
                   · exact compileSafe_observational_correct_modulo_crypto_call_codegen
                       p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
-                      [(a, Agrees.SlotKind.param)] hAgrees hNoAlias
+                      [(a, Agrees.SlotKind.param)] hAgrees hNoLoop
                 · -- **crypto_call hash-peel branch.**  Before the universal
                   -- fallback, the decidable `hashCallConsumeShapeBool` classifier
                   -- peels the single-`sha256`/`hash160`-call method fragment: the
@@ -6457,13 +6742,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                           initialAnf initialStack hSinglePublic hHashName hHParams hHBody
                           hargBytes hrestV hHArg hHStk hHLen
                     · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+                        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
                   · -- Substrate-gap fallback: no structural classifier fires.
                     -- This is the crypto-call family (no dedicated Bool checker
                     -- until A4-crypto + Phase B per-primitive land). The
                     -- sub-omnibus hypothesis is `True`.
                     exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoAlias
+                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hNoLoop
 
 /--
 **Capstone variant consuming `SupportedANFBody`.**
@@ -6489,10 +6774,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    -- Aliased-operand guard (2026-06-08): threads to the narrowed crypto_call /
-    -- loop sub-omnibus axioms.  Decidable; every frontend-produced program
-    -- satisfies it by construction (operands are fresh temps).
-    (hNoAlias : noAliasedOperandsB anfM.body = true)
+    -- Loop-exclusion guard (2026-06-11, replaces the 2026-06-08 `hNoAlias`):
+    -- threads to the re-guarded crypto_call / loop sub-omnibus axioms. The
+    -- aliased-operand divergence is FIXED in the model (operandConsume port),
+    -- so the aliasing guard is gone; the model loop arm remains unfaithful
+    -- (`loopCx*`), so the omnibus currently covers LOOP-FREE programs only.
+    -- Decidable; every loop-free frontend program satisfies it trivially.
+    (hNoLoop : programUsesLoopB p = false)
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
     (hUntag :
       Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
@@ -6591,7 +6879,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       (runParsedBytes bytes initialStack) :=
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
-    hNoAlias Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
+    hNoLoop Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
     hMethodCallFrag hHashCallFrag hStatefulFrag hDispatchFrag hCoh
 
 

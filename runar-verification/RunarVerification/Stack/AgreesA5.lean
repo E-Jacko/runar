@@ -3915,7 +3915,17 @@ private theorem wave58_pref_lowerStep_binOp :
     Stack.Lower.lowerValueP [] [] 1000 2 wave58PrefLU [] [] [] ["c1", "c0", "count"] "t0"
         (.binOp "+" "c1" "c0" none)
       = ([StackOp.swap, .opcode "OP_ADD"], ["t0", "count"], []) := by
-  unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+  have hOpBridgeL : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
+      Stack.Lower.loadRefOperand smx "c1" ["c1", "c0"] ci lu oprot
+        = Stack.Lower.loadRefLive smx "c1" ci lu oprot :=
+    fun smx ci lu oprot => Stack.Lower.loadRefOperand_pair_left smx "c1" "c0" ci lu oprot (by decide)
+  have hOpBridgeR : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
+      Stack.Lower.loadRefOperand smx "c0" ["c1", "c0"] ci lu oprot
+        = Stack.Lower.loadRefLive smx "c0" ci lu oprot :=
+    fun smx ci lu oprot => Stack.Lower.loadRefOperand_pair_right smx "c1" "c0" ci lu oprot (by decide)
+  unfold Stack.Lower.lowerValueP
+  simp only [hOpBridgeL, hOpBridgeR]
+  unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     Stack.Lower.StackMap.depth?
   have hLU1 : Stack.Lower.isLastUse wave58PrefLU "c1" 2 = true := by decide
   have hLU0 : Stack.Lower.isLastUse wave58PrefLU "c0" 2 = true := by decide
@@ -4257,7 +4267,17 @@ private theorem wave58_canon_lowerStep_binOp :
         ["c1", "c0", "count"] "t0" (.binOp "+" "c0" "c1" none)
       = ([StackOp.swap, StackOp.swap, .opcode "OP_ADD"], ["t0", "count"],
           (smokeCUpdatePropBody.map (·.name))) := by
-  unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+  have hOpBridgeL : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
+      Stack.Lower.loadRefOperand smx "c0" ["c0", "c1"] ci lu oprot
+        = Stack.Lower.loadRefLive smx "c0" ci lu oprot :=
+    fun smx ci lu oprot => Stack.Lower.loadRefOperand_pair_left smx "c0" "c1" ci lu oprot (by decide)
+  have hOpBridgeR : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
+      Stack.Lower.loadRefOperand smx "c1" ["c0", "c1"] ci lu oprot
+        = Stack.Lower.loadRefLive smx "c1" ci lu oprot :=
+    fun smx ci lu oprot => Stack.Lower.loadRefOperand_pair_right smx "c0" "c1" ci lu oprot (by decide)
+  unfold Stack.Lower.lowerValueP
+  simp only [hOpBridgeL, hOpBridgeR]
+  unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
     Stack.Lower.StackMap.depth?
   have hLU0 : Stack.Lower.isLastUse wave58CanonLU "c0" 2 = true := by decide
   have hLU1 : Stack.Lower.isLastUse wave58CanonLU "c1" 2 = true := by decide
@@ -4722,7 +4742,17 @@ theorem successAgrees_updateProp_consume_unconditional
       Stack.Lower.lowerValueP progMethods props budget 2 lastUses [] names constInts
           ["c1", "c0", p] "t0" (.binOp op "c0" "c1" none)
         = ([StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)], ["t0", p], names) := by
-    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    have hOpBridgeL : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
+        Stack.Lower.loadRefOperand smx "c0" ["c0", "c1"] ci lu oprot
+          = Stack.Lower.loadRefLive smx "c0" ci lu oprot :=
+      fun smx ci lu oprot => Stack.Lower.loadRefOperand_pair_left smx "c0" "c1" ci lu oprot (by decide)
+    have hOpBridgeR : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
+        Stack.Lower.loadRefOperand smx "c1" ["c0", "c1"] ci lu oprot
+          = Stack.Lower.loadRefLive smx "c1" ci lu oprot :=
+      fun smx ci lu oprot => Stack.Lower.loadRefOperand_pair_right smx "c0" "c1" ci lu oprot (by decide)
+    unfold Stack.Lower.lowerValueP
+    simp only [hOpBridgeL, hOpBridgeR]
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
       Stack.Lower.StackMap.depth?
     have hF0 : (["c1", "c0", p] : StackMap).findIdx? (· == "c0") = some 1 := by
       unfold List.findIdx?; simp [List.findIdx?.go]
@@ -4982,7 +5012,17 @@ theorem updatePropConsume_RAW_eq (progMethods : List ANFMethod)
           (ANFValue.binOp op "c0" "c1" none)
         = ([StackOp.swap, .swap, .opcode (Stack.Lower.binopOpcode op none)], ["t0", p],
            ["c0", "c1", "t0", "u0"]) := by
-    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    have hOpBridgeL : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
+        Stack.Lower.loadRefOperand smx "c0" ["c0", "c1"] ci lu oprot
+          = Stack.Lower.loadRefLive smx "c0" ci lu oprot :=
+      fun smx ci lu oprot => Stack.Lower.loadRefOperand_pair_left smx "c0" "c1" ci lu oprot (by decide)
+    have hOpBridgeR : ∀ (smx : StackMap) (ci : Nat) (lu : List (String × Nat)) (oprot : List String),
+        Stack.Lower.loadRefOperand smx "c1" ["c0", "c1"] ci lu oprot
+          = Stack.Lower.loadRefLive smx "c1" ci lu oprot :=
+      fun smx ci lu oprot => Stack.Lower.loadRefOperand_pair_right smx "c0" "c1" ci lu oprot (by decide)
+    unfold Stack.Lower.lowerValueP
+    simp only [hOpBridgeL, hOpBridgeR]
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
       Stack.Lower.StackMap.depth?
     have hF0 : (["c1", "c0", p] : Stack.Lower.StackMap).findIdx? (· == "c0") = some 1 := by
       unfold List.findIdx?; simp [List.findIdx?.go]

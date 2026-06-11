@@ -4894,7 +4894,8 @@ private theorem sA_elsOps :
         ["u0", "u1"] [] ["p0", "p1", "p2"] "u0" (.binOp "-" "p0" "p1" none)).1 :=
       (congrArg Prod.fst h1).symm
     rw [hfst]
-    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    unfold Stack.Lower.lowerValueP Stack.Lower.loadRefOperand
+      Stack.Lower.operandConsume Stack.Lower.bringToTop
     decide
   simp only []
   intro hcontra

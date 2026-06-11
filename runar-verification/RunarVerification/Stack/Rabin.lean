@@ -24,8 +24,9 @@ stale until the follow-up lands.
 
 Mirrors the TypeScript reference one-to-one. The dispatch arm in
 `Stack.Lower` (`lowerVerifyRabinSigOpsLive`) brings the four args to the
-top of the stack via `loadRefLive` — yielding the layout
-`bottom→top: msg sig padding pubKey` — and then splices the body
+top of the stack via `loadRefOperand` (consume on last use, modulo the
+repeated-operand gate over `[msg, sig, padding, pubKey]`) — yielding the
+layout `bottom→top: msg sig padding pubKey` — and then splices the body
 defined here.
 
 ## Entry / exit shape
@@ -112,9 +113,10 @@ load-bearing fact for any future `runOps`-level reasoning.
 -/
 
 /-- The 10-opcode body emitted by `lowerVerifyRabinSigOpsLive` is
-byte-identical to `rabinBodyOps`. The four leading `loadRefLive`
-blocks are quotiented out by `arg loaders` — they are pure
-ref-loads that vary only with the runtime stack map.
+byte-identical to `rabinBodyOps`. The four leading `loadRefOperand`
+blocks (operand-gated over `[msg, sig, padding, pubKey]`) are
+quotiented out by `arg loaders` — they are pure ref-loads that vary
+only with the runtime stack map.
 
 This is provable by `rfl` because both sides are constructed by
 the same concrete `++` of literal op lists in `Stack/Lower.lean`. -/
@@ -124,22 +126,32 @@ theorem lowerVerifyRabinSigOpsLive_body
     (outerProtected : List String) :
     (lowerVerifyRabinSigOpsLive sm bn msg sig padding pubKey
         currentIndex lastUses outerProtected).fst
-      = (loadRefLive sm msg currentIndex lastUses outerProtected).fst
-        ++ (loadRefLive
-              (loadRefLive sm msg currentIndex lastUses outerProtected).snd
-              sig currentIndex lastUses outerProtected).fst
-        ++ (loadRefLive
-              (loadRefLive
-                (loadRefLive sm msg currentIndex lastUses outerProtected).snd
-                sig currentIndex lastUses outerProtected).snd
-              padding currentIndex lastUses outerProtected).fst
-        ++ (loadRefLive
-              (loadRefLive
-                (loadRefLive
-                  (loadRefLive sm msg currentIndex lastUses outerProtected).snd
-                  sig currentIndex lastUses outerProtected).snd
-                padding currentIndex lastUses outerProtected).snd
-              pubKey currentIndex lastUses outerProtected).fst
+      = (loadRefOperand sm msg [msg, sig, padding, pubKey]
+            currentIndex lastUses outerProtected).fst
+        ++ (loadRefOperand
+              (loadRefOperand sm msg [msg, sig, padding, pubKey]
+                currentIndex lastUses outerProtected).snd
+              sig [msg, sig, padding, pubKey]
+              currentIndex lastUses outerProtected).fst
+        ++ (loadRefOperand
+              (loadRefOperand
+                (loadRefOperand sm msg [msg, sig, padding, pubKey]
+                  currentIndex lastUses outerProtected).snd
+                sig [msg, sig, padding, pubKey]
+                currentIndex lastUses outerProtected).snd
+              padding [msg, sig, padding, pubKey]
+              currentIndex lastUses outerProtected).fst
+        ++ (loadRefOperand
+              (loadRefOperand
+                (loadRefOperand
+                  (loadRefOperand sm msg [msg, sig, padding, pubKey]
+                    currentIndex lastUses outerProtected).snd
+                  sig [msg, sig, padding, pubKey]
+                  currentIndex lastUses outerProtected).snd
+                padding [msg, sig, padding, pubKey]
+                currentIndex lastUses outerProtected).snd
+              pubKey [msg, sig, padding, pubKey]
+              currentIndex lastUses outerProtected).fst
         ++ rabinBodyOps := by
   rfl
 
