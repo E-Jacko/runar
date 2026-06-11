@@ -3010,29 +3010,26 @@ public body can still lower a loop). -/
 def programUsesLoopB (p : ANFProgram) : Bool :=
   p.methods.any (fun m => bindingsUseLoopB m.body)
 
-/-- Per-value loop **map-neutrality** check (the honest residual guard for
-the loop sub-omnibus axiom after the 2026-06-11 loop-arm counterexample,
-`loopCx*` below).
+/-- Per-value loop **map-neutrality** check — the conservative class
+restriction retained on the loop sub-omnibus axiom.
 
-The model's `.loop` arm lowers the body ONCE per liveness mode and replays
-it per iteration, emitting a per-iteration `.drop` whenever the iteration
-variable SURVIVES the body on the stack map. That drop removes the runtime
-top-of-stack — which is the body's last produced value, NOT the buried
-iteration variable — so any loop whose body (a) leaves the iter var alive,
-or (b) ends with a stack-map shape different from the parent map, runs the
-subsequent iterations (and the post-loop code) against a stack that has
-drifted from the map. `loopCx_stack_fails` pins the resulting success-bit
-divergence.
-
-A loop value passes only when BOTH lowered variants (non-final clamped /
-final natural) consume the iteration variable AND return the stack map to
-EXACTLY the parent shape (`smNF == sm && smF == sm`) — then every
-iteration starts and ends aligned, no per-iter drop is emitted, and the
-replayed ops are depth-consistent. Nested loops are conservatively
-rejected. `ifVal` values are accepted only when their branches are
-loop-free. Designed to be required ALONGSIDE `structuralLoopBodyBool`
-(which already excludes top-level `methodCall` values, so loops cannot
-sneak in through private-method inlining within the loop fragment). -/
+History: introduced 2026-06-11 when the (since-FIXED) lower-once `.loop`
+arm was shown unfaithful for map-non-neutral bodies (`loopCx*` below).
+Under the faithful per-iteration arm (loop-fidelity rewrite, same date)
+the predicate's role changed: it now selects the ITERATION-IDENTICAL
+class — loop bodies whose single-iteration lowering (in both liveness
+modes, against the iteration-0 map with the historical body-names-only
+localBindings) consumes the iteration variable and returns the map to
+EXACTLY the parent shape (`smNF == sm && smF == sm`). For that class
+every iteration's chunk is provably iteration-invariant (see
+`AgreesA7.lowerLoopItersP_neutral_eq`). Strand-shaped bodies (values
+surviving across iterations, growing PICK/ROLL depths) are excluded —
+not because the arm is unfaithful for them (it is now faithful; see
+`loopOk*`), but because widening is blocked on the terminal-assert
+success-bit gap (`termCx*`) and methodCall-in-loop fidelity. Nested
+loops are conservatively rejected; `ifVal` values are accepted only when
+their branches are loop-free. Designed to be required ALONGSIDE
+`structuralLoopBodyBool`. -/
 def valueLoopMapNeutralB (progMethods : List ANFMethod) (props : List ANFProperty)
     (budget : Nat) (constInts : List (String × Int)) (sm : Lower.StackMap) :
     ANFValue → Bool
@@ -3151,29 +3148,43 @@ theorem aliasCx_successAgrees (bytes : ByteArray)
 for the guard definition itself). -/
 theorem aliasCx_guard_rejects : noAliasedOperandsB aliasCxM.body = false := by decide
 
-/-! ## Loop-arm divergence counterexample (2026-06-11)
+/-! ## Loop-arm divergence counterexample — FIXED (2026-06-11)
 
-Found by the MANDATORY pre-removal probes when re-evaluating the
-`hNoAlias` guard after the operandConsume alignment: the model's `.loop`
-arm (Lower.lean) is unfaithful for bodies whose iteration variable
-survives the body — the per-iteration `.drop` targets the runtime
-top-of-stack (the body's last value) instead of the buried iteration
-variable, so the accumulator slot carries the stale iteration index into
-the next iteration. The probe program below is WF, NON-ALIASED
-(`noAliasedOperandsB = true`), accepted by `compileSafe`, and ACCEPTED by
-the loop axiom's structural hypothesis (`structuralLoopBodyBool = true`):
-its ANF evaluation succeeds while the deployed bytes abort at the
-second iteration's `OP_VERIFY` (the in-loop range check reads the
-corrupted accumulator slot). The previously-`hNoAlias`-guarded loop and
-crypto_call sub-omnibus axioms were therefore STILL refutable — the
-aliasing guard never excluded this class. Both axioms are re-guarded
-below (`bodyLoopMapNeutralB` for loop; `programUsesLoopB = false` for
-crypto_call); the theorems here pin the counterexample permanently.
+History: the 2026-06-11 pre-removal probes found the model's `.loop`
+arm (Lower.lean) unfaithful for bodies whose iteration variable
+survives the body — the old lower-once-and-replay arm emitted an
+any-depth per-iteration `.drop` that destroyed the body's last value
+(`loopCx_stack_fails` pinned ANF-succeeds vs bytes-abort), plus three
+sibling divergences: iteration-0 depth replay (PICK/ROLL depths must
+GROW as values strand), a body-names-only `localBindings` set (TS uses
+the enclosing ∪ body union), and an over-approximated `bodyOuterRefs`
+(TS only protects `load_param` names and non-body-bound `@ref:`
+targets).
 
-**Production impact**: the loop arm is a MODEL-side infidelity (the TS
-reference drops the iteration variable it tracks, not blindly the top);
-fixing the model loop arm (tracked as the loop-fidelity follow-up) will
-allow re-widening `bodyLoopMapNeutralB`. -/
+LOOP-FIDELITY REWRITE (this commit): the arm now performs per-iteration
+re-lowering against the live threaded stack map (`lowerLoopItersP`),
+drops the iter var only at exactly depth 0, threads the union
+localBindings, and narrows `bodyOuterRefs` to the TS set. Byte-parity
+evidence: the `bounded-loop` conformance golden still matches
+byte-exactly; the canonical accumulator shape (`loopOk*` below) and a
+nested-loop probe produce hex IDENTICAL to the production TS compiler
+(`compileFromANF`, fold/EC-optimizer off); shapes the TS reference
+REJECTS ("Value not found on stack" — outer non-param locals read as
+raw operands across iterations) are now REJECTED by `compileSafe` too
+(`OP_RUNAR_UNRESOLVED_*` sentinels — `loopCx_ts_aligned_rejects`).
+
+The guards stay (see the axiom comments for the honest residual
+classes): `bodyLoopMapNeutralB` on the loop axiom and
+`programUsesLoopB = false` on crypto_call are RETAINED — not because of
+the (fixed) loop-arm infidelity, but because the widening probes
+surfaced a PRE-EXISTING, loop-INDEPENDENT success-bit modeling gap
+(`termCx*` below): the public-method terminal-assert `OP_VERIFY`
+elision leaves the boolean ON the stack and `runParsedBytes`-based
+`successAgrees` counts falsy completion as success, while the ANF
+evaluator's assert errors. Admitting loop bodies into crypto_call would
+add KNOWN agreement falsifiers of that class (e.g. the `loopOk`
+accumulator with a non-satisfying entry), so the widening is BLOCKED on
+the truthy-top success-bit fix (tracked follow-up). -/
 
 private def loopCxM : ANFMethod :=
   { name := "unlock", params := [ANFParam.mk "p" .bigint],
@@ -3197,13 +3208,26 @@ theorem loopCx_anf_succeeds :
       { params := [("p", .vBigint 5)] } loopCxM.body).toOption.isSome = true := by
   native_decide
 
-/-- COUNTEREXAMPLE (Stack half): the deployed bytes FAIL — the misplaced
-per-iteration drop leaves the iteration index in the accumulator slot, so
-the second iteration's `OP_VERIFY` sees `0 >= 50 = false`. -/
-theorem loopCx_stack_fails :
+/-- DIVERGENCE GONE (replaces the retired `loopCx_stack_fails`): under
+the FAITHFUL per-iteration loop arm (loop-fidelity rewrite 2026-06-11)
+the model REJECTS this program at compile time, exactly like the TS
+reference. The body reads the outer non-param local `c50` (and the
+method param `p`) as RAW binop operands with no `load_param` binding;
+the faithful (narrow) `bodyOuterRefs` does not protect them, so
+iteration 0 consumes them at their natural last-use and iteration 1
+fails to resolve them — TS errors with "Value 'c50' not found on stack"
+(verified against `compileFromANF` on the production compiler
+2026-06-11), and the model emits `OP_RUNAR_UNRESOLVED_*` sentinels that
+`validateStackProgram` rejects. ANF-vs-bytes agreement is restored
+VACUOUSLY for this program: there are no deployed bytes to disagree
+with (`hSafe : compileSafe p = .ok bytes` is unsatisfiable). Note this
+exact ANF is NOT frontend-reachable (frontends emit `load_param` /
+in-body `load_const` bindings for such reads — see `loopOk*` below for
+the frontend-shaped accumulator that now compiles AND agrees). -/
+theorem loopCx_ts_aligned_rejects :
     (match compileSafe loopCxProg with
-     | .ok bytes => (runParsedBytes bytes { stack := [.vBigint 5] }).toOption.isSome
-     | .error _ => true) = false := by
+     | .ok _ => false
+     | .error _ => true) = true := by
   native_decide
 
 /-- The program is WF and NON-ALIASED — the old `hNoAlias` guard does NOT
@@ -3213,7 +3237,9 @@ theorem loopCx_wf_and_nonaliased :
   native_decide
 
 /-- The loop axiom's structural hypothesis ACCEPTS the counterexample —
-which is why the axiom needed the NEW `bodyLoopMapNeutralB` guard. -/
+which is why the axiom carries the `bodyLoopMapNeutralB` guard (the
+classifier alone does not exclude this shape; today `compileSafe`
+rejects it outright, making the axiom vacuous for it). -/
 theorem loopCx_structural_accepts :
     Agrees.structuralLoopBodyBool loopCxProg.methods loopCxProg.properties
       Lower.defaultInlineBudget
@@ -3225,8 +3251,11 @@ theorem loopCx_structural_accepts :
       0 = true := by
   native_decide
 
-/-- The NEW guard REJECTS the counterexample (the narrowing is effective):
-the loop body leaves the iteration variable alive on the lowered map. -/
+/-- The retained map-neutrality guard REJECTS the counterexample (the
+loop body leaves the iteration variable alive on the lowered map) —
+kept as a regression pin for the guard definition itself; the program
+is in any case now rejected by `compileSafe`
+(`loopCx_ts_aligned_rejects`). -/
 theorem loopCx_guard_rejects :
     bodyLoopMapNeutralB loopCxProg.methods loopCxProg.properties
       Lower.defaultInlineBudget
@@ -3243,6 +3272,131 @@ loop), so loop bodies that fail the structural classifier and fall to the
 crypto_call fallback are excluded there too. -/
 theorem loopCx_program_guard_rejects :
     programUsesLoopB loopCxProg = true := by decide
+
+/-! ### loopOk — the frontend-shaped accumulator now compiles AND agrees
+
+The canonical accumulator loop (`for i in 0..3 { sum = sum + start }`
+followed by an `expectedSum` check — the shape every frontend emits,
+with an explicit `load_param` binding inside the body). Under the OLD
+arm this class was miscompiled (the loopCx divergence); under the
+faithful arm its model hex is IDENTICAL to the production TS compiler's
+(`000052797b7c935153797b7c9352547a7b7c93009c777777` — growing PICK
+depths 2→3, final ROLL 4, NO per-iteration drops, three epilogue NIPs
+for the stranded iter vars), and ANF + deployed bytes AGREE on the
+satisfying entry. -/
+
+private def loopOkM : ANFMethod :=
+  { name := "verify", params := [ANFParam.mk "start" .bigint],
+    body :=
+      [ ANFBinding.mk "t0" (.loadConst (.int 0)) none
+      , ANFBinding.mk "sum" (.loadConst (.refAlias "t0")) none
+      , ANFBinding.mk "t9" (.loop 3
+          [ ANFBinding.mk "t1" (.loadParam "start") none
+          , ANFBinding.mk "t2" (.binOp "+" "sum" "t1" none) none
+          , ANFBinding.mk "sum" (.loadConst (.refAlias "t2")) none ] "i") none
+      , ANFBinding.mk "t3" (.loadProp "expectedSum") none
+      , ANFBinding.mk "t4" (.binOp "===" "sum" "t3" none) none
+      , ANFBinding.mk "t5" (.assert "t4") none ],
+    isPublic := true }
+
+private def loopOkProg : ANFProgram :=
+  { contractName := "LoopOk"
+  , properties := [{ name := "expectedSum", type := .bigint, readonly := true }]
+  , methods := [loopOkM] }
+
+/-- Byte-faithfulness pin: the model's deployed hex for the accumulator
+equals the TS reference's (`compileFromANF`, constant folding + EC
+optimizer disabled; captured 2026-06-11). -/
+theorem loopOk_hex_matches_ts :
+    (match compileHexSafe loopOkProg with
+     | .ok hex => hex == "000052797b7c935153797b7c9352547a7b7c93009c777777"
+     | .error _ => false) = true := by
+  native_decide
+
+/-- ANF half: the accumulator evaluates successfully on the satisfying
+entry (`start = 0`, `expectedSum = 0` — matching the deployed
+placeholder `OP_0`). -/
+theorem loopOk_anf_succeeds :
+    (RunarVerification.ANF.Eval.evalBindingsP loopOkProg.methods
+      { params := [("start", .vBigint 0)]
+      , props := [("expectedSum", .vBigint 0)] } loopOkM.body).toOption.isSome
+      = true := by
+  native_decide
+
+/-- Stack half: the deployed bytes RUN successfully on the same entry —
+the loopCx divergence class is FIXED (the old arm's misplaced drop made
+this class abort). -/
+theorem loopOk_stack_succeeds :
+    (match compileSafe loopOkProg with
+     | .ok bytes => (runParsedBytes bytes { stack := [.vBigint 0] }).toOption.isSome
+     | .error _ => false) = true := by
+  native_decide
+
+/-- Agreement smoke for the fixed class: ANF and deployed bytes agree on
+the success bit (both succeed) on the satisfying entry. -/
+theorem loopOk_successAgrees (bytes : ByteArray)
+    (hSafe : compileSafe loopOkProg = .ok bytes) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP loopOkProg.methods
+        { params := [("start", .vBigint 0)]
+        , props := [("expectedSum", .vBigint 0)] } loopOkM.body)
+      (runParsedBytes bytes { stack := [.vBigint 0] }) := by
+  have hStack := loopOk_stack_succeeds
+  rw [hSafe] at hStack
+  exact iff_of_true (by simpa using loopOk_anf_succeeds) (by simpa using hStack)
+
+/-! ### termCx — pre-existing terminal-assert success-bit gap (KNOWN OPEN)
+
+Discovered 2026-06-11 by the loop-widening probes, but LOOP-FREE and
+PRE-EXISTING: a public method body ending in `assert` has its trailing
+`OP_VERIFY` elided (Bitcoin's truthy-top contract), so the deployed
+bytes COMPLETE even when the asserted condition is FALSE — the falsy
+boolean is simply left on top — while the ANF evaluator's `assert`
+errors. `runParsedBytes`-based `successAgrees` therefore DISAGREES on
+any non-satisfying entry of an assert-terminated body. The program
+below is WF, loop-free, and rejected by every structural classifier, so
+it lands on the `crypto_call` fallback axiom: the axiom's statement is
+REFUTABLE for this (program, entry) pair as pinned here. This gap is
+NOT introduced or enlarged by the loop-fidelity rewrite (it reproduces
+identically on the parent commit); the honest fix is a truthy-top-aware
+bytes-side success bit (consensus checks the final stack top), which
+touches every discharged successAgrees theorem and is tracked as an
+URGENT follow-up. Until then the crypto_call guard set is NOT widened
+(admitting loop bodies would add more instances of the same class). -/
+
+private def termCxM : ANFMethod :=
+  { name := "verify", params := [ANFParam.mk "x" .bigint],
+    body :=
+      [ ANFBinding.mk "ta" (.loadParam "x") none
+      , ANFBinding.mk "tb" (.loadConst (.int 5)) none
+      , ANFBinding.mk "tc" (.binOp "===" "ta" "tb" none) none
+      , ANFBinding.mk "td" (.assert "tc") none ],
+    isPublic := true }
+
+private def termCxProg : ANFProgram :=
+  { contractName := "TermCx", properties := [], methods := [termCxM] }
+
+/-- The ANF evaluation FAILS on the non-satisfying entry (`x = 1`,
+`assert (1 === 5)`). -/
+theorem termCx_anf_fails :
+    (RunarVerification.ANF.Eval.evalBindingsP termCxProg.methods
+      { params := [("x", .vBigint 1)] } termCxM.body).toOption.isSome = false := by
+  native_decide
+
+/-- The deployed bytes COMPLETE on the same entry (the terminal
+`OP_VERIFY` is elided; the falsy `OP_NUMEQUAL` result is left on top) —
+the success bits DISAGREE. -/
+theorem termCx_bytes_complete :
+    (match compileSafe termCxProg with
+     | .ok bytes => (runParsedBytes bytes { stack := [.vBigint 1] }).toOption.isSome
+     | .error _ => false) = true := by
+  native_decide
+
+/-- The program is WF and LOOP-FREE — the crypto_call axiom's `_hNoLoop`
+guard does NOT exclude it. -/
+theorem termCx_wf_and_loopfree :
+    (WF.programIsWF termCxProg && !programUsesLoopB termCxProg) = true := by
+  native_decide
 
 /-- **O1 sub-omnibus — crypto call family.**
 
@@ -3280,13 +3434,18 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    -- Loop-exclusion guard (2026-06-11, replaces the 2026-06-08 `hNoAlias`):
-    -- the aliased-operand divergence is FIXED (operandConsume port — see the
-    -- aliasCx section above; `aliasCx_stack_succeeds`), so the aliasing guard
-    -- is no longer needed. The loop-arm divergence (`loopCx*` above) remains:
-    -- loop bodies can reach this fallback (e.g. when `structuralLoopBodyBool`
-    -- rejects a post-loop binding — probe shapes A/D), so without a loop
-    -- exclusion this axiom is refutable. Program-level (not body-level)
+    -- Loop-exclusion guard (2026-06-11; RE-EVALUATED after the loop-arm
+    -- fidelity rewrite, same date): the loop-arm divergence (`loopCx*`)
+    -- is FIXED — per-iteration re-lowering, depth-0 drop gate, union
+    -- localBindings, narrowed bodyOuterRefs; byte-parity pinned against
+    -- the TS reference (`loopOk_hex_matches_ts`, bounded-loop golden,
+    -- nested probe). The guard is nevertheless KEPT, NOT widened: the
+    -- widening probes surfaced the PRE-EXISTING loop-independent
+    -- terminal-assert success-bit gap (`termCx*` above) — admitting loop
+    -- bodies here would add KNOWN agreement falsifiers of that class
+    -- (assert-terminated loop programs on non-satisfying entries, e.g.
+    -- `loopOkProg` with `start = 7`). Re-widening is blocked on the
+    -- truthy-top success-bit follow-up. Program-level (not body-level)
     -- because private-method inlining can splice a loop into a loop-free
     -- public body.
     (_hNoLoop : programUsesLoopB p = false) :
@@ -3346,18 +3505,23 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
         anfM.body
         (List.reverse (anfM.params.map (·.name)))
         0 = true)
-    -- Loop map-neutrality guard (2026-06-11, replaces the 2026-06-08
-    -- `hNoAlias`): the aliased-operand divergence is FIXED (operandConsume
-    -- port), but the probes that gated the guard removal produced a NEW
-    -- counterexample (`loopCx*` above) that SATISFIES `_hLoop` and is
-    -- non-aliased: the model loop arm's per-iteration drop is misplaced for
-    -- bodies whose iteration variable survives the body, so the previous
-    -- guard set left this axiom refutable. The residual believed-true
-    -- fragment requires every loop body to CONSUME its iteration variable
-    -- and return the stack map to the parent shape in both lowering modes
-    -- (`bodyLoopMapNeutralB`); `loopCx_guard_rejects` shows the
-    -- counterexample is excluded. Re-widening is tracked with the loop-arm
-    -- fidelity follow-up.
+    -- Loop map-neutrality guard (2026-06-11; RE-EVALUATED after the
+    -- loop-arm fidelity rewrite, same date): the divergence that
+    -- motivated this guard (`loopCx*` — the old arm's misplaced
+    -- per-iteration drop) is FIXED; the faithful arm's byte parity is
+    -- pinned against the TS reference (`loopOk_hex_matches_ts`,
+    -- bounded-loop golden). The guard is nevertheless KEPT, NOT widened:
+    -- (a) methodCall-spliced loop bodies remain byte-UNVERIFIED (TS's
+    -- localBindings pollution persists ACROSS iterations after an inlined
+    -- call, while the model resets the union per loop entry), and
+    -- (b) the pre-existing terminal-assert success-bit gap (`termCx*`
+    -- above) means any widening that admits assert-terminated bodies
+    -- through `_hLoop` would add known agreement falsifiers. The retained
+    -- fragment (iteration-identical map-neutral loop bodies that consume
+    -- their iteration variable, per `bodyLoopMapNeutralB`) is the class
+    -- whose per-iteration chunks are provably iteration-invariant under
+    -- the faithful arm (see `AgreesA7.lowerLoopItersP_neutral_eq`).
+    -- Re-widening is blocked on the truthy-top success-bit follow-up.
     (_hLoopNeutral :
       bodyLoopMapNeutralB
         p.methods p.properties
@@ -6319,12 +6483,15 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    -- Loop-exclusion guard (2026-06-11, replaces the 2026-06-08 `hNoAlias`):
-    -- threads to the re-guarded crypto_call / loop sub-omnibus axioms. The
-    -- aliased-operand divergence is FIXED in the model (operandConsume port),
-    -- so the aliasing guard is gone; the model loop arm remains unfaithful
-    -- (`loopCx*`), so the omnibus currently covers LOOP-FREE programs only.
-    -- Decidable; every loop-free frontend program satisfies it trivially.
+    -- Loop-exclusion guard (2026-06-11; loop-arm fidelity rewrite landed
+    -- same date): threads to the guarded crypto_call / loop sub-omnibus
+    -- axioms. The model loop arm is now FAITHFUL (per-iteration
+    -- re-lowering; `loopOk*` / bounded-loop golden byte parity), but the
+    -- omnibus still covers LOOP-FREE programs only: widening is blocked
+    -- on the pre-existing terminal-assert success-bit gap (`termCx*`) and
+    -- the methodCall-in-loop fidelity question — see the sub-omnibus
+    -- guard comments. Decidable; every loop-free frontend program
+    -- satisfies it trivially.
     (hNoLoop : programUsesLoopB p = false)
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
     (hUntag :
@@ -6774,12 +6941,15 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
-    -- Loop-exclusion guard (2026-06-11, replaces the 2026-06-08 `hNoAlias`):
-    -- threads to the re-guarded crypto_call / loop sub-omnibus axioms. The
-    -- aliased-operand divergence is FIXED in the model (operandConsume port),
-    -- so the aliasing guard is gone; the model loop arm remains unfaithful
-    -- (`loopCx*`), so the omnibus currently covers LOOP-FREE programs only.
-    -- Decidable; every loop-free frontend program satisfies it trivially.
+    -- Loop-exclusion guard (2026-06-11; loop-arm fidelity rewrite landed
+    -- same date): threads to the guarded crypto_call / loop sub-omnibus
+    -- axioms. The model loop arm is now FAITHFUL (per-iteration
+    -- re-lowering; `loopOk*` / bounded-loop golden byte parity), but the
+    -- omnibus still covers LOOP-FREE programs only: widening is blocked
+    -- on the pre-existing terminal-assert success-bit gap (`termCx*`) and
+    -- the methodCall-in-loop fidelity question — see the sub-omnibus
+    -- guard comments. Decidable; every loop-free frontend program
+    -- satisfies it trivially.
     (hNoLoop : programUsesLoopB p = false)
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
     (hUntag :

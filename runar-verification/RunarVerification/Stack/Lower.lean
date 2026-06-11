@@ -261,28 +261,39 @@ def collectBoundNames : List ANFBinding → List String
       here ++ collectBoundNames rest
 
 /-- Outer-scope refs referenced by `body`. Mirrors TS
-`lowerLoop`'s `outerRefs` computation (`05-stack-lower.ts:1907-1923`):
-a name is "outer" if the body reads it via `load_param` (other than the
-iter var) or via `@ref:` whose target is not body-bound.
+`lowerLoop`'s `outerRefs` computation (`05-stack-lower.ts:2115-2133`)
+EXACTLY: the TS reference iterates over body bindings and adds outer
+refs ONLY for
 
-The TS reference iterates over body bindings and only adds outer refs
-for `load_param` (excluding the iter var) and `load_const "@ref:..."`
-where the target name is not in `bodyBindingNames`. We approximate that
-by collecting all read names not bound in body, then excluding the iter
-var. -/
+* `load_param` values whose name is not the iter var, and
+* `load_const "@ref:..."` values whose target name is not in
+  `bodyBindingNames` (= the plain binding-name set, NOT
+  `collectBoundNames` — TS does not include `update_prop` targets).
+
+A previous version of this function approximated the set by collecting
+EVERY read name not bound in the body. That over-approximation
+PROTECTED outer non-param locals read as raw binop/call operands, so
+the model accepted (and emitted bytes for) loop shapes the TS reference
+REJECTS with "Value not found on stack" — the consumed ref simply
+fails to resolve in the next iteration. With the faithful narrow set,
+those shapes now reach `bringToTop`'s unresolved branch
+(`OP_RUNAR_UNRESOLVED_*`) and `compileSafe` rejects them, matching the
+TS compile error. -/
 def bodyOuterRefs (body : List ANFBinding) (iterVar : String) :
     List String :=
-  let bound := collectBoundNames body
-  let read  := collectRefsBindings body
-  read.foldl (init := ([] : List String)) fun acc r =>
-    if r == iterVar || listContains bound r || listContains acc r then
-      acc
-    else
-      acc ++ [r]
+  let bound := body.map (fun b => b.name)
+  body.foldl (init := ([] : List String)) fun acc b =>
+    match b.value with
+    | .loadParam n =>
+        if n == iterVar || listContains acc n then acc else acc ++ [n]
+    | .loadConst (.refAlias r) =>
+        if listContains bound r || listContains acc r then acc
+        else acc ++ [r]
+    | _ => acc
 
 /-- For non-final loop iters, bump the recorded last-use index of every
 outer ref to `clampTo` so they cannot be considered last-use within the
-body. Mirrors TS `lowerLoop` (`05-stack-lower.ts:1940-1944`). -/
+body. Mirrors TS `lowerLoop` (`05-stack-lower.ts:2149-2154`). -/
 def clampLastUsesForOuter (m : List (String × Nat))
     (outerRefs : List String) (clampTo : Nat) : List (String × Nat) :=
   outerRefs.foldl (init := m) fun acc r => lastUsesUpdate acc r clampTo
@@ -807,6 +818,20 @@ def lowerArrayElems (sm : StackMap) : List String → List StackOp
   | first :: rest =>
       rest.foldl (init := loadRef sm first) fun acc el =>
         acc ++ loadRef (sm.push first) el ++ [.opcode "OP_CAT"]
+
+/-- Per-iteration iteration-variable cleanup gate for the faithful
+loop arm (TS `lowerLoop` `05-stack-lower.ts:2158-2167`): emit a single
+`OP_DROP` iff the iter var survives the body at EXACTLY depth 0 of the
+stack map; a survivor buried deeper (or absent) emits nothing and the
+map is left unchanged (stranded values are cleaned by the
+end-of-method NIP pass). Named (rather than inlined in
+`lowerLoopItersP`) so proof hypotheses about the gate are plain
+equations on a constant application. -/
+def iterVarCleanup (smBody : StackMap) (iterVar : String) :
+    List StackOp × StackMap :=
+  match smBody.depth? iterVar with
+  | some 0 => ([.drop], smBody.removeAtDepth 0)
+  | _      => ([], smBody)
 
 /-! ## Loop unroll helper
 
@@ -2773,6 +2798,19 @@ def lowerValue (sm : StackMap) (bindingName : String) :
       -- (with `iterVar` registered as a synthetic param at depth 0);
       -- `unrollIter` then iterates the body `count` times, each
       -- iteration prefixing with `push i` and suffixing with `OP_DROP`.
+      --
+      -- ⚠ NON-FAITHFUL / LEGACY (2026-06-11 loop-fidelity audit): this
+      -- arm is NOT byte-faithful to the TS reference — it lowers the
+      -- body once and replays it, drops unconditionally, ignores
+      -- liveness, and pushes a phantom `bindingName` entry (loops are
+      -- statements in TS). It is EXCLUDED from the production path:
+      -- `lowerMethod` / `lower` / `compileSafe` go through
+      -- `lowerBindingsP`, whose `.loop` arm performs faithful
+      -- per-iteration re-lowering via `lowerLoopItersP`. This
+      -- placeholder is preserved only because Sim.lean / Agrees*-era
+      -- `rfl`-level lemmas reduce the unparameterized `lowerValue` on
+      -- loop-FREE fragments and must keep their existing shape; no
+      -- proof may rely on this arm's bytes for a loop-CONTAINING body.
       let (bodyOps, _) := lowerBindings (sm.push iterVar) body
       (unrollIter bodyOps count, sm.push bindingName)
   | .arrayLiteral elems =>
@@ -2811,11 +2849,15 @@ end
 program's method table and an inlining budget so the `methodCall`
 case can resolve and recursively lower the callee's body.
 
-Termination uses lexicographic order on `(budget, sizeOf payload)`:
-the `methodCall` recursion decrements `budget` (and may grow the
-payload arbitrarily); every other recursion preserves `budget` and
-descends to a structurally-smaller payload. Together this is well-
-founded and Lean's `decreasing_by` can discharge it.
+Termination uses lexicographic order on `(budget, sizeOf payload,
+iterations)`: the `methodCall` recursion decrements `budget` (and may
+grow the payload arbitrarily); every other recursion preserves `budget`
+and descends to a structurally-smaller payload — except the
+per-iteration loop fold `lowerLoopItersP`, which keeps the loop body
+fixed (already structurally smaller than the `.loop` value that
+entered it) and descends on the third component, its remaining
+iteration count. Together this is well-founded and Lean's
+`decreasing_by` can discharge it.
 -/
 
 /-! ### Liveness-aware program lowering (Phase 3x)
@@ -3661,70 +3703,56 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
       let (cleanup, sm2) := removePropEntryOps smRenamed propName
       (load ++ cleanup, sm2, localBindings)
   | .loop count body iterVar =>
-      -- Phase 3z-F: per-iter lowering with non-final / final liveness
-      -- discrimination (mirrors TS `lowerLoop` at `05-stack-lower.ts:1899-1965`).
+      -- Loop-fidelity rewrite (2026-06-11; replaces the Phase 3z-F
+      -- lower-once-and-replay arm): per-ITERATION re-lowering against the
+      -- live threaded stack map, mirroring TS `lowerLoop` at
+      -- `05-stack-lower.ts:2109-2176`.
       --
-      -- For non-final iters, outer-scope refs (those read but not bound by
-      -- the body) have their last-use clamped to `body.length` so they are
-      -- never consumed — preserving the parent stack map across iters.
-      -- Only the FINAL iter sees their natural last-use, allowing ROLL/SWAP
-      -- consumption on the last access.
+      -- The TS reference unrolls the loop at compile time and lowers the
+      -- body EVERY iteration in the SAME context, so PICK/ROLL depths GROW
+      -- across iterations when values strand (e.g. an unreferenced iter
+      -- var buried under the accumulator). `lowerLoopItersP` (below in
+      -- this mutual block) reproduces that fold; the old arm lowered the
+      -- body once per liveness mode and replayed the iteration-0 depths,
+      -- which produced semantically wrong bytes for every body whose
+      -- ending map shape differs from its starting one (the pinned
+      -- `loopCx*` divergence in `Pipeline.lean`).
       --
-      -- TS does NOT use a generic `outerProtected` set inside loop bodies —
-      -- it relies on the lastUses clamping for outer-refs and on
-      -- `localBindings` for the `@ref:` consume gate. Here we set
-      -- `innerProtected = []` to match the TS binop/unary/call consume
-      -- behavior; outer-ref protection is achieved entirely through the
-      -- clamped lastUses below. The `loadConst .refAlias` arm still needs
-      -- protection for outer @ref: targets — those refs are also in
-      -- `outerRefs` (collected by `bodyOuterRefs`) so the clamping covers
-      -- them indirectly.
+      -- * `outerRefs` (TS 2115-2133): only `load_param` names (≠ iterVar)
+      --   and `@ref:` targets not body-bound. Non-final iterations clamp
+      --   their recorded last-use to `body.length` so they are never
+      --   consumed (TS 2149-2154); ONLY the final iteration sees natural
+      --   last-uses, allowing ROLL/SWAP consumption on the last access.
+      -- * `localBindings` (TS 2136-2138): the body is lowered with the
+      --   ENCLOSING localBindings extended by the body's binding names
+      --   (`new Set([...this.localBindings, ...bodyBindingNames])`), so
+      --   the final-iteration `@ref:` consume gate sees outer locals too
+      --   (ROLL where the previous body-names-only set wrongly PICKed).
+      --   TS restores the enclosing set after the loop (2171); we return
+      --   the unmodified `localBindings`.
+      -- * per-iteration iterVar cleanup (TS 2158-2167): drop iff the iter
+      --   var survives at EXACTLY depth 0. A survivor buried deeper emits
+      --   NOTHING and stays on the map (stranded values are cleaned by
+      --   the end-of-method NIP pass) — the old arm's any-depth `.drop`
+      --   destroyed the body's last value instead.
       --
-      -- The iter var is pushed before each body, registered on the stack
-      -- map, and DROPped after the body iff it survives (the body did not
-      -- consume it).
-      let smInner := sm.push iterVar
-      let innerProtected : List String := []
+      -- TS does NOT use a generic `outerProtected` set inside loop bodies
+      -- — it relies on the lastUses clamping for outer-refs and on
+      -- `localBindings` for the `@ref:` consume gate — so the body is
+      -- lowered with `outerProtected = []` (the `[]` literal below).
       let outerRefs := bodyOuterRefs body iterVar
       let naturalLU := computeLastUses body
       let nonFinalLU := clampLastUsesForOuter naturalLU outerRefs body.length
-      let bodyLocal := body.map (fun b => b.name)
-      -- Lower the body once for non-final iters and once for the final iter.
-      let (bodyOpsNF, smNF) :=
-        lowerBindingsP progMethods props budget 0 nonFinalLU innerProtected bodyLocal constInts smInner body
-      let (bodyOpsF, smF) :=
-        lowerBindingsP progMethods props budget 0 naturalLU innerProtected bodyLocal constInts smInner body
-      -- Detect whether the body consumed the iter var: if iterVar is no
-      -- longer on the body's resulting sm, no DROP needed.
-      let consumedNF : Bool := !listContains smNF iterVar
-      let consumedF  : Bool := !listContains smF iterVar
-      let dropNF : List StackOp := if consumedNF then [] else [.drop]
-      let dropF  : List StackOp := if consumedF  then [] else [.drop]
-      -- Assemble per-iter ops: push i, body, optional DROP.
-      let mkIter (i : Nat) (final : Bool) : List StackOp :=
-        let idxPush : StackOp := .push (.bigint (Int.ofNat i))
-        if final then [idxPush] ++ bodyOpsF ++ dropF
-        else [idxPush] ++ bodyOpsNF ++ dropNF
-      let rec assemble : Nat → List StackOp
-        | 0     => []
-        | n + 1 =>
-            let i := count - (n + 1)
-            let final := decide (n = 0)
-            mkIter i final ++ assemble n
+      let loopLocal := localBindings ++ body.map (fun b => b.name)
+      let (ops, smPostLoop) :=
+        lowerLoopItersP progMethods props budget naturalLU nonFinalLU
+          loopLocal constInts body iterVar count sm count
       -- Loops are statements, not expressions — no stack value is produced
-      -- (mirrors TS `lowerLoop` `05-stack-lower.ts:1962-1964`). The post-
-      -- loop sm equals the parent sm (the body's net effect on the stack
-      -- map is invariant across iterations: each iter ends with the same
-      -- shape it started with). We return `smF` minus the iterVar slot if
-      -- it survived the final iter, so subsequent bindings see exactly the
-      -- parent shape.
-      let smPostLoop : StackMap :=
-        if consumedF then smF
-        else
-          match smF.depth? iterVar with
-          | some d => smF.removeAtDepth d
-          | none   => smF
-      (assemble count, smPostLoop, localBindings)
+      -- (TS 2172-2175) and the enclosing localBindings set is restored
+      -- (TS 2171). The post-loop sm is the THREADED map from the final
+      -- iteration, including any stranded iter-var entries (TS leaves
+      -- them on `this.stackMap`; the public-method epilogue NIPs them).
+      (ops, smPostLoop, localBindings)
   | .arrayLiteral elems =>
       (lowerArrayElems sm elems, sm.push bindingName, localBindings)
   -- Phase 3w-b: framework intrinsics with concrete lowering. The
@@ -3758,7 +3786,46 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
   -- value carries no temp refs.
   | .rawScript bytes _ _     =>
       ([.rawBytes bytes], sm.push bindingName, localBindings)
-termination_by v => (budget, sizeOf v)
+termination_by v => (budget, sizeOf v, 0)
+
+/-- Per-iteration loop unrolling for the program-aware lowerer. Mirrors
+the iteration loop `for (let i = 0; i < count; i++)` of TS `lowerLoop`
+(`05-stack-lower.ts:2140-2169`): each iteration
+
+1. pushes the iteration index constant and registers `iterVar` on the
+   LIVE threaded stack map,
+2. RE-LOWERS the body against that map (so PICK/ROLL depths grow when
+   values strand across iterations — TS re-runs `lowerBinding` per
+   iteration in the same context),
+3. drops the iter var iff it survives the body at EXACTLY depth 0
+   (TS 2158-2167); a buried survivor is left stranded on map + stack.
+
+`remaining` counts down from `count`; the iteration index is
+`count - remaining`. The FINAL iteration (`remaining = 1`) lowers under
+the natural last-uses (`naturalLU`) while every earlier iteration uses
+the outer-clamped ones (`nonFinalLU`) so outer refs are only consumable
+on the last pass (TS 2149-2154). `loopLocal` is the enclosing
+localBindings ∪ body binding names (TS 2136-2138); `outerProtected` is
+`[]` inside loop bodies (TS has no such set — see the `.loop` arm). -/
+def lowerLoopItersP (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (naturalLU nonFinalLU : List (String × Nat))
+    (loopLocal : List String) (constInts : List (String × Int))
+    (body : List ANFBinding) (iterVar : String) (count : Nat) :
+    StackMap → Nat → (List StackOp × StackMap)
+  | sm, 0 => ([], sm)
+  | sm, remaining + 1 =>
+      let i := count - (remaining + 1)
+      let lu := if remaining == 0 then naturalLU else nonFinalLU
+      let smInner := sm.push iterVar
+      let (bodyOps, smBody) :=
+        lowerBindingsP progMethods props budget 0 lu [] loopLocal constInts smInner body
+      let (dropOps, smIter) := iterVarCleanup smBody iterVar
+      let (restOps, smFinal) :=
+        lowerLoopItersP progMethods props budget naturalLU nonFinalLU
+          loopLocal constInts body iterVar count smIter remaining
+      ([StackOp.push (.bigint (Int.ofNat i))] ++ bodyOps ++ dropOps ++ restOps,
+       smFinal)
+termination_by _ n => (budget, sizeOf body, n)
 
 def lowerBindingsP (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
     (currentIndex : Nat) (lastUses : List (String × Nat))
@@ -3772,7 +3839,7 @@ def lowerBindingsP (progMethods : List ANFMethod) (props : List ANFProperty) (bu
       let (ops', sm'') :=
         lowerBindingsP progMethods props budget (currentIndex + 1) lastUses outerProtected localBindings' constInts sm' rest
       (ops ++ ops', sm'')
-termination_by bs => (budget, sizeOf bs)
+termination_by bs => (budget, sizeOf bs, 0)
 
 end
 
