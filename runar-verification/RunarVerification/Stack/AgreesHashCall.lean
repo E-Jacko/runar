@@ -735,6 +735,46 @@ def hashAssertConsumeShapeBool (m : ANFMethod) : Bool :=
         && hashAssertNamesOk d ok arg r
   | _ => false
 
+/-- Existential extraction from the W1 classifier: a classified method
+carries the `(expected, arg)` param pair and the canonical
+`hashAssertBody` with an admissible hash and distinct referenced names.
+Consumed by the mixed-dispatch widening, which needs the per-branch shape
+of EVERY public method (not just the keyed-premise-supplied selected one). -/
+theorem hashAssertConsumeShapeBool_extract (m : ANFMethod)
+    (h : hashAssertConsumeShapeBool m = true) :
+    ∃ (d ok anm arg expected func : String) (tyE tyA : ANFType)
+      (s1 s2 s3 : Option SourceLoc),
+      m.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA] ∧
+      m.body = hashAssertBody d ok anm arg expected func s1 s2 s3 ∧
+      (func = "sha256" ∨ func = "hash160") ∧
+      hashAssertNamesOk d ok arg expected = true := by
+  unfold hashAssertConsumeShapeBool at h
+  split at h
+  case _ =>
+    rename_i d func arg s1 ok l r rt s2 anm ar s3 hBodyEq
+    simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at h
+    obtain ⟨⟨⟨⟨⟨hFunc, hRt⟩, hL⟩, hAr⟩, hParamNames⟩, hNames⟩ := h
+    rw [hL, hRt, hAr] at hBodyEq
+    obtain ⟨tyE, tyA, hParams⟩ :
+        ∃ tyE tyA, m.params = [ANFParam.mk r tyE, ANFParam.mk arg tyA] := by
+      cases hp : m.params with
+      | nil => rw [hp] at hParamNames; simp at hParamNames
+      | cons p1 ps =>
+        cases ps with
+        | nil => rw [hp] at hParamNames; simp at hParamNames
+        | cons p2 ps2 =>
+          cases ps2 with
+          | nil =>
+            rw [hp] at hParamNames
+            simp only [List.map_cons, List.map_nil, List.cons.injEq,
+              and_true] at hParamNames
+            obtain ⟨h1, h2, _⟩ := hParamNames
+            exact ⟨p1.type, p2.type, by cases p1; cases p2; simp_all⟩
+          | cons _ _ => rw [hp] at hParamNames; simp at hParamNames
+    exact ⟨d, ok, anm, arg, r, func, tyE, tyA, s1, s2, s3, hParams,
+      hBodyEq, hFunc, hNames⟩
+  next => exact absurd h (by decide)
+
 /-! ### Part 8d — MANDATORY anti-vacuity smokes (concrete, W1)
 
 The canonical hash-lock `unlock(expected, x) { d := sha256(x); ok := d ===
