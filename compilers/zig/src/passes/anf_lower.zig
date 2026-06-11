@@ -118,25 +118,19 @@ fn isByteTypedExpr(expr: Expression, ctx: *const LowerCtx) bool {
             for (ctx.contract.properties) |p| {
                 if (std.mem.eql(u8, p.name, name) and isByteType(p.type_info)) return true;
             }
-            // Check local byte vars
+            // Check method-scoped byte-typed names. `local_byte_vars` is
+            // populated once per method/constructor (in `lowerMethods` /
+            // `lowerStatefulPublicMethod`) with the CURRENT method's params
+            // (and auto-injected continuation params) plus byte-typed locals,
+            // and is shared into if/else/loop sub-contexts via `subContext`.
+            // Restricting the param-type lookup to this map (instead of walking
+            // ALL methods' params) fixes issue #34: a param name shared across
+            // methods (e.g. one method's `x` colliding with another method's
+            // `x: ByteString`) no longer poisons byte-type analysis, so
+            // `1n + x` emits OP_ADD instead of OP_CAT. Mirrors the TS reference
+            // `getParamType` reading only `methodParamTypes`
+            // (packages/runar-compiler/src/passes/04-anf-lower.ts).
             if (ctx.local_byte_vars.get(name) != null) return true;
-            // Mirror TS reference: getParamType walks ALL methods' params
-            // (and the constructor) and returns the first match by name.
-            // This means a param name shared across methods inherits the
-            // type from whichever method declared it first in source order.
-            // See packages/runar-compiler/src/passes/04-anf-lower.ts getParamType.
-            for (ctx.contract.constructor.params) |p| {
-                if (std.mem.eql(u8, p.name, name)) {
-                    return isByteType(p.type_info);
-                }
-            }
-            for (ctx.contract.methods) |m| {
-                for (m.params) |p| {
-                    if (std.mem.eql(u8, p.name, name)) {
-                        return isByteType(p.type_info);
-                    }
-                }
-            }
             return false;
         },
         .property_access => |pa| {

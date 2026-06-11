@@ -50,39 +50,39 @@ var byteTypes = map[string]bool{
 }
 
 var byteReturningFunctions = map[string]bool{
-	"sha256":       true,
-	"ripemd160":    true,
-	"hash160":      true,
-	"hash256":      true,
-	"cat":          true,
-	"substr":       true,
-	"num2bin":      true,
-	"reverseBytes": true,
-	"left":         true,
-	"right":        true,
-	"int2str":      true,
-	"toByteString":       true,
-	"pack":               true,
-	"ecAdd":              true,
-	"ecMul":              true,
-	"ecMulGen":           true,
-	"ecNegate":           true,
-	"ecMakePoint":            true,
-	"ecEncodeCompressed":     true,
-	"p256Add":                true,
-	"p256Mul":                true,
-	"p256MulGen":             true,
-	"p256Negate":             true,
-	"p256EncodeCompressed":   true,
-	"p384Add":                true,
-	"p384Mul":                true,
-	"p384MulGen":             true,
-	"p384Negate":             true,
-	"p384EncodeCompressed":   true,
-	"sha256Compress":     true,
-	"sha256Finalize":     true,
-	"blake3Compress":     true,
-	"blake3Hash":         true,
+	"sha256":               true,
+	"ripemd160":            true,
+	"hash160":              true,
+	"hash256":              true,
+	"cat":                  true,
+	"substr":               true,
+	"num2bin":              true,
+	"reverseBytes":         true,
+	"left":                 true,
+	"right":                true,
+	"int2str":              true,
+	"toByteString":         true,
+	"pack":                 true,
+	"ecAdd":                true,
+	"ecMul":                true,
+	"ecMulGen":             true,
+	"ecNegate":             true,
+	"ecMakePoint":          true,
+	"ecEncodeCompressed":   true,
+	"p256Add":              true,
+	"p256Mul":              true,
+	"p256MulGen":           true,
+	"p256Negate":           true,
+	"p256EncodeCompressed": true,
+	"p384Add":              true,
+	"p384Mul":              true,
+	"p384MulGen":           true,
+	"p384Negate":           true,
+	"p384EncodeCompressed": true,
+	"sha256Compress":       true,
+	"sha256Finalize":       true,
+	"blake3Compress":       true,
+	"blake3Hash":           true,
 }
 
 func isByteTypedExpr(expr Expression, ctx *lowerCtx) bool {
@@ -199,6 +199,7 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 
 	// Lower constructor (the TS reference includes the constructor in output)
 	ctorCtx := newLowerCtxWithEffects(contract, sideEffects)
+	ctorCtx.setMethodParamTypes(contract.Constructor.Params)
 	ctorCtx.lowerStatements(contract.Constructor.Body)
 	result = append(result, ir.ANFMethod{
 		Name:     "constructor",
@@ -210,6 +211,7 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 	// Lower each method (including private methods as separate entries)
 	for _, method := range contract.Methods {
 		methodCtx := newLowerCtxWithEffects(contract, sideEffects)
+		methodCtx.setMethodParamTypes(method.Params)
 
 		if contract.ParentClass == "StatefulSmartContract" && method.Visibility == "public" {
 			// Continuation requirements come from the side-effect summary,
@@ -224,13 +226,13 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 
 			// Register implicit parameters
 			if needsChangeOutput {
-				methodCtx.addParam("_changePKH")
-				methodCtx.addParam("_changeAmount")
+				methodCtx.addParam("_changePKH", "Ripemd160")
+				methodCtx.addParam("_changeAmount", "bigint")
 			}
 			if needsNewAmount {
-				methodCtx.addParam("_newAmount")
+				methodCtx.addParam("_newAmount", "bigint")
 			}
-			methodCtx.addParam("txPreimage")
+			methodCtx.addParam("txPreimage", "SigHashPreimage")
 
 			// Inject checkPreimage(txPreimage) at the start
 			preimageRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
@@ -404,12 +406,13 @@ type lowerCtx struct {
 	bindings          []ir.ANFBinding
 	counter           int
 	contract          *ContractNode
-	localNames        map[string]bool   // tracks variable names registered via addLocal
-	paramNames        map[string]bool   // tracks parameter names registered via addParam
-	addOutputRefs     []string          // tracks addOutput / addRawOutput binding refs (state outputs)
-	addDataOutputRefs []string          // tracks addDataOutput binding refs — data outputs are included in the continuation hash AFTER state outputs and BEFORE the change output
-	localAliases      map[string]string // maps local variable names to their current ANF binding name (updated after if-statements that reassign locals in both branches)
-	localByteVars     map[string]bool   // tracks local variables known to be byte-typed
+	localNames        map[string]bool    // tracks variable names registered via addLocal
+	paramNames        map[string]bool    // tracks parameter names registered via addParam
+	methodParamTypes  map[string]string  // tracks the CURRENT method's parameter types (issue #34); copied into sub-contexts
+	addOutputRefs     []string           // tracks addOutput / addRawOutput binding refs (state outputs)
+	addDataOutputRefs []string           // tracks addDataOutput binding refs — data outputs are included in the continuation hash AFTER state outputs and BEFORE the change output
+	localAliases      map[string]string  // maps local variable names to their current ANF binding name (updated after if-statements that reassign locals in both branches)
+	localByteVars     map[string]bool    // tracks local variables known to be byte-typed
 	currentSourceLoc  *ir.SourceLocation // Debug: source location to attach to emitted ANF bindings
 	// Param substitution stack used when inlining a private method's body
 	// directly into this context. Each entry on top is the active alias
@@ -461,14 +464,15 @@ func newLowerCtx(contract *ContractNode) *lowerCtx {
 
 func newLowerCtxWithEffects(contract *ContractNode, summary SideEffectSummary) *lowerCtx {
 	return &lowerCtx{
-		contract:        contract,
-		localNames:      make(map[string]bool),
-		paramNames:      make(map[string]bool),
-		localAliases:    make(map[string]string),
-		localByteVars:   make(map[string]bool),
-		paramAliasStack: make(map[string][]string),
-		sideEffects:     summary,
-		methodScope:     newMethodScope(),
+		contract:         contract,
+		localNames:       make(map[string]bool),
+		paramNames:       make(map[string]bool),
+		methodParamTypes: make(map[string]string),
+		localAliases:     make(map[string]string),
+		localByteVars:    make(map[string]bool),
+		paramAliasStack:  make(map[string][]string),
+		sideEffects:      summary,
+		methodScope:      newMethodScope(),
 	}
 }
 
@@ -577,8 +581,24 @@ func (ctx *lowerCtx) isLocal(name string) bool {
 }
 
 // addParam records a parameter name so we know to use load_param for it.
-func (ctx *lowerCtx) addParam(name string) {
+// An optional type (variadic, at most one element) records the param's
+// type in the method-scoped type table — used for auto-injected
+// continuation params so getParamType still finds them (issue #34).
+func (ctx *lowerCtx) addParam(name string, typ ...string) {
 	ctx.paramNames[name] = true
+	if len(typ) > 0 {
+		ctx.methodParamTypes[name] = typ[0]
+	}
+}
+
+// setMethodParamTypes records the current method's parameter types in the
+// method-scoped table. Must be called once per method/constructor before
+// lowering its body so getParamType only sees THIS method's params (issue #34).
+func (ctx *lowerCtx) setMethodParamTypes(params []ParamNode) {
+	ctx.methodParamTypes = make(map[string]string, len(params))
+	for _, p := range params {
+		ctx.methodParamTypes[p.Name] = typeNodeToString(p.Type)
+	}
 }
 
 // isParam checks if a name is a registered parameter.
@@ -641,19 +661,13 @@ func (ctx *lowerCtx) isProperty(name string) bool {
 }
 
 func (ctx *lowerCtx) getParamType(name string) (string, bool) {
-	for _, p := range ctx.contract.Constructor.Params {
-		if p.Name == name {
-			return typeNodeToString(p.Type), true
-		}
-	}
-	for _, method := range ctx.contract.Methods {
-		for _, p := range method.Params {
-			if p.Name == name {
-				return typeNodeToString(p.Type), true
-			}
-		}
-	}
-	return "", false
+	// Restricted to the CURRENT method's parameters (issue #34). A cross-method
+	// lookup poisoned the byte-type analysis when two methods shared a parameter
+	// name (e.g. one method's local `x: bigint` collided with another method's
+	// `x: ByteString` parameter), which flipped result_type to 'bytes' and made
+	// stack lowering emit OP_CAT for an integer add.
+	t, ok := ctx.methodParamTypes[name]
+	return t, ok
 }
 
 func (ctx *lowerCtx) getPropertyType(name string) (string, bool) {
@@ -669,13 +683,14 @@ func (ctx *lowerCtx) getPropertyType(name string) (string, bool) {
 // The counter continues from the parent. Local names and param names are shared.
 func (ctx *lowerCtx) subContext() *lowerCtx {
 	sub := &lowerCtx{
-		contract:      ctx.contract,
-		counter:       ctx.counter,
-		localNames:    make(map[string]bool),
-		paramNames:    make(map[string]bool),
-		localAliases:  make(map[string]string),
-		localByteVars: make(map[string]bool),
-		methodScope:   ctx.methodScope, // shared pointer — auto-injection registers propagate up
+		contract:         ctx.contract,
+		counter:          ctx.counter,
+		localNames:       make(map[string]bool),
+		paramNames:       make(map[string]bool),
+		methodParamTypes: make(map[string]string),
+		localAliases:     make(map[string]string),
+		localByteVars:    make(map[string]bool),
+		methodScope:      ctx.methodScope, // shared pointer — auto-injection registers propagate up
 	}
 	// Share local name set
 	for k := range ctx.localNames {
@@ -684,6 +699,11 @@ func (ctx *lowerCtx) subContext() *lowerCtx {
 	// Share param name set
 	for k := range ctx.paramNames {
 		sub.paramNames[k] = true
+	}
+	// Share method-scoped param types (issue #34) so nested blocks see the
+	// same current-method param types and not other methods' params.
+	for k, v := range ctx.methodParamTypes {
+		sub.methodParamTypes[k] = v
 	}
 	// Share local byte var set
 	for k := range ctx.localByteVars {
@@ -1873,10 +1893,10 @@ func collectUpdateBranches(ifCond string, thenBindings, elseBindings []ir.ANFBin
 	}
 
 	branches := []updateBranch{{
-		condRef:      &ifCond,
-		propName:     propName,
+		condRef:       &ifCond,
+		propName:      propName,
 		valueBindings: valBindings,
-		valueRef:     valRef,
+		valueRef:      valRef,
 	}}
 
 	if len(elseBindings) == 0 {

@@ -165,6 +165,9 @@ public final class AnfLower {
         // Constructor
         if (contract.constructor() != null) {
             LowerCtx ctx = new LowerCtx(contract);
+            for (ParamNode p : contract.constructor().params()) {
+                ctx.registerParamType(p.name(), typeToString(p.type()));
+            }
             ctx.lowerStatements(contract.constructor().body());
             out.add(new AnfMethod(
                 "constructor",
@@ -177,6 +180,9 @@ public final class AnfLower {
         // Methods
         for (MethodNode method : contract.methods()) {
             LowerCtx ctx = new LowerCtx(contract);
+            for (ParamNode p : method.params()) {
+                ctx.registerParamType(p.name(), typeToString(p.type()));
+            }
 
             boolean isStatefulPublic = contract.parentClass() == ParentClass.STATEFUL_SMART_CONTRACT
                 && method.visibility() == Visibility.PUBLIC;
@@ -191,11 +197,15 @@ public final class AnfLower {
                 if (needsChange) {
                     ctx.addParam("_changePKH");
                     ctx.addParam("_changeAmount");
+                    ctx.registerParamType("_changePKH", "Ripemd160");
+                    ctx.registerParamType("_changeAmount", "bigint");
                 }
                 if (needsNewAmount) {
                     ctx.addParam("_newAmount");
+                    ctx.registerParamType("_newAmount", "bigint");
                 }
                 ctx.addParam("txPreimage");
+                ctx.registerParamType("txPreimage", "SigHashPreimage");
 
                 // checkPreimage(txPreimage) at the start
                 String preimageRef = ctx.emit(new LoadParam("txPreimage"));
@@ -356,9 +366,23 @@ public final class AnfLower {
         // {@code extractPrevOutputScript} / {@code requireOutputP2PKH} call
         // registers its auto-injected param on the public method's ABI.
         MethodScope methodScope = new MethodScope();
+        // Issue #34: param-type lookup must be scoped to the CURRENT method's
+        // parameters only. Searching every method's params makes a local named
+        // `x` in one method falsely match a same-named `x: ByteString` param of
+        // a *different* method, poisoning byte-type analysis (e.g. `1n + x`
+        // wrongly emitted as OP_CAT instead of OP_ADD). This map is populated
+        // once per method/constructor before its body lowers and shared into
+        // every sub-context (if/else branches, ternaries). Mirrors the
+        // method-scoped param-type tracking in the TS reference compiler.
+        Map<String, String> methodParamTypes = new HashMap<>();
 
         LowerCtx(ContractNode contract) {
             this.contract = contract;
+        }
+
+        /** Register a parameter's type in the current method's scope. */
+        void registerParamType(String name, String type) {
+            methodParamTypes.put(name, type);
         }
 
         void pushParamAlias(String name, String aliasRef) {
@@ -496,17 +520,9 @@ public final class AnfLower {
         }
 
         String getParamType(String name) {
-            if (contract.constructor() != null) {
-                for (ParamNode p : contract.constructor().params()) {
-                    if (p.name().equals(name)) return typeToString(p.type());
-                }
-            }
-            for (MethodNode m : contract.methods()) {
-                for (ParamNode p : m.params()) {
-                    if (p.name().equals(name)) return typeToString(p.type());
-                }
-            }
-            return null;
+            // Issue #34: scoped to the CURRENT method's params only. See
+            // methodParamTypes field comment.
+            return methodParamTypes.get(name);
         }
 
         String getPropertyType(String name) {
@@ -527,6 +543,10 @@ public final class AnfLower {
             // inside if/else branches or ternaries register their
             // auto-injected witness params on the parent method's ABI.
             sub.methodScope = this.methodScope;
+            // Issue #34: share the current method's param-type map so byte-type
+            // analysis inside if/else / ternary sub-contexts resolves params
+            // against THIS method's ABI, not every method's.
+            sub.methodParamTypes = this.methodParamTypes;
             // GAP-002: inherit the outer statement's source location so
             // bindings emitted inside an if/else / loop branch are still
             // mapped back to the originating AST statement.

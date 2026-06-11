@@ -255,6 +255,8 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
 
     # Lower constructor
     ctor_ctx = _LowerCtx(contract, side_effects)
+    for p in contract.constructor.params:
+        ctor_ctx.register_param_type(p.name, _type_node_to_string(p.type))
     ctor_ctx.lower_statements(contract.constructor.body)
     result.append(ANFMethod(
         name="constructor",
@@ -266,6 +268,8 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
     # Lower each method
     for method in contract.methods:
         method_ctx = _LowerCtx(contract, side_effects)
+        for p in method.params:
+            method_ctx.register_param_type(p.name, _type_node_to_string(p.type))
 
         if contract.parent_class == "StatefulSmartContract" and method.visibility == "public":
             # Continuation requirements come from the side-effect
@@ -282,9 +286,13 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
             if needs_change_output:
                 method_ctx.add_param("_changePKH")
                 method_ctx.add_param("_changeAmount")
+                method_ctx.register_param_type("_changePKH", "Ripemd160")
+                method_ctx.register_param_type("_changeAmount", "bigint")
             if needs_new_amount:
                 method_ctx.add_param("_newAmount")
+                method_ctx.register_param_type("_newAmount", "bigint")
             method_ctx.add_param("txPreimage")
+            method_ctx.register_param_type("txPreimage", "SigHashPreimage")
 
             # Inject checkPreimage(txPreimage) at the start
             preimage_ref = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
@@ -466,6 +474,15 @@ class _LowerCtx:
         self._contract: ContractNode = contract
         self._local_names: set[str] = set()
         self._param_names: set[str] = set()
+        # Method-scoped parameter type table. Populated once per
+        # method/constructor (and for auto-injected continuation params)
+        # before its body is lowered. Mirrors the TS reference's
+        # per-method getParamType: a local named ``x`` in one method must
+        # NOT pick up a same-named parameter (e.g. ``x: ByteString``) of a
+        # DIFFERENT method, which would poison byte-type analysis and emit
+        # OP_CAT where OP_ADD is correct. Shared by reference into
+        # sub-contexts so if/else blocks see the same scope.
+        self._param_types: dict[str, str] = {}
         self._add_output_refs: list[str] = []
         self._add_data_output_refs: list[str] = []
         self._local_aliases: dict[str, str] = {}
@@ -564,6 +581,11 @@ class _LowerCtx:
     def add_param(self, name: str) -> None:
         self._param_names.add(name)
 
+    def register_param_type(self, name: str, type_str: str | None) -> None:
+        """Record the type of a parameter for the CURRENT method scope."""
+        if type_str is not None:
+            self._param_types[name] = type_str
+
     def is_param(self, name: str) -> bool:
         return name in self._param_names
 
@@ -601,14 +623,10 @@ class _LowerCtx:
         return False
 
     def get_param_type(self, name: str) -> str | None:
-        for p in self._contract.constructor.params:
-            if p.name == name:
-                return _type_node_to_string(p.type)
-        for method in self._contract.methods:
-            for p in method.params:
-                if p.name == name:
-                    return _type_node_to_string(p.type)
-        return None
+        # Method-scoped: read ONLY the current method's parameter types.
+        # Searching all methods would let a local in one method falsely
+        # match a same-named param of a different method (issue #34).
+        return self._param_types.get(name)
 
     def get_property_type(self, name: str) -> str | None:
         for p in self._contract.properties:
@@ -628,6 +646,9 @@ class _LowerCtx:
         sub._counter = self._counter
         sub._local_names = set(self._local_names)
         sub._param_names = set(self._param_names)
+        # Share the method-scoped param-type table by reference so if/else
+        # sub-contexts resolve parameter types against the same method.
+        sub._param_types = self._param_types
         sub._local_aliases = dict(self._local_aliases)
         sub._local_byte_vars = set(self._local_byte_vars)
         return sub
@@ -995,6 +1016,7 @@ class _LowerCtx:
             param_name = f"_prevOutScript_{idx}"
             self.method_scope.record_auto_injected_param(param_name, "ByteString")
             self.add_param(param_name)
+            self.register_param_type(param_name, "ByteString")
             witness_ref = self.emit(ANFValue(kind="load_param", name=param_name))
             expected_hash_ref = self.lower_expr_to_ref(e.args[1])
 
@@ -1044,6 +1066,7 @@ class _LowerCtx:
 
             self.method_scope.record_auto_injected_param("_serialisedOutputs", "ByteString")
             self.add_param("_serialisedOutputs")
+            self.register_param_type("_serialisedOutputs", "ByteString")
 
             # Emit the hashOutputs(preimage) check exactly once per method.
             if not self.method_scope.did_emit_hash_outputs_check:
