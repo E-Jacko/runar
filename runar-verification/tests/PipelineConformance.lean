@@ -63,6 +63,16 @@ and classifies each one against the formal verification corpus using a
 A fixture that fails the static parse / WF / compile-safe checks lands
 in a `DEFERRED-<reason>` bucket.
 
+**Omnibus instantiation (2026-06-12).** This executable remains a purely
+syntactic classifier. The companion module
+`tests/OmnibusInstantiation.lean` complements it with per-fixture
+INSTANTIATION THEOREMS: fully-applied instances of the omnibus
+`compileSafe_observational_correct_modulo_codegen_axioms` (concrete
+program / bytes / entry states, all premises — including the keyed
+per-family premises — discharged), spanning the arith, update_prop,
+crypto_call (hash-then-assert AND the real `basic-p2pkh` fallback),
+stateful, and mixed-dispatch families.
+
 ## Honest assessment
 
 The direct VERIFIED tier requires every binding to be a literal load
