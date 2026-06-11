@@ -34,3 +34,7 @@ lean_exe pipelineConformance where
 lean_exe typecheckSweep where
   root := `tests.TypeCheckSweep
   supportInterpreter := true
+
+lean_exe omnibusInstantiation where
+  root := `tests.OmnibusInstantiation
+  supportInterpreter := true
