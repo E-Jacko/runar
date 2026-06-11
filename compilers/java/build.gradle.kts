@@ -16,6 +16,14 @@ repositories {
     mavenCentral()
 }
 
+// Lock all configurations so the resolved dependency graph is committed as
+// gradle.lockfile. The Dependency Audit CI workflow scans that lockfile with
+// osv-scanner; regenerate with `gradle dependencies --write-locks` whenever
+// a dependency version changes.
+dependencyLocking {
+    lockAllConfigurations()
+}
+
 dependencies {
     // Placeholder deps. Populated in milestone 3 (parse/validate/typecheck).
     // implementation("com.github.javaparser:javaparser-core:3.25.10")
