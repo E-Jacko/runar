@@ -5810,6 +5810,632 @@ theorem smoke_hashCall_consume_fires
     rfl rfl (ByteArray.mk #[1, 2, 3]) [] rfl rfl (by decide)
     (fun _ s hRun => hTopTruthy bytes s hSafe hRun)
 
+/-! ## crypto_call peel-off (WIDENED 2026-06-11) — hash-then-assert consume theorem
+
+The PRODUCTION hash shape (the validator requires public methods to end in
+`assert`): the hash-lock `unlock(expected, x) { d := func(x); ok := (d ===
+expected); assert ok }` with `func ∈ {sha256, hash160}`.  The method lowers
+to `AgreesHashCall.hashAssertOps op = [op, .swap, OP_EQUAL]` (terminal
+`OP_VERIFY` elided), and the deployed run's ACCEPTANCE bit is the equality
+verdict itself — the SAME `decide ((H x).toList = expected.toList)` the ANF
+side's `===`/`assert` computes (`Stack/AgreesHashCall.lean` Part 8b: the two
+sides go through the same decidable `ByteArray.toList` equality, same
+orientation).  Because the body is ASSERT-terminated, the consume theorem
+needs NO digest-truthiness hypothesis (contrast the value-terminated bare
+single-call fragment): on a failing entry the ANF eval errors AND the bytes
+run completes with `false` on top — REJECTED, agreeing. -/
+
+/-- The 4-pass peephole pipeline is the identity on the elided hash-lock ops
+(sha256): no fusable adjacency (`OP_EQUAL` is followed by nothing — the
+`OP_VERIFY` that `applyEqualVerifyFuse` would fuse with was elided). -/
+theorem peepholeMethodOps_hashAssert_sha256 :
+    peepholeMethodOps (AgreesHashCall.hashAssertOps "OP_SHA256")
+      = AgreesHashCall.hashAssertOps "OP_SHA256" := by
+  unfold peepholeMethodOps
+  have hNoIf : Peephole.noIfOp (AgreesHashCall.hashAssertOps "OP_SHA256") := by
+    simp [AgreesHashCall.hashAssertOps, Peephole.noIfOp]
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
+  have hFlat : Peephole.peepholePassAllFlat (AgreesHashCall.hashAssertOps "OP_SHA256")
+      = AgreesHashCall.hashAssertOps "OP_SHA256" := by
+    simp +decide [AgreesHashCall.hashAssertOps, Peephole.peepholePassAllFlat,
+      Peephole.applyEqualVerifyFuse, Peephole.applyCheckSigVerifyFuse,
+      Peephole.applyNumEqualVerifyFuse, Peephole.applyZeroNumEqual,
+      Peephole.applyDoubleSha256, Peephole.applyDoubleDrop, Peephole.applyDoubleOver,
+      Peephole.applyDoubleNot, Peephole.applyDoubleNegate, Peephole.applyOneSub,
+      Peephole.applyOneAdd, Peephole.applySubZero, Peephole.applyAddZero,
+      Peephole.applyPushPushMul, Peephole.applyPushPushSub, Peephole.applyPushPushAdd,
+      Peephole.applyDoubleSwap, Peephole.applyDupDrop, Peephole.applyDropAfterPush]
+  rw [hFlat, Peephole.peepholePostFold_eq_applyPushOne_of_noIfOp _ hNoIf]
+  have hPost : Peephole.applyPushOneSub
+      (Peephole.applyPushOneAdd (AgreesHashCall.hashAssertOps "OP_SHA256"))
+      = AgreesHashCall.hashAssertOps "OP_SHA256" := by
+    simp +decide [AgreesHashCall.hashAssertOps, Peephole.applyPushOneAdd,
+      Peephole.applyPushOneSub]
+  rw [hPost,
+    Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ hNoIf (by
+      simp +decide [AgreesHashCall.hashAssertOps,
+        Peephole.applyPushAddPushAdd, Peephole.applyPushAddPushSub]),
+    Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIf (by
+      simp +decide [AgreesHashCall.hashAssertOps,
+        Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])]
+
+/-- Peephole identity on the elided hash-lock ops (hash160). -/
+theorem peepholeMethodOps_hashAssert_hash160 :
+    peepholeMethodOps (AgreesHashCall.hashAssertOps "OP_HASH160")
+      = AgreesHashCall.hashAssertOps "OP_HASH160" := by
+  unfold peepholeMethodOps
+  have hNoIf : Peephole.noIfOp (AgreesHashCall.hashAssertOps "OP_HASH160") := by
+    simp [AgreesHashCall.hashAssertOps, Peephole.noIfOp]
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
+  have hFlat : Peephole.peepholePassAllFlat (AgreesHashCall.hashAssertOps "OP_HASH160")
+      = AgreesHashCall.hashAssertOps "OP_HASH160" := by
+    simp +decide [AgreesHashCall.hashAssertOps, Peephole.peepholePassAllFlat,
+      Peephole.applyEqualVerifyFuse, Peephole.applyCheckSigVerifyFuse,
+      Peephole.applyNumEqualVerifyFuse, Peephole.applyZeroNumEqual,
+      Peephole.applyDoubleSha256, Peephole.applyDoubleDrop, Peephole.applyDoubleOver,
+      Peephole.applyDoubleNot, Peephole.applyDoubleNegate, Peephole.applyOneSub,
+      Peephole.applyOneAdd, Peephole.applySubZero, Peephole.applyAddZero,
+      Peephole.applyPushPushMul, Peephole.applyPushPushSub, Peephole.applyPushPushAdd,
+      Peephole.applyDoubleSwap, Peephole.applyDupDrop, Peephole.applyDropAfterPush]
+  rw [hFlat, Peephole.peepholePostFold_eq_applyPushOne_of_noIfOp _ hNoIf]
+  have hPost : Peephole.applyPushOneSub
+      (Peephole.applyPushOneAdd (AgreesHashCall.hashAssertOps "OP_HASH160"))
+      = AgreesHashCall.hashAssertOps "OP_HASH160" := by
+    simp +decide [AgreesHashCall.hashAssertOps, Peephole.applyPushOneAdd,
+      Peephole.applyPushOneSub]
+  rw [hPost,
+    Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ hNoIf (by
+      simp +decide [AgreesHashCall.hashAssertOps,
+        Peephole.applyPushAddPushAdd, Peephole.applyPushAddPushSub]),
+    Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIf (by
+      simp +decide [AgreesHashCall.hashAssertOps,
+        Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])]
+
+/-- **Hash-then-assert consume core (func-agnostic).**  Composes the ANF and
+Stack equality-verdict walks with the method-level lowering reduction, the
+peephole identity, and the push round-trip M4.  The acceptance bits on both
+sides ARE the same verdict, so the conclusion is `acceptAgrees` with NO
+truthiness hypothesis. -/
+theorem hashAssert_consume_core
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (d ok anm arg expected func op : String) (tyE tyA : ANFType)
+    (s1 s2 s3 : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : anfM.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA])
+    (hBody : anfM.body
+      = AgreesHashCall.hashAssertBody d ok anm arg expected func s1 s2 s3)
+    (hNames : AgreesHashCall.hashAssertNamesOk d ok arg expected = true)
+    (hFunc : func = "sha256" ∨ func = "hash160")
+    (digest argBytes expBytes : ByteArray)
+    (rest : List RunarVerification.ANF.Eval.Value)
+    (hExp : initialAnf.resolveRef expected = some (.vBytes expBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: .vBytes expBytes :: rest)
+    (hCallEval : RunarVerification.ANF.Eval.evalValue initialAnf (.call func [arg])
+      = .ok (.vBytes digest, initialAnf))
+    (hHashStep : runOps [.opcode op] initialStack
+      = .ok { initialStack with
+          stack := .vBytes digest :: .vBytes expBytes :: rest })
+    (hPeep : peepholeMethodOps (AgreesHashCall.hashAssertOps op)
+      = AgreesHashCall.hashAssertOps op)
+    (hEmit : Parse.areRunarEmittablePushBool (AgreesHashCall.hashAssertOps op) = true)
+    (hCallWit : Lower.lowerValueP p.methods p.properties Lower.defaultInlineBudget 0
+        [(ok, 2), (expected, 1), (d, 1), (arg, 0)]
+        [] [d, ok, anm]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashAssertBody d ok anm arg expected func s1 s2 s3))
+        [arg, expected] d (.call func [arg])
+      = ([StackOp.opcode op], [d, expected], [d, ok, anm])) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  -- ANF side: success bit = the equality verdict.
+  have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome
+      = decide (digest.toList = expBytes.toList) := by
+    rw [hBody]
+    exact AgreesHashCall.evalBindingsP_hashAssert_isSome_eq p.methods initialAnf
+      d ok anm arg expected func s1 s2 s3 digest expBytes hNames hCallEval hExp
+  -- Method lowering: the elided 3-op fragment.
+  have hOps : (Lower.lowerMethod p.methods p.properties anfM).ops
+      = AgreesHashCall.hashAssertOps op :=
+    AgreesHashCall.lowerMethod_ops_hashAssert p.methods p.properties anfM
+      d ok anm arg expected func op tyE tyA s1 s2 s3
+      hParams hBody hPublic hNames hFunc hCallWit
+  obtain ⟨hPubSingleton, _hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hPeeped : (peepholedLoweredMethod p anfM).ops
+      = AgreesHashCall.hashAssertOps op := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = _
+    rw [hOps]
+    exact hPeep
+  -- M4: the deployed bytes replay the elided fragment.
+  have hM4 : runParsedBytes bytes initialStack
+      = runOps (AgreesHashCall.hashAssertOps op) initialStack := by
+    have hEmitPush : Parse.AreRunarEmittablePush (peepholedLoweredMethod p anfM).ops := by
+      show Parse.areRunarEmittablePushBool (peepholedLoweredMethod p anfM).ops = true
+      rw [hPeeped]
+      exact hEmit
+    have hEq := compileSafe_single_public_runOps_eq_push p bytes
+      (peepholedLoweredMethod p anfM) initialStack hSafe hPubSingleton hEmitPush
+    rw [hEq, hPeeped]
+  -- Stack side: acceptance bit = the SAME verdict.
+  have hStack : scriptAccepts (runOps (AgreesHashCall.hashAssertOps op) initialStack)
+      = decide (digest.toList = expBytes.toList) :=
+    AgreesHashCall.runOps_hashAssertOps_scriptAccepts initialStack op
+      argBytes digest expBytes rest hStk hHashStep
+  show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome
+      ↔ scriptAccepts (runParsedBytes bytes initialStack) = true
+  rw [hM4, hANF, hStack]
+
+/-- **sha256 hash-lock consume (HEADLINE, acceptance bit, NO truthiness
+hypothesis).**  Discharges the omnibus obligation for the production-shaped
+single-public `unlock(expected, x) { d := sha256(x); ok := d === expected;
+assert ok }` method, given the bytes-typed entry fragment. -/
+theorem hashAssert_consume_sha256
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (d ok anm arg expected : String) (tyE tyA : ANFType)
+    (s1 s2 s3 : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : anfM.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA])
+    (hBody : anfM.body
+      = AgreesHashCall.hashAssertBody d ok anm arg expected "sha256" s1 s2 s3)
+    (hNames : AgreesHashCall.hashAssertNamesOk d ok arg expected = true)
+    (argBytes expBytes : ByteArray)
+    (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hExp : initialAnf.resolveRef expected = some (.vBytes expBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: .vBytes expBytes :: rest)
+    (hLen : argBytes.size ≤ 520) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hStkEq : initialStack.stack
+      = .vBytes argBytes :: (.vBytes expBytes :: rest) := hStk
+  exact hashAssert_consume_core p anfM bytes d ok anm arg expected "sha256"
+    "OP_SHA256" tyE tyA s1 s2 s3 hMem hPublic hSafe initialAnf initialStack
+    hSinglePublic hName hParams hBody hNames (Or.inl rfl)
+    (RunarVerification.ANF.Eval.Crypto.sha256 argBytes) argBytes expBytes rest
+    hExp hStk
+    (AgreesHashCall.evalValue_call_sha256_eq_local initialAnf arg argBytes hArg)
+    (Stack.HashOps.runOps_sha256Ops_eq initialStack argBytes
+      (.vBytes expBytes :: rest) hStkEq hLen)
+    peepholeMethodOps_hashAssert_sha256 (by rfl)
+    (AgreesHashCall.lowerValueP_call_sha256_consume_d0_full p.methods p.properties
+      Lower.defaultInlineBudget 0 [(ok, 2), (expected, 1), (d, 1), (arg, 0)]
+      [d, ok, anm] (Lower.collectConstInts
+        (AgreesHashCall.hashAssertBody d ok anm arg expected "sha256" s1 s2 s3))
+      d arg [expected]
+      (AgreesHashCall.hashAssert_arg_consume_fact d ok arg expected hNames))
+
+/-- **hash160 hash-lock consume (HEADLINE, acceptance bit, NO truthiness
+hypothesis).** -/
+theorem hashAssert_consume_hash160
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (d ok anm arg expected : String) (tyE tyA : ANFType)
+    (s1 s2 s3 : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : anfM.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA])
+    (hBody : anfM.body
+      = AgreesHashCall.hashAssertBody d ok anm arg expected "hash160" s1 s2 s3)
+    (hNames : AgreesHashCall.hashAssertNamesOk d ok arg expected = true)
+    (argBytes expBytes : ByteArray)
+    (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hExp : initialAnf.resolveRef expected = some (.vBytes expBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: .vBytes expBytes :: rest)
+    (hLen : argBytes.size ≤ 520) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hStkEq : initialStack.stack
+      = .vBytes argBytes :: (.vBytes expBytes :: rest) := hStk
+  exact hashAssert_consume_core p anfM bytes d ok anm arg expected "hash160"
+    "OP_HASH160" tyE tyA s1 s2 s3 hMem hPublic hSafe initialAnf initialStack
+    hSinglePublic hName hParams hBody hNames (Or.inr rfl)
+    (RunarVerification.ANF.Eval.Crypto.hash160 argBytes) argBytes expBytes rest
+    hExp hStk
+    (AgreesHashCall.evalValue_call_hash160_eq_local initialAnf arg argBytes hArg)
+    (Stack.HashOps.runOps_hash160Ops_eq initialStack argBytes
+      (.vBytes expBytes :: rest) hStkEq hLen)
+    peepholeMethodOps_hashAssert_hash160 (by rfl)
+    (AgreesHashCall.lowerValueP_call_hash160_consume_d0_full p.methods p.properties
+      Lower.defaultInlineBudget 0 [(ok, 2), (expected, 1), (d, 1), (arg, 0)]
+      [d, ok, anm] (Lower.collectConstInts
+        (AgreesHashCall.hashAssertBody d ok anm arg expected "hash160" s1 s2 s3))
+      d arg [expected]
+      (AgreesHashCall.hashAssert_arg_consume_fact d ok arg expected hNames))
+
+/-! ### MANDATORY smoke: the hash-then-assert consume theorem fires
+
+The canonical hash-lock `HL` with public `unlock(expected, x)`, fired
+end-to-end through `hashAssert_consume_sha256`: `compileSafe` accepts it, and
+on a concrete bytes entry the ANF eval and the deployed-bytes run AGREE on
+the acceptance bit — UNCONDITIONALLY (no truthiness hypothesis: both bits ARE
+the same symbolic equality verdict `decide ((sha256 [1,2,3]).toList =
+[4,5].toList)`, which the agreement never needs to evaluate). -/
+
+private def hashAssertSmokeProg : ANFProgram :=
+  { contractName := "HL", properties := [],
+    methods := [AgreesHashCall.hashAssertSmokeMethod] }
+
+private def hashAssertSmokeAnf : State :=
+  { (default : State) with
+    bindings := [("x", .vBytes (ByteArray.mk #[1, 2, 3])),
+                 ("expected", .vBytes (ByteArray.mk #[4, 5]))] }
+
+private def hashAssertSmokeStk : StackState :=
+  { (default : StackState) with
+    stack := [.vBytes (ByteArray.mk #[1, 2, 3]),
+              .vBytes (ByteArray.mk #[4, 5])] }
+
+/-- SMOKE — `hashAssert_consume_sha256` fires on the canonical hash-lock with
+NO hypotheses at all (the assert-terminated agreement is unconditional). -/
+theorem smoke_hashAssert_consume_fires :
+    ∃ bytes, compileSafe hashAssertSmokeProg = .ok bytes ∧
+      acceptAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP hashAssertSmokeProg.methods
+          hashAssertSmokeAnf AgreesHashCall.hashAssertSmokeMethod.body)
+        (runParsedBytes bytes hashAssertSmokeStk) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe hashAssertSmokeProg = .ok b := by
+    have h : (compileSafe hashAssertSmokeProg).toOption.isSome = true := by
+      native_decide
+    cases hc : compileSafe hashAssertSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  exact hashAssert_consume_sha256 hashAssertSmokeProg
+    AgreesHashCall.hashAssertSmokeMethod bytes "d" "ok" "a0" "x" "expected"
+    .byteString .byteString none none none
+    (by simp [hashAssertSmokeProg]) rfl hSafe
+    hashAssertSmokeAnf hashAssertSmokeStk rfl (by decide) rfl rfl (by decide)
+    (ByteArray.mk #[1, 2, 3]) (ByteArray.mk #[4, 5]) [] rfl rfl rfl (by decide)
+
+/-! ## crypto_call peel-off (WIDENED 2026-06-11) — 2-chain consume theorem
+
+W2: `h(x) { d1 := f1(x); d2 := f2(d1) }` with the peephole-stable pairs
+`(f1, f2) ∈ {(sha256, hash160), (hash160, sha256), (hash160, hash160)}`
+(the fusing `(sha256, sha256)` pair is excluded by the classifier — see
+`AgreesHashCall` Part 9).  VALUE-terminated, so the acceptance bit needs the
+keyed `hValueTruthy` truthiness premise (the final digest is backend-opaque;
+no digest-size axiom exists), exactly like the bare single-call fragment. -/
+
+/-- Factored peephole-identity spine: the 4-pass pipeline is the identity on
+any if-free op list on which each flat pass is the identity. -/
+private theorem peepholeMethodOps_eq_self_of_passes
+    (ops : List StackOp)
+    (hNoIf : Peephole.noIfOp ops)
+    (hFlat : Peephole.peepholePassAllFlat ops = ops)
+    (hPost : Peephole.applyPushOneSub (Peephole.applyPushOneAdd ops) = ops)
+    (hChain : Peephole.applyPushAddPushSub (Peephole.applyPushAddPushAdd ops) = ops)
+    (hRoll : Peephole.rollPickFoldFlatNoop ops) :
+    peepholeMethodOps ops = ops := by
+  unfold peepholeMethodOps
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf, hFlat,
+      Peephole.peepholePostFold_eq_applyPushOne_of_noIfOp _ hNoIf, hPost,
+      Peephole.peepholeChainFold_eq_self_of_noIfOp_stepId _ hNoIf hChain,
+      Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIf hRoll]
+
+/-- Peephole identity on `[OP_SHA256, OP_HASH160]`. -/
+theorem peepholeMethodOps_hashChain_sha256_hash160 :
+    peepholeMethodOps (AgreesHashCall.hashChainOps "OP_SHA256" "OP_HASH160")
+      = AgreesHashCall.hashChainOps "OP_SHA256" "OP_HASH160" :=
+  peepholeMethodOps_eq_self_of_passes _
+    (by simp [AgreesHashCall.hashChainOps, Peephole.noIfOp])
+    (by simp +decide [AgreesHashCall.hashChainOps, Peephole.peepholePassAllFlat,
+      Peephole.applyEqualVerifyFuse, Peephole.applyCheckSigVerifyFuse,
+      Peephole.applyNumEqualVerifyFuse, Peephole.applyZeroNumEqual,
+      Peephole.applyDoubleSha256, Peephole.applyDoubleDrop, Peephole.applyDoubleOver,
+      Peephole.applyDoubleNot, Peephole.applyDoubleNegate, Peephole.applyOneSub,
+      Peephole.applyOneAdd, Peephole.applySubZero, Peephole.applyAddZero,
+      Peephole.applyPushPushMul, Peephole.applyPushPushSub, Peephole.applyPushPushAdd,
+      Peephole.applyDoubleSwap, Peephole.applyDupDrop, Peephole.applyDropAfterPush])
+    (by simp +decide [AgreesHashCall.hashChainOps, Peephole.applyPushOneAdd,
+      Peephole.applyPushOneSub])
+    (by simp +decide [AgreesHashCall.hashChainOps,
+      Peephole.applyPushAddPushAdd, Peephole.applyPushAddPushSub])
+    (by simp +decide [AgreesHashCall.hashChainOps,
+      Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])
+
+/-- Peephole identity on `[OP_HASH160, OP_SHA256]`. -/
+theorem peepholeMethodOps_hashChain_hash160_sha256 :
+    peepholeMethodOps (AgreesHashCall.hashChainOps "OP_HASH160" "OP_SHA256")
+      = AgreesHashCall.hashChainOps "OP_HASH160" "OP_SHA256" :=
+  peepholeMethodOps_eq_self_of_passes _
+    (by simp [AgreesHashCall.hashChainOps, Peephole.noIfOp])
+    (by simp +decide [AgreesHashCall.hashChainOps, Peephole.peepholePassAllFlat,
+      Peephole.applyEqualVerifyFuse, Peephole.applyCheckSigVerifyFuse,
+      Peephole.applyNumEqualVerifyFuse, Peephole.applyZeroNumEqual,
+      Peephole.applyDoubleSha256, Peephole.applyDoubleDrop, Peephole.applyDoubleOver,
+      Peephole.applyDoubleNot, Peephole.applyDoubleNegate, Peephole.applyOneSub,
+      Peephole.applyOneAdd, Peephole.applySubZero, Peephole.applyAddZero,
+      Peephole.applyPushPushMul, Peephole.applyPushPushSub, Peephole.applyPushPushAdd,
+      Peephole.applyDoubleSwap, Peephole.applyDupDrop, Peephole.applyDropAfterPush])
+    (by simp +decide [AgreesHashCall.hashChainOps, Peephole.applyPushOneAdd,
+      Peephole.applyPushOneSub])
+    (by simp +decide [AgreesHashCall.hashChainOps,
+      Peephole.applyPushAddPushAdd, Peephole.applyPushAddPushSub])
+    (by simp +decide [AgreesHashCall.hashChainOps,
+      Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])
+
+/-- Peephole identity on `[OP_HASH160, OP_HASH160]`. -/
+theorem peepholeMethodOps_hashChain_hash160_hash160 :
+    peepholeMethodOps (AgreesHashCall.hashChainOps "OP_HASH160" "OP_HASH160")
+      = AgreesHashCall.hashChainOps "OP_HASH160" "OP_HASH160" :=
+  peepholeMethodOps_eq_self_of_passes _
+    (by simp [AgreesHashCall.hashChainOps, Peephole.noIfOp])
+    (by simp +decide [AgreesHashCall.hashChainOps, Peephole.peepholePassAllFlat,
+      Peephole.applyEqualVerifyFuse, Peephole.applyCheckSigVerifyFuse,
+      Peephole.applyNumEqualVerifyFuse, Peephole.applyZeroNumEqual,
+      Peephole.applyDoubleSha256, Peephole.applyDoubleDrop, Peephole.applyDoubleOver,
+      Peephole.applyDoubleNot, Peephole.applyDoubleNegate, Peephole.applyOneSub,
+      Peephole.applyOneAdd, Peephole.applySubZero, Peephole.applyAddZero,
+      Peephole.applyPushPushMul, Peephole.applyPushPushSub, Peephole.applyPushPushAdd,
+      Peephole.applyDoubleSwap, Peephole.applyDupDrop, Peephole.applyDropAfterPush])
+    (by simp +decide [AgreesHashCall.hashChainOps, Peephole.applyPushOneAdd,
+      Peephole.applyPushOneSub])
+    (by simp +decide [AgreesHashCall.hashChainOps,
+      Peephole.applyPushAddPushAdd, Peephole.applyPushAddPushSub])
+    (by simp +decide [AgreesHashCall.hashChainOps,
+      Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])
+
+/-- **2-chain consume core (func-agnostic).**  Composes the always-completing
+ANF and Stack walks with the method-level lowering reduction, the peephole
+identity, and the push round-trip M4.  VALUE-terminated, so the acceptance
+restatement consumes the keyed truthiness premise. -/
+theorem hashChain_consume_core
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (d1 d2 arg f1 f2 op1 op2 : String) (ty : ANFType)
+    (s1 s2 : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : anfM.params = [ANFParam.mk arg ty])
+    (hBody : anfM.body = AgreesHashCall.hashChainBody d1 d2 arg f1 f2 s1 s2)
+    (hNe : d1 ≠ arg)
+    (hFuncs : AgreesHashCall.hashChainFuncsOk f1 f2 = true)
+    (dg1 dg2 : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hCall1 : RunarVerification.ANF.Eval.evalValue initialAnf (.call f1 [arg])
+      = .ok (.vBytes dg1, initialAnf))
+    (hCall2 : RunarVerification.ANF.Eval.evalValue
+        (initialAnf.addBinding d1 (.vBytes dg1)) (.call f2 [d1])
+      = .ok (.vBytes dg2, initialAnf.addBinding d1 (.vBytes dg1)))
+    (hStep1 : runOps [.opcode op1] initialStack
+      = .ok { initialStack with stack := .vBytes dg1 :: rest })
+    (hStep2 : runOps [.opcode op2]
+        { initialStack with stack := .vBytes dg1 :: rest }
+      = .ok { initialStack with stack := .vBytes dg2 :: rest })
+    (hPeep : peepholeMethodOps (AgreesHashCall.hashChainOps op1 op2)
+      = AgreesHashCall.hashChainOps op1 op2)
+    (hEmit : Parse.areRunarEmittablePushBool
+      (AgreesHashCall.hashChainOps op1 op2) = true)
+    (hCallWit1 : Lower.lowerValueP p.methods p.properties Lower.defaultInlineBudget 0
+        [(d1, 1), (arg, 0)] [] [d1, d2]
+        (Lower.collectConstInts (AgreesHashCall.hashChainBody d1 d2 arg f1 f2 s1 s2))
+        [arg] d1 (.call f1 [arg])
+      = ([StackOp.opcode op1], [d1], [d1, d2]))
+    (hCallWit2 : Lower.lowerValueP p.methods p.properties Lower.defaultInlineBudget 1
+        [(d1, 1), (arg, 0)] [] [d1, d2]
+        (Lower.collectConstInts (AgreesHashCall.hashChainBody d1 d2 arg f1 f2 s1 s2))
+        [d1] d2 (.call f2 [d1])
+      = ([StackOp.opcode op2], [d2], [d1, d2]))
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome = true := by
+    rw [hBody]
+    exact AgreesHashCall.evalBindingsP_hashChain_isSome p.methods initialAnf
+      d1 d2 arg f1 f2 s1 s2 dg1 dg2 hCall1 hCall2
+  have hOps : (Lower.lowerMethod p.methods p.properties anfM).ops
+      = AgreesHashCall.hashChainOps op1 op2 :=
+    AgreesHashCall.lowerMethod_ops_hashChain p.methods p.properties anfM
+      d1 d2 arg f1 f2 op1 op2 ty s1 s2 hParams hBody hPublic hNe hFuncs
+      hCallWit1 hCallWit2
+  obtain ⟨hPubSingleton, _hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hPeeped : (peepholedLoweredMethod p anfM).ops
+      = AgreesHashCall.hashChainOps op1 op2 := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = _
+    rw [hOps]
+    exact hPeep
+  have hM4 : runParsedBytes bytes initialStack
+      = runOps (AgreesHashCall.hashChainOps op1 op2) initialStack := by
+    have hEmitPush : Parse.AreRunarEmittablePush (peepholedLoweredMethod p anfM).ops := by
+      show Parse.areRunarEmittablePushBool (peepholedLoweredMethod p anfM).ops = true
+      rw [hPeeped]
+      exact hEmit
+    have hEq := compileSafe_single_public_runOps_eq_push p bytes
+      (peepholedLoweredMethod p anfM) initialStack hSafe hPubSingleton hEmitPush
+    rw [hEq, hPeeped]
+  have hStackRun : runOps (AgreesHashCall.hashChainOps op1 op2) initialStack
+      = .ok { initialStack with stack := .vBytes dg2 :: rest } :=
+    AgreesHashCall.runOps_hashChainOps_ok initialStack op1 op2 dg1 dg2 rest
+      hStep1 hStep2
+  have hCompletion :
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+        anfM.body).toOption.isSome
+      ↔ (runParsedBytes bytes initialStack).toOption.isSome := by
+    rw [hANF, hM4, hStackRun]
+    simp [Except.toOption]
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBody]; simp [AgreesHashCall.hashChainBody, Lower.bodyEndsInAssert]
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hCompletion (hTopTruthy hNoTA)
+
+/-- **2-chain consume (HEADLINE, acceptance bit).**  One theorem over the
+three admissible pairs (`hashChainFuncsOk`); the digest truthiness is carried
+by the keyed `hTopTruthy` premise (the body is VALUE-terminated and the hash
+backends are opaque — same regime as the bare single-call theorems). -/
+theorem hashChain_consume
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (d1 d2 arg f1 f2 : String) (ty : ANFType) (s1 s2 : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : anfM.params = [ANFParam.mk arg ty])
+    (hBody : anfM.body = AgreesHashCall.hashChainBody d1 d2 arg f1 f2 s1 s2)
+    (hNe : d1 ≠ arg)
+    (hFuncs : AgreesHashCall.hashChainFuncsOk f1 f2 = true)
+    (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: rest)
+    (hLen : argBytes.size ≤ 520)
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hF : (f1 = "sha256" ∧ f2 = "hash160") ∨ (f1 = "hash160" ∧ f2 = "sha256")
+      ∨ (f1 = "hash160" ∧ f2 = "hash160") := by
+    have h := hFuncs
+    simp only [AgreesHashCall.hashChainFuncsOk, Bool.or_eq_true,
+      Bool.and_eq_true, beq_iff_eq] at h
+    rcases h with (h | h) | h
+    · exact Or.inl h
+    · exact Or.inr (Or.inl h)
+    · exact Or.inr (Or.inr h)
+  have hD1Self : (initialAnf.addBinding d1
+      (.vBytes (RunarVerification.ANF.Eval.Crypto.sha256 argBytes))).resolveRef d1
+      = some (.vBytes (RunarVerification.ANF.Eval.Crypto.sha256 argBytes)) :=
+    RunarVerification.ANF.WellTyped.resolveRef_addBinding_self initialAnf d1 _
+  have hD1Self160 : (initialAnf.addBinding d1
+      (.vBytes (RunarVerification.ANF.Eval.Crypto.hash160 argBytes))).resolveRef d1
+      = some (.vBytes (RunarVerification.ANF.Eval.Crypto.hash160 argBytes)) :=
+    RunarVerification.ANF.WellTyped.resolveRef_addBinding_self initialAnf d1 _
+  rcases hF with ⟨hF1, hF2⟩ | ⟨hF1, hF2⟩ | ⟨hF1, hF2⟩ <;> subst hF1 <;> subst hF2
+  · -- (sha256, hash160)
+    exact hashChain_consume_core p anfM bytes d1 d2 arg "sha256" "hash160"
+      "OP_SHA256" "OP_HASH160" ty s1 s2 hMem hPublic hSafe initialAnf initialStack
+      hSinglePublic hName hParams hBody hNe hFuncs
+      (RunarVerification.ANF.Eval.Crypto.sha256 argBytes)
+      (RunarVerification.ANF.Eval.Crypto.hash160
+        (RunarVerification.ANF.Eval.Crypto.sha256 argBytes)) rest
+      (AgreesHashCall.evalValue_call_sha256_eq_local initialAnf arg argBytes hArg)
+      (AgreesHashCall.evalValue_call_hash160_eq_local _ d1 _ hD1Self)
+      (Stack.HashOps.runOps_sha256Ops_eq initialStack argBytes rest hStk hLen)
+      (AgreesHashCall.runOps_hash160_step_nosize _ _ rest rfl)
+      peepholeMethodOps_hashChain_sha256_hash160 (by rfl)
+      (AgreesHashCall.lowerValueP_call_sha256_consume_d0_full p.methods p.properties
+        Lower.defaultInlineBudget 0 [(d1, 1), (arg, 0)] [d1, d2]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashChainBody d1 d2 arg "sha256" "hash160" s1 s2))
+        d1 arg [] (AgreesHashCall.hashChain_arg_consume_fact d1 arg hNe))
+      (AgreesHashCall.lowerValueP_call_hash160_consume_d0_full p.methods p.properties
+        Lower.defaultInlineBudget 1 [(d1, 1), (arg, 0)] [d1, d2]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashChainBody d1 d2 arg "sha256" "hash160" s1 s2))
+        d2 d1 [] (AgreesHashCall.hashChain_d1_consume_fact d1 arg))
+      hTopTruthy
+  · -- (hash160, sha256)
+    exact hashChain_consume_core p anfM bytes d1 d2 arg "hash160" "sha256"
+      "OP_HASH160" "OP_SHA256" ty s1 s2 hMem hPublic hSafe initialAnf initialStack
+      hSinglePublic hName hParams hBody hNe hFuncs
+      (RunarVerification.ANF.Eval.Crypto.hash160 argBytes)
+      (RunarVerification.ANF.Eval.Crypto.sha256
+        (RunarVerification.ANF.Eval.Crypto.hash160 argBytes)) rest
+      (AgreesHashCall.evalValue_call_hash160_eq_local initialAnf arg argBytes hArg)
+      (AgreesHashCall.evalValue_call_sha256_eq_local _ d1 _ hD1Self160)
+      (Stack.HashOps.runOps_hash160Ops_eq initialStack argBytes rest hStk hLen)
+      (AgreesHashCall.runOps_sha256_step_nosize _ _ rest rfl)
+      peepholeMethodOps_hashChain_hash160_sha256 (by rfl)
+      (AgreesHashCall.lowerValueP_call_hash160_consume_d0_full p.methods p.properties
+        Lower.defaultInlineBudget 0 [(d1, 1), (arg, 0)] [d1, d2]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashChainBody d1 d2 arg "hash160" "sha256" s1 s2))
+        d1 arg [] (AgreesHashCall.hashChain_arg_consume_fact d1 arg hNe))
+      (AgreesHashCall.lowerValueP_call_sha256_consume_d0_full p.methods p.properties
+        Lower.defaultInlineBudget 1 [(d1, 1), (arg, 0)] [d1, d2]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashChainBody d1 d2 arg "hash160" "sha256" s1 s2))
+        d2 d1 [] (AgreesHashCall.hashChain_d1_consume_fact d1 arg))
+      hTopTruthy
+  · -- (hash160, hash160)
+    exact hashChain_consume_core p anfM bytes d1 d2 arg "hash160" "hash160"
+      "OP_HASH160" "OP_HASH160" ty s1 s2 hMem hPublic hSafe initialAnf initialStack
+      hSinglePublic hName hParams hBody hNe hFuncs
+      (RunarVerification.ANF.Eval.Crypto.hash160 argBytes)
+      (RunarVerification.ANF.Eval.Crypto.hash160
+        (RunarVerification.ANF.Eval.Crypto.hash160 argBytes)) rest
+      (AgreesHashCall.evalValue_call_hash160_eq_local initialAnf arg argBytes hArg)
+      (AgreesHashCall.evalValue_call_hash160_eq_local _ d1 _ hD1Self160)
+      (Stack.HashOps.runOps_hash160Ops_eq initialStack argBytes rest hStk hLen)
+      (AgreesHashCall.runOps_hash160_step_nosize _ _ rest rfl)
+      peepholeMethodOps_hashChain_hash160_hash160 (by rfl)
+      (AgreesHashCall.lowerValueP_call_hash160_consume_d0_full p.methods p.properties
+        Lower.defaultInlineBudget 0 [(d1, 1), (arg, 0)] [d1, d2]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashChainBody d1 d2 arg "hash160" "hash160" s1 s2))
+        d1 arg [] (AgreesHashCall.hashChain_arg_consume_fact d1 arg hNe))
+      (AgreesHashCall.lowerValueP_call_hash160_consume_d0_full p.methods p.properties
+        Lower.defaultInlineBudget 1 [(d1, 1), (arg, 0)] [d1, d2]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashChainBody d1 d2 arg "hash160" "hash160" s1 s2))
+        d2 d1 [] (AgreesHashCall.hashChain_d1_consume_fact d1 arg))
+      hTopTruthy
+
+/-! ### MANDATORY smoke: the 2-chain consume theorem fires
+
+Like the bare single-call smoke, the digest-truthiness fact is carried as a
+hypothesis (the hash backends are OPAQUE — no digest-size axiom);
+reachability (`compileSafe` accepts) stays unconditional. -/
+
+private def hashChainSmokeProg : ANFProgram :=
+  { contractName := "HC", properties := [],
+    methods := [AgreesHashCall.hashChainSmokeMethod] }
+
+private def hashChainSmokeAnf : State :=
+  { (default : State) with
+    bindings := [("x", .vBytes (ByteArray.mk #[1, 2, 3]))] }
+
+private def hashChainSmokeStk : StackState :=
+  { (default : StackState) with
+    stack := [.vBytes (ByteArray.mk #[1, 2, 3])] }
+
+/-- SMOKE — `hashChain_consume` fires on the canonical sha256→hash160 chain. -/
+theorem smoke_hashChain_consume_fires
+    (hTopTruthy : ∀ bytes s, compileSafe hashChainSmokeProg = .ok bytes →
+        runParsedBytes bytes hashChainSmokeStk = .ok s →
+        topTruthy s.stack = true) :
+    ∃ bytes, compileSafe hashChainSmokeProg = .ok bytes ∧
+      acceptAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP hashChainSmokeProg.methods
+          hashChainSmokeAnf AgreesHashCall.hashChainSmokeMethod.body)
+        (runParsedBytes bytes hashChainSmokeStk) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe hashChainSmokeProg = .ok b := by
+    have h : (compileSafe hashChainSmokeProg).toOption.isSome = true := by
+      native_decide
+    cases hc : compileSafe hashChainSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  exact hashChain_consume hashChainSmokeProg
+    AgreesHashCall.hashChainSmokeMethod bytes "d1" "d2" "x" "sha256" "hash160"
+    .byteString none none
+    (by simp [hashChainSmokeProg]) rfl hSafe
+    hashChainSmokeAnf hashChainSmokeStk rfl (by decide) rfl rfl (by decide)
+    (by decide) (ByteArray.mk #[1, 2, 3]) [] rfl rfl (by decide)
+    (fun _ s hRun => hTopTruthy bytes s hSafe hRun)
+
 /-! ## Stateful sub-omnibus retirement — the canonical stateful consume theorem
 
 Discharges the stateful family's omnibus branch for the CANONICAL stateful
@@ -7353,6 +7979,50 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
           initialStack.stack = .vBytes argBytes :: rest ∧
           argBytes.size ≤ 520)
+    -- **crypto_call hash-then-assert peel premise (keyed; 2026-06-11 hash
+    -- widening).**  For a body in the PRODUCTION hash-lock fragment (decided
+    -- by `hashAssertConsumeShapeBool` — two params `(expected, arg)`, body
+    -- `d := sha256/hash160(arg) ; ok := (d === expected : bytes) ; assert ok`,
+    -- referenced names pairwise distinct) the shape witnesses plus the
+    -- bytes-typed entry are recovered.  Keyed on the DECIDABLE classifier, it
+    -- is VACUOUS for every other body, so the omnibus stays jointly
+    -- satisfiable; its only consumer is the conformance harness, which
+    -- discharges it per fixture from the bytes-typed entry.
+    (hHashAssertFrag :
+      RunarVerification.Stack.AgreesHashCall.hashAssertConsumeShapeBool anfM = true →
+        ∃ (d ok anm arg expected func : String) (tyE tyA : ANFType)
+          (s1 s2 s3 : Option SourceLoc) (argBytes expBytes : ByteArray)
+          (rest : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA] ∧
+          anfM.body = RunarVerification.Stack.AgreesHashCall.hashAssertBody
+            d ok anm arg expected func s1 s2 s3 ∧
+          (func = "sha256" ∨ func = "hash160") ∧
+          RunarVerification.Stack.AgreesHashCall.hashAssertNamesOk
+            d ok arg expected = true ∧
+          initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
+          initialAnf.resolveRef expected = some (.vBytes expBytes) ∧
+          initialStack.stack = .vBytes argBytes :: .vBytes expBytes :: rest ∧
+          argBytes.size ≤ 520)
+    -- **crypto_call 2-chain peel premise (keyed; 2026-06-11 hash widening).**
+    -- For a body in the 2-chain fragment (decided by
+    -- `hashChainConsumeShapeBool` — one param, body `d1 := f1(arg) ; d2 :=
+    -- f2(d1)` with `(f1, f2)` a peephole-stable hash pair) the shape
+    -- witnesses plus the bytes-typed entry are recovered.  Keyed on the
+    -- DECIDABLE classifier, VACUOUS for every other body; its only consumer
+    -- is the conformance harness.
+    (hHashChainFrag :
+      RunarVerification.Stack.AgreesHashCall.hashChainConsumeShapeBool anfM = true →
+        ∃ (d1 d2 arg f1 f2 : String) (ty : ANFType)
+          (s1 s2 : Option SourceLoc) (argBytes : ByteArray)
+          (rest : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk arg ty] ∧
+          anfM.body = RunarVerification.Stack.AgreesHashCall.hashChainBody
+            d1 d2 arg f1 f2 s1 s2 ∧
+          RunarVerification.Stack.AgreesHashCall.hashChainFuncsOk f1 f2 = true ∧
+          d1 ≠ arg ∧
+          initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
+          initialStack.stack = .vBytes argBytes :: rest ∧
+          argBytes.size ≤ 520)
     -- **Stateful consume premise (keyed).**  For a body in the canonical
     -- stateful fragment (decided by `AgreesStateful.statefulConsumeShapeBool` —
     -- one param `pre`, body exactly the auto-injected gated prologue) the shape
@@ -7740,35 +8410,89 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                   · exact compileSafe_observational_correct_modulo_crypto_call_codegen
                       p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
                       [(a, Agrees.SlotKind.param)] hAgrees hValueTruthy
-                · -- **crypto_call hash-peel branch.**  Before the universal
-                  -- fallback, the decidable `hashCallConsumeShapeBool` classifier
-                  -- peels the single-`sha256`/`hash160`-call method fragment: the
-                  -- keyed `hHashCallFrag` premise recovers the shape witnesses + the
-                  -- bytes-typed entry, and the discharged consume theorem fires
-                  -- (RAW = the bare allowlisted opcode).  Non-hash bodies fall
-                  -- through to the sound crypto_call fallback — NO new axiom.
-                  by_cases hHashShape :
-                      RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true
-                  · by_cases hHashName : anfM.name ≠ "constructor"
-                    · obtain ⟨bn, harg, hfunc, hsrc, hargBytes, hrestV,
-                        hHParams, hHBody, hHFunc, hHArg, hHStk, hHLen⟩ := hHashCallFrag hHashShape
-                      rcases hHFunc with hF | hF
+                · -- **crypto_call hash-then-assert peel branch (W1, 2026-06-11
+                  -- hash widening).**  Tried BEFORE the bare single-call
+                  -- classifier: the decidable `hashAssertConsumeShapeBool`
+                  -- classifier peels the PRODUCTION hash-lock fragment
+                  -- (`d := func(arg) ; ok := (d === expected) ; assert ok`);
+                  -- the keyed `hHashAssertFrag` premise recovers the shape
+                  -- witnesses + the bytes-typed entry, and the discharged
+                  -- consume theorem fires with NO truthiness premise (the
+                  -- body is assert-terminated — the acceptance bit IS the
+                  -- equality verdict on both sides).  Other bodies fall
+                  -- through to the single-call peel / crypto_call cascade —
+                  -- NO new axiom.
+                  by_cases hHashAssertShape :
+                      RunarVerification.Stack.AgreesHashCall.hashAssertConsumeShapeBool anfM = true
+                  · by_cases hHashAssertName : anfM.name ≠ "constructor"
+                    · obtain ⟨da, oka, anma, harga, hexpa, hfunca, tyEa, tyAa,
+                        hs1a, hs2a, hs3a, hargBa, hexpBa, hrestA,
+                        hAParams, hABody, hAFunc, hANames, hAArg, hAExp,
+                        hAStk, hALen⟩ := hHashAssertFrag hHashAssertShape
+                      rcases hAFunc with hF | hF
                       · subst hF
-                        exact hashCall_consume_sha256 p anfM bytes bn harg hsrc hMem hPublic hSafe
-                          initialAnf initialStack hSinglePublic hHashName hHParams hHBody
-                          hargBytes hrestV hHArg hHStk hHLen hValueTruthy
+                        exact hashAssert_consume_sha256 p anfM bytes da oka anma
+                          harga hexpa tyEa tyAa hs1a hs2a hs3a hMem hPublic hSafe
+                          initialAnf initialStack hSinglePublic hHashAssertName
+                          hAParams hABody hANames hargBa hexpBa hrestA
+                          hAArg hAExp hAStk hALen
                       · subst hF
-                        exact hashCall_consume_hash160 p anfM bytes bn harg hsrc hMem hPublic hSafe
-                          initialAnf initialStack hSinglePublic hHashName hHParams hHBody
-                          hargBytes hrestV hHArg hHStk hHLen hValueTruthy
+                        exact hashAssert_consume_hash160 p anfM bytes da oka anma
+                          harga hexpa tyEa tyAa hs1a hs2a hs3a hMem hPublic hSafe
+                          initialAnf initialStack hSinglePublic hHashAssertName
+                          hAParams hABody hANames hargBa hexpBa hrestA
+                          hAArg hAExp hAStk hALen
                     · exact compileSafe_observational_correct_modulo_crypto_call_codegen
                         p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
-                  · -- Substrate-gap fallback: no structural classifier fires.
-                    -- This is the crypto-call family (no dedicated Bool checker
-                    -- until A4-crypto + Phase B per-primitive land). The
-                    -- sub-omnibus hypothesis is `True`.
-                    exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                      p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+                  · -- **crypto_call 2-chain peel branch (W2, 2026-06-11 hash
+                    -- widening).**  The decidable `hashChainConsumeShapeBool`
+                    -- classifier peels the 2-chain fragment; the keyed
+                    -- `hHashChainFrag` premise recovers the shape witnesses +
+                    -- the bytes-typed entry, and the discharged consume
+                    -- theorem fires (value-terminated — consumes the keyed
+                    -- `hValueTruthy` truthiness premise).  Other bodies fall
+                    -- through to the single-call peel / crypto_call cascade.
+                    by_cases hHashChainShape :
+                        RunarVerification.Stack.AgreesHashCall.hashChainConsumeShapeBool anfM = true
+                    · by_cases hHashChainName : anfM.name ≠ "constructor"
+                      · obtain ⟨dc1, dc2, hargc, hf1c, hf2c, tyc, hs1c, hs2c,
+                          hargBc, hrestC, hCParams, hCBody, hCFuncs, hCNe,
+                          hCArg, hCStk, hCLen⟩ := hHashChainFrag hHashChainShape
+                        exact hashChain_consume p anfM bytes dc1 dc2 hargc hf1c hf2c
+                          tyc hs1c hs2c hMem hPublic hSafe initialAnf initialStack
+                          hSinglePublic hHashChainName hCParams hCBody hCNe hCFuncs
+                          hargBc hrestC hCArg hCStk hCLen hValueTruthy
+                      · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+                    · -- **crypto_call hash-peel branch.**  Before the universal
+                      -- fallback, the decidable `hashCallConsumeShapeBool` classifier
+                      -- peels the single-`sha256`/`hash160`-call method fragment: the
+                      -- keyed `hHashCallFrag` premise recovers the shape witnesses + the
+                      -- bytes-typed entry, and the discharged consume theorem fires
+                      -- (RAW = the bare allowlisted opcode).  Non-hash bodies fall
+                      -- through to the sound crypto_call fallback — NO new axiom.
+                      by_cases hHashShape :
+                          RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true
+                      · by_cases hHashName : anfM.name ≠ "constructor"
+                        · obtain ⟨bn, harg, hfunc, hsrc, hargBytes, hrestV,
+                            hHParams, hHBody, hHFunc, hHArg, hHStk, hHLen⟩ := hHashCallFrag hHashShape
+                          rcases hHFunc with hF | hF
+                          · subst hF
+                            exact hashCall_consume_sha256 p anfM bytes bn harg hsrc hMem hPublic hSafe
+                              initialAnf initialStack hSinglePublic hHashName hHParams hHBody
+                              hargBytes hrestV hHArg hHStk hHLen hValueTruthy
+                          · subst hF
+                            exact hashCall_consume_hash160 p anfM bytes bn harg hsrc hMem hPublic hSafe
+                              initialAnf initialStack hSinglePublic hHashName hHParams hHBody
+                              hargBytes hrestV hHArg hHStk hHLen hValueTruthy
+                        · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+                      · -- Substrate-gap fallback: no structural classifier fires.
+                        -- This is the crypto-call family (no dedicated Bool checker
+                        -- until A4-crypto + Phase B per-primitive land). The
+                        -- sub-omnibus hypothesis is `True`.
+                        exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
 
 /--
 **Capstone variant consuming `SupportedANFBody`.**
@@ -7850,6 +8574,50 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           (anfM.params.map (·.name)).reverse = [arg] ∧
           anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
           (func = "sha256" ∨ func = "hash160") ∧
+          initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
+          initialStack.stack = .vBytes argBytes :: rest ∧
+          argBytes.size ≤ 520)
+    -- **crypto_call hash-then-assert peel premise (keyed; 2026-06-11 hash
+    -- widening).**  For a body in the PRODUCTION hash-lock fragment (decided
+    -- by `hashAssertConsumeShapeBool` — two params `(expected, arg)`, body
+    -- `d := sha256/hash160(arg) ; ok := (d === expected : bytes) ; assert ok`,
+    -- referenced names pairwise distinct) the shape witnesses plus the
+    -- bytes-typed entry are recovered.  Keyed on the DECIDABLE classifier, it
+    -- is VACUOUS for every other body, so the omnibus stays jointly
+    -- satisfiable; its only consumer is the conformance harness, which
+    -- discharges it per fixture from the bytes-typed entry.
+    (hHashAssertFrag :
+      RunarVerification.Stack.AgreesHashCall.hashAssertConsumeShapeBool anfM = true →
+        ∃ (d ok anm arg expected func : String) (tyE tyA : ANFType)
+          (s1 s2 s3 : Option SourceLoc) (argBytes expBytes : ByteArray)
+          (rest : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk expected tyE, ANFParam.mk arg tyA] ∧
+          anfM.body = RunarVerification.Stack.AgreesHashCall.hashAssertBody
+            d ok anm arg expected func s1 s2 s3 ∧
+          (func = "sha256" ∨ func = "hash160") ∧
+          RunarVerification.Stack.AgreesHashCall.hashAssertNamesOk
+            d ok arg expected = true ∧
+          initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
+          initialAnf.resolveRef expected = some (.vBytes expBytes) ∧
+          initialStack.stack = .vBytes argBytes :: .vBytes expBytes :: rest ∧
+          argBytes.size ≤ 520)
+    -- **crypto_call 2-chain peel premise (keyed; 2026-06-11 hash widening).**
+    -- For a body in the 2-chain fragment (decided by
+    -- `hashChainConsumeShapeBool` — one param, body `d1 := f1(arg) ; d2 :=
+    -- f2(d1)` with `(f1, f2)` a peephole-stable hash pair) the shape
+    -- witnesses plus the bytes-typed entry are recovered.  Keyed on the
+    -- DECIDABLE classifier, VACUOUS for every other body; its only consumer
+    -- is the conformance harness.
+    (hHashChainFrag :
+      RunarVerification.Stack.AgreesHashCall.hashChainConsumeShapeBool anfM = true →
+        ∃ (d1 d2 arg f1 f2 : String) (ty : ANFType)
+          (s1 s2 : Option SourceLoc) (argBytes : ByteArray)
+          (rest : List RunarVerification.ANF.Eval.Value),
+          anfM.params = [ANFParam.mk arg ty] ∧
+          anfM.body = RunarVerification.Stack.AgreesHashCall.hashChainBody
+            d1 d2 arg f1 f2 s1 s2 ∧
+          RunarVerification.Stack.AgreesHashCall.hashChainFuncsOk f1 f2 = true ∧
+          d1 ≠ arg ∧
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
           initialStack.stack = .vBytes argBytes :: rest ∧
           argBytes.size ≤ 520)
@@ -7951,7 +8719,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
     hNoLoop Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
-    hMethodCallFrag hHashCallFrag hStatefulFrag hStatefulFullFrag hDispatchFrag
+    hMethodCallFrag hHashCallFrag hHashAssertFrag hHashChainFrag hStatefulFrag hStatefulFullFrag hDispatchFrag
     hValueTruthy hCoh
 
 
