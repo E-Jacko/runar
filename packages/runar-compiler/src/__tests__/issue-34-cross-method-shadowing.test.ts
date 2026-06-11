@@ -44,7 +44,8 @@ describe('issue #34: cross-method parameter-name shadowing', () => {
       disableConstantFolding: true,
     });
     expect(result.success).toBe(true);
-    const hex = result.scriptHex.toLowerCase();
+    expect(result.scriptHex).toBeDefined();
+    const hex = (result.scriptHex ?? '').toLowerCase();
     // The fix must emit OP_ADD (0x93) for the integer add. Before the fix the
     // shadowing produced OP_CAT (0x7e) at the addition site.
     expect(hex).toContain('93'); // OP_ADD present
