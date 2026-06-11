@@ -29,7 +29,9 @@ with **every premise discharged**:
 | `omniCounter` (inc)    | update_prop consume (wave 64)       | synthetic (counter) |
 | `omniHashLock`         | crypto_call hash-then-assert (W1)   | synthetic hash-lock |
 | `omniStateful`         | stateful consume (gated prologue)   | synthetic stateful  |
+| `omniSf`               | statefulFull consume (widened)      | synthetic (SF)      |
 | `omniDispatch` (MX)    | mixed dispatch consume, selector 0  | synthetic 2-method  |
+| `omniMxHL`   (MX)      | mixed dispatch consume, selector 1  | synthetic 2-method  |
 | `omniP2pkh`            | crypto_call fallback sub-omnibus    | REAL `basic-p2pkh`  |
 
 `omniP2pkh*` is a faithful Lean transcription of
@@ -37,35 +39,37 @@ with **every premise discharged**:
 JSON golden at runtime and checks the transcription compiles to
 byte-identical Script (see `checkP2pkhTranscription`).
 
-## Honest notes (premise-shape findings)
+## Premise-shape findings — RESOLVED (2026-06-12 omnibus repair)
 
-1. **`statefulFull` cannot be instantiated through the omnibus.**  The
-   widened stateful body (`statefulFullBody`) ends in `addOutput`, so
-   `bodyEndsInAssert = false` and the keyed `hValueTruthy` premise goes
-   LIVE — yet the statefulFull branch never consumes it (its consume
-   theorem needs no truthiness), and it is NOT derivable from the keyed
-   `hStatefulFullFrag` entry bundle: the spend-witness verdict
-   (`checkPreimage`) is backend-opaque, and on a falsifying context the
-   bytes run completes with a falsy top, making `hValueTruthy` FALSE.
-   The stateful family is therefore instantiated here on the
-   prologue-only fragment (assert-terminated ⇒ `hValueTruthy` vacuous).
-   Suggested premise-shape fix (not taken here, to keep the omnibus
-   signature stable): key `hValueTruthy` off the `statefulFull`
-   classifier as well.
+The first harness wiring (PR #77) surfaced two WRONG-SHAPED omnibus
+premises; both are now fixed in `Pipeline.lean` and the two
+previously-uninstantiable fragments are instantiated below:
 
-2. **The mixed-dispatch HASH-LOCK arm cannot be instantiated through
-   the omnibus.**  `hUntag` pins `tsm` to the selected method's
-   reversed params, and `hAgrees`+`hCoh` then force the SELECTED
-   method's first param slot to resolve to the stack TOP — which for a
-   dispatch entry is the `.vBigint` selector, while the hash-lock arm's
-   keyed bundle (`hDispatchMixedFrag`) simultaneously forces the same
-   name to resolve to the `.vBytes` argument.  `.vBigint _ = .vBytes _`
-   is unsatisfiable, so only selector arms whose param value can
-   coincide with the selector are instantiable (here: the passthrough
-   arm at selector 0 with witness value 0).  The consume-theorem smokes
-   are unaffected (they carry no `tsm`); the conflict is between the
-   omnibus's GLOBAL alignment bundle and the selector-headed dispatch
-   stack layout.
+1. **`statefulFull` (fixed by re-keying `hValueTruthy`).**  The widened
+   stateful body ends in `addOutput` (`bodyEndsInAssert = false`), which
+   made the keyed truthiness premise go LIVE although the statefulFull
+   consume theorem never consumes it and the harness cannot discharge it
+   mechanically: the run is gated on the OPAQUE `authBackend.checkSig`
+   verdict (on a rejected witness the deployed bytes ABORT at
+   `OP_CHECKSIGVERIFY` — they never complete with a falsy top; on an
+   accepted witness the top is the NONEMPTY serialized output).
+   `hValueTruthy` is now keyed off `statefulFullDischargedB p anfM =
+   false`, exempting exactly the discharged path; see
+   `omnibus_instantiation_statefulFull`.
+
+2. **The mixed-dispatch HASH-LOCK arm (fixed by single-public-gating
+   the alignment bundle).**  `hUntag` pinned `tsm` to the selected
+   method's reversed params, so `hAgrees` forced the first param slot to
+   the stack TOP — the `.vBigint` selector for a dispatch entry — while
+   the keyed `hDispatchMixedFrag` bundle forced the same name to
+   `.vBytes`: jointly unsatisfiable.  The METHOD-local entry-peel
+   premises (`hHashAssertFrag` etc.) had the same flaw (their classifier
+   fires on the hash-lock method, but their consequent pins a
+   non-selector-headed stack).  `hUntag` and the five peel premises are
+   now gated on `(p.methods.filter (·.isPublic)).length < 2`; dispatch
+   instantiations pass `tsm := []` (whose `agreesTagged` carries only
+   props/outputs equality); see
+   `omnibus_instantiation_dispatchMixed_hashLock` (selector 1).
 
 Run with `lake exe omnibusInstantiation`.
 -/
@@ -91,9 +95,17 @@ theorem vacuous {b : Bool} {P : Prop} (hb : b = false) : b = true → P :=
 
 /-- Vacuous discharge for the keyed truthiness premise on
 assert-terminated bodies (`bodyEndsInAssert = true` refutes the
-antecedent `… = false`). -/
+antecedent `… = false`) — and, post 2026-06-12 re-keying, for the whole
+truthiness premise on the statefulFull discharged path
+(`statefulFullDischargedB = true` refutes the antecedent `… = false`). -/
 theorem vacuousAssert {b : Bool} {P : Prop} (hb : b = true) : b = false → P :=
   fun hf => absurd hf (by simp [hb])
+
+/-- Vacuous discharge for a `Prop`-keyed premise whose antecedent is
+refuted by `native_decide` — used for the single-public-gated alignment
+and entry-peel premises on MULTI-public (dispatch) fixtures. -/
+theorem vacuousOf {P Q : Prop} (hp : ¬P) : P → Q :=
+  fun h => absurd h hp
 
 /-- Vacuous discharge for the keyed arith typed-entry premise, through
 the decidable mirror `emittableArithChainReadyNoDblNegBool`. -/
@@ -161,7 +173,7 @@ theorem omnibus_instantiation_arith :
     (EntryModel.agreesTagged_mkEntry _ _ _ (by decide))                  -- hAgrees
     (by native_decide)                                                   -- hNoLoop
     (TypeCheck.TypeEnv.ofParamsProps [] omniArithParams)                 -- Γ
-    (EntryModel.untagSm_mkTsm omniArithParams)                           -- hUntag
+    (fun _ => EntryModel.untagSm_mkTsm omniArithParams)                  -- hUntag (single-public)
     (EntryModel.mkEntryState_entryBigintTyped_noProps _ _ _ (by decide)) -- hTypedEntry
     (fun _ => EntryModel.entryTsmArithTyped_mkEntry [] omniArithParams
       (by decide) (fun pr hpr => by
@@ -171,14 +183,14 @@ theorem omnibus_instantiation_arith :
     (vacuous (by native_decide))                                         -- hMathByteFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
-    (vacuous (by native_decide))                                         -- hHashCallFrag
-    (vacuous (by native_decide))                                         -- hHashAssertFrag
-    (vacuous (by native_decide))                                         -- hHashChainFrag
-    (vacuous (by native_decide))                                         -- hStatefulFrag
-    (vacuous (by native_decide))                                         -- hStatefulFullFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashAssertFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashChainFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFullFrag
     (vacuous (by native_decide))                                         -- hDispatchFrag
     (vacuous (by native_decide))                                         -- hDispatchMixedFrag
-    (fun _ => Stack.Eval.truthy_of_scriptAccepts (by native_decide))     -- hValueTruthy (LIVE)
+    (fun _ _ => Stack.Eval.truthy_of_scriptAccepts (by native_decide))   -- hValueTruthy (LIVE)
     (EntryModel.tsmCoherent_mkEntry [] omniArithParams [] omniArithWitness
       (by decide))                                                       -- hCoh
 
@@ -268,7 +280,7 @@ theorem omnibus_instantiation_updateProp :
     omniCounter_agreesTagged                                             -- hAgrees
     (by native_decide)                                                   -- hNoLoop
     omniCounterEnv                                                       -- Γ
-    rfl                                                                  -- hUntag
+    (fun _ => rfl)                                                       -- hUntag (single-public)
     omniCounter_entryBigintTyped                                         -- hTypedEntry
     (vacuousArith (by native_decide))                                    -- hTsmTyped
     (by intro bn cond thn els src h
@@ -276,14 +288,14 @@ theorem omnibus_instantiation_updateProp :
     (vacuous (by native_decide))                                         -- hMathByteFrag
     omniCounter_updatePropFrag                                           -- hUpdatePropFrag (LIVE)
     (vacuous (by native_decide))                                         -- hMethodCallFrag
-    (vacuous (by native_decide))                                         -- hHashCallFrag
-    (vacuous (by native_decide))                                         -- hHashAssertFrag
-    (vacuous (by native_decide))                                         -- hHashChainFrag
-    (vacuous (by native_decide))                                         -- hStatefulFrag
-    (vacuous (by native_decide))                                         -- hStatefulFullFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashAssertFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashChainFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFullFrag
     (vacuous (by native_decide))                                         -- hDispatchFrag
     (vacuous (by native_decide))                                         -- hDispatchMixedFrag
-    (fun _ => Stack.Eval.truthy_of_scriptAccepts (by native_decide))     -- hValueTruthy (LIVE)
+    (fun _ _ => Stack.Eval.truthy_of_scriptAccepts (by native_decide))   -- hValueTruthy (LIVE)
     omniCounter_coh                                                      -- hCoh
 
 /-! ## Fixture C — crypto_call hash-then-assert family (production hash-lock)
@@ -336,7 +348,7 @@ theorem omnibus_instantiation_hashLock :
     ⟨⟨rfl, rfl, trivial⟩, rfl, rfl⟩                                      -- hAgrees
     (by native_decide)                                                   -- hNoLoop
     Typed.TypeEnv.empty                                                  -- Γ
-    rfl                                                                  -- hUntag
+    (fun _ => rfl)                                                       -- hUntag (single-public)
     (entryBigintTyped_empty _)                                           -- hTypedEntry
     (vacuousArith (by native_decide))                                    -- hTsmTyped
     (by intro bn cond thn els src h
@@ -345,17 +357,17 @@ theorem omnibus_instantiation_hashLock :
     (vacuous (by native_decide))                                         -- hMathByteFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
-    (vacuous (by native_decide))                                         -- hHashCallFrag
-    (fun _ => ⟨"d", "ok", "a0", "x", "expected", "sha256",
+    (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
+    (fun _ _ => ⟨"d", "ok", "a0", "x", "expected", "sha256",
       .byteString, .byteString, none, none, none,
       omniHashLockArgB, omniHashLockExpB, [],
       rfl, rfl, Or.inl rfl, by decide, rfl, rfl, rfl, by decide⟩)        -- hHashAssertFrag (LIVE)
-    (vacuous (by native_decide))                                         -- hHashChainFrag
-    (vacuous (by native_decide))                                         -- hStatefulFrag
-    (vacuous (by native_decide))                                         -- hStatefulFullFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashChainFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFullFrag
     (vacuous (by native_decide))                                         -- hDispatchFrag
     (vacuous (by native_decide))                                         -- hDispatchMixedFrag
-    (vacuousAssert (by native_decide))                                   -- hValueTruthy
+    (fun _ => vacuousAssert (by native_decide))                          -- hValueTruthy
     omniHashLock_coh                                                     -- hCoh
 
 /-! ## Fixture D — stateful family (gated prologue, `AgreesStateful.smokeMethod`)
@@ -421,7 +433,7 @@ theorem omnibus_instantiation_stateful :
     ⟨⟨rfl, trivial⟩, rfl, rfl⟩                                           -- hAgrees
     (by native_decide)                                                   -- hNoLoop
     Typed.TypeEnv.empty                                                  -- Γ
-    rfl                                                                  -- hUntag
+    (fun _ => rfl)                                                       -- hUntag (single-public)
     (entryBigintTyped_empty _)                                           -- hTypedEntry
     (vacuousArith (by native_decide))                                    -- hTsmTyped
     (by intro bn cond thn els src h
@@ -431,28 +443,132 @@ theorem omnibus_instantiation_stateful :
     (vacuous (by native_decide))                                         -- hMathByteFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
-    (vacuous (by native_decide))                                         -- hHashCallFrag
-    (vacuous (by native_decide))                                         -- hHashAssertFrag
-    (vacuous (by native_decide))                                         -- hHashChainFrag
-    (fun _ => ⟨"pre", .byteString, Stack.TxContext.sampleCtx, omniStatefulSig,
+    (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashAssertFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashChainFrag
+    (fun _ _ => ⟨"pre", .byteString, Stack.TxContext.sampleCtx, omniStatefulSig,
       omniStatefulPreimage, [],
       rfl, rfl, by decide, by decide,
       Stack.ValidTxContext.sampleCtx_valid, rfl, rfl, rfl,
       omniStatefulSig_spec⟩)                                             -- hStatefulFrag (LIVE)
-    (vacuous (by native_decide))                                         -- hStatefulFullFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFullFrag
     (vacuous (by native_decide))                                         -- hDispatchFrag
     (vacuous (by native_decide))                                         -- hDispatchMixedFrag
-    (vacuousAssert (by native_decide))                                   -- hValueTruthy
+    (fun _ => vacuousAssert (by native_decide))                          -- hValueTruthy
     omniStateful_coh                                                     -- hCoh
+
+/-! ## Fixture D' — WIDENED stateful family (prologue + state-output epilogue)
+
+`verify(sats, stateVal, pre)` with the composed
+`check_preimage ; assert ; add_output` body on the sample BIP-143
+context (`AgreesStateful.smokeFullMethod`; witnesses mirror
+`smoke_statefulFull_consume_fires`).  The body ends in `addOutput`
+(`bodyEndsInAssert = false`), but the re-keyed `hValueTruthy` premise is
+EXEMPT on the discharged statefulFull path (`statefulFullDischargedB =
+true` refutes its antecedent): the deployed bytes either ABORT at
+`OP_CHECKSIGVERIFY` (rejected witness) or complete with the NONEMPTY
+serialized output on top — no truthiness obligation reaches the
+harness.  Previously NOT instantiable (module docstring, finding 1). -/
+
+def omniSfProg : ANFProgram :=
+  { contractName := "SF",
+    properties := AgreesStateful.smokeFullProps,
+    methods := [AgreesStateful.smokeFullMethod] }
+
+def omniSfPreimage : ByteArray :=
+  Stack.TxContext.buildPreimage Stack.TxContext.sampleCtx
+
+def omniSfAnf : State :=
+  { params := [("sats", .vBigint 1000), ("stateVal", .vBigint 7),
+               ("pre", .vBytes omniSfPreimage)] }
+
+def omniSfCp : ByteArray := ByteArray.mk #[0xAA, 0xBB, 0xCC]
+
+noncomputable def omniSfSig : ByteArray :=
+  Classical.choose
+    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
+      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
+
+theorem omniSfSig_spec :
+    RunarVerification.ANF.Eval.Crypto.authBackend.checkSig omniSfSig
+        AgreesStateful.stG
+      = RunarVerification.ANF.Eval.Crypto.checkPreimage omniSfPreimage :=
+  Classical.choose_spec
+    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
+      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
+
+noncomputable def omniSfStk : StackState :=
+  { stack := [.vBytes omniSfPreimage, .vBigint 7, .vBigint 1000,
+              .vBytes omniSfSig, .vBytes omniSfCp] }
+
+def omniSfBytes : ByteArray :=
+  Emit.emitFast (peepholeProgram (Lower.lower omniSfProg))
+
+def omniSfTsm : Agrees.TaggedStackMap :=
+  [("pre", Agrees.SlotKind.param), ("stateVal", Agrees.SlotKind.param),
+   ("sats", Agrees.SlotKind.param)]
+
+theorem omniSf_coh : Agrees.tsmCoherent omniSfAnf omniSfTsm := by
+  intro s hs
+  simp only [omniSfTsm, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with h | h | h <;> subst h <;> rfl
+
+/-- **Omnibus instantiation — WIDENED stateful family (statefulFull).** -/
+theorem omnibus_instantiation_statefulFull :
+    Stack.Eval.acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP omniSfProg.methods omniSfAnf
+        AgreesStateful.smokeFullMethod.body)
+      (runParsedBytes omniSfBytes omniSfStk) :=
+  compileSafe_observational_correct_modulo_codegen_axioms
+    omniSfProg
+    (by native_decide)                                                   -- hWF
+    AgreesStateful.smokeFullMethod omniSfBytes
+    (by unfold omniSfProg; simp)                                         -- hMem
+    rfl                                                                  -- hPublic
+    (EntryDischarge.compileSafe_of_producesBool _ _ (by native_decide))  -- hSafe
+    omniSfAnf omniSfStk
+    omniSfTsm
+    ⟨⟨rfl, rfl, rfl, trivial⟩, rfl, rfl⟩                                 -- hAgrees
+    (by native_decide)                                                   -- hNoLoop
+    Typed.TypeEnv.empty                                                  -- Γ
+    (fun _ => rfl)                                                       -- hUntag (single-public)
+    (entryBigintTyped_empty _)                                           -- hTypedEntry
+    (vacuousArith (by native_decide))                                    -- hTsmTyped
+    (by intro bn cond thn els src h
+        simp [AgreesStateful.smokeFullMethod, AgreesStateful.statefulFullBody,
+          Stack.StatefulBridge.gatedStatefulPrologueBody,
+          Stack.AgreesD2.statefulPrologueBody,
+          Stack.AgreesD2.statefulEpilogueBody] at h)                     -- hIfValTyped
+    (vacuous (by native_decide))                                         -- hMathByteFrag
+    (vacuous (by native_decide))                                         -- hUpdatePropFrag
+    (vacuous (by native_decide))                                         -- hMethodCallFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashAssertFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashChainFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFrag
+    (fun _ _ => ⟨"pre", "sats", "stateVal", "count", .bigint, .bigint,
+      .byteString, Stack.TxContext.sampleCtx, omniSfSig, omniSfPreimage,
+      omniSfCp, ByteArray.mk #[7, 0, 0, 0, 0, 0, 0, 0], ByteArray.mk #[12, 0],
+      ByteArray.mk #[0xE8, 0x03, 0, 0, 0, 0, 0, 0], 7, 1000, [],
+      rfl, rfl, rfl, by native_decide,
+      Stack.ValidTxContext.sampleCtx_valid, rfl, rfl, rfl, rfl, rfl,
+      by native_decide, by native_decide, by native_decide,
+      by native_decide, by native_decide, by native_decide,
+      omniSfSig_spec⟩)                                                   -- hStatefulFullFrag (LIVE)
+    (vacuous (by native_decide))                                         -- hDispatchFrag
+    (vacuous (by native_decide))                                         -- hDispatchMixedFrag
+    (vacuousAssert (by native_decide))                                   -- hValueTruthy (EXEMPT path)
+    omniSf_coh                                                           -- hCoh
 
 /-! ## Fixture E — mixed dispatch family (`MX`, selector 0 / passthrough arm)
 
 Two public methods: passthrough `ma(x) { t0 := x }` and the hash-lock
-`unlock(expected, h)`.  Instantiated on selector 0.  The witness value
-for `x` is `0` — the one value that lets the omnibus's global alignment
-bundle (`hUntag`+`hAgrees`+`hCoh`, which pin `x`'s slot to the stack TOP
-= the selector) coexist with the keyed dispatch bundle (see module
-docstring, honest note 2). -/
+`unlock(expected, h)`.  Instantiated on selector 0.  Post the 2026-06-12
+premise-shape repair `hUntag` is single-public-gated (vacuous here), so
+the witness value for `x` is no longer forced to coincide with the
+selector; the fixture keeps `x = 0` and its original `tsm` for
+continuity (the gated `hUntag` is still satisfiable as supplied).  The
+previously-uninstantiable selector-1 hash-lock arm is Fixture E' below. -/
 
 def omniMxMa : ANFMethod :=
   { name := "ma", params := [ANFParam.mk "x" .bigint],
@@ -519,26 +635,89 @@ theorem omnibus_instantiation_dispatchMixed :
     ⟨⟨rfl, trivial⟩, rfl, rfl⟩                                           -- hAgrees
     (by native_decide)                                                   -- hNoLoop
     (Typed.TypeEnv.empty.extend "x" .bigint)                             -- Γ
-    rfl                                                                  -- hUntag
+    (fun _ => rfl)                                                       -- hUntag (gate false; still satisfiable)
     omniMxEnv_entryBigintTyped                                           -- hTypedEntry
     (fun _ => omniMx_wt)                                                 -- hTsmTyped
     (by intro bn cond thn els src h; simp [omniMxMa] at h)               -- hIfValTyped
     (vacuous (by native_decide))                                         -- hMathByteFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
-    (vacuous (by native_decide))                                         -- hHashCallFrag
-    (vacuous (by native_decide))                                         -- hHashAssertFrag
-    (vacuous (by native_decide))                                         -- hHashChainFrag
-    (vacuous (by native_decide))                                         -- hStatefulFrag
-    (vacuous (by native_decide))                                         -- hStatefulFullFrag
+    (vacuousOf (by native_decide))                                       -- hHashCallFrag (multi-public)
+    (vacuousOf (by native_decide))                                       -- hHashAssertFrag (multi-public)
+    (vacuousOf (by native_decide))                                       -- hHashChainFrag (multi-public)
+    (vacuousOf (by native_decide))                                       -- hStatefulFrag (multi-public)
+    (vacuousOf (by native_decide))                                       -- hStatefulFullFrag (multi-public)
     (vacuous (by native_decide))                                         -- hDispatchFrag
     (fun _ => ⟨0, [.vBigint 7],
       (by rw [omniMx_filter]; rfl),                                      -- selector index
       rfl,                                                               -- witness-headed stack
       (fun _ => ⟨"x", "t0", .bigint, none, .vBigint 0, rfl, rfl, rfl⟩),  -- passthrough arm
       (vacuous (by native_decide))⟩)                                     -- hash-lock arm (vacuous)
-    (fun _ => Stack.Eval.truthy_of_scriptAccepts (by native_decide))     -- hValueTruthy (LIVE)
+    (fun _ _ => Stack.Eval.truthy_of_scriptAccepts (by native_decide))   -- hValueTruthy (LIVE)
     omniMx_coh                                                           -- hCoh
+
+/-! ## Fixture E' — mixed dispatch family (`MX`, selector 1 / HASH-LOCK arm)
+
+The previously-unsatisfiable arm (module docstring, finding 2): selector
+`1` selects `unlock(expected, h)`, whose keyed dispatch bundle pins the
+witness stack to `selector :: vBytes h :: vBytes expected`.  With
+`hUntag` and the method-local entry-peel premises single-public-gated,
+the harness passes `tsm := []` (its `agreesTagged` carries only
+props/outputs equality) and discharges the gated premises vacuously —
+including `hHashAssertFrag`, whose method-local classifier DOES fire on
+`unlock` but whose consequent pins a non-selector-headed stack. -/
+
+def omniMxArgB : ByteArray := ByteArray.mk #[1, 2, 3]
+def omniMxExpB : ByteArray := ByteArray.mk #[4, 5]
+
+def omniMxHLAnf : State :=
+  { params := [("expected", .vBytes omniMxExpB), ("h", .vBytes omniMxArgB)] }
+
+def omniMxHLStk : StackState :=
+  { stack := [.vBigint 1, .vBytes omniMxArgB, .vBytes omniMxExpB] }
+
+/-- **Omnibus instantiation — mixed dispatch family (selector 1, hash-lock).** -/
+theorem omnibus_instantiation_dispatchMixed_hashLock :
+    Stack.Eval.acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP omniMxProg.methods omniMxHLAnf
+        omniMxUnlock.body)
+      (runParsedBytes omniMxBytes omniMxHLStk) :=
+  compileSafe_observational_correct_modulo_codegen_axioms
+    omniMxProg
+    (by native_decide)                                                   -- hWF
+    omniMxUnlock omniMxBytes
+    (by unfold omniMxProg; simp)                                         -- hMem
+    rfl                                                                  -- hPublic
+    (EntryDischarge.compileSafe_of_producesBool _ _ (by native_decide))  -- hSafe
+    omniMxHLAnf omniMxHLStk
+    []                                                                   -- tsm (free for dispatch)
+    ⟨trivial, rfl, rfl⟩                                                  -- hAgrees (empty tsm)
+    (by native_decide)                                                   -- hNoLoop
+    Typed.TypeEnv.empty                                                  -- Γ
+    (vacuousOf (by native_decide))                                       -- hUntag (multi-public)
+    (entryBigintTyped_empty _)                                           -- hTypedEntry
+    (vacuousArith (by native_decide))                                    -- hTsmTyped
+    (by intro bn cond thn els src h
+        simp [omniMxUnlock, AgreesHashCall.hashAssertBody] at h)         -- hIfValTyped
+    (vacuous (by native_decide))                                         -- hMathByteFrag
+    (vacuous (by native_decide))                                         -- hUpdatePropFrag
+    (vacuous (by native_decide))                                         -- hMethodCallFrag
+    (vacuousOf (by native_decide))                                       -- hHashCallFrag (multi-public)
+    (vacuousOf (by native_decide))                                       -- hHashAssertFrag (multi-public)
+    (vacuousOf (by native_decide))                                       -- hHashChainFrag (multi-public)
+    (vacuousOf (by native_decide))                                       -- hStatefulFrag (multi-public)
+    (vacuousOf (by native_decide))                                       -- hStatefulFullFrag (multi-public)
+    (vacuous (by native_decide))                                         -- hDispatchFrag
+    (fun _ => ⟨1, [.vBytes omniMxArgB, .vBytes omniMxExpB],
+      (by rw [omniMx_filter]; rfl),                                      -- selector index
+      rfl,                                                               -- witness-headed stack
+      (vacuous (by native_decide)),                                      -- passthrough arm (vacuous)
+      (fun _ => ⟨"d", "ok", "a0", "h", "expected", "sha256", .byteString,
+        .byteString, none, none, none, omniMxArgB, omniMxExpB, [],
+        rfl, rfl, Or.inl rfl, by decide, rfl, rfl, rfl,
+        by decide⟩)⟩)                                                    -- hash-lock arm (LIVE)
+    (fun _ => vacuousAssert (by native_decide))                          -- hValueTruthy
+    (by intro s hs; simp at hs)                                          -- hCoh (empty tsm)
 
 /-! ## Fixture F — REAL conformance fixture `basic-p2pkh` (crypto_call fallback)
 
@@ -624,27 +803,29 @@ theorem omnibus_instantiation_p2pkh :
     ⟨⟨rfl, rfl, trivial⟩, rfl, rfl⟩                                      -- hAgrees
     (by native_decide)                                                   -- hNoLoop
     Typed.TypeEnv.empty                                                  -- Γ
-    rfl                                                                  -- hUntag
+    (fun _ => rfl)                                                       -- hUntag (single-public)
     (entryBigintTyped_empty _)                                           -- hTypedEntry
     (vacuousArith (by native_decide))                                    -- hTsmTyped
     (by intro bn cond thn els src h; simp [omniP2pkhUnlock] at h)        -- hIfValTyped
     (vacuous (by native_decide))                                         -- hMathByteFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
-    (vacuous (by native_decide))                                         -- hHashCallFrag
-    (vacuous (by native_decide))                                         -- hHashAssertFrag
-    (vacuous (by native_decide))                                         -- hHashChainFrag
-    (vacuous (by native_decide))                                         -- hStatefulFrag
-    (vacuous (by native_decide))                                         -- hStatefulFullFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashAssertFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashChainFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFullFrag
     (vacuous (by native_decide))                                         -- hDispatchFrag
     (vacuous (by native_decide))                                         -- hDispatchMixedFrag
-    (vacuousAssert (by native_decide))                                   -- hValueTruthy
+    (fun _ => vacuousAssert (by native_decide))                          -- hValueTruthy
     omniP2pkh_coh                                                        -- hCoh
 
 /-! ## Trust-footprint evidence (build-time) -/
 
 #print axioms omnibus_instantiation_arith
 #print axioms omnibus_instantiation_p2pkh
+#print axioms omnibus_instantiation_statefulFull
+#print axioms omnibus_instantiation_dispatchMixed_hashLock
 
 end OmnibusInstantiation
 
@@ -688,7 +869,9 @@ def main : IO UInt32 := do
   IO.println "  omniCounter    update_prop consume                 synthetic (counter inc)"
   IO.println "  omniHashLock   crypto_call hash-then-assert        synthetic (hash-lock)"
   IO.println "  omniStateful   stateful consume (gated prologue)   synthetic (stateful)"
+  IO.println "  omniSf         statefulFull consume (widened)      synthetic (SF)"
   IO.println "  omniDispatch   mixed dispatch consume (selector 0) synthetic (MX)"
+  IO.println "  omniMxHL       mixed dispatch consume (selector 1) synthetic (MX hash-lock)"
   IO.println "  omniP2pkh      crypto_call fallback sub-omnibus    REAL basic-p2pkh golden"
   IO.println ""
   IO.println "Each row is a zero-sorry theorem `omnibus_instantiation_*` applying"

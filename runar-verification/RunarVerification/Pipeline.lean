@@ -8265,6 +8265,47 @@ theorem compileSafe_observational_correct_mathByte_consume
     AgreesA4.bodyEndsInAssert_false_of_noLen anfM.body tsm hShapeNoLen
   exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
 
+/-- **The statefulFull DISCHARGED-PATH guard (2026-06-12 premise-shape
+repair).**  TRUE exactly when the omnibus dispatch reaches the
+`statefulFull` consume theorem: the widened classifier fires, the
+program is single-public, and the method is not constructor-named.
+
+The keyed `hValueTruthy` premise is EXEMPTED on this path.  The widened
+body ends in `addOutput` (`bodyEndsInAssert = false`), so the
+truthiness premise would go LIVE — yet it is not mechanically
+dischargeable by the harness: the deployed run's completion is gated on
+the OPAQUE `authBackend.checkSig` verdict (`native_decide` cannot run
+the script).  Semantically the premise is TRUE for the fragment — on a
+rejected witness the bytes ABORT at `OP_CHECKSIGVERIFY` (they never
+complete with a falsy top), and on an accepted witness the top is the
+NONEMPTY serialized output (`runOps_statefulFullParsedOps_scriptAccepts`)
+— and the discharged consume theorem needs no truthiness premise at
+all, so exempting the path demands nothing the proof uses. -/
+def statefulFullDischargedB (p : ANFProgram) (anfM : ANFMethod) : Bool :=
+  RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
+      p.properties anfM
+    && decide ((p.methods.filter (·.isPublic)).length < 2)
+    && (anfM.name != "constructor")
+
+/-- A `statefulFullConsumeShapeBool`-true body starts with a
+`check_preimage` binding, so `bindingsUseCheckPreimage` is true — the
+omnibus's non-stateful subtree can refute the classifier (and hence the
+discharged-path guard) from its own `¬hStateful` context. -/
+theorem statefulFullShape_usesCheckPreimage (props : List ANFProperty)
+    (m : ANFMethod)
+    (h : RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
+        props m = true) :
+    Lower.bindingsUseCheckPreimage m.body = true := by
+  obtain ⟨pre, sats, stateVal, _pn, _tyS, _tyV, _tyP, _hParams, hBody, _hProps,
+    _hNames⟩ :=
+    RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool_extract
+      props m h
+  rw [hBody]
+  simp [RunarVerification.Stack.AgreesStateful.statefulFullBody,
+    Stack.StatefulBridge.gatedStatefulPrologueBody,
+    Stack.AgreesD2.statefulPrologueBody, Stack.AgreesD2.statefulEpilogueBody,
+    Lower.bindingsUseCheckPreimage]
+
 /--
 **Harness-level codegen-soundness theorem (Phase D harness integration).**
 
@@ -8321,6 +8362,31 @@ forwarded to every value-terminated family branch and both surviving
 axioms; it is vacuous for assert-terminated bodies and for every
 frontend-reachable program (the TS validator forces public methods to
 end in assert).
+
+**Premise-shape repair (2026-06-12, harness findings from
+`tests/OmnibusInstantiation.lean`).**  Two premise families were
+wrong-shaped — the omnibus could not be instantiated for two of its own
+discharged fragments:
+
+* `hValueTruthy` is now keyed off `statefulFullDischargedB p anfM =
+  false`: the widened stateful body ends in `addOutput`, which made the
+  truthiness obligation go LIVE although the statefulFull consume
+  theorem never consumes it and the harness cannot discharge it (the
+  run is gated on the opaque `authBackend.checkSig` verdict).  Off the
+  discharged path the omnibus derives the unguarded fact from its own
+  branch context.
+* `hUntag` and the five method-local entry-peel premises
+  (`hHashCallFrag` / `hHashAssertFrag` / `hHashChainFrag` /
+  `hStatefulFrag` / `hStatefulFullFrag`) are now gated on the
+  single-public filter length: their consequents pin `tsm` /
+  the FULL entry-stack layout, which is wrong-shaped for multi-method
+  dispatch programs whose entry stack is selector-headed.  All consuming
+  branches sit in single-public subtrees and derive the gate from their
+  own `hSinglePublic` context; dispatch instantiations pass `tsm := []`.
+
+Both previously-uninstantiable fragments (statefulFull; the
+mixed-dispatch hash-lock arm) now have per-fixture instantiations in
+`tests/OmnibusInstantiation.lean`.
 -/
 theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
@@ -8340,7 +8406,20 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- satisfies it trivially.
     (hNoLoop : programUsesLoopB p = false)
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
-    (hUntag :
+    -- **Single-public tsm alignment (RE-KEYED 2026-06-12 premise-shape
+    -- repair).**  `hUntag` pins `tsm` to the SELECTED method's reversed
+    -- param list — correct for single-public programs (the entry stack is
+    -- exactly the pushed args), but WRONG-SHAPED for multi-method dispatch
+    -- programs, whose entry stack is SELECTOR-headed (`vBigint i :: args`):
+    -- together with `hAgrees` it pinned the selected method's first param
+    -- slot to the selector value, jointly unsatisfiable with e.g. the
+    -- mixed-dispatch hash-lock arm's `.vBytes` entry facts.  Keyed on the
+    -- single-public filter length, it is VACUOUS for dispatch programs
+    -- (which pass `tsm := []`; `agreesTagged []` then only carries
+    -- props/outputs equality).  Every consuming branch (arith, math_byte,
+    -- update_prop, if_val) sits in the single-public subtree and derives
+    -- the antecedent from its own `hSinglePublic` context.
+    (hUntag : (p.methods.filter (·.isPublic)).length < 2 →
       Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     -- **Wave 39 arith typed-entry premise (keyed).**  The arith branch needs
@@ -8417,7 +8496,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- Keyed on the DECIDABLE classifier, it is VACUOUS for every non-hash body, so
     -- the omnibus stays jointly satisfiable; its only consumer is the conformance
     -- harness, which discharges it per fixture from the bytes-typed entry.
-    (hHashCallFrag :
+    -- ADDITIONALLY gated on single-public (2026-06-12 premise-shape repair,
+    -- with the four hash/stateful peel premises below): the classifier is
+    -- METHOD-local, but the consequent pins the FULL entry-stack layout —
+    -- wrong-shaped for dispatch programs, whose entry stack is
+    -- selector-headed.  Each premise's only consuming branch sits in a
+    -- single-public subtree of the omnibus dispatch.
+    (hHashCallFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true →
         ∃ (bn arg func : String) (src : Option SourceLoc)
           (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
@@ -8436,7 +8521,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- is VACUOUS for every other body, so the omnibus stays jointly
     -- satisfiable; its only consumer is the conformance harness, which
     -- discharges it per fixture from the bytes-typed entry.
-    (hHashAssertFrag :
+    (hHashAssertFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesHashCall.hashAssertConsumeShapeBool anfM = true →
         ∃ (d ok anm arg expected func : String) (tyE tyA : ANFType)
           (s1 s2 s3 : Option SourceLoc) (argBytes expBytes : ByteArray)
@@ -8458,7 +8543,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- witnesses plus the bytes-typed entry are recovered.  Keyed on the
     -- DECIDABLE classifier, VACUOUS for every other body; its only consumer
     -- is the conformance harness.
-    (hHashChainFrag :
+    (hHashChainFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesHashCall.hashChainConsumeShapeBool anfM = true →
         ∃ (d1 d2 arg f1 f2 : String) (ty : ANFType)
           (s1 s2 : Option SourceLoc) (argBytes : ByteArray)
@@ -8487,7 +8572,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- the deployment context (the witness-existence axiom
     -- `StatefulBridge.exists_checkSig_witness_under_validTxContext` shows the
     -- bundle satisfiable for every valid context).
-    (hStatefulFrag :
+    (hStatefulFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
         ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
           (sigV preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
@@ -8514,7 +8599,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- VACUOUS for every non-fragment body, so the omnibus stays jointly
     -- satisfiable.  Its only consumer is the conformance harness, which
     -- discharges it per fixture from the deployment context.
-    (hStatefulFullFrag :
+    (hStatefulFullFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
           p.properties anfM = true →
         ∃ (pre sats stateVal pn : String) (tyS tyV tyP : ANFType)
@@ -8611,7 +8696,20 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- frontend-reachable program.  Its only consumer is the conformance
     -- harness, which discharges it per fixture by `native_decide` on the
     -- concrete run.
-    (hValueTruthy : Lower.bodyEndsInAssert anfM.body = false →
+    -- RE-KEYED on the statefulFull discharged-path guard (2026-06-12
+    -- premise-shape repair): the widened stateful body ends in `addOutput`
+    -- (`bodyEndsInAssert = false`), which made this premise go LIVE for the
+    -- statefulFull fragment although its consume theorem needs no
+    -- truthiness fact and the harness cannot discharge it mechanically
+    -- (the run is gated on the opaque `authBackend.checkSig` verdict; on a
+    -- rejected witness the bytes ABORT at `OP_CHECKSIGVERIFY`, on an
+    -- accepted one the top is the nonempty serialized output — see
+    -- `statefulFullDischargedB`).  Off the discharged path the omnibus
+    -- recovers the unguarded fact from its branch context (the classifier
+    -- is refutable from `¬hStateful`, the filter length from `hStMulti`,
+    -- the name disequality from `hStFullName`).
+    (hValueTruthy : statefulFullDischargedB p anfM = false →
+      Lower.bodyEndsInAssert anfM.body = false →
       ∀ s, runParsedBytes bytes initialStack = .ok s →
         topTruthy s.stack = true)
     (hCoh : Agrees.tsmCoherent initialAnf tsm) :
@@ -8637,7 +8735,12 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     -- constructor-named methods) fall through to the sound crypto_call
     -- fallback — NO new axiom is introduced.
     by_cases hStMulti : (p.methods.filter (·.isPublic)).length ≥ 2
-    · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+    · -- Multi-public + checkPreimage: off the discharged path (the filter
+      -- length refutes the guard's single-public conjunct).
+      have hValueTruthy := hValueTruthy (by
+        simp [statefulFullDischargedB,
+          decide_eq_false (Nat.not_lt.mpr hStMulti)])
+      exact compileSafe_observational_correct_modulo_crypto_call_codegen
         p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
     · have hStSingle : p.methods.filter (·.isPublic) = [anfM] := by
         have hAnfMem : anfM ∈ p.methods.filter (·.isPublic) :=
@@ -8652,6 +8755,11 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
         rw [ha] at hAnfMem ⊢
         have : anfM = a := by simpa using hAnfMem
         rw [this]
+      -- Single-public: unlock the single-public-gated keyed peel premises.
+      have hStLt : (p.methods.filter (·.isPublic)).length < 2 := by
+        simp [hStSingle]
+      have hStatefulFullFrag := hStatefulFullFrag hStLt
+      have hStatefulFrag := hStatefulFrag hStLt
       -- WIDENED fragment first: prologue + state-output epilogue.
       by_cases hStFullShape :
           RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
@@ -8669,9 +8777,19 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
             var2F sats8F svVF satsVF restF hFValid hFPreLink hFAnfPre
             hFAnfSats hFAnfSv hFStk hFSv8 hFSv8sz hFLt hFVar hFVar2
             hFSats8 hFSig
-        · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+        · -- Constructor-named: off the discharged path (the guard's name
+          -- conjunct is false).
+          have hNmEq : anfM.name = "constructor" :=
+            Classical.byContradiction (fun h => hStFullName h)
+          have hValueTruthy := hValueTruthy (by
+            simp [statefulFullDischargedB, hNmEq])
+          exact compileSafe_observational_correct_modulo_crypto_call_codegen
             p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
-      · by_cases hStShape :
+      · -- Widened classifier FALSE: off the discharged path for the whole
+        -- residual stateful subtree.
+        have hValueTruthy := hValueTruthy (by
+          simp [statefulFullDischargedB, Bool.eq_false_iff.mpr hStFullShape])
+        by_cases hStShape :
             RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true
         · by_cases hStName : anfM.name ≠ "constructor"
           · obtain ⟨pre, ty, ctx, sigV, preimage, restV, hStParams, hStBody,
@@ -8685,7 +8803,22 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
         · exact compileSafe_observational_correct_modulo_crypto_call_codegen
             p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
-  · by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
+  · -- Non-stateful subtree: the statefulFull classifier is refutable from
+    -- `¬hStateful` (its body starts with `check_preimage`), so the re-keyed
+    -- truthiness premise yields its unguarded form for every branch below.
+    have hValueTruthy : Lower.bodyEndsInAssert anfM.body = false →
+        ∀ s, runParsedBytes bytes initialStack = .ok s →
+          topTruthy s.stack = true := by
+      apply hValueTruthy
+      have hCls : RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
+          p.properties anfM = false := by
+        cases hc : RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
+            p.properties anfM
+        · rfl
+        · exact absurd (statefulFullShape_usesCheckPreimage p.properties anfM hc)
+            hStateful
+      simp [statefulFullDischargedB, hCls]
+    by_cases hDispatch : (p.methods.filter (·.isPublic)).length ≥ 2
     · -- **WIDENED mixed dispatch consume branch (2026-06-11 dispatch
       -- widening; tried BEFORE the passthrough-only classifier — the mixed
       -- fragment strictly contains it, so this branch subsumes the legacy
@@ -8739,6 +8872,14 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
         rw [ha] at hAnfMem ⊢
         have : anfM = a := by simpa using hAnfMem
         rw [this]
+      -- Single-public: unlock the single-public-gated alignment + peel
+      -- premises (2026-06-12 premise-shape repair).
+      have hSpLt : (p.methods.filter (·.isPublic)).length < 2 := by
+        simp [hSinglePublic]
+      have hUntag := hUntag hSpLt
+      have hHashCallFrag := hHashCallFrag hSpLt
+      have hHashAssertFrag := hHashAssertFrag hSpLt
+      have hHashChainFrag := hHashChainFrag hSpLt
       -- **Wave 39 consume-arith branch (replaces the retired arith axiom).**
       by_cases hArithConsume :
           anfM.name ≠ "constructor" ∧
@@ -9030,7 +9171,9 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     -- satisfies it trivially.
     (hNoLoop : programUsesLoopB p = false)
     (Γ : RunarVerification.ANF.WellTyped.TypeEnv)
-    (hUntag :
+    -- Single-public-gated (2026-06-12 premise-shape repair); forwarded
+    -- verbatim to the omnibus, see the comment there.
+    (hUntag : (p.methods.filter (·.isPublic)).length < 2 →
       Agrees.untagSm tsm = List.reverse (anfM.params.map (·.name)))
     (hTypedEntry : RunarVerification.ANF.WellTyped.EntryBigintTyped Γ initialAnf)
     (hTsmTyped :
@@ -9068,7 +9211,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     -- Keyed on the DECIDABLE classifier, it is VACUOUS for every non-hash body, so
     -- the omnibus stays jointly satisfiable; its only consumer is the conformance
     -- harness, which discharges it per fixture from the bytes-typed entry.
-    (hHashCallFrag :
+    -- ADDITIONALLY gated on single-public (2026-06-12 premise-shape repair,
+    -- with the four hash/stateful peel premises below): the classifier is
+    -- METHOD-local, but the consequent pins the FULL entry-stack layout —
+    -- wrong-shaped for dispatch programs, whose entry stack is
+    -- selector-headed.  Each premise's only consuming branch sits in a
+    -- single-public subtree of the omnibus dispatch.
+    (hHashCallFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesHashCall.hashCallConsumeShapeBool anfM = true →
         ∃ (bn arg func : String) (src : Option SourceLoc)
           (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
@@ -9087,7 +9236,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     -- is VACUOUS for every other body, so the omnibus stays jointly
     -- satisfiable; its only consumer is the conformance harness, which
     -- discharges it per fixture from the bytes-typed entry.
-    (hHashAssertFrag :
+    (hHashAssertFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesHashCall.hashAssertConsumeShapeBool anfM = true →
         ∃ (d ok anm arg expected func : String) (tyE tyA : ANFType)
           (s1 s2 s3 : Option SourceLoc) (argBytes expBytes : ByteArray)
@@ -9109,7 +9258,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     -- witnesses plus the bytes-typed entry are recovered.  Keyed on the
     -- DECIDABLE classifier, VACUOUS for every other body; its only consumer
     -- is the conformance harness.
-    (hHashChainFrag :
+    (hHashChainFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesHashCall.hashChainConsumeShapeBool anfM = true →
         ∃ (d1 d2 arg f1 f2 : String) (ty : ANFType)
           (s1 s2 : Option SourceLoc) (argBytes : ByteArray)
@@ -9134,7 +9283,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     -- classifier, it is VACUOUS for every non-canonical body, so the omnibus
     -- stays jointly satisfiable.  Its only consumer is the conformance
     -- harness, which discharges it per fixture from the deployment context.
-    (hStatefulFrag :
+    (hStatefulFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
         ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
           (sigV preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
@@ -9161,7 +9310,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     -- VACUOUS for every non-fragment body, so the omnibus stays jointly
     -- satisfiable.  Its only consumer is the conformance harness, which
     -- discharges it per fixture from the deployment context.
-    (hStatefulFullFrag :
+    (hStatefulFullFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
           p.properties anfM = true →
         ∃ (pre sats stateVal pn : String) (tyS tyV tyP : ANFType)
@@ -9236,7 +9385,20 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     -- **Value-terminated-body truthiness premise (keyed; 2026-06-11
     -- truthy-top success-bit repair).**  Forwarded verbatim to the omnibus;
     -- see the comment there.
-    (hValueTruthy : Lower.bodyEndsInAssert anfM.body = false →
+    -- RE-KEYED on the statefulFull discharged-path guard (2026-06-12
+    -- premise-shape repair): the widened stateful body ends in `addOutput`
+    -- (`bodyEndsInAssert = false`), which made this premise go LIVE for the
+    -- statefulFull fragment although its consume theorem needs no
+    -- truthiness fact and the harness cannot discharge it mechanically
+    -- (the run is gated on the opaque `authBackend.checkSig` verdict; on a
+    -- rejected witness the bytes ABORT at `OP_CHECKSIGVERIFY`, on an
+    -- accepted one the top is the nonempty serialized output — see
+    -- `statefulFullDischargedB`).  Off the discharged path the omnibus
+    -- recovers the unguarded fact from its branch context (the classifier
+    -- is refutable from `¬hStateful`, the filter length from `hStMulti`,
+    -- the name disequality from `hStFullName`).
+    (hValueTruthy : statefulFullDischargedB p anfM = false →
+      Lower.bodyEndsInAssert anfM.body = false →
       ∀ s, runParsedBytes bytes initialStack = .ok s →
         topTruthy s.stack = true)
     (hCoh : Agrees.tsmCoherent initialAnf tsm)

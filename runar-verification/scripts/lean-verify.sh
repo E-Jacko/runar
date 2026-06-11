@@ -6,6 +6,12 @@
 # under `tests/` and any future tracked Lean file that is not imported by the
 # root module, so stale proof sketches cannot silently survive.
 #
+# NOTE: this script BUILDS the modules only — it does not RUN
+# `lake exe pipelineConformance`, which overflows the C stack at the macOS
+# default `ulimit -s` (8 MB) on the multi-MB crypto fixtures. Run that
+# binary via `scripts/run-pipeline-conformance.sh`, which raises the
+# main-thread stack limit (`ulimit -s unlimited` / 65520 KiB) first.
+#
 # Run from anywhere.
 
 set -euo pipefail
