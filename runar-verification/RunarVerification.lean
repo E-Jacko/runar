@@ -9,6 +9,7 @@ import RunarVerification.Crypto.NistEC
 import RunarVerification.Crypto.Spec
 import RunarVerification.Stack.Syntax
 import RunarVerification.Stack.Eval
+import RunarVerification.Stack.Accept
 import RunarVerification.Stack.Lower
 import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
