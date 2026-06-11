@@ -587,9 +587,13 @@ theorem runOpcode_WITHIN_def (s : StackState) :
                | _, _, _ => .error (.typeError "OP_WITHIN expects ints")
            | _ => .error (.unsupported "OP_WITHIN popN bug")) := rfl
 
+/-- `OP_LESSTHAN` routes through the consensus-coercing `liftIntBinNum`
+(2026-06-11 stateful-widening repair — see `Eval.asNum?`): byte-vector
+operands of ≤ 4 bytes decode as CScriptNum numbers, matching the real
+VM on parsed numeric pushes above OP_16. -/
 theorem runOpcode_LESSTHAN_def (s : StackState) :
     runOpcode "OP_LESSTHAN" s
-    = liftIntBin s (fun a b => .vBool (decide (a < b))) := rfl
+    = liftIntBinNum s (fun a b => .vBool (decide (a < b))) := rfl
 
 theorem runOpcode_GREATERTHAN_def (s : StackState) :
     runOpcode "OP_GREATERTHAN" s
@@ -892,9 +896,9 @@ theorem runOpcode_LESSTHAN_intInt
     (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
     runOpcode "OP_LESSTHAN" s = .ok ({ s with stack := rest }.push (.vBool (decide (a < b)))) := by
   rw [runOpcode_LESSTHAN_def]
-  unfold liftIntBin
+  unfold liftIntBinNum
   rw [popN_two_local s _ _ rest hStk]
-  simp [asInt?]
+  simp [asNum?, asInt?]
 
 theorem runOpcode_GREATERTHAN_intInt
     (s : StackState) (a b : Int) (rest : List Value)

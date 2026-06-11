@@ -125,6 +125,38 @@ def asNonNegativeNat? (v : Value) : Option Nat :=
   | some i => if i < 0 then none else some i.toNat
   | none => none
 
+/-- **Consensus CScriptNum coercion (2026-06-11 stateful-widening repair).**
+
+On a real Bitcoin Script stack every element is a byte vector, and the
+numeric opcodes decode their operands as little-endian sign-magnitude
+numbers (`CScriptNum`, operand size ≤ 4 bytes pre-Genesis).  Our typed
+VM mostly keeps numbers as `vBigint` — but PARSED scripts re-enter
+numeric pushes above `OP_16` as raw `vBytes` (the wire encodes them as
+pushdata), so a deployed script like the auto-injected stateful
+epilogue's varint encoder (`… push 253; OP_LESSTHAN …`) feeds a byte
+vector to a numeric opcode.  Consensus ACCEPTS that (the bytes ARE the
+number); the bare `asInt?` rejects it.
+
+`asNum?` is the faithful operand coercion: byte vectors of ≤ 4 bytes
+decode via `decodeMinimalLE`; every other value falls back to `asInt?`.
+It is wired into `OP_LESSTHAN` only (the one opcode the discharged
+deployed-bytes walks currently exercise with a byte-encoded literal);
+the remaining numeric opcodes keep the strictly-typed `liftIntBin`
+because the Wave-30 failure-lockstep theorems
+(`AgreesA3.liftIntBin_nonInt_top_isError` and friends) pin the ANF
+type-error ⟷ Stack type-error agreement for `+`/`-`/`*` on byte
+operands, and widening the coercion there would falsify them.  Extend
+opcode-by-opcode (with the matching ANF-side story) as future walks
+require. -/
+def asNum? (v : Value) : Option Int :=
+  match v with
+  | .vBytes b => if b.size ≤ 4 then some (decodeMinimalLE b) else none
+  | v => asInt? v
+
+@[simp] theorem asNum?_vBigint (i : Int) : asNum? (.vBigint i) = some i := rfl
+@[simp] theorem asNum?_vBool (b : Bool) :
+    asNum? (.vBool b) = some (if b then 1 else 0) := rfl
+
 /-! ## Primitive stack-manipulation ops -/
 
 def applyDup (s : StackState) : EvalResult StackState :=
@@ -213,6 +245,21 @@ def liftIntBin (s : StackState) (f : Int → Int → Value) : EvalResult StackSt
           match asInt? a, asInt? b with
           | some ai, some bi => .ok (s'.push (f ai bi))
           | _, _ => .error (.typeError "binary numeric op expects two ints")
+      | _ => .error (.unsupported "binary op popN bug")
+
+/-- `liftIntBin` with the consensus `asNum?` operand coercion (see the
+`asNum?` docstring): byte-vector operands of ≤ 4 bytes decode as
+CScriptNum numbers instead of type-erroring.  Used by `OP_LESSTHAN`
+only (for now). -/
+def liftIntBinNum (s : StackState) (f : Int → Int → Value) : EvalResult StackState :=
+  match popN s 2 with
+  | .error e => .error e
+  | .ok (vs, s') =>
+      match vs with
+      | [b, a] =>
+          match asNum? a, asNum? b with
+          | some ai, some bi => .ok (s'.push (f ai bi))
+          | _, _ => .error (.typeError "binary numeric op expects two numbers")
       | _ => .error (.unsupported "binary op popN bug")
 
 def liftIntUnary (s : StackState) (f : Int → Value) : EvalResult StackState :=
@@ -490,7 +537,10 @@ def runOpcode (code : String) (s : StackState) : EvalResult StackState :=
   | "OP_LSHIFTNUM" => liftIntBin s (fun a b => .vBigint (a * (2 ^ b.toNat)))
   | "OP_RSHIFTNUM" => liftIntBin s (fun a b => .vBigint (a / (2 ^ b.toNat)))
   -- ---------------------------------------------------------------- comparison
-  | "OP_LESSTHAN"           => liftIntBin s (fun a b => .vBool (decide (a < b)))
+  -- Consensus CScriptNum coercion (see `asNum?`): parsed numeric pushes
+  -- above OP_16 re-enter as `vBytes`; `OP_LESSTHAN` decodes them like the
+  -- real VM does (the stateful epilogue's varint encoder pushes 253).
+  | "OP_LESSTHAN"           => liftIntBinNum s (fun a b => .vBool (decide (a < b)))
   | "OP_GREATERTHAN"        => liftIntBin s (fun a b => .vBool (decide (a > b)))
   | "OP_LESSTHANOREQUAL"    => liftIntBin s (fun a b => .vBool (decide (a ≤ b)))
   | "OP_GREATERTHANOREQUAL" => liftIntBin s (fun a b => .vBool (decide (a ≥ b)))
