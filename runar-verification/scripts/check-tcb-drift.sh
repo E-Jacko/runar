@@ -20,7 +20,25 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=71        # −1 (2026-06-08 — dispatch sub-omnibus RETIRED:
+TARGET_AXIOMS=71        # ±0 (2026-06-10 — BIP-143 bridge TIGHTENED, count-neutral:
+                        # `checkPreimage_iff_checkSig_under_validTxContext` in
+                        # Stack/StatefulBridge.lean equated the two backend
+                        # verdicts for UNIVERSALLY quantified sig/pk, which
+                        # forced `authBackend.checkSig` to be a CONSTANT
+                        # function — cryptographically unfaithful. REPLACED by
+                        # the strictly weaker existential
+                        # `exists_checkSig_witness_under_validTxContext`
+                        # (∃ sig, checkSig sig stG = checkPreimage
+                        # (buildPreimage ctx) per valid ctx — true under the
+                        # real-ECDSA reading, constrains nothing off the
+                        # witness). The per-deployment agreement for the
+                        # spender's specific sig is now the `hSig` hypothesis
+                        # of the bridge/consume theorems and a new conjunct of
+                        # the keyed `hStatefulFrag` omnibus premise; the
+                        # existence axiom powers the smokes via
+                        # Classical.choose. See TRUST_MANIFEST.md §3.)
+                        #
+                        # Previous: 71 — −1 (2026-06-08 — dispatch sub-omnibus RETIRED:
                         # `compileSafe_observational_correct_modulo_dispatch_codegen`
                         # is GONE; its branch is discharged by the theorem
                         # `compileSafe_observational_correct_dispatch_consume` for the

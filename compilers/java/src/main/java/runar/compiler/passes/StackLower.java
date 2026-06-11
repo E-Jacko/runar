@@ -672,6 +672,32 @@ public final class StackLower {
             return last <= currentIndex;
         }
 
+        /**
+         * Consume-vs-copy decision for one operand of a multi-operand ANF value.
+         *
+         * <p>{@code operands} is the FULL operand-ref list of the value (including
+         * {@code ref} itself). The load may consume (ROLL / move) the ref only when
+         * this binding is the ref's last use AND the ref occurs exactly once in the
+         * operand list. A ref read at more than one operand position of the same
+         * value must be copied (PICK / DUP) at EVERY position: a consume-mode
+         * bringToTop of a ref already on top of the stack is a no-op, so two
+         * consume-mode loads of the same ref would leave a single slot for an opcode
+         * that pops one item per operand (e.g. {@code t := x + x} underflowing
+         * OP_ADD), or silently pair the opcode with the wrong slot. The original then
+         * stays on the stack and the existing method epilogue cleans it up.
+         * Unreachable from the frontend (every operand gets a fresh temp); reachable
+         * via AnfLoader / CLI --ir hand-written ANF.
+         */
+        boolean operandConsume(String ref, List<String> operands, int currentIndex,
+                               Map<String, Integer> lastUses) {
+            if (!isLastUse(ref, currentIndex, lastUses)) return false;
+            int occurrences = 0;
+            for (String o : operands) {
+                if (o.equals(ref)) occurrences++;
+            }
+            return occurrences <= 1;
+        }
+
         // ---------------- lower_bindings ----------------
 
         void lowerBindings(List<AnfBinding> bindings, boolean terminalAssert) {
@@ -881,8 +907,9 @@ public final class StackLower {
 
         void lowerBinOp(String bindingName, String op, String left, String right,
                         int idx, Map<String, Integer> lastUses, String resultType) {
-            bringToTop(left, isLastUse(left, idx, lastUses));
-            bringToTop(right, isLastUse(right, idx, lastUses));
+            List<String> binOperands = List.of(left, right);
+            bringToTop(left, operandConsume(left, binOperands, idx, lastUses));
+            bringToTop(right, operandConsume(right, binOperands, idx, lastUses));
             sm.pop();
             sm.pop();
 
@@ -1093,7 +1120,7 @@ public final class StackLower {
 
             // General builtin path
             for (String a : args) {
-                bringToTop(a, isLastUse(a, idx, lastUses));
+                bringToTop(a, operandConsume(a, args, idx, lastUses));
             }
             for (int i = 0; i < args.size(); i++) sm.pop();
 
@@ -1134,7 +1161,7 @@ public final class StackLower {
                     "sha256Compress requires 2 arguments: state, block");
             }
             for (String a : args) {
-                bringToTop(a, isLastUse(a, idx, lastUses));
+                bringToTop(a, operandConsume(a, args, idx, lastUses));
             }
             for (int i = 0; i < 2; i++) sm.pop();
 
@@ -1153,7 +1180,7 @@ public final class StackLower {
                     "verifySLHDSA requires 3 arguments: msg, sig, pubkey");
             }
             for (String a : args) {
-                bringToTop(a, isLastUse(a, idx, lastUses));
+                bringToTop(a, operandConsume(a, args, idx, lastUses));
             }
             for (int i = 0; i < 3; i++) sm.pop();
 
@@ -1168,7 +1195,7 @@ public final class StackLower {
         void lowerEcBuiltin(String bindingName, String funcName, List<String> args,
                             int idx, Map<String, Integer> lastUses) {
             for (String a : args) {
-                bringToTop(a, isLastUse(a, idx, lastUses));
+                bringToTop(a, operandConsume(a, args, idx, lastUses));
             }
             for (int i = 0; i < args.size(); i++) sm.pop();
 
@@ -1187,7 +1214,7 @@ public final class StackLower {
                     funcName + " requires 3 arguments: msg, sig, pubkey");
             }
             for (String a : args) {
-                bringToTop(a, isLastUse(a, idx, lastUses));
+                bringToTop(a, operandConsume(a, args, idx, lastUses));
             }
             for (int i = 0; i < args.size(); i++) sm.pop();
 
@@ -1208,7 +1235,7 @@ public final class StackLower {
                     funcName + " requires " + expected + " argument" + (expected == 1 ? "" : "s"));
             }
             for (String a : args) {
-                bringToTop(a, isLastUse(a, idx, lastUses));
+                bringToTop(a, operandConsume(a, args, idx, lastUses));
             }
             for (int i = 0; i < args.size(); i++) sm.pop();
 
@@ -1228,7 +1255,7 @@ public final class StackLower {
                 throw new RuntimeException(funcName + " requires 3 arguments: msg, sig, pubkey");
             }
             for (String a : args) {
-                bringToTop(a, isLastUse(a, idx, lastUses));
+                bringToTop(a, operandConsume(a, args, idx, lastUses));
             }
             for (int i = 0; i < args.size(); i++) sm.pop();
 
@@ -1246,7 +1273,7 @@ public final class StackLower {
                     funcName + " requires 4 arguments: msg, sig, padding, pubkey");
             }
             for (String a : args) {
-                bringToTop(a, isLastUse(a, idx, lastUses));
+                bringToTop(a, operandConsume(a, args, idx, lastUses));
             }
             for (int i = 0; i < args.size(); i++) sm.pop();
 
@@ -1264,7 +1291,7 @@ public final class StackLower {
                     "sha256Finalize requires 3 arguments: state, remaining, msgBitLen");
             }
             for (String a : args) {
-                bringToTop(a, isLastUse(a, idx, lastUses));
+                bringToTop(a, operandConsume(a, args, idx, lastUses));
             }
             for (int i = 0; i < 3; i++) sm.pop();
 
@@ -1298,9 +1325,14 @@ public final class StackLower {
             emitOp(new PushOp(PushValue.of(0)));
             sm.push("");
 
+            // A ref repeated across the combined element list (e.g. the same
+            // pubkey twice) must be copied at every position — see operandConsume.
+            List<String> msigOperands = new ArrayList<>(sigElems);
+            msigOperands.addAll(pkElems);
+
             // Bring each sig element to TOS in declaration order.
             for (String sig : sigElems) {
-                bringToTop(sig, isLastUse(sig, idx, lastUses));
+                bringToTop(sig, operandConsume(sig, msigOperands, idx, lastUses));
             }
 
             // Push nSigs.
@@ -1309,7 +1341,7 @@ public final class StackLower {
 
             // Bring each pubkey element to TOS in declaration order.
             for (String pk : pkElems) {
-                bringToTop(pk, isLastUse(pk, idx, lastUses));
+                bringToTop(pk, operandConsume(pk, msigOperands, idx, lastUses));
             }
 
             // Push nPKs.
@@ -1344,8 +1376,8 @@ public final class StackLower {
             String start = args.get(1);
             String length = args.get(2);
 
-            bringToTop(data, isLastUse(data, idx, lastUses));
-            bringToTop(start, isLastUse(start, idx, lastUses));
+            bringToTop(data, operandConsume(data, args, idx, lastUses));
+            bringToTop(start, operandConsume(start, args, idx, lastUses));
 
             // OP_SPLIT consumes [data, start] -> [left, right]
             sm.pop();
@@ -1360,7 +1392,7 @@ public final class StackLower {
             String rightPart = sm.pop();
             sm.push(rightPart);
 
-            bringToTop(length, isLastUse(length, idx, lastUses));
+            bringToTop(length, operandConsume(length, args, idx, lastUses));
 
             // OP_SPLIT consumes [right, length] -> [result, remainder]
             sm.pop();
@@ -1393,8 +1425,8 @@ public final class StackLower {
             String a = args.get(0);
             String b = args.get(1);
 
-            bringToTop(a, isLastUse(a, idx, lastUses));
-            bringToTop(b, isLastUse(b, idx, lastUses));
+            bringToTop(a, operandConsume(a, args, idx, lastUses));
+            bringToTop(b, operandConsume(b, args, idx, lastUses));
 
             // DUP b, assert b != 0, then divide / mod.
             // Stack: a b -> a b b -> a b (b!=0) -> [verify pops] -> a b -> a/b or a%b
@@ -1427,8 +1459,8 @@ public final class StackLower {
             String amount = args.get(0);
             String bps = args.get(1);
 
-            bringToTop(amount, isLastUse(amount, idx, lastUses));
-            bringToTop(bps, isLastUse(bps, idx, lastUses));
+            bringToTop(amount, operandConsume(amount, args, idx, lastUses));
+            bringToTop(bps, operandConsume(bps, args, idx, lastUses));
 
             sm.pop();
             sm.pop();
@@ -1460,14 +1492,14 @@ public final class StackLower {
             String lo = args.get(1);
             String hi = args.get(2);
 
-            bringToTop(val, isLastUse(val, idx, lastUses));
-            bringToTop(lo, isLastUse(lo, idx, lastUses));
+            bringToTop(val, operandConsume(val, args, idx, lastUses));
+            bringToTop(lo, operandConsume(lo, args, idx, lastUses));
             sm.pop();
             sm.pop();
             emitOp(new OpcodeOp("OP_MAX"));
             sm.push(""); // intermediate max(val, lo)
 
-            bringToTop(hi, isLastUse(hi, idx, lastUses));
+            bringToTop(hi, operandConsume(hi, args, idx, lastUses));
             sm.pop();
             sm.pop();
             emitOp(new OpcodeOp("OP_MIN"));
@@ -1492,8 +1524,8 @@ public final class StackLower {
             String base = args.get(0);
             String exp = args.get(1);
 
-            bringToTop(base, isLastUse(base, idx, lastUses));
-            bringToTop(exp, isLastUse(exp, idx, lastUses));
+            bringToTop(base, operandConsume(base, args, idx, lastUses));
+            bringToTop(exp, operandConsume(exp, args, idx, lastUses));
             sm.pop();
             sm.pop();
 
@@ -1531,14 +1563,14 @@ public final class StackLower {
             String b = args.get(1);
             String c = args.get(2);
 
-            bringToTop(a, isLastUse(a, idx, lastUses));
-            bringToTop(b, isLastUse(b, idx, lastUses));
+            bringToTop(a, operandConsume(a, args, idx, lastUses));
+            bringToTop(b, operandConsume(b, args, idx, lastUses));
             sm.pop();
             sm.pop();
             emitOp(new OpcodeOp("OP_MUL"));
             sm.push(""); // a*b
 
-            bringToTop(c, isLastUse(c, idx, lastUses));
+            bringToTop(c, operandConsume(c, args, idx, lastUses));
             sm.pop();
             sm.pop();
             emitOp(new OpcodeOp("OP_DIV"));
@@ -1597,8 +1629,8 @@ public final class StackLower {
             String a = args.get(0);
             String b = args.get(1);
 
-            bringToTop(a, isLastUse(a, idx, lastUses));
-            bringToTop(b, isLastUse(b, idx, lastUses));
+            bringToTop(a, operandConsume(a, args, idx, lastUses));
+            bringToTop(b, operandConsume(b, args, idx, lastUses));
             sm.pop();
             sm.pop();
 
@@ -1635,8 +1667,8 @@ public final class StackLower {
             String a = args.get(0);
             String b = args.get(1);
 
-            bringToTop(a, isLastUse(a, idx, lastUses));
-            bringToTop(b, isLastUse(b, idx, lastUses));
+            bringToTop(a, operandConsume(a, args, idx, lastUses));
+            bringToTop(b, operandConsume(b, args, idx, lastUses));
             sm.pop();
             sm.pop();
 
@@ -1751,7 +1783,7 @@ public final class StackLower {
             for (int i = 0; i < args.size() && i < m.params().size(); i++) {
                 String paramName = m.params().get(i).name();
                 String arg = args.get(i);
-                bringToTop(arg, isLastUse(arg, idx, lastUses));
+                bringToTop(arg, operandConsume(arg, args, idx, lastUses));
                 sm.pop();
 
                 if (sm.has(paramName)) {
@@ -2565,6 +2597,9 @@ public final class StackLower {
                             String preimage, int idx, Map<String, Integer> lastUses) {
             List<AnfProperty> stateProps = new ArrayList<>();
             for (AnfProperty p : properties) if (!p.readonly()) stateProps.add(p);
+            List<String> outputOperands = new ArrayList<>();
+            outputOperands.add(satoshis);
+            outputOperands.addAll(stateValues);
 
             // Step 1: Bring _codePart to top (PICK)
             bringToTop("_codePart", false);
@@ -2581,7 +2616,7 @@ public final class StackLower {
             for (int i = 0; i < cnt; i++) {
                 String valueRef = stateValues.get(i);
                 AnfProperty prop = stateProps.get(i);
-                bringToTop(valueRef, isLastUse(valueRef, idx, lastUses));
+                bringToTop(valueRef, operandConsume(valueRef, outputOperands, idx, lastUses));
                 if ("bigint".equals(prop.type())) {
                     emitOp(new PushOp(PushValue.of(8)));
                     sm.push("");
@@ -2613,7 +2648,7 @@ public final class StackLower {
             sm.push("");
 
             // Step 6: Prepend satoshis as 8-byte LE
-            bringToTop(satoshis, isLastUse(satoshis, idx, lastUses));
+            bringToTop(satoshis, operandConsume(satoshis, outputOperands, idx, lastUses));
             emitOp(new PushOp(PushValue.of(8)));
             sm.push("");
             emitOp(new OpcodeOp("OP_NUM2BIN"));
@@ -2631,7 +2666,7 @@ public final class StackLower {
 
         void lowerAddRawOutput(String bindingName, String satoshis, String scriptBytes,
                                int idx, Map<String, Integer> lastUses) {
-            bringToTop(scriptBytes, isLastUse(scriptBytes, idx, lastUses));
+            bringToTop(scriptBytes, operandConsume(scriptBytes, List.of(satoshis, scriptBytes), idx, lastUses));
 
             emitOp(new OpcodeOp("OP_SIZE"));
             sm.push("");
@@ -2643,7 +2678,7 @@ public final class StackLower {
             emitOp(new OpcodeOp("OP_CAT"));
             sm.push("");
 
-            bringToTop(satoshis, isLastUse(satoshis, idx, lastUses));
+            bringToTop(satoshis, operandConsume(satoshis, List.of(satoshis, scriptBytes), idx, lastUses));
             emitOp(new PushOp(PushValue.of(8)));
             sm.push("");
             emitOp(new OpcodeOp("OP_NUM2BIN"));
@@ -2667,7 +2702,7 @@ public final class StackLower {
 
             emitOp(new PushOp(PushValue.ofHex("1976a914")));
             sm.push("");
-            bringToTop(pkh, isLastUse(pkh, idx, lastUses));
+            bringToTop(pkh, operandConsume(pkh, args, idx, lastUses));
             emitOp(new OpcodeOp("OP_CAT"));
             sm.pop(); sm.pop();
             sm.push("");
@@ -2678,7 +2713,7 @@ public final class StackLower {
             sm.pop(); sm.pop();
             sm.push("");
 
-            bringToTop(amount, isLastUse(amount, idx, lastUses));
+            bringToTop(amount, operandConsume(amount, args, idx, lastUses));
             emitOp(new PushOp(PushValue.of(8)));
             sm.push("");
             emitOp(new OpcodeOp("OP_NUM2BIN"));
@@ -2701,9 +2736,9 @@ public final class StackLower {
             String stateBytes = args.get(1);
 
             // stateBytes
-            bringToTop(stateBytes, isLastUse(stateBytes, idx, lastUses));
+            bringToTop(stateBytes, operandConsume(stateBytes, args, idx, lastUses));
             // preimage
-            bringToTop(preimage, isLastUse(preimage, idx, lastUses));
+            bringToTop(preimage, operandConsume(preimage, args, idx, lastUses));
 
             // Extract amount: last 52 bytes, take 8
             emitOp(new OpcodeOp("OP_SIZE"));
@@ -2775,12 +2810,12 @@ public final class StackLower {
             String newAmount = args.get(2);
 
             // drop preimage
-            bringToTop(preimage, isLastUse(preimage, idx, lastUses));
+            bringToTop(preimage, operandConsume(preimage, args, idx, lastUses));
             emitOp(new DropOp());
             sm.pop();
 
             // newAmount -> 8-byte LE -> altstack
-            bringToTop(newAmount, isLastUse(newAmount, idx, lastUses));
+            bringToTop(newAmount, operandConsume(newAmount, args, idx, lastUses));
             emitOp(new PushOp(PushValue.of(8)));
             sm.push("");
             emitOp(new OpcodeOp("OP_NUM2BIN"));
@@ -2789,7 +2824,7 @@ public final class StackLower {
             emitOp(new OpcodeOp("OP_TOALTSTACK"));
             sm.pop();
 
-            bringToTop(stateBytes, isLastUse(stateBytes, idx, lastUses));
+            bringToTop(stateBytes, operandConsume(stateBytes, args, idx, lastUses));
             bringToTop("_codePart", false);
 
             emitOp(new PushOp(PushValue.ofHex("6a")));

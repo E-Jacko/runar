@@ -12,10 +12,12 @@ SDKs Must Stay in Sync".
 """
 
 import json
+import hashlib
 import pathlib
 
 import pytest
 
+from runar.ecdsa import ecdsa_sign
 from runar.sdk.envelope import (
     canonical_json,
     verify_envelope,
@@ -51,6 +53,27 @@ def test_verify_rejection_vectors(fixture: dict) -> None:
         assert r.reason == VerifyEnvelopeReason(v["reason"]), (
             f"rejection {v['reason']!r}: got reason={r.reason}"
         )
+
+
+def test_signing_vectors(fixture: dict) -> None:
+    """GAP-064 cross-tier signing reproduction. Signing the SAME payload with
+    the SAME key (priv=1) via RFC 6979 deterministic ECDSA (plain-SHA-256
+    nonce, low-S) MUST yield the byte-identical DER signature the TS reference
+    committed. ecdsa_sign signs the 32-byte digest directly.
+    """
+    alice_priv = 1
+    vectors = fixture["signing_vectors"]
+    assert vectors, "signing_vectors missing or empty"
+    for v in vectors:
+        vid = v.get("_vector_id", "?")
+        # Drift guard: re-derive the canonical payload from data + lifetime.
+        merged = {**v["data"], "nonce": v["nonce"], "expiresAt": v["expiresAt"]}
+        payload = canonical_json(merged)
+        assert payload == v["expected_payload"], f"vector {vid}: payload"
+
+        digest = hashlib.sha256(payload.encode("utf-8")).digest()
+        der = ecdsa_sign(alice_priv, digest).hex()
+        assert der == v["expected_sig"], f"vector {vid}: signature divergence"
 
 
 def test_canonical_json_rejection_vectors(fixture: dict) -> None:

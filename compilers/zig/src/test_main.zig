@@ -27,6 +27,7 @@ test {
     _ = @import("passes/constant_fold.zig");
     _ = @import("passes/ec_optimizer.zig");
     _ = @import("tests/e2e.zig");
+    _ = @import("tests/repeated_operand_consume.zig");
     _ = @import("tests/math_builtins.zig");
     _ = @import("tests/hash_builtins.zig");
     _ = @import("tests/check_multisig.zig");
