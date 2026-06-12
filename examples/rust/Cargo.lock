@@ -988,6 +988,7 @@ dependencies = [
 name = "runar-example-tests"
 version = "0.1.0"
 dependencies = [
+ "num-bigint",
  "runar-compiler-rust",
  "runar-lang",
  "serde_json",
