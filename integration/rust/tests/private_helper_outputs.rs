@@ -39,14 +39,43 @@ fn test_private_helper_outputs_commit_chain() {
     }
 }
 
+/// Inline private-helper variant whose `record()` helper emits a 1-satoshi
+/// (not 0) data output. The CI regtest node runs with acceptnonstdtxn=0
+/// (oracle hardening, PR #49) and rejects 0-satoshi OP_RETURN outputs as
+/// "dust" at sendrawtransaction. The shared conformance contract
+/// (examples/ts/private-helper-outputs/PrivateHelperOutputs.runar.ts) is
+/// deliberately left at 0n so its cross-tier hex goldens stay frozen; this
+/// inline source preserves the exact "data output routed through a private
+/// helper, broadcast to a live node" assertion without that golden churn.
+/// Mirrors the Python integration test's PrivateHelperLog (PR #55).
+const LOG_SOURCE: &str = r#"
+import { StatefulSmartContract, ByteString, assert } from 'runar-lang';
+
+export class PrivateHelperLog extends StatefulSmartContract {
+    counter: bigint;
+
+    constructor(counter: bigint) {
+        super(counter);
+        this.counter = counter;
+    }
+
+    private record(payload: ByteString): void {
+        this.addDataOutput(1n, payload);
+    }
+
+    public log(payload: ByteString): void {
+        this.record(payload);
+        assert(true);
+    }
+}
+"#;
+
 #[test]
 #[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_private_helper_outputs_log_emits_data() {
     skip_if_no_node();
 
-    let artifact = compile_contract(
-        "examples/ts/private-helper-outputs/PrivateHelperOutputs.runar.ts",
-    );
+    let artifact = compile_source(LOG_SOURCE, "PrivateHelperLog.runar.ts");
     let mut contract = RunarContract::new(artifact, vec![SdkValue::Int(0)]);
     let mut provider = create_provider();
     let (signer, _wallet) = create_funded_wallet(&mut provider);
