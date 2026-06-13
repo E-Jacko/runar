@@ -730,6 +730,120 @@ theorem runOpcode_LESSTHAN_intBytes
   simp only [Eval.popN, StackState.pop?, hStk]
   simp [Eval.asNum?, Eval.asInt?, hSz]
 
+/-! ### Byte-coercion fidelity smokes for the widened comparison / select ops
+
+The 2026-06-13 extension wires the consensus `asNum?` coercion into the
+comparison and numeric-select opcodes (`OP_GREATERTHAN`,
+`OP_LESSTHANOREQUAL`, `OP_GREATERTHANOREQUAL`, `OP_NUMEQUAL`,
+`OP_NUMNOTEQUAL`, `OP_MIN`, `OP_MAX`) that deployed-bytes machinery feeds
+byte-encoded literals to (the stateful varint encoder, num2bin's
+size-dispatch, clamp/pow).  These concrete smokes feed a parsed
+`vBytes` numeric push (the wire encoding `[0xfd, 0x00]` = 253, exactly
+what `push 253` parses back to) to each newly-widened opcode and confirm
+it now evaluates to the CONSENSUS result instead of type-erroring.  The
+top operand is the byte vector; the second-from-top is a typed bigint
+(`100`), mirroring the real stack shape (`OP_DUP; push 253; OP_…`). -/
+
+/-- A parsed 2-byte CScriptNum push of 253 (the `push 253` wire form). -/
+def bytes253 : ByteArray := ByteArray.mk #[0xfd, 0x00]
+
+/-- The load-bearing consensus fact, checked by the kernel evaluator: the
+parsed `push 253` byte vector decodes (via the `asNum?` ≤4-byte path) to the
+integer 253, and is ≤ 4 bytes so the coercion applies.  Every byte-coercion
+smoke below rides on this. -/
+theorem bytes253_decodes : decodeMinimalLE bytes253 = 253 ∧ bytes253.size ≤ 4 := by
+  native_decide
+
+/-- Generic reduction: a `liftIntBinNum`-wired opcode given a bigint
+second-from-top and a ≤4-byte vector top decodes the top via `asNum?` and
+applies `f`.  Mirrors `runOpcode_LESSTHAN_intBytes` but parameterised over the
+opcode's def-lemma equation `hDef`. -/
+private theorem liftIntBinNum_intBytes_reduce
+    (s : StackState) (op : String) (f : Int → Int → Value)
+    (a : Int) (bB : ByteArray) (rest : List Value)
+    (hDef : Eval.runOpcode op s = Eval.liftIntBinNum s f)
+    (hStk : s.stack = .vBytes bB :: .vBigint a :: rest)
+    (hSz : bB.size ≤ 4) :
+    Eval.runOpcode op s
+      = .ok ({ s with stack := rest }.push (f a (decodeMinimalLE bB))) := by
+  rw [hDef]
+  unfold Eval.liftIntBinNum
+  simp only [Eval.popN, StackState.pop?, hStk]
+  simp [Eval.asNum?, Eval.asInt?, hSz]
+
+/-- SMOKE — `OP_GREATERTHAN` coerces a byte-literal top operand: `100 > 253`
+is `false`, matching consensus (the bare `asInt?` would type-error). -/
+theorem smoke_GREATERTHAN_byte_coerces (s : StackState) (rest : List Value)
+    (hStk : s.stack = .vBytes bytes253 :: .vBigint 100 :: rest) :
+    Eval.runOpcode "OP_GREATERTHAN" s
+      = .ok ({ s with stack := rest }.push (.vBool false)) := by
+  have := liftIntBinNum_intBytes_reduce s "OP_GREATERTHAN"
+    (fun a b => .vBool (decide (a > b))) 100 bytes253 rest
+    (Sim.runOpcode_GREATERTHAN_def s) hStk bytes253_decodes.2
+  rw [this]; simp [bytes253_decodes.1]
+
+/-- SMOKE — `OP_LESSTHANOREQUAL` coerces a byte-literal top: `100 ≤ 253`. -/
+theorem smoke_LESSTHANOREQUAL_byte_coerces (s : StackState) (rest : List Value)
+    (hStk : s.stack = .vBytes bytes253 :: .vBigint 100 :: rest) :
+    Eval.runOpcode "OP_LESSTHANOREQUAL" s
+      = .ok ({ s with stack := rest }.push (.vBool true)) := by
+  have := liftIntBinNum_intBytes_reduce s "OP_LESSTHANOREQUAL"
+    (fun a b => .vBool (decide (a ≤ b))) 100 bytes253 rest
+    (Sim.runOpcode_LESSTHANOREQUAL_def s) hStk bytes253_decodes.2
+  rw [this]; simp [bytes253_decodes.1]
+
+/-- SMOKE — `OP_GREATERTHANOREQUAL` coerces a byte-literal top: `100 ≥ 253`. -/
+theorem smoke_GREATERTHANOREQUAL_byte_coerces (s : StackState) (rest : List Value)
+    (hStk : s.stack = .vBytes bytes253 :: .vBigint 100 :: rest) :
+    Eval.runOpcode "OP_GREATERTHANOREQUAL" s
+      = .ok ({ s with stack := rest }.push (.vBool false)) := by
+  have := liftIntBinNum_intBytes_reduce s "OP_GREATERTHANOREQUAL"
+    (fun a b => .vBool (decide (a ≥ b))) 100 bytes253 rest
+    (Sim.runOpcode_GREATERTHANOREQUAL_def s) hStk bytes253_decodes.2
+  rw [this]; simp [bytes253_decodes.1]
+
+/-- SMOKE — `OP_NUMEQUAL` coerces a byte-literal top: `253 = 253`.  This is
+the num2bin size-dispatch shape (`OP_DUP; push 254/77; OP_NUMEQUAL`). -/
+theorem smoke_NUMEQUAL_byte_coerces (s : StackState) (rest : List Value)
+    (hStk : s.stack = .vBytes bytes253 :: .vBigint 253 :: rest) :
+    Eval.runOpcode "OP_NUMEQUAL" s
+      = .ok ({ s with stack := rest }.push (.vBool true)) := by
+  have := liftIntBinNum_intBytes_reduce s "OP_NUMEQUAL"
+    (fun a b => .vBool (decide (a = b))) 253 bytes253 rest
+    (Sim.runOpcode_NUMEQUAL_def s) hStk bytes253_decodes.2
+  rw [this]; simp [bytes253_decodes.1]
+
+/-- SMOKE — `OP_NUMNOTEQUAL` coerces a byte-literal top: `100 ≠ 253`. -/
+theorem smoke_NUMNOTEQUAL_byte_coerces (s : StackState) (rest : List Value)
+    (hStk : s.stack = .vBytes bytes253 :: .vBigint 100 :: rest) :
+    Eval.runOpcode "OP_NUMNOTEQUAL" s
+      = .ok ({ s with stack := rest }.push (.vBool true)) := by
+  have := liftIntBinNum_intBytes_reduce s "OP_NUMNOTEQUAL"
+    (fun a b => .vBool (decide (a ≠ b))) 100 bytes253 rest
+    (Sim.runOpcode_NUMNOTEQUAL_def s) hStk bytes253_decodes.2
+  rw [this]; simp [bytes253_decodes.1]
+
+/-- SMOKE — `OP_MIN` coerces a byte-literal top: `min 100 253 = 100`.
+This is the clamp machinery shape (`OP_MAX … OP_MIN`). -/
+theorem smoke_MIN_byte_coerces (s : StackState) (rest : List Value)
+    (hStk : s.stack = .vBytes bytes253 :: .vBigint 100 :: rest) :
+    Eval.runOpcode "OP_MIN" s
+      = .ok ({ s with stack := rest }.push (.vBigint 100)) := by
+  have := liftIntBinNum_intBytes_reduce s "OP_MIN"
+    (fun a b => .vBigint (min a b)) 100 bytes253 rest
+    (Sim.runOpcode_MIN_def s) hStk bytes253_decodes.2
+  rw [this]; simp only [bytes253_decodes.1, show min (100 : Int) 253 = 100 from by decide]
+
+/-- SMOKE — `OP_MAX` coerces a byte-literal top: `max 100 253 = 253`. -/
+theorem smoke_MAX_byte_coerces (s : StackState) (rest : List Value)
+    (hStk : s.stack = .vBytes bytes253 :: .vBigint 100 :: rest) :
+    Eval.runOpcode "OP_MAX" s
+      = .ok ({ s with stack := rest }.push (.vBigint 253)) := by
+  have := liftIntBinNum_intBytes_reduce s "OP_MAX"
+    (fun a b => .vBigint (max a b)) 100 bytes253 rest
+    (Sim.runOpcode_MAX_def s) hStk bytes253_decodes.2
+  rw [this]; simp only [bytes253_decodes.1, show max (100 : Int) 253 = 253 from by decide]
+
 /-- Abbreviation for the accumulated state-script bytes:
 `codePart ++ OP_RETURN ++ stateVal(8-byte LE)`. -/
 def epiAcc (cpV sv8 : ByteArray) : ByteArray :=

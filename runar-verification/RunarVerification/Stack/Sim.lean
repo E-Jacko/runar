@@ -569,10 +569,10 @@ theorem runOpcode_RSHIFT_def (s : StackState) :
     = liftIntBin s (fun a b => .vBigint (a / (2 ^ b.toNat))) := rfl
 
 theorem runOpcode_MIN_def (s : StackState) :
-    runOpcode "OP_MIN" s = liftIntBin s (fun a b => .vBigint (min a b)) := rfl
+    runOpcode "OP_MIN" s = liftIntBinNum s (fun a b => .vBigint (min a b)) := rfl
 
 theorem runOpcode_MAX_def (s : StackState) :
-    runOpcode "OP_MAX" s = liftIntBin s (fun a b => .vBigint (max a b)) := rfl
+    runOpcode "OP_MAX" s = liftIntBinNum s (fun a b => .vBigint (max a b)) := rfl
 
 theorem runOpcode_WITHIN_def (s : StackState) :
     runOpcode "OP_WITHIN" s =
@@ -597,23 +597,23 @@ theorem runOpcode_LESSTHAN_def (s : StackState) :
 
 theorem runOpcode_GREATERTHAN_def (s : StackState) :
     runOpcode "OP_GREATERTHAN" s
-    = liftIntBin s (fun a b => .vBool (decide (a > b))) := rfl
+    = liftIntBinNum s (fun a b => .vBool (decide (a > b))) := rfl
 
 theorem runOpcode_LESSTHANOREQUAL_def (s : StackState) :
     runOpcode "OP_LESSTHANOREQUAL" s
-    = liftIntBin s (fun a b => .vBool (decide (a ≤ b))) := rfl
+    = liftIntBinNum s (fun a b => .vBool (decide (a ≤ b))) := rfl
 
 theorem runOpcode_GREATERTHANOREQUAL_def (s : StackState) :
     runOpcode "OP_GREATERTHANOREQUAL" s
-    = liftIntBin s (fun a b => .vBool (decide (a ≥ b))) := rfl
+    = liftIntBinNum s (fun a b => .vBool (decide (a ≥ b))) := rfl
 
 theorem runOpcode_NUMEQUAL_def (s : StackState) :
     runOpcode "OP_NUMEQUAL" s
-    = liftIntBin s (fun a b => .vBool (decide (a = b))) := rfl
+    = liftIntBinNum s (fun a b => .vBool (decide (a = b))) := rfl
 
 theorem runOpcode_NUMNOTEQUAL_def (s : StackState) :
     runOpcode "OP_NUMNOTEQUAL" s
-    = liftIntBin s (fun a b => .vBool (decide (a ≠ b))) := rfl
+    = liftIntBinNum s (fun a b => .vBool (decide (a ≠ b))) := rfl
 
 theorem runOpcode_BOOLAND_def (s : StackState) :
     runOpcode "OP_BOOLAND" s
@@ -867,18 +867,18 @@ theorem runOpcode_MIN_intInt
     (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
     runOpcode "OP_MIN" s = .ok ({ s with stack := rest }.push (.vBigint (min a b))) := by
   rw [runOpcode_MIN_def]
-  unfold liftIntBin
+  unfold liftIntBinNum
   rw [popN_two_local s _ _ rest hStk]
-  simp [asInt?]
+  simp [asNum?, asInt?]
 
 theorem runOpcode_MAX_intInt
     (s : StackState) (a b : Int) (rest : List Value)
     (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
     runOpcode "OP_MAX" s = .ok ({ s with stack := rest }.push (.vBigint (max a b))) := by
   rw [runOpcode_MAX_def]
-  unfold liftIntBin
+  unfold liftIntBinNum
   rw [popN_two_local s _ _ rest hStk]
-  simp [asInt?]
+  simp [asNum?, asInt?]
 
 theorem runOpcode_WITHIN_intIntInt
     (s : StackState) (x lo hi : Int) (rest : List Value)
@@ -905,45 +905,45 @@ theorem runOpcode_GREATERTHAN_intInt
     (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
     runOpcode "OP_GREATERTHAN" s = .ok ({ s with stack := rest }.push (.vBool (decide (a > b)))) := by
   rw [runOpcode_GREATERTHAN_def]
-  unfold liftIntBin
+  unfold liftIntBinNum
   rw [popN_two_local s _ _ rest hStk]
-  simp [asInt?]
+  simp [asNum?, asInt?]
 
 theorem runOpcode_LESSTHANOREQUAL_intInt
     (s : StackState) (a b : Int) (rest : List Value)
     (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
     runOpcode "OP_LESSTHANOREQUAL" s = .ok ({ s with stack := rest }.push (.vBool (decide (a ≤ b)))) := by
   rw [runOpcode_LESSTHANOREQUAL_def]
-  unfold liftIntBin
+  unfold liftIntBinNum
   rw [popN_two_local s _ _ rest hStk]
-  simp [asInt?]
+  simp [asNum?, asInt?]
 
 theorem runOpcode_GREATERTHANOREQUAL_intInt
     (s : StackState) (a b : Int) (rest : List Value)
     (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
     runOpcode "OP_GREATERTHANOREQUAL" s = .ok ({ s with stack := rest }.push (.vBool (decide (a ≥ b)))) := by
   rw [runOpcode_GREATERTHANOREQUAL_def]
-  unfold liftIntBin
+  unfold liftIntBinNum
   rw [popN_two_local s _ _ rest hStk]
-  simp [asInt?]
+  simp [asNum?, asInt?]
 
 theorem runOpcode_NUMEQUAL_intInt
     (s : StackState) (a b : Int) (rest : List Value)
     (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
     runOpcode "OP_NUMEQUAL" s = .ok ({ s with stack := rest }.push (.vBool (decide (a = b)))) := by
   rw [runOpcode_NUMEQUAL_def]
-  unfold liftIntBin
+  unfold liftIntBinNum
   rw [popN_two_local s _ _ rest hStk]
-  simp [asInt?]
+  simp [asNum?, asInt?]
 
 theorem runOpcode_NUMNOTEQUAL_intInt
     (s : StackState) (a b : Int) (rest : List Value)
     (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
     runOpcode "OP_NUMNOTEQUAL" s = .ok ({ s with stack := rest }.push (.vBool (decide (a ≠ b)))) := by
   rw [runOpcode_NUMNOTEQUAL_def]
-  unfold liftIntBin
+  unfold liftIntBinNum
   rw [popN_two_local s _ _ rest hStk]
-  simp [asInt?]
+  simp [asNum?, asInt?]
 
 theorem runOpcode_BOOLAND_intInt
     (s : StackState) (a b : Int) (rest : List Value)

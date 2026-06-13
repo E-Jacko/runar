@@ -139,15 +139,28 @@ number); the bare `asInt?` rejects it.
 
 `asNum?` is the faithful operand coercion: byte vectors of ≤ 4 bytes
 decode via `decodeMinimalLE`; every other value falls back to `asInt?`.
-It is wired into `OP_LESSTHAN` only (the one opcode the discharged
-deployed-bytes walks currently exercise with a byte-encoded literal);
-the remaining numeric opcodes keep the strictly-typed `liftIntBin`
+It is wired into the COMPARISON and numeric-SELECT opcodes that the
+deployed-bytes machinery feeds byte-encoded literals to:
+`OP_LESSTHAN`, `OP_GREATERTHAN`, `OP_LESSTHANOREQUAL`,
+`OP_GREATERTHANOREQUAL`, `OP_NUMEQUAL`, `OP_NUMNOTEQUAL`, `OP_MIN`,
+`OP_MAX` (the varint encoder pushes 253; num2bin's size-dispatch feeds
+`push 254`/`push 77` to `OP_NUMEQUAL`; clamp/pow feed `push i` to
+`OP_MAX`/`OP_MIN`/`OP_GREATERTHAN`).  These coercions are safe because
+`asNum?` agrees with `asInt?` on `vBigint`/`vBool` operands
+(`asNum?_vBigint` / `asNum?_vBool`), so every success-direction
+lockstep theorem (which only ever runs on typed operands) is unchanged,
+and NO failure-direction theorem asserts these opcodes error on a byte
+top.
+
+The ARITHMETIC opcodes (`OP_ADD`, `OP_SUB`, `OP_MUL`, `OP_NEGATE`, and
+the shift ops) deliberately keep the strictly-typed `liftIntBin`,
 because the Wave-30 failure-lockstep theorems
-(`AgreesA3.liftIntBin_nonInt_top_isError` and friends) pin the ANF
-type-error ⟷ Stack type-error agreement for `+`/`-`/`*` on byte
-operands, and widening the coercion there would falsify them.  Extend
-opcode-by-opcode (with the matching ANF-side story) as future walks
-require. -/
+(`AgreesA3.liftIntBin_nonInt_top_isError`,
+`AgreesA3.runOpcode_binopOpcode_emittable_nonInt_top_isError` — covers
+EXACTLY `+`/`-`/`*`) pin the ANF type-error ⟷ Stack type-error
+agreement for those ops on byte operands, and widening the coercion
+there would falsify them.  Extend further opcode-by-opcode (with the
+matching ANF-side story) as future walks require. -/
 def asNum? (v : Value) : Option Int :=
   match v with
   | .vBytes b => if b.size ≤ 4 then some (decodeMinimalLE b) else none
@@ -538,18 +551,19 @@ def runOpcode (code : String) (s : StackState) : EvalResult StackState :=
   | "OP_RSHIFTNUM" => liftIntBin s (fun a b => .vBigint (a / (2 ^ b.toNat)))
   -- ---------------------------------------------------------------- comparison
   -- Consensus CScriptNum coercion (see `asNum?`): parsed numeric pushes
-  -- above OP_16 re-enter as `vBytes`; `OP_LESSTHAN` decodes them like the
-  -- real VM does (the stateful epilogue's varint encoder pushes 253).
+  -- above OP_16 re-enter as `vBytes`; the comparison + numeric-select
+  -- opcodes decode them like the real VM does (the stateful epilogue's
+  -- varint encoder pushes 253; num2bin/clamp feed byte literals here).
   | "OP_LESSTHAN"           => liftIntBinNum s (fun a b => .vBool (decide (a < b)))
-  | "OP_GREATERTHAN"        => liftIntBin s (fun a b => .vBool (decide (a > b)))
-  | "OP_LESSTHANOREQUAL"    => liftIntBin s (fun a b => .vBool (decide (a ≤ b)))
-  | "OP_GREATERTHANOREQUAL" => liftIntBin s (fun a b => .vBool (decide (a ≥ b)))
-  | "OP_NUMEQUAL"           => liftIntBin s (fun a b => .vBool (decide (a = b)))
-  | "OP_NUMNOTEQUAL"        => liftIntBin s (fun a b => .vBool (decide (a ≠ b)))
+  | "OP_GREATERTHAN"        => liftIntBinNum s (fun a b => .vBool (decide (a > b)))
+  | "OP_LESSTHANOREQUAL"    => liftIntBinNum s (fun a b => .vBool (decide (a ≤ b)))
+  | "OP_GREATERTHANOREQUAL" => liftIntBinNum s (fun a b => .vBool (decide (a ≥ b)))
+  | "OP_NUMEQUAL"           => liftIntBinNum s (fun a b => .vBool (decide (a = b)))
+  | "OP_NUMNOTEQUAL"        => liftIntBinNum s (fun a b => .vBool (decide (a ≠ b)))
   | "OP_BOOLAND"            => liftIntBin s (fun a b => .vBool (decide (a ≠ 0 ∧ b ≠ 0)))
   | "OP_BOOLOR"             => liftIntBin s (fun a b => .vBool (decide (a ≠ 0 ∨ b ≠ 0)))
-  | "OP_MIN"                => liftIntBin s (fun a b => .vBigint (min a b))
-  | "OP_MAX"                => liftIntBin s (fun a b => .vBigint (max a b))
+  | "OP_MIN"                => liftIntBinNum s (fun a b => .vBigint (min a b))
+  | "OP_MAX"                => liftIntBinNum s (fun a b => .vBigint (max a b))
   | "OP_WITHIN" =>
       match popN s 3 with
       | .error e => .error e
@@ -1312,6 +1326,19 @@ theorem liftIntBin_bigint_local
   unfold liftIntBin
   rw [popN_two_bigint_local s a b rest hStk]
   simp only [asInt?]
+
+/-- `liftIntBinNum` on a bigint top-two reduces to a push of `f a b`, exactly
+like `liftIntBin_bigint_local`.  The consensus `asNum?` coercion agrees with
+`asInt?` on `vBigint` operands (`asNum?_vBigint`), so the comparison /
+numeric-select opcodes wired through `liftIntBinNum` keep their bigint-operand
+success behaviour bit-for-bit.  In-module. -/
+theorem liftIntBinNum_bigint_local
+    (s : StackState) (f : Int → Int → Value) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    liftIntBinNum s f = .ok ({ s with stack := rest }.push (f a b)) := by
+  unfold liftIntBinNum
+  rw [popN_two_bigint_local s a b rest hStk]
+  simp only [asNum?, asInt?]
 
 /-- `liftIntUnary` on a bigint top reduces to a push of `f a`.  In-module. -/
 theorem liftIntUnary_bigint_local
