@@ -181,6 +181,7 @@ theorem omnibus_instantiation_arith :
         rcases hpr with h | h | h <;> subst h <;> rfl))                  -- hTsmTyped (LIVE)
     (by intro bn cond thn els src h; simp [omniArithMethod] at h)        -- hIfValTyped
     (vacuous (by native_decide))                                         -- hMathByteFrag
+    (fun _ => vacuous (by native_decide))                                -- hMathByteCatFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
     (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
@@ -286,6 +287,7 @@ theorem omnibus_instantiation_updateProp :
     (by intro bn cond thn els src h
         simp [omniCounterMethod, Agrees.updatePropConsumeBody] at h)     -- hIfValTyped
     (vacuous (by native_decide))                                         -- hMathByteFrag
+    (fun _ => vacuous (by native_decide))                                -- hMathByteCatFrag
     omniCounter_updatePropFrag                                           -- hUpdatePropFrag (LIVE)
     (vacuous (by native_decide))                                         -- hMethodCallFrag
     (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
@@ -355,6 +357,7 @@ theorem omnibus_instantiation_hashLock :
         simp [AgreesHashCall.hashAssertSmokeMethod,
           AgreesHashCall.hashAssertBody] at h)                           -- hIfValTyped
     (vacuous (by native_decide))                                         -- hMathByteFrag
+    (fun _ => vacuous (by native_decide))                                -- hMathByteCatFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
     (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
@@ -441,6 +444,7 @@ theorem omnibus_instantiation_stateful :
           Stack.StatefulBridge.gatedStatefulPrologueBody,
           Stack.AgreesD2.statefulPrologueBody] at h)                     -- hIfValTyped
     (vacuous (by native_decide))                                         -- hMathByteFrag
+    (fun _ => vacuous (by native_decide))                                -- hMathByteCatFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
     (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
@@ -540,6 +544,7 @@ theorem omnibus_instantiation_statefulFull :
           Stack.AgreesD2.statefulPrologueBody,
           Stack.AgreesD2.statefulEpilogueBody] at h)                     -- hIfValTyped
     (vacuous (by native_decide))                                         -- hMathByteFrag
+    (fun _ => vacuous (by native_decide))                                -- hMathByteCatFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
     (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
@@ -640,6 +645,7 @@ theorem omnibus_instantiation_dispatchMixed :
     (fun _ => omniMx_wt)                                                 -- hTsmTyped
     (by intro bn cond thn els src h; simp [omniMxMa] at h)               -- hIfValTyped
     (vacuous (by native_decide))                                         -- hMathByteFrag
+    (fun _ => vacuous (by native_decide))                                -- hMathByteCatFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
     (vacuousOf (by native_decide))                                       -- hHashCallFrag (multi-public)
@@ -700,6 +706,7 @@ theorem omnibus_instantiation_dispatchMixed_hashLock :
     (by intro bn cond thn els src h
         simp [omniMxUnlock, AgreesHashCall.hashAssertBody] at h)         -- hIfValTyped
     (vacuous (by native_decide))                                         -- hMathByteFrag
+    (fun _ => vacuous (by native_decide))                                -- hMathByteCatFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
     (vacuousOf (by native_decide))                                       -- hHashCallFrag (multi-public)
@@ -808,6 +815,7 @@ theorem omnibus_instantiation_p2pkh :
     (vacuousArith (by native_decide))                                    -- hTsmTyped
     (by intro bn cond thn els src h; simp [omniP2pkhUnlock] at h)        -- hIfValTyped
     (vacuous (by native_decide))                                         -- hMathByteFrag
+    (fun _ => vacuous (by native_decide))                                -- hMathByteCatFrag
     (vacuous (by native_decide))                                         -- hUpdatePropFrag
     (vacuous (by native_decide))                                         -- hMethodCallFrag
     (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
@@ -820,12 +828,85 @@ theorem omnibus_instantiation_p2pkh :
     (fun _ => vacuousAssert (by native_decide))                          -- hValueTruthy
     omniP2pkh_coh                                                        -- hCoh
 
+/-! ## Fixture H — math_byte-WIDENED 2-arg `cat` family (`AgreesCat.smokeMethod`)
+
+`f(a, b) { d := cat(a, b) }` on concrete two-bytes entry (`a ↦ #[01,02]`,
+`b ↦ #[03]`, the deployed stack carrying them as `b` over `a`).  Value-
+terminated (the concatenation lands on top), so the truthiness premise is
+LIVE; the concatenated result `#[01,02,03]` is nonempty ⇒ truthy by
+`truthy_of_scriptAccepts` on the concrete run.  This is the only LIVE
+instantiation that drives the new `hMathByteCatFrag` consume arm of the
+omnibus dispatch end-to-end. -/
+
+def omniCatProg : ANFProgram :=
+  { contractName := "C", properties := [],
+    methods := [AgreesCat.smokeMethod] }
+
+def omniCatAB : ByteArray := ByteArray.mk #[1, 2]
+def omniCatBB : ByteArray := ByteArray.mk #[3]
+
+def omniCatAnf : State :=
+  { params := [("b", .vBytes omniCatBB), ("a", .vBytes omniCatAB)] }
+
+def omniCatStk : StackState :=
+  { stack := [.vBytes omniCatBB, .vBytes omniCatAB] }
+
+def omniCatBytes : ByteArray :=
+  Emit.emitFast (peepholeProgram (Lower.lower omniCatProg))
+
+def omniCatTsm : Agrees.TaggedStackMap :=
+  [("b", Agrees.SlotKind.param), ("a", Agrees.SlotKind.param)]
+
+theorem omniCat_coh : Agrees.tsmCoherent omniCatAnf omniCatTsm := by
+  intro s hs
+  simp only [omniCatTsm, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with h | h <;> subst h <;> rfl
+
+/-- **Omnibus instantiation — math_byte-WIDENED 2-arg `cat` family.** -/
+theorem omnibus_instantiation_cat :
+    Stack.Eval.acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP omniCatProg.methods omniCatAnf
+        AgreesCat.smokeMethod.body)
+      (runParsedBytes omniCatBytes omniCatStk) :=
+  compileSafe_observational_correct_modulo_codegen_axioms
+    omniCatProg
+    (by native_decide)                                                   -- hWF
+    AgreesCat.smokeMethod omniCatBytes
+    (by unfold omniCatProg; simp)                                        -- hMem
+    rfl                                                                  -- hPublic
+    (EntryDischarge.compileSafe_of_producesBool _ _ (by native_decide))  -- hSafe
+    omniCatAnf omniCatStk
+    omniCatTsm
+    ⟨⟨rfl, rfl, trivial⟩, rfl, rfl⟩                                      -- hAgrees
+    (by native_decide)                                                   -- hNoLoop
+    Typed.TypeEnv.empty                                                  -- Γ
+    (fun _ => rfl)                                                       -- hUntag (single-public)
+    (entryBigintTyped_empty _)                                           -- hTypedEntry
+    (vacuousArith (by native_decide))                                    -- hTsmTyped
+    (by intro bn cond thn els src h
+        simp [AgreesCat.smokeMethod] at h)                               -- hIfValTyped
+    (vacuous (by native_decide))                                         -- hMathByteFrag
+    (fun _ _ => ⟨"d", "a", "b", none, omniCatAB, omniCatBB, [],
+      rfl, rfl, by decide, rfl, rfl, rfl⟩)                              -- hMathByteCatFrag (LIVE)
+    (vacuous (by native_decide))                                         -- hUpdatePropFrag
+    (vacuous (by native_decide))                                         -- hMethodCallFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashAssertFrag
+    (fun _ => vacuous (by native_decide))                                -- hHashChainFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFrag
+    (fun _ => vacuous (by native_decide))                                -- hStatefulFullFrag
+    (vacuous (by native_decide))                                         -- hDispatchFrag
+    (vacuous (by native_decide))                                         -- hDispatchMixedFrag
+    (fun _ _ => Stack.Eval.truthy_of_scriptAccepts (by native_decide))   -- hValueTruthy (LIVE)
+    omniCat_coh                                                          -- hCoh
+
 /-! ## Trust-footprint evidence (build-time) -/
 
 #print axioms omnibus_instantiation_arith
 #print axioms omnibus_instantiation_p2pkh
 #print axioms omnibus_instantiation_statefulFull
 #print axioms omnibus_instantiation_dispatchMixed_hashLock
+#print axioms omnibus_instantiation_cat
 
 end OmnibusInstantiation
 
@@ -873,6 +954,7 @@ def main : IO UInt32 := do
   IO.println "  omniDispatch   mixed dispatch consume (selector 0) synthetic (MX)"
   IO.println "  omniMxHL       mixed dispatch consume (selector 1) synthetic (MX hash-lock)"
   IO.println "  omniP2pkh      crypto_call fallback sub-omnibus    REAL basic-p2pkh golden"
+  IO.println "  omniCat        math_byte 2-arg cat consume         synthetic (cat(a,b))"
   IO.println ""
   IO.println "Each row is a zero-sorry theorem `omnibus_instantiation_*` applying"
   IO.println "`compileSafe_observational_correct_modulo_codegen_axioms` with all"
