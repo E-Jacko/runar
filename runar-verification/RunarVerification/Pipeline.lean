@@ -2857,11 +2857,15 @@ integration omnibus — planned split"):
   `compileSafe_observational_correct_ifval_consume`; residual if_val
   bodies fall through to the sound `crypto_call` fallback.
 * `compileSafe_observational_correct_modulo_loop_codegen` —
-  Discharged once A7 widening completes. GUARDED (2026-06-11) by
-  `bodyLoopMapNeutralB` after the `loopCx*` counterexample showed a
-  `structuralLoopBodyBool`-accepted, non-aliased accumulator-loop shape
-  diverging (the model loop arm's per-iteration drop is misplaced for
-  bodies whose iteration variable survives the body).
+  RETIRED (2026-06-13): the omnibus's top-level `hNoLoop`
+  (`programUsesLoopB p = false`) confines the loop arm to loop-FREE
+  bodies (a `structuralLoopBodyBool`-accepted body containing a real
+  `.loop` refutes `hNoLoop` via `bindingsUseLoopB_false_of_program`), so
+  the non-vacuous residue is exactly the loop-free shapes the sound
+  `crypto_call` fallback already covers. Discharged by the theorem
+  `compileSafe_observational_correct_loop_consume`. The deferred
+  growing-per-iteration-depth real-loop codegen proof (A7 Tier 3b/3d)
+  only becomes load-bearing once `hNoLoop` is lifted from the omnibus.
 * `compileSafe_observational_correct_modulo_method_call_codegen` —
   RETIRED (Wave 66, 2026-05-24): the single-public param-passthrough
   `method_call` fragment (decided by `Agrees.methodCallConsumeShapeBool`)
@@ -3630,24 +3634,48 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
 -- (nested if_val, non-self-contained branches, non-arith branches) fall
 -- through to the sound crypto_call fallback — NO new axiom is introduced.
 
-/-- **O1 sub-omnibus — loop family.**
+/-- **O1 sub-omnibus — loop family — RETIRED (Tier 1, 2026-06-13).**
 
-Phase D harness integration: codegen-soundness for ANF bodies with
-`loop` bindings (bounded iteration lowered to an unrolled chain of
-`OP_DUP / OP_TOALTSTACK / body / OP_FROMALTSTACK` per iteration). The
-hypothesis `hLoop` requires the body to satisfy
-`Agrees.structuralLoopBodyBool`.
+The axiom `compileSafe_observational_correct_modulo_loop_codegen` is GONE.
+Its omnibus dispatch arm is now discharged by this PROVEN theorem
+`compileSafe_observational_correct_loop_consume`.
 
-Discharge path: this sub-omnibus retires once Stage C A7 widening
-completes; see `PATH2_PLAN.md` §5.23.
--/
-axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
-    (_hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
-    (_hMem : anfM ∈ p.methods) (_hPublic : anfM.isPublic = true)
-    (_hSafe : compileSafe p = .ok bytes)
+The discharge is exact, not an over-approximation. The omnibus carries the
+top-level guard `hNoLoop : programUsesLoopB p = false`
+(`compileSafe_observational_correct_modulo_codegen_axioms`,
+Pipeline.lean), so EVERY program that reaches any dispatch arm — the loop
+arm included — is loop-FREE. The loop arm fires on the decidable guard
+`structuralLoopBodyBool`, but that classifier is satisfied by loop-free
+bodies too (its non-`.loop` case falls through to the `if_val` structural
+check; see `Agrees.structuralLoopValueBool`). A body that ACTUALLY contains
+a `.loop` binding forces `bindingsUseLoopB anfM.body = true`, contradicting
+`bindingsUseLoopB_false_of_program p anfM hMem hNoLoop`; such bodies are
+therefore vacuous in this context. The non-vacuous residue is exactly the
+loop-FREE programs whose body shape satisfies `structuralLoopBodyBool` —
+precisely the class the SOUND universal `crypto_call` fallback covers (the
+`crypto_call` sub-omnibus dropped its own `_hNoLoop` guard in the 2026-06-11
+truthy-top repair, so it admits every single-public loop-free body the
+earlier structural classifiers did not peel).
+
+Hence the loop arm composes the loop-freedom restriction
+(`bindingsUseLoopB_false_of_program`) with the sound `crypto_call`
+fallback. NO new axiom is introduced, and NO real loop-body codegen
+obligation is hidden: the growing-per-iteration-depth loop codegen proof
+(A7 Tier 3b/3d, deferred) only becomes load-bearing once `hNoLoop` is
+LIFTED from the omnibus — a separate, larger widening tracked in the
+`crypto_call` axiom comment / `PATH2_PLAN.md` §5.23. -/
+theorem compileSafe_observational_correct_loop_consume (p : ANFProgram)
+    (hWF : WF.ANF p) (anfM : ANFMethod) (bytes : ByteArray)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
-    (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    (hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    -- Top-level loop-freedom guard, inherited verbatim from the omnibus.
+    -- This is what makes the discharge exact: it confines the loop arm to
+    -- loop-FREE bodies (any `.loop` binding refutes it via
+    -- `bindingsUseLoopB_false_of_program`).
+    (_hNoLoop : programUsesLoopB p = false)
     (_hLoop :
       Agrees.structuralLoopBodyBool
         p.methods p.properties
@@ -3658,24 +3686,6 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
         anfM.body
         (List.reverse (anfM.params.map (·.name)))
         0 = true)
-    -- Loop map-neutrality guard (RE-EVALUATED 2026-06-11, twice: after
-    -- the loop-arm fidelity rewrite, then after the truthy-top
-    -- success-bit repair): the divergence that motivated this guard
-    -- (`loopCx*` — the old arm's misplaced per-iteration drop) is FIXED;
-    -- the faithful arm's byte parity is pinned against the TS reference
-    -- (`loopOk_hex_matches_ts`, bounded-loop golden); and the
-    -- terminal-assert success-bit falsifier class (reason (b) of the
-    -- previous retention) is RESOLVED by the acceptance restatement
-    -- (`loopOk_start7_acceptAgrees`). The guard is KEPT for the one
-    -- SURVIVING reason: (a) methodCall-spliced loop bodies remain
-    -- byte-UNVERIFIED (TS's localBindings pollution persists ACROSS
-    -- iterations after an inlined call, while the model resets the union
-    -- per loop entry). The retained fragment (iteration-identical
-    -- map-neutral loop bodies that consume their iteration variable, per
-    -- `bodyLoopMapNeutralB`) is the class whose per-iteration chunks are
-    -- provably iteration-invariant under the faithful arm (see
-    -- `AgreesA7.lowerLoopItersP_neutral_eq`). Widening is blocked on a
-    -- byte-parity probe of the methodCall-in-loop class.
     (_hLoopNeutral :
       bodyLoopMapNeutralB
         p.methods p.properties
@@ -3688,17 +3698,24 @@ axiom compileSafe_observational_correct_modulo_loop_codegen (p : ANFProgram)
         0 = true)
     -- Value-terminated-body keyed truthiness premise (2026-06-11
     -- truthy-top success-bit repair; same role as on the crypto_call
-    -- axiom): for a loop body that does not end in assert the lowered
-    -- ops leave the final value on top, and acceptance = completion only
-    -- under this explicit (input-side) truthiness fact. Vacuous for
-    -- every frontend-reachable program (the TS validator forces public
-    -- methods to end in assert).
-    (_hValueTruthy : Lower.bodyEndsInAssert anfM.body = false →
+    -- fallback): for a loop-free body that does not end in assert the
+    -- lowered ops leave the final value on top, and acceptance =
+    -- completion only under this explicit (input-side) truthiness fact.
+    -- Forwarded verbatim to the crypto_call fallback. Vacuous for every
+    -- frontend-reachable program (the TS validator forces public methods
+    -- to end in assert).
+    (hValueTruthy : Lower.bodyEndsInAssert anfM.body = false →
       ∀ s, runParsedBytes bytes initialStack = .ok s →
         topTruthy s.stack = true) :
     acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
-      (runParsedBytes bytes initialStack)
+      (runParsedBytes bytes initialStack) :=
+  -- Loop-free residue ⇒ the sound universal crypto_call fallback. The
+  -- `_hLoop` / `_hLoopNeutral` guards are not needed for the loop-free
+  -- residue (they only scoped the now-deferred real-loop codegen class).
+  compileSafe_observational_correct_modulo_crypto_call_codegen
+    p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+    hValueTruthy
 
 -- **O1 sub-omnibus — method_call family — RETIRED (Tier 1 wave 66, 2026-05-24).**
 -- The axiom `compileSafe_observational_correct_modulo_method_call_codegen` is
@@ -9022,8 +9039,9 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                     Lower.defaultInlineBudget
                     lastUses [] localBindings constInts
                     anfM.body initialSm 0 = true
-              · exact compileSafe_observational_correct_modulo_loop_codegen
-                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hLoop
+              · exact compileSafe_observational_correct_loop_consume
+                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+                  hNoLoop hLoop
                   (bodyLoopMapNeutralB_of_noLoop p.methods p.properties
                     Lower.defaultInlineBudget (Lower.computeLastUses anfM.body) []
                     (anfM.body.map (·.name)) (Lower.collectConstInts anfM.body)
