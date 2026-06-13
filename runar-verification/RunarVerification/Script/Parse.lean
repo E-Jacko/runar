@@ -667,6 +667,11 @@ def isAllowedOpcodeName (name : String) : Bool :=
     || name = "OP_ADD" || name = "OP_SUB" || name = "OP_MUL"
     || name = "OP_EQUAL" || name = "OP_EQUALVERIFY"
     || name = "OP_HASH160" || name = "OP_SHA256"
+    -- OP_HASH256 (byte 0xaa): emitted by the peephole's `applyDoubleSha256`
+    -- fusion (`[OP_SHA256, OP_SHA256] → [OP_HASH256]`).  Round-trips cleanly —
+    -- `parseStackOp1? 0xaa = some (.opcode "OP_HASH256")` (0xaa is neither a
+    -- short-form byte nor an if-frame byte), so it is safe to allowlist.
+    || name = "OP_HASH256"
     || name = "OP_CHECKSIG" || name = "OP_CHECKSIGVERIFY"
     || name = "OP_CAT" || name = "OP_SPLIT"
     -- Wave 49: math_byte single-arg popping opcodes. These three round-trip
@@ -1295,6 +1300,10 @@ theorem parseStackOpFuel_OP_SHA256 (fuel : Nat) (rest : List UInt8) :
     parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_SHA256") ++ rest)
       = .ok (.opcode "OP_SHA256", rest) := rfl
 
+theorem parseStackOpFuel_OP_HASH256 (fuel : Nat) (rest : List UInt8) :
+    parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_HASH256") ++ rest)
+      = .ok (.opcode "OP_HASH256", rest) := rfl
+
 theorem parseStackOpFuel_OP_CHECKSIG (fuel : Nat) (rest : List UInt8) :
     parseStackOpFuel (fuel + 1) (emitStackOpL (.opcode "OP_CHECKSIG") ++ rest)
       = .ok (.opcode "OP_CHECKSIG", rest) := rfl
@@ -1414,6 +1423,7 @@ theorem parseStackOpFuel_opcode_allowed (fuel : Nat) (rest : List UInt8)
   obtain h1 | h1 := h1
   obtain h1 | h1 := h1
   obtain h1 | h1 := h1
+  obtain h1 | h1 := h1
   all_goals (subst h1; first
     | exact parseStackOpFuel_OP_VERIFY fuel rest
     | exact parseStackOpFuel_OP_NEGATE fuel rest
@@ -1425,6 +1435,7 @@ theorem parseStackOpFuel_opcode_allowed (fuel : Nat) (rest : List UInt8)
     | exact parseStackOpFuel_OP_EQUALVERIFY fuel rest
     | exact parseStackOpFuel_OP_HASH160 fuel rest
     | exact parseStackOpFuel_OP_SHA256 fuel rest
+    | exact parseStackOpFuel_OP_HASH256 fuel rest
     | exact parseStackOpFuel_OP_CHECKSIG fuel rest
     | exact parseStackOpFuel_OP_CHECKSIGVERIFY fuel rest
     | exact parseStackOpFuel_OP_CAT fuel rest
@@ -1557,6 +1568,7 @@ theorem emitStackOpL_cons_of_RunarEmittable (op : StackOp)
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
+      obtain hN | hN := hN
       all_goals (subst hN; first
         | exact ⟨0x69, [], rfl⟩  -- VERIFY
         | exact ⟨0x8f, [], rfl⟩  -- NEGATE
@@ -1568,6 +1580,7 @@ theorem emitStackOpL_cons_of_RunarEmittable (op : StackOp)
         | exact ⟨0x88, [], rfl⟩  -- EQUALVERIFY
         | exact ⟨0xa9, [], rfl⟩  -- HASH160
         | exact ⟨0xa8, [], rfl⟩  -- SHA256
+        | exact ⟨0xaa, [], rfl⟩  -- HASH256 (2026-06-13 fusion image)
         | exact ⟨0xac, [], rfl⟩  -- CHECKSIG
         | exact ⟨0xad, [], rfl⟩  -- CHECKSIGVERIFY
         | exact ⟨0x7e, [], rfl⟩  -- CAT
@@ -1839,6 +1852,7 @@ theorem emitStackOp_toList_of_RunarEmittable (op : StackOp)
       unfold isAllowedOpcodeName at hAllow
       simp only [Bool.or_eq_true, decide_eq_true_eq] at hAllow
       obtain hN | hN := hAllow
+      obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
@@ -2248,6 +2262,7 @@ private theorem head_of_emitStackOpL_not_else_or_endif
       unfold isAllowedOpcodeName at hAllow
       simp only [Bool.or_eq_true, decide_eq_true_eq] at hAllow
       obtain hN | hN := hAllow
+      obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
       obtain hN | hN := hN
