@@ -20,7 +20,22 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=71        # ±0 (2026-06-10 — BIP-143 bridge TIGHTENED, count-neutral:
+TARGET_AXIOMS=70        # −1 (2026-06-13 — loop sub-omnibus RETIRED:
+                        # `compileSafe_observational_correct_modulo_loop_codegen`
+                        # is GONE; its omnibus dispatch arm is discharged by the
+                        # theorem `compileSafe_observational_correct_loop_consume`.
+                        # The omnibus's top-level `hNoLoop`
+                        # (`programUsesLoopB p = false`) confines the loop arm to
+                        # loop-FREE bodies (a `structuralLoopBodyBool`-accepted
+                        # body containing a real `.loop` refutes `hNoLoop` via
+                        # `bindingsUseLoopB_false_of_program`), so the non-vacuous
+                        # residue is exactly the loop-free shapes the sound
+                        # `crypto_call` fallback already covers — NO new axiom.
+                        # The deferred growing-per-iteration-depth real-loop
+                        # codegen proof (A7 Tier 3b/3d) only becomes load-bearing
+                        # once `hNoLoop` is lifted from the omnibus.)
+                        #
+                        # Previous: 71 — ±0 (2026-06-10 — BIP-143 bridge TIGHTENED, count-neutral:
                         # `checkPreimage_iff_checkSig_under_validTxContext` in
                         # Stack/StatefulBridge.lean equated the two backend
                         # verdicts for UNIVERSALLY quantified sig/pk, which
