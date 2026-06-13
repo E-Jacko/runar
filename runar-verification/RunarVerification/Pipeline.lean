@@ -10,6 +10,7 @@ import RunarVerification.Stack.AgreesA5
 import RunarVerification.Stack.AgreesA6
 import RunarVerification.Stack.AgreesA8
 import RunarVerification.Stack.AgreesHashCall
+import RunarVerification.Stack.AgreesCat
 import RunarVerification.Stack.AgreesStateful
 import RunarVerification.Stack.AgreesD1
 import RunarVerification.Stack.AgreesD2
@@ -8476,6 +8477,260 @@ theorem compileSafe_observational_correct_mathByte_consume
     AgreesA4.bodyEndsInAssert_false_of_noLen anfM.body tsm hShapeNoLen
   exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
 
+/-! ## math_byte fragment WIDENED to the 2-arg `cat` builtin (OP_CAT)
+
+The single-arg math_byte consume fragment is widened here to admit the
+canonical two-param concatenation method `f(a, b) { d := cat(a, b) }`.
+There is no `+` on ByteString in Rúnar — byte concatenation is the `cat`
+builtin (`.call "cat" [a, b]` → `OP_CAT`).  The lowering substrate lives in
+`Stack/AgreesCat.lean`; this section carries the peephole reduction and the
+in-`Pipeline` consume theorem.
+
+`RAW = [swap, swap, OP_CAT]` (both params consumed; the d1d0 copy emits two
+swaps that cancel) and the post-peephole image collapses to `[OP_CAT]`
+(`applyDoubleSwap`), so this is the OPERATIONAL M3 regime (NOT op-list
+identity) exactly like the wave-63 update_prop image. -/
+
+/-- The 4-pass peephole pipeline collapses the cat fragment RAW
+`[swap, swap, OP_CAT]` to the single `[OP_CAT]` (the first pass'
+`applyDoubleSwap` cancels the swap pair; the remaining three passes are the
+identity on a single opcode). -/
+theorem peepholeMethodOps_catOps :
+    peepholeMethodOps AgreesCat.catOps = [StackOp.opcode "OP_CAT"] := by
+  unfold peepholeMethodOps
+  have hNoIf : Peephole.noIfOp AgreesCat.catOps := by
+    simp [AgreesCat.catOps, Peephole.noIfOp]
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
+  have hFlat : Peephole.peepholePassAllFlat AgreesCat.catOps
+      = [StackOp.opcode "OP_CAT"] := by
+    simp +decide [AgreesCat.catOps, Peephole.peepholePassAllFlat,
+      Peephole.applyEqualVerifyFuse, Peephole.applyCheckSigVerifyFuse,
+      Peephole.applyNumEqualVerifyFuse, Peephole.applyZeroNumEqual,
+      Peephole.applyDoubleSha256, Peephole.applyDoubleDrop, Peephole.applyDoubleOver,
+      Peephole.applyDoubleNot, Peephole.applyDoubleNegate, Peephole.applyOneSub,
+      Peephole.applyOneAdd, Peephole.applySubZero, Peephole.applyAddZero,
+      Peephole.applyPushPushMul, Peephole.applyPushPushSub, Peephole.applyPushPushAdd,
+      Peephole.applyDoubleSwap, Peephole.applyDupDrop, Peephole.applyDropAfterPush]
+  rw [hFlat]
+  have hNoIfCat : Peephole.noIfOp [StackOp.opcode "OP_CAT"] := by simp [Peephole.noIfOp]
+  rw [Peephole.peepholePostFold_eq_applyPushOne_of_noIfOp _ hNoIfCat]
+  have hPost : Peephole.applyPushOneSub
+      (Peephole.applyPushOneAdd [StackOp.opcode "OP_CAT"])
+      = [StackOp.opcode "OP_CAT"] := by
+    simp [Peephole.applyPushOneAdd, Peephole.applyPushOneSub]
+  rw [hPost, Peephole.peepholeChainFold_eq_self_of_noIfOp_pushFree _ hNoIfCat
+        (by simp [Peephole.pushFree]),
+    Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIfCat
+        (by simp [Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])]
+
+/-- **cat 2-arg consume (completion-bit leg).** Discharges the omnibus
+obligation for a single-public `f(a, b) = cat(a, b)` method, given the
+two-bytes-typed entry (`a`, `b` resolve to bytes; the entry stack carries
+them as `b` over `a`).  PRIVATE leg; the headline `acceptAgrees` restatement
+is below.  4-leg transitivity:
+
+* **M2** — `AgreesCat.cat_M2` gives the body-level success iff between
+  `evalBindingsP` and `runOps catOps`.
+* **M3 (OPERATIONAL)** — unlike a single-opcode body, `peepholeMethodOps RAW
+  ≠ RAW`; `AgreesCat.runOps_catOnly_eq_catOps` proves
+  `runOps [OP_CAT] = runOps catOps` on the two-bytes entry (the swaps cancel).
+* **M4 (push round-trip)** — `[OP_CAT]` is `AreRunarEmittablePush`, fed to
+  `compileSafe_single_public_runOps_eq_push`.
+* **shape** — `peepholeProgram_single_public_shape` from `hSinglePublic` /
+  `hName`. -/
+private theorem cat_consume_completion
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (bn a b : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : (anfM.params.map (·.name)).reverse = [b, a])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "cat" [a, b]) src])
+    (hab : a ≠ b)
+    (ba bb : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArgA : initialAnf.resolveRef a = some (.vBytes ba))
+    (hArgB : initialAnf.resolveRef b = some (.vBytes bb))
+    (hStk : initialStack.stack = .vBytes bb :: .vBytes ba :: rest) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hUnique :
+      ∀ m', m' ∈ p.methods → m'.isPublic = true →
+        (m'.name == anfM.name) = true → m' = anfM :=
+    unique_public_of_filter_singleton p anfM hSinglePublic
+  have hNoPreimage : Lower.bindingsUseCheckPreimage anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseCheckPreimage]
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseCodePart]
+  have hNoDeserialize : Lower.bindingsUseDeserializeState anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseDeserializeState]
+  have hNoTerminalAssert : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBody]; simp [Lower.bodyEndsInAssert]
+  -- Method RAW = catOps.
+  have hRaw : Agrees.lowerMethodUserRawOps p.methods p.properties anfM = AgreesCat.catOps :=
+    AgreesCat.lowerMethodUserRawOps_cat p.methods p.properties anfM bn a b src
+      hParams hBody hab
+  -- Leg M2: ANF eval agrees with `runOps catOps`.
+  have hM2 :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+        (runOps AgreesCat.catOps initialStack) := by
+    rw [hBody]
+    exact AgreesCat.cat_M2 p.methods initialAnf initialStack bn a b src ba bb rest
+      hArgA hArgB hStk
+  -- Leg M2→method.
+  have hM2Method :
+      successAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+        (runMethod (Lower.lower p) anfM.name initialStack) := by
+    have hRunEq :
+        runMethod (Lower.lower p) anfM.name initialStack
+          = runOps (Agrees.lowerMethodUserRawOps p.methods p.properties anfM) initialStack := by
+      have hP : p =
+          { contractName := p.contractName, properties := p.properties,
+            methods := p.methods } := rfl
+      rw [hP]
+      exact Agrees.runMethod_lower_public_unique_no_post_eq_userRaw
+        p.contractName p.properties p.methods anfM initialStack hMem hPublic hUnique
+        hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize
+    rw [hRunEq, hRaw]; exact hM2
+  -- shape: post-peephole program is single-public with body `peepholeMethodOps RAW`.
+  obtain ⟨hPubSingleton, _hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  have hPeepedOpsImg : (peepholedLoweredMethod p anfM).ops = [StackOp.opcode "OP_CAT"] := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops
+      = [StackOp.opcode "OP_CAT"]
+    rw [Agrees.lowerMethod_ops_eq_userRaw_no_implicits_no_post
+          p.methods p.properties anfM hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize,
+        hRaw, peepholeMethodOps_catOps]
+  have hEmitPush : Parse.AreRunarEmittablePush (peepholedLoweredMethod p anfM).ops := by
+    show Parse.areRunarEmittablePushBool (peepholedLoweredMethod p anfM).ops = true
+    rw [hPeepedOpsImg]; rfl
+  -- M4: `runParsedBytes bytes = runOps [OP_CAT]`.
+  have hM4 :
+      runParsedBytes bytes initialStack = runOps [StackOp.opcode "OP_CAT"] initialStack := by
+    have hEq :
+        runParsedBytes bytes initialStack
+          = runOps (peepholedLoweredMethod p anfM).ops initialStack :=
+      compileSafe_single_public_runOps_eq_push p bytes (peepholedLoweredMethod p anfM)
+        initialStack hSafe hPubSingleton hEmitPush
+    rw [hEq, hPeepedOpsImg]
+  -- M3 (operational): `runOps [OP_CAT] = runOps catOps` on the two-bytes entry.
+  have hM3 :
+      runOps [StackOp.opcode "OP_CAT"] initialStack = runOps AgreesCat.catOps initialStack :=
+    AgreesCat.runOps_catOnly_eq_catOps initialStack ba bb rest hStk
+  -- Compose: M2 ∘ M3 ∘ M4.
+  have hParsed :
+      successAgrees
+        (runMethod (Lower.lower p) anfM.name initialStack)
+        (runParsedBytes bytes initialStack) := by
+    rw [hM4, hM3]
+    have hMethodEq :
+        runMethod (Lower.lower p) anfM.name initialStack = runOps AgreesCat.catOps initialStack := by
+      have hRunEq :
+          runMethod (Lower.lower p) anfM.name initialStack
+            = runOps (Agrees.lowerMethodUserRawOps p.methods p.properties anfM) initialStack := by
+        have hP : p =
+            { contractName := p.contractName, properties := p.properties,
+              methods := p.methods } := rfl
+        rw [hP]
+        exact Agrees.runMethod_lower_public_unique_no_post_eq_userRaw
+          p.contractName p.properties p.methods anfM initialStack hMem hPublic hUnique
+          hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize
+      rw [hRunEq, hRaw]
+    rw [hMethodEq]; exact successAgrees_refl _
+  exact successAgrees_trans _ _ _ hM2Method hParsed
+
+/-- **cat 2-arg consume (HEADLINE, acceptance bit).** Restated over
+`acceptAgrees` (truthy-top success-bit). The fragment is VALUE-terminated
+(the concatenated bytes land on top). A NONEMPTY byte string is truthy under
+the VM's `asBool?`, but the inputs are OPAQUE in-model (no nonempty-bytes
+axiom), so the truthiness fact is carried as the keyed `hTopTruthy` premise
+(FLAGGED: new hypothesis vs. the completion-era statement; discharged per
+fixture by `native_decide` on the concrete run). -/
+theorem compileSafe_observational_correct_cat_consume
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (bn a b : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : (anfM.params.map (·.name)).reverse = [b, a])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "cat" [a, b]) src])
+    (hab : a ≠ b)
+    (ba bb : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArgA : initialAnf.resolveRef a = some (.vBytes ba))
+    (hArgB : initialAnf.resolveRef b = some (.vBytes bb))
+    (hStk : initialStack.stack = .vBytes bb :: .vBytes ba :: rest)
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hOld := cat_consume_completion
+    p anfM bytes bn a b src hMem hPublic hSafe initialAnf initialStack
+    hSinglePublic hName hParams hBody hab ba bb rest hArgA hArgB hStk
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBody]; simp [Lower.bodyEndsInAssert]
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
+
+/-! ### MANDATORY smoke: the cat consume theorem fires
+
+The canonical single-public cat contract `C` with public `f(a, b) =
+cat(a, b)`, fired end-to-end through `compileSafe_observational_correct_cat_consume`:
+`compileSafe` accepts it, and on a concrete two-bytes entry (`a ↦ #[01,02]`,
+`b ↦ #[03]`, the same bytes on the deployed stack as `b` over `a`) the ANF
+eval and the deployed-bytes run AGREE on their acceptance bit. -/
+
+private def catSmokeProg : ANFProgram :=
+  { contractName := "C", properties := [],
+    methods := [RunarVerification.Stack.AgreesCat.smokeMethod] }
+
+private def catSmokeAnf : State :=
+  { (default : State) with
+    bindings := [("b", .vBytes (ByteArray.mk #[3])), ("a", .vBytes (ByteArray.mk #[1, 2]))] }
+
+private def catSmokeStk : StackState :=
+  { (default : StackState) with
+    stack := [.vBytes (ByteArray.mk #[3]), .vBytes (ByteArray.mk #[1, 2])] }
+
+/-- SMOKE — `compileSafe_observational_correct_cat_consume` fires on the
+canonical cat contract.  The concatenation-result-truthiness fact is carried
+as `hTopTruthy` (the inputs are OPAQUE in-model; in reality `a ++ b` is
+nonempty when either input is, truthy under `asBool?`).  The fragment's
+REACHABILITY (compileSafe succeeds) is unconditional. -/
+theorem smoke_cat_consume_fires
+    (hTopTruthy : ∀ bytes s, compileSafe catSmokeProg = .ok bytes →
+        runParsedBytes bytes catSmokeStk = .ok s →
+        topTruthy s.stack = true) :
+    ∃ bytes, compileSafe catSmokeProg = .ok bytes ∧
+      acceptAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP catSmokeProg.methods catSmokeAnf
+          RunarVerification.Stack.AgreesCat.smokeMethod.body)
+        (runParsedBytes bytes catSmokeStk) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe catSmokeProg = .ok b := by
+    have h : (compileSafe catSmokeProg).toOption.isSome = true := by native_decide
+    cases hc : compileSafe catSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  have hMem : RunarVerification.Stack.AgreesCat.smokeMethod ∈ catSmokeProg.methods := by
+    simp [catSmokeProg]
+  have hPub : RunarVerification.Stack.AgreesCat.smokeMethod.isPublic = true := rfl
+  have hSP : catSmokeProg.methods.filter (·.isPublic)
+      = [RunarVerification.Stack.AgreesCat.smokeMethod] := by
+    simp [catSmokeProg, RunarVerification.Stack.AgreesCat.smokeMethod]
+  exact compileSafe_observational_correct_cat_consume catSmokeProg
+    RunarVerification.Stack.AgreesCat.smokeMethod bytes "d" "a" "b" none
+    hMem hPub hSafe catSmokeAnf catSmokeStk
+    hSP (by decide) rfl rfl (by decide)
+    (ByteArray.mk #[1, 2]) (ByteArray.mk #[3]) [] rfl rfl rfl
+    (fun _ s hRun => hTopTruthy bytes s hSafe hRun)
+
 /-- **The statefulFull DISCHARGED-PATH guard (2026-06-12 premise-shape
 repair).**  TRUE exactly when the omnibus dispatch reaches the
 `statefulFull` consume theorem: the widened classifier fires, the
@@ -8671,6 +8926,26 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
         AgreesA4.structuralCallBody (Lower.computeLastUses anfM.body) []
           anfM.body (anfM.params.map (fun pp => pp.name) |>.reverse) 0 ∧
         AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf)
+    -- **math_byte-WIDENED 2-arg `cat` consume premise (keyed).**  For a body in
+    -- the canonical two-param `cat` fragment (decided by
+    -- `catConsumeShapeBool` — two distinct params `[a, b]`, body one binding
+    -- `bn := cat(a, b)`) the shape witnesses plus the two-bytes-typed entry
+    -- (`a`, `b` resolve to bytes; the entry stack carries them as `b` over `a`)
+    -- are recovered.  Keyed on the DECIDABLE classifier, it is VACUOUS for every
+    -- non-cat body (the antecedent is `false`), so the omnibus stays jointly
+    -- satisfiable; its only consumer is the conformance harness, which discharges
+    -- it per fixture from the bytes-typed entry.  Single-public-gated (like the
+    -- hash peel premises): the consequent pins the FULL entry-stack layout.
+    (hMathByteCatFrag : (p.methods.filter (·.isPublic)).length < 2 →
+      RunarVerification.Stack.AgreesCat.catConsumeShapeBool anfM = true →
+        ∃ (bn a b : String) (src : Option SourceLoc)
+          (ba bb : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          (anfM.params.map (·.name)).reverse = [b, a] ∧
+          anfM.body = [ANFBinding.mk bn (.call "cat" [a, b]) src] ∧
+          a ≠ b ∧
+          initialAnf.resolveRef a = some (.vBytes ba) ∧
+          initialAnf.resolveRef b = some (.vBytes bb) ∧
+          initialStack.stack = .vBytes bb :: .vBytes ba :: rest)
     -- **Wave 64 update_prop consume typed-entry premise (keyed).**  For a body
     -- in the canonical `prop ± small-const ; update_prop` consume fragment
     -- (decided by `updatePropConsumeShapeBool`) the entry tsm is the single
@@ -9091,6 +9366,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
       have hHashCallFrag := hHashCallFrag hSpLt
       have hHashAssertFrag := hHashAssertFrag hSpLt
       have hHashChainFrag := hHashChainFrag hSpLt
+      have hMathByteCatFrag := hMathByteCatFrag hSpLt
       -- **Wave 39 consume-arith branch (replaces the retired arith axiom).**
       by_cases hArithConsume :
           anfM.name ≠ "constructor" ∧
@@ -9101,7 +9377,29 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
           Γ hSinglePublic hArithConsume.1 hArithConsume.2 hUntag hTypedEntry
           (hTsmTyped hArithConsume) hCoh hValueTruthy
-      · -- **Wave 51 consume-`math_byte` branch (replaces the retired math_byte
+      · -- **math_byte-WIDENED 2-arg `cat` branch.**  The decidable
+        -- `catConsumeShapeBool` classifier pins the body to the canonical
+        -- two-param `cat(a, b)` consume fragment; the keyed `hMathByteCatFrag`
+        -- premise recovers the shape witnesses + the two-bytes-typed entry, and
+        -- the discharged consume theorem fires (value-terminated — consumes the
+        -- keyed `hValueTruthy` truthiness premise).  Bodies OUTSIDE this fragment
+        -- fall through to the single-arg math_byte / crypto_call cascade — NO new
+        -- axiom is introduced.
+        by_cases hCatShape :
+            RunarVerification.Stack.AgreesCat.catConsumeShapeBool anfM = true
+        case pos =>
+          by_cases hCatName : anfM.name ≠ "constructor"
+          · obtain ⟨bnC, aC, bC, srcC, baC, bbC, restC,
+              hCatParams, hCatBody, hCatNe, hCatArgA, hCatArgB, hCatStk⟩ :=
+              hMathByteCatFrag hCatShape
+            exact compileSafe_observational_correct_cat_consume p anfM bytes
+              bnC aC bC srcC hMem hPublic hSafe initialAnf initialStack
+              hSinglePublic hCatName hCatParams hCatBody hCatNe
+              baC bbC restC hCatArgA hCatArgB hCatStk hValueTruthy
+          · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+        case neg =>
+        -- **Wave 51 consume-`math_byte` branch (replaces the retired math_byte
         -- axiom).**  The decidable NO-LEN math_byte classifier pins the body to
         -- `abs` / `bin2num` / `toByteString` chains at head slots; the keyed
         -- premise `hMathByteFrag` then supplies the copy-mode structural-call
@@ -9406,6 +9704,16 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
         AgreesA4.structuralCallBody (Lower.computeLastUses anfM.body) []
           anfM.body (anfM.params.map (fun pp => pp.name) |>.reverse) 0 ∧
         AgreesA4.mathByteSingleArgBody anfM.body tsm initialAnf)
+    (hMathByteCatFrag : (p.methods.filter (·.isPublic)).length < 2 →
+      RunarVerification.Stack.AgreesCat.catConsumeShapeBool anfM = true →
+        ∃ (bn a b : String) (src : Option SourceLoc)
+          (ba bb : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          (anfM.params.map (·.name)).reverse = [b, a] ∧
+          anfM.body = [ANFBinding.mk bn (.call "cat" [a, b]) src] ∧
+          a ≠ b ∧
+          initialAnf.resolveRef a = some (.vBytes ba) ∧
+          initialAnf.resolveRef b = some (.vBytes bb) ∧
+          initialStack.stack = .vBytes bb :: .vBytes ba :: rest)
     (hUpdatePropFrag :
       Agrees.updatePropConsumeShapeBool anfM.body = true →
         ∀ (prop op : String) (c : Int),
@@ -9620,7 +9928,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
       (runParsedBytes bytes initialStack) :=
   compileSafe_observational_correct_modulo_codegen_axioms
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
-    hNoLoop Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hUpdatePropFrag
+    hNoLoop Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hMathByteCatFrag hUpdatePropFrag
     hMethodCallFrag hHashCallFrag hHashAssertFrag hHashChainFrag hStatefulFrag hStatefulFullFrag hDispatchFrag
     hDispatchMixedFrag hValueTruthy hCoh
 
