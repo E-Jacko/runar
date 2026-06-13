@@ -3545,6 +3545,115 @@ theorem termCx_acceptAgrees_satisfying (bytes : ByteArray)
   rw [hSafe] at hAccept
   exact Stack.Eval.acceptAgrees_of_bits_true termCx_anf_succeeds_satisfying hAccept
 
+/-- **No-fragment residual body classifier (2026-06-13 legibility re-key).**
+
+Decidable Bool that is `true` exactly when a single-public method body
+matches NONE of the fully-discharged single-public BODY-SHAPE fragment
+classifiers tried in the omnibus cascade after the arith/cat split:
+`updateProp`, `loop`, `methodCall`, `hashAssert`, `hashChain`, and
+`hashCall`.  (The `cat` negation is carried separately on `anfM` in
+`cryptoCallResidueB` since its classifier takes the whole method; the
+`arith` / `if_val` fragments are name-gated and handled by the
+`name == "constructor"` / `ifValArithBodyBool` disjuncts there.)
+
+This is the precise SHAPE of the body reaching the terminal fallback
+site of the cascade: every structural classifier returned `false`.  It
+is the load-bearing meaningful conjunct of `cryptoCallResidueB` — a body
+that the cascade DOES discharge through one of these fragments makes this
+`false`. -/
+def cryptoCallNoFragmentBodyB (p : ANFProgram) (anfM : ANFMethod) : Bool :=
+  (!Stack.AgreesCat.catConsumeShapeBool anfM)
+    && (!Agrees.updatePropConsumeShapeBool anfM.body)
+    && (!Agrees.methodCallConsumeShapeBool p.methods anfM)
+    && (!Stack.AgreesHashCall.hashAssertConsumeShapeBool anfM)
+    && (!Stack.AgreesHashCall.hashChainConsumeShapeBool anfM)
+    && (!Stack.AgreesHashCall.hashCallConsumeShapeBool anfM)
+
+/-- **Loop-classified residual body classifier (2026-06-13 legibility re-key).**
+
+Decidable Bool, `true` on a body the cascade's loop arm leaves to the
+fallback: a `structuralLoopBodyBool`-accepted body (loop-FREE in context —
+the omnibus `hNoLoop` guard forbids a real `.loop` binding) that is neither
+the emittable arith fragment nor the `if_val` arith fragment nor a `cat` /
+`updateProp` body.  These conjuncts are exactly the negated classifiers
+established on the path to the loop dispatch arm; ANDing them keeps the
+predicate from going true on arith / cat / updateProp bodies (preserving
+anti-vacuity). -/
+def cryptoCallLoopResidueB (p : ANFProgram) (anfM : ANFMethod) : Bool :=
+  Agrees.structuralLoopBodyBool
+      p.methods p.properties
+      Lower.defaultInlineBudget
+      (Lower.computeLastUses anfM.body) []
+      (anfM.body.map (·.name))
+      (Lower.collectConstInts anfM.body)
+      anfM.body
+      (List.reverse (anfM.params.map (·.name)))
+      0
+    && (!Agrees.emittableArithChainReadyNoDblNeg
+          (Lower.computeLastUses anfM.body) anfM.body
+          (List.reverse (anfM.params.map (·.name))) 0 false)
+    && (!Agrees.ifValArithBodyBool
+          p.methods p.properties
+          Lower.defaultInlineBudget 0
+          (Lower.computeLastUses anfM.body) []
+          (Lower.collectConstInts anfM.body)
+          (List.reverse (anfM.params.map (·.name)))
+          anfM.body)
+    && (!Stack.AgreesCat.catConsumeShapeBool anfM)
+    && (!Agrees.updatePropConsumeShapeBool anfM.body)
+
+/-- **Crypto-call fallback RESIDUAL predicate (2026-06-13 legibility re-key).**
+
+Decidable Bool the universal `crypto_call` fallback axiom is now keyed on.
+It documents — as an inspectable named predicate, instead of an implicit
+catch-all — the exact domain over which the fallback fires in the omnibus
+dispatch cascade.  It is a DISJUNCTION over the structural site-classes the
+cascade leaves to the fallback, each provable from local branch context at
+its dispatch site:
+
+* `(p.methods.filter (·.isPublic)).length ≥ 2` — the MULTI-PUBLIC residue
+  (the stateful-multi arm and the post-dispatch multi-public arm: a
+  multi-public program whose program-level dispatch classifiers did not
+  fire).
+* `Lower.bindingsUseCheckPreimage anfM.body = true` — the STATEFUL residue
+  (single-public stateful bodies the stateful consume fragments did not
+  peel).
+* `anfM.name == "constructor"` — the seven name-gated inner fallbacks (a
+  body whose own fragment classifier DID fire but whose method is the
+  constructor, excluded from every consume theorem's `name ≠ "constructor"`
+  side-condition).
+* `Agrees.ifValArithBodyBool …` — the IF_VAL residue (a single-`.ifVal`
+  arith-branch body whose residual structural facts — cond at head /
+  last-use / self-contained branches — failed).
+* `cryptoCallLoopResidueB p anfM` — the LOOP residue (a loop-classified,
+  loop-free body the loop arm forwards to the fallback, restricted off the
+  arith / if_val / cat / updateProp fragments).
+* `cryptoCallNoFragmentBodyB p anfM` — the TERMINAL no-fragment residue
+  (a single-public body matching none of the body-shape classifiers).
+
+**Provably excluded** (the predicate is non-vacuous): any single-public,
+non-stateful, non-constructor method body that the cascade DISCHARGES
+through a tsm-free BODY-SHAPE fragment — `cat`, `updateProp`, `methodCall`,
+`hashAssert`, `hashChain`, or `hashCall` — makes EVERY disjunct `false`, so
+`cryptoCallResidueB` is `false` on it.  (The `arith`, `math_byte`, and
+`if_val`-discharged fragments are name- or tsm-gated, hence not asserted
+excluded here; this predicate honestly scopes only the uniformly-provable,
+tsm-free body-shape fragments.) -/
+def cryptoCallResidueB (p : ANFProgram) (anfM : ANFMethod) : Bool :=
+  anfM.isPublic
+    && (decide ((p.methods.filter (·.isPublic)).length ≥ 2)
+        || Lower.bindingsUseCheckPreimage anfM.body
+        || (anfM.name == "constructor")
+        || Agrees.ifValArithBodyBool
+            p.methods p.properties
+            Lower.defaultInlineBudget 0
+            (Lower.computeLastUses anfM.body) []
+            (Lower.collectConstInts anfM.body)
+            (List.reverse (anfM.params.map (·.name)))
+            anfM.body
+        || cryptoCallLoopResidueB p anfM
+        || cryptoCallNoFragmentBodyB p anfM)
+
 /-- **O1 sub-omnibus — crypto call family.**
 
 Phase D harness integration: codegen-soundness for ANF bodies whose
@@ -3568,9 +3677,33 @@ in the dispatch BEFORE this axiom is reached — through the real
 axiom survives only as the residual for crypto bodies OUTSIDE that
 fragment (multi-binding, non-hash primitives, chained calls).
 
+**Residual-domain RE-KEY (2026-06-13, count-neutral legibility).** The
+axiom now carries the guard `_hResidue : cryptoCallResidueB p anfM = true`
+— a NAMED, decidable Bool predicate that documents the fallback's domain
+in its STATEMENT instead of leaving it an implicit catch-all.  The guard is
+DISCHARGED internally at every one of the omnibus's 14 dispatch sites from
+local branch context (it is NOT an omnibus premise — the omnibus signature
+is unchanged), so coverage is identical to before this re-key.
+`cryptoCallResidueB` is the disjunction of the structural site-classes the
+cascade leaves to the fallback:
+* MULTI-PUBLIC (`(filter isPublic).length ≥ 2`) — stateful-multi and
+  post-dispatch multi-public arms;
+* STATEFUL (`bindingsUseCheckPreimage anfM.body`) — residual single-public
+  stateful bodies;
+* CONSTRUCTOR (`anfM.name == "constructor"`) — the seven name-gated inner
+  fallbacks;
+* IF_VAL residue (`Agrees.ifValArithBodyBool …`);
+* LOOP residue (`cryptoCallLoopResidueB`);
+* TERMINAL no-fragment residue (`cryptoCallNoFragmentBodyB`).
+It provably EXCLUDES (anti-vacuity smokes
+`cryptoCallResidueB_{true_on_fallback,false_on_discharged}`) every
+single-public, non-stateful, non-constructor body the cascade peels through
+a tsm-free body-shape fragment — `cat` / `updateProp` / `methodCall` /
+`hashAssert` / `hashChain` / `hashCall`.
+
 Discharge path: this sub-omnibus retires after Phase B per-primitive
 codegen-to-spec discharges + A4-crypto Stage C wrappers land; the
-hypothesis tightens to a dedicated `structuralCryptoCallBody`
+`cryptoCallResidueB` guard tightens to a dedicated `structuralCryptoCallBody`
 predicate (mirrors `structuralCallBody`) at that point. See
 `PATH2_PLAN.md` §5.23.
 -/
@@ -3581,6 +3714,20 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
     (initialAnf : State) (initialStack : StackState)
     (tsm : Agrees.TaggedStackMap)
     (_hAgrees : Agrees.agreesTagged tsm initialAnf initialStack)
+    -- RESIDUAL-DOMAIN GUARD (2026-06-13, legibility re-key, count-neutral).
+    -- The fallback no longer asserts `acceptAgrees` for an UNRESTRICTED
+    -- single-public body: it is keyed on the named, decidable residual
+    -- predicate `cryptoCallResidueB`, which the omnibus cascade DISCHARGES
+    -- internally at every one of its 14 dispatch sites from local branch
+    -- context (multi-public / stateful / constructor-named / if_val-residue
+    -- / no-fragment).  This documents the axiom's domain as an inspectable
+    -- predicate instead of an implicit catch-all; it provably EXCLUDES every
+    -- single-public, non-stateful, non-constructor body the cascade peels
+    -- through a `cat` / `updateProp` / `methodCall` / `hashAssert` /
+    -- `hashChain` / `hashCall` fragment (those make every disjunct false).
+    -- The omnibus's external signature is UNCHANGED — the guard is proven
+    -- INTERNALLY at each site, not added as an omnibus premise.
+    (_hResidue : cryptoCallResidueB p anfM = true)
     -- GUARD RE-EVALUATION (2026-06-11, truthy-top success-bit repair):
     -- the `_hNoLoop : programUsesLoopB p = false` guard is REMOVED. It
     -- was retained (after the loop-arm fidelity rewrite of the same
@@ -3610,6 +3757,57 @@ axiom compileSafe_observational_correct_modulo_crypto_call_codegen (p : ANFProgr
     acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack)
+
+/-! ### Anti-vacuity smokes for the crypto_call residual predicate
+
+`cryptoCallResidueB` is a MEANINGFUL named domain, not a trivially-`true`
+catch-all: it evaluates `true` on a genuine multi-binding crypto-primitive
+fallback body (matching none of the discharged body-shape classifiers) and
+`false` on a body the cascade DISCHARGES (a single-public, non-constructor
+`cat` fragment). -/
+
+/-- A genuine fallback method: a 2-binding `sha256` then `ecMul` chain over
+one param — matches NONE of the body-shape fragment classifiers
+(`cat` / `updateProp` / `methodCall` / `hashAssert` / `hashChain` /
+`hashCall`), is single-public, non-stateful, non-constructor. -/
+private def cryptoResidueFallbackProg : ANFProgram :=
+  { contractName := "CryptoFallback"
+  , properties := []
+  , methods :=
+    [ { name := "verify"
+      , params := [ANFParam.mk "arg" .byteString]
+      , body :=
+        [ ANFBinding.mk "d1" (.call "sha256" ["arg"]) none
+        , ANFBinding.mk "d2" (.call "ecMul" ["d1", "arg"]) none ]
+      , isPublic := true } ] }
+
+/-- A DISCHARGED fragment method: a single-public, non-constructor two-param
+`cat(a, b)` — peeled by the cat consume theorem, never reaching the
+fallback. -/
+private def cryptoResidueDischargedProg : ANFProgram :=
+  { contractName := "CatDischarged"
+  , properties := []
+  , methods :=
+    [ { name := "verify"
+      , params := [ANFParam.mk "a" .byteString, ANFParam.mk "b" .byteString]
+      , body := [ANFBinding.mk "r" (.call "cat" ["a", "b"]) none]
+      , isPublic := true } ] }
+
+/-- Non-vacuity (positive): the residual predicate fires on the genuine
+crypto-primitive fallback body (terminal no-fragment disjunct). -/
+theorem cryptoCallResidueB_true_on_fallback :
+    cryptoCallResidueB cryptoResidueFallbackProg
+      cryptoResidueFallbackProg.methods.head! = true := by
+  native_decide
+
+/-- Non-vacuity (negative): the residual predicate is FALSE on a body the
+cascade discharges (the `cat` fragment), proving `cryptoCallResidueB`
+genuinely EXCLUDES a substantial body-shape class rather than holding
+universally. -/
+theorem cryptoCallResidueB_false_on_discharged :
+    cryptoCallResidueB cryptoResidueDischargedProg
+      cryptoResidueDischargedProg.methods.head! = false := by
+  native_decide
 
 -- **O1 sub-omnibus — update_prop family — RETIRED (Tier 1 Wave 64, 2026-05-23).**
 -- The `compileSafe_observational_correct_modulo_update_prop_codegen` axiom is
@@ -3707,7 +3905,11 @@ theorem compileSafe_observational_correct_loop_consume (p : ANFProgram)
     -- to end in assert).
     (hValueTruthy : Lower.bodyEndsInAssert anfM.body = false →
       ∀ s, runParsedBytes bytes initialStack = .ok s →
-        topTruthy s.stack = true) :
+        topTruthy s.stack = true)
+    -- Residual-domain guard, forwarded verbatim to the crypto_call fallback
+    -- (2026-06-13 legibility re-key).  Discharged at this theorem's single
+    -- omnibus call site from the loop arm's local context.
+    (hResidue : cryptoCallResidueB p anfM = true) :
     acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) :=
@@ -3716,7 +3918,7 @@ theorem compileSafe_observational_correct_loop_consume (p : ANFProgram)
   -- residue (they only scoped the now-deferred real-loop codegen class).
   compileSafe_observational_correct_modulo_crypto_call_codegen
     p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
-    hValueTruthy
+    hResidue hValueTruthy
 
 -- **O1 sub-omnibus — method_call family — RETIRED (Tier 1 wave 66, 2026-05-24).**
 -- The axiom `compileSafe_observational_correct_modulo_method_call_codegen` is
@@ -9226,8 +9428,12 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
       have hValueTruthy := hValueTruthy (by
         simp [statefulFullDischargedB,
           decide_eq_false (Nat.not_lt.mpr hStMulti)])
+      have hResidue : cryptoCallResidueB p anfM = true := by
+        simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+        simp [decide_eq_true hStMulti]
       exact compileSafe_observational_correct_modulo_crypto_call_codegen
-        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+        hResidue hValueTruthy
     · have hStSingle : p.methods.filter (·.isPublic) = [anfM] := by
         have hAnfMem : anfM ∈ p.methods.filter (·.isPublic) :=
           List.mem_filter.mpr ⟨hMem, by simpa using hPublic⟩
@@ -9269,8 +9475,12 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
             Classical.byContradiction (fun h => hStFullName h)
           have hValueTruthy := hValueTruthy (by
             simp [statefulFullDischargedB, hNmEq])
+          have hResidue : cryptoCallResidueB p anfM = true := by
+            simp only [cryptoCallResidueB, hPublic, hStateful, Bool.true_and,
+              Bool.or_true, Bool.true_or]
           exact compileSafe_observational_correct_modulo_crypto_call_codegen
-            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+            hResidue hValueTruthy
       · -- Widened classifier FALSE: off the discharged path for the whole
         -- residual stateful subtree.
         have hValueTruthy := hValueTruthy (by
@@ -9285,10 +9495,18 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               p anfM bytes hMem hPublic hSafe initialAnf initialStack
               hStSingle hStName pre ty hStParams hStBody hStNe1 hStNe2
               ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk hStSig
-          · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
-        · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+          · have hResidue : cryptoCallResidueB p anfM = true := by
+              simp only [cryptoCallResidueB, hPublic, hStateful, Bool.true_and,
+                Bool.or_true, Bool.true_or]
+            exact compileSafe_observational_correct_modulo_crypto_call_codegen
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+              hResidue hValueTruthy
+        · have hResidue : cryptoCallResidueB p anfM = true := by
+            simp only [cryptoCallResidueB, hPublic, hStateful, Bool.true_and,
+              Bool.or_true, Bool.true_or]
+          exact compileSafe_observational_correct_modulo_crypto_call_codegen
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+            hResidue hValueTruthy
   · -- Non-stateful subtree: the statefulFull classifier is refutable from
     -- `¬hStateful` (its body starts with `check_preimage`), so the re-keyed
     -- truthiness premise yields its unguarded form for every branch below.
@@ -9339,8 +9557,12 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
             p anfM bytes hPublic hSafe initialAnf initialStack i restW
             hIdxW hWitnessW hDpNames hDpAllPass _h2 _h17
             x bn ty src hParamsW hBodyW v (hResW x ty hParamsW) hValueTruthy
-        · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+        · have hResidue : cryptoCallResidueB p anfM = true := by
+            simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+            simp [decide_eq_true hDispatch]
+          exact compileSafe_observational_correct_modulo_crypto_call_codegen
+            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+            hResidue hValueTruthy
     · -- In the `¬hDispatch` branch the public-method filter has length < 2;
       -- since `anfM` is itself public it must be the SOLE public method, so
       -- the filter is exactly `[anfM]`.  This `hSinglePublic` fact feeds the
@@ -9396,8 +9618,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               bnC aC bC srcC hMem hPublic hSafe initialAnf initialStack
               hSinglePublic hCatName hCatParams hCatBody hCatNe
               baC bbC restC hCatArgA hCatArgB hCatStk hValueTruthy
-          · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+          · have hNm : anfM.name = "constructor" := Classical.byContradiction (fun h => hCatName h)
+            have hResidue : cryptoCallResidueB p anfM = true := by
+              simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+              simp [hNm]
+            exact compileSafe_observational_correct_modulo_crypto_call_codegen
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+              hResidue hValueTruthy
         case neg =>
         -- **Wave 51 consume-`math_byte` branch (replaces the retired math_byte
         -- axiom).**  The decidable NO-LEN math_byte classifier pins the body to
@@ -9414,8 +9641,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
               p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
               hSinglePublic hNameMB hMathByteNoLen hStructCall hUntag hCoh hFrag
               hValueTruthy
-          · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+          · have hNm : anfM.name = "constructor" := Classical.byContradiction (fun h => hNameMB h)
+            have hResidue : cryptoCallResidueB p anfM = true := by
+              simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+              simp [hNm]
+            exact compileSafe_observational_correct_modulo_crypto_call_codegen
+              p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+              hResidue hValueTruthy
         · -- **Wave 64 consume-`update_prop` branch (replaces the retired
           -- update_prop axiom).**  The decidable `updatePropConsumeShapeBool`
           -- classifier pins the body to the canonical
@@ -9440,8 +9672,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                 p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack Γ
                 hSinglePublic hNameUP prop op c hBodyEq hSM hAdmis hAgrees hUntagUP
                 hTypedEntry hWtUP hCoh hValueTruthy
-            · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+            · have hNm : anfM.name = "constructor" := Classical.byContradiction (fun h => hNameUP h)
+              have hResidue : cryptoCallResidueB p anfM = true := by
+                simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+                simp [hNm]
+              exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+                hResidue hValueTruthy
           · -- **Wave 45 consume-`if_val` branch (replaces the retired if_val axiom).**
             -- The decidable `ifValArithBody` fragment pins the body to a single
             -- `.ifVal` with arith branches; the residual structural facts
@@ -9523,15 +9760,76 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                   (hTsmEq ▸ hAgrees) hFrag
                   (hTsmEq ▸ hUntag) hTypedEntry hBranchTyped (hTsmEq ▸ hCoh)
                   hCondBool hCondHead hLastU hIPThn hIPThn hValueTruthy
-              · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+              · -- if_val residue: `hFrag : ifValArithBody …` reflects to the
+                -- `ifValArithBodyBool` disjunct of `cryptoCallResidueB`.
+                have hIfValBool : Agrees.ifValArithBodyBool
+                    p.methods p.properties Lower.defaultInlineBudget 0
+                    (Lower.computeLastUses anfM.body) []
+                    (Lower.collectConstInts anfM.body)
+                    (List.reverse (anfM.params.map (·.name)))
+                    anfM.body = true :=
+                  (Agrees.ifValArithBodyBool_iff p.methods p.properties
+                    Lower.defaultInlineBudget 0 (Lower.computeLastUses anfM.body) []
+                    (Lower.collectConstInts anfM.body)
+                    (List.reverse (anfM.params.map (·.name))) anfM.body).mpr hFrag
+                have hResidue : cryptoCallResidueB p anfM = true := by
+                  simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+                  simp [hIfValBool]
+                exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                  p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+                  hResidue hValueTruthy
             · by_cases hLoop :
                   Agrees.structuralLoopBodyBool
                     p.methods p.properties
                     Lower.defaultInlineBudget
                     lastUses [] localBindings constInts
                     anfM.body initialSm 0 = true
-              · exact compileSafe_observational_correct_loop_consume
+              · -- Loop arm: discharge the forwarded residual guard.  Either the
+                -- method is the constructor (constructor disjunct), or the
+                -- loop-classified body is off the arith / if_val / cat /
+                -- updateProp fragments (`cryptoCallLoopResidueB` disjunct), using
+                -- the negations established on the path to this arm.
+                have hResidue : cryptoCallResidueB p anfM = true := by
+                  by_cases hNm : anfM.name = "constructor"
+                  · simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+                    simp [hNm]
+                  · -- `¬emittableArith` (Prop) from `¬hArithConsume` + `name≠constr`.
+                    have hArithF : ¬ Agrees.emittableArithChainReadyNoDblNeg
+                        (Lower.computeLastUses anfM.body) anfM.body
+                        (List.reverse (anfM.params.map (·.name))) 0 false :=
+                      fun hP => hArithConsume ⟨hNm, hP⟩
+                    -- `ifValArithBodyBool = false` from `¬hIfValFrag` + `name≠constr`.
+                    have hIfValF : Agrees.ifValArithBodyBool
+                        p.methods p.properties Lower.defaultInlineBudget 0
+                        (Lower.computeLastUses anfM.body) []
+                        (Lower.collectConstInts anfM.body)
+                        (List.reverse (anfM.params.map (·.name)))
+                        anfM.body = false := by
+                      cases hI : Agrees.ifValArithBodyBool
+                          p.methods p.properties Lower.defaultInlineBudget 0
+                          (Lower.computeLastUses anfM.body) []
+                          (Lower.collectConstInts anfM.body)
+                          (List.reverse (anfM.params.map (·.name)))
+                          anfM.body
+                      · rfl
+                      · exact absurd ⟨hNm, (Agrees.ifValArithBodyBool_iff p.methods
+                          p.properties Lower.defaultInlineBudget 0
+                          (Lower.computeLastUses anfM.body) []
+                          (Lower.collectConstInts anfM.body)
+                          (List.reverse (anfM.params.map (·.name))) anfM.body).mp hI⟩
+                          hIfValFrag
+                    have hCatF : Stack.AgreesCat.catConsumeShapeBool anfM = false :=
+                      Bool.eq_false_iff.mpr hCatShape
+                    have hUpF : Agrees.updatePropConsumeShapeBool anfM.body = false :=
+                      Bool.eq_false_iff.mpr hUpdatePropShape
+                    have hLoopResidue : cryptoCallLoopResidueB p anfM = true := by
+                      simp only [cryptoCallLoopResidueB, hIfValF, hCatF, hUpF,
+                        decide_eq_false hArithF, Bool.not_false, Bool.not_true,
+                        Bool.and_true, Bool.and_false]
+                      exact hLoop
+                    simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+                    simp [hLoopResidue]
+                exact compileSafe_observational_correct_loop_consume
                   p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
                   hNoLoop hLoop
                   (bodyLoopMapNeutralB_of_noLoop p.methods p.properties
@@ -9539,7 +9837,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                     (anfM.body.map (·.name)) (Lower.collectConstInts anfM.body)
                     anfM.body (List.reverse (anfM.params.map (·.name))) 0
                     (bindingsUseLoopB_false_of_program p anfM hMem hNoLoop))
-                  hValueTruthy
+                  hValueTruthy hResidue
               · -- **Wave 66 consume-`method_call` branch (replaces the retired
                 -- method_call axiom).**  The decidable `methodCallConsumeShapeBool`
                 -- classifier pins the body to the param-passthrough fragment
@@ -9559,9 +9857,14 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                       p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
                       hSinglePublic hNameMC a hMethodCallShape hAgrees
                       (fun _ => hSm) hCoh hValueTruthy
-                  · exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                  · have hNm : anfM.name = "constructor" :=
+                      Classical.byContradiction (fun h => hNameMC h)
+                    have hResidue : cryptoCallResidueB p anfM = true := by
+                      simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+                      simp [hNm]
+                    exact compileSafe_observational_correct_modulo_crypto_call_codegen
                       p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack
-                      [(a, Agrees.SlotKind.param)] hAgrees hValueTruthy
+                      [(a, Agrees.SlotKind.param)] hAgrees hResidue hValueTruthy
                 · -- **crypto_call hash-then-assert peel branch (W1, 2026-06-11
                   -- hash widening).**  Tried BEFORE the bare single-call
                   -- classifier: the decidable `hashAssertConsumeShapeBool`
@@ -9594,8 +9897,14 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                           initialAnf initialStack hSinglePublic hHashAssertName
                           hAParams hABody hANames hargBa hexpBa hrestA
                           hAArg hAExp hAStk hALen
-                    · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+                    · have hNm : anfM.name = "constructor" :=
+                        Classical.byContradiction (fun h => hHashAssertName h)
+                      have hResidue : cryptoCallResidueB p anfM = true := by
+                        simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+                        simp [hNm]
+                      exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                        p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+                        hResidue hValueTruthy
                   · -- **crypto_call 2-chain peel branch (W2, 2026-06-11 hash
                     -- widening).**  The decidable `hashChainConsumeShapeBool`
                     -- classifier peels the 2-chain fragment; the keyed
@@ -9614,8 +9923,14 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                           tyc hs1c hs2c hMem hPublic hSafe initialAnf initialStack
                           hSinglePublic hHashChainName hCParams hCBody hCNe hCFuncs
                           hargBc hrestC hCArg hCStk hCLen hValueTruthy
-                      · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+                      · have hNm : anfM.name = "constructor" :=
+                          Classical.byContradiction (fun h => hHashChainName h)
+                        have hResidue : cryptoCallResidueB p anfM = true := by
+                          simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+                          simp [hNm]
+                        exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+                          hResidue hValueTruthy
                     · -- **crypto_call hash-peel branch.**  Before the universal
                       -- fallback, the decidable `hashCallConsumeShapeBool` classifier
                       -- peels the single-`sha256`/`hash160`-call method fragment: the
@@ -9637,14 +9952,34 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                             exact hashCall_consume_hash160 p anfM bytes bn harg hsrc hMem hPublic hSafe
                               initialAnf initialStack hSinglePublic hHashName hHParams hHBody
                               hargBytes hrestV hHArg hHStk hHLen hValueTruthy
-                        · exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+                        · have hNm : anfM.name = "constructor" :=
+                            Classical.byContradiction (fun h => hHashName h)
+                          have hResidue : cryptoCallResidueB p anfM = true := by
+                            simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+                            simp [hNm]
+                          exact compileSafe_observational_correct_modulo_crypto_call_codegen
+                            p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+                            hResidue hValueTruthy
                       · -- Substrate-gap fallback: no structural classifier fires.
-                        -- This is the crypto-call family (no dedicated Bool checker
-                        -- until A4-crypto + Phase B per-primitive land). The
-                        -- sub-omnibus hypothesis is `True`.
+                        -- This is the TERMINAL crypto-call residue: every
+                        -- body-shape classifier returned false, so
+                        -- `cryptoCallNoFragmentBodyB` holds and discharges the
+                        -- named residual guard.
+                        have hResidue : cryptoCallResidueB p anfM = true := by
+                          have hNoFrag : cryptoCallNoFragmentBodyB p anfM = true := by
+                            simp only [cryptoCallNoFragmentBodyB,
+                              Bool.eq_false_iff.mpr hCatShape,
+                              Bool.eq_false_iff.mpr hUpdatePropShape,
+                              Bool.eq_false_iff.mpr hMethodCallShape,
+                              Bool.eq_false_iff.mpr hHashAssertShape,
+                              Bool.eq_false_iff.mpr hHashChainShape,
+                              Bool.eq_false_iff.mpr hHashShape,
+                              Bool.not_false, Bool.and_true]
+                          simp only [cryptoCallResidueB, hPublic, Bool.true_and]
+                          simp [hNoFrag]
                         exact compileSafe_observational_correct_modulo_crypto_call_codegen
-                          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees hValueTruthy
+                          p hWF anfM bytes hMem hPublic hSafe initialAnf initialStack tsm hAgrees
+                          hResidue hValueTruthy
 
 /--
 **Capstone variant consuming `SupportedANFBody`.**
