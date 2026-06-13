@@ -362,7 +362,7 @@ tactic step (which exhausts `maxHeartbeats`).
 
 theorem runOpcode_NUMEQUAL_def (s : StackState) :
     runOpcode "OP_NUMEQUAL" s
-    = liftIntBin s (fun a b => .vBool (decide (a = b))) := rfl
+    = liftIntBinNum s (fun a b => .vBool (decide (a = b))) := rfl
 
 theorem runOpcode_VERIFY_def (s : StackState) :
     runOpcode "OP_VERIFY" s
@@ -458,9 +458,9 @@ theorem runOpcode_numEqual_int
     runOpcode "OP_NUMEQUAL" s
     = .ok (({ s with stack := rest } : StackState).push (.vBool (decide (a = b)))) := by
   rw [runOpcode_NUMEQUAL_def]
-  unfold liftIntBin
+  unfold liftIntBinNum
   rw [popN_two_cons s (.vBigint b) (.vBigint a) rest hs]
-  simp [asInt?]
+  simp [asNum?, asInt?]
 
 theorem runOpcode_NUMEQUALVERIFY_def (s : StackState) :
     runOpcode "OP_NUMEQUALVERIFY" s
