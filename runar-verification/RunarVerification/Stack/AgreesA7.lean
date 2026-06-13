@@ -1890,6 +1890,58 @@ theorem lowerBindingsP_singletonRefRefAlias
         outerProtected localBindings constInts sm xName n d hDepth hConsume]
   simp only [Stack.Lower.lowerBindingsP, List.append_nil]
 
+/-- CONSUME-path reduction of the `.loadConst (.refAlias n)` arm: when
+the consume gate is `true` (target in localBindings, not outer-protected,
+last use), the arm emits `(bringToTop sm n true).1` and the map relabels
+the consumed entry's slot to `bindingName`. -/
+theorem lowerValueP_loadConstRefAlias_consume_eq
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) (sm : StackMap)
+    (bindingName n : String) (d : Nat)
+    (hDepth : sm.depth? n = some d)
+    (hConsume :
+      (Stack.Lower.listContains localBindings n
+        && !Stack.Lower.listContains outerProtected n
+        && Stack.Lower.isLastUse lastUses n currentIndex) = true) :
+    Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName
+        (.loadConst (.refAlias n))
+      = ((Stack.Lower.bringToTop sm n true).1,
+         (match (Stack.Lower.bringToTop sm n true).2 with
+            | _ :: rest => bindingName :: rest
+            | []        => [bindingName]),
+         localBindings) := by
+  unfold Stack.Lower.lowerValueP
+  simp only [hDepth, if_true, hConsume]
+  rfl
+
+/-- Closed-form reduction of a singleton-`.loadConst (.refAlias n)`-body's
+`lowerBindingsP` on the CONSUME path (gate true). -/
+theorem lowerBindingsP_singletonRefRefAliasConsume
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int)) (sm : StackMap)
+    (xName n : String) (d : Nat)
+    (hDepth : sm.depth? n = some d)
+    (hConsume :
+      (Stack.Lower.listContains localBindings n
+        && !Stack.Lower.listContains outerProtected n
+        && Stack.Lower.isLastUse lastUses n 0) = true) :
+    Stack.Lower.lowerBindingsP progMethods props budget 0 lastUses
+        outerProtected localBindings constInts sm
+        [ANFBinding.mk xName (.loadConst (.refAlias n)) none]
+      = ((Stack.Lower.bringToTop sm n true).1,
+         (match (Stack.Lower.bringToTop sm n true).2 with
+            | _ :: rest => xName :: rest
+            | []        => [xName])) := by
+  unfold Stack.Lower.lowerBindingsP
+  rw [lowerValueP_loadConstRefAlias_consume_eq progMethods props budget 0 lastUses
+        outerProtected localBindings constInts sm xName n d hDepth hConsume]
+  simp only [Stack.Lower.lowerBindingsP, List.append_nil]
+
 /-- Depth of `n` in `sm.push name` (= `name :: sm`) when `name ≠ n` is
 one greater than its depth in `sm`. Local helper for the singleton-
 ref-body loop wrapper below — the loop's lowering inserts `iterVar` at
@@ -2524,6 +2576,714 @@ theorem tier3b_outer_raw_binop_sentinel_pin :
         | .opcode s => s.startsWith "OP_RUNAR_UNRESOLVED"
         | _ => false)) = true := by
   native_decide
+
+/-! ### Growing-depth closed form — singleton-ref `loadProp` body
+
+The honest deferral above is discharged here for the COPY-ON-EVERY-
+ITERATION class (`loadProp`, and — under the copy gate — `refAlias`).
+Unlike the const case, the body's `loadRef` resolves at a depth that
+GROWS by 2 per iteration as the loaded copy + iter index strand on the
+threaded map. We capture this faithfully by THREADING the current `sm`
+through both the assemble and the strand map (analogous to how the
+const `loopConstPostState` threads `s`): each recursion step emits the
+index push followed by `loadRef (sm.push iterVar) n` against the
+CURRENT map, then continues on the 2-grown map `xName :: iterVar :: sm`.
+
+`loadProp` copies unconditionally (`bringToTop _ _ false`), so the
+per-iteration chunk is identical in shape on EVERY iteration (final and
+non-final alike) — only the `sm` it is applied to grows. This is the
+SIMPLEST ref tier: there is no final/non-final consume split. -/
+
+/-- sm-threaded per-iteration op assembly for a singleton `loadProp n`
+loop body. Mirrors `loopConstAssemble` but the per-iter chunk is
+`[push i] ++ loadRef (sm.push iterVar) n` (copy, no drop) and the map
+GROWS by `xName :: iterVar ::` each step, so the chunk is applied to a
+progressively deeper `sm`. -/
+def loopRefPropAssemble (xName iterVar n : String) (count : Nat) :
+    StackMap → Nat → List StackOp
+  | _,  0     => []
+  | sm, m + 1 =>
+      ([.push (.bigint (Int.ofNat (count - (m + 1))))]
+        ++ Stack.Lower.loadRef (sm.push iterVar) n)
+        ++ loopRefPropAssemble xName iterVar n count
+              (xName :: iterVar :: sm) m
+
+/-- Strand-map for the copy-on-every-iteration ref body: identical in
+shape to `constStrandMap` (each iteration leaves `xName :: iterVar ::`
+on top of the previous map). -/
+def refStrandMap (xName iterVar : String) : Nat → StackMap → StackMap
+  | 0,     sm => sm
+  | m + 1, sm => refStrandMap xName iterVar m (xName :: iterVar :: sm)
+
+/-- Closed form: the per-iteration fold `lowerLoopItersP` on a singleton
+`loadProp n` body equals the sm-threaded `loopRefPropAssemble` chain and
+threads the 2-per-iteration grown `refStrandMap`. Requires `xName ≠
+iterVar` (so the iter var stays BURIED at depth 1 and no per-iteration
+drop fires) and `iterVar ≠ n` (so pushing the iter var only shifts `n`'s
+depth, never resolving it). The depth fact is carried as a per-step
+`∀ sm, sm.depth? n = some _` is NOT needed: `loadRef` is itself a
+function of the map, and `lowerBindingsP_singletonRefProp` needs only
+that `n` is resolvable in `sm.push iterVar` — supplied by `hResolv`
+threaded as "for any tail map, `n` resolves once `iterVar` is pushed".
+
+We thread the resolvability as a single hypothesis `hDepth : ∀ (s :
+StackMap), ((xName :: iterVar :: s)) ... ` — but in fact the cleanest
+statement keeps `n` resolvable in EVERY grown map. Since the grown maps
+are `(xName :: iterVar ::)^k sm`, and `xName ≠ n`, `iterVar ≠ n`,
+resolvability in `sm` propagates. We pass the base depth `d` and the two
+freshness facts and derive resolvability inductively. -/
+theorem lowerLoopItersP_singletonRefProp_eq
+    (xName iterVar n : String)
+    (hXNe : (xName == iterVar) = false)
+    (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (naturalLU nonFinalLU : List (String × Nat))
+    (loopLocal : List String) (constInts : List (String × Int))
+    (count : Nat) :
+    ∀ (m : Nat) (sm : StackMap) (d : Nat) (hDepth : sm.depth? n = some d),
+      Stack.Lower.lowerLoopItersP progMethods props budget naturalLU
+        nonFinalLU loopLocal constInts
+        [ANFBinding.mk xName (.loadProp n) none] iterVar count sm m
+        = (loopRefPropAssemble xName iterVar n count sm m,
+           refStrandMap xName iterVar m sm)
+  | 0, sm, d, _ => by
+      simp [Stack.Lower.lowerLoopItersP, loopRefPropAssemble, refStrandMap]
+  | m + 1, sm, d, hDepth => by
+      -- `n` resolves in `iterVar :: sm` at depth `d+1` (iterVar ≠ n).
+      have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
+        depth?_push_ne sm iterVar n hIterNe d hDepth
+      -- Body map after the copy: `xName :: iterVar :: sm`.
+      have hSmCopy : (Stack.Lower.loadRefLiveCopy (sm.push iterVar) n).2
+          = n :: iterVar :: sm := by
+        unfold Stack.Lower.loadRefLiveCopy
+        rw [bringToTop_false_sm_eq (sm.push iterVar) n (d + 1) hDepthInner]
+        rfl
+      unfold Stack.Lower.lowerLoopItersP loopRefPropAssemble refStrandMap
+      -- Reduce the body lowering via the singleton-prop helper.
+      simp only [lowerBindingsP_singletonRefProp progMethods props budget
+            (if (m == 0) = true then naturalLU else nonFinalLU)
+            [] loopLocal constInts (sm.push iterVar) xName n (d + 1) hDepthInner,
+                 hSmCopy]
+      -- Cleanup gate: iter var BURIED at depth 1 under `xName`, no drop.
+      rw [cleanupGate_buried xName iterVar sm hXNe]
+      -- Depth of `n` in the grown map `xName :: iterVar :: sm` is `d + 2`.
+      have h1 : (Stack.Lower.StackMap.push sm iterVar).depth? n = some (d + 1) :=
+        depth?_push_ne sm iterVar n hIterNe d hDepth
+      have hDepthGrown :
+          (Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName).depth? n
+            = some (d + 2) :=
+        depth?_push_ne (Stack.Lower.StackMap.push sm iterVar) xName n hXNameNe (d + 1) h1
+      -- Recurse on the grown map (`xName :: iterVar :: sm = push (push sm iv) x`).
+      simp only []
+      rw [show (xName :: iterVar :: sm)
+            = Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName from rfl]
+      rw [lowerLoopItersP_singletonRefProp_eq xName iterVar n hXNe hIterNe
+            hXNameNe progMethods props budget naturalLU nonFinalLU loopLocal
+            constInts count m
+            (Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName)
+            (d + 2) hDepthGrown]
+      simp [List.append_nil]
+
+/-- Value-level lift: `lowerValueP` of `.loop count [.mk x (.loadProp n)
+none] iv` produces exactly the sm-threaded `loopRefPropAssemble count`
+chain (growing-depth copy loads, no drops). The loop arm invokes
+`lowerLoopItersP ... sm count count`, so the closed form at `m = count`
+applies. The lastUses / loopLocal context the arm computes is captured
+opaquely by the closed form. -/
+theorem lowerValueP_loop_singletonRefProp_ops_eq
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (bindingName xName iterVar n : String)
+    (count d : Nat)
+    (hXNe : (xName == iterVar) = false)
+    (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
+    (hDepth : sm.depth? n = some d) :
+    (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName
+        (.loop count [.mk xName (.loadProp n) none] iterVar)).1
+      = loopRefPropAssemble xName iterVar n count sm count := by
+  unfold Stack.Lower.lowerValueP
+  simp only [lowerLoopItersP_singletonRefProp_eq xName iterVar n hXNe hIterNe
+    hXNameNe progMethods props budget _ _ _ constInts count count sm d hDepth]
+
+/-- Count-generic sanity: the loadProp closed form instantiated at
+`count = 2` against the concrete parent map `["p", "q"]` (`q` at depth 1)
+reproduces EXACTLY the bytes + threaded map pinned by
+`tier3b_refProp_count2_pin` (`005279515479`, map
+`x::i::x::i::p::q`). This certifies the growing-depth closed form
+agrees with the independently-`native_decide`d concrete pin at `n = 2`. -/
+theorem lowerValueP_loop_singletonRefProp_count2_matches_pin :
+    (RunarVerification.Script.Emit.bytesToHex (RunarVerification.Script.Emit.emitOps
+      (Stack.Lower.lowerValueP [] [] Stack.Lower.defaultInlineBudget 0
+        [] [] [] [] ["p", "q"] "L"
+        (.loop 2 [ANFBinding.mk "x" (.loadProp "q") none] "i")).1)
+      = RunarVerification.Script.Emit.bytesToHex (RunarVerification.Script.Emit.emitOps
+          (loopRefPropAssemble "x" "i" "q" 2 ["p", "q"] 2))) := by
+  rw [lowerValueP_loop_singletonRefProp_ops_eq [] [] Stack.Lower.defaultInlineBudget 0
+        [] [] [] [] ["p", "q"] "L" "x" "i" "q" 2 1
+        (by decide) (by decide) (by decide) (by decide)]
+
+/-- Concrete byte certificate: the loadProp closed-form assemble at
+`count = 2` emits the exact pinned hex `005279515479`. Combined with
+`lowerValueP_loop_singletonRefProp_count2_matches_pin`, this re-derives
+`tier3b_refProp_count2_pin`'s bytes from the count-generic closed form. -/
+theorem loopRefPropAssemble_count2_hex :
+    RunarVerification.Script.Emit.bytesToHex (RunarVerification.Script.Emit.emitOps
+      (loopRefPropAssemble "x" "i" "q" 2 ["p", "q"] 2)) = "005279515479" := by
+  native_decide
+
+/-! ### Growing-depth closed form — singleton-ref `loadParam` body
+(final/non-final consume split — THE CRUX)
+
+`loadParam` (and `refAlias` whose target is in the enclosing
+localBindings) behaves DIFFERENTLY on the final vs non-final iteration:
+
+* non-final iterations (`remaining ≠ 0`, clamped `nonFinalLU`) COPY via
+  `bringToTop _ _ false` = `loadRef` — identical to the loadProp tier,
+  growing the map by `xName :: iterVar ::`;
+* the FINAL iteration (`remaining == 0`, natural `naturalLU`) CONSUMES
+  via `bringToTop _ _ true` (`swap` / `rot` / `roll d`) — the param
+  leaves the map (`removeAtDepth`).
+
+In `lowerLoopItersP`'s recursion the per-step `lu` is `if remaining == 0
+then naturalLU else nonFinalLU`. The recursion peels the OUTERMOST
+iteration (emitted first, smallest index) and bottoms at `remaining =
+0`, so the ONLY consume chunk is the LAST emitted one (deepest map). The
+assemble below threads `sm` and branches at `m + 1` on whether `m = 0`
+(final, consume) or `m > 0` (non-final, copy). We require the two
+liveness hypotheses as named consume-gate equations (supplied by the
+caller as `hConsumeFinal` / `hCopyNonFinal`) so the closed form is
+agnostic to the exact `computeLastUses` / clamp shape — the per-shape
+corollaries (param vs refAlias) discharge them. -/
+
+/-- sm-threaded per-iteration op assembly for the consume-on-final ref
+class. For `m + 1` iterations remaining: when `m = 0` the chunk is the
+CONSUME load `[push i] ++ bringToTop (sm.push iterVar) n true` (the
+final iteration); when `m > 0` it is the COPY load `[push i] ++ loadRef
+(sm.push iterVar) n`, recursing on the 2-grown map. -/
+def loopRefConsumeAssemble (xName iterVar n : String) (count : Nat) :
+    StackMap → Nat → List StackOp
+  | _,  0     => []
+  | sm, m + 1 =>
+      let i := count - (m + 1)
+      match m with
+      | 0 =>
+          [.push (.bigint (Int.ofNat i))]
+            ++ (Stack.Lower.bringToTop (sm.push iterVar) n true).1
+      | _ + 1 =>
+          ([.push (.bigint (Int.ofNat i))]
+            ++ Stack.Lower.loadRef (sm.push iterVar) n)
+            ++ loopRefConsumeAssemble xName iterVar n count
+                  (xName :: iterVar :: sm) m
+
+/-- sm-threaded resulting stack map for the consume-on-final ref class:
+copies grow by `xName :: iterVar ::`; the FINAL consume yields `xName ::
+iterVar :: (the post-consume tail)`. The final tail is the second
+component of `bringToTop (·.push iterVar) n true` with its top relabeled
+to `xName`. -/
+def refConsumeStrandMap (xName iterVar n : String) :
+    StackMap → Nat → StackMap
+  | sm, 0     => sm
+  | sm, m + 1 =>
+      match m with
+      | 0 =>
+          (match (Stack.Lower.bringToTop (sm.push iterVar) n true).2 with
+           | _ :: rest => xName :: rest
+           | []        => [xName])
+      | _ + 1 =>
+          refConsumeStrandMap xName iterVar n (xName :: iterVar :: sm) m
+
+/-- Closed form: the per-iteration fold `lowerLoopItersP` on a singleton
+`loadParam n` body equals the sm-threaded `loopRefConsumeAssemble`
+chain. Non-final iterations copy (depth grows), the final iteration
+consumes. The consume-gate booleans are supplied as named hypotheses
+parametric in `lu`: `hConsumeFinal` pins the final (`naturalLU`) gate to
+`true`, `hCopyNonFinal` pins the non-final (`nonFinalLU`) gate to
+`false`. -/
+theorem lowerLoopItersP_singletonRefParam_eq
+    (xName iterVar n : String)
+    (hXNe : (xName == iterVar) = false)
+    (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (naturalLU nonFinalLU : List (String × Nat))
+    (loopLocal : List String) (constInts : List (String × Int))
+    (count : Nat)
+    (hConsumeFinal :
+      (!Stack.Lower.listContains ([] : List String) n
+        && Stack.Lower.isLastUse naturalLU n 0) = true)
+    (hCopyNonFinal :
+      (!Stack.Lower.listContains ([] : List String) n
+        && Stack.Lower.isLastUse nonFinalLU n 0) = false) :
+    ∀ (m : Nat) (sm : StackMap) (d : Nat) (hDepth : sm.depth? n = some d),
+      Stack.Lower.lowerLoopItersP progMethods props budget naturalLU
+        nonFinalLU loopLocal constInts
+        [ANFBinding.mk xName (.loadParam n) none] iterVar count sm m
+        = (loopRefConsumeAssemble xName iterVar n count sm m,
+           refConsumeStrandMap xName iterVar n sm m)
+  | 0, sm, d, _ => by
+      simp [Stack.Lower.lowerLoopItersP, loopRefConsumeAssemble,
+            refConsumeStrandMap]
+  | 1, sm, d, hDepth => by
+      -- Single final iteration: `lu = naturalLU` (remaining = 0),
+      -- consume gate true.
+      have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
+        depth?_push_ne sm iterVar n hIterNe d hDepth
+      unfold Stack.Lower.lowerLoopItersP loopRefConsumeAssemble
+             refConsumeStrandMap
+      simp only [lowerBindingsP_singletonRefParam progMethods props budget
+            naturalLU [] loopLocal constInts (sm.push iterVar) xName n,
+                 hConsumeFinal, beq_self_eq_true, if_true]
+      -- The body produced the consume ops + map `x :: iv :: rest`.
+      -- Cleanup gate: iter var buried at depth 1 (it survives in the
+      -- consume map under `xName`), no drop. Obtain the `n :: iv :: rest`
+      -- shape of the consume map to apply `cleanupGate_buried`.
+      have hSmShape : ∃ rest, (Stack.Lower.bringToTop (sm.push iterVar) n true).2
+          = n :: iterVar :: rest := by
+        match d with
+        | 0 => exact bringToTop_true_smInner_depth1 sm iterVar n hIterNe hDepthInner
+        | 1 => exact ⟨Stack.Lower.StackMap.removeAtDepth sm 1,
+            bringToTop_true_smInner_depth2 sm iterVar n hDepthInner⟩
+        | d' + 2 => exact ⟨Stack.Lower.StackMap.removeAtDepth sm (d' + 3 - 1),
+            bringToTop_true_smInner_depthD sm iterVar n (d' + 3) (by omega) hDepthInner⟩
+      obtain ⟨rest, hSm2⟩ := hSmShape
+      rw [hSm2]
+      rw [cleanupGate_buried xName iterVar rest hXNe]
+      simp [Stack.Lower.lowerLoopItersP, List.append_nil]
+  | m + 2, sm, d, hDepth => by
+      -- Non-final iteration: `remaining = m + 1 ≠ 0` so `lu = nonFinalLU`,
+      -- consume gate false → COPY. Map grows; recurse with `m + 1`.
+      have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
+        depth?_push_ne sm iterVar n hIterNe d hDepth
+      have hSmCopy : (Stack.Lower.bringToTop (sm.push iterVar) n false).2
+          = n :: iterVar :: sm := by
+        rw [bringToTop_false_sm_eq (sm.push iterVar) n (d + 1) hDepthInner]; rfl
+      have hCopyOps : (Stack.Lower.bringToTop (sm.push iterVar) n false).1
+          = Stack.Lower.loadRef (sm.push iterVar) n :=
+        bringToTop_false_ops_eq_loadRef (sm.push iterVar) n (d + 1) hDepthInner
+      unfold Stack.Lower.lowerLoopItersP loopRefConsumeAssemble
+             refConsumeStrandMap
+      simp only [lowerBindingsP_singletonRefParam progMethods props budget
+            nonFinalLU [] loopLocal constInts (sm.push iterVar) xName n,
+                 hCopyNonFinal, Nat.add_one_ne_zero, beq_iff_eq, if_false,
+                 hSmCopy, hCopyOps]
+      rw [cleanupGate_buried xName iterVar sm hXNe]
+      -- Depth of `n` in the grown map is `d + 2`.
+      have h1 : (Stack.Lower.StackMap.push sm iterVar).depth? n = some (d + 1) :=
+        depth?_push_ne sm iterVar n hIterNe d hDepth
+      have hDepthGrown :
+          (Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName).depth? n
+            = some (d + 2) :=
+        depth?_push_ne (Stack.Lower.StackMap.push sm iterVar) xName n hXNameNe (d + 1) h1
+      simp only []
+      rw [show (xName :: iterVar :: sm)
+            = Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName from rfl]
+      rw [lowerLoopItersP_singletonRefParam_eq xName iterVar n hXNe hIterNe
+            hXNameNe progMethods props budget naturalLU nonFinalLU loopLocal
+            constInts count hConsumeFinal hCopyNonFinal (m + 1)
+            (Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName)
+            (d + 2) hDepthGrown]
+      simp [List.append_nil]
+
+/-- Value-level lift: `lowerValueP` of `.loop count [.mk x (.loadParam n)
+none] iv` produces the sm-threaded `loopRefConsumeAssemble count` chain
+(growing-depth copies on non-final iterations, ROLL/SWAP/ROT consume on
+the final one). The loop arm's computed `naturalLU` / `nonFinalLU`
+discharge the consume-gate hypotheses via the per-shape param helpers
+(`singletonRefParam_consume_true_final` /
+`singletonRefParam_consume_false_nonFinal`). Requires `iterVar ≠ n` and
+`xName ≠ n` (the latter so `n` is an outer ref clamped on non-final
+iterations). -/
+theorem lowerValueP_loop_singletonRefParam_ops_eq
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (bindingName xName iterVar n : String)
+    (count d : Nat)
+    (hXNe : (xName == iterVar) = false)
+    (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
+    (hDepth : sm.depth? n = some d) :
+    (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName
+        (.loop count [.mk xName (.loadParam n) none] iterVar)).1
+      = loopRefConsumeAssemble xName iterVar n count sm count := by
+  unfold Stack.Lower.lowerValueP
+  simp only [lowerLoopItersP_singletonRefParam_eq xName iterVar n hXNe hIterNe
+    hXNameNe progMethods props budget
+    (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadParam n) none])
+    (Stack.Lower.clampLastUsesForOuter
+      (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadParam n) none])
+      (Stack.Lower.bodyOuterRefs [ANFBinding.mk xName (.loadParam n) none] iterVar)
+      [ANFBinding.mk xName (.loadParam n) none].length)
+    _ constInts count
+    (singletonRefParam_consume_true_final xName n)
+    (singletonRefParam_consume_false_nonFinal xName iterVar n hIterNe hXNameNe)
+    count sm d hDepth]
+
+/-- Count-generic sanity: the loadParam closed form at `count = 2`
+against parent map `["p", "q"]` reproduces EXACTLY the bytes + threaded
+map pinned by `tier3b_refParam_count2_pin` (`00527951547a`, map
+`x::i::x::i::p`) — the final iteration ROLL-consumes `q`. Certifies the
+final/non-final-split closed form agrees with the concrete pin at
+`n = 2`. -/
+theorem lowerValueP_loop_singletonRefParam_count2_matches_pin :
+    (RunarVerification.Script.Emit.bytesToHex (RunarVerification.Script.Emit.emitOps
+      (Stack.Lower.lowerValueP [] [] Stack.Lower.defaultInlineBudget 0
+        [] [] [] [] ["p", "q"] "L"
+        (.loop 2 [ANFBinding.mk "x" (.loadParam "q") none] "i")).1)
+      = RunarVerification.Script.Emit.bytesToHex (RunarVerification.Script.Emit.emitOps
+          (loopRefConsumeAssemble "x" "i" "q" 2 ["p", "q"] 2))) := by
+  rw [lowerValueP_loop_singletonRefParam_ops_eq [] [] Stack.Lower.defaultInlineBudget 0
+        [] [] [] [] ["p", "q"] "L" "x" "i" "q" 2 1
+        (by decide) (by decide) (by decide) (by decide)]
+
+/-- Concrete byte certificate: the loadParam closed-form assemble at
+`count = 2` emits the exact pinned hex `00527951547a` (final ROLL). -/
+theorem loopRefConsumeAssemble_count2_hex :
+    RunarVerification.Script.Emit.bytesToHex (RunarVerification.Script.Emit.emitOps
+      (loopRefConsumeAssemble "x" "i" "q" 2 ["p", "q"] 2)) = "00527951547a" := by
+  native_decide
+
+/-! ### Growing-depth closed form — singleton-ref `refAlias` body, COPY
+gate (target NOT in enclosing localBindings)
+
+When the `@ref:n` target is NOT in the (union) loop-local set, the
+consume gate is `false` on EVERY iteration (the `listContains
+localBindings n` conjunct is false), so the body copies exactly like
+`loadProp`. The op assembly + strand map are therefore IDENTICAL to the
+loadProp tier (`loopRefPropAssemble` / `refStrandMap`); only the body
+reduction lemma differs (`lowerBindingsP_singletonRefRefAlias` with the
+copy gate). We reuse the loadProp assemble verbatim. -/
+theorem lowerLoopItersP_singletonRefAliasCopy_eq
+    (xName iterVar n : String)
+    (hXNe : (xName == iterVar) = false)
+    (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (naturalLU nonFinalLU : List (String × Nat))
+    (loopLocal : List String) (constInts : List (String × Int))
+    (count : Nat)
+    (hGateNatural :
+      (Stack.Lower.listContains loopLocal n
+        && !Stack.Lower.listContains ([] : List String) n
+        && Stack.Lower.isLastUse naturalLU n 0) = false)
+    (hGateNonFinal :
+      (Stack.Lower.listContains loopLocal n
+        && !Stack.Lower.listContains ([] : List String) n
+        && Stack.Lower.isLastUse nonFinalLU n 0) = false) :
+    ∀ (m : Nat) (sm : StackMap) (d : Nat) (hDepth : sm.depth? n = some d),
+      Stack.Lower.lowerLoopItersP progMethods props budget naturalLU
+        nonFinalLU loopLocal constInts
+        [ANFBinding.mk xName (.loadConst (.refAlias n)) none] iterVar count sm m
+        = (loopRefPropAssemble xName iterVar n count sm m,
+           refStrandMap xName iterVar m sm)
+  | 0, sm, d, _ => by
+      simp [Stack.Lower.lowerLoopItersP, loopRefPropAssemble, refStrandMap]
+  | m + 1, sm, d, hDepth => by
+      have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
+        depth?_push_ne sm iterVar n hIterNe d hDepth
+      have hSmCopy : (Stack.Lower.bringToTop (sm.push iterVar) n false).2
+          = n :: iterVar :: sm := by
+        rw [bringToTop_false_sm_eq (sm.push iterVar) n (d + 1) hDepthInner]; rfl
+      -- The per-step gate: `if m == 0 then naturalLU else nonFinalLU`; both false.
+      have hGateStep :
+          (Stack.Lower.listContains loopLocal n
+            && !Stack.Lower.listContains ([] : List String) n
+            && Stack.Lower.isLastUse
+                 (if (m == 0) = true then naturalLU else nonFinalLU) n 0) = false := by
+        by_cases hm : (m == 0) = true
+        · simp only [hm, if_true]; exact hGateNatural
+        · simp only [hm, if_false]; exact hGateNonFinal
+      unfold Stack.Lower.lowerLoopItersP loopRefPropAssemble refStrandMap
+      simp only [lowerBindingsP_singletonRefRefAlias progMethods props budget
+            (if (m == 0) = true then naturalLU else nonFinalLU) [] loopLocal
+            constInts (sm.push iterVar) xName n (d + 1) hDepthInner hGateStep,
+                 hSmCopy]
+      rw [cleanupGate_buried xName iterVar sm hXNe]
+      have h1 : (Stack.Lower.StackMap.push sm iterVar).depth? n = some (d + 1) :=
+        depth?_push_ne sm iterVar n hIterNe d hDepth
+      have hDepthGrown :
+          (Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName).depth? n
+            = some (d + 2) :=
+        depth?_push_ne (Stack.Lower.StackMap.push sm iterVar) xName n hXNameNe (d + 1) h1
+      simp only []
+      rw [show (xName :: iterVar :: sm)
+            = Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName from rfl]
+      rw [lowerLoopItersP_singletonRefAliasCopy_eq xName iterVar n hXNe hIterNe
+            hXNameNe progMethods props budget naturalLU nonFinalLU loopLocal
+            constInts count hGateNatural hGateNonFinal m
+            (Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName)
+            (d + 2) hDepthGrown]
+      simp [List.append_nil]
+
+/-- Value-level lift for the refAlias COPY tier. The loop arm threads
+`loopLocal = localBindings ++ [xName]`; when `n` is not in that set
+(`hNotLocal`) the consume gate is false on every iteration, so the
+lowering is the loadProp-shaped copy chain `loopRefPropAssemble`. -/
+theorem lowerValueP_loop_singletonRefAliasCopy_ops_eq
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (bindingName xName iterVar n : String)
+    (count d : Nat)
+    (hXNe : (xName == iterVar) = false)
+    (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
+    (hDepth : sm.depth? n = some d)
+    (hNotLocal :
+      Stack.Lower.listContains (localBindings ++ [xName]) n = false) :
+    (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName
+        (.loop count [.mk xName (.loadConst (.refAlias n)) none] iterVar)).1
+      = loopRefPropAssemble xName iterVar n count sm count := by
+  -- The loop arm's loopLocal is `localBindings ++ [body binding name]`.
+  have hLoopLocal :
+      (localBindings ++ [ANFBinding.mk xName (.loadConst (.refAlias n)) none].map
+        (fun b => b.name)) = localBindings ++ [xName] := rfl
+  have hNotLocal' :
+      Stack.Lower.listContains
+        (localBindings ++ [ANFBinding.mk xName (.loadConst (.refAlias n)) none].map
+          (fun b => b.name)) n = false := by
+    rw [hLoopLocal]; exact hNotLocal
+  unfold Stack.Lower.lowerValueP
+  simp only [lowerLoopItersP_singletonRefAliasCopy_eq xName iterVar n hXNe hIterNe
+    hXNameNe progMethods props budget
+    (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadConst (.refAlias n)) none])
+    (Stack.Lower.clampLastUsesForOuter
+      (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadConst (.refAlias n)) none])
+      (Stack.Lower.bodyOuterRefs
+        [ANFBinding.mk xName (.loadConst (.refAlias n)) none] iterVar)
+      [ANFBinding.mk xName (.loadConst (.refAlias n)) none].length)
+    (localBindings ++ [ANFBinding.mk xName (.loadConst (.refAlias n)) none].map
+      (fun b => b.name)) constInts count
+    (by rw [hNotLocal']; simp)
+    (by rw [hNotLocal']; simp)
+    count sm d hDepth]
+
+/-- Count-generic sanity for the refAlias COPY tier: at `count = 2`
+against `["p", "q"]` with empty enclosing localBindings, the closed form
+reproduces `tier3b_refAlias_copy_count2_pin`'s bytes (`005279515479`,
+both iterations PICK-copy). -/
+theorem lowerValueP_loop_singletonRefAliasCopy_count2_matches_pin :
+    RunarVerification.Script.Emit.bytesToHex (RunarVerification.Script.Emit.emitOps
+      (Stack.Lower.lowerValueP [] [] Stack.Lower.defaultInlineBudget 0
+        [] [] [] [] ["p", "q"] "L"
+        (.loop 2 [ANFBinding.mk "x" (.loadConst (.refAlias "q")) none] "i")).1)
+      = "005279515479" := by
+  rw [lowerValueP_loop_singletonRefAliasCopy_ops_eq [] [] Stack.Lower.defaultInlineBudget 0
+        [] [] [] [] ["p", "q"] "L" "x" "i" "q" 2 1
+        (by decide) (by decide) (by decide) (by decide) (by decide)]
+  exact loopRefPropAssemble_count2_hex
+
+/-! ### Growing-depth closed form — singleton-ref `refAlias` body,
+CONSUME gate (target IN enclosing localBindings — divergence-3 union)
+
+When the `@ref:n` target IS in the (union) loop-local set, the consume
+gate fires on the FINAL iteration (natural last-use) and is clamped off
+on non-final ones — structurally identical to the `loadParam` tier, so
+we reuse `loopRefConsumeAssemble` / `refConsumeStrandMap`. The body
+reduction differs (`lowerBindingsP_singletonRefRefAlias{,Consume}`),
+gated by the 3-conjunct refAlias consume predicate. -/
+theorem lowerLoopItersP_singletonRefAliasConsume_eq
+    (xName iterVar n : String)
+    (hXNe : (xName == iterVar) = false)
+    (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (naturalLU nonFinalLU : List (String × Nat))
+    (loopLocal : List String) (constInts : List (String × Int))
+    (count : Nat)
+    (hConsumeFinal :
+      (Stack.Lower.listContains loopLocal n
+        && !Stack.Lower.listContains ([] : List String) n
+        && Stack.Lower.isLastUse naturalLU n 0) = true)
+    (hCopyNonFinal :
+      (Stack.Lower.listContains loopLocal n
+        && !Stack.Lower.listContains ([] : List String) n
+        && Stack.Lower.isLastUse nonFinalLU n 0) = false) :
+    ∀ (m : Nat) (sm : StackMap) (d : Nat) (hDepth : sm.depth? n = some d),
+      Stack.Lower.lowerLoopItersP progMethods props budget naturalLU
+        nonFinalLU loopLocal constInts
+        [ANFBinding.mk xName (.loadConst (.refAlias n)) none] iterVar count sm m
+        = (loopRefConsumeAssemble xName iterVar n count sm m,
+           refConsumeStrandMap xName iterVar n sm m)
+  | 0, sm, d, _ => by
+      simp [Stack.Lower.lowerLoopItersP, loopRefConsumeAssemble,
+            refConsumeStrandMap]
+  | 1, sm, d, hDepth => by
+      have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
+        depth?_push_ne sm iterVar n hIterNe d hDepth
+      unfold Stack.Lower.lowerLoopItersP loopRefConsumeAssemble
+             refConsumeStrandMap
+      simp only [lowerBindingsP_singletonRefRefAliasConsume progMethods props budget
+            naturalLU [] loopLocal constInts (sm.push iterVar) xName n (d + 1)
+            hDepthInner hConsumeFinal, beq_self_eq_true, if_true]
+      have hSmShape : ∃ rest, (Stack.Lower.bringToTop (sm.push iterVar) n true).2
+          = n :: iterVar :: rest := by
+        match d with
+        | 0 => exact bringToTop_true_smInner_depth1 sm iterVar n hIterNe hDepthInner
+        | 1 => exact ⟨Stack.Lower.StackMap.removeAtDepth sm 1,
+            bringToTop_true_smInner_depth2 sm iterVar n hDepthInner⟩
+        | d' + 2 => exact ⟨Stack.Lower.StackMap.removeAtDepth sm (d' + 3 - 1),
+            bringToTop_true_smInner_depthD sm iterVar n (d' + 3) (by omega) hDepthInner⟩
+      obtain ⟨rest, hSm2⟩ := hSmShape
+      rw [hSm2]
+      rw [cleanupGate_buried xName iterVar rest hXNe]
+      simp [Stack.Lower.lowerLoopItersP, List.append_nil]
+  | m + 2, sm, d, hDepth => by
+      have hDepthInner : (sm.push iterVar).depth? n = some (d + 1) :=
+        depth?_push_ne sm iterVar n hIterNe d hDepth
+      have hSmCopy : (Stack.Lower.bringToTop (sm.push iterVar) n false).2
+          = n :: iterVar :: sm := by
+        rw [bringToTop_false_sm_eq (sm.push iterVar) n (d + 1) hDepthInner]; rfl
+      have hCopyOps : (Stack.Lower.bringToTop (sm.push iterVar) n false).1
+          = Stack.Lower.loadRef (sm.push iterVar) n :=
+        bringToTop_false_ops_eq_loadRef (sm.push iterVar) n (d + 1) hDepthInner
+      unfold Stack.Lower.lowerLoopItersP loopRefConsumeAssemble
+             refConsumeStrandMap
+      -- Non-final: `lu = nonFinalLU` (remaining = m+1 ≠ 0), gate false → copy.
+      simp only [lowerBindingsP_singletonRefRefAlias progMethods props budget
+            nonFinalLU [] loopLocal constInts (sm.push iterVar) xName n (d + 1)
+            hDepthInner hCopyNonFinal, Nat.add_one_ne_zero, beq_iff_eq, if_false,
+                 hSmCopy, hCopyOps]
+      rw [cleanupGate_buried xName iterVar sm hXNe]
+      have h1 : (Stack.Lower.StackMap.push sm iterVar).depth? n = some (d + 1) :=
+        depth?_push_ne sm iterVar n hIterNe d hDepth
+      have hDepthGrown :
+          (Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName).depth? n
+            = some (d + 2) :=
+        depth?_push_ne (Stack.Lower.StackMap.push sm iterVar) xName n hXNameNe (d + 1) h1
+      simp only []
+      rw [show (xName :: iterVar :: sm)
+            = Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName from rfl]
+      rw [lowerLoopItersP_singletonRefAliasConsume_eq xName iterVar n hXNe hIterNe
+            hXNameNe progMethods props budget naturalLU nonFinalLU loopLocal
+            constInts count hConsumeFinal hCopyNonFinal (m + 1)
+            (Stack.Lower.StackMap.push (Stack.Lower.StackMap.push sm iterVar) xName)
+            (d + 2) hDepthGrown]
+      simp [List.append_nil]
+
+/-- `computeLastUses` of a singleton refAlias body is `[(n, 0)]`
+(`collectRefs (.loadConst (.refAlias n)) = [n]`, identical to the
+loadParam case). -/
+private theorem refAlias_computeLastUses (xName n : String) :
+    Stack.Lower.computeLastUses
+      [ANFBinding.mk xName (.loadConst (.refAlias n)) none] = [(n, 0)] := by
+  show Stack.Lower.computeLastUses.go [] 0
+          [ANFBinding.mk xName (.loadConst (.refAlias n)) none] = [(n, 0)]
+  unfold Stack.Lower.computeLastUses.go
+  have hCR : Stack.Lower.collectRefs (.loadConst (.refAlias n)) = [n] := rfl
+  show Stack.Lower.computeLastUses.go
+          ((Stack.Lower.collectRefs (.loadConst (.refAlias n))).foldl
+            (init := ([] : List (String × Nat)))
+            (fun a r => Stack.Lower.lastUsesUpdate a r 0)) (0 + 1) [] = [(n, 0)]
+  rw [hCR]
+  show Stack.Lower.computeLastUses.go
+          (Stack.Lower.lastUsesUpdate [] n 0) 1 [] = [(n, 0)]
+  unfold Stack.Lower.computeLastUses.go Stack.Lower.lastUsesUpdate
+  simp
+
+/-- `bodyOuterRefs` of a singleton refAlias body (with `xName ≠ n`) is
+`[n]`: the target is not body-bound, so it is collected as an outer
+ref. -/
+private theorem refAlias_bodyOuterRefs (xName iterVar n : String)
+    (hXNameNe : xName ≠ n) :
+    Stack.Lower.bodyOuterRefs
+      [ANFBinding.mk xName (.loadConst (.refAlias n)) none] iterVar = [n] := by
+  unfold Stack.Lower.bodyOuterRefs
+  simp [List.foldl_cons, List.foldl_nil, ANFBinding.value,
+        Stack.Lower.listContains]
+  exact hXNameNe
+
+/-- `clampLastUsesForOuter` bumps `n`'s recorded index to `1` for a
+singleton refAlias body (with `xName ≠ n`). -/
+private theorem refAlias_clampLastUses (xName iterVar n : String)
+    (hXNameNe : xName ≠ n) :
+    Stack.Lower.clampLastUsesForOuter
+      (Stack.Lower.computeLastUses
+        [ANFBinding.mk xName (.loadConst (.refAlias n)) none])
+      (Stack.Lower.bodyOuterRefs
+        [ANFBinding.mk xName (.loadConst (.refAlias n)) none] iterVar)
+      [ANFBinding.mk xName (.loadConst (.refAlias n)) none].length = [(n, 1)] := by
+  rw [refAlias_computeLastUses, refAlias_bodyOuterRefs xName iterVar n hXNameNe]
+  show Stack.Lower.clampLastUsesForOuter [(n, 0)] [n] 1 = [(n, 1)]
+  unfold Stack.Lower.clampLastUsesForOuter
+  simp only [List.foldl_cons, List.foldl_nil]
+  unfold Stack.Lower.lastUsesUpdate
+  simp [beq_iff_eq]
+
+/-- Value-level lift for the refAlias CONSUME tier. The loop arm threads
+`loopLocal = localBindings ++ [xName]`; when `n` IS in that set
+(`hLocal`) the final-iteration gate fires (ROLL/SWAP/ROT consume) while
+non-final iterations are clamped to copy. Requires `xName ≠ n` (so the
+clamp recognises `n` as an outer ref). -/
+theorem lowerValueP_loop_singletonRefAliasConsume_ops_eq
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (bindingName xName iterVar n : String)
+    (count d : Nat)
+    (hXNe : (xName == iterVar) = false)
+    (hIterNe : iterVar ≠ n) (hXNameNe : xName ≠ n)
+    (hDepth : sm.depth? n = some d)
+    (hLocal :
+      Stack.Lower.listContains (localBindings ++ [xName]) n = true) :
+    (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts sm bindingName
+        (.loop count [.mk xName (.loadConst (.refAlias n)) none] iterVar)).1
+      = loopRefConsumeAssemble xName iterVar n count sm count := by
+  have hLocal' :
+      Stack.Lower.listContains
+        (localBindings ++ [ANFBinding.mk xName (.loadConst (.refAlias n)) none].map
+          (fun b => b.name)) n = true := by
+    show Stack.Lower.listContains (localBindings ++ [xName]) n = true
+    exact hLocal
+  unfold Stack.Lower.lowerValueP
+  simp only [lowerLoopItersP_singletonRefAliasConsume_eq xName iterVar n hXNe hIterNe
+    hXNameNe progMethods props budget
+    (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadConst (.refAlias n)) none])
+    (Stack.Lower.clampLastUsesForOuter
+      (Stack.Lower.computeLastUses [ANFBinding.mk xName (.loadConst (.refAlias n)) none])
+      (Stack.Lower.bodyOuterRefs
+        [ANFBinding.mk xName (.loadConst (.refAlias n)) none] iterVar)
+      [ANFBinding.mk xName (.loadConst (.refAlias n)) none].length)
+    (localBindings ++ [ANFBinding.mk xName (.loadConst (.refAlias n)) none].map
+      (fun b => b.name)) constInts count
+    (by
+      rw [hLocal', refAlias_computeLastUses]
+      show (true && !Stack.Lower.listContains ([] : List String) n
+              && Stack.Lower.isLastUse [(n, 0)] n 0) = true
+      unfold Stack.Lower.listContains Stack.Lower.isLastUse
+        Stack.Lower.lastUsesLookup
+      simp [List.find?])
+    (by
+      rw [hLocal', refAlias_clampLastUses xName iterVar n hXNameNe]
+      show (true && !Stack.Lower.listContains ([] : List String) n
+              && Stack.Lower.isLastUse [(n, 1)] n 0) = false
+      unfold Stack.Lower.listContains Stack.Lower.isLastUse
+        Stack.Lower.lastUsesLookup
+      simp [List.find?])
+    count sm d hDepth]
+
+/-- Count-generic sanity for the refAlias CONSUME tier: at `count = 2`
+against `["p", "q"]` with enclosing localBindings `["q"]` (target in the
+set), the closed form reproduces `tier3b_refAlias_consume_count2_pin`'s
+bytes (`00527951547a`, final ROLL-consume). -/
+theorem lowerValueP_loop_singletonRefAliasConsume_count2_matches_pin :
+    RunarVerification.Script.Emit.bytesToHex (RunarVerification.Script.Emit.emitOps
+      (Stack.Lower.lowerValueP [] [] Stack.Lower.defaultInlineBudget 0
+        [] [] ["q"] [] ["p", "q"] "L"
+        (.loop 2 [ANFBinding.mk "x" (.loadConst (.refAlias "q")) none] "i")).1)
+      = "00527951547a" := by
+  rw [lowerValueP_loop_singletonRefAliasConsume_ops_eq [] [] Stack.Lower.defaultInlineBudget 0
+        [] [] ["q"] [] ["p", "q"] "L" "x" "i" "q" 2 1
+        (by decide) (by decide) (by decide) (by decide) (by decide)]
+  exact loopRefConsumeAssemble_count2_hex
 
 /-! ### Generic op-level transports (op-list facts; unchanged) -/
 
