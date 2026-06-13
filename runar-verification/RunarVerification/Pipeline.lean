@@ -6208,6 +6208,46 @@ theorem peepholeMethodOps_hashChain_hash160_hash160 :
     (by simp +decide [AgreesHashCall.hashChainOps,
       Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])
 
+/-- **Peephole FUSION image on `[OP_SHA256, OP_SHA256]`.**  Unlike the three
+peephole-stable pairs, the `(sha256, sha256)` chain ops do NOT survive: the
+flat pass's `applyDoubleSha256` rewrites `[OP_SHA256, OP_SHA256]` to the single
+`[OP_HASH256]`, on which the three remaining passes are the identity (same
+single-opcode reduction as `peepholeMethodOps_single_opcode`).  Sound — the VM
+identity `hash256 = sha256 ∘ sha256` (`Stack.HashOps.hash256_eq_double_sha256`)
+links the two images at runtime. -/
+theorem peepholeMethodOps_hashChain_sha256_sha256 :
+    peepholeMethodOps (AgreesHashCall.hashChainOps "OP_SHA256" "OP_SHA256")
+      = [StackOp.opcode "OP_HASH256"] := by
+  unfold peepholeMethodOps
+  have hNoIf : Peephole.noIfOp (AgreesHashCall.hashChainOps "OP_SHA256" "OP_SHA256") := by
+    simp [AgreesHashCall.hashChainOps, Peephole.noIfOp]
+  rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
+  -- The flat pass FUSES the double-sha256 to a single OP_HASH256.
+  have hFlat : Peephole.peepholePassAllFlat
+      (AgreesHashCall.hashChainOps "OP_SHA256" "OP_SHA256")
+      = [StackOp.opcode "OP_HASH256"] := by
+    simp +decide [AgreesHashCall.hashChainOps, Peephole.peepholePassAllFlat,
+      Peephole.applyEqualVerifyFuse, Peephole.applyCheckSigVerifyFuse,
+      Peephole.applyNumEqualVerifyFuse, Peephole.applyZeroNumEqual,
+      Peephole.applyDoubleSha256, Peephole.applyDoubleDrop, Peephole.applyDoubleOver,
+      Peephole.applyDoubleNot, Peephole.applyDoubleNegate, Peephole.applyOneSub,
+      Peephole.applyOneAdd, Peephole.applySubZero, Peephole.applyAddZero,
+      Peephole.applyPushPushMul, Peephole.applyPushPushSub, Peephole.applyPushPushAdd,
+      Peephole.applyDoubleSwap, Peephole.applyDupDrop, Peephole.applyDropAfterPush]
+  rw [hFlat]
+  -- The remaining three passes are the identity on the single OP_HASH256.
+  have hNoIf256 : Peephole.noIfOp [StackOp.opcode "OP_HASH256"] := by
+    simp [Peephole.noIfOp]
+  rw [Peephole.peepholePostFold_eq_applyPushOne_of_noIfOp _ hNoIf256]
+  have hPost : Peephole.applyPushOneSub
+      (Peephole.applyPushOneAdd [StackOp.opcode "OP_HASH256"])
+      = [StackOp.opcode "OP_HASH256"] := by
+    simp [Peephole.applyPushOneAdd, Peephole.applyPushOneSub]
+  rw [hPost, Peephole.peepholeChainFold_eq_self_of_noIfOp_pushFree _ hNoIf256
+        (by simp [Peephole.pushFree]),
+    Peephole.peepholeRollPickFold_eq_self_of_noIfOp_flatNoop _ hNoIf256
+        (by simp [Peephole.rollPickFoldFlatNoop, Peephole.rollPickFoldOpNoop])]
+
 /-- **2-chain consume core (func-agnostic).**  Composes the always-completing
 ANF and Stack walks with the method-level lowering reduction, the peephole
 identity, and the push round-trip M4.  VALUE-terminated, so the acceptance
@@ -6296,10 +6336,113 @@ theorem hashChain_consume_core
     rw [hBody]; simp [AgreesHashCall.hashChainBody, Lower.bodyEndsInAssert]
   exact Stack.Eval.acceptAgrees_of_completion_of_truthy hCompletion (hTopTruthy hNoTA)
 
+/-- **2-chain consume core — FUSING `(sha256, sha256)` pair.**  Sibling of
+`hashChain_consume_core` for the one pair whose lowered ops do NOT survive the
+peephole: `lowerMethod` still emits `hashChainOps "OP_SHA256" "OP_SHA256"`
+(pre-peephole, shared), but the peephole stage FUSES it to `[OP_HASH256]`
+(`peepholeMethodOps_hashChain_sha256_sha256`).  The M4 round-trip and M2 walk
+are therefore over `[OP_HASH256]`, whose digest `hash256 arg = sha256 (sha256
+arg)` matches the ANF body's `d2`.  VALUE-terminated. -/
+theorem hashChain_consume_sha256d_core
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (d1 d2 arg : String) (ty : ANFType)
+    (s1 s2 : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : anfM.params = [ANFParam.mk arg ty])
+    (hBody : anfM.body = AgreesHashCall.hashChainBody d1 d2 arg "sha256" "sha256" s1 s2)
+    (hNe : d1 ≠ arg)
+    (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: rest)
+    (hLen : argBytes.size ≤ 520)
+    (hCallWit1 : Lower.lowerValueP p.methods p.properties Lower.defaultInlineBudget 0
+        [(d1, 1), (arg, 0)] [] [d1, d2]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashChainBody d1 d2 arg "sha256" "sha256" s1 s2))
+        [arg] d1 (.call "sha256" [arg])
+      = ([StackOp.opcode "OP_SHA256"], [d1], [d1, d2]))
+    (hCallWit2 : Lower.lowerValueP p.methods p.properties Lower.defaultInlineBudget 1
+        [(d1, 1), (arg, 0)] [] [d1, d2]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashChainBody d1 d2 arg "sha256" "sha256" s1 s2))
+        [d1] d2 (.call "sha256" [d1])
+      = ([StackOp.opcode "OP_SHA256"], [d2], [d1, d2]))
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hFuncs : AgreesHashCall.hashChainFuncsOk "sha256" "sha256" = true := by decide
+  have hD1Self : (initialAnf.addBinding d1
+      (.vBytes (RunarVerification.ANF.Eval.Crypto.sha256 argBytes))).resolveRef d1
+      = some (.vBytes (RunarVerification.ANF.Eval.Crypto.sha256 argBytes)) :=
+    RunarVerification.ANF.WellTyped.resolveRef_addBinding_self initialAnf d1 _
+  -- ANF: both sha256 calls complete; the body's d2 = sha256 (sha256 argBytes).
+  have hCall1 : RunarVerification.ANF.Eval.evalValue initialAnf (.call "sha256" [arg])
+      = .ok (.vBytes (RunarVerification.ANF.Eval.Crypto.sha256 argBytes), initialAnf) :=
+    AgreesHashCall.evalValue_call_sha256_eq_local initialAnf arg argBytes hArg
+  have hCall2 : RunarVerification.ANF.Eval.evalValue
+      (initialAnf.addBinding d1
+        (.vBytes (RunarVerification.ANF.Eval.Crypto.sha256 argBytes))) (.call "sha256" [d1])
+      = .ok (.vBytes (RunarVerification.ANF.Eval.Crypto.sha256
+          (RunarVerification.ANF.Eval.Crypto.sha256 argBytes)),
+        initialAnf.addBinding d1
+          (.vBytes (RunarVerification.ANF.Eval.Crypto.sha256 argBytes))) :=
+    AgreesHashCall.evalValue_call_sha256_eq_local _ d1 _ hD1Self
+  have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+      anfM.body).toOption.isSome = true := by
+    rw [hBody]
+    exact AgreesHashCall.evalBindingsP_hashChain_isSome p.methods initialAnf
+      d1 d2 arg "sha256" "sha256" s1 s2 _ _ hCall1 hCall2
+  -- Lowering (pre-peephole, shared) reduces to the bare 2-opcode double-sha256.
+  have hOps : (Lower.lowerMethod p.methods p.properties anfM).ops
+      = AgreesHashCall.hashChainOps "OP_SHA256" "OP_SHA256" :=
+    AgreesHashCall.lowerMethod_ops_hashChain p.methods p.properties anfM
+      d1 d2 arg "sha256" "sha256" "OP_SHA256" "OP_SHA256" ty s1 s2 hParams hBody hPublic
+      hNe hFuncs hCallWit1 hCallWit2
+  obtain ⟨hPubSingleton, _hStackBody⟩ :=
+    peepholeProgram_single_public_shape p anfM hSinglePublic hName
+  -- Peephole FUSES the lowered ops to a single OP_HASH256.
+  have hPeeped : (peepholedLoweredMethod p anfM).ops = [StackOp.opcode "OP_HASH256"] := by
+    show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = _
+    rw [hOps]
+    exact peepholeMethodOps_hashChain_sha256_sha256
+  -- M4: parsed bytes run as the fused [OP_HASH256].
+  have hM4 : runParsedBytes bytes initialStack
+      = runOps [StackOp.opcode "OP_HASH256"] initialStack := by
+    have hEmitPush : Parse.AreRunarEmittablePush (peepholedLoweredMethod p anfM).ops := by
+      show Parse.areRunarEmittablePushBool (peepholedLoweredMethod p anfM).ops = true
+      rw [hPeeped]; decide
+    have hEq := compileSafe_single_public_runOps_eq_push p bytes
+      (peepholedLoweredMethod p anfM) initialStack hSafe hPubSingleton hEmitPush
+    rw [hEq, hPeeped]
+  -- M2: the fused op produces hash256 argBytes = sha256 (sha256 argBytes).
+  have hStackRun : runOps [StackOp.opcode "OP_HASH256"] initialStack
+      = .ok { initialStack with
+          stack := .vBytes (RunarVerification.ANF.Eval.Crypto.sha256
+            (RunarVerification.ANF.Eval.Crypto.sha256 argBytes)) :: rest } :=
+    Stack.HashOps.runOps_hash256Ops_eq_composition initialStack argBytes rest hStk hLen
+  have hCompletion :
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
+        anfM.body).toOption.isSome
+      ↔ (runParsedBytes bytes initialStack).toOption.isSome := by
+    rw [hANF, hM4, hStackRun]
+    simp [Except.toOption]
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBody]; simp [AgreesHashCall.hashChainBody, Lower.bodyEndsInAssert]
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hCompletion (hTopTruthy hNoTA)
+
 /-- **2-chain consume (HEADLINE, acceptance bit).**  One theorem over the
-three admissible pairs (`hashChainFuncsOk`); the digest truthiness is carried
+four admissible pairs (`hashChainFuncsOk`); the digest truthiness is carried
 by the keyed `hTopTruthy` premise (the body is VALUE-terminated and the hash
-backends are opaque — same regime as the bare single-call theorems). -/
+backends are opaque — same regime as the bare single-call theorems).  Three
+pairs are peephole-stable; `(sha256, sha256)` FUSES to `[OP_HASH256]` and is
+discharged by `hashChain_consume_sha256d_core`. -/
 theorem hashChain_consume
     (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
     (d1 d2 arg f1 f2 : String) (ty : ANFType) (s1 s2 : Option SourceLoc)
@@ -6323,14 +6466,15 @@ theorem hashChain_consume
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
   have hF : (f1 = "sha256" ∧ f2 = "hash160") ∨ (f1 = "hash160" ∧ f2 = "sha256")
-      ∨ (f1 = "hash160" ∧ f2 = "hash160") := by
+      ∨ (f1 = "hash160" ∧ f2 = "hash160") ∨ (f1 = "sha256" ∧ f2 = "sha256") := by
     have h := hFuncs
     simp only [AgreesHashCall.hashChainFuncsOk, Bool.or_eq_true,
       Bool.and_eq_true, beq_iff_eq] at h
-    rcases h with (h | h) | h
+    rcases h with ((h | h) | h) | h
     · exact Or.inl h
     · exact Or.inr (Or.inl h)
-    · exact Or.inr (Or.inr h)
+    · exact Or.inr (Or.inr (Or.inl h))
+    · exact Or.inr (Or.inr (Or.inr h))
   have hD1Self : (initialAnf.addBinding d1
       (.vBytes (RunarVerification.ANF.Eval.Crypto.sha256 argBytes))).resolveRef d1
       = some (.vBytes (RunarVerification.ANF.Eval.Crypto.sha256 argBytes)) :=
@@ -6339,7 +6483,8 @@ theorem hashChain_consume
       (.vBytes (RunarVerification.ANF.Eval.Crypto.hash160 argBytes))).resolveRef d1
       = some (.vBytes (RunarVerification.ANF.Eval.Crypto.hash160 argBytes)) :=
     RunarVerification.ANF.WellTyped.resolveRef_addBinding_self initialAnf d1 _
-  rcases hF with ⟨hF1, hF2⟩ | ⟨hF1, hF2⟩ | ⟨hF1, hF2⟩ <;> subst hF1 <;> subst hF2
+  rcases hF with ⟨hF1, hF2⟩ | ⟨hF1, hF2⟩ | ⟨hF1, hF2⟩ | ⟨hF1, hF2⟩ <;>
+    subst hF1 <;> subst hF2
   · -- (sha256, hash160)
     exact hashChain_consume_core p anfM bytes d1 d2 arg "sha256" "hash160"
       "OP_SHA256" "OP_HASH160" ty s1 s2 hMem hPublic hSafe initialAnf initialStack
@@ -6409,6 +6554,21 @@ theorem hashChain_consume
           (AgreesHashCall.hashChainBody d1 d2 arg "hash160" "hash160" s1 s2))
         d2 d1 [] (AgreesHashCall.hashChain_d1_consume_fact d1 arg))
       hTopTruthy
+  · -- (sha256, sha256) — FUSES to [OP_HASH256]; sibling fused core.
+    exact hashChain_consume_sha256d_core p anfM bytes d1 d2 arg ty s1 s2
+      hMem hPublic hSafe initialAnf initialStack hSinglePublic hName hParams hBody hNe
+      argBytes rest hArg hStk hLen
+      (AgreesHashCall.lowerValueP_call_sha256_consume_d0_full p.methods p.properties
+        Lower.defaultInlineBudget 0 [(d1, 1), (arg, 0)] [d1, d2]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashChainBody d1 d2 arg "sha256" "sha256" s1 s2))
+        d1 arg [] (AgreesHashCall.hashChain_arg_consume_fact d1 arg hNe))
+      (AgreesHashCall.lowerValueP_call_sha256_consume_d0_full p.methods p.properties
+        Lower.defaultInlineBudget 1 [(d1, 1), (arg, 0)] [d1, d2]
+        (Lower.collectConstInts
+          (AgreesHashCall.hashChainBody d1 d2 arg "sha256" "sha256" s1 s2))
+        d2 d1 [] (AgreesHashCall.hashChain_d1_consume_fact d1 arg))
+      hTopTruthy
 
 /-! ### MANDATORY smoke: the 2-chain consume theorem fires
 
@@ -6449,6 +6609,40 @@ theorem smoke_hashChain_consume_fires
     AgreesHashCall.hashChainSmokeMethod bytes "d1" "d2" "x" "sha256" "hash160"
     .byteString none none
     (by simp [hashChainSmokeProg]) rfl hSafe
+    hashChainSmokeAnf hashChainSmokeStk rfl (by decide) rfl rfl (by decide)
+    (by decide) (ByteArray.mk #[1, 2, 3]) [] rfl rfl (by decide)
+    (fun _ s hRun => hTopTruthy bytes s hSafe hRun)
+
+/-- The FUSING `(sha256, sha256)` 2-chain method `h(x){d1:=sha256(x); d2:=sha256(d1)}`. -/
+private def hashChainSha256dSmokeMethod : ANFMethod :=
+  { AgreesHashCall.hashChainSmokeMethod with
+    body := AgreesHashCall.hashChainBody "d1" "d2" "x" "sha256" "sha256" none none }
+
+private def hashChainSha256dSmokeProg : ANFProgram :=
+  { contractName := "HCD", properties := [], methods := [hashChainSha256dSmokeMethod] }
+
+/-- SMOKE — `hashChain_consume` fires on the FUSING sha256→sha256 chain (the
+new `(sha256, sha256)` coverage; the peephole fuses to `[OP_HASH256]`). -/
+theorem smoke_hashChain_consume_fires_sha256d
+    (hTopTruthy : ∀ bytes s, compileSafe hashChainSha256dSmokeProg = .ok bytes →
+        runParsedBytes bytes hashChainSmokeStk = .ok s →
+        topTruthy s.stack = true) :
+    ∃ bytes, compileSafe hashChainSha256dSmokeProg = .ok bytes ∧
+      acceptAgrees
+        (RunarVerification.ANF.Eval.evalBindingsP hashChainSha256dSmokeProg.methods
+          hashChainSmokeAnf hashChainSha256dSmokeMethod.body)
+        (runParsedBytes bytes hashChainSmokeStk) := by
+  obtain ⟨bytes, hSafe⟩ : ∃ b, compileSafe hashChainSha256dSmokeProg = .ok b := by
+    have h : (compileSafe hashChainSha256dSmokeProg).toOption.isSome = true := by
+      native_decide
+    cases hc : compileSafe hashChainSha256dSmokeProg with
+    | ok b => exact ⟨b, rfl⟩
+    | error e => rw [hc] at h; simp [Except.toOption] at h
+  refine ⟨bytes, hSafe, ?_⟩
+  exact hashChain_consume hashChainSha256dSmokeProg
+    hashChainSha256dSmokeMethod bytes "d1" "d2" "x" "sha256" "sha256"
+    .byteString none none
+    (by simp [hashChainSha256dSmokeProg]) rfl hSafe
     hashChainSmokeAnf hashChainSmokeStk rfl (by decide) rfl rfl (by decide)
     (by decide) (ByteArray.mk #[1, 2, 3]) [] rfl rfl (by decide)
     (fun _ s hRun => hTopTruthy bytes s hSafe hRun)

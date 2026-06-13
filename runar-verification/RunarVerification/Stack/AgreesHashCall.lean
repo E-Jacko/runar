@@ -819,11 +819,13 @@ Each intermediate is consumed in place (depth-0 last-use), so the method
 lowers to the bare 2-opcode list `[op1, op2]` — no elision (the body is
 VALUE-terminated), no NIPs (the `bodyEndsInAssert` gate is false).
 
-SCOPE (probed 2026-06-11): the pair `(sha256, sha256)` is EXCLUDED — the
-peephole `applyDoubleSha256` fuses `[OP_SHA256, OP_SHA256]` to `[OP_HASH256]`
-(sound — `hash256 = sha256 ∘ sha256` — but a different M3/M4 image; covering
-it via the `runOps_hash256Ops_eq_composition` transport is deferred).  The
-remaining three pairs are peephole-stable. -/
+SCOPE (2026-06-13, widened): all FOUR ordered hash pairs are covered.  Three
+are peephole-STABLE (`hashChainOps` survives unchanged).  The pair
+`(sha256, sha256)` is peephole-FUSING — `applyDoubleSha256` rewrites
+`[OP_SHA256, OP_SHA256]` to `[OP_HASH256]` — and is sound via
+`hash256 = sha256 ∘ sha256` (`runOps_hash256Ops_eq_composition`); its M3/M4
+image is `[OP_HASH256]`, discharged in `Pipeline.hashChain_consume_sha256d_core`
+(`OP_HASH256` is allowlisted for the round-trip in `Script.Parse`). -/
 
 /-- The 2-chain body shape. -/
 def hashChainBody (d1 d2 arg f1 f2 : String) (s1 s2 : Option SourceLoc) :
@@ -835,12 +837,22 @@ def hashChainBody (d1 d2 arg f1 f2 : String) (s1 s2 : Option SourceLoc) :
 def hashChainOps (op1 op2 : String) : List StackOp :=
   [.opcode op1, .opcode op2]
 
-/-- The admissible (peephole-stable) function pairs.  `(sha256, sha256)` is
-deliberately ABSENT — see the Part 9 header. -/
+/-- The admissible function pairs.  Three pairs are peephole-STABLE
+(`hashChainOps` survives the peephole unchanged); `(sha256, sha256)` is also
+admitted but is peephole-FUSING — the pair `[OP_SHA256, OP_SHA256]` fuses to
+`[OP_HASH256]` (sound: `hash256 = sha256 ∘ sha256`).  See the Part 9 header
+and `hashChainFuses` for the discriminator. -/
 def hashChainFuncsOk (f1 f2 : String) : Bool :=
   (f1 == "sha256" && f2 == "hash160")
     || (f1 == "hash160" && f2 == "sha256")
     || (f1 == "hash160" && f2 == "hash160")
+    || (f1 == "sha256" && f2 == "sha256")
+
+/-- Discriminates the peephole-FUSING pair `(sha256, sha256)` from the three
+peephole-stable pairs.  The fusing pair lowers to `[OP_SHA256, OP_SHA256]`,
+which the peephole `applyDoubleSha256` rewrites to `[OP_HASH256]`. -/
+def hashChainFuses (f1 f2 : String) : Bool :=
+  f1 == "sha256" && f2 == "sha256"
 
 /-- The concrete last-use table of the 2-chain body. -/
 theorem computeLastUses_hashChain
@@ -915,14 +927,15 @@ theorem lowerMethod_ops_hashChain
       = ([StackOp.opcode op2], [d2], [d1, d2])) :
     (Lower.lowerMethod progMethods props anfM).ops = hashChainOps op1 op2 := by
   have hF : (f1 = "sha256" ∧ f2 = "hash160") ∨ (f1 = "hash160" ∧ f2 = "sha256")
-      ∨ (f1 = "hash160" ∧ f2 = "hash160") := by
+      ∨ (f1 = "hash160" ∧ f2 = "hash160") ∨ (f1 = "sha256" ∧ f2 = "sha256") := by
     have h := hFuncs
     simp only [hashChainFuncsOk, Bool.or_eq_true, Bool.and_eq_true,
       beq_iff_eq] at h
-    rcases h with (h | h) | h
+    rcases h with ((h | h) | h) | h
     · exact Or.inl h
     · exact Or.inr (Or.inl h)
-    · exact Or.inr (Or.inr h)
+    · exact Or.inr (Or.inr (Or.inl h))
+    · exact Or.inr (Or.inr (Or.inr h))
   unfold Lower.lowerMethod
   rw [hParams, hBody, hPub]
   simp only [List.map_cons, List.map_nil, List.reverse_cons, List.reverse_nil,
@@ -932,8 +945,8 @@ theorem lowerMethod_ops_hashChain
     simp [hashChainBody, Lower.bindingsUseCheckPreimage]
   have hUsesCode : Lower.bindingsUseCodePart
       (hashChainBody d1 d2 arg f1 f2 s1 s2) = false := by
-    rcases hF with ⟨h1, h2⟩ | ⟨h1, h2⟩ | ⟨h1, h2⟩ <;> subst h1 <;> subst h2 <;>
-      simp [hashChainBody, Lower.bindingsUseCodePart]
+    rcases hF with ⟨h1, h2⟩ | ⟨h1, h2⟩ | ⟨h1, h2⟩ | ⟨h1, h2⟩ <;> subst h1 <;>
+      subst h2 <;> simp [hashChainBody, Lower.bindingsUseCodePart]
   have hEndsAssert : Lower.bodyEndsInAssert
       (hashChainBody d1 d2 arg f1 f2 s1 s2) = false := by
     simp [hashChainBody, Lower.bodyEndsInAssert]
@@ -1072,11 +1085,12 @@ theorem smoke_hashChain_classifier_fires :
     hashAssertConsumeShapeBool hashChainSmokeMethod = false := by
   refine ⟨?_, ?_, ?_⟩ <;> decide +kernel
 
-/-- SMOKE — the excluded fusing pair `(sha256, sha256)` is NOT classified. -/
-theorem smoke_hashChain_excludes_double_sha256 :
+/-- SMOKE — the fusing pair `(sha256, sha256)` IS now classified (2026-06-13
+widening; its method ops fuse `[OP_SHA256, OP_SHA256] → [OP_HASH256]`). -/
+theorem smoke_hashChain_includes_double_sha256 :
     hashChainConsumeShapeBool
       { hashChainSmokeMethod with
-        body := hashChainBody "d1" "d2" "x" "sha256" "sha256" none none } = false := by
+        body := hashChainBody "d1" "d2" "x" "sha256" "sha256" none none } = true := by
   decide +kernel
 
 /-- SMOKE — the canonical chain's method ops reduce to the bare 2-opcode list. -/
