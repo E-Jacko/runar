@@ -6,6 +6,7 @@ import RunarVerification.Stack.Eval
 import RunarVerification.Stack.Lower
 import RunarVerification.Stack.Sim
 import RunarVerification.Stack.Agrees
+import RunarVerification.Stack.Accept
 import RunarVerification.Script.Emit
 
 /-!
@@ -5455,6 +5456,398 @@ theorem loopOkAssemble_count3_sum_matches :
   rw [hstk, hb]
   -- 0 + (3 : Int) * 5 = 15.
   rfl
+
+/-! ### TIER 4a — the epilogue runtime walk + assembled runtime closed form
+
+Tier 3 left the loop-portion post-state implicit (`∃ below`).  The deployed
+`loopOk` method does not stop there: after the loop bytes the lowered method
+emits the EPILOGUE — `loadProp expectedSum` (a constructor `.placeholder`,
+encoded `OP_0`, runtime-pushing `vBigint 0`), the `===` binop
+(`OP_NUMEQUAL`), and — after the terminal `OP_VERIFY` is ELIDED by
+`lowerMethod` (public + `bodyEndsInAssert`) — `count` strand-cleanup `OP_NIP`s
+(the deployed `777777` for `count = 3`).
+
+This section adds, ALL as pure-runtime substrate over `runOps`:
+
+1. `loopOkPostStack_explicit` — strengthens `loopOkPostStack_head_sum` to the
+   EXPLICIT post-loop stack shape `(sum) :: strands ++ rest` with
+   `strands.length = m + iStrands.length` (so at the headline `m = count`,
+   `iStrands = []`: exactly `count` index strands below the sum).
+2. `runOps_replicate_nip_walk` — `k` `OP_NIP`s remove the `k` elements DIRECTLY
+   below the top (the strand cleanup).
+3. `runOps_loopOkEpilogue` — the epilogue ops
+   `[OP_0, OP_NUMEQUAL] ++ replicate count nip` over `(v) :: strands ++ rest`
+   (`strands.length = count`) leave `(v === 0)` on top of `rest`.
+4. `runOps_loopOkFull_accept` — the ASSEMBLED runtime closed form: the loop
+   bytes ++ epilogue, from the mirror entry `sum0 :: start0 :: rest`, leave
+   `(.vBool (decide (sum0 + count*start0 = 0)))` on top of `rest`.  This is
+   the runtime side of the `acceptAgrees` accumulator-consume fact at the
+   placeholder `expectedSum = 0`: the deployed bytes are ACCEPTED iff
+   `sum0 + count*start0 = 0`, exactly when the ANF terminal assert passes.
+
+GENERALITY: fully general over the loop entry `sum0`, `start0`, `count ≥ 1`,
+and the residual stack `rest`.  The `expectedSum` comparand is FIXED at the
+deployed placeholder value `0` (the readonly prop lowers to `OP_0`; the SDK
+splices the real constructor arg at deploy time — the in-model bytes compare
+against `0`).  This matches the deployed-hex pin and the concrete
+`loopOk_bytes_accepted` entry.  The remaining lift to the parsed-bytes /
+`compileSafe` surface (the entry-shape bridge) is documented at the end of
+this section as the Tier 4b boundary. -/
+
+/-- **Explicit post-loop stack.** Strengthens `loopOkPostStack_head_sum`: for
+`1 ≤ m`, the post-state is `sum :: strands ++ rest` where the `strands` are
+exactly the `m + iStrands.length` index slots that accumulated during the
+walk (the `count - i` index per iteration, plus the carried `iStrands`).  At
+the headline `m = count`, `iStrands = []` this gives exactly `count` strands
+below the runtime `sum`. -/
+private theorem loopOkPostStack_explicit
+    (count : Nat) (startI : Int) :
+    ∀ (m : Nat) (sumI : Int) (iStrands rest : List Value), 1 ≤ m →
+      ∃ strands : List Value,
+        loopOkPostStack count sumI startI m iStrands rest
+          = (.vBigint (sumI + (m : Int) * startI)) :: strands ++ rest
+        ∧ strands.length = m + iStrands.length
+  | 1, sumI, iStrands, rest, _ => by
+      refine ⟨(.vBigint (Int.ofNat (count - 1))) :: iStrands, ?_, ?_⟩
+      · show (Value.vBigint (sumI + startI))
+              :: (Value.vBigint (Int.ofNat (count - 1))) :: iStrands ++ rest
+            = (Value.vBigint (sumI + ((1 : Nat) : Int) * startI))
+              :: ((Value.vBigint (Int.ofNat (count - 1))) :: iStrands) ++ rest
+        rw [show (((1 : Nat) : Int)) * startI = startI from by
+            rw [show (((1 : Nat) : Int)) = 1 from by omega, Int.one_mul]]
+      · simp only [List.length_cons]; omega
+  | m + 2, sumI, iStrands, rest, _ => by
+      obtain ⟨strands, hstr, hlen⟩ :=
+        loopOkPostStack_explicit count startI (m + 1) (sumI + startI)
+          ((.vBigint (Int.ofNat (count - (m + 2)))) :: iStrands) rest (by omega)
+      refine ⟨strands, ?_, ?_⟩
+      · show loopOkPostStack count (sumI + startI) startI (m + 1)
+              ((.vBigint (Int.ofNat (count - (m + 2)))) :: iStrands) rest = _
+        rw [hstr]
+        have hcast : sumI + startI + (((m + 1 : Nat) : Int)) * startI
+            = sumI + (((m + 2 : Nat) : Int)) * startI := by
+          rw [show (((m + 2 : Nat) : Int)) = (((m + 1 : Nat) : Int)) + 1 from by omega]
+          rw [Int.add_mul, Int.one_mul]; omega
+        rw [hcast]
+      · -- strands.length = (m+1) + (iStrands.length + 1) = (m+2) + iStrands.length
+        rw [hlen]; simp only [List.length_cons]; omega
+
+/-- **NIP-replicate walk.** Running `k` `OP_NIP`s over a stack whose top is
+`top` followed by `k` "strand" elements then `rest` removes all `k` strand
+elements, leaving `top :: rest`.  Each `OP_NIP` deletes the element directly
+below the top. -/
+private theorem runOps_replicate_nip_walk (top : Value) :
+    ∀ (strands rest : List Value) (s : StackState),
+      runOps (List.replicate strands.length StackOp.nip)
+          { s with stack := top :: strands ++ rest }
+        = .ok { s with stack := top :: rest }
+  | [], rest, s => by
+      simp only [List.length_nil, List.replicate_zero]
+      exact Stack.Eval.runOps_nil _
+  | x :: xs, rest, s => by
+      -- replicate (xs.length + 1) nip = nip :: replicate xs.length nip
+      rw [show (x :: xs : List Value).length = xs.length + 1 from rfl]
+      rw [List.replicate_succ]
+      rw [Stack.Eval.runOps_cons_nonIf_eq StackOp.nip _
+            { s with stack := top :: (x :: xs) ++ rest } (by intro _ _ h; cases h)]
+      -- stepNonIf nip = applyNip; on top :: x :: (xs ++ rest) ⇒ top :: (xs ++ rest)
+      have hstep : stepNonIf StackOp.nip
+          { s with stack := top :: (x :: xs) ++ rest }
+          = .ok { s with stack := top :: (xs ++ rest) } := by
+        show Stack.Eval.applyNip { s with stack := top :: (x :: xs) ++ rest } = _
+        unfold Stack.Eval.applyNip
+        simp only [List.cons_append]
+      rw [hstep]
+      -- Recurse on the shortened strand.
+      have hrec := runOps_replicate_nip_walk top xs rest s
+      rw [show (top :: (xs ++ rest)) = (top :: xs ++ rest) from rfl]
+      exact hrec
+
+/-- **The epilogue runtime walk.** The deployed `loopOk` epilogue —
+`[OP_0, OP_NUMEQUAL] ++ replicate count OP_NIP` — over the explicit post-loop
+stack `(.vBigint v) :: strands ++ rest` with `strands.length = count` leaves
+the comparison boolean `(.vBool (decide (v = 0)))` on top of `rest`.
+
+* `OP_0` pushes `vBigint 0` (the `loadProp expectedSum` placeholder).
+* `OP_NUMEQUAL` pops `0` and `v`, pushing `decide (v = 0)` — the `===` result.
+* `count` `OP_NIP`s erase the `count` index strands left by the loop unroll,
+  leaving the boolean directly over `rest` (the deployed `777777` for
+  `count = 3`).
+
+The `OP_0` push is stated literally; the model uses a `.placeholder` op that
+runs IDENTICALLY (`stepNonIf (.placeholder ..) = s.push (vBigint 0)`), bridged
+at the assembly site. -/
+private theorem runOps_loopOkEpilogue
+    (count : Nat) (v : Int) (strands rest : List Value) (s : StackState)
+    (hlen : strands.length = count) :
+    runOps
+        ([StackOp.opcode "OP_0", StackOp.opcode "OP_NUMEQUAL"]
+          ++ List.replicate count StackOp.nip)
+        { s with stack := (.vBigint v) :: strands ++ rest }
+      = .ok { s with stack := (.vBool (decide (v = 0))) :: rest } := by
+  -- [OP_0, OP_NUMEQUAL] ++ nips = OP_0 :: OP_NUMEQUAL :: nips
+  rw [show ([StackOp.opcode "OP_0", StackOp.opcode "OP_NUMEQUAL"]
+        ++ List.replicate count StackOp.nip)
+        = StackOp.opcode "OP_0" :: StackOp.opcode "OP_NUMEQUAL"
+            :: List.replicate count StackOp.nip from rfl]
+  -- Step OP_0: push vBigint 0.
+  rw [Stack.Eval.runOps_cons_nonIf_eq (StackOp.opcode "OP_0") _ _
+        (by intro _ _ h; cases h)]
+  have hOp0 : stepNonIf (StackOp.opcode "OP_0")
+      { s with stack := (.vBigint v) :: strands ++ rest }
+      = .ok { s with stack := (.vBigint 0) :: (.vBigint v) :: strands ++ rest } := by
+    rw [Stack.Eval.stepNonIf_opcode]; rfl
+  rw [hOp0]
+  -- The `match Except.ok …` reduces to running the tail on the pushed state.
+  show runOps (StackOp.opcode "OP_NUMEQUAL" :: List.replicate count StackOp.nip)
+      { s with stack := (.vBigint 0) :: (.vBigint v) :: strands ++ rest } = _
+  -- Step OP_NUMEQUAL: pop 0 and v, push decide (v = 0).
+  rw [Stack.Eval.runOps_cons_nonIf_eq (StackOp.opcode "OP_NUMEQUAL") _ _
+        (by intro _ _ h; cases h)]
+  have hNumEq : stepNonIf (StackOp.opcode "OP_NUMEQUAL")
+      { s with stack := (.vBigint 0) :: (.vBigint v) :: strands ++ rest }
+      = .ok { s with stack := (.vBool (decide (v = 0))) :: strands ++ rest } := by
+    rw [Stack.Eval.stepNonIf_opcode]
+    -- OP_NUMEQUAL = liftIntBinNum s (fun a b => vBool (decide (a = b)));
+    -- popN 2 = [0, v]; a = v, b = 0; result vBool (decide (v = 0)).
+    have hpop : Stack.Eval.popN
+        { s with stack := (.vBigint 0) :: (.vBigint v) :: strands ++ rest } 2
+        = .ok ([(.vBigint 0), (.vBigint v)],
+                { s with stack := strands ++ rest }) := by
+      unfold Stack.Eval.popN Stack.Eval.popN Stack.Eval.popN StackState.pop?
+      simp
+    have hNE : Stack.Eval.runOpcode "OP_NUMEQUAL"
+        { s with stack := (.vBigint 0) :: (.vBigint v) :: strands ++ rest }
+        = Stack.Eval.liftIntBinNum
+            { s with stack := (.vBigint 0) :: (.vBigint v) :: strands ++ rest }
+            (fun a b => .vBool (decide (a = b))) := rfl
+    rw [hNE]
+    unfold Stack.Eval.liftIntBinNum
+    rw [hpop]
+    simp only [Stack.Eval.asNum?_vBigint]
+    rfl
+  rw [hNumEq]
+  -- The `match Except.ok …` reduces to running the NIPs on the compared state.
+  show runOps (List.replicate count StackOp.nip)
+      { s with stack := (.vBool (decide (v = 0))) :: strands ++ rest } = _
+  -- Step the strand-cleanup NIPs.
+  rw [← hlen]
+  exact runOps_replicate_nip_walk (.vBool (decide (v = 0))) strands rest s
+
+/-- **Explicit post-loop runtime stack (headline entry).** Running the
+deployed loop bytes `loopOkAssemble count ["sum","start"] count` over the
+mirror entry `sum0 :: start0 :: rest` leaves `(sum0 + count*start0)` on top of
+EXACTLY `count` index strands then `rest`.  Strengthens
+`runOps_loopOkAssemble_sum_eq` (which hid the `below` structure) so the
+epilogue NIP walk can consume the strands.  Specialises the `n`-induction
+post-state at `k = 0`. -/
+theorem runOps_loopOkAssemble_explicit
+    (count : Nat) (sum0 start0 : Int) (rest : List Value) (tail : StackMap)
+    (s : StackState) (hCount : 1 ≤ count) :
+    ∃ strands : List Value,
+      runOps (loopOkAssemble count ("sum" :: "start" :: tail) count)
+          { s with stack := (.vBigint sum0) :: (.vBigint start0) :: rest }
+        = .ok { s with stack :=
+            (.vBigint (sum0 + (count : Int) * start0)) :: strands ++ rest }
+      ∧ strands.length = count := by
+  have hmap : ("sum" :: "start" :: tail : StackMap)
+      = "sum" :: (List.replicate 0 "i" ++ "start" :: tail) := by
+    rw [List.replicate_zero, List.nil_append]
+  have hstk : ((.vBigint sum0) :: (.vBigint start0) :: rest)
+      = (.vBigint sum0) :: ([] : List Value) ++ (.vBigint start0) :: rest := by
+    simp
+  rw [hmap, hstk]
+  rw [runOps_loopOkAssemble_postStack count tail count 0 sum0 start0 [] rest
+        (by simp) s]
+  rw [if_neg (by omega : count ≠ 0)]
+  obtain ⟨strands, hstr, hlen⟩ :=
+    loopOkPostStack_explicit count start0 count sum0 [] rest hCount
+  exact ⟨strands, by rw [hstr], by rw [hlen]; simp⟩
+
+/-! ### The assembled runtime closed form
+
+`runOps_loopOkAssemble_explicit` (loop) + `runOps_loopOkEpilogue` (epilogue)
+compose to the full method-body runtime: the deployed loop bytes ++ the
+elided-assert epilogue leave the `===` boolean
+`(.vBool (decide (sum0 + count*start0 = 0)))` on top of `rest`.  The deployed
+bytes are therefore ACCEPTED (truthy top) iff `sum0 + count*start0 = 0`,
+exactly when the ANF terminal `assert (sum === expectedSum)` passes at the
+placeholder `expectedSum = 0`.  Fully general over `sum0`, `start0`,
+`count ≥ 1`, `rest`. -/
+
+/-- **TIER 4a HEADLINE — assembled accumulator-method runtime.** The full
+deployed op chain for the canonical `loopOk` body — the loop bytes
+(`loopOkAssemble count ["sum","start"] count`, the count-generic Tier 2 closed
+form) followed by the elided-assert epilogue (`OP_0; OP_NUMEQUAL` + `count`
+strand-cleanup NIPs) — run from the mirror entry `sum0 :: start0 :: rest`
+leaves the `===` comparison boolean `(.vBool (decide (sum0 + count*start0 =
+0)))` on top of `rest`.
+
+This is the RUNTIME side of the accumulator `acceptAgrees` consume fact: the
+deployed bytes leave a TRUTHY top (are accepted) iff `sum0 + count*start0 = 0`,
+which is exactly the ANF terminal assert's satisfying condition at the
+deployed `expectedSum` placeholder value `0`.  General over `sum0`, `start0`,
+`count ≥ 1`, and the residual stack `rest`. -/
+theorem runOps_loopOkFull_accept
+    (count : Nat) (sum0 start0 : Int) (rest : List Value) (tail : StackMap)
+    (s : StackState) (hCount : 1 ≤ count) :
+    runOps
+        (loopOkAssemble count ("sum" :: "start" :: tail) count
+          ++ ([StackOp.opcode "OP_0", StackOp.opcode "OP_NUMEQUAL"]
+              ++ List.replicate count StackOp.nip))
+        { s with stack := (.vBigint sum0) :: (.vBigint start0) :: rest }
+      = .ok { s with stack :=
+          (.vBool (decide (sum0 + (count : Int) * start0 = 0))) :: rest } := by
+  rw [Stack.Sim.runOps_append]
+  obtain ⟨strands, hloop, hlen⟩ :=
+    runOps_loopOkAssemble_explicit count sum0 start0 rest tail s hCount
+  rw [hloop]
+  -- Now the epilogue over the explicit post-loop stack.
+  exact runOps_loopOkEpilogue count (sum0 + (count : Int) * start0) strands rest s hlen
+
+/-! ### count=3 sanity for the assembled runtime closed form
+
+The TIER 4a headline at `count = 3`, `sum0 = 0` reproduces the deployed
+behaviour: from the satisfying entry `start0 = 0` the bytes leave `true`
+(`0 + 3*0 = 0`); from the falsifier `start0 = 5` they leave `false`
+(`0 + 3*5 = 15 ≠ 0`).  Both derived THROUGH the count-generic headline (NOT a
+direct `native_decide` on the run), tying the closed form to the concrete
+`loopOk_bytes_accepted` / `loopOk_start7_bytes_rejected` pins' polarity. -/
+
+/-- **count=3 accept pin (lemma-derived).** At the satisfying entry the
+assembled runtime leaves `true` on top. -/
+theorem loopOkFull_count3_accept_sat :
+    runOps
+        (loopOkAssemble 3 (["sum", "start"] : StackMap) 3
+          ++ ([StackOp.opcode "OP_0", StackOp.opcode "OP_NUMEQUAL"]
+              ++ List.replicate 3 StackOp.nip))
+        { stack := [.vBigint 0, .vBigint 0] }
+      = .ok { stack := [.vBool true] } := by
+  have h := runOps_loopOkFull_accept 3 0 0 [] [] { stack := [] } (by omega)
+  have hstk : ({ stack := [.vBigint 0, .vBigint 0] } : StackState)
+      = { ({ stack := [] } : StackState) with
+          stack := (.vBigint 0) :: (.vBigint 0) :: [] } := rfl
+  rw [hstk, h]
+  -- 0 + 3*0 = 0 ⇒ decide (… = 0) = true.
+  have heq : (0 + ((3 : Nat) : Int) * 0) = 0 := by omega
+  simp only [heq, decide_true]
+
+/-- **count=3 reject pin (lemma-derived).** At the falsifier entry
+(`start0 = 5`) the assembled runtime leaves `false` on top — `0 + 3*5 = 15`. -/
+theorem loopOkFull_count3_reject_unsat :
+    runOps
+        (loopOkAssemble 3 (["sum", "start"] : StackMap) 3
+          ++ ([StackOp.opcode "OP_0", StackOp.opcode "OP_NUMEQUAL"]
+              ++ List.replicate 3 StackOp.nip))
+        { stack := [.vBigint 0, .vBigint 5] }
+      = .ok { stack := [.vBool false] } := by
+  have h := runOps_loopOkFull_accept 3 0 5 [] [] { stack := [] } (by omega)
+  have hstk : ({ stack := [.vBigint 0, .vBigint 5] } : StackState)
+      = { ({ stack := [] } : StackState) with
+          stack := (.vBigint 0) :: (.vBigint 5) :: [] } := rfl
+  rw [hstk, h]
+  -- 0 + 3*5 = 15 ≠ 0 ⇒ decide (… = 0) = false.
+  have hne : ¬ (0 + ((3 : Nat) : Int) * 5 = 0) := by omega
+  simp only [decide_eq_false hne]
+
+/-! ### The runtime acceptance bit (consume-shaped)
+
+The assembled runtime closed form, restated on the consensus
+`scriptAccepts` bit (truthy top-of-stack — Bitcoin's actual acceptance
+rule, the same bit the headline pipeline `acceptAgrees` theorems use).
+The deployed loop-method ops (loop bytes ++ elided-assert epilogue) are
+ACCEPTED from the mirror entry exactly when `sum0 + count*start0 = 0` —
+the satisfying condition of the ANF terminal assert at the placeholder
+`expectedSum = 0`.  This is the runtime half of the accumulator-consume
+`acceptAgrees`; the remaining step (Tier 4b) bridges
+`runParsedBytes bytes` of `compileSafe loopOkProg` to this `runOps` chain
+(the symbolic method-assembly bridge — see the section note below). -/
+
+/-- **TIER 4a — runtime acceptance closed form.** The assembled loop-method
+ops are accepted (`scriptAccepts`) from the mirror entry iff
+`sum0 + count*start0 = 0`.  Direct corollary of `runOps_loopOkFull_accept`:
+the truthy-top bit reads off the `===` boolean. -/
+theorem scriptAccepts_loopOkFull
+    (count : Nat) (sum0 start0 : Int) (rest : List Value) (tail : StackMap)
+    (s : StackState) (hCount : 1 ≤ count) :
+    Stack.Eval.scriptAccepts
+        (runOps
+          (loopOkAssemble count ("sum" :: "start" :: tail) count
+            ++ ([StackOp.opcode "OP_0", StackOp.opcode "OP_NUMEQUAL"]
+                ++ List.replicate count StackOp.nip))
+          { s with stack := (.vBigint sum0) :: (.vBigint start0) :: rest })
+      = decide (sum0 + (count : Int) * start0 = 0) := by
+  rw [runOps_loopOkFull_accept count sum0 start0 rest tail s hCount]
+  -- scriptAccepts (.ok …) = topTruthy (vBool b :: rest) = b.
+  show Stack.Eval.topTruthy
+      ((.vBool (decide (sum0 + (count : Int) * start0 = 0))) :: rest) = _
+  rfl
+
+/-- **TIER 4a — runtime consume agreement (canonical accumulator fragment).**
+At the deployed placeholder `expectedSum = 0`, the deployed loop-method ops'
+acceptance bit AGREES with the satisfying condition of the ANF terminal
+assert: the ops are accepted iff `sum0 + count*start0 = 0`.  This makes the
+runtime side of `acceptAgrees` for the accumulator fragment EXPLICIT and
+count-general / entry-general (over `sum0`, `start0`, `count ≥ 1`, `rest`).  It
+subsumes the polarity of the concrete `loopOk_bytes_accepted` (start = 0 ⇒
+accept) and `loopOk_start7_bytes_rejected` (start ≠ 0 ⇒ reject) pins
+(`loopOkFull_count3_accept_sat` / `loopOkFull_count3_reject_unsat`). -/
+theorem loopOkFull_accept_iff_sat
+    (count : Nat) (sum0 start0 : Int) (rest : List Value) (tail : StackMap)
+    (s : StackState) (hCount : 1 ≤ count) :
+    Stack.Eval.scriptAccepts
+        (runOps
+          (loopOkAssemble count ("sum" :: "start" :: tail) count
+            ++ ([StackOp.opcode "OP_0", StackOp.opcode "OP_NUMEQUAL"]
+                ++ List.replicate count StackOp.nip))
+          { s with stack := (.vBigint sum0) :: (.vBigint start0) :: rest })
+        = true
+      ↔ sum0 + (count : Int) * start0 = 0 := by
+  rw [scriptAccepts_loopOkFull count sum0 start0 rest tail s hCount]
+  exact decide_eq_true_iff
+
+/-! ### The entry-shape bridge (Tier 4b boundary — documented wall)
+
+What is PROVEN here (Tier 4a, add-only, fully green):
+
+* the loop-portion explicit post-stack (`runOps_loopOkAssemble_explicit`),
+* the epilogue runtime walk (`runOps_loopOkEpilogue`) + its NIP-cleanup
+  sub-walk (`runOps_replicate_nip_walk`),
+* the ASSEMBLED runtime closed form (`runOps_loopOkFull_accept`) and its
+  consensus-acceptance restatement (`scriptAccepts_loopOkFull`,
+  `loopOkFull_accept_iff_sat`),
+
+ALL over the deployed op chain
+`loopOkAssemble count ["sum","start"] count ++ [OP_0, OP_NUMEQUAL] ++ nip^count`
+— the bytes of the canonical accumulator method body (prologue `sum0 = 0`
+established by the entry mirror, loop = Tier 2/3 closed form, epilogue =
+elided-assert `===` + strand cleanup).  GENERALITY: count-general and
+entry-general over `(sum0, start0, rest)`.  The `expectedSum` comparand is
+PINNED at the deployed placeholder value `0` (the readonly prop lowers to
+`OP_0`; the SDK splices the real constructor arg at deploy) — so entry-
+generality over `expectedSum` is NOT available at the byte level, by design.
+
+What REMAINS for Tier 4b (the bridge, deliberately NOT attempted here — it
+touches the method-assembly path the omnibus dispatch relies on):
+
+  Bridge `runParsedBytes bytes initialStack` of `compileSafe loopOkProg`
+  (Pipeline.lean) to `runOps (loopOkAssemble … ++ epilogue) s`.  Concretely:
+  show `(peepholedLoweredMethod loopOkProg loopOkM).ops` equals the chain
+  above by lowering the WHOLE method symbolically — the prologue
+  (`loadConst 0; sum := loadConst (refAlias t0)` ⇒ `[OP_0]`), the loop arm
+  (already `lowerValueP_loop_loopOkBody_ops_eq`, Tier 2), and the epilogue
+  (`loadProp expectedSum` ⇒ `.placeholder`, `binOp "==="` ⇒ `OP_NUMEQUAL`,
+  terminal `assert` ⇒ `OP_VERIFY` ELIDED, + the `nipCount`-NIP cleanup) —
+  then round-trip via `compileSafe_single_public_runOps_eq_push` and the
+  `.placeholder`-runs-as-`OP_0` fact.  Composed with
+  `loopOkFull_accept_iff_sat` and the ANF half (the terminal assert passes
+  iff `3*start = 0`), this yields the method-level `acceptAgrees`
+  accumulator-consume theorem GENERAL over `start` (a real generalisation of
+  the concrete `loopOk_acceptAgrees`, proven by `native_decide` only at
+  `start = 0`).  The symbolic whole-method lowering is the load-bearing
+  obstacle: the existing Tier 1-3 lemmas isolate the loop VALUE, not the
+  full method, and the bridge sits on the same `lowerMethod`/`compileSafe`
+  assembly the omnibus dispatch consumes — hence the HARD SCOPE gate. -/
 
 end A7
 end Agrees
