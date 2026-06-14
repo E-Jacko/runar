@@ -4892,6 +4892,570 @@ theorem tier3d_anf_loop_meaningful_smoke :
       unfold RunarVerification.ANF.Eval.evalBindingsP
       rfl)
 
+/-! ## Tier 3 — accumulator-loop RUNTIME (M2)
+
+The lowering side (Tier 2) proved the deployed `loopOk` bytes lower to the
+`loopOkAssemble` chain: per-iteration `[push i] ++ loadStart ++ loopOkBinopTail`,
+with `loadStart` a growing-depth PICK (COPY) on non-final iterations and a
+ROLL/ROT (CONSUME) on the final, and `loopOkBinopTail = [ROT, SWAP, OP_ADD]`.
+
+This block proves the RUNTIME (`runOps`) side: the closed-form post-state of
+running that chain, the `n`-induction post-state theorem, the ANF `runLoop`
+agreement on the accumulated `sum`, and the count=3 sanity certificate.
+
+### Per-iteration runtime walk (the crux)
+
+The iteration-start runtime stack mirrors the strand map
+`"sum" :: replicate k "i" ++ "start" :: tail`, i.e. the explicit list
+
+  `sumV :: iStrands ++ startV :: rest`   with `iStrands.length = k`.
+
+One non-final (COPY) chunk `[push i] ++ pickStart ++ [ROT, SWAP, OP_ADD]`:
+* `push i`  ⇒ `iV :: sumV :: iStrands ++ startV :: rest`  (start at depth `2+k`)
+* COPY load ⇒ `startV :: iV :: sumV :: iStrands ++ startV :: rest`
+* ROT       ⇒ `sumV :: startV :: iV :: iStrands ++ startV :: rest`
+* SWAP      ⇒ `startV :: sumV :: iV :: iStrands ++ startV :: rest`
+* OP_ADD    ⇒ `(sumV + startV) :: iV :: iStrands ++ startV :: rest`
+
+so the new `sum` is `sumV + startV`, and one `iV` strands between it and the
+preserved `iStrands ++ startV :: rest`. The final (CONSUME) chunk is identical
+except the ROLL erases the original `startV` from depth `2+k`, leaving
+`(sumV + startV) :: iV :: iStrands ++ rest`. -/
+
+/-- **The binOp tail runtime walk.** Running `loopOkBinopTail = [ROT, SWAP,
+OP_ADD]` on `startV :: iV :: sumV :: below` (the state right after the
+start-load, with `t1 = startV` on top, the iter index buried at depth 1, and
+`sum` at depth 2 — the runtime mirror of the Tier 2 binop-tail bridge's
+entry map `"t1" :: "i" :: "sum" :: rest`) yields `(sum+start) :: iV ::
+below`:
+* ROT  (`a::b::c::rest → c::a::b::rest`): lifts `sumV` to top ⇒
+  `sumV :: startV :: iV :: below`;
+* SWAP (`a::b::rest → b::a::rest`): exposes `startV` under `sum` ⇒
+  `startV :: sumV :: iV :: below`;
+* OP_ADD: pops the top two (`b = startV`, `a = sumV`), pushes `a + b =
+  sum + start` ⇒ `(sum+start) :: iV :: below`.
+`below` (including the original `start`/strands/tail) is preserved verbatim. -/
+private theorem runOps_loopOkBinopTail_walk
+    (sumI startI : Int) (iV : Value) (below : List Value) (s : StackState) :
+    runOps loopOkBinopTail
+        { s with stack := (.vBigint startI) :: iV :: (.vBigint sumI) :: below }
+      = .ok { s with stack := (.vBigint (sumI + startI)) :: iV :: below } := by
+  -- Each opcode reduces definitionally on the explicit cons-stack.
+  have hRot : stepNonIf .rot
+        { s with stack := (.vBigint startI) :: iV :: (.vBigint sumI) :: below }
+        = .ok { s with stack := (.vBigint sumI) :: (.vBigint startI) :: iV :: below } := rfl
+  have hSwap : stepNonIf .swap
+        { s with stack := (.vBigint sumI) :: (.vBigint startI) :: iV :: below }
+        = .ok { s with stack := (.vBigint startI) :: (.vBigint sumI) :: iV :: below } := rfl
+  have hAdd : stepNonIf (.opcode "OP_ADD")
+        { s with stack := (.vBigint startI) :: (.vBigint sumI) :: iV :: below }
+        = .ok { s with stack := (.vBigint (sumI + startI)) :: iV :: below } := rfl
+  -- Sequence the three steps through `runOps`'s `op :: rest` equation.
+  have hStep : ∀ (op : StackOp) (rest : List StackOp) (st st' : StackState),
+      (∀ thn els, op ≠ .ifOp thn els) →
+      stepNonIf op st = .ok st' → runOps (op :: rest) st = runOps rest st' := by
+    intro op rest st st' hNotIf h
+    rw [Stack.Sim.runOps_cons_nonIf_eq op rest st hNotIf, h]
+  show runOps (.rot :: .swap :: .opcode "OP_ADD" :: [])
+        { s with stack := (.vBigint startI) :: iV :: (.vBigint sumI) :: below } = _
+  rw [hStep _ _ _ _ (by intro thn els h; cases h) hRot,
+      hStep _ _ _ _ (by intro thn els h; cases h) hSwap,
+      hStep _ _ _ _ (by intro thn els h; cases h) hAdd]
+  exact Stack.Eval.runOps_nil _
+
+/-- The runtime stack mirroring the strand map `"sum" :: replicate k "i" ++
+"start" :: tail`: `sum` on top, `k` stranded indices, then the original
+`start`, then the tail values. Indices stranded are arbitrary `Value`s
+(`iStrands`); the lemmas below only need their LENGTH `k` (so `start`
+resolves at depth `2+k`). -/
+private def loopOkStack (sumI startI : Int) (iStrands rest : List Value) : List Value :=
+  (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest
+
+/-- Index `n` into `prefix ++ v :: rest` is `v` when `prefix.length = n`. -/
+private theorem getElem!_append_mid (pre : List Value) (v : Value) (rest : List Value) :
+    ∀ n, pre.length = n → (pre ++ v :: rest)[n]! = v := by
+  induction pre with
+  | nil => intro n hn; cases hn; simp
+  | cons a as ih =>
+      intro n hn
+      cases n with
+      | zero => simp at hn
+      | succ n' =>
+          have hn' : as.length = n' := by simpa using hn
+          show (a :: (as ++ v :: rest))[n' + 1]! = v
+          rw [List.getElem!_cons_succ]
+          exact ih n' hn'
+
+/-- The value at structural index `2 + k` of the iter-pushed mirror stack
+`iV :: sumV :: iStrands ++ startV :: rest` (with `iStrands.length = k`) is the
+original `startV`. The PICK/ROLL at the start's resolved depth retrieves it. -/
+private theorem loopOkStack_get_start
+    (iV : Value) (sumI startI : Int) (iStrands rest : List Value) (k : Nat)
+    (hk : iStrands.length = k) :
+    (iV :: (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest)[2 + k]!
+      = .vBigint startI := by
+  -- index 0 = iV, 1 = sumV, then 2..(1+k) = iStrands, (2+k) = startV.
+  rw [show (iV :: (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest)
+        = iV :: (.vBigint sumI) :: (iStrands ++ (.vBigint startI) :: rest) from by
+      simp [List.cons_append]]
+  rw [show 2 + k = (k + 1) + 1 from by omega]
+  rw [List.getElem!_cons_succ, List.getElem!_cons_succ]
+  exact getElem!_append_mid iStrands (.vBigint startI) rest k hk
+
+/-- **Per-iteration COPY chunk runtime walk (non-final).** The non-final
+accumulator chunk
+`[push i] ++ loadRef ("i"::"sum"::replicate k "i"++"start"::tail) "start" ++ loopOkBinopTail`
+runs the iteration-start mirror stack `sumV :: iStrands ++ startV :: rest`
+(with `iStrands.length = k`) to `(sum+start)V :: iV :: iStrands ++ startV ::
+rest`:
+* `push i` exposes `iV` on top, dropping `start` to depth `2+k`;
+* `loadRef` (PICK at depth `2+k`, COPY) duplicates `startV` to the top —
+  KEY: the COPY does not disturb the buried `startV`, so the next iteration's
+  COPY retrieves the same value;
+* `loopOkBinopTail` runs `start :: i :: sum :: below` to `(sum+start) :: i ::
+  below`.
+The new top is `sum + start`; one `iV` strands; the original `start` and
+tail are preserved. -/
+private theorem runOps_loopOkCopyChunk_walk
+    (i : Nat) (k : Nat) (sumI startI : Int) (iStrands rest : List Value)
+    (tail : StackMap) (hk : iStrands.length = k) (s : StackState) :
+    runOps
+        ([.push (.bigint (Int.ofNat i))]
+          ++ Stack.Lower.loadRef
+              ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start"
+          ++ loopOkBinopTail)
+        { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
+      = .ok { s with stack :=
+          (.vBigint (sumI + startI)) :: (.vBigint (Int.ofNat i))
+            :: iStrands ++ (.vBigint startI) :: rest } := by
+  -- The iter-pushed stack.
+  let sPush : StackState :=
+    { s with stack := (.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+        :: iStrands ++ (.vBigint startI) :: rest }
+  -- Split [push i] ++ load ++ tail.
+  rw [Stack.Sim.runOps_append, Stack.Sim.runOps_append]
+  -- push i.
+  have hPushStep : runOps [.push (.bigint (Int.ofNat i))]
+        { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
+        = .ok sPush := by
+    rw [Stack.Sim.runOps_cons_nonIf_eq (.push (.bigint (Int.ofNat i))) []
+          { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
+          (by intro thn els h; cases h)]
+    exact Stack.Eval.runOps_nil sPush
+  rw [hPushStep]
+  simp only []
+  -- loadRef start (COPY at depth 2+k): pushes startV on top of sPush.
+  have hDepth : Stack.Lower.StackMap.depth?
+      ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start"
+      = some (2 + k) := loopOkBody_start_depth k tail
+  have hLen : (2 + k) < sPush.stack.length := by
+    show (2 + k) < ((.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+        :: iStrands ++ (.vBigint startI) :: rest).length
+    simp only [List.length_cons, List.length_append]
+    omega
+  have hAt : sPush.stack[2 + k]! = .vBigint startI := by
+    show ((.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+        :: iStrands ++ (.vBigint startI) :: rest)[2 + k]! = _
+    exact loopOkStack_get_start (.vBigint (Int.ofNat i)) sumI startI iStrands rest k hk
+  rw [Stack.Agrees.runOps_loadRef_at_depth
+        ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" (2 + k)
+        (.vBigint startI) sPush hDepth hLen hAt]
+  simp only []
+  -- binop tail: start :: i :: sum :: below ⇒ (sum+start) :: i :: below.
+  rw [show sPush.push (.vBigint startI)
+        = { s with stack := (.vBigint startI) :: (.vBigint (Int.ofNat i))
+              :: (.vBigint sumI) :: (iStrands ++ (.vBigint startI) :: rest) } from by
+      show StackState.push
+            { s with stack := (.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+                :: iStrands ++ (.vBigint startI) :: rest } (.vBigint startI) = _
+      unfold StackState.push; simp [List.cons_append]]
+  rw [runOps_loopOkBinopTail_walk sumI startI (.vBigint (Int.ofNat i))
+        (iStrands ++ (.vBigint startI) :: rest) s]
+  simp [List.cons_append]
+
+/-- `eraseIdx` at index `n` of `pre ++ v :: rest` drops `v` when
+`pre.length = n`, leaving `pre ++ rest`. -/
+private theorem eraseIdx_append_mid (pre : List Value) (v : Value) (rest : List Value) :
+    ∀ n, pre.length = n → (pre ++ v :: rest).eraseIdx n = pre ++ rest := by
+  induction pre with
+  | nil => intro n hn; cases hn; simp [List.eraseIdx]
+  | cons a as ih =>
+      intro n hn
+      cases n with
+      | zero => simp at hn
+      | succ n' =>
+          have hn' : as.length = n' := by simpa using hn
+          show (a :: (as ++ v :: rest)).eraseIdx (n' + 1) = a :: (as ++ rest)
+          rw [List.eraseIdx_cons_succ]
+          rw [ih n' hn']
+
+/-- **Per-iteration CONSUME chunk runtime walk (final).** The final
+accumulator chunk
+`[push i] ++ (bringToTop ("i"::"sum"::replicate k "i"++"start"::tail) "start" true).1 ++ loopOkBinopTail`
+runs the iteration-start mirror stack `sumV :: iStrands ++ startV :: rest`
+(`iStrands.length = k`) to `(sum+start)V :: iV :: iStrands ++ rest`. Identical
+to the COPY walk except the ROLL/ROT CONSUMES `startV` (erases it from depth
+`2+k`), so the tail's `below` is `iStrands ++ rest` (no surviving `start`). -/
+private theorem runOps_loopOkConsumeChunk_walk
+    (i : Nat) (k : Nat) (sumI startI : Int) (iStrands rest : List Value)
+    (tail : StackMap) (hk : iStrands.length = k) (s : StackState) :
+    runOps
+        ([.push (.bigint (Int.ofNat i))]
+          ++ (Stack.Lower.bringToTop
+              ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" true).1
+          ++ loopOkBinopTail)
+        { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
+      = .ok { s with stack :=
+          (.vBigint (sumI + startI)) :: (.vBigint (Int.ofNat i))
+            :: iStrands ++ rest } := by
+  let sPush : StackState :=
+    { s with stack := (.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+        :: iStrands ++ (.vBigint startI) :: rest }
+  -- The state after the ROLL/ROT consume of `start`.
+  let sRolled : StackState :=
+    { s with stack := (.vBigint startI) :: (.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+        :: iStrands ++ rest }
+  rw [Stack.Sim.runOps_append, Stack.Sim.runOps_append]
+  -- push i.
+  have hPushStep : runOps [.push (.bigint (Int.ofNat i))]
+        { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
+        = .ok sPush := by
+    rw [Stack.Sim.runOps_cons_nonIf_eq (.push (.bigint (Int.ofNat i))) []
+          { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
+          (by intro thn els h; cases h)]
+    exact Stack.Eval.runOps_nil sPush
+  rw [hPushStep]
+  simp only []
+  -- The consume op list: `.rot` (k=0) or `.roll (2+k)` (k≥1); both move the
+  -- element at index `2+k` to the top, erasing it.
+  have hDepth : Stack.Lower.StackMap.depth?
+      ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start"
+      = some (2 + k) := loopOkBody_start_depth k tail
+  have hLen : (2 + k) < sPush.stack.length := by
+    show (2 + k) < ((.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+        :: iStrands ++ (.vBigint startI) :: rest).length
+    simp only [List.length_cons, List.length_append]; omega
+  have hAt : sPush.stack[2 + k]! = .vBigint startI := by
+    show ((.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+        :: iStrands ++ (.vBigint startI) :: rest)[2 + k]! = _
+    exact loopOkStack_get_start (.vBigint (Int.ofNat i)) sumI startI iStrands rest k hk
+  have hErase : sPush.stack.eraseIdx (2 + k)
+      = (.vBigint (Int.ofNat i)) :: (.vBigint sumI) :: iStrands ++ rest := by
+    show ((.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+        :: iStrands ++ (.vBigint startI) :: rest).eraseIdx (2 + k) = _
+    rw [show (.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+            :: iStrands ++ (.vBigint startI) :: rest
+          = ((.vBigint (Int.ofNat i)) :: (.vBigint sumI) :: iStrands)
+              ++ (.vBigint startI) :: rest from by simp [List.cons_append]]
+    rw [eraseIdx_append_mid _ (.vBigint startI) rest (2 + k)
+        (by simp only [List.length_cons]; omega)]
+  -- The consume runtime step (covers both `.rot` and `.roll`).
+  have hConsumeStep : runOps
+        (Stack.Lower.bringToTop
+          ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) "start" true).1
+        sPush = .ok sRolled := by
+    cases k with
+    | zero =>
+        -- depth 2 → `.rot`.
+        have hbt : (Stack.Lower.bringToTop
+              ("i" :: "sum" :: List.replicate 0 "i" ++ "start" :: tail) "start" true).1
+              = [StackOp.rot] := by
+          unfold Stack.Lower.bringToTop
+          rw [show Stack.Lower.StackMap.depth?
+                ("i" :: "sum" :: List.replicate 0 "i" ++ "start" :: tail) "start"
+                = some (2 + 0) from hDepth]
+          rfl
+        rw [hbt]
+        -- iStrands = [] since its length is 0.
+        have hNil : iStrands = [] := by
+          have := hk; simp only [Nat.add_zero] at this
+          exact List.length_eq_zero_iff.mp this
+        -- sPush.stack = iV :: sumV :: startV :: rest; .rot ⇒ startV::iV::sumV::rest.
+        rw [Stack.Sim.runOps_cons_nonIf_eq .rot [] sPush (by intro thn els h; cases h)]
+        rw [show stepNonIf .rot sPush = .ok sRolled from by
+            show Stack.Eval.applyRot sPush = _
+            show Stack.Eval.applyRot
+                  { s with stack := (.vBigint (Int.ofNat i)) :: (.vBigint sumI)
+                      :: iStrands ++ (.vBigint startI) :: rest }
+                = .ok { s with stack := (.vBigint startI) :: (.vBigint (Int.ofNat i))
+                      :: (.vBigint sumI) :: iStrands ++ rest }
+            rw [hNil]
+            unfold Stack.Eval.applyRot
+            rfl]
+        exact Stack.Eval.runOps_nil sRolled
+    | succ k' =>
+        -- depth 2+(k'+1) = k'+3 ≥ 3 → `.roll (2+(k'+1))`.
+        have hbt : (Stack.Lower.bringToTop
+              ("i" :: "sum" :: List.replicate (k' + 1) "i" ++ "start" :: tail) "start" true).1
+              = [StackOp.roll (2 + (k' + 1))] := by
+          unfold Stack.Lower.bringToTop
+          rw [show Stack.Lower.StackMap.depth?
+                ("i" :: "sum" :: List.replicate (k' + 1) "i" ++ "start" :: tail) "start"
+                = some (2 + (k' + 1)) from hDepth]
+          rw [show 2 + (k' + 1) = k' + 3 from by omega]
+          rfl
+        rw [hbt]
+        rw [Stack.Sim.runOps_cons_nonIf_eq (.roll (2 + (k' + 1))) [] sPush
+              (by intro thn els h; cases h)]
+        rw [show stepNonIf (.roll (2 + (k' + 1))) sPush = .ok sRolled from by
+            show Stack.Eval.applyRoll sPush (2 + (k' + 1)) = _
+            unfold Stack.Eval.applyRoll
+            rw [if_neg (by omega)]
+            rw [hAt, hErase]
+            rfl]
+        exact Stack.Eval.runOps_nil sRolled
+  rw [hConsumeStep]
+  simp only []
+  -- binop tail on start :: i :: sum :: (iStrands ++ rest); sRolled is already
+  -- in that exact cons shape (`:: iStrands ++ rest` = `:: (iStrands ++ rest)`).
+  show runOps loopOkBinopTail
+        { s with stack := (.vBigint startI) :: (.vBigint (Int.ofNat i))
+            :: (.vBigint sumI) :: (iStrands ++ rest) }
+      = .ok { s with stack :=
+          (.vBigint (sumI + startI)) :: (.vBigint (Int.ofNat i)) :: (iStrands ++ rest) }
+  rw [runOps_loopOkBinopTail_walk sumI startI (.vBigint (Int.ofNat i))
+        (iStrands ++ rest) s]
+
+/-! ### Closed-form runtime post-state + `n`-induction
+
+`loopOkAssemble count ("sum" :: replicate k "i" ++ "start" :: tail) m` is a
+chain of `m` accumulator chunks: `m - 1` non-final (COPY) chunks then one
+final (CONSUME) chunk (or empty for `m = 0`). The runtime post-state, started
+from the mirror stack `sumV :: iStrands ++ startV :: rest`, advances `sum` by
+`+start` exactly `m` times and strands `m - 1` indices above the (now-consumed)
+`start`.
+
+`loopOkPostStack` computes the explicit post-stack: `(sum + m*start)` on top,
+then the `m` pushed indices `[count-1, …, count-m]` (most-recent first — but
+the final iteration's index lands DIRECTLY under the sum, the rest strand in
+between), then the surviving `iStrands ++ rest`. We state the recursion on
+`m` mirroring `loopOkAssemble`/`lowerLoopItersP_loopOkBody_eq` so the
+`n`-induction lines up step-for-step. The index list is captured abstractly via
+the explicit per-step push so we do not need its closed form for M2. -/
+
+/-- Explicit runtime post-stack after `m` accumulator iterations from the
+mirror stack `sumV :: iStrands ++ startV :: rest`. Mirrors `loopOkAssemble`'s
+`m`-recursion: the final iteration (`m = 1`) consumes `start`; non-final ones
+(`m ≥ 2`) keep it and recurse with the strand grown by the new index. -/
+private def loopOkPostStack (count : Nat) (sumI startI : Int) :
+    Nat → List Value → List Value → List Value
+  | 0,     iStrands, _    => (.vBigint sumI) :: iStrands  -- placeholder; unused (m≥1 in use)
+  | 1,     iStrands, rest =>
+      -- final CONSUME chunk: sum+start on top, the index below, start erased.
+      (.vBigint (sumI + startI)) :: (.vBigint (Int.ofNat (count - 1)))
+        :: iStrands ++ rest
+  | m + 2, iStrands, rest =>
+      -- non-final COPY chunk: sum+start, the new index `i` strands DIRECTLY
+      -- below the sum (above the existing strands), `start` preserved.
+      loopOkPostStack count (sumI + startI) startI (m + 1)
+        ((.vBigint (Int.ofNat (count - (m + 2)))) :: iStrands) rest
+
+/-- `loopOkAssemble` at `m = 1` (single final iteration) reduces to the
+CONSUME chunk: `[push (count-1)] ++ bringToTop(sm.push "i") "start" true ++
+tail`. The `match 0, sm` head-arm fires for any `sm`. -/
+private theorem loopOkAssemble_one (count : Nat) (sm : StackMap) :
+    loopOkAssemble count sm 1
+      = [.push (.bigint (Int.ofNat (count - 1)))]
+          ++ (Stack.Lower.bringToTop (Stack.Lower.StackMap.push sm "i") "start" true).1
+          ++ loopOkBinopTail := by
+  show loopOkAssemble count sm (0 + 1) = _
+  rfl
+
+/-- `loopOkAssemble` at `m + 2` over a `"sum" :: rest` map reduces to the
+COPY chunk followed by the recursion on the `"sum" :: "i" :: rest` grown map. -/
+private theorem loopOkAssemble_succ_succ (count : Nat) (rest : StackMap) (m : Nat) :
+    loopOkAssemble count ("sum" :: rest) (m + 2)
+      = ([.push (.bigint (Int.ofNat (count - (m + 2))))]
+          ++ Stack.Lower.loadRef (Stack.Lower.StackMap.push ("sum" :: rest) "i") "start"
+          ++ loopOkBinopTail)
+          ++ loopOkAssemble count ("sum" :: "i" :: rest) (m + 1) := by
+  show loopOkAssemble count ("sum" :: rest) ((m + 1) + 1) = _
+  rfl
+
+/-- **The `n`-induction runtime post-state theorem.** Running the
+`loopOkAssemble` chain (the lowered accumulator loop bytes, Tier 2) over the
+mirror stack `sumV :: iStrands ++ startV :: rest` yields the explicit
+`loopOkPostStack`. Inducts on the remaining-iteration count `m`, mirroring
+`lowerLoopItersP_loopOkBody_eq`'s `0`/`1`/`m+2` split: the final iteration
+CONSUMEs `start`, non-final ones COPY it and recurse on the grown strand.
+`tail` is the (op-only) map tail; the runtime stack uses the abstract
+`iStrands`/`rest`. This is the runtime mirror of the Tier 2 closed form. -/
+private theorem runOps_loopOkAssemble_postStack
+    (count : Nat) (tail : StackMap) :
+    ∀ (m k : Nat) (sumI startI : Int) (iStrands rest : List Value)
+      (hk : iStrands.length = k) (s : StackState),
+      runOps
+          (loopOkAssemble count
+            ("sum" :: (List.replicate k "i" ++ "start" :: tail)) m)
+          { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
+        = (if m = 0 then
+            .ok { s with stack := (.vBigint sumI) :: iStrands ++ (.vBigint startI) :: rest }
+          else
+            .ok { s with stack := loopOkPostStack count sumI startI m iStrands rest })
+  | 0, k, sumI, startI, iStrands, rest, _hk, s => by
+      simp only [loopOkAssemble, if_pos rfl]
+      exact Stack.Eval.runOps_nil _
+  | 1, k, sumI, startI, iStrands, rest, hk, s => by
+      -- Single FINAL iteration: loopOkAssemble's `0, sm` arm = CONSUME chunk.
+      simp only [if_neg (by decide : (1 : Nat) ≠ 0)]
+      -- Unfold loopOkAssemble at m = 1: the `0, sm` final arm.
+      rw [loopOkAssemble_one count ("sum" :: (List.replicate k "i" ++ "start" :: tail))]
+      have hbtPush : Stack.Lower.StackMap.push
+            ("sum" :: (List.replicate k "i" ++ "start" :: tail)) "i"
+            = ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) := by
+        show ("i" :: "sum" :: (List.replicate k "i" ++ "start" :: tail)) = _
+        simp [List.cons_append]
+      rw [hbtPush]
+      rw [runOps_loopOkConsumeChunk_walk (count - 1) k sumI startI iStrands rest tail hk s]
+      simp only [loopOkPostStack]
+  | m + 2, k, sumI, startI, iStrands, rest, hk, s => by
+      -- Non-final COPY iteration; recurse with k+1.
+      rw [if_neg (by omega : (m + 2 : Nat) ≠ 0)]
+      rw [loopOkAssemble_succ_succ count (List.replicate k "i" ++ "start" :: tail) m]
+      rw [Stack.Sim.runOps_append]
+      have hldPush : Stack.Lower.StackMap.push
+            ("sum" :: (List.replicate k "i" ++ "start" :: tail)) "i"
+            = ("i" :: "sum" :: List.replicate k "i" ++ "start" :: tail) := by
+        show ("i" :: "sum" :: (List.replicate k "i" ++ "start" :: tail)) = _
+        simp [List.cons_append]
+      rw [hldPush]
+      rw [runOps_loopOkCopyChunk_walk (count - (m + 2)) k sumI startI iStrands rest tail hk s]
+      simp only []
+      -- Recurse: next map = "sum" :: "i" :: (replicate k ...) =
+      --          "sum" :: (replicate (k+1) ...); strand grows by the new index.
+      rw [show ("sum" :: "i" :: (List.replicate k "i" ++ "start" :: tail) : StackMap)
+            = "sum" :: (List.replicate (k + 1) "i" ++ "start" :: tail) from by
+          rw [List.replicate_succ, List.cons_append]]
+      rw [runOps_loopOkAssemble_postStack count tail (m + 1) (k + 1)
+            (sumI + startI) startI
+            ((.vBigint (Int.ofNat (count - (m + 2)))) :: iStrands) rest
+            (by simp [hk]) s]
+      rw [if_neg (by omega : (m + 1 : Nat) ≠ 0)]
+      -- Both sides reduce to the same `loopOkPostStack` recursive call.
+      simp only [loopOkPostStack]
+
+/-! ### M2 — the accumulated `sum` closed form + ANF `runLoop` agreement
+
+The head of `loopOkPostStack` (the runtime `sum`) after `m ≥ 1` iterations
+started from `sumI` is `sumI + m * startI` — each iteration adds `start`. This
+is the runtime-side closed form. The ANF `runLoop` computes the same value
+(`sum := sum + start` per iteration), so the deployed-bytes post-state's `sum`
+agrees with the ANF loop's accumulated `sum`. -/
+
+/-- **The accumulated-`sum` closed form.** The TOP of `loopOkPostStack` (the
+runtime `sum`) after `m ≥ 1` iterations is `sumI + m * startI`. By induction
+on `m` over the post-stack recursion. -/
+private theorem loopOkPostStack_head_sum
+    (count : Nat) (startI : Int) :
+    ∀ (m : Nat) (sumI : Int) (iStrands rest : List Value), 1 ≤ m →
+      ∃ below, loopOkPostStack count sumI startI m iStrands rest
+        = (.vBigint (sumI + (m : Int) * startI)) :: below
+  | 1, sumI, iStrands, rest, _ => by
+      refine ⟨(.vBigint (Int.ofNat (count - 1))) :: iStrands ++ rest, ?_⟩
+      -- loopOkPostStack at 1 = (sum+start) :: (count-1) :: strands ++ rest;
+      -- the head sum is sumI + start = sumI + 1*start.
+      show (Value.vBigint (sumI + startI))
+            :: (Value.vBigint (Int.ofNat (count - 1))) :: iStrands ++ rest
+          = (Value.vBigint (sumI + ((1 : Nat) : Int) * startI))
+            :: (Value.vBigint (Int.ofNat (count - 1))) :: iStrands ++ rest
+      rw [show (((1 : Nat) : Int)) * startI = startI from by
+          rw [show (((1 : Nat) : Int)) = 1 from by omega, Int.one_mul]]
+  | m + 2, sumI, iStrands, rest, _ => by
+      obtain ⟨below, hbelow⟩ :=
+        loopOkPostStack_head_sum count startI (m + 1) (sumI + startI)
+          ((.vBigint (Int.ofNat (count - (m + 2)))) :: iStrands) rest (by omega)
+      refine ⟨below, ?_⟩
+      -- post-stack at m+2 = post-stack at m+1 with sum advanced by start.
+      show loopOkPostStack count (sumI + startI) startI (m + 1)
+            ((.vBigint (Int.ofNat (count - (m + 2)))) :: iStrands) rest = _
+      rw [hbelow]
+      -- (sumI+startI) + (m+1)*startI = sumI + (m+2)*startI.
+      congr 2
+      -- (m+2)*start = (m+1)*start + start via the distributive law.
+      have hcast : (((m + 2 : Nat) : Int)) * startI
+          = (((m + 1 : Nat) : Int)) * startI + startI := by
+        rw [show (((m + 2 : Nat) : Int)) = (((m + 1 : Nat) : Int)) + 1 from by omega]
+        rw [Int.add_mul, Int.one_mul]
+      rw [hcast]
+      -- Now linear in the opaque product term.
+      omega
+
+/-- **M2 — the deployed-loop runtime `sum` equals the ANF accumulator.** Running
+the lowered accumulator loop bytes (`loopOkAssemble count ["sum","start"] count`,
+the Tier 2 closed form at the real loop-entry map `"sum" :: "start" :: tail`,
+strand `k = 0`) over the mirror stack `sum0 :: start0 :: rest` leaves the
+runtime `sum` equal to `sum0 + count * start0` on top — the exact value the
+ANF `runLoop`'s per-iteration `sum := sum + start` accumulates. The `start`
+itself is consumed (final ROLL), the indices strand below the sum. This is the
+loop-portion M2 agreement. -/
+theorem runOps_loopOkAssemble_sum_eq
+    (count : Nat) (sum0 start0 : Int) (rest : List Value) (tail : StackMap)
+    (s : StackState) (hCount : 1 ≤ count) :
+    ∃ below,
+      runOps (loopOkAssemble count ("sum" :: "start" :: tail) count)
+          { s with stack := (.vBigint sum0) :: (.vBigint start0) :: rest }
+        = .ok { s with stack :=
+            (.vBigint (sum0 + (count : Int) * start0)) :: below } := by
+  -- Instantiate the n-induction at k = 0 (iStrands = [], map "sum"::"start"::tail).
+  have hmap : ("sum" :: "start" :: tail : StackMap)
+      = "sum" :: (List.replicate 0 "i" ++ "start" :: tail) := by
+    rw [List.replicate_zero, List.nil_append]
+  have hstk : ((.vBigint sum0) :: (.vBigint start0) :: rest)
+      = (.vBigint sum0) :: ([] : List Value) ++ (.vBigint start0) :: rest := by
+    simp
+  rw [hmap, hstk]
+  rw [runOps_loopOkAssemble_postStack count tail count 0 sum0 start0 [] rest
+        (by simp) s]
+  rw [if_neg (by omega : count ≠ 0)]
+  obtain ⟨below, hbelow⟩ :=
+    loopOkPostStack_head_sum count start0 count sum0 [] rest hCount
+  exact ⟨below, by rw [hbelow]⟩
+
+/-! ### count=3 sanity (mirror of Tier 2's `*_count3_matches_pin`)
+
+The count-generic runtime closed form, instantiated at `count = 3`, reproduces
+the concrete accumulator behaviour: from `sum0 = 0, start0 = 5` the deployed
+loop bytes leave `0 + 3 * 5 = 15` on top. We pin the concrete `runOps` result
+by `native_decide` (the legitimate certificate) AND derive the same fact
+THROUGH `runOps_loopOkAssemble_sum_eq` (the count-generic lemma), confirming
+the generic M2 closed form fires on the concrete instance. -/
+
+/-- **count=3 runtime pin (`native_decide`).** The concrete projected stack
+after running `loopOkAssemble 3 ["sum","start"] 3` from `sum0 = 0, start0 = 5`
+(mirror stack `[0, 5]`) has `15` on top — the accumulated `0 + 3*5`. The strand
+indices `[2, 1, 0]` sit between the sum and the (consumed) start; the start is
+gone (final ROLL). Projected to bigint payloads so the equality is decidable. -/
+theorem loopOkAssemble_count3_runtime_pin :
+    ((runOps (loopOkAssemble 3 (["sum", "start"] : StackMap) 3)
+        { stack := [.vBigint 0, .vBigint 5] }).toOption.map
+        (fun st => st.stack.map (fun v => match v with
+          | .vBigint i => i
+          | _ => (-1 : Int))))
+      = some [15, 2, 1, 0] := by
+  native_decide
+
+/-- **count=3 sanity (lemma-derived).** The count-generic
+`runOps_loopOkAssemble_sum_eq` at `count = 3`, `sum0 = 0`, `start0 = 5`
+yields a post-state whose TOP is `0 + 3*5 = 15` — derived from the
+count-generic M2 closed form (NOT a direct `native_decide` on the run). Ties
+the generic accumulated-`sum` theorem to the concrete pin above. -/
+theorem loopOkAssemble_count3_sum_matches :
+    ∃ below,
+      runOps (loopOkAssemble 3 (["sum", "start"] : StackMap) 3)
+          { stack := [.vBigint 0, .vBigint 5] }
+        = .ok { stack := (.vBigint 15) :: below } := by
+  obtain ⟨below, hb⟩ :=
+    runOps_loopOkAssemble_sum_eq 3 0 5 [] []
+      { stack := [] } (by omega)
+  refine ⟨below, ?_⟩
+  -- The entry mirror stack `[0, 5]` is `0 :: 5 :: []` over the empty base.
+  have hstk : ({ stack := [.vBigint 0, .vBigint 5] } : StackState)
+      = { ({ stack := [] } : StackState) with
+          stack := (.vBigint 0) :: (.vBigint 5) :: [] } := rfl
+  rw [hstk, hb]
+  -- 0 + (3 : Int) * 5 = 15.
+  rfl
+
 end A7
 end Agrees
 end RunarVerification.Stack
