@@ -49,6 +49,7 @@ import RunarVerification.Script.Emit
 import RunarVerification.Script.EmitCorrect
 import RunarVerification.Script.Parse
 import RunarVerification.Pipeline
+import RunarVerification.Stack.AgreesLoopBridge
 
 /-!
 # RunarVerification
