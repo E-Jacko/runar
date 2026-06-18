@@ -49,8 +49,10 @@ import RunarVerification.Script.Emit
 import RunarVerification.Script.EmitCorrect
 import RunarVerification.Script.Parse
 import RunarVerification.Pipeline
+import RunarVerification.Script.LoopParse
 import RunarVerification.Stack.AgreesLoopBridge
 import RunarVerification.Stack.AgreesLoopParsed
+import RunarVerification.Stack.AgreesLoopParametric
 import RunarVerification.OmnibusLoop
 
 /-!
