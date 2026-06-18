@@ -53,6 +53,7 @@ import RunarVerification.Script.LoopParse
 import RunarVerification.Stack.AgreesLoopBridge
 import RunarVerification.Stack.AgreesLoopParsed
 import RunarVerification.Stack.AgreesLoopParametric
+import RunarVerification.Stack.AgreesLoopAccept
 import RunarVerification.OmnibusLoop
 
 /-!
