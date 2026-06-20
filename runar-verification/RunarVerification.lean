@@ -55,6 +55,7 @@ import RunarVerification.Stack.AgreesLoopParsed
 import RunarVerification.Stack.AgreesLoopParametric
 import RunarVerification.Stack.AgreesLoopAccept
 import RunarVerification.Stack.AgreesLoopCountGeneric
+import RunarVerification.Stack.AgreesLoopWholeMethod
 import RunarVerification.OmnibusLoop
 
 /-!
