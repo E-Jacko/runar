@@ -900,13 +900,32 @@ theorem omnibus_instantiation_cat :
     (fun _ _ => Stack.Eval.truthy_of_scriptAccepts (by native_decide))   -- hValueTruthy (LIVE)
     omniCat_coh                                                          -- hCoh
 
-/-! ## Trust-footprint evidence (build-time) -/
+/-! ## Trust-footprint evidence (build-time, human-readable) -/
 
 #print axioms omnibus_instantiation_arith
 #print axioms omnibus_instantiation_p2pkh
 #print axioms omnibus_instantiation_statefulFull
 #print axioms omnibus_instantiation_dispatchMixed_hashLock
 #print axioms omnibus_instantiation_cat
+
+/-! ## Trust-boundary GATE (PROVE-001, build-enforced)
+
+`#audit_axioms` (`RunarVerification/AxiomAuditCmd.lean`) **fails the build** if
+any of these fully-applied omnibus instantiations depends on `sorryAx` or on an
+axiom outside the documented v1 trust base; it logs each one's `native_decide`
+exposure. Unlike the `#print axioms` lines above (diagnostic only), these are
+enforced — a regression or an undisclosed new axiom turns the build red. Covers
+all nine discharged-fragment instantiations. -/
+
+#audit_axioms omnibus_instantiation_arith
+#audit_axioms omnibus_instantiation_updateProp
+#audit_axioms omnibus_instantiation_hashLock
+#audit_axioms omnibus_instantiation_stateful
+#audit_axioms omnibus_instantiation_statefulFull
+#audit_axioms omnibus_instantiation_dispatchMixed
+#audit_axioms omnibus_instantiation_dispatchMixed_hashLock
+#audit_axioms omnibus_instantiation_p2pkh
+#audit_axioms omnibus_instantiation_cat
 
 end OmnibusInstantiation
 

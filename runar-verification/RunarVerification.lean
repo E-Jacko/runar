@@ -57,6 +57,7 @@ import RunarVerification.Stack.AgreesLoopAccept
 import RunarVerification.Stack.AgreesLoopCountGeneric
 import RunarVerification.Stack.AgreesLoopWholeMethod
 import RunarVerification.OmnibusLoop
+import RunarVerification.AxiomAuditCmd
 
 /-!
 # RunarVerification

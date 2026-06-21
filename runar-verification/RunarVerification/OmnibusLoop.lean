@@ -1,4 +1,5 @@
 import RunarVerification.Stack.AgreesLoopParsed
+import RunarVerification.AxiomAuditCmd
 
 /-! # Omnibus-with-loop — the downstream loop-widened observational omnibus
 
@@ -506,5 +507,13 @@ theorem omnibus_covers_loopOk
     Γ hUntag hTypedEntry hTsmTyped hIfValTyped hMathByteFrag hMathByteCatFrag
     hUpdatePropFrag hMethodCallFrag hHashCallFrag hHashAssertFrag hHashChainFrag
     hStatefulFrag hStatefulFullFrag hDispatchFrag hDispatchMixedFrag hValueTruthy hCoh
+
+/-! ## Trust-boundary GATE (PROVE-001, build-enforced)
+
+The with-loop capstone's loop arm, fired on the canonical accumulator fixture,
+audited against the documented v1 trust base. Build-enforced: a `sorryAx` or an
+undocumented axiom in the loop-consume path turns the build red. -/
+
+#audit_axioms omnibus_covers_loopOk
 
 end RunarVerification.Pipeline.Soundness

@@ -125,7 +125,7 @@ run_logged() {
   "$@" 2>&1 | tee "$artifact_dir/${name}.log"
 }
 
-run_logged "build-fixture-gates" lake build goldenLoad roundtrip pipelineGolden differential
+run_logged "build-fixture-gates" lake build goldenLoad roundtrip pipelineGolden differential omnibusInstantiation
 run_logged "goldenLoad" lake env ./.lake/build/bin/goldenLoad
 run_logged "roundtrip" lake env ./.lake/build/bin/roundtrip
 
