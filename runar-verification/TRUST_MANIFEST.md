@@ -114,11 +114,22 @@ class as CompCert assuming properties of its host logic. Three groups:
 
 ### Disclosures a skeptical reader must know
 
-* **`native_decide` puts the Lean compiler in the TCB.** Many fixture-level
-  discharges use `native_decide` (and `Lean.ofReduceBool`), which trusts the Lean
-  compiler + native code generator in addition to the kernel. This is **disclosed
-  and machine-tracked**: every audited capstone reports `native_decide in TCB:
-  true`. It is an accepted, bounded part of the trust base, not a hidden one.
+* **`native_decide` puts the Lean compiler in the TCB.** Fixture-level discharges
+  use `native_decide` (and `Lean.ofReduceBool`), which trusts the Lean compiler +
+  native code generator in addition to the kernel. This is **disclosed and
+  machine-tracked**: every audited capstone reports `native_decide in TCB: true`.
+  It is **not gratuitous**: in each omnibus instantiation the `native_decide` is
+  confined to the irreducible *whole-program oracle* checks — `hSafe`
+  (`compileSafeProducesBool p bytes`: compile the entire program and byte-compare
+  the result) and `hValueTruthy` (`scriptAccepts`: run the emitted script). These
+  cannot be discharged by the kernel's plain `decide` — empirically verified
+  (2026-06-21: `decide` fails on `compileSafeProducesBool omniArithProg
+  omniArithBytes` because the `Decidable` instance does not reduce; the kernel
+  cannot evaluate a full compilation). `decide`/`decide +kernel` is already used
+  wherever feasible (e.g. the classifier smokes). So a capstone cannot be made
+  `native_decide`-free without the kernel reducing a whole compilation/execution,
+  which is infeasible; the compiler-in-TCB is an accepted, bounded, *minimal*
+  part of the trust base, anchored to the compile/run oracle, not hidden.
 * **The proofs target a re-modeled pipeline, linked to the real compiler
   per-fixture, not universally.** `compileSafe` is a Lean model of the back half.
   Its agreement with the seven real-tier compilers is checked per conformance
