@@ -111,7 +111,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_with_loop
           (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
           (anfM.params.map (·.name)).reverse = [arg] ∧
           anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
-          (func = "sha256" ∨ func = "hash160") ∧
+          (func = "sha256" ∨ func = "hash160" ∨ func = "hash256") ∧
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
           initialStack.stack = .vBytes argBytes :: rest ∧
           argBytes.size ≤ 520)
@@ -357,7 +357,7 @@ theorem omnibus_covers_loopOk
             = [arg] ∧
           RunarVerification.Stack.LoopBridge.loopOkM.body
             = [ANFBinding.mk bn (.call func [arg]) src] ∧
-          (func = "sha256" ∨ func = "hash160") ∧
+          (func = "sha256" ∨ func = "hash160" ∨ func = "hash256") ∧
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
           initialStack.stack = .vBytes argBytes :: rest ∧
           argBytes.size ≤ 520)

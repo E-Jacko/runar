@@ -5981,6 +5981,69 @@ theorem hashCall_consume_hash160
     rw [hBody]; simp [Lower.bodyEndsInAssert]
   exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
 
+/-- **hash256 single-call consume (completion-bit leg).** PROVE-002 peer of the
+sha256/hash160 legs.  `OP_HASH256` (byte 0xaa) is allowlisted in
+`isAllowedOpcodeName`, so the bare `[OP_HASH256]` RAW round-trips at M4. -/
+private theorem hashCall_consume_hash256_completion
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (bn arg : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "hash256" [arg]) src])
+    (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: rest)
+    (hLen : argBytes.size ≤ 520) :
+    successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hRaw := RunarVerification.Stack.AgreesHashCall.lowerMethodUserRawOps_single_hash256
+    p.methods p.properties anfM bn arg src hParams hBody
+  have hM2 : successAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runOps [StackOp.opcode "OP_HASH256"] initialStack) := by
+    rw [hBody]
+    exact RunarVerification.Stack.AgreesHashCall.hashCall_M2_hash256
+      p.methods initialAnf initialStack bn arg src argBytes rest hArg hStk hLen
+  have hNoCode : Lower.bindingsUseCodePart anfM.body = false := by
+    rw [hBody]; simp [Lower.bindingsUseCodePart]
+  exact hashCall_consume_core p anfM bytes "OP_HASH256" bn arg "hash256" src
+    hMem hPublic hSafe initialAnf initialStack hSinglePublic hName hBody hRaw
+    hNoCode (by rfl) hM2
+
+/-- **hash256 single-call consume (HEADLINE, acceptance bit).** See the sha256
+peer for the truthiness-premise rationale. -/
+theorem hashCall_consume_hash256
+    (p : ANFProgram) (anfM : ANFMethod) (bytes : ByteArray)
+    (bn arg : String) (src : Option SourceLoc)
+    (hMem : anfM ∈ p.methods) (hPublic : anfM.isPublic = true)
+    (hSafe : compileSafe p = .ok bytes)
+    (initialAnf : State) (initialStack : StackState)
+    (hSinglePublic : p.methods.filter (·.isPublic) = [anfM])
+    (hName : anfM.name ≠ "constructor")
+    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "hash256" [arg]) src])
+    (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value)
+    (hArg : initialAnf.resolveRef arg = some (.vBytes argBytes))
+    (hStk : initialStack.stack = .vBytes argBytes :: rest)
+    (hLen : argBytes.size ≤ 520)
+    (hTopTruthy : Lower.bodyEndsInAssert anfM.body = false →
+      ∀ s, runParsedBytes bytes initialStack = .ok s →
+        topTruthy s.stack = true) :
+    acceptAgrees
+      (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
+      (runParsedBytes bytes initialStack) := by
+  have hOld := hashCall_consume_hash256_completion
+    p anfM bytes bn arg src hMem hPublic hSafe initialAnf initialStack
+    hSinglePublic hName hParams hBody argBytes rest hArg hStk hLen
+  have hNoTA : Lower.bodyEndsInAssert anfM.body = false := by
+    rw [hBody]; simp [Lower.bodyEndsInAssert]
+  exact Stack.Eval.acceptAgrees_of_completion_of_truthy hOld (hTopTruthy hNoTA)
+
 /-! ### MANDATORY smoke: the hash-call consume theorem fires
 
 The canonical single-public sha256 contract `H` with public `h(x) = sha256(x)`,
@@ -9196,7 +9259,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
           (anfM.params.map (·.name)).reverse = [arg] ∧
           anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
-          (func = "sha256" ∨ func = "hash160") ∧
+          (func = "sha256" ∨ func = "hash160" ∨ func = "hash256") ∧
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
           initialStack.stack = .vBytes argBytes :: rest ∧
           argBytes.size ≤ 520)
@@ -9943,13 +10006,17 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
                       · by_cases hHashName : anfM.name ≠ "constructor"
                         · obtain ⟨bn, harg, hfunc, hsrc, hargBytes, hrestV,
                             hHParams, hHBody, hHFunc, hHArg, hHStk, hHLen⟩ := hHashCallFrag hHashShape
-                          rcases hHFunc with hF | hF
+                          rcases hHFunc with hF | hF | hF
                           · subst hF
                             exact hashCall_consume_sha256 p anfM bytes bn harg hsrc hMem hPublic hSafe
                               initialAnf initialStack hSinglePublic hHashName hHParams hHBody
                               hargBytes hrestV hHArg hHStk hHLen hValueTruthy
                           · subst hF
                             exact hashCall_consume_hash160 p anfM bytes bn harg hsrc hMem hPublic hSafe
+                              initialAnf initialStack hSinglePublic hHashName hHParams hHBody
+                              hargBytes hrestV hHArg hHStk hHLen hValueTruthy
+                          · subst hF
+                            exact hashCall_consume_hash256 p anfM bytes bn harg hsrc hMem hPublic hSafe
                               initialAnf initialStack hSinglePublic hHashName hHParams hHBody
                               hargBytes hrestV hHArg hHStk hHLen hValueTruthy
                         · have hNm : anfM.name = "constructor" :=
@@ -10078,7 +10145,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           (argBytes : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
           (anfM.params.map (·.name)).reverse = [arg] ∧
           anfM.body = [ANFBinding.mk bn (.call func [arg]) src] ∧
-          (func = "sha256" ∨ func = "hash160") ∧
+          (func = "sha256" ∨ func = "hash160" ∨ func = "hash256") ∧
           initialAnf.resolveRef arg = some (.vBytes argBytes) ∧
           initialStack.stack = .vBytes argBytes :: rest ∧
           argBytes.size ≤ 520)

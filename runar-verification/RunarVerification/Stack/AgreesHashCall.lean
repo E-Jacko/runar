@@ -109,6 +109,48 @@ theorem lowerValueP_call_hash160_consume_d0
   simp [hDepthTop, hConsume, hUntag, hExt, Lower.builtinOpcode,
     Lower.lowerArgsLive, Lower.loadRefLive, Lower.bringToTop]
 
+/-- `ripemd160` single-call, consume-d0: RAW arm is `[OP_RIPEMD160]`. -/
+theorem lowerValueP_call_ripemd160_consume_d0
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String) (constInts : List (String × Int))
+    (bn arg : String) (k : SlotKind) (tsm_rest : TaggedStackMap)
+    (hConsume :
+      (!Lower.listContains outerProtected arg
+        && Lower.isLastUse lastUses arg currentIndex) = true) :
+    (Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts
+        (untagSm ((arg, k) :: tsm_rest)) bn (.call "ripemd160" [arg])).1
+      = [StackOp.opcode "OP_RIPEMD160"] := by
+  have hUntag : untagSm ((arg, k) :: tsm_rest) = arg :: untagSm tsm_rest := rfl
+  have hDepthTop : Lower.StackMap.depth? (arg :: untagSm tsm_rest) arg = some 0 := by
+    unfold Lower.StackMap.depth? List.findIdx? List.findIdx?.go; simp
+  have hExt : Lower.isExtractor "ripemd160" = false := by decide +kernel
+  unfold Lower.lowerValueP
+  simp [hDepthTop, hConsume, hUntag, hExt, Lower.builtinOpcode,
+    Lower.lowerArgsLive, Lower.loadRefLive, Lower.bringToTop]
+
+/-- `hash256` single-call, consume-d0: RAW arm is `[OP_HASH256]`. -/
+theorem lowerValueP_call_hash256_consume_d0
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected localBindings : List String) (constInts : List (String × Int))
+    (bn arg : String) (k : SlotKind) (tsm_rest : TaggedStackMap)
+    (hConsume :
+      (!Lower.listContains outerProtected arg
+        && Lower.isLastUse lastUses arg currentIndex) = true) :
+    (Lower.lowerValueP progMethods props budget currentIndex lastUses
+        outerProtected localBindings constInts
+        (untagSm ((arg, k) :: tsm_rest)) bn (.call "hash256" [arg])).1
+      = [StackOp.opcode "OP_HASH256"] := by
+  have hUntag : untagSm ((arg, k) :: tsm_rest) = arg :: untagSm tsm_rest := rfl
+  have hDepthTop : Lower.StackMap.depth? (arg :: untagSm tsm_rest) arg = some 0 := by
+    unfold Lower.StackMap.depth? List.findIdx? List.findIdx?.go; simp
+  have hExt : Lower.isExtractor "hash256" = false := by decide +kernel
+  unfold Lower.lowerValueP
+  simp [hDepthTop, hConsume, hUntag, hExt, Lower.builtinOpcode,
+    Lower.lowerArgsLive, Lower.loadRefLive, Lower.bringToTop]
+
 /-! ## Part 3 — the single-binding `lowerBindingsP` lift
 
 Given the value-level reduction `(lowerValueP … v).1 = [op]`, a single-binding
@@ -195,6 +237,46 @@ theorem lowerMethodUserRawOps_single_hash160
       (Lower.collectConstInts [ANFBinding.mk bn (.call "hash160" [arg]) src])
       bn arg .param [] (single_call_consume_fact bn arg "hash160" src))
 
+/-- Method RAW for a single-`ripemd160`-call method is `[OP_RIPEMD160]`. -/
+theorem lowerMethodUserRawOps_single_ripemd160
+    (progMethods : List ANFMethod) (props : List ANFProperty) (anfM : ANFMethod)
+    (bn arg : String) (src : Option SourceLoc)
+    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "ripemd160" [arg]) src]) :
+    Agrees.lowerMethodUserRawOps progMethods props anfM = [StackOp.opcode "OP_RIPEMD160"] := by
+  unfold Agrees.lowerMethodUserRawOps
+  rw [hBody, hParams]
+  exact lowerBindingsP_single_lift progMethods props Lower.defaultInlineBudget 0
+    (Lower.computeLastUses [ANFBinding.mk bn (.call "ripemd160" [arg]) src]) []
+    ([ANFBinding.mk bn (.call "ripemd160" [arg]) src].map (·.name))
+    (Lower.collectConstInts [ANFBinding.mk bn (.call "ripemd160" [arg]) src])
+    bn "OP_RIPEMD160" (.call "ripemd160" [arg]) [arg] src
+    (lowerValueP_call_ripemd160_consume_d0 progMethods props Lower.defaultInlineBudget 0
+      (Lower.computeLastUses [ANFBinding.mk bn (.call "ripemd160" [arg]) src]) []
+      ([ANFBinding.mk bn (.call "ripemd160" [arg]) src].map (·.name))
+      (Lower.collectConstInts [ANFBinding.mk bn (.call "ripemd160" [arg]) src])
+      bn arg .param [] (single_call_consume_fact bn arg "ripemd160" src))
+
+/-- Method RAW for a single-`hash256`-call method is `[OP_HASH256]`. -/
+theorem lowerMethodUserRawOps_single_hash256
+    (progMethods : List ANFMethod) (props : List ANFProperty) (anfM : ANFMethod)
+    (bn arg : String) (src : Option SourceLoc)
+    (hParams : (anfM.params.map (·.name)).reverse = [arg])
+    (hBody : anfM.body = [ANFBinding.mk bn (.call "hash256" [arg]) src]) :
+    Agrees.lowerMethodUserRawOps progMethods props anfM = [StackOp.opcode "OP_HASH256"] := by
+  unfold Agrees.lowerMethodUserRawOps
+  rw [hBody, hParams]
+  exact lowerBindingsP_single_lift progMethods props Lower.defaultInlineBudget 0
+    (Lower.computeLastUses [ANFBinding.mk bn (.call "hash256" [arg]) src]) []
+    ([ANFBinding.mk bn (.call "hash256" [arg]) src].map (·.name))
+    (Lower.collectConstInts [ANFBinding.mk bn (.call "hash256" [arg]) src])
+    bn "OP_HASH256" (.call "hash256" [arg]) [arg] src
+    (lowerValueP_call_hash256_consume_d0 progMethods props Lower.defaultInlineBudget 0
+      (Lower.computeLastUses [ANFBinding.mk bn (.call "hash256" [arg]) src]) []
+      ([ANFBinding.mk bn (.call "hash256" [arg]) src].map (·.name))
+      (Lower.collectConstInts [ANFBinding.mk bn (.call "hash256" [arg]) src])
+      bn arg .param [] (single_call_consume_fact bn arg "hash256" src))
+
 /-! ## Part 5 — the body-level M2 walk (`evalBindingsP` ⟷ `runOps [opcode]`)
 
 A single-hash-call method body evaluates (ANF) and runs (Stack) to a SUCCESS on
@@ -237,6 +319,28 @@ theorem evalValue_call_hash160_eq_local
     bind, Except.bind, pure, Except.pure]
   rfl
 
+/-- Local `ripemd160` value-eval reduction. -/
+theorem evalValue_call_ripemd160_eq_local
+    (s : State) (x : String) (bytes : ByteArray)
+    (hx : s.resolveRef x = some (.vBytes bytes)) :
+    evalValue s (.call "ripemd160" [x]) = .ok (.vBytes (ripemd160 bytes), s) := by
+  show evalValue s (ANFValue.call "ripemd160" [x]) = .ok (.vBytes (ripemd160 bytes), s)
+  unfold evalValue
+  simp only [List.mapM_cons, List.mapM_nil, RunarVerification.ANF.Eval.lookupRef, hx,
+    bind, Except.bind, pure, Except.pure]
+  rfl
+
+/-- Local `hash256` value-eval reduction. -/
+theorem evalValue_call_hash256_eq_local
+    (s : State) (x : String) (bytes : ByteArray)
+    (hx : s.resolveRef x = some (.vBytes bytes)) :
+    evalValue s (.call "hash256" [x]) = .ok (.vBytes (hash256 bytes), s) := by
+  show evalValue s (ANFValue.call "hash256" [x]) = .ok (.vBytes (hash256 bytes), s)
+  unfold evalValue
+  simp only [List.mapM_cons, List.mapM_nil, RunarVerification.ANF.Eval.lookupRef, hx,
+    bind, Except.bind, pure, Except.pure]
+  rfl
+
 /-- ANF side succeeds for the single `sha256` binding. -/
 theorem evalBindingsP_single_sha256_isSome
     (progMethods : List ANFMethod) (s : State)
@@ -273,6 +377,42 @@ theorem evalBindingsP_single_hash160_isSome
     simp only [bind, Except.bind, evalBindings]
   rw [hEval]; rfl
 
+/-- ANF side succeeds for the single `ripemd160` binding. -/
+theorem evalBindingsP_single_ripemd160_isSome
+    (progMethods : List ANFMethod) (s : State)
+    (bn x : String) (src : Option SourceLoc) (bytes : ByteArray)
+    (hx : s.resolveRef x = some (.vBytes bytes)) :
+    (evalBindingsP progMethods s [ANFBinding.mk bn (.call "ripemd160" [x]) src]).toOption.isSome = true := by
+  have hNoMC : RunarVerification.ANF.Eval.noMethodCallBindings
+      [ANFBinding.mk bn (.call "ripemd160" [x]) src] = true := by
+    simp [RunarVerification.ANF.Eval.noMethodCallBindings, RunarVerification.ANF.Eval.noMethodCallValue]
+  rw [RunarVerification.ANF.Eval.evalBindingsP_eq_evalBindings_of_noMethodCall progMethods s
+        [ANFBinding.mk bn (.call "ripemd160" [x]) src] hNoMC]
+  have hEval : evalBindings s [ANFBinding.mk bn (.call "ripemd160" [x]) src]
+      = .ok (s.addBinding bn (.vBytes (ripemd160 bytes))) := by
+    unfold evalBindings
+    rw [evalValue_call_ripemd160_eq_local s x bytes hx]
+    simp only [bind, Except.bind, evalBindings]
+  rw [hEval]; rfl
+
+/-- ANF side succeeds for the single `hash256` binding. -/
+theorem evalBindingsP_single_hash256_isSome
+    (progMethods : List ANFMethod) (s : State)
+    (bn x : String) (src : Option SourceLoc) (bytes : ByteArray)
+    (hx : s.resolveRef x = some (.vBytes bytes)) :
+    (evalBindingsP progMethods s [ANFBinding.mk bn (.call "hash256" [x]) src]).toOption.isSome = true := by
+  have hNoMC : RunarVerification.ANF.Eval.noMethodCallBindings
+      [ANFBinding.mk bn (.call "hash256" [x]) src] = true := by
+    simp [RunarVerification.ANF.Eval.noMethodCallBindings, RunarVerification.ANF.Eval.noMethodCallValue]
+  rw [RunarVerification.ANF.Eval.evalBindingsP_eq_evalBindings_of_noMethodCall progMethods s
+        [ANFBinding.mk bn (.call "hash256" [x]) src] hNoMC]
+  have hEval : evalBindings s [ANFBinding.mk bn (.call "hash256" [x]) src]
+      = .ok (s.addBinding bn (.vBytes (hash256 bytes))) := by
+    unfold evalBindings
+    rw [evalValue_call_hash256_eq_local s x bytes hx]
+    simp only [bind, Except.bind, evalBindings]
+  rw [hEval]; rfl
+
 /-- **M2 walk (sha256).** The single-`sha256`-call body's success bit agrees
 with the deployed `[OP_SHA256]` run on the matching entry. -/
 theorem hashCall_M2_sha256
@@ -304,22 +444,64 @@ theorem hashCall_M2_hash160
     rw [HashOps.runOps_hash160Ops_eq stkSt bytes rest hStk hLen]; rfl
   rw [hANF, hStack]
 
+/-- **M2 walk (ripemd160).** -/
+theorem hashCall_M2_ripemd160
+    (progMethods : List ANFMethod) (anfSt : State)
+    (stkSt : StackState) (bn x : String) (src : Option SourceLoc)
+    (bytes : ByteArray) (rest : List Value)
+    (hArg : anfSt.resolveRef x = some (.vBytes bytes))
+    (hStk : stkSt.stack = .vBytes bytes :: rest)
+    (hLen : bytes.size ≤ 520) :
+    (evalBindingsP progMethods anfSt [ANFBinding.mk bn (.call "ripemd160" [x]) src]).toOption.isSome
+      ↔ (runOps [StackOp.opcode "OP_RIPEMD160"] stkSt).toOption.isSome := by
+  have hANF := evalBindingsP_single_ripemd160_isSome progMethods anfSt bn x src bytes hArg
+  have hStack : (runOps [StackOp.opcode "OP_RIPEMD160"] stkSt).toOption.isSome = true := by
+    rw [HashOps.runOps_ripemd160Ops_eq stkSt bytes rest hStk hLen]; rfl
+  rw [hANF, hStack]
+
+/-- **M2 walk (hash256).** -/
+theorem hashCall_M2_hash256
+    (progMethods : List ANFMethod) (anfSt : State)
+    (stkSt : StackState) (bn x : String) (src : Option SourceLoc)
+    (bytes : ByteArray) (rest : List Value)
+    (hArg : anfSt.resolveRef x = some (.vBytes bytes))
+    (hStk : stkSt.stack = .vBytes bytes :: rest)
+    (hLen : bytes.size ≤ 520) :
+    (evalBindingsP progMethods anfSt [ANFBinding.mk bn (.call "hash256" [x]) src]).toOption.isSome
+      ↔ (runOps [StackOp.opcode "OP_HASH256"] stkSt).toOption.isSome := by
+  have hANF := evalBindingsP_single_hash256_isSome progMethods anfSt bn x src bytes hArg
+  have hStack : (runOps [StackOp.opcode "OP_HASH256"] stkSt).toOption.isSome = true := by
+    rw [HashOps.runOps_hash256Ops_eq stkSt bytes rest hStk hLen]; rfl
+  rw [hANF, hStack]
+
 end M2
 
 /-! ## Part 6 — the decidable fragment classifier
 
 `hashCallConsumeShapeBool` decides the single-hash-call consume fragment: a
 method with exactly one param whose body is one binding `bn = func(param)` with
-`func ∈ {sha256, hash160}` (the param read once → consumed → RAW is the bare
-opcode). The in-`Pipeline` dispatch `by_cases` on this; the witnesses are
+`func ∈ {sha256, hash160, hash256}` (the param read once → consumed → RAW is the
+bare opcode). The in-`Pipeline` dispatch `by_cases` on this; the witnesses are
 recovered by the keyed `hHashCallFrag` omnibus premise (vacuous on non-hash
-bodies, like `hMathByteFrag`). -/
+bodies, like `hMathByteFrag`).
+
+2026-06-21 (PROVE-002 widening): `hash256` joins `sha256`/`hash160` — its opcode
+`OP_HASH256` (byte 0xaa) IS in `Script.Parse.isAllowedOpcodeName`, so the bare
+`[OP_HASH256]` RAW round-trips at the M4 layer and the whole-method consume
+theorem `hashCall_consume_hash256` discharges it.  `ripemd160` is DELIBERATELY
+EXCLUDED here: `OP_RIPEMD160` is NOT in `isAllowedOpcodeName`, so
+`Parse.areRunarEmittablePushBool [.opcode "OP_RIPEMD160"]` is provably `false`
+and `hashCall_consume_core`'s `hEmit` premise cannot be discharged — the
+ripemd160 RAW/M2 substrate below exists for ANF-side model completeness only and
+is NOT a round-trippable fragment (mirrors the `ANF/Eval.lean` `ripemd160` arm
+comment). -/
 
 /-- Decidable single-hash-call consume fragment classifier. -/
 def hashCallConsumeShapeBool (m : ANFMethod) : Bool :=
   match m.body with
   | [ANFBinding.mk _ (.call func [arg]) _] =>
-      (func == "sha256" || func == "hash160") && (m.params.map (·.name) == [arg])
+      (func == "sha256" || func == "hash160" || func == "hash256")
+        && (m.params.map (·.name) == [arg])
   | _ => false
 
 /-! ## Part 7 — MANDATORY anti-vacuity smokes (concrete)
@@ -345,6 +527,40 @@ theorem smoke_classifier_fires : hashCallConsumeShapeBool smokeMethod = true := 
 theorem smoke_method_raw :
     Agrees.lowerMethodUserRawOps [] [] smokeMethod = [StackOp.opcode "OP_SHA256"] :=
   lowerMethodUserRawOps_single_sha256 [] [] smokeMethod "c0" "x" none rfl rfl
+
+/-- The canonical single-`hash256`-call method (PROVE-002 widening). -/
+def smokeMethodHash256 : ANFMethod :=
+  { name := "h"
+    params := [ANFParam.mk "x" .byteString]
+    body := [ANFBinding.mk "c0" (.call "hash256" ["x"]) none]
+    isPublic := true }
+
+/-- SMOKE — the classifier fires on the canonical `hash256` method (anti-vacuity). -/
+theorem smoke_classifier_fires_hash256 : hashCallConsumeShapeBool smokeMethodHash256 = true := by
+  decide +kernel
+
+/-- SMOKE — RAW reduces to the bare `[OP_HASH256]` for the canonical `hash256` method. -/
+theorem smoke_method_raw_hash256 :
+    Agrees.lowerMethodUserRawOps [] [] smokeMethodHash256 = [StackOp.opcode "OP_HASH256"] :=
+  lowerMethodUserRawOps_single_hash256 [] [] smokeMethodHash256 "c0" "x" none rfl rfl
+
+/-- The canonical single-`ripemd160`-call method.  Witnesses the ripemd160 RAW
+substrate (M4-blocked, so NOT admitted by `hashCallConsumeShapeBool`). -/
+def smokeMethodRipemd160 : ANFMethod :=
+  { name := "h"
+    params := [ANFParam.mk "x" .byteString]
+    body := [ANFBinding.mk "c0" (.call "ripemd160" ["x"]) none]
+    isPublic := true }
+
+/-- SMOKE — the classifier does NOT fire on `ripemd160` (M4-blocked opcode). -/
+theorem smoke_classifier_skips_ripemd160 :
+    hashCallConsumeShapeBool smokeMethodRipemd160 = false := by
+  decide +kernel
+
+/-- SMOKE — RAW reduces to the bare `[OP_RIPEMD160]` for the `ripemd160` method. -/
+theorem smoke_method_raw_ripemd160 :
+    Agrees.lowerMethodUserRawOps [] [] smokeMethodRipemd160 = [StackOp.opcode "OP_RIPEMD160"] :=
+  lowerMethodUserRawOps_single_ripemd160 [] [] smokeMethodRipemd160 "c0" "x" none rfl rfl
 
 /-! ## Part 8 — W1: hash-then-assert (the PRODUCTION hash-lock shape)
 
