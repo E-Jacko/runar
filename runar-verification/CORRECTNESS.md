@@ -1,11 +1,12 @@
 # Rúnar Verification — Correctness Statement
 
 **Scope:** what the Lean 4 verification under `runar-verification/` *proves*,
-what it *assumes*, and where the boundaries are. This document is the
-authoritative, public-facing summary; the proofs themselves are the ultimate
-authority.
+what it *assumes*, and where the boundaries are. This is the public-facing
+narrative summary; the authoritative trust boundary is `TRUST_MANIFEST.md`
+§"v1 Trust Boundary" (where this document and the manifest disagree, the
+manifest is correct), and the proofs themselves are the ultimate authority.
 
-**Status (2026-05-26):** 73 axioms (down from 125 at the start of the
+**Status:** 70 axioms (2026-06-21) (down from 125 at the start of the
 campaign). Build green, `tests/PipelineConformance.lean` exit 0, drift gate
 `scripts/check-tcb-drift.sh` exit 0. Every retirement was independently
 re-verified on `main` via `#print axioms`.
@@ -123,7 +124,7 @@ will close on this codebase:
 
 ---
 
-## 4. The trusted base (73 axioms)
+## 4. The trusted base (70 axioms)
 
 Categorized by the `scripts/check-tcb-drift.sh` invariants
 (`opaques = 0`, `opaque stubs = 0`, `partial defs = 0`):
@@ -167,39 +168,25 @@ by project decision:
   equivalence in Script semantics over ~60k ops, research-grade. Documented
   as a known structural mismatch in `Crypto/Spec.lean §7`.
 
-### 4.4 Four remaining sub-omnibus axioms
+### 4.4 The remaining composition-path structural axiom
 
-These are the codegen-soundness axioms the omnibus still depends on. Each is
-documented with its precise blocker in `PATH2_PLAN.md §11.6`:
+The `dispatch`, `loop`, and `stateful` sub-omnibus axioms have all been
+**retired**. The composition layer is now proven down to exactly **one**
+structural codegen-soundness axiom (plus the BIP-143 bridge from §4.3, which
+the canonical stateful gated-prologue relies on). It is documented with its
+precise blocker in `PATH2_PLAN.md §11.6` and `TRUST_MANIFEST.md`:
 
 * **`crypto_call`** — the *residual universal fallback*. Hypothesis `True`;
   every body not matching a discharged classifier (including all
   crypto-builtin calls outside the discharged hash/EC peel-offs, the scoped
   families above, and any non-fragment shape of an already-retired family)
   lands here. By definition, this axiom only disappears when nothing falls
-  through. It is the safety net.
-* **`dispatch`** — multi-public-method dispatch. The `merkle_dispatch_selection_correct`
-  *selection* fact is now a theorem (wave 69), but the sub-omnibus itself is
-  *false-as-stated* (it carries no witness premise, while `successAgrees`
-  requires the method-index witness on the stack), and the only discharge
-  substrate (the capstone `compileSafe_multi_public_observational_correct`)
-  is structural-const-only — bridging requires the full multi-public
-  Stage-C widening across every body family (effectively redoing A3–A8
-  for the dispatched-stack case), wave-70 finding.
-* **`loop`** — bounded iteration. The ANF-side walk now exists
-  (wave 68: `runLoopP_isSome_of_{bodySucceeds,iterBodySucceeds}`), but the
-  meaningful (consuming) loop case is walled at M4: the unrolled image's
-  `loadRef` emits `pickStruct` (not `AreRunarEmittablePush`), and depth-1
-  bodies peephole-fuse into non-emittable ops; only the dead-code `t = i + i`
-  body survives.
-* **`stateful`** — `checkPreimage` + state continuation. Wave 68 produced
-  the genuine prologue/epilogue substrate, but the sub-omnibus is
-  *false-as-stated* (the omnibus fires it unconditionally and
-  `successAgrees` fails on the invalid-spend path: ANF `checkPreimage`
-  always succeeds, Stack `OP_CHECKSIGVERIFY` aborts). A genuine retirement
-  needs both a valid-path keyed premise *and* the BIP-143 axiom from §4.3
-  — a lateral move in axiom count, principled if the project commits to
-  the BIP-143 trust assumption.
+  through. It is the safety net — narrowable but provably never zero.
+
+Together with the BIP-143 `exists_checkSig_witness` bridge (§4.3), these are
+the **two structural composition-path axioms** the manifest's "v1 Trust
+Boundary" calls out; everything else in the 70-axiom base is primitive-level
+(crypto semantics + per-primitive codegen→runtime bridges).
 
 ---
 
@@ -250,12 +237,12 @@ within the differential test's coverage.
 | What's the property? | Accept/reject agreement between the ANF reference interpreter and the compiled Bitcoin Script. |
 | What pipeline is covered? | ANF IR → Stack IR → peephole → emit → bytes → parse → execute (the back half). |
 | For which programs is it proven *unconditionally* (no codegen axiom)? | Single-public methods whose bodies lie in arith / if_val / math_byte / update_prop / method_call fragments, plus the dispatch selection fact and the 8 in-scope secp256k1 EC ops. |
-| What's the trusted base? | 73 axioms: 3 standard Lean + irreducible crypto primitives + 4 explicit scope-outs (BIP-143, SLH-DSA, Go-only proof-system families, ecMul/ecMulGen) + 4 remaining sub-omnibus codegen axioms (crypto_call, dispatch, loop, stateful) with precise blockers documented. |
+| What's the trusted base? | 70 axioms: 3 standard Lean + irreducible crypto primitives + 4 explicit scope-outs (BIP-143, SLH-DSA, Go-only proof-system families, ecMul/ecMulGen) + 1 remaining composition-path sub-omnibus codegen axiom (`crypto_call`; the `dispatch`, `loop`, and `stateful` sub-omnibuses were all retired) with its precise blocker documented. The two structural composition-path axioms are `crypto_call` + the BIP-143 bridge. |
 | How does it connect to the real compilers? | Per-fixture byte-equality between Lean `compileSafe` and `expected-script.hex`, plus `conformance/runner.ts` enforcing real compilers match the goldens. |
 | What's not covered? | Source-format parsing/typechecking; output/state equivalence (beyond accept/reject); proof of the Script VM model against BSV consensus (differential-tested instead); the scoped-out families above. |
 
 This is a strong, defensible result for a production compiler: a
 kernel-checked accept/reject correctness theorem for the compiler back-half
 on an explicitly-bounded set of contract shapes, with a clearly-inventoried
-73-axiom trusted base and per-fixture validation against the 7 real-tier
+70-axiom trusted base and per-fixture validation against the 7 real-tier
 compilers.

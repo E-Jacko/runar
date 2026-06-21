@@ -20,7 +20,7 @@ pipeline. The package is useful in two roles:
 | Crypto-heavy fixtures | 15/49 stored Lean-produced constants; explicit pending-assumption bucket |
 | Full/sharded byte-exact target | live `cryptoAxiomPending` bucket regeneration |
 | Tracked Lean modules | all build via `scripts/lean-verify.sh` |
-| Project axioms | 110 (was 125; wave 1 of Path 2 discharged 15 — see `TRUST_MANIFEST.md` for per-axiom breakdown and trajectory) |
+| Project axioms | 70 (current; was 125 at the start of Path 2 — see `TRUST_MANIFEST.md` for per-axiom breakdown and trajectory) |
 | Opaque executable defaults | 0 |
 | `partial def` in `RunarVerification/` | 0 |
 | `sorry` / `admit` | 0 |
@@ -367,7 +367,9 @@ is stated over `compileSafe` bytes for the structural-const fragment.
 For every fixture in `conformance/tests/`, the Lean 4 kernel
 mechanically derives observational correctness between the ANF
 interpreter and parsed-byte execution of the emitted Bitcoin Script —
-modulo a small set of documented codegen-soundness axioms backed by
+modulo the documented 70-axiom trust base (see TRUST_MANIFEST.md §"v1
+Trust Boundary", the authoritative statement of what this verification
+does and does not establish), backed by
 the project's 7-tier cross-compiler conformance suite. The result is
 56/56 fixtures classified `VERIFIED-modulo-codegen-axioms` by
 `tests/PipelineConformance.lean`, gated in CI on every PR.
@@ -376,7 +378,10 @@ Concretely:
 
 * **Three end-to-end capstone theorems** in `Pipeline.lean` —
   unconditional Lean theorems with no `sorry` / `admit` / `partial
-  def`:
+  def`. Here "unconditional" means no codegen-soundness axiom and no
+  `sorry` — it does NOT mean free of all axioms; these capstones still
+  rest on the Group A cryptographic-primitive axioms documented in
+  `TRUST_MANIFEST.md`:
   * `compileSafe_single_public_observational_correct_unconditional`
     (literal-load fragment, M5)
   * `compileSafe_single_public_observational_correct_unconditional_ref`
@@ -388,8 +393,8 @@ Concretely:
   BLAKE3, secp256k1, NIST P-256 / P-384 / ECDSA, BabyBear field +
   degree-4 extension, Merkle root, WOTS+, SLH-DSA (all 6 FIPS 205
   SHA-2 parameter sets), and Rabin.
-* **Mechanically checked, citable trust footprint.** The 110 axioms
-  in `TRUST_MANIFEST.md` (was 125 before Path 2 wave 1 — 2026-05-17)
+* **Mechanically checked, citable trust footprint.** The 70 axioms
+  in `TRUST_MANIFEST.md` (was 125 at the start of Path 2)
   each carry a literature citation (FIPS, SEC, RFC, Plonky3) or a
   7-tier-conformance backing reference. Trust assumptions are
   explicit, not implicit. See `TRUST_MANIFEST.md` §"Axiom-count
@@ -429,7 +434,8 @@ codegen-to-spec), 1 in `Stack/Wots.lean` (Phase B8 WOTS+
 codegen-to-spec), and 1 in `Stack/Rabin.lean` (Phase B10 Rabin
 codegen-to-spec). Discharging them with direct Lean proofs — Path 2 —
 is multi-month specialist work. Wave 1 (2026-05-17, commit
-`7dcc7fc3`) discharged 15 axioms (125 → 110). The remaining work is
+`7dcc7fc3`) discharged 15 axioms (125 → 110); subsequent Path 2 waves
+have since brought the tree to 70 axioms (current). The remaining work is
 tier-prioritized in `TODO.md` and `PATH2_PLAN.md`: Tier 1 ≈ 8–10
 weeks parallel / 18–22 weeks solo; Tier 2 is an explicit decision
 point; Tier 3 is deferred indefinitely. Without further Path 2
@@ -443,7 +449,10 @@ already unconditional Lean theorems today.
 ## Active References
 
 * `TRUST_MANIFEST.md` is the authoritative trusted-computing-base and
-  assumption inventory.
+  assumption inventory. Its §"v1 Trust Boundary — PROVE / AXIOMATIZE /
+  DEFER" is the authoritative, calibrated statement of what this
+  verification establishes; where any doc here disagrees, that section
+  is correct.
 * `HANDOFF.md` is the active implementation roadmap.
 * `TODO.md` enumerates Path 2 — axiom discharge work — remaining for
   the unconditional verification claim.

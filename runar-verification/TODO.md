@@ -1,5 +1,11 @@
 # Rúnar Verification — Path 2 TODO (revised post-wave-1)
 
+> **STATUS (2026-06-21): superseded** — the tree is at **70 axioms**;
+> the `125 → 110` wave-1 endpoint framing below and the per-tier axiom
+> targets (e.g. `axioms ≈ 88`) are historical. See `TRUST_MANIFEST.md`
+> §"v1 Trust Boundary" for the authoritative current state. The wave-1
+> content is retained below for the record.
+
 Path 2 is the multi-month proof project that discharges the
 codegen-soundness axioms in `TRUST_MANIFEST.md` with direct Lean
 proofs, removing them from the trusted computing base.
@@ -7,7 +13,8 @@ proofs, removing them from the trusted computing base.
 **Wave 1 (2026-05-17, commit `7dcc7fc3`) discharged 15 axioms
 (125 → 110).** See `PATH2_PLAN.md` §0 for the wave 1 completion
 notice and §4 for the tier-based sequencing that emerged from the
-2026-05-17 reprioritization review. The list below is re-grouped
+2026-05-17 reprioritization decision (recorded inline in
+`PATH2_PLAN.md` §0). The list below is re-grouped
 by tier with explicit "decision point" markers between tiers.
 
 For the value the verification package delivers today **without**

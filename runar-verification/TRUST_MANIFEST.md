@@ -14,6 +14,139 @@ counts:
 | Opaque defaults with bodies | 0 | No opaque declarations carry defaults |
 | `partial def` | 0 | No partial definitions under `RunarVerification/` |
 
+## v1 Trust Boundary — PROVE / AXIOMATIZE / DEFER
+
+This section is the authoritative, calibrated statement of what Rúnar v1's
+formal verification does and does not establish. Everything below it (the
+trajectory log, the per-axiom inventory) is supporting detail; where any other
+document disagrees with this section, **this section is correct**.
+
+### Headline
+
+The verified pipeline is the **back half** of the compiler: ANF IR → Stack IR →
+peephole → emit → bytes → parse → execute. The front end (the 9 source-format
+parsers, validation, typecheck, ANF lowering) is **out of scope**. The property
+proved is **observational (accept/reject) agreement** between the ANF reference
+evaluator and parsed-byte execution of the emitted Bitcoin Script — *not* output
+equivalence. The capstone is
+`compileSafe_observational_correct_modulo_codegen_axioms` (`Pipeline.lean`), with
+a loop-widened wrapper `..._with_loop` (`OmnibusLoop.lean`).
+
+The trust base is **70 axioms** (drift-gated, `scripts/check-tcb-drift.sh`).
+Of those, the large majority are **primitive-level**: textbook cryptographic
+semantics and per-primitive codegen→runtime bridges. The **composition layer
+itself is proven down to exactly two structural axioms** — the `crypto_call`
+residue fallback and the BIP-143 signature-witness bridge — plus the three
+opaque crypto backends that anchor the model to a real crypto implementation.
+
+This boundary is **machine-checked**, not asserted: `#audit_axioms`
+(`RunarVerification/AxiomAuditCmd.lean`) fails the build if any of the nine
+omnibus-fragment instantiations or the with-loop capstone depends on `sorryAx`
+or on an axiom outside the documented base. There are **zero** `sorry`/`admit`
+in the tree.
+
+### PROVE — discharged for v1 (zero `sorry`)
+
+* **The composition layer.** Every public-method body is dispatched through a
+  decidable fragment cascade, each fragment discharged by a *proven* consume
+  theorem: arith, if_val, math_byte, update_prop, method_call, cat, hash-call
+  (`{sha256, hash160, hash256}`), hash-assert, hash-chain, the multi-public
+  Merkle-dispatch selection (`merkle_dispatch_selection_correct`), the canonical
+  stateful gated-prologue, and 8/10 secp256k1 EC ops. Bodies outside every
+  fragment land on the sound `crypto_call` fallback (an axiom — see AXIOMATIZE).
+* **PROVE-001 — machine-enforced axiom audit** (this manifest's enforcement
+  arm). `#audit_axioms` gates all nine fragment instantiations + the with-loop
+  capstone; wired into `scripts/full-verification.sh`. Each is recorded as
+  carrying `native_decide` in its TCB (disclosed below).
+* **PROVE-002 — `crypto_call` residue narrowed.** `hash256` single-hash-call
+  bodies were peeled out of the fallback into the proven `hashCall_consume_hash256`
+  (via `HashOps.runOps_hash256Ops_eq`), shrinking the fallback's live domain with
+  zero new axioms.
+* **CHALLENGE-001 — BIP-143 bridge re-audited (2026-06-21).** The
+  `exists_checkSig_witness_under_validTxContext` axiom was re-examined and found
+  **sound** (consistent with the opaque backends; the real-ECDSA witness reading
+  is valid; constrains nothing off the witness), **non-vacuous** (it is a
+  proof-term dependency of the `statefulFull` omnibus instantiation —
+  load-bearing for concrete stateful spends), and **not usefully tightenable**
+  without de-opaquing ECDSA. It stays axiomatized (AXIOMATIZE Group C). Refinement:
+  the *universal* omnibus depends on `{crypto_call, 3 backends}`; a *concrete
+  stateful* instantiation **additionally** depends on this witness.
+
+### AXIOMATIZE — standard assumptions (the 70-axiom trust base)
+
+Axiomatizing cryptographic primitives is correct and sufficient — the same trust
+class as CompCert assuming properties of its host logic. Three groups:
+
+* **Group A — cryptographic primitive semantics (~43).** secp256k1 / NIST P-256
+  / P-384 group laws; ECDSA / WOTS+ / SLH-DSA / Rabin verification correctness
+  (EUF-CMA / FIPS-205); key-derivation opacity; SHA-256 composition; and the
+  three opaque backends (`hashBackend`, `authBackend`, `preimageBackend`) that
+  bind the model to a real crypto implementation. A Lean proof would re-derive
+  textbook results.
+* **Group B — per-primitive codegen→runtime bridges (~26).** `emitEcMul/MulGen`,
+  `emitP256*/P384*`, `runOps_b3*Ops_eq`, `runOps_emitVerifySLHDSABody_*`,
+  `runOps_wotsBodyOps_eq`, `runOps_rabinBodyOps_eq` — each asserts "the opcodes
+  the compiler emits for primitive X compute X's spec." Backed empirically by
+  per-fixture byte-parity + the 7-tier conformance gate. Some primitives
+  (BabyBear, Poseidon2, BN254, FRI) are **Go-only by project policy** and out of
+  Lean scope.
+* **Group C — composition-path structural axioms (2).** `crypto_call` (the
+  decidable residue fallback, keyed on `cryptoCallResidueB` — narrowable but
+  provably never zero) and the BIP-143 `exists_checkSig_witness` bridge.
+
+### DEFER — out of scope for v1 (each a non-guarantee, not a covered case)
+
+* **Loop count-generic widening (PROVE-003).** The canonical accumulator loop is
+  already proven end-to-end and wired into the with-loop capstone; generalizing
+  it to symbolic iteration count `n` drops no axiom and is blocked on a 23-rule
+  peephole replay. Deferred. Future home: a post-v1 loop-generalization wave.
+* **`ripemd160` hash-call peel.** Blocked: `OP_RIPEMD160 ∉ isAllowedOpcodeName`
+  (the parse allowlist), so its M4 round-trip is unsatisfiable. Adding it to the
+  allowlist (+ round-trip lemmas) is the prerequisite. The RAW+M2 substrate is
+  proven; the exclusion is machine-witnessed (`smoke_classifier_skips_ripemd160`).
+* **Per-primitive opcode-level discharge of the Group-B bridges.** Future
+  per-primitive proof waves (the 8/10 EC ops show it is possible; the rest, and
+  the Go-only families, are deferred).
+* **Universal model↔real-emitted-bytes equivalence.** Today the link is
+  per-fixture (goldens + 7-tier + differential), not a universal proof.
+* **Front-end verification** (9 parsers, validate, typecheck, ANF-lower).
+* **fold-ON model proof.** The model is aligned to the fold-OFF goldens (below).
+
+### Disclosures a skeptical reader must know
+
+* **`native_decide` puts the Lean compiler in the TCB.** Many fixture-level
+  discharges use `native_decide` (and `Lean.ofReduceBool`), which trusts the Lean
+  compiler + native code generator in addition to the kernel. This is **disclosed
+  and machine-tracked**: every audited capstone reports `native_decide in TCB:
+  true`. It is an accepted, bounded part of the trust base, not a hidden one.
+* **The proofs target a re-modeled pipeline, linked to the real compiler
+  per-fixture, not universally.** `compileSafe` is a Lean model of the back half.
+  Its agreement with the seven real-tier compilers is checked per conformance
+  fixture (`tests/PipelineGolden.lean` byte-compares to `expected-script.hex`,
+  which all 7 tiers must also match), and the Lean Script-VM model (`runOps`) is
+  validated against the real BSV interpreter by differential testing
+  (`tests/Differential.lean`) — **empirically, not by proof** (no consensus spec
+  exists to prove against). The universal theorems are about the *model*.
+* **fold-OFF vs fold-ON.** The checked-in goldens (hence the byte-parity layer)
+  are stamped under constant-folding **OFF**. The real compilers ship folding
+  **ON** by default. The Lean model is aligned to the fold-OFF goldens; proving
+  the deployed fold-ON compiler correct is a DEFER item.
+
+### What this verification does and does not guarantee
+
+**Does:** for the modeled ANF→Script back half, on the conformance corpus and
+within the fragment cascade, the emitted-and-parsed Bitcoin Script accepts/rejects
+exactly when the ANF reference evaluator does — kernel-checked modulo the 70
+documented axioms, with the axiom set machine-enforced and `sorry`-free.
+
+**Does not:** prove the front end; prove output-byte equivalence (only accept/
+reject); prove the fold-ON deployed compiler; prove crypto primitives from first
+principles (they are axiomatized); or universally prove the model equals the real
+compilers (that link is per-fixture empirical). Loop programs are covered for the
+canonical accumulator fixture; symbolic-`n` loops are deferred.
+
+---
+
 ## Axiom-count trajectory
 
 Direction of travel across recent phases. Each row records the axiom
@@ -70,6 +203,8 @@ that are preserved by design.
 | **BIP-143 bridge TIGHTENED — universal `checkSig` equality forced the auth backend constant** | 2026-06-10 | **71** | **0** | 0 (no axiom added or removed — the bridge axiom is REPLACED by a strictly weaker existential, count-neutral) | 0 | **The 2026-05-30 bridge axiom `checkPreimage_iff_checkSig_under_validTxContext` was over-strong.** It asserted `Crypto.checkPreimage preimage = authBackend.checkSig sig pk` for UNIVERSALLY quantified `sig pk : ByteArray` under any one valid context — so `authBackend.checkSig` was pinned to the SAME boolean for ALL `(sig, pk)` pairs, i.e. the axiom forced the auth backend to be a CONSTANT function. Consistent in-model (both backends are opaque), but cryptographically UNFAITHFUL: for real ECDSA some signatures verify and most do not, so the assumption's real-world reading is false. TIGHTENED (in `Stack/StatefulBridge.lean`): (a) the universal equality is GONE; (b) the surviving axiom is `exists_checkSig_witness_under_validTxContext` — for every valid context ∃ sig with `authBackend.checkSig sig stG = Crypto.checkPreimage (buildPreimage ctx)` (`stG` = the compiler's synthetic key `G`, now defined in `StatefulBridge` and aliased by `AgreesStateful.stG`). The existential is TRUE under the real-ECDSA reading (the synthetic key's discrete log is public, so the deterministic signature over the digest is a verifying witness when the preimage backend accepts; any garbage is a non-verifying one when it rejects) and constrains nothing about `checkSig` off the witness — the backend may be non-constant. (c) The per-deployment agreement for the spender's SPECIFIC `_opPushTxSig` witness is now a HYPOTHESIS (`hSig : authBackend.checkSig sig stG = Crypto.checkPreimage preimage`) of `statefulPrologue_successAgrees_under_validTxContext`, of `compileSafe_observational_correct_stateful_consume`, and of the keyed `hStatefulFrag` omnibus premise (one new conjunct) — discharged per fixture by the conformance harness, exactly like the other keyed entry bundles. (d) Anti-vacuity preserved: the smokes (`smoke_statefulPrologue_successAgrees`, `Pipeline.smoke_stateful_consume_fires`) obtain the witness via `Classical.choose` of the existence axiom and fire end-to-end on the sample context. `#print axioms` after: the consume theorem and the correspondence theorem now depend only on propext / Classical.choice / Quot.sound + the crypto backends (the bridge content moved into their hypotheses); the smokes additionally list `exists_checkSig_witness_under_validTxContext`. Net 0, 71 → 71. |
 | **Model aligned to the 7-tier `operandConsume` fix — aliasCx divergence GONE; loop-arm counterexample found, both surviving sub-omnibus axioms RE-GUARDED** | 2026-06-11 | **71** | **0** | 0 (no axiom added or removed — 2 axioms re-guarded with honest decidable loop guards) | 0 | **(a) Model aligned.** `Stack.Lower` now implements the production rule `operandConsume` (consume(ref) = isLastUse AND ref occurs exactly once in the value's FULL operand list — PRs #62/#67/#68, identical in all 7 compilers) via `operandConsume` / `loadRefOperand` at every multi-operand load site (binOp, generic call args via `lowerArgsLive` threading the full arg list, methodCall arg binding `loadAndBindArgsLive`, checkMultiSig, computeStateOutput/computeStateOutputHash/buildChangeOutput, addOutput/addRawOutput, substr/percentOf/mulDiv/safediv/safemod/clamp/pow/gcd/divmod, verifyRabinSig, sha256Compress/Finalize, blake3Compress, verifyWOTS, verifySLHDSA, EC/P256P384/BabyBear arg loops, merkleRoot); single-operand sites keep `loadRefLive` (TS parity). `lowerMethod`'s epilogue NIP gate is now `isPublic && bodyEndsInAssert && depth > 1` (TS `cleanupExcessStack` parity on every validator-accepted program — `02-validate.ts` requires public methods to end in assert). Faithfulness: model `compileSafe` output verified byte-identical to the 7-tier pinned constants for all four canonical shapes (`t:=x+x` → `767693009c77`, `min(x,x)` → `7676a3009c77`, buried-ref → `7876937c93009c77`, distinct-ref regression → `767c93009c`). The 2026-06-08 aliasCx divergence is GONE: `aliasCx_stack_fails` REPLACED by `aliasCx_stack_succeeds` + the agreement smoke `aliasCx_successAgrees`. **(b) Guard re-evaluation (mandatory pre-removal probes) — `hNoAlias` could NOT simply be dropped.** Probing the known loop-arm infidelity produced a NEW counterexample (`loopCx*`, pinned by native_decide): a WF, NON-aliased, `compileSafe`-accepted accumulator loop (`sum:=100; loop 2 i {assert(sum>=50); sum:=sum+p}`) that SATISFIES the loop axiom's `structuralLoopBodyBool` hypothesis (`loopCx_structural_accepts`) yet diverges: ANF succeeds (`loopCx_anf_succeeds`), deployed bytes abort (`loopCx_stack_fails`) — the model loop arm's per-iteration `.drop` removes the runtime TOS (the body's last value) instead of the buried iteration variable, so iteration 2's range check reads the stale iteration index. Both previously-`hNoAlias`-guarded axioms were therefore STILL refutable (pre-existing, independent of the operand fix). REPAIR: `hNoAlias` is REPLACED (not removed) — the loop axiom now requires `bodyLoopMapNeutralB` (every loop body consumes its iteration variable and returns the lowered stack map to the parent shape in BOTH liveness modes; `loopCx_guard_rejects` pins exclusion), and the crypto_call axiom requires `programUsesLoopB p = false` (loop bodies reach the fallback when the loop classifier rejects a post-loop binding — probe shapes A/D; program-level because private-method inlining can splice loops). The omnibus + `via_support` thread `hNoLoop : programUsesLoopB p = false` (replacing `hNoAlias`); the loop branch derives `bodyLoopMapNeutralB` via `bodyLoopMapNeutralB_of_noLoop`. Model-side loop-arm fidelity fix (and guard re-widening) tracked as the loop follow-up. Axiom count unchanged (71); `#print axioms` on the omnibus lists exactly crypto_call + loop + the 3 crypto backends + pre-existing native_decide axioms, NO sorryAx. |
 | **Loop arm made FAITHFUL — per-iteration re-lowering; loopCx class fixed; guards RETAINED; pre-existing terminal-assert success-bit gap pinned (`termCx*`)** | 2026-06-11 | **71** | **0** | 0 (no axiom added or removed; guard hypotheses textually unchanged — comments re-justified) | 0 | **(a) Loop-arm fidelity rewrite (`Stack/Lower.lean`).** The `lowerValueP` `.loop` arm no longer lowers the body once per liveness mode and replays iteration-0 depths: the new mutual member `lowerLoopItersP` RE-LOWERS the body EVERY iteration against the live threaded stack map (PICK/ROLL depths grow as values strand), mirroring TS `lowerLoop` (`05-stack-lower.ts:2109-2176`). Four divergences fixed: (1) per-iteration cleanup now drops the iter var ONLY at exactly depth 0 (`iterVarCleanup`; the old any-depth `.drop` destroyed the body's last value — the `loopCx` divergence); (2) per-iteration re-lowering replaces lower-once replay; (3) the body is lowered with the ENCLOSING ∪ body-names `localBindings` union (final-iteration `@ref:` consume gate now ROLLs outer targets where the old body-names-only set PICKed); (4) `bodyOuterRefs` narrowed to the exact TS set (`load_param` names ≠ iterVar + non-body-bound `@ref:` targets) — loops reading outer non-param locals as raw operands now emit `OP_RUNAR_UNRESOLVED_*` sentinels in iteration ≥ 1 and `compileSafe` REJECTS them, matching the TS "Value not found on stack" compile error (empirically confirmed against `compileFromANF`). Termination: the mutual block's measure is now the 3-tuple `(budget, sizeOf payload, iterations)`. The legacy non-P `lowerValue` loop arm is marked NON-FAITHFUL/legacy (excluded from the `compileSafe` path, preserved for loop-free rfl-lemmas). **Byte-parity evidence:** bounded-loop conformance golden still byte-exact (`tests.PipelineGolden` green); the canonical accumulator (`loopOkProg`) compiles to hex IDENTICAL to the production TS compiler (`loopOk_hex_matches_ts` = `000052797b7c935153797b7c9352547a7b7c93009c777777`: growing PICKs 2→3, final ROLL 4, no per-iteration drops, 3 epilogue NIPs); a nested-loop probe also matched TS hex; `loopCx` (hand-written ANF, not frontend-reachable) is now REJECTED by both TS and the model (`loopCx_stack_fails` → `loopCx_ts_aligned_rejects`; agreement restored vacuously) and the fixed frontend-shaped class is pinned positively (`loopOk_anf_succeeds` + `loopOk_stack_succeeds` + `loopOk_successAgrees`). Known semantics-preserving residual: the model's peephole applies a fixed pass chain (not TS's to-fixpoint loop), so deep const-fold chains exposed by unrolled loops can differ from TS bytes (probe: model `515293009c` vs TS `53009c`, same semantics; none of the 49 goldens affected). **(b) AgreesA7 substrate restated** for the faithful arm: Tier 1/2 (empty bodies) re-proved byte-identical via `lowerLoopItersP_empty_eq`; Tier 3a const bodies restated as the STRAND form (`[push i, emitConst c]`, no drop, `constStrandMap` threading, new `x ≠ iv` hypothesis); Tier 3b/Wave-12 ref bodies restated at `count ≤ 1` (`lowerLoopItersP_one_eq` + per-shape corollaries) plus concrete `count = 2` faithful pins (hex-level, incl. the divergence-3 ROLL pin and the divergence-4 sentinel pin) — the count-generic growing-depth closed forms are an HONEST DEFERRAL; Tier 3c restated as the iteration-identical map-neutral class (`loopNeutralAssemble` / `lowerLoopItersP_neutral_eq` / `runOps_loopNeutralAssemble_id`) and `successAgrees_loop_allCopyBody_unconditional` → `successAgrees_loop_neutralBody_unconditional`. **(c) Guard re-evaluation — widening evaluated and NOT taken.** Probes (accumulator, nested, bounded-loop class, methodCall-in-loop — all byte-matched or TS-aligned-rejected) cleared the loop-arm infidelity class, BUT surfaced a PRE-EXISTING, loop-INDEPENDENT falsifier of the `crypto_call` fallback axiom: the public-method terminal-assert `OP_VERIFY` elision leaves the falsy boolean on the stack and `runParsedBytes`-based `successAgrees` counts the completion as success while the ANF `assert` errors. Pinned as `termCx*` (WF, loop-free, classifier-rejected `assert(x === 5)` body: `termCx_anf_fails` + `termCx_bytes_complete` + `termCx_wf_and_loopfree`) — this class reproduces identically on the parent commit and lands on the crypto_call axiom, whose statement is therefore REFUTABLE for that (program, entry) pair TODAY; the honest fix is a truthy-top-aware bytes-side success bit (consensus checks the final stack top), tracked as an URGENT follow-up since it touches every discharged successAgrees theorem. Because admitting loop bodies into crypto_call would ADD known instances of the same class (e.g. `loopOkProg` on a non-satisfying entry), and methodCall-spliced loop bodies remain byte-unverified (TS's cross-iteration localBindings pollution vs the model's per-loop union reset), BOTH guards are textually RETAINED (`_hLoopNeutral` on loop — now selecting the iteration-identical class that `AgreesA7.lowerLoopItersP_neutral_eq` proves iteration-invariant; `_hNoLoop` on crypto_call + omnibus threading unchanged); all guard-comment rationales rewritten to the post-fix truth. Axiom count unchanged (71); `#print axioms` on the omnibus lists exactly crypto_call + loop + the 3 crypto backends + native_decide axioms, NO sorryAx. |
+| **Loop sub-omnibus RETIRED — `hNoLoop` confines the loop arm vacuously** | 2026-06-13 | **70** | **−1** | −1 (`compileSafe_observational_correct_modulo_loop_codegen` GONE) | 0 | The loop sub-omnibus axiom is retired. The omnibus's top-level `hNoLoop : programUsesLoopB p = false` confines the loop arm to loop-FREE bodies (a real `.loop` refutes `hNoLoop`), so the non-vacuous residue is exactly the loop-free shapes the sound `crypto_call` fallback already covers — NO new axiom. The genuine accumulator loop is proven separately (`loopOk_acceptAgrees_parsedBytes`) and wired into the downstream `..._with_loop` capstone (`OmnibusLoop.lean`). `#print axioms` on the omnibus now lists exactly `crypto_call` + the 3 crypto backends + native_decide, NO loop axiom, NO sorryAx. The acceptance surface is `acceptAgrees` (consensus truthy-top), which closes the pre-existing `termCx*` terminal-assert success-bit gap. |
+| **v1 convergence — boundary machine-enforced + `crypto_call` residue narrowed (count-neutral)** | 2026-06-21 | **70** | **0** | 0 (no axiom added or removed) | 0 | Three count-neutral landings. **(1) CHALLENGE-001:** the BIP-143 bridge axiom re-audited — sound, non-vacuous (a proof-term dependency of the `statefulFull` omnibus instantiation), not usefully tightenable; stays axiomatized with sharpened justification. **(2) PROVE-001:** new `#audit_axioms` command (`RunarVerification/AxiomAuditCmd.lean`, via `Lean.collectAxioms`) makes the trust boundary BUILD-ENFORCED — fails on `sorryAx` or any axiom outside the documented base; wired onto all 9 omnibus-fragment instantiations + the with-loop capstone, and added to `full-verification.sh`. Discloses `native_decide` TCB per capstone. **(3) PROVE-002:** `hash256` single-hash-call bodies peeled out of the `crypto_call` residue into the proven `hashCall_consume_hash256` (`ripemd160` deferred — `OP_RIPEMD160 ∉` parse allowlist). Drift gate unchanged at 70. |
 
 | **SUCCESS BIT REDEFINED — bytes-side observational surface moved from COMPLETION to CONSENSUS ACCEPTANCE (truthy top); termCx class RESOLVED; crypto_call `_hNoLoop` guard REMOVED** | 2026-06-11 | **71** | **0** | 0 (no axiom added or removed — both surviving sub-omnibus axioms RESTATED on the acceptance bit; one keyed premise added to each) | 0 | **The headline trust-model event of this wave.** *Old bit:* `successAgrees` compared mere COMPLETION bits — `(runParsedBytes bytes stk).toOption.isSome` on the bytes side. *Why it was wrong:* Bitcoin consensus accepts a script run only when it completes AND leaves a truthy top-of-stack; the compiler's terminal-assert elision (`lowerMethod` drops a public method's trailing `OP_VERIFY`, leaving the asserted bool as the implicit return) is designed around exactly that rule. Consequence (pinned 2026-06-11 by `termCx_*`): a WF, loop-free, classifier-rejected method ending in a FAILING assert had ANF eval = error but deployed bytes = completes-with-false-on-top — the completion bits DISAGREED, REFUTING the then-stated crypto_call fallback axiom. *New bit:* `Stack.Eval.scriptAccepts` (new module `Stack/Accept.lean`) — false on error, `topTruthy s.stack` on ok, with `topTruthy` mirroring EXACTLY the `OP_VERIFY` arm of `runOpcode` (`asBool?`-based: empty stack falsy, no-bool-reading `vOpaque` falsy, `vBigint i` truthy iff `i ≠ 0`, `vBytes b` truthy iff `b.size > 0`); agreement notion `acceptAgrees a r := a.toOption.isSome ↔ scriptAccepts r = true`. Keystone elision lemma `runOps_append_verify_isSome_iff_scriptAccepts` (PROVEN, definitional per case): appending one `OP_VERIFY` completes iff the bare op list is accepted — the formal content of the elision's soundness. *Validator finding (drives the fragment split):* the TS validator (`02-validate.ts:325-344`) REQUIRES public methods to end in `assert()` (auto-injected for stateful), so assert-terminated is THE production fragment; the Lean `validateStackProgram` does not enforce this, so value-terminated bodies remain reachable via hand IR only. *Theorems RESTATED to `acceptAgrees` (headline set):* the omnibus `compileSafe_observational_correct_modulo_codegen_axioms` + `_via_support` (one NEW keyed premise `hValueTruthy : bodyEndsInAssert = false → completed-run top truthy`, forwarded verbatim to every branch; vacuous for assert-terminated bodies and every frontend-reachable program), both surviving sub-omnibus axioms (crypto_call, loop — each gains the same `_hValueTruthy` keyed premise), and all discharged consume theorems. *Per-family:* stateful = the only assert-terminated discharged family — restated WITHOUT new hypotheses (new shape lemma `runOps_statefulPrologueOps_scriptAccepts`: the fused `OP_CHECKSIGVERIFY` errors on a bad witness and leaves the NONEMPTY preimage on top on success, truthy via `buildPreimage_size_pos`); arith / if_val / math_byte / update_prop / method_call / hash_call ×2 / dispatch = value-terminated — each GAINS the keyed `hTopTruthy` premise (FLAGGED in each docstring; genuinely required — e.g. an arith chain evaluating to 0 completes but is not accepted; old completion-bit proofs survive as `private *_completion` legs). `EntryDischarge` (`arith_consume_from_witness` / `arith_family_verified` / smoke) restated likewise. *Smokes:* hash smoke now carries the digest-truthiness hypothesis (hash backends are OPAQUE — `native_decide` cannot evaluate `Crypto.sha256` and no digest-size axiom exists; reachability stays unconditional); updateProp / methodCall / dispatch / aliasCx / loopOk smokes discharge their truthiness by `native_decide` on the concrete runs. *termCx flip:* on the refuting entry (x=1) the bytes are now REJECTED (`termCx_bytes_rejected`) — agreement (`termCx_acceptAgrees`, plus the satisfying-entry companion); the completion-era pins are KEPT as history. *Guard re-evaluation:* crypto_call's `_hNoLoop` guard REMOVED — it was retained solely for the termCx falsifier class, and the named instances now AGREE under acceptance (probes `loopOk_start7_anf_fails` / `_bytes_complete` / `_bytes_rejected` / `_acceptAgrees`); the loop axiom's `_hLoopNeutral` guard KEPT for its one surviving reason (methodCall-spliced loop bodies remain byte-unverified); the omnibus still threads `hNoLoop` (its loop branch derives map-neutrality from it — omnibus loop widening is the tracked follow-up). Axiom count unchanged (71). `#print axioms` on the omnibus: propext / Classical.choice / Quot.sound + crypto_call + loop + 3 crypto backends + pre-existing native_decide certs, NO sorryAx; stateful / arith / hashCall consume theorems list NO sub-omnibus axiom. |
 | **Stateful fragment WIDENED — prologue-only → prologue + state-output epilogue; OP_LESSTHAN consensus number coercion** | 2026-06-11 | **71** | **0** | 0 (no axiom added or removed — the widening adds THEOREMS only) | 0 | The discharged stateful consume surface grows from the bare gated entry prologue to the REAL stateful-method shape: `AgreesStateful.statefulFullBody pre sats stateVal` = `_cp0 := check_preimage pre ; _v := assert _cp0 ; _so0 := add_output(sats, [stateVal], "")` — the honest composition of the two PROVEN substrates (`StatefulBridge.gatedStatefulPrologueBody` + `AgreesD2.statefulEpilogueBody`; the empty `add_output` preimage ref matches the real compiler's auto-injection at `04-anf-lower.ts:1311`; the full injection additionally deserializes state and asserts a `hashOutputs` commitment — future widening). Decided by the new classifier `statefulFullConsumeShapeBool` (3 params, one mutable bigint prop, name-collision exclusions via `statefulFullNamesOk`); the prologue-only classifier and fragment are UNCHANGED and tried second in the omnibus stateful branch. **The `_codePart` finding:** the epilogue trips `bindingsUseCodePart`, so the initial stack map becomes `[pre, stateVal, sats, _opPushTxSig, _codePart]` — the prologue's witness consume lowers to `.roll 3` (not `.swap`), and the mid-body assert's `OP_VERIFY` SURVIVES (no terminal elision; the script's return value is the serialized output bytes, accepted under truthy-top). The whole method lowers to the CONSTANT 68-op `statefulFullOps` (`lowerMethod_ops_statefulFull`, staged per-binding reductions incl. the de-`private`d `addOutputStateValuesLive`); M3 = peephole identity (`peepholeMethodOps_statefulFull`); M4 = concrete `parseScript ∘ emitOpsFast` round-trip to the STRUCTURALLY DISTINCT 24-op parse image `statefulFullParsedOps` (flat varint `OP_IF`s reconstruct as nested `.ifOp`; `pickStruct 2` → `.pick 2`; int pushes above OP_16 → minimal-LE byte pushes) — proved by `with_unfolding_all rfl` leaves + the generic `emitOps_eq_emitOpsFast` bridge. **Model-fidelity repair (load-bearing, consensus-faithful):** the parsed `push 253` re-enters the VM as `vBytes [0xfd,0x00]`, and the typed `liftIntBin` REJECTED byte operands — i.e. the model's deployed-bytes run rejected EVERY script with a >OP_16 numeric push feeding a numeric opcode, where real consensus decodes the bytes as a CScriptNum. Repair: `Eval.asNum?` (byte vectors ≤ 4 bytes decode via `decodeMinimalLE`; everything else falls back to `asInt?`) wired into `OP_LESSTHAN` ONLY via `liftIntBinNum` (`runOpcode_LESSTHAN_def` / `_intInt` restated; new `runOpcode_LESSTHAN_intBytes`); the other numeric opcodes keep the strict typing because the Wave-30 failure-lockstep theorems (`AgreesA3.liftIntBin_nonInt_top_isError` + consumers) pin ANF-type-error ⟷ Stack-type-error agreement for `+`/`-`/`*` and would be FALSIFIED by a wider coercion — extend opcode-by-opcode with the matching ANF-side story as future walks require. **Runtime walk:** `runOps_statefulFullParsedOps_scriptAccepts` — acceptance bit = `authBackend.checkSig sigV G`, under input-side readiness premises (`num2binEncode?` witnesses for the 8-byte state value, 8-byte amount and 2-byte varint source; `cpV.size + 9 < 253` selecting the 1-byte-varint `ifOp` branch; nonempty preimage); ANF side `evalBindingsP_statefulFull_isSome_eq` = `Crypto.checkPreimage preimage` (epilogue never aborts; output-record byte-identity per `AgreesD2.statefulEpilogue_outputs_agree`). Pipeline consume theorem `compileSafe_observational_correct_statefulFull_consume` (acceptAgrees conclusion; per-deployment `hSig` provenance hypothesis as in the prologue-only theorem); omnibus + `_via_support` gain the keyed `hStatefulFullFrag` premise (vacuous off-fragment) and the stateful branch tries the FULL classifier first. End-to-end smoke `smoke_statefulFull_consume_fires` (`compileSafe` accepts the canonical widened contract; the theorem fires on the sample-context entry with concrete encodings). `#print axioms` on the consume theorem: propext / Classical.choice / Quot.sound + the 3 crypto backends — NO sub-omnibus axiom, NO bridge/witness axiom (it enters via the smoke only), NO native_decide certs, NO sorryAx. Axiom count unchanged (71). |
@@ -1519,17 +1654,25 @@ These are active proof obligations, not historical notes:
   op-index semantic gap in `emitWithCodeSepPatches` / `runOpsPc`
   blocks the full `successAgrees` round-trip for `pushCodesepIndex`
   cases across method-dispatch branches.
-* **Phase D — multi-method dispatch + stateful continuation.** Not
-  started. The capstone still requires `hPublicSingleton` (single
-  public method). Stateful-contract auto-injection of `checkPreimage`
-  and state continuation is not proved.
-* **0/56 conformance fixtures formally verified.** The
-  `tests/PipelineConformance.lean` harness runs and reports honestly,
-  but every fixture falls into a DEFERRED bucket. Most are
-  `DEFERRED-structuralRefBody`: the fixture body contains constructors
-  (binOp, call, assert, update_prop, if_val, loop, or method_call)
-  outside the current capstone's predicate. The count will rise only
-  once A3–A14 runtime discharge lands.
+* **Phase D — multi-method dispatch + stateful continuation.**
+  SUPERSEDED (this bullet is historical). The dispatch and stateful
+  sub-omnibus axioms were both retired as THEOREMS (trajectory rows
+  2026-06-08): `compileSafe_observational_correct_dispatch_consume`
+  (canonical multi-public passthrough, via
+  `merkle_dispatch_selection_correct`) and
+  `compileSafe_observational_correct_stateful_consume` (canonical gated
+  prologue, `checkPreimage` auto-injection + state continuation). The
+  omnibus no longer requires a single-public method. See the v1 Trust
+  Boundary section.
+* **Conformance-fixture coverage (the "0/56 direct" framing).** The
+  `tests/PipelineConformance.lean` harness reports **0/56 VERIFIED-direct**
+  (the intentionally narrow structural-ref fragment) but **56/56
+  VERIFIED-modulo-codegen-axioms** — every fixture is covered by the
+  omnibus modulo the documented 70-axiom base. Representative fixtures now
+  carry explicit, machine-audited omnibus *instantiations*
+  (`tests/OmnibusInstantiation.lean`, one per discharged family plus a real
+  `basic-p2pkh` golden transcription). "0/56" refers to the direct tier,
+  not to "nothing proven" — do not read it as the latter.
 * **Flat first-pass peephole rule preconditions and roll/pick-fold
   obligations** outside the current no-op subset for the full
   `Pipeline.peepholeProgram` chain.
@@ -1561,9 +1704,10 @@ maintained outside this directory.
   for frontend parity and the Stack-IR / hex parity matrix for the
   codegen layer. The check is a true 7-way agreement on byte output, not
   a pairwise spot check.
-* **Empirical backing for the codegen-soundness axioms.** The 22
-  codegen-soundness axioms tracked across Phase B, Phase D, and the
-  omnibus inventory encode the assumption that the Lean spec faithfully
+* **Empirical backing for the codegen-soundness axioms.** The
+  per-primitive codegen-soundness axioms (Group B of the v1 Trust
+  Boundary) plus the `crypto_call` structural fallback encode the
+  assumption that the Lean spec faithfully
   models what the Rúnar compiler actually emits for the corresponding
   intrinsics. The seven-tier suite gives that assumption seven
   independent implementations agreeing on byte-level output across the

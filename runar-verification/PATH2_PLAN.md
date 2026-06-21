@@ -28,7 +28,7 @@ Strategic choices fixed at plan time (2026-05-17):
   3 ceiling*, not the Tier 1 / Tier 2 target.
 
 Estimated calendar time (revised per the 2026-05-17 reprioritization
-review and the §1.2 acceptance criteria):
+decision, recorded inline in §0, and the §1.2 acceptance criteria):
 
 * **Tier 1:** ≈ 8–10 weeks with 2–3 parallel specialists; 18–22
   weeks solo.
@@ -110,10 +110,13 @@ revised §1.2 below uses the corrected baseline.
 Replace every codegen-soundness axiom in `TRUST_MANIFEST.md` with a
 direct Lean proof. After Path 2:
 
-* The mechanised conformance claim is unconditional on the compiler
-  side. The remaining axioms are real cryptographic primitive
-  existence / group law / EUF-CMA / backend assumptions, plus
-  whatever Tier 3 codegen-to-spec residue remains — see §1.2.
+* The mechanised conformance claim rests, on the compiler side, on the
+  documented trust base only: real cryptographic primitive
+  existence / group law / EUF-CMA / backend assumptions, PLUS two
+  structural composition-path axioms (the `crypto_call` residue
+  fallback and the BIP-143 bridge; see `TRUST_MANIFEST.md` §"v1 Trust
+  Boundary"), plus whatever Tier 3 codegen-to-spec residue remains —
+  see §1.2.
 * `tests/PipelineConformance.lean` reports **56/56 VERIFIED** (or
   fine-grained per-family classifications post-O1 omnibus split),
   0 fixtures conditional on a single omnibus axiom.
@@ -124,6 +127,11 @@ direct Lean proof. After Path 2:
   milestone lands).
 
 ### 1.2 Acceptance criteria
+
+> **STATUS (2026-06-21): superseded** — the tree is at **70 axioms**,
+> past these Tier 1 / Tier 2 targets; see `TRUST_MANIFEST.md` §"v1
+> Trust Boundary". The historical tier-target content below is retained
+> for the record, not as a live plan.
 
 The Path 2 finish line is split into per-tier targets. Tier 1 is
 the visible-progress milestone (omnibus split + Stage C composition
@@ -159,12 +167,16 @@ passes before moving to the next. Continuous integration via
 ### 1.3 What success looks like
 
 After Path 2, anyone evaluating Rúnar's correctness story reads
-`TRUST_MANIFEST.md` and sees only cryptographic-primitive
-assumptions — same trust class as CompCert (which assumes properties
+`TRUST_MANIFEST.md` and sees the documented trust base — same trust
+class as CompCert (which assumes properties
 of the host logic), Bedrock2 (which assumes properties of word
 arithmetic), or any other production verified compiler. The
-*compiler* itself is unconditionally proved correct against the ANF
-reference semantics.
+*compiler* back-half is proven against the ANF reference semantics
+**modulo the documented trust base** — cryptographic-primitive
+assumptions PLUS two structural axioms (the `crypto_call` residue
+fallback and the BIP-143 bridge); see TRUST_MANIFEST.md §"v1 Trust
+Boundary". The model is aligned to the fold-OFF goldens, whereas the
+deployed compilers ship fold-ON.
 
 ---
 
@@ -286,7 +298,8 @@ Per `CLAUDE.md`:
 ## 3. Dependency graph (revised post-wave-1)
 
 The dependency graph below reflects the wave 1 commit (2026-05-17,
-`7dcc7fc3`) and the 2026-05-17 reprioritization review.
+`7dcc7fc3`) and the 2026-05-17 reprioritization decision (recorded
+inline in §0).
 Milestones marked **[DONE]** retired in wave 1. New sub-phases
 (B4-a / B5-a / B9-a / B10-prep / O1 / pXNegate-derivable /
 group-law audit) appear as explicit nodes.
@@ -1088,8 +1101,8 @@ to arbitrary inlined method calls within the inline budget.
 **Status (2026-05-17):** a wave-1 in-session subagent attempted
 discharge by defining `sha256CompressOps` as `[.opcode "OP_SHA256"]`
 (a trivial alias making the theorems tautological); that attempt
-was rejected and no commit landed. The accepted approach (decided
-in the 2026-05-17 reprioritization review) is: add the
+was rejected and no commit landed. The accepted approach (the
+2026-05-17 reprioritization decision, recorded inline in §0) is: add the
 FIPS 180-4 §6.2 composition axiom
 `sha256_compose : sha256 (xs ++ ys) = sha256Finalize (sha256Compress
 sha256Init xs) ys.length ys` in `Crypto/HashBackend.lean` with

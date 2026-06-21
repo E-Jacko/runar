@@ -107,7 +107,8 @@ points are now in place inside `runar-verification/`:
   stored crypto-pending constants). The 7 fixtures whose hex is
   regenerated rather than compared remain in the `cryptoAxiomPending`
   bucket. The Lean proof gate (`scripts/lean-verify.sh` +
-  `scripts/check-tcb-drift.sh`) is green; axioms = 124.
+  `scripts/check-tcb-drift.sh`) is green; axioms = 70 (current; the 124
+  figure recorded in this baseline snapshot was the wave-1-era count).
 * **Phase B done (codegen-to-spec for crypto primitives, axiom-shim path).**
   13 primitive families now have spec links: SHA-256 / RIPEMD-160 /
   hash160 / hash256 (B1+B2, single-opcode runOps-to-spec, 0 new
@@ -416,8 +417,9 @@ milestones are **met**:
   multi-method dispatch). None relies on hypotheses that restate the
   conclusion.
 * Every remaining assumption is listed in `TRUST_MANIFEST.md` and
-  counted by `check-tcb-drift.sh` (**124 axioms**, 0 opaques, 0
-  opaque stubs, 0 `partial def`s).
+  counted by `check-tcb-drift.sh` (**70 axioms** current — the 124
+  figure was the wave-1-era baseline; subsequent Path 2 waves brought
+  it to 70 — 0 opaques, 0 opaque stubs, 0 `partial def`s).
 * No active code path silently emits empty bytes for unknown opcodes
   (rejected by `compileSafe` before emission).
 * Conformance harness (`tests/PipelineConformance.lean`) runs all 56
