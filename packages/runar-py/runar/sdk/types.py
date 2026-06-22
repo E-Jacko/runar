@@ -61,6 +61,8 @@ class AbiMethod:
     params: list[AbiParam] = field(default_factory=list)
     is_public: bool = True
     is_terminal: bool | None = None
+    # Unlocking script is prefixed with _codePart (issue #100).
+    uses_code_part: bool | None = None
 
 
 @dataclass
@@ -145,6 +147,7 @@ class RunarArtifact:
                 ],
                 is_public=m.get('isPublic', True),
                 is_terminal=m.get('isTerminal'),
+                uses_code_part=m.get('usesCodePart'),
             )
             for m in abi_raw.get('methods', [])
         ]
@@ -253,6 +256,8 @@ class PreparedCall:
     is_terminal: bool = False
     needs_op_push_tx: bool = False
     method_needs_change: bool = False
+    # Unlocking script is prefixed with _codePart (issue #100).
+    method_uses_code_part: bool = False
     change_pkh_hex: str = ''
     change_amount: int = 0
     method_needs_new_amount: bool = False

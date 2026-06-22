@@ -57,6 +57,11 @@ type StackMethod struct {
 	Name          string
 	Ops           []StackOp
 	MaxStackDepth int
+	// UsesCodePart is true if the unlocking script is prefixed with the
+	// _codePart implicit parameter — needed for continuation builders OR
+	// terminal methods that read variable-length (ByteString) state (issue
+	// #100). Propagated to ABIMethod.UsesCodePart for the SDK.
+	UsesCodePart bool
 }
 
 // ---------------------------------------------------------------------------
@@ -1747,16 +1752,19 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 		}
 	}
 
-	// Phase 3: single depth-balance check after ALL drops.
-	// Push placeholder only if one branch is still deeper than the other.
-	if thenCtx.sm.depth() > elseCtx.sm.depth() {
-		// When the then-branch reassigned a local variable (if-without-else),
-		// push a COPY of that variable in the else-branch instead of a generic
-		// placeholder. This ensures the else-branch preserves the correct value
-		// when post-ENDIF stale removal (NIP) removes the old entry.
-		thenTopP3 := thenCtx.sm.peekAtDepth(0)
-		if len(elseBindings) == 0 && thenTopP3 != "" && elseCtx.sm.has(thenTopP3) {
-			varDepth := elseCtx.sm.findDepth(thenTopP3)
+	// Phase 3: depth-balance reconciliation after ALL drops.
+	//
+	// Compensate the FULL depth difference between the branches — NOT just a
+	// single item. A conditional write of N state fields leaves N result
+	// values on the then-branch, so the (empty) else-branch must preserve N
+	// old values. Issue #99 Bug 1: the previous single-shot check only balanced
+	// a 1-item difference, leaving N>=2 conditional writes imbalanced by (N-1)
+	// and the update branch unspendable.
+	for thenCtx.sm.depth() > elseCtx.sm.depth() {
+		resultDepth := thenCtx.sm.depth() - elseCtx.sm.depth() - 1
+		thenName := thenCtx.sm.peekAtDepth(resultDepth)
+		if len(elseBindings) == 0 && thenName != "" && elseCtx.sm.has(thenName) {
+			varDepth := elseCtx.sm.findDepth(thenName)
 			if varDepth == 0 {
 				elseCtx.emitOp(StackOp{Op: "dup"})
 			} else {
@@ -1765,14 +1773,25 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 				elseCtx.emitOp(StackOp{Op: "pick", Depth: varDepth})
 				elseCtx.sm.pop()
 			}
-			elseCtx.sm.push(thenTopP3)
+			elseCtx.sm.push(thenName)
 		} else {
 			elseCtx.emitOp(StackOp{Op: "push", Value: PushValue{Kind: "bytes", Bytes: []byte{}}})
 			elseCtx.sm.push("")
 		}
-	} else if elseCtx.sm.depth() > thenCtx.sm.depth() {
+	}
+	for elseCtx.sm.depth() > thenCtx.sm.depth() {
 		thenCtx.emitOp(StackOp{Op: "push", Value: PushValue{Kind: "bytes", Bytes: []byte{}}})
 		thenCtx.sm.push("")
+	}
+
+	// Layer B — branch-balance invariant (#99 Bug 1 guard). After reconciliation
+	// the two arms of an OP_IF/OP_ELSE MUST leave the stack at identical depth;
+	// otherwise the post-ENDIF code (generated against a single assumed depth)
+	// is only correct for the branch the spender does not take, producing a
+	// silently-unspendable script. The VM does not enforce branch balance, so
+	// this is the compiler's responsibility — fail loudly at compile time.
+	if thenCtx.sm.depth() != elseCtx.sm.depth() {
+		panic(fmt.Sprintf("internal codegen error: conditional emitted stack-imbalanced branches (then depth %d != else depth %d); would produce an unspendable script (see GitHub issue #99); binding=%q", thenCtx.sm.depth(), elseCtx.sm.depth(), bindingName))
 	}
 
 	thenOps := thenCtx.ops
@@ -1797,7 +1816,42 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	}
 
 	// The if expression may produce a result value on top.
-	if thenCtx.sm.depth() > ctx.sm.depth() {
+	if len(elseBindings) == 0 && thenCtx.sm.depth() > ctx.sm.depth() && thenCtx.sm.depth()-ctx.sm.depth() >= 2 {
+		// #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+		// values on top (new values if taken, preserved old values if skipped).
+		// Record the N results in their on-stack order, then physically remove
+		// the N stale old property values that now sit beneath the result block.
+		resultCount := thenCtx.sm.depth() - ctx.sm.depth()
+		for i := resultCount - 1; i >= 0; i-- {
+			name := thenCtx.sm.peekAtDepth(i)
+			if name == "" {
+				name = bindingName
+			}
+			ctx.sm.push(name)
+		}
+		resultNames := make([]string, 0, resultCount)
+		for i := 0; i < resultCount; i++ {
+			resultNames = append(resultNames, ctx.sm.peekAtDepth(i))
+		}
+		for _, name := range resultNames {
+			if name == "" {
+				continue
+			}
+			for d := resultCount; d < ctx.sm.depth(); d++ {
+				if ctx.sm.peekAtDepth(d) == name {
+					ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(d))})
+					ctx.sm.push("")
+					ctx.emitOp(StackOp{Op: "roll", Depth: d + 1})
+					ctx.sm.pop()
+					rolled := ctx.sm.removeAtDepth(d)
+					ctx.sm.push(rolled)
+					ctx.emitOp(StackOp{Op: "drop"})
+					ctx.sm.pop()
+					break
+				}
+			}
+		}
+	} else if thenCtx.sm.depth() > ctx.sm.depth() {
 		// Branches increased depth — check if both updated the same property.
 		thenTop := thenCtx.sm.peekAtDepth(0)
 		elseTop := ""
@@ -4183,6 +4237,29 @@ func emitGroth16WAPreamble(ctx *loweringContext, config Groth16Config, useMSM bo
 	}
 }
 
+// methodReadsVarLenState reports whether a method READS a mutable variable-length
+// (ByteString) state field's value (via load_prop), recursing into branches and
+// loops. Issue #100: such a terminal method needs _codePart for the
+// preimage-relative state offset. Narrowed to the live var-length read so
+// methods that only read readonly fields (baked into the locking script) or
+// fixed-size fields keep their original terminal codegen.
+func methodReadsVarLenState(bindings []ir.ANFBinding, varLenProps map[string]bool) bool {
+	for _, b := range bindings {
+		if b.Value.Kind == "load_prop" && varLenProps[b.Value.Name] {
+			return true
+		}
+		if b.Value.Kind == "if" {
+			if methodReadsVarLenState(b.Value.Then, varLenProps) || methodReadsVarLenState(b.Value.Else, varLenProps) {
+				return true
+			}
+		}
+		if b.Value.Kind == "loop" && methodReadsVarLenState(b.Value.Body, varLenProps) {
+			return true
+		}
+	}
+	return false
+}
+
 // methodUsesCodePart checks whether a method has add_output, add_raw_output,
 // add_data_output, or computeStateOutput/computeStateOutputHash calls
 // (recursively).
@@ -4224,12 +4301,21 @@ func lowerMethodWithPrivateMethodsAndOptions(method *ir.ANFMethod, properties []
 	// _codePart: full code script (locking script minus state) as ByteString
 	// _opPushTxSig: ECDSA signature for OP_PUSH_TX verification
 	// These are inserted at the base of the stack so they can be consumed later.
-	if methodUsesCheckPreimageRec(method.Body, privateMethods, map[string]bool{}) {
+	// _codePart is needed for continuation builders (add_output/add_raw_output)
+	// OR when the method reads variable-length (ByteString) mutable state — the
+	// deserialization needs it for the preimage-relative offset (issue #100).
+	varLenProps := map[string]bool{}
+	for _, p := range properties {
+		if !p.Readonly && p.Type == "ByteString" {
+			varLenProps[p.Name] = true
+		}
+	}
+	usesCheckPreimage := methodUsesCheckPreimageRec(method.Body, privateMethods, map[string]bool{})
+	usesCodePart := usesCheckPreimage &&
+		(methodUsesCodePart(method.Body) || methodReadsVarLenState(method.Body, varLenProps))
+	if usesCheckPreimage {
 		paramNames = append([]string{"_opPushTxSig"}, paramNames...)
-		// _codePart is needed when the method has add_output or add_raw_output
-		// (it provides the code script for continuation output construction),
-		// or when deserializing variable-length (ByteString) state fields.
-		if methodUsesCodePart(method.Body) {
+		if usesCodePart {
 			paramNames = append([]string{"_codePart"}, paramNames...)
 		}
 	}
@@ -4284,6 +4370,7 @@ func lowerMethodWithPrivateMethodsAndOptions(method *ir.ANFMethod, properties []
 		Name:          method.Name,
 		Ops:           ctx.ops,
 		MaxStackDepth: ctx.maxDepth,
+		UsesCodePart:  usesCodePart,
 	}, nil
 }
 

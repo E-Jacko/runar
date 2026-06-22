@@ -85,7 +85,7 @@ class ScriptSizeGuardTest {
         // Use fromUtxo() to simulate a reconnect with a poisoned (oversized)
         // locking script. Avoids needing to actually deploy first.
         RunarArtifact artifact = makeArtifact("51", "OversizedContract",
-            List.of(new RunarArtifact.ABIMethod("spend", List.of(), true, null)));
+            List.of(new RunarArtifact.ABIMethod("spend", List.of(), true, null, null)));
         UTXO poisoned = new UTXO("aa".repeat(32), 0, 50_000L, oversizedScriptHex());
         RunarContract contract = RunarContract.fromUtxo(artifact, poisoned);
 

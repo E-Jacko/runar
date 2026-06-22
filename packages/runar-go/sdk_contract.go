@@ -36,9 +36,9 @@ type RunarContract struct {
 	// hex strings (normalized in the setters). Read by the call-builder when
 	// assembling the unlocking script for methods that use extractPrevOutputScript
 	// / requireOutputP2PKH.
-	prevOutScripts        map[int]string
-	serialisedOutputs     string
-	serialisedOutputsSet  bool
+	prevOutScripts       map[int]string
+	serialisedOutputs    string
+	serialisedOutputsSet bool
 }
 
 // NewRunarContract creates a new contract instance from a compiled artifact
@@ -473,6 +473,14 @@ func (c *RunarContract) PrepareCall(
 			methodNeedsNewAmount = true
 		}
 	}
+	// Whether the unlocking script is prefixed with _codePart. New artifacts
+	// carry the authoritative UsesCodePart flag (true for continuation builders
+	// AND terminal var-length-state readers — issue #100). Older artifacts lack
+	// it; fall back to the legacy rule (codePart iff continuation).
+	methodUsesCodePart := methodNeedsChange
+	if method.UsesCodePart != nil {
+		methodUsesCodePart = *method.UsesCodePart
+	}
 	// Drop auto-injected continuation params AND intent-intrinsic witness
 	// params (`_prevOutScript_<i>`, `_serialisedOutputs`) from the
 	// user-facing arg count check. Witness values come from
@@ -619,7 +627,7 @@ func (c *RunarContract) PrepareCall(
 	if options != nil && len(options.TerminalOutputs) > 0 {
 		return c.prepareCallTerminal(
 			methodName, resolvedArgs, signer, options,
-			isStateful, parentStateful, needsOpPushTx, methodNeedsChange,
+			isStateful, parentStateful, needsOpPushTx, methodNeedsChange, methodUsesCodePart,
 			sigIndices, prevoutsIndices, preimageIndex,
 			methodSelectorHex, changePKHHex, contractUtxo, witnessHex,
 		)
@@ -718,7 +726,7 @@ func (c *RunarContract) PrepareCall(
 	// methods.
 	var unlockingScript string
 	if needsOpPushTx || isStateful {
-		unlockingScript = c.buildStatefulPrefix(strings.Repeat("00", 72), methodNeedsChange) +
+		unlockingScript = c.buildStatefulPrefix(strings.Repeat("00", 72), methodUsesCodePart) +
 			c.BuildUnlockingScript(methodName, resolvedArgs) + witnessHex
 	} else {
 		unlockingScript = c.BuildUnlockingScript(methodName, resolvedArgs) + witnessHex
@@ -764,7 +772,7 @@ func (c *RunarContract) PrepareCall(
 	// (witnessHex suffixed for sizing — buildStatefulUnlock builds the real scripts).
 	extraUnlockPlaceholders := make([]string, len(extraContractUtxos))
 	for i := range extraContractUtxos {
-		extraUnlockPlaceholders[i] = c.buildStatefulPrefix(strings.Repeat("00", 72), methodNeedsChange) +
+		extraUnlockPlaceholders[i] = c.buildStatefulPrefix(strings.Repeat("00", 72), methodUsesCodePart) +
 			c.BuildUnlockingScript(methodName, extraResolvedArgs[i]) + witnessHex
 	}
 
@@ -892,7 +900,7 @@ func (c *RunarContract) PrepareCall(
 			// the verifier consumes its witness inputs. See
 			// emitGroth16WAPreamble in compilers/go/codegen/stack.go.
 			unlockStr := groth16WAWitnessHex +
-				c.buildStatefulPrefix(opSigHexStr, methodNeedsChange) +
+				c.buildStatefulPrefix(opSigHexStr, methodUsesCodePart) +
 				argsHex +
 				changeHex +
 				newAmountHex +
@@ -1047,32 +1055,33 @@ func (c *RunarContract) PrepareCall(
 	}
 
 	return &PreparedCall{
-		Sighash:           sighash,
-		Preimage:          finalPreimage,
-		OpPushTxSig:       finalOpPushTxSig,
-		TxHex:             signedTx,
-		SigIndices:        sigIndices,
-		methodName:        methodName,
-		resolvedArgs:      resolvedArgs,
-		methodSelectorHex: methodSelectorHex,
-		isStateful:        isStateful,
-		parentStateful:    parentStateful,
-		isTerminal:        false,
-		needsOpPushTx:     needsOpPushTx,
-		methodNeedsChange: methodNeedsChange,
-		changePKHHex:      changePKHHex,
-		changeAmount:      changeAmount,
+		Sighash:              sighash,
+		Preimage:             finalPreimage,
+		OpPushTxSig:          finalOpPushTxSig,
+		TxHex:                signedTx,
+		SigIndices:           sigIndices,
+		methodName:           methodName,
+		resolvedArgs:         resolvedArgs,
+		methodSelectorHex:    methodSelectorHex,
+		isStateful:           isStateful,
+		parentStateful:       parentStateful,
+		isTerminal:           false,
+		needsOpPushTx:        needsOpPushTx,
+		methodNeedsChange:    methodNeedsChange,
+		methodUsesCodePart:   methodUsesCodePart,
+		changePKHHex:         changePKHHex,
+		changeAmount:         changeAmount,
 		methodNeedsNewAmount: methodNeedsNewAmount,
-		newAmount:         newSatoshis,
-		preimageIndex:     preimageIndex,
-		contractUtxo:      contractUtxo,
-		newLockingScript:  newLockingScript,
-		newSatoshis:       newSatoshis,
-		hasMultiOutput:    hasMultiOutput,
-		contractOutputs:   contractOutputs,
-		groth16WAWitnessHex: groth16WAWitnessHex,
-		intentWitnessHex:  witnessHex,
-		codeSepIdx:        codeSepIdx,
+		newAmount:            newSatoshis,
+		preimageIndex:        preimageIndex,
+		contractUtxo:         contractUtxo,
+		newLockingScript:     newLockingScript,
+		newSatoshis:          newSatoshis,
+		hasMultiOutput:       hasMultiOutput,
+		contractOutputs:      contractOutputs,
+		groth16WAWitnessHex:  groth16WAWitnessHex,
+		intentWitnessHex:     witnessHex,
+		codeSepIdx:           codeSepIdx,
 	}, nil
 }
 
@@ -1122,7 +1131,7 @@ func (c *RunarContract) FinalizeCall(
 		// regular method body executes. See emitGroth16WAPreamble in
 		// compilers/go/codegen/stack.go.
 		primaryUnlock = prepared.groth16WAWitnessHex +
-			c.buildStatefulPrefix(prepared.OpPushTxSig, prepared.methodNeedsChange) +
+			c.buildStatefulPrefix(prepared.OpPushTxSig, prepared.methodUsesCodePart) +
 			argsHex +
 			changeHex +
 			newAmountHex +
@@ -1754,6 +1763,7 @@ func (c *RunarContract) prepareCallTerminal(
 	parentStateful bool,
 	needsOpPushTx bool,
 	methodNeedsChange bool,
+	methodUsesCodePart bool,
 	sigIndices []int,
 	prevoutsIndices []int,
 	preimageIndex int,
@@ -1923,31 +1933,32 @@ func (c *RunarContract) prepareCallTerminal(
 	}
 
 	return &PreparedCall{
-		Sighash:           sighash,
-		Preimage:          finalPreimage,
-		OpPushTxSig:       finalOpPushTxSig,
-		TxHex:             termTx,
-		SigIndices:        sigIndices,
-		methodName:        methodName,
-		resolvedArgs:      resolvedArgs,
-		methodSelectorHex: methodSelectorHex,
-		isStateful:        isStateful,
-		parentStateful:    parentStateful,
-		isTerminal:        true,
-		needsOpPushTx:     needsOpPushTx,
-		methodNeedsChange: methodNeedsChange,
-		changePKHHex:      changePKHHex,
-		changeAmount:      0,
+		Sighash:              sighash,
+		Preimage:             finalPreimage,
+		OpPushTxSig:          finalOpPushTxSig,
+		TxHex:                termTx,
+		SigIndices:           sigIndices,
+		methodName:           methodName,
+		resolvedArgs:         resolvedArgs,
+		methodSelectorHex:    methodSelectorHex,
+		isStateful:           isStateful,
+		parentStateful:       parentStateful,
+		isTerminal:           true,
+		needsOpPushTx:        needsOpPushTx,
+		methodNeedsChange:    methodNeedsChange,
+		methodUsesCodePart:   methodUsesCodePart,
+		changePKHHex:         changePKHHex,
+		changeAmount:         0,
 		methodNeedsNewAmount: false,
-		newAmount:         0,
-		preimageIndex:     preimageIndex,
-		contractUtxo:      contractUtxo,
-		newLockingScript:  "",
-		newSatoshis:       0,
-		hasMultiOutput:    false,
-		contractOutputs:   nil,
-		intentWitnessHex:  witnessHex,
-		codeSepIdx:        termCodeSepIdx,
+		newAmount:            0,
+		preimageIndex:        preimageIndex,
+		contractUtxo:         contractUtxo,
+		newLockingScript:     "",
+		newSatoshis:          0,
+		hasMultiOutput:       false,
+		contractOutputs:      nil,
+		intentWitnessHex:     witnessHex,
+		codeSepIdx:           termCodeSepIdx,
 	}, nil
 }
 
@@ -2110,4 +2121,3 @@ func txidToChainHash(txid string) *chainhash.Hash {
 	h, _ := chainhash.NewHashFromHex(txid)
 	return h
 }
-

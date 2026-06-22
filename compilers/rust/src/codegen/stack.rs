@@ -85,6 +85,10 @@ pub struct StackMethod {
     /// Parallel to `ops`: optional source location for each stack operation.
     /// Used for generating source maps in the emit phase.
     pub source_locs: Vec<Option<crate::ir::SourceLocation>>,
+    /// True if the unlocking script is prefixed with `_codePart` — needed for
+    /// continuation builders OR terminal methods that read variable-length
+    /// (ByteString) state (issue #100). Propagated to ABIMethod.uses_code_part.
+    pub uses_code_part: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1792,15 +1796,19 @@ impl LoweringContext {
             }
         }
 
-        // Phase 3: single depth-balance check after ALL drops.
-        // Push placeholder only if one branch is still deeper than the other.
-        if then_ctx.sm.depth() > else_ctx.sm.depth() {
-            // When the then-branch reassigned a local variable (if-without-else),
-            // push a COPY of that variable in the else-branch instead of a generic
-            // placeholder.
-            let then_top_p3 = then_ctx.sm.peek_at_depth(0).to_string();
-            if else_bindings.is_empty() && !then_top_p3.is_empty() && else_ctx.sm.has(&then_top_p3) {
-                let var_depth = else_ctx.sm.find_depth(&then_top_p3).unwrap();
+        // Phase 3: depth-balance reconciliation after ALL drops.
+        //
+        // Compensate the FULL depth difference between the branches — NOT just a
+        // single item. A conditional write of N state fields leaves N result
+        // values on the then-branch, so the (empty) else-branch must preserve N
+        // old values. Issue #99 Bug 1: the previous single-shot check only
+        // balanced a 1-item difference, leaving N>=2 conditional writes
+        // imbalanced by (N-1) and the update branch unspendable.
+        while then_ctx.sm.depth() > else_ctx.sm.depth() {
+            let result_depth = then_ctx.sm.depth() - else_ctx.sm.depth() - 1;
+            let then_name = then_ctx.sm.peek_at_depth(result_depth).to_string();
+            if else_bindings.is_empty() && !then_name.is_empty() && else_ctx.sm.has(&then_name) {
+                let var_depth = else_ctx.sm.find_depth(&then_name).unwrap();
                 if var_depth == 0 {
                     else_ctx.emit_op(StackOp::Dup);
                 } else {
@@ -1809,14 +1817,30 @@ impl LoweringContext {
                     else_ctx.emit_op(StackOp::Pick { depth: var_depth });
                     else_ctx.sm.pop();
                 }
-                else_ctx.sm.push(&then_top_p3);
+                else_ctx.sm.push(&then_name);
             } else {
                 else_ctx.emit_op(StackOp::Push(PushValue::Bytes(Vec::new())));
                 else_ctx.sm.push("");
             }
-        } else if else_ctx.sm.depth() > then_ctx.sm.depth() {
+        }
+        while else_ctx.sm.depth() > then_ctx.sm.depth() {
             then_ctx.emit_op(StackOp::Push(PushValue::Bytes(Vec::new())));
             then_ctx.sm.push("");
+        }
+
+        // Layer B — branch-balance invariant (#99 Bug 1 guard). After
+        // reconciliation the two arms of an OP_IF/OP_ELSE MUST leave the stack
+        // at identical depth; otherwise the post-ENDIF code (generated against a
+        // single assumed depth) is only correct for the branch the spender does
+        // not take, producing a silently-unspendable script. The VM does not
+        // enforce branch balance, so this is the compiler's responsibility.
+        if then_ctx.sm.depth() != else_ctx.sm.depth() {
+            panic!(
+                "internal codegen error: conditional emitted stack-imbalanced branches (then depth {} != else depth {}); would produce an unspendable script (see GitHub issue #99); binding={:?}",
+                then_ctx.sm.depth(),
+                else_ctx.sm.depth(),
+                binding_name
+            );
         }
 
         let then_ops = then_ctx.ops;
@@ -1842,7 +1866,46 @@ impl LoweringContext {
         }
 
         // The if expression may produce a result value on top.
-        if then_ctx.sm.depth() > self.sm.depth() {
+        if else_bindings.is_empty()
+            && then_ctx.sm.depth() > self.sm.depth()
+            && then_ctx.sm.depth() - self.sm.depth() >= 2
+        {
+            // #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+            // values on top (new values if taken, preserved old values if
+            // skipped). Record the N results in their on-stack order, then
+            // physically remove the N stale old property values beneath them.
+            let result_count = then_ctx.sm.depth() - self.sm.depth();
+            for i in (0..result_count).rev() {
+                let mut name = then_ctx.sm.peek_at_depth(i).to_string();
+                if name.is_empty() {
+                    name = binding_name.to_string();
+                }
+                self.sm.push(&name);
+            }
+            let result_names: Vec<String> = (0..result_count)
+                .map(|i| self.sm.peek_at_depth(i).to_string())
+                .collect();
+            for name in &result_names {
+                if name.is_empty() {
+                    continue;
+                }
+                let mut d = result_count;
+                while d < self.sm.depth() {
+                    if self.sm.peek_at_depth(d) == name.as_str() {
+                        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(d as i128))));
+                        self.sm.push("");
+                        self.emit_op(StackOp::Roll { depth: d + 1 });
+                        self.sm.pop();
+                        let rolled = self.sm.remove_at_depth(d);
+                        self.sm.push(&rolled);
+                        self.emit_op(StackOp::Drop);
+                        self.sm.pop();
+                        break;
+                    }
+                    d += 1;
+                }
+            }
+        } else if then_ctx.sm.depth() > self.sm.depth() {
             let then_top = then_ctx.sm.peek_at_depth(0).to_string();
             let else_top = if else_ctx.sm.depth() > 0 {
                 else_ctx.sm.peek_at_depth(0).to_string()
@@ -4665,6 +4728,28 @@ fn method_uses_code_part(bindings: &[ANFBinding]) -> bool {
     })
 }
 
+/// Whether a method READS a mutable variable-length (ByteString) state field's
+/// value (via `load_prop`), recursing into branches and loops. Issue #100: such
+/// a terminal method needs `_codePart` for the preimage-relative state offset.
+/// A method that only reads readonly fields (baked into the locking script) or
+/// fixed-size mutable fields does NOT need `_codePart` — narrowing to the live
+/// var-length read avoids over-provisioning (e.g. MessageBoard.burn reads only
+/// the readonly owner and must keep its original terminal codegen).
+fn method_reads_var_len_state(
+    bindings: &[ANFBinding],
+    var_len_props: &std::collections::HashSet<String>,
+) -> bool {
+    bindings.iter().any(|b| match &b.value {
+        ANFValue::LoadProp { name } => var_len_props.contains(name),
+        ANFValue::If { then, else_branch, .. } => {
+            method_reads_var_len_state(then, var_len_props)
+                || method_reads_var_len_state(else_branch, var_len_props)
+        }
+        ANFValue::Loop { body, .. } => method_reads_var_len_state(body, var_len_props),
+        _ => false,
+    })
+}
+
 fn lower_method_with_private_methods(
     method: &ANFMethod,
     properties: &[ANFProperty],
@@ -4677,12 +4762,21 @@ fn lower_method_with_private_methods(
     // _codePart: full code script (locking script minus state) as ByteString
     // _opPushTxSig: ECDSA signature for OP_PUSH_TX verification
     // These are inserted at the base of the stack so they can be consumed later.
+    // _codePart is needed for continuation builders (add_output/add_raw_output)
+    // OR when the method reads a mutable variable-length (ByteString) state
+    // field — the deserialization needs it for the preimage-relative offset
+    // (issue #100).
+    let var_len_props: std::collections::HashSet<String> = properties
+        .iter()
+        .filter(|p| !p.readonly && p.prop_type == "ByteString")
+        .map(|p| p.name.clone())
+        .collect();
+    let uses_code_part = method_uses_check_preimage(&method.body, Some(private_methods))
+        && (method_uses_code_part(&method.body)
+            || method_reads_var_len_state(&method.body, &var_len_props));
     if method_uses_check_preimage(&method.body, Some(private_methods)) {
         param_names.insert(0, "_opPushTxSig".to_string());
-        // _codePart is needed when the method has add_output or add_raw_output
-        // (it provides the code script for continuation output construction),
-        // or when deserializing variable-length (ByteString) state fields.
-        if method_uses_code_part(&method.body) {
+        if uses_code_part {
             param_names.insert(0, "_codePart".to_string());
         }
     }
@@ -4718,6 +4812,7 @@ fn lower_method_with_private_methods(
         source_locs: ctx.source_locs,
         ops: ctx.ops,
         max_stack_depth: ctx.max_depth,
+        uses_code_part,
     })
 }
 

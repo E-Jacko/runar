@@ -11,6 +11,7 @@
 const std = @import("std");
 const types = @import("../ir/types.zig");
 const opcodes = @import("opcodes.zig");
+const stack_lower = @import("../passes/stack_lower.zig");
 const Opcode = opcodes.Opcode;
 
 // ============================================================================
@@ -620,6 +621,10 @@ pub fn emitArtifact(
             }
             try w.writeAll("],\"isPublic\":");
             try w.writeAll(if (method.is_public) "true" else "false");
+            // usesCodePart: unlocking script is prefixed with _codePart (#100).
+            if (stack_lower.methodUsesCodePartFull(stack_lower.methodBindings(method), anf_program.properties)) {
+                try w.writeAll(",\"usesCodePart\":true");
+            }
             try w.writeByte('}');
         }
     }

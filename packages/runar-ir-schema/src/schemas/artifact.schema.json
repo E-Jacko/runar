@@ -134,6 +134,10 @@
         "isTerminal": {
           "type": "boolean",
           "description": "True for stateful contract methods that don't mutate state (no continuation output)."
+        },
+        "usesCodePart": {
+          "type": "boolean",
+          "description": "True if the unlocking script is prefixed with _codePart (continuation builders or terminal var-length-state readers — issue #100)."
         }
       }
     },

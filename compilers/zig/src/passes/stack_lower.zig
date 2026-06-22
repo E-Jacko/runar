@@ -3894,27 +3894,31 @@ const LowerCtx = struct {
             try removeBranchValueAtDepth(&then_ctx, depth);
         }
 
-        if (then_ctx.stack.depth() > else_ctx.stack.depth()) {
-            const then_top = then_ctx.stack.peekAtDepth(0);
-            if (else_bindings.len == 0 and then_top != null) {
-                if (else_ctx.stack.findDepth(then_top.?)) |var_depth| {
-                    try duplicateBranchValueAtDepth(&else_ctx, var_depth, then_top);
-                } else {
-                    try else_ctx.emitPushData("");
-                    try else_ctx.stack.push(self.allocator, null);
-                    else_ctx.trackDepth();
-                }
+        // Phase 3: depth-balance reconciliation after ALL drops (issue #99 Bug 1).
+        // Compensate the FULL depth difference between the branches — NOT just a
+        // single item. A conditional write of N state fields leaves N result
+        // values on the then-branch, so the (empty) else-branch must preserve N
+        // old values. The previous single-shot check only balanced a 1-item
+        // difference, leaving N>=2 conditional writes imbalanced by (N-1).
+        while (then_ctx.stack.depth() > else_ctx.stack.depth()) {
+            const result_depth = then_ctx.stack.depth() - else_ctx.stack.depth() - 1;
+            const then_name = then_ctx.stack.peekAtDepth(result_depth);
+            if (else_bindings.len == 0 and then_name != null and else_ctx.stack.findDepth(then_name.?) != null) {
+                const var_depth = else_ctx.stack.findDepth(then_name.?).?;
+                try duplicateBranchValueAtDepth(&else_ctx, var_depth, then_name);
             } else {
                 try else_ctx.emitPushData("");
                 try else_ctx.stack.push(self.allocator, null);
                 else_ctx.trackDepth();
             }
-        } else if (else_ctx.stack.depth() > then_ctx.stack.depth()) {
+        }
+        while (else_ctx.stack.depth() > then_ctx.stack.depth()) {
             try then_ctx.emitPushData("");
             try then_ctx.stack.push(self.allocator, null);
             then_ctx.trackDepth();
         }
 
+        // Layer B — branch-balance invariant (#99 Bug 1 guard; pre-existing).
         if (then_ctx.stack.depth() != else_ctx.stack.depth()) {
             return LowerError.BranchStackMismatch;
         }
@@ -3950,7 +3954,31 @@ const LowerCtx = struct {
             }
         }
 
-        if (then_ctx.stack.depth() > self.stack.depth()) {
+        if (else_bindings.len == 0 and then_ctx.stack.depth() > self.stack.depth() and then_ctx.stack.depth() - self.stack.depth() >= 2) {
+            // #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+            // values on top; record them in their on-stack order, then remove
+            // the N stale old property values beneath them.
+            const result_count = then_ctx.stack.depth() - self.stack.depth();
+            var ri: usize = result_count;
+            while (ri > 0) {
+                ri -= 1;
+                const nm = then_ctx.stack.peekAtDepth(ri);
+                try self.stack.push(self.allocator, if (nm) |n| n else bind_name);
+            }
+            var rj: usize = 0;
+            while (rj < result_count) : (rj += 1) {
+                const name = self.stack.peekAtDepth(rj) orelse continue;
+                var d: usize = result_count;
+                while (d < self.stack.depth()) : (d += 1) {
+                    if (self.stack.peekAtDepth(d)) |nm2| {
+                        if (std.mem.eql(u8, nm2, name)) {
+                            try removeStalePropertyAtDepth(self, d);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (then_ctx.stack.depth() > self.stack.depth()) {
             const then_top = then_ctx.stack.peekAtDepth(0);
             const else_top = else_ctx.stack.peekAtDepth(0);
             var is_property = false;
@@ -4294,10 +4322,10 @@ fn isStateful(program: types.ANFProgram) bool {
     return program.parent_class == .stateful_smart_contract;
 }
 
-fn setupMethodStack(ctx: *LowerCtx, _: types.ANFProgram, method: types.ANFMethod) !void {
+fn setupMethodStack(ctx: *LowerCtx, program: types.ANFProgram, method: types.ANFMethod) !void {
     const bindings = methodBindings(method);
 
-    if (methodUsesCodePart(bindings)) {
+    if (methodUsesCodePartFull(bindings, program.properties)) {
         try ctx.stack.push(ctx.allocator, "_codePart");
         ctx.trackDepth();
     }
@@ -4318,7 +4346,7 @@ fn setupPropertyStack(ctx: *LowerCtx, program: types.ANFProgram) !void {
     _ = program;
 }
 
-fn methodBindings(method: types.ANFMethod) []const types.ANFBinding {
+pub fn methodBindings(method: types.ANFMethod) []const types.ANFBinding {
     return if (method.body.len > 0) method.body else method.bindings;
 }
 
@@ -4422,6 +4450,39 @@ fn methodUsesCodePart(bindings: []const types.ANFBinding) bool {
         }
     }
     return false;
+}
+
+/// Whether a method READS a mutable variable-length (ByteString) state field's
+/// value (via load_prop). Issue #100: such a terminal method needs _codePart for
+/// the preimage-relative state offset. Narrowed to the live var-length read so
+/// methods that only read readonly fields (baked into the locking script) or
+/// fixed-size fields keep their original terminal codegen.
+fn methodReadsVarLenState(bindings: []const types.ANFBinding, properties: []const types.ANFProperty) bool {
+    for (bindings) |binding| {
+        switch (binding.value) {
+            .load_prop => |lp| {
+                for (properties) |prop| {
+                    if (!prop.readonly and prop.type_info == .byte_string and std.mem.eql(u8, prop.name, lp.name)) return true;
+                }
+            },
+            .@"if" => |ie| {
+                if (methodReadsVarLenState(ie.then, properties) or methodReadsVarLenState(ie.@"else", properties)) return true;
+            },
+            .loop => |loop| {
+                if (methodReadsVarLenState(loop.body, properties)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Combined `_codePart` requirement (issue #100): continuation builders OR
+/// terminal methods that read a mutable variable-length state field. Gated on
+/// checkPreimage so the SDK side (which provisions _codePart) stays in sync.
+pub fn methodUsesCodePartFull(bindings: []const types.ANFBinding, properties: []const types.ANFProperty) bool {
+    return methodUsesCheckPreimage(bindings) and
+        (methodUsesCodePart(bindings) or methodReadsVarLenState(bindings, properties));
 }
 
 fn findPrivateMethod(methods: []const types.ANFMethod, name: []const u8) ?types.ANFMethod {

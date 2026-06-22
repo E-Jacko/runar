@@ -337,6 +337,11 @@ module Runar
 
         method_needs_change     = method.params.any? { |p| p.name == '_changePKH' }
         method_needs_new_amount = method.params.any? { |p| p.name == '_newAmount' }
+        # Whether the unlocking script is prefixed with _codePart. New artifacts
+        # carry the authoritative uses_code_part flag (true for continuation
+        # builders AND terminal var-length-state readers -- issue #100). Older
+        # artifacts lack it; fall back to the legacy rule (codePart iff change).
+        method_uses_code_part = method.uses_code_part.nil? ? method_needs_change : method.uses_code_part
 
         # Drop auto-injected continuation params AND intent-intrinsic witness
         # params (`_prevOutScript_<i>`, `_serialisedOutputs`) from the
@@ -435,7 +440,7 @@ module Runar
         if opts.terminal_outputs && !opts.terminal_outputs.empty?
           return prepare_terminal(
             method_name, resolved_args, signer, opts,
-            is_stateful, parent_stateful, needs_op_push_tx, method_needs_change,
+            is_stateful, parent_stateful, needs_op_push_tx, method_needs_change, method_uses_code_part,
             sig_indices, preimage_index,
             method_selector_hex, change_pkh_hex, contract_utxo, code_sep_idx,
             intent_witness_hex
@@ -509,7 +514,7 @@ module Runar
         # real ABI-correct unlock is rebuilt by build_stateful_unlock below
         # for stateful methods.
         unlocking_script = if needs_op_push_tx
-                             build_stateful_prefix('00' * 72, method_needs_change) +
+                             build_stateful_prefix('00' * 72, method_uses_code_part) +
                                build_unlocking_script(method_name, resolved_args) +
                                intent_witness_hex
                            else
@@ -521,7 +526,7 @@ module Runar
         # Witness hex suffixed for sizing — build_stateful_unlock builds the real scripts.
         extra_unlock_placeholders = extra_contract_utxos.each_with_index.map do |_, i|
           args_for_placeholder = resolved_per_input_args[i] || resolved_args
-          build_stateful_prefix('00' * 72, method_needs_change) +
+          build_stateful_prefix('00' * 72, method_uses_code_part) +
             build_unlocking_script(method_name, args_for_placeholder) +
             intent_witness_hex
         end
@@ -563,7 +568,8 @@ module Runar
             resolved_per_input_args: resolved_per_input_args,
             prevouts_indices: prevouts_indices,
             intent_witness_hex: intent_witness_hex,
-            locktime: opts.locktime
+            locktime: opts.locktime,
+            method_uses_code_part: method_uses_code_part
           )
 
         sighash = final_preimage.empty? ? '' : Digest::SHA256.hexdigest([final_preimage].pack('H*'))
@@ -577,7 +583,8 @@ module Runar
           has_multi_output: has_multi_output,
           contract_outputs: contract_outputs || [],
           intent_witness_hex: intent_witness_hex,
-          parent_stateful: parent_stateful
+          parent_stateful: parent_stateful,
+          method_uses_code_part: method_uses_code_part
         )
       end
       # rubocop:enable Metrics/AbcSize, Metrics/MethodLength, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
@@ -882,7 +889,7 @@ module Runar
       # rubocop:disable Metrics/AbcSize, Metrics/MethodLength, Metrics/CyclomaticComplexity, Metrics/ParameterLists
       def prepare_terminal(
         method_name, resolved_args, _signer, opts,
-        is_stateful, parent_stateful, needs_op_push_tx, method_needs_change,
+        is_stateful, parent_stateful, needs_op_push_tx, method_needs_change, method_uses_code_part,
         sig_indices, preimage_index,
         method_selector_hex, change_pkh_hex, contract_utxo, code_sep_idx,
         intent_witness_hex = ''
@@ -905,7 +912,7 @@ module Runar
         # Intent-witness hex is suffixed for sizing — the real ABI-correct
         # unlock is built by build_stateful_terminal_unlock below for stateful.
         term_unlock_script = if needs_op_push_tx
-                               build_stateful_prefix('00' * 72, false) +
+                               build_stateful_prefix('00' * 72, method_uses_code_part) +
                                  build_unlocking_script(method_name, resolved_args) +
                                  intent_witness_hex
                              else
@@ -953,7 +960,7 @@ module Runar
             if method_needs_change && !change_pkh_hex.empty?
               change_hex = State.encode_push_data(change_pkh_hex) + State.encode_script_int(0)
             end
-            unlock = build_stateful_prefix(op_sig, false) +
+            unlock = build_stateful_prefix(op_sig, method_uses_code_part) +
                      args_hex +
                      change_hex +
                      State.encode_push_data(preimage) +
@@ -1014,6 +1021,7 @@ module Runar
           is_terminal: true,
           needs_op_push_tx: needs_op_push_tx,
           method_needs_change: method_needs_change,
+          method_uses_code_part: method_uses_code_part,
           change_pkh_hex: change_pkh_hex,
           change_amount: 0,
           method_needs_new_amount: false,
@@ -1121,7 +1129,8 @@ module Runar
         resolved_per_input_args: [],
         prevouts_indices: [],
         intent_witness_hex: '',
-        locktime: nil
+        locktime: nil,
+        method_uses_code_part: nil
       )
         final_op_push_tx_sig = ''
         final_preimage       = ''
@@ -1140,7 +1149,8 @@ module Runar
               resolved_per_input_args: resolved_per_input_args,
               prevouts_indices: prevouts_indices,
               intent_witness_hex: intent_witness_hex,
-              locktime: locktime
+              locktime: locktime,
+              method_uses_code_part: method_uses_code_part
             )
 
           # Update resolved_args with final prevouts so finalize_call can rebuild
@@ -1176,7 +1186,8 @@ module Runar
         resolved_per_input_args: [],
         prevouts_indices: [],
         intent_witness_hex: '',
-        locktime: nil
+        locktime: nil,
+        method_uses_code_part: nil
       )
         pub_key     = signer.get_public_key
         p2pkh_start = 1 + extra_contract_utxos.length
@@ -1195,7 +1206,8 @@ module Runar
           change_pkh_hex, method_selector_hex, code_sep_idx,
           change_amount, new_satoshis,
           prevouts_indices: prevouts_indices,
-          intent_witness_hex: intent_witness_hex
+          intent_witness_hex: intent_witness_hex,
+          method_uses_code_part: method_uses_code_part
         )
 
         # First-pass unlocks for extra contract inputs.
@@ -1206,7 +1218,8 @@ module Runar
             method_name, method_needs_change, method_needs_new_amount,
             change_pkh_hex, method_selector_hex, code_sep_idx,
             change_amount, new_satoshis,
-            prevouts_indices: prevouts_indices
+            prevouts_indices: prevouts_indices,
+            method_uses_code_part: method_uses_code_part
           )
           unlock
         end
@@ -1235,7 +1248,8 @@ module Runar
           change_pkh_hex, method_selector_hex, code_sep_idx,
           change_amount, new_satoshis,
           prevouts_indices: prevouts_indices,
-          intent_witness_hex: intent_witness_hex
+          intent_witness_hex: intent_witness_hex,
+          method_uses_code_part: method_uses_code_part
         )
         signed_tx = SDK.insert_unlocking_script(signed_tx, 0, final_unlock)
 
@@ -1261,7 +1275,8 @@ module Runar
             method_name, method_needs_change, method_needs_new_amount,
             change_pkh_hex, method_selector_hex, code_sep_idx,
             change_amount, new_satoshis,
-            prevouts_indices: prevouts_indices
+            prevouts_indices: prevouts_indices,
+            method_uses_code_part: method_uses_code_part
           )
           signed_tx = SDK.insert_unlocking_script(signed_tx, i + 1, extra_unlock)
         end
@@ -1318,11 +1333,15 @@ module Runar
         has_multi_output: false,
         contract_outputs: [],
         intent_witness_hex: '',
-        parent_stateful: nil
+        parent_stateful: nil,
+        method_uses_code_part: nil
       )
         # parent_stateful gates the issue-#42/#44 terminal sighash subscript
         # trim; fall back to is_stateful when not passed (older callers).
         parent_stateful = is_stateful if parent_stateful.nil?
+        # Resolve the codePart-prefix flag (issue #100). Older callers omit it;
+        # fall back to the legacy rule (codePart iff change).
+        method_uses_code_part = method_needs_change if method_uses_code_part.nil?
         PreparedCall.new(
           sighash: sighash,
           preimage: final_preimage,
@@ -1337,6 +1356,7 @@ module Runar
           is_terminal: false,
           needs_op_push_tx: needs_op_push_tx,
           method_needs_change: method_needs_change,
+          method_uses_code_part: method_uses_code_part,
           change_pkh_hex: change_pkh_hex,
           change_amount: change_amount,
           method_needs_new_amount: method_needs_new_amount,
@@ -1370,7 +1390,7 @@ module Runar
 
           new_amount_hex = prepared.method_needs_new_amount ? State.encode_script_int(prepared.new_amount) : ''
 
-          build_stateful_prefix(prepared.op_push_tx_sig, prepared.method_needs_change) +
+          build_stateful_prefix(prepared.op_push_tx_sig, prepared.method_uses_code_part) +
             args_hex + change_hex + new_amount_hex +
             State.encode_push_data(prepared.preimage) +
             prepared.intent_witness_hex +
@@ -1683,7 +1703,8 @@ module Runar
                                 _method_name, method_needs_change, method_needs_new_amount,
                                 change_pkh_hex, method_selector_hex, code_sep_idx,
                                 change_amount, new_satoshis,
-                                prevouts_indices: [], intent_witness_hex: '')
+                                prevouts_indices: [], intent_witness_hex: '',
+                                method_uses_code_part: nil)
         op_sig, preimage = SDK.compute_op_push_tx(
           tx_hex, input_idx, contract_utxo.script, contract_utxo.satoshis, code_sep_idx
         )
@@ -1707,7 +1728,12 @@ module Runar
 
         new_amount_hex = method_needs_new_amount ? State.encode_script_int(new_satoshis) : ''
 
-        unlock = build_stateful_prefix(op_sig, method_needs_change) +
+        # Older artifacts lack uses_code_part — fall back to the legacy rule
+        # (codePart iff change). New artifacts carry the authoritative flag
+        # (true for terminal var-length-state readers — issue #100).
+        uses_code_part = method_uses_code_part.nil? ? method_needs_change : method_uses_code_part
+
+        unlock = build_stateful_prefix(op_sig, uses_code_part) +
                  args_hex + change_hex + new_amount_hex +
                  State.encode_push_data(preimage) +
                  intent_witness_hex +

@@ -45,6 +45,8 @@ type ABIMethod struct {
 	Params     []ABIParam `json:"params"`
 	IsPublic   bool       `json:"isPublic"`
 	IsTerminal *bool      `json:"isTerminal,omitempty"`
+	// UsesCodePart: unlocking script is prefixed with _codePart (issue #100).
+	UsesCodePart *bool `json:"usesCodePart,omitempty"`
 }
 
 // ABI describes the contract's public interface.
@@ -303,6 +305,16 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 			if !hasChange {
 				t := true
 				m.IsTerminal = &t
+			}
+		}
+		// Propagate the authoritative _codePart decision from stack-lowering
+		// into the ABI so the SDK supplies _codePart for terminal var-length
+		// reads (issue #100).
+		for i := range stackMethods {
+			if stackMethods[i].Name == method.Name && stackMethods[i].UsesCodePart {
+				u := true
+				m.UsesCodePart = &u
+				break
 			}
 		}
 		methods = append(methods, m)

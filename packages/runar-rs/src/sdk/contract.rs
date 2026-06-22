@@ -502,6 +502,11 @@ impl RunarContract {
         // _changePKH and _changeAmount). The SDK auto-computes these.
         let method_needs_change = method.params.iter().any(|p| p.name == "_changePKH");
         let method_needs_new_amount = method.params.iter().any(|p| p.name == "_newAmount");
+        // Whether the unlocking script is prefixed with `_codePart`. New
+        // artifacts carry the authoritative `uses_code_part` flag (true for
+        // continuation builders AND terminal var-length-state readers — issue
+        // #100). Older artifacts lack it; fall back to the legacy rule.
+        let method_uses_code_part = method.uses_code_part.unwrap_or(method_needs_change);
         // Drop auto-injected continuation params AND intent-intrinsic witness
         // params (`_prevOutScript_<i>`, `_serialisedOutputs`) from the
         // user-facing arg count check. Witness values come from
@@ -625,7 +630,7 @@ impl RunarContract {
             return self.prepare_call_terminal(
                 method_name, &mut resolved_args, signer,
                 options, terminal_outputs, &current_utxo,
-                is_stateful, parent_stateful, needs_op_push_tx, method_needs_change,
+                is_stateful, parent_stateful, needs_op_push_tx, method_needs_change, method_uses_code_part,
                 &sig_indices, &prevouts_indices, preimage_index,
                 &method_selector_hex, &change_pkh_hex, &witness_hex,
             );
@@ -643,7 +648,7 @@ impl RunarContract {
             // Prepend placeholder prefix (optionally _codePart + _opPushTxSig) before user args
             format!(
                 "{}{}{}",
-                self.build_stateful_prefix(&"00".repeat(72), method_needs_change),
+                self.build_stateful_prefix(&"00".repeat(72), method_uses_code_part),
                 self.build_unlocking_script(method_name, &resolved_args)?,
                 witness_hex,
             )
@@ -787,7 +792,7 @@ impl RunarContract {
                 .unwrap_or(&resolved_args);
             format!(
                 "{}{}{}",
-                self.build_stateful_prefix(&"00".repeat(72), method_needs_change),
+                self.build_stateful_prefix(&"00".repeat(72), method_uses_code_part),
                 self.build_unlocking_script(method_name, args_for_placeholder).unwrap_or_default(),
                 witness_hex,
             )
@@ -1109,6 +1114,7 @@ impl RunarContract {
             is_terminal: false,
             needs_op_push_tx,
             method_needs_change,
+            method_uses_code_part,
             change_pkh_hex,
             change_amount,
             method_needs_new_amount,
@@ -1160,7 +1166,7 @@ impl RunarContract {
             }
             format!(
                 "{}{}{}{}{}{}{}",
-                self.build_stateful_prefix(&prepared.op_push_tx_sig, prepared.method_needs_change),
+                self.build_stateful_prefix(&prepared.op_push_tx_sig, prepared.method_uses_code_part),
                 args_hex,
                 change_hex,
                 new_amount_hex,
@@ -1241,6 +1247,7 @@ impl RunarContract {
         parent_stateful: bool,
         needs_op_push_tx: bool,
         method_needs_change: bool,
+        method_uses_code_part: bool,
         sig_indices: &[usize],
         _prevouts_indices: &[usize],
         preimage_index: Option<usize>,
@@ -1402,6 +1409,7 @@ impl RunarContract {
             is_terminal: true,
             needs_op_push_tx,
             method_needs_change,
+            method_uses_code_part,
             change_pkh_hex: change_pkh_hex.to_string(),
             change_amount: 0,
             method_needs_new_amount: false,

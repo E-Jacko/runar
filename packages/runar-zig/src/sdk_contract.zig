@@ -361,6 +361,11 @@ pub const RunarContract = struct {
             if (std.mem.eql(u8, p.name, "_changePKH")) needs_change = true;
             if (std.mem.eql(u8, p.name, "_newAmount")) needs_new_amount = true;
         }
+        // Whether the unlocking script is prefixed with _codePart. New artifacts
+        // carry the authoritative usesCodePart flag (true for continuation
+        // builders AND terminal var-length-state readers — issue #100). Older
+        // artifacts lack it; fall back to the legacy rule (codePart iff change).
+        const method_uses_code_part = abi_method.uses_code_part orelse needs_change;
 
         // Drop auto-injected continuation params AND intent-intrinsic
         // witness params (`_prevOutScript_<i>`, `_serialisedOutputs`) from
@@ -896,7 +901,7 @@ pub const RunarContract = struct {
         const placeholder_unlock = try self.buildStatefulUnlockScript(
             "00" ** 72, // placeholder sig
             resolved_args,
-            needs_change,
+            method_uses_code_part,
             change_pkh_hex,
             0, // placeholder change amount
             needs_new_amount,
@@ -921,7 +926,7 @@ pub const RunarContract = struct {
             const u = try self.buildStatefulUnlockScript(
                 "00" ** 72,
                 earg,
-                needs_change,
+                method_uses_code_part,
                 change_pkh_hex,
                 0,
                 needs_new_amount,
@@ -1035,7 +1040,7 @@ pub const RunarContract = struct {
         const first_unlock = try self.buildStatefulUnlockScript(
             ptx_result.sig_hex,
             resolved_args,
-            needs_change,
+            method_uses_code_part,
             change_pkh_hex,
             change_amount,
             needs_new_amount,
@@ -1147,7 +1152,7 @@ pub const RunarContract = struct {
         const final_unlock = try self.buildStatefulUnlockScript(
             ptx_result.sig_hex,
             resolved_args,
-            needs_change,
+            method_uses_code_part,
             change_pkh_hex,
             change_amount,
             needs_new_amount,
@@ -1229,7 +1234,7 @@ pub const RunarContract = struct {
             const x_unlock = try self.buildStatefulUnlockScript(
                 xptx.sig_hex,
                 per_input_args,
-                needs_change,
+                method_uses_code_part,
                 change_pkh_hex,
                 change_amount,
                 needs_new_amount,
@@ -1549,6 +1554,8 @@ pub const RunarContract = struct {
             if (std.mem.eql(u8, p.name, "_changePKH")) needs_change = true;
             if (std.mem.eql(u8, p.name, "_newAmount")) needs_new_amount = true;
         }
+        // _codePart prefix decision (issue #100); see other call site.
+        const method_uses_code_part = abi_method.uses_code_part orelse needs_change;
 
         // ---- Filter user params ------------------------------------------
         // Drop auto-injected continuation params AND intent-intrinsic
@@ -1721,7 +1728,7 @@ pub const RunarContract = struct {
 
         const placeholder_unlock = try self.buildStatefulUnlockScript(
             "00" ** 72, resolved_args,
-            needs_change, change_pkh_opt, 0,
+            method_uses_code_part, change_pkh_opt, 0,
             needs_new_amount, new_satoshis,
             "00" ** 181, method_selector_opt,
             witness_hex,
@@ -1751,7 +1758,7 @@ pub const RunarContract = struct {
         {
             const first_unlock = try self.buildStatefulUnlockScript(
                 ptx_result.sig_hex, resolved_args,
-                needs_change, change_pkh_opt, change_amount,
+                method_uses_code_part, change_pkh_opt, change_amount,
                 needs_new_amount, new_satoshis,
                 ptx_result.preimage_hex, method_selector_opt,
                 witness_hex,
@@ -1789,7 +1796,7 @@ pub const RunarContract = struct {
         // into the tx so finalizeCall just splices Sig and broadcasts.
         const final_placeholder = try self.buildStatefulUnlockScript(
             ptx_result.sig_hex, resolved_args,
-            needs_change, change_pkh_opt, change_amount,
+            method_uses_code_part, change_pkh_opt, change_amount,
             needs_new_amount, new_satoshis,
             ptx_result.preimage_hex, method_selector_opt,
             witness_hex,
@@ -1850,6 +1857,7 @@ pub const RunarContract = struct {
             .preimage = preimage_owned,
             .method_selector = method_selector_buf,
             .needs_change = needs_change,
+            .method_uses_code_part = method_uses_code_part,
             .change_pkh = change_pkh_buf,
             .change_amount = change_amount,
             .needs_new_amount = needs_new_amount,
@@ -1925,7 +1933,7 @@ pub const RunarContract = struct {
             break :blk try self.buildStatefulUnlockScript(
                 prepared.op_push_tx_sig,
                 prepared.resolved_args,
-                prepared.needs_change,
+                prepared.method_uses_code_part,
                 change_pkh_opt,
                 prepared.change_amount,
                 prepared.needs_new_amount,

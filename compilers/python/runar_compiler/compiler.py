@@ -45,6 +45,8 @@ class ABIMethod:
     params: list[ABIParam] = field(default_factory=list)
     is_public: bool = False
     is_terminal: bool | None = None
+    # Unlocking script is prefixed with _codePart (issue #100).
+    uses_code_part: bool | None = None
 
 
 @dataclass
@@ -577,11 +579,21 @@ def _assemble_artifact(
             has_change = any(p.name == "_changePKH" for p in method.params)
             if not has_change:
                 is_terminal = True
+        # Propagate the authoritative _codePart decision from stack-lowering
+        # into the ABI so the SDK supplies _codePart for terminal var-length
+        # reads (issue #100).
+        uses_code_part: bool | None = None
+        if stack_methods:
+            for sm in stack_methods:
+                if getattr(sm, "name", None) == method.name and getattr(sm, "uses_code_part", False):
+                    uses_code_part = True
+                    break
         methods.append(ABIMethod(
             name=method.name,
             params=params,
             is_public=method.is_public,
             is_terminal=is_terminal,
+            uses_code_part=uses_code_part,
         ))
 
     cs_index = code_separator_index if code_separator_index >= 0 else None
@@ -667,6 +679,7 @@ def artifact_to_json(artifact: Artifact) -> str:
                     "params": [_abi_param_to_dict(p) for p in m.params],
                     "isPublic": m.is_public,
                     **({"isTerminal": m.is_terminal} if m.is_terminal is not None else {}),
+                    **({"usesCodePart": m.uses_code_part} if m.uses_code_part is not None else {}),
                 }
                 for m in artifact.abi.methods
             ],

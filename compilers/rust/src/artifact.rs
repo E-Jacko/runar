@@ -45,6 +45,9 @@ pub struct ABIMethod {
     pub is_public: bool,
     #[serde(rename = "isTerminal", skip_serializing_if = "Option::is_none")]
     pub is_terminal: Option<bool>,
+    /// Unlocking script is prefixed with `_codePart` (issue #100).
+    #[serde(rename = "usesCodePart", skip_serializing_if = "Option::is_none")]
+    pub uses_code_part: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +149,7 @@ pub fn assemble_artifact(
     include_anf: bool,
     source_mappings: Vec<SourceMapping>,
     raw_script_spans: Vec<RawScriptSpan>,
+    stack_methods: &[crate::codegen::stack::StackMethod],
 ) -> RunarArtifact {
     // Build constructor params from properties, excluding those with initializers
     // (properties with default values are not constructor parameters).
@@ -206,6 +210,17 @@ pub fn assemble_artifact(
             } else {
                 None
             };
+            // Propagate the authoritative `_codePart` decision from
+            // stack-lowering into the ABI so the SDK supplies `_codePart` for
+            // terminal var-length reads (issue #100).
+            let uses_code_part = if stack_methods
+                .iter()
+                .any(|sm| sm.name == m.name && sm.uses_code_part)
+            {
+                Some(true)
+            } else {
+                None
+            };
             ABIMethod {
                 name: m.name.clone(),
                 params: m
@@ -219,6 +234,7 @@ pub fn assemble_artifact(
                     .collect(),
                 is_public: m.is_public,
                 is_terminal,
+                uses_code_part,
             }
         })
         .collect();

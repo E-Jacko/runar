@@ -395,6 +395,8 @@ pub const ABIMethod = struct {
     params: []ABIParam = &.{},
     is_public: bool = false,
     is_terminal: ?bool = null,
+    /// Unlocking script is prefixed with _codePart (issue #100).
+    uses_code_part: ?bool = null,
 
     pub fn deinit(self: *ABIMethod, allocator: std.mem.Allocator) void {
         if (self.name.len > 0) allocator.free(self.name);
@@ -415,6 +417,9 @@ pub const ABIMethod = struct {
         }
         if (obj.get("isTerminal")) |v| {
             if (v == .bool) method.is_terminal = v.bool;
+        }
+        if (obj.get("usesCodePart")) |v| {
+            if (v == .bool) method.uses_code_part = v.bool;
         }
         if (obj.get("params")) |params_val| {
             if (params_val == .array) {
@@ -665,6 +670,8 @@ pub const PreparedCall = struct {
     method_selector: []u8 = &.{},
     /// True when the method's ABI declared a `_changePKH` parameter.
     needs_change: bool = false,
+    /// Unlocking script is prefixed with _codePart (issue #100).
+    method_uses_code_part: bool = false,
     /// Hex-encoded change-recipient PKH; null for terminal-stateful methods.
     change_pkh: []u8 = &.{},
     /// Change amount that was baked into the unlock script's
