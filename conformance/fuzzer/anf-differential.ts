@@ -662,16 +662,25 @@ async function initTierContext(): Promise<TierContext> {
   };
 }
 
-function runIrFile(tier: CompilerName, irFile: string, ctx: TierContext): string | null {
-  const fold = '--disable-constant-folding';
+function runIrFile(
+  tier: CompilerName,
+  irFile: string,
+  ctx: TierContext,
+  disableConstantFolding: boolean,
+): string | null {
+  // fold-OFF: pass `--disable-constant-folding`. fold-ON: omit it so each
+  // native tier runs its default (folding-enabled) pipeline. The flag is
+  // spliced into argv only when set so the empty case doesn't leave a
+  // stray `''` arg.
+  const foldArgs = disableConstantFolding ? ['--disable-constant-folding'] : [];
   if (tier === 'go') {
     if (!ctx.goBin) return null;
-    const r = runProc(ctx.goBin, ['--ir', irFile, '--hex', fold]);
+    const r = runProc(ctx.goBin, ['--ir', irFile, '--hex', ...foldArgs]);
     return r.code === 0 ? r.stdout.trim().toLowerCase() : null;
   }
   if (tier === 'rust') {
     if (!ctx.rustBin) return null;
-    const r = runProc(ctx.rustBin, ['--ir', irFile, '--hex', fold]);
+    const r = runProc(ctx.rustBin, ['--ir', irFile, '--hex', ...foldArgs]);
     return r.code === 0 ? r.stdout.trim().toLowerCase() : null;
   }
   if (tier === 'zig') {
@@ -680,34 +689,38 @@ function runIrFile(tier: CompilerName, irFile: string, ctx: TierContext): string
     // dispatches by file extension under `--source` (`.json` →
     // ANF-IR consumer mode). Filename matters, so write to a `.json`
     // path. We re-use the same canonical IR bytes from `irFile`.
-    const r = runProc(ctx.zigBin, ['--source', irFile, '--hex', fold]);
+    const r = runProc(ctx.zigBin, ['--source', irFile, '--hex', ...foldArgs]);
     return r.code === 0 ? r.stdout.trim().toLowerCase() : null;
   }
   if (tier === 'python') {
     if (!ctx.pythonAvail) return null;
-    const r = runProc('python3', ['-m', 'runar_compiler', '--ir', irFile, '--hex', fold], {
+    const r = runProc('python3', ['-m', 'runar_compiler', '--ir', irFile, '--hex', ...foldArgs], {
       cwd: resolve(ROOT, 'compilers/python'),
     });
     return r.code === 0 ? r.stdout.trim().toLowerCase() : null;
   }
   if (tier === 'ruby') {
     if (!ctx.rubyBin) return null;
-    const r = runProc('ruby', [ctx.rubyBin, '--ir', irFile, '--hex', fold]);
+    const r = runProc('ruby', [ctx.rubyBin, '--ir', irFile, '--hex', ...foldArgs]);
     return r.code === 0 ? r.stdout.trim().toLowerCase() : null;
   }
   if (tier === 'java') {
     if (!ctx.javaJar) return null;
-    const r = runProc('java', ['-jar', ctx.javaJar, '--ir', irFile, '--hex', fold]);
+    const r = runProc('java', ['-jar', ctx.javaJar, '--ir', irFile, '--hex', ...foldArgs]);
     return r.code === 0 ? r.stdout.trim().toLowerCase() : null;
   }
   // 'ts'
   return null;
 }
 
-function runTsInProcess(program: AnfProgram, ctx: TierContext): string | null {
+function runTsInProcess(
+  program: AnfProgram,
+  ctx: TierContext,
+  disableConstantFolding: boolean,
+): string | null {
   if (!ctx.tsCompile) return null;
   try {
-    const r = ctx.tsCompile(program, { disableConstantFolding: true });
+    const r = ctx.tsCompile(program, { disableConstantFolding });
     return r.scriptHex ? r.scriptHex.toLowerCase() : null;
   } catch (e) {
     if (process.env.FUZZ_DEBUG) console.error('ts-compile throw:', (e as Error).message);
@@ -762,6 +775,15 @@ export interface AnfDifferentialOptions {
   findingsDir?: string;
   /** Wall-clock budget in ms; harness returns early once exceeded. */
   timeBudgetMs?: number;
+  /**
+   * Run every tier with constant-folding DISABLED (fold-OFF). Default
+   * `true` — preserves the harness's original behavior of matching the
+   * checked-in fold-OFF goldens. Set `false` to exercise the fold-ON
+   * cross-tier path: native tiers omit `--disable-constant-folding` and
+   * the TS in-process path passes `disableConstantFolding: false`. Either
+   * mode must produce byte-identical hex across every available tier.
+   */
+  disableConstantFolding?: boolean;
   /** Verbose per-program log. */
   verbose?: boolean;
   /** Generator knobs. */
@@ -782,6 +804,9 @@ export async function runAnfDifferential(
   opts: AnfDifferentialOptions,
 ): Promise<AnfDifferentialReport> {
   const tiers = opts.tiers ?? ALL_TIERS;
+  // Default fold-OFF (matches the checked-in goldens). fold-ON is opt-in
+  // via `disableConstantFolding: false`.
+  const disableConstantFolding = opts.disableConstantFolding ?? true;
   const findingsDir = opts.findingsDir ?? join(__dirname, '..', 'fuzz-findings-anf');
   const tmpDir = join(__dirname, '..', '.tmp', 'fuzz-anf');
   if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
@@ -855,9 +880,9 @@ export async function runAnfDifferential(
     for (const tier of tiers) {
       let hex: string | null;
       if (tier === 'ts') {
-        hex = runTsInProcess(program, ctx);
+        hex = runTsInProcess(program, ctx, disableConstantFolding);
       } else {
-        hex = runIrFile(tier, irFile, ctx);
+        hex = runIrFile(tier, irFile, ctx, disableConstantFolding);
       }
 
       if (hex === null) {

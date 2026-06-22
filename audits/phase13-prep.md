@@ -307,20 +307,30 @@ before the engagement begins.
   - `conformance/sdk-envelope/fixtures.json` — single TS-signed
     envelope replayed against every tier's `verifyEnvelope`, plus a
     known-bad envelope per `VerifyEnvelopeReason`.
-- **Residual risk:** See the **5 documented canonical-JSON
-  divergences** in `audits/canonical-json-rfc8785-parity.md` §2 (D1
-  Zig UTF-16 key sort, D2 Zig string-escape bytewise loop, D3 Zig
-  duplicate-key emission, D5 five-tier float formatter divergence, D6
-  lone-surrogate handling). **D4 (Ruby falsy-rewrite) is fixed in the
-  current working tree.** **D1 is NOT fixed** — `utf16Less` at
-  `packages/runar-zig/src/sdk_envelope.zig:252` is still a
-  byte-comparison fast path with a comment admitting the scope. The
-  audit must validate whether today's envelope payload schemas avoid
-  all 5 documented divergence triggers; the wire protocol's current
-  fields (`kind`, `n`, `nonce`, `expiresAt`) are all ASCII and
-  integer-valued, so the divergences are latent until schema
-  expansion. **Recommend: ship at least D1 + D3 fixes before
-  engagement, or explicitly scope the audit to today's schemas.**
+- **Residual risk:** The canonical-JSON divergences catalogued in
+  `audits/canonical-json-rfc8785-parity.md` (D1 Zig UTF-16 key sort,
+  D3 Zig duplicate-key emission, D5 cross-tier float formatter, D6
+  lone-surrogate handling — plus D4 Ruby falsy-rewrite) are **all
+  RESOLVED in the current working tree.** **D1 is fixed** — Zig now
+  transcodes each key to UTF-16LE (`std.unicode.utf8ToUtf16LeAlloc`)
+  and sorts via `utf16Less` (code-unit order) at
+  `packages/runar-zig/src/sdk_envelope.zig:81-96, 279-285`. **D3 is
+  fixed** — duplicate keys are rejected with `error.DuplicateObjectKey`
+  (post-sort adjacency check, `sdk_envelope.zig:97-105`). **D5 is
+  fixed** — every tier emits the spec ECMA-262 Number::toString form
+  via a `*Ecma262Double` formatter (Go `appendEcma262Double`, Rust
+  `format_ecma262_double`, Python `_format_double`, Zig
+  `appendEcma262Double`, Ruby `format_ecma262_double`, Java
+  `formatEcma262Double`; TS native). **D6 is fixed** — lone surrogates
+  are rejected by TS (`packages/runar-ir-schema/src/canonical-json.ts`)
+  and the six SDKs (Go/Python/Zig/Ruby/Java raise; Rust cannot
+  represent one in `&str`). The remaining exposure is **latent**: the
+  wire protocol's current fields (`kind`, `n`, `nonce`, `expiresAt`)
+  are all ASCII and integer-valued, so none of the divergence triggers
+  can arise on today's schemas — and the fixes mean they would not
+  diverge even if the schema expanded. The conformance fixture
+  `conformance/sdk-envelope/fixtures.json` now gates the float form
+  (v20/v21) and lone-surrogate rejection (v22) across all tiers.
 
 ---
 
@@ -393,20 +403,38 @@ wrapping an upstream BSV SDK interpreter. Zig / Ruby / Java do **not**
 ship a Script VM (no canonical upstream interpreter). Java compensates
 with `ContractSimulator`. Documented in `CLAUDE.md`. Out of scope.
 
-**Canonical-JSON known divergences (`audits/canonical-json-rfc8785-parity.md`):**
-- **D1 BLOCKING:** Zig key sort is byte-wise, not UTF-16 code-unit
-  (not yet fixed in working tree — see §2.6 R / verified at
-  `packages/runar-zig/src/sdk_envelope.zig:252`).
-- **D2 HIGH:** Zig string escape walks bytes, not codepoints (not
-  fixed — `appendJsonString` at same file).
-- **D3 HIGH:** Zig `Value.Object` is a slice; duplicate keys are
-  emitted, not deduped (not fixed).
+**Canonical-JSON divergences (`audits/canonical-json-rfc8785-parity.md`)
+— D1/D3/D4/D5/D6 all RESOLVED in the current working tree:**
+- **D1 RESOLVED:** Zig key sort is now UTF-16 code-unit order — keys
+  are transcoded with `std.unicode.utf8ToUtf16LeAlloc` and compared by
+  `utf16Less` at `packages/runar-zig/src/sdk_envelope.zig:81-96,
+  279-285`.
+- **D2 HIGH:** Zig string escape walks bytes, not codepoints
+  (`appendJsonString`, same file). Out of scope for this packet's
+  D1/D3/D5/D6 reconciliation; the byte walk now validates UTF-8
+  well-formedness and rejects the surrogate range, so it is no longer
+  the lone-surrogate vector (see D6), but the broader codepoint-escape
+  framing is tracked separately.
+- **D3 RESOLVED:** Zig rejects duplicate object keys with
+  `error.DuplicateObjectKey` via a post-sort adjacency check
+  (`sdk_envelope.zig:97-105`).
 - **D4 MEDIUM:** Ruby `value[k] || value[k.to_sym]` falsy-rewrite.
-  **FIXED** in current working tree (Ruby `envelope.rb:67-76` now
-  uses `value.key?(k) ? value[k] : (value.key?(k.to_sym) ? value[k.to_sym] : raise)`).
-- **D5 MEDIUM:** 6 tiers use non-ES float formatters (not fixed).
-- **D6 LOW:** Lone-surrogate handling undefined across tiers (Ruby
-  fixed — `envelope.rb:115-122` now raises; other tiers not fixed).
+  **FIXED** in current working tree (Ruby `envelope.rb` now uses an
+  explicit `key?` presence check, not the falsy-`||` fallthrough).
+- **D5 RESOLVED:** every tier emits the spec ECMA-262 Number::toString
+  float form via a `*Ecma262Double` formatter (Go `appendEcma262Double`,
+  Rust `format_ecma262_double`, Python `_format_double`, Zig
+  `appendEcma262Double`, Ruby `format_ecma262_double`, Java
+  `formatEcma262Double`; TS native). Gated by fixture vectors v20
+  (`1e+21`) and v21 (`1e-300`).
+- **D6 RESOLVED:** lone-surrogate input is rejected by all tiers — TS
+  (`packages/runar-ir-schema/src/canonical-json.ts`), Go
+  (`sdk_envelope.go` WTF-8 0xED,0xA0..0xBF detection), Python
+  (`envelope.py` 0xD800..0xDFFF check), Zig (`sdk_envelope.zig:159-161`
+  `error.LoneSurrogate`), Ruby (`envelope.rb` U+D800..U+DFFF raise),
+  Java (`Envelope.java` high/low-surrogate check); Rust cannot
+  represent a lone surrogate in `&str`. Gated by fixture vector v22 and
+  the Go interop test `packages/runar-go/sdk_envelope_interop_test.go`.
 
 All other Phase 13 / 22-task deliverables produce parity-required
 output: zero deliberate divergences in the intrinsics, size guards,
@@ -496,16 +524,17 @@ schema; SDK boundary covered by future audit."
 | 5 | Dep audit clean | ✓ workflow shipped | `.github/workflows/dependency-audit.yml`; per-tier scans (govulncheck, cargo-audit, pip-audit, bundler-audit, gradle dependency-check, pnpm audit) |
 | 6 | Internal review completed | ✓ this packet IS that | `audits/phase13-prep.md` |
 | 7 | **SDK-side wiring for `_prevOutScript_*` / `_serialisedOutputs`** | **✗ NOT YET — see §2.4 R-6** | None of 7 SDKs filter or wire these params |
-| 8 | Canonical-JSON D1 (Zig UTF-16 sort) fix landed | **✗ NOT YET** | `packages/runar-zig/src/sdk_envelope.zig:252` still byte-wise |
-| 9 | Canonical-JSON D2 (Zig string escape) fix landed | **✗ NOT YET** | same file |
-| 10 | Canonical-JSON D3 (Zig duplicate-key dedup) fix landed | **✗ NOT YET** | same file |
-| 11 | Canonical-JSON D5 (six-tier float formatter parity) | **✗ NOT YET** | All 6 non-TS tiers; see `audits/canonical-json-rfc8785-parity.md` |
-| 12 | Canonical-JSON D4 (Ruby falsy-rewrite) fix landed | ✓ shipped | `packages/runar-rb/lib/runar/sdk/envelope.rb:67-76` |
-| 13 | External audit booked | (user action) | n/a |
+| 8 | Canonical-JSON D1 (Zig UTF-16 sort) fix landed | ✓ shipped | `packages/runar-zig/src/sdk_envelope.zig:81-96, 279-285` (UTF-16LE transcode + `utf16Less`) |
+| 9 | Canonical-JSON D2 (Zig string escape) fix landed | **✗ NOT YET** | `appendJsonString` same file (out of scope for this reconciliation; now validates UTF-8 + rejects surrogate range) |
+| 10 | Canonical-JSON D3 (Zig duplicate-key dedup) fix landed | ✓ shipped | `packages/runar-zig/src/sdk_envelope.zig:97-105` (`error.DuplicateObjectKey`) |
+| 11 | Canonical-JSON D5 (cross-tier float formatter parity) | ✓ shipped | All 7 tiers via `*Ecma262Double` formatters; gated by fixture v20/v21; see `audits/canonical-json-rfc8785-parity.md` |
+| 12 | Canonical-JSON D4 (Ruby falsy-rewrite) fix landed | ✓ shipped | `packages/runar-rb/lib/runar/sdk/envelope.rb` (explicit `key?` presence check) |
+| 13 | Canonical-JSON D6 (lone-surrogate rejection) fix landed | ✓ shipped | TS `canonical-json.ts` + 6 SDKs; gated by fixture v22 + Go interop test |
+| 14 | External audit booked | (user action) | n/a |
 
-**Recommendation:** Land items 7 + 8 + 10 (the three BLOCKING / HIGH-
-severity gaps where the on-chain code paths are sound but the SDK or
-cross-tier surface is not) before engagement. D2 + D5 + D6 + D9 can be
-explicit "known divergences, audit-scoped to today's payload schemas"
-if the timeline pressure to engage is high — current envelope schemas
-(ASCII keys, integer values only) avoid all 5 latent divergences.
+**Recommendation:** Land item 7 (`_prevOutScript_*` / `_serialisedOutputs`
+SDK wiring) before engagement — it is the one remaining BLOCKING gap.
+The canonical-JSON divergences D1/D3/D5/D6 are now all RESOLVED in code
+(items 8/10/11/13) and additionally latent on today's wire schema
+(ASCII keys, integer/bool/ASCII-string values only). D2 remains an
+open "known divergence" but is not reachable on the current schema.

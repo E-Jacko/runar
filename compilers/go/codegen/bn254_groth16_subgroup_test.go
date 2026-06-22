@@ -430,44 +430,37 @@ func TestGroth16WA_G2Subgroup_RejectsBadGradients(t *testing.T) {
 }
 
 // TestGroth16WA_G2Subgroup_RejectsOutOfSubgroup: construct an on-curve
-// point that is NOT in the prime-order subgroup (using the gnark
-// GeneratePointNotInG2 helper, which seeds a random Fp² then hashes to
-// the twist curve and deliberately subtracts the r-torsion component so
-// the residual lies in the cofactor subgroup). The script must abort.
+// point that is NOT in the prime-order subgroup deterministically via
+// gnark's MapToCurve2 (Shallue–van de Woestijne), whose output is not
+// cofactor-cleared and therefore lands off the r-torsion. The script
+// must abort. This is a security-load-bearing negative vector, so the
+// off-subgroup point is asserted (t.Fatalf), never skipped.
 //
 // The witness gradients are computed as though the scalar-mul would
 // succeed: we follow the double-and-add chain starting from the off-
 // subgroup point. Either (a) the chain hits a 2-torsion / x-collision
-// step and the gradient inversion fails off-chain (testing harness
-// reports that case via t.Skip), or (b) the chain completes but the
-// final [6·x²]·P is NOT equal to ψ(P), so the OP_EQUALVERIFY at the
-// end of emitWAG2SubgroupCheck aborts the script.
+// step and the gradient inversion fails off-chain (the lenient
+// tryComputeSubgroupGradients reports !ok and we substitute zeros), or
+// (b) the chain completes but the final [6·x²]·P is NOT equal to ψ(P),
+// so the OP_EQUALVERIFY at the end of emitWAG2SubgroupCheck aborts the
+// script. Both branches reject.
 func TestGroth16WA_G2Subgroup_RejectsOutOfSubgroup(t *testing.T) {
-	// Construct a twist-curve point that is NOT in G2 by sweeping
-	// seeds through gnark's MapToCurve2 (Shallue–van de Woestijne). The
-	// map produces a point on E'(Fp²) with no guarantee of landing in
-	// the prime-order subgroup; the BN254 twist cofactor is
-	// 2p − n ≈ 2^{255}, so a random seed almost always lands OFF the
-	// r-torsion. Loop over seeds until we find one outside G2.
-	var aff bn254.G2Affine
-	found := false
-	for seedI := uint64(1); seedI < 32; seedI++ {
-		var seed bn254.E2
-		seed.A0.SetUint64(seedI)
-		seed.A1.SetUint64(seedI * 3)
-		cand := bn254.MapToCurve2(&seed)
-		if !cand.IsOnCurve() {
-			continue
-		}
-		if cand.IsInSubGroup() {
-			continue
-		}
-		aff = cand
-		found = true
-		break
+	// Construct a twist-curve point that is NOT in G2 deterministically
+	// via gnark's MapToCurve2 (Shallue–van de Woestijne). The map produces
+	// a point on E'(Fp²) WITHOUT cofactor clearing, so its output is not in
+	// the prime-order subgroup; the BN254 twist cofactor is 2p − n ≈ 2^{255},
+	// so the SvdW output lands OFF the r-torsion. A fixed seed (A0=1, A1=3)
+	// is deterministic — assert (not skip) that it is on-curve and
+	// off-subgroup so this negative vector can never silently disappear.
+	var seed bn254.E2
+	seed.A0.SetUint64(1)
+	seed.A1.SetUint64(3)
+	aff := bn254.MapToCurve2(&seed)
+	if !aff.IsOnCurve() {
+		t.Fatalf("fixed MapToCurve2 seed (1,3) is not on the twist curve")
 	}
-	if !found {
-		t.Skip("could not find an off-subgroup twist point via MapToCurve2 in the seed range; negative vector unavailable")
+	if aff.IsInSubGroup() {
+		t.Fatalf("fixed MapToCurve2 seed (1,3) landed IN G2; pick a different fixed seed")
 	}
 
 	x0, x1 := bigFromE2(aff.X)

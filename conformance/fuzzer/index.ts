@@ -65,6 +65,12 @@ interface FuzzerCLIOptions {
   anf: boolean;
   /** Wall-clock budget in ms (anf mode only). */
   timeBudgetMs?: number;
+  /**
+   * ANF mode only. Run every tier with constant-folding ON (omit
+   * `--disable-constant-folding`). Default off → fold-OFF, matching the
+   * checked-in goldens.
+   */
+  foldOn: boolean;
 }
 
 function parseArgs(argv: string[]): FuzzerCLIOptions {
@@ -86,6 +92,7 @@ function parseArgs(argv: string[]): FuzzerCLIOptions {
     renderStrategy: 'ts',
     stateful: false,
     anf: false,
+    foldOn: false,
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -134,6 +141,9 @@ function parseArgs(argv: string[]): FuzzerCLIOptions {
         break;
       case '--anf':
         opts.anf = true;
+        break;
+      case '--fold-on':
+        opts.foldOn = true;
         break;
       case '--time-budget-ms':
         opts.timeBudgetMs = parseInt(argv[++i] ?? '0', 10);
@@ -186,6 +196,10 @@ Options:
                          tier's --ir --hex pipeline produces byte-identical
                          Bitcoin Script. Skips frontends entirely.
   --time-budget-ms <n>   ANF mode only. Early-stop once wall-clock exceeded.
+  --fold-on              ANF mode only. Run every tier with constant-folding
+                         ENABLED (omit --disable-constant-folding). Default is
+                         fold-OFF, matching the checked-in goldens. Either mode
+                         must produce byte-identical hex across all tiers.
   --help, -h             Show this help message
 
 Examples:
@@ -234,6 +248,7 @@ async function main(): Promise<void> {
   }
   if (opts.anf) {
     console.log('  Generator: ANF (Item 7 — direct ANF IR, all 7 tiers via --ir --hex)');
+    console.log(`  Folding: ${opts.foldOn ? 'ON (fold-on)' : 'OFF (--disable-constant-folding)'}`);
     if (opts.timeBudgetMs !== undefined) {
       console.log(`  Budget: ${opts.timeBudgetMs}ms`);
     }
@@ -255,6 +270,7 @@ async function main(): Promise<void> {
       verbose: opts.verbose,
       findingsDir: opts.findingsDir,
       timeBudgetMs: opts.timeBudgetMs,
+      disableConstantFolding: !opts.foldOn,
     });
     console.log('');
     console.log(`ANF differential fuzzing complete:`);

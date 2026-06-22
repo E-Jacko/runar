@@ -778,10 +778,32 @@ jobs:
       - name: Check TCB drift
         working-directory: runar-verification
         run: ./scripts/check-tcb-drift.sh
-      - name: Verify all 56 fixtures parse + satisfy WF
+      - name: Verify all discovered fixtures parse + satisfy WF
         working-directory: runar-verification
-        run: lake env ./.lake/build/bin/goldenLoad
-      - name: Verify all 56 fixtures round-trip through ANF JSON
+        run: lake env ./.lake/build/bin/goldenLoad | tee /tmp/goldenload.out
+      - name: Assert README discovered-count matches goldenLoad runtime count
+        working-directory: runar-verification
+        # DOC-003 drift guard: goldenLoad walks conformance/tests with readDir
+        # (no hardcoded allowlist) and prints "found N expected-ir.json files".
+        # The README status table is the only place the count is written by
+        # hand, so it silently goes stale when fixtures are added. This step
+        # reuses the goldenLoad output from the previous step (no extra Lean
+        # build) and fails if the README's "discovered" literal != runtime N.
+        run: |
+          set -o pipefail
+          found=$(grep -oE 'found [0-9]+ expected-ir.json files' /tmp/goldenload.out | grep -oE '[0-9]+' | head -n1)
+          if [ -z "$found" ]; then
+            echo "FAIL: could not parse 'found N' from goldenLoad output"; exit 1
+          fi
+          # Extract N from the README row: "| Conformance fixtures discovered ... | N/N (...) |"
+          readme=$(grep -E 'Conformance fixtures discovered' README.md | grep -oE '[0-9]+/[0-9]+' | head -n1 | cut -d/ -f1)
+          echo "goldenLoad found=$found  README discovered=$readme"
+          if [ "$found" != "$readme" ]; then
+            echo "FAIL: README 'Conformance fixtures discovered' ($readme) != goldenLoad runtime count ($found)."
+            echo "       Update runar-verification/README.md status table to $found/$found."
+            exit 1
+          fi
+      - name: Verify all discovered fixtures round-trip through ANF JSON
         working-directory: runar-verification
         run: lake env ./.lake/build/bin/roundtrip
       - name: Verify pipelineConformance (2-tier classifier)
@@ -792,7 +814,8 @@ jobs:
         # (DEFERRED-parse-failure, DEFERRED-not-well-formed); soft buckets
         # (DEFERRED-compile-safe-error, DEFERRED-no-public-method) are
         # reported but do not fail the gate. Current expected:
-        # VERIFIED-modulo-codegen-axioms = 56/56, 0 hard failures.
+        # VERIFIED-modulo-codegen-axioms = 63/63 (discovered dynamically),
+        # 0 hard failures.
         run: ./runar-verification/scripts/run-pipeline-conformance.sh | tee /tmp/pconf.out
       - name: Verify byte-exact regression gate (34/49 live fixtures)
         id: byte-exact-gate

@@ -42,7 +42,7 @@ RSpec.describe 'Issue #100 — terminal var-len state read gets _codePart' do
 
   # Parse input[0]'s unlocking-script hex out of a raw transaction hex.
   def input0_unlock(tx_hex)
-    i = 8 # skip 4-byte version
+    i = 8 # advance past the 4-byte version
     i += 2 # input count varint (single input)
     i += 64 + 8 # txid (32) + vout (4)
     slen = tx_hex[i, 2].to_i(16)

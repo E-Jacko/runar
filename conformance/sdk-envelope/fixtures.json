@@ -140,7 +140,7 @@
     {
       "_vector_id": "v20-float-1e21-scientific",
       "_audit_ref": "audits/canonical-json-rfc8785-parity.md §3 rec 5 (D5)",
-      "_notes": "Float at the ECMA-262 1e21 boundary MUST emit `1e+21`. Known divergences (audit D5): Ruby emits `1.0e+21`, Java emits `1.0E21`, Zig emits `{e}`-format. Gates the float-formatter family.",
+      "_notes": "Float at the ECMA-262 1e21 boundary MUST emit `1e+21`. The D5 divergence is fixed: every tier now emits the spec ECMA-262 Number::toString form via its `*Ecma262Double` formatter (Go appendEcma262Double, Rust format_ecma262_double, Python _format_double, Zig appendEcma262Double, Ruby format_ecma262_double, Java formatEcma262Double; TS uses the native JS formatter). `expected` is the spec form and is enforced as a byte-parity gate across all tiers.",
       "input": {
         "big": 1e21
       },
@@ -149,7 +149,7 @@
     {
       "_vector_id": "v21-float-1e-300-no-trailing-dotzero",
       "_audit_ref": "audits/canonical-json-rfc8785-parity.md §3 rec 4 (D5)",
-      "_notes": "Tiny float MUST emit `1e-300` (no trailing `.0`). Known divergences (audit D5): Ruby/Java emit `1.0e-300` / `1.0E-300`.",
+      "_notes": "Tiny float MUST emit `1e-300` (no trailing `.0`). The D5 divergence is fixed: every tier's `*Ecma262Double` formatter now emits the spec ECMA-262 Number::toString form, so all tiers produce `1e-300` (no trailing `.0`). `expected` is the spec form and is enforced as a byte-parity gate across all tiers.",
       "input": {
         "r": 1e-300
       },
@@ -160,7 +160,7 @@
     {
       "_vector_id": "v22-lone-surrogate-rejected",
       "_audit_ref": "audits/canonical-json-rfc8785-parity.md §3 rec 6 (D6)",
-      "_notes": "Lone surrogate (U+D800 with no low-surrogate partner) is invalid Unicode per RFC 8785 and MUST be rejected. Today (per audit D6) NO tier rejects: TS/JS happily emits `\\ud800`, Go replaces with U+FFFD, Ruby's JSON parser errors before canonical_json even runs, Java/Python pass through as-is. This vector documents the desired behavior and gates the eventual fix. The input is supplied as a UTF-16 code-unit array so each tier constructs the string deterministically without relying on its JSON parser's lone-surrogate handling.",
+      "_notes": "Lone surrogate (U+D800 with no low-surrogate partner) is invalid Unicode per RFC 8785 and MUST be rejected. The D6 fix has landed: every tier now rejects this input — TS (canonical-json.ts: lone-surrogate code path), Go (sdk_envelope.go: WTF-8 0xED,0xA0..0xBF detection), Python (envelope.py: 0xD800..0xDFFF check), Zig (sdk_envelope.zig: error.LoneSurrogate), Ruby (envelope.rb: U+D800..U+DFFF raise), Java (Envelope.java: Character.isHighSurrogate/isLowSurrogate check). Rust cannot represent a lone surrogate in its `&str` type at all (structurally rejected at the type boundary). The Go interop test `packages/runar-go/sdk_envelope_interop_test.go` (TestEnvelopeInterop_CanonicalJSONRejectionVectors) asserts this rejection against this vector. This vector now ENFORCES rejection across all tiers. The input is supplied as a UTF-16 code-unit array so each tier constructs the string deterministically without relying on its JSON parser's lone-surrogate handling.",
       "description": "object with a value containing the lone high surrogate U+D800",
       "input_object_key": "surrogate",
       "input_value_utf16_units": [55296]
