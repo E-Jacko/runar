@@ -267,7 +267,7 @@ class TypedContractGeneratorTest {
                 new ABIParam("sig", "Sig", null),
                 new ABIParam("pubKey", "PubKey", null)
             ),
-            true, null
+            true, null, null
         );
         return new RunarArtifact(
             "runar-v0.1.0", "0.1.0", "P2PKH",
@@ -295,7 +295,8 @@ class TypedContractGeneratorTest {
                 new ABIParam("_changeAmount", "bigint", null)
             ),
             true,
-            false
+            false,
+            null
         );
         ABIMethod reset = new ABIMethod(
             "reset",
@@ -303,7 +304,8 @@ class TypedContractGeneratorTest {
                 new ABIParam("txPreimage", "SigHashPreimage", null)
             ),
             true,
-            true
+            true,
+            null
         );
         return new RunarArtifact(
             "runar-v0.1.0", "0.1.0", "Counter",
@@ -335,7 +337,8 @@ class TypedContractGeneratorTest {
                 new ABIParam("_changeAmount", "bigint", null)
             ),
             true,
-            false
+            false,
+            null
         );
         return new RunarArtifact(
             "runar-v0.1.0", "0.1.0", "Counter",
@@ -350,7 +353,7 @@ class TypedContractGeneratorTest {
 
     private static RunarArtifact buildNoArgsArtifact() {
         ABIConstructor ctor = new ABIConstructor(List.of());
-        ABIMethod execute = new ABIMethod("execute", List.of(), true, null);
+        ABIMethod execute = new ABIMethod("execute", List.of(), true, null, null);
         return new RunarArtifact(
             "runar-v0.1.0", "0.1.0", "Simple",
             new ABI(ctor, List.of(execute)),

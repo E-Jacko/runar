@@ -1981,16 +1981,25 @@ class LoweringContext {
       }
     }
 
-    // Phase 3: single depth-balance check after ALL drops.
-    // Push placeholder only if one branch is still deeper than the other.
-    if (thenCtx.stackMap.depth > elseCtx.stackMap.depth) {
-      // When the then-branch reassigned a local variable (if-without-else),
-      // push a COPY of that variable in the else-branch instead of a generic
-      // placeholder. This ensures the else-branch preserves the correct value
-      // when post-ENDIF stale removal (NIP) removes the old entry.
-      const thenTop = thenCtx.stackMap.peekAtDepth(0);
-      if (elseBindings.length === 0 && thenTop && elseCtx.stackMap.has(thenTop)) {
-        const varDepth = elseCtx.stackMap.findDepth(thenTop);
+    // Phase 3: depth-balance reconciliation after ALL drops.
+    //
+    // Compensate the FULL depth difference between the branches — NOT just a
+    // single item. A conditional write of N state fields leaves N result
+    // values on the then-branch, so the (empty) else-branch must preserve N
+    // old values. Issue #99 Bug 1: the previous single-shot check only
+    // balanced a 1-item difference, leaving N>=2 conditional writes
+    // imbalanced by (N-1) and the update branch unspendable.
+    //
+    // For each missing slot, when the then-branch reassigned a variable
+    // (if-without-else), push a COPY of that same-named (old) value in the
+    // else-branch so the preserved value is correct; otherwise push a generic
+    // placeholder. Process the then-branch's result slots from deepest to
+    // top so the preserved copies land in the same order.
+    while (thenCtx.stackMap.depth > elseCtx.stackMap.depth) {
+      const resultDepth = thenCtx.stackMap.depth - elseCtx.stackMap.depth - 1;
+      const thenName = thenCtx.stackMap.peekAtDepth(resultDepth);
+      if (elseBindings.length === 0 && thenName && elseCtx.stackMap.has(thenName)) {
+        const varDepth = elseCtx.stackMap.findDepth(thenName);
         if (varDepth === 0) {
           elseCtx.emitOp({ op: 'dup' });
         } else {
@@ -1999,14 +2008,32 @@ class LoweringContext {
           elseCtx.emitOp({ op: 'pick', depth: varDepth });
           elseCtx.stackMap.pop();
         }
-        elseCtx.stackMap.push(thenTop);
+        elseCtx.stackMap.push(thenName);
       } else {
         elseCtx.emitOp({ op: 'push', value: new Uint8Array(0) });
         elseCtx.stackMap.push(null);
       }
-    } else if (elseCtx.stackMap.depth > thenCtx.stackMap.depth) {
+    }
+    while (elseCtx.stackMap.depth > thenCtx.stackMap.depth) {
       thenCtx.emitOp({ op: 'push', value: new Uint8Array(0) });
       thenCtx.stackMap.push(null);
+    }
+
+    // Layer B — branch-balance invariant (#99 Bug 1 guard).
+    // After reconciliation the two arms of an OP_IF/OP_ELSE MUST leave the
+    // stack at identical depth; otherwise the code after OP_ENDIF (which is
+    // generated against a single assumed depth) is only correct for whichever
+    // branch the spender does not take, producing a silently-unspendable
+    // script. The Bitcoin Script VM does not enforce branch balance, so this
+    // check is the compiler's responsibility. A failure here is a codegen bug,
+    // never a user error — fail loudly at compile time instead of on-chain.
+    if (thenCtx.stackMap.depth !== elseCtx.stackMap.depth) {
+      throw new Error(
+        `Internal codegen error: conditional in method emitted stack-imbalanced ` +
+        `branches (then depth ${thenCtx.stackMap.depth} != else depth ${elseCtx.stackMap.depth}). ` +
+        `This would produce an unspendable script (see GitHub issue #99). ` +
+        `binding='${bindingName}'.`,
+      );
     }
 
     const thenOps = thenCtx.result.ops;
@@ -2029,7 +2056,38 @@ class LoweringContext {
     }
 
     // The if expression may produce a result value on top.
-    if (thenCtx.stackMap.depth > this.stackMap.depth) {
+    if (elseBindings.length === 0 &&
+        thenCtx.stackMap.depth > this.stackMap.depth &&
+        thenCtx.stackMap.depth - this.stackMap.depth >= 2) {
+      // #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+      // values on top (new values if taken, preserved old values if skipped).
+      // Record the N results in their on-stack order, then physically remove
+      // the N stale old property values that now sit beneath the result block.
+      const resultCount = thenCtx.stackMap.depth - this.stackMap.depth;
+      for (let i = resultCount - 1; i >= 0; i--) {
+        this.stackMap.push(thenCtx.stackMap.peekAtDepth(i) ?? bindingName);
+      }
+      const resultNames: (string | null)[] = [];
+      for (let i = 0; i < resultCount; i++) {
+        resultNames.push(this.stackMap.peekAtDepth(i));
+      }
+      for (const name of resultNames) {
+        if (name === null) continue;
+        for (let d = resultCount; d < this.stackMap.depth; d++) {
+          if (this.stackMap.peekAtDepth(d) === name) {
+            this.emitOp({ op: 'push', value: BigInt(d) });
+            this.stackMap.push(null);
+            this.emitOp({ op: 'roll', depth: d + 1 });
+            this.stackMap.pop();
+            const rolled = this.stackMap.removeAtDepth(d);
+            this.stackMap.push(rolled);
+            this.emitOp({ op: 'drop' });
+            this.stackMap.pop();
+            break;
+          }
+        }
+      }
+    } else if (thenCtx.stackMap.depth > this.stackMap.depth) {
       // Branches increased depth — check if both updated the same property.
       const thenTop = thenCtx.stackMap.peekAtDepth(0);
       const elseTop = elseCtx.stackMap.depth > 0 ? elseCtx.stackMap.peekAtDepth(0) : null;
@@ -4876,6 +4934,25 @@ function methodUsesCheckPreimage(
   return false;
 }
 
+/**
+ * Whether a method READS a mutable variable-length (ByteString) state field's
+ * value (via load_prop). Issue #100: such a terminal method needs `_codePart`
+ * for the preimage-relative state offset. Narrowed to the live var-length read
+ * so methods that only read readonly fields (baked into the locking script) or
+ * fixed-size fields keep their original terminal codegen.
+ */
+function methodReadsVarLenState(bindings: ANFBinding[], varLenProps: Set<string>): boolean {
+  for (const b of bindings) {
+    if (b.value.kind === 'load_prop' && varLenProps.has(b.value.name)) return true;
+    if (b.value.kind === 'if') {
+      if (methodReadsVarLenState(b.value.then, varLenProps) ||
+          methodReadsVarLenState(b.value.else, varLenProps)) return true;
+    }
+    if (b.value.kind === 'loop' && methodReadsVarLenState(b.value.body, varLenProps)) return true;
+  }
+  return false;
+}
+
 function methodUsesCodePart(bindings: ANFBinding[]): boolean {
   for (const b of bindings) {
     if (b.value.kind === 'add_output' || b.value.kind === 'add_raw_output') return true;
@@ -4902,12 +4979,18 @@ function lowerMethod(
   // _codePart: full code script (locking script minus state) as ByteString
   // _opPushTxSig: ECDSA signature for OP_PUSH_TX verification
   // These are inserted at the base of the stack so they can be consumed later.
+  // _codePart is needed for continuation builders (add_output/add_raw_output)
+  // OR when the method reads variable-length (ByteString) mutable state — the
+  // deserialization needs it for the preimage-relative offset (issue #100).
+  const varLenProps = new Set(
+    properties.filter(p => !p.readonly && p.type === 'ByteString').map(p => p.name),
+  );
+  const usesCodePart =
+    methodUsesCheckPreimage(method.body, privateMethods) &&
+    (methodUsesCodePart(method.body) || methodReadsVarLenState(method.body, varLenProps));
   if (methodUsesCheckPreimage(method.body, privateMethods)) {
     paramNames.unshift('_opPushTxSig');
-    // _codePart is needed when the method has add_output or add_raw_output
-    // (it provides the code script for continuation output construction),
-    // or when deserializing variable-length (ByteString) state fields.
-    if (methodUsesCodePart(method.body)) {
+    if (usesCodePart) {
       paramNames.unshift('_codePart');
     }
   }
@@ -4948,5 +5031,6 @@ function lowerMethod(
     name: method.name,
     ops,
     maxStackDepth,
+    usesCodePart,
   };
 }

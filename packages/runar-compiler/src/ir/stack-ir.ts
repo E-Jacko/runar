@@ -18,6 +18,8 @@ export interface StackMethod {
   name: string;
   ops: StackOp[];
   maxStackDepth: number;
+  /** True if the unlocking script is prefixed with `_codePart` (issue #100). */
+  usesCodePart?: boolean;
 }
 
 /** Optional source location for debug source maps. */

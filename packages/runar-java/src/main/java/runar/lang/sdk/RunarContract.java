@@ -878,9 +878,12 @@ public final class RunarContract {
     ) {
         StringBuilder sb = new StringBuilder();
 
-        // _codePart push (only when the method needs change — i.e. the
-        // contract continuation references the codePart for hash-outputs).
-        if (changePkhHex != null) {
+        // _codePart push. New artifacts carry the authoritative usesCodePart
+        // flag — true for continuation builders AND terminal var-length-state
+        // readers (issue #100). Older artifacts omit it; fall back to the
+        // legacy rule (codePart iff change, i.e. changePkhHex present).
+        boolean usesCodePart = m.usesCodePart() != null ? m.usesCodePart() : (changePkhHex != null);
+        if (usesCodePart) {
             sb.append(ScriptUtils.encodePushData(getCodePartHex()));
         }
 

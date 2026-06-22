@@ -407,6 +407,14 @@ class RunarContract:
         # Filter them out so users only pass their own args.
         method_needs_change = any(p.name == '_changePKH' for p in method.params)
         method_needs_new_amount = any(p.name == '_newAmount' for p in method.params)
+        # Whether the unlocking script is prefixed with _codePart. New artifacts
+        # carry the authoritative uses_code_part flag (true for continuation
+        # builders AND terminal var-length-state readers — issue #100). Older
+        # artifacts lack it; fall back to the legacy rule.
+        method_uses_code_part = (
+            method.uses_code_part if method.uses_code_part is not None
+            else method_needs_change
+        )
         # Drop auto-injected continuation params AND intent-intrinsic witness
         # params (`_prevOutScript_<i>`, `_serialisedOutputs`) from the
         # user-facing arg count check. Witness values come from
@@ -515,6 +523,7 @@ class RunarContract:
             return self._prepare_terminal(
                 method_name, resolved_args, signer, opts,
                 is_stateful, parent_stateful, needs_op_push_tx, method_needs_change,
+                method_uses_code_part,
                 sig_indices, prevouts_indices, preimage_index,
                 method_selector_hex, change_pkh_hex, contract_utxo, witness_hex,
             )
@@ -528,7 +537,7 @@ class RunarContract:
         # for stateful methods.
         if needs_op_push_tx:
             # Prepend placeholder prefix (optionally _codePart + _opPushTxSig)
-            unlocking_script = self._build_stateful_prefix('00' * 72, method_needs_change) + \
+            unlocking_script = self._build_stateful_prefix('00' * 72, method_uses_code_part) + \
                 self.build_unlocking_script(method_name, resolved_args) + witness_hex
         else:
             unlocking_script = self.build_unlocking_script(method_name, resolved_args) + witness_hex
@@ -672,7 +681,7 @@ class RunarContract:
         for i in range(len(extra_contract_utxos)):
             args_for_placeholder = resolved_per_input_args[i] if resolved_per_input_args and i < len(resolved_per_input_args) else resolved_args
             extra_unlock_placeholders.append(
-                self._build_stateful_prefix('00' * 72, method_needs_change) + self.build_unlocking_script(method_name, args_for_placeholder) + witness_hex
+                self._build_stateful_prefix('00' * 72, method_uses_code_part) + self.build_unlocking_script(method_name, args_for_placeholder) + witness_hex
             )
 
         tx_hex, input_count, change_amount = build_call_transaction(
@@ -738,7 +747,7 @@ class RunarContract:
                 if method_needs_new_amount:
                     new_amount_hex = _encode_script_number(new_satoshis)
                 unlock = (
-                    self._build_stateful_prefix(op_sig, method_needs_change) +
+                    self._build_stateful_prefix(op_sig, method_uses_code_part) +
                     args_hex +
                     change_hex +
                     new_amount_hex +
@@ -870,6 +879,7 @@ class RunarContract:
             is_terminal=False,
             needs_op_push_tx=needs_op_push_tx,
             method_needs_change=method_needs_change,
+            method_uses_code_part=method_uses_code_part,
             change_pkh_hex=change_pkh_hex,
             change_amount=change_amount,
             method_needs_new_amount=method_needs_new_amount,
@@ -920,7 +930,7 @@ class RunarContract:
             if prepared.method_needs_new_amount:
                 new_amount_hex = _encode_script_number(prepared.new_amount)
             primary_unlock = (
-                self._build_stateful_prefix(prepared.op_push_tx_sig, prepared.method_needs_change) +
+                self._build_stateful_prefix(prepared.op_push_tx_sig, prepared.method_uses_code_part) +
                 args_hex +
                 change_hex +
                 new_amount_hex +
@@ -1112,6 +1122,7 @@ class RunarContract:
         parent_stateful: bool,
         needs_op_push_tx: bool,
         method_needs_change: bool,
+        method_uses_code_part: bool,
         sig_indices: list[int],
         prevouts_indices: list[int],
         preimage_index: int,
@@ -1261,6 +1272,7 @@ class RunarContract:
             is_terminal=True,
             needs_op_push_tx=needs_op_push_tx,
             method_needs_change=method_needs_change,
+            method_uses_code_part=method_uses_code_part,
             change_pkh_hex=change_pkh_hex,
             change_amount=0,
             method_needs_new_amount=False,

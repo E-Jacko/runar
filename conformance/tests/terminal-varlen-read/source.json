@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "../../../examples/ts/terminal-varlen-read/TerminalVarlenRead.runar.ts",
+    ".runar.sol": "../../../examples/sol/terminal-varlen-read/TerminalVarlenRead.runar.sol",
+    ".runar.move": "../../../examples/move/terminal-varlen-read/TerminalVarlenRead.runar.move",
+    ".runar.go": "../../../examples/go/terminal-varlen-read/TerminalVarlenRead.runar.go",
+    ".runar.rs": "../../../examples/rust/terminal-varlen-read/TerminalVarlenRead.runar.rs",
+    ".runar.py": "../../../examples/python/terminal-varlen-read/TerminalVarlenRead.runar.py",
+    ".runar.zig": "../../../examples/zig/terminal-varlen-read/TerminalVarlenRead.runar.zig",
+    ".runar.rb": "../../../examples/ruby/terminal-varlen-read/TerminalVarlenRead.runar.rb",
+    ".runar.java": "../../../examples/java/src/main/java/runar/examples/terminal-varlen-read/TerminalVarlenRead.runar.java"
+  }
+}

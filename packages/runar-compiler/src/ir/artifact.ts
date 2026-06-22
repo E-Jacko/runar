@@ -37,6 +37,8 @@ export interface ABIMethod {
   isPublic: boolean;
   /** True for stateful contract methods that don't mutate state (no continuation output). */
   isTerminal?: boolean;
+  /** True if the unlocking script is prefixed with `_codePart` (issue #100). */
+  usesCodePart?: boolean;
 }
 
 export interface ABI {

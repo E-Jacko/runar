@@ -46,6 +46,8 @@ export interface ABIMethod {
   isPublic: boolean;
   /** True for stateful contract methods that don't mutate state (no continuation output). */
   isTerminal?: boolean;
+  /** True if the unlocking script is prefixed with `_codePart` (issue #100). */
+  usesCodePart?: boolean;
 }
 
 export interface ABI {
@@ -630,6 +632,14 @@ export function assembleArtifact(
   options?: AssembleOptions,
 ): RunarArtifact {
   const abi = extractABI(contract);
+  // Propagate stack-lowering's authoritative `_codePart` decision into the ABI
+  // so the SDK can supply `_codePart` for terminal var-length reads (issue #100).
+  for (const m of abi.methods) {
+    const sm = stackProgram.methods.find(s => s.name === m.name);
+    if (sm?.usesCodePart) {
+      m.usesCodePart = true;
+    }
+  }
   const stateFields = extractStateFields(contract.properties, anfProgram);
   const compilerVersion = options?.compilerVersion ?? DEFAULT_COMPILER_VERSION;
 

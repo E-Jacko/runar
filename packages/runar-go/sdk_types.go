@@ -30,7 +30,7 @@ type TransactionData struct {
 type TxInput struct {
 	Txid        string `json:"txid"`
 	OutputIndex int    `json:"outputIndex"`
-	Script      string `json:"script"`   // hex-encoded scriptSig
+	Script      string `json:"script"` // hex-encoded scriptSig
 	Sequence    uint32 `json:"sequence"`
 }
 
@@ -142,21 +142,22 @@ type PreparedCall struct {
 	// parentStateful is true when the contract extends StatefulSmartContract
 	// (from artifact ParentClass), independent of whether it has mutable
 	// state fields. Gates the issue-#42/#44 terminal sighash subscript trim.
-	parentStateful    bool
-	isTerminal        bool
-	needsOpPushTx     bool
-	methodNeedsChange bool
-	changePKHHex      string
-	changeAmount      int64
+	parentStateful       bool
+	isTerminal           bool
+	needsOpPushTx        bool
+	methodNeedsChange    bool
+	methodUsesCodePart   bool
+	changePKHHex         string
+	changeAmount         int64
 	methodNeedsNewAmount bool
-	newAmount         int64
-	preimageIndex     int
-	contractUtxo      UTXO
-	newLockingScript  string
-	newSatoshis       int64
-	hasMultiOutput    bool
-	contractOutputs   []ContractOutput
-	codeSepIdx        int // adjusted OP_CODESEPARATOR byte offset, -1 if none
+	newAmount            int64
+	preimageIndex        int
+	contractUtxo         UTXO
+	newLockingScript     string
+	newSatoshis          int64
+	hasMultiOutput       bool
+	contractOutputs      []ContractOutput
+	codeSepIdx           int // adjusted OP_CODESEPARATOR byte offset, -1 if none
 
 	// Mode 3: pre-encoded witness-assisted Groth16 prover bundle hex,
 	// spliced into the unlock script BEFORE the stateful prefix so the
@@ -197,25 +198,25 @@ type Groth16WAMeta struct {
 
 // RunarArtifact is the compiled output of a Runar compiler.
 type RunarArtifact struct {
-	Version                string             `json:"version"`
-	CompilerVersion        string             `json:"compilerVersion"`
-	ContractName           string             `json:"contractName"`
+	Version         string `json:"version"`
+	CompilerVersion string `json:"compilerVersion"`
+	ContractName    string `json:"contractName"`
 	// ParentClass is the base class the source contract extends. It is the
 	// authoritative stateful signal for the issue-#42/#44 terminal sighash
 	// subscript trim: a StatefulSmartContract with zero mutable fields still
 	// needs the trim even though StateFields is empty. Older artifacts that
 	// predate this field leave it empty.
-	ParentClass            string             `json:"parentClass,omitempty"`
-	ABI                    ABI                `json:"abi"`
-	Script                 string             `json:"script"`
-	ASM                    string             `json:"asm"`
-	StateFields            []StateField       `json:"stateFields,omitempty"`
-	ConstructorSlots       []ConstructorSlot  `json:"constructorSlots,omitempty"`
-	CodeSepIndexSlots      []CodeSepIndexSlot `json:"codeSepIndexSlots,omitempty"`
-	BuildTimestamp         string             `json:"buildTimestamp"`
-	CodeSeparatorIndex     *int               `json:"codeSeparatorIndex,omitempty"`
-	CodeSeparatorIndices   []int              `json:"codeSeparatorIndices,omitempty"`
-	ANF                    *ANFProgram        `json:"anf,omitempty"`
+	ParentClass          string             `json:"parentClass,omitempty"`
+	ABI                  ABI                `json:"abi"`
+	Script               string             `json:"script"`
+	ASM                  string             `json:"asm"`
+	StateFields          []StateField       `json:"stateFields,omitempty"`
+	ConstructorSlots     []ConstructorSlot  `json:"constructorSlots,omitempty"`
+	CodeSepIndexSlots    []CodeSepIndexSlot `json:"codeSepIndexSlots,omitempty"`
+	BuildTimestamp       string             `json:"buildTimestamp"`
+	CodeSeparatorIndex   *int               `json:"codeSeparatorIndex,omitempty"`
+	CodeSeparatorIndices []int              `json:"codeSeparatorIndices,omitempty"`
+	ANF                  *ANFProgram        `json:"anf,omitempty"`
 
 	// Groth16WA is populated only for artifacts produced by the
 	// `runarc groth16-wa` backend. Nil for normal Rúnar contract
@@ -240,6 +241,8 @@ type ABIMethod struct {
 	Params     []ABIParam `json:"params"`
 	IsPublic   bool       `json:"isPublic"`
 	IsTerminal *bool      `json:"isTerminal,omitempty"`
+	// UsesCodePart: unlocking script is prefixed with _codePart (issue #100).
+	UsesCodePart *bool `json:"usesCodePart,omitempty"`
 }
 
 // ABIFixedArray describes the fixed-array shape of a grouped ABI

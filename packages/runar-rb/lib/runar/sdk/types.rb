@@ -50,8 +50,8 @@ module Runar
     end
 
     # A contract method descriptor.
-    ABIMethod = Struct.new(:name, :params, :is_public, :is_terminal, keyword_init: true) do
-      def initialize(name:, params: [], is_public: true, is_terminal: nil)
+    ABIMethod = Struct.new(:name, :params, :is_public, :is_terminal, :uses_code_part, keyword_init: true) do
+      def initialize(name:, params: [], is_public: true, is_terminal: nil, uses_code_part: nil)
         super
       end
     end
@@ -166,7 +166,8 @@ module Runar
             name: m['name'],
             params: params,
             is_public: m.fetch('isPublic', true),
-            is_terminal: m['isTerminal']
+            is_terminal: m['isTerminal'],
+            uses_code_part: m['usesCodePart']
           )
         end
 
@@ -296,6 +297,7 @@ module Runar
       :is_terminal,
       :needs_op_push_tx,
       :method_needs_change,
+      :method_uses_code_part,
       :change_pkh_hex,
       :change_amount,
       :method_needs_new_amount,
@@ -328,6 +330,7 @@ module Runar
         is_terminal: false,
         needs_op_push_tx: false,
         method_needs_change: false,
+        method_uses_code_part: false,
         change_pkh_hex: '',
         change_amount: 0,
         method_needs_new_amount: false,

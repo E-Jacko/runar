@@ -31,8 +31,8 @@ module RunarCompiler
     end
   end
 
-  ABIMethod = Struct.new(:name, :params, :is_public, :is_terminal, keyword_init: true) do
-    def initialize(name: "", params: [], is_public: false, is_terminal: nil)
+  ABIMethod = Struct.new(:name, :params, :is_public, :is_terminal, :uses_code_part, keyword_init: true) do
+    def initialize(name: "", params: [], is_public: false, is_terminal: nil, uses_code_part: nil)
       super
     end
   end
@@ -691,11 +691,18 @@ module RunarCompiler
         is_terminal = true unless has_change
       end
 
+      # Propagate the authoritative _codePart decision from stack-lowering into
+      # the ABI so the SDK supplies _codePart for terminal var-length reads (#100).
+      uses_code_part = nil
+      sm_match = stack_methods&.find { |sm| sm[:name] == method.name }
+      uses_code_part = true if sm_match && sm_match[:uses_code_part]
+
       methods << ABIMethod.new(
         name: method.name,
         params: params,
         is_public: method.is_public,
-        is_terminal: is_terminal
+        is_terminal: is_terminal,
+        uses_code_part: uses_code_part
       )
     end
 
@@ -789,6 +796,7 @@ module RunarCompiler
             "isPublic" => m.is_public,
           }
           md["isTerminal"] = m.is_terminal unless m.is_terminal.nil?
+          md["usesCodePart"] = m.uses_code_part unless m.uses_code_part.nil?
           md
         end,
       },

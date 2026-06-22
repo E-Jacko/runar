@@ -17,6 +17,7 @@
     "boolean-logic": 15,
     "bounded-loop": 42,
     "branched-readonly-len": 336,
+    "cond-write-multi-field": 212,
     "conditional-data-output-stateful": 270,
     "convergence-proof": 450601,
     "covenant-vault": 71,
@@ -62,6 +63,7 @@
     "stateful": 386,
     "stateful-bytestring": 373,
     "stateful-counter": 385,
+    "terminal-varlen-read": 462,
     "token-ft": 919,
     "token-nft": 260
   }

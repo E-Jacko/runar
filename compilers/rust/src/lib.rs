@@ -364,6 +364,7 @@ pub fn compile_from_program_with_options(program: &ir::ANFProgram, opts: &Compil
         true, // include ANF IR for SDK state auto-computation
         emit_result.source_map,
         emit_result.raw_script_spans,
+        &stack_methods,
     );
     Ok(artifact)
 }
@@ -521,6 +522,7 @@ pub fn compile_from_source_str_with_result(
                 true,
                 emit_result.source_map,
                 emit_result.raw_script_spans,
+        &stack_methods,
             );
             result.script_hex = Some(emit_result.script_hex);
             result.script_asm = Some(emit_result.script_asm);

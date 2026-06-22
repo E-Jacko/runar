@@ -115,6 +115,10 @@ class StackMethod:
     name: str = ""
     ops: list[StackOp] = field(default_factory=list)
     max_stack_depth: int = 0
+    # True if the unlocking script is prefixed with _codePart — needed for
+    # continuation builders OR terminal methods that read variable-length
+    # (ByteString) state (issue #100). Propagated to ABIMethod.usesCodePart.
+    uses_code_part: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1477,16 +1481,20 @@ class _LoweringContext:
                     then_ctx.emit_op(StackOp(op="drop"))
                     then_ctx.sm.pop()
 
-        # Phase 3: single depth-balance check after ALL drops.
-        # Push placeholder only if one branch is still deeper than the other.
-        if then_ctx.sm.depth() > else_ctx.sm.depth():
-            # When the then-branch reassigned a local variable (if-without-else),
-            # push a COPY of that variable in the else-branch instead of a generic
-            # placeholder.
-            then_top_p3 = then_ctx.sm.peek_at_depth(0)
-            if (not else_bindings and then_top_p3
-                    and else_ctx.sm.has(then_top_p3)):
-                var_depth = else_ctx.sm.find_depth(then_top_p3)
+        # Phase 3: depth-balance reconciliation after ALL drops.
+        #
+        # Compensate the FULL depth difference between the branches — NOT just a
+        # single item. A conditional write of N state fields leaves N result
+        # values on the then-branch, so the (empty) else-branch must preserve N
+        # old values. Issue #99 Bug 1: the previous single-shot check only
+        # balanced a 1-item difference, leaving N>=2 conditional writes
+        # imbalanced by (N-1) and the update branch unspendable.
+        while then_ctx.sm.depth() > else_ctx.sm.depth():
+            result_depth = then_ctx.sm.depth() - else_ctx.sm.depth() - 1
+            then_name = then_ctx.sm.peek_at_depth(result_depth)
+            if (not else_bindings and then_name
+                    and else_ctx.sm.has(then_name)):
+                var_depth = else_ctx.sm.find_depth(then_name)
                 if var_depth == 0:
                     else_ctx.emit_op(StackOp(op="dup"))
                 else:
@@ -1494,13 +1502,26 @@ class _LoweringContext:
                     else_ctx.sm.push("")
                     else_ctx.emit_op(StackOp(op="pick", depth=var_depth))
                     else_ctx.sm.pop()
-                else_ctx.sm.push(then_top_p3)
+                else_ctx.sm.push(then_name)
             else:
                 else_ctx.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=b"")))
                 else_ctx.sm.push("")
-        elif else_ctx.sm.depth() > then_ctx.sm.depth():
+        while else_ctx.sm.depth() > then_ctx.sm.depth():
             then_ctx.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=b"")))
             then_ctx.sm.push("")
+
+        # Layer B — branch-balance invariant (#99 Bug 1 guard). After
+        # reconciliation the two arms of an OP_IF/OP_ELSE MUST leave the stack at
+        # identical depth; otherwise the post-ENDIF code (generated against a
+        # single assumed depth) is only correct for the branch the spender does
+        # not take, producing a silently-unspendable script.
+        if then_ctx.sm.depth() != else_ctx.sm.depth():
+            raise RuntimeError(
+                "internal codegen error: conditional emitted stack-imbalanced "
+                f"branches (then depth {then_ctx.sm.depth()} != else depth "
+                f"{else_ctx.sm.depth()}); would produce an unspendable script "
+                f"(see GitHub issue #99); binding={binding_name!r}"
+            )
 
         then_ops = then_ctx.ops
         else_ops = else_ctx.ops
@@ -1518,7 +1539,35 @@ class _LoweringContext:
                 self.sm.remove_at_depth(depth)
 
         # The if expression may produce a result value on top.
-        if then_ctx.sm.depth() > self.sm.depth():
+        if (not else_bindings
+                and then_ctx.sm.depth() > self.sm.depth()
+                and then_ctx.sm.depth() - self.sm.depth() >= 2):
+            # #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+            # values on top (new values if taken, preserved old values if
+            # skipped). Record the N results in their on-stack order, then
+            # physically remove the N stale old property values beneath them.
+            result_count = then_ctx.sm.depth() - self.sm.depth()
+            for i in range(result_count - 1, -1, -1):
+                name = then_ctx.sm.peek_at_depth(i) or binding_name
+                self.sm.push(name)
+            result_names = [self.sm.peek_at_depth(i) for i in range(result_count)]
+            for name in result_names:
+                if not name:
+                    continue
+                d = result_count
+                while d < self.sm.depth():
+                    if self.sm.peek_at_depth(d) == name:
+                        self.emit_op(StackOp(op="push", value=big_int_push(d)))
+                        self.sm.push("")
+                        self.emit_op(StackOp(op="roll", depth=d + 1))
+                        self.sm.pop()
+                        rolled = self.sm.remove_at_depth(d)
+                        self.sm.push(rolled)
+                        self.emit_op(StackOp(op="drop"))
+                        self.sm.pop()
+                        break
+                    d += 1
+        elif then_ctx.sm.depth() > self.sm.depth():
             then_top = then_ctx.sm.peek_at_depth(0)
             else_top = else_ctx.sm.peek_at_depth(0) if else_ctx.sm.depth() > 0 else ""
             is_property = any(p.name == then_top for p in self.properties)
@@ -3972,6 +4021,31 @@ def _method_uses_code_part(bindings: list[ANFBinding]) -> bool:
     return False
 
 
+def _method_reads_var_len_state(
+    bindings: list[ANFBinding],
+    var_len_props: set[str],
+) -> bool:
+    """Whether a method READS a mutable variable-length (ByteString) state
+    field's value (via load_prop). Issue #100: such a terminal method needs
+    _codePart for the preimage-relative state offset. Narrowed to the live
+    var-length read so methods that only read readonly fields (baked into the
+    locking script) or fixed-size fields keep their original terminal codegen."""
+    for b in bindings:
+        if b.value.kind == "load_prop" and getattr(b.value, "name", None) in var_len_props:
+            return True
+        if b.value.kind == "if":
+            then_bindings = getattr(b.value, "then", None) or []
+            else_bindings = getattr(b.value, "else_", None) or []
+            if (_method_reads_var_len_state(then_bindings, var_len_props)
+                    or _method_reads_var_len_state(else_bindings, var_len_props)):
+                return True
+        if b.value.kind == "loop":
+            body_bindings = getattr(b.value, "body", None) or []
+            if _method_reads_var_len_state(body_bindings, var_len_props):
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -4034,14 +4108,22 @@ def _lower_method_with_private_methods(
     # _codePart: full code script (locking script minus state) as ByteString
     # _opPushTxSig: ECDSA signature for OP_PUSH_TX verification
     # These are inserted at the base of the stack so they can be consumed later.
+    # _codePart is needed for continuation builders (add_output/add_raw_output)
+    # OR when the method reads a mutable variable-length (ByteString) state
+    # field — the deserialization needs it for the preimage-relative offset
+    # (issue #100).
+    var_len_props = {
+        p.name for p in properties if not p.readonly and p.type == "ByteString"
+    }
+    uses_code_part = (
+        _method_uses_check_preimage(method.body, private_methods)
+        and (_method_uses_code_part(method.body)
+             or _method_reads_var_len_state(method.body, var_len_props))
+    )
     if _method_uses_check_preimage(method.body, private_methods):
         param_names = ["_opPushTxSig"] + param_names
-        # _codePart is needed when the method has add_output or add_raw_output
-        # (it provides the code script for continuation output construction),
-        # or when deserializing variable-length (ByteString) state fields.
-        if _method_uses_code_part(method.body):
+        if uses_code_part:
             param_names = ["_codePart"] + param_names
-        # No else needed — terminal methods without addOutput don't need _codePart
 
     ctx = _LoweringContext(param_names, properties)
     ctx.private_methods = private_methods
@@ -4069,6 +4151,7 @@ def _lower_method_with_private_methods(
         name=method.name,
         ops=ctx.ops,
         max_stack_depth=ctx.max_depth,
+        uses_code_part=uses_code_part,
     )
 
 

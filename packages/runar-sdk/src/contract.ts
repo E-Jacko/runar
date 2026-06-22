@@ -580,6 +580,11 @@ export class RunarContract {
         : isStateful;
     const methodNeedsChange = method.params.some((p) => p.name === '_changePKH');
     const methodNeedsNewAmount = method.params.some((p) => p.name === '_newAmount');
+    // Whether the unlocking script is prefixed with `_codePart`. New artifacts
+    // carry the authoritative `usesCodePart` flag (true for continuation
+    // builders AND terminal var-length-state readers — issue #100). Older
+    // artifacts lack it; fall back to the legacy rule (codePart iff continuation).
+    const methodUsesCodePart = method.usesCodePart ?? methodNeedsChange;
     // Drop auto-injected continuation params AND intent-intrinsic witness
     // params (`_prevOutScript_<i>`, `_serialisedOutputs`) from the
     // user-facing arg count check. Witness values come from
@@ -737,7 +742,7 @@ export class RunarContract {
           if (methodNeedsNewAmount) {
             newAmountHex = encodeArg(BigInt(contractUtxo.satoshis));
           }
-          const unlock = this.buildStatefulPrefix(opSig) + argsHex + changeHex + newAmountHex + encodePushData(preimage) + witnessHex + methodSelectorHex;
+          const unlock = this.buildStatefulPrefix(opSig, methodUsesCodePart) + argsHex + changeHex + newAmountHex + encodePushData(preimage) + witnessHex + methodSelectorHex;
           return { unlock, opSig, preimage };
         };
 
@@ -804,6 +809,7 @@ export class RunarContract {
         _isTerminal: true,
         _needsOpPushTx: needsOpPushTx,
         _methodNeedsChange: methodNeedsChange,
+        _methodUsesCodePart: methodUsesCodePart,
         _changePKHHex: changePKHHex,
         _changeAmount: 0,
         _methodNeedsNewAmount: false,
@@ -1021,7 +1027,7 @@ export class RunarContract {
         if (methodNeedsNewAmount) {
           newAmountHex = encodeArg(BigInt(newSatoshis ?? this.currentUtxo!.satoshis));
         }
-        const unlock = this.buildStatefulPrefix(opSig, methodNeedsChange) + argsHex + changeHex + newAmountHex + encodePushData(preimage) + witnessHex + methodSelectorHex;
+        const unlock = this.buildStatefulPrefix(opSig, methodUsesCodePart) + argsHex + changeHex + newAmountHex + encodePushData(preimage) + witnessHex + methodSelectorHex;
         return { unlock, opSig, preimage };
       };
 
@@ -1159,6 +1165,7 @@ export class RunarContract {
       _isTerminal: false,
       _needsOpPushTx: needsOpPushTx,
       _methodNeedsChange: methodNeedsChange,
+        _methodUsesCodePart: methodUsesCodePart,
       _changePKHHex: changePKHHex,
       _changeAmount: changeAmount,
       _methodNeedsNewAmount: methodNeedsNewAmount,
@@ -1209,7 +1216,7 @@ export class RunarContract {
         newAmountHex = encodeArg(BigInt(prepared._newAmount));
       }
       primaryUnlock =
-        this.buildStatefulPrefix(prepared.opPushTxSig, prepared._methodNeedsChange) +
+        this.buildStatefulPrefix(prepared.opPushTxSig, prepared._methodUsesCodePart ?? prepared._methodNeedsChange) +
         argsHex +
         changeHex +
         newAmountHex +

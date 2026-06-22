@@ -179,6 +179,9 @@ pub struct AbiMethod {
     pub is_public: bool,
     #[serde(default)]
     pub is_terminal: Option<bool>,
+    /// Unlocking script is prefixed with `_codePart` (issue #100).
+    #[serde(default)]
+    pub uses_code_part: Option<bool>,
 }
 
 /// A parameter in the ABI.
@@ -595,6 +598,8 @@ pub struct PreparedCall {
     pub(crate) is_terminal: bool,
     pub(crate) needs_op_push_tx: bool,
     pub(crate) method_needs_change: bool,
+    /// Unlocking script is prefixed with `_codePart` (issue #100).
+    pub(crate) method_uses_code_part: bool,
     pub(crate) change_pkh_hex: String,
     pub(crate) change_amount: i64,
     pub(crate) method_needs_new_amount: bool,

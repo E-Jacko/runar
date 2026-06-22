@@ -215,7 +215,8 @@ public record RunarArtifact(
         }
     }
 
-    public record ABIMethod(String name, List<ABIParam> params, boolean isPublic, Boolean isTerminal) {
+    public record ABIMethod(String name, List<ABIParam> params, boolean isPublic, Boolean isTerminal,
+                            Boolean usesCodePart) {
         public ABIMethod {
             params = params == null ? List.of() : Collections.unmodifiableList(params);
         }
@@ -230,7 +231,15 @@ public record RunarArtifact(
             if (m.containsKey("isTerminal") && m.get("isTerminal") != null) {
                 isTerminal = Json.asBool(m.get("isTerminal"));
             }
-            return new ABIMethod(name, ps, isPublic, isTerminal);
+            // Issue #100: authoritative flag for whether the unlocking script
+            // is prefixed with _codePart (true for continuation builders AND
+            // terminal var-length-state readers). Older artifacts omit it; the
+            // SDK then falls back to the legacy rule (codePart iff change).
+            Boolean usesCodePart = null;
+            if (m.containsKey("usesCodePart") && m.get("usesCodePart") != null) {
+                usesCodePart = Json.asBool(m.get("usesCodePart"));
+            }
+            return new ABIMethod(name, ps, isPublic, isTerminal, usesCodePart);
         }
     }
 

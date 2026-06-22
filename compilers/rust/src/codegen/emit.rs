@@ -562,6 +562,7 @@ mod tests {
             }],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -590,6 +591,7 @@ mod tests {
             ],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -627,6 +629,7 @@ mod tests {
             ],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -657,6 +660,7 @@ mod tests {
             ],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         // Apply peephole optimization before emit (as the compiler pipeline does)
@@ -665,6 +669,7 @@ mod tests {
             ops: optimize_stack_ops(&method.ops),
             max_stack_depth: method.max_stack_depth,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit(&[optimized_method]).expect("emit should succeed");
@@ -700,6 +705,7 @@ mod tests {
             ],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -738,6 +744,7 @@ mod tests {
             ],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -770,6 +777,7 @@ mod tests {
             ],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -801,6 +809,7 @@ mod tests {
             ops: optimized_ops,
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -926,6 +935,7 @@ mod tests {
                 ops: optimize_stack_ops(&m.ops),
                 max_stack_depth: m.max_stack_depth,
                 source_locs: vec![],
+                uses_code_part: false,
             })
             .collect();
 
@@ -972,6 +982,7 @@ mod tests {
             ],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -1098,6 +1109,7 @@ mod tests {
             ops: vec![StackOp::Push(PushValue::Int(BigInt::from(17)))],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
         let result = emit_method(&method).expect("emit should succeed");
         // OP_17 would be 0x61. A push-data encoded 17 would be "0111" (length 1, value 0x11).
@@ -1127,6 +1139,7 @@ mod tests {
             ops: vec![StackOp::Push(PushValue::Bytes(data))],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
         let result = emit_method(&method).expect("emit should succeed");
         // OP_PUSHDATA2 = 0x4d, followed by length in 2 bytes LE: 256 = 0x0001 LE = 00 01
@@ -1200,6 +1213,7 @@ mod tests {
             ops: vec![StackOp::Dup],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
         let result = emit_method(&method).expect("emit should succeed");
         assert_eq!(
@@ -1220,6 +1234,7 @@ mod tests {
             ops: vec![StackOp::Swap],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
         let result = emit_method(&method).expect("emit should succeed");
         assert_eq!(
@@ -1243,6 +1258,7 @@ mod tests {
             }],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
         let result = emit_method(&method).expect("emit should succeed");
         assert!(

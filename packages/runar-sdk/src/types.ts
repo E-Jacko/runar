@@ -83,6 +83,7 @@ export interface PreparedCall {
   /** @internal */ _isTerminal: boolean;
   /** @internal */ _needsOpPushTx: boolean;
   /** @internal */ _methodNeedsChange: boolean;
+  /** @internal Whether the unlocking script is prefixed with `_codePart` (issue #100). */ _methodUsesCodePart?: boolean;
   /** @internal */ _changePKHHex: string;
   /** @internal */ _changeAmount: number;
   /** @internal */ _methodNeedsNewAmount: boolean;

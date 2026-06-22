@@ -439,6 +439,26 @@ module RunarCompiler::Codegen
     false
   end
 
+  # Whether a method READS a mutable variable-length (ByteString) state field's
+  # value (via load_prop). Issue #100: such a terminal method needs _codePart
+  # for the preimage-relative state offset. Narrowed to the live var-length read
+  # so methods that only read readonly fields (baked into the locking script) or
+  # fixed-size fields keep their original terminal codegen.
+  def self.method_reads_var_len_state?(bindings, var_len_props)
+    bindings.each do |b|
+      return true if b.value.kind == "load_prop" && var_len_props.include?(b.value.name)
+
+      if b.value.kind == "if"
+        return true if method_reads_var_len_state?(b.value.then || [], var_len_props) ||
+                       method_reads_var_len_state?(b.value.else_ || [], var_len_props)
+      end
+      if b.value.kind == "loop"
+        return true if method_reads_var_len_state?(b.value.body || [], var_len_props)
+      end
+    end
+    false
+  end
+
   # -----------------------------------------------------------------------
   # State-property type classification helpers
   # -----------------------------------------------------------------------
@@ -1777,11 +1797,18 @@ module RunarCompiler::Codegen
         end
       end
 
-      # Phase 3: single depth-balance check after ALL drops.
-      if then_ctx.sm.depth > else_ctx.sm.depth
-        then_top_p3 = then_ctx.sm.peek_at_depth(0)
-        if else_bindings.empty? && then_top_p3 && !then_top_p3.empty? && else_ctx.sm.has?(then_top_p3)
-          var_depth = else_ctx.sm.find_depth(then_top_p3)
+      # Phase 3: depth-balance reconciliation after ALL drops.
+      #
+      # Compensate the FULL depth difference between the branches -- NOT just a
+      # single item. A conditional write of N state fields leaves N result
+      # values on the then-branch, so the (empty) else-branch must preserve N
+      # old values. Issue #99 Bug 1: the previous single-shot check only balanced
+      # a 1-item difference, leaving N>=2 conditional writes imbalanced by (N-1).
+      while then_ctx.sm.depth > else_ctx.sm.depth
+        result_depth = then_ctx.sm.depth - else_ctx.sm.depth - 1
+        then_name = then_ctx.sm.peek_at_depth(result_depth)
+        if else_bindings.empty? && then_name && !then_name.empty? && else_ctx.sm.has?(then_name)
+          var_depth = else_ctx.sm.find_depth(then_name)
           if var_depth == 0
             else_ctx.emit_op({ op: "dup" })
           else
@@ -1790,14 +1817,27 @@ module RunarCompiler::Codegen
             else_ctx.emit_op({ op: "pick", depth: var_depth })
             else_ctx.sm.pop
           end
-          else_ctx.sm.push(then_top_p3)
+          else_ctx.sm.push(then_name)
         else
           else_ctx.emit_op({ op: "push", value: { kind: "bytes", bytes_val: "".b } })
           else_ctx.sm.push("")
         end
-      elsif else_ctx.sm.depth > then_ctx.sm.depth
+      end
+      while else_ctx.sm.depth > then_ctx.sm.depth
         then_ctx.emit_op({ op: "push", value: { kind: "bytes", bytes_val: "".b } })
         then_ctx.sm.push("")
+      end
+
+      # Layer B -- branch-balance invariant (#99 Bug 1 guard). After
+      # reconciliation the two arms of an OP_IF/OP_ELSE MUST leave the stack at
+      # identical depth; otherwise the post-ENDIF code (generated against a
+      # single assumed depth) is only correct for the branch the spender does
+      # not take, producing a silently-unspendable script.
+      if then_ctx.sm.depth != else_ctx.sm.depth
+        raise "internal codegen error: conditional emitted stack-imbalanced " \
+              "branches (then depth #{then_ctx.sm.depth} != else depth " \
+              "#{else_ctx.sm.depth}); would produce an unspendable script " \
+              "(see GitHub issue #99); binding=#{binding_name.inspect}"
       end
 
       then_ops = then_ctx.ops
@@ -1817,7 +1857,36 @@ module RunarCompiler::Codegen
       end
 
       # The if expression may produce a result value on top.
-      if then_ctx.sm.depth > @sm.depth
+      if else_bindings.empty? && then_ctx.sm.depth > @sm.depth && then_ctx.sm.depth - @sm.depth >= 2
+        # #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+        # values on top; record them in their on-stack order, then remove the
+        # N stale old property values beneath them.
+        result_count = then_ctx.sm.depth - @sm.depth
+        (result_count - 1).downto(0) do |i|
+          name = then_ctx.sm.peek_at_depth(i)
+          @sm.push(name.nil? || name.empty? ? binding_name : name)
+        end
+        result_names = (0...result_count).map { |i| @sm.peek_at_depth(i) }
+        result_names.each do |name|
+          next if name.nil? || name.empty?
+
+          d = result_count
+          while d < @sm.depth
+            if @sm.peek_at_depth(d) == name
+              emit_push_int(d)
+              @sm.push("")
+              emit_op({ op: "roll", depth: d + 1 })
+              @sm.pop
+              rolled = @sm.remove_at_depth(d)
+              @sm.push(rolled)
+              emit_op({ op: "drop" })
+              @sm.pop
+              break
+            end
+            d += 1
+          end
+        end
+      elsif then_ctx.sm.depth > @sm.depth
         then_top = then_ctx.sm.peek_at_depth(0)
         else_top = else_ctx.sm.depth > 0 ? else_ctx.sm.peek_at_depth(0) : ""
         is_property = @properties.any? { |p| p.name == then_top }
@@ -3542,14 +3611,17 @@ module RunarCompiler::Codegen
   def self._lower_method_with_private_methods(method, properties, private_methods)
     param_names = method.params.map(&:name)
 
-    # If the method uses checkPreimage, the unlocking script pushes implicit
-    # params before all declared parameters (OP_PUSH_TX pattern).
+    # _codePart is needed for continuation builders (add_output/add_raw_output)
+    # OR when the method reads a mutable variable-length (ByteString) state
+    # field -- the deserialization needs it for the preimage-relative offset
+    # (issue #100).
+    var_len_props = properties.select { |p| !p.readonly && p.type == "ByteString" }.map(&:name)
+    uses_code_part = method_uses_check_preimage?(method.body, private_methods) &&
+                     (method_uses_code_part?(method.body) ||
+                      method_reads_var_len_state?(method.body, var_len_props))
     if method_uses_check_preimage?(method.body, private_methods)
       param_names = ["_opPushTxSig"] + param_names
-      # _codePart is needed when the method has add_output or add_raw_output
-      if method_uses_code_part?(method.body)
-        param_names = ["_codePart"] + param_names
-      end
+      param_names = ["_codePart"] + param_names if uses_code_part
     end
 
     ctx = LoweringContext.new(param_names, properties)
@@ -3576,7 +3648,7 @@ module RunarCompiler::Codegen
             "(actual: #{ctx.max_depth}). Simplify the contract logic"
     end
 
-    { name: method.name, ops: ctx.ops, max_stack_depth: ctx.max_depth }
+    { name: method.name, ops: ctx.ops, max_stack_depth: ctx.max_depth, uses_code_part: uses_code_part }
   end
   private_class_method :_lower_method_with_private_methods
 

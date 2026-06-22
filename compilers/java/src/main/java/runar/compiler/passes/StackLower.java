@@ -371,8 +371,19 @@ public final class StackLower {
             // _opPushTxSig is prepended first, then _codePart is prepended in
             // front of it, so the final paramNames layout is
             // [_codePart, _opPushTxSig, ...declared params...].
+            //
+            // _codePart is provisioned for continuation builders
+            // (add_output/add_raw_output/computeStateOutput) OR when the method
+            // reads a mutable variable-length (ByteString) state field — the
+            // var-length deserialization needs it for the preimage-relative
+            // offset (issue #100).
+            java.util.Set<String> varLenProps = new java.util.HashSet<>();
+            for (AnfProperty p : properties) {
+                if (!p.readonly() && "ByteString".equals(p.type())) varLenProps.add(p.name());
+            }
             paramNames.add(0, "_opPushTxSig");
-            if (methodUsesCodePart(method.body())) {
+            if (methodUsesCodePart(method.body())
+                || methodReadsVarLenState(method.body(), varLenProps)) {
                 paramNames.add(0, "_codePart");
             }
         }
@@ -446,6 +457,27 @@ public final class StackLower {
                 if (methodUsesCodePart(iv.thenBranch()) || methodUsesCodePart(iv.elseBranch())) return true;
             }
             if (v instanceof Loop l && methodUsesCodePart(l.body())) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Issue #100: a terminal method that READS a mutable variable-length
+     * (ByteString) state field needs {@code _codePart} on the stack so the
+     * preimage-relative var-length deserialization can compute the state
+     * offset. Narrowed to a live {@code load_prop} of a non-readonly ByteString
+     * property: methods that only read readonly fields (baked into the locking
+     * script) or fixed-size fields keep their original terminal codegen.
+     */
+    private static boolean methodReadsVarLenState(List<AnfBinding> body, java.util.Set<String> varLenProps) {
+        for (AnfBinding b : body) {
+            AnfValue v = b.value();
+            if (v instanceof LoadProp lp && varLenProps.contains(lp.name())) return true;
+            if (v instanceof If iv) {
+                if (methodReadsVarLenState(iv.thenBranch(), varLenProps)
+                    || methodReadsVarLenState(iv.elseBranch(), varLenProps)) return true;
+            }
+            if (v instanceof Loop l && methodReadsVarLenState(l.body(), varLenProps)) return true;
         }
         return false;
     }
@@ -1891,11 +1923,24 @@ public final class StackLower {
                 for (int d : depths) dropAtDepth(thenCtx, d);
             }
 
-            // Phase 3: push placeholder if branches differ in depth.
-            if (thenCtx.sm.depth() > elseCtx.sm.depth()) {
-                String thenTop = thenCtx.sm.peekAtDepth(0);
-                if (elseB.isEmpty() && thenTop != null && !thenTop.isEmpty() && elseCtx.sm.has(thenTop)) {
-                    int varDepth = elseCtx.sm.findDepth(thenTop);
+            // Phase 3: depth-balance reconciliation after ALL drops.
+            //
+            // Compensate the FULL depth difference between the branches — NOT
+            // just a single item. A conditional write of N state fields leaves
+            // N result values on the then-branch, so the (empty) else-branch
+            // must preserve N old values. Issue #99 Bug 1: the previous
+            // single-shot check only balanced a 1-item difference, leaving
+            // N>=2 conditional writes imbalanced by (N-1) and the update branch
+            // unspendable. For each missing slot, when the then-branch
+            // reassigned a variable (if-without-else), push a COPY of that
+            // same-named (old) value in the else-branch; otherwise push a
+            // generic placeholder. Process deepest-to-top so copies land in
+            // the same order.
+            while (thenCtx.sm.depth() > elseCtx.sm.depth()) {
+                int resultDepth = thenCtx.sm.depth() - elseCtx.sm.depth() - 1;
+                String thenName = thenCtx.sm.peekAtDepth(resultDepth);
+                if (elseB.isEmpty() && thenName != null && !thenName.isEmpty() && elseCtx.sm.has(thenName)) {
+                    int varDepth = elseCtx.sm.findDepth(thenName);
                     if (varDepth == 0) {
                         elseCtx.emitOp(new DupOp());
                     } else {
@@ -1904,14 +1949,32 @@ public final class StackLower {
                         elseCtx.emitOp(new PickOp(varDepth));
                         elseCtx.sm.pop();
                     }
-                    elseCtx.sm.push(thenTop);
+                    elseCtx.sm.push(thenName);
                 } else {
                     elseCtx.emitOp(new PushOp(PushValue.ofHex("")));
                     elseCtx.sm.push("");
                 }
-            } else if (elseCtx.sm.depth() > thenCtx.sm.depth()) {
+            }
+            while (elseCtx.sm.depth() > thenCtx.sm.depth()) {
                 thenCtx.emitOp(new PushOp(PushValue.ofHex("")));
                 thenCtx.sm.push("");
+            }
+
+            // Layer B — branch-balance invariant (#99 Bug 1 guard).
+            // After reconciliation the two arms of an OP_IF/OP_ELSE MUST leave
+            // the stack at identical depth; otherwise the code after OP_ENDIF
+            // (generated against a single assumed depth) is only correct for
+            // whichever branch the spender does not take, producing a silently
+            // unspendable script. The Script VM does not enforce branch
+            // balance, so this is the compiler's responsibility. A failure here
+            // is a codegen bug, never a user error — fail loudly at compile
+            // time instead of on-chain.
+            if (thenCtx.sm.depth() != elseCtx.sm.depth()) {
+                throw new RuntimeException(
+                    "Internal codegen error: conditional in method emitted stack-imbalanced "
+                    + "branches (then depth " + thenCtx.sm.depth() + " != else depth "
+                    + elseCtx.sm.depth() + "). This would produce an unspendable script "
+                    + "(see GitHub issue #99). binding='" + bindingName + "'.");
             }
 
             IfOp ifOp;
@@ -1934,7 +1997,37 @@ public final class StackLower {
             }
 
             // If expression may produce a result value on top
-            if (thenCtx.sm.depth() > sm.depth()) {
+            if (elseB.isEmpty() && thenCtx.sm.depth() > sm.depth()
+                && thenCtx.sm.depth() - sm.depth() >= 2) {
+                // #99 Bug 1: a conditional write of N>=2 state fields leaves N
+                // result values on top (new values if taken, preserved old
+                // values if skipped). Record the N results in their on-stack
+                // order, then physically remove the N stale old property values
+                // that now sit beneath the result block.
+                int resultCount = thenCtx.sm.depth() - sm.depth();
+                for (int i = resultCount - 1; i >= 0; i--) {
+                    String nm = thenCtx.sm.peekAtDepth(i);
+                    sm.push((nm == null || nm.isEmpty()) ? bindingName : nm);
+                }
+                List<String> resultNames = new ArrayList<>();
+                for (int i = 0; i < resultCount; i++) resultNames.add(sm.peekAtDepth(i));
+                for (String name : resultNames) {
+                    if (name == null || name.isEmpty()) continue;
+                    for (int d = resultCount; d < sm.depth(); d++) {
+                        if (name.equals(sm.peekAtDepth(d))) {
+                            emitOp(new PushOp(PushValue.of(d)));
+                            sm.push("");
+                            emitOp(new RollOp(d + 1));
+                            sm.pop();
+                            String rolled = sm.removeAtDepth(d);
+                            sm.push(rolled);
+                            emitOp(new DropOp());
+                            sm.pop();
+                            break;
+                        }
+                    }
+                }
+            } else if (thenCtx.sm.depth() > sm.depth()) {
                 String thenTop = thenCtx.sm.peekAtDepth(0);
                 String elseTop = elseCtx.sm.depth() > 0 ? elseCtx.sm.peekAtDepth(0) : "";
                 boolean isProperty = false;
