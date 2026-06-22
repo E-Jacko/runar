@@ -5,6 +5,12 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main, 'release/v*']
+  workflow_dispatch:
+    inputs:
+      run_teranode:
+        description: 'Also run the integration suite against a Teranode node (heavy; opt-in)'
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -109,6 +115,53 @@ jobs:
             exit 1
           fi
           echo "All 6 non-TS SDK envelope interop tests present and wired to the fixture."
+
+  sdk-bip143-fixtures:
+    # Guards the cross-tier BIP-143 transaction-sighash fixture (GAP-003). The
+    # fixture is the frozen TS-reference preimage + deterministic RFC-6979
+    # signature that all seven SDKs replay: each tier recomputes the BIP-143
+    # preimage and verifies the signature, proving the SDKs agree on preimage
+    # assembly (not just that each agrees with the node). Same two silent-
+    # failure modes as the envelope job: TS drift vs the committed fixture, and
+    # a tier silently dropping its interop test from its suite.
+    name: Lint — SDK BIP-143 fixture drift + interop coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Validate BIP-143 fixture against the TS reference (drift guard)
+        run: cd conformance && npx tsx sdk-bip143/generate-fixtures.ts --check
+      - name: Assert every SDK has a BIP-143 interop test wired to the fixture
+        run: |
+          set -euo pipefail
+          files=(
+            "packages/runar-go/sdk_bip143_interop_test.go"
+            "packages/runar-rs/tests/bip143_interop.rs"
+            "packages/runar-py/tests/test_bip143_interop.py"
+            "packages/runar-rb/spec/runar/sdk/bip143_interop_spec.rb"
+            "packages/runar-zig/src/sdk_bip143_interop_test.zig"
+            "packages/runar-java/src/test/java/runar/lang/sdk/Bip143InteropTest.java"
+          )
+          missing=0
+          for f in "${files[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing BIP-143 interop test: $f"
+              missing=1
+            elif ! grep -q "sdk-bip143" "$f"; then
+              echo "::error::$f no longer references conformance/sdk-bip143/fixtures.json"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Cross-tier BIP-143 interop coverage is incomplete. See conformance/sdk-bip143/."
+            exit 1
+          fi
+          echo "All 6 non-TS SDK BIP-143 interop tests present and wired to the fixture."
 
   # ---------------------------------------------------------------------------
   # Compilers — build, unit test, upload artifacts
@@ -1082,3 +1135,32 @@ jobs:
       - name: Stop regtest node
         if: always()
         run: cd integration && ./regtest.sh stop
+
+  # GAP-105: the PR/push integration job above runs against an SV Node regtest.
+  # Teranode is the other production node implementation; its compose stack
+  # (10+ microservices + ~10k-block pre-mine) is too heavy to run on every PR,
+  # so this leg is opt-in via `workflow_dispatch` with `run_teranode=true`. It
+  # reuses integration/teranode.sh and the same Go integration suite under
+  # NODE_TYPE=teranode, giving an automated (not just manual) Teranode path.
+  integration-teranode:
+    name: Integration Tests (Teranode — opt-in)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_teranode
+    needs: [go-compiler, go-sdk]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: compilers/go/go.sum
+      - run: pnpm install --frozen-lockfile
+      - name: Start Teranode + run Go integration suite (NODE_TYPE=teranode)
+        run: pnpm run integration:teranode:run
+      - name: Stop Teranode
+        if: always()
+        run: cd integration && ./teranode.sh stop
