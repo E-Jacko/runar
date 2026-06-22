@@ -15,6 +15,9 @@ coverage/
 /artifacts/
 /conformance/fuzz-findings/
 /conformance/fuzz-findings-ir/
+/conformance/fuzz-findings-anf/
+/conformance/fuzz-findings-canonical/
+/conformance/.tmp/
 target/
 __pycache__/
 *.pyc

@@ -100,4 +100,21 @@ pub fn build(b: *std.Build) void {
     const install_analyzer = b.addInstallArtifact(analyzer_exe, .{});
     const analyzer_step = b.step("analyzer", "Build the runar-analyzer CLI executable");
     analyzer_step.dependOn(&install_analyzer.step);
+
+    // ── canonicalise CLI shim (cross-tier canonicalJson differential fuzzer) ──
+    // conformance/fuzzer/canonical-json-differential.ts shells out to this
+    // binary. It only needs sdk_envelope.zig + std, so it gets a bare module
+    // with no extra imports.
+    const canonicalise_cli_module = b.createModule(.{
+        .root_source_file = b.path("src/canonicalise_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const canonicalise_exe = b.addExecutable(.{
+        .name = "runar-canonicalise",
+        .root_module = canonicalise_cli_module,
+    });
+    const install_canonicalise = b.addInstallArtifact(canonicalise_exe, .{});
+    const canonicalise_step = b.step("canonicalise", "Build the runar-canonicalise CLI shim");
+    canonicalise_step.dependOn(&install_canonicalise.step);
 }

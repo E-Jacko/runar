@@ -414,3 +414,41 @@ that is absent from `sdk-output/tests/` AND not listed in
 `conformance/sdk-output/coverage-allowlist.json`. The allowlist is the only
 approved way to opt a fixture out of SDK-output coverage; every entry carries
 a one-line rationale and is checked for staleness on each audit run.
+
+### Cross-tier BIP-143 sighash interop (GAP-003)
+
+`sdk-bip143/` is the cross-tier gate for **BIP-143 transaction sighash
+preimage construction** — proving the seven SDKs build the *same* preimage
+bytes for the same spend, independent of any node. (Before this, BIP-143
+deploy/call sighash was only tested per-tier against a regtest node; two tiers
+could diverge on a consensus-irrelevant byte, or skip a scenario, and still
+ship green.)
+
+- `sdk-bip143/generate-fixtures.ts` — TypeScript reference generator. TS owns
+  the de-facto golden BIP-143 path (`@bsv/sdk` `TransactionSignature.format`,
+  the exact code `runar-sdk`'s LocalSigner / oppushtx use). It hand-builds an
+  unsigned raw tx per scenario, computes the full preimage, and signs
+  `sha256d(preimage)` with a fixed test key (priv=1, RFC-6979 + low-S — same
+  convention as `sdk-envelope/` signing vectors, so the DER signature is
+  byte-reproducible). Run `npx tsx sdk-bip143/generate-fixtures.ts` to
+  regenerate; `--check` re-derives and fails on drift without rewriting (the
+  CI drift guard).
+- `sdk-bip143/fixtures.json` — frozen fixture. Two scenarios:
+  `p2pkh_spend` (stateless, SIGHASH_ALL|FORKID) and `counter_call` (the
+  stateful OP_PUSH_TX path, using the compiled `Counter` contract as the
+  subscript + a stateful-continuation + OP_RETURN output shape). Each scenario
+  carries everything a consumer needs to recompute the preimage:
+  `{ unsignedTxHex, inputIndex, prevScriptHex, prevValueSats, sighashFlags }`
+  plus expected `{ preimageHex, digestHex, sigHex, pubkeyHex }`.
+- Per-tier replay tests load the fixture, **independently recompute** the
+  BIP-143 preimage from the tx + prevout, assert byte-equality with
+  `preimageHex` (the core node-free check), assert `sha256d(preimage)` equals
+  `digestHex`, and verify the TS-produced `sigHex` against `pubkeyHex` over
+  their own digest. They live beside each tier's `envelope_interop` peer:
+  Go `packages/runar-go/sdk_bip143_interop_test.go`,
+  Rust `packages/runar-rs/tests/bip143_interop.rs`,
+  Python `packages/runar-py/tests/test_bip143_interop.py`,
+  Ruby `packages/runar-rb/spec/runar/sdk/bip143_interop_spec.rb`,
+  Zig `packages/runar-zig/src/sdk_bip143_interop_test.zig`,
+  Java `packages/runar-java/src/test/java/runar/lang/sdk/Bip143InteropTest.java`.
+  All seven tiers (TS reference + six consumers) are green and byte-identical.

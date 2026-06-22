@@ -36,6 +36,11 @@ import {
   ALL_TIERS,
   type CompilerName as AnfCompilerName,
 } from './anf-differential.js';
+import {
+  runCanonicalDifferential,
+  ALL_TIERS as CANON_ALL_TIERS,
+  type CompilerName as CanonCompilerName,
+} from './canonical-json-differential.js';
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -63,6 +68,14 @@ interface FuzzerCLIOptions {
    * stresses every tier's loader + stack-lowerer + emitter.
    */
   anf: boolean;
+  /**
+   * GAP-002 — cross-tier canonicalJson (RFC 8785 / JCS) differential fuzzer.
+   * Generates random JSON-shaped values spanning the tricky surface (key
+   * ordering, float boundaries, surrogate handling, nesting) and asserts all
+   * 7 tiers' canonicalJson produce byte-identical output OR an identical
+   * typed rejection.
+   */
+  canonical: boolean;
   /** Wall-clock budget in ms (anf mode only). */
   timeBudgetMs?: number;
   /**
@@ -92,6 +105,7 @@ function parseArgs(argv: string[]): FuzzerCLIOptions {
     renderStrategy: 'ts',
     stateful: false,
     anf: false,
+    canonical: false,
     foldOn: false,
   };
 
@@ -141,6 +155,9 @@ function parseArgs(argv: string[]): FuzzerCLIOptions {
         break;
       case '--anf':
         opts.anf = true;
+        break;
+      case '--canonical':
+        opts.canonical = true;
         break;
       case '--fold-on':
         opts.foldOn = true;
@@ -195,6 +212,14 @@ Options:
                          Generates random valid ANF programs and asserts every
                          tier's --ir --hex pipeline produces byte-identical
                          Bitcoin Script. Skips frontends entirely.
+  --canonical            GAP-002 — cross-tier canonicalJson (RFC 8785 / JCS)
+                         differential fuzzer. Generates random JSON-shaped
+                         values spanning the tricky surface (UTF-16 key order,
+                         ECMA-262 float boundaries, lone surrogates, nesting)
+                         and asserts all 7 SDK tiers' canonicalJson produce
+                         byte-identical output OR an identical typed rejection.
+                         Each non-TS tier is driven via its --canonicalise CLI
+                         shim. Use --num for case count and --seed to reproduce.
   --time-budget-ms <n>   ANF mode only. Early-stop once wall-clock exceeded.
   --fold-on              ANF mode only. Run every tier with constant-folding
                          ENABLED (omit --disable-constant-folding). Default is
@@ -253,8 +278,46 @@ async function main(): Promise<void> {
       console.log(`  Budget: ${opts.timeBudgetMs}ms`);
     }
   }
+  if (opts.canonical) {
+    console.log('  Generator: canonical (GAP-002 — cross-tier canonicalJson RFC 8785 / JCS)');
+  }
   console.log(`  Mode: ${opts.property ? 'property-based (with shrinking)' : 'sample-based'}`);
   console.log('');
+
+  if (opts.canonical) {
+    const tiers = (opts.compilers as readonly string[]).filter((c): c is CanonCompilerName =>
+      (CANON_ALL_TIERS as readonly string[]).includes(c),
+    );
+    const report = await runCanonicalDifferential({
+      numCases: opts.num,
+      seed: opts.seed,
+      tiers,
+      verbose: opts.verbose,
+      findingsDir: opts.findingsDir,
+    });
+    console.log('');
+    console.log('canonicalJson differential fuzzing complete:');
+    console.log(`  Cases run:   ${report.casesRun}/${report.totalCases}`);
+    console.log(`  Mismatches:  ${report.mismatchCount}`);
+    console.log(`  Duration:    ${report.durationMs}ms`);
+    console.log(`  Tiers:       ${Object.entries(report.perTierAvailable)
+      .map(([t, ok]) => `${t}=${ok ? 'ok' : 'skip'}`)
+      .join(' ')}`);
+    if (report.findings.length > 0) {
+      console.log(`  Findings:    ${report.findings.length} (e.g. ${report.findings[0]})`);
+    }
+    if (opts.output) {
+      writeOutput(opts.output, {
+        timestamp: new Date().toISOString(),
+        seed: opts.seed,
+        generator: 'canonical',
+        ...report,
+      });
+      console.log(`\nResults written to: ${opts.output}`);
+    }
+    if (report.mismatchCount > 0) process.exit(1);
+    return;
+  }
 
   if (opts.anf) {
     // Filter the requested compilers down to the ANF tier list (the

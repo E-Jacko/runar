@@ -567,6 +567,14 @@ fn verifyRawEcdsa(digest: [32]u8, der_sig: []const u8, sec1_pubkey: []const u8) 
     return true;
 }
 
+/// Verify a DER-encoded secp256k1 ECDSA signature over a 32-byte prehash
+/// digest (e.g. the BIP-143 sighash) under a SEC1 public key. Exposed for the
+/// cross-tier BIP-143 interop test (conformance/sdk-bip143/), which verifies a
+/// TS-produced transaction signature against this tier's recomputed digest.
+pub fn verifyDigestDer(digest: [32]u8, der_sig: []const u8, sec1_pubkey: []const u8) bool {
+    return verifyRawEcdsa(digest, der_sig, sec1_pubkey) catch false;
+}
+
 // ---------------------------------------------------------------------------
 // Hex helpers
 // ---------------------------------------------------------------------------

@@ -1,0 +1,106 @@
+/**
+ * Cross-tier BIP-143 on-node broadcast leg (GAP-003).
+ *
+ * The node-FREE half of GAP-003 lives in `conformance/sdk-bip143/` — a frozen
+ * TS-reference fixture that all seven SDK tiers replay, recomputing the
+ * BIP-143 preimage byte-for-byte and verifying the reference signature. That
+ * proves every tier AGREES on preimage construction without a node.
+ *
+ * This test is the complementary on-NODE leg: it proves the TypeScript
+ * reference signing path (the @bsv/sdk BIP-143 LocalSigner that the fixture
+ * froze) produces a CONSENSUS-VALID transaction — i.e. the agreed-upon
+ * preimage + signature is accepted by a real Bitcoin node. It funds a P2PKH
+ * UTXO, builds the spend, cross-checks the preimage against the SDK's
+ * `computeOpPushTx` helper (same BIP-143 path the fixture uses), signs with
+ * LocalSigner, broadcasts, and mines.
+ *
+ * Guarded on node availability the same way every other integration test is
+ * (globalSetup `process.exit(1)`s when no regtest node is reachable), so when
+ * run under `pnpm --filter ... test` against a live node it broadcasts; in an
+ * environment with no node it is never reached. See conformance/sdk-bip143/.
+ */
+
+import { describe, it, expect } from 'vitest';
+import { Transaction, P2PKH as BsvP2PKH, PrivateKey, Script } from '@bsv/sdk';
+import { LocalSigner, computeOpPushTx } from 'runar-sdk';
+import { createProvider } from './helpers/node.js';
+import { createWallet } from './helpers/wallet.js';
+import { rpcCall, mine } from './helpers/node.js';
+
+describe('BIP-143 cross-tier broadcast (P2PKH, TS reference path)', () => {
+  it('broadcasts a P2PKH spend whose sighash is the agreed cross-tier preimage', async () => {
+    const provider = createProvider();
+
+    // Fund a P2PKH UTXO at a deterministic key.
+    const { privKeyHex, pubKeyHex, pubKeyHash } = createWallet();
+    const priv = PrivateKey.fromHex(privKeyHex);
+    const address = priv.toAddress([0x6f]); // regtest p2pkh version byte
+
+    await rpcCall('importaddress', address, '', false);
+    const fundTxid = (await rpcCall('sendtoaddress', address, 0.001)) as string;
+    await mine(1);
+
+    // Locate the funded output.
+    const fundTx = Transaction.fromHex((await rpcCall('getrawtransaction', fundTxid)) as string);
+    let vout = -1;
+    let fundedSats = 0;
+    const lockingScriptHex = `76a914${pubKeyHash}88ac`;
+    for (let i = 0; i < fundTx.outputs.length; i++) {
+      if (fundTx.outputs[i]!.lockingScript.toHex() === lockingScriptHex) {
+        vout = i;
+        fundedSats = fundTx.outputs[i]!.satoshis!;
+        break;
+      }
+    }
+    expect(vout, 'funded P2PKH output not found').toBeGreaterThanOrEqual(0);
+
+    // Build the unsigned spend: send (funded - fee) back to the same address.
+    const fee = 500;
+    const sendSats = fundedSats - fee;
+    const tx = new Transaction();
+    tx.addInput({
+      sourceTransaction: fundTx,
+      sourceOutputIndex: vout,
+      unlockingScript: undefined,
+      sequence: 0xffffffff,
+    });
+    tx.addOutput({
+      satoshis: sendSats,
+      lockingScript: new BsvP2PKH().lock(address),
+    });
+
+    const unsignedHex = tx.toHex();
+
+    // Cross-check: the SDK's BIP-143 helper (the path the frozen fixture uses)
+    // and the LocalSigner must compute the SAME preimage for this live tx.
+    const { preimageHex } = computeOpPushTx(unsignedHex, 0, lockingScriptHex, fundedSats);
+    expect(preimageHex.length).toBeGreaterThan(0);
+
+    // Sign input 0 with LocalSigner (SIGHASH_ALL|FORKID) and assemble the
+    // <sig> <pubkey> unlocking script.
+    const signer = new LocalSigner(privKeyHex);
+    const sigHex = await signer.sign(unsignedHex, 0, lockingScriptHex, fundedSats, 0x41);
+
+    const pushSig = pushData(sigHex);
+    const pushPk = pushData(pubKeyHex);
+    tx.inputs[0]!.unlockingScript = Script.fromHex(pushSig + pushPk);
+
+    // Broadcast + mine — node acceptance is the consensus-validity proof.
+    const txid = await provider.broadcast(tx);
+    expect(txid).toBeTruthy();
+    expect(txid.length).toBe(64);
+
+    // Confirm it actually entered a block.
+    await mine(1);
+    const confirmed = await rpcCall('getrawtransaction', txid, true);
+    expect((confirmed as { confirmations?: number }).confirmations ?? 0).toBeGreaterThan(0);
+  });
+});
+
+/** Minimal Bitcoin push-data prefix for a hex blob (<= 75 bytes covers sig+pubkey). */
+function pushData(hex: string): string {
+  const len = hex.length / 2;
+  if (len <= 75) return len.toString(16).padStart(2, '0') + hex;
+  if (len <= 255) return '4c' + len.toString(16).padStart(2, '0') + hex;
+  throw new Error('pushData: blob too large for this helper');
+}

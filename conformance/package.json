@@ -17,6 +17,9 @@
     "fuzz:property": "tsx fuzzer/index.ts --property",
     "fuzz:anf": "tsx fuzzer/index.ts --anf --num 100 --time-budget-ms 30000",
     "fuzz:anf:thorough": "tsx fuzzer/index.ts --anf --num 1000 --time-budget-ms 300000",
+    "fuzz:canonical": "tsx fuzzer/index.ts --canonical --num 200",
+    "fuzz:canonical:fast": "tsx fuzzer/index.ts --canonical --num 200 --compilers ts,go,rust,python,zig,ruby",
+    "fuzz:canonical:gate": "tsx fuzzer/index.ts --canonical --seed 20020602 --num 64 --compilers ts,go,rust,python,zig,ruby",
     "sdk-output": "tsx sdk-output/runner/sdk-runner.ts"
   },
   "dependencies": {

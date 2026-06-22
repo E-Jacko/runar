@@ -31,6 +31,16 @@ tasks.register<JavaExec>("runAnalyzer") {
     mainClass.set("runar.lang.analyzer.AnalyzerCli")
 }
 
+// Convenience task: `gradle -q runCanonicalise` with a JSON request on stdin.
+// Used by conformance/fuzzer/canonical-json-differential.ts.
+tasks.register<JavaExec>("runCanonicalise") {
+    description = "Run the canonicalJson CLI shim (stdin JSON request -> stdout canonical bytes)."
+    group = "application"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("runar.lang.sdk.CanonicaliseShim")
+    standardInput = System.`in`
+}
+
 repositories {
     mavenCentral()
 }

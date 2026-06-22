@@ -53,9 +53,13 @@ def _canonical_append(out: List[str], value: Any) -> None:
         if value.is_integer() and -9_007_199_254_740_992 <= value <= 9_007_199_254_740_992:
             out.append(str(int(value)))
             return
-        # Python's repr matches ES Number.prototype.toString for most cases
-        # via shortest-roundtrip. Use repr() for floats.
-        out.append(repr(value))
+        # ECMA-262 §6.1.6.1.13 Number::toString. Python's repr() is shortest
+        # round-trip (same digit string as JS) but its surface form diverges
+        # from ES: repr zero-pads exponents (1e-07), switches to scientific
+        # form earlier than ES (1e-06 vs ES 0.000001), and never expands large
+        # integers (1e+20 vs ES 100000000000000000000). Re-emit per the ES
+        # rules so the bytes are byte-identical to the TS / Go / Rust tiers.
+        out.append(_format_ecma262_double(value))
         return
     if isinstance(value, str):
         _append_json_string(out, value)
@@ -95,6 +99,56 @@ def _canonical_append(out: List[str], value: Any) -> None:
         out.append("}")
         return
     raise TypeError(f"canonical JSON: unsupported type {type(value).__name__}")
+
+
+def _format_ecma262_double(x: float) -> str:
+    """Format a finite, non-zero double per ECMA-262 §6.1.6.1.13
+    Number::toString. Output is byte-identical to JS ``JSON.stringify(x)`` /
+    ``String(x)`` for any finite ``x``. Ported from the Rust reference
+    ``format_ecma262_double`` (packages/runar-rs/src/sdk/envelope.rs) so the
+    bytes match across tiers (caller filters 0 / NaN / Infinity).
+    """
+    if x < 0:
+        return "-" + _format_ecma262_double(-x)
+
+    # repr() gives the shortest round-trip decimal string (same digits JS
+    # picks). Decompose it into a normalized digit string + decimal exponent
+    # k, then re-emit per the ES rules — independent of repr's surface form.
+    s = repr(x)
+    if "e" in s or "E" in s:
+        mantissa, _, exp_str = s.replace("E", "e").partition("e")
+        exp_part = int(exp_str)
+    else:
+        mantissa, exp_part = s, 0
+
+    if "." in mantissa:
+        int_part, frac_part = mantissa.split(".", 1)
+    else:
+        int_part, frac_part = mantissa, ""
+
+    raw_digits = int_part + frac_part
+    leading_zeros = len(raw_digits) - len(raw_digits.lstrip("0"))
+    digits = raw_digits[leading_zeros:].rstrip("0")
+    if not digits:
+        return "0"
+
+    # k: position of the decimal point relative to the significant digits.
+    k = len(int_part) - leading_zeros + exp_part
+    s_len = len(digits)
+
+    if k >= s_len and k <= 21:
+        return digits + "0" * (k - s_len)
+    if 0 < k <= 21:
+        return digits[:k] + "." + digits[k:]
+    if -6 < k <= 0:
+        return "0." + "0" * (-k) + digits
+    # Scientific notation.
+    exp = k - 1
+    exp_sign = "+" if exp >= 0 else "-"
+    exp_abs = abs(exp)
+    if s_len == 1:
+        return f"{digits}e{exp_sign}{exp_abs}"
+    return f"{digits[0]}.{digits[1:]}e{exp_sign}{exp_abs}"
 
 
 def _append_json_string(out: List[str], s: str) -> None:

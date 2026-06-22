@@ -257,3 +257,130 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
+
+  # ---------------------------------------------------------------------------
+  # GAP-002 — cross-tier canonicalJson (RFC 8785 / JCS) differential fuzz.
+  #
+  # canonicalJson is a WIRE-PROTOCOL primitive (its bytes are hashed + signed;
+  # a signature from one tier must verify under every other tier). This job
+  # generates random JSON-shaped values spanning the tricky surface (UTF-16
+  # key ordering, ECMA-262 §6.1.6.1.13 float boundaries, lone surrogates,
+  # nesting) and asserts all 7 SDK tiers' canonicalJson produce byte-identical
+  # output OR an identical typed rejection. Each non-TS tier is driven via its
+  # `--canonicalise` CLI shim.
+  #
+  # Triggers: same as the ANF job. On `pull_request` it runs a FIXED-seed,
+  # modest-count gate over the six fast tiers (Java's per-invocation gradle
+  # JVM cold-start is too slow for a PR gate, so Java is covered nightly).
+  # Schedule / push / workflow_dispatch run all 7 tiers with a run_id-seeded
+  # corpus for rotating coverage.
+  # ---------------------------------------------------------------------------
+  fuzz-canonical:
+    name: canonicalJson differential (7 SDK tiers x N random JSON values)
+    runs-on: ubuntu-latest
+    # Java is driven via `gradle -q runCanonicalise`, one JVM cold-start per
+    # case; budget generously for the nightly 7-tier run.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ----- Toolchains for all 7 SDK tiers -----
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: packages/runar-go/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+
+      # ----- TS workspace install + build (the canonical fuzzer in-process
+      # ----- imports the TS reference `canonicalJsonStringify`). -----
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: cd conformance && npm ci
+
+      # ----- Build the Zig canonicalise shim binary the driver shells out to.
+      # ----- (Go uses `go run`, Rust `cargo run --example`, Python/Ruby are
+      # ----- interpreted, Java is `gradle -q runCanonicalise` — all built
+      # ----- lazily on first invocation, so only Zig needs a prebuild step.)
+      - name: Build Zig canonicalise shim
+        run: cd packages/runar-zig && zig build canonicalise
+
+      # ----- PR gate: fixed seed, six fast tiers, hard-fail on divergence.
+      - name: Canonical fuzz (PR gate — fixed seed, 6 fast tiers)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --canonical \
+            --num 64 \
+            --seed 20020602 \
+            --compilers ts,go,rust,python,zig,ruby \
+            --output /tmp/canonical-fuzz-pr.json
+
+      # ----- Schedule / push / dispatch: all 7 tiers, run_id-seeded corpus.
+      - name: Resolve canonical fuzz parameters
+        if: github.event_name != 'pull_request'
+        id: cparams
+        env:
+          INPUT_SEED: ${{ inputs.seed }}
+          INPUT_NUM: ${{ inputs.num_programs }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          seed="$INPUT_SEED"
+          if [ -z "$seed" ]; then
+            seed=$(( RUN_ID % 2147483647 ))
+          fi
+          num="$INPUT_NUM"
+          if [ -z "$num" ]; then num=100; fi
+          {
+            echo "seed=$seed"
+            echo "num=$num"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Canonical fuzz (all 7 SDK tiers)
+        if: github.event_name != 'pull_request'
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.cparams.outputs.seed }}
+          NUM: ${{ steps.cparams.outputs.num }}
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --canonical \
+            --num "$NUM" \
+            --seed "$SEED" \
+            --compilers ts,go,rust,python,zig,ruby,java \
+            --output /tmp/canonical-fuzz-report.json
+
+      - name: Upload canonical fuzz findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canonical-fuzz-findings-${{ github.run_id }}
+          path: |
+            conformance/fuzz-findings-canonical/
+            /tmp/canonical-fuzz-report.json
+            /tmp/canonical-fuzz-pr.json
+          if-no-files-found: ignore
+          retention-days: 30
