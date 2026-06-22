@@ -272,7 +272,7 @@ mod tests {
                             AbiParam { name: "to".to_string(), param_type: "Addr".to_string(), fixed_array: None  },
                         ],
                         is_public: true,
-                        is_terminal: None,
+                        is_terminal: None, uses_code_part: None,
                     },
                     AbiMethod {
                         name: "merge".to_string(),
@@ -282,7 +282,7 @@ mod tests {
                             AbiParam { name: "otherHolder".to_string(), param_type: "PubKey".to_string(), fixed_array: None  },
                         ],
                         is_public: true,
-                        is_terminal: None,
+                        is_terminal: None, uses_code_part: None,
                     },
                 ],
             },

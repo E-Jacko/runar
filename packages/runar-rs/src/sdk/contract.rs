@@ -2283,7 +2283,7 @@ mod tests {
                 methods: vec![AbiMethod {
                     name: "unlock".to_string(),
                     params: vec![],
-                    is_public: true, is_terminal: None,
+                    is_public: true, is_terminal: None, uses_code_part: None,
                 }],
             },
             script: "76a90088ac".to_string(),
@@ -2323,7 +2323,7 @@ mod tests {
                         AbiParam { name: "pk2".to_string(), param_type: "PubKey".to_string(), fixed_array: None },
                     ],
                 },
-                methods: vec![AbiMethod { name: "unlock".to_string(), params: vec![], is_public: true, is_terminal: None }],
+                methods: vec![AbiMethod { name: "unlock".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None }],
             },
             script: "007c00ac".to_string(),
             state_fields: None,
@@ -2361,7 +2361,7 @@ mod tests {
                         param_type: "Addr".to_string(), fixed_array: None ,
                     }],
                 },
-                methods: vec![AbiMethod { name: "unlock".to_string(), params: vec![], is_public: true, is_terminal: None }],
+                methods: vec![AbiMethod { name: "unlock".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None }],
             },
             script: "76a90088ac".to_string(),
             state_fields: None,
@@ -2397,7 +2397,7 @@ mod tests {
                         param_type: "bigint".to_string(), fixed_array: None ,
                     }],
                 },
-                methods: vec![AbiMethod { name: "check".to_string(), params: vec![], is_public: true, is_terminal: None }],
+                methods: vec![AbiMethod { name: "check".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None }],
             },
             script: "009c69".to_string(),
             state_fields: None,
@@ -2425,7 +2425,7 @@ mod tests {
                 constructor: AbiConstructor {
                     params: vec![AbiParam { name: "x".to_string(), param_type: "bigint".to_string(), fixed_array: None }],
                 },
-                methods: vec![AbiMethod { name: "check".to_string(), params: vec![], is_public: true, is_terminal: None }],
+                methods: vec![AbiMethod { name: "check".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None }],
             },
             script: "00930088".to_string(),
             state_fields: None,
@@ -2450,7 +2450,7 @@ mod tests {
     #[test]
     fn no_selector_for_single_public_method() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "unlock".to_string(), params: vec![AbiParam { name: "sig".to_string(), param_type: "Sig".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "unlock".to_string(), params: vec![AbiParam { name: "sig".to_string(), param_type: "Sig".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         let sig = "aa".repeat(72);
@@ -2462,8 +2462,8 @@ mod tests {
     #[test]
     fn selector_op0_for_index_0() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "release".to_string(), params: vec![], is_public: true, is_terminal: None },
-            AbiMethod { name: "refund".to_string(), params: vec![], is_public: true, is_terminal: None },
+            AbiMethod { name: "release".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
+            AbiMethod { name: "refund".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         let script = contract.build_unlocking_script("release", &[]).unwrap();
@@ -2473,8 +2473,8 @@ mod tests {
     #[test]
     fn selector_op1_for_index_1() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "release".to_string(), params: vec![], is_public: true, is_terminal: None },
-            AbiMethod { name: "refund".to_string(), params: vec![], is_public: true, is_terminal: None },
+            AbiMethod { name: "release".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
+            AbiMethod { name: "refund".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         let script = contract.build_unlocking_script("refund", &[]).unwrap();
@@ -2484,9 +2484,9 @@ mod tests {
     #[test]
     fn selector_skips_private_methods() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "release".to_string(), params: vec![], is_public: true, is_terminal: None },
-            AbiMethod { name: "_helper".to_string(), params: vec![], is_public: false, is_terminal: None },
-            AbiMethod { name: "refund".to_string(), params: vec![], is_public: true, is_terminal: None },
+            AbiMethod { name: "release".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
+            AbiMethod { name: "_helper".to_string(), params: vec![], is_public: false, is_terminal: None, uses_code_part: None },
+            AbiMethod { name: "refund".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         // 'refund' is public method index 1 (skipping private)
@@ -2497,8 +2497,8 @@ mod tests {
     #[test]
     fn unlocking_script_unknown_method() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "release".to_string(), params: vec![], is_public: true, is_terminal: None },
-            AbiMethod { name: "refund".to_string(), params: vec![], is_public: true, is_terminal: None },
+            AbiMethod { name: "release".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
+            AbiMethod { name: "refund".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         assert!(contract.build_unlocking_script("nonexistent", &[]).is_err());
@@ -2511,7 +2511,7 @@ mod tests {
     #[test]
     fn encodes_bigint_0_as_op0() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "n".to_string(), param_type: "bigint".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "n".to_string(), param_type: "bigint".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         assert_eq!(contract.build_unlocking_script("check", &[SdkValue::Int(0)]).unwrap(), "00");
@@ -2520,7 +2520,7 @@ mod tests {
     #[test]
     fn encodes_bigint_1_to_16_as_opcodes() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "n".to_string(), param_type: "bigint".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "n".to_string(), param_type: "bigint".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         assert_eq!(contract.build_unlocking_script("check", &[SdkValue::Int(1)]).unwrap(), "51");
@@ -2531,7 +2531,7 @@ mod tests {
     #[test]
     fn encodes_neg1_as_op1negate() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "n".to_string(), param_type: "bigint".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "n".to_string(), param_type: "bigint".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         assert_eq!(contract.build_unlocking_script("check", &[SdkValue::Int(-1)]).unwrap(), "4f");
@@ -2540,7 +2540,7 @@ mod tests {
     #[test]
     fn encodes_1000_as_push_data() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "n".to_string(), param_type: "bigint".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "n".to_string(), param_type: "bigint".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         assert_eq!(contract.build_unlocking_script("check", &[SdkValue::Int(1000)]).unwrap(), "02e803");
@@ -2549,7 +2549,7 @@ mod tests {
     #[test]
     fn encodes_neg42_with_sign_bit() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "n".to_string(), param_type: "bigint".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "n".to_string(), param_type: "bigint".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         assert_eq!(contract.build_unlocking_script("check", &[SdkValue::Int(-42)]).unwrap(), "01aa");
@@ -2558,7 +2558,7 @@ mod tests {
     #[test]
     fn encodes_20_byte_hex_with_14_prefix() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "h".to_string(), param_type: "Addr".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "h".to_string(), param_type: "Addr".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         let addr = "aa".repeat(20);
@@ -2569,7 +2569,7 @@ mod tests {
     #[test]
     fn encodes_33_byte_hex_with_21_prefix() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "pk".to_string(), param_type: "PubKey".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "pk".to_string(), param_type: "PubKey".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         let pubkey = "bb".repeat(33);
@@ -2580,7 +2580,7 @@ mod tests {
     #[test]
     fn encodes_bool_true() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "flag".to_string(), param_type: "bool".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "flag".to_string(), param_type: "bool".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         assert_eq!(contract.build_unlocking_script("check", &[SdkValue::Bool(true)]).unwrap(), "51");
@@ -2589,7 +2589,7 @@ mod tests {
     #[test]
     fn encodes_bool_false() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "flag".to_string(), param_type: "bool".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "check".to_string(), params: vec![AbiParam { name: "flag".to_string(), param_type: "bool".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         assert_eq!(contract.build_unlocking_script("check", &[SdkValue::Bool(false)]).unwrap(), "00");
@@ -2602,8 +2602,8 @@ mod tests {
     #[test]
     fn args_then_selector() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "release".to_string(), params: vec![AbiParam { name: "sig".to_string(), param_type: "Sig".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
-            AbiMethod { name: "refund".to_string(), params: vec![AbiParam { name: "sig".to_string(), param_type: "Sig".to_string(), fixed_array: None }], is_public: true, is_terminal: None },
+            AbiMethod { name: "release".to_string(), params: vec![AbiParam { name: "sig".to_string(), param_type: "Sig".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
+            AbiMethod { name: "refund".to_string(), params: vec![AbiParam { name: "sig".to_string(), param_type: "Sig".to_string(), fixed_array: None }], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         let sig = "cc".repeat(71);
@@ -2615,9 +2615,9 @@ mod tests {
     #[test]
     fn three_methods_correct_indices() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "a".to_string(), params: vec![], is_public: true, is_terminal: None },
-            AbiMethod { name: "b".to_string(), params: vec![], is_public: true, is_terminal: None },
-            AbiMethod { name: "c".to_string(), params: vec![], is_public: true, is_terminal: None },
+            AbiMethod { name: "a".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
+            AbiMethod { name: "b".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
+            AbiMethod { name: "c".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let contract = RunarContract::new(artifact, vec![]);
         assert_eq!(contract.build_unlocking_script("a", &[]).unwrap(), "00");
@@ -2660,7 +2660,7 @@ mod tests {
             abi_with_methods(vec![AbiMethod {
                 name: "spend".to_string(),
                 params: vec![],
-                is_public: true, is_terminal: None,
+                is_public: true, is_terminal: None, uses_code_part: None,
             }]),
         );
         let mut contract = RunarContract::new(artifact, vec![]);
@@ -2735,7 +2735,7 @@ mod tests {
             abi_with_methods(vec![AbiMethod {
                 name: "spend".to_string(),
                 params: vec![],
-                is_public: true, is_terminal: None,
+                is_public: true, is_terminal: None, uses_code_part: None,
             }]),
         );
         let mut contract = RunarContract::new(artifact, vec![]);
@@ -2755,7 +2755,7 @@ mod tests {
             abi_with_methods(vec![AbiMethod {
                 name: "spend".to_string(),
                 params: vec![],
-                is_public: true, is_terminal: None,
+                is_public: true, is_terminal: None, uses_code_part: None,
             }]),
         );
         let mut contract = RunarContract::new(artifact, vec![]);
@@ -2790,7 +2790,7 @@ mod tests {
                     AbiParam { name: "to".to_string(), param_type: "Addr".to_string(), fixed_array: None },
                     AbiParam { name: "amount".to_string(), param_type: "bigint".to_string(), fixed_array: None },
                 ],
-                is_public: true, is_terminal: None,
+                is_public: true, is_terminal: None, uses_code_part: None,
             }]),
         );
         let mut contract = RunarContract::new(artifact, vec![]);
@@ -2890,7 +2890,7 @@ mod tests {
             abi_with_methods(vec![AbiMethod {
                 name: "spend".to_string(),
                 params: vec![],
-                is_public: true, is_terminal: None,
+                is_public: true, is_terminal: None, uses_code_part: None,
             }]),
         );
 
@@ -3042,7 +3042,7 @@ mod tests {
     #[test]
     fn terminal_call_sets_utxo_to_none() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "cancel".to_string(), params: vec![], is_public: true, is_terminal: None },
+            AbiMethod { name: "cancel".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let mut contract = RunarContract::new(artifact, vec![]);
 
@@ -3077,7 +3077,7 @@ mod tests {
     #[test]
     fn terminal_call_subsequent_call_fails() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "spend".to_string(), params: vec![], is_public: true, is_terminal: None },
+            AbiMethod { name: "spend".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let mut contract = RunarContract::new(artifact, vec![]);
 
@@ -3113,7 +3113,7 @@ mod tests {
     #[test]
     fn terminal_call_multiple_outputs() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "settle".to_string(), params: vec![], is_public: true, is_terminal: None },
+            AbiMethod { name: "settle".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let mut contract = RunarContract::new(artifact, vec![]);
 
@@ -3147,7 +3147,7 @@ mod tests {
     #[test]
     fn terminal_call_tx_structure() {
         let artifact = make_artifact("51", abi_with_methods(vec![
-            AbiMethod { name: "cancel".to_string(), params: vec![], is_public: true, is_terminal: None },
+            AbiMethod { name: "cancel".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
         ]));
         let mut contract = RunarContract::new(artifact, vec![]);
 
@@ -3334,7 +3334,7 @@ mod tests {
                     name: "increment".to_string(),
                     params: vec![],
                     is_public: true,
-                    is_terminal: None,
+                    is_terminal: None, uses_code_part: None,
                 }],
             },
             script: script.to_string(),

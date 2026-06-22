@@ -316,7 +316,7 @@ mod tests {
                     name: "spend".to_string(),
                     params: vec![],
                     is_public: true,
-                    is_terminal: None,
+                    is_terminal: None, uses_code_part: None,
                 }],
             },
             script: script.to_string(),

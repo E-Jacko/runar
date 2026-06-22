@@ -57,7 +57,7 @@ fn make_intent_artifact(prev_out_inputs: &[usize], serialised: bool) -> RunarArt
                 name: "move".to_string(),
                 params,
                 is_public: true,
-                is_terminal: None,
+                is_terminal: None, uses_code_part: None,
             }],
         },
         script: "51".to_string(),

@@ -52,9 +52,10 @@ import {
   Utils,
 } from '@bsv/sdk';
 import { sign as ecdsaSign, verify as ecdsaVerify } from '@bsv/sdk/primitives/ECDSA';
-// Import the compiler from source (mirrors how validate-fixtures.ts imports
-// runar-ir-schema source) so this stays install-only in CI without a build.
-import { compile } from '../../packages/runar-compiler/src/index.js';
+// The compiler (used only to build the Counter scenario's locking script when
+// REGENERATING the fixture) is imported dynamically inside compileCounterScript
+// so the build-free `--check` drift guard never pulls in runar-compiler /
+// runar-ir-schema/dist (which a lightweight CI lint job does not build).
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = resolve(__dirname, '..', '..');
@@ -255,7 +256,8 @@ function buildScenario(
   };
 }
 
-function compileCounterScript(): string {
+async function compileCounterScript(): Promise<string> {
+  const { compile } = await import('../../packages/runar-compiler/src/index.js');
   const src = readFileSync(
     resolve(PROJECT_ROOT, 'examples/ts/stateful-counter/Counter.runar.ts'),
     'utf8',
@@ -274,7 +276,7 @@ function compileCounterScript(): string {
   return hex;
 }
 
-function buildScenarios(): Scenario[] {
+async function buildScenarios(): Promise<Scenario[]> {
   const scenarios: Scenario[] = [];
 
   // ---- Scenario 1: P2PKH spend — SIGHASH_ALL|FORKID, stateless ----
@@ -308,7 +310,7 @@ function buildScenarios(): Scenario[] {
   // carries a stateful continuation output (the same shape buildCallTransaction
   // produces). Distinct tx shape + a large scriptCode exercises a different
   // preimage than scenario 1.
-  const counterScript = compileCounterScript();
+  const counterScript = await compileCounterScript();
   const s2Inputs: TxIn[] = [
     {
       prevTxid: 'b'.repeat(64),
@@ -445,33 +447,39 @@ function readVarint(buf: Buffer, o: number): [number, number] {
 
 // ---------------------------------------------------------------------------
 
-function main(): void {
+async function main(): Promise<void> {
   const checkOnly = process.argv.includes('--check');
   const fixturePath = join(__dirname, 'fixtures.json');
 
   if (checkOnly) {
+    // Build-free drift guard: re-derive the signing-sensitive bytes (preimage,
+    // digest, deterministic signature) from the committed tx + prevout using
+    // the live TS reference, and re-verify the signature. This catches any
+    // drift in the BIP-143 preimage-assembly or RFC-6979/low-S signing path
+    // WITHOUT recompiling the Counter contract — the prevScriptHex is a frozen
+    // test vector (compiled-script drift is covered by the conformance suite),
+    // so `--check` stays install-only and needs no `pnpm build`.
     const committed = JSON.parse(readFileSync(fixturePath, 'utf8'));
     const scenarios = committed.scenarios as Scenario[];
-    // Re-derive from scratch and assert the committed bytes still match.
-    const fresh = buildScenarios();
-    selfValidate(scenarios); // committed bytes are internally consistent
-    for (const f of fresh) {
-      const c = scenarios.find((s) => s.scenario === f.scenario);
-      if (!c) throw new Error(`committed fixture missing scenario ${f.scenario}`);
-      for (const k of ['unsignedTxHex', 'prevScriptHex', 'preimageHex', 'sigHex', 'pubkeyHex', 'digestHex'] as const) {
-        if ((c as Record<string, unknown>)[k] !== (f as Record<string, unknown>)[k]) {
-          console.error(`FAIL: ${f.scenario}.${k} drifted from TS reference`);
-          console.error(`  committed:  ${(c as Record<string, unknown>)[k]}`);
-          console.error(`  recomputed: ${(f as Record<string, unknown>)[k]}`);
-          process.exit(1);
-        }
+    selfValidate(scenarios); // preimage recomputes + digest matches + sig verifies
+    for (const s of scenarios) {
+      const { sigHex, digestHex } = signPreimage(s.preimageHex);
+      if (sigHex !== s.sigHex) {
+        console.error(`FAIL: ${s.scenario}.sigHex drifted from the TS reference`);
+        console.error(`  committed:  ${s.sigHex}`);
+        console.error(`  recomputed: ${sigHex}`);
+        process.exit(1);
+      }
+      if (digestHex !== s.digestHex) {
+        console.error(`FAIL: ${s.scenario}.digestHex drifted ${digestHex} != ${s.digestHex}`);
+        process.exit(1);
       }
     }
     console.log(`OK: committed BIP-143 fixture matches the TS reference (${scenarios.length} scenarios).`);
     return;
   }
 
-  const scenarios = buildScenarios();
+  const scenarios = await buildScenarios();
   selfValidate(scenarios);
 
   const fixture = {
@@ -491,4 +499,7 @@ function main(): void {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

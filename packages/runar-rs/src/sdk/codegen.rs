@@ -1056,7 +1056,7 @@ mod tests {
                 name: "unlock".to_string(),
                 params: vec![],
                 is_public: true,
-                is_terminal: None,
+                is_terminal: None, uses_code_part: None,
             }],
             None,
         );
@@ -1088,7 +1088,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
-                is_terminal: None,
+                is_terminal: None, uses_code_part: None,
             }],
             None,
         );
@@ -1131,7 +1131,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
-                is_terminal: None,
+                is_terminal: None, uses_code_part: None,
             }],
             Some(vec![StateField {
                 name: "count".to_string(),
@@ -1162,7 +1162,7 @@ mod tests {
                 name: "connect".to_string(),
                 params: vec![],
                 is_public: true,
-                is_terminal: None,
+                is_terminal: None, uses_code_part: None,
             }],
             None,
         );
