@@ -8,5 +8,5 @@ package runar.compiler;
 public final class Version {
     private Version() {}
 
-    public static final String VALUE = "0.5.0";
+    public static final String VALUE = "1.0.0-rc.1";
 }

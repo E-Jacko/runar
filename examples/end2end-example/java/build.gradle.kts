@@ -19,7 +19,7 @@ plugins {
 }
 
 group = "build.runar.end2end"
-version = "0.5.0"
+version = "1.0.0-rc.1"
 
 java {
     toolchain {
@@ -45,7 +45,7 @@ sourceSets {
 }
 
 dependencies {
-    implementation("build.runar:runar-java:0.5.0")
+    implementation("build.runar:runar-java:1.0.0-rc.1")
 
     testImplementation(platform("org.junit:junit-bom:5.10.2"))
     testImplementation("org.junit.jupiter:junit-jupiter")

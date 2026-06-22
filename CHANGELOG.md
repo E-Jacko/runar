@@ -5,7 +5,16 @@ All notable changes to Rúnar are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0-rc.1] — 2026-06-22
+
+First release candidate for 1.0.0. All seven compiler and SDK tiers are unified
+on a single version (`1.0.0-rc.1`); CI now enforces version coherence via
+`scripts/bump-version.sh --check`.
+
+### Fixed
+
+- **Stateful conditional multi-field write (#99) and terminal var-length state read (#100).** Two stack-lowering / SDK bugs that produced silently unspendable locking scripts, fixed identically across all seven tiers with byte-exact cross-tier parity and a compile-time branch-balance invariant. New conformance fixtures (`cond-write-multi-field`, `terminal-varlen-read`) enforce both across every tier.
+- **Groth16 G2 off-subgroup negative test no longer silently skips** — replaced a seed-search + `t.Skip` with a deterministic off-subgroup point + `t.Fatalf`.
 
 ### Changed
 
@@ -13,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- **BREAKING (Rust DSL):** the `#[runar::methods(ContractName)]` and `#[public]` attribute macros have been removed from `runar-lang-macros` (and dropped from the `runar-lang` prelude re-export). No parser accepts them any longer — `#[runar::methods]` and `#[public]` now produce a migration parse error. Migrate `.runar.rs` files by deleting those attributes: write a bare `impl` block and mark spending entry points with `pub fn`. Struct-level `#[runar::contract]` / `#[runar::stateful_contract]` (which strip `#[readonly]` so the struct compiles under `rustc`) are unchanged. `runar-lang-macros`, `runar-lang`, and `runar-compiler-rust` bump to **0.6.0**.
+- **BREAKING (Rust DSL):** the `#[runar::methods(ContractName)]` and `#[public]` attribute macros have been removed from `runar-lang-macros` (and dropped from the `runar-lang` prelude re-export). No parser accepts them any longer — `#[runar::methods]` and `#[public]` now produce a migration parse error. Migrate `.runar.rs` files by deleting those attributes: write a bare `impl` block and mark spending entry points with `pub fn`. Struct-level `#[runar::contract]` / `#[runar::stateful_contract]` (which strip `#[readonly]` so the struct compiles under `rustc`) are unchanged. This breaking Rust-DSL change briefly carried the Rust crates at `0.6.0` while the other tiers stayed at `0.5.0`; all tiers are now unified at `1.0.0-rc.1`.
 
 ### Performance
 

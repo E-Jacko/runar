@@ -1,7 +1,7 @@
 {
   "artifact": {
-    "version": "runar-v0.5.0",
-    "compilerVersion": "0.5.0",
+    "version": "runar-v1.0.0-rc.1",
+    "compilerVersion": "1.0.0-rc.1",
     "contractName": "P256Primitives",
     "abi": {
       "constructor": {

@@ -1,6 +1,6 @@
 [package]
 name = "runar-lang-macros"
-version = "0.6.0"
+version = "1.0.0-rc.1"
 edition = "2021"
 description = "Proc-macro attributes for Rúnar smart contract development"
 license = "MIT"

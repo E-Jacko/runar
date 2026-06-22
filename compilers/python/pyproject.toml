@@ -1,6 +1,6 @@
 [project]
 name = "runar-compiler"
-version = "0.5.0"
+version = "1.0.0-rc.1"
 description = "Runar smart contract compiler - Python implementation"
 requires-python = ">=3.10"
 dependencies = []

@@ -30,6 +30,12 @@ jobs:
         #      docs/test-skips.md so every documented skip stays the audit
         #      trail of the only legitimate skip paths in the corpus.
         run: bash scripts/lint-no-silent-skips.sh
+      - name: Assert all tier versions are consistent
+        # DOC-001 drift gate: every compiler/SDK manifest, Cargo.lock, gradle
+        # module, and embedded version string must agree. The checker already
+        # exists; this wires it into the merge gate so a mismatch (e.g. one
+        # tier bumped without the others) fails the PR instead of shipping.
+        run: bash scripts/bump-version.sh --check
 
   conformance-allowlist-audit:
     # Pin which conformance fixtures are allowed to opt out of compiler tiers

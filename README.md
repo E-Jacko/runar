@@ -5,9 +5,9 @@
 **Write Bitcoin smart contracts in TypeScript, Go, Rust, Java, Ruby, Python, Zig, Solidity, or Move. Compile to Bitcoin Script.**
 
 <!-- Badges -->
-![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
+[![CI](https://github.com/icellan/runar/actions/workflows/ci.yml/badge.svg)](https://github.com/icellan/runar/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![npm version](https://img.shields.io/badge/npm-v0.3.2-orange)
+![version](https://img.shields.io/badge/version-1.0.0--rc.1-orange)
 
 ---
 
@@ -262,6 +262,8 @@ Rúnar ships seven deployment SDKs with equivalent capabilities. Each one wraps 
 | Zig | [`runar-zig`](packages/runar-zig/) | `zig fetch --save runar-zig` | [README](packages/runar-zig/README.md) |
 
 Each SDK's Quick Start deploys the same `Counter` contract (stateful, two methods, single `bigint` field) end-to-end, so a developer comparing languages sees identical functionality with idiomatic differences. SDK output is byte-identical across all seven — verified by [`conformance/sdk-output/`](conformance/sdk-output/).
+
+> **On "verified":** the byte-identity above is an *empirical* cross-tier conformance result. Separately, the compiler's back-half pipeline (ANF → Stack IR → Bitcoin Script) carries a *machine-checked Lean proof* of observational correctness **modulo 70 explicitly-enumerated codegen axioms** — not an end-to-end formal guarantee. See [`runar-verification/TRUST_MANIFEST.md`](runar-verification/TRUST_MANIFEST.md) for the precise trust boundary.
 
 For an in-progress comparison of the codegen surface across SDKs, see [`RUNAR-SDK-PARITY.md`](RUNAR-SDK-PARITY.md).
 
