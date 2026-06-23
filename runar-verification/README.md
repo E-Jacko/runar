@@ -298,13 +298,19 @@ suite). B11 compound builtins (`extractOutputHash`, `buildChangeOutput`,
 
 Phase D capstone landed: `compileSafe_multi_public_observational_correct`
 drops the `hPublicSingleton` premise and quantifies over any public
-method in `publicMethodsOf`. The 5 Phase D codegen-soundness axioms in
-`Pipeline.lean` link Merkle-dispatch selection, auto-injected
-`checkPreimage` at method entry, auto-injected state output at method
-exit, terminal-assert elision residue, and trailing-NIP cleanup
-residue to the existing concrete `Stack.Lower` implementation. The
-runtime instantiation of this capstone for each conformance fixture
-remains the next active milestone.
+method in `publicMethodsOf`. The 5 Phase D codegen-soundness properties
+in `Pipeline.lean` — Merkle-dispatch selection
+(`merkle_dispatch_selection_correct`), auto-injected `checkPreimage` at
+method entry (`auto_check_preimage_at_method_entry_correct`),
+auto-injected state output at method exit
+(`auto_state_output_at_method_exit_correct`), terminal-assert elision
+residue (`terminal_assert_elision_residue_correct`), and trailing-NIP
+cleanup residue — are now discharged as **theorems** against the
+concrete `Stack.Lower` implementation; they are no longer axioms. The
+only `axiom` surviving in `Pipeline.lean` is
+`compileSafe_observational_correct_modulo_crypto_call_codegen` (the
+`crypto_call` residual). The runtime instantiation of this capstone for
+each conformance fixture remains the next active milestone.
 
 The current proof surface is deliberately split:
 

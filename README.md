@@ -360,19 +360,24 @@ Zig example tests live next to the contracts under `examples/zig/` and use `pack
 
 ## Supported Formats
 
+All seven compilers parse all nine formats (frontend parity is enforced in CI
+by the all-tier parser-only matrix). The **Status** column tracks language-surface
+maturity, not parser coverage.
+
 | Format | Extension | Compilers | IDE Support | Status |
 |--------|-----------|-----------|-------------|--------|
-| TypeScript | `.runar.ts` | TS, Go, Rust, Python, Zig | Full (`tsc`) | **Stable** |
-| Zig | `.runar.zig` | TS, Zig | Full (`zls`) | Experimental |
-| Go | `.runar.go` | Go, Python | Full (`gopls`) | Experimental |
-| Rust DSL | `.runar.rs` | Rust, Python | Full (`rust-analyzer`) | Experimental |
-| Ruby | `.runar.rb` | TS, Go, Rust, Python | Full (Ruby LSP) | Experimental |
-| Python | `.runar.py` | TS, Go, Rust, Python | Full (`pyright`) | Experimental |
-| Java | `.runar.java` | Java[^java-tier] | Full (IntelliJ, Eclipse) | Experimental |
-| Solidity-like | `.runar.sol` | TS, Go, Rust, Python | Syntax highlighting | Experimental |
-| Move-style | `.runar.move` | TS, Go, Rust, Python | Syntax highlighting | Experimental |
+| TypeScript | `.runar.ts` | All 7 | Full (`tsc`) | **Stable** |
+| Zig | `.runar.zig` | All 7 | Full (`zls`) | Experimental |
+| Go | `.runar.go` | All 7 | Full (`gopls`) | Experimental |
+| Rust DSL | `.runar.rs` | All 7 | Full (`rust-analyzer`) | Experimental |
+| Ruby | `.runar.rb` | All 7 | Full (Ruby LSP) | Experimental |
+| Python | `.runar.py` | All 7 | Full (`pyright`) | Experimental |
+| Java | `.runar.java` | All 7 | Full (IntelliJ, Eclipse) | Experimental |
+| Solidity-like | `.runar.sol` | All 7 | Syntax highlighting | Experimental |
+| Move-style | `.runar.move` | All 7 | Syntax highlighting | Experimental |
 
-[^java-tier]: Java is the seventh native compiler + SDK tier and is landing in phases. The Java compiler accepts `.runar.java` today; parity across the other six compilers lands in milestone 7 of [`docs/java-tier-plan.md`](docs/java-tier-plan.md).
+"All 7" = TypeScript (reference), Go, Rust, Python, Zig, Ruby, Java. Only the
+TypeScript surface is **Stable**; every other language surface is **Experimental**.
 
 All formats parse into the same `ContractNode` AST. From there, the pipeline is identical:
 
