@@ -212,6 +212,19 @@ public final class AnfLower {
                 String checkResult = ctx.emit(new CheckPreimage(preimageRef));
                 ctx.emit(new Assert(checkResult));
 
+                // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
+                // auto-injected covenant cannot be spent under a permissive sighash
+                // flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
+                // a contract may read. The hashOutputs continuation already fails
+                // under non-ALL flags, so this is a no-op on spendability for
+                // continuation-using methods and closes the field-zeroing exposure
+                // for the rest.
+                String sigHashPreimageRef = ctx.emit(new LoadParam("txPreimage"));
+                String sigHashTypeRef = ctx.emit(new Call("extractSigHashType", List.of(sigHashPreimageRef)));
+                String expectedSigHashRef = ctx.emit(makeLoadConstInt(BigInteger.valueOf(0x41)));
+                String sigHashOkRef = ctx.emit(new BinOp("===", sigHashTypeRef, expectedSigHashRef, null));
+                ctx.emit(new Assert(sigHashOkRef));
+
                 // Deserialize mutable state from the preimage's scriptCode
                 boolean hasStateProp = false;
                 for (PropertyNode p : contract.properties()) {

@@ -1349,6 +1349,7 @@ const LowerCtx = struct {
         extractLocktime,
         extractOutpoint,
         extractOutputHash,
+        extractSigHashType,
         buildChangeOutput,
         getStateScript,
         buildStateOutput,
@@ -1477,6 +1478,7 @@ const LowerCtx = struct {
         .{ "extractLocktime", .extractLocktime },
         .{ "extractOutpoint", .extractOutpoint },
         .{ "extractOutputHash", .extractOutputHash },
+        .{ "extractSigHashType", .extractSigHashType },
         .{ "buildChangeOutput", .buildChangeOutput },
         .{ "getStateScript", .getStateScript },
         .{ "buildStateOutput", .buildStateOutput },
@@ -1604,7 +1606,7 @@ const LowerCtx = struct {
             .clamp => try self.lowerClamp(bind_name, args),
             .checkPreimage => try self.lowerCheckPreimage(bind_name, args),
             .deserializeState => try self.lowerDeserializeState(bind_name, args),
-            .extractHashPrevouts, .extractLocktime, .extractOutpoint, .extractOutputHash => try self.lowerExtractor(bind_name, id, args),
+            .extractHashPrevouts, .extractLocktime, .extractOutpoint, .extractOutputHash, .extractSigHashType => try self.lowerExtractor(bind_name, id, args),
             .sign => try self.lowerSign(bind_name, args),
             .buildChangeOutput => try self.lowerBuildChangeOutput(bind_name, args),
             .getStateScript => try self.lowerGetStateScript(bind_name),
@@ -3578,6 +3580,30 @@ const LowerCtx = struct {
                 try self.stack.push(self.allocator, null);
                 try self.emitOp(.op_drop);
                 _ = self.stack.pop();
+                try self.emitOp(.op_bin2num);
+            },
+            .extractSigHashType => {
+                // End-relative: last 4 bytes -> number.
+                // OP_SIZE 4 OP_SUB OP_SPLIT OP_NIP OP_BIN2NUM (matches TS
+                // 05-stack-lower extractSigHashType).
+                try self.emitOp(.op_size);
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitPushInt(4);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_sub);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_nip);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
                 try self.emitOp(.op_bin2num);
             },
             .extractOutputHash => {

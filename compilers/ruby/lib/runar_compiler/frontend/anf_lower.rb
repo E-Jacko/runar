@@ -216,6 +216,23 @@ module RunarCompiler
           check_result = method_ctx.emit(IR::ANFValue.new(kind: "check_preimage").tap { |v| v.preimage = preimage_ref })
           method_ctx.emit(_make_assert(check_result))
 
+          # GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
+          # auto-injected covenant cannot be spent under a permissive sighash
+          # flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
+          # a contract may read. The hashOutputs continuation already fails
+          # under non-ALL flags, so this is a no-op on spendability for
+          # continuation-using methods and closes the field-zeroing exposure
+          # for the rest.
+          sig_hash_preimage_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
+          sig_hash_type_ref = method_ctx.emit(_make_call("extractSigHashType", [sig_hash_preimage_ref]))
+          expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(0x41))
+          sig_hash_ok_ref = method_ctx.emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
+            v.op = "==="
+            v.left = sig_hash_type_ref
+            v.right = expected_sig_hash_ref
+          end)
+          method_ctx.emit(_make_assert(sig_hash_ok_ref))
+
           # Deserialize mutable state from the preimage's scriptCode
           has_state_prop = contract.properties.any? { |p| !p.readonly }
           if has_state_prop

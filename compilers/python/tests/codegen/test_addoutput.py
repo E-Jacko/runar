@@ -174,7 +174,7 @@ def test_increment_pushes_8_for_satoshis_and_state_widths():
 
 # These counts pin the precise shape of the lowering. Update only if the
 # stateful-counter contract or add_output codegen changes intentionally.
-EXPECTED_INCREMENT_TOTAL_OPS = 134  # captured from current emission
+EXPECTED_INCREMENT_TOTAL_OPS = 146  # captured from current emission (incl. GAP-302 sighash-type pin)
 
 def test_increment_total_op_count_pinned():
     flat = _flatten_ops(_increment_ops())

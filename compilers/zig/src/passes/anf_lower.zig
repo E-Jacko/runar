@@ -400,6 +400,26 @@ fn lowerStatefulPublicMethod(
     const check_result = try ctx.emit(.{ .check_preimage = .{ .preimage = preimage_ref } });
     _ = try ctx.emit(.{ .assert = .{ .value = check_result } });
 
+    // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
+    // auto-injected covenant cannot be spent under a permissive sighash flag
+    // (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields a contract
+    // may read. The hashOutputs continuation already fails under non-ALL flags,
+    // so this is a no-op on spendability for continuation-using methods and
+    // closes the field-zeroing exposure for the rest.
+    const sig_hash_preimage_ref = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
+    const sig_hash_type_ref = try ctx.emit(.{ .call = .{
+        .func = "extractSigHashType",
+        .args = try ctx.allocSlice(&.{sig_hash_preimage_ref}),
+    } });
+    const expected_sig_hash_ref = try ctx.emit(makeLoadConstInt(0x41));
+    const sig_hash_ok_ref = try ctx.emit(.{ .bin_op = .{
+        .op = "===",
+        .left = sig_hash_type_ref,
+        .right = expected_sig_hash_ref,
+        .result_type = null,
+    } });
+    _ = try ctx.emit(.{ .assert = .{ .value = sig_hash_ok_ref } });
+
     // Deserialize state if there are mutable properties
     const has_mutable_state = for (contract.properties) |p| {
         if (!p.readonly) break true;

@@ -299,6 +299,22 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
             check_result = method_ctx.emit(ANFValue(kind="check_preimage", preimage=preimage_ref))
             method_ctx.emit(_make_assert(check_result))
 
+            # GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
+            # auto-injected covenant cannot be spent under a permissive sighash
+            # flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
+            # a contract may read. The hashOutputs continuation already fails
+            # under non-ALL flags, so this is a no-op on spendability for
+            # continuation-using methods and closes the field-zeroing exposure
+            # for the rest.
+            sig_hash_preimage_ref = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
+            sig_hash_type_ref = method_ctx.emit(_make_call("extractSigHashType", [sig_hash_preimage_ref]))
+            expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(0x41))
+            sig_hash_ok_ref = method_ctx.emit(ANFValue(
+                kind="bin_op", op="===",
+                left=sig_hash_type_ref, right=expected_sig_hash_ref,
+            ))
+            method_ctx.emit(_make_assert(sig_hash_ok_ref))
+
             # Deserialize mutable state from the preimage's scriptCode
             has_state_prop = any(not p.readonly for p in contract.properties)
             if has_state_prop:

@@ -228,6 +228,34 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 is_auto_injected_state_check: false,
             });
 
+            // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
+            // auto-injected covenant cannot be spent under a permissive sighash
+            // flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
+            // a contract may read. The hashOutputs continuation already fails
+            // under non-ALL flags, so this is a no-op on spendability for
+            // continuation-using methods and closes the field-zeroing exposure
+            // for the rest.
+            let sig_hash_preimage_ref = method_ctx.emit(ANFValue::LoadParam {
+                name: "txPreimage".to_string(),
+            });
+            let sig_hash_type_ref = method_ctx.emit(ANFValue::Call {
+                func: "extractSigHashType".to_string(),
+                args: vec![sig_hash_preimage_ref],
+            });
+            let expected_sig_hash_ref = method_ctx.emit(ANFValue::LoadConst {
+                value: bigint_to_json(&BigInt::from(0x41)),
+            });
+            let sig_hash_ok_ref = method_ctx.emit(ANFValue::BinOp {
+                op: "===".to_string(),
+                left: sig_hash_type_ref,
+                right: expected_sig_hash_ref,
+                result_type: None,
+            });
+            method_ctx.emit(ANFValue::Assert {
+                value: sig_hash_ok_ref,
+                is_auto_injected_state_check: false,
+            });
+
             // Deserialize mutable state from the preimage's scriptCode.
             // On subsequent spends, the state is embedded in the script (after OP_RETURN),
             // so we extract it from the scriptCode field rather than using hardcoded initial values.

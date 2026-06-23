@@ -720,8 +720,10 @@ describe('Pass 6: Emit', () => {
       // change-output plumbing. The asserted hex covers OP_CODESEPARATOR
       // injection (0xab at position 2), the BIP-143 generator pubkey
       // (0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798),
-      // and the addOutput serialization path. A regression in any of these
-      // emits would shift the bytes here.
+      // the GAP-302 sighash-type pin (OP_SIZE 4 OP_SUB OP_SPLIT OP_NIP
+      // OP_BIN2NUM <0x41> OP_NUMEQUALVERIFY, right after checkPreimage), and the
+      // addOutput serialization path. A regression in any of these emits would
+      // shift the bytes here.
       const source = `
         import { StatefulSmartContract, assert } from 'runar-lang';
         class Counter extends StatefulSmartContract {
@@ -736,10 +738,11 @@ describe('Pass 6: Emit', () => {
       const result = compileToEmit(source);
       expect(result.scriptHex).toBe(
         '76ab547a210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798' +
-        'ad697601687f7782012c947f758258947f758258947f7781768b7702e803785679016a7e7c58' +
-        '807e827602fd009f635280517f756776030000019f635380527f7501fd7c7e67760500000000' +
-        '019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e7c58807c7e547a547a0419' +
-        '76a9147b7e0288ac7e7c58807c7e7eaa7b820128947f7701207f75877777'
+        'ad69768254947f778101419d7601687f7782012c947f758258947f758258947f7781768b7702' +
+        'e803785679016a7e7c58807e827602fd009f635280517f756776030000019f635380527f7501' +
+        'fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e7c' +
+        '58807c7e547a547a041976a9147b7e0288ac7e7c58807c7e7eaa7b820128947f7701207f7587' +
+        '7777'
       );
     });
   });

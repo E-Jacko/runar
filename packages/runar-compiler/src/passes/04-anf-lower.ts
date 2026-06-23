@@ -160,6 +160,20 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       const checkResult = methodCtx.emit({ kind: 'check_preimage', preimage: preimageRef });
       methodCtx.emit({ kind: 'assert', value: checkResult });
 
+      // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41). The
+      // auto-injected covenant verifies a real tx preimage, but without this
+      // check the spend could use a permissive sighash flag
+      // (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields a
+      // contract may read (extractAmount / extractHashPrevouts /
+      // extractSequence). The hashOutputs continuation already fails under
+      // non-ALL flags, so for continuation-using methods this is a no-op on
+      // spendability; it closes the field-zeroing exposure for the rest.
+      const sigHashPreimageRef = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
+      const sigHashTypeRef = methodCtx.emit({ kind: 'call', func: 'extractSigHashType', args: [sigHashPreimageRef] });
+      const expectedSigHashRef = methodCtx.emit({ kind: 'load_const', value: 0x41n });
+      const sigHashOkRef = methodCtx.emit({ kind: 'bin_op', op: '===', left: sigHashTypeRef, right: expectedSigHashRef });
+      methodCtx.emit({ kind: 'assert', value: sigHashOkRef });
+
       // Deserialize mutable state from the preimage's scriptCode.
       const stateProps = contract.properties.filter(p => p.kind === 'property' && !p.readonly);
       if (stateProps.length > 0) {

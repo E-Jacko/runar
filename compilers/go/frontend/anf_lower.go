@@ -239,6 +239,19 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			checkResult := methodCtx.emit(ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef})
 			methodCtx.emit(makeAssert(checkResult))
 
+			// GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
+			// auto-injected covenant cannot be spent under a permissive sighash
+			// flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
+			// a contract may read. The hashOutputs continuation already fails
+			// under non-ALL flags, so this is a no-op on spendability for
+			// continuation-using methods and closes the field-zeroing exposure
+			// for the rest.
+			sigHashPreimageRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
+			sigHashTypeRef := methodCtx.emit(makeCall("extractSigHashType", []string{sigHashPreimageRef}))
+			expectedSigHashRef := methodCtx.emit(makeLoadConstInt(big.NewInt(0x41)))
+			sigHashOkRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: sigHashTypeRef, Right: expectedSigHashRef})
+			methodCtx.emit(makeAssert(sigHashOkRef))
+
 			// Deserialize mutable state from the preimage's scriptCode.
 			// On subsequent spends, the state is embedded in the script (after OP_RETURN),
 			// so we extract it from the scriptCode field rather than using hardcoded initial values.
