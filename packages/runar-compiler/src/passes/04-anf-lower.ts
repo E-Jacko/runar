@@ -213,18 +213,17 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       // param injection. Both must agree or the deployed locking
       // script will not match the ABI's declared parameter list.
       //
-      // KNOWN GAP: when `effects.hasStateOutput` or
-      // `effects.hasDataOutput` is true via a private method only,
-      // the local `addOutputRefs`/`addDataOutputRefs` lists do not
-      // see those refs (private bodies are inlined later, in stack
-      // lowering, so their `add_output` ANF nodes never bubble up to
-      // this context). The continuation hash will then concatenate
-      // fewer outputs than the runtime transaction actually contains
-      // and the spend will fail on chain. Fixing this requires
-      // either inlining private method bodies at ANF time or moving
-      // continuation-hash construction past stack lowering. Left as
-      // a follow-up audit finding because the audit's F1 expectation
-      // is limited to param injection and continuation presence.
+      // Private-helper outputs ARE seen here: a public method that
+      // delegates `addOutput` / `addRawOutput` / `addDataOutput` to a
+      // private helper has that helper inlined into its binding stream
+      // at ANF time (driven by `computeSideEffectSummary` above and
+      // `inlinePrivateMethodCall`), so the helper's `add_output` /
+      // `add_data_output` ANF nodes register on this context's
+      // `addOutputRefs` / `addDataOutputRefs` lists before the
+      // continuation hash is built. The continuation therefore commits
+      // to the full runtime output set. Locked in by the all-tier
+      // `private-helper-outputs` conformance fixture (its `partition`
+      // and `log` methods route outputs through private helpers).
       if (needsChangeOutput) {
         // Build the P2PKH change output for hashOutputs verification
         const changePKHRef = methodCtx.emit({ kind: 'load_param', name: '_changePKH' });
