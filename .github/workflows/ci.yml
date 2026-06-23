@@ -185,7 +185,7 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -225,7 +225,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - run: cd compilers/go && go build ./...
       - run: cd compilers/go && go build -o runar-go .
@@ -358,7 +358,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: packages/runar-go/go.sum
       - name: SDK tests
         run: cd packages/runar-go && go test ./...
@@ -686,7 +686,7 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: actions/setup-python@v5
         with:
@@ -756,7 +756,7 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -979,7 +979,7 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: packages/runar-go/go.sum
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -1043,7 +1043,7 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -1156,7 +1156,7 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - run: pnpm install --frozen-lockfile
       - name: Start Teranode + run Go integration suite (NODE_TYPE=teranode)

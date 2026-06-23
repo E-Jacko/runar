@@ -2,8 +2,17 @@
 name = "runar"
 version = "1.0.0-rc.1"
 description = "Runar - TypeScript-to-Bitcoin Script Compiler (Python runtime)"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Siggi Oskarsson", email = "siggi.oskarsson@gmail.com" }]
+keywords = ["bitcoin", "bitcoin-sv", "bsv", "smart-contracts", "bitcoin-script", "compiler"]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/icellan/runar"
+Repository = "https://github.com/icellan/runar"
+Issues = "https://github.com/icellan/runar/issues"
 
 [project.optional-dependencies]
 crypto = ["coincurve>=20.0"]
@@ -13,7 +22,7 @@ dev = ["pytest>=7.0"]
 script-vm = ["bsv-sdk>=1.0"]
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

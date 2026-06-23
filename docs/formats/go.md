@@ -10,7 +10,7 @@
 
 The Go format lets you write Rúnar contracts as idiomatic Go code. Contracts are Go structs embedding `runar.SmartContract` or `runar.StatefulSmartContract`, with methods defined as receiver functions. The Go compiler parses these directly -- no intermediate conversion to TypeScript.
 
-This format is supported by all six compilers (TypeScript, Go, Rust, Python, Zig, Ruby) via their respective `parser_go*` modules, so `.runar.go` contracts produce identical Bitcoin Script across compilers.
+This format is supported by all seven compilers (TypeScript, Go, Rust, Python, Zig, Ruby, Java) via their respective `parser_go*` modules, so `.runar.go` contracts produce identical Bitcoin Script across compilers.
 
 ---
 

@@ -10,7 +10,7 @@
 
 The Python format lets you write Runar contracts as Python classes extending `SmartContract` or `StatefulSmartContract`. Contracts use standard Python syntax with snake_case naming, `@public` decorators, and `Readonly[T]` type annotations.
 
-All six compilers (TypeScript, Go, Rust, Python, Zig, Ruby) support `.runar.py` parsing, so Python-format contracts produce identical Bitcoin Script across all compilers.
+All seven compilers (TypeScript, Go, Rust, Python, Zig, Ruby, Java) support `.runar.py` parsing, so Python-format contracts produce identical Bitcoin Script across all compilers.
 
 ---
 

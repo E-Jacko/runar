@@ -3,13 +3,21 @@ name = "runar-compiler"
 version = "1.0.0-rc.1"
 description = "Runar smart contract compiler - Python implementation"
 requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Siggi Oskarsson", email = "siggi.oskarsson@gmail.com" }]
+keywords = ["bitcoin", "bitcoin-sv", "bsv", "smart-contracts", "bitcoin-script", "compiler"]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/icellan/runar"
+Repository = "https://github.com/icellan/runar"
+Issues = "https://github.com/icellan/runar/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]

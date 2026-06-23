@@ -81,7 +81,7 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -302,7 +302,7 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: packages/runar-go/go.sum
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5

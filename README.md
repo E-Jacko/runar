@@ -177,7 +177,7 @@ pub const P2PKH = struct {
 };
 ```
 
-All eight formats produce the same Bitcoin Script: `OP_DUP OP_HASH160 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG`
+All nine formats produce the same Bitcoin Script: `OP_DUP OP_HASH160 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG`
 
 ---
 
@@ -186,10 +186,10 @@ All eight formats produce the same Bitcoin Script: `OP_DUP OP_HASH160 <pubKeyHas
 Bitcoin Script development today forces a choice between hand-writing opcodes (error-prone, unauditable) or adopting a framework with heavy decorator-based DSLs that obscure what happens on-chain. Rúnar takes a different path:
 
 - **No decorators** — uses native language keywords (`readonly`, `public`, `immutable`, `#[readonly]`, `prop`)
-- **Write in your language** — TypeScript, Go, Rust, Ruby, Python, Zig, Solidity-like, or Move-style
-- **Test natively** — `vitest` for TS, `go test` for Go, `cargo test` for Rust, `rspec` for Ruby, `pytest` for Python, `zig build test` for Zig examples
-- **Five compilers** — TypeScript (reference), Go, Rust, Python, Zig — all produce byte-identical output
-- **Post-quantum ready** — WOTS+ and SLH-DSA (FIPS 205) signature verification in Bitcoin Script
+- **Write in your language** — TypeScript, Go, Rust, Ruby, Python, Zig, Java, Solidity-like, or Move-style
+- **Test natively** — `vitest` for TS, `go test` for Go, `cargo test` for Rust, `rspec` for Ruby, `pytest` for Python, `zig build test` for Zig, JUnit for Java examples
+- **Seven compilers** — TypeScript (reference), Go, Rust, Python, Zig, Ruby, Java — all produce byte-identical output
+- **Post-quantum (experimental)** — WOTS+ and SLH-DSA (FIPS 205) signature verification in Bitcoin Script. The shipped wallet examples are deliberately naive constructions (see `examples/ts/post-quantum-*-naive-INSECURE*`); treat the PQ surface as experimental, not production-ready.
 - **Nanopass architecture** — 6 small passes, each auditable in a single sitting
 - **Full IDE support** — type checking, autocompletion, go-to-definition in every language
 
@@ -208,7 +208,7 @@ runar compile MyContract.runar.ts    # => artifacts/MyContract.runar.json
 
 ```bash
 # In your go.mod, add:
-#   require github.com/icellan/runar/packages/runar-go v0.1.0
+#   require github.com/icellan/runar/packages/runar-go v1.0.0-rc.1
 # Contracts are real Go — test with go test, compile with the Rúnar Go compiler
 go test ./...
 ```
@@ -216,7 +216,7 @@ go test ./...
 ### Rust
 
 ```bash
-# In Cargo.toml: runar = { package = "runar-lang", version = "0.1.0" }
+# In Cargo.toml: runar = { package = "runar-lang", version = "1.0.0-rc.1" }
 # Contracts are real Rust — test with cargo test, compile with the Rúnar Rust compiler
 cargo test
 ```
@@ -392,7 +392,7 @@ All formats parse into the same `ContractNode` AST. From there, the pipeline is 
 
 ## Example Contracts
 
-21 example contracts demonstrate the major contract patterns implemented across the maintained native-language frontends:
+24 example contracts demonstrate the major contract patterns implemented across the maintained native-language frontends:
 
 | Contract | Pattern | Stateful | Multi-method |
 |----------|---------|----------|-------------|
@@ -421,7 +421,7 @@ All formats parse into the same `ContractNode` AST. From there, the pipeline is 
 | [BSV20Token](examples/ts/bsv20-token/) | BSV-20 fungible token inscription | No | No |
 | [BSV21Token](examples/ts/bsv21-token/) | BSV-21 fungible token inscription | No | No |
 
-All 24 examples are available in `ts/`, `go/`, `rust/`, `python/`, and `zig/`. 11 contracts are available in all 8 formats (TypeScript, Go, Rust, Ruby, Python, Zig, Solidity, Move). FunctionPatterns, PostQuantumWallet, SPHINCSWallet, SchnorrZKP, and ConvergenceProof are available in TypeScript, Go, Rust, Ruby, and Python. A 16-contract subset is also available in `sol/` and `move/`.
+All 24 examples are available in `ts/`, `go/`, `rust/`, `python/`, and `zig/`. 11 contracts are available in all 9 formats (TypeScript, Go, Rust, Ruby, Python, Zig, Java, Solidity, Move). FunctionPatterns, PostQuantumWallet, SPHINCSWallet, SchnorrZKP, and ConvergenceProof are available in TypeScript, Go, Rust, Ruby, and Python. The full example set is also mirrored in `sol/` and `move/` (69 contracts each).
 ```
 examples/
   ts/p2pkh/          P2PKH.runar.ts + P2PKH.test.ts
@@ -467,7 +467,7 @@ The compiler is structured as six small, composable nanopass transforms. Each pa
 | 5 | **Stack Lower** | ANF IR | Stack IR |
 | 6 | **Emit** | Stack IR | Bitcoin Script |
 
-The constant folding optimizer (+ dead binding elimination) is available between passes 4 and 5; it is enabled by default at the user-facing TS API and CI enforces cross-tier parity in BOTH fold-on and fold-off modes (see `conformance/fold-on-allowlist.json` for the small set of fixture×format pairs allowlisted under fold-on with a documented reason). The peephole optimizer runs between passes 5 and 6 (always enabled).
+The constant folding optimizer (+ dead binding elimination) is available between passes 4 and 5; it is enabled by default at the user-facing TS API and CI enforces cross-tier parity in BOTH fold-on and fold-off modes (`conformance/fold-on-allowlist.json` is the registry for any fixture×format pairs allowlisted under fold-on with a documented reason; it is currently empty — no exemptions). The peephole optimizer runs between passes 5 and 6 (always enabled).
 
 ### Multi-Compiler Strategy
 
@@ -476,7 +476,7 @@ Rúnar defines a **canonical IR conformance boundary** at the ANF level. The sev
 - **Frontend parity (mandatory for every tier).** Every fixture must parse cleanly through every compiler in every one of the nine source formats. There are no per-tier carve-outs at the parser layer. Enforced in CI by the `--parser-only` runner mode (`pnpm --filter runar-conformance test:parser-only` locally; CI step "Run all-tier parser-only coverage"): every available compiler runs `--parse-only` against every (fixture, format) pair, ignoring the per-fixture `compilers` allowlist (which only scopes Stack-IR / hex parity).
 - **Stack-IR + hex parity (scoped per fixture).** Fixtures without a `compilers` allowlist in `source.json` must produce byte-identical Stack IR + Bitcoin Script hex across all seven tiers. Fixtures that opt out (Go-only crypto: BabyBear / KoalaBear / Poseidon2 / BN254 / Merkle / FRI; Java-deferred: state-covenant / stateful-bytestring) carry an explicit `compilers` array + `compilersJustification` rationale string.
 
-The TypeScript compiler is the reference implementation; Go, Rust, Python, Zig, Ruby, and Java are full peers. The conformance suite in `conformance/` contains 49 fixtures spanning P2PKH, stateful counters, escrow, oracle covenants, WOTS+/SLH-DSA, SHA-256, BLAKE3, EC, NIST P-256/P-384, BabyBear / KoalaBear / Merkle / FRI primitives. The cross-tier audit (`conformance/runner/__tests__/allowlist-audit.test.ts`) gates the allowlist set so opt-outs don't grow silently.
+The TypeScript compiler is the reference implementation; Go, Rust, Python, Zig, Ruby, and Java are full peers. The conformance suite in `conformance/` contains 63 fixtures spanning P2PKH, stateful counters, escrow, oracle covenants, WOTS+/SLH-DSA, SHA-256, BLAKE3, EC, NIST P-256/P-384, BabyBear / KoalaBear / Merkle / FRI primitives. The cross-tier audit (`conformance/runner/__tests__/allowlist-audit.test.ts`) gates the allowlist set so opt-outs don't grow silently.
 
 ### Contract Model
 

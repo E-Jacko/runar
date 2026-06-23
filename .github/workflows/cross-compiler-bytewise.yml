@@ -2,7 +2,8 @@ name: Cross-compiler bytewise
 
 # Tier 6.1 — six-tier (plus TS reference and Lean) byte-exact cross-compiler
 # CI. Runs `runar-verification/scripts/cross-compiler-diff.sh` against the
-# full 49-fixture conformance corpus. Each fixture is compiled by every
+# full conformance corpus (63 fixtures; the script discovers them dynamically
+# from conformance/tests, so the count is not pinned here). Each fixture is compiled by every
 # available tier, and the script asserts:
 #   - each tier's hex output equals the on-disk expected-script.hex golden
 #   - every active tier's hex matches every other active tier's hex
@@ -29,9 +30,9 @@ env:
 
 jobs:
   cross-compiler-bytewise:
-    name: Cross-compiler bytewise diff (49 fixtures x 7 tiers + Lean)
+    name: Cross-compiler bytewise diff (full corpus x 7 tiers + Lean)
     runs-on: ubuntu-latest
-    # The full 49-fixture x 7-tier matrix runs every compiler twice per
+    # The full 63-fixture x 7-tier matrix runs every compiler twice per
     # fixture (source -> hex). Even with the Java daemon disabled (the diff
     # script invokes `java -jar` per fixture for portability) and warm
     # caches, the typical wall-clock is ~25-40 minutes; budget 60 to absorb
@@ -48,7 +49,7 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5

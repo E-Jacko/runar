@@ -5,6 +5,9 @@ several languages into Bitcoin SV Script, and its correctness guarantees come
 from a few hard invariants. Please read this before opening a PR — changes that
 break these invariants cannot be merged.
 
+By participating in this project you agree to abide by our
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## The Central Invariant: Seven Tiers Must Stay in Sync
 
 Rúnar ships **seven independent compiler implementations** (TypeScript, Go,

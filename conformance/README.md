@@ -145,11 +145,7 @@ Hybrid contracts whose method bodies call EVM/STARK primitives also fall under t
 |---|---|---|
 | `state-covenant` | `["go"]` | Uses `bbFieldMul` (BabyBear field) and `merkleRootSha256` (4-deep Merkle proof). Both are EVM/STARK primitives — Go is the canonical reference; partial ports in TS/Rust/Python/Zig/Ruby exist for historical reasons but are not conformance targets, and Java is not exempt due to a deferred port — it is exempt because the entire family is Go-only. |
 
-##### Oversize bigint literals (256-bit secp256k1 group order)
-
-| Fixture | Allowlist | Rationale |
-|---|---|---|
-| `schnorr-zkp` | `["ts", "go", "python"]` | BUG-001 — embeds the secp256k1 group order (256 bits) as an inline bigint literal in `assert(within(s, 1, n))`. Only TS, Go, and Python carry an arbitrary-precision integer through parse → ANF → codegen; Rust / Zig / Ruby / Java tiers truncate to their native int width (i128 / i64) and emit `OP_0` instead of the 32-byte little-endian push. Widening the remaining tiers to a decimal-string-backed `BigIntLiteral` is a separate cross-tier refactor. Parser-only coverage stays universal — all 7 tiers parse all 9 formats cleanly. |
+(The former `schnorr-zkp` oversize-bigint exemption is gone: every tier now carries the 256-bit secp256k1 group order through parse → ANF → codegen as a decimal-string-backed `BigIntLiteral`, so `schnorr-zkp` runs across all 7 tiers with no allowlist.)
 
 ### Fold-ON allowlist (`conformance/fold-on-allowlist.json`)
 
@@ -352,7 +348,7 @@ Golden file updates should always be reviewed carefully. An unexpected change in
 
 ## Current Test Cases
 
-The suite currently contains **60 fixtures** under `tests/` — that directory is the authoritative list (`find tests -name source.json | wc -l`). The table below describes the most commonly referenced ones. Tier scoping (which compilers run a fixture) is governed solely by the [Per-fixture compiler allowlist](#per-fixture-compiler-allowlist) above — do not infer it from this table.
+The suite currently contains **63 fixtures** under `tests/` — that directory is the authoritative list (`find tests -name source.json | wc -l`). The table below describes the most commonly referenced ones. Tier scoping (which compilers run a fixture) is governed solely by the [Per-fixture compiler allowlist](#per-fixture-compiler-allowlist) above — do not infer it from this table.
 
 | Test | Exercises | Has Script Golden |
 |---|---|---|
@@ -399,9 +395,9 @@ The suite currently contains **60 fixtures** under `tests/` — that directory i
 | `token-ft` | Fungible token with split/merge | Yes |
 | `token-nft` | NFT with transfer/burn | Yes |
 
-### SDK-output conformance (45 fixtures, 7 SDKs)
+### SDK-output conformance (46 fixtures, 7 SDKs)
 
-`sdk-output/tests/` contains 45 fixtures (one `input.json` + one
+`sdk-output/tests/` contains 46 fixtures (one `input.json` + one
 `expected-locking.hex` per directory). The runner in `sdk-output/runner/sdk-runner.ts`
 compiles each fixture through all seven SDK tools in `sdk-output/tools/` (TypeScript,
 Go, Python, Ruby, Rust, Zig, Java) and asserts byte-identical locking-script hex
