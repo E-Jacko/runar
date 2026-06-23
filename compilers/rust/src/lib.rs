@@ -109,7 +109,7 @@ pub fn compile_from_ir(path: &Path) -> Result<RunarArtifact, String> {
 /// Compile from an ANF IR JSON file on disk, with options.
 pub fn compile_from_ir_with_options(path: &Path, opts: &CompileOptions) -> Result<RunarArtifact, String> {
     let program = load_ir(path)?;
-    compile_from_program_with_options(&program, opts)
+    compile_from_program_with_options(&program, &ir_input_options(opts))
 }
 
 /// Compile from an ANF IR JSON string.
@@ -120,7 +120,19 @@ pub fn compile_from_ir_str(json_str: &str) -> Result<RunarArtifact, String> {
 /// Compile from an ANF IR JSON string, with options.
 pub fn compile_from_ir_str_with_options(json_str: &str, opts: &CompileOptions) -> Result<RunarArtifact, String> {
     let program = load_ir_from_str(json_str)?;
-    compile_from_program_with_options(&program, opts)
+    compile_from_program_with_options(&program, &ir_input_options(opts))
+}
+
+/// Force the ANF constant-folding pass off when compiling already-lowered ANF
+/// IR (the `--ir` path). The ANF fold is a source-pipeline optimization;
+/// re-running it on pre-lowered IR rewrites `bin_op`s to constants but leaves
+/// the now-dead operand bindings in place (fold does no dead-binding
+/// elimination), which stack-lowering then emits as wasteful push+drop
+/// sequences — diverging from both the fold-OFF goldens and the Zig tier,
+/// whose `compileFromIR` never folds IR input (compilers/zig/src/main.zig).
+/// Folding stays enabled on the source path (`compile_from_source`).
+fn ir_input_options(opts: &CompileOptions) -> CompileOptions {
+    CompileOptions { disable_constant_folding: true, ..opts.clone() }
 }
 
 /// Compile from a `.runar.ts` source file on disk.

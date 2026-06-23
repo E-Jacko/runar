@@ -133,16 +133,18 @@ jobs:
             --compilers ts,go,rust,python,zig,ruby,java \
             --output /tmp/anf-fuzz-pr-foldoff.json
 
-      # ----- fold-ON is NON-BLOCKING (continue-on-error) on PRs (GAP-101 is a
-      # ----- non-blocking finding). This run currently surfaces a REAL,
-      # ----- pre-existing cross-tier constant-folding divergence in the Rust
-      # ----- and/or Zig tiers on random programs (fold-ON was never fuzzed
-      # ----- before this gate existed — ts/go/python/ruby/java agree). Until
-      # ----- 7-tier fold-ON parity is fixed it reports in the PR annotations
-      # ----- without blocking the merge. Tracked as the GAP-101 follow-up.
-      - name: Fuzz (PR — fold-ON, fixed seed, non-blocking)
+      # ----- fold-ON is now a BLOCKING merge gate (GAP-101 closed). The earlier
+      # ----- cross-tier divergence was the ANF constant-fold being re-run on
+      # ----- the `--ir` path: it rewrote bin_ops to constants but left the
+      # ----- now-dead operand bindings, which the six non-Zig tiers emitted as
+      # ----- wasteful push+drop sequences (Zig's compileFromIR never folds IR
+      # ----- input). All seven IR entry points now skip the ANF fold on
+      # ----- pre-lowered IR (the peephole optimizer still folds), so fold-ON
+      # ----- `--ir` output is byte-identical to fold-OFF / the goldens across
+      # ----- all 7 tiers. Constant folding is still exercised on the source
+      # ----- path (the multi-format conformance gate).
+      - name: Fuzz (PR gate — fold-ON, fixed seed)
         if: github.event_name == 'pull_request'
-        continue-on-error: true
         working-directory: conformance
         run: |
           set -euo pipefail

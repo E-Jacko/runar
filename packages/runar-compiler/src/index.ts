@@ -450,7 +450,7 @@ export function compileFromANF(
 ): CompileFromANFResult {
   const opts = options ?? {};
 
-  let anf: ANFProgram = program;
+  const anf: ANFProgram = program;
 
   // Bake constructor args into ANF properties so stack lowering emits real
   // values instead of OP_0 placeholders.
@@ -462,9 +462,15 @@ export function compileFromANF(
     }
   }
 
-  if (!opts.disableConstantFolding) {
-    anf = foldConstants(anf);
-  }
+  // Constant folding is a source-pipeline optimization (see compile()); it is
+  // intentionally NOT run here on already-lowered ANF IR. Re-folding pre-lowered
+  // IR rewrites bin_ops to constants but leaves the now-dead operand bindings in
+  // place (foldConstants does no dead-binding elimination), which stack lowering
+  // then emits as wasteful push+drop sequences — diverging from both the fold-OFF
+  // goldens and the Zig tier, whose compileFromIR never folds IR input
+  // (compilers/zig/src/main.zig). The peephole optimizer still folds constants at
+  // the stack level, so the IR path stays byte-identical to the goldens.
+  // (opts.disableConstantFolding is accepted for CLI symmetry but is a no-op here.)
 
   // EC optimizer delegates internally to optimizer/dce.ts for dead-binding cleanup.
   const optimizedAnf = opts.disableEcOptimizer ? anf : optimizeEC(anf);

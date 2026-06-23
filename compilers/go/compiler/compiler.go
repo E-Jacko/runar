@@ -142,7 +142,7 @@ func CompileFromIR(irPath string, opts ...CompileOptions) (*Artifact, error) {
 		return nil, fmt.Errorf("loading IR: %w", err)
 	}
 
-	return CompileFromProgram(program, opts...)
+	return CompileFromProgram(program, disableFoldForIRInput(opts)...)
 }
 
 // CompileFromIRBytes compiles from raw ANF IR JSON bytes.
@@ -152,7 +152,24 @@ func CompileFromIRBytes(data []byte, opts ...CompileOptions) (*Artifact, error) 
 		return nil, fmt.Errorf("loading IR: %w", err)
 	}
 
-	return CompileFromProgram(program, opts...)
+	return CompileFromProgram(program, disableFoldForIRInput(opts)...)
+}
+
+// disableFoldForIRInput forces the ANF constant-folding pass off when the
+// compiler is fed already-lowered ANF IR (the `--ir` path). The ANF fold is a
+// source-pipeline optimization; re-running it on pre-lowered IR rewrites
+// `bin_op`s to constants but leaves the now-dead operand bindings in place
+// (FoldConstants intentionally does no dead-binding elimination — see
+// frontend/constant_fold.go:574), which the stack-lowering then emits as
+// wasteful push+drop sequences. The result diverges from both the fold-OFF
+// goldens and the Zig tier, whose `compileFromIR` never folds IR input
+// (compilers/zig/src/main.zig:226). Forcing fold off here makes the IR path
+// byte-identical to the goldens across all tiers. Constant folding is still
+// exercised on the source path (CompileFromSource).
+func disableFoldForIRInput(opts []CompileOptions) []CompileOptions {
+	o := mergeOptions(opts)
+	o.DisableConstantFolding = true
+	return []CompileOptions{o}
 }
 
 // CompileFromProgram compiles a parsed ANF program to a Rúnar artifact.

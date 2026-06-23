@@ -297,9 +297,15 @@ module RunarCompiler
   # @param ir_path [String] path to ANF IR JSON file
   # @param disable_constant_folding [Boolean] skip constant folding pass
   # @return [Artifact]
+  # Constant folding is a source-pipeline optimization; never re-run it on
+  # already-lowered ANF IR. Re-folding pre-lowered IR rewrites bin_ops to
+  # constants but leaves the now-dead operand bindings (the fold does no
+  # dead-binding elimination), which stack-lowering emits as wasteful push+drop
+  # sequences — diverging from the fold-OFF goldens and from the Zig tier, whose
+  # compileFromIR never folds IR input. Force folding off here; peephole still folds.
   def self.compile_from_ir(ir_path, disable_constant_folding: false)
     program = _load_ir(ir_path)
-    compile_from_program(program, disable_constant_folding: disable_constant_folding)
+    compile_from_program(program, disable_constant_folding: true)
   end
 
   # Compile from raw ANF IR JSON bytes.
@@ -309,7 +315,7 @@ module RunarCompiler
   # @return [Artifact]
   def self.compile_from_ir_bytes(data, disable_constant_folding: false)
     program = _load_ir_from_bytes(data)
-    compile_from_program(program, disable_constant_folding: disable_constant_folding)
+    compile_from_program(program, disable_constant_folding: true)
   end
 
   # Compile a parsed ANF program to a Runar artifact.

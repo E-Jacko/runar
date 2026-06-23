@@ -277,9 +277,14 @@ public final class Cli {
             return 65;
         }
 
-        // Pass 4.25/4.5 — same optimizer wiring as the source path.
+        // Constant folding is a source-pipeline optimization; never re-run it on
+        // already-lowered ANF IR. Re-folding pre-lowered IR rewrites bin_ops to
+        // constants but leaves the now-dead operand bindings, which stack-lowering
+        // emits as wasteful push+drop sequences — diverging from the fold-OFF
+        // goldens and from the Zig tier, whose compileFromIR never folds IR input.
+        // So force folding off here regardless of the flag; peephole still folds.
         try {
-            anf = optimizeAnf(anf, parsed.disableConstantFolding);
+            anf = optimizeAnf(anf, /* disableConstantFolding */ true);
         } catch (RuntimeException e) {
             err.println("runar-java: anf-optimize error: " + e.getMessage());
             return 70;

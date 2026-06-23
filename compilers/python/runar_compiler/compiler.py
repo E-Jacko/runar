@@ -260,16 +260,23 @@ def _apply_constructor_args(program: ANFProgram, args: dict[str, object] | None)
             prop.initial_value = args[prop.name]
 
 
+# Constant folding is a source-pipeline optimization; never re-run it on
+# already-lowered ANF IR (the ``--ir`` path). Re-folding pre-lowered IR rewrites
+# bin_ops to constants but leaves the now-dead operand bindings in place (the
+# fold does no dead-binding elimination), which stack-lowering then emits as
+# wasteful push+drop sequences — diverging from both the fold-OFF goldens and
+# the Zig tier, whose compileFromIR never folds IR input. So the IR entry points
+# force folding off regardless of the flag; the peephole optimizer still folds.
 def compile_from_ir(ir_path: str, disable_constant_folding: bool = False) -> Artifact:
     """Read an ANF IR JSON file and compile it to a Runar artifact."""
     program = _load_ir(ir_path)
-    return compile_from_program(program, disable_constant_folding=disable_constant_folding)
+    return compile_from_program(program, disable_constant_folding=True)
 
 
 def compile_from_ir_bytes(data: bytes, disable_constant_folding: bool = False) -> Artifact:
     """Compile from raw ANF IR JSON bytes."""
     program = _load_ir_from_bytes(data)
-    return compile_from_program(program, disable_constant_folding=disable_constant_folding)
+    return compile_from_program(program, disable_constant_folding=True)
 
 
 def compile_from_program(program: ANFProgram, disable_constant_folding: bool = False) -> Artifact:
