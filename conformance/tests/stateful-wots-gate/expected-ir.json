@@ -1,0 +1,351 @@
+{
+  "contractName": "StatefulWOTSGate",
+  "methods": [
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "kind": "load_prop",
+            "name": "count"
+          }
+        },
+        {
+          "name": "t1",
+          "value": {
+            "args": [
+              "t0"
+            ],
+            "func": "super",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t2",
+          "value": {
+            "kind": "load_prop",
+            "name": "count"
+          }
+        },
+        {
+          "name": "t3",
+          "value": {
+            "kind": "update_prop",
+            "name": "count",
+            "value": "t2"
+          }
+        }
+      ],
+      "isPublic": false,
+      "name": "constructor",
+      "params": [
+        {
+          "name": "count",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "kind": "load_param",
+            "name": "txPreimage"
+          }
+        },
+        {
+          "name": "t1",
+          "value": {
+            "kind": "check_preimage",
+            "preimage": "t0"
+          }
+        },
+        {
+          "name": "t2",
+          "value": {
+            "kind": "assert",
+            "value": "t1"
+          }
+        },
+        {
+          "name": "t3",
+          "value": {
+            "kind": "load_param",
+            "name": "txPreimage"
+          }
+        },
+        {
+          "name": "t4",
+          "value": {
+            "args": [
+              "t3"
+            ],
+            "func": "extractSigHashType",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t5",
+          "value": {
+            "kind": "load_const",
+            "value": 65
+          }
+        },
+        {
+          "name": "t6",
+          "value": {
+            "kind": "bin_op",
+            "left": "t4",
+            "op": "===",
+            "right": "t5"
+          }
+        },
+        {
+          "name": "t7",
+          "value": {
+            "kind": "assert",
+            "value": "t6"
+          }
+        },
+        {
+          "name": "t8",
+          "value": {
+            "kind": "load_param",
+            "name": "txPreimage"
+          }
+        },
+        {
+          "name": "t9",
+          "value": {
+            "kind": "deserialize_state",
+            "preimage": "t8"
+          }
+        },
+        {
+          "name": "t10",
+          "value": {
+            "kind": "load_param",
+            "name": "msg"
+          }
+        },
+        {
+          "name": "t11",
+          "value": {
+            "kind": "load_param",
+            "name": "sig"
+          }
+        },
+        {
+          "name": "t12",
+          "value": {
+            "kind": "load_param",
+            "name": "wotsPubKey"
+          }
+        },
+        {
+          "name": "t13",
+          "value": {
+            "args": [
+              "t10",
+              "t11",
+              "t12"
+            ],
+            "func": "verifyWOTS",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t14",
+          "value": {
+            "kind": "assert",
+            "value": "t13"
+          }
+        },
+        {
+          "name": "t15",
+          "value": {
+            "kind": "load_prop",
+            "name": "count"
+          }
+        },
+        {
+          "name": "t16",
+          "value": {
+            "kind": "load_const",
+            "value": 1
+          }
+        },
+        {
+          "name": "t17",
+          "value": {
+            "kind": "bin_op",
+            "left": "t15",
+            "op": "+",
+            "right": "t16"
+          }
+        },
+        {
+          "name": "t18",
+          "value": {
+            "kind": "update_prop",
+            "name": "count",
+            "value": "t17"
+          }
+        },
+        {
+          "name": "t19",
+          "value": {
+            "kind": "load_param",
+            "name": "_changePKH"
+          }
+        },
+        {
+          "name": "t20",
+          "value": {
+            "kind": "load_param",
+            "name": "_changeAmount"
+          }
+        },
+        {
+          "name": "t21",
+          "value": {
+            "args": [
+              "t19",
+              "t20"
+            ],
+            "func": "buildChangeOutput",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t22",
+          "value": {
+            "kind": "get_state_script"
+          }
+        },
+        {
+          "name": "t23",
+          "value": {
+            "kind": "load_param",
+            "name": "txPreimage"
+          }
+        },
+        {
+          "name": "t24",
+          "value": {
+            "kind": "load_param",
+            "name": "_newAmount"
+          }
+        },
+        {
+          "name": "t25",
+          "value": {
+            "args": [
+              "t23",
+              "t22",
+              "t24"
+            ],
+            "func": "computeStateOutput",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t26",
+          "value": {
+            "args": [
+              "t25",
+              "t21"
+            ],
+            "func": "cat",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t27",
+          "value": {
+            "args": [
+              "t26"
+            ],
+            "func": "hash256",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t28",
+          "value": {
+            "kind": "load_param",
+            "name": "txPreimage"
+          }
+        },
+        {
+          "name": "t29",
+          "value": {
+            "args": [
+              "t28"
+            ],
+            "func": "extractOutputHash",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t30",
+          "value": {
+            "kind": "bin_op",
+            "left": "t27",
+            "op": "===",
+            "result_type": "bytes",
+            "right": "t29"
+          }
+        },
+        {
+          "name": "t31",
+          "value": {
+            "isAutoInjectedStateCheck": true,
+            "kind": "assert",
+            "value": "t30"
+          }
+        }
+      ],
+      "isPublic": true,
+      "name": "advance",
+      "params": [
+        {
+          "name": "msg",
+          "type": "ByteString"
+        },
+        {
+          "name": "sig",
+          "type": "ByteString"
+        },
+        {
+          "name": "wotsPubKey",
+          "type": "ByteString"
+        },
+        {
+          "name": "_changePKH",
+          "type": "Ripemd160"
+        },
+        {
+          "name": "_changeAmount",
+          "type": "bigint"
+        },
+        {
+          "name": "_newAmount",
+          "type": "bigint"
+        },
+        {
+          "name": "txPreimage",
+          "type": "SigHashPreimage"
+        }
+      ]
+    }
+  ],
+  "properties": [
+    {
+      "name": "count",
+      "readonly": false,
+      "type": "bigint"
+    }
+  ]
+}
