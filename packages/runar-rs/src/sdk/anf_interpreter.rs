@@ -1332,6 +1332,15 @@ fn eval_call(
                 .and_then(|w| w.mock_preimage.get("sequence").copied())
                 .unwrap_or(0xfffffffei64),
         ),
+        // GAP-302: the auto-injected stateful covenant pins the sighash type
+        // to SIGHASH_ALL | FORKID (0x41). The interpreter mocks a valid
+        // preimage (checkPreimage passes), so report the canonical pinned
+        // type here too -- otherwise the pin assert spuriously fails.
+        "extractSigHashType" => Val::Int(
+            witness
+                .and_then(|w| w.mock_preimage.get("sigHashType").copied())
+                .unwrap_or(0x41),
+        ),
         "extractOutputHash" | "extractOutputs" => match witness {
             Some(w) => Val::Bytes(bytes_to_hex(
                 w.mock_preimage_bytes
