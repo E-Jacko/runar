@@ -1,6 +1,6 @@
 {
-  "script": "76009c637576ab587a210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad697601687f7782012c947f758258947f75820129947f7701217f81587a5879ad567978a06952798258947f77547f7581009f69577a527a75567a527a75557a557a041976a9147b7e0288ac7e7c58807c7e7b7b58807e5279547a7c7558806b5379016a7e7c7e827602fd009f635280517f756776030000019f635380527f7501fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e6c7c7e7c7eaa7c820128947f7701207f75877767519d76ab537a210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad697601687f7782012c947f758258947f75820129947f7701217f81537a00ad7b8258947f77547f758100a2777768",
-  "scriptSize": 316,
+  "script": "76009c637576ab587a210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad69768254947f778101419d7601687f7782012c947f758258947f75820129947f7701217f81587a5879ad567978a06952798258947f77547f7581009f69577a527a75567a527a75557a557a041976a9147b7e0288ac7e7c58807c7e7b7b58807e5279547a7c7558806b5379016a7e7c7e827602fd009f635280517f756776030000019f635380527f7501fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e6c7c7e7c7eaa7c820128947f7701207f75877767519d76ab537a210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad69768254947f778101419d7601687f7782012c947f758258947f75820129947f7701217f81537a00ad7b8258947f77547f758100a2777768",
+  "scriptSize": 336,
   "findings": [
     {
       "severity": "info",
@@ -13,14 +13,14 @@
       "severity": "info",
       "code": "CODESEPARATOR_PRESENT",
       "message": "OP_CODESEPARATOR found — expected for stateful contracts, unusual otherwise",
-      "offset": 232,
+      "offset": 242,
       "opcode": "OP_CODESEPARATOR"
     }
   ],
   "paths": [
     {
       "id": 0,
-      "description": "IF[false] at 3 -> IF[false] at 152 -> IF[false] at 165 -> IF[false] at 184",
+      "description": "IF[false] at 3 -> IF[false] at 162 -> IF[false] at 175 -> IF[false] at 194",
       "branchChoices": [
         false,
         false,
@@ -33,7 +33,7 @@
     },
     {
       "id": 1,
-      "description": "IF[true] at 3 -> IF[false] at 152 -> IF[false] at 165 -> IF[false] at 184",
+      "description": "IF[true] at 3 -> IF[false] at 162 -> IF[false] at 175 -> IF[false] at 194",
       "branchChoices": [
         true,
         false,
@@ -46,7 +46,7 @@
     },
     {
       "id": 2,
-      "description": "IF[false] at 3 -> IF[true] at 152 -> IF[false] at 165 -> IF[false] at 184",
+      "description": "IF[false] at 3 -> IF[true] at 162 -> IF[false] at 175 -> IF[false] at 194",
       "branchChoices": [
         false,
         true,
@@ -59,7 +59,7 @@
     },
     {
       "id": 3,
-      "description": "IF[true] at 3 -> IF[true] at 152 -> IF[false] at 165 -> IF[false] at 184",
+      "description": "IF[true] at 3 -> IF[true] at 162 -> IF[false] at 175 -> IF[false] at 194",
       "branchChoices": [
         true,
         true,
@@ -72,7 +72,7 @@
     },
     {
       "id": 4,
-      "description": "IF[false] at 3 -> IF[false] at 152 -> IF[true] at 165 -> IF[false] at 184",
+      "description": "IF[false] at 3 -> IF[false] at 162 -> IF[true] at 175 -> IF[false] at 194",
       "branchChoices": [
         false,
         false,
@@ -85,7 +85,7 @@
     },
     {
       "id": 5,
-      "description": "IF[true] at 3 -> IF[false] at 152 -> IF[true] at 165 -> IF[false] at 184",
+      "description": "IF[true] at 3 -> IF[false] at 162 -> IF[true] at 175 -> IF[false] at 194",
       "branchChoices": [
         true,
         false,
@@ -98,7 +98,7 @@
     },
     {
       "id": 6,
-      "description": "IF[false] at 3 -> IF[true] at 152 -> IF[true] at 165 -> IF[false] at 184",
+      "description": "IF[false] at 3 -> IF[true] at 162 -> IF[true] at 175 -> IF[false] at 194",
       "branchChoices": [
         false,
         true,
@@ -111,7 +111,7 @@
     },
     {
       "id": 7,
-      "description": "IF[true] at 3 -> IF[true] at 152 -> IF[true] at 165 -> IF[false] at 184",
+      "description": "IF[true] at 3 -> IF[true] at 162 -> IF[true] at 175 -> IF[false] at 194",
       "branchChoices": [
         true,
         true,
@@ -124,7 +124,7 @@
     },
     {
       "id": 8,
-      "description": "IF[false] at 3 -> IF[false] at 152 -> IF[false] at 165 -> IF[true] at 184",
+      "description": "IF[false] at 3 -> IF[false] at 162 -> IF[false] at 175 -> IF[true] at 194",
       "branchChoices": [
         false,
         false,
@@ -137,7 +137,7 @@
     },
     {
       "id": 9,
-      "description": "IF[true] at 3 -> IF[false] at 152 -> IF[false] at 165 -> IF[true] at 184",
+      "description": "IF[true] at 3 -> IF[false] at 162 -> IF[false] at 175 -> IF[true] at 194",
       "branchChoices": [
         true,
         false,
@@ -150,7 +150,7 @@
     },
     {
       "id": 10,
-      "description": "IF[false] at 3 -> IF[true] at 152 -> IF[false] at 165 -> IF[true] at 184",
+      "description": "IF[false] at 3 -> IF[true] at 162 -> IF[false] at 175 -> IF[true] at 194",
       "branchChoices": [
         false,
         true,
@@ -163,7 +163,7 @@
     },
     {
       "id": 11,
-      "description": "IF[true] at 3 -> IF[true] at 152 -> IF[false] at 165 -> IF[true] at 184",
+      "description": "IF[true] at 3 -> IF[true] at 162 -> IF[false] at 175 -> IF[true] at 194",
       "branchChoices": [
         true,
         true,
@@ -176,7 +176,7 @@
     },
     {
       "id": 12,
-      "description": "IF[false] at 3 -> IF[false] at 152 -> IF[true] at 165 -> IF[true] at 184",
+      "description": "IF[false] at 3 -> IF[false] at 162 -> IF[true] at 175 -> IF[true] at 194",
       "branchChoices": [
         false,
         false,
@@ -189,7 +189,7 @@
     },
     {
       "id": 13,
-      "description": "IF[true] at 3 -> IF[false] at 152 -> IF[true] at 165 -> IF[true] at 184",
+      "description": "IF[true] at 3 -> IF[false] at 162 -> IF[true] at 175 -> IF[true] at 194",
       "branchChoices": [
         true,
         false,
@@ -202,7 +202,7 @@
     },
     {
       "id": 14,
-      "description": "IF[false] at 3 -> IF[true] at 152 -> IF[true] at 165 -> IF[true] at 184",
+      "description": "IF[false] at 3 -> IF[true] at 162 -> IF[true] at 175 -> IF[true] at 194",
       "branchChoices": [
         false,
         true,
@@ -215,7 +215,7 @@
     },
     {
       "id": 15,
-      "description": "IF[true] at 3 -> IF[true] at 152 -> IF[true] at 165 -> IF[true] at 184",
+      "description": "IF[true] at 3 -> IF[true] at 162 -> IF[true] at 175 -> IF[true] at 194",
       "branchChoices": [
         true,
         true,
@@ -233,6 +233,6 @@
     "pathsWithCheckSig": 16,
     "pathsWithoutCheckSig": 0,
     "maxStackDepth": 0,
-    "scriptSizeBytes": 316
+    "scriptSizeBytes": 336
   }
 }

@@ -1,6 +1,9 @@
 package runar.lang.sdk;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.MathContext;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -158,9 +161,19 @@ public final class Envelope {
     /**
      * Format a finite double per ECMA-262 §6.1.6.1.13 Number::toString. Output
      * is byte-identical to JS {@code JSON.stringify(x)} / {@code String(x)}
-     * for any finite {@code x}. {@code Double.toString} alone diverges
-     * ("1.0E21" vs "1e+21" — audit D5), so we re-derive the digit string and
-     * decimal exponent from the surface form and re-emit per the spec rules.
+     * for any finite {@code x}.
+     *
+     * <p>ECMA-262 requires the SHORTEST decimal string that round-trips to
+     * {@code x} (closest value, ties-to-even). We cannot lean on
+     * {@code Double.toString} for the digits: its output is only guaranteed
+     * shortest on JDK 19+ (JDK-4511638 / Ryū). On JDK 17 it can emit a
+     * longer form — e.g. {@code Double.toString(1e23)} is
+     * {@code "9.999999999999999E22"} where ECMAScript yields {@code "1e+23"}
+     * — which would make the signed wire bytes diverge from the other six
+     * SDK tiers (cross-tier canonicalJson must be byte-identical). So derive
+     * the shortest significant-digit string directly: round the exact value
+     * of {@code x} to k significant digits (k = 1..17, half-even) and take
+     * the smallest k whose rounding still parses back to {@code x}.
      */
     private static String formatEcma262Double(double x) {
         if (x == 0.0) {
@@ -169,50 +182,21 @@ public final class Envelope {
         if (x < 0.0) {
             return "-" + formatEcma262Double(-x);
         }
-        String s = Double.toString(x);
-        // Split into mantissa and explicit exponent.
-        int ePos = -1;
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == 'e' || c == 'E') {
-                ePos = i;
+        BigDecimal exact = new BigDecimal(x);
+        BigDecimal rounded = exact;
+        for (int precision = 1; precision <= 17; precision++) {
+            BigDecimal cand = exact.round(new MathContext(precision, RoundingMode.HALF_EVEN));
+            if (cand.doubleValue() == x) {
+                rounded = cand;
                 break;
             }
         }
-        String mantissa;
-        int expPart;
-        if (ePos >= 0) {
-            mantissa = s.substring(0, ePos);
-            expPart = Integer.parseInt(s.substring(ePos + 1));
-        } else {
-            mantissa = s;
-            expPart = 0;
-        }
-        int dot = mantissa.indexOf('.');
-        String intPart;
-        String fracPart;
-        if (dot >= 0) {
-            intPart = mantissa.substring(0, dot);
-            fracPart = mantissa.substring(dot + 1);
-        } else {
-            intPart = mantissa;
-            fracPart = "";
-        }
-        String rawDigits = intPart + fracPart;
-        int leadingZeros = 0;
-        while (leadingZeros < rawDigits.length() && rawDigits.charAt(leadingZeros) == '0') {
-            leadingZeros++;
-        }
-        String trimmed = rawDigits.substring(leadingZeros);
-        int end = trimmed.length();
-        while (end > 0 && trimmed.charAt(end - 1) == '0') {
-            end--;
-        }
-        String digits = trimmed.substring(0, end);
-        if (digits.isEmpty()) {
-            return "0";
-        }
-        int k = intPart.length() - leadingZeros + expPart;
+        // Strip trailing zeros so `digits` carries only significant digits and
+        // `k` (the count of integer-part digits in plain notation, i.e.
+        // ECMAScript's `n`) is computed cleanly.
+        rounded = rounded.stripTrailingZeros();
+        String digits = rounded.unscaledValue().toString(); // x > 0: no sign
+        int k = digits.length() - rounded.scale();
         int sLen = digits.length();
         if (k >= sLen && k <= 21) {
             StringBuilder b = new StringBuilder(digits);

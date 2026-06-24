@@ -267,9 +267,23 @@ class AnfLowerTest {
         assertBinding(inc.body().get(2), "t2", Assert.class);
         assertEquals("t1", ((Assert) inc.body().get(2).value()).value());
 
-        // Next: deserialize_state
+        // Next: GAP-302 sighash-type pin, always injected after checkPreimage:
+        //   t3 = load_param txPreimage
+        //   t4 = call extractSigHashType t3
+        //   t5 = load_const 0x41
+        //   t6 = bin_op === t4 t5
+        //   t7 = assert t6
         assertBinding(inc.body().get(3), "t3", LoadParam.class);
-        assertBinding(inc.body().get(4), "t4", DeserializeState.class);
+        assertEquals("txPreimage", ((LoadParam) inc.body().get(3).value()).name());
+        assertBinding(inc.body().get(4), "t4", Call.class);
+        assertEquals("extractSigHashType", ((Call) inc.body().get(4).value()).func());
+        assertBinding(inc.body().get(5), "t5", LoadConst.class);
+        assertBinding(inc.body().get(6), "t6", BinOp.class);
+        assertBinding(inc.body().get(7), "t7", Assert.class);
+
+        // Next: deserialize_state
+        assertBinding(inc.body().get(8), "t8", LoadParam.class);
+        assertBinding(inc.body().get(9), "t9", DeserializeState.class);
 
         // Augmented params must include the auto-injected ones
         List<String> paramNames = inc.params().stream().map(p -> p.name()).toList();

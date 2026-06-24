@@ -898,6 +898,14 @@ module Runar
           mock_pre = Thread.current[:runar_mock_preimage]
           to_int((mock_pre && (mock_pre['sequence'] || mock_pre[:sequence])) || 0xfffffffe)
 
+        when 'extractSigHashType'
+          # GAP-302: the auto-injected stateful covenant pins the sighash type
+          # to SIGHASH_ALL | FORKID (0x41). The interpreter mocks a valid
+          # preimage (checkPreimage passes), so report the canonical pinned
+          # type here too -- otherwise the pin assert spuriously fails.
+          mock_pre = Thread.current[:runar_mock_preimage]
+          to_int((mock_pre && (mock_pre['sigHashType'] || mock_pre[:sigHashType])) || 0x41)
+
         else
           nil
         end

@@ -116,6 +116,22 @@ class EnvelopeTest {
         assertEquals("{\"v\":1e-300}", Envelope.canonicalJson(Map.of("v", 1e-300)));
     }
 
+    @Test
+    void canonicalJsonFloatsUseShortestRoundTrip() {
+        // Cross-tier regression (canonicalJson fuzzer). ECMA-262 mandates the
+        // SHORTEST decimal that round-trips to x; JDK 17's Double.toString is
+        // not shortest, so it emits "9.999999999999999E22" for 1e23 where V8 —
+        // and the other six SDK tiers — emit "1e+23". A divergence here would
+        // silently break every cross-tier signature over a float payload.
+        assertEquals("{\"v\":1e+23}", Envelope.canonicalJson(Map.of("v", 1e23)));
+        assertEquals("{\"v\":1e+23}", Envelope.canonicalJson(Map.of("v", 9.999999999999999e22)));
+        assertEquals("{\"v\":100000000000000000000}",
+            Envelope.canonicalJson(Map.of("v", 1e20)));
+        assertEquals("{\"v\":5e-324}", Envelope.canonicalJson(Map.of("v", Double.MIN_VALUE)));
+        assertEquals("{\"v\":1.7976931348623157e+308}",
+            Envelope.canonicalJson(Map.of("v", Double.MAX_VALUE)));
+    }
+
     // -------------------------------------------------------------------
     // sign + verify
     // -------------------------------------------------------------------

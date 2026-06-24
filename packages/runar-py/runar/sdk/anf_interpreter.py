@@ -1168,6 +1168,14 @@ def _eval_call(
         if intent is not None and 'sequence' in intent.mock_preimage:
             return intent.mock_preimage['sequence']
         return 0xfffffffe
+    if func == 'extractSigHashType':
+        # GAP-302: the auto-injected stateful covenant pins the sighash type
+        # to SIGHASH_ALL | FORKID (0x41). The interpreter mocks a valid
+        # preimage (checkPreimage passes), so report the canonical pinned
+        # type here too -- otherwise the pin assert spuriously fails.
+        if intent is not None and 'sigHashType' in intent.mock_preimage:
+            return intent.mock_preimage['sigHashType']
+        return 0x41
     if func == 'extractHashPrevouts':
         if intent is not None and 'hashPrevouts' in intent.mock_preimage_bytes:
             return intent.mock_preimage_bytes['hashPrevouts'].hex()

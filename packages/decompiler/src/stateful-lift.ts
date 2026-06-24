@@ -158,6 +158,35 @@ function stripStatefulWrapping(
   }
   cursor += 3;
 
+  // Step 1b: GAP-302 sighash-type pin. Auto-injected for EVERY stateful
+  // public method (regardless of mutable state), immediately after the
+  // checkPreimage assert:
+  //     load_param txPreimage
+  //     call extractSigHashType(txPreimage)
+  //     load_const 0x41
+  //     bin_op === (sigHashType, 0x41)
+  //     assert
+  // It carries no user-visible meaning — the compiler re-injects it on
+  // recompile — so strip it before recovering the user body.
+  if (cursor + 5 <= body.length) {
+    const p0 = body[cursor]!;
+    const p1 = body[cursor + 1]!;
+    const p2 = body[cursor + 2]!;
+    const p3 = body[cursor + 3]!;
+    const p4 = body[cursor + 4]!;
+    if (
+      p0.value.kind === 'load_param' && p0.value.name === 'txPreimage' &&
+      p1.value.kind === 'call' && p1.value.func === 'extractSigHashType' &&
+      p1.value.args.length === 1 && p1.value.args[0] === p0.name &&
+      p2.value.kind === 'load_const' && p2.value.value === 0x41n &&
+      p3.value.kind === 'bin_op' && p3.value.op === '===' &&
+      p3.value.left === p1.name && p3.value.right === p2.name &&
+      p4.value.kind === 'assert' && p4.value.value === p3.name
+    ) {
+      cursor += 5;
+    }
+  }
+
   // Step 2: optional load_param txPreimage → deserialize_state (skipped when
   // the contract has no mutable state). Recognize both shapes.
   if (cursor + 2 <= body.length) {
