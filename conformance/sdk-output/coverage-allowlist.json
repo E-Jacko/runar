@@ -46,6 +46,9 @@
     "post-quantum-slhdsa-192f":         "SLH-DSA parameter-set variant of post-quantum-slhdsa (SDK-output covered); identical SDK deploy-splice path, differs only in compile-time SLH-DSA parameter constants.",
     "post-quantum-slhdsa-192s":         "SLH-DSA parameter-set variant of post-quantum-slhdsa (SDK-output covered); identical SDK deploy-splice path, differs only in compile-time SLH-DSA parameter constants.",
     "post-quantum-slhdsa-256f":         "SLH-DSA parameter-set variant of post-quantum-slhdsa (SDK-output covered); identical SDK deploy-splice path, differs only in compile-time SLH-DSA parameter constants.",
-    "post-quantum-slhdsa-256s":         "SLH-DSA parameter-set variant of post-quantum-slhdsa (SDK-output covered); identical SDK deploy-splice path, differs only in compile-time SLH-DSA parameter constants."
+    "post-quantum-slhdsa-256s":         "SLH-DSA parameter-set variant of post-quantum-slhdsa (SDK-output covered); identical SDK deploy-splice path, differs only in compile-time SLH-DSA parameter constants.",
+    "cond-write-multi-field":           "Stateful conditional multi-field write (issue #99); two bigint state slots [a, b]. The SDK deploy-splice path (multiple bigint constructor slots into a stateful continuation) is already covered by auction; the conditional write + multi-output addOutput is method-time script body whose cross-tier byte-identity is gated by compiler conformance.",
+    "terminal-varlen-read":             "Terminal var-length state read (issue #100); single ByteString state slot. Deploy-splice path is the single-ByteString stateful continuation already covered by stateful-bytestring; the len()-driven terminal read is method-time script body gated by compiler conformance.",
+    "stateful-wots-gate":               "Stateful + WOTS one-time-signature gate (GAP-407); single bigint count slot. Deploy-splice path is identical to stateful-counter; the ~10 KB verifyWOTS check is method-time script body whose cross-tier byte-identity is gated by compiler conformance."
   }
 }
