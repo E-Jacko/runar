@@ -40,7 +40,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-EXPECTED_FIXTURE_TOTAL = 49
+# Floor (not exact): guard against fixture-discovery collapse (a vacuous pass),
+# while allowing the conformance corpus to grow without a hand edit here.
+MIN_FIXTURE_TOTAL = 49
 
 try:
     from bitcoin.core import CTransaction, CTxIn, CTxOut, COutPoint
@@ -161,9 +163,9 @@ def main(argv: list[str]) -> int:
             hex_text = fh.read()
         results.append(run_fixture(entry.name, hex_text))
 
-    if len(results) != EXPECTED_FIXTURE_TOTAL:
+    if len(results) < MIN_FIXTURE_TOTAL:
         print(
-            f"ERROR: discovered {len(results)} fixtures, expected {EXPECTED_FIXTURE_TOTAL}",
+            f"ERROR: discovered {len(results)} fixtures, expected at least {MIN_FIXTURE_TOTAL}",
             file=sys.stderr,
         )
         return 1

@@ -277,8 +277,8 @@ def main : IO Unit := do
       let r := runFixture e.fileName body
       if r.success then succ := succ + 1
       results := r :: results
-  if total != expectedFixtureTotal then
-    IO.eprintln s!"DIFFERENTIAL FAIL: discovered {total} fixtures, expected {expectedFixtureTotal}"
+  if total < expectedFixtureTotal then
+    IO.eprintln s!"DIFFERENTIAL FAIL: discovered {total} fixtures, expected at least {expectedFixtureTotal}"
     IO.Process.exit 1
   let report := renderReport results
   let outPath :=

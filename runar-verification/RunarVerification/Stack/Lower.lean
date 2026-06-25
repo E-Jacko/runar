@@ -1333,6 +1333,15 @@ def lowerVerifyRabinSigOpsLive (sm : StackMap) (bindingName : String)
   let (loadPk, sm4) :=
     loadRefOperand sm3 pubKey rabinOperands currentIndex lastUses outerProtected
   -- Stack bottom→top: msg sig padding pubKey
+  -- KNOWN DIVERGENCE (2026-06-25): BUG-010 added a 5-opcode `OP_WITHIN` range
+  -- check (`0 ≤ padding < 65536`) right after this first `swap` in the 7 real
+  -- compilers, and regenerated the `oracle-price` golden. This model lowering
+  -- does NOT yet emit that gate, so `oracle-price` is tracked in
+  -- `lowerDivergencePending` (PipelineGolden). Porting it (insert
+  -- `dup, push 0, push 65536, OP_WITHIN, OP_VERIFY` here) is byte-exact but
+  -- requires re-proving `Stack/Rabin.runOps_rabinBodyOps_eq` with a
+  -- `0 ≤ padding < 65536` hypothesis threading the within+verify gate — a
+  -- per-primitive codegen-to-spec follow-up.
   let body : List StackOp :=
     [ StackOp.swap                    -- msg sig pubKey padding
     , StackOp.rot                     -- msg pubKey padding sig

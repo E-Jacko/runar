@@ -98,6 +98,16 @@ instance : FromJson ConstValue where
         else if s.startsWith "@ref:" then
           -- `String.drop` returns `String.Slice` in Lean ≥ v4.29.
           .ok (.refAlias (s.drop 5).toString)
+        else if s.endsWith "n" then
+          -- A `bigint` literal too large for a JSON number (e.g. a 256-bit
+          -- field constant) is encoded as a decimal string with the JS
+          -- `BigInt` `n` suffix (`"123n"` / `"-5n"`) — see the conformance
+          -- IR change in BUG-001 ("preserve 'n' suffix in golden IR").
+          -- `n` is not a hex digit, so this never collides with the
+          -- bytestring-literal fallback below.
+          match (s.dropRight 1).toInt? with
+          | some i => .ok (.int i)
+          | none   => .error s!"ConstValue: malformed bigint literal {s}"
         else
           -- Anything else is a hex-encoded ByteString literal
           -- (the Rúnar goldens encode bytestrings as raw hex without
