@@ -447,8 +447,34 @@ fn encode_num2bin(n: i64, width: usize) -> String {
 }
 
 /// Wrap a hex-encoded byte string in a Bitcoin Script push data opcode.
-pub(crate) fn encode_push_data(data_hex: &str) -> String {
+///
+/// Applies BSV consensus rule `SCRIPT_VERIFY_MINIMALDATA` for single-byte
+/// pushes: a 1-byte payload whose value is in `{0x00, 0x01..=0x10, 0x81}`
+/// MUST use the corresponding minimal opcode (`OP_0` / `OP_1..OP_16` /
+/// `OP_1NEGATE`) rather than the direct push `01 NN`. Non-minimal direct
+/// pushes are rejected by ARC, TAAL ARC, and WhatsOnChain at the relay
+/// layer with the error:
+///   `non-mandatory-script-verify-flag (Data push larger than necessary)`
+pub fn encode_push_data(data_hex: &str) -> String {
     let len = data_hex.len() / 2;
+
+    // MINIMALDATA: single-byte payloads in the OP_N range must use the
+    // corresponding minimal opcode. Mirrors the same rule already enforced
+    // by `encode_script_number` for `SdkValue::Int` (which short-circuits
+    // to `OP_N` opcodes for n in 1..=16). The encoder for `SdkValue::Bytes`
+    // did not previously honor this rule, so an arbitrary ByteString that
+    // happened to be a single byte in this range produced a relay-rejected
+    // direct push.
+    if len == 1 {
+        if let Ok(byte) = u8::from_str_radix(data_hex, 16) {
+            match byte {
+                0x00 => return "00".to_string(),                       // OP_0
+                0x01..=0x10 => return format!("{:02x}", 0x50 + byte),  // OP_1..OP_16
+                0x81 => return "4f".to_string(),                       // OP_1NEGATE
+                _ => {}
+            }
+        }
+    }
 
     if len <= 75 {
         format!("{:02x}{}", len, data_hex)
