@@ -880,20 +880,27 @@ impl RunarContract {
                                           tx_change_amount: i64| -> Result<(String, String, String), String> {
                 let (op_sig, preimage) = compute_op_push_tx_with_code_sep(tx, input_idx, subscript, sats, code_sep_idx)?;
 
-                // Only sign Sig params for extra inputs, not the primary
-                if input_idx > 0 {
-                    // In stateful contracts, user checkSig is AFTER OP_CODESEPARATOR — trim.
-                    let mut sig_subscript = subscript.to_string();
-                    if code_sep_idx >= 0 {
-                        let trim_pos = ((code_sep_idx as usize) + 1) * 2;
-                        if trim_pos <= sig_subscript.len() {
-                            sig_subscript = sig_subscript[trim_pos..].to_string();
-                        }
+                // Sign Sig params for ALL inputs. Stateful contracts that mix
+                // OP_PUSH_TX preimage verification with user `check_sig` calls
+                // require a real signature at the primary covenant input
+                // (input_idx == 0) too — leaving the placeholder zero bytes
+                // there fails on-chain `check_sig` and the relay rejects the
+                // transaction. The BIP-143 sighash for input 0 is identical
+                // to the OP_PUSH_TX sighash for that input (same tx, same
+                // input_idx, same trimmed subscript), so both checks in the
+                // unlock context see consistent message bytes.
+                //
+                // In stateful contracts, user checkSig is AFTER OP_CODESEPARATOR — trim.
+                let mut sig_subscript = subscript.to_string();
+                if code_sep_idx >= 0 {
+                    let trim_pos = ((code_sep_idx as usize) + 1) * 2;
+                    if trim_pos <= sig_subscript.len() {
+                        sig_subscript = sig_subscript[trim_pos..].to_string();
                     }
-                    for &idx in sig_indices {
-                        let real_sig = signer.sign(tx, input_idx, &sig_subscript, sats, None)?;
-                        resolved_args[idx] = SdkValue::Bytes(real_sig);
-                    }
+                }
+                for &idx in sig_indices {
+                    let real_sig = signer.sign(tx, input_idx, &sig_subscript, sats, None)?;
+                    resolved_args[idx] = SdkValue::Bytes(real_sig);
                 }
 
                 // Resolve ByteString params (auto-compute allPrevouts from tx)
