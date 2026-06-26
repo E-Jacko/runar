@@ -10,7 +10,7 @@ use bsv::transaction::Transaction as BsvTransaction;
 use sha2::{Sha256, Digest};
 use ripemd::Ripemd160;
 use serde_json::Value;
-use super::types::{TransactionData, Utxo};
+use super::types::{TransactionData, TxInput, TxOutput, Utxo};
 use super::provider::Provider;
 use super::signer::Signer;
 use super::script_utils::build_p2pkh_script;
@@ -295,45 +295,124 @@ impl<W: WalletClient> Provider for WalletProvider<W> {
         let raw_bytes = hex_to_bytes(&raw_hex)?;
         let txid = compute_txid(&raw_bytes);
 
-        // POST to ARC as application/octet-stream
+        // POST to ARC as application/octet-stream.
+        // R1 (Wave 1) — surface ARC failures as Err so callers can distinguish
+        // accepted from rejected broadcasts. The previous code returned
+        // Ok(synthetic_txid) on HTTP non-2xx and on network errors, masking
+        // real failures (mainnet ARC 461 from GorillaPool was the trigger).
         let arc_endpoint = format!("{}/v1/tx", self.arc_url);
-        match ureq::post(&arc_endpoint)
+        let response = ureq::post(&arc_endpoint)
             .set("Content-Type", "application/octet-stream")
-            .send_bytes(&raw_bytes)
-        {
-            Ok(resp) => {
-                let body = resp.into_string().unwrap_or_default();
-                if let Ok(json) = serde_json::from_str::<Value>(&body) {
-                    if let Some(arc_txid) = json.get("txid").and_then(|v| v.as_str()) {
-                        self.tx_cache.insert(arc_txid.to_string(), raw_hex);
-                        return Ok(arc_txid.to_string());
-                    }
-                }
-                self.tx_cache.insert(txid.clone(), raw_hex);
-                Ok(txid)
+            .send_bytes(&raw_bytes);
+
+        let resp = match response {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                return Err(format!(
+                    "WalletProvider broadcast: ARC HTTP {} from {}: {}",
+                    code, arc_endpoint, body
+                ));
             }
-            Err(_) => {
-                // ARC unreachable — cache locally and return computed txid
-                self.tx_cache.insert(txid.clone(), raw_hex);
-                Ok(txid)
+            Err(e) => {
+                return Err(format!(
+                    "WalletProvider broadcast: ARC network error against {}: {}",
+                    arc_endpoint, e
+                ));
             }
+        };
+
+        let status_code = resp.status();
+        let body = resp.into_string().unwrap_or_default();
+        if !(200..300).contains(&status_code) {
+            return Err(format!(
+                "WalletProvider broadcast: ARC HTTP {} from {}: {}",
+                status_code, arc_endpoint, body
+            ));
         }
+
+        let json: Value = serde_json::from_str(&body).map_err(|e| {
+            format!(
+                "WalletProvider broadcast: ARC returned 2xx but body is not JSON ({}): {}",
+                e, body
+            )
+        })?;
+
+        let arc_txid = json
+            .get("txid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "WalletProvider broadcast: ARC accepted but returned no txid; body: {}",
+                    body
+                )
+            })?
+            .to_string();
+
+        // Sanity check: ARC's txid must match what we computed locally.
+        if arc_txid != txid {
+            return Err(format!(
+                "WalletProvider broadcast: ARC txid {} != local txid {} (body: {})",
+                arc_txid, txid, body
+            ));
+        }
+
+        self.tx_cache.insert(arc_txid.clone(), raw_hex);
+        Ok(arc_txid)
     }
 
     fn get_transaction(&self, txid: &str) -> Result<TransactionData, String> {
-        // Check local cache first
+        // R2 (Wave 1) — parse the cached raw bytes so callers receive populated
+        // inputs/outputs. Previously this returned empty inputs and outputs
+        // even on cache hit, which broke RunarContract::from_txid (which
+        // indexes tx.outputs[output_index]) on every deployed stateful contract.
         if let Some(raw) = self.tx_cache.get(txid) {
+            let raw_hex = raw.clone();
+            let raw_bytes = hex_to_bytes(&raw_hex)?;
+            let parsed = parse_raw_tx(&raw_bytes)?;
+            let inputs = parsed
+                .inputs
+                .into_iter()
+                .map(|i| {
+                    let mut prev_txid_hex = String::with_capacity(64);
+                    for b in i.prev_txid_bytes.iter().rev() {
+                        prev_txid_hex.push_str(&format!("{:02x}", b));
+                    }
+                    TxInput {
+                        txid: prev_txid_hex,
+                        output_index: i.prev_output_index,
+                        script: String::new(),
+                        sequence: i.sequence,
+                    }
+                })
+                .collect();
+            let outputs = parsed
+                .outputs
+                .into_iter()
+                .map(|o| {
+                    let mut script_hex = String::with_capacity(o.script.len() * 2);
+                    for b in &o.script {
+                        script_hex.push_str(&format!("{:02x}", b));
+                    }
+                    TxOutput {
+                        satoshis: o.satoshis as i64,
+                        script: script_hex,
+                    }
+                })
+                .collect();
             return Ok(TransactionData {
                 txid: txid.to_string(),
-                version: 1,
-                inputs: vec![],
-                outputs: vec![],
-                locktime: 0,
-                raw: Some(raw.clone()),
+                version: parsed.version,
+                inputs,
+                outputs,
+                locktime: parsed.locktime,
+                raw: Some(raw_hex),
             });
         }
 
-        // Minimal fallback
+        // Cache miss — preserve upstream's fallback behavior: return an
+        // empty TransactionData with raw: None. Callers that need the parsed
+        // transaction will then fall back to get_raw_transaction (overlay).
         Ok(TransactionData {
             txid: txid.to_string(),
             version: 1,
