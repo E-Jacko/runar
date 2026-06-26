@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 use bsv::transaction::Transaction as BsvTransaction;
+use bsv::transaction::beef::Beef;
 use super::types::*;
 use super::state::{serialize_state, extract_state_from_script, encode_push_data, find_last_op_return};
 use super::oppushtx::compute_op_push_tx_with_code_sep;
@@ -21,7 +22,37 @@ use super::ordinals::{Inscription, build_inscription_envelope, parse_inscription
 use crate::prelude::hash160 as compute_hash160;
 
 /// Convert a raw transaction hex string to a BSV SDK Transaction object for broadcasting.
-fn hex_to_bsv_tx(hex: &str) -> Result<BsvTransaction, String> {
+///
+/// Detects AtomicBEEF / BEEF magic bytes at the start of the hex stream and
+/// parses via `Beef::from_hex` so that wallet-toolbox's `CreateActionResult.tx`
+/// (which is AtomicBEEF — see TS canonical at packages/wallet/wallet-toolbox/src/signer/
+/// methods/createAction.ts:66 `r.tx = beef.toBinaryAtomic(r.txid)`) is unwrapped
+/// with `source_transaction` populated on every input. Treating those bytes as
+/// raw tx hex either fails or produces a transaction with empty parent context,
+/// forcing every downstream broadcaster to re-fetch parents over HTTP.
+///
+/// Mirrors TS engine behaviour: `Transaction.fromAtomicBEEF(result.tx)`.
+/// Magic bytes (first 4 bytes little-endian u32):
+///   - ATOMIC_BEEF = 0x01010101 → hex "01010101"
+///   - BEEF_V1     = 0x0100BEEF → hex "efbe0001"
+///   - BEEF_V2     = 0x0200BEEF → hex "efbe0002"
+/// Raw tx hex starts with the tx version ("01000000" / "02000000"), so the
+/// discriminator is unambiguous.
+///
+/// Exposed (`pub`) so external regression tests can verify the AtomicBEEF
+/// detection + parent-chain preservation path.
+pub fn hex_to_bsv_tx(hex: &str) -> Result<BsvTransaction, String> {
+    if hex.len() >= 8 {
+        let prefix = hex[..8].to_ascii_lowercase();
+        if prefix == "01010101" || prefix == "efbe0001" || prefix == "efbe0002" {
+            let beef = Beef::from_hex(hex).map_err(|e| {
+                format!("hex_to_bsv_tx: BEEF magic detected but Beef::from_hex failed: {}", e)
+            })?;
+            return beef.into_transaction().map_err(|e| {
+                format!("hex_to_bsv_tx: BEEF parsed but into_transaction failed: {}", e)
+            });
+        }
+    }
     BsvTransaction::from_hex(hex).map_err(|e| format!("hex_to_bsv_tx: {}", e))
 }
 
