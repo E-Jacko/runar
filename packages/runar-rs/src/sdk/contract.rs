@@ -720,11 +720,31 @@ impl RunarContract {
         } else if is_stateful {
             // For single-output continuations, the on-chain script uses the input amount
             // (extracted from the preimage). The SDK output must match.
-            new_satoshis = Some(
-                options
-                    .and_then(|o| o.satoshis)
-                    .unwrap_or(current_utxo.satoshis),
-            );
+            //
+            // R3 fix: when the method declares `outputSatoshis` as an EXPLICIT
+            // public user param (e.g. EnergyTag.transfer/split/retire), the
+            // contract body uses that value as the continuation output's
+            // satoshi amount via `addOutput(outputSatoshis, ...)`. The compiler
+            // lowers that into a `hashOutputs` preimage check parameterized on
+            // the user-supplied value — so the SDK MUST emit an output with
+            // that exact satoshi count or OP_HASH256(serialize(output)) ≠
+            // committed hash, OP_EQUALVERIFY fails post-broadcast, ARC HTTP 461.
+            //
+            // Resolution order (highest priority first):
+            //   1. `CallOptions.satoshis` (caller override)
+            //   2. User's `outputSatoshis` arg at `resolved_args[user_params position]`
+            //      when the method declares it as a public param
+            //   3. Legacy fallback to `current_utxo.satoshis`
+            //
+            // Methods that don't declare outputSatoshis keep the legacy fallback.
+            let user_param_names: Vec<&str> =
+                user_params.iter().map(|p| p.name.as_str()).collect();
+            new_satoshis = Some(resolve_continuation_satoshis(
+                &user_param_names,
+                &resolved_args,
+                options.and_then(|o| o.satoshis),
+                current_utxo.satoshis,
+            ));
             // Apply new state values before building the continuation output.
             // Explicit newState takes priority (backward compat); otherwise
             // auto-compute from ANF IR if available.
@@ -1967,6 +1987,36 @@ fn read_varint_bytes(bytes: &[u8], offset: usize) -> (u64, usize) {
         // 0xff: 8-byte varint (unlikely for tx input counts)
         (0, 9)
     }
+}
+
+/// Resolve the satoshi amount for a stateful contract's continuation output
+/// at the moment the SDK builds the spending transaction.
+///
+/// Resolution order (highest priority first):
+///   1. `options.satoshis` (caller override via `CallOptions`)
+///   2. User's `outputSatoshis` arg at the matching position in
+///      `resolved_args` when the method declares it as a public param
+///   3. Legacy fallback to `current_utxo_satoshis`
+///
+/// This is extracted from `RunarContract::prepare_call_terminal` so external
+/// regression tests can assert the rung priority directly without standing up
+/// a full stateful-contract deploy + call cycle.
+pub fn resolve_continuation_satoshis(
+    user_param_names: &[&str],
+    resolved_args: &[SdkValue],
+    options_satoshis: Option<i64>,
+    current_utxo_satoshis: i64,
+) -> i64 {
+    let user_outputs_satoshis = user_param_names
+        .iter()
+        .position(|n| *n == "outputSatoshis")
+        .and_then(|i| match resolved_args.get(i) {
+            Some(SdkValue::Int(v)) => Some(*v),
+            _ => None,
+        });
+    options_satoshis
+        .or(user_outputs_satoshis)
+        .unwrap_or(current_utxo_satoshis)
 }
 
 /// Encode an argument value as a Bitcoin Script push data element.
