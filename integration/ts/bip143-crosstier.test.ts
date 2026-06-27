@@ -21,7 +21,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { Transaction, P2PKH as BsvP2PKH, PrivateKey, Script } from '@bsv/sdk';
+import { Transaction, P2PKH as BsvP2PKH, PrivateKey, Script, UnlockingScript } from '@bsv/sdk';
 import { LocalSigner, computeOpPushTx } from 'runar-sdk';
 import { createProvider } from './helpers/node.js';
 import { createWallet } from './helpers/wallet.js';
@@ -61,7 +61,9 @@ describe('BIP-143 cross-tier broadcast (P2PKH, TS reference path)', () => {
     tx.addInput({
       sourceTransaction: fundTx,
       sourceOutputIndex: vout,
-      unlockingScript: undefined,
+      // @bsv/sdk 2.0.7's tx.toHex() rejects a null unlockingScript; an unsigned
+      // input needs an explicit empty script (input 0 is signed below).
+      unlockingScript: new UnlockingScript(),
       sequence: 0xffffffff,
     });
     tx.addOutput({
