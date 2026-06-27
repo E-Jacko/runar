@@ -54,24 +54,30 @@ describe('BIP-143 cross-tier broadcast (P2PKH, TS reference path)', () => {
     }
     expect(vout, 'funded P2PKH output not found').toBeGreaterThanOrEqual(0);
 
-    // Build the unsigned spend: send (funded - fee) back to the same address.
+    // Build the spend: send (funded - fee) back to the same address. We build
+    // it twice — unsigned (for the preimage) and again with the real unlocking
+    // script (for broadcast). @bsv/sdk caches a tx's serialization on the first
+    // toHex(), and mutating inputs[i].unlockingScript afterwards does NOT
+    // invalidate that cache, so reusing the unsigned tx for broadcast would ship
+    // an empty scriptSig (consensus-invalid). A fresh tx serializes cleanly.
     const fee = 500;
     const sendSats = fundedSats - fee;
-    const tx = new Transaction();
-    tx.addInput({
-      sourceTransaction: fundTx,
-      sourceOutputIndex: vout,
-      // @bsv/sdk 2.0.7's tx.toHex() rejects a null unlockingScript; an unsigned
-      // input needs an explicit empty script (input 0 is signed below).
-      unlockingScript: new UnlockingScript(),
-      sequence: 0xffffffff,
-    });
-    tx.addOutput({
-      satoshis: sendSats,
-      lockingScript: new BsvP2PKH().lock(address),
-    });
+    const buildSpend = (unlockingScript: Script): Transaction => {
+      const t = new Transaction();
+      t.addInput({
+        sourceTransaction: fundTx,
+        sourceOutputIndex: vout,
+        unlockingScript,
+        sequence: 0xffffffff,
+      });
+      t.addOutput({
+        satoshis: sendSats,
+        lockingScript: new BsvP2PKH().lock(address),
+      });
+      return t;
+    };
 
-    const unsignedHex = tx.toHex();
+    const unsignedHex = buildSpend(new UnlockingScript()).toHex();
 
     // Cross-check: the SDK's BIP-143 helper (the path the frozen fixture uses)
     // and the LocalSigner must compute the SAME preimage for this live tx.
@@ -85,7 +91,7 @@ describe('BIP-143 cross-tier broadcast (P2PKH, TS reference path)', () => {
 
     const pushSig = pushData(sigHex);
     const pushPk = pushData(pubKeyHex);
-    tx.inputs[0]!.unlockingScript = Script.fromHex(pushSig + pushPk);
+    const tx = buildSpend(Script.fromHex(pushSig + pushPk));
 
     // Broadcast + mine — node acceptance is the consensus-validity proof.
     const txid = await provider.broadcast(tx);
