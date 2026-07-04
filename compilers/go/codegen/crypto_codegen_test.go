@@ -28,7 +28,7 @@ func TestCryptoEmitOpCountGoldens(t *testing.T) {
 		{"EcMul", EmitEcMul, 63828},
 		{"EcMulGen", EmitEcMulGen, 63830},
 		{"EcNegate", EmitEcNegate, 945},
-		{"EcOnCurve", EmitEcOnCurve, 520},
+		{"EcOnCurve", EmitEcOnCurve, 533},
 		{"P256Add", EmitP256Add, 6505},
 		{"P256Mul", EmitP256Mul, 73306},
 		{"VerifyECDSA_P256", EmitVerifyECDSA_P256, 163589},

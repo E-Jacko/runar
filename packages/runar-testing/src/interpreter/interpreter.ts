@@ -1753,6 +1753,10 @@ function ecNegateImpl(pt: Uint8Array): Uint8Array {
 
 function ecOnCurveImpl(pt: Uint8Array): boolean {
   const [x, y] = ecDecodePoint(pt);
+  // GAP-301: reject non-canonical coordinate encodings (x ≥ p or y ≥ p) to
+  // match the compiled script, which range-checks the coordinates before the
+  // field arithmetic reduces them mod p.
+  if (x >= EC_P || y >= EC_P) return false;
   const lhs = ecMod(y * y, EC_P);
   const rhs = ecMod(x * x * x + 7n, EC_P);
   return lhs === rhs;
