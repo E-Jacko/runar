@@ -23,6 +23,7 @@ export class TestSmartContract {
   private readonly artifact: RunarArtifact;
   readonly constructorArgs: unknown[];
   private readonly lockingScript: Uint8Array;
+  private readonly lockingScriptHex: string;
   private vmOptions: VMOptions;
 
   private constructor(
@@ -32,7 +33,11 @@ export class TestSmartContract {
   ) {
     this.artifact = artifact;
     this.constructorArgs = constructorArgs;
-    this.lockingScript = hexToBytes(artifact.script);
+    this.lockingScriptHex = bakeConstructorArgsIntoScript(
+      artifact,
+      constructorArgs,
+    );
+    this.lockingScript = hexToBytes(this.lockingScriptHex);
     this.vmOptions = vmOptions;
   }
 
@@ -75,10 +80,10 @@ export class TestSmartContract {
   }
 
   /**
-   * Get the locking script as a hex string.
+   * Get the locking script as a hex string (with constructor args baked in).
    */
   getLockingScriptHex(): string {
-    return this.artifact.script;
+    return this.lockingScriptHex;
   }
 
   /**
@@ -141,6 +146,91 @@ export class TestSmartContract {
   getContractName(): string {
     return this.artifact.contractName;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Constructor arg baking
+// ---------------------------------------------------------------------------
+
+/**
+ * Apply the artifact's `constructorSlots` substitution so the locking script
+ * carries the real constructor values instead of OP_0 placeholders (mirrors
+ * runar-sdk's `RunarContract.buildCodeScript`).
+ *
+ * Previously `fromArtifact` stored `constructorArgs` but executed the raw
+ * placeholder script, so any comparison against a baked readonly value
+ * failed with `OP_EQUALVERIFY failed` and no hint as to why.
+ *
+ * - No `constructorSlots`: the raw script is returned unchanged. Passing
+ *   non-empty args is fine when the ABI declares constructor params —
+ *   unreferenced readonly properties are eliminated by the compiler and
+ *   simply have no placeholder to fill.
+ * - `constructorSlots` present: every slot's `paramIndex` must resolve to a
+ *   provided arg, and the arg count must match the ABI constructor's param
+ *   count; otherwise this throws instead of silently running placeholders.
+ */
+function bakeConstructorArgsIntoScript(
+  artifact: RunarArtifact,
+  constructorArgs: unknown[],
+): string {
+  const slots = artifact.constructorSlots;
+  if (!slots || slots.length === 0) {
+    return artifact.script;
+  }
+
+  const abiParams = artifact.abi.constructor?.params ?? [];
+  if (constructorArgs.length !== abiParams.length) {
+    throw new Error(
+      `TestSmartContract.fromArtifact: contract '${artifact.contractName}' ` +
+        `expects ${abiParams.length} constructor arg(s) ` +
+        `(${abiParams.map((p) => p.name).join(', ')}), got ${constructorArgs.length}`,
+    );
+  }
+
+  // Substitute in descending byte-offset order so earlier splices don't
+  // invalidate later offsets.
+  const sorted = [...slots].sort((a, b) => b.byteOffset - a.byteOffset);
+  let script = artifact.script;
+  for (const slot of sorted) {
+    const value = constructorArgs[slot.paramIndex];
+    if (value === undefined) {
+      const paramName = abiParams[slot.paramIndex]?.name ?? `#${slot.paramIndex}`;
+      throw new Error(
+        `TestSmartContract.fromArtifact: missing constructor arg '${paramName}' ` +
+          `(paramIndex ${slot.paramIndex}) required by a constructorSlot of ` +
+          `contract '${artifact.contractName}'`,
+      );
+    }
+    const encoded = encodeConstructorValueHex(value);
+    const hexOffset = slot.byteOffset * 2;
+    // Replace the 1-byte OP_0 placeholder (2 hex chars) with the encoded push.
+    script = script.slice(0, hexOffset) + encoded + script.slice(hexOffset + 2);
+  }
+  return script;
+}
+
+/**
+ * Encode a constructor value as a Bitcoin Script push element (hex).
+ * Mirrors runar-sdk's `encodeArg`.
+ */
+function encodeConstructorValueHex(value: unknown): string {
+  if (typeof value === 'bigint' || typeof value === 'number') {
+    const n = typeof value === 'bigint' ? value : BigInt(value);
+    if (n === 0n) return '00'; // OP_0
+    if (n >= 1n && n <= 16n) return (0x50 + Number(n)).toString(16); // OP_1..OP_16
+    if (n === -1n) return '4f'; // OP_1NEGATE
+    return bytesToHex(encodePushData(encodeScriptNumber(n)));
+  }
+  if (typeof value === 'boolean') {
+    return value ? '51' : '00';
+  }
+  if (typeof value === 'string') {
+    // Hex-encoded data (ByteString / PubKey / Sha256 / ...)
+    return bytesToHex(encodePushData(hexToBytes(value)));
+  }
+  throw new Error(
+    `TestSmartContract.fromArtifact: unsupported constructor arg type '${typeof value}'`,
+  );
 }
 
 // ---------------------------------------------------------------------------
