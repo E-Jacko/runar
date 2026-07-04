@@ -168,6 +168,32 @@ interface Substitution {
   slot?: ConstructorSlot;
 }
 
+/**
+ * Assert that the template script actually carries the 1-byte OP_0
+ * placeholder (0x00) at a slot's byteOffset. The descriptor anchor points
+ * (`constructorSlots[].byteOffset`, `codeSepIndexSlots[].byteOffset`) are
+ * trusted verbatim from the artifact JSON — a corrupted or mismatched
+ * descriptor (wrong offsets for this script) would otherwise be spliced
+ * over silently, yielding wrong layouts and a wrong template hash.
+ */
+function assertPlaceholderByte(
+  artifact: RunarArtifact,
+  byteOffset: number,
+  slotKind: string,
+  slotLabel: string,
+): void {
+  const byteHex = artifact.script.slice(byteOffset * 2, byteOffset * 2 + 2);
+  if (byteHex !== '00') {
+    throw new Error(
+      `resolveSlotLayout: ${slotKind} ${slotLabel} expects an OP_0 placeholder ` +
+        `(0x00) at byteOffset ${byteOffset} of the template script, found ` +
+        `${byteHex === '' ? 'end-of-script' : `0x${byteHex}`} — ` +
+        `the descriptor does not match this artifact's script (corrupted or ` +
+        `mismatched artifact JSON)`,
+    );
+  }
+}
+
 /** All template substitutions (constructor slots + codeSepIndex slots). */
 function collectSubstitutions(
   artifact: RunarArtifact,
@@ -175,13 +201,31 @@ function collectSubstitutions(
 ): Substitution[] {
   const subs: Substitution[] = [];
   for (const slot of artifact.constructorSlots ?? []) {
+    const abiParamName = artifact.abi.constructor.params[slot.paramIndex]?.name;
     if (slot.paramIndex >= constructorArgs.length) {
       throw new Error(
         `resolveSlotLayout: constructor slot for paramIndex ${slot.paramIndex} ` +
-          `('${slot.name ?? artifact.abi.constructor.params[slot.paramIndex]?.name ?? '?'}') ` +
+          `('${slot.name ?? abiParamName ?? '?'}') ` +
           `has no matching constructor arg (got ${constructorArgs.length} args)`,
       );
     }
+    // An enriched slot's name must correspond to the ABI constructor param
+    // at its paramIndex — a mismatch means the descriptor's slot metadata
+    // and the ABI disagree about which value lands in this slot.
+    if (slot.name !== undefined && slot.name !== abiParamName) {
+      throw new Error(
+        `resolveSlotLayout: constructor slot at byteOffset ${slot.byteOffset} ` +
+          `is named '${slot.name}' but abi.constructor.params[${slot.paramIndex}] ` +
+          `is ${abiParamName === undefined ? 'missing' : `named '${abiParamName}'`} — ` +
+          `corrupted or mismatched descriptor`,
+      );
+    }
+    assertPlaceholderByte(
+      artifact,
+      slot.byteOffset,
+      'constructor slot',
+      `'${slot.name ?? abiParamName ?? `param${slot.paramIndex}`}'`,
+    );
     subs.push({
       templateByteOffset: slot.byteOffset,
       encodedHex: encodeArg(constructorArgs[slot.paramIndex]),
@@ -189,6 +233,12 @@ function collectSubstitutions(
     });
   }
   for (const rs of resolvedCodeSepSlotValues(artifact, constructorArgs)) {
+    assertPlaceholderByte(
+      artifact,
+      rs.templateByteOffset,
+      'codeSepIndex slot',
+      `(adjusted value ${rs.adjustedValue})`,
+    );
     subs.push({
       templateByteOffset: rs.templateByteOffset,
       encodedHex: encodeScriptNumber(BigInt(rs.adjustedValue)),

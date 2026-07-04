@@ -229,6 +229,136 @@ describe('the OP_N / OP_0 / multi-byte encoding boundaries (iteration-010 trap)'
   });
 });
 
+// ---------------------------------------------------------------------------
+// Descriptor hardening: the anchor points (byteOffset / paramIndex / name)
+// are trusted verbatim from the artifact JSON. A corrupted or mismatched
+// descriptor must fail loudly instead of being spliced over silently.
+// ---------------------------------------------------------------------------
+
+/** Stateful contract with a variable-length state field → codeSepIndexSlots. */
+const VARLEN_STATE_SOURCE = `
+import { StatefulSmartContract, assert, checkSig } from 'runar-lang';
+import type { PubKey, Sig, ByteString } from 'runar-lang';
+
+class VarState extends StatefulSmartContract {
+  owner: PubKey;
+  memo: ByteString;
+
+  readonly issuer: PubKey;
+  readonly bound: bigint;
+
+  constructor(owner: PubKey, memo: ByteString, issuer: PubKey, bound: bigint) {
+    super(owner, memo, issuer, bound);
+    this.owner = owner;
+    this.memo = memo;
+    this.issuer = issuer;
+    this.bound = bound;
+  }
+
+  public update(sig: Sig, newMemo: ByteString, outputSatoshis: bigint) {
+    assert(checkSig(sig, this.owner));
+    assert(this.bound >= 1n);
+    assert(outputSatoshis >= 1n);
+    this.memo = newMemo;
+    this.addOutput(outputSatoshis, this.owner, this.memo);
+  }
+
+  public reclaim(sig: Sig, outputSatoshis: bigint) {
+    assert(checkSig(sig, this.issuer));
+    assert(outputSatoshis >= 1n);
+    this.addOutput(outputSatoshis, this.owner, this.memo);
+  }
+}
+`;
+
+const varlenCompiled = compile(VARLEN_STATE_SOURCE, { fileName: 'VarState.runar.ts' });
+if (!varlenCompiled.artifact) {
+  throw new Error('varlen compile failed: ' + JSON.stringify(varlenCompiled.diagnostics));
+}
+const varlenArtifact = varlenCompiled.artifact;
+/** ctor args: [owner, memo, issuer, bound] */
+const VARLEN_ARGS: unknown[] = [OWNER, 'aabbcc', ISSUER, 5n];
+
+/** Corrupt the 1-byte placeholder at `byteOffset` in a cloned artifact. */
+function withCorruptedByte(a: typeof artifact, byteOffset: number): typeof artifact {
+  const s = a.script;
+  return {
+    ...a,
+    script: s.slice(0, byteOffset * 2) + 'ee' + s.slice(byteOffset * 2 + 2),
+  };
+}
+
+describe('descriptor hardening asserts', () => {
+  it('sanity: the varlen fixture actually carries codeSepIndexSlots', () => {
+    expect(varlenArtifact.codeSepIndexSlots!.length).toBeGreaterThanOrEqual(1);
+    expect(varlenArtifact.constructorSlots!.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('throws when a constructor slot byteOffset does not point at an OP_0 placeholder', () => {
+    const slot = artifact.constructorSlots![0]!;
+    const corrupted = withCorruptedByte(artifact, slot.byteOffset);
+    expect(() => resolveSlotLayout(corrupted, ARGS)).toThrow(/OP_0 placeholder/);
+    expect(() => buildResolvedCodeHex(corrupted, ARGS)).toThrow(/OP_0 placeholder/);
+    expect(() => computeTemplateHash(corrupted, ARGS)).toThrow(/OP_0 placeholder/);
+  });
+
+  it('throws when a constructor slot byteOffset points past the end of the script', () => {
+    const bad = {
+      ...artifact,
+      constructorSlots: artifact.constructorSlots!.map((s, i) =>
+        i === 0 ? { ...s, byteOffset: artifact.script.length / 2 + 10 } : s,
+      ),
+    };
+    expect(() => resolveSlotLayout(bad, ARGS)).toThrow(/end-of-script/);
+  });
+
+  it('throws when an enriched slot name does not match the ABI param at its paramIndex', () => {
+    // Swap the two slots' names — offsets stay valid, so only the
+    // name/paramIndex correspondence check can catch this.
+    const [a, b] = artifact.constructorSlots!;
+    const swapped = {
+      ...artifact,
+      constructorSlots: [
+        { ...a!, name: b!.name },
+        { ...b!, name: a!.name },
+      ],
+    };
+    expect(() => resolveSlotLayout(swapped, ARGS)).toThrow(/named .* but abi\.constructor\.params/);
+    expect(() => computeTemplateHash(swapped, ARGS)).toThrow(/named .* but abi\.constructor\.params/);
+  });
+
+  it('accepts un-enriched slots (no name) — pre-descriptor artifacts still resolve', () => {
+    const bare = {
+      ...artifact,
+      constructorSlots: artifact.constructorSlots!.map(s => ({
+        paramIndex: s.paramIndex,
+        byteOffset: s.byteOffset,
+      })),
+    };
+    expect(buildResolvedCodeHex(bare, ARGS).toLowerCase()).toBe(oracle.code);
+  });
+
+  it('throws when a codeSepIndex slot byteOffset does not point at an OP_0 placeholder', () => {
+    const slot = varlenArtifact.codeSepIndexSlots![0]!;
+    const corrupted = withCorruptedByte(varlenArtifact, slot.byteOffset);
+    expect(() => buildResolvedCodeHex(corrupted, VARLEN_ARGS)).toThrow(
+      /codeSepIndex slot .*OP_0 placeholder/,
+    );
+  });
+
+  it('parity on a codeSepIndexSlots artifact: buildResolvedCodeHex === getCodePartHex', () => {
+    const c = new RunarContract(varlenArtifact, VARLEN_ARGS);
+    const expected = (c as unknown as { getCodePartHex(): string })
+      .getCodePartHex()
+      .toLowerCase();
+    expect(buildResolvedCodeHex(varlenArtifact, VARLEN_ARGS).toLowerCase()).toBe(expected);
+    // and the codeSep placeholders are actually gone
+    for (const cs of varlenArtifact.codeSepIndexSlots!) {
+      expect(varlenArtifact.script.slice(cs.byteOffset * 2, cs.byteOffset * 2 + 2)).toBe('00');
+    }
+  });
+});
+
 describe('resolveStateLayout', () => {
   const layout = resolveStateLayout(artifact);
 
