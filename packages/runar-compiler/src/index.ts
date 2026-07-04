@@ -68,9 +68,10 @@ import { emit } from './passes/06-emit.js';
 import { optimizeStackIR } from './optimizer/peephole.js';
 import { optimizeEC } from './optimizer/anf-ec.js';
 import { foldConstants } from './optimizer/constant-fold.js';
+import { eliminateDeadBindings } from './optimizer/dce.js';
 import { assembleArtifact } from './artifact/assembler.js';
 import type { CompilerDiagnostic } from './errors.js';
-import type { ContractNode, ANFProgram, RunarArtifact } from './ir/index.js';
+import type { ContractNode, ANFProgram, ANFBinding, RunarArtifact } from './ir/index.js';
 import { InputLimits, CanonicalJsonError } from 'runar-ir-schema';
 
 // ---------------------------------------------------------------------------
@@ -325,10 +326,36 @@ export function compile(source: string, options?: CompileOptions): CompileResult
   // Bake constructor args into ANF properties so stack lowering emits real
   // values instead of OP_0 placeholders.
   if (opts.constructorArgs) {
+    const shapeErrors = validateConstructorArgsShape(anf, opts.constructorArgs);
+    if (shapeErrors.length > 0) {
+      for (const msg of shapeErrors) {
+        diagnostics.push({ message: msg, severity: 'error' } as CompilerDiagnostic);
+      }
+      return {
+        anf: null,
+        contract: parseResult.contract,
+        diagnostics,
+        success: false,
+      };
+    }
+
     for (const prop of anf.properties) {
       if (prop.name in opts.constructorArgs) {
         prop.initialValue = opts.constructorArgs[prop.name];
       }
+    }
+
+    const unbakedErrors = findUnbakedReferencedReadonly(anf);
+    if (unbakedErrors.length > 0) {
+      for (const msg of unbakedErrors) {
+        diagnostics.push({ message: msg, severity: 'error' } as CompilerDiagnostic);
+      }
+      return {
+        anf: null,
+        contract: parseResult.contract,
+        diagnostics,
+        success: false,
+      };
     }
   }
 
@@ -455,10 +482,20 @@ export function compileFromANF(
   // Bake constructor args into ANF properties so stack lowering emits real
   // values instead of OP_0 placeholders.
   if (opts.constructorArgs) {
+    const shapeErrors = validateConstructorArgsShape(anf, opts.constructorArgs);
+    if (shapeErrors.length > 0) {
+      throw new Error(`compileFromANF: ${shapeErrors.join('; ')}`);
+    }
+
     for (const prop of anf.properties) {
       if (prop.name in opts.constructorArgs) {
         prop.initialValue = opts.constructorArgs[prop.name];
       }
+    }
+
+    const unbakedErrors = findUnbakedReferencedReadonly(anf);
+    if (unbakedErrors.length > 0) {
+      throw new Error(`compileFromANF: ${unbakedErrors.join('; ')}`);
     }
   }
 
@@ -632,4 +669,116 @@ export function compileCheck(source: string, fileName?: string, options?: Compil
 
 function hasErrors(diagnostics: CompilerDiagnostic[]): boolean {
   return diagnostics.some(d => d.severity === 'error');
+}
+
+/**
+ * Validate the shape of `constructorArgs` against the contract's properties
+ * BEFORE baking. Returns a list of error messages (empty when valid).
+ *
+ * Rejects:
+ *  (a) positional arrays — `constructorArgs` must be a named record keyed by
+ *      property name. A positional array matches no property names, so
+ *      nothing would be baked and the script would silently keep its OP_0
+ *      placeholders (failing opaquely at runtime).
+ *  (b) keys that do not match any contract property name (typos would
+ *      otherwise silently bake nothing for that key).
+ */
+function validateConstructorArgsShape(
+  anf: ANFProgram,
+  constructorArgs: Record<string, bigint | boolean | string>,
+): string[] {
+  const errors: string[] = [];
+
+  if (Array.isArray(constructorArgs)) {
+    const propNames = anf.properties.map(p => p.name).join(', ');
+    errors.push(
+      `constructorArgs must be a record keyed by property name, not a positional array. ` +
+        `Contract '${anf.contractName}' properties: [${propNames}]. ` +
+        `Example: { ${anf.properties[0]?.name ?? 'propName'}: <value> }`,
+    );
+    return errors;
+  }
+
+  const propNameSet = new Set(anf.properties.map(p => p.name));
+  for (const key of Object.keys(constructorArgs)) {
+    if (!propNameSet.has(key)) {
+      const propNames = anf.properties.map(p => p.name).join(', ');
+      errors.push(
+        `constructorArgs key '${key}' does not match any property of contract ` +
+          `'${anf.contractName}' (properties: [${propNames}]). ` +
+          `Nothing would be baked for this key.`,
+      );
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * After baking `constructorArgs`, find readonly properties that are
+ * REFERENCED by at least one method body but still have no baked
+ * `initialValue`. Such properties would be emitted as OP_0 placeholders,
+ * making the compiled script fail opaquely at runtime (e.g.
+ * `OP_EQUALVERIFY failed` with no hint as to why).
+ *
+ * Only applies when the caller asked for baking — unbaked placeholder
+ * compilation (no `constructorArgs`) is the normal deploy-artifact path
+ * where the SDK substitutes values via `constructorSlots`.
+ */
+function findUnbakedReferencedReadonly(anf: ANFProgram): string[] {
+  const referenced = collectReferencedProps(anf);
+
+  const errors: string[] = [];
+  for (const prop of anf.properties) {
+    if (prop.readonly && prop.initialValue === undefined && referenced.has(prop.name)) {
+      errors.push(
+        `readonly property '${prop.name}' is referenced by a method but has no value ` +
+          `after baking constructorArgs — the emitted script would carry an OP_0 ` +
+          `placeholder that fails at runtime. Provide '${prop.name}' in constructorArgs ` +
+          `(or give the property an initializer).`,
+      );
+    }
+  }
+  return errors;
+}
+
+/**
+ * Collect the property names actually referenced by method bodies.
+ *
+ * The raw ANF from pass 4 loads every property at method entry; only after
+ * dead-binding elimination do the surviving `load_prop` nodes reflect real
+ * references. DCE is a pure function, so running it here on a probe copy
+ * does not perturb the main pipeline.
+ */
+function collectReferencedProps(anf: ANFProgram): Set<string> {
+  const probe = eliminateDeadBindings(anf);
+  const referenced = new Set<string>();
+  for (const method of probe.methods) {
+    // The constructor's super(...) call references every property but is
+    // never emitted as script code — only real method bodies count.
+    if (method.name === 'constructor') continue;
+    collectLoadPropRefs(method.body, referenced);
+  }
+  return referenced;
+}
+
+/** Recursively collect `load_prop` property names from ANF bindings. */
+function collectLoadPropRefs(bindings: ANFBinding[], out: Set<string>): void {
+  for (const binding of bindings) {
+    const v = binding.value;
+    switch (v.kind) {
+      case 'load_prop':
+        out.add(v.name);
+        break;
+      case 'if':
+        collectLoadPropRefs(v.then, out);
+        collectLoadPropRefs(v.else, out);
+        break;
+      case 'loop':
+        collectLoadPropRefs(v.body, out);
+        break;
+      default:
+        break;
+    }
+  }
 }
