@@ -243,6 +243,11 @@ class StackMap {
     this.slots.push(this.slots[this.slots.length - 1]!);
   }
 
+  /** Debug string of the slot names (bottom -> top) for error messages. */
+  debugSlots(): string {
+    return this.slots.join(', ');
+  }
+
   /** Get the set of all named (non-null) slot values. */
   namedSlots(): Set<string> {
     const names = new Set<string>();
@@ -301,6 +306,28 @@ function computeLastUses(bindings: ANFBinding[]): Map<string, number> {
   }
 
   return lastUse;
+}
+
+/**
+ * Collect every binding name defined anywhere in a binding sequence,
+ * recursing into nested if-branches and loop bodies. Used by lowerLoop to
+ * distinguish loop-internal (re)definitions from true outer-scope refs.
+ */
+function collectDeepBindingNames(bindings: ANFBinding[]): Set<string> {
+  const names = new Set<string>();
+  const walk = (bs: ANFBinding[]): void => {
+    for (const b of bs) {
+      names.add(b.name);
+      if (b.value.kind === 'if') {
+        walk(b.value.then);
+        walk(b.value.else);
+      } else if (b.value.kind === 'loop') {
+        walk(b.value.body);
+      }
+    }
+  };
+  walk(bindings);
+  return names;
 }
 
 function collectRefs(value: ANFValue): string[] {
@@ -1042,7 +1069,7 @@ class LoweringContext {
         this.lowerIf(name, value.cond, value.then, value.else, bindingIndex, lastUses);
         break;
       case 'loop':
-        this.lowerLoop(name, value.count, value.body, value.iterVar);
+        this.lowerLoop(name, value.count, value.body, value.iterVar, bindingIndex, lastUses);
         break;
       case 'assert':
         this.lowerAssert(value.value, bindingIndex, lastUses);
@@ -1173,10 +1200,16 @@ class LoweringContext {
       this.stackMap.pop();
       this.stackMap.push(bindingName);
     } else {
-      // Parameter not found - should not happen in well-formed ANF.
-      // Emit a push of zero as a fallback.
-      this.emitOp({ op: 'push', value: 0n });
-      this.stackMap.push(bindingName);
+      // Parameter no longer on the stack — a compiler invariant violation
+      // (historically caused by unrolled loops consuming outer refs; see
+      // lowerLoop). Silently emitting OP_0 here produced scripts that
+      // compiled, passed the env-based interpreter, and then failed on
+      // chain — fail loudly instead.
+      throw new Error(
+        `Stack lowering: method parameter '${paramName}' is not on the stack ` +
+          `at a post-consumption reference (stack: [${this.stackMap.debugSlots()}]). ` +
+          `Refusing to emit a silent OP_0 placeholder.`,
+      );
     }
   }
 
@@ -1240,9 +1273,14 @@ class LoweringContext {
         this.stackMap.pop();
         this.stackMap.push(bindingName);
       } else {
-        // Referenced value not on stack -- push a placeholder
-        this.emitOp({ op: 'push', value: 0n });
-        this.stackMap.push(bindingName);
+        // Referenced value no longer on the stack — a compiler invariant
+        // violation (see lowerLoadParam for the loop-consumption history).
+        // Fail loudly instead of silently emitting OP_0.
+        throw new Error(
+          `Stack lowering: value '${refName}' referenced by '${bindingName}' is not ` +
+            `on the stack (stack: [${this.stackMap.debugSlots()}]). ` +
+            `Refusing to emit a silent OP_0 placeholder.`,
+        );
       }
       return;
     }
@@ -2169,23 +2207,28 @@ class LoweringContext {
     count: number,
     body: ANFBinding[],
     _iterVar: string,
+    loopBindingIndex?: number,
+    enclosingLastUses?: Map<string, number>,
   ): void {
-    // Collect outer-scope names referenced in the loop body.
-    // These must not be consumed in non-final iterations.
+    // Names (re)defined anywhere inside the loop body, nested branches
+    // included. A name the body itself binds is NOT an outer ref —
+    // reassigned locals (e.g. `off = off + ...` inside an if) flow through
+    // lowerIf's branch-reassignment reconciliation, not through protection
+    // here.
+    const deepBodyBindingNames = collectDeepBindingNames(body);
     const bodyBindingNames = new Set(body.map(b => b.name));
+
+    // Collect ALL outer-scope refs used anywhere in the body — including
+    // refs that only occur inside nested if-branches (collectRefs recurses).
+    // The previous top-level-only scan missed nested references: a const
+    // defined before the loop and referenced only inside an if-branch was
+    // consumed by the first iteration, making iteration 2 fail with
+    // "Value 'X' not found on stack".
     const outerRefs = new Set<string>();
     for (const b of body) {
-      if (b.value.kind === 'load_param' && b.value.name !== _iterVar) {
-        outerRefs.add(b.value.name);
-      }
-      // Also protect @ref: targets from outer scope (not redefined in body)
-      if (b.value.kind === 'load_const') {
-        const v = b.value.value;
-        if (typeof v === 'string' && v.startsWith('@ref:')) {
-          const refName = v.slice(5);
-          if (!bodyBindingNames.has(refName)) {
-            outerRefs.add(refName);
-          }
+      for (const ref of collectRefs(b.value)) {
+        if (ref !== _iterVar && !deepBodyBindingNames.has(ref)) {
+          outerRefs.add(ref);
         }
       }
     }
@@ -2203,10 +2246,23 @@ class LoweringContext {
 
       const lastUses = computeLastUses(body);
 
-      // In non-final iterations, prevent outer-scope refs from being
-      // consumed by setting their last-use beyond any body binding index.
-      if (i < count - 1) {
-        for (const refName of outerRefs) {
+      // Prevent outer-scope refs from being consumed by setting their
+      // last-use beyond any body binding index:
+      //  - in non-final iterations: always (the next iteration re-reads them);
+      //  - in the FINAL iteration: when the enclosing scope still references
+      //    them AFTER the loop. Previously the final iteration consumed
+      //    every outer ref at its last body use, so a method param (or
+      //    const) referenced after the loop was gone from the stack and was
+      //    silently lowered to an OP_0/empty push — compilation succeeded,
+      //    the env-based interpreter passed, but the emitted Script failed
+      //    at runtime (silent interpreter <-> Script divergence).
+      const isFinalIteration = i === count - 1;
+      for (const refName of outerRefs) {
+        const usedAfterLoop =
+          enclosingLastUses !== undefined &&
+          loopBindingIndex !== undefined &&
+          (enclosingLastUses.get(refName) ?? -1) > loopBindingIndex;
+        if (!isFinalIteration || usedAfterLoop) {
           lastUses.set(refName, body.length);
         }
       }
