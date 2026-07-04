@@ -23,7 +23,16 @@ export { LocalSigner, MockSigner, ExternalSigner, WalletSigner } from './signers
 export type { Signer, SignCallback, WalletSignerOptions } from './signers/index.js';
 
 // Contract
-export { RunarContract } from './contract.js';
+export { RunarContract, encodeArg, encodePushData, encodeScriptNumber } from './contract.js';
+
+// Cross-artifact transaction assembly (N different-artifact covenant inputs in one tx)
+export { assembleMultiContractCall, dryRunMultiContractInput } from './multi-contract.js';
+export type {
+  MultiContractCallInput,
+  MultiContractCallOutput,
+  AssembleMultiContractCallOptions,
+  AssembledMultiContractCall,
+} from './multi-contract.js';
 
 // Typed SDK errors
 export { ScriptSizeExceededError, assertScriptHexUnderLimit } from './errors.js';
