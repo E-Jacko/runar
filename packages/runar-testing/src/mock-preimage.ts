@@ -44,6 +44,20 @@ export interface StatefulPreimageParams {
   version?: number;
   locktime?: number;
   sequence?: number;
+  /**
+   * Outpoint of the input being spent (72 hex chars: 32-byte txid +
+   * 4-byte LE vout). Defaults to the first entry of `prevouts` when that
+   * is given, otherwise to 36 zero bytes (legacy behaviour).
+   */
+  outpoint?: string;
+  /**
+   * All input outpoints of the spending transaction, in input order
+   * (each 72 hex chars). When given,
+   * `hashPrevouts = hash256(concat(prevouts))`, enabling multi-input
+   * covenant tests (`extractHashPrevouts` / companion-input checks).
+   * Defaults to `[outpoint]` (single-input, legacy behaviour).
+   */
+  prevouts?: string[];
 }
 
 export interface StatefulPreimageResult {
@@ -361,7 +375,29 @@ export function buildStatefulPreimage(
     version = 1,
     locktime = 0,
     sequence = 0xffffffff,
+    outpoint,
+    prevouts,
   } = params;
+
+  // Validate outpoint / prevouts overrides (72 hex chars = 36 bytes each).
+  const OUTPOINT_RE = /^[0-9a-fA-F]{72}$/;
+  if (outpoint !== undefined && !OUTPOINT_RE.test(outpoint)) {
+    throw new Error(
+      `buildStatefulPreimage: outpoint must be 72 hex chars (32-byte txid + 4-byte LE vout), got ${outpoint.length} chars`,
+    );
+  }
+  if (prevouts !== undefined) {
+    if (prevouts.length === 0) {
+      throw new Error('buildStatefulPreimage: prevouts must not be empty');
+    }
+    for (const [idx, po] of prevouts.entries()) {
+      if (!OUTPOINT_RE.test(po)) {
+        throw new Error(
+          `buildStatefulPreimage: prevouts[${idx}] must be 72 hex chars (32-byte txid + 4-byte LE vout), got ${po.length} chars`,
+        );
+      }
+    }
+  }
 
   // Build code part and full locking script
   const codePart = buildCodePart(artifact, constructorArgs);
@@ -421,11 +457,18 @@ export function buildStatefulPreimage(
 
   const nVersion = uint32LE(version);
 
-  // Dummy outpoint: 32 zero bytes (txid) + 00000000 (vout 0)
-  const dummyOutpoint = '00'.repeat(32) + '00000000';
+  // Outpoint of the input being spent. Default: first prevout when given,
+  // otherwise 32 zero bytes (txid) + 00000000 (vout 0) — legacy behaviour.
+  const spentOutpoint = (
+    outpoint ?? prevouts?.[0] ?? '00'.repeat(32) + '00000000'
+  ).toLowerCase();
 
-  // hashPrevouts = hash256(outpoint)
-  const hashPrevouts = bytesToHex(hash256(hexToBytes(dummyOutpoint)));
+  // hashPrevouts = hash256(concat(all input outpoints)).
+  // Default (single input): hash256(spent outpoint).
+  const prevoutsHex = prevouts
+    ? prevouts.join('').toLowerCase()
+    : spentOutpoint;
+  const hashPrevouts = bytesToHex(hash256(hexToBytes(prevoutsHex)));
 
   // hashSequence = hash256(sequence as 4-byte LE)
   const hashSequence = bytesToHex(hash256(hexToBytes(uint32LE(sequence))));
@@ -450,7 +493,7 @@ export function buildStatefulPreimage(
     nVersion +
     hashPrevouts +
     hashSequence +
-    dummyOutpoint +
+    spentOutpoint +
     scriptCodePrefixed +
     amountHex +
     nSequence +
