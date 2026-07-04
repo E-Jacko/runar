@@ -38,6 +38,10 @@ function compileSource(source: string, fileName = 'Probe.runar.ts') {
   return r;
 }
 
+// Slot `name` is source metadata, not byte-derivable — recovered sources
+// declare synthetic propN names, so round-trip comparisons ignore it.
+const stripName = ({ name: _name, ...rest }: { name?: string }) => rest;
+
 describe('symexec — constructor placeholder recovery', () => {
   it('without constructorSlots, OP_0 placeholders are treated as literal 0n', () => {
     // Same probe as the next case; here we OMIT constructorSlots. The
@@ -74,7 +78,9 @@ describe('symexec — constructor placeholder recovery', () => {
       }
     `;
     const r = compileSource(source);
-    expect(r.artifact!.constructorSlots).toEqual([{ paramIndex: 0, byteOffset: 0 }]);
+    expect(r.artifact!.constructorSlots).toEqual([
+      { paramIndex: 0, byteOffset: 0, name: 'threshold', type: 'bigint', valueEncoding: 'scriptnum' },
+    ]);
 
     const dec = decompile(hexToBytes(r.scriptHex!), {
       constructorSlots: r.artifact!.constructorSlots,
@@ -86,11 +92,15 @@ describe('symexec — constructor placeholder recovery', () => {
     expect(dec.source).toContain('readonly prop0:');
     expect(dec.source).toContain('this.prop0');
 
-    // Re-compile and confirm byte-identity AND slot alignment.
+    // Re-compile and confirm byte-identity AND slot alignment. Slot `name`
+    // is source metadata (the recovered source declares synthetic propN
+    // names), so only the byte-level fields must round-trip.
     const recompiled = compile(dec.source, { fileName: '_Recovered.runar.ts' });
     expect(recompiled.success).toBe(true);
     expect(recompiled.scriptHex).toBe(r.scriptHex);
-    expect(recompiled.artifact!.constructorSlots).toEqual(r.artifact!.constructorSlots);
+    expect(recompiled.artifact!.constructorSlots!.map(stripName)).toEqual(
+      r.artifact!.constructorSlots!.map(stripName),
+    );
   });
 
   it('recovers two placeholders at independent byte offsets via the full symexec pipeline', () => {
@@ -121,8 +131,8 @@ describe('symexec — constructor placeholder recovery', () => {
     `;
     const r = compileSource(source);
     expect(r.artifact!.constructorSlots).toEqual([
-      { paramIndex: 0, byteOffset: 1 },
-      { paramIndex: 1, byteOffset: 4 },
+      { paramIndex: 0, byteOffset: 1, name: 'lo', type: 'bigint', valueEncoding: 'scriptnum' },
+      { paramIndex: 1, byteOffset: 4, name: 'hi', type: 'bigint', valueEncoding: 'scriptnum' },
     ]);
 
     const dec = decompile(hexToBytes(r.scriptHex!), {
@@ -139,7 +149,9 @@ describe('symexec — constructor placeholder recovery', () => {
     const recompiled = compile(dec.source, { fileName: '_Recovered.runar.ts' });
     expect(recompiled.success).toBe(true);
     expect(recompiled.scriptHex).toBe(r.scriptHex);
-    expect(recompiled.artifact!.constructorSlots).toEqual(r.artifact!.constructorSlots);
+    expect(recompiled.artifact!.constructorSlots!.map(stripName)).toEqual(
+      r.artifact!.constructorSlots!.map(stripName),
+    );
   });
 
   it('contract with no placeholders does not synthesize spurious properties', () => {

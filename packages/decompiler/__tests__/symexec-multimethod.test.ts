@@ -159,7 +159,11 @@ describe('symexec — multi-method dispatch', () => {
     const recompiled = compile(dec.source, { fileName: '_Recovered.runar.ts' });
     expect(recompiled.success).toBe(true);
     expect(recompiled.scriptHex).toBe(r.scriptHex);
-    expect(recompiled.artifact!.constructorSlots).toEqual(slots);
+    // Compare slots ignoring `name`: the enriched name is source metadata,
+    // not byte-derivable — the recovered source declares synthetic propN
+    // names, so only the byte-level fields must round-trip.
+    const stripName = ({ name: _name, ...rest }: { name?: string }) => rest;
+    expect(recompiled.artifact!.constructorSlots!.map(stripName)).toEqual(slots.map(stripName));
   });
 
   it('one-method-fails aborts the whole recovery to raw_script (no partial recovery)', () => {
