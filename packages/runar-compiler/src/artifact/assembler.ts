@@ -16,6 +16,7 @@ import type {
   ANFProgram,
 } from '../ir/index.js';
 import { computeSideEffectSummary, continuationShape } from '../passes/side-effect-summary.js';
+import { annotateStateFieldLayout, STATE_FIELD_WIDTHS } from 'runar-ir-schema';
 
 // ---------------------------------------------------------------------------
 // Artifact types (mirroring runar-ir-schema/artifact.ts)
@@ -101,16 +102,65 @@ export interface StateField {
     length: number;
     syntheticNames: string[];
   };
+
+  // -- Byte-layout descriptors (additive; mirror the SDK's serializeState) --
+
+  /** Wire encoding of the serialized field in the OP_RETURN state tail. */
+  encoding?: 'num2bin-le8' | 'bool1' | 'raw' | 'pushdata';
+  /** Byte offset from the byte AFTER the OP_RETURN separator. Omitted when
+   *  any preceding field is variable-length. */
+  byteOffset?: number;
+  /** Serialized length in bytes. Omitted for variable-length fields. */
+  byteLength?: number;
+  /** NEGATIVE byte offset from the END of the locking script. Omitted when
+   *  this or any following field is variable-length. */
+  tailOffset?: number;
 }
 
+/**
+ * One deploy-baked constructor slot: a 1-byte OP_0 placeholder in the
+ * template script. The optional verification-descriptor fields carry
+ * value-INDEPENDENT metadata (name/type/encoding); the SDK's
+ * `resolveSlotLayout(artifact, constructorArgs)` resolves concrete deployed
+ * offsets/lengths for given args.
+ */
 export interface ConstructorSlot {
   paramIndex: number;
   byteOffset: number;
+  /** Constructor parameter name (matches `abi.constructor.params[paramIndex].name`). */
+  name?: string;
+  /** ABI type of the parameter (e.g. `PubKey`, `bigint`, `ByteString`). */
+  type?: string;
+  /** How the deploy-time value is encoded when spliced into the slot. */
+  valueEncoding?: 'data' | 'scriptnum' | 'bool';
+  /** For fixed-size data types only: baked value length in bytes. */
+  fixedValueByteLength?: number;
+  /** For fixed-size data types only: push-header bytes preceding the value. */
+  fixedPushHeaderBytes?: number;
 }
 
 export interface CodeSepIndexSlot {
   byteOffset: number;
   codeSepIndex: number;
+}
+
+/** One piece of the slot-excised template identity. */
+export interface TemplateDigestPiece {
+  kind: 'code' | 'slot';
+  /** For kind 'slot': the excised slot's constructor param name. */
+  slot?: string;
+  /** For kind 'slot': the slot's TEMPLATE byte offset. */
+  byteOffset?: number;
+}
+
+/**
+ * Recipe for recomputing the contract's slot-excised template hash:
+ * hash256 over the resolved code part with every constructor slot's VALUE
+ * bytes removed (push headers stay in the hashed template).
+ */
+export interface TemplateDigest {
+  algorithm: 'hash256-excised-slots';
+  pieces: TemplateDigestPiece[];
 }
 
 /**
@@ -168,8 +218,12 @@ export interface RunarArtifact {
   /** State field descriptors (present only for stateful contracts) */
   stateFields?: StateField[];
 
-  /** Byte offsets of constructor parameter placeholders in the script */
+  /** Byte offsets of constructor parameter placeholders in the script,
+   *  enriched with verification-descriptor metadata (name/type/encoding). */
   constructorSlots?: ConstructorSlot[];
+
+  /** Recipe for recomputing the slot-excised template identity hash. */
+  templateDigest?: TemplateDigest;
 
   /** Byte offsets of codeSepIndex placeholders in the script */
   codeSepIndexSlots?: CodeSepIndexSlot[];
@@ -609,6 +663,69 @@ function extractStateFields(properties: PropertyNode[], anfProgram?: ANFProgram)
 }
 
 // ---------------------------------------------------------------------------
+// Verification-descriptor enrichment
+// ---------------------------------------------------------------------------
+
+/** Classify how a constructor arg of the given ABI type is encoded when
+ *  spliced into its slot (see ConstructorSlot.valueEncoding). */
+function slotValueEncoding(type: string): 'data' | 'scriptnum' | 'bool' {
+  if (type === 'int' || type === 'bigint') return 'scriptnum';
+  if (type === 'bool' || type === 'boolean') return 'bool';
+  return 'data';
+}
+
+/**
+ * Enrich raw emitter constructor slots with value-INDEPENDENT verification
+ * metadata: param name/type, value encoding, and — for fixed-size data
+ * types (PubKey, Sha256, ...) — the exact value length and push-header
+ * length. Widths come from the shared `STATE_FIELD_WIDTHS` table (the same
+ * table the state serializer uses), so slot and state descriptors cannot
+ * drift apart.
+ */
+function enrichConstructorSlots(
+  slots: ConstructorSlot[],
+  abi: ABI,
+): ConstructorSlot[] {
+  return slots.map(slot => {
+    const out: ConstructorSlot = { paramIndex: slot.paramIndex, byteOffset: slot.byteOffset };
+    const param = abi.constructor.params[slot.paramIndex];
+    if (!param) return out;
+    out.name = param.name;
+    out.type = param.type;
+    out.valueEncoding = slotValueEncoding(param.type);
+    if (out.valueEncoding === 'data') {
+      const width = STATE_FIELD_WIDTHS[param.type];
+      if (width && width.encoding === 'raw') {
+        out.fixedValueByteLength = width.size;
+        out.fixedPushHeaderBytes = 1; // direct push: all fixed types are <= 75 bytes
+      }
+    }
+    return out;
+  });
+}
+
+/**
+ * Build the slot-excised template digest recipe: alternating code/slot
+ * pieces in script order (slots deduped by template byte offset — the same
+ * placeholder cannot be excised twice).
+ */
+function buildTemplateDigest(slots: ConstructorSlot[]): TemplateDigest {
+  const seen = new Set<number>();
+  const ordered = [...slots]
+    .sort((a, b) => a.byteOffset - b.byteOffset)
+    .filter(s => (seen.has(s.byteOffset) ? false : (seen.add(s.byteOffset), true)));
+
+  const pieces: TemplateDigestPiece[] = [{ kind: 'code' }];
+  for (const s of ordered) {
+    const piece: TemplateDigestPiece = { kind: 'slot', byteOffset: s.byteOffset };
+    if (s.name !== undefined) piece.slot = s.name;
+    pieces.push(piece);
+    pieces.push({ kind: 'code' });
+  }
+  return { algorithm: 'hash256-excised-slots', pieces };
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -640,7 +757,12 @@ export function assembleArtifact(
       m.usesCodePart = true;
     }
   }
-  const stateFields = extractStateFields(contract.properties, anfProgram);
+  // Annotate state fields with their byte layout (encoding/byteOffset/
+  // byteLength/tailOffset) so verifiers can locate state values in a
+  // companion input's locking script without re-deriving the layout.
+  const stateFields = annotateStateFieldLayout(
+    extractStateFields(contract.properties, anfProgram),
+  ) as StateField[];
   const compilerVersion = options?.compilerVersion ?? DEFAULT_COMPILER_VERSION;
 
   const artifact: RunarArtifact = {
@@ -677,9 +799,11 @@ export function assembleArtifact(
     artifact.anf = anfProgram;
   }
 
-  // Constructor slots (only if there are placeholder byte offsets)
+  // Constructor slots (only if there are placeholder byte offsets), enriched
+  // with verification-descriptor metadata + the template digest recipe.
   if (options?.constructorSlots && options.constructorSlots.length > 0) {
-    artifact.constructorSlots = options.constructorSlots;
+    artifact.constructorSlots = enrichConstructorSlots(options.constructorSlots, abi);
+    artifact.templateDigest = buildTemplateDigest(artifact.constructorSlots);
   }
 
   // CodeSepIndex slots (only if there are placeholder byte offsets)

@@ -99,15 +99,45 @@ export interface StateField {
     length: number;
     syntheticNames: string[];
   };
+
+  // -- Byte-layout descriptors (additive; mirror the SDK's serializeState) --
+
+  /** Wire encoding of the serialized field in the OP_RETURN state tail. */
+  encoding?: 'num2bin-le8' | 'bool1' | 'raw' | 'pushdata';
+  /** Byte offset from the byte AFTER the OP_RETURN separator. Omitted when
+   *  any preceding field is variable-length. */
+  byteOffset?: number;
+  /** Serialized length in bytes. Omitted for variable-length fields. */
+  byteLength?: number;
+  /** NEGATIVE byte offset from the END of the locking script. Omitted when
+   *  this or any following field is variable-length. */
+  tailOffset?: number;
 }
 
 // ---------------------------------------------------------------------------
 // Constructor slots
 // ---------------------------------------------------------------------------
 
+/**
+ * One deploy-baked constructor slot: a 1-byte OP_0 placeholder in the
+ * template script. The optional verification-descriptor fields carry
+ * value-INDEPENDENT metadata (name/type/encoding); the SDK's
+ * `resolveSlotLayout(artifact, constructorArgs)` resolves concrete deployed
+ * offsets/lengths for given args.
+ */
 export interface ConstructorSlot {
   paramIndex: number;
   byteOffset: number;
+  /** Constructor parameter name (matches `abi.constructor.params[paramIndex].name`). */
+  name?: string;
+  /** ABI type of the parameter (e.g. `PubKey`, `bigint`, `ByteString`). */
+  type?: string;
+  /** How the deploy-time value is encoded when spliced into the slot. */
+  valueEncoding?: 'data' | 'scriptnum' | 'bool';
+  /** For fixed-size data types only: baked value length in bytes. */
+  fixedValueByteLength?: number;
+  /** For fixed-size data types only: push-header bytes preceding the value. */
+  fixedPushHeaderBytes?: number;
 }
 
 export interface CodeSepIndexSlot {
@@ -115,6 +145,29 @@ export interface CodeSepIndexSlot {
   byteOffset: number;
   /** The template-relative codeSeparatorIndex value this placeholder represents */
   codeSepIndex: number;
+}
+
+// ---------------------------------------------------------------------------
+// Template digest (slot-excised script identity)
+// ---------------------------------------------------------------------------
+
+/** One piece of the slot-excised template identity. */
+export interface TemplateDigestPiece {
+  kind: 'code' | 'slot';
+  /** For kind 'slot': the excised slot's constructor param name. */
+  slot?: string;
+  /** For kind 'slot': the slot's TEMPLATE byte offset. */
+  byteOffset?: number;
+}
+
+/**
+ * Recipe for recomputing the contract's slot-excised template hash:
+ * hash256 over the resolved code part with every constructor slot's VALUE
+ * bytes removed (push headers stay in the hashed template).
+ */
+export interface TemplateDigest {
+  algorithm: 'hash256-excised-slots';
+  pieces: TemplateDigestPiece[];
 }
 
 /**
@@ -178,8 +231,12 @@ export interface RunarArtifact {
   /** State field descriptors (present only for stateful contracts) */
   stateFields?: StateField[];
 
-  /** Byte offsets of constructor parameter placeholders in the script */
+  /** Byte offsets of constructor parameter placeholders in the script,
+   *  enriched with verification-descriptor metadata (name/type/encoding). */
   constructorSlots?: ConstructorSlot[];
+
+  /** Recipe for recomputing the slot-excised template identity hash. */
+  templateDigest?: TemplateDigest;
 
   /** Byte offsets of codeSepIndex placeholders in the script (OP_0 placeholders
    *  that the SDK must replace with the adjusted codeSeparatorIndex). */
