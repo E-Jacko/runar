@@ -1497,8 +1497,13 @@ export class RunarContract {
    * Includes the inscription envelope if one is attached — this is required for
    * stateful contracts where the on-chain hashOutputs verification includes
    * the envelope as part of the codePart.
+   *
+   * Public low-level assembly surface: needed for cross-artifact transaction
+   * assembly (see `assembleMultiContractCall`), where a spending tx mixes
+   * covenant inputs from DIFFERENT artifacts and each input's `_codePart` /
+   * continuation script must be built outside `call()`.
    */
-  private getCodePartHex(): string {
+  getCodePartHex(): string {
     if (this._codeScript) return this._codeScript;
     let code = this.buildCodeScript();
     if (this._inscription) {
@@ -1588,8 +1593,12 @@ export class RunarContract {
    * whenever the OP_CODESEPARATOR sits after constructor slots that expand at
    * deploy time. The symptom of using the wrong offset is NULLFAIL at
    * OP_CHECKSIG for terminal methods.
+   *
+   * Public low-level assembly surface: multi-contract tx assembly must sign
+   * each covenant input's user `Sig` over ITS artifact's codesep-trimmed
+   * subscript, which `call()` only does for its own single primary input.
    */
-  private getSubscriptForSigning(fullScript: string, methodIndex?: number): string {
+  getSubscriptForSigning(fullScript: string, methodIndex?: number): string {
     if (this._codeScript !== null) {
       const realOffsets = findCodesepOffsets(this._codeScript);
       if (realOffsets.length > 0) {
@@ -1627,8 +1636,12 @@ export class RunarContract {
    * For multi-method contracts, each method has its own separator at a different
    * byte offset. Uses codeSeparatorIndices[methodIndex] if available, otherwise
    * falls back to the single codeSeparatorIndex.
+   *
+   * Public low-level assembly surface: each covenant input of a
+   * multi-contract tx needs its own OP_PUSH_TX signature + BIP-143 preimage
+   * computed against ITS artifact's code separator layout.
    */
-  private computeOpPushTxWithCodeSep(
+  computeOpPushTxWithCodeSep(
     tx: BsvTransaction,
     inputIndex: number,
     subscript: string,
@@ -1650,15 +1663,18 @@ export class RunarContract {
   }
 
   /**
-   * Build the prefix for an unlocking script: optionally _codePart + _opPushTxSig.
+   * Build the prefix for an unlocking script: optionally _codePart.
    * needsCodePart should be true only when the method constructs continuation outputs
    * (non-terminal stateful calls). Terminal and stateless methods don't use _codePart.
+   *
+   * Public low-level assembly surface. BUG-100: the OP_PUSH_TX signature is
+   * derived on-chain from the preimage (see codegen emitCheckPreimageBinding),
+   * so NO signature is pushed here — the stateful unlock layout is
+   * `[_codePart?] args... [_changePKH _changeAmount] [_newAmount] txPreimage
+   * [selector]` (multi-contract assembly rebuilds it per input). `opSig` is
+   * accepted for call-site compatibility but ignored.
    */
-  // BUG-100 fix: the OP_PUSH_TX signature is now derived on-chain from the
-  // preimage (see codegen emitCheckPreimageBinding), so NO signature is pushed
-  // here — the unlocking script carries only _codePart (if needed) and the
-  // preimage. `opSig` is retained for call-site compatibility but ignored.
-  private buildStatefulPrefix(_opSig: string, needsCodePart: boolean = false): string {
+  buildStatefulPrefix(_opSig: string, needsCodePart: boolean = false): string {
     let prefix = '';
     if (needsCodePart && this.artifact.codeSeparatorIndex !== undefined) {
       prefix += encodePushData(this.getCodePartHex());
@@ -2029,8 +2045,10 @@ function buildNamedArgs(
 /**
  * Encode an argument value as a Bitcoin Script push data element.
  *
- * Exported so downstream tooling (e.g. runar-testing's mock-preimage
- * builders) shares this exact encoding instead of maintaining a copy.
+ * Exported as part of the low-level assembly surface: downstream tooling
+ * (runar-testing's mock-preimage builders) and multi-contract tx assembly (and
+ * any external unlocking-script construction) must encode arguments
+ * byte-identically to `buildUnlockingScript` — share this, don't copy it.
  */
 export function encodeArg(value: unknown): string {
   if (typeof value === 'bigint') {
@@ -2050,7 +2068,12 @@ export function encodeArg(value: unknown): string {
   return encodePushData(String(value));
 }
 
-function encodeScriptNumber(n: bigint): string {
+/**
+ * Encode a bigint as a minimally-encoded Bitcoin Script number push
+ * (OP_0 / OP_1..OP_16 / OP_1NEGATE / sign-magnitude LE push data).
+ * Exported as part of the low-level assembly surface.
+ */
+export function encodeScriptNumber(n: bigint): string {
   if (n === 0n) {
     return '00'; // OP_0
   }
@@ -2105,7 +2128,11 @@ function normalizeWitnessBytes(value: string | Uint8Array): string {
   return out;
 }
 
-function encodePushData(dataHex: string): string {
+/**
+ * Encode raw hex bytes as a Bitcoin Script push (direct push / PUSHDATA1/2/4).
+ * Exported as part of the low-level assembly surface.
+ */
+export function encodePushData(dataHex: string): string {
   if (dataHex.length === 0) return '00'; // OP_0
   const len = dataHex.length / 2;
 
