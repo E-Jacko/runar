@@ -156,6 +156,46 @@ jobs:
             --compilers ts,go,rust,python,zig,ruby,java \
             --output /tmp/anf-fuzz-pr-foldon.json
 
+      # ----- PR merge gate (TS-GAP-001 randomized half / TS-GAP-005): the
+      # ----- source-vs-script EXECUTION oracle. Unlike the parity gates above
+      # ----- (which only assert 7-tier byte-identical hex — seven tiers can
+      # ----- agree on the SAME wrong bytes), this generates stateless non-crypto
+      # ----- contracts, renders each to TS, and runs every generated spend
+      # ----- through the ANF interpreter AND the compiled fold-ON script on
+      # ----- ScriptVM, hard-failing (exit 1) on any accept/reject divergence.
+      # ----- The oracle is tier-independent (in-process TS compiler + @bsv/sdk
+      # ----- ScriptVM), so it needs no native compiler build. FIXED seed
+      # ----- (424242) keeps it deterministic and flake-free.
+      - name: Fuzz (PR gate — execution oracle, fixed seed)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --execute \
+            --num 60 \
+            --seed 424242 \
+            --output /tmp/anf-fuzz-pr-execute.json
+
+      # ----- Contract-level (`--ir`) PR gate (TS-GAP-007). The ANF gates above
+      # ----- drive raw generated ANF programs; this gate drives the
+      # ----- contract-level generator (stateful + native renderers) through the
+      # ----- full `--ir` pipeline across all 7 tiers, fixed-seed for a
+      # ----- deterministic, flake-free merge gate. Hard-fails (fuzzer exit 1)
+      # ----- on any cross-tier divergence.
+      - name: Fuzz (PR gate — contract-level IR, fixed seed)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --ir \
+            --seed 424242 \
+            --num 40 \
+            --compilers ts,go,rust,python,zig,ruby,java \
+            --render native \
+            --output /tmp/ir-fuzz-pr.json
+
       - name: Upload PR-gate fuzz findings
         if: always() && github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
@@ -163,8 +203,11 @@ jobs:
           name: anf-fuzz-pr-findings
           path: |
             conformance/fuzz-findings-anf/
+            conformance/fuzz-findings-execute/
             /tmp/anf-fuzz-pr-foldoff.json
             /tmp/anf-fuzz-pr-foldon.json
+            /tmp/anf-fuzz-pr-execute.json
+            /tmp/ir-fuzz-pr.json
           if-no-files-found: ignore
           retention-days: 30
 
@@ -217,6 +260,25 @@ jobs:
             --compilers ts,go,rust,python,zig,ruby,java \
             --output /tmp/anf-fuzz-report.json
 
+      # ----- Nightly source-vs-script EXECUTION oracle (TS-GAP-001 randomized /
+      # ----- TS-GAP-005): a larger rotating-seed corpus than the fixed-seed PR
+      # ----- gate, hard-failing on any interpreter-vs-ScriptVM accept/reject
+      # ----- divergence. `$SEED` is the already-validated integer from the
+      # ----- Resolve step (reaches argv via env:, never shell-interpolated).
+      - name: Fuzz (execution oracle, rotating seed)
+        if: github.event_name != 'pull_request'
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.params.outputs.seed }}
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --execute \
+            --num 500 \
+            --seed "$SEED" \
+            --time-budget-ms 120000 \
+            --output /tmp/anf-exec-nightly.json
+
       # ----- Always upload the per-finding artifact tree so a failing
       # ----- run leaves behind a replayable repro corpus.
       - name: Upload fuzz findings
@@ -226,7 +288,9 @@ jobs:
           name: anf-fuzz-findings-${{ steps.params.outputs.seed }}
           path: |
             conformance/fuzz-findings-anf/
+            conformance/fuzz-findings-execute/
             /tmp/anf-fuzz-report.json
+            /tmp/anf-exec-nightly.json
           if-no-files-found: ignore
           retention-days: 30
 
@@ -391,5 +455,140 @@ jobs:
             conformance/fuzz-findings-canonical/
             /tmp/canonical-fuzz-report.json
             /tmp/canonical-fuzz-pr.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # TS-GAP-009 — metamorphic / EMI fuzz.
+  #
+  # Generates random stateless / arithmetic contracts, applies each
+  # semantics-preserving source transform (identifier rename, commutative
+  # operand reorder, let-introduction, dead-code insertion), and asserts the
+  # ORIGINAL and TRANSFORMED contracts produce the SAME executed accept/reject
+  # verdict on the BSV script engine. A pair where both compile but their
+  # verdicts differ is a real, latent compiler bug (a shared-design mistake all
+  # seven tiers would emit identically, invisible to cross-tier byte-parity).
+  #
+  # TS-only: the driver imports the compiler + differential-execution oracle
+  # in-process, so it needs just the Node toolchain and the TS build — no native
+  # compiler tiers. Deterministic (fixed seed 424242), so it also gates PRs.
+  # ---------------------------------------------------------------------------
+  fuzz-metamorphic:
+    name: Metamorphic / EMI fuzz (semantics-preserving transforms)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # The driver imports runar-compiler / runar-testing in-process, so the TS
+      # workspace must be installed + built; conformance is not a pnpm member.
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: cd conformance && npm ci
+
+      - name: Metamorphic fuzz (fixed seed, hard-fail on divergence)
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/metamorphic-fuzz.ts \
+            --num 200 \
+            --seed 424242
+
+      - name: Upload metamorphic fuzz findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metamorphic-fuzz-findings-${{ github.run_id }}
+          path: conformance/fuzz-findings-metamorphic/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # TS-GAP-006 — mutation scoring of the safety net.
+  #
+  # Applies a curated corpus of representative compiler bugs
+  # (conformance/mutation/mutants.json) to real TypeScript compiler source
+  # files, runs the mapped fast in-process gates (differential-witness,
+  # fold-equivalence, peephole-exhaustive), and records caught-vs-survived.
+  # The scorer ALWAYS reverts each mutant, so the working tree is left clean.
+  #
+  # The gates resolve runar-compiler/runar-testing through the root vitest SRC
+  # alias, so a mutated src file is observed without a rebuild.
+  #
+  # Nightly-only (not a PR gate): the run fails if any mutant that MUST be
+  # caught survives, AND a baseline-regression check fails if any mutant that
+  # was CAUGHT in conformance/mutation/baseline.json has become a survivor
+  # (i.e. the net weakened).
+  # ---------------------------------------------------------------------------
+  mutation-score:
+    name: Mutation score (safety-net detection power)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # The gates import runar-compiler / runar-testing in-process via the src
+      # alias; the workspace must be installed + built, and conformance needs
+      # its own tsx (it is not a pnpm member).
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: cd conformance && npm ci
+
+      - name: Mutation score (survivor gate)
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx mutation/run-mutation.ts \
+            --json-out /tmp/mutation-current.json
+
+      - name: Baseline regression check (previously-caught mutant must stay caught)
+        if: always()
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/mutation-current.json ]; then
+            echo "no current scorecard produced — scorer aborted; failing"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const base = JSON.parse(fs.readFileSync("mutation/baseline.json", "utf8")).results;
+            const cur = JSON.parse(fs.readFileSync("/tmp/mutation-current.json", "utf8")).results;
+            const curById = new Map(cur.map((r) => [r.id, r]));
+            const regressions = [];
+            for (const b of base) {
+              const c = curById.get(b.id);
+              if (!c) { regressions.push(b.id + " (missing from current run)"); continue; }
+              if (b.caught && c.survived) regressions.push(b.id + " (was caught, now SURVIVES)");
+            }
+            if (regressions.length) {
+              console.error("MUTATION REGRESSION — the net weakened:");
+              for (const r of regressions) console.error("  • " + r);
+              process.exit(1);
+            }
+            console.log("No mutation regressions vs baseline (" + base.length + " mutants).");
+          '
+
+      - name: Upload mutation scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-scorecard-${{ github.run_id }}
+          path: /tmp/mutation-current.json
           if-no-files-found: ignore
           retention-days: 30
