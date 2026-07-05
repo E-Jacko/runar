@@ -209,6 +209,51 @@ describe('Pass 2: Validate', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Contract must have at least one public method
+  // ---------------------------------------------------------------------------
+
+  describe('no public methods', () => {
+    it('reports error when no method has the public modifier', () => {
+      const source = `
+        class Locked extends SmartContract {
+          readonly pk: PubKey;
+
+          constructor(pk: PubKey) {
+            super(pk);
+            this.pk = pk;
+          }
+
+          unlock(sig: Sig) {
+            assert(checkSig(sig, this.pk));
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, 'no public methods')).toBe(true);
+    });
+
+    it('reports error when a contract has no methods at all', () => {
+      const source = `
+        class Empty extends SmartContract {
+          readonly x: bigint;
+
+          constructor(x: bigint) {
+            super(x);
+            this.x = x;
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, 'no public methods')).toBe(true);
+    });
+
+    it('does not report when at least one method is public', () => {
+      const result = validateSource(VALID_P2PKH);
+      expect(hasError(result, 'no public methods')).toBe(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // For loop with non-constant bound
   // ---------------------------------------------------------------------------
 
