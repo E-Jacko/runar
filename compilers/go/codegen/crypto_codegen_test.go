@@ -22,8 +22,8 @@ func TestCryptoEmitOpCountGoldens(t *testing.T) {
 	}{
 		{"Sha256Compress", EmitSha256Compress, 21292},
 		{"Sha256Finalize", EmitSha256Finalize, 63941},
-		{"Blake3Compress", EmitBlake3Compress, 10819},
-		{"Blake3Hash", EmitBlake3Hash, 10829},
+		{"Blake3Compress", EmitBlake3Compress, 10373},
+		{"Blake3Hash", EmitBlake3Hash, 10387},
 		{"EcAdd", EmitEcAdd, 8078},
 		{"EcMul", EmitEcMul, 63828},
 		{"EcMulGen", EmitEcMulGen, 63830},
