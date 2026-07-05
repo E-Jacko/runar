@@ -46,16 +46,16 @@ export interface WalletProviderOptions {
 // ---------------------------------------------------------------------------
 
 export class WalletProvider implements Provider {
-  private readonly wallet: WalletClient;
-  private readonly signer: Signer;
-  private readonly basket: string;
-  private readonly fundingTag: string;
-  private readonly arcUrl: string;
-  private readonly overlayUrl: string | undefined;
-  private readonly overlayTopics: string[] | undefined;
-  private readonly _network: 'mainnet' | 'testnet';
-  private readonly _feeRate: number;
-  private readonly txCache = new Map<string, string>();
+  protected readonly wallet: WalletClient;
+  protected readonly signer: Signer;
+  protected readonly basket: string;
+  protected readonly fundingTag: string;
+  protected readonly arcUrl: string;
+  protected readonly overlayUrl: string | undefined;
+  protected readonly overlayTopics: string[] | undefined;
+  protected readonly _network: 'mainnet' | 'testnet';
+  protected readonly _feeRate: number;
+  protected readonly txCache = new Map<string, string>();
 
   constructor(options: WalletProviderOptions) {
     this.wallet = options.wallet;
@@ -70,6 +70,21 @@ export class WalletProvider implements Provider {
   }
 
   // -------------------------------------------------------------------------
+  // Typed accessors (used by RunarContract.deployWithWallet; also lets
+  // consumers reach the wallet without reaching into internals)
+  // -------------------------------------------------------------------------
+
+  /** The BRC-100 wallet client this provider wraps. */
+  get walletClient(): WalletClient {
+    return this.wallet;
+  }
+
+  /** The wallet basket used for UTXO management. */
+  get basketName(): string {
+    return this.basket;
+  }
+
+  // -------------------------------------------------------------------------
   // Transaction cache
   // -------------------------------------------------------------------------
 
@@ -78,8 +93,14 @@ export class WalletProvider implements Provider {
     this.txCache.set(txid, rawHex);
   }
 
-  /** Fetch raw tx hex: local cache → overlay → throw. */
-  private async fetchRawTx(txid: string): Promise<string> {
+  /**
+   * Fetch raw tx hex: local cache → overlay → throw.
+   *
+   * Protected so subclasses can supply parents from another source (their
+   * own index, a node RPC, …); the EF assembly in `broadcastTx` dispatches
+   * through the override.
+   */
+  protected async fetchRawTx(txid: string): Promise<string> {
     const cached = this.txCache.get(txid);
     if (cached) return cached;
 
@@ -101,8 +122,14 @@ export class WalletProvider implements Provider {
   // Broadcast
   // -------------------------------------------------------------------------
 
-  /** Broadcast a transaction via ARC in EF format. */
-  private async broadcastTx(tx: Transaction): Promise<string> {
+  /**
+   * Broadcast a transaction via ARC in EF format.
+   *
+   * Protected so subclasses can reroute broadcast (e.g. through an overlay
+   * that gates admission) while `broadcast()` and `ensureFunding()` keep
+   * dispatching through the override.
+   */
+  protected async broadcastTx(tx: Transaction): Promise<string> {
     // Attach source transactions for EF format
     for (const input of tx.inputs) {
       if (input.sourceTransaction) continue;
@@ -137,8 +164,9 @@ export class WalletProvider implements Provider {
     return txid;
   }
 
-  /** Submit a transaction to the overlay for indexing (non-fatal). */
-  private async submitToOverlay(tx: Transaction): Promise<void> {
+  /** Submit a transaction to the overlay for indexing (non-fatal).
+   * Protected so subclasses can adapt the submit request to their overlay. */
+  protected async submitToOverlay(tx: Transaction): Promise<void> {
     if (!this.overlayUrl || !this.overlayTopics) return;
 
     const beef = tx.toBEEF();
