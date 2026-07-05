@@ -530,6 +530,67 @@ describe('Pass 4: ANF Lower', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Unsupported loop shapes: non-zero start, countdown (issue #121 reject path)
+  // ---------------------------------------------------------------------------
+
+  describe('unsupported loop shapes', () => {
+    it('throws for a loop with a non-zero start value', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 1n; i <= 3n; i++) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      expect(() => lowerSource(source)).toThrow(/must start at 0/);
+    });
+
+    it('throws for a countdown loop', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 3n; i > 0n; i--) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      expect(() => lowerSource(source)).toThrow(/[Cc]ountdown/);
+    });
+
+    it('still lowers a zero-start counting-up loop', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 0n; i <= 3n; i++) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loops = bindingsOfKind(method.body, 'loop');
+      expect(loops.length).toBe(1);
+      expect((loops[0]!.value as { kind: 'loop'; count: number }).count).toBe(4);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Assignment lowering: update_prop
   // ---------------------------------------------------------------------------
 
