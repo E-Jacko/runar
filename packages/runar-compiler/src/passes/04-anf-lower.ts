@@ -889,30 +889,43 @@ function lowerForStatement(
  *
  * Returns the count (number of iterations). Falls back to 0 if
  * the pattern is not recognized.
+ *
+ * The ANF loop node carries only the count — no start value or step
+ * direction — so lowering (and the ANF interpreter) always iterates
+ * i = 0..count-1. Loop shapes that representation cannot express are
+ * rejected here (mirroring the source-located errors in 02-validate)
+ * rather than silently compiled as a zero-start counting-up loop.
  */
 function extractLoopCount(
   stmt: Extract<Statement, { kind: 'for_statement' }>,
 ): number {
+  // A countdown loop necessarily also has a non-zero start, so check the
+  // condition direction first — it is the more precise diagnosis.
+  if (stmt.condition.kind === 'binary_expr') {
+    const op = stmt.condition.op;
+    if (op === '>' || op === '>=') {
+      throw new Error(
+        `For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead.`,
+      );
+    }
+  }
+
   // Try to extract start value
   const startVal = extractBigIntValue(stmt.init.init);
 
+  if (startVal !== null && startVal !== 0n) {
+    throw new Error(
+      `For loop iterator must start at 0 (got ${startVal}n) — loops compile to i = 0..count-1; offset the iterator inside the body instead.`,
+    );
+  }
+
   // Try to extract the bound from the condition
   if (stmt.condition.kind === 'binary_expr') {
+    const op = stmt.condition.op;
     const boundVal = extractBigIntValue(stmt.condition.right);
-
-    if (startVal !== null && boundVal !== null) {
-      const op = stmt.condition.op;
-      if (op === '<') return Math.max(0, Number(boundVal - startVal));
-      if (op === '<=') return Math.max(0, Number(boundVal - startVal + 1n));
-      if (op === '>') return Math.max(0, Number(startVal - boundVal));
-      if (op === '>=') return Math.max(0, Number(startVal - boundVal + 1n));
-    }
-
-    // If we can at least get the bound, assume start = 0
     if (boundVal !== null) {
-      const op = stmt.condition.op;
-      if (op === '<') return Number(boundVal);
-      if (op === '<=') return Number(boundVal) + 1;
+      if (op === '<') return Math.max(0, Number(boundVal));
+      if (op === '<=') return Math.max(0, Number(boundVal) + 1);
     }
   }
 
