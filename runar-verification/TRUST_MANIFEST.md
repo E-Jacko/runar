@@ -9,7 +9,7 @@ counts:
 
 | Item | Count | Meaning |
 |---|---:|---|
-| Project axioms | 70 | Named assumptions in Lean code |
+| Project axioms | 71 | Named assumptions in Lean code |
 | Opaque executable defaults | 0 | No executable bodies hidden from proofs |
 | Opaque defaults with bodies | 0 | No opaque declarations carry defaults |
 | `partial def` | 0 | No partial definitions under `RunarVerification/` |
@@ -32,12 +32,27 @@ equivalence. The capstone is
 `compileSafe_observational_correct_modulo_codegen_axioms` (`Pipeline.lean`), with
 a loop-widened wrapper `..._with_loop` (`OmnibusLoop.lean`).
 
-The trust base is **70 axioms** (drift-gated, `scripts/check-tcb-drift.sh`).
+The trust base is **71 axioms** (drift-gated, `scripts/check-tcb-drift.sh`).
 Of those, the large majority are **primitive-level**: textbook cryptographic
 semantics and per-primitive codegen→runtime bridges. The **composition layer
-itself is proven down to exactly two structural axioms** — the `crypto_call`
-residue fallback and the BIP-143 signature-witness bridge — plus the three
-opaque crypto backends that anchor the model to a real crypto implementation.
+itself is proven down to exactly three structural axioms** — the `crypto_call`
+residue fallback and the two opaque OP_PUSH_TX preimage-binding
+codegen→runtime shims (BUG-100) — plus the three opaque crypto backends that
+anchor the model to a real crypto implementation.
+
+**BUG-100 update (2026-07-06).** The pre-BUG-100 BIP-143 signature-witness
+bridge axiom (`exists_checkSig_witness_under_validTxContext`) was RETIRED. The
+compiler-injected `checkPreimage` now emits a fixed 760-byte on-chain
+OP_PUSH_TX blob that DERIVES the ECDSA signature from `hash256(preimage)` and
+runs `OP_CHECKSIGVERIFY` against `G`, so the preimage↔transaction binding is
+ENFORCED BY CODEGEN rather than assumed of a spender-supplied witness. The
+deployed blob is real executable script but is emitted as an opaque `.rawBytes`
+op (modelled as a data push by the Stack evaluator), so its runtime abort
+behaviour is characterised by two opaque codegen→runtime shims — peers of
+`Blake3.runOps_b3HashOps_eq`: `AgreesStateful.runOps_checkPreimageBindingRaw_eq`
+(gated prologue) and `runOps_statefulFullParsedOps_scriptAccepts` (widened
+prologue+epilogue). Net axiom change: **−1 (retired witness) +2 (binding
+shims) = +1 (70 → 71)**.
 
 This boundary is **machine-checked**, not asserted: `#audit_axioms`
 (`RunarVerification/AxiomAuditCmd.lean`) fails the build if any of the nine

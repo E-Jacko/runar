@@ -146,23 +146,20 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_with_loop
     (hStatefulFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
         ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
-          (sigV preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          (preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
           anfM.params = [ANFParam.mk pre ty] ∧
           anfM.body = Stack.StatefulBridge.gatedStatefulPrologueBody pre ∧
-          pre ≠ "_cp0" ∧ pre ≠ "_opPushTxSig" ∧
+          pre ≠ "_cp0" ∧
           Stack.ValidTxContext ctx ∧
           preimage = Stack.TxContext.buildPreimage ctx ∧
           initialAnf.resolveRef pre = some (.vBytes preimage) ∧
-          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest ∧
-          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-              Stack.AgreesStateful.stG
-            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
+          initialStack.stack = .vBytes preimage :: rest)
     (hStatefulFullFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
           p.properties anfM = true →
         ∃ (pre sats stateVal pn : String) (tyS tyV tyP : ANFType)
           (ctx : Stack.TxContext)
-          (sigV preimage cpV sv8 var2 sats8 : ByteArray) (svV satsV : Int)
+          (preimage cpV : ByteArray) (svV satsV : Int)
           (rest : List RunarVerification.ANF.Eval.Value),
           anfM.params = [ANFParam.mk sats tyS, ANFParam.mk stateVal tyV,
             ANFParam.mk pre tyP] ∧
@@ -176,16 +173,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_with_loop
           initialAnf.resolveRef sats = some (.vBigint satsV) ∧
           initialAnf.resolveRef stateVal = some (.vBigint svV) ∧
           initialStack.stack = .vBytes preimage :: .vBigint svV
-            :: .vBigint satsV :: .vBytes sigV :: .vBytes cpV :: rest ∧
-          Stack.num2binEncode? svV 8 = some sv8 ∧ sv8.size = 8 ∧
-          cpV.size + 9 < 253 ∧
-          Stack.num2binEncode?
-            ((Stack.AgreesStateful.epiAcc cpV sv8).size : Int) 2 = some var2 ∧
-          1 ≤ var2.size ∧
-          Stack.num2binEncode? satsV 8 = some sats8 ∧
-          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-              Stack.AgreesStateful.stG
-            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
+            :: .vBigint satsV :: .vBytes cpV :: rest)
     (hDispatchFrag :
       dispatchConsumeShapeBool p = true →
         ∃ (i : Nat) (rest : List RunarVerification.ANF.Eval.Value)
@@ -401,18 +389,15 @@ theorem omnibus_covers_loopOk
       RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool
           RunarVerification.Stack.LoopBridge.loopOkM = true →
         ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
-          (sigV preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          (preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
           RunarVerification.Stack.LoopBridge.loopOkM.params = [ANFParam.mk pre ty] ∧
           RunarVerification.Stack.LoopBridge.loopOkM.body
             = Stack.StatefulBridge.gatedStatefulPrologueBody pre ∧
-          pre ≠ "_cp0" ∧ pre ≠ "_opPushTxSig" ∧
+          pre ≠ "_cp0" ∧
           Stack.ValidTxContext ctx ∧
           preimage = Stack.TxContext.buildPreimage ctx ∧
           initialAnf.resolveRef pre = some (.vBytes preimage) ∧
-          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest ∧
-          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-              Stack.AgreesStateful.stG
-            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
+          initialStack.stack = .vBytes preimage :: rest)
     (hStatefulFullFrag : (RunarVerification.Stack.LoopBridge.loopOkProg.methods.filter
         (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
@@ -420,7 +405,7 @@ theorem omnibus_covers_loopOk
           RunarVerification.Stack.LoopBridge.loopOkM = true →
         ∃ (pre sats stateVal pn : String) (tyS tyV tyP : ANFType)
           (ctx : Stack.TxContext)
-          (sigV preimage cpV sv8 var2 sats8 : ByteArray) (svV satsV : Int)
+          (preimage cpV : ByteArray) (svV satsV : Int)
           (rest : List RunarVerification.ANF.Eval.Value),
           RunarVerification.Stack.LoopBridge.loopOkM.params
             = [ANFParam.mk sats tyS, ANFParam.mk stateVal tyV,
@@ -437,16 +422,7 @@ theorem omnibus_covers_loopOk
           initialAnf.resolveRef sats = some (.vBigint satsV) ∧
           initialAnf.resolveRef stateVal = some (.vBigint svV) ∧
           initialStack.stack = .vBytes preimage :: .vBigint svV
-            :: .vBigint satsV :: .vBytes sigV :: .vBytes cpV :: rest ∧
-          Stack.num2binEncode? svV 8 = some sv8 ∧ sv8.size = 8 ∧
-          cpV.size + 9 < 253 ∧
-          Stack.num2binEncode?
-            ((Stack.AgreesStateful.epiAcc cpV sv8).size : Int) 2 = some var2 ∧
-          1 ≤ var2.size ∧
-          Stack.num2binEncode? satsV 8 = some sats8 ∧
-          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-              Stack.AgreesStateful.stG
-            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
+            :: .vBigint satsV :: .vBytes cpV :: rest)
     (hDispatchFrag :
       dispatchConsumeShapeBool RunarVerification.Stack.LoopBridge.loopOkProg = true →
         ∃ (i : Nat) (rest : List RunarVerification.ANF.Eval.Value)

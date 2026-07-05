@@ -20,7 +20,20 @@ cd "$(dirname "$0")/.."
 # |partial def) ` keys on declaration position; in practice the
 # false-positive rate is low because Lean docstrings indent.
 
-TARGET_AXIOMS=70        # −1 (2026-06-13 — loop sub-omnibus RETIRED:
+TARGET_AXIOMS=71        # +1 net (2026-07-06 — BUG-100 on-chain checkPreimage
+                        # binding: RETIRED `exists_checkSig_witness_under_
+                        # validTxContext` (−1, the pre-BUG-100 spender-witness
+                        # assumption) and ADDED the two opaque OP_PUSH_TX
+                        # codegen→runtime binding shims (+2): `AgreesStateful.
+                        # runOps_checkPreimageBindingRaw_eq` (gated prologue) and
+                        # `runOps_statefulFullParsedOps_scriptAccepts` (widened
+                        # prologue+epilogue). The binding is now ENFORCED BY
+                        # CODEGEN — the emitted 760-byte blob derives the ECDSA
+                        # signature on-chain from hash256(preimage) — so the
+                        # correspondence is a codegen bridge (peer of Blake3's
+                        # `runOps_b3HashOps_eq`), not a witness-existence
+                        # assumption. See TRUST_MANIFEST.md.
+                        # −1 (2026-06-13 — loop sub-omnibus RETIRED:
                         # `compileSafe_observational_correct_modulo_loop_codegen`
                         # is GONE; its omnibus dispatch arm is discharged by the
                         # theorem `compileSafe_observational_correct_loop_consume`.

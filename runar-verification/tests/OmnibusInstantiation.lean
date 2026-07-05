@@ -391,21 +391,10 @@ def omniStatefulPreimage : ByteArray :=
 
 def omniStatefulAnf : State := { params := [("pre", .vBytes omniStatefulPreimage)] }
 
-noncomputable def omniStatefulSig : ByteArray :=
-  Classical.choose
-    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
-      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
-
-theorem omniStatefulSig_spec :
-    RunarVerification.ANF.Eval.Crypto.authBackend.checkSig omniStatefulSig
-        AgreesStateful.stG
-      = RunarVerification.ANF.Eval.Crypto.checkPreimage omniStatefulPreimage :=
-  Classical.choose_spec
-    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
-      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
-
-noncomputable def omniStatefulStk : StackState :=
-  { stack := [.vBytes omniStatefulPreimage, .vBytes omniStatefulSig] }
+-- BUG-100: no spender-witness signature; the deployed stack carries only the
+-- preimage. The binding is enforced by the on-chain OP_PUSH_TX blob.
+def omniStatefulStk : StackState :=
+  { stack := [.vBytes omniStatefulPreimage] }
 
 def omniStatefulBytes : ByteArray :=
   Emit.emitFast (peepholeProgram (Lower.lower omniStatefulProg))
@@ -450,11 +439,10 @@ theorem omnibus_instantiation_stateful :
     (fun _ => vacuous (by native_decide))                                -- hHashCallFrag
     (fun _ => vacuous (by native_decide))                                -- hHashAssertFrag
     (fun _ => vacuous (by native_decide))                                -- hHashChainFrag
-    (fun _ _ => ⟨"pre", .byteString, Stack.TxContext.sampleCtx, omniStatefulSig,
+    (fun _ _ => ⟨"pre", .byteString, Stack.TxContext.sampleCtx,
       omniStatefulPreimage, [],
-      rfl, rfl, by decide, by decide,
-      Stack.ValidTxContext.sampleCtx_valid, rfl, rfl, rfl,
-      omniStatefulSig_spec⟩)                                             -- hStatefulFrag (LIVE)
+      rfl, rfl, by decide,
+      Stack.ValidTxContext.sampleCtx_valid, rfl, rfl, rfl⟩)              -- hStatefulFrag (LIVE)
     (fun _ => vacuous (by native_decide))                                -- hStatefulFullFrag
     (vacuous (by native_decide))                                         -- hDispatchFrag
     (vacuous (by native_decide))                                         -- hDispatchMixedFrag
@@ -488,22 +476,11 @@ def omniSfAnf : State :=
 
 def omniSfCp : ByteArray := ByteArray.mk #[0xAA, 0xBB, 0xCC]
 
-noncomputable def omniSfSig : ByteArray :=
-  Classical.choose
-    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
-      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
-
-theorem omniSfSig_spec :
-    RunarVerification.ANF.Eval.Crypto.authBackend.checkSig omniSfSig
-        AgreesStateful.stG
-      = RunarVerification.ANF.Eval.Crypto.checkPreimage omniSfPreimage :=
-  Classical.choose_spec
-    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
-      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
-
-noncomputable def omniSfStk : StackState :=
+-- BUG-100: no spender-witness signature; the deployed stack carries the
+-- preimage, state value, satoshis, and code part (no witness).
+def omniSfStk : StackState :=
   { stack := [.vBytes omniSfPreimage, .vBigint 7, .vBigint 1000,
-              .vBytes omniSfSig, .vBytes omniSfCp] }
+              .vBytes omniSfCp] }
 
 def omniSfBytes : ByteArray :=
   Emit.emitFast (peepholeProgram (Lower.lower omniSfProg))
@@ -552,14 +529,10 @@ theorem omnibus_instantiation_statefulFull :
     (fun _ => vacuous (by native_decide))                                -- hHashChainFrag
     (fun _ => vacuous (by native_decide))                                -- hStatefulFrag
     (fun _ _ => ⟨"pre", "sats", "stateVal", "count", .bigint, .bigint,
-      .byteString, Stack.TxContext.sampleCtx, omniSfSig, omniSfPreimage,
-      omniSfCp, ByteArray.mk #[7, 0, 0, 0, 0, 0, 0, 0], ByteArray.mk #[12, 0],
-      ByteArray.mk #[0xE8, 0x03, 0, 0, 0, 0, 0, 0], 7, 1000, [],
+      .byteString, Stack.TxContext.sampleCtx, omniSfPreimage, omniSfCp,
+      7, 1000, [],
       rfl, rfl, rfl, by native_decide,
-      Stack.ValidTxContext.sampleCtx_valid, rfl, rfl, rfl, rfl, rfl,
-      by native_decide, by native_decide, by native_decide,
-      by native_decide, by native_decide, by native_decide,
-      omniSfSig_spec⟩)                                                   -- hStatefulFullFrag (LIVE)
+      Stack.ValidTxContext.sampleCtx_valid, rfl, rfl, rfl, rfl, rfl⟩)     -- hStatefulFullFrag (LIVE)
     (vacuous (by native_decide))                                         -- hDispatchFrag
     (vacuous (by native_decide))                                         -- hDispatchMixedFrag
     (vacuousAssert (by native_decide))                                   -- hValueTruthy (EXEMPT path)

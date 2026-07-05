@@ -6932,8 +6932,8 @@ asserts a witness EXISTS per valid context, and powers the smoke).  No
 sub-omnibus axiom appears in the discharge. -/
 
 /-- The 4-pass peephole pipeline is the identity on the constant stateful
-prologue ops (no fusable adjacency: the only push is the 33-byte key `G`
-followed by `OP_CHECKSIGVERIFY`). -/
+prologue ops (BUG-100: `OP_CODESEPARATOR` followed by the opaque 760-byte
+`.rawBytes` binding blob — a hard peephole barrier, no fusable adjacency). -/
 theorem peepholeMethodOps_statefulPrologue :
     peepholeMethodOps AgreesStateful.statefulPrologueOps
       = AgreesStateful.statefulPrologueOps := by
@@ -6943,7 +6943,7 @@ theorem peepholeMethodOps_statefulPrologue :
   rw [Peephole.peepholePassAll_eq_flat_of_noIfOp _ hNoIf]
   have hFlat : Peephole.peepholePassAllFlat AgreesStateful.statefulPrologueOps
       = AgreesStateful.statefulPrologueOps := by
-    simp +decide [AgreesStateful.statefulPrologueOps, AgreesStateful.stG,
+    simp +decide [AgreesStateful.statefulPrologueOps,
       Peephole.peepholePassAllFlat, Peephole.applyEqualVerifyFuse,
       Peephole.applyCheckSigVerifyFuse, Peephole.applyNumEqualVerifyFuse,
       Peephole.applyZeroNumEqual, Peephole.applyDoubleSha256,
@@ -7012,19 +7012,20 @@ theorem compileSafe_observational_correct_stateful_consume
     (pre : String) (ty : ANFType)
     (hParams : anfM.params = [ANFParam.mk pre ty])
     (hBody : anfM.body = StatefulBridge.gatedStatefulPrologueBody pre)
-    (hne1 : pre ≠ "_cp0") (hne2 : pre ≠ "_opPushTxSig")
-    (ctx : TxContext) (sigV preimage : ByteArray)
+    (hne1 : pre ≠ "_cp0")
+    (ctx : TxContext) (preimage : ByteArray)
     (rest : List RunarVerification.ANF.Eval.Value)
     (_hValid : ValidTxContext ctx)
     (hPreLink : preimage = TxContext.buildPreimage ctx)
     (hAnfPre : initialAnf.resolveRef pre = some (.vBytes preimage))
-    (hStk : initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest)
-    (hSig : RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-          AgreesStateful.stG
-        = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage) :
+    (hStk : initialStack.stack = .vBytes preimage :: rest) :
     acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
+  -- BUG-100: no spender-witness signature. The ANF success bit is the
+  -- preimage verdict, and the deployed script's acceptance is that SAME
+  -- verdict via `runOps_statefulPrologueOps_scriptAccepts` (the opaque
+  -- OP_PUSH_TX binding shim) — the two agree by construction.
   have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
       anfM.body).toOption.isSome
       = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage := by
@@ -7036,14 +7037,14 @@ theorem compileSafe_observational_correct_stateful_consume
   have hOps : (Lower.lowerMethod p.methods p.properties anfM).ops
       = AgreesStateful.statefulPrologueOps :=
     AgreesStateful.lowerMethod_ops_statefulPrologue p.methods p.properties anfM
-      pre ty hParams hBody hPublic hne1 hne2
+      pre ty hParams hBody hPublic hne1
   have hPeeped : (peepholedLoweredMethod p anfM).ops
       = AgreesStateful.statefulPrologueOps := by
     show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = _
     rw [hOps]
     exact peepholeMethodOps_statefulPrologue
   have hM4 : runParsedBytes bytes initialStack
-      = runOps AgreesStateful.statefulPrologueOps initialStack := by
+      = runOps AgreesStateful.statefulPrologueParsedOps initialStack := by
     have hBytes := compileSafe_ok_implies_emitFast p bytes hSafe
     rw [hBytes]
     unfold runParsedBytes RunarVerification.Script.Emit.emitFast
@@ -7052,14 +7053,14 @@ theorem compileSafe_observational_correct_stateful_consume
     rw [hPeeped, AgreesStateful.parseScript_emitOpsFast_statefulPrologue]
   have hPreSize : 0 < preimage.size := by
     rw [hPreLink]; exact buildPreimage_size_pos ctx
-  have hStack : scriptAccepts (runOps AgreesStateful.statefulPrologueOps initialStack)
-      = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV AgreesStateful.stG :=
+  have hStack : scriptAccepts (runOps AgreesStateful.statefulPrologueParsedOps initialStack)
+      = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage :=
     AgreesStateful.runOps_statefulPrologueOps_scriptAccepts
-      initialStack preimage sigV rest hStk hPreSize
+      initialStack preimage rest hStk hPreSize
   show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
       anfM.body).toOption.isSome
       ↔ scriptAccepts (runParsedBytes bytes initialStack) = true
-  rw [hM4, hANF, hStack, hSig]
+  rw [hM4, hANF, hStack]
 
 /-! ### MANDATORY smoke: the stateful consume theorem fires
 
@@ -7079,30 +7080,14 @@ private def stSmokePreimage : ByteArray :=
 
 private def stSmokeAnf : State := { params := [("pre", .vBytes stSmokePreimage)] }
 
-/-- The sample context's spend witness, from the witness-existence axiom
-(`Classical.choose` — the backends are opaque, so no concrete signature
-bytes are derivable in-model). -/
-private noncomputable def stSmokeSig : ByteArray :=
-  Classical.choose
-    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
-      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
-
-/-- The witness property — discharges the consume theorem's `hSig`
-sig-provenance hypothesis for the smoke. -/
-private theorem stSmokeSig_spec :
-    RunarVerification.ANF.Eval.Crypto.authBackend.checkSig stSmokeSig
-        AgreesStateful.stG
-      = RunarVerification.ANF.Eval.Crypto.checkPreimage stSmokePreimage :=
-  Classical.choose_spec
-    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
-      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
-
-private noncomputable def stSmokeStk : StackState :=
-  { stack := [.vBytes stSmokePreimage, .vBytes stSmokeSig] }
+/-- The deployed method-entry stack: just the preimage (BUG-100 — no
+spender-supplied witness signature). -/
+private def stSmokeStk : StackState :=
+  { stack := [.vBytes stSmokePreimage] }
 
 /-- SMOKE — `compileSafe` accepts the canonical stateful contract and the
-consume theorem fires on the sample-context entry (with the chosen witness
-signature on the deployed stack). -/
+consume theorem fires on the sample-context entry. The binding is enforced by
+the deployed blob (no witness on the stack). -/
 theorem smoke_stateful_consume_fires :
     ∃ bytes, compileSafe stSmokeProg = .ok bytes ∧
       acceptAgrees
@@ -7118,10 +7103,9 @@ theorem smoke_stateful_consume_fires :
   exact compileSafe_observational_correct_stateful_consume
     stSmokeProg AgreesStateful.smokeMethod bytes
     (by simp [stSmokeProg]) rfl hSafe stSmokeAnf stSmokeStk rfl (by decide)
-    "pre" .byteString rfl rfl (by decide) (by decide)
-    Stack.TxContext.sampleCtx stSmokeSig stSmokePreimage []
+    "pre" .byteString rfl rfl (by decide)
+    Stack.TxContext.sampleCtx stSmokePreimage []
     RunarVerification.Stack.ValidTxContext.sampleCtx_valid rfl rfl rfl
-    stSmokeSig_spec
 
 /-! ## Stateful WIDENED fragment — prologue + state-output epilogue (2026-06-11)
 
@@ -7193,7 +7177,7 @@ theorem compileSafe_observational_correct_statefulFull_consume
     (hProps : p.properties.filter (fun pp => !pp.readonly)
         = [{ name := pn, type := .bigint, readonly := false }])
     (hNames : AgreesStateful.statefulFullNamesOk pre sats stateVal = true)
-    (ctx : TxContext) (sigV preimage cpV sv8 var2 sats8 : ByteArray)
+    (ctx : TxContext) (preimage cpV : ByteArray)
     (svV satsV : Int)
     (rest : List RunarVerification.ANF.Eval.Value)
     (_hValid : ValidTxContext ctx)
@@ -7202,23 +7186,16 @@ theorem compileSafe_observational_correct_statefulFull_consume
     (hAnfSats : initialAnf.resolveRef sats = some (.vBigint satsV))
     (hAnfSv : initialAnf.resolveRef stateVal = some (.vBigint svV))
     (hStk : initialStack.stack = .vBytes preimage :: .vBigint svV
-        :: .vBigint satsV :: .vBytes sigV :: .vBytes cpV :: rest)
-    (hSv8 : Stack.num2binEncode? svV 8 = some sv8)
-    (hSv8sz : sv8.size = 8)
-    (hLt : cpV.size + 9 < 253)
-    (hVar : Stack.num2binEncode?
-        ((AgreesStateful.epiAcc cpV sv8).size : Int) 2 = some var2)
-    (hVar2 : 1 ≤ var2.size)
-    (hSats8 : Stack.num2binEncode? satsV 8 = some sats8)
-    (hSig : RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-          AgreesStateful.stG
-        = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage) :
+        :: .vBigint satsV :: .vBytes cpV :: rest) :
     acceptAgrees
       (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf anfM.body)
       (runParsedBytes bytes initialStack) := by
-  obtain ⟨hPE, hPC, _hPv1, _hPso, hPO, _hPcp,
-    hSE, hSC, hS2, _hSso, hSO, hSCp, hSA,
-    hVE, hVC, hV2, _hVso, hVO, hVCp, hVA,
+  -- BUG-100: no spender-witness signature and no serialization readiness
+  -- hypotheses — the deployed script's acceptance is the preimage verdict via
+  -- the opaque `runOps_statefulFullParsedOps_scriptAccepts` shim.
+  obtain ⟨hPE, hPC, _hPv1, _hPso, _hPO, _hPcp,
+    hSE, hSC, hS2, _hSso, _hSO, hSCp, hSA,
+    hVE, hVC, hV2, _hVso, _hVO, hVCp, hVA,
     hPS, hPV, hSV⟩ := AgreesStateful.statefulFullNamesOk_unpack pre sats stateVal hNames
   have hANF : (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
       anfM.body).toOption.isSome
@@ -7233,7 +7210,7 @@ theorem compileSafe_observational_correct_statefulFull_consume
       = AgreesStateful.statefulFullOps :=
     AgreesStateful.lowerMethod_ops_statefulFull p.methods p.properties anfM
       pre sats stateVal pn tyS tyV tyP hParams hBody hPublic hProps
-      hPE hPS hPV hPC hPO hSE hVE hSV hSC hVC hSO hVO hVCp hSCp hVA hSA
+      hPE hPS hPV hPC hSE hVE hSV hSC hVC hVCp hSCp hVA hSA
   have hPeeped : (peepholedLoweredMethod p anfM).ops
       = AgreesStateful.statefulFullOps := by
     show peepholeMethodOps (Lower.lowerMethod p.methods p.properties anfM).ops = _
@@ -7251,15 +7228,13 @@ theorem compileSafe_observational_correct_statefulFull_consume
     rw [hPreLink]; exact buildPreimage_size_pos ctx
   have hStack : scriptAccepts
       (runOps AgreesStateful.statefulFullParsedOps initialStack)
-      = RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-          AgreesStateful.stG :=
+      = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage :=
     AgreesStateful.runOps_statefulFullParsedOps_scriptAccepts
-      initialStack preimage sigV cpV sv8 var2 sats8 svV satsV rest
-      hStk hPreSize hSv8 hSv8sz hLt hVar hVar2 hSats8
+      initialStack preimage cpV svV satsV rest hStk hPreSize
   show (RunarVerification.ANF.Eval.evalBindingsP p.methods initialAnf
       anfM.body).toOption.isSome
       ↔ scriptAccepts (runParsedBytes bytes initialStack) = true
-  rw [hM4, hANF, hStack, hSig]
+  rw [hM4, hANF, hStack]
 
 /-! ### MANDATORY smoke: the WIDENED stateful consume theorem fires
 
@@ -7282,25 +7257,13 @@ private def stfSmokeAnf : State :=
 
 private def stfSmokeCp : ByteArray := ByteArray.mk #[0xAA, 0xBB, 0xCC]
 
-private noncomputable def stfSmokeSig : ByteArray :=
-  Classical.choose
-    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
-      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
-
-private theorem stfSmokeSig_spec :
-    RunarVerification.ANF.Eval.Crypto.authBackend.checkSig stfSmokeSig
-        AgreesStateful.stG
-      = RunarVerification.ANF.Eval.Crypto.checkPreimage stfSmokePreimage :=
-  Classical.choose_spec
-    (Stack.StatefulBridge.exists_checkSig_witness_under_validTxContext
-      Stack.TxContext.sampleCtx Stack.ValidTxContext.sampleCtx_valid)
-
-private noncomputable def stfSmokeStk : StackState :=
+private def stfSmokeStk : StackState :=
   { stack := [.vBytes stfSmokePreimage, .vBigint 7, .vBigint 1000,
-              .vBytes stfSmokeSig, .vBytes stfSmokeCp] }
+              .vBytes stfSmokeCp] }
 
 /-- SMOKE — `compileSafe` accepts the widened stateful contract and the
-consume theorem fires on the sample-context entry. -/
+consume theorem fires on the sample-context entry (BUG-100: no witness on the
+deployed stack). -/
 theorem smoke_statefulFull_consume_fires :
     ∃ bytes, compileSafe stfSmokeProg = .ok bytes ∧
       acceptAgrees
@@ -7318,14 +7281,9 @@ theorem smoke_statefulFull_consume_fires :
     (by simp [stfSmokeProg]) rfl hSafe stfSmokeAnf stfSmokeStk rfl (by decide)
     "pre" "sats" "stateVal" "count" .bigint .bigint .byteString rfl rfl
     rfl (by native_decide)
-    Stack.TxContext.sampleCtx stfSmokeSig stfSmokePreimage stfSmokeCp
-    (ByteArray.mk #[7, 0, 0, 0, 0, 0, 0, 0]) (ByteArray.mk #[12, 0])
-    (ByteArray.mk #[0xE8, 0x03, 0, 0, 0, 0, 0, 0])
+    Stack.TxContext.sampleCtx stfSmokePreimage stfSmokeCp
     7 1000 []
     RunarVerification.Stack.ValidTxContext.sampleCtx_valid rfl rfl rfl rfl rfl
-    (by native_decide) (by native_decide) (by native_decide)
-    (by native_decide) (by native_decide) (by native_decide)
-    stfSmokeSig_spec
 
 /-! ## Dispatch sub-omnibus retirement — the multi-public passthrough consume
 
@@ -9326,36 +9284,31 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
     (hStatefulFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
         ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
-          (sigV preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          (preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
           anfM.params = [ANFParam.mk pre ty] ∧
           anfM.body = Stack.StatefulBridge.gatedStatefulPrologueBody pre ∧
-          pre ≠ "_cp0" ∧ pre ≠ "_opPushTxSig" ∧
+          pre ≠ "_cp0" ∧
           Stack.ValidTxContext ctx ∧
           preimage = Stack.TxContext.buildPreimage ctx ∧
           initialAnf.resolveRef pre = some (.vBytes preimage) ∧
-          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest ∧
-          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-              Stack.AgreesStateful.stG
-            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
+          initialStack.stack = .vBytes preimage :: rest)
     -- **WIDENED stateful consume premise (keyed; 2026-06-11 stateful
-    -- widening).**  For a body in the widened prologue+epilogue fragment
-    -- (decided by `AgreesStateful.statefulFullConsumeShapeBool`) the shape
-    -- witnesses plus the valid-BIP-143-context entry bundle are recovered,
-    -- extended with the epilogue's serialization readiness facts: the
-    -- satoshi / state-value params resolve to ints on the ANF side, the
-    -- runtime stack carries `[pre, stateVal, sats, sig, codePart]`, the
-    -- three `num2binEncode?` encodings exist (8-byte state value, 8-byte
-    -- amount, 2-byte varint source), and the codePart size bound selects
-    -- the 1-byte-varint branch.  Keyed on the DECIDABLE classifier, it is
-    -- VACUOUS for every non-fragment body, so the omnibus stays jointly
-    -- satisfiable.  Its only consumer is the conformance harness, which
-    -- discharges it per fixture from the deployment context.
+    -- widening; BUG-100 re-shape).**  For a body in the widened
+    -- prologue+epilogue fragment (decided by
+    -- `AgreesStateful.statefulFullConsumeShapeBool`) the shape witnesses plus
+    -- the valid-BIP-143-context entry bundle are recovered: the satoshi /
+    -- state-value params resolve to ints on the ANF side, and the runtime
+    -- stack carries `[pre, stateVal, sats, codePart]` (BUG-100: no witness
+    -- signature).  The old serialization-readiness facts are gone — the
+    -- deployed script's acceptance is the preimage verdict via the opaque
+    -- OP_PUSH_TX shim.  Keyed on the DECIDABLE classifier, it is VACUOUS for
+    -- every non-fragment body, so the omnibus stays jointly satisfiable.
     (hStatefulFullFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
           p.properties anfM = true →
         ∃ (pre sats stateVal pn : String) (tyS tyV tyP : ANFType)
           (ctx : Stack.TxContext)
-          (sigV preimage cpV sv8 var2 sats8 : ByteArray) (svV satsV : Int)
+          (preimage cpV : ByteArray) (svV satsV : Int)
           (rest : List RunarVerification.ANF.Eval.Value),
           anfM.params = [ANFParam.mk sats tyS, ANFParam.mk stateVal tyV,
             ANFParam.mk pre tyP] ∧
@@ -9369,16 +9322,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           initialAnf.resolveRef sats = some (.vBigint satsV) ∧
           initialAnf.resolveRef stateVal = some (.vBigint svV) ∧
           initialStack.stack = .vBytes preimage :: .vBigint svV
-            :: .vBigint satsV :: .vBytes sigV :: .vBytes cpV :: rest ∧
-          Stack.num2binEncode? svV 8 = some sv8 ∧ sv8.size = 8 ∧
-          cpV.size + 9 < 253 ∧
-          Stack.num2binEncode?
-            ((Stack.AgreesStateful.epiAcc cpV sv8).size : Int) 2 = some var2 ∧
-          1 ≤ var2.size ∧
-          Stack.num2binEncode? satsV 8 = some sats8 ∧
-          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-              Stack.AgreesStateful.stG
-            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
+            :: .vBigint satsV :: .vBytes cpV :: rest)
     -- **Dispatch consume premise (keyed).**  For a multi-public program in the
     -- canonical passthrough fragment (decided by `dispatchConsumeShapeBool`)
     -- the entry bundle is recovered: the unlocking caller pushed the selector
@@ -9520,18 +9464,16 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
           RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
             p.properties anfM = true
       · by_cases hStFullName : anfM.name ≠ "constructor"
-        · obtain ⟨preF, satsF, stateValF, pnF, tySF, tyVF, tyPF, ctxF, sigVF,
-            preimageF, cpVF, sv8F, var2F, sats8F, svVF, satsVF, restF,
+        · obtain ⟨preF, satsF, stateValF, pnF, tySF, tyVF, tyPF, ctxF,
+            preimageF, cpVF, svVF, satsVF, restF,
             hFParams, hFBody, hFProps, hFNames, hFValid, hFPreLink, hFAnfPre,
-            hFAnfSats, hFAnfSv, hFStk, hFSv8, hFSv8sz, hFLt, hFVar, hFVar2,
-            hFSats8, hFSig⟩ := hStatefulFullFrag hStFullShape
+            hFAnfSats, hFAnfSv, hFStk⟩ := hStatefulFullFrag hStFullShape
           exact compileSafe_observational_correct_statefulFull_consume
             p anfM bytes hMem hPublic hSafe initialAnf initialStack
             hStSingle hStFullName preF satsF stateValF pnF tySF tyVF tyPF
-            hFParams hFBody hFProps hFNames ctxF sigVF preimageF cpVF sv8F
-            var2F sats8F svVF satsVF restF hFValid hFPreLink hFAnfPre
-            hFAnfSats hFAnfSv hFStk hFSv8 hFSv8sz hFLt hFVar hFVar2
-            hFSats8 hFSig
+            hFParams hFBody hFProps hFNames ctxF preimageF cpVF
+            svVF satsVF restF hFValid hFPreLink hFAnfPre
+            hFAnfSats hFAnfSv hFStk
         · -- Constructor-named: off the discharged path (the guard's name
           -- conjunct is false).
           have hNmEq : anfM.name = "constructor" :=
@@ -9551,13 +9493,13 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms (p : ANFProgram)
         by_cases hStShape :
             RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true
         · by_cases hStName : anfM.name ≠ "constructor"
-          · obtain ⟨pre, ty, ctx, sigV, preimage, restV, hStParams, hStBody,
-              hStNe1, hStNe2, hStValid, hStPreLink, hStAnfPre, hStStk, hStSig⟩ :=
+          · obtain ⟨pre, ty, ctx, preimage, restV, hStParams, hStBody,
+              hStNe1, hStValid, hStPreLink, hStAnfPre, hStStk⟩ :=
               hStatefulFrag hStShape
             exact compileSafe_observational_correct_stateful_consume
               p anfM bytes hMem hPublic hSafe initialAnf initialStack
-              hStSingle hStName pre ty hStParams hStBody hStNe1 hStNe2
-              ctx sigV preimage restV hStValid hStPreLink hStAnfPre hStStk hStSig
+              hStSingle hStName pre ty hStParams hStBody hStNe1
+              ctx preimage restV hStValid hStPreLink hStAnfPre hStStk
           · have hResidue : cryptoCallResidueB p anfM = true := by
               simp only [cryptoCallResidueB, hPublic, hStateful, Bool.true_and,
                 Bool.or_true, Bool.true_or]
@@ -10208,36 +10150,31 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
     (hStatefulFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulConsumeShapeBool anfM = true →
         ∃ (pre : String) (ty : ANFType) (ctx : Stack.TxContext)
-          (sigV preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
+          (preimage : ByteArray) (rest : List RunarVerification.ANF.Eval.Value),
           anfM.params = [ANFParam.mk pre ty] ∧
           anfM.body = Stack.StatefulBridge.gatedStatefulPrologueBody pre ∧
-          pre ≠ "_cp0" ∧ pre ≠ "_opPushTxSig" ∧
+          pre ≠ "_cp0" ∧
           Stack.ValidTxContext ctx ∧
           preimage = Stack.TxContext.buildPreimage ctx ∧
           initialAnf.resolveRef pre = some (.vBytes preimage) ∧
-          initialStack.stack = .vBytes preimage :: .vBytes sigV :: rest ∧
-          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-              Stack.AgreesStateful.stG
-            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
+          initialStack.stack = .vBytes preimage :: rest)
     -- **WIDENED stateful consume premise (keyed; 2026-06-11 stateful
-    -- widening).**  For a body in the widened prologue+epilogue fragment
-    -- (decided by `AgreesStateful.statefulFullConsumeShapeBool`) the shape
-    -- witnesses plus the valid-BIP-143-context entry bundle are recovered,
-    -- extended with the epilogue's serialization readiness facts: the
-    -- satoshi / state-value params resolve to ints on the ANF side, the
-    -- runtime stack carries `[pre, stateVal, sats, sig, codePart]`, the
-    -- three `num2binEncode?` encodings exist (8-byte state value, 8-byte
-    -- amount, 2-byte varint source), and the codePart size bound selects
-    -- the 1-byte-varint branch.  Keyed on the DECIDABLE classifier, it is
-    -- VACUOUS for every non-fragment body, so the omnibus stays jointly
-    -- satisfiable.  Its only consumer is the conformance harness, which
-    -- discharges it per fixture from the deployment context.
+    -- widening; BUG-100 re-shape).**  For a body in the widened
+    -- prologue+epilogue fragment (decided by
+    -- `AgreesStateful.statefulFullConsumeShapeBool`) the shape witnesses plus
+    -- the valid-BIP-143-context entry bundle are recovered: the satoshi /
+    -- state-value params resolve to ints on the ANF side, and the runtime
+    -- stack carries `[pre, stateVal, sats, codePart]` (BUG-100: no witness
+    -- signature).  The old serialization-readiness facts are gone — the
+    -- deployed script's acceptance is the preimage verdict via the opaque
+    -- OP_PUSH_TX shim.  Keyed on the DECIDABLE classifier, it is VACUOUS for
+    -- every non-fragment body, so the omnibus stays jointly satisfiable.
     (hStatefulFullFrag : (p.methods.filter (·.isPublic)).length < 2 →
       RunarVerification.Stack.AgreesStateful.statefulFullConsumeShapeBool
           p.properties anfM = true →
         ∃ (pre sats stateVal pn : String) (tyS tyV tyP : ANFType)
           (ctx : Stack.TxContext)
-          (sigV preimage cpV sv8 var2 sats8 : ByteArray) (svV satsV : Int)
+          (preimage cpV : ByteArray) (svV satsV : Int)
           (rest : List RunarVerification.ANF.Eval.Value),
           anfM.params = [ANFParam.mk sats tyS, ANFParam.mk stateVal tyV,
             ANFParam.mk pre tyP] ∧
@@ -10251,16 +10188,7 @@ theorem compileSafe_observational_correct_modulo_codegen_axioms_via_support
           initialAnf.resolveRef sats = some (.vBigint satsV) ∧
           initialAnf.resolveRef stateVal = some (.vBigint svV) ∧
           initialStack.stack = .vBytes preimage :: .vBigint svV
-            :: .vBigint satsV :: .vBytes sigV :: .vBytes cpV :: rest ∧
-          Stack.num2binEncode? svV 8 = some sv8 ∧ sv8.size = 8 ∧
-          cpV.size + 9 < 253 ∧
-          Stack.num2binEncode?
-            ((Stack.AgreesStateful.epiAcc cpV sv8).size : Int) 2 = some var2 ∧
-          1 ≤ var2.size ∧
-          Stack.num2binEncode? satsV 8 = some sats8 ∧
-          RunarVerification.ANF.Eval.Crypto.authBackend.checkSig sigV
-              Stack.AgreesStateful.stG
-            = RunarVerification.ANF.Eval.Crypto.checkPreimage preimage)
+            :: .vBigint satsV :: .vBytes cpV :: rest)
     -- **Dispatch consume premise (keyed).**  For a multi-public program in the
     -- canonical passthrough fragment (decided by `dispatchConsumeShapeBool`)
     -- the entry bundle is recovered: the unlocking caller pushed the selector

@@ -54,6 +54,14 @@ open RunarVerification.Stack
   let b3 : UInt8 := (n &&& 0xff).toUInt8
   #[b0, b1, b2, b3]
 
+/-- 32-bit value as 4 little-endian bytes (TS `u32ToLE n`). -/
+@[inline] def u32ToLEBytes (n : UInt32) : Array UInt8 :=
+  let b0 : UInt8 := (n &&& 0xff).toUInt8
+  let b1 : UInt8 := ((n >>> 8) &&& 0xff).toUInt8
+  let b2 : UInt8 := ((n >>> 16) &&& 0xff).toUInt8
+  let b3 : UInt8 := ((n >>> 24) &&& 0xff).toUInt8
+  #[b0, b1, b2, b3]
+
 /-- Emit `pick(d)` per TS Emitter: 0 → dup, 1 → over, else `pickStruct d`.
 The TS reference emits a single `pick` opcode (no preceding push at the
 StackOp layer); the depth becomes a byte-level push inside `Emit`. We
@@ -384,25 +392,21 @@ def b3XorPairsAux : Nat → Nat → List StackOp
 
 def b3XorPairs : List StackOp := b3XorPairsAux 0 8
 
-/-- Pack `h0..h7` (main stack, h7 = TOS) into a 32-byte BE result.
-TS:
+/-- Pack `h0..h7` (main stack, h7 = TOS) into a 32-byte little-endian
+digest `h0_LE || h1_LE || ... || h7_LE` (BUG-101: standard BLAKE3 output
+is little-endian, and a 4-byte Bitcoin Script byte-string IS a LE word,
+so there is no per-word reversal — just concatenate the top two words 7
+times). TS `generateCompressOps` output stage:
 ```
-em.reverseBytes4();           // h7 → h7_BE
-for (i = 1..7) {
-  em.swap();
-  em.reverseBytes4();
-  em.swap();
-  em.binOp('OP_CAT');
-}
+for (i = 1..7) { em.binOp('OP_CAT'); }   // h[7-i] || accumulated
 ```
 -/
 def b3PackOutputAux : Nat → List StackOp
   | 0     => []
-  | n + 1 => [.swap] ++ b3ReverseBytes4 ++ [.swap, b3Opc "OP_CAT"]
-             ++ b3PackOutputAux n
+  | n + 1 => [b3Opc "OP_CAT"] ++ b3PackOutputAux n
 
 def b3PackOutput : List StackOp :=
-  b3ReverseBytes4 ++ b3PackOutputAux 7
+  b3PackOutputAux 7
 
 /-- Drop 16 message words from below the result. 16 × (swap; drop). -/
 def b3DropMessageWords : Nat → List StackOp
@@ -418,16 +422,23 @@ def b3IVPushes : List StackOp :=
   , b3PushU32LE b3IV[2]!
   , b3PushU32LE b3IV[3]! ]
 
-/-- Generate the full compression op list. Stack on entry:
-`[..., chainingValue(32 BE), block(64 BE)]`. Stack on exit:
-`[..., hash(32 BE)]`. Net depth: -1. -/
-def b3CompressOps : List StackOp :=
+/-- Generate the full compression op list (BUG-101: standard little-endian
+BLAKE3, single-block). Stack on entry: `[..., chainingValue(32 LE),
+block(64 LE)]`. Stack on exit: `[..., hash(32 LE)]`. Net depth: -1.
+
+`blockLenFromAlt`: when `true`, `v[14]` (block_len) is popped from the alt
+stack (the real message length supplied by `b3HashOps`); when `false` it is
+the constant 64 (a full-block `blake3Compress`). Mirrors TS
+`generateCompressOps(7, blockLenFromAlt)` (`blake3-codegen.ts:273`). The raw
+4-byte chunks are already little-endian words, so there is NO per-word
+`beWordsToLE` conversion. -/
+def b3CompressOpsGen (blockLenFromAlt : Bool) : List StackOp :=
   -- ============================================================
   -- Phase 1: Unpack block into 16 LE message words
   -- ============================================================
-  -- Split block (64 BE) into 16 × 4-byte BE words, convert each to LE.
+  -- Split block (64 LE) into 16 × 4-byte little-endian words (raw chunks
+  -- are already LE words — no conversion).
   b3Split4N 15
-  ++ b3BeWordsToLE 16
   -- Stack: [CV, m0..m15]   m15=TOS
 
   -- ============================================================
@@ -438,10 +449,9 @@ def b3CompressOps : List StackOp :=
   ++ [b3Opc "OP_TOALTSTACK"]
   -- Stack: [m0..m15]   Alt: [CV]
 
-  -- Get CV back, split into 8 LE words.
+  -- Get CV back, split into 8 LE words (raw chunks are already LE words).
   ++ [b3Opc "OP_FROMALTSTACK"]
   ++ b3Split4N 7
-  ++ b3BeWordsToLE 8
   -- Stack: [m0..m15, cv0..cv7]   cv7=TOS
 
   -- v[8..11] = IV[0..3]
@@ -450,8 +460,8 @@ def b3CompressOps : List StackOp :=
   ++ [b3PushU32LE 0]
   -- v[13] = counter_high = 0
   ++ [b3PushU32LE 0]
-  -- v[14] = block_len = 64
-  ++ [b3PushU32LE 64]
+  -- v[14] = block_len — from alt (real message length) or the constant 64.
+  ++ (if blockLenFromAlt then [b3Opc "OP_FROMALTSTACK"] else [b3PushU32LE 64])
   -- v[15] = flags = 11
   ++ [b3PushU32LE b3FullFlags]
   -- Stack: [m0..m15, v0..v15]   v15=TOS
@@ -474,28 +484,45 @@ def b3CompressOps : List StackOp :=
   -- Main: [m0..m15, h0..h7]   h7=TOS
 
   -- ============================================================
-  -- Phase 6: Pack into 32-byte BE result and drop message words.
+  -- Phase 6: Pack into 32-byte LE digest and drop message words.
   -- ============================================================
   ++ b3PackOutput
   ++ b3DropMessageWords 16
 
+/-- Full-block compression (block_len = 64 constant). The `blake3Compress`
+builtin path; also pinned by `runOps_b3CompressOps_eq`. -/
+def b3CompressOps : List StackOp := b3CompressOpsGen false
+
+/-- Compression with block_len taken from the alt stack (the `b3HashOps`
+path, which pushes the real message length there). -/
+def b3CompressOpsHash : List StackOp := b3CompressOpsGen true
+
 /-! ## Single-block hash entry point -/
 
-/-- 32-byte BE BLAKE3 IV (concatenation of `u32ToBE(IV[0..7])`). -/
+/-- 32-byte little-endian BLAKE3 IV (concatenation of `u32ToLE(IV[0..7])`).
+BUG-101: standard BLAKE3 loads the chaining value as little-endian words. -/
 def b3IVBytes32 : ByteArray :=
   let bs : Array UInt8 :=
-    (u32ToBEBytes b3IV[0]!) ++ (u32ToBEBytes b3IV[1]!)
-    ++ (u32ToBEBytes b3IV[2]!) ++ (u32ToBEBytes b3IV[3]!)
-    ++ (u32ToBEBytes b3IV[4]!) ++ (u32ToBEBytes b3IV[5]!)
-    ++ (u32ToBEBytes b3IV[6]!) ++ (u32ToBEBytes b3IV[7]!)
+    (u32ToLEBytes b3IV[0]!) ++ (u32ToLEBytes b3IV[1]!)
+    ++ (u32ToLEBytes b3IV[2]!) ++ (u32ToLEBytes b3IV[3]!)
+    ++ (u32ToLEBytes b3IV[4]!) ++ (u32ToLEBytes b3IV[5]!)
+    ++ (u32ToLEBytes b3IV[6]!) ++ (u32ToLEBytes b3IV[7]!)
   ByteArray.mk bs
 
-/-- Generate the full single-block hash op list. Stack on entry:
+/-- Generate the full single-block hash op list (BUG-101: standard BLAKE3,
+little-endian, real message length as `block_len`). Stack on entry:
 `[..., message]` where message has length ≤ 64. Stack on exit:
-`[..., hash(32 BE)]`. Net depth: 0. Mirrors TS `emitBlake3Hash`. -/
+`[..., hash(32 LE)]`. Net depth: 0. Mirrors TS `emitBlake3Hash`
+(`blake3-codegen.ts:439`). -/
 def b3HashOps : List StackOp :=
-  -- Pad message to 64 bytes by appending `64 - len` zero bytes.
+  -- Capture block_len = message length as a 4-byte little-endian value on
+  -- the alt stack (consumed as v[14] inside the compression).
   [ b3Opc "OP_SIZE"             -- [message, len]
+  , b3Opc "OP_DUP"              -- [message, len, len]
+  , b3PushI 4
+  , b3Opc "OP_NUM2BIN"          -- [message, len, blockLenLE(4)]
+  , b3Opc "OP_TOALTSTACK"       -- [message, len]   Alt: [blockLenLE]
+  -- Pad message to 64 bytes by appending `64 - len` zero bytes.
   , b3PushI 64
   , .swap
   , b3Opc "OP_SUB"              -- [message, 64-len]
@@ -503,11 +530,11 @@ def b3HashOps : List StackOp :=
   , .swap
   , b3Opc "OP_NUM2BIN"          -- [message, zeros]
   , b3Opc "OP_CAT"              -- [paddedMessage(64)]
-  -- Push IV as 32-byte BE chaining value, swap to put paddedMessage on top.
+  -- Push IV as 32-byte LE chaining value, swap to put paddedMessage on top.
   , .push (.bytes b3IVBytes32)
   , .swap ]
-  -- Splice compression ops.
-  ++ b3CompressOps
+  -- Splice compression ops (block_len taken from the alt stack).
+  ++ b3CompressOpsHash
 
 /-! ## Codegen-to-spec equivalence (Phase B3)
 

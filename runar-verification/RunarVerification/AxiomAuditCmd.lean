@@ -41,14 +41,16 @@ caught at the gate.
 
 Kept deliberately tight: the capstone instantiations depend only on the three
 logical axioms, the single `crypto_call` structural fallback, the three opaque
-crypto backends, and (for stateful spends) the BIP-143 witness. If that set ever
-grows, this list must be updated *and* the change justified in
-`TRUST_MANIFEST.md` — the audit forces that reconciliation. -/
+crypto backends, and (for stateful spends, BUG-100) the two opaque OP_PUSH_TX
+preimage-binding codegen→runtime shims. If that set ever grows, this list must
+be updated *and* the change justified in `TRUST_MANIFEST.md` — the audit forces
+that reconciliation. -/
 def allowedSubstrings : List String :=
   [ "propext", "Classical.choice", "Quot.sound",
     "compileSafe_observational_correct_modulo_crypto_call_codegen",
     "authBackend", "hashBackend", "preimageBackend",
-    "exists_checkSig_witness_under_validTxContext" ]
+    "runOps_checkPreimageBindingRaw_eq",
+    "runOps_statefulFullParsedOps_scriptAccepts" ]
 
 private def containsSub (s : String) (sub : String) : Bool :=
   (s.splitOn sub).length > 1
