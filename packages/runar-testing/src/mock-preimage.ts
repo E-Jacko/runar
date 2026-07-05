@@ -18,6 +18,7 @@ import {
   Hash,
   BigNumber,
 } from '@bsv/sdk';
+import { encodeArg } from 'runar-sdk';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -259,23 +260,16 @@ function encodeVarint(n: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Constructor arg encoding
-// ---------------------------------------------------------------------------
-
-function encodeConstructorArg(value: bigint | boolean | string): string {
-  if (typeof value === 'bigint') return encodeNum2Bin(value, 8);
-  if (typeof value === 'boolean') return value ? '01' : '00';
-  // Hex string for ByteString/PubKey/etc.
-  return String(value);
-}
-
-// ---------------------------------------------------------------------------
 // Code part building
 // ---------------------------------------------------------------------------
 
 /**
  * Build the code part of the locking script by substituting constructor args
  * into the artifact's script at the specified byte offsets.
+ *
+ * Args are encoded with the SDK's `encodeArg` (minimal script-number /
+ * push-data encodings) so the code part — and anything hashed from it — is
+ * byte-identical to the script `RunarContract` deploys.
  */
 function buildCodePart(
   artifact: RunarArtifact,
@@ -292,7 +286,7 @@ function buildCodePart(
       if (!paramName) continue;
       const value = constructorArgs[paramName];
       if (value === undefined) continue;
-      const encoded = encodeConstructorArg(value);
+      const encoded = encodeArg(value);
       const hexOffset = slot.byteOffset * 2;
       // Replace the OP_0 placeholder (2 hex chars) with the encoded value
       script = script.slice(0, hexOffset) + encoded + script.slice(hexOffset + 2);
