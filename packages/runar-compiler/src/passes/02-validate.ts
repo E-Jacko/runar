@@ -291,6 +291,16 @@ function isSuperCall(stmt: Statement): boolean {
 // ---------------------------------------------------------------------------
 
 function validateMethods(ctx: ValidationContext): void {
+  // A contract with no public methods has no spending entry points and
+  // compiles to an empty script — never what the author meant (usually a
+  // missing `public` modifier; methods default to private).
+  if (!ctx.contract.methods.some((m) => m.visibility === 'public')) {
+    ctx.errors.push(makeDiagnostic(
+      `Contract '${ctx.contract.name}' has no public methods — no spending entry points; add 'public' to at least one method`,
+      'error',
+    ));
+  }
+
   for (const method of ctx.contract.methods) {
     validateMethod(method, ctx);
   }
