@@ -379,8 +379,8 @@ export class RunarContract {
       );
     }
     const walletProvider = this._provider as WalletProvider;
-    const wallet = (walletProvider as any).wallet;
-    const basket = (walletProvider as any).basket;
+    const wallet = walletProvider.walletClient;
+    const basket = walletProvider.basketName;
 
     const lockingScript = this.getLockingScript();
     const satoshis = options.satoshis ?? 1;
