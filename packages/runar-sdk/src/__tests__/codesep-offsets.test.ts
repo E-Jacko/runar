@@ -37,4 +37,20 @@ describe('findCodesepOffsets (issue #42)', () => {
   it('returns empty for a script with no OP_CODESEPARATOR', () => {
     expect(findCodesepOffsets('76a91400000000000000000000000000000000000000000088ac')).toEqual([]);
   });
+
+  it('handles OP_PUSHDATA4, skipping 0xab inside push-data', () => {
+    // 4e (OP_PUSHDATA4) 02000000 (len=2 LE) abab (data) ab (real codesep, byte 7)
+    expect(findCodesepOffsets('4e02000000ababab')).toEqual([7]);
+  });
+
+  it('terminates when an OP_PUSHDATA4 length has the high bit set (issue #117)', () => {
+    // 4e 00000080 — declared length 0x80000000. Signed 32-bit math makes the
+    // push length negative, walking the cursor backwards forever.
+    expect(findCodesepOffsets('4e00000080abab')).toEqual([]);
+  });
+
+  it('terminates when an OP_PUSHDATA4 length runs past the script end', () => {
+    // 4e ffffff7f — declared length 0x7fffffff, far larger than the script.
+    expect(findCodesepOffsets('4effffff7fab')).toEqual([]);
+  });
 });
