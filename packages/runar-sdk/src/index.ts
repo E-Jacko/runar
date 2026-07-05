@@ -23,7 +23,7 @@ export { LocalSigner, MockSigner, ExternalSigner, WalletSigner } from './signers
 export type { Signer, SignCallback, WalletSignerOptions } from './signers/index.js';
 
 // Contract
-export { RunarContract } from './contract.js';
+export { RunarContract, encodeArg } from './contract.js';
 
 // Typed SDK errors
 export { ScriptSizeExceededError, assertScriptHexUnderLimit } from './errors.js';

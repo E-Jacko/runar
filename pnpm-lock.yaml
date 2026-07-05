@@ -181,6 +181,9 @@ importers:
       runar-lang:
         specifier: workspace:*
         version: link:../runar-lang
+      runar-sdk:
+        specifier: workspace:*
+        version: link:../runar-sdk
     devDependencies:
       fast-check:
         specifier: ^3.22.0

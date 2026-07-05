@@ -2020,8 +2020,11 @@ function buildNamedArgs(
 
 /**
  * Encode an argument value as a Bitcoin Script push data element.
+ *
+ * Exported so downstream tooling (e.g. runar-testing's mock-preimage
+ * builders) shares this exact encoding instead of maintaining a copy.
  */
-function encodeArg(value: unknown): string {
+export function encodeArg(value: unknown): string {
   if (typeof value === 'bigint') {
     return encodeScriptNumber(value);
   }
