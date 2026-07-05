@@ -610,6 +610,28 @@ function validateForStatement(
         stmt.sourceLocation,
       ));
     }
+
+    // The ANF loop node carries only an iteration count, so lowering always
+    // iterates i = 0..count-1. Reject the loop shapes that representation
+    // cannot express — a non-zero start or a countdown would otherwise be
+    // silently compiled as a zero-start counting-up loop while the
+    // interpreter runs the true source semantics.
+    if (stmt.condition.op === '>' || stmt.condition.op === '>=') {
+      ctx.errors.push(makeDiagnostic(
+        `For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead`,
+        'error',
+        stmt.sourceLocation,
+      ));
+    }
+  }
+
+  const startVal = extractLiteralBigInt(stmt.init.init);
+  if (startVal !== null && startVal !== 0n) {
+    ctx.errors.push(makeDiagnostic(
+      `For loop iterator must start at 0 (got ${startVal}n) — loops compile to i = 0..count-1; offset the iterator inside the body instead`,
+      'error',
+      stmt.sourceLocation,
+    ));
   }
 
   // Validate init
@@ -619,6 +641,15 @@ function validateForStatement(
   for (const s of stmt.body) {
     validateStatement(s, ctx);
   }
+}
+
+function extractLiteralBigInt(expr: Expression): bigint | null {
+  if (expr.kind === 'bigint_literal') return expr.value;
+  if (expr.kind === 'unary_expr' && expr.op === '-') {
+    const inner = extractLiteralBigInt(expr.operand);
+    return inner !== null ? -inner : null;
+  }
+  return null;
 }
 
 function isCompileTimeConstant(expr: Expression): boolean {

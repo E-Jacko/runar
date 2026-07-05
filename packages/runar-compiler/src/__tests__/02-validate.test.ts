@@ -284,6 +284,76 @@ describe('Pass 2: Validate', () => {
       // Identifier is treated as potentially const, so should pass
       expect(hasError(result, "compile-time constant")).toBe(false);
     });
+
+    it('reports error for for-loop with a non-zero start value', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+
+          constructor(x: bigint) {
+            super(x);
+            this.x = x;
+          }
+
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 1n; i <= 3n; i++) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, 'must start at 0')).toBe(true);
+    });
+
+    it('reports error for a countdown for-loop', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+
+          constructor(x: bigint) {
+            super(x);
+            this.x = x;
+          }
+
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 3n; i > 0n; i--) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, 'countdown')).toBe(true);
+    });
+
+    it('accepts a zero-start counting-up for-loop', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+
+          constructor(x: bigint) {
+            super(x);
+            this.x = x;
+          }
+
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 0n; i <= 3n; i++) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, 'must start at 0')).toBe(false);
+      expect(hasError(result, 'countdown')).toBe(false);
+    });
   });
 
   // ---------------------------------------------------------------------------
