@@ -73,7 +73,12 @@ export function findCodesepOffsets(scriptHex: string): number[] {
       const b1 = b(off + 4);
       const b2 = b(off + 6);
       const b3 = b(off + 8);
-      const pushLen = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+      // >>> 0 forces uint32: with b3 >= 0x80 the signed OR result is negative,
+      // which would walk the cursor backwards and never terminate the scan.
+      const pushLen = (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) >>> 0;
+      // A declared push length past the script end means a malformed script;
+      // stop scanning rather than skipping into nothing.
+      if (pushLen > (n - off - 10) / 2) break;
       off += 10 + pushLen * 2;
     } else {
       off += 2;
