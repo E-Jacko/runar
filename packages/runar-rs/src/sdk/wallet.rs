@@ -10,7 +10,7 @@ use bsv::transaction::Transaction as BsvTransaction;
 use sha2::{Sha256, Digest};
 use ripemd::Ripemd160;
 use serde_json::Value;
-use super::types::{TransactionData, Utxo};
+use super::types::{TransactionData, TxInput, TxOutput, Utxo};
 use super::provider::Provider;
 use super::signer::Signer;
 use super::script_utils::build_p2pkh_script;
@@ -301,6 +301,7 @@ impl<W: WalletClient> Provider for WalletProvider<W> {
             .set("Content-Type", "application/octet-stream")
             .send_bytes(&raw_bytes)
         {
+            // 2xx: ARC accepted the transaction.
             Ok(resp) => {
                 let body = resp.into_string().unwrap_or_default();
                 if let Ok(json) = serde_json::from_str::<Value>(&body) {
@@ -312,23 +313,72 @@ impl<W: WalletClient> Provider for WalletProvider<W> {
                 self.tx_cache.insert(txid.clone(), raw_hex);
                 Ok(txid)
             }
-            Err(_) => {
-                // ARC unreachable — cache locally and return computed txid
-                self.tx_cache.insert(txid.clone(), raw_hex);
-                Ok(txid)
+            // Non-2xx (e.g. HTTP 461 — "Script evaluated ... false/empty top
+            // stack element", the canonical NULLFAIL / preimage-mismatch
+            // rejection). ureq surfaces this as Error::Status. Do NOT swallow
+            // it as a success — the tx is NOT on chain.
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                Err(format!(
+                    "WalletProvider broadcast: ARC HTTP {} from {}: {}",
+                    code, arc_endpoint, body
+                ))
             }
+            // Transport failure (connection refused, DNS, TLS handshake). The
+            // broadcast was never attempted/completed — surface it rather than
+            // returning a synthetic txid the caller would treat as broadcast.
+            Err(e) => Err(format!(
+                "WalletProvider broadcast: ARC network error against {}: {}",
+                arc_endpoint, e
+            )),
         }
     }
 
     fn get_transaction(&self, txid: &str) -> Result<TransactionData, String> {
         // Check local cache first
         if let Some(raw) = self.tx_cache.get(txid) {
+            // Best-effort: parse the cached bytes to populate inputs/outputs so
+            // callers (e.g. RunarContract::from_txid indexing tx.outputs[i]) can
+            // find the contract UTXO. Unparseable cache (placeholder/partial hex)
+            // is NOT fatal — fall back to the raw hex with empty inputs/outputs,
+            // preserving the historical cache-hit shape.
+            let (version, inputs, outputs, locktime) = match hex_to_bytes(raw)
+                .and_then(|bytes| parse_raw_tx(&bytes))
+            {
+                Ok(parsed) => {
+                    let inputs = parsed
+                        .inputs
+                        .iter()
+                        .map(|i| {
+                            // Display order = reverse of wire (little-endian) bytes.
+                            let mut disp = i.prev_txid_bytes;
+                            disp.reverse();
+                            TxInput {
+                                txid: bytes_to_hex(&disp),
+                                output_index: i.prev_output_index,
+                                script: bytes_to_hex(&i.script),
+                                sequence: i.sequence,
+                            }
+                        })
+                        .collect();
+                    let outputs = parsed
+                        .outputs
+                        .iter()
+                        .map(|o| TxOutput {
+                            satoshis: o.satoshis as i64,
+                            script: bytes_to_hex(&o.script),
+                        })
+                        .collect();
+                    (parsed.version, inputs, outputs, parsed.locktime)
+                }
+                Err(_) => (1, vec![], vec![], 0),
+            };
             return Ok(TransactionData {
                 txid: txid.to_string(),
-                version: 1,
-                inputs: vec![],
-                outputs: vec![],
-                locktime: 0,
+                version,
+                inputs,
+                outputs,
+                locktime,
                 raw: Some(raw.clone()),
             });
         }
@@ -607,6 +657,7 @@ fn bip143_sighash(
 struct ParsedInput {
     prev_txid_bytes: [u8; 32],
     prev_output_index: u32,
+    script: Vec<u8>,
     sequence: u32,
 }
 
@@ -677,11 +728,12 @@ fn parse_raw_tx(bytes: &[u8]) -> Result<ParsedTx, String> {
         prev_txid_bytes.copy_from_slice(txid_slice);
         let prev_output_index = read_u32_le(&mut offset)?;
         let script_len = read_var_int(&mut offset)?;
-        let _ = read(&mut offset, script_len as usize)?;
+        let script = read(&mut offset, script_len as usize)?.to_vec();
         let sequence = read_u32_le(&mut offset)?;
         inputs.push(ParsedInput {
             prev_txid_bytes,
             prev_output_index,
+            script,
             sequence,
         });
     }
@@ -1246,5 +1298,180 @@ mod tests {
         let tx = provider.get_transaction(&txid).unwrap();
         assert_eq!(tx.txid, txid);
         assert!(tx.raw.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // #104 — WalletProvider broadcast/get_transaction fixes
+    // -----------------------------------------------------------------------
+
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    /// A minimal, self-consistent raw tx: 1 input, 1 output (value 1000 sats),
+    /// scriptSig = 0x51, scriptPubKey = 0x51.
+    fn minimal_raw_tx_hex() -> String {
+        [
+            "01000000",              // version = 1
+            "01",                    // vin count
+            &"11".repeat(32),        // prevout txid (wire order)
+            "00000000",              // prevout index = 0
+            "0151",                  // scriptSig len=1, byte 0x51
+            "ffffffff",              // sequence
+            "01",                    // vout count
+            "e803000000000000",      // value = 1000
+            "0151",                  // scriptPubKey len=1, byte 0x51
+            "00000000",              // locktime
+        ]
+        .concat()
+    }
+
+    fn provider_with_arc(arc_url: String) -> WalletProvider<MockWalletClient> {
+        WalletProvider::new(
+            MockWalletClient::new(),
+            (2, "test".to_string()),
+            "1".to_string(),
+            "b".to_string(),
+            None,
+            Some(arc_url),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// One-shot mock ARC server: replies once with `status_line` (e.g.
+    /// "461 Preimage Mismatch") and `body`, then closes. Returns its base URL.
+    ///
+    /// The mock fully drains the client's request (headers + the Content-Length
+    /// body) BEFORE responding. ureq writes the whole request before reading the
+    /// response, so consuming it first guarantees the client has finished
+    /// writing — without this, closing the socket mid-write races the client and
+    /// makes the test flaky (partial-read / connection-reset).
+    fn spawn_mock_arc(status_line: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read until we have the full headers and Content-Length body.
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 1024];
+                let mut header_end: Option<usize> = None;
+                let mut content_length: usize = 0;
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if header_end.is_none() {
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_end = Some(pos + 4);
+                                    let headers = String::from_utf8_lossy(&buf[..pos]);
+                                    for line in headers.lines() {
+                                        let lower = line.to_ascii_lowercase();
+                                        if let Some(v) = lower.strip_prefix("content-length:") {
+                                            content_length = v.trim().parse().unwrap_or(0);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(he) = header_end {
+                                if buf.len() >= he + content_length {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// Bind an ephemeral port then drop the listener so any connect is refused
+    /// — a deterministic, offline "ARC unreachable" URL.
+    fn dead_arc_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{}", addr)
+    }
+
+    #[test]
+    fn r1_broadcast_returns_err_on_network_failure() {
+        let mut provider = provider_with_arc(dead_arc_url());
+        let tx = BsvTransaction::from_hex(&minimal_raw_tx_hex()).unwrap();
+        let result = provider.broadcast(&tx);
+        assert!(
+            result.is_err(),
+            "R1: broadcast must return Err on connection refused, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn r1_broadcast_returns_err_on_http_non2xx() {
+        let mut provider = provider_with_arc(spawn_mock_arc("461 Preimage Mismatch", "{}"));
+        let tx = BsvTransaction::from_hex(&minimal_raw_tx_hex()).unwrap();
+        let result = provider.broadcast(&tx);
+        assert!(
+            result.is_err(),
+            "R1: broadcast must return Err on ARC HTTP 461, got {:?}",
+            result
+        );
+        let msg = result.unwrap_err();
+        assert!(msg.contains("461"), "R1: Err should surface the HTTP status, got: {}", msg);
+    }
+
+    #[test]
+    fn r1_broadcast_returns_arc_txid_on_2xx() {
+        // Locks the happy path: a 2xx with a txid body still returns Ok(txid).
+        let arc_txid = "aa".repeat(32);
+        // body is 'static: use a leaked string so the closure can capture it.
+        let body: &'static str = Box::leak(format!("{{\"txid\":\"{}\"}}", arc_txid).into_boxed_str());
+        let mut provider = provider_with_arc(spawn_mock_arc("200 OK", body));
+        let tx = BsvTransaction::from_hex(&minimal_raw_tx_hex()).unwrap();
+        let result = provider.broadcast(&tx);
+        assert_eq!(result.unwrap(), arc_txid, "R1: 2xx with txid body must return that txid");
+    }
+
+    #[test]
+    fn r2_get_transaction_populates_inputs_and_outputs_from_cache() {
+        let mut provider = provider_with_arc(dead_arc_url());
+        let raw = minimal_raw_tx_hex();
+        let txid = "ab".repeat(32);
+        provider.cache_tx(&txid, &raw);
+
+        let tx = provider.get_transaction(&txid).unwrap();
+        assert_eq!(tx.raw.as_deref(), Some(raw.as_str()), "raw must still be returned");
+        assert_eq!(tx.inputs.len(), 1, "R2: get_transaction must populate inputs from cached bytes");
+        assert_eq!(tx.outputs.len(), 1, "R2: get_transaction must populate outputs from cached bytes");
+        assert_eq!(tx.outputs[0].satoshis, 1000);
+        assert_eq!(tx.outputs[0].script, "51");
+        assert_eq!(tx.inputs[0].output_index, 0);
+        assert_eq!(tx.inputs[0].sequence, 0xffff_ffff);
+        assert_eq!(tx.inputs[0].script, "51");
+    }
+
+    #[test]
+    fn r2_get_transaction_unparseable_cache_still_returns_raw() {
+        // Best-effort: garbage cached hex is not fatal — raw preserved,
+        // inputs/outputs empty (same shape the pre-existing from_cache test needs).
+        let mut provider = provider_with_arc(dead_arc_url());
+        let txid = "cd".repeat(32);
+        provider.cache_tx(&txid, "01000000deadbeef");
+        let tx = provider.get_transaction(&txid).unwrap();
+        assert_eq!(tx.raw.as_deref(), Some("01000000deadbeef"));
+        assert!(tx.inputs.is_empty());
+        assert!(tx.outputs.is_empty());
     }
 }
