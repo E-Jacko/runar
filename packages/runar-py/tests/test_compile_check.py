@@ -26,7 +26,7 @@ def test_compile_check_rejects_non_class():
 def test_compile_check_rejects_unknown_builtin():
     """A contract that calls an unknown builtin fails typecheck."""
     source = """\
-from runar import SmartContract, assert_
+from runar import SmartContract, assert_, public
 
 class Bad(SmartContract):
     pub_key_hash: bytes
@@ -35,6 +35,7 @@ class Bad(SmartContract):
         super().__init__(pub_key_hash)
         self.pub_key_hash = pub_key_hash
 
+    @public
     def unlock(self, sig: bytes, pub: bytes) -> None:
         _ = totally_not_a_builtin(sig)
         assert_(check_sig(sig, pub))
@@ -56,7 +57,7 @@ def test_compile_check_accepts_kb_and_bn254_after_typecheck_fix():
     would reject this source with 'unknown function'.
     """
     source = """\
-from runar import SmartContract, assert_
+from runar import SmartContract, assert_, public
 
 class KbBn(SmartContract):
     hash: int
@@ -65,6 +66,7 @@ class KbBn(SmartContract):
         super().__init__(hash)
         self.hash = hash
 
+    @public
     def unlock(self, a: int, b: int) -> None:
         s = kb_field_add(a, b)
         p = bn254_field_mul(a, b)
