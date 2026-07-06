@@ -206,4 +206,89 @@ class TestAnfLower < Minitest::Test
     refute_empty if_binding.value.then, "ternary `then` branch should not be empty"
     refute_empty if_binding.value.else_, "ternary `else` branch should not be empty"
   end
+
+  # ---------------------------------------------------------------------------
+  # #127 -- unsupported loop shapes rejected during ANF lowering, for callers
+  # that skip validation (the extractLoopCount reject path).
+  # ---------------------------------------------------------------------------
+
+  # Parse + lower WITHOUT running validation, so the extractLoopCount guards
+  # are exercised directly.
+  def lower_without_validate(source, file_name = "T.runar.ts")
+    parse_result = RunarCompiler.send(:_parse_source, source, file_name)
+    assert_empty parse_result.errors.map(&:format_message), "unexpected parse errors"
+    refute_nil parse_result.contract
+    RunarCompiler::Frontend.lower_to_anf(parse_result.contract)
+  end
+
+  NON_ZERO_START_LOOP = <<~TS
+    import { SmartContract, assert } from 'runar-lang';
+
+    class C extends SmartContract {
+      readonly x: bigint;
+      constructor(x: bigint) { super(x); this.x = x; }
+      public m(): void {
+        let sum: bigint = 0n;
+        for (let i: bigint = 1n; i <= 3n; i++) {
+          sum = sum + i;
+        }
+        assert(sum > 0n);
+      }
+    }
+  TS
+
+  COUNTDOWN_LOOP = <<~TS
+    import { SmartContract, assert } from 'runar-lang';
+
+    class C extends SmartContract {
+      readonly x: bigint;
+      constructor(x: bigint) { super(x); this.x = x; }
+      public m(): void {
+        let sum: bigint = 0n;
+        for (let i: bigint = 3n; i > 0n; i--) {
+          sum = sum + i;
+        }
+        assert(sum > 0n);
+      }
+    }
+  TS
+
+  ZERO_START_LOOP = <<~TS
+    import { SmartContract, assert } from 'runar-lang';
+
+    class C extends SmartContract {
+      readonly x: bigint;
+      constructor(x: bigint) { super(x); this.x = x; }
+      public m(): void {
+        let sum: bigint = 0n;
+        for (let i: bigint = 0n; i <= 3n; i++) {
+          sum = sum + i;
+        }
+        assert(sum > 0n);
+      }
+    }
+  TS
+
+  def test_anf_rejects_non_zero_start_loop
+    err = assert_raises(RuntimeError) do
+      lower_without_validate(NON_ZERO_START_LOOP, "C.runar.ts")
+    end
+    assert_includes err.message, "must start at 0"
+  end
+
+  def test_anf_rejects_countdown_loop
+    err = assert_raises(RuntimeError) do
+      lower_without_validate(COUNTDOWN_LOOP, "C.runar.ts")
+    end
+    assert_includes err.message.downcase, "countdown"
+  end
+
+  def test_anf_still_lowers_zero_start_counting_up_loop
+    prog = lower_without_validate(ZERO_START_LOOP, "C.runar.ts")
+    m = prog.methods.find { |method| method.name == "m" }
+    refute_nil m
+    loops = m.body.select { |b| b.value.kind == "loop" }
+    assert_equal 1, loops.length
+    assert_equal 4, loops[0].value.count
+  end
 end

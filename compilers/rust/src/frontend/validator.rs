@@ -5,6 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use num_traits::ToPrimitive;
+
 use super::ast::*;
 use super::diagnostic::Diagnostic;
 
@@ -216,6 +218,19 @@ fn is_super_call(stmt: &Statement) -> bool {
 // ---------------------------------------------------------------------------
 
 fn validate_methods(contract: &ContractNode, errors: &mut Vec<Diagnostic>, warnings: &mut Vec<Diagnostic>) {
+    // A contract with no public methods has no spending entry points and
+    // compiles to an empty script — never what the author meant (usually a
+    // missing `public` modifier; methods default to private).
+    if !contract.methods.iter().any(|m| m.visibility == Visibility::Public) {
+        errors.push(Diagnostic::error(
+            format!(
+                "Contract '{}' has no public methods — no spending entry points; add 'public' to at least one method",
+                contract.name
+            ),
+            None,
+        ));
+    }
+
     for method in &contract.methods {
         validate_method(method, contract, errors);
 
@@ -528,17 +543,44 @@ fn validate_statement(stmt: &Statement, errors: &mut Vec<Diagnostic>) {
             condition,
             init,
             body,
+            source_location,
             ..
         } => {
             validate_expression(condition, errors);
 
             // Check that the loop bound is a compile-time constant
-            if let Expression::BinaryExpr { right, .. } = condition {
+            if let Expression::BinaryExpr { op, right, .. } = condition {
                 if !is_compile_time_constant(right) {
                     errors.push(Diagnostic::error(
                         "For loop bound must be a compile-time constant (literal or const variable)",
                         None,
                     ));
+                }
+
+                // The ANF loop node carries only an iteration count, so lowering
+                // always iterates i = 0..count-1. Reject the loop shapes that
+                // representation cannot express — a non-zero start or a countdown
+                // would otherwise be silently compiled as a zero-start counting-up
+                // loop while the interpreter runs the true source semantics.
+                if *op == BinaryOp::Gt || *op == BinaryOp::Ge {
+                    errors.push(Diagnostic::error(
+                        "For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead",
+                        Some(source_location.clone()),
+                    ));
+                }
+            }
+
+            if let Statement::VariableDecl { init: init_expr, .. } = init.as_ref() {
+                if let Some(start_val) = extract_literal_bigint(init_expr) {
+                    if start_val != 0 {
+                        errors.push(Diagnostic::error(
+                            format!(
+                                "For loop iterator must start at 0 (got {}n) — loops compile to i = 0..count-1; offset the iterator inside the body instead",
+                                start_val
+                            ),
+                            Some(source_location.clone()),
+                        ));
+                    }
                 }
             }
 
@@ -560,6 +602,16 @@ fn validate_statement(stmt: &Statement, errors: &mut Vec<Diagnostic>) {
                 validate_expression(v, errors);
             }
         }
+    }
+}
+
+fn extract_literal_bigint(expr: &Expression) -> Option<i128> {
+    match expr {
+        Expression::BigIntLiteral { value } => value.to_i128(),
+        Expression::UnaryExpr { op, operand } if *op == UnaryOp::Neg => {
+            extract_literal_bigint(operand).map(|v| -v)
+        }
+        _ => None,
     }
 }
 
@@ -1207,6 +1259,211 @@ class Rec extends SmartContract {
                 .iter()
                 .any(|e| e.message.to_lowercase().contains("recursion") || e.message.to_lowercase().contains("recursive")),
             "expected error about recursion, got: {:?}",
+            result.errors
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #126: contract with no public methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_no_public_methods_produces_error() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class NoPub extends SmartContract {
+    readonly x: bigint;
+
+    constructor(x: bigint) {
+        super(x);
+        this.x = x;
+    }
+
+    private helper(v: bigint): bigint {
+        return v + this.x;
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("no public methods")),
+            "expected 'no public methods' error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_public_method_passes_no_public_methods_check() {
+        let source = r#"
+import { SmartContract, Addr, PubKey, Sig } from 'runar-lang';
+
+class P2PKH extends SmartContract {
+    readonly pubKeyHash: Addr;
+
+    constructor(pubKeyHash: Addr) {
+        super(pubKeyHash);
+        this.pubKeyHash = pubKeyHash;
+    }
+
+    public unlock(sig: Sig, pubKey: PubKey) {
+        assert(hash160(pubKey) === this.pubKeyHash);
+        assert(checkSig(sig, pubKey));
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("no public methods")),
+            "did not expect 'no public methods' error, got: {:?}",
+            result.errors
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #127: reject non-zero-start and countdown loops
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_countdown_loop_gt_produces_error() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Countdown extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 0n; i > 3n; i--) {
+            sum += i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("countdown loops are not supported")),
+            "expected countdown-loop error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_countdown_loop_ge_produces_error() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Countdown extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 0n; i >= 3n; i--) {
+            sum += i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("countdown loops are not supported")),
+            "expected countdown-loop error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_non_zero_start_loop_produces_error() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class NonZeroStart extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 1n; i < 3n; i++) {
+            sum += i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("must start at 0")),
+            "expected non-zero-start error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_zero_start_count_up_loop_passes() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class ZeroStart extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 0n; i < 3n; i++) {
+            sum += i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            !result.errors.iter().any(|e| {
+                e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")
+            }),
+            "zero-start counting-up loop should not trigger loop-shape errors, got: {:?}",
             result.errors
         );
     }

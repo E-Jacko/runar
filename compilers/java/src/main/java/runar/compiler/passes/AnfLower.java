@@ -1508,30 +1508,41 @@ public final class AnfLower {
     // ------------------------------------------------------------------
 
     private static int extractLoopCount(ForStatement stmt) {
+        // The ANF loop node carries only the count — no start value or step
+        // direction — so lowering (and the ANF interpreter) always iterates
+        // i = 0..count-1. Loop shapes that representation cannot express are
+        // rejected here (mirroring the source-located errors in Validate)
+        // rather than silently compiled as a zero-start counting-up loop.
+        //
+        // A countdown loop necessarily also has a non-zero start, so check the
+        // condition direction first — it is the more precise diagnosis.
+        if (stmt.condition() instanceof BinaryExpr be) {
+            String op = be.op().canonical();
+            if (op.equals(">") || op.equals(">=")) {
+                throw new IllegalStateException(
+                    "For loop condition must count up with '<' or '<=' — countdown loops are "
+                        + "not supported; iterate i = 0..N-1 and index backwards instead.");
+            }
+        }
+
         BigInteger startVal = null;
         if (stmt.init() != null) {
             startVal = extractBigintValue(stmt.init().init());
         }
 
+        if (startVal != null && startVal.signum() != 0) {
+            throw new IllegalStateException(
+                "For loop iterator must start at 0 (got " + startVal + "n) — loops compile "
+                    + "to i = 0..count-1; offset the iterator inside the body instead.");
+        }
+
         if (stmt.condition() instanceof BinaryExpr be) {
+            String op = be.op().canonical();
             BigInteger boundVal = extractBigintValue(be.right());
-            if (startVal != null && boundVal != null) {
-                BigInteger start = startVal;
-                BigInteger bound = boundVal;
-                String op = be.op().canonical();
-                return switch (op) {
-                    case "<" -> Math.max(0, bound.subtract(start).intValue());
-                    case "<=" -> Math.max(0, bound.subtract(start).add(BigInteger.ONE).intValue());
-                    case ">" -> Math.max(0, start.subtract(bound).intValue());
-                    case ">=" -> Math.max(0, start.subtract(bound).add(BigInteger.ONE).intValue());
-                    default -> 0;
-                };
-            }
             if (boundVal != null) {
-                String op = be.op().canonical();
                 return switch (op) {
-                    case "<" -> boundVal.intValue();
-                    case "<=" -> boundVal.add(BigInteger.ONE).intValue();
+                    case "<" -> Math.max(0, boundVal.intValue());
+                    case "<=" -> Math.max(0, boundVal.add(BigInteger.ONE).intValue());
                     default -> 0;
                 };
             }

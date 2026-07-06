@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.HashSet;
@@ -26,6 +27,7 @@ import runar.compiler.ir.anf.DeserializeState;
 import runar.compiler.ir.anf.LoadConst;
 import runar.compiler.ir.anf.LoadParam;
 import runar.compiler.ir.anf.LoadProp;
+import runar.compiler.ir.anf.Loop;
 import runar.compiler.ir.anf.UpdateProp;
 import runar.compiler.ir.ast.ContractNode;
 
@@ -363,6 +365,91 @@ class AnfLowerTest {
             }
         }
         assertTrue(assertCount >= 2, "expected at least 2 asserts, got " + assertCount);
+    }
+
+    // ---------------------------------------------------------------
+    // Unsupported loop shapes: non-zero start, countdown (issue #121)
+    //
+    // The ANF loop node carries only an iteration count, so extractLoopCount
+    // rejects shapes that representation cannot express — even for callers
+    // that skip the Validate pass.
+    // ---------------------------------------------------------------
+
+    private static Loop findLoop(List<AnfBinding> body) {
+        for (AnfBinding b : body) {
+            if (b.value() instanceof Loop l) return l;
+        }
+        throw new IllegalArgumentException("no loop binding found");
+    }
+
+    @Test
+    void throwsForNonZeroStartLoop() {
+        String src = """
+            public class C extends SmartContract {
+                @Readonly Bigint x;
+                public C(Bigint x) { super(x); this.x = x; }
+                @Public
+                public void m() {
+                    for (Bigint i = 1; i <= 3; i++) {
+                        assertThat(true);
+                    }
+                    assertThat(true);
+                }
+            }
+            """;
+        ContractNode contract = parse(src, "C.runar.java");
+        IllegalStateException e = assertThrows(
+            IllegalStateException.class,
+            () -> AnfLower.run(contract)
+        );
+        assertTrue(e.getMessage().contains("must start at 0"),
+            "expected non-zero-start error, got " + e.getMessage());
+    }
+
+    @Test
+    void throwsForCountdownLoop() {
+        String src = """
+            public class C extends SmartContract {
+                @Readonly Bigint x;
+                public C(Bigint x) { super(x); this.x = x; }
+                @Public
+                public void m() {
+                    for (Bigint i = 3; i > 0; i--) {
+                        assertThat(true);
+                    }
+                    assertThat(true);
+                }
+            }
+            """;
+        ContractNode contract = parse(src, "C.runar.java");
+        IllegalStateException e = assertThrows(
+            IllegalStateException.class,
+            () -> AnfLower.run(contract)
+        );
+        assertTrue(e.getMessage().toLowerCase().contains("countdown"),
+            "expected countdown error, got " + e.getMessage());
+    }
+
+    @Test
+    void lowersZeroStartCountingUpLoop() {
+        String src = """
+            public class C extends SmartContract {
+                @Readonly Bigint x;
+                public C(Bigint x) { super(x); this.x = x; }
+                @Public
+                public void m() {
+                    for (Bigint i = 0; i <= 3; i++) {
+                        assertThat(true);
+                    }
+                    assertThat(true);
+                }
+            }
+            """;
+        ContractNode contract = parse(src, "C.runar.java");
+        AnfProgram prog = AnfLower.run(contract);
+        AnfMethod m = findMethod(prog, "m");
+        Loop loop = findLoop(m.body());
+        assertEquals(4, loop.count());
     }
 
     // ---------------------------------------------------------------

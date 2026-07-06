@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"math/big"
 	"strings"
 	"testing"
 )
@@ -1877,5 +1878,74 @@ class TernaryDemo extends SmartContract {
 			kinds = append(kinds, b.Value.Kind)
 		}
 		t.Errorf("expected ternary to lower to `if` ANF node; got kinds: %v", kinds)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #127: extractLoopCount rejects non-zero-start and countdown loops (the
+// reject path for callers that lower without validating). Zero-start
+// counting-up loops still lower to a plain iteration count.
+// ---------------------------------------------------------------------------
+
+func recoverMessage(r interface{}) string {
+	if s, ok := r.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func TestExtractLoopCount_NonZeroStart_Panics(t *testing.T) {
+	// for (let i = 1n; i <= 3n; i++)
+	stmt := ForStmt{
+		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(1)}},
+		Condition: BinaryExpr{Op: "<=", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(3)}},
+	}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for non-zero-start loop")
+		}
+		if !strings.Contains(recoverMessage(r), "must start at 0") {
+			t.Errorf("expected 'must start at 0' panic, got: %v", r)
+		}
+	}()
+	extractLoopCount(stmt)
+}
+
+func TestExtractLoopCount_Countdown_Panics(t *testing.T) {
+	// for (let i = 3n; i > 0n; i--)
+	stmt := ForStmt{
+		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(3)}},
+		Condition: BinaryExpr{Op: ">", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(0)}},
+	}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for countdown loop")
+		}
+		if !strings.Contains(recoverMessage(r), "countdown") {
+			t.Errorf("expected 'countdown' panic, got: %v", r)
+		}
+	}()
+	extractLoopCount(stmt)
+}
+
+func TestExtractLoopCount_ZeroStartCountingUp(t *testing.T) {
+	// for (let i = 0n; i <= 3n; i++) → 4 iterations
+	stmt := ForStmt{
+		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(0)}},
+		Condition: BinaryExpr{Op: "<=", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(3)}},
+	}
+	if got := extractLoopCount(stmt); got != 4 {
+		t.Errorf("expected loop count 4, got %d", got)
+	}
+
+	// for (let i = 0n; i < 10n; i++) → 10 iterations
+	stmt2 := ForStmt{
+		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(0)}},
+		Condition: BinaryExpr{Op: "<", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(10)}},
+	}
+	if got := extractLoopCount(stmt2); got != 10 {
+		t.Errorf("expected loop count 10, got %d", got)
 	}
 }

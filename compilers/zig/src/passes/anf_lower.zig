@@ -945,6 +945,17 @@ fn lowerIfStatementWithElse(ctx: *LowerCtx, condition: Expression, then_body: []
 }
 
 fn lowerForStatement(ctx: *LowerCtx, for_s: types.ForStmt) LowerError!void {
+    // The ANF loop node carries only the count — no start value or step
+    // direction — so lowering (and the ANF interpreter) always iterates
+    // i = 0..count-1. Reject the loop shapes that representation cannot
+    // express (mirroring the source-located errors in Pass 2 validate) rather
+    // than silently compiling them as a zero-start counting-up loop for
+    // callers that skip validation. A countdown necessarily also has a
+    // non-zero start, so check the direction first — it is the more precise
+    // diagnosis.
+    if (for_s.descending) return error.UnsupportedStatement;
+    if (for_s.init_value != 0) return error.UnsupportedStatement;
+
     const count: u32 = blk: {
         const diff = for_s.bound - for_s.init_value;
         if (diff < 0) break :blk 0;
@@ -3100,4 +3111,72 @@ test "lower properties with initial values" {
     try std.testing.expectEqualStrings("owner", result[1].name);
     try std.testing.expect(result[1].readonly);
     try std.testing.expect(result[1].initial_value == null);
+}
+
+// -- #127: extractLoopCount (lowerForStatement) rejects unsupported loop shapes
+// for callers that skip validation. Uses an arena so partial allocations on the
+// error path are freed together (lowerToANF does not clean up on error).
+
+fn lowerContractWithLoop(alloc: Allocator, for_stmt: types.ForStmt) LowerError!ANFProgram {
+    const props = try alloc.alloc(PropertyNode, 1);
+    props[0] = .{ .name = "x", .type_info = .bigint, .readonly = true };
+
+    const ctor_params = try alloc.alloc(ParamNode, 1);
+    ctor_params[0] = .{ .name = "x", .type_info = .bigint, .type_name = "bigint" };
+    const ctor_assignments = try alloc.alloc(types.AssignmentNode, 1);
+    ctor_assignments[0] = .{ .target = "x", .value = .{ .identifier = "x" } };
+
+    const body = try alloc.alloc(Statement, 2);
+    body[0] = .{ .for_stmt = for_stmt };
+    body[1] = .{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } };
+
+    const methods = try alloc.alloc(MethodNode, 1);
+    methods[0] = .{ .name = "m", .is_public = true, .params = &.{}, .body = body };
+
+    return lowerToANF(alloc, .{
+        .name = "C",
+        .parent_class = .smart_contract,
+        .properties = props,
+        .constructor = .{ .params = ctor_params, .super_args = &.{}, .assignments = ctor_assignments },
+        .methods = methods,
+    });
+}
+
+test "lowering rejects a countdown loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // for (let i = 3; i > 0; i--)
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 3, .bound = 0, .descending = true, .body = &.{} };
+    try std.testing.expectError(error.UnsupportedStatement, lowerContractWithLoop(arena.allocator(), for_stmt));
+}
+
+test "lowering rejects a non-zero-start loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // for (let i = 1; i <= 3; i++)
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 1, .bound = 3, .body = &.{} };
+    try std.testing.expectError(error.UnsupportedStatement, lowerContractWithLoop(arena.allocator(), for_stmt));
+}
+
+test "lowering still accepts a zero-start counting-up loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // for (let i = 0; i < 4; i++)
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 0, .bound = 4, .body = &.{} };
+    const program = try lowerContractWithLoop(arena.allocator(), for_stmt);
+    // Find method "m" and confirm it lowered a loop with count 4.
+    var found_loop = false;
+    for (program.methods) |m| {
+        if (!std.mem.eql(u8, m.name, "m")) continue;
+        for (m.bindings) |b| {
+            switch (b.value) {
+                .loop => |lp| {
+                    found_loop = true;
+                    try std.testing.expectEqual(@as(u32, 4), lp.count);
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found_loop);
 }

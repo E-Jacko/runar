@@ -1815,25 +1815,35 @@ module RunarCompiler
     # @param stmt [ForStmt]
     # @return [Integer]
     def self._extract_loop_count(stmt)
+      # The ANF loop node carries only the count -- no start value or step
+      # direction -- so lowering (and the ANF interpreter) always iterates
+      # i = 0..count-1. Loop shapes that representation cannot express are
+      # rejected here (mirroring the source-located errors in the validator)
+      # rather than silently compiled as a zero-start counting-up loop.
+      #
+      # A countdown loop necessarily also has a non-zero start, so check the
+      # condition direction first -- it is the more precise diagnosis.
+      if stmt.condition.is_a?(BinaryExpr)
+        op = stmt.condition.op
+        if op == ">" || op == ">="
+          raise "For loop condition must count up with '<' or '<=' — countdown loops are not supported; " \
+                "iterate i = 0..N-1 and index backwards instead."
+        end
+      end
+
       start_val = _extract_bigint_value(stmt.init&.init)
 
+      if !start_val.nil? && start_val != 0
+        raise "For loop iterator must start at 0 (got #{start_val}n) — " \
+              "loops compile to i = 0..count-1; offset the iterator inside the body instead."
+      end
+
       if stmt.condition.is_a?(BinaryExpr)
+        op = stmt.condition.op
         bound_val = _extract_bigint_value(stmt.condition.right)
-
-        if start_val && bound_val
-          start = start_val
-          bound = bound_val
-          op = stmt.condition.op
-          return [0, bound - start].max if op == "<"
-          return [0, bound - start + 1].max if op == "<="
-          return [0, start - bound].max if op == ">"
-          return [0, start - bound + 1].max if op == ">="
-        end
-
         if bound_val
-          op = stmt.condition.op
-          return bound_val if op == "<"
-          return bound_val + 1 if op == "<="
+          return [0, bound_val].max if op == "<"
+          return [0, bound_val + 1].max if op == "<="
         end
       end
 

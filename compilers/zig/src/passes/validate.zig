@@ -243,6 +243,23 @@ fn validateMethods(
     errors: *std.ArrayListUnmanaged(CompilerDiagnostic),
     warnings: *std.ArrayListUnmanaged(CompilerDiagnostic),
 ) !void {
+    // A contract with no public methods has no spending entry points and
+    // compiles to an empty script — never what the author meant (usually a
+    // missing `public` modifier; methods default to private).
+    var has_public = false;
+    for (contract.methods) |method| {
+        if (method.is_public) {
+            has_public = true;
+            break;
+        }
+    }
+    if (!has_public) {
+        try errors.append(allocator, .{
+            .message = "Contract has no public methods — no spending entry points; add 'public' to at least one method",
+            .severity = .@"error",
+        });
+    }
+
     for (contract.methods) |method| {
         // FixedArray may not appear as a method parameter.
         for (method.params) |p| {
@@ -540,9 +557,27 @@ fn validateStatement(
     errors: *std.ArrayListUnmanaged(CompilerDiagnostic),
 ) !void {
     switch (stmt) {
-        .for_stmt => {
+        .for_stmt => |f| {
             // For loops in the Zig IR already have concrete i64 bounds (init_value, bound),
-            // so they are inherently compile-time constants. No validation needed here.
+            // so they are inherently compile-time constants. However, the ANF loop node
+            // carries only an iteration count — no start value or step direction — so
+            // lowering always iterates i = 0..count-1. Reject the loop shapes that
+            // representation cannot express: a countdown ('>'/'>=') or a non-zero start
+            // would otherwise be silently compiled as a zero-start counting-up loop while
+            // the interpreter runs the true source semantics.
+            if (f.descending) {
+                try errors.append(allocator, .{
+                    .message = "For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead",
+                    .severity = .@"error",
+                });
+            }
+            if (f.init_value != 0) {
+                try errors.append(allocator, .{
+                    .message = "For loop iterator must start at 0 — loops compile to i = 0..count-1; offset the iterator inside the body instead",
+                    .severity = .@"error",
+                });
+            }
+            for (f.body) |s| try validateStatement(allocator, s, errors);
         },
         .if_stmt => |if_s| {
             for (if_s.then_body) |s| try validateStatement(allocator, s, errors);
@@ -830,12 +865,16 @@ test "valid SmartContract passes validation" {
     var assignments = [_]types.AssignmentNode{makeAssignment("pk")};
     var super_args = [_]Expression{.{ .identifier = "pk" }};
     var params = [_]types.ParamNode{makeParam("pk")};
+    var body = [_]Statement{.{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } }};
+    var methods = [_]MethodNode{
+        .{ .name = "unlock", .is_public = true, .params = &.{}, .body = &body },
+    };
     const contract = ContractNode{
         .name = "P2PKH",
         .parent_class = .smart_contract,
         .properties = @constCast(&props),
         .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
-        .methods = &.{},
+        .methods = &methods,
     };
     const result = try validate(allocator, contract);
     defer freeResult(allocator, result);
@@ -979,12 +1018,16 @@ test "zig constructor without super() passes when properties are assigned" {
         .{ .target = "pk", .value = .{ .identifier = "pk" } },
     };
     var params = [_]types.ParamNode{makeZigParam("pk")};
+    var body = [_]Statement{.{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } }};
+    var methods = [_]MethodNode{
+        .{ .name = "unlock", .is_public = true, .params = &.{}, .body = &body },
+    };
     const contract = ContractNode{
         .name = "P2PKH",
         .parent_class = .smart_contract,
         .properties = @constCast(&props),
         .constructor = .{ .params = &params, .super_args = &.{}, .assignments = &assignments },
-        .methods = &.{},
+        .methods = &methods,
     };
     const result = try validateZig(allocator, contract);
     defer freeResult(allocator, result);
@@ -1372,7 +1415,10 @@ test "empty contract with no properties or methods" {
     const result = try validate(allocator, contract);
     defer freeResult(allocator, result);
 
-    try testing.expectEqual(@as(usize, 0), result.errors.len);
+    // A contract with no methods has no public spending entry point (#126),
+    // which is now a validation error — the only one for an otherwise-empty contract.
+    try testing.expectEqual(@as(usize, 1), result.errors.len);
+    try testing.expect(hasErrorContaining(result, "no public methods"));
     try testing.expectEqual(@as(usize, 0), result.warnings.len);
 }
 
@@ -1400,4 +1446,123 @@ test "endsWithAssert rejects if with missing else assert" {
 
 test "endsWithAssert on empty body returns false" {
     try testing.expect(!endsWithAssert(&.{}));
+}
+
+// -- #126: contract must have at least one public method --
+
+fn hasErrorContaining(result: ValidationResult, needle: []const u8) bool {
+    for (result.errors) |err| {
+        if (std.mem.indexOf(u8, err.message, needle) != null) return true;
+    }
+    return false;
+}
+
+test "no public methods reports error" {
+    const allocator = testing.allocator;
+    var props = [_]PropertyNode{makeProperty("x", .bigint, true)};
+    var assert_body = [_]Statement{.{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } }};
+    var methods = [_]MethodNode{
+        .{ .name = "helper", .is_public = false, .params = &.{}, .body = &assert_body },
+    };
+    var assignments = [_]types.AssignmentNode{makeAssignment("x")};
+    var super_args = [_]Expression{.{ .identifier = "x" }};
+    var params = [_]types.ParamNode{makeParam("x")};
+    const contract = ContractNode{
+        .name = "Locked",
+        .parent_class = .smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &methods,
+    };
+    const result = try validate(allocator, contract);
+    defer freeResult(allocator, result);
+    try testing.expect(hasErrorContaining(result, "no public methods"));
+}
+
+test "contract with no methods at all reports no-public-methods error" {
+    const allocator = testing.allocator;
+    var props = [_]PropertyNode{makeProperty("x", .bigint, true)};
+    var assignments = [_]types.AssignmentNode{makeAssignment("x")};
+    var super_args = [_]Expression{.{ .identifier = "x" }};
+    var params = [_]types.ParamNode{makeParam("x")};
+    const contract = ContractNode{
+        .name = "Empty",
+        .parent_class = .smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &.{},
+    };
+    const result = try validate(allocator, contract);
+    defer freeResult(allocator, result);
+    try testing.expect(hasErrorContaining(result, "no public methods"));
+}
+
+test "contract with a public method does not report no-public-methods error" {
+    const allocator = testing.allocator;
+    var props = [_]PropertyNode{makeProperty("x", .bigint, true)};
+    var assert_body = [_]Statement{.{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } }};
+    var methods = [_]MethodNode{
+        .{ .name = "unlock", .is_public = true, .params = &.{}, .body = &assert_body },
+    };
+    var assignments = [_]types.AssignmentNode{makeAssignment("x")};
+    var super_args = [_]Expression{.{ .identifier = "x" }};
+    var params = [_]types.ParamNode{makeParam("x")};
+    const contract = ContractNode{
+        .name = "P2PKH",
+        .parent_class = .smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &methods,
+    };
+    const result = try validate(allocator, contract);
+    defer freeResult(allocator, result);
+    try testing.expect(!hasErrorContaining(result, "no public methods"));
+}
+
+// -- #127: reject non-zero-start and countdown loops --
+
+/// Validate a stateless contract with a single public method `m` whose body is
+/// the given for-loop followed by a terminal assert. Returns whether any error
+/// message contains `needle`.
+fn validateLoopHasError(allocator: Allocator, for_stmt: types.ForStmt, needle: []const u8) !bool {
+    var props = [_]PropertyNode{makeProperty("x", .bigint, true)};
+    var body = [_]Statement{
+        .{ .for_stmt = for_stmt },
+        .{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } },
+    };
+    var methods = [_]MethodNode{
+        .{ .name = "m", .is_public = true, .params = &.{}, .body = &body },
+    };
+    var assignments = [_]types.AssignmentNode{makeAssignment("x")};
+    var super_args = [_]Expression{.{ .identifier = "x" }};
+    var params = [_]types.ParamNode{makeParam("x")};
+    const contract = ContractNode{
+        .name = "C",
+        .parent_class = .smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &methods,
+    };
+    const result = try validate(allocator, contract);
+    defer freeResult(allocator, result);
+    return hasErrorContaining(result, needle);
+}
+
+test "for loop with non-zero start reports error" {
+    // for (let i = 1; i <= 3; i++)
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 1, .bound = 3, .body = &.{} };
+    try testing.expect(try validateLoopHasError(testing.allocator, for_stmt, "must start at 0"));
+}
+
+test "countdown for loop reports error" {
+    // for (let i = 3; i > 0; i--)
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 3, .bound = 0, .descending = true, .body = &.{} };
+    try testing.expect(try validateLoopHasError(testing.allocator, for_stmt, "countdown"));
+}
+
+test "zero-start counting-up for loop is accepted" {
+    // for (let i = 0; i <= 3; i++)
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 0, .bound = 4, .body = &.{} };
+    try testing.expect(!try validateLoopHasError(testing.allocator, for_stmt, "must start at 0"));
+    try testing.expect(!try validateLoopHasError(testing.allocator, for_stmt, "countdown"));
 }

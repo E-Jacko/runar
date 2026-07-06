@@ -1511,3 +1511,176 @@ func TestValidate_EmptyContractName(t *testing.T) {
 		t.Fatal("expected error for empty contract name")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #126: contract must have at least one public method
+// ---------------------------------------------------------------------------
+
+func hasValidationError(result *ValidationResult, substr string) bool {
+	for _, e := range result.Errors {
+		if strings.Contains(e.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestValidate_NoPublicMethods_Error(t *testing.T) {
+	source := `
+import { SmartContract, assert, PubKey, Sig, checkSig } from 'runar-lang';
+
+class Locked extends SmartContract {
+  readonly pk: PubKey;
+
+  constructor(pk: PubKey) {
+    super(pk);
+    this.pk = pk;
+  }
+
+  unlock(sig: Sig): void {
+    assert(checkSig(sig, this.pk));
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if !hasValidationError(result, "no public methods") {
+		t.Errorf("expected 'no public methods' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+func TestValidate_NoMethodsAtAll_Error(t *testing.T) {
+	source := `
+import { SmartContract } from 'runar-lang';
+
+class Empty extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if !hasValidationError(result, "no public methods") {
+		t.Errorf("expected 'no public methods' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+func TestValidate_HasPublicMethod_NoError(t *testing.T) {
+	source := `
+import { SmartContract, assert, PubKey, Sig, Addr, hash160, checkSig } from 'runar-lang';
+
+class P2PKH extends SmartContract {
+  readonly pubKeyHash: Addr;
+
+  constructor(pubKeyHash: Addr) {
+    super(pubKeyHash);
+    this.pubKeyHash = pubKeyHash;
+  }
+
+  public unlock(sig: Sig, pubKey: PubKey): void {
+    assert(hash160(pubKey) === this.pubKeyHash);
+    assert(checkSig(sig, pubKey));
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasValidationError(result, "no public methods") {
+		t.Errorf("did not expect 'no public methods' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #127: reject non-zero-start and countdown for-loops
+// ---------------------------------------------------------------------------
+
+func TestValidate_ForLoopNonZeroStart_Error(t *testing.T) {
+	source := `
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 1n; i <= 3n; i++) {
+      sum = sum + i;
+    }
+    assert(sum > 0n);
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if !hasValidationError(result, "must start at 0") {
+		t.Errorf("expected 'must start at 0' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+func TestValidate_ForLoopCountdown_Error(t *testing.T) {
+	source := `
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 3n; i > 0n; i--) {
+      sum = sum + i;
+    }
+    assert(sum > 0n);
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if !hasValidationError(result, "countdown") {
+		t.Errorf("expected 'countdown' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+func TestValidate_ForLoopZeroStartCountingUp_NoError(t *testing.T) {
+	source := `
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 0n; i <= 3n; i++) {
+      sum = sum + i;
+    }
+    assert(sum > 0n);
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasValidationError(result, "must start at 0") {
+		t.Errorf("did not expect 'must start at 0' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+	if hasValidationError(result, "countdown") {
+		t.Errorf("did not expect 'countdown' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}

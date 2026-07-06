@@ -359,6 +359,167 @@ class ValidateTest {
         );
     }
 
+    // ------------------------------------------------------------------
+    // No public methods (issue #120)
+    // ------------------------------------------------------------------
+
+    @Test
+    void rejectsContractWithNoPublicMethods() {
+        // Every method defaults to private without @Public — the contract has
+        // no spending entry point and would compile to an empty script.
+        String src = """
+            class Locked extends SmartContract {
+                @Readonly PubKey pk;
+
+                Locked(PubKey pk) {
+                    super(pk);
+                    this.pk = pk;
+                }
+
+                void unlock(Sig sig) {
+                    assertThat(checkSig(sig, this.pk));
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "Locked.runar.java");
+        Validate.ValidationException e = assertThrows(
+            Validate.ValidationException.class,
+            () -> Validate.run(c)
+        );
+        assertTrue(
+            e.errors().stream().anyMatch(m -> m.contains("no public methods")),
+            "expected no-public-methods error, got " + e.errors()
+        );
+    }
+
+    @Test
+    void rejectsContractWithNoMethodsAtAll() {
+        String src = """
+            class Empty extends SmartContract {
+                @Readonly Bigint x;
+
+                Empty(Bigint x) {
+                    super(x);
+                    this.x = x;
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "Empty.runar.java");
+        Validate.ValidationException e = assertThrows(
+            Validate.ValidationException.class,
+            () -> Validate.run(c)
+        );
+        assertTrue(
+            e.errors().stream().anyMatch(m -> m.contains("no public methods")),
+            "expected no-public-methods error, got " + e.errors()
+        );
+    }
+
+    @Test
+    void acceptsContractWithAtLeastOnePublicMethod() {
+        ContractNode c = JavaParser.parse(VALID_P2PKH, "P2PKH.runar.java");
+        Validate.Result r = Validate.runCollecting(c);
+        assertFalse(
+            r.errors().stream().anyMatch(m -> m.contains("no public methods")),
+            "did not expect no-public-methods error, got " + r.errors()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Unsupported loop shapes: non-zero start, countdown (issue #121)
+    // ------------------------------------------------------------------
+
+    @Test
+    void rejectsForLoopWithNonZeroStart() {
+        String src = """
+            class C extends SmartContract {
+                @Readonly Bigint x;
+
+                C(Bigint x) {
+                    super(x);
+                    this.x = x;
+                }
+
+                @Public
+                void m() {
+                    for (Bigint i = 1; i <= 3; i++) {
+                        assertThat(true);
+                    }
+                    assertThat(true);
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        Validate.ValidationException e = assertThrows(
+            Validate.ValidationException.class,
+            () -> Validate.run(c)
+        );
+        assertTrue(
+            e.errors().stream().anyMatch(m -> m.contains("must start at 0")),
+            "expected non-zero-start error, got " + e.errors()
+        );
+    }
+
+    @Test
+    void rejectsCountdownForLoop() {
+        String src = """
+            class C extends SmartContract {
+                @Readonly Bigint x;
+
+                C(Bigint x) {
+                    super(x);
+                    this.x = x;
+                }
+
+                @Public
+                void m() {
+                    for (Bigint i = 3; i > 0; i--) {
+                        assertThat(true);
+                    }
+                    assertThat(true);
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        Validate.ValidationException e = assertThrows(
+            Validate.ValidationException.class,
+            () -> Validate.run(c)
+        );
+        assertTrue(
+            e.errors().stream().anyMatch(m -> m.contains("countdown")),
+            "expected countdown error, got " + e.errors()
+        );
+    }
+
+    @Test
+    void acceptsZeroStartCountingUpForLoop() {
+        String src = """
+            class C extends SmartContract {
+                @Readonly Bigint x;
+
+                C(Bigint x) {
+                    super(x);
+                    this.x = x;
+                }
+
+                @Public
+                void m() {
+                    for (Bigint i = 0; i <= 3; i++) {
+                        assertThat(true);
+                    }
+                    assertThat(true);
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        Validate.Result r = Validate.runCollecting(c);
+        assertFalse(
+            r.errors().stream().anyMatch(m ->
+                m.contains("must start at 0") || m.contains("countdown")),
+            "did not expect loop-shape error, got " + r.errors()
+        );
+    }
+
     @Test
     void rejectsPublicMethodWithoutFinalAssert() {
         String src = """

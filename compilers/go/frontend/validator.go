@@ -293,6 +293,20 @@ func isSuperCall(stmt Statement) bool {
 // ---------------------------------------------------------------------------
 
 func (ctx *validationContext) validateMethods() {
+	// A contract with no public methods has no spending entry points and
+	// compiles to an empty script — never what the author meant (usually a
+	// missing `public` modifier; methods default to private).
+	hasPublic := false
+	for _, method := range ctx.contract.Methods {
+		if method.Visibility == "public" {
+			hasPublic = true
+			break
+		}
+	}
+	if !hasPublic {
+		ctx.addError(fmt.Sprintf("Contract '%s' has no public methods — no spending entry points; add 'public' to at least one method", ctx.contract.Name))
+	}
+
 	for _, method := range ctx.contract.Methods {
 		ctx.validateMethod(method)
 	}
@@ -529,6 +543,26 @@ func (ctx *validationContext) validateForStatement(stmt ForStmt) {
 		if !isCompileTimeConstant(bin.Right) {
 			ctx.addError("for loop bound must be a compile-time constant")
 		}
+
+		// The ANF loop node carries only an iteration count, so lowering always
+		// iterates i = 0..count-1. Reject the loop shapes that representation
+		// cannot express — a non-zero start or a countdown would otherwise be
+		// silently compiled as a zero-start counting-up loop while the
+		// interpreter runs the true source semantics.
+		if bin.Op == ">" || bin.Op == ">=" {
+			ctx.addErrorWithLoc(
+				"For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead",
+				&stmt.SourceLocation,
+			)
+		}
+	}
+
+	startVal := extractBigIntValue(stmt.Init.Init)
+	if startVal != nil && startVal.Sign() != 0 {
+		ctx.addErrorWithLoc(
+			fmt.Sprintf("For loop iterator must start at 0 (got %sn) — loops compile to i = 0..count-1; offset the iterator inside the body instead", startVal.String()),
+			&stmt.SourceLocation,
+		)
 	}
 
 	ctx.validateExpression(stmt.Init.Init)

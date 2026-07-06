@@ -176,7 +176,12 @@ pub const Assign = struct {
     index_target: ?*IndexAccess = null,
 };
 pub const IfStmt = struct { condition: Expression, then_body: []Statement, else_body: ?[]Statement = null, source_loc: ?SourceLocation = null };
-pub const ForStmt = struct { var_name: []const u8, init_value: i64, bound: i64, body: []Statement, source_loc: ?SourceLocation = null };
+// `descending` records whether the source condition counted down (`>`/`>=`).
+// The ANF loop node carries only an iteration count (no start/step), so
+// countdown and non-zero-start loops cannot be represented and are rejected
+// in Pass 2 (validate) and Pass 4 (anf-lower). Only C-style parsers set this;
+// range-based parsers (Rust/Ruby/Python/Zig/Move) are always ascending.
+pub const ForStmt = struct { var_name: []const u8, init_value: i64, bound: i64, body: []Statement, descending: bool = false, source_loc: ?SourceLocation = null };
 pub const AssertStmt = struct { condition: Expression, message: ?[]const u8 = null, source_loc: ?SourceLocation = null };
 
 pub const Expression = union(enum) {

@@ -226,6 +226,15 @@ class _ValidationContext:
     # -------------------------------------------------------------------
 
     def validate_methods(self) -> None:
+        # A contract with no public methods has no spending entry points and
+        # compiles to an empty script -- never what the author meant (usually a
+        # missing `public` modifier; methods default to private).
+        if not any(m.visibility == "public" for m in self.contract.methods):
+            self._add_error(
+                f"Contract '{self.contract.name}' has no public methods "
+                "— no spending entry points; add 'public' to at least one method"
+            )
+
         for method in self.contract.methods:
             self._validate_method(method)
 
@@ -402,6 +411,28 @@ class _ValidationContext:
             if not _is_compile_time_constant(stmt.condition.right):
                 self._add_error("for loop bound must be a compile-time constant")
 
+            # The ANF loop node carries only an iteration count, so lowering
+            # always iterates i = 0..count-1. Reject the loop shapes that
+            # representation cannot express -- a non-zero start or a countdown
+            # would otherwise be silently compiled as a zero-start counting-up
+            # loop while the interpreter runs the true source semantics.
+            if stmt.condition.op in (">", ">="):
+                self._add_error(
+                    "For loop condition must count up with '<' or '<=' "
+                    "— countdown loops are not supported; iterate i = 0..N-1 "
+                    "and index backwards instead",
+                    loc=stmt.source_location,
+                )
+
+        start_val = _extract_literal_bigint(stmt.init.init if stmt.init else None)
+        if start_val is not None and start_val != 0:
+            self._add_error(
+                f"For loop iterator must start at 0 (got {start_val}n) "
+                "— loops compile to i = 0..count-1; offset the iterator "
+                "inside the body instead",
+                loc=stmt.source_location,
+            )
+
         self._validate_expression(stmt.init.init)
         for s in stmt.body:
             self._validate_statement(s)
@@ -563,6 +594,15 @@ def _ends_with_terminal_asm(body: list[Statement]) -> bool:
         return then_ends and else_ends
 
     return False
+
+
+def _extract_literal_bigint(expr: Expression | None) -> int | None:
+    if isinstance(expr, BigIntLiteral):
+        return expr.value
+    if isinstance(expr, UnaryExpr) and expr.op == "-":
+        inner = _extract_literal_bigint(expr.operand)
+        return -inner if inner is not None else None
+    return None
 
 
 def _is_compile_time_constant(expr: Expression | None) -> bool:

@@ -351,6 +351,176 @@ class LoopBad extends SmartContract {
             f"expected error about non-constant loop bound, got: {valid_result.errors}"
         )
 
+    # -----------------------------------------------------------------------
+    # Contract must have at least one public method (issue #120 / PR #126)
+    # -----------------------------------------------------------------------
+
+    def test_validate_no_public_methods_all_private(self):
+        """A contract whose methods all lack `public` has no spending entry
+        point and must be rejected."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class Locked extends SmartContract {
+  readonly pk: PubKey;
+
+  constructor(pk: PubKey) {
+    super(pk);
+    this.pk = pk;
+  }
+
+  unlock(sig: Sig): void {
+    assert(checkSig(sig, this.pk));
+  }
+}
+"""
+        result = parse_source(source, "Locked.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert any("no public methods" in e.message.lower() for e in valid_result.errors), (
+            f"expected error about no public methods, got: {valid_result.errors}"
+        )
+
+    def test_validate_no_methods_at_all(self):
+        """A contract with no methods at all must be rejected."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class Empty extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+}
+"""
+        result = parse_source(source, "Empty.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert any("no public methods" in e.message.lower() for e in valid_result.errors), (
+            f"expected error about no public methods, got: {valid_result.errors}"
+        )
+
+    def test_validate_public_method_present_ok(self):
+        """A contract with at least one public method is not flagged."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class Ok extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public check(): void {
+    assert(this.x > 0n);
+  }
+}
+"""
+        result = parse_source(source, "Ok.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert not any("no public methods" in e.message.lower() for e in valid_result.errors), (
+            f"unexpected no-public-methods error, got: {valid_result.errors}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Unsupported loop shapes: non-zero start, countdown (issue #121 / PR #127)
+    # -----------------------------------------------------------------------
+
+    def test_validate_for_loop_nonzero_start(self):
+        """A for loop with a non-zero literal start value must be rejected."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 1n; i <= 3n; i++) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert any("must start at 0" in e.message.lower() for e in valid_result.errors), (
+            f"expected error about non-zero start, got: {valid_result.errors}"
+        )
+
+    def test_validate_for_loop_countdown(self):
+        """A countdown for loop must be rejected."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 3n; i > 0n; i--) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert any("countdown" in e.message.lower() for e in valid_result.errors), (
+            f"expected error about countdown loop, got: {valid_result.errors}"
+        )
+
+    def test_validate_for_loop_zero_start_ok(self):
+        """A zero-start counting-up for loop is accepted."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 0n; i <= 3n; i++) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert not any("must start at 0" in e.message.lower() for e in valid_result.errors), (
+            f"unexpected non-zero-start error, got: {valid_result.errors}"
+        )
+        assert not any("countdown" in e.message.lower() for e in valid_result.errors), (
+            f"unexpected countdown error, got: {valid_result.errors}"
+        )
+
     def test_validate_void_property_type(self):
         """Property with type 'void' should produce a validation error."""
         source = """
@@ -1101,6 +1271,71 @@ class LoopContract extends SmartContract {
             f"expected at least one binding with kind='loop' in sum method, "
             f"got kinds: {[b.value.kind for b in sum_method.body]}"
         )
+
+    def test_anf_lower_rejects_nonzero_start_loop(self):
+        """extractLoopCount must reject a non-zero start (issue #121 reject path)."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 1n; i <= 3n; i++) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+        with pytest.raises(ValueError, match="must start at 0"):
+            lower_to_anf(result.contract)
+
+    def test_anf_lower_rejects_countdown_loop(self):
+        """extractLoopCount must reject a countdown loop (issue #121 reject path)."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 3n; i > 0n; i--) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+        with pytest.raises(ValueError, match="[Cc]ountdown"):
+            lower_to_anf(result.contract)
+
+    def test_anf_lower_zero_start_loop_count(self):
+        """A zero-start counting-up loop still lowers with count = 4."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 0n; i <= 3n; i++) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        program = lower_to_anf(result.contract)
+        m_method = next((m for m in program.methods if m.name == "m"), None)
+        assert m_method is not None
+        loop_bindings = [b for b in m_method.body if b.value.kind == "loop"]
+        assert len(loop_bindings) == 1
+        assert loop_bindings[0].value.count == 4
 
     def test_anf_lower_stateful(self):
         """A StatefulSmartContract's public method should have implicit params after ANF lowering.

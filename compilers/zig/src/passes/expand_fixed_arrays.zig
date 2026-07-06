@@ -431,6 +431,7 @@ const Ctx = struct {
                     .var_name = fs.var_name,
                     .init_value = fs.init_value,
                     .bound = fs.bound,
+                    .descending = fs.descending,
                     .body = new_body,
                     .source_loc = fs.source_loc,
                 } });

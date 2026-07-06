@@ -991,50 +991,46 @@ func (ctx *lowerCtx) lowerForStatement(stmt ForStmt) {
 	})
 }
 
+// extractLoopCount returns the iteration count for a for-loop.
+//
+// The ANF loop node carries only the count — no start value or step
+// direction — so lowering (and the ANF interpreter) always iterates
+// i = 0..count-1. Loop shapes that representation cannot express are
+// rejected here (mirroring the source-located errors in the validate pass)
+// rather than silently compiled as a zero-start counting-up loop. In the
+// normal pipeline the validate pass rejects these first; these panics guard
+// callers that lower without validating.
 func extractLoopCount(stmt ForStmt) int {
+	// A countdown loop necessarily also has a non-zero start, so check the
+	// condition direction first — it is the more precise diagnosis.
+	if bin, ok := stmt.Condition.(BinaryExpr); ok {
+		if bin.Op == ">" || bin.Op == ">=" {
+			panic("For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead.")
+		}
+	}
+
 	startVal := extractBigIntValue(stmt.Init.Init)
+
+	if startVal != nil && startVal.Sign() != 0 {
+		panic(fmt.Sprintf("For loop iterator must start at 0 (got %sn) — loops compile to i = 0..count-1; offset the iterator inside the body instead.", startVal.String()))
+	}
 
 	if bin, ok := stmt.Condition.(BinaryExpr); ok {
 		boundVal := extractBigIntValue(bin.Right)
-
-		if startVal != nil && boundVal != nil {
-			start := startVal.Int64()
-			bound := boundVal.Int64()
-			switch bin.Op {
-			case "<":
-				v := int(bound - start)
-				if v < 0 {
-					v = 0
-				}
-				return v
-			case "<=":
-				v := int(bound - start + 1)
-				if v < 0 {
-					v = 0
-				}
-				return v
-			case ">":
-				v := int(start - bound)
-				if v < 0 {
-					v = 0
-				}
-				return v
-			case ">=":
-				v := int(start - bound + 1)
-				if v < 0 {
-					v = 0
-				}
-				return v
-			}
-		}
-
 		if boundVal != nil {
-			bound := boundVal.Int64()
+			bound := int(boundVal.Int64())
 			switch bin.Op {
 			case "<":
-				return int(bound)
+				if bound < 0 {
+					return 0
+				}
+				return bound
 			case "<=":
-				return int(bound) + 1
+				v := bound + 1
+				if v < 0 {
+					return 0
+				}
+				return v
 			}
 		}
 	}

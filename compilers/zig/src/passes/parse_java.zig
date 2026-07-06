@@ -1065,6 +1065,7 @@ const Parser = struct {
         var var_name: []const u8 = "_i";
         var init_value: i64 = 0;
         var bound: i64 = 0;
+        var descending: bool = false;
 
         // Init: `Type name = expr;` or plain expression
         if (self.current.kind == .ident) {
@@ -1105,9 +1106,12 @@ const Parser = struct {
             const cond_expr = self.parseExpression();
             if (cond_expr) |expr| {
                 switch (expr) {
-                    .binary_op => |bop| switch (bop.right) {
-                        .literal_int => |v| bound = v,
-                        else => {},
+                    .binary_op => |bop| {
+                        descending = bop.op == .gt or bop.op == .gte;
+                        switch (bop.right) {
+                            .literal_int => |v| bound = v,
+                            else => {},
+                        }
                     },
                     else => {},
                 }
@@ -1131,7 +1135,7 @@ const Parser = struct {
         _ = self.expect(.rparen);
 
         const body = self.parseStmtOrBlock();
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .body = body } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .body = body } };
     }
 
     fn parseReturnStmt(self: *Parser) ?Statement {
