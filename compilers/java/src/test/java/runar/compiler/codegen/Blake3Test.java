@@ -46,14 +46,14 @@ class Blake3Test {
     void compressOpCount() {
         List<StackOp> ops = new ArrayList<>();
         Blake3.emitBlake3Compress(ops::add);
-        assertEquals(10819, ops.size(), "blake3Compress op count drift");
+        assertEquals(10373, ops.size(), "blake3Compress op count drift");
     }
 
     @Test
     void hashOpCount() {
         List<StackOp> ops = new ArrayList<>();
         Blake3.emitBlake3Hash(ops::add);
-        assertEquals(10829, ops.size(), "blake3Hash op count drift");
+        assertEquals(10387, ops.size(), "blake3Hash op count drift");
     }
 
     // ------------------------------------------------------------------
@@ -63,7 +63,7 @@ class Blake3Test {
     @Test
     void compressOpcodesStartCorrectly() {
         // Compression starts by splitting the 64-byte block into 16x4-byte
-        // BE words. First 30 ops alternate (push 4, OP_SPLIT) x15.
+        // LE words. First 30 ops alternate (push 4, OP_SPLIT) x15.
         List<StackOp> ops = new ArrayList<>();
         Blake3.emitBlake3Compress(ops::add);
 
@@ -83,40 +83,57 @@ class Blake3Test {
 
     @Test
     void hashOpcodesStartCorrectly() {
-        // Hash starts with: OP_SIZE, push 64, SWAP, OP_SUB, push 0, SWAP,
-        // OP_NUM2BIN, OP_CAT, push 32-byte IV, SWAP, then the compress ops.
+        // Hash starts by capturing block_len = message length as a 4-byte LE
+        // value on the alt stack: OP_SIZE, OP_DUP, push 4, OP_NUM2BIN,
+        // OP_TOALTSTACK. Then it zero-pads the message to 64 bytes:
+        // push 64, SWAP, OP_SUB, push 0, SWAP, OP_NUM2BIN, OP_CAT. Then it
+        // pushes the 32-byte LE IV chaining value and SWAPs it below the
+        // padded message, followed by the compress ops.
         List<StackOp> ops = new ArrayList<>();
         Blake3.emitBlake3Hash(ops::add);
 
         assertTrue(ops.get(0) instanceof OpcodeOp
             && "OP_SIZE".equals(((OpcodeOp) ops.get(0)).code()),
             "op[0] must be OP_SIZE");
-        assertTrue(ops.get(1) instanceof PushOp);
-        assertEquals(BigInteger.valueOf(64),
-            ((BigIntPushValue) ((PushOp) ops.get(1)).value()).value());
-        assertTrue(ops.get(2) instanceof SwapOp, "op[2] must be SWAP");
+        assertTrue(ops.get(1) instanceof OpcodeOp
+            && "OP_DUP".equals(((OpcodeOp) ops.get(1)).code()),
+            "op[1] must be OP_DUP");
+        assertTrue(ops.get(2) instanceof PushOp);
+        assertEquals(BigInteger.valueOf(4),
+            ((BigIntPushValue) ((PushOp) ops.get(2)).value()).value());
         assertTrue(ops.get(3) instanceof OpcodeOp
-            && "OP_SUB".equals(((OpcodeOp) ops.get(3)).code()),
-            "op[3] must be OP_SUB");
-        assertTrue(ops.get(4) instanceof PushOp);
-        assertEquals(BigInteger.ZERO,
-            ((BigIntPushValue) ((PushOp) ops.get(4)).value()).value());
-        assertTrue(ops.get(5) instanceof SwapOp);
-        assertTrue(ops.get(6) instanceof OpcodeOp
-            && "OP_NUM2BIN".equals(((OpcodeOp) ops.get(6)).code()));
+            && "OP_NUM2BIN".equals(((OpcodeOp) ops.get(3)).code()),
+            "op[3] must be OP_NUM2BIN");
+        assertTrue(ops.get(4) instanceof OpcodeOp
+            && "OP_TOALTSTACK".equals(((OpcodeOp) ops.get(4)).code()),
+            "op[4] must be OP_TOALTSTACK");
+        assertTrue(ops.get(5) instanceof PushOp);
+        assertEquals(BigInteger.valueOf(64),
+            ((BigIntPushValue) ((PushOp) ops.get(5)).value()).value());
+        assertTrue(ops.get(6) instanceof SwapOp, "op[6] must be SWAP");
         assertTrue(ops.get(7) instanceof OpcodeOp
-            && "OP_CAT".equals(((OpcodeOp) ops.get(7)).code()));
-
-        // op[8] = push 32-byte BE IV (big-endian concatenation of the 8 IV words)
+            && "OP_SUB".equals(((OpcodeOp) ops.get(7)).code()),
+            "op[7] must be OP_SUB");
         assertTrue(ops.get(8) instanceof PushOp);
-        PushValue iv = ((PushOp) ops.get(8)).value();
-        assertTrue(iv instanceof ByteStringPushValue, "op[8] must be byte push");
-        // 32-byte IV: 6a09e667 bb67ae85 3c6ef372 a54ff53a 510e527f 9b05688c 1f83d9ab 5be0cd19
+        assertEquals(BigInteger.ZERO,
+            ((BigIntPushValue) ((PushOp) ops.get(8)).value()).value());
+        assertTrue(ops.get(9) instanceof SwapOp);
+        assertTrue(ops.get(10) instanceof OpcodeOp
+            && "OP_NUM2BIN".equals(((OpcodeOp) ops.get(10)).code()));
+        assertTrue(ops.get(11) instanceof OpcodeOp
+            && "OP_CAT".equals(((OpcodeOp) ops.get(11)).code()));
+
+        // op[12] = push 32-byte LE IV (little-endian concatenation of the 8 IV words)
+        assertTrue(ops.get(12) instanceof PushOp);
+        PushValue iv = ((PushOp) ops.get(12)).value();
+        assertTrue(iv instanceof ByteStringPushValue, "op[12] must be byte push");
+        // 32-byte LE IV: each of the 8 IV words 6a09e667 bb67ae85 3c6ef372
+        // a54ff53a 510e527f 9b05688c 1f83d9ab 5be0cd19 encoded little-endian.
         assertEquals(
-            "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19",
+            "67e6096a85ae67bb72f36e3c3af54fa57f520e518c68059babd9831f19cde05b",
             ((ByteStringPushValue) iv).hex());
 
-        assertTrue(ops.get(9) instanceof SwapOp);
+        assertTrue(ops.get(13) instanceof SwapOp);
     }
 
     // ------------------------------------------------------------------
@@ -135,12 +152,12 @@ class Blake3Test {
         String hex = Emit.run(prog);
         assertFalse(hex.isEmpty(), "hex must not be empty");
 
-        // From Go: compress hex byte length = 11632.
-        assertEquals(11632, hex.length() / 2, "compress hex byte count drift");
+        // LE port: compress hex byte length = 11186.
+        assertEquals(11186, hex.length() / 2, "compress hex byte count drift");
 
-        // From Go: first 32 bytes of compress hex.
+        // LE port: first 32 bytes of compress hex.
         assertEquals(
-            "547f547f547f547f547f547f547f547f547f547f547f547f547f547f547f517f",
+            "547f547f547f547f547f547f547f547f547f547f547f547f547f547f547f607a",
             hex.substring(0, 64));
     }
 
@@ -156,15 +173,16 @@ class Blake3Test {
         String hex = Emit.run(prog);
         assertFalse(hex.isEmpty(), "hex must not be empty");
 
-        // From Go: hash hex byte length = 11675.
-        assertEquals(11675, hex.length() / 2, "hash hex byte count drift");
+        // LE port: hash hex byte length = 11229.
+        assertEquals(11229, hex.length() / 2, "hash hex byte count drift");
 
-        // From Go: first 32 bytes of hash hex.
-        // 82 = OP_SIZE, 0140 = push 1 byte 0x40 (=64), 7c = SWAP, 94 = OP_SUB,
-        // 00 = push 0, 7c = SWAP, 80 = OP_NUM2BIN, 7e = OP_CAT,
-        // 20 = push 32 bytes (the IV), then 6a09e667...5be0cd19.
+        // LE port: first 32 bytes of hash hex.
+        // 82 = OP_SIZE, 76 = OP_DUP, 54 = OP_4 (push 4), 80 = OP_NUM2BIN,
+        // 6b = OP_TOALTSTACK, 0140 = push 1 byte 0x40 (=64), 7c = SWAP,
+        // 94 = OP_SUB, 00 = push 0, 7c = SWAP, 80 = OP_NUM2BIN, 7e = OP_CAT,
+        // 20 = push 32 bytes (the LE IV), then 67e6096a...19cde05b.
         assertEquals(
-            "8201407c94007c807e206a09e667bb67ae853c6ef372a54ff53a510e527f9b05",
+            "827654806b01407c94007c807e2067e6096a85ae67bb72f36e3c3af54fa57f52",
             hex.substring(0, 64));
     }
 

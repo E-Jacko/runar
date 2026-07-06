@@ -747,31 +747,19 @@ func TestStateful_Increment(t *testing.T) {
 		t.Fatalf("calc preimage: %v", err)
 	}
 
-	sigHashBytes, err := spendTx.CalcInputSignatureHash(0, sighash.AllForkID)
-	if err != nil {
-		t.Fatalf("calc sighash: %v", err)
-	}
-
-	// Step 10: Sign with k=1 (OP_PUSH_TX pattern).
-	sig, err := opPushTxPrivKey.Sign(sigHashBytes)
-	if err != nil {
-		t.Fatalf("sign: %v", err)
-	}
-	// Enforce low-S.
-	halfN := new(big.Int).Rsh(curveOrderN, 1)
-	if sig.S.Cmp(halfN) > 0 {
-		sig.S = new(big.Int).Sub(curveOrderN, sig.S)
-	}
-	derSig := append(sig.Serialize(), byte(sighash.AllForkID))
+	// Step 10: BUG-100 — the injected stateful checkPreimage now derives the
+	// OP_PUSH_TX signature ON-CHAIN from the preimage (the fixed 760-byte binding
+	// blob) and OP_CHECKSIGs it against G, passing iff hash256(preimage) equals
+	// the real tx sighash. The spender no longer supplies _opPushTxSig, so no
+	// signing happens here and the sig is absent from the unlocking script.
 
 	// Restore the source output to the full locking script for execution.
 	spendTx.Inputs[0].SetSourceTxOutput(prevOutput)
 
 	// Step 11: Build the unlocking script.
 	// Stack layout (bottom to top / first pushed to last pushed):
-	//   _codePart, _opPushTxSig, _changePKH, _changeAmount, _newAmount, txPreimage, methodSelector
+	//   _codePart, _changePKH, _changeAmount, _newAmount, txPreimage, methodSelector
 	unlockingHex := encodePushBytes(codePartBytes) + // _codePart
-		encodePushBytes(derSig) + // _opPushTxSig
 		encodePushBytes(changePKH) + // _changePKH
 		encodePushInt(int64(changeSatoshis)) + // _changeAmount
 		encodePushInt(int64(contSatoshis)) + // _newAmount
@@ -843,19 +831,12 @@ func TestStateful_Decrement(t *testing.T) {
 	})
 
 	preimage, _ := spendTx.CalcInputPreimage(0, sighash.AllForkID)
-	sigHashBytes, _ := spendTx.CalcInputSignatureHash(0, sighash.AllForkID)
 
-	sig, _ := opPushTxPrivKey.Sign(sigHashBytes)
-	halfN := new(big.Int).Rsh(curveOrderN, 1)
-	if sig.S.Cmp(halfN) > 0 {
-		sig.S = new(big.Int).Sub(curveOrderN, sig.S)
-	}
-	derSig := append(sig.Serialize(), byte(sighash.AllForkID))
-
+	// BUG-100: the injected checkPreimage derives the OP_PUSH_TX signature
+	// on-chain from the preimage; the spender no longer supplies _opPushTxSig.
 	spendTx.Inputs[0].SetSourceTxOutput(prevOutput)
 
 	unlockingHex := encodePushBytes(codePartBytes) +
-		encodePushBytes(derSig) +
 		encodePushBytes(changePKH) +
 		encodePushInt(int64(changeSatoshis)) +
 		encodePushInt(int64(contSatoshis)) +
@@ -921,19 +902,14 @@ func TestStateful_WrongState_Fail(t *testing.T) {
 	})
 
 	preimage, _ := spendTx.CalcInputPreimage(0, sighash.AllForkID)
-	sigHashBytes, _ := spendTx.CalcInputSignatureHash(0, sighash.AllForkID)
 
-	sig, _ := opPushTxPrivKey.Sign(sigHashBytes)
-	halfN := new(big.Int).Rsh(curveOrderN, 1)
-	if sig.S.Cmp(halfN) > 0 {
-		sig.S = new(big.Int).Sub(curveOrderN, sig.S)
-	}
-	derSig := append(sig.Serialize(), byte(sighash.AllForkID))
-
+	// BUG-100: the injected checkPreimage derives the OP_PUSH_TX signature
+	// on-chain from the preimage; the spender no longer supplies _opPushTxSig.
+	// The preimage here is bound to the tx carrying the WRONG (count=99)
+	// continuation output, so the state-continuation assert still fails.
 	spendTx.Inputs[0].SetSourceTxOutput(prevOutput)
 
 	unlockingHex := encodePushBytes(codePartBytes) +
-		encodePushBytes(derSig) +
 		encodePushBytes(changePKH) +
 		encodePushInt(int64(changeSatoshis)) +
 		encodePushInt(int64(contSatoshis)) +
@@ -2261,7 +2237,8 @@ class Blake3HashTest extends SmartContract {
 
 // referenceBlake3Compress implements BLAKE3 single-block compression in pure Go.
 // Matches the on-chain codegen which hardcodes blockLen=64, counter=0, flags=11.
-func referenceBlake3Compress(cvHex, blockHex string) string {
+// Chaining-value/message words and the digest are little-endian (standard BLAKE3, BUG-101).
+func referenceBlake3Compress(cvHex, blockHex string, blockLen uint32) string {
 	blake3IV := [8]uint32{
 		0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
 		0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -2298,19 +2275,19 @@ func referenceBlake3Compress(cvHex, blockHex string) string {
 
 	var cv [8]uint32
 	for i := 0; i < 8; i++ {
-		cv[i] = binary.BigEndian.Uint32(cvBytes[i*4:])
+		cv[i] = binary.LittleEndian.Uint32(cvBytes[i*4:])
 	}
 
 	var m [16]uint32
 	for i := 0; i < 16; i++ {
-		m[i] = binary.BigEndian.Uint32(blockBytes[i*4:])
+		m[i] = binary.LittleEndian.Uint32(blockBytes[i*4:])
 	}
 
 	state := [16]uint32{
 		cv[0], cv[1], cv[2], cv[3],
 		cv[4], cv[5], cv[6], cv[7],
 		blake3IV[0], blake3IV[1], blake3IV[2], blake3IV[3],
-		0, 0, 64, 11, // counter=0, counter_hi=0, blockLen=64, flags=CHUNK_START|CHUNK_END|ROOT
+		0, 0, blockLen, 11, // counter=0, counter_hi=0, blockLen, flags=CHUNK_START|CHUNK_END|ROOT
 	}
 
 	msg := m
@@ -2328,26 +2305,28 @@ func referenceBlake3Compress(cvHex, blockHex string) string {
 	result := make([]byte, 32)
 	for i := 0; i < 8; i++ {
 		w := state[i] ^ state[i+8]
-		binary.BigEndian.PutUint32(result[i*4:], w)
+		binary.LittleEndian.PutUint32(result[i*4:], w)
 	}
 	return hex.EncodeToString(result)
 }
 
 // referenceBlake3Hash computes BLAKE3 hash of a message <= 64 bytes.
 func referenceBlake3Hash(msgHex string) string {
+	// blockLen = actual message byte length (standard BLAKE3, not the fixed 64 of blake3Compress)
+	blockLen := uint32(len(msgHex) / 2)
 	// Zero-pad to 64 bytes (128 hex chars)
 	padded := msgHex
 	for len(padded) < 128 {
 		padded += "0"
 	}
-	blake3IVHex := "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19"
-	return referenceBlake3Compress(blake3IVHex, padded)
+	blake3IVHex := "67e6096a85ae67bb72f36e3c3af54fa57f520e518c68059babd9831f19cde05b"
+	return referenceBlake3Compress(blake3IVHex, padded, blockLen)
 }
 
 func TestBlake3Compress_Empty(t *testing.T) {
 	block := strings.Repeat("00", 64)
-	blake3IVHex := "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19"
-	expected := referenceBlake3Compress(blake3IVHex, block)
+	blake3IVHex := "67e6096a85ae67bb72f36e3c3af54fa57f520e518c68059babd9831f19cde05b"
+	expected := referenceBlake3Compress(blake3IVHex, block, 64)
 
 	lockingHex, err := compileRúnarInline(blake3CompressSource,
 		fmt.Sprintf(`{"expected":"%s"}`, expected), "Blake3CompressTest.runar.ts")
@@ -2366,8 +2345,8 @@ func TestBlake3Compress_Empty(t *testing.T) {
 
 func TestBlake3Compress_ABC(t *testing.T) {
 	block := "616263" + strings.Repeat("00", 61)
-	blake3IVHex := "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19"
-	expected := referenceBlake3Compress(blake3IVHex, block)
+	blake3IVHex := "67e6096a85ae67bb72f36e3c3af54fa57f520e518c68059babd9831f19cde05b"
+	expected := referenceBlake3Compress(blake3IVHex, block, 64)
 
 	lockingHex, err := compileRúnarInline(blake3CompressSource,
 		fmt.Sprintf(`{"expected":"%s"}`, expected), "Blake3CompressTest.runar.ts")
@@ -2394,7 +2373,7 @@ func TestBlake3Compress_RejectsWrongHash(t *testing.T) {
 		t.Fatalf("compile: %v", err)
 	}
 
-	blake3IVHex := "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19"
+	blake3IVHex := "67e6096a85ae67bb72f36e3c3af54fa57f520e518c68059babd9831f19cde05b"
 	cvBytes, _ := hex.DecodeString(blake3IVHex)
 	blockBytes, _ := hex.DecodeString(block)
 	unlockingHex := encodePushBytes(cvBytes) + encodePushBytes(blockBytes)
@@ -2407,7 +2386,7 @@ func TestBlake3Compress_RejectsWrongHash(t *testing.T) {
 func TestBlake3Compress_NonIVChaining(t *testing.T) {
 	customCV := strings.Repeat("deadbeef", 8)
 	block := strings.Repeat("ff", 64)
-	expected := referenceBlake3Compress(customCV, block)
+	expected := referenceBlake3Compress(customCV, block, 64)
 
 	lockingHex, err := compileRúnarInline(blake3CompressSource,
 		fmt.Sprintf(`{"expected":"%s"}`, expected), "Blake3CompressTest.runar.ts")
