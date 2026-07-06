@@ -255,8 +255,30 @@ def _decode_num2bin(hex_str: str) -> int:
 
 
 def encode_push_data(data_hex: str) -> str:
-    """Wrap hex data in a Bitcoin Script push data opcode."""
+    """Wrap hex data in a Bitcoin Script push data opcode.
+
+    Applies BSV consensus rule ``SCRIPT_VERIFY_MINIMALDATA`` for single-byte
+    pushes: a 1-byte payload whose value is in ``{0x00, 0x01..=0x10, 0x81}``
+    MUST use the corresponding minimal opcode (``OP_0`` / ``OP_1..OP_16`` /
+    ``OP_1NEGATE``) rather than the direct push ``01 NN``. Non-minimal direct
+    pushes are rejected at the relay layer with
+    ``non-mandatory-script-verify-flag (Data push larger than necessary)``.
+    """
     data_len = len(data_hex) // 2
+
+    # MINIMALDATA: single-byte payloads in the OP_N range must use the
+    # corresponding minimal opcode. The script-number encoder already
+    # short-circuits OP_N for Int fields; this brings the ByteString push
+    # path to the same standard so a 1-byte ByteString value does not emit
+    # a relay-rejected non-minimal direct push.
+    if data_len == 1:
+        byte = int(data_hex, 16)
+        if byte == 0x00:
+            return '00'  # OP_0
+        if 0x01 <= byte <= 0x10:
+            return f'{0x50 + byte:02x}'  # OP_1..OP_16
+        if byte == 0x81:
+            return '4f'  # OP_1NEGATE
 
     if data_len <= 75:
         return f'{data_len:02x}' + data_hex

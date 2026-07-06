@@ -49,6 +49,36 @@ RSpec.describe 'Runar::SDK::State' do
       # 1000 = 0x03E8 in little-endian → e803
       expect(mod.encode_push_data(data)).to eq("4de803#{data}")
     end
+
+    # MINIMALDATA (SCRIPT_VERIFY_MINIMALDATA): a 1-byte payload in
+    # {0x00, 0x01..0x10, 0x81} must use the minimal opcode, not a direct push.
+    context 'MINIMALDATA single-byte pushes' do
+      it 'encodes 0x00 as OP_0 (00)' do
+        expect(mod.encode_push_data('00')).to eq('00')
+      end
+
+      it 'encodes 0x05 as OP_5 (55)' do
+        expect(mod.encode_push_data('05')).to eq('55')
+      end
+
+      it 'encodes 0x81 as OP_1NEGATE (4f)' do
+        expect(mod.encode_push_data('81')).to eq('4f')
+      end
+
+      it 'encodes 0x01..0x10 as OP_1..OP_16' do
+        (1..16).each do |n|
+          expect(mod.encode_push_data(format('%02x', n))).to eq(format('%02x', 0x50 + n))
+        end
+      end
+
+      it 'still direct-pushes a single byte outside the range (0x11 -> 0111)' do
+        expect(mod.encode_push_data('11')).to eq('0111')
+      end
+
+      it 'still direct-pushes a two-byte payload (0x0011 -> 020011)' do
+        expect(mod.encode_push_data('0011')).to eq('020011')
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------

@@ -2109,6 +2109,20 @@ function encodePushData(dataHex: string): string {
   if (dataHex.length === 0) return '00'; // OP_0
   const len = dataHex.length / 2;
 
+  // MINIMALDATA: single-byte payloads in the OP_N range must use the
+  // corresponding minimal opcode (`OP_0` / `OP_1..OP_16` / `OP_1NEGATE`)
+  // rather than the direct push `01 NN`, which is relay-rejected as
+  // "Data push larger than necessary". `encodeScriptNumber` already
+  // short-circuits Int args to OP_N; this brings the ByteString push path
+  // to the same standard. Kept byte-identical with `encodePushDataState`
+  // in state.ts and the shared `encode_push_data` in the other six SDKs.
+  if (len === 1) {
+    const byte = parseInt(dataHex, 16);
+    if (byte === 0x00) return '00'; // OP_0
+    if (byte >= 0x01 && byte <= 0x10) return (0x50 + byte).toString(16).padStart(2, '0'); // OP_1..OP_16
+    if (byte === 0x81) return '4f'; // OP_1NEGATE
+  }
+
   if (len <= 75) {
     return len.toString(16).padStart(2, '0') + dataHex;
   } else if (len <= 0xff) {

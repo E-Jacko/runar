@@ -451,8 +451,33 @@ func EncodeScriptInt(n int64) string {
 
 // EncodePushData wraps a hex-encoded byte string in a Bitcoin Script push
 // data opcode.
+//
+// Applies BSV consensus rule SCRIPT_VERIFY_MINIMALDATA for single-byte
+// pushes: a 1-byte payload whose value is in {0x00, 0x01..=0x10, 0x81}
+// MUST use the corresponding minimal opcode (OP_0 / OP_1..OP_16 /
+// OP_1NEGATE) rather than the direct push "01 NN". Non-minimal direct
+// pushes are rejected at the relay layer with:
+//   non-mandatory-script-verify-flag (Data push larger than necessary)
 func EncodePushData(dataHex string) string {
 	dataLen := len(dataHex) / 2
+
+	// MINIMALDATA: single-byte payloads in the OP_N range must use the
+	// corresponding minimal opcode. The script-number encoder already
+	// short-circuits OP_N for Int fields; this brings the ByteString push
+	// path to the same standard so a 1-byte ByteString value does not emit
+	// a relay-rejected non-minimal direct push.
+	if dataLen == 1 {
+		if b, err := strconv.ParseUint(dataHex, 16, 8); err == nil {
+			switch {
+			case b == 0x00:
+				return "00" // OP_0
+			case b >= 0x01 && b <= 0x10:
+				return fmt.Sprintf("%02x", 0x50+b) // OP_1..OP_16
+			case b == 0x81:
+				return "4f" // OP_1NEGATE
+			}
+		}
+	}
 
 	if dataLen <= 75 {
 		return fmt.Sprintf("%02x", dataLen) + dataHex

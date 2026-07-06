@@ -199,6 +199,35 @@ class TestPushDataRoundTrip:
 
 
 # ---------------------------------------------------------------------------
+# MINIMALDATA-correct single-byte push encoding (SCRIPT_VERIFY_MINIMALDATA).
+# A 1-byte payload in {0x00, 0x01..0x10, 0x81} must use the minimal opcode
+# (OP_0 / OP_1..OP_16 / OP_1NEGATE), not a direct push "01 NN". Byte-identical
+# with the other six SDKs.
+# ---------------------------------------------------------------------------
+
+class TestPushDataMinimalData:
+    def test_op_0(self):
+        assert encode_push_data('00') == '00'
+
+    def test_op_1negate(self):
+        assert encode_push_data('81') == '4f'
+
+    def test_op_5(self):
+        assert encode_push_data('05') == '55'
+
+    def test_op_1_through_16(self):
+        for n in range(1, 17):
+            assert encode_push_data(f'{n:02x}') == f'{0x50 + n:02x}'
+
+    def test_single_byte_outside_range_still_direct_push(self):
+        for b in (0x11, 0x4f, 0x50, 0x60, 0x80, 0x82, 0xff):
+            assert encode_push_data(f'{b:02x}') == f'01{b:02x}'
+
+    def test_two_byte_payload_still_direct_push(self):
+        assert encode_push_data('0011') == '020011'
+
+
+# ---------------------------------------------------------------------------
 # extract_state_from_script — end-to-end tests
 # ---------------------------------------------------------------------------
 

@@ -2667,6 +2667,47 @@ func TestPushData_76Bytes_UsesPUSHDATA1(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// MINIMALDATA (SCRIPT_VERIFY_MINIMALDATA): a 1-byte payload in
+// {0x00, 0x01..0x10, 0x81} must use the minimal opcode (OP_0 / OP_1..OP_16 /
+// OP_1NEGATE), not a direct push "01 NN". Byte-identical with the other SDKs.
+// ---------------------------------------------------------------------------
+
+func TestPushData_MinimalData_SingleByte(t *testing.T) {
+	cases := map[string]string{
+		"00": "00", // OP_0
+		"05": "55", // OP_5
+		"81": "4f", // OP_1NEGATE
+	}
+	for input, want := range cases {
+		if got := EncodePushData(input); got != want {
+			t.Errorf("EncodePushData(%q) = %q, want %q", input, got, want)
+		}
+	}
+	// 0x01..0x10 -> OP_1..OP_16 (0x51..0x60)
+	for n := 1; n <= 16; n++ {
+		input := fmt.Sprintf("%02x", n)
+		want := fmt.Sprintf("%02x", 0x50+n)
+		if got := EncodePushData(input); got != want {
+			t.Errorf("EncodePushData(%q) = %q, want %q (OP_%d)", input, got, want, n)
+		}
+	}
+}
+
+func TestPushData_MinimalData_OutsideRangeStillDirectPush(t *testing.T) {
+	for _, b := range []int{0x11, 0x4f, 0x50, 0x60, 0x80, 0x82, 0xff} {
+		input := fmt.Sprintf("%02x", b)
+		want := fmt.Sprintf("01%02x", b)
+		if got := EncodePushData(input); got != want {
+			t.Errorf("EncodePushData(%q) = %q, want %q", input, got, want)
+		}
+	}
+	// Two-byte payload is unaffected.
+	if got := EncodePushData("0011"); got != "020011" {
+		t.Errorf("EncodePushData(\"0011\") = %q, want \"020011\"", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Row 387: MockSigner.sign() is deterministic
 // ---------------------------------------------------------------------------
 

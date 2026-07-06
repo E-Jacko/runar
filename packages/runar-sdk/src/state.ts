@@ -334,9 +334,27 @@ function encodeNum2Bin(n: bigint, width: number): string {
 
 /**
  * Encode variable-length data as Bitcoin Script push data (with length prefix).
+ *
+ * Applies BSV consensus rule `SCRIPT_VERIFY_MINIMALDATA` for single-byte
+ * pushes: a 1-byte payload whose value is in `{0x00, 0x01..=0x10, 0x81}`
+ * MUST use the corresponding minimal opcode (`OP_0` / `OP_1..OP_16` /
+ * `OP_1NEGATE`) rather than the direct push `01 NN`. Non-minimal direct
+ * pushes are rejected by ARC, TAAL ARC, and WhatsOnChain at the relay
+ * layer with: `non-mandatory-script-verify-flag (Data push larger than necessary)`.
  */
 function encodePushDataState(dataHex: string): string {
   const len = dataHex.length / 2;
+  // MINIMALDATA: single-byte payloads in the OP_N range must use the
+  // corresponding minimal opcode. The `encodeScriptNumber` path for Int
+  // fields already short-circuits to OP_N; this brings the ByteString path
+  // to the same standard so a 1-byte ByteString state field does not emit a
+  // relay-rejected non-minimal direct push.
+  if (len === 1) {
+    const byte = parseInt(dataHex, 16);
+    if (byte === 0x00) return '00'; // OP_0
+    if (byte >= 0x01 && byte <= 0x10) return (0x50 + byte).toString(16).padStart(2, '0'); // OP_1..OP_16
+    if (byte === 0x81) return '4f'; // OP_1NEGATE
+  }
   if (len <= 75) {
     return len.toString(16).padStart(2, '0') + dataHex;
   } else if (len <= 0xff) {

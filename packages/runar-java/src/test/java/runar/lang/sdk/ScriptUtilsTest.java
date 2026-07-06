@@ -18,6 +18,30 @@ class ScriptUtilsTest {
         assertEquals("4c4c" + data, out);
     }
 
+    // MINIMALDATA (SCRIPT_VERIFY_MINIMALDATA): a 1-byte payload in
+    // {0x00, 0x01..0x10, 0x81} must use the minimal opcode, not a direct push.
+    @Test
+    void encodePushDataMinimalDataSingleByte() {
+        assertEquals("00", ScriptUtils.encodePushData("00")); // OP_0
+        assertEquals("55", ScriptUtils.encodePushData("05")); // OP_5
+        assertEquals("4f", ScriptUtils.encodePushData("81")); // OP_1NEGATE
+        for (int n = 1; n <= 16; n++) {
+            assertEquals(String.format("%02x", 0x50 + n),
+                ScriptUtils.encodePushData(String.format("%02x", n)));
+        }
+    }
+
+    @Test
+    void encodePushDataMinimalDataBoundariesStillDirectPush() {
+        // Single bytes outside the OP_N range still direct-push.
+        for (int b : new int[]{0x11, 0x4f, 0x50, 0x60, 0x80, 0x82, 0xff}) {
+            assertEquals(String.format("01%02x", b),
+                ScriptUtils.encodePushData(String.format("%02x", b)));
+        }
+        // Two-byte payloads are unaffected.
+        assertEquals("020011", ScriptUtils.encodePushData("0011"));
+    }
+
     @Test
     void decodePushDataRoundTrips() {
         String data = "deadbeef";

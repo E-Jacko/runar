@@ -32,10 +32,28 @@ module Runar
       #   - ≤65535 bytes — OP_PUSHDATA2 (0x4d) + 2-byte LE length
       #   - otherwise    — OP_PUSHDATA4 (0x4e) + 4-byte LE length
       #
+      # Applies BSV consensus rule SCRIPT_VERIFY_MINIMALDATA for single-byte
+      # pushes: a 1-byte payload whose value is in {0x00, 0x01..0x10, 0x81}
+      # MUST use the corresponding minimal opcode (OP_0 / OP_1..OP_16 /
+      # OP_1NEGATE) rather than the direct push "01 NN". Non-minimal direct
+      # pushes are relay-rejected as "Data push larger than necessary".
+      #
       # @param data_hex [String] hex-encoded bytes to push
       # @return [String] hex-encoded push instruction + data
       def encode_push_data(data_hex)
         data_len = data_hex.length / 2
+
+        # MINIMALDATA: single-byte payloads in the OP_N range must use the
+        # corresponding minimal opcode. encode_script_int already
+        # short-circuits OP_N for Int fields; this brings the ByteString push
+        # path to the same standard so a 1-byte ByteString value does not
+        # emit a relay-rejected non-minimal direct push.
+        if data_len == 1
+          byte = data_hex.to_i(16)
+          return '00' if byte.zero?                                # OP_0
+          return format('%02x', 0x50 + byte) if byte.between?(1, 16) # OP_1..OP_16
+          return '4f' if byte == 0x81                              # OP_1NEGATE
+        end
 
         if data_len <= 75
           format('%02x', data_len) + data_hex

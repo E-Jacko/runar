@@ -255,8 +255,32 @@ pub fn encodeBigNum2Bin(allocator: std.mem.Allocator, decimal_str: []const u8, w
 
 /// EncodePushData wraps a hex-encoded byte string in a Bitcoin Script push
 /// data opcode.
+///
+/// Applies BSV consensus rule SCRIPT_VERIFY_MINIMALDATA for single-byte
+/// pushes: a 1-byte payload whose value is in {0x00, 0x01..=0x10, 0x81}
+/// MUST use the corresponding minimal opcode (OP_0 / OP_1..OP_16 /
+/// OP_1NEGATE) rather than the direct push "01 NN". Non-minimal direct
+/// pushes are relay-rejected as "Data push larger than necessary".
 pub fn encodePushData(allocator: std.mem.Allocator, data_hex: []const u8) ![]u8 {
     const data_len = data_hex.len / 2;
+
+    // MINIMALDATA: single-byte payloads in the OP_N range must use the
+    // corresponding minimal opcode. encodeScriptNumber already short-circuits
+    // OP_N for Int fields; this brings the ByteString push path to the same
+    // standard so a 1-byte ByteString value does not emit a relay-rejected
+    // non-minimal direct push.
+    if (data_len == 1) {
+        const maybe_byte: ?u8 = std.fmt.parseInt(u8, data_hex, 16) catch null;
+        if (maybe_byte) |b| {
+            if (b == 0x00) return allocator.dupe(u8, "00"); // OP_0
+            if (b >= 0x01 and b <= 0x10) {
+                var buf: [2]u8 = undefined;
+                _ = std.fmt.bufPrint(&buf, "{x:0>2}", .{@as(u8, @intCast(0x50 + @as(u16, b)))}) catch unreachable;
+                return allocator.dupe(u8, &buf);
+            }
+            if (b == 0x81) return allocator.dupe(u8, "4f"); // OP_1NEGATE
+        }
+    }
 
     if (data_len <= 75) {
         var result = try allocator.alloc(u8, 2 + data_hex.len);
@@ -679,6 +703,53 @@ test "encodePushData empty returns OP_0" {
     const result = try encodeArg(allocator, .{ .bytes = "" });
     defer allocator.free(result);
     try std.testing.expectEqualStrings("00", result);
+}
+
+// MINIMALDATA (SCRIPT_VERIFY_MINIMALDATA): a 1-byte payload in
+// {0x00, 0x01..0x10, 0x81} must use the minimal opcode, not a direct push.
+test "encodePushData MINIMALDATA single-byte opcodes" {
+    const allocator = std.testing.allocator;
+    {
+        const r = try encodePushData(allocator, "00");
+        defer allocator.free(r);
+        try std.testing.expectEqualStrings("00", r); // OP_0
+    }
+    {
+        const r = try encodePushData(allocator, "05");
+        defer allocator.free(r);
+        try std.testing.expectEqualStrings("55", r); // OP_5
+    }
+    {
+        const r = try encodePushData(allocator, "81");
+        defer allocator.free(r);
+        try std.testing.expectEqualStrings("4f", r); // OP_1NEGATE
+    }
+    var n: u8 = 1;
+    while (n <= 16) : (n += 1) {
+        var in_buf: [2]u8 = undefined;
+        _ = std.fmt.bufPrint(&in_buf, "{x:0>2}", .{n}) catch unreachable;
+        var want_buf: [2]u8 = undefined;
+        _ = std.fmt.bufPrint(&want_buf, "{x:0>2}", .{@as(u8, @intCast(0x50 + @as(u16, n)))}) catch unreachable;
+        const r = try encodePushData(allocator, &in_buf);
+        defer allocator.free(r);
+        try std.testing.expectEqualStrings(&want_buf, r);
+    }
+}
+
+test "encodePushData MINIMALDATA out-of-range still direct-pushes" {
+    const allocator = std.testing.allocator;
+    for ([_]u8{ 0x11, 0x4f, 0x50, 0x60, 0x80, 0x82, 0xff }) |b| {
+        var in_buf: [2]u8 = undefined;
+        _ = std.fmt.bufPrint(&in_buf, "{x:0>2}", .{b}) catch unreachable;
+        var want_buf: [4]u8 = undefined;
+        _ = std.fmt.bufPrint(&want_buf, "01{x:0>2}", .{b}) catch unreachable;
+        const r = try encodePushData(allocator, &in_buf);
+        defer allocator.free(r);
+        try std.testing.expectEqualStrings(&want_buf, r);
+    }
+    const r = try encodePushData(allocator, "0011");
+    defer allocator.free(r);
+    try std.testing.expectEqualStrings("020011", r);
 }
 
 test "encodeScriptNumber small values" {
