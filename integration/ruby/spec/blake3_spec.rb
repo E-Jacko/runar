@@ -14,7 +14,10 @@ BLAKE3_IV = [
   0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 ].freeze
-BLAKE3_IV_HEX = BLAKE3_IV.map { |w| w.to_s(16).rjust(8, '0') }.join.freeze
+# Standard BLAKE3 (BUG-101): the IV is encoded little-endian, so each 32-bit
+# word is emitted low-byte-first (0x6a09e667 -> "67e6096a"). This yields
+# 67e6096a...19cde05b, NOT the big-endian 6a09e667... word order.
+BLAKE3_IV_HEX = BLAKE3_IV.pack('V8').unpack1('H*').freeze
 BLAKE3_MSG_PERM = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8].freeze
 
 def blake3_rotr32(x, n)
@@ -47,15 +50,19 @@ def blake3_round(state, m)
   blake3_g(state, 3, 4,  9, 14, m[14], m[15])
 end
 
-def reference_blake3_compress(cv_hex, block_hex)
-  cv = (0...8).map { |i| cv_hex[(i * 8), 8].to_i(16) }
-  m  = (0...16).map { |i| block_hex[(i * 8), 8].to_i(16) }
+# Standard BLAKE3 (BUG-101): chaining value + message words are loaded as
+# little-endian 32-bit words, the digest is stored little-endian, and block_len
+# is the message-byte length (64 for a full block, the true length for
+# reference_blake3_hash).
+def reference_blake3_compress(cv_hex, block_hex, block_len)
+  cv = [cv_hex].pack('H*').unpack('V8')
+  m  = [block_hex].pack('H*').unpack('V16')
 
   state = [
     cv[0], cv[1], cv[2], cv[3],
     cv[4], cv[5], cv[6], cv[7],
     BLAKE3_IV[0], BLAKE3_IV[1], BLAKE3_IV[2], BLAKE3_IV[3],
-    0, 0, 64, 11
+    0, 0, block_len, 11
   ]
 
   msg = m.dup
@@ -65,12 +72,13 @@ def reference_blake3_compress(cv_hex, block_hex)
   end
 
   output = (0...8).map { |i| (state[i] ^ state[i + 8]) & 0xFFFFFFFF }
-  output.map { |w| w.to_s(16).rjust(8, '0') }.join
+  output.pack('V8').unpack1('H*')
 end
 
 def reference_blake3_hash(msg_hex)
+  block_len = msg_hex.length / 2
   padded = msg_hex.ljust(128, '0')
-  reference_blake3_compress(BLAKE3_IV_HEX, padded)
+  reference_blake3_compress(BLAKE3_IV_HEX, padded, block_len)
 end
 
 def compile_source_blake3(source, file_name)
@@ -107,7 +115,7 @@ RSpec.describe 'BLAKE3' do # rubocop:disable RSpec/DescribeClass
       TS
 
       block    = '00' * 64
-      expected = reference_blake3_compress(BLAKE3_IV_HEX, block)
+      expected = reference_blake3_compress(BLAKE3_IV_HEX, block, 64)
 
       artifact = compile_source_blake3(source, 'Blake3CompressEmpty.runar.ts')
       contract = Runar::SDK::RunarContract.new(artifact, [expected])

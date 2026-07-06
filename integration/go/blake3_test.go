@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -37,12 +38,15 @@ var blake3IV = [8]uint32{
 
 var blake3MsgPerm = [16]int{2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8}
 
+// blake3IVHex returns the BLAKE3 IV encoded as little-endian bytes (standard
+// BLAKE3, BUG-101). Each 32-bit IV word is written little-endian, so this
+// yields 67e6096a...19cde05b — NOT the big-endian 6a09e667... word order.
 func blake3IVHex() string {
-	var sb strings.Builder
-	for _, w := range blake3IV {
-		fmt.Fprintf(&sb, "%08x", w)
+	buf := make([]byte, 32)
+	for i, w := range blake3IV {
+		binary.LittleEndian.PutUint32(buf[i*4:], w)
 	}
-	return sb.String()
+	return hex.EncodeToString(buf)
 }
 
 func rotr32(x uint32, n uint) uint32 {
@@ -71,7 +75,12 @@ func blake3Round(state []uint32, m []uint32) {
 	blake3G(state, 3, 4, 9, 14, m[14], m[15])
 }
 
-func referenceBlake3Compress(cvHex, blockHex string) string {
+// referenceBlake3Compress implements BLAKE3 single-block compression.
+// Chaining-value/message words are loaded and the digest is stored as
+// little-endian 32-bit words (standard BLAKE3, BUG-101). blockLen is the
+// message-byte length placed in the block-length state word (64 for a full
+// block, the true message length for blake3Hash).
+func referenceBlake3Compress(cvHex, blockHex string, blockLen uint32) string {
 	if len(cvHex) != 64 || len(blockHex) != 128 {
 		panic(fmt.Sprintf("blake3Compress: cv must be 32 bytes, block must be 64 bytes (got cv=%d hex chars, block=%d hex chars)", len(cvHex), len(blockHex)))
 	}
@@ -86,18 +95,18 @@ func referenceBlake3Compress(cvHex, blockHex string) string {
 
 	var cv [8]uint32
 	for i := 0; i < 8; i++ {
-		cv[i] = uint32(cvBytes[i*4])<<24 | uint32(cvBytes[i*4+1])<<16 | uint32(cvBytes[i*4+2])<<8 | uint32(cvBytes[i*4+3])
+		cv[i] = binary.LittleEndian.Uint32(cvBytes[i*4:])
 	}
 	var m [16]uint32
 	for i := 0; i < 16; i++ {
-		m[i] = uint32(blockBytes[i*4])<<24 | uint32(blockBytes[i*4+1])<<16 | uint32(blockBytes[i*4+2])<<8 | uint32(blockBytes[i*4+3])
+		m[i] = binary.LittleEndian.Uint32(blockBytes[i*4:])
 	}
 
 	state := []uint32{
 		cv[0], cv[1], cv[2], cv[3],
 		cv[4], cv[5], cv[6], cv[7],
 		blake3IV[0], blake3IV[1], blake3IV[2], blake3IV[3],
-		0, 0, 64, 11,
+		0, 0, blockLen, 11,
 	}
 
 	msg := make([]uint32, 16)
@@ -113,16 +122,12 @@ func referenceBlake3Compress(cvHex, blockHex string) string {
 		}
 	}
 
-	var out [8]uint32
+	result := make([]byte, 32)
 	for i := 0; i < 8; i++ {
-		out[i] = state[i] ^ state[i+8]
+		w := state[i] ^ state[i+8]
+		binary.LittleEndian.PutUint32(result[i*4:], w)
 	}
-
-	var sb strings.Builder
-	for _, w := range out {
-		fmt.Fprintf(&sb, "%08x", w)
-	}
-	return sb.String()
+	return hex.EncodeToString(result)
 }
 
 func referenceBlake3Hash(msgHex string) string {
@@ -132,8 +137,10 @@ func referenceBlake3Hash(msgHex string) string {
 	if len(msgHex)/2 > 64 {
 		panic("blake3Hash: msg must fit a single 64-byte block")
 	}
+	// blockLen is the real message byte length (0..64), not a fixed 64.
+	blockLen := uint32(len(msgHex) / 2)
 	padded := msgHex + strings.Repeat("00", 64-len(msgHex)/2)
-	return referenceBlake3Compress(blake3IVHex(), padded)
+	return referenceBlake3Compress(blake3IVHex(), padded, blockLen)
 }
 
 // ---------------------------------------------------------------------------
@@ -260,14 +267,14 @@ func TestBlake3_Compress_EmptyBlockWithIV(t *testing.T) {
 	artifact := getBlake3CompressArtifact(t)
 	t.Logf("Blake3CompressVerify script: %d bytes", len(artifact.Script)/2)
 	block := strings.Repeat("00", 64)
-	expected := referenceBlake3Compress(blake3IVHex(), block)
+	expected := referenceBlake3Compress(blake3IVHex(), block, 64)
 	deployAndVerifyBlake3(t, artifact, expected, []interface{}{blake3IVHex(), block})
 }
 
 func TestBlake3_Compress_AbcPaddedTo64(t *testing.T) {
 	artifact := getBlake3CompressArtifact(t)
 	block := "616263" + strings.Repeat("00", 61)
-	expected := referenceBlake3Compress(blake3IVHex(), block)
+	expected := referenceBlake3Compress(blake3IVHex(), block, 64)
 	deployAndVerifyBlake3(t, artifact, expected, []interface{}{blake3IVHex(), block})
 }
 
@@ -275,7 +282,7 @@ func TestBlake3_Compress_NonIVChainingValue(t *testing.T) {
 	artifact := getBlake3CompressArtifact(t)
 	customCV := strings.Repeat("deadbeef", 8)
 	block := strings.Repeat("ff", 64)
-	expected := referenceBlake3Compress(customCV, block)
+	expected := referenceBlake3Compress(customCV, block, 64)
 	deployAndVerifyBlake3(t, artifact, expected, []interface{}{customCV, block})
 }
 
