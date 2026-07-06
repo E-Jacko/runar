@@ -317,6 +317,29 @@ module RunarCompiler::Codegen
     refs
   end
 
+  # Collect every binding name defined anywhere in a binding sequence,
+  # recursing into nested if-branches and loop bodies. Used by _lower_loop
+  # to distinguish loop-internal (re)definitions from true outer-scope refs.
+  #
+  # @param bindings [Array<IR::ANFBinding>]
+  # @return [Set<String>]
+  def self.collect_deep_binding_names(bindings)
+    names = Set.new
+    walk = lambda do |bs|
+      (bs || []).each do |b|
+        names.add(b.name)
+        if b.value.kind == "if"
+          walk.call(b.value.then)
+          walk.call(b.value.else_)
+        elsif b.value.kind == "loop"
+          walk.call(b.value.body)
+        end
+      end
+    end
+    walk.call(bindings)
+    names
+  end
+
   # -----------------------------------------------------------------------
   # Helpers
   # -----------------------------------------------------------------------
@@ -1135,7 +1158,7 @@ module RunarCompiler::Codegen
       when "if"
         _lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
       when "loop"
-        _lower_loop(name, value.count, value.body, value.iter_var)
+        _lower_loop(name, value.count, value.body, value.iter_var, binding_index, last_uses)
       when "check_preimage"
         _lower_check_preimage(name, value.preimage, binding_index, last_uses)
       when "deserialize_state"
@@ -1209,8 +1232,14 @@ module RunarCompiler::Codegen
         @sm.pop
         @sm.push(binding_name)
       else
-        emit_push_int(0)
-        @sm.push(binding_name)
+        # Parameter no longer on the stack -- a compiler invariant violation
+        # (historically caused by unrolled loops consuming outer refs; see
+        # _lower_loop). Silently emitting OP_0 here produced scripts that
+        # compiled, passed the env-based interpreter, and then failed on
+        # chain -- fail loudly instead.
+        raise "Stack lowering: method parameter '#{param_name}' is not on the stack " \
+              "at a post-consumption reference (stack: [#{@sm.slots.join(', ')}]). " \
+              "Refusing to emit a silent OP_0 placeholder."
       end
     end
 
@@ -1282,9 +1311,12 @@ module RunarCompiler::Codegen
           @sm.pop
           @sm.push(binding_name)
         else
-          # Referenced value not on stack -- push placeholder
-          emit_push_int(0)
-          @sm.push(binding_name)
+          # Referenced value no longer on the stack -- a compiler invariant
+          # violation (see _lower_load_param for the loop-consumption history).
+          # Fail loudly instead of silently emitting OP_0.
+          raise "Stack lowering: value '#{ref_name}' referenced by '#{binding_name}' is not " \
+                "on the stack (stack: [#{@sm.slots.join(', ')}]). " \
+                "Refusing to emit a silent OP_0 placeholder."
         end
         return
       end
@@ -1969,24 +2001,31 @@ module RunarCompiler::Codegen
     # loop
     # -----------------------------------------------------------------
 
-    def _lower_loop(binding_name, count, body, iter_var)
+    def _lower_loop(binding_name, count, body, iter_var, loop_binding_index = nil, enclosing_last_uses = nil)
       body ||= []
       count ||= 0
 
-      # Collect body binding names
+      # Names (re)defined anywhere inside the loop body, nested branches
+      # included. A name the body itself binds is NOT an outer ref --
+      # reassigned locals (e.g. `off = off + ...` inside an if) flow through
+      # _lower_if's branch-reassignment reconciliation, not through the
+      # protection here.
+      deep_body_binding_names = RunarCompiler::Codegen.collect_deep_binding_names(body)
+
+      # Collect body binding names (top-level only) for the local-bindings merge.
       body_binding_names = {}
       body.each { |b| body_binding_names[b.name] = true }
 
-      # Collect outer-scope names referenced in the loop body
+      # Collect ALL outer-scope refs used anywhere in the body -- including
+      # refs that only occur inside nested if-branches (collect_refs recurses).
+      # The previous top-level-only scan missed nested references: a const
+      # defined before the loop and referenced only inside an if-branch was
+      # consumed by the first iteration, making iteration 2 fail with
+      # "Value 'X' not found on stack".
       outer_refs = Set.new
       body.each do |b|
-        if b.value.kind == "load_param" && b.value.name != iter_var
-          outer_refs.add(b.value.name)
-        end
-        if b.value.kind == "load_const" && b.value.const_string &&
-           b.value.const_string.length > 5 && b.value.const_string[0, 5] == "@ref:"
-          ref_name = b.value.const_string[5..]
-          outer_refs.add(ref_name) unless body_binding_names[ref_name]
+        RunarCompiler::Codegen.collect_refs(b.value).each do |ref|
+          outer_refs.add(ref) if ref != iter_var && !deep_body_binding_names.include?(ref)
         end
       end
 
@@ -2002,9 +2041,23 @@ module RunarCompiler::Codegen
 
         lu = RunarCompiler::Codegen.compute_last_uses(body)
 
-        # In non-final iterations, prevent outer-scope refs from being consumed
-        if i < count - 1
-          outer_refs.each { |ref_name| lu[ref_name] = body.length }
+        # Prevent outer-scope refs from being consumed by setting their
+        # last-use beyond any body binding index:
+        #  - non-final iterations: always (the next iteration re-reads them);
+        #  - final iteration: when the enclosing scope still references them
+        #    AFTER the loop. Previously the final iteration consumed every
+        #    outer ref at its last body use, so a method param (or const)
+        #    referenced after the loop was gone from the stack and was
+        #    silently lowered to an OP_0/empty push -- compilation succeeded,
+        #    the env-based interpreter passed, but the emitted Script failed
+        #    at runtime (silent interpreter <-> Script divergence).
+        is_final_iteration = i == count - 1
+        outer_refs.each do |ref_name|
+          used_after_loop =
+            !enclosing_last_uses.nil? &&
+            !loop_binding_index.nil? &&
+            (enclosing_last_uses[ref_name] || -1) > loop_binding_index
+          lu[ref_name] = body.length if !is_final_iteration || used_after_loop
         end
 
         body.each_with_index do |b, j|

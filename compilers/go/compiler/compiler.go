@@ -191,7 +191,9 @@ func CompileFromProgram(program *ir.ANFProgram, opts ...CompileOptions) (*Artifa
 	o := mergeOptions(opts)
 
 	// Bake constructor args into ANF properties.
-	applyConstructorArgs(program, o.ConstructorArgs)
+	if errs := applyConstructorArgs(program, o.ConstructorArgs); len(errs) > 0 {
+		return nil, fmt.Errorf("applyConstructorArgs: %s", strings.Join(errs, "; "))
+	}
 
 	// Pass 4.25: Constant folding (on by default)
 	if !o.DisableConstantFolding {
@@ -654,7 +656,13 @@ func CompileFromSourceWithResult(sourcePath string, opts ...CompileOptions) *Com
 	result.ANF = frontend.LowerToANF(result.Contract)
 
 	// Bake constructor args into ANF properties.
-	applyConstructorArgs(result.ANF, o.ConstructorArgs)
+	if errs := applyConstructorArgs(result.ANF, o.ConstructorArgs); len(errs) > 0 {
+		for _, msg := range errs {
+			result.Diagnostics = append(result.Diagnostics, frontend.MakeDiagnostic(
+				msg, frontend.SeverityError, nil))
+		}
+		return result
+	}
 
 	// Pass 4.25: Constant folding (on by default)
 	if !o.DisableConstantFolding {
@@ -797,7 +805,13 @@ func CompileFromSourceStrWithResult(source string, fileName string, opts ...Comp
 	result.ANF = frontend.LowerToANF(result.Contract)
 
 	// Bake constructor args into ANF properties.
-	applyConstructorArgs(result.ANF, o.ConstructorArgs)
+	if errs := applyConstructorArgs(result.ANF, o.ConstructorArgs); len(errs) > 0 {
+		for _, msg := range errs {
+			result.Diagnostics = append(result.Diagnostics, frontend.MakeDiagnostic(
+				msg, frontend.SeverityError, nil))
+		}
+		return result
+	}
 
 	// Pass 4.25: Constant folding (on by default)
 	if !o.DisableConstantFolding {

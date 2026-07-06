@@ -7,6 +7,7 @@
 
 require "json"
 require "time"
+require "set"
 
 require_relative "ir/types"
 
@@ -281,16 +282,128 @@ module RunarCompiler
   # -------------------------------------------------------------------------
 
   # Bake constructor arg values into ANF property initial_values.
+  #
+  # When args are provided they are validated before AND after baking so a
+  # mistyped or mis-shaped +args+ fails loudly instead of silently baking
+  # nothing and emitting OP_0 placeholder scripts that fail opaquely at
+  # runtime. Rejects:
+  #  (a) a positional array instead of a name-keyed record (Ruby is
+  #      dynamically typed, so the natural `[value]` guess must be caught),
+  #  (b) keys that match no contract property (typos),
+  #  (c) a readonly property referenced by a method body left unbaked after
+  #      applying the args (checked on a DCE'd probe so unreferenced
+  #      readonlys stay allowed; the constructor's super() call is excluded).
+  # The no-args placeholder path (nil / empty record) stays unchecked and
+  # byte-identical.
   def self._apply_constructor_args(program, args)
-    return if args.nil? || args.empty?
+    return if args.nil?
+    # An empty *record* is the unchecked no-op placeholder path; an array
+    # (even empty) is a shape error handled by check (a) below.
+    return if !args.is_a?(Array) && args.empty?
 
+    # (a) Shape / positional-array reject.
+    if args.is_a?(Array)
+      prop_names = program.properties.map(&:name).join(", ")
+      example = program.properties.empty? ? "propName" : program.properties.first.name
+      raise CompilationError,
+            "constructorArgs must be a record keyed by property name, not a positional array. " \
+            "Contract '#{program.contract_name}' properties: [#{prop_names}]. " \
+            "Example: { #{example}: <value> }"
+    end
+
+    # (b) Unknown-key reject.
+    prop_names_list = program.properties.map(&:name)
+    args.each_key do |key|
+      next if prop_names_list.include?(key)
+
+      raise CompilationError,
+            "constructorArgs key '#{key}' does not match any property of contract " \
+            "'#{program.contract_name}' (properties: [#{prop_names_list.join(', ')}]). " \
+            "Nothing would be baked for this key."
+    end
+
+    # Bake values into ANF property initial_values.
     program.properties.each do |prop|
-      if args.key?(prop.name)
-        prop.initial_value = args[prop.name]
+      prop.initial_value = args[prop.name] if args.key?(prop.name)
+    end
+
+    # (c) Unbaked-referenced-readonly reject.
+    unbaked = _find_unbaked_referenced_readonly(program)
+    raise CompilationError, unbaked.join("; ") unless unbaked.empty?
+  end
+  private_class_method :_apply_constructor_args
+
+  # After baking constructor args, find readonly properties that are
+  # REFERENCED by at least one method body but still have no baked
+  # initial_value. Such properties would be emitted as OP_0 placeholders,
+  # making the compiled script fail opaquely at runtime.
+  #
+  # @return [Array<String>] error messages (empty when valid)
+  def self._find_unbaked_referenced_readonly(program)
+    referenced = _collect_referenced_props(program)
+    errors = []
+    program.properties.each do |prop|
+      next unless prop.readonly && prop.initial_value.nil? && referenced.include?(prop.name)
+
+      errors << "readonly property '#{prop.name}' is referenced by a method but has no value " \
+                "after baking constructorArgs -- the emitted script would carry an OP_0 " \
+                "placeholder that fails at runtime. Provide '#{prop.name}' in constructorArgs " \
+                "(or give the property an initializer)."
+    end
+    errors
+  end
+  private_class_method :_find_unbaked_referenced_readonly
+
+  # Collect the property names actually referenced by method bodies.
+  #
+  # The raw ANF may load properties that later prove dead; only after
+  # dead-binding elimination do the surviving +load_prop+ nodes reflect real
+  # references. DCE mutates +method.body+ in place, so it runs on a throwaway
+  # probe whose methods carry duplicated body arrays (the binding objects are
+  # only read by DCE, never mutated), leaving the main pipeline untouched.
+  #
+  # @return [Set<String>]
+  def self._collect_referenced_props(program)
+    require_relative "frontend/dce"
+    probe = IR::ANFProgram.new(
+      contract_name: program.contract_name,
+      properties: program.properties,
+      methods: program.methods.map do |m|
+        IR::ANFMethod.new(name: m.name, params: m.params, body: m.body.dup, is_public: m.is_public)
+      end,
+      parent_class: program.parent_class
+    )
+    Frontend::DCE.eliminate_dead_code(probe)
+
+    referenced = Set.new
+    probe.methods.each do |method|
+      # The constructor's super(...) call references every property but is
+      # never emitted as script code -- only real method bodies count.
+      next if method.name == "constructor"
+
+      _collect_load_prop_refs(method.body, referenced)
+    end
+    referenced
+  end
+  private_class_method :_collect_referenced_props
+
+  # Recursively collect +load_prop+ property names from ANF bindings,
+  # recursing only through if(then/else) + loop(body).
+  def self._collect_load_prop_refs(bindings, out)
+    bindings.each do |binding|
+      v = binding.value
+      case v.kind
+      when "load_prop"
+        out.add(v.name)
+      when "if"
+        _collect_load_prop_refs(v.then || [], out)
+        _collect_load_prop_refs(v.else_ || [], out)
+      when "loop"
+        _collect_load_prop_refs(v.body || [], out)
       end
     end
   end
-  private_class_method :_apply_constructor_args
+  private_class_method :_collect_load_prop_refs
 
   # Read an ANF IR JSON file and compile it to a Runar artifact.
   #

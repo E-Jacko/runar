@@ -302,6 +302,11 @@ impl StackMap {
     fn named_slots(&self) -> HashSet<String> {
         self.slots.iter().filter(|s| !s.is_empty()).cloned().collect()
     }
+
+    /// Debug string of the slot names (bottom -> top) for error messages.
+    fn debug_slots(&self) -> String {
+        self.slots.join(", ")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +341,30 @@ fn compute_last_uses(bindings: &[ANFBinding]) -> HashMap<String, usize> {
         }
     }
     last_use
+}
+
+/// Collect every binding name defined anywhere in a binding sequence,
+/// recursing into nested if-branches and loop bodies. Used by lower_loop to
+/// distinguish loop-internal (re)definitions from true outer-scope refs.
+fn collect_deep_binding_names(bindings: &[ANFBinding]) -> HashSet<String> {
+    fn walk(bindings: &[ANFBinding], names: &mut HashSet<String>) {
+        for b in bindings {
+            names.insert(b.name.clone());
+            match &b.value {
+                ANFValue::If { then, else_branch, .. } => {
+                    walk(then, names);
+                    walk(else_branch, names);
+                }
+                ANFValue::Loop { body, .. } => {
+                    walk(body, names);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut names = HashSet::new();
+    walk(bindings, &mut names);
+    names
 }
 
 fn collect_refs(value: &ANFValue) -> Vec<String> {
@@ -1039,7 +1068,7 @@ impl LoweringContext {
                 body,
                 iter_var,
             } => {
-                self.lower_loop(name, *count, body, iter_var);
+                self.lower_loop(name, *count, body, iter_var, Some(binding_index), Some(last_uses));
             }
             ANFValue::Assert { value, .. } => {
                 self.lower_assert(value, binding_index, last_uses, false);
@@ -1096,8 +1125,18 @@ impl LoweringContext {
             self.sm.pop();
             self.sm.push(binding_name);
         } else {
-            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
-            self.sm.push(binding_name);
+            // Parameter no longer on the stack — a compiler invariant violation
+            // (historically caused by unrolled loops consuming outer refs; see
+            // lower_loop). Silently emitting OP_0 here produced scripts that
+            // compiled, passed the env-based interpreter, and then failed on
+            // chain — fail loudly instead.
+            panic!(
+                "Stack lowering: method parameter '{}' is not on the stack at a \
+                 post-consumption reference (stack: [{}]). Refusing to emit a \
+                 silent OP_0 placeholder.",
+                param_name,
+                self.sm.debug_slots()
+            );
         }
     }
 
@@ -1191,9 +1230,17 @@ impl LoweringContext {
                     self.sm.pop();
                     self.sm.push(binding_name);
                 } else {
-                    // Referenced value not on stack -- push a placeholder
-                    self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
-                    self.sm.push(binding_name);
+                    // Referenced value no longer on the stack — a compiler
+                    // invariant violation (see lower_load_param for the loop-
+                    // consumption history). Fail loudly instead of silently
+                    // emitting OP_0.
+                    panic!(
+                        "Stack lowering: value '{}' referenced by '{}' is not on the \
+                         stack (stack: [{}]). Refusing to emit a silent OP_0 placeholder.",
+                        ref_name,
+                        binding_name,
+                        self.sm.debug_slots()
+                    );
                 }
                 return;
             }
@@ -1985,26 +2032,28 @@ impl LoweringContext {
         count: usize,
         body: &[ANFBinding],
         iter_var: &str,
+        loop_binding_index: Option<usize>,
+        enclosing_last_uses: Option<&HashMap<String, usize>>,
     ) {
-        // Collect outer-scope names referenced in the loop body.
-        // These must not be consumed in non-final iterations.
+        // Names (re)defined anywhere inside the loop body, nested branches
+        // included. A name the body itself binds is NOT an outer ref —
+        // reassigned locals (e.g. `off = off + ...` inside an if) flow through
+        // lower_if's branch-reassignment reconciliation, not through protection
+        // here.
+        let deep_body_binding_names = collect_deep_binding_names(body);
         let body_binding_names: HashSet<String> = body.iter().map(|b| b.name.clone()).collect();
+
+        // Collect ALL outer-scope refs used anywhere in the body — including
+        // refs that only occur inside nested if-branches (collect_refs recurses).
+        // The previous top-level-only scan missed nested references: a const
+        // defined before the loop and referenced only inside an if-branch was
+        // consumed by the first iteration, making iteration 2 fail with
+        // "value 'X' not found on stack".
         let mut outer_refs = HashSet::new();
         for b in body {
-            if let ANFValue::LoadParam { name } = &b.value {
-                if name != iter_var {
-                    outer_refs.insert(name.clone());
-                }
-            }
-            // Also protect @ref: targets from outer scope (not redefined in body)
-            if let ANFValue::LoadConst { value: v } = &b.value {
-                if let Some(s) = v.as_str() {
-                    if s.len() > 5 && &s[..5] == "@ref:" {
-                        let ref_name = &s[5..];
-                        if !body_binding_names.contains(ref_name) {
-                            outer_refs.insert(ref_name.to_string());
-                        }
-                    }
+            for r in collect_refs(&b.value) {
+                if r.as_str() != iter_var && !deep_body_binding_names.contains(&r) {
+                    outer_refs.insert(r);
                 }
             }
         }
@@ -2020,10 +2069,23 @@ impl LoweringContext {
 
             let mut last_uses = compute_last_uses(body);
 
-            // In non-final iterations, prevent outer-scope refs from being
-            // consumed by setting their last-use beyond any body binding index.
-            if i < count - 1 {
-                for ref_name in &outer_refs {
+            // Prevent outer-scope refs from being consumed by setting their
+            // last-use beyond any body binding index:
+            //  - in non-final iterations: always (the next iteration re-reads them);
+            //  - in the FINAL iteration: when the enclosing scope still references
+            //    them AFTER the loop. Previously the final iteration consumed
+            //    every outer ref at its last body use, so a method param (or
+            //    const) referenced after the loop was gone from the stack and was
+            //    silently lowered to an OP_0/empty push — compilation succeeded,
+            //    the env-based interpreter passed, but the emitted Script failed
+            //    at runtime (silent interpreter <-> Script divergence).
+            let is_final_iteration = i == count - 1;
+            for ref_name in &outer_refs {
+                let used_after_loop = match (loop_binding_index, enclosing_last_uses) {
+                    (Some(idx), Some(elu)) => elu.get(ref_name).map_or(false, |&lu| lu > idx),
+                    _ => false,
+                };
+                if !is_final_iteration || used_after_loop {
                     last_uses.insert(ref_name.clone(), body.len());
                 }
             }

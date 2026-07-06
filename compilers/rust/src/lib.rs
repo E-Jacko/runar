@@ -45,14 +45,118 @@ impl Default for CompileOptions {
     }
 }
 
-/// Apply constructor args by setting ANF property initial_value fields.
-fn apply_constructor_args(program: &mut ir::ANFProgram, args: &std::collections::HashMap<String, serde_json::Value>) {
+/// Validate `constructor_args` shape/keys, bake them into the ANF, then verify
+/// no referenced readonly property is left unbaked. Returns a list of error
+/// messages (empty = OK). Mirrors the TypeScript `validateConstructorArgsShape`
+/// + `findUnbakedReferencedReadonly` pair in
+/// `packages/runar-compiler/src/index.ts` (PR #113, fix 1).
+///
+/// The no-args path returns no errors and mutates nothing — byte-identical to
+/// the previous behaviour.
+///
+/// Check (a) — "positional array" reject — is structurally N/A for the Rust
+/// tier: `constructor_args` is a `HashMap<String, serde_json::Value>`, already
+/// name-keyed, so no positional array can reach this typed API. Kept as a
+/// documented no-op to stay 1:1 with the dynamically-typed tiers.
+fn apply_constructor_args(
+    program: &mut ir::ANFProgram,
+    args: &std::collections::HashMap<String, serde_json::Value>,
+) -> Vec<String> {
     if args.is_empty() {
-        return;
+        return Vec::new();
     }
+
+    // (b) Unknown-key reject — every key must name a contract property.
+    let prop_name_set: std::collections::HashSet<&str> =
+        program.properties.iter().map(|p| p.name.as_str()).collect();
+    let mut shape_errors: Vec<String> = Vec::new();
+    for key in args.keys() {
+        if !prop_name_set.contains(key.as_str()) {
+            let prop_names: Vec<&str> =
+                program.properties.iter().map(|p| p.name.as_str()).collect();
+            shape_errors.push(format!(
+                "constructorArgs key '{}' does not match any property of contract '{}' \
+                 (properties: [{}]). Nothing would be baked for this key.",
+                key,
+                program.contract_name,
+                prop_names.join(", ")
+            ));
+        }
+    }
+    if !shape_errors.is_empty() {
+        return shape_errors;
+    }
+
+    // Bake.
     for prop in &mut program.properties {
         if let Some(val) = args.get(&prop.name) {
             prop.initial_value = Some(val.clone());
+        }
+    }
+
+    // (c) Unbaked-referenced-readonly reject.
+    find_unbaked_referenced_readonly(program)
+}
+
+/// After baking `constructor_args`, find readonly properties that are
+/// REFERENCED by at least one method body but still have no baked
+/// `initial_value`. Such properties would be emitted as OP_0 placeholders,
+/// making the compiled script fail opaquely at runtime.
+fn find_unbaked_referenced_readonly(program: &ir::ANFProgram) -> Vec<String> {
+    let referenced = collect_referenced_props(program);
+    let mut errors = Vec::new();
+    for prop in &program.properties {
+        if prop.readonly && prop.initial_value.is_none() && referenced.contains(&prop.name) {
+            errors.push(format!(
+                "readonly property '{}' is referenced by a method but has no value after \
+                 baking constructorArgs — the emitted script would carry an OP_0 placeholder \
+                 that fails at runtime. Provide '{}' in constructorArgs (or give the property \
+                 an initializer).",
+                prop.name, prop.name
+            ));
+        }
+    }
+    errors
+}
+
+/// Collect the property names actually referenced by method bodies.
+///
+/// The raw ANF may load properties that are ultimately dead; only after
+/// dead-binding elimination do the surviving `load_prop` nodes reflect real
+/// references. DCE is a pure function, so running it here on a probe copy does
+/// not perturb the main pipeline. The constructor's `super(...)` call
+/// references every property but is never emitted as script code, so it is
+/// excluded.
+fn collect_referenced_props(program: &ir::ANFProgram) -> std::collections::HashSet<String> {
+    let probe = frontend::dce::eliminate_dead_code(program.clone());
+    let mut referenced = std::collections::HashSet::new();
+    for method in &probe.methods {
+        if method.name == "constructor" {
+            continue;
+        }
+        collect_load_prop_refs(&method.body, &mut referenced);
+    }
+    referenced
+}
+
+/// Recursively collect `load_prop` property names from ANF bindings.
+fn collect_load_prop_refs(
+    bindings: &[ir::ANFBinding],
+    out: &mut std::collections::HashSet<String>,
+) {
+    for binding in bindings {
+        match &binding.value {
+            ir::ANFValue::LoadProp { name } => {
+                out.insert(name.clone());
+            }
+            ir::ANFValue::If { then, else_branch, .. } => {
+                collect_load_prop_refs(then, out);
+                collect_load_prop_refs(else_branch, out);
+            }
+            ir::ANFValue::Loop { body, .. } => {
+                collect_load_prop_refs(body, out);
+            }
+            _ => {}
         }
     }
 }
@@ -215,8 +319,14 @@ pub fn compile_from_source_str_with_options(
     // Pass 4: ANF Lower
     let mut anf_program = frontend::anf_lower::lower_to_anf(&contract);
 
-    // Bake constructor args into ANF properties.
-    apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    // Bake constructor args into ANF properties (validated first).
+    let arg_errors = apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    if !arg_errors.is_empty() {
+        return Err(format!(
+            "constructorArgs errors:\n  {}",
+            arg_errors.join("\n  ")
+        ));
+    }
 
     // Pass 4.25: Constant folding (optional)
     if !opts.disable_constant_folding {
@@ -306,8 +416,14 @@ pub fn compile_source_str_to_ir_with_options(
 
     let mut anf_program = frontend::anf_lower::lower_to_anf(&contract);
 
-    // Bake constructor args into ANF properties.
-    apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    // Bake constructor args into ANF properties (validated first).
+    let arg_errors = apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    if !arg_errors.is_empty() {
+        return Err(format!(
+            "constructorArgs errors:\n  {}",
+            arg_errors.join("\n  ")
+        ));
+    }
 
     // Pass 4.25: Constant folding (optional)
     if !opts.disable_constant_folding {
@@ -465,8 +581,14 @@ pub fn compile_from_source_str_with_result(
     // Pass 4: ANF lowering
     let mut anf_program = frontend::anf_lower::lower_to_anf(contract);
 
-    // Bake constructor args into ANF properties.
-    apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    // Bake constructor args into ANF properties (validated first).
+    let arg_errors = apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    if !arg_errors.is_empty() {
+        for msg in arg_errors {
+            result.diagnostics.push(Diagnostic::error(msg, None));
+        }
+        return result;
+    }
 
     // Pass 4.25: Constant folding (optional)
     if !opts.disable_constant_folding {

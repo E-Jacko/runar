@@ -278,6 +278,11 @@ public final class StackLower {
             for (String s : slots) if (s != null && !s.isEmpty()) out.add(s);
             return out;
         }
+
+        /** Debug string of the slot names (bottom -> top) for error messages. */
+        String debugSlots() {
+            return String.join(", ", slots);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -314,6 +319,29 @@ public final class StackLower {
             }
         }
         return lastUse;
+    }
+
+    /**
+     * Collect every binding name defined anywhere in a binding sequence,
+     * recursing into nested if-branches and loop bodies. Used by lowerLoop to
+     * distinguish loop-internal (re)definitions from true outer-scope refs.
+     */
+    static Set<String> collectDeepBindingNames(List<AnfBinding> bindings) {
+        Set<String> names = new LinkedHashSet<>();
+        collectDeepBindingNamesInto(bindings, names);
+        return names;
+    }
+
+    private static void collectDeepBindingNamesInto(List<AnfBinding> bindings, Set<String> names) {
+        for (AnfBinding b : bindings) {
+            names.add(b.name());
+            if (b.value() instanceof If iv) {
+                collectDeepBindingNamesInto(iv.thenBranch(), names);
+                collectDeepBindingNamesInto(iv.elseBranch(), names);
+            } else if (b.value() instanceof Loop l) {
+                collectDeepBindingNamesInto(l.body(), names);
+            }
+        }
     }
 
     static List<String> collectRefs(AnfValue value) {
@@ -848,7 +876,7 @@ public final class StackLower {
             } else if (v instanceof If iv) {
                 lowerIf(name, iv.cond(), iv.thenBranch(), iv.elseBranch(), idx, lastUses, false);
             } else if (v instanceof Loop l) {
-                lowerLoop(name, l.count(), l.body(), l.iterVar());
+                lowerLoop(name, l.count(), l.body(), l.iterVar(), idx, lastUses);
             } else if (v instanceof Assert a) {
                 lowerAssert(a.value(), idx, lastUses, false);
             } else if (v instanceof UpdateProp up) {
@@ -887,8 +915,15 @@ public final class StackLower {
                 sm.pop();
                 sm.push(bindingName);
             } else {
-                emitOp(new PushOp(PushValue.of(0)));
-                sm.push(bindingName);
+                // Parameter no longer on the stack — a compiler invariant
+                // violation (historically caused by unrolled loops consuming
+                // outer refs; see lowerLoop). Silently emitting OP_0 here
+                // produced scripts that compiled, passed the env-based
+                // interpreter, and then failed on chain — fail loudly instead.
+                throw new RuntimeException(
+                    "Stack lowering: method parameter '" + paramName + "' is not on the stack "
+                        + "at a post-consumption reference (stack: [" + sm.debugSlots() + "]). "
+                        + "Refusing to emit a silent OP_0 placeholder.");
             }
         }
 
@@ -951,8 +986,14 @@ public final class StackLower {
                         sm.pop();
                         sm.push(bindingName);
                     } else {
-                        emitOp(new PushOp(PushValue.of(0)));
-                        sm.push(bindingName);
+                        // Referenced value no longer on the stack — a compiler
+                        // invariant violation (see lowerLoadParam for the
+                        // loop-consumption history). Fail loudly instead of
+                        // silently emitting OP_0.
+                        throw new RuntimeException(
+                            "Stack lowering: value '" + refName + "' referenced by '" + bindingName
+                                + "' is not on the stack (stack: [" + sm.debugSlots() + "]). "
+                                + "Refusing to emit a silent OP_0 placeholder.");
                     }
                     return;
                 }
@@ -2135,19 +2176,30 @@ public final class StackLower {
 
         // ---------------- loop ----------------
 
-        void lowerLoop(String bindingName, int count, List<AnfBinding> body, String iterVar) {
+        void lowerLoop(String bindingName, int count, List<AnfBinding> body, String iterVar,
+                       Integer loopBindingIndex, Map<String, Integer> enclosingLastUses) {
+            // Names (re)defined anywhere inside the loop body, nested branches
+            // included. A name the body itself binds is NOT an outer ref —
+            // reassigned locals (e.g. `off = off + ...` inside an if) flow
+            // through lowerIf's branch-reassignment reconciliation, not through
+            // protection here.
+            Set<String> deepBodyBindingNames = collectDeepBindingNames(body);
+
             Map<String, Boolean> bodyNames = new HashMap<>();
             for (AnfBinding b : body) bodyNames.put(b.name(), true);
 
+            // Collect ALL outer-scope refs used anywhere in the body — including
+            // refs that only occur inside nested if-branches (collectRefs
+            // recurses). The previous top-level-only scan missed nested
+            // references: a const defined before the loop and referenced only
+            // inside an if-branch was consumed by the first iteration, making
+            // iteration 2 fail with "Value 'X' not found on stack".
             Set<String> outerRefs = new LinkedHashSet<>();
             for (AnfBinding b : body) {
-                if (b.value() instanceof LoadParam lp && !lp.name().equals(iterVar)) {
-                    outerRefs.add(lp.name());
-                }
-                if (b.value() instanceof LoadConst lc && lc.value() instanceof BytesConst bc
-                    && bc.hex() != null && bc.hex().length() > 5 && bc.hex().startsWith("@ref:")) {
-                    String target = bc.hex().substring(5);
-                    if (!bodyNames.containsKey(target)) outerRefs.add(target);
+                for (String ref : collectRefs(b.value())) {
+                    if (!ref.equals(iterVar) && !deepBodyBindingNames.contains(ref)) {
+                        outerRefs.add(ref);
+                    }
                 }
             }
 
@@ -2160,9 +2212,28 @@ public final class StackLower {
                 emitOp(new PushOp(PushValue.of(i)));
                 sm.push(iterVar);
                 Map<String, Integer> lastUses = computeLastUses(body);
-                if (i < count - 1) {
-                    for (String ref : outerRefs) lastUses.put(ref, body.size());
+
+                // Prevent outer-scope refs from being consumed by setting their
+                // last-use beyond any body binding index:
+                //  - non-final iterations: always (the next iteration re-reads them);
+                //  - the FINAL iteration: when the enclosing scope still references
+                //    them AFTER the loop. Previously the final iteration consumed
+                //    every outer ref at its last body use, so a method param (or
+                //    const) referenced after the loop was gone from the stack and
+                //    was silently lowered to an OP_0/empty push — compilation
+                //    succeeded, the env-based interpreter passed, but the emitted
+                //    Script failed at runtime (silent interpreter <-> Script
+                //    divergence).
+                boolean isFinalIteration = i == count - 1;
+                for (String ref : outerRefs) {
+                    boolean usedAfterLoop = enclosingLastUses != null
+                        && loopBindingIndex != null
+                        && enclosingLastUses.getOrDefault(ref, -1) > loopBindingIndex;
+                    if (!isFinalIteration || usedAfterLoop) {
+                        lastUses.put(ref, body.size());
+                    }
                 }
+
                 for (int j = 0; j < body.size(); j++) {
                     lowerBinding(body.get(j), j, lastUses);
                 }

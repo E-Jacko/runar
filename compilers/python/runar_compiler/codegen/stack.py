@@ -300,6 +300,10 @@ class StackMap:
         """Return the set of all non-empty slot names."""
         return {s for s in self.slots if s}
 
+    def debug_slots(self) -> str:
+        """Debug string of the slot names (bottom -> top) for error messages."""
+        return ", ".join(self.slots)
+
 
 # ---------------------------------------------------------------------------
 # Use analysis -- determine last-use sites for each variable
@@ -327,6 +331,26 @@ def compute_last_uses(bindings: list[ANFBinding]) -> dict[str, int]:
                 for e in array_elems[ref]:
                     last_use[e] = i
     return last_use
+
+
+def collect_deep_binding_names(bindings: list[ANFBinding]) -> set[str]:
+    """Collect every binding name defined anywhere in a binding sequence,
+    recursing into nested if-branches and loop bodies. Used by _lower_loop to
+    distinguish loop-internal (re)definitions from true outer-scope refs.
+    """
+    names: set[str] = set()
+
+    def walk(bs: list[ANFBinding]) -> None:
+        for b in bs:
+            names.add(b.name)
+            if b.value.kind == "if":
+                walk(b.value.then)
+                walk(b.value.else_)
+            elif b.value.kind == "loop":
+                walk(b.value.body)
+
+    walk(bindings)
+    return names
 
 
 def collect_refs(value: ANFValue) -> list[str]:
@@ -939,7 +963,7 @@ class _LoweringContext:
         elif kind == "if":
             self._lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
         elif kind == "loop":
-            self._lower_loop(name, value.count, value.body, value.iter_var)
+            self._lower_loop(name, value.count, value.body, value.iter_var, binding_index, last_uses)
         elif kind == "assert":
             self._lower_assert(value.value_ref, binding_index, last_uses, False)
         elif kind == "update_prop":
@@ -981,8 +1005,16 @@ class _LoweringContext:
             self.sm.pop()
             self.sm.push(binding_name)
         else:
-            self.emit_op(StackOp(op="push", value=big_int_push(0)))
-            self.sm.push(binding_name)
+            # Parameter no longer on the stack -- a compiler invariant
+            # violation (historically caused by unrolled loops consuming outer
+            # refs; see _lower_loop). Silently emitting OP_0 here produced
+            # scripts that compiled, passed the env-based interpreter, and then
+            # failed on chain -- fail loudly instead.
+            raise RuntimeError(
+                f"Stack lowering: method parameter '{param_name}' is not on the "
+                f"stack at a post-consumption reference (stack: [{self.sm.debug_slots()}]). "
+                f"Refusing to emit a silent OP_0 placeholder."
+            )
 
     def _lower_load_prop(self, binding_name: str, prop_name: str) -> None:
         prop: Optional[ANFProperty] = None
@@ -1048,9 +1080,16 @@ class _LoweringContext:
                 self.sm.pop()
                 self.sm.push(binding_name)
             else:
-                # Referenced value not on stack -- push placeholder
-                self.emit_op(StackOp(op="push", value=big_int_push(0)))
-                self.sm.push(binding_name)
+                # Referenced value no longer on the stack -- a compiler
+                # invariant violation (see _lower_load_param for the
+                # loop-consumption history). Fail loudly instead of silently
+                # emitting OP_0.
+                raise RuntimeError(
+                    f"Stack lowering: value '{ref_name}' referenced by "
+                    f"'{binding_name}' is not on the stack "
+                    f"(stack: [{self.sm.debug_slots()}]). "
+                    f"Refusing to emit a silent OP_0 placeholder."
+                )
             return
 
         # Handle @this marker -- compile-time concept, not a runtime value
@@ -1670,23 +1709,30 @@ class _LoweringContext:
     # -----------------------------------------------------------------
 
     def _lower_loop(self, binding_name: str, count: int,
-                    body: list[ANFBinding], iter_var: str) -> None:
+                    body: list[ANFBinding], iter_var: str,
+                    loop_binding_index: Optional[int] = None,
+                    enclosing_last_uses: Optional[dict[str, int]] = None) -> None:
         # Collect body binding names
         body_binding_names: dict[str, bool] = {b.name: True for b in body}
 
-        # Collect outer-scope names referenced in the loop body
+        # Names (re)defined anywhere inside the loop body, nested branches
+        # included. A name the body itself binds is NOT an outer ref --
+        # reassigned locals (e.g. `off = off + ...` inside an if) flow through
+        # _lower_if's branch-reassignment reconciliation, not through
+        # protection here.
+        deep_body_binding_names = collect_deep_binding_names(body)
+
+        # Collect ALL outer-scope refs used anywhere in the body -- including
+        # refs that only occur inside nested if-branches (collect_refs
+        # recurses). The previous top-level-only scan missed nested references:
+        # a const defined before the loop and referenced only inside an
+        # if-branch was consumed by the first iteration, making iteration 2
+        # fail with "Value 'X' not found on stack".
         outer_refs: set[str] = set()
         for b in body:
-            if b.value.kind == "load_param" and b.value.name != iter_var:
-                outer_refs.add(b.value.name)
-            # Also protect @ref: targets from outer scope (not redefined in body)
-            if (b.value.kind == "load_const"
-                    and b.value.const_string is not None
-                    and len(b.value.const_string) > 5
-                    and b.value.const_string[:5] == "@ref:"):
-                ref_name = b.value.const_string[5:]
-                if ref_name not in body_binding_names:
-                    outer_refs.add(ref_name)
+            for ref in collect_refs(b.value):
+                if ref != iter_var and ref not in deep_body_binding_names:
+                    outer_refs.add(ref)
 
         # Temporarily extend localBindings with body binding names
         prev_local_bindings = self.local_bindings
@@ -1700,9 +1746,26 @@ class _LoweringContext:
 
             last_uses = compute_last_uses(body)
 
-            # In non-final iterations, prevent outer-scope refs from being consumed
-            if i < count - 1:
-                for ref_name in outer_refs:
+            # Prevent outer-scope refs from being consumed by setting their
+            # last-use beyond any body binding index:
+            #  - in non-final iterations: always (the next iteration re-reads
+            #    them);
+            #  - in the FINAL iteration: when the enclosing scope still
+            #    references them AFTER the loop. Previously the final iteration
+            #    consumed every outer ref at its last body use, so a method
+            #    param (or const) referenced after the loop was gone from the
+            #    stack and was silently lowered to an OP_0/empty push --
+            #    compilation succeeded, the env-based interpreter passed, but
+            #    the emitted Script failed at runtime (silent interpreter <->
+            #    Script divergence).
+            is_final_iteration = i == count - 1
+            for ref_name in outer_refs:
+                used_after_loop = (
+                    enclosing_last_uses is not None
+                    and loop_binding_index is not None
+                    and enclosing_last_uses.get(ref_name, -1) > loop_binding_index
+                )
+                if (not is_final_iteration) or used_after_loop:
                     last_uses[ref_name] = len(body)
 
             for j, binding in enumerate(body):

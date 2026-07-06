@@ -3,13 +3,19 @@ package runar.compiler.passes;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigInteger;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import runar.compiler.frontend.JavaParser;
+import runar.compiler.ir.anf.AnfBinding;
+import runar.compiler.ir.anf.AnfMethod;
+import runar.compiler.ir.anf.AnfParam;
 import runar.compiler.ir.anf.AnfProgram;
+import runar.compiler.ir.anf.Assert;
+import runar.compiler.ir.anf.LoadParam;
 import runar.compiler.ir.ast.ContractNode;
 import runar.compiler.ir.stack.DropOp;
 import runar.compiler.ir.stack.DupOp;
@@ -1242,5 +1248,122 @@ class StackLowerTest {
         assertTrue(nipCount >= 1,
             "stateful counter increment must emit at least one NipOp "
                 + "(UpdateProp at depth 1 + cleanup); got " + nipCount);
+    }
+
+    /* ================================================================== */
+    /* Outer-scope refs across unrolled loops (PR #113 fix 5)              */
+    /* ================================================================== */
+
+    /**
+     * Symptom (a): a value defined BEFORE a loop and referenced INSIDE the
+     * loop body (here {@code base} via {@code base.plus(i)}) must survive
+     * loop unrolling. Before the fix, lowerLoop's outer-ref scan only caught
+     * top-level {@code load_param} / {@code @ref} bindings, so {@code base}
+     * was consumed by the first iteration and iteration 2 failed with
+     * "Value 'base' not found on stack". The fix collects outer refs deeply
+     * (collectRefs recurses) and protects them across iterations.
+     * Mirrors {@code loop-outer-refs.test.ts}.
+     */
+    @Test
+    void valueDefinedBeforeLoopReferencedInsideCompiles() {
+        String src = """
+            package fix.constloop;
+            import runar.lang.SmartContract;
+            import runar.lang.annotations.Public;
+            import runar.lang.annotations.Readonly;
+            import runar.lang.types.Bigint;
+            import runar.lang.types.ByteString;
+            import static runar.lang.Builtins.assertThat;
+            import static runar.lang.Builtins.substr;
+            import static runar.lang.Builtins.cat;
+            import static runar.lang.Builtins.bin2num;
+            class ConstLoop extends SmartContract {
+                @Readonly ByteString pad00;
+                ConstLoop(ByteString pad00) { super(pad00); this.pad00 = pad00; }
+                @Public
+                void probe(ByteString data) {
+                    Bigint base = Bigint.of(5);
+                    Bigint acc = Bigint.ZERO;
+                    for (Bigint i = Bigint.ZERO; i.lt(Bigint.of(3)); i = i.plus(Bigint.ONE)) {
+                        Bigint b = bin2num(cat(substr(data, base.plus(i), Bigint.ONE), this.pad00));
+                        acc = acc.plus(b);
+                    }
+                    assertThat(acc.eq(Bigint.of(6)));
+                }
+            }
+            """;
+        StackProgram p = compile(src, "ConstLoop.runar.java");
+        assertNotNull(findMethod(p, "probe"),
+            "a value referenced inside an unrolled loop must survive across iterations");
+    }
+
+    /**
+     * Symptom (b): a method param ({@code data}) referenced INSIDE a loop
+     * AND AFTER it. Before the fix the final iteration consumed {@code data}
+     * at its last body use, so the post-loop {@code substr(data, ...)} found
+     * an empty stack slot and was silently lowered to OP_0 — the script
+     * compiled but diverged on chain. The fix protects outer refs in the
+     * FINAL iteration when the enclosing scope still uses them after the loop.
+     * The former silent OP_0 fallback in lowerLoadParam is now a hard error,
+     * so if that protection regressed this test would THROW rather than
+     * silently pass. Mirrors {@code loop-outer-refs.test.ts} /
+     * {@code loop-walk-vm.test.ts}.
+     */
+    @Test
+    void paramReferencedAfterLoopSurvivesUnrolling() {
+        String src = """
+            package fix.loopwalk;
+            import runar.lang.SmartContract;
+            import runar.lang.annotations.Public;
+            import runar.lang.annotations.Readonly;
+            import runar.lang.types.Bigint;
+            import runar.lang.types.ByteString;
+            import static runar.lang.Builtins.assertThat;
+            import static runar.lang.Builtins.substr;
+            import static runar.lang.Builtins.cat;
+            import static runar.lang.Builtins.bin2num;
+            class LoopWalk extends SmartContract {
+                @Readonly ByteString pad00;
+                LoopWalk(ByteString pad00) { super(pad00); this.pad00 = pad00; }
+                @Public
+                void walk(ByteString data) {
+                    Bigint acc = Bigint.ZERO;
+                    for (Bigint i = Bigint.ZERO; i.lt(Bigint.of(3)); i = i.plus(Bigint.ONE)) {
+                        acc = acc.plus(bin2num(cat(substr(data, i, Bigint.ONE), this.pad00)));
+                    }
+                    Bigint tail = bin2num(cat(substr(data, Bigint.of(9), Bigint.ONE), this.pad00));
+                    assertThat(acc.plus(tail).eq(Bigint.of(7)));
+                }
+            }
+            """;
+        StackProgram p = compile(src, "LoopWalk.runar.java");
+        assertNotNull(findMethod(p, "walk"),
+            "a param used inside AND after an unrolled loop must survive; if the "
+                + "final-iteration protection regressed, lowerLoadParam would throw "
+                + "the silent-OP_0 hard error instead of reaching here");
+    }
+
+    /**
+     * A hand-written ANF {@code load_param} of a parameter the method does
+     * not have can no longer be silently lowered to OP_0 — it is a hard
+     * error. Mirrors the {@code compileFromANF} case in
+     * {@code loop-outer-refs.test.ts}.
+     */
+    @Test
+    void loadParamNotOnStackIsHardErrorNotOp0() {
+        AnfMethod method = new AnfMethod(
+            "run",
+            List.of(new AnfParam("x", "bigint")),
+            List.of(
+                new AnfBinding("t0", new LoadParam("ghost"), null),
+                new AnfBinding("t1", new Assert("t0"), null)
+            ),
+            true);
+        AnfProgram program = new AnfProgram("Broken", List.of(), List.of(method));
+
+        RuntimeException err = assertThrows(RuntimeException.class,
+            () -> StackLower.run(program));
+        assertTrue(err.getMessage().contains("Refusing to emit a silent OP_0"),
+            "expected the silent-OP_0 hard error, got: " + err.getMessage());
     }
 }

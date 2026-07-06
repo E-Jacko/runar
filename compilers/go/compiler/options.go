@@ -2,8 +2,11 @@ package compiler
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/icellan/runar/compilers/go/codegen"
+	"github.com/icellan/runar/compilers/go/frontend"
 	"github.com/icellan/runar/compilers/go/ir"
 )
 
@@ -151,15 +154,140 @@ func mergeOptions(opts []CompileOptions) CompileOptions {
 	return opts[0]
 }
 
-// applyConstructorArgs bakes constructor arg values into ANF property initialValues.
-// This replaces OP_0 placeholders with real push data in the emitted script.
-func applyConstructorArgs(program *ir.ANFProgram, args map[string]interface{}) {
+// applyConstructorArgs validates and bakes constructor arg values into ANF
+// property initialValues, replacing OP_0 placeholders with real push data in
+// the emitted script. It returns a list of diagnostic error messages (empty
+// when valid); a non-empty result means nothing was baked and the caller must
+// surface the errors.
+//
+// The no-args placeholder path (len(args) == 0) is unchecked and byte-identical
+// to before — that is the normal deploy-artifact path where the SDK substitutes
+// values via constructorSlots.
+//
+// Mirrors the TypeScript reference (validateConstructorArgsShape +
+// findUnbakedReferencedReadonly in packages/runar-compiler/src/index.ts):
+//
+//	(a) positional-array reject — N/A for the Go tier. ConstructorArgs is a
+//	    typed map[string]interface{}, so a positional array cannot reach this
+//	    API. The dynamically-typed tiers (Python isinstance(list), Ruby
+//	    is_a?(Array)) must guard this explicitly; Go's type system does.
+//	(b) unknown-key reject — every key must match a contract property name.
+//	(c) unbaked-referenced-readonly reject — after baking, a readonly property
+//	    referenced by a method body but still without a value would emit an OP_0
+//	    placeholder that fails opaquely at runtime.
+func applyConstructorArgs(program *ir.ANFProgram, args map[string]interface{}) []string {
 	if len(args) == 0 || program == nil {
-		return
+		return nil
 	}
+
+	// (b) Unknown-key reject.
+	propNameSet := make(map[string]bool, len(program.Properties))
+	for i := range program.Properties {
+		propNameSet[program.Properties[i].Name] = true
+	}
+	var errs []string
+	keys := make([]string, 0, len(args))
+	for key := range args {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys) // deterministic diagnostics across map-iteration order
+	for _, key := range keys {
+		if !propNameSet[key] {
+			errs = append(errs, fmt.Sprintf(
+				"constructorArgs key '%s' does not match any property of contract "+
+					"'%s' (properties: [%s]). Nothing would be baked for this key.",
+				key, program.ContractName, propertyNameList(program)))
+		}
+	}
+	if len(errs) > 0 {
+		return errs
+	}
+
+	// Bake constructor args into ANF property initialValues.
 	for i := range program.Properties {
 		if v, ok := args[program.Properties[i].Name]; ok {
 			program.Properties[i].InitialValue = v
+		}
+	}
+
+	// (c) Unbaked-referenced-readonly reject.
+	return findUnbakedReferencedReadonly(program)
+}
+
+// propertyNameList renders the contract's property names as "a, b, c" for
+// diagnostics.
+func propertyNameList(program *ir.ANFProgram) string {
+	names := make([]string, len(program.Properties))
+	for i := range program.Properties {
+		names[i] = program.Properties[i].Name
+	}
+	return strings.Join(names, ", ")
+}
+
+// findUnbakedReferencedReadonly finds readonly properties that are referenced
+// by at least one method body but still have no baked InitialValue after
+// applying constructorArgs. Such properties would be emitted as OP_0
+// placeholders, making the compiled script fail opaquely at runtime.
+func findUnbakedReferencedReadonly(program *ir.ANFProgram) []string {
+	referenced := collectReferencedProps(program)
+	var errs []string
+	for i := range program.Properties {
+		p := &program.Properties[i]
+		if p.Readonly && p.InitialValue == nil && referenced[p.Name] {
+			errs = append(errs, fmt.Sprintf(
+				"readonly property '%s' is referenced by a method but has no value "+
+					"after baking constructorArgs — the emitted script would carry an OP_0 "+
+					"placeholder that fails at runtime. Provide '%s' in constructorArgs "+
+					"(or give the property an initializer).",
+				p.Name, p.Name))
+		}
+	}
+	return errs
+}
+
+// collectReferencedProps collects the property names actually referenced by
+// method bodies. The raw ANF from pass 4 loads every property at method entry;
+// only after dead-binding elimination do the surviving load_prop nodes reflect
+// real references. DCE is a pure function, so running it on a throwaway probe
+// copy does not perturb the main pipeline.
+func collectReferencedProps(program *ir.ANFProgram) map[string]bool {
+	// Throwaway probe: EliminateDeadCode reassigns each method's Body slice
+	// header (never mutating property or binding contents), so shallow-copying
+	// the method structs into a fresh slice fully isolates the real program.
+	probe := &ir.ANFProgram{
+		ContractName: program.ContractName,
+		Properties:   program.Properties,
+		Methods:      make([]ir.ANFMethod, len(program.Methods)),
+	}
+	copy(probe.Methods, program.Methods)
+	frontend.EliminateDeadCode(probe)
+
+	referenced := make(map[string]bool)
+	for i := range probe.Methods {
+		m := &probe.Methods[i]
+		// The constructor's super(...) call references every property but is
+		// never emitted as script code — only real method bodies count.
+		if m.Name == "constructor" {
+			continue
+		}
+		collectLoadPropRefs(m.Body, referenced)
+	}
+	return referenced
+}
+
+// collectLoadPropRefs recursively collects load_prop property names from ANF
+// bindings, recursing through if(then/else) and loop(body).
+func collectLoadPropRefs(bindings []ir.ANFBinding, out map[string]bool) {
+	for i := range bindings {
+		v := &bindings[i].Value
+		switch v.Kind {
+		case "load_prop":
+			out[v.Name] = true
+		case "if":
+			collectLoadPropRefs(v.Then, out)
+			collectLoadPropRefs(v.Else, out)
+		case "loop":
+			collectLoadPropRefs(v.Body, out)
 		}
 	}
 }

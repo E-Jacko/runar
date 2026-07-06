@@ -130,6 +130,18 @@ pub const StackMap = struct {
         return set;
     }
 
+    /// Debug string of the slot names (bottom -> top) for error messages.
+    /// Mirrors the TS reference compiler's `StackMap.debugSlots`.
+    pub fn debugSlots(self: *const StackMap, allocator: Allocator) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        for (self.slots.items, 0..) |slot, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            try buf.appendSlice(allocator, slot orelse "<null>");
+        }
+        return buf.toOwnedSlice(allocator);
+    }
+
     pub fn deinit(self: *StackMap, allocator: Allocator) void {
         self.slots.deinit(allocator);
         self.name_index.deinit(allocator);
@@ -146,6 +158,12 @@ const LowerError = error{
     InvalidBuiltin,
     UnsupportedOperation,
     BranchStackMismatch,
+    /// A ref (method param or @ref: value) is no longer on the stack at a
+    /// point that needs it — a compiler invariant violation historically
+    /// caused by unrolled loops consuming outer-scope refs (see lowerForLoop).
+    /// Emitting a silent OP_0 here produced scripts that compiled, passed the
+    /// env-based interpreter, and then failed on chain — so we fail loudly.
+    SilentOpZeroRefused,
 };
 
 const LowerCtx = struct {
@@ -1014,9 +1032,20 @@ const LowerCtx = struct {
             return;
         }
 
-        try self.emitPushInt(0);
-        try self.stack.push(self.allocator, bind_name);
-        self.trackDepth();
+        // Parameter no longer on the stack — a compiler invariant violation
+        // (historically caused by unrolled loops consuming outer refs; see
+        // lowerForLoop). Silently emitting OP_0 here produced scripts that
+        // compiled, passed the env-based interpreter, and then failed on
+        // chain — fail loudly instead.
+        const slots_str = self.stack.debugSlots(self.allocator) catch null;
+        defer if (slots_str) |s| self.allocator.free(s);
+        std.log.warn(
+            "stack lowering: method parameter '{s}' is not on the stack at a " ++
+                "post-consumption reference (stack: [{s}]). Refusing to emit a " ++
+                "silent OP_0 placeholder.",
+            .{ param_name, slots_str orelse "<unavailable>" },
+        );
+        return LowerError.SilentOpZeroRefused;
     }
 
     fn lowerMethodCall(self: *LowerCtx, bind_name: []const u8, mc: types.ANFMethodCall) !void {
@@ -1148,6 +1177,21 @@ const LowerCtx = struct {
                             try self.array_lengths.put(self.allocator, bind_name, len);
                         }
                         return;
+                    }
+                    // Referenced value no longer on the stack — a compiler
+                    // invariant violation (see lowerForLoop for the loop-
+                    // consumption history). Fail loudly instead of relying on a
+                    // silent OP_0 placeholder / an opaque VariableNotFound.
+                    if (self.stack.findDepth(ref_name) == null) {
+                        const slots_str = self.stack.debugSlots(self.allocator) catch null;
+                        defer if (slots_str) |dbg| self.allocator.free(dbg);
+                        std.log.warn(
+                            "stack lowering: value '{s}' referenced by '{s}' is not on " ++
+                                "the stack (stack: [{s}]). Refusing to emit a silent OP_0 " ++
+                                "placeholder.",
+                            .{ ref_name, bind_name, slots_str orelse "<unavailable>" },
+                        );
+                        return LowerError.SilentOpZeroRefused;
                     }
                     // Match TS reference compiler: consume only if ref target is
                     // a local binding in the current scope and this is the last
@@ -4079,6 +4123,102 @@ const LowerCtx = struct {
     // for_loop
     // ========================================================================
 
+    /// Collect every binding name defined anywhere in `bindings`, recursing
+    /// into nested if-branches and loop bodies. Mirrors the TS reference
+    /// compiler's `collectDeepBindingNames` (05-stack-lower.ts). Used by
+    /// `lowerForLoop` to distinguish loop-internal (re)definitions from true
+    /// outer-scope refs, so reassigned locals keep flowing through
+    /// `lowerIfExpr`'s branch-reassignment reconciliation instead of the
+    /// outer-ref protection path.
+    fn collectDeepBindingNames(
+        allocator: Allocator,
+        bindings: []const types.ANFBinding,
+        out: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        for (bindings) |b| {
+            try out.put(allocator, b.name, {});
+            switch (b.value) {
+                .@"if" => |ie| {
+                    try collectDeepBindingNames(allocator, ie.then, out);
+                    try collectDeepBindingNames(allocator, ie.@"else", out);
+                },
+                .loop => |lp| {
+                    try collectDeepBindingNames(allocator, lp.body, out);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Collect every SSA operand name referenced by a single ANF value,
+    /// recursing into nested if-branches and loop bodies. Mirrors the TS
+    /// reference compiler's `collectRefs` (05-stack-lower.ts). Used by
+    /// `lowerForLoop` to find outer-scope refs used anywhere in the body —
+    /// including refs that only occur inside a nested if-branch.
+    fn collectValueRefs(
+        allocator: Allocator,
+        value: types.ANFValue,
+        out: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        switch (value) {
+            .load_param => |lp| try out.put(allocator, lp.name, {}),
+            .load_prop, .get_state_script => {},
+            .load_const => |lc| {
+                switch (lc.value) {
+                    .string => |s| {
+                        if (std.mem.startsWith(u8, s, "@ref:")) {
+                            try out.put(allocator, s[5..], {});
+                        }
+                    },
+                    else => {},
+                }
+            },
+            .bin_op => |bop| {
+                try out.put(allocator, bop.left, {});
+                try out.put(allocator, bop.right, {});
+            },
+            .unary_op => |uop| try out.put(allocator, uop.operand, {}),
+            .call => |c| {
+                for (c.args) |arg| try out.put(allocator, arg, {});
+            },
+            .method_call => |mc| {
+                if (mc.object.len > 0) try out.put(allocator, mc.object, {});
+                for (mc.args) |arg| try out.put(allocator, arg, {});
+            },
+            .@"if" => |ie| {
+                try out.put(allocator, ie.cond, {});
+                for (ie.then) |b| try collectValueRefs(allocator, b.value, out);
+                for (ie.@"else") |b| try collectValueRefs(allocator, b.value, out);
+            },
+            .loop => |lp| {
+                for (lp.body) |b| try collectValueRefs(allocator, b.value, out);
+            },
+            .assert => |a| try out.put(allocator, a.value, {}),
+            .update_prop => |up| try out.put(allocator, up.value, {}),
+            .check_preimage => |cp| try out.put(allocator, cp.preimage, {}),
+            .deserialize_state => |ds| try out.put(allocator, ds.preimage, {}),
+            .add_output => |ao| {
+                if (ao.satoshis.len > 0) try out.put(allocator, ao.satoshis, {});
+                if (ao.preimage.len > 0) try out.put(allocator, ao.preimage, {});
+                for (ao.state_values) |sv| {
+                    if (sv.len > 0) try out.put(allocator, sv, {});
+                }
+            },
+            .add_raw_output => |aro| {
+                if (aro.satoshis.len > 0) try out.put(allocator, aro.satoshis, {});
+                if (aro.script_bytes.len > 0) try out.put(allocator, aro.script_bytes, {});
+            },
+            .add_data_output => |ado| {
+                if (ado.satoshis.len > 0) try out.put(allocator, ado.satoshis, {});
+                if (ado.script_bytes.len > 0) try out.put(allocator, ado.script_bytes, {});
+            },
+            .array_literal => |al| {
+                for (al.elements) |e| try out.put(allocator, e, {});
+            },
+            .raw_script => {},
+        }
+    }
+
     fn lowerForLoop(self: *LowerCtx, bind_name: []const u8, fl: *const types.ANFForLoop) !void {
         var body_binding_names: std.StringHashMapUnmanaged(void) = .empty;
         defer body_binding_names.deinit(self.allocator);
@@ -4086,29 +4226,35 @@ const LowerCtx = struct {
             try body_binding_names.put(self.allocator, binding.name, {});
         }
 
+        // Names (re)defined anywhere inside the loop body, nested if-branches
+        // and nested loops included. A name the body itself binds is NOT an
+        // outer ref — reassigned locals (e.g. `off = off + ...` inside an if)
+        // flow through lowerIfExpr's branch-reassignment reconciliation, not
+        // through the outer-ref protection here.
+        var deep_body_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer deep_body_names.deinit(self.allocator);
+        try collectDeepBindingNames(self.allocator, fl.body_bindings, &deep_body_names);
+
+        // Collect ALL outer-scope refs used anywhere in the body — including
+        // refs that only occur inside a nested if-branch (collectValueRefs
+        // recurses). The previous top-level-only scan (top-level load_param +
+        // top-level load_const @ref) missed nested references: a const defined
+        // before the loop and referenced only inside an if-branch was consumed
+        // by the first iteration, making iteration 2 fail with
+        // "Value 'X' not found on stack".
+        var all_refs: std.StringHashMapUnmanaged(void) = .empty;
+        defer all_refs.deinit(self.allocator);
+        for (fl.body_bindings) |binding| {
+            try collectValueRefs(self.allocator, binding.value, &all_refs);
+        }
+
         var outer_refs: std.StringHashMapUnmanaged(void) = .empty;
         defer outer_refs.deinit(self.allocator);
-        for (fl.body_bindings) |binding| {
-            switch (binding.value) {
-                .load_param => |lp| {
-                    if (!std.mem.eql(u8, lp.name, fl.var_name)) {
-                        try outer_refs.put(self.allocator, lp.name, {});
-                    }
-                },
-                .load_const => |lc| {
-                    switch (lc.value) {
-                        .string => |s| {
-                            if (std.mem.startsWith(u8, s, "@ref:")) {
-                                const ref_name = s[5..];
-                                if (!body_binding_names.contains(ref_name)) {
-                                    try outer_refs.put(self.allocator, ref_name, {});
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-                },
-                else => {},
+        var all_refs_it = all_refs.iterator();
+        while (all_refs_it.next()) |entry| {
+            const ref = entry.key_ptr.*;
+            if (!std.mem.eql(u8, ref, fl.var_name) and !deep_body_names.contains(ref)) {
+                try outer_refs.put(self.allocator, ref, {});
             }
         }
 
@@ -4127,27 +4273,55 @@ const LowerCtx = struct {
             try self.local_bindings.put(self.allocator, entry.key_ptr.*, {});
         }
 
+        // The enclosing binding index of this loop, captured before the
+        // per-iteration body lowering clobbers `current_idx`. Combined with the
+        // enclosing scope's last-use map (still live in `self.last_uses` on
+        // entry), it tells us whether an outer ref is still needed AFTER the
+        // loop. Zig threads the enclosing index / last-use map implicitly via
+        // the shared LowerCtx (unlike the TS reference, which passes them as
+        // explicit params to lowerLoop).
+        const loop_binding_index = self.current_idx;
+
         var i: i64 = fl.init_val;
         while (i < fl.bound) : (i += 1) {
             try self.emitPushInt(i);
             try self.stack.push(self.allocator, fl.var_name);
             self.trackDepth();
 
-            const saved_lu = self.last_uses;
+            const enclosing_last_uses = self.last_uses;
             self.last_uses = .empty;
             try self.computeLastUses(fl.body_bindings);
-            if (i < fl.bound - 1) {
-                var outer_it = outer_refs.iterator();
-                while (outer_it.next()) |entry| {
-                    try self.last_uses.put(self.allocator, entry.key_ptr.*, fl.body_bindings.len);
+
+            // Prevent outer-scope refs from being consumed by pinning their
+            // last-use past every body binding index:
+            //  - in non-final iterations: always (the next iteration re-reads);
+            //  - in the FINAL iteration: only when the enclosing scope still
+            //    references the ref AFTER the loop. Previously the final
+            //    iteration consumed every outer ref at its last body use, so a
+            //    method param (or const) referenced after the loop was gone
+            //    from the stack and was silently lowered to an OP_0 — the
+            //    script compiled and the env interpreter passed, but the
+            //    emitted Script failed on chain (silent interpreter/Script
+            //    divergence).
+            const is_final_iteration = (i == fl.bound - 1);
+            var outer_it = outer_refs.iterator();
+            while (outer_it.next()) |entry| {
+                const ref = entry.key_ptr.*;
+                const used_after_loop = if (enclosing_last_uses.get(ref)) |lu|
+                    lu > loop_binding_index
+                else
+                    false;
+                if (!is_final_iteration or used_after_loop) {
+                    try self.last_uses.put(self.allocator, ref, fl.body_bindings.len);
                 }
             }
+
             for (fl.body_bindings, 0..) |binding, idx| {
                 self.current_idx = idx;
                 try self.lowerBinding(binding);
             }
             self.last_uses.deinit(self.allocator);
-            self.last_uses = saved_lu;
+            self.last_uses = enclosing_last_uses;
 
             // Remove iteration variable if still on stack
             if (self.stack.findDepth(fl.var_name)) |d| {
@@ -5277,6 +5451,76 @@ test "lower for loop unrolling" {
     }
     // 3 iteration vars + 3 body constants = at least 6
     try std.testing.expect(push_count >= 6);
+}
+
+test "lower for loop keeps outer const alive across iterations (fix 5)" {
+    // Regression: a const defined before the loop and referenced inside the
+    // body (here via bin_op `base + i`) was consumed by the first iteration,
+    // making iteration 2 fail with VariableNotFound. The deep outer-ref
+    // collection now protects `base` across the non-final iterations.
+    const allocator = std.testing.allocator;
+
+    const loop_body = [_]types.ANFBinding{
+        .{ .name = "t_sum", .value = .{ .bin_op = .{ .op = "+", .left = "base", .right = "i" } } },
+    };
+
+    var loop_val = types.ANFLoop{
+        .iter_var = "i",
+        .count = 3,
+        .body = @constCast(&loop_body),
+    };
+
+    const bindings = [_]types.ANFBinding{
+        .{ .name = "base", .value = .{ .load_const = .{ .value = .{ .integer = 5 } } } },
+        .{ .name = "loop_result", .value = .{ .loop = &loop_val } },
+    };
+
+    const method = types.ANFMethod{
+        .name = "looper",
+        .is_public = true,
+        .params = &.{},
+        .bindings = @constCast(&bindings),
+    };
+
+    const program = types.ANFProgram{
+        .contract_name = "OuterRefLooper",
+        .properties = &.{},
+        .methods = @constCast(&[_]types.ANFMethod{method}),
+    };
+
+    // Previously threw VariableNotFound on the second iteration; must now
+    // lower cleanly.
+    const result = try lower(allocator, program);
+    defer result.deinit(allocator);
+    try std.testing.expect(result.methods.len == 1);
+    try std.testing.expect(result.methods[0].instructions.len > 0);
+}
+
+test "lower rejects load_param of a missing param instead of emitting OP_0 (fix 5)" {
+    // Hand-written ANF referencing a parameter that is not on the stack.
+    // The old fallback silently pushed OP_0 (producing scripts that passed
+    // the interpreter but failed on chain); it must now hard-error.
+    const allocator = std.testing.allocator;
+
+    const bindings = [_]types.ANFBinding{
+        .{ .name = "t0", .value = .{ .load_param = .{ .name = "ghost" } } },
+        .{ .name = "t1", .value = .{ .assert = .{ .value = "t0" } } },
+    };
+
+    const method = types.ANFMethod{
+        .name = "spend",
+        .is_public = true,
+        .params = &.{},
+        .bindings = @constCast(&bindings),
+    };
+
+    const program = types.ANFProgram{
+        .contract_name = "GhostParam",
+        .properties = &.{},
+        .methods = @constCast(&[_]types.ANFMethod{method}),
+    };
+
+    try std.testing.expectError(LowerError.SilentOpZeroRefused, lower(allocator, program));
 }
 
 test "lower multi-method produces one StackMethod per public method" {

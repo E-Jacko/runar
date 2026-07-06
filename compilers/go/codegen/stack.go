@@ -252,6 +252,11 @@ func (s *stackMap) dup() {
 	s.slots = append(s.slots, s.slots[len(s.slots)-1])
 }
 
+// debugSlots renders the slot names (bottom -> top) for error messages.
+func (s *stackMap) debugSlots() string {
+	return strings.Join(s.slots, ", ")
+}
+
 // namedSlots returns the set of all non-empty slot names.
 func (s *stackMap) namedSlots() map[string]bool {
 	names := make(map[string]bool)
@@ -298,6 +303,30 @@ func computeLastUses(bindings []ir.ANFBinding) map[string]int {
 		}
 	}
 	return lastUse
+}
+
+// collectDeepBindingNames collects every binding name defined anywhere in a
+// binding sequence, recursing into nested if-branches and loop bodies. Used by
+// lowerLoop to distinguish loop-internal (re)definitions from true outer-scope
+// refs.
+func collectDeepBindingNames(bindings []ir.ANFBinding) map[string]bool {
+	names := make(map[string]bool)
+	var walk func(bs []ir.ANFBinding)
+	walk = func(bs []ir.ANFBinding) {
+		for i := range bs {
+			b := &bs[i]
+			names[b.Name] = true
+			switch b.Value.Kind {
+			case "if":
+				walk(b.Value.Then)
+				walk(b.Value.Else)
+			case "loop":
+				walk(b.Value.Body)
+			}
+		}
+	}
+	walk(bindings)
+	return names
 }
 
 func collectRefs(value *ir.ANFValue) []string {
@@ -990,7 +1019,7 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 	case "if":
 		ctx.lowerIf(name, value.Cond, value.Then, value.Else, bindingIndex, lastUses)
 	case "loop":
-		ctx.lowerLoop(name, value.Count, value.Body, value.IterVar)
+		ctx.lowerLoop(name, value.Count, value.Body, value.IterVar, bindingIndex, lastUses)
 	case "assert":
 		ctx.lowerAssert(value.ValueRef, bindingIndex, lastUses, false)
 	case "update_prop":
@@ -1032,8 +1061,16 @@ func (ctx *loweringContext) lowerLoadParam(bindingName, paramName string, bindin
 		ctx.sm.pop()
 		ctx.sm.push(bindingName)
 	} else {
-		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(0)})
-		ctx.sm.push(bindingName)
+		// Parameter no longer on the stack — a compiler invariant violation
+		// (historically caused by unrolled loops consuming outer refs; see
+		// lowerLoop). Silently emitting OP_0 here produced scripts that
+		// compiled, passed the env-based interpreter, and then failed on
+		// chain — fail loudly instead.
+		panic(fmt.Errorf(
+			"stack lowering: method parameter '%s' is not on the stack "+
+				"at a post-consumption reference (stack: [%s]). "+
+				"Refusing to emit a silent OP_0 placeholder.",
+			paramName, ctx.sm.debugSlots()))
 	}
 }
 
@@ -1118,9 +1155,14 @@ func (ctx *loweringContext) lowerLoadConst(bindingName string, value *ir.ANFValu
 			ctx.sm.pop()
 			ctx.sm.push(bindingName)
 		} else {
-			// Referenced value not on stack -- push a placeholder
-			ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(0)})
-			ctx.sm.push(bindingName)
+			// Referenced value no longer on the stack — a compiler invariant
+			// violation (see lowerLoadParam for the loop-consumption history).
+			// Fail loudly instead of silently emitting OP_0.
+			panic(fmt.Errorf(
+				"stack lowering: value '%s' referenced by '%s' is not "+
+					"on the stack (stack: [%s]). "+
+					"Refusing to emit a silent OP_0 placeholder.",
+				refName, bindingName, ctx.sm.debugSlots()))
 		}
 		return
 	}
@@ -1927,26 +1969,30 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	}
 }
 
-func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.ANFBinding, iterVar string) {
+func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.ANFBinding, iterVar string, loopBindingIndex int, enclosingLastUses map[string]int) {
 	// Collect body binding names (values defined inside the loop body).
 	bodyBindingNames := make(map[string]bool, len(body))
 	for _, b := range body {
 		bodyBindingNames[b.Name] = true
 	}
 
-	// Collect outer-scope names referenced in the loop body.
-	// These must not be consumed in non-final iterations.
+	// Names (re)defined anywhere inside the loop body, nested branches
+	// included. A name the body itself binds is NOT an outer ref — reassigned
+	// locals (e.g. `off = off + ...` inside an if) flow through lowerIf's
+	// branch-reassignment reconciliation, not through protection here.
+	deepBodyBindingNames := collectDeepBindingNames(body)
+
+	// Collect ALL outer-scope refs used anywhere in the body — including refs
+	// that only occur inside nested if-branches (collectRefs recurses). The
+	// previous top-level-only scan missed nested references: a const defined
+	// before the loop and referenced only inside an if-branch was consumed by
+	// the first iteration, making iteration 2 fail with "Value 'X' not found
+	// on stack".
 	outerRefs := make(map[string]bool)
-	for _, b := range body {
-		if b.Value.Kind == "load_param" && b.Value.Name != iterVar {
-			outerRefs[b.Value.Name] = true
-		}
-		// Also protect @ref: targets from outer scope (not redefined in body)
-		if b.Value.Kind == "load_const" && b.Value.ConstString != nil &&
-			len(*b.Value.ConstString) > 5 && (*b.Value.ConstString)[:5] == "@ref:" {
-			refName := (*b.Value.ConstString)[5:]
-			if !bodyBindingNames[refName] {
-				outerRefs[refName] = true
+	for i := range body {
+		for _, ref := range collectRefs(&body[i].Value) {
+			if ref != iterVar && !deepBodyBindingNames[ref] {
+				outerRefs[ref] = true
 			}
 		}
 	}
@@ -1969,10 +2015,26 @@ func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.A
 
 		lastUses := computeLastUses(body)
 
-		// In non-final iterations, prevent outer-scope refs from being
-		// consumed by setting their last-use beyond any body binding index.
-		if i < count-1 {
-			for refName := range outerRefs {
+		// Prevent outer-scope refs from being consumed by setting their
+		// last-use beyond any body binding index:
+		//  - in non-final iterations: always (the next iteration re-reads them);
+		//  - in the FINAL iteration: when the enclosing scope still references
+		//    them AFTER the loop. Previously the final iteration consumed every
+		//    outer ref at its last body use, so a method param (or const)
+		//    referenced after the loop was gone from the stack and was silently
+		//    lowered to an OP_0/empty push — compilation succeeded, the
+		//    env-based interpreter passed, but the emitted Script failed at
+		//    runtime (silent interpreter <-> Script divergence).
+		isFinalIteration := i == count-1
+		for refName := range outerRefs {
+			usedAfterLoop := false
+			if enclosingLastUses != nil {
+				lu, ok := enclosingLastUses[refName]
+				if ok && lu > loopBindingIndex {
+					usedAfterLoop = true
+				}
+			}
+			if !isFinalIteration || usedAfterLoop {
 				lastUses[refName] = len(body)
 			}
 		}

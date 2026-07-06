@@ -252,12 +252,128 @@ def _load_ir_from_bytes(data: bytes) -> ANFProgram:
 
 
 def _apply_constructor_args(program: ANFProgram, args: dict[str, object] | None) -> None:
-    """Bake constructor arg values into ANF property initial_values."""
+    """Bake constructor arg values into ANF property initial_values.
+
+    Validates the args before and after baking so a mistyped or ill-shaped
+    ``constructorArgs`` fails loudly instead of silently baking nothing and
+    emitting OP_0 placeholder scripts that fail opaquely at runtime. The
+    no-args placeholder path (``args`` falsy) stays byte-identical + unchecked.
+    """
     if not args:
         return
+
+    shape_errors = _validate_constructor_args_shape(program, args)
+    if shape_errors:
+        raise CompilationError("constructorArgs errors:\n  " + "\n  ".join(shape_errors))
+
     for prop in program.properties:
         if prop.name in args:
             prop.initial_value = args[prop.name]
+
+    unbaked_errors = _find_unbaked_referenced_readonly(program)
+    if unbaked_errors:
+        raise CompilationError("constructorArgs errors:\n  " + "\n  ".join(unbaked_errors))
+
+
+def _validate_constructor_args_shape(program: ANFProgram, args: object) -> list[str]:
+    """Validate the shape of ``constructorArgs`` against the contract's
+    properties BEFORE baking. Returns a list of error messages (empty = valid).
+
+    Rejects:
+     (a) positional arrays/sequences -- ``constructorArgs`` must be a record
+         keyed by property name. A positional array matches no property names,
+         so nothing would be baked and the script would silently keep its OP_0
+         placeholders (failing opaquely at runtime).
+     (b) keys that do not match any contract property name (typos would
+         otherwise silently bake nothing for that key).
+    """
+    errors: list[str] = []
+
+    if isinstance(args, (list, tuple)):
+        prop_names = ", ".join(p.name for p in program.properties)
+        first = program.properties[0].name if program.properties else "propName"
+        errors.append(
+            f"constructorArgs must be a record keyed by property name, not a "
+            f"positional array. Contract '{program.contract_name}' properties: "
+            f"[{prop_names}]. Example: {{ {first}: <value> }}"
+        )
+        return errors
+
+    prop_name_set = {p.name for p in program.properties}
+    for key in args.keys():  # type: ignore[union-attr]
+        if key not in prop_name_set:
+            prop_names = ", ".join(p.name for p in program.properties)
+            errors.append(
+                f"constructorArgs key '{key}' does not match any property of "
+                f"contract '{program.contract_name}' (properties: [{prop_names}]). "
+                f"Nothing would be baked for this key."
+            )
+
+    return errors
+
+
+def _find_unbaked_referenced_readonly(program: ANFProgram) -> list[str]:
+    """After baking ``constructorArgs``, find readonly properties that are
+    REFERENCED by at least one method body but still have no baked
+    ``initial_value``. Such properties would be emitted as OP_0 placeholders,
+    making the compiled script fail opaquely at runtime.
+
+    Only applies when the caller asked for baking -- unbaked placeholder
+    compilation (no ``constructorArgs``) is the normal deploy-artifact path
+    where the SDK substitutes values via ``constructorSlots``.
+    """
+    referenced = _collect_referenced_props(program)
+
+    errors: list[str] = []
+    for prop in program.properties:
+        if prop.readonly and prop.initial_value is None and prop.name in referenced:
+            errors.append(
+                f"readonly property '{prop.name}' is referenced by a method but "
+                f"has no value after baking constructorArgs -- the emitted script "
+                f"would carry an OP_0 placeholder that fails at runtime. Provide "
+                f"'{prop.name}' in constructorArgs (or give the property an "
+                f"initializer)."
+            )
+    return errors
+
+
+def _collect_referenced_props(program: ANFProgram) -> set[str]:
+    """Collect the property names actually referenced by method bodies.
+
+    The raw ANF from pass 4 loads every property at method entry; only after
+    dead-binding elimination do the surviving ``load_prop`` nodes reflect real
+    references. DCE mutates in place in this tier, so it runs on a deep-copied
+    probe here and does not perturb the main pipeline.
+    """
+    import copy
+
+    from runar_compiler.frontend.dce import eliminate_dead_code
+
+    probe = copy.deepcopy(program)
+    eliminate_dead_code(probe)
+
+    referenced: set[str] = set()
+    for method in probe.methods:
+        # The constructor's super(...) call references every property but is
+        # never emitted as script code -- only real method bodies count.
+        if method.name == "constructor":
+            continue
+        _collect_load_prop_refs(method.body, referenced)
+    return referenced
+
+
+def _collect_load_prop_refs(bindings: list[Any], out: set[str]) -> None:
+    """Recursively collect ``load_prop`` property names from ANF bindings."""
+    for binding in bindings:
+        v = binding.value
+        if v.kind == "load_prop":
+            if v.name is not None:
+                out.add(v.name)
+        elif v.kind == "if":
+            _collect_load_prop_refs(v.then or [], out)
+            _collect_load_prop_refs(v.else_ or [], out)
+        elif v.kind == "loop":
+            _collect_load_prop_refs(v.body or [], out)
 
 
 # Constant folding is a source-pipeline optimization; never re-run it on
