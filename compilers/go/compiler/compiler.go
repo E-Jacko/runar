@@ -672,6 +672,12 @@ func CompileFromSourceWithResult(sourcePath string, opts ...CompileOptions) *Com
 	// Pass 4.5: EC optimization
 	result.ANF = frontend.OptimizeEC(result.ANF)
 
+	// Issue #109: warn when DCE strips an un-annotated readonly field. Computed
+	// from the post-lowering ANF (the surviving load_prop set), mirroring the TS
+	// reference's collectReferencedProps(optimizedAnf) placement.
+	result.Diagnostics = append(result.Diagnostics,
+		frontend.CollectEmbedAlwaysDCEWarnings(result.Contract, result.ANF)...)
+
 	// Pass 5: Stack lowering (recover from panics)
 	var stackMethods []codegen.StackMethod
 	func() {
@@ -820,6 +826,12 @@ func CompileFromSourceStrWithResult(source string, fileName string, opts ...Comp
 
 	// Pass 4.5: EC optimization
 	result.ANF = frontend.OptimizeEC(result.ANF)
+
+	// Issue #109: warn when DCE strips an un-annotated readonly field. Computed
+	// from the post-lowering ANF (the surviving load_prop set), mirroring the TS
+	// reference's collectReferencedProps(optimizedAnf) placement.
+	result.Diagnostics = append(result.Diagnostics,
+		frontend.CollectEmbedAlwaysDCEWarnings(result.Contract, result.ANF)...)
 
 	// Pass 5: Stack lowering (recover from panics)
 	var stackMethods []codegen.StackMethod

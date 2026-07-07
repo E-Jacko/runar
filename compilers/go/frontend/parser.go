@@ -62,37 +62,61 @@ func ParseSource(source []byte, fileName string) *ParseResult {
 		}
 	}
 
-	// Fail-closed guard for the author-facing comment directives that only
-	// the TypeScript compiler implements today: `@sighash <FLAGS>` (#123,
-	// per-method sighash type) and `@embedAlways` (#109, readonly-field DCE
-	// opt-out). The Go frontend ignores comments, so it would silently drop
-	// these directives and change signing / DCE semantics. Reject rather than
-	// diverge until the ports land.
-	if msg := unsupportedDirectiveError(source); msg != "" {
-		return &ParseResult{
-			Errors: []Diagnostic{{Message: msg, Severity: SeverityError}},
-		}
-	}
-
 	lower := strings.ToLower(fileName)
+
+	// The TypeScript surface parser (Parse, the default branch) now honours the
+	// `@sighash` (#123, per-method sighash type) and `@embedAlways` (#109,
+	// readonly-field DCE opt-out) comment directives, matching the TS reference
+	// compiler. The eight non-TS surface parsers below do NOT read comments, so
+	// they would silently drop these directives and change signing / DCE
+	// semantics. Fail closed on those formats rather than miscompile — this is
+	// strictly safer than the TS reference (which silently ignores the
+	// directives in its non-.ts frontends) and has zero conformance impact (no
+	// fixture uses the directives). The `.runar.ts` surface is exempt because
+	// Parse now implements the directives.
 	switch {
 	case strings.HasSuffix(lower, ".runar.sol"):
+		if msg := unsupportedDirectiveError(source, "Solidity"); msg != "" {
+			return directiveGuardResult(msg)
+		}
 		return ParseSolidity(source, fileName)
 	case strings.HasSuffix(lower, ".runar.move"):
+		if msg := unsupportedDirectiveError(source, "Move"); msg != "" {
+			return directiveGuardResult(msg)
+		}
 		return ParseMove(source, fileName)
 	case strings.HasSuffix(lower, ".runar.go"):
+		if msg := unsupportedDirectiveError(source, "Go DSL"); msg != "" {
+			return directiveGuardResult(msg)
+		}
 		return ParseGoContract(source, fileName)
 	case strings.HasSuffix(lower, ".runar.py"):
+		if msg := unsupportedDirectiveError(source, "Python"); msg != "" {
+			return directiveGuardResult(msg)
+		}
 		return ParsePython(source, fileName)
 	case strings.HasSuffix(lower, ".runar.rs"):
+		if msg := unsupportedDirectiveError(source, "Rust"); msg != "" {
+			return directiveGuardResult(msg)
+		}
 		return ParseRustMacro(source, fileName)
 	case strings.HasSuffix(lower, ".runar.rb"):
+		if msg := unsupportedDirectiveError(source, "Ruby"); msg != "" {
+			return directiveGuardResult(msg)
+		}
 		return ParseRuby(source, fileName)
 	case strings.HasSuffix(lower, ".runar.zig"):
+		if msg := unsupportedDirectiveError(source, "Zig"); msg != "" {
+			return directiveGuardResult(msg)
+		}
 		return ParseZig(source, fileName)
 	case strings.HasSuffix(lower, ".runar.java"):
+		if msg := unsupportedDirectiveError(source, "Java"); msg != "" {
+			return directiveGuardResult(msg)
+		}
 		return ParseJava(source, fileName)
 	default:
+		// TypeScript surface: honours @sighash / @embedAlways directly.
 		return Parse(source, fileName)
 	}
 }
@@ -105,15 +129,21 @@ var (
 	embedAlwaysDirectiveRE = regexp.MustCompile(`@embedAlways\b`)
 )
 
+func directiveGuardResult(msg string) *ParseResult {
+	return &ParseResult{Errors: []Diagnostic{{Message: msg, Severity: SeverityError}}}
+}
+
 // unsupportedDirectiveError returns a non-empty diagnostic message when the
-// source carries a `@sighash` (#123) or `@embedAlways` (#109) directive that
-// this compiler does not yet honour, or "" when the source is clean.
-func unsupportedDirectiveError(source []byte) string {
+// source carries a `@sighash` (#123) or `@embedAlways` (#109) directive on a
+// surface format whose parser does not read comments (so the directive would be
+// silently dropped), or "" when the source is clean. surfaceName names the
+// non-TS format for the diagnostic.
+func unsupportedDirectiveError(source []byte, surfaceName string) string {
 	if sighashDirectiveRE.Match(source) {
-		return "@sighash directive is not yet supported by the Go compiler (issue #123); compile the contract with the TypeScript compiler"
+		return fmt.Sprintf("@sighash directive (issue #123) is not supported by the %s surface parser; write the contract in TypeScript (.runar.ts) where @sighash is honoured", surfaceName)
 	}
 	if embedAlwaysDirectiveRE.Match(source) {
-		return "@embedAlways directive is not yet supported by the Go compiler (issue #109); compile the contract with the TypeScript compiler"
+		return fmt.Sprintf("@embedAlways directive (issue #109) is not supported by the %s surface parser; write the contract in TypeScript (.runar.ts) where @embedAlways is honoured", surfaceName)
 	}
 	return ""
 }
@@ -342,13 +372,32 @@ func (p *parseContext) parseProperty(node *sitter.Node) *PropertyNode {
 		typeNode = CustomType{Name: "unknown"}
 	}
 
+	// Issue #109: `/** @embedAlways */` (or `// @embedAlways`) directive in the
+	// field's leading comment trivia opts it out of DCE elimination.
+	embedAlways := embedAlwaysDirectiveRE.MatchString(p.leadingCommentText(node))
+
 	return &PropertyNode{
 		Name:           nameStr,
 		Type:           typeNode,
 		Readonly:       isReadonly,
 		Initializer:    initializer,
+		EmbedAlways:    embedAlways,
 		SourceLocation: p.loc(node),
 	}
+}
+
+// leadingCommentText collects the text of consecutive `comment` sibling nodes
+// immediately preceding a class-body member (property / method). tree-sitter
+// exposes comments as siblings in the class_body, so a `/** @sighash ... */`
+// or `// @embedAlways` directive is the immediately-preceding sibling of the
+// member it annotates. Stacked comments are concatenated (mirrors the TS
+// reference's JSDoc + leading-trivia scan).
+func (p *parseContext) leadingCommentText(node *sitter.Node) string {
+	var parts []string
+	for prev := node.PrevSibling(); prev != nil && prev.Type() == "comment"; prev = prev.PrevSibling() {
+		parts = append(parts, p.nodeText(prev))
+	}
+	return strings.Join(parts, "\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -389,13 +438,45 @@ func (p *parseContext) parseMethod(node *sitter.Node) MethodNode {
 		}
 	}
 
+	// Issue #123: `/** @sighash <FLAGS> */` directive → per-method sighash type.
+	sighashType := p.parseSighashOnMethod(node, name, visibility)
+
 	return MethodNode{
 		Name:           name,
 		Params:         params,
 		Body:           body,
 		Visibility:     visibility,
+		SighashType:    sighashType,
 		SourceLocation: p.loc(node),
 	}
+}
+
+// parseSighashOnMethod detects + parses a `/** @sighash <FLAGS> */` (or
+// `// @sighash ...`) directive on a method from its leading comment trivia.
+// Returns the numeric sighash type, or nil when no directive is present.
+// Pushes an error for a malformed flag list or a directive on a non-public
+// method (only public methods are spending entry points, so a `@sighash` on a
+// private helper is meaningless). Mirrors the TS parseSighashOnMethod.
+func (p *parseContext) parseSighashOnMethod(node *sitter.Node, name, visibility string) *int {
+	comments := p.leadingCommentText(node)
+	result, present := extractSighashDirective(comments)
+	if !present {
+		return nil
+	}
+
+	if visibility != "public" {
+		p.addError(fmt.Sprintf(
+			"@sighash directive on non-public method '%s' has no effect — only public methods are spending entry points",
+			name))
+		return nil
+	}
+
+	if !result.ok() {
+		p.addError(fmt.Sprintf("Method '%s': %s", name, result.err))
+		return nil
+	}
+	v := result.value
+	return &v
 }
 
 func (p *parseContext) getMethodName(node *sitter.Node) string {

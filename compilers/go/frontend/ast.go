@@ -79,6 +79,18 @@ type PropertyNode struct {
 	Initializer    Expression // may be nil — literal default value
 	SourceLocation SourceLocation
 
+	// EmbedAlways is set by the parser when a `/** @embedAlways */` (or
+	// `// @embedAlways`) comment directive immediately precedes a readonly
+	// field (issue #109). It opts the field OUT of dead-code elimination: a
+	// readonly field no method references is normally stripped from the
+	// locking script (its load_prop is dead, so no constructor slot is
+	// emitted), silently removing deploy-time metadata an author intends to
+	// recover from the on-chain script later. When set, ANF lowering forces
+	// the field into the script (a constructor slot) so its bytes survive.
+	// Comment-directive form (not a decorator) keeps it portable across the
+	// surface formats. Only meaningful on readonly fields.
+	EmbedAlways bool
+
 	// SyntheticArrayChain records the full nesting of FixedArray levels
 	// that produced a given scalar leaf property. Only populated by the
 	// expand-fixed-arrays pass; a nil chain means the property is
@@ -94,6 +106,14 @@ type MethodNode struct {
 	Body           []Statement
 	Visibility     string // "public" or "private"
 	SourceLocation SourceLocation
+
+	// SighashType is the BIP-143 sighash type declared via a
+	// `/** @sighash <FLAGS> */` directive on a public method (issue #123),
+	// e.g. 0x43 for SINGLE|FORKID. Nil = no directive = the default
+	// ALL|FORKID (0x41), byte-identical to the historically-pinned mode.
+	// Drives the auto-injected preimage-type assert, the OP_PUSH_TX binding
+	// flag, the ABI sigHashType, and the SDK-side preimage construction.
+	SighashType *int
 }
 
 // ParamNode represents a method parameter.

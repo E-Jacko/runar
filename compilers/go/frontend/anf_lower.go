@@ -208,6 +208,23 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 		IsPublic: false,
 	})
 
+	// Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+	// must survive DCE into the locking script. A readonly field no method
+	// references lowers to no load_prop, so no constructor slot is emitted and
+	// the field's deploy-time bytes vanish. We inject a load_prop + a `@ref:`
+	// alias (the exact shape the `const _bind = this.field;` idiom produces)
+	// into the FIRST public method's body — the alias keeps the load_prop alive
+	// through dead-binding DCE, and stack lowering threads the pushed value
+	// through and cleans it up at method end. One slot in the deployed script
+	// suffices; every spending branch shares it.
+	var embedFields []PropertyNode
+	for _, p := range contract.Properties {
+		if p.Readonly && p.EmbedAlways {
+			embedFields = append(embedFields, p)
+		}
+	}
+	embedInjected := false
+
 	// Lower each method (including private methods as separate entries)
 	for _, method := range contract.Methods {
 		methodCtx := newLowerCtxWithEffects(contract, sideEffects)
@@ -276,6 +293,14 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			if hasStateProp {
 				preimageRef3 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
 				methodCtx.emit(ir.ANFValue{Kind: "deserialize_state", Preimage: preimageRef3})
+			}
+
+			// Issue #109: preserve @embedAlways fields at the first user-statement
+			// position (after the checkPreimage/deserialize preamble), mirroring
+			// where a `const _bind = this.field;` idiom would sit.
+			if !embedInjected && len(embedFields) > 0 {
+				emitEmbedAlwaysPreservation(methodCtx, embedFields)
+				embedInjected = true
 			}
 
 			// Lower the developer's method body
@@ -405,6 +430,13 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 				IsPublic: true,
 			})
 		} else {
+			// Issue #109: stateless public methods (and stateless contracts'
+			// spending entry points) are lowered here — inject @embedAlways
+			// preservation into the first PUBLIC one before its body.
+			if !embedInjected && len(embedFields) > 0 && method.Visibility == "public" {
+				emitEmbedAlwaysPreservation(methodCtx, embedFields)
+				embedInjected = true
+			}
 			methodCtx.lowerStatements(method.Body)
 			augmented := lowerParams(method.Params)
 			// Private methods can also call the intent intrinsics; capture
@@ -426,6 +458,22 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 	}
 
 	return result
+}
+
+// emitEmbedAlwaysPreservation emits the DCE-surviving preservation pair for
+// each `@embedAlways` readonly field into the given (public) method context
+// (issue #109). Reproduces exactly what a hand-written `const _bind =
+// this.field;` lowers to: a load_prop followed by a load_const("@ref:<t>")
+// alias. The alias marks the load_prop as referenced (see dce.go), so
+// dead-binding DCE keeps it; stack lowering then emits the field's
+// constructor-slot placeholder and NIPs the unused value off the stack at
+// method end. The field's bytes therefore remain in the deployed locking
+// script for downstream recovery.
+func emitEmbedAlwaysPreservation(ctx *lowerCtx, fields []PropertyNode) {
+	for _, field := range fields {
+		loadRef := ctx.emit(ir.ANFValue{Kind: "load_prop", Name: field.Name})
+		ctx.emitNamed("__embedAlways_"+field.Name, makeLoadConstString("@ref:"+loadRef))
+	}
 }
 
 func lowerParams(params []ParamNode) []ir.ANFParam {
