@@ -713,11 +713,58 @@ func (c *RunarContract) PrepareCall(
 	if err != nil {
 		return nil, fmt.Errorf("RunarContract.PrepareCall: getting UTXOs: %w", err)
 	}
-	var additionalUtxos []UTXO
+	var candidateFundingUtxos []UTXO
 	for _, u := range allFundingUtxos {
 		if !(u.Txid == c.currentUtxo.Txid && u.OutputIndex == c.currentUtxo.OutputIndex) {
-			additionalUtxos = append(additionalUtxos, u)
+			candidateFundingUtxos = append(candidateFundingUtxos, u)
 		}
+	}
+
+	// Coin selection for funding inputs (issue #133): don't sweep the whole
+	// wallet. Compute how much the funding must cover — the contract's own input
+	// value already offsets the contract/data outputs — and pick the smallest
+	// largest-first set via SelectUtxos (the strategy deploy uses).
+	var contractOutputSats int64
+	if len(contractOutputs) > 0 {
+		for _, co := range contractOutputs {
+			contractOutputSats += co.Satoshis
+		}
+	} else {
+		contractOutputSats = newSatoshis
+	}
+	for _, do := range resolvedDataOutputs {
+		contractOutputSats += do.Satoshis
+	}
+	contractInputSats := c.currentUtxo.Satoshis
+	for _, u := range extraContractUtxos {
+		contractInputSats += u.Satoshis
+	}
+	fundingTarget := contractOutputSats - contractInputSats
+	if fundingTarget < 0 {
+		fundingTarget = 0
+	}
+	// Fee sizing hint for SelectUtxos: the continuation script length (falls
+	// back to the first multi-output script, else 0 for stateless calls).
+	fundingLockLen := 0
+	if newLockingScript != "" {
+		fundingLockLen = len(newLockingScript) / 2
+	} else if len(contractOutputs) > 0 {
+		fundingLockLen = len(contractOutputs[0].Script) / 2
+	}
+	var additionalUtxos []UTXO
+	if len(candidateFundingUtxos) > 0 {
+		additionalUtxos = SelectUtxos(candidateFundingUtxos, fundingTarget, fundingLockLen, feeRate)
+	}
+
+	// Cap funding inputs when the caller sets MaxFundingInputs. SelectUtxos
+	// returns the minimal largest-first set; if that still exceeds the cap the
+	// funding can't cover outputs + fee within the budget, so fail loudly
+	// instead of broadcasting an underfunded tx.
+	if options != nil && options.MaxFundingInputs != nil && len(additionalUtxos) > *options.MaxFundingInputs {
+		return nil, fmt.Errorf(
+			"RunarContract.Call(%s): funding requires %d input(s) but maxFundingInputs=%d. "+
+				"Increase maxFundingInputs, use larger UTXOs, or consolidate.",
+			methodName, len(additionalUtxos), *options.MaxFundingInputs)
 	}
 
 	// Initial unlocking script (with placeholders). Intent-witness hex is
