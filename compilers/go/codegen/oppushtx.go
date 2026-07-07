@@ -33,10 +33,6 @@ const checkPreimageBindingHex = "76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7
 // replacement is exact.
 const checkPreimageSighashTail = "7e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad"
 
-func checkPreimageBindingBytes() []byte {
-	return checkPreimageBindingBytesWithFlag(0x41)
-}
-
 // checkPreimageBindingBytesWithFlag returns the binding blob with the appended
 // DER sighash flag byte set to sighashFlag. For the default 0x41 the frozen
 // constant is returned unchanged (zero cross-tier churn); a non-default flag
