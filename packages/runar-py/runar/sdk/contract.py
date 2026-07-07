@@ -14,7 +14,10 @@ from runar.sdk.deployment import (
     build_deploy_transaction, select_utxos, build_p2pkh_script,
     _to_le32, _to_le64, _encode_varint, _reverse_hex,
 )
-from runar.sdk.calling import build_call_transaction, insert_unlocking_script
+from runar.sdk.calling import (
+    build_call_transaction, insert_unlocking_script, resolve_input_sequence,
+)
+from runar.sdk.script_utils import restore_constructor_args
 from runar.sdk.state import (
     serialize_state, extract_state_from_script, find_last_op_return,
     encode_push_data,
@@ -987,8 +990,14 @@ class RunarContract:
         UTXO data is already available (e.g. from an overlay service or cache)
         without needing a Provider to fetch the transaction.
         """
-        dummy_args = [0] * len(artifact.abi.constructor_params)
-        contract = cls(artifact, dummy_args)
+        # Issue #119: recover the real baked-in constructor args from the
+        # deployed script rather than seeding zeros. Readonly ctor params feed
+        # the state-continuation formula and adjust_code_sep_offset, so zero
+        # placeholders make a restored stateful spend unspendable. Params with
+        # no ctor slot (mutable state fields) fall back to 0 and are overwritten
+        # by extract_state_from_script below.
+        restored_args = restore_constructor_args(artifact, utxo.script)
+        contract = cls(artifact, restored_args)
 
         if artifact.state_fields:
             last_op_return = find_last_op_return(utxo.script)
@@ -1174,13 +1183,19 @@ class RunarContract:
             tx += _to_le32(contract_utxo.output_index)
             tx += _encode_varint(len(unlock) // 2)
             tx += unlock
-            tx += 'ffffffff'
+            tx += term_sequence_hex
+            # Fee input (unsigned placeholder; signed after tx is final)
+            if fee_utxo:
+                tx += _reverse_hex(fee_utxo.txid)
+                tx += _to_le32(fee_utxo.output_index)
+                tx += '00'  # empty scriptSig
+                tx += term_sequence_hex
             # Funding inputs (unsigned placeholders)
             for fu in funding_utxos:
                 tx += _reverse_hex(fu.txid)
                 tx += _to_le32(fu.output_index)
                 tx += '00'  # empty scriptSig
-                tx += 'ffffffff'
+                tx += term_sequence_hex
             tx += _encode_varint(len(term_outputs))
             for out in term_outputs:
                 tx += _to_le64(out.satoshis)
