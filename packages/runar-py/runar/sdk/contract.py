@@ -700,17 +700,23 @@ class RunarContract:
             # Thread CallOptions.locktime so contracts asserting
             # extractLocktime(preimage) can succeed. None → 0 (legacy).
             locktime=opts.locktime,
+            # Thread CallOptions.sequence (issue #131): a non-zero locktime
+            # needs non-final input sequences or consensus ignores nLockTime.
+            sequence=opts.sequence,
         )
 
-        # Sign P2PKH funding inputs (after contract inputs)
+        # Sign P2PKH funding inputs (after contract inputs). Funding inputs are
+        # signed by funding_signer when set (issue #134): the method signer may
+        # not own the funding coins. The method's own Sig args keep the
+        # connected signer. Defaults to the connected signer.
         signed_tx = tx_hex
-        pub_key = signer.get_public_key()
+        pub_key = funding_signer.get_public_key()
         p2pkh_start_idx = 1 + len(extra_contract_utxos)
         for i in range(p2pkh_start_idx, input_count):
             utxo_idx = i - p2pkh_start_idx
             if utxo_idx < len(additional_utxos):
                 utxo = additional_utxos[utxo_idx]
-                sig = signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
+                sig = funding_signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
                 unlock_script = encode_push_data(sig) + encode_push_data(pub_key)
                 signed_tx = insert_unlocking_script(signed_tx, i, unlock_script)
 
@@ -790,16 +796,19 @@ class RunarContract:
                 # Rebuild path must honor the override too: a preimage computed
                 # on a rebuilt tx with locktime 0 would mismatch the final tx.
                 locktime=opts.locktime,
+                # Same for sequence — the second-pass preimage must see the
+                # final input sequences (issue #131).
+                sequence=opts.sequence,
             )
             signed_tx = tx_hex
 
-            # Re-sign P2PKH funding inputs after rebuild
+            # Re-sign P2PKH funding inputs after rebuild (funding_signer — #134)
             p2pkh_start_idx = 1 + len(extra_contract_utxos)
             for i in range(p2pkh_start_idx, input_count):
                 utxo_idx = i - p2pkh_start_idx
                 if utxo_idx < len(additional_utxos):
                     utxo = additional_utxos[utxo_idx]
-                    sig = signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
+                    sig = funding_signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
                     unlock_script = encode_push_data(sig) + encode_push_data(pub_key)
                     signed_tx = insert_unlocking_script(signed_tx, i, unlock_script)
 
@@ -1172,9 +1181,22 @@ class RunarContract:
         # behavior for contracts that don't check locktime.
         terminal_locktime = opts.locktime if opts.locktime is not None else 0
 
-        # Build raw terminal transaction: contract input + optional funding inputs, exact outputs
+        # Sequence (issue #131): all-final inputs make nLockTime a consensus
+        # no-op — when a non-zero locktime is set, default to 0xfffffffe so the
+        # terminal method's extractLocktime assertion is actually enforced.
+        term_sequence_hex = _to_le32(resolve_input_sequence(opts.locktime, opts.sequence))
+
+        # Fee input (issue #118): a single plain P2PKH UTXO added BEFORE the
+        # OP_PUSH_TX preimage is computed (so hashPrevouts covers it), consumed
+        # entirely as fee — no change output. It sits at index 1, right after
+        # the primary contract input, so the covenant's terminal output
+        # assertions (which don't touch the input side) stay valid.
+        fee_utxo = opts.fee_utxo
+
+        # Build raw terminal transaction: contract input + optional fee input +
+        # optional funding inputs, exact outputs.
         def build_terminal_tx(unlock: str) -> str:
-            num_inputs = 1 + len(funding_utxos)
+            num_inputs = 1 + (1 if fee_utxo else 0) + len(funding_utxos)
             tx = ''
             tx += _to_le32(1)  # version
             tx += _encode_varint(num_inputs)
