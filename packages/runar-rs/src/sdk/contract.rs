@@ -615,6 +615,26 @@ impl RunarContract {
                     resolved_args[i] = SdkValue::Bytes("00".repeat(36 * estimated_inputs));
                 }
             }
+            // EmptySig (issue #106) is intentionally NOT handled here: it is not
+            // `Auto`, so it is never added to `sig_indices` and never signed. It
+            // stays `SdkValue::EmptySig` in `resolved_args` and `encode_arg`
+            // emits OP_0 for it.
+        }
+
+        // Soft heuristic (issue #106): more than one Auto Sig slot after
+        // resolution usually means an OR-CHECKSIG method whose non-matching
+        // branch should use `SdkValue::EmptySig` instead — otherwise every
+        // branch gets the same real signature and the failing CHECKSIG trips
+        // BIP146 NULLFAIL on broadcast. Legitimate AND-CHECKSIG multi-signer
+        // flows also use multiple Autos, so this is informational only (the ABI
+        // does not encode the script's OR-vs-AND topology).
+        if sig_indices.len() >= 2 {
+            eprintln!(
+                "runar-sdk: warning: {}.call('{}') has {} auto-signed Sig slots. \
+                 If this is an OR-CHECKSIG method, pass SdkValue::EmptySig for the \
+                 non-matching branch(es) to satisfy BIP146 NULLFAIL (issue #106).",
+                self.artifact.contract_name, method_name, sig_indices.len(),
+            );
         }
 
         // If any param uses SigHashPreimage, or this is a stateful contract,
@@ -2179,6 +2199,7 @@ fn encode_arg(value: &SdkValue) -> String {
                 encode_push_data(hex)
             }
         }
+        SdkValue::EmptySig => "00".to_string(), // OP_0 — empty signature push (issue #106)
         SdkValue::Auto => {
             panic!("encode_arg: SdkValue::Auto should be resolved before encoding")
         }

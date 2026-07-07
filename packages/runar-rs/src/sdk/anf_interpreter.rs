@@ -93,6 +93,9 @@ impl Val {
             SdkValue::Bool(b) => Val::Bool(*b),
             SdkValue::Bytes(s) => Val::Bytes(s.clone()),
             SdkValue::Auto => Val::Undefined,
+            // EmptySig is a signature slot (issue #106); its value never feeds
+            // state/data-output computation, so treat it as Undefined like Auto.
+            SdkValue::EmptySig => Val::Undefined,
             // Array values must be flattened into scalar slots by the
             // caller before reaching the ANF interpreter. Treat any
             // leaked Array as Undefined so downstream code fails loudly.

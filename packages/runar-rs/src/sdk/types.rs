@@ -334,6 +334,15 @@ pub enum SdkValue {
     /// Pass this as an arg to `call()` for params of type `Sig` or `PubKey` —
     /// the SDK will compute the real value from the signer.
     Auto,
+    /// Producer-side marker for the deliberately-empty branch of an
+    /// OR-CHECKSIG method (issue #106). Encodes as `OP_0` (a single `0x00`
+    /// byte, i.e. an empty signature push) and is SKIPPED by the auto-sig
+    /// signing pass — no signature is ever computed for this slot. Pass it for
+    /// the non-matching `checkSig(sig, pk)` branch so BIP146 NULLFAIL is
+    /// satisfied (the failing CHECKSIG sees an empty sig and returns false
+    /// instead of aborting). Coexists with `Auto` at the same call:
+    /// `[Auto, EmptySig]` signs only the Auto slot.
+    EmptySig,
     /// A (possibly nested) array of values. Used for FixedArray state
     /// fields. The SDK flattens this into positional scalar slots keyed
     /// by `fixed_array.synthetic_names` when serializing state.
@@ -573,6 +582,15 @@ mod tests {
     fn sdk_value_auto() {
         let v = SdkValue::Auto;
         assert_eq!(v, SdkValue::Auto);
+    }
+
+    #[test]
+    fn sdk_value_empty_sig() {
+        // Issue #106: EmptySig is a distinct unit variant from Auto/Bytes.
+        let v = SdkValue::EmptySig;
+        assert_eq!(v, SdkValue::EmptySig);
+        assert_ne!(SdkValue::EmptySig, SdkValue::Auto);
+        assert_ne!(SdkValue::EmptySig, SdkValue::Bytes(String::new()));
     }
 
     #[test]
