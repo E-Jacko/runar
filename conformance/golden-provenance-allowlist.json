@@ -1,0 +1,28 @@
+{
+  "_comment": [
+    "GOLDEN-REGENERATION INTEGRITY GATE — provenance allowlist (issue #122).",
+    "Goldens/vectors are self-produced by the implementation-under-test. This file",
+    "is how a PR carries an INDEPENDENT justification for changing one. Every entry",
+    "pins a specific golden file to the exact NEW content it is authorizing, via a",
+    "sha256 of that file's bytes. Because the pin is content-addressed, an entry can",
+    "only ever justify the ONE value it was reviewed for — a later, different",
+    "regeneration of the same file fails the gate again and forces a fresh entry.",
+    "See conformance/README.md -> 'Golden-regeneration integrity gate' for the full",
+    "design and the two ways to satisfy the gate.",
+    "",
+    "Schema of each entry in `entries`:",
+    "  path             (string, required)  repo-root-relative path of the golden file",
+    "  sha256           (string, required)  hex sha256 of the file's NEW (post-change) bytes",
+    "  verified-against (enum,   required)  one of: official-KAT | second-implementation |",
+    "                                       differential-oracle | intentional-spec-change",
+    "  reason           (string, required)  human explanation of WHY the new bytes are correct",
+    "                                       and against WHICH independent oracle they were checked",
+    "  reviewer         (string, required)  sign-off marker, e.g. a GitHub handle 'gh:alice'",
+    "  date             (string, optional)  ISO date the entry was added",
+    "",
+    "To compute the sha256 of a golden after you have regenerated it:",
+    "  shasum -a 256 conformance/tests/<fixture>/expected-script.hex",
+    "or run the checker with --print-hashes to get them for the whole changed set."
+  ],
+  "entries": []
+}
