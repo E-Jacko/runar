@@ -108,6 +108,10 @@ public final class ContractScript {
      * for backwards compatibility).
      */
     static String encodeConstructorArg(Object value, String type) {
+        if (RunarContract.isEmptySig(value)) {
+            // Issue #106: OP_0 — empty signature push for the failing OR-CHECKSIG branch.
+            return "00";
+        }
         if (value instanceof Boolean b) {
             return b ? "51" : "00";
         }

@@ -113,9 +113,10 @@ final class RawTx {
             hashPrevouts = new byte[32];
         }
 
-        if (!anyoneCanPay && baseType != SIGHASH_ALL && baseType != 0x03 /*SINGLE*/) {
-            hashSequence = new byte[32];
-        } else if (!anyoneCanPay) {
+        // hashSequence (BIP-143): committed ONLY under pure SIGHASH_ALL. NONE /
+        // SINGLE / ANYONECANPAY all zero it. OpPushTx.preimage is kept in lock
+        // step (issue #123).
+        if (!anyoneCanPay && baseType == SIGHASH_ALL) {
             StringBuilder seqs = new StringBuilder();
             for (Input in : inputs) {
                 seqs.append(ScriptUtils.toLittleEndian32((int) in.sequence));
@@ -125,7 +126,26 @@ final class RawTx {
             hashSequence = new byte[32];
         }
 
-        if (baseType != 0x03 /*SINGLE*/ && baseType != 0x02 /*NONE*/) {
+        // hashOutputs (BIP-143):
+        //   NONE   -> 32 zero bytes (no outputs committed)
+        //   SINGLE -> hash256(output at THIS input's index), or 32 zero bytes
+        //             when inputIndex >= outputs.size() (issue #123 F5)
+        //   else   -> hash256(all outputs)
+        if (baseType == 0x02 /*NONE*/) {
+            hashOutputs = new byte[32];
+        } else if (baseType == 0x03 /*SINGLE*/) {
+            if (inputIndex < outputs.size()) {
+                Output o = outputs.get(inputIndex);
+                StringBuilder one = new StringBuilder();
+                one.append(ScriptUtils.toLittleEndian64(o.satoshis));
+                int len = o.scriptPubKeyHex.length() / 2;
+                one.append(ScriptUtils.encodeVarInt(len));
+                one.append(o.scriptPubKeyHex);
+                hashOutputs = Hash160.doubleSha256(ScriptUtils.hexToBytes(one.toString()));
+            } else {
+                hashOutputs = new byte[32];
+            }
+        } else {
             StringBuilder outs = new StringBuilder();
             for (Output o : outputs) {
                 outs.append(ScriptUtils.toLittleEndian64(o.satoshis));
@@ -134,8 +154,6 @@ final class RawTx {
                 outs.append(o.scriptPubKeyHex);
             }
             hashOutputs = Hash160.doubleSha256(ScriptUtils.hexToBytes(outs.toString()));
-        } else {
-            hashOutputs = new byte[32];
         }
 
         Input signed = inputs.get(inputIndex);
