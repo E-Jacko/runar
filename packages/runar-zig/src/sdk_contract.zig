@@ -522,6 +522,11 @@ pub const RunarContract = struct {
             for (terminal_funding) |u| {
                 try additional_utxos.append(self.allocator, u);
             }
+            // Issue #118: a single P2PKH fee input, added to the terminal tx
+            // BEFORE the OP_PUSH_TX preimage (so hashPrevouts covers it) and
+            // consumed entirely as fee — no change output. Merges into the same
+            // terminal funding-input path as funding_utxos.
+            if (options) |o| if (o.fee_utxo) |fee| try additional_utxos.append(self.allocator, fee);
         } else {
             for (all_utxos) |u| {
                 if (!(std.mem.eql(u8, u.txid, contract_utxo.txid) and u.output_index == contract_utxo.output_index)) {
@@ -1420,6 +1425,10 @@ pub const RunarContract = struct {
         defer additional_utxos.deinit(self.allocator);
         if (is_terminal_call) {
             for (terminal_funding) |u| try additional_utxos.append(self.allocator, u);
+            // Issue #118: a single P2PKH fee input, added BEFORE the OP_PUSH_TX
+            // preimage and consumed entirely as fee (no change output). Merges
+            // into the same terminal funding-input path as funding_utxos.
+            if (options) |o| if (o.fee_utxo) |fee| try additional_utxos.append(self.allocator, fee);
         } else {
             for (all_utxos) |u| {
                 if (!(std.mem.eql(u8, u.txid, contract_utxo.txid) and u.output_index == contract_utxo.output_index)) {
@@ -1668,6 +1677,10 @@ pub const RunarContract = struct {
         defer additional_utxos.deinit(self.allocator);
         if (is_terminal_call) {
             for (terminal_funding) |u| try additional_utxos.append(self.allocator, u);
+            // Issue #118: a single P2PKH fee input, added BEFORE the OP_PUSH_TX
+            // preimage and consumed entirely as fee (no change output). Merges
+            // into the same terminal funding-input path as funding_utxos.
+            if (options) |o| if (o.fee_utxo) |fee| try additional_utxos.append(self.allocator, fee);
         } else {
             for (all_utxos) |u| {
                 if (!(std.mem.eql(u8, u.txid, contract_utxo.txid) and u.output_index == contract_utxo.output_index)) {
@@ -3569,6 +3582,61 @@ test "call with terminal_outputs builds tx with exact outputs and clears UTXO" {
     // The OP_1 output is one byte; check by surrounding length-prefix
     // pattern "0151" (varint length 1, OP_1).
     try std.testing.expect(std.mem.indexOf(u8, raw_tx, "0151") != null);
+}
+
+// Issue #118: CallOptions.fee_utxo adds a single P2PKH input to a terminal call
+// tx purely to pay the miner fee — added before the OP_PUSH_TX preimage and
+// consumed entirely as fee (no change output). Merges into the terminal
+// funding-input path.
+test "terminal call adds fee_utxo input to pay the miner fee (#118)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"contractName":"OpOne","version":"1","compilerVersion":"1.0","script":"51","asm":"OP_1",
+        \\"abi":{"constructor":{"params":[]},"methods":[{"name":"go","params":[],"isPublic":true}]},
+        \\"stateFields":[],"constructorSlots":[],"buildTimestamp":"2024-01-01"}
+    ;
+    var artifact = try types.RunarArtifact.fromJson(allocator, json);
+    defer artifact.deinit();
+
+    var signer = try signer_mod.LocalSigner.fromHex("18e14a7b6a307f426a94f8114701e7c8e774e7f9a47e2c2035db29a206321725");
+    const term_p2pkh = "76a914" ++ ("aa" ** 20) ++ "88ac";
+    // Terminal output pays out the full 5000 contract balance, so the fee must
+    // come from the fee_utxo. The fee input's txid is all-0xcc, which is a
+    // palindrome under the little-endian prevout byte reversal.
+    const term_outputs = [_]types.ContractOutput{.{ .script = term_p2pkh, .satoshis = 5000 }};
+    const fee_utxo = types.UTXO{ .txid = "cc" ** 32, .output_index = 1, .satoshis = 1000, .script = "76a914" ++ ("bb" ** 20) ++ "88ac" };
+
+    // WITH fee_utxo: the fee input's prevout appears in the broadcast tx.
+    {
+        var contract = try RunarContract.init(allocator, &artifact, &.{});
+        defer contract.deinit();
+        var prov = provider_mod.MockProvider.init(allocator, "testnet");
+        defer prov.deinit();
+        try contract.setCurrentUtxo(.{ .txid = "fe" ** 32, .output_index = 0, .satoshis = 5000, .script = "51" });
+        const opts = types.CallOptions{ .terminal_outputs = &term_outputs, .fee_utxo = fee_utxo };
+        const txid = try contract.call("go", &.{}, prov.provider(), signer.signer(), opts);
+        defer allocator.free(txid);
+        try std.testing.expect(contract.getCurrentUtxo() == null);
+        const raw_tx = try prov.provider().getRawTransaction(allocator, txid);
+        defer allocator.free(raw_tx);
+        try std.testing.expect(std.mem.indexOf(u8, raw_tx, "cc" ** 32) != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw_tx, term_p2pkh) != null);
+    }
+
+    // WITHOUT fee_utxo: no such input (baseline).
+    {
+        var contract = try RunarContract.init(allocator, &artifact, &.{});
+        defer contract.deinit();
+        var prov = provider_mod.MockProvider.init(allocator, "testnet");
+        defer prov.deinit();
+        try contract.setCurrentUtxo(.{ .txid = "fe" ** 32, .output_index = 0, .satoshis = 5000, .script = "51" });
+        const opts = types.CallOptions{ .terminal_outputs = &term_outputs };
+        const txid = try contract.call("go", &.{}, prov.provider(), signer.signer(), opts);
+        defer allocator.free(txid);
+        const raw_tx = try prov.provider().getRawTransaction(allocator, txid);
+        defer allocator.free(raw_tx);
+        try std.testing.expect(std.mem.indexOf(u8, raw_tx, "cc" ** 32) == null);
+    }
 }
 
 test "resolveTerminalOutputs converts addresses and script_hex into ContractOutput list" {

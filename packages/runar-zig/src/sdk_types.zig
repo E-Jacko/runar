@@ -112,6 +112,16 @@ pub const CallOptions = struct {
     /// `terminal_outputs` + fee. Ignored unless `terminal_outputs` is
     /// non-null. Each UTXO is signed with the configured signer's key.
     funding_utxos: ?[]const UTXO = null,
+    /// A single plain P2PKH UTXO added to a terminal call tx purely to pay the
+    /// miner fee (issue #118). A true terminal method pays out the full contract
+    /// balance, so fee would be 0 and ARC rejects; the covenant asserts its exact
+    /// output set, so no change output can absorb a fee. The fee input is added
+    /// BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers it) and
+    /// is consumed entirely as fee — no change output is created. Signed with
+    /// `funding_signer ?? signer` (composes with #134). Merges into the same
+    /// terminal P2PKH funding-input path as `funding_utxos`; the covenant's
+    /// output assertions are untouched.
+    fee_utxo: ?UTXO = null,
     /// Additional contract UTXOs to include as inputs (e.g. `merge` on a
     /// fungible token spends two contract UTXOs into one). Each entry is
     /// unlocked with the same method + arg shape as the primary call;
