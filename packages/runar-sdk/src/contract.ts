@@ -1637,6 +1637,14 @@ export class RunarContract {
    * byte offset. Uses codeSeparatorIndices[methodIndex] if available, otherwise
    * falls back to the single codeSeparatorIndex.
    *
+   * When `_codeScript` is set (chain-loaded, or a deploy script already built
+   * from real constructor args), byte-walk the actual script for the true
+   * on-chain OP_CODESEPARATOR offset — mirroring `getSubscriptForSigning`.
+   * `adjustCodeSepOffset` derives the shift from the in-memory
+   * `constructorArgs`, which are placeholders on the restore path (issue #132);
+   * the byte-walk is independent of those args. The template `adjustCodeSepOffset`
+   * path remains only for template-built (deploy-time) contracts.
+   *
    * Public low-level assembly surface: each covenant input of a
    * multi-contract tx needs its own OP_PUSH_TX signature + BIP-143 preimage
    * computed against ITS artifact's code separator layout.
@@ -1648,14 +1656,33 @@ export class RunarContract {
     satoshis: number,
     methodIndex?: number,
   ): { sigHex: string; preimageHex: string } {
-    let codeSepIdx = this.artifact.codeSeparatorIndex;
-    const indices = this.artifact.codeSeparatorIndices;
-    if (indices && methodIndex !== undefined && methodIndex < indices.length) {
-      codeSepIdx = indices[methodIndex];
+    let codeSepIdx: number | undefined;
+
+    if (this._codeScript !== null) {
+      const realOffsets = findCodesepOffsets(this._codeScript);
+      if (realOffsets.length > 0) {
+        const indices = this.artifact.codeSeparatorIndices;
+        if (indices && methodIndex !== undefined && methodIndex < indices.length
+            && methodIndex < realOffsets.length) {
+          codeSepIdx = realOffsets[methodIndex];
+        } else if (this.artifact.codeSeparatorIndex !== undefined) {
+          codeSepIdx = realOffsets[0];
+        }
+      }
     }
-    if (codeSepIdx !== undefined) {
-      codeSepIdx = this.adjustCodeSepOffset(codeSepIdx);
+
+    if (codeSepIdx === undefined) {
+      // Template (deploy-time) path: derive the shifted offset from the args.
+      codeSepIdx = this.artifact.codeSeparatorIndex;
+      const indices = this.artifact.codeSeparatorIndices;
+      if (indices && methodIndex !== undefined && methodIndex < indices.length) {
+        codeSepIdx = indices[methodIndex];
+      }
+      if (codeSepIdx !== undefined) {
+        codeSepIdx = this.adjustCodeSepOffset(codeSepIdx);
+      }
     }
+
     return computeOpPushTx(
       tx, inputIndex, subscript, satoshis,
       codeSepIdx,
