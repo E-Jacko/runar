@@ -1,6 +1,5 @@
 package runar.compiler.passes;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -592,34 +591,17 @@ public final class Validate {
 
         private void validateForStatement(ForStatement f) {
             // Bounded, literal iteration count — check the right-hand side of
-            // the comparison in the loop condition.
+            // the comparison in the loop condition. Non-zero starts and
+            // countdown loops (`i--` with `>`/`>=`) are supported: the ANF loop
+            // node carries an explicit start value and step direction (issue
+            // #121), so lowering binds `iterVar = start + i*step` on each
+            // unrolled iteration.
             if (f.condition() instanceof BinaryExpr be) {
                 if (!isCompileTimeConstant(be.right())) {
                     error("for-loop bound must be a compile-time constant", f.sourceLocation());
                 }
-
-                // The ANF loop node carries only an iteration count, so
-                // lowering always iterates i = 0..count-1. Reject the loop
-                // shapes that representation cannot express — a non-zero start
-                // or a countdown would otherwise be silently compiled as a
-                // zero-start counting-up loop while the interpreter runs the
-                // true source semantics.
-                if (be.op() == Expression.BinaryOp.GT || be.op() == Expression.BinaryOp.GE) {
-                    error(
-                        "For loop condition must count up with '<' or '<=' — countdown loops "
-                            + "are not supported; iterate i = 0..N-1 and index backwards instead",
-                        f.sourceLocation());
-                }
             } else {
                 error("for-loop condition must be a comparison against a compile-time constant",
-                    f.sourceLocation());
-            }
-
-            BigInteger startVal = f.init() != null ? extractLiteralBigInt(f.init().init()) : null;
-            if (startVal != null && startVal.signum() != 0) {
-                error(
-                    "For loop iterator must start at 0 (got " + startVal + "n) — loops compile "
-                        + "to i = 0..count-1; offset the iterator inside the body instead",
                     f.sourceLocation());
             }
 
@@ -905,16 +887,6 @@ public final class Validate {
             return isCompileTimeConstant(u.operand());
         }
         return false;
-    }
-
-    /** Extract a literal bigint value (folding a leading unary minus), or null. */
-    private static BigInteger extractLiteralBigInt(Expression expr) {
-        if (expr instanceof BigIntLiteral bi) return bi.value();
-        if (expr instanceof UnaryExpr u && u.op() == Expression.UnaryOp.NEG) {
-            BigInteger inner = extractLiteralBigInt(u.operand());
-            return inner != null ? inner.negate() : null;
-        }
-        return null;
     }
 
     // ------------------------------------------------------------------

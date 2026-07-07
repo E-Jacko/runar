@@ -1,5 +1,6 @@
 package runar.compiler.passes;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -563,6 +564,14 @@ public final class StackLower {
         Map<String, Boolean> localBindings = new HashMap<>();
         Set<String> outerProtectedRefs;
         boolean insideBranch;
+        /**
+         * Method params whose names collide with a MUTABLE property. Maps the
+         * param name to the reserved stack-slot name its witness value lives
+         * under, so {@code lowerLoadParam} reads the param and not the
+         * same-named deserialized property slot (issue #130). Empty for the
+         * common no-collision case (byte-identical output).
+         */
+        Map<String, String> renamedParams = new HashMap<>();
         // Element counts for array_literal bindings (used by checkMultiSig).
         Map<String, Integer> arrayLengths = new HashMap<>();
         // Element refs for array_literal bindings (used by checkMultiSig).
@@ -575,6 +584,32 @@ public final class StackLower {
         LoweringContext(List<String> params, List<AnfProperty> properties) {
             this.sm = new StackMap(params);
             this.properties = properties;
+
+            // Issue #130 (stack layer): a method param whose name collides with
+            // a MUTABLE property gets a duplicate stackMap slot once
+            // `deserialize_state` pushes that property under the same name. Name
+            // lookups resolve to the shallowest match (the deserialized
+            // property), so `load_param` would read the stale on-chain state
+            // instead of the witness value. Rename the colliding param's slot to
+            // a reserved, collision-proof name up front and remember the mapping
+            // so `lowerLoadParam` targets the real param slot. Only mutable
+            // properties are deserialized onto the stack, so readonly shadows
+            // (handled purely by ANF resolution) never enter this map, and
+            // non-colliding contracts get an empty map — byte-identical output.
+            if (params != null && properties != null) {
+                Set<String> mutablePropNames = new java.util.HashSet<>();
+                for (AnfProperty p : properties) {
+                    if (!p.readonly()) mutablePropNames.add(p.name());
+                }
+                for (String name : params) {
+                    if (name != null && mutablePropNames.contains(name)) {
+                        String renamed = "__param_" + name;
+                        sm.renameAtDepth(sm.findDepth(name), renamed);
+                        renamedParams.put(name, renamed);
+                    }
+                }
+            }
+
             trackDepth();
         }
 
@@ -667,6 +702,10 @@ public final class StackLower {
             LoweringContext c = new LoweringContext(null, properties);
             c.sm.slots.addAll(this.sm.slots);
             c.privateMethods = this.privateMethods;
+            // Issue #130: a `load_param` for a shadowed param inside a branch
+            // body must resolve to the same reserved renamed slot the parent set
+            // up (the parent copied its renamed slot names into c.sm above).
+            c.renamedParams = this.renamedParams;
             // GAP-002: nested branches keep the outer statement's loc by
             // default; the inner binding loop will override on each step.
             c.currentSourceLoc = this.currentSourceLoc;
@@ -876,7 +915,7 @@ public final class StackLower {
             } else if (v instanceof If iv) {
                 lowerIf(name, iv.cond(), iv.thenBranch(), iv.elseBranch(), idx, lastUses, false);
             } else if (v instanceof Loop l) {
-                lowerLoop(name, l.count(), l.body(), l.iterVar(), idx, lastUses);
+                lowerLoop(name, l.count(), l.body(), l.iterVar(), l.start(), l.step(), idx, lastUses);
             } else if (v instanceof Assert a) {
                 lowerAssert(a.value(), idx, lastUses, false);
             } else if (v instanceof UpdateProp up) {
@@ -909,9 +948,14 @@ public final class StackLower {
         // ---------------- load_param / load_prop / load_const ----------------
 
         void lowerLoadParam(String bindingName, String paramName, int idx, Map<String, Integer> lastUses) {
-            if (sm.has(paramName)) {
+            // The parameter is already on the stack under its original name — or,
+            // for a param that shadows a mutable property, under a reserved
+            // renamed slot (issue #130) so it is not confused with the
+            // deserialized property slot.
+            String slotName = renamedParams.getOrDefault(paramName, paramName);
+            if (sm.has(slotName)) {
                 boolean isLast = isLastUse(paramName, idx, lastUses);
-                bringToTop(paramName, isLast);
+                bringToTop(slotName, isLast);
                 sm.pop();
                 sm.push(bindingName);
             } else {
@@ -2177,6 +2221,7 @@ public final class StackLower {
         // ---------------- loop ----------------
 
         void lowerLoop(String bindingName, int count, List<AnfBinding> body, String iterVar,
+                       BigInteger start, int step,
                        Integer loopBindingIndex, Map<String, Integer> enclosingLastUses) {
             // Names (re)defined anywhere inside the loop body, nested branches
             // included. A name the body itself binds is NOT an outer ref —
@@ -2209,7 +2254,13 @@ public final class StackLower {
             localBindings = newLocal;
 
             for (int i = 0; i < count; i++) {
-                emitOp(new PushOp(PushValue.of(i)));
+                // Push the iteration variable value (in case the loop body uses
+                // it). Iteration `i` binds `start + i*step` (issue #121);
+                // zero-start counting-up loops (start=0, step=1) reduce to
+                // BigInteger.valueOf(i), preserving the historical byte-for-byte
+                // lowering.
+                emitOp(new PushOp(PushValue.of(
+                    start.add(BigInteger.valueOf((long) i * step)))));
                 sm.push(iterVar);
                 Map<String, Integer> lastUses = computeLastUses(body);
 

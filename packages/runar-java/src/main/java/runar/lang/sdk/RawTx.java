@@ -47,6 +47,16 @@ final class RawTx {
         inputs.get(inputIndex).scriptSigHex = scriptSigHex == null ? "" : scriptSigHex;
     }
 
+    /**
+     * Overwrite the nSequence of every input (issue #131). Must be called
+     * BEFORE any BIP-143 preimage / sighash is computed, since hashSequence and
+     * the signed input's own nSequence both feed the digest.
+     */
+    void setAllSequences(long sequence) {
+        long s = sequence & 0xffffffffL;
+        for (Input in : inputs) in.sequence = s;
+    }
+
     String toHex() {
         StringBuilder sb = new StringBuilder();
         sb.append(ScriptUtils.toLittleEndian32(version));

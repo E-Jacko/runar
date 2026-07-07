@@ -426,11 +426,11 @@ class ValidateTest {
     }
 
     // ------------------------------------------------------------------
-    // Unsupported loop shapes: non-zero start, countdown (issue #121)
+    // Non-zero-start and countdown loop shapes (issue #121)
     // ------------------------------------------------------------------
 
     @Test
-    void rejectsForLoopWithNonZeroStart() {
+    void acceptsForLoopWithNonZeroStart() {
         String src = """
             class C extends SmartContract {
                 @Readonly Bigint x;
@@ -450,18 +450,12 @@ class ValidateTest {
             }
             """;
         ContractNode c = JavaParser.parse(src, "C.runar.java");
-        Validate.ValidationException e = assertThrows(
-            Validate.ValidationException.class,
-            () -> Validate.run(c)
-        );
-        assertTrue(
-            e.errors().stream().anyMatch(m -> m.contains("must start at 0")),
-            "expected non-zero-start error, got " + e.errors()
-        );
+        // Issue #121: a non-zero-start loop is now supported and must validate.
+        assertDoesNotThrow(() -> Validate.run(c));
     }
 
     @Test
-    void rejectsCountdownForLoop() {
+    void acceptsCountdownForLoop() {
         String src = """
             class C extends SmartContract {
                 @Readonly Bigint x;
@@ -481,14 +475,8 @@ class ValidateTest {
             }
             """;
         ContractNode c = JavaParser.parse(src, "C.runar.java");
-        Validate.ValidationException e = assertThrows(
-            Validate.ValidationException.class,
-            () -> Validate.run(c)
-        );
-        assertTrue(
-            e.errors().stream().anyMatch(m -> m.contains("countdown")),
-            "expected countdown error, got " + e.errors()
-        );
+        // Issue #121: a countdown loop is now supported and must validate.
+        assertDoesNotThrow(() -> Validate.run(c));
     }
 
     @Test
