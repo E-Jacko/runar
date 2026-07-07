@@ -485,6 +485,12 @@ struct LoweringContext {
     array_lengths: HashMap<String, usize>,
     /// Element refs for array_literal bindings (used by checkMultiSig).
     array_elements: HashMap<String, Vec<String>>,
+    /// Method params whose names collide with a MUTABLE property. Maps the
+    /// param name to the reserved stack-slot name its witness value lives
+    /// under, so `lower_load_param` reads the param and not the same-named
+    /// deserialized property slot (issue #130). Empty for the common
+    /// no-collision case, so all other contracts are byte-identical.
+    renamed_params: HashMap<String, String>,
 }
 
 impl LoweringContext {
@@ -503,7 +509,35 @@ impl LoweringContext {
             const_values: HashMap::new(),
             array_lengths: HashMap::new(),
             array_elements: HashMap::new(),
+            renamed_params: HashMap::new(),
         };
+
+        // Issue #130 (stack layer): a method param whose name collides with a
+        // MUTABLE property gets a duplicate stackMap slot once
+        // `deserialize_state` pushes that property under the same name. Name
+        // lookups resolve to the shallowest match (the deserialized property),
+        // so `load_param` would read the stale on-chain state instead of the
+        // witness value. Rename the colliding param's slot to a reserved,
+        // collision-proof name up front and remember the mapping so
+        // `lower_load_param` targets the real param slot. Only mutable
+        // properties are deserialized onto the stack, so readonly shadows
+        // (handled purely by ANF resolution) never enter this map, and
+        // non-colliding contracts get an empty map — byte-identical output.
+        let mutable_prop_names: HashSet<&str> = properties
+            .iter()
+            .filter(|p| !p.readonly)
+            .map(|p| p.name.as_str())
+            .collect();
+        for name in params {
+            if mutable_prop_names.contains(name.as_str()) {
+                if let Some(depth) = ctx.sm.find_depth(name) {
+                    let renamed = format!("__param_{}", name);
+                    ctx.sm.rename_at_depth(depth, &renamed);
+                    ctx.renamed_params.insert(name.clone(), renamed);
+                }
+            }
+        }
+
         ctx.track_depth();
         ctx
     }
@@ -1121,9 +1155,18 @@ impl LoweringContext {
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
-        if self.sm.has(param_name) {
+        // The parameter is on the stack under its original name — or, for a
+        // param that shadows a mutable property, under a reserved renamed slot
+        // (issue #130) so it is not confused with the deserialized property
+        // slot.
+        let slot_name = self
+            .renamed_params
+            .get(param_name)
+            .cloned()
+            .unwrap_or_else(|| param_name.to_string());
+        if self.sm.has(&slot_name) {
             let is_last = self.is_last_use(param_name, binding_index, last_uses);
-            self.bring_to_top(param_name, is_last);
+            self.bring_to_top(&slot_name, is_last);
             self.sm.pop();
             self.sm.push(binding_name);
         } else {

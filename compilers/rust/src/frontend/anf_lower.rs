@@ -185,6 +185,16 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
             method_ctx.register_param_type(&p.name, &type_node_to_string(&p.param_type));
         }
 
+        // Register the declared param NAMES so a bare identifier resolves to
+        // `load_param` before falling through to `load_prop` (issue #130).
+        // Without this, a param whose name collides with a mutable state
+        // property lowered to the stale deserialized property value instead of
+        // the witness param. Explicit `this.x` is unaffected: it checks
+        // is_property before is_param (see PropertyAccess / lower_member_expr).
+        for p in &method.params {
+            method_ctx.add_param(&p.name);
+        }
+
         if contract.parent_class == "StatefulSmartContract"
             && method.visibility == Visibility::Public
         {
@@ -1193,7 +1203,17 @@ fn lower_expr_to_ref(expr: &Expression, ctx: &mut LoweringContext) -> String {
         Expression::Identifier { name } => lower_identifier(name, ctx),
 
         Expression::PropertyAccess { property } => {
-            // this.txPreimage in StatefulSmartContract -> load_param (it's an implicit param, not a stored property)
+            // Explicit `this.x`: a real contract property always wins, even when
+            // a method param shares the name (issue #130). Now that declared
+            // params are registered, the is_param branch below must not shadow a
+            // stored property.
+            if ctx.is_property(property) {
+                return ctx.emit(ANFValue::LoadProp {
+                    name: property.clone(),
+                });
+            }
+            // this.txPreimage in StatefulSmartContract -> load_param (it's an
+            // implicit injected param, not a stored property).
             if ctx.is_param(property) {
                 return ctx.emit(ANFValue::LoadParam {
                     name: property.clone(),
@@ -1301,6 +1321,15 @@ fn lower_member_expr(
     // this.x -> load_prop (or load_param for implicit params like txPreimage)
     if let Expression::Identifier { name } = object {
         if name == "this" {
+            // Explicit `this.x`: a real contract property always wins, even
+            // when a method param shares the name (issue #130). Only fall
+            // through to load_param for implicit injected params (txPreimage)
+            // that are NOT stored properties.
+            if ctx.is_property(property) {
+                return ctx.emit(ANFValue::LoadProp {
+                    name: property.to_string(),
+                });
+            }
             if ctx.is_param(property) {
                 return ctx.emit(ANFValue::LoadParam {
                     name: property.to_string(),
@@ -3237,5 +3266,54 @@ class Countdown extends SmartContract {
         assert_eq!(count, 3);
         assert_eq!(start, serde_json::json!(3));
         assert_eq!(step, -1);
+    }
+
+    // -----------------------------------------------------------------------
+    // #130: a method param whose name shadows a property resolves to the param
+    // for bare identifiers, while explicit `this.x` still resolves to the
+    // property.
+    // -----------------------------------------------------------------------
+
+    /// Count `load_param` / `load_prop` bindings referencing `name` anywhere in
+    /// a method body (recursing into if/loop bodies).
+    fn count_loads(bindings: &[ANFBinding], kind_is_param: bool, name: &str) -> usize {
+        let mut n = 0;
+        for b in bindings {
+            match &b.value {
+                ANFValue::LoadParam { name: pn } if kind_is_param && pn == name => n += 1,
+                ANFValue::LoadProp { name: pn } if !kind_is_param && pn == name => n += 1,
+                ANFValue::If { then, else_branch, .. } => {
+                    n += count_loads(then, kind_is_param, name);
+                    n += count_loads(else_branch, kind_is_param, name);
+                }
+                ANFValue::Loop { body, .. } => {
+                    n += count_loads(body, kind_is_param, name);
+                }
+                _ => {}
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn test_param_shadowing_property_resolves_both_directions() {
+        let source = r#"
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+    readonly x: bigint;
+    constructor(x: bigint) { super(x); this.x = x; }
+    public m(x: bigint) {
+        assert(x === this.x);
+    }
+}
+"#;
+        let contract = parse_only(source);
+        let anf = lower_to_anf(&contract);
+        let m = anf.methods.iter().find(|m| m.name == "m").expect("method m");
+        // bare `x` -> load_param (the witness value), not the property.
+        assert_eq!(count_loads(&m.body, true, "x"), 1, "expected one load_param x");
+        // explicit `this.x` -> load_prop (the stored property).
+        assert_eq!(count_loads(&m.body, false, "x"), 1, "expected one load_prop x");
     }
 }
