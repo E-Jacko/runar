@@ -817,11 +817,12 @@ pub const RunarContract = struct {
                 // Thread CallOptions.locktime so contracts asserting
                 // extractLocktime(preimage) can succeed. null → 0 (legacy).
                 .locktime = if (options) |o| o.locktime else null,
+                .sequence = if (options) |o| o.sequence else null,
             };
             const stateless_change_address: ?[]const u8 =
                 if (is_terminal_call) null else change_address;
             const stateless_build_opts_ptr: ?*const call_mod.CallBuildOptions =
-                if (is_terminal_call or (if (options) |o| o.locktime != null else false)) &stateless_build_opts else null;
+                if (is_terminal_call or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &stateless_build_opts else null;
 
             var call_result = call_mod.buildCallTransaction(
                 self.allocator,
@@ -980,9 +981,10 @@ pub const RunarContract = struct {
             // Thread CallOptions.locktime through the stateful build + rebuild
             // path so the preimage's locktime matches the final on-chain tx.
             .locktime = if (options) |o| o.locktime else null,
+                .sequence = if (options) |o| o.sequence else null,
         };
         const build_opts_ptr: ?*const call_mod.CallBuildOptions =
-            if (is_terminal_call or has_multi_output or data_outputs_hex.items.len > 0 or extra_call_inputs.items.len > 0 or (if (options) |o| o.locktime != null else false)) &build_opts else null;
+            if (is_terminal_call or has_multi_output or data_outputs_hex.items.len > 0 or extra_call_inputs.items.len > 0 or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &build_opts else null;
 
         var call_result = call_mod.buildCallTransaction(
             self.allocator,
@@ -1426,11 +1428,12 @@ pub const RunarContract = struct {
             // Thread CallOptions.locktime so contracts asserting
             // extractLocktime(preimage) can succeed. null → 0 (legacy).
             .locktime = if (options) |o| o.locktime else null,
+                .sequence = if (options) |o| o.sequence else null,
         };
         const stateless_change_address: ?[]const u8 =
             if (is_terminal_call) null else change_address;
         const stateless_build_opts_ptr: ?*const call_mod.CallBuildOptions =
-            if (is_terminal_call or (if (options) |o| o.locktime != null else false)) &stateless_build_opts else null;
+            if (is_terminal_call or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &stateless_build_opts else null;
 
         var call_result = call_mod.buildCallTransaction(
             self.allocator,
@@ -1688,9 +1691,10 @@ pub const RunarContract = struct {
             // Thread CallOptions.locktime through both the prepare build and
             // rebuild paths so the preimage matches the final on-chain tx.
             .locktime = if (options) |o| o.locktime else null,
+                .sequence = if (options) |o| o.sequence else null,
         };
         const stateful_build_opts_ptr: ?*const call_mod.CallBuildOptions =
-            if (is_terminal_call or (if (options) |o| o.locktime != null else false)) &stateful_build_opts else null;
+            if (is_terminal_call or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &stateful_build_opts else null;
 
         // ---- Compute change PKH for stateful methods needing it ----------
         var change_pkh_buf: []u8 = &.{};

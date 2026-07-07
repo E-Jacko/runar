@@ -29,7 +29,24 @@ pub const CallBuildOptions = struct {
     /// contracts that assert `extractLocktime(preimage) >= deadline`
     /// (e.g. auction close/claim).
     locktime: ?u32 = null,
+    /// Override the nSequence written onto EVERY input of the call tx (issue
+    /// #131). `null` → zero-config default: 0xfffffffe when `locktime` is set
+    /// and non-zero (non-final, so consensus actually enforces nLockTime), else
+    /// 0xffffffff (final, legacy). Set explicitly only for RBF or custom
+    /// relative-locktime scenarios.
+    sequence: ?u32 = null,
 };
+
+/// Resolve the nSequence written onto every call-tx input (issue #131). An
+/// explicit `sequence` always wins; otherwise all-0xffffffff (final) inputs make
+/// nLockTime a consensus no-op, so default to 0xfffffffe (non-final) when a
+/// non-zero locktime is set, else keep 0xffffffff. Shared by buildCallTransaction
+/// and the terminal-path tx builder so both sites stay byte-consistent.
+pub fn resolveInputSequence(locktime: u32, sequence: ?u32) u32 {
+    if (sequence) |s| return s;
+    if (locktime != 0) return 0xfffffffe;
+    return 0xffffffff;
+}
 
 /// AdditionalContractInput pairs an extra contract UTXO with its
 /// (placeholder-or-real) unlocking script for the same tx. Mirrors Go's
@@ -128,9 +145,17 @@ pub fn buildCallTransaction(
 
     // Locktime: default 0 (legacy); overridable via CallBuildOptions.locktime
     // for contracts asserting extractLocktime(preimage) >= deadline.
+    var lock_time: u32 = 0;
+    var seq_override: ?u32 = null;
     if (opts) |o| {
-        if (o.locktime) |lt| builder.lock_time = lt;
+        if (o.locktime) |lt| lock_time = lt;
+        seq_override = o.sequence;
     }
+    builder.lock_time = lock_time;
+    // nSequence for every input (issue #131): non-final (0xfffffffe) when a
+    // non-zero locktime is set so consensus enforces nLockTime, else final
+    // (0xffffffff); an explicit override always wins.
+    const input_sequence = resolveInputSequence(lock_time, seq_override);
 
     // Input 0: contract UTXO with unlocking script
     {
@@ -147,7 +172,7 @@ pub fn buildCallTransaction(
                 .index = @intCast(current_utxo.output_index),
             },
             .unlocking_script = bsvz.script.Script.init(unlock_bytes),
-            .sequence = 0xffffffff,
+            .sequence = input_sequence,
             .source_output = .{
                 .satoshis = current_utxo.satoshis,
                 .locking_script = bsvz.script.Script.init(utxo_script_bytes),
@@ -170,7 +195,7 @@ pub fn buildCallTransaction(
                 .index = @intCast(ci.utxo.output_index),
             },
             .unlocking_script = bsvz.script.Script.init(ci_unlock_bytes),
-            .sequence = 0xffffffff,
+            .sequence = input_sequence,
             .source_output = .{
                 .satoshis = ci.utxo.satoshis,
                 .locking_script = bsvz.script.Script.init(ci_script_bytes),
@@ -191,7 +216,7 @@ pub fn buildCallTransaction(
                 .index = @intCast(utxo.output_index),
             },
             .unlocking_script = .empty(),
-            .sequence = 0xffffffff,
+            .sequence = input_sequence,
             .source_output = .{
                 .satoshis = utxo.satoshis,
                 .locking_script = bsvz.script.Script.init(utxo_script_bytes),
@@ -405,6 +430,57 @@ test "buildCallTransaction locktime defaults to zero (issue #40)" {
 
     const tail = result.tx_hex[result.tx_hex.len - 8 ..];
     try std.testing.expectEqualStrings("00000000", tail);
+}
+
+test "resolveInputSequence defaults to non-final when locktime set (issue #131)" {
+    // Explicit override always wins.
+    try std.testing.expectEqual(@as(u32, 0x12345678), resolveInputSequence(0, 0x12345678));
+    try std.testing.expectEqual(@as(u32, 0x12345678), resolveInputSequence(800_000, 0x12345678));
+    // No override, non-zero locktime → 0xfffffffe (non-final, consensus-enforced).
+    try std.testing.expectEqual(@as(u32, 0xfffffffe), resolveInputSequence(800_000, null));
+    // No override, zero locktime → 0xffffffff (final, legacy).
+    try std.testing.expectEqual(@as(u32, 0xffffffff), resolveInputSequence(0, null));
+}
+
+test "buildCallTransaction writes non-final input sequence when locktime set (issue #131)" {
+    const allocator = std.testing.allocator;
+
+    const contract_utxo = types.UTXO{
+        .txid = "aa" ** 32,
+        .output_index = 0,
+        .satoshis = 1000,
+        .script = "5100",
+    };
+
+    // Raw tx layout for a single input with a 1-byte unlocking script "51":
+    //   version(4) | in_count(1) | txid(32) | index(4) | scriptlen(1) | script(1)
+    //   | sequence(4) ...
+    // So nSequence occupies hex chars [86..94).
+    const seq_off = (4 + 1 + 32 + 4 + 1 + 1) * 2;
+
+    // Non-zero locktime, no explicit sequence → 0xfffffffe (LE "feffffff").
+    {
+        const opts = CallBuildOptions{ .locktime = 800_000 };
+        var result = try buildCallTransaction(allocator, contract_utxo, "51", "", 0, null, &.{}, 100, &opts);
+        defer result.deinit(allocator);
+        try std.testing.expectEqualStrings("feffffff", result.tx_hex[seq_off .. seq_off + 8]);
+    }
+
+    // No locktime → 0xffffffff (LE "ffffffff"), legacy.
+    {
+        const opts = CallBuildOptions{};
+        var result = try buildCallTransaction(allocator, contract_utxo, "51", "", 0, null, &.{}, 100, &opts);
+        defer result.deinit(allocator);
+        try std.testing.expectEqualStrings("ffffffff", result.tx_hex[seq_off .. seq_off + 8]);
+    }
+
+    // Explicit sequence override wins even without a locktime.
+    {
+        const opts = CallBuildOptions{ .sequence = 0xfffffffd };
+        var result = try buildCallTransaction(allocator, contract_utxo, "51", "", 0, null, &.{}, 100, &opts);
+        defer result.deinit(allocator);
+        try std.testing.expectEqualStrings("fdffffff", result.tx_hex[seq_off .. seq_off + 8]);
+    }
 }
 
 test "estimateCallFee mirrors TS semantics" {

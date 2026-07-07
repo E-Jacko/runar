@@ -127,6 +127,13 @@ pub const CallOptions = struct {
     /// Threaded through every call-tx build site (stateless, stateful,
     /// rebuild, terminal).
     locktime: ?u32 = null,
+    /// Override the nSequence written onto EVERY input of the call tx (issue
+    /// #131). Zero-config: when `locktime` is set and non-zero, sequence defaults
+    /// to 0xfffffffe (non-final, so consensus actually enforces nLockTime);
+    /// otherwise it stays 0xffffffff (final, legacy). Set explicitly only for RBF
+    /// or custom relative-locktime scenarios. Threaded through the non-terminal
+    /// and terminal call-tx build sites.
+    sequence: ?u32 = null,
 };
 
 /// OutputSpec describes one continuation output for a multi-output method.
