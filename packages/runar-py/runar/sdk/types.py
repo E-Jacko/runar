@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Union
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    from runar.sdk.signer import Signer
 
 
 @dataclass
@@ -190,6 +193,11 @@ class DeployOptions:
     """Options for deploying a contract."""
     satoshis: int = 10000
     change_address: str = ''
+    # Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+    # are owned by a different key than the connected deploy signer, set this
+    # so the funding inputs are signed by their real owner. Defaults to the
+    # connected signer (zero behaviour change).
+    funding_signer: 'Signer | None' = None
 
 
 @dataclass

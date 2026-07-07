@@ -208,12 +208,15 @@ class RunarContract:
             locking_script, utxos, opts.satoshis, change_address, change_script, fee_rate,
         )
 
-        # Sign all inputs
+        # Sign all inputs. Funding inputs are signed by funding_signer when set
+        # (issue #134): the deploy signer may not own the funding coins.
+        # Defaults to the connected signer (zero behaviour change).
+        funding_signer = opts.funding_signer or signer
         signed_tx = tx_hex
-        pub_key = signer.get_public_key()
+        pub_key = funding_signer.get_public_key()
         for i in range(input_count):
             utxo = utxos[i]
-            sig = signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
+            sig = funding_signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
             unlock_script = encode_push_data(sig) + encode_push_data(pub_key)
             signed_tx = insert_unlocking_script(signed_tx, i, unlock_script)
 
@@ -384,6 +387,11 @@ class RunarContract:
             raise RuntimeError(
                 "RunarContract.prepare_call: no provider/signer. Call connect() or pass them."
             )
+
+        # Funding (and terminal fee) inputs are signed by funding_signer when
+        # set (issue #134). The method's own Sig args stay with the connected
+        # signer. Defaults to the connected signer (zero behaviour change).
+        funding_signer = (options.funding_signer if options and options.funding_signer else signer)
 
         args = args or []
         method = self._find_method(method_name)
@@ -874,12 +882,12 @@ class RunarContract:
                 )
                 signed_tx = insert_unlocking_script(signed_tx, i + 1, final_merge_unlock)
 
-            # Re-sign P2PKH funding inputs after second pass
+            # Re-sign P2PKH funding inputs after second pass (funding_signer — #134)
             for i in range(p2pkh_start_idx, input_count):
                 utxo_idx = i - p2pkh_start_idx
                 if utxo_idx < len(additional_utxos):
                     utxo = additional_utxos[utxo_idx]
-                    sig = signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
+                    sig = funding_signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
                     unlock_script = encode_push_data(sig) + encode_push_data(pub_key)
                     signed_tx = insert_unlocking_script(signed_tx, i, unlock_script)
 
@@ -1215,6 +1223,11 @@ class RunarContract:
         else:
             term_unlock_script = self.build_unlocking_script(method_name, resolved_args)
         term_unlock_script += witness_hex
+
+        # Funding (and terminal fee) inputs are signed by funding_signer when
+        # set (issue #134). The method's own Sig args stay with the connected
+        # signer. Defaults to the connected signer.
+        funding_signer = opts.funding_signer or signer
 
         # Resolve funding UTXOs for terminal methods
         funding_utxos = opts.funding_utxos or []
