@@ -83,6 +83,10 @@ export interface StatefulPreimageResult {
 /** SIGHASH_ALL | SIGHASH_FORKID */
 const SIGHASH_ALL_FORKID = 0x41;
 
+/** 32 zero bytes — BIP-143 fills zeroed digest fields (hashPrevouts /
+ *  hashSequence / hashOutputs) with this under the relaxed sighash flags. */
+const ZERO32 = '00'.repeat(32);
+
 /** secp256k1 curve order N. */
 const CURVE_ORDER = new BigNumber(
   'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141',
@@ -401,6 +405,13 @@ export function buildStatefulPreimage(
       ? codePart + '6a' + serializeState(stateFields, state)
       : codePart;
 
+  // Issue #123: resolve the method's declared @sighash mode (default 0x41).
+  // methodIndex indexes the public-methods list.
+  const publicMethods = (artifact.abi?.methods ?? []).filter((m) => m.isPublic);
+  const sigHashType = publicMethods[methodIndex]?.sigHashType ?? SIGHASH_ALL_FORKID;
+  const base = sigHashType & 0x1f;
+  const acp = (sigHashType & 0x80) !== 0;
+
   // Determine OP_CODESEPARATOR offset for the scriptCode
   let codeSepIndex: number | undefined;
   if (
@@ -433,7 +444,13 @@ export function buildStatefulPreimage(
     outputs.push(rawOut);
   }
 
-  const hashOutputsHex = computeHashOutputs(outputs);
+  // BIP-143 hashOutputs by sighash base:
+  //   ALL    -> hash256(all outputs)
+  //   SINGLE -> hash256(output at this input's index) — the mock is single-input
+  //             at index 0, so the sole continuation output IS that output
+  //   NONE   -> 32 zero bytes (no outputs committed)
+  const hashOutputsHex =
+    base === 0x02 /* NONE */ ? ZERO32 : computeHashOutputs(outputs);
 
   // Build BIP-143 preimage manually
   //
@@ -459,13 +476,19 @@ export function buildStatefulPreimage(
 
   // hashPrevouts = hash256(concat(all input outpoints)).
   // Default (single input): hash256(spent outpoint).
+  // Issue #123: ANYONECANPAY zeroes hashPrevouts (only this input is signed).
   const prevoutsHex = prevouts
     ? prevouts.join('').toLowerCase()
     : spentOutpoint;
-  const hashPrevouts = bytesToHex(hash256(hexToBytes(prevoutsHex)));
+  const hashPrevouts = acp ? ZERO32 : bytesToHex(hash256(hexToBytes(prevoutsHex)));
 
-  // hashSequence = hash256(sequence as 4-byte LE)
-  const hashSequence = bytesToHex(hash256(hexToBytes(uint32LE(sequence))));
+  // hashSequence = hash256(sequence as 4-byte LE).
+  // Issue #123: zeroed under anything but pure SIGHASH_ALL (NONE / SINGLE /
+  // ANYONECANPAY all clear it).
+  const hashSequenceSound = base === 0x01 /* ALL */ && !acp;
+  const hashSequence = hashSequenceSound
+    ? bytesToHex(hash256(hexToBytes(uint32LE(sequence))))
+    : ZERO32;
 
   // scriptCode with varint length prefix
   const scriptCodeBytes = scriptCode.length / 2;
@@ -480,8 +503,8 @@ export function buildStatefulPreimage(
   // nLocktime (4 bytes LE)
   const nLocktime = uint32LE(locktime);
 
-  // sighashType (4 bytes LE)
-  const sighashType = uint32LE(SIGHASH_ALL_FORKID);
+  // sighashType (4 bytes LE) — the method's declared @sighash mode (issue #123).
+  const sighashType = uint32LE(sigHashType);
 
   const preimageHex =
     nVersion +
@@ -511,7 +534,7 @@ export function buildStatefulPreimage(
 
   const derHex = signature.toDER('hex') as string;
   const signatureHex =
-    derHex + SIGHASH_ALL_FORKID.toString(16).padStart(2, '0');
+    derHex + (sigHashType & 0xff).toString(16).padStart(2, '0');
 
   return {
     preimageHex,

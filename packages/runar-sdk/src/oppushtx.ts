@@ -31,6 +31,12 @@ const opPushTxPrivKey = PrivateKey.fromHex('000000000000000000000000000000000000
  * @param codeSeparatorIndex - Byte offset of OP_CODESEPARATOR in the locking script (optional).
  *                             When present, the scriptCode in BIP-143 is the portion AFTER
  *                             the OP_CODESEPARATOR (excluding the separator byte itself).
+ * @param sigHashType - BIP-143 sighash type the preimage is built under (issue #123).
+ *                      Defaults to `0x41` (ALL|FORKID). Must match the method's declared
+ *                      `@sighash` mode: it drives which preimage fields @bsv/sdk zeroes
+ *                      (hashPrevouts / hashSequence / hashOutputs) AND the sighash flag
+ *                      byte appended to the DER signature. A mismatch makes the on-chain
+ *                      OP_PUSH_TX binding fail to verify.
  * @returns Object with `sigHex` (DER + sighash byte) and `preimageHex` (raw preimage)
  */
 export function computeOpPushTx(
@@ -39,6 +45,7 @@ export function computeOpPushTx(
   subscript: string,
   satoshis: number,
   codeSeparatorIndex?: number,
+  sigHashType: number = SIGHASH_ALL_FORKID,
 ): { sigHex: string; preimageHex: string } {
   const tx = typeof txOrHex === 'string' ? Transaction.fromHex(txOrHex) : txOrHex;
   const input = tx.inputs[inputIndex]!;
@@ -76,7 +83,7 @@ export function computeOpPushTx(
     subscript: Script.fromHex(scriptCode) as unknown as Parameters<typeof TransactionSignature.format>[0]['subscript'],
     inputSequence: input.sequence!,
     lockTime: tx.lockTime,
-    scope: SIGHASH_ALL_FORKID,
+    scope: sigHashType,
   });
 
   // Double-SHA256 for BIP-143 sighash
@@ -92,7 +99,7 @@ export function computeOpPushTx(
   }
 
   const derHex = signature.toDER('hex') as string;
-  const sigHex = derHex + SIGHASH_ALL_FORKID.toString(16).padStart(2, '0');
+  const sigHex = derHex + (sigHashType & 0xff).toString(16).padStart(2, '0');
 
   // Convert preimage to hex
   const preimageHex = Array.from(preimage).map((b) => b.toString(16).padStart(2, '0')).join('');
