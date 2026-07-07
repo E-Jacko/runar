@@ -10,6 +10,7 @@ const oppushtx_mod = @import("sdk_oppushtx.zig");
 const anf_interp = @import("sdk_anf_interpreter.zig");
 const ordinals = @import("sdk_ordinals.zig");
 const errors_mod = @import("sdk_errors.zig");
+const script_utils = @import("sdk_script_utils.zig");
 
 // ---------------------------------------------------------------------------
 // RunarContract — main contract runtime wrapper
@@ -2211,19 +2212,62 @@ pub const RunarContract = struct {
     /// script is extracted from the UTXO's locking script, and if an
     /// inscription envelope is present it is detected and stored. State is
     /// deserialized for stateful contracts.
+    /// Recover the positional constructor argument list from a deployed locking
+    /// script, so a restored contract (fromUtxo) operates on the real baked-in
+    /// values rather than 0 placeholders (issue #119). readonly ctor params feed
+    /// the state-continuation formula and adjustCodeSepOffset; zeros there yield
+    /// the wrong continuation and the wrong OP_CODESEPARATOR offset, making
+    /// restored stateful spends unspendable.
+    ///
+    /// extractConstructorArgs returns a name->value map; artifact.abi.constructor
+    /// .params is ordered by paramIndex, so mapping over it yields the positional
+    /// slice the RunarContract expects. Params that carry no constructor slot
+    /// (mutable state fields — restored separately by extractStateFromScript) are
+    /// absent from the map and fall back to int64(0), matching the prior
+    /// placeholder behaviour.
+    fn restoreConstructorArgs(
+        allocator: std.mem.Allocator,
+        artifact: *const types.RunarArtifact,
+        script_hex: []const u8,
+    ) ![]types.StateValue {
+        const params = artifact.abi.constructor.params;
+        var out = try allocator.alloc(types.StateValue, params.len);
+        if (params.len == 0) return out;
+
+        var extracted = try script_utils.extractConstructorArgs(artifact, script_hex, allocator);
+        defer {
+            var it = extracted.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(allocator);
+            }
+            extracted.deinit();
+        }
+
+        for (params, 0..) |p, i| {
+            if (extracted.get(p.name)) |v| {
+                out[i] = try v.clone(allocator);
+            } else {
+                out[i] = .{ .int = 0 };
+            }
+        }
+        return out;
+    }
+
     pub fn fromUtxo(
         allocator: std.mem.Allocator,
         artifact: *types.RunarArtifact,
         utxo: types.UTXO,
     ) !RunarContract {
-        // Build with dummy constructor args (zeros)
-        var dummy_args = try allocator.alloc(types.StateValue, artifact.abi.constructor.params.len);
-        for (0..dummy_args.len) |i| dummy_args[i] = .{ .int = 0 };
+        // Recover the real baked-in constructor args from the deployed script so
+        // a restored contract operates on the true values rather than 0
+        // placeholders (issue #119).
+        const restored_args = try restoreConstructorArgs(allocator, artifact, utxo.script);
 
         var contract = RunarContract{
             .allocator = allocator,
             .artifact = artifact,
-            .constructor_args = dummy_args,
+            .constructor_args = restored_args,
             .state = &.{},
         };
 
@@ -3509,6 +3553,37 @@ test "RunarContract.fromUtxo detects inscription in code script" {
     // code_script should include the envelope (not stripped)
     try std.testing.expect(contract.code_script != null);
     try std.testing.expect(std.mem.indexOf(u8, contract.code_script.?, "0063036f726451") != null);
+}
+
+// Issue #119: fromUtxo must recover the REAL baked-in constructor args from the
+// deployed script (via extractConstructorArgs), not fill them with 0
+// placeholders. readonly ctor params feed the state-continuation formula and the
+// OP_CODESEPARATOR / OP_PUSH_TX offset, so zeros there make restored stateful
+// spends unspendable.
+test "fromUtxo recovers real constructor args from the deployed script (#119)" {
+    const allocator = std.testing.allocator;
+    // Stateful artifact: readonly ctor param `owner` (int) baked at byte 0 via a
+    // constructor slot; mutable state field `count`.
+    const json =
+        \\{"contractName":"Vault","version":"1","compilerVersion":"1.0","script":"0087","asm":"OP_0 OP_EQUAL",
+        \\"abi":{"constructor":{"params":[{"name":"owner","type":"int"}]},"methods":[{"name":"spend","params":[],"isPublic":true}]},
+        \\"stateFields":[{"name":"count","type":"int","index":0}],
+        \\"constructorSlots":[{"paramIndex":0,"byteOffset":0}],"buildTimestamp":"2024-01-01"}
+    ;
+    var artifact = try types.RunarArtifact.fromJson(allocator, json);
+    defer artifact.deinit();
+
+    // Deployed script: OP_5 (owner=5, baked at byte 0), OP_EQUAL, then an
+    // OP_RETURN state section.
+    const script = "5587" ++ "6a" ++ "0101";
+    const utxo = types.UTXO{ .txid = "bb" ** 32, .output_index = 0, .satoshis = 1000, .script = script };
+
+    var contract = try RunarContract.fromUtxo(allocator, &artifact, utxo);
+    defer contract.deinit();
+
+    // Pre-#119 this was int64(0); after the fix it is the real baked value 5.
+    try std.testing.expectEqual(@as(usize, 1), contract.constructor_args.len);
+    try std.testing.expectEqual(@as(i64, 5), contract.constructor_args[0].int);
 }
 
 // ---------------------------------------------------------------------------
