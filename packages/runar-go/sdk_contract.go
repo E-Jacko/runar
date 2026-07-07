@@ -322,14 +322,20 @@ func (c *RunarContract) Deploy(
 		return "", nil, fmt.Errorf("RunarContract.Deploy: %w", err)
 	}
 
-	// Sign all inputs
+	// Sign all inputs. Deploy inputs are all P2PKH funding, signed by
+	// fundingSigner when set (issue #134): the deploy signer may not own the
+	// funding coins. Defaults to the connected signer.
+	fundingSigner := options.FundingSigner
+	if fundingSigner == nil {
+		fundingSigner = signer
+	}
 	for i := 0; i < inputCount; i++ {
 		utxo := utxos[i]
-		sig, err := signer.Sign(deployTx.Hex(), i, utxo.Script, utxo.Satoshis, nil)
+		sig, err := fundingSigner.Sign(deployTx.Hex(), i, utxo.Script, utxo.Satoshis, nil)
 		if err != nil {
 			return "", nil, fmt.Errorf("RunarContract.Deploy: signing input %d: %w", i, err)
 		}
-		pubKey, err := signer.GetPublicKey()
+		pubKey, err := fundingSigner.GetPublicKey()
 		if err != nil {
 			return "", nil, fmt.Errorf("RunarContract.Deploy: getting public key: %w", err)
 		}
@@ -442,6 +448,13 @@ func (c *RunarContract) PrepareCall(
 	}
 	if provider == nil || signer == nil {
 		return nil, fmt.Errorf("RunarContract.PrepareCall: no provider/signer available. Call Connect() or pass them explicitly")
+	}
+
+	// Funding (and terminal fee) inputs are signed by fundingSigner when set
+	// (issue #134). The method's own Sig args stay with the connected signer.
+	fundingSigner := signer
+	if options != nil && options.FundingSigner != nil {
+		fundingSigner = options.FundingSigner
 	}
 
 	// Validate method exists
@@ -861,18 +874,18 @@ func (c *RunarContract) PrepareCall(
 		buildOpts,
 	)
 
-	// Sign P2PKH funding inputs (after contract inputs)
+	// Sign P2PKH funding inputs (after contract inputs) with fundingSigner (issue #134)
 	signedTx := callTx.Hex()
 	p2pkhStartIdx := 1 + len(extraContractUtxos)
 	for i := p2pkhStartIdx; i < inputCount; i++ {
 		utxoIdx := i - p2pkhStartIdx
 		if utxoIdx < len(additionalUtxos) {
 			utxo := additionalUtxos[utxoIdx]
-			sig, signErr := signer.Sign(signedTx, i, utxo.Script, utxo.Satoshis, nil)
+			sig, signErr := fundingSigner.Sign(signedTx, i, utxo.Script, utxo.Satoshis, nil)
 			if signErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall: signing input %d: %w", i, signErr)
 			}
-			pubKey, pkErr := signer.GetPublicKey()
+			pubKey, pkErr := fundingSigner.GetPublicKey()
 			if pkErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall: getting public key: %w", pkErr)
 			}
@@ -1030,16 +1043,16 @@ func (c *RunarContract) PrepareCall(
 			signedTx = InsertUnlockingScript(signedTx, i+1, finalMergeUnlock)
 		}
 
-		// Re-sign P2PKH funding inputs (outputs changed after rebuild)
+		// Re-sign P2PKH funding inputs (outputs changed after rebuild) with fundingSigner (issue #134)
 		for i := p2pkhStartIdx; i < inputCount; i++ {
 			utxoIdx := i - p2pkhStartIdx
 			if utxoIdx < len(additionalUtxos) {
 				utxo := additionalUtxos[utxoIdx]
-				sig, signErr := signer.Sign(signedTx, i, utxo.Script, utxo.Satoshis, nil)
+				sig, signErr := fundingSigner.Sign(signedTx, i, utxo.Script, utxo.Satoshis, nil)
 				if signErr != nil {
 					return nil, fmt.Errorf("RunarContract.PrepareCall: re-signing input %d: %w", i, signErr)
 				}
-				pubKey, pkErr := signer.GetPublicKey()
+				pubKey, pkErr := fundingSigner.GetPublicKey()
 				if pkErr != nil {
 					return nil, fmt.Errorf("RunarContract.PrepareCall: getting public key: %w", pkErr)
 				}
@@ -1855,7 +1868,30 @@ func (c *RunarContract) prepareCallTerminal(
 	witnessHex string,
 ) (*PreparedCall, error) {
 	termOutputs := options.TerminalOutputs
+
+	// Terminal P2PKH funding inputs. Two callers feed this single mechanism —
+	// both are added to the terminal tx BEFORE the OP_PUSH_TX preimage is
+	// computed (so hashPrevouts covers them) and consumed entirely as fee with
+	// no change output:
+	//   - FeeUtxo (issue #118): a single input added purely to pay the miner
+	//     fee. A true terminal method pays out the full contract balance, so fee
+	//     would be 0 and ARC rejects; the covenant asserts its exact output set,
+	//     so no change output can absorb a fee. Placed FIRST (input index 1) to
+	//     match the cross-tier convention.
+	//   - FundingUtxos: the pre-existing multi-input funding role (contract
+	//     balance insufficient for outputs + fees).
+	// Both are signed by fundingSigner (issue #134) below.
 	fundingUtxos := options.FundingUtxos
+	if options.FeeUtxo != nil {
+		fundingUtxos = append([]UTXO{*options.FeeUtxo}, fundingUtxos...)
+	}
+
+	// Funding/fee inputs are signed by fundingSigner when set (issue #134); the
+	// method's own Sig args stay with the connected signer.
+	fundingSigner := signer
+	if options.FundingSigner != nil {
+		fundingSigner = options.FundingSigner
+	}
 
 	// Build placeholder unlocking script (witnessHex suffixed for sizing;
 	// the real ABI-correct unlock is built by buildUnlock below for stateful).
@@ -1995,14 +2031,17 @@ func (c *RunarContract) prepareCallTerminal(
 		}
 	}
 
-	// Sign funding UTXOs (P2PKH inputs added after the contract input)
+	// Sign funding / fee UTXOs (P2PKH inputs added after the contract input)
+	// with fundingSigner (issue #134 / #118). Their BIP-143 P2PKH sighash covers
+	// only hashPrevouts / hashOutputs / their own outpoint — NOT input 0's
+	// scriptSig — so they stay valid even after input 0 is rewritten above.
 	for i, fu := range fundingUtxos {
 		inputIdx := 1 + i // contract input is at index 0
-		sig, signErr := signer.Sign(termTx, inputIdx, fu.Script, fu.Satoshis, nil)
+		sig, signErr := fundingSigner.Sign(termTx, inputIdx, fu.Script, fu.Satoshis, nil)
 		if signErr != nil {
 			return nil, fmt.Errorf("RunarContract.PrepareCall terminal: signing funding input %d: %w", inputIdx, signErr)
 		}
-		pubKey, pkErr := signer.GetPublicKey()
+		pubKey, pkErr := fundingSigner.GetPublicKey()
 		if pkErr != nil {
 			return nil, fmt.Errorf("RunarContract.PrepareCall terminal: getting public key: %w", pkErr)
 		}
