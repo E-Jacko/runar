@@ -56,6 +56,7 @@ import { parseRustSource } from './01-parse-rust.js';
 import { parseRubySource } from './01-parse-ruby.js';
 import { parseZigSource } from './01-parse-zig.js';
 import { parseJavaSource } from './01-parse-java.js';
+import { extractSighashDirective } from './sighash-directive.js';
 import { OPCODES } from './06-emit.js';
 import {
   encodePushBigIntHex,
@@ -344,15 +345,70 @@ function parseMethod(
   const bodyNode = method.getBody();
   const body = bodyNode ? parseStatements(bodyNode, file, errors) : [];
 
+  // Issue #123: `/** @sighash <FLAGS> */` directive → per-method sighash type.
+  const sighashType = parseSighashOnMethod(method, name, visibility, file, errors);
+
   return {
     kind: 'method',
     name,
     params,
     body,
     visibility,
+    ...(sighashType !== undefined ? { sighashType } : {}),
     sourceLocation: locFromNode(method, file),
   };
 }
+
+/**
+ * Detect + parse a `/** @sighash <FLAGS> *\/` (or `// @sighash ...`) directive on
+ * a method. Uses the same two-surface trivia scan as `@embedAlways` (#109):
+ * ts-morph attaches JSDoc blocks separately from ordinary leading comments, so
+ * both are checked. Returns the numeric sighash type, or `undefined` when no
+ * directive is present. Pushes an error diagnostic for a malformed flag list or
+ * a directive on a non-public method (only public methods are spending entry
+ * points, so a `@sighash` on a private helper is meaningless).
+ */
+function parseSighashOnMethod(
+  method: MethodDeclaration,
+  name: string,
+  visibility: 'public' | 'private',
+  file: string,
+  errors: CompilerDiagnostic[],
+): number | undefined {
+  let text: string | undefined;
+  for (const jsdoc of method.getJsDocs()) {
+    if (SIGHASH_TOKEN_RE.test(jsdoc.getText())) { text = jsdoc.getText(); break; }
+  }
+  if (text === undefined) {
+    for (const range of method.getLeadingCommentRanges()) {
+      if (SIGHASH_TOKEN_RE.test(range.getText())) { text = range.getText(); break; }
+    }
+  }
+  if (text === undefined) return undefined;
+
+  if (visibility !== 'public') {
+    errors.push(makeDiagnostic(
+      `@sighash directive on non-public method '${name}' has no effect — only public methods are spending entry points`,
+      'error',
+      locFromNode(method, file),
+    ));
+    return undefined;
+  }
+
+  const result = extractSighashDirective(text);
+  if (result === null) return undefined;
+  if ('error' in result) {
+    errors.push(makeDiagnostic(
+      `Method '${name}': ${result.error}`,
+      'error',
+      locFromNode(method, file),
+    ));
+    return undefined;
+  }
+  return result.value;
+}
+
+const SIGHASH_TOKEN_RE = /@sighash\b/;
 
 // ---------------------------------------------------------------------------
 // Parameters

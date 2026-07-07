@@ -123,6 +123,14 @@ export interface MethodNode {
   params: ParamNode[];
   body: Statement[];
   visibility: 'public' | 'private';
+  /**
+   * Issue #123: the BIP-143 sighash type declared via a `/** @sighash <FLAGS> *\/`
+   * directive on a public method (e.g. `0x43` for SINGLE|FORKID). Absent = the
+   * default `ALL|FORKID` (0x41), byte-identical to the historically-pinned mode.
+   * Drives the auto-injected preimage-type assert, the OP_PUSH_TX binding flag,
+   * the ABI `sigHashType`, and the SDK-side preimage/signature construction.
+   */
+  sighashType?: number;
   sourceLocation: SourceLocation;
 }
 

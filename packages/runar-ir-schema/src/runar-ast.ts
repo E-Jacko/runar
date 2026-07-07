@@ -123,6 +123,11 @@ export interface MethodNode {
   params: ParamNode[];
   body: Statement[];
   visibility: 'public' | 'private';
+  /**
+   * Issue #123: BIP-143 sighash type from a `/** @sighash <FLAGS> *\/` directive
+   * on a public method. Absent = default `ALL|FORKID` (0x41).
+   */
+  sighashType?: number;
   sourceLocation: SourceLocation;
 }
 
