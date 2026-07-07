@@ -1595,10 +1595,10 @@ class P2PKH extends SmartContract {
 }
 
 // ---------------------------------------------------------------------------
-// #127: reject non-zero-start and countdown for-loops
+// #121: accept non-zero-start and countdown for-loops (was #127 reject)
 // ---------------------------------------------------------------------------
 
-func TestValidate_ForLoopNonZeroStart_Error(t *testing.T) {
+func TestValidate_ForLoopNonZeroStart_NoError(t *testing.T) {
 	source := `
 import { SmartContract, assert } from 'runar-lang';
 
@@ -1621,12 +1621,12 @@ class C extends SmartContract {
 `
 	contract := mustParseTS(t, source)
 	result := Validate(contract)
-	if !hasValidationError(result, "must start at 0") {
-		t.Errorf("expected 'must start at 0' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	if hasValidationError(result, "must start at 0") {
+		t.Errorf("did not expect 'must start at 0' error (issue #121), got: %s", strings.Join(result.ErrorStrings(), "; "))
 	}
 }
 
-func TestValidate_ForLoopCountdown_Error(t *testing.T) {
+func TestValidate_ForLoopCountdown_NoError(t *testing.T) {
 	source := `
 import { SmartContract, assert } from 'runar-lang';
 
@@ -1649,8 +1649,8 @@ class C extends SmartContract {
 `
 	contract := mustParseTS(t, source)
 	result := Validate(contract)
-	if !hasValidationError(result, "countdown") {
-		t.Errorf("expected 'countdown' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	if hasValidationError(result, "countdown") {
+		t.Errorf("did not expect 'countdown' error (issue #121), got: %s", strings.Join(result.ErrorStrings(), "; "))
 	}
 }
 

@@ -538,31 +538,14 @@ func (ctx *validationContext) validateStatement(stmt Statement) {
 func (ctx *validationContext) validateForStatement(stmt ForStmt) {
 	ctx.validateExpression(stmt.Condition)
 
-	// Check constant bounds
+	// Check constant bounds. Non-zero starts and countdown loops (`i--` with
+	// `>`/`>=`) are supported: the ANF loop node carries an explicit start value
+	// and step direction (issue #121), so lowering binds `iterVar = start +
+	// i*step` on each unrolled iteration.
 	if bin, ok := stmt.Condition.(BinaryExpr); ok {
 		if !isCompileTimeConstant(bin.Right) {
 			ctx.addError("for loop bound must be a compile-time constant")
 		}
-
-		// The ANF loop node carries only an iteration count, so lowering always
-		// iterates i = 0..count-1. Reject the loop shapes that representation
-		// cannot express — a non-zero start or a countdown would otherwise be
-		// silently compiled as a zero-start counting-up loop while the
-		// interpreter runs the true source semantics.
-		if bin.Op == ">" || bin.Op == ">=" {
-			ctx.addErrorWithLoc(
-				"For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead",
-				&stmt.SourceLocation,
-			)
-		}
-	}
-
-	startVal := extractBigIntValue(stmt.Init.Init)
-	if startVal != nil && startVal.Sign() != 0 {
-		ctx.addErrorWithLoc(
-			fmt.Sprintf("For loop iterator must start at 0 (got %sn) — loops compile to i = 0..count-1; offset the iterator inside the body instead", startVal.String()),
-			&stmt.SourceLocation,
-		)
 	}
 
 	ctx.validateExpression(stmt.Init.Init)

@@ -1019,7 +1019,7 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 	case "if":
 		ctx.lowerIf(name, value.Cond, value.Then, value.Else, bindingIndex, lastUses)
 	case "loop":
-		ctx.lowerLoop(name, value.Count, value.Body, value.IterVar, bindingIndex, lastUses)
+		ctx.lowerLoop(name, value.Count, value.Body, value.IterVar, value.Start, value.Step, bindingIndex, lastUses)
 	case "assert":
 		ctx.lowerAssert(value.ValueRef, bindingIndex, lastUses, false)
 	case "update_prop":
@@ -1969,7 +1969,15 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	}
 }
 
-func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.ANFBinding, iterVar string, loopBindingIndex int, enclosingLastUses map[string]int) {
+func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.ANFBinding, iterVar string, start *big.Int, step int, loopBindingIndex int, enclosingLastUses map[string]int) {
+	// Iteration i binds `start + i*step` (issue #121). Older ANF payloads
+	// without start/step describe zero-start counting-up loops.
+	if start == nil {
+		start = big.NewInt(0)
+	}
+	if step == 0 {
+		step = 1
+	}
 	// Collect body binding names (values defined inside the loop body).
 	bodyBindingNames := make(map[string]bool, len(body))
 	for _, b := range body {
@@ -2010,7 +2018,11 @@ func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.A
 	ctx.localBindings = newLocalBindings
 
 	for i := 0; i < count; i++ {
-		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(i))})
+		// Push the iteration variable value: start + i*step (issue #121).
+		// Zero-start counting-up loops (start=0, step=1) reduce to i, preserving
+		// the historical byte-for-byte lowering.
+		iterVal := new(big.Int).Add(start, new(big.Int).Mul(big.NewInt(int64(i)), big.NewInt(int64(step))))
+		ctx.emitOp(StackOp{Op: "push", Value: PushValue{Kind: "bigint", BigInt: iterVal}})
 		ctx.sm.push(iterVar)
 
 		lastUses := computeLastUses(body)

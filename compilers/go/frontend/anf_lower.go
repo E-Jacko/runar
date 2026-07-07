@@ -976,7 +976,10 @@ func appendBranchOutputConcat(branchCtx *lowerCtx) string {
 }
 
 func (ctx *lowerCtx) lowerForStatement(stmt ForStmt) {
-	count := extractLoopCount(stmt)
+	// Resolve the loop's compile-time shape: start value, step direction, and
+	// iteration count. Rúnar requires bounded loops, so all three must be
+	// statically determinable (issue #121).
+	start, step, count := extractLoopShape(stmt)
 
 	// Lower body into sub-context
 	bodyCtx := ctx.subContext()
@@ -984,58 +987,107 @@ func (ctx *lowerCtx) lowerForStatement(stmt ForStmt) {
 	ctx.syncCounter(bodyCtx)
 
 	ctx.emit(ir.ANFValue{
-		Kind:    "loop",
-		Count:   count,
-		Body:    bodyCtx.bindings,
-		IterVar: stmt.Init.Name,
+		Kind:     "loop",
+		Count:    count,
+		Body:     bodyCtx.bindings,
+		IterVar:  stmt.Init.Name,
+		Start:    start,
+		StartRaw: bigIntStartRaw(start),
+		Step:     step,
 	})
 }
 
-// extractLoopCount returns the iteration count for a for-loop.
+// extractLoopShape resolves a for-statement's compile-time loop shape (issue
+// #121): the iterator start value, step direction (+1/-1), and iteration count.
 //
-// The ANF loop node carries only the count — no start value or step
-// direction — so lowering (and the ANF interpreter) always iterates
-// i = 0..count-1. Loop shapes that representation cannot express are
-// rejected here (mirroring the source-located errors in the validate pass)
-// rather than silently compiled as a zero-start counting-up loop. In the
-// normal pipeline the validate pass rejects these first; these panics guard
-// callers that lower without validating.
-func extractLoopCount(stmt ForStmt) int {
-	// A countdown loop necessarily also has a non-zero start, so check the
-	// condition direction first — it is the more precise diagnosis.
+// Supports counting-up and counting-down loops:
+//
+//	for (let i = 0n; i < 10n; i++)  -> start 0, step +1, count 10
+//	for (let i = 1n; i <= 3n; i++)  -> start 1, step +1, count 3
+//	for (let i = 3n; i > 0n; i--)   -> start 3, step -1, count 3
+//	for (let i = 3n; i >= 1n; i--)  -> start 3, step -1, count 3
+//
+// The loop is unrolled `count` times; on iteration i the iterator holds
+// `start + i*step`. Start and bound must be compile-time integer literals; in
+// the normal pipeline the validate pass rejects non-literal bounds first, so
+// these panics guard callers that lower without validating.
+func extractLoopShape(stmt ForStmt) (*big.Int, int, int) {
+	start := extractBigIntValue(stmt.Init.Init)
+	if start == nil {
+		panic("Cannot determine loop start at compile time. For-loop iterators must start at an integer literal.")
+	}
+
+	bin, ok := stmt.Condition.(BinaryExpr)
+	if !ok {
+		panic("Cannot determine loop bound at compile time. For-loop bounds must be integer literals.")
+	}
+	bound := extractBigIntValue(bin.Right)
+	if bound == nil {
+		panic("Cannot determine loop bound at compile time. For-loop bounds must be integer literals.")
+	}
+
+	step := extractLoopStep(stmt)
+
+	// Count = number of iterations before the condition first turns false.
+	var count *big.Int
+	if step == 1 {
+		switch bin.Op {
+		case "<":
+			count = new(big.Int).Sub(bound, start)
+		case "<=":
+			count = new(big.Int).Add(new(big.Int).Sub(bound, start), big.NewInt(1))
+		default:
+			panic(fmt.Sprintf("For loop counting up (i++) must use '<' or '<=' (got '%s').", bin.Op))
+		}
+	} else {
+		switch bin.Op {
+		case ">":
+			count = new(big.Int).Sub(start, bound)
+		case ">=":
+			count = new(big.Int).Add(new(big.Int).Sub(start, bound), big.NewInt(1))
+		default:
+			panic(fmt.Sprintf("For loop counting down (i--) must use '>' or '>=' (got '%s').", bin.Op))
+		}
+	}
+
+	n := 0
+	if count.Sign() > 0 {
+		n = int(count.Int64())
+	}
+	return start, step, n
+}
+
+// extractLoopStep determines the iterator step direction (+1/-1) from the
+// for-statement's update clause, falling back to the condition direction. Only
+// unit steps are supported (issue #121).
+func extractLoopStep(stmt ForStmt) int {
+	if u, ok := stmt.Update.(ExpressionStmt); ok {
+		switch u.Expr.(type) {
+		case IncrementExpr:
+			return 1
+		case DecrementExpr:
+			return -1
+		}
+	}
+	// Fall back to the comparison direction for other unit-step spellings
+	// (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
 	if bin, ok := stmt.Condition.(BinaryExpr); ok {
 		if bin.Op == ">" || bin.Op == ">=" {
-			panic("For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead.")
+			return -1
 		}
 	}
+	return 1
+}
 
-	startVal := extractBigIntValue(stmt.Init.Init)
-
-	if startVal != nil && startVal.Sign() != 0 {
-		panic(fmt.Sprintf("For loop iterator must start at 0 (got %sn) — loops compile to i = 0..count-1; offset the iterator inside the body instead.", startVal.String()))
+// bigIntStartRaw encodes a loop iterator start value into the raw JSON form the
+// loop ANF node emits (issue #121), mirroring the load_const bigint encoding.
+func bigIntStartRaw(val *big.Int) json.RawMessage {
+	if val.IsInt64() {
+		raw, _ := json.Marshal(val.Int64())
+		return raw
 	}
-
-	if bin, ok := stmt.Condition.(BinaryExpr); ok {
-		boundVal := extractBigIntValue(bin.Right)
-		if boundVal != nil {
-			bound := int(boundVal.Int64())
-			switch bin.Op {
-			case "<":
-				if bound < 0 {
-					return 0
-				}
-				return bound
-			case "<=":
-				v := bound + 1
-				if v < 0 {
-					return 0
-				}
-				return v
-			}
-		}
-	}
-
-	return 0
+	raw, _ := json.Marshal(val.String() + "n")
+	return raw
 }
 
 func extractBigIntValue(expr Expression) *big.Int {

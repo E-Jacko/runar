@@ -653,9 +653,19 @@ func anfEvalValue(
 		count := anfToInt(value["count"])
 		iterVar, _ := value["iterVar"].(string)
 		body := anfGetBindings(value["body"])
+		// Iteration i binds `iterVar = start + i*step` (issue #121). Older ANF
+		// payloads without start/step describe zero-start counting-up loops.
+		start := big.NewInt(0)
+		if s, ok := value["start"]; ok {
+			start = anfToBigInt(s)
+		}
+		step := int64(1)
+		if s, ok := value["step"]; ok {
+			step = anfToInt(s)
+		}
 		var lastVal interface{}
 		for i := int64(0); i < count; i++ {
-			env[iterVar] = big.NewInt(i)
+			env[iterVar] = new(big.Int).Add(start, new(big.Int).Mul(big.NewInt(i), big.NewInt(step)))
 			loopEnv := make(map[string]interface{})
 			for k, v := range env {
 				loopEnv[k] = v
