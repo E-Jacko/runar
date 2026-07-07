@@ -177,6 +177,22 @@ public final class AnfLower {
             ));
         }
 
+        // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+        // must survive DCE into the locking script. A readonly field no method
+        // references lowers to no `load_prop`, so no constructor slot is emitted
+        // and the field's deploy-time bytes vanish. We inject a `load_prop` + a
+        // `@ref:` alias (the exact shape `const _bind = this.field;` produces)
+        // into the first public method's body — the alias keeps the `load_prop`
+        // alive through dead-binding DCE, and stack lowering threads the pushed
+        // value through and cleans it up (OP_NIP) at method end.
+        List<PropertyNode> embedFields = new ArrayList<>();
+        for (PropertyNode p : contract.properties()) {
+            if (p.readonly() && p.embedAlways()) {
+                embedFields.add(p);
+            }
+        }
+        boolean embedInjected = false;
+
         // Methods
         for (MethodNode method : contract.methods()) {
             LowerCtx ctx = new LowerCtx(contract);
@@ -193,6 +209,16 @@ public final class AnfLower {
             // property_access branch (isProperty checked before isParam).
             for (ParamNode p : method.params()) {
                 ctx.addParam(p.name());
+            }
+
+            // Issue #123: a non-default @sighash mode drives the OP_PUSH_TX
+            // binding flag for any checkPreimage (auto-injected below, or a
+            // manual call) in this method.
+            int sighashMode = method.sighashType() != null
+                ? method.sighashType() : SighashDirective.SIGHASH_DEFAULT;
+            boolean isDefaultSighash = sighashMode == SighashDirective.SIGHASH_DEFAULT;
+            if (!isDefaultSighash) {
+                ctx.sighashFlag = sighashMode;
             }
 
             boolean isStatefulPublic = contract.parentClass() == ParentClass.STATEFUL_SMART_CONTRACT
@@ -218,21 +244,24 @@ public final class AnfLower {
                 ctx.addParam("txPreimage");
                 ctx.registerParamType("txPreimage", "SigHashPreimage");
 
-                // checkPreimage(txPreimage) at the start
+                // checkPreimage(txPreimage) at the start. Issue #123: a
+                // non-default @sighash mode changes only the appended OP_PUSH_TX
+                // binding flag byte (omit for the default so the ANF + pinned
+                // binding blob stay byte-identical for every existing contract).
                 String preimageRef = ctx.emit(new LoadParam("txPreimage"));
-                String checkResult = ctx.emit(new CheckPreimage(preimageRef));
+                String checkResult = ctx.emit(
+                    new CheckPreimage(preimageRef, isDefaultSighash ? null : sighashMode));
                 ctx.emit(new Assert(checkResult));
 
-                // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-                // auto-injected covenant cannot be spent under a permissive sighash
-                // flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
-                // a contract may read. The hashOutputs continuation already fails
-                // under non-ALL flags, so this is a no-op on spendability for
-                // continuation-using methods and closes the field-zeroing exposure
-                // for the rest.
+                // GAP-302 / #123: pin the sighash type to the declared mode
+                // (default SIGHASH_ALL|FORKID, 0x41). Without this the spend
+                // could use a DIFFERENT sighash flag than declared that zeroes
+                // out preimage fields the contract (or its continuation) relies
+                // on (hashOutputs / hashPrevouts / hashSequence). The default
+                // 0x41 keeps existing contracts byte-identical.
                 String sigHashPreimageRef = ctx.emit(new LoadParam("txPreimage"));
                 String sigHashTypeRef = ctx.emit(new Call("extractSigHashType", List.of(sigHashPreimageRef)));
-                String expectedSigHashRef = ctx.emit(makeLoadConstInt(BigInteger.valueOf(0x41)));
+                String expectedSigHashRef = ctx.emit(makeLoadConstInt(BigInteger.valueOf(sighashMode)));
                 String sigHashOkRef = ctx.emit(new BinOp("===", sigHashTypeRef, expectedSigHashRef, null));
                 ctx.emit(new Assert(sigHashOkRef));
 
@@ -244,6 +273,14 @@ public final class AnfLower {
                 if (hasStateProp) {
                     String preimageRef3 = ctx.emit(new LoadParam("txPreimage"));
                     ctx.emit(new DeserializeState(preimageRef3));
+                }
+
+                // Issue #109: preserve @embedAlways fields at the first
+                // user-statement position (after the checkPreimage/deserialize
+                // preamble), mirroring where a `const _bind = this.field;` would sit.
+                if (!embedInjected && !embedFields.isEmpty()) {
+                    emitEmbedAlwaysPreservation(ctx, embedFields);
+                    embedInjected = true;
                 }
 
                 // Developer's method body
@@ -329,6 +366,14 @@ public final class AnfLower {
 
                 out.add(new AnfMethod(method.name(), augmented, ctx.bindings, true));
             } else {
+                // Issue #109: stateless public methods (and non-stateful
+                // spending entry points) are lowered here — inject @embedAlways
+                // preservation into the first PUBLIC one before its body.
+                if (!embedInjected && !embedFields.isEmpty()
+                        && method.visibility() == Visibility.PUBLIC) {
+                    emitEmbedAlwaysPreservation(ctx, embedFields);
+                    embedInjected = true;
+                }
                 ctx.lowerStatements(method.body());
                 List<AnfParam> privAugmented = new ArrayList<>(lowerParams(method.params()));
                 // Private methods can also call the intent intrinsics; capture
@@ -419,6 +464,10 @@ public final class AnfLower {
         // every sub-context (if/else branches, ternaries). Mirrors the
         // method-scoped param-type tracking in the TS reference compiler.
         Map<String, String> methodParamTypes = new HashMap<>();
+        // Issue #123: the declared non-default @sighash flag for the method
+        // being lowered, so a MANUAL checkPreimage(pre) call binds under the
+        // same mode as the method's declared sighash. null = default ALL|FORKID.
+        Integer sighashFlag = null;
 
         LowerCtx(ContractNode contract) {
             this.contract = contract;
@@ -591,6 +640,10 @@ public final class AnfLower {
             // analysis inside if/else / ternary sub-contexts resolves params
             // against THIS method's ABI, not every method's.
             sub.methodParamTypes = this.methodParamTypes;
+            // Issue #123: propagate the method's declared @sighash flag so a
+            // manual checkPreimage() inside an if/else / ternary / inlined
+            // branch binds under the same mode instead of the default.
+            sub.sighashFlag = this.sighashFlag;
             // GAP-002: inherit the outer statement's source location so
             // bindings emitted inside an if/else / loop branch are still
             // mapped back to the originating AST statement.
@@ -974,7 +1027,8 @@ public final class AnfLower {
             if (callee instanceof Identifier id2 && "checkPreimage".equals(id2.name())) {
                 if (!e.args().isEmpty()) {
                     String preimageRef = lowerExprToRef(e.args().get(0));
-                    return emit(new CheckPreimage(preimageRef));
+                    // Issue #123: honour the method's declared @sighash on manual calls.
+                    return emit(new CheckPreimage(preimageRef, sighashFlag));
                 }
             }
 
@@ -1348,6 +1402,24 @@ public final class AnfLower {
         return new LoadConst(new BytesConst(v));
     }
 
+    /**
+     * Issue #109: emit the DCE-surviving preservation pair for each
+     * {@code @embedAlways} readonly field, into the given (public) method
+     * context. Reproduces exactly what a hand-written {@code const _bind =
+     * this.field;} lowers to: a {@code load_prop} followed by a
+     * {@code load_const("@ref:<t>")} alias. The alias marks the {@code load_prop}
+     * as referenced, so dead-binding DCE keeps it; stack lowering then emits the
+     * field's constructor-slot placeholder and NIPs the unused value off the
+     * stack at method end. The field's bytes therefore remain in the deployed
+     * locking script for downstream recovery.
+     */
+    private static void emitEmbedAlwaysPreservation(LowerCtx ctx, List<PropertyNode> fields) {
+        for (PropertyNode field : fields) {
+            String loadRef = ctx.emit(new LoadProp(field.name()));
+            ctx.emitNamed("__embedAlways_" + field.name(), makeLoadConstString("@ref:" + loadRef));
+        }
+    }
+
     private static List<Expression> flattenAddOutputArgs(List<Expression> args) {
         if (args.size() == 2 && args.get(1) instanceof ArrayLiteralExpr al) {
             List<Expression> out = new ArrayList<>(1 + al.elements().size());
@@ -1367,7 +1439,9 @@ public final class AnfLower {
     // addDataOutput to a private helper is correctly classified.
     // 2026-04-30 audit fix for findings F1 (Critical) and F3 (High).
 
-    private static MethodNode lookupPrivateMethod(ContractNode contract, String name) {
+    // Package-visible so SighashValidate (issue #123) can reuse the same
+    // transitive continuation-shape predicates the ANF lowering uses.
+    static MethodNode lookupPrivateMethod(ContractNode contract, String name) {
         if (name == null) return null;
         for (MethodNode m : contract.methods()) {
             if (name.equals(m.name()) && m.visibility() != Visibility.PUBLIC) return m;
@@ -1382,7 +1456,7 @@ public final class AnfLower {
         return null;
     }
 
-    private static boolean methodMutatesState(MethodNode method, ContractNode contract) {
+    static boolean methodMutatesState(MethodNode method, ContractNode contract) {
         Set<String> mutable = new HashSet<>();
         for (PropertyNode p : contract.properties()) {
             if (!p.readonly()) mutable.add(p.name());
@@ -1451,7 +1525,7 @@ public final class AnfLower {
     // addOutput / addDataOutput detection (recursive across private calls)
     // ------------------------------------------------------------------
 
-    private static boolean methodHasAddOutput(MethodNode m, ContractNode contract) {
+    static boolean methodHasAddOutput(MethodNode m, ContractNode contract) {
         return bodyHasAddOutput(m.body(), contract, new HashSet<>());
     }
 
@@ -1499,7 +1573,7 @@ public final class AnfLower {
         return false;
     }
 
-    private static boolean methodHasAddDataOutput(MethodNode m, ContractNode contract) {
+    static boolean methodHasAddDataOutput(MethodNode m, ContractNode contract) {
         return bodyHasAddDataOutput(m.body(), contract, new HashSet<>());
     }
 
@@ -1858,7 +1932,7 @@ public final class AnfLower {
             return new UpdateProp(up.name(), mapOr(up.value(), nameMap));
         }
         if (value instanceof CheckPreimage cp) {
-            return new CheckPreimage(mapOr(cp.preimage(), nameMap));
+            return new CheckPreimage(mapOr(cp.preimage(), nameMap), cp.sighashFlag());
         }
         if (value instanceof DeserializeState ds) {
             return new DeserializeState(mapOr(ds.preimage(), nameMap));

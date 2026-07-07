@@ -100,6 +100,19 @@ public final class Validate {
         ctx.validateConstructor();
         ctx.validateMethods();
         ctx.checkNoRecursion();
+        ctx.warnStrippedReadonlyFields();
+
+        // Issue #123: reject preimage-field reads / output bindings that are
+        // unsound under a method's declared @sighash mode (security core). Emits
+        // both errors (unsound usages) and warnings (e.g. an explicit single-output
+        // SINGLE covenant whose same-index value cannot be pinned statically).
+        for (SighashValidate.Diag d : SighashValidate.validate(contract)) {
+            if (d.isWarning()) {
+                ctx.warn(d.message(), d.loc());
+            } else {
+                ctx.error(d.message(), d.loc());
+            }
+        }
 
         return new Result(ctx.errors, ctx.warnings);
     }
@@ -480,6 +493,45 @@ public final class Validate {
         private static boolean isAsmCall(Expression expr) {
             if (!(expr instanceof CallExpr call)) return false;
             return call.callee() instanceof Identifier id && "asm".equals(id.name());
+        }
+
+        /**
+         * Issue #109 (Option 4): warn when DCE will strip an un-annotated
+         * readonly field. Such a field carries no compile-time value (no
+         * initializer), is referenced by no method body, and is not marked
+         * {@code /** @embedAlways *&#47;}, so it is eliminated from the locking
+         * script entirely — silently dropping deploy-time metadata an author may
+         * intend to recover from the on-chain script later. Rides the warning
+         * channel; {@code @embedAlways} fields are forced back into the script
+         * during ANF lowering and so are excluded here (never warn).
+         */
+        private void warnStrippedReadonlyFields() {
+            java.util.Set<String> referenced = new java.util.HashSet<>();
+            for (MethodNode m : contract.methods()) {
+                walkExpressionsInBody(m.body(), expr -> {
+                    if (expr instanceof PropertyAccessExpr pa) {
+                        referenced.add(pa.property());
+                    } else if (expr instanceof MemberExpr me
+                            && me.object() instanceof Identifier id
+                            && "this".equals(id.name())) {
+                        referenced.add(me.property());
+                    } else if (expr instanceof Identifier id) {
+                        referenced.add(id.name());
+                    }
+                });
+            }
+            for (PropertyNode prop : contract.properties()) {
+                if (prop.readonly()
+                        && !prop.embedAlways()
+                        && prop.initializer() == null
+                        && !referenced.contains(prop.name())) {
+                    warn(
+                        "readonly field '" + prop.name() + "' is not referenced in any method body "
+                            + "and was eliminated by DCE; annotate it /** @embedAlways */ to preserve "
+                            + "it in the on-chain script",
+                        prop.sourceLocation());
+                }
+            }
         }
 
         @FunctionalInterface
