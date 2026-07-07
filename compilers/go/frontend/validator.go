@@ -554,14 +554,16 @@ func (ctx *validationContext) validateForStatement(stmt ForStmt) {
 	}
 }
 
+// isCompileTimeConstant reports whether a for-loop bound can be unrolled into
+// fixed Bitcoin Script. Only integer literals (and their negation) qualify: a
+// bare identifier bound (e.g. `const N`) or a runtime member access (`this.x`)
+// is NOT resolvable and must be rejected here with a graceful diagnostic —
+// anf-lower's extractLoopShape would otherwise panic. Mirrors the reference TS
+// compiler's observable behavior: only literal loop bounds compile.
 func isCompileTimeConstant(expr Expression) bool {
 	switch e := expr.(type) {
 	case BigIntLiteral:
 		return true
-	case BoolLiteral:
-		return true
-	case Identifier:
-		return true // trust it's a const
 	case UnaryExpr:
 		if e.Op == "-" {
 			return isCompileTimeConstant(e.Operand)

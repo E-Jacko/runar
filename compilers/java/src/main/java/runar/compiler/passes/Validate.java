@@ -877,12 +877,15 @@ public final class Validate {
         return false;
     }
 
+    // Only integer literals (and their negation) can be unrolled into fixed
+    // Bitcoin Script by anf-lower. A bare identifier bound (e.g. `final N`) or a
+    // runtime member access (`this.x`) is NOT resolvable and must be rejected
+    // here with a graceful diagnostic — anf-lower's extractLoopShape would
+    // otherwise throw. Mirrors the reference TS compiler's observable behavior:
+    // only literal loop bounds compile.
     private static boolean isCompileTimeConstant(Expression e) {
         if (e == null) return false;
         if (e instanceof BigIntLiteral) return true;
-        if (e instanceof BoolLiteral) return true;
-        // An identifier may refer to a local `final` constant — trust it.
-        if (e instanceof Identifier) return true;
         if (e instanceof UnaryExpr u && u.op() == Expression.UnaryOp.NEG) {
             return isCompileTimeConstant(u.operand());
         }

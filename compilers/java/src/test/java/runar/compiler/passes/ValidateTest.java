@@ -326,6 +326,40 @@ class ValidateTest {
         );
     }
 
+    @Test
+    void rejectsForLoopWithIdentifierBound() {
+        // A bare identifier bound (a method parameter here) is not unrollable
+        // into fixed Bitcoin Script; the reference TS compiler rejects it, so
+        // the validator must too (anf-lower would otherwise throw).
+        String src = """
+            class Bad extends SmartContract {
+                @Readonly Bigint x;
+
+                Bad(Bigint x) {
+                    super(x);
+                    this.x = x;
+                }
+
+                @Public
+                void unlock(Bigint n) {
+                    for (Bigint i = BigInteger.ZERO; i < n; i++) {
+                        assertThat(true);
+                    }
+                    assertThat(true);
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "Bad.runar.java");
+        Validate.ValidationException e = assertThrows(
+            Validate.ValidationException.class,
+            () -> Validate.run(c)
+        );
+        assertTrue(
+            e.errors().stream().anyMatch(m -> m.contains("compile-time constant")),
+            "expected for-loop-bound error, got " + e.errors()
+        );
+    }
+
     // ------------------------------------------------------------------
     // Unknown function calls
     // ------------------------------------------------------------------

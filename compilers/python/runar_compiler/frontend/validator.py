@@ -14,7 +14,6 @@ from runar_compiler.frontend.ast_nodes import (
     AssignmentStmt,
     BigIntLiteral,
     BinaryExpr,
-    BoolLiteral,
     ByteStringLiteral,
     CallExpr,
     ContractNode,
@@ -578,14 +577,16 @@ def _ends_with_terminal_asm(body: list[Statement]) -> bool:
 
 
 def _is_compile_time_constant(expr: Expression | None) -> bool:
+    # Only integer literals (and their negation) can be unrolled into fixed
+    # Bitcoin Script by anf-lower. A bare identifier bound (e.g. ``const N``) or
+    # a runtime member access (``this.x``) is NOT resolvable and must be
+    # rejected here with a graceful diagnostic — anf-lower's
+    # ``_extract_loop_shape`` would otherwise raise. Mirrors the reference TS
+    # compiler's observable behavior: only literal loop bounds compile.
     if expr is None:
         return False
     if isinstance(expr, BigIntLiteral):
         return True
-    if isinstance(expr, BoolLiteral):
-        return True
-    if isinstance(expr, Identifier):
-        return True  # trust it's a const
     if isinstance(expr, UnaryExpr):
         if expr.op == "-":
             return _is_compile_time_constant(expr.operand)

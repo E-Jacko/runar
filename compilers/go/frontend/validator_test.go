@@ -1032,10 +1032,14 @@ func TestValidate_EmptyPublicMethodBody_Error(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test V11: validate — identifier for-loop bound (treated as possibly const) accepted
+// Test V11: validate — identifier for-loop bound rejected (cleanly, no panic)
 // ---------------------------------------------------------------------------
+//
+// A bare identifier loop bound (`const N`) cannot be unrolled into fixed
+// Bitcoin Script. The reference TS compiler rejects it with a graceful
+// diagnostic; the validator must do the same so anf-lower never panics.
 
-func TestValidate_ForLoopIdentifierBound_OK(t *testing.T) {
+func TestValidate_ForLoopIdentifierBound_Rejected(t *testing.T) {
 	contract := &ContractNode{
 		Name:        "IdentBound",
 		ParentClass: "SmartContract",
@@ -1068,11 +1072,15 @@ func TestValidate_ForLoopIdentifierBound_OK(t *testing.T) {
 
 	result := Validate(contract)
 
-	// Identifier bound should not produce a "constant bound" error
+	// Identifier bound must be rejected with a compile-time-constant diagnostic.
+	found := false
 	for _, e := range result.Errors {
-		if strings.Contains(e.Message,"constant") || strings.Contains(e.Message,"bound") {
-			t.Errorf("expected identifier for-loop bound to be accepted (treated as const), but got error: %s", e.Message)
+		if strings.Contains(e.Message, "constant") || strings.Contains(e.Message, "bound") {
+			found = true
 		}
+	}
+	if !found {
+		t.Errorf("expected identifier for-loop bound to be rejected with a compile-time-constant diagnostic, got: %v", result.Errors)
 	}
 }
 

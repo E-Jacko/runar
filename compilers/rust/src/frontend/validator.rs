@@ -581,10 +581,14 @@ fn validate_statement(stmt: &Statement, errors: &mut Vec<Diagnostic>) {
 }
 
 fn is_compile_time_constant(expr: &Expression) -> bool {
+    // Only integer literals (and their negation) can be unrolled into fixed
+    // Bitcoin Script by anf-lower. A bare identifier bound (e.g. `const N`) or a
+    // runtime member access (`this.x`) is NOT resolvable and must be rejected
+    // here with a graceful diagnostic — anf-lower's `extract_loop_shape` would
+    // otherwise panic. This mirrors the reference TS compiler's observable
+    // behavior: only literal loop bounds compile.
     match expr {
         Expression::BigIntLiteral { .. } => true,
-        Expression::BoolLiteral { .. } => true,
-        Expression::Identifier { .. } => true, // Could be a const
         Expression::UnaryExpr { op, operand } if *op == UnaryOp::Neg => {
             is_compile_time_constant(operand)
         }

@@ -1070,6 +1070,10 @@ const Parser = struct {
         var bound: i64 = 0;
         var descending: bool = false;
         var inclusive: bool = false;
+        // Only a genuine integer-literal bound is unrollable. A runtime bound
+        // (`i < this.x`) or an identifier bound (`i < N`) must be rejected by
+        // the validator rather than silently collapsing to a 0-iteration loop.
+        var bound_is_const: bool = false;
 
         // Initializer: let/const varname = expr
         if (self.checkIdent("let") or self.checkIdent("const")) {
@@ -1109,6 +1113,7 @@ const Parser = struct {
                         switch (bop.right) {
                             .literal_int => |v| {
                                 bound = v;
+                                bound_is_const = true;
                             },
                             else => {},
                         }
@@ -1127,7 +1132,7 @@ const Parser = struct {
 
         const body = self.parseBlockOrStatement();
 
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .body = body } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .bound_is_const = bound_is_const, .body = body } };
     }
 
     fn parseReturnStmt(self: *Parser) ?Statement {

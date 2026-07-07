@@ -501,6 +501,37 @@ class TestValidator < Minitest::Test
            "expected error about non-constant loop bound, got: #{result.error_strings}"
   end
 
+  # A bare identifier bound (`const N`) is likewise not unrollable and must be
+  # rejected at the validator (never a panic/raise in anf-lower), matching the
+  # reference TS compiler: only integer-literal loop bounds compile.
+  def test_for_loop_identifier_bound_rejected
+    source = <<~TS
+      import { SmartContract, assert } from 'runar-lang';
+
+      const N: bigint = 5n;
+
+      class LoopIdent extends SmartContract {
+        readonly target: bigint;
+
+        constructor(target: bigint) {
+          super(target);
+          this.target = target;
+        }
+
+        public check(): void {
+          let total: bigint = 0n;
+          for (let i: bigint = 0n; i < N; i++) { total += i; }
+          assert(total > 0n);
+        }
+      }
+    TS
+
+    contract = parse_ts(source, "LoopIdent.runar.ts")
+    result = RunarCompiler::Frontend.validate(contract)
+    assert result.errors.any? { |e| e.message.downcase.include?("constant") || e.message.downcase.include?("bound") },
+           "expected identifier loop bound to be rejected, got: #{result.error_strings}"
+  end
+
   # ---------------------------------------------------------------------------
   # 16. ByteString literal with odd-length hex fails
   # ---------------------------------------------------------------------------

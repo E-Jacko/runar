@@ -558,13 +558,20 @@ fn validateStatement(
 ) !void {
     switch (stmt) {
         .for_stmt => |f| {
-            // For loops in the Zig IR already have concrete i64 bounds
-            // (init_value, bound), so they are inherently compile-time
-            // constants. Issue #121: the ANF loop node now carries an explicit
-            // start value and step direction, so non-zero-start and countdown
-            // (`>`/`>=`) loops are supported and no longer rejected here —
-            // anf-lower binds `iterVar = start + i*step` on each unrolled
-            // iteration.
+            // The parser collapses a for-loop bound to a concrete i64, but a
+            // runtime bound (`i < this.x`) or an identifier bound (`i < N`)
+            // is not unrollable and would otherwise silently become a
+            // 0-iteration loop. Reject it here with the same diagnostic the
+            // reference TS compiler emits — only genuine integer-literal bounds
+            // compile. Issue #121: non-zero-start and countdown (`>`/`>=`)
+            // loops with literal bounds remain supported (anf-lower binds
+            // `iterVar = start + i*step` on each unrolled iteration).
+            if (!f.bound_is_const) {
+                try errors.append(allocator, .{
+                    .message = "For loop bound must be a compile-time constant (literal or const variable)",
+                    .severity = .@"error",
+                });
+            }
             for (f.body) |s| try validateStatement(allocator, s, errors);
         },
         .if_stmt => |if_s| {
@@ -1141,6 +1148,50 @@ test "public method without assert reports error for SmartContract" {
     var found = false;
     for (result.errors) |err| {
         if (std.mem.indexOf(u8, err.message, "assert()") != null) {
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "for loop with non-constant bound is rejected" {
+    const allocator = testing.allocator;
+    const props = [_]PropertyNode{
+        makeProperty("x", .bigint, true),
+    };
+    // for (let i = 0; i < <runtime>; i++) {}  — bound_is_const = false marks a
+    // runtime/identifier bound that the parser could not resolve to a literal.
+    var loop_body = [_]Statement{};
+    var body = [_]Statement{
+        .{ .for_stmt = .{
+            .var_name = "i",
+            .init_value = 0,
+            .bound = 0,
+            .bound_is_const = false,
+            .body = &loop_body,
+        } },
+        .{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } },
+    };
+    var methods = [_]MethodNode{
+        .{ .name = "run", .is_public = true, .params = &.{}, .body = &body },
+    };
+    var assignments = [_]types.AssignmentNode{makeAssignment("x")};
+    var super_args = [_]Expression{.{ .identifier = "x" }};
+    var params = [_]types.ParamNode{makeParam("x")};
+    const contract = ContractNode{
+        .name = "LoopRuntime",
+        .parent_class = .smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &methods,
+    };
+    const result = try validate(allocator, contract);
+    defer freeResult(allocator, result);
+
+    var found = false;
+    for (result.errors) |err| {
+        if (std.mem.indexOf(u8, err.message, "compile-time constant") != null) {
             found = true;
             break;
         }

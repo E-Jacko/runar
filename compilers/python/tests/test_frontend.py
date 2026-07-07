@@ -2322,9 +2322,14 @@ class LiteralLoop extends SmartContract {
             f"expected no errors for literal loop bound, got: {vr.errors}"
         )
 
-    # V11: identifier loop bound accepted
-    def test_v11_identifier_loop_bound_accepted(self):
-        """for(let i=0n;i<N;i++) where N is identifier → no errors."""
+    # V11: identifier loop bound rejected (cleanly, no crash)
+    def test_v11_identifier_loop_bound_rejected(self):
+        """for(let i=0n;i<N;i++) where N is identifier → rejected at validator.
+
+        A bare identifier bound cannot be unrolled into fixed Bitcoin Script;
+        the reference TS compiler rejects it gracefully. The validator must do
+        the same so anf-lower's _extract_loop_shape never raises.
+        """
         source = """
 import { SmartContract, assert } from 'runar-lang';
 
@@ -2348,9 +2353,9 @@ class IdentLoop extends SmartContract {
         result = parse_source(source, "IdentLoop.runar.ts")
         assert result.contract is not None
         vr = validate(result.contract)
-        assert len(vr.errors) == 0, (
-            f"expected no errors for identifier loop bound, got: {vr.errors}"
-        )
+        assert any(
+            "constant" in e.message or "bound" in e.message for e in vr.errors
+        ), f"expected a compile-time-constant loop-bound error, got: {vr.errors}"
 
     # V12: constructor missing super() rejected
     def test_v12_constructor_missing_super_rejected(self):

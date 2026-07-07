@@ -579,11 +579,15 @@ module RunarCompiler
       # Helper: compile-time constant check
       # -------------------------------------------------------------------
 
+      # Only integer literals (and their negation) can be unrolled into fixed
+      # Bitcoin Script by anf-lower. A bare identifier bound (e.g. `const N`) or
+      # a runtime member access (`this.x`) is NOT resolvable and must be
+      # rejected here with a graceful diagnostic — anf-lower's
+      # _extract_loop_shape would otherwise raise. Mirrors the reference TS
+      # compiler's observable behavior: only literal loop bounds compile.
       def compile_time_constant?(expr)
         return false if expr.nil?
         return true if expr.is_a?(BigIntLiteral)
-        return true if expr.is_a?(BoolLiteral)
-        return true if expr.is_a?(Identifier) # trust it's a const
 
         if expr.is_a?(UnaryExpr) && expr.op == "-"
           return compile_time_constant?(expr.operand)

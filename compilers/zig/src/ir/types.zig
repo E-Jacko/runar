@@ -184,7 +184,14 @@ pub const IfStmt = struct { condition: Expression, then_body: []Statement, else_
 // (TS/Sol/Go/Java) set `descending`/`inclusive` from the raw operator while
 // range-based parsers (Rust/Ruby/Python/Zig/Move) are ascending and fold any
 // inclusive endpoint into `bound` at parse time (leaving `inclusive = false`).
-pub const ForStmt = struct { var_name: []const u8, init_value: i64, bound: i64, body: []Statement, descending: bool = false, inclusive: bool = false, source_loc: ?SourceLocation = null };
+// `bound_is_const` records whether the loop bound was a genuine integer
+// literal. The Zig parsers collapse the bound to a concrete i64 (defaulting to
+// 0), so a runtime bound (`i < this.x`) or an identifier bound (`i < N`) would
+// otherwise silently become a 0-iteration loop. When false, the validator
+// rejects the loop with a compile-time-constant diagnostic (matching the
+// reference TS compiler). Defaults to true so unrelated construction sites and
+// format parsers stay literal-bounded by default.
+pub const ForStmt = struct { var_name: []const u8, init_value: i64, bound: i64, body: []Statement, descending: bool = false, inclusive: bool = false, bound_is_const: bool = true, source_loc: ?SourceLocation = null };
 pub const AssertStmt = struct { condition: Expression, message: ?[]const u8 = null, source_loc: ?SourceLocation = null };
 
 pub const Expression = union(enum) {
