@@ -456,13 +456,39 @@ fn lowerStatefulPublicMethod(
     _ = allocator;
 
     if (add_output_refs.len > 0 or add_data_output_refs.len > 0 or methodMutatesState(method, contract)) {
-        // Build P2PKH change output
+        // Build the P2PKH change output for hashOutputs verification.
+        //
+        // Issue #116: the SDK's buildCallTransaction OMITS the change output when
+        // `change <= 0` (an exact-cover call) and passes `_changeAmount = 0`.
+        // Gate the change segment on `_changeAmount != 0` at runtime so the hashed
+        // output set matches the SDK at the exact-zero boundary — the segment is
+        // the P2PKH change output when non-zero, and empty bytes (cat with empty
+        // is a no-op) when zero, reproducing the omission. For any change > 0 the
+        // hashed bytes are unchanged; only the emitted script gains the guard.
         const change_pkh_ref = try ctx.emit(.{ .load_param = .{ .name = "_changePKH" } });
         const change_amount_ref = try ctx.emit(.{ .load_param = .{ .name = "_changeAmount" } });
-        const change_output_ref = try ctx.emit(.{ .call = .{
-            .func = "buildChangeOutput",
-            .args = try ctx.allocSlice(&.{ change_pkh_ref, change_amount_ref }),
+        const zero_ref = try ctx.emit(makeLoadConstInt(0));
+        const change_nonzero_ref = try ctx.emit(.{ .bin_op = .{
+            .op = "!==",
+            .left = change_amount_ref,
+            .right = zero_ref,
         } });
+        var change_then_ctx = ctx.subContext();
+        _ = try change_then_ctx.emit(.{ .call = .{
+            .func = "buildChangeOutput",
+            .args = try change_then_ctx.allocSlice(&.{ change_pkh_ref, change_amount_ref }),
+        } });
+        ctx.syncCounter(&change_then_ctx);
+        var change_else_ctx = ctx.subContext();
+        _ = try change_else_ctx.emit(makeLoadConstString(change_else_ctx.allocator, ""));
+        ctx.syncCounter(&change_else_ctx);
+        const change_if = try ctx.allocator.create(types.ANFIf);
+        change_if.* = .{
+            .cond = change_nonzero_ref,
+            .then = try change_then_ctx.bindings.toOwnedSlice(ctx.allocator),
+            .@"else" = try change_else_ctx.bindings.toOwnedSlice(ctx.allocator),
+        };
+        const change_output_ref = try ctx.emit(.{ .@"if" = change_if });
 
         if (add_output_refs.len > 0) {
             // Multi-output: concat all state outputs, then all data outputs,
