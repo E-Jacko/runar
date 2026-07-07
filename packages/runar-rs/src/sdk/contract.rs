@@ -807,10 +807,54 @@ impl RunarContract {
         let change_script_str = build_p2pkh_script_from_address(change_address);
         let all_funding_utxos = provider.get_utxos(&address).unwrap_or_default();
         // Filter out the contract UTXO from funding UTXOs to avoid duplicate inputs
-        let additional_utxos: Vec<Utxo> = all_funding_utxos
+        let candidate_funding_utxos: Vec<Utxo> = all_funding_utxos
             .into_iter()
             .filter(|u| !(u.txid == current_utxo.txid && u.output_index == current_utxo.output_index))
             .collect();
+
+        // Coin selection for funding inputs (issue #133): don't sweep the whole
+        // wallet. Compute how much the funding must cover — the contract's own
+        // input value already offsets the contract/data outputs — and pick the
+        // smallest largest-first set via select_utxos (the strategy deploy uses).
+        let contract_output_base: i64 = match &contract_outputs {
+            Some(cos) => cos.iter().map(|o| o.satoshis).sum(),
+            None => new_satoshis.unwrap_or(0),
+        };
+        let contract_output_sats =
+            contract_output_base + resolved_data_outputs.iter().map(|o| o.satoshis).sum::<i64>();
+        let contract_input_sats =
+            current_utxo.satoshis + extra_contract_utxos.iter().map(|u| u.satoshis).sum::<i64>();
+        let funding_target = (contract_output_sats - contract_input_sats).max(0);
+        // Fee sizing hint for select_utxos: the continuation script length
+        // (falls back to the first multi-output script, else 0 for stateless).
+        let funding_lock_len = new_locking_script
+            .as_ref()
+            .map(|s| s.len())
+            .or_else(|| contract_outputs.as_ref().and_then(|c| c.first()).map(|o| o.script.len()))
+            .unwrap_or(0)
+            / 2;
+        let additional_utxos: Vec<Utxo> = if candidate_funding_utxos.is_empty() {
+            Vec::new()
+        } else {
+            select_utxos(&candidate_funding_utxos, funding_target, funding_lock_len, Some(fee_rate))
+        };
+
+        // Cap funding inputs when the caller sets max_funding_inputs.
+        // select_utxos returns the minimal largest-first set; if that still
+        // exceeds the cap the funding can't cover outputs + fee within the
+        // budget, so fail loudly instead of broadcasting an underfunded tx.
+        if let Some(cap) = options.and_then(|o| o.max_funding_inputs) {
+            if additional_utxos.len() > cap {
+                return Err(format!(
+                    "RunarContract.call({}): funding requires {} input(s) but \
+                     max_funding_inputs={}. Increase max_funding_inputs, use \
+                     larger UTXOs, or consolidate.",
+                    method_name,
+                    additional_utxos.len(),
+                    cap
+                ));
+            }
+        }
 
         // Resolve per-input args for additional contract inputs (same Sig/PubKey/ByteString handling as primary args)
         let resolved_per_input_args: Option<Vec<Vec<SdkValue>>> = options

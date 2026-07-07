@@ -106,6 +106,13 @@ pub struct CallOptions {
     /// Set explicitly only for RBF or custom relative-locktime scenarios.
     /// Threaded through the non-terminal and terminal call-tx build sites.
     pub sequence: Option<u32>,
+    /// Cap the number of P2PKH funding inputs added to a non-terminal call tx
+    /// (issue #133). Funding is chosen by smallest-sufficient, largest-first
+    /// selection (the same `select_utxos` strategy deploy uses). If covering
+    /// the outputs + fee would need more than this many inputs, the call
+    /// returns an error rather than silently sweeping the wallet. `None` → no
+    /// cap.
+    pub max_funding_inputs: Option<usize>,
 }
 
 /// A data output entry — hex-encoded script + satoshis — for the
