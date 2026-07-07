@@ -24,5 +24,30 @@
     "  shasum -a 256 conformance/tests/<fixture>/expected-script.hex",
     "or run the checker with --print-hashes to get them for the whole changed set."
   ],
-  "entries": []
+  "entries": [
+    {
+      "path": "conformance/runtime-vectors/blake3-official-kat.json",
+      "sha256": "6bbc509a9e6dfa3a6a5cba24ba0f4b9744fe65e9df18f5edda101eaa60318c0a",
+      "verified-against": "official-KAT",
+      "reason": "Verbatim official BLAKE3 KAT vectors (input lengths 0..64) from BLAKE3-team/BLAKE3 test_vectors/test_vectors.json; empty-input hash matches the canonical af1349b9…. These ARE the independent oracle, not compiler-produced bytes — the fix for the BUG-101 self-golden gap.",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-08"
+    },
+    {
+      "path": "conformance/runtime-vectors/ecdsa-rfc6979.json",
+      "sha256": "e34647e3a2cc9d130a129a1707e69e7e1c7db53d86865026f8891032b7b002bb",
+      "verified-against": "official-KAT",
+      "reason": "RFC 6979 Appendix A.2.5 (P-256) + A.2.6 (P-384) deterministic-ECDSA test vectors, With-SHA-256 variant (matches the native verify path). Independently published, not compiler-produced.",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-08"
+    },
+    {
+      "path": "conformance/runtime-vectors/slh-dsa-acvp-kat.json",
+      "sha256": "83f10b696fc2e601bb1f0208580e783e918b3bf23bc85c7336f5eb2f24b34b90",
+      "verified-against": "official-KAT",
+      "reason": "NIST ACVP SLH-DSA-SHA2-128s (internal) sigVer vector, tcId 422, testPassed=true. Authoritative regression gate that currently exposes a real native SLH-DSA FIPS-205 non-conformance (see docs/test-skips.md crypto_kat_test.go:286).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-08"
+    }
+  ]
 }
