@@ -255,6 +255,7 @@ module Runar
       :sequence,
       :max_funding_inputs,
       :funding_signer,
+      :fee_utxo,
       keyword_init: true
     ) do
       def initialize(
@@ -289,7 +290,15 @@ module Runar
         # method signer, set this so those inputs are signed by their real
         # owner. The method's own Sig args are still signed by the connected
         # signer. nil → the connected signer (zero behaviour change).
-        funding_signer: nil
+        funding_signer: nil,
+        # A single plain P2PKH UTXO added to a terminal call tx purely to pay
+        # the miner fee (#118). A true terminal method pays out the full
+        # contract balance, so fee would be 0 and ARC rejects; the covenant
+        # asserts its exact output set, so no change output can absorb a fee.
+        # The fee input is added BEFORE the OP_PUSH_TX preimage is computed (so
+        # hashPrevouts covers it) and consumed entirely as fee -- no change
+        # output. Signed with funding_signer || signer. nil → no fee input.
+        fee_utxo: nil
       )
         super
       end

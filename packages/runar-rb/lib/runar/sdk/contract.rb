@@ -964,12 +964,16 @@ module Runar
 
       # rubocop:disable Metrics/AbcSize, Metrics/MethodLength, Metrics/CyclomaticComplexity, Metrics/ParameterLists
       def prepare_terminal(
-        method_name, resolved_args, _signer, opts,
+        method_name, resolved_args, signer, opts,
         is_stateful, parent_stateful, needs_op_push_tx, method_needs_change, method_uses_code_part,
         sig_indices, preimage_index,
         method_selector_hex, change_pkh_hex, contract_utxo, code_sep_idx,
         intent_witness_hex = ''
       )
+        # Fee input (#118) is signed by funding_signer when set (#134); nil →
+        # the connected signer.
+        funding_signer = opts.funding_signer || signer
+        fee_utxo = opts.fee_utxo ? self.class.send(:normalize_utxo, opts.fee_utxo) : nil
         # Normalize terminal outputs — accept TerminalOutput structs or hashes.
         term_outputs = Array(opts.terminal_outputs).map do |item|
           case item
@@ -1005,16 +1009,26 @@ module Runar
         # method's extractLocktime assertion is actually enforced.
         terminal_sequence = SDK.resolve_input_sequence(opts.locktime, opts.sequence)
 
-        # Build raw terminal transaction: single input, exact outputs, no change.
+        # Build raw terminal transaction: contract input (+ optional fee input),
+        # exact outputs, no change.
         build_terminal_tx = lambda do |unlock|
           tx = +''
           tx << SDK.to_le32(1)
-          tx << SDK.encode_varint(1)
+          tx << SDK.encode_varint(fee_utxo ? 2 : 1)
           tx << SDK.reverse_hex(contract_utxo.txid)
           tx << SDK.to_le32(contract_utxo.output_index)
           tx << SDK.encode_varint(unlock.length / 2)
           tx << unlock
           tx << SDK.to_le32(terminal_sequence)
+          # Fee input (#118): a plain P2PKH input added BEFORE the OP_PUSH_TX
+          # preimage is computed so hashPrevouts covers it. Empty scriptSig at
+          # build time; its P2PKH sig is filled in after the tx is final.
+          if fee_utxo
+            tx << SDK.reverse_hex(fee_utxo.txid)
+            tx << SDK.to_le32(fee_utxo.output_index)
+            tx << '00'
+            tx << SDK.to_le32(terminal_sequence)
+          end
           tx << SDK.encode_varint(term_outputs.length)
           term_outputs.each do |out|
             tx << SDK.to_le64(out.satoshis)
@@ -1083,6 +1097,18 @@ module Runar
           end
           term_tx = SDK.insert_unlocking_script(term_tx, 0, real_unlock)
           final_preimage = resolved_args[preimage_index] if final_preimage.empty? && needs_op_push_tx
+        end
+
+        # Sign the fee input (#118). Its BIP-143 P2PKH sighash covers only
+        # hashPrevouts / hashOutputs / its own outpoint -- NOT input 0's
+        # scriptSig -- so it stays valid even after finalize_call rewrites input
+        # 0. Owned by funding_signer || signer (composes with #134). The fee
+        # input sits at index 1, right after the primary contract input.
+        if fee_utxo
+          fee_sig    = funding_signer.sign(term_tx, 1, fee_utxo.script, fee_utxo.satoshis)
+          fee_pubkey = funding_signer.get_public_key
+          fee_unlock = State.encode_push_data(fee_sig) + State.encode_push_data(fee_pubkey)
+          term_tx    = SDK.insert_unlocking_script(term_tx, 1, fee_unlock)
         end
 
         sighash = final_preimage.empty? ? '' : Digest::SHA256.hexdigest([final_preimage].pack('H*'))
