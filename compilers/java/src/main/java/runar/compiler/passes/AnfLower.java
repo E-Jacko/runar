@@ -253,9 +253,29 @@ public final class AnfLower {
                 List<String> addOutputRefs = ctx.addOutputRefs;
                 List<String> addDataOutputRefs = ctx.addDataOutputRefs;
                 if (!addOutputRefs.isEmpty() || !addDataOutputRefs.isEmpty() || mutates) {
+                    // Build the P2PKH change output for hashOutputs verification.
+                    //
+                    // Issue #116: the SDK's buildCallTransaction OMITS the change
+                    // output when `change <= 0` (an exact-cover call) and passes
+                    // `_changeAmount = 0`. Gate the change segment on
+                    // `_changeAmount != 0` at runtime so the hashed output set
+                    // matches the SDK at the exact-zero boundary — the segment is
+                    // the P2PKH change output when non-zero, and empty bytes (cat
+                    // with empty is a no-op) when zero, reproducing the omission.
+                    // For any change > 0 the hashed bytes are unchanged; only the
+                    // emitted script gains the guard.
                     String changePkhRef = ctx.emit(new LoadParam("_changePKH"));
                     String changeAmountRef = ctx.emit(new LoadParam("_changeAmount"));
-                    String changeOutputRef = ctx.emit(new Call("buildChangeOutput", List.of(changePkhRef, changeAmountRef)));
+                    String zeroRef = ctx.emit(makeLoadConstInt(BigInteger.ZERO));
+                    String changeNonZeroRef = ctx.emit(new BinOp("!==", changeAmountRef, zeroRef, null));
+                    LowerCtx changeThenCtx = ctx.subContext();
+                    changeThenCtx.emit(new Call("buildChangeOutput", List.of(changePkhRef, changeAmountRef)));
+                    ctx.syncCounter(changeThenCtx);
+                    LowerCtx changeElseCtx = ctx.subContext();
+                    changeElseCtx.emit(makeLoadConstString(""));
+                    ctx.syncCounter(changeElseCtx);
+                    String changeOutputRef = ctx.emit(new If(
+                        changeNonZeroRef, changeThenCtx.bindings, changeElseCtx.bindings));
 
                     if (!addOutputRefs.isEmpty()) {
                         String accumulated = addOutputRefs.get(0);
