@@ -22,3 +22,40 @@ pub fn assertSourceBytesUnderLimit(source: []const u8) SourceSizeError!void {
         return SourceSizeError.SourceSizeExceeded;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fail-closed guard for author-facing comment directives that only the
+// TypeScript compiler implements today: `@sighash <FLAGS>` (#123, per-method
+// sighash type) and `@embedAlways` (#109, readonly-field DCE opt-out). The Zig
+// frontend ignores comments, so silently dropping these would change signing /
+// DCE semantics — reject rather than diverge until the ports land.
+// ---------------------------------------------------------------------------
+
+pub const SIGHASH_DIRECTIVE_ERROR = "@sighash directive is not yet supported by the Zig compiler (issue #123); compile the contract with the TypeScript compiler";
+pub const EMBED_ALWAYS_DIRECTIVE_ERROR = "@embedAlways directive is not yet supported by the Zig compiler (issue #109); compile the contract with the TypeScript compiler";
+
+fn isWordByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+}
+
+/// True when `marker` (which begins with a non-word `@`) appears in `source`
+/// followed by a word boundary — i.e. the next byte is not `[A-Za-z0-9_]`.
+/// Mirrors the TypeScript compiler's `/@sighash\b/` / `/@embedAlways\b/` scans
+/// so an identifier like `sighashType` does not trip the guard.
+pub fn containsDirectiveToken(source: []const u8, marker: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, source, i, marker)) |pos| {
+        const after = pos + marker.len;
+        if (after >= source.len or !isWordByte(source[after])) return true;
+        i = pos + 1;
+    }
+    return false;
+}
+
+/// Returns the fail-closed diagnostic message for the first unsupported
+/// directive in `source`, or null when the source is clean.
+pub fn unsupportedDirectiveError(source: []const u8) ?[]const u8 {
+    if (containsDirectiveToken(source, "@sighash")) return SIGHASH_DIRECTIVE_ERROR;
+    if (containsDirectiveToken(source, "@embedAlways")) return EMBED_ALWAYS_DIRECTIVE_ERROR;
+    return null;
+}

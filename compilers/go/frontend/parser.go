@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -61,6 +62,18 @@ func ParseSource(source []byte, fileName string) *ParseResult {
 		}
 	}
 
+	// Fail-closed guard for the author-facing comment directives that only
+	// the TypeScript compiler implements today: `@sighash <FLAGS>` (#123,
+	// per-method sighash type) and `@embedAlways` (#109, readonly-field DCE
+	// opt-out). The Go frontend ignores comments, so it would silently drop
+	// these directives and change signing / DCE semantics. Reject rather than
+	// diverge until the ports land.
+	if msg := unsupportedDirectiveError(source); msg != "" {
+		return &ParseResult{
+			Errors: []Diagnostic{{Message: msg, Severity: SeverityError}},
+		}
+	}
+
 	lower := strings.ToLower(fileName)
 	switch {
 	case strings.HasSuffix(lower, ".runar.sol"):
@@ -82,6 +95,27 @@ func ParseSource(source []byte, fileName string) *ParseResult {
 	default:
 		return Parse(source, fileName)
 	}
+}
+
+// Directive markers for the fail-closed guard. Word-boundary anchored to
+// mirror the TypeScript compiler's `/@sighash\b/` / `/@embedAlways\b/` scans,
+// so an identifier like `sighashType` does not trip the guard.
+var (
+	sighashDirectiveRE     = regexp.MustCompile(`@sighash\b`)
+	embedAlwaysDirectiveRE = regexp.MustCompile(`@embedAlways\b`)
+)
+
+// unsupportedDirectiveError returns a non-empty diagnostic message when the
+// source carries a `@sighash` (#123) or `@embedAlways` (#109) directive that
+// this compiler does not yet honour, or "" when the source is clean.
+func unsupportedDirectiveError(source []byte) string {
+	if sighashDirectiveRE.Match(source) {
+		return "@sighash directive is not yet supported by the Go compiler (issue #123); compile the contract with the TypeScript compiler"
+	}
+	if embedAlwaysDirectiveRE.Match(source) {
+		return "@embedAlways directive is not yet supported by the Go compiler (issue #109); compile the contract with the TypeScript compiler"
+	}
+	return ""
 }
 
 // Parse parses a TypeScript source string and extracts the Rúnar contract AST.

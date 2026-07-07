@@ -60,6 +60,15 @@ fn detectFormat(path: []const u8) FileFormat {
 }
 
 fn parseSource(work: std.mem.Allocator, source: []const u8, file_name: []const u8) struct { contract: ?types.ContractNode, errors: []const []const u8 } {
+    // Fail-closed guard: reject the `@sighash` (#123) / `@embedAlways` (#109)
+    // comment directives that only the TypeScript compiler honours today.
+    if (input_limits.containsDirectiveToken(source, "@sighash")) {
+        return .{ .contract = null, .errors = &.{input_limits.SIGHASH_DIRECTIVE_ERROR} };
+    }
+    if (input_limits.containsDirectiveToken(source, "@embedAlways")) {
+        return .{ .contract = null, .errors = &.{input_limits.EMBED_ALWAYS_DIRECTIVE_ERROR} };
+    }
+
     const format = detectFormat(file_name);
     return switch (format) {
         .runar_zig => blk: {

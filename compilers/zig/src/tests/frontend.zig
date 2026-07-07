@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const compiler_api = @import("../compiler_api.zig");
+const input_limits = @import("../frontend/input_limits.zig");
 const types = @import("../ir/types.zig");
 const parse_ts = @import("../passes/parse_ts.zig");
 const parse_sol = @import("../passes/parse_sol.zig");
@@ -560,4 +561,44 @@ test "frontend: compileSource end-to-end for every non-Zig parser produces hex" 
         defer std.testing.allocator.free(hex);
         try std.testing.expect(hex.len > 0);
     }
+}
+
+// The @sighash (#123) and @embedAlways (#109) comment directives are
+// implemented only in the TypeScript compiler. The Zig compiler must fail
+// closed rather than silently drop them.
+
+test "frontend guard: @sighash directive is rejected (fail closed)" {
+    const src =
+        \\class Counter extends SmartContract {
+        \\  readonly x: bigint;
+        \\  constructor(x: bigint) { super(x); this.x = x; }
+        \\  /** @sighash SINGLE|FORKID */
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    const result = compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.ts");
+    try std.testing.expectError(error.ParseFailed, result);
+}
+
+test "frontend guard: @embedAlways directive is rejected (fail closed)" {
+    const src =
+        \\class Counter extends SmartContract {
+        \\  /** @embedAlways */
+        \\  readonly x: bigint;
+        \\  constructor(x: bigint) { super(x); this.x = x; }
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    const result = compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.ts");
+    try std.testing.expectError(error.ParseFailed, result);
+}
+
+test "frontend guard: word boundary — sighashType identifier does not trip" {
+    // Directive present → detected.
+    try std.testing.expect(input_limits.containsDirectiveToken("/** @sighash ALL */", "@sighash"));
+    try std.testing.expect(input_limits.containsDirectiveToken("// @embedAlways\n", "@embedAlways"));
+    // Word-boundary: an identifier that merely starts with the marker text
+    // must NOT be flagged.
+    try std.testing.expect(!input_limits.containsDirectiveToken("readonly sighashType: bigint;", "@sighash"));
+    try std.testing.expect(!input_limits.containsDirectiveToken("@sighashTag", "@sighash"));
 }

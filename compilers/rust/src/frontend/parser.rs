@@ -1641,6 +1641,20 @@ pub fn parse_source(source: &str, file_name: Option<&str>) -> ParseResult {
             source_size_err: Some(sse),
         };
     }
+    // Fail-closed guard for the author-facing comment directives that only
+    // the TypeScript compiler implements today: `@sighash <FLAGS>` (#123,
+    // per-method sighash type) and `@embedAlways` (#109, readonly-field DCE
+    // opt-out). The Rust frontend ignores comments, so it would silently drop
+    // these directives and change signing / DCE semantics. Reject rather than
+    // diverge until the ports land.
+    if let Some(msg) = unsupported_directive_error(source) {
+        return ParseResult {
+            contract: None,
+            errors: vec![Diagnostic::error(msg.to_string(), None)],
+            source_size_err: None,
+        };
+    }
+
     let name = file_name.unwrap_or("contract.ts");
     if name.ends_with(".runar.sol") {
         return super::parser_sol::parse_solidity(source, file_name);
@@ -1670,6 +1684,43 @@ pub fn parse_source(source: &str, file_name: Option<&str>) -> ParseResult {
     parse(source, file_name)
 }
 
+/// Report the first unsupported author-facing comment directive in `source`,
+/// or `None` when the source is clean. Word-boundary matched to mirror the
+/// TypeScript compiler's `/@sighash\b/` / `/@embedAlways\b/` scans so an
+/// identifier like `sighashType` does not trip the guard.
+fn unsupported_directive_error(source: &str) -> Option<&'static str> {
+    if contains_directive_token(source, "@sighash") {
+        return Some(
+            "@sighash directive is not yet supported by the Rust compiler (issue #123); \
+             compile the contract with the TypeScript compiler",
+        );
+    }
+    if contains_directive_token(source, "@embedAlways") {
+        return Some(
+            "@embedAlways directive is not yet supported by the Rust compiler (issue #109); \
+             compile the contract with the TypeScript compiler",
+        );
+    }
+    None
+}
+
+/// True when `marker` (which begins with a non-word `@`) appears in `source`
+/// followed by a word boundary — i.e. the next byte is not `[A-Za-z0-9_]`.
+fn contains_directive_token(source: &str, marker: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = source[start..].find(marker) {
+        let after = start + pos + marker.len();
+        let boundary =
+            after >= bytes.len() || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+        if boundary {
+            return true;
+        }
+        start += pos + 1;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1677,6 +1728,62 @@ pub fn parse_source(source: &str, file_name: Option<&str>) -> ParseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_source_rejects_sighash_directive() {
+        let src = r#"
+            class Counter extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); }
+                /** @sighash SINGLE|FORKID */
+                public unlock() {}
+            }
+        "#;
+        let result = parse_source(src, Some("Counter.runar.ts"));
+        assert!(!result.errors.is_empty(), "expected fail-closed error for @sighash");
+        let joined = result.error_strings().join("\n");
+        assert!(
+            joined.contains("@sighash") && joined.contains("#123"),
+            "expected @sighash/#123 fail-closed error, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_parse_source_rejects_embed_always_directive() {
+        let src = r#"
+            class Counter extends SmartContract {
+                /** @embedAlways */
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); }
+                public unlock() {}
+            }
+        "#;
+        let result = parse_source(src, Some("Counter.runar.ts"));
+        assert!(!result.errors.is_empty(), "expected fail-closed error for @embedAlways");
+        let joined = result.error_strings().join("\n");
+        assert!(
+            joined.contains("@embedAlways") && joined.contains("#109"),
+            "expected @embedAlways/#109 fail-closed error, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_parse_source_allows_non_directive_identifier() {
+        // A field named `sighashType` must NOT trip the word-boundary guard.
+        let src = r#"
+            class Counter extends SmartContract {
+                readonly sighashType: bigint;
+                constructor(sighashType: bigint) { super(sighashType); }
+                public unlock() {}
+            }
+        "#;
+        let result = parse_source(src, Some("Counter.runar.ts"));
+        assert!(
+            !result.error_strings().iter().any(|m| m.contains("not yet supported")),
+            "directive guard tripped on a non-directive identifier: {:?}",
+            result.error_strings()
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Basic P2PKH contract

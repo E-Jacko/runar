@@ -19,6 +19,7 @@ const ec_optimizer = @import("passes/ec_optimizer.zig");
 const stack_lower = @import("passes/stack_lower.zig");
 const peephole = @import("passes/peephole.zig");
 const emit = @import("codegen/emit.zig");
+const input_limits = @import("frontend/input_limits.zig");
 
 const CompileOptions = struct {
     emit_ir: bool = false,
@@ -275,6 +276,14 @@ fn compileFromSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8,
     const work_allocator = arena.allocator();
 
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, work_allocator, .limited(1 * 1024 * 1024));
+
+    // Pass 0.5: Fail-closed guard for the `@sighash` (#123) / `@embedAlways`
+    // (#109) comment directives that only the TypeScript compiler honours
+    // today. The Zig frontend ignores comments, so it would silently drop them.
+    if (input_limits.unsupportedDirectiveError(source)) |msg| {
+        std.debug.print("  parse error: {s}\n", .{msg});
+        return error.ParseFailed;
+    }
 
     const format = detectFormat(path);
 

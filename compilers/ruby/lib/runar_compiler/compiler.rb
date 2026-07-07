@@ -128,6 +128,20 @@ module RunarCompiler
     require_relative "frontend/input_limits"
     Frontend::InputLimits.assert_source_bytes_under_limit(source)
 
+    # Fail-closed guard for the author-facing comment directives that only the
+    # TypeScript compiler implements today: +@sighash <FLAGS>+ (#123, per-method
+    # sighash type) and +@embedAlways+ (#109, readonly-field DCE opt-out). Ruby
+    # ignores comments, so it would silently drop them and change signing / DCE
+    # semantics. Reject rather than diverge until the ports land.
+    directive_error = _unsupported_directive_error(source)
+    unless directive_error.nil?
+      require_relative "frontend/parse_result"
+      require_relative "frontend/diagnostic"
+      return Frontend::ParseResult.new(errors: [
+        Frontend::Diagnostic.new(message: directive_error, severity: Frontend::Severity::ERROR),
+      ])
+    end
+
     lower = file_name.downcase
     if lower.end_with?(".runar.py")
       require_relative "frontend/parser_python"
@@ -163,6 +177,21 @@ module RunarCompiler
     end
   end
   private_class_method :_parse_source
+
+  # Detect the first unsupported author-facing comment directive in +source+,
+  # or nil when the source is clean. Word-boundary matched (\b) to mirror the
+  # TypeScript compiler's +/@sighash\b/+ / +/@embedAlways\b/+ scans so an
+  # identifier like +sighashType+ does not trip the guard.
+  def self._unsupported_directive_error(source)
+    if source =~ /@sighash\b/
+      "@sighash directive is not yet supported by the Ruby compiler " \
+        "(issue #123); compile the contract with the TypeScript compiler"
+    elsif source =~ /@embedAlways\b/
+      "@embedAlways directive is not yet supported by the Ruby compiler " \
+        "(issue #109); compile the contract with the TypeScript compiler"
+    end
+  end
+  private_class_method :_unsupported_directive_error
 
   # Run validation on a parsed ContractNode.
   def self._validate(contract)
