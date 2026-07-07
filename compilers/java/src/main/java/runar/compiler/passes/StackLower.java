@@ -1,5 +1,6 @@
 package runar.compiler.passes;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -876,7 +877,7 @@ public final class StackLower {
             } else if (v instanceof If iv) {
                 lowerIf(name, iv.cond(), iv.thenBranch(), iv.elseBranch(), idx, lastUses, false);
             } else if (v instanceof Loop l) {
-                lowerLoop(name, l.count(), l.body(), l.iterVar(), idx, lastUses);
+                lowerLoop(name, l.count(), l.body(), l.iterVar(), l.start(), l.step(), idx, lastUses);
             } else if (v instanceof Assert a) {
                 lowerAssert(a.value(), idx, lastUses, false);
             } else if (v instanceof UpdateProp up) {
@@ -2177,6 +2178,7 @@ public final class StackLower {
         // ---------------- loop ----------------
 
         void lowerLoop(String bindingName, int count, List<AnfBinding> body, String iterVar,
+                       BigInteger start, int step,
                        Integer loopBindingIndex, Map<String, Integer> enclosingLastUses) {
             // Names (re)defined anywhere inside the loop body, nested branches
             // included. A name the body itself binds is NOT an outer ref —
@@ -2209,7 +2211,13 @@ public final class StackLower {
             localBindings = newLocal;
 
             for (int i = 0; i < count; i++) {
-                emitOp(new PushOp(PushValue.of(i)));
+                // Push the iteration variable value (in case the loop body uses
+                // it). Iteration `i` binds `start + i*step` (issue #121);
+                // zero-start counting-up loops (start=0, step=1) reduce to
+                // BigInteger.valueOf(i), preserving the historical byte-for-byte
+                // lowering.
+                emitOp(new PushOp(PushValue.of(
+                    start.add(BigInteger.valueOf((long) i * step)))));
                 sm.push(iterVar);
                 Map<String, Integer> lastUses = computeLastUses(body);
 

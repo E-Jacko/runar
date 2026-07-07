@@ -747,14 +747,17 @@ public final class AnfLower {
         }
 
         void lowerForStatement(ForStatement stmt) {
-            int count = extractLoopCount(stmt);
+            // Resolve the loop's compile-time shape: start value, step
+            // direction, and iteration count. Rúnar requires bounded loops, so
+            // all three must be statically determinable (issue #121).
+            LoopShape shape = extractLoopShape(stmt);
 
             LowerCtx bodyCtx = subContext();
             bodyCtx.lowerStatements(stmt.body());
             syncCounter(bodyCtx);
 
             String iterVar = stmt.init() != null ? stmt.init().name() : "";
-            emit(new Loop(count, bodyCtx.bindings, iterVar));
+            emit(new Loop(shape.count, bodyCtx.bindings, iterVar, shape.start, shape.step));
         }
 
         // -----------------------------------------------------------
@@ -1507,47 +1510,93 @@ public final class AnfLower {
     // Loop count extraction
     // ------------------------------------------------------------------
 
-    private static int extractLoopCount(ForStatement stmt) {
-        // The ANF loop node carries only the count — no start value or step
-        // direction — so lowering (and the ANF interpreter) always iterates
-        // i = 0..count-1. Loop shapes that representation cannot express are
-        // rejected here (mirroring the source-located errors in Validate)
-        // rather than silently compiled as a zero-start counting-up loop.
-        //
-        // A countdown loop necessarily also has a non-zero start, so check the
-        // condition direction first — it is the more precise diagnosis.
-        if (stmt.condition() instanceof BinaryExpr be) {
-            String op = be.op().canonical();
-            if (op.equals(">") || op.equals(">=")) {
-                throw new IllegalStateException(
-                    "For loop condition must count up with '<' or '<=' — countdown loops are "
-                        + "not supported; iterate i = 0..N-1 and index backwards instead.");
-            }
-        }
+    /** Compile-time loop shape resolved from a for-statement (issue #121). */
+    private record LoopShape(BigInteger start, int step, int count) {}
 
-        BigInteger startVal = null;
-        if (stmt.init() != null) {
-            startVal = extractBigintValue(stmt.init().init());
-        }
-
-        if (startVal != null && startVal.signum() != 0) {
+    /**
+     * Resolve a for-statement's compile-time loop shape (issue #121).
+     *
+     * <p>Supports counting-up and counting-down loops:
+     * <pre>
+     *   for (i = 0; i &lt; 10; i++)   -&gt; start 0, step +1, count 10
+     *   for (i = 1; i &lt;= 3; i++)   -&gt; start 1, step +1, count 3
+     *   for (i = 3; i &gt; 0; i--)    -&gt; start 3, step -1, count 3
+     *   for (i = 3; i &gt;= 1; i--)   -&gt; start 3, step -1, count 3
+     * </pre>
+     *
+     * <p>The loop is unrolled {@code count} times; on iteration {@code i} the
+     * iterator holds {@code start + i * step}. Start and bound must be
+     * compile-time integer literals.
+     */
+    private static LoopShape extractLoopShape(ForStatement stmt) {
+        BigInteger start = stmt.init() != null ? extractBigintValue(stmt.init().init()) : null;
+        if (start == null) {
             throw new IllegalStateException(
-                "For loop iterator must start at 0 (got " + startVal + "n) — loops compile "
-                    + "to i = 0..count-1; offset the iterator inside the body instead.");
+                "Cannot determine loop start at compile time. For-loop iterators must start at "
+                    + "an integer literal.");
         }
 
-        if (stmt.condition() instanceof BinaryExpr be) {
-            String op = be.op().canonical();
-            BigInteger boundVal = extractBigintValue(be.right());
-            if (boundVal != null) {
-                return switch (op) {
-                    case "<" -> Math.max(0, boundVal.intValue());
-                    case "<=" -> Math.max(0, boundVal.add(BigInteger.ONE).intValue());
-                    default -> 0;
-                };
+        if (!(stmt.condition() instanceof BinaryExpr be)) {
+            throw new IllegalStateException(
+                "Cannot determine loop bound at compile time. For-loop bounds must be integer "
+                    + "literals.");
+        }
+        String op = be.op().canonical();
+        BigInteger bound = extractBigintValue(be.right());
+        if (bound == null) {
+            throw new IllegalStateException(
+                "Cannot determine loop bound at compile time. For-loop bounds must be integer "
+                    + "literals.");
+        }
+
+        int step = extractLoopStep(stmt);
+
+        // Count = number of iterations before the condition first turns false.
+        BigInteger count;
+        if (step == 1) {
+            if (op.equals("<")) {
+                count = bound.subtract(start);
+            } else if (op.equals("<=")) {
+                count = bound.subtract(start).add(BigInteger.ONE);
+            } else {
+                throw new IllegalStateException(
+                    "For loop counting up (i++) must use '<' or '<=' (got '" + op + "').");
+            }
+        } else {
+            if (op.equals(">")) {
+                count = start.subtract(bound);
+            } else if (op.equals(">=")) {
+                count = start.subtract(bound).add(BigInteger.ONE);
+            } else {
+                throw new IllegalStateException(
+                    "For loop counting down (i--) must use '>' or '>=' (got '" + op + "').");
             }
         }
-        return 0;
+
+        int c = count.signum() <= 0 ? 0 : count.intValueExact();
+        return new LoopShape(start, step, c);
+    }
+
+    /**
+     * Determine the iterator step direction (+1 / -1) from the for-statement's
+     * update clause, falling back to the condition direction (issue #121). Only
+     * unit steps are supported; a non-unit update (e.g. {@code i += 2}) is out
+     * of the loop model.
+     */
+    private static int extractLoopStep(ForStatement stmt) {
+        Statement update = stmt.update();
+        if (update instanceof ExpressionStatement es) {
+            Expression e = es.expression();
+            if (e instanceof IncrementExpr) return 1;
+            if (e instanceof DecrementExpr) return -1;
+        }
+        // Fall back to the comparison direction for other unit-step spellings
+        // (e.g. `i = i + 1`): `<`/`<=` counts up, `>`/`>=` counts down.
+        if (stmt.condition() instanceof BinaryExpr be) {
+            String op = be.op().canonical();
+            if (op.equals(">") || op.equals(">=")) return -1;
+        }
+        return 1;
     }
 
     private static BigInteger extractBigintValue(Expression expr) {
@@ -1761,7 +1810,7 @@ public final class AnfLower {
             return new If(mapOr(ifv.cond(), nameMap), ifv.thenBranch(), ifv.elseBranch());
         }
         if (value instanceof Loop lp) {
-            return new Loop(lp.count(), lp.body(), lp.iterVar());
+            return new Loop(lp.count(), lp.body(), lp.iterVar(), lp.start(), lp.step());
         }
         if (value instanceof Assert asv) {
             return new Assert(mapOr(asv.value(), nameMap));

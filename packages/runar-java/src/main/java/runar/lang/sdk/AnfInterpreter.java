@@ -700,10 +700,17 @@ public final class AnfInterpreter {
             case "loop": {
                 long count = toBigInt(value.get("count")).longValueExact();
                 String iterVar = (String) value.getOrDefault("iterVar", "");
+                // Iteration `i` binds `iterVar = start + i*step` (issue #121).
+                // Older ANF payloads without start/step describe zero-start
+                // counting-up loops.
+                BigInteger start = value.containsKey("start")
+                    ? toBigInt(value.get("start")) : BigInteger.ZERO;
+                BigInteger step = value.containsKey("step")
+                    ? toBigInt(value.get("step")) : BigInteger.ONE;
                 List<Map<String, Object>> body = listOfObjects(value.get("body"));
                 Object lastVal = null;
                 for (long i = 0; i < count; i++) {
-                    env.put(iterVar, BigInteger.valueOf(i));
+                    env.put(iterVar, start.add(step.multiply(BigInteger.valueOf(i))));
                     Map<String, Object> loopEnv = new LinkedHashMap<>(env);
                     evalBindings(anf, body, loopEnv, stateDelta, dataOutputs, rawOutputs, strict, realCrypto, witness, methodName, continuationTaint);
                     env.putAll(loopEnv);
