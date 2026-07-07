@@ -352,100 +352,134 @@
         {
           "name": "t29",
           "value": {
-            "args": [
-              "t27",
-              "t28"
-            ],
-            "func": "buildChangeOutput",
-            "kind": "call"
+            "kind": "load_const",
+            "value": 0
           }
         },
         {
           "name": "t30",
           "value": {
-            "kind": "get_state_script"
-          }
-        },
-        {
-          "name": "t31",
-          "value": {
-            "kind": "load_param",
-            "name": "txPreimage"
-          }
-        },
-        {
-          "name": "t32",
-          "value": {
-            "kind": "load_param",
-            "name": "_newAmount"
+            "kind": "bin_op",
+            "left": "t28",
+            "op": "!==",
+            "right": "t29"
           }
         },
         {
           "name": "t33",
           "value": {
-            "args": [
-              "t31",
-              "t30",
-              "t32"
+            "cond": "t30",
+            "else": [
+              {
+                "name": "t32",
+                "value": {
+                  "kind": "load_const",
+                  "value": ""
+                }
+              }
             ],
-            "func": "computeStateOutput",
-            "kind": "call"
+            "kind": "if",
+            "then": [
+              {
+                "name": "t31",
+                "value": {
+                  "args": [
+                    "t27",
+                    "t28"
+                  ],
+                  "func": "buildChangeOutput",
+                  "kind": "call"
+                }
+              }
+            ]
           }
         },
         {
           "name": "t34",
           "value": {
-            "args": [
-              "t33",
-              "t29"
-            ],
-            "func": "cat",
-            "kind": "call"
+            "kind": "get_state_script"
           }
         },
         {
           "name": "t35",
           "value": {
-            "args": [
-              "t34"
-            ],
-            "func": "hash256",
-            "kind": "call"
+            "kind": "load_param",
+            "name": "txPreimage"
           }
         },
         {
           "name": "t36",
           "value": {
             "kind": "load_param",
-            "name": "txPreimage"
+            "name": "_newAmount"
           }
         },
         {
           "name": "t37",
           "value": {
             "args": [
+              "t35",
+              "t34",
               "t36"
             ],
-            "func": "extractOutputHash",
+            "func": "computeStateOutput",
             "kind": "call"
           }
         },
         {
           "name": "t38",
           "value": {
-            "kind": "bin_op",
-            "left": "t35",
-            "op": "===",
-            "result_type": "bytes",
-            "right": "t37"
+            "args": [
+              "t37",
+              "t33"
+            ],
+            "func": "cat",
+            "kind": "call"
           }
         },
         {
           "name": "t39",
           "value": {
+            "args": [
+              "t38"
+            ],
+            "func": "hash256",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t40",
+          "value": {
+            "kind": "load_param",
+            "name": "txPreimage"
+          }
+        },
+        {
+          "name": "t41",
+          "value": {
+            "args": [
+              "t40"
+            ],
+            "func": "extractOutputHash",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t42",
+          "value": {
+            "kind": "bin_op",
+            "left": "t39",
+            "op": "===",
+            "result_type": "bytes",
+            "right": "t41"
+          }
+        },
+        {
+          "name": "t43",
+          "value": {
             "isAutoInjectedStateCheck": true,
             "kind": "assert",
-            "value": "t38"
+            "value": "t42"
           }
         }
       ],

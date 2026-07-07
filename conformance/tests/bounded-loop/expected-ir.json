@@ -107,7 +107,9 @@
             ],
             "count": 5,
             "iterVar": "i",
-            "kind": "loop"
+            "kind": "loop",
+            "start": 0,
+            "step": 1
           }
         },
         {

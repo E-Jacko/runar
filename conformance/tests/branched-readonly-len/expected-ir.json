@@ -335,68 +335,102 @@
         {
           "name": "t33",
           "value": {
-            "args": [
-              "t31",
-              "t32"
-            ],
-            "func": "buildChangeOutput",
-            "kind": "call"
+            "kind": "load_const",
+            "value": 0
           }
         },
         {
           "name": "t34",
           "value": {
+            "kind": "bin_op",
+            "left": "t32",
+            "op": "!==",
+            "right": "t33"
+          }
+        },
+        {
+          "name": "t37",
+          "value": {
+            "cond": "t34",
+            "else": [
+              {
+                "name": "t36",
+                "value": {
+                  "kind": "load_const",
+                  "value": ""
+                }
+              }
+            ],
+            "kind": "if",
+            "then": [
+              {
+                "name": "t35",
+                "value": {
+                  "args": [
+                    "t31",
+                    "t32"
+                  ],
+                  "func": "buildChangeOutput",
+                  "kind": "call"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "t38",
+          "value": {
             "args": [
               "t30",
-              "t33"
+              "t37"
             ],
             "func": "cat",
             "kind": "call"
           }
         },
         {
-          "name": "t35",
+          "name": "t39",
           "value": {
             "args": [
-              "t34"
+              "t38"
             ],
             "func": "hash256",
             "kind": "call"
           }
         },
         {
-          "name": "t36",
+          "name": "t40",
           "value": {
             "kind": "load_param",
             "name": "txPreimage"
           }
         },
         {
-          "name": "t37",
+          "name": "t41",
           "value": {
             "args": [
-              "t36"
+              "t40"
             ],
             "func": "extractOutputHash",
             "kind": "call"
           }
         },
         {
-          "name": "t38",
+          "name": "t42",
           "value": {
             "kind": "bin_op",
-            "left": "t35",
+            "left": "t39",
             "op": "===",
             "result_type": "bytes",
-            "right": "t37"
+            "right": "t41"
           }
         },
         {
-          "name": "t39",
+          "name": "t43",
           "value": {
             "isAutoInjectedStateCheck": true,
             "kind": "assert",
-            "value": "t38"
+            "value": "t42"
           }
         }
       ],
