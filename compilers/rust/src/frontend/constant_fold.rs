@@ -473,6 +473,8 @@ fn fold_value(value: &ANFValue, env: &mut ConstEnv) -> ANFValue {
             count,
             body,
             iter_var,
+            start,
+            step,
         } => {
             let mut body_env = env_clone(env);
             let folded_body = fold_bindings(body, &mut body_env);
@@ -480,6 +482,8 @@ fn fold_value(value: &ANFValue, env: &mut ConstEnv) -> ANFValue {
                 count: *count,
                 body: folded_body,
                 iter_var: iter_var.clone(),
+                start: start.clone(),
+                step: *step,
             }
         }
 
@@ -1029,6 +1033,8 @@ mod tests {
                 count: 5,
                 body: vec![b("t3", bin_op("+", "t0", "t1"))],
                 iter_var: "i".to_string(),
+                start: serde_json::json!(0),
+                step: 1,
             }),
         ])]);
         let r = fold_constants_only(&p);

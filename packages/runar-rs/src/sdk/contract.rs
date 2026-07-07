@@ -13,7 +13,8 @@ use super::deployment::{
     build_p2pkh_script_from_address, encode_varint,
     to_little_endian_32, to_little_endian_64, reverse_hex,
 };
-use super::calling::{build_call_transaction_ext, CallTxOptions, ContractOutput, AdditionalContractInput};
+use super::calling::{build_call_transaction_ext, resolve_input_sequence, CallTxOptions, ContractOutput, AdditionalContractInput};
+use super::script_utils::extract_constructor_args;
 use super::provider::Provider;
 use super::signer::Signer;
 use super::errors::{assert_script_hex_under_limit, WitnessValueMissingError, MAX_SCRIPT_BYTES};
@@ -383,12 +384,19 @@ impl RunarContract {
             Some(fee_rate),
         );
 
-        // Sign all inputs
+        // Sign all inputs. Funding inputs are signed by funding_signer when set
+        // (issue #134): the deploy signer may not own the funding coins.
+        // Defaults to the connected signer.
+        let funding_signer: &dyn Signer = options
+            .funding_signer
+            .as_ref()
+            .map(|fs| fs.as_signer())
+            .unwrap_or(signer);
         let mut signed_tx = tx_hex;
         for i in 0..input_count {
             let utxo = &utxos[i];
-            let sig = signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
-            let pub_key = signer.get_public_key()?;
+            let sig = funding_signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
+            let pub_key = funding_signer.get_public_key()?;
             // Build P2PKH unlocking script: <sig> <pubkey>
             let unlock_script = format!("{}{}", encode_push_data(&sig), encode_push_data(&pub_key));
             signed_tx = insert_unlocking_script(&signed_tx, i, &unlock_script)?;
@@ -807,10 +815,54 @@ impl RunarContract {
         let change_script_str = build_p2pkh_script_from_address(change_address);
         let all_funding_utxos = provider.get_utxos(&address).unwrap_or_default();
         // Filter out the contract UTXO from funding UTXOs to avoid duplicate inputs
-        let additional_utxos: Vec<Utxo> = all_funding_utxos
+        let candidate_funding_utxos: Vec<Utxo> = all_funding_utxos
             .into_iter()
             .filter(|u| !(u.txid == current_utxo.txid && u.output_index == current_utxo.output_index))
             .collect();
+
+        // Coin selection for funding inputs (issue #133): don't sweep the whole
+        // wallet. Compute how much the funding must cover — the contract's own
+        // input value already offsets the contract/data outputs — and pick the
+        // smallest largest-first set via select_utxos (the strategy deploy uses).
+        let contract_output_base: i64 = match &contract_outputs {
+            Some(cos) => cos.iter().map(|o| o.satoshis).sum(),
+            None => new_satoshis.unwrap_or(0),
+        };
+        let contract_output_sats =
+            contract_output_base + resolved_data_outputs.iter().map(|o| o.satoshis).sum::<i64>();
+        let contract_input_sats =
+            current_utxo.satoshis + extra_contract_utxos.iter().map(|u| u.satoshis).sum::<i64>();
+        let funding_target = (contract_output_sats - contract_input_sats).max(0);
+        // Fee sizing hint for select_utxos: the continuation script length
+        // (falls back to the first multi-output script, else 0 for stateless).
+        let funding_lock_len = new_locking_script
+            .as_ref()
+            .map(|s| s.len())
+            .or_else(|| contract_outputs.as_ref().and_then(|c| c.first()).map(|o| o.script.len()))
+            .unwrap_or(0)
+            / 2;
+        let additional_utxos: Vec<Utxo> = if candidate_funding_utxos.is_empty() {
+            Vec::new()
+        } else {
+            select_utxos(&candidate_funding_utxos, funding_target, funding_lock_len, Some(fee_rate))
+        };
+
+        // Cap funding inputs when the caller sets max_funding_inputs.
+        // select_utxos returns the minimal largest-first set; if that still
+        // exceeds the cap the funding can't cover outputs + fee within the
+        // budget, so fail loudly instead of broadcasting an underfunded tx.
+        if let Some(cap) = options.and_then(|o| o.max_funding_inputs) {
+            if additional_utxos.len() > cap {
+                return Err(format!(
+                    "RunarContract.call({}): funding requires {} input(s) but \
+                     max_funding_inputs={}. Increase max_funding_inputs, use \
+                     larger UTXOs, or consolidate.",
+                    method_name,
+                    additional_utxos.len(),
+                    cap
+                ));
+            }
+        }
 
         // Resolve per-input args for additional contract inputs (same Sig/PubKey/ByteString handling as primary args)
         let resolved_per_input_args: Option<Vec<Vec<SdkValue>>> = options
@@ -878,6 +930,9 @@ impl RunarContract {
             // asserting `extractLocktime(preimage)` can succeed. Default `None` → `0`
             // (legacy behavior preserved).
             locktime: options.and_then(|o| o.locktime),
+            // Thread `CallOptions.sequence` (issue #131): a non-zero locktime
+            // needs non-final input sequences or consensus ignores nLockTime.
+            sequence: options.and_then(|o| o.sequence),
         };
 
         let (tx_hex, input_count, mut change_amount) = build_call_transaction_ext(
@@ -896,13 +951,21 @@ impl RunarContract {
             Some(&call_tx_options),
         );
 
+        // Funding inputs are signed by funding_signer when set (issue #134):
+        // the method signer may not own the funding coins. The method's own Sig
+        // args stay with the connected signer. Defaults to the connected signer.
+        let funding_signer: &dyn Signer = options
+            .and_then(|o| o.funding_signer.as_ref())
+            .map(|fs| fs.as_signer())
+            .unwrap_or(signer);
+
         // Sign P2PKH funding inputs (after contract inputs)
         let mut signed_tx = tx_hex;
         let p2pkh_start_idx = 1 + extra_contract_utxos.len();
         for i in p2pkh_start_idx..input_count {
             if let Some(utxo) = additional_utxos.get(i - p2pkh_start_idx) {
-                let sig = signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
-                let pub_key = signer.get_public_key()?;
+                let sig = funding_signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
+                let pub_key = funding_signer.get_public_key()?;
                 let unlock_script = format!("{}{}", encode_push_data(&sig), encode_push_data(&pub_key));
                 signed_tx = insert_unlocking_script(&signed_tx, i, &unlock_script)?;
             }
@@ -1041,6 +1104,9 @@ impl RunarContract {
                 // on a rebuilt tx with `locktime = 0` would mismatch what
                 // `extractLocktime` sees in the final on-chain tx.
                 locktime: options.and_then(|o| o.locktime),
+                // Same for sequence — the second-pass preimage must see the
+                // final input sequences (issue #131).
+                sequence: options.and_then(|o| o.sequence),
             };
 
             let (rebuilt_tx, _, rebuilt_change) = build_call_transaction_ext(
@@ -1080,11 +1146,12 @@ impl RunarContract {
                 signed_tx = insert_unlocking_script(&signed_tx, i + 1, &final_merge_unlock)?;
             }
 
-            // Re-sign P2PKH funding inputs (outputs changed after rebuild)
+            // Re-sign P2PKH funding inputs (outputs changed after rebuild) with
+            // funding_signer — issue #134.
             for i in p2pkh_start_idx..input_count {
                 if let Some(utxo) = additional_utxos.get(i - p2pkh_start_idx) {
-                    let sig = signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
-                    let pub_key = signer.get_public_key()?;
+                    let sig = funding_signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
+                    let pub_key = funding_signer.get_public_key()?;
                     let unlock_script = format!("{}{}", encode_push_data(&sig), encode_push_data(&pub_key));
                     signed_tx = insert_unlocking_script(&signed_tx, i, &unlock_script)?;
                 }
@@ -1290,7 +1357,7 @@ impl RunarContract {
         &mut self,
         method_name: &str,
         resolved_args: &mut Vec<SdkValue>,
-        _signer: &dyn Signer,
+        signer: &dyn Signer,
         options: Option<&CallOptions>,
         terminal_outputs: &[TerminalOutput],
         current_utxo: &Utxo,
@@ -1315,6 +1382,14 @@ impl RunarContract {
         // check locktime.
         let terminal_locktime = options.and_then(|o| o.locktime).unwrap_or(0);
 
+        // Sequence (issue #131): all-final inputs make nLockTime a consensus
+        // no-op — when a non-zero locktime is set, default to 0xfffffffe so the
+        // terminal method's extractLocktime assertion is actually enforced.
+        let terminal_sequence_hex = to_little_endian_32(resolve_input_sequence(
+            options.and_then(|o| o.locktime),
+            options.and_then(|o| o.sequence),
+        ));
+
         // Build placeholder unlocking script (witness_hex suffixed for sizing
         // — the real ABI-correct unlock is built by build_unlock below for
         // stateful methods).
@@ -1334,16 +1409,33 @@ impl RunarContract {
             )
         };
 
-        // Build raw transaction: single input (contract UTXO), exact outputs
+        // Optional fee input (issue #118): a plain P2PKH UTXO consumed entirely
+        // as the miner fee for a terminal tx whose covenant asserts an exact,
+        // change-free output set.
+        let fee_utxo = options.and_then(|o| o.fee_utxo.as_ref());
+
+        // Build raw transaction: contract input (+ optional fee input), exact
+        // outputs. The fee input's outpoint is present BEFORE the OP_PUSH_TX
+        // preimage is computed so hashPrevouts covers it; its scriptSig is an
+        // empty placeholder until the tx structure is final (signed below).
         let build_terminal_tx = |unlock: &str| -> String {
             let mut tx = String::new();
             tx.push_str(&to_little_endian_32(1)); // version
-            tx.push_str(&encode_varint(1)); // 1 input
+            let num_inputs = 1 + if fee_utxo.is_some() { 1 } else { 0 };
+            tx.push_str(&encode_varint(num_inputs));
+            // Input 0: contract UTXO
             tx.push_str(&reverse_hex(&current_utxo.txid));
             tx.push_str(&to_little_endian_32(current_utxo.output_index));
             tx.push_str(&encode_varint((unlock.len() / 2) as u64));
             tx.push_str(unlock);
-            tx.push_str("ffffffff");
+            tx.push_str(&terminal_sequence_hex);
+            // Input 1 (optional): P2PKH fee input with an empty scriptSig for now.
+            if let Some(fee) = fee_utxo {
+                tx.push_str(&reverse_hex(&fee.txid));
+                tx.push_str(&to_little_endian_32(fee.output_index));
+                tx.push_str("00"); // empty scriptSig placeholder
+                tx.push_str(&terminal_sequence_hex);
+            }
             tx.push_str(&encode_varint(terminal_outputs.len() as u64));
             for out in terminal_outputs {
                 tx.push_str(&to_little_endian_64(out.satoshis));
@@ -1432,6 +1524,23 @@ impl RunarContract {
                     }
                 }
             }
+        }
+
+        // Sign the fee input (issue #118). Its BIP-143 P2PKH sighash covers only
+        // hashPrevouts / hashOutputs / its own outpoint — NOT input 0's scriptSig
+        // — so it stays valid even though input 0 was finalized above. Owned by
+        // funding_signer ?? signer (composes with #134). The fee input sits at
+        // index 1 (right after the primary contract input).
+        if let Some(fee) = fee_utxo {
+            let funding_signer: &dyn Signer = options
+                .and_then(|o| o.funding_signer.as_ref())
+                .map(|fs| fs.as_signer())
+                .unwrap_or(signer);
+            let fee_input_idx = 1;
+            let fee_sig = funding_signer.sign(&term_tx, fee_input_idx, &fee.script, fee.satoshis, None)?;
+            let fee_pubkey = funding_signer.get_public_key()?;
+            let fee_script_sig = format!("{}{}", encode_push_data(&fee_sig), encode_push_data(&fee_pubkey));
+            term_tx = insert_unlocking_script(&term_tx, fee_input_idx, &fee_script_sig)?;
         }
 
         // Compute sighash from preimage (single SHA-256)
@@ -1683,17 +1792,12 @@ impl RunarContract {
         artifact: RunarArtifact,
         utxo: &Utxo,
     ) -> Self {
-        // Dummy constructor args -- we store the on-chain code script directly
-        // so these won't be used in get_locking_script().
-        let dummy_args: Vec<SdkValue> = artifact
-            .abi
-            .constructor
-            .params
-            .iter()
-            .map(|_| SdkValue::Int(0))
-            .collect();
+        // Recover the real constructor args baked into the deployed script
+        // (issue #119). Filling zeros made restored stateful spends compute the
+        // wrong state continuation and codesep/OP_PUSH_TX offset — unspendable.
+        let restored_args = restore_constructor_args(&artifact, &utxo.script);
 
-        let mut contract = RunarContract::new(artifact, dummy_args);
+        let mut contract = RunarContract::new(artifact, restored_args);
 
         // Store the code portion of the on-chain script.
         // Use opcode-aware walking to find the real OP_RETURN (not a 0x6a
@@ -2247,6 +2351,28 @@ fn revive_json_value(value: &serde_json::Value, field_type: &str) -> SdkValue {
     }
 }
 
+/// Recover the positional constructor argument list from a deployed locking
+/// script, so a restored contract (`from_utxo` / `from_tx_id`) operates on the
+/// real baked-in values rather than `0` placeholders (issue #119).
+///
+/// `extract_constructor_args` returns a name→value map keyed by ABI param name;
+/// `abi.constructor.params` is already ordered by paramIndex, so mapping over it
+/// yields the positional list the constructor expects. Params that carry no
+/// constructor slot (mutable state fields — their value lives in the OP_RETURN
+/// state section, restored separately by `extract_state_from_script`) are absent
+/// from the map and fall back to `0`, matching the prior placeholder behaviour.
+fn restore_constructor_args(artifact: &RunarArtifact, script_hex: &str) -> Vec<SdkValue> {
+    let params = &artifact.abi.constructor.params;
+    if params.is_empty() {
+        return Vec::new();
+    }
+    let extracted = extract_constructor_args(artifact, script_hex).unwrap_or_default();
+    params
+        .iter()
+        .map(|p| extracted.get(&p.name).cloned().unwrap_or(SdkValue::Int(0)))
+        .collect()
+}
+
 /// Build a named-args map from user ABI params and resolved arg values.
 fn build_named_args(
     user_params: &[&AbiParam],
@@ -2734,6 +2860,7 @@ mod tests {
         let (txid, _tx) = contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         assert_eq!(txid.len(), 64);
@@ -2765,6 +2892,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         // Call should succeed (not throw "not deployed")
@@ -2783,6 +2911,7 @@ mod tests {
         let result = contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no UTXOs"));
@@ -2812,6 +2941,7 @@ mod tests {
         let _ = contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         });
     }
 
@@ -2860,6 +2990,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         let result = contract.call("nonexistent", &[], &mut provider, &signer, None);
@@ -2895,6 +3026,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         let result = contract.call(
@@ -3146,6 +3278,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         let payout_script = format!("76a914{}88ac", "bb".repeat(20));
@@ -3181,6 +3314,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 10_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         contract.call("spend", &[], &mut provider, &signer, Some(&CallOptions {
@@ -3217,6 +3351,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 20_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         let (txid, _) = contract.call("settle", &[], &mut provider, &signer, Some(&CallOptions {
@@ -3251,6 +3386,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         contract.call("cancel", &[], &mut provider, &signer, Some(&CallOptions {
@@ -3538,6 +3674,43 @@ mod tests {
     }
 
     #[test]
+    fn from_utxo_restores_real_constructor_args_issue_119() {
+        // A constructor param `tag` baked into a slot at byte offset 0. Restore
+        // must read the real value from the deployed script, not fill a 0
+        // placeholder (which made restored stateful spends unspendable).
+        let artifact = RunarArtifact {
+            version: "runar-v0.1.0".to_string(),
+            contract_name: "Restorable".to_string(),
+            parent_class: None,
+            abi: Abi {
+                constructor: AbiConstructor {
+                    params: vec![AbiParam {
+                        name: "tag".to_string(),
+                        param_type: "bigint".to_string(),
+                        fixed_array: None,
+                    }],
+                },
+                methods: vec![],
+            },
+            script: "0093".to_string(), // template: OP_0 placeholder + OP_ADD
+            state_fields: None,
+            constructor_slots: Some(vec![ConstructorSlot { param_index: 0, byte_offset: 0 }]),
+            code_sep_index_slots: None,
+            code_separator_index: None,
+            code_separator_indices: None,
+            anf: None,
+        };
+        // Deployed script bakes tag = 42 at the slot (push 1 byte 0x2a).
+        let reconnected = RunarContract::from_utxo(artifact, &Utxo {
+            txid: "00".repeat(32),
+            output_index: 0,
+            satoshis: 1,
+            script: "012a93".to_string(),
+        });
+        assert_eq!(reconnected.constructor_args, vec![SdkValue::Int(42)]);
+    }
+
+    #[test]
     fn from_utxo_detects_inscription_and_state_stateful() {
         let artifact = make_stateful_artifact("aabbccdd");
         let mut original = RunarContract::new(artifact.clone(), vec![SdkValue::Int(7)]);
@@ -3688,5 +3861,54 @@ mod tests {
         }
         // Only the OP_CHECKSIG (ac) after the separator remains.
         assert_eq!(subscript, "ac");
+    }
+
+    #[test]
+    fn code_sep_offset_is_byte_walked_independent_of_constructor_args_issue_132() {
+        // Issue #132: when code_script is set, the OP_CODESEPARATOR offset used
+        // for OP_PUSH_TX must be byte-walked from the real script, NOT derived
+        // from the in-memory constructor_args (which are placeholders on the
+        // restore path). Two contracts sharing the same real code_script — one
+        // with real args, one with 0 placeholders — must resolve the SAME
+        // per-method code-sep offset, so their OP_PUSH_TX scriptCode matches.
+        let artifact = RunarArtifact {
+            version: "runar-v0.1.0".to_string(),
+            contract_name: "Restorable".to_string(),
+            parent_class: Some("StatefulSmartContract".to_string()),
+            abi: Abi {
+                constructor: AbiConstructor {
+                    params: vec![AbiParam {
+                        name: "tag".to_string(),
+                        param_type: "bigint".to_string(),
+                        fixed_array: None,
+                    }],
+                },
+                methods: vec![
+                    AbiMethod { name: "bump".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
+                    AbiMethod { name: "bump_two".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
+                ],
+            },
+            // Real on-chain code with two OP_CODESEPARATORs (0xab) at byte
+            // offsets 1 and 3. A constructor slot at offset 0 would shift these
+            // under adjust_code_sep_offset, but the byte-walk ignores args.
+            script: "51ab52ab".to_string(),
+            state_fields: None,
+            constructor_slots: Some(vec![ConstructorSlot { param_index: 0, byte_offset: 0 }]),
+            code_sep_index_slots: None,
+            code_separator_index: Some(1),
+            code_separator_indices: Some(vec![1, 3]),
+            anf: None,
+        };
+
+        let mut real = RunarContract::new(artifact.clone(), vec![SdkValue::Int(500)]);
+        real.code_script = Some("51ab52ab".to_string());
+        let mut placeholder = RunarContract::new(artifact, vec![SdkValue::Int(0)]);
+        placeholder.code_script = Some("51ab52ab".to_string());
+
+        // Byte-walked offsets: method 0 -> 1, method 1 -> 3, independent of args.
+        assert_eq!(real.get_code_sep_index(0), 1);
+        assert_eq!(real.get_code_sep_index(1), 3);
+        assert_eq!(placeholder.get_code_sep_index(0), real.get_code_sep_index(0));
+        assert_eq!(placeholder.get_code_sep_index(1), real.get_code_sep_index(1));
     }
 }

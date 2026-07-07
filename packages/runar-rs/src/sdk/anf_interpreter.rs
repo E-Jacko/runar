@@ -921,6 +921,11 @@ fn eval_value(
         "loop" => {
             let count = value.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
             let iter_var = str_field(value, "iterVar");
+            // Iteration `i` binds `iterVar = start + i*step` (issue #121). Older
+            // ANF payloads without start/step describe zero-start counting-up
+            // loops. `start` may be a JSON number or a `Nn` decimal string.
+            let start = value.get("start").map(|v| json_to_val(v).to_i64()).unwrap_or(0);
+            let step = value.get("step").and_then(|v| v.as_i64()).unwrap_or(1);
             let body_json = value.get("body").and_then(|v| v.as_array());
             let mut last_val = Val::Undefined;
             if let Some(body_arr) = body_json {
@@ -928,7 +933,7 @@ fn eval_value(
                     .filter_map(|b| serde_json::from_value(b.clone()).ok())
                     .collect();
                 for i in 0..count {
-                    env.insert(iter_var.clone(), Val::Int(i));
+                    env.insert(iter_var.clone(), Val::Int(start + i * step));
                     let mut loop_env = env.clone();
                     eval_bindings(&bindings, &mut loop_env, state_delta, data_outputs, raw_outputs, anf, strict)?;
                     // Copy loop bindings back
