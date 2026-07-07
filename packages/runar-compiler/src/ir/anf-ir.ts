@@ -110,6 +110,13 @@ export interface Loop {
   count: number;
   body: ANFBinding[];
   iterVar: string;
+  // Iterator start value and step direction (issue #121). The loop is unrolled
+  // `count` times; on iteration `i` (0-based) the iterator variable holds
+  // `start + i * step`. Zero-start counting-up loops carry `start = 0n` and
+  // `step = 1`, which reproduces the historical `i = 0..count-1` lowering
+  // byte-for-byte. Countdown loops carry `step = -1`.
+  start: bigint;
+  step: 1 | -1;
 }
 
 export interface Assert {

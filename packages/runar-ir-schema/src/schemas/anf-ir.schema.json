@@ -217,7 +217,7 @@
     },
     "Loop": {
       "type": "object",
-      "required": ["kind", "count", "body", "iterVar"],
+      "required": ["kind", "count", "body", "iterVar", "start", "step"],
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "loop" },
@@ -226,7 +226,14 @@
           "type": "array",
           "items": { "$ref": "#/$defs/ANFBinding" }
         },
-        "iterVar": { "type": "string", "minLength": 1 }
+        "iterVar": { "type": "string", "minLength": 1 },
+        "start": {
+          "oneOf": [
+            { "type": "integer" },
+            { "type": "string" }
+          ]
+        },
+        "step": { "type": "integer", "enum": [1, -1] }
       }
     },
     "Assert": {

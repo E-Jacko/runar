@@ -530,11 +530,13 @@ describe('Pass 4: ANF Lower', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Unsupported loop shapes: non-zero start, countdown (issue #121 reject path)
+  // Non-zero start and countdown loop shapes (issue #121)
   // ---------------------------------------------------------------------------
 
-  describe('unsupported loop shapes', () => {
-    it('throws for a loop with a non-zero start value', () => {
+  describe('non-zero-start and countdown loop shapes', () => {
+    type LoopVal = { kind: 'loop'; count: number; start: bigint; step: 1 | -1 };
+
+    it('lowers a loop with a non-zero start value (start=1, step=+1, count=3)', () => {
       const source = `
         class C extends SmartContract {
           readonly x: bigint;
@@ -548,10 +550,17 @@ describe('Pass 4: ANF Lower', () => {
           }
         }
       `;
-      expect(() => lowerSource(source)).toThrow(/must start at 0/);
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loops = bindingsOfKind(method.body, 'loop');
+      expect(loops.length).toBe(1);
+      const loop = loops[0]!.value as LoopVal;
+      expect(loop.start).toBe(1n);
+      expect(loop.step).toBe(1);
+      expect(loop.count).toBe(3);
     });
 
-    it('throws for a countdown loop', () => {
+    it('lowers a countdown loop (start=3, step=-1, count=3)', () => {
       const source = `
         class C extends SmartContract {
           readonly x: bigint;
@@ -565,10 +574,41 @@ describe('Pass 4: ANF Lower', () => {
           }
         }
       `;
-      expect(() => lowerSource(source)).toThrow(/[Cc]ountdown/);
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loops = bindingsOfKind(method.body, 'loop');
+      expect(loops.length).toBe(1);
+      const loop = loops[0]!.value as LoopVal;
+      expect(loop.start).toBe(3n);
+      expect(loop.step).toBe(-1);
+      expect(loop.count).toBe(3);
     });
 
-    it('still lowers a zero-start counting-up loop', () => {
+    it('lowers an inclusive countdown loop (start=3, step=-1, count=3)', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 3n; i >= 1n; i--) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loops = bindingsOfKind(method.body, 'loop');
+      expect(loops.length).toBe(1);
+      const loop = loops[0]!.value as LoopVal;
+      expect(loop.start).toBe(3n);
+      expect(loop.step).toBe(-1);
+      expect(loop.count).toBe(3);
+    });
+
+    it('still lowers a zero-start counting-up loop (start=0, step=+1, count=4)', () => {
       const source = `
         class C extends SmartContract {
           readonly x: bigint;
@@ -586,7 +626,10 @@ describe('Pass 4: ANF Lower', () => {
       const method = findMethod(program, 'm');
       const loops = bindingsOfKind(method.body, 'loop');
       expect(loops.length).toBe(1);
-      expect((loops[0]!.value as { kind: 'loop'; count: number }).count).toBe(4);
+      const loop = loops[0]!.value as LoopVal;
+      expect(loop.start).toBe(0n);
+      expect(loop.step).toBe(1);
+      expect(loop.count).toBe(4);
     });
   });
 

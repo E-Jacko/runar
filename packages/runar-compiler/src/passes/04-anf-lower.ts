@@ -863,9 +863,10 @@ function lowerForStatement(
   stmt: Extract<Statement, { kind: 'for_statement' }>,
   ctx: LoweringContext,
 ): void {
-  // Extract the loop count from the for-statement.
-  // Rúnar requires bounded loops, so we try to determine the count statically.
-  const count = extractLoopCount(stmt);
+  // Resolve the loop's compile-time shape: start value, step direction, and
+  // iteration count. Rúnar requires bounded loops, so all three must be
+  // statically determinable (issue #121).
+  const { start, step, count } = extractLoopShape(stmt);
 
   // Lower body into sub-context
   const bodyCtx = ctx.subContext();
@@ -877,59 +878,88 @@ function lowerForStatement(
     count,
     body: bodyCtx.bindings,
     iterVar: stmt.init.name,
+    start,
+    step,
   });
 }
 
 /**
- * Extract a compile-time loop count from a for statement.
+ * Resolve a for-statement's compile-time loop shape (issue #121).
  *
- * Supports patterns like:
- *   for (let i = 0n; i < 10n; i++)
- *   for (let i: bigint = 0n; i < N; i++)
+ * Supports counting-up and counting-down loops:
+ *   for (let i = 0n; i < 10n; i++)     -> start 0,  step +1, count 10
+ *   for (let i = 1n; i <= 3n; i++)     -> start 1,  step +1, count 3
+ *   for (let i = 3n; i > 0n; i--)      -> start 3,  step -1, count 3
+ *   for (let i = 3n; i >= 1n; i--)     -> start 3,  step -1, count 3
  *
- * Returns the count (number of iterations). Falls back to 0 if
- * the pattern is not recognized.
- *
- * The ANF loop node carries only the count — no start value or step
- * direction — so lowering (and the ANF interpreter) always iterates
- * i = 0..count-1. Loop shapes that representation cannot express are
- * rejected here (mirroring the source-located errors in 02-validate)
- * rather than silently compiled as a zero-start counting-up loop.
+ * The loop is unrolled `count` times; on iteration `i` the iterator holds
+ * `start + i * step`. Start and bound must be compile-time integer literals.
  */
-function extractLoopCount(
+function extractLoopShape(
   stmt: Extract<Statement, { kind: 'for_statement' }>,
-): number {
-  // A countdown loop necessarily also has a non-zero start, so check the
-  // condition direction first — it is the more precise diagnosis.
-  if (stmt.condition.kind === 'binary_expr') {
-    const op = stmt.condition.op;
-    if (op === '>' || op === '>=') {
+): { start: bigint; step: 1 | -1; count: number } {
+  const start = extractBigIntValue(stmt.init.init);
+  if (start === null) {
+    throw new Error(
+      'Cannot determine loop start at compile time. For-loop iterators must start at an integer literal.',
+    );
+  }
+
+  if (stmt.condition.kind !== 'binary_expr') {
+    throw new Error('Cannot determine loop bound at compile time. For-loop bounds must be integer literals.');
+  }
+  const op = stmt.condition.op;
+  const bound = extractBigIntValue(stmt.condition.right);
+  if (bound === null) {
+    throw new Error('Cannot determine loop bound at compile time. For-loop bounds must be integer literals.');
+  }
+
+  const step = extractLoopStep(stmt);
+
+  // Count = number of iterations before the condition first turns false.
+  let count: bigint;
+  if (step === 1) {
+    if (op === '<') count = bound - start;
+    else if (op === '<=') count = bound - start + 1n;
+    else {
       throw new Error(
-        `For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead.`,
+        `For loop counting up (i${'++'}) must use '<' or '<=' (got '${op}').`,
+      );
+    }
+  } else {
+    if (op === '>') count = start - bound;
+    else if (op === '>=') count = start - bound + 1n;
+    else {
+      throw new Error(
+        `For loop counting down (i--) must use '>' or '>=' (got '${op}').`,
       );
     }
   }
 
-  // Try to extract start value
-  const startVal = extractBigIntValue(stmt.init.init);
+  return { start, step, count: Math.max(0, Number(count)) };
+}
 
-  if (startVal !== null && startVal !== 0n) {
-    throw new Error(
-      `For loop iterator must start at 0 (got ${startVal}n) — loops compile to i = 0..count-1; offset the iterator inside the body instead.`,
-    );
+/**
+ * Determine the iterator step direction (+1 / -1) from the for-statement's
+ * update clause, falling back to the condition direction. Only unit steps are
+ * supported; a non-unit update (e.g. `i += 2`) is out of the loop model.
+ */
+function extractLoopStep(
+  stmt: Extract<Statement, { kind: 'for_statement' }>,
+): 1 | -1 {
+  const update = stmt.update;
+  if (update.kind === 'expression_statement') {
+    const e = update.expression;
+    if (e.kind === 'increment_expr') return 1;
+    if (e.kind === 'decrement_expr') return -1;
   }
-
-  // Try to extract the bound from the condition
+  // Fall back to the comparison direction for other unit-step spellings
+  // (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
   if (stmt.condition.kind === 'binary_expr') {
     const op = stmt.condition.op;
-    const boundVal = extractBigIntValue(stmt.condition.right);
-    if (boundVal !== null) {
-      if (op === '<') return Math.max(0, Number(boundVal));
-      if (op === '<=') return Math.max(0, Number(boundVal) + 1);
-    }
+    if (op === '>' || op === '>=') return -1;
   }
-
-  throw new Error('Cannot determine loop bound at compile time. For-loop bounds must be integer literals.');
+  return 1;
 }
 
 function extractBigIntValue(expr: Expression): bigint | null {

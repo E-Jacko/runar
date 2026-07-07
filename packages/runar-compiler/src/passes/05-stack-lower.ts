@@ -1070,7 +1070,7 @@ class LoweringContext {
         this.lowerIf(name, value.cond, value.then, value.else, bindingIndex, lastUses);
         break;
       case 'loop':
-        this.lowerLoop(name, value.count, value.body, value.iterVar, bindingIndex, lastUses);
+        this.lowerLoop(name, value.count, value.body, value.iterVar, value.start, value.step, bindingIndex, lastUses);
         break;
       case 'assert':
         this.lowerAssert(value.value, bindingIndex, lastUses);
@@ -2208,6 +2208,8 @@ class LoweringContext {
     count: number,
     body: ANFBinding[],
     _iterVar: string,
+    start: bigint,
+    step: 1 | -1,
     loopBindingIndex?: number,
     enclosingLastUses?: Map<string, number>,
   ): void {
@@ -2241,8 +2243,11 @@ class LoweringContext {
 
     // Loops are unrolled at compile time. Repeat the body `count` times.
     for (let i = 0; i < count; i++) {
-      // Push the iteration index as a constant (in case the loop body uses it)
-      this.emitOp({ op: 'push', value: BigInt(i) });
+      // Push the iteration variable value (in case the loop body uses it).
+      // Iteration `i` binds `start + i*step` (issue #121); zero-start
+      // counting-up loops (start=0, step=1) reduce to `BigInt(i)`, preserving
+      // the historical byte-for-byte lowering.
+      this.emitOp({ op: 'push', value: start + BigInt(i) * BigInt(step) });
       this.stackMap.push(_iterVar);
 
       const lastUses = computeLastUses(body);
