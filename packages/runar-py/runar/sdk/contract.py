@@ -656,10 +656,53 @@ class RunarContract:
         change_script = build_p2pkh_script(change_address)
         all_funding_utxos = provider.get_utxos(address)
         # Filter out the contract UTXO to avoid duplicate inputs
-        additional_utxos: list[Utxo] = [
+        candidate_funding_utxos: list[Utxo] = [
             u for u in all_funding_utxos
             if not (u.txid == self._current_utxo.txid and u.output_index == self._current_utxo.output_index)
         ]
+
+        # Coin selection for funding inputs (issue #133): don't sweep the whole
+        # wallet. Compute how much the funding must cover -- the contract's own
+        # input value already offsets the contract/data outputs -- and pick the
+        # smallest largest-first set via select_utxos (the strategy deploy uses).
+        contract_output_sats = (
+            (sum(co['satoshis'] for co in contract_outputs)
+             if contract_outputs else (new_satoshis or 0))
+            + sum(do['satoshis'] for do in resolved_data_outputs)
+        )
+        contract_input_sats = (
+            self._current_utxo.satoshis
+            + sum(u.satoshis for u in extra_contract_utxos)
+        )
+        funding_target = max(0, contract_output_sats - contract_input_sats)
+        # Fee sizing hint for select_utxos: the continuation script length
+        # (falls back to the first multi-output script, else 0 for stateless).
+        if new_locking_script:
+            funding_lock_len = len(new_locking_script) // 2
+        elif contract_outputs:
+            funding_lock_len = len(contract_outputs[0]['script']) // 2
+        else:
+            funding_lock_len = 0
+        additional_utxos: list[Utxo] = (
+            select_utxos(candidate_funding_utxos, funding_target, funding_lock_len, fee_rate)
+            if candidate_funding_utxos else []
+        )
+
+        # Cap funding inputs when the caller sets max_funding_inputs. select_utxos
+        # returns the minimal largest-first set; if that still exceeds the cap the
+        # funding can't cover outputs + fee within the budget, so fail loudly
+        # instead of broadcasting an underfunded tx.
+        if (
+            options is not None
+            and options.max_funding_inputs is not None
+            and len(additional_utxos) > options.max_funding_inputs
+        ):
+            raise ValueError(
+                f"RunarContract.call({method_name}): funding requires "
+                f"{len(additional_utxos)} input(s) but "
+                f"max_funding_inputs={options.max_funding_inputs}. Increase "
+                f"max_funding_inputs, use larger UTXOs, or consolidate."
+            )
 
         # Resolve per-input args for additional contract inputs (same Sig/PubKey/ByteString handling)
         resolved_per_input_args: list[list] | None = None
