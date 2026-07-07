@@ -110,6 +110,17 @@ pub struct ANFBinding {
 // ANF value types (discriminated on `kind`)
 // ---------------------------------------------------------------------------
 
+/// Default `Loop::start` for IR payloads that predate issue #121: a zero-start
+/// counting-up loop (`i = 0..count-1`).
+fn default_loop_start() -> serde_json::Value {
+    serde_json::Value::Number(serde_json::Number::from(0))
+}
+
+/// Default `Loop::step` for IR payloads that predate issue #121: +1 (counting up).
+fn default_loop_step() -> i64 {
+    1
+}
+
 /// Discriminated union of all ANF value types.
 ///
 /// Uses `#[serde(tag = "kind")]` to match the JSON `"kind"` discriminator.
@@ -169,6 +180,18 @@ pub enum ANFValue {
         body: Vec<ANFBinding>,
         #[serde(rename = "iterVar")]
         iter_var: String,
+        // Iterator start value and step direction (issue #121). The loop is
+        // unrolled `count` times; on iteration `i` (0-based) the iterator
+        // variable holds `start + i * step`. Zero-start counting-up loops carry
+        // `start = 0` and `step = 1`, reproducing the historical
+        // `i = 0..count-1` lowering byte-for-byte. Countdown loops carry
+        // `step = -1`. Serialised as a JS-style decimal (number or `Nn`
+        // string) via `bigint_to_json`; older payloads without the fields
+        // default to a zero-start counting-up loop.
+        #[serde(default = "default_loop_start")]
+        start: serde_json::Value,
+        #[serde(default = "default_loop_step")]
+        step: i64,
     },
 
     #[serde(rename = "assert")]

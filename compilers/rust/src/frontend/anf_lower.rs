@@ -853,10 +853,11 @@ fn lower_statement(stmt: &Statement, ctx: &mut LoweringContext) {
         Statement::ForStatement {
             init,
             condition,
+            update,
             body,
             ..
         } => {
-            lower_for_statement(init, condition, body, ctx);
+            lower_for_statement(init, condition, update, body, ctx);
         }
         Statement::ExpressionStatement { expression, .. } => {
             lower_expr_to_ref(expression, ctx);
@@ -1044,11 +1045,14 @@ fn append_branch_output_concat(branch_ctx: &mut LoweringContext) -> String {
 fn lower_for_statement(
     init: &Statement,
     condition: &Expression,
+    update: &Statement,
     body: &[Statement],
     ctx: &mut LoweringContext,
 ) {
-    // Extract the loop count from the for-statement.
-    let count = extract_loop_count(init, condition);
+    // Resolve the loop's compile-time shape: start value, step direction, and
+    // iteration count. Rúnar requires bounded loops, so all three must be
+    // statically determinable (issue #121).
+    let (start, step, count) = extract_loop_shape(init, condition, update);
 
     // Extract the iterator variable name
     let iter_var = if let Statement::VariableDecl { name, .. } = init {
@@ -1066,55 +1070,92 @@ fn lower_for_statement(
         count,
         body: body_ctx.bindings,
         iter_var,
+        start: bigint_to_json(&start),
+        step,
     });
 }
 
-/// Extract a compile-time loop count from a for statement.
+/// Resolve a for-statement's compile-time loop shape (issue #121).
 ///
-/// The ANF loop node carries only the count — no start value or step
-/// direction — so lowering (and the ANF interpreter) always iterates
-/// i = 0..count-1. Loop shapes that representation cannot express are
-/// rejected here (mirroring the source-located errors in the validator)
-/// rather than silently compiled as a zero-start counting-up loop. This
-/// path is a hard guard for callers that skip validation; the normal
-/// pipeline rejects these shapes in the validate pass first.
-fn extract_loop_count(init: &Statement, condition: &Expression) -> usize {
-    // A countdown loop necessarily also has a non-zero start, so check the
-    // condition direction first — it is the more precise diagnosis.
-    if let Expression::BinaryExpr { op, .. } = condition {
-        if *op == BinaryOp::Gt || *op == BinaryOp::Ge {
-            panic!(
-                "For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead."
-            );
-        }
-    }
-
-    let start_val = if let Statement::VariableDecl { init: init_expr, .. } = init {
-        extract_bigint_value(init_expr)
-    } else {
-        None
+/// Supports counting-up and counting-down loops:
+///   for (let i = 0n; i < 10n; i++)     -> start 0,  step +1, count 10
+///   for (let i = 1n; i <= 3n; i++)     -> start 1,  step +1, count 3
+///   for (let i = 3n; i > 0n; i--)      -> start 3,  step -1, count 3
+///   for (let i = 3n; i >= 1n; i--)     -> start 3,  step -1, count 3
+///
+/// The loop is unrolled `count` times; on iteration `i` the iterator holds
+/// `start + i * step`. Start and bound must be compile-time integer literals.
+///
+/// This path is a hard guard for callers that skip validation; the normal
+/// pipeline rejects unresolvable shapes in the validate pass first.
+fn extract_loop_shape(
+    init: &Statement,
+    condition: &Expression,
+    update: &Statement,
+) -> (num_bigint::BigInt, i64, usize) {
+    let start = match init {
+        Statement::VariableDecl { init: init_expr, .. } => extract_bigint_value(init_expr),
+        _ => None,
+    };
+    let start = match start {
+        Some(s) => BigInt::from(s),
+        None => panic!(
+            "Cannot determine loop start at compile time. For-loop iterators must start at an integer literal."
+        ),
     };
 
-    if let Some(start) = start_val {
-        if start != 0 {
-            panic!(
-                "For loop iterator must start at 0 (got {}n) — loops compile to i = 0..count-1; offset the iterator inside the body instead.",
-                start
-            );
+    let (op, bound) = match condition {
+        Expression::BinaryExpr { op, right, .. } => match extract_bigint_value(right) {
+            Some(b) => (op, BigInt::from(b)),
+            None => panic!(
+                "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+            ),
+        },
+        _ => panic!(
+            "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+        ),
+    };
+
+    let step = extract_loop_step(condition, update);
+
+    // Count = number of iterations before the condition first turns false.
+    let count: BigInt = if step == 1 {
+        match op {
+            BinaryOp::Lt => &bound - &start,
+            BinaryOp::Le => &bound - &start + 1,
+            _ => panic!("For loop counting up (i++) must use '<' or '<=' (got '{:?}').", op),
+        }
+    } else {
+        match op {
+            BinaryOp::Gt => &start - &bound,
+            BinaryOp::Ge => &start - &bound + 1,
+            _ => panic!("For loop counting down (i--) must use '>' or '>=' (got '{:?}').", op),
+        }
+    };
+
+    let count = count.to_i64().unwrap_or(0).max(0) as usize;
+    (start, step, count)
+}
+
+/// Determine the iterator step direction (+1 / -1) from the for-statement's
+/// update clause, falling back to the condition direction. Only unit steps are
+/// supported; a non-unit update (e.g. `i += 2`) is out of the loop model.
+fn extract_loop_step(condition: &Expression, update: &Statement) -> i64 {
+    if let Statement::ExpressionStatement { expression, .. } = update {
+        match expression {
+            Expression::IncrementExpr { .. } => return 1,
+            Expression::DecrementExpr { .. } => return -1,
+            _ => {}
         }
     }
-
-    if let Expression::BinaryExpr { op, right, .. } = condition {
-        if let Some(bound) = extract_bigint_value(right) {
-            match op {
-                BinaryOp::Lt => return bound.max(0) as usize,
-                BinaryOp::Le => return (bound + 1).max(0) as usize,
-                _ => {}
-            }
+    // Fall back to the comparison direction for other unit-step spellings
+    // (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
+    if let Expression::BinaryExpr { op, .. } = condition {
+        if *op == BinaryOp::Gt || *op == BinaryOp::Ge {
+            return -1;
         }
     }
-
-    0
+    1
 }
 
 fn extract_bigint_value(expr: &Expression) -> Option<i128> {
@@ -2391,10 +2432,12 @@ fn remap_value_refs(value: &ANFValue, map: &HashMap<String, String>) -> ANFValue
             then: then.clone(),
             else_branch: else_branch.clone(),
         },
-        ANFValue::Loop { count, body, iter_var } => ANFValue::Loop {
+        ANFValue::Loop { count, body, iter_var, start, step } => ANFValue::Loop {
             count: *count,
             body: body.clone(),
             iter_var: iter_var.clone(),
+            start: start.clone(),
+            step: *step,
         },
     }
 }
@@ -3100,46 +3143,44 @@ class TernaryDemo extends SmartContract {
     }
 
     // -----------------------------------------------------------------------
-    // #127: extract_loop_count hard guards (for callers that skip validation)
+    // #121: extract_loop_shape — non-zero start and countdown support
     // -----------------------------------------------------------------------
 
-    /// Parse only (no validate) so the anf-lower hard guard is exercised.
+    /// Parse only (no validate) so the anf-lower loop-shape path is exercised.
     fn parse_only(source: &str) -> ContractNode {
         let result = parse_source(source, Some("test.runar.ts"));
         assert!(result.errors.is_empty(), "parse errors: {:?}", result.errors);
         result.contract.expect("expected a contract from parse")
     }
 
-    #[test]
-    #[should_panic(expected = "countdown loops are not supported")]
-    fn test_extract_loop_count_rejects_countdown() {
-        let source = r#"
-import { SmartContract } from 'runar-lang';
-
-class Countdown extends SmartContract {
-    readonly n: bigint;
-
-    constructor(n: bigint) {
-        super(n);
-        this.n = n;
-    }
-
-    public run(v: bigint) {
-        let sum = 0n;
-        for (let i = 0n; i > 3n; i--) {
-            sum += i;
+    /// Find the first `loop` node anywhere in a lowered program.
+    fn find_loop(anf: &ANFProgram) -> (usize, serde_json::Value, i64) {
+        fn walk(bindings: &[ANFBinding]) -> Option<(usize, serde_json::Value, i64)> {
+            for b in bindings {
+                match &b.value {
+                    ANFValue::Loop { count, start, step, .. } => {
+                        return Some((*count, start.clone(), *step));
+                    }
+                    ANFValue::If { then, else_branch, .. } => {
+                        if let Some(r) = walk(then).or_else(|| walk(else_branch)) {
+                            return Some(r);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
         }
-        assert(sum === v);
-    }
-}
-"#;
-        let contract = parse_only(source);
-        let _ = lower_to_anf(&contract);
+        for m in &anf.methods {
+            if let Some(r) = walk(&m.body) {
+                return r;
+            }
+        }
+        panic!("no loop node found");
     }
 
     #[test]
-    #[should_panic(expected = "must start at 0")]
-    fn test_extract_loop_count_rejects_non_zero_start() {
+    fn test_extract_loop_shape_non_zero_start() {
         let source = r#"
 import { SmartContract } from 'runar-lang';
 
@@ -3154,13 +3195,47 @@ class NonZeroStart extends SmartContract {
     public run(v: bigint) {
         let sum = 0n;
         for (let i = 1n; i < 3n; i++) {
-            sum += i;
+            sum = sum + i;
         }
         assert(sum === v);
     }
 }
 "#;
         let contract = parse_only(source);
-        let _ = lower_to_anf(&contract);
+        let anf = lower_to_anf(&contract);
+        let (count, start, step) = find_loop(&anf);
+        assert_eq!(count, 2);
+        assert_eq!(start, serde_json::json!(1));
+        assert_eq!(step, 1);
+    }
+
+    #[test]
+    fn test_extract_loop_shape_countdown() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Countdown extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 3n; i > 0n; i--) {
+            sum = sum + i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_only(source);
+        let anf = lower_to_anf(&contract);
+        let (count, start, step) = find_loop(&anf);
+        assert_eq!(count, 3);
+        assert_eq!(start, serde_json::json!(3));
+        assert_eq!(step, -1);
     }
 }

@@ -686,6 +686,8 @@ mod tests {
                                 source_loc: None,
                             }],
                             iter_var: "i".to_string(),
+                            start: serde_json::json!(0),
+                            step: 1,
                         },
                         source_loc: None,
                     },
@@ -707,10 +709,12 @@ mod tests {
         }
 
         // Verify Loop survived
-        if let ANFValue::Loop { count, body, iter_var } = &loaded.methods[0].body[2].value {
+        if let ANFValue::Loop { count, body, iter_var, start, step } = &loaded.methods[0].body[2].value {
             assert_eq!(*count, 5);
             assert_eq!(body.len(), 1);
             assert_eq!(iter_var, "i");
+            assert_eq!(*start, serde_json::json!(0));
+            assert_eq!(*step, 1);
         } else {
             panic!("expected Loop binding");
         }

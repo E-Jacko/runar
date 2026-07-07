@@ -1067,8 +1067,10 @@ impl LoweringContext {
                 count,
                 body,
                 iter_var,
+                start,
+                step,
             } => {
-                self.lower_loop(name, *count, body, iter_var, Some(binding_index), Some(last_uses));
+                self.lower_loop(name, *count, body, iter_var, start, *step, Some(binding_index), Some(last_uses));
             }
             ANFValue::Assert { value, .. } => {
                 self.lower_assert(value, binding_index, last_uses, false);
@@ -2032,9 +2034,19 @@ impl LoweringContext {
         count: usize,
         body: &[ANFBinding],
         iter_var: &str,
+        start: &serde_json::Value,
+        step: i64,
         loop_binding_index: Option<usize>,
         enclosing_last_uses: Option<&HashMap<String, usize>>,
     ) {
+        // Iteration `i` binds `iterVar = start + i*step` (issue #121).
+        // Zero-start counting-up loops (start=0, step=1) reduce to `BigInt(i)`,
+        // preserving the historical byte-for-byte lowering.
+        let start_bigint = match crate::ir::parse_const_value(start) {
+            Some(ConstValue::Int(n)) => n,
+            _ => BigInt::from(0),
+        };
+        let step_bigint = BigInt::from(step);
         // Names (re)defined anywhere inside the loop body, nested branches
         // included. A name the body itself binds is NOT an outer ref —
         // reassigned locals (e.g. `off = off + ...` inside an if) flow through
@@ -2064,7 +2076,9 @@ impl LoweringContext {
         self.local_bindings = self.local_bindings.union(&body_binding_names).cloned().collect();
 
         for i in 0..count {
-            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(i as i128))));
+            // Push the iteration variable value: start + i*step (issue #121).
+            let iter_val = &start_bigint + BigInt::from(i as i128) * &step_bigint;
+            self.emit_op(StackOp::Push(PushValue::Int(iter_val)));
             self.sm.push(iter_var);
 
             let mut last_uses = compute_last_uses(body);
@@ -5560,6 +5574,8 @@ mod tests {
                         name: "t_loop".to_string(),
                         value: ANFValue::Loop {
                             count: 3,
+                            start: serde_json::json!(0),
+                            step: 1,
                             body: vec![
                                 // Body uses x but not iter var __i, and asserts consume
                                 ANFBinding {

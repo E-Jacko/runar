@@ -5,8 +5,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use num_traits::ToPrimitive;
-
 use super::ast::*;
 use super::diagnostic::Diagnostic;
 
@@ -543,44 +541,21 @@ fn validate_statement(stmt: &Statement, errors: &mut Vec<Diagnostic>) {
             condition,
             init,
             body,
-            source_location,
             ..
         } => {
             validate_expression(condition, errors);
 
-            // Check that the loop bound is a compile-time constant
-            if let Expression::BinaryExpr { op, right, .. } = condition {
+            // Check that the loop bound is a compile-time constant. Non-zero
+            // starts and countdown loops (`i--` with `>`/`>=`) are supported:
+            // the ANF loop node carries an explicit start value and step
+            // direction (issue #121), so lowering binds `iterVar = start +
+            // i*step` on each unrolled iteration.
+            if let Expression::BinaryExpr { right, .. } = condition {
                 if !is_compile_time_constant(right) {
                     errors.push(Diagnostic::error(
                         "For loop bound must be a compile-time constant (literal or const variable)",
                         None,
                     ));
-                }
-
-                // The ANF loop node carries only an iteration count, so lowering
-                // always iterates i = 0..count-1. Reject the loop shapes that
-                // representation cannot express — a non-zero start or a countdown
-                // would otherwise be silently compiled as a zero-start counting-up
-                // loop while the interpreter runs the true source semantics.
-                if *op == BinaryOp::Gt || *op == BinaryOp::Ge {
-                    errors.push(Diagnostic::error(
-                        "For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead",
-                        Some(source_location.clone()),
-                    ));
-                }
-            }
-
-            if let Statement::VariableDecl { init: init_expr, .. } = init.as_ref() {
-                if let Some(start_val) = extract_literal_bigint(init_expr) {
-                    if start_val != 0 {
-                        errors.push(Diagnostic::error(
-                            format!(
-                                "For loop iterator must start at 0 (got {}n) — loops compile to i = 0..count-1; offset the iterator inside the body instead",
-                                start_val
-                            ),
-                            Some(source_location.clone()),
-                        ));
-                    }
                 }
             }
 
@@ -602,16 +577,6 @@ fn validate_statement(stmt: &Statement, errors: &mut Vec<Diagnostic>) {
                 validate_expression(v, errors);
             }
         }
-    }
-}
-
-fn extract_literal_bigint(expr: &Expression) -> Option<i128> {
-    match expr {
-        Expression::BigIntLiteral { value } => value.to_i128(),
-        Expression::UnaryExpr { op, operand } if *op == UnaryOp::Neg => {
-            extract_literal_bigint(operand).map(|v| -v)
-        }
-        _ => None,
     }
 }
 
@@ -1329,11 +1294,12 @@ class P2PKH extends SmartContract {
     }
 
     // -----------------------------------------------------------------------
-    // #127: reject non-zero-start and countdown loops
+    // #121: non-zero-start and countdown loops are now accepted (were rejected
+    // under the earlier count-only ANF loop node).
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_countdown_loop_gt_produces_error() {
+    fn test_countdown_loop_gt_accepted() {
         let source = r#"
 import { SmartContract } from 'runar-lang';
 
@@ -1347,8 +1313,8 @@ class Countdown extends SmartContract {
 
     public run(v: bigint) {
         let sum = 0n;
-        for (let i = 0n; i > 3n; i--) {
-            sum += i;
+        for (let i = 3n; i > 0n; i--) {
+            sum = sum + i;
         }
         assert(sum === v);
     }
@@ -1357,17 +1323,18 @@ class Countdown extends SmartContract {
         let contract = parse_contract(source);
         let result = validate(&contract);
         assert!(
-            result
+            !result
                 .errors
                 .iter()
-                .any(|e| e.message.contains("countdown loops are not supported")),
-            "expected countdown-loop error, got: {:?}",
+                .any(|e| e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")),
+            "countdown loop should be accepted (#121), got: {:?}",
             result.errors
         );
     }
 
     #[test]
-    fn test_countdown_loop_ge_produces_error() {
+    fn test_countdown_loop_ge_accepted() {
         let source = r#"
 import { SmartContract } from 'runar-lang';
 
@@ -1381,8 +1348,8 @@ class Countdown extends SmartContract {
 
     public run(v: bigint) {
         let sum = 0n;
-        for (let i = 0n; i >= 3n; i--) {
-            sum += i;
+        for (let i = 3n; i >= 1n; i--) {
+            sum = sum + i;
         }
         assert(sum === v);
     }
@@ -1391,17 +1358,18 @@ class Countdown extends SmartContract {
         let contract = parse_contract(source);
         let result = validate(&contract);
         assert!(
-            result
+            !result
                 .errors
                 .iter()
-                .any(|e| e.message.contains("countdown loops are not supported")),
-            "expected countdown-loop error, got: {:?}",
+                .any(|e| e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")),
+            "countdown loop should be accepted (#121), got: {:?}",
             result.errors
         );
     }
 
     #[test]
-    fn test_non_zero_start_loop_produces_error() {
+    fn test_non_zero_start_loop_accepted() {
         let source = r#"
 import { SmartContract } from 'runar-lang';
 
@@ -1416,7 +1384,7 @@ class NonZeroStart extends SmartContract {
     public run(v: bigint) {
         let sum = 0n;
         for (let i = 1n; i < 3n; i++) {
-            sum += i;
+            sum = sum + i;
         }
         assert(sum === v);
     }
@@ -1425,11 +1393,12 @@ class NonZeroStart extends SmartContract {
         let contract = parse_contract(source);
         let result = validate(&contract);
         assert!(
-            result
+            !result
                 .errors
                 .iter()
-                .any(|e| e.message.contains("must start at 0")),
-            "expected non-zero-start error, got: {:?}",
+                .any(|e| e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")),
+            "non-zero-start loop should be accepted (#121), got: {:?}",
             result.errors
         );
     }
