@@ -493,11 +493,31 @@ fn parseLoop(allocator: std.mem.Allocator, obj: std.json.ObjectMap, depth: u32) 
     const body_val = obj.get("body") orelse return ParseError.MissingField;
     const body_bindings = try parseBindings(allocator, body_val.array, depth + 1);
 
+    // Issue #121: decode the iterator start value (a bare number, or a decimal
+    // `Nn` string for oversize starts) and step direction. Older ANF payloads
+    // without start/step describe zero-start counting-up loops (start=0, step=1).
+    const start: i64 = if (obj.get("start")) |v| switch (v) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        .string => |s| blk: {
+            const text = if (s.len > 0 and s[s.len - 1] == 'n') s[0 .. s.len - 1] else s;
+            break :blk std.fmt.parseInt(i64, text, 10) catch 0;
+        },
+        else => 0,
+    } else 0;
+    const step: i8 = if (obj.get("step")) |v| switch (v) {
+        .integer => |i| if (i < 0) @as(i8, -1) else 1,
+        .float => |f| if (f < 0) @as(i8, -1) else 1,
+        else => 1,
+    } else 1;
+
     const loop_node = try allocator.create(types.ANFLoop);
     loop_node.* = .{
         .count = count,
         .body = body_bindings,
         .iter_var = try allocator.dupe(u8, iter_var),
+        .start = start,
+        .step = step,
     };
 
     return .{ .loop = loop_node };
@@ -987,7 +1007,7 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
         },
         .loop => |lp| {
             try writer.writeAll("{\n");
-            // Sorted keys: body, count, iterVar, kind
+            // Sorted keys: body, count, iterVar, kind, start, step
             try writeIndent(writer, depth + 1);
             try writeJsonString(writer, "body");
             try writer.writeAll(": ");
@@ -1010,6 +1030,22 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
             try writeJsonString(writer, "kind");
             try writer.writeAll(": ");
             try writeJsonString(writer, "loop");
+            try writer.writeAll(",\n");
+
+            // Issue #121: iterator start value and step direction. `start` is an
+            // int64 loop start, emitted as a bare JSON number — byte-identical
+            // to the TypeScript ANF JSON, whose reviver collapses int64-range
+            // `Nn` strings back to plain numbers.
+            try writeIndent(writer, depth + 1);
+            try writeJsonString(writer, "start");
+            try writer.writeAll(": ");
+            try writer.print("{d}", .{lp.start});
+            try writer.writeAll(",\n");
+
+            try writeIndent(writer, depth + 1);
+            try writeJsonString(writer, "step");
+            try writer.writeAll(": ");
+            try writer.print("{d}", .{lp.step});
             try writer.writeByte('\n');
 
             try writeIndent(writer, depth);

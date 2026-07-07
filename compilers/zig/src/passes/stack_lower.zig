@@ -941,7 +941,9 @@ const LowerCtx = struct {
             .loop => |lp| {
                 const legacy = try self.allocator.create(types.ANFForLoop);
                 defer self.allocator.destroy(legacy);
-                legacy.* = .{ .var_name = lp.iter_var, .init_val = 0, .bound = @intCast(lp.count), .body_bindings = lp.body };
+                // Issue #121: carry start/step so the unroll pushes
+                // `start + n*step` on iteration `n`.
+                legacy.* = .{ .var_name = lp.iter_var, .start = lp.start, .step = lp.step, .count = lp.count, .body_bindings = lp.body };
                 try self.lowerForLoop(binding.name, legacy);
             },
             .assert => |a| try self.lowerAssertOp(binding.name, .{ .condition = a.value }, false),
@@ -4282,9 +4284,13 @@ const LowerCtx = struct {
         // explicit params to lowerLoop).
         const loop_binding_index = self.current_idx;
 
-        var i: i64 = fl.init_val;
-        while (i < fl.bound) : (i += 1) {
-            try self.emitPushInt(i);
+        var n: u32 = 0;
+        while (n < fl.count) : (n += 1) {
+            // Iteration `n` binds `start + n*step` (issue #121). Zero-start
+            // counting-up loops (start=0, step=1) reduce to `n`, preserving the
+            // historical byte-for-byte lowering.
+            const iter_val: i64 = fl.start + @as(i64, @intCast(n)) * fl.step;
+            try self.emitPushInt(iter_val);
             try self.stack.push(self.allocator, fl.var_name);
             self.trackDepth();
 
@@ -4303,7 +4309,7 @@ const LowerCtx = struct {
             //    script compiled and the env interpreter passed, but the
             //    emitted Script failed on chain (silent interpreter/Script
             //    divergence).
-            const is_final_iteration = (i == fl.bound - 1);
+            const is_final_iteration = (n == fl.count - 1);
             var outer_it = outer_refs.iterator();
             while (outer_it.next()) |entry| {
                 const ref = entry.key_ptr.*;

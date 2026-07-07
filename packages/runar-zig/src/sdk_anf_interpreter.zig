@@ -99,6 +99,10 @@ pub const ANFNode = union(enum) {
         count: usize = 0,
         iter_var: []const u8 = "",
         body: []ANFBinding = &.{},
+        // Iteration `i` binds `iter_var = start + i*step` (issue #121). Older
+        // ANF payloads without start/step describe zero-start counting-up loops.
+        start: i64 = 0,
+        step: i64 = 1,
     },
     assert_node: struct {
         // Reference to the binding holding the predicate value. Used by
@@ -770,7 +774,8 @@ fn evalNode(
         .loop_node => |ln| {
             var last_val: ANFValue = anf_none;
             for (0..ln.count) |i| {
-                try env.put(ln.iter_var, .{ .int = @intCast(i) });
+                // Iteration `i` binds `start + i*step` (issue #121).
+                try env.put(ln.iter_var, .{ .int = ln.start + @as(i64, @intCast(i)) * ln.step });
                 try evalBindings(allocator, ln.body, env, state_delta, data_outputs, raw_outputs, anf, eval_ctx);
                 if (ln.body.len > 0) {
                     last_val = env.get(ln.body[ln.body.len - 1].name) orelse anf_none;
@@ -1960,6 +1965,18 @@ fn parseANFNode(allocator: std.mem.Allocator, val: std.json.Value) error{OutOfMe
     if (std.mem.eql(u8, kind, "loop")) {
         const count: usize = if (obj.get("count")) |v| (if (v == .integer) @as(usize, @intCast(v.integer)) else 0) else 0;
         const iter_var = if (obj.get("iterVar")) |v| (if (v == .string) try allocator.dupe(u8, v.string) else "") else "";
+        // Issue #121: iterator start value (bare number or decimal `Nn` string)
+        // and step direction. Absent fields default to a zero-start counting-up
+        // loop.
+        const start: i64 = if (obj.get("start")) |v| switch (v) {
+            .integer => |i| i,
+            .string => |s| blk: {
+                const text = if (s.len > 0 and s[s.len - 1] == 'n') s[0 .. s.len - 1] else s;
+                break :blk std.fmt.parseInt(i64, text, 10) catch 0;
+            },
+            else => 0,
+        } else 0;
+        const step: i64 = if (obj.get("step")) |v| (if (v == .integer and v.integer < 0) @as(i64, -1) else 1) else 1;
         var body: std.ArrayListUnmanaged(ANFBinding) = .empty;
         if (obj.get("body")) |b| {
             if (b == .array) {
@@ -1972,6 +1989,8 @@ fn parseANFNode(allocator: std.mem.Allocator, val: std.json.Value) error{OutOfMe
             .count = count,
             .iter_var = iter_var,
             .body = try body.toOwnedSlice(allocator),
+            .start = start,
+            .step = step,
         } };
     }
     // nop — skip
