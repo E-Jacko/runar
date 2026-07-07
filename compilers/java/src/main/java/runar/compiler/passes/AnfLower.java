@@ -184,6 +184,17 @@ public final class AnfLower {
                 ctx.registerParamType(p.name(), typeToString(p.type()));
             }
 
+            // Register the declared param NAMES so a bare identifier resolves
+            // to `load_param` before falling through to `load_prop` (issue
+            // #130). Without this, a param whose name collides with a mutable
+            // state property lowered to the stale deserialized property value
+            // instead of the witness param. Explicit `this.x` is unaffected: it
+            // lowers via lowerMemberExpr (always load_prop) and the reordered
+            // property_access branch (isProperty checked before isParam).
+            for (ParamNode p : method.params()) {
+                ctx.addParam(p.name());
+            }
+
             boolean isStatefulPublic = contract.parentClass() == ParentClass.STATEFUL_SMART_CONTRACT
                 && method.visibility() == Visibility.PUBLIC;
 
@@ -781,6 +792,14 @@ public final class AnfLower {
                 return lowerIdentifier(id);
             }
             if (expr instanceof PropertyAccessExpr pa) {
+                // Explicit `this.x`: a real contract property always wins, even
+                // when a method param shares the name (issue #130). Now that
+                // declared params are registered, the isParam branch below must
+                // not shadow a stored property. The isParam branch is only for
+                // the implicit injected `this.txPreimage` member.
+                if (isProperty(pa.property())) {
+                    return emit(new LoadProp(pa.property()));
+                }
                 if (isParam(pa.property())) {
                     return emit(new LoadParam(pa.property()));
                 }
