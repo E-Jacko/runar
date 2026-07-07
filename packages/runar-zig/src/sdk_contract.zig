@@ -10,6 +10,7 @@ const oppushtx_mod = @import("sdk_oppushtx.zig");
 const anf_interp = @import("sdk_anf_interpreter.zig");
 const ordinals = @import("sdk_ordinals.zig");
 const errors_mod = @import("sdk_errors.zig");
+const script_utils = @import("sdk_script_utils.zig");
 
 // ---------------------------------------------------------------------------
 // RunarContract — main contract runtime wrapper
@@ -254,14 +255,17 @@ pub const RunarContract = struct {
         ) catch return ContractError.DeployFailed;
         defer deploy_result.deinit(self.allocator);
 
-        // Sign all P2PKH inputs
+        // Sign all P2PKH inputs. Funding inputs are signed by fundingSigner when
+        // set (issue #134): the deploy signer may not own the funding coins.
+        // Defaults to the connected signer.
+        const funding_sign = options.funding_signer orelse sign;
         var signed_tx = try self.allocator.dupe(u8, deploy_result.tx_hex);
         errdefer self.allocator.free(signed_tx);
 
         for (selected, 0..) |utxo, i| {
-            const sig = try sign.sign(self.allocator, signed_tx, i, utxo.script, utxo.satoshis, null);
+            const sig = try funding_sign.sign(self.allocator, signed_tx, i, utxo.script, utxo.satoshis, null);
             defer self.allocator.free(sig);
-            const pub_key = try sign.getPublicKey(self.allocator);
+            const pub_key = try funding_sign.getPublicKey(self.allocator);
             defer self.allocator.free(pub_key);
 
             // Build P2PKH unlocking script hex: push(sig) + push(pubkey)
@@ -314,6 +318,9 @@ pub const RunarContract = struct {
     ) ![]u8 {
         const prov = prov_arg orelse self.provider orelse return ContractError.NoProviderOrSigner;
         const sign = signer_arg orelse self.signer orelse return ContractError.NoProviderOrSigner;
+        // Funding (and terminal fee) inputs are signed by fundingSigner when set
+        // (issue #134); the method's own Sig args stay with the connected signer.
+        const funding_sign = if (options) |o| (o.funding_signer orelse sign) else sign;
 
         if (self.current_utxo == null) return ContractError.NotDeployed;
         const contract_utxo = self.current_utxo.?;
@@ -515,6 +522,11 @@ pub const RunarContract = struct {
             for (terminal_funding) |u| {
                 try additional_utxos.append(self.allocator, u);
             }
+            // Issue #118: a single P2PKH fee input, added to the terminal tx
+            // BEFORE the OP_PUSH_TX preimage (so hashPrevouts covers it) and
+            // consumed entirely as fee — no change output. Merges into the same
+            // terminal funding-input path as funding_utxos.
+            if (options) |o| if (o.fee_utxo) |fee| try additional_utxos.append(self.allocator, fee);
         } else {
             for (all_utxos) |u| {
                 if (!(std.mem.eql(u8, u.txid, contract_utxo.txid) and u.output_index == contract_utxo.output_index)) {
@@ -796,6 +808,38 @@ pub const RunarContract = struct {
             }
         }
 
+        // Issue #133: coin-select the non-terminal call's P2PKH funding inputs
+        // instead of sweeping the whole wallet. `additional_utxos` currently
+        // holds every candidate wallet UTXO; keep only the smallest-sufficient,
+        // largest-first subset (deploy's selectUtxos strategy) that covers the
+        // output/fee shortfall the contract's own input value does not.
+        {
+            var contract_output_sats: i64 = 0;
+            if (has_multi_output) {
+                for (multi_outputs_hex.items) |co| contract_output_sats += co.satoshis;
+            } else if (new_locking_script.len > 0) {
+                contract_output_sats += new_satoshis;
+            }
+            for (data_outputs_hex.items) |do_| contract_output_sats += do_.satoshis;
+            var contract_input_sats: i64 = contract_utxo.satoshis;
+            for (extra_contract_utxos) |u| contract_input_sats += u.satoshis;
+            const funding_lock_len: usize = if (new_locking_script.len > 0)
+                new_locking_script.len / 2
+            else if (has_multi_output and multi_outputs_hex.items.len > 0)
+                multi_outputs_hex.items[0].script.len / 2
+            else
+                0;
+            try self.selectCallFunding(
+                &additional_utxos,
+                is_terminal_call,
+                contract_output_sats,
+                contract_input_sats,
+                funding_lock_len,
+                fee_rate,
+                if (options) |o| o.max_funding_inputs else null,
+            );
+        }
+
         // ---------------------------------------------------------------
         // Stateless path
         // ---------------------------------------------------------------
@@ -816,11 +860,12 @@ pub const RunarContract = struct {
                 // Thread CallOptions.locktime so contracts asserting
                 // extractLocktime(preimage) can succeed. null → 0 (legacy).
                 .locktime = if (options) |o| o.locktime else null,
+                .sequence = if (options) |o| o.sequence else null,
             };
             const stateless_change_address: ?[]const u8 =
                 if (is_terminal_call) null else change_address;
             const stateless_build_opts_ptr: ?*const call_mod.CallBuildOptions =
-                if (is_terminal_call or (if (options) |o| o.locktime != null else false)) &stateless_build_opts else null;
+                if (is_terminal_call or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &stateless_build_opts else null;
 
             var call_result = call_mod.buildCallTransaction(
                 self.allocator,
@@ -845,9 +890,9 @@ pub const RunarContract = struct {
                 const utxo_idx = inp_idx - p2pkh_start;
                 if (utxo_idx < additional_utxos.items.len) {
                     const utxo = additional_utxos.items[utxo_idx];
-                    const sig_val = try sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
+                    const sig_val = try funding_sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
                     defer self.allocator.free(sig_val);
-                    const pub_key = try sign.getPublicKey(self.allocator);
+                    const pub_key = try funding_sign.getPublicKey(self.allocator);
                     defer self.allocator.free(pub_key);
                     const sig_push = try state_mod.encodePushData(self.allocator, sig_val);
                     defer self.allocator.free(sig_push);
@@ -979,9 +1024,10 @@ pub const RunarContract = struct {
             // Thread CallOptions.locktime through the stateful build + rebuild
             // path so the preimage's locktime matches the final on-chain tx.
             .locktime = if (options) |o| o.locktime else null,
+                .sequence = if (options) |o| o.sequence else null,
         };
         const build_opts_ptr: ?*const call_mod.CallBuildOptions =
-            if (is_terminal_call or has_multi_output or data_outputs_hex.items.len > 0 or extra_call_inputs.items.len > 0 or (if (options) |o| o.locktime != null else false)) &build_opts else null;
+            if (is_terminal_call or has_multi_output or data_outputs_hex.items.len > 0 or extra_call_inputs.items.len > 0 or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &build_opts else null;
 
         var call_result = call_mod.buildCallTransaction(
             self.allocator,
@@ -1009,9 +1055,9 @@ pub const RunarContract = struct {
                 const utxo_idx = inp_idx - p2pkh_start;
                 if (utxo_idx < additional_utxos.items.len) {
                     const utxo = additional_utxos.items[utxo_idx];
-                    const sig_val = try sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
+                    const sig_val = try funding_sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
                     defer self.allocator.free(sig_val);
-                    const pub_key = try sign.getPublicKey(self.allocator);
+                    const pub_key = try funding_sign.getPublicKey(self.allocator);
                     defer self.allocator.free(pub_key);
                     const sig_push = try state_mod.encodePushData(self.allocator, sig_val);
                     defer self.allocator.free(sig_push);
@@ -1086,9 +1132,9 @@ pub const RunarContract = struct {
             const funding_offset: usize = 1 + extra_call_inputs.items.len;
             for (additional_utxos.items, 0..) |utxo, ui| {
                 const inp_idx = funding_offset + ui;
-                const sig_val = try sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
+                const sig_val = try funding_sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
                 defer self.allocator.free(sig_val);
-                const pub_key = try sign.getPublicKey(self.allocator);
+                const pub_key = try funding_sign.getPublicKey(self.allocator);
                 defer self.allocator.free(pub_key);
                 const sig_push = try state_mod.encodePushData(self.allocator, sig_val);
                 defer self.allocator.free(sig_push);
@@ -1256,9 +1302,9 @@ pub const RunarContract = struct {
             const funding_offset: usize = 1 + extra_call_inputs.items.len;
             for (additional_utxos.items, 0..) |utxo, ui| {
                 const inp_idx = funding_offset + ui;
-                const sig_val = try sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
+                const sig_val = try funding_sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
                 defer self.allocator.free(sig_val);
-                const pub_key = try sign.getPublicKey(self.allocator);
+                const pub_key = try funding_sign.getPublicKey(self.allocator);
                 defer self.allocator.free(pub_key);
                 const s_push = try state_mod.encodePushData(self.allocator, sig_val);
                 defer self.allocator.free(s_push);
@@ -1337,6 +1383,9 @@ pub const RunarContract = struct {
     ) !types.PreparedCall {
         const prov = prov_arg orelse self.provider orelse return ContractError.NoProviderOrSigner;
         const sign = signer_arg orelse self.signer orelse return ContractError.NoProviderOrSigner;
+        // Funding (and terminal fee) inputs are signed by fundingSigner when set
+        // (issue #134); the method's own Sig args stay with the connected signer.
+        const funding_sign = if (options) |o| (o.funding_signer orelse sign) else sign;
 
         if (self.current_utxo == null) return ContractError.NotDeployed;
         const contract_utxo = self.current_utxo.?;
@@ -1408,6 +1457,10 @@ pub const RunarContract = struct {
         defer additional_utxos.deinit(self.allocator);
         if (is_terminal_call) {
             for (terminal_funding) |u| try additional_utxos.append(self.allocator, u);
+            // Issue #118: a single P2PKH fee input, added BEFORE the OP_PUSH_TX
+            // preimage and consumed entirely as fee (no change output). Merges
+            // into the same terminal funding-input path as funding_utxos.
+            if (options) |o| if (o.fee_utxo) |fee| try additional_utxos.append(self.allocator, fee);
         } else {
             for (all_utxos) |u| {
                 if (!(std.mem.eql(u8, u.txid, contract_utxo.txid) and u.output_index == contract_utxo.output_index)) {
@@ -1415,6 +1468,19 @@ pub const RunarContract = struct {
                 }
             }
         }
+
+        // Issue #133: coin-select funding instead of sweeping the wallet. A
+        // stateless prepare has no continuation output (build is called with no
+        // new locking script), so contract_output_sats is 0.
+        try self.selectCallFunding(
+            &additional_utxos,
+            is_terminal_call,
+            0,
+            contract_utxo.satoshis,
+            0,
+            fee_rate,
+            if (options) |o| o.max_funding_inputs else null,
+        );
 
         // ---- Build placeholder unlock + tx ------------------------------
         const placeholder_unlock = try self.buildUnlockingScript(method_name, resolved_args);
@@ -1425,11 +1491,12 @@ pub const RunarContract = struct {
             // Thread CallOptions.locktime so contracts asserting
             // extractLocktime(preimage) can succeed. null → 0 (legacy).
             .locktime = if (options) |o| o.locktime else null,
+                .sequence = if (options) |o| o.sequence else null,
         };
         const stateless_change_address: ?[]const u8 =
             if (is_terminal_call) null else change_address;
         const stateless_build_opts_ptr: ?*const call_mod.CallBuildOptions =
-            if (is_terminal_call or (if (options) |o| o.locktime != null else false)) &stateless_build_opts else null;
+            if (is_terminal_call or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &stateless_build_opts else null;
 
         var call_result = call_mod.buildCallTransaction(
             self.allocator,
@@ -1454,9 +1521,9 @@ pub const RunarContract = struct {
                 const utxo_idx = inp_idx - 1;
                 if (utxo_idx >= additional_utxos.items.len) break;
                 const utxo = additional_utxos.items[utxo_idx];
-                const sig_val = try sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
+                const sig_val = try funding_sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
                 defer self.allocator.free(sig_val);
-                const pub_key = try sign.getPublicKey(self.allocator);
+                const pub_key = try funding_sign.getPublicKey(self.allocator);
                 defer self.allocator.free(pub_key);
                 const sig_push = try state_mod.encodePushData(self.allocator, sig_val);
                 defer self.allocator.free(sig_push);
@@ -1531,6 +1598,9 @@ pub const RunarContract = struct {
         options: ?types.CallOptions,
     ) !types.PreparedCall {
         const contract_utxo = self.current_utxo.?;
+        // Funding (and terminal fee) inputs are signed by fundingSigner when set
+        // (issue #134); the method's own Sig args stay with the connected signer.
+        const funding_sign = if (options) |o| (o.funding_signer orelse sign) else sign;
 
         // ---- Method lookup + multi-method index --------------------------
         const public_methods = try self.getPublicMethods();
@@ -1652,6 +1722,10 @@ pub const RunarContract = struct {
         defer additional_utxos.deinit(self.allocator);
         if (is_terminal_call) {
             for (terminal_funding) |u| try additional_utxos.append(self.allocator, u);
+            // Issue #118: a single P2PKH fee input, added BEFORE the OP_PUSH_TX
+            // preimage and consumed entirely as fee (no change output). Merges
+            // into the same terminal funding-input path as funding_utxos.
+            if (options) |o| if (o.fee_utxo) |fee| try additional_utxos.append(self.allocator, fee);
         } else {
             for (all_utxos) |u| {
                 if (!(std.mem.eql(u8, u.txid, contract_utxo.txid) and u.output_index == contract_utxo.output_index)) {
@@ -1687,9 +1761,23 @@ pub const RunarContract = struct {
             // Thread CallOptions.locktime through both the prepare build and
             // rebuild paths so the preimage matches the final on-chain tx.
             .locktime = if (options) |o| o.locktime else null,
+                .sequence = if (options) |o| o.sequence else null,
         };
         const stateful_build_opts_ptr: ?*const call_mod.CallBuildOptions =
-            if (is_terminal_call or (if (options) |o| o.locktime != null else false)) &stateful_build_opts else null;
+            if (is_terminal_call or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &stateful_build_opts else null;
+
+        // Issue #133: coin-select funding instead of sweeping the wallet. The
+        // continuation output value (stateful_new_satoshis) is the only output
+        // this prepare path emits before change; no data/multi outputs here.
+        try self.selectCallFunding(
+            &additional_utxos,
+            is_terminal_call,
+            stateful_new_satoshis,
+            contract_utxo.satoshis,
+            if (new_locking_script.len > 0) new_locking_script.len / 2 else 0,
+            fee_rate,
+            if (options) |o| o.max_funding_inputs else null,
+        );
 
         // ---- Compute change PKH for stateful methods needing it ----------
         var change_pkh_buf: []u8 = &.{};
@@ -1747,7 +1835,7 @@ pub const RunarContract = struct {
         var signed_tx = try self.allocator.dupe(u8, call_result.tx_hex);
         errdefer self.allocator.free(signed_tx);
 
-        try signFundingInputs(self, &signed_tx, sign, additional_utxos.items, call_result.input_count);
+        try signFundingInputs(self, &signed_tx, funding_sign, additional_utxos.items, call_result.input_count);
 
         var ptx_result = oppushtx_mod.computeOpPushTx(
             self.allocator, signed_tx, 0,
@@ -1782,7 +1870,7 @@ pub const RunarContract = struct {
             self.allocator.free(first_unlock);
         }
 
-        try signFundingInputs(self, &signed_tx, sign, additional_utxos.items, 1 + additional_utxos.items.len);
+        try signFundingInputs(self, &signed_tx, funding_sign, additional_utxos.items, 1 + additional_utxos.items.len);
 
         // Recompute preimage on the final tx (depends on tx size).
         ptx_result.deinit(self.allocator);
@@ -1866,12 +1954,72 @@ pub const RunarContract = struct {
         };
     }
 
+    /// Coin-select the non-terminal call's P2PKH funding inputs (issue #133).
+    ///
+    /// `additional_utxos` arrives holding every candidate wallet UTXO (borrowed
+    /// references). Replace the full-wallet sweep with the smallest-sufficient,
+    /// largest-first subset — the same strategy deploy's selectUtxos uses —
+    /// covering `funding_target = contract_output_sats - contract_input_sats`
+    /// (clamped to 0) plus the tx fee. selectUtxos returns clones, so we map the
+    /// selection back to the borrowed candidate references and keep only those:
+    /// ownership is unchanged (the entries still borrow from the caller's
+    /// `all_utxos`). Terminal calls are left untouched (their funding is caller-
+    /// supplied). Fails with InsufficientFunds when the selection would exceed
+    /// `max_funding_inputs`.
+    fn selectCallFunding(
+        self: *RunarContract,
+        additional_utxos: *std.ArrayListUnmanaged(types.UTXO),
+        is_terminal_call: bool,
+        contract_output_sats: i64,
+        contract_input_sats: i64,
+        funding_lock_len: usize,
+        fee_rate: i64,
+        max_funding_inputs: ?usize,
+    ) !void {
+        if (is_terminal_call or additional_utxos.items.len == 0) return;
+
+        var funding_target: i64 = contract_output_sats - contract_input_sats;
+        if (funding_target < 0) funding_target = 0;
+
+        const selected = try deploy_mod.selectUtxos(
+            self.allocator,
+            additional_utxos.items,
+            funding_target,
+            funding_lock_len,
+            fee_rate,
+        );
+        defer {
+            for (selected) |*u| u.deinit(self.allocator);
+            self.allocator.free(selected);
+        }
+
+        if (max_funding_inputs) |cap| {
+            if (selected.len > cap) return ContractError.InsufficientFunds;
+        }
+
+        // Rebuild `additional_utxos` as the borrowed subset matching the
+        // selection (map selectUtxos' clones back to the original refs by
+        // prevout).
+        var kept: std.ArrayListUnmanaged(types.UTXO) = .empty;
+        defer kept.deinit(self.allocator);
+        for (additional_utxos.items) |cand| {
+            for (selected) |sel| {
+                if (std.mem.eql(u8, cand.txid, sel.txid) and cand.output_index == sel.output_index) {
+                    try kept.append(self.allocator, cand);
+                    break;
+                }
+            }
+        }
+        additional_utxos.clearRetainingCapacity();
+        try additional_utxos.appendSlice(self.allocator, kept.items);
+    }
+
     /// Sign every P2PKH funding input on `tx_hex` (input 0 is the contract).
     /// Mutates `tx_hex` in place by reallocating with each splice.
     fn signFundingInputs(
         self: *RunarContract,
         tx_hex_inout: *[]u8,
-        sign: signer_mod.Signer,
+        funding_sign: signer_mod.Signer,
         additional_utxos: []const types.UTXO,
         input_count: usize,
     ) !void {
@@ -1880,9 +2028,9 @@ pub const RunarContract = struct {
             const utxo_idx = inp_idx - 1;
             if (utxo_idx >= additional_utxos.len) break;
             const utxo = additional_utxos[utxo_idx];
-            const sig_val = try sign.sign(self.allocator, tx_hex_inout.*, inp_idx, utxo.script, utxo.satoshis, null);
+            const sig_val = try funding_sign.sign(self.allocator, tx_hex_inout.*, inp_idx, utxo.script, utxo.satoshis, null);
             defer self.allocator.free(sig_val);
-            const pub_key = try sign.getPublicKey(self.allocator);
+            const pub_key = try funding_sign.getPublicKey(self.allocator);
             defer self.allocator.free(pub_key);
             const sig_push = try state_mod.encodePushData(self.allocator, sig_val);
             defer self.allocator.free(sig_push);
@@ -2211,19 +2359,62 @@ pub const RunarContract = struct {
     /// script is extracted from the UTXO's locking script, and if an
     /// inscription envelope is present it is detected and stored. State is
     /// deserialized for stateful contracts.
+    /// Recover the positional constructor argument list from a deployed locking
+    /// script, so a restored contract (fromUtxo) operates on the real baked-in
+    /// values rather than 0 placeholders (issue #119). readonly ctor params feed
+    /// the state-continuation formula and adjustCodeSepOffset; zeros there yield
+    /// the wrong continuation and the wrong OP_CODESEPARATOR offset, making
+    /// restored stateful spends unspendable.
+    ///
+    /// extractConstructorArgs returns a name->value map; artifact.abi.constructor
+    /// .params is ordered by paramIndex, so mapping over it yields the positional
+    /// slice the RunarContract expects. Params that carry no constructor slot
+    /// (mutable state fields — restored separately by extractStateFromScript) are
+    /// absent from the map and fall back to int64(0), matching the prior
+    /// placeholder behaviour.
+    fn restoreConstructorArgs(
+        allocator: std.mem.Allocator,
+        artifact: *const types.RunarArtifact,
+        script_hex: []const u8,
+    ) ![]types.StateValue {
+        const params = artifact.abi.constructor.params;
+        var out = try allocator.alloc(types.StateValue, params.len);
+        if (params.len == 0) return out;
+
+        var extracted = try script_utils.extractConstructorArgs(artifact, script_hex, allocator);
+        defer {
+            var it = extracted.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(allocator);
+            }
+            extracted.deinit();
+        }
+
+        for (params, 0..) |p, i| {
+            if (extracted.get(p.name)) |v| {
+                out[i] = try v.clone(allocator);
+            } else {
+                out[i] = .{ .int = 0 };
+            }
+        }
+        return out;
+    }
+
     pub fn fromUtxo(
         allocator: std.mem.Allocator,
         artifact: *types.RunarArtifact,
         utxo: types.UTXO,
     ) !RunarContract {
-        // Build with dummy constructor args (zeros)
-        var dummy_args = try allocator.alloc(types.StateValue, artifact.abi.constructor.params.len);
-        for (0..dummy_args.len) |i| dummy_args[i] = .{ .int = 0 };
+        // Recover the real baked-in constructor args from the deployed script so
+        // a restored contract operates on the true values rather than 0
+        // placeholders (issue #119).
+        const restored_args = try restoreConstructorArgs(allocator, artifact, utxo.script);
 
         var contract = RunarContract{
             .allocator = allocator,
             .artifact = artifact,
-            .constructor_args = dummy_args,
+            .constructor_args = restored_args,
             .state = &.{},
         };
 
@@ -3063,6 +3254,59 @@ test "findCodesepOffsets trims subscript at real codesep byte position" {
     try std.testing.expectEqualStrings("ac", subscript);
 }
 
+// Issue #132: the OP_CODESEPARATOR offset used for a covenant input's
+// OP_PUSH_TX signature must be derived by byte-walking the REAL code script when
+// it is present (chain-loaded, or a deploy script already built from real
+// constructor args) — mirroring getSubscriptForSigning — NOT recomputed from the
+// in-memory constructor args (which are placeholders on the restore path).
+//
+// Zig centralises this in getCodeSepIndex, which byte-walks code_script via
+// findCodesepOffsets whenever code_script is set and only falls back to the
+// template adjustCodeSepOffset when code_script == null (deploy-time). Like Go
+// (and unlike the TS reference), Zig has no divergent public sibling that
+// bypassed the byte-walk, so no production change is needed — this test pins the
+// invariant: with a real code_script present, the resolved offset is the
+// byte-walked position and is independent of the (placeholder) constructor args.
+test "getCodeSepIndex byte-walks the real code script, independent of placeholder args (#132)" {
+    const allocator = std.testing.allocator;
+
+    // code script: OP_1..OP_8 (eight single-byte opcodes) then OP_CODESEPARATOR
+    // (0xab) at byte offset 8, then a trailing opcode. findCodesepOffsets -> [8].
+    const code_script_hex = "5152535455565758ab51";
+    const real_offsets = try findCodesepOffsets(allocator, code_script_hex);
+    defer allocator.free(real_offsets);
+    try std.testing.expectEqual(@as(usize, 1), real_offsets.len);
+    try std.testing.expectEqual(@as(i32, 8), real_offsets[0]);
+
+    // Artifact carrying a deliberately WRONG template codeSeparatorIndex (5) and
+    // no constructor slots, so adjustCodeSepOffset(5) == 5 — diverging from the
+    // byte-walked answer (8).
+    const json =
+        \\{"contractName":"Cov","version":"1","compilerVersion":"1.0","script":"005100","asm":"OP_0 OP_1 OP_0",
+        \\"abi":{"constructor":{"params":[{"name":"count","type":"int"}]},"methods":[{"name":"spend","params":[],"isPublic":true}]},
+        \\"stateFields":[{"name":"count","type":"int","index":0}],
+        \\"constructorSlots":[],"codeSeparatorIndex":5,"buildTimestamp":"2024-01-01"}
+    ;
+    var artifact = try types.RunarArtifact.fromJson(allocator, json);
+    defer artifact.deinit();
+
+    var contract = try RunarContract.init(allocator, &artifact, &[_]types.StateValue{.{ .int = 0 }});
+    defer contract.deinit();
+
+    // With a real code_script present, the offset is byte-walked (8), not the
+    // template (5).
+    contract.code_script = try allocator.dupe(u8, code_script_hex);
+    const got = (try contract.getCodeSepIndex(0)) orelse return error.TestExpectedIndex;
+    try std.testing.expectEqual(@as(i32, 8), got);
+    try std.testing.expect(got != try contract.adjustCodeSepOffset(5));
+
+    // Without a code_script, the template (deploy-time) path is used.
+    var contract2 = try RunarContract.init(allocator, &artifact, &[_]types.StateValue{.{ .int = 0 }});
+    defer contract2.deinit();
+    const got2 = (try contract2.getCodeSepIndex(0)) orelse return error.TestExpectedIndex;
+    try std.testing.expectEqual(try contract2.adjustCodeSepOffset(5), got2);
+}
+
 test "RunarContract.init and getLockingScript for stateful contract" {
     const allocator = std.testing.allocator;
     const json =
@@ -3458,6 +3702,119 @@ test "call with terminal_outputs builds tx with exact outputs and clears UTXO" {
     try std.testing.expect(std.mem.indexOf(u8, raw_tx, "0151") != null);
 }
 
+// Issue #118: CallOptions.fee_utxo adds a single P2PKH input to a terminal call
+// tx purely to pay the miner fee — added before the OP_PUSH_TX preimage and
+// consumed entirely as fee (no change output). Merges into the terminal
+// funding-input path.
+test "terminal call adds fee_utxo input to pay the miner fee (#118)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"contractName":"OpOne","version":"1","compilerVersion":"1.0","script":"51","asm":"OP_1",
+        \\"abi":{"constructor":{"params":[]},"methods":[{"name":"go","params":[],"isPublic":true}]},
+        \\"stateFields":[],"constructorSlots":[],"buildTimestamp":"2024-01-01"}
+    ;
+    var artifact = try types.RunarArtifact.fromJson(allocator, json);
+    defer artifact.deinit();
+
+    var signer = try signer_mod.LocalSigner.fromHex("18e14a7b6a307f426a94f8114701e7c8e774e7f9a47e2c2035db29a206321725");
+    const term_p2pkh = "76a914" ++ ("aa" ** 20) ++ "88ac";
+    // Terminal output pays out the full 5000 contract balance, so the fee must
+    // come from the fee_utxo. The fee input's txid is all-0xcc, which is a
+    // palindrome under the little-endian prevout byte reversal.
+    const term_outputs = [_]types.ContractOutput{.{ .script = term_p2pkh, .satoshis = 5000 }};
+    const fee_utxo = types.UTXO{ .txid = "cc" ** 32, .output_index = 1, .satoshis = 1000, .script = "76a914" ++ ("bb" ** 20) ++ "88ac" };
+
+    // WITH fee_utxo: the fee input's prevout appears in the broadcast tx.
+    {
+        var contract = try RunarContract.init(allocator, &artifact, &.{});
+        defer contract.deinit();
+        var prov = provider_mod.MockProvider.init(allocator, "testnet");
+        defer prov.deinit();
+        try contract.setCurrentUtxo(.{ .txid = "fe" ** 32, .output_index = 0, .satoshis = 5000, .script = "51" });
+        const opts = types.CallOptions{ .terminal_outputs = &term_outputs, .fee_utxo = fee_utxo };
+        const txid = try contract.call("go", &.{}, prov.provider(), signer.signer(), opts);
+        defer allocator.free(txid);
+        try std.testing.expect(contract.getCurrentUtxo() == null);
+        const raw_tx = try prov.provider().getRawTransaction(allocator, txid);
+        defer allocator.free(raw_tx);
+        try std.testing.expect(std.mem.indexOf(u8, raw_tx, "cc" ** 32) != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw_tx, term_p2pkh) != null);
+    }
+
+    // WITHOUT fee_utxo: no such input (baseline).
+    {
+        var contract = try RunarContract.init(allocator, &artifact, &.{});
+        defer contract.deinit();
+        var prov = provider_mod.MockProvider.init(allocator, "testnet");
+        defer prov.deinit();
+        try contract.setCurrentUtxo(.{ .txid = "fe" ** 32, .output_index = 0, .satoshis = 5000, .script = "51" });
+        const opts = types.CallOptions{ .terminal_outputs = &term_outputs };
+        const txid = try contract.call("go", &.{}, prov.provider(), signer.signer(), opts);
+        defer allocator.free(txid);
+        const raw_tx = try prov.provider().getRawTransaction(allocator, txid);
+        defer allocator.free(raw_tx);
+        try std.testing.expect(std.mem.indexOf(u8, raw_tx, "cc" ** 32) == null);
+    }
+}
+
+// Issue #133: the non-terminal call funding path coin-selects the smallest
+// largest-first subset of wallet UTXOs (reusing selectUtxos) instead of sweeping
+// every candidate, and enforces max_funding_inputs.
+test "selectCallFunding trims the wallet sweep to the minimal subset (#133)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"contractName":"Trivial","version":"1","compilerVersion":"1.0","script":"51","asm":"OP_1",
+        \\"abi":{"constructor":{"params":[]},"methods":[{"name":"unlock","params":[],"isPublic":true}]},
+        \\"stateFields":[],"constructorSlots":[],"buildTimestamp":"2024-01-01"}
+    ;
+    var artifact = try types.RunarArtifact.fromJson(allocator, json);
+    defer artifact.deinit();
+    var contract = try RunarContract.init(allocator, &artifact, &.{});
+    defer contract.deinit();
+
+    const p2pkh = "76a914" ++ ("00" ** 20) ++ "88ac";
+    const cands = [_]types.UTXO{
+        .{ .txid = "01" ** 32, .output_index = 0, .satoshis = 1000, .script = p2pkh },
+        .{ .txid = "02" ** 32, .output_index = 0, .satoshis = 2000, .script = p2pkh },
+        .{ .txid = "03" ** 32, .output_index = 0, .satoshis = 10000, .script = p2pkh },
+        .{ .txid = "04" ** 32, .output_index = 0, .satoshis = 500, .script = p2pkh },
+        .{ .txid = "05" ** 32, .output_index = 0, .satoshis = 3000, .script = p2pkh },
+    };
+
+    // funding_target = output(0) - input(0) = 0 → cover just the fee. The
+    // largest UTXO (10000) alone covers it → exactly 1 input, and it is the
+    // largest (not the whole 5-UTXO wallet).
+    {
+        var au: std.ArrayListUnmanaged(types.UTXO) = .empty;
+        defer au.deinit(allocator);
+        for (cands) |c| try au.append(allocator, c);
+        try contract.selectCallFunding(&au, false, 0, 0, 25, 100, null);
+        try std.testing.expectEqual(@as(usize, 1), au.items.len);
+        try std.testing.expectEqual(@as(i64, 10000), au.items[0].satoshis);
+    }
+
+    // A terminal call leaves the caller-supplied funding untouched.
+    {
+        var au: std.ArrayListUnmanaged(types.UTXO) = .empty;
+        defer au.deinit(allocator);
+        for (cands) |c| try au.append(allocator, c);
+        try contract.selectCallFunding(&au, true, 0, 0, 25, 100, null);
+        try std.testing.expectEqual(@as(usize, 5), au.items.len);
+    }
+
+    // max_funding_inputs cap: covering funding_target 5000 needs the 10000 UTXO
+    // (1 input), which exceeds a cap of 0 → fail loudly.
+    {
+        var au: std.ArrayListUnmanaged(types.UTXO) = .empty;
+        defer au.deinit(allocator);
+        for (cands) |c| try au.append(allocator, c);
+        try std.testing.expectError(
+            ContractError.InsufficientFunds,
+            contract.selectCallFunding(&au, false, 5000, 0, 25, 100, 0),
+        );
+    }
+}
+
 test "resolveTerminalOutputs converts addresses and script_hex into ContractOutput list" {
     const allocator = std.testing.allocator;
     const inputs = [_]types.TerminalOutput{
@@ -3509,6 +3866,37 @@ test "RunarContract.fromUtxo detects inscription in code script" {
     // code_script should include the envelope (not stripped)
     try std.testing.expect(contract.code_script != null);
     try std.testing.expect(std.mem.indexOf(u8, contract.code_script.?, "0063036f726451") != null);
+}
+
+// Issue #119: fromUtxo must recover the REAL baked-in constructor args from the
+// deployed script (via extractConstructorArgs), not fill them with 0
+// placeholders. readonly ctor params feed the state-continuation formula and the
+// OP_CODESEPARATOR / OP_PUSH_TX offset, so zeros there make restored stateful
+// spends unspendable.
+test "fromUtxo recovers real constructor args from the deployed script (#119)" {
+    const allocator = std.testing.allocator;
+    // Stateful artifact: readonly ctor param `owner` (int) baked at byte 0 via a
+    // constructor slot; mutable state field `count`.
+    const json =
+        \\{"contractName":"Vault","version":"1","compilerVersion":"1.0","script":"0087","asm":"OP_0 OP_EQUAL",
+        \\"abi":{"constructor":{"params":[{"name":"owner","type":"int"}]},"methods":[{"name":"spend","params":[],"isPublic":true}]},
+        \\"stateFields":[{"name":"count","type":"int","index":0}],
+        \\"constructorSlots":[{"paramIndex":0,"byteOffset":0}],"buildTimestamp":"2024-01-01"}
+    ;
+    var artifact = try types.RunarArtifact.fromJson(allocator, json);
+    defer artifact.deinit();
+
+    // Deployed script: OP_5 (owner=5, baked at byte 0), OP_EQUAL, then an
+    // OP_RETURN state section.
+    const script = "5587" ++ "6a" ++ "0101";
+    const utxo = types.UTXO{ .txid = "bb" ** 32, .output_index = 0, .satoshis = 1000, .script = script };
+
+    var contract = try RunarContract.fromUtxo(allocator, &artifact, utxo);
+    defer contract.deinit();
+
+    // Pre-#119 this was int64(0); after the fix it is the real baked value 5.
+    try std.testing.expectEqual(@as(usize, 1), contract.constructor_args.len);
+    try std.testing.expectEqual(@as(i64, 5), contract.constructor_args[0].int);
 }
 
 // ---------------------------------------------------------------------------
@@ -3629,6 +4017,63 @@ test "Item 8 — RunarContract.deploy rejects oversized locking script" {
 
     // No broadcast should have happened.
     try std.testing.expectEqual(@as(usize, 0), prov.getBroadcastedTxs().len);
+}
+
+// Issue #134: P2PKH funding inputs must be signed by DeployOptions.funding_signer
+// (CallOptions.funding_signer for calls) when set — the funding coins may be
+// owned by a different key than the connected method/deploy signer. Defaults to
+// the connected signer (zero behaviour change).
+test "deploy signs funding inputs with fundingSigner when set (#134)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"contractName":"Trivial","version":"1","compilerVersion":"1.0","script":"51","asm":"OP_1",
+        \\"abi":{"constructor":{"params":[]},"methods":[{"name":"unlock","params":[],"isPublic":true}]},
+        \\"stateFields":[],"constructorSlots":[],"buildTimestamp":"2024-01-01"}
+    ;
+    var artifact = try types.RunarArtifact.fromJson(allocator, json);
+    defer artifact.deinit();
+
+    var signer_a = try signer_mod.LocalSigner.fromHex("18e14a7b6a307f426a94f8114701e7c8e774e7f9a47e2c2035db29a206321725");
+    var signer_b = try signer_mod.LocalSigner.fromHex("0000000000000000000000000000000000000000000000000000000000000003");
+
+    const addr_a = try signer_a.signer().getAddress(allocator);
+    defer allocator.free(addr_a);
+    const pub_a = try signer_a.signer().getPublicKey(allocator);
+    defer allocator.free(pub_a);
+    const pub_b = try signer_b.signer().getPublicKey(allocator);
+    defer allocator.free(pub_b);
+    try std.testing.expect(!std.mem.eql(u8, pub_a, pub_b));
+
+    // WITH fundingSigner = B: the funding input pushes B's pubkey, not A's.
+    // (The change output is a P2PKH to A's hash160 — the full pubkey A only
+    // appears in the tx if A signs an input.)
+    {
+        var contract = try RunarContract.init(allocator, &artifact, &.{});
+        defer contract.deinit();
+        var prov = provider_mod.MockProvider.init(allocator, "testnet");
+        defer prov.deinit();
+        try prov.addUtxo(addr_a, .{ .txid = "aa" ** 32, .output_index = 0, .satoshis = 100_000, .script = "76a914" ++ "00" ** 20 ++ "88ac" });
+        const txid = try contract.deploy(prov.provider(), signer_a.signer(), .{ .satoshis = 1000, .funding_signer = signer_b.signer() });
+        allocator.free(txid);
+        const txs = prov.getBroadcastedTxs();
+        try std.testing.expectEqual(@as(usize, 1), txs.len);
+        try std.testing.expect(std.mem.indexOf(u8, txs[0], pub_b) != null);
+        try std.testing.expect(std.mem.indexOf(u8, txs[0], pub_a) == null);
+    }
+
+    // WITHOUT fundingSigner: the funding input pushes A's pubkey (default).
+    {
+        var contract = try RunarContract.init(allocator, &artifact, &.{});
+        defer contract.deinit();
+        var prov = provider_mod.MockProvider.init(allocator, "testnet");
+        defer prov.deinit();
+        try prov.addUtxo(addr_a, .{ .txid = "aa" ** 32, .output_index = 0, .satoshis = 100_000, .script = "76a914" ++ "00" ** 20 ++ "88ac" });
+        const txid = try contract.deploy(prov.provider(), signer_a.signer(), .{ .satoshis = 1000 });
+        allocator.free(txid);
+        const txs = prov.getBroadcastedTxs();
+        try std.testing.expect(std.mem.indexOf(u8, txs[0], pub_a) != null);
+        try std.testing.expect(std.mem.indexOf(u8, txs[0], pub_b) == null);
+    }
 }
 
 // ===========================================================================

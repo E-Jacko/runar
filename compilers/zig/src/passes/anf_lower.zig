@@ -456,13 +456,39 @@ fn lowerStatefulPublicMethod(
     _ = allocator;
 
     if (add_output_refs.len > 0 or add_data_output_refs.len > 0 or methodMutatesState(method, contract)) {
-        // Build P2PKH change output
+        // Build the P2PKH change output for hashOutputs verification.
+        //
+        // Issue #116: the SDK's buildCallTransaction OMITS the change output when
+        // `change <= 0` (an exact-cover call) and passes `_changeAmount = 0`.
+        // Gate the change segment on `_changeAmount != 0` at runtime so the hashed
+        // output set matches the SDK at the exact-zero boundary — the segment is
+        // the P2PKH change output when non-zero, and empty bytes (cat with empty
+        // is a no-op) when zero, reproducing the omission. For any change > 0 the
+        // hashed bytes are unchanged; only the emitted script gains the guard.
         const change_pkh_ref = try ctx.emit(.{ .load_param = .{ .name = "_changePKH" } });
         const change_amount_ref = try ctx.emit(.{ .load_param = .{ .name = "_changeAmount" } });
-        const change_output_ref = try ctx.emit(.{ .call = .{
-            .func = "buildChangeOutput",
-            .args = try ctx.allocSlice(&.{ change_pkh_ref, change_amount_ref }),
+        const zero_ref = try ctx.emit(makeLoadConstInt(0));
+        const change_nonzero_ref = try ctx.emit(.{ .bin_op = .{
+            .op = "!==",
+            .left = change_amount_ref,
+            .right = zero_ref,
         } });
+        var change_then_ctx = ctx.subContext();
+        _ = try change_then_ctx.emit(.{ .call = .{
+            .func = "buildChangeOutput",
+            .args = try change_then_ctx.allocSlice(&.{ change_pkh_ref, change_amount_ref }),
+        } });
+        ctx.syncCounter(&change_then_ctx);
+        var change_else_ctx = ctx.subContext();
+        _ = try change_else_ctx.emit(makeLoadConstString(change_else_ctx.allocator, ""));
+        ctx.syncCounter(&change_else_ctx);
+        const change_if = try ctx.allocator.create(types.ANFIf);
+        change_if.* = .{
+            .cond = change_nonzero_ref,
+            .then = try change_then_ctx.bindings.toOwnedSlice(ctx.allocator),
+            .@"else" = try change_else_ctx.bindings.toOwnedSlice(ctx.allocator),
+        };
+        const change_output_ref = try ctx.emit(.{ .@"if" = change_if });
 
         if (add_output_refs.len > 0) {
             // Multi-output: concat all state outputs, then all data outputs,
@@ -945,22 +971,21 @@ fn lowerIfStatementWithElse(ctx: *LowerCtx, condition: Expression, then_body: []
 }
 
 fn lowerForStatement(ctx: *LowerCtx, for_s: types.ForStmt) LowerError!void {
-    // The ANF loop node carries only the count — no start value or step
-    // direction — so lowering (and the ANF interpreter) always iterates
-    // i = 0..count-1. Reject the loop shapes that representation cannot
-    // express (mirroring the source-located errors in Pass 2 validate) rather
-    // than silently compiling them as a zero-start counting-up loop for
-    // callers that skip validation. A countdown necessarily also has a
-    // non-zero start, so check the direction first — it is the more precise
-    // diagnosis.
-    if (for_s.descending) return error.UnsupportedStatement;
-    if (for_s.init_value != 0) return error.UnsupportedStatement;
+    // Resolve the loop's compile-time shape: start value, step direction, and
+    // iteration count (issue #121). The loop is unrolled `count` times; on
+    // iteration `i` the iterator holds `start + i*step`. Zero-start counting-up
+    // loops (start=0, step=1) reproduce the historical `i = 0..count-1`
+    // lowering byte-for-byte. Non-zero starts and countdowns (`step = -1`) are
+    // now supported — the C-style parsers record the raw operator direction
+    // (`descending`) and inclusivity (`inclusive`); range parsers fold any
+    // inclusive endpoint into `bound` and stay ascending.
+    const start: i64 = for_s.init_value;
+    const step: i8 = if (for_s.descending) -1 else 1;
 
-    const count: u32 = blk: {
-        const diff = for_s.bound - for_s.init_value;
-        if (diff < 0) break :blk 0;
-        break :blk @intCast(diff);
-    };
+    // count = number of iterations before the condition first turns false.
+    const base: i64 = if (for_s.descending) start - for_s.bound else for_s.bound - start;
+    const raw: i64 = base + (if (for_s.inclusive) @as(i64, 1) else 0);
+    const count: u32 = if (raw > 0) @intCast(raw) else 0;
 
     // Lower body
     var body_ctx = ctx.subContext();
@@ -972,6 +997,8 @@ fn lowerForStatement(ctx: *LowerCtx, for_s: types.ForStmt) LowerError!void {
         .count = count,
         .body = try body_ctx.bindings.toOwnedSlice(ctx.allocator),
         .iter_var = for_s.var_name,
+        .start = start,
+        .step = step,
     };
     _ = try ctx.emit(.{ .loop = loop_val });
 }
@@ -998,7 +1025,15 @@ fn lowerExprToRef(ctx: *LowerCtx, expr: Expression) LowerError![]const u8 {
             return try lowerIdentifier(ctx, name);
         },
         .property_access => |pa| {
-            // this.txPreimage in StatefulSmartContract -> load_param
+            // Explicit `this.x`: a real contract property always wins, even when
+            // a method param shares the name (issue #130). Zig registers declared
+            // method params via addParam, so without this isProperty-first check
+            // `this.balance` (with a `balance` param) would lower to load_param.
+            if (ctx.isProperty(pa.property)) {
+                return try ctx.emit(.{ .load_prop = .{ .name = pa.property } });
+            }
+            // this.txPreimage in StatefulSmartContract -> load_param (an implicit
+            // injected param, not a stored property).
             if (ctx.isParam(pa.property)) {
                 return try ctx.emit(.{ .load_param = .{ .name = pa.property } });
             }
@@ -2659,6 +2694,46 @@ test "lower property access" {
     }
 }
 
+test "explicit this.x resolves to load_prop even when x is a registered param (#130)" {
+    const allocator = std.testing.allocator;
+
+    const props = try allocator.alloc(PropertyNode, 1);
+    defer allocator.free(props);
+    props[0] = .{ .name = "balance", .type_info = .bigint, .readonly = false };
+
+    var ctx = LowerCtx.init(allocator, .{
+        .name = "ShadowRepro",
+        .parent_class = .stateful_smart_contract,
+        .properties = props,
+        .constructor = .{ .params = &.{}, .super_args = &.{}, .assignments = &.{} },
+        .methods = &.{},
+    });
+    defer {
+        for (ctx.bindings.items) |b| allocator.free(b.name);
+        ctx.bindings.deinit(allocator);
+        ctx.param_names.deinit(allocator);
+    }
+
+    // A method param named `balance` shadows the mutable property `balance`.
+    ctx.addParam("balance");
+
+    // Bare identifier `balance` -> load_param (the witness value).
+    const id_ref = try lowerIdentifier(&ctx, "balance");
+    _ = id_ref;
+    switch (ctx.bindings.items[0].value) {
+        .load_param => |lp| try std.testing.expectEqualStrings("balance", lp.name),
+        else => return error.TestExpectedLoadParam,
+    }
+
+    // Explicit `this.balance` -> load_prop (the property always wins).
+    const prop_ref = try lowerExprToRef(&ctx, .{ .property_access = .{ .object = "this", .property = "balance" } });
+    _ = prop_ref;
+    switch (ctx.bindings.items[1].value) {
+        .load_prop => |lp| try std.testing.expectEqualStrings("balance", lp.name),
+        else => return error.TestExpectedLoadProp,
+    }
+}
+
 test "lower assert expression" {
     const allocator = std.testing.allocator;
     var ctx = LowerCtx.init(allocator, .{
@@ -3113,9 +3188,23 @@ test "lower properties with initial values" {
     try std.testing.expect(result[1].initial_value == null);
 }
 
-// -- #127: extractLoopCount (lowerForStatement) rejects unsupported loop shapes
-// for callers that skip validation. Uses an arena so partial allocations on the
-// error path are freed together (lowerToANF does not clean up on error).
+// -- #121: lowerForStatement resolves the compile-time loop shape (start / step
+// / count) for non-zero-start and countdown loops. Uses an arena so all
+// allocations are freed together.
+
+/// Find method "m"'s loop node and return it (or null).
+fn findLoweredLoop(program: ANFProgram) ?types.ANFLoop {
+    for (program.methods) |m| {
+        if (!std.mem.eql(u8, m.name, "m")) continue;
+        for (m.bindings) |b| {
+            switch (b.value) {
+                .loop => |lp| return lp.*,
+                else => {},
+            }
+        }
+    }
+    return null;
+}
 
 fn lowerContractWithLoop(alloc: Allocator, for_stmt: types.ForStmt) LowerError!ANFProgram {
     const props = try alloc.alloc(PropertyNode, 1);
@@ -3142,20 +3231,28 @@ fn lowerContractWithLoop(alloc: Allocator, for_stmt: types.ForStmt) LowerError!A
     });
 }
 
-test "lowering rejects a countdown loop" {
+test "lowering supports a countdown loop (#121)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    // for (let i = 3; i > 0; i--)
+    // for (let i = 3; i > 0; i--)  -> start 3, step -1, count 3
     const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 3, .bound = 0, .descending = true, .body = &.{} };
-    try std.testing.expectError(error.UnsupportedStatement, lowerContractWithLoop(arena.allocator(), for_stmt));
+    const program = try lowerContractWithLoop(arena.allocator(), for_stmt);
+    const lp = findLoweredLoop(program) orelse return error.TestExpectedLoop;
+    try std.testing.expectEqual(@as(u32, 3), lp.count);
+    try std.testing.expectEqual(@as(i64, 3), lp.start);
+    try std.testing.expectEqual(@as(i8, -1), lp.step);
 }
 
-test "lowering rejects a non-zero-start loop" {
+test "lowering supports a non-zero-start loop (#121)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    // for (let i = 1; i <= 3; i++)
-    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 1, .bound = 3, .body = &.{} };
-    try std.testing.expectError(error.UnsupportedStatement, lowerContractWithLoop(arena.allocator(), for_stmt));
+    // for (let i = 1; i <= 3; i++)  -> start 1, step +1, count 3
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 1, .bound = 3, .inclusive = true, .body = &.{} };
+    const program = try lowerContractWithLoop(arena.allocator(), for_stmt);
+    const lp = findLoweredLoop(program) orelse return error.TestExpectedLoop;
+    try std.testing.expectEqual(@as(u32, 3), lp.count);
+    try std.testing.expectEqual(@as(i64, 1), lp.start);
+    try std.testing.expectEqual(@as(i8, 1), lp.step);
 }
 
 test "lowering still accepts a zero-start counting-up loop" {

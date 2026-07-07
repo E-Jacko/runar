@@ -69,6 +69,11 @@ pub const TxOutput = struct {
 pub const DeployOptions = struct {
     satoshis: i64,
     change_address: ?[]const u8 = null,
+    /// Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+    /// are owned by a different key than the connected deploy signer, set this so
+    /// the funding inputs are signed by their real owner. Defaults to the
+    /// connected signer (zero behaviour change).
+    funding_signer: ?@import("sdk_signer.zig").Signer = null,
 };
 
 /// CallOptions specifies options for calling a contract method.
@@ -107,6 +112,16 @@ pub const CallOptions = struct {
     /// `terminal_outputs` + fee. Ignored unless `terminal_outputs` is
     /// non-null. Each UTXO is signed with the configured signer's key.
     funding_utxos: ?[]const UTXO = null,
+    /// A single plain P2PKH UTXO added to a terminal call tx purely to pay the
+    /// miner fee (issue #118). A true terminal method pays out the full contract
+    /// balance, so fee would be 0 and ARC rejects; the covenant asserts its exact
+    /// output set, so no change output can absorb a fee. The fee input is added
+    /// BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers it) and
+    /// is consumed entirely as fee — no change output is created. Signed with
+    /// `funding_signer ?? signer` (composes with #134). Merges into the same
+    /// terminal P2PKH funding-input path as `funding_utxos`; the covenant's
+    /// output assertions are untouched.
+    fee_utxo: ?UTXO = null,
     /// Additional contract UTXOs to include as inputs (e.g. `merge` on a
     /// fungible token spends two contract UTXOs into one). Each entry is
     /// unlocked with the same method + arg shape as the primary call;
@@ -127,6 +142,26 @@ pub const CallOptions = struct {
     /// Threaded through every call-tx build site (stateless, stateful,
     /// rebuild, terminal).
     locktime: ?u32 = null,
+    /// Override the nSequence written onto EVERY input of the call tx (issue
+    /// #131). Zero-config: when `locktime` is set and non-zero, sequence defaults
+    /// to 0xfffffffe (non-final, so consensus actually enforces nLockTime);
+    /// otherwise it stays 0xffffffff (final, legacy). Set explicitly only for RBF
+    /// or custom relative-locktime scenarios. Threaded through the non-terminal
+    /// and terminal call-tx build sites.
+    sequence: ?u32 = null,
+    /// Signer for the P2PKH funding (and terminal fee) inputs (issue #134). When
+    /// the funding/fee UTXOs are owned by a different key than the connected
+    /// method signer, set this so those inputs are signed by their real owner.
+    /// The method's own `Sig` args are still signed by the connected signer.
+    /// Defaults to the connected signer (zero behaviour change).
+    funding_signer: ?@import("sdk_signer.zig").Signer = null,
+    /// Cap the number of P2PKH funding inputs added to a non-terminal call tx
+    /// (issue #133). Funding is chosen by smallest-sufficient, largest-first
+    /// selection (the same selectUtxos strategy deploy uses). If covering the
+    /// outputs + fee would need more than this many inputs, the call fails
+    /// (InsufficientFunds) rather than silently sweeping the wallet. null → no
+    /// cap.
+    max_funding_inputs: ?usize = null,
 };
 
 /// OutputSpec describes one continuation output for a multi-output method.

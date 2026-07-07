@@ -558,25 +558,13 @@ fn validateStatement(
 ) !void {
     switch (stmt) {
         .for_stmt => |f| {
-            // For loops in the Zig IR already have concrete i64 bounds (init_value, bound),
-            // so they are inherently compile-time constants. However, the ANF loop node
-            // carries only an iteration count — no start value or step direction — so
-            // lowering always iterates i = 0..count-1. Reject the loop shapes that
-            // representation cannot express: a countdown ('>'/'>=') or a non-zero start
-            // would otherwise be silently compiled as a zero-start counting-up loop while
-            // the interpreter runs the true source semantics.
-            if (f.descending) {
-                try errors.append(allocator, .{
-                    .message = "For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead",
-                    .severity = .@"error",
-                });
-            }
-            if (f.init_value != 0) {
-                try errors.append(allocator, .{
-                    .message = "For loop iterator must start at 0 — loops compile to i = 0..count-1; offset the iterator inside the body instead",
-                    .severity = .@"error",
-                });
-            }
+            // For loops in the Zig IR already have concrete i64 bounds
+            // (init_value, bound), so they are inherently compile-time
+            // constants. Issue #121: the ANF loop node now carries an explicit
+            // start value and step direction, so non-zero-start and countdown
+            // (`>`/`>=`) loops are supported and no longer rejected here —
+            // anf-lower binds `iterVar = start + i*step` on each unrolled
+            // iteration.
             for (f.body) |s| try validateStatement(allocator, s, errors);
         },
         .if_stmt => |if_s| {
@@ -1519,7 +1507,7 @@ test "contract with a public method does not report no-public-methods error" {
     try testing.expect(!hasErrorContaining(result, "no public methods"));
 }
 
-// -- #127: reject non-zero-start and countdown loops --
+// -- #121: non-zero-start and countdown loops are supported (no longer rejected) --
 
 /// Validate a stateless contract with a single public method `m` whose body is
 /// the given for-loop followed by a terminal assert. Returns whether any error
@@ -1548,16 +1536,16 @@ fn validateLoopHasError(allocator: Allocator, for_stmt: types.ForStmt, needle: [
     return hasErrorContaining(result, needle);
 }
 
-test "for loop with non-zero start reports error" {
+test "for loop with non-zero start is accepted (#121)" {
     // for (let i = 1; i <= 3; i++)
-    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 1, .bound = 3, .body = &.{} };
-    try testing.expect(try validateLoopHasError(testing.allocator, for_stmt, "must start at 0"));
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 1, .bound = 3, .inclusive = true, .body = &.{} };
+    try testing.expect(!try validateLoopHasError(testing.allocator, for_stmt, "must start at 0"));
 }
 
-test "countdown for loop reports error" {
+test "countdown for loop is accepted (#121)" {
     // for (let i = 3; i > 0; i--)
     const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 3, .bound = 0, .descending = true, .body = &.{} };
-    try testing.expect(try validateLoopHasError(testing.allocator, for_stmt, "countdown"));
+    try testing.expect(!try validateLoopHasError(testing.allocator, for_stmt, "countdown"));
 }
 
 test "zero-start counting-up for loop is accepted" {

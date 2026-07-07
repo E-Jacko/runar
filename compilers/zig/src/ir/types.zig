@@ -177,11 +177,14 @@ pub const Assign = struct {
 };
 pub const IfStmt = struct { condition: Expression, then_body: []Statement, else_body: ?[]Statement = null, source_loc: ?SourceLocation = null };
 // `descending` records whether the source condition counted down (`>`/`>=`).
-// The ANF loop node carries only an iteration count (no start/step), so
-// countdown and non-zero-start loops cannot be represented and are rejected
-// in Pass 2 (validate) and Pass 4 (anf-lower). Only C-style parsers set this;
-// range-based parsers (Rust/Ruby/Python/Zig/Move) are always ascending.
-pub const ForStmt = struct { var_name: []const u8, init_value: i64, bound: i64, body: []Statement, descending: bool = false, source_loc: ?SourceLocation = null };
+// `inclusive` records whether the source comparison was inclusive (`<=`/`>=`).
+// Issue #121: the ANF loop node now carries an explicit start value and step
+// direction, so countdown and non-zero-start loops are supported. anf-lower
+// computes count = |bound - start| (+1 when inclusive), so the C-style parsers
+// (TS/Sol/Go/Java) set `descending`/`inclusive` from the raw operator while
+// range-based parsers (Rust/Ruby/Python/Zig/Move) are ascending and fold any
+// inclusive endpoint into `bound` at parse time (leaving `inclusive = false`).
+pub const ForStmt = struct { var_name: []const u8, init_value: i64, bound: i64, body: []Statement, descending: bool = false, inclusive: bool = false, source_loc: ?SourceLocation = null };
 pub const AssertStmt = struct { condition: Expression, message: ?[]const u8 = null, source_loc: ?SourceLocation = null };
 
 pub const Expression = union(enum) {
@@ -360,7 +363,12 @@ pub const ANFUnaryOp = struct { op: []const u8, operand: []const u8, result_type
 pub const ANFCall = struct { func: []const u8, args: []const []const u8 };
 pub const ANFMethodCall = struct { object: []const u8, method: []const u8, args: []const []const u8 };
 pub const ANFIf = struct { cond: []const u8, then: []ANFBinding, @"else": []ANFBinding };
-pub const ANFLoop = struct { count: u32, body: []ANFBinding, iter_var: []const u8 };
+// Iterator start value and step direction (issue #121). The loop is unrolled
+// `count` times; on iteration `i` (0-based) the iterator variable holds
+// `start + i * step`. Zero-start counting-up loops carry `start = 0`, `step = 1`,
+// reproducing the historical `i = 0..count-1` lowering byte-for-byte. Countdown
+// loops carry `step = -1`.
+pub const ANFLoop = struct { count: u32, body: []ANFBinding, iter_var: []const u8, start: i64 = 0, step: i8 = 1 };
 pub const ANFAssert = struct {
     value: []const u8,
     /// Optional marker: `true` only on the auto-injected
@@ -398,7 +406,10 @@ pub const PropertyWrite = struct { name: []const u8, value_ref: []const u8 };
 pub const ANFBinaryOp = struct { op: BinOperator, left: []const u8, right: []const u8, result_type: ?[]const u8 = null };
 pub const ANFBuiltinCall = struct { name: []const u8, args: []const []const u8 };
 pub const ANFIfExpr = struct { condition: []const u8, then_bindings: []ANFBinding, else_bindings: ?[]ANFBinding };
-pub const ANFForLoop = struct { var_name: []const u8, init_val: i64, bound: i64, body_bindings: []ANFBinding };
+// Legacy bridge struct adapted from ANFLoop by stack_lower.zig's loop dispatch.
+// Issue #121: carries the iterator start value, step direction, and iteration
+// count directly; the unroll pushes `start + n*step` on iteration `n`.
+pub const ANFForLoop = struct { var_name: []const u8, start: i64, step: i64, count: u32, body_bindings: []ANFBinding };
 pub const ANFLegacyAssert = struct { condition: []const u8, message: ?[]const u8 = null };
 
 fn freeBindings(allocator: std.mem.Allocator, bindings: []ANFBinding) void {

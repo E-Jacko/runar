@@ -488,6 +488,9 @@ fn foldValue(allocator: Allocator, value: ANFValue, env: *ConstEnv) anyerror!ANF
                 .count = loop_node.count,
                 .body = folded_body,
                 .iter_var = loop_node.iter_var,
+                // Issue #121: preserve the iterator start value / step direction.
+                .start = loop_node.start,
+                .step = loop_node.step,
             };
             return .{ .loop = new_loop };
         },

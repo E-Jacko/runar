@@ -119,6 +119,69 @@ test "if without else emits OP_IF / OP_ENDIF" {
     try std.testing.expect(hexHasOpcode(hex, "68")); // OP_ENDIF
 }
 
+// #121 — a countdown for-loop (`i > 0`, from 3; unrolled as i = 3,2,1). The
+// expected hex is byte-identical to the TypeScript reference compiler's output
+// for the same contract, pinning cross-tier parity for issue #121.
+test "countdown for-loop matches the TS reference hex (#121)" {
+    const source =
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\class Down1 extends SmartContract {
+        \\  readonly expectedSum: bigint;
+        \\
+        \\  constructor(expectedSum: bigint) {
+        \\    super(expectedSum);
+        \\    this.expectedSum = expectedSum;
+        \\  }
+        \\
+        \\  public verify(base: bigint): void {
+        \\    let sum: bigint = 0n;
+        \\    for (let i: bigint = 3n; i > 0n; i--) {
+        \\      sum = sum + base + i;
+        \\    }
+        \\    assert(sum === this.expectedSum);
+        \\  }
+        \\}
+    ;
+    const hex = try compile(source, "Down1.runar.ts");
+    defer std.testing.allocator.free(hex);
+    try std.testing.expectEqualStrings(
+        "005352797b7c937c935252797b7c937c93517b7b7c937c93009c",
+        hex,
+    );
+}
+
+// #121 — a non-zero-start ascending for-loop (`j < 5`, from 2; unrolled as
+// j = 2,3,4). Byte-identical to the TypeScript reference compiler output.
+test "non-zero-start for-loop matches the TS reference hex (#121)" {
+    const source =
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\class Up1 extends SmartContract {
+        \\  readonly expectedSum: bigint;
+        \\
+        \\  constructor(expectedSum: bigint) {
+        \\    super(expectedSum);
+        \\    this.expectedSum = expectedSum;
+        \\  }
+        \\
+        \\  public verify(base: bigint): void {
+        \\    let sum: bigint = 0n;
+        \\    for (let j: bigint = 2n; j < 5n; j++) {
+        \\      sum = sum + base + j;
+        \\    }
+        \\    assert(sum === this.expectedSum);
+        \\  }
+        \\}
+    ;
+    const hex = try compile(source, "Up1.runar.ts");
+    defer std.testing.allocator.free(hex);
+    try std.testing.expectEqualStrings(
+        "005252797b7c937c935352797b7c937c93547b7b7c937c93009c",
+        hex,
+    );
+}
+
 // D10 — bitwise & | ^ ~ on bigint.
 test "bitwise operators on bigint emit OP_AND / OP_OR / OP_XOR / OP_INVERT" {
     const source =
