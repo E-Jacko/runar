@@ -152,6 +152,15 @@ pub struct CallOptions {
     /// real owner. The method's own `Sig` args are still signed by the
     /// connected signer. `None` → the connected signer (zero behaviour change).
     pub funding_signer: Option<FundingSigner>,
+    /// A single plain P2PKH UTXO added to a TERMINAL call tx purely to pay the
+    /// miner fee (issue #118). A true terminal method pays out the full contract
+    /// balance, so fee would be 0 and ARC rejects; the covenant asserts its exact
+    /// output set, so no change output can absorb a fee. The fee input is added
+    /// BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers it) and
+    /// is consumed entirely as fee — no change output is created. Signed with
+    /// `funding_signer` ?? the connected signer. The covenant's output
+    /// assertions are untouched — only the input side grows.
+    pub fee_utxo: Option<Utxo>,
 }
 
 /// A data output entry — hex-encoded script + satoshis — for the

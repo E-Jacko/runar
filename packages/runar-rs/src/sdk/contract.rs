@@ -1357,7 +1357,7 @@ impl RunarContract {
         &mut self,
         method_name: &str,
         resolved_args: &mut Vec<SdkValue>,
-        _signer: &dyn Signer,
+        signer: &dyn Signer,
         options: Option<&CallOptions>,
         terminal_outputs: &[TerminalOutput],
         current_utxo: &Utxo,
@@ -1409,16 +1409,33 @@ impl RunarContract {
             )
         };
 
-        // Build raw transaction: single input (contract UTXO), exact outputs
+        // Optional fee input (issue #118): a plain P2PKH UTXO consumed entirely
+        // as the miner fee for a terminal tx whose covenant asserts an exact,
+        // change-free output set.
+        let fee_utxo = options.and_then(|o| o.fee_utxo.as_ref());
+
+        // Build raw transaction: contract input (+ optional fee input), exact
+        // outputs. The fee input's outpoint is present BEFORE the OP_PUSH_TX
+        // preimage is computed so hashPrevouts covers it; its scriptSig is an
+        // empty placeholder until the tx structure is final (signed below).
         let build_terminal_tx = |unlock: &str| -> String {
             let mut tx = String::new();
             tx.push_str(&to_little_endian_32(1)); // version
-            tx.push_str(&encode_varint(1)); // 1 input
+            let num_inputs = 1 + if fee_utxo.is_some() { 1 } else { 0 };
+            tx.push_str(&encode_varint(num_inputs));
+            // Input 0: contract UTXO
             tx.push_str(&reverse_hex(&current_utxo.txid));
             tx.push_str(&to_little_endian_32(current_utxo.output_index));
             tx.push_str(&encode_varint((unlock.len() / 2) as u64));
             tx.push_str(unlock);
             tx.push_str(&terminal_sequence_hex);
+            // Input 1 (optional): P2PKH fee input with an empty scriptSig for now.
+            if let Some(fee) = fee_utxo {
+                tx.push_str(&reverse_hex(&fee.txid));
+                tx.push_str(&to_little_endian_32(fee.output_index));
+                tx.push_str("00"); // empty scriptSig placeholder
+                tx.push_str(&terminal_sequence_hex);
+            }
             tx.push_str(&encode_varint(terminal_outputs.len() as u64));
             for out in terminal_outputs {
                 tx.push_str(&to_little_endian_64(out.satoshis));
@@ -1507,6 +1524,23 @@ impl RunarContract {
                     }
                 }
             }
+        }
+
+        // Sign the fee input (issue #118). Its BIP-143 P2PKH sighash covers only
+        // hashPrevouts / hashOutputs / its own outpoint — NOT input 0's scriptSig
+        // — so it stays valid even though input 0 was finalized above. Owned by
+        // funding_signer ?? signer (composes with #134). The fee input sits at
+        // index 1 (right after the primary contract input).
+        if let Some(fee) = fee_utxo {
+            let funding_signer: &dyn Signer = options
+                .and_then(|o| o.funding_signer.as_ref())
+                .map(|fs| fs.as_signer())
+                .unwrap_or(signer);
+            let fee_input_idx = 1;
+            let fee_sig = funding_signer.sign(&term_tx, fee_input_idx, &fee.script, fee.satoshis, None)?;
+            let fee_pubkey = funding_signer.get_public_key()?;
+            let fee_script_sig = format!("{}{}", encode_push_data(&fee_sig), encode_push_data(&fee_pubkey));
+            term_tx = insert_unlocking_script(&term_tx, fee_input_idx, &fee_script_sig)?;
         }
 
         // Compute sighash from preimage (single SHA-256)
