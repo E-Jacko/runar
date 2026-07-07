@@ -2578,6 +2578,59 @@ func TestBuildCallTransaction_AllSequences(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// #131: honor CallOptions.Sequence; non-final input sequences under locktime.
+// ---------------------------------------------------------------------------
+
+func TestBuildCallTransaction_LocktimeDefaultsNonFinalSequence(t *testing.T) {
+	// A non-zero locktime must default EVERY input to 0xfffffffe (non-final) so
+	// consensus actually enforces nLockTime (issue #131).
+	utxo := makeUtxo(100000, 0)
+	additional := []UTXO{makeUtxo(50000, 1), makeUtxo(30000, 2)}
+	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
+	lt := uint32(800000)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100, &BuildCallOptions{Locktime: &lt})
+	parsed := parseTxHex(callTxObj.Hex())
+	if parsed.locktime != 800000 {
+		t.Errorf("expected locktime 800000, got %d", parsed.locktime)
+	}
+	if len(parsed.inputs) != 3 {
+		t.Fatalf("expected 3 inputs, got %d", len(parsed.inputs))
+	}
+	for i, inp := range parsed.inputs {
+		if inp.sequence != 0xfffffffe {
+			t.Errorf("input %d: expected sequence 0xfffffffe under locktime, got %#x", i, inp.sequence)
+		}
+	}
+}
+
+func TestBuildCallTransaction_LocktimeZeroKeepsFinalSequence(t *testing.T) {
+	// An explicit locktime of 0 keeps the legacy final 0xffffffff (issue #131).
+	utxo := makeUtxo(100000, 0)
+	lt := uint32(0)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{Locktime: &lt})
+	parsed := parseTxHex(callTxObj.Hex())
+	if parsed.inputs[0].sequence != 0xffffffff {
+		t.Errorf("expected sequence 0xffffffff with locktime 0, got %#x", parsed.inputs[0].sequence)
+	}
+}
+
+func TestBuildCallTransaction_ExplicitSequenceWins(t *testing.T) {
+	// An explicit Sequence override wins on every input, even under locktime.
+	utxo := makeUtxo(100000, 0)
+	additional := []UTXO{makeUtxo(50000, 1)}
+	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
+	lt := uint32(800000)
+	seq := uint32(0x12345678)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100, &BuildCallOptions{Locktime: &lt, Sequence: &seq})
+	parsed := parseTxHex(callTxObj.Hex())
+	for i, inp := range parsed.inputs {
+		if inp.sequence != 0x12345678 {
+			t.Errorf("input %d: expected explicit sequence 0x12345678, got %#x", i, inp.sequence)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Row 363: InsertUnlockingScript with out-of-range input index panics
 // ---------------------------------------------------------------------------
 

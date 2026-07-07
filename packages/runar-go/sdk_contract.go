@@ -786,8 +786,11 @@ func (c *RunarContract) PrepareCall(
 	}
 	// Thread CallOptions.Locktime through so contracts asserting
 	// extractLocktime(preimage) can succeed. nil → 0 (legacy behavior).
+	// Thread CallOptions.Sequence (issue #131): a non-zero locktime needs
+	// non-final input sequences or consensus ignores nLockTime.
 	if options != nil {
 		buildOpts.Locktime = options.Locktime
+		buildOpts.Sequence = options.Sequence
 	}
 	if len(extraContractUtxos) > 0 {
 		buildOpts.AdditionalContractInputs = make([]AdditionalContractInput, len(extraContractUtxos))
@@ -933,8 +936,11 @@ func (c *RunarContract) PrepareCall(
 		}
 		// Rebuild path must honor the override too: a preimage computed on a
 		// rebuilt tx with locktime 0 would mismatch the final on-chain tx.
+		// Same for sequence — the second-pass preimage must see the final input
+		// sequences (issue #131).
 		if options != nil {
 			rebuildOpts.Locktime = options.Locktime
+			rebuildOpts.Sequence = options.Sequence
 		}
 		if len(extraContractUtxos) > 0 {
 			rebuildOpts.AdditionalContractInputs = make([]AdditionalContractInput, len(extraContractUtxos))
@@ -1799,6 +1805,12 @@ func (c *RunarContract) prepareCallTerminal(
 		terminalLocktime = *options.Locktime
 	}
 
+	// Sequence (issue #131): all-final inputs make nLockTime a consensus no-op —
+	// when a non-zero locktime is set, default to 0xfffffffe so the terminal
+	// method's extractLocktime assertion is actually enforced. Explicit
+	// options.Sequence wins.
+	terminalSequence := resolveInputSequence(terminalLocktime, options.Sequence)
+
 	// Build terminal transaction using go-sdk Transaction
 	buildTerminalTx := func(unlock string) *transaction.Transaction {
 		ttx := transaction.NewTransaction()
@@ -1808,7 +1820,7 @@ func (c *RunarContract) prepareCallTerminal(
 			SourceTXID:       txidToChainHash(contractUtxo.Txid),
 			SourceTxOutIndex: uint32(contractUtxo.OutputIndex),
 			UnlockingScript:  unlockLS,
-			SequenceNumber:   0xffffffff,
+			SequenceNumber:   terminalSequence,
 		})
 		// Add funding UTXOs as additional P2PKH inputs (unsigned)
 		for _, fu := range fundingUtxos {
@@ -1817,7 +1829,7 @@ func (c *RunarContract) prepareCallTerminal(
 				SourceTXID:       fuHash,
 				SourceTxOutIndex: uint32(fu.OutputIndex),
 				UnlockingScript:  &sdkscript.Script{},
-				SequenceNumber:   0xffffffff,
+				SequenceNumber:   terminalSequence,
 			})
 		}
 		for _, out := range termOutputs {

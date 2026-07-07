@@ -44,6 +44,12 @@ type TxOutput struct {
 type DeployOptions struct {
 	Satoshis      int64  `json:"satoshis"`
 	ChangeAddress string `json:"changeAddress,omitempty"`
+
+	// FundingSigner signs the P2PKH funding inputs (issue #134). When the
+	// funding UTXOs are owned by a different key than the connected deploy
+	// signer, set this so the funding inputs are signed by their real owner.
+	// nil → the connected signer (zero behaviour change).
+	FundingSigner Signer `json:"-"`
 }
 
 // CallOptions specifies options for calling a contract method.
@@ -109,6 +115,39 @@ type CallOptions struct {
 	// assert extractLocktime(preimage) >= deadline (e.g. auction close/claim).
 	// Threaded through both the non-terminal and terminal call-tx build sites.
 	Locktime *uint32 `json:"locktime,omitempty"`
+
+	// Sequence overrides the nSequence written onto EVERY input of the call tx
+	// (issue #131). Defaults are zero-config: when Locktime is set and non-zero,
+	// sequence defaults to 0xfffffffe (non-final, so consensus actually enforces
+	// nLockTime); otherwise it stays 0xffffffff (final, legacy). Set explicitly
+	// only for RBF or custom relative-locktime scenarios. Threaded through the
+	// non-terminal and terminal call-tx build sites.
+	Sequence *uint32 `json:"sequence,omitempty"`
+
+	// MaxFundingInputs caps the number of P2PKH funding inputs added to a
+	// non-terminal call tx (issue #133). Funding is chosen by smallest-
+	// sufficient, largest-first selection (the same SelectUtxos strategy deploy
+	// uses). If covering the outputs + fee would need more than this many
+	// inputs, the call fails loudly rather than silently sweeping the wallet.
+	// nil → no cap.
+	MaxFundingInputs *int `json:"maxFundingInputs,omitempty"`
+
+	// FundingSigner signs the P2PKH funding (and terminal fee) inputs (issue
+	// #134). When the funding/fee UTXOs are owned by a different key than the
+	// connected method signer, set this so those inputs are signed by their real
+	// owner. The method's own Sig args are still signed by the connected signer.
+	// nil → the connected signer (zero behaviour change).
+	FundingSigner Signer `json:"-"`
+
+	// FeeUtxo is a single plain P2PKH UTXO added to a terminal call tx purely to
+	// pay the miner fee (issue #118). A true terminal method pays out the full
+	// contract balance, so fee would be 0 and ARC rejects; the covenant asserts
+	// its exact output set, so no change output can absorb a fee. The fee input
+	// is added BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers
+	// it) and is consumed entirely as fee — no change output is created. Signed
+	// with FundingSigner ?? signer. The covenant's output assertions are
+	// untouched. nil → no fee input.
+	FeeUtxo *UTXO `json:"feeUtxo,omitempty"`
 }
 
 // TerminalOutput specifies an exact output for a terminal method call.
