@@ -3107,6 +3107,59 @@ test "findCodesepOffsets trims subscript at real codesep byte position" {
     try std.testing.expectEqualStrings("ac", subscript);
 }
 
+// Issue #132: the OP_CODESEPARATOR offset used for a covenant input's
+// OP_PUSH_TX signature must be derived by byte-walking the REAL code script when
+// it is present (chain-loaded, or a deploy script already built from real
+// constructor args) — mirroring getSubscriptForSigning — NOT recomputed from the
+// in-memory constructor args (which are placeholders on the restore path).
+//
+// Zig centralises this in getCodeSepIndex, which byte-walks code_script via
+// findCodesepOffsets whenever code_script is set and only falls back to the
+// template adjustCodeSepOffset when code_script == null (deploy-time). Like Go
+// (and unlike the TS reference), Zig has no divergent public sibling that
+// bypassed the byte-walk, so no production change is needed — this test pins the
+// invariant: with a real code_script present, the resolved offset is the
+// byte-walked position and is independent of the (placeholder) constructor args.
+test "getCodeSepIndex byte-walks the real code script, independent of placeholder args (#132)" {
+    const allocator = std.testing.allocator;
+
+    // code script: OP_1..OP_8 (eight single-byte opcodes) then OP_CODESEPARATOR
+    // (0xab) at byte offset 8, then a trailing opcode. findCodesepOffsets -> [8].
+    const code_script_hex = "5152535455565758ab51";
+    const real_offsets = try findCodesepOffsets(allocator, code_script_hex);
+    defer allocator.free(real_offsets);
+    try std.testing.expectEqual(@as(usize, 1), real_offsets.len);
+    try std.testing.expectEqual(@as(i32, 8), real_offsets[0]);
+
+    // Artifact carrying a deliberately WRONG template codeSeparatorIndex (5) and
+    // no constructor slots, so adjustCodeSepOffset(5) == 5 — diverging from the
+    // byte-walked answer (8).
+    const json =
+        \\{"contractName":"Cov","version":"1","compilerVersion":"1.0","script":"005100","asm":"OP_0 OP_1 OP_0",
+        \\"abi":{"constructor":{"params":[{"name":"count","type":"int"}]},"methods":[{"name":"spend","params":[],"isPublic":true}]},
+        \\"stateFields":[{"name":"count","type":"int","index":0}],
+        \\"constructorSlots":[],"codeSeparatorIndex":5,"buildTimestamp":"2024-01-01"}
+    ;
+    var artifact = try types.RunarArtifact.fromJson(allocator, json);
+    defer artifact.deinit();
+
+    var contract = try RunarContract.init(allocator, &artifact, &[_]types.StateValue{.{ .int = 0 }});
+    defer contract.deinit();
+
+    // With a real code_script present, the offset is byte-walked (8), not the
+    // template (5).
+    contract.code_script = try allocator.dupe(u8, code_script_hex);
+    const got = (try contract.getCodeSepIndex(0)) orelse return error.TestExpectedIndex;
+    try std.testing.expectEqual(@as(i32, 8), got);
+    try std.testing.expect(got != try contract.adjustCodeSepOffset(5));
+
+    // Without a code_script, the template (deploy-time) path is used.
+    var contract2 = try RunarContract.init(allocator, &artifact, &[_]types.StateValue{.{ .int = 0 }});
+    defer contract2.deinit();
+    const got2 = (try contract2.getCodeSepIndex(0)) orelse return error.TestExpectedIndex;
+    try std.testing.expectEqual(try contract2.adjustCodeSepOffset(5), got2);
+}
+
 test "RunarContract.init and getLockingScript for stateful contract" {
     const allocator = std.testing.allocator;
     const json =
