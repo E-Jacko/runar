@@ -4,6 +4,8 @@ import (
 	"math/big"
 	"strings"
 	"testing"
+
+	"github.com/icellan/runar/compilers/go/ir"
 )
 
 // ---------------------------------------------------------------------------
@@ -917,10 +919,32 @@ class FT extends StatefulSmartContract {
 	body := program.Methods[transfer].Body
 
 	// Count bindings by kind and capture refs in declaration order.
+	//
+	// Issue #116: the change segment is now gated on `_changeAmount != 0`, so
+	// buildChangeOutput lives inside the then-branch of an `if` node, and the
+	// continuation cats the `if` node's result (not buildChangeOutput directly).
 	var stateOutputRefs []string
 	var dataOutputRefs []string
 	var catArgs [][]string
 	var changeRef string
+	var hasBuildChangeCall bool
+	// containsBuildChangeCall reports whether a binding slice (deeply) contains
+	// a buildChangeOutput call.
+	var containsBuildChangeCall func(bs []ir.ANFBinding) bool
+	containsBuildChangeCall = func(bs []ir.ANFBinding) bool {
+		for _, b := range bs {
+			if b.Value.Kind == "call" && b.Value.Func == "buildChangeOutput" {
+				return true
+			}
+			if b.Value.Kind == "if" && (containsBuildChangeCall(b.Value.Then) || containsBuildChangeCall(b.Value.Else)) {
+				return true
+			}
+			if b.Value.Kind == "loop" && containsBuildChangeCall(b.Value.Body) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, b := range body {
 		switch b.Value.Kind {
 		case "add_output":
@@ -930,8 +954,11 @@ class FT extends StatefulSmartContract {
 		case "call":
 			if b.Value.Func == "cat" {
 				catArgs = append(catArgs, append([]string(nil), b.Value.Args...))
-			} else if b.Value.Func == "buildChangeOutput" {
+			}
+		case "if":
+			if containsBuildChangeCall(b.Value.Then) || containsBuildChangeCall(b.Value.Else) {
 				changeRef = b.Name
+				hasBuildChangeCall = true
 			}
 		}
 	}
@@ -941,8 +968,8 @@ class FT extends StatefulSmartContract {
 	if len(dataOutputRefs) != 1 {
 		t.Fatalf("expected 1 add_data_output binding, got %d", len(dataOutputRefs))
 	}
-	if changeRef == "" {
-		t.Fatal("expected a buildChangeOutput call")
+	if !hasBuildChangeCall || changeRef == "" {
+		t.Fatal("expected an `if` node gating a buildChangeOutput call (issue #116)")
 	}
 	if len(catArgs) < 3 {
 		t.Fatalf("expected at least 3 cat calls (state1+state2, +data, +change), got %d", len(catArgs))

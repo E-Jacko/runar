@@ -306,10 +306,33 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			// param injection. Both must agree or the deployed locking
 			// script will not match the auto-injected parameter list.
 			if needsChangeOutput {
-				// Build the P2PKH change output for hashOutputs verification
+				// Build the P2PKH change output for hashOutputs verification.
+				//
+				// Issue #116: the SDK's BuildCallTransaction OMITS the change
+				// output when `change <= 0` (an exact-cover call) and passes
+				// `_changeAmount = 0`. Gate the change segment on `_changeAmount
+				// != 0` at runtime so the hashed output set matches the SDK at
+				// the exact-zero boundary — the segment is the P2PKH change
+				// output when non-zero, and empty bytes (cat with empty is a
+				// no-op) when zero, reproducing the omission. For any change > 0
+				// the hashed bytes are unchanged; only the emitted script gains
+				// the guard.
 				changePKHRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "_changePKH"})
 				changeAmountRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "_changeAmount"})
-				changeOutputRef := methodCtx.emit(makeCall("buildChangeOutput", []string{changePKHRef, changeAmountRef}))
+				zeroRef := methodCtx.emit(makeLoadConstInt(big.NewInt(0)))
+				changeNonZeroRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "!==", Left: changeAmountRef, Right: zeroRef})
+				changeThenCtx := methodCtx.subContext()
+				changeThenCtx.emit(makeCall("buildChangeOutput", []string{changePKHRef, changeAmountRef}))
+				methodCtx.syncCounter(changeThenCtx)
+				changeElseCtx := methodCtx.subContext()
+				changeElseCtx.emit(makeLoadConstString(""))
+				methodCtx.syncCounter(changeElseCtx)
+				changeOutputRef := methodCtx.emit(ir.ANFValue{
+					Kind: "if",
+					Cond: changeNonZeroRef,
+					Then: changeThenCtx.bindings,
+					Else: changeElseCtx.bindings,
+				})
 
 				if len(addOutputRefs) > 0 {
 					// Multi-output continuation: concat all state outputs, then
