@@ -46,6 +46,14 @@ const ZIG_PORT_PENDING: readonly string[] = [
   // tiers and is verified via the .runar.ts conformance fixture compiled by
   // every tier; it needs no per-format example port.
   'nested-if-multi-reassign/StackTrackerRepro.runar.zig',
+  // TS-only until the non-TS tiers receive the outer-scope-refs-across-
+  // unrolled-loops stack-lowering fix (the TS fix landed in
+  // 05-stack-lower.ts): CompanionVerifier's bounded multi-input walk
+  // references `inCount`/`off` inside an unrolled loop, which the Go/Rust
+  // stack lowerers still reject with "value 'inCount' not found on stack".
+  // Port these alongside that fix.
+  'companion-verifier/AttributedToken.runar.zig',
+  'companion-verifier/CompanionVerifier.runar.zig',
 ];
 
 describe('Zig parser: example inventory', () => {

@@ -288,13 +288,36 @@ describe('Assembler', () => {
   // 7. Constructor slots and codeSeparator
   // -------------------------------------------------------------------------
   describe('constructor slots and codeSeparator', () => {
-    it('includes constructorSlots when provided', () => {
+    it('includes constructorSlots when provided (enriched with descriptor metadata)', () => {
       const slots = [
         { paramIndex: 0, byteOffset: 5 },
         { paramIndex: 1, byteOffset: 40 },
       ];
       const artifact = assemble(P2PKH_SOURCE, { constructorSlots: slots });
-      expect(artifact.constructorSlots).toEqual(slots);
+      // Raw emitter data is preserved...
+      expect(artifact.constructorSlots).toMatchObject(slots);
+      // ...and enriched with verification-descriptor metadata from the ABI.
+      // P2PKH has one ctor param (pk: PubKey) — slot 0 resolves, slot 1 has
+      // no matching param and stays bare.
+      expect(artifact.constructorSlots![0]).toMatchObject({
+        name: 'pk',
+        type: 'PubKey',
+        valueEncoding: 'data',
+        fixedValueByteLength: 33,
+        fixedPushHeaderBytes: 1,
+      });
+      expect(artifact.constructorSlots![1]).toEqual({ paramIndex: 1, byteOffset: 40 });
+      // A templateDigest recipe accompanies the slots.
+      expect(artifact.templateDigest).toEqual({
+        algorithm: 'hash256-excised-slots',
+        pieces: [
+          { kind: 'code' },
+          { kind: 'slot', slot: 'pk', byteOffset: 5 },
+          { kind: 'code' },
+          { kind: 'slot', byteOffset: 40 },
+          { kind: 'code' },
+        ],
+      });
     });
 
     it('omits constructorSlots when empty', () => {

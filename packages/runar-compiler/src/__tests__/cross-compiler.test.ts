@@ -746,6 +746,19 @@ describe.skipIf(!hasRust || !rustBinaryPath)('Cross-compiler: TS IR -> Rust Scri
 // Test compilation of all example contracts through TS + Go pipeline
 // ---------------------------------------------------------------------------
 
+// Examples that currently compile on the TS tier ONLY, keyed by example
+// directory name with a required justification (mirrors ZIG_PORT_PENDING in
+// zig-parser-examples.test.ts — tracked explicitly, never silently dropped).
+const TS_ONLY_EXAMPLES = new Map<string, string>([
+  // The TS stack lowerer keeps outer-scope refs (method params / pre-loop
+  // consts) alive across unrolled loops (fix in 05-stack-lower.ts); the Go
+  // and Rust lowerers still reject such programs with "value 'inCount' not
+  // found on stack". CompanionVerifier's bounded multi-input walk depends
+  // on that fix. Remove this entry when the loop-scope fix is ported to
+  // the other tiers.
+  ['companion-verifier', 'Go/Rust stack lowering lacks the outer-scope-refs-across-unrolled-loops fix'],
+]);
+
 function findExampleContracts(targetTier?: string): { name: string; source: string }[] {
   const examplesDir = join(__dirname, '..', '..', '..', '..', 'examples', 'ts');
   const contracts: { name: string; source: string }[] = [];
@@ -789,6 +802,9 @@ function findExampleContracts(targetTier?: string): { name: string; source: stri
           if (targetTier) {
             const allowlist = fixtureAllowlists.get(dir.name);
             if (allowlist && !allowlist.includes(targetTier)) continue;
+            // TS-only examples without a conformance fixture (see
+            // TS_ONLY_EXAMPLES above for the tracked justifications).
+            if (targetTier !== 'ts' && TS_ONLY_EXAMPLES.has(dir.name)) continue;
           }
           const source = readFileSync(join(dirPath, file), 'utf-8');
           contracts.push({ name: file.replace('.runar.ts', ''), source });

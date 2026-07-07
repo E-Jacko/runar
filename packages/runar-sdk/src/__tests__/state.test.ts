@@ -109,6 +109,29 @@ describe('boolean state encoding/decoding', () => {
     const result = deserializeState(fields, hex);
     expect(result.flag).toBe(false);
   });
+
+  // The canonical Rúnar primitive name is `boolean` (not `bool`). Regression
+  // for the encode drift the #115 review flagged: encodeStateValue only had
+  // `case 'bool'`, so a `boolean` field fell through to the push-data default
+  // while decode + the descriptor annotation + on-chain use 1 raw byte.
+  it("roundtrips the canonical 'boolean' type", () => {
+    const fields = makeFields({ name: 'flag', type: 'boolean', index: 0 });
+    for (const v of [true, false]) {
+      const hex = serializeState(fields, { flag: v });
+      expect(deserializeState(fields, hex).flag).toBe(v);
+    }
+  });
+
+  // Byte-level: a boolean state field must serialize to EXACTLY 1 raw byte
+  // (0x01 / 0x00) — matching the on-chain layout (05-stack-lower.ts
+  // `case 'boolean': propSizes.push(1)`), NOT a length-prefixed push. This
+  // asserts against the on-chain ground truth, not just serialize↔deserialize
+  // self-consistency.
+  it("serializes a 'boolean' field as a single raw byte (matches on-chain)", () => {
+    const fields = makeFields({ name: 'flag', type: 'boolean', index: 0 });
+    expect(serializeState(fields, { flag: true })).toBe('01');
+    expect(serializeState(fields, { flag: false })).toBe('00');
+  });
 });
 
 // ---------------------------------------------------------------------------

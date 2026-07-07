@@ -98,8 +98,18 @@ export type {
   StateField,
   ConstructorSlot,
   CodeSepIndexSlot,
+  TemplateDigest,
+  TemplateDigestPiece,
   RunarArtifact,
 } from './artifact.js';
+
+// State-tail byte layout (shared width table: compiler + SDK + verifiers)
+export {
+  STATE_FIELD_WIDTHS,
+  annotateStateFieldLayout,
+  totalStateByteLength,
+} from './state-layout.js';
+export type { StateFieldEncoding } from './state-layout.js';
 
 // Validators
 export {

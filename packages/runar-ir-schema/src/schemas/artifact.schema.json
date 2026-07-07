@@ -70,6 +70,10 @@
       "items": { "$ref": "#/$defs/ConstructorSlot" },
       "description": "Byte offsets of constructor parameter placeholders in the script"
     },
+    "templateDigest": {
+      "$ref": "#/$defs/TemplateDigest",
+      "description": "Recipe for recomputing the slot-excised template identity hash"
+    },
     "codeSepIndexSlots": {
       "type": "array",
       "items": { "$ref": "#/$defs/CodeSepIndexSlot" },
@@ -207,7 +211,27 @@
         "type": { "type": "string", "minLength": 1 },
         "index": { "type": "integer", "minimum": 0 },
         "initialValue": { "$ref": "#/$defs/StateFieldInitialValue" },
-        "fixedArray": { "$ref": "#/$defs/FixedArrayInfo" }
+        "fixedArray": { "$ref": "#/$defs/FixedArrayInfo" },
+        "encoding": {
+          "type": "string",
+          "enum": ["num2bin-le8", "bool1", "raw", "pushdata"],
+          "description": "Wire encoding of the serialized field in the OP_RETURN state tail"
+        },
+        "byteOffset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset from the byte AFTER the OP_RETURN separator (omitted when a preceding field is variable-length)"
+        },
+        "byteLength": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Serialized length in bytes (omitted for variable-length fields)"
+        },
+        "tailOffset": {
+          "type": "integer",
+          "maximum": -1,
+          "description": "NEGATIVE byte offset from the END of the locking script (omitted when this or any following field is variable-length)"
+        }
       }
     },
     "ConstructorSlot": {
@@ -216,8 +240,64 @@
       "additionalProperties": false,
       "properties": {
         "paramIndex": { "type": "integer", "minimum": 0 },
-        "byteOffset": { "type": "integer", "minimum": 0 }
+        "byteOffset": { "type": "integer", "minimum": 0 },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Constructor parameter name (matches abi.constructor.params[paramIndex].name)"
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "ABI type of the parameter (e.g. PubKey, bigint, ByteString)"
+        },
+        "valueEncoding": {
+          "type": "string",
+          "enum": ["data", "scriptnum", "bool"],
+          "description": "How the deploy-time value is encoded when spliced into the slot"
+        },
+        "fixedValueByteLength": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "For fixed-size data types only: baked value length in bytes (PubKey 33, Sha256 32, Addr/Ripemd160 20, Point 64)"
+        },
+        "fixedPushHeaderBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "For fixed-size data types only: push-header length in bytes preceding the value"
+        }
       }
+    },
+    "TemplateDigestPiece": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string", "enum": ["code", "slot"] },
+        "slot": {
+          "type": "string",
+          "minLength": 1,
+          "description": "For kind 'slot': the excised slot's constructor param name"
+        },
+        "byteOffset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For kind 'slot': the slot's TEMPLATE byte offset"
+        }
+      }
+    },
+    "TemplateDigest": {
+      "type": "object",
+      "required": ["algorithm", "pieces"],
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": { "type": "string", "enum": ["hash256-excised-slots"] },
+        "pieces": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TemplateDigestPiece" }
+        }
+      },
+      "description": "hash256 over the resolved code part with every constructor slot's VALUE bytes removed (push headers stay in the hashed template)"
     },
     "CodeSepIndexSlot": {
       "type": "object",

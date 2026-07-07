@@ -56,6 +56,21 @@ export { computeOpPushTx } from './oppushtx.js';
 // Script utilities
 export { buildP2PKHScript, extractConstructorArgs, matchesArtifact, pubkeyToPKH } from './script-utils.js';
 
+// Verification-descriptor resolution (value-dependent half of the artifact's
+// constructorSlots/stateFields/templateDigest descriptors)
+export {
+  resolveSlotLayout,
+  computeTemplateHash,
+  buildResolvedCodeHex,
+  resolveStateLayout,
+} from './slot-layout.js';
+export type {
+  ResolvedSlot,
+  ResolvedSlotLayout,
+  ResolvedSlotEncoding,
+  ResolvedStateLayout,
+} from './slot-layout.js';
+
 // Signed-envelope wire protocol for overlay apps
 export { canonicalJson, signEnvelope, verifyEnvelope } from './envelope.js';
 export type {
@@ -106,6 +121,9 @@ export type {
   ABIParam,
   ABIConstructor,
   StateField,
+  ConstructorSlot,
+  TemplateDigest,
+  TemplateDigestPiece,
   SourceMap,
   SourceMapping,
 } from 'runar-ir-schema';

@@ -12,6 +12,7 @@
 // ---------------------------------------------------------------------------
 
 import type { StateField, RunarArtifact } from 'runar-ir-schema';
+import { STATE_FIELD_WIDTHS } from 'runar-ir-schema';
 
 /**
  * Serialize a set of state values into a hex-encoded Bitcoin Script data
@@ -289,8 +290,16 @@ function encodeStateValue(value: unknown, type: string): string {
       }
       return encodeNum2Bin(n, 8);
     }
-    case 'bool': {
-      return value ? '01' : '00'; // 1 raw byte
+    case 'bool':
+    case 'boolean': {
+      // 1 raw byte — matches on-chain serialization (05-stack-lower.ts
+      // `case 'boolean': propSizes.push(1)`), decodeStateValue, and the shared
+      // STATE_FIELD_WIDTHS table. The canonical Rúnar primitive name is
+      // `boolean`; `bool` is accepted as an alias. Without the `boolean` case
+      // a real boolean state field fell through to the push-data `default`,
+      // silently disagreeing with all three (the descriptor drift #115's
+      // review flagged).
+      return value ? '01' : '00';
     }
     case 'PubKey':
     case 'Addr':
@@ -380,33 +389,28 @@ function decodeStateValue(
   offset: number,
   type: string,
 ): { value: unknown; bytesRead: number } {
-  switch (type) {
-    case 'bool': {
-      // 1 raw byte: 0x00 = false, 0x01 = true
-      return { value: hex.slice(offset, offset + 2) !== '00', bytesRead: 2 };
-    }
-    case 'int':
-    case 'bigint': {
-      // 8 raw bytes LE sign-magnitude (NUM2BIN 8)
-      const hexWidth = 16; // 8 bytes * 2
-      const data = hex.slice(offset, offset + hexWidth);
-      return { value: decodeNum2Bin(data), bytesRead: hexWidth };
-    }
-    case 'PubKey':
-      return { value: hex.slice(offset, offset + 66), bytesRead: 66 }; // 33 bytes
-    case 'Addr':
-    case 'Ripemd160':
-      return { value: hex.slice(offset, offset + 40), bytesRead: 40 }; // 20 bytes
-    case 'Sha256':
-      return { value: hex.slice(offset, offset + 64), bytesRead: 64 }; // 32 bytes
-    case 'Point':
-      return { value: hex.slice(offset, offset + 128), bytesRead: 128 }; // 64 bytes
-    default: {
-      // For unknown types, fall back to push-data decoding
-      const { data, bytesRead } = decodePushData(hex, offset);
-      return { value: data, bytesRead };
+  // Fixed-width types read exactly `size` raw bytes; widths come from the
+  // shared runar-ir-schema table so the codec, the compiler's stateField
+  // layout annotations, and verifier tooling can never drift apart.
+  const width = STATE_FIELD_WIDTHS[type];
+  if (width) {
+    const hexWidth = width.size * 2;
+    const data = hex.slice(offset, offset + hexWidth);
+    switch (width.encoding) {
+      case 'bool1':
+        // 1 raw byte: 0x00 = false, 0x01 = true
+        return { value: data !== '00', bytesRead: hexWidth };
+      case 'num2bin-le8':
+        // 8 raw bytes LE sign-magnitude (NUM2BIN 8)
+        return { value: decodeNum2Bin(data), bytesRead: hexWidth };
+      default:
+        // Raw fixed-size byte types (PubKey 33, Addr/Ripemd160 20, Sha256 32, Point 64)
+        return { value: data, bytesRead: hexWidth };
     }
   }
+  // For variable-length / unknown types, fall back to push-data decoding
+  const { data, bytesRead } = decodePushData(hex, offset);
+  return { value: data, bytesRead };
 }
 
 /**

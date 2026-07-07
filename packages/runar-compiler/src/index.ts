@@ -100,6 +100,20 @@ export interface CompileOptions {
   /** Bake property values into the locking script (replaces placeholders). */
   constructorArgs?: Record<string, bigint | boolean | string>;
 
+  /**
+   * Names of readonly properties that MUST be verifiable on-chain — i.e.
+   * survive compilation baked into the locking script (as deploy-time
+   * constructor slots, or as compile-time-baked values).
+   *
+   * A readonly property that no method references is ELIMINATED from the
+   * compiled script entirely — silently. Its value then exists nowhere in
+   * the deployed UTXO, so no downstream contract or verifier can extract
+   * it: provenance you can check in Script only exists if the contract
+   * itself commits to it. Listing such a property here turns that silent
+   * elimination into a compile error.
+   */
+  requireBaked?: string[];
+
   /** If true, skip the ANF constant folding pass. Default: false (folding enabled). */
   disableConstantFolding?: boolean;
 
@@ -365,6 +379,24 @@ export function compile(source: string, options?: CompileOptions): CompileResult
     }
   }
 
+  // requireBaked guard: turn silent elimination of a must-be-verifiable
+  // readonly property into a compile error. Runs on the pre-fold ANF so
+  // `load_prop` references are still intact in both template and baked modes.
+  if (opts.requireBaked && opts.requireBaked.length > 0) {
+    const requireBakedErrors = validateRequireBaked(anf, opts.requireBaked);
+    if (requireBakedErrors.length > 0) {
+      for (const msg of requireBakedErrors) {
+        diagnostics.push({ message: msg, severity: 'error' } as CompilerDiagnostic);
+      }
+      return {
+        anf: null,
+        contract: parseResult.contract,
+        diagnostics,
+        success: false,
+      };
+    }
+  }
+
   // Pass 4.25: Constant folding (on by default)
   if (!opts.disableConstantFolding) {
     onProgress?.('Constant folding', 45);
@@ -396,6 +428,28 @@ export function compile(source: string, options?: CompileOptions): CompileResult
 
     onProgress?.('Emitting script', 85);
     const emitResult = emit(stackProgram);
+
+    // requireBaked belt-and-braces: in template mode every required prop
+    // without a compile-time value must have produced a constructor slot.
+    if (opts.requireBaked && opts.requireBaked.length > 0) {
+      const slotErrors = findRequireBakedMissingSlots(
+        optimizedAnf,
+        opts.requireBaked,
+        emitResult.constructorSlots,
+      );
+      if (slotErrors.length > 0) {
+        for (const msg of slotErrors) {
+          diagnostics.push({ message: msg, severity: 'error' } as CompilerDiagnostic);
+        }
+        return {
+          anf: optimizedAnf,
+          contract: parseResult.contract,
+          diagnostics,
+          success: false,
+        };
+      }
+    }
+
     onProgress?.('Assembling artifact', 95);
     const artifact = assembleArtifact(
       expandedContract,
@@ -742,6 +796,93 @@ function findUnbakedReferencedReadonly(anf: ANFProgram): string[] {
           `after baking constructorArgs — the emitted script would carry an OP_0 ` +
           `placeholder that fails at runtime. Provide '${prop.name}' in constructorArgs ` +
           `(or give the property an initializer).`,
+      );
+    }
+  }
+  return errors;
+}
+
+/**
+ * Validate `requireBaked` names against the (post-bake, pre-fold) ANF:
+ *  (a) every name must be a contract property;
+ *  (b) it must be readonly — mutable state lives in the OP_RETURN state
+ *      tail, not a baked code slot;
+ *  (c) it must be REFERENCED by at least one method body — an unreferenced
+ *      readonly property is eliminated from the compiled script entirely,
+ *      so its value would not be verifiable on-chain by anyone.
+ */
+function validateRequireBaked(anf: ANFProgram, names: string[]): string[] {
+  const errors: string[] = [];
+  const referenced = collectReferencedProps(anf);
+  for (const name of names) {
+    const prop = anf.properties.find(p => p.name === name);
+    if (!prop) {
+      const propNames = anf.properties.map(p => p.name).join(', ');
+      errors.push(
+        `requireBaked: '${name}' is not a property of contract '${anf.contractName}' ` +
+          `(properties: [${propNames}]).`,
+      );
+      continue;
+    }
+    if (!prop.readonly) {
+      errors.push(
+        `requireBaked: property '${name}' is mutable state — it is serialized into the ` +
+          `OP_RETURN state tail, not baked into the code part. requireBaked applies to ` +
+          `readonly properties only.`,
+      );
+      continue;
+    }
+    if (!referenced.has(name)) {
+      errors.push(
+        `requireBaked: readonly property '${name}' is not referenced by any method body, ` +
+          `so the compiler ELIMINATES it — its value would exist nowhere in the deployed ` +
+          `locking script and could not be verified on-chain by any downstream contract. ` +
+          `Reference it in a method (e.g. checkSig(sig, this.${name}) or ` +
+          `assert(this.${name} >= 1n)) to force it into a constructor slot.`,
+      );
+    }
+  }
+  return errors;
+}
+
+/**
+ * Post-emit requireBaked cross-check (template mode): every required prop
+ * that has no compile-time value must map to at least one emitted
+ * constructor slot. Guards against any optimizer pass dropping a reference
+ * AFTER the ANF-level check.
+ *
+ * SCOPE / KNOWN LIMITATION: this belt-and-braces check covers TEMPLATE mode
+ * only — baked props (`initialValue !== undefined`) are skipped because they
+ * carry no constructor slot. In baked mode the guarantee rests solely on the
+ * pre-fold `validateRequireBaked` reference check. A baked required prop whose
+ * ONLY reference constant-folds to a tautology (e.g. `assert(this.source >= 1n)`
+ * with `source` baked to `1n` → `assert(true)`, then eliminated) can therefore
+ * be dropped from the emitted code with no diagnostic, because folding runs
+ * after the reference check and the folded literal is indistinguishable from an
+ * eliminated one. A robust baked-mode check would require tracking the baked
+ * value's survival through fold+emit; until then, authors relying on
+ * requireBaked in baked mode should confirm the value is present in the emitted
+ * artifact. Template mode (the documented deploy path) is fully covered.
+ */
+function findRequireBakedMissingSlots(
+  anf: ANFProgram,
+  names: string[],
+  constructorSlots: { paramIndex: number; byteOffset: number }[],
+): string[] {
+  const ctorProps = anf.properties.filter(p => p.initialValue === undefined);
+  const slotNames = new Set(
+    constructorSlots.map(s => ctorProps[s.paramIndex]?.name).filter(n => n !== undefined),
+  );
+  const errors: string[] = [];
+  for (const name of names) {
+    const prop = anf.properties.find(p => p.name === name);
+    if (!prop || !prop.readonly) continue; // reported by validateRequireBaked
+    if (prop.initialValue !== undefined) continue; // baked at compile time
+    if (!slotNames.has(name)) {
+      errors.push(
+        `requireBaked: readonly property '${name}' produced no constructor slot in the ` +
+          `emitted script (optimized away after ANF lowering) — its value would not be ` +
+          `verifiable on-chain.`,
       );
     }
   }

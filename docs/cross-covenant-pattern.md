@@ -90,6 +90,16 @@ const stateRoot = substr(referencedOutput, stateRootOffset, 32n);
 See `examples/ts/cross-covenant/CrossCovenantRef.runar.ts` for a complete
 working example with tests.
 
+For the stronger form — verifying attributes of a *specific companion input*
+of the current transaction by parsing its parent tx (hash-bound to the
+spending tx via the BIP-143 preimage), with contract identity proven by a
+slot-excised *template* hash instead of an exact script hash — see the
+"Verified Companion Inputs" example pair in
+`examples/ts/companion-verifier/` (`AttributedToken.runar.ts` +
+`CompanionVerifier.runar.ts`). It addresses the third limitation above:
+the parent tx binds a specific UTXO, not just a script shape, and
+per-instance attribute values survive the identity check.
+
 ## Use in BSV-EVM
 
 The bridge covenant uses this pattern to read the state covenant's latest

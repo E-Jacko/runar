@@ -188,6 +188,9 @@ importers:
       fast-check:
         specifier: ^3.22.0
         version: 3.23.2
+      runar-sdk:
+        specifier: workspace:*
+        version: link:../runar-sdk
       typescript:
         specifier: ^5.6.0
         version: 5.9.3

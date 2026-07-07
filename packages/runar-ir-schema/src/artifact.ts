@@ -102,15 +102,92 @@ export interface StateField {
     length: number;
     syntheticNames: string[];
   };
+
+  // -- Byte-layout descriptors (additive; mirror the SDK's serializeState) --
+  //
+  // Stateful contracts serialize state as `<code> OP_RETURN <field0>...<fieldN>`
+  // in `index` order. These fields let a verifier locate a state value inside
+  // a companion input's locking script without re-deriving the layout.
+
+  /**
+   * Wire encoding of the serialized field:
+   *  - 'num2bin-le8': bigint — 8 raw bytes, little-endian sign-magnitude
+   *                   (OP_NUM2BIN 8 semantics; sign bit = MSB of last byte).
+   *  - 'bool1':       bool — 1 raw byte (0x00 / 0x01).
+   *  - 'raw':         fixed-size byte types — raw bytes, no framing
+   *                   (PubKey 33, Addr/Ripemd160 20, Sha256 32, Point 64).
+   *  - 'pushdata':    variable-length types — push-data framed (length
+   *                   prefix + bytes); byte length is value-dependent.
+   */
+  encoding?: 'num2bin-le8' | 'bool1' | 'raw' | 'pushdata';
+  /** Byte offset from the byte AFTER the OP_RETURN separator. Omitted when
+   *  any preceding field is variable-length. */
+  byteOffset?: number;
+  /** Serialized length in bytes (for fixedArray fields: total across all
+   *  flattened leaves). Omitted for variable-length fields. */
+  byteLength?: number;
+  /** NEGATIVE byte offset from the END of the locking script (the state
+   *  tail is the script's suffix, so `scriptLen + tailOffset` is the
+   *  field's start). Omitted when this or any following field is
+   *  variable-length. */
+  tailOffset?: number;
 }
 
 // ---------------------------------------------------------------------------
 // Constructor slots
 // ---------------------------------------------------------------------------
 
+/**
+ * One deploy-baked constructor slot: a 1-byte OP_0 placeholder in the
+ * TEMPLATE script (`artifact.script`) that the SDK replaces with the
+ * encoded constructor arg at deploy time.
+ *
+ * The verification-descriptor fields (`name`, `type`, `valueEncoding`,
+ * `fixedValueByteLength`, `fixedPushHeaderBytes`) are additive metadata that
+ * make cross-contract verification MECHANICAL: a consuming contract (or
+ * off-chain verifier) that inspects a companion input's parent transaction
+ * can locate each baked readonly value without re-deriving offsets by
+ * diffing/`indexOf`-ing compiled scripts — which is fragile and encoding-
+ * sensitive (bigint values 1..16 bake as a single OP_N opcode byte, 0 bakes
+ * as OP_0, and >=17 bakes as a multi-byte push that shifts every downstream
+ * offset).
+ *
+ * DESIGN SPLIT (value-independence): the compiler cannot know the byte
+ * length a slot occupies after deployment — that depends on the VALUE baked
+ * at deploy time (a 33-byte PubKey push vs. a 1-byte OP_N). So the artifact
+ * carries only value-INDEPENDENT metadata here, and the SDK's
+ * `resolveSlotLayout(artifact, constructorArgs)` / `computeTemplateHash(
+ * artifact, constructorArgs)` resolve concrete offsets/lengths/hashes for
+ * GIVEN args.
+ */
 export interface ConstructorSlot {
+  /** Index into `abi.constructor.params`. */
   paramIndex: number;
+  /** Byte offset of the 1-byte OP_0 placeholder in the template script. */
   byteOffset: number;
+  /** Constructor parameter name (matches `abi.constructor.params[paramIndex].name`). */
+  name?: string;
+  /** ABI type of the parameter (e.g. `PubKey`, `bigint`, `ByteString`). */
+  type?: string;
+  /**
+   * How the deploy-time value is encoded when spliced into the slot:
+   *  - 'data':      raw data push (push header + value bytes). Fixed-size
+   *                 types (PubKey 33B, Sha256 32B, ...) always take
+   *                 header 1B + value NB; variable-length ByteString
+   *                 header size depends on the value length.
+   *  - 'scriptnum': minimally-encoded Script number. 0 → OP_0 (1 opcode
+   *                 byte), 1..16 → single OP_N opcode byte (0x50+N),
+   *                 -1 → OP_1NEGATE, else 1-byte header + LE
+   *                 sign-magnitude bytes.
+   *  - 'bool':      single opcode byte (OP_TRUE / OP_0).
+   */
+  valueEncoding?: 'data' | 'scriptnum' | 'bool';
+  /** For fixed-size data types only: the baked value length in bytes
+   *  (PubKey 33, Sha256 32, Addr/Ripemd160 20, Point 64). */
+  fixedValueByteLength?: number;
+  /** For fixed-size data types only: the push-header length in bytes that
+   *  precedes the value (1 for all lengths <= 75). */
+  fixedPushHeaderBytes?: number;
 }
 
 export interface CodeSepIndexSlot {
@@ -118,6 +195,46 @@ export interface CodeSepIndexSlot {
   byteOffset: number;
   /** The template-relative codeSeparatorIndex value this placeholder represents */
   codeSepIndex: number;
+}
+
+// ---------------------------------------------------------------------------
+// Template digest (slot-excised script identity)
+// ---------------------------------------------------------------------------
+
+/**
+ * One piece of the slot-excised template identity.
+ *
+ * The resolved code part (template with constructor args spliced in) is
+ * split at every constructor slot's VALUE bytes: `code` pieces are the
+ * byte runs kept in the template (including each slot's push header, whose
+ * presence pins the baked value's length), `slot` pieces are the excised
+ * value bytes. A verifier recomputes the template hash by concatenating
+ * the `code` pieces of a candidate script — using the concrete boundaries
+ * from the SDK's `resolveSlotLayout` — and hashing the result.
+ */
+export interface TemplateDigestPiece {
+  kind: 'code' | 'slot';
+  /** For kind 'slot': the excised slot's constructor param name. */
+  slot?: string;
+  /** For kind 'slot': the slot's TEMPLATE byte offset (disambiguates
+   *  multiple slots baked from the same parameter). */
+  byteOffset?: number;
+}
+
+/**
+ * Recipe for recomputing the contract's slot-excised template hash.
+ *
+ * `hash256-excised-slots`: hash256 (double SHA-256) over the resolved code
+ * part with every constructor slot's VALUE bytes removed. Push headers of
+ * 'data'/'scriptnum' pushes remain in the hashed template; single-opcode
+ * encodings (OP_N / OP_0 / OP_1NEGATE / bool) contribute no header and the
+ * opcode byte itself is excised.
+ */
+export interface TemplateDigest {
+  algorithm: 'hash256-excised-slots';
+  /** Alternating code/slot pieces, in script order (starts and ends with a
+   *  `code` piece; boundary `code` pieces may be empty byte runs). */
+  pieces: TemplateDigestPiece[];
 }
 
 // ---------------------------------------------------------------------------
@@ -195,8 +312,12 @@ export interface RunarArtifact {
   /** State field descriptors (present only for stateful contracts) */
   stateFields?: StateField[];
 
-  /** Byte offsets of constructor parameter placeholders in the script */
+  /** Byte offsets of constructor parameter placeholders in the script,
+   *  enriched with verification-descriptor metadata (name/type/encoding). */
   constructorSlots?: ConstructorSlot[];
+
+  /** Recipe for recomputing the slot-excised template identity hash. */
+  templateDigest?: TemplateDigest;
 
   /** Byte offsets of codeSepIndex placeholders in the script (OP_0 placeholders
    *  that the SDK must replace with the adjusted codeSeparatorIndex). */
