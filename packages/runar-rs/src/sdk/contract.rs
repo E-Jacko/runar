@@ -14,6 +14,7 @@ use super::deployment::{
     to_little_endian_32, to_little_endian_64, reverse_hex,
 };
 use super::calling::{build_call_transaction_ext, resolve_input_sequence, CallTxOptions, ContractOutput, AdditionalContractInput};
+use super::script_utils::extract_constructor_args;
 use super::provider::Provider;
 use super::signer::Signer;
 use super::errors::{assert_script_hex_under_limit, WitnessValueMissingError, MAX_SCRIPT_BYTES};
@@ -1757,17 +1758,12 @@ impl RunarContract {
         artifact: RunarArtifact,
         utxo: &Utxo,
     ) -> Self {
-        // Dummy constructor args -- we store the on-chain code script directly
-        // so these won't be used in get_locking_script().
-        let dummy_args: Vec<SdkValue> = artifact
-            .abi
-            .constructor
-            .params
-            .iter()
-            .map(|_| SdkValue::Int(0))
-            .collect();
+        // Recover the real constructor args baked into the deployed script
+        // (issue #119). Filling zeros made restored stateful spends compute the
+        // wrong state continuation and codesep/OP_PUSH_TX offset — unspendable.
+        let restored_args = restore_constructor_args(&artifact, &utxo.script);
 
-        let mut contract = RunarContract::new(artifact, dummy_args);
+        let mut contract = RunarContract::new(artifact, restored_args);
 
         // Store the code portion of the on-chain script.
         // Use opcode-aware walking to find the real OP_RETURN (not a 0x6a
@@ -2319,6 +2315,28 @@ fn revive_json_value(value: &serde_json::Value, field_type: &str) -> SdkValue {
         (_, serde_json::Value::String(s)) => SdkValue::Bytes(s.clone()),
         _ => SdkValue::Int(0),
     }
+}
+
+/// Recover the positional constructor argument list from a deployed locking
+/// script, so a restored contract (`from_utxo` / `from_tx_id`) operates on the
+/// real baked-in values rather than `0` placeholders (issue #119).
+///
+/// `extract_constructor_args` returns a name→value map keyed by ABI param name;
+/// `abi.constructor.params` is already ordered by paramIndex, so mapping over it
+/// yields the positional list the constructor expects. Params that carry no
+/// constructor slot (mutable state fields — their value lives in the OP_RETURN
+/// state section, restored separately by `extract_state_from_script`) are absent
+/// from the map and fall back to `0`, matching the prior placeholder behaviour.
+fn restore_constructor_args(artifact: &RunarArtifact, script_hex: &str) -> Vec<SdkValue> {
+    let params = &artifact.abi.constructor.params;
+    if params.is_empty() {
+        return Vec::new();
+    }
+    let extracted = extract_constructor_args(artifact, script_hex).unwrap_or_default();
+    params
+        .iter()
+        .map(|p| extracted.get(&p.name).cloned().unwrap_or(SdkValue::Int(0)))
+        .collect()
 }
 
 /// Build a named-args map from user ABI params and resolved arg values.
@@ -3619,6 +3637,43 @@ mod tests {
         let insc = reconnected.inscription().unwrap();
         assert_eq!(insc.content_type, "image/png");
         assert_eq!(insc.data, "deadbeef");
+    }
+
+    #[test]
+    fn from_utxo_restores_real_constructor_args_issue_119() {
+        // A constructor param `tag` baked into a slot at byte offset 0. Restore
+        // must read the real value from the deployed script, not fill a 0
+        // placeholder (which made restored stateful spends unspendable).
+        let artifact = RunarArtifact {
+            version: "runar-v0.1.0".to_string(),
+            contract_name: "Restorable".to_string(),
+            parent_class: None,
+            abi: Abi {
+                constructor: AbiConstructor {
+                    params: vec![AbiParam {
+                        name: "tag".to_string(),
+                        param_type: "bigint".to_string(),
+                        fixed_array: None,
+                    }],
+                },
+                methods: vec![],
+            },
+            script: "0093".to_string(), // template: OP_0 placeholder + OP_ADD
+            state_fields: None,
+            constructor_slots: Some(vec![ConstructorSlot { param_index: 0, byte_offset: 0 }]),
+            code_sep_index_slots: None,
+            code_separator_index: None,
+            code_separator_indices: None,
+            anf: None,
+        };
+        // Deployed script bakes tag = 42 at the slot (push 1 byte 0x2a).
+        let reconnected = RunarContract::from_utxo(artifact, &Utxo {
+            txid: "00".repeat(32),
+            output_index: 0,
+            satoshis: 1,
+            script: "012a93".to_string(),
+        });
+        assert_eq!(reconnected.constructor_args, vec![SdkValue::Int(42)]);
     }
 
     #[test]
