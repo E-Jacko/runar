@@ -1945,3 +1945,59 @@ func TestExtractLoopShape_ZeroStartCountingUp(t *testing.T) {
 		t.Errorf("expected (start=0, step=1, count=10), got (%s, %d, %d)", start.String(), step, count)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #130: a method param shadowing a property — both resolution directions.
+// A bare identifier `x` resolves to the param (load_param); explicit `this.x`
+// still resolves to the property (load_prop).
+// ---------------------------------------------------------------------------
+
+func TestParamShadowingProperty_Issue130(t *testing.T) {
+	source := `
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(x: bigint): void {
+    assert(x === this.x);
+  }
+}
+`
+	contract, _ := mustLowerToANF(t, source)
+	program := LowerToANF(contract)
+
+	methodIdx := -1
+	for i := range program.Methods {
+		if program.Methods[i].Name == "m" {
+			methodIdx = i
+			break
+		}
+	}
+	if methodIdx == -1 {
+		t.Fatal("could not find method 'm'")
+	}
+	method := program.Methods[methodIdx]
+
+	loadParamX, loadPropX := 0, 0
+	for _, b := range method.Body {
+		switch b.Value.Kind {
+		case "load_param":
+			if b.Value.Name == "x" {
+				loadParamX++
+			}
+		case "load_prop":
+			if b.Value.Name == "x" {
+				loadPropX++
+			}
+		}
+	}
+	// Bare `x` -> load_param (the witness value, not stale state).
+	if loadParamX != 1 {
+		t.Errorf("expected 1 load_param for bare `x` (issue #130), got %d", loadParamX)
+	}
+	// Explicit `this.x` -> load_prop.
+	if loadPropX != 1 {
+		t.Errorf("expected 1 load_prop for `this.x` (issue #130), got %d", loadPropX)
+	}
+}

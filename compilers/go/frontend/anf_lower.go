@@ -213,6 +213,17 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 		methodCtx := newLowerCtxWithEffects(contract, sideEffects)
 		methodCtx.setMethodParamTypes(method.Params)
 
+		// Register the declared param NAMES so a bare identifier resolves to
+		// load_param before falling through to load_prop (issue #130). Without
+		// this, a param whose name collides with a mutable state property
+		// lowered to the stale deserialized property value instead of the
+		// witness param. Explicit `this.x` is unaffected: it lowers via
+		// lowerMemberExpr / the property_access isProperty branch, which always
+		// emit load_prop regardless of param registration.
+		for _, p := range method.Params {
+			methodCtx.addParam(p.Name)
+		}
+
 		if contract.ParentClass == "StatefulSmartContract" && method.Visibility == "public" {
 			// Continuation requirements come from the side-effect summary,
 			// which walks the private-method call graph. A public method
@@ -1126,7 +1137,15 @@ func (ctx *lowerCtx) lowerExprToRef(expr Expression) string {
 		return ctx.lowerIdentifier(e)
 
 	case PropertyAccessExpr:
-		// this.txPreimage in StatefulSmartContract -> load_param (it's an implicit param, not a stored property)
+		// Explicit `this.x`: a real contract property always wins, even when a
+		// method param shares the name (issue #130). Now that declared params
+		// are registered, the isParam branch below must not shadow a stored
+		// property.
+		if ctx.isProperty(e.Property) {
+			return ctx.emit(ir.ANFValue{Kind: "load_prop", Name: e.Property})
+		}
+		// this.txPreimage in StatefulSmartContract -> load_param (it's an
+		// implicit injected param, not a stored property).
 		if ctx.isParam(e.Property) {
 			return ctx.emit(ir.ANFValue{Kind: "load_param", Name: e.Property})
 		}

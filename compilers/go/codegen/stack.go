@@ -419,6 +419,14 @@ type loweringContext struct {
 	arrayLengths       map[string]int      // element counts for array_literal bindings (used by checkMultiSig)
 	arrayElements      map[string][]string // element refs for array_literal bindings (used by checkMultiSig)
 
+	// renamedParams maps a method param name whose name collides with a MUTABLE
+	// property to the reserved stack-slot name its witness value lives under
+	// (issue #130). deserialize_state pushes each mutable property onto the
+	// stack under its own name, so a same-named param slot would otherwise be
+	// shadowed and load_param would read the stale deserialized state. Empty for
+	// the common no-collision case (byte-identical output).
+	renamedParams map[string]string
+
 	// Mode 3: when true, calls to assertGroth16WitnessAssisted in the
 	// method body are treated as no-ops by lowerCall. The actual verifier
 	// ops were already emitted as a method-entry preamble.
@@ -440,7 +448,33 @@ func newLoweringContext(params []string, properties []ir.ANFProperty) *loweringC
 		constValues:    make(map[string]*big.Int),
 		arrayLengths:   make(map[string]int),
 		arrayElements:  make(map[string][]string),
+		renamedParams:  make(map[string]string),
 	}
+
+	// Issue #130 (stack layer): a method param whose name collides with a
+	// MUTABLE property gets a duplicate stackMap slot once deserialize_state
+	// pushes that property under the same name. Name lookups resolve to the
+	// shallowest match (the deserialized property), so load_param would read the
+	// stale on-chain state instead of the witness value. Rename the colliding
+	// param's slot to a reserved, collision-proof name up front and remember the
+	// mapping so lowerLoadParam targets the real param slot. Only mutable
+	// properties are deserialized onto the stack, so readonly shadows (handled
+	// purely by ANF resolution) never enter this map, and non-colliding
+	// contracts get an empty map — byte-identical output.
+	mutablePropNames := make(map[string]bool, len(properties))
+	for _, p := range properties {
+		if !p.Readonly {
+			mutablePropNames[p.Name] = true
+		}
+	}
+	for _, name := range params {
+		if mutablePropNames[name] {
+			renamed := "__param_" + name
+			ctx.sm.renameAtDepth(ctx.sm.findDepth(name), renamed)
+			ctx.renamedParams[name] = renamed
+		}
+	}
+
 	ctx.trackDepth()
 	return ctx
 }
@@ -1055,9 +1089,16 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 // ---------------------------------------------------------------------------
 
 func (ctx *loweringContext) lowerLoadParam(bindingName, paramName string, bindingIndex int, lastUses map[string]int) {
-	if ctx.sm.has(paramName) {
+	// The parameter is already on the stack under its original name — or, for a
+	// param that shadows a mutable property, under a reserved renamed slot
+	// (issue #130) so it is not confused with the deserialized property slot.
+	slotName := paramName
+	if renamed, ok := ctx.renamedParams[paramName]; ok {
+		slotName = renamed
+	}
+	if ctx.sm.has(slotName) {
 		isLast := ctx.isLastUse(paramName, bindingIndex, lastUses)
-		ctx.bringToTop(paramName, isLast)
+		ctx.bringToTop(slotName, isLast)
 		ctx.sm.pop()
 		ctx.sm.push(bindingName)
 	} else {
