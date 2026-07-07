@@ -808,6 +808,38 @@ pub const RunarContract = struct {
             }
         }
 
+        // Issue #133: coin-select the non-terminal call's P2PKH funding inputs
+        // instead of sweeping the whole wallet. `additional_utxos` currently
+        // holds every candidate wallet UTXO; keep only the smallest-sufficient,
+        // largest-first subset (deploy's selectUtxos strategy) that covers the
+        // output/fee shortfall the contract's own input value does not.
+        {
+            var contract_output_sats: i64 = 0;
+            if (has_multi_output) {
+                for (multi_outputs_hex.items) |co| contract_output_sats += co.satoshis;
+            } else if (new_locking_script.len > 0) {
+                contract_output_sats += new_satoshis;
+            }
+            for (data_outputs_hex.items) |do_| contract_output_sats += do_.satoshis;
+            var contract_input_sats: i64 = contract_utxo.satoshis;
+            for (extra_contract_utxos) |u| contract_input_sats += u.satoshis;
+            const funding_lock_len: usize = if (new_locking_script.len > 0)
+                new_locking_script.len / 2
+            else if (has_multi_output and multi_outputs_hex.items.len > 0)
+                multi_outputs_hex.items[0].script.len / 2
+            else
+                0;
+            try self.selectCallFunding(
+                &additional_utxos,
+                is_terminal_call,
+                contract_output_sats,
+                contract_input_sats,
+                funding_lock_len,
+                fee_rate,
+                if (options) |o| o.max_funding_inputs else null,
+            );
+        }
+
         // ---------------------------------------------------------------
         // Stateless path
         // ---------------------------------------------------------------
@@ -1437,6 +1469,19 @@ pub const RunarContract = struct {
             }
         }
 
+        // Issue #133: coin-select funding instead of sweeping the wallet. A
+        // stateless prepare has no continuation output (build is called with no
+        // new locking script), so contract_output_sats is 0.
+        try self.selectCallFunding(
+            &additional_utxos,
+            is_terminal_call,
+            0,
+            contract_utxo.satoshis,
+            0,
+            fee_rate,
+            if (options) |o| o.max_funding_inputs else null,
+        );
+
         // ---- Build placeholder unlock + tx ------------------------------
         const placeholder_unlock = try self.buildUnlockingScript(method_name, resolved_args);
         defer self.allocator.free(placeholder_unlock);
@@ -1721,6 +1766,19 @@ pub const RunarContract = struct {
         const stateful_build_opts_ptr: ?*const call_mod.CallBuildOptions =
             if (is_terminal_call or (if (options) |o| o.locktime != null else false) or (if (options) |o| o.sequence != null else false)) &stateful_build_opts else null;
 
+        // Issue #133: coin-select funding instead of sweeping the wallet. The
+        // continuation output value (stateful_new_satoshis) is the only output
+        // this prepare path emits before change; no data/multi outputs here.
+        try self.selectCallFunding(
+            &additional_utxos,
+            is_terminal_call,
+            stateful_new_satoshis,
+            contract_utxo.satoshis,
+            if (new_locking_script.len > 0) new_locking_script.len / 2 else 0,
+            fee_rate,
+            if (options) |o| o.max_funding_inputs else null,
+        );
+
         // ---- Compute change PKH for stateful methods needing it ----------
         var change_pkh_buf: []u8 = &.{};
         errdefer if (change_pkh_buf.len > 0) self.allocator.free(change_pkh_buf);
@@ -1894,6 +1952,66 @@ pub const RunarContract = struct {
             .code_sep_idx = code_sep_idx,
             .intent_witness_hex = intent_witness_owned,
         };
+    }
+
+    /// Coin-select the non-terminal call's P2PKH funding inputs (issue #133).
+    ///
+    /// `additional_utxos` arrives holding every candidate wallet UTXO (borrowed
+    /// references). Replace the full-wallet sweep with the smallest-sufficient,
+    /// largest-first subset — the same strategy deploy's selectUtxos uses —
+    /// covering `funding_target = contract_output_sats - contract_input_sats`
+    /// (clamped to 0) plus the tx fee. selectUtxos returns clones, so we map the
+    /// selection back to the borrowed candidate references and keep only those:
+    /// ownership is unchanged (the entries still borrow from the caller's
+    /// `all_utxos`). Terminal calls are left untouched (their funding is caller-
+    /// supplied). Fails with InsufficientFunds when the selection would exceed
+    /// `max_funding_inputs`.
+    fn selectCallFunding(
+        self: *RunarContract,
+        additional_utxos: *std.ArrayListUnmanaged(types.UTXO),
+        is_terminal_call: bool,
+        contract_output_sats: i64,
+        contract_input_sats: i64,
+        funding_lock_len: usize,
+        fee_rate: i64,
+        max_funding_inputs: ?usize,
+    ) !void {
+        if (is_terminal_call or additional_utxos.items.len == 0) return;
+
+        var funding_target: i64 = contract_output_sats - contract_input_sats;
+        if (funding_target < 0) funding_target = 0;
+
+        const selected = try deploy_mod.selectUtxos(
+            self.allocator,
+            additional_utxos.items,
+            funding_target,
+            funding_lock_len,
+            fee_rate,
+        );
+        defer {
+            for (selected) |*u| u.deinit(self.allocator);
+            self.allocator.free(selected);
+        }
+
+        if (max_funding_inputs) |cap| {
+            if (selected.len > cap) return ContractError.InsufficientFunds;
+        }
+
+        // Rebuild `additional_utxos` as the borrowed subset matching the
+        // selection (map selectUtxos' clones back to the original refs by
+        // prevout).
+        var kept: std.ArrayListUnmanaged(types.UTXO) = .empty;
+        defer kept.deinit(self.allocator);
+        for (additional_utxos.items) |cand| {
+            for (selected) |sel| {
+                if (std.mem.eql(u8, cand.txid, sel.txid) and cand.output_index == sel.output_index) {
+                    try kept.append(self.allocator, cand);
+                    break;
+                }
+            }
+        }
+        additional_utxos.clearRetainingCapacity();
+        try additional_utxos.appendSlice(self.allocator, kept.items);
     }
 
     /// Sign every P2PKH funding input on `tx_hex` (input 0 is the contract).
@@ -3636,6 +3754,64 @@ test "terminal call adds fee_utxo input to pay the miner fee (#118)" {
         const raw_tx = try prov.provider().getRawTransaction(allocator, txid);
         defer allocator.free(raw_tx);
         try std.testing.expect(std.mem.indexOf(u8, raw_tx, "cc" ** 32) == null);
+    }
+}
+
+// Issue #133: the non-terminal call funding path coin-selects the smallest
+// largest-first subset of wallet UTXOs (reusing selectUtxos) instead of sweeping
+// every candidate, and enforces max_funding_inputs.
+test "selectCallFunding trims the wallet sweep to the minimal subset (#133)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"contractName":"Trivial","version":"1","compilerVersion":"1.0","script":"51","asm":"OP_1",
+        \\"abi":{"constructor":{"params":[]},"methods":[{"name":"unlock","params":[],"isPublic":true}]},
+        \\"stateFields":[],"constructorSlots":[],"buildTimestamp":"2024-01-01"}
+    ;
+    var artifact = try types.RunarArtifact.fromJson(allocator, json);
+    defer artifact.deinit();
+    var contract = try RunarContract.init(allocator, &artifact, &.{});
+    defer contract.deinit();
+
+    const p2pkh = "76a914" ++ ("00" ** 20) ++ "88ac";
+    const cands = [_]types.UTXO{
+        .{ .txid = "01" ** 32, .output_index = 0, .satoshis = 1000, .script = p2pkh },
+        .{ .txid = "02" ** 32, .output_index = 0, .satoshis = 2000, .script = p2pkh },
+        .{ .txid = "03" ** 32, .output_index = 0, .satoshis = 10000, .script = p2pkh },
+        .{ .txid = "04" ** 32, .output_index = 0, .satoshis = 500, .script = p2pkh },
+        .{ .txid = "05" ** 32, .output_index = 0, .satoshis = 3000, .script = p2pkh },
+    };
+
+    // funding_target = output(0) - input(0) = 0 → cover just the fee. The
+    // largest UTXO (10000) alone covers it → exactly 1 input, and it is the
+    // largest (not the whole 5-UTXO wallet).
+    {
+        var au: std.ArrayListUnmanaged(types.UTXO) = .empty;
+        defer au.deinit(allocator);
+        for (cands) |c| try au.append(allocator, c);
+        try contract.selectCallFunding(&au, false, 0, 0, 25, 100, null);
+        try std.testing.expectEqual(@as(usize, 1), au.items.len);
+        try std.testing.expectEqual(@as(i64, 10000), au.items[0].satoshis);
+    }
+
+    // A terminal call leaves the caller-supplied funding untouched.
+    {
+        var au: std.ArrayListUnmanaged(types.UTXO) = .empty;
+        defer au.deinit(allocator);
+        for (cands) |c| try au.append(allocator, c);
+        try contract.selectCallFunding(&au, true, 0, 0, 25, 100, null);
+        try std.testing.expectEqual(@as(usize, 5), au.items.len);
+    }
+
+    // max_funding_inputs cap: covering funding_target 5000 needs the 10000 UTXO
+    // (1 input), which exceeds a cap of 0 → fail loudly.
+    {
+        var au: std.ArrayListUnmanaged(types.UTXO) = .empty;
+        defer au.deinit(allocator);
+        for (cands) |c| try au.append(allocator, c);
+        try std.testing.expectError(
+            ContractError.InsufficientFunds,
+            contract.selectCallFunding(&au, false, 5000, 0, 25, 100, 0),
+        );
     }
 }
 

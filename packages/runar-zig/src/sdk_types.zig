@@ -155,6 +155,13 @@ pub const CallOptions = struct {
     /// The method's own `Sig` args are still signed by the connected signer.
     /// Defaults to the connected signer (zero behaviour change).
     funding_signer: ?@import("sdk_signer.zig").Signer = null,
+    /// Cap the number of P2PKH funding inputs added to a non-terminal call tx
+    /// (issue #133). Funding is chosen by smallest-sufficient, largest-first
+    /// selection (the same selectUtxos strategy deploy uses). If covering the
+    /// outputs + fee would need more than this many inputs, the call fails
+    /// (InsufficientFunds) rather than silently sweeping the wallet. null → no
+    /// cap.
+    max_funding_inputs: ?usize = null,
 };
 
 /// OutputSpec describes one continuation output for a multi-output method.
