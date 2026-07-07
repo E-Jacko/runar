@@ -1254,14 +1254,41 @@ func (c *RunarContract) FinalizeCall(
 // without needing a Provider to fetch the transaction. This is the synchronous
 // equivalent of FromTxId() — use it when the UTXO data is already available
 // (e.g. from an overlay service or cache).
-func FromUtxo(artifact *RunarArtifact, utxo UTXO) *RunarContract {
-	// Create dummy constructor args
-	dummyArgs := make([]interface{}, len(artifact.ABI.Constructor.Params))
-	for i := range dummyArgs {
-		dummyArgs[i] = int64(0)
+// restoreConstructorArgs recovers the positional constructor argument list from
+// a deployed locking script, so a restored contract (FromUtxo / FromTxId)
+// operates on the real baked-in values rather than 0 placeholders (issue #119).
+//
+// ExtractConstructorArgs returns a name→value map keyed by ABI param name;
+// artifact.ABI.Constructor.Params is already ordered by paramIndex, so mapping
+// over it yields the positional []interface{} the RunarContract expects. Params
+// that carry no constructor slot (mutable state fields — their value lives in
+// the OP_RETURN state section, restored separately by ExtractStateFromScript)
+// are absent from the extracted map; they fall back to int64(0), matching the
+// prior placeholder behaviour.
+func restoreConstructorArgs(artifact *RunarArtifact, scriptHex string) []interface{} {
+	params := artifact.ABI.Constructor.Params
+	if len(params) == 0 {
+		return []interface{}{}
 	}
+	extracted := ExtractConstructorArgs(artifact, scriptHex)
+	out := make([]interface{}, len(params))
+	for i, p := range params {
+		if v, ok := extracted[p.Name]; ok {
+			out[i] = v
+		} else {
+			out[i] = int64(0)
+		}
+	}
+	return out
+}
 
-	contract := NewRunarContract(artifact, dummyArgs)
+func FromUtxo(artifact *RunarArtifact, utxo UTXO) *RunarContract {
+	// Recover the real baked-in constructor args from the deployed script so a
+	// restored contract operates on the true values rather than 0 placeholders
+	// (issue #119). readonly ctor params feed the state-continuation formula and
+	// adjustCodeSepOffset; zeros there yield the wrong continuation and the
+	// wrong OP_CODESEPARATOR offset, making restored stateful spends unspendable.
+	contract := NewRunarContract(artifact, restoreConstructorArgs(artifact, utxo.Script))
 
 	// Store the code portion of the on-chain script
 	if len(artifact.StateFields) > 0 {
@@ -1325,13 +1352,10 @@ func FromTxId(
 
 	output := tx.Outputs[outputIndex]
 
-	// Create dummy constructor args (we'll store the on-chain code script directly)
-	dummyArgs := make([]interface{}, len(artifact.ABI.Constructor.Params))
-	for i := range dummyArgs {
-		dummyArgs[i] = int64(0)
-	}
-
-	contract := NewRunarContract(artifact, dummyArgs)
+	// Recover the real baked-in constructor args from the deployed script (issue
+	// #119) — see FromUtxo. Params without a constructor slot (mutable state
+	// fields) fall back to 0 and are overwritten by ExtractStateFromScript.
+	contract := NewRunarContract(artifact, restoreConstructorArgs(artifact, output.Script))
 
 	// Store the code portion of the on-chain script.
 	// Use opcode-aware walking to find the real OP_RETURN (not a 0x6a
