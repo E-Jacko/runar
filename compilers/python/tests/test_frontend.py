@@ -1747,8 +1747,17 @@ class FT extends StatefulSmartContract {
         assert len(state_refs) == 2
         assert len(data_refs) == 1
 
+        # Issue #116: the change output is gated behind a runtime
+        # `if (_changeAmount != 0)`; buildChangeOutput now lives inside the
+        # if-then branch, and the top-level continuation cats with the if
+        # node's result ref.
+        change_if = next(
+            (b for b in transfer.body if b.value.kind == "if"),
+            None,
+        )
+        assert change_if is not None
         change_builder = next(
-            (b for b in transfer.body
+            (b for b in (change_if.value.then or [])
              if b.value.kind == "call" and b.value.func == "buildChangeOutput"),
             None,
         )

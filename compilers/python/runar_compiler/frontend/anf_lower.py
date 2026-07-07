@@ -354,10 +354,36 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
             # locking script will not match the auto-injected parameter
             # list.
             if needs_change_output:
-                # Build the P2PKH change output for hashOutputs verification
+                # Build the P2PKH change output for hashOutputs verification.
+                #
+                # Issue #116: the SDK's build_call_transaction OMITS the change
+                # output when ``change <= 0`` (an exact-cover call) and passes
+                # ``_changeAmount = 0``. Gate the change segment on
+                # ``_changeAmount != 0`` at runtime so the hashed output set
+                # matches the SDK at the exact-zero boundary -- the segment is
+                # the P2PKH change output when non-zero, and empty bytes (cat
+                # with empty is a no-op) when zero, reproducing the omission.
+                # For any change > 0 the hashed bytes are unchanged; only the
+                # emitted script gains the guard.
                 change_pkh_ref = method_ctx.emit(ANFValue(kind="load_param", name="_changePKH"))
                 change_amount_ref = method_ctx.emit(ANFValue(kind="load_param", name="_changeAmount"))
-                change_output_ref = method_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+                zero_ref = method_ctx.emit(_make_load_const_int(0))
+                change_non_zero_ref = method_ctx.emit(ANFValue(
+                    kind="bin_op", op="!==",
+                    left=change_amount_ref, right=zero_ref,
+                ))
+                change_then_ctx = method_ctx.sub_context()
+                change_then_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+                method_ctx.sync_counter(change_then_ctx)
+                change_else_ctx = method_ctx.sub_context()
+                change_else_ctx.emit(_make_load_const_string(""))
+                method_ctx.sync_counter(change_else_ctx)
+                change_output_ref = method_ctx.emit(ANFValue(
+                    kind="if",
+                    cond=change_non_zero_ref,
+                    then=change_then_ctx.bindings,
+                    else_=change_else_ctx.bindings,
+                ))
 
                 if add_output_refs:
                     # Multi-output continuation: concat all state outputs, then
