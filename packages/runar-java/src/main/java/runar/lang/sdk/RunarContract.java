@@ -62,14 +62,20 @@ public final class RunarContract {
 
     /**
      * Internal constructor used by {@link #fromUtxo} / {@link #fromTxId}
-     * to re-attach to an existing on-chain UTXO without re-running the
-     * constructor-arg pipeline. Constructor args are intentionally
-     * empty: the deployed locking script already encodes them, and
-     * subsequent calls do not need them re-run through ContractScript.
+     * to re-attach to an existing on-chain UTXO.
+     *
+     * <p>Issue #119: the constructor args are recovered from the deployed
+     * locking script via {@link ContractScript#extractConstructorArgs} rather
+     * than left empty. Restored stateful spends feed readonly ctor params into
+     * the ANF interpreter's state-continuation formula, so a placeholder
+     * (empty / zero) arg list computed the wrong new state and left the spend
+     * unspendable. Params without a constructor slot (mutable state fields)
+     * fall back to 0 and are overwritten by {@link StateSerializer} below.
      */
     private RunarContract(RunarArtifact artifact, UTXO utxo) {
         this.artifact = artifact;
-        this.constructorArgs = List.of();
+        this.constructorArgs = List.copyOf(
+            ContractScript.extractConstructorArgs(artifact, utxo.scriptHex()));
         this.state = new HashMap<>();
         this.currentUtxo = utxo;
         if (artifact.isStateful()) {
@@ -976,7 +982,9 @@ public final class RunarContract {
      * <p>Falls back to the legacy template-adjusted offset for synthetic /
      * unit-test paths that have no live script available.
      */
-    private int getCodeSepIndex(int methodIndex) {
+    // Package-private (not private) so the #132 regression test can assert the
+    // byte-walk behaviour directly. See RunarContractSdkFixesTest.
+    int getCodeSepIndex(int methodIndex) {
         if (currentUtxo != null && currentUtxo.scriptHex() != null) {
             java.util.List<Integer> realOffsets =
                 findCodesepOffsets(currentUtxo.scriptHex());
