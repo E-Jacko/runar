@@ -128,6 +128,32 @@ pub struct WalletProviderOptions<W: WalletClient> {
 }
 
 // ---------------------------------------------------------------------------
+// Broadcaster trait (issue #107 — shared-broadcaster injection)
+// ---------------------------------------------------------------------------
+
+/// Minimal, synchronous transaction broadcaster injection point (issue #107).
+///
+/// Lets the SDK and a downstream layer (e.g. wallet-toolbox) broadcast through
+/// **one** shared instance/configuration rather than `WalletProvider`'s
+/// hardcoded ARC URL. When both layers share a broadcaster, parent and child
+/// transactions land at the same ARC deployment, avoiding the
+/// `SEEN_IN_ORPHAN_MEMPOOL` divergence described in the issue.
+///
+/// This is deliberately a *synchronous* trait matching the runar-rs SDK's
+/// existing blocking (`ureq`) transport and the `Provider::broadcast` error
+/// shape (`Result<String, String>`). The canonical
+/// `bsv::transaction::Broadcaster` is `#[async_trait]`; adopting it directly
+/// here would force a full async runtime into an otherwise-synchronous SDK.
+/// A consumer holding a canonical async broadcaster wraps it in a thin adapter
+/// that `block_on`s their runtime and flattens the structured failure into the
+/// `Err(String)` shape.
+pub trait Broadcaster {
+    /// Broadcast a transaction. Returns `Ok(txid)` on success, or `Err(message)`
+    /// on failure (any structured failure flattened into the message).
+    fn broadcast(&self, tx: &BsvTransaction) -> Result<String, String>;
+}
+
+// ---------------------------------------------------------------------------
 // WalletProvider
 // ---------------------------------------------------------------------------
 
@@ -148,6 +174,9 @@ pub struct WalletProvider<W: WalletClient> {
     tx_cache: HashMap<String, String>,
     /// Cached public key from the wallet (lazily computed).
     cached_pub_key: Option<String>,
+    /// Optional injected broadcaster (issue #107). When set, `broadcast()`
+    /// delegates here instead of the hardcoded ARC URL path.
+    broadcaster: Option<Box<dyn Broadcaster>>,
 }
 
 impl<W: WalletClient> WalletProvider<W> {
@@ -177,7 +206,19 @@ impl<W: WalletClient> WalletProvider<W> {
             fee_rate: fee_rate.unwrap_or(100),
             tx_cache: HashMap::new(),
             cached_pub_key: None,
+            broadcaster: None,
         }
+    }
+
+    /// Inject a shared broadcaster (issue #107).
+    ///
+    /// Additive and non-breaking: `broadcast()` delegates to `broadcaster` when
+    /// set, else falls back to the hardcoded ARC URL. Consumes and returns
+    /// `self` for builder-style chaining, e.g.
+    /// `WalletProvider::new(..).with_broadcaster(Box::new(my_broadcaster))`.
+    pub fn with_broadcaster(mut self, broadcaster: Box<dyn Broadcaster>) -> Self {
+        self.broadcaster = Some(broadcaster);
+        self
     }
 
     /// Cache a raw transaction hex by its txid (for EF parent lookups).
@@ -292,6 +333,19 @@ impl<W: WalletClient> Provider for WalletProvider<W> {
 
     fn broadcast(&mut self, tx: &BsvTransaction) -> Result<String, String> {
         let raw_hex = tx.to_hex().map_err(|e| format!("WalletProvider broadcast: to_hex failed: {}", e))?;
+
+        // Issue #107: when a broadcaster is injected, delegate to it so the SDK
+        // and the calling layer share one broadcaster instance/config (avoids
+        // parent/child landing at divergent ARC deployments →
+        // SEEN_IN_ORPHAN_MEMPOOL). `map` runs the delegated broadcast and drops
+        // the immutable borrow of `self.broadcaster` before we mutate tx_cache.
+        let injected = self.broadcaster.as_ref().map(|b| b.broadcast(tx));
+        if let Some(result) = injected {
+            let txid = result?;
+            self.tx_cache.insert(txid.clone(), raw_hex);
+            return Ok(txid);
+        }
+
         let raw_bytes = hex_to_bytes(&raw_hex)?;
         let txid = compute_txid(&raw_bytes);
 
@@ -1473,5 +1527,94 @@ mod tests {
         assert_eq!(tx.raw.as_deref(), Some("01000000deadbeef"));
         assert!(tx.inputs.is_empty());
         assert!(tx.outputs.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // #107 — WalletProvider injected broadcaster (Shape B: additive, non-breaking)
+    // -----------------------------------------------------------------------
+
+    use std::rc::Rc;
+
+    /// A mock Broadcaster that records call count and returns a fixed txid.
+    struct MockBroadcaster {
+        txid: String,
+        calls: Rc<RefCell<u32>>,
+    }
+
+    impl Broadcaster for MockBroadcaster {
+        fn broadcast(&self, _tx: &BsvTransaction) -> Result<String, String> {
+            *self.calls.borrow_mut() += 1;
+            Ok(self.txid.clone())
+        }
+    }
+
+    #[test]
+    fn b107_injected_broadcaster_is_used_instead_of_hardcoded_arc() {
+        // ARC url is dead: if broadcast fell through to the hardcoded path it
+        // would Err. Instead it must delegate to the injected broadcaster and
+        // return that broadcaster's txid.
+        let calls = Rc::new(RefCell::new(0u32));
+        let expected = "bb".repeat(32);
+        let broadcaster = Box::new(MockBroadcaster {
+            txid: expected.clone(),
+            calls: Rc::clone(&calls),
+        });
+
+        let mut provider = provider_with_arc(dead_arc_url()).with_broadcaster(broadcaster);
+        let tx = BsvTransaction::from_hex(&minimal_raw_tx_hex()).unwrap();
+        let txid = provider.broadcast(&tx).unwrap();
+
+        assert_eq!(
+            txid, expected,
+            "#107: broadcast must return the injected broadcaster's txid, not the hardcoded ARC path"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            1,
+            "#107: the injected broadcaster must be called exactly once"
+        );
+        // The returned txid is cached for subsequent EF parent lookups.
+        assert_eq!(
+            provider.get_raw_transaction(&expected).unwrap(),
+            minimal_raw_tx_hex(),
+            "#107: delegated broadcast must still cache the raw tx by txid"
+        );
+    }
+
+    #[test]
+    fn b107_injected_broadcaster_failure_flattens_to_err() {
+        struct FailBroadcaster;
+        impl Broadcaster for FailBroadcaster {
+            fn broadcast(&self, _tx: &BsvTransaction) -> Result<String, String> {
+                Err("461 preimage mismatch".to_string())
+            }
+        }
+        let mut provider =
+            provider_with_arc(dead_arc_url()).with_broadcaster(Box::new(FailBroadcaster));
+        let tx = BsvTransaction::from_hex(&minimal_raw_tx_hex()).unwrap();
+        let result = provider.broadcast(&tx);
+        assert!(
+            result.is_err(),
+            "#107: an injected broadcaster failure must surface as Err (flattened), got {:?}",
+            result
+        );
+        assert!(result.unwrap_err().contains("461"));
+    }
+
+    #[test]
+    fn b107_no_injection_uses_default_arc_path() {
+        // No broadcaster injected → the hardcoded ARC path still runs. Against a
+        // live mock ARC returning a known txid, broadcast returns THAT txid —
+        // proving the default (existing) behavior is unchanged.
+        let arc_txid = "cc".repeat(32);
+        let body: &'static str =
+            Box::leak(format!("{{\"txid\":\"{}\"}}", arc_txid).into_boxed_str());
+        let mut provider = provider_with_arc(spawn_mock_arc("200 OK", body));
+        let tx = BsvTransaction::from_hex(&minimal_raw_tx_hex()).unwrap();
+        assert_eq!(
+            provider.broadcast(&tx).unwrap(),
+            arc_txid,
+            "#107: without an injected broadcaster, the default ARC path must still run"
+        );
     }
 }
