@@ -40,6 +40,21 @@ function bindingsOfKind(bindings: ANFBinding[], kind: string): ANFBinding[] {
   return bindings.filter(b => b.value.kind === kind);
 }
 
+/** Recursive variant: also descends into `if` branches and `loop` bodies. */
+function bindingsOfKindDeep(bindings: ANFBinding[], kind: string): ANFBinding[] {
+  const out: ANFBinding[] = [];
+  for (const b of bindings) {
+    if (b.value.kind === kind) out.push(b);
+    if (b.value.kind === 'if') {
+      out.push(...bindingsOfKindDeep(b.value.then, kind));
+      out.push(...bindingsOfKindDeep(b.value.else, kind));
+    } else if (b.value.kind === 'loop') {
+      out.push(...bindingsOfKindDeep(b.value.body, kind));
+    }
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -743,9 +758,18 @@ describe('Pass 4: ANF Lower', () => {
       const computeOutputCall = calls.find(b => (b.value as { func: string }).func === 'computeStateOutput');
       expect(computeOutputCall).toBeDefined();
 
-      // Check that buildChangeOutput is called (builds P2PKH change output)
-      const buildChangeCall = calls.find(b => (b.value as { func: string }).func === 'buildChangeOutput');
+      // Check that buildChangeOutput is called (builds P2PKH change output).
+      // Issue #116: the change segment is now gated on `_changeAmount != 0`, so
+      // buildChangeOutput lives inside the then-branch of an `if` node.
+      const buildChangeCall = bindingsOfKindDeep(method.body, 'call')
+        .find(b => (b.value as { func: string }).func === 'buildChangeOutput');
       expect(buildChangeCall).toBeDefined();
+      // The change segment is a runtime conditional, not an unconditional cat.
+      const changeIf = bindingsOfKind(method.body, 'if').find(
+        b => bindingsOfKindDeep([b], 'call')
+          .some(c => (c.value as { func: string }).func === 'buildChangeOutput'),
+      );
+      expect(changeIf).toBeDefined();
 
       // Check that hash256 is called (hashes concatenated outputs)
       const hash256Call = calls.find(b => (b.value as { func: string }).func === 'hash256');
@@ -994,11 +1018,15 @@ describe('Pass 4: ANF Lower', () => {
       // the change output. Verify cat args reference data output binding.
       const addOutputRefs = bindingsOfKind(method.body, 'add_output').map(b => b.name);
       const dataOutputRefs = bindingsOfKind(method.body, 'add_data_output').map(b => b.name);
-      const changeBuilder = method.body.find(
-        b => b.value.kind === 'call' && (b.value as { func: string }).func === 'buildChangeOutput',
+      // Issue #116: the change segment is gated on `_changeAmount != 0`, so the
+      // continuation cats the `if` node's result (buildChangeOutput lives in its
+      // then-branch), not buildChangeOutput directly.
+      const changeIf = bindingsOfKind(method.body, 'if').find(
+        b => bindingsOfKindDeep([b], 'call')
+          .some(c => (c.value as { func: string }).func === 'buildChangeOutput'),
       );
-      expect(changeBuilder).toBeDefined();
-      const changeRef = changeBuilder!.name;
+      expect(changeIf).toBeDefined();
+      const changeRef = changeIf!.name;
 
       const cats = method.body.filter(
         b => b.value.kind === 'call' && (b.value as { func: string }).func === 'cat',

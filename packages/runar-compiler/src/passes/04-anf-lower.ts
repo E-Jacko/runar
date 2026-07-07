@@ -235,10 +235,32 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       // `private-helper-outputs` conformance fixture (its `partition`
       // and `log` methods route outputs through private helpers).
       if (needsChangeOutput) {
-        // Build the P2PKH change output for hashOutputs verification
+        // Build the P2PKH change output for hashOutputs verification.
+        //
+        // Issue #116: the SDK's buildCallTransaction OMITS the change output
+        // when `change <= 0` (an exact-cover call) and passes `_changeAmount =
+        // 0`. Gate the change segment on `_changeAmount != 0` at runtime so the
+        // hashed output set matches the SDK at the exact-zero boundary — the
+        // segment is the P2PKH change output when non-zero, and empty bytes
+        // (cat with empty is a no-op) when zero, reproducing the omission. For
+        // any change > 0 the hashed bytes are unchanged; only the emitted
+        // script gains the guard.
         const changePKHRef = methodCtx.emit({ kind: 'load_param', name: '_changePKH' });
         const changeAmountRef = methodCtx.emit({ kind: 'load_param', name: '_changeAmount' });
-        const changeOutputRef = methodCtx.emit({ kind: 'call', func: 'buildChangeOutput', args: [changePKHRef, changeAmountRef] });
+        const zeroRef = methodCtx.emit({ kind: 'load_const', value: 0n });
+        const changeNonZeroRef = methodCtx.emit({ kind: 'bin_op', op: '!==', left: changeAmountRef, right: zeroRef });
+        const changeThenCtx = methodCtx.subContext();
+        changeThenCtx.emit({ kind: 'call', func: 'buildChangeOutput', args: [changePKHRef, changeAmountRef] });
+        methodCtx.syncCounter(changeThenCtx);
+        const changeElseCtx = methodCtx.subContext();
+        changeElseCtx.emit({ kind: 'load_const', value: '' });
+        methodCtx.syncCounter(changeElseCtx);
+        const changeOutputRef = methodCtx.emit({
+          kind: 'if',
+          cond: changeNonZeroRef,
+          then: changeThenCtx.bindings,
+          else: changeElseCtx.bindings,
+        });
 
         if (addOutputRefs.length > 0) {
           // Multi-output continuation: concat all state outputs, then all
