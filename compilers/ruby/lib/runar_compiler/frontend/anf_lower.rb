@@ -12,9 +12,14 @@
 require "json"
 require_relative "../ir/types"
 require_relative "ast_nodes"
+require_relative "sighash_directive"
 
 module RunarCompiler
   module Frontend
+    # SIGHASH_ALL | SIGHASH_FORKID — the default @sighash mode (issue #123).
+    # Byte-identical to the historically-pinned covenant binding blob.
+    SIGHASH_DEFAULT = SighashDirective::SIGHASH_DEFAULT
+
     # -------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------
@@ -185,6 +190,15 @@ module RunarCompiler
       contract.methods.each do |method|
         method_ctx = LoweringContext.new(contract)
 
+        # Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+        # flag for any checkPreimage (auto-injected below, or a manual call) in
+        # this method. Omitted for the default so the ANF (and pinned binding
+        # blob) is unchanged.
+        method_sighash = method.respond_to?(:sighash_type) ? method.sighash_type : nil
+        if !method_sighash.nil? && method_sighash != SIGHASH_DEFAULT
+          method_ctx.sighash_flag = method_sighash
+        end
+
         # Register the developer-declared param types scoped to this method
         # before lowering its body, so byte-type analysis sees only this
         # method's params (issue #34).
@@ -233,21 +247,30 @@ module RunarCompiler
           method_ctx.add_param("txPreimage")
           method_ctx.register_param_type("txPreimage", "SigHashPreimage")
 
+          # Issue #123: the declared per-method sighash mode (default ALL|FORKID).
+          # Drives BOTH the OP_PUSH_TX binding flag (so the derived sig re-computes
+          # the tx sighash under this mode) AND the runtime preimage-type assert.
+          sighash_mode = method_sighash.nil? ? SIGHASH_DEFAULT : method_sighash
+          is_default_sighash = sighash_mode == SIGHASH_DEFAULT
+
           # Inject checkPreimage(txPreimage) at the start
           preimage_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
-          check_result = method_ctx.emit(IR::ANFValue.new(kind: "check_preimage").tap { |v| v.preimage = preimage_ref })
+          check_result = method_ctx.emit(IR::ANFValue.new(kind: "check_preimage").tap do |v|
+            v.preimage = preimage_ref
+            # Omit for the default so the ANF (and pinned binding blob) is unchanged.
+            v.sighash_flag = sighash_mode unless is_default_sighash
+          end)
           method_ctx.emit(_make_assert(check_result))
 
-          # GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-          # auto-injected covenant cannot be spent under a permissive sighash
-          # flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
-          # a contract may read. The hashOutputs continuation already fails
-          # under non-ALL flags, so this is a no-op on spendability for
-          # continuation-using methods and closes the field-zeroing exposure
-          # for the rest.
+          # GAP-302 / #123: pin the sighash type to the declared mode. The
+          # auto-injected covenant verifies a real tx preimage, but without this
+          # check the spend could use a DIFFERENT sighash flag than declared that
+          # zeroes out preimage fields the contract (or its continuation) relies
+          # on (hashOutputs / hashPrevouts / hashSequence). The value defaults to
+          # 0x41 (SIGHASH_ALL|FORKID) so existing contracts emit byte-identical ANF.
           sig_hash_preimage_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
           sig_hash_type_ref = method_ctx.emit(_make_call("extractSigHashType", [sig_hash_preimage_ref]))
-          expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(0x41))
+          expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(sighash_mode))
           sig_hash_ok_ref = method_ctx.emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
             v.op = "==="
             v.left = sig_hash_type_ref
@@ -391,7 +414,8 @@ module RunarCompiler
             name: method.name,
             params: augmented_params,
             body: method_ctx.bindings,
-            is_public: true
+            is_public: true,
+            sighash_type: method_sighash
           )
         else
           # Issue #109: stateless public methods (and stateless contracts'
@@ -416,7 +440,8 @@ module RunarCompiler
             name: method.name,
             params: augmented,
             body: method_ctx.bindings,
-            is_public: method.visibility == "public"
+            is_public: method.visibility == "public",
+            sighash_type: method_sighash
           )
         end
       end
@@ -530,10 +555,17 @@ module RunarCompiler
         # inside a branch surface at the parent method's ABI. Mirrors the
         # Go reference compiler's methodScopeT.
         @method_scope = MethodScope.new
+        # Issue #123: non-default @sighash flag for this method (nil = default).
+        @sighash_flag = nil
       end
 
       # @return [MethodScope] shared per-method bookkeeping for intent intrinsics
       attr_reader :method_scope
+
+      # Issue #123: the declared non-default +@sighash+ flag for the method being
+      # lowered, so a MANUAL +checkPreimage(pre)+ call binds under the same mode
+      # as the method's declared sighash. nil = default ALL|FORKID.
+      attr_accessor :sighash_flag
 
       # Push an alias for a parameter name, used while inlining the body of
       # a private method into this context: identifier references to that
@@ -765,6 +797,9 @@ module RunarCompiler
         # registrations and the once-per-method hashOutputs flag propagate up
         # from if/else branches. Mirrors Go subContext.methodScope sharing.
         sub.instance_variable_set(:@method_scope, @method_scope)
+        # Propagate the method's declared @sighash flag (issue #123) so a manual
+        # checkPreimage inside an if/else branch binds under the same mode.
+        sub.sighash_flag = @sighash_flag
         sub
       end
 
@@ -1144,7 +1179,11 @@ module RunarCompiler
         if callee.is_a?(Identifier) && callee.name == "checkPreimage"
           if e.args.length >= 1
             preimage_ref = lower_expr_to_ref(e.args[0])
-            return emit(IR::ANFValue.new(kind: "check_preimage").tap { |v| v.preimage = preimage_ref })
+            return emit(IR::ANFValue.new(kind: "check_preimage").tap do |v|
+              v.preimage = preimage_ref
+              # Issue #123: honour the method's declared @sighash on manual calls.
+              v.sighash_flag = @sighash_flag unless @sighash_flag.nil?
+            end)
           end
         end
 

@@ -10,20 +10,27 @@ class TestDirectiveGuard < Minitest::Test
     RunarCompiler.send(:_parse_source, source, file_name)
   end
 
-  # @sighash is not yet implemented in the Ruby tier, so it still fails closed
-  # on every format including .runar.ts (until the #123 port lands).
-  def test_sighash_directive_is_rejected
+  # @sighash (#123) is implemented for .runar.ts — it must NOT be rejected
+  # there. The other 8 formats still fail closed.
+  def test_sighash_allowed_on_ts
     source = <<~TS
-      class Counter extends SmartContract {
-        readonly x: bigint;
-        constructor(x: bigint) { super(x); this.x = x; }
+      class Counter extends StatefulSmartContract {
+        n: bigint;
+        constructor(n: bigint) { super(n); this.n = n; }
         /** @sighash SINGLE|FORKID */
-        public unlock() {}
+        public bump() { this.addOutput(1000n, this.n); }
       }
     TS
-    result = parse(source)
+    result = parse(source, 'Counter.runar.ts')
+    refute(result.error_strings.any? { |m| m.include?('not supported') },
+           "@sighash must compile on .runar.ts: #{result.error_strings}")
+  end
+
+  def test_sighash_directive_rejected_on_non_ts
+    source = "# @sighash SINGLE|FORKID\nclass Counter < SmartContract\nend\n"
+    result = parse(source, 'Counter.runar.rb')
     joined = result.error_strings.join("\n")
-    assert result.errors.any?, 'expected fail-closed error for @sighash'
+    assert result.errors.any?, 'expected fail-closed error for @sighash on .runar.rb'
     assert_includes joined, '@sighash'
     assert_includes joined, '#123'
   end

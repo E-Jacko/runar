@@ -9,6 +9,7 @@ require "set"
 require_relative "ast_nodes"
 require_relative "diagnostic"
 require_relative "parse_result"
+require_relative "sighash_directive"
 require_relative "../codegen/emit"
 
 module RunarCompiler
@@ -690,6 +691,7 @@ module RunarCompiler
         # source gap immediately before this member (issue #109 / #123).
         member_directives = gather_member_directives(location.line)
         embed_always = member_directives.any? { |d| d[:text].match?(/@embedAlways\b/) }
+        sighash_text = member_directives.map { |d| d[:text] }.find { |t| t.match?(/@sighash\b/) }
 
         # Collect modifiers: public, private, readonly
         visibility = "private"
@@ -731,7 +733,7 @@ module RunarCompiler
 
         # Method: name(...)
         if check(TOK_LPAREN)
-          return parse_method(member_name, visibility, location)
+          return parse_method(member_name, visibility, location, sighash_text)
         end
 
         # Property: name: Type (possibly with ; at end)
@@ -834,7 +836,7 @@ module RunarCompiler
 
       # -- Methods ----------------------------------------------------------
 
-      def parse_method(name, visibility, location)
+      def parse_method(name, visibility, location, sighash_text = nil)
         params = parse_params
 
         # Skip optional return type annotation
@@ -845,13 +847,41 @@ module RunarCompiler
 
         body = parse_block
 
+        # Issue #123: `/** @sighash <FLAGS> */` directive -> per-method sighash
+        # type. Only public methods are spending entry points, so a directive on
+        # a private helper is meaningless (error). Malformed flag lists error too.
+        sighash_type = parse_sighash_on_method(name, visibility, sighash_text)
+
         MethodNode.new(
           name: name,
           params: params,
           body: body,
           visibility: visibility,
-          source_location: location
+          source_location: location,
+          sighash_type: sighash_type
         )
+      end
+
+      # Resolve a method's `@sighash` directive text to a numeric sighash type,
+      # or nil when there is no directive. Pushes a parse error for a directive
+      # on a non-public method or for a malformed flag list.
+      def parse_sighash_on_method(name, visibility, sighash_text)
+        return nil if sighash_text.nil?
+
+        if visibility != "public"
+          add_error("@sighash directive on non-public method '#{name}' has no effect — " \
+                    "only public methods are spending entry points")
+          return nil
+        end
+
+        result = SighashDirective.extract_sighash_directive(sighash_text)
+        return nil if result.nil?
+
+        if result.key?(:error)
+          add_error("Method '#{name}': #{result[:error]}")
+          return nil
+        end
+        result[:value]
       end
 
       # -- Parameters -------------------------------------------------------

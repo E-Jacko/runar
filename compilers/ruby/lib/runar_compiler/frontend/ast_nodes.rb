@@ -209,8 +209,16 @@ module RunarCompiler
     end
 
     # A contract method.
-    MethodNode = Struct.new(:name, :params, :body, :visibility, :source_location, keyword_init: true) do
-      def initialize(name: "", params: [], body: [], visibility: "public", source_location: SourceLocation.new)
+    #
+    # +sighash_type+ is the BIP-143 sighash type declared via a
+    # +/** @sighash <FLAGS> */+ directive on a public method (e.g. +0x43+ for
+    # SINGLE|FORKID); issue #123. +nil+ = the default +ALL|FORKID+ (0x41),
+    # byte-identical to the historically-pinned mode. Honored ONLY on the
+    # +.runar.ts+ surface. Drives the auto-injected preimage-type assert, the
+    # OP_PUSH_TX binding flag, the ABI +sigHashType+, and the SDK-side
+    # preimage/signature construction.
+    MethodNode = Struct.new(:name, :params, :body, :visibility, :source_location, :sighash_type, keyword_init: true) do
+      def initialize(name: "", params: [], body: [], visibility: "public", source_location: SourceLocation.new, sighash_type: nil)
         super
       end
     end
