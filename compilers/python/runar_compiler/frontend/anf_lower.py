@@ -271,6 +271,15 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
         for p in method.params:
             method_ctx.register_param_type(p.name, _type_node_to_string(p.type))
 
+        # Register the declared param NAMES so a bare identifier resolves to
+        # ``load_param`` before falling through to ``load_prop`` (issue #130).
+        # Without this, a param whose name collides with a mutable state
+        # property lowered to the stale deserialized property value instead of
+        # the witness param. Explicit ``this.x`` is unaffected: it lowers via
+        # the property_access / member paths, which prefer a real property.
+        for p in method.params:
+            method_ctx.add_param(p.name)
+
         if contract.parent_class == "StatefulSmartContract" and method.visibility == "public":
             # Continuation requirements come from the side-effect
             # summary, which walks the private-method call graph. A
@@ -345,10 +354,36 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
             # locking script will not match the auto-injected parameter
             # list.
             if needs_change_output:
-                # Build the P2PKH change output for hashOutputs verification
+                # Build the P2PKH change output for hashOutputs verification.
+                #
+                # Issue #116: the SDK's build_call_transaction OMITS the change
+                # output when ``change <= 0`` (an exact-cover call) and passes
+                # ``_changeAmount = 0``. Gate the change segment on
+                # ``_changeAmount != 0`` at runtime so the hashed output set
+                # matches the SDK at the exact-zero boundary -- the segment is
+                # the P2PKH change output when non-zero, and empty bytes (cat
+                # with empty is a no-op) when zero, reproducing the omission.
+                # For any change > 0 the hashed bytes are unchanged; only the
+                # emitted script gains the guard.
                 change_pkh_ref = method_ctx.emit(ANFValue(kind="load_param", name="_changePKH"))
                 change_amount_ref = method_ctx.emit(ANFValue(kind="load_param", name="_changeAmount"))
-                change_output_ref = method_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+                zero_ref = method_ctx.emit(_make_load_const_int(0))
+                change_non_zero_ref = method_ctx.emit(ANFValue(
+                    kind="bin_op", op="!==",
+                    left=change_amount_ref, right=zero_ref,
+                ))
+                change_then_ctx = method_ctx.sub_context()
+                change_then_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+                method_ctx.sync_counter(change_then_ctx)
+                change_else_ctx = method_ctx.sub_context()
+                change_else_ctx.emit(_make_load_const_string(""))
+                method_ctx.sync_counter(change_else_ctx)
+                change_output_ref = method_ctx.emit(ANFValue(
+                    kind="if",
+                    cond=change_non_zero_ref,
+                    then=change_then_ctx.bindings,
+                    else_=change_else_ctx.bindings,
+                ))
 
                 if add_output_refs:
                     # Multi-output continuation: concat all state outputs, then
@@ -823,7 +858,10 @@ class _LowerCtx:
                 self.set_local_alias(then_last.name, if_name)
 
     def _lower_for_statement(self, stmt: ForStmt) -> None:
-        count = _extract_loop_count(stmt)
+        # Resolve the loop's compile-time shape: start value, step direction,
+        # and iteration count. Rúnar requires bounded loops, so all three must
+        # be statically determinable (issue #121).
+        start, step, count = _extract_loop_shape(stmt)
 
         # Lower body into sub-context
         body_ctx = self.sub_context()
@@ -835,6 +873,8 @@ class _LowerCtx:
             count=count,
             body=body_ctx.bindings,
             iter_var=stmt.init.name if stmt.init else "",
+            start=start,
+            step=step,
         ))
 
     # -------------------------------------------------------------------
@@ -858,7 +898,14 @@ class _LowerCtx:
             return self._lower_identifier(expr)
 
         if isinstance(expr, PropertyAccessExpr):
-            # this.txPreimage in StatefulSmartContract -> load_param
+            # Explicit ``this.x``: a real contract property always wins, even
+            # when a method param shares the name (issue #130). Now that
+            # declared params are registered, the is_param branch below must not
+            # shadow a stored property.
+            if self.is_property(expr.property):
+                return self.emit(ANFValue(kind="load_prop", name=expr.property))
+            # this.txPreimage in StatefulSmartContract -> load_param (implicit
+            # injected param, not a stored property).
             if self.is_param(expr.property):
                 return self.emit(ANFValue(kind="load_param", name=expr.property))
             # this.x -> load_prop
@@ -1646,43 +1693,84 @@ def _expr_has_add_data_output(expr: Expression | None) -> bool:
 # Loop count extraction
 # ---------------------------------------------------------------------------
 
-def _extract_loop_count(stmt: ForStmt) -> int:
-    # The ANF loop node carries only the count -- no start value or step
-    # direction -- so lowering (and the ANF interpreter) always iterates
-    # i = 0..count-1. Loop shapes that representation cannot express are
-    # rejected here (mirroring the source-located errors in the validator)
-    # rather than silently compiled as a zero-start counting-up loop.
-    #
-    # A countdown loop necessarily also has a non-zero start, so check the
-    # condition direction first -- it is the more precise diagnosis.
-    if isinstance(stmt.condition, BinaryExpr):
-        if stmt.condition.op in (">", ">="):
-            raise ValueError(
-                "For loop condition must count up with '<' or '<=' "
-                "— countdown loops are not supported; iterate i = 0..N-1 "
-                "and index backwards instead."
-            )
+def _extract_loop_shape(stmt: ForStmt) -> tuple[int, int, int]:
+    """Resolve a for-statement's compile-time loop shape (issue #121).
 
-    start_val = _extract_bigint_value(stmt.init.init if stmt.init else None)
+    Supports counting-up and counting-down loops::
 
-    if start_val is not None and start_val != 0:
+        for (let i = 0n; i < 10n; i++)     -> start 0,  step +1, count 10
+        for (let i = 1n; i <= 3n; i++)     -> start 1,  step +1, count 3
+        for (let i = 3n; i > 0n; i--)      -> start 3,  step -1, count 3
+        for (let i = 3n; i >= 1n; i--)     -> start 3,  step -1, count 3
+
+    The loop is unrolled ``count`` times; on iteration ``i`` the iterator holds
+    ``start + i * step``. Start and bound must be compile-time integer literals.
+
+    Returns ``(start, step, count)``.
+    """
+    start = _extract_bigint_value(stmt.init.init if stmt.init else None)
+    if start is None:
         raise ValueError(
-            f"For loop iterator must start at 0 (got {start_val}n) "
-            "— loops compile to i = 0..count-1; offset the iterator "
-            "inside the body instead."
+            "Cannot determine loop start at compile time. For-loop iterators "
+            "must start at an integer literal."
         )
 
+    if not isinstance(stmt.condition, BinaryExpr):
+        raise ValueError(
+            "Cannot determine loop bound at compile time. For-loop bounds must "
+            "be integer literals."
+        )
+    op = stmt.condition.op
+    bound = _extract_bigint_value(stmt.condition.right)
+    if bound is None:
+        raise ValueError(
+            "Cannot determine loop bound at compile time. For-loop bounds must "
+            "be integer literals."
+        )
+
+    step = _extract_loop_step(stmt)
+
+    # Count = number of iterations before the condition first turns false.
+    if step == 1:
+        if op == "<":
+            count = bound - start
+        elif op == "<=":
+            count = bound - start + 1
+        else:
+            raise ValueError(
+                f"For loop counting up (i++) must use '<' or '<=' (got '{op}')."
+            )
+    else:
+        if op == ">":
+            count = start - bound
+        elif op == ">=":
+            count = start - bound + 1
+        else:
+            raise ValueError(
+                f"For loop counting down (i--) must use '>' or '>=' (got '{op}')."
+            )
+
+    return start, step, max(0, count)
+
+
+def _extract_loop_step(stmt: ForStmt) -> int:
+    """Determine the iterator step direction (+1 / -1) from the for-statement's
+    update clause, falling back to the condition direction. Only unit steps are
+    supported; a non-unit update (e.g. ``i += 2``) is out of the loop model.
+    """
+    update = stmt.update
+    if isinstance(update, ExpressionStmt):
+        e = update.expr
+        if isinstance(e, IncrementExpr):
+            return 1
+        if isinstance(e, DecrementExpr):
+            return -1
+    # Fall back to the comparison direction for other unit-step spellings
+    # (e.g. ``i = i + 1n``): ``<``/``<=`` counts up, ``>``/``>=`` counts down.
     if isinstance(stmt.condition, BinaryExpr):
-        bound_val = _extract_bigint_value(stmt.condition.right)
-
-        if bound_val is not None:
-            op = stmt.condition.op
-            if op == "<":
-                return max(0, bound_val)
-            if op == "<=":
-                return max(0, bound_val + 1)
-
-    return 0
+        if stmt.condition.op in (">", ">="):
+            return -1
+    return 1
 
 
 def _extract_bigint_value(expr: Expression | None) -> int | None:
@@ -1927,6 +2015,8 @@ def _remap_value_refs(value: ANFValue, name_map: dict[str, str]) -> ANFValue:
     new_v.else_ = value.else_
     new_v.count = value.count
     new_v.iter_var = value.iter_var
+    new_v.start = value.start
+    new_v.step = value.step
     new_v.body = value.body
     new_v.value_ref = r(value.value_ref)
     new_v.preimage = r(value.preimage)

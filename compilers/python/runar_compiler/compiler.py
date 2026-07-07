@@ -918,6 +918,13 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
             d["count"] = v.count
         if v.iter_var is not None:
             d["iterVar"] = v.iter_var
+        # Loop start/step (issue #121). Emitted as plain integers to match the
+        # TS reference tier after the conformance runner's bigint reviver
+        # normalizes its ``"0n"`` artifact form to a JSON number.
+        if v.start is not None:
+            d["start"] = v.start
+        if v.step is not None:
+            d["step"] = v.step
         if v.body is not None:
             d["body"] = [_ser_binding(b) for b in v.body]
         if v.value_ref is not None:

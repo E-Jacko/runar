@@ -138,6 +138,31 @@ def extract_constructor_args(
     return result
 
 
+def restore_constructor_args(
+    artifact: RunarArtifact,
+    script_hex: str,
+) -> list:
+    """Recover the positional constructor argument list from a deployed locking
+    script (issue #119), so a restored contract (``from_utxo`` / ``from_txid``)
+    operates on the real baked-in values rather than ``0`` placeholders.
+
+    ``extract_constructor_args`` returns a name→value map keyed by ABI param
+    name; ``abi.constructor_params`` is already ordered by paramIndex, so
+    mapping over it yields the positional list the ``RunarContract`` constructor
+    expects.
+
+    Params that carry no constructor slot (mutable state fields — their value
+    lives in the OP_RETURN state section, restored separately) are absent from
+    the extracted map; they fall back to ``0``, matching the prior placeholder
+    behaviour, and are immediately overwritten by ``extract_state_from_script``.
+    """
+    params = artifact.abi.constructor_params
+    if not params:
+        return []
+    extracted = extract_constructor_args(artifact, script_hex)
+    return [extracted[p.name] if p.name in extracted else 0 for p in params]
+
+
 # ---------------------------------------------------------------------------
 # Script matching
 # ---------------------------------------------------------------------------

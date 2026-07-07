@@ -451,6 +451,26 @@ class _LoweringContext:
         self.array_lengths: dict[str, int] = {}
         # Element refs for array_literal bindings (used by checkMultiSig).
         self.array_elements: dict[str, list[str]] = {}
+
+        # Issue #130 (stack layer): a method param whose name collides with a
+        # MUTABLE property gets a duplicate stackMap slot once
+        # ``deserialize_state`` pushes that property under the same name. Name
+        # lookups resolve to the shallowest match (the deserialized property),
+        # so ``load_param`` would read the stale on-chain state instead of the
+        # witness value. Rename the colliding param's slot to a reserved,
+        # collision-proof name up front and remember the mapping so
+        # ``_lower_load_param`` targets the real param slot. Only mutable
+        # properties are deserialized onto the stack, so readonly shadows
+        # (handled purely by ANF resolution) never enter this map, and
+        # non-colliding contracts get an empty map -- byte-identical output.
+        self.renamed_params: dict[str, str] = {}
+        mutable_prop_names = {p.name for p in properties if not p.readonly}
+        for name in (params or []):
+            if name in mutable_prop_names:
+                renamed = f"__param_{name}"
+                self.sm.rename_at_depth(self.sm.find_depth(name), renamed)
+                self.renamed_params[name] = renamed
+
         self._track_depth()
 
     def _track_depth(self) -> None:
@@ -963,7 +983,8 @@ class _LoweringContext:
         elif kind == "if":
             self._lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
         elif kind == "loop":
-            self._lower_loop(name, value.count, value.body, value.iter_var, binding_index, last_uses)
+            self._lower_loop(name, value.count, value.body, value.iter_var,
+                             value.start, value.step, binding_index, last_uses)
         elif kind == "assert":
             self._lower_assert(value.value_ref, binding_index, last_uses, False)
         elif kind == "update_prop":
@@ -999,9 +1020,14 @@ class _LoweringContext:
 
     def _lower_load_param(self, binding_name: str, param_name: str,
                           binding_index: int, last_uses: dict[str, int]) -> None:
-        if self.sm.has(param_name):
+        # The parameter is already on the stack under its original name -- or,
+        # for a param that shadows a mutable property, under a reserved renamed
+        # slot (issue #130) so it is not confused with the deserialized
+        # property slot.
+        slot_name = self.renamed_params.get(param_name, param_name)
+        if self.sm.has(slot_name):
             is_last = self._is_last_use(param_name, binding_index, last_uses)
-            self.bring_to_top(param_name, is_last)
+            self.bring_to_top(slot_name, is_last)
             self.sm.pop()
             self.sm.push(binding_name)
         else:
@@ -1710,8 +1736,13 @@ class _LoweringContext:
 
     def _lower_loop(self, binding_name: str, count: int,
                     body: list[ANFBinding], iter_var: str,
+                    start: Optional[int] = None, step: Optional[int] = None,
                     loop_binding_index: Optional[int] = None,
                     enclosing_last_uses: Optional[dict[str, int]] = None) -> None:
+        # Iterator start value and step direction (issue #121). Older ANF
+        # payloads without start/step describe zero-start counting-up loops.
+        start_val = start if start is not None else 0
+        step_val = step if step is not None else 1
         # Collect body binding names
         body_binding_names: dict[str, bool] = {b.name: True for b in body}
 
@@ -1741,7 +1772,11 @@ class _LoweringContext:
         self.local_bindings = new_local_bindings
 
         for i in range(count):
-            self.emit_op(StackOp(op="push", value=big_int_push(i)))
+            # Push the iteration variable value (in case the loop body uses it).
+            # Iteration ``i`` binds ``start + i*step`` (issue #121); zero-start
+            # counting-up loops (start=0, step=1) reduce to ``i``, preserving
+            # the historical byte-for-byte lowering.
+            self.emit_op(StackOp(op="push", value=big_int_push(start_val + i * step_val)))
             self.sm.push(iter_var)
 
             last_uses = compute_last_uses(body)
