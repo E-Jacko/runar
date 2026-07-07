@@ -76,6 +76,7 @@ fn call_rejects_oversized_current_utxo_script() {
         params: vec![],
         is_public: true,
         is_terminal: None, uses_code_part: None,
+        sig_hash_type: None,
     }]);
     let utxo = Utxo {
         txid: "a".repeat(64),
