@@ -10,7 +10,7 @@ import type { Signer } from './signers/signer.js';
 import type { TransactionData, UTXO, DeployOptions, CallOptions, PreparedCall } from './types.js';
 import type { Inscription } from './ordinals/types.js';
 import { buildDeployTransaction, selectUtxos } from './deployment.js';
-import { buildCallTransaction } from './calling.js';
+import { buildCallTransaction, resolveInputSequence } from './calling.js';
 import { serializeState, extractStateFromScript, findLastOpReturn } from './state.js';
 import { computeOpPushTx } from './oppushtx.js';
 import { buildP2PKHScript } from './script-utils.js';
@@ -706,6 +706,11 @@ export class RunarContract {
       // `buildUnlock` below which inserts witnessHex in the correct ABI slot).
       termUnlockScript += witnessHex;
 
+      // Sequence (issue #131): all-final inputs make nLockTime a consensus
+      // no-op — when a non-zero locktime is set, default to 0xfffffffe so the
+      // terminal method's extractLocktime assertion is actually enforced.
+      const termSequence = resolveInputSequence(options?.locktime, options?.sequence);
+
       const buildTerminalTx = (unlock: string): BsvTransaction => {
         const ttx = new BsvTransaction();
         // Terminal calls (auction close/claim/withdraw) typically assert
@@ -716,7 +721,7 @@ export class RunarContract {
           sourceTXID: contractUtxo.txid,
           sourceOutputIndex: contractUtxo.outputIndex,
           unlockingScript: UnlockingScript.fromHex(unlock),
-          sequence: 0xffffffff,
+          sequence: termSequence,
         });
         for (const out of terminalOutputs) {
           ttx.addOutput({
@@ -966,6 +971,9 @@ export class RunarContract {
         // Thread CallOptions.locktime so contracts asserting
         // extractLocktime(preimage) can succeed. Default unset → 0.
         locktime: options?.locktime,
+        // Thread CallOptions.sequence (issue #131): a non-zero locktime needs
+        // non-final input sequences or consensus ignores nLockTime.
+        sequence: options?.sequence,
       },
     );
 
@@ -1068,6 +1076,9 @@ export class RunarContract {
           // Rebuild path must honor the override too: a preimage computed on a
           // rebuilt tx with locktime 0 would mismatch the final on-chain tx.
           locktime: options?.locktime,
+          // Same for sequence — the second-pass preimage must see the final
+          // input sequences (issue #131).
+          sequence: options?.sequence,
         },
       ));
 
