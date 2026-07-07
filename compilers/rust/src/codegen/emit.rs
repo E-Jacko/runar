@@ -1586,6 +1586,12 @@ mod tests {
         // blob (the long `517f7b7b7c7e`-heavy region), so OP_CHECKSIG lives INSIDE
         // that blob rather than as a discrete tail opcode, and the stateful
         // unlocking script no longer carries the `_opPushTxSig` witness push.
+        //
+        // NOTE (#116): the change-output segment is now gated behind a runtime
+        // `_changeAmount != 0` guard (the `00787c9c9163 ... 67007b7577687e`
+        // OP_IF/ELSE/ENDIF wrapper around the `1976a914..88ac` P2PKH change
+        // output), so an exact-cover call (change 0) validates. These bytes are
+        // byte-identical to the post-#116 TS reference.
         let hex = compile_to_fold_off_hex(source, "Counter.runar.ts");
         let expected = concat!(
             "76ab76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b",
@@ -1611,8 +1617,8 @@ mod tests {
             "98ad69768254947f778101419d7601687f7782012c947f758258947f758258947f7781768b77",
             "02e803785679016a7e7c58807e827602fd009f635280517f756776030000019f635380527f75",
             "01fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e",
-            "7c58807c7e547a547a041976a9147b7e0288ac7e7c58807c7e7eaa7b820128947f7701207f75",
-            "877777",
+            "7c58807c7e547a547a00787c9c9163041976a9147b7e0288ac7e7c58807c7e67007b7577687e",
+            "aa7b820128947f7701207f75877777",
         );
         assert_eq!(hex, expected);
     }

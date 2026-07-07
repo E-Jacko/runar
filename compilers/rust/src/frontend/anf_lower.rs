@@ -309,16 +309,47 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
             // locking script will not match the auto-injected
             // parameter list.
             if needs_change_output {
-                // Build the P2PKH change output for hashOutputs verification
+                // Build the P2PKH change output for hashOutputs verification.
+                //
+                // Issue #116: the SDK's build_call_transaction OMITS the change
+                // output when `change <= 0` (an exact-cover call) and passes
+                // `_changeAmount = 0`. Gate the change segment on
+                // `_changeAmount != 0` at runtime so the hashed output set
+                // matches the SDK at the exact-zero boundary — the segment is
+                // the P2PKH change output when non-zero, and empty bytes (cat
+                // with empty is a no-op) when zero, reproducing the omission.
+                // For any change > 0 the hashed bytes are unchanged; only the
+                // emitted script gains the guard.
                 let change_pkh_ref = method_ctx.emit(ANFValue::LoadParam {
                     name: "_changePKH".to_string(),
                 });
                 let change_amount_ref = method_ctx.emit(ANFValue::LoadParam {
                     name: "_changeAmount".to_string(),
                 });
-                let change_output_ref = method_ctx.emit(ANFValue::Call {
+                let zero_ref = method_ctx.emit(ANFValue::LoadConst {
+                    value: bigint_to_json(&BigInt::from(0)),
+                });
+                let change_nonzero_ref = method_ctx.emit(ANFValue::BinOp {
+                    op: "!==".to_string(),
+                    left: change_amount_ref.clone(),
+                    right: zero_ref,
+                    result_type: None,
+                });
+                let mut change_then_ctx = method_ctx.sub_context();
+                change_then_ctx.emit(ANFValue::Call {
                     func: "buildChangeOutput".to_string(),
                     args: vec![change_pkh_ref, change_amount_ref],
+                });
+                method_ctx.sync_counter(&change_then_ctx);
+                let mut change_else_ctx = method_ctx.sub_context();
+                change_else_ctx.emit(ANFValue::LoadConst {
+                    value: serde_json::Value::String(String::new()),
+                });
+                method_ctx.sync_counter(&change_else_ctx);
+                let change_output_ref = method_ctx.emit(ANFValue::If {
+                    cond: change_nonzero_ref,
+                    then: change_then_ctx.bindings,
+                    else_branch: change_else_ctx.bindings,
                 });
 
                 if !add_output_refs.is_empty() {
