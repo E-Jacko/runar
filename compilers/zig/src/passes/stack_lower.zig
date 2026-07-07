@@ -195,6 +195,13 @@ const LowerCtx = struct {
     outer_protected_refs: ?*const std.StringHashMapUnmanaged(void) = null,
     updated_props: std.StringHashMapUnmanaged(void),
     max_depth: u32,
+    /// Method params whose names collide with a MUTABLE property, mapped to the
+    /// reserved stack-slot name their witness value lives under (issue #130).
+    /// deserialize_state pushes each mutable property onto the stack under its
+    /// own name, so a same-named param slot would otherwise be shadowed and
+    /// lowerLoadParam would read the stale deserialized state. Empty for the
+    /// common no-collision case (byte-identical output).
+    renamed_params: std.StringHashMapUnmanaged([]const u8),
     /// Current ANF binding's source location — set before processing each binding.
     current_source_loc: ?types.SourceLocation = null,
 
@@ -217,6 +224,7 @@ const LowerCtx = struct {
             .in_branch = false,
             .updated_props = .empty,
             .max_depth = 0,
+            .renamed_params = .empty,
         };
     }
 
@@ -238,6 +246,7 @@ const LowerCtx = struct {
         for (self.owned_push_data.items) |data| self.allocator.free(data);
         self.owned_push_data.deinit(self.allocator);
         self.updated_props.deinit(self.allocator);
+        self.renamed_params.deinit(self.allocator);
     }
 
     fn trackDepth(self: *LowerCtx) void {
@@ -1027,9 +1036,13 @@ const LowerCtx = struct {
     }
 
     fn lowerLoadParam(self: *LowerCtx, bind_name: []const u8, param_name: []const u8) !void {
-        if (self.stack.findDepth(param_name) != null) {
+        // The parameter is already on the stack under its original name — or, for
+        // a param that shadows a mutable property, under a reserved renamed slot
+        // (issue #130) so it is not confused with the deserialized property slot.
+        const slot_name = self.renamed_params.get(param_name) orelse param_name;
+        if (self.stack.findDepth(slot_name) != null) {
             const consume = self.isLastUse(param_name);
-            try self.bringToTop(param_name, consume);
+            try self.bringToTop(slot_name, consume);
             try self.stack.renameAtDepth(self.allocator, 0, bind_name);
             return;
         }
@@ -4574,6 +4587,30 @@ fn setupMethodStack(ctx: *LowerCtx, program: types.ANFProgram, method: types.ANF
         try ctx.stack.push(ctx.allocator, param.name);
     }
     ctx.trackDepth();
+
+    // Issue #130: a method param whose name collides with a MUTABLE property
+    // gets a duplicate stackMap slot once deserialize_state pushes that property
+    // under the same name. Name lookups resolve to the shallowest match (the
+    // deserialized property), so lowerLoadParam would read the stale on-chain
+    // state instead of the witness value. Rename the colliding param's slot to a
+    // reserved, collision-proof name up front and remember the mapping so
+    // lowerLoadParam targets the real param slot. Only mutable properties are
+    // deserialized onto the stack, so readonly shadows (handled purely by ANF
+    // resolution) never enter this map, and non-colliding contracts get an empty
+    // map — byte-identical output.
+    for (method.params) |param| {
+        const is_mutable_prop = for (program.properties) |prop| {
+            if (!prop.readonly and std.mem.eql(u8, prop.name, param.name)) break true;
+        } else false;
+        if (is_mutable_prop) {
+            if (ctx.stack.findDepth(param.name)) |d| {
+                const renamed = try std.fmt.allocPrint(ctx.allocator, "__param_{s}", .{param.name});
+                try ctx.owned_push_data.append(ctx.allocator, renamed);
+                try ctx.stack.renameAtDepth(ctx.allocator, d, renamed);
+                try ctx.renamed_params.put(ctx.allocator, param.name, renamed);
+            }
+        }
+    }
 }
 
 fn setupPropertyStack(ctx: *LowerCtx, program: types.ANFProgram) !void {

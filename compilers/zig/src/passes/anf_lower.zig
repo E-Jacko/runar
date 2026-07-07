@@ -999,7 +999,15 @@ fn lowerExprToRef(ctx: *LowerCtx, expr: Expression) LowerError![]const u8 {
             return try lowerIdentifier(ctx, name);
         },
         .property_access => |pa| {
-            // this.txPreimage in StatefulSmartContract -> load_param
+            // Explicit `this.x`: a real contract property always wins, even when
+            // a method param shares the name (issue #130). Zig registers declared
+            // method params via addParam, so without this isProperty-first check
+            // `this.balance` (with a `balance` param) would lower to load_param.
+            if (ctx.isProperty(pa.property)) {
+                return try ctx.emit(.{ .load_prop = .{ .name = pa.property } });
+            }
+            // this.txPreimage in StatefulSmartContract -> load_param (an implicit
+            // injected param, not a stored property).
             if (ctx.isParam(pa.property)) {
                 return try ctx.emit(.{ .load_param = .{ .name = pa.property } });
             }
@@ -2657,6 +2665,46 @@ test "lower property access" {
     switch (ctx.bindings.items[0].value) {
         .load_prop => |lp| try std.testing.expectEqualStrings("pubKeyHash", lp.name),
         else => return error.TestExpectedEqual,
+    }
+}
+
+test "explicit this.x resolves to load_prop even when x is a registered param (#130)" {
+    const allocator = std.testing.allocator;
+
+    const props = try allocator.alloc(PropertyNode, 1);
+    defer allocator.free(props);
+    props[0] = .{ .name = "balance", .type_info = .bigint, .readonly = false };
+
+    var ctx = LowerCtx.init(allocator, .{
+        .name = "ShadowRepro",
+        .parent_class = .stateful_smart_contract,
+        .properties = props,
+        .constructor = .{ .params = &.{}, .super_args = &.{}, .assignments = &.{} },
+        .methods = &.{},
+    });
+    defer {
+        for (ctx.bindings.items) |b| allocator.free(b.name);
+        ctx.bindings.deinit(allocator);
+        ctx.param_names.deinit(allocator);
+    }
+
+    // A method param named `balance` shadows the mutable property `balance`.
+    ctx.addParam("balance");
+
+    // Bare identifier `balance` -> load_param (the witness value).
+    const id_ref = try lowerIdentifier(&ctx, "balance");
+    _ = id_ref;
+    switch (ctx.bindings.items[0].value) {
+        .load_param => |lp| try std.testing.expectEqualStrings("balance", lp.name),
+        else => return error.TestExpectedLoadParam,
+    }
+
+    // Explicit `this.balance` -> load_prop (the property always wins).
+    const prop_ref = try lowerExprToRef(&ctx, .{ .property_access = .{ .object = "this", .property = "balance" } });
+    _ = prop_ref;
+    switch (ctx.bindings.items[1].value) {
+        .load_prop => |lp| try std.testing.expectEqualStrings("balance", lp.name),
+        else => return error.TestExpectedLoadProp,
     }
 }
 
