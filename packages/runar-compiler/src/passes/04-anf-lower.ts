@@ -129,6 +129,16 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
     const methodCtx = new LoweringContext(contract, sideEffects);
     methodCtx.setMethodParamTypes(method.params);
 
+    // Register the declared param NAMES so a bare identifier resolves to
+    // `load_param` before falling through to `load_prop` (issue #130). Without
+    // this, a param whose name collides with a mutable state property lowered
+    // to the stale deserialized property value instead of the witness param.
+    // Explicit `this.x` is unaffected: it lowers via lowerMemberExpr, which
+    // always emits `load_prop` regardless of param registration.
+    for (const p of method.params) {
+      methodCtx.addParam(p.name);
+    }
+
     if (contract.parentClass === 'StatefulSmartContract' && method.visibility === 'public') {
       // Continuation requirements come from the side-effect summary,
       // which walks the private-method call graph. A public method that
@@ -1020,7 +1030,14 @@ function lowerExprToRef(expr: Expression, ctx: LoweringContext): string {
       return lowerIdentifier(expr, ctx);
 
     case 'property_access':
-      // this.txPreimage in StatefulSmartContract -> load_param (it's an implicit param, not a stored property)
+      // Explicit `this.x`: a real contract property always wins, even when a
+      // method param shares the name (issue #130). Now that declared params are
+      // registered, the isParam branch below must not shadow a stored property.
+      if (ctx.isProperty(expr.property)) {
+        return ctx.emit({ kind: 'load_prop', name: expr.property });
+      }
+      // this.txPreimage in StatefulSmartContract -> load_param (it's an
+      // implicit injected param, not a stored property).
       if (ctx.isParam(expr.property)) {
         return ctx.emit({ kind: 'load_param', name: expr.property });
       }

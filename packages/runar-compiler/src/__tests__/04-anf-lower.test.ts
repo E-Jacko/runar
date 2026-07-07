@@ -634,6 +634,38 @@ describe('Pass 4: ANF Lower', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Param name shadowing a property (issue #130) — both resolution directions
+  // ---------------------------------------------------------------------------
+
+  describe('param name shadowing a property (#130)', () => {
+    const source = `
+      class C extends SmartContract {
+        readonly x: bigint;
+        constructor(x: bigint) { super(x); this.x = x; }
+        public m(x: bigint) {
+          assert(x === this.x);
+        }
+      }
+    `;
+
+    it('bare identifier `x` resolves to the param (load_param), not the property', () => {
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loadParams = bindingsOfKind(method.body, 'load_param')
+        .filter(b => (b.value as { name: string }).name === 'x');
+      expect(loadParams.length).toBe(1);
+    });
+
+    it('explicit `this.x` still resolves to the property (load_prop)', () => {
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loadProps = bindingsOfKind(method.body, 'load_prop')
+        .filter(b => (b.value as { name: string }).name === 'x');
+      expect(loadProps.length).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Assignment lowering: update_prop
   // ---------------------------------------------------------------------------
 
