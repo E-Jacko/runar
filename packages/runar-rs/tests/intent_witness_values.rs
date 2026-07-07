@@ -93,6 +93,7 @@ fn deploy_helper(
     contract.deploy(&mut provider, &signer, &DeployOptions {
         satoshis: 50_000,
         change_address: None,
+        funding_signer: None,
     }).unwrap();
     // Funding UTXO for the call
     provider.add_utxo(&address, Utxo {

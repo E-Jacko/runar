@@ -56,6 +56,7 @@ fn deploy_rejects_oversized_script() {
     let result = contract.deploy(&mut provider, &signer, &DeployOptions {
         satoshis: 1000,
         change_address: None,
+        funding_signer: None,
     });
     let err = result.expect_err("expected ScriptSizeExceededError");
     assert!(err.contains("OversizedContract.deploy"), "context missing: {}", err);

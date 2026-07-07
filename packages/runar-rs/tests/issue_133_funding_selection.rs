@@ -81,7 +81,7 @@ fn deploy_with_wallet(
         script: format!("76a914{}88ac", "00".repeat(20)),
     });
     contract
-        .deploy(&mut deploy_provider, &signer, &DeployOptions { satoshis: deploy_sats, change_address: None })
+        .deploy(&mut deploy_provider, &signer, &DeployOptions { satoshis: deploy_sats, change_address: None, funding_signer: None })
         .unwrap();
 
     let mut call_provider = MockProvider::testnet();

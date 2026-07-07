@@ -383,12 +383,19 @@ impl RunarContract {
             Some(fee_rate),
         );
 
-        // Sign all inputs
+        // Sign all inputs. Funding inputs are signed by funding_signer when set
+        // (issue #134): the deploy signer may not own the funding coins.
+        // Defaults to the connected signer.
+        let funding_signer: &dyn Signer = options
+            .funding_signer
+            .as_ref()
+            .map(|fs| fs.as_signer())
+            .unwrap_or(signer);
         let mut signed_tx = tx_hex;
         for i in 0..input_count {
             let utxo = &utxos[i];
-            let sig = signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
-            let pub_key = signer.get_public_key()?;
+            let sig = funding_signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
+            let pub_key = funding_signer.get_public_key()?;
             // Build P2PKH unlocking script: <sig> <pubkey>
             let unlock_script = format!("{}{}", encode_push_data(&sig), encode_push_data(&pub_key));
             signed_tx = insert_unlocking_script(&signed_tx, i, &unlock_script)?;
@@ -943,13 +950,21 @@ impl RunarContract {
             Some(&call_tx_options),
         );
 
+        // Funding inputs are signed by funding_signer when set (issue #134):
+        // the method signer may not own the funding coins. The method's own Sig
+        // args stay with the connected signer. Defaults to the connected signer.
+        let funding_signer: &dyn Signer = options
+            .and_then(|o| o.funding_signer.as_ref())
+            .map(|fs| fs.as_signer())
+            .unwrap_or(signer);
+
         // Sign P2PKH funding inputs (after contract inputs)
         let mut signed_tx = tx_hex;
         let p2pkh_start_idx = 1 + extra_contract_utxos.len();
         for i in p2pkh_start_idx..input_count {
             if let Some(utxo) = additional_utxos.get(i - p2pkh_start_idx) {
-                let sig = signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
-                let pub_key = signer.get_public_key()?;
+                let sig = funding_signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
+                let pub_key = funding_signer.get_public_key()?;
                 let unlock_script = format!("{}{}", encode_push_data(&sig), encode_push_data(&pub_key));
                 signed_tx = insert_unlocking_script(&signed_tx, i, &unlock_script)?;
             }
@@ -1130,11 +1145,12 @@ impl RunarContract {
                 signed_tx = insert_unlocking_script(&signed_tx, i + 1, &final_merge_unlock)?;
             }
 
-            // Re-sign P2PKH funding inputs (outputs changed after rebuild)
+            // Re-sign P2PKH funding inputs (outputs changed after rebuild) with
+            // funding_signer — issue #134.
             for i in p2pkh_start_idx..input_count {
                 if let Some(utxo) = additional_utxos.get(i - p2pkh_start_idx) {
-                    let sig = signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
-                    let pub_key = signer.get_public_key()?;
+                    let sig = funding_signer.sign(&signed_tx, i, &utxo.script, utxo.satoshis, None)?;
+                    let pub_key = funding_signer.get_public_key()?;
                     let unlock_script = format!("{}{}", encode_push_data(&sig), encode_push_data(&pub_key));
                     signed_tx = insert_unlocking_script(&signed_tx, i, &unlock_script)?;
                 }
@@ -2792,6 +2808,7 @@ mod tests {
         let (txid, _tx) = contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         assert_eq!(txid.len(), 64);
@@ -2823,6 +2840,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         // Call should succeed (not throw "not deployed")
@@ -2841,6 +2859,7 @@ mod tests {
         let result = contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no UTXOs"));
@@ -2870,6 +2889,7 @@ mod tests {
         let _ = contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         });
     }
 
@@ -2918,6 +2938,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         let result = contract.call("nonexistent", &[], &mut provider, &signer, None);
@@ -2953,6 +2974,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         let result = contract.call(
@@ -3204,6 +3226,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         let payout_script = format!("76a914{}88ac", "bb".repeat(20));
@@ -3239,6 +3262,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 10_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         contract.call("spend", &[], &mut provider, &signer, Some(&CallOptions {
@@ -3275,6 +3299,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 20_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         let (txid, _) = contract.call("settle", &[], &mut provider, &signer, Some(&CallOptions {
@@ -3309,6 +3334,7 @@ mod tests {
         contract.deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            funding_signer: None,
         }).unwrap();
 
         contract.call("cancel", &[], &mut provider, &signer, Some(&CallOptions {

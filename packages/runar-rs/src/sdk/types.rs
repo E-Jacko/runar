@@ -2,7 +2,35 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use super::anf_interpreter::ANFProgram;
+use super::signer::Signer;
+
+/// A shared signer used to sign the P2PKH funding (and terminal fee) inputs of
+/// a deploy/call tx (issue #134). A thin `Arc<dyn Signer>` newtype so the option
+/// structs keep deriving `Debug`/`Clone`/`Default` even though `Signer` is not
+/// `Debug`. Deref to `&dyn Signer` at the sign sites.
+#[derive(Clone)]
+pub struct FundingSigner(pub Arc<dyn Signer>);
+
+impl FundingSigner {
+    /// Borrow the inner signer as a trait object.
+    pub fn as_signer(&self) -> &dyn Signer {
+        self.0.as_ref()
+    }
+}
+
+impl std::fmt::Debug for FundingSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FundingSigner(<signer>)")
+    }
+}
+
+impl<S: Signer + 'static> From<Arc<S>> for FundingSigner {
+    fn from(s: Arc<S>) -> Self {
+        FundingSigner(s)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Transaction types
@@ -52,10 +80,15 @@ pub struct Utxo {
 // ---------------------------------------------------------------------------
 
 /// Options for deploying a contract.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeployOptions {
     pub satoshis: i64,
     pub change_address: Option<String>,
+    /// Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+    /// are owned by a different key than the connected deploy signer, set this
+    /// so the funding inputs are signed by their real owner. `None` → the
+    /// connected signer (zero behaviour change).
+    pub funding_signer: Option<FundingSigner>,
 }
 
 /// Options for calling a contract method.
@@ -113,6 +146,12 @@ pub struct CallOptions {
     /// returns an error rather than silently sweeping the wallet. `None` → no
     /// cap.
     pub max_funding_inputs: Option<usize>,
+    /// Signer for the P2PKH funding (and terminal fee) inputs (issue #134).
+    /// When the funding/fee UTXOs are owned by a different key than the
+    /// connected method signer, set this so those inputs are signed by their
+    /// real owner. The method's own `Sig` args are still signed by the
+    /// connected signer. `None` → the connected signer (zero behaviour change).
+    pub funding_signer: Option<FundingSigner>,
 }
 
 /// A data output entry — hex-encoded script + satoshis — for the
@@ -561,6 +600,7 @@ mod tests {
         let opts = DeployOptions {
             satoshis: 1000,
             change_address: Some("maddr".to_string()),
+            funding_signer: None,
         };
         assert_eq!(opts.satoshis, 1000);
         assert_eq!(opts.change_address.as_deref(), Some("maddr"));
