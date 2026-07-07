@@ -10,7 +10,7 @@ import type { Signer } from './signers/signer.js';
 import type { TransactionData, UTXO, DeployOptions, CallOptions, PreparedCall } from './types.js';
 import type { Inscription } from './ordinals/types.js';
 import { buildDeployTransaction, selectUtxos } from './deployment.js';
-import { buildCallTransaction } from './calling.js';
+import { buildCallTransaction, resolveInputSequence } from './calling.js';
 import { serializeState, extractStateFromScript, findLastOpReturn } from './state.js';
 import { computeOpPushTx } from './oppushtx.js';
 import { buildP2PKHScript, extractConstructorArgs } from './script-utils.js';
@@ -322,12 +322,15 @@ export class RunarContract {
       feeRate,
     );
 
-    // Sign all inputs — need unsigned hex for signer
+    // Sign all inputs — need unsigned hex for signer. Funding inputs are
+    // signed by fundingSigner when set (issue #134): the deploy signer may not
+    // own the funding coins. Defaults to the connected signer.
+    const fundingSigner = options.fundingSigner ?? signer;
     const unsignedHex = tx.toHex();
     for (let i = 0; i < inputCount; i++) {
       const utxo = utxos[i]!;
-      const sig = await signer.sign(unsignedHex, i, utxo.script, utxo.satoshis);
-      const pubKey = await signer.getPublicKey();
+      const sig = await fundingSigner.sign(unsignedHex, i, utxo.script, utxo.satoshis);
+      const pubKey = await fundingSigner.getPublicKey();
       // Build P2PKH unlocking script: <sig> <pubkey>
       const unlockScript = encodePushData(sig) + encodePushData(pubKey);
       tx.inputs[i]!.unlockingScript = UnlockingScript.fromHex(unlockScript);
@@ -561,6 +564,9 @@ export class RunarContract {
     options?: CallOptions,
   ): Promise<PreparedCall> {
     const { provider, signer } = this.resolveProviderSigner();
+    // Funding (and terminal fee) inputs are signed by fundingSigner when set
+    // (issue #134). The method's own Sig args stay with the connected signer.
+    const fundingSigner = options?.fundingSigner ?? signer;
 
     const method = this.findMethod(methodName);
     if (!method) {
@@ -706,6 +712,11 @@ export class RunarContract {
       // `buildUnlock` below which inserts witnessHex in the correct ABI slot).
       termUnlockScript += witnessHex;
 
+      // Sequence (issue #131): all-final inputs make nLockTime a consensus
+      // no-op — when a non-zero locktime is set, default to 0xfffffffe so the
+      // terminal method's extractLocktime assertion is actually enforced.
+      const termSequence = resolveInputSequence(options?.locktime, options?.sequence);
+
       const buildTerminalTx = (unlock: string): BsvTransaction => {
         const ttx = new BsvTransaction();
         // Terminal calls (auction close/claim/withdraw) typically assert
@@ -716,8 +727,21 @@ export class RunarContract {
           sourceTXID: contractUtxo.txid,
           sourceOutputIndex: contractUtxo.outputIndex,
           unlockingScript: UnlockingScript.fromHex(unlock),
-          sequence: 0xffffffff,
+          sequence: termSequence,
         });
+        // Fee input (issue #118): a plain P2PKH input added BEFORE the
+        // OP_PUSH_TX preimage is computed so hashPrevouts covers it. Consumed
+        // entirely as fee (no change output) — the covenant's terminal output
+        // assertions are untouched; only the input side grows. Its P2PKH sig is
+        // filled in after the tx structure is final (below).
+        if (options?.feeUtxo) {
+          ttx.addInput({
+            sourceTXID: options.feeUtxo.txid,
+            sourceOutputIndex: options.feeUtxo.outputIndex,
+            unlockingScript: new UnlockingScript(),
+            sequence: termSequence,
+          });
+        }
         for (const out of terminalOutputs) {
           ttx.addOutput({
             satoshis: out.satoshis,
@@ -790,6 +814,24 @@ export class RunarContract {
         if (!finalPreimage && needsOpPushTx) {
           finalPreimage = resolvedArgs[preimageIndex] as string;
         }
+      }
+
+      // Sign the fee input (issue #118). Its BIP-143 P2PKH sighash covers only
+      // hashPrevouts / hashOutputs / its own outpoint — NOT input 0's scriptSig
+      // — so it stays valid even after finalizeCall rewrites input 0. Owned by
+      // fundingSigner ?? signer (composes with #134). The fee input sits at
+      // index 1 (right after the primary contract input).
+      if (options?.feeUtxo) {
+        const feeInputIdx = 1;
+        const feeTxHex = termTx.toHex();
+        const feeSig = await fundingSigner.sign(
+          feeTxHex, feeInputIdx, options.feeUtxo.script, options.feeUtxo.satoshis,
+        );
+        const feePubKey = await fundingSigner.getPublicKey();
+        termTx.inputs[feeInputIdx]!.unlockingScript = UnlockingScript.fromHex(
+          encodePushData(feeSig) + encodePushData(feePubKey),
+        );
+        invalidateTxCache(termTx);
       }
 
       // Compute sighash from preimage
@@ -917,9 +959,46 @@ export class RunarContract {
     const feeRate = await provider.getFeeRate();
     const changeScript = buildP2PKHScript(changeAddress);
     const allFundingUtxos = await provider.getUtxos(address);
-    const additionalUtxos = allFundingUtxos.filter(
+    const candidateFundingUtxos = allFundingUtxos.filter(
       (u) => !(u.txid === this.currentUtxo!.txid && u.outputIndex === this.currentUtxo!.outputIndex),
     );
+
+    // Coin selection for funding inputs (issue #133): don't sweep the whole
+    // wallet. Compute how much the funding must cover — the contract's own
+    // input value already offsets the contract/data outputs — and pick the
+    // smallest largest-first set via selectUtxos (the strategy deploy uses).
+    const contractOutputSats =
+      (contractOutputs
+        ? contractOutputs.reduce((sum, o) => sum + o.satoshis, 0)
+        : (newSatoshis ?? 0))
+      + resolvedDataOutputs.reduce((sum, o) => sum + o.satoshis, 0);
+    const contractInputSats =
+      this.currentUtxo.satoshis
+      + extraContractUtxos.reduce((sum, u) => sum + u.satoshis, 0);
+    const fundingTarget = Math.max(0, contractOutputSats - contractInputSats);
+    // Fee sizing hint for selectUtxos: the continuation script length (falls
+    // back to the first multi-output script, else 0 for stateless calls).
+    const fundingLockLen =
+      (newLockingScript?.length ?? contractOutputs?.[0]?.script.length ?? 0) / 2;
+    const additionalUtxos =
+      candidateFundingUtxos.length > 0
+        ? selectUtxos(candidateFundingUtxos, fundingTarget, fundingLockLen, feeRate)
+        : [];
+
+    // Cap funding inputs when the caller sets maxFundingInputs. selectUtxos
+    // returns the minimal largest-first set; if that still exceeds the cap the
+    // funding can't cover outputs + fee within the budget, so fail loudly
+    // instead of broadcasting an underfunded tx.
+    if (
+      options?.maxFundingInputs !== undefined &&
+      additionalUtxos.length > options.maxFundingInputs
+    ) {
+      throw new Error(
+        `RunarContract.call(${methodName}): funding requires ${additionalUtxos.length} input(s) ` +
+          `but maxFundingInputs=${options.maxFundingInputs}. Increase maxFundingInputs, ` +
+          `use larger UTXOs, or consolidate.`,
+      );
+    }
 
     // Resolve per-input args for additional contract inputs
     const resolvedPerInputArgs: unknown[][] | undefined = options?.additionalContractInputArgs
@@ -966,17 +1045,20 @@ export class RunarContract {
         // Thread CallOptions.locktime so contracts asserting
         // extractLocktime(preimage) can succeed. Default unset → 0.
         locktime: options?.locktime,
+        // Thread CallOptions.sequence (issue #131): a non-zero locktime needs
+        // non-final input sequences or consensus ignores nLockTime.
+        sequence: options?.sequence,
       },
     );
 
-    // Sign P2PKH funding inputs
+    // Sign P2PKH funding inputs (with fundingSigner — issue #134)
     let txHex = tx.toHex();
     const p2pkhStartIdx = 1 + extraContractUtxos.length;
     for (let i = p2pkhStartIdx; i < inputCount; i++) {
       const utxo = additionalUtxos[i - p2pkhStartIdx];
       if (utxo) {
-        const sig = await signer.sign(txHex, i, utxo.script, utxo.satoshis);
-        const pubKey = await signer.getPublicKey();
+        const sig = await fundingSigner.sign(txHex, i, utxo.script, utxo.satoshis);
+        const pubKey = await fundingSigner.getPublicKey();
         const unlockScript = encodePushData(sig) + encodePushData(pubKey);
         tx.inputs[i]!.unlockingScript = UnlockingScript.fromHex(unlockScript);
         invalidateTxCache(tx);
@@ -1068,6 +1150,9 @@ export class RunarContract {
           // Rebuild path must honor the override too: a preimage computed on a
           // rebuilt tx with locktime 0 would mismatch the final on-chain tx.
           locktime: options?.locktime,
+          // Same for sequence — the second-pass preimage must see the final
+          // input sequences (issue #131).
+          sequence: options?.sequence,
         },
       ));
 
@@ -1089,13 +1174,13 @@ export class RunarContract {
         invalidateTxCache(tx);
       }
 
-      // Re-sign P2PKH funding inputs
+      // Re-sign P2PKH funding inputs (with fundingSigner — issue #134)
       txHex = tx.toHex();
       for (let i = p2pkhStartIdx; i < inputCount; i++) {
         const utxo = additionalUtxos[i - p2pkhStartIdx];
         if (utxo) {
-          const sig = await signer.sign(txHex, i, utxo.script, utxo.satoshis);
-          const pubKey = await signer.getPublicKey();
+          const sig = await fundingSigner.sign(txHex, i, utxo.script, utxo.satoshis);
+          const pubKey = await fundingSigner.getPublicKey();
           const unlockScript = encodePushData(sig) + encodePushData(pubKey);
           tx.inputs[i]!.unlockingScript = UnlockingScript.fromHex(unlockScript);
           invalidateTxCache(tx);
