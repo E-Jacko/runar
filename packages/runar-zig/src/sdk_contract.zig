@@ -255,14 +255,17 @@ pub const RunarContract = struct {
         ) catch return ContractError.DeployFailed;
         defer deploy_result.deinit(self.allocator);
 
-        // Sign all P2PKH inputs
+        // Sign all P2PKH inputs. Funding inputs are signed by fundingSigner when
+        // set (issue #134): the deploy signer may not own the funding coins.
+        // Defaults to the connected signer.
+        const funding_sign = options.funding_signer orelse sign;
         var signed_tx = try self.allocator.dupe(u8, deploy_result.tx_hex);
         errdefer self.allocator.free(signed_tx);
 
         for (selected, 0..) |utxo, i| {
-            const sig = try sign.sign(self.allocator, signed_tx, i, utxo.script, utxo.satoshis, null);
+            const sig = try funding_sign.sign(self.allocator, signed_tx, i, utxo.script, utxo.satoshis, null);
             defer self.allocator.free(sig);
-            const pub_key = try sign.getPublicKey(self.allocator);
+            const pub_key = try funding_sign.getPublicKey(self.allocator);
             defer self.allocator.free(pub_key);
 
             // Build P2PKH unlocking script hex: push(sig) + push(pubkey)
@@ -315,6 +318,9 @@ pub const RunarContract = struct {
     ) ![]u8 {
         const prov = prov_arg orelse self.provider orelse return ContractError.NoProviderOrSigner;
         const sign = signer_arg orelse self.signer orelse return ContractError.NoProviderOrSigner;
+        // Funding (and terminal fee) inputs are signed by fundingSigner when set
+        // (issue #134); the method's own Sig args stay with the connected signer.
+        const funding_sign = if (options) |o| (o.funding_signer orelse sign) else sign;
 
         if (self.current_utxo == null) return ContractError.NotDeployed;
         const contract_utxo = self.current_utxo.?;
@@ -847,9 +853,9 @@ pub const RunarContract = struct {
                 const utxo_idx = inp_idx - p2pkh_start;
                 if (utxo_idx < additional_utxos.items.len) {
                     const utxo = additional_utxos.items[utxo_idx];
-                    const sig_val = try sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
+                    const sig_val = try funding_sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
                     defer self.allocator.free(sig_val);
-                    const pub_key = try sign.getPublicKey(self.allocator);
+                    const pub_key = try funding_sign.getPublicKey(self.allocator);
                     defer self.allocator.free(pub_key);
                     const sig_push = try state_mod.encodePushData(self.allocator, sig_val);
                     defer self.allocator.free(sig_push);
@@ -1012,9 +1018,9 @@ pub const RunarContract = struct {
                 const utxo_idx = inp_idx - p2pkh_start;
                 if (utxo_idx < additional_utxos.items.len) {
                     const utxo = additional_utxos.items[utxo_idx];
-                    const sig_val = try sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
+                    const sig_val = try funding_sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
                     defer self.allocator.free(sig_val);
-                    const pub_key = try sign.getPublicKey(self.allocator);
+                    const pub_key = try funding_sign.getPublicKey(self.allocator);
                     defer self.allocator.free(pub_key);
                     const sig_push = try state_mod.encodePushData(self.allocator, sig_val);
                     defer self.allocator.free(sig_push);
@@ -1089,9 +1095,9 @@ pub const RunarContract = struct {
             const funding_offset: usize = 1 + extra_call_inputs.items.len;
             for (additional_utxos.items, 0..) |utxo, ui| {
                 const inp_idx = funding_offset + ui;
-                const sig_val = try sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
+                const sig_val = try funding_sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
                 defer self.allocator.free(sig_val);
-                const pub_key = try sign.getPublicKey(self.allocator);
+                const pub_key = try funding_sign.getPublicKey(self.allocator);
                 defer self.allocator.free(pub_key);
                 const sig_push = try state_mod.encodePushData(self.allocator, sig_val);
                 defer self.allocator.free(sig_push);
@@ -1259,9 +1265,9 @@ pub const RunarContract = struct {
             const funding_offset: usize = 1 + extra_call_inputs.items.len;
             for (additional_utxos.items, 0..) |utxo, ui| {
                 const inp_idx = funding_offset + ui;
-                const sig_val = try sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
+                const sig_val = try funding_sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
                 defer self.allocator.free(sig_val);
-                const pub_key = try sign.getPublicKey(self.allocator);
+                const pub_key = try funding_sign.getPublicKey(self.allocator);
                 defer self.allocator.free(pub_key);
                 const s_push = try state_mod.encodePushData(self.allocator, sig_val);
                 defer self.allocator.free(s_push);
@@ -1340,6 +1346,9 @@ pub const RunarContract = struct {
     ) !types.PreparedCall {
         const prov = prov_arg orelse self.provider orelse return ContractError.NoProviderOrSigner;
         const sign = signer_arg orelse self.signer orelse return ContractError.NoProviderOrSigner;
+        // Funding (and terminal fee) inputs are signed by fundingSigner when set
+        // (issue #134); the method's own Sig args stay with the connected signer.
+        const funding_sign = if (options) |o| (o.funding_signer orelse sign) else sign;
 
         if (self.current_utxo == null) return ContractError.NotDeployed;
         const contract_utxo = self.current_utxo.?;
@@ -1458,9 +1467,9 @@ pub const RunarContract = struct {
                 const utxo_idx = inp_idx - 1;
                 if (utxo_idx >= additional_utxos.items.len) break;
                 const utxo = additional_utxos.items[utxo_idx];
-                const sig_val = try sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
+                const sig_val = try funding_sign.sign(self.allocator, signed_tx, inp_idx, utxo.script, utxo.satoshis, null);
                 defer self.allocator.free(sig_val);
-                const pub_key = try sign.getPublicKey(self.allocator);
+                const pub_key = try funding_sign.getPublicKey(self.allocator);
                 defer self.allocator.free(pub_key);
                 const sig_push = try state_mod.encodePushData(self.allocator, sig_val);
                 defer self.allocator.free(sig_push);
@@ -1535,6 +1544,9 @@ pub const RunarContract = struct {
         options: ?types.CallOptions,
     ) !types.PreparedCall {
         const contract_utxo = self.current_utxo.?;
+        // Funding (and terminal fee) inputs are signed by fundingSigner when set
+        // (issue #134); the method's own Sig args stay with the connected signer.
+        const funding_sign = if (options) |o| (o.funding_signer orelse sign) else sign;
 
         // ---- Method lookup + multi-method index --------------------------
         const public_methods = try self.getPublicMethods();
@@ -1752,7 +1764,7 @@ pub const RunarContract = struct {
         var signed_tx = try self.allocator.dupe(u8, call_result.tx_hex);
         errdefer self.allocator.free(signed_tx);
 
-        try signFundingInputs(self, &signed_tx, sign, additional_utxos.items, call_result.input_count);
+        try signFundingInputs(self, &signed_tx, funding_sign, additional_utxos.items, call_result.input_count);
 
         var ptx_result = oppushtx_mod.computeOpPushTx(
             self.allocator, signed_tx, 0,
@@ -1787,7 +1799,7 @@ pub const RunarContract = struct {
             self.allocator.free(first_unlock);
         }
 
-        try signFundingInputs(self, &signed_tx, sign, additional_utxos.items, 1 + additional_utxos.items.len);
+        try signFundingInputs(self, &signed_tx, funding_sign, additional_utxos.items, 1 + additional_utxos.items.len);
 
         // Recompute preimage on the final tx (depends on tx size).
         ptx_result.deinit(self.allocator);
@@ -1876,7 +1888,7 @@ pub const RunarContract = struct {
     fn signFundingInputs(
         self: *RunarContract,
         tx_hex_inout: *[]u8,
-        sign: signer_mod.Signer,
+        funding_sign: signer_mod.Signer,
         additional_utxos: []const types.UTXO,
         input_count: usize,
     ) !void {
@@ -1885,9 +1897,9 @@ pub const RunarContract = struct {
             const utxo_idx = inp_idx - 1;
             if (utxo_idx >= additional_utxos.len) break;
             const utxo = additional_utxos[utxo_idx];
-            const sig_val = try sign.sign(self.allocator, tx_hex_inout.*, inp_idx, utxo.script, utxo.satoshis, null);
+            const sig_val = try funding_sign.sign(self.allocator, tx_hex_inout.*, inp_idx, utxo.script, utxo.satoshis, null);
             defer self.allocator.free(sig_val);
-            const pub_key = try sign.getPublicKey(self.allocator);
+            const pub_key = try funding_sign.getPublicKey(self.allocator);
             defer self.allocator.free(pub_key);
             const sig_push = try state_mod.encodePushData(self.allocator, sig_val);
             defer self.allocator.free(sig_push);
@@ -3761,6 +3773,63 @@ test "Item 8 — RunarContract.deploy rejects oversized locking script" {
 
     // No broadcast should have happened.
     try std.testing.expectEqual(@as(usize, 0), prov.getBroadcastedTxs().len);
+}
+
+// Issue #134: P2PKH funding inputs must be signed by DeployOptions.funding_signer
+// (CallOptions.funding_signer for calls) when set — the funding coins may be
+// owned by a different key than the connected method/deploy signer. Defaults to
+// the connected signer (zero behaviour change).
+test "deploy signs funding inputs with fundingSigner when set (#134)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"contractName":"Trivial","version":"1","compilerVersion":"1.0","script":"51","asm":"OP_1",
+        \\"abi":{"constructor":{"params":[]},"methods":[{"name":"unlock","params":[],"isPublic":true}]},
+        \\"stateFields":[],"constructorSlots":[],"buildTimestamp":"2024-01-01"}
+    ;
+    var artifact = try types.RunarArtifact.fromJson(allocator, json);
+    defer artifact.deinit();
+
+    var signer_a = try signer_mod.LocalSigner.fromHex("18e14a7b6a307f426a94f8114701e7c8e774e7f9a47e2c2035db29a206321725");
+    var signer_b = try signer_mod.LocalSigner.fromHex("0000000000000000000000000000000000000000000000000000000000000003");
+
+    const addr_a = try signer_a.signer().getAddress(allocator);
+    defer allocator.free(addr_a);
+    const pub_a = try signer_a.signer().getPublicKey(allocator);
+    defer allocator.free(pub_a);
+    const pub_b = try signer_b.signer().getPublicKey(allocator);
+    defer allocator.free(pub_b);
+    try std.testing.expect(!std.mem.eql(u8, pub_a, pub_b));
+
+    // WITH fundingSigner = B: the funding input pushes B's pubkey, not A's.
+    // (The change output is a P2PKH to A's hash160 — the full pubkey A only
+    // appears in the tx if A signs an input.)
+    {
+        var contract = try RunarContract.init(allocator, &artifact, &.{});
+        defer contract.deinit();
+        var prov = provider_mod.MockProvider.init(allocator, "testnet");
+        defer prov.deinit();
+        try prov.addUtxo(addr_a, .{ .txid = "aa" ** 32, .output_index = 0, .satoshis = 100_000, .script = "76a914" ++ "00" ** 20 ++ "88ac" });
+        const txid = try contract.deploy(prov.provider(), signer_a.signer(), .{ .satoshis = 1000, .funding_signer = signer_b.signer() });
+        allocator.free(txid);
+        const txs = prov.getBroadcastedTxs();
+        try std.testing.expectEqual(@as(usize, 1), txs.len);
+        try std.testing.expect(std.mem.indexOf(u8, txs[0], pub_b) != null);
+        try std.testing.expect(std.mem.indexOf(u8, txs[0], pub_a) == null);
+    }
+
+    // WITHOUT fundingSigner: the funding input pushes A's pubkey (default).
+    {
+        var contract = try RunarContract.init(allocator, &artifact, &.{});
+        defer contract.deinit();
+        var prov = provider_mod.MockProvider.init(allocator, "testnet");
+        defer prov.deinit();
+        try prov.addUtxo(addr_a, .{ .txid = "aa" ** 32, .output_index = 0, .satoshis = 100_000, .script = "76a914" ++ "00" ** 20 ++ "88ac" });
+        const txid = try contract.deploy(prov.provider(), signer_a.signer(), .{ .satoshis = 1000 });
+        allocator.free(txid);
+        const txs = prov.getBroadcastedTxs();
+        try std.testing.expect(std.mem.indexOf(u8, txs[0], pub_a) != null);
+        try std.testing.expect(std.mem.indexOf(u8, txs[0], pub_b) == null);
+    }
 }
 
 // ===========================================================================

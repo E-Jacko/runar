@@ -69,6 +69,11 @@ pub const TxOutput = struct {
 pub const DeployOptions = struct {
     satoshis: i64,
     change_address: ?[]const u8 = null,
+    /// Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+    /// are owned by a different key than the connected deploy signer, set this so
+    /// the funding inputs are signed by their real owner. Defaults to the
+    /// connected signer (zero behaviour change).
+    funding_signer: ?@import("sdk_signer.zig").Signer = null,
 };
 
 /// CallOptions specifies options for calling a contract method.
@@ -134,6 +139,12 @@ pub const CallOptions = struct {
     /// or custom relative-locktime scenarios. Threaded through the non-terminal
     /// and terminal call-tx build sites.
     sequence: ?u32 = null,
+    /// Signer for the P2PKH funding (and terminal fee) inputs (issue #134). When
+    /// the funding/fee UTXOs are owned by a different key than the connected
+    /// method signer, set this so those inputs are signed by their real owner.
+    /// The method's own `Sig` args are still signed by the connected signer.
+    /// Defaults to the connected signer (zero behaviour change).
+    funding_signer: ?@import("sdk_signer.zig").Signer = null,
 };
 
 /// OutputSpec describes one continuation output for a multi-output method.
