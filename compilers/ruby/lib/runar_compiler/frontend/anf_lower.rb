@@ -180,6 +180,16 @@ module RunarCompiler
           method_ctx.register_param_type(p.name, _type_node_to_string(p.type))
         end
 
+        # Register the declared param NAMES so a bare identifier resolves to
+        # load_param before falling through to load_prop (#130). Without this,
+        # a param whose name collides with a mutable state property lowered to
+        # the stale deserialized property value instead of the witness param.
+        # Explicit this.x is unaffected: PropertyAccessExpr lowering checks
+        # property? before param? (below), so a stored property still wins.
+        method.params.each do |p|
+          method_ctx.add_param(p.name)
+        end
+
         if contract.parent_class == "StatefulSmartContract" && method.visibility == "public"
           # Determine if this method verifies hashOutputs (needs change output support).
           # Methods that use addOutput / addDataOutput or mutate state need hashOutputs
@@ -769,7 +779,14 @@ module RunarCompiler
         when Identifier
           _lower_identifier(expr)
         when PropertyAccessExpr
-          # this.txPreimage in StatefulSmartContract -> load_param
+          # Explicit this.x: a real contract property always wins, even when a
+          # method param shares the name (#130). Now that declared params are
+          # registered, the param? branch below must not shadow a stored property.
+          if property?(expr.property)
+            return emit(IR::ANFValue.new(kind: "load_prop").tap { |v| v.name = expr.property })
+          end
+          # this.txPreimage in StatefulSmartContract -> load_param (it's an
+          # implicit injected param, not a stored property).
           if param?(expr.property)
             return emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = expr.property })
           end
