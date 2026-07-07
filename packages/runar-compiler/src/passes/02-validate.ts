@@ -16,6 +16,7 @@ import type {
 } from '../ir/index.js';
 import type { CompilerDiagnostic } from '../errors.js';
 import { makeDiagnostic } from '../errors.js';
+import { validateSighashUsage } from './sighash-validate.js';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -44,6 +45,10 @@ export function validate(contract: ContractNode): ValidationResult {
   validateConstructor(ctx);
   validateMethods(ctx);
   checkNoRecursion(ctx);
+
+  // Issue #123: reject preimage-field reads / output bindings that are unsound
+  // under a method's declared @sighash mode (security core).
+  errors.push(...validateSighashUsage(contract));
 
   return { errors, warnings };
 }
