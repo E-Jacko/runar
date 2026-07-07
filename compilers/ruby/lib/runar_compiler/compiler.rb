@@ -128,12 +128,14 @@ module RunarCompiler
     require_relative "frontend/input_limits"
     Frontend::InputLimits.assert_source_bytes_under_limit(source)
 
-    # Fail-closed guard for the author-facing comment directives that only the
-    # TypeScript compiler implements today: +@sighash <FLAGS>+ (#123, per-method
-    # sighash type) and +@embedAlways+ (#109, readonly-field DCE opt-out). Ruby
-    # ignores comments, so it would silently drop them and change signing / DCE
-    # semantics. Reject rather than diverge until the ports land.
-    directive_error = _unsupported_directive_error(source)
+    # Fail-closed guard for the author-facing comment directives. These are
+    # honored ONLY on the +.runar.ts+ surface (matching the TypeScript
+    # reference); on the other 8 formats Ruby's parsers ignore comments and
+    # would silently drop the directive, changing signing / DCE semantics, so
+    # the guard fails closed there. +@embedAlways+ (#109, readonly-field DCE
+    # opt-out) is implemented for +.runar.ts+ below; +@sighash+ (#123) is not
+    # yet, so it still fails closed on every format including +.runar.ts+.
+    directive_error = _unsupported_directive_error(source, file_name)
     unless directive_error.nil?
       require_relative "frontend/parse_result"
       require_relative "frontend/diagnostic"
@@ -182,14 +184,28 @@ module RunarCompiler
   # or nil when the source is clean. Word-boundary matched (\b) to mirror the
   # TypeScript compiler's +/@sighash\b/+ / +/@embedAlways\b/+ scans so an
   # identifier like +sighashType+ does not trip the guard.
-  def self._unsupported_directive_error(source)
+  #
+  # The directives are honored ONLY on the +.runar.ts+ surface (matching the
+  # TypeScript reference). For +.runar.ts+ the implemented directives are
+  # allowed through to the parser; the other 8 formats always fail closed.
+  def self._unsupported_directive_error(source, file_name)
+    is_ts = file_name.downcase.end_with?(".runar.ts")
+
+    # @sighash (#123) is not yet implemented in the Ruby tier — fail closed on
+    # every format, including .runar.ts, until the port lands.
     if source =~ /@sighash\b/
-      "@sighash directive is not yet supported by the Ruby compiler " \
-        "(issue #123); compile the contract with the TypeScript compiler"
-    elsif source =~ /@embedAlways\b/
-      "@embedAlways directive is not yet supported by the Ruby compiler " \
-        "(issue #109); compile the contract with the TypeScript compiler"
+      return "@sighash directive is not yet supported by the Ruby compiler " \
+             "(issue #123); compile the contract with the TypeScript compiler"
     end
+
+    # @embedAlways (#109) is implemented for the .runar.ts surface; only the
+    # other 8 formats fail closed.
+    if source =~ /@embedAlways\b/ && !is_ts
+      return "@embedAlways directive is not supported by the Ruby compiler for " \
+             "this format (issue #109); it is honored only on the .runar.ts surface"
+    end
+
+    nil
   end
   private_class_method :_unsupported_directive_error
 

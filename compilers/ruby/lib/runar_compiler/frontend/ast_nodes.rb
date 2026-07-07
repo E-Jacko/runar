@@ -191,8 +191,19 @@ module RunarCompiler
     # The artifact assembler uses this marker to re-group the flat synthetic
     # runs back into logical +FixedArray+ ABI and state entries.  User-written
     # scalar properties leave this field as +nil+.
-    PropertyNode = Struct.new(:name, :type, :readonly, :initializer, :source_location, :synthetic_array_chain, keyword_init: true) do
-      def initialize(name: "", type: nil, readonly: false, initializer: nil, source_location: SourceLocation.new, synthetic_array_chain: nil)
+    #
+    # +embed_always+ is set by the parser when a +/** @embedAlways */+ (or
+    # +// @embedAlways+) comment directive immediately precedes a readonly field
+    # (issue #109). It opts the field OUT of dead-code elimination: a readonly
+    # field no method references is normally stripped from the locking script
+    # (its +load_prop+ is dead, so no constructor slot is emitted), silently
+    # removing deploy-time metadata an author intends to recover from the
+    # on-chain script later. When set, ANF lowering forces the field into the
+    # script (a constructor slot) so its bytes survive. Honored ONLY on the
+    # +.runar.ts+ surface (matching the TypeScript reference). Only meaningful
+    # on readonly fields.
+    PropertyNode = Struct.new(:name, :type, :readonly, :initializer, :source_location, :synthetic_array_chain, :embed_always, keyword_init: true) do
+      def initialize(name: "", type: nil, readonly: false, initializer: nil, source_location: SourceLocation.new, synthetic_array_chain: nil, embed_always: false)
         super
       end
     end

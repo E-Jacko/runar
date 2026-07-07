@@ -169,6 +169,18 @@ module RunarCompiler
         is_public: false
       )
 
+      # Issue #109: readonly fields carrying a +/** @embedAlways */+ directive
+      # must survive DCE into the locking script. A readonly field no method
+      # references lowers to no +load_prop+, so no constructor slot is emitted
+      # and the field's deploy-time bytes vanish. Inject a +load_prop+ + a
+      # +@ref:+ alias (the exact shape +const _bind = this.field;+ produces)
+      # into the first public method's body — the alias keeps the +load_prop+
+      # alive through dead-binding DCE, and stack lowering threads the pushed
+      # value through and cleans it up at method end. One slot in the deployed
+      # script suffices; every spending branch shares it.
+      embed_fields = contract.properties.select { |p| p.readonly && _embed_always?(p) }
+      embed_injected = false
+
       # Lower each method
       contract.methods.each do |method|
         method_ctx = LoweringContext.new(contract)
@@ -248,6 +260,14 @@ module RunarCompiler
           if has_state_prop
             preimage_ref3 = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
             method_ctx.emit(IR::ANFValue.new(kind: "deserialize_state").tap { |v| v.preimage = preimage_ref3 })
+          end
+
+          # Issue #109: preserve @embedAlways fields at the first user-statement
+          # position (after the checkPreimage/deserialize preamble), mirroring
+          # where a `const _bind = this.field;` idiom would sit.
+          if !embed_injected && embed_fields.any?
+            _emit_embed_always_preservation(method_ctx, embed_fields)
+            embed_injected = true
           end
 
           # Lower the developer's method body
@@ -374,6 +394,13 @@ module RunarCompiler
             is_public: true
           )
         else
+          # Issue #109: stateless public methods (and stateless contracts'
+          # spending entry points) are lowered here — inject @embedAlways
+          # preservation into the first PUBLIC one before its body.
+          if !embed_injected && embed_fields.any? && method.visibility == "public"
+            _emit_embed_always_preservation(method_ctx, embed_fields)
+            embed_injected = true
+          end
           method_ctx.lower_statements(method.body)
           augmented = _lower_params(
             method.params.reject { |p| _is_stateful_context_param(p) }
@@ -397,6 +424,33 @@ module RunarCompiler
       result
     end
     private_class_method :_lower_methods
+
+    # True when a property carries the +/** @embedAlways */+ directive (#109).
+    # PropertyNode gained the +embed_always+ field with the directive; guard
+    # +respond_to?+ so ANF lowering still works on AST nodes from formats /
+    # code paths that predate the field.
+    def self._embed_always?(prop)
+      prop.respond_to?(:embed_always) && prop.embed_always == true
+    end
+    private_class_method :_embed_always?
+
+    # Issue #109: emit the DCE-surviving preservation pair for each
+    # +@embedAlways+ readonly field into the given (public) method context.
+    #
+    # Reproduces exactly what a hand-written +const _bind = this.field;+ lowers
+    # to: a +load_prop+ followed by a +load_const("@ref:<t>")+ alias. The alias
+    # marks the +load_prop+ as referenced (see collect_refs_from_value in
+    # constant_fold.rb / dce.rb), so dead-binding DCE keeps it; stack lowering
+    # then emits the field's constructor-slot placeholder and NIPs the unused
+    # value off the stack at method end. The field's bytes therefore remain in
+    # the deployed locking script for downstream recovery.
+    def self._emit_embed_always_preservation(ctx, fields)
+      fields.each do |field|
+        load_ref = ctx.emit(IR::ANFValue.new(kind: "load_prop").tap { |v| v.name = field.name })
+        ctx.emit_named("__embedAlways_#{field.name}", _make_load_const_string("@ref:#{load_ref}"))
+      end
+    end
+    private_class_method :_emit_embed_always_preservation
 
     # Check if a parameter is a StatefulContext parameter (should be filtered from ANF).
     def self._is_stateful_context_param(param)

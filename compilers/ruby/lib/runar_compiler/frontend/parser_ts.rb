@@ -179,12 +179,26 @@ module RunarCompiler
         "?" => TOK_QUESTION,
       }.freeze
 
+      # Matches the author-facing comment directives (issue #109 @embedAlways,
+      # issue #123 @sighash). Word-boundary anchored to mirror the TS reference
+      # compiler's +/@embedAlways\b/+ / +/@sighash\b/+ scans so an identifier
+      # like +sighashType+ inside a comment does not register a directive.
+      DIRECTIVE_RE = /@(?:embedAlways|sighash)\b/
+
       # Tokenize a source string into an array of Token structs.
       #
+      # Comments are stripped from the token stream, but any comment carrying an
+      # +@embedAlways+ / +@sighash+ directive is recorded (with its start line)
+      # in the returned +directives+ list so the parser can attach it to the
+      # class member it immediately precedes — the TS reference gets this from
+      # ts-morph's leading-comment trivia; the Ruby tokenizer discards comments,
+      # so we capture directive comments here instead.
+      #
       # @param source [String]
-      # @return [Array<Token>]
+      # @return [Array(Array<Token>, Array<Hash>)] tokens and directive records
       def self.tokenize(source)
       tokens = []
+      directives = []
       line = 1
       col = 0
       i = 0
@@ -219,14 +233,20 @@ module RunarCompiler
 
         # Single-line comment //
         if ch == "/" && i + 1 < n && source[i + 1] == "/"
+          c_start = i
+          c_line = line
           while i < n && source[i] != "\n" && source[i] != "\r"
             i += 1
           end
+          ctext = source[c_start...i]
+          directives << { line: c_line, text: ctext } if ctext&.match?(DIRECTIVE_RE)
           next
         end
 
         # Multi-line comment /* ... */
         if ch == "/" && i + 1 < n && source[i + 1] == "*"
+          c_start = i
+          c_line = line
           i += 2
           col += 2
           found_end = false
@@ -249,6 +269,8 @@ module RunarCompiler
             # Reached end without finding */
             i += 1 if i < n
           end
+          ctext = source[c_start...i]
+          directives << { line: c_line, text: ctext } if ctext&.match?(DIRECTIVE_RE)
           next
         end
 
@@ -399,7 +421,7 @@ module RunarCompiler
       end
 
       tokens << Token.new(kind: TOK_EOF, value: "", line: line, col: col)
-      tokens
+      [tokens, directives]
     end
     end # module TsTokens
 
@@ -420,9 +442,18 @@ module RunarCompiler
         @tokens = []
         @pos = 0
         @errors = []
+        # Directive records ({line:, text:}) collected by the tokenizer for
+        # every @embedAlways / @sighash comment. Attached to the member each
+        # immediately precedes (see gather_member_directives). Set by parse_ts.
+        @directives = []
+        # Start line of the most recently parsed member (or the class body's
+        # opening brace). A directive attaches to a member only when it sits in
+        # the source gap AFTER the previous member and BEFORE this one, so a
+        # directive is claimed by exactly the member it immediately precedes.
+        @last_member_line = 0
       end
 
-      attr_accessor :tokens, :pos, :errors
+      attr_accessor :tokens, :pos, :errors, :directives
 
       # -- Error helpers ----------------------------------------------------
 
@@ -596,7 +627,11 @@ module RunarCompiler
           raise "no class extending SmartContract, StatefulSmartContract, or UnsafeSmartContract found"
         end
 
-        expect(TOK_LBRACE)
+        lbrace = expect(TOK_LBRACE)
+        # Anchor directive attribution at the class body's opening brace so a
+        # stray directive comment ABOVE the class does not attach to the first
+        # member.
+        @last_member_line = lbrace.line
 
         properties = []
         constructor = nil
@@ -650,6 +685,11 @@ module RunarCompiler
 
       def parse_class_member(parent_class)
         location = loc
+
+        # Claim any @embedAlways / @sighash directive comments sitting in the
+        # source gap immediately before this member (issue #109 / #123).
+        member_directives = gather_member_directives(location.line)
+        embed_always = member_directives.any? { |d| d[:text].match?(/@embedAlways\b/) }
 
         # Collect modifiers: public, private, readonly
         visibility = "private"
@@ -713,7 +753,8 @@ module RunarCompiler
             type: type_node,
             readonly: is_readonly,
             initializer: initializer,
-            source_location: location
+            source_location: location,
+            embed_always: embed_always
           )
         end
 
@@ -725,13 +766,26 @@ module RunarCompiler
             name: member_name,
             type: CustomType.new(name: "unknown"),
             readonly: is_readonly,
-            source_location: location
+            source_location: location,
+            embed_always: embed_always
           )
         end
 
         # Skip unknown
         skip_to_next_member
         nil
+      end
+
+      # Return the directive records that attach to a member starting at
+      # +member_line+: those recorded AFTER the previous member (or the class
+      # brace) and BEFORE this member, i.e. the ones this member immediately
+      # follows. Advances +@last_member_line+ so each directive is claimed once.
+      def gather_member_directives(member_line)
+        claimed = @directives.select do |d|
+          d[:line] > @last_member_line && d[:line] < member_line
+        end
+        @last_member_line = member_line
+        claimed
       end
 
       def skip_to_next_member
@@ -1786,7 +1840,9 @@ module RunarCompiler
     # @return [ParseResult]
     def self.parse_ts(source, file_name)
       p = TsParser.new(file_name)
-      p.tokens = TsTokens.tokenize(source)
+      toks, directives = TsTokens.tokenize(source)
+      p.tokens = toks
+      p.directives = directives
       p.pos = 0
 
       begin
