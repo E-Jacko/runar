@@ -1346,6 +1346,20 @@ class RunarContract:
             if not final_preimage and needs_op_push_tx:
                 final_preimage = resolved_args[preimage_index]
 
+        # Sign the fee input (issue #118). Its BIP-143 P2PKH sighash covers only
+        # hashPrevouts / hashOutputs / its own outpoint — NOT input 0's scriptSig
+        # — so it stays valid even after finalize_call rewrites input 0. Owned by
+        # funding_signer (composes with #134). The fee input sits at index 1,
+        # right after the primary contract input.
+        if fee_utxo:
+            fee_input_idx = 1
+            fee_sig = funding_signer.sign(
+                term_tx, fee_input_idx, fee_utxo.script, fee_utxo.satoshis,
+            )
+            fee_pub_key = funding_signer.get_public_key()
+            fee_unlock = encode_push_data(fee_sig) + encode_push_data(fee_pub_key)
+            term_tx = insert_unlocking_script(term_tx, fee_input_idx, fee_unlock)
+
         # Compute sighash from preimage
         sighash = ''
         if final_preimage:
