@@ -553,6 +553,8 @@ pub fn foldMethod(allocator: Allocator, method: ANFMethod) !ANFMethod {
         .params = method.params,
         .bindings = method.bindings,
         .body = folded_body,
+        // #123: preserve the in-memory @sighash carrier across the rebuild.
+        .sighash_type = method.sighash_type,
     };
 }
 

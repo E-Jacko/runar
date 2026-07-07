@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const types = @import("../ir/types.zig");
+const sighash_validate = @import("sighash_validate.zig");
 
 const Allocator = std.mem.Allocator;
 const ContractNode = types.ContractNode;
@@ -69,6 +70,24 @@ fn validateWithMode(
     try validateConstructor(allocator, contract, mode, &errors);
     try validateMethods(allocator, contract, &errors, &warnings);
     try checkNoRecursion(allocator, contract, &errors);
+
+    // Issue #123: reject preimage-field reads / output bindings that are
+    // unsound under a method's declared @sighash mode (security core). The pass
+    // emits both errors (unsound usages) and warnings (e.g. an explicit
+    // single-output SINGLE covenant whose same-index value cannot be pinned
+    // statically), so route each diagnostic to the matching bucket.
+    {
+        var sighash_diags: std.ArrayListUnmanaged(CompilerDiagnostic) = .empty;
+        defer sighash_diags.deinit(allocator);
+        try sighash_validate.validateSighashUsage(allocator, contract, &sighash_diags);
+        for (sighash_diags.items) |d| {
+            if (d.severity == .warning) {
+                try warnings.append(allocator, d);
+            } else {
+                try errors.append(allocator, d);
+            }
+        }
+    }
 
     return .{
         .errors = try errors.toOwnedSlice(allocator),

@@ -21,6 +21,7 @@ test {
     _ = @import("passes/parse_ruby.zig");
     _ = @import("passes/parse_java.zig");
     _ = @import("passes/validate.zig");
+    _ = @import("passes/sighash_validate.zig");
     _ = @import("passes/typecheck.zig");
     _ = @import("passes/expand_fixed_arrays.zig");
     _ = @import("passes/anf_lower.zig");
@@ -36,6 +37,8 @@ test {
     _ = @import("tests/language_constructs.zig");
     _ = @import("tests/frontend.zig");
     _ = @import("tests/embed_always.zig");
+    _ = @import("tests/sighash_codegen.zig");
+    _ = @import("tests/sighash_validate_test.zig");
     _ = @import("compiler_api.zig");
     _ = @import("passes/helpers/koalabear_emitters.zig");
     _ = @import("passes/helpers/poseidon2_koalabear.zig");

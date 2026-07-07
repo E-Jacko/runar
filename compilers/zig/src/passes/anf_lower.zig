@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const types = @import("../ir/types.zig");
+const sighash_directive = @import("../frontend/sighash_directive.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -267,6 +268,18 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
             if (isByteType(param.type_info)) method_ctx.markByteTyped(param.name);
         }
 
+        // Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+        // flag for any checkPreimage (auto-injected below, or a manual call) in
+        // this method, and rides on the ANF method as a carrier the artifact
+        // assembler copies to ABIMethod.sighash_type (omitted for the default).
+        var method_sighash: ?i32 = null;
+        if (method.sighash_type) |st| {
+            if (st != sighash_directive.SIGHASH_DEFAULT) {
+                method_ctx.sighash_flag = st;
+                method_sighash = st;
+            }
+        }
+
         if (contract.parent_class == .stateful_smart_contract and method.is_public) {
             try lowerStatefulPublicMethod(allocator, &method_ctx, method, contract, &embed_injected);
         } else {
@@ -303,6 +316,7 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
                 .params = params_out,
                 .bindings = bindings,
                 .body = bindings,
+                .sighash_type = method_sighash,
             });
         }
 
@@ -354,6 +368,7 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
                 .params = try aug_params.toOwnedSlice(allocator),
                 .bindings = bindings,
                 .body = bindings,
+                .sighash_type = method_sighash,
             });
         }
     }
@@ -436,23 +451,33 @@ fn lowerStatefulPublicMethod(
     ctx.addParam("txPreimage");
     ctx.markByteTyped("txPreimage");
 
-    // Inject checkPreimage(txPreimage)
+    // Issue #123: the declared per-method sighash mode (default ALL|FORKID).
+    // Drives BOTH the OP_PUSH_TX binding flag (so the derived sig re-computes
+    // the tx sighash under this mode) AND the runtime preimage-type assert.
+    const sighash_mode: i32 = method.sighash_type orelse sighash_directive.SIGHASH_DEFAULT;
+    const is_default_sighash = sighash_mode == sighash_directive.SIGHASH_DEFAULT;
+
+    // Inject checkPreimage(txPreimage). Omit the sighash flag for the default so
+    // the ANF (and pinned binding blob) is byte-identical to every existing
+    // contract.
     const preimage_ref = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
-    const check_result = try ctx.emit(.{ .check_preimage = .{ .preimage = preimage_ref } });
+    const check_result = try ctx.emit(.{ .check_preimage = .{
+        .preimage = preimage_ref,
+        .sighash_flag = if (is_default_sighash) 0 else sighash_mode,
+    } });
     _ = try ctx.emit(.{ .assert = .{ .value = check_result } });
 
-    // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-    // auto-injected covenant cannot be spent under a permissive sighash flag
-    // (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields a contract
-    // may read. The hashOutputs continuation already fails under non-ALL flags,
-    // so this is a no-op on spendability for continuation-using methods and
-    // closes the field-zeroing exposure for the rest.
+    // GAP-302 / #123: pin the sighash type to the declared mode. Without this
+    // check the spend could use a DIFFERENT sighash flag than declared that
+    // zeroes out preimage fields the contract (or its continuation) relies on
+    // (hashOutputs / hashPrevouts / hashSequence). The value defaults to 0x41
+    // (SIGHASH_ALL|FORKID) so existing contracts emit byte-identical ANF.
     const sig_hash_preimage_ref = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
     const sig_hash_type_ref = try ctx.emit(.{ .call = .{
         .func = "extractSigHashType",
         .args = try ctx.allocSlice(&.{sig_hash_preimage_ref}),
     } });
-    const expected_sig_hash_ref = try ctx.emit(makeLoadConstInt(0x41));
+    const expected_sig_hash_ref = try ctx.emit(makeLoadConstInt(sighash_mode));
     const sig_hash_ok_ref = try ctx.emit(.{ .bin_op = .{
         .op = "===",
         .left = sig_hash_type_ref,
@@ -651,6 +676,12 @@ const LowerCtx = struct {
     /// requireOutputP2PKH emits its hashOutputs(preimage) check at most once
     /// per method — flipped on the first call.
     did_emit_hash_outputs_check: bool = false,
+    /// Issue #123: the declared non-default `@sighash` flag for the method
+    /// being lowered, so a MANUAL checkPreimage(pre) call binds under the same
+    /// mode as the method's declared sighash. Null = default ALL|FORKID,
+    /// keeping the pinned binding blob unchanged. Propagated into sub-contexts
+    /// so a manual call inside an if/for body picks it up.
+    sighash_flag: ?i32 = null,
 
     fn init(allocator: Allocator, contract: ContractNode) LowerCtx {
         return .{
@@ -779,6 +810,8 @@ const LowerCtx = struct {
     fn subContext(self: *LowerCtx) LowerCtx {
         var sub = LowerCtx.init(self.allocator, self.contract);
         sub.counter = self.counter;
+        // #123: nested manual checkPreimage inherits the method's mode.
+        sub.sighash_flag = self.sighash_flag;
         // Copy local names
         var local_it = self.local_names.iterator();
         while (local_it.next()) |entry| {
@@ -1277,7 +1310,11 @@ fn lowerCallExpr(ctx: *LowerCtx, c: *const types.CallExpr) LowerError![]const u8
     if (std.mem.eql(u8, c.callee, "checkPreimage")) {
         if (c.args.len >= 1) {
             const preimage_ref = try lowerExprToRef(ctx, c.args[0]);
-            return try ctx.emit(.{ .check_preimage = .{ .preimage = preimage_ref } });
+            // Issue #123: honour the method's declared @sighash on manual calls.
+            return try ctx.emit(.{ .check_preimage = .{
+                .preimage = preimage_ref,
+                .sighash_flag = ctx.sighash_flag orelse 0,
+            } });
         }
     }
 

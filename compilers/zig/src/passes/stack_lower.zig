@@ -957,7 +957,7 @@ const LowerCtx = struct {
             },
             .assert => |a| try self.lowerAssertOp(binding.name, .{ .condition = a.value }, false),
             .update_prop => |up| try self.lowerPropertyWrite(binding.name, .{ .name = up.name, .value_ref = up.value }),
-            .check_preimage => |cp| try self.lowerCheckPreimage(binding.name, &.{cp.preimage}),
+            .check_preimage => |cp| try self.lowerCheckPreimage(binding.name, &.{cp.preimage}, cp.sighash_flag),
             .deserialize_state => |ds| try self.lowerDeserializeState(binding.name, &.{ds.preimage}),
             .array_literal => |al| try self.lowerArrayLiteral(binding.name, al.elements),
             .raw_script => |rs| try self.lowerRawScript(binding.name, rs.bytes, rs.in_arity, rs.out_arity),
@@ -1663,7 +1663,11 @@ const LowerCtx = struct {
             .divmod => try self.lowerDivMod(bind_name, args),
             .log2 => try self.lowerLog2(bind_name, args),
             .clamp => try self.lowerClamp(bind_name, args),
-            .checkPreimage => try self.lowerCheckPreimage(bind_name, args),
+            // Builtin-call dispatch path: reached only for a `call` node named
+            // checkPreimage, which anf_lower never emits (it lowers manual
+            // checkPreimage() into a dedicated check_preimage node carrying the
+            // sighash flag). Default flag (0 = ALL|FORKID) is correct here.
+            .checkPreimage => try self.lowerCheckPreimage(bind_name, args, 0),
             .deserializeState => try self.lowerDeserializeState(bind_name, args),
             .extractHashPrevouts, .extractLocktime, .extractOutpoint, .extractOutputHash, .extractSigHashType => try self.lowerExtractor(bind_name, id, args),
             .sign => try self.lowerSign(bind_name, args),
@@ -2608,7 +2612,7 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
-    fn lowerCheckPreimage(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
+    fn lowerCheckPreimage(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, sighash_flag: i32) !void {
         if (args.len < 1) return LowerError.InvalidBuiltin;
         // OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
         // current spending transaction. The signature is DERIVED FROM THE PREIMAGE
@@ -2625,9 +2629,12 @@ const LowerCtx = struct {
         // Bring the preimage to the top (kept for field extractors below).
         try self.bringToTopAuto(args[0]);
 
-        // Derive + verify the signature on-chain (single opaque raw_bytes blob,
-        // byte-identical across all 7 tiers). Net stack effect is zero.
-        try self.emitCheckPreimageBinding();
+        // Derive + verify the signature on-chain (single opaque raw_bytes blob).
+        // For the default ALL|FORKID (sighash_flag 0/0x41) the blob is
+        // byte-identical to the pinned cross-tier constant; issue #123 lets a
+        // method declare a different mode, which only changes the appended
+        // sighash flag byte. Net stack effect is zero.
+        try self.emitCheckPreimageBinding(sighash_flag);
 
         // Preimage remains on top. Rename for field extractors.
         try self.stack.renameAtDepth(self.allocator, 0, bind_name);
@@ -2640,9 +2647,36 @@ const LowerCtx = struct {
     /// peephole optimizer treats it as a hard barrier. The construction is the
     /// canonical output of the TypeScript reference, byte-identical across all
     /// seven tiers (guarded by the cross-tier conformance suite).
-    fn emitCheckPreimageBinding(self: *LowerCtx) !void {
-        const decoded = try self.allocator.alloc(u8, check_preimage_binding_hex.len / 2);
-        _ = std.fmt.hexToBytes(decoded, check_preimage_binding_hex) catch {
+    fn emitCheckPreimageBinding(self: *LowerCtx, sighash_flag: i32) !void {
+        // The frozen binding hex pushes SIGHASH_ALL|FORKID (0x41) as the DER
+        // signature's appended sighash byte via the single `0141` push
+        // immediately before the fixed G-pubkey tail. Issue #123 lets a method
+        // declare a different mode, which only changes that one appended flag
+        // byte — byte-for-byte matching the TS reference's
+        // emitCheckPreimageBinding(flag). All valid (FORKID-required) sighash
+        // flags (0x41/0x42/0x43/0xc1/0xc2/0xc3) minimal-push as OP_DATA_1 + flag.
+        var flag: i32 = sighash_flag;
+        if (flag == 0) flag = 0x41;
+
+        var owned_hex: ?[]u8 = null;
+        defer if (owned_hex) |h| self.allocator.free(h);
+        const hex: []const u8 = if (flag == 0x41) check_preimage_binding_hex else blk: {
+            const suffix = "0141" ++ check_preimage_sighash_tail;
+            if (!std.mem.endsWith(u8, check_preimage_binding_hex, suffix)) {
+                return LowerError.UnsupportedOperation;
+            }
+            const prefix = check_preimage_binding_hex[0 .. check_preimage_binding_hex.len - suffix.len];
+            const new_hex = try std.fmt.allocPrint(self.allocator, "{s}01{x:0>2}{s}", .{
+                prefix,
+                @as(u8, @intCast(flag & 0xff)),
+                check_preimage_sighash_tail,
+            });
+            owned_hex = new_hex;
+            break :blk new_hex;
+        };
+
+        const decoded = try self.allocator.alloc(u8, hex.len / 2);
+        _ = std.fmt.hexToBytes(decoded, hex) catch {
             self.allocator.free(decoded);
             return LowerError.UnsupportedOperation;
         };
@@ -4488,6 +4522,13 @@ const LowerCtx = struct {
 // opaque raw_bytes op (peephole barrier). The cross-tier conformance suite
 // guards that this constant matches every other tier byte-for-byte.
 const check_preimage_binding_hex = "76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad";
+
+// The frozen binding hex above ends with `0141` (OP_DATA_1 SIGHASH_ALL|FORKID)
+// immediately before this fixed G-pubkey tail. Issue #123: a non-default
+// @sighash mode swaps only that single push (`0141` -> `01<flag>`), leaving the
+// tail intact — byte-for-byte matching the TS reference. Mirrors Go's
+// checkPreimageSighashTail (compilers/go/codegen/oppushtx.go).
+const check_preimage_sighash_tail = "7e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad";
 
 // ============================================================================
 // Public API

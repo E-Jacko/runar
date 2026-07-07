@@ -321,6 +321,14 @@ pub const ANFMethod = struct {
     params: []ParamNode = &.{},
     bindings: []ANFBinding = &.{},
     body: []ANFBinding = &.{},
+    /// Non-default BIP-143 sighash mode a `@sighash` directive declared for
+    /// this (public) method (issue #123), e.g. 0x43 for SINGLE|FORKID. Null =
+    /// default ALL|FORKID (0x41). In-memory carrier only — never serialized
+    /// into the ANF IR JSON compared cross-tier (the codegen-relevant flag
+    /// rides on each check_preimage node's sighash_flag). The artifact
+    /// assembler copies it to ABIMethod.sighash_type so the SDK builds a
+    /// matching preimage.
+    sighash_type: ?i32 = null,
 };
 pub const ANFBinding = struct { name: []const u8, value: ANFValue, source_loc: ?SourceLocation = null };
 
@@ -424,7 +432,16 @@ pub const ANFAssert = struct {
     is_auto_injected_state_check: bool = false,
 };
 pub const UpdateProp = struct { name: []const u8, value: []const u8 };
-pub const CheckPreimage = struct { preimage: []const u8 };
+pub const CheckPreimage = struct {
+    preimage: []const u8,
+    /// Issue #123: the BIP-143 sighash flag the on-chain OP_PUSH_TX binding
+    /// appends to the derived signature (so the node re-derives the tx sighash
+    /// under this flag). 0 = default ALL|FORKID (0x41), byte-identical to the
+    /// pinned cross-tier binding blob. Only set for a method that declares a
+    /// non-default @sighash mode, keeping golden ANF unchanged for every
+    /// existing contract.
+    sighash_flag: i32 = 0,
+};
 pub const DeserializeState = struct { preimage: []const u8 };
 pub const ANFAddOutput = struct { satoshis: []const u8, state_values: []const []const u8 = &.{}, preimage: []const u8 = "", state_refs: []const []const u8 = &.{} };
 pub const ANFAddRawOutput = struct { satoshis: []const u8, script_bytes: []const u8 = "" };
@@ -568,7 +585,17 @@ pub const RunarArtifact = struct {
 pub const Artifact = RunarArtifact;
 pub const ABI = struct { constructor: ABIConstructor, methods: []ABIMethod };
 pub const ABIConstructor = struct { params: []ABIParam };
-pub const ABIMethod = struct { name: []const u8, params: []ABIParam, is_public: bool, is_terminal: bool = false };
+pub const ABIMethod = struct {
+    name: []const u8,
+    params: []ABIParam,
+    is_public: bool,
+    is_terminal: bool = false,
+    /// Issue #123: the BIP-143 sighash type this method's preimage/covenant is
+    /// built under (from a `@sighash` directive), e.g. 0x43 for SINGLE|FORKID.
+    /// Null = default ALL|FORKID (0x41); the SDK falls back to 0x41 so existing
+    /// artifacts are unchanged. Emitted into the artifact JSON only when set.
+    sighash_type: ?i32 = null,
+};
 pub const ABIParam = struct { name: []const u8, type_name: []const u8 };
 pub const ConstructorSlot = struct { param_index: usize, byte_offset: usize };
 pub const CodeSepIndexSlot = struct { byte_offset: usize, code_sep_index: usize };
