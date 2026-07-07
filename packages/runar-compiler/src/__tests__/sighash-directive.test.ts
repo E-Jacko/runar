@@ -53,6 +53,21 @@ describe('#123 @sighash flag grammar', () => {
     expect('error' in parseSighashFlags('   ')).toBe(true);
   });
 
+  // F2 (P2, leaning P1): FORKID is mandatory on BSV — the whole OP_PUSH_TX /
+  // BIP-143 preimage machinery is FORKID-only, so a FORKID-less flag set
+  // deploys a covenant whose derived signature can never verify (deploy-to-brick).
+  it('rejects a base type without FORKID (deploy-to-brick)', () => {
+    for (const flags of ['SINGLE', 'ALL', 'NONE', 'ALL|ANYONECANPAY']) {
+      const r = parseSighashFlags(flags);
+      expect('error' in r && r.error).toMatch(/FORKID is mandatory on BSV/);
+    }
+  });
+
+  it('accepts the same flag sets once FORKID is added', () => {
+    expect(parseSighashFlags('SINGLE|FORKID')).toEqual({ value: 0x43 });
+    expect(parseSighashFlags('ALL|ANYONECANPAY|FORKID')).toEqual({ value: 0xc1 });
+  });
+
   it('extracts from JSDoc block text', () => {
     expect(extractSighashDirective('/** @sighash SINGLE|FORKID */')).toEqual({ value: 0x43 });
     expect(extractSighashDirective('// @sighash NONE|FORKID')).toEqual({ value: 0x42 });

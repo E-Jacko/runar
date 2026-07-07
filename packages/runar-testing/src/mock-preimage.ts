@@ -446,11 +446,25 @@ export function buildStatefulPreimage(
 
   // BIP-143 hashOutputs by sighash base:
   //   ALL    -> hash256(all outputs)
-  //   SINGLE -> hash256(output at this input's index) — the mock is single-input
-  //             at index 0, so the sole continuation output IS that output
+  //   SINGLE -> hash256(the single output at THIS input's index), or 32 zero
+  //             bytes when inputIndex >= outputs.length. It must NOT digest the
+  //             whole output set — under SINGLE every other output is
+  //             attacker-controllable, so hashing them all would diverge from
+  //             the real BIP-143 sighash and make the mock validate spends the
+  //             chain rejects. The mock spends a single input at index 0.
   //   NONE   -> 32 zero bytes (no outputs committed)
-  const hashOutputsHex =
-    base === 0x02 /* NONE */ ? ZERO32 : computeHashOutputs(outputs);
+  const inputIndex = 0;
+  let hashOutputsHex: string;
+  if (base === 0x02 /* NONE */) {
+    hashOutputsHex = ZERO32;
+  } else if (base === 0x03 /* SINGLE */) {
+    hashOutputsHex =
+      inputIndex < outputs.length
+        ? bytesToHex(hash256(hexToBytes(outputs[inputIndex]!)))
+        : ZERO32;
+  } else {
+    hashOutputsHex = computeHashOutputs(outputs);
+  }
 
   // Build BIP-143 preimage manually
   //

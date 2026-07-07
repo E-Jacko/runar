@@ -98,6 +98,16 @@ export function parseSighashFlags(flagsText: string): SighashParseResult {
     };
   }
 
+  // FORKID is mandatory on BSV: the entire OP_PUSH_TX / BIP-143 preimage
+  // machinery is FORKID-only, so a FORKID-less flag set deploys a covenant
+  // whose derived signature can never verify (deploy-to-brick). Reject it up
+  // front rather than let a spendable-looking script ship.
+  if ((value & FLAG_VALUES.FORKID!) === 0) {
+    return {
+      error: `@sighash: FORKID is mandatory on BSV; write e.g. @sighash ${baseTypes[0]}|FORKID (got "${raw}")`,
+    };
+  }
+
   return { value };
 }
 

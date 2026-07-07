@@ -110,6 +110,8 @@ export function validateSighashUsage(contract: ContractNode): CompilerDiagnostic
 
     const push = (u: Usage, msg: string) =>
       errors.push(makeDiagnostic(msg, 'error', u.loc ?? method.sourceLocation));
+    const pushWarn = (u: Usage, msg: string) =>
+      errors.push(makeDiagnostic(msg, 'warning', u.loc ?? method.sourceLocation));
 
     // ---- ANYONECANPAY: only THIS input is signed --------------------------
     if (acp) {
@@ -149,11 +151,30 @@ export function validateSighashUsage(contract: ContractNode): CompilerDiagnostic
 
     // ---- SINGLE commits ONLY to the same-index output ---------------------
     if (base === BASE_SINGLE) {
-      // Committed output count: explicit state outputs (addOutput) OR the
-      // single auto-continuation state output, plus any data outputs. The
+      // A fixed-index output assertion (requireOutputP2PKH) cannot be proven to
+      // land at THIS input's index, which is the only output SINGLE commits to.
+      for (const u of scan.outputAsserts) {
+        push(u, `@sighash ${label}: '${u.name}' asserts an output at a fixed index, but SINGLE commits ONLY to the output at THIS input's index — the asserted index cannot be statically proven equal to the input index, so the assertion may bind an uncommitted (attacker-controllable) output or silently brick the spend. Use ALL.`);
+      }
+
+      // A stateful mutate-only (or data-only) method has NO explicit output
+      // intrinsic, so the compiler auto-injects a single state-continuation
+      // output whose value is the caller-chosen `_newAmount` (04-anf-lower).
+      // Under SINGLE, BIP-143 commits ONLY to the output at THIS input's index
+      // and does NOT pin its value, so that continuation is value-skimmable: a
+      // spender sets _newAmount to dust, drives the change output to zero, and
+      // APPENDS a draining output — the covenant + OP_PUSH_TX binding still
+      // validate while funds are stolen (and an honest change>0 makes the UTXO
+      // unspendable). REJECT it.
+      const isMutateOnlyAutoContinuation =
+        needsContinuation &&
+        scan.stateOutputCount === 0 &&
+        scan.dataOutputCount === 0;
+
+      // Committed-output count for the multi-output rule: explicit state outputs
+      // (addOutput) OR the single auto-continuation, plus any data outputs. The
       // change output is conditional (0 under an exact-cover call) and is NOT
-      // counted; the caller must place the sole committed output at this
-      // input's index and pay exact cover (documented runtime obligation).
+      // counted.
       const stateOutputs =
         scan.stateOutputCount > 0
           ? scan.stateOutputCount
@@ -161,14 +182,25 @@ export function validateSighashUsage(contract: ContractNode): CompilerDiagnostic
             ? 1
             : 0;
       const committed = stateOutputs + scan.dataOutputCount;
-      if (committed > 1) {
+
+      if (isMutateOnlyAutoContinuation) {
+        push({ name: 'state continuation', loc: method.sourceLocation },
+          `@sighash ${label}: this stateful method's state continuation is sized by the caller-chosen _newAmount, but SINGLE commits ONLY to the same-index output WITHOUT pinning its value — a spender can set _newAmount to dust, drive the change output to zero, and append a draining output while the covenant + OP_PUSH_TX binding still validate (value skim); an honest change>0 leaves the UTXO unspendable. A mutate-only SINGLE continuation is unsound. Use ALL, or emit an explicit addOutput/addRawOutput that carries the full protected value at this input's index.`);
+      } else if (committed > 1) {
         push({ name: 'multi-output continuation', loc: method.sourceLocation },
           `@sighash ${label}: SINGLE commits ONLY to the output at this input's index, but this method binds ${committed} outputs (${scan.stateOutputCount} addOutput + ${scan.dataOutputCount} addDataOutput${stateOutputs > scan.stateOutputCount ? ' + state continuation' : ''}). Outputs beyond the same-index one are uncommitted and attacker-controllable. A SINGLE covenant must bind exactly one same-index output.`);
+      } else if (committed === 1) {
+        // Legitimate pairwise input↔output covenant: exactly one explicit
+        // addOutput/addRawOutput (or single data output). The same-index output
+        // IS committed, but SINGLE does not let the compiler prove statically
+        // that its VALUE equals the full protected amount — a runtime
+        // obligation on the caller. Allow, but warn.
+        pushWarn({ name: 'single-output SINGLE covenant', loc: method.sourceLocation },
+          `@sighash ${label}: SINGLE commits ONLY to the output at this input's index. This method binds exactly one output there, which is sound ONLY if that output carries the FULL protected value — SINGLE does not pin the amount, so a short-changed same-index output cannot be caught at compile time. Ensure the caller places the fully-valued output at this input's index.`);
       }
-      for (const u of scan.hashSequenceReads) {
-        // already covered by hashSequence rule above; no double report
-        void u;
-      }
+
+      // hashSequence reads under SINGLE are already reported by the shared
+      // hashSequence rule above (no double report).
     }
   }
 
@@ -199,6 +231,9 @@ function scanMethod(method: MethodNode, privateByName: Map<string, MethodNode>):
   const walkStmt = (stmt: Statement) => {
     switch (stmt.kind) {
       case 'assignment':
+        // Walk BOTH sides: a forbidden field read can hide in the assignment
+        // target (e.g. `arr[extractOutputHash(pre)] = x`), not just the value.
+        walkExpr(stmt.target);
         walkExpr(stmt.value);
         return;
       case 'expression_statement':
@@ -210,6 +245,10 @@ function scanMethod(method: MethodNode, privateByName: Map<string, MethodNode>):
         if (stmt.else) walkBody(stmt.else);
         return;
       case 'for_statement':
+        // Walk the full loop header: init and condition can hide a forbidden
+        // field read just as easily as the body/update do.
+        walkStmt(stmt.init);
+        walkExpr(stmt.condition);
         walkStmt(stmt.update);
         walkBody(stmt.body);
         return;

@@ -117,7 +117,9 @@ export function computeSideEffectSummary(contract: ContractNode): SideEffectSumm
         ) {
           into.mutatesState = true;
         }
-        // Right-hand side may still contain calls.
+        // Both sides may still contain calls (output intrinsics could hide in
+        // the target's index/object as well as the value).
+        collectExpr(stmt.target, into);
         collectExpr(stmt.value, into);
         return;
       case 'expression_statement':
@@ -129,6 +131,10 @@ export function computeSideEffectSummary(contract: ContractNode): SideEffectSumm
         if (stmt.else) for (const inner of stmt.else) collectStmt(inner, into);
         return;
       case 'for_statement':
+        // Walk the full loop header: an output intrinsic can hide in init or
+        // condition, not only in update/body.
+        collectStmt(stmt.init, into);
+        collectExpr(stmt.condition, into);
         collectStmt(stmt.update, into);
         for (const inner of stmt.body) collectStmt(inner, into);
         return;

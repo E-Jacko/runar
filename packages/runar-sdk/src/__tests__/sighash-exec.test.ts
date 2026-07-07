@@ -93,7 +93,14 @@ function sighashByteOf(preimage: number[]): number {
   return preimage[preimage.length - 4]!;
 }
 
-describe('#123 — SINGLE|FORKID single-output continuation validates through Spend', () => {
+describe('#123 (F1) — mutate-only SINGLE continuation is a compile REJECT, not a spend', () => {
+  // This flow used to "deploy + exact-cover call + validate through Spend", but
+  // the continuation output was sized by the caller-chosen `_newAmount`, which
+  // BIP-143 SINGLE never pins. That made it value-skimmable: call bump with
+  // `_newAmount` = dust, drive change to 0, and APPEND a draining output — the
+  // covenant + OP_PUSH_TX binding still validate (they only see the same-index
+  // continuation) while the protected funds are swept away. The compiler now
+  // rejects the unsound mode up front, so there is no artifact to deploy.
   const SRC = `
     class Counter extends StatefulSmartContract {
       n: bigint;
@@ -103,32 +110,10 @@ describe('#123 — SINGLE|FORKID single-output continuation validates through Sp
     }
   `;
 
-  it('deploy + exact-cover call is VALID and the preimage sighash byte is 0x43', async () => {
-    const artifact = compileSource(SRC, 'Counter.runar.ts');
-    // Sanity: the ABI advertises SINGLE|FORKID for the SDK.
-    expect(artifact.abi.methods.find((m) => m.name === 'bump')!.sigHashType).toBe(0x43);
-
-    const provider = new MockProvider();
-    const deployer = await fundedSigner(provider, DEPLOYER_KEY, 500_000);
-    const caller = new LocalSigner(CALLER_KEY); // unfunded -> change clamps to 0
-
-    const contract = new RunarContract(artifact, [0n]);
-    await contract.deploy(provider, deployer, { satoshis: 50_000 });
-    const deployTx = Transaction.fromHex(provider.getBroadcastedTxs()[0]!);
-
-    await contract.call('bump', [], provider, caller);
-    const callTx = Transaction.fromHex(provider.getBroadcastedTxs()[1]!);
-
-    // Exact-cover: the continuation is the SOLE output (same index as the input).
-    expect(callTx.outputs.length).toBe(1);
-    expect(contract.state.n).toBe(1n);
-
-    // The preimage was built under SINGLE|FORKID -> its sighash flag byte is 0x43.
-    const pre = preimageFromUnlock(callTx, 0);
-    expect(sighashByteOf(pre)).toBe(0x43);
-
-    // The whole covenant validates through the real BSV Script interpreter.
-    expect(validateSpend(callTx, 0, deployTx, 0)).toBe(true);
+  it('the compiler refuses to emit an artifact for the skimmable SINGLE mode', () => {
+    expect(() => compileSource(SRC, 'Counter.runar.ts')).toThrow(
+      /mutate-only SINGLE continuation is unsound|sized by the caller-chosen _newAmount/,
+    );
   });
 });
 
