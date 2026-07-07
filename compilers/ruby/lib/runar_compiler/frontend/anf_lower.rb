@@ -271,9 +271,34 @@ module RunarCompiler
           add_data_output_refs = method_ctx.get_add_data_output_refs
           if add_output_refs.any? || add_data_output_refs.any? || _method_mutates_state(method, contract)
             # Build the P2PKH change output for hashOutputs verification
+            #
+            # #116: the SDK's buildCallTransaction OMITS the change output when
+            # change <= 0 (an exact-cover call) and passes _changeAmount = 0.
+            # Gate the change segment on _changeAmount != 0 at runtime so the
+            # hashed output set matches the SDK at the exact-zero boundary -- the
+            # segment is the P2PKH change output when non-zero, and empty bytes
+            # (cat with empty is a no-op) when zero, reproducing the omission.
+            # For any change > 0 the hashed bytes are unchanged; only the emitted
+            # script gains the guard.
             change_pkh_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "_changePKH" })
             change_amount_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "_changeAmount" })
-            change_output_ref = method_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+            zero_ref = method_ctx.emit(_make_load_const_int(0))
+            change_nonzero_ref = method_ctx.emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
+              v.op = "!=="
+              v.left = change_amount_ref
+              v.right = zero_ref
+            end)
+            change_then_ctx = method_ctx.sub_context
+            change_then_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+            method_ctx.sync_counter(change_then_ctx)
+            change_else_ctx = method_ctx.sub_context
+            change_else_ctx.emit(_make_load_const_string(""))
+            method_ctx.sync_counter(change_else_ctx)
+            change_output_ref = method_ctx.emit(IR::ANFValue.new(kind: "if").tap do |v|
+              v.cond = change_nonzero_ref
+              v.then = change_then_ctx.bindings
+              v.else_ = change_else_ctx.bindings
+            end)
 
             if add_output_refs.any?
               # Multi-output continuation: concat all state outputs, then all

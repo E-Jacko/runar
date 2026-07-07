@@ -323,8 +323,10 @@ class TestExpandFixedArrays < Minitest::Test
     # Byte equality is the acceptance criterion for the FixedArray port —
     # v2 uses FixedArray<bigint, 9> which the expand pass must desugar into
     # the same hand-rolled 9 scalar fields + 9-way dispatch as v1.
-    assert_equal 9425, v1.script.length / 2, "v1 script must be 9425 bytes"
-    assert_equal 9425, v2.script.length / 2, "v2 script must be 9425 bytes"
+    # Byte count updated for #116 (change-output guard adds an OP_IF/ELSE/ENDIF
+    # wrapper, +24 bytes) — matches the TS reference fold-ON output.
+    assert_equal 9449, v1.script.length / 2, "v1 script must be 9449 bytes"
+    assert_equal 9449, v2.script.length / 2, "v2 script must be 9449 bytes"
     assert_equal v1.script, v2.script, "TicTacToe v1 and v2 scripts must be byte-identical"
   end
 
