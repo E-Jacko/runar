@@ -271,6 +271,15 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
         for p in method.params:
             method_ctx.register_param_type(p.name, _type_node_to_string(p.type))
 
+        # Register the declared param NAMES so a bare identifier resolves to
+        # ``load_param`` before falling through to ``load_prop`` (issue #130).
+        # Without this, a param whose name collides with a mutable state
+        # property lowered to the stale deserialized property value instead of
+        # the witness param. Explicit ``this.x`` is unaffected: it lowers via
+        # the property_access / member paths, which prefer a real property.
+        for p in method.params:
+            method_ctx.add_param(p.name)
+
         if contract.parent_class == "StatefulSmartContract" and method.visibility == "public":
             # Continuation requirements come from the side-effect
             # summary, which walks the private-method call graph. A
@@ -863,7 +872,14 @@ class _LowerCtx:
             return self._lower_identifier(expr)
 
         if isinstance(expr, PropertyAccessExpr):
-            # this.txPreimage in StatefulSmartContract -> load_param
+            # Explicit ``this.x``: a real contract property always wins, even
+            # when a method param shares the name (issue #130). Now that
+            # declared params are registered, the is_param branch below must not
+            # shadow a stored property.
+            if self.is_property(expr.property):
+                return self.emit(ANFValue(kind="load_prop", name=expr.property))
+            # this.txPreimage in StatefulSmartContract -> load_param (implicit
+            # injected param, not a stored property).
             if self.is_param(expr.property):
                 return self.emit(ANFValue(kind="load_param", name=expr.property))
             # this.x -> load_prop
