@@ -13,7 +13,7 @@ import { buildDeployTransaction, selectUtxos } from './deployment.js';
 import { buildCallTransaction } from './calling.js';
 import { serializeState, extractStateFromScript, findLastOpReturn } from './state.js';
 import { computeOpPushTx } from './oppushtx.js';
-import { buildP2PKHScript } from './script-utils.js';
+import { buildP2PKHScript, extractConstructorArgs } from './script-utils.js';
 import { computeNewStateAndDataOutputs } from './anf-interpreter.js';
 import { buildInscriptionEnvelope, parseInscriptionEnvelope } from './ordinals/envelope.js';
 import { Utils, Hash, Transaction as BsvTransaction, LockingScript, UnlockingScript } from '@bsv/sdk';
@@ -1703,7 +1703,7 @@ export class RunarContract {
   ): RunarContract {
     const contract = new RunarContract(
       artifact,
-      new Array(artifact.abi.constructor.params.length).fill(0n) as unknown[],
+      restoreConstructorArgs(artifact, utxo.script),
     );
 
     if (artifact.stateFields && artifact.stateFields.length > 0) {
@@ -2021,6 +2021,30 @@ function flattenFixedArrayArgs(
     }
   }
   return out;
+}
+
+/**
+ * Recover the positional constructor argument list from a deployed locking
+ * script, so a restored contract (`fromUtxo` / `fromTxId`) operates on the real
+ * baked-in values rather than `0n` placeholders.
+ *
+ * `extractConstructorArgs` returns a name→value map keyed by ABI param name;
+ * `abi.constructor.params` is already ordered by paramIndex, so mapping over it
+ * yields the positional `unknown[]` the `RunarContract` constructor expects.
+ *
+ * Params that carry no constructor slot (mutable state fields — their value
+ * lives in the OP_RETURN state section, restored separately) are absent from
+ * the extracted map; they fall back to `0n`, matching the prior placeholder
+ * behaviour, and are immediately overwritten by `extractStateFromScript`.
+ *
+ * FixedArray constructor params are rejected by the compiler ("Constructor
+ * parameter cannot be a FixedArray"), so no FixedArray grouping arises here.
+ */
+function restoreConstructorArgs(artifact: RunarArtifact, scriptHex: string): unknown[] {
+  const params = artifact.abi.constructor.params;
+  if (params.length === 0) return [];
+  const extracted = extractConstructorArgs(artifact, scriptHex);
+  return params.map((p) => (Object.prototype.hasOwnProperty.call(extracted, p.name) ? extracted[p.name] : 0n));
 }
 
 /**
