@@ -75,6 +75,19 @@ export interface PropertyNode {
   type: TypeNode;
   readonly: boolean;
   initializer?: Expression;
+  /**
+   * Set by the parser when a `/** @embedAlways *\/` (or `// @embedAlways`)
+   * comment directive immediately precedes a readonly field declaration
+   * (issue #109). It opts the field OUT of dead-code elimination: a
+   * readonly field no method references is normally stripped from the
+   * locking script (its `load_prop` is dead, so no constructor slot is
+   * emitted), silently removing deploy-time metadata an author intends to
+   * recover from the on-chain script later. When set, the compiler forces
+   * the field into the script (a constructor slot) so its bytes survive.
+   * Comment-directive form (not a decorator) keeps it portable across all
+   * nine surface formats. Only meaningful on readonly fields.
+   */
+  embedAlways?: boolean;
   sourceLocation: SourceLocation;
   /**
    * Set by the compiler's `expand-fixed-arrays` pass on every scalar

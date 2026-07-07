@@ -25,6 +25,7 @@ import type {
   MethodDeclaration,
   ConstructorDeclaration,
   ParameterDeclaration,
+  PropertyDeclaration,
 } from 'ts-morph';
 
 import type {
@@ -249,17 +250,42 @@ function parseProperties(
       initializer = parseExpression(initExpr, file, errors);
     }
 
+    // Issue #109: `/** @embedAlways */` (or `// @embedAlways`) directive
+    // immediately preceding the field opts it out of DCE elimination.
+    const embedAlways = hasEmbedAlwaysDirective(prop);
+
     result.push({
       kind: 'property',
       name,
       type,
       readonly: isReadonly,
       initializer,
+      ...(embedAlways ? { embedAlways: true } : {}),
       sourceLocation: locFromNode(prop, file),
     });
   }
 
   return result;
+}
+
+/**
+ * Detect an `@embedAlways` comment directive on a property declaration.
+ *
+ * Accepts the JSDoc block form `/** @embedAlways *\/` (the canonical,
+ * cross-format shape shared with the sibling `@sighash` directive) as well
+ * as `// @embedAlways` line comments and `/* @embedAlways *\/` block
+ * comments in the field's leading trivia. ts-morph attaches JSDoc blocks
+ * separately from ordinary leading comments, so both surfaces are checked.
+ */
+const EMBED_ALWAYS_RE = /@embedAlways\b/;
+function hasEmbedAlwaysDirective(prop: PropertyDeclaration): boolean {
+  for (const jsdoc of prop.getJsDocs()) {
+    if (EMBED_ALWAYS_RE.test(jsdoc.getText())) return true;
+  }
+  for (const range of prop.getLeadingCommentRanges()) {
+    if (EMBED_ALWAYS_RE.test(range.getText())) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
