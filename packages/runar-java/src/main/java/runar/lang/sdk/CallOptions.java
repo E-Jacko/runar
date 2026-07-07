@@ -55,6 +55,47 @@ public final class CallOptions {
      */
     public final Integer locktime;
 
+    /**
+     * Override the nSequence written onto EVERY input of the call tx (issue
+     * #131). Defaults are zero-config: when {@link #locktime} is set and
+     * non-zero, sequence defaults to {@code 0xfffffffe} (non-final, so
+     * consensus actually enforces nLockTime); otherwise it stays
+     * {@code 0xffffffff} (final, legacy). Set explicitly only for RBF or
+     * custom relative-locktime scenarios.
+     */
+    public final Integer sequence;
+
+    /**
+     * Cap the number of P2PKH funding inputs added to a non-terminal call tx
+     * (issue #133). Funding is chosen by smallest-sufficient, largest-first
+     * selection. If covering the outputs + fee would need more than this many
+     * inputs, the call throws rather than silently sweeping the wallet.
+     * {@code null} → no cap.
+     */
+    public final Integer maxFundingInputs;
+
+    /**
+     * Signer for the P2PKH funding (and terminal fee) inputs (issue #134).
+     * When the funding/fee UTXOs are owned by a different key than the
+     * connected method signer, set this so those inputs are signed by their
+     * real owner. The method's own {@code Sig} args are still signed by the
+     * connected signer. {@code null} → the connected signer (zero behaviour
+     * change).
+     */
+    public final Signer fundingSigner;
+
+    /**
+     * A single plain P2PKH UTXO added to a terminal call tx purely to pay the
+     * miner fee (issue #118). A true terminal method pays out the full
+     * contract balance, so fee would be 0 and ARC rejects; the covenant
+     * asserts its exact output set, so no change output can absorb a fee. The
+     * fee input is added BEFORE the OP_PUSH_TX preimage is computed (so
+     * hashPrevouts covers it) and is consumed entirely as fee — no change
+     * output is created. Signed with {@link #fundingSigner} (falling back to
+     * the connected signer). The covenant's output assertions are untouched.
+     */
+    public final UTXO feeUtxo;
+
     public CallOptions(
         Map<String, Object> newState,
         List<TerminalOutput> terminalOutputs,
@@ -69,15 +110,67 @@ public final class CallOptions {
         List<UTXO> fundingUtxos,
         Integer locktime
     ) {
+        this(newState, terminalOutputs, fundingUtxos, locktime, null, null, null, null);
+    }
+
+    /** Canonical all-fields constructor. */
+    public CallOptions(
+        Map<String, Object> newState,
+        List<TerminalOutput> terminalOutputs,
+        List<UTXO> fundingUtxos,
+        Integer locktime,
+        Integer sequence,
+        Integer maxFundingInputs,
+        Signer fundingSigner,
+        UTXO feeUtxo
+    ) {
         this.newState = newState;
         this.terminalOutputs = terminalOutputs;
         this.fundingUtxos = fundingUtxos;
         this.locktime = locktime;
+        this.sequence = sequence;
+        this.maxFundingInputs = maxFundingInputs;
+        this.fundingSigner = fundingSigner;
+        this.feeUtxo = feeUtxo;
     }
 
     /** Convenience factory for the common terminal-call case. */
     public static CallOptions terminal(List<TerminalOutput> outputs) {
         return new CallOptions(null, outputs, null);
+    }
+
+    // ------------------------------------------------------------------
+    // Immutable "wither" copies for setting individual optional fields.
+    // ------------------------------------------------------------------
+
+    /** Copy with {@link #locktime} set (issue #131 companion). */
+    public CallOptions withLocktime(Integer locktime) {
+        return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
+            sequence, maxFundingInputs, fundingSigner, feeUtxo);
+    }
+
+    /** Copy with {@link #sequence} set (issue #131). */
+    public CallOptions withSequence(Integer sequence) {
+        return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
+            sequence, maxFundingInputs, fundingSigner, feeUtxo);
+    }
+
+    /** Copy with {@link #maxFundingInputs} set (issue #133). */
+    public CallOptions withMaxFundingInputs(Integer maxFundingInputs) {
+        return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
+            sequence, maxFundingInputs, fundingSigner, feeUtxo);
+    }
+
+    /** Copy with {@link #fundingSigner} set (issue #134). */
+    public CallOptions withFundingSigner(Signer fundingSigner) {
+        return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
+            sequence, maxFundingInputs, fundingSigner, feeUtxo);
+    }
+
+    /** Copy with {@link #feeUtxo} set (issue #118). */
+    public CallOptions withFeeUtxo(UTXO feeUtxo) {
+        return new CallOptions(newState, terminalOutputs, fundingUtxos, locktime,
+            sequence, maxFundingInputs, fundingSigner, feeUtxo);
     }
 
     /**
