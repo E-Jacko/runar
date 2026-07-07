@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import hashlib
+import warnings
 from runar.sdk.types import (
     RunarArtifact, Utxo, TransactionData, TxOutput,
     DeployOptions, CallOptions, OutputSpec, TerminalOutput, PreparedCall,
@@ -28,6 +29,37 @@ from runar.sdk.anf_interpreter import compute_new_state, compute_new_state_and_d
 from runar.sdk.ordinals import (
     Inscription, build_inscription_envelope, parse_inscription_envelope,
 )
+
+
+class _EmptySig:
+    """Producer-side marker type (issue #106) for the deliberately-empty branch
+    of an OR-CHECKSIG method — ``checkSig(sigA, pkA) || checkSig(sigB, pkB)``,
+    where ``||`` lowers to the non-lazy ``OP_BOOLOR`` so BOTH ``OP_CHECKSIG``s
+    run. Only the matching branch supplies a real signature; the failing branch
+    MUST push an empty signature (OP_0) or BIP146 NULLFAIL rejects the spend.
+
+    Pass :data:`EMPTY_SIG` as the call arg for the non-matching ``Sig`` slot: the
+    SDK pushes OP_0 for it and never signs it, distinct from ``None`` (auto-sign)
+    and an explicit hex-bytes value. ``call('execute', [None, EMPTY_SIG])`` signs
+    only slot 0.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "EMPTY_SIG"
+
+
+#: Singleton marker for the empty OR-CHECKSIG branch (issue #106).
+EMPTY_SIG = _EmptySig()
+
+
+def is_empty_sig(value: object) -> bool:
+    """Type guard: is this call arg the :data:`EMPTY_SIG` marker (issue #106)?
+
+    Uses ``isinstance`` so identity holds even if the module is imported twice.
+    """
+    return isinstance(value, _EmptySig)
 
 
 class RunarContract:
@@ -492,6 +524,24 @@ class RunarContract:
                 prevouts_indices.append(i)
                 # Placeholder: 36 bytes per estimated input
                 resolved_args[i] = '00' * (36 * estimated_inputs)
+            # EMPTY_SIG (issue #106) is intentionally NOT handled here: it is not
+            # None, so it is never added to `sig_indices` and never signed. It
+            # stays in `resolved_args` and `_encode_arg` emits OP_0 for it.
+
+        # Soft heuristic (issue #106): more than one auto-signed Sig slot usually
+        # means an OR-CHECKSIG method whose non-matching branch should use
+        # EMPTY_SIG instead — otherwise every branch gets the same real signature
+        # and the failing CHECKSIG trips BIP146 NULLFAIL on broadcast. Legitimate
+        # AND-CHECKSIG multi-signer flows also use multiple auto slots, so this is
+        # informational only (the ABI does not encode OR-vs-AND topology).
+        if len(sig_indices) >= 2:
+            warnings.warn(
+                f"runar-sdk: {self.artifact.contract_name}.call('{method_name}') "
+                f"has {len(sig_indices)} auto-signed Sig slots. If this is an "
+                f"OR-CHECKSIG method, pass EMPTY_SIG for the non-matching "
+                f"branch(es) to satisfy BIP146 NULLFAIL (issue #106).",
+                stacklevel=2,
+            )
 
         # If any param uses SigHashPreimage, or this is stateful,
         # the compiler injects an implicit _opPushTxSig.
@@ -1737,6 +1787,9 @@ def _normalize_witness_bytes(value) -> str:
 
 
 def _encode_arg(value) -> str:
+    if is_empty_sig(value):
+        # OP_0 — empty signature push for the failing OR-CHECKSIG branch (#106).
+        return '00'
     if isinstance(value, bool):
         return '51' if value else '00'
     if isinstance(value, int):
