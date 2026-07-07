@@ -6,6 +6,8 @@ Hand-written tokenizer + recursive descent parser for TypeScript-like syntax.
 
 from __future__ import annotations
 
+import re
+
 from runar_compiler.frontend.ast_nodes import (
     ArrayLiteralExpr,
     ContractNode, PropertyNode, MethodNode, ParamNode, SourceLocation,
@@ -72,14 +74,25 @@ TOK_RSHIFT = 44      # >>
 TOK_ARROW = 45        # =>
 
 
-class Token:
-    __slots__ = ("kind", "value", "line", "col")
+# Issue #109: `@embedAlways` comment directive (word-boundary anchored so an
+# identifier like ``embedAlwaysFlag`` does not trip it), mirroring the TS
+# `/@embedAlways\b/` scan.
+_EMBED_ALWAYS_RE = re.compile(r"@embedAlways\b")
 
-    def __init__(self, kind: int, value: str, line: int, col: int):
+
+class Token:
+    __slots__ = ("kind", "value", "line", "col", "leading_comments")
+
+    def __init__(self, kind: int, value: str, line: int, col: int,
+                 leading_comments: str = ""):
         self.kind = kind
         self.value = value
         self.line = line
         self.col = col
+        # Issue #109/#123: the raw text of comment(s) immediately preceding this
+        # token (the token's "leading trivia"). Populated by the tokenizer so the
+        # parser can detect ``@embedAlways`` / ``@sighash`` comment directives.
+        self.leading_comments = leading_comments
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +150,17 @@ def _tokenize(source: str) -> list[Token]:
     i = 0
     n = len(source)
 
+    # Issue #109/#123: accumulate comment text so the *next* real token carries
+    # it as leading trivia. Comments are otherwise discarded; the parser needs
+    # the trivia to detect ``@embedAlways`` / ``@sighash`` directives.
+    pending_comments: list[str] = []
+
+    def _add(tok: Token) -> None:
+        if pending_comments:
+            tok.leading_comments = "\n".join(pending_comments)
+            pending_comments.clear()
+        tokens.append(tok)
+
     while i < n:
         ch = source[i]
 
@@ -162,12 +186,15 @@ def _tokenize(source: str) -> list[Token]:
 
         # Single-line comment //
         if ch == "/" and i + 1 < n and source[i + 1] == "/":
+            _comment_start = i
             while i < n and source[i] != "\n" and source[i] != "\r":
                 i += 1
+            pending_comments.append(source[_comment_start:i])
             continue
 
         # Multi-line comment /* ... */
         if ch == "/" and i + 1 < n and source[i + 1] == "*":
+            _comment_start = i
             i += 2
             col += 2
             while i + 1 < n:
@@ -184,6 +211,7 @@ def _tokenize(source: str) -> list[Token]:
             else:
                 if i < n:
                     i += 1
+            pending_comments.append(source[_comment_start:i])
             continue
 
         start_col = col
@@ -208,7 +236,7 @@ def _tokenize(source: str) -> list[Token]:
             if i < n:
                 i += 1
                 col += 1
-            tokens.append(Token(TOK_STRING, val, line, start_col))
+            _add(Token(TOK_STRING, val, line, start_col))
             continue
 
         # String literals: single or double quotes
@@ -228,7 +256,7 @@ def _tokenize(source: str) -> list[Token]:
             if i < n:
                 i += 1
                 col += 1
-            tokens.append(Token(TOK_STRING, val, line, start_col))
+            _add(Token(TOK_STRING, val, line, start_col))
             continue
 
         # Numbers (including BigInt suffix 'n')
@@ -261,7 +289,7 @@ def _tokenize(source: str) -> list[Token]:
             if i < n and source[i] == "n":
                 i += 1
                 col += 1
-            tokens.append(Token(TOK_NUMBER, num_str, line, start_col))
+            _add(Token(TOK_NUMBER, num_str, line, start_col))
             continue
 
         # Identifiers and keywords
@@ -271,7 +299,7 @@ def _tokenize(source: str) -> list[Token]:
                 i += 1
                 col += 1
             word = source[start:i]
-            tokens.append(Token(TOK_IDENT, word, line, start_col))
+            _add(Token(TOK_IDENT, word, line, start_col))
             continue
 
         # Three-character operators
@@ -282,7 +310,7 @@ def _tokenize(source: str) -> list[Token]:
                 "!==": TOK_NOTEQEQ,
             }.get(three)
             if three_kind is not None:
-                tokens.append(Token(three_kind, three, line, start_col))
+                _add(Token(three_kind, three, line, start_col))
                 i += 3
                 col += 3
                 continue
@@ -309,7 +337,7 @@ def _tokenize(source: str) -> list[Token]:
                 "=>": TOK_ARROW,
             }.get(two)
             if two_kind is not None:
-                tokens.append(Token(two_kind, two, line, start_col))
+                _add(Token(two_kind, two, line, start_col))
                 i += 2
                 col += 2
                 continue
@@ -343,7 +371,7 @@ def _tokenize(source: str) -> list[Token]:
         }
         one_kind = one_map.get(ch)
         if one_kind is not None:
-            tokens.append(Token(one_kind, ch, line, start_col))
+            _add(Token(one_kind, ch, line, start_col))
             i += 1
             col += 1
             continue
@@ -352,7 +380,7 @@ def _tokenize(source: str) -> list[Token]:
         i += 1
         col += 1
 
-    tokens.append(Token(TOK_EOF, "", line, col))
+    _add(Token(TOK_EOF, "", line, col))
     return tokens
 
 
@@ -574,6 +602,12 @@ class _TsParser:
         """Parse a property or method from inside a class body."""
         location = self.loc()
 
+        # Issue #109/#123: comment directives (``/** @embedAlways */`` /
+        # ``/** @sighash <FLAGS> */``) sit in the leading trivia of the member's
+        # first token, captured by the tokenizer. Grab it before consuming
+        # modifiers (which is where the trivia attaches).
+        leading = self.peek().leading_comments
+
         # Collect modifiers: public, private, readonly
         visibility = "private"
         is_readonly = False
@@ -610,7 +644,11 @@ class _TsParser:
 
         # Method: name(...)
         if self.check(TOK_LPAREN):
-            return self._parse_method(member_name, visibility, location)
+            return self._parse_method(member_name, visibility, location, leading)
+
+        # Issue #109: `/** @embedAlways */` (or `// @embedAlways`) directive
+        # immediately preceding the field opts it out of DCE elimination.
+        embed_always = _EMBED_ALWAYS_RE.search(leading) is not None
 
         # Property: name: Type (possibly with ; at end)
         if self.check(TOK_COLON):
@@ -630,6 +668,7 @@ class _TsParser:
                 type=type_node,
                 readonly=is_readonly,
                 initializer=initializer,
+                embed_always=embed_always,
                 source_location=location,
             )
 
@@ -643,6 +682,7 @@ class _TsParser:
                 name=member_name,
                 type=CustomType(name="unknown"),
                 readonly=is_readonly,
+                embed_always=embed_always,
                 source_location=location,
             )
 
@@ -694,7 +734,8 @@ class _TsParser:
     # -- Methods -------------------------------------------------------------
 
     def _parse_method(
-        self, name: str, visibility: str, location: SourceLocation
+        self, name: str, visibility: str, location: SourceLocation,
+        leading: str = "",
     ) -> MethodNode:
         params = self._parse_params()
 

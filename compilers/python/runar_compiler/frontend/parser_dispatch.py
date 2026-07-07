@@ -10,31 +10,25 @@ if TYPE_CHECKING:
 from runar_compiler.frontend.diagnostic import Diagnostic, Severity
 
 
-# Author-facing comment directives implemented only by the TypeScript compiler
-# today: ``@sighash <FLAGS>`` (#123, per-method sighash type) and
-# ``@embedAlways`` (#109, readonly-field DCE opt-out). Word-boundary anchored to
-# mirror the TS ``/@sighash\b/`` / ``/@embedAlways\b/`` scans so an identifier
-# like ``sighashType`` does not trip the guard.
+# Author-facing comment directive still fail-closed here: ``@sighash <FLAGS>``
+# (#123, per-method sighash type). ``@embedAlways`` (#109) is now supported by
+# the Python TS-surface parser, so it is no longer guarded. Word-boundary
+# anchored to mirror the TS ``/@sighash\b/`` scan so an identifier like
+# ``sighashType`` does not trip the guard.
 _SIGHASH_DIRECTIVE_RE = re.compile(r"@sighash\b")
-_EMBED_ALWAYS_DIRECTIVE_RE = re.compile(r"@embedAlways\b")
 
 
 def _unsupported_directive_error(source: str) -> str | None:
     """Return a fail-closed diagnostic message when ``source`` carries a
     directive this compiler does not yet honour, else ``None``. The Python
-    frontend ignores comments, so silently dropping these directives would
-    change signing / DCE semantics — reject rather than diverge until the
-    ports land.
+    frontend ignores comments, so silently dropping the ``@sighash`` directive
+    would change signing semantics — reject rather than diverge until the port
+    lands.
     """
     if _SIGHASH_DIRECTIVE_RE.search(source):
         return (
             "@sighash directive is not yet supported by the Python compiler "
             "(issue #123); compile the contract with the TypeScript compiler"
-        )
-    if _EMBED_ALWAYS_DIRECTIVE_RE.search(source):
-        return (
-            "@embedAlways directive is not yet supported by the Python compiler "
-            "(issue #109); compile the contract with the TypeScript compiler"
         )
     return None
 

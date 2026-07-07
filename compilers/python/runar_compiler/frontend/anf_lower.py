@@ -253,6 +253,18 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
     # private-helper effects, not just direct ones.
     side_effects = compute_side_effect_summary(contract)
 
+    # Issue #109: readonly fields carrying a ``/** @embedAlways */`` directive
+    # must survive DCE into the locking script. A readonly field no method
+    # references lowers to no ``load_prop``, so no constructor slot is emitted
+    # and the field's deploy-time bytes vanish. We inject a ``load_prop`` + a
+    # ``@ref:`` alias (the exact shape ``const _bind = this.field;`` produces)
+    # into the first public method's body — the alias keeps the ``load_prop``
+    # alive through dead-binding DCE, and stack lowering threads the pushed
+    # value through and cleans it up (OP_NIP) at method end. One slot in the
+    # deployed script suffices; every spending branch shares it.
+    embed_fields = [p for p in contract.properties if p.readonly and p.embed_always]
+    embed_injected = False
+
     # Lower constructor
     ctor_ctx = _LowerCtx(contract, side_effects)
     for p in contract.constructor.params:
@@ -329,6 +341,13 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
             if has_state_prop:
                 preimage_ref3 = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
                 method_ctx.emit(ANFValue(kind="deserialize_state", preimage=preimage_ref3))
+
+            # Issue #109: preserve @embedAlways fields at the first user-statement
+            # position (after the checkPreimage/deserialize preamble), mirroring
+            # where a ``const _bind = this.field;`` idiom would sit.
+            if not embed_injected and embed_fields:
+                _emit_embed_always_preservation(method_ctx, embed_fields)
+                embed_injected = True
 
             # Lower the developer's method body
             method_ctx.lower_statements(method.body)
@@ -454,6 +473,12 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                 is_public=True,
             ))
         else:
+            # Issue #109: stateless public methods (and stateless contracts'
+            # spending entry points) are lowered here — inject @embedAlways
+            # preservation into the first PUBLIC one before its body.
+            if not embed_injected and embed_fields and method.visibility == "public":
+                _emit_embed_always_preservation(method_ctx, embed_fields)
+                embed_injected = True
             method_ctx.lower_statements(method.body)
             # Private methods can also call the intent intrinsics; capture
             # their auto-injected witness params so a public method that
@@ -475,6 +500,26 @@ def _lower_params(params: list) -> list[ANFParam]:
         ANFParam(name=p.name, type=_type_node_to_string(p.type))
         for p in params
     ]
+
+
+def _emit_embed_always_preservation(ctx: "_LowerCtx", fields: list) -> None:
+    """Issue #109: emit the DCE-surviving preservation pair for each
+    ``@embedAlways`` readonly field, into the given (public) method context.
+
+    Reproduces exactly what a hand-written ``const _bind = this.field;`` lowers
+    to: a ``load_prop`` followed by a ``load_const("@ref:<t>")`` alias. The alias
+    marks the ``load_prop`` as referenced (see ``collect_refs`` in the DCE pass),
+    so dead-binding DCE keeps it; stack lowering then emits the field's
+    constructor-slot placeholder and NIPs the unused value off the stack at
+    method end. The field's bytes therefore remain in the deployed locking
+    script for downstream recovery.
+    """
+    for field in fields:
+        load_ref = ctx.emit(ANFValue(kind="load_prop", name=field.name))
+        ctx.emit_named(
+            f"__embedAlways_{field.name}",
+            _make_load_const_string(f"@ref:{load_ref}"),
+        )
 
 
 # ---------------------------------------------------------------------------

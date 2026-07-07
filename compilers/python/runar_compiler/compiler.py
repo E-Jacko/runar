@@ -376,6 +376,44 @@ def _collect_load_prop_refs(bindings: list[Any], out: set[str]) -> None:
             _collect_load_prop_refs(v.body or [], out)
 
 
+def _warn_dropped_readonly_fields(result: Any, Diagnostic: Any, Severity: Any) -> None:
+    """Issue #109: emit a warning for each un-annotated, unreferenced readonly
+    field that DCE eliminated (no initializer, no method reference). The
+    ``result.anf`` is already DCE-optimized here, so its surviving ``load_prop``
+    nodes are the authoritative reference set — ``@embedAlways`` fields were
+    forced back in during ANF lowering, so they appear referenced and never
+    warn. Rides the existing diagnostics channel (non-fatal).
+    """
+    contract = result.contract
+    if contract is None or result.anf is None:
+        return
+
+    referenced: set[str] = set()
+    for method in result.anf.methods:
+        if method.name == "constructor":
+            continue
+        _collect_load_prop_refs(method.body, referenced)
+
+    for prop in contract.properties:
+        if (
+            prop.readonly
+            and not getattr(prop, "embed_always", False)
+            and prop.initializer is None
+            and prop.name not in referenced
+        ):
+            result.diagnostics.append(
+                Diagnostic(
+                    message=(
+                        f"readonly field '{prop.name}' is not referenced in any "
+                        f"method body and was eliminated by DCE; annotate it "
+                        f"/** @embedAlways */ to preserve it in the on-chain script"
+                    ),
+                    severity=Severity.WARNING,
+                    loc=prop.source_location,
+                )
+            )
+
+
 # Constant folding is a source-pipeline optimization; never re-run it on
 # already-lowered ANF IR (the ``--ir`` path). Re-folding pre-lowered IR rewrites
 # bin_ops to constants but leaves the now-dead operand bindings in place (the
@@ -1245,6 +1283,14 @@ def _compile_from_source_str_with_result(
             Diagnostic(message=f"EC optimization error: {e}", severity=Severity.ERROR)
         )
         return result
+
+    # Issue #109: warn when DCE strips an un-annotated readonly field. Such a
+    # field carries no compile-time value (no initializer) and is referenced by
+    # no method, so it is eliminated from the locking script entirely — silently
+    # dropping deploy-time metadata an author may intend to recover from the
+    # on-chain script later. ``@embedAlways`` fields were forced back in during
+    # ANF lowering, so they are "referenced" here and never warn.
+    _warn_dropped_readonly_fields(result, Diagnostic, Severity)
 
     # Pass 5: Stack lowering
     try:
