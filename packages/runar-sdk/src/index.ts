@@ -23,7 +23,7 @@ export { LocalSigner, MockSigner, ExternalSigner, WalletSigner } from './signers
 export type { Signer, SignCallback, WalletSignerOptions } from './signers/index.js';
 
 // Contract
-export { RunarContract, encodeArg, encodePushData, encodeScriptNumber } from './contract.js';
+export { RunarContract, encodeArg, encodePushData, encodeScriptNumber, EMPTY_SIG, isEmptySig } from './contract.js';
 
 // Cross-artifact transaction assembly (N different-artifact covenant inputs in one tx)
 export { assembleMultiContractCall, dryRunMultiContractInput } from './multi-contract.js';

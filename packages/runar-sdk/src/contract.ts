@@ -20,6 +20,28 @@ import { Utils, Hash, Transaction as BsvTransaction, LockingScript, UnlockingScr
 import { WalletProvider } from './providers/wallet-provider.js';
 
 /**
+ * Producer-side marker (issue #106) for the deliberately-empty branch of an
+ * OR-CHECKSIG method — `checkSig(sigA, pkA) || checkSig(sigB, pkB)`, where
+ * `||` lowers to the non-lazy `OP_BOOLOR` so BOTH `OP_CHECKSIG`s run. Only the
+ * matching branch supplies a real signature; the failing branch MUST push an
+ * empty signature (OP_0) or BIP146 NULLFAIL rejects the whole spend.
+ *
+ * Pass `EMPTY_SIG` as the call arg for the non-matching `Sig` slot: the SDK
+ * pushes OP_0 for it and never signs it, distinct from `null` (auto-sign) and
+ * an explicit hex-bytes value. Coexists with `null` at the same call —
+ * `call('execute', [null, EMPTY_SIG])` signs only slot 0.
+ *
+ * Uses the global symbol registry so identity holds across duplicate module
+ * instances (bundlers).
+ */
+export const EMPTY_SIG: unique symbol = Symbol.for('runar.sdk.emptySig');
+
+/** Type guard: is this call arg the {@link EMPTY_SIG} marker (issue #106)? */
+export function isEmptySig(value: unknown): value is typeof EMPTY_SIG {
+  return value === EMPTY_SIG;
+}
+
+/**
  * Invalidate the @bsv/sdk Transaction's serialization caches after
  * directly modifying inputs/outputs. The SDK caches toHex()/toBinary()
  * results and only invalidates them through addInput/addOutput.
@@ -660,6 +682,24 @@ export class RunarContract {
         const estimatedInputs = 1 + (options?.additionalContractInputs?.length ?? 0) + 1;
         resolvedArgs[i] = '00'.repeat(36 * estimatedInputs);
       }
+      // EMPTY_SIG (issue #106) is intentionally NOT handled here: it is not
+      // `null`, so it is never added to `sigIndices` and never signed. It stays
+      // in `resolvedArgs` and `encodeArg` emits OP_0 (empty sig) for it.
+    }
+
+    // Soft heuristic (issue #106): more than one auto-signed Sig slot usually
+    // means an OR-CHECKSIG method whose non-matching branch should use
+    // EMPTY_SIG instead — otherwise every branch gets the same real signature
+    // and the failing CHECKSIG trips BIP146 NULLFAIL on broadcast. Legitimate
+    // AND-CHECKSIG multi-signer flows also use multiple auto slots, so this is
+    // informational only (the ABI does not encode OR-vs-AND topology).
+    if (sigIndices.length >= 2) {
+      console.warn(
+        `runar-sdk: ${this.artifact.contractName}.call('${methodName}') has ` +
+          `${sigIndices.length} auto-signed Sig slots. If this is an OR-CHECKSIG ` +
+          `method, pass EMPTY_SIG for the non-matching branch(es) to satisfy ` +
+          `BIP146 NULLFAIL (issue #106).`,
+      );
     }
 
     const needsOpPushTx = preimageIndex >= 0 || isStateful;
@@ -2187,6 +2227,9 @@ function buildNamedArgs(
  * byte-identically to `buildUnlockingScript` — share this, don't copy it.
  */
 export function encodeArg(value: unknown): string {
+  if (isEmptySig(value)) {
+    return '00'; // OP_0 — empty signature push for the failing OR-CHECKSIG branch (issue #106)
+  }
   if (typeof value === 'bigint') {
     return encodeScriptNumber(value);
   }
