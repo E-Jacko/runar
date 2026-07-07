@@ -177,6 +177,29 @@ jobs:
             --seed 424242 \
             --output /tmp/anf-fuzz-pr-execute.json
 
+      # ----- PR merge gate (issue #124): the TRI-MODAL execution oracle in
+      # ----- fast-check PROPERTY mode. Generates stateless contracts with loops
+      # ----- (non-zero start + countdown), substr/cat/len byte-ops over
+      # ----- ByteString params, and post-loop param reads, then runs every spend
+      # ----- through THREE independent engines — the ANF interpreter, the
+      # ----- hand-rolled ScriptVM, and the upstream @bsv/sdk Spend interpreter
+      # ----- (which also enforces the consensus clean-stack + push-only +
+      # ----- minimal-push rules the hand-rolled VM does not). Property mode
+      # ----- SHRINKS any divergence to a minimal (contract, inputs) repro. The
+      # ----- oracle is tier-independent (in-process TS compiler + @bsv/sdk), so
+      # ----- it needs no native compiler build. FIXED seed keeps it flake-free;
+      # ----- ~200 property runs matches the other PR gates' budget.
+      - name: Fuzz (PR gate — tri-modal execution oracle, fixed seed)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --tri-modal \
+            --num 200 \
+            --seed 424242 \
+            --output /tmp/anf-fuzz-pr-trimodal.json
+
       # ----- Contract-level (`--ir`) PR gate (TS-GAP-007). The ANF gates above
       # ----- drive raw generated ANF programs; this gate drives the
       # ----- contract-level generator (stateful + native renderers) through the
@@ -204,9 +227,11 @@ jobs:
           path: |
             conformance/fuzz-findings-anf/
             conformance/fuzz-findings-execute/
+            conformance/fuzz-findings-trimodal/
             /tmp/anf-fuzz-pr-foldoff.json
             /tmp/anf-fuzz-pr-foldon.json
             /tmp/anf-fuzz-pr-execute.json
+            /tmp/anf-fuzz-pr-trimodal.json
             /tmp/ir-fuzz-pr.json
           if-no-files-found: ignore
           retention-days: 30
@@ -279,6 +304,25 @@ jobs:
             --time-budget-ms 120000 \
             --output /tmp/anf-exec-nightly.json
 
+      # ----- Nightly TRI-MODAL execution oracle (issue #124): a larger
+      # ----- rotating-seed property run than the fixed-seed PR gate, hard-failing
+      # ----- (exit 1) on any interpreter-vs-ScriptVM-vs-Spend disagreement and
+      # ----- SHRINKING it to a minimal repro. `$SEED` is the already-validated
+      # ----- integer from the Resolve step (reaches argv via env:, never
+      # ----- shell-interpolated).
+      - name: Fuzz (tri-modal execution oracle, rotating seed)
+        if: github.event_name != 'pull_request'
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.params.outputs.seed }}
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --tri-modal \
+            --num 1000 \
+            --seed "$SEED" \
+            --output /tmp/anf-trimodal-nightly.json
+
       # ----- Always upload the per-finding artifact tree so a failing
       # ----- run leaves behind a replayable repro corpus.
       - name: Upload fuzz findings
@@ -289,8 +333,10 @@ jobs:
           path: |
             conformance/fuzz-findings-anf/
             conformance/fuzz-findings-execute/
+            conformance/fuzz-findings-trimodal/
             /tmp/anf-fuzz-report.json
             /tmp/anf-exec-nightly.json
+            /tmp/anf-trimodal-nightly.json
           if-no-files-found: ignore
           retention-days: 30
 

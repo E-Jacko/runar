@@ -18,6 +18,7 @@ coverage/
 /conformance/fuzz-findings-anf/
 /conformance/fuzz-findings-canonical/
 /conformance/fuzz-findings-execute/
+/conformance/fuzz-findings-trimodal/
 /conformance/.tmp/
 target/
 __pycache__/
