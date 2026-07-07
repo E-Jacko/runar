@@ -59,6 +59,15 @@ type ANFMethod struct {
 	Params   []ANFParam   `json:"params"`
 	Body     []ANFBinding `json:"body"`
 	IsPublic bool         `json:"isPublic"`
+
+	// SigHashType is the non-default BIP-143 sighash mode a `@sighash`
+	// directive declared for this (public) method (issue #123), e.g. 0x43 for
+	// SINGLE|FORKID. Nil = default ALL|FORKID (0x41). Carried in-memory only
+	// (json:"-") so it never appears in the emitted ANF IR JSON compared
+	// cross-tier — the codegen-relevant flag rides on each check_preimage
+	// node's sighashFlag instead. The artifact assembler copies it to
+	// ABIMethod.SigHashType so the SDK builds a matching preimage.
+	SigHashType *int `json:"-"`
 }
 
 // ANFParam describes a method parameter.
@@ -157,6 +166,15 @@ type ANFValue struct {
 
 	// check_preimage, deserialize_state
 	Preimage string `json:"preimage,omitempty"`
+
+	// check_preimage — issue #123: the BIP-143 sighash flag the on-chain
+	// OP_PUSH_TX binding appends to the derived signature (so the node
+	// re-derives the tx sighash under this flag). 0 = default ALL|FORKID
+	// (0x41), byte-identical to the pinned cross-tier binding blob. Only set
+	// for a method that declares a non-default @sighash mode, keeping golden
+	// ANF unchanged for every existing contract. The json tag drives --ir
+	// deserialization; emission is handled by MarshalJSON.
+	SighashFlag int `json:"sighashFlag,omitempty"`
 
 	// add_output
 	Satoshis    string   `json:"satoshis,omitempty"`
@@ -295,6 +313,12 @@ func (v ANFValue) MarshalJSON() ([]byte, error) {
 		// kind only
 	case "check_preimage", "deserialize_state":
 		out["preimage"] = v.Preimage
+		// Issue #123: emit the non-default sighash flag only when set, so the
+		// golden ANF for every existing (default ALL|FORKID) contract is
+		// byte-identical.
+		if v.Kind == "check_preimage" && v.SighashFlag != 0 {
+			out["sighashFlag"] = v.SighashFlag
+		}
 	case "add_output":
 		out["preimage"] = v.Preimage
 		out["satoshis"] = v.Satoshis

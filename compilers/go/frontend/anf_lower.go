@@ -230,6 +230,16 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 		methodCtx := newLowerCtxWithEffects(contract, sideEffects)
 		methodCtx.setMethodParamTypes(method.Params)
 
+		// Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+		// flag for any checkPreimage (auto-injected below, or a manual call) in
+		// this method, and rides on the ANF method as a carrier the artifact
+		// assembler copies to ABIMethod.SigHashType (omitted for the default).
+		var methodSigHash *int
+		if method.SighashType != nil && *method.SighashType != SighashDefault {
+			methodCtx.sighashFlag = method.SighashType
+			methodSigHash = method.SighashType
+		}
+
 		// Register the declared param NAMES so a bare identifier resolves to
 		// load_param before falling through to load_prop (issue #130). Without
 		// this, a param whose name collides with a mutable state property
@@ -262,21 +272,35 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			}
 			methodCtx.addParam("txPreimage", "SigHashPreimage")
 
-			// Inject checkPreimage(txPreimage) at the start
+			// Issue #123: the declared per-method sighash mode (default
+			// ALL|FORKID). Drives BOTH the OP_PUSH_TX binding flag (so the
+			// derived sig re-computes the tx sighash under this mode) AND the
+			// runtime preimage-type assert.
+			sighashMode := SighashDefault
+			if method.SighashType != nil {
+				sighashMode = *method.SighashType
+			}
+			isDefaultSighash := sighashMode == SighashDefault
+
+			// Inject checkPreimage(txPreimage) at the start.
 			preimageRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
-			checkResult := methodCtx.emit(ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef})
+			checkPre := ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef}
+			// Omit for the default so the ANF (and pinned binding blob) is unchanged.
+			if !isDefaultSighash {
+				checkPre.SighashFlag = sighashMode
+			}
+			checkResult := methodCtx.emit(checkPre)
 			methodCtx.emit(makeAssert(checkResult))
 
-			// GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-			// auto-injected covenant cannot be spent under a permissive sighash
-			// flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
-			// a contract may read. The hashOutputs continuation already fails
-			// under non-ALL flags, so this is a no-op on spendability for
-			// continuation-using methods and closes the field-zeroing exposure
-			// for the rest.
+			// GAP-302 / #123: pin the sighash type to the declared mode. Without
+			// this check the spend could use a DIFFERENT sighash flag than
+			// declared that zeroes out preimage fields the contract (or its
+			// continuation) relies on (hashOutputs / hashPrevouts / hashSequence).
+			// The value defaults to 0x41 (SIGHASH_ALL|FORKID) so existing
+			// contracts emit byte-identical ANF.
 			sigHashPreimageRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
 			sigHashTypeRef := methodCtx.emit(makeCall("extractSigHashType", []string{sigHashPreimageRef}))
-			expectedSigHashRef := methodCtx.emit(makeLoadConstInt(big.NewInt(0x41)))
+			expectedSigHashRef := methodCtx.emit(makeLoadConstInt(big.NewInt(int64(sighashMode))))
 			sigHashOkRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: sigHashTypeRef, Right: expectedSigHashRef})
 			methodCtx.emit(makeAssert(sigHashOkRef))
 
@@ -424,10 +448,11 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			augmentedParams = append(augmentedParams, methodCtx.methodScope.autoInjectedParams...)
 
 			result = append(result, ir.ANFMethod{
-				Name:     method.Name,
-				Params:   augmentedParams,
-				Body:     methodCtx.bindings,
-				IsPublic: true,
+				Name:        method.Name,
+				Params:      augmentedParams,
+				Body:        methodCtx.bindings,
+				IsPublic:    true,
+				SigHashType: methodSigHash,
 			})
 		} else {
 			// Issue #109: stateless public methods (and stateless contracts'
@@ -449,10 +474,11 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			// is still informative for non-inlined callees.)
 			augmented = append(augmented, methodCtx.methodScope.autoInjectedParams...)
 			result = append(result, ir.ANFMethod{
-				Name:     method.Name,
-				Params:   augmented,
-				Body:     methodCtx.bindings,
-				IsPublic: method.Visibility == "public",
+				Name:        method.Name,
+				Params:      augmented,
+				Body:        methodCtx.bindings,
+				IsPublic:    method.Visibility == "public",
+				SigHashType: methodSigHash,
 			})
 		}
 	}
@@ -527,6 +553,12 @@ type lowerCtx struct {
 	// the intrinsic is called from the method's top-level body or from
 	// inside a nested block (if/else, ternary). See methodScopeT.
 	methodScope *methodScopeT
+	// sighashFlag is the declared non-default `@sighash` flag for the method
+	// being lowered (issue #123), so a MANUAL checkPreimage(pre) call binds
+	// under the same mode as the method's declared sighash. nil = default
+	// ALL|FORKID, keeping the pinned binding blob unchanged. Propagated into
+	// sub-contexts so a manual call inside an if/for body picks it up.
+	sighashFlag *int
 }
 
 // methodScopeT holds per-method bookkeeping shared by parent and
@@ -786,6 +818,7 @@ func (ctx *lowerCtx) subContext() *lowerCtx {
 		localAliases:     make(map[string]string),
 		localByteVars:    make(map[string]bool),
 		methodScope:      ctx.methodScope, // shared pointer — auto-injection registers propagate up
+		sighashFlag:      ctx.sighashFlag, // #123: nested manual checkPreimage inherits the method's mode
 	}
 	// Share local name set
 	for k := range ctx.localNames {
@@ -1374,7 +1407,12 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 	if id, ok := callee.(Identifier); ok && id.Name == "checkPreimage" {
 		if len(e.Args) >= 1 {
 			preimageRef := ctx.lowerExprToRef(e.Args[0])
-			return ctx.emit(ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef})
+			cp := ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef}
+			// Issue #123: honour the method's declared @sighash on manual calls.
+			if ctx.sighashFlag != nil {
+				cp.SighashFlag = *ctx.sighashFlag
+			}
+			return ctx.emit(cp)
 		}
 	}
 
