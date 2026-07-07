@@ -416,6 +416,7 @@ fn optimize_method_ec(method: &ANFMethod) -> (ANFMethod, bool) {
         params: method.params.clone(),
         body: result,
         is_public: method.is_public,
+        sighash_type: method.sighash_type,
     }, true)
 }
 
@@ -482,6 +483,7 @@ mod tests {
                 params: vec![],
                 body: bindings,
                 is_public: true,
+                sighash_type: None,
             }],
         }
     }
@@ -940,6 +942,7 @@ mod tests {
                     assert_binding("t1", "t0"),
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -968,6 +971,7 @@ mod tests {
                         assert_binding("t2", "t1"),
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "method2".to_string(),
@@ -978,6 +982,7 @@ mod tests {
                         assert_binding("t2", "t1"),
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
             ],
         };

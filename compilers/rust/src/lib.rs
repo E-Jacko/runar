@@ -599,6 +599,35 @@ pub fn compile_from_source_str_with_result(
     anf_program = frontend::anf_optimize::optimize_ec(anf_program);
     result.anf = Some(anf_program.clone());
 
+    // Issue #109: warn when DCE strips an un-annotated readonly field. Such a
+    // field carries no compile-time value (no initializer) and is referenced by
+    // no method, so it is eliminated from the locking script entirely —
+    // silently dropping deploy-time metadata an author may intend to recover
+    // from the on-chain script later. `@embedAlways` fields were forced back in
+    // during ANF lowering, so they are "referenced" here and never warn.
+    {
+        let referenced = collect_referenced_props(&anf_program);
+        if let Some(contract_ast) = result.contract.as_ref() {
+            for prop in &contract_ast.properties {
+                if prop.readonly
+                    && !prop.embed_always
+                    && prop.initializer.is_none()
+                    && !referenced.contains(&prop.name)
+                {
+                    result.diagnostics.push(Diagnostic::warning(
+                        format!(
+                            "readonly field '{}' is not referenced in any method body and was \
+                             eliminated by DCE; annotate it /** @embedAlways */ to preserve it in \
+                             the on-chain script",
+                            prop.name
+                        ),
+                        Some(prop.source_location.clone()),
+                    ));
+                }
+            }
+        }
+    }
+
     // Pass 5: Stack lowering (catch panics)
     let stack_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         lower_to_stack(&anf_program)

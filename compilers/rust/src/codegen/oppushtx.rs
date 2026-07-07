@@ -20,3 +20,53 @@ pub(crate) const CHECK_PREIMAGE_BINDING_HEX: &str = "76aa007c517f7b7b7c7e7c517f7
 pub(crate) fn check_preimage_binding_bytes() -> Vec<u8> {
     hex::decode(CHECK_PREIMAGE_BINDING_HEX).expect("invalid CHECK_PREIMAGE_BINDING_HEX")
 }
+
+/// Like [`check_preimage_binding_bytes`] but honours a declared non-default
+/// `@sighash` mode (issue #123). The binding blob differs from the default in
+/// exactly one byte: the sighash flag appended to the derived DER signature
+/// (the reference `emitCheckPreimageBinding` only swaps `push(0x41)` for
+/// `push(sighashFlag)`). The DER signature itself is derived from
+/// hash256(preimage) and is independent of the flag byte, so no other byte
+/// moves. `None` (or the default 0x41) returns the exact pinned constant, so
+/// every existing contract stays byte-identical (zero golden churn).
+pub(crate) fn check_preimage_binding_bytes_with_flag(flag: Option<i64>) -> Vec<u8> {
+    let mut bytes = check_preimage_binding_bytes();
+    let f = match flag {
+        None => return bytes,
+        Some(v) if (v & 0xff) as u8 == SIGHASH_FLAG_DEFAULT => return bytes,
+        Some(v) => (v & 0xff) as u8,
+    };
+    // The sighash flag sits immediately before the `OP_PUSHBYTES_33 <G>` push
+    // that appends the OP_PUSH_TX pubkey: the tail is
+    // `.. 01 <flag> 7e 21 02 79 be 66 7e f9 ..` (push-1 flag, OP_CAT, push-33 G).
+    // Anchor on the unique pubkey-push prefix and rewrite the flag byte in place.
+    const PUBKEY_ANCHOR: &[u8] = &[0x21, 0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9];
+    let pos = find_subslice(&bytes, PUBKEY_ANCHOR)
+        .expect("OP_PUSH_TX pubkey anchor not found in binding blob");
+    assert!(pos >= 3, "unexpected binding blob layout (pubkey too early)");
+    assert_eq!(
+        bytes[pos - 2],
+        SIGHASH_FLAG_DEFAULT,
+        "expected 0x41 sighash flag before pubkey push"
+    );
+    assert_eq!(
+        bytes[pos - 3],
+        0x01,
+        "expected single-byte push prefix for the sighash flag"
+    );
+    bytes[pos - 2] = f;
+    bytes
+}
+
+/// SIGHASH_ALL | SIGHASH_FORKID — default when a method declares no @sighash.
+const SIGHASH_FLAG_DEFAULT: u8 = 0x41;
+
+/// Find the first index of `needle` within `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}

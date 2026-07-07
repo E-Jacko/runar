@@ -345,6 +345,7 @@ impl RustDslParser {
                                     initializer: None,
                                     source_location: loc,
                                     synthetic_array_chain: None,
+                                    embed_always: false,
                                 });
                             }
                         } else {
@@ -445,6 +446,7 @@ impl RustDslParser {
             body: ctor_body,
             visibility: Visibility::Public,
             source_location: loc,
+            sighash_type: None,
         };
 
         let contract = ContractNode {
@@ -618,7 +620,7 @@ impl RustDslParser {
         }
         self.expect(&TokenType::RBrace);
 
-        MethodNode { name, params, body, visibility, source_location: loc }
+        MethodNode { name, params, body, visibility, sighash_type: None, source_location: loc }
     }
 
     fn parse_statement(&mut self) -> Option<Statement> {

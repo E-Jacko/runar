@@ -516,6 +516,7 @@ fn fold_method(method: &ANFMethod) -> ANFMethod {
         params: method.params.clone(),
         body: folded_body,
         is_public: method.is_public,
+        sighash_type: method.sighash_type,
     }
 }
 
@@ -559,6 +560,7 @@ mod tests {
             params: vec![],
             body,
             is_public: true,
+            sighash_type: None,
         }
     }
 
