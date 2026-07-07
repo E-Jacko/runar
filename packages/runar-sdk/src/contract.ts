@@ -729,6 +729,19 @@ export class RunarContract {
           unlockingScript: UnlockingScript.fromHex(unlock),
           sequence: termSequence,
         });
+        // Fee input (issue #118): a plain P2PKH input added BEFORE the
+        // OP_PUSH_TX preimage is computed so hashPrevouts covers it. Consumed
+        // entirely as fee (no change output) — the covenant's terminal output
+        // assertions are untouched; only the input side grows. Its P2PKH sig is
+        // filled in after the tx structure is final (below).
+        if (options?.feeUtxo) {
+          ttx.addInput({
+            sourceTXID: options.feeUtxo.txid,
+            sourceOutputIndex: options.feeUtxo.outputIndex,
+            unlockingScript: new UnlockingScript(),
+            sequence: termSequence,
+          });
+        }
         for (const out of terminalOutputs) {
           ttx.addOutput({
             satoshis: out.satoshis,
@@ -801,6 +814,24 @@ export class RunarContract {
         if (!finalPreimage && needsOpPushTx) {
           finalPreimage = resolvedArgs[preimageIndex] as string;
         }
+      }
+
+      // Sign the fee input (issue #118). Its BIP-143 P2PKH sighash covers only
+      // hashPrevouts / hashOutputs / its own outpoint — NOT input 0's scriptSig
+      // — so it stays valid even after finalizeCall rewrites input 0. Owned by
+      // fundingSigner ?? signer (composes with #134). The fee input sits at
+      // index 1 (right after the primary contract input).
+      if (options?.feeUtxo) {
+        const feeInputIdx = 1;
+        const feeTxHex = termTx.toHex();
+        const feeSig = await fundingSigner.sign(
+          feeTxHex, feeInputIdx, options.feeUtxo.script, options.feeUtxo.satoshis,
+        );
+        const feePubKey = await fundingSigner.getPublicKey();
+        termTx.inputs[feeInputIdx]!.unlockingScript = UnlockingScript.fromHex(
+          encodePushData(feeSig) + encodePushData(feePubKey),
+        );
+        invalidateTxCache(termTx);
       }
 
       // Compute sighash from preimage

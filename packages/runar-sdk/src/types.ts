@@ -165,6 +165,17 @@ export interface CallOptions {
   fundingUtxos?: UTXO[];
 
   /**
+   * A single plain P2PKH UTXO added to a terminal call tx purely to pay the
+   * miner fee (issue #118). A true terminal method pays out the full contract
+   * balance, so fee would be 0 and ARC rejects; the covenant asserts its exact
+   * output set, so no change output can absorb a fee. The fee input is added
+   * BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers it) and
+   * is consumed entirely as fee — no change output is created. Signed with
+   * `fundingSigner ?? signer`. The covenant's output assertions are untouched.
+   */
+  feeUtxo?: UTXO;
+
+  /**
    * Optional explicit override for data outputs emitted via
    * `this.addDataOutput(...)` in the method body. When omitted, the SDK
    * resolves data outputs automatically by running the ANF interpreter on
