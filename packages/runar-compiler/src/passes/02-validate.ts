@@ -16,6 +16,7 @@ import type {
 } from '../ir/index.js';
 import type { CompilerDiagnostic } from '../errors.js';
 import { makeDiagnostic } from '../errors.js';
+import { validateSighashUsage } from './sighash-validate.js';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -44,6 +45,15 @@ export function validate(contract: ContractNode): ValidationResult {
   validateConstructor(ctx);
   validateMethods(ctx);
   checkNoRecursion(ctx);
+
+  // Issue #123: reject preimage-field reads / output bindings that are unsound
+  // under a method's declared @sighash mode (security core). This pass emits
+  // both errors (unsound usages) and warnings (e.g. an explicit single-output
+  // SINGLE covenant whose same-index value cannot be pinned statically), so
+  // route each diagnostic to the matching bucket.
+  for (const d of validateSighashUsage(contract)) {
+    (d.severity === 'warning' ? warnings : errors).push(d);
+  }
 
   return { errors, warnings };
 }

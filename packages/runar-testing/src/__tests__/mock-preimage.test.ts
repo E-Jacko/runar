@@ -444,6 +444,42 @@ describe('mock-preimage', () => {
       expect(result.hashOutputs).toBe(expected);
     });
 
+    it('SINGLE commits ONLY to the same-index output, not the whole set (F5)', () => {
+      // BIP-143 SINGLE hashes ONLY output[inputIndex]; the mock spends input 0,
+      // so hashOutputs must be hash256(output[0]) = the continuation ALONE.
+      // Digesting ALL outputs (the pre-fix behavior) would let the mock bless
+      // spends the chain rejects, since every non-same-index output is
+      // attacker-controllable under SINGLE.
+      const artifact = compileArtifact(counterSource, 'Counter.runar.ts');
+      // Force the called method into SINGLE|FORKID (0x43) for the mock. The
+      // BIP-143 scoping is what's under test, independent of the validator.
+      for (const m of artifact.abi.methods) {
+        (m as { sigHashType?: number }).sigHashType = 0x43;
+      }
+
+      const rawOutput = '0000000000000000' + '01' + 'ff'; // an extra/draining output
+      const result = buildStatefulPreimage({
+        artifact,
+        constructorArgs: { count: 0n },
+        state: { count: 0n },
+        newState: { count: 1n },
+        satoshis: 10000n,
+        additionalOutputs: [rawOutput],
+      });
+
+      const contOutput = buildContinuationOutput(
+        result.codePart,
+        artifact.stateFields!,
+        { count: 1n },
+        10000n,
+      );
+
+      // SINGLE: hashOutputs = hash256(output[0]) = the continuation only.
+      expect(result.hashOutputs).toBe(computeHashOutputs([contOutput]));
+      // It must NOT be the digest over ALL outputs (the divergence F5 fixes).
+      expect(result.hashOutputs).not.toBe(computeHashOutputs([contOutput, rawOutput]));
+    });
+
     it('signature is a valid DER-encoded string', () => {
       const artifact = compileArtifact(counterSource, 'Counter.runar.ts');
 

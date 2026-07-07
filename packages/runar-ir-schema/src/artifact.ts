@@ -40,6 +40,11 @@ export interface ABIMethod {
   isTerminal?: boolean;
   /** True if the unlocking script is prefixed with `_codePart` (issue #100). */
   usesCodePart?: boolean;
+  /**
+   * Issue #123: BIP-143 sighash type from a `@sighash` directive (e.g. `0x43`
+   * for SINGLE|FORKID). Absent = default `ALL|FORKID` (0x41).
+   */
+  sigHashType?: number;
 }
 
 export interface ABI {

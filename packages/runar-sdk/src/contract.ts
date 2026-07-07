@@ -1808,9 +1808,18 @@ export class RunarContract {
       }
     }
 
+    // Issue #123: build the preimage under the method's declared @sighash mode.
+    // `methodIndex` indexes the public-methods list (same convention as the
+    // codeSeparatorIndices lookup above); a method with no directive carries no
+    // `sigHashType` and falls back to 0x41 (ALL|FORKID), unchanged behaviour.
+    const publicMethods = this.artifact.abi.methods.filter((m) => m.isPublic);
+    const sigHashType =
+      (methodIndex !== undefined ? publicMethods[methodIndex]?.sigHashType : undefined) ?? 0x41;
+
     return computeOpPushTx(
       tx, inputIndex, subscript, satoshis,
       codeSepIdx,
+      sigHashType,
     );
   }
 

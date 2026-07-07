@@ -33,7 +33,8 @@ import type {
 } from '../ir/index.js';
 import { computeSideEffectSummary, continuationShape } from './side-effect-summary.js';
 import type { SideEffectSummary } from './side-effect-summary.js';
-import type { MethodNode } from '../ir/runar-ast.js';
+import { SIGHASH_DEFAULT } from './sighash-directive.js';
+import type { MethodNode, PropertyNode } from '../ir/runar-ast.js';
 import { UnknownANFKindError } from 'runar-ir-schema';
 
 // ---------------------------------------------------------------------------
@@ -113,6 +114,18 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
   // assembler so ABI declarations cannot drift from ANF auto-injection.
   const sideEffects = computeSideEffectSummary(contract);
 
+  // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+  // must survive DCE into the locking script. A readonly field no method
+  // references lowers to no `load_prop`, so no constructor slot is emitted
+  // and the field's deploy-time bytes vanish. We inject a `load_prop` + a
+  // `@ref:` alias (the exact shape the `const _bind = this.field;` idiom
+  // produces) into the first public method's body — the alias keeps the
+  // `load_prop` alive through dead-binding DCE, and stack lowering threads
+  // the pushed value through and cleans it up (OP_NIP) at method end. One
+  // slot in the deployed script suffices; every spending branch shares it.
+  const embedFields = contract.properties.filter(p => p.readonly && p.embedAlways);
+  let embedInjected = false;
+
   // Lower constructor
   const ctorCtx = new LoweringContext(contract, sideEffects);
   ctorCtx.setMethodParamTypes(contract.constructor.params);
@@ -128,6 +141,11 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
   for (const method of contract.methods) {
     const methodCtx = new LoweringContext(contract, sideEffects);
     methodCtx.setMethodParamTypes(method.params);
+    // Issue #123: non-default @sighash mode drives the OP_PUSH_TX binding flag
+    // for any checkPreimage (auto-injected below, or a manual call) in this method.
+    if (method.sighashType !== undefined && method.sighashType !== SIGHASH_DEFAULT) {
+      methodCtx.sighashFlag = method.sighashType;
+    }
 
     // Register the declared param NAMES so a bare identifier resolves to
     // `load_param` before falling through to `load_prop` (issue #130). Without
@@ -165,22 +183,31 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       }
       methodCtx.addParam('txPreimage', 'SigHashPreimage');
 
+      // Issue #123: the declared per-method sighash mode (default ALL|FORKID).
+      // Drives BOTH the OP_PUSH_TX binding flag (so the derived sig re-computes
+      // the tx sighash under this mode) AND the runtime preimage-type assert.
+      const sighashMode = method.sighashType ?? SIGHASH_DEFAULT;
+      const isDefaultSighash = sighashMode === SIGHASH_DEFAULT;
+
       // Inject checkPreimage(txPreimage) at the start
       const preimageRef = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
-      const checkResult = methodCtx.emit({ kind: 'check_preimage', preimage: preimageRef });
+      const checkResult = methodCtx.emit({
+        kind: 'check_preimage',
+        preimage: preimageRef,
+        // Omit for the default so the ANF (and pinned binding blob) is unchanged.
+        ...(isDefaultSighash ? {} : { sighashFlag: sighashMode }),
+      });
       methodCtx.emit({ kind: 'assert', value: checkResult });
 
-      // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41). The
+      // GAP-302 / #123: pin the sighash type to the declared mode. The
       // auto-injected covenant verifies a real tx preimage, but without this
-      // check the spend could use a permissive sighash flag
-      // (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields a
-      // contract may read (extractAmount / extractHashPrevouts /
-      // extractSequence). The hashOutputs continuation already fails under
-      // non-ALL flags, so for continuation-using methods this is a no-op on
-      // spendability; it closes the field-zeroing exposure for the rest.
+      // check the spend could use a DIFFERENT sighash flag than declared that
+      // zeroes out preimage fields the contract (or its continuation) relies on
+      // (hashOutputs / hashPrevouts / hashSequence). The value defaults to 0x41
+      // (SIGHASH_ALL|FORKID) so existing contracts emit byte-identical ANF.
       const sigHashPreimageRef = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
       const sigHashTypeRef = methodCtx.emit({ kind: 'call', func: 'extractSigHashType', args: [sigHashPreimageRef] });
-      const expectedSigHashRef = methodCtx.emit({ kind: 'load_const', value: 0x41n });
+      const expectedSigHashRef = methodCtx.emit({ kind: 'load_const', value: BigInt(sighashMode) });
       const sigHashOkRef = methodCtx.emit({ kind: 'bin_op', op: '===', left: sigHashTypeRef, right: expectedSigHashRef });
       methodCtx.emit({ kind: 'assert', value: sigHashOkRef });
 
@@ -189,6 +216,14 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       if (stateProps.length > 0) {
         const preimageRef3 = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
         methodCtx.emit({ kind: 'deserialize_state', preimage: preimageRef3 });
+      }
+
+      // Issue #109: preserve @embedAlways fields at the first user-statement
+      // position (after the checkPreimage/deserialize preamble), mirroring
+      // where a `const _bind = this.field;` idiom would sit.
+      if (!embedInjected && embedFields.length > 0) {
+        emitEmbedAlwaysPreservation(methodCtx, embedFields);
+        embedInjected = true;
       }
 
       // Lower the developer's method body
@@ -335,6 +370,13 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
         isPublic: true,
       });
     } else {
+      // Issue #109: stateless public methods (and stateless contracts'
+      // spending entry points) are lowered here — inject @embedAlways
+      // preservation into the first PUBLIC one before its body.
+      if (!embedInjected && embedFields.length > 0 && method.visibility === 'public') {
+        emitEmbedAlwaysPreservation(methodCtx, embedFields);
+        embedInjected = true;
+      }
       lowerStatements(method.body, methodCtx);
       // Private methods can also call the intent intrinsics; capture
       // their auto-injected witness params. Public callers that inline
@@ -363,6 +405,28 @@ function lowerParams(params: ParamNode[]): ANFParam[] {
     name: p.name,
     type: typeNodeToString(p.type),
   }));
+}
+
+/**
+ * Issue #109: emit the DCE-surviving preservation pair for each
+ * `@embedAlways` readonly field, into the given (public) method context.
+ *
+ * Reproduces exactly what a hand-written `const _bind = this.field;` lowers
+ * to: a `load_prop` followed by a `load_const("@ref:<t>")` alias. The alias
+ * marks the `load_prop` as referenced (see `collectRefsFromValue` in
+ * `optimizer/dce.ts`), so dead-binding DCE keeps it; stack lowering then
+ * emits the field's constructor-slot placeholder and NIPs the unused value
+ * off the stack at method end. The field's bytes therefore remain in the
+ * deployed locking script for downstream recovery.
+ */
+function emitEmbedAlwaysPreservation(ctx: LoweringContext, fields: PropertyNode[]): void {
+  for (const field of fields) {
+    const loadRef = ctx.emit({ kind: 'load_prop', name: field.name });
+    ctx.emitNamed(`__embedAlways_${field.name}`, {
+      kind: 'load_const',
+      value: `@ref:${loadRef}`,
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +484,13 @@ class LoweringContext {
    * still registers on the parent method's ABI augmentation list.
    */
   methodScope: MethodScope = new MethodScope();
+  /**
+   * Issue #123: the declared non-default `@sighash` flag for the method being
+   * lowered, so a MANUAL `checkPreimage(pre)` call (stateless / explicit) binds
+   * under the same mode as the method's declared sighash. `undefined` = default
+   * ALL|FORKID, keeping the pinned binding blob unchanged.
+   */
+  sighashFlag: number | undefined;
   /** Maps local variable names to their current ANF binding name.
    *  Updated after if-statements that reassign locals in both branches. */
   private readonly localAliases: Map<string, string> = new Map();
@@ -1242,7 +1313,12 @@ function lowerCallExpr(
   if (callee.kind === 'identifier' && callee.name === 'checkPreimage') {
     if (expr.args.length >= 1) {
       const preimageRef = lowerExprToRef(expr.args[0]!, ctx);
-      return ctx.emit({ kind: 'check_preimage', preimage: preimageRef });
+      return ctx.emit({
+        kind: 'check_preimage',
+        preimage: preimageRef,
+        // Issue #123: honour the method's declared @sighash on manual calls.
+        ...(ctx.sighashFlag !== undefined ? { sighashFlag: ctx.sighashFlag } : {}),
+      });
     }
   }
 
