@@ -56,12 +56,14 @@ export type {
 export {
   buildWitness,
   runDifferentialExecution,
+  runTriModalExecution,
   runFoldEquivalence,
 } from './oracle/index.js';
 export type {
   WitnessArg,
   DiffExecOptions,
   DiffExecResult,
+  TriModalExecResult,
   FoldEqOptions,
   FoldEqResult,
   FoldEqDivergence,
