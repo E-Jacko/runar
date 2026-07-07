@@ -172,12 +172,15 @@ module Runar
           locking_script, utxos, opts.satoshis, change_address, change_script, fee_rate: fee_rate
         )
 
-        # Sign all P2PKH funding inputs.
+        # Sign all P2PKH funding inputs. Funding inputs are signed by
+        # funding_signer when set (#134): the deploy signer may not own the
+        # funding coins. Defaults to the connected signer.
+        funding_signer = opts.funding_signer || signer
         signed_tx = tx_hex
-        pub_key   = signer.get_public_key
+        pub_key   = funding_signer.get_public_key
         input_count.times do |i|
           utxo      = utxos[i]
-          sig       = signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
+          sig       = funding_signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
           unlock    = State.encode_push_data(sig) + State.encode_push_data(pub_key)
           signed_tx = SDK.insert_unlocking_script(signed_tx, i, unlock)
         end
@@ -386,6 +389,9 @@ module Runar
         address        = signer.get_address
         opts           = options || CallOptions.new
         change_address = opts.change_address.to_s.empty? ? address : opts.change_address
+        # Funding (and terminal fee) inputs are signed by funding_signer when
+        # set (#134). The method's own Sig args stay with the connected signer.
+        funding_signer = opts.funding_signer || signer
 
         extra_input_count = Array(opts.additional_contract_inputs).length
         estimated_inputs  = 1 + extra_input_count + 1
@@ -505,8 +511,45 @@ module Runar
         fee_rate          = provider.get_fee_rate
         change_script     = SDK.build_p2pkh_script(change_address)
         all_funding_utxos = provider.get_utxos(address)
-        additional_utxos  = all_funding_utxos.reject do |u|
+        candidate_funding_utxos = all_funding_utxos.reject do |u|
           u.txid == @current_utxo.txid && u.output_index == @current_utxo.output_index
+        end
+
+        # Coin selection for funding inputs (#133): don't sweep the whole
+        # wallet. Compute how much the funding must cover -- the contract's own
+        # input value already offsets the contract/data outputs -- and pick the
+        # smallest largest-first set via select_utxos (the strategy deploy uses).
+        contract_output_sats =
+          (contract_outputs ? contract_outputs.sum { |o| o[:satoshis] } : (new_satoshis || 0)) +
+          resolved_data_outputs.sum { |o| o[:satoshis] }
+        contract_input_sats =
+          @current_utxo.satoshis + extra_contract_utxos.sum(&:satoshis)
+        funding_target = [0, contract_output_sats - contract_input_sats].max
+        # Fee sizing hint for select_utxos: the continuation script length
+        # (falls back to the first multi-output script, else 0 for stateless).
+        funding_lock_len =
+          if new_locking_script && !new_locking_script.empty?
+            new_locking_script.length / 2
+          elsif contract_outputs && contract_outputs.first
+            contract_outputs.first[:script].length / 2
+          else
+            0
+          end
+        additional_utxos =
+          if candidate_funding_utxos.empty?
+            []
+          else
+            SDK.select_utxos(candidate_funding_utxos, funding_target, funding_lock_len, fee_rate: fee_rate)
+          end
+
+        # Cap funding inputs when the caller sets max_funding_inputs (#133).
+        # select_utxos returns the minimal largest-first set; if that still
+        # exceeds the cap the funding can't cover outputs + fee within budget,
+        # so fail loudly instead of broadcasting an underfunded tx.
+        if !opts.max_funding_inputs.nil? && additional_utxos.length > opts.max_funding_inputs
+          raise "RunarContract.call(#{method_name}): funding requires #{additional_utxos.length} " \
+                "input(s) but max_funding_inputs=#{opts.max_funding_inputs}. Increase " \
+                'max_funding_inputs, use larger UTXOs, or consolidate.'
         end
 
         # Initial unlocking script (with placeholders). Intent-witness hex is
@@ -537,6 +580,9 @@ module Runar
         # Thread CallOptions#locktime so contracts asserting
         # extractLocktime(preimage) can succeed. nil → 0 (legacy).
         call_options[:locktime] = opts.locktime unless opts.locktime.nil?
+        # Thread CallOptions#sequence (#131): a non-zero locktime needs
+        # non-final input sequences or consensus ignores nLockTime.
+        call_options[:sequence] = opts.sequence unless opts.sequence.nil?
         if extra_contract_utxos.any?
           call_options[:additional_contract_inputs] = extra_contract_utxos.each_with_index.map do |utxo, i|
             { utxo: utxo, unlocking_script: extra_unlock_placeholders[i] }
@@ -552,7 +598,7 @@ module Runar
         )
 
         p2pkh_start_idx = 1 + extra_contract_utxos.length
-        signed_tx = sign_funding_inputs(tx_hex, additional_utxos, signer, p2pkh_start_idx)
+        signed_tx = sign_funding_inputs(tx_hex, additional_utxos, funding_signer, p2pkh_start_idx)
 
         signed_tx, change_amount, final_op_push_tx_sig, final_preimage =
           compute_preimage_passes(
@@ -569,6 +615,8 @@ module Runar
             prevouts_indices: prevouts_indices,
             intent_witness_hex: intent_witness_hex,
             locktime: opts.locktime,
+            sequence: opts.sequence,
+            funding_signer: funding_signer,
             method_uses_code_part: method_uses_code_part
           )
 
@@ -636,8 +684,10 @@ module Runar
         end
 
         output     = tx.outputs[output_index]
-        dummy_args = Array.new(artifact.abi.constructor_params.length, 0)
-        contract   = new(artifact, dummy_args)
+        # #119: recover the real constructor args baked into the deployed script
+        # instead of 0 placeholders, so the ANF continuation formula and the
+        # codesep-offset walk operate on the true values.
+        contract   = new(artifact, restore_constructor_args(artifact, output.script))
 
         stateful = !artifact.state_fields.empty?
         code_script = if stateful
@@ -681,8 +731,9 @@ module Runar
       # @return [RunarContract]
       def self.from_utxo(artifact, utxo)
         utxo = normalize_utxo(utxo)
-        dummy_args = Array.new(artifact.abi.constructor_params.length, 0)
-        contract   = new(artifact, dummy_args)
+        # #119: recover the real constructor args baked into the deployed script
+        # instead of 0 placeholders (see restore_constructor_args).
+        contract   = new(artifact, restore_constructor_args(artifact, utxo.script))
 
         stateful = !artifact.state_fields.empty?
         code_script = if stateful
@@ -732,6 +783,31 @@ module Runar
         end
       end
       private_class_method :normalize_utxo
+
+      # Recover the positional constructor argument list from a deployed locking
+      # script (#119), so a restored contract (from_utxo / from_txid) operates on
+      # the real baked-in values rather than 0 placeholders.
+      #
+      # extract_constructor_args returns a name→value map keyed by ABI param
+      # name; abi.constructor_params is already ordered by paramIndex, so mapping
+      # over it yields the positional array the RunarContract constructor expects.
+      #
+      # Params that carry no constructor slot (mutable state fields — their value
+      # lives in the OP_RETURN state section, restored separately by
+      # extract_state_from_script) are absent from the extracted map and fall
+      # back to 0, matching the prior placeholder behaviour.
+      #
+      # @param artifact [RunarArtifact]
+      # @param script_hex [String] deployed locking script hex
+      # @return [Array]
+      def self.restore_constructor_args(artifact, script_hex)
+        params = artifact.abi.constructor_params
+        return [] if params.empty?
+
+        extracted = ScriptUtils.extract_constructor_args(artifact, script_hex)
+        params.map { |p| extracted.key?(p.name) ? extracted[p.name] : 0 }
+      end
+      private_class_method :restore_constructor_args
 
       # Return the full locking script hex (code script + optional envelope + optional OP_RETURN + state).
       #
@@ -888,12 +964,16 @@ module Runar
 
       # rubocop:disable Metrics/AbcSize, Metrics/MethodLength, Metrics/CyclomaticComplexity, Metrics/ParameterLists
       def prepare_terminal(
-        method_name, resolved_args, _signer, opts,
+        method_name, resolved_args, signer, opts,
         is_stateful, parent_stateful, needs_op_push_tx, method_needs_change, method_uses_code_part,
         sig_indices, preimage_index,
         method_selector_hex, change_pkh_hex, contract_utxo, code_sep_idx,
         intent_witness_hex = ''
       )
+        # Fee input (#118) is signed by funding_signer when set (#134); nil →
+        # the connected signer.
+        funding_signer = opts.funding_signer || signer
+        fee_utxo = opts.fee_utxo ? self.class.send(:normalize_utxo, opts.fee_utxo) : nil
         # Normalize terminal outputs — accept TerminalOutput structs or hashes.
         term_outputs = Array(opts.terminal_outputs).map do |item|
           case item
@@ -924,17 +1004,31 @@ module Runar
         # extractLocktime(preimage) >= deadline. Default 0 preserves legacy
         # behavior for contracts that don't check locktime.
         terminal_locktime = opts.locktime || 0
+        # Sequence (#131): all-final inputs make nLockTime a consensus no-op --
+        # when a non-zero locktime is set, default to 0xfffffffe so the terminal
+        # method's extractLocktime assertion is actually enforced.
+        terminal_sequence = SDK.resolve_input_sequence(opts.locktime, opts.sequence)
 
-        # Build raw terminal transaction: single input, exact outputs, no change.
+        # Build raw terminal transaction: contract input (+ optional fee input),
+        # exact outputs, no change.
         build_terminal_tx = lambda do |unlock|
           tx = +''
           tx << SDK.to_le32(1)
-          tx << SDK.encode_varint(1)
+          tx << SDK.encode_varint(fee_utxo ? 2 : 1)
           tx << SDK.reverse_hex(contract_utxo.txid)
           tx << SDK.to_le32(contract_utxo.output_index)
           tx << SDK.encode_varint(unlock.length / 2)
           tx << unlock
-          tx << 'ffffffff'
+          tx << SDK.to_le32(terminal_sequence)
+          # Fee input (#118): a plain P2PKH input added BEFORE the OP_PUSH_TX
+          # preimage is computed so hashPrevouts covers it. Empty scriptSig at
+          # build time; its P2PKH sig is filled in after the tx is final.
+          if fee_utxo
+            tx << SDK.reverse_hex(fee_utxo.txid)
+            tx << SDK.to_le32(fee_utxo.output_index)
+            tx << '00'
+            tx << SDK.to_le32(terminal_sequence)
+          end
           tx << SDK.encode_varint(term_outputs.length)
           term_outputs.each do |out|
             tx << SDK.to_le64(out.satoshis)
@@ -1003,6 +1097,18 @@ module Runar
           end
           term_tx = SDK.insert_unlocking_script(term_tx, 0, real_unlock)
           final_preimage = resolved_args[preimage_index] if final_preimage.empty? && needs_op_push_tx
+        end
+
+        # Sign the fee input (#118). Its BIP-143 P2PKH sighash covers only
+        # hashPrevouts / hashOutputs / its own outpoint -- NOT input 0's
+        # scriptSig -- so it stays valid even after finalize_call rewrites input
+        # 0. Owned by funding_signer || signer (composes with #134). The fee
+        # input sits at index 1, right after the primary contract input.
+        if fee_utxo
+          fee_sig    = funding_signer.sign(term_tx, 1, fee_utxo.script, fee_utxo.satoshis)
+          fee_pubkey = funding_signer.get_public_key
+          fee_unlock = State.encode_push_data(fee_sig) + State.encode_push_data(fee_pubkey)
+          term_tx    = SDK.insert_unlocking_script(term_tx, 1, fee_unlock)
         end
 
         sighash = final_preimage.empty? ? '' : Digest::SHA256.hexdigest([final_preimage].pack('H*'))
@@ -1130,6 +1236,8 @@ module Runar
         prevouts_indices: [],
         intent_witness_hex: '',
         locktime: nil,
+        sequence: nil,
+        funding_signer: nil,
         method_uses_code_part: nil
       )
         final_op_push_tx_sig = ''
@@ -1150,6 +1258,8 @@ module Runar
               prevouts_indices: prevouts_indices,
               intent_witness_hex: intent_witness_hex,
               locktime: locktime,
+              sequence: sequence,
+              funding_signer: funding_signer,
               method_uses_code_part: method_uses_code_part
             )
 
@@ -1187,9 +1297,15 @@ module Runar
         prevouts_indices: [],
         intent_witness_hex: '',
         locktime: nil,
+        sequence: nil,
+        funding_signer: nil,
         method_uses_code_part: nil
       )
-        pub_key     = signer.get_public_key
+        # Funding inputs are signed by funding_signer when set (#134); the
+        # method's own Sig args (for extra contract inputs, below) stay with the
+        # connected signer. Defaults to the connected signer.
+        fund_signer = funding_signer || signer
+        pub_key     = fund_signer.get_public_key
         p2pkh_start = 1 + extra_contract_utxos.length
 
         call_opts = {}
@@ -1198,6 +1314,9 @@ module Runar
         # Rebuild path must honor the override too: a preimage computed on a
         # rebuilt tx with locktime 0 would mismatch the final on-chain tx.
         call_opts[:locktime] = locktime unless locktime.nil?
+        # Same for sequence — the second-pass preimage must see the final
+        # input sequences (#131).
+        call_opts[:sequence] = sequence unless sequence.nil?
 
         # First pass — build unlock with placeholder Sig/prevouts params.
         input0_unlock, = build_stateful_unlock(
@@ -1239,7 +1358,7 @@ module Runar
           fee_rate: fee_rate,
           options: rebuild_opts.empty? ? nil : rebuild_opts
         )
-        signed_tx = sign_funding_inputs(tx_hex, additional_utxos, signer, p2pkh_start)
+        signed_tx = sign_funding_inputs(tx_hex, additional_utxos, fund_signer, p2pkh_start)
 
         # Second pass — stable preimage with finalised TX layout.
         final_unlock, op_sig, preimage = build_stateful_unlock(
@@ -1281,9 +1400,10 @@ module Runar
           signed_tx = SDK.insert_unlocking_script(signed_tx, i + 1, extra_unlock)
         end
 
-        # Re-sign P2PKH inputs after second-pass rebuild.
+        # Re-sign P2PKH funding inputs after second-pass rebuild (with
+        # fund_signer — #134).
         additional_utxos.each_with_index do |utxo, i|
-          sig    = signer.sign(signed_tx, p2pkh_start + i, utxo.script, utxo.satoshis)
+          sig    = fund_signer.sign(signed_tx, p2pkh_start + i, utxo.script, utxo.satoshis)
           unlock = State.encode_push_data(sig) + State.encode_push_data(pub_key)
           signed_tx = SDK.insert_unlocking_script(signed_tx, p2pkh_start + i, unlock)
         end

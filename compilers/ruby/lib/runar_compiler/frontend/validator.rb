@@ -344,49 +344,18 @@ module RunarCompiler
       def validate_for_statement(stmt)
         validate_expression(stmt.condition)
 
-        # Check constant bounds
+        # Check that the loop bound is a compile-time constant. Non-zero starts
+        # and countdown loops (`i--` with `>`/`>=`) are supported: the ANF loop
+        # node carries an explicit start value and step direction (#121), so
+        # lowering binds iterVar = start + i*step on each unrolled iteration.
         if stmt.condition.is_a?(BinaryExpr)
           unless compile_time_constant?(stmt.condition.right)
             add_error("for loop bound must be a compile-time constant")
           end
-
-          # The ANF loop node carries only an iteration count, so lowering always
-          # iterates i = 0..count-1. Reject the loop shapes that representation
-          # cannot express -- a non-zero start or a countdown would otherwise be
-          # silently compiled as a zero-start counting-up loop while the
-          # interpreter runs the true source semantics.
-          if stmt.condition.op == ">" || stmt.condition.op == ">="
-            add_error(
-              "For loop condition must count up with '<' or '<=' — countdown loops are not supported; " \
-              "iterate i = 0..N-1 and index backwards instead",
-              loc: stmt.source_location
-            )
-          end
-        end
-
-        start_val = extract_literal_bigint(stmt.init&.init)
-        if !start_val.nil? && start_val != 0
-          add_error(
-            "For loop iterator must start at 0 (got #{start_val}n) — " \
-            "loops compile to i = 0..count-1; offset the iterator inside the body instead",
-            loc: stmt.source_location
-          )
         end
 
         validate_expression(stmt.init.init)
         stmt.body.each { |s| validate_statement(s) }
-      end
-
-      # Extract a literal bigint value from an expression, or nil if the
-      # expression is not a (possibly negated) bigint literal.
-      def extract_literal_bigint(expr)
-        return nil if expr.nil?
-        return expr.value if expr.is_a?(BigIntLiteral)
-        if expr.is_a?(UnaryExpr) && expr.op == "-"
-          inner = extract_literal_bigint(expr.operand)
-          return inner.nil? ? nil : -inner
-        end
-        nil
       end
 
       # -------------------------------------------------------------------

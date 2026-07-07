@@ -729,10 +729,10 @@ class TestValidator < Minitest::Test
   end
 
   # ---------------------------------------------------------------------------
-  # #127 -- reject non-zero-start and countdown for-loops
+  # #121 -- accept non-zero-start and countdown for-loops
   # ---------------------------------------------------------------------------
 
-  def test_for_loop_non_zero_start_reports_error
+  def test_for_loop_non_zero_start_accepted
     source = <<~TS
       import { SmartContract, assert } from 'runar-lang';
 
@@ -756,11 +756,11 @@ class TestValidator < Minitest::Test
 
     contract = parse_ts(source, "C.runar.ts")
     result = RunarCompiler::Frontend.validate(contract)
-    assert result.errors.any? { |e| e.message.include?("must start at 0") },
-           "expected error about non-zero start, got: #{result.error_strings}"
+    refute result.errors.any? { |e| e.message.include?("must start at 0") },
+           "did not expect a non-zero start error (#121), got: #{result.error_strings}"
   end
 
-  def test_for_loop_countdown_reports_error
+  def test_for_loop_countdown_accepted
     source = <<~TS
       import { SmartContract, assert } from 'runar-lang';
 
@@ -784,8 +784,8 @@ class TestValidator < Minitest::Test
 
     contract = parse_ts(source, "C.runar.ts")
     result = RunarCompiler::Frontend.validate(contract)
-    assert result.errors.any? { |e| e.message.include?("countdown") },
-           "expected error about countdown loop, got: #{result.error_strings}"
+    refute result.errors.any? { |e| e.message.include?("countdown") },
+           "did not expect a countdown error (#121), got: #{result.error_strings}"
   end
 
   def test_for_loop_zero_start_counting_up_passes

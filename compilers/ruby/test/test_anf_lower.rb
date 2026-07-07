@@ -269,18 +269,28 @@ class TestAnfLower < Minitest::Test
     }
   TS
 
-  def test_anf_rejects_non_zero_start_loop
-    err = assert_raises(RuntimeError) do
-      lower_without_validate(NON_ZERO_START_LOOP, "C.runar.ts")
-    end
-    assert_includes err.message, "must start at 0"
+  # #121: non-zero start (start=1, step=+1, count=3).
+  def test_anf_lowers_non_zero_start_loop
+    prog = lower_without_validate(NON_ZERO_START_LOOP, "C.runar.ts")
+    m = prog.methods.find { |method| method.name == "m" }
+    refute_nil m
+    loops = m.body.select { |b| b.value.kind == "loop" }
+    assert_equal 1, loops.length
+    assert_equal 1, loops[0].value.start
+    assert_equal 1, loops[0].value.step
+    assert_equal 3, loops[0].value.count
   end
 
-  def test_anf_rejects_countdown_loop
-    err = assert_raises(RuntimeError) do
-      lower_without_validate(COUNTDOWN_LOOP, "C.runar.ts")
-    end
-    assert_includes err.message.downcase, "countdown"
+  # #121: exclusive countdown (start=3, step=-1, count=3).
+  def test_anf_lowers_countdown_loop
+    prog = lower_without_validate(COUNTDOWN_LOOP, "C.runar.ts")
+    m = prog.methods.find { |method| method.name == "m" }
+    refute_nil m
+    loops = m.body.select { |b| b.value.kind == "loop" }
+    assert_equal 1, loops.length
+    assert_equal 3, loops[0].value.start
+    assert_equal(-1, loops[0].value.step)
+    assert_equal 3, loops[0].value.count
   end
 
   def test_anf_still_lowers_zero_start_counting_up_loop
@@ -289,6 +299,38 @@ class TestAnfLower < Minitest::Test
     refute_nil m
     loops = m.body.select { |b| b.value.kind == "loop" }
     assert_equal 1, loops.length
+    assert_equal 0, loops[0].value.start
+    assert_equal 1, loops[0].value.step
     assert_equal 4, loops[0].value.count
+  end
+
+  # #130: a method param whose name collides with a mutable state property
+  # must resolve (as a bare identifier) to the witness PARAM (load_param), not
+  # the stale deserialized property (load_prop).
+  SHADOW_PARAM = <<~TS
+    import { SmartContract, assert } from 'runar-lang';
+
+    class ShadowRepro extends StatefulSmartContract {
+      balance: bigint;
+      constructor(balance: bigint) { super(balance); this.balance = balance; }
+      public retire(balance: bigint): void {
+        this.balance = balance;
+      }
+    }
+  TS
+
+  def test_anf_shadow_param_resolves_to_load_param
+    prog = lower_without_validate(SHADOW_PARAM, "ShadowRepro.runar.ts")
+    m = prog.methods.find { |method| method.name == "retire" }
+    refute_nil m
+    # The update_prop for `balance` must take its value from a load_param
+    # binding (the witness param), NOT a load_prop (the deserialized state).
+    upd = m.body.find { |b| b.value.kind == "update_prop" && b.value.name == "balance" }
+    refute_nil upd
+    src = m.body.find { |b| b.name == upd.value.value_ref }
+    refute_nil src
+    assert_equal "load_param", src.value.kind,
+                 "shadowing param must resolve to load_param, not #{src.value.kind}"
+    assert_equal "balance", src.value.name
   end
 end

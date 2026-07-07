@@ -57,6 +57,12 @@ module Runar
       data_outputs           = opts[:data_outputs] || []
       additional             = additional_utxos || []
 
+      # Sequence (#131): an all-0xffffffff input set makes nLockTime a
+      # consensus no-op. When a non-zero locktime is set, default every input
+      # to 0xfffffffe (non-final) so the locktime is actually enforced.
+      # Explicit options[:sequence] always wins.
+      input_sequence = resolve_input_sequence(opts[:locktime], opts[:sequence])
+
       all_utxos = [current_utxo] + extra_contract_inputs.map { |ci| ci[:utxo] } + additional
       total_input = all_utxos.sum(&:satoshis)
 
@@ -123,7 +129,7 @@ module Runar
       tx << to_le32(current_utxo.output_index)
       tx << encode_varint(unlock_byte_len)
       tx << unlocking_script
-      tx << 'ffffffff'
+      tx << to_le32(input_sequence)
 
       # Additional contract inputs with their own unlocking scripts.
       extra_contract_inputs.each do |ci|
@@ -133,7 +139,7 @@ module Runar
         tx << to_le32(ci_utxo.output_index)
         tx << encode_varint(ci_script.length / 2)
         tx << ci_script
-        tx << 'ffffffff'
+        tx << to_le32(input_sequence)
       end
 
       # P2PKH funding inputs — unsigned, empty scriptSig.
@@ -141,7 +147,7 @@ module Runar
         tx << reverse_hex(utxo.txid)
         tx << to_le32(utxo.output_index)
         tx << '00'
-        tx << 'ffffffff'
+        tx << to_le32(input_sequence)
       end
 
       # Output count
@@ -179,6 +185,26 @@ module Runar
       tx << to_le32(opts[:locktime] || 0)
 
       [tx, all_utxos.length, has_change ? change : 0]
+    end
+
+    # Resolve the nSequence for a call tx's inputs (#131).
+    #
+    # An all-0xffffffff input set makes nLockTime a consensus no-op, so a
+    # locktime-gated method would be script-enforced (via extractLocktime) yet
+    # NOT consensus-enforced. When a non-zero locktime is set we therefore
+    # default every input to 0xfffffffe (non-final, enforceable). Explicit
+    # +sequence+ always wins; with no/zero locktime we keep the legacy
+    # 0xffffffff. Shared by the non-terminal and terminal call-tx build sites
+    # so both stay byte-consistent.
+    #
+    # @param locktime [Integer, nil]
+    # @param sequence [Integer, nil]
+    # @return [Integer]
+    def resolve_input_sequence(locktime, sequence)
+      return sequence unless sequence.nil?
+      return 0xfffffffe if !locktime.nil? && locktime != 0
+
+      0xffffffff
     end
 
     # Replace the scriptSig of a specific input within a raw transaction.

@@ -549,6 +549,27 @@ module RunarCompiler::Codegen
       @outer_protected_refs = nil
       @inside_branch = false
       @current_source_loc = nil
+
+      # #130 (stack layer): a method param whose name collides with a MUTABLE
+      # property gets a duplicate stackMap slot once deserialize_state pushes
+      # that property under the same name. Name lookups resolve to the
+      # shallowest match (the deserialized property), so load_param would read
+      # stale on-chain state instead of the witness value. Rename the colliding
+      # param's slot to a reserved, collision-proof name up front and remember
+      # the mapping so _lower_load_param targets the real param slot. Only
+      # mutable properties are deserialized onto the stack, so readonly shadows
+      # (handled purely by ANF resolution) never enter this map, and
+      # non-colliding contracts get an empty map -- byte-identical output.
+      @renamed_params = {}
+      mutable_prop_names = (properties || []).reject(&:readonly).map(&:name)
+      (params || []).each do |name|
+        next unless mutable_prop_names.include?(name)
+
+        renamed = "__param_#{name}"
+        @sm.rename_at_depth(@sm.find_depth(name), renamed)
+        @renamed_params[name] = renamed
+      end
+
       _track_depth
     end
 
@@ -1158,7 +1179,7 @@ module RunarCompiler::Codegen
       when "if"
         _lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
       when "loop"
-        _lower_loop(name, value.count, value.body, value.iter_var, binding_index, last_uses)
+        _lower_loop(name, value.count, value.body, value.iter_var, value.start, value.step, binding_index, last_uses)
       when "check_preimage"
         _lower_check_preimage(name, value.preimage, binding_index, last_uses)
       when "deserialize_state"
@@ -1226,9 +1247,13 @@ module RunarCompiler::Codegen
     # -----------------------------------------------------------------
 
     def _lower_load_param(binding_name, param_name, binding_index, last_uses)
-      if @sm.has?(param_name)
+      # The parameter is already on the stack under its original name -- or, for
+      # a param that shadows a mutable property, under a reserved renamed slot
+      # (#130) so it is not confused with the deserialized property slot.
+      slot_name = @renamed_params.fetch(param_name, param_name)
+      if @sm.has?(slot_name)
         is_last = _is_last_use(param_name, binding_index, last_uses)
-        bring_to_top(param_name, is_last)
+        bring_to_top(slot_name, is_last)
         @sm.pop
         @sm.push(binding_name)
       else
@@ -2001,9 +2026,13 @@ module RunarCompiler::Codegen
     # loop
     # -----------------------------------------------------------------
 
-    def _lower_loop(binding_name, count, body, iter_var, loop_binding_index = nil, enclosing_last_uses = nil)
+    def _lower_loop(binding_name, count, body, iter_var, start = 0, step = 1, loop_binding_index = nil, enclosing_last_uses = nil)
       body ||= []
       count ||= 0
+      # Iteration i binds iterVar = start + i*step (#121). Older ANF payloads
+      # without start/step describe zero-start counting-up loops.
+      start ||= 0
+      step ||= 1
 
       # Names (re)defined anywhere inside the loop body, nested branches
       # included. A name the body itself binds is NOT an outer ref --
@@ -2036,7 +2065,10 @@ module RunarCompiler::Codegen
       @local_bindings = new_local_bindings
 
       count.times do |i|
-        emit_push_int(i)
+        # Push the iteration variable value (in case the loop body uses it).
+        # Iteration i binds start + i*step (#121); zero-start counting-up loops
+        # (start=0, step=1) reduce to i, preserving byte-for-byte lowering.
+        emit_push_int(start + i * step)
         @sm.push(iter_var)
 
         lu = RunarCompiler::Codegen.compute_last_uses(body)

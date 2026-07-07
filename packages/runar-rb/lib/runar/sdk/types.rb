@@ -215,8 +215,11 @@ module Runar
     end
 
     # Options for deploying a contract.
-    DeployOptions = Struct.new(:satoshis, :change_address, keyword_init: true) do
-      def initialize(satoshis: 10_000, change_address: '')
+    DeployOptions = Struct.new(:satoshis, :change_address, :funding_signer, keyword_init: true) do
+      def initialize(satoshis: 10_000, change_address: '', funding_signer: nil)
+        # funding_signer (#134): signs the P2PKH funding inputs when the deploy
+        # funding UTXOs are owned by a different key than the connected deploy
+        # signer. nil → the connected signer (zero behaviour change).
         super
       end
     end
@@ -249,6 +252,10 @@ module Runar
       :funding_utxos,
       :data_outputs,
       :locktime,
+      :sequence,
+      :max_funding_inputs,
+      :funding_signer,
+      :fee_utxo,
       keyword_init: true
     ) do
       def initialize(
@@ -265,7 +272,33 @@ module Runar
         # Override the call tx's nLockTime field. nil → SDK uses 0 (legacy
         # behavior). Set for contracts that assert
         # extractLocktime(preimage) >= deadline (e.g. auction close/claim).
-        locktime: nil
+        locktime: nil,
+        # Override the nSequence written onto EVERY input of the call tx (#131).
+        # Defaults are zero-config: when +locktime+ is set and non-zero,
+        # sequence defaults to 0xfffffffe (non-final, so consensus actually
+        # enforces nLockTime); otherwise it stays 0xffffffff (final, legacy).
+        # Set explicitly only for RBF or custom relative-locktime scenarios.
+        sequence: nil,
+        # Cap the number of P2PKH funding inputs added to a non-terminal call
+        # tx (#133). Funding is chosen by smallest-sufficient, largest-first
+        # selection (the same select_utxos strategy deploy uses). If covering
+        # outputs + fee would need more inputs than this, the call raises rather
+        # than silently sweeping the wallet. nil → no cap.
+        max_funding_inputs: nil,
+        # Signer for the P2PKH funding (and terminal fee) inputs (#134). When
+        # the funding/fee UTXOs are owned by a different key than the connected
+        # method signer, set this so those inputs are signed by their real
+        # owner. The method's own Sig args are still signed by the connected
+        # signer. nil → the connected signer (zero behaviour change).
+        funding_signer: nil,
+        # A single plain P2PKH UTXO added to a terminal call tx purely to pay
+        # the miner fee (#118). A true terminal method pays out the full
+        # contract balance, so fee would be 0 and ARC rejects; the covenant
+        # asserts its exact output set, so no change output can absorb a fee.
+        # The fee input is added BEFORE the OP_PUSH_TX preimage is computed (so
+        # hashPrevouts covers it) and consumed entirely as fee -- no change
+        # output. Signed with funding_signer || signer. nil → no fee input.
+        fee_utxo: nil
       )
         super
       end

@@ -1038,6 +1038,10 @@ module RunarCompiler
       d["else"] = v.else_.map { |b| ser_binding.call(b) } unless v.else_.nil?
       d["count"] = v.count unless v.count.nil?
       d["iterVar"] = v.iter_var unless v.iter_var.nil?
+      # Loop start/step (#121). Match the TS reference byte-for-byte: start is
+      # emitted as a JS-style "Nn" bigint string, step as a plain integer.
+      d["start"] = "#{v.start}n" unless v.start.nil?
+      d["step"] = v.step unless v.step.nil?
       d["body"] = v.body.map { |b| ser_binding.call(b) } unless v.body.nil?
       d["value"] = v.value_ref unless v.value_ref.nil?
       d["isAutoInjectedStateCheck"] = true if v.kind == "assert" && v.is_auto_injected_state_check
