@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Transaction as BsvTransaction } from '@bsv/sdk';
+import type { Signer } from './signers/signer.js';
 
 /**
  * Plain data shape returned by Provider.getTransaction().
@@ -44,6 +45,13 @@ export interface DeployOptions {
   /** Satoshis to lock in the contract UTXO. Defaults to 1. */
   satoshis?: number;
   changeAddress?: string;
+  /**
+   * Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+   * are owned by a different key than the connected deploy signer, set this so
+   * the funding inputs are signed by their real owner. Defaults to the
+   * connected signer (zero behaviour change).
+   */
+  fundingSigner?: Signer;
 }
 
 /**
@@ -190,4 +198,13 @@ export interface CallOptions {
    * rather than silently sweeping the wallet. Unset → no cap.
    */
   maxFundingInputs?: number;
+
+  /**
+   * Signer for the P2PKH funding (and terminal fee) inputs (issue #134). When
+   * the funding/fee UTXOs are owned by a different key than the connected
+   * method signer, set this so those inputs are signed by their real owner.
+   * The method's own `Sig` args are still signed by the connected signer.
+   * Defaults to the connected signer (zero behaviour change).
+   */
+  fundingSigner?: Signer;
 }

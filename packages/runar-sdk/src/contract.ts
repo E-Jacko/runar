@@ -322,12 +322,15 @@ export class RunarContract {
       feeRate,
     );
 
-    // Sign all inputs — need unsigned hex for signer
+    // Sign all inputs — need unsigned hex for signer. Funding inputs are
+    // signed by fundingSigner when set (issue #134): the deploy signer may not
+    // own the funding coins. Defaults to the connected signer.
+    const fundingSigner = options.fundingSigner ?? signer;
     const unsignedHex = tx.toHex();
     for (let i = 0; i < inputCount; i++) {
       const utxo = utxos[i]!;
-      const sig = await signer.sign(unsignedHex, i, utxo.script, utxo.satoshis);
-      const pubKey = await signer.getPublicKey();
+      const sig = await fundingSigner.sign(unsignedHex, i, utxo.script, utxo.satoshis);
+      const pubKey = await fundingSigner.getPublicKey();
       // Build P2PKH unlocking script: <sig> <pubkey>
       const unlockScript = encodePushData(sig) + encodePushData(pubKey);
       tx.inputs[i]!.unlockingScript = UnlockingScript.fromHex(unlockScript);
@@ -561,6 +564,9 @@ export class RunarContract {
     options?: CallOptions,
   ): Promise<PreparedCall> {
     const { provider, signer } = this.resolveProviderSigner();
+    // Funding (and terminal fee) inputs are signed by fundingSigner when set
+    // (issue #134). The method's own Sig args stay with the connected signer.
+    const fundingSigner = options?.fundingSigner ?? signer;
 
     const method = this.findMethod(methodName);
     if (!method) {
@@ -1014,14 +1020,14 @@ export class RunarContract {
       },
     );
 
-    // Sign P2PKH funding inputs
+    // Sign P2PKH funding inputs (with fundingSigner — issue #134)
     let txHex = tx.toHex();
     const p2pkhStartIdx = 1 + extraContractUtxos.length;
     for (let i = p2pkhStartIdx; i < inputCount; i++) {
       const utxo = additionalUtxos[i - p2pkhStartIdx];
       if (utxo) {
-        const sig = await signer.sign(txHex, i, utxo.script, utxo.satoshis);
-        const pubKey = await signer.getPublicKey();
+        const sig = await fundingSigner.sign(txHex, i, utxo.script, utxo.satoshis);
+        const pubKey = await fundingSigner.getPublicKey();
         const unlockScript = encodePushData(sig) + encodePushData(pubKey);
         tx.inputs[i]!.unlockingScript = UnlockingScript.fromHex(unlockScript);
         invalidateTxCache(tx);
@@ -1137,13 +1143,13 @@ export class RunarContract {
         invalidateTxCache(tx);
       }
 
-      // Re-sign P2PKH funding inputs
+      // Re-sign P2PKH funding inputs (with fundingSigner — issue #134)
       txHex = tx.toHex();
       for (let i = p2pkhStartIdx; i < inputCount; i++) {
         const utxo = additionalUtxos[i - p2pkhStartIdx];
         if (utxo) {
-          const sig = await signer.sign(txHex, i, utxo.script, utxo.satoshis);
-          const pubKey = await signer.getPublicKey();
+          const sig = await fundingSigner.sign(txHex, i, utxo.script, utxo.satoshis);
+          const pubKey = await fundingSigner.getPublicKey();
           const unlockScript = encodePushData(sig) + encodePushData(pubKey);
           tx.inputs[i]!.unlockingScript = UnlockingScript.fromHex(unlockScript);
           invalidateTxCache(tx);
