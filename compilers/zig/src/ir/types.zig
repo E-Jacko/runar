@@ -142,6 +142,17 @@ pub const PropertyNode = struct {
     type_info: RunarType,
     readonly: bool,
     initializer: ?Expression = null,
+    /// Set by the `.runar.ts` surface parser when a `/** @embedAlways */` (or
+    /// `// @embedAlways`) comment directive immediately precedes a readonly
+    /// field (issue #109). Opts the field OUT of dead-code elimination: a
+    /// readonly field no method references is normally stripped from the
+    /// locking script (its load_prop is dead, so no constructor slot is
+    /// emitted), silently dropping deploy-time metadata an author intends to
+    /// recover from the on-chain script later. When set, ANF lowering forces
+    /// the field into the script (a constructor slot) so its bytes survive.
+    /// Only meaningful on readonly fields; honoured only on the `.runar.ts`
+    /// surface (the other 8 formats fail closed at the parse dispatch).
+    embed_always: bool = false,
     /// Non-zero when `type_info == .fixed_array` (set by the parser) or when
     /// we want to remember the original outer length for post-expansion.
     fixed_array_length: u32 = 0,
@@ -155,7 +166,20 @@ pub const PropertyNode = struct {
     synthetic_array_chain: ?[]const SyntheticArrayLevel = null,
 };
 pub const ConstructorNode = struct { params: []ParamNode, super_args: []Expression, assignments: []AssignmentNode };
-pub const MethodNode = struct { name: []const u8, is_public: bool, params: []ParamNode, body: []Statement, source_loc: ?SourceLocation = null };
+pub const MethodNode = struct {
+    name: []const u8,
+    is_public: bool,
+    params: []ParamNode,
+    body: []Statement,
+    source_loc: ?SourceLocation = null,
+    /// BIP-143 sighash type declared via a `/** @sighash <FLAGS> */` directive
+    /// on a public method (issue #123), e.g. 0x43 for SINGLE|FORKID. Null = no
+    /// directive = the default ALL|FORKID (0x41), byte-identical to the
+    /// historically-pinned mode. Drives the auto-injected preimage-type assert,
+    /// the OP_PUSH_TX binding flag, the ABI sigHashType, and the SDK-side
+    /// preimage construction. Honoured only on the `.runar.ts` surface.
+    sighash_type: ?i32 = null,
+};
 pub const ParamNode = struct { name: []const u8, type_info: RunarType = .unknown, type_name: []const u8 = "" };
 pub const ANFParam = ParamNode;
 pub const AssignmentNode = struct { target: []const u8, value: Expression };
@@ -363,7 +387,20 @@ pub const ANFValue = union(enum) {
 
 // -- TypeScript-matching value structs (used by stack_lower.zig) --
 pub const LoadParam = struct { name: []const u8 };
-pub const LoadProp = struct { name: []const u8 };
+pub const LoadProp = struct {
+    name: []const u8,
+    /// Issue #109 (@embedAlways): when true, dead-binding DCE must NOT remove
+    /// this load_prop even though nothing references it, so the readonly field
+    /// it loads survives into the deployed locking script (a constructor slot).
+    /// The TypeScript reference relies on a single-pass DCE + a `@ref` alias to
+    /// keep the load_prop alive; the Zig `ec_optimizer` runs a fixpoint DCE that
+    /// would strip such an unreferenced alias chain, so the Zig tier marks the
+    /// injected load_prop directly and teaches `dce.hasSideEffect` to honour it.
+    /// The observable output (constructor slot + OP_NIP cleanup) is byte-identical
+    /// to the TS reference. In-memory only — never serialized into the ANF JSON,
+    /// so existing (default false) load_props stay byte-identical cross-tier.
+    preserve: bool = false,
+};
 pub const LoadConst = struct { value: ConstValue };
 pub const BinOp = struct { op: []const u8, left: []const u8, right: []const u8, result_type: ?[]const u8 = null };
 pub const ANFUnaryOp = struct { op: []const u8, operand: []const u8, result_type: ?[]const u8 = null };

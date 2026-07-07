@@ -246,6 +246,16 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
         });
     }
 
+    // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+    // must survive DCE into the locking script. A readonly field no method
+    // references lowers to no load_prop, so no constructor slot is emitted and
+    // the field's deploy-time bytes vanish. We inject a preserved load_prop
+    // for each such field into the FIRST public method's body — it keeps the
+    // field's constructor-slot placeholder in the deployed script, and stack
+    // lowering threads the pushed value through and NIPs it at method end.
+    // One slot in the deployed script suffices; every spending branch shares it.
+    var embed_injected = false;
+
     // Lower each method
     for (contract.methods) |method| {
         var method_ctx = LowerCtx.init(allocator, contract);
@@ -258,8 +268,14 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
         }
 
         if (contract.parent_class == .stateful_smart_contract and method.is_public) {
-            try lowerStatefulPublicMethod(allocator, &method_ctx, method, contract);
+            try lowerStatefulPublicMethod(allocator, &method_ctx, method, contract, &embed_injected);
         } else {
+            // Issue #109: stateless public methods (and stateless contracts'
+            // spending entry points) are lowered here — inject @embedAlways
+            // preservation into the first PUBLIC one before its body.
+            if (!embed_injected and method.is_public) {
+                if (try emitEmbedAlwaysPreservation(&method_ctx, contract)) embed_injected = true;
+            }
             try lowerStatements(&method_ctx, method.body);
             const bindings = try method_ctx.bindings.toOwnedSlice(allocator);
             // Private methods can also call the intent intrinsics; append
@@ -368,11 +384,36 @@ fn lowerConstructorBody(ctx: *LowerCtx, ctor: ConstructorNode) LowerError!void {
     }
 }
 
+/// Issue #109: emit a DCE-surviving preservation `load_prop` for each
+/// `@embedAlways` readonly field into the given (public) method context.
+/// Returns true when at least one field was injected (so the caller marks the
+/// one-shot injection done). The load_prop carries `preserve = true`, so
+/// `dce.hasSideEffect` keeps it even though nothing references it; stack
+/// lowering then emits the field's constructor-slot placeholder and NIPs the
+/// unused value off the stack at method end. The field's bytes therefore remain
+/// in the deployed locking script for downstream recovery.
+///
+/// The TypeScript reference achieves the same via a `load_prop` + `@ref` alias
+/// relying on a single-pass DCE. The Zig `ec_optimizer` runs a fixpoint DCE
+/// that would strip such an unreferenced alias chain, so the Zig tier marks the
+/// injected load_prop directly. The observable output is byte-identical.
+fn emitEmbedAlwaysPreservation(ctx: *LowerCtx, contract: ContractNode) LowerError!bool {
+    var injected = false;
+    for (contract.properties) |prop| {
+        if (prop.readonly and prop.embed_always) {
+            _ = try ctx.emit(.{ .load_prop = .{ .name = prop.name, .preserve = true } });
+            injected = true;
+        }
+    }
+    return injected;
+}
+
 fn lowerStatefulPublicMethod(
     allocator: Allocator,
     ctx: *LowerCtx,
     method: MethodNode,
     contract: ContractNode,
+    embed_injected: *bool,
 ) LowerError!void {
     // Methods that use addOutput, addDataOutput, or mutate state need hashOutputs
     // verification (change output support).
@@ -428,6 +469,13 @@ fn lowerStatefulPublicMethod(
     if (has_mutable_state) {
         const preimage_ref3 = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
         _ = try ctx.emit(.{ .deserialize_state = .{ .preimage = preimage_ref3 } });
+    }
+
+    // Issue #109: preserve @embedAlways fields at the first user-statement
+    // position (after the checkPreimage/deserialize preamble), mirroring where
+    // a `const _bind = this.field;` idiom would sit.
+    if (!embed_injected.*) {
+        if (try emitEmbedAlwaysPreservation(ctx, contract)) embed_injected.* = true;
     }
 
     // Lower the developer's method body
