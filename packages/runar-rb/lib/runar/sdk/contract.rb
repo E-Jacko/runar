@@ -49,6 +49,24 @@ require_relative 'ordinals'
 
 module Runar
   module SDK
+    # Producer-side marker (issue #106) for the deliberately-empty branch of an
+    # OR-CHECKSIG method — checkSig(sigA, pkA) || checkSig(sigB, pkB), where the
+    # `||` lowers to the non-lazy OP_BOOLOR so BOTH OP_CHECKSIGs run. Only the
+    # matching branch supplies a real signature; the failing branch MUST push an
+    # empty signature (OP_0) or BIP146 NULLFAIL rejects the whole spend.
+    #
+    # Pass EMPTY_SIG as the call arg for the non-matching Sig slot: the SDK
+    # pushes OP_0 for it and never signs it, distinct from nil (auto-sign) and
+    # an explicit hex-bytes value. Coexists with nil at the same call —
+    # call('execute', [nil, EMPTY_SIG]) signs only slot 0. A globally-interned
+    # symbol so identity holds process-wide.
+    EMPTY_SIG = :__runar_sdk_empty_sig__
+
+    # Type guard: is this call arg the EMPTY_SIG marker (issue #106)?
+    def self.empty_sig?(value)
+      value.equal?(EMPTY_SIG)
+    end
+
     # rubocop:disable Naming/AccessorMethodName, Naming/PredicatePrefix
     class RunarContract
       attr_reader :artifact, :inscription
@@ -1170,6 +1188,10 @@ module Runar
         user_params.each_with_index do |param, i|
           case param.type
           when 'Sig'
+            # Only a nil Sig slot is auto-signed. EMPTY_SIG (issue #106) is not
+            # nil, so it is never added to sig_indices and never signed — it
+            # stays in resolved_args and encode_arg emits OP_0 (empty sig) for
+            # the failing OR-CHECKSIG branch (satisfies BIP146 NULLFAIL).
             if args[i].nil?
               sig_indices << i
               resolved_args[i] = '00' * 72
@@ -1776,6 +1798,10 @@ module Runar
       # @param value [Integer, String, TrueClass, FalseClass]
       # @return [String] hex-encoded push instruction
       def encode_arg(value)
+        # EMPTY_SIG (issue #106) -> OP_0: an empty signature push for the failing
+        # branch of an OR-CHECKSIG method, so BIP146 NULLFAIL accepts the spend.
+        return '00' if SDK.empty_sig?(value)
+
         case value
         when true    then '51'  # OP_1
         when false   then '00'  # OP_0
