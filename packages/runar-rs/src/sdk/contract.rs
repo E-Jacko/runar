@@ -13,7 +13,7 @@ use super::deployment::{
     build_p2pkh_script_from_address, encode_varint,
     to_little_endian_32, to_little_endian_64, reverse_hex,
 };
-use super::calling::{build_call_transaction_ext, CallTxOptions, ContractOutput, AdditionalContractInput};
+use super::calling::{build_call_transaction_ext, resolve_input_sequence, CallTxOptions, ContractOutput, AdditionalContractInput};
 use super::provider::Provider;
 use super::signer::Signer;
 use super::errors::{assert_script_hex_under_limit, WitnessValueMissingError, MAX_SCRIPT_BYTES};
@@ -878,6 +878,9 @@ impl RunarContract {
             // asserting `extractLocktime(preimage)` can succeed. Default `None` → `0`
             // (legacy behavior preserved).
             locktime: options.and_then(|o| o.locktime),
+            // Thread `CallOptions.sequence` (issue #131): a non-zero locktime
+            // needs non-final input sequences or consensus ignores nLockTime.
+            sequence: options.and_then(|o| o.sequence),
         };
 
         let (tx_hex, input_count, mut change_amount) = build_call_transaction_ext(
@@ -1041,6 +1044,9 @@ impl RunarContract {
                 // on a rebuilt tx with `locktime = 0` would mismatch what
                 // `extractLocktime` sees in the final on-chain tx.
                 locktime: options.and_then(|o| o.locktime),
+                // Same for sequence — the second-pass preimage must see the
+                // final input sequences (issue #131).
+                sequence: options.and_then(|o| o.sequence),
             };
 
             let (rebuilt_tx, _, rebuilt_change) = build_call_transaction_ext(
@@ -1315,6 +1321,14 @@ impl RunarContract {
         // check locktime.
         let terminal_locktime = options.and_then(|o| o.locktime).unwrap_or(0);
 
+        // Sequence (issue #131): all-final inputs make nLockTime a consensus
+        // no-op — when a non-zero locktime is set, default to 0xfffffffe so the
+        // terminal method's extractLocktime assertion is actually enforced.
+        let terminal_sequence_hex = to_little_endian_32(resolve_input_sequence(
+            options.and_then(|o| o.locktime),
+            options.and_then(|o| o.sequence),
+        ));
+
         // Build placeholder unlocking script (witness_hex suffixed for sizing
         // — the real ABI-correct unlock is built by build_unlock below for
         // stateful methods).
@@ -1343,7 +1357,7 @@ impl RunarContract {
             tx.push_str(&to_little_endian_32(current_utxo.output_index));
             tx.push_str(&encode_varint((unlock.len() / 2) as u64));
             tx.push_str(unlock);
-            tx.push_str("ffffffff");
+            tx.push_str(&terminal_sequence_hex);
             tx.push_str(&encode_varint(terminal_outputs.len() as u64));
             for out in terminal_outputs {
                 tx.push_str(&to_little_endian_64(out.satoshis));

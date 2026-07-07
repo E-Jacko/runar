@@ -99,6 +99,13 @@ pub struct CallOptions {
     /// non-terminal (`build_call_transaction_ext`) and terminal call-tx
     /// build sites.
     pub locktime: Option<u32>,
+    /// Override the nSequence written onto EVERY input of the call tx (issue
+    /// #131). Zero-config defaults: when `locktime` is set and non-zero,
+    /// sequence defaults to `0xfffffffe` (non-final, so consensus actually
+    /// enforces nLockTime); otherwise it stays `0xffffffff` (final, legacy).
+    /// Set explicitly only for RBF or custom relative-locktime scenarios.
+    /// Threaded through the non-terminal and terminal call-tx build sites.
+    pub sequence: Option<u32>,
 }
 
 /// A data output entry — hex-encoded script + satoshis — for the
