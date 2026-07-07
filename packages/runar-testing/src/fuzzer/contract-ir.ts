@@ -101,6 +101,7 @@ export type Stmt =
   | AssertStmt
   | AssignStmt
   | IfStmt
+  | ForStmt
   | ExprStmt;
 
 export interface VarDeclStmt {
@@ -128,6 +129,23 @@ export interface IfStmt {
   condition: Expr;
   then: Stmt[];
   else_?: Stmt[];
+}
+
+/**
+ * Bounded `for` loop with a compile-time-constant iteration count. Models the
+ * shapes the Rúnar compiler unrolls (issue #121): a NON-ZERO start counting up
+ * (`step: 1`, `op: '<' | '<='`) or a countdown (`step: -1`, `op: '>' | '>='`).
+ * `start` and `bound` are integer literals; the loop variable (`iterVar`,
+ * `bigint`) is available inside `body` and goes out of scope after it.
+ */
+export interface ForStmt {
+  kind: 'for';
+  iterVar: string;
+  start: bigint;
+  bound: bigint;
+  op: '<' | '<=' | '>' | '>=';
+  step: 1 | -1;
+  body: Stmt[];
 }
 
 export interface ExprStmt {
@@ -220,6 +238,9 @@ export function collectUsedFunctions(contract: GeneratedContract): Set<string> {
         walkExpr(stmt.condition);
         stmt.then.forEach(walkStmt);
         stmt.else_?.forEach(walkStmt);
+        break;
+      case 'for':
+        stmt.body.forEach(walkStmt);
         break;
       case 'expr':
         walkExpr(stmt.expr);
