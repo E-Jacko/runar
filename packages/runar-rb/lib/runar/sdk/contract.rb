@@ -640,8 +640,10 @@ module Runar
         end
 
         output     = tx.outputs[output_index]
-        dummy_args = Array.new(artifact.abi.constructor_params.length, 0)
-        contract   = new(artifact, dummy_args)
+        # #119: recover the real constructor args baked into the deployed script
+        # instead of 0 placeholders, so the ANF continuation formula and the
+        # codesep-offset walk operate on the true values.
+        contract   = new(artifact, restore_constructor_args(artifact, output.script))
 
         stateful = !artifact.state_fields.empty?
         code_script = if stateful
@@ -685,8 +687,9 @@ module Runar
       # @return [RunarContract]
       def self.from_utxo(artifact, utxo)
         utxo = normalize_utxo(utxo)
-        dummy_args = Array.new(artifact.abi.constructor_params.length, 0)
-        contract   = new(artifact, dummy_args)
+        # #119: recover the real constructor args baked into the deployed script
+        # instead of 0 placeholders (see restore_constructor_args).
+        contract   = new(artifact, restore_constructor_args(artifact, utxo.script))
 
         stateful = !artifact.state_fields.empty?
         code_script = if stateful
@@ -736,6 +739,31 @@ module Runar
         end
       end
       private_class_method :normalize_utxo
+
+      # Recover the positional constructor argument list from a deployed locking
+      # script (#119), so a restored contract (from_utxo / from_txid) operates on
+      # the real baked-in values rather than 0 placeholders.
+      #
+      # extract_constructor_args returns a name→value map keyed by ABI param
+      # name; abi.constructor_params is already ordered by paramIndex, so mapping
+      # over it yields the positional array the RunarContract constructor expects.
+      #
+      # Params that carry no constructor slot (mutable state fields — their value
+      # lives in the OP_RETURN state section, restored separately by
+      # extract_state_from_script) are absent from the extracted map and fall
+      # back to 0, matching the prior placeholder behaviour.
+      #
+      # @param artifact [RunarArtifact]
+      # @param script_hex [String] deployed locking script hex
+      # @return [Array]
+      def self.restore_constructor_args(artifact, script_hex)
+        params = artifact.abi.constructor_params
+        return [] if params.empty?
+
+        extracted = ScriptUtils.extract_constructor_args(artifact, script_hex)
+        params.map { |p| extracted.key?(p.name) ? extracted[p.name] : 0 }
+      end
+      private_class_method :restore_constructor_args
 
       # Return the full locking script hex (code script + optional envelope + optional OP_RETURN + state).
       #

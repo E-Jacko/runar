@@ -485,6 +485,33 @@ RSpec.describe Runar::SDK::RunarContract do
       expect { described_class.from_txid(artifact, tx.txid, 5, provider) }
         .to raise_error(ArgumentError, /out of range/)
     end
+
+    # #119: from_txid must recover the REAL constructor args baked into the
+    # deployed script, not 0 placeholders.
+    it 'restores the real constructor args from the deployed script (#119)' do
+      contract = described_class.from_txid(artifact, tx.txid, 0, provider)
+      restored = contract.instance_variable_get(:@constructor_args)
+      expect(restored).to eq([SAMPLE_PKH])
+      expect(restored).not_to eq([0])
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # from_utxo — restore real constructor args (issue #119)
+  # ---------------------------------------------------------------------------
+
+  describe '.from_utxo restores constructor args (#119)' do
+    let(:artifact) { stateless_artifact }
+    let(:script)   { described_class.new(artifact, [SAMPLE_PKH]).get_locking_script }
+
+    it 'recovers the baked-in pubKeyHash instead of a 0 placeholder' do
+      utxo = Runar::SDK::Utxo.new(
+        txid: 'ab' * 32, output_index: 0, satoshis: 10_000, script: script
+      )
+      contract = described_class.from_utxo(artifact, utxo)
+      restored = contract.instance_variable_get(:@constructor_args)
+      expect(restored).to eq([SAMPLE_PKH])
+    end
   end
 
   # ---------------------------------------------------------------------------
