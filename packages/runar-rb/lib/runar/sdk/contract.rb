@@ -1065,7 +1065,8 @@ module Runar
           # Two-pass stateful terminal: compute preimage with placeholder, then stabilize.
           build_stateful_terminal_unlock = lambda do |tx|
             op_sig, preimage = SDK.compute_op_push_tx(
-              tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx
+              tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+              resolve_sighash_type(method_name)
             )
             args_hex   = resolved_args.map { |a| encode_arg(a) }.join
             change_hex = ''
@@ -1094,7 +1095,8 @@ module Runar
         elsif needs_op_push_tx || !sig_indices.empty?
           if needs_op_push_tx
             sig_hex, preimage_hex = SDK.compute_op_push_tx(
-              term_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx
+              term_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+              resolve_sighash_type(method_name)
             )
             final_op_push_tx_sig          = sig_hex
             resolved_args[preimage_index] = preimage_hex
@@ -1105,7 +1107,8 @@ module Runar
             real_unlock = build_stateful_prefix(final_op_push_tx_sig, false) + real_unlock
             tmp_tx      = SDK.insert_unlocking_script(term_tx, 0, real_unlock)
             final_sig, final_pre = SDK.compute_op_push_tx(
-              tmp_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx
+              tmp_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+              resolve_sighash_type(method_name)
             )
             resolved_args[preimage_index] = final_pre
             final_op_push_tx_sig          = final_sig
@@ -1441,7 +1444,8 @@ module Runar
 
         if needs_op_push_tx
           sig_hex, preimage_hex = SDK.compute_op_push_tx(
-            signed_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx
+            signed_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+            resolve_sighash_type(method_name)
           )
           final_op_push_tx_sig          = sig_hex
           resolved_args[preimage_index] = preimage_hex
@@ -1452,7 +1456,8 @@ module Runar
           real_unlock = build_stateful_prefix(final_op_push_tx_sig, false) + real_unlock
           tmp_tx      = SDK.insert_unlocking_script(signed_tx, 0, real_unlock)
           final_sig, final_pre = SDK.compute_op_push_tx(
-            tmp_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx
+            tmp_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+            resolve_sighash_type(method_name)
           )
           resolved_args[preimage_index] = final_pre
           final_op_push_tx_sig          = final_sig
@@ -1761,6 +1766,16 @@ module Runar
         get_public_methods.index { |m| m.name == name } || 0
       end
 
+      # Issue #123: the BIP-143 sighash mode a method's covenant/preimage is
+      # built under. Resolved from the public method's ABI sigHashType; a method
+      # with no @sighash directive carries none and falls back to 0x41
+      # (ALL|FORKID), unchanged behaviour.
+      def resolve_sighash_type(method_name)
+        m = find_method(method_name)
+        mode = m.respond_to?(:sig_hash_type) ? m&.sig_hash_type : nil
+        mode || SDK::SIGHASH_ALL_FORKID
+      end
+
       def compute_method_selector(method_name, is_stateful)
         return '' unless is_stateful
 
@@ -1857,13 +1872,15 @@ module Runar
       #
       # rubocop:disable Metrics/AbcSize, Metrics/MethodLength, Metrics/ParameterLists
       def build_stateful_unlock(tx_hex, input_idx, contract_utxo, resolved_args,
-                                _method_name, method_needs_change, method_needs_new_amount,
+                                method_name, method_needs_change, method_needs_new_amount,
                                 change_pkh_hex, method_selector_hex, code_sep_idx,
                                 change_amount, new_satoshis,
                                 prevouts_indices: [], intent_witness_hex: '',
                                 method_uses_code_part: nil)
+        # Issue #123: build the preimage under the method's declared @sighash mode.
         op_sig, preimage = SDK.compute_op_push_tx(
-          tx_hex, input_idx, contract_utxo.script, contract_utxo.satoshis, code_sep_idx
+          tx_hex, input_idx, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+          resolve_sighash_type(method_name)
         )
 
         # Inject real allPrevouts into any ByteString placeholders.

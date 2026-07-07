@@ -20,7 +20,7 @@ require 'tmpdir'
 # rubocop:disable RSpec/DescribeClass
 RSpec.describe 'Issue #106 — EMPTY_SIG for OR-CHECKSIG branched authorization' do
   # rubocop:enable RSpec/DescribeClass
-  SRC = <<~TS
+  E106_SRC = <<~TS
     import { SmartContract, assert, checkSig } from 'runar-lang';
     import type { PubKey, Sig } from 'runar-lang';
     class OrChecksig extends SmartContract {
@@ -33,8 +33,8 @@ RSpec.describe 'Issue #106 — EMPTY_SIG for OR-CHECKSIG branched authorization'
     }
   TS
 
-  ALICE_KEY = ('00' * 31) + '03'
-  BOB_KEY   = ('00' * 31) + '07'
+  E106_ALICE_KEY = ('00' * 31) + '03'
+  E106_BOB_KEY   = ('00' * 31) + '07'
 
   def compile_or_checksig
     repo_root = File.expand_path('../../../..', __dir__)
@@ -42,7 +42,7 @@ RSpec.describe 'Issue #106 — EMPTY_SIG for OR-CHECKSIG branched authorization'
     return nil unless File.exist?(cli)
 
     src_path = File.join(Dir.tmpdir, 'OrChecksig.runar.ts')
-    File.write(src_path, SRC)
+    File.write(src_path, E106_SRC)
     out, _err, status = Open3.capture3('ruby', cli, '--source', src_path)
     status.success? ? out : nil
   end
@@ -92,8 +92,8 @@ RSpec.describe 'Issue #106 — EMPTY_SIG for OR-CHECKSIG branched authorization'
     return nil if compiled.nil?
 
     artifact = Runar::SDK::RunarArtifact.from_json(compiled)
-    alice = Runar::SDK::LocalSigner.new(ALICE_KEY)
-    bob   = Runar::SDK::LocalSigner.new(BOB_KEY)
+    alice = Runar::SDK::LocalSigner.new(E106_ALICE_KEY)
+    bob   = Runar::SDK::LocalSigner.new(E106_BOB_KEY)
     provider = Runar::SDK::MockProvider.new
     provider.add_utxo(
       alice.get_address,
@@ -119,8 +119,8 @@ RSpec.describe 'Issue #106 — EMPTY_SIG for OR-CHECKSIG branched authorization'
       artifact = Runar::SDK::RunarArtifact.from_json(
         compile_or_checksig || (skip 'Ruby compiler CLI unavailable')
       )
-      alice = Runar::SDK::LocalSigner.new(ALICE_KEY)
-      bob = Runar::SDK::LocalSigner.new(BOB_KEY)
+      alice = Runar::SDK::LocalSigner.new(E106_ALICE_KEY)
+      bob = Runar::SDK::LocalSigner.new(E106_BOB_KEY)
       contract = Runar::SDK::RunarContract.new(artifact, [alice.get_public_key, bob.get_public_key])
       expect(contract.send(:encode_arg, Runar::SDK::EMPTY_SIG)).to eq('00')
     end
