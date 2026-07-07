@@ -505,8 +505,45 @@ module Runar
         fee_rate          = provider.get_fee_rate
         change_script     = SDK.build_p2pkh_script(change_address)
         all_funding_utxos = provider.get_utxos(address)
-        additional_utxos  = all_funding_utxos.reject do |u|
+        candidate_funding_utxos = all_funding_utxos.reject do |u|
           u.txid == @current_utxo.txid && u.output_index == @current_utxo.output_index
+        end
+
+        # Coin selection for funding inputs (#133): don't sweep the whole
+        # wallet. Compute how much the funding must cover -- the contract's own
+        # input value already offsets the contract/data outputs -- and pick the
+        # smallest largest-first set via select_utxos (the strategy deploy uses).
+        contract_output_sats =
+          (contract_outputs ? contract_outputs.sum { |o| o[:satoshis] } : (new_satoshis || 0)) +
+          resolved_data_outputs.sum { |o| o[:satoshis] }
+        contract_input_sats =
+          @current_utxo.satoshis + extra_contract_utxos.sum(&:satoshis)
+        funding_target = [0, contract_output_sats - contract_input_sats].max
+        # Fee sizing hint for select_utxos: the continuation script length
+        # (falls back to the first multi-output script, else 0 for stateless).
+        funding_lock_len =
+          if new_locking_script && !new_locking_script.empty?
+            new_locking_script.length / 2
+          elsif contract_outputs && contract_outputs.first
+            contract_outputs.first[:script].length / 2
+          else
+            0
+          end
+        additional_utxos =
+          if candidate_funding_utxos.empty?
+            []
+          else
+            SDK.select_utxos(candidate_funding_utxos, funding_target, funding_lock_len, fee_rate: fee_rate)
+          end
+
+        # Cap funding inputs when the caller sets max_funding_inputs (#133).
+        # select_utxos returns the minimal largest-first set; if that still
+        # exceeds the cap the funding can't cover outputs + fee within budget,
+        # so fail loudly instead of broadcasting an underfunded tx.
+        if !opts.max_funding_inputs.nil? && additional_utxos.length > opts.max_funding_inputs
+          raise "RunarContract.call(#{method_name}): funding requires #{additional_utxos.length} " \
+                "input(s) but max_funding_inputs=#{opts.max_funding_inputs}. Increase " \
+                'max_funding_inputs, use larger UTXOs, or consolidate.'
         end
 
         # Initial unlocking script (with placeholders). Intent-witness hex is

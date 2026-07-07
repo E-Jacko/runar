@@ -250,6 +250,7 @@ module Runar
       :data_outputs,
       :locktime,
       :sequence,
+      :max_funding_inputs,
       keyword_init: true
     ) do
       def initialize(
@@ -272,7 +273,13 @@ module Runar
         # sequence defaults to 0xfffffffe (non-final, so consensus actually
         # enforces nLockTime); otherwise it stays 0xffffffff (final, legacy).
         # Set explicitly only for RBF or custom relative-locktime scenarios.
-        sequence: nil
+        sequence: nil,
+        # Cap the number of P2PKH funding inputs added to a non-terminal call
+        # tx (#133). Funding is chosen by smallest-sufficient, largest-first
+        # selection (the same select_utxos strategy deploy uses). If covering
+        # outputs + fee would need more inputs than this, the call raises rather
+        # than silently sweeping the wallet. nil → no cap.
+        max_funding_inputs: nil
       )
         super
       end

@@ -426,6 +426,65 @@ RSpec.describe Runar::SDK::RunarContract do
   end
 
   # ---------------------------------------------------------------------------
+  # #call funding selection (issue #133)
+  # ---------------------------------------------------------------------------
+
+  describe '#call funding selection (#133)' do
+    let(:provider) { mock_provider }
+    let(:signer)   { mock_signer }
+    let(:contract) { described_class.new(stateful_anf_artifact, [5]) }
+
+    def input_count(tx_hex)
+      count, = Runar::SDK.read_varint_hex(tx_hex, 8)
+      count
+    end
+
+    # Give the contract a deployed UTXO directly (no deploy noise) so the
+    # provider's funding set contains only the coins each test adds.
+    def deploy_manually(satoshis = 10_000)
+      contract.connect(provider, signer)
+      contract.instance_variable_set(
+        :@current_utxo,
+        Runar::SDK::Utxo.new(txid: 'cc' * 32, output_index: 0,
+                             satoshis: satoshis, script: contract.get_locking_script)
+      )
+    end
+
+    def fund(address_utxos)
+      address_utxos.each { |txid, sats| provider.add_utxo(SAMPLE_ADDRESS, make_utxo(txid, sats, script: '76a914' + SAMPLE_ADDRESS + '88ac')) }
+    end
+
+    it 'selects the smallest-sufficient funding, not all wallet UTXOs' do
+      deploy_manually
+      fund([['a0' * 32, 100_000], ['a1' * 32, 100_000], ['a2' * 32, 100_000]])
+      contract.call('increment', [])
+      call_tx = provider.get_broadcasted_txs.last
+      # 1 contract input + 1 funding input = 2 (NOT 4).
+      expect(input_count(call_tx)).to eq(2)
+    end
+
+    it 'raises clearly when max_funding_inputs cannot cover outputs + fee' do
+      deploy_manually
+      # Continuation value 16k against a 10k contract input needs ~6k of
+      # funding; with 3k coins that is 2 inputs. Cap at 1 => must raise.
+      fund([['b0' * 32, 3_000], ['b1' * 32, 3_000], ['b2' * 32, 3_000]])
+      expect do
+        contract.call('increment', [], nil, nil,
+                      Runar::SDK::CallOptions.new(satoshis: 16_000, max_funding_inputs: 1))
+      end.to raise_error(/max_funding_inputs/)
+    end
+
+    it 'honors a max_funding_inputs cap that is sufficient' do
+      deploy_manually
+      fund([['c0' * 32, 3_000], ['c1' * 32, 3_000], ['c2' * 32, 3_000]])
+      expect do
+        contract.call('increment', [], nil, nil,
+                      Runar::SDK::CallOptions.new(satoshis: 16_000, max_funding_inputs: 3))
+      end.not_to raise_error
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # get_state / set_state
   # ---------------------------------------------------------------------------
 
