@@ -282,6 +282,10 @@ type ABIMethod struct {
 	IsTerminal *bool      `json:"isTerminal,omitempty"`
 	// UsesCodePart: unlocking script is prefixed with _codePart (issue #100).
 	UsesCodePart *bool `json:"usesCodePart,omitempty"`
+	// SigHashType: the BIP-143 sighash type this method's preimage is built
+	// under (from a @sighash directive, issue #123), e.g. 0x43 for
+	// SINGLE|FORKID. Absent = default ALL|FORKID (0x41).
+	SigHashType *int `json:"sigHashType,omitempty"`
 }
 
 // ABIFixedArray describes the fixed-array shape of a grouped ABI

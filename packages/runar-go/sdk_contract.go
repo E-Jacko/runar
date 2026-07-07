@@ -15,6 +15,27 @@ import (
 	"golang.org/x/crypto/ripemd160"
 )
 
+// emptySigMarker is the type of the EmptySig sentinel (issue #106).
+type emptySigMarker struct{}
+
+// EmptySig is the producer-side marker (issue #106) for the deliberately-empty
+// branch of an OR-CHECKSIG method — checkSig(sigA, pkA) || checkSig(sigB, pkB),
+// where || lowers to the non-lazy OP_BOOLOR so BOTH OP_CHECKSIGs run. Only the
+// matching branch supplies a real signature; the failing branch MUST push an
+// empty signature (OP_0) or BIP146 NULLFAIL rejects the whole spend.
+//
+// Pass EmptySig as the call arg for the non-matching Sig slot: the SDK pushes
+// OP_0 for it and never signs it, distinct from nil (auto-sign) and an explicit
+// hex-bytes value. Coexists with nil at the same call — Call("execute", []any{
+// nil, EmptySig}) signs only slot 0.
+var EmptySig interface{} = emptySigMarker{}
+
+// IsEmptySig reports whether a call arg is the EmptySig marker (issue #106).
+func IsEmptySig(value interface{}) bool {
+	_, ok := value.(emptySigMarker)
+	return ok
+}
+
 // ---------------------------------------------------------------------------
 // RunarContract — main contract runtime wrapper
 // ---------------------------------------------------------------------------
@@ -562,6 +583,10 @@ func (c *RunarContract) PrepareCall(
 			sigIndices = append(sigIndices, i)
 			resolvedArgs[i] = strings.Repeat("00", 72)
 		}
+		// Issue #106: EmptySig is intentionally NOT collected here — it is not
+		// nil, so it is never added to sigIndices and never signed. It stays in
+		// resolvedArgs and encodeArg emits OP_0 (empty sig) for it, satisfying
+		// BIP146 NULLFAIL on the failing branch of an OR-CHECKSIG method.
 		if param.Type == "PubKey" && args[i] == nil {
 			pubKey, pkErr := signer.GetPublicKey()
 			if pkErr != nil {
@@ -897,6 +922,9 @@ func (c *RunarContract) PrepareCall(
 	finalOpPushTxSig := ""
 	finalPreimage := ""
 	codeSepIdx := c.getCodeSepIndex(methodIndex)
+	// Issue #123: build every preimage on this path under the method's declared
+	// @sighash mode (default 0x41 for methods with no directive).
+	sigHashType := c.methodSigHashType(methodName)
 
 	// Mode 3: pre-encode the witness-assisted Groth16 prover bundle into a
 	// flat hex push sequence so each pass of buildStatefulUnlock can splice
@@ -914,7 +942,7 @@ func (c *RunarContract) PrepareCall(
 		// Helper: build a stateful unlock. For inputIdx==0 (primary), keeps
 		// placeholder Sig params. For inputIdx>0 (extra), signs with signer.
 		buildStatefulUnlock := func(tx string, inputIdx int, subscript string, sats int64, baseArgs []interface{}, txChangeAmount int64) (unlock string, opSigHex string, preimageHex string, retErr error) {
-			opSig, preimage, ptxErr := ComputeOpPushTxWithCodeSep(tx, inputIdx, subscript, sats, codeSepIdx)
+			opSig, preimage, ptxErr := ComputeOpPushTxWithSigHash(tx, inputIdx, subscript, sats, codeSepIdx, sigHashType)
 			if ptxErr != nil {
 				return "", "", "", fmt.Errorf("OP_PUSH_TX for input %d: %w", inputIdx, ptxErr)
 			}
@@ -1072,8 +1100,8 @@ func (c *RunarContract) PrepareCall(
 	} else if needsOpPushTx || len(sigIndices) > 0 {
 		// Stateless: keep placeholder sigs, compute OP_PUSH_TX
 		if needsOpPushTx {
-			opPushTxSig, preimage, ptxErr := ComputeOpPushTxWithCodeSep(signedTx, 0,
-				contractUtxo.Script, contractUtxo.Satoshis, codeSepIdx)
+			opPushTxSig, preimage, ptxErr := ComputeOpPushTxWithSigHash(signedTx, 0,
+				contractUtxo.Script, contractUtxo.Satoshis, codeSepIdx, sigHashType)
 			if ptxErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall: OP_PUSH_TX: %w", ptxErr)
 			}
@@ -1085,8 +1113,8 @@ func (c *RunarContract) PrepareCall(
 		if needsOpPushTx && finalOpPushTxSig != "" {
 			realUnlockingScript = groth16WAWitnessHex + c.buildStatefulPrefix(finalOpPushTxSig, false) + c.BuildUnlockingScript(methodName, resolvedArgs)
 			tmpTx := InsertUnlockingScript(signedTx, 0, realUnlockingScript)
-			finalSig, finalPre, ptxErr := ComputeOpPushTxWithCodeSep(tmpTx, 0,
-				contractUtxo.Script, contractUtxo.Satoshis, codeSepIdx)
+			finalSig, finalPre, ptxErr := ComputeOpPushTxWithSigHash(tmpTx, 0,
+				contractUtxo.Script, contractUtxo.Satoshis, codeSepIdx, sigHashType)
 			if ptxErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall: OP_PUSH_TX for rebuild: %w", ptxErr)
 			}
@@ -1443,6 +1471,22 @@ func (c *RunarContract) GetLockingScript() string {
 	}
 
 	return script
+}
+
+// methodSigHashType resolves the BIP-143 sighash type a method's OP_PUSH_TX
+// preimage must be built under (issue #123). Returns the ABI-declared
+// @sighash mode for the named public method, or the default ALL|FORKID (0x41)
+// when the method carries no directive. Keeps every call/finalize path
+// mode-aware with no call-site churn.
+func (c *RunarContract) methodSigHashType(methodName string) int {
+	if c.Artifact != nil {
+		for _, m := range c.Artifact.ABI.Methods {
+			if m.Name == methodName && m.IsPublic && m.SigHashType != nil {
+				return *m.SigHashType
+			}
+		}
+	}
+	return 0x41
 }
 
 // BuildUnlockingScript builds the unlocking script for a method call.
@@ -1955,10 +1999,13 @@ func (c *RunarContract) prepareCallTerminal(
 	finalPreimage := ""
 
 	termCodeSepIdx := c.getCodeSepIndex(c.findMethodIndex(methodName))
+	// Issue #123: terminal preimages are also built under the method's declared
+	// @sighash mode (default 0x41).
+	termSigHashType := c.methodSigHashType(methodName)
 	if isStateful {
 		// Build stateful terminal unlock with PLACEHOLDER user sigs
 		buildUnlock := func(tx string) (unlock string, opSigHex string, preimageHex string, retErr error) {
-			opSig, preimage, ptxErr := ComputeOpPushTxWithCodeSep(tx, 0, contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx)
+			opSig, preimage, ptxErr := ComputeOpPushTxWithSigHash(tx, 0, contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx, termSigHashType)
 			if ptxErr != nil {
 				return "", "", "", fmt.Errorf("OP_PUSH_TX for terminal: %w", ptxErr)
 			}
@@ -1999,8 +2046,8 @@ func (c *RunarContract) prepareCallTerminal(
 	} else if needsOpPushTx || len(sigIndices) > 0 {
 		// Stateless terminal — keep placeholder sigs
 		if needsOpPushTx {
-			opPushTxSig, preimage, ptxErr := ComputeOpPushTxWithCodeSep(termTx, 0,
-				contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx)
+			opPushTxSig, preimage, ptxErr := ComputeOpPushTxWithSigHash(termTx, 0,
+				contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx, termSigHashType)
 			if ptxErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall terminal: OP_PUSH_TX: %w", ptxErr)
 			}
@@ -2012,8 +2059,8 @@ func (c *RunarContract) prepareCallTerminal(
 		if needsOpPushTx && finalOpPushTxSig != "" {
 			realUnlock = c.buildStatefulPrefix(finalOpPushTxSig, false) + realUnlock
 			tmpTx := InsertUnlockingScript(termTx, 0, realUnlock)
-			finalSig, finalPre, ptxErr := ComputeOpPushTxWithCodeSep(tmpTx, 0,
-				contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx)
+			finalSig, finalPre, ptxErr := ComputeOpPushTxWithSigHash(tmpTx, 0,
+				contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx, termSigHashType)
 			if ptxErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall terminal: OP_PUSH_TX rebuild: %w", ptxErr)
 			}
@@ -2139,6 +2186,10 @@ func readVarintBytes(data []byte, offset int) (uint64, int) {
 // encodeArg encodes an argument value as a Bitcoin Script push data element.
 func encodeArg(value interface{}) string {
 	switch v := value.(type) {
+	case emptySigMarker:
+		// Issue #106: OP_0 — empty signature push for the deliberately-failing
+		// branch of an OR-CHECKSIG method. See EmptySig.
+		return "00"
 	case int64:
 		return encodeScriptNumber(v)
 	case int:
