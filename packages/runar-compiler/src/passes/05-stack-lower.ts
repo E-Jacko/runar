@@ -1112,7 +1112,7 @@ class LoweringContext {
         this.lowerGetStateScript(name);
         break;
       case 'check_preimage':
-        this.lowerCheckPreimage(name, value.preimage, bindingIndex, lastUses);
+        this.lowerCheckPreimage(name, value.preimage, value.sighashFlag, bindingIndex, lastUses);
         break;
       case 'deserialize_state':
         this.lowerDeserializeState(value.preimage, bindingIndex, lastUses);
@@ -3249,6 +3249,7 @@ class LoweringContext {
   private lowerCheckPreimage(
     bindingName: string,
     preimage: string,
+    sighashFlag: number | undefined,
     bindingIndex: number,
     lastUses: Map<string, number>,
   ): void {
@@ -3275,11 +3276,14 @@ class LoweringContext {
     const isLast = this.isLastUse(preimage, bindingIndex, lastUses);
     this.bringToTop(preimage, isLast);
 
-    // Derive + verify the signature on-chain (single opaque raw_bytes blob,
-    // byte-identical across all 7 tiers). Net stack effect is zero: the preimage
-    // is consumed internally as a copy and left on top; OP_CHECKSIGVERIFY aborts
-    // the script unless the binding holds.
-    emitCheckPreimageBindingRaw((op) => this.emitOp(op));
+    // Derive + verify the signature on-chain (single opaque raw_bytes blob).
+    // For the default ALL|FORKID (sighashFlag undefined) the blob is
+    // byte-identical to the pinned cross-tier constant; issue #123 lets a
+    // method declare a different mode, which only changes the appended sighash
+    // flag byte (TS-reference tier only until the 6-tier port lands). Net stack
+    // effect is zero: the preimage is consumed internally as a copy and left on
+    // top; OP_CHECKSIGVERIFY aborts the script unless the binding holds.
+    emitCheckPreimageBindingRaw((op) => this.emitOp(op), sighashFlag);
 
     // The preimage remains on top. Rename to the binding name so field
     // extractors can reference it.

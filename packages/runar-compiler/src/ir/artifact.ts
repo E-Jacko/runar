@@ -39,6 +39,13 @@ export interface ABIMethod {
   isTerminal?: boolean;
   /** True if the unlocking script is prefixed with `_codePart` (issue #100). */
   usesCodePart?: boolean;
+  /**
+   * Issue #123: the BIP-143 sighash type this method's preimage/covenant is
+   * built under (from a `@sighash` directive), e.g. `0x43` for SINGLE|FORKID.
+   * Absent = default `ALL|FORKID` (0x41); the SDK falls back to 0x41 so
+   * existing artifacts are unchanged and older SDKs keep working.
+   */
+  sigHashType?: number;
 }
 
 export interface ABI {
