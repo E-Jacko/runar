@@ -148,6 +148,14 @@ class ANFValue:
     count: int | None = None
     iter_var: str | None = None
     body: list[ANFBinding] | None = None
+    # Iterator start value and step direction (issue #121). The loop is
+    # unrolled ``count`` times; on iteration ``i`` (0-based) the iterator
+    # variable holds ``start + i * step``. Zero-start counting-up loops carry
+    # ``start = 0`` and ``step = 1``, reproducing the historical
+    # ``i = 0..count-1`` lowering byte-for-byte. Countdown loops carry
+    # ``step = -1``.
+    start: int | None = None
+    step: int | None = None
 
     # -- assert, update_prop (value ref), check_preimage -------------------
     value_ref: str | None = None
@@ -307,6 +315,16 @@ def _anf_value_from_dict(d: dict[str, Any]) -> ANFValue:
     v.cond = d.get("cond")
     v.count = d.get("count")
     v.iter_var = d.get("iterVar")
+    # Loop start/step (issue #121). Accept both the JS-style bigint literal
+    # string ("0n") and a plain JSON integer for ``start``; ``step`` is always
+    # a small integer (1 or -1).
+    _start = d.get("start")
+    if isinstance(_start, str) and _start.endswith("n"):
+        v.start = int(_start[:-1])
+    elif _start is not None:
+        v.start = int(_start)
+    if d.get("step") is not None:
+        v.step = int(d.get("step"))
     v.preimage = d.get("preimage")
     v.satoshis = d.get("satoshis")
     v.state_values = d.get("stateValues")

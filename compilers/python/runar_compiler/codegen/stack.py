@@ -963,7 +963,8 @@ class _LoweringContext:
         elif kind == "if":
             self._lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
         elif kind == "loop":
-            self._lower_loop(name, value.count, value.body, value.iter_var, binding_index, last_uses)
+            self._lower_loop(name, value.count, value.body, value.iter_var,
+                             value.start, value.step, binding_index, last_uses)
         elif kind == "assert":
             self._lower_assert(value.value_ref, binding_index, last_uses, False)
         elif kind == "update_prop":
@@ -1710,8 +1711,13 @@ class _LoweringContext:
 
     def _lower_loop(self, binding_name: str, count: int,
                     body: list[ANFBinding], iter_var: str,
+                    start: Optional[int] = None, step: Optional[int] = None,
                     loop_binding_index: Optional[int] = None,
                     enclosing_last_uses: Optional[dict[str, int]] = None) -> None:
+        # Iterator start value and step direction (issue #121). Older ANF
+        # payloads without start/step describe zero-start counting-up loops.
+        start_val = start if start is not None else 0
+        step_val = step if step is not None else 1
         # Collect body binding names
         body_binding_names: dict[str, bool] = {b.name: True for b in body}
 
@@ -1741,7 +1747,11 @@ class _LoweringContext:
         self.local_bindings = new_local_bindings
 
         for i in range(count):
-            self.emit_op(StackOp(op="push", value=big_int_push(i)))
+            # Push the iteration variable value (in case the loop body uses it).
+            # Iteration ``i`` binds ``start + i*step`` (issue #121); zero-start
+            # counting-up loops (start=0, step=1) reduce to ``i``, preserving
+            # the historical byte-for-byte lowering.
+            self.emit_op(StackOp(op="push", value=big_int_push(start_val + i * step_val)))
             self.sm.push(iter_var)
 
             last_uses = compute_last_uses(body)

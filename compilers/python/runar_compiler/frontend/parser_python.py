@@ -1021,9 +1021,15 @@ class _PyParser:
 
         first = self.parse_expression()
 
+        step_expr: Expression | None = None
         if self.match(TOK_COMMA):
             init_expr = first
             limit_expr = self.parse_expression()
+            # Optional third range() argument: the step (issue #121). Only unit
+            # steps (+1 / -1) are supported by the loop model; a negative step
+            # is a countdown (range(3, 0, -1) -> 3, 2, 1).
+            if self.match(TOK_COMMA):
+                step_expr = self.parse_expression()
         else:
             init_expr = BigIntLiteral(value=0)
             limit_expr = first
@@ -1041,16 +1047,28 @@ class _PyParser:
             source_location=loc,
         )
 
+        # A negative literal step means a countdown loop: iterate while
+        # `var > stop` and decrement (issue #121). Any other step (absent, or a
+        # positive literal) counts up with `<` / `i++`, preserving the historical
+        # zero-config `range(n)` / `range(a, b)` behaviour byte-for-byte.
+        is_countdown = _is_negative_literal(step_expr)
+
         condition = BinaryExpr(
-            op="<",
+            op=">" if is_countdown else "<",
             left=Identifier(name=var_name),
             right=limit_expr,
         )
 
-        update = ExpressionStmt(
-            expr=IncrementExpr(operand=Identifier(name=var_name), prefix=False),
-            source_location=loc,
-        )
+        if is_countdown:
+            update = ExpressionStmt(
+                expr=DecrementExpr(operand=Identifier(name=var_name), prefix=False),
+                source_location=loc,
+            )
+        else:
+            update = ExpressionStmt(
+                expr=IncrementExpr(operand=Identifier(name=var_name), prefix=False),
+                source_location=loc,
+            )
 
         return ForStmt(
             init=init_stmt,
@@ -1421,6 +1439,23 @@ def _parse_number(s: str) -> Expression:
     except ValueError:
         val = 0
     return BigIntLiteral(value=val)
+
+
+def _is_negative_literal(expr: Expression | None) -> bool:
+    """True if *expr* is a negative integer literal (``-1``), spelled either as
+    a unary-minus over a literal or a directly-negative BigIntLiteral. Used to
+    detect a countdown ``range(start, stop, -1)`` step (issue #121)."""
+    if expr is None:
+        return False
+    if isinstance(expr, UnaryExpr) and expr.op == "-":
+        return _is_positive_or_zero_literal(expr.operand)
+    if isinstance(expr, BigIntLiteral):
+        return expr.value < 0
+    return False
+
+
+def _is_positive_or_zero_literal(expr: Expression | None) -> bool:
+    return isinstance(expr, BigIntLiteral) and expr.value >= 0
 
 
 # ---------------------------------------------------------------------------

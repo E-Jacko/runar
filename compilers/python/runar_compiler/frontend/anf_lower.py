@@ -823,7 +823,10 @@ class _LowerCtx:
                 self.set_local_alias(then_last.name, if_name)
 
     def _lower_for_statement(self, stmt: ForStmt) -> None:
-        count = _extract_loop_count(stmt)
+        # Resolve the loop's compile-time shape: start value, step direction,
+        # and iteration count. Rúnar requires bounded loops, so all three must
+        # be statically determinable (issue #121).
+        start, step, count = _extract_loop_shape(stmt)
 
         # Lower body into sub-context
         body_ctx = self.sub_context()
@@ -835,6 +838,8 @@ class _LowerCtx:
             count=count,
             body=body_ctx.bindings,
             iter_var=stmt.init.name if stmt.init else "",
+            start=start,
+            step=step,
         ))
 
     # -------------------------------------------------------------------
@@ -1646,43 +1651,84 @@ def _expr_has_add_data_output(expr: Expression | None) -> bool:
 # Loop count extraction
 # ---------------------------------------------------------------------------
 
-def _extract_loop_count(stmt: ForStmt) -> int:
-    # The ANF loop node carries only the count -- no start value or step
-    # direction -- so lowering (and the ANF interpreter) always iterates
-    # i = 0..count-1. Loop shapes that representation cannot express are
-    # rejected here (mirroring the source-located errors in the validator)
-    # rather than silently compiled as a zero-start counting-up loop.
-    #
-    # A countdown loop necessarily also has a non-zero start, so check the
-    # condition direction first -- it is the more precise diagnosis.
-    if isinstance(stmt.condition, BinaryExpr):
-        if stmt.condition.op in (">", ">="):
-            raise ValueError(
-                "For loop condition must count up with '<' or '<=' "
-                "— countdown loops are not supported; iterate i = 0..N-1 "
-                "and index backwards instead."
-            )
+def _extract_loop_shape(stmt: ForStmt) -> tuple[int, int, int]:
+    """Resolve a for-statement's compile-time loop shape (issue #121).
 
-    start_val = _extract_bigint_value(stmt.init.init if stmt.init else None)
+    Supports counting-up and counting-down loops::
 
-    if start_val is not None and start_val != 0:
+        for (let i = 0n; i < 10n; i++)     -> start 0,  step +1, count 10
+        for (let i = 1n; i <= 3n; i++)     -> start 1,  step +1, count 3
+        for (let i = 3n; i > 0n; i--)      -> start 3,  step -1, count 3
+        for (let i = 3n; i >= 1n; i--)     -> start 3,  step -1, count 3
+
+    The loop is unrolled ``count`` times; on iteration ``i`` the iterator holds
+    ``start + i * step``. Start and bound must be compile-time integer literals.
+
+    Returns ``(start, step, count)``.
+    """
+    start = _extract_bigint_value(stmt.init.init if stmt.init else None)
+    if start is None:
         raise ValueError(
-            f"For loop iterator must start at 0 (got {start_val}n) "
-            "— loops compile to i = 0..count-1; offset the iterator "
-            "inside the body instead."
+            "Cannot determine loop start at compile time. For-loop iterators "
+            "must start at an integer literal."
         )
 
+    if not isinstance(stmt.condition, BinaryExpr):
+        raise ValueError(
+            "Cannot determine loop bound at compile time. For-loop bounds must "
+            "be integer literals."
+        )
+    op = stmt.condition.op
+    bound = _extract_bigint_value(stmt.condition.right)
+    if bound is None:
+        raise ValueError(
+            "Cannot determine loop bound at compile time. For-loop bounds must "
+            "be integer literals."
+        )
+
+    step = _extract_loop_step(stmt)
+
+    # Count = number of iterations before the condition first turns false.
+    if step == 1:
+        if op == "<":
+            count = bound - start
+        elif op == "<=":
+            count = bound - start + 1
+        else:
+            raise ValueError(
+                f"For loop counting up (i++) must use '<' or '<=' (got '{op}')."
+            )
+    else:
+        if op == ">":
+            count = start - bound
+        elif op == ">=":
+            count = start - bound + 1
+        else:
+            raise ValueError(
+                f"For loop counting down (i--) must use '>' or '>=' (got '{op}')."
+            )
+
+    return start, step, max(0, count)
+
+
+def _extract_loop_step(stmt: ForStmt) -> int:
+    """Determine the iterator step direction (+1 / -1) from the for-statement's
+    update clause, falling back to the condition direction. Only unit steps are
+    supported; a non-unit update (e.g. ``i += 2``) is out of the loop model.
+    """
+    update = stmt.update
+    if isinstance(update, ExpressionStmt):
+        e = update.expr
+        if isinstance(e, IncrementExpr):
+            return 1
+        if isinstance(e, DecrementExpr):
+            return -1
+    # Fall back to the comparison direction for other unit-step spellings
+    # (e.g. ``i = i + 1n``): ``<``/``<=`` counts up, ``>``/``>=`` counts down.
     if isinstance(stmt.condition, BinaryExpr):
-        bound_val = _extract_bigint_value(stmt.condition.right)
-
-        if bound_val is not None:
-            op = stmt.condition.op
-            if op == "<":
-                return max(0, bound_val)
-            if op == "<=":
-                return max(0, bound_val + 1)
-
-    return 0
+        if stmt.condition.op in (">", ">="):
+            return -1
+    return 1
 
 
 def _extract_bigint_value(expr: Expression | None) -> int | None:
@@ -1927,6 +1973,8 @@ def _remap_value_refs(value: ANFValue, name_map: dict[str, str]) -> ANFValue:
     new_v.else_ = value.else_
     new_v.count = value.count
     new_v.iter_var = value.iter_var
+    new_v.start = value.start
+    new_v.step = value.step
     new_v.body = value.body
     new_v.value_ref = r(value.value_ref)
     new_v.preimage = r(value.preimage)

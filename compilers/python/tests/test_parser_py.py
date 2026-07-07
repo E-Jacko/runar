@@ -136,3 +136,49 @@ class TestPyRejection:
         source = "class (SmartContract):\n    pass\n"
         result = parse_source(source, "bad.runar.py")
         assert result.contract is None or len(result.errors) > 0
+
+
+class TestPyRangeLoops:
+    """range() -> ForStmt lowering, including the countdown step (issue #121)."""
+
+    def _unlock_for(self, body: str):
+        from runar_compiler.frontend.ast_nodes import ForStmt
+        source = (
+            "from runar import SmartContract, Bigint, public, assert_\n\n"
+            "class C(SmartContract):\n"
+            "    target: Bigint\n\n"
+            "    def __init__(self, target: Bigint):\n"
+            "        super().__init__(target)\n"
+            "        self.target = target\n\n"
+            "    @public\n"
+            "    def unlock(self) -> None:\n"
+            "        acc: Bigint = 0\n"
+            f"{body}"
+            "        assert_(acc > 0)\n"
+        )
+        result = parse_source(source, "C.runar.py")
+        assert result.errors == [], result.error_strings()
+        c = result.contract
+        assert c is not None
+        unlock = next(m for m in c.methods if m.name == "unlock")
+        return next(s for s in unlock.body if isinstance(s, ForStmt))
+
+    def test_range_single_arg_counts_up_from_zero(self):
+        loop = self._unlock_for("        for i in range(3):\n            acc = acc + i\n")
+        assert loop.init.init.value == 0
+        assert loop.condition.op == "<"
+        assert loop.condition.right.value == 3
+
+    def test_range_two_arg_nonzero_start(self):
+        loop = self._unlock_for("        for i in range(2, 6):\n            acc = acc + i\n")
+        assert loop.init.init.value == 2
+        assert loop.condition.op == "<"
+        assert loop.condition.right.value == 6
+
+    def test_range_countdown_step(self):
+        from runar_compiler.frontend.ast_nodes import DecrementExpr
+        loop = self._unlock_for("        for j in range(4, 0, -1):\n            acc = acc + j\n")
+        assert loop.init.init.value == 4
+        assert loop.condition.op == ">"
+        assert loop.condition.right.value == 0
+        assert isinstance(loop.update.expr, DecrementExpr)

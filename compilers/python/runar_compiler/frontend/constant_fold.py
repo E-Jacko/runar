@@ -502,6 +502,8 @@ def _fold_value(value: ANFValue, env: ConstEnv) -> ANFValue:
             count=value.count,
             body=folded_body,
             iter_var=value.iter_var,
+            start=value.start,
+            step=value.step,
         )
 
     if kind == "raw_script":

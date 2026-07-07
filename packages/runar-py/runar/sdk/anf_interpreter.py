@@ -812,9 +812,15 @@ def _eval_value(
         count = value.get('count', 0)
         body = value.get('body', [])
         iter_var = value.get('iterVar', '')
+        # Iteration ``i`` binds ``iterVar = start + i*step`` (issue #121). Older
+        # ANF payloads without start/step describe zero-start counting-up loops.
+        start = value.get('start', 0)
+        if isinstance(start, str) and start.endswith('n'):
+            start = int(start[:-1])
+        step = value.get('step', 1)
         last_val = None
         for i in range(count):
-            env[iter_var] = i
+            env[iter_var] = start + i * step
             loop_env = dict(env)
             _eval_bindings(
                 body, loop_env, state_delta, data_outputs, raw_outputs, anf, strict,
