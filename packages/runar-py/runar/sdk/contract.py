@@ -510,6 +510,11 @@ class RunarContract:
         # Compute code separator index for this method
         code_sep_idx = self._get_code_sep_index(self._find_method_index(method_name))
 
+        # Issue #123: build every preimage for this call under the method's
+        # declared @sighash mode (default 0x41). A method with no directive
+        # carries no sigHashType → falls back to 0x41 (unchanged behaviour).
+        method_sig_hash_type = self._method_sig_hash_type(method_name)
+
         # Compute change PKH for stateful methods that need it
         change_pkh_hex = ''
         if is_stateful and method_needs_change:
@@ -779,7 +784,7 @@ class RunarContract:
             # keeps placeholder Sig params.  For input_idx>0 (extra), signs
             # with signer.
             def _build_stateful_unlock(tx: str, input_idx: int, subscript: str, sats: int, args_override: list | None = None, tx_change_amount: int = 0, pi: list[int] | None = None) -> tuple[str, str, str]:
-                op_sig, preimage = compute_op_push_tx(tx, input_idx, subscript, sats, code_sep_idx)
+                op_sig, preimage = compute_op_push_tx(tx, input_idx, subscript, sats, code_sep_idx, method_sig_hash_type)
                 base_args = args_override if args_override is not None else resolved_args
                 input_args = list(base_args)
                 # Only sign Sig params for extra inputs, not the primary
@@ -903,6 +908,7 @@ class RunarContract:
             if needs_op_push_tx:
                 sig_hex, preimage_hex = compute_op_push_tx(
                     signed_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+                    method_sig_hash_type,
                 )
                 final_op_push_tx_sig = sig_hex
                 resolved_args[preimage_index] = preimage_hex
@@ -913,6 +919,7 @@ class RunarContract:
                 tmp_tx = insert_unlocking_script(signed_tx, 0, real_unlocking_script)
                 final_sig, final_pre = compute_op_push_tx(
                     tmp_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+                    method_sig_hash_type,
                 )
                 resolved_args[preimage_index] = final_pre
                 final_op_push_tx_sig = final_sig
@@ -1287,11 +1294,13 @@ class RunarContract:
         final_preimage = ''
 
         term_code_sep_idx = self._get_code_sep_index(self._find_method_index(method_name))
+        # Issue #123: terminal preimages also honour the declared @sighash mode.
+        term_sig_hash_type = self._method_sig_hash_type(method_name)
 
         if is_stateful:
             # Build stateful terminal unlock with PLACEHOLDER user sigs
             def build_stateful_terminal_unlock(tx: str) -> tuple[str, str, str]:
-                op_sig, preimage = compute_op_push_tx(tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx)
+                op_sig, preimage = compute_op_push_tx(tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx, term_sig_hash_type)
                 # Keep placeholder Sig params (don't sign for primary)
                 args_hex = ''
                 for arg in resolved_args:
@@ -1325,6 +1334,7 @@ class RunarContract:
             if needs_op_push_tx:
                 sig_hex, preimage_hex = compute_op_push_tx(
                     term_tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx,
+                    term_sig_hash_type,
                 )
                 final_op_push_tx_sig = sig_hex
                 resolved_args[preimage_index] = preimage_hex
@@ -1336,6 +1346,7 @@ class RunarContract:
                 tmp_tx = insert_unlocking_script(term_tx, 0, real_unlock)
                 final_sig, final_pre = compute_op_push_tx(
                     tmp_tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx,
+                    term_sig_hash_type,
                 )
                 resolved_args[preimage_index] = final_pre
                 final_op_push_tx_sig = final_sig
@@ -1568,6 +1579,17 @@ class RunarContract:
 
     def _get_public_methods(self):
         return [m for m in self.artifact.abi.methods if m.is_public]
+
+    def _method_sig_hash_type(self, method_name: str) -> int:
+        """Issue #123: resolve the BIP-143 sighash type for ``method_name`` from
+        the ABI (default 0x41 = ALL|FORKID). Drives both the OP_PUSH_TX binding
+        derivation and the SDK-built BIP-143 preimage so they commit to the same
+        fields the on-chain covenant expects.
+        """
+        for m in self.artifact.abi.methods:
+            if m.name == method_name:
+                return m.sig_hash_type if m.sig_hash_type is not None else 0x41
+        return 0x41
 
 
 # ---------------------------------------------------------------------------

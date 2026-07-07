@@ -20,6 +20,7 @@ from runar_compiler.frontend.ast_nodes import (
 )
 from runar_compiler.frontend.parser_dispatch import ParseResult
 from runar_compiler.frontend.diagnostic import Diagnostic, Severity
+from runar_compiler.frontend.sighash_directive import extract_sighash_directive
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,10 @@ TOK_ARROW = 45        # =>
 # identifier like ``embedAlwaysFlag`` does not trip it), mirroring the TS
 # `/@embedAlways\b/` scan.
 _EMBED_ALWAYS_RE = re.compile(r"@embedAlways\b")
+
+# Issue #123: `@sighash` comment directive token (word-boundary anchored),
+# mirroring the TS `/@sighash\b/` scan.
+_SIGHASH_TOKEN_RE = re.compile(r"@sighash\b")
 
 
 class Token:
@@ -746,13 +751,46 @@ class _TsParser:
 
         body = self._parse_block()
 
+        # Issue #123: `/** @sighash <FLAGS> */` (or `// @sighash ...`) directive
+        # in the method's leading trivia → per-method BIP-143 sighash type.
+        sighash_type = self._parse_sighash_directive(leading, name, visibility)
+
         return MethodNode(
             name=name,
             params=params,
             body=body,
             visibility=visibility,
+            sighash_type=sighash_type,
             source_location=location,
         )
+
+    def _parse_sighash_directive(
+        self, leading: str, name: str, visibility: str,
+    ) -> int | None:
+        """Detect + parse a ``@sighash`` directive on a method (issue #123).
+
+        Returns the numeric BIP-143 sighash type, or ``None`` when no directive
+        is present. Pushes an error for a malformed flag list or a directive on
+        a non-public method (only public methods are spending entry points, so a
+        ``@sighash`` on a private helper is meaningless).
+        """
+        if not _SIGHASH_TOKEN_RE.search(leading):
+            return None
+
+        if visibility != "public":
+            self.add_error(
+                f"@sighash directive on non-public method '{name}' has no effect "
+                f"— only public methods are spending entry points"
+            )
+            return None
+
+        result = extract_sighash_directive(leading)
+        if result is None:
+            return None
+        if result.error is not None:
+            self.add_error(f"Method '{name}': {result.error}")
+            return None
+        return result.value
 
     # -- Parameters ----------------------------------------------------------
 

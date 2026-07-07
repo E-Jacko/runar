@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from runar_compiler.ir.types import ANFProgram
+from runar_compiler.frontend.sighash_directive import SIGHASH_DEFAULT as _SIGHASH_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,10 @@ class ABIMethod:
     is_terminal: bool | None = None
     # Unlocking script is prefixed with _codePart (issue #100).
     uses_code_part: bool | None = None
+    # Issue #123: BIP-143 sighash type from a @sighash directive (e.g. 0x43 for
+    # SINGLE|FORKID). ``None`` = default ALL|FORKID (0x41); the SDK falls back to
+    # 0x41 so existing artifacts are unchanged and older SDKs keep working.
+    sig_hash_type: int | None = None
 
 
 @dataclass
@@ -749,12 +754,20 @@ def _assemble_artifact(
                 if getattr(sm, "name", None) == method.name and getattr(sm, "uses_code_part", False):
                     uses_code_part = True
                     break
+        # Issue #123: carry a non-default @sighash mode into the ABI so the SDK
+        # builds the BIP-143 preimage under the same flags the covenant expects.
+        # Omitted for the default (0x41) → existing artifacts are byte-identical.
+        sig_hash_type: int | None = None
+        m_sig = getattr(method, "sighash_type", None)
+        if method.is_public and m_sig is not None and m_sig != _SIGHASH_DEFAULT:
+            sig_hash_type = m_sig
         methods.append(ABIMethod(
             name=method.name,
             params=params,
             is_public=method.is_public,
             is_terminal=is_terminal,
             uses_code_part=uses_code_part,
+            sig_hash_type=sig_hash_type,
         ))
 
     cs_index = code_separator_index if code_separator_index >= 0 else None
@@ -841,6 +854,7 @@ def artifact_to_json(artifact: Artifact) -> str:
                     "isPublic": m.is_public,
                     **({"isTerminal": m.is_terminal} if m.is_terminal is not None else {}),
                     **({"usesCodePart": m.uses_code_part} if m.uses_code_part is not None else {}),
+                    **({"sigHashType": m.sig_hash_type} if getattr(m, "sig_hash_type", None) is not None else {}),
                 }
                 for m in artifact.abi.methods
             ],
@@ -971,6 +985,10 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
             d["isAutoInjectedStateCheck"] = True
         if v.preimage is not None:
             d["preimage"] = v.preimage
+        # Issue #123: non-default @sighash flag on a check_preimage node. Omitted
+        # for the default (None) so existing ANF is byte-identical.
+        if v.kind == "check_preimage" and v.sighash_flag is not None:
+            d["sighashFlag"] = v.sighash_flag
         if v.satoshis is not None:
             d["satoshis"] = v.satoshis
         if v.state_values is not None:
@@ -1005,6 +1023,10 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
                 "params": [{"name": p.name, "type": p.type} for p in m.params],
                 "body": [_ser_binding(b) for b in m.body],
                 "isPublic": m.is_public,
+                # Omit the default (and None) so explicit ``@sighash ALL|FORKID``
+                # and no-directive produce byte-identical ANF (zero golden churn).
+                **({"sigHashType": m.sighash_type}
+                   if getattr(m, "sighash_type", None) not in (None, _SIGHASH_DEFAULT) else {}),
             }
             for m in program.methods
         ],

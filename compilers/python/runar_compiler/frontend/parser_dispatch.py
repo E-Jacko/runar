@@ -1,36 +1,12 @@
 """Parser dispatch — routes source files to the appropriate format parser."""
 
 from __future__ import annotations
-import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from runar_compiler.frontend.ast_nodes import ContractNode
 
 from runar_compiler.frontend.diagnostic import Diagnostic, Severity
-
-
-# Author-facing comment directive still fail-closed here: ``@sighash <FLAGS>``
-# (#123, per-method sighash type). ``@embedAlways`` (#109) is now supported by
-# the Python TS-surface parser, so it is no longer guarded. Word-boundary
-# anchored to mirror the TS ``/@sighash\b/`` scan so an identifier like
-# ``sighashType`` does not trip the guard.
-_SIGHASH_DIRECTIVE_RE = re.compile(r"@sighash\b")
-
-
-def _unsupported_directive_error(source: str) -> str | None:
-    """Return a fail-closed diagnostic message when ``source`` carries a
-    directive this compiler does not yet honour, else ``None``. The Python
-    frontend ignores comments, so silently dropping the ``@sighash`` directive
-    would change signing semantics — reject rather than diverge until the port
-    lands.
-    """
-    if _SIGHASH_DIRECTIVE_RE.search(source):
-        return (
-            "@sighash directive is not yet supported by the Python compiler "
-            "(issue #123); compile the contract with the TypeScript compiler"
-        )
-    return None
 
 
 class ParseResult:
@@ -52,13 +28,6 @@ def parse_source(source: str, file_name: str) -> ParseResult:
     # :class:`SourceSizeExceededError` on rejection. BUG-008 follow-up.
     from runar_compiler.frontend.input_limits import assert_source_bytes_under_limit
     assert_source_bytes_under_limit(source)
-
-    directive_error = _unsupported_directive_error(source)
-    if directive_error is not None:
-        return ParseResult(errors=[Diagnostic(
-            message=directive_error,
-            severity=Severity.ERROR,
-        )])
 
     lower = file_name.lower()
 
