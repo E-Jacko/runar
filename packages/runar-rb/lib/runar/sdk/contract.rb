@@ -172,12 +172,15 @@ module Runar
           locking_script, utxos, opts.satoshis, change_address, change_script, fee_rate: fee_rate
         )
 
-        # Sign all P2PKH funding inputs.
+        # Sign all P2PKH funding inputs. Funding inputs are signed by
+        # funding_signer when set (#134): the deploy signer may not own the
+        # funding coins. Defaults to the connected signer.
+        funding_signer = opts.funding_signer || signer
         signed_tx = tx_hex
-        pub_key   = signer.get_public_key
+        pub_key   = funding_signer.get_public_key
         input_count.times do |i|
           utxo      = utxos[i]
-          sig       = signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
+          sig       = funding_signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
           unlock    = State.encode_push_data(sig) + State.encode_push_data(pub_key)
           signed_tx = SDK.insert_unlocking_script(signed_tx, i, unlock)
         end
@@ -386,6 +389,9 @@ module Runar
         address        = signer.get_address
         opts           = options || CallOptions.new
         change_address = opts.change_address.to_s.empty? ? address : opts.change_address
+        # Funding (and terminal fee) inputs are signed by funding_signer when
+        # set (#134). The method's own Sig args stay with the connected signer.
+        funding_signer = opts.funding_signer || signer
 
         extra_input_count = Array(opts.additional_contract_inputs).length
         estimated_inputs  = 1 + extra_input_count + 1
@@ -592,7 +598,7 @@ module Runar
         )
 
         p2pkh_start_idx = 1 + extra_contract_utxos.length
-        signed_tx = sign_funding_inputs(tx_hex, additional_utxos, signer, p2pkh_start_idx)
+        signed_tx = sign_funding_inputs(tx_hex, additional_utxos, funding_signer, p2pkh_start_idx)
 
         signed_tx, change_amount, final_op_push_tx_sig, final_preimage =
           compute_preimage_passes(
@@ -610,6 +616,7 @@ module Runar
             intent_witness_hex: intent_witness_hex,
             locktime: opts.locktime,
             sequence: opts.sequence,
+            funding_signer: funding_signer,
             method_uses_code_part: method_uses_code_part
           )
 
@@ -1204,6 +1211,7 @@ module Runar
         intent_witness_hex: '',
         locktime: nil,
         sequence: nil,
+        funding_signer: nil,
         method_uses_code_part: nil
       )
         final_op_push_tx_sig = ''
@@ -1225,6 +1233,7 @@ module Runar
               intent_witness_hex: intent_witness_hex,
               locktime: locktime,
               sequence: sequence,
+              funding_signer: funding_signer,
               method_uses_code_part: method_uses_code_part
             )
 
@@ -1263,9 +1272,14 @@ module Runar
         intent_witness_hex: '',
         locktime: nil,
         sequence: nil,
+        funding_signer: nil,
         method_uses_code_part: nil
       )
-        pub_key     = signer.get_public_key
+        # Funding inputs are signed by funding_signer when set (#134); the
+        # method's own Sig args (for extra contract inputs, below) stay with the
+        # connected signer. Defaults to the connected signer.
+        fund_signer = funding_signer || signer
+        pub_key     = fund_signer.get_public_key
         p2pkh_start = 1 + extra_contract_utxos.length
 
         call_opts = {}
@@ -1318,7 +1332,7 @@ module Runar
           fee_rate: fee_rate,
           options: rebuild_opts.empty? ? nil : rebuild_opts
         )
-        signed_tx = sign_funding_inputs(tx_hex, additional_utxos, signer, p2pkh_start)
+        signed_tx = sign_funding_inputs(tx_hex, additional_utxos, fund_signer, p2pkh_start)
 
         # Second pass — stable preimage with finalised TX layout.
         final_unlock, op_sig, preimage = build_stateful_unlock(
@@ -1360,9 +1374,10 @@ module Runar
           signed_tx = SDK.insert_unlocking_script(signed_tx, i + 1, extra_unlock)
         end
 
-        # Re-sign P2PKH inputs after second-pass rebuild.
+        # Re-sign P2PKH funding inputs after second-pass rebuild (with
+        # fund_signer — #134).
         additional_utxos.each_with_index do |utxo, i|
-          sig    = signer.sign(signed_tx, p2pkh_start + i, utxo.script, utxo.satoshis)
+          sig    = fund_signer.sign(signed_tx, p2pkh_start + i, utxo.script, utxo.satoshis)
           unlock = State.encode_push_data(sig) + State.encode_push_data(pub_key)
           signed_tx = SDK.insert_unlocking_script(signed_tx, p2pkh_start + i, unlock)
         end

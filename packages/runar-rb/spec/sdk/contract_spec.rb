@@ -426,6 +426,55 @@ RSpec.describe Runar::SDK::RunarContract do
   end
 
   # ---------------------------------------------------------------------------
+  # funding_signer — sign funding inputs with a distinct key (issue #134)
+  # ---------------------------------------------------------------------------
+
+  describe 'funding_signer (#134)' do
+    METHOD_PUB  = "02#{'aa' * 32}"
+    FUNDING_PUB = "02#{'bb' * 32}"
+    METHOD_ADDR = ('aa' * 20)
+
+    let(:method_signer)  { Runar::SDK::MockSigner.new(pub_key_hex: METHOD_PUB, address: METHOD_ADDR) }
+    let(:funding_signer) { Runar::SDK::MockSigner.new(pub_key_hex: FUNDING_PUB, address: 'bb' * 20) }
+    let(:provider)       { mock_provider }
+
+    before do
+      provider.add_utxo(METHOD_ADDR,
+                        make_utxo('ee' * 32, 1_000_000, script: "76a914#{METHOD_ADDR}88ac"))
+    end
+
+    it 'deploy signs funding inputs with funding_signer, pushing its pubkey' do
+      contract = described_class.new(stateful_anf_artifact, [5])
+      contract.deploy(provider, method_signer,
+                      Runar::SDK::DeployOptions.new(satoshis: 1_000, funding_signer: funding_signer))
+      deploy_tx = provider.get_broadcasted_txs.last
+      expect(deploy_tx).to include(FUNDING_PUB)
+      expect(deploy_tx).not_to include(METHOD_PUB)
+    end
+
+    it 'deploy defaults to the connected signer when funding_signer is unset' do
+      contract = described_class.new(stateful_anf_artifact, [5])
+      contract.deploy(provider, method_signer, Runar::SDK::DeployOptions.new(satoshis: 1_000))
+      deploy_tx = provider.get_broadcasted_txs.last
+      expect(deploy_tx).to include(METHOD_PUB)
+    end
+
+    it 'call signs funding inputs with funding_signer, pushing its pubkey' do
+      contract = described_class.new(stateful_anf_artifact, [5])
+      contract.connect(provider, method_signer)
+      contract.instance_variable_set(
+        :@current_utxo,
+        Runar::SDK::Utxo.new(txid: 'cc' * 32, output_index: 0,
+                             satoshis: 10_000, script: contract.get_locking_script)
+      )
+      contract.call('increment', [], nil, nil,
+                    Runar::SDK::CallOptions.new(funding_signer: funding_signer))
+      call_tx = provider.get_broadcasted_txs.last
+      expect(call_tx).to include(FUNDING_PUB)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # #call funding selection (issue #133)
   # ---------------------------------------------------------------------------
 

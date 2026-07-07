@@ -215,8 +215,11 @@ module Runar
     end
 
     # Options for deploying a contract.
-    DeployOptions = Struct.new(:satoshis, :change_address, keyword_init: true) do
-      def initialize(satoshis: 10_000, change_address: '')
+    DeployOptions = Struct.new(:satoshis, :change_address, :funding_signer, keyword_init: true) do
+      def initialize(satoshis: 10_000, change_address: '', funding_signer: nil)
+        # funding_signer (#134): signs the P2PKH funding inputs when the deploy
+        # funding UTXOs are owned by a different key than the connected deploy
+        # signer. nil → the connected signer (zero behaviour change).
         super
       end
     end
@@ -251,6 +254,7 @@ module Runar
       :locktime,
       :sequence,
       :max_funding_inputs,
+      :funding_signer,
       keyword_init: true
     ) do
       def initialize(
@@ -279,7 +283,13 @@ module Runar
         # selection (the same select_utxos strategy deploy uses). If covering
         # outputs + fee would need more inputs than this, the call raises rather
         # than silently sweeping the wallet. nil → no cap.
-        max_funding_inputs: nil
+        max_funding_inputs: nil,
+        # Signer for the P2PKH funding (and terminal fee) inputs (#134). When
+        # the funding/fee UTXOs are owned by a different key than the connected
+        # method signer, set this so those inputs are signed by their real
+        # owner. The method's own Sig args are still signed by the connected
+        # signer. nil → the connected signer (zero behaviour change).
+        funding_signer: nil
       )
         super
       end
