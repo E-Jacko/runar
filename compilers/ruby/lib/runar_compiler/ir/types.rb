@@ -116,6 +116,13 @@ module RunarCompiler
                     :count,
                     :iter_var,
                     :body,
+                    # Iterator start value (Integer) and step direction
+                    # (+1 / -1) for non-zero-start & countdown loops (#121).
+                    # On iteration +i+ the iterator holds +start + i*step+.
+                    # Zero-start counting-up loops carry start=0, step=1,
+                    # reproducing the historical i = 0..count-1 lowering.
+                    :start,
+                    :step,
                     # -- assert, update_prop (value ref), check_preimage ---
                     :value_ref,
                     # -- check_preimage, deserialize_state -----------------
@@ -163,6 +170,8 @@ module RunarCompiler
         @count = nil
         @iter_var = nil
         @body = nil
+        @start = nil
+        @step = nil
         @value_ref = nil
         @preimage = nil
         @satoshis = nil
@@ -311,6 +320,11 @@ module RunarCompiler
       v.cond        = d["cond"]
       v.count       = d["count"]
       v.iter_var    = d["iterVar"]
+      # Loop start/step (#121). start is serialized as a JS-style "Nn" bigint
+      # string; decode it to a Ruby Integer so stack lowering / the interpreter
+      # can compute start + i*step. step is a plain integer (+1 / -1).
+      v.start       = _decode_loop_start(d["start"]) if d.key?("start")
+      v.step        = d["step"]
       v.preimage    = d["preimage"]
       v.satoshis    = d["satoshis"]
       v.state_values = d["stateValues"]
@@ -335,6 +349,20 @@ module RunarCompiler
       v
     end
     private_class_method :_anf_value_from_hash
+
+    # Decode a loop `start` field (#121). Accepts a JS-style "Nn" bigint
+    # string (the canonical serialization), a plain JSON integer, or nil
+    # (older payloads with no start → zero-start counting-up loop).
+    def self._decode_loop_start(raw)
+      return 0 if raw.nil?
+      return raw if raw.is_a?(Integer)
+      if raw.is_a?(String)
+        return raw[0..-2].to_i if decimal_bigint_literal?(raw)
+        return raw.to_i if raw.match?(/\A-?\d+\z/)
+      end
+      0
+    end
+    private_class_method :_decode_loop_start
 
     def self._anf_binding_from_hash(d)
       ANFBinding.new(

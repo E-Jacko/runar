@@ -941,7 +941,10 @@ module RunarCompiler
 
       # @param stmt [ForStmt]
       def _lower_for_statement(stmt)
-        count = Frontend._extract_loop_count(stmt)
+        # Resolve the loop's compile-time shape: start value, step direction,
+        # and iteration count. Non-zero starts and countdown loops are
+        # supported (#121) — on iteration i the iterator holds start + i*step.
+        shape = Frontend._extract_loop_shape(stmt)
 
         # Lower body into sub-context
         body_ctx = sub_context
@@ -949,9 +952,11 @@ module RunarCompiler
         sync_counter(body_ctx)
 
         emit(IR::ANFValue.new(kind: "loop").tap do |v|
-          v.count = count
+          v.count = shape[:count]
           v.body = body_ctx.bindings
           v.iter_var = stmt.init ? stmt.init.name : ""
+          v.start = shape[:start]
+          v.step = shape[:step]
         end)
       end
 
@@ -1809,45 +1814,80 @@ module RunarCompiler
     private_class_method :_expr_has_add_data_output
 
     # -------------------------------------------------------------------
-    # Loop count extraction
+    # Loop shape extraction (#121)
     # -------------------------------------------------------------------
 
+    # Resolve a for-statement's compile-time loop shape: start value, step
+    # direction, and iteration count. Supports counting-up and counting-down
+    # loops:
+    #   for (let i = 0n; i < 10n; i++)  -> start 0, step +1, count 10
+    #   for (let i = 1n; i <= 3n; i++)  -> start 1, step +1, count 3
+    #   for (let i = 3n; i > 0n; i--)   -> start 3, step -1, count 3
+    #   for (let i = 3n; i >= 1n; i--)  -> start 3, step -1, count 3
+    #
+    # The loop is unrolled +count+ times; on iteration +i+ the iterator holds
+    # +start + i*step+. Start and bound must be compile-time integer literals.
+    #
     # @param stmt [ForStmt]
-    # @return [Integer]
-    def self._extract_loop_count(stmt)
-      # The ANF loop node carries only the count -- no start value or step
-      # direction -- so lowering (and the ANF interpreter) always iterates
-      # i = 0..count-1. Loop shapes that representation cannot express are
-      # rejected here (mirroring the source-located errors in the validator)
-      # rather than silently compiled as a zero-start counting-up loop.
-      #
-      # A countdown loop necessarily also has a non-zero start, so check the
-      # condition direction first -- it is the more precise diagnosis.
-      if stmt.condition.is_a?(BinaryExpr)
-        op = stmt.condition.op
-        if op == ">" || op == ">="
-          raise "For loop condition must count up with '<' or '<=' — countdown loops are not supported; " \
-                "iterate i = 0..N-1 and index backwards instead."
+    # @return [Hash] { start: Integer, step: Integer, count: Integer }
+    def self._extract_loop_shape(stmt)
+      start = _extract_bigint_value(stmt.init&.init)
+      if start.nil?
+        raise "Cannot determine loop start at compile time. " \
+              "For-loop iterators must start at an integer literal."
+      end
+
+      unless stmt.condition.is_a?(BinaryExpr)
+        raise "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+      end
+      op = stmt.condition.op
+      bound = _extract_bigint_value(stmt.condition.right)
+      if bound.nil?
+        raise "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+      end
+
+      step = _extract_loop_step(stmt)
+
+      # Count = number of iterations before the condition first turns false.
+      if step == 1
+        case op
+        when "<"  then count = bound - start
+        when "<=" then count = bound - start + 1
+        else
+          raise "For loop counting up (i++) must use '<' or '<=' (got '#{op}')."
+        end
+      else
+        case op
+        when ">"  then count = start - bound
+        when ">=" then count = start - bound + 1
+        else
+          raise "For loop counting down (i--) must use '>' or '>=' (got '#{op}')."
         end
       end
 
-      start_val = _extract_bigint_value(stmt.init&.init)
+      { start: start, step: step, count: [0, count].max }
+    end
 
-      if !start_val.nil? && start_val != 0
-        raise "For loop iterator must start at 0 (got #{start_val}n) — " \
-              "loops compile to i = 0..count-1; offset the iterator inside the body instead."
+    # Determine the iterator step direction (+1 / -1) from the for-statement's
+    # update clause, falling back to the condition direction. Only unit steps
+    # are supported.
+    #
+    # @param stmt [ForStmt]
+    # @return [Integer] +1 or -1
+    def self._extract_loop_step(stmt)
+      update = stmt.update
+      if update.is_a?(ExpressionStmt)
+        e = update.expr
+        return 1 if e.is_a?(IncrementExpr)
+        return -1 if e.is_a?(DecrementExpr)
       end
-
+      # Fall back to the comparison direction for other unit-step spellings
+      # (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
       if stmt.condition.is_a?(BinaryExpr)
         op = stmt.condition.op
-        bound_val = _extract_bigint_value(stmt.condition.right)
-        if bound_val
-          return [0, bound_val].max if op == "<"
-          return [0, bound_val + 1].max if op == "<="
-        end
+        return -1 if op == ">" || op == ">="
       end
-
-      0
+      1
     end
 
     # @param expr [Expression, nil]
@@ -2141,6 +2181,8 @@ module RunarCompiler
       new_v.count = v.count
       new_v.iter_var = v.iter_var
       new_v.body = v.body
+      new_v.start = v.start
+      new_v.step = v.step
       new_v.value_ref = v.value_ref
       new_v.preimage = v.preimage
       new_v.satoshis = v.satoshis

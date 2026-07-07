@@ -1158,7 +1158,7 @@ module RunarCompiler::Codegen
       when "if"
         _lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
       when "loop"
-        _lower_loop(name, value.count, value.body, value.iter_var, binding_index, last_uses)
+        _lower_loop(name, value.count, value.body, value.iter_var, value.start, value.step, binding_index, last_uses)
       when "check_preimage"
         _lower_check_preimage(name, value.preimage, binding_index, last_uses)
       when "deserialize_state"
@@ -2001,9 +2001,13 @@ module RunarCompiler::Codegen
     # loop
     # -----------------------------------------------------------------
 
-    def _lower_loop(binding_name, count, body, iter_var, loop_binding_index = nil, enclosing_last_uses = nil)
+    def _lower_loop(binding_name, count, body, iter_var, start = 0, step = 1, loop_binding_index = nil, enclosing_last_uses = nil)
       body ||= []
       count ||= 0
+      # Iteration i binds iterVar = start + i*step (#121). Older ANF payloads
+      # without start/step describe zero-start counting-up loops.
+      start ||= 0
+      step ||= 1
 
       # Names (re)defined anywhere inside the loop body, nested branches
       # included. A name the body itself binds is NOT an outer ref --
@@ -2036,7 +2040,10 @@ module RunarCompiler::Codegen
       @local_bindings = new_local_bindings
 
       count.times do |i|
-        emit_push_int(i)
+        # Push the iteration variable value (in case the loop body uses it).
+        # Iteration i binds start + i*step (#121); zero-start counting-up loops
+        # (start=0, step=1) reduce to i, preserving byte-for-byte lowering.
+        emit_push_int(start + i * step)
         @sm.push(iter_var)
 
         lu = RunarCompiler::Codegen.compute_last_uses(body)

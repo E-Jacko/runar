@@ -462,6 +462,8 @@ module RunarCompiler
           new_v.count = value.count
           new_v.body = folded_body
           new_v.iter_var = value.iter_var
+          new_v.start = value.start
+          new_v.step = value.step
           return new_v
         end
 

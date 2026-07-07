@@ -269,18 +269,28 @@ class TestAnfLower < Minitest::Test
     }
   TS
 
-  def test_anf_rejects_non_zero_start_loop
-    err = assert_raises(RuntimeError) do
-      lower_without_validate(NON_ZERO_START_LOOP, "C.runar.ts")
-    end
-    assert_includes err.message, "must start at 0"
+  # #121: non-zero start (start=1, step=+1, count=3).
+  def test_anf_lowers_non_zero_start_loop
+    prog = lower_without_validate(NON_ZERO_START_LOOP, "C.runar.ts")
+    m = prog.methods.find { |method| method.name == "m" }
+    refute_nil m
+    loops = m.body.select { |b| b.value.kind == "loop" }
+    assert_equal 1, loops.length
+    assert_equal 1, loops[0].value.start
+    assert_equal 1, loops[0].value.step
+    assert_equal 3, loops[0].value.count
   end
 
-  def test_anf_rejects_countdown_loop
-    err = assert_raises(RuntimeError) do
-      lower_without_validate(COUNTDOWN_LOOP, "C.runar.ts")
-    end
-    assert_includes err.message.downcase, "countdown"
+  # #121: exclusive countdown (start=3, step=-1, count=3).
+  def test_anf_lowers_countdown_loop
+    prog = lower_without_validate(COUNTDOWN_LOOP, "C.runar.ts")
+    m = prog.methods.find { |method| method.name == "m" }
+    refute_nil m
+    loops = m.body.select { |b| b.value.kind == "loop" }
+    assert_equal 1, loops.length
+    assert_equal 3, loops[0].value.start
+    assert_equal(-1, loops[0].value.step)
+    assert_equal 3, loops[0].value.count
   end
 
   def test_anf_still_lowers_zero_start_counting_up_loop
@@ -289,6 +299,8 @@ class TestAnfLower < Minitest::Test
     refute_nil m
     loops = m.body.select { |b| b.value.kind == "loop" }
     assert_equal 1, loops.length
+    assert_equal 0, loops[0].value.start
+    assert_equal 1, loops[0].value.step
     assert_equal 4, loops[0].value.count
   end
 end
