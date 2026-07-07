@@ -41,7 +41,7 @@ export function minimalValueFor(kind: AnfKind): ANFValue {
     case 'if':
       return { kind: 'if', cond: 'c', then: [], else: [] };
     case 'loop':
-      return { kind: 'loop', count: 1, body: [], iterVar: 'i' };
+      return { kind: 'loop', count: 1, body: [], iterVar: 'i', start: 0n, step: 1 };
     case 'assert':
       return { kind: 'assert', value: 'v' };
     case 'update_prop':

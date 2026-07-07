@@ -738,13 +738,17 @@ describe('Pass 6: Emit', () => {
         }
       `;
       const result = compileToEmit(source);
+      // Issue #116: the change segment is now gated on `_changeAmount != 0` at
+      // runtime, so the tail carries the guard (`…547a547a 00787c9c9163` OP_IF
+      // … OP_ELSE `67007b7577687e` OP_ENDIF) around the P2PKH change output
+      // instead of catting it unconditionally.
       expect(result.scriptHex).toBe(
         '76ab' + CHECK_PREIMAGE_BINDING_HEX +
         '69768254947f778101419d7601687f7782012c947f758258947f758258947f7781768b7702' +
         'e803785679016a7e7c58807e827602fd009f635280517f756776030000019f635380527f7501' +
         'fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e7c' +
-        '58807c7e547a547a041976a9147b7e0288ac7e7c58807c7e7eaa7b820128947f7701207f7587' +
-        '7777'
+        '58807c7e547a547a00787c9c9163041976a9147b7e0288ac7e7c58807c7e67007b7577687eaa' +
+        '7b820128947f7701207f75877777'
       );
     });
   });

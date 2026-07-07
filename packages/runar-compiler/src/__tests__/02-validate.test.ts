@@ -330,7 +330,7 @@ describe('Pass 2: Validate', () => {
       expect(hasError(result, "compile-time constant")).toBe(false);
     });
 
-    it('reports error for for-loop with a non-zero start value', () => {
+    it('accepts a for-loop with a non-zero start value (issue #121)', () => {
       const source = `
         class C extends SmartContract {
           readonly x: bigint;
@@ -350,10 +350,10 @@ describe('Pass 2: Validate', () => {
         }
       `;
       const result = validateSource(source);
-      expect(hasError(result, 'must start at 0')).toBe(true);
+      expect(hasError(result, 'must start at 0')).toBe(false);
     });
 
-    it('reports error for a countdown for-loop', () => {
+    it('accepts a countdown for-loop (issue #121)', () => {
       const source = `
         class C extends SmartContract {
           readonly x: bigint;
@@ -373,7 +373,7 @@ describe('Pass 2: Validate', () => {
         }
       `;
       const result = validateSource(source);
-      expect(hasError(result, 'countdown')).toBe(true);
+      expect(hasError(result, 'countdown')).toBe(false);
     });
 
     it('accepts a zero-start counting-up for-loop', () => {

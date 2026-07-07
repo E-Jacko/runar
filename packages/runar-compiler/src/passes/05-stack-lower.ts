@@ -440,6 +440,14 @@ class LoweringContext {
   /** Tracks constant values by binding name (for compile-time constant extraction). */
   private constValues: Map<string, bigint | string | boolean> = new Map();
 
+  /**
+   * Method params whose names collide with a mutable property. Maps the param
+   * name to the reserved stack-slot name its witness value lives under, so
+   * `lowerLoadParam` reads the param and not the same-named deserialized
+   * property slot (issue #130). Empty for the common no-collision case.
+   */
+  private readonly renamedParams: Map<string, string> = new Map();
+
   constructor(
     params: string[],
     properties: ANFProperty[],
@@ -450,6 +458,28 @@ class LoweringContext {
     this.stackMap = new StackMap(params);
     this._properties = properties;
     this.privateMethods = privateMethods;
+
+    // Issue #130 (stack layer): a method param whose name collides with a
+    // MUTABLE property gets a duplicate stackMap slot once `deserialize_state`
+    // pushes that property under the same name. Name lookups resolve to the
+    // shallowest match (the deserialized property), so `load_param` would read
+    // the stale on-chain state instead of the witness value. Rename the
+    // colliding param's slot to a reserved, collision-proof name up front and
+    // remember the mapping so `lowerLoadParam` targets the real param slot.
+    // Only mutable properties are deserialized onto the stack, so readonly
+    // shadows (handled purely by ANF resolution) never enter this map, and
+    // non-colliding contracts get an empty map — byte-identical output.
+    const mutablePropNames = new Set(
+      properties.filter(p => !p.readonly).map(p => p.name),
+    );
+    for (const name of params) {
+      if (mutablePropNames.has(name)) {
+        const renamed = `__param_${name}`;
+        this.stackMap.renameAtDepth(this.stackMap.findDepth(name), renamed);
+        this.renamedParams.set(name, renamed);
+      }
+    }
+
     this.trackDepth();
   }
 
@@ -1070,7 +1100,7 @@ class LoweringContext {
         this.lowerIf(name, value.cond, value.then, value.else, bindingIndex, lastUses);
         break;
       case 'loop':
-        this.lowerLoop(name, value.count, value.body, value.iterVar, bindingIndex, lastUses);
+        this.lowerLoop(name, value.count, value.body, value.iterVar, value.start, value.step, bindingIndex, lastUses);
         break;
       case 'assert':
         this.lowerAssert(value.value, bindingIndex, lastUses);
@@ -1192,11 +1222,13 @@ class LoweringContext {
     bindingIndex: number,
     lastUses: Map<string, number>,
   ): void {
-    // The parameter is already on the stack under its original name.
-    // We alias it by bringing it to the top.
-    if (this.stackMap.has(paramName)) {
+    // The parameter is already on the stack under its original name — or, for
+    // a param that shadows a mutable property, under a reserved renamed slot
+    // (issue #130) so it is not confused with the deserialized property slot.
+    const slotName = this.renamedParams.get(paramName) ?? paramName;
+    if (this.stackMap.has(slotName)) {
       const isLast = this.isLastUse(paramName, bindingIndex, lastUses);
-      this.bringToTop(paramName, isLast);
+      this.bringToTop(slotName, isLast);
       // Rename the top-of-stack entry to the binding name
       this.stackMap.pop();
       this.stackMap.push(bindingName);
@@ -2208,6 +2240,8 @@ class LoweringContext {
     count: number,
     body: ANFBinding[],
     _iterVar: string,
+    start: bigint,
+    step: 1 | -1,
     loopBindingIndex?: number,
     enclosingLastUses?: Map<string, number>,
   ): void {
@@ -2241,8 +2275,11 @@ class LoweringContext {
 
     // Loops are unrolled at compile time. Repeat the body `count` times.
     for (let i = 0; i < count; i++) {
-      // Push the iteration index as a constant (in case the loop body uses it)
-      this.emitOp({ op: 'push', value: BigInt(i) });
+      // Push the iteration variable value (in case the loop body uses it).
+      // Iteration `i` binds `start + i*step` (issue #121); zero-start
+      // counting-up loops (start=0, step=1) reduce to `BigInt(i)`, preserving
+      // the historical byte-for-byte lowering.
+      this.emitOp({ op: 'push', value: start + BigInt(i) * BigInt(step) });
       this.stackMap.push(_iterVar);
 
       const lastUses = computeLastUses(body);
