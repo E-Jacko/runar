@@ -3828,4 +3828,53 @@ mod tests {
         // Only the OP_CHECKSIG (ac) after the separator remains.
         assert_eq!(subscript, "ac");
     }
+
+    #[test]
+    fn code_sep_offset_is_byte_walked_independent_of_constructor_args_issue_132() {
+        // Issue #132: when code_script is set, the OP_CODESEPARATOR offset used
+        // for OP_PUSH_TX must be byte-walked from the real script, NOT derived
+        // from the in-memory constructor_args (which are placeholders on the
+        // restore path). Two contracts sharing the same real code_script — one
+        // with real args, one with 0 placeholders — must resolve the SAME
+        // per-method code-sep offset, so their OP_PUSH_TX scriptCode matches.
+        let artifact = RunarArtifact {
+            version: "runar-v0.1.0".to_string(),
+            contract_name: "Restorable".to_string(),
+            parent_class: Some("StatefulSmartContract".to_string()),
+            abi: Abi {
+                constructor: AbiConstructor {
+                    params: vec![AbiParam {
+                        name: "tag".to_string(),
+                        param_type: "bigint".to_string(),
+                        fixed_array: None,
+                    }],
+                },
+                methods: vec![
+                    AbiMethod { name: "bump".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
+                    AbiMethod { name: "bump_two".to_string(), params: vec![], is_public: true, is_terminal: None, uses_code_part: None },
+                ],
+            },
+            // Real on-chain code with two OP_CODESEPARATORs (0xab) at byte
+            // offsets 1 and 3. A constructor slot at offset 0 would shift these
+            // under adjust_code_sep_offset, but the byte-walk ignores args.
+            script: "51ab52ab".to_string(),
+            state_fields: None,
+            constructor_slots: Some(vec![ConstructorSlot { param_index: 0, byte_offset: 0 }]),
+            code_sep_index_slots: None,
+            code_separator_index: Some(1),
+            code_separator_indices: Some(vec![1, 3]),
+            anf: None,
+        };
+
+        let mut real = RunarContract::new(artifact.clone(), vec![SdkValue::Int(500)]);
+        real.code_script = Some("51ab52ab".to_string());
+        let mut placeholder = RunarContract::new(artifact, vec![SdkValue::Int(0)]);
+        placeholder.code_script = Some("51ab52ab".to_string());
+
+        // Byte-walked offsets: method 0 -> 1, method 1 -> 3, independent of args.
+        assert_eq!(real.get_code_sep_index(0), 1);
+        assert_eq!(real.get_code_sep_index(1), 3);
+        assert_eq!(placeholder.get_code_sep_index(0), real.get_code_sep_index(0));
+        assert_eq!(placeholder.get_code_sep_index(1), real.get_code_sep_index(1));
+    }
 }
