@@ -537,6 +537,9 @@ module Runar
         # Thread CallOptions#locktime so contracts asserting
         # extractLocktime(preimage) can succeed. nil → 0 (legacy).
         call_options[:locktime] = opts.locktime unless opts.locktime.nil?
+        # Thread CallOptions#sequence (#131): a non-zero locktime needs
+        # non-final input sequences or consensus ignores nLockTime.
+        call_options[:sequence] = opts.sequence unless opts.sequence.nil?
         if extra_contract_utxos.any?
           call_options[:additional_contract_inputs] = extra_contract_utxos.each_with_index.map do |utxo, i|
             { utxo: utxo, unlocking_script: extra_unlock_placeholders[i] }
@@ -569,6 +572,7 @@ module Runar
             prevouts_indices: prevouts_indices,
             intent_witness_hex: intent_witness_hex,
             locktime: opts.locktime,
+            sequence: opts.sequence,
             method_uses_code_part: method_uses_code_part
           )
 
@@ -924,6 +928,10 @@ module Runar
         # extractLocktime(preimage) >= deadline. Default 0 preserves legacy
         # behavior for contracts that don't check locktime.
         terminal_locktime = opts.locktime || 0
+        # Sequence (#131): all-final inputs make nLockTime a consensus no-op --
+        # when a non-zero locktime is set, default to 0xfffffffe so the terminal
+        # method's extractLocktime assertion is actually enforced.
+        terminal_sequence = SDK.resolve_input_sequence(opts.locktime, opts.sequence)
 
         # Build raw terminal transaction: single input, exact outputs, no change.
         build_terminal_tx = lambda do |unlock|
@@ -934,7 +942,7 @@ module Runar
           tx << SDK.to_le32(contract_utxo.output_index)
           tx << SDK.encode_varint(unlock.length / 2)
           tx << unlock
-          tx << 'ffffffff'
+          tx << SDK.to_le32(terminal_sequence)
           tx << SDK.encode_varint(term_outputs.length)
           term_outputs.each do |out|
             tx << SDK.to_le64(out.satoshis)
@@ -1130,6 +1138,7 @@ module Runar
         prevouts_indices: [],
         intent_witness_hex: '',
         locktime: nil,
+        sequence: nil,
         method_uses_code_part: nil
       )
         final_op_push_tx_sig = ''
@@ -1150,6 +1159,7 @@ module Runar
               prevouts_indices: prevouts_indices,
               intent_witness_hex: intent_witness_hex,
               locktime: locktime,
+              sequence: sequence,
               method_uses_code_part: method_uses_code_part
             )
 
@@ -1187,6 +1197,7 @@ module Runar
         prevouts_indices: [],
         intent_witness_hex: '',
         locktime: nil,
+        sequence: nil,
         method_uses_code_part: nil
       )
         pub_key     = signer.get_public_key
@@ -1198,6 +1209,9 @@ module Runar
         # Rebuild path must honor the override too: a preimage computed on a
         # rebuilt tx with locktime 0 would mismatch the final on-chain tx.
         call_opts[:locktime] = locktime unless locktime.nil?
+        # Same for sequence — the second-pass preimage must see the final
+        # input sequences (#131).
+        call_opts[:sequence] = sequence unless sequence.nil?
 
         # First pass — build unlock with placeholder Sig/prevouts params.
         input0_unlock, = build_stateful_unlock(

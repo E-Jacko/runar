@@ -249,6 +249,7 @@ module Runar
       :funding_utxos,
       :data_outputs,
       :locktime,
+      :sequence,
       keyword_init: true
     ) do
       def initialize(
@@ -265,7 +266,13 @@ module Runar
         # Override the call tx's nLockTime field. nil → SDK uses 0 (legacy
         # behavior). Set for contracts that assert
         # extractLocktime(preimage) >= deadline (e.g. auction close/claim).
-        locktime: nil
+        locktime: nil,
+        # Override the nSequence written onto EVERY input of the call tx (#131).
+        # Defaults are zero-config: when +locktime+ is set and non-zero,
+        # sequence defaults to 0xfffffffe (non-final, so consensus actually
+        # enforces nLockTime); otherwise it stays 0xffffffff (final, legacy).
+        # Set explicitly only for RBF or custom relative-locktime scenarios.
+        sequence: nil
       )
         super
       end

@@ -394,6 +394,35 @@ RSpec.describe Runar::SDK::RunarContract do
       expect(new_utxo.txid).to eq(call_txid)
       expect(new_utxo.txid).not_to eq(deploy_txid)
     end
+
+    # #131: a stateful call with a future locktime must produce non-final
+    # input sequences (0xfffffffe) so consensus actually enforces nLockTime.
+    it 'threads a future locktime into non-final input sequences (#131)' do
+      contract.deploy
+      provider.add_utxo(
+        SAMPLE_ADDRESS,
+        make_utxo('ff' * 32, 1_000_000, script: '76a914' + SAMPLE_ADDRESS + '88ac')
+      )
+
+      contract.call('increment', [], nil, nil,
+                    Runar::SDK::CallOptions.new(locktime: 800_000))
+      call_tx_hex = provider.get_broadcasted_txs.last
+
+      # locktime written LE at the tail.
+      expect(call_tx_hex).to end_with('00350c00')
+
+      # Every input sequence must be 0xfffffffe (LE hex "feffffff").
+      pos = 8
+      count, ic = Runar::SDK.read_varint_hex(call_tx_hex, pos)
+      pos += ic
+      count.times do
+        pos += 72 # prev txid (64) + output index (8)
+        script_len, sl = Runar::SDK.read_varint_hex(call_tx_hex, pos)
+        pos += sl + script_len * 2
+        expect(call_tx_hex[pos, 8]).to eq('feffffff')
+        pos += 8
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
