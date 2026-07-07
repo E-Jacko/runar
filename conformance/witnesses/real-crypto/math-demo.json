@@ -1,0 +1,12 @@
+{
+  "fixture": "math-demo",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "Math built-ins over a stateful value with a real checkPreimage continuation.",
+  "constructorArgs": ["100n"],
+  "spends": [
+    { "method": "divideBy", "args": ["2n"], "expect": "accept", "note": "value 100->50" },
+    { "method": "exponentiate", "args": ["2n"], "expect": "accept", "note": "value 100->10000" },
+    { "method": "divideBy", "args": ["2n"], "tamperOutput": true, "cryptoNearMiss": true, "expect": "reject", "note": "tampered continuation output" }
+  ]
+}

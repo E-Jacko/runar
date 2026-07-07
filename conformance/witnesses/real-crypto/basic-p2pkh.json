@@ -1,0 +1,20 @@
+{
+  "fixture": "basic-p2pkh",
+  "kind": "stateless-signed",
+  "note": "P2PKH: hash160(pubkey)==committed pkh + real ECDSA checkSig over the real BIP-143 sighash.",
+  "constructorArgs": { "pubKeyHash": { "$pkh": "alice" } },
+  "spends": [
+    {
+      "method": "unlock",
+      "args": [{ "$sig": "alice" }, { "$pubkey": "alice" }],
+      "expect": "accept",
+      "note": "correct key: real DER sig verifies; interpreter agrees"
+    },
+    {
+      "method": "unlock",
+      "args": [{ "$sig": "bob" }, { "$pubkey": "bob" }],
+      "expect": "reject",
+      "note": "wrong committed key: hash160(bob) != alice pkh — both engines reject"
+    }
+  ]
+}

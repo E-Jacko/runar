@@ -1,0 +1,34 @@
+{
+  "fixture": "multisig",
+  "kind": "stateless-signed",
+  "note": "2-of-3 OP_CHECKMULTISIG over real signatures. pk1=alice, pk2=bob, pk3=charlie. Signatures must be supplied in committed-pubkey order. checkInterpreter is disabled because the ANF interpreter does not implement checkMultiSig (always returns false); the compiled bytes are exercised for real here instead.",
+  "constructorArgs": {
+    "pk1": { "$pubkey": "alice" },
+    "pk2": { "$pubkey": "bob" },
+    "pk3": { "$pubkey": "charlie" }
+  },
+  "spends": [
+    {
+      "method": "unlock",
+      "args": [{ "$sig": "alice" }, { "$sig": "bob" }],
+      "checkInterpreter": false,
+      "expect": "accept",
+      "note": "pk1 + pk2 (in order) satisfy 2-of-3"
+    },
+    {
+      "method": "unlock",
+      "args": [{ "$sig": "bob" }, { "$sig": "charlie" }],
+      "checkInterpreter": false,
+      "expect": "accept",
+      "note": "pk2 + pk3 (in order) satisfy 2-of-3"
+    },
+    {
+      "method": "unlock",
+      "args": [{ "$sig": "alice" }, { "$sig": "dave" }],
+      "checkInterpreter": false,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "crypto near-miss: dave is not a committed key — only 1 valid sig"
+    }
+  ]
+}
