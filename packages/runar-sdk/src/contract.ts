@@ -872,6 +872,37 @@ export class RunarContract {
           encodePushData(feeSig) + encodePushData(feePubKey),
         );
         invalidateTxCache(termTx);
+
+        // #118: a feeUtxo is consumed ENTIRELY as fee — there is no change
+        // output, because the covenant binds the exact terminal output set.
+        // An oversized feeUtxo therefore silently BURNS the excess. Warn (but
+        // never block) when it dwarfs the terminal tx's estimated fee.
+        // Heuristic: excess is burned if the feeUtxo is > 5x the estimated fee
+        // AND at least ~1000 sats of excess would be burned (an absolute floor
+        // so a slightly-generous fee on a tiny tx does not nag). Best-effort:
+        // any failure fetching the fee rate skips the advisory silently.
+        try {
+          const feeRate = await provider.getFeeRate(); // sat/KB
+          const termTxSizeBytes = termTx.toHex().length / 2;
+          const estimatedFee = Math.max(1, Math.ceil((termTxSizeBytes * feeRate) / 1000));
+          const excess = options.feeUtxo.satoshis - estimatedFee;
+          const OVERSIZE_FEE_MULTIPLE = 5;
+          const OVERSIZE_MIN_EXCESS_SATS = 1000;
+          if (
+            options.feeUtxo.satoshis > estimatedFee * OVERSIZE_FEE_MULTIPLE &&
+            excess > OVERSIZE_MIN_EXCESS_SATS
+          ) {
+            console.warn(
+              `runar-sdk: ${this.artifact.contractName}.call('${methodName}'): feeUtxo is ` +
+                `${options.feeUtxo.satoshis} sats but the terminal tx needs only ~${estimatedFee} sats ` +
+                `of fee. A feeUtxo is consumed ENTIRELY as fee (no change output — the covenant binds ` +
+                `the exact terminal outputs), so ~${excess} sats will be BURNED. Size the feeUtxo close ` +
+                `to the intended fee (issue #118).`,
+            );
+          }
+        } catch {
+          // Advisory only — never fail a call because the fee-rate lookup threw.
+        }
       }
 
       // Compute sighash from preimage
