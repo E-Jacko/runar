@@ -149,7 +149,9 @@ fn encodeStateValue(
         const n: i64 = switch (value) {
             .int => |i| i,
             .boolean => |b| if (b) @as(i64, 1) else @as(i64, 0),
-            .bytes => 0,
+            // .empty_sig (#106) is a call-arg-only marker, never a state field;
+            // grouped with .bytes for exhaustiveness.
+            .bytes, .empty_sig => 0,
             .big_int => unreachable, // handled above
             .array_value => return error.ArrayValueInScalarField,
         };
@@ -158,7 +160,7 @@ fn encodeStateValue(
         const b: bool = switch (value) {
             .boolean => |bv| bv,
             .int => |i| i != 0,
-            .bytes, .big_int => false,
+            .bytes, .big_int, .empty_sig => false,
             .array_value => return error.ArrayValueInScalarField,
         };
         return allocator.dupe(u8, if (b) "01" else "00");
@@ -489,6 +491,9 @@ pub fn encodeArg(allocator: std.mem.Allocator, value: types.StateValue) ![]u8 {
         .big_int => |decimal_str| encodeBigScriptNumber(allocator, decimal_str),
         .boolean => |b| allocator.dupe(u8, if (b) "51" else "00"),
         .bytes => |hex| encodePushData(allocator, hex),
+        // Issue #106: OP_0 — the empty-signature push for the deliberately-
+        // failing branch of an OR-CHECKSIG method. See types.EMPTY_SIG.
+        .empty_sig => allocator.dupe(u8, "00"),
         // Arrays are not valid standalone arguments — callers must flatten
         // them via flattenStateValues before passing them in.
         .array_value => error.ArrayValueInScalarField,

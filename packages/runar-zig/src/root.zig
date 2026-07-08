@@ -49,6 +49,8 @@ pub const ContractOutput = sdk_types.ContractOutput;
 pub const TerminalOutput = sdk_types.TerminalOutput;
 pub const OutputSpec = sdk_types.OutputSpec;
 pub const StateValue = sdk_types.StateValue;
+/// Issue #106: EmptySig marker for OR-CHECKSIG branched auth (pushes OP_0).
+pub const EMPTY_SIG = sdk_types.EMPTY_SIG;
 pub const resolveTerminalOutputs = sdk_call.resolveTerminalOutputs;
 pub const freeResolvedTerminalOutputs = sdk_call.freeResolvedTerminalOutputs;
 pub const PreparedCall = sdk_types.PreparedCall;
@@ -77,6 +79,7 @@ pub const selectUtxos = sdk_deploy.selectUtxos;
 pub const buildCallTransaction = sdk_call.buildCallTransaction;
 pub const estimateCallFee = sdk_call.estimateCallFee;
 pub const computeOpPushTx = sdk_oppushtx.computeOpPushTx;
+pub const computeOpPushTxWithSigHash = sdk_oppushtx.computeOpPushTxWithSigHash;
 pub const opPushTxPubKeyHex = sdk_oppushtx.opPushTxPubKeyHex;
 pub const buildP2PKHScript = sdk_deploy.buildP2PKHScript;
 pub const insertUnlockingScript = sdk_contract.insertUnlockingScript;
@@ -247,6 +250,7 @@ test {
     _ = @import("sdk_envelope_sign.zig");
     _ = @import("sdk_envelope_interop_test.zig");
     _ = @import("sdk_bip143_interop_test.zig");
+    _ = @import("sdk_sighash_emptysig_test.zig");
     _ = @import("sdk_rpc_provider.zig");
     _ = @import("sdk_token_wallet.zig");
     _ = @import("sdk_codegen.zig");
