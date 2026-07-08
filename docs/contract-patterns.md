@@ -361,6 +361,20 @@ class Auction extends StatefulSmartContract {
 
 This pattern demonstrates combining multiple stateful fields, time-based conditions via locktime, and two distinct spending paths with different authorization rules.
 
+> **Pair `extractLocktime` with an `extractSequence` finality guard.** A
+> transaction's `nLockTime` is only enforced by consensus when at least one
+> input is *non-final* — i.e. its `nSequence` is below `0xffffffff`. If every
+> input is final, miners ignore `nLockTime` entirely, so a
+> `extractLocktime(preimage) >= deadline` (or `< deadline`) assertion can be
+> bypassed by a hand-built all-final-sequence spend. To make a locktime gate
+> consensus-enforced, also assert the spend is non-final:
+> `assert(extractSequence(this.txPreimage) < 0xffffffffn);`. The compiler emits
+> an advisory warning for any method that reads `extractLocktime` without such a
+> guard. The SDK's `CallOptions` help on the tx side: when you set a non-zero
+> `locktime`, `sequence` defaults to `0xfffffffe` (non-final) automatically — but
+> the covenant itself must still assert the sequence bound so no other unlocking
+> path can supply an all-final tx.
+
 ---
 
 ## Schnorr Zero-Knowledge Proof
