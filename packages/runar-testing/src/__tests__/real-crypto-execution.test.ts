@@ -18,6 +18,7 @@ function readContract(name: string): { source: string; fileName: string } {
     readFileSync(resolve(CONFORMANCE, name, 'source.json'), 'utf8'),
   ) as { sources: Record<string, string> };
   const rel = manifest.sources['.runar.ts'];
+  if (!rel) throw new Error(`${name}: source.json has no '.runar.ts' entry`);
   return { source: readFileSync(resolve(CONFORMANCE, name, rel), 'utf8'), fileName: rel.split('/').pop()! };
 }
 
