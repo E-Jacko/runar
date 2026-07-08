@@ -1008,11 +1008,34 @@ public final class StackLower {
                 pushPropertyValue(prop.initialValue());
             } else {
                 // Deployment-time constructor arg placeholder.
-                int paramIndex = 0;
+                //
+                // #119 tail (H1): a property that reaches this fallback with no
+                // matching constructor slot (paramIndex < 0) has no deploy-time
+                // bytes of its own. The previous behaviour coerced it onto slot
+                // 0, silently splicing an UNRELATED constructor argument's
+                // placeholder into the locking script — a silent-wrong-code
+                // path. Fail loudly instead. (A real constructor-param property
+                // — readonly, or a mutable state field whose initial value is
+                // spliced at deploy — is found and unaffected, so zero golden
+                // churn.)
+                List<String> ctorProps = new ArrayList<>();
                 for (AnfProperty p : properties) {
                     if (p.initialValue() != null) continue;
-                    if (p.name().equals(propName)) break;
-                    paramIndex++;
+                    ctorProps.add(p.name());
+                }
+                int paramIndex = ctorProps.indexOf(propName);
+                if (paramIndex < 0) {
+                    String loc = currentSourceLoc != null
+                        ? " at " + currentSourceLoc.file() + ":" + currentSourceLoc.line()
+                            + ":" + currentSourceLoc.column()
+                        : "";
+                    throw new RuntimeException(
+                        "Stack lowering: property '" + propName + "'" + loc
+                            + " is neither on the stack, initialized, nor a constructor "
+                            + "parameter, so it has no deploy-time slot. Refusing to emit "
+                            + "a placeholder for an unrelated constructor argument (slot 0). "
+                            + "Known constructor-param properties: ["
+                            + String.join(", ", ctorProps) + "].");
                 }
                 emitOp(new PlaceholderOp(paramIndex, propName));
             }
