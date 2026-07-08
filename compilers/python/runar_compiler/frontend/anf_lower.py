@@ -57,6 +57,7 @@ from runar_compiler.frontend.side_effect_summary import (
     compute_side_effect_summary,
     continuation_shape_for,
 )
+from runar_compiler.frontend.sighash_directive import SIGHASH_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +254,18 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
     # private-helper effects, not just direct ones.
     side_effects = compute_side_effect_summary(contract)
 
+    # Issue #109: readonly fields carrying a ``/** @embedAlways */`` directive
+    # must survive DCE into the locking script. A readonly field no method
+    # references lowers to no ``load_prop``, so no constructor slot is emitted
+    # and the field's deploy-time bytes vanish. We inject a ``load_prop`` + a
+    # ``@ref:`` alias (the exact shape ``const _bind = this.field;`` produces)
+    # into the first public method's body — the alias keeps the ``load_prop``
+    # alive through dead-binding DCE, and stack lowering threads the pushed
+    # value through and cleans it up (OP_NIP) at method end. One slot in the
+    # deployed script suffices; every spending branch shares it.
+    embed_fields = [p for p in contract.properties if p.readonly and p.embed_always]
+    embed_injected = False
+
     # Lower constructor
     ctor_ctx = _LowerCtx(contract, side_effects)
     for p in contract.constructor.params:
@@ -268,6 +281,11 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
     # Lower each method
     for method in contract.methods:
         method_ctx = _LowerCtx(contract, side_effects)
+        # Issue #123: non-default @sighash mode drives the OP_PUSH_TX binding
+        # flag for any checkPreimage (auto-injected below, or a manual call) in
+        # this method.
+        if method.sighash_type is not None and method.sighash_type != SIGHASH_DEFAULT:
+            method_ctx.sighash_flag = method.sighash_type
         for p in method.params:
             method_ctx.register_param_type(p.name, _type_node_to_string(p.type))
 
@@ -303,21 +321,32 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
             method_ctx.add_param("txPreimage")
             method_ctx.register_param_type("txPreimage", "SigHashPreimage")
 
+            # Issue #123: the declared per-method sighash mode (default
+            # ALL|FORKID). Drives BOTH the OP_PUSH_TX binding flag (so the
+            # derived sig re-computes the tx sighash under this mode) AND the
+            # runtime preimage-type assert.
+            sighash_mode = method.sighash_type if method.sighash_type is not None else SIGHASH_DEFAULT
+            is_default_sighash = sighash_mode == SIGHASH_DEFAULT
+
             # Inject checkPreimage(txPreimage) at the start
             preimage_ref = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
-            check_result = method_ctx.emit(ANFValue(kind="check_preimage", preimage=preimage_ref))
+            check_pre_value = ANFValue(kind="check_preimage", preimage=preimage_ref)
+            # Omit for the default so the ANF (and pinned binding blob) is unchanged.
+            if not is_default_sighash:
+                check_pre_value.sighash_flag = sighash_mode
+            check_result = method_ctx.emit(check_pre_value)
             method_ctx.emit(_make_assert(check_result))
 
-            # GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-            # auto-injected covenant cannot be spent under a permissive sighash
-            # flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
-            # a contract may read. The hashOutputs continuation already fails
-            # under non-ALL flags, so this is a no-op on spendability for
-            # continuation-using methods and closes the field-zeroing exposure
-            # for the rest.
+            # GAP-302 / #123: pin the sighash type to the declared mode. The
+            # auto-injected covenant verifies a real tx preimage, but without
+            # this check the spend could use a DIFFERENT sighash flag than
+            # declared that zeroes out preimage fields the contract (or its
+            # continuation) relies on (hashOutputs / hashPrevouts / hashSequence).
+            # The value defaults to 0x41 (SIGHASH_ALL|FORKID) so existing
+            # contracts emit byte-identical ANF.
             sig_hash_preimage_ref = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
             sig_hash_type_ref = method_ctx.emit(_make_call("extractSigHashType", [sig_hash_preimage_ref]))
-            expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(0x41))
+            expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(sighash_mode))
             sig_hash_ok_ref = method_ctx.emit(ANFValue(
                 kind="bin_op", op="===",
                 left=sig_hash_type_ref, right=expected_sig_hash_ref,
@@ -329,6 +358,13 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
             if has_state_prop:
                 preimage_ref3 = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
                 method_ctx.emit(ANFValue(kind="deserialize_state", preimage=preimage_ref3))
+
+            # Issue #109: preserve @embedAlways fields at the first user-statement
+            # position (after the checkPreimage/deserialize preamble), mirroring
+            # where a ``const _bind = this.field;`` idiom would sit.
+            if not embed_injected and embed_fields:
+                _emit_embed_always_preservation(method_ctx, embed_fields)
+                embed_injected = True
 
             # Lower the developer's method body
             method_ctx.lower_statements(method.body)
@@ -452,8 +488,15 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                 params=augmented_params,
                 body=method_ctx.bindings,
                 is_public=True,
+                sighash_type=method.sighash_type,
             ))
         else:
+            # Issue #109: stateless public methods (and stateless contracts'
+            # spending entry points) are lowered here — inject @embedAlways
+            # preservation into the first PUBLIC one before its body.
+            if not embed_injected and embed_fields and method.visibility == "public":
+                _emit_embed_always_preservation(method_ctx, embed_fields)
+                embed_injected = True
             method_ctx.lower_statements(method.body)
             # Private methods can also call the intent intrinsics; capture
             # their auto-injected witness params so a public method that
@@ -465,6 +508,7 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                 params=augmented,
                 body=method_ctx.bindings,
                 is_public=method.visibility == "public",
+                sighash_type=method.sighash_type,
             ))
 
     return result
@@ -475,6 +519,26 @@ def _lower_params(params: list) -> list[ANFParam]:
         ANFParam(name=p.name, type=_type_node_to_string(p.type))
         for p in params
     ]
+
+
+def _emit_embed_always_preservation(ctx: "_LowerCtx", fields: list) -> None:
+    """Issue #109: emit the DCE-surviving preservation pair for each
+    ``@embedAlways`` readonly field, into the given (public) method context.
+
+    Reproduces exactly what a hand-written ``const _bind = this.field;`` lowers
+    to: a ``load_prop`` followed by a ``load_const("@ref:<t>")`` alias. The alias
+    marks the ``load_prop`` as referenced (see ``collect_refs`` in the DCE pass),
+    so dead-binding DCE keeps it; stack lowering then emits the field's
+    constructor-slot placeholder and NIPs the unused value off the stack at
+    method end. The field's bytes therefore remain in the deployed locking
+    script for downstream recovery.
+    """
+    for field in fields:
+        load_ref = ctx.emit(ANFValue(kind="load_prop", name=field.name))
+        ctx.emit_named(
+            f"__embedAlways_{field.name}",
+            _make_load_const_string(f"@ref:{load_ref}"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +589,11 @@ class _LowerCtx:
         self._contract: ContractNode = contract
         self._local_names: set[str] = set()
         self._param_names: set[str] = set()
+        # Issue #123: the declared non-default @sighash flag for the method being
+        # lowered, so a MANUAL ``checkPreimage(pre)`` call (stateless / explicit)
+        # binds under the same mode as the method's declared sighash. ``None`` =
+        # default ALL|FORKID, keeping the pinned binding blob unchanged.
+        self.sighash_flag: int | None = None
         # Method-scoped parameter type table. Populated once per
         # method/constructor (and for auto-injected continuation params)
         # before its body is lowered. Mirrors the TS reference's
@@ -697,6 +766,9 @@ class _LowerCtx:
         sub._counter = self._counter
         sub._local_names = set(self._local_names)
         sub._param_names = set(self._param_names)
+        # Issue #123: a manual checkPreimage() inside a nested block must bind
+        # under the same declared @sighash mode as the enclosing method.
+        sub.sighash_flag = self.sighash_flag
         # Share the method-scoped param-type table by reference so if/else
         # sub-contexts resolve parameter types against the same method.
         sub._param_types = self._param_types
@@ -1051,7 +1123,11 @@ class _LowerCtx:
         if isinstance(callee, Identifier) and callee.name == "checkPreimage":
             if len(e.args) >= 1:
                 preimage_ref = self.lower_expr_to_ref(e.args[0])
-                return self.emit(ANFValue(kind="check_preimage", preimage=preimage_ref))
+                cp = ANFValue(kind="check_preimage", preimage=preimage_ref)
+                # Issue #123: honour the method's declared @sighash on manual calls.
+                if self.sighash_flag is not None:
+                    cp.sighash_flag = self.sighash_flag
+                return self.emit(cp)
 
         # extractPrevOutputScript(inputIndex_literal, expectedScriptHash) -> ByteString.
         # extractPrevOutputScript(inputIndex_literal, expectedScriptPrefixHash, prefixLen_literal) -> ByteString.
