@@ -216,10 +216,17 @@ public record RunarArtifact(
     }
 
     public record ABIMethod(String name, List<ABIParam> params, boolean isPublic, Boolean isTerminal,
-                            Boolean usesCodePart) {
+                            Boolean usesCodePart, Integer sigHashType) {
         public ABIMethod {
             params = params == null ? List.of() : Collections.unmodifiableList(params);
         }
+
+        /** Backwards-compatible constructor: default sighash (ALL|FORKID, 0x41). */
+        public ABIMethod(String name, List<ABIParam> params, boolean isPublic, Boolean isTerminal,
+                         Boolean usesCodePart) {
+            this(name, params, isPublic, isTerminal, usesCodePart, null);
+        }
+
         static ABIMethod fromMap(Map<String, Object> m) {
             String name = Json.asString(m.get("name"));
             List<ABIParam> ps = new ArrayList<>();
@@ -239,7 +246,15 @@ public record RunarArtifact(
             if (m.containsKey("usesCodePart") && m.get("usesCodePart") != null) {
                 usesCodePart = Json.asBool(m.get("usesCodePart"));
             }
-            return new ABIMethod(name, ps, isPublic, isTerminal, usesCodePart);
+            // Issue #123: the BIP-143 sighash type this method's preimage/covenant
+            // is built under (from a @sighash directive), e.g. 0x43 for
+            // SINGLE|FORKID. Absent = default ALL|FORKID (0x41); the SDK falls
+            // back to 0x41 so existing artifacts are unchanged.
+            Integer sigHashType = null;
+            if (m.containsKey("sigHashType") && m.get("sigHashType") != null) {
+                sigHashType = Json.asInt(m.get("sigHashType"));
+            }
+            return new ABIMethod(name, ps, isPublic, isTerminal, usesCodePart, sigHashType);
         }
     }
 

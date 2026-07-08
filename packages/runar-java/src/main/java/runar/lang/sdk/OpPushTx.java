@@ -76,12 +76,10 @@ final class OpPushTx {
             hashPrevouts = new byte[32];
         }
 
-        // hashSequence
-        if (!anyoneCanPay && baseType != 0x01 /*ALL*/ && baseType != 0x03 /*SINGLE*/) {
-            // Strict BIP-143: zero hashSequence when not ALL/SINGLE/ANYONECANPAY-ANY.
-            // RawTx.sighashBIP143 has the same logic — keep them in lock step.
-            hashSequence = new byte[32];
-        } else if (!anyoneCanPay) {
+        // hashSequence (BIP-143): committed ONLY under pure SIGHASH_ALL. NONE /
+        // SINGLE / ANYONECANPAY all zero it. RawTx.sighashBIP143 keeps the same
+        // logic in lock step (issue #123).
+        if (!anyoneCanPay && baseType == 0x01 /*ALL*/) {
             ByteArrayOutputStream seqs = new ByteArrayOutputStream();
             for (RawTx.Input in : tx.inputs) {
                 writeLE32(seqs, (int) in.sequence);
@@ -91,8 +89,28 @@ final class OpPushTx {
             hashSequence = new byte[32];
         }
 
-        // hashOutputs
-        if (baseType != 0x03 /*SINGLE*/ && baseType != 0x02 /*NONE*/) {
+        // hashOutputs (BIP-143):
+        //   NONE   -> 32 zero bytes (no outputs committed)
+        //   SINGLE -> hash256(output at THIS input's index), or 32 zero bytes
+        //             when inputIndex >= outputs.size() (issue #123 F5). It must
+        //             NOT digest the whole output set — every other output is
+        //             attacker-controllable under SINGLE.
+        //   else   -> hash256(all outputs)
+        if (baseType == 0x02 /*NONE*/) {
+            hashOutputs = new byte[32];
+        } else if (baseType == 0x03 /*SINGLE*/) {
+            if (inputIndex < tx.outputs.size()) {
+                ByteArrayOutputStream one = new ByteArrayOutputStream();
+                RawTx.Output o = tx.outputs.get(inputIndex);
+                writeLE64(one, o.satoshis);
+                byte[] script = ScriptUtils.hexToBytes(o.scriptPubKeyHex);
+                writeVarInt(one, script.length);
+                one.writeBytes(script);
+                hashOutputs = Hash160.doubleSha256(one.toByteArray());
+            } else {
+                hashOutputs = new byte[32];
+            }
+        } else {
             ByteArrayOutputStream outs = new ByteArrayOutputStream();
             for (RawTx.Output o : tx.outputs) {
                 writeLE64(outs, o.satoshis);
@@ -101,8 +119,6 @@ final class OpPushTx {
                 outs.writeBytes(script);
             }
             hashOutputs = Hash160.doubleSha256(outs.toByteArray());
-        } else {
-            hashOutputs = new byte[32];
         }
 
         RawTx.Input signed = tx.inputs.get(inputIndex);
@@ -195,7 +211,19 @@ final class OpPushTx {
      * flag byte ready for splicing into the unlocking script.
      */
     static byte[] computePushTxSig(RawTx tx, int inputIndex, byte[] scriptCode, long satoshis) {
-        byte[] preimageBytes = preimage(tx, inputIndex, scriptCode, satoshis, SIGHASH_ALL_FORKID);
+        return computePushTxSig(tx, inputIndex, scriptCode, satoshis, SIGHASH_ALL_FORKID);
+    }
+
+    /**
+     * Issue #123: covenant OP_PUSH_TX signature under a declared BIP-143 sighash
+     * mode. The preimage is built under {@code sigHashFlag} (driving which fields
+     * are zeroed) and the same flag byte is appended to the DER signature, so the
+     * on-chain binding re-derives the tx sighash under the matching mode. Default
+     * {@link #SIGHASH_ALL_FORKID} keeps existing covenants byte-identical.
+     */
+    static byte[] computePushTxSig(RawTx tx, int inputIndex, byte[] scriptCode, long satoshis,
+                                   int sigHashFlag) {
+        byte[] preimageBytes = preimage(tx, inputIndex, scriptCode, satoshis, sigHashFlag);
         byte[] sighash = Hash160.doubleSha256(preimageBytes);
         BigInteger z = new BigInteger(1, sighash);
         BigInteger r = CURVE_GX.mod(CURVE_N);
@@ -206,13 +234,19 @@ final class OpPushTx {
         byte[] der = LocalSigner.derEncode(r, s);
         byte[] out = new byte[der.length + 1];
         System.arraycopy(der, 0, out, 0, der.length);
-        out[der.length] = (byte) SIGHASH_ALL_FORKID;
+        out[der.length] = (byte) (sigHashFlag & 0xff);
         return out;
     }
 
     /** Convenience overload that takes a hex-encoded scriptCode. */
     static byte[] computePushTxSig(RawTx tx, int inputIndex, String scriptCodeHex, long satoshis) {
         return computePushTxSig(tx, inputIndex, ScriptUtils.hexToBytes(scriptCodeHex), satoshis);
+    }
+
+    /** Convenience overload: hex-encoded scriptCode under a declared sighash mode. */
+    static byte[] computePushTxSig(RawTx tx, int inputIndex, String scriptCodeHex, long satoshis,
+                                   int sigHashFlag) {
+        return computePushTxSig(tx, inputIndex, ScriptUtils.hexToBytes(scriptCodeHex), satoshis, sigHashFlag);
     }
 
     // ------------------------------------------------------------------

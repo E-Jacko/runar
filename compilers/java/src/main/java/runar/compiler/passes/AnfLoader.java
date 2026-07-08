@@ -174,7 +174,11 @@ public final class AnfLoader {
             );
             case "update_prop" -> new UpdateProp(asString(obj.get("name")), asString(obj.get("value")));
             case "get_state_script" -> new GetStateScript();
-            case "check_preimage" -> new CheckPreimage(asString(obj.get("preimage")));
+            case "check_preimage" -> new CheckPreimage(
+                asString(obj.get("preimage")),
+                obj.containsKey("sighashFlag") && obj.get("sighashFlag") != null
+                    ? asInt(obj.get("sighashFlag")) : null
+            );
             case "deserialize_state" -> new DeserializeState(asString(obj.get("preimage")));
             case "add_output" -> {
                 String sat = asString(obj.get("satoshis"));

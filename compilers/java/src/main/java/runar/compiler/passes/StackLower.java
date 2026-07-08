@@ -114,6 +114,30 @@ public final class StackLower {
         + "9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e"
         + "01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad";
 
+    /**
+     * Issue #123: the check-preimage binding blob for a declared @sighash mode.
+     * The default ALL|FORKID (null / 0x41) returns the pinned cross-tier
+     * constant verbatim. A non-default mode swaps ONLY the appended sighash flag
+     * byte — the unique {@code 01 41 7e} subsequence (OP_PUSHDATA(1) 0x41 OP_CAT)
+     * that appends the flag to the derived DER signature — leaving every other
+     * byte byte-identical to the default blob (matching the TypeScript reference
+     * {@code checkPreimageBindingBytes(sighashFlag)}).
+     */
+    private static String checkPreimageBindingHex(Integer sighashFlag) {
+        if (sighashFlag == null || sighashFlag == SighashDirective.SIGHASH_DEFAULT) {
+            return CHECK_PREIMAGE_BINDING_HEX;
+        }
+        int marker = CHECK_PREIMAGE_BINDING_HEX.indexOf("01417e");
+        if (marker < 0) {
+            // Defensive: the constant is pinned, so this cannot happen.
+            throw new IllegalStateException("check-preimage binding: sighash flag byte not found");
+        }
+        String flagHex = String.format("%02x", sighashFlag & 0xff);
+        return CHECK_PREIMAGE_BINDING_HEX.substring(0, marker + 2)
+            + flagHex
+            + CHECK_PREIMAGE_BINDING_HEX.substring(marker + 4);
+    }
+
     // ------------------------------------------------------------------
     // State-field type classification (mirrors stack.py)
     // ------------------------------------------------------------------
@@ -923,7 +947,7 @@ public final class StackLower {
             } else if (v instanceof GetStateScript) {
                 lowerGetStateScript(name);
             } else if (v instanceof CheckPreimage cp) {
-                lowerCheckPreimage(name, cp.preimage(), idx, lastUses);
+                lowerCheckPreimage(name, cp.preimage(), cp.sighashFlag(), idx, lastUses);
             } else if (v instanceof DeserializeState ds) {
                 lowerDeserializeState(ds.preimage(), idx, lastUses);
             } else if (v instanceof AddOutput ao) {
@@ -2395,7 +2419,8 @@ public final class StackLower {
 
         // ---------------- check_preimage (OP_PUSH_TX) ----------------
 
-        void lowerCheckPreimage(String bindingName, String preimage, int idx, Map<String, Integer> lastUses) {
+        void lowerCheckPreimage(String bindingName, String preimage, Integer sighashFlag,
+                                int idx, Map<String, Integer> lastUses) {
             // OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to
             // the current spending transaction. The signature is DERIVED FROM THE
             // PREIMAGE ON CHAIN (Optimal OP_PUSH_TX): s = (hash256(preimage) + r)*
@@ -2414,8 +2439,11 @@ public final class StackLower {
             bringToTop(preimage, isLastUse(preimage, idx, lastUses));
 
             // Derive + verify the signature on-chain (single opaque raw_bytes
-            // blob, byte-identical across all 7 tiers). Net stack effect is zero.
-            emitCheckPreimageBinding();
+            // blob). For the default ALL|FORKID (sighashFlag null) the blob is
+            // byte-identical to the pinned cross-tier constant; issue #123 lets a
+            // method declare a different mode, which only changes the appended
+            // sighash flag byte. Net stack effect is zero.
+            emitCheckPreimageBinding(sighashFlag);
 
             // Preimage remains on top. Rename for field extractors.
             sm.pop();
@@ -2427,10 +2455,12 @@ public final class StackLower {
          * Emit the on-chain preimage binding as one opaque raw_bytes op. Net
          * stack effect is 0 (preimage in → preimage out), declared as in=1/out=1
          * so the static analyzer keeps the depth consistent. The bytes are the
-         * canonical construction shared byte-for-byte by all seven tiers.
+         * canonical construction shared byte-for-byte by all seven tiers for the
+         * default ALL|FORKID mode; issue #123 swaps only the appended sighash
+         * flag byte for a non-default declared mode.
          */
-        void emitCheckPreimageBinding() {
-            emitOp(new RawBytesOp(Emit.hexToBytes(CHECK_PREIMAGE_BINDING_HEX), 1, 1));
+        void emitCheckPreimageBinding(Integer sighashFlag) {
+            emitOp(new RawBytesOp(Emit.hexToBytes(checkPreimageBindingHex(sighashFlag)), 1, 1));
         }
 
         // ---------------- deserialize_state ----------------
