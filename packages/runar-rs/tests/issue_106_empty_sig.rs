@@ -67,6 +67,7 @@ fn or_checksig_artifact(pk_a_hex: &str, pk_b_hex: &str) -> RunarArtifact {
                 is_public: true,
                 is_terminal: None,
                 uses_code_part: None,
+                sig_hash_type: None,
             }],
         },
         script: or_checksig_script(pk_a_hex, pk_b_hex),

@@ -39,6 +39,18 @@ pub fn validate(contract: &ContractNode) -> ValidationResult {
     validate_methods(contract, &mut errors, &mut warnings);
     check_no_recursion(contract, &mut errors);
 
+    // Issue #123: reject preimage-field reads / output bindings that are
+    // unsound under a method's declared @sighash mode (security core). This
+    // pass emits both errors (unsound usages) and warnings (e.g. an explicit
+    // single-output SINGLE covenant whose same-index value cannot be pinned
+    // statically), so route each diagnostic to the matching bucket.
+    for d in super::sighash_validate::validate_sighash_usage(contract) {
+        match d.severity {
+            super::diagnostic::Severity::Warning => warnings.push(d),
+            _ => errors.push(d),
+        }
+    }
+
     ValidationResult { errors, warnings }
 }
 

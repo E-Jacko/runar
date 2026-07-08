@@ -317,6 +317,7 @@ mod tests {
                     params: vec![],
                     is_public: true,
                     is_terminal: None, uses_code_part: None,
+                    sig_hash_type: None,
                 }],
             },
             script: script.to_string(),

@@ -4,8 +4,9 @@
 //! subclass into a Rúnar AST.
 
 use num_bigint::BigInt;
+use swc_common::comments::{Comments, SingleThreadedComments};
 use swc_common::sync::Lrc;
-use swc_common::{FileName, SourceMap};
+use swc_common::{BytePos, FileName, SourceMap, Spanned};
 use swc_ecma_ast as swc;
 use swc_ecma_ast::{
     Accessibility, AssignExpr, AssignOp, AssignTarget, CallExpr, Callee, Class, ClassDecl,
@@ -60,9 +61,12 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
     let mut errors: Vec<Diagnostic> = Vec::new();
     let file = file_name.unwrap_or("contract.ts");
 
-    // Set up SWC parser
+    // Set up SWC parser. Collect comments so the author-facing directives
+    // `/** @embedAlways */` (#109) and `/** @sighash <FLAGS> */` (#123) — which
+    // SWC otherwise discards — can be recovered by member position.
     let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
     let fm = cm.new_source_file(Lrc::new(FileName::Custom(file.to_string())), source.to_string());
+    let comments = SingleThreadedComments::default();
     let lexer = Lexer::new(
         Syntax::Typescript(TsSyntax {
             tsx: false,
@@ -71,7 +75,7 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
         }),
         EsVersion::Es2022,
         StringInput::from(&*fm),
-        None,
+        Some(&comments),
     );
     let mut parser = Parser::new_from(lexer);
 
@@ -139,13 +143,13 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
     let class = &class_decl.class;
 
     // Extract properties
-    let properties = parse_properties(class, file, &mut errors);
+    let properties = parse_properties(class, file, &mut errors, &comments);
 
     // Extract constructor
     let constructor_node = parse_constructor(class, file, &mut errors);
 
     // Extract methods
-    let methods = parse_methods(class, file, &mut errors);
+    let methods = parse_methods(class, file, &mut errors, &comments);
 
     let contract = ContractNode {
         name: contract_name,
@@ -196,7 +200,12 @@ fn default_loc(file: &str) -> SourceLocation {
 // Properties
 // ---------------------------------------------------------------------------
 
-fn parse_properties(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) -> Vec<PropertyNode> {
+fn parse_properties(
+    class: &Class,
+    file: &str,
+    errors: &mut Vec<Diagnostic>,
+    comments: &SingleThreadedComments,
+) -> Vec<PropertyNode> {
     let mut result = Vec::new();
 
     for member in &class.body {
@@ -224,11 +233,18 @@ fn parse_properties(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) -> 
             // Parse initializer if present (SWC ClassProp.value)
             let initializer = prop.value.as_ref().map(|v| parse_expression(v, file, errors));
 
+            // Issue #109: a `/** @embedAlways */` (or `// @embedAlways`)
+            // directive immediately preceding the field opts it out of DCE.
+            let embed_always = leading_comment_text(comments, prop.span().lo)
+                .map(|t| directive_present(&t, "@embedAlways"))
+                .unwrap_or(false);
+
             result.push(PropertyNode {
                 name,
                 prop_type,
                 readonly,
                 initializer,
+                embed_always,
                 source_location: default_loc(file),
                 synthetic_array_chain: None,
             });
@@ -257,6 +273,7 @@ fn parse_constructor(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) ->
                 params,
                 body,
                 visibility: Visibility::Public,
+                sighash_type: None,
                 source_location: default_loc(file),
             };
         }
@@ -268,6 +285,7 @@ fn parse_constructor(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) ->
         params: Vec::new(),
         body: Vec::new(),
         visibility: Visibility::Public,
+        sighash_type: None,
         source_location: default_loc(file),
     }
 }
@@ -316,7 +334,12 @@ fn parse_constructor_params(
 // Methods
 // ---------------------------------------------------------------------------
 
-fn parse_methods(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) -> Vec<MethodNode> {
+fn parse_methods(
+    class: &Class,
+    file: &str,
+    errors: &mut Vec<Diagnostic>,
+    comments: &SingleThreadedComments,
+) -> Vec<MethodNode> {
     let mut result = Vec::new();
 
     for member in &class.body {
@@ -343,17 +366,105 @@ fn parse_methods(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) -> Vec
                 Vec::new()
             };
 
+            // Issue #123: `/** @sighash <FLAGS> */` directive → per-method type.
+            let sighash_type =
+                parse_sighash_on_method(comments, method.span().lo, &name, &visibility, file, errors);
+
             result.push(MethodNode {
                 name,
                 params,
                 body,
                 visibility,
+                sighash_type,
                 source_location: default_loc(file),
             });
         }
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Author-facing comment directives (#109 @embedAlways, #123 @sighash)
+// ---------------------------------------------------------------------------
+
+/// Concatenated text of the leading comments attached to `pos` (the `.lo` of a
+/// class member), or `None` when the member has no leading comment. SWC keys
+/// leading comments by the byte position of the token that follows them, so a
+/// JSDoc block / line comment immediately preceding a field or method surfaces
+/// here. Both JSDoc blocks and ordinary `//` / `/* */` trivia are collected.
+fn leading_comment_text(comments: &SingleThreadedComments, pos: BytePos) -> Option<String> {
+    let list = comments.get_leading(pos)?;
+    if list.is_empty() {
+        return None;
+    }
+    Some(
+        list.iter()
+            .map(|c| c.text.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// True when `marker` (e.g. `@sighash`, `@embedAlways`) appears in `text`
+/// followed by a word boundary — mirroring the TS reference's `/@sighash\b/`
+/// and `/@embedAlways\b/` scans so an identifier like `sighashType` inside a
+/// comment does not trip detection.
+fn directive_present(text: &str, marker: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(marker) {
+        let after = start + pos + marker.len();
+        let boundary =
+            after >= bytes.len() || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+        if boundary {
+            return true;
+        }
+        start += pos + 1;
+    }
+    false
+}
+
+/// Detect + parse a `/** @sighash <FLAGS> */` directive on a method by its
+/// leading comment. Returns the numeric sighash type, or `None` when absent.
+/// Pushes an error for a malformed flag list or a directive on a non-public
+/// method (only public methods are spending entry points). Mirrors the TS
+/// reference `parseSighashOnMethod`.
+fn parse_sighash_on_method(
+    comments: &SingleThreadedComments,
+    pos: BytePos,
+    name: &str,
+    visibility: &Visibility,
+    file: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<i64> {
+    let text = leading_comment_text(comments, pos)?;
+    if !directive_present(&text, "@sighash") {
+        return None;
+    }
+
+    if *visibility != Visibility::Public {
+        errors.push(Diagnostic::error(
+            format!(
+                "@sighash directive on non-public method '{}' has no effect — only public methods are spending entry points",
+                name
+            ),
+            Some(default_loc(file)),
+        ));
+        return None;
+    }
+
+    match super::sighash_directive::extract_sighash_directive(&text) {
+        None => None,
+        Some(Ok(value)) => Some(value),
+        Some(Err(msg)) => {
+            errors.push(Diagnostic::error(
+                format!("Method '{}': {}", name, msg),
+                Some(default_loc(file)),
+            ));
+            None
+        }
+    }
 }
 
 fn parse_method_params(
@@ -1641,20 +1752,6 @@ pub fn parse_source(source: &str, file_name: Option<&str>) -> ParseResult {
             source_size_err: Some(sse),
         };
     }
-    // Fail-closed guard for the author-facing comment directives that only
-    // the TypeScript compiler implements today: `@sighash <FLAGS>` (#123,
-    // per-method sighash type) and `@embedAlways` (#109, readonly-field DCE
-    // opt-out). The Rust frontend ignores comments, so it would silently drop
-    // these directives and change signing / DCE semantics. Reject rather than
-    // diverge until the ports land.
-    if let Some(msg) = unsupported_directive_error(source) {
-        return ParseResult {
-            contract: None,
-            errors: vec![Diagnostic::error(msg.to_string(), None)],
-            source_size_err: None,
-        };
-    }
-
     let name = file_name.unwrap_or("contract.ts");
     if name.ends_with(".runar.sol") {
         return super::parser_sol::parse_solidity(source, file_name);
@@ -1684,43 +1781,6 @@ pub fn parse_source(source: &str, file_name: Option<&str>) -> ParseResult {
     parse(source, file_name)
 }
 
-/// Report the first unsupported author-facing comment directive in `source`,
-/// or `None` when the source is clean. Word-boundary matched to mirror the
-/// TypeScript compiler's `/@sighash\b/` / `/@embedAlways\b/` scans so an
-/// identifier like `sighashType` does not trip the guard.
-fn unsupported_directive_error(source: &str) -> Option<&'static str> {
-    if contains_directive_token(source, "@sighash") {
-        return Some(
-            "@sighash directive is not yet supported by the Rust compiler (issue #123); \
-             compile the contract with the TypeScript compiler",
-        );
-    }
-    if contains_directive_token(source, "@embedAlways") {
-        return Some(
-            "@embedAlways directive is not yet supported by the Rust compiler (issue #109); \
-             compile the contract with the TypeScript compiler",
-        );
-    }
-    None
-}
-
-/// True when `marker` (which begins with a non-word `@`) appears in `source`
-/// followed by a word boundary — i.e. the next byte is not `[A-Za-z0-9_]`.
-fn contains_directive_token(source: &str, marker: &str) -> bool {
-    let bytes = source.as_bytes();
-    let mut start = 0;
-    while let Some(pos) = source[start..].find(marker) {
-        let after = start + pos + marker.len();
-        let boundary =
-            after >= bytes.len() || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
-        if boundary {
-            return true;
-        }
-        start += pos + 1;
-    }
-    false
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1728,44 +1788,6 @@ fn contains_directive_token(source: &str, marker: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_source_rejects_sighash_directive() {
-        let src = r#"
-            class Counter extends SmartContract {
-                readonly x: bigint;
-                constructor(x: bigint) { super(x); }
-                /** @sighash SINGLE|FORKID */
-                public unlock() {}
-            }
-        "#;
-        let result = parse_source(src, Some("Counter.runar.ts"));
-        assert!(!result.errors.is_empty(), "expected fail-closed error for @sighash");
-        let joined = result.error_strings().join("\n");
-        assert!(
-            joined.contains("@sighash") && joined.contains("#123"),
-            "expected @sighash/#123 fail-closed error, got: {joined}"
-        );
-    }
-
-    #[test]
-    fn test_parse_source_rejects_embed_always_directive() {
-        let src = r#"
-            class Counter extends SmartContract {
-                /** @embedAlways */
-                readonly x: bigint;
-                constructor(x: bigint) { super(x); }
-                public unlock() {}
-            }
-        "#;
-        let result = parse_source(src, Some("Counter.runar.ts"));
-        assert!(!result.errors.is_empty(), "expected fail-closed error for @embedAlways");
-        let joined = result.error_strings().join("\n");
-        assert!(
-            joined.contains("@embedAlways") && joined.contains("#109"),
-            "expected @embedAlways/#109 fail-closed error, got: {joined}"
-        );
-    }
 
     #[test]
     fn test_parse_source_allows_non_directive_identifier() {
@@ -1783,6 +1805,150 @@ mod tests {
             "directive guard tripped on a non-directive identifier: {:?}",
             result.error_strings()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #109 @embedAlways directive detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_embed_always_jsdoc_directive_sets_flag() {
+        let src = r#"
+            class Meta extends SmartContract {
+                readonly pubKeyHash: Ripemd160;
+                /** @embedAlways */
+                readonly metadataId: ByteString;
+                constructor(pubKeyHash: Ripemd160, metadataId: ByteString) {
+                    super(pubKeyHash, metadataId);
+                    this.pubKeyHash = pubKeyHash;
+                    this.metadataId = metadataId;
+                }
+                public unlock(sig: Sig, pubKey: PubKey) {
+                    assert(hash160(pubKey) === this.pubKeyHash);
+                    assert(checkSig(sig, pubKey));
+                }
+            }
+        "#;
+        let r = parse_source(src, Some("Meta.runar.ts"));
+        assert!(r.errors.is_empty(), "unexpected errors: {:?}", r.error_strings());
+        let c = r.contract.unwrap();
+        let meta = c.properties.iter().find(|p| p.name == "metadataId").unwrap();
+        assert!(meta.embed_always, "metadataId should carry embed_always");
+        let pkh = c.properties.iter().find(|p| p.name == "pubKeyHash").unwrap();
+        assert!(!pkh.embed_always, "un-annotated field must stay unset");
+    }
+
+    #[test]
+    fn test_embed_always_line_comment_directive() {
+        let src = r#"
+            class Meta extends SmartContract {
+                // @embedAlways
+                readonly metadataId: ByteString;
+                constructor(metadataId: ByteString) { super(metadataId); this.metadataId = metadataId; }
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("Meta.runar.ts"));
+        let c = r.contract.unwrap();
+        let meta = c.properties.iter().find(|p| p.name == "metadataId").unwrap();
+        assert!(meta.embed_always, "line-comment @embedAlways should set flag");
+    }
+
+    #[test]
+    fn test_embed_always_absent() {
+        let src = r#"
+            class Meta extends SmartContract {
+                readonly metadataId: ByteString;
+                constructor(metadataId: ByteString) { super(metadataId); this.metadataId = metadataId; }
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("Meta.runar.ts"));
+        let c = r.contract.unwrap();
+        let meta = c.properties.iter().find(|p| p.name == "metadataId").unwrap();
+        assert!(!meta.embed_always);
+    }
+
+    // -----------------------------------------------------------------------
+    // #123 @sighash directive detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sighash_directive_single_forkid() {
+        let src = r#"
+            class C extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); this.x = x; }
+                /** @sighash SINGLE|FORKID */
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("C.runar.ts"));
+        assert!(r.errors.is_empty(), "unexpected errors: {:?}", r.error_strings());
+        let c = r.contract.unwrap();
+        let m = c.methods.iter().find(|m| m.name == "unlock").unwrap();
+        assert_eq!(m.sighash_type, Some(0x43));
+    }
+
+    #[test]
+    fn test_sighash_absent_defaults_none() {
+        let src = r#"
+            class C extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); this.x = x; }
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("C.runar.ts"));
+        let c = r.contract.unwrap();
+        let m = c.methods.iter().find(|m| m.name == "unlock").unwrap();
+        assert_eq!(m.sighash_type, None);
+    }
+
+    #[test]
+    fn test_sighash_on_private_method_errors() {
+        let src = r#"
+            class C extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); this.x = x; }
+                /** @sighash SINGLE|FORKID */
+                private helper() {}
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("C.runar.ts"));
+        let joined = r.error_strings().join("\n");
+        assert!(joined.contains("non-public method"), "expected non-public error, got: {joined}");
+    }
+
+    #[test]
+    fn test_sighash_unknown_flag_errors() {
+        let src = r#"
+            class C extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); this.x = x; }
+                /** @sighash BOGUS|FORKID */
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("C.runar.ts"));
+        let joined = r.error_strings().join("\n");
+        assert!(joined.contains("unknown flag"), "expected unknown-flag error, got: {joined}");
+    }
+
+    #[test]
+    fn test_sighash_missing_forkid_errors() {
+        let src = r#"
+            class C extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); this.x = x; }
+                /** @sighash SINGLE */
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("C.runar.ts"));
+        let joined = r.error_strings().join("\n");
+        assert!(joined.contains("FORKID is mandatory"), "expected FORKID error, got: {joined}");
     }
 
     // -----------------------------------------------------------------------

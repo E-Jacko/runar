@@ -846,6 +846,7 @@ mod tests {
                     params: vec![],
                     body: vec![],
                     is_public: false,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "m1".to_string(),
@@ -883,6 +884,7 @@ mod tests {
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "m2".to_string(),
@@ -920,6 +922,7 @@ mod tests {
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
             ],
         };
@@ -1082,6 +1085,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -1190,6 +1194,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -1302,6 +1307,7 @@ mod tests {
                     }],
                     body: vec![],
                     is_public: false,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "check".to_string(),
@@ -1337,6 +1343,7 @@ mod tests {
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
             ],
         };

@@ -425,7 +425,7 @@ fn collect_refs(value: &ANFValue) -> Vec<String> {
         ANFValue::UpdateProp { value, .. } => {
             refs.push(value.clone());
         }
-        ANFValue::CheckPreimage { preimage } => {
+        ANFValue::CheckPreimage { preimage, .. } => {
             refs.push(preimage.clone());
         }
         ANFValue::DeserializeState { preimage } => {
@@ -1118,8 +1118,8 @@ impl LoweringContext {
             ANFValue::GetStateScript {} => {
                 self.lower_get_state_script(name);
             }
-            ANFValue::CheckPreimage { preimage } => {
-                self.lower_check_preimage(name, preimage, binding_index, last_uses);
+            ANFValue::CheckPreimage { preimage, sighash_flag } => {
+                self.lower_check_preimage(name, preimage, *sighash_flag, binding_index, last_uses);
             }
             ANFValue::DeserializeState { preimage } => {
                 self.lower_deserialize_state(preimage, binding_index, last_uses);
@@ -2841,6 +2841,7 @@ impl LoweringContext {
         &mut self,
         binding_name: &str,
         preimage: &str,
+        sighash_flag: Option<i64>,
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
@@ -2860,9 +2861,12 @@ impl LoweringContext {
         let is_last = self.is_last_use(preimage, binding_index, last_uses);
         self.bring_to_top(preimage, is_last);
 
-        // Derive + verify the signature on-chain (single opaque raw_bytes blob,
-        // byte-identical across all 7 tiers). Net stack effect is zero.
-        self.emit_check_preimage_binding();
+        // Derive + verify the signature on-chain (single opaque raw_bytes blob).
+        // For the default ALL|FORKID (sighash_flag None) the blob is
+        // byte-identical to the pinned cross-tier constant; issue #123 lets a
+        // method declare a different mode, which only changes the appended
+        // sighash flag byte. Net stack effect is zero.
+        self.emit_check_preimage_binding(sighash_flag);
 
         // The preimage is now on top. Rename to binding name so field extractors
         // can reference it.
@@ -2876,9 +2880,9 @@ impl LoweringContext {
     /// effect is 0 (preimage in → preimage out), declared as in=1/out=1 so the
     /// static analyzer keeps the depth consistent. The stack tracker is updated
     /// by the caller (`lower_check_preimage`), mirroring the Go reference.
-    fn emit_check_preimage_binding(&mut self) {
+    fn emit_check_preimage_binding(&mut self, sighash_flag: Option<i64>) {
         self.emit_op(StackOp::RawBytes {
-            bytes: super::oppushtx::check_preimage_binding_bytes(),
+            bytes: super::oppushtx::check_preimage_binding_bytes_with_flag(sighash_flag),
             in_arity: 1,
             out_arity: 1,
         });
@@ -5012,6 +5016,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         }
     }
@@ -5213,6 +5218,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5318,6 +5324,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5392,6 +5399,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5443,6 +5451,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5500,6 +5509,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5566,6 +5576,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5650,6 +5661,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5768,6 +5780,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5849,6 +5862,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5919,6 +5933,7 @@ mod tests {
                     params: vec![],
                     body: vec![],
                     is_public: false,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "method1".to_string(),
@@ -5956,6 +5971,7 @@ mod tests {
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "method2".to_string(),
@@ -5993,6 +6009,7 @@ mod tests {
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
             ],
         };
@@ -6044,6 +6061,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -6132,6 +6150,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -6257,6 +6276,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -6329,6 +6349,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 

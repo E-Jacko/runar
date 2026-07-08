@@ -1057,6 +1057,7 @@ mod tests {
                 params: vec![],
                 is_public: true,
                 is_terminal: None, uses_code_part: None,
+                sig_hash_type: None,
             }],
             None,
         );
@@ -1089,6 +1090,7 @@ mod tests {
                 ],
                 is_public: true,
                 is_terminal: None, uses_code_part: None,
+                sig_hash_type: None,
             }],
             None,
         );
@@ -1132,6 +1134,7 @@ mod tests {
                 ],
                 is_public: true,
                 is_terminal: None, uses_code_part: None,
+                sig_hash_type: None,
             }],
             Some(vec![StateField {
                 name: "count".to_string(),
@@ -1163,6 +1166,7 @@ mod tests {
                 params: vec![],
                 is_public: true,
                 is_terminal: None, uses_code_part: None,
+                sig_hash_type: None,
             }],
             None,
         );

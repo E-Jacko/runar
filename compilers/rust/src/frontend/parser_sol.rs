@@ -504,6 +504,7 @@ impl<'a> SolParser<'a> {
                 body: Vec::new(),
                 visibility: Visibility::Public,
                 source_location: self.loc(),
+                sighash_type: None,
             }
         });
 
@@ -576,6 +577,7 @@ impl<'a> SolParser<'a> {
             initializer,
             source_location: self.loc(),
             synthetic_array_chain: None,
+            embed_always: false,
         }
     }
 
@@ -714,6 +716,7 @@ impl<'a> SolParser<'a> {
             body: std::iter::once(super_call).chain(fixed_body).collect(),
             visibility: Visibility::Public,
             source_location: loc,
+            sighash_type: None,
         }
     }
 
@@ -785,6 +788,7 @@ impl<'a> SolParser<'a> {
             body,
             visibility,
             source_location: self.loc(),
+            sighash_type: None,
         }
     }
 
