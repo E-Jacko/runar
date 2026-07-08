@@ -54,6 +54,28 @@ public final class TransactionBuilder {
         long satoshis,
         String changeAddress
     ) {
+        return buildDeployWithLockingScript(
+            lockingScriptHex, provider, signer, satoshis, changeAddress, signer
+        );
+    }
+
+    /**
+     * Deploy variant that signs the P2PKH funding inputs with a separate
+     * {@code fundingSigner} (issue #134). The funding-UTXO lookup and the
+     * default change address still come from the deploy {@code signer}
+     * (mirroring the TS SDK's {@code DeployOptions.fundingSigner}); only the
+     * per-input signature + pushed pubkey use {@code fundingSigner}. Pass
+     * {@code fundingSigner == signer} for the default (zero behaviour change).
+     */
+    public static DeployResult buildDeployWithLockingScript(
+        String lockingScriptHex,
+        Provider provider,
+        Signer signer,
+        long satoshis,
+        String changeAddress,
+        Signer fundingSigner
+    ) {
+        Signer funder = fundingSigner != null ? fundingSigner : signer;
         String funderAddress = signer.address();
         List<UTXO> all = provider.listUtxos(funderAddress);
         if (all.isEmpty()) {
@@ -86,12 +108,12 @@ public final class TransactionBuilder {
             tx.addOutput(change, ScriptUtils.buildP2PKHScript(effectiveChangeAddr));
         }
 
-        // Sign each P2PKH funding input.
+        // Sign each P2PKH funding input (with fundingSigner — issue #134).
         for (int i = 0; i < selected.size(); i++) {
             UTXO u = selected.get(i);
             byte[] sighash = tx.sighashBIP143(i, u.scriptHex(), u.satoshis(), RawTx.SIGHASH_ALL_FORKID);
-            byte[] der = signer.sign(sighash, null);
-            byte[] pub = signer.pubKey();
+            byte[] der = funder.sign(sighash, null);
+            byte[] pub = funder.pubKey();
             String sigHex = ScriptUtils.bytesToHex(der)
                 + String.format("%02x", RawTx.SIGHASH_ALL_FORKID);
             String unlockHex = ScriptUtils.encodePushData(sigHex)
