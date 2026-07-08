@@ -625,6 +625,15 @@ pub fn emitArtifact(
             if (stack_lower.methodUsesCodePartFull(stack_lower.methodBindings(method), anf_program.properties)) {
                 try w.writeAll(",\"usesCodePart\":true");
             }
+            // Issue #123: carry a non-default @sighash mode into the ABI so the
+            // SDK builds the BIP-143 preimage under the same flags the covenant
+            // expects. Omitted for the default (0x41) so existing artifacts are
+            // byte-identical.
+            if (method.is_public) {
+                if (method.sighash_type) |st| {
+                    try w.print(",\"sigHashType\":{d}", .{st});
+                }
+            }
             try w.writeByte('}');
         }
     }
@@ -962,6 +971,12 @@ fn emitANFValueJson(w: anytype, value: types.ANFValue) error{OutOfMemory}!void {
         .check_preimage => |cp| {
             try w.writeAll("{\"kind\":\"check_preimage\",\"preimage\":");
             try writeJsonString(w, cp.preimage);
+            // Issue #123: emit the non-default sighash flag only when set, so
+            // the golden ANF for every existing (default ALL|FORKID) contract
+            // is byte-identical.
+            if (cp.sighash_flag != 0) {
+                try w.print(",\"sighashFlag\":{d}", .{cp.sighash_flag});
+            }
             try w.writeByte('}');
         },
         .deserialize_state => |ds| {

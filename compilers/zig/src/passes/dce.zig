@@ -164,8 +164,12 @@ pub fn hasSideEffect(v: types.ANFValue) bool {
         // when the binding is unreferenced.
         .raw_script,
         => true,
+        // Issue #109 (@embedAlways): a load_prop injected to force a readonly
+        // field into the deployed locking script carries `preserve = true`, so
+        // DCE must keep it even though nothing references it. Ordinary
+        // load_props (preserve = false) remain freely eliminable.
+        .load_prop => |lp| lp.preserve,
         .load_param,
-        .load_prop,
         .load_const,
         .bin_op,
         .unary_op,

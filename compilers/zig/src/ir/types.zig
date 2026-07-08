@@ -142,6 +142,17 @@ pub const PropertyNode = struct {
     type_info: RunarType,
     readonly: bool,
     initializer: ?Expression = null,
+    /// Set by the `.runar.ts` surface parser when a `/** @embedAlways */` (or
+    /// `// @embedAlways`) comment directive immediately precedes a readonly
+    /// field (issue #109). Opts the field OUT of dead-code elimination: a
+    /// readonly field no method references is normally stripped from the
+    /// locking script (its load_prop is dead, so no constructor slot is
+    /// emitted), silently dropping deploy-time metadata an author intends to
+    /// recover from the on-chain script later. When set, ANF lowering forces
+    /// the field into the script (a constructor slot) so its bytes survive.
+    /// Only meaningful on readonly fields; honoured only on the `.runar.ts`
+    /// surface (the other 8 formats fail closed at the parse dispatch).
+    embed_always: bool = false,
     /// Non-zero when `type_info == .fixed_array` (set by the parser) or when
     /// we want to remember the original outer length for post-expansion.
     fixed_array_length: u32 = 0,
@@ -155,7 +166,20 @@ pub const PropertyNode = struct {
     synthetic_array_chain: ?[]const SyntheticArrayLevel = null,
 };
 pub const ConstructorNode = struct { params: []ParamNode, super_args: []Expression, assignments: []AssignmentNode };
-pub const MethodNode = struct { name: []const u8, is_public: bool, params: []ParamNode, body: []Statement, source_loc: ?SourceLocation = null };
+pub const MethodNode = struct {
+    name: []const u8,
+    is_public: bool,
+    params: []ParamNode,
+    body: []Statement,
+    source_loc: ?SourceLocation = null,
+    /// BIP-143 sighash type declared via a `/** @sighash <FLAGS> */` directive
+    /// on a public method (issue #123), e.g. 0x43 for SINGLE|FORKID. Null = no
+    /// directive = the default ALL|FORKID (0x41), byte-identical to the
+    /// historically-pinned mode. Drives the auto-injected preimage-type assert,
+    /// the OP_PUSH_TX binding flag, the ABI sigHashType, and the SDK-side
+    /// preimage construction. Honoured only on the `.runar.ts` surface.
+    sighash_type: ?i32 = null,
+};
 pub const ParamNode = struct { name: []const u8, type_info: RunarType = .unknown, type_name: []const u8 = "" };
 pub const ANFParam = ParamNode;
 pub const AssignmentNode = struct { target: []const u8, value: Expression };
@@ -297,6 +321,14 @@ pub const ANFMethod = struct {
     params: []ParamNode = &.{},
     bindings: []ANFBinding = &.{},
     body: []ANFBinding = &.{},
+    /// Non-default BIP-143 sighash mode a `@sighash` directive declared for
+    /// this (public) method (issue #123), e.g. 0x43 for SINGLE|FORKID. Null =
+    /// default ALL|FORKID (0x41). In-memory carrier only — never serialized
+    /// into the ANF IR JSON compared cross-tier (the codegen-relevant flag
+    /// rides on each check_preimage node's sighash_flag). The artifact
+    /// assembler copies it to ABIMethod.sighash_type so the SDK builds a
+    /// matching preimage.
+    sighash_type: ?i32 = null,
 };
 pub const ANFBinding = struct { name: []const u8, value: ANFValue, source_loc: ?SourceLocation = null };
 
@@ -363,7 +395,20 @@ pub const ANFValue = union(enum) {
 
 // -- TypeScript-matching value structs (used by stack_lower.zig) --
 pub const LoadParam = struct { name: []const u8 };
-pub const LoadProp = struct { name: []const u8 };
+pub const LoadProp = struct {
+    name: []const u8,
+    /// Issue #109 (@embedAlways): when true, dead-binding DCE must NOT remove
+    /// this load_prop even though nothing references it, so the readonly field
+    /// it loads survives into the deployed locking script (a constructor slot).
+    /// The TypeScript reference relies on a single-pass DCE + a `@ref` alias to
+    /// keep the load_prop alive; the Zig `ec_optimizer` runs a fixpoint DCE that
+    /// would strip such an unreferenced alias chain, so the Zig tier marks the
+    /// injected load_prop directly and teaches `dce.hasSideEffect` to honour it.
+    /// The observable output (constructor slot + OP_NIP cleanup) is byte-identical
+    /// to the TS reference. In-memory only — never serialized into the ANF JSON,
+    /// so existing (default false) load_props stay byte-identical cross-tier.
+    preserve: bool = false,
+};
 pub const LoadConst = struct { value: ConstValue };
 pub const BinOp = struct { op: []const u8, left: []const u8, right: []const u8, result_type: ?[]const u8 = null };
 pub const ANFUnaryOp = struct { op: []const u8, operand: []const u8, result_type: ?[]const u8 = null };
@@ -387,7 +432,16 @@ pub const ANFAssert = struct {
     is_auto_injected_state_check: bool = false,
 };
 pub const UpdateProp = struct { name: []const u8, value: []const u8 };
-pub const CheckPreimage = struct { preimage: []const u8 };
+pub const CheckPreimage = struct {
+    preimage: []const u8,
+    /// Issue #123: the BIP-143 sighash flag the on-chain OP_PUSH_TX binding
+    /// appends to the derived signature (so the node re-derives the tx sighash
+    /// under this flag). 0 = default ALL|FORKID (0x41), byte-identical to the
+    /// pinned cross-tier binding blob. Only set for a method that declares a
+    /// non-default @sighash mode, keeping golden ANF unchanged for every
+    /// existing contract.
+    sighash_flag: i32 = 0,
+};
 pub const DeserializeState = struct { preimage: []const u8 };
 pub const ANFAddOutput = struct { satoshis: []const u8, state_values: []const []const u8 = &.{}, preimage: []const u8 = "", state_refs: []const []const u8 = &.{} };
 pub const ANFAddRawOutput = struct { satoshis: []const u8, script_bytes: []const u8 = "" };
@@ -531,7 +585,17 @@ pub const RunarArtifact = struct {
 pub const Artifact = RunarArtifact;
 pub const ABI = struct { constructor: ABIConstructor, methods: []ABIMethod };
 pub const ABIConstructor = struct { params: []ABIParam };
-pub const ABIMethod = struct { name: []const u8, params: []ABIParam, is_public: bool, is_terminal: bool = false };
+pub const ABIMethod = struct {
+    name: []const u8,
+    params: []ABIParam,
+    is_public: bool,
+    is_terminal: bool = false,
+    /// Issue #123: the BIP-143 sighash type this method's preimage/covenant is
+    /// built under (from a `@sighash` directive), e.g. 0x43 for SINGLE|FORKID.
+    /// Null = default ALL|FORKID (0x41); the SDK falls back to 0x41 so existing
+    /// artifacts are unchanged. Emitted into the artifact JSON only when set.
+    sighash_type: ?i32 = null,
+};
 pub const ABIParam = struct { name: []const u8, type_name: []const u8 };
 pub const ConstructorSlot = struct { param_index: usize, byte_offset: usize };
 pub const CodeSepIndexSlot = struct { byte_offset: usize, code_sep_index: usize };

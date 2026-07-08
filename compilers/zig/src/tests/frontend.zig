@@ -563,11 +563,14 @@ test "frontend: compileSource end-to-end for every non-Zig parser produces hex" 
     }
 }
 
-// The @sighash (#123) and @embedAlways (#109) comment directives are
-// implemented only in the TypeScript compiler. The Zig compiler must fail
-// closed rather than silently drop them.
+// The @sighash (#123) and @embedAlways (#109) comment directives are now
+// honoured on the TypeScript (.runar.ts) surface parser, matching the TS
+// reference compiler. The eight non-TS surface parsers do NOT read comments,
+// so the parse dispatch fails closed on those formats rather than silently
+// drop a security-critical directive. These tests pin both halves of that
+// policy (mirrors the Go tier's repurposed guard tests).
 
-test "frontend guard: @sighash directive is rejected (fail closed)" {
+test "frontend guard: .runar.ts honours @sighash directive (compiles, not rejected)" {
     const src =
         \\class Counter extends SmartContract {
         \\  readonly x: bigint;
@@ -576,11 +579,12 @@ test "frontend guard: @sighash directive is rejected (fail closed)" {
         \\  public unlock() { assert(true); }
         \\}
     ;
-    const result = compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.ts");
-    try std.testing.expectError(error.ParseFailed, result);
+    const hex = try compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.ts");
+    defer std.testing.allocator.free(hex);
+    try std.testing.expect(hex.len > 0);
 }
 
-test "frontend guard: @embedAlways directive is rejected (fail closed)" {
+test "frontend guard: .runar.ts honours @embedAlways directive (compiles, not rejected)" {
     const src =
         \\class Counter extends SmartContract {
         \\  /** @embedAlways */
@@ -589,7 +593,31 @@ test "frontend guard: @embedAlways directive is rejected (fail closed)" {
         \\  public unlock() { assert(true); }
         \\}
     ;
-    const result = compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.ts");
+    const hex = try compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.ts");
+    defer std.testing.allocator.free(hex);
+    try std.testing.expect(hex.len > 0);
+}
+
+test "frontend guard: non-TS surface rejects @sighash directive (fail closed)" {
+    // A .runar.sol surface parser ignores comments, so the guard must fire.
+    const src =
+        \\contract Counter {
+        \\  // @sighash SINGLE|FORKID
+        \\  function unlock() public {}
+        \\}
+    ;
+    const result = compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.sol");
+    try std.testing.expectError(error.ParseFailed, result);
+}
+
+test "frontend guard: non-TS surface rejects @embedAlways directive (fail closed)" {
+    const src =
+        \\contract Counter {
+        \\  // @embedAlways
+        \\  uint x;
+        \\}
+    ;
+    const result = compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.sol");
     try std.testing.expectError(error.ParseFailed, result);
 }
 
