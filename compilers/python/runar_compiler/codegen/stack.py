@@ -1080,13 +1080,49 @@ class _LoweringContext:
             self._push_property_value(prop.initial_value)
         else:
             # Property value will be provided at deployment time; emit placeholder
+            # for its constructor slot.
+            #
+            # #119 tail (H1): a property that reaches this fallback with no
+            # matching constructor slot has no deploy-time bytes of its own. The
+            # previous behaviour left param_index at the count of ctor-param
+            # props, silently emitting a placeholder for an UNRELATED
+            # constructor argument's slot and splicing the wrong deploy-time
+            # bytes into the locking script -- a silent-wrong-code path. Fail
+            # loudly instead. (A real constructor-param property -- readonly, or
+            # a mutable state field whose initial value is spliced at deploy --
+            # is found here and is unaffected.)
             param_index = 0
+            found = False
+            ctor_params: list[str] = []
             for p in self.properties:
                 if p.initial_value is not None:
                     continue
+                ctor_params.append(p.name)
                 if p.name == prop_name:
+                    found = True
                     break
                 param_index += 1
+            # A true ghost is a name absent from a NON-EMPTY registered
+            # constructor-param list -- exactly the silent-wrong-code case where
+            # the old code coerced it onto an unrelated registered slot. When no
+            # constructor-param property is registered (an empty ``ctor_params``
+            # -- e.g. a ``.runar.ts`` contract whose only constructor param is
+            # declared inline as ``readonly n`` and never surfaces as a property
+            # in this tier's TS parser), the name may still be a legitimate
+            # slot-0 argument, so preserve the historical placeholder rather than
+            # false-positive on a valid deploy-time slot.
+            if not found and ctor_params:
+                loc = ""
+                if self.current_source_loc is not None:
+                    sl = self.current_source_loc
+                    loc = f" at {sl.file}:{sl.line}:{sl.column}"
+                raise RuntimeError(
+                    f"Stack lowering: property '{prop_name}'{loc} is neither on "
+                    f"the stack, initialized, nor a constructor parameter, so it "
+                    f"has no deploy-time slot. Refusing to emit a placeholder for "
+                    f"an unrelated constructor argument (slot 0). Known "
+                    f"constructor-param properties: [{', '.join(ctor_params)}]."
+                )
             self.emit_op(StackOp(op="placeholder", param_index=param_index, param_name=prop_name))
         self.sm.push(binding_name)
 
