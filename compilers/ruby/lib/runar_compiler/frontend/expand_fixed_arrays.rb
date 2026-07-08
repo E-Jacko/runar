@@ -331,7 +331,9 @@ module RunarCompiler
           params: method.params,
           body: new_body,
           visibility: method.visibility,
-          source_location: method.source_location
+          source_location: method.source_location,
+          # Preserve the declared @sighash mode (issue #123) across expansion.
+          sighash_type: method.sighash_type
         )
       end
 

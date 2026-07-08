@@ -12,9 +12,14 @@
 require "json"
 require_relative "../ir/types"
 require_relative "ast_nodes"
+require_relative "sighash_directive"
 
 module RunarCompiler
   module Frontend
+    # SIGHASH_ALL | SIGHASH_FORKID — the default @sighash mode (issue #123).
+    # Byte-identical to the historically-pinned covenant binding blob.
+    SIGHASH_DEFAULT = SighashDirective::SIGHASH_DEFAULT
+
     # -------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------
@@ -169,9 +174,30 @@ module RunarCompiler
         is_public: false
       )
 
+      # Issue #109: readonly fields carrying a +/** @embedAlways */+ directive
+      # must survive DCE into the locking script. A readonly field no method
+      # references lowers to no +load_prop+, so no constructor slot is emitted
+      # and the field's deploy-time bytes vanish. Inject a +load_prop+ + a
+      # +@ref:+ alias (the exact shape +const _bind = this.field;+ produces)
+      # into the first public method's body — the alias keeps the +load_prop+
+      # alive through dead-binding DCE, and stack lowering threads the pushed
+      # value through and cleans it up at method end. One slot in the deployed
+      # script suffices; every spending branch shares it.
+      embed_fields = contract.properties.select { |p| p.readonly && _embed_always?(p) }
+      embed_injected = false
+
       # Lower each method
       contract.methods.each do |method|
         method_ctx = LoweringContext.new(contract)
+
+        # Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+        # flag for any checkPreimage (auto-injected below, or a manual call) in
+        # this method. Omitted for the default so the ANF (and pinned binding
+        # blob) is unchanged.
+        method_sighash = method.respond_to?(:sighash_type) ? method.sighash_type : nil
+        if !method_sighash.nil? && method_sighash != SIGHASH_DEFAULT
+          method_ctx.sighash_flag = method_sighash
+        end
 
         # Register the developer-declared param types scoped to this method
         # before lowering its body, so byte-type analysis sees only this
@@ -221,21 +247,30 @@ module RunarCompiler
           method_ctx.add_param("txPreimage")
           method_ctx.register_param_type("txPreimage", "SigHashPreimage")
 
+          # Issue #123: the declared per-method sighash mode (default ALL|FORKID).
+          # Drives BOTH the OP_PUSH_TX binding flag (so the derived sig re-computes
+          # the tx sighash under this mode) AND the runtime preimage-type assert.
+          sighash_mode = method_sighash.nil? ? SIGHASH_DEFAULT : method_sighash
+          is_default_sighash = sighash_mode == SIGHASH_DEFAULT
+
           # Inject checkPreimage(txPreimage) at the start
           preimage_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
-          check_result = method_ctx.emit(IR::ANFValue.new(kind: "check_preimage").tap { |v| v.preimage = preimage_ref })
+          check_result = method_ctx.emit(IR::ANFValue.new(kind: "check_preimage").tap do |v|
+            v.preimage = preimage_ref
+            # Omit for the default so the ANF (and pinned binding blob) is unchanged.
+            v.sighash_flag = sighash_mode unless is_default_sighash
+          end)
           method_ctx.emit(_make_assert(check_result))
 
-          # GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-          # auto-injected covenant cannot be spent under a permissive sighash
-          # flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
-          # a contract may read. The hashOutputs continuation already fails
-          # under non-ALL flags, so this is a no-op on spendability for
-          # continuation-using methods and closes the field-zeroing exposure
-          # for the rest.
+          # GAP-302 / #123: pin the sighash type to the declared mode. The
+          # auto-injected covenant verifies a real tx preimage, but without this
+          # check the spend could use a DIFFERENT sighash flag than declared that
+          # zeroes out preimage fields the contract (or its continuation) relies
+          # on (hashOutputs / hashPrevouts / hashSequence). The value defaults to
+          # 0x41 (SIGHASH_ALL|FORKID) so existing contracts emit byte-identical ANF.
           sig_hash_preimage_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
           sig_hash_type_ref = method_ctx.emit(_make_call("extractSigHashType", [sig_hash_preimage_ref]))
-          expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(0x41))
+          expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(sighash_mode))
           sig_hash_ok_ref = method_ctx.emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
             v.op = "==="
             v.left = sig_hash_type_ref
@@ -248,6 +283,14 @@ module RunarCompiler
           if has_state_prop
             preimage_ref3 = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
             method_ctx.emit(IR::ANFValue.new(kind: "deserialize_state").tap { |v| v.preimage = preimage_ref3 })
+          end
+
+          # Issue #109: preserve @embedAlways fields at the first user-statement
+          # position (after the checkPreimage/deserialize preamble), mirroring
+          # where a `const _bind = this.field;` idiom would sit.
+          if !embed_injected && embed_fields.any?
+            _emit_embed_always_preservation(method_ctx, embed_fields)
+            embed_injected = true
           end
 
           # Lower the developer's method body
@@ -371,9 +414,17 @@ module RunarCompiler
             name: method.name,
             params: augmented_params,
             body: method_ctx.bindings,
-            is_public: true
+            is_public: true,
+            sighash_type: method_sighash
           )
         else
+          # Issue #109: stateless public methods (and stateless contracts'
+          # spending entry points) are lowered here — inject @embedAlways
+          # preservation into the first PUBLIC one before its body.
+          if !embed_injected && embed_fields.any? && method.visibility == "public"
+            _emit_embed_always_preservation(method_ctx, embed_fields)
+            embed_injected = true
+          end
           method_ctx.lower_statements(method.body)
           augmented = _lower_params(
             method.params.reject { |p| _is_stateful_context_param(p) }
@@ -389,7 +440,8 @@ module RunarCompiler
             name: method.name,
             params: augmented,
             body: method_ctx.bindings,
-            is_public: method.visibility == "public"
+            is_public: method.visibility == "public",
+            sighash_type: method_sighash
           )
         end
       end
@@ -397,6 +449,33 @@ module RunarCompiler
       result
     end
     private_class_method :_lower_methods
+
+    # True when a property carries the +/** @embedAlways */+ directive (#109).
+    # PropertyNode gained the +embed_always+ field with the directive; guard
+    # +respond_to?+ so ANF lowering still works on AST nodes from formats /
+    # code paths that predate the field.
+    def self._embed_always?(prop)
+      prop.respond_to?(:embed_always) && prop.embed_always == true
+    end
+    private_class_method :_embed_always?
+
+    # Issue #109: emit the DCE-surviving preservation pair for each
+    # +@embedAlways+ readonly field into the given (public) method context.
+    #
+    # Reproduces exactly what a hand-written +const _bind = this.field;+ lowers
+    # to: a +load_prop+ followed by a +load_const("@ref:<t>")+ alias. The alias
+    # marks the +load_prop+ as referenced (see collect_refs_from_value in
+    # constant_fold.rb / dce.rb), so dead-binding DCE keeps it; stack lowering
+    # then emits the field's constructor-slot placeholder and NIPs the unused
+    # value off the stack at method end. The field's bytes therefore remain in
+    # the deployed locking script for downstream recovery.
+    def self._emit_embed_always_preservation(ctx, fields)
+      fields.each do |field|
+        load_ref = ctx.emit(IR::ANFValue.new(kind: "load_prop").tap { |v| v.name = field.name })
+        ctx.emit_named("__embedAlways_#{field.name}", _make_load_const_string("@ref:#{load_ref}"))
+      end
+    end
+    private_class_method :_emit_embed_always_preservation
 
     # Check if a parameter is a StatefulContext parameter (should be filtered from ANF).
     def self._is_stateful_context_param(param)
@@ -476,10 +555,17 @@ module RunarCompiler
         # inside a branch surface at the parent method's ABI. Mirrors the
         # Go reference compiler's methodScopeT.
         @method_scope = MethodScope.new
+        # Issue #123: non-default @sighash flag for this method (nil = default).
+        @sighash_flag = nil
       end
 
       # @return [MethodScope] shared per-method bookkeeping for intent intrinsics
       attr_reader :method_scope
+
+      # Issue #123: the declared non-default +@sighash+ flag for the method being
+      # lowered, so a MANUAL +checkPreimage(pre)+ call binds under the same mode
+      # as the method's declared sighash. nil = default ALL|FORKID.
+      attr_accessor :sighash_flag
 
       # Push an alias for a parameter name, used while inlining the body of
       # a private method into this context: identifier references to that
@@ -711,6 +797,9 @@ module RunarCompiler
         # registrations and the once-per-method hashOutputs flag propagate up
         # from if/else branches. Mirrors Go subContext.methodScope sharing.
         sub.instance_variable_set(:@method_scope, @method_scope)
+        # Propagate the method's declared @sighash flag (issue #123) so a manual
+        # checkPreimage inside an if/else branch binds under the same mode.
+        sub.sighash_flag = @sighash_flag
         sub
       end
 
@@ -1090,7 +1179,11 @@ module RunarCompiler
         if callee.is_a?(Identifier) && callee.name == "checkPreimage"
           if e.args.length >= 1
             preimage_ref = lower_expr_to_ref(e.args[0])
-            return emit(IR::ANFValue.new(kind: "check_preimage").tap { |v| v.preimage = preimage_ref })
+            return emit(IR::ANFValue.new(kind: "check_preimage").tap do |v|
+              v.preimage = preimage_ref
+              # Issue #123: honour the method's declared @sighash on manual calls.
+              v.sighash_flag = @sighash_flag unless @sighash_flag.nil?
+            end)
           end
         end
 

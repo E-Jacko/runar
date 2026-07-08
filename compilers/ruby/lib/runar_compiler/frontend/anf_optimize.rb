@@ -78,7 +78,9 @@ module RunarCompiler
           name: method.name,
           params: method.params.map(&:dup),
           body: method.body.map { |b| deep_copy_binding(b) },
-          is_public: method.is_public
+          is_public: method.is_public,
+          # Issue #123: preserve the declared @sighash mode across EC deep-copy.
+          sighash_type: method.sighash_type
         )
       end
       private_class_method :deep_copy_method
@@ -114,6 +116,7 @@ module RunarCompiler
         nv.iter_var     = v.iter_var
         nv.value_ref    = v.value_ref
         nv.preimage     = v.preimage
+        nv.sighash_flag = v.sighash_flag
         nv.satoshis     = v.satoshis
         nv.state_values = v.state_values&.dup
         nv.script_bytes = v.script_bytes

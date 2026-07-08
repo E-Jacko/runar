@@ -23,6 +23,10 @@ module Runar
   module SDK
     SIGHASH_ALL_FORKID = 0x41
 
+    # 32 zero bytes — BIP-143 fills zeroed digest fields (hashPrevouts /
+    # hashSequence / hashOutputs) with this under the relaxed sighash flags.
+    ZERO32 = ("\x00".b * 32).freeze
+
     module_function
 
     # Compute the BIP-143 sighash preimage for a transaction input.
@@ -52,8 +56,9 @@ module Runar
     # appended, hex-encoded.
     #
     # @param preimage_hex [String] BIP-143 preimage as hex (from +compute_preimage+)
+    # @param sighash_type [Integer] BIP-143 sighash flag appended to the sig (#123)
     # @return [String] DER signature + sighash byte, hex-encoded
-    def sign_preimage_k1(preimage_hex)
+    def sign_preimage_k1(preimage_hex, sighash_type = SIGHASH_ALL_FORKID)
       hash = double_sha256(preimage_hex)
       hash_bytes = [hash].pack('H*')
 
@@ -63,7 +68,7 @@ module Runar
       half_n = ECPrimitives::SECP256K1_N >> 1
       s = ECPrimitives::SECP256K1_N - s if s > half_n
 
-      der_encode(r, s).unpack1('H*') + format('%02x', SIGHASH_ALL_FORKID)
+      der_encode(r, s).unpack1('H*') + format('%02x', sighash_type & 0xff)
     end
 
     # Compute the OP_PUSH_TX DER signature and BIP-143 preimage for a
@@ -78,11 +83,17 @@ module Runar
     # @param subscript_hex        [String]       hex-encoded locking script
     # @param satoshis             [Integer]      value of the UTXO being spent
     # @param code_separator_index [Integer, nil] byte offset of OP_CODESEPARATOR, or -1/nil
+    # @param sighash_type [Integer] BIP-143 sighash type the preimage is built
+    #        under (issue #123). Default 0x41 (ALL|FORKID); must match the
+    #        method's declared @sighash mode — it drives which preimage fields
+    #        get zeroed AND the appended sighash flag byte. A mismatch makes the
+    #        on-chain OP_PUSH_TX binding fail to verify.
     # @return [Array(String, String)] [sig_hex, preimage_hex]
-    def compute_op_push_tx(tx_hex, input_index, subscript_hex, satoshis, code_separator_index = -1)
+    def compute_op_push_tx(tx_hex, input_index, subscript_hex, satoshis, code_separator_index = -1,
+                           sighash_type = SIGHASH_ALL_FORKID)
       effective_subscript = get_subscript(subscript_hex, code_separator_index)
-      preimage_hex = compute_preimage(tx_hex, input_index, effective_subscript, satoshis)
-      sig_hex = sign_preimage_k1(preimage_hex)
+      preimage_hex = compute_preimage(tx_hex, input_index, effective_subscript, satoshis, sighash_type)
+      sig_hex = sign_preimage_k1(preimage_hex, sighash_type)
       [sig_hex, preimage_hex]
     end
 
@@ -184,19 +195,54 @@ module Runar
     # @return [String] binary preimage
     # rubocop:disable Metrics/AbcSize, Metrics/MethodLength, Naming/MethodParameterName
     def bip143_preimage(tx, input_index, subscript, satoshis, sighash_type)
+      base = sighash_type & 0x1f
+      acp  = (sighash_type & 0x80) != 0
+
       # hashPrevouts — double-SHA256 of all outpoints.
-      prevouts = tx[:inputs].flat_map { |inp| [inp[:prev_txid], [inp[:prev_output_index]].pack('V')] }.join
-      hash_prevouts = [double_sha256(prevouts.unpack1('H*'))].pack('H*')
+      # Issue #123: ANYONECANPAY zeroes hashPrevouts (only this input is signed).
+      hash_prevouts =
+        if acp
+          ZERO32.dup
+        else
+          prevouts = tx[:inputs].flat_map { |inp| [inp[:prev_txid], [inp[:prev_output_index]].pack('V')] }.join
+          [double_sha256(prevouts.unpack1('H*'))].pack('H*')
+        end
 
       # hashSequence — double-SHA256 of all input sequences.
-      sequences = tx[:inputs].map { |inp| [inp[:sequence]].pack('V') }.join
-      hash_sequence = [double_sha256(sequences.unpack1('H*'))].pack('H*')
+      # Issue #123: zeroed under anything but pure SIGHASH_ALL (NONE / SINGLE /
+      # ANYONECANPAY all clear it).
+      hash_sequence =
+        if base == 0x01 && !acp
+          sequences = tx[:inputs].map { |inp| [inp[:sequence]].pack('V') }.join
+          [double_sha256(sequences.unpack1('H*'))].pack('H*')
+        else
+          ZERO32.dup
+        end
 
-      # hashOutputs — double-SHA256 of all serialized outputs.
-      outputs_data = tx[:outputs].map do |out|
-        [out[:satoshis]].pack('Q<') + encode_varint_bin(out[:script].bytesize) + out[:script]
-      end.join
-      hash_outputs = [double_sha256(outputs_data.unpack1('H*'))].pack('H*')
+      # hashOutputs by sighash base (issue #123):
+      #   ALL    -> hash256(all outputs)
+      #   SINGLE -> hash256(the single output at THIS input's index), or 32 zero
+      #             bytes when input_index >= outputs.length. It must NOT digest
+      #             the whole output set — under SINGLE every other output is
+      #             attacker-controllable (F5).
+      #   NONE   -> 32 zero bytes (no outputs committed)
+      hash_outputs =
+        if base == 0x02 # NONE
+          ZERO32.dup
+        elsif base == 0x03 # SINGLE
+          if input_index < tx[:outputs].length
+            out = tx[:outputs][input_index]
+            single = [out[:satoshis]].pack('Q<') + encode_varint_bin(out[:script].bytesize) + out[:script]
+            [double_sha256(single.unpack1('H*'))].pack('H*')
+          else
+            ZERO32.dup
+          end
+        else
+          outputs_data = tx[:outputs].map do |out|
+            [out[:satoshis]].pack('Q<') + encode_varint_bin(out[:script].bytesize) + out[:script]
+          end.join
+          [double_sha256(outputs_data.unpack1('H*'))].pack('H*')
+        end
 
       inp = tx[:inputs][input_index]
 
