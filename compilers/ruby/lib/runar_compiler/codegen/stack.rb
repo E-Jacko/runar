@@ -1309,14 +1309,29 @@ module RunarCompiler::Codegen
       elsif prop && !prop.initial_value.nil?
         _push_property_value(prop.initial_value)
       else
-        # Property value will be provided at deployment time; emit placeholder
-        param_index = 0
-        @properties.each do |p|
-          next if p.initial_value
-          if p.name == prop_name
-            break
+        # Property value will be provided at deployment time; emit placeholder.
+        # Initialized properties are excluded from the constructor, so the
+        # deploy-time slot index counts only non-initialized props.
+        ctor_props = @properties.reject { |p| p.initial_value }
+        param_index = ctor_props.find_index { |p| p.name == prop_name }
+        # #119 tail (H1): a property that reaches the placeholder fallback with
+        # no matching constructor slot (param_index nil) has no deploy-time
+        # bytes of its own. The previous behaviour coerced it onto slot 0 (the
+        # non-initialized-prop count), silently splicing an UNRELATED
+        # constructor argument's placeholder into the locking script -- a
+        # silent-wrong-code path. Fail loudly instead. (A real constructor-param
+        # property -- readonly or a mutable state field whose initial value is
+        # spliced at deploy -- has param_index >= 0 and is unaffected.)
+        if param_index.nil?
+          loc = ""
+          if @current_source_loc && !@current_source_loc.file.to_s.empty?
+            loc = " at #{@current_source_loc.file}:#{@current_source_loc.line}:#{@current_source_loc.column}"
           end
-          param_index += 1
+          raise "Stack lowering: property '#{prop_name}'#{loc} is neither on the stack, " \
+                "initialized, nor a constructor parameter, so it has no deploy-time " \
+                "slot. Refusing to emit a placeholder for an unrelated constructor " \
+                "argument (slot 0). Known constructor-param properties: " \
+                "[#{ctor_props.map(&:name).join(', ')}]."
         end
         emit_op({ op: "placeholder", param_index: param_index, param_name: prop_name })
       end

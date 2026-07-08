@@ -302,6 +302,13 @@ module RunarCompiler
           warn_manual_preimage_usage(method)
         end
 
+        # #131: warn when a public method gates on extractLocktime but never
+        # asserts the spending tx is non-final (extractSequence < 0xffffffff).
+        # Advisory only.
+        if method.visibility == "public"
+          warn_locktime_without_sequence_guard(method)
+        end
+
         # Gate asm({...}) calls on UnsafeSmartContract and check the structural args.
         validate_asm_usage(method)
 
@@ -655,6 +662,100 @@ module RunarCompiler
         return callee.property if callee.is_a?(MemberExpr)
 
         nil
+      end
+
+      # -------------------------------------------------------------------
+      # #131: locktime soundness -- extractLocktime needs an extractSequence guard
+      # -------------------------------------------------------------------
+
+      # Sentinel maximum nSequence: a tx is FINAL (ignores locktime) at this value.
+      SEQUENCE_FINAL = 0xffffffff
+
+      # True when +expr+ is a direct call to the named intrinsic, e.g. +f(...)+.
+      def call_to_named?(expr, name)
+        expr.is_a?(CallExpr) &&
+          expr.callee.is_a?(Identifier) &&
+          expr.callee.name == name
+      end
+
+      # True when +expr+ reads the transaction locktime. Both the raw intrinsic
+      # +extractLocktime(preimage)+ and its ergonomic sugar
+      # +currentBlockHeight()+ (which the ANF pass desugars to
+      # +extractLocktime(txPreimage)+) count -- either read is unsound without a
+      # sequence-finality guard.
+      def locktime_read?(expr)
+        call_to_named?(expr, "extractLocktime") || call_to_named?(expr, "currentBlockHeight")
+      end
+
+      # True when +expr+ is an +extractSequence(...) < <final>+-style comparison
+      # (the guard that makes a locktime gate consensus-enforced). Accepts the
+      # two natural spellings: +extractSequence(pre) < N+ / +<= N+, and the
+      # reversed +N > extractSequence(pre)+ / +>= ...+. +N+ must be a bigint
+      # literal no greater than the finality sentinel, so the guard genuinely
+      # forces non-finality.
+      def sequence_finality_guard?(expr)
+        return false unless expr.is_a?(BinaryExpr)
+
+        bound_ok = ->(e) { e.is_a?(BigIntLiteral) && e.value <= SEQUENCE_FINAL }
+
+        if ["<", "<="].include?(expr.op) &&
+           call_to_named?(expr.left, "extractSequence") && bound_ok.call(expr.right)
+          return true
+        end
+        if [">", ">="].include?(expr.op) &&
+           call_to_named?(expr.right, "extractSequence") && bound_ok.call(expr.left)
+          return true
+        end
+
+        false
+      end
+
+      # #131: warn when +method+ (transitively, through the private-helper call
+      # graph) reads the tx locktime but never asserts the tx is non-final. A
+      # locktime gate is not consensus-enforced unless
+      # +extractSequence < 0xffffffff+ is also asserted -- otherwise an
+      # all-final-sequence spend bypasses it. Advisory (warning) only -- no
+      # effect on emitted bytecode.
+      def warn_locktime_without_sequence_guard(method)
+        private_methods = {}
+        @contract.methods.each do |m|
+          private_methods[m.name] = m if m.visibility == "private"
+        end
+
+        reads_locktime = false
+        has_sequence_guard = false
+        visited = Set.new([method.name])
+        queue = [method]
+
+        until queue.empty?
+          current = queue.shift
+          walk_expressions_in_body(current.body, proc do |expr|
+            reads_locktime = true if locktime_read?(expr)
+            has_sequence_guard = true if sequence_finality_guard?(expr)
+          end)
+
+          # Follow calls into private helpers so a guard (or locktime read)
+          # supplied by an inlined helper is seen by the public entry point.
+          calls = Set.new
+          collect_method_calls(current.body, calls)
+          calls.each do |callee|
+            next if visited.include?(callee) || !private_methods.key?(callee)
+
+            visited.add(callee)
+            queue << private_methods[callee]
+          end
+        end
+
+        return unless reads_locktime && !has_sequence_guard
+
+        @warnings << Diagnostic.new(
+          message: "method '#{method.name}' reads extractLocktime but does not assert " \
+                   "extractSequence < 0xffffffff; a locktime gate is not consensus-enforced " \
+                   "unless the tx is non-final — add " \
+                   "assert(extractSequence(this.txPreimage) < 0xffffffffn)",
+          severity: Severity::WARNING,
+          loc: method.source_location
+        )
       end
 
       # -------------------------------------------------------------------
