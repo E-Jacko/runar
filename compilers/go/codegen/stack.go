@@ -1135,15 +1135,45 @@ func (ctx *loweringContext) lowerLoadProp(bindingName, propName string) {
 	} else {
 		// Property value will be provided at deployment time; emit a placeholder.
 		// The emitter records byte offsets so the SDK can splice in real values.
+		//
+		// #119 tail (H1): scan the non-initialized (constructor-param) props for
+		// this name. Go signals not-found by never breaking out of the loop —
+		// paramIndex then equals the COUNT of constructor-param props, not a real
+		// slot. The previous behaviour emitted that out-of-range index as the
+		// placeholder, silently splicing an UNRELATED constructor argument's
+		// deploy-time bytes into the locking script. Fail loudly instead. (A real
+		// constructor-param property — readonly or a mutable state field whose
+		// initial value is spliced at deploy — is found and is unaffected.)
 		paramIndex := 0
+		found := false
 		for _, p := range ctx.properties {
 			if p.InitialValue != nil {
 				continue
 			}
 			if p.Name == propName {
+				found = true
 				break
 			}
 			paramIndex++
+		}
+		if !found {
+			var ctorProps []string
+			for _, p := range ctx.properties {
+				if p.InitialValue == nil {
+					ctorProps = append(ctorProps, p.Name)
+				}
+			}
+			loc := ""
+			if ctx.currentSourceLoc != nil {
+				loc = fmt.Sprintf(" at %s:%d:%d", ctx.currentSourceLoc.File, ctx.currentSourceLoc.Line, ctx.currentSourceLoc.Column)
+			}
+			panic(fmt.Errorf(
+				"stack lowering: property '%s'%s is neither on the stack, "+
+					"initialized, nor a constructor parameter, so it has no "+
+					"deploy-time slot. Refusing to emit a placeholder for an "+
+					"unrelated constructor argument (slot 0). Known "+
+					"constructor-param properties: [%s].",
+				propName, loc, strings.Join(ctorProps, ", ")))
 		}
 		ctx.emitOp(StackOp{Op: "placeholder", ParamIndex: paramIndex, ParamName: propName})
 	}
