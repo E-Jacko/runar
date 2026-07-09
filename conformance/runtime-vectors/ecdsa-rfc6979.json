@@ -1,0 +1,61 @@
+{
+  "_doc": "Independent OFFICIAL deterministic-ECDSA known-answer vectors for NIST P-256 and P-384. Each SDK's runtime-vectors test loads this file, reconstructs the compressed public key from (qx,qy) and the raw signature from (r,s), and asserts its native verifyEcdsaP256/P384 ACCEPTS the published signature and REJECTS a 1-bit-tampered one. Values are copied verbatim from RFC 6979 \u2014 NOT re-derived from any Runar tier. Verification is signature-source-agnostic: a valid RFC-6979 (r,s) verifies under any correct ECDSA verifier.",
+  "_source": {
+    "spec": "RFC 6979 \u2014 Deterministic Usage of the Digital Signature Algorithm (DSA) and Elliptic Curve Digital Signature Algorithm (ECDSA), T. Pornin, August 2013",
+    "url": "https://www.rfc-editor.org/rfc/rfc6979.txt",
+    "sections": "Appendix A.2.5 (P-256) and A.2.6 (P-384)",
+    "retrieved": "2026-07-08",
+    "hash_note": "Runar's VerifyECDSAP256 AND VerifyECDSAP384 both hash the message with SHA-256 internally (P-384 codegen uses OP_SHA256, not SHA-384). Therefore BOTH curves use the RFC 6979 'With SHA-256' variant. RFC 6979's bits2int leaves a 256-bit hash unshifted when qlen=384, matching Go/Rust/Python hashToInt \u2014 so the same (r,s) verifies.",
+    "message_note": "message_ascii is the RFC's literal test message ('sample' / 'test'); the native verifier is handed the raw ASCII bytes and hashes them itself."
+  },
+  "ecdsa_rfc6979": [
+    {
+      "name": "p256-rfc6979-sha256-sample",
+      "curve": "P-256",
+      "hash": "SHA-256",
+      "message_ascii": "sample",
+      "message_hex": "73616d706c65",
+      "qx": "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6",
+      "qy": "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299",
+      "r": "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716",
+      "s": "f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8",
+      "source": "RFC 6979 Appendix A.2.5 (NIST P-256), 'With SHA-256, message = \"sample\"'"
+    },
+    {
+      "name": "p256-rfc6979-sha256-test",
+      "curve": "P-256",
+      "hash": "SHA-256",
+      "message_ascii": "test",
+      "message_hex": "74657374",
+      "qx": "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6",
+      "qy": "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299",
+      "r": "f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d38367",
+      "s": "019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083",
+      "source": "RFC 6979 Appendix A.2.5 (NIST P-256), 'With SHA-256, message = \"test\"'"
+    },
+    {
+      "name": "p384-rfc6979-sha256-sample",
+      "curve": "P-384",
+      "hash": "SHA-256",
+      "message_ascii": "sample",
+      "message_hex": "73616d706c65",
+      "qx": "ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc13",
+      "qy": "8015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720",
+      "r": "21b13d1e013c7fa1392d03c5f99af8b30c570c6f98d4ea8e354b63a21d3daa33bde1e888e63355d92fa2b3c36d8fb2cd",
+      "s": "f3aa443fb107745bf4bd77cb3891674632068a10ca67e3d45db2266fa7d1feebefdc63eccd1ac42ec0cb8668a4fa0ab0",
+      "source": "RFC 6979 Appendix A.2.6 (NIST P-384), 'With SHA-256, message = \"sample\"'"
+    },
+    {
+      "name": "p384-rfc6979-sha256-test",
+      "curve": "P-384",
+      "hash": "SHA-256",
+      "message_ascii": "test",
+      "message_hex": "74657374",
+      "qx": "ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc13",
+      "qy": "8015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720",
+      "r": "6d6defac9ab64dabafe36c6bf510352a4cc27001263638e5b16d9bb51d451559f918eedaf2293be5b475cc8f0188636b",
+      "s": "2d46f3becbcc523d5f1a1256bf0c9b024d879ba9e838144c8ba6baeb4b53b47d51ab373f9845c0514eefb14024787265",
+      "source": "RFC 6979 Appendix A.2.6 (NIST P-384), 'With SHA-256, message = \"test\"'"
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "fixture": "private-helper-outputs",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "Public methods delegate output emission to private helpers; each still needs a real checkPreimage continuation.",
+  "constructorArgs": [
+    "0n"
+  ],
+  "spends": [
+    {
+      "method": "commit",
+      "args": [],
+      "expect": "accept",
+      "note": "private bump(): counter 0->1"
+    },
+    {
+      "method": "log",
+      "args": [
+        "0xdead"
+      ],
+      "expect": "accept",
+      "note": "private record(): data output"
+    },
+    {
+      "method": "partition",
+      "args": [
+        "500n",
+        "7n"
+      ],
+      "expect": "accept",
+      "note": "private forkOutput(): extra output",
+      "satoshis": 500
+    },
+    {
+      "method": "commit",
+      "args": [],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output"
+    }
+  ]
+}

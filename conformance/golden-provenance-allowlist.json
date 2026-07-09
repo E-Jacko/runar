@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "GOLDEN-REGENERATION INTEGRITY GATE — provenance allowlist (issue #122).",
+    "Goldens/vectors are self-produced by the implementation-under-test. This file",
+    "is how a PR carries an INDEPENDENT justification for changing one. Every entry",
+    "pins a specific golden file to the exact NEW content it is authorizing, via a",
+    "sha256 of that file's bytes. Because the pin is content-addressed, an entry can",
+    "only ever justify the ONE value it was reviewed for — a later, different",
+    "regeneration of the same file fails the gate again and forces a fresh entry.",
+    "See conformance/README.md -> 'Golden-regeneration integrity gate' for the full",
+    "design and the two ways to satisfy the gate.",
+    "",
+    "Schema of each entry in `entries`:",
+    "  path             (string, required)  repo-root-relative path of the golden file",
+    "  sha256           (string, required)  hex sha256 of the file's NEW (post-change) bytes",
+    "  verified-against (enum,   required)  one of: official-KAT | second-implementation |",
+    "                                       differential-oracle | intentional-spec-change",
+    "  reason           (string, required)  human explanation of WHY the new bytes are correct",
+    "                                       and against WHICH independent oracle they were checked",
+    "  reviewer         (string, required)  sign-off marker, e.g. a GitHub handle 'gh:alice'",
+    "  date             (string, optional)  ISO date the entry was added",
+    "",
+    "To compute the sha256 of a golden after you have regenerated it:",
+    "  shasum -a 256 conformance/tests/<fixture>/expected-script.hex",
+    "or run the checker with --print-hashes to get them for the whole changed set."
+  ],
+  "entries": [
+    {
+      "path": "conformance/runtime-vectors/blake3-official-kat.json",
+      "sha256": "6bbc509a9e6dfa3a6a5cba24ba0f4b9744fe65e9df18f5edda101eaa60318c0a",
+      "verified-against": "official-KAT",
+      "reason": "Verbatim official BLAKE3 KAT vectors (input lengths 0..64) from BLAKE3-team/BLAKE3 test_vectors/test_vectors.json; empty-input hash matches the canonical af1349b9…. These ARE the independent oracle, not compiler-produced bytes — the fix for the BUG-101 self-golden gap.",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-08"
+    },
+    {
+      "path": "conformance/runtime-vectors/ecdsa-rfc6979.json",
+      "sha256": "e34647e3a2cc9d130a129a1707e69e7e1c7db53d86865026f8891032b7b002bb",
+      "verified-against": "official-KAT",
+      "reason": "RFC 6979 Appendix A.2.5 (P-256) + A.2.6 (P-384) deterministic-ECDSA test vectors, With-SHA-256 variant (matches the native verify path). Independently published, not compiler-produced.",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-08"
+    },
+    {
+      "path": "conformance/runtime-vectors/slh-dsa-acvp-kat.json",
+      "sha256": "83f10b696fc2e601bb1f0208580e783e918b3bf23bc85c7336f5eb2f24b34b90",
+      "verified-against": "official-KAT",
+      "reason": "NIST ACVP SLH-DSA-SHA2-128s (internal) sigVer vector, tcId 422, testPassed=true. Authoritative regression gate that currently exposes a real native SLH-DSA FIPS-205 non-conformance (see docs/test-skips.md crypto_kat_test.go:286).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-08"
+    }
+  ]
+}

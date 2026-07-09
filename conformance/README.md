@@ -344,6 +344,55 @@ pnpm run update-golden
 
 Golden file updates should always be reviewed carefully. An unexpected change in a golden file indicates either a compiler bug or an unintended spec change.
 
+### Golden-regeneration integrity gate (issue #122)
+
+Goldens are **self-produced** by the very implementation under test — `pnpm run update-golden` writes whatever the compilers currently emit. That is a structural hazard: a PR can silently regenerate a golden to match a *buggy* new output, and the suite then validates the corrupt bytes against itself and ships green ("corrupt scripts validated by self-consistent tests"). The gate closes that hole. It does **not** replace the golden comparison — it adds an admission check so that *changing* a golden requires an **independent** cross-check, not just the compiler's own say-so.
+
+**What it guards.** Any file in the PR's changed set (three-dot diff against the merge-base) matching one of the self-produced golden/vector families:
+
+- `conformance/tests/**/expected-script.hex`
+- `conformance/tests/**/expected-ir.json`
+- `conformance/runtime-vectors/*.json` (official-KAT hash vectors)
+- `conformance/sdk-output/tests/**/expected-*.hex`
+- `conformance/analyzer/**/expected-analyzer-report.json`
+- `conformance/source-map/**/expected-source-map.json`
+- `packages/decompiler/coverage-baseline.json`
+
+(The authoritative matcher list lives in `GOLDEN_MATCHERS` in `conformance/scripts/check-golden-provenance.mjs` — extend it there when a new golden family is added.) Pure **deletions** are ignored (removing a golden is not a regeneration risk); non-golden changes are a no-op.
+
+**How a golden change is justified.** For **each** changed golden, the gate requires **one** of:
+
+- **(A) Scoped cross-check co-change** — for a fixture golden `conformance/tests/<fixture>/expected-{script.hex,ir.json}`, the same PR also modifies that fixture's independent execution oracle `conformance/witnesses/<fixture>.json`. The differential-execution oracle (`witnesses/differential.test.ts`) re-runs the declared spends through a *second* engine (ANF interpreter + `@bsv/sdk` ScriptVM), so the fixture's new bytes get an accept/reject check that does not come from the compiler that produced them. This is the ergonomic happy-path for a legitimate codegen change.
+- **(B) Provenance allowlist entry** — an entry in `conformance/golden-provenance-allowlist.json` (works for **any** golden, including runtime-vectors, sdk-output, analyzer, source-map, and crypto-exempt fixtures with no witness):
+
+  ```json
+  {
+    "path": "conformance/tests/arithmetic/expected-script.hex",
+    "sha256": "<sha256 of the NEW file bytes>",
+    "verified-against": "official-KAT | second-implementation | differential-oracle | intentional-spec-change",
+    "reason": "why the new bytes are correct + which independent oracle confirmed them",
+    "reviewer": "gh:your-handle"
+  }
+  ```
+
+  The entry is **content-pinned**: `sha256` must equal the current bytes of the golden. Because the pin is content-addressed, an entry can only ever justify the *one* value it was reviewed for — a later, *different* regeneration of the same file fails the gate again and forces a fresh, re-reviewed entry. This is what prevents a stale exemption from silently authorizing future silent regenerations. `verified-against` records the class of independent oracle; `reason` and `reviewer` make the sign-off explicit and reviewable in the allowlist diff.
+
+**Running it.**
+
+```bash
+# Auto-detect the changed set vs the merge-base (CI mode); base defaults to
+# origin/main, override with --base <ref> or $GOLDEN_GATE_BASE.
+node conformance/scripts/check-golden-provenance.mjs --base origin/main
+
+# Print the sha256 of every changed golden (to fill in an allowlist entry).
+node conformance/scripts/check-golden-provenance.mjs --print-hashes --base origin/main
+
+# Prove both directions still work (reject-without-justification / pass-with).
+node conformance/scripts/check-golden-provenance.mjs --self-test
+```
+
+**CI wiring.** The `golden-provenance-gate` job in `.github/workflows/ci.yml` runs on `pull_request` (no `continue-on-error`), checks out with `fetch-depth: 0`, and passes the PR base commit SHA via `$GOLDEN_GATE_BASE` (through `env:`, never interpolated into a shell command). It runs the checker in auto-detect mode and then `--self-test` so the gate cannot rot into a silent no-op. The script is dependency-light (Node built-ins + `git`; no `pnpm install`).
+
 ---
 
 ## Current Test Cases

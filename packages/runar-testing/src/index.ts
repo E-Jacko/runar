@@ -58,6 +58,9 @@ export {
   runDifferentialExecution,
   runTriModalExecution,
   runFoldEquivalence,
+  runStatelessSigned,
+  runStatefulSpend,
+  testKey,
 } from './oracle/index.js';
 export type {
   WitnessArg,
@@ -67,6 +70,11 @@ export type {
   FoldEqOptions,
   FoldEqResult,
   FoldEqDivergence,
+  RealExecResult,
+  SignMarker,
+  StatelessArg,
+  StatelessSignedOptions,
+  StatefulSpendOptions,
 } from './oracle/index.js';
 
 // Test helpers

@@ -1,0 +1,41 @@
+{
+  "fixture": "cond-write-multi-field",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "issue #99: conditional write of >=2 state fields. Both the update branch and the skip branch must produce a spendable continuation.",
+  "constructorArgs": [
+    "0n",
+    "0n"
+  ],
+  "spends": [
+    {
+      "method": "bump",
+      "args": [
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "flag>0: a+1,b+2 update branch",
+      "satoshis": 1000
+    },
+    {
+      "method": "bump",
+      "args": [
+        "0n"
+      ],
+      "expect": "accept",
+      "note": "flag==0: skip branch, state unchanged",
+      "satoshis": 1000
+    },
+    {
+      "method": "bump",
+      "args": [
+        "1n"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output",
+      "satoshis": 1000
+    }
+  ]
+}

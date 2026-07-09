@@ -1,0 +1,12 @@
+{
+  "fixture": "terminal-varlen-read",
+  "kind": "stateful",
+  "signerKey": "alice",
+  "note": "issue #100: post() updates a var-length ByteString state field; reveal() is a terminal method reading the live length. Real checkPreimage continuation.",
+  "constructorArgs": ["00"],
+  "spends": [
+    { "method": "post", "args": ["0xdeadbeef"], "expect": "accept", "note": "message -> deadbeef" },
+    { "method": "reveal", "args": ["2n"], "constructorArgs": ["deadbeef"], "expect": "accept", "note": "len(message)=4 > minLen 2" },
+    { "method": "post", "args": ["0xdeadbeef"], "tamperOutput": true, "cryptoNearMiss": true, "expect": "reject", "note": "tampered continuation output" }
+  ]
+}

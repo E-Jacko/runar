@@ -63,6 +63,53 @@ jobs:
       - name: Run allowlist audit (vitest)
         run: pnpm run conformance:allowlist-audit
 
+  golden-provenance-gate:
+    # GOLDEN-REGENERATION INTEGRITY GATE (issue #122). Conformance goldens /
+    # vectors (expected-script.hex, expected-ir.json, runtime-vectors/*.json,
+    # sdk-output/**/expected-locking.hex, analyzer + source-map goldens, the
+    # decompiler baseline) are SELF-PRODUCED by the implementation under test
+    # (`pnpm run update-golden`). Nothing else stops a PR from silently
+    # regenerating one to match a buggy new compiler output — the suite then
+    # validates the corrupt bytes against itself and ships green. This gate
+    # fails the PR if any golden changed WITHOUT an independent provenance
+    # justification: either (A) the fixture's own witnesses/<fixture>.json
+    # co-changed (differential oracle re-checks it via a second engine), or
+    # (B) a content-pinned entry in conformance/golden-provenance-allowlist.json
+    # (sha256 + verified-against + reason + reviewer sign-off). Cheap (Node
+    # built-ins only, no install) — gates the heavy matrix like the other lints.
+    #
+    # Security note: the only github.event.* value consumed is the base commit
+    # SHA, passed via `env:` (never interpolated into the shell) and used solely
+    # as a git ref for the three-dot diff. No untrusted event text reaches a
+    # `run:` block.
+    name: Lint — golden-regeneration provenance gate
+    runs-on: ubuntu-latest
+    # A merged golden change on `main` is already landed; the gate is a PR
+    # admission control, so scope it to pull_request events.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the PR base commit is present for the merge-base
+          # three-dot diff below.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check golden/vector provenance (changed set vs merge-base)
+        env:
+          # base.sha = tip of the branch this PR merges into. The script diffs
+          # `<base>...HEAD` (three-dot = merge-base) to get the PR's true
+          # changed set, so an already-merged commit from another PR is never
+          # misattributed here.
+          GOLDEN_GATE_BASE: ${{ github.event.pull_request.base.sha }}
+        run: node conformance/scripts/check-golden-provenance.mjs
+      - name: Self-test the gate (both directions)
+        # Belt-and-suspenders: proves the checker still rejects an unjustified
+        # golden change and passes a justified one, so the gate can't silently
+        # rot into a no-op that greenlights everything.
+        run: node conformance/scripts/check-golden-provenance.mjs --self-test
+
   sdk-envelope-fixtures:
     # Guards the signed-envelope wire protocol's cross-tier fixture. The
     # fixture is the frozen TS-reference bytes that all 6 non-TS SDKs validate
