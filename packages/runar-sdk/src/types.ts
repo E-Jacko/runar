@@ -172,6 +172,14 @@ export interface CallOptions {
    * BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers it) and
    * is consumed entirely as fee — no change output is created. Signed with
    * `fundingSigner ?? signer`. The covenant's output assertions are untouched.
+   *
+   * IMPORTANT: because there is no change output, the ENTIRE feeUtxo is spent
+   * as fee — any amount beyond the actual miner fee is BURNED, not returned.
+   * Size the feeUtxo close to the intended fee (a few hundred sats at the BSV
+   * standard 0.1 sat/byte is typical for a small terminal tx). The SDK emits a
+   * `console.warn` when the supplied feeUtxo dwarfs the terminal tx's estimated
+   * fee (> 5x and > ~1000 sats of excess), so an accidental large coin is
+   * caught before broadcast.
    */
   feeUtxo?: UTXO;
 

@@ -397,6 +397,14 @@ public final class Validate {
                 }
             }
 
+            // #131: warn when a public method gates on extractLocktime but
+            // never asserts the spending tx is non-final
+            // (extractSequence < 0xffffffff). Advisory only — no effect on the
+            // emitted bytecode.
+            if (m.visibility() == Visibility.PUBLIC) {
+                warnLocktimeWithoutSequenceGuard(m, this);
+            }
+
             // Gate asm({...}) calls on UnsafeSmartContract and check the
             // structural args.
             validateAsmUsage(m);
@@ -1043,6 +1051,110 @@ public final class Validate {
             for (Expression el : al.elements()) {
                 collectMethodCallsInExpr(el, out);
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // #131: locktime soundness — extractLocktime needs an extractSequence guard
+    // ------------------------------------------------------------------
+
+    /** Sentinel maximum nSequence: a tx is FINAL (ignores locktime) at this value. */
+    private static final java.math.BigInteger SEQUENCE_FINAL =
+        java.math.BigInteger.valueOf(0xffffffffL);
+
+    /** True when {@code expr} is a direct call to the named intrinsic, e.g. {@code f(...)}. */
+    private static boolean isCallToNamed(Expression expr, String name) {
+        return expr instanceof CallExpr c
+            && c.callee() instanceof Identifier id
+            && name.equals(id.name());
+    }
+
+    /**
+     * True when {@code expr} reads the transaction locktime. Both the raw
+     * intrinsic {@code extractLocktime(preimage)} and its ergonomic sugar
+     * {@code currentBlockHeight()} (which the ANF pass desugars to
+     * {@code extractLocktime(txPreimage)}) count — either read is unsound
+     * without a sequence-finality guard.
+     */
+    private static boolean isLocktimeRead(Expression expr) {
+        return isCallToNamed(expr, "extractLocktime")
+            || isCallToNamed(expr, "currentBlockHeight");
+    }
+
+    /**
+     * True when {@code expr} is an {@code extractSequence(...) < <final>}-style
+     * comparison (the guard that makes a locktime gate consensus-enforced).
+     * Accepts the two natural spellings: {@code extractSequence(pre) < N} /
+     * {@code <= N}, and the reversed {@code N > extractSequence(pre)} /
+     * {@code >= ...}. {@code N} must be a bigint literal no greater than the
+     * finality sentinel, so the guard genuinely forces non-finality.
+     */
+    private static boolean isSequenceFinalityGuard(Expression expr) {
+        if (!(expr instanceof BinaryExpr be)) return false;
+        Expression.BinaryOp op = be.op();
+        if ((op == Expression.BinaryOp.LT || op == Expression.BinaryOp.LE)
+            && isCallToNamed(be.left(), "extractSequence") && isSequenceBound(be.right())) {
+            return true;
+        }
+        if ((op == Expression.BinaryOp.GT || op == Expression.BinaryOp.GE)
+            && isCallToNamed(be.right(), "extractSequence") && isSequenceBound(be.left())) {
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean isSequenceBound(Expression e) {
+        return e instanceof BigIntLiteral lit && lit.value().compareTo(SEQUENCE_FINAL) <= 0;
+    }
+
+    /**
+     * #131: warn when {@code method} (transitively, through the private-helper
+     * call graph) reads the tx locktime but never asserts the tx is non-final.
+     * A locktime gate is not consensus-enforced unless
+     * {@code extractSequence < 0xffffffff} is also asserted — otherwise an
+     * all-final-sequence spend bypasses it. Advisory (warning) only — no effect
+     * on emitted bytecode.
+     */
+    private static void warnLocktimeWithoutSequenceGuard(MethodNode method, Ctx ctx) {
+        java.util.Map<String, MethodNode> privateMethods = new java.util.HashMap<>();
+        for (MethodNode m : ctx.contract.methods()) {
+            if (m.visibility() == Visibility.PRIVATE) {
+                privateMethods.put(m.name(), m);
+            }
+        }
+
+        boolean[] readsLocktime = {false};
+        boolean[] hasSequenceGuard = {false};
+        Set<String> visited = new HashSet<>();
+        visited.add(method.name());
+        java.util.Deque<MethodNode> queue = new java.util.ArrayDeque<>();
+        queue.add(method);
+
+        while (!queue.isEmpty()) {
+            MethodNode current = queue.poll();
+            Ctx.walkExpressionsInBody(current.body(), expr -> {
+                if (isLocktimeRead(expr)) readsLocktime[0] = true;
+                if (isSequenceFinalityGuard(expr)) hasSequenceGuard[0] = true;
+            });
+            // Follow calls into private helpers so a guard (or locktime read)
+            // supplied by an inlined helper is seen by the public entry point.
+            Set<String> calls = new HashSet<>();
+            collectMethodCalls(current.body(), calls);
+            for (String callee : calls) {
+                if (!visited.contains(callee) && privateMethods.containsKey(callee)) {
+                    visited.add(callee);
+                    queue.add(privateMethods.get(callee));
+                }
+            }
+        }
+
+        if (readsLocktime[0] && !hasSequenceGuard[0]) {
+            ctx.warn(
+                "method '" + method.name() + "' reads extractLocktime but does not assert "
+                    + "extractSequence < 0xffffffff; a locktime gate is not consensus-enforced "
+                    + "unless the tx is non-final — add "
+                    + "assert(extractSequence(this.txPreimage) < 0xffffffffn)",
+                method.sourceLocation());
         }
     }
 

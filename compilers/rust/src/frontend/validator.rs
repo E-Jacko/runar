@@ -248,6 +248,13 @@ fn validate_methods(contract: &ContractNode, errors: &mut Vec<Diagnostic>, warni
         if contract.parent_class == "StatefulSmartContract" && method.visibility == Visibility::Public {
             warn_manual_preimage_usage(method, warnings);
         }
+
+        // #131: warn when a public method gates on extractLocktime but never
+        // asserts the spending tx is non-final (extractSequence < 0xffffffff).
+        // Advisory only.
+        if method.visibility == Visibility::Public {
+            warn_locktime_without_sequence_guard(method, contract, warnings);
+        }
     }
 }
 
@@ -879,6 +886,118 @@ fn warn_manual_preimage_usage(method: &MethodNode, warnings: &mut Vec<Diagnostic
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// #131: locktime soundness — extractLocktime needs an extractSequence guard
+// ---------------------------------------------------------------------------
+
+/// Sentinel maximum nSequence: a tx is FINAL (ignores locktime) at this value.
+const SEQUENCE_FINAL: u64 = 0xffff_ffff;
+
+/// True when `expr` is a direct call to the named intrinsic, e.g. `f(...)`.
+fn is_call_to_named(expr: &Expression, name: &str) -> bool {
+    if let Expression::CallExpr { callee, .. } = expr {
+        if let Expression::Identifier { name: callee_name } = callee.as_ref() {
+            return callee_name == name;
+        }
+    }
+    false
+}
+
+/// True when `expr` reads the transaction locktime. Both the raw intrinsic
+/// `extractLocktime(preimage)` and its ergonomic sugar `currentBlockHeight()`
+/// (which the ANF pass desugars to `extractLocktime(txPreimage)`) count —
+/// either read is unsound without a sequence-finality guard.
+fn is_locktime_read(expr: &Expression) -> bool {
+    is_call_to_named(expr, "extractLocktime") || is_call_to_named(expr, "currentBlockHeight")
+}
+
+/// True when `expr` is an `extractSequence(...) < <final>`-style comparison
+/// (the guard that makes a locktime gate consensus-enforced). Accepts the two
+/// natural spellings: `extractSequence(pre) < N` / `<= N`, and the reversed
+/// `N > extractSequence(pre)` / `>= ...`. `N` must be a bigint literal no
+/// greater than the finality sentinel, so the guard genuinely forces
+/// non-finality.
+fn is_sequence_finality_guard(expr: &Expression) -> bool {
+    let Expression::BinaryExpr { op, left, right } = expr else {
+        return false;
+    };
+    let bound_ok = |e: &Expression| -> bool {
+        matches!(
+            e,
+            Expression::BigIntLiteral { value }
+                if *value <= num_bigint::BigInt::from(SEQUENCE_FINAL)
+        )
+    };
+    match op {
+        BinaryOp::Lt | BinaryOp::Le => is_call_to_named(left, "extractSequence") && bound_ok(right),
+        BinaryOp::Gt | BinaryOp::Ge => is_call_to_named(right, "extractSequence") && bound_ok(left),
+        _ => false,
+    }
+}
+
+/// #131: warn when `method` (transitively, through the private-helper call
+/// graph) reads the tx locktime but never asserts the tx is non-final. A
+/// locktime gate is not consensus-enforced unless `extractSequence < 0xffffffff`
+/// is also asserted — otherwise an all-final-sequence spend bypasses it.
+/// Advisory (warning) only — no effect on emitted bytecode.
+fn warn_locktime_without_sequence_guard(
+    method: &MethodNode,
+    contract: &ContractNode,
+    warnings: &mut Vec<Diagnostic>,
+) {
+    // Map of private helper methods by name (BFS follows calls into these).
+    let private_methods: HashMap<&str, &MethodNode> = contract
+        .methods
+        .iter()
+        .filter(|m| m.visibility == Visibility::Private)
+        .map(|m| (m.name.as_str(), m))
+        .collect();
+
+    let mut reads_locktime = false;
+    let mut has_sequence_guard = false;
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(method.name.clone());
+    let mut queue: std::collections::VecDeque<&MethodNode> = std::collections::VecDeque::new();
+    queue.push_back(method);
+
+    while let Some(current) = queue.pop_front() {
+        walk_expressions_in_body(&current.body, &mut |expr| {
+            if is_locktime_read(expr) {
+                reads_locktime = true;
+            }
+            if is_sequence_finality_guard(expr) {
+                has_sequence_guard = true;
+            }
+        });
+        // Follow calls into private helpers so a guard (or locktime read)
+        // supplied by an inlined helper is seen by the public entry point.
+        // Reuses the shared `collect_method_calls` recursion-detection helper.
+        let mut calls = HashSet::new();
+        collect_method_calls(&current.body, &mut calls);
+        for callee in calls {
+            if !visited.contains(&callee) {
+                if let Some(m) = private_methods.get(callee.as_str()) {
+                    visited.insert(callee.clone());
+                    queue.push_back(m);
+                }
+            }
+        }
+    }
+
+    if reads_locktime && !has_sequence_guard {
+        warnings.push(Diagnostic::warning(
+            format!(
+                "method '{}' reads extractLocktime but does not assert \
+                 extractSequence < 0xffffffff; a locktime gate is not \
+                 consensus-enforced unless the tx is non-final — add \
+                 assert(extractSequence(this.txPreimage) < 0xffffffffn)",
+                method.name
+            ),
+            Some(method.source_location.clone()),
+        ));
+    }
 }
 
 fn walk_expressions_in_body(stmts: &[Statement], visitor: &mut impl FnMut(&Expression)) {

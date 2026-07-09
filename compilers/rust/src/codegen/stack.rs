@@ -1200,31 +1200,68 @@ impl LoweringContext {
             } else {
                 // Property value will be provided at deployment time; emit a placeholder.
                 // The emitter records byte offsets so the SDK can splice in real values.
-                let param_index = self
-                    .properties
-                    .iter()
-                    .filter(|p| p.initial_value.is_none())
-                    .position(|p| p.name == prop_name)
-                    .unwrap_or(0);
+                let param_index = self.ctor_param_index_or_panic(prop_name);
                 self.emit_op(StackOp::Placeholder {
                     param_index,
                     param_name: prop_name.to_string(),
                 });
             }
         } else {
-            // Property not found and not on stack — emit placeholder with index 0.
-            let param_index = self
-                .properties
-                .iter()
-                .filter(|p| p.initial_value.is_none())
-                .position(|p| p.name == prop_name)
-                .unwrap_or(0);
+            // Property not found and not on stack — must still be a real
+            // constructor-param slot, otherwise there is nothing to splice.
+            let param_index = self.ctor_param_index_or_panic(prop_name);
             self.emit_op(StackOp::Placeholder {
                 param_index,
                 param_name: prop_name.to_string(),
             });
         }
         self.sm.push(binding_name);
+    }
+
+    /// Resolve `prop_name`'s constructor slot for a placeholder, or fail loudly.
+    ///
+    /// #119 tail (H1): a property that reaches the placeholder fallback with no
+    /// matching constructor slot has no deploy-time bytes of its own. The
+    /// previous behaviour coerced it onto slot 0 (`.unwrap_or(0)`), silently
+    /// splicing an UNRELATED constructor argument's placeholder into the
+    /// locking script — a silent-wrong-code path. Fail loudly instead. (A real
+    /// constructor-param property — readonly, or a mutable state field whose
+    /// initial value is spliced at deploy — is found by `position` and is
+    /// unaffected: zero golden churn.)
+    fn ctor_param_index_or_panic(&self, prop_name: &str) -> usize {
+        // Initialized properties are excluded from the constructor, so only
+        // uninitialized (deploy-time) properties own a constructor slot.
+        match self
+            .properties
+            .iter()
+            .filter(|p| p.initial_value.is_none())
+            .position(|p| p.name == prop_name)
+        {
+            Some(idx) => idx,
+            None => {
+                let loc = self
+                    .current_source_loc
+                    .as_ref()
+                    .map(|l| format!(" at {}:{}:{}", l.file, l.line, l.column))
+                    .unwrap_or_default();
+                let ctor_props: Vec<&str> = self
+                    .properties
+                    .iter()
+                    .filter(|p| p.initial_value.is_none())
+                    .map(|p| p.name.as_str())
+                    .collect();
+                panic!(
+                    "Stack lowering: property '{}'{} is neither on the stack, \
+                     initialized, nor a constructor parameter, so it has no \
+                     deploy-time slot. Refusing to emit a placeholder for an \
+                     unrelated constructor argument (slot 0). Known \
+                     constructor-param properties: [{}].",
+                    prop_name,
+                    loc,
+                    ctor_props.join(", ")
+                );
+            }
+        }
     }
 
     fn push_json_value(&mut self, val: &serde_json::Value) {

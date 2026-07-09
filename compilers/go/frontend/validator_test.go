@@ -1692,3 +1692,175 @@ class C extends SmartContract {
 		t.Errorf("did not expect 'countdown' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// H2 (#131): locktime soundness warning.
+//
+// A public method that reads extractLocktime(preimage) — directly or
+// transitively through a private helper — only enforces a timelock if the
+// covenant ALSO asserts the spending tx is non-final
+// (extractSequence(preimage) < 0xffffffff). Otherwise a hand-built
+// all-final-sequence tx bypasses the locktime gate. The validator emits an
+// advisory WARNING (non-fatal) when the guard is missing.
+// ---------------------------------------------------------------------------
+
+const locktimeWarningNeedle = "does not assert extractSequence"
+
+func hasLocktimeWarning(result *ValidationResult) bool {
+	for _, w := range result.Warnings {
+		if strings.Contains(w.Message, locktimeWarningNeedle) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestValidate_H2_LocktimeWithoutSequenceGuard_Warns(t *testing.T) {
+	source := `
+import { StatefulSmartContract, assert, extractLocktime } from 'runar-lang';
+
+class TimeLock extends StatefulSmartContract {
+  count: bigint;
+  readonly deadline: bigint;
+  constructor(count: bigint, deadline: bigint) {
+    super(count, deadline);
+    this.count = count;
+    this.deadline = deadline;
+  }
+  public unlock(): void {
+    assert(extractLocktime(this.txPreimage) >= this.deadline);
+    this.count++;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if !hasLocktimeWarning(result) {
+		t.Fatalf("expected a locktime-soundness warning, got warnings: %v", result.WarningStrings())
+	}
+	// The warning names the method, points at the fix, and is a warning.
+	var found *Diagnostic
+	for i := range result.Warnings {
+		if strings.Contains(result.Warnings[i].Message, locktimeWarningNeedle) {
+			found = &result.Warnings[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("expected to find the locktime warning diagnostic")
+	}
+	if found.Severity != SeverityWarning {
+		t.Errorf("expected severity warning, got: %v", found.Severity)
+	}
+	if !strings.Contains(found.Message, "unlock") {
+		t.Errorf("expected warning to name the method 'unlock', got: %s", found.Message)
+	}
+	if !strings.Contains(found.Message, "0xffffffff") {
+		t.Errorf("expected warning to mention 0xffffffff, got: %s", found.Message)
+	}
+}
+
+func TestValidate_H2_LocktimeWithSequenceGuard_NoWarn(t *testing.T) {
+	source := `
+import { StatefulSmartContract, assert, extractLocktime, extractSequence } from 'runar-lang';
+
+class TimeLock extends StatefulSmartContract {
+  count: bigint;
+  readonly deadline: bigint;
+  constructor(count: bigint, deadline: bigint) {
+    super(count, deadline);
+    this.count = count;
+    this.deadline = deadline;
+  }
+  public unlock(): void {
+    assert(extractSequence(this.txPreimage) < 0xffffffffn);
+    assert(extractLocktime(this.txPreimage) >= this.deadline);
+    this.count++;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasLocktimeWarning(result) {
+		t.Errorf("did not expect a locktime warning when extractSequence guard is present, got: %v", result.WarningStrings())
+	}
+}
+
+func TestValidate_H2_NoLocktimeRead_NoWarn(t *testing.T) {
+	source := `
+import { StatefulSmartContract } from 'runar-lang';
+
+class Counter extends StatefulSmartContract {
+  count: bigint;
+  constructor(count: bigint) {
+    super(count);
+    this.count = count;
+  }
+  public increment(): void {
+    this.count++;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasLocktimeWarning(result) {
+		t.Errorf("did not expect a locktime warning for a method that never reads locktime, got: %v", result.WarningStrings())
+	}
+}
+
+func TestValidate_H2_SequenceGuardViaPrivateHelper_NoWarn(t *testing.T) {
+	source := `
+import { StatefulSmartContract, assert, extractLocktime, extractSequence } from 'runar-lang';
+
+class TimeLock extends StatefulSmartContract {
+  count: bigint;
+  readonly deadline: bigint;
+  constructor(count: bigint, deadline: bigint) {
+    super(count, deadline);
+    this.count = count;
+    this.deadline = deadline;
+  }
+  private requireNonFinal(): void {
+    assert(extractSequence(this.txPreimage) < 0xffffffffn);
+  }
+  public unlock(): void {
+    this.requireNonFinal();
+    assert(extractLocktime(this.txPreimage) >= this.deadline);
+    this.count++;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasLocktimeWarning(result) {
+		t.Errorf("did not expect a locktime warning when guard is supplied via a private helper, got: %v", result.WarningStrings())
+	}
+}
+
+func TestValidate_H2_LocktimeReadInPrivateHelper_NoGuard_Warns(t *testing.T) {
+	source := `
+import { StatefulSmartContract, assert, extractLocktime } from 'runar-lang';
+
+class TimeLock extends StatefulSmartContract {
+  count: bigint;
+  readonly deadline: bigint;
+  constructor(count: bigint, deadline: bigint) {
+    super(count, deadline);
+    this.count = count;
+    this.deadline = deadline;
+  }
+  private checkDeadline(): void {
+    assert(extractLocktime(this.txPreimage) >= this.deadline);
+  }
+  public unlock(): void {
+    this.checkDeadline();
+    this.count++;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if !hasLocktimeWarning(result) {
+		t.Errorf("expected a locktime warning when the read is in a private helper and no guard exists, got: %v", result.WarningStrings())
+	}
+}

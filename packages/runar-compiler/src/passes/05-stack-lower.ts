@@ -1265,9 +1265,29 @@ class LoweringContext {
       // since initialized properties are excluded from the constructor.
       const ctorProps = this._properties.filter(p => p.initialValue === undefined);
       const paramIndex = ctorProps.findIndex(p => p.name === propName);
+      // #119 tail (H1): a property that reaches the placeholder fallback with
+      // no matching constructor slot (paramIndex === -1) has no deploy-time
+      // bytes of its own. The previous behaviour coerced it onto slot 0,
+      // silently splicing an UNRELATED constructor argument's placeholder into
+      // the locking script — a silent-wrong-code path. Fail loudly instead.
+      // (A real constructor-param property — readonly or a mutable state field
+      // whose initial value is spliced at deploy — has paramIndex >= 0 and is
+      // unaffected.)
+      if (paramIndex < 0) {
+        const loc = this.currentSourceLoc
+          ? ` at ${this.currentSourceLoc.file}:${this.currentSourceLoc.line}:${this.currentSourceLoc.column}`
+          : '';
+        throw new Error(
+          `Stack lowering: property '${propName}'${loc} is neither on the stack, ` +
+            `initialized, nor a constructor parameter, so it has no deploy-time ` +
+            `slot. Refusing to emit a placeholder for an unrelated constructor ` +
+            `argument (slot 0). Known constructor-param properties: ` +
+            `[${ctorProps.map(p => p.name).join(', ')}].`,
+        );
+      }
       this.emitOp({
         op: 'placeholder',
-        paramIndex: paramIndex >= 0 ? paramIndex : 0,
+        paramIndex,
         paramName: propName,
       });
     }

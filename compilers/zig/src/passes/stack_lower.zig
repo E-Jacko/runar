@@ -164,6 +164,12 @@ const LowerError = error{
     /// Emitting a silent OP_0 here produced scripts that compiled, passed the
     /// env-based interpreter, and then failed on chain — so we fail loudly.
     SilentOpZeroRefused,
+    /// #119 tail (H1): a `load_prop` for a property that is neither on the
+    /// stack, initialized, nor a constructor parameter has no deploy-time slot
+    /// of its own. Coercing it onto slot 0 silently splices an UNRELATED
+    /// constructor argument's placeholder into the locking script, so we fail
+    /// loudly instead.
+    LoadPropNoConstructorSlot,
 };
 
 const LowerCtx = struct {
@@ -1228,6 +1234,22 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
+    /// Comma-separated names of the constructor-param properties (those with no
+    /// initial value, i.e. the ones that occupy a deploy-time slot). Used only
+    /// for the H1 diagnostic in `lowerPropertyRead`.
+    fn knownCtorPropNames(self: *const LowerCtx) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        var first = true;
+        for (self.program.properties) |prop| {
+            if (prop.initial_value != null) continue;
+            if (!first) try buf.appendSlice(self.allocator, ", ");
+            first = false;
+            try buf.appendSlice(self.allocator, prop.name);
+        }
+        return buf.toOwnedSlice(self.allocator);
+    }
+
     fn lowerPropertyRead(self: *LowerCtx, bind_name: []const u8, prop_name: []const u8) !void {
         // Check if property has been updated on stack
         if (self.updated_props.get(prop_name) != null) {
@@ -1259,12 +1281,50 @@ const LowerCtx = struct {
                 }
             }
         }
-        // Not found — push constructor param placeholder
-        // Determine param_index: count properties without initial_value before this one
+        // Not found on stack / initialized — push constructor param placeholder.
+        // Determine param_index: count properties without initial_value before
+        // this one. Zig signals "not a declared property" by never breaking, so
+        // track it explicitly with `found`.
         var param_idx: u32 = 0;
+        var found = false;
         for (self.program.properties) |prop| {
-            if (std.mem.eql(u8, prop.name, prop_name)) break;
+            if (std.mem.eql(u8, prop.name, prop_name)) {
+                found = true;
+                break;
+            }
             if (prop.initial_value == null) param_idx += 1;
+        }
+        // #119 tail (H1): a property that reaches this fallback with no matching
+        // constructor slot (found == false) has no deploy-time bytes of its own.
+        // The previous behaviour left `param_idx` at the count of ctor-param
+        // properties and emitted a placeholder for an UNRELATED constructor
+        // argument — a silent-wrong-code path that splices the wrong value into
+        // the locking script. Fail loudly instead. (A real constructor-param
+        // property — readonly, or a mutable state field whose initial value is
+        // spliced at deploy — is found and unaffected.)
+        if (!found) {
+            const known = self.knownCtorPropNames() catch null;
+            defer if (known) |k| self.allocator.free(k);
+            if (self.current_source_loc) |loc| {
+                std.log.warn(
+                    "stack lowering: property '{s}' at {s}:{d}:{d} is neither on " ++
+                        "the stack, initialized, nor a constructor parameter, so it " ++
+                        "has no deploy-time slot. Refusing to emit a placeholder for " ++
+                        "an unrelated constructor argument (slot 0). Known " ++
+                        "constructor-param properties: [{s}].",
+                    .{ prop_name, loc.file, loc.line, loc.column, known orelse "<unavailable>" },
+                );
+            } else {
+                std.log.warn(
+                    "stack lowering: property '{s}' is neither on the stack, " ++
+                        "initialized, nor a constructor parameter, so it has no " ++
+                        "deploy-time slot. Refusing to emit a placeholder for an " ++
+                        "unrelated constructor argument (slot 0). Known " ++
+                        "constructor-param properties: [{s}].",
+                    .{ prop_name, known orelse "<unavailable>" },
+                );
+            }
+            return LowerError.LoadPropNoConstructorSlot;
         }
         try self.emit(.{ .placeholder = .{ .param_index = param_idx, .param_name = prop_name } });
         try self.stack.push(self.allocator, bind_name);
@@ -5605,6 +5665,75 @@ test "lower rejects load_param of a missing param instead of emitting OP_0 (fix 
     };
 
     try std.testing.expectError(LowerError.SilentOpZeroRefused, lower(allocator, program));
+}
+
+test "lower rejects load_prop for a property with no constructor slot (H1)" {
+    // #119 tail: a `load_prop` whose name is not a declared constructor-param
+    // property used to be coerced onto slot 0, silently splicing an UNRELATED
+    // constructor argument's placeholder into the locking script. It must now
+    // hard-error instead. The contract has a real ctor-param property `pk`, and
+    // the method reads a `ghost` property that is not declared at all.
+    const allocator = std.testing.allocator;
+
+    const bindings = [_]types.ANFBinding{
+        .{
+            .name = "t0",
+            .value = .{ .load_prop = .{ .name = "ghost" } },
+            .source_loc = .{ .file = "Ghost.runar.ts", .line = 7, .column = 4 },
+        },
+        .{ .name = "t1", .value = .{ .assert = .{ .value = "t0" } } },
+    };
+
+    var props = [_]types.ANFProperty{
+        .{ .name = "pk", .type_name = "PubKey", .readonly = true },
+    };
+    var methods_arr = [_]types.ANFMethod{
+        .{ .name = "spend", .is_public = true, .params = &.{}, .bindings = @constCast(&bindings) },
+    };
+    const program = types.ANFProgram{
+        .contract_name = "Ghost",
+        .properties = &props,
+        .methods = &methods_arr,
+    };
+
+    try std.testing.expectError(LowerError.LoadPropNoConstructorSlot, lower(allocator, program));
+}
+
+test "lower accepts load_prop for a real constructor-param property (H1)" {
+    // A genuine readonly constructor-param property has a deploy-time slot
+    // (found == true) and must still lower to a placeholder without error.
+    const allocator = std.testing.allocator;
+
+    const bindings = [_]types.ANFBinding{
+        .{ .name = "t0", .value = .{ .load_prop = .{ .name = "pk" } } },
+        .{ .name = "t1", .value = .{ .assert = .{ .value = "t0" } } },
+    };
+
+    var props = [_]types.ANFProperty{
+        .{ .name = "pk", .type_name = "PubKey", .readonly = true },
+    };
+    var methods_arr = [_]types.ANFMethod{
+        .{ .name = "spend", .is_public = true, .params = &.{}, .bindings = @constCast(&bindings) },
+    };
+    const ctor_params = [_]types.ParamNode{
+        .{ .name = "pk", .type_info = .pub_key },
+    };
+    const program = types.ANFProgram{
+        .contract_name = "Ok",
+        .properties = &props,
+        .methods = &methods_arr,
+        .constructor = .{ .params = @constCast(&ctor_params), .assertions = &.{} },
+    };
+
+    const result = try lower(allocator, program);
+    defer {
+        for (result.methods) |m| {
+            allocator.free(m.instructions);
+            if (m.instruction_source_locs.len > 0) allocator.free(m.instruction_source_locs);
+        }
+        allocator.free(result.methods);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.methods.len);
 }
 
 test "lower multi-method produces one StackMethod per public method" {
