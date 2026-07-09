@@ -572,6 +572,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -627,6 +628,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -693,6 +695,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 

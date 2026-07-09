@@ -69,6 +69,11 @@ class ANFMethod:
     params: list[ANFParam] = field(default_factory=list)
     body: list[ANFBinding] = field(default_factory=list)
     is_public: bool = False
+    # Issue #123: BIP-143 sighash type declared via @sighash on the source
+    # method (e.g. 0x43 for SINGLE|FORKID). ``None`` = default ALL|FORKID.
+    # Carried onto the ABI method descriptor so the SDK builds the matching
+    # preimage.
+    sighash_type: int | None = None
 
 
 @dataclass
@@ -170,6 +175,11 @@ class ANFValue:
 
     # -- check_preimage, deserialize_state ---------------------------------
     preimage: str | None = None
+    # -- check_preimage: issue #123 BIP-143 sighash flag the on-chain
+    #    OP_PUSH_TX binding appends to the derived signature. ``None`` = default
+    #    ALL|FORKID (0x41), byte-identical to the pinned cross-tier binding
+    #    blob. Only set for a method that declares a non-default @sighash mode.
+    sighash_flag: int | None = None
 
     # -- add_output --------------------------------------------------------
     satoshis: str | None = None
@@ -326,6 +336,7 @@ def _anf_value_from_dict(d: dict[str, Any]) -> ANFValue:
     if d.get("step") is not None:
         v.step = int(d.get("step"))
     v.preimage = d.get("preimage")
+    v.sighash_flag = d.get("sighashFlag")
     v.satoshis = d.get("satoshis")
     v.state_values = d.get("stateValues")
     v.script_bytes = d.get("scriptBytes")
@@ -377,6 +388,7 @@ def _anf_method_from_dict(d: dict[str, Any]) -> ANFMethod:
         params=[_anf_param_from_dict(p) for p in d.get("params", [])],
         body=[_anf_binding_from_dict(b) for b in d.get("body", [])],
         is_public=d.get("isPublic", False),
+        sighash_type=d.get("sigHashType"),
     )
 
 

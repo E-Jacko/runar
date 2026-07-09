@@ -1061,7 +1061,7 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 	case "get_state_script":
 		ctx.lowerGetStateScript(name)
 	case "check_preimage":
-		ctx.lowerCheckPreimage(name, value.Preimage, bindingIndex, lastUses)
+		ctx.lowerCheckPreimage(name, value.Preimage, value.SighashFlag, bindingIndex, lastUses)
 	case "deserialize_state":
 		ctx.lowerDeserializeState(value.Preimage, bindingIndex, lastUses)
 	case "add_output":
@@ -3104,7 +3104,7 @@ func (ctx *loweringContext) lowerCheckMultiSig(bindingName string, args []string
 	ctx.trackDepth()
 }
 
-func (ctx *loweringContext) lowerCheckPreimage(bindingName, preimage string, bindingIndex int, lastUses map[string]int) {
+func (ctx *loweringContext) lowerCheckPreimage(bindingName, preimage string, sighashFlag int, bindingIndex int, lastUses map[string]int) {
 	// OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
 	// current spending transaction. The signature is DERIVED FROM THE PREIMAGE
 	// ON CHAIN (Optimal OP_PUSH_TX): s = (hash256(preimage) + r)*k⁻¹ mod n, with
@@ -3121,9 +3121,12 @@ func (ctx *loweringContext) lowerCheckPreimage(bindingName, preimage string, bin
 	isLast := ctx.isLastUse(preimage, bindingIndex, lastUses)
 	ctx.bringToTop(preimage, isLast)
 
-	// Derive + verify the signature on-chain (single opaque raw_bytes blob,
-	// byte-identical across all 7 tiers). Net stack effect is zero.
-	ctx.emitCheckPreimageBinding()
+	// Derive + verify the signature on-chain (single opaque raw_bytes blob).
+	// For the default ALL|FORKID (sighashFlag 0/0x41) the blob is byte-identical
+	// to the pinned cross-tier constant; issue #123 lets a method declare a
+	// different mode, which only changes the appended sighash flag byte. Net
+	// stack effect is zero.
+	ctx.emitCheckPreimageBinding(sighashFlag)
 
 	// Preimage remains on top. Rename for field extractors.
 	ctx.sm.pop()

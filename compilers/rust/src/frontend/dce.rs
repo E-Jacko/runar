@@ -62,6 +62,7 @@ pub fn eliminate_dead_bindings_method(method: &ANFMethod) -> ANFMethod {
         params: method.params.clone(),
         body,
         is_public: method.is_public,
+        sighash_type: method.sighash_type,
     }
 }
 
@@ -130,7 +131,7 @@ pub fn collect_refs_from_value(value: &ANFValue, refs: &mut HashSet<String>) {
         ANFValue::UpdateProp { value, .. } => {
             refs.insert(value.clone());
         }
-        ANFValue::CheckPreimage { preimage } => {
+        ANFValue::CheckPreimage { preimage, .. } => {
             refs.insert(preimage.clone());
         }
         ANFValue::DeserializeState { preimage } => {

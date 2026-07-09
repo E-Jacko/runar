@@ -49,6 +49,19 @@ func Validate(contract *ContractNode) *ValidationResult {
 	ctx.validateMethods()
 	ctx.checkNoRecursion()
 
+	// Issue #123: reject preimage-field reads / output bindings that are
+	// unsound under a method's declared @sighash mode (security core). This
+	// pass emits both errors (unsound usages) and warnings (e.g. an explicit
+	// single-output SINGLE covenant whose same-index value cannot be pinned
+	// statically), so route each diagnostic to the matching bucket.
+	for _, d := range ValidateSighashUsage(contract) {
+		if d.Severity == SeverityWarning {
+			ctx.warnings = append(ctx.warnings, d)
+		} else {
+			ctx.errors = append(ctx.errors, d)
+		}
+	}
+
 	return &ValidationResult{
 		Errors:   ctx.errors,
 		Warnings: ctx.warnings,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import hashlib
+import warnings
 from runar.sdk.types import (
     RunarArtifact, Utxo, TransactionData, TxOutput,
     DeployOptions, CallOptions, OutputSpec, TerminalOutput, PreparedCall,
@@ -28,6 +29,37 @@ from runar.sdk.anf_interpreter import compute_new_state, compute_new_state_and_d
 from runar.sdk.ordinals import (
     Inscription, build_inscription_envelope, parse_inscription_envelope,
 )
+
+
+class _EmptySig:
+    """Producer-side marker type (issue #106) for the deliberately-empty branch
+    of an OR-CHECKSIG method — ``checkSig(sigA, pkA) || checkSig(sigB, pkB)``,
+    where ``||`` lowers to the non-lazy ``OP_BOOLOR`` so BOTH ``OP_CHECKSIG``s
+    run. Only the matching branch supplies a real signature; the failing branch
+    MUST push an empty signature (OP_0) or BIP146 NULLFAIL rejects the spend.
+
+    Pass :data:`EMPTY_SIG` as the call arg for the non-matching ``Sig`` slot: the
+    SDK pushes OP_0 for it and never signs it, distinct from ``None`` (auto-sign)
+    and an explicit hex-bytes value. ``call('execute', [None, EMPTY_SIG])`` signs
+    only slot 0.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "EMPTY_SIG"
+
+
+#: Singleton marker for the empty OR-CHECKSIG branch (issue #106).
+EMPTY_SIG = _EmptySig()
+
+
+def is_empty_sig(value: object) -> bool:
+    """Type guard: is this call arg the :data:`EMPTY_SIG` marker (issue #106)?
+
+    Uses ``isinstance`` so identity holds even if the module is imported twice.
+    """
+    return isinstance(value, _EmptySig)
 
 
 class RunarContract:
@@ -492,6 +524,24 @@ class RunarContract:
                 prevouts_indices.append(i)
                 # Placeholder: 36 bytes per estimated input
                 resolved_args[i] = '00' * (36 * estimated_inputs)
+            # EMPTY_SIG (issue #106) is intentionally NOT handled here: it is not
+            # None, so it is never added to `sig_indices` and never signed. It
+            # stays in `resolved_args` and `_encode_arg` emits OP_0 for it.
+
+        # Soft heuristic (issue #106): more than one auto-signed Sig slot usually
+        # means an OR-CHECKSIG method whose non-matching branch should use
+        # EMPTY_SIG instead — otherwise every branch gets the same real signature
+        # and the failing CHECKSIG trips BIP146 NULLFAIL on broadcast. Legitimate
+        # AND-CHECKSIG multi-signer flows also use multiple auto slots, so this is
+        # informational only (the ABI does not encode OR-vs-AND topology).
+        if len(sig_indices) >= 2:
+            warnings.warn(
+                f"runar-sdk: {self.artifact.contract_name}.call('{method_name}') "
+                f"has {len(sig_indices)} auto-signed Sig slots. If this is an "
+                f"OR-CHECKSIG method, pass EMPTY_SIG for the non-matching "
+                f"branch(es) to satisfy BIP146 NULLFAIL (issue #106).",
+                stacklevel=2,
+            )
 
         # If any param uses SigHashPreimage, or this is stateful,
         # the compiler injects an implicit _opPushTxSig.
@@ -509,6 +559,11 @@ class RunarContract:
 
         # Compute code separator index for this method
         code_sep_idx = self._get_code_sep_index(self._find_method_index(method_name))
+
+        # Issue #123: build every preimage for this call under the method's
+        # declared @sighash mode (default 0x41). A method with no directive
+        # carries no sigHashType → falls back to 0x41 (unchanged behaviour).
+        method_sig_hash_type = self._method_sig_hash_type(method_name)
 
         # Compute change PKH for stateful methods that need it
         change_pkh_hex = ''
@@ -779,7 +834,7 @@ class RunarContract:
             # keeps placeholder Sig params.  For input_idx>0 (extra), signs
             # with signer.
             def _build_stateful_unlock(tx: str, input_idx: int, subscript: str, sats: int, args_override: list | None = None, tx_change_amount: int = 0, pi: list[int] | None = None) -> tuple[str, str, str]:
-                op_sig, preimage = compute_op_push_tx(tx, input_idx, subscript, sats, code_sep_idx)
+                op_sig, preimage = compute_op_push_tx(tx, input_idx, subscript, sats, code_sep_idx, method_sig_hash_type)
                 base_args = args_override if args_override is not None else resolved_args
                 input_args = list(base_args)
                 # Only sign Sig params for extra inputs, not the primary
@@ -903,6 +958,7 @@ class RunarContract:
             if needs_op_push_tx:
                 sig_hex, preimage_hex = compute_op_push_tx(
                     signed_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+                    method_sig_hash_type,
                 )
                 final_op_push_tx_sig = sig_hex
                 resolved_args[preimage_index] = preimage_hex
@@ -913,6 +969,7 @@ class RunarContract:
                 tmp_tx = insert_unlocking_script(signed_tx, 0, real_unlocking_script)
                 final_sig, final_pre = compute_op_push_tx(
                     tmp_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+                    method_sig_hash_type,
                 )
                 resolved_args[preimage_index] = final_pre
                 final_op_push_tx_sig = final_sig
@@ -1287,11 +1344,13 @@ class RunarContract:
         final_preimage = ''
 
         term_code_sep_idx = self._get_code_sep_index(self._find_method_index(method_name))
+        # Issue #123: terminal preimages also honour the declared @sighash mode.
+        term_sig_hash_type = self._method_sig_hash_type(method_name)
 
         if is_stateful:
             # Build stateful terminal unlock with PLACEHOLDER user sigs
             def build_stateful_terminal_unlock(tx: str) -> tuple[str, str, str]:
-                op_sig, preimage = compute_op_push_tx(tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx)
+                op_sig, preimage = compute_op_push_tx(tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx, term_sig_hash_type)
                 # Keep placeholder Sig params (don't sign for primary)
                 args_hex = ''
                 for arg in resolved_args:
@@ -1325,6 +1384,7 @@ class RunarContract:
             if needs_op_push_tx:
                 sig_hex, preimage_hex = compute_op_push_tx(
                     term_tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx,
+                    term_sig_hash_type,
                 )
                 final_op_push_tx_sig = sig_hex
                 resolved_args[preimage_index] = preimage_hex
@@ -1336,6 +1396,7 @@ class RunarContract:
                 tmp_tx = insert_unlocking_script(term_tx, 0, real_unlock)
                 final_sig, final_pre = compute_op_push_tx(
                     tmp_tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx,
+                    term_sig_hash_type,
                 )
                 resolved_args[preimage_index] = final_pre
                 final_op_push_tx_sig = final_sig
@@ -1569,6 +1630,17 @@ class RunarContract:
     def _get_public_methods(self):
         return [m for m in self.artifact.abi.methods if m.is_public]
 
+    def _method_sig_hash_type(self, method_name: str) -> int:
+        """Issue #123: resolve the BIP-143 sighash type for ``method_name`` from
+        the ABI (default 0x41 = ALL|FORKID). Drives both the OP_PUSH_TX binding
+        derivation and the SDK-built BIP-143 preimage so they commit to the same
+        fields the on-chain covenant expects.
+        """
+        for m in self.artifact.abi.methods:
+            if m.name == method_name:
+                return m.sig_hash_type if m.sig_hash_type is not None else 0x41
+        return 0x41
+
 
 # ---------------------------------------------------------------------------
 # Argument encoding
@@ -1715,6 +1787,9 @@ def _normalize_witness_bytes(value) -> str:
 
 
 def _encode_arg(value) -> str:
+    if is_empty_sig(value):
+        # OP_0 — empty signature push for the failing OR-CHECKSIG branch (#106).
+        return '00'
     if isinstance(value, bool):
         return '51' if value else '00'
     if isinstance(value, int):

@@ -432,6 +432,10 @@ pub const ABIMethod = struct {
     is_terminal: ?bool = null,
     /// Unlocking script is prefixed with _codePart (issue #100).
     uses_code_part: ?bool = null,
+    /// The BIP-143 sighash type this method's preimage is built under (from a
+    /// `@sighash` directive, issue #123), e.g. 0x43 for SINGLE|FORKID. Absent =
+    /// default ALL|FORKID (0x41).
+    sig_hash_type: ?i64 = null,
 
     pub fn deinit(self: *ABIMethod, allocator: std.mem.Allocator) void {
         if (self.name.len > 0) allocator.free(self.name);
@@ -455,6 +459,9 @@ pub const ABIMethod = struct {
         }
         if (obj.get("usesCodePart")) |v| {
             if (v == .bool) method.uses_code_part = v.bool;
+        }
+        if (obj.get("sigHashType")) |v| {
+            if (v == .integer) method.sig_hash_type = v.integer;
         }
         if (obj.get("params")) |params_val| {
             if (params_val == .array) {
@@ -626,6 +633,15 @@ pub const StateValue = union(enum) {
     /// constructing such a field. Leaves may only be scalar StateValues; the
     /// flatten/regroup helpers in `sdk_state.zig` walk the tree linearly.
     array_value: []const StateValue,
+    /// Issue #106: the producer-side EmptySig marker for the deliberately-empty
+    /// branch of an OR-CHECKSIG method — `checkSig(sigA, pkA) || checkSig(sigB,
+    /// pkB)`, where `||` lowers to the non-lazy OP_BOOLOR so BOTH OP_CHECKSIGs
+    /// run. Only the matching branch supplies a real signature; the failing
+    /// branch MUST push an empty signature (OP_0) or BIP146 NULLFAIL rejects the
+    /// whole spend. Distinct from `.int = 0` (the auto-sign sentinel), so the
+    /// auto-sign collectors never treat it as auto-sign and never sign it —
+    /// `encodeArg` emits OP_0 (00) for it. See `EMPTY_SIG`.
+    empty_sig,
 
     pub fn deinit(self: StateValue, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -645,6 +661,7 @@ pub const StateValue = union(enum) {
             .big_int => |s| .{ .big_int = try allocator.dupe(u8, s) },
             .boolean => |b| .{ .boolean = b },
             .bytes => |b| .{ .bytes = try allocator.dupe(u8, b) },
+            .empty_sig => .empty_sig,
             .array_value => |items| blk: {
                 var copy = try allocator.alloc(StateValue, items.len);
                 for (items, 0..) |it, i| copy[i] = try it.clone(allocator);
@@ -653,6 +670,12 @@ pub const StateValue = union(enum) {
         };
     }
 };
+
+/// Issue #106: the EmptySig marker value. Pass as the call arg for the
+/// non-matching Sig slot of an OR-CHECKSIG method: the SDK pushes OP_0 for it
+/// and never signs it, distinct from `.int = 0` (auto-sign) and an explicit
+/// hex-bytes value. Wire-byte parity with the TS SDK (which encodes "00").
+pub const EMPTY_SIG: StateValue = .empty_sig;
 
 // ---------------------------------------------------------------------------
 // PreparedCall — deferred-signing handoff for multi-signer flows

@@ -16,8 +16,29 @@ public record PropertyNode(
     boolean readonly,
     Expression initializer,
     SourceLocation sourceLocation,
-    List<SyntheticArrayChainEntry> syntheticArrayChain
+    List<SyntheticArrayChainEntry> syntheticArrayChain,
+    /**
+     * Issue #109: set by the parser when a {@code /** @embedAlways *&#47;} (or
+     * {@code // @embedAlways}) comment directive immediately precedes a readonly
+     * field. It opts the field OUT of dead-code elimination so its deploy-time
+     * bytes survive into the on-chain locking script. Only meaningful on
+     * readonly fields, and only honoured on the {@code .runar.ts} surface
+     * (mirrors the TypeScript reference).
+     */
+    boolean embedAlways
 ) {
+    /** Backwards-compatible constructor for callers that carry no {@code @embedAlways}. */
+    public PropertyNode(
+        String name,
+        TypeNode type,
+        boolean readonly,
+        Expression initializer,
+        SourceLocation sourceLocation,
+        List<SyntheticArrayChainEntry> syntheticArrayChain
+    ) {
+        this(name, type, readonly, initializer, sourceLocation, syntheticArrayChain, false);
+    }
+
     public String kind() {
         return "property";
     }

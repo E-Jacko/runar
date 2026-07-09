@@ -10,6 +10,7 @@ require "time"
 require "set"
 
 require_relative "ir/types"
+require_relative "frontend/sighash_directive"
 
 module RunarCompiler
   # -------------------------------------------------------------------------
@@ -32,8 +33,8 @@ module RunarCompiler
     end
   end
 
-  ABIMethod = Struct.new(:name, :params, :is_public, :is_terminal, :uses_code_part, keyword_init: true) do
-    def initialize(name: "", params: [], is_public: false, is_terminal: nil, uses_code_part: nil)
+  ABIMethod = Struct.new(:name, :params, :is_public, :is_terminal, :uses_code_part, :sig_hash_type, keyword_init: true) do
+    def initialize(name: "", params: [], is_public: false, is_terminal: nil, uses_code_part: nil, sig_hash_type: nil)
       super
     end
   end
@@ -128,12 +129,13 @@ module RunarCompiler
     require_relative "frontend/input_limits"
     Frontend::InputLimits.assert_source_bytes_under_limit(source)
 
-    # Fail-closed guard for the author-facing comment directives that only the
-    # TypeScript compiler implements today: +@sighash <FLAGS>+ (#123, per-method
-    # sighash type) and +@embedAlways+ (#109, readonly-field DCE opt-out). Ruby
-    # ignores comments, so it would silently drop them and change signing / DCE
-    # semantics. Reject rather than diverge until the ports land.
-    directive_error = _unsupported_directive_error(source)
+    # Fail-closed guard for the author-facing comment directives +@sighash+
+    # (#123, per-method sighash type) and +@embedAlways+ (#109, readonly-field
+    # DCE opt-out). Both are honored ONLY on the +.runar.ts+ surface (matching
+    # the TypeScript reference); on the other 8 formats Ruby's parsers ignore
+    # comments and would silently drop the directive, changing signing / DCE
+    # semantics, so the guard fails closed there.
+    directive_error = _unsupported_directive_error(source, file_name)
     unless directive_error.nil?
       require_relative "frontend/parse_result"
       require_relative "frontend/diagnostic"
@@ -182,14 +184,28 @@ module RunarCompiler
   # or nil when the source is clean. Word-boundary matched (\b) to mirror the
   # TypeScript compiler's +/@sighash\b/+ / +/@embedAlways\b/+ scans so an
   # identifier like +sighashType+ does not trip the guard.
-  def self._unsupported_directive_error(source)
-    if source =~ /@sighash\b/
-      "@sighash directive is not yet supported by the Ruby compiler " \
-        "(issue #123); compile the contract with the TypeScript compiler"
-    elsif source =~ /@embedAlways\b/
-      "@embedAlways directive is not yet supported by the Ruby compiler " \
-        "(issue #109); compile the contract with the TypeScript compiler"
+  #
+  # The directives are honored ONLY on the +.runar.ts+ surface (matching the
+  # TypeScript reference). For +.runar.ts+ the implemented directives are
+  # allowed through to the parser; the other 8 formats always fail closed.
+  def self._unsupported_directive_error(source, file_name)
+    is_ts = file_name.downcase.end_with?(".runar.ts")
+
+    # @sighash (#123) is implemented for the .runar.ts surface; only the other
+    # 8 formats fail closed.
+    if source =~ /@sighash\b/ && !is_ts
+      return "@sighash directive is not supported by the Ruby compiler for " \
+             "this format (issue #123); it is honored only on the .runar.ts surface"
     end
+
+    # @embedAlways (#109) is implemented for the .runar.ts surface; only the
+    # other 8 formats fail closed.
+    if source =~ /@embedAlways\b/ && !is_ts
+      return "@embedAlways directive is not supported by the Ruby compiler for " \
+             "this format (issue #109); it is honored only on the .runar.ts surface"
+    end
+
+    nil
   end
   private_class_method :_unsupported_directive_error
 
@@ -845,12 +861,22 @@ module RunarCompiler
       sm_match = stack_methods&.find { |sm| sm[:name] == method.name }
       uses_code_part = true if sm_match && sm_match[:uses_code_part]
 
+      # Issue #123: carry a non-default @sighash mode into the ABI so the SDK
+      # builds the BIP-143 preimage under the same flags the covenant expects.
+      # Omitted for the default (0x41) → existing artifacts are byte-identical.
+      sig_hash_type = nil
+      if method.is_public && method.respond_to?(:sighash_type) &&
+         !method.sighash_type.nil? && method.sighash_type != Frontend::SighashDirective::SIGHASH_DEFAULT
+        sig_hash_type = method.sighash_type
+      end
+
       methods << ABIMethod.new(
         name: method.name,
         params: params,
         is_public: method.is_public,
         is_terminal: is_terminal,
-        uses_code_part: uses_code_part
+        uses_code_part: uses_code_part,
+        sig_hash_type: sig_hash_type
       )
     end
 
@@ -945,6 +971,8 @@ module RunarCompiler
           }
           md["isTerminal"] = m.is_terminal unless m.is_terminal.nil?
           md["usesCodePart"] = m.uses_code_part unless m.uses_code_part.nil?
+          # Issue #123: BIP-143 sighash type for a non-default @sighash mode.
+          md["sigHashType"] = m.sig_hash_type if m.respond_to?(:sig_hash_type) && !m.sig_hash_type.nil?
           md
         end,
       },
@@ -1075,6 +1103,9 @@ module RunarCompiler
       d["value"] = v.value_ref unless v.value_ref.nil?
       d["isAutoInjectedStateCheck"] = true if v.kind == "assert" && v.is_auto_injected_state_check
       d["preimage"] = v.preimage unless v.preimage.nil?
+      # Issue #123: a non-default @sighash mode threads the BIP-143 flag onto the
+      # check_preimage node. Omitted for the default so existing ANF is unchanged.
+      d["sighashFlag"] = v.sighash_flag if v.respond_to?(:sighash_flag) && !v.sighash_flag.nil?
       d["satoshis"] = v.satoshis unless v.satoshis.nil?
       d["stateValues"] = v.state_values unless v.state_values.nil?
       d["scriptBytes"] = v.script_bytes unless v.script_bytes.nil?

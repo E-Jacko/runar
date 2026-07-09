@@ -50,8 +50,12 @@ module Runar
     end
 
     # A contract method descriptor.
-    ABIMethod = Struct.new(:name, :params, :is_public, :is_terminal, :uses_code_part, keyword_init: true) do
-      def initialize(name:, params: [], is_public: true, is_terminal: nil, uses_code_part: nil)
+    # +sig_hash_type+ (issue #123): the BIP-143 sighash type this method's
+    # covenant is built under, from a @sighash directive (e.g. 0x43 for
+    # SINGLE|FORKID). nil = default ALL|FORKID (0x41); the SDK falls back to
+    # 0x41 so older artifacts keep working.
+    ABIMethod = Struct.new(:name, :params, :is_public, :is_terminal, :uses_code_part, :sig_hash_type, keyword_init: true) do
+      def initialize(name:, params: [], is_public: true, is_terminal: nil, uses_code_part: nil, sig_hash_type: nil)
         super
       end
     end
@@ -167,7 +171,8 @@ module Runar
             params: params,
             is_public: m.fetch('isPublic', true),
             is_terminal: m['isTerminal'],
-            uses_code_part: m['usesCodePart']
+            uses_code_part: m['usesCodePart'],
+            sig_hash_type: m['sigHashType']
           )
         end
 

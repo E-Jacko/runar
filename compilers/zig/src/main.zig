@@ -20,6 +20,7 @@ const stack_lower = @import("passes/stack_lower.zig");
 const peephole = @import("passes/peephole.zig");
 const emit = @import("codegen/emit.zig");
 const input_limits = @import("frontend/input_limits.zig");
+const embed_always_warn = @import("passes/embed_always_warn.zig");
 
 const CompileOptions = struct {
     emit_ir: bool = false,
@@ -277,15 +278,19 @@ fn compileFromSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8,
 
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, work_allocator, .limited(1 * 1024 * 1024));
 
-    // Pass 0.5: Fail-closed guard for the `@sighash` (#123) / `@embedAlways`
-    // (#109) comment directives that only the TypeScript compiler honours
-    // today. The Zig frontend ignores comments, so it would silently drop them.
-    if (input_limits.unsupportedDirectiveError(source)) |msg| {
-        std.debug.print("  parse error: {s}\n", .{msg});
-        return error.ParseFailed;
-    }
-
     const format = detectFormat(path);
+
+    // Pass 0.5: Fail-closed guard for the `@sighash` (#123) / `@embedAlways`
+    // (#109) comment directives. The `.runar.ts` surface parser honours them
+    // (matching the TS reference); the eight non-TS surface parsers ignore
+    // comments, so they must reject a directive rather than silently drop it.
+    // `.runar.ts` is exempt.
+    if (format != .runar_ts) {
+        if (input_limits.unsupportedDirectiveError(source)) |msg| {
+            std.debug.print("  parse error: {s}\n", .{msg});
+            return error.ParseFailed;
+        }
+    }
 
     // Pass 1: Parse (dispatch by format, extract contract or fail)
     const contract: types.ContractNode = switch (format) {
@@ -416,6 +421,14 @@ fn compileFromSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8,
     // from private method bodies (whose last binding is the return value,
     // only referenced at inlining call sites in other methods).
     program = try ec_optimizer.optimize(work_allocator, program);
+
+    // Issue #109: warn when DCE strips an un-annotated readonly field. Computed
+    // from the post-optimizer ANF (the surviving load_prop set), mirroring the
+    // TS reference's collectReferencedProps(optimizedAnf) placement.
+    {
+        const dce_warnings = try embed_always_warn.collectDceWarnings(work_allocator, expanded_contract, &program);
+        for (dce_warnings) |diag| std.debug.print("  warning: {s}\n", .{diag.message});
+    }
 
     // --emit-ir: output canonical ANF IR JSON and stop
     if (opts.emit_ir) {

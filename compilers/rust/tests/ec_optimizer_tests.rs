@@ -34,6 +34,7 @@ fn make_program(bindings: Vec<ANFBinding>) -> ANFProgram {
             params: vec![],
             body: bindings,
             is_public: true,
+            sighash_type: None,
         }],
     }
 }
@@ -514,6 +515,7 @@ fn test_contract_metadata_preserved() {
                 assert_binding("t1", "t0"),
             ],
             is_public: true,
+            sighash_type: None,
         }],
     };
 
@@ -553,12 +555,14 @@ fn test_multiple_methods_all_optimized() {
                 params: vec![],
                 body: method1_body,
                 is_public: true,
+                sighash_type: None,
             },
             ANFMethod {
                 name: "method2".to_string(),
                 params: vec![],
                 body: method2_body,
                 is_public: true,
+                sighash_type: None,
             },
         ],
     };
@@ -604,6 +608,7 @@ fn test_empty_method_body_unchanged() {
             params: vec![],
             body: vec![],
             is_public: true,
+            sighash_type: None,
         }],
     };
     let result = optimize_ec(program);

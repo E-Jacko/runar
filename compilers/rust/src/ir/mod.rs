@@ -82,6 +82,14 @@ pub struct ANFMethod {
     pub body: Vec<ANFBinding>,
     #[serde(rename = "isPublic")]
     pub is_public: bool,
+    /// Issue #123: the method's declared `@sighash` type (e.g. `0x43` for
+    /// SINGLE|FORKID), `None` for the default `ALL|FORKID`. In-memory carrier
+    /// ONLY (`#[serde(skip)]`, like `ANFProgram::parent_class`) so it never
+    /// appears in the emitted ANF IR JSON the conformance suite compares
+    /// cross-tier; the artifact assembler copies a non-default value into
+    /// `ABIMethod.sigHashType` so the SDK builds the matching preimage.
+    #[serde(skip, default)]
+    pub sighash_type: Option<i64>,
 }
 
 /// A method parameter.
@@ -219,7 +227,16 @@ pub enum ANFValue {
     GetStateScript {},
 
     #[serde(rename = "check_preimage")]
-    CheckPreimage { preimage: String },
+    CheckPreimage {
+        preimage: String,
+        /// Issue #123: BIP-143 sighash flag the on-chain OP_PUSH_TX binding
+        /// appends to the derived signature. Absent = default `ALL|FORKID`
+        /// (0x41), byte-identical to the pinned cross-tier binding blob. Only
+        /// set for a method that declares a non-default `@sighash` mode, so
+        /// golden ANF stays unchanged for every existing contract.
+        #[serde(rename = "sighashFlag", skip_serializing_if = "Option::is_none", default)]
+        sighash_flag: Option<i64>,
+    },
 
     #[serde(rename = "deserialize_state")]
     DeserializeState { preimage: String },

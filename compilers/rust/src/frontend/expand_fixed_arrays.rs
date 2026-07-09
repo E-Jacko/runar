@@ -361,6 +361,8 @@ impl<'a> ExpandContext<'a> {
                     prop_type: meta.element_type.clone(),
                     readonly,
                     initializer: slot_init,
+                    // Synthetic array leaves are not @embedAlways targets.
+                    embed_always: false,
                     source_location: loc.clone(),
                     synthetic_array_chain: Some(chain_here),
                 });
@@ -380,6 +382,9 @@ impl<'a> ExpandContext<'a> {
             params: method.params.clone(),
             body: new_body,
             visibility: method.visibility.clone(),
+            // Issue #123: the @sighash directive is attached to the source
+            // method; preserve it through fixed-array expansion.
+            sighash_type: method.sighash_type,
             source_location: method.source_location.clone(),
         }
     }

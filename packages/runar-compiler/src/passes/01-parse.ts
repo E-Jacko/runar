@@ -73,6 +73,53 @@ export interface ParseResult {
   errors: CompilerDiagnostic[];
 }
 
+// ---------------------------------------------------------------------------
+// Fail-closed directive guard (issues #123 / #109)
+// ---------------------------------------------------------------------------
+
+// The author-facing comment directives `@sighash <FLAGS>` (#123, per-method
+// sighash type) and `@embedAlways` (#109, readonly-field DCE opt-out) are
+// honoured ONLY on the TypeScript (.runar.ts) surface below — the default
+// branch reads leading trivia / JSDoc. The eight non-TS surface parsers this
+// compiler dispatches to (.sol/.move/.py/.go/.rs/.rb/.zig/.java) ignore
+// comments, so a directive in one of those sources would be silently dropped
+// and change signing / DCE semantics. Fail closed on those formats rather than
+// miscompile — this matches the Go/Rust/Python/Zig/Ruby/Java tiers. No
+// conformance fixture uses either directive, so this has zero golden impact.
+// Word-boundary anchored (matching the `/@sighash\b/` / `/@embedAlways\b/`
+// scans used to detect the directives) so an identifier like `sighashType`
+// does not trip the guard.
+const SIGHASH_DIRECTIVE_RE = /@sighash\b/;
+const EMBED_ALWAYS_DIRECTIVE_RE = /@embedAlways\b/;
+
+// Extension → human-readable surface name for the diagnostic. `.runar.ts` is
+// intentionally absent: the default branch implements the directives.
+const NON_TS_SURFACES: ReadonlyArray<readonly [string, string]> = [
+  ['.runar.sol', 'Solidity'],
+  ['.runar.move', 'Move'],
+  ['.runar.py', 'Python'],
+  ['.runar.go', 'Go DSL'],
+  ['.runar.rs', 'Rust'],
+  ['.runar.rb', 'Ruby'],
+  ['.runar.zig', 'Zig'],
+  ['.runar.java', 'Java'],
+];
+
+/**
+ * Return a fail-closed diagnostic message when `source` carries a `@sighash`
+ * (#123) or `@embedAlways` (#109) directive on a non-TS surface whose parser
+ * ignores comments (so the directive would be silently dropped), else null.
+ */
+function unsupportedDirectiveError(source: string, surfaceName: string): string | null {
+  if (SIGHASH_DIRECTIVE_RE.test(source)) {
+    return `@sighash directive (issue #123) is not supported by the ${surfaceName} surface parser; write the contract in TypeScript (.runar.ts) where @sighash is honoured`;
+  }
+  if (EMBED_ALWAYS_DIRECTIVE_RE.test(source)) {
+    return `@embedAlways directive (issue #109) is not supported by the ${surfaceName} surface parser; write the contract in TypeScript (.runar.ts) where @embedAlways is honoured`;
+  }
+  return null;
+}
+
 /**
  * Parse a Rúnar source string and extract the contract AST.
  *
@@ -95,6 +142,22 @@ export function parse(source: string, fileName?: string): ParseResult {
       `parse: source exceeds MAX_SOURCE_BYTES (limit=${InputLimits.MAX_SOURCE_BYTES}, actual=${sourceBytes})`,
       { limit: InputLimits.MAX_SOURCE_BYTES, actual: sourceBytes },
     );
+  }
+
+  // Fail-closed directive guard: reject `@sighash` / `@embedAlways` on any
+  // non-TS surface (whose parser ignores comments) before dispatching. The
+  // `.runar.ts` / default branch is exempt because it honours the directives.
+  for (const [ext, surfaceName] of NON_TS_SURFACES) {
+    if (file.endsWith(ext)) {
+      const directiveMsg = unsupportedDirectiveError(source, surfaceName);
+      if (directiveMsg) {
+        return {
+          contract: null,
+          errors: [makeDiagnostic(directiveMsg, 'error', { file, line: 1, column: 0 })],
+        };
+      }
+      break;
+    }
   }
 
   // Multi-format dispatch based on file extension

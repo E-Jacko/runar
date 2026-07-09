@@ -66,6 +66,10 @@ class AbiMethod:
     is_terminal: bool | None = None
     # Unlocking script is prefixed with _codePart (issue #100).
     uses_code_part: bool | None = None
+    # Issue #123: BIP-143 sighash type this method's preimage/covenant is built
+    # under (from a @sighash directive), e.g. 0x43 for SINGLE|FORKID. ``None`` =
+    # default ALL|FORKID (0x41); the SDK falls back to 0x41.
+    sig_hash_type: int | None = None
 
 
 @dataclass
@@ -151,6 +155,7 @@ class RunarArtifact:
                 is_public=m.get('isPublic', True),
                 is_terminal=m.get('isTerminal'),
                 uses_code_part=m.get('usesCodePart'),
+                sig_hash_type=m.get('sigHashType'),
             )
             for m in abi_raw.get('methods', [])
         ]

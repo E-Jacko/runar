@@ -24,15 +24,18 @@ pub fn assertSourceBytesUnderLimit(source: []const u8) SourceSizeError!void {
 }
 
 // ---------------------------------------------------------------------------
-// Fail-closed guard for author-facing comment directives that only the
-// TypeScript compiler implements today: `@sighash <FLAGS>` (#123, per-method
-// sighash type) and `@embedAlways` (#109, readonly-field DCE opt-out). The Zig
-// frontend ignores comments, so silently dropping these would change signing /
-// DCE semantics — reject rather than diverge until the ports land.
+// Fail-closed guard for author-facing comment directives that the Zig frontend
+// honours ONLY on the `.runar.ts` surface (matching the TS reference compiler,
+// which implements them only there): `@sighash <FLAGS>` (#123, per-method
+// sighash type) and `@embedAlways` (#109, readonly-field DCE opt-out). The
+// eight non-TS surface parsers ignore comments, so silently dropping a
+// directive would change signing / DCE semantics — those formats reject rather
+// than diverge. The `.runar.ts` parse path is exempt (it implements the
+// directives) — the guard callers narrow accordingly.
 // ---------------------------------------------------------------------------
 
-pub const SIGHASH_DIRECTIVE_ERROR = "@sighash directive is not yet supported by the Zig compiler (issue #123); compile the contract with the TypeScript compiler";
-pub const EMBED_ALWAYS_DIRECTIVE_ERROR = "@embedAlways directive is not yet supported by the Zig compiler (issue #109); compile the contract with the TypeScript compiler";
+pub const SIGHASH_DIRECTIVE_ERROR = "@sighash directive (issue #123) is only honoured on the TypeScript (.runar.ts) surface; write the contract in .runar.ts where @sighash is implemented";
+pub const EMBED_ALWAYS_DIRECTIVE_ERROR = "@embedAlways directive (issue #109) is only honoured on the TypeScript (.runar.ts) surface; write the contract in .runar.ts where @embedAlways is implemented";
 
 fn isWordByte(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';

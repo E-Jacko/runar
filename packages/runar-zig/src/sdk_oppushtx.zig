@@ -74,8 +74,36 @@ pub fn computeOpPushTx(
     satoshis: i64,
     code_separator_index: i32,
 ) OpPushTxError!OpPushTxResult {
+    const default_scope: u32 = bsvz.transaction.sighash.SigHashType.forkid | bsvz.transaction.sighash.SigHashType.all;
+    return computeOpPushTxWithSigHash(allocator, tx_hex, input_index, subscript_hex, satoshis, code_separator_index, default_scope);
+}
+
+/// Mode-aware form (issue #123). `sig_hash_type` is the BIP-143 sighash type the
+/// preimage is built under (e.g. 0x43 for SINGLE|FORKID); it drives which
+/// preimage fields the bsvz library zeroes (hashPrevouts under ANYONECANPAY,
+/// hashSequence unless pure ALL, hashOutputs under NONE / same-index SINGLE) AND
+/// the sighash flag byte appended to the DER signature. Must match the method's
+/// declared @sighash mode or the on-chain OP_PUSH_TX binding fails to verify.
+/// Pass 0 or 0x41 for the default ALL|FORKID.
+///
+/// NOTE: bsvz's transaction/sighash.zig performs the SINGLE same-index
+/// hashOutputs (and NONE / ANYONECANPAY zeroing) natively once the scope is
+/// passed — no hand-rolled preimage zeroing is needed (mirrors the Go tier's
+/// use of go-sdk's CalcInputPreimage).
+pub fn computeOpPushTxWithSigHash(
+    allocator: std.mem.Allocator,
+    tx_hex: []const u8,
+    input_index: usize,
+    subscript_hex: []const u8,
+    satoshis: i64,
+    code_separator_index: i32,
+    sig_hash_type: u32,
+) OpPushTxError!OpPushTxResult {
     const priv_key = getOpPushTxPrivateKey() catch return OpPushTxError.InvalidKey;
-    const scope: u32 = bsvz.transaction.sighash.SigHashType.forkid | bsvz.transaction.sighash.SigHashType.all;
+    const scope: u32 = if (sig_hash_type == 0)
+        (bsvz.transaction.sighash.SigHashType.forkid | bsvz.transaction.sighash.SigHashType.all)
+    else
+        sig_hash_type;
 
     // Decode transaction
     const tx_bytes = bsvz.primitives.hex.decode(allocator, tx_hex) catch return OpPushTxError.InvalidTransaction;

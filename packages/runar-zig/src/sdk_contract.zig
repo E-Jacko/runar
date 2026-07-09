@@ -1072,14 +1072,19 @@ pub const RunarContract = struct {
             }
         }
 
+        // Issue #123: build every preimage on this path under the method's
+        // declared @sighash mode (default 0x41 for methods with no directive).
+        const sig_hash_type = self.methodSigHashType(method_name);
+
         // First pass: compute OP_PUSH_TX
-        var ptx_result = oppushtx_mod.computeOpPushTx(
+        var ptx_result = oppushtx_mod.computeOpPushTxWithSigHash(
             self.allocator,
             signed_tx,
             0,
             contract_utxo.script,
             contract_utxo.satoshis,
             code_sep_idx orelse -1,
+            sig_hash_type,
         ) catch return ContractError.CallFailed;
 
         // Build first real unlocking script
@@ -1150,13 +1155,14 @@ pub const RunarContract = struct {
 
         // Second pass: recompute with final tx (preimage depends on tx size)
         ptx_result.deinit(self.allocator);
-        ptx_result = oppushtx_mod.computeOpPushTx(
+        ptx_result = oppushtx_mod.computeOpPushTxWithSigHash(
             self.allocator,
             signed_tx,
             0,
             contract_utxo.script,
             contract_utxo.satoshis,
             code_sep_idx orelse -1,
+            sig_hash_type,
         ) catch return ContractError.CallFailed;
         defer ptx_result.deinit(self.allocator);
 
@@ -1267,13 +1273,14 @@ pub const RunarContract = struct {
             }
 
             // Compute OP_PUSH_TX preimage for this input.
-            var xptx = oppushtx_mod.computeOpPushTx(
+            var xptx = oppushtx_mod.computeOpPushTxWithSigHash(
                 self.allocator,
                 signed_tx,
                 inp_idx,
                 xu.script,
                 xu.satoshis,
                 code_sep_idx orelse -1,
+                sig_hash_type,
             ) catch return ContractError.CallFailed;
             defer xptx.deinit(self.allocator);
 
@@ -1837,9 +1844,14 @@ pub const RunarContract = struct {
 
         try signFundingInputs(self, &signed_tx, funding_sign, additional_utxos.items, call_result.input_count);
 
-        var ptx_result = oppushtx_mod.computeOpPushTx(
+        // Issue #123: build the preimage under the method's declared @sighash
+        // mode (default 0x41 for methods with no directive).
+        const sig_hash_type = self.methodSigHashType(method_name);
+
+        var ptx_result = oppushtx_mod.computeOpPushTxWithSigHash(
             self.allocator, signed_tx, 0,
             contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+            sig_hash_type,
         ) catch return ContractError.CallFailed;
 
         // ---- Pass 2: rebuild with real preimage + real change_amount -----
@@ -1874,9 +1886,10 @@ pub const RunarContract = struct {
 
         // Recompute preimage on the final tx (depends on tx size).
         ptx_result.deinit(self.allocator);
-        ptx_result = oppushtx_mod.computeOpPushTx(
+        ptx_result = oppushtx_mod.computeOpPushTxWithSigHash(
             self.allocator, signed_tx, 0,
             contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+            sig_hash_type,
         ) catch return ContractError.CallFailed;
         defer ptx_result.deinit(self.allocator);
 
@@ -2833,6 +2846,20 @@ pub const RunarContract = struct {
     ///
     /// Falls back to the legacy template-adjusted offset for synthetic /
     /// unit-test paths that have no code_script available.
+    /// Resolve the BIP-143 sighash type a method's OP_PUSH_TX preimage must be
+    /// built under (issue #123). Returns the ABI-declared `@sighash` mode for
+    /// the named public method, or the default ALL|FORKID (0x41) when the method
+    /// carries no directive. Keeps every call/finalize path mode-aware with no
+    /// call-site churn (mirrors the Go SDK's methodSigHashType).
+    fn methodSigHashType(self: *const RunarContract, method_name: []const u8) u32 {
+        for (self.artifact.abi.methods) |m| {
+            if (m.is_public and std.mem.eql(u8, m.name, method_name)) {
+                if (m.sig_hash_type) |st| return @intCast(st & 0xff);
+            }
+        }
+        return 0x41;
+    }
+
     pub fn getCodeSepIndex(self: *const RunarContract, method_index: usize) !?i32 {
         if (self.code_script) |cs| {
             const real_offsets = try findCodesepOffsets(self.allocator, cs);
@@ -2887,6 +2914,10 @@ fn stateValueToAnf(sv: types.StateValue) anf_interp.ANFValue {
         },
         .boolean => |b| .{ .boolean = b },
         .bytes => |hex| .{ .bytes = hex },
+        // Issue #106: EmptySig -> an empty signature push (empty bytes). The
+        // off-chain interpreter mocks checkSig, so the empty branch of an
+        // OR-CHECKSIG simply carries no bytes here.
+        .empty_sig => .{ .bytes = "" },
         // Arrays — used by callers that pass `[sig1, sig2, ...]` /
         // `[pk1, pk2, pk3, ...]` shapes to `checkMultiSig`. The conversion
         // borrows element storage; the StateValue is owned by the caller

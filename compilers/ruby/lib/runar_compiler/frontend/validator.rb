@@ -7,6 +7,7 @@
 
 require_relative "ast_nodes"
 require_relative "diagnostic"
+require_relative "sighash_validate"
 
 module RunarCompiler
   module Frontend
@@ -61,6 +62,15 @@ module RunarCompiler
       ctx.validate_constructor
       ctx.validate_methods
       ctx.check_no_recursion
+
+      # Issue #123: reject preimage-field reads / output bindings that are
+      # unsound under a method's declared @sighash mode (security core). This
+      # pass emits both errors (unsound usages) and warnings (e.g. an explicit
+      # single-output SINGLE covenant whose same-index value cannot be pinned
+      # statically), so route each diagnostic to the matching bucket.
+      SighashValidate.validate_sighash_usage(contract).each do |d|
+        (d.severity == Severity::WARNING ? ctx.warnings : ctx.errors) << d
+      end
 
       ValidationResult.new(errors: ctx.errors, warnings: ctx.warnings)
     end

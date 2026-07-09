@@ -48,6 +48,12 @@ pub struct ABIMethod {
     /// Unlocking script is prefixed with `_codePart` (issue #100).
     #[serde(rename = "usesCodePart", skip_serializing_if = "Option::is_none")]
     pub uses_code_part: Option<bool>,
+    /// Issue #123: the BIP-143 sighash type this method's preimage/covenant is
+    /// built under (from a `@sighash` directive), e.g. `0x43` for SINGLE|FORKID.
+    /// Absent = default `ALL|FORKID` (0x41); the SDK falls back to 0x41 so
+    /// existing artifacts are unchanged and older SDKs keep working.
+    #[serde(rename = "sigHashType", skip_serializing_if = "Option::is_none")]
+    pub sig_hash_type: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +227,15 @@ pub fn assemble_artifact(
             } else {
                 None
             };
+            // Issue #123: carry a non-default @sighash mode into the ABI so the
+            // SDK builds the BIP-143 preimage under the same flags the covenant
+            // expects. Omitted for the default (0x41) → byte-identical artifacts.
+            let sig_hash_type = match m.sighash_type {
+                Some(v) if m.is_public && v != crate::frontend::sighash_directive::SIGHASH_DEFAULT => {
+                    Some(v)
+                }
+                _ => None,
+            };
             ABIMethod {
                 name: m.name.clone(),
                 params: m
@@ -235,6 +250,7 @@ pub fn assemble_artifact(
                 is_public: m.is_public,
                 is_terminal,
                 uses_code_part,
+                sig_hash_type,
             }
         })
         .collect();

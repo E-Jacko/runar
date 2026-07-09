@@ -117,6 +117,8 @@ fn optimizeMethod(allocator: Allocator, method: types.ANFMethod) !types.ANFMetho
         .params = method.params,
         .bindings = method.bindings,
         .body = body,
+        // #123: preserve the in-memory @sighash carrier across the rebuild.
+        .sighash_type = method.sighash_type,
     };
 }
 

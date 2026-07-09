@@ -23,6 +23,10 @@ _Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 
 SIGHASH_ALL_FORKID = 0x41
 
+# 32 zero bytes — BIP-143 fills zeroed digest fields (hashPrevouts /
+# hashSequence / hashOutputs) with this under the relaxed sighash flags.
+_ZERO32 = b'\x00' * 32
+
 
 def compute_op_push_tx(
     tx_hex: str,
@@ -30,10 +34,16 @@ def compute_op_push_tx(
     subscript: str,
     satoshis: int,
     code_separator_index: int = -1,
+    sig_hash_type: int = SIGHASH_ALL_FORKID,
 ) -> tuple[str, str]:
     """Compute the OP_PUSH_TX DER signature and BIP-143 preimage.
 
     Returns (sig_hex, preimage_hex) where sig_hex includes the sighash byte.
+
+    ``sig_hash_type`` (issue #123) drives both which preimage fields are zeroed
+    (hashPrevouts / hashSequence / hashOutputs) and the appended sighash flag
+    byte. Defaults to 0x41 (ALL|FORKID); it must match the method's declared
+    ``@sighash`` mode or the on-chain OP_PUSH_TX binding fails to verify.
     """
     # If OP_CODESEPARATOR is present, use only the script after it as scriptCode.
     effective_subscript = subscript
@@ -45,7 +55,7 @@ def compute_op_push_tx(
     tx = _parse_raw_tx(tx_bytes)
     subscript_bytes = bytes.fromhex(effective_subscript)
 
-    preimage = _bip143_preimage(tx, input_index, subscript_bytes, satoshis)
+    preimage = _bip143_preimage(tx, input_index, subscript_bytes, satoshis, sig_hash_type)
     sighash = _sha256d(preimage)
 
     # Sign with k=1 private key
@@ -58,7 +68,7 @@ def compute_op_push_tx(
 
     # DER encode
     der = _der_encode(sig_r, sig_s)
-    sig_hex = der.hex() + format(SIGHASH_ALL_FORKID, '02x')
+    sig_hex = der.hex() + format(sig_hash_type & 0xFF, '02x')
     preimage_hex = preimage.hex()
 
     return sig_hex, preimage_hex
@@ -159,26 +169,52 @@ def _bip143_preimage(
     input_index: int,
     subscript: bytes,
     satoshis: int,
+    sig_hash_type: int = SIGHASH_ALL_FORKID,
 ) -> bytes:
-    # hashPrevouts
-    prevouts = b''
-    for inp in tx['inputs']:
-        prevouts += inp['prev_txid_bytes'] + struct.pack('<I', inp['prev_output_index'])
-    hash_prevouts = _sha256d(prevouts)
+    base = sig_hash_type & 0x1F
+    acp = (sig_hash_type & 0x80) != 0
 
-    # hashSequence
-    sequences = b''
-    for inp in tx['inputs']:
-        sequences += struct.pack('<I', inp['sequence'])
-    hash_sequence = _sha256d(sequences)
+    # hashPrevouts — issue #123: ANYONECANPAY zeroes it (only this input signed).
+    if acp:
+        hash_prevouts = _ZERO32
+    else:
+        prevouts = b''
+        for inp in tx['inputs']:
+            prevouts += inp['prev_txid_bytes'] + struct.pack('<I', inp['prev_output_index'])
+        hash_prevouts = _sha256d(prevouts)
 
-    # hashOutputs
-    outputs_data = b''
-    for out in tx['outputs']:
-        outputs_data += struct.pack('<Q', out['satoshis'])
-        outputs_data += _encode_varint(len(out['script']))
-        outputs_data += out['script']
-    hash_outputs = _sha256d(outputs_data)
+    # hashSequence — zeroed under anything but pure SIGHASH_ALL (NONE / SINGLE /
+    # ANYONECANPAY all clear it).
+    if base == 0x01 and not acp:  # ALL
+        sequences = b''
+        for inp in tx['inputs']:
+            sequences += struct.pack('<I', inp['sequence'])
+        hash_sequence = _sha256d(sequences)
+    else:
+        hash_sequence = _ZERO32
+
+    # hashOutputs by sighash base:
+    #   ALL    -> hash256(all outputs)
+    #   SINGLE -> hash256(the single output at THIS input's index), or 32 zero
+    #             bytes when input_index >= len(outputs)
+    #   NONE   -> 32 zero bytes (no outputs committed)
+    def _serialize_output(out: dict) -> bytes:
+        return (struct.pack('<Q', out['satoshis'])
+                + _encode_varint(len(out['script']))
+                + out['script'])
+
+    if base == 0x02:  # NONE
+        hash_outputs = _ZERO32
+    elif base == 0x03:  # SINGLE
+        if input_index < len(tx['outputs']):
+            hash_outputs = _sha256d(_serialize_output(tx['outputs'][input_index]))
+        else:
+            hash_outputs = _ZERO32
+    else:  # ALL
+        outputs_data = b''
+        for out in tx['outputs']:
+            outputs_data += _serialize_output(out)
+        hash_outputs = _sha256d(outputs_data)
 
     # Build preimage
     inp = tx['inputs'][input_index]
@@ -194,7 +230,7 @@ def _bip143_preimage(
     preimage += struct.pack('<I', inp['sequence'])
     preimage += hash_outputs
     preimage += struct.pack('<I', tx['locktime'])
-    preimage += struct.pack('<I', SIGHASH_ALL_FORKID)
+    preimage += struct.pack('<I', sig_hash_type)
 
     return preimage
 

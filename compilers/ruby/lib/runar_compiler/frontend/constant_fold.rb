@@ -577,7 +577,12 @@ module RunarCompiler
           name: method.name,
           params: method.params.dup,
           body: folded_body,
-          is_public: method.is_public
+          is_public: method.is_public,
+          # Issue #123: preserve the declared @sighash mode across folding so
+          # the artifact assembler can still stamp the ABI sigHashType. (The
+          # per-node check_preimage sighash_flag survives via fold_value's
+          # passthrough of the same object.)
+          sighash_type: method.sighash_type
         )
       end
       private_class_method :fold_method

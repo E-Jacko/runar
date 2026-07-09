@@ -739,6 +739,7 @@ impl<'a> GoParser<'a> {
             body: constructor_body,
             visibility: Visibility::Public,
             source_location: Self::loc_at(&self.file, 1, 1),
+            sighash_type: None,
         };
 
         Some(ContractNode {
@@ -895,6 +896,7 @@ impl<'a> GoParser<'a> {
                 initializer: None,
                 source_location: loc,
                 synthetic_array_chain: None,
+                embed_always: false,
             });
 
             self.skip_semis();
@@ -1023,6 +1025,7 @@ impl<'a> GoParser<'a> {
             body,
             visibility,
             source_location: loc,
+            sighash_type: None,
         })
     }
 
@@ -1068,6 +1071,7 @@ impl<'a> GoParser<'a> {
             body,
             visibility: Visibility::Private,
             source_location: loc,
+            sighash_type: None,
         })
     }
 

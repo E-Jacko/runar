@@ -37,6 +37,7 @@ fn counter_artifact() -> RunarArtifact {
                 is_public: true,
                 is_terminal: None,
                 uses_code_part: None,
+                sig_hash_type: None,
             }],
         },
         script: "51".to_string(),

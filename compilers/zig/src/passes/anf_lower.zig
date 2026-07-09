@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const types = @import("../ir/types.zig");
+const sighash_directive = @import("../frontend/sighash_directive.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -246,6 +247,16 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
         });
     }
 
+    // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+    // must survive DCE into the locking script. A readonly field no method
+    // references lowers to no load_prop, so no constructor slot is emitted and
+    // the field's deploy-time bytes vanish. We inject a preserved load_prop
+    // for each such field into the FIRST public method's body — it keeps the
+    // field's constructor-slot placeholder in the deployed script, and stack
+    // lowering threads the pushed value through and NIPs it at method end.
+    // One slot in the deployed script suffices; every spending branch shares it.
+    var embed_injected = false;
+
     // Lower each method
     for (contract.methods) |method| {
         var method_ctx = LowerCtx.init(allocator, contract);
@@ -257,9 +268,27 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
             if (isByteType(param.type_info)) method_ctx.markByteTyped(param.name);
         }
 
+        // Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+        // flag for any checkPreimage (auto-injected below, or a manual call) in
+        // this method, and rides on the ANF method as a carrier the artifact
+        // assembler copies to ABIMethod.sighash_type (omitted for the default).
+        var method_sighash: ?i32 = null;
+        if (method.sighash_type) |st| {
+            if (st != sighash_directive.SIGHASH_DEFAULT) {
+                method_ctx.sighash_flag = st;
+                method_sighash = st;
+            }
+        }
+
         if (contract.parent_class == .stateful_smart_contract and method.is_public) {
-            try lowerStatefulPublicMethod(allocator, &method_ctx, method, contract);
+            try lowerStatefulPublicMethod(allocator, &method_ctx, method, contract, &embed_injected);
         } else {
+            // Issue #109: stateless public methods (and stateless contracts'
+            // spending entry points) are lowered here — inject @embedAlways
+            // preservation into the first PUBLIC one before its body.
+            if (!embed_injected and method.is_public) {
+                if (try emitEmbedAlwaysPreservation(&method_ctx, contract)) embed_injected = true;
+            }
             try lowerStatements(&method_ctx, method.body);
             const bindings = try method_ctx.bindings.toOwnedSlice(allocator);
             // Private methods can also call the intent intrinsics; append
@@ -287,6 +316,7 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
                 .params = params_out,
                 .bindings = bindings,
                 .body = bindings,
+                .sighash_type = method_sighash,
             });
         }
 
@@ -338,6 +368,7 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
                 .params = try aug_params.toOwnedSlice(allocator),
                 .bindings = bindings,
                 .body = bindings,
+                .sighash_type = method_sighash,
             });
         }
     }
@@ -368,11 +399,36 @@ fn lowerConstructorBody(ctx: *LowerCtx, ctor: ConstructorNode) LowerError!void {
     }
 }
 
+/// Issue #109: emit a DCE-surviving preservation `load_prop` for each
+/// `@embedAlways` readonly field into the given (public) method context.
+/// Returns true when at least one field was injected (so the caller marks the
+/// one-shot injection done). The load_prop carries `preserve = true`, so
+/// `dce.hasSideEffect` keeps it even though nothing references it; stack
+/// lowering then emits the field's constructor-slot placeholder and NIPs the
+/// unused value off the stack at method end. The field's bytes therefore remain
+/// in the deployed locking script for downstream recovery.
+///
+/// The TypeScript reference achieves the same via a `load_prop` + `@ref` alias
+/// relying on a single-pass DCE. The Zig `ec_optimizer` runs a fixpoint DCE
+/// that would strip such an unreferenced alias chain, so the Zig tier marks the
+/// injected load_prop directly. The observable output is byte-identical.
+fn emitEmbedAlwaysPreservation(ctx: *LowerCtx, contract: ContractNode) LowerError!bool {
+    var injected = false;
+    for (contract.properties) |prop| {
+        if (prop.readonly and prop.embed_always) {
+            _ = try ctx.emit(.{ .load_prop = .{ .name = prop.name, .preserve = true } });
+            injected = true;
+        }
+    }
+    return injected;
+}
+
 fn lowerStatefulPublicMethod(
     allocator: Allocator,
     ctx: *LowerCtx,
     method: MethodNode,
     contract: ContractNode,
+    embed_injected: *bool,
 ) LowerError!void {
     // Methods that use addOutput, addDataOutput, or mutate state need hashOutputs
     // verification (change output support).
@@ -395,23 +451,33 @@ fn lowerStatefulPublicMethod(
     ctx.addParam("txPreimage");
     ctx.markByteTyped("txPreimage");
 
-    // Inject checkPreimage(txPreimage)
+    // Issue #123: the declared per-method sighash mode (default ALL|FORKID).
+    // Drives BOTH the OP_PUSH_TX binding flag (so the derived sig re-computes
+    // the tx sighash under this mode) AND the runtime preimage-type assert.
+    const sighash_mode: i32 = method.sighash_type orelse sighash_directive.SIGHASH_DEFAULT;
+    const is_default_sighash = sighash_mode == sighash_directive.SIGHASH_DEFAULT;
+
+    // Inject checkPreimage(txPreimage). Omit the sighash flag for the default so
+    // the ANF (and pinned binding blob) is byte-identical to every existing
+    // contract.
     const preimage_ref = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
-    const check_result = try ctx.emit(.{ .check_preimage = .{ .preimage = preimage_ref } });
+    const check_result = try ctx.emit(.{ .check_preimage = .{
+        .preimage = preimage_ref,
+        .sighash_flag = if (is_default_sighash) 0 else sighash_mode,
+    } });
     _ = try ctx.emit(.{ .assert = .{ .value = check_result } });
 
-    // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-    // auto-injected covenant cannot be spent under a permissive sighash flag
-    // (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields a contract
-    // may read. The hashOutputs continuation already fails under non-ALL flags,
-    // so this is a no-op on spendability for continuation-using methods and
-    // closes the field-zeroing exposure for the rest.
+    // GAP-302 / #123: pin the sighash type to the declared mode. Without this
+    // check the spend could use a DIFFERENT sighash flag than declared that
+    // zeroes out preimage fields the contract (or its continuation) relies on
+    // (hashOutputs / hashPrevouts / hashSequence). The value defaults to 0x41
+    // (SIGHASH_ALL|FORKID) so existing contracts emit byte-identical ANF.
     const sig_hash_preimage_ref = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
     const sig_hash_type_ref = try ctx.emit(.{ .call = .{
         .func = "extractSigHashType",
         .args = try ctx.allocSlice(&.{sig_hash_preimage_ref}),
     } });
-    const expected_sig_hash_ref = try ctx.emit(makeLoadConstInt(0x41));
+    const expected_sig_hash_ref = try ctx.emit(makeLoadConstInt(sighash_mode));
     const sig_hash_ok_ref = try ctx.emit(.{ .bin_op = .{
         .op = "===",
         .left = sig_hash_type_ref,
@@ -428,6 +494,13 @@ fn lowerStatefulPublicMethod(
     if (has_mutable_state) {
         const preimage_ref3 = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
         _ = try ctx.emit(.{ .deserialize_state = .{ .preimage = preimage_ref3 } });
+    }
+
+    // Issue #109: preserve @embedAlways fields at the first user-statement
+    // position (after the checkPreimage/deserialize preamble), mirroring where
+    // a `const _bind = this.field;` idiom would sit.
+    if (!embed_injected.*) {
+        if (try emitEmbedAlwaysPreservation(ctx, contract)) embed_injected.* = true;
     }
 
     // Lower the developer's method body
@@ -603,6 +676,12 @@ const LowerCtx = struct {
     /// requireOutputP2PKH emits its hashOutputs(preimage) check at most once
     /// per method — flipped on the first call.
     did_emit_hash_outputs_check: bool = false,
+    /// Issue #123: the declared non-default `@sighash` flag for the method
+    /// being lowered, so a MANUAL checkPreimage(pre) call binds under the same
+    /// mode as the method's declared sighash. Null = default ALL|FORKID,
+    /// keeping the pinned binding blob unchanged. Propagated into sub-contexts
+    /// so a manual call inside an if/for body picks it up.
+    sighash_flag: ?i32 = null,
 
     fn init(allocator: Allocator, contract: ContractNode) LowerCtx {
         return .{
@@ -731,6 +810,8 @@ const LowerCtx = struct {
     fn subContext(self: *LowerCtx) LowerCtx {
         var sub = LowerCtx.init(self.allocator, self.contract);
         sub.counter = self.counter;
+        // #123: nested manual checkPreimage inherits the method's mode.
+        sub.sighash_flag = self.sighash_flag;
         // Copy local names
         var local_it = self.local_names.iterator();
         while (local_it.next()) |entry| {
@@ -1229,7 +1310,11 @@ fn lowerCallExpr(ctx: *LowerCtx, c: *const types.CallExpr) LowerError![]const u8
     if (std.mem.eql(u8, c.callee, "checkPreimage")) {
         if (c.args.len >= 1) {
             const preimage_ref = try lowerExprToRef(ctx, c.args[0]);
-            return try ctx.emit(.{ .check_preimage = .{ .preimage = preimage_ref } });
+            // Issue #123: honour the method's declared @sighash on manual calls.
+            return try ctx.emit(.{ .check_preimage = .{
+                .preimage = preimage_ref,
+                .sighash_flag = ctx.sighash_flag orelse 0,
+            } });
         }
     }
 

@@ -27,6 +27,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use super::ast::*;
+use super::sighash_directive::SIGHASH_DEFAULT;
 use super::side_effect_summary::{
     compute_side_effect_summary, ContinuationShape, SideEffectSummary,
 };
@@ -162,6 +163,22 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
     // private-helper effects, not just direct ones.
     let side_effects = compute_side_effect_summary(contract);
 
+    // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+    // must survive DCE into the locking script. A readonly field no method
+    // references lowers to no `load_prop`, so no constructor slot is emitted
+    // and the field's deploy-time bytes vanish. We inject a `load_prop` + a
+    // `@ref:` alias (the exact shape `const _bind = this.field;` produces) into
+    // the first public method's body — the alias keeps the `load_prop` alive
+    // through dead-binding DCE, and stack lowering threads the pushed value
+    // through and NIPs it at method end. One slot in the deployed script
+    // suffices; every spending branch shares it.
+    let embed_fields: Vec<&PropertyNode> = contract
+        .properties
+        .iter()
+        .filter(|p| p.readonly && p.embed_always)
+        .collect();
+    let mut embed_injected = false;
+
     // Lower constructor (the TS reference includes the constructor in output)
     let mut ctor_ctx = LoweringContext::with_effects(contract, Some(side_effects.clone()));
     for p in &contract.constructor.params {
@@ -173,11 +190,21 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
         params: lower_params(&contract.constructor.params),
         body: ctor_ctx.bindings,
         is_public: false,
+        sighash_type: None,
     });
 
     // Lower each method (including private methods as separate entries)
     for method in &contract.methods {
         let mut method_ctx = LoweringContext::with_effects(contract, Some(side_effects.clone()));
+        // Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+        // flag for any checkPreimage (auto-injected below, or a manual call) in
+        // this method. Default ALL|FORKID leaves the flag `None` so the pinned
+        // binding blob is unchanged.
+        if let Some(v) = method.sighash_type {
+            if v != SIGHASH_DEFAULT {
+                method_ctx.sighash_flag = Some(v);
+            }
+        }
         // Register THIS method's declared params for method-scoped byte-type
         // analysis (issue #34). Auto-injected continuation params register
         // their types below, next to their add_param calls.
@@ -226,25 +253,34 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
             method_ctx.add_param("txPreimage");
             method_ctx.register_param_type("txPreimage", "SigHashPreimage");
 
+            // Issue #123: the declared per-method sighash mode (default
+            // ALL|FORKID). Drives BOTH the OP_PUSH_TX binding flag (so the
+            // derived sig re-computes the tx sighash under this mode) AND the
+            // runtime preimage-type assert.
+            let sighash_mode = method.sighash_type.unwrap_or(SIGHASH_DEFAULT);
+
             // Inject checkPreimage(txPreimage) at the start
             let preimage_ref = method_ctx.emit(ANFValue::LoadParam {
                 name: "txPreimage".to_string(),
             });
             let check_result = method_ctx.emit(ANFValue::CheckPreimage {
                 preimage: preimage_ref,
+                // Omit for the default so the ANF (and pinned binding blob) is
+                // byte-identical; `sighash_flag` is None unless non-default.
+                sighash_flag: method_ctx.sighash_flag,
             });
             method_ctx.emit(ANFValue::Assert {
                 value: check_result,
                 is_auto_injected_state_check: false,
             });
 
-            // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-            // auto-injected covenant cannot be spent under a permissive sighash
-            // flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
-            // a contract may read. The hashOutputs continuation already fails
-            // under non-ALL flags, so this is a no-op on spendability for
-            // continuation-using methods and closes the field-zeroing exposure
-            // for the rest.
+            // GAP-302 / #123: pin the sighash type to the declared mode. The
+            // auto-injected covenant verifies a real tx preimage, but without
+            // this check the spend could use a DIFFERENT sighash flag than
+            // declared that zeroes out preimage fields the contract (or its
+            // continuation) relies on (hashOutputs / hashPrevouts /
+            // hashSequence). The value defaults to 0x41 (ALL|FORKID) so existing
+            // contracts emit byte-identical ANF.
             let sig_hash_preimage_ref = method_ctx.emit(ANFValue::LoadParam {
                 name: "txPreimage".to_string(),
             });
@@ -253,7 +289,7 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 args: vec![sig_hash_preimage_ref],
             });
             let expected_sig_hash_ref = method_ctx.emit(ANFValue::LoadConst {
-                value: bigint_to_json(&BigInt::from(0x41)),
+                value: bigint_to_json(&BigInt::from(sighash_mode)),
             });
             let sig_hash_ok_ref = method_ctx.emit(ANFValue::BinOp {
                 op: "===".to_string(),
@@ -277,6 +313,15 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 method_ctx.emit(ANFValue::DeserializeState {
                     preimage: preimage_ref3,
                 });
+            }
+
+            // Issue #109: preserve @embedAlways fields at the first
+            // user-statement position (after the checkPreimage/deserialize
+            // preamble), mirroring where a `const _bind = this.field;` idiom
+            // would sit.
+            if !embed_injected && !embed_fields.is_empty() {
+                emit_embed_always_preservation(&mut method_ctx, &embed_fields);
+                embed_injected = true;
             }
 
             // Lower the developer's method body
@@ -478,8 +523,19 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 params: augmented_params,
                 body: method_ctx.bindings,
                 is_public: true,
+                sighash_type: method.sighash_type,
             });
         } else {
+            // Issue #109: stateless public methods (and stateless contracts'
+            // spending entry points) are lowered here — inject @embedAlways
+            // preservation into the first PUBLIC one before its body.
+            if !embed_injected
+                && !embed_fields.is_empty()
+                && method.visibility == Visibility::Public
+            {
+                emit_embed_always_preservation(&mut method_ctx, &embed_fields);
+                embed_injected = true;
+            }
             lower_statements(&method.body, &mut method_ctx);
             // Private methods can also call the intent intrinsics; surface
             // their auto-injected witness params on the private method's
@@ -496,11 +552,35 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 params: augmented,
                 body: method_ctx.bindings,
                 is_public: method.visibility == Visibility::Public,
+                sighash_type: method.sighash_type,
             });
         }
     }
 
     result
+}
+
+/// Issue #109: emit the DCE-surviving preservation pair for each
+/// `@embedAlways` readonly field into the given (public) method context.
+///
+/// Reproduces exactly what a hand-written `const _bind = this.field;` lowers
+/// to: a `load_prop` followed by a `load_const("@ref:<t>")` alias. The alias
+/// marks the `load_prop` as referenced (see `collect_refs_from_value` in
+/// `frontend/dce.rs`), so dead-binding DCE keeps it; stack lowering then emits
+/// the field's constructor-slot placeholder and NIPs the unused value off the
+/// stack at method end, so the field's bytes remain in the deployed script.
+fn emit_embed_always_preservation(ctx: &mut LoweringContext, fields: &[&PropertyNode]) {
+    for field in fields {
+        let load_ref = ctx.emit(ANFValue::LoadProp {
+            name: field.name.clone(),
+        });
+        ctx.emit_named(
+            &format!("__embedAlways_{}", field.name),
+            ANFValue::LoadConst {
+                value: serde_json::Value::String(format!("@ref:{}", load_ref)),
+            },
+        );
+    }
 }
 
 fn lower_params(params: &[ParamNode]) -> Vec<ANFParam> {
@@ -604,6 +684,12 @@ struct LoweringContext<'a> {
     /// inside a nested block (if/else, ternary). Shared via Rc<RefCell<>>
     /// so sub-contexts mutate the same scope the parent reads from.
     method_scope: Rc<RefCell<MethodScope>>,
+    /// Issue #123: the declared non-default `@sighash` flag for the method
+    /// being lowered, so a MANUAL `checkPreimage(pre)` call (stateless /
+    /// explicit) AND the auto-injected covenant bind under the same mode as the
+    /// method's declared sighash. `None` = default ALL|FORKID, keeping the
+    /// pinned binding blob unchanged.
+    sighash_flag: Option<i64>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -627,6 +713,7 @@ impl<'a> LoweringContext<'a> {
             param_alias_stack: HashMap::new(),
             side_effects,
             method_scope: Rc::new(RefCell::new(MethodScope::default())),
+            sighash_flag: None,
         }
     }
 
@@ -788,6 +875,9 @@ impl<'a> LoweringContext<'a> {
         // inside a nested block (if/else, ternary) registers on the
         // parent method's ABI augmentation pass.
         sub.method_scope = Rc::clone(&self.method_scope);
+        // Issue #123: a manual checkPreimage inside a nested block must bind
+        // under the method's declared @sighash mode.
+        sub.sighash_flag = self.sighash_flag;
         // Note: add_output_refs is NOT propagated to sub-contexts
         // because addOutput calls in sub-blocks should flow up to
         // the parent context via explicit tracking.
@@ -1491,6 +1581,9 @@ fn lower_call_expr(
                 let preimage_ref = lower_expr_to_ref(&args[0], ctx);
                 return ctx.emit(ANFValue::CheckPreimage {
                     preimage: preimage_ref,
+                    // Issue #123: honour the method's declared @sighash on
+                    // manual checkPreimage calls (None = default ALL|FORKID).
+                    sighash_flag: ctx.sighash_flag,
                 });
             }
         }
@@ -2465,8 +2558,9 @@ fn remap_value_refs(value: &ANFValue, map: &HashMap<String, String>) -> ANFValue
             name: name.clone(),
             value: r(v),
         },
-        ANFValue::CheckPreimage { preimage } => ANFValue::CheckPreimage {
+        ANFValue::CheckPreimage { preimage, sighash_flag } => ANFValue::CheckPreimage {
             preimage: r(preimage),
+            sighash_flag: *sighash_flag,
         },
         ANFValue::DeserializeState { preimage } => ANFValue::DeserializeState {
             preimage: r(preimage),

@@ -10,31 +10,50 @@ if TYPE_CHECKING:
 from runar_compiler.frontend.diagnostic import Diagnostic, Severity
 
 
-# Author-facing comment directives implemented only by the TypeScript compiler
-# today: ``@sighash <FLAGS>`` (#123, per-method sighash type) and
-# ``@embedAlways`` (#109, readonly-field DCE opt-out). Word-boundary anchored to
-# mirror the TS ``/@sighash\b/`` / ``/@embedAlways\b/`` scans so an identifier
-# like ``sighashType`` does not trip the guard.
+# Author-facing comment directives honoured ONLY on the TypeScript (.runar.ts)
+# surface (parser_ts reads leading trivia): ``@sighash <FLAGS>`` (#123,
+# per-method sighash type) and ``@embedAlways`` (#109, readonly-field DCE
+# opt-out). The eight non-TS surface parsers ignore comments, so a directive in
+# one of those sources would be silently dropped and change signing / DCE
+# semantics. Fail closed on those formats rather than miscompile — this mirrors
+# the Go/Rust/Zig/Ruby/Java tiers. Word-boundary anchored to mirror the TS
+# ``/@sighash\b/`` / ``/@embedAlways\b/`` scans so an identifier like
+# ``sighashType`` does not trip the guard. No conformance fixture uses either
+# directive, so this has zero golden impact.
 _SIGHASH_DIRECTIVE_RE = re.compile(r"@sighash\b")
 _EMBED_ALWAYS_DIRECTIVE_RE = re.compile(r"@embedAlways\b")
 
+# Non-TS extension -> human-readable surface name for the diagnostic.
+# ``.runar.ts`` is intentionally absent: parser_ts honours the directives.
+_NON_TS_SURFACES = {
+    ".runar.sol": "Solidity",
+    ".runar.move": "Move",
+    ".runar.py": "Python",
+    ".runar.go": "Go DSL",
+    ".runar.rs": "Rust",
+    ".runar.rb": "Ruby",
+    ".runar.zig": "Zig",
+    ".runar.java": "Java",
+}
 
-def _unsupported_directive_error(source: str) -> str | None:
+
+def _unsupported_directive_error(source: str, surface_name: str) -> str | None:
     """Return a fail-closed diagnostic message when ``source`` carries a
-    directive this compiler does not yet honour, else ``None``. The Python
-    frontend ignores comments, so silently dropping these directives would
-    change signing / DCE semantics — reject rather than diverge until the
-    ports land.
+    ``@sighash`` (#123) or ``@embedAlways`` (#109) directive on a non-TS surface
+    whose parser ignores comments (so the directive would be silently dropped),
+    else ``None``.
     """
     if _SIGHASH_DIRECTIVE_RE.search(source):
         return (
-            "@sighash directive is not yet supported by the Python compiler "
-            "(issue #123); compile the contract with the TypeScript compiler"
+            f"@sighash directive (issue #123) is not supported by the {surface_name} "
+            "surface parser; write the contract in TypeScript (.runar.ts) where "
+            "@sighash is honoured"
         )
     if _EMBED_ALWAYS_DIRECTIVE_RE.search(source):
         return (
-            "@embedAlways directive is not yet supported by the Python compiler "
-            "(issue #109); compile the contract with the TypeScript compiler"
+            f"@embedAlways directive (issue #109) is not supported by the {surface_name} "
+            "surface parser; write the contract in TypeScript (.runar.ts) where "
+            "@embedAlways is honoured"
         )
     return None
 
@@ -59,14 +78,20 @@ def parse_source(source: str, file_name: str) -> ParseResult:
     from runar_compiler.frontend.input_limits import assert_source_bytes_under_limit
     assert_source_bytes_under_limit(source)
 
-    directive_error = _unsupported_directive_error(source)
-    if directive_error is not None:
-        return ParseResult(errors=[Diagnostic(
-            message=directive_error,
-            severity=Severity.ERROR,
-        )])
-
     lower = file_name.lower()
+
+    # Fail-closed directive guard: reject ``@sighash`` / ``@embedAlways`` on any
+    # non-TS surface (whose parser ignores comments) before dispatching. The
+    # ``.runar.ts`` branch is exempt because parser_ts honours the directives.
+    for ext, surface_name in _NON_TS_SURFACES.items():
+        if lower.endswith(ext):
+            directive_error = _unsupported_directive_error(source, surface_name)
+            if directive_error is not None:
+                return ParseResult(errors=[Diagnostic(
+                    message=directive_error,
+                    severity=Severity.ERROR,
+                )])
+            break
 
     if lower.endswith(".runar.py"):
         from runar_compiler.frontend.parser_python import parse_python

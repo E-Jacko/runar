@@ -305,6 +305,8 @@ fn parseANFValue(allocator: std.mem.Allocator, obj: std.json.ObjectMap, depth: u
         .get_state_script => .{ .get_state_script = {} },
         .check_preimage => .{ .check_preimage = .{
             .preimage = try allocator.dupe(u8, try getString(obj, "preimage")),
+            // #123: optional non-default sighash flag (default 0 = ALL|FORKID).
+            .sighash_flag = getOptionalI32(obj, "sighashFlag"),
         } },
         .deserialize_state => .{ .deserialize_state = .{
             .preimage = try allocator.dupe(u8, try getString(obj, "preimage")),
@@ -595,6 +597,16 @@ fn getString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
     return switch (val) {
         .string => |s| s,
         else => ParseError.UnexpectedValueType,
+    };
+}
+
+/// Read an optional integer field, returning 0 when absent or not an integer.
+/// Used for the #123 check_preimage `sighashFlag` (default 0 = ALL|FORKID).
+fn getOptionalI32(obj: std.json.ObjectMap, key: []const u8) i32 {
+    const val = obj.get(key) orelse return 0;
+    return switch (val) {
+        .integer => |i| @intCast(i),
+        else => 0,
     };
 }
 
@@ -1110,7 +1122,7 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
         },
         .check_preimage => |cp| {
             try writer.writeAll("{\n");
-            // Sorted keys: kind, preimage
+            // Sorted keys: kind, preimage, sighashFlag (#123, only when non-default)
             try writeIndent(writer, depth + 1);
             try writeJsonString(writer, "kind");
             try writer.writeAll(": ");
@@ -1120,6 +1132,12 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
             try writeJsonString(writer, "preimage");
             try writer.writeAll(": ");
             try writeJsonString(writer, cp.preimage);
+            if (cp.sighash_flag != 0) {
+                try writer.writeAll(",\n");
+                try writeIndent(writer, depth + 1);
+                try writeJsonString(writer, "sighashFlag");
+                try writer.print(": {d}", .{cp.sighash_flag});
+            }
             try writer.writeByte('\n');
             try writeIndent(writer, depth);
             try writer.writeByte('}');

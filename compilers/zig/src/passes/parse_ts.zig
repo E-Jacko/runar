@@ -20,6 +20,9 @@
 const std = @import("std");
 const types = @import("../ir/types.zig");
 const opcodes = @import("../codegen/opcodes.zig");
+const sighash_directive = @import("../frontend/sighash_directive.zig");
+const input_limits = @import("../frontend/input_limits.zig");
+const containsDirectiveToken = input_limits.containsDirectiveToken;
 
 const Allocator = std.mem.Allocator;
 const Expression = types.Expression;
@@ -136,6 +139,14 @@ const Token = struct {
     text: []const u8,
     line: u32,
     col: u32,
+    /// Byte offset into the source where this token's lexeme starts (after any
+    /// leading whitespace/comment trivia). Issue #109/#123: lets the parser
+    /// recover the leading comment trivia of a class member — the source region
+    /// between the previous token's `end` and this token's `start` — to detect
+    /// `@embedAlways` / `@sighash` directives that the tokenizer discards.
+    start: usize = 0,
+    /// Byte offset one past this token's lexeme (self.pos after scanning it).
+    end: usize = 0,
 };
 
 // ============================================================================
@@ -200,8 +211,18 @@ const Tokenizer = struct {
         }
     }
 
+    /// Public entry: skip leading trivia, scan one token, and stamp its byte
+    /// span (`start`..`end`) so the parser can recover leading comment trivia.
     fn next(self: *Tokenizer) Token {
         self.skipWhitespaceAndComments();
+        const start_off = self.pos;
+        var tok = self.scanToken();
+        tok.start = start_off;
+        tok.end = self.pos;
+        return tok;
+    }
+
+    fn scanToken(self: *Tokenizer) Token {
         if (self.pos >= self.source.len) return .{ .kind = .eof, .text = "", .line = self.line, .col = self.col };
 
         const sl = self.line;
@@ -388,13 +409,30 @@ const Parser = struct {
     file_name: []const u8,
     errors: std.ArrayListUnmanaged([]const u8),
     depth: u32,
+    /// Byte offset one past the token most recently consumed by `bump()`. The
+    /// leading comment trivia of `self.current` is `source[prev_token_end ..
+    /// current.start]`. Used to detect `@embedAlways` / `@sighash` directives.
+    prev_token_end: usize = 0,
 
     const max_depth: u32 = 256;
 
     fn init(allocator: Allocator, source: []const u8, file_name: []const u8) Parser {
         var tokenizer = Tokenizer.init(source);
         const first = tokenizer.next();
-        return .{ .allocator = allocator, .tokenizer = tokenizer, .current = first, .file_name = file_name, .errors = .empty, .depth = 0 };
+        return .{ .allocator = allocator, .tokenizer = tokenizer, .current = first, .file_name = file_name, .errors = .empty, .depth = 0, .prev_token_end = 0 };
+    }
+
+    /// The leading comment/whitespace trivia immediately preceding `self.current`
+    /// — the raw source between the previous consumed token and this one. A
+    /// `/** @embedAlways */` or `/** @sighash ... */` directive that annotates a
+    /// class member lives here (the tokenizer discards comments, so this is how
+    /// the parser recovers directives). Empty when `current` is the first token.
+    fn leadingTrivia(self: *const Parser) []const u8 {
+        const src = self.tokenizer.source;
+        const start = self.prev_token_end;
+        const end = self.current.start;
+        if (start >= end or end > src.len) return "";
+        return src[start..end];
     }
 
     fn addError(self: *Parser, msg: []const u8) void {
@@ -411,6 +449,7 @@ const Parser = struct {
 
     fn bump(self: *Parser) Token {
         const prev = self.current;
+        self.prev_token_end = prev.end;
         self.current = self.tokenizer.next();
         return prev;
     }
@@ -599,6 +638,13 @@ const Parser = struct {
     };
 
     fn parseClassMember(self: *Parser, parent_class: ParentClass) ClassMember {
+        // Capture the leading comment trivia BEFORE consuming any tokens, so a
+        // `/** @embedAlways */` (issue #109) or `/** @sighash <FLAGS> */`
+        // (issue #123) directive that annotates this member is available. The
+        // tokenizer discards comments; leadingTrivia() recovers the raw source
+        // between the previous token and this member's first token.
+        const member_trivia = self.leadingTrivia();
+
         // Skip TypeScript decorators: @prop(), @method(), etc.
         while (self.current.kind == .ident and self.current.text.len == 1 and self.current.text[0] == '@') {
             _ = self.bump(); // consume '@'
@@ -648,7 +694,11 @@ const Parser = struct {
 
         // Method: name(...)
         if (self.current.kind == .lparen) {
-            const m = self.parseMethod(member_name, is_public);
+            var m = self.parseMethod(member_name, is_public);
+            // Issue #123: honour a `/** @sighash <FLAGS> */` directive in the
+            // method's leading comment trivia. Only public methods are spending
+            // entry points, so a directive on a private helper is meaningless.
+            m.sighash_type = self.parseSighashDirective(member_trivia, member_name, is_public);
             return .{ .method = m };
         }
 
@@ -669,6 +719,12 @@ const Parser = struct {
             // For SmartContract, all fields are readonly.
             // For StatefulSmartContract, readonly depends on the keyword.
             const readonly = if (parent_class == .smart_contract) true else is_readonly;
+
+            // Issue #109: `/** @embedAlways */` (or `// @embedAlways`) directive
+            // in the field's leading comment trivia opts it out of DCE. Matches
+            // the TS `/@embedAlways\b/` scan: the marker must be at a word
+            // boundary so `embedAlwaysX` does not trip.
+            const embed_always = containsDirectiveToken(member_trivia, "@embedAlways");
 
             // Capture FixedArray length + element type so expand_fixed_arrays
             // can see the shape after typecheck.
@@ -692,6 +748,7 @@ const Parser = struct {
                 .fixed_array_length = fa_len,
                 .fixed_array_element = fa_elem,
                 .fixed_array_nested_length = fa_nested_len,
+                .embed_always = embed_always,
             } };
         }
 
@@ -812,6 +869,32 @@ const Parser = struct {
 
         const body = self.parseBlock();
         return .{ .name = name, .is_public = is_public, .params = params, .body = body };
+    }
+
+    /// Detect + parse a `/** @sighash <FLAGS> */` (or `// @sighash ...`)
+    /// directive on a method from its leading comment trivia (issue #123).
+    /// Returns the numeric sighash type, or null when no directive is present.
+    /// Pushes an error for a malformed flag list, or a directive on a
+    /// non-public method (only public methods are spending entry points, so a
+    /// `@sighash` on a private helper is meaningless). Mirrors the Go
+    /// parseSighashOnMethod / TS parseSighashOnMethod.
+    fn parseSighashDirective(self: *Parser, trivia: []const u8, name: []const u8, is_public: bool) ?i32 {
+        // Fast reject: no directive token present (word-boundary matched).
+        if (!containsDirectiveToken(trivia, "@sighash")) return null;
+
+        if (!is_public) {
+            self.addErrorFmt("@sighash directive on non-public method '{s}' has no effect — only public methods are spending entry points", .{name});
+            return null;
+        }
+
+        const result = sighash_directive.extractDirective(self.allocator, trivia) orelse return null;
+        switch (result) {
+            .value => |v| return v,
+            .err => |msg| {
+                self.addErrorFmt("Method '{s}': {s}", .{ name, msg });
+                return null;
+            },
+        }
     }
 
     // ---- Parameters ----
@@ -2594,3 +2677,178 @@ test "multiple imports skipped (TS)" {
 }
 
 const UnexpectedVariant = error{UnexpectedVariant};
+
+// ---------------------------------------------------------------------------
+// #109 / #123 — author-facing comment directive parsing (.runar.ts surface)
+// ---------------------------------------------------------------------------
+
+test "parse @embedAlways directive sets PropertyNode.embed_always" {
+    const source =
+        \\import { SmartContract, Addr, ByteString } from 'runar-lang';
+        \\class Meta extends SmartContract {
+        \\  readonly pubKeyHash: Addr;
+        \\  /** @embedAlways */
+        \\  readonly metadataId: ByteString;
+        \\  constructor(pubKeyHash: Addr, metadataId: ByteString) {
+        \\    super(pubKeyHash, metadataId);
+        \\    this.pubKeyHash = pubKeyHash;
+        \\    this.metadataId = metadataId;
+        \\  }
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "Meta.runar.ts");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    const c = r.contract.?;
+    // metadataId annotated; pubKeyHash sibling stays unset.
+    try std.testing.expect(!c.properties[0].embed_always); // pubKeyHash
+    try std.testing.expect(c.properties[1].embed_always); // metadataId
+}
+
+test "parse // @embedAlways line-comment sets embed_always" {
+    const source =
+        \\import { SmartContract, ByteString } from 'runar-lang';
+        \\class Meta extends SmartContract {
+        \\  // @embedAlways
+        \\  readonly metadataId: ByteString;
+        \\  constructor(metadataId: ByteString) { super(metadataId); this.metadataId = metadataId; }
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "Meta.runar.ts");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expect(r.contract.?.properties[0].embed_always);
+}
+
+test "no directive leaves embed_always unset and sighash_type null" {
+    const source =
+        \\import { SmartContract, ByteString } from 'runar-lang';
+        \\class Meta extends SmartContract {
+        \\  readonly metadataId: ByteString;
+        \\  constructor(metadataId: ByteString) { super(metadataId); this.metadataId = metadataId; }
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "Meta.runar.ts");
+    try std.testing.expect(!r.contract.?.properties[0].embed_always);
+    try std.testing.expect(r.contract.?.methods[0].sighash_type == null);
+}
+
+test "parse @sighash directive sets MethodNode.sighash_type" {
+    const source =
+        \\import { StatefulSmartContract } from 'runar-lang';
+        \\class C extends StatefulSmartContract {
+        \\  n: bigint;
+        \\  constructor(n: bigint) { super(n); this.n = n; }
+        \\  /** @sighash SINGLE|FORKID */
+        \\  public bump() { this.addOutput(1000n, this.n); }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    const m = r.contract.?.methods[0];
+    try std.testing.expect(m.sighash_type != null);
+    try std.testing.expectEqual(@as(i32, 0x43), m.sighash_type.?);
+}
+
+test "parse @sighash line-comment NONE|FORKID -> 0x42" {
+    const source =
+        \\import { StatefulSmartContract } from 'runar-lang';
+        \\class C extends StatefulSmartContract {
+        \\  n: bigint;
+        \\  constructor(n: bigint) { super(n); this.n = n; }
+        \\  // @sighash NONE|FORKID
+        \\  public wipe() { this.n = 0n; }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expectEqual(@as(i32, 0x42), r.contract.?.methods[0].sighash_type.?);
+}
+
+test "parse @sighash bad combo pushes an error" {
+    const source =
+        \\import { StatefulSmartContract } from 'runar-lang';
+        \\class C extends StatefulSmartContract {
+        \\  n: bigint;
+        \\  constructor(n: bigint) { super(n); this.n = n; }
+        \\  /** @sighash ALL|NONE|FORKID */
+        \\  public bump() { this.n = this.n + 1n; }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    var found = false;
+    for (r.errors) |e| {
+        if (std.mem.indexOf(u8, e, "cannot combine base types") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "parse @sighash on private method pushes an error" {
+    const source =
+        \\import { StatefulSmartContract } from 'runar-lang';
+        \\class C extends StatefulSmartContract {
+        \\  n: bigint;
+        \\  constructor(n: bigint) { super(n); this.n = n; }
+        \\  /** @sighash SINGLE|FORKID */
+        \\  helper() { assert(true); }
+        \\  public bump() { this.n = this.n + 1n; }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    var found = false;
+    for (r.errors) |e| {
+        if (std.mem.indexOf(u8, e, "non-public method") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "parse @sighash missing FORKID pushes an error" {
+    const source =
+        \\import { StatefulSmartContract } from 'runar-lang';
+        \\class C extends StatefulSmartContract {
+        \\  n: bigint;
+        \\  constructor(n: bigint) { super(n); this.n = n; }
+        \\  /** @sighash SINGLE */
+        \\  public bump() { this.n = this.n + 1n; }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    var found = false;
+    for (r.errors) |e| {
+        if (std.mem.indexOf(u8, e, "FORKID is mandatory on BSV") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "sighashType identifier does not trip the @sighash directive scan" {
+    const source =
+        \\import { SmartContract } from 'runar-lang';
+        \\class C extends SmartContract {
+        \\  readonly sighashType: bigint;
+        \\  constructor(sighashType: bigint) { super(sighashType); this.sighashType = sighashType; }
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expect(r.contract.?.methods[0].sighash_type == null);
+}

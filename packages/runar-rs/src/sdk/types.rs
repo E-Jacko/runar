@@ -244,6 +244,11 @@ pub struct AbiMethod {
     /// Unlocking script is prefixed with `_codePart` (issue #100).
     #[serde(default)]
     pub uses_code_part: Option<bool>,
+    /// Issue #123: the BIP-143 sighash type this method's preimage/covenant is
+    /// built under (from a `@sighash` directive), e.g. `0x43` for SINGLE|FORKID.
+    /// Absent = default `ALL|FORKID` (0x41); the SDK falls back to 0x41.
+    #[serde(default)]
+    pub sig_hash_type: Option<i64>,
 }
 
 /// A parameter in the ABI.

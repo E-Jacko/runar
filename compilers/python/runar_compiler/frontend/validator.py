@@ -73,6 +73,15 @@ def validate(contract: ContractNode) -> ValidationResult:
     ctx.validate_methods()
     ctx.check_no_recursion()
 
+    # Issue #123: reject preimage-field reads / output bindings that are unsound
+    # under a method's declared @sighash mode (security core). This pass emits
+    # both errors (unsound usages) and warnings (e.g. an explicit single-output
+    # SINGLE covenant whose same-index value cannot be pinned statically), so
+    # route each diagnostic to the matching bucket.
+    from runar_compiler.frontend.sighash_validate import validate_sighash_usage
+    for d in validate_sighash_usage(contract):
+        (ctx.warnings if d.severity == Severity.WARNING else ctx.errors).append(d)
+
     return ValidationResult(errors=ctx.errors, warnings=ctx.warnings)
 
 

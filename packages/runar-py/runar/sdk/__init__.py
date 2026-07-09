@@ -13,7 +13,7 @@ from runar.sdk.rpc_provider import RPCProvider
 from runar.sdk.woc_provider import WhatsOnChainProvider
 from runar.sdk.signer import Signer, MockSigner, ExternalSigner
 from runar.sdk.local_signer import LocalSigner
-from runar.sdk.contract import RunarContract
+from runar.sdk.contract import RunarContract, EMPTY_SIG, is_empty_sig
 from runar.sdk.deployment import build_deploy_transaction, select_utxos, estimate_deploy_fee, build_p2pkh_script
 from runar.sdk.calling import build_call_transaction, insert_unlocking_script, estimate_call_fee
 from runar.sdk.state import serialize_state, deserialize_state, find_last_op_return
@@ -54,7 +54,7 @@ __all__ = [
     'PreparedCall', 'SdkValue', 'TerminalOutput',
     'Provider', 'MockProvider', 'RPCProvider', 'WhatsOnChainProvider',
     'Signer', 'MockSigner', 'ExternalSigner', 'LocalSigner',
-    'RunarContract',
+    'RunarContract', 'EMPTY_SIG', 'is_empty_sig',
     'build_deploy_transaction', 'select_utxos', 'estimate_deploy_fee',
     'build_p2pkh_script',
     'build_call_transaction', 'insert_unlocking_script', 'estimate_call_fee',

@@ -779,6 +779,7 @@ impl<'a> JavaParser<'a> {
                     body,
                     visibility: Visibility::Public,
                     source_location: member_loc,
+                    sighash_type: None,
                 });
                 return;
             }
@@ -837,6 +838,7 @@ impl<'a> JavaParser<'a> {
                 body,
                 visibility,
                 source_location: member_loc,
+                sighash_type: None,
             });
             return;
         }
@@ -859,6 +861,7 @@ impl<'a> JavaParser<'a> {
             initializer,
             source_location: member_loc,
             synthetic_array_chain: None,
+            embed_always: false,
         });
     }
 
@@ -2365,6 +2368,7 @@ fn synthesize_constructor(properties: &[PropertyNode], file: &str) -> MethodNode
         body,
         visibility: Visibility::Public,
         source_location: loc,
+        sighash_type: None,
     }
 }
 

@@ -28,12 +28,40 @@ pub fn compute_op_push_tx(
 /// Like `compute_op_push_tx` but supports OP_CODESEPARATOR.
 /// When `code_separator_index` >= 0, the scriptCode in the BIP-143 preimage uses only
 /// the portion of subscript after the OP_CODESEPARATOR byte offset.
+///
+/// Uses the default `ALL|FORKID` (0x41) sighash mode. Callers honouring a
+/// `@sighash` directive use [`compute_op_push_tx_with_code_sep_sighash`].
 pub fn compute_op_push_tx_with_code_sep(
     tx_hex: &str,
     input_index: usize,
     subscript: &str,
     satoshis: i64,
     code_separator_index: i64,
+) -> Result<(String, String), String> {
+    compute_op_push_tx_with_code_sep_sighash(
+        tx_hex,
+        input_index,
+        subscript,
+        satoshis,
+        code_separator_index,
+        SIGHASH_ALL_FORKID,
+    )
+}
+
+/// Like [`compute_op_push_tx_with_code_sep`] but builds the BIP-143 preimage
+/// under the given `sig_hash_type` (issue #123). The mode drives which preimage
+/// fields are zeroed (hashPrevouts under ANYONECANPAY, hashSequence unless pure
+/// ALL, hashOutputs under NONE / restricted to the same-index output under
+/// SINGLE) AND the sighash flag byte appended to the DER signature. Must match
+/// the method's declared `@sighash` mode or the on-chain OP_PUSH_TX binding
+/// fails to verify.
+pub fn compute_op_push_tx_with_code_sep_sighash(
+    tx_hex: &str,
+    input_index: usize,
+    subscript: &str,
+    satoshis: i64,
+    code_separator_index: i64,
+    sig_hash_type: u32,
 ) -> Result<(String, String), String> {
     let mut effective_subscript = subscript.to_string();
     if code_separator_index >= 0 {
@@ -57,7 +85,7 @@ pub fn compute_op_push_tx_with_code_sep(
     let subscript_bytes = hex_to_bytes(&effective_subscript)?;
 
     // Compute BIP-143 preimage (raw bytes, not hashed)
-    let preimage = bip143_preimage(&tx, input_index, &subscript_bytes, satoshis as u64, SIGHASH_ALL_FORKID);
+    let preimage = bip143_preimage(&tx, input_index, &subscript_bytes, satoshis as u64, sig_hash_type);
 
     // Double-SHA256 for the sighash
     let sighash = sha256d(&preimage);
@@ -78,7 +106,7 @@ pub fn compute_op_push_tx_with_code_sep(
     // DER encode + append sighash byte
     let der = normalized.to_der();
     let mut result = der.as_bytes().to_vec();
-    result.push(SIGHASH_ALL_FORKID as u8);
+    result.push((sig_hash_type & 0xff) as u8);
 
     let sig_hex = bytes_to_hex(&result);
     let preimage_hex = bytes_to_hex(&preimage);
@@ -105,29 +133,63 @@ fn bip143_preimage(
     satoshis: u64,
     sig_hash_type: u32,
 ) -> Vec<u8> {
-    // hashPrevouts = SHA256d(all outpoints)
-    let mut prevouts_data = Vec::new();
-    for inp in &tx.inputs {
-        prevouts_data.extend_from_slice(&inp.prev_txid_bytes);
-        prevouts_data.extend_from_slice(&inp.prev_output_index.to_le_bytes());
-    }
-    let hash_prevouts = sha256d(&prevouts_data);
+    // Issue #123: BIP-143 zeroes specific digest fields under relaxed modes.
+    const ZERO32: [u8; 32] = [0u8; 32];
+    let base = sig_hash_type & 0x1f;
+    let acp = (sig_hash_type & 0x80) != 0;
 
-    // hashSequence = SHA256d(all sequences)
-    let mut sequence_data = Vec::new();
-    for inp in &tx.inputs {
-        sequence_data.extend_from_slice(&inp.sequence.to_le_bytes());
-    }
-    let hash_sequence = sha256d(&sequence_data);
+    // hashPrevouts = SHA256d(all outpoints). ANYONECANPAY zeroes it (only this
+    // input is signed).
+    let hash_prevouts = if acp {
+        ZERO32
+    } else {
+        let mut prevouts_data = Vec::new();
+        for inp in &tx.inputs {
+            prevouts_data.extend_from_slice(&inp.prev_txid_bytes);
+            prevouts_data.extend_from_slice(&inp.prev_output_index.to_le_bytes());
+        }
+        sha256d(&prevouts_data)
+    };
 
-    // hashOutputs = SHA256d(all outputs)
-    let mut outputs_data = Vec::new();
-    for out in &tx.outputs {
-        outputs_data.extend_from_slice(&out.satoshis.to_le_bytes());
-        write_var_int(&mut outputs_data, out.script.len() as u64);
-        outputs_data.extend_from_slice(&out.script);
-    }
-    let hash_outputs = sha256d(&outputs_data);
+    // hashSequence = SHA256d(all sequences). Zeroed under anything but pure ALL
+    // (NONE / SINGLE / ANYONECANPAY all clear it).
+    let hash_sequence = if base == 0x01 && !acp {
+        let mut sequence_data = Vec::new();
+        for inp in &tx.inputs {
+            sequence_data.extend_from_slice(&inp.sequence.to_le_bytes());
+        }
+        sha256d(&sequence_data)
+    } else {
+        ZERO32
+    };
+
+    // hashOutputs by sighash base:
+    //   ALL    -> hash256(all outputs)
+    //   SINGLE -> hash256(the single output at THIS input's index), or ZERO32
+    //             when input_index >= outputs.len (matches BIP-143)
+    //   NONE   -> 32 zero bytes (no outputs committed)
+    let hash_outputs = if base == 0x02 {
+        ZERO32
+    } else if base == 0x03 {
+        if input_index < tx.outputs.len() {
+            let out = &tx.outputs[input_index];
+            let mut od = Vec::new();
+            od.extend_from_slice(&out.satoshis.to_le_bytes());
+            write_var_int(&mut od, out.script.len() as u64);
+            od.extend_from_slice(&out.script);
+            sha256d(&od)
+        } else {
+            ZERO32
+        }
+    } else {
+        let mut outputs_data = Vec::new();
+        for out in &tx.outputs {
+            outputs_data.extend_from_slice(&out.satoshis.to_le_bytes());
+            write_var_int(&mut outputs_data, out.script.len() as u64);
+            outputs_data.extend_from_slice(&out.script);
+        }
+        sha256d(&outputs_data)
+    };
 
     // BIP-143 preimage
     let input = &tx.inputs[input_index];
@@ -363,6 +425,54 @@ mod tests {
             .map(|i| u8::from_str_radix(&sig_hex[i..i + 2], 16).unwrap())
             .collect();
         assert_eq!(*sig_bytes.last().unwrap(), 0x41, "last byte must be SIGHASH_ALL|FORKID (0x41)");
+    }
+
+    fn sig_last_byte(sig_hex: &str) -> u8 {
+        let n = sig_hex.len();
+        u8::from_str_radix(&sig_hex[n - 2..n], 16).unwrap()
+    }
+
+    // Issue #123: the appended sighash byte + the preimage's sighashType field
+    // (last 4 bytes, LE) follow the declared @sighash mode.
+    #[test]
+    fn test_sighash_mode_single_forkid_0x43() {
+        let tx_hex = minimal_tx_hex();
+        let (sig_hex, preimage_hex) =
+            compute_op_push_tx_with_code_sep_sighash(&tx_hex, 0, minimal_subscript(), 1000, -1, 0x43)
+                .unwrap();
+        assert_eq!(sig_last_byte(&sig_hex), 0x43, "sig must end in SINGLE|FORKID 0x43");
+        // sighashType is the final 4 preimage bytes, little-endian → "43000000".
+        assert!(
+            preimage_hex.ends_with("43000000"),
+            "preimage sighashType field must be 0x43 LE, got tail: {}",
+            &preimage_hex[preimage_hex.len() - 8..]
+        );
+    }
+
+    #[test]
+    fn test_sighash_mode_anyonecanpay_0xc1() {
+        let tx_hex = minimal_tx_hex();
+        let (sig_hex, preimage_hex) =
+            compute_op_push_tx_with_code_sep_sighash(&tx_hex, 0, minimal_subscript(), 1000, -1, 0xC1)
+                .unwrap();
+        assert_eq!(sig_last_byte(&sig_hex), 0xC1, "sig must end in ALL|ANYONECANPAY|FORKID 0xC1");
+        assert!(preimage_hex.ends_with("c1000000"), "preimage sighashType must be 0xC1 LE");
+        // ANYONECANPAY zeroes hashPrevouts (preimage bytes 4..36).
+        let bytes: Vec<u8> = (0..preimage_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&preimage_hex[i..i + 2], 16).unwrap())
+            .collect();
+        assert!(bytes[4..36].iter().all(|&b| b == 0), "hashPrevouts must be zeroed under ANYONECANPAY");
+    }
+
+    #[test]
+    fn test_sighash_mode_default_still_0x41() {
+        let tx_hex = minimal_tx_hex();
+        let with_default =
+            compute_op_push_tx_with_code_sep_sighash(&tx_hex, 0, minimal_subscript(), 1000, -1, 0x41)
+                .unwrap();
+        let plain = compute_op_push_tx(&tx_hex, 0, minimal_subscript(), 1000).unwrap();
+        assert_eq!(with_default, plain, "explicit 0x41 must equal the default path byte-for-byte");
     }
 
     #[test]
