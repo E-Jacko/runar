@@ -50,6 +50,7 @@ class EcOnCurveTest extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -98,6 +99,7 @@ class EcMulGenTest extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -157,6 +159,7 @@ class EcAddTest extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -222,6 +225,7 @@ class EcNegateTest extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -269,6 +273,7 @@ class EcPointXTest extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -313,6 +318,7 @@ class EcOnCurveTwice extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -366,6 +372,7 @@ class ConvergencePattern extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 500000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -430,6 +437,7 @@ class EcMulGenTest extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 500000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());

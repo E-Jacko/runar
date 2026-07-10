@@ -79,6 +79,7 @@ fn test_schnorr_zkp_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -105,6 +106,7 @@ fn test_schnorr_zkp_deploy_different_key() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -140,6 +142,7 @@ fn test_schnorr_zkp_spend_valid_proof() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -182,6 +185,7 @@ fn test_schnorr_zkp_invalid_s_rejected() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

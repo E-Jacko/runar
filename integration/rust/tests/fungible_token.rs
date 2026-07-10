@@ -58,6 +58,7 @@ fn test_fungible_token_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -88,6 +89,7 @@ fn test_fungible_token_deploy_zero_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -117,6 +119,7 @@ fn test_fungible_token_deploy_large_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -145,6 +148,7 @@ fn test_fungible_token_send() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -183,6 +187,7 @@ fn test_fungible_token_wrong_owner_rejected() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -229,6 +234,7 @@ fn test_fungible_token_transfer() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -289,6 +295,7 @@ fn test_fungible_token_merge() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy contract1 failed");
 
@@ -303,6 +310,7 @@ fn test_fungible_token_merge() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy contract2 failed");
 
@@ -360,6 +368,7 @@ fn test_fungible_token_merge_inflated_other_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy contract1 failed");
 
@@ -373,6 +382,7 @@ fn test_fungible_token_merge_inflated_other_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy contract2 failed");
 
@@ -427,6 +437,7 @@ fn test_fungible_token_merge_negative_other_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy contract1 failed");
 
@@ -440,6 +451,7 @@ fn test_fungible_token_merge_negative_other_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy contract2 failed");
 
@@ -492,6 +504,7 @@ fn test_fungible_token_merge_zero_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy contract1 failed");
 
@@ -505,6 +518,7 @@ fn test_fungible_token_merge_zero_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy contract2 failed");
 
@@ -561,6 +575,7 @@ fn test_fungible_token_merge_wrong_signer() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy contract1 failed");
 
@@ -574,6 +589,7 @@ fn test_fungible_token_merge_wrong_signer() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy contract2 failed");
 
@@ -628,6 +644,7 @@ fn test_fungible_token_transfer_wrong_signer() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -684,6 +701,7 @@ fn test_fungible_token_transfer_exact_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -740,6 +758,7 @@ fn test_fungible_token_transfer_zero_amount_rejected() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -792,6 +811,7 @@ fn test_fungible_token_transfer_exceeds_balance_rejected() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -844,6 +864,7 @@ fn test_fungible_token_transfer_inflated_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -903,6 +924,7 @@ fn test_fungible_token_transfer_deflated_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

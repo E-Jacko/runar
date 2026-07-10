@@ -42,6 +42,7 @@ fn test_convergence_proof_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -75,6 +76,7 @@ fn test_convergence_proof_spend_valid() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -113,6 +115,7 @@ fn test_convergence_proof_spend_invalid_rejected() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

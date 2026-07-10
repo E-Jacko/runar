@@ -52,6 +52,7 @@ fn test_message_board_deploy_and_post() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 20_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());

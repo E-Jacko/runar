@@ -103,6 +103,7 @@ fn test_sphincs_wallet_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -131,6 +132,7 @@ fn test_sphincs_wallet_deploy_different_key() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -167,6 +169,7 @@ fn test_sphincs_wallet_deploy_and_verify_utxo() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());

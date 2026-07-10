@@ -27,6 +27,7 @@ fn deploy_game(
         .deploy(provider, signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     contract
@@ -66,6 +67,7 @@ fn test_tic_tac_toe_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());

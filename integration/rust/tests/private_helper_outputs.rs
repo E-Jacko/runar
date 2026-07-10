@@ -28,6 +28,7 @@ fn test_private_helper_outputs_commit_chain() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -84,6 +85,7 @@ fn test_private_helper_outputs_log_emits_data() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

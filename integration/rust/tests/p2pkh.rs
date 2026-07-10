@@ -31,6 +31,7 @@ fn test_p2pkh_compile_and_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -56,6 +57,7 @@ fn test_p2pkh_deploy_and_spend() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -94,6 +96,7 @@ fn test_p2pkh_deploy_different_pubkeyhash() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -119,6 +122,7 @@ fn test_p2pkh_wrong_signer_rejected() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

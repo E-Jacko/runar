@@ -88,6 +88,7 @@ fn test_blake3_deploy_and_call_compress() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("blake3 deploy failed");
     assert!(!deploy_txid.is_empty());

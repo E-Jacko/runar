@@ -102,6 +102,7 @@ fn test_post_quantum_wallet_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -136,6 +137,7 @@ fn test_post_quantum_wallet_deploy_different_seed() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -179,6 +181,7 @@ fn test_post_quantum_wallet_deploy_and_verify_utxo() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());

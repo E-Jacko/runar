@@ -46,6 +46,7 @@ fn test_escrow_deploy_three_pubkeys() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -75,6 +76,7 @@ fn test_escrow_deploy_same_key_multiple_roles() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -105,6 +107,7 @@ fn test_escrow_release() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -146,6 +149,7 @@ fn test_escrow_refund() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -185,6 +189,7 @@ fn test_escrow_release_wrong_signer_rejected() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -222,6 +227,7 @@ fn test_escrow_refund_wrong_signer_rejected() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

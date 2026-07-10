@@ -62,6 +62,7 @@ fn test_slhdsa_naive_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("SLH-DSA naive deploy failed");
     assert!(!deploy_txid.is_empty());

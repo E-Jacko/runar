@@ -42,6 +42,7 @@ fn test_bsv20_token_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("BSV-20 deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -78,6 +79,7 @@ fn test_bsv21_token_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("BSV-21 deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -114,6 +116,7 @@ fn test_ordinal_nft_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 1_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("OrdinalNFT deploy failed");
     assert!(!deploy_txid.is_empty());

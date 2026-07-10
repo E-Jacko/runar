@@ -44,6 +44,7 @@ class BBAddTest extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -82,6 +83,7 @@ class BBAddWrap extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -120,6 +122,7 @@ class BBInvIdentity extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 500000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -158,6 +161,7 @@ class BBAddReject extends SmartContract {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
