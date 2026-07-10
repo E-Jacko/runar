@@ -43,6 +43,10 @@ export function buildCallTransaction(
      * Set to a non-zero value for contracts that assert
      * `extractLocktime(preimage) >= deadline` (e.g. auction close/claim). */
     locktime?: number;
+    /** Override the nSequence written onto every input (issue #131). Unset →
+     * 0xfffffffe when a non-zero locktime is set (so nLockTime is consensus-
+     * enforced), else 0xffffffff (final, legacy). */
+    sequence?: number;
   },
 ): { tx: Transaction; inputCount: number; changeAmount: number } {
   const extraContractInputs = options?.additionalContractInputs ?? [];
@@ -96,12 +100,18 @@ export function buildCallTransaction(
   // contracts asserting `extractLocktime(preimage) >= deadline`.
   tx.lockTime = options?.locktime ?? 0;
 
+  // Sequence (issue #131): an all-0xffffffff input set makes nLockTime a
+  // consensus no-op. When a non-zero locktime is set, default every input to
+  // 0xfffffffe (non-final) so the locktime is actually enforced. Explicit
+  // options.sequence always wins.
+  const inputSequence = resolveInputSequence(options?.locktime, options?.sequence);
+
   // Input 0: primary contract UTXO with unlocking script
   tx.addInput({
     sourceTXID: currentUtxo.txid,
     sourceOutputIndex: currentUtxo.outputIndex,
     unlockingScript: UnlockingScript.fromHex(unlockingScript),
-    sequence: 0xffffffff,
+    sequence: inputSequence,
   });
 
   // Additional contract inputs (with their own unlocking scripts)
@@ -110,7 +120,7 @@ export function buildCallTransaction(
       sourceTXID: ci.utxo.txid,
       sourceOutputIndex: ci.utxo.outputIndex,
       unlockingScript: UnlockingScript.fromHex(ci.unlockingScript),
-      sequence: 0xffffffff,
+      sequence: inputSequence,
     });
   }
 
@@ -121,7 +131,7 @@ export function buildCallTransaction(
         sourceTXID: utxo.txid,
         sourceOutputIndex: utxo.outputIndex,
         unlockingScript: new UnlockingScript(),
-        sequence: 0xffffffff,
+        sequence: inputSequence,
       });
     }
   }
@@ -154,6 +164,27 @@ export function buildCallTransaction(
   }
 
   return { tx, inputCount: allUtxos.length, changeAmount: change > 0 ? change : 0 };
+}
+
+/**
+ * Resolve the nSequence for a call tx's inputs (issue #131).
+ *
+ * An all-0xffffffff input set makes nLockTime a consensus no-op, so a
+ * locktime-gated method would be script-enforced (via extractLocktime) yet
+ * NOT consensus-enforced. When a non-zero locktime is set we therefore default
+ * every input to 0xfffffffe (non-final, enforceable). Explicit `sequence`
+ * always wins; with no/zero locktime we keep the legacy 0xffffffff.
+ *
+ * Shared by `buildCallTransaction` and the terminal-path tx builder so both
+ * sites stay byte-consistent.
+ */
+export function resolveInputSequence(
+  locktime: number | undefined,
+  sequence: number | undefined,
+): number {
+  if (sequence !== undefined) return sequence;
+  if (locktime !== undefined && locktime !== 0) return 0xfffffffe;
+  return 0xffffffff;
 }
 
 // ---------------------------------------------------------------------------

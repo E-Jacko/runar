@@ -243,4 +243,72 @@ RSpec.describe Runar::SDK::RunarContract do
       expect(prepared.is_terminal).to be false
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Terminal fee input (issue #118)
+  # ---------------------------------------------------------------------------
+
+  describe '#prepare_call with a fee_utxo (#118)' do
+    let(:artifact) { make_artifact(SIMPLE_TERMINAL_ARTIFACT_JSON) }
+    let(:provider) { funded_provider }
+    let(:signer)   { make_signer }
+    let(:contract) { contract_with_utxo(artifact, 'cc') }
+
+    let(:fee_utxo) do
+      Runar::SDK::Utxo.new(txid: 'fe' * 32, output_index: 3, satoshis: 2_000,
+                           script: "76a914#{TERMINAL_ADDRESS}88ac")
+    end
+
+    def input_count(tx_hex)
+      count, = Runar::SDK.read_varint_hex(tx_hex, 8)
+      count
+    end
+
+    # Return [scriptSig_hex] for every input of a raw tx.
+    def input_scripts(tx_hex)
+      pos = 8
+      count, ic = Runar::SDK.read_varint_hex(tx_hex, pos)
+      pos += ic
+      scripts = []
+      count.times do
+        pos += 72 # prev txid + output index
+        len, sl = Runar::SDK.read_varint_hex(tx_hex, pos)
+        pos += sl
+        scripts << tx_hex[pos, len * 2]
+        pos += len * 2 + 8 # scriptSig + sequence
+      end
+      scripts
+    end
+
+    it 'adds the fee input (2 inputs total)' do
+      prepared = contract.prepare_call(
+        'settle', [], provider, signer,
+        Runar::SDK::CallOptions.new(terminal_outputs: sample_terminal_outputs, fee_utxo: fee_utxo)
+      )
+      expect(input_count(prepared.tx_hex)).to eq(2)
+    end
+
+    it 'references the fee UTXO outpoint and signs its input (non-empty scriptSig)' do
+      prepared = contract.prepare_call(
+        'settle', [], provider, signer,
+        Runar::SDK::CallOptions.new(terminal_outputs: sample_terminal_outputs, fee_utxo: fee_utxo)
+      )
+      # Fee input outpoint (txid little-endian) present in the tx.
+      expect(prepared.tx_hex).to include(Runar::SDK.reverse_hex('fe' * 32))
+      # The fee input (index 1) carries a signed P2PKH scriptSig (pushes the
+      # signer's pubkey), not an empty placeholder.
+      scripts = input_scripts(prepared.tx_hex)
+      expect(scripts.length).to eq(2)
+      expect(scripts[1]).not_to be_empty
+      expect(scripts[1]).to include(TERMINAL_PUB_KEY)
+    end
+
+    it 'omits the fee input when fee_utxo is unset (back-compatible)' do
+      prepared = contract.prepare_call(
+        'settle', [], provider, signer,
+        Runar::SDK::CallOptions.new(terminal_outputs: sample_terminal_outputs)
+      )
+      expect(input_count(prepared.tx_hex)).to eq(1)
+    end
+  end
 end

@@ -326,6 +326,40 @@ class ValidateTest {
         );
     }
 
+    @Test
+    void rejectsForLoopWithIdentifierBound() {
+        // A bare identifier bound (a method parameter here) is not unrollable
+        // into fixed Bitcoin Script; the reference TS compiler rejects it, so
+        // the validator must too (anf-lower would otherwise throw).
+        String src = """
+            class Bad extends SmartContract {
+                @Readonly Bigint x;
+
+                Bad(Bigint x) {
+                    super(x);
+                    this.x = x;
+                }
+
+                @Public
+                void unlock(Bigint n) {
+                    for (Bigint i = BigInteger.ZERO; i < n; i++) {
+                        assertThat(true);
+                    }
+                    assertThat(true);
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "Bad.runar.java");
+        Validate.ValidationException e = assertThrows(
+            Validate.ValidationException.class,
+            () -> Validate.run(c)
+        );
+        assertTrue(
+            e.errors().stream().anyMatch(m -> m.contains("compile-time constant")),
+            "expected for-loop-bound error, got " + e.errors()
+        );
+    }
+
     // ------------------------------------------------------------------
     // Unknown function calls
     // ------------------------------------------------------------------
@@ -426,11 +460,11 @@ class ValidateTest {
     }
 
     // ------------------------------------------------------------------
-    // Unsupported loop shapes: non-zero start, countdown (issue #121)
+    // Non-zero-start and countdown loop shapes (issue #121)
     // ------------------------------------------------------------------
 
     @Test
-    void rejectsForLoopWithNonZeroStart() {
+    void acceptsForLoopWithNonZeroStart() {
         String src = """
             class C extends SmartContract {
                 @Readonly Bigint x;
@@ -450,18 +484,12 @@ class ValidateTest {
             }
             """;
         ContractNode c = JavaParser.parse(src, "C.runar.java");
-        Validate.ValidationException e = assertThrows(
-            Validate.ValidationException.class,
-            () -> Validate.run(c)
-        );
-        assertTrue(
-            e.errors().stream().anyMatch(m -> m.contains("must start at 0")),
-            "expected non-zero-start error, got " + e.errors()
-        );
+        // Issue #121: a non-zero-start loop is now supported and must validate.
+        assertDoesNotThrow(() -> Validate.run(c));
     }
 
     @Test
-    void rejectsCountdownForLoop() {
+    void acceptsCountdownForLoop() {
         String src = """
             class C extends SmartContract {
                 @Readonly Bigint x;
@@ -481,14 +509,8 @@ class ValidateTest {
             }
             """;
         ContractNode c = JavaParser.parse(src, "C.runar.java");
-        Validate.ValidationException e = assertThrows(
-            Validate.ValidationException.class,
-            () -> Validate.run(c)
-        );
-        assertTrue(
-            e.errors().stream().anyMatch(m -> m.contains("countdown")),
-            "expected countdown error, got " + e.errors()
-        );
+        // Issue #121: a countdown loop is now supported and must validate.
+        assertDoesNotThrow(() -> Validate.run(c));
     }
 
     @Test

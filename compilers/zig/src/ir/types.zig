@@ -142,6 +142,17 @@ pub const PropertyNode = struct {
     type_info: RunarType,
     readonly: bool,
     initializer: ?Expression = null,
+    /// Set by the `.runar.ts` surface parser when a `/** @embedAlways */` (or
+    /// `// @embedAlways`) comment directive immediately precedes a readonly
+    /// field (issue #109). Opts the field OUT of dead-code elimination: a
+    /// readonly field no method references is normally stripped from the
+    /// locking script (its load_prop is dead, so no constructor slot is
+    /// emitted), silently dropping deploy-time metadata an author intends to
+    /// recover from the on-chain script later. When set, ANF lowering forces
+    /// the field into the script (a constructor slot) so its bytes survive.
+    /// Only meaningful on readonly fields; honoured only on the `.runar.ts`
+    /// surface (the other 8 formats fail closed at the parse dispatch).
+    embed_always: bool = false,
     /// Non-zero when `type_info == .fixed_array` (set by the parser) or when
     /// we want to remember the original outer length for post-expansion.
     fixed_array_length: u32 = 0,
@@ -155,7 +166,20 @@ pub const PropertyNode = struct {
     synthetic_array_chain: ?[]const SyntheticArrayLevel = null,
 };
 pub const ConstructorNode = struct { params: []ParamNode, super_args: []Expression, assignments: []AssignmentNode };
-pub const MethodNode = struct { name: []const u8, is_public: bool, params: []ParamNode, body: []Statement, source_loc: ?SourceLocation = null };
+pub const MethodNode = struct {
+    name: []const u8,
+    is_public: bool,
+    params: []ParamNode,
+    body: []Statement,
+    source_loc: ?SourceLocation = null,
+    /// BIP-143 sighash type declared via a `/** @sighash <FLAGS> */` directive
+    /// on a public method (issue #123), e.g. 0x43 for SINGLE|FORKID. Null = no
+    /// directive = the default ALL|FORKID (0x41), byte-identical to the
+    /// historically-pinned mode. Drives the auto-injected preimage-type assert,
+    /// the OP_PUSH_TX binding flag, the ABI sigHashType, and the SDK-side
+    /// preimage construction. Honoured only on the `.runar.ts` surface.
+    sighash_type: ?i32 = null,
+};
 pub const ParamNode = struct { name: []const u8, type_info: RunarType = .unknown, type_name: []const u8 = "" };
 pub const ANFParam = ParamNode;
 pub const AssignmentNode = struct { target: []const u8, value: Expression };
@@ -177,11 +201,21 @@ pub const Assign = struct {
 };
 pub const IfStmt = struct { condition: Expression, then_body: []Statement, else_body: ?[]Statement = null, source_loc: ?SourceLocation = null };
 // `descending` records whether the source condition counted down (`>`/`>=`).
-// The ANF loop node carries only an iteration count (no start/step), so
-// countdown and non-zero-start loops cannot be represented and are rejected
-// in Pass 2 (validate) and Pass 4 (anf-lower). Only C-style parsers set this;
-// range-based parsers (Rust/Ruby/Python/Zig/Move) are always ascending.
-pub const ForStmt = struct { var_name: []const u8, init_value: i64, bound: i64, body: []Statement, descending: bool = false, source_loc: ?SourceLocation = null };
+// `inclusive` records whether the source comparison was inclusive (`<=`/`>=`).
+// Issue #121: the ANF loop node now carries an explicit start value and step
+// direction, so countdown and non-zero-start loops are supported. anf-lower
+// computes count = |bound - start| (+1 when inclusive), so the C-style parsers
+// (TS/Sol/Go/Java) set `descending`/`inclusive` from the raw operator while
+// range-based parsers (Rust/Ruby/Python/Zig/Move) are ascending and fold any
+// inclusive endpoint into `bound` at parse time (leaving `inclusive = false`).
+// `bound_is_const` records whether the loop bound was a genuine integer
+// literal. The Zig parsers collapse the bound to a concrete i64 (defaulting to
+// 0), so a runtime bound (`i < this.x`) or an identifier bound (`i < N`) would
+// otherwise silently become a 0-iteration loop. When false, the validator
+// rejects the loop with a compile-time-constant diagnostic (matching the
+// reference TS compiler). Defaults to true so unrelated construction sites and
+// format parsers stay literal-bounded by default.
+pub const ForStmt = struct { var_name: []const u8, init_value: i64, bound: i64, body: []Statement, descending: bool = false, inclusive: bool = false, bound_is_const: bool = true, source_loc: ?SourceLocation = null };
 pub const AssertStmt = struct { condition: Expression, message: ?[]const u8 = null, source_loc: ?SourceLocation = null };
 
 pub const Expression = union(enum) {
@@ -287,6 +321,14 @@ pub const ANFMethod = struct {
     params: []ParamNode = &.{},
     bindings: []ANFBinding = &.{},
     body: []ANFBinding = &.{},
+    /// Non-default BIP-143 sighash mode a `@sighash` directive declared for
+    /// this (public) method (issue #123), e.g. 0x43 for SINGLE|FORKID. Null =
+    /// default ALL|FORKID (0x41). In-memory carrier only — never serialized
+    /// into the ANF IR JSON compared cross-tier (the codegen-relevant flag
+    /// rides on each check_preimage node's sighash_flag). The artifact
+    /// assembler copies it to ABIMethod.sighash_type so the SDK builds a
+    /// matching preimage.
+    sighash_type: ?i32 = null,
 };
 pub const ANFBinding = struct { name: []const u8, value: ANFValue, source_loc: ?SourceLocation = null };
 
@@ -353,14 +395,32 @@ pub const ANFValue = union(enum) {
 
 // -- TypeScript-matching value structs (used by stack_lower.zig) --
 pub const LoadParam = struct { name: []const u8 };
-pub const LoadProp = struct { name: []const u8 };
+pub const LoadProp = struct {
+    name: []const u8,
+    /// Issue #109 (@embedAlways): when true, dead-binding DCE must NOT remove
+    /// this load_prop even though nothing references it, so the readonly field
+    /// it loads survives into the deployed locking script (a constructor slot).
+    /// The TypeScript reference relies on a single-pass DCE + a `@ref` alias to
+    /// keep the load_prop alive; the Zig `ec_optimizer` runs a fixpoint DCE that
+    /// would strip such an unreferenced alias chain, so the Zig tier marks the
+    /// injected load_prop directly and teaches `dce.hasSideEffect` to honour it.
+    /// The observable output (constructor slot + OP_NIP cleanup) is byte-identical
+    /// to the TS reference. In-memory only — never serialized into the ANF JSON,
+    /// so existing (default false) load_props stay byte-identical cross-tier.
+    preserve: bool = false,
+};
 pub const LoadConst = struct { value: ConstValue };
 pub const BinOp = struct { op: []const u8, left: []const u8, right: []const u8, result_type: ?[]const u8 = null };
 pub const ANFUnaryOp = struct { op: []const u8, operand: []const u8, result_type: ?[]const u8 = null };
 pub const ANFCall = struct { func: []const u8, args: []const []const u8 };
 pub const ANFMethodCall = struct { object: []const u8, method: []const u8, args: []const []const u8 };
 pub const ANFIf = struct { cond: []const u8, then: []ANFBinding, @"else": []ANFBinding };
-pub const ANFLoop = struct { count: u32, body: []ANFBinding, iter_var: []const u8 };
+// Iterator start value and step direction (issue #121). The loop is unrolled
+// `count` times; on iteration `i` (0-based) the iterator variable holds
+// `start + i * step`. Zero-start counting-up loops carry `start = 0`, `step = 1`,
+// reproducing the historical `i = 0..count-1` lowering byte-for-byte. Countdown
+// loops carry `step = -1`.
+pub const ANFLoop = struct { count: u32, body: []ANFBinding, iter_var: []const u8, start: i64 = 0, step: i8 = 1 };
 pub const ANFAssert = struct {
     value: []const u8,
     /// Optional marker: `true` only on the auto-injected
@@ -372,7 +432,16 @@ pub const ANFAssert = struct {
     is_auto_injected_state_check: bool = false,
 };
 pub const UpdateProp = struct { name: []const u8, value: []const u8 };
-pub const CheckPreimage = struct { preimage: []const u8 };
+pub const CheckPreimage = struct {
+    preimage: []const u8,
+    /// Issue #123: the BIP-143 sighash flag the on-chain OP_PUSH_TX binding
+    /// appends to the derived signature (so the node re-derives the tx sighash
+    /// under this flag). 0 = default ALL|FORKID (0x41), byte-identical to the
+    /// pinned cross-tier binding blob. Only set for a method that declares a
+    /// non-default @sighash mode, keeping golden ANF unchanged for every
+    /// existing contract.
+    sighash_flag: i32 = 0,
+};
 pub const DeserializeState = struct { preimage: []const u8 };
 pub const ANFAddOutput = struct { satoshis: []const u8, state_values: []const []const u8 = &.{}, preimage: []const u8 = "", state_refs: []const []const u8 = &.{} };
 pub const ANFAddRawOutput = struct { satoshis: []const u8, script_bytes: []const u8 = "" };
@@ -398,7 +467,10 @@ pub const PropertyWrite = struct { name: []const u8, value_ref: []const u8 };
 pub const ANFBinaryOp = struct { op: BinOperator, left: []const u8, right: []const u8, result_type: ?[]const u8 = null };
 pub const ANFBuiltinCall = struct { name: []const u8, args: []const []const u8 };
 pub const ANFIfExpr = struct { condition: []const u8, then_bindings: []ANFBinding, else_bindings: ?[]ANFBinding };
-pub const ANFForLoop = struct { var_name: []const u8, init_val: i64, bound: i64, body_bindings: []ANFBinding };
+// Legacy bridge struct adapted from ANFLoop by stack_lower.zig's loop dispatch.
+// Issue #121: carries the iterator start value, step direction, and iteration
+// count directly; the unroll pushes `start + n*step` on iteration `n`.
+pub const ANFForLoop = struct { var_name: []const u8, start: i64, step: i64, count: u32, body_bindings: []ANFBinding };
 pub const ANFLegacyAssert = struct { condition: []const u8, message: ?[]const u8 = null };
 
 fn freeBindings(allocator: std.mem.Allocator, bindings: []ANFBinding) void {
@@ -513,7 +585,17 @@ pub const RunarArtifact = struct {
 pub const Artifact = RunarArtifact;
 pub const ABI = struct { constructor: ABIConstructor, methods: []ABIMethod };
 pub const ABIConstructor = struct { params: []ABIParam };
-pub const ABIMethod = struct { name: []const u8, params: []ABIParam, is_public: bool, is_terminal: bool = false };
+pub const ABIMethod = struct {
+    name: []const u8,
+    params: []ABIParam,
+    is_public: bool,
+    is_terminal: bool = false,
+    /// Issue #123: the BIP-143 sighash type this method's preimage/covenant is
+    /// built under (from a `@sighash` directive), e.g. 0x43 for SINGLE|FORKID.
+    /// Null = default ALL|FORKID (0x41); the SDK falls back to 0x41 so existing
+    /// artifacts are unchanged. Emitted into the artifact JSON only when set.
+    sighash_type: ?i32 = null,
+};
 pub const ABIParam = struct { name: []const u8, type_name: []const u8 };
 pub const ConstructorSlot = struct { param_index: usize, byte_offset: usize };
 pub const CodeSepIndexSlot = struct { byte_offset: usize, code_sep_index: usize };

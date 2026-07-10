@@ -2,7 +2,35 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use super::anf_interpreter::ANFProgram;
+use super::signer::Signer;
+
+/// A shared signer used to sign the P2PKH funding (and terminal fee) inputs of
+/// a deploy/call tx (issue #134). A thin `Arc<dyn Signer>` newtype so the option
+/// structs keep deriving `Debug`/`Clone`/`Default` even though `Signer` is not
+/// `Debug`. Deref to `&dyn Signer` at the sign sites.
+#[derive(Clone)]
+pub struct FundingSigner(pub Arc<dyn Signer>);
+
+impl FundingSigner {
+    /// Borrow the inner signer as a trait object.
+    pub fn as_signer(&self) -> &dyn Signer {
+        self.0.as_ref()
+    }
+}
+
+impl std::fmt::Debug for FundingSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FundingSigner(<signer>)")
+    }
+}
+
+impl<S: Signer + 'static> From<Arc<S>> for FundingSigner {
+    fn from(s: Arc<S>) -> Self {
+        FundingSigner(s)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Transaction types
@@ -52,10 +80,15 @@ pub struct Utxo {
 // ---------------------------------------------------------------------------
 
 /// Options for deploying a contract.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeployOptions {
     pub satoshis: i64,
     pub change_address: Option<String>,
+    /// Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+    /// are owned by a different key than the connected deploy signer, set this
+    /// so the funding inputs are signed by their real owner. `None` → the
+    /// connected signer (zero behaviour change).
+    pub funding_signer: Option<FundingSigner>,
 }
 
 /// Options for calling a contract method.
@@ -99,6 +132,35 @@ pub struct CallOptions {
     /// non-terminal (`build_call_transaction_ext`) and terminal call-tx
     /// build sites.
     pub locktime: Option<u32>,
+    /// Override the nSequence written onto EVERY input of the call tx (issue
+    /// #131). Zero-config defaults: when `locktime` is set and non-zero,
+    /// sequence defaults to `0xfffffffe` (non-final, so consensus actually
+    /// enforces nLockTime); otherwise it stays `0xffffffff` (final, legacy).
+    /// Set explicitly only for RBF or custom relative-locktime scenarios.
+    /// Threaded through the non-terminal and terminal call-tx build sites.
+    pub sequence: Option<u32>,
+    /// Cap the number of P2PKH funding inputs added to a non-terminal call tx
+    /// (issue #133). Funding is chosen by smallest-sufficient, largest-first
+    /// selection (the same `select_utxos` strategy deploy uses). If covering
+    /// the outputs + fee would need more than this many inputs, the call
+    /// returns an error rather than silently sweeping the wallet. `None` → no
+    /// cap.
+    pub max_funding_inputs: Option<usize>,
+    /// Signer for the P2PKH funding (and terminal fee) inputs (issue #134).
+    /// When the funding/fee UTXOs are owned by a different key than the
+    /// connected method signer, set this so those inputs are signed by their
+    /// real owner. The method's own `Sig` args are still signed by the
+    /// connected signer. `None` → the connected signer (zero behaviour change).
+    pub funding_signer: Option<FundingSigner>,
+    /// A single plain P2PKH UTXO added to a TERMINAL call tx purely to pay the
+    /// miner fee (issue #118). A true terminal method pays out the full contract
+    /// balance, so fee would be 0 and ARC rejects; the covenant asserts its exact
+    /// output set, so no change output can absorb a fee. The fee input is added
+    /// BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers it) and
+    /// is consumed entirely as fee — no change output is created. Signed with
+    /// `funding_signer` ?? the connected signer. The covenant's output
+    /// assertions are untouched — only the input side grows.
+    pub fee_utxo: Option<Utxo>,
 }
 
 /// A data output entry — hex-encoded script + satoshis — for the
@@ -182,6 +244,11 @@ pub struct AbiMethod {
     /// Unlocking script is prefixed with `_codePart` (issue #100).
     #[serde(default)]
     pub uses_code_part: Option<bool>,
+    /// Issue #123: the BIP-143 sighash type this method's preimage/covenant is
+    /// built under (from a `@sighash` directive), e.g. `0x43` for SINGLE|FORKID.
+    /// Absent = default `ALL|FORKID` (0x41); the SDK falls back to 0x41.
+    #[serde(default)]
+    pub sig_hash_type: Option<i64>,
 }
 
 /// A parameter in the ABI.
@@ -272,6 +339,15 @@ pub enum SdkValue {
     /// Pass this as an arg to `call()` for params of type `Sig` or `PubKey` —
     /// the SDK will compute the real value from the signer.
     Auto,
+    /// Producer-side marker for the deliberately-empty branch of an
+    /// OR-CHECKSIG method (issue #106). Encodes as `OP_0` (a single `0x00`
+    /// byte, i.e. an empty signature push) and is SKIPPED by the auto-sig
+    /// signing pass — no signature is ever computed for this slot. Pass it for
+    /// the non-matching `checkSig(sig, pk)` branch so BIP146 NULLFAIL is
+    /// satisfied (the failing CHECKSIG sees an empty sig and returns false
+    /// instead of aborting). Coexists with `Auto` at the same call:
+    /// `[Auto, EmptySig]` signs only the Auto slot.
+    EmptySig,
     /// A (possibly nested) array of values. Used for FixedArray state
     /// fields. The SDK flattens this into positional scalar slots keyed
     /// by `fixed_array.synthetic_names` when serializing state.
@@ -514,6 +590,15 @@ mod tests {
     }
 
     #[test]
+    fn sdk_value_empty_sig() {
+        // Issue #106: EmptySig is a distinct unit variant from Auto/Bytes.
+        let v = SdkValue::EmptySig;
+        assert_eq!(v, SdkValue::EmptySig);
+        assert_ne!(SdkValue::EmptySig, SdkValue::Auto);
+        assert_ne!(SdkValue::EmptySig, SdkValue::Bytes(String::new()));
+    }
+
+    #[test]
     #[should_panic(expected = "non-numeric")]
     fn sdk_value_as_int_panics_on_bool() {
         SdkValue::Bool(true).as_int();
@@ -547,6 +632,7 @@ mod tests {
         let opts = DeployOptions {
             satoshis: 1000,
             change_address: Some("maddr".to_string()),
+            funding_signer: None,
         };
         assert_eq!(opts.satoshis, 1000);
         assert_eq!(opts.change_address.as_deref(), Some("maddr"));

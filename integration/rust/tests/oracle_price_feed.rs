@@ -80,6 +80,7 @@ fn test_oracle_price_feed_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -109,6 +110,7 @@ fn test_oracle_price_feed_deploy_different_receiver() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -146,6 +148,7 @@ fn test_oracle_price_feed_spend_valid_price() {
         .deploy(&mut provider, &*receiver_signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -199,6 +202,7 @@ fn test_oracle_price_feed_below_threshold_rejected() {
         .deploy(&mut provider, &*receiver_signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -248,6 +252,7 @@ fn test_oracle_price_feed_wrong_receiver_rejected() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

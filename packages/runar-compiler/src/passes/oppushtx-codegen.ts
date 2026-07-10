@@ -58,8 +58,8 @@ const G_COMPRESSED = new Uint8Array([
   0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
 ]);
 
-// SIGHASH_ALL | SIGHASH_FORKID
-const SIGHASH_FLAG = new Uint8Array([0x41]);
+// SIGHASH_ALL | SIGHASH_FORKID — default when a method declares no @sighash.
+const SIGHASH_FLAG_DEFAULT = 0x41;
 
 /** Reverse a fixed-length byte string on TOS (N bytes → N bytes, order flipped). */
 function emitReverseN(e: (op: StackOp) => void, N: number): void {
@@ -104,7 +104,10 @@ function modN(t: ECTracker, aName: string, resultName: string): void {
  *
  * Net stack effect: 0 (preimage in → preimage out).
  */
-export function emitCheckPreimageBinding(emit: (op: StackOp) => void): void {
+export function emitCheckPreimageBinding(
+  emit: (op: StackOp) => void,
+  sighashFlag: number = SIGHASH_FLAG_DEFAULT,
+): void {
   const t = new ECTracker(['preimage'], emit);
 
   // --- z = hash256(preimage) as a positive script number --------------------
@@ -202,7 +205,7 @@ export function emitCheckPreimageBinding(emit: (op: StackOp) => void): void {
     e({ op: 'opcode', code: 'OP_CAT' });  // [sder, 30||totLen||rDER]
     e({ op: 'swap' });                    // [30||totLen||rDER, sder]
     e({ op: 'opcode', code: 'OP_CAT' });  // [30||totLen||rDER||sder]
-    e({ op: 'push', value: SIGHASH_FLAG }); // append sighash byte
+    e({ op: 'push', value: new Uint8Array([sighashFlag & 0xff]) }); // append sighash byte
     e({ op: 'opcode', code: 'OP_CAT' });  // full sig
   });
 
@@ -223,9 +226,9 @@ export function emitCheckPreimageBinding(emit: (op: StackOp) => void): void {
  * single source of truth; the six non-TS tiers pin the same constant hex
  * (CHECK_PREIMAGE_BINDING_HEX), with the cross-tier conformance suite as guard.
  */
-export function checkPreimageBindingBytes(): Uint8Array {
+export function checkPreimageBindingBytes(sighashFlag: number = SIGHASH_FLAG_DEFAULT): Uint8Array {
   const ops: StackOp[] = [];
-  emitCheckPreimageBinding((op) => ops.push(op));
+  emitCheckPreimageBinding((op) => ops.push(op), sighashFlag);
   const { scriptHex } = emitMethod({ name: 'checkPreimageBinding', ops, maxStackDepth: 200 });
   const out = new Uint8Array(scriptHex.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(scriptHex.slice(i * 2, i * 2 + 2), 16);
@@ -243,6 +246,9 @@ export const CHECK_PREIMAGE_BINDING_HEX: string = Array.from(
  * effect is 0 (preimage in → preimage out), declared as in=1/out=1 so the static
  * analyzer keeps the depth consistent.
  */
-export function emitCheckPreimageBindingRaw(emit: (op: StackOp) => void): void {
-  emit({ op: 'raw_bytes', bytes: checkPreimageBindingBytes(), in_arity: 1, out_arity: 1 });
+export function emitCheckPreimageBindingRaw(
+  emit: (op: StackOp) => void,
+  sighashFlag: number = SIGHASH_FLAG_DEFAULT,
+): void {
+  emit({ op: 'raw_bytes', bytes: checkPreimageBindingBytes(sighashFlag), in_arity: 1, out_arity: 1 });
 }

@@ -79,6 +79,7 @@ fn test_wots_naive_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("WOTS+ naive deploy failed");
     assert!(!deploy_txid.is_empty());

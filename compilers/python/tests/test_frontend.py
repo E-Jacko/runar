@@ -435,7 +435,7 @@ class Ok extends SmartContract {
     # -----------------------------------------------------------------------
 
     def test_validate_for_loop_nonzero_start(self):
-        """A for loop with a non-zero literal start value must be rejected."""
+        """A for loop with a non-zero literal start value is accepted (issue #121)."""
         source = """
 import { SmartContract, assert } from 'runar-lang';
 
@@ -458,12 +458,12 @@ class C extends SmartContract {
         assert result.contract is not None
 
         valid_result = validate(result.contract)
-        assert any("must start at 0" in e.message.lower() for e in valid_result.errors), (
-            f"expected error about non-zero start, got: {valid_result.errors}"
+        assert not any("must start at 0" in e.message.lower() for e in valid_result.errors), (
+            f"non-zero start must no longer be rejected, got: {valid_result.errors}"
         )
 
     def test_validate_for_loop_countdown(self):
-        """A countdown for loop must be rejected."""
+        """A countdown for loop is accepted (issue #121)."""
         source = """
 import { SmartContract, assert } from 'runar-lang';
 
@@ -486,8 +486,8 @@ class C extends SmartContract {
         assert result.contract is not None
 
         valid_result = validate(result.contract)
-        assert any("countdown" in e.message.lower() for e in valid_result.errors), (
-            f"expected error about countdown loop, got: {valid_result.errors}"
+        assert not any("countdown" in e.message.lower() for e in valid_result.errors), (
+            f"countdown loops must no longer be rejected, got: {valid_result.errors}"
         )
 
     def test_validate_for_loop_zero_start_ok(self):
@@ -1272,8 +1272,8 @@ class LoopContract extends SmartContract {
             f"got kinds: {[b.value.kind for b in sum_method.body]}"
         )
 
-    def test_anf_lower_rejects_nonzero_start_loop(self):
-        """extractLoopCount must reject a non-zero start (issue #121 reject path)."""
+    def test_anf_lower_nonzero_start_loop(self):
+        """A non-zero-start loop lowers with start=1, step=+1, count=3 (issue #121)."""
         source = """
 import { SmartContract, assert } from 'runar-lang';
 
@@ -1289,11 +1289,19 @@ class C extends SmartContract {
 """
         result = parse_source(source, "C.runar.ts")
         assert result.contract is not None
-        with pytest.raises(ValueError, match="must start at 0"):
-            lower_to_anf(result.contract)
 
-    def test_anf_lower_rejects_countdown_loop(self):
-        """extractLoopCount must reject a countdown loop (issue #121 reject path)."""
+        program = lower_to_anf(result.contract)
+        m_method = next((m for m in program.methods if m.name == "m"), None)
+        assert m_method is not None
+        loop_bindings = [b for b in m_method.body if b.value.kind == "loop"]
+        assert len(loop_bindings) == 1
+        loop = loop_bindings[0].value
+        assert loop.start == 1
+        assert loop.step == 1
+        assert loop.count == 3
+
+    def test_anf_lower_countdown_loop(self):
+        """A countdown loop lowers with start=3, step=-1, count=3 (issue #121)."""
         source = """
 import { SmartContract, assert } from 'runar-lang';
 
@@ -1309,11 +1317,47 @@ class C extends SmartContract {
 """
         result = parse_source(source, "C.runar.ts")
         assert result.contract is not None
-        with pytest.raises(ValueError, match="[Cc]ountdown"):
-            lower_to_anf(result.contract)
+
+        program = lower_to_anf(result.contract)
+        m_method = next((m for m in program.methods if m.name == "m"), None)
+        assert m_method is not None
+        loop_bindings = [b for b in m_method.body if b.value.kind == "loop"]
+        assert len(loop_bindings) == 1
+        loop = loop_bindings[0].value
+        assert loop.start == 3
+        assert loop.step == -1
+        assert loop.count == 3
+
+    def test_anf_lower_inclusive_countdown_loop(self):
+        """An inclusive countdown loop lowers with start=3, step=-1, count=3 (issue #121)."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 3n; i >= 1n; i--) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        program = lower_to_anf(result.contract)
+        m_method = next((m for m in program.methods if m.name == "m"), None)
+        assert m_method is not None
+        loop_bindings = [b for b in m_method.body if b.value.kind == "loop"]
+        assert len(loop_bindings) == 1
+        loop = loop_bindings[0].value
+        assert loop.start == 3
+        assert loop.step == -1
+        assert loop.count == 3
 
     def test_anf_lower_zero_start_loop_count(self):
-        """A zero-start counting-up loop still lowers with count = 4."""
+        """A zero-start counting-up loop still lowers with start=0, step=+1, count=4."""
         source = """
 import { SmartContract, assert } from 'runar-lang';
 
@@ -1335,7 +1379,10 @@ class C extends SmartContract {
         assert m_method is not None
         loop_bindings = [b for b in m_method.body if b.value.kind == "loop"]
         assert len(loop_bindings) == 1
-        assert loop_bindings[0].value.count == 4
+        loop = loop_bindings[0].value
+        assert loop.start == 0
+        assert loop.step == 1
+        assert loop.count == 4
 
     def test_anf_lower_stateful(self):
         """A StatefulSmartContract's public method should have implicit params after ANF lowering.
@@ -1700,8 +1747,17 @@ class FT extends StatefulSmartContract {
         assert len(state_refs) == 2
         assert len(data_refs) == 1
 
+        # Issue #116: the change output is gated behind a runtime
+        # `if (_changeAmount != 0)`; buildChangeOutput now lives inside the
+        # if-then branch, and the top-level continuation cats with the if
+        # node's result ref.
+        change_if = next(
+            (b for b in transfer.body if b.value.kind == "if"),
+            None,
+        )
+        assert change_if is not None
         change_builder = next(
-            (b for b in transfer.body
+            (b for b in (change_if.value.then or [])
              if b.value.kind == "call" and b.value.func == "buildChangeOutput"),
             None,
         )
@@ -1714,8 +1770,8 @@ class FT extends StatefulSmartContract {
         assert cats[0].value.args == [state_refs[0], state_refs[1]]
         # Second cat: prev + data[0]
         assert cats[1].value.args[1] == data_refs[0]
-        # Third cat: prev + change
-        assert cats[2].value.args[1] == change_builder.name
+        # Third cat: prev + change (the gated if node's result)
+        assert cats[2].value.args[1] == change_if.name
 
     def test_anf_lower_add_data_output_single_continuation(self):
         """addDataOutput works with the single-output state continuation path.
@@ -2266,9 +2322,14 @@ class LiteralLoop extends SmartContract {
             f"expected no errors for literal loop bound, got: {vr.errors}"
         )
 
-    # V11: identifier loop bound accepted
-    def test_v11_identifier_loop_bound_accepted(self):
-        """for(let i=0n;i<N;i++) where N is identifier → no errors."""
+    # V11: identifier loop bound rejected (cleanly, no crash)
+    def test_v11_identifier_loop_bound_rejected(self):
+        """for(let i=0n;i<N;i++) where N is identifier → rejected at validator.
+
+        A bare identifier bound cannot be unrolled into fixed Bitcoin Script;
+        the reference TS compiler rejects it gracefully. The validator must do
+        the same so anf-lower's _extract_loop_shape never raises.
+        """
         source = """
 import { SmartContract, assert } from 'runar-lang';
 
@@ -2292,9 +2353,9 @@ class IdentLoop extends SmartContract {
         result = parse_source(source, "IdentLoop.runar.ts")
         assert result.contract is not None
         vr = validate(result.contract)
-        assert len(vr.errors) == 0, (
-            f"expected no errors for identifier loop bound, got: {vr.errors}"
-        )
+        assert any(
+            "constant" in e.message or "bound" in e.message for e in vr.errors
+        ), f"expected a compile-time-constant loop-bound error, got: {vr.errors}"
 
     # V12: constructor missing super() rejected
     def test_v12_constructor_missing_super_rejected(self):

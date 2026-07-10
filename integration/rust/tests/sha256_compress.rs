@@ -55,6 +55,7 @@ fn test_sha256_compress_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("sha256-compress deploy failed");
     assert!(!deploy_txid.is_empty());

@@ -110,6 +110,13 @@ export interface Loop {
   count: number;
   body: ANFBinding[];
   iterVar: string;
+  // Iterator start value and step direction (issue #121). The loop is unrolled
+  // `count` times; on iteration `i` (0-based) the iterator variable holds
+  // `start + i * step`. Zero-start counting-up loops carry `start = 0n` and
+  // `step = 1`, which reproduces the historical `i = 0..count-1` lowering
+  // byte-for-byte. Countdown loops carry `step = -1`.
+  start: bigint;
+  step: 1 | -1;
 }
 
 export interface Assert {
@@ -139,6 +146,14 @@ export interface GetStateScript {
 export interface CheckPreimage {
   kind: 'check_preimage';
   preimage: string; // reference to a temp name
+  /**
+   * Issue #123: BIP-143 sighash flag the on-chain OP_PUSH_TX binding appends to
+   * the derived signature (so the node re-derives the tx sighash under this
+   * flag). Absent = default `ALL|FORKID` (0x41), byte-identical to the pinned
+   * cross-tier binding blob. Only set for a method that declares a non-default
+   * `@sighash` mode, keeping golden ANF unchanged for every existing contract.
+   */
+  sighashFlag?: number;
 }
 
 export interface DeserializeState {

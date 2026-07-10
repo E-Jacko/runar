@@ -37,7 +37,7 @@ pub use script_vm::{ScriptVm, VmOptions, VmResult};
 pub use woc_provider::WhatsOnChainProvider;
 pub use token_wallet::TokenWallet;
 pub use wallet::{
-    WalletClient, WalletSigner, WalletProvider,
+    WalletClient, WalletSigner, WalletProvider, Broadcaster,
     WalletActionOutput, WalletActionResult, WalletOutput,
     DeployWithWalletOptions, deploy_with_wallet,
 };

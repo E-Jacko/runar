@@ -1,5 +1,6 @@
 package runar.compiler.frontend;
 
+import java.util.regex.Pattern;
 import runar.compiler.ir.ast.ContractNode;
 
 /**
@@ -16,6 +17,15 @@ import runar.compiler.ir.ast.ContractNode;
 public final class ParserDispatch {
     private ParserDispatch() {}
 
+    // Author-facing comment directives implemented only by the TypeScript
+    // compiler today: {@code @sighash <FLAGS>} (#123, per-method sighash type)
+    // and {@code @embedAlways} (#109, readonly-field DCE opt-out). Word-boundary
+    // anchored (\b) to mirror the TS {@code /@sighash\b/} / {@code
+    // /@embedAlways\b/} scans so an identifier like {@code sighashType} does not
+    // trip the guard.
+    private static final Pattern SIGHASH_DIRECTIVE = Pattern.compile("@sighash\\b");
+    private static final Pattern EMBED_ALWAYS_DIRECTIVE = Pattern.compile("@embedAlways\\b");
+
     /**
      * Parse {@code source} into a {@link ContractNode}, dispatching by the
      * format suffix in {@code filename}. Recognised suffixes:
@@ -29,6 +39,28 @@ public final class ParserDispatch {
         InputLimits.assertSourceBytesUnderLimit(source);
 
         String lower = filename == null ? "" : filename.toLowerCase();
+
+        // Fail-closed guard, NARROWED to the 8 non-TypeScript surface formats
+        // (#123/#109 port): the {@code @sighash} (#123, per-method sighash type)
+        // and {@code @embedAlways} (#109, readonly-field DCE opt-out) comment
+        // directives are honoured ONLY on the {@code .runar.ts} surface, which
+        // the {@link TsParser} now parses directly. The other 8 frontends still
+        // ignore comments, so they would silently drop these directives and
+        // change signing / DCE semantics — keep rejecting them there until (if
+        // ever) those tiers port the feature.
+        if (source != null && !lower.endsWith(".runar.ts")) {
+            if (SIGHASH_DIRECTIVE.matcher(source).find()) {
+                throw new ParseException(
+                    "@sighash directive is only supported on the .runar.ts surface "
+                    + "(issue #123); write the contract in TypeScript syntax");
+            }
+            if (EMBED_ALWAYS_DIRECTIVE.matcher(source).find()) {
+                throw new ParseException(
+                    "@embedAlways directive is only supported on the .runar.ts surface "
+                    + "(issue #109); write the contract in TypeScript syntax");
+            }
+        }
+
         try {
             if (lower.endsWith(".runar.java")) {
                 return JavaParser.parse(source, filename);

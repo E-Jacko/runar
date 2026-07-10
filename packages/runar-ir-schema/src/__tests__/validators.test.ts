@@ -146,6 +146,8 @@ describe('validateANF', () => {
                 count: 3,
                 body: [{ name: 'i0', value: { kind: 'load_const', value: 0 } }],
                 iterVar: 'i',
+                start: 0,
+                step: 1,
               },
             },
             { name: 't9', value: { kind: 'assert', value: 't3' } },

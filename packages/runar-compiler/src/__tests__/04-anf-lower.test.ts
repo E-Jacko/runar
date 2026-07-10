@@ -40,6 +40,21 @@ function bindingsOfKind(bindings: ANFBinding[], kind: string): ANFBinding[] {
   return bindings.filter(b => b.value.kind === kind);
 }
 
+/** Recursive variant: also descends into `if` branches and `loop` bodies. */
+function bindingsOfKindDeep(bindings: ANFBinding[], kind: string): ANFBinding[] {
+  const out: ANFBinding[] = [];
+  for (const b of bindings) {
+    if (b.value.kind === kind) out.push(b);
+    if (b.value.kind === 'if') {
+      out.push(...bindingsOfKindDeep(b.value.then, kind));
+      out.push(...bindingsOfKindDeep(b.value.else, kind));
+    } else if (b.value.kind === 'loop') {
+      out.push(...bindingsOfKindDeep(b.value.body, kind));
+    }
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -530,11 +545,13 @@ describe('Pass 4: ANF Lower', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Unsupported loop shapes: non-zero start, countdown (issue #121 reject path)
+  // Non-zero start and countdown loop shapes (issue #121)
   // ---------------------------------------------------------------------------
 
-  describe('unsupported loop shapes', () => {
-    it('throws for a loop with a non-zero start value', () => {
+  describe('non-zero-start and countdown loop shapes', () => {
+    type LoopVal = { kind: 'loop'; count: number; start: bigint; step: 1 | -1 };
+
+    it('lowers a loop with a non-zero start value (start=1, step=+1, count=3)', () => {
       const source = `
         class C extends SmartContract {
           readonly x: bigint;
@@ -548,10 +565,17 @@ describe('Pass 4: ANF Lower', () => {
           }
         }
       `;
-      expect(() => lowerSource(source)).toThrow(/must start at 0/);
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loops = bindingsOfKind(method.body, 'loop');
+      expect(loops.length).toBe(1);
+      const loop = loops[0]!.value as LoopVal;
+      expect(loop.start).toBe(1n);
+      expect(loop.step).toBe(1);
+      expect(loop.count).toBe(3);
     });
 
-    it('throws for a countdown loop', () => {
+    it('lowers a countdown loop (start=3, step=-1, count=3)', () => {
       const source = `
         class C extends SmartContract {
           readonly x: bigint;
@@ -565,10 +589,41 @@ describe('Pass 4: ANF Lower', () => {
           }
         }
       `;
-      expect(() => lowerSource(source)).toThrow(/[Cc]ountdown/);
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loops = bindingsOfKind(method.body, 'loop');
+      expect(loops.length).toBe(1);
+      const loop = loops[0]!.value as LoopVal;
+      expect(loop.start).toBe(3n);
+      expect(loop.step).toBe(-1);
+      expect(loop.count).toBe(3);
     });
 
-    it('still lowers a zero-start counting-up loop', () => {
+    it('lowers an inclusive countdown loop (start=3, step=-1, count=3)', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+          constructor(x: bigint) { super(x); this.x = x; }
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 3n; i >= 1n; i--) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loops = bindingsOfKind(method.body, 'loop');
+      expect(loops.length).toBe(1);
+      const loop = loops[0]!.value as LoopVal;
+      expect(loop.start).toBe(3n);
+      expect(loop.step).toBe(-1);
+      expect(loop.count).toBe(3);
+    });
+
+    it('still lowers a zero-start counting-up loop (start=0, step=+1, count=4)', () => {
       const source = `
         class C extends SmartContract {
           readonly x: bigint;
@@ -586,7 +641,42 @@ describe('Pass 4: ANF Lower', () => {
       const method = findMethod(program, 'm');
       const loops = bindingsOfKind(method.body, 'loop');
       expect(loops.length).toBe(1);
-      expect((loops[0]!.value as { kind: 'loop'; count: number }).count).toBe(4);
+      const loop = loops[0]!.value as LoopVal;
+      expect(loop.start).toBe(0n);
+      expect(loop.step).toBe(1);
+      expect(loop.count).toBe(4);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Param name shadowing a property (issue #130) — both resolution directions
+  // ---------------------------------------------------------------------------
+
+  describe('param name shadowing a property (#130)', () => {
+    const source = `
+      class C extends SmartContract {
+        readonly x: bigint;
+        constructor(x: bigint) { super(x); this.x = x; }
+        public m(x: bigint) {
+          assert(x === this.x);
+        }
+      }
+    `;
+
+    it('bare identifier `x` resolves to the param (load_param), not the property', () => {
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loadParams = bindingsOfKind(method.body, 'load_param')
+        .filter(b => (b.value as { name: string }).name === 'x');
+      expect(loadParams.length).toBe(1);
+    });
+
+    it('explicit `this.x` still resolves to the property (load_prop)', () => {
+      const program = lowerSource(source);
+      const method = findMethod(program, 'm');
+      const loadProps = bindingsOfKind(method.body, 'load_prop')
+        .filter(b => (b.value as { name: string }).name === 'x');
+      expect(loadProps.length).toBe(1);
     });
   });
 
@@ -668,9 +758,18 @@ describe('Pass 4: ANF Lower', () => {
       const computeOutputCall = calls.find(b => (b.value as { func: string }).func === 'computeStateOutput');
       expect(computeOutputCall).toBeDefined();
 
-      // Check that buildChangeOutput is called (builds P2PKH change output)
-      const buildChangeCall = calls.find(b => (b.value as { func: string }).func === 'buildChangeOutput');
+      // Check that buildChangeOutput is called (builds P2PKH change output).
+      // Issue #116: the change segment is now gated on `_changeAmount != 0`, so
+      // buildChangeOutput lives inside the then-branch of an `if` node.
+      const buildChangeCall = bindingsOfKindDeep(method.body, 'call')
+        .find(b => (b.value as { func: string }).func === 'buildChangeOutput');
       expect(buildChangeCall).toBeDefined();
+      // The change segment is a runtime conditional, not an unconditional cat.
+      const changeIf = bindingsOfKind(method.body, 'if').find(
+        b => bindingsOfKindDeep([b], 'call')
+          .some(c => (c.value as { func: string }).func === 'buildChangeOutput'),
+      );
+      expect(changeIf).toBeDefined();
 
       // Check that hash256 is called (hashes concatenated outputs)
       const hash256Call = calls.find(b => (b.value as { func: string }).func === 'hash256');
@@ -919,11 +1018,15 @@ describe('Pass 4: ANF Lower', () => {
       // the change output. Verify cat args reference data output binding.
       const addOutputRefs = bindingsOfKind(method.body, 'add_output').map(b => b.name);
       const dataOutputRefs = bindingsOfKind(method.body, 'add_data_output').map(b => b.name);
-      const changeBuilder = method.body.find(
-        b => b.value.kind === 'call' && (b.value as { func: string }).func === 'buildChangeOutput',
+      // Issue #116: the change segment is gated on `_changeAmount != 0`, so the
+      // continuation cats the `if` node's result (buildChangeOutput lives in its
+      // then-branch), not buildChangeOutput directly.
+      const changeIf = bindingsOfKind(method.body, 'if').find(
+        b => bindingsOfKindDeep([b], 'call')
+          .some(c => (c.value as { func: string }).func === 'buildChangeOutput'),
       );
-      expect(changeBuilder).toBeDefined();
-      const changeRef = changeBuilder!.name;
+      expect(changeIf).toBeDefined();
+      const changeRef = changeIf!.name;
 
       const cats = method.body.filter(
         b => b.value.kind === 'call' && (b.value as { func: string }).func === 'cat',

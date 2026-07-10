@@ -534,6 +534,33 @@ module RunarCompiler::Codegen
       "76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad"
     CHECK_PREIMAGE_BINDING_BYTES = [CHECK_PREIMAGE_BINDING_HEX].pack("H*")
 
+    # Byte offset (in the 760-byte binding blob) of the appended BIP-143 sighash
+    # flag byte. The blob ends with `...7c7e 01 41 7e 21 02 79be...` — `01` is
+    # OP_DATA_1, `41` is the flag byte (SIGHASH_ALL|FORKID), `7e` is OP_CAT that
+    # appends it to the derived DER signature. Issue #123 rewrites ONLY this one
+    # byte for a non-default @sighash mode; every other byte is byte-identical to
+    # the pinned cross-tier constant (matching the TS reference, whose procedural
+    # blob differs only in this appended flag byte).
+    SIGHASH_FLAG_BYTE_OFFSET = 723
+
+    # Return the check_preimage binding blob for a given BIP-143 sighash flag.
+    # For the default 0x41 (or nil) this is the pinned constant unchanged; for a
+    # non-default mode only the single appended sighash flag byte differs.
+    def self.check_preimage_binding_bytes(sighash_flag = nil)
+      return CHECK_PREIMAGE_BINDING_BYTES if sighash_flag.nil? || (sighash_flag & 0xff) == 0x41
+
+      # Fail loudly if the pinned blob ever changes such that the offset no
+      # longer points at the default 0x41 flag byte — otherwise a non-default
+      # mode would silently corrupt an unrelated opcode.
+      unless CHECK_PREIMAGE_BINDING_BYTES.getbyte(SIGHASH_FLAG_BYTE_OFFSET) == 0x41
+        raise "check_preimage binding blob changed: byte @#{SIGHASH_FLAG_BYTE_OFFSET} is not the 0x41 sighash flag"
+      end
+
+      bytes = CHECK_PREIMAGE_BINDING_BYTES.dup
+      bytes.setbyte(SIGHASH_FLAG_BYTE_OFFSET, sighash_flag & 0xff)
+      bytes.freeze
+    end
+
     # @param params [Array<String>, nil] initial stack parameter names
     # @param properties [Array<IR::ANFProperty>]
     def initialize(params, properties)
@@ -549,6 +576,27 @@ module RunarCompiler::Codegen
       @outer_protected_refs = nil
       @inside_branch = false
       @current_source_loc = nil
+
+      # #130 (stack layer): a method param whose name collides with a MUTABLE
+      # property gets a duplicate stackMap slot once deserialize_state pushes
+      # that property under the same name. Name lookups resolve to the
+      # shallowest match (the deserialized property), so load_param would read
+      # stale on-chain state instead of the witness value. Rename the colliding
+      # param's slot to a reserved, collision-proof name up front and remember
+      # the mapping so _lower_load_param targets the real param slot. Only
+      # mutable properties are deserialized onto the stack, so readonly shadows
+      # (handled purely by ANF resolution) never enter this map, and
+      # non-colliding contracts get an empty map -- byte-identical output.
+      @renamed_params = {}
+      mutable_prop_names = (properties || []).reject(&:readonly).map(&:name)
+      (params || []).each do |name|
+        next unless mutable_prop_names.include?(name)
+
+        renamed = "__param_#{name}"
+        @sm.rename_at_depth(@sm.find_depth(name), renamed)
+        @renamed_params[name] = renamed
+      end
+
       _track_depth
     end
 
@@ -1158,9 +1206,9 @@ module RunarCompiler::Codegen
       when "if"
         _lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
       when "loop"
-        _lower_loop(name, value.count, value.body, value.iter_var, binding_index, last_uses)
+        _lower_loop(name, value.count, value.body, value.iter_var, value.start, value.step, binding_index, last_uses)
       when "check_preimage"
-        _lower_check_preimage(name, value.preimage, binding_index, last_uses)
+        _lower_check_preimage(name, value.preimage, value.sighash_flag, binding_index, last_uses)
       when "deserialize_state"
         _lower_deserialize_state(value.preimage, binding_index, last_uses)
       when "add_output"
@@ -1226,9 +1274,13 @@ module RunarCompiler::Codegen
     # -----------------------------------------------------------------
 
     def _lower_load_param(binding_name, param_name, binding_index, last_uses)
-      if @sm.has?(param_name)
+      # The parameter is already on the stack under its original name -- or, for
+      # a param that shadows a mutable property, under a reserved renamed slot
+      # (#130) so it is not confused with the deserialized property slot.
+      slot_name = @renamed_params.fetch(param_name, param_name)
+      if @sm.has?(slot_name)
         is_last = _is_last_use(param_name, binding_index, last_uses)
-        bring_to_top(param_name, is_last)
+        bring_to_top(slot_name, is_last)
         @sm.pop
         @sm.push(binding_name)
       else
@@ -1257,14 +1309,29 @@ module RunarCompiler::Codegen
       elsif prop && !prop.initial_value.nil?
         _push_property_value(prop.initial_value)
       else
-        # Property value will be provided at deployment time; emit placeholder
-        param_index = 0
-        @properties.each do |p|
-          next if p.initial_value
-          if p.name == prop_name
-            break
+        # Property value will be provided at deployment time; emit placeholder.
+        # Initialized properties are excluded from the constructor, so the
+        # deploy-time slot index counts only non-initialized props.
+        ctor_props = @properties.reject { |p| p.initial_value }
+        param_index = ctor_props.find_index { |p| p.name == prop_name }
+        # #119 tail (H1): a property that reaches the placeholder fallback with
+        # no matching constructor slot (param_index nil) has no deploy-time
+        # bytes of its own. The previous behaviour coerced it onto slot 0 (the
+        # non-initialized-prop count), silently splicing an UNRELATED
+        # constructor argument's placeholder into the locking script -- a
+        # silent-wrong-code path. Fail loudly instead. (A real constructor-param
+        # property -- readonly or a mutable state field whose initial value is
+        # spliced at deploy -- has param_index >= 0 and is unaffected.)
+        if param_index.nil?
+          loc = ""
+          if @current_source_loc && !@current_source_loc.file.to_s.empty?
+            loc = " at #{@current_source_loc.file}:#{@current_source_loc.line}:#{@current_source_loc.column}"
           end
-          param_index += 1
+          raise "Stack lowering: property '#{prop_name}'#{loc} is neither on the stack, " \
+                "initialized, nor a constructor parameter, so it has no deploy-time " \
+                "slot. Refusing to emit a placeholder for an unrelated constructor " \
+                "argument (slot 0). Known constructor-param properties: " \
+                "[#{ctor_props.map(&:name).join(', ')}]."
         end
         emit_op({ op: "placeholder", param_index: param_index, param_name: prop_name })
       end
@@ -2001,9 +2068,13 @@ module RunarCompiler::Codegen
     # loop
     # -----------------------------------------------------------------
 
-    def _lower_loop(binding_name, count, body, iter_var, loop_binding_index = nil, enclosing_last_uses = nil)
+    def _lower_loop(binding_name, count, body, iter_var, start = 0, step = 1, loop_binding_index = nil, enclosing_last_uses = nil)
       body ||= []
       count ||= 0
+      # Iteration i binds iterVar = start + i*step (#121). Older ANF payloads
+      # without start/step describe zero-start counting-up loops.
+      start ||= 0
+      step ||= 1
 
       # Names (re)defined anywhere inside the loop body, nested branches
       # included. A name the body itself binds is NOT an outer ref --
@@ -2036,7 +2107,10 @@ module RunarCompiler::Codegen
       @local_bindings = new_local_bindings
 
       count.times do |i|
-        emit_push_int(i)
+        # Push the iteration variable value (in case the loop body uses it).
+        # Iteration i binds start + i*step (#121); zero-start counting-up loops
+        # (start=0, step=1) reduce to i, preserving byte-for-byte lowering.
+        emit_push_int(start + i * step)
         @sm.push(iter_var)
 
         lu = RunarCompiler::Codegen.compute_last_uses(body)
@@ -2883,7 +2957,7 @@ module RunarCompiler::Codegen
     # check_preimage (OP_PUSH_TX)
     # -----------------------------------------------------------------
 
-    def _lower_check_preimage(binding_name, preimage, binding_index, last_uses)
+    def _lower_check_preimage(binding_name, preimage, sighash_flag, binding_index, last_uses)
       # OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
       # current spending transaction. The signature is DERIVED FROM THE PREIMAGE
       # ON CHAIN (Optimal OP_PUSH_TX): s = (hash256(preimage) + r)*k^-1 mod n,
@@ -2902,9 +2976,12 @@ module RunarCompiler::Codegen
       bring_to_top(preimage, is_last)
 
       # Step 2: Derive + verify the signature on-chain (single opaque raw_bytes
-      # blob, byte-identical across all 7 tiers). Declared in=1/out=1 so the
-      # static analyzer keeps the depth consistent; net stack effect is zero.
-      emit_op({ op: "raw_bytes", raw_bytes: CHECK_PREIMAGE_BINDING_BYTES, in_arity: 1, out_arity: 1 })
+      # blob). For the default ALL|FORKID (sighash_flag nil/0x41) the blob is
+      # byte-identical to the pinned cross-tier constant; issue #123 lets a
+      # method declare a non-default mode, which only changes the appended
+      # sighash flag byte. Declared in=1/out=1 so the static analyzer keeps the
+      # depth consistent; net stack effect is zero.
+      emit_op({ op: "raw_bytes", raw_bytes: LoweringContext.check_preimage_binding_bytes(sighash_flag), in_arity: 1, out_arity: 1 })
 
       # Preimage remains on top. Rename for field extractors.
       @sm.pop

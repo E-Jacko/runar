@@ -502,6 +502,8 @@ def _fold_value(value: ANFValue, env: ConstEnv) -> ANFValue:
             count=value.count,
             body=folded_body,
             iter_var=value.iter_var,
+            start=value.start,
+            step=value.step,
         )
 
     if kind == "raw_script":
@@ -530,6 +532,8 @@ def _fold_method(method: ANFMethod) -> ANFMethod:
         params=list(method.params),
         body=folded_body,
         is_public=method.is_public,
+        # Issue #123: preserve the declared @sighash type through folding.
+        sighash_type=method.sighash_type,
     )
 
 

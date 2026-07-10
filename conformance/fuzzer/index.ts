@@ -42,6 +42,7 @@ import {
   type CompilerName as CanonCompilerName,
 } from './canonical-json-differential.js';
 import { runExecuteDifferential } from './execute-differential.js';
+import { runTriModalDifferential } from './tri-modal-differential.js';
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -86,6 +87,16 @@ interface FuzzerCLIOptions {
    * still pass the parity fuzzers).
    */
   execute: boolean;
+  /**
+   * Issue #124 — TRI-MODAL source-vs-script execution oracle in fast-check
+   * PROPERTY mode. Generates stateless contracts with loops + byte-ops +
+   * post-loop param reads, and runs every spend through the ANF interpreter,
+   * the hand-rolled ScriptVM, AND the upstream @bsv/sdk Spend engine, asserting
+   * all three agree. Unlike `--execute` (bi-modal, `fc.sample`, no shrinking),
+   * a divergence is SHRUNK to a minimal (contract, inputs) repro. `--num` =
+   * property runs; `--seed` reproduces the run.
+   */
+  triModal: boolean;
   /** Execution-oracle input vectors per (contract, method). Default 6. */
   inputs?: number;
   /** Wall-clock budget in ms (anf / execute modes). */
@@ -119,6 +130,7 @@ function parseArgs(argv: string[]): FuzzerCLIOptions {
     anf: false,
     canonical: false,
     execute: false,
+    triModal: false,
     foldOn: false,
   };
 
@@ -174,6 +186,9 @@ function parseArgs(argv: string[]): FuzzerCLIOptions {
         break;
       case '--execute':
         opts.execute = true;
+        break;
+      case '--tri-modal':
+        opts.triModal = true;
         break;
       case '--inputs':
         opts.inputs = parseInt(argv[++i] ?? '6', 10);
@@ -248,6 +263,16 @@ Options:
                          catches bugs where all 7 tiers agree on the SAME wrong
                          bytes. --num = contract count; --inputs = input vectors
                          per method; --seed reproduces the corpus AND the inputs.
+  --tri-modal            Issue #124 — TRI-MODAL execution oracle in fast-check
+                         PROPERTY mode. Generates stateless contracts with loops
+                         (non-zero start + countdown), substr/cat/len byte-ops
+                         over ByteString params, and post-loop param reads, then
+                         runs every spend through the ANF interpreter, the
+                         hand-rolled ScriptVM, AND the upstream @bsv/sdk Spend
+                         engine, asserting all three agree. Unlike --execute
+                         (bi-modal, fc.sample, no shrinking), a divergence is
+                         SHRUNK to a minimal (contract, inputs) repro. --num =
+                         property runs (~200 for the PR gate); --seed reproduces.
   --inputs <n>           Execute mode only. Input vectors per (contract, method)
                          (default 6).
   --time-budget-ms <n>   ANF / execute modes. Early-stop once wall-clock exceeded.
@@ -318,8 +343,39 @@ async function main(): Promise<void> {
       console.log(`  Budget: ${opts.timeBudgetMs}ms`);
     }
   }
+  if (opts.triModal) {
+    console.log('  Generator: tri-modal (issue #124 — interpreter / ScriptVM / @bsv/sdk Spend, property mode)');
+    console.log(`  Property runs: ${opts.num}`);
+  }
   console.log(`  Mode: ${opts.property ? 'property-based (with shrinking)' : 'sample-based'}`);
   console.log('');
+
+  if (opts.triModal) {
+    const report = await runTriModalDifferential({
+      numCases: opts.num,
+      seed: opts.seed,
+      findingsDir: opts.findingsDir,
+      verbose: opts.verbose,
+    });
+    console.log('');
+    console.log('Tri-modal source-vs-script execution fuzzing complete:');
+    console.log(`  Property runs: ${report.numRuns}`);
+    console.log(`  Result:        ${report.failed ? 'FAILED (divergence)' : 'all three engines agree'}`);
+    console.log(`  Duration:      ${report.durationMs}ms`);
+    console.log(`  Seed:          ${report.seed} (replay with --seed ${report.seed})`);
+    if (report.repro) console.log(`  Shrunk repro:  ${report.repro}`);
+    if (report.findings.length > 0) console.log(`  Findings dir:  ${report.findings[0]}`);
+    if (opts.output) {
+      writeOutput(opts.output, {
+        timestamp: new Date().toISOString(),
+        generator: 'tri-modal',
+        ...report,
+      });
+      console.log(`\nResults written to: ${opts.output}`);
+    }
+    if (report.failed) process.exit(1);
+    return;
+  }
 
   if (opts.execute) {
     const report = await runExecuteDifferential({

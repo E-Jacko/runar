@@ -4760,7 +4760,7 @@ theorem successAgrees_updateProp_consume_unconditional
       unfold List.findIdx?; simp [List.findIdx?.go]
     simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
       hLU_c0, hLU_c1, hF0, hF1, if_true]
-    have hNB : (op == "!==" && none == some "bytes") = false := by
+    have hNB : (op == "!==") = false := by
       rcases hEmit with h | h <;> subst h <;> rfl
     simp only [hNB, Bool.false_eq_true, if_false, List.append_assoc, List.cons_append,
       List.nil_append, Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push]
@@ -5030,7 +5030,7 @@ theorem updatePropConsume_RAW_eq (progMethods : List ANFMethod)
       unfold List.findIdx?; simp [List.findIdx?.go]
     simp only [Stack.Lower.listContains, List.any_nil, Bool.not_false, Bool.true_and,
       hLU_c0, hLU_c1, hF0, hF1, if_true]
-    have hNB : (op == "!==" && none == some "bytes") = false := by
+    have hNB : (op == "!==") = false := by
       rcases hOp with h | h <;> subst h <;> rfl
     simp only [hNB, Bool.false_eq_true, if_false, List.cons_append,
       List.nil_append, Stack.Lower.StackMap.popN, Stack.Lower.StackMap.push]

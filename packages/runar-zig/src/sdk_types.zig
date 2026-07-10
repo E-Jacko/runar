@@ -69,6 +69,11 @@ pub const TxOutput = struct {
 pub const DeployOptions = struct {
     satoshis: i64,
     change_address: ?[]const u8 = null,
+    /// Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+    /// are owned by a different key than the connected deploy signer, set this so
+    /// the funding inputs are signed by their real owner. Defaults to the
+    /// connected signer (zero behaviour change).
+    funding_signer: ?@import("sdk_signer.zig").Signer = null,
 };
 
 /// CallOptions specifies options for calling a contract method.
@@ -107,6 +112,16 @@ pub const CallOptions = struct {
     /// `terminal_outputs` + fee. Ignored unless `terminal_outputs` is
     /// non-null. Each UTXO is signed with the configured signer's key.
     funding_utxos: ?[]const UTXO = null,
+    /// A single plain P2PKH UTXO added to a terminal call tx purely to pay the
+    /// miner fee (issue #118). A true terminal method pays out the full contract
+    /// balance, so fee would be 0 and ARC rejects; the covenant asserts its exact
+    /// output set, so no change output can absorb a fee. The fee input is added
+    /// BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers it) and
+    /// is consumed entirely as fee — no change output is created. Signed with
+    /// `funding_signer ?? signer` (composes with #134). Merges into the same
+    /// terminal P2PKH funding-input path as `funding_utxos`; the covenant's
+    /// output assertions are untouched.
+    fee_utxo: ?UTXO = null,
     /// Additional contract UTXOs to include as inputs (e.g. `merge` on a
     /// fungible token spends two contract UTXOs into one). Each entry is
     /// unlocked with the same method + arg shape as the primary call;
@@ -127,6 +142,26 @@ pub const CallOptions = struct {
     /// Threaded through every call-tx build site (stateless, stateful,
     /// rebuild, terminal).
     locktime: ?u32 = null,
+    /// Override the nSequence written onto EVERY input of the call tx (issue
+    /// #131). Zero-config: when `locktime` is set and non-zero, sequence defaults
+    /// to 0xfffffffe (non-final, so consensus actually enforces nLockTime);
+    /// otherwise it stays 0xffffffff (final, legacy). Set explicitly only for RBF
+    /// or custom relative-locktime scenarios. Threaded through the non-terminal
+    /// and terminal call-tx build sites.
+    sequence: ?u32 = null,
+    /// Signer for the P2PKH funding (and terminal fee) inputs (issue #134). When
+    /// the funding/fee UTXOs are owned by a different key than the connected
+    /// method signer, set this so those inputs are signed by their real owner.
+    /// The method's own `Sig` args are still signed by the connected signer.
+    /// Defaults to the connected signer (zero behaviour change).
+    funding_signer: ?@import("sdk_signer.zig").Signer = null,
+    /// Cap the number of P2PKH funding inputs added to a non-terminal call tx
+    /// (issue #133). Funding is chosen by smallest-sufficient, largest-first
+    /// selection (the same selectUtxos strategy deploy uses). If covering the
+    /// outputs + fee would need more than this many inputs, the call fails
+    /// (InsufficientFunds) rather than silently sweeping the wallet. null → no
+    /// cap.
+    max_funding_inputs: ?usize = null,
 };
 
 /// OutputSpec describes one continuation output for a multi-output method.
@@ -397,6 +432,10 @@ pub const ABIMethod = struct {
     is_terminal: ?bool = null,
     /// Unlocking script is prefixed with _codePart (issue #100).
     uses_code_part: ?bool = null,
+    /// The BIP-143 sighash type this method's preimage is built under (from a
+    /// `@sighash` directive, issue #123), e.g. 0x43 for SINGLE|FORKID. Absent =
+    /// default ALL|FORKID (0x41).
+    sig_hash_type: ?i64 = null,
 
     pub fn deinit(self: *ABIMethod, allocator: std.mem.Allocator) void {
         if (self.name.len > 0) allocator.free(self.name);
@@ -420,6 +459,9 @@ pub const ABIMethod = struct {
         }
         if (obj.get("usesCodePart")) |v| {
             if (v == .bool) method.uses_code_part = v.bool;
+        }
+        if (obj.get("sigHashType")) |v| {
+            if (v == .integer) method.sig_hash_type = v.integer;
         }
         if (obj.get("params")) |params_val| {
             if (params_val == .array) {
@@ -591,6 +633,15 @@ pub const StateValue = union(enum) {
     /// constructing such a field. Leaves may only be scalar StateValues; the
     /// flatten/regroup helpers in `sdk_state.zig` walk the tree linearly.
     array_value: []const StateValue,
+    /// Issue #106: the producer-side EmptySig marker for the deliberately-empty
+    /// branch of an OR-CHECKSIG method — `checkSig(sigA, pkA) || checkSig(sigB,
+    /// pkB)`, where `||` lowers to the non-lazy OP_BOOLOR so BOTH OP_CHECKSIGs
+    /// run. Only the matching branch supplies a real signature; the failing
+    /// branch MUST push an empty signature (OP_0) or BIP146 NULLFAIL rejects the
+    /// whole spend. Distinct from `.int = 0` (the auto-sign sentinel), so the
+    /// auto-sign collectors never treat it as auto-sign and never sign it —
+    /// `encodeArg` emits OP_0 (00) for it. See `EMPTY_SIG`.
+    empty_sig,
 
     pub fn deinit(self: StateValue, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -610,6 +661,7 @@ pub const StateValue = union(enum) {
             .big_int => |s| .{ .big_int = try allocator.dupe(u8, s) },
             .boolean => |b| .{ .boolean = b },
             .bytes => |b| .{ .bytes = try allocator.dupe(u8, b) },
+            .empty_sig => .empty_sig,
             .array_value => |items| blk: {
                 var copy = try allocator.alloc(StateValue, items.len);
                 for (items, 0..) |it, i| copy[i] = try it.clone(allocator);
@@ -618,6 +670,12 @@ pub const StateValue = union(enum) {
         };
     }
 };
+
+/// Issue #106: the EmptySig marker value. Pass as the call arg for the
+/// non-matching Sig slot of an OR-CHECKSIG method: the SDK pushes OP_0 for it
+/// and never signs it, distinct from `.int = 0` (auto-sign) and an explicit
+/// hex-bytes value. Wire-byte parity with the TS SDK (which encodes "00").
+pub const EMPTY_SIG: StateValue = .empty_sig;
 
 // ---------------------------------------------------------------------------
 // PreparedCall — deferred-signing handoff for multi-signer flows

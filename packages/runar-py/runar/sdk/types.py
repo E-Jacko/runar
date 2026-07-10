@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Union
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    from runar.sdk.signer import Signer
 
 
 @dataclass
@@ -63,6 +66,10 @@ class AbiMethod:
     is_terminal: bool | None = None
     # Unlocking script is prefixed with _codePart (issue #100).
     uses_code_part: bool | None = None
+    # Issue #123: BIP-143 sighash type this method's preimage/covenant is built
+    # under (from a @sighash directive), e.g. 0x43 for SINGLE|FORKID. ``None`` =
+    # default ALL|FORKID (0x41); the SDK falls back to 0x41.
+    sig_hash_type: int | None = None
 
 
 @dataclass
@@ -148,6 +155,7 @@ class RunarArtifact:
                 is_public=m.get('isPublic', True),
                 is_terminal=m.get('isTerminal'),
                 uses_code_part=m.get('usesCodePart'),
+                sig_hash_type=m.get('sigHashType'),
             )
             for m in abi_raw.get('methods', [])
         ]
@@ -190,6 +198,11 @@ class DeployOptions:
     """Options for deploying a contract."""
     satoshis: int = 10000
     change_address: str = ''
+    # Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+    # are owned by a different key than the connected deploy signer, set this
+    # so the funding inputs are signed by their real owner. Defaults to the
+    # connected signer (zero behaviour change).
+    funding_signer: 'Signer | None' = None
 
 
 @dataclass
@@ -232,6 +245,32 @@ class CallOptions:
     # extractLocktime(preimage) >= deadline (e.g. auction close/claim).
     # Threaded through both the non-terminal and terminal call-tx build sites.
     locktime: int | None = None
+    # Override the nSequence written onto EVERY input of the call tx (issue
+    # #131). None → 0xfffffffe when locktime is set and non-zero (so consensus
+    # actually enforces nLockTime); otherwise 0xffffffff (final, legacy). Set
+    # explicitly only for RBF or custom relative-locktime scenarios. Threaded
+    # through the non-terminal and terminal call-tx build sites.
+    sequence: int | None = None
+    # Cap the number of P2PKH funding inputs added to a non-terminal call tx
+    # (issue #133). Funding is chosen by smallest-sufficient, largest-first
+    # selection (the same select_utxos strategy deploy uses). If covering the
+    # outputs + fee would need more than this many inputs, the call raises
+    # rather than silently sweeping the wallet. None → no cap.
+    max_funding_inputs: int | None = None
+    # A single plain P2PKH UTXO added to a terminal call tx purely to pay the
+    # miner fee (issue #118). A true terminal method pays out the full contract
+    # balance, so fee would be 0 and ARC rejects; the covenant asserts its
+    # exact output set, so no change output can absorb a fee. The fee input is
+    # added BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers
+    # it) and is consumed entirely as fee -- no change output is created.
+    # Signed with funding_signer or signer.
+    fee_utxo: Utxo | None = None
+    # Signer for the P2PKH funding (and terminal fee) inputs (issue #134). When
+    # the funding/fee UTXOs are owned by a different key than the connected
+    # method signer, set this so those inputs are signed by their real owner.
+    # The method's own Sig args are still signed by the connected signer.
+    # Defaults to the connected signer (zero behaviour change).
+    funding_signer: 'Signer | None' = None
 
 
 @dataclass

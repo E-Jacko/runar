@@ -488,6 +488,9 @@ fn foldValue(allocator: Allocator, value: ANFValue, env: *ConstEnv) anyerror!ANF
                 .count = loop_node.count,
                 .body = folded_body,
                 .iter_var = loop_node.iter_var,
+                // Issue #121: preserve the iterator start value / step direction.
+                .start = loop_node.start,
+                .step = loop_node.step,
             };
             return .{ .loop = new_loop };
         },
@@ -550,6 +553,8 @@ pub fn foldMethod(allocator: Allocator, method: ANFMethod) !ANFMethod {
         .params = method.params,
         .bindings = method.bindings,
         .body = folded_body,
+        // #123: preserve the in-memory @sighash carrier across the rebuild.
+        .sighash_type = method.sighash_type,
     };
 }
 

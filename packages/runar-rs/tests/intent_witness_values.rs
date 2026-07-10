@@ -58,6 +58,7 @@ fn make_intent_artifact(prev_out_inputs: &[usize], serialised: bool) -> RunarArt
                 params,
                 is_public: true,
                 is_terminal: None, uses_code_part: None,
+                sig_hash_type: None,
             }],
         },
         script: "51".to_string(),
@@ -93,6 +94,7 @@ fn deploy_helper(
     contract.deploy(&mut provider, &signer, &DeployOptions {
         satoshis: 50_000,
         change_address: None,
+        funding_signer: None,
     }).unwrap();
     // Funding UTXO for the call
     provider.add_utxo(&address, Utxo {

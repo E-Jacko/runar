@@ -208,10 +208,48 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 		IsPublic: false,
 	})
 
+	// Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+	// must survive DCE into the locking script. A readonly field no method
+	// references lowers to no load_prop, so no constructor slot is emitted and
+	// the field's deploy-time bytes vanish. We inject a load_prop + a `@ref:`
+	// alias (the exact shape the `const _bind = this.field;` idiom produces)
+	// into the FIRST public method's body — the alias keeps the load_prop alive
+	// through dead-binding DCE, and stack lowering threads the pushed value
+	// through and cleans it up at method end. One slot in the deployed script
+	// suffices; every spending branch shares it.
+	var embedFields []PropertyNode
+	for _, p := range contract.Properties {
+		if p.Readonly && p.EmbedAlways {
+			embedFields = append(embedFields, p)
+		}
+	}
+	embedInjected := false
+
 	// Lower each method (including private methods as separate entries)
 	for _, method := range contract.Methods {
 		methodCtx := newLowerCtxWithEffects(contract, sideEffects)
 		methodCtx.setMethodParamTypes(method.Params)
+
+		// Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+		// flag for any checkPreimage (auto-injected below, or a manual call) in
+		// this method, and rides on the ANF method as a carrier the artifact
+		// assembler copies to ABIMethod.SigHashType (omitted for the default).
+		var methodSigHash *int
+		if method.SighashType != nil && *method.SighashType != SighashDefault {
+			methodCtx.sighashFlag = method.SighashType
+			methodSigHash = method.SighashType
+		}
+
+		// Register the declared param NAMES so a bare identifier resolves to
+		// load_param before falling through to load_prop (issue #130). Without
+		// this, a param whose name collides with a mutable state property
+		// lowered to the stale deserialized property value instead of the
+		// witness param. Explicit `this.x` is unaffected: it lowers via
+		// lowerMemberExpr / the property_access isProperty branch, which always
+		// emit load_prop regardless of param registration.
+		for _, p := range method.Params {
+			methodCtx.addParam(p.Name)
+		}
 
 		if contract.ParentClass == "StatefulSmartContract" && method.Visibility == "public" {
 			// Continuation requirements come from the side-effect summary,
@@ -234,21 +272,35 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			}
 			methodCtx.addParam("txPreimage", "SigHashPreimage")
 
-			// Inject checkPreimage(txPreimage) at the start
+			// Issue #123: the declared per-method sighash mode (default
+			// ALL|FORKID). Drives BOTH the OP_PUSH_TX binding flag (so the
+			// derived sig re-computes the tx sighash under this mode) AND the
+			// runtime preimage-type assert.
+			sighashMode := SighashDefault
+			if method.SighashType != nil {
+				sighashMode = *method.SighashType
+			}
+			isDefaultSighash := sighashMode == SighashDefault
+
+			// Inject checkPreimage(txPreimage) at the start.
 			preimageRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
-			checkResult := methodCtx.emit(ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef})
+			checkPre := ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef}
+			// Omit for the default so the ANF (and pinned binding blob) is unchanged.
+			if !isDefaultSighash {
+				checkPre.SighashFlag = sighashMode
+			}
+			checkResult := methodCtx.emit(checkPre)
 			methodCtx.emit(makeAssert(checkResult))
 
-			// GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-			// auto-injected covenant cannot be spent under a permissive sighash
-			// flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
-			// a contract may read. The hashOutputs continuation already fails
-			// under non-ALL flags, so this is a no-op on spendability for
-			// continuation-using methods and closes the field-zeroing exposure
-			// for the rest.
+			// GAP-302 / #123: pin the sighash type to the declared mode. Without
+			// this check the spend could use a DIFFERENT sighash flag than
+			// declared that zeroes out preimage fields the contract (or its
+			// continuation) relies on (hashOutputs / hashPrevouts / hashSequence).
+			// The value defaults to 0x41 (SIGHASH_ALL|FORKID) so existing
+			// contracts emit byte-identical ANF.
 			sigHashPreimageRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
 			sigHashTypeRef := methodCtx.emit(makeCall("extractSigHashType", []string{sigHashPreimageRef}))
-			expectedSigHashRef := methodCtx.emit(makeLoadConstInt(big.NewInt(0x41)))
+			expectedSigHashRef := methodCtx.emit(makeLoadConstInt(big.NewInt(int64(sighashMode))))
 			sigHashOkRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: sigHashTypeRef, Right: expectedSigHashRef})
 			methodCtx.emit(makeAssert(sigHashOkRef))
 
@@ -265,6 +317,14 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			if hasStateProp {
 				preimageRef3 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
 				methodCtx.emit(ir.ANFValue{Kind: "deserialize_state", Preimage: preimageRef3})
+			}
+
+			// Issue #109: preserve @embedAlways fields at the first user-statement
+			// position (after the checkPreimage/deserialize preamble), mirroring
+			// where a `const _bind = this.field;` idiom would sit.
+			if !embedInjected && len(embedFields) > 0 {
+				emitEmbedAlwaysPreservation(methodCtx, embedFields)
+				embedInjected = true
 			}
 
 			// Lower the developer's method body
@@ -295,10 +355,33 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			// param injection. Both must agree or the deployed locking
 			// script will not match the auto-injected parameter list.
 			if needsChangeOutput {
-				// Build the P2PKH change output for hashOutputs verification
+				// Build the P2PKH change output for hashOutputs verification.
+				//
+				// Issue #116: the SDK's BuildCallTransaction OMITS the change
+				// output when `change <= 0` (an exact-cover call) and passes
+				// `_changeAmount = 0`. Gate the change segment on `_changeAmount
+				// != 0` at runtime so the hashed output set matches the SDK at
+				// the exact-zero boundary — the segment is the P2PKH change
+				// output when non-zero, and empty bytes (cat with empty is a
+				// no-op) when zero, reproducing the omission. For any change > 0
+				// the hashed bytes are unchanged; only the emitted script gains
+				// the guard.
 				changePKHRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "_changePKH"})
 				changeAmountRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "_changeAmount"})
-				changeOutputRef := methodCtx.emit(makeCall("buildChangeOutput", []string{changePKHRef, changeAmountRef}))
+				zeroRef := methodCtx.emit(makeLoadConstInt(big.NewInt(0)))
+				changeNonZeroRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "!==", Left: changeAmountRef, Right: zeroRef})
+				changeThenCtx := methodCtx.subContext()
+				changeThenCtx.emit(makeCall("buildChangeOutput", []string{changePKHRef, changeAmountRef}))
+				methodCtx.syncCounter(changeThenCtx)
+				changeElseCtx := methodCtx.subContext()
+				changeElseCtx.emit(makeLoadConstString(""))
+				methodCtx.syncCounter(changeElseCtx)
+				changeOutputRef := methodCtx.emit(ir.ANFValue{
+					Kind: "if",
+					Cond: changeNonZeroRef,
+					Then: changeThenCtx.bindings,
+					Else: changeElseCtx.bindings,
+				})
 
 				if len(addOutputRefs) > 0 {
 					// Multi-output continuation: concat all state outputs, then
@@ -365,12 +448,20 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			augmentedParams = append(augmentedParams, methodCtx.methodScope.autoInjectedParams...)
 
 			result = append(result, ir.ANFMethod{
-				Name:     method.Name,
-				Params:   augmentedParams,
-				Body:     methodCtx.bindings,
-				IsPublic: true,
+				Name:        method.Name,
+				Params:      augmentedParams,
+				Body:        methodCtx.bindings,
+				IsPublic:    true,
+				SigHashType: methodSigHash,
 			})
 		} else {
+			// Issue #109: stateless public methods (and stateless contracts'
+			// spending entry points) are lowered here — inject @embedAlways
+			// preservation into the first PUBLIC one before its body.
+			if !embedInjected && len(embedFields) > 0 && method.Visibility == "public" {
+				emitEmbedAlwaysPreservation(methodCtx, embedFields)
+				embedInjected = true
+			}
 			methodCtx.lowerStatements(method.Body)
 			augmented := lowerParams(method.Params)
 			// Private methods can also call the intent intrinsics; capture
@@ -383,15 +474,32 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 			// is still informative for non-inlined callees.)
 			augmented = append(augmented, methodCtx.methodScope.autoInjectedParams...)
 			result = append(result, ir.ANFMethod{
-				Name:     method.Name,
-				Params:   augmented,
-				Body:     methodCtx.bindings,
-				IsPublic: method.Visibility == "public",
+				Name:        method.Name,
+				Params:      augmented,
+				Body:        methodCtx.bindings,
+				IsPublic:    method.Visibility == "public",
+				SigHashType: methodSigHash,
 			})
 		}
 	}
 
 	return result
+}
+
+// emitEmbedAlwaysPreservation emits the DCE-surviving preservation pair for
+// each `@embedAlways` readonly field into the given (public) method context
+// (issue #109). Reproduces exactly what a hand-written `const _bind =
+// this.field;` lowers to: a load_prop followed by a load_const("@ref:<t>")
+// alias. The alias marks the load_prop as referenced (see dce.go), so
+// dead-binding DCE keeps it; stack lowering then emits the field's
+// constructor-slot placeholder and NIPs the unused value off the stack at
+// method end. The field's bytes therefore remain in the deployed locking
+// script for downstream recovery.
+func emitEmbedAlwaysPreservation(ctx *lowerCtx, fields []PropertyNode) {
+	for _, field := range fields {
+		loadRef := ctx.emit(ir.ANFValue{Kind: "load_prop", Name: field.Name})
+		ctx.emitNamed("__embedAlways_"+field.Name, makeLoadConstString("@ref:"+loadRef))
+	}
 }
 
 func lowerParams(params []ParamNode) []ir.ANFParam {
@@ -445,6 +553,12 @@ type lowerCtx struct {
 	// the intrinsic is called from the method's top-level body or from
 	// inside a nested block (if/else, ternary). See methodScopeT.
 	methodScope *methodScopeT
+	// sighashFlag is the declared non-default `@sighash` flag for the method
+	// being lowered (issue #123), so a MANUAL checkPreimage(pre) call binds
+	// under the same mode as the method's declared sighash. nil = default
+	// ALL|FORKID, keeping the pinned binding blob unchanged. Propagated into
+	// sub-contexts so a manual call inside an if/for body picks it up.
+	sighashFlag *int
 }
 
 // methodScopeT holds per-method bookkeeping shared by parent and
@@ -704,6 +818,7 @@ func (ctx *lowerCtx) subContext() *lowerCtx {
 		localAliases:     make(map[string]string),
 		localByteVars:    make(map[string]bool),
 		methodScope:      ctx.methodScope, // shared pointer — auto-injection registers propagate up
+		sighashFlag:      ctx.sighashFlag, // #123: nested manual checkPreimage inherits the method's mode
 	}
 	// Share local name set
 	for k := range ctx.localNames {
@@ -976,7 +1091,10 @@ func appendBranchOutputConcat(branchCtx *lowerCtx) string {
 }
 
 func (ctx *lowerCtx) lowerForStatement(stmt ForStmt) {
-	count := extractLoopCount(stmt)
+	// Resolve the loop's compile-time shape: start value, step direction, and
+	// iteration count. Rúnar requires bounded loops, so all three must be
+	// statically determinable (issue #121).
+	start, step, count := extractLoopShape(stmt)
 
 	// Lower body into sub-context
 	bodyCtx := ctx.subContext()
@@ -984,58 +1102,107 @@ func (ctx *lowerCtx) lowerForStatement(stmt ForStmt) {
 	ctx.syncCounter(bodyCtx)
 
 	ctx.emit(ir.ANFValue{
-		Kind:    "loop",
-		Count:   count,
-		Body:    bodyCtx.bindings,
-		IterVar: stmt.Init.Name,
+		Kind:     "loop",
+		Count:    count,
+		Body:     bodyCtx.bindings,
+		IterVar:  stmt.Init.Name,
+		Start:    start,
+		StartRaw: bigIntStartRaw(start),
+		Step:     step,
 	})
 }
 
-// extractLoopCount returns the iteration count for a for-loop.
+// extractLoopShape resolves a for-statement's compile-time loop shape (issue
+// #121): the iterator start value, step direction (+1/-1), and iteration count.
 //
-// The ANF loop node carries only the count — no start value or step
-// direction — so lowering (and the ANF interpreter) always iterates
-// i = 0..count-1. Loop shapes that representation cannot express are
-// rejected here (mirroring the source-located errors in the validate pass)
-// rather than silently compiled as a zero-start counting-up loop. In the
-// normal pipeline the validate pass rejects these first; these panics guard
-// callers that lower without validating.
-func extractLoopCount(stmt ForStmt) int {
-	// A countdown loop necessarily also has a non-zero start, so check the
-	// condition direction first — it is the more precise diagnosis.
+// Supports counting-up and counting-down loops:
+//
+//	for (let i = 0n; i < 10n; i++)  -> start 0, step +1, count 10
+//	for (let i = 1n; i <= 3n; i++)  -> start 1, step +1, count 3
+//	for (let i = 3n; i > 0n; i--)   -> start 3, step -1, count 3
+//	for (let i = 3n; i >= 1n; i--)  -> start 3, step -1, count 3
+//
+// The loop is unrolled `count` times; on iteration i the iterator holds
+// `start + i*step`. Start and bound must be compile-time integer literals; in
+// the normal pipeline the validate pass rejects non-literal bounds first, so
+// these panics guard callers that lower without validating.
+func extractLoopShape(stmt ForStmt) (*big.Int, int, int) {
+	start := extractBigIntValue(stmt.Init.Init)
+	if start == nil {
+		panic("Cannot determine loop start at compile time. For-loop iterators must start at an integer literal.")
+	}
+
+	bin, ok := stmt.Condition.(BinaryExpr)
+	if !ok {
+		panic("Cannot determine loop bound at compile time. For-loop bounds must be integer literals.")
+	}
+	bound := extractBigIntValue(bin.Right)
+	if bound == nil {
+		panic("Cannot determine loop bound at compile time. For-loop bounds must be integer literals.")
+	}
+
+	step := extractLoopStep(stmt)
+
+	// Count = number of iterations before the condition first turns false.
+	var count *big.Int
+	if step == 1 {
+		switch bin.Op {
+		case "<":
+			count = new(big.Int).Sub(bound, start)
+		case "<=":
+			count = new(big.Int).Add(new(big.Int).Sub(bound, start), big.NewInt(1))
+		default:
+			panic(fmt.Sprintf("For loop counting up (i++) must use '<' or '<=' (got '%s').", bin.Op))
+		}
+	} else {
+		switch bin.Op {
+		case ">":
+			count = new(big.Int).Sub(start, bound)
+		case ">=":
+			count = new(big.Int).Add(new(big.Int).Sub(start, bound), big.NewInt(1))
+		default:
+			panic(fmt.Sprintf("For loop counting down (i--) must use '>' or '>=' (got '%s').", bin.Op))
+		}
+	}
+
+	n := 0
+	if count.Sign() > 0 {
+		n = int(count.Int64())
+	}
+	return start, step, n
+}
+
+// extractLoopStep determines the iterator step direction (+1/-1) from the
+// for-statement's update clause, falling back to the condition direction. Only
+// unit steps are supported (issue #121).
+func extractLoopStep(stmt ForStmt) int {
+	if u, ok := stmt.Update.(ExpressionStmt); ok {
+		switch u.Expr.(type) {
+		case IncrementExpr:
+			return 1
+		case DecrementExpr:
+			return -1
+		}
+	}
+	// Fall back to the comparison direction for other unit-step spellings
+	// (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
 	if bin, ok := stmt.Condition.(BinaryExpr); ok {
 		if bin.Op == ">" || bin.Op == ">=" {
-			panic("For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead.")
+			return -1
 		}
 	}
+	return 1
+}
 
-	startVal := extractBigIntValue(stmt.Init.Init)
-
-	if startVal != nil && startVal.Sign() != 0 {
-		panic(fmt.Sprintf("For loop iterator must start at 0 (got %sn) — loops compile to i = 0..count-1; offset the iterator inside the body instead.", startVal.String()))
+// bigIntStartRaw encodes a loop iterator start value into the raw JSON form the
+// loop ANF node emits (issue #121), mirroring the load_const bigint encoding.
+func bigIntStartRaw(val *big.Int) json.RawMessage {
+	if val.IsInt64() {
+		raw, _ := json.Marshal(val.Int64())
+		return raw
 	}
-
-	if bin, ok := stmt.Condition.(BinaryExpr); ok {
-		boundVal := extractBigIntValue(bin.Right)
-		if boundVal != nil {
-			bound := int(boundVal.Int64())
-			switch bin.Op {
-			case "<":
-				if bound < 0 {
-					return 0
-				}
-				return bound
-			case "<=":
-				v := bound + 1
-				if v < 0 {
-					return 0
-				}
-				return v
-			}
-		}
-	}
-
-	return 0
+	raw, _ := json.Marshal(val.String() + "n")
+	return raw
 }
 
 func extractBigIntValue(expr Expression) *big.Int {
@@ -1074,7 +1241,15 @@ func (ctx *lowerCtx) lowerExprToRef(expr Expression) string {
 		return ctx.lowerIdentifier(e)
 
 	case PropertyAccessExpr:
-		// this.txPreimage in StatefulSmartContract -> load_param (it's an implicit param, not a stored property)
+		// Explicit `this.x`: a real contract property always wins, even when a
+		// method param shares the name (issue #130). Now that declared params
+		// are registered, the isParam branch below must not shadow a stored
+		// property.
+		if ctx.isProperty(e.Property) {
+			return ctx.emit(ir.ANFValue{Kind: "load_prop", Name: e.Property})
+		}
+		// this.txPreimage in StatefulSmartContract -> load_param (it's an
+		// implicit injected param, not a stored property).
 		if ctx.isParam(e.Property) {
 			return ctx.emit(ir.ANFValue{Kind: "load_param", Name: e.Property})
 		}
@@ -1232,7 +1407,12 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 	if id, ok := callee.(Identifier); ok && id.Name == "checkPreimage" {
 		if len(e.Args) >= 1 {
 			preimageRef := ctx.lowerExprToRef(e.Args[0])
-			return ctx.emit(ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef})
+			cp := ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef}
+			// Issue #123: honour the method's declared @sighash on manual calls.
+			if ctx.sighashFlag != nil {
+				cp.SighashFlag = *ctx.sighashFlag
+			}
+			return ctx.emit(cp)
 		}
 	}
 

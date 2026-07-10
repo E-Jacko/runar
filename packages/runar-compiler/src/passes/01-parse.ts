@@ -25,6 +25,7 @@ import type {
   MethodDeclaration,
   ConstructorDeclaration,
   ParameterDeclaration,
+  PropertyDeclaration,
 } from 'ts-morph';
 
 import type {
@@ -55,6 +56,7 @@ import { parseRustSource } from './01-parse-rust.js';
 import { parseRubySource } from './01-parse-ruby.js';
 import { parseZigSource } from './01-parse-zig.js';
 import { parseJavaSource } from './01-parse-java.js';
+import { extractSighashDirective } from './sighash-directive.js';
 import { OPCODES } from './06-emit.js';
 import {
   encodePushBigIntHex,
@@ -69,6 +71,53 @@ import {
 export interface ParseResult {
   contract: ContractNode | null;
   errors: CompilerDiagnostic[];
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed directive guard (issues #123 / #109)
+// ---------------------------------------------------------------------------
+
+// The author-facing comment directives `@sighash <FLAGS>` (#123, per-method
+// sighash type) and `@embedAlways` (#109, readonly-field DCE opt-out) are
+// honoured ONLY on the TypeScript (.runar.ts) surface below — the default
+// branch reads leading trivia / JSDoc. The eight non-TS surface parsers this
+// compiler dispatches to (.sol/.move/.py/.go/.rs/.rb/.zig/.java) ignore
+// comments, so a directive in one of those sources would be silently dropped
+// and change signing / DCE semantics. Fail closed on those formats rather than
+// miscompile — this matches the Go/Rust/Python/Zig/Ruby/Java tiers. No
+// conformance fixture uses either directive, so this has zero golden impact.
+// Word-boundary anchored (matching the `/@sighash\b/` / `/@embedAlways\b/`
+// scans used to detect the directives) so an identifier like `sighashType`
+// does not trip the guard.
+const SIGHASH_DIRECTIVE_RE = /@sighash\b/;
+const EMBED_ALWAYS_DIRECTIVE_RE = /@embedAlways\b/;
+
+// Extension → human-readable surface name for the diagnostic. `.runar.ts` is
+// intentionally absent: the default branch implements the directives.
+const NON_TS_SURFACES: ReadonlyArray<readonly [string, string]> = [
+  ['.runar.sol', 'Solidity'],
+  ['.runar.move', 'Move'],
+  ['.runar.py', 'Python'],
+  ['.runar.go', 'Go DSL'],
+  ['.runar.rs', 'Rust'],
+  ['.runar.rb', 'Ruby'],
+  ['.runar.zig', 'Zig'],
+  ['.runar.java', 'Java'],
+];
+
+/**
+ * Return a fail-closed diagnostic message when `source` carries a `@sighash`
+ * (#123) or `@embedAlways` (#109) directive on a non-TS surface whose parser
+ * ignores comments (so the directive would be silently dropped), else null.
+ */
+function unsupportedDirectiveError(source: string, surfaceName: string): string | null {
+  if (SIGHASH_DIRECTIVE_RE.test(source)) {
+    return `@sighash directive (issue #123) is not supported by the ${surfaceName} surface parser; write the contract in TypeScript (.runar.ts) where @sighash is honoured`;
+  }
+  if (EMBED_ALWAYS_DIRECTIVE_RE.test(source)) {
+    return `@embedAlways directive (issue #109) is not supported by the ${surfaceName} surface parser; write the contract in TypeScript (.runar.ts) where @embedAlways is honoured`;
+  }
+  return null;
 }
 
 /**
@@ -93,6 +142,22 @@ export function parse(source: string, fileName?: string): ParseResult {
       `parse: source exceeds MAX_SOURCE_BYTES (limit=${InputLimits.MAX_SOURCE_BYTES}, actual=${sourceBytes})`,
       { limit: InputLimits.MAX_SOURCE_BYTES, actual: sourceBytes },
     );
+  }
+
+  // Fail-closed directive guard: reject `@sighash` / `@embedAlways` on any
+  // non-TS surface (whose parser ignores comments) before dispatching. The
+  // `.runar.ts` / default branch is exempt because it honours the directives.
+  for (const [ext, surfaceName] of NON_TS_SURFACES) {
+    if (file.endsWith(ext)) {
+      const directiveMsg = unsupportedDirectiveError(source, surfaceName);
+      if (directiveMsg) {
+        return {
+          contract: null,
+          errors: [makeDiagnostic(directiveMsg, 'error', { file, line: 1, column: 0 })],
+        };
+      }
+      break;
+    }
   }
 
   // Multi-format dispatch based on file extension
@@ -249,17 +314,42 @@ function parseProperties(
       initializer = parseExpression(initExpr, file, errors);
     }
 
+    // Issue #109: `/** @embedAlways */` (or `// @embedAlways`) directive
+    // immediately preceding the field opts it out of DCE elimination.
+    const embedAlways = hasEmbedAlwaysDirective(prop);
+
     result.push({
       kind: 'property',
       name,
       type,
       readonly: isReadonly,
       initializer,
+      ...(embedAlways ? { embedAlways: true } : {}),
       sourceLocation: locFromNode(prop, file),
     });
   }
 
   return result;
+}
+
+/**
+ * Detect an `@embedAlways` comment directive on a property declaration.
+ *
+ * Accepts the JSDoc block form `/** @embedAlways *\/` (the canonical,
+ * cross-format shape shared with the sibling `@sighash` directive) as well
+ * as `// @embedAlways` line comments and `/* @embedAlways *\/` block
+ * comments in the field's leading trivia. ts-morph attaches JSDoc blocks
+ * separately from ordinary leading comments, so both surfaces are checked.
+ */
+const EMBED_ALWAYS_RE = /@embedAlways\b/;
+function hasEmbedAlwaysDirective(prop: PropertyDeclaration): boolean {
+  for (const jsdoc of prop.getJsDocs()) {
+    if (EMBED_ALWAYS_RE.test(jsdoc.getText())) return true;
+  }
+  for (const range of prop.getLeadingCommentRanges()) {
+    if (EMBED_ALWAYS_RE.test(range.getText())) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,15 +408,70 @@ function parseMethod(
   const bodyNode = method.getBody();
   const body = bodyNode ? parseStatements(bodyNode, file, errors) : [];
 
+  // Issue #123: `/** @sighash <FLAGS> */` directive → per-method sighash type.
+  const sighashType = parseSighashOnMethod(method, name, visibility, file, errors);
+
   return {
     kind: 'method',
     name,
     params,
     body,
     visibility,
+    ...(sighashType !== undefined ? { sighashType } : {}),
     sourceLocation: locFromNode(method, file),
   };
 }
+
+/**
+ * Detect + parse a `/** @sighash <FLAGS> *\/` (or `// @sighash ...`) directive on
+ * a method. Uses the same two-surface trivia scan as `@embedAlways` (#109):
+ * ts-morph attaches JSDoc blocks separately from ordinary leading comments, so
+ * both are checked. Returns the numeric sighash type, or `undefined` when no
+ * directive is present. Pushes an error diagnostic for a malformed flag list or
+ * a directive on a non-public method (only public methods are spending entry
+ * points, so a `@sighash` on a private helper is meaningless).
+ */
+function parseSighashOnMethod(
+  method: MethodDeclaration,
+  name: string,
+  visibility: 'public' | 'private',
+  file: string,
+  errors: CompilerDiagnostic[],
+): number | undefined {
+  let text: string | undefined;
+  for (const jsdoc of method.getJsDocs()) {
+    if (SIGHASH_TOKEN_RE.test(jsdoc.getText())) { text = jsdoc.getText(); break; }
+  }
+  if (text === undefined) {
+    for (const range of method.getLeadingCommentRanges()) {
+      if (SIGHASH_TOKEN_RE.test(range.getText())) { text = range.getText(); break; }
+    }
+  }
+  if (text === undefined) return undefined;
+
+  if (visibility !== 'public') {
+    errors.push(makeDiagnostic(
+      `@sighash directive on non-public method '${name}' has no effect — only public methods are spending entry points`,
+      'error',
+      locFromNode(method, file),
+    ));
+    return undefined;
+  }
+
+  const result = extractSighashDirective(text);
+  if (result === null) return undefined;
+  if ('error' in result) {
+    errors.push(makeDiagnostic(
+      `Method '${name}': ${result.error}`,
+      'error',
+      locFromNode(method, file),
+    ));
+    return undefined;
+  }
+  return result.value;
+}
+
+const SIGHASH_TOKEN_RE = /@sighash\b/;
 
 // ---------------------------------------------------------------------------
 // Parameters

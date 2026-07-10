@@ -69,6 +69,11 @@ class ANFMethod:
     params: list[ANFParam] = field(default_factory=list)
     body: list[ANFBinding] = field(default_factory=list)
     is_public: bool = False
+    # Issue #123: BIP-143 sighash type declared via @sighash on the source
+    # method (e.g. 0x43 for SINGLE|FORKID). ``None`` = default ALL|FORKID.
+    # Carried onto the ABI method descriptor so the SDK builds the matching
+    # preimage.
+    sighash_type: int | None = None
 
 
 @dataclass
@@ -148,6 +153,14 @@ class ANFValue:
     count: int | None = None
     iter_var: str | None = None
     body: list[ANFBinding] | None = None
+    # Iterator start value and step direction (issue #121). The loop is
+    # unrolled ``count`` times; on iteration ``i`` (0-based) the iterator
+    # variable holds ``start + i * step``. Zero-start counting-up loops carry
+    # ``start = 0`` and ``step = 1``, reproducing the historical
+    # ``i = 0..count-1`` lowering byte-for-byte. Countdown loops carry
+    # ``step = -1``.
+    start: int | None = None
+    step: int | None = None
 
     # -- assert, update_prop (value ref), check_preimage -------------------
     value_ref: str | None = None
@@ -162,6 +175,11 @@ class ANFValue:
 
     # -- check_preimage, deserialize_state ---------------------------------
     preimage: str | None = None
+    # -- check_preimage: issue #123 BIP-143 sighash flag the on-chain
+    #    OP_PUSH_TX binding appends to the derived signature. ``None`` = default
+    #    ALL|FORKID (0x41), byte-identical to the pinned cross-tier binding
+    #    blob. Only set for a method that declares a non-default @sighash mode.
+    sighash_flag: int | None = None
 
     # -- add_output --------------------------------------------------------
     satoshis: str | None = None
@@ -307,7 +325,18 @@ def _anf_value_from_dict(d: dict[str, Any]) -> ANFValue:
     v.cond = d.get("cond")
     v.count = d.get("count")
     v.iter_var = d.get("iterVar")
+    # Loop start/step (issue #121). Accept both the JS-style bigint literal
+    # string ("0n") and a plain JSON integer for ``start``; ``step`` is always
+    # a small integer (1 or -1).
+    _start = d.get("start")
+    if isinstance(_start, str) and _start.endswith("n"):
+        v.start = int(_start[:-1])
+    elif _start is not None:
+        v.start = int(_start)
+    if d.get("step") is not None:
+        v.step = int(d.get("step"))
     v.preimage = d.get("preimage")
+    v.sighash_flag = d.get("sighashFlag")
     v.satoshis = d.get("satoshis")
     v.state_values = d.get("stateValues")
     v.script_bytes = d.get("scriptBytes")
@@ -359,6 +388,7 @@ def _anf_method_from_dict(d: dict[str, Any]) -> ANFMethod:
         params=[_anf_param_from_dict(p) for p in d.get("params", [])],
         body=[_anf_binding_from_dict(b) for b in d.get("body", [])],
         is_public=d.get("isPublic", False),
+        sighash_type=d.get("sigHashType"),
     )
 
 

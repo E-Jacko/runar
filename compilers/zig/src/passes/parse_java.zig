@@ -1066,6 +1066,7 @@ const Parser = struct {
         var init_value: i64 = 0;
         var bound: i64 = 0;
         var descending: bool = false;
+        var inclusive: bool = false;
 
         // Init: `Type name = expr;` or plain expression
         if (self.current.kind == .ident) {
@@ -1108,6 +1109,8 @@ const Parser = struct {
                 switch (expr) {
                     .binary_op => |bop| {
                         descending = bop.op == .gt or bop.op == .gte;
+                        // Issue #121: record inclusivity (`<=`/`>=`).
+                        inclusive = bop.op == .lte or bop.op == .gte;
                         switch (bop.right) {
                             .literal_int => |v| bound = v,
                             else => {},
@@ -1135,7 +1138,7 @@ const Parser = struct {
         _ = self.expect(.rparen);
 
         const body = self.parseStmtOrBlock();
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .body = body } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .body = body } };
     }
 
     fn parseReturnStmt(self: *Parser) ?Statement {

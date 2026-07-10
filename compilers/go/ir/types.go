@@ -59,6 +59,15 @@ type ANFMethod struct {
 	Params   []ANFParam   `json:"params"`
 	Body     []ANFBinding `json:"body"`
 	IsPublic bool         `json:"isPublic"`
+
+	// SigHashType is the non-default BIP-143 sighash mode a `@sighash`
+	// directive declared for this (public) method (issue #123), e.g. 0x43 for
+	// SINGLE|FORKID. Nil = default ALL|FORKID (0x41). Carried in-memory only
+	// (json:"-") so it never appears in the emitted ANF IR JSON compared
+	// cross-tier — the codegen-relevant flag rides on each check_preimage
+	// node's sighashFlag instead. The artifact assembler copies it to
+	// ABIMethod.SigHashType so the SDK builds a matching preimage.
+	SigHashType *int `json:"-"`
 }
 
 // ANFParam describes a method parameter.
@@ -141,12 +150,31 @@ type ANFValue struct {
 	IterVar string `json:"iterVar,omitempty"`
 	// loop body reuses Then field? No — we use a separate Body field.
 	Body []ANFBinding `json:"body,omitempty"`
+	// loop iterator start value and step direction (issue #121). The loop is
+	// unrolled Count times; on iteration i (0-based) the iterator variable
+	// holds Start + i*Step. Zero-start counting-up loops carry Start=0, Step=1,
+	// which reproduces the historical i = 0..Count-1 lowering byte-for-byte.
+	// Countdown loops carry Step=-1. StartRaw is the raw JSON form (a bare
+	// number for int64-range starts, else a decimal `Nn` string) preserved for
+	// byte-identical round-tripping; Start is the decoded value.
+	StartRaw json.RawMessage `json:"start,omitempty"`
+	Step     int             `json:"step,omitempty"`
+	Start    *big.Int        `json:"-"`
 
 	// assert, update_prop (value ref), check_preimage
 	ValueRef string `json:"-"` // populated from RawValue for assert / update_prop / check_preimage
 
 	// check_preimage, deserialize_state
 	Preimage string `json:"preimage,omitempty"`
+
+	// check_preimage — issue #123: the BIP-143 sighash flag the on-chain
+	// OP_PUSH_TX binding appends to the derived signature (so the node
+	// re-derives the tx sighash under this flag). 0 = default ALL|FORKID
+	// (0x41), byte-identical to the pinned cross-tier binding blob. Only set
+	// for a method that declares a non-default @sighash mode, keeping golden
+	// ANF unchanged for every existing contract. The json tag drives --ir
+	// deserialization; emission is handled by MarshalJSON.
+	SighashFlag int `json:"sighashFlag,omitempty"`
 
 	// add_output
 	Satoshis    string   `json:"satoshis,omitempty"`
@@ -244,6 +272,21 @@ func (v ANFValue) MarshalJSON() ([]byte, error) {
 		} else {
 			out["body"] = v.Body
 		}
+		// Issue #121: emit the iterator start value and step direction, matching
+		// the TypeScript ANF JSON. StartRaw preserves the exact numeric/string
+		// encoding (bare number for int64-range starts, `Nn` string otherwise).
+		if len(v.StartRaw) > 0 {
+			out["start"] = v.StartRaw
+		} else if v.Start != nil {
+			out["start"] = bigIntToRawJSON(v.Start)
+		} else {
+			out["start"] = 0
+		}
+		if v.Step != 0 {
+			out["step"] = v.Step
+		} else {
+			out["step"] = 1
+		}
 	case "assert":
 		// Prefer the decoded ValueRef when populated by DecodeConstants;
 		// otherwise fall back to the raw JSON value for pre-decode round-trips.
@@ -270,6 +313,12 @@ func (v ANFValue) MarshalJSON() ([]byte, error) {
 		// kind only
 	case "check_preimage", "deserialize_state":
 		out["preimage"] = v.Preimage
+		// Issue #123: emit the non-default sighash flag only when set, so the
+		// golden ANF for every existing (default ALL|FORKID) contract is
+		// byte-identical.
+		if v.Kind == "check_preimage" && v.SighashFlag != 0 {
+			out["sighashFlag"] = v.SighashFlag
+		}
 	case "add_output":
 		out["preimage"] = v.Preimage
 		out["satoshis"] = v.Satoshis
@@ -360,6 +409,21 @@ func decodeValue(v *ANFValue) error {
 			return fmt.Errorf("if/else: %w", err)
 		}
 	case "loop":
+		// Issue #121: decode the iterator start value (bare number or `Nn`
+		// string) and default a missing step to +1 (older payloads without
+		// start/step describe zero-start counting-up loops).
+		if len(v.StartRaw) > 0 {
+			bi, err := decodeBigIntFromRaw(v.StartRaw)
+			if err != nil {
+				return fmt.Errorf("loop/start: %w", err)
+			}
+			v.Start = bi
+		} else {
+			v.Start = big.NewInt(0)
+		}
+		if v.Step == 0 {
+			v.Step = 1
+		}
 		if err := decodeBindings(v.Body); err != nil {
 			return fmt.Errorf("loop/body: %w", err)
 		}
@@ -470,4 +534,44 @@ func isDecimalBigIntLiteral(s string) bool {
 		}
 	}
 	return true
+}
+
+// bigIntToRawJSON encodes a big.Int into the canonical Rúnar IR JSON form used
+// for loop iterator starts (issue #121): a bare JSON number for values in
+// int64 range, else a quoted decimal string with the JS BigInt `n` suffix. This
+// mirrors makeLoadConstInt so the loop `start` field round-trips losslessly and
+// is byte-identical to the TypeScript ANF JSON (whose reviver collapses small
+// `Nn` strings back to plain numbers).
+func bigIntToRawJSON(val *big.Int) json.RawMessage {
+	var raw json.RawMessage
+	if val.IsInt64() {
+		raw, _ = json.Marshal(val.Int64())
+	} else {
+		raw, _ = json.Marshal(val.String() + "n")
+	}
+	return raw
+}
+
+// decodeBigIntFromRaw decodes a loop iterator start value from its raw JSON
+// form — a bare number or a decimal `Nn` string (issue #121).
+func decodeBigIntFromRaw(raw json.RawMessage) (*big.Int, error) {
+	var num json.Number
+	if err := json.Unmarshal(raw, &num); err == nil {
+		bi := new(big.Int)
+		if _, ok := bi.SetString(num.String(), 10); ok {
+			return bi, nil
+		}
+	}
+	var str string
+	if err := json.Unmarshal(raw, &str); err == nil {
+		text := str
+		if len(text) > 0 && text[len(text)-1] == 'n' {
+			text = text[:len(text)-1]
+		}
+		bi := new(big.Int)
+		if _, ok := bi.SetString(text, 10); ok {
+			return bi, nil
+		}
+	}
+	return nil, fmt.Errorf("unable to decode loop start value: %s", string(raw))
 }

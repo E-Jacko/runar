@@ -146,6 +146,10 @@ def _collect_stmt(
         if isinstance(stmt.target, PropertyAccessExpr):
             if stmt.target.property in mutable_props:
                 into.mutates_state = True
+        # Issue #123 F3: both sides may still contain calls (output intrinsics
+        # could hide in the target's index/object as well as the value).
+        if stmt.target is not None:
+            _collect_expr(stmt.target, into, mutable_props, private_by_name, classify)
         if stmt.value is not None:
             _collect_expr(stmt.value, into, mutable_props, private_by_name, classify)
         return
@@ -162,6 +166,12 @@ def _collect_stmt(
             _collect_stmt(inner, into, mutable_props, private_by_name, classify)
         return
     if isinstance(stmt, ForStmt):
+        # Issue #123 F3: walk the full loop header — an output intrinsic can hide
+        # in init or condition, not only in update/body.
+        if stmt.init is not None:
+            _collect_stmt(stmt.init, into, mutable_props, private_by_name, classify)
+        if stmt.condition is not None:
+            _collect_expr(stmt.condition, into, mutable_props, private_by_name, classify)
         if stmt.update is not None:
             _collect_stmt(stmt.update, into, mutable_props, private_by_name, classify)
         for inner in stmt.body:

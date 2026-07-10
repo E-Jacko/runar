@@ -197,7 +197,7 @@ public final class ConstantFold {
         if (value instanceof Loop lp) {
             Map<String, ConstSlot> bodyEnv = new HashMap<>(env);
             List<AnfBinding> foldedBody = foldBindings(orEmpty(lp.body()), bodyEnv);
-            return new Loop(lp.count(), foldedBody, lp.iterVar());
+            return new Loop(lp.count(), foldedBody, lp.iterVar(), lp.start(), lp.step());
         }
 
         // Side-effecting / opaque values pass through unchanged. This matches

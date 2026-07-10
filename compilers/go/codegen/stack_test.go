@@ -1751,3 +1751,103 @@ func TestStack_AddDataOutput_WireShapeMatchesAddRawOutput(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// H1 (#119 tail): lowerLoadProp must NOT silently coerce an unknown property
+// onto a constructor slot.
+//
+// A `load_prop` binding whose name is not a declared constructor-param
+// property has no deploy-time bytes of its own. The previous behaviour let the
+// paramIndex scan run off the end (Go signals not-found by never breaking, so
+// paramIndex == count of non-initialized props) and emitted a placeholder for
+// an UNRELATED constructor argument — a silent-wrong-code path. The hardened
+// behaviour is a HARD panic (recovered into an error by LowerToStack) naming
+// the offending property, the source location, and the known ctor-param props.
+// ---------------------------------------------------------------------------
+
+// ghostLoadPropProgram builds a minimal ANF program with one real readonly
+// constructor-param property `pk` (slot 0) plus a public method whose body
+// loads a property `ghost` that is NOT declared on the contract. `ghost`
+// therefore reaches the placeholder fallback with no matching ctor slot.
+func ghostLoadPropProgram() *ir.ANFProgram {
+	assertT0, _ := marshalString("t0")
+	return &ir.ANFProgram{
+		ContractName: "Ghost",
+		Properties: []ir.ANFProperty{
+			{Name: "pk", Type: "PubKey", Readonly: true},
+		},
+		Methods: []ir.ANFMethod{
+			{
+				Name:     "constructor",
+				Params:   []ir.ANFParam{{Name: "pk", Type: "PubKey"}},
+				Body:     nil,
+				IsPublic: false,
+			},
+			{
+				Name:     "spend",
+				Params:   []ir.ANFParam{},
+				IsPublic: true,
+				Body: []ir.ANFBinding{
+					{
+						Name:      "t0",
+						Value:     ir.ANFValue{Kind: "load_prop", Name: "ghost"},
+						SourceLoc: &ir.SourceLocation{File: "Ghost.runar.ts", Line: 7, Column: 4},
+					},
+					{Name: "t1", Value: ir.ANFValue{Kind: "assert", RawValue: assertT0, ValueRef: "t0"}},
+				},
+			},
+		},
+	}
+}
+
+func TestLowerToStack_H1_GhostLoadPropIsHardError(t *testing.T) {
+	_, err := LowerToStack(ghostLoadPropProgram())
+	if err == nil {
+		t.Fatal("expected a hard error for load_prop of undeclared property 'ghost', got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "ghost") {
+		t.Errorf("expected error to name the ghost property, got: %s", msg)
+	}
+	if !strings.Contains(msg, "constructor") {
+		t.Errorf("expected error to mention the missing constructor slot, got: %s", msg)
+	}
+	// The known constructor-param property list must include the real prop 'pk'.
+	if !strings.Contains(msg, "pk") {
+		t.Errorf("expected error to list known ctor-param props (including 'pk'), got: %s", msg)
+	}
+	// Source location threaded from the ANF binding should appear.
+	if !strings.Contains(msg, "Ghost.runar.ts") {
+		t.Errorf("expected error to include the source location, got: %s", msg)
+	}
+}
+
+func TestLowerToStack_H1_RealCtorPropLowersWithoutError(t *testing.T) {
+	assertT0, _ := marshalString("t0")
+	program := &ir.ANFProgram{
+		ContractName: "Ok",
+		Properties: []ir.ANFProperty{
+			{Name: "pk", Type: "PubKey", Readonly: true},
+		},
+		Methods: []ir.ANFMethod{
+			{
+				Name:     "constructor",
+				Params:   []ir.ANFParam{{Name: "pk", Type: "PubKey"}},
+				Body:     nil,
+				IsPublic: false,
+			},
+			{
+				Name:     "spend",
+				Params:   []ir.ANFParam{},
+				IsPublic: true,
+				Body: []ir.ANFBinding{
+					{Name: "t0", Value: ir.ANFValue{Kind: "load_prop", Name: "pk"}},
+					{Name: "t1", Value: ir.ANFValue{Kind: "assert", RawValue: assertT0, ValueRef: "t0"}},
+				},
+			},
+		},
+	}
+	if _, err := LowerToStack(program); err != nil {
+		t.Fatalf("expected a real ctor-param property to lower without error, got: %v", err)
+	}
+}

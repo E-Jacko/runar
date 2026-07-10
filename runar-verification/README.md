@@ -15,9 +15,9 @@ pipeline. The package is useful in two roles:
 | Conformance fixtures discovered (Lean-recognised) | 64/64 (dynamic readDir) |
 | ANF parse + well-formedness | 63/63 |
 | ANF JSON round-trip | 63/63 |
-| Default byte-exact gate (`pipelineGolden`) | 49/49 byte-exact (fixed tracked subset; see note) |
+| Default byte-exact gate (`pipelineGolden`) | 47/64 byte-exact (39 baseline + 8 stored crypto constants; see note) |
 | Formal-evidence gate (`pipelineConformance`) | **0/63 VERIFIED-direct**, **63/63 VERIFIED-modulo-codegen-axioms** (Phase D harness omnibus tier; soundness conditional on the codegen-soundness axioms documented in `TRUST_MANIFEST.md`) |
-| Crypto-heavy fixtures | 15/49 stored Lean-produced constants; explicit pending-assumption bucket |
+| Crypto-heavy fixtures | 20 `cryptoAxiomPending` (8 byte-exact via stored constants) |
 | Full/sharded byte-exact target | live `cryptoAxiomPending` bucket regeneration |
 | Tracked Lean modules | all build via `scripts/lean-verify.sh` |
 | Project axioms | 70 (current; was 125 at the start of Path 2 — see `TRUST_MANIFEST.md` for per-axiom breakdown and trajectory) |
@@ -29,25 +29,37 @@ pipeline. The package is useful in two roles:
 | End-to-end capstone — multi-method dispatch | `Pipeline.compileSafe_multi_public_observational_correct` (Phase D) |
 | Crypto codegen-to-spec links | 13 primitive families (SHA-256 / RIPEMD-160 / hash160 / hash256 / BLAKE3 / secp256k1 / P-256 / P-384 / ECDSA / BabyBear / Merkle / WOTS+ / SLH-DSA × 6 / Rabin) |
 
-Default `pipelineGolden` is the fast gate and currently reports 49/49
-fixtures byte-exact (34 baseline + 15 stored crypto-pending constants).
-The 15 crypto-heavy fixtures are counted only through stored
+Default `pipelineGolden` is the fast gate and currently reports 47/64
+fixtures byte-exact (39 baseline + 8 stored crypto-pending constants).
+The crypto-heavy fixtures are counted only through stored
 Lean-produced constants, not by comparing `expected-script.hex` to
 itself. They remain visible as the `cryptoAxiomPending` bucket because
 their semantic proof obligations still depend on the crypto assumptions
 listed in `TRUST_MANIFEST.md`.
 
+**Issue #116 (2026-07):** the stateful change-output epilogue now wraps
+the change output in a runtime `if (_changeAmount !== 0)` guard so the
+hashed output set matches the SDK when change == 0. All 7 real compilers
+emit the numeric `!==` guard as `[OP_NUMEQUAL, OP_NOT]` (per the TS
+`BINOP_OPCODES['!==']` table). The Lean model's numeric-`!==` lowering
+was migrated to the same 2-opcode pair (`Stack/Lower.binopOpcode` +
+`lowerValueP`), with the semantic bridge
+`Stack.Sim.runOps_numEqualNot_eq_numNotEqual` and the dependent
+operational proofs (`Stack/Agrees` `stageC_simpleStep_binOp_NUMNOTEQUAL_*`,
+`Stack/AgreesA3` `singletonBinNeq_*` + `build_consume_binOp_witness_*`,
+`Stack/AgreesA5`) all discharged — no new `sorry`, no new axioms. The 18
+stateful change-output fixtures are byte-exact again and `state-covenant`'s
+stored constant was regenerated from the model's genuine output.
+
 Unlike the discovery-driven gates below, `pipelineGolden` carries a
-**fixed, hand-curated fixture inventory** (`expectedFixtureTotal := 49`
-plus the `baselineMatches` / `cryptoAxiomPending` bucket lists in
-`tests/PipelineGolden.lean`). It does NOT auto-track new fixtures: the
-corpus has since grown to 63 fixtures, and extending the byte-exact gate
-to the 14 newer fixtures (each a 7-tier byte-identity target, no
-`"compilers"` allowlist) is pending Lean work — until then this gate
-intentionally byte-checks only its tracked 49 subset. The discovered
-counts in the status table (63/63) come from the dynamic `readDir` gates
-(`goldenLoad` / `roundtrip` / `pipelineConformance`), which auto-track
-the corpus.
+**hand-curated fixture inventory** (`expectedFixtureTotal := 49` as a
+lower bound, plus the `baselineMatches` / `cryptoAxiomPending` /
+`lowerDivergencePending` bucket lists in `tests/PipelineGolden.lean`).
+All 64 discovered fixtures are bucketed (39 baseline + 20 crypto-pending
++ 5 lower-divergence); the gate byte-checks the 47 the Lean model
+reproduces exactly. The discovered counts in the status table (64/64)
+come from the dynamic `readDir` gates (`goldenLoad` / `roundtrip` /
+`pipelineConformance`), which auto-track the corpus.
 
 `pipelineConformance` is the formal-evidence gate. It reports
 **0/63 VERIFIED-direct** and **63/63 VERIFIED-modulo-codegen-axioms**
@@ -95,10 +107,10 @@ auto-tracks new fixtures (the `goldenLoad` binary prints `found N
 expected-ir.json files` and asserts all N parse + satisfy WF; the
 `asm-raw-script` fixture parses cleanly after the `raw_script` ANF kind
 landed; only its codegen-to-Stack-IR simulation discharge is deferred).
-`pipelineGolden` remains at 49/49 byte-exact across its fixed tracked
-subset (it does not auto-track the 14 newer fixtures — see the note
-above); the 15 stored-constant fixtures whose emit hex is regenerated
-rather than compared live in the `cryptoAxiomPending` bucket.
+`pipelineGolden` reports 47/64 byte-exact across its tracked
+inventory (see the note above); the crypto stored-constant fixtures whose
+emit hex is regenerated rather than compared live in the
+`cryptoAxiomPending` bucket.
 
 ## Commands
 
@@ -113,7 +125,7 @@ lake env ./.lake/build/bin/pipelineGolden
 
 `scripts/lean-verify.sh` builds every tracked Lean module, including
 standalone test modules that are outside the default root import closure.
-`pipelineGolden` is the default 49/49 fast byte-exact gate.
+`pipelineGolden` is the default fast byte-exact gate (47/64).
 
 Full and scheduled checks:
 

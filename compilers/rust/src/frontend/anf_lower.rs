@@ -27,6 +27,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use super::ast::*;
+use super::sighash_directive::SIGHASH_DEFAULT;
 use super::side_effect_summary::{
     compute_side_effect_summary, ContinuationShape, SideEffectSummary,
 };
@@ -162,6 +163,22 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
     // private-helper effects, not just direct ones.
     let side_effects = compute_side_effect_summary(contract);
 
+    // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+    // must survive DCE into the locking script. A readonly field no method
+    // references lowers to no `load_prop`, so no constructor slot is emitted
+    // and the field's deploy-time bytes vanish. We inject a `load_prop` + a
+    // `@ref:` alias (the exact shape `const _bind = this.field;` produces) into
+    // the first public method's body — the alias keeps the `load_prop` alive
+    // through dead-binding DCE, and stack lowering threads the pushed value
+    // through and NIPs it at method end. One slot in the deployed script
+    // suffices; every spending branch shares it.
+    let embed_fields: Vec<&PropertyNode> = contract
+        .properties
+        .iter()
+        .filter(|p| p.readonly && p.embed_always)
+        .collect();
+    let mut embed_injected = false;
+
     // Lower constructor (the TS reference includes the constructor in output)
     let mut ctor_ctx = LoweringContext::with_effects(contract, Some(side_effects.clone()));
     for p in &contract.constructor.params {
@@ -173,16 +190,36 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
         params: lower_params(&contract.constructor.params),
         body: ctor_ctx.bindings,
         is_public: false,
+        sighash_type: None,
     });
 
     // Lower each method (including private methods as separate entries)
     for method in &contract.methods {
         let mut method_ctx = LoweringContext::with_effects(contract, Some(side_effects.clone()));
+        // Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+        // flag for any checkPreimage (auto-injected below, or a manual call) in
+        // this method. Default ALL|FORKID leaves the flag `None` so the pinned
+        // binding blob is unchanged.
+        if let Some(v) = method.sighash_type {
+            if v != SIGHASH_DEFAULT {
+                method_ctx.sighash_flag = Some(v);
+            }
+        }
         // Register THIS method's declared params for method-scoped byte-type
         // analysis (issue #34). Auto-injected continuation params register
         // their types below, next to their add_param calls.
         for p in &method.params {
             method_ctx.register_param_type(&p.name, &type_node_to_string(&p.param_type));
+        }
+
+        // Register the declared param NAMES so a bare identifier resolves to
+        // `load_param` before falling through to `load_prop` (issue #130).
+        // Without this, a param whose name collides with a mutable state
+        // property lowered to the stale deserialized property value instead of
+        // the witness param. Explicit `this.x` is unaffected: it checks
+        // is_property before is_param (see PropertyAccess / lower_member_expr).
+        for p in &method.params {
+            method_ctx.add_param(&p.name);
         }
 
         if contract.parent_class == "StatefulSmartContract"
@@ -216,25 +253,34 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
             method_ctx.add_param("txPreimage");
             method_ctx.register_param_type("txPreimage", "SigHashPreimage");
 
+            // Issue #123: the declared per-method sighash mode (default
+            // ALL|FORKID). Drives BOTH the OP_PUSH_TX binding flag (so the
+            // derived sig re-computes the tx sighash under this mode) AND the
+            // runtime preimage-type assert.
+            let sighash_mode = method.sighash_type.unwrap_or(SIGHASH_DEFAULT);
+
             // Inject checkPreimage(txPreimage) at the start
             let preimage_ref = method_ctx.emit(ANFValue::LoadParam {
                 name: "txPreimage".to_string(),
             });
             let check_result = method_ctx.emit(ANFValue::CheckPreimage {
                 preimage: preimage_ref,
+                // Omit for the default so the ANF (and pinned binding blob) is
+                // byte-identical; `sighash_flag` is None unless non-default.
+                sighash_flag: method_ctx.sighash_flag,
             });
             method_ctx.emit(ANFValue::Assert {
                 value: check_result,
                 is_auto_injected_state_check: false,
             });
 
-            // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-            // auto-injected covenant cannot be spent under a permissive sighash
-            // flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
-            // a contract may read. The hashOutputs continuation already fails
-            // under non-ALL flags, so this is a no-op on spendability for
-            // continuation-using methods and closes the field-zeroing exposure
-            // for the rest.
+            // GAP-302 / #123: pin the sighash type to the declared mode. The
+            // auto-injected covenant verifies a real tx preimage, but without
+            // this check the spend could use a DIFFERENT sighash flag than
+            // declared that zeroes out preimage fields the contract (or its
+            // continuation) relies on (hashOutputs / hashPrevouts /
+            // hashSequence). The value defaults to 0x41 (ALL|FORKID) so existing
+            // contracts emit byte-identical ANF.
             let sig_hash_preimage_ref = method_ctx.emit(ANFValue::LoadParam {
                 name: "txPreimage".to_string(),
             });
@@ -243,7 +289,7 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 args: vec![sig_hash_preimage_ref],
             });
             let expected_sig_hash_ref = method_ctx.emit(ANFValue::LoadConst {
-                value: bigint_to_json(&BigInt::from(0x41)),
+                value: bigint_to_json(&BigInt::from(sighash_mode)),
             });
             let sig_hash_ok_ref = method_ctx.emit(ANFValue::BinOp {
                 op: "===".to_string(),
@@ -267,6 +313,15 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 method_ctx.emit(ANFValue::DeserializeState {
                     preimage: preimage_ref3,
                 });
+            }
+
+            // Issue #109: preserve @embedAlways fields at the first
+            // user-statement position (after the checkPreimage/deserialize
+            // preamble), mirroring where a `const _bind = this.field;` idiom
+            // would sit.
+            if !embed_injected && !embed_fields.is_empty() {
+                emit_embed_always_preservation(&mut method_ctx, &embed_fields);
+                embed_injected = true;
             }
 
             // Lower the developer's method body
@@ -299,16 +354,47 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
             // locking script will not match the auto-injected
             // parameter list.
             if needs_change_output {
-                // Build the P2PKH change output for hashOutputs verification
+                // Build the P2PKH change output for hashOutputs verification.
+                //
+                // Issue #116: the SDK's build_call_transaction OMITS the change
+                // output when `change <= 0` (an exact-cover call) and passes
+                // `_changeAmount = 0`. Gate the change segment on
+                // `_changeAmount != 0` at runtime so the hashed output set
+                // matches the SDK at the exact-zero boundary — the segment is
+                // the P2PKH change output when non-zero, and empty bytes (cat
+                // with empty is a no-op) when zero, reproducing the omission.
+                // For any change > 0 the hashed bytes are unchanged; only the
+                // emitted script gains the guard.
                 let change_pkh_ref = method_ctx.emit(ANFValue::LoadParam {
                     name: "_changePKH".to_string(),
                 });
                 let change_amount_ref = method_ctx.emit(ANFValue::LoadParam {
                     name: "_changeAmount".to_string(),
                 });
-                let change_output_ref = method_ctx.emit(ANFValue::Call {
+                let zero_ref = method_ctx.emit(ANFValue::LoadConst {
+                    value: bigint_to_json(&BigInt::from(0)),
+                });
+                let change_nonzero_ref = method_ctx.emit(ANFValue::BinOp {
+                    op: "!==".to_string(),
+                    left: change_amount_ref.clone(),
+                    right: zero_ref,
+                    result_type: None,
+                });
+                let mut change_then_ctx = method_ctx.sub_context();
+                change_then_ctx.emit(ANFValue::Call {
                     func: "buildChangeOutput".to_string(),
                     args: vec![change_pkh_ref, change_amount_ref],
+                });
+                method_ctx.sync_counter(&change_then_ctx);
+                let mut change_else_ctx = method_ctx.sub_context();
+                change_else_ctx.emit(ANFValue::LoadConst {
+                    value: serde_json::Value::String(String::new()),
+                });
+                method_ctx.sync_counter(&change_else_ctx);
+                let change_output_ref = method_ctx.emit(ANFValue::If {
+                    cond: change_nonzero_ref,
+                    then: change_then_ctx.bindings,
+                    else_branch: change_else_ctx.bindings,
                 });
 
                 if !add_output_refs.is_empty() {
@@ -437,8 +523,19 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 params: augmented_params,
                 body: method_ctx.bindings,
                 is_public: true,
+                sighash_type: method.sighash_type,
             });
         } else {
+            // Issue #109: stateless public methods (and stateless contracts'
+            // spending entry points) are lowered here — inject @embedAlways
+            // preservation into the first PUBLIC one before its body.
+            if !embed_injected
+                && !embed_fields.is_empty()
+                && method.visibility == Visibility::Public
+            {
+                emit_embed_always_preservation(&mut method_ctx, &embed_fields);
+                embed_injected = true;
+            }
             lower_statements(&method.body, &mut method_ctx);
             // Private methods can also call the intent intrinsics; surface
             // their auto-injected witness params on the private method's
@@ -455,11 +552,35 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 params: augmented,
                 body: method_ctx.bindings,
                 is_public: method.visibility == Visibility::Public,
+                sighash_type: method.sighash_type,
             });
         }
     }
 
     result
+}
+
+/// Issue #109: emit the DCE-surviving preservation pair for each
+/// `@embedAlways` readonly field into the given (public) method context.
+///
+/// Reproduces exactly what a hand-written `const _bind = this.field;` lowers
+/// to: a `load_prop` followed by a `load_const("@ref:<t>")` alias. The alias
+/// marks the `load_prop` as referenced (see `collect_refs_from_value` in
+/// `frontend/dce.rs`), so dead-binding DCE keeps it; stack lowering then emits
+/// the field's constructor-slot placeholder and NIPs the unused value off the
+/// stack at method end, so the field's bytes remain in the deployed script.
+fn emit_embed_always_preservation(ctx: &mut LoweringContext, fields: &[&PropertyNode]) {
+    for field in fields {
+        let load_ref = ctx.emit(ANFValue::LoadProp {
+            name: field.name.clone(),
+        });
+        ctx.emit_named(
+            &format!("__embedAlways_{}", field.name),
+            ANFValue::LoadConst {
+                value: serde_json::Value::String(format!("@ref:{}", load_ref)),
+            },
+        );
+    }
 }
 
 fn lower_params(params: &[ParamNode]) -> Vec<ANFParam> {
@@ -563,6 +684,12 @@ struct LoweringContext<'a> {
     /// inside a nested block (if/else, ternary). Shared via Rc<RefCell<>>
     /// so sub-contexts mutate the same scope the parent reads from.
     method_scope: Rc<RefCell<MethodScope>>,
+    /// Issue #123: the declared non-default `@sighash` flag for the method
+    /// being lowered, so a MANUAL `checkPreimage(pre)` call (stateless /
+    /// explicit) AND the auto-injected covenant bind under the same mode as the
+    /// method's declared sighash. `None` = default ALL|FORKID, keeping the
+    /// pinned binding blob unchanged.
+    sighash_flag: Option<i64>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -586,6 +713,7 @@ impl<'a> LoweringContext<'a> {
             param_alias_stack: HashMap::new(),
             side_effects,
             method_scope: Rc::new(RefCell::new(MethodScope::default())),
+            sighash_flag: None,
         }
     }
 
@@ -747,6 +875,9 @@ impl<'a> LoweringContext<'a> {
         // inside a nested block (if/else, ternary) registers on the
         // parent method's ABI augmentation pass.
         sub.method_scope = Rc::clone(&self.method_scope);
+        // Issue #123: a manual checkPreimage inside a nested block must bind
+        // under the method's declared @sighash mode.
+        sub.sighash_flag = self.sighash_flag;
         // Note: add_output_refs is NOT propagated to sub-contexts
         // because addOutput calls in sub-blocks should flow up to
         // the parent context via explicit tracking.
@@ -853,10 +984,11 @@ fn lower_statement(stmt: &Statement, ctx: &mut LoweringContext) {
         Statement::ForStatement {
             init,
             condition,
+            update,
             body,
             ..
         } => {
-            lower_for_statement(init, condition, body, ctx);
+            lower_for_statement(init, condition, update, body, ctx);
         }
         Statement::ExpressionStatement { expression, .. } => {
             lower_expr_to_ref(expression, ctx);
@@ -1044,11 +1176,14 @@ fn append_branch_output_concat(branch_ctx: &mut LoweringContext) -> String {
 fn lower_for_statement(
     init: &Statement,
     condition: &Expression,
+    update: &Statement,
     body: &[Statement],
     ctx: &mut LoweringContext,
 ) {
-    // Extract the loop count from the for-statement.
-    let count = extract_loop_count(init, condition);
+    // Resolve the loop's compile-time shape: start value, step direction, and
+    // iteration count. Rúnar requires bounded loops, so all three must be
+    // statically determinable (issue #121).
+    let (start, step, count) = extract_loop_shape(init, condition, update);
 
     // Extract the iterator variable name
     let iter_var = if let Statement::VariableDecl { name, .. } = init {
@@ -1066,55 +1201,92 @@ fn lower_for_statement(
         count,
         body: body_ctx.bindings,
         iter_var,
+        start: bigint_to_json(&start),
+        step,
     });
 }
 
-/// Extract a compile-time loop count from a for statement.
+/// Resolve a for-statement's compile-time loop shape (issue #121).
 ///
-/// The ANF loop node carries only the count — no start value or step
-/// direction — so lowering (and the ANF interpreter) always iterates
-/// i = 0..count-1. Loop shapes that representation cannot express are
-/// rejected here (mirroring the source-located errors in the validator)
-/// rather than silently compiled as a zero-start counting-up loop. This
-/// path is a hard guard for callers that skip validation; the normal
-/// pipeline rejects these shapes in the validate pass first.
-fn extract_loop_count(init: &Statement, condition: &Expression) -> usize {
-    // A countdown loop necessarily also has a non-zero start, so check the
-    // condition direction first — it is the more precise diagnosis.
-    if let Expression::BinaryExpr { op, .. } = condition {
-        if *op == BinaryOp::Gt || *op == BinaryOp::Ge {
-            panic!(
-                "For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead."
-            );
-        }
-    }
-
-    let start_val = if let Statement::VariableDecl { init: init_expr, .. } = init {
-        extract_bigint_value(init_expr)
-    } else {
-        None
+/// Supports counting-up and counting-down loops:
+///   for (let i = 0n; i < 10n; i++)     -> start 0,  step +1, count 10
+///   for (let i = 1n; i <= 3n; i++)     -> start 1,  step +1, count 3
+///   for (let i = 3n; i > 0n; i--)      -> start 3,  step -1, count 3
+///   for (let i = 3n; i >= 1n; i--)     -> start 3,  step -1, count 3
+///
+/// The loop is unrolled `count` times; on iteration `i` the iterator holds
+/// `start + i * step`. Start and bound must be compile-time integer literals.
+///
+/// This path is a hard guard for callers that skip validation; the normal
+/// pipeline rejects unresolvable shapes in the validate pass first.
+fn extract_loop_shape(
+    init: &Statement,
+    condition: &Expression,
+    update: &Statement,
+) -> (num_bigint::BigInt, i64, usize) {
+    let start = match init {
+        Statement::VariableDecl { init: init_expr, .. } => extract_bigint_value(init_expr),
+        _ => None,
+    };
+    let start = match start {
+        Some(s) => BigInt::from(s),
+        None => panic!(
+            "Cannot determine loop start at compile time. For-loop iterators must start at an integer literal."
+        ),
     };
 
-    if let Some(start) = start_val {
-        if start != 0 {
-            panic!(
-                "For loop iterator must start at 0 (got {}n) — loops compile to i = 0..count-1; offset the iterator inside the body instead.",
-                start
-            );
+    let (op, bound) = match condition {
+        Expression::BinaryExpr { op, right, .. } => match extract_bigint_value(right) {
+            Some(b) => (op, BigInt::from(b)),
+            None => panic!(
+                "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+            ),
+        },
+        _ => panic!(
+            "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+        ),
+    };
+
+    let step = extract_loop_step(condition, update);
+
+    // Count = number of iterations before the condition first turns false.
+    let count: BigInt = if step == 1 {
+        match op {
+            BinaryOp::Lt => &bound - &start,
+            BinaryOp::Le => &bound - &start + 1,
+            _ => panic!("For loop counting up (i++) must use '<' or '<=' (got '{:?}').", op),
+        }
+    } else {
+        match op {
+            BinaryOp::Gt => &start - &bound,
+            BinaryOp::Ge => &start - &bound + 1,
+            _ => panic!("For loop counting down (i--) must use '>' or '>=' (got '{:?}').", op),
+        }
+    };
+
+    let count = count.to_i64().unwrap_or(0).max(0) as usize;
+    (start, step, count)
+}
+
+/// Determine the iterator step direction (+1 / -1) from the for-statement's
+/// update clause, falling back to the condition direction. Only unit steps are
+/// supported; a non-unit update (e.g. `i += 2`) is out of the loop model.
+fn extract_loop_step(condition: &Expression, update: &Statement) -> i64 {
+    if let Statement::ExpressionStatement { expression, .. } = update {
+        match expression {
+            Expression::IncrementExpr { .. } => return 1,
+            Expression::DecrementExpr { .. } => return -1,
+            _ => {}
         }
     }
-
-    if let Expression::BinaryExpr { op, right, .. } = condition {
-        if let Some(bound) = extract_bigint_value(right) {
-            match op {
-                BinaryOp::Lt => return bound.max(0) as usize,
-                BinaryOp::Le => return (bound + 1).max(0) as usize,
-                _ => {}
-            }
+    // Fall back to the comparison direction for other unit-step spellings
+    // (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
+    if let Expression::BinaryExpr { op, .. } = condition {
+        if *op == BinaryOp::Gt || *op == BinaryOp::Ge {
+            return -1;
         }
     }
-
-    0
+    1
 }
 
 fn extract_bigint_value(expr: &Expression) -> Option<i128> {
@@ -1152,7 +1324,17 @@ fn lower_expr_to_ref(expr: &Expression, ctx: &mut LoweringContext) -> String {
         Expression::Identifier { name } => lower_identifier(name, ctx),
 
         Expression::PropertyAccess { property } => {
-            // this.txPreimage in StatefulSmartContract -> load_param (it's an implicit param, not a stored property)
+            // Explicit `this.x`: a real contract property always wins, even when
+            // a method param shares the name (issue #130). Now that declared
+            // params are registered, the is_param branch below must not shadow a
+            // stored property.
+            if ctx.is_property(property) {
+                return ctx.emit(ANFValue::LoadProp {
+                    name: property.clone(),
+                });
+            }
+            // this.txPreimage in StatefulSmartContract -> load_param (it's an
+            // implicit injected param, not a stored property).
             if ctx.is_param(property) {
                 return ctx.emit(ANFValue::LoadParam {
                     name: property.clone(),
@@ -1260,6 +1442,15 @@ fn lower_member_expr(
     // this.x -> load_prop (or load_param for implicit params like txPreimage)
     if let Expression::Identifier { name } = object {
         if name == "this" {
+            // Explicit `this.x`: a real contract property always wins, even
+            // when a method param shares the name (issue #130). Only fall
+            // through to load_param for implicit injected params (txPreimage)
+            // that are NOT stored properties.
+            if ctx.is_property(property) {
+                return ctx.emit(ANFValue::LoadProp {
+                    name: property.to_string(),
+                });
+            }
             if ctx.is_param(property) {
                 return ctx.emit(ANFValue::LoadParam {
                     name: property.to_string(),
@@ -1390,6 +1581,9 @@ fn lower_call_expr(
                 let preimage_ref = lower_expr_to_ref(&args[0], ctx);
                 return ctx.emit(ANFValue::CheckPreimage {
                     preimage: preimage_ref,
+                    // Issue #123: honour the method's declared @sighash on
+                    // manual checkPreimage calls (None = default ALL|FORKID).
+                    sighash_flag: ctx.sighash_flag,
                 });
             }
         }
@@ -2364,8 +2558,9 @@ fn remap_value_refs(value: &ANFValue, map: &HashMap<String, String>) -> ANFValue
             name: name.clone(),
             value: r(v),
         },
-        ANFValue::CheckPreimage { preimage } => ANFValue::CheckPreimage {
+        ANFValue::CheckPreimage { preimage, sighash_flag } => ANFValue::CheckPreimage {
             preimage: r(preimage),
+            sighash_flag: *sighash_flag,
         },
         ANFValue::DeserializeState { preimage } => ANFValue::DeserializeState {
             preimage: r(preimage),
@@ -2391,10 +2586,12 @@ fn remap_value_refs(value: &ANFValue, map: &HashMap<String, String>) -> ANFValue
             then: then.clone(),
             else_branch: else_branch.clone(),
         },
-        ANFValue::Loop { count, body, iter_var } => ANFValue::Loop {
+        ANFValue::Loop { count, body, iter_var, start, step } => ANFValue::Loop {
             count: *count,
             body: body.clone(),
             iter_var: iter_var.clone(),
+            start: start.clone(),
+            step: *step,
         },
     }
 }
@@ -3100,46 +3297,44 @@ class TernaryDemo extends SmartContract {
     }
 
     // -----------------------------------------------------------------------
-    // #127: extract_loop_count hard guards (for callers that skip validation)
+    // #121: extract_loop_shape — non-zero start and countdown support
     // -----------------------------------------------------------------------
 
-    /// Parse only (no validate) so the anf-lower hard guard is exercised.
+    /// Parse only (no validate) so the anf-lower loop-shape path is exercised.
     fn parse_only(source: &str) -> ContractNode {
         let result = parse_source(source, Some("test.runar.ts"));
         assert!(result.errors.is_empty(), "parse errors: {:?}", result.errors);
         result.contract.expect("expected a contract from parse")
     }
 
-    #[test]
-    #[should_panic(expected = "countdown loops are not supported")]
-    fn test_extract_loop_count_rejects_countdown() {
-        let source = r#"
-import { SmartContract } from 'runar-lang';
-
-class Countdown extends SmartContract {
-    readonly n: bigint;
-
-    constructor(n: bigint) {
-        super(n);
-        this.n = n;
-    }
-
-    public run(v: bigint) {
-        let sum = 0n;
-        for (let i = 0n; i > 3n; i--) {
-            sum += i;
+    /// Find the first `loop` node anywhere in a lowered program.
+    fn find_loop(anf: &ANFProgram) -> (usize, serde_json::Value, i64) {
+        fn walk(bindings: &[ANFBinding]) -> Option<(usize, serde_json::Value, i64)> {
+            for b in bindings {
+                match &b.value {
+                    ANFValue::Loop { count, start, step, .. } => {
+                        return Some((*count, start.clone(), *step));
+                    }
+                    ANFValue::If { then, else_branch, .. } => {
+                        if let Some(r) = walk(then).or_else(|| walk(else_branch)) {
+                            return Some(r);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
         }
-        assert(sum === v);
-    }
-}
-"#;
-        let contract = parse_only(source);
-        let _ = lower_to_anf(&contract);
+        for m in &anf.methods {
+            if let Some(r) = walk(&m.body) {
+                return r;
+            }
+        }
+        panic!("no loop node found");
     }
 
     #[test]
-    #[should_panic(expected = "must start at 0")]
-    fn test_extract_loop_count_rejects_non_zero_start() {
+    fn test_extract_loop_shape_non_zero_start() {
         let source = r#"
 import { SmartContract } from 'runar-lang';
 
@@ -3154,13 +3349,96 @@ class NonZeroStart extends SmartContract {
     public run(v: bigint) {
         let sum = 0n;
         for (let i = 1n; i < 3n; i++) {
-            sum += i;
+            sum = sum + i;
         }
         assert(sum === v);
     }
 }
 "#;
         let contract = parse_only(source);
-        let _ = lower_to_anf(&contract);
+        let anf = lower_to_anf(&contract);
+        let (count, start, step) = find_loop(&anf);
+        assert_eq!(count, 2);
+        assert_eq!(start, serde_json::json!(1));
+        assert_eq!(step, 1);
+    }
+
+    #[test]
+    fn test_extract_loop_shape_countdown() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Countdown extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 3n; i > 0n; i--) {
+            sum = sum + i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_only(source);
+        let anf = lower_to_anf(&contract);
+        let (count, start, step) = find_loop(&anf);
+        assert_eq!(count, 3);
+        assert_eq!(start, serde_json::json!(3));
+        assert_eq!(step, -1);
+    }
+
+    // -----------------------------------------------------------------------
+    // #130: a method param whose name shadows a property resolves to the param
+    // for bare identifiers, while explicit `this.x` still resolves to the
+    // property.
+    // -----------------------------------------------------------------------
+
+    /// Count `load_param` / `load_prop` bindings referencing `name` anywhere in
+    /// a method body (recursing into if/loop bodies).
+    fn count_loads(bindings: &[ANFBinding], kind_is_param: bool, name: &str) -> usize {
+        let mut n = 0;
+        for b in bindings {
+            match &b.value {
+                ANFValue::LoadParam { name: pn } if kind_is_param && pn == name => n += 1,
+                ANFValue::LoadProp { name: pn } if !kind_is_param && pn == name => n += 1,
+                ANFValue::If { then, else_branch, .. } => {
+                    n += count_loads(then, kind_is_param, name);
+                    n += count_loads(else_branch, kind_is_param, name);
+                }
+                ANFValue::Loop { body, .. } => {
+                    n += count_loads(body, kind_is_param, name);
+                }
+                _ => {}
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn test_param_shadowing_property_resolves_both_directions() {
+        let source = r#"
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+    readonly x: bigint;
+    constructor(x: bigint) { super(x); this.x = x; }
+    public m(x: bigint) {
+        assert(x === this.x);
+    }
+}
+"#;
+        let contract = parse_only(source);
+        let anf = lower_to_anf(&contract);
+        let m = anf.methods.iter().find(|m| m.name == "m").expect("method m");
+        // bare `x` -> load_param (the witness value), not the property.
+        assert_eq!(count_loads(&m.body, true, "x"), 1, "expected one load_param x");
+        // explicit `this.x` -> load_prop (the stored property).
+        assert_eq!(count_loads(&m.body, false, "x"), 1, "expected one load_prop x");
     }
 }

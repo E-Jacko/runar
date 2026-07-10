@@ -56,6 +56,7 @@ export type {
 export {
   buildWitness,
   runDifferentialExecution,
+  runTriModalExecution,
   runFoldEquivalence,
   runStatelessSigned,
   runStatefulSpend,
@@ -65,6 +66,7 @@ export type {
   WitnessArg,
   DiffExecOptions,
   DiffExecResult,
+  TriModalExecResult,
   FoldEqOptions,
   FoldEqResult,
   FoldEqDivergence,

@@ -1,5 +1,6 @@
 package runar.compiler.passes;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -112,6 +113,30 @@ public final class StackLower {
         + "7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f"
         + "9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e"
         + "01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad";
+
+    /**
+     * Issue #123: the check-preimage binding blob for a declared @sighash mode.
+     * The default ALL|FORKID (null / 0x41) returns the pinned cross-tier
+     * constant verbatim. A non-default mode swaps ONLY the appended sighash flag
+     * byte — the unique {@code 01 41 7e} subsequence (OP_PUSHDATA(1) 0x41 OP_CAT)
+     * that appends the flag to the derived DER signature — leaving every other
+     * byte byte-identical to the default blob (matching the TypeScript reference
+     * {@code checkPreimageBindingBytes(sighashFlag)}).
+     */
+    private static String checkPreimageBindingHex(Integer sighashFlag) {
+        if (sighashFlag == null || sighashFlag == SighashDirective.SIGHASH_DEFAULT) {
+            return CHECK_PREIMAGE_BINDING_HEX;
+        }
+        int marker = CHECK_PREIMAGE_BINDING_HEX.indexOf("01417e");
+        if (marker < 0) {
+            // Defensive: the constant is pinned, so this cannot happen.
+            throw new IllegalStateException("check-preimage binding: sighash flag byte not found");
+        }
+        String flagHex = String.format("%02x", sighashFlag & 0xff);
+        return CHECK_PREIMAGE_BINDING_HEX.substring(0, marker + 2)
+            + flagHex
+            + CHECK_PREIMAGE_BINDING_HEX.substring(marker + 4);
+    }
 
     // ------------------------------------------------------------------
     // State-field type classification (mirrors stack.py)
@@ -563,6 +588,14 @@ public final class StackLower {
         Map<String, Boolean> localBindings = new HashMap<>();
         Set<String> outerProtectedRefs;
         boolean insideBranch;
+        /**
+         * Method params whose names collide with a MUTABLE property. Maps the
+         * param name to the reserved stack-slot name its witness value lives
+         * under, so {@code lowerLoadParam} reads the param and not the
+         * same-named deserialized property slot (issue #130). Empty for the
+         * common no-collision case (byte-identical output).
+         */
+        Map<String, String> renamedParams = new HashMap<>();
         // Element counts for array_literal bindings (used by checkMultiSig).
         Map<String, Integer> arrayLengths = new HashMap<>();
         // Element refs for array_literal bindings (used by checkMultiSig).
@@ -575,6 +608,32 @@ public final class StackLower {
         LoweringContext(List<String> params, List<AnfProperty> properties) {
             this.sm = new StackMap(params);
             this.properties = properties;
+
+            // Issue #130 (stack layer): a method param whose name collides with
+            // a MUTABLE property gets a duplicate stackMap slot once
+            // `deserialize_state` pushes that property under the same name. Name
+            // lookups resolve to the shallowest match (the deserialized
+            // property), so `load_param` would read the stale on-chain state
+            // instead of the witness value. Rename the colliding param's slot to
+            // a reserved, collision-proof name up front and remember the mapping
+            // so `lowerLoadParam` targets the real param slot. Only mutable
+            // properties are deserialized onto the stack, so readonly shadows
+            // (handled purely by ANF resolution) never enter this map, and
+            // non-colliding contracts get an empty map — byte-identical output.
+            if (params != null && properties != null) {
+                Set<String> mutablePropNames = new java.util.HashSet<>();
+                for (AnfProperty p : properties) {
+                    if (!p.readonly()) mutablePropNames.add(p.name());
+                }
+                for (String name : params) {
+                    if (name != null && mutablePropNames.contains(name)) {
+                        String renamed = "__param_" + name;
+                        sm.renameAtDepth(sm.findDepth(name), renamed);
+                        renamedParams.put(name, renamed);
+                    }
+                }
+            }
+
             trackDepth();
         }
 
@@ -667,6 +726,10 @@ public final class StackLower {
             LoweringContext c = new LoweringContext(null, properties);
             c.sm.slots.addAll(this.sm.slots);
             c.privateMethods = this.privateMethods;
+            // Issue #130: a `load_param` for a shadowed param inside a branch
+            // body must resolve to the same reserved renamed slot the parent set
+            // up (the parent copied its renamed slot names into c.sm above).
+            c.renamedParams = this.renamedParams;
             // GAP-002: nested branches keep the outer statement's loc by
             // default; the inner binding loop will override on each step.
             c.currentSourceLoc = this.currentSourceLoc;
@@ -876,7 +939,7 @@ public final class StackLower {
             } else if (v instanceof If iv) {
                 lowerIf(name, iv.cond(), iv.thenBranch(), iv.elseBranch(), idx, lastUses, false);
             } else if (v instanceof Loop l) {
-                lowerLoop(name, l.count(), l.body(), l.iterVar(), idx, lastUses);
+                lowerLoop(name, l.count(), l.body(), l.iterVar(), l.start(), l.step(), idx, lastUses);
             } else if (v instanceof Assert a) {
                 lowerAssert(a.value(), idx, lastUses, false);
             } else if (v instanceof UpdateProp up) {
@@ -884,7 +947,7 @@ public final class StackLower {
             } else if (v instanceof GetStateScript) {
                 lowerGetStateScript(name);
             } else if (v instanceof CheckPreimage cp) {
-                lowerCheckPreimage(name, cp.preimage(), idx, lastUses);
+                lowerCheckPreimage(name, cp.preimage(), cp.sighashFlag(), idx, lastUses);
             } else if (v instanceof DeserializeState ds) {
                 lowerDeserializeState(ds.preimage(), idx, lastUses);
             } else if (v instanceof AddOutput ao) {
@@ -909,9 +972,14 @@ public final class StackLower {
         // ---------------- load_param / load_prop / load_const ----------------
 
         void lowerLoadParam(String bindingName, String paramName, int idx, Map<String, Integer> lastUses) {
-            if (sm.has(paramName)) {
+            // The parameter is already on the stack under its original name — or,
+            // for a param that shadows a mutable property, under a reserved
+            // renamed slot (issue #130) so it is not confused with the
+            // deserialized property slot.
+            String slotName = renamedParams.getOrDefault(paramName, paramName);
+            if (sm.has(slotName)) {
                 boolean isLast = isLastUse(paramName, idx, lastUses);
-                bringToTop(paramName, isLast);
+                bringToTop(slotName, isLast);
                 sm.pop();
                 sm.push(bindingName);
             } else {
@@ -940,11 +1008,34 @@ public final class StackLower {
                 pushPropertyValue(prop.initialValue());
             } else {
                 // Deployment-time constructor arg placeholder.
-                int paramIndex = 0;
+                //
+                // #119 tail (H1): a property that reaches this fallback with no
+                // matching constructor slot (paramIndex < 0) has no deploy-time
+                // bytes of its own. The previous behaviour coerced it onto slot
+                // 0, silently splicing an UNRELATED constructor argument's
+                // placeholder into the locking script — a silent-wrong-code
+                // path. Fail loudly instead. (A real constructor-param property
+                // — readonly, or a mutable state field whose initial value is
+                // spliced at deploy — is found and unaffected, so zero golden
+                // churn.)
+                List<String> ctorProps = new ArrayList<>();
                 for (AnfProperty p : properties) {
                     if (p.initialValue() != null) continue;
-                    if (p.name().equals(propName)) break;
-                    paramIndex++;
+                    ctorProps.add(p.name());
+                }
+                int paramIndex = ctorProps.indexOf(propName);
+                if (paramIndex < 0) {
+                    String loc = currentSourceLoc != null
+                        ? " at " + currentSourceLoc.file() + ":" + currentSourceLoc.line()
+                            + ":" + currentSourceLoc.column()
+                        : "";
+                    throw new RuntimeException(
+                        "Stack lowering: property '" + propName + "'" + loc
+                            + " is neither on the stack, initialized, nor a constructor "
+                            + "parameter, so it has no deploy-time slot. Refusing to emit "
+                            + "a placeholder for an unrelated constructor argument (slot 0). "
+                            + "Known constructor-param properties: ["
+                            + String.join(", ", ctorProps) + "].");
                 }
                 emitOp(new PlaceholderOp(paramIndex, propName));
             }
@@ -2177,6 +2268,7 @@ public final class StackLower {
         // ---------------- loop ----------------
 
         void lowerLoop(String bindingName, int count, List<AnfBinding> body, String iterVar,
+                       BigInteger start, int step,
                        Integer loopBindingIndex, Map<String, Integer> enclosingLastUses) {
             // Names (re)defined anywhere inside the loop body, nested branches
             // included. A name the body itself binds is NOT an outer ref —
@@ -2209,7 +2301,13 @@ public final class StackLower {
             localBindings = newLocal;
 
             for (int i = 0; i < count; i++) {
-                emitOp(new PushOp(PushValue.of(i)));
+                // Push the iteration variable value (in case the loop body uses
+                // it). Iteration `i` binds `start + i*step` (issue #121);
+                // zero-start counting-up loops (start=0, step=1) reduce to
+                // BigInteger.valueOf(i), preserving the historical byte-for-byte
+                // lowering.
+                emitOp(new PushOp(PushValue.of(
+                    start.add(BigInteger.valueOf((long) i * step)))));
                 sm.push(iterVar);
                 Map<String, Integer> lastUses = computeLastUses(body);
 
@@ -2344,7 +2442,8 @@ public final class StackLower {
 
         // ---------------- check_preimage (OP_PUSH_TX) ----------------
 
-        void lowerCheckPreimage(String bindingName, String preimage, int idx, Map<String, Integer> lastUses) {
+        void lowerCheckPreimage(String bindingName, String preimage, Integer sighashFlag,
+                                int idx, Map<String, Integer> lastUses) {
             // OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to
             // the current spending transaction. The signature is DERIVED FROM THE
             // PREIMAGE ON CHAIN (Optimal OP_PUSH_TX): s = (hash256(preimage) + r)*
@@ -2363,8 +2462,11 @@ public final class StackLower {
             bringToTop(preimage, isLastUse(preimage, idx, lastUses));
 
             // Derive + verify the signature on-chain (single opaque raw_bytes
-            // blob, byte-identical across all 7 tiers). Net stack effect is zero.
-            emitCheckPreimageBinding();
+            // blob). For the default ALL|FORKID (sighashFlag null) the blob is
+            // byte-identical to the pinned cross-tier constant; issue #123 lets a
+            // method declare a different mode, which only changes the appended
+            // sighash flag byte. Net stack effect is zero.
+            emitCheckPreimageBinding(sighashFlag);
 
             // Preimage remains on top. Rename for field extractors.
             sm.pop();
@@ -2376,10 +2478,12 @@ public final class StackLower {
          * Emit the on-chain preimage binding as one opaque raw_bytes op. Net
          * stack effect is 0 (preimage in → preimage out), declared as in=1/out=1
          * so the static analyzer keeps the depth consistent. The bytes are the
-         * canonical construction shared byte-for-byte by all seven tiers.
+         * canonical construction shared byte-for-byte by all seven tiers for the
+         * default ALL|FORKID mode; issue #123 swaps only the appended sighash
+         * flag byte for a non-default declared mode.
          */
-        void emitCheckPreimageBinding() {
-            emitOp(new RawBytesOp(Emit.hexToBytes(CHECK_PREIMAGE_BINDING_HEX), 1, 1));
+        void emitCheckPreimageBinding(Integer sighashFlag) {
+            emitOp(new RawBytesOp(Emit.hexToBytes(checkPreimageBindingHex(sighashFlag)), 1, 1));
         }
 
         // ---------------- deserialize_state ----------------

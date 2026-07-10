@@ -110,6 +110,9 @@ func ComputeSideEffectSummary(contract *ContractNode) SideEffectSummary {
 			if pa, ok := s.Target.(PropertyAccessExpr); ok && mutableProps[pa.Property] {
 				into.MutatesState = true
 			}
+			// #123 F3: both sides may contain calls — an output intrinsic could
+			// hide in the target's index/object as well as the value.
+			collectExpr(s.Target, into)
 			collectExpr(s.Value, into)
 		case ExpressionStmt:
 			collectExpr(s.Expr, into)
@@ -122,6 +125,10 @@ func ComputeSideEffectSummary(contract *ContractNode) SideEffectSummary {
 				collectStmt(inner, into)
 			}
 		case ForStmt:
+			// #123 F3: walk the full loop header — an output intrinsic can hide
+			// in init or condition, not only in update/body.
+			collectStmt(s.Init, into)
+			collectExpr(s.Condition, into)
 			collectStmt(s.Update, into)
 			for _, inner := range s.Body {
 				collectStmt(inner, into)

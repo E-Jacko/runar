@@ -21,6 +21,7 @@ def build_call_transaction(
     additional_contract_inputs: list[dict] | None = None,
     data_outputs: list[dict] | None = None,
     locktime: int | None = None,
+    sequence: int | None = None,
 ) -> tuple[str, int, int]:
     """Build a raw transaction that spends a contract UTXO.
 
@@ -34,9 +35,18 @@ def build_call_transaction(
     locktime: override the call tx's nLockTime. None → defaults to 0 (legacy).
         Set for contracts that assert extractLocktime(preimage) >= deadline
         (e.g. auction close/claim).
+    sequence: override the nSequence written onto every input (issue #131).
+        None → 0xfffffffe when a non-zero locktime is set (so nLockTime is
+        consensus-enforced), else 0xffffffff (final, legacy).
 
     Returns (tx_hex, input_count, change_amount).
     """
+    # Sequence (issue #131): an all-0xffffffff input set makes nLockTime a
+    # consensus no-op. When a non-zero locktime is set, default every input to
+    # 0xfffffffe (non-final) so the locktime is actually enforced. Explicit
+    # sequence always wins.
+    input_sequence_hex = _to_le32(resolve_input_sequence(locktime, sequence))
+
     extra_contract_inputs = additional_contract_inputs or []
     additional = additional_utxos or []
     resolved_data_outputs = data_outputs or []
@@ -106,7 +116,7 @@ def build_call_transaction(
     tx += _to_le32(current_utxo.output_index)
     tx += _encode_varint(len(unlocking_script) // 2)
     tx += unlocking_script
-    tx += 'ffffffff'
+    tx += input_sequence_hex
 
     # Additional contract inputs (with their own unlocking scripts)
     for ci in extra_contract_inputs:
@@ -116,14 +126,14 @@ def build_call_transaction(
         tx += _to_le32(ci_utxo.output_index)
         tx += _encode_varint(len(ci_script) // 2)
         tx += ci_script
-        tx += 'ffffffff'
+        tx += input_sequence_hex
 
     # P2PKH funding inputs (unsigned)
     for utxo in additional:
         tx += _reverse_hex(utxo.txid)
         tx += _to_le32(utxo.output_index)
         tx += '00'
-        tx += 'ffffffff'
+        tx += input_sequence_hex
 
     # Outputs
     num_outputs = len(resolved_contract_outputs) + len(resolved_data_outputs)
@@ -158,6 +168,29 @@ def build_call_transaction(
     tx += _to_le32(locktime if locktime is not None else 0)
 
     return tx, len(all_utxos), change if change > 0 else 0
+
+
+def resolve_input_sequence(
+    locktime: int | None,
+    sequence: int | None,
+) -> int:
+    """Resolve the nSequence for a call tx's inputs (issue #131).
+
+    An all-0xffffffff input set makes nLockTime a consensus no-op, so a
+    locktime-gated method would be script-enforced (via extractLocktime) yet
+    NOT consensus-enforced. When a non-zero locktime is set we therefore
+    default every input to 0xfffffffe (non-final, enforceable). Explicit
+    ``sequence`` always wins; with no/zero locktime we keep the legacy
+    0xffffffff.
+
+    Shared by ``build_call_transaction`` and the terminal-path tx builder so
+    both sites stay byte-consistent.
+    """
+    if sequence is not None:
+        return sequence
+    if locktime is not None and locktime != 0:
+        return 0xFFFFFFFE
+    return 0xFFFFFFFF
 
 
 # ---------------------------------------------------------------------------

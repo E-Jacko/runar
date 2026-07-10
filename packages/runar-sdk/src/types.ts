@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Transaction as BsvTransaction } from '@bsv/sdk';
+import type { Signer } from './signers/signer.js';
 
 /**
  * Plain data shape returned by Provider.getTransaction().
@@ -44,6 +45,13 @@ export interface DeployOptions {
   /** Satoshis to lock in the contract UTXO. Defaults to 1. */
   satoshis?: number;
   changeAddress?: string;
+  /**
+   * Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+   * are owned by a different key than the connected deploy signer, set this so
+   * the funding inputs are signed by their real owner. Defaults to the
+   * connected signer (zero behaviour change).
+   */
+  fundingSigner?: Signer;
 }
 
 /**
@@ -157,6 +165,25 @@ export interface CallOptions {
   fundingUtxos?: UTXO[];
 
   /**
+   * A single plain P2PKH UTXO added to a terminal call tx purely to pay the
+   * miner fee (issue #118). A true terminal method pays out the full contract
+   * balance, so fee would be 0 and ARC rejects; the covenant asserts its exact
+   * output set, so no change output can absorb a fee. The fee input is added
+   * BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers it) and
+   * is consumed entirely as fee — no change output is created. Signed with
+   * `fundingSigner ?? signer`. The covenant's output assertions are untouched.
+   *
+   * IMPORTANT: because there is no change output, the ENTIRE feeUtxo is spent
+   * as fee — any amount beyond the actual miner fee is BURNED, not returned.
+   * Size the feeUtxo close to the intended fee (a few hundred sats at the BSV
+   * standard 0.1 sat/byte is typical for a small terminal tx). The SDK emits a
+   * `console.warn` when the supplied feeUtxo dwarfs the terminal tx's estimated
+   * fee (> 5x and > ~1000 sats of excess), so an accidental large coin is
+   * caught before broadcast.
+   */
+  feeUtxo?: UTXO;
+
+  /**
    * Optional explicit override for data outputs emitted via
    * `this.addDataOutput(...)` in the method body. When omitted, the SDK
    * resolves data outputs automatically by running the ANF interpreter on
@@ -171,4 +198,32 @@ export interface CallOptions {
    * Threaded through both the non-terminal and terminal call-tx build sites.
    */
   locktime?: number;
+
+  /**
+   * Override the nSequence written onto EVERY input of the call tx (issue #131).
+   * Defaults are zero-config: when `locktime` is set and non-zero, sequence
+   * defaults to 0xfffffffe (non-final, so consensus actually enforces
+   * nLockTime); otherwise it stays 0xffffffff (final, legacy). Set explicitly
+   * only for RBF or custom relative-locktime scenarios. Threaded through the
+   * non-terminal and terminal call-tx build sites.
+   */
+  sequence?: number;
+
+  /**
+   * Cap the number of P2PKH funding inputs added to a non-terminal call tx
+   * (issue #133). Funding is chosen by smallest-sufficient, largest-first
+   * selection (the same `selectUtxos` strategy deploy uses). If covering the
+   * outputs + fee would need more than this many inputs, the call throws
+   * rather than silently sweeping the wallet. Unset → no cap.
+   */
+  maxFundingInputs?: number;
+
+  /**
+   * Signer for the P2PKH funding (and terminal fee) inputs (issue #134). When
+   * the funding/fee UTXOs are owned by a different key than the connected
+   * method signer, set this so those inputs are signed by their real owner.
+   * The method's own `Sig` args are still signed by the connected signer.
+   * Defaults to the connected signer (zero behaviour change).
+   */
+  fundingSigner?: Signer;
 }

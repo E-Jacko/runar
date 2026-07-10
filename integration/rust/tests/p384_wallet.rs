@@ -69,6 +69,7 @@ fn test_p384_wallet_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("P-384 wallet deploy failed");
     assert!(!deploy_txid.is_empty());

@@ -21,6 +21,15 @@ import {
   collectUsedTypes,
 } from './contract-ir.js';
 
+// `ForStmt` is exec-oracle-only (issue #124): the tri-modal execution oracle
+// generates loops + byte-ops and renders them to TypeScript only. The native
+// cross-tier `--ir` renderers deliberately do NOT emit loops (that would force
+// 7-compiler byte-identical loop parity, out of #124's scope), so they reject
+// a ForStmt loudly rather than emit unverified per-language loop syntax.
+const FOR_STMT_UNSUPPORTED =
+  'ForStmt is exec-oracle-only (issue #124); render loop contracts to ' +
+  'TypeScript via renderTypeScript, not the native cross-tier renderers.';
+
 // ---------------------------------------------------------------------------
 // TypeScript renderer (.runar.ts)
 // ---------------------------------------------------------------------------
@@ -65,6 +74,16 @@ function tsStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
+    case 'for': {
+      const upd = stmt.step === 1 ? '++' : '--';
+      const lines = [
+        `${indent}for (let ${stmt.iterVar}: bigint = ${stmt.start}n; ` +
+          `${stmt.iterVar} ${stmt.op} ${stmt.bound}n; ${stmt.iterVar}${upd}) {`,
+      ];
+      for (const s of stmt.body) lines.push(tsStmt(s, indent + '  '));
+      lines.push(`${indent}}`);
+      return lines.join('\n');
+    }
     case 'expr':
       return `${indent}${tsExpr(stmt.expr)};`;
   }
@@ -83,6 +102,7 @@ export function renderTypeScript(contract: GeneratedContract): string {
   if (usedFns.has('checkSig')) valueImports.push('checkSig');
   if (usedFns.has('len')) valueImports.push('len');
   if (usedFns.has('cat')) valueImports.push('cat');
+  if (usedFns.has('substr')) valueImports.push('substr');
   if (usedFns.has('abs')) valueImports.push('abs');
   if (usedFns.has('min')) valueImports.push('min');
   if (usedFns.has('max')) valueImports.push('max');
@@ -205,6 +225,8 @@ function goStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
+    case 'for':
+      throw new Error(FOR_STMT_UNSUPPORTED);
     case 'expr':
       return `${indent}${goExpr(stmt.expr)}`;
   }
@@ -299,6 +321,8 @@ function rsStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
+    case 'for':
+      throw new Error(FOR_STMT_UNSUPPORTED);
     case 'expr':
       return `${indent}${rsExpr(stmt.expr)};`;
   }
@@ -401,6 +425,8 @@ function pyStmt(stmt: Stmt, indent: string): string {
       }
       return lines.join('\n');
     }
+    case 'for':
+      throw new Error(FOR_STMT_UNSUPPORTED);
     case 'expr':
       return `${indent}${pyExpr(stmt.expr)}`;
   }
@@ -541,6 +567,8 @@ function zigStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
+    case 'for':
+      throw new Error(FOR_STMT_UNSUPPORTED);
     case 'expr':
       return `${indent}${zigExpr(stmt.expr)};`;
   }
@@ -644,6 +672,8 @@ function rbStmt(stmt: Stmt, indent: string): string {
       lines.push(`${indent}end`);
       return lines.join('\n');
     }
+    case 'for':
+      throw new Error(FOR_STMT_UNSUPPORTED);
     case 'expr':
       return `${indent}${rbExpr(stmt.expr)}`;
   }
@@ -892,6 +922,8 @@ function javaStmt(
       lines.push(`${indent}}`);
       return lines.join('\n');
     }
+    case 'for':
+      throw new Error(FOR_STMT_UNSUPPORTED);
     case 'expr':
       return `${indent}${javaExpr(stmt.expr, bigintVars, boolVars)};`;
   }

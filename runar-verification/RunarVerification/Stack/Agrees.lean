@@ -7050,21 +7050,61 @@ theorem stageC_simpleStep_binOp_NUMNOTEQUAL_d0d1
         ((bn, .binding) :: (topName, k_top) :: (botName, k_bot) :: tsm_rest)
         (anfSt.addBinding bn (.vBool (decide (a ≠ b))))
         (stkSt.push (.vBool (decide (a ≠ b)))) := by
-  apply stageC_simpleStep_binOp_d0d1_core
-    (op := "!==") (opcode := "OP_NUMNOTEQUAL") (rt := none)
-    (out := .vBool (decide (a ≠ b)))
-    (bn := bn) (topName := topName) (botName := botName)
-    (k_top := k_top) (k_bot := k_bot) (tsm_rest := tsm_rest)
-    (anfSt := anfSt) (stkSt := stkSt) (a := a) (b := b)
-    hAgrees hLookupL hLookupR hFresh hLoadLeftShape hLoadRightShape
-  · rfl
-  · intro rightV hRight
-    have hMidStk : ((stkSt.push (.vBigint a)).push rightV).stack =
-        .vBigint b :: .vBigint a :: stkSt.stack := by
-      unfold StackState.push
-      rw [hRight]
-    exact Stack.Sim.runOpcode_NUMNOTEQUAL_intInt
-      ((stkSt.push (.vBigint a)).push rightV) a b stkSt.stack hMidStk
+  -- Issue #116: numeric `!==` now lowers to the 2-opcode tail
+  -- `[OP_NUMEQUAL, OP_NOT]` (mirroring the byte-equality path
+  -- `stageC_simpleStep_binOp_BYTES_NOTEQUAL_d0d1`). `OP_NUMEQUAL` yields
+  -- `decide (a = b)`, `OP_NOT` inverts it to `!decide (a = b) = decide (a ≠ b)`.
+  refine ⟨?_, ?_⟩
+  · have hLower :
+        (lowerValue (untagSm ((topName, k_top) :: (botName, k_bot) :: tsm_rest))
+          bn (.binOp "!==" topName botName none)).1 =
+        loadRef (untagSm ((topName, k_top) :: (botName, k_bot) :: tsm_rest)) topName
+          ++ loadRef
+              ((untagSm ((topName, k_top) :: (botName, k_bot) :: tsm_rest)).push topName)
+              botName
+          ++ [.opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT"] := by rfl
+    rw [hLower, hLoadLeftShape, hLoadRightShape]
+    have hEqRun :
+        runOps [.dup, .pickStruct 2, .opcode "OP_NUMEQUAL"] stkSt =
+          .ok (stkSt.push (.vBool (decide (a = b)))) :=
+      runOps_dup_pickStruct2_intOpcode_d0d1
+        topName botName k_top k_bot tsm_rest anfSt stkSt a b "OP_NUMEQUAL"
+        (.vBool (decide (a = b))) hAgrees hLookupL hLookupR
+        (by
+          intro rightV hRight
+          have hMidStk : ((stkSt.push (.vBigint a)).push rightV).stack =
+              .vBigint b :: .vBigint a :: stkSt.stack := by
+            unfold StackState.push
+            rw [hRight]
+          exact Stack.Sim.runOpcode_NUMEQUAL_intInt
+            ((stkSt.push (.vBigint a)).push rightV) a b stkSt.stack hMidStk)
+    have hNotStk : (stkSt.push (.vBool (decide (a = b)))).stack =
+        .vBool (decide (a = b)) :: stkSt.stack := by unfold StackState.push; rfl
+    have hNot :
+        runOpcode "OP_NOT" (stkSt.push (.vBool (decide (a = b)))) =
+          .ok ({stkSt.push (.vBool (decide (a = b))) with stack := stkSt.stack}.push
+              (.vBool (!decide (a = b)))) :=
+      Stack.Sim.runOpcode_NOT_bool (stkSt.push (.vBool (decide (a = b))))
+        (decide (a = b)) stkSt.stack hNotStk
+    have hPostEq :
+        ({stkSt.push (.vBool (decide (a = b))) with stack := stkSt.stack}.push
+            (.vBool (!decide (a = b))))
+          = stkSt.push (.vBool (decide (a ≠ b))) := by
+      have hval : (!decide (a = b)) = decide (a ≠ b) := by
+        by_cases h : a = b <;> simp [h]
+      rw [hval]; unfold StackState.push; cases stkSt; simp
+    rw [hPostEq] at hNot
+    show runOps ([.dup, .pickStruct 2, .opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT"]) stkSt =
+      .ok (stkSt.push (.vBool (decide (a ≠ b))))
+    exact runOps_loadThenOpcode_unconditional
+      [.dup, .pickStruct 2, .opcode "OP_NUMEQUAL"] "OP_NOT" stkSt
+      (stkSt.push (.vBool (decide (a = b)))) (stkSt.push (.vBool (decide (a ≠ b))))
+      hEqRun hNot
+  · refine ⟨?_, (.vBool (decide (a ≠ b))), rfl, rfl, rfl⟩
+    show freshIn bn
+      (untagSm ((topName, k_top) :: (botName, k_bot) :: tsm_rest))
+    unfold untagSm
+    exact hFresh
 
 /-- Operational discharge for `binOp "&&" left right _` when `left` is at
 depth 0 and `right` is at depth 1. -/
@@ -7670,21 +7710,55 @@ theorem stageC_simpleStep_binOp_NUMNOTEQUAL_d0_dge2
         ((bn, .binding) :: (topName, k_top) :: tsm_rest)
         (anfSt.addBinding bn (.vBool (decide (a ≠ b))))
         (stkSt.push (.vBool (decide (a ≠ b)))) := by
-  apply stageC_simpleStep_binOp_d0_dge2_core
-    (op := "!==") (opcode := "OP_NUMNOTEQUAL") (rt := none)
-    (out := .vBool (decide (a ≠ b)))
-    (bn := bn) (topName := topName) (rightName := rightName)
-    (k_top := k_top) (k_right := k_right) (tsm_rest := tsm_rest)
-    (anfSt := anfSt) (stkSt := stkSt) (a := a) (b := b) (d := d)
-    hAgrees hAtDepth hLookupL hLookupR hFresh hLoadLeftShape hLoadRightShape
-  · rfl
-  · intro rightV hRight
-    have hMidStk : ((stkSt.push (.vBigint a)).push rightV).stack =
-        .vBigint b :: .vBigint a :: stkSt.stack := by
-      unfold StackState.push
-      rw [hRight]
-    exact Stack.Sim.runOpcode_NUMNOTEQUAL_intInt
-      ((stkSt.push (.vBigint a)).push rightV) a b stkSt.stack hMidStk
+  -- Issue #116: numeric `!==` 2-opcode tail (see NUMNOTEQUAL_d0d1).
+  refine ⟨?_, ?_⟩
+  · have hLower :
+        (lowerValue (untagSm ((topName, k_top) :: tsm_rest))
+          bn (.binOp "!==" topName rightName none)).1 =
+        loadRef (untagSm ((topName, k_top) :: tsm_rest)) topName
+          ++ loadRef ((untagSm ((topName, k_top) :: tsm_rest)).push topName) rightName
+          ++ [.opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT"] := by rfl
+    rw [hLower, hLoadLeftShape, hLoadRightShape]
+    have hEqRun :
+        runOps [.dup, .pickStruct (d + 1), .opcode "OP_NUMEQUAL"] stkSt =
+          .ok (stkSt.push (.vBool (decide (a = b)))) :=
+      runOps_dup_pickStructSucc_intOpcode_d0_dge2
+        topName rightName k_top k_right tsm_rest anfSt stkSt a b d "OP_NUMEQUAL"
+        (.vBool (decide (a = b))) hAgrees hAtDepth hLookupL hLookupR
+        (by
+          intro rightV hRight
+          have hMidStk : ((stkSt.push (.vBigint a)).push rightV).stack =
+              .vBigint b :: .vBigint a :: stkSt.stack := by
+            unfold StackState.push
+            rw [hRight]
+          exact Stack.Sim.runOpcode_NUMEQUAL_intInt
+            ((stkSt.push (.vBigint a)).push rightV) a b stkSt.stack hMidStk)
+    have hNotStk : (stkSt.push (.vBool (decide (a = b)))).stack =
+        .vBool (decide (a = b)) :: stkSt.stack := by unfold StackState.push; rfl
+    have hNot :
+        runOpcode "OP_NOT" (stkSt.push (.vBool (decide (a = b)))) =
+          .ok ({stkSt.push (.vBool (decide (a = b))) with stack := stkSt.stack}.push
+              (.vBool (!decide (a = b)))) :=
+      Stack.Sim.runOpcode_NOT_bool (stkSt.push (.vBool (decide (a = b))))
+        (decide (a = b)) stkSt.stack hNotStk
+    have hPostEq :
+        ({stkSt.push (.vBool (decide (a = b))) with stack := stkSt.stack}.push
+            (.vBool (!decide (a = b))))
+          = stkSt.push (.vBool (decide (a ≠ b))) := by
+      have hval : (!decide (a = b)) = decide (a ≠ b) := by
+        by_cases h : a = b <;> simp [h]
+      rw [hval]; unfold StackState.push; cases stkSt; simp
+    rw [hPostEq] at hNot
+    show runOps ([.dup, .pickStruct (d + 1), .opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT"]) stkSt =
+      .ok (stkSt.push (.vBool (decide (a ≠ b))))
+    exact runOps_loadThenOpcode_unconditional
+      [.dup, .pickStruct (d + 1), .opcode "OP_NUMEQUAL"] "OP_NOT" stkSt
+      (stkSt.push (.vBool (decide (a = b)))) (stkSt.push (.vBool (decide (a ≠ b))))
+      hEqRun hNot
+  · refine ⟨?_, (.vBool (decide (a ≠ b))), rfl, rfl, rfl⟩
+    show freshIn bn (untagSm ((topName, k_top) :: tsm_rest))
+    unfold untagSm
+    exact hFresh
 
 /-- Operational discharge for `binOp "&&" left right _` when `left` is at
 depth 0 and `right` is at depth >= 2. -/
@@ -8271,21 +8345,55 @@ theorem stageC_simpleStep_binOp_NUMNOTEQUAL_dge2_d0
         ((bn, .binding) :: (topName, k_top) :: tsm_rest)
         (anfSt.addBinding bn (.vBool (decide (a ≠ b))))
         (stkSt.push (.vBool (decide (a ≠ b)))) := by
-  apply stageC_simpleStep_binOp_dge2_d0_core
-    (op := "!==") (opcode := "OP_NUMNOTEQUAL") (rt := none)
-    (out := .vBool (decide (a ≠ b)))
-    (bn := bn) (topName := topName) (leftName := leftName)
-    (k_top := k_top) (k_left := k_left) (tsm_rest := tsm_rest)
-    (anfSt := anfSt) (stkSt := stkSt) (a := a) (b := b) (d := d)
-    hAgrees hAtDepth hLookupL hLookupR hFresh hLoadLeftShape hLoadRightShape
-  · rfl
-  · intro rightV hRight
-    have hMidStk : ((stkSt.push (.vBigint a)).push rightV).stack =
-        .vBigint b :: .vBigint a :: stkSt.stack := by
-      unfold StackState.push
-      rw [hRight]
-    exact Stack.Sim.runOpcode_NUMNOTEQUAL_intInt
-      ((stkSt.push (.vBigint a)).push rightV) a b stkSt.stack hMidStk
+  -- Issue #116: numeric `!==` 2-opcode tail (see NUMNOTEQUAL_d0d1).
+  refine ⟨?_, ?_⟩
+  · have hLower :
+        (lowerValue (untagSm ((topName, k_top) :: tsm_rest))
+          bn (.binOp "!==" leftName topName none)).1 =
+        loadRef (untagSm ((topName, k_top) :: tsm_rest)) leftName
+          ++ loadRef ((untagSm ((topName, k_top) :: tsm_rest)).push leftName) topName
+          ++ [.opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT"] := by rfl
+    rw [hLower, hLoadLeftShape, hLoadRightShape]
+    have hEqRun :
+        runOps [.pickStruct d, .over, .opcode "OP_NUMEQUAL"] stkSt =
+          .ok (stkSt.push (.vBool (decide (a = b)))) :=
+      runOps_pickStruct_over_intOpcode_dge2_d0
+        topName leftName k_top k_left tsm_rest anfSt stkSt a b d "OP_NUMEQUAL"
+        (.vBool (decide (a = b))) hAgrees hAtDepth hLookupL hLookupR
+        (by
+          intro rightV hRight
+          have hMidStk : ((stkSt.push (.vBigint a)).push rightV).stack =
+              .vBigint b :: .vBigint a :: stkSt.stack := by
+            unfold StackState.push
+            rw [hRight]
+          exact Stack.Sim.runOpcode_NUMEQUAL_intInt
+            ((stkSt.push (.vBigint a)).push rightV) a b stkSt.stack hMidStk)
+    have hNotStk : (stkSt.push (.vBool (decide (a = b)))).stack =
+        .vBool (decide (a = b)) :: stkSt.stack := by unfold StackState.push; rfl
+    have hNot :
+        runOpcode "OP_NOT" (stkSt.push (.vBool (decide (a = b)))) =
+          .ok ({stkSt.push (.vBool (decide (a = b))) with stack := stkSt.stack}.push
+              (.vBool (!decide (a = b)))) :=
+      Stack.Sim.runOpcode_NOT_bool (stkSt.push (.vBool (decide (a = b))))
+        (decide (a = b)) stkSt.stack hNotStk
+    have hPostEq :
+        ({stkSt.push (.vBool (decide (a = b))) with stack := stkSt.stack}.push
+            (.vBool (!decide (a = b))))
+          = stkSt.push (.vBool (decide (a ≠ b))) := by
+      have hval : (!decide (a = b)) = decide (a ≠ b) := by
+        by_cases h : a = b <;> simp [h]
+      rw [hval]; unfold StackState.push; cases stkSt; simp
+    rw [hPostEq] at hNot
+    show runOps ([.pickStruct d, .over, .opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT"]) stkSt =
+      .ok (stkSt.push (.vBool (decide (a ≠ b))))
+    exact runOps_loadThenOpcode_unconditional
+      [.pickStruct d, .over, .opcode "OP_NUMEQUAL"] "OP_NOT" stkSt
+      (stkSt.push (.vBool (decide (a = b)))) (stkSt.push (.vBool (decide (a ≠ b))))
+      hEqRun hNot
+  · refine ⟨?_, (.vBool (decide (a ≠ b))), rfl, rfl, rfl⟩
+    show freshIn bn (untagSm ((topName, k_top) :: tsm_rest))
+    unfold untagSm
+    exact hFresh
 
 /-- Operational discharge for `binOp "&&" left right _` when `left` is at
 depth >= 2 and `right` is at depth 0. -/
@@ -9319,20 +9427,58 @@ theorem stageC_simpleStep_binOp_NUMNOTEQUAL_d1d0
         ((bn, .binding) :: (topName, k_top) :: (botName, k_bot) :: tsm_rest)
         (anfSt.addBinding bn (.vBool (decide (a ≠ b))))
         (stkSt.push (.vBool (decide (a ≠ b)))) := by
-  apply stageC_simpleStep_binOp_d1d0_core
-    (op := "!==") (opcode := "OP_NUMNOTEQUAL") (rt := none) (out := .vBool (decide (a ≠ b)))
-    (bn := bn) (topName := topName) (botName := botName)
-    (k_top := k_top) (k_bot := k_bot) (tsm_rest := tsm_rest)
-    (anfSt := anfSt) (stkSt := stkSt) (a := a) (b := b)
-    hAgrees hLookupL hLookupR hFresh hLoadLeftShape hLoadRightShape
-  · rfl
-  · intro topV hTop
-    have hMidStk : ((stkSt.push (.vBigint a)).push topV).stack =
-        .vBigint b :: .vBigint a :: stkSt.stack := by
-      unfold StackState.push
-      rw [hTop]
-    exact Stack.Sim.runOpcode_NUMNOTEQUAL_intInt
-      ((stkSt.push (.vBigint a)).push topV) a b stkSt.stack hMidStk
+  -- Issue #116: numeric `!==` 2-opcode tail (see NUMNOTEQUAL_d0d1).
+  refine ⟨?_, ?_⟩
+  · have hLower :
+        (lowerValue (untagSm ((topName, k_top) :: (botName, k_bot) :: tsm_rest))
+          bn (.binOp "!==" botName topName none)).1 =
+        loadRef (untagSm ((topName, k_top) :: (botName, k_bot) :: tsm_rest)) botName
+          ++ loadRef
+              ((untagSm ((topName, k_top) :: (botName, k_bot) :: tsm_rest)).push botName)
+              topName
+          ++ [.opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT"] := by rfl
+    rw [hLower, hLoadLeftShape, hLoadRightShape]
+    have hEqRun :
+        runOps [.over, .over, .opcode "OP_NUMEQUAL"] stkSt =
+          .ok (stkSt.push (.vBool (decide (a = b)))) :=
+      runOps_two_over_intOpcode_d1d0
+        topName botName k_top k_bot tsm_rest anfSt stkSt a b "OP_NUMEQUAL"
+        (.vBool (decide (a = b))) hAgrees hLookupL hLookupR
+        (by
+          intro topV hTop
+          have hMidStk : ((stkSt.push (.vBigint a)).push topV).stack =
+              .vBigint b :: .vBigint a :: stkSt.stack := by
+            unfold StackState.push
+            rw [hTop]
+          exact Stack.Sim.runOpcode_NUMEQUAL_intInt
+            ((stkSt.push (.vBigint a)).push topV) a b stkSt.stack hMidStk)
+    have hNotStk : (stkSt.push (.vBool (decide (a = b)))).stack =
+        .vBool (decide (a = b)) :: stkSt.stack := by unfold StackState.push; rfl
+    have hNot :
+        runOpcode "OP_NOT" (stkSt.push (.vBool (decide (a = b)))) =
+          .ok ({stkSt.push (.vBool (decide (a = b))) with stack := stkSt.stack}.push
+              (.vBool (!decide (a = b)))) :=
+      Stack.Sim.runOpcode_NOT_bool (stkSt.push (.vBool (decide (a = b))))
+        (decide (a = b)) stkSt.stack hNotStk
+    have hPostEq :
+        ({stkSt.push (.vBool (decide (a = b))) with stack := stkSt.stack}.push
+            (.vBool (!decide (a = b))))
+          = stkSt.push (.vBool (decide (a ≠ b))) := by
+      have hval : (!decide (a = b)) = decide (a ≠ b) := by
+        by_cases h : a = b <;> simp [h]
+      rw [hval]; unfold StackState.push; cases stkSt; simp
+    rw [hPostEq] at hNot
+    show runOps ([.over, .over, .opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT"]) stkSt =
+      .ok (stkSt.push (.vBool (decide (a ≠ b))))
+    exact runOps_loadThenOpcode_unconditional
+      [.over, .over, .opcode "OP_NUMEQUAL"] "OP_NOT" stkSt
+      (stkSt.push (.vBool (decide (a = b)))) (stkSt.push (.vBool (decide (a ≠ b))))
+      hEqRun hNot
+  · refine ⟨?_, (.vBool (decide (a ≠ b))), rfl, rfl, rfl⟩
+    show freshIn bn
+      (untagSm ((topName, k_top) :: (botName, k_bot) :: tsm_rest))
+    unfold untagSm
+    exact hFresh
 
 theorem stageC_simpleStep_binOp_BOOLAND_d1d0
     (bn topName botName : String) (k_top k_bot : SlotKind)
@@ -14652,7 +14798,10 @@ This is the form a body-level arith capstone consumes directly:
 theorem runOps_lowerValue_binOp_depth_general
     (sm : StackMap) (bn l r : String) (rt : Option String) (op : String)
     (dl dr' : Nat) (vl vr : Value) (out : StackState) (stkSt : StackState)
-    (hNotBytes : ¬ (op = "!==" ∧ rt = some "bytes"))
+    -- Issue #116: `!==` (any `rt`) now appends a trailing `OP_NOT`, so the
+    -- single-opcode shape below holds only for `op ≠ "!=="` (was: not the
+    -- bytes-`!==` conjunction). Callers pass a concrete non-`!==` op.
+    (hNotNeq : op ≠ "!==")
     (hDl : sm.depth? l = some dl)
     (hLenL : dl < stkSt.stack.length)
     (hAtL : stkSt.stack[dl]! = vl)
@@ -14667,12 +14816,8 @@ theorem runOps_lowerValue_binOp_depth_general
             ++ Stack.Lower.loadRef (sm.push l) r
             ++ [.opcode (Stack.Lower.binopOpcode op rt)] := by
     unfold Stack.Lower.lowerValue
-    have hGuard : (op == "!==" && rt == some "bytes") = false := by
-      by_cases hop : op = "!=="
-      · by_cases hrt : rt = some "bytes"
-        · exact absurd ⟨hop, hrt⟩ hNotBytes
-        · simp [hrt]
-      · simp [hop]
+    have hGuard : (op == "!==") = false := by
+      rw [beq_eq_false_iff_ne]; exact hNotNeq
     simp only [hGuard, Bool.false_eq_true, if_false]
   rw [hOps]
   exact runOps_loadRef_loadRef_opcode_depth_general sm l r dl dr' vl vr out
@@ -14698,7 +14843,7 @@ private theorem runOps_lowerValue_binOp_depth_general_smoke :
   exact runOps_lowerValue_binOp_depth_general
     ["a", "b", "l", "r"] "t" "l" "r" none "+" 2 4
     (.vBigint 30) (.vBigint 40) (stk0.push (.vBigint 70)) stk0
-    (by intro h; exact absurd h.1 (by decide))
+    (by decide)
     (by show Stack.Lower.StackMap.depth? ["a", "b", "l", "r"] "l" = some 2; rfl)
     (by show 2 < stk0.stack.length; decide)
     (by show stk0.stack[2]! = .vBigint 30; rfl)

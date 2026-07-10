@@ -5,8 +5,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use num_traits::ToPrimitive;
-
 use super::ast::*;
 use super::diagnostic::Diagnostic;
 
@@ -40,6 +38,18 @@ pub fn validate(contract: &ContractNode) -> ValidationResult {
     validate_constructor(contract, &mut errors);
     validate_methods(contract, &mut errors, &mut warnings);
     check_no_recursion(contract, &mut errors);
+
+    // Issue #123: reject preimage-field reads / output bindings that are
+    // unsound under a method's declared @sighash mode (security core). This
+    // pass emits both errors (unsound usages) and warnings (e.g. an explicit
+    // single-output SINGLE covenant whose same-index value cannot be pinned
+    // statically), so route each diagnostic to the matching bucket.
+    for d in super::sighash_validate::validate_sighash_usage(contract) {
+        match d.severity {
+            super::diagnostic::Severity::Warning => warnings.push(d),
+            _ => errors.push(d),
+        }
+    }
 
     ValidationResult { errors, warnings }
 }
@@ -237,6 +247,13 @@ fn validate_methods(contract: &ContractNode, errors: &mut Vec<Diagnostic>, warni
         // V24, V25: Warn when StatefulSmartContract public method calls checkPreimage or getStateScript explicitly
         if contract.parent_class == "StatefulSmartContract" && method.visibility == Visibility::Public {
             warn_manual_preimage_usage(method, warnings);
+        }
+
+        // #131: warn when a public method gates on extractLocktime but never
+        // asserts the spending tx is non-final (extractSequence < 0xffffffff).
+        // Advisory only.
+        if method.visibility == Visibility::Public {
+            warn_locktime_without_sequence_guard(method, contract, warnings);
         }
     }
 }
@@ -543,44 +560,21 @@ fn validate_statement(stmt: &Statement, errors: &mut Vec<Diagnostic>) {
             condition,
             init,
             body,
-            source_location,
             ..
         } => {
             validate_expression(condition, errors);
 
-            // Check that the loop bound is a compile-time constant
-            if let Expression::BinaryExpr { op, right, .. } = condition {
+            // Check that the loop bound is a compile-time constant. Non-zero
+            // starts and countdown loops (`i--` with `>`/`>=`) are supported:
+            // the ANF loop node carries an explicit start value and step
+            // direction (issue #121), so lowering binds `iterVar = start +
+            // i*step` on each unrolled iteration.
+            if let Expression::BinaryExpr { right, .. } = condition {
                 if !is_compile_time_constant(right) {
                     errors.push(Diagnostic::error(
                         "For loop bound must be a compile-time constant (literal or const variable)",
                         None,
                     ));
-                }
-
-                // The ANF loop node carries only an iteration count, so lowering
-                // always iterates i = 0..count-1. Reject the loop shapes that
-                // representation cannot express — a non-zero start or a countdown
-                // would otherwise be silently compiled as a zero-start counting-up
-                // loop while the interpreter runs the true source semantics.
-                if *op == BinaryOp::Gt || *op == BinaryOp::Ge {
-                    errors.push(Diagnostic::error(
-                        "For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead",
-                        Some(source_location.clone()),
-                    ));
-                }
-            }
-
-            if let Statement::VariableDecl { init: init_expr, .. } = init.as_ref() {
-                if let Some(start_val) = extract_literal_bigint(init_expr) {
-                    if start_val != 0 {
-                        errors.push(Diagnostic::error(
-                            format!(
-                                "For loop iterator must start at 0 (got {}n) — loops compile to i = 0..count-1; offset the iterator inside the body instead",
-                                start_val
-                            ),
-                            Some(source_location.clone()),
-                        ));
-                    }
                 }
             }
 
@@ -605,21 +599,15 @@ fn validate_statement(stmt: &Statement, errors: &mut Vec<Diagnostic>) {
     }
 }
 
-fn extract_literal_bigint(expr: &Expression) -> Option<i128> {
-    match expr {
-        Expression::BigIntLiteral { value } => value.to_i128(),
-        Expression::UnaryExpr { op, operand } if *op == UnaryOp::Neg => {
-            extract_literal_bigint(operand).map(|v| -v)
-        }
-        _ => None,
-    }
-}
-
 fn is_compile_time_constant(expr: &Expression) -> bool {
+    // Only integer literals (and their negation) can be unrolled into fixed
+    // Bitcoin Script by anf-lower. A bare identifier bound (e.g. `const N`) or a
+    // runtime member access (`this.x`) is NOT resolvable and must be rejected
+    // here with a graceful diagnostic — anf-lower's `extract_loop_shape` would
+    // otherwise panic. This mirrors the reference TS compiler's observable
+    // behavior: only literal loop bounds compile.
     match expr {
         Expression::BigIntLiteral { .. } => true,
-        Expression::BoolLiteral { .. } => true,
-        Expression::Identifier { .. } => true, // Could be a const
         Expression::UnaryExpr { op, operand } if *op == UnaryOp::Neg => {
             is_compile_time_constant(operand)
         }
@@ -898,6 +886,118 @@ fn warn_manual_preimage_usage(method: &MethodNode, warnings: &mut Vec<Diagnostic
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// #131: locktime soundness — extractLocktime needs an extractSequence guard
+// ---------------------------------------------------------------------------
+
+/// Sentinel maximum nSequence: a tx is FINAL (ignores locktime) at this value.
+const SEQUENCE_FINAL: u64 = 0xffff_ffff;
+
+/// True when `expr` is a direct call to the named intrinsic, e.g. `f(...)`.
+fn is_call_to_named(expr: &Expression, name: &str) -> bool {
+    if let Expression::CallExpr { callee, .. } = expr {
+        if let Expression::Identifier { name: callee_name } = callee.as_ref() {
+            return callee_name == name;
+        }
+    }
+    false
+}
+
+/// True when `expr` reads the transaction locktime. Both the raw intrinsic
+/// `extractLocktime(preimage)` and its ergonomic sugar `currentBlockHeight()`
+/// (which the ANF pass desugars to `extractLocktime(txPreimage)`) count —
+/// either read is unsound without a sequence-finality guard.
+fn is_locktime_read(expr: &Expression) -> bool {
+    is_call_to_named(expr, "extractLocktime") || is_call_to_named(expr, "currentBlockHeight")
+}
+
+/// True when `expr` is an `extractSequence(...) < <final>`-style comparison
+/// (the guard that makes a locktime gate consensus-enforced). Accepts the two
+/// natural spellings: `extractSequence(pre) < N` / `<= N`, and the reversed
+/// `N > extractSequence(pre)` / `>= ...`. `N` must be a bigint literal no
+/// greater than the finality sentinel, so the guard genuinely forces
+/// non-finality.
+fn is_sequence_finality_guard(expr: &Expression) -> bool {
+    let Expression::BinaryExpr { op, left, right } = expr else {
+        return false;
+    };
+    let bound_ok = |e: &Expression| -> bool {
+        matches!(
+            e,
+            Expression::BigIntLiteral { value }
+                if *value <= num_bigint::BigInt::from(SEQUENCE_FINAL)
+        )
+    };
+    match op {
+        BinaryOp::Lt | BinaryOp::Le => is_call_to_named(left, "extractSequence") && bound_ok(right),
+        BinaryOp::Gt | BinaryOp::Ge => is_call_to_named(right, "extractSequence") && bound_ok(left),
+        _ => false,
+    }
+}
+
+/// #131: warn when `method` (transitively, through the private-helper call
+/// graph) reads the tx locktime but never asserts the tx is non-final. A
+/// locktime gate is not consensus-enforced unless `extractSequence < 0xffffffff`
+/// is also asserted — otherwise an all-final-sequence spend bypasses it.
+/// Advisory (warning) only — no effect on emitted bytecode.
+fn warn_locktime_without_sequence_guard(
+    method: &MethodNode,
+    contract: &ContractNode,
+    warnings: &mut Vec<Diagnostic>,
+) {
+    // Map of private helper methods by name (BFS follows calls into these).
+    let private_methods: HashMap<&str, &MethodNode> = contract
+        .methods
+        .iter()
+        .filter(|m| m.visibility == Visibility::Private)
+        .map(|m| (m.name.as_str(), m))
+        .collect();
+
+    let mut reads_locktime = false;
+    let mut has_sequence_guard = false;
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(method.name.clone());
+    let mut queue: std::collections::VecDeque<&MethodNode> = std::collections::VecDeque::new();
+    queue.push_back(method);
+
+    while let Some(current) = queue.pop_front() {
+        walk_expressions_in_body(&current.body, &mut |expr| {
+            if is_locktime_read(expr) {
+                reads_locktime = true;
+            }
+            if is_sequence_finality_guard(expr) {
+                has_sequence_guard = true;
+            }
+        });
+        // Follow calls into private helpers so a guard (or locktime read)
+        // supplied by an inlined helper is seen by the public entry point.
+        // Reuses the shared `collect_method_calls` recursion-detection helper.
+        let mut calls = HashSet::new();
+        collect_method_calls(&current.body, &mut calls);
+        for callee in calls {
+            if !visited.contains(&callee) {
+                if let Some(m) = private_methods.get(callee.as_str()) {
+                    visited.insert(callee.clone());
+                    queue.push_back(m);
+                }
+            }
+        }
+    }
+
+    if reads_locktime && !has_sequence_guard {
+        warnings.push(Diagnostic::warning(
+            format!(
+                "method '{}' reads extractLocktime but does not assert \
+                 extractSequence < 0xffffffff; a locktime gate is not \
+                 consensus-enforced unless the tx is non-final — add \
+                 assert(extractSequence(this.txPreimage) < 0xffffffffn)",
+                method.name
+            ),
+            Some(method.source_location.clone()),
+        ));
+    }
 }
 
 fn walk_expressions_in_body(stmts: &[Statement], visitor: &mut impl FnMut(&Expression)) {
@@ -1329,11 +1429,12 @@ class P2PKH extends SmartContract {
     }
 
     // -----------------------------------------------------------------------
-    // #127: reject non-zero-start and countdown loops
+    // #121: non-zero-start and countdown loops are now accepted (were rejected
+    // under the earlier count-only ANF loop node).
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_countdown_loop_gt_produces_error() {
+    fn test_countdown_loop_gt_accepted() {
         let source = r#"
 import { SmartContract } from 'runar-lang';
 
@@ -1347,8 +1448,8 @@ class Countdown extends SmartContract {
 
     public run(v: bigint) {
         let sum = 0n;
-        for (let i = 0n; i > 3n; i--) {
-            sum += i;
+        for (let i = 3n; i > 0n; i--) {
+            sum = sum + i;
         }
         assert(sum === v);
     }
@@ -1357,17 +1458,18 @@ class Countdown extends SmartContract {
         let contract = parse_contract(source);
         let result = validate(&contract);
         assert!(
-            result
+            !result
                 .errors
                 .iter()
-                .any(|e| e.message.contains("countdown loops are not supported")),
-            "expected countdown-loop error, got: {:?}",
+                .any(|e| e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")),
+            "countdown loop should be accepted (#121), got: {:?}",
             result.errors
         );
     }
 
     #[test]
-    fn test_countdown_loop_ge_produces_error() {
+    fn test_countdown_loop_ge_accepted() {
         let source = r#"
 import { SmartContract } from 'runar-lang';
 
@@ -1381,8 +1483,8 @@ class Countdown extends SmartContract {
 
     public run(v: bigint) {
         let sum = 0n;
-        for (let i = 0n; i >= 3n; i--) {
-            sum += i;
+        for (let i = 3n; i >= 1n; i--) {
+            sum = sum + i;
         }
         assert(sum === v);
     }
@@ -1391,17 +1493,18 @@ class Countdown extends SmartContract {
         let contract = parse_contract(source);
         let result = validate(&contract);
         assert!(
-            result
+            !result
                 .errors
                 .iter()
-                .any(|e| e.message.contains("countdown loops are not supported")),
-            "expected countdown-loop error, got: {:?}",
+                .any(|e| e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")),
+            "countdown loop should be accepted (#121), got: {:?}",
             result.errors
         );
     }
 
     #[test]
-    fn test_non_zero_start_loop_produces_error() {
+    fn test_non_zero_start_loop_accepted() {
         let source = r#"
 import { SmartContract } from 'runar-lang';
 
@@ -1416,7 +1519,7 @@ class NonZeroStart extends SmartContract {
     public run(v: bigint) {
         let sum = 0n;
         for (let i = 1n; i < 3n; i++) {
-            sum += i;
+            sum = sum + i;
         }
         assert(sum === v);
     }
@@ -1425,11 +1528,12 @@ class NonZeroStart extends SmartContract {
         let contract = parse_contract(source);
         let result = validate(&contract);
         assert!(
-            result
+            !result
                 .errors
                 .iter()
-                .any(|e| e.message.contains("must start at 0")),
-            "expected non-zero-start error, got: {:?}",
+                .any(|e| e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")),
+            "non-zero-start loop should be accepted (#121), got: {:?}",
             result.errors
         );
     }

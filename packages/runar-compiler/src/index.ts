@@ -411,6 +411,33 @@ export function compile(source: string, options?: CompileOptions): CompileResult
   onProgress?.('EC optimization', 50);
   const optimizedAnf = opts.disableEcOptimizer ? anf : optimizeEC(anf);
 
+  // Issue #109: warn when DCE strips an un-annotated readonly field. Such a
+  // field carries no compile-time value (no initializer) and is referenced by
+  // no method, so it is eliminated from the locking script entirely — silently
+  // dropping deploy-time metadata an author may intend to recover from the
+  // on-chain script later. `@embedAlways` fields were forced back in during
+  // ANF lowering, so they are "referenced" here and never warn.
+  {
+    const referenced = collectReferencedProps(optimizedAnf);
+    for (const prop of parseResult.contract.properties) {
+      if (
+        prop.readonly &&
+        !prop.embedAlways &&
+        prop.initializer === undefined &&
+        !referenced.has(prop.name)
+      ) {
+        diagnostics.push({
+          message:
+            `readonly field '${prop.name}' is not referenced in any method body and was ` +
+            `eliminated by DCE; annotate it /** @embedAlways */ to preserve it in the ` +
+            `on-chain script`,
+          severity: 'warning',
+          loc: prop.sourceLocation,
+        } as CompilerDiagnostic);
+      }
+    }
+  }
+
   // Pass 5-6: Stack lower + Peephole optimize + Emit
   try {
     onProgress?.('Stack lowering', 60);

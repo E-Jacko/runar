@@ -52,6 +52,7 @@ fn test_sha256_finalize_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("sha256-finalize deploy failed");
     assert!(!deploy_txid.is_empty());

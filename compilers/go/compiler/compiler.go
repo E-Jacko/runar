@@ -61,6 +61,11 @@ type ABIMethod struct {
 	IsTerminal *bool      `json:"isTerminal,omitempty"`
 	// UsesCodePart: unlocking script is prefixed with _codePart (issue #100).
 	UsesCodePart *bool `json:"usesCodePart,omitempty"`
+	// SigHashType: the BIP-143 sighash type this method's preimage/covenant is
+	// built under (from a `@sighash` directive, issue #123), e.g. 0x43 for
+	// SINGLE|FORKID. Absent = default ALL|FORKID (0x41); the SDK falls back to
+	// 0x41 so existing artifacts are unchanged.
+	SigHashType *int `json:"sigHashType,omitempty"`
 }
 
 // ABI describes the contract's public interface.
@@ -325,6 +330,13 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 			Name:     method.Name,
 			Params:   params,
 			IsPublic: method.IsPublic,
+		}
+		// Issue #123: carry a non-default @sighash mode into the ABI so the SDK
+		// builds the BIP-143 preimage under the same flags the covenant expects.
+		// Omitted for the default (0x41) → existing artifacts are byte-identical.
+		if method.IsPublic && method.SigHashType != nil && *method.SigHashType != frontend.SighashDefault {
+			v := *method.SigHashType
+			m.SigHashType = &v
 		}
 		// For stateful contracts, mark public methods without _changePKH as terminal
 		if isStateful && method.IsPublic {
@@ -672,6 +684,12 @@ func CompileFromSourceWithResult(sourcePath string, opts ...CompileOptions) *Com
 	// Pass 4.5: EC optimization
 	result.ANF = frontend.OptimizeEC(result.ANF)
 
+	// Issue #109: warn when DCE strips an un-annotated readonly field. Computed
+	// from the post-lowering ANF (the surviving load_prop set), mirroring the TS
+	// reference's collectReferencedProps(optimizedAnf) placement.
+	result.Diagnostics = append(result.Diagnostics,
+		frontend.CollectEmbedAlwaysDCEWarnings(result.Contract, result.ANF)...)
+
 	// Pass 5: Stack lowering (recover from panics)
 	var stackMethods []codegen.StackMethod
 	func() {
@@ -820,6 +838,12 @@ func CompileFromSourceStrWithResult(source string, fileName string, opts ...Comp
 
 	// Pass 4.5: EC optimization
 	result.ANF = frontend.OptimizeEC(result.ANF)
+
+	// Issue #109: warn when DCE strips an un-annotated readonly field. Computed
+	// from the post-lowering ANF (the surviving load_prop set), mirroring the TS
+	// reference's collectReferencedProps(optimizedAnf) placement.
+	result.Diagnostics = append(result.Diagnostics,
+		frontend.CollectEmbedAlwaysDCEWarnings(result.Contract, result.ANF)...)
 
 	// Pass 5: Stack lowering (recover from panics)
 	var stackMethods []codegen.StackMethod

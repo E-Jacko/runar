@@ -43,7 +43,27 @@ func ComputeOpPushTx(txHex string, inputIndex int, subscript string, satoshis in
 // ComputeOpPushTxWithCodeSep is like ComputeOpPushTx but supports OP_CODESEPARATOR.
 // When codeSeparatorIndex >= 0, the scriptCode in the BIP-143 preimage uses only the
 // portion of the subscript AFTER the OP_CODESEPARATOR byte at that offset.
+//
+// Builds the preimage under the default ALL|FORKID sighash. For a method
+// declaring a non-default @sighash mode (issue #123), use
+// ComputeOpPushTxWithSigHash so the derived signature and preimage match the
+// on-chain OP_PUSH_TX binding flag.
 func ComputeOpPushTxWithCodeSep(txHex string, inputIndex int, subscript string, satoshis int64, codeSeparatorIndex int) ([]byte, []byte, error) {
+	return ComputeOpPushTxWithSigHash(txHex, inputIndex, subscript, satoshis, codeSeparatorIndex, int(sighash.AllForkID))
+}
+
+// ComputeOpPushTxWithSigHash is the mode-aware form (issue #123). sigHashType is
+// the BIP-143 sighash type the preimage is built under (e.g. 0x43 for
+// SINGLE|FORKID); it drives which preimage fields the node zeroes AND the
+// sighash flag byte appended to the DER signature. Must match the method's
+// declared @sighash mode or the on-chain binding fails to verify. Pass 0 or
+// 0x41 for the default ALL|FORKID.
+func ComputeOpPushTxWithSigHash(txHex string, inputIndex int, subscript string, satoshis int64, codeSeparatorIndex int, sigHashType int) ([]byte, []byte, error) {
+	if sigHashType == 0 {
+		sigHashType = int(sighash.AllForkID)
+	}
+	flag := sighash.Flag(sigHashType & 0xff)
+
 	tx, err := transaction.NewTransactionFromHex(txHex)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse transaction: %w", err)
@@ -70,14 +90,16 @@ func ComputeOpPushTxWithCodeSep(txHex string, inputIndex int, subscript string, 
 		LockingScript: lockScript,
 	})
 
-	// Get the raw preimage
-	preimage, err := tx.CalcInputPreimage(uint32(inputIndex), sighash.AllForkID)
+	// Get the raw preimage under the declared sighash flag (the flag controls
+	// which BIP-143 digest fields are zeroed: hashPrevouts under ANYONECANPAY,
+	// hashSequence unless pure ALL, hashOutputs under NONE / same-index SINGLE).
+	preimage, err := tx.CalcInputPreimage(uint32(inputIndex), flag)
 	if err != nil {
 		return nil, nil, fmt.Errorf("calc preimage: %w", err)
 	}
 
 	// Compute sighash
-	sigHashBytes, err := tx.CalcInputSignatureHash(uint32(inputIndex), sighash.AllForkID)
+	sigHashBytes, err := tx.CalcInputSignatureHash(uint32(inputIndex), flag)
 	if err != nil {
 		return nil, nil, fmt.Errorf("calc sighash: %w", err)
 	}
@@ -95,7 +117,7 @@ func ComputeOpPushTxWithCodeSep(txHex string, inputIndex int, subscript string, 
 	}
 
 	derBytes := sig.Serialize()
-	derBytes = append(derBytes, byte(sighash.AllForkID))
+	derBytes = append(derBytes, byte(flag))
 
 	return derBytes, preimage, nil
 }

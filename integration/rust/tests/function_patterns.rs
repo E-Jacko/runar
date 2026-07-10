@@ -41,6 +41,7 @@ fn test_function_patterns_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -67,6 +68,7 @@ fn test_function_patterns_deploy_zero_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -92,6 +94,7 @@ fn test_function_patterns_deploy_large_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -117,6 +120,7 @@ fn test_function_patterns_distinct_deploy_txids() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy 1 failed");
 
@@ -128,6 +132,7 @@ fn test_function_patterns_distinct_deploy_txids() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy 2 failed");
 
@@ -154,6 +159,7 @@ fn test_function_patterns_deposit() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -187,6 +193,7 @@ fn test_function_patterns_deposit_then_withdraw() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -232,6 +239,7 @@ fn test_function_patterns_wrong_owner_rejected() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

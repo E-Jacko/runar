@@ -128,6 +128,13 @@ pub struct PropertyNode {
     pub prop_type: TypeNode,
     pub readonly: bool,
     pub initializer: Option<Expression>,
+    /// Issue #109: set by the parser when a `/** @embedAlways */` (or
+    /// `// @embedAlways`) comment directive immediately precedes a readonly
+    /// field. Opts the field OUT of dead-code elimination so its deploy-time
+    /// bytes survive into the on-chain locking script (a constructor slot).
+    /// Comment-directive form (not a decorator) keeps it portable across
+    /// surface formats. Only meaningful on readonly fields.
+    pub embed_always: bool,
     pub source_location: SourceLocation,
     /// Non-empty for synthetic scalar leaves produced by the
     /// expand-fixed-arrays pass. Outermost level first. Used by the
@@ -143,6 +150,13 @@ pub struct MethodNode {
     pub params: Vec<ParamNode>,
     pub body: Vec<Statement>,
     pub visibility: Visibility,
+    /// Issue #123: the BIP-143 sighash type declared via a
+    /// `/** @sighash <FLAGS> */` directive on a public method (e.g. `0x43`
+    /// for SINGLE|FORKID). `None` = the default `ALL|FORKID` (0x41),
+    /// byte-identical to the historically-pinned mode. Drives the
+    /// auto-injected preimage-type assert, the OP_PUSH_TX binding flag, the
+    /// ABI `sigHashType`, and the SDK-side preimage/signature construction.
+    pub sighash_type: Option<i64>,
     pub source_location: SourceLocation,
 }
 

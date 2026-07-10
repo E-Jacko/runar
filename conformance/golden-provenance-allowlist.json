@@ -48,6 +48,382 @@
       "reason": "NIST ACVP SLH-DSA-SHA2-128s (internal) sigVer vector, tcId 422, testPassed=true. Authoritative regression gate that currently exposes a real native SLH-DSA FIPS-205 non-conformance (see docs/test-skips.md crypto_kat_test.go:286).",
       "reviewer": "gh:icellan",
       "date": "2026-07-08"
+    },
+    {
+      "path": "conformance/analyzer/auction/expected-analyzer-report.json",
+      "sha256": "fadd1e3225be187fff09e43c81f9bf8f453238f831862b4d12b12a31efd098f8",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the static-analyzer report is derived from the compiled contract, which now gates the stateful change output on _changeAmount != 0. Intentional spec change; the same #116 codegen delta is independently corroborated by the 7-tier cross-compiler conformance parity that regenerates byte-identical goldens for this fixture across all seven tiers.",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/analyzer/stateful-counter/expected-analyzer-report.json",
+      "sha256": "954359a11ad591a44dd498e066de7c89b74faac61e90c1dbd453e4fd465f0f5b",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the static-analyzer report is derived from the compiled contract, which now gates the stateful change output on _changeAmount != 0. Intentional spec change; the same #116 codegen delta is independently corroborated by the 7-tier cross-compiler conformance parity that regenerates byte-identical goldens for this fixture across all seven tiers.",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/add-data-output/expected-ir.json",
+      "sha256": "9bc964c3258da53ec90aa2162c1824a03ae8e6d257bc7133a595e1642516ec69",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/add-data-output/expected-script.hex",
+      "sha256": "ab2f450d65fe16ded9f64ee49039ad192525793e27ef9c47878bbdf448fdaca4",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/add-raw-output/expected-ir.json",
+      "sha256": "fa35039e2a2544a39bf1ac41f4d6a219610d83739004b971b7916cef09faa5db",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/add-raw-output/expected-script.hex",
+      "sha256": "e748f15c03d8f0791eb404c39fcbd297849742b29e37cdadf809dd9bbf9f9b53",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/auction/expected-ir.json",
+      "sha256": "f81892f2a617a48058972a2497c1d91022e302659cc98bd0a55098f1e4cb29d9",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/auction/expected-script.hex",
+      "sha256": "fbaa5b5e8eea10338e488df03fbfe796be9337f4f5b19748099d4833376b59e2",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/bounded-loop/expected-ir.json",
+      "sha256": "35b23e46b5fbfbfdb56160d64599f7e5cb80fa4b0cee06cd6d4e506fbded5077",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #121 (loop start/step): the loop ANF/IR node now carries explicit \"start\": 0 and \"step\": 1 fields (previously implicit). IR-shape-only change — the emitted expected-script.hex for bounded-loop is unchanged. Intentional IR representation change, independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers emit byte-identical Stack IR for this fixture).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/branched-readonly-len/expected-ir.json",
+      "sha256": "d93505136c3d138de9a5172512575f2e0a428d86c1c57e5a45f931cfbe024c9b",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/branched-readonly-len/expected-script.hex",
+      "sha256": "36ee6eb0fce597392e831f55ec2e6056b716b6c2fb54a20148df67bd7af9068e",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/cond-write-multi-field/expected-ir.json",
+      "sha256": "87963449a3bd7a9a8950f9dafe2f6345f5c9d5cd606d1ede5eb1dd278e77fc33",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/cond-write-multi-field/expected-script.hex",
+      "sha256": "3083a6f37cec4c5449ee0656752cf3c6900e72e35450c36c693725ee8230734c",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/conditional-data-output-stateful/expected-ir.json",
+      "sha256": "d768c0c0373473e824a1818748dbd3e9544674963b077d69b7c23016c6486a30",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/conditional-data-output-stateful/expected-script.hex",
+      "sha256": "7e384cf1fd9b1f0936f5c3f01d486c91378db951390b4276c1550214ea508371",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/function-patterns/expected-ir.json",
+      "sha256": "2e0280b1eb032f62e1aba1651bd699ac67710feea4e42dc9b5e56ba83da6f78b",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/function-patterns/expected-script.hex",
+      "sha256": "f92c2f065c32d76a8b085a373cfcd35f81d30b6114efc8eba2f233ad69d19d68",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/intent-current-block-height/expected-ir.json",
+      "sha256": "abda8c9661f687c2446a1e1d9538190b923bccd6854117bc22aee1ae43959ad5",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/intent-current-block-height/expected-script.hex",
+      "sha256": "62a879bc0626a906401046bc3a8ed445b44cde608fdce809475d963ebf81e4a6",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/intent-output-p2pkh/expected-ir.json",
+      "sha256": "adf9912cd5dfe703e999fd7494a8188669d398d754c70389b35549f794699095",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/intent-output-p2pkh/expected-script.hex",
+      "sha256": "508435c06b3504a5f4536468b7e9710b3f98153822b123ccc60b170d901f9790",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/intent-prev-output-script/expected-ir.json",
+      "sha256": "bb49c5355c4c81bf064918f4e1c02891c5e3c5de72e4ec2b375040779f8845d3",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/intent-prev-output-script/expected-script.hex",
+      "sha256": "74476bd75e4b7d287fd9c9447910d1f16083c4aac62921a636450592666c88c5",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/math-demo/expected-ir.json",
+      "sha256": "55f9420638a6508d12ee506a601f80625d85602b742e815acddc4b303836e69c",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/math-demo/expected-script.hex",
+      "sha256": "472ed9b25f2d6a0bb85f9181f02383eab7336dcbc4e1fc158afb9652c84fb964",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/private-helper-outputs/expected-ir.json",
+      "sha256": "7565081277276232233db1ab80ee1a72a02fa61f6d3a0bb7b0980622052f3007",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/private-helper-outputs/expected-script.hex",
+      "sha256": "a0e51f89ef254f2edd8376f40bc3ebce37f375e190c0f3a934c457c279f2c317",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/property-initializers/expected-ir.json",
+      "sha256": "53aaba675147fa949fe154171fe42502d56a087fd3bfbcad07b5457362a2380c",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/property-initializers/expected-script.hex",
+      "sha256": "062fff744da1da99b69d05d7ce84ecea14fff6d1e40b4c3bec0c60a4433c245d",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/state-covenant/expected-ir.json",
+      "sha256": "df54379f589232305aea54f2549e961e6db252c1571d958a43eaa9429e3a838e",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/state-covenant/expected-script.hex",
+      "sha256": "c1a68af869479011cf2bd070d364cefb3c473e6685ae42ce18f3f819282b6e32",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/state-ripemd160/expected-ir.json",
+      "sha256": "9950c2e8274cba7a13436abd4df51d059946a4681211fdc50d7ed06f413339d9",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/state-ripemd160/expected-script.hex",
+      "sha256": "0dedcc913bac3fe661a9435fa0487cceec91666808239ba883a77fbf744bb5c9",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/stateful-bytestring/expected-ir.json",
+      "sha256": "91acdabef76177a3d85a6f40e544430946d67e1cca75fda84ed54f3c310c4cd6",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/stateful-bytestring/expected-script.hex",
+      "sha256": "713b04e9809be51ebf82fe6ce78db154f78310e64ab05463649c72c73a394a51",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/stateful-counter/expected-ir.json",
+      "sha256": "a6348eea2df7e39434ae29cbdcb405a3f49c887480bfd44ddd2f1ddb8a39951b",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/stateful-counter/expected-script.hex",
+      "sha256": "17e415409a944a10cd279a26a5ea8bd8fbefd8bb6715eeabdf580b21195aafcb",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/stateful-wots-gate/expected-ir.json",
+      "sha256": "8da4550dbc52f6d88abd72ad3c642a456135c03db1ea1fe908817975c2d0b502",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/stateful-wots-gate/expected-script.hex",
+      "sha256": "267f83776c63ff5baab67b43bdef26f9f33e9e7676e0d58706e7f9e71529ff42",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/stateful/expected-ir.json",
+      "sha256": "ed82a9cd6d38b8faa6dc5a7152628c5be44dad515cc538dd0a29a64447b717b0",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/stateful/expected-script.hex",
+      "sha256": "422d9671e8816de79fba51bccce07b242fae1f3b83c6bd64a8cefd4dac57137f",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/terminal-varlen-read/expected-ir.json",
+      "sha256": "374d81d93e4f115e778664a95d57b172c1c72ecae22772427763aa0a5069eb81",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/terminal-varlen-read/expected-script.hex",
+      "sha256": "737f68ffd2ee923dd8eb49f714ae69c7ccc312b546d4e28c7e4326ddf96fd916",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/token-ft/expected-ir.json",
+      "sha256": "694f4e5531030942e99afb5125488e0c1f0d6a8c22d7e68171c6898c4693a0a6",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/token-ft/expected-script.hex",
+      "sha256": "3a54d69f2ea998687402b217df29ce0c13002ee1e34d5678c8ed7039cffe824c",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/token-nft/expected-ir.json",
+      "sha256": "8e3c44743d26d7daf84cb7a7ff0b89f69e1f7024fd448f38b1c60d317b34a0b8",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
+    },
+    {
+      "path": "conformance/tests/token-nft/expected-script.hex",
+      "sha256": "1b17b847a1e894893b7ef0baff093e2861198f26f5d95aef6e4b33e251eaad1b",
+      "verified-against": "intentional-spec-change",
+      "reason": "Regenerated for #116 (conditional change-output gate): the auto-injected stateful covenant now emits the change output only when _changeAmount != 0, so the compiled Stack IR + script hex for this fixture legitimately change. Intentional codegen change, not a silent self-regeneration: independently corroborated by the 7-tier cross-compiler conformance parity (all seven compilers regenerate byte-identical Stack IR and Bitcoin Script hex for this fixture, fold-off and fold-on).",
+      "reviewer": "gh:icellan",
+      "date": "2026-07-09"
     }
   ]
 }

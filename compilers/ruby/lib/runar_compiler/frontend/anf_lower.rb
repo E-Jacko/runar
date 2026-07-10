@@ -12,9 +12,14 @@
 require "json"
 require_relative "../ir/types"
 require_relative "ast_nodes"
+require_relative "sighash_directive"
 
 module RunarCompiler
   module Frontend
+    # SIGHASH_ALL | SIGHASH_FORKID — the default @sighash mode (issue #123).
+    # Byte-identical to the historically-pinned covenant binding blob.
+    SIGHASH_DEFAULT = SighashDirective::SIGHASH_DEFAULT
+
     # -------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------
@@ -169,15 +174,46 @@ module RunarCompiler
         is_public: false
       )
 
+      # Issue #109: readonly fields carrying a +/** @embedAlways */+ directive
+      # must survive DCE into the locking script. A readonly field no method
+      # references lowers to no +load_prop+, so no constructor slot is emitted
+      # and the field's deploy-time bytes vanish. Inject a +load_prop+ + a
+      # +@ref:+ alias (the exact shape +const _bind = this.field;+ produces)
+      # into the first public method's body — the alias keeps the +load_prop+
+      # alive through dead-binding DCE, and stack lowering threads the pushed
+      # value through and cleans it up at method end. One slot in the deployed
+      # script suffices; every spending branch shares it.
+      embed_fields = contract.properties.select { |p| p.readonly && _embed_always?(p) }
+      embed_injected = false
+
       # Lower each method
       contract.methods.each do |method|
         method_ctx = LoweringContext.new(contract)
+
+        # Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+        # flag for any checkPreimage (auto-injected below, or a manual call) in
+        # this method. Omitted for the default so the ANF (and pinned binding
+        # blob) is unchanged.
+        method_sighash = method.respond_to?(:sighash_type) ? method.sighash_type : nil
+        if !method_sighash.nil? && method_sighash != SIGHASH_DEFAULT
+          method_ctx.sighash_flag = method_sighash
+        end
 
         # Register the developer-declared param types scoped to this method
         # before lowering its body, so byte-type analysis sees only this
         # method's params (issue #34).
         method.params.each do |p|
           method_ctx.register_param_type(p.name, _type_node_to_string(p.type))
+        end
+
+        # Register the declared param NAMES so a bare identifier resolves to
+        # load_param before falling through to load_prop (#130). Without this,
+        # a param whose name collides with a mutable state property lowered to
+        # the stale deserialized property value instead of the witness param.
+        # Explicit this.x is unaffected: PropertyAccessExpr lowering checks
+        # property? before param? (below), so a stored property still wins.
+        method.params.each do |p|
+          method_ctx.add_param(p.name)
         end
 
         if contract.parent_class == "StatefulSmartContract" && method.visibility == "public"
@@ -211,21 +247,30 @@ module RunarCompiler
           method_ctx.add_param("txPreimage")
           method_ctx.register_param_type("txPreimage", "SigHashPreimage")
 
+          # Issue #123: the declared per-method sighash mode (default ALL|FORKID).
+          # Drives BOTH the OP_PUSH_TX binding flag (so the derived sig re-computes
+          # the tx sighash under this mode) AND the runtime preimage-type assert.
+          sighash_mode = method_sighash.nil? ? SIGHASH_DEFAULT : method_sighash
+          is_default_sighash = sighash_mode == SIGHASH_DEFAULT
+
           # Inject checkPreimage(txPreimage) at the start
           preimage_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
-          check_result = method_ctx.emit(IR::ANFValue.new(kind: "check_preimage").tap { |v| v.preimage = preimage_ref })
+          check_result = method_ctx.emit(IR::ANFValue.new(kind: "check_preimage").tap do |v|
+            v.preimage = preimage_ref
+            # Omit for the default so the ANF (and pinned binding blob) is unchanged.
+            v.sighash_flag = sighash_mode unless is_default_sighash
+          end)
           method_ctx.emit(_make_assert(check_result))
 
-          # GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-          # auto-injected covenant cannot be spent under a permissive sighash
-          # flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
-          # a contract may read. The hashOutputs continuation already fails
-          # under non-ALL flags, so this is a no-op on spendability for
-          # continuation-using methods and closes the field-zeroing exposure
-          # for the rest.
+          # GAP-302 / #123: pin the sighash type to the declared mode. The
+          # auto-injected covenant verifies a real tx preimage, but without this
+          # check the spend could use a DIFFERENT sighash flag than declared that
+          # zeroes out preimage fields the contract (or its continuation) relies
+          # on (hashOutputs / hashPrevouts / hashSequence). The value defaults to
+          # 0x41 (SIGHASH_ALL|FORKID) so existing contracts emit byte-identical ANF.
           sig_hash_preimage_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
           sig_hash_type_ref = method_ctx.emit(_make_call("extractSigHashType", [sig_hash_preimage_ref]))
-          expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(0x41))
+          expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(sighash_mode))
           sig_hash_ok_ref = method_ctx.emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
             v.op = "==="
             v.left = sig_hash_type_ref
@@ -238,6 +283,14 @@ module RunarCompiler
           if has_state_prop
             preimage_ref3 = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
             method_ctx.emit(IR::ANFValue.new(kind: "deserialize_state").tap { |v| v.preimage = preimage_ref3 })
+          end
+
+          # Issue #109: preserve @embedAlways fields at the first user-statement
+          # position (after the checkPreimage/deserialize preamble), mirroring
+          # where a `const _bind = this.field;` idiom would sit.
+          if !embed_injected && embed_fields.any?
+            _emit_embed_always_preservation(method_ctx, embed_fields)
+            embed_injected = true
           end
 
           # Lower the developer's method body
@@ -261,9 +314,34 @@ module RunarCompiler
           add_data_output_refs = method_ctx.get_add_data_output_refs
           if add_output_refs.any? || add_data_output_refs.any? || _method_mutates_state(method, contract)
             # Build the P2PKH change output for hashOutputs verification
+            #
+            # #116: the SDK's buildCallTransaction OMITS the change output when
+            # change <= 0 (an exact-cover call) and passes _changeAmount = 0.
+            # Gate the change segment on _changeAmount != 0 at runtime so the
+            # hashed output set matches the SDK at the exact-zero boundary -- the
+            # segment is the P2PKH change output when non-zero, and empty bytes
+            # (cat with empty is a no-op) when zero, reproducing the omission.
+            # For any change > 0 the hashed bytes are unchanged; only the emitted
+            # script gains the guard.
             change_pkh_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "_changePKH" })
             change_amount_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "_changeAmount" })
-            change_output_ref = method_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+            zero_ref = method_ctx.emit(_make_load_const_int(0))
+            change_nonzero_ref = method_ctx.emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
+              v.op = "!=="
+              v.left = change_amount_ref
+              v.right = zero_ref
+            end)
+            change_then_ctx = method_ctx.sub_context
+            change_then_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+            method_ctx.sync_counter(change_then_ctx)
+            change_else_ctx = method_ctx.sub_context
+            change_else_ctx.emit(_make_load_const_string(""))
+            method_ctx.sync_counter(change_else_ctx)
+            change_output_ref = method_ctx.emit(IR::ANFValue.new(kind: "if").tap do |v|
+              v.cond = change_nonzero_ref
+              v.then = change_then_ctx.bindings
+              v.else_ = change_else_ctx.bindings
+            end)
 
             if add_output_refs.any?
               # Multi-output continuation: concat all state outputs, then all
@@ -336,9 +414,17 @@ module RunarCompiler
             name: method.name,
             params: augmented_params,
             body: method_ctx.bindings,
-            is_public: true
+            is_public: true,
+            sighash_type: method_sighash
           )
         else
+          # Issue #109: stateless public methods (and stateless contracts'
+          # spending entry points) are lowered here — inject @embedAlways
+          # preservation into the first PUBLIC one before its body.
+          if !embed_injected && embed_fields.any? && method.visibility == "public"
+            _emit_embed_always_preservation(method_ctx, embed_fields)
+            embed_injected = true
+          end
           method_ctx.lower_statements(method.body)
           augmented = _lower_params(
             method.params.reject { |p| _is_stateful_context_param(p) }
@@ -354,7 +440,8 @@ module RunarCompiler
             name: method.name,
             params: augmented,
             body: method_ctx.bindings,
-            is_public: method.visibility == "public"
+            is_public: method.visibility == "public",
+            sighash_type: method_sighash
           )
         end
       end
@@ -362,6 +449,33 @@ module RunarCompiler
       result
     end
     private_class_method :_lower_methods
+
+    # True when a property carries the +/** @embedAlways */+ directive (#109).
+    # PropertyNode gained the +embed_always+ field with the directive; guard
+    # +respond_to?+ so ANF lowering still works on AST nodes from formats /
+    # code paths that predate the field.
+    def self._embed_always?(prop)
+      prop.respond_to?(:embed_always) && prop.embed_always == true
+    end
+    private_class_method :_embed_always?
+
+    # Issue #109: emit the DCE-surviving preservation pair for each
+    # +@embedAlways+ readonly field into the given (public) method context.
+    #
+    # Reproduces exactly what a hand-written +const _bind = this.field;+ lowers
+    # to: a +load_prop+ followed by a +load_const("@ref:<t>")+ alias. The alias
+    # marks the +load_prop+ as referenced (see collect_refs_from_value in
+    # constant_fold.rb / dce.rb), so dead-binding DCE keeps it; stack lowering
+    # then emits the field's constructor-slot placeholder and NIPs the unused
+    # value off the stack at method end. The field's bytes therefore remain in
+    # the deployed locking script for downstream recovery.
+    def self._emit_embed_always_preservation(ctx, fields)
+      fields.each do |field|
+        load_ref = ctx.emit(IR::ANFValue.new(kind: "load_prop").tap { |v| v.name = field.name })
+        ctx.emit_named("__embedAlways_#{field.name}", _make_load_const_string("@ref:#{load_ref}"))
+      end
+    end
+    private_class_method :_emit_embed_always_preservation
 
     # Check if a parameter is a StatefulContext parameter (should be filtered from ANF).
     def self._is_stateful_context_param(param)
@@ -441,10 +555,17 @@ module RunarCompiler
         # inside a branch surface at the parent method's ABI. Mirrors the
         # Go reference compiler's methodScopeT.
         @method_scope = MethodScope.new
+        # Issue #123: non-default @sighash flag for this method (nil = default).
+        @sighash_flag = nil
       end
 
       # @return [MethodScope] shared per-method bookkeeping for intent intrinsics
       attr_reader :method_scope
+
+      # Issue #123: the declared non-default +@sighash+ flag for the method being
+      # lowered, so a MANUAL +checkPreimage(pre)+ call binds under the same mode
+      # as the method's declared sighash. nil = default ALL|FORKID.
+      attr_accessor :sighash_flag
 
       # Push an alias for a parameter name, used while inlining the body of
       # a private method into this context: identifier references to that
@@ -676,6 +797,9 @@ module RunarCompiler
         # registrations and the once-per-method hashOutputs flag propagate up
         # from if/else branches. Mirrors Go subContext.methodScope sharing.
         sub.instance_variable_set(:@method_scope, @method_scope)
+        # Propagate the method's declared @sighash flag (issue #123) so a manual
+        # checkPreimage inside an if/else branch binds under the same mode.
+        sub.sighash_flag = @sighash_flag
         sub
       end
 
@@ -769,7 +893,14 @@ module RunarCompiler
         when Identifier
           _lower_identifier(expr)
         when PropertyAccessExpr
-          # this.txPreimage in StatefulSmartContract -> load_param
+          # Explicit this.x: a real contract property always wins, even when a
+          # method param shares the name (#130). Now that declared params are
+          # registered, the param? branch below must not shadow a stored property.
+          if property?(expr.property)
+            return emit(IR::ANFValue.new(kind: "load_prop").tap { |v| v.name = expr.property })
+          end
+          # this.txPreimage in StatefulSmartContract -> load_param (it's an
+          # implicit injected param, not a stored property).
           if param?(expr.property)
             return emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = expr.property })
           end
@@ -941,7 +1072,10 @@ module RunarCompiler
 
       # @param stmt [ForStmt]
       def _lower_for_statement(stmt)
-        count = Frontend._extract_loop_count(stmt)
+        # Resolve the loop's compile-time shape: start value, step direction,
+        # and iteration count. Non-zero starts and countdown loops are
+        # supported (#121) — on iteration i the iterator holds start + i*step.
+        shape = Frontend._extract_loop_shape(stmt)
 
         # Lower body into sub-context
         body_ctx = sub_context
@@ -949,9 +1083,11 @@ module RunarCompiler
         sync_counter(body_ctx)
 
         emit(IR::ANFValue.new(kind: "loop").tap do |v|
-          v.count = count
+          v.count = shape[:count]
           v.body = body_ctx.bindings
           v.iter_var = stmt.init ? stmt.init.name : ""
+          v.start = shape[:start]
+          v.step = shape[:step]
         end)
       end
 
@@ -1043,7 +1179,11 @@ module RunarCompiler
         if callee.is_a?(Identifier) && callee.name == "checkPreimage"
           if e.args.length >= 1
             preimage_ref = lower_expr_to_ref(e.args[0])
-            return emit(IR::ANFValue.new(kind: "check_preimage").tap { |v| v.preimage = preimage_ref })
+            return emit(IR::ANFValue.new(kind: "check_preimage").tap do |v|
+              v.preimage = preimage_ref
+              # Issue #123: honour the method's declared @sighash on manual calls.
+              v.sighash_flag = @sighash_flag unless @sighash_flag.nil?
+            end)
           end
         end
 
@@ -1809,45 +1949,80 @@ module RunarCompiler
     private_class_method :_expr_has_add_data_output
 
     # -------------------------------------------------------------------
-    # Loop count extraction
+    # Loop shape extraction (#121)
     # -------------------------------------------------------------------
 
+    # Resolve a for-statement's compile-time loop shape: start value, step
+    # direction, and iteration count. Supports counting-up and counting-down
+    # loops:
+    #   for (let i = 0n; i < 10n; i++)  -> start 0, step +1, count 10
+    #   for (let i = 1n; i <= 3n; i++)  -> start 1, step +1, count 3
+    #   for (let i = 3n; i > 0n; i--)   -> start 3, step -1, count 3
+    #   for (let i = 3n; i >= 1n; i--)  -> start 3, step -1, count 3
+    #
+    # The loop is unrolled +count+ times; on iteration +i+ the iterator holds
+    # +start + i*step+. Start and bound must be compile-time integer literals.
+    #
     # @param stmt [ForStmt]
-    # @return [Integer]
-    def self._extract_loop_count(stmt)
-      # The ANF loop node carries only the count -- no start value or step
-      # direction -- so lowering (and the ANF interpreter) always iterates
-      # i = 0..count-1. Loop shapes that representation cannot express are
-      # rejected here (mirroring the source-located errors in the validator)
-      # rather than silently compiled as a zero-start counting-up loop.
-      #
-      # A countdown loop necessarily also has a non-zero start, so check the
-      # condition direction first -- it is the more precise diagnosis.
-      if stmt.condition.is_a?(BinaryExpr)
-        op = stmt.condition.op
-        if op == ">" || op == ">="
-          raise "For loop condition must count up with '<' or '<=' — countdown loops are not supported; " \
-                "iterate i = 0..N-1 and index backwards instead."
+    # @return [Hash] { start: Integer, step: Integer, count: Integer }
+    def self._extract_loop_shape(stmt)
+      start = _extract_bigint_value(stmt.init&.init)
+      if start.nil?
+        raise "Cannot determine loop start at compile time. " \
+              "For-loop iterators must start at an integer literal."
+      end
+
+      unless stmt.condition.is_a?(BinaryExpr)
+        raise "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+      end
+      op = stmt.condition.op
+      bound = _extract_bigint_value(stmt.condition.right)
+      if bound.nil?
+        raise "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+      end
+
+      step = _extract_loop_step(stmt)
+
+      # Count = number of iterations before the condition first turns false.
+      if step == 1
+        case op
+        when "<"  then count = bound - start
+        when "<=" then count = bound - start + 1
+        else
+          raise "For loop counting up (i++) must use '<' or '<=' (got '#{op}')."
+        end
+      else
+        case op
+        when ">"  then count = start - bound
+        when ">=" then count = start - bound + 1
+        else
+          raise "For loop counting down (i--) must use '>' or '>=' (got '#{op}')."
         end
       end
 
-      start_val = _extract_bigint_value(stmt.init&.init)
+      { start: start, step: step, count: [0, count].max }
+    end
 
-      if !start_val.nil? && start_val != 0
-        raise "For loop iterator must start at 0 (got #{start_val}n) — " \
-              "loops compile to i = 0..count-1; offset the iterator inside the body instead."
+    # Determine the iterator step direction (+1 / -1) from the for-statement's
+    # update clause, falling back to the condition direction. Only unit steps
+    # are supported.
+    #
+    # @param stmt [ForStmt]
+    # @return [Integer] +1 or -1
+    def self._extract_loop_step(stmt)
+      update = stmt.update
+      if update.is_a?(ExpressionStmt)
+        e = update.expr
+        return 1 if e.is_a?(IncrementExpr)
+        return -1 if e.is_a?(DecrementExpr)
       end
-
+      # Fall back to the comparison direction for other unit-step spellings
+      # (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
       if stmt.condition.is_a?(BinaryExpr)
         op = stmt.condition.op
-        bound_val = _extract_bigint_value(stmt.condition.right)
-        if bound_val
-          return [0, bound_val].max if op == "<"
-          return [0, bound_val + 1].max if op == "<="
-        end
+        return -1 if op == ">" || op == ">="
       end
-
-      0
+      1
     end
 
     # @param expr [Expression, nil]
@@ -2141,6 +2316,8 @@ module RunarCompiler
       new_v.count = v.count
       new_v.iter_var = v.iter_var
       new_v.body = v.body
+      new_v.start = v.start
+      new_v.step = v.step
       new_v.value_ref = v.value_ref
       new_v.preimage = v.preimage
       new_v.satoshis = v.satoshis

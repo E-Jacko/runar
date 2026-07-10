@@ -470,7 +470,7 @@ public final class AnfOptimize {
             }
             if (b.value() instanceof Loop lp) {
                 List<AnfBinding> bodyOpt = collapseTautologicalIfs(orEmpty(lp.body()));
-                out.add(new AnfBinding(b.name(), new Loop(lp.count(), bodyOpt, lp.iterVar()), b.sourceLoc()));
+                out.add(new AnfBinding(b.name(), new Loop(lp.count(), bodyOpt, lp.iterVar(), lp.start(), lp.step()), b.sourceLoc()));
                 continue;
             }
             out.add(b);
@@ -561,7 +561,7 @@ public final class AnfOptimize {
                 renameInBody(orEmpty(ifv.elseBranch()), rename));
         }
         if (v instanceof Loop lp) {
-            return new Loop(lp.count(), renameInBody(orEmpty(lp.body()), rename), lp.iterVar());
+            return new Loop(lp.count(), renameInBody(orEmpty(lp.body()), rename), lp.iterVar(), lp.start(), lp.step());
         }
         if (v instanceof Assert a) {
             return new Assert(resolve(a.value(), rename));

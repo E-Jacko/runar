@@ -440,6 +440,14 @@ class LoweringContext {
   /** Tracks constant values by binding name (for compile-time constant extraction). */
   private constValues: Map<string, bigint | string | boolean> = new Map();
 
+  /**
+   * Method params whose names collide with a mutable property. Maps the param
+   * name to the reserved stack-slot name its witness value lives under, so
+   * `lowerLoadParam` reads the param and not the same-named deserialized
+   * property slot (issue #130). Empty for the common no-collision case.
+   */
+  private readonly renamedParams: Map<string, string> = new Map();
+
   constructor(
     params: string[],
     properties: ANFProperty[],
@@ -450,6 +458,28 @@ class LoweringContext {
     this.stackMap = new StackMap(params);
     this._properties = properties;
     this.privateMethods = privateMethods;
+
+    // Issue #130 (stack layer): a method param whose name collides with a
+    // MUTABLE property gets a duplicate stackMap slot once `deserialize_state`
+    // pushes that property under the same name. Name lookups resolve to the
+    // shallowest match (the deserialized property), so `load_param` would read
+    // the stale on-chain state instead of the witness value. Rename the
+    // colliding param's slot to a reserved, collision-proof name up front and
+    // remember the mapping so `lowerLoadParam` targets the real param slot.
+    // Only mutable properties are deserialized onto the stack, so readonly
+    // shadows (handled purely by ANF resolution) never enter this map, and
+    // non-colliding contracts get an empty map — byte-identical output.
+    const mutablePropNames = new Set(
+      properties.filter(p => !p.readonly).map(p => p.name),
+    );
+    for (const name of params) {
+      if (mutablePropNames.has(name)) {
+        const renamed = `__param_${name}`;
+        this.stackMap.renameAtDepth(this.stackMap.findDepth(name), renamed);
+        this.renamedParams.set(name, renamed);
+      }
+    }
+
     this.trackDepth();
   }
 
@@ -1070,7 +1100,7 @@ class LoweringContext {
         this.lowerIf(name, value.cond, value.then, value.else, bindingIndex, lastUses);
         break;
       case 'loop':
-        this.lowerLoop(name, value.count, value.body, value.iterVar, bindingIndex, lastUses);
+        this.lowerLoop(name, value.count, value.body, value.iterVar, value.start, value.step, bindingIndex, lastUses);
         break;
       case 'assert':
         this.lowerAssert(value.value, bindingIndex, lastUses);
@@ -1082,7 +1112,7 @@ class LoweringContext {
         this.lowerGetStateScript(name);
         break;
       case 'check_preimage':
-        this.lowerCheckPreimage(name, value.preimage, bindingIndex, lastUses);
+        this.lowerCheckPreimage(name, value.preimage, value.sighashFlag, bindingIndex, lastUses);
         break;
       case 'deserialize_state':
         this.lowerDeserializeState(value.preimage, bindingIndex, lastUses);
@@ -1192,11 +1222,13 @@ class LoweringContext {
     bindingIndex: number,
     lastUses: Map<string, number>,
   ): void {
-    // The parameter is already on the stack under its original name.
-    // We alias it by bringing it to the top.
-    if (this.stackMap.has(paramName)) {
+    // The parameter is already on the stack under its original name — or, for
+    // a param that shadows a mutable property, under a reserved renamed slot
+    // (issue #130) so it is not confused with the deserialized property slot.
+    const slotName = this.renamedParams.get(paramName) ?? paramName;
+    if (this.stackMap.has(slotName)) {
       const isLast = this.isLastUse(paramName, bindingIndex, lastUses);
-      this.bringToTop(paramName, isLast);
+      this.bringToTop(slotName, isLast);
       // Rename the top-of-stack entry to the binding name
       this.stackMap.pop();
       this.stackMap.push(bindingName);
@@ -1233,9 +1265,29 @@ class LoweringContext {
       // since initialized properties are excluded from the constructor.
       const ctorProps = this._properties.filter(p => p.initialValue === undefined);
       const paramIndex = ctorProps.findIndex(p => p.name === propName);
+      // #119 tail (H1): a property that reaches the placeholder fallback with
+      // no matching constructor slot (paramIndex === -1) has no deploy-time
+      // bytes of its own. The previous behaviour coerced it onto slot 0,
+      // silently splicing an UNRELATED constructor argument's placeholder into
+      // the locking script — a silent-wrong-code path. Fail loudly instead.
+      // (A real constructor-param property — readonly or a mutable state field
+      // whose initial value is spliced at deploy — has paramIndex >= 0 and is
+      // unaffected.)
+      if (paramIndex < 0) {
+        const loc = this.currentSourceLoc
+          ? ` at ${this.currentSourceLoc.file}:${this.currentSourceLoc.line}:${this.currentSourceLoc.column}`
+          : '';
+        throw new Error(
+          `Stack lowering: property '${propName}'${loc} is neither on the stack, ` +
+            `initialized, nor a constructor parameter, so it has no deploy-time ` +
+            `slot. Refusing to emit a placeholder for an unrelated constructor ` +
+            `argument (slot 0). Known constructor-param properties: ` +
+            `[${ctorProps.map(p => p.name).join(', ')}].`,
+        );
+      }
       this.emitOp({
         op: 'placeholder',
-        paramIndex: paramIndex >= 0 ? paramIndex : 0,
+        paramIndex,
         paramName: propName,
       });
     }
@@ -2208,6 +2260,8 @@ class LoweringContext {
     count: number,
     body: ANFBinding[],
     _iterVar: string,
+    start: bigint,
+    step: 1 | -1,
     loopBindingIndex?: number,
     enclosingLastUses?: Map<string, number>,
   ): void {
@@ -2241,8 +2295,11 @@ class LoweringContext {
 
     // Loops are unrolled at compile time. Repeat the body `count` times.
     for (let i = 0; i < count; i++) {
-      // Push the iteration index as a constant (in case the loop body uses it)
-      this.emitOp({ op: 'push', value: BigInt(i) });
+      // Push the iteration variable value (in case the loop body uses it).
+      // Iteration `i` binds `start + i*step` (issue #121); zero-start
+      // counting-up loops (start=0, step=1) reduce to `BigInt(i)`, preserving
+      // the historical byte-for-byte lowering.
+      this.emitOp({ op: 'push', value: start + BigInt(i) * BigInt(step) });
       this.stackMap.push(_iterVar);
 
       const lastUses = computeLastUses(body);
@@ -3212,6 +3269,7 @@ class LoweringContext {
   private lowerCheckPreimage(
     bindingName: string,
     preimage: string,
+    sighashFlag: number | undefined,
     bindingIndex: number,
     lastUses: Map<string, number>,
   ): void {
@@ -3238,11 +3296,14 @@ class LoweringContext {
     const isLast = this.isLastUse(preimage, bindingIndex, lastUses);
     this.bringToTop(preimage, isLast);
 
-    // Derive + verify the signature on-chain (single opaque raw_bytes blob,
-    // byte-identical across all 7 tiers). Net stack effect is zero: the preimage
-    // is consumed internally as a copy and left on top; OP_CHECKSIGVERIFY aborts
-    // the script unless the binding holds.
-    emitCheckPreimageBindingRaw((op) => this.emitOp(op));
+    // Derive + verify the signature on-chain (single opaque raw_bytes blob).
+    // For the default ALL|FORKID (sighashFlag undefined) the blob is
+    // byte-identical to the pinned cross-tier constant; issue #123 lets a
+    // method declare a different mode, which only changes the appended sighash
+    // flag byte (TS-reference tier only until the 6-tier port lands). Net stack
+    // effect is zero: the preimage is consumed internally as a copy and left on
+    // top; OP_CHECKSIGVERIFY aborts the script unless the binding holds.
+    emitCheckPreimageBindingRaw((op) => this.emitOp(op), sighashFlag);
 
     // The preimage remains on top. Rename to the binding name so field
     // extractors can reference it.

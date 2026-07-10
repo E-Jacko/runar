@@ -419,6 +419,14 @@ type loweringContext struct {
 	arrayLengths       map[string]int      // element counts for array_literal bindings (used by checkMultiSig)
 	arrayElements      map[string][]string // element refs for array_literal bindings (used by checkMultiSig)
 
+	// renamedParams maps a method param name whose name collides with a MUTABLE
+	// property to the reserved stack-slot name its witness value lives under
+	// (issue #130). deserialize_state pushes each mutable property onto the
+	// stack under its own name, so a same-named param slot would otherwise be
+	// shadowed and load_param would read the stale deserialized state. Empty for
+	// the common no-collision case (byte-identical output).
+	renamedParams map[string]string
+
 	// Mode 3: when true, calls to assertGroth16WitnessAssisted in the
 	// method body are treated as no-ops by lowerCall. The actual verifier
 	// ops were already emitted as a method-entry preamble.
@@ -440,7 +448,33 @@ func newLoweringContext(params []string, properties []ir.ANFProperty) *loweringC
 		constValues:    make(map[string]*big.Int),
 		arrayLengths:   make(map[string]int),
 		arrayElements:  make(map[string][]string),
+		renamedParams:  make(map[string]string),
 	}
+
+	// Issue #130 (stack layer): a method param whose name collides with a
+	// MUTABLE property gets a duplicate stackMap slot once deserialize_state
+	// pushes that property under the same name. Name lookups resolve to the
+	// shallowest match (the deserialized property), so load_param would read the
+	// stale on-chain state instead of the witness value. Rename the colliding
+	// param's slot to a reserved, collision-proof name up front and remember the
+	// mapping so lowerLoadParam targets the real param slot. Only mutable
+	// properties are deserialized onto the stack, so readonly shadows (handled
+	// purely by ANF resolution) never enter this map, and non-colliding
+	// contracts get an empty map — byte-identical output.
+	mutablePropNames := make(map[string]bool, len(properties))
+	for _, p := range properties {
+		if !p.Readonly {
+			mutablePropNames[p.Name] = true
+		}
+	}
+	for _, name := range params {
+		if mutablePropNames[name] {
+			renamed := "__param_" + name
+			ctx.sm.renameAtDepth(ctx.sm.findDepth(name), renamed)
+			ctx.renamedParams[name] = renamed
+		}
+	}
+
 	ctx.trackDepth()
 	return ctx
 }
@@ -1019,7 +1053,7 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 	case "if":
 		ctx.lowerIf(name, value.Cond, value.Then, value.Else, bindingIndex, lastUses)
 	case "loop":
-		ctx.lowerLoop(name, value.Count, value.Body, value.IterVar, bindingIndex, lastUses)
+		ctx.lowerLoop(name, value.Count, value.Body, value.IterVar, value.Start, value.Step, bindingIndex, lastUses)
 	case "assert":
 		ctx.lowerAssert(value.ValueRef, bindingIndex, lastUses, false)
 	case "update_prop":
@@ -1027,7 +1061,7 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 	case "get_state_script":
 		ctx.lowerGetStateScript(name)
 	case "check_preimage":
-		ctx.lowerCheckPreimage(name, value.Preimage, bindingIndex, lastUses)
+		ctx.lowerCheckPreimage(name, value.Preimage, value.SighashFlag, bindingIndex, lastUses)
 	case "deserialize_state":
 		ctx.lowerDeserializeState(value.Preimage, bindingIndex, lastUses)
 	case "add_output":
@@ -1055,9 +1089,16 @@ func (ctx *loweringContext) lowerBinding(binding *ir.ANFBinding, bindingIndex in
 // ---------------------------------------------------------------------------
 
 func (ctx *loweringContext) lowerLoadParam(bindingName, paramName string, bindingIndex int, lastUses map[string]int) {
-	if ctx.sm.has(paramName) {
+	// The parameter is already on the stack under its original name — or, for a
+	// param that shadows a mutable property, under a reserved renamed slot
+	// (issue #130) so it is not confused with the deserialized property slot.
+	slotName := paramName
+	if renamed, ok := ctx.renamedParams[paramName]; ok {
+		slotName = renamed
+	}
+	if ctx.sm.has(slotName) {
 		isLast := ctx.isLastUse(paramName, bindingIndex, lastUses)
-		ctx.bringToTop(paramName, isLast)
+		ctx.bringToTop(slotName, isLast)
 		ctx.sm.pop()
 		ctx.sm.push(bindingName)
 	} else {
@@ -1094,15 +1135,45 @@ func (ctx *loweringContext) lowerLoadProp(bindingName, propName string) {
 	} else {
 		// Property value will be provided at deployment time; emit a placeholder.
 		// The emitter records byte offsets so the SDK can splice in real values.
+		//
+		// #119 tail (H1): scan the non-initialized (constructor-param) props for
+		// this name. Go signals not-found by never breaking out of the loop —
+		// paramIndex then equals the COUNT of constructor-param props, not a real
+		// slot. The previous behaviour emitted that out-of-range index as the
+		// placeholder, silently splicing an UNRELATED constructor argument's
+		// deploy-time bytes into the locking script. Fail loudly instead. (A real
+		// constructor-param property — readonly or a mutable state field whose
+		// initial value is spliced at deploy — is found and is unaffected.)
 		paramIndex := 0
+		found := false
 		for _, p := range ctx.properties {
 			if p.InitialValue != nil {
 				continue
 			}
 			if p.Name == propName {
+				found = true
 				break
 			}
 			paramIndex++
+		}
+		if !found {
+			var ctorProps []string
+			for _, p := range ctx.properties {
+				if p.InitialValue == nil {
+					ctorProps = append(ctorProps, p.Name)
+				}
+			}
+			loc := ""
+			if ctx.currentSourceLoc != nil {
+				loc = fmt.Sprintf(" at %s:%d:%d", ctx.currentSourceLoc.File, ctx.currentSourceLoc.Line, ctx.currentSourceLoc.Column)
+			}
+			panic(fmt.Errorf(
+				"stack lowering: property '%s'%s is neither on the stack, "+
+					"initialized, nor a constructor parameter, so it has no "+
+					"deploy-time slot. Refusing to emit a placeholder for an "+
+					"unrelated constructor argument (slot 0). Known "+
+					"constructor-param properties: [%s].",
+				propName, loc, strings.Join(ctorProps, ", ")))
 		}
 		ctx.emitOp(StackOp{Op: "placeholder", ParamIndex: paramIndex, ParamName: propName})
 	}
@@ -1969,7 +2040,15 @@ func (ctx *loweringContext) lowerIf(bindingName, cond string, thenBindings, else
 	}
 }
 
-func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.ANFBinding, iterVar string, loopBindingIndex int, enclosingLastUses map[string]int) {
+func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.ANFBinding, iterVar string, start *big.Int, step int, loopBindingIndex int, enclosingLastUses map[string]int) {
+	// Iteration i binds `start + i*step` (issue #121). Older ANF payloads
+	// without start/step describe zero-start counting-up loops.
+	if start == nil {
+		start = big.NewInt(0)
+	}
+	if step == 0 {
+		step = 1
+	}
 	// Collect body binding names (values defined inside the loop body).
 	bodyBindingNames := make(map[string]bool, len(body))
 	for _, b := range body {
@@ -2010,7 +2089,11 @@ func (ctx *loweringContext) lowerLoop(bindingName string, count int, body []ir.A
 	ctx.localBindings = newLocalBindings
 
 	for i := 0; i < count; i++ {
-		ctx.emitOp(StackOp{Op: "push", Value: bigIntPush(int64(i))})
+		// Push the iteration variable value: start + i*step (issue #121).
+		// Zero-start counting-up loops (start=0, step=1) reduce to i, preserving
+		// the historical byte-for-byte lowering.
+		iterVal := new(big.Int).Add(start, new(big.Int).Mul(big.NewInt(int64(i)), big.NewInt(int64(step))))
+		ctx.emitOp(StackOp{Op: "push", Value: PushValue{Kind: "bigint", BigInt: iterVal}})
 		ctx.sm.push(iterVar)
 
 		lastUses := computeLastUses(body)
@@ -3051,7 +3134,7 @@ func (ctx *loweringContext) lowerCheckMultiSig(bindingName string, args []string
 	ctx.trackDepth()
 }
 
-func (ctx *loweringContext) lowerCheckPreimage(bindingName, preimage string, bindingIndex int, lastUses map[string]int) {
+func (ctx *loweringContext) lowerCheckPreimage(bindingName, preimage string, sighashFlag int, bindingIndex int, lastUses map[string]int) {
 	// OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
 	// current spending transaction. The signature is DERIVED FROM THE PREIMAGE
 	// ON CHAIN (Optimal OP_PUSH_TX): s = (hash256(preimage) + r)*k⁻¹ mod n, with
@@ -3068,9 +3151,12 @@ func (ctx *loweringContext) lowerCheckPreimage(bindingName, preimage string, bin
 	isLast := ctx.isLastUse(preimage, bindingIndex, lastUses)
 	ctx.bringToTop(preimage, isLast)
 
-	// Derive + verify the signature on-chain (single opaque raw_bytes blob,
-	// byte-identical across all 7 tiers). Net stack effect is zero.
-	ctx.emitCheckPreimageBinding()
+	// Derive + verify the signature on-chain (single opaque raw_bytes blob).
+	// For the default ALL|FORKID (sighashFlag 0/0x41) the blob is byte-identical
+	// to the pinned cross-tier constant; issue #123 lets a method declare a
+	// different mode, which only changes the appended sighash flag byte. Net
+	// stack effect is zero.
+	ctx.emitCheckPreimageBinding(sighashFlag)
 
 	// Preimage remains on top. Rename for field extractors.
 	ctx.sm.pop()

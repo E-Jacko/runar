@@ -404,9 +404,13 @@ function evalValue(
 
     case 'loop': {
       const { count, body, iterVar } = value;
+      // Iteration `i` binds `iterVar = start + i*step` (issue #121). Older ANF
+      // payloads without start/step describe zero-start counting-up loops.
+      const start = (value as { start?: bigint }).start ?? 0n;
+      const step = BigInt((value as { step?: number }).step ?? 1);
       let lastVal: unknown;
       for (let i = 0; i < count; i++) {
-        env[iterVar] = BigInt(i);
+        env[iterVar] = start + BigInt(i) * step;
         const loopEnv = { ...env };
         evalBindings(body, loopEnv, stateDelta, dataOutputs, rawOutputs, anf, strict);
         // Copy loop bindings back

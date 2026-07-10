@@ -4,6 +4,8 @@ import (
 	"math/big"
 	"strings"
 	"testing"
+
+	"github.com/icellan/runar/compilers/go/ir"
 )
 
 // ---------------------------------------------------------------------------
@@ -917,10 +919,32 @@ class FT extends StatefulSmartContract {
 	body := program.Methods[transfer].Body
 
 	// Count bindings by kind and capture refs in declaration order.
+	//
+	// Issue #116: the change segment is now gated on `_changeAmount != 0`, so
+	// buildChangeOutput lives inside the then-branch of an `if` node, and the
+	// continuation cats the `if` node's result (not buildChangeOutput directly).
 	var stateOutputRefs []string
 	var dataOutputRefs []string
 	var catArgs [][]string
 	var changeRef string
+	var hasBuildChangeCall bool
+	// containsBuildChangeCall reports whether a binding slice (deeply) contains
+	// a buildChangeOutput call.
+	var containsBuildChangeCall func(bs []ir.ANFBinding) bool
+	containsBuildChangeCall = func(bs []ir.ANFBinding) bool {
+		for _, b := range bs {
+			if b.Value.Kind == "call" && b.Value.Func == "buildChangeOutput" {
+				return true
+			}
+			if b.Value.Kind == "if" && (containsBuildChangeCall(b.Value.Then) || containsBuildChangeCall(b.Value.Else)) {
+				return true
+			}
+			if b.Value.Kind == "loop" && containsBuildChangeCall(b.Value.Body) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, b := range body {
 		switch b.Value.Kind {
 		case "add_output":
@@ -930,8 +954,11 @@ class FT extends StatefulSmartContract {
 		case "call":
 			if b.Value.Func == "cat" {
 				catArgs = append(catArgs, append([]string(nil), b.Value.Args...))
-			} else if b.Value.Func == "buildChangeOutput" {
+			}
+		case "if":
+			if containsBuildChangeCall(b.Value.Then) || containsBuildChangeCall(b.Value.Else) {
 				changeRef = b.Name
+				hasBuildChangeCall = true
 			}
 		}
 	}
@@ -941,8 +968,8 @@ class FT extends StatefulSmartContract {
 	if len(dataOutputRefs) != 1 {
 		t.Fatalf("expected 1 add_data_output binding, got %d", len(dataOutputRefs))
 	}
-	if changeRef == "" {
-		t.Fatal("expected a buildChangeOutput call")
+	if !hasBuildChangeCall || changeRef == "" {
+		t.Fatal("expected an `if` node gating a buildChangeOutput call (issue #116)")
 	}
 	if len(catArgs) < 3 {
 		t.Fatalf("expected at least 3 cat calls (state1+state2, +data, +change), got %d", len(catArgs))
@@ -1882,70 +1909,122 @@ class TernaryDemo extends SmartContract {
 }
 
 // ---------------------------------------------------------------------------
-// #127: extractLoopCount rejects non-zero-start and countdown loops (the
-// reject path for callers that lower without validating). Zero-start
-// counting-up loops still lower to a plain iteration count.
+// #121: extractLoopShape supports non-zero-start and countdown loops (was #127,
+// which rejected them). It returns the iterator start, step direction, and
+// iteration count.
 // ---------------------------------------------------------------------------
 
-func recoverMessage(r interface{}) string {
-	if s, ok := r.(string); ok {
-		return s
-	}
-	return ""
-}
-
-func TestExtractLoopCount_NonZeroStart_Panics(t *testing.T) {
-	// for (let i = 1n; i <= 3n; i++)
+func TestExtractLoopShape_NonZeroStart(t *testing.T) {
+	// for (let i = 1n; i <= 3n; i++) → start 1, step +1, count 3
 	stmt := ForStmt{
 		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(1)}},
 		Condition: BinaryExpr{Op: "<=", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(3)}},
+		Update:    ExpressionStmt{Expr: IncrementExpr{Operand: Identifier{Name: "i"}}},
 	}
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic for non-zero-start loop")
-		}
-		if !strings.Contains(recoverMessage(r), "must start at 0") {
-			t.Errorf("expected 'must start at 0' panic, got: %v", r)
-		}
-	}()
-	extractLoopCount(stmt)
+	start, step, count := extractLoopShape(stmt)
+	if start.Int64() != 1 || step != 1 || count != 3 {
+		t.Errorf("expected (start=1, step=1, count=3), got (%s, %d, %d)", start.String(), step, count)
+	}
 }
 
-func TestExtractLoopCount_Countdown_Panics(t *testing.T) {
-	// for (let i = 3n; i > 0n; i--)
+func TestExtractLoopShape_Countdown(t *testing.T) {
+	// for (let i = 3n; i > 0n; i--) → start 3, step -1, count 3
 	stmt := ForStmt{
 		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(3)}},
 		Condition: BinaryExpr{Op: ">", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(0)}},
+		Update:    ExpressionStmt{Expr: DecrementExpr{Operand: Identifier{Name: "i"}}},
 	}
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic for countdown loop")
-		}
-		if !strings.Contains(recoverMessage(r), "countdown") {
-			t.Errorf("expected 'countdown' panic, got: %v", r)
-		}
-	}()
-	extractLoopCount(stmt)
+	start, step, count := extractLoopShape(stmt)
+	if start.Int64() != 3 || step != -1 || count != 3 {
+		t.Errorf("expected (start=3, step=-1, count=3), got (%s, %d, %d)", start.String(), step, count)
+	}
+
+	// for (let i = 3n; i >= 1n; i--) → start 3, step -1, count 3
+	stmt2 := ForStmt{
+		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(3)}},
+		Condition: BinaryExpr{Op: ">=", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(1)}},
+		Update:    ExpressionStmt{Expr: DecrementExpr{Operand: Identifier{Name: "i"}}},
+	}
+	start2, step2, count2 := extractLoopShape(stmt2)
+	if start2.Int64() != 3 || step2 != -1 || count2 != 3 {
+		t.Errorf("expected (start=3, step=-1, count=3), got (%s, %d, %d)", start2.String(), step2, count2)
+	}
 }
 
-func TestExtractLoopCount_ZeroStartCountingUp(t *testing.T) {
-	// for (let i = 0n; i <= 3n; i++) → 4 iterations
+func TestExtractLoopShape_ZeroStartCountingUp(t *testing.T) {
+	// for (let i = 0n; i <= 3n; i++) → start 0, step +1, count 4
 	stmt := ForStmt{
 		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(0)}},
 		Condition: BinaryExpr{Op: "<=", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(3)}},
+		Update:    ExpressionStmt{Expr: IncrementExpr{Operand: Identifier{Name: "i"}}},
 	}
-	if got := extractLoopCount(stmt); got != 4 {
-		t.Errorf("expected loop count 4, got %d", got)
+	if start, step, count := extractLoopShape(stmt); start.Int64() != 0 || step != 1 || count != 4 {
+		t.Errorf("expected (start=0, step=1, count=4), got (%s, %d, %d)", start.String(), step, count)
 	}
 
-	// for (let i = 0n; i < 10n; i++) → 10 iterations
+	// for (let i = 0n; i < 10n; i++) → start 0, step +1, count 10
 	stmt2 := ForStmt{
 		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(0)}},
 		Condition: BinaryExpr{Op: "<", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(10)}},
+		Update:    ExpressionStmt{Expr: IncrementExpr{Operand: Identifier{Name: "i"}}},
 	}
-	if got := extractLoopCount(stmt2); got != 10 {
-		t.Errorf("expected loop count 10, got %d", got)
+	if start, step, count := extractLoopShape(stmt2); start.Int64() != 0 || step != 1 || count != 10 {
+		t.Errorf("expected (start=0, step=1, count=10), got (%s, %d, %d)", start.String(), step, count)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #130: a method param shadowing a property — both resolution directions.
+// A bare identifier `x` resolves to the param (load_param); explicit `this.x`
+// still resolves to the property (load_prop).
+// ---------------------------------------------------------------------------
+
+func TestParamShadowingProperty_Issue130(t *testing.T) {
+	source := `
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(x: bigint): void {
+    assert(x === this.x);
+  }
+}
+`
+	contract, _ := mustLowerToANF(t, source)
+	program := LowerToANF(contract)
+
+	methodIdx := -1
+	for i := range program.Methods {
+		if program.Methods[i].Name == "m" {
+			methodIdx = i
+			break
+		}
+	}
+	if methodIdx == -1 {
+		t.Fatal("could not find method 'm'")
+	}
+	method := program.Methods[methodIdx]
+
+	loadParamX, loadPropX := 0, 0
+	for _, b := range method.Body {
+		switch b.Value.Kind {
+		case "load_param":
+			if b.Value.Name == "x" {
+				loadParamX++
+			}
+		case "load_prop":
+			if b.Value.Name == "x" {
+				loadPropX++
+			}
+		}
+	}
+	// Bare `x` -> load_param (the witness value, not stale state).
+	if loadParamX != 1 {
+		t.Errorf("expected 1 load_param for bare `x` (issue #130), got %d", loadParamX)
+	}
+	// Explicit `this.x` -> load_prop.
+	if loadPropX != 1 {
+		t.Errorf("expected 1 load_prop for `this.x` (issue #130), got %d", loadPropX)
 	}
 }

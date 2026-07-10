@@ -471,6 +471,8 @@ describe('Optimizer: Constant Folding', () => {
             kind: 'loop',
             count: 5,
             iterVar: 'i',
+            start: 0n,
+            step: 1,
             body: [b('t1', { kind: 'bin_op', op: '+', left: 'c1', right: 'c2' })],
           }),
         ]),

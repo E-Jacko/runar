@@ -56,6 +56,7 @@ fn deploy_rejects_oversized_script() {
     let result = contract.deploy(&mut provider, &signer, &DeployOptions {
         satoshis: 1000,
         change_address: None,
+        funding_signer: None,
     });
     let err = result.expect_err("expected ScriptSizeExceededError");
     assert!(err.contains("OversizedContract.deploy"), "context missing: {}", err);
@@ -75,6 +76,7 @@ fn call_rejects_oversized_current_utxo_script() {
         params: vec![],
         is_public: true,
         is_terminal: None, uses_code_part: None,
+        sig_hash_type: None,
     }]);
     let utxo = Utxo {
         txid: "a".repeat(64),

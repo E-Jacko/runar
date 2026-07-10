@@ -16,6 +16,7 @@ import type {
   ANFProgram,
 } from '../ir/index.js';
 import { computeSideEffectSummary, continuationShape } from '../passes/side-effect-summary.js';
+import { SIGHASH_DEFAULT } from '../passes/sighash-directive.js';
 import { annotateStateFieldLayout, STATE_FIELD_WIDTHS } from 'runar-ir-schema';
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,11 @@ export interface ABIMethod {
   isTerminal?: boolean;
   /** True if the unlocking script is prefixed with `_codePart` (issue #100). */
   usesCodePart?: boolean;
+  /**
+   * Issue #123: BIP-143 sighash type from a `@sighash` directive (e.g. `0x43`
+   * for SINGLE|FORKID). Absent = default `ALL|FORKID` (0x41).
+   */
+  sigHashType?: number;
 }
 
 export interface ABI {
@@ -540,6 +546,13 @@ function extractABI(contract: ContractNode): ABI {
     // For stateful contracts, mark terminal methods (no state mutation, no addOutput)
     if (isStateful && isPublic && !needsChange) {
       result.isTerminal = true;
+    }
+
+    // Issue #123: carry a non-default @sighash mode into the ABI so the SDK
+    // builds the BIP-143 preimage under the same flags the covenant expects.
+    // Omitted for the default (0x41) → existing artifacts are byte-identical.
+    if (isPublic && method.sighashType !== undefined && method.sighashType !== SIGHASH_DEFAULT) {
+      result.sigHashType = method.sighashType;
     }
 
     return result;

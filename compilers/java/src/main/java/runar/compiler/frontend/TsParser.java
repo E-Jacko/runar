@@ -5,6 +5,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
+import runar.compiler.passes.SighashDirective;
 import runar.compiler.ir.ast.ArrayLiteralExpr;
 import runar.compiler.ir.ast.AssignmentStatement;
 import runar.compiler.ir.ast.BigIntLiteral;
@@ -64,14 +66,24 @@ public final class TsParser {
     // ---------------------------------------------------------------
 
     public static ContractNode parse(String source, String filename) throws ParseException {
-        List<Token> tokens = tokenize(source);
-        Parser p = new Parser(tokens, filename);
+        List<CommentInfo> comments = new ArrayList<>();
+        List<Token> tokens = tokenize(source, comments);
+        Parser p = new Parser(tokens, filename, comments);
         ContractNode contract = p.parseContract();
         if (!p.errors.isEmpty()) {
             throw new ParseException(String.join("\n", p.errors));
         }
         return contract;
     }
+
+    // Author-facing comment directives honoured ONLY on the .runar.ts surface
+    // (issues #109 / #123). Word-boundary anchored to mirror the TS
+    // /@embedAlways\b/ and /@sighash\b/ scans.
+    private static final Pattern EMBED_ALWAYS_RE = Pattern.compile("@embedAlways\\b");
+    private static final Pattern SIGHASH_TOKEN_RE = Pattern.compile("@sighash\\b");
+
+    /** A source comment captured by the tokenizer, keyed by its start line. */
+    private record CommentInfo(int line, String text) {}
 
     /** Checked exception for parse-time problems. */
     public static class ParseException extends Exception {
@@ -213,7 +225,7 @@ public final class TsParser {
         return ch == '0' || ch == '1';
     }
 
-    private static List<Token> tokenize(String source) {
+    private static List<Token> tokenize(String source, List<CommentInfo> comments) {
         List<Token> tokens = new ArrayList<>();
         int line = 1;
         int col = 0;
@@ -247,14 +259,21 @@ public final class TsParser {
 
             // Single-line comment //
             if (ch == '/' && i + 1 < n && source.charAt(i + 1) == '/') {
+                int commentStart = i;
+                int commentLine = line;
                 while (i < n && source.charAt(i) != '\n' && source.charAt(i) != '\r') {
                     i++;
                 }
+                // Capture leading trivia so the parser can detect .runar.ts
+                // comment directives (#109 @embedAlways / #123 @sighash).
+                comments.add(new CommentInfo(commentLine, source.substring(commentStart, i)));
                 continue;
             }
 
             // Multi-line comment /* ... */
             if (ch == '/' && i + 1 < n && source.charAt(i + 1) == '*') {
+                int commentStart = i;
+                int commentLine = line;
                 i += 2;
                 col += 2;
                 boolean closed = false;
@@ -276,6 +295,7 @@ public final class TsParser {
                 if (!closed && i < n) {
                     i++;
                 }
+                comments.add(new CommentInfo(commentLine, source.substring(commentStart, Math.min(i, n))));
                 continue;
             }
 
@@ -490,14 +510,35 @@ public final class TsParser {
     private static final class Parser {
         final List<Token> tokens;
         final String fileName;
+        final List<CommentInfo> comments;
         int pos = 0;
         final List<String> errors = new ArrayList<>();
         boolean fatal = false;
         String fatalMsg = null;
 
-        Parser(List<Token> tokens, String fileName) {
+        Parser(List<Token> tokens, String fileName, List<CommentInfo> comments) {
             this.tokens = tokens;
             this.fileName = fileName;
+            this.comments = comments;
+        }
+
+        /**
+         * Concatenate the text of every captured comment that leads the member
+         * whose first token is on {@code memberLine} — i.e. comments strictly
+         * after the previous token's line and up to (and including) the member
+         * line. Mirrors ts-morph's leading-trivia scan used by the TS reference.
+         */
+        String collectLeadingComments(int afterLine, int memberLine) {
+            StringBuilder sb = new StringBuilder();
+            for (CommentInfo c : comments) {
+                if (c.line() > afterLine && c.line() <= memberLine) {
+                    if (sb.length() > 0) {
+                        sb.append('\n');
+                    }
+                    sb.append(c.text());
+                }
+            }
+            return sb.toString();
         }
 
         void addError(String msg) {
@@ -727,6 +768,12 @@ public final class TsParser {
         Object parseClassMember() throws ParseException {
             SourceLocation location = loc();
 
+            // Capture the leading-comment trivia for this member so we can
+            // detect the .runar.ts comment directives (#109 @embedAlways on a
+            // readonly field, #123 @sighash on a public method).
+            int prevTokenLine = pos > 0 ? tokens.get(pos - 1).line : 0;
+            String leadingComments = collectLeadingComments(prevTokenLine, location.line());
+
             String visibility = "private";
             boolean isReadonly = false;
 
@@ -762,7 +809,7 @@ public final class TsParser {
 
             // Method: name(...)
             if (check(TOK_LPAREN)) {
-                return parseMethod(memberName, visibility, location);
+                return parseMethod(memberName, visibility, location, leadingComments);
             }
 
             // Property: name: Type
@@ -777,13 +824,17 @@ public final class TsParser {
                 }
 
                 skipSemicolons();
+                // Issue #109: a `/** @embedAlways */` (or `// @embedAlways`)
+                // directive immediately preceding the field opts it out of DCE.
+                boolean embedAlways = EMBED_ALWAYS_RE.matcher(leadingComments).find();
                 return new PropertyNode(
                     memberName,
                     typeNode,
                     isReadonly,
                     initializer,
                     location,
-                    null
+                    null,
+                    embedAlways
                 );
             }
 
@@ -844,7 +895,8 @@ public final class TsParser {
 
         // -- Methods --------------------------------------------------
 
-        MethodNode parseMethod(String name, String visibility, SourceLocation location) throws ParseException {
+        MethodNode parseMethod(String name, String visibility, SourceLocation location,
+                               String leadingComments) throws ParseException {
             List<ParamNode> params = parseParams();
 
             if (check(TOK_COLON)) {
@@ -855,7 +907,36 @@ public final class TsParser {
             List<Statement> body = parseBlock();
 
             Visibility vis = visibility.equals("public") ? Visibility.PUBLIC : Visibility.PRIVATE;
-            return new MethodNode(name, params, body, vis, location);
+            Integer sighashType = parseSighashDirective(name, vis, leadingComments);
+            return new MethodNode(name, params, body, vis, location, sighashType);
+        }
+
+        /**
+         * Issue #123: detect + parse a {@code /** @sighash <FLAGS> *&#47;} (or
+         * {@code // @sighash ...}) directive in a method's leading trivia.
+         * Returns the numeric sighash type, or {@code null} when no directive is
+         * present. Pushes an error for a malformed flag list or a directive on a
+         * non-public method (only public methods are spending entry points).
+         */
+        Integer parseSighashDirective(String name, Visibility vis, String leadingComments) {
+            if (leadingComments == null || !SIGHASH_TOKEN_RE.matcher(leadingComments).find()) {
+                return null;
+            }
+            if (vis != Visibility.PUBLIC) {
+                addError(String.format(
+                    "@sighash directive on non-public method '%s' has no effect "
+                    + "— only public methods are spending entry points", name));
+                return null;
+            }
+            SighashDirective.Result result = SighashDirective.extractSighashDirective(leadingComments);
+            if (result == null) {
+                return null;
+            }
+            if (result.isError()) {
+                addError(String.format("Method '%s': %s", name, result.error()));
+                return null;
+            }
+            return result.value();
         }
 
         // -- Parameters -----------------------------------------------

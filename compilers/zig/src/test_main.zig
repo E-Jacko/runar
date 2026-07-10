@@ -6,6 +6,7 @@ test {
     _ = @import("ir/json_size_guard_test.zig");
     _ = @import("frontend/input_limits.zig");
     _ = @import("frontend/input_limits_test.zig");
+    _ = @import("frontend/sighash_directive.zig");
     _ = @import("codegen/opcodes.zig");
     _ = @import("codegen/emit.zig");
     _ = @import("passes/stack_lower.zig");
@@ -20,12 +21,14 @@ test {
     _ = @import("passes/parse_ruby.zig");
     _ = @import("passes/parse_java.zig");
     _ = @import("passes/validate.zig");
+    _ = @import("passes/sighash_validate.zig");
     _ = @import("passes/typecheck.zig");
     _ = @import("passes/expand_fixed_arrays.zig");
     _ = @import("passes/anf_lower.zig");
     _ = @import("passes/intent_intrinsics_test.zig");
     _ = @import("passes/constant_fold.zig");
     _ = @import("passes/ec_optimizer.zig");
+    _ = @import("passes/embed_always_warn.zig");
     _ = @import("tests/e2e.zig");
     _ = @import("tests/repeated_operand_consume.zig");
     _ = @import("tests/math_builtins.zig");
@@ -33,6 +36,9 @@ test {
     _ = @import("tests/check_multisig.zig");
     _ = @import("tests/language_constructs.zig");
     _ = @import("tests/frontend.zig");
+    _ = @import("tests/embed_always.zig");
+    _ = @import("tests/sighash_codegen.zig");
+    _ = @import("tests/sighash_validate_test.zig");
     _ = @import("compiler_api.zig");
     _ = @import("passes/helpers/koalabear_emitters.zig");
     _ = @import("passes/helpers/poseidon2_koalabear.zig");

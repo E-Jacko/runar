@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from runar_compiler.ir.types import ANFProgram
+from runar_compiler.frontend.sighash_directive import SIGHASH_DEFAULT as _SIGHASH_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,10 @@ class ABIMethod:
     is_terminal: bool | None = None
     # Unlocking script is prefixed with _codePart (issue #100).
     uses_code_part: bool | None = None
+    # Issue #123: BIP-143 sighash type from a @sighash directive (e.g. 0x43 for
+    # SINGLE|FORKID). ``None`` = default ALL|FORKID (0x41); the SDK falls back to
+    # 0x41 so existing artifacts are unchanged and older SDKs keep working.
+    sig_hash_type: int | None = None
 
 
 @dataclass
@@ -374,6 +379,44 @@ def _collect_load_prop_refs(bindings: list[Any], out: set[str]) -> None:
             _collect_load_prop_refs(v.else_ or [], out)
         elif v.kind == "loop":
             _collect_load_prop_refs(v.body or [], out)
+
+
+def _warn_dropped_readonly_fields(result: Any, Diagnostic: Any, Severity: Any) -> None:
+    """Issue #109: emit a warning for each un-annotated, unreferenced readonly
+    field that DCE eliminated (no initializer, no method reference). The
+    ``result.anf`` is already DCE-optimized here, so its surviving ``load_prop``
+    nodes are the authoritative reference set — ``@embedAlways`` fields were
+    forced back in during ANF lowering, so they appear referenced and never
+    warn. Rides the existing diagnostics channel (non-fatal).
+    """
+    contract = result.contract
+    if contract is None or result.anf is None:
+        return
+
+    referenced: set[str] = set()
+    for method in result.anf.methods:
+        if method.name == "constructor":
+            continue
+        _collect_load_prop_refs(method.body, referenced)
+
+    for prop in contract.properties:
+        if (
+            prop.readonly
+            and not getattr(prop, "embed_always", False)
+            and prop.initializer is None
+            and prop.name not in referenced
+        ):
+            result.diagnostics.append(
+                Diagnostic(
+                    message=(
+                        f"readonly field '{prop.name}' is not referenced in any "
+                        f"method body and was eliminated by DCE; annotate it "
+                        f"/** @embedAlways */ to preserve it in the on-chain script"
+                    ),
+                    severity=Severity.WARNING,
+                    loc=prop.source_location,
+                )
+            )
 
 
 # Constant folding is a source-pipeline optimization; never re-run it on
@@ -711,12 +754,20 @@ def _assemble_artifact(
                 if getattr(sm, "name", None) == method.name and getattr(sm, "uses_code_part", False):
                     uses_code_part = True
                     break
+        # Issue #123: carry a non-default @sighash mode into the ABI so the SDK
+        # builds the BIP-143 preimage under the same flags the covenant expects.
+        # Omitted for the default (0x41) → existing artifacts are byte-identical.
+        sig_hash_type: int | None = None
+        m_sig = getattr(method, "sighash_type", None)
+        if method.is_public and m_sig is not None and m_sig != _SIGHASH_DEFAULT:
+            sig_hash_type = m_sig
         methods.append(ABIMethod(
             name=method.name,
             params=params,
             is_public=method.is_public,
             is_terminal=is_terminal,
             uses_code_part=uses_code_part,
+            sig_hash_type=sig_hash_type,
         ))
 
     cs_index = code_separator_index if code_separator_index >= 0 else None
@@ -803,6 +854,7 @@ def artifact_to_json(artifact: Artifact) -> str:
                     "isPublic": m.is_public,
                     **({"isTerminal": m.is_terminal} if m.is_terminal is not None else {}),
                     **({"usesCodePart": m.uses_code_part} if m.uses_code_part is not None else {}),
+                    **({"sigHashType": m.sig_hash_type} if getattr(m, "sig_hash_type", None) is not None else {}),
                 }
                 for m in artifact.abi.methods
             ],
@@ -918,6 +970,13 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
             d["count"] = v.count
         if v.iter_var is not None:
             d["iterVar"] = v.iter_var
+        # Loop start/step (issue #121). Emitted as plain integers to match the
+        # TS reference tier after the conformance runner's bigint reviver
+        # normalizes its ``"0n"`` artifact form to a JSON number.
+        if v.start is not None:
+            d["start"] = v.start
+        if v.step is not None:
+            d["step"] = v.step
         if v.body is not None:
             d["body"] = [_ser_binding(b) for b in v.body]
         if v.value_ref is not None:
@@ -926,6 +985,10 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
             d["isAutoInjectedStateCheck"] = True
         if v.preimage is not None:
             d["preimage"] = v.preimage
+        # Issue #123: non-default @sighash flag on a check_preimage node. Omitted
+        # for the default (None) so existing ANF is byte-identical.
+        if v.kind == "check_preimage" and v.sighash_flag is not None:
+            d["sighashFlag"] = v.sighash_flag
         if v.satoshis is not None:
             d["satoshis"] = v.satoshis
         if v.state_values is not None:
@@ -960,6 +1023,10 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
                 "params": [{"name": p.name, "type": p.type} for p in m.params],
                 "body": [_ser_binding(b) for b in m.body],
                 "isPublic": m.is_public,
+                # Omit the default (and None) so explicit ``@sighash ALL|FORKID``
+                # and no-directive produce byte-identical ANF (zero golden churn).
+                **({"sigHashType": m.sighash_type}
+                   if getattr(m, "sighash_type", None) not in (None, _SIGHASH_DEFAULT) else {}),
             }
             for m in program.methods
         ],
@@ -1238,6 +1305,14 @@ def _compile_from_source_str_with_result(
             Diagnostic(message=f"EC optimization error: {e}", severity=Severity.ERROR)
         )
         return result
+
+    # Issue #109: warn when DCE strips an un-annotated readonly field. Such a
+    # field carries no compile-time value (no initializer) and is referenced by
+    # no method, so it is eliminated from the locking script entirely — silently
+    # dropping deploy-time metadata an author may intend to recover from the
+    # on-chain script later. ``@embedAlways`` fields were forced back in during
+    # ANF lowering, so they are "referenced" here and never warn.
+    _warn_dropped_readonly_fields(result, Diagnostic, Severity)
 
     # Pass 5: Stack lowering
     try:

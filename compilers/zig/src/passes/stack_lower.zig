@@ -164,6 +164,12 @@ const LowerError = error{
     /// Emitting a silent OP_0 here produced scripts that compiled, passed the
     /// env-based interpreter, and then failed on chain — so we fail loudly.
     SilentOpZeroRefused,
+    /// #119 tail (H1): a `load_prop` for a property that is neither on the
+    /// stack, initialized, nor a constructor parameter has no deploy-time slot
+    /// of its own. Coercing it onto slot 0 silently splices an UNRELATED
+    /// constructor argument's placeholder into the locking script, so we fail
+    /// loudly instead.
+    LoadPropNoConstructorSlot,
 };
 
 const LowerCtx = struct {
@@ -195,6 +201,13 @@ const LowerCtx = struct {
     outer_protected_refs: ?*const std.StringHashMapUnmanaged(void) = null,
     updated_props: std.StringHashMapUnmanaged(void),
     max_depth: u32,
+    /// Method params whose names collide with a MUTABLE property, mapped to the
+    /// reserved stack-slot name their witness value lives under (issue #130).
+    /// deserialize_state pushes each mutable property onto the stack under its
+    /// own name, so a same-named param slot would otherwise be shadowed and
+    /// lowerLoadParam would read the stale deserialized state. Empty for the
+    /// common no-collision case (byte-identical output).
+    renamed_params: std.StringHashMapUnmanaged([]const u8),
     /// Current ANF binding's source location — set before processing each binding.
     current_source_loc: ?types.SourceLocation = null,
 
@@ -217,6 +230,7 @@ const LowerCtx = struct {
             .in_branch = false,
             .updated_props = .empty,
             .max_depth = 0,
+            .renamed_params = .empty,
         };
     }
 
@@ -238,6 +252,7 @@ const LowerCtx = struct {
         for (self.owned_push_data.items) |data| self.allocator.free(data);
         self.owned_push_data.deinit(self.allocator);
         self.updated_props.deinit(self.allocator);
+        self.renamed_params.deinit(self.allocator);
     }
 
     fn trackDepth(self: *LowerCtx) void {
@@ -941,12 +956,14 @@ const LowerCtx = struct {
             .loop => |lp| {
                 const legacy = try self.allocator.create(types.ANFForLoop);
                 defer self.allocator.destroy(legacy);
-                legacy.* = .{ .var_name = lp.iter_var, .init_val = 0, .bound = @intCast(lp.count), .body_bindings = lp.body };
+                // Issue #121: carry start/step so the unroll pushes
+                // `start + n*step` on iteration `n`.
+                legacy.* = .{ .var_name = lp.iter_var, .start = lp.start, .step = lp.step, .count = lp.count, .body_bindings = lp.body };
                 try self.lowerForLoop(binding.name, legacy);
             },
             .assert => |a| try self.lowerAssertOp(binding.name, .{ .condition = a.value }, false),
             .update_prop => |up| try self.lowerPropertyWrite(binding.name, .{ .name = up.name, .value_ref = up.value }),
-            .check_preimage => |cp| try self.lowerCheckPreimage(binding.name, &.{cp.preimage}),
+            .check_preimage => |cp| try self.lowerCheckPreimage(binding.name, &.{cp.preimage}, cp.sighash_flag),
             .deserialize_state => |ds| try self.lowerDeserializeState(binding.name, &.{ds.preimage}),
             .array_literal => |al| try self.lowerArrayLiteral(binding.name, al.elements),
             .raw_script => |rs| try self.lowerRawScript(binding.name, rs.bytes, rs.in_arity, rs.out_arity),
@@ -1025,9 +1042,13 @@ const LowerCtx = struct {
     }
 
     fn lowerLoadParam(self: *LowerCtx, bind_name: []const u8, param_name: []const u8) !void {
-        if (self.stack.findDepth(param_name) != null) {
+        // The parameter is already on the stack under its original name — or, for
+        // a param that shadows a mutable property, under a reserved renamed slot
+        // (issue #130) so it is not confused with the deserialized property slot.
+        const slot_name = self.renamed_params.get(param_name) orelse param_name;
+        if (self.stack.findDepth(slot_name) != null) {
             const consume = self.isLastUse(param_name);
-            try self.bringToTop(param_name, consume);
+            try self.bringToTop(slot_name, consume);
             try self.stack.renameAtDepth(self.allocator, 0, bind_name);
             return;
         }
@@ -1213,6 +1234,22 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
+    /// Comma-separated names of the constructor-param properties (those with no
+    /// initial value, i.e. the ones that occupy a deploy-time slot). Used only
+    /// for the H1 diagnostic in `lowerPropertyRead`.
+    fn knownCtorPropNames(self: *const LowerCtx) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        var first = true;
+        for (self.program.properties) |prop| {
+            if (prop.initial_value != null) continue;
+            if (!first) try buf.appendSlice(self.allocator, ", ");
+            first = false;
+            try buf.appendSlice(self.allocator, prop.name);
+        }
+        return buf.toOwnedSlice(self.allocator);
+    }
+
     fn lowerPropertyRead(self: *LowerCtx, bind_name: []const u8, prop_name: []const u8) !void {
         // Check if property has been updated on stack
         if (self.updated_props.get(prop_name) != null) {
@@ -1244,12 +1281,50 @@ const LowerCtx = struct {
                 }
             }
         }
-        // Not found — push constructor param placeholder
-        // Determine param_index: count properties without initial_value before this one
+        // Not found on stack / initialized — push constructor param placeholder.
+        // Determine param_index: count properties without initial_value before
+        // this one. Zig signals "not a declared property" by never breaking, so
+        // track it explicitly with `found`.
         var param_idx: u32 = 0;
+        var found = false;
         for (self.program.properties) |prop| {
-            if (std.mem.eql(u8, prop.name, prop_name)) break;
+            if (std.mem.eql(u8, prop.name, prop_name)) {
+                found = true;
+                break;
+            }
             if (prop.initial_value == null) param_idx += 1;
+        }
+        // #119 tail (H1): a property that reaches this fallback with no matching
+        // constructor slot (found == false) has no deploy-time bytes of its own.
+        // The previous behaviour left `param_idx` at the count of ctor-param
+        // properties and emitted a placeholder for an UNRELATED constructor
+        // argument — a silent-wrong-code path that splices the wrong value into
+        // the locking script. Fail loudly instead. (A real constructor-param
+        // property — readonly, or a mutable state field whose initial value is
+        // spliced at deploy — is found and unaffected.)
+        if (!found) {
+            const known = self.knownCtorPropNames() catch null;
+            defer if (known) |k| self.allocator.free(k);
+            if (self.current_source_loc) |loc| {
+                std.log.warn(
+                    "stack lowering: property '{s}' at {s}:{d}:{d} is neither on " ++
+                        "the stack, initialized, nor a constructor parameter, so it " ++
+                        "has no deploy-time slot. Refusing to emit a placeholder for " ++
+                        "an unrelated constructor argument (slot 0). Known " ++
+                        "constructor-param properties: [{s}].",
+                    .{ prop_name, loc.file, loc.line, loc.column, known orelse "<unavailable>" },
+                );
+            } else {
+                std.log.warn(
+                    "stack lowering: property '{s}' is neither on the stack, " ++
+                        "initialized, nor a constructor parameter, so it has no " ++
+                        "deploy-time slot. Refusing to emit a placeholder for an " ++
+                        "unrelated constructor argument (slot 0). Known " ++
+                        "constructor-param properties: [{s}].",
+                    .{ prop_name, known orelse "<unavailable>" },
+                );
+            }
+            return LowerError.LoadPropNoConstructorSlot;
         }
         try self.emit(.{ .placeholder = .{ .param_index = param_idx, .param_name = prop_name } });
         try self.stack.push(self.allocator, bind_name);
@@ -1648,7 +1723,11 @@ const LowerCtx = struct {
             .divmod => try self.lowerDivMod(bind_name, args),
             .log2 => try self.lowerLog2(bind_name, args),
             .clamp => try self.lowerClamp(bind_name, args),
-            .checkPreimage => try self.lowerCheckPreimage(bind_name, args),
+            // Builtin-call dispatch path: reached only for a `call` node named
+            // checkPreimage, which anf_lower never emits (it lowers manual
+            // checkPreimage() into a dedicated check_preimage node carrying the
+            // sighash flag). Default flag (0 = ALL|FORKID) is correct here.
+            .checkPreimage => try self.lowerCheckPreimage(bind_name, args, 0),
             .deserializeState => try self.lowerDeserializeState(bind_name, args),
             .extractHashPrevouts, .extractLocktime, .extractOutpoint, .extractOutputHash, .extractSigHashType => try self.lowerExtractor(bind_name, id, args),
             .sign => try self.lowerSign(bind_name, args),
@@ -2593,7 +2672,7 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
-    fn lowerCheckPreimage(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
+    fn lowerCheckPreimage(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, sighash_flag: i32) !void {
         if (args.len < 1) return LowerError.InvalidBuiltin;
         // OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
         // current spending transaction. The signature is DERIVED FROM THE PREIMAGE
@@ -2610,9 +2689,12 @@ const LowerCtx = struct {
         // Bring the preimage to the top (kept for field extractors below).
         try self.bringToTopAuto(args[0]);
 
-        // Derive + verify the signature on-chain (single opaque raw_bytes blob,
-        // byte-identical across all 7 tiers). Net stack effect is zero.
-        try self.emitCheckPreimageBinding();
+        // Derive + verify the signature on-chain (single opaque raw_bytes blob).
+        // For the default ALL|FORKID (sighash_flag 0/0x41) the blob is
+        // byte-identical to the pinned cross-tier constant; issue #123 lets a
+        // method declare a different mode, which only changes the appended
+        // sighash flag byte. Net stack effect is zero.
+        try self.emitCheckPreimageBinding(sighash_flag);
 
         // Preimage remains on top. Rename for field extractors.
         try self.stack.renameAtDepth(self.allocator, 0, bind_name);
@@ -2625,9 +2707,36 @@ const LowerCtx = struct {
     /// peephole optimizer treats it as a hard barrier. The construction is the
     /// canonical output of the TypeScript reference, byte-identical across all
     /// seven tiers (guarded by the cross-tier conformance suite).
-    fn emitCheckPreimageBinding(self: *LowerCtx) !void {
-        const decoded = try self.allocator.alloc(u8, check_preimage_binding_hex.len / 2);
-        _ = std.fmt.hexToBytes(decoded, check_preimage_binding_hex) catch {
+    fn emitCheckPreimageBinding(self: *LowerCtx, sighash_flag: i32) !void {
+        // The frozen binding hex pushes SIGHASH_ALL|FORKID (0x41) as the DER
+        // signature's appended sighash byte via the single `0141` push
+        // immediately before the fixed G-pubkey tail. Issue #123 lets a method
+        // declare a different mode, which only changes that one appended flag
+        // byte — byte-for-byte matching the TS reference's
+        // emitCheckPreimageBinding(flag). All valid (FORKID-required) sighash
+        // flags (0x41/0x42/0x43/0xc1/0xc2/0xc3) minimal-push as OP_DATA_1 + flag.
+        var flag: i32 = sighash_flag;
+        if (flag == 0) flag = 0x41;
+
+        var owned_hex: ?[]u8 = null;
+        defer if (owned_hex) |h| self.allocator.free(h);
+        const hex: []const u8 = if (flag == 0x41) check_preimage_binding_hex else blk: {
+            const suffix = "0141" ++ check_preimage_sighash_tail;
+            if (!std.mem.endsWith(u8, check_preimage_binding_hex, suffix)) {
+                return LowerError.UnsupportedOperation;
+            }
+            const prefix = check_preimage_binding_hex[0 .. check_preimage_binding_hex.len - suffix.len];
+            const new_hex = try std.fmt.allocPrint(self.allocator, "{s}01{x:0>2}{s}", .{
+                prefix,
+                @as(u8, @intCast(flag & 0xff)),
+                check_preimage_sighash_tail,
+            });
+            owned_hex = new_hex;
+            break :blk new_hex;
+        };
+
+        const decoded = try self.allocator.alloc(u8, hex.len / 2);
+        _ = std.fmt.hexToBytes(decoded, hex) catch {
             self.allocator.free(decoded);
             return LowerError.UnsupportedOperation;
         };
@@ -4282,9 +4391,13 @@ const LowerCtx = struct {
         // explicit params to lowerLoop).
         const loop_binding_index = self.current_idx;
 
-        var i: i64 = fl.init_val;
-        while (i < fl.bound) : (i += 1) {
-            try self.emitPushInt(i);
+        var n: u32 = 0;
+        while (n < fl.count) : (n += 1) {
+            // Iteration `n` binds `start + n*step` (issue #121). Zero-start
+            // counting-up loops (start=0, step=1) reduce to `n`, preserving the
+            // historical byte-for-byte lowering.
+            const iter_val: i64 = fl.start + @as(i64, @intCast(n)) * fl.step;
+            try self.emitPushInt(iter_val);
             try self.stack.push(self.allocator, fl.var_name);
             self.trackDepth();
 
@@ -4303,7 +4416,7 @@ const LowerCtx = struct {
             //    script compiled and the env interpreter passed, but the
             //    emitted Script failed on chain (silent interpreter/Script
             //    divergence).
-            const is_final_iteration = (i == fl.bound - 1);
+            const is_final_iteration = (n == fl.count - 1);
             var outer_it = outer_refs.iterator();
             while (outer_it.next()) |entry| {
                 const ref = entry.key_ptr.*;
@@ -4470,6 +4583,13 @@ const LowerCtx = struct {
 // guards that this constant matches every other tier byte-for-byte.
 const check_preimage_binding_hex = "76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad";
 
+// The frozen binding hex above ends with `0141` (OP_DATA_1 SIGHASH_ALL|FORKID)
+// immediately before this fixed G-pubkey tail. Issue #123: a non-default
+// @sighash mode swaps only that single push (`0141` -> `01<flag>`), leaving the
+// tail intact — byte-for-byte matching the TS reference. Mirrors Go's
+// checkPreimageSighashTail (compilers/go/codegen/oppushtx.go).
+const check_preimage_sighash_tail = "7e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad";
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -4568,6 +4688,30 @@ fn setupMethodStack(ctx: *LowerCtx, program: types.ANFProgram, method: types.ANF
         try ctx.stack.push(ctx.allocator, param.name);
     }
     ctx.trackDepth();
+
+    // Issue #130: a method param whose name collides with a MUTABLE property
+    // gets a duplicate stackMap slot once deserialize_state pushes that property
+    // under the same name. Name lookups resolve to the shallowest match (the
+    // deserialized property), so lowerLoadParam would read the stale on-chain
+    // state instead of the witness value. Rename the colliding param's slot to a
+    // reserved, collision-proof name up front and remember the mapping so
+    // lowerLoadParam targets the real param slot. Only mutable properties are
+    // deserialized onto the stack, so readonly shadows (handled purely by ANF
+    // resolution) never enter this map, and non-colliding contracts get an empty
+    // map — byte-identical output.
+    for (method.params) |param| {
+        const is_mutable_prop = for (program.properties) |prop| {
+            if (!prop.readonly and std.mem.eql(u8, prop.name, param.name)) break true;
+        } else false;
+        if (is_mutable_prop) {
+            if (ctx.stack.findDepth(param.name)) |d| {
+                const renamed = try std.fmt.allocPrint(ctx.allocator, "__param_{s}", .{param.name});
+                try ctx.owned_push_data.append(ctx.allocator, renamed);
+                try ctx.stack.renameAtDepth(ctx.allocator, d, renamed);
+                try ctx.renamed_params.put(ctx.allocator, param.name, renamed);
+            }
+        }
+    }
 }
 
 fn setupPropertyStack(ctx: *LowerCtx, program: types.ANFProgram) !void {
@@ -5521,6 +5665,75 @@ test "lower rejects load_param of a missing param instead of emitting OP_0 (fix 
     };
 
     try std.testing.expectError(LowerError.SilentOpZeroRefused, lower(allocator, program));
+}
+
+test "lower rejects load_prop for a property with no constructor slot (H1)" {
+    // #119 tail: a `load_prop` whose name is not a declared constructor-param
+    // property used to be coerced onto slot 0, silently splicing an UNRELATED
+    // constructor argument's placeholder into the locking script. It must now
+    // hard-error instead. The contract has a real ctor-param property `pk`, and
+    // the method reads a `ghost` property that is not declared at all.
+    const allocator = std.testing.allocator;
+
+    const bindings = [_]types.ANFBinding{
+        .{
+            .name = "t0",
+            .value = .{ .load_prop = .{ .name = "ghost" } },
+            .source_loc = .{ .file = "Ghost.runar.ts", .line = 7, .column = 4 },
+        },
+        .{ .name = "t1", .value = .{ .assert = .{ .value = "t0" } } },
+    };
+
+    var props = [_]types.ANFProperty{
+        .{ .name = "pk", .type_name = "PubKey", .readonly = true },
+    };
+    var methods_arr = [_]types.ANFMethod{
+        .{ .name = "spend", .is_public = true, .params = &.{}, .bindings = @constCast(&bindings) },
+    };
+    const program = types.ANFProgram{
+        .contract_name = "Ghost",
+        .properties = &props,
+        .methods = &methods_arr,
+    };
+
+    try std.testing.expectError(LowerError.LoadPropNoConstructorSlot, lower(allocator, program));
+}
+
+test "lower accepts load_prop for a real constructor-param property (H1)" {
+    // A genuine readonly constructor-param property has a deploy-time slot
+    // (found == true) and must still lower to a placeholder without error.
+    const allocator = std.testing.allocator;
+
+    const bindings = [_]types.ANFBinding{
+        .{ .name = "t0", .value = .{ .load_prop = .{ .name = "pk" } } },
+        .{ .name = "t1", .value = .{ .assert = .{ .value = "t0" } } },
+    };
+
+    var props = [_]types.ANFProperty{
+        .{ .name = "pk", .type_name = "PubKey", .readonly = true },
+    };
+    var methods_arr = [_]types.ANFMethod{
+        .{ .name = "spend", .is_public = true, .params = &.{}, .bindings = @constCast(&bindings) },
+    };
+    const ctor_params = [_]types.ParamNode{
+        .{ .name = "pk", .type_info = .pub_key },
+    };
+    const program = types.ANFProgram{
+        .contract_name = "Ok",
+        .properties = &props,
+        .methods = &methods_arr,
+        .constructor = .{ .params = @constCast(&ctor_params), .assertions = &.{} },
+    };
+
+    const result = try lower(allocator, program);
+    defer {
+        for (result.methods) |m| {
+            allocator.free(m.instructions);
+            if (m.instruction_source_locs.len > 0) allocator.free(m.instruction_source_locs);
+        }
+        allocator.free(result.methods);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.methods.len);
 }
 
 test "lower multi-method produces one StackMethod per public method" {

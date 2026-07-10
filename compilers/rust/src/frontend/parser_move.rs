@@ -812,6 +812,7 @@ impl<'a> MoveParser<'a> {
             initializer,
             source_location: self.loc(),
             synthetic_array_chain: None,
+            embed_always: false,
         }
     }
 
@@ -909,6 +910,7 @@ impl<'a> MoveParser<'a> {
             body,
             visibility,
             source_location: self.loc(),
+            sighash_type: None,
         }
     }
 
@@ -1817,6 +1819,7 @@ fn build_constructor(properties: &[PropertyNode], file: &str) -> MethodNode {
             line: 1,
             column: 0,
         },
+        sighash_type: None,
     }
 }
 

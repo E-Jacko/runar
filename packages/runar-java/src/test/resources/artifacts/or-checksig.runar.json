@@ -1,0 +1,129 @@
+{
+  "version": "runar-v1.0.0-rc.1",
+  "compilerVersion": "1.0.0-rc.1",
+  "contractName": "OrChecksig",
+  "parentClass": "SmartContract",
+  "abi": {
+    "constructor": {
+      "params": [
+        {
+          "name": "pkA",
+          "type": "PubKey"
+        },
+        {
+          "name": "pkB",
+          "type": "PubKey"
+        }
+      ]
+    },
+    "methods": [
+      {
+        "name": "execute",
+        "params": [
+          {
+            "name": "sigA",
+            "type": "Sig"
+          },
+          {
+            "name": "sigB",
+            "type": "Sig"
+          }
+        ],
+        "isPublic": true
+      }
+    ]
+  },
+  "script": "7c00ac7c00ac9b",
+  "asm": "OP_SWAP OP_0 OP_CHECKSIG OP_SWAP OP_0 OP_CHECKSIG OP_BOOLOR",
+  "buildTimestamp": "2026-07-07T23:49:54.889Z",
+  "sourceMap": {
+    "mappings": [
+      {
+        "opcodeIndex": 0,
+        "sourceFile": "OrChecksig.runar.ts",
+        "line": 7,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 1,
+        "sourceFile": "OrChecksig.runar.ts",
+        "line": 7,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 2,
+        "sourceFile": "OrChecksig.runar.ts",
+        "line": 7,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 3,
+        "sourceFile": "OrChecksig.runar.ts",
+        "line": 7,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 4,
+        "sourceFile": "OrChecksig.runar.ts",
+        "line": 7,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 5,
+        "sourceFile": "OrChecksig.runar.ts",
+        "line": 7,
+        "column": 4
+      },
+      {
+        "opcodeIndex": 6,
+        "sourceFile": "OrChecksig.runar.ts",
+        "line": 7,
+        "column": 4
+      }
+    ]
+  },
+  "constructorSlots": [
+    {
+      "paramIndex": 0,
+      "byteOffset": 1,
+      "name": "pkA",
+      "type": "PubKey",
+      "valueEncoding": "data",
+      "fixedValueByteLength": 33,
+      "fixedPushHeaderBytes": 1
+    },
+    {
+      "paramIndex": 1,
+      "byteOffset": 4,
+      "name": "pkB",
+      "type": "PubKey",
+      "valueEncoding": "data",
+      "fixedValueByteLength": 33,
+      "fixedPushHeaderBytes": 1
+    }
+  ],
+  "templateDigest": {
+    "algorithm": "hash256-excised-slots",
+    "pieces": [
+      {
+        "kind": "code"
+      },
+      {
+        "kind": "slot",
+        "byteOffset": 1,
+        "slot": "pkA"
+      },
+      {
+        "kind": "code"
+      },
+      {
+        "kind": "slot",
+        "byteOffset": 4,
+        "slot": "pkB"
+      },
+      {
+        "kind": "code"
+      }
+    ]
+  }
+}

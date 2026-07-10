@@ -33,6 +33,32 @@ pub struct CallTxOptions {
     /// `Some(N)` writes `N` as little-endian `u32` in the locktime field.
     /// Required for contracts that assert `extractLocktime(preimage) >= deadline`.
     pub locktime: Option<u32>,
+    /// Override the nSequence written onto every input (issue #131). `None` →
+    /// `0xfffffffe` when a non-zero locktime is set (so nLockTime is
+    /// consensus-enforced), else `0xffffffff` (final, legacy).
+    pub sequence: Option<u32>,
+}
+
+/// Resolve the nSequence for a call tx's inputs (issue #131).
+///
+/// An all-`0xffffffff` input set makes nLockTime a consensus no-op, so a
+/// locktime-gated method would be script-enforced (via extractLocktime) yet
+/// NOT consensus-enforced. When a non-zero locktime is set we therefore default
+/// every input to `0xfffffffe` (non-final, enforceable). Explicit `sequence`
+/// always wins; with no/zero locktime we keep the legacy `0xffffffff`.
+///
+/// Shared by `build_call_transaction_ext` and the terminal-path tx builder so
+/// both sites stay byte-consistent.
+pub fn resolve_input_sequence(locktime: Option<u32>, sequence: Option<u32>) -> u32 {
+    if let Some(s) = sequence {
+        return s;
+    }
+    if let Some(lt) = locktime {
+        if lt != 0 {
+            return 0xffff_fffe;
+        }
+    }
+    0xffff_ffff
 }
 
 /// Build a raw transaction that spends a contract UTXO (method call).
@@ -150,6 +176,16 @@ pub fn build_call_transaction_ext(
 
     let change = total_input - contract_output_sats - fee;
 
+    // Sequence (issue #131): an all-0xffffffff input set makes nLockTime a
+    // consensus no-op. When a non-zero locktime is set, default every input to
+    // 0xfffffffe (non-final) so the locktime is actually enforced. Explicit
+    // options.sequence always wins.
+    let input_sequence = resolve_input_sequence(
+        options.and_then(|o| o.locktime),
+        options.and_then(|o| o.sequence),
+    );
+    let sequence_hex = to_little_endian_32(input_sequence);
+
     // Build raw transaction
     let mut tx = String::new();
 
@@ -164,7 +200,7 @@ pub fn build_call_transaction_ext(
     tx.push_str(&to_little_endian_32(current_utxo.output_index));
     tx.push_str(&encode_varint(unlock_byte_len as u64));
     tx.push_str(unlocking_script);
-    tx.push_str("ffffffff");
+    tx.push_str(&sequence_hex);
 
     // Additional contract inputs (with their own unlocking scripts)
     for ci in extra_contract_inputs {
@@ -173,7 +209,7 @@ pub fn build_call_transaction_ext(
         let ci_byte_len = ci.unlocking_script.len() / 2;
         tx.push_str(&encode_varint(ci_byte_len as u64));
         tx.push_str(&ci.unlocking_script);
-        tx.push_str("ffffffff");
+        tx.push_str(&sequence_hex);
     }
 
     // P2PKH funding inputs (unsigned)
@@ -181,7 +217,7 @@ pub fn build_call_transaction_ext(
         tx.push_str(&reverse_hex(&utxo.txid));
         tx.push_str(&to_little_endian_32(utxo.output_index));
         tx.push_str("00"); // empty scriptSig
-        tx.push_str("ffffffff");
+        tx.push_str(&sequence_hex);
     }
 
     // Output count
@@ -420,6 +456,7 @@ mod tests {
             additional_contract_inputs: None,
             data_outputs: None,
             locktime: Some(800_000),
+            sequence: None,
         };
         let (tx_hex, _, _) = build_call_transaction_ext(
             &utxo, "51", None, None, None, None, None, None, Some(&options),
@@ -437,6 +474,7 @@ mod tests {
             additional_contract_inputs: None,
             data_outputs: None,
             locktime: None,
+            sequence: None,
         };
         let (tx_hex, _, _) = build_call_transaction_ext(
             &utxo, "51", None, None, None, None, None, None, Some(&options),
@@ -473,6 +511,61 @@ mod tests {
         for input in &parsed.inputs {
             assert_eq!(input.sequence, 0xffff_ffff);
         }
+    }
+
+    #[test]
+    fn nonzero_locktime_defaults_inputs_to_non_final_sequence() {
+        // Issue #131: a non-zero locktime with no explicit sequence must set
+        // every input to 0xfffffffe so consensus enforces nLockTime.
+        let utxo = make_utxo(100_000, 0);
+        let additional = vec![make_utxo(50_000, 1)];
+        let change_script = format!("76a914{}88ac", "ff".repeat(20));
+        let options = CallTxOptions {
+            contract_outputs: None,
+            additional_contract_inputs: None,
+            data_outputs: None,
+            locktime: Some(800_000),
+            sequence: None,
+        };
+        let (tx_hex, _, _) = build_call_transaction_ext(
+            &utxo, "51", None, None, Some("changeaddr"), Some(&change_script),
+            Some(&additional), None, Some(&options),
+        );
+        let parsed = parse_tx_hex(&tx_hex);
+        assert!(!parsed.inputs.is_empty());
+        for input in &parsed.inputs {
+            assert_eq!(input.sequence, 0xffff_fffe);
+        }
+        assert_eq!(parsed.locktime, 800_000);
+    }
+
+    #[test]
+    fn explicit_sequence_overrides_locktime_default() {
+        // Issue #131: an explicit sequence always wins, even with a locktime.
+        let utxo = make_utxo(100_000, 0);
+        let options = CallTxOptions {
+            contract_outputs: None,
+            additional_contract_inputs: None,
+            data_outputs: None,
+            locktime: Some(800_000),
+            sequence: Some(0xdead_beef),
+        };
+        let (tx_hex, _, _) = build_call_transaction_ext(
+            &utxo, "51", None, None, None, None, None, None, Some(&options),
+        );
+        let parsed = parse_tx_hex(&tx_hex);
+        assert_eq!(parsed.inputs[0].sequence, 0xdead_beef);
+    }
+
+    #[test]
+    fn resolve_input_sequence_matches_ts_defaults() {
+        // No locktime -> final. Zero locktime -> final. Non-zero locktime ->
+        // non-final. Explicit sequence always wins.
+        assert_eq!(resolve_input_sequence(None, None), 0xffff_ffff);
+        assert_eq!(resolve_input_sequence(Some(0), None), 0xffff_ffff);
+        assert_eq!(resolve_input_sequence(Some(1), None), 0xffff_fffe);
+        assert_eq!(resolve_input_sequence(Some(800_000), Some(7)), 7);
+        assert_eq!(resolve_input_sequence(None, Some(7)), 7);
     }
 
     #[test]

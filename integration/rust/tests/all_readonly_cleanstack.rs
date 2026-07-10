@@ -70,6 +70,7 @@ fn test_all_readonly_cleanstack_claim_accepted() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

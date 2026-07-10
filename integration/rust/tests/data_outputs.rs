@@ -62,6 +62,7 @@ fn test_add_data_output_end_to_end_via_mock_provider() {
         .deploy(&mut provider, &signer, &DeployOptions {
             satoshis: 10_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy");
 

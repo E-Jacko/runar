@@ -33,7 +33,8 @@ import type {
 } from '../ir/index.js';
 import { computeSideEffectSummary, continuationShape } from './side-effect-summary.js';
 import type { SideEffectSummary } from './side-effect-summary.js';
-import type { MethodNode } from '../ir/runar-ast.js';
+import { SIGHASH_DEFAULT } from './sighash-directive.js';
+import type { MethodNode, PropertyNode } from '../ir/runar-ast.js';
 import { UnknownANFKindError } from 'runar-ir-schema';
 
 // ---------------------------------------------------------------------------
@@ -113,6 +114,18 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
   // assembler so ABI declarations cannot drift from ANF auto-injection.
   const sideEffects = computeSideEffectSummary(contract);
 
+  // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+  // must survive DCE into the locking script. A readonly field no method
+  // references lowers to no `load_prop`, so no constructor slot is emitted
+  // and the field's deploy-time bytes vanish. We inject a `load_prop` + a
+  // `@ref:` alias (the exact shape the `const _bind = this.field;` idiom
+  // produces) into the first public method's body — the alias keeps the
+  // `load_prop` alive through dead-binding DCE, and stack lowering threads
+  // the pushed value through and cleans it up (OP_NIP) at method end. One
+  // slot in the deployed script suffices; every spending branch shares it.
+  const embedFields = contract.properties.filter(p => p.readonly && p.embedAlways);
+  let embedInjected = false;
+
   // Lower constructor
   const ctorCtx = new LoweringContext(contract, sideEffects);
   ctorCtx.setMethodParamTypes(contract.constructor.params);
@@ -128,6 +141,21 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
   for (const method of contract.methods) {
     const methodCtx = new LoweringContext(contract, sideEffects);
     methodCtx.setMethodParamTypes(method.params);
+    // Issue #123: non-default @sighash mode drives the OP_PUSH_TX binding flag
+    // for any checkPreimage (auto-injected below, or a manual call) in this method.
+    if (method.sighashType !== undefined && method.sighashType !== SIGHASH_DEFAULT) {
+      methodCtx.sighashFlag = method.sighashType;
+    }
+
+    // Register the declared param NAMES so a bare identifier resolves to
+    // `load_param` before falling through to `load_prop` (issue #130). Without
+    // this, a param whose name collides with a mutable state property lowered
+    // to the stale deserialized property value instead of the witness param.
+    // Explicit `this.x` is unaffected: it lowers via lowerMemberExpr, which
+    // always emits `load_prop` regardless of param registration.
+    for (const p of method.params) {
+      methodCtx.addParam(p.name);
+    }
 
     if (contract.parentClass === 'StatefulSmartContract' && method.visibility === 'public') {
       // Continuation requirements come from the side-effect summary,
@@ -155,22 +183,31 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       }
       methodCtx.addParam('txPreimage', 'SigHashPreimage');
 
+      // Issue #123: the declared per-method sighash mode (default ALL|FORKID).
+      // Drives BOTH the OP_PUSH_TX binding flag (so the derived sig re-computes
+      // the tx sighash under this mode) AND the runtime preimage-type assert.
+      const sighashMode = method.sighashType ?? SIGHASH_DEFAULT;
+      const isDefaultSighash = sighashMode === SIGHASH_DEFAULT;
+
       // Inject checkPreimage(txPreimage) at the start
       const preimageRef = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
-      const checkResult = methodCtx.emit({ kind: 'check_preimage', preimage: preimageRef });
+      const checkResult = methodCtx.emit({
+        kind: 'check_preimage',
+        preimage: preimageRef,
+        // Omit for the default so the ANF (and pinned binding blob) is unchanged.
+        ...(isDefaultSighash ? {} : { sighashFlag: sighashMode }),
+      });
       methodCtx.emit({ kind: 'assert', value: checkResult });
 
-      // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41). The
+      // GAP-302 / #123: pin the sighash type to the declared mode. The
       // auto-injected covenant verifies a real tx preimage, but without this
-      // check the spend could use a permissive sighash flag
-      // (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields a
-      // contract may read (extractAmount / extractHashPrevouts /
-      // extractSequence). The hashOutputs continuation already fails under
-      // non-ALL flags, so for continuation-using methods this is a no-op on
-      // spendability; it closes the field-zeroing exposure for the rest.
+      // check the spend could use a DIFFERENT sighash flag than declared that
+      // zeroes out preimage fields the contract (or its continuation) relies on
+      // (hashOutputs / hashPrevouts / hashSequence). The value defaults to 0x41
+      // (SIGHASH_ALL|FORKID) so existing contracts emit byte-identical ANF.
       const sigHashPreimageRef = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
       const sigHashTypeRef = methodCtx.emit({ kind: 'call', func: 'extractSigHashType', args: [sigHashPreimageRef] });
-      const expectedSigHashRef = methodCtx.emit({ kind: 'load_const', value: 0x41n });
+      const expectedSigHashRef = methodCtx.emit({ kind: 'load_const', value: BigInt(sighashMode) });
       const sigHashOkRef = methodCtx.emit({ kind: 'bin_op', op: '===', left: sigHashTypeRef, right: expectedSigHashRef });
       methodCtx.emit({ kind: 'assert', value: sigHashOkRef });
 
@@ -179,6 +216,14 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       if (stateProps.length > 0) {
         const preimageRef3 = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
         methodCtx.emit({ kind: 'deserialize_state', preimage: preimageRef3 });
+      }
+
+      // Issue #109: preserve @embedAlways fields at the first user-statement
+      // position (after the checkPreimage/deserialize preamble), mirroring
+      // where a `const _bind = this.field;` idiom would sit.
+      if (!embedInjected && embedFields.length > 0) {
+        emitEmbedAlwaysPreservation(methodCtx, embedFields);
+        embedInjected = true;
       }
 
       // Lower the developer's method body
@@ -225,10 +270,32 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
       // `private-helper-outputs` conformance fixture (its `partition`
       // and `log` methods route outputs through private helpers).
       if (needsChangeOutput) {
-        // Build the P2PKH change output for hashOutputs verification
+        // Build the P2PKH change output for hashOutputs verification.
+        //
+        // Issue #116: the SDK's buildCallTransaction OMITS the change output
+        // when `change <= 0` (an exact-cover call) and passes `_changeAmount =
+        // 0`. Gate the change segment on `_changeAmount != 0` at runtime so the
+        // hashed output set matches the SDK at the exact-zero boundary — the
+        // segment is the P2PKH change output when non-zero, and empty bytes
+        // (cat with empty is a no-op) when zero, reproducing the omission. For
+        // any change > 0 the hashed bytes are unchanged; only the emitted
+        // script gains the guard.
         const changePKHRef = methodCtx.emit({ kind: 'load_param', name: '_changePKH' });
         const changeAmountRef = methodCtx.emit({ kind: 'load_param', name: '_changeAmount' });
-        const changeOutputRef = methodCtx.emit({ kind: 'call', func: 'buildChangeOutput', args: [changePKHRef, changeAmountRef] });
+        const zeroRef = methodCtx.emit({ kind: 'load_const', value: 0n });
+        const changeNonZeroRef = methodCtx.emit({ kind: 'bin_op', op: '!==', left: changeAmountRef, right: zeroRef });
+        const changeThenCtx = methodCtx.subContext();
+        changeThenCtx.emit({ kind: 'call', func: 'buildChangeOutput', args: [changePKHRef, changeAmountRef] });
+        methodCtx.syncCounter(changeThenCtx);
+        const changeElseCtx = methodCtx.subContext();
+        changeElseCtx.emit({ kind: 'load_const', value: '' });
+        methodCtx.syncCounter(changeElseCtx);
+        const changeOutputRef = methodCtx.emit({
+          kind: 'if',
+          cond: changeNonZeroRef,
+          then: changeThenCtx.bindings,
+          else: changeElseCtx.bindings,
+        });
 
         if (addOutputRefs.length > 0) {
           // Multi-output continuation: concat all state outputs, then all
@@ -303,6 +370,13 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
         isPublic: true,
       });
     } else {
+      // Issue #109: stateless public methods (and stateless contracts'
+      // spending entry points) are lowered here — inject @embedAlways
+      // preservation into the first PUBLIC one before its body.
+      if (!embedInjected && embedFields.length > 0 && method.visibility === 'public') {
+        emitEmbedAlwaysPreservation(methodCtx, embedFields);
+        embedInjected = true;
+      }
       lowerStatements(method.body, methodCtx);
       // Private methods can also call the intent intrinsics; capture
       // their auto-injected witness params. Public callers that inline
@@ -331,6 +405,28 @@ function lowerParams(params: ParamNode[]): ANFParam[] {
     name: p.name,
     type: typeNodeToString(p.type),
   }));
+}
+
+/**
+ * Issue #109: emit the DCE-surviving preservation pair for each
+ * `@embedAlways` readonly field, into the given (public) method context.
+ *
+ * Reproduces exactly what a hand-written `const _bind = this.field;` lowers
+ * to: a `load_prop` followed by a `load_const("@ref:<t>")` alias. The alias
+ * marks the `load_prop` as referenced (see `collectRefsFromValue` in
+ * `optimizer/dce.ts`), so dead-binding DCE keeps it; stack lowering then
+ * emits the field's constructor-slot placeholder and NIPs the unused value
+ * off the stack at method end. The field's bytes therefore remain in the
+ * deployed locking script for downstream recovery.
+ */
+function emitEmbedAlwaysPreservation(ctx: LoweringContext, fields: PropertyNode[]): void {
+  for (const field of fields) {
+    const loadRef = ctx.emit({ kind: 'load_prop', name: field.name });
+    ctx.emitNamed(`__embedAlways_${field.name}`, {
+      kind: 'load_const',
+      value: `@ref:${loadRef}`,
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +484,13 @@ class LoweringContext {
    * still registers on the parent method's ABI augmentation list.
    */
   methodScope: MethodScope = new MethodScope();
+  /**
+   * Issue #123: the declared non-default `@sighash` flag for the method being
+   * lowered, so a MANUAL `checkPreimage(pre)` call (stateless / explicit) binds
+   * under the same mode as the method's declared sighash. `undefined` = default
+   * ALL|FORKID, keeping the pinned binding blob unchanged.
+   */
+  sighashFlag: number | undefined;
   /** Maps local variable names to their current ANF binding name.
    *  Updated after if-statements that reassign locals in both branches. */
   private readonly localAliases: Map<string, string> = new Map();
@@ -863,9 +966,10 @@ function lowerForStatement(
   stmt: Extract<Statement, { kind: 'for_statement' }>,
   ctx: LoweringContext,
 ): void {
-  // Extract the loop count from the for-statement.
-  // Rúnar requires bounded loops, so we try to determine the count statically.
-  const count = extractLoopCount(stmt);
+  // Resolve the loop's compile-time shape: start value, step direction, and
+  // iteration count. Rúnar requires bounded loops, so all three must be
+  // statically determinable (issue #121).
+  const { start, step, count } = extractLoopShape(stmt);
 
   // Lower body into sub-context
   const bodyCtx = ctx.subContext();
@@ -877,59 +981,88 @@ function lowerForStatement(
     count,
     body: bodyCtx.bindings,
     iterVar: stmt.init.name,
+    start,
+    step,
   });
 }
 
 /**
- * Extract a compile-time loop count from a for statement.
+ * Resolve a for-statement's compile-time loop shape (issue #121).
  *
- * Supports patterns like:
- *   for (let i = 0n; i < 10n; i++)
- *   for (let i: bigint = 0n; i < N; i++)
+ * Supports counting-up and counting-down loops:
+ *   for (let i = 0n; i < 10n; i++)     -> start 0,  step +1, count 10
+ *   for (let i = 1n; i <= 3n; i++)     -> start 1,  step +1, count 3
+ *   for (let i = 3n; i > 0n; i--)      -> start 3,  step -1, count 3
+ *   for (let i = 3n; i >= 1n; i--)     -> start 3,  step -1, count 3
  *
- * Returns the count (number of iterations). Falls back to 0 if
- * the pattern is not recognized.
- *
- * The ANF loop node carries only the count — no start value or step
- * direction — so lowering (and the ANF interpreter) always iterates
- * i = 0..count-1. Loop shapes that representation cannot express are
- * rejected here (mirroring the source-located errors in 02-validate)
- * rather than silently compiled as a zero-start counting-up loop.
+ * The loop is unrolled `count` times; on iteration `i` the iterator holds
+ * `start + i * step`. Start and bound must be compile-time integer literals.
  */
-function extractLoopCount(
+function extractLoopShape(
   stmt: Extract<Statement, { kind: 'for_statement' }>,
-): number {
-  // A countdown loop necessarily also has a non-zero start, so check the
-  // condition direction first — it is the more precise diagnosis.
-  if (stmt.condition.kind === 'binary_expr') {
-    const op = stmt.condition.op;
-    if (op === '>' || op === '>=') {
+): { start: bigint; step: 1 | -1; count: number } {
+  const start = extractBigIntValue(stmt.init.init);
+  if (start === null) {
+    throw new Error(
+      'Cannot determine loop start at compile time. For-loop iterators must start at an integer literal.',
+    );
+  }
+
+  if (stmt.condition.kind !== 'binary_expr') {
+    throw new Error('Cannot determine loop bound at compile time. For-loop bounds must be integer literals.');
+  }
+  const op = stmt.condition.op;
+  const bound = extractBigIntValue(stmt.condition.right);
+  if (bound === null) {
+    throw new Error('Cannot determine loop bound at compile time. For-loop bounds must be integer literals.');
+  }
+
+  const step = extractLoopStep(stmt);
+
+  // Count = number of iterations before the condition first turns false.
+  let count: bigint;
+  if (step === 1) {
+    if (op === '<') count = bound - start;
+    else if (op === '<=') count = bound - start + 1n;
+    else {
       throw new Error(
-        `For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead.`,
+        `For loop counting up (i${'++'}) must use '<' or '<=' (got '${op}').`,
+      );
+    }
+  } else {
+    if (op === '>') count = start - bound;
+    else if (op === '>=') count = start - bound + 1n;
+    else {
+      throw new Error(
+        `For loop counting down (i--) must use '>' or '>=' (got '${op}').`,
       );
     }
   }
 
-  // Try to extract start value
-  const startVal = extractBigIntValue(stmt.init.init);
+  return { start, step, count: Math.max(0, Number(count)) };
+}
 
-  if (startVal !== null && startVal !== 0n) {
-    throw new Error(
-      `For loop iterator must start at 0 (got ${startVal}n) — loops compile to i = 0..count-1; offset the iterator inside the body instead.`,
-    );
+/**
+ * Determine the iterator step direction (+1 / -1) from the for-statement's
+ * update clause, falling back to the condition direction. Only unit steps are
+ * supported; a non-unit update (e.g. `i += 2`) is out of the loop model.
+ */
+function extractLoopStep(
+  stmt: Extract<Statement, { kind: 'for_statement' }>,
+): 1 | -1 {
+  const update = stmt.update;
+  if (update.kind === 'expression_statement') {
+    const e = update.expression;
+    if (e.kind === 'increment_expr') return 1;
+    if (e.kind === 'decrement_expr') return -1;
   }
-
-  // Try to extract the bound from the condition
+  // Fall back to the comparison direction for other unit-step spellings
+  // (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
   if (stmt.condition.kind === 'binary_expr') {
     const op = stmt.condition.op;
-    const boundVal = extractBigIntValue(stmt.condition.right);
-    if (boundVal !== null) {
-      if (op === '<') return Math.max(0, Number(boundVal));
-      if (op === '<=') return Math.max(0, Number(boundVal) + 1);
-    }
+    if (op === '>' || op === '>=') return -1;
   }
-
-  throw new Error('Cannot determine loop bound at compile time. For-loop bounds must be integer literals.');
+  return 1;
 }
 
 function extractBigIntValue(expr: Expression): bigint | null {
@@ -990,7 +1123,14 @@ function lowerExprToRef(expr: Expression, ctx: LoweringContext): string {
       return lowerIdentifier(expr, ctx);
 
     case 'property_access':
-      // this.txPreimage in StatefulSmartContract -> load_param (it's an implicit param, not a stored property)
+      // Explicit `this.x`: a real contract property always wins, even when a
+      // method param shares the name (issue #130). Now that declared params are
+      // registered, the isParam branch below must not shadow a stored property.
+      if (ctx.isProperty(expr.property)) {
+        return ctx.emit({ kind: 'load_prop', name: expr.property });
+      }
+      // this.txPreimage in StatefulSmartContract -> load_param (it's an
+      // implicit injected param, not a stored property).
       if (ctx.isParam(expr.property)) {
         return ctx.emit({ kind: 'load_param', name: expr.property });
       }
@@ -1173,7 +1313,12 @@ function lowerCallExpr(
   if (callee.kind === 'identifier' && callee.name === 'checkPreimage') {
     if (expr.args.length >= 1) {
       const preimageRef = lowerExprToRef(expr.args[0]!, ctx);
-      return ctx.emit({ kind: 'check_preimage', preimage: preimageRef });
+      return ctx.emit({
+        kind: 'check_preimage',
+        preimage: preimageRef,
+        // Issue #123: honour the method's declared @sighash on manual calls.
+        ...(ctx.sighashFlag !== undefined ? { sighashFlag: ctx.sighashFlag } : {}),
+      });
     }
   }
 

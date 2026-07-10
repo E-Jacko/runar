@@ -2103,11 +2103,18 @@ class EmptyMethod extends SmartContract {
 }
 
 // ---------------------------------------------------------------------------
-// V11: validator — identifier loop bound accepted
+// V11: validator — identifier loop bound rejected (cleanly, no panic)
 // ---------------------------------------------------------------------------
+//
+// A for-loop bound that is a bare identifier (e.g. `const N`) cannot be
+// unrolled into fixed Bitcoin Script — the reference TS compiler rejects it
+// with a graceful diagnostic (never a panic). The 6 non-TS tiers previously
+// PANICKED in anf-lower (`extract_loop_shape`) on such a bound; the fix moves
+// the rejection to the validator so compilation fails cleanly. Only genuine
+// integer-literal bounds compile.
 
 #[test]
-fn test_v11_validator_identifier_loop_bound_ok() {
+fn test_v11_validator_identifier_loop_bound_rejects() {
     let source = r#"
 import { SmartContract } from 'runar-lang';
 
@@ -2131,9 +2138,13 @@ class LoopWithIdent extends SmartContract {
 "#;
     let result = compile_ts(source);
     assert!(
-        result.is_ok(),
-        "for loop with identifier bound (const N) should pass validation; got: {:?}",
-        result.err()
+        result.is_err(),
+        "for loop with identifier bound (const N) must be rejected cleanly (no panic)"
+    );
+    let err = format!("{:?}", result.err());
+    assert!(
+        err.contains("compile-time constant"),
+        "expected a 'compile-time constant' loop-bound diagnostic, got: {err}"
     );
 }
 

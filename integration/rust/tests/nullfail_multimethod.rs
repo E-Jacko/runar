@@ -81,6 +81,7 @@ fn test_nullfail_multimethod_chain_spends() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 50_000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

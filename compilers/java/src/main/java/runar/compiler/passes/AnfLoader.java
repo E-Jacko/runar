@@ -161,7 +161,11 @@ public final class AnfLoader {
             case "loop" -> new Loop(
                 asInt(obj.get("count")),
                 toBindingList(obj.get("body")),
-                asString(obj.get("iterVar"))
+                asString(obj.get("iterVar")),
+                // Iterator start / step (issue #121). Older payloads without
+                // these describe zero-start counting-up loops.
+                obj.containsKey("start") ? asBigInt(obj.get("start")) : BigInteger.ZERO,
+                obj.containsKey("step") ? asInt(obj.get("step")) : 1
             );
             case "assert" -> new Assert(
                 asString(obj.get("value")),
@@ -170,7 +174,11 @@ public final class AnfLoader {
             );
             case "update_prop" -> new UpdateProp(asString(obj.get("name")), asString(obj.get("value")));
             case "get_state_script" -> new GetStateScript();
-            case "check_preimage" -> new CheckPreimage(asString(obj.get("preimage")));
+            case "check_preimage" -> new CheckPreimage(
+                asString(obj.get("preimage")),
+                obj.containsKey("sighashFlag") && obj.get("sighashFlag") != null
+                    ? asInt(obj.get("sighashFlag")) : null
+            );
             case "deserialize_state" -> new DeserializeState(asString(obj.get("preimage")));
             case "add_output" -> {
                 String sat = asString(obj.get("satoshis"));
@@ -321,6 +329,13 @@ public final class AnfLoader {
         if (v instanceof Integer i) return i;
         if (v instanceof BigInteger bi) return bi.intValue();
         throw new RuntimeException("expected int, got " + (v == null ? "null" : v.getClass()));
+    }
+
+    private static BigInteger asBigInt(Object v) {
+        if (v instanceof BigInteger bi) return bi;
+        if (v instanceof Long l) return BigInteger.valueOf(l);
+        if (v instanceof Integer i) return BigInteger.valueOf(i);
+        throw new RuntimeException("expected integer, got " + (v == null ? "null" : v.getClass()));
     }
 
     // ------------------------------------------------------------------

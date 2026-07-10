@@ -15,6 +15,27 @@ import (
 	"golang.org/x/crypto/ripemd160"
 )
 
+// emptySigMarker is the type of the EmptySig sentinel (issue #106).
+type emptySigMarker struct{}
+
+// EmptySig is the producer-side marker (issue #106) for the deliberately-empty
+// branch of an OR-CHECKSIG method — checkSig(sigA, pkA) || checkSig(sigB, pkB),
+// where || lowers to the non-lazy OP_BOOLOR so BOTH OP_CHECKSIGs run. Only the
+// matching branch supplies a real signature; the failing branch MUST push an
+// empty signature (OP_0) or BIP146 NULLFAIL rejects the whole spend.
+//
+// Pass EmptySig as the call arg for the non-matching Sig slot: the SDK pushes
+// OP_0 for it and never signs it, distinct from nil (auto-sign) and an explicit
+// hex-bytes value. Coexists with nil at the same call — Call("execute", []any{
+// nil, EmptySig}) signs only slot 0.
+var EmptySig interface{} = emptySigMarker{}
+
+// IsEmptySig reports whether a call arg is the EmptySig marker (issue #106).
+func IsEmptySig(value interface{}) bool {
+	_, ok := value.(emptySigMarker)
+	return ok
+}
+
 // ---------------------------------------------------------------------------
 // RunarContract — main contract runtime wrapper
 // ---------------------------------------------------------------------------
@@ -322,14 +343,20 @@ func (c *RunarContract) Deploy(
 		return "", nil, fmt.Errorf("RunarContract.Deploy: %w", err)
 	}
 
-	// Sign all inputs
+	// Sign all inputs. Deploy inputs are all P2PKH funding, signed by
+	// fundingSigner when set (issue #134): the deploy signer may not own the
+	// funding coins. Defaults to the connected signer.
+	fundingSigner := options.FundingSigner
+	if fundingSigner == nil {
+		fundingSigner = signer
+	}
 	for i := 0; i < inputCount; i++ {
 		utxo := utxos[i]
-		sig, err := signer.Sign(deployTx.Hex(), i, utxo.Script, utxo.Satoshis, nil)
+		sig, err := fundingSigner.Sign(deployTx.Hex(), i, utxo.Script, utxo.Satoshis, nil)
 		if err != nil {
 			return "", nil, fmt.Errorf("RunarContract.Deploy: signing input %d: %w", i, err)
 		}
-		pubKey, err := signer.GetPublicKey()
+		pubKey, err := fundingSigner.GetPublicKey()
 		if err != nil {
 			return "", nil, fmt.Errorf("RunarContract.Deploy: getting public key: %w", err)
 		}
@@ -444,6 +471,13 @@ func (c *RunarContract) PrepareCall(
 		return nil, fmt.Errorf("RunarContract.PrepareCall: no provider/signer available. Call Connect() or pass them explicitly")
 	}
 
+	// Funding (and terminal fee) inputs are signed by fundingSigner when set
+	// (issue #134). The method's own Sig args stay with the connected signer.
+	fundingSigner := signer
+	if options != nil && options.FundingSigner != nil {
+		fundingSigner = options.FundingSigner
+	}
+
 	// Validate method exists
 	method := c.findMethod(methodName)
 	if method == nil {
@@ -549,6 +583,10 @@ func (c *RunarContract) PrepareCall(
 			sigIndices = append(sigIndices, i)
 			resolvedArgs[i] = strings.Repeat("00", 72)
 		}
+		// Issue #106: EmptySig is intentionally NOT collected here — it is not
+		// nil, so it is never added to sigIndices and never signed. It stays in
+		// resolvedArgs and encodeArg emits OP_0 (empty sig) for it, satisfying
+		// BIP146 NULLFAIL on the failing branch of an OR-CHECKSIG method.
 		if param.Type == "PubKey" && args[i] == nil {
 			pubKey, pkErr := signer.GetPublicKey()
 			if pkErr != nil {
@@ -713,11 +751,58 @@ func (c *RunarContract) PrepareCall(
 	if err != nil {
 		return nil, fmt.Errorf("RunarContract.PrepareCall: getting UTXOs: %w", err)
 	}
-	var additionalUtxos []UTXO
+	var candidateFundingUtxos []UTXO
 	for _, u := range allFundingUtxos {
 		if !(u.Txid == c.currentUtxo.Txid && u.OutputIndex == c.currentUtxo.OutputIndex) {
-			additionalUtxos = append(additionalUtxos, u)
+			candidateFundingUtxos = append(candidateFundingUtxos, u)
 		}
+	}
+
+	// Coin selection for funding inputs (issue #133): don't sweep the whole
+	// wallet. Compute how much the funding must cover — the contract's own input
+	// value already offsets the contract/data outputs — and pick the smallest
+	// largest-first set via SelectUtxos (the strategy deploy uses).
+	var contractOutputSats int64
+	if len(contractOutputs) > 0 {
+		for _, co := range contractOutputs {
+			contractOutputSats += co.Satoshis
+		}
+	} else {
+		contractOutputSats = newSatoshis
+	}
+	for _, do := range resolvedDataOutputs {
+		contractOutputSats += do.Satoshis
+	}
+	contractInputSats := c.currentUtxo.Satoshis
+	for _, u := range extraContractUtxos {
+		contractInputSats += u.Satoshis
+	}
+	fundingTarget := contractOutputSats - contractInputSats
+	if fundingTarget < 0 {
+		fundingTarget = 0
+	}
+	// Fee sizing hint for SelectUtxos: the continuation script length (falls
+	// back to the first multi-output script, else 0 for stateless calls).
+	fundingLockLen := 0
+	if newLockingScript != "" {
+		fundingLockLen = len(newLockingScript) / 2
+	} else if len(contractOutputs) > 0 {
+		fundingLockLen = len(contractOutputs[0].Script) / 2
+	}
+	var additionalUtxos []UTXO
+	if len(candidateFundingUtxos) > 0 {
+		additionalUtxos = SelectUtxos(candidateFundingUtxos, fundingTarget, fundingLockLen, feeRate)
+	}
+
+	// Cap funding inputs when the caller sets MaxFundingInputs. SelectUtxos
+	// returns the minimal largest-first set; if that still exceeds the cap the
+	// funding can't cover outputs + fee within the budget, so fail loudly
+	// instead of broadcasting an underfunded tx.
+	if options != nil && options.MaxFundingInputs != nil && len(additionalUtxos) > *options.MaxFundingInputs {
+		return nil, fmt.Errorf(
+			"RunarContract.Call(%s): funding requires %d input(s) but maxFundingInputs=%d. "+
+				"Increase maxFundingInputs, use larger UTXOs, or consolidate.",
+			methodName, len(additionalUtxos), *options.MaxFundingInputs)
 	}
 
 	// Initial unlocking script (with placeholders). Intent-witness hex is
@@ -786,8 +871,11 @@ func (c *RunarContract) PrepareCall(
 	}
 	// Thread CallOptions.Locktime through so contracts asserting
 	// extractLocktime(preimage) can succeed. nil → 0 (legacy behavior).
+	// Thread CallOptions.Sequence (issue #131): a non-zero locktime needs
+	// non-final input sequences or consensus ignores nLockTime.
 	if options != nil {
 		buildOpts.Locktime = options.Locktime
+		buildOpts.Sequence = options.Sequence
 	}
 	if len(extraContractUtxos) > 0 {
 		buildOpts.AdditionalContractInputs = make([]AdditionalContractInput, len(extraContractUtxos))
@@ -811,18 +899,18 @@ func (c *RunarContract) PrepareCall(
 		buildOpts,
 	)
 
-	// Sign P2PKH funding inputs (after contract inputs)
+	// Sign P2PKH funding inputs (after contract inputs) with fundingSigner (issue #134)
 	signedTx := callTx.Hex()
 	p2pkhStartIdx := 1 + len(extraContractUtxos)
 	for i := p2pkhStartIdx; i < inputCount; i++ {
 		utxoIdx := i - p2pkhStartIdx
 		if utxoIdx < len(additionalUtxos) {
 			utxo := additionalUtxos[utxoIdx]
-			sig, signErr := signer.Sign(signedTx, i, utxo.Script, utxo.Satoshis, nil)
+			sig, signErr := fundingSigner.Sign(signedTx, i, utxo.Script, utxo.Satoshis, nil)
 			if signErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall: signing input %d: %w", i, signErr)
 			}
-			pubKey, pkErr := signer.GetPublicKey()
+			pubKey, pkErr := fundingSigner.GetPublicKey()
 			if pkErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall: getting public key: %w", pkErr)
 			}
@@ -834,6 +922,9 @@ func (c *RunarContract) PrepareCall(
 	finalOpPushTxSig := ""
 	finalPreimage := ""
 	codeSepIdx := c.getCodeSepIndex(methodIndex)
+	// Issue #123: build every preimage on this path under the method's declared
+	// @sighash mode (default 0x41 for methods with no directive).
+	sigHashType := c.methodSigHashType(methodName)
 
 	// Mode 3: pre-encode the witness-assisted Groth16 prover bundle into a
 	// flat hex push sequence so each pass of buildStatefulUnlock can splice
@@ -851,7 +942,7 @@ func (c *RunarContract) PrepareCall(
 		// Helper: build a stateful unlock. For inputIdx==0 (primary), keeps
 		// placeholder Sig params. For inputIdx>0 (extra), signs with signer.
 		buildStatefulUnlock := func(tx string, inputIdx int, subscript string, sats int64, baseArgs []interface{}, txChangeAmount int64) (unlock string, opSigHex string, preimageHex string, retErr error) {
-			opSig, preimage, ptxErr := ComputeOpPushTxWithCodeSep(tx, inputIdx, subscript, sats, codeSepIdx)
+			opSig, preimage, ptxErr := ComputeOpPushTxWithSigHash(tx, inputIdx, subscript, sats, codeSepIdx, sigHashType)
 			if ptxErr != nil {
 				return "", "", "", fmt.Errorf("OP_PUSH_TX for input %d: %w", inputIdx, ptxErr)
 			}
@@ -933,8 +1024,11 @@ func (c *RunarContract) PrepareCall(
 		}
 		// Rebuild path must honor the override too: a preimage computed on a
 		// rebuilt tx with locktime 0 would mismatch the final on-chain tx.
+		// Same for sequence — the second-pass preimage must see the final input
+		// sequences (issue #131).
 		if options != nil {
 			rebuildOpts.Locktime = options.Locktime
+			rebuildOpts.Sequence = options.Sequence
 		}
 		if len(extraContractUtxos) > 0 {
 			rebuildOpts.AdditionalContractInputs = make([]AdditionalContractInput, len(extraContractUtxos))
@@ -977,16 +1071,16 @@ func (c *RunarContract) PrepareCall(
 			signedTx = InsertUnlockingScript(signedTx, i+1, finalMergeUnlock)
 		}
 
-		// Re-sign P2PKH funding inputs (outputs changed after rebuild)
+		// Re-sign P2PKH funding inputs (outputs changed after rebuild) with fundingSigner (issue #134)
 		for i := p2pkhStartIdx; i < inputCount; i++ {
 			utxoIdx := i - p2pkhStartIdx
 			if utxoIdx < len(additionalUtxos) {
 				utxo := additionalUtxos[utxoIdx]
-				sig, signErr := signer.Sign(signedTx, i, utxo.Script, utxo.Satoshis, nil)
+				sig, signErr := fundingSigner.Sign(signedTx, i, utxo.Script, utxo.Satoshis, nil)
 				if signErr != nil {
 					return nil, fmt.Errorf("RunarContract.PrepareCall: re-signing input %d: %w", i, signErr)
 				}
-				pubKey, pkErr := signer.GetPublicKey()
+				pubKey, pkErr := fundingSigner.GetPublicKey()
 				if pkErr != nil {
 					return nil, fmt.Errorf("RunarContract.PrepareCall: getting public key: %w", pkErr)
 				}
@@ -1006,8 +1100,8 @@ func (c *RunarContract) PrepareCall(
 	} else if needsOpPushTx || len(sigIndices) > 0 {
 		// Stateless: keep placeholder sigs, compute OP_PUSH_TX
 		if needsOpPushTx {
-			opPushTxSig, preimage, ptxErr := ComputeOpPushTxWithCodeSep(signedTx, 0,
-				contractUtxo.Script, contractUtxo.Satoshis, codeSepIdx)
+			opPushTxSig, preimage, ptxErr := ComputeOpPushTxWithSigHash(signedTx, 0,
+				contractUtxo.Script, contractUtxo.Satoshis, codeSepIdx, sigHashType)
 			if ptxErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall: OP_PUSH_TX: %w", ptxErr)
 			}
@@ -1019,8 +1113,8 @@ func (c *RunarContract) PrepareCall(
 		if needsOpPushTx && finalOpPushTxSig != "" {
 			realUnlockingScript = groth16WAWitnessHex + c.buildStatefulPrefix(finalOpPushTxSig, false) + c.BuildUnlockingScript(methodName, resolvedArgs)
 			tmpTx := InsertUnlockingScript(signedTx, 0, realUnlockingScript)
-			finalSig, finalPre, ptxErr := ComputeOpPushTxWithCodeSep(tmpTx, 0,
-				contractUtxo.Script, contractUtxo.Satoshis, codeSepIdx)
+			finalSig, finalPre, ptxErr := ComputeOpPushTxWithSigHash(tmpTx, 0,
+				contractUtxo.Script, contractUtxo.Satoshis, codeSepIdx, sigHashType)
 			if ptxErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall: OP_PUSH_TX for rebuild: %w", ptxErr)
 			}
@@ -1201,14 +1295,41 @@ func (c *RunarContract) FinalizeCall(
 // without needing a Provider to fetch the transaction. This is the synchronous
 // equivalent of FromTxId() — use it when the UTXO data is already available
 // (e.g. from an overlay service or cache).
-func FromUtxo(artifact *RunarArtifact, utxo UTXO) *RunarContract {
-	// Create dummy constructor args
-	dummyArgs := make([]interface{}, len(artifact.ABI.Constructor.Params))
-	for i := range dummyArgs {
-		dummyArgs[i] = int64(0)
+// restoreConstructorArgs recovers the positional constructor argument list from
+// a deployed locking script, so a restored contract (FromUtxo / FromTxId)
+// operates on the real baked-in values rather than 0 placeholders (issue #119).
+//
+// ExtractConstructorArgs returns a name→value map keyed by ABI param name;
+// artifact.ABI.Constructor.Params is already ordered by paramIndex, so mapping
+// over it yields the positional []interface{} the RunarContract expects. Params
+// that carry no constructor slot (mutable state fields — their value lives in
+// the OP_RETURN state section, restored separately by ExtractStateFromScript)
+// are absent from the extracted map; they fall back to int64(0), matching the
+// prior placeholder behaviour.
+func restoreConstructorArgs(artifact *RunarArtifact, scriptHex string) []interface{} {
+	params := artifact.ABI.Constructor.Params
+	if len(params) == 0 {
+		return []interface{}{}
 	}
+	extracted := ExtractConstructorArgs(artifact, scriptHex)
+	out := make([]interface{}, len(params))
+	for i, p := range params {
+		if v, ok := extracted[p.Name]; ok {
+			out[i] = v
+		} else {
+			out[i] = int64(0)
+		}
+	}
+	return out
+}
 
-	contract := NewRunarContract(artifact, dummyArgs)
+func FromUtxo(artifact *RunarArtifact, utxo UTXO) *RunarContract {
+	// Recover the real baked-in constructor args from the deployed script so a
+	// restored contract operates on the true values rather than 0 placeholders
+	// (issue #119). readonly ctor params feed the state-continuation formula and
+	// adjustCodeSepOffset; zeros there yield the wrong continuation and the
+	// wrong OP_CODESEPARATOR offset, making restored stateful spends unspendable.
+	contract := NewRunarContract(artifact, restoreConstructorArgs(artifact, utxo.Script))
 
 	// Store the code portion of the on-chain script
 	if len(artifact.StateFields) > 0 {
@@ -1272,13 +1393,10 @@ func FromTxId(
 
 	output := tx.Outputs[outputIndex]
 
-	// Create dummy constructor args (we'll store the on-chain code script directly)
-	dummyArgs := make([]interface{}, len(artifact.ABI.Constructor.Params))
-	for i := range dummyArgs {
-		dummyArgs[i] = int64(0)
-	}
-
-	contract := NewRunarContract(artifact, dummyArgs)
+	// Recover the real baked-in constructor args from the deployed script (issue
+	// #119) — see FromUtxo. Params without a constructor slot (mutable state
+	// fields) fall back to 0 and are overwritten by ExtractStateFromScript.
+	contract := NewRunarContract(artifact, restoreConstructorArgs(artifact, output.Script))
 
 	// Store the code portion of the on-chain script.
 	// Use opcode-aware walking to find the real OP_RETURN (not a 0x6a
@@ -1353,6 +1471,22 @@ func (c *RunarContract) GetLockingScript() string {
 	}
 
 	return script
+}
+
+// methodSigHashType resolves the BIP-143 sighash type a method's OP_PUSH_TX
+// preimage must be built under (issue #123). Returns the ABI-declared
+// @sighash mode for the named public method, or the default ALL|FORKID (0x41)
+// when the method carries no directive. Keeps every call/finalize path
+// mode-aware with no call-site churn.
+func (c *RunarContract) methodSigHashType(methodName string) int {
+	if c.Artifact != nil {
+		for _, m := range c.Artifact.ABI.Methods {
+			if m.Name == methodName && m.IsPublic && m.SigHashType != nil {
+				return *m.SigHashType
+			}
+		}
+	}
+	return 0x41
 }
 
 // BuildUnlockingScript builds the unlocking script for a method call.
@@ -1778,7 +1912,30 @@ func (c *RunarContract) prepareCallTerminal(
 	witnessHex string,
 ) (*PreparedCall, error) {
 	termOutputs := options.TerminalOutputs
+
+	// Terminal P2PKH funding inputs. Two callers feed this single mechanism —
+	// both are added to the terminal tx BEFORE the OP_PUSH_TX preimage is
+	// computed (so hashPrevouts covers them) and consumed entirely as fee with
+	// no change output:
+	//   - FeeUtxo (issue #118): a single input added purely to pay the miner
+	//     fee. A true terminal method pays out the full contract balance, so fee
+	//     would be 0 and ARC rejects; the covenant asserts its exact output set,
+	//     so no change output can absorb a fee. Placed FIRST (input index 1) to
+	//     match the cross-tier convention.
+	//   - FundingUtxos: the pre-existing multi-input funding role (contract
+	//     balance insufficient for outputs + fees).
+	// Both are signed by fundingSigner (issue #134) below.
 	fundingUtxos := options.FundingUtxos
+	if options.FeeUtxo != nil {
+		fundingUtxos = append([]UTXO{*options.FeeUtxo}, fundingUtxos...)
+	}
+
+	// Funding/fee inputs are signed by fundingSigner when set (issue #134); the
+	// method's own Sig args stay with the connected signer.
+	fundingSigner := signer
+	if options.FundingSigner != nil {
+		fundingSigner = options.FundingSigner
+	}
 
 	// Build placeholder unlocking script (witnessHex suffixed for sizing;
 	// the real ABI-correct unlock is built by buildUnlock below for stateful).
@@ -1799,6 +1956,12 @@ func (c *RunarContract) prepareCallTerminal(
 		terminalLocktime = *options.Locktime
 	}
 
+	// Sequence (issue #131): all-final inputs make nLockTime a consensus no-op —
+	// when a non-zero locktime is set, default to 0xfffffffe so the terminal
+	// method's extractLocktime assertion is actually enforced. Explicit
+	// options.Sequence wins.
+	terminalSequence := resolveInputSequence(terminalLocktime, options.Sequence)
+
 	// Build terminal transaction using go-sdk Transaction
 	buildTerminalTx := func(unlock string) *transaction.Transaction {
 		ttx := transaction.NewTransaction()
@@ -1808,7 +1971,7 @@ func (c *RunarContract) prepareCallTerminal(
 			SourceTXID:       txidToChainHash(contractUtxo.Txid),
 			SourceTxOutIndex: uint32(contractUtxo.OutputIndex),
 			UnlockingScript:  unlockLS,
-			SequenceNumber:   0xffffffff,
+			SequenceNumber:   terminalSequence,
 		})
 		// Add funding UTXOs as additional P2PKH inputs (unsigned)
 		for _, fu := range fundingUtxos {
@@ -1817,7 +1980,7 @@ func (c *RunarContract) prepareCallTerminal(
 				SourceTXID:       fuHash,
 				SourceTxOutIndex: uint32(fu.OutputIndex),
 				UnlockingScript:  &sdkscript.Script{},
-				SequenceNumber:   0xffffffff,
+				SequenceNumber:   terminalSequence,
 			})
 		}
 		for _, out := range termOutputs {
@@ -1836,10 +1999,13 @@ func (c *RunarContract) prepareCallTerminal(
 	finalPreimage := ""
 
 	termCodeSepIdx := c.getCodeSepIndex(c.findMethodIndex(methodName))
+	// Issue #123: terminal preimages are also built under the method's declared
+	// @sighash mode (default 0x41).
+	termSigHashType := c.methodSigHashType(methodName)
 	if isStateful {
 		// Build stateful terminal unlock with PLACEHOLDER user sigs
 		buildUnlock := func(tx string) (unlock string, opSigHex string, preimageHex string, retErr error) {
-			opSig, preimage, ptxErr := ComputeOpPushTxWithCodeSep(tx, 0, contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx)
+			opSig, preimage, ptxErr := ComputeOpPushTxWithSigHash(tx, 0, contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx, termSigHashType)
 			if ptxErr != nil {
 				return "", "", "", fmt.Errorf("OP_PUSH_TX for terminal: %w", ptxErr)
 			}
@@ -1880,8 +2046,8 @@ func (c *RunarContract) prepareCallTerminal(
 	} else if needsOpPushTx || len(sigIndices) > 0 {
 		// Stateless terminal — keep placeholder sigs
 		if needsOpPushTx {
-			opPushTxSig, preimage, ptxErr := ComputeOpPushTxWithCodeSep(termTx, 0,
-				contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx)
+			opPushTxSig, preimage, ptxErr := ComputeOpPushTxWithSigHash(termTx, 0,
+				contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx, termSigHashType)
 			if ptxErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall terminal: OP_PUSH_TX: %w", ptxErr)
 			}
@@ -1893,8 +2059,8 @@ func (c *RunarContract) prepareCallTerminal(
 		if needsOpPushTx && finalOpPushTxSig != "" {
 			realUnlock = c.buildStatefulPrefix(finalOpPushTxSig, false) + realUnlock
 			tmpTx := InsertUnlockingScript(termTx, 0, realUnlock)
-			finalSig, finalPre, ptxErr := ComputeOpPushTxWithCodeSep(tmpTx, 0,
-				contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx)
+			finalSig, finalPre, ptxErr := ComputeOpPushTxWithSigHash(tmpTx, 0,
+				contractUtxo.Script, contractUtxo.Satoshis, termCodeSepIdx, termSigHashType)
 			if ptxErr != nil {
 				return nil, fmt.Errorf("RunarContract.PrepareCall terminal: OP_PUSH_TX rebuild: %w", ptxErr)
 			}
@@ -1912,14 +2078,17 @@ func (c *RunarContract) prepareCallTerminal(
 		}
 	}
 
-	// Sign funding UTXOs (P2PKH inputs added after the contract input)
+	// Sign funding / fee UTXOs (P2PKH inputs added after the contract input)
+	// with fundingSigner (issue #134 / #118). Their BIP-143 P2PKH sighash covers
+	// only hashPrevouts / hashOutputs / their own outpoint — NOT input 0's
+	// scriptSig — so they stay valid even after input 0 is rewritten above.
 	for i, fu := range fundingUtxos {
 		inputIdx := 1 + i // contract input is at index 0
-		sig, signErr := signer.Sign(termTx, inputIdx, fu.Script, fu.Satoshis, nil)
+		sig, signErr := fundingSigner.Sign(termTx, inputIdx, fu.Script, fu.Satoshis, nil)
 		if signErr != nil {
 			return nil, fmt.Errorf("RunarContract.PrepareCall terminal: signing funding input %d: %w", inputIdx, signErr)
 		}
-		pubKey, pkErr := signer.GetPublicKey()
+		pubKey, pkErr := fundingSigner.GetPublicKey()
 		if pkErr != nil {
 			return nil, fmt.Errorf("RunarContract.PrepareCall terminal: getting public key: %w", pkErr)
 		}
@@ -2017,6 +2186,10 @@ func readVarintBytes(data []byte, offset int) (uint64, int) {
 // encodeArg encodes an argument value as a Bitcoin Script push data element.
 func encodeArg(value interface{}) string {
 	switch v := value.(type) {
+	case emptySigMarker:
+		// Issue #106: OP_0 — empty signature push for the deliberately-failing
+		// branch of an OR-CHECKSIG method. See EmptySig.
+		return "00"
 	case int64:
 		return encodeScriptNumber(v)
 	case int:

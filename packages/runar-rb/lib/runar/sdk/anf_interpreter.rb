@@ -482,9 +482,13 @@ module Runar
 
           body     = Array(value['body'])
           iter_var = value['iterVar'].to_s
+          # Iteration i binds iterVar = start + i*step (#121). Older ANF
+          # payloads without start/step describe zero-start counting-up loops.
+          start = to_int(value['start'] || 0)
+          step  = value.key?('step') ? to_int(value['step']) : 1
           last_val = nil
           count.times do |i|
-            env[iter_var] = i
+            env[iter_var] = start + i * step
             loop_env = env.dup
             eval_bindings(body, loop_env, state_delta, data_outputs, raw_outputs, anf)
             env.merge!(loop_env)

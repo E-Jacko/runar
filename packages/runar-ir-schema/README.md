@@ -117,7 +117,7 @@ ANFBinding
 | `call` | `func`, `args` | Call a built-in function |
 | `method_call` | `object`, `method`, `args` | Call a private method |
 | `if` | `cond`, `then`, `else` | Conditional (branches are `ANFBinding[]`) |
-| `loop` | `count`, `body`, `iterVar` | Bounded loop (`body` is `ANFBinding[]`) |
+| `loop` | `count`, `body`, `iterVar`, `start`, `step` | Bounded loop (`body` is `ANFBinding[]`). Unrolled `count` times; iteration `i` binds `iterVar = start + i*step`. `step` is `1` or `-1`. Zero-start counting-up loops carry `start=0`, `step=1`. |
 | `assert` | `value` | Assert condition |
 | `update_prop` | `name`, `value` | Update mutable property |
 | `get_state_script` | _(none)_ | Get serialized state |

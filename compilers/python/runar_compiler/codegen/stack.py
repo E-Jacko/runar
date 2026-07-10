@@ -160,6 +160,29 @@ _CHECK_PREIMAGE_BINDING_HEX = (
     "01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad"
 )
 
+# SIGHASH_ALL | SIGHASH_FORKID — default appended sighash flag byte in the
+# binding blob above. The append is encoded ``01<flag>7e`` (OP_DATA_1, flag byte,
+# OP_CAT); this pattern occurs exactly once in the canonical blob (issue #123).
+_SIGHASH_ALL_FORKID = 0x41
+_DEFAULT_SIGHASH_APPEND = "01417e"
+
+
+def _binding_hex_with_sighash_flag(sighash_flag: int) -> str:
+    """Return the canonical preimage-binding blob with its appended sighash flag
+    byte swapped for ``sighash_flag`` (issue #123).
+
+    The default blob appends ``push(0x41) OP_CAT`` (``01417e``) exactly once. A
+    non-default @sighash mode changes ONLY that byte — byte-exact equivalent to
+    the TS reference regenerating the blob with a different flag.
+    """
+    replacement = f"01{sighash_flag & 0xFF:02x}7e"
+    if _CHECK_PREIMAGE_BINDING_HEX.count(_DEFAULT_SIGHASH_APPEND) != 1:
+        # Defensive: the anchor must be unique or the substitution is unsafe.
+        raise AssertionError(
+            "check-preimage binding blob no longer has a unique sighash-flag anchor"
+        )
+    return _CHECK_PREIMAGE_BINDING_HEX.replace(_DEFAULT_SIGHASH_APPEND, replacement)
+
 
 # ---------------------------------------------------------------------------
 # Builtin function -> opcode mapping
@@ -451,6 +474,26 @@ class _LoweringContext:
         self.array_lengths: dict[str, int] = {}
         # Element refs for array_literal bindings (used by checkMultiSig).
         self.array_elements: dict[str, list[str]] = {}
+
+        # Issue #130 (stack layer): a method param whose name collides with a
+        # MUTABLE property gets a duplicate stackMap slot once
+        # ``deserialize_state`` pushes that property under the same name. Name
+        # lookups resolve to the shallowest match (the deserialized property),
+        # so ``load_param`` would read the stale on-chain state instead of the
+        # witness value. Rename the colliding param's slot to a reserved,
+        # collision-proof name up front and remember the mapping so
+        # ``_lower_load_param`` targets the real param slot. Only mutable
+        # properties are deserialized onto the stack, so readonly shadows
+        # (handled purely by ANF resolution) never enter this map, and
+        # non-colliding contracts get an empty map -- byte-identical output.
+        self.renamed_params: dict[str, str] = {}
+        mutable_prop_names = {p.name for p in properties if not p.readonly}
+        for name in (params or []):
+            if name in mutable_prop_names:
+                renamed = f"__param_{name}"
+                self.sm.rename_at_depth(self.sm.find_depth(name), renamed)
+                self.renamed_params[name] = renamed
+
         self._track_depth()
 
     def _track_depth(self) -> None:
@@ -963,7 +1006,8 @@ class _LoweringContext:
         elif kind == "if":
             self._lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
         elif kind == "loop":
-            self._lower_loop(name, value.count, value.body, value.iter_var, binding_index, last_uses)
+            self._lower_loop(name, value.count, value.body, value.iter_var,
+                             value.start, value.step, binding_index, last_uses)
         elif kind == "assert":
             self._lower_assert(value.value_ref, binding_index, last_uses, False)
         elif kind == "update_prop":
@@ -971,7 +1015,7 @@ class _LoweringContext:
         elif kind == "get_state_script":
             self._lower_get_state_script(name)
         elif kind == "check_preimage":
-            self._lower_check_preimage(name, value.preimage, binding_index, last_uses)
+            self._lower_check_preimage(name, value.preimage, value.sighash_flag, binding_index, last_uses)
         elif kind == "deserialize_state":
             self._lower_deserialize_state(value.preimage, binding_index, last_uses)
         elif kind == "add_output":
@@ -999,9 +1043,14 @@ class _LoweringContext:
 
     def _lower_load_param(self, binding_name: str, param_name: str,
                           binding_index: int, last_uses: dict[str, int]) -> None:
-        if self.sm.has(param_name):
+        # The parameter is already on the stack under its original name -- or,
+        # for a param that shadows a mutable property, under a reserved renamed
+        # slot (issue #130) so it is not confused with the deserialized
+        # property slot.
+        slot_name = self.renamed_params.get(param_name, param_name)
+        if self.sm.has(slot_name):
             is_last = self._is_last_use(param_name, binding_index, last_uses)
-            self.bring_to_top(param_name, is_last)
+            self.bring_to_top(slot_name, is_last)
             self.sm.pop()
             self.sm.push(binding_name)
         else:
@@ -1031,13 +1080,49 @@ class _LoweringContext:
             self._push_property_value(prop.initial_value)
         else:
             # Property value will be provided at deployment time; emit placeholder
+            # for its constructor slot.
+            #
+            # #119 tail (H1): a property that reaches this fallback with no
+            # matching constructor slot has no deploy-time bytes of its own. The
+            # previous behaviour left param_index at the count of ctor-param
+            # props, silently emitting a placeholder for an UNRELATED
+            # constructor argument's slot and splicing the wrong deploy-time
+            # bytes into the locking script -- a silent-wrong-code path. Fail
+            # loudly instead. (A real constructor-param property -- readonly, or
+            # a mutable state field whose initial value is spliced at deploy --
+            # is found here and is unaffected.)
             param_index = 0
+            found = False
+            ctor_params: list[str] = []
             for p in self.properties:
                 if p.initial_value is not None:
                     continue
+                ctor_params.append(p.name)
                 if p.name == prop_name:
+                    found = True
                     break
                 param_index += 1
+            # A true ghost is a name absent from a NON-EMPTY registered
+            # constructor-param list -- exactly the silent-wrong-code case where
+            # the old code coerced it onto an unrelated registered slot. When no
+            # constructor-param property is registered (an empty ``ctor_params``
+            # -- e.g. a ``.runar.ts`` contract whose only constructor param is
+            # declared inline as ``readonly n`` and never surfaces as a property
+            # in this tier's TS parser), the name may still be a legitimate
+            # slot-0 argument, so preserve the historical placeholder rather than
+            # false-positive on a valid deploy-time slot.
+            if not found and ctor_params:
+                loc = ""
+                if self.current_source_loc is not None:
+                    sl = self.current_source_loc
+                    loc = f" at {sl.file}:{sl.line}:{sl.column}"
+                raise RuntimeError(
+                    f"Stack lowering: property '{prop_name}'{loc} is neither on "
+                    f"the stack, initialized, nor a constructor parameter, so it "
+                    f"has no deploy-time slot. Refusing to emit a placeholder for "
+                    f"an unrelated constructor argument (slot 0). Known "
+                    f"constructor-param properties: [{', '.join(ctor_params)}]."
+                )
             self.emit_op(StackOp(op="placeholder", param_index=param_index, param_name=prop_name))
         self.sm.push(binding_name)
 
@@ -1710,8 +1795,13 @@ class _LoweringContext:
 
     def _lower_loop(self, binding_name: str, count: int,
                     body: list[ANFBinding], iter_var: str,
+                    start: Optional[int] = None, step: Optional[int] = None,
                     loop_binding_index: Optional[int] = None,
                     enclosing_last_uses: Optional[dict[str, int]] = None) -> None:
+        # Iterator start value and step direction (issue #121). Older ANF
+        # payloads without start/step describe zero-start counting-up loops.
+        start_val = start if start is not None else 0
+        step_val = step if step is not None else 1
         # Collect body binding names
         body_binding_names: dict[str, bool] = {b.name: True for b in body}
 
@@ -1741,7 +1831,11 @@ class _LoweringContext:
         self.local_bindings = new_local_bindings
 
         for i in range(count):
-            self.emit_op(StackOp(op="push", value=big_int_push(i)))
+            # Push the iteration variable value (in case the loop body uses it).
+            # Iteration ``i`` binds ``start + i*step`` (issue #121); zero-start
+            # counting-up loops (start=0, step=1) reduce to ``i``, preserving
+            # the historical byte-for-byte lowering.
+            self.emit_op(StackOp(op="push", value=big_int_push(start_val + i * step_val)))
             self.sm.push(iter_var)
 
             last_uses = compute_last_uses(body)
@@ -2730,6 +2824,7 @@ class _LoweringContext:
     # -----------------------------------------------------------------
 
     def _lower_check_preimage(self, binding_name: str, preimage: str,
+                              sighash_flag: int | None,
                               binding_index: int, last_uses: dict[str, int]) -> None:
         # OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
         # current spending transaction. The signature is DERIVED FROM THE PREIMAGE
@@ -2750,25 +2845,39 @@ class _LoweringContext:
         self.bring_to_top(preimage, is_last)
 
         # Step 2: Derive + verify the signature on-chain (single opaque raw_bytes
-        # blob, byte-identical across all 7 tiers). Net stack effect is zero.
-        self._emit_check_preimage_binding()
+        # blob). For the default ALL|FORKID (sighash_flag None) the blob is
+        # byte-identical to the pinned cross-tier constant; issue #123 lets a
+        # method declare a different mode, which only changes the appended
+        # sighash flag byte. Net stack effect is zero.
+        self._emit_check_preimage_binding(sighash_flag)
 
         # Preimage remains on top.  Rename for field extractors.
         self.sm.pop()
         self.sm.push(binding_name)
         self._track_depth()
 
-    def _emit_check_preimage_binding(self) -> None:
+    def _emit_check_preimage_binding(self, sighash_flag: int | None = None) -> None:
         """Emit the on-chain preimage binding as one opaque raw_bytes op.
 
         Net stack effect is 0 (preimage in -> preimage out), declared as
         in_arity=1 / out_arity=1 so the static analyzer keeps the depth
         consistent. The bytes are the canonical BUG-100 construction, identical
         across all seven tiers and guarded by the cross-tier conformance suite.
+
+        Issue #123: a non-default @sighash mode changes ONLY the single appended
+        sighash flag byte in the derived DER signature (``push(flag) OP_CAT``,
+        encoded ``01<flag>7e`` in the blob). This substitution is byte-exact
+        equivalent to regenerating the blob with a different flag (the TS
+        reference's ``emitCheckPreimageBinding(emit, sighashFlag)`` differs only
+        in that push), so the default (None) blob is unchanged (zero golden
+        churn) and every other mode swaps exactly that one byte.
         """
+        blob_hex = _CHECK_PREIMAGE_BINDING_HEX
+        if sighash_flag is not None and sighash_flag != _SIGHASH_ALL_FORKID:
+            blob_hex = _binding_hex_with_sighash_flag(sighash_flag)
         self.emit_op(StackOp(
             op="raw_bytes",
-            raw_bytes=bytes.fromhex(_CHECK_PREIMAGE_BINDING_HEX),
+            raw_bytes=bytes.fromhex(blob_hex),
             in_arity=1,
             out_arity=1,
         ))

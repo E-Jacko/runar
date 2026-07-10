@@ -108,6 +108,10 @@ public final class ContractScript {
      * for backwards compatibility).
      */
     static String encodeConstructorArg(Object value, String type) {
+        if (RunarContract.isEmptySig(value)) {
+            // Issue #106: OP_0 — empty signature push for the failing OR-CHECKSIG branch.
+            return "00";
+        }
         if (value instanceof Boolean b) {
             return b ? "51" : "00";
         }
@@ -162,6 +166,115 @@ public final class ContractScript {
         var params = artifact.abi().constructor().params();
         if (paramIndex < 0 || paramIndex >= params.size()) return "bigint";
         return params.get(paramIndex).type();
+    }
+
+    // ------------------------------------------------------------------
+    // Constructor-arg recovery from a deployed script (issue #119)
+    // ------------------------------------------------------------------
+
+    /**
+     * Recover the positional constructor argument list from a deployed locking
+     * script (issue #119), so a restored contract ({@code fromUtxo} /
+     * {@code fromTxId}) operates on the real baked-in values rather than
+     * {@code 0} placeholders. Without this the ANF interpreter computes the
+     * wrong state continuation (readonly ctor params feed the continuation
+     * formula) for restored stateful spends.
+     *
+     * <p>Byte-walks the {@link RunarArtifact#scriptHex()} template and the
+     * deployed script in parallel: everywhere the template carries a 1-byte
+     * OP_0 placeholder at a {@link RunarArtifact#constructorSlots()} offset, the
+     * deployed script carries the substituted push — decoded here into the
+     * positional arg. Code-separator-index slots are skipped (they are not
+     * constructor args). Params that carry no constructor slot (mutable state
+     * fields) fall back to {@code 0} and are overwritten by state extraction.
+     *
+     * @return a list of length {@code abi.constructor.params.size()} ordered by
+     *     paramIndex; missing slots hold {@link BigInteger#ZERO}.
+     */
+    static List<Object> extractConstructorArgs(RunarArtifact artifact, String deployedScriptHex) {
+        int paramCount = artifact.abi().constructor().params().size();
+        List<Object> args = new ArrayList<>(paramCount);
+        for (int i = 0; i < paramCount; i++) args.add(BigInteger.ZERO);
+        if (paramCount == 0 || artifact.constructorSlots().isEmpty()) return args;
+
+        String template = artifact.scriptHex();
+        String deployed = deployedScriptHex;
+
+        // Template byte-offset -> paramIndex for constructor slots.
+        Map<Integer, Integer> ctorSlotByOffset = new java.util.HashMap<>();
+        for (ConstructorSlot slot : artifact.constructorSlots()) {
+            if (slot.paramIndex() < paramCount) {
+                ctorSlotByOffset.put(slot.byteOffset(), slot.paramIndex());
+            }
+        }
+        // Code-sep-index slot template byte-offsets (substituted but not args).
+        java.util.Set<Integer> codesepOffsets = new java.util.HashSet<>();
+        for (CodeSepIndexSlot slot : artifact.codeSepIndexSlots()) {
+            codesepOffsets.add(slot.byteOffset());
+        }
+
+        int templatePos = 0;      // hex-char offset into the template
+        int deployedPos = 0;      // hex-char offset into the deployed script
+        int templateLen = template.length();
+        while (templatePos + 2 <= templateLen && deployedPos + 2 <= deployed.length()) {
+            int templateByteOffset = templatePos / 2;
+            if (ctorSlotByOffset.containsKey(templateByteOffset)) {
+                int paramIndex = ctorSlotByOffset.get(templateByteOffset);
+                int opcode = Integer.parseInt(deployed.substring(deployedPos, deployedPos + 2), 16);
+                args.set(paramIndex, decodeSlotValue(deployed, deployedPos, opcode,
+                    paramType(artifact, paramIndex)));
+                templatePos += 2;  // OP_0 placeholder is 1 byte
+                deployedPos += ScriptUtils.decodePushData(deployed, deployedPos).hexCharsConsumed();
+            } else if (codesepOffsets.contains(templateByteOffset)) {
+                templatePos += 2;
+                deployedPos += ScriptUtils.decodePushData(deployed, deployedPos).hexCharsConsumed();
+            } else {
+                // Non-slot item: template and deployed are byte-identical here.
+                int consumed = ScriptUtils.decodePushData(template, templatePos).hexCharsConsumed();
+                templatePos += consumed;
+                deployedPos += consumed;
+            }
+        }
+        return args;
+    }
+
+    /**
+     * Decode the value pushed at {@code offset} in the deployed script into the
+     * positional constructor argument, using the ABI {@code type} to pick the
+     * representation (script number for {@code int}/{@code bigint}, boolean for
+     * {@code bool}, hex string for byte types) — the inverse of
+     * {@link #encodeConstructorArg}.
+     */
+    private static Object decodeSlotValue(String deployed, int offset, int opcode, String type) {
+        boolean isBool = "bool".equals(type) || "boolean".equals(type);
+        boolean isInt = "int".equals(type) || "bigint".equals(type);
+        if (opcode == 0x00) {                       // OP_0
+            return isBool ? Boolean.FALSE : (isInt ? BigInteger.ZERO : "");
+        }
+        if (opcode == 0x4f) {                       // OP_1NEGATE
+            return BigInteger.valueOf(-1);
+        }
+        if (opcode >= 0x51 && opcode <= 0x60) {     // OP_1..OP_16
+            int v = opcode - 0x50;
+            return isBool ? Boolean.TRUE : BigInteger.valueOf(v);
+        }
+        String dataHex = ScriptUtils.decodePushData(deployed, offset).dataHex();
+        if (isInt) return decodeScriptNumber(dataHex);
+        return dataHex;
+    }
+
+    /** Decode a minimal little-endian sign-magnitude script number (inverse of
+     * {@link #pushScriptNumber}'s data-push branch). */
+    private static BigInteger decodeScriptNumber(String leHex) {
+        if (leHex == null || leHex.isEmpty()) return BigInteger.ZERO;
+        byte[] le = ScriptUtils.hexToBytes(leHex);
+        boolean neg = (le[le.length - 1] & 0x80) != 0;
+        le[le.length - 1] &= 0x7f;
+        BigInteger mag = BigInteger.ZERO;
+        for (int i = le.length - 1; i >= 0; i--) {
+            mag = mag.shiftLeft(8).or(BigInteger.valueOf(le[i] & 0xff));
+        }
+        return neg ? mag.negate() : mag;
     }
 
     // ------------------------------------------------------------------

@@ -24,6 +24,7 @@ import runar.compiler.ir.anf.BinOp;
 import runar.compiler.ir.anf.Call;
 import runar.compiler.ir.anf.CheckPreimage;
 import runar.compiler.ir.anf.DeserializeState;
+import runar.compiler.ir.anf.If;
 import runar.compiler.ir.anf.LoadConst;
 import runar.compiler.ir.anf.LoadParam;
 import runar.compiler.ir.anf.LoadProp;
@@ -320,25 +321,48 @@ class AnfLowerTest {
 
         AnfMethod inc = findMethod(prog, "increment");
 
-        boolean sawComputeStateOutput = false;
-        boolean sawBuildChangeOutput = false;
-        boolean sawHash256 = false;
-        boolean sawExtractOutputHash = false;
-        for (AnfBinding b : inc.body()) {
-            if (b.value() instanceof Call c) {
-                switch (c.func()) {
-                    case "computeStateOutput" -> sawComputeStateOutput = true;
-                    case "buildChangeOutput" -> sawBuildChangeOutput = true;
-                    case "hash256" -> sawHash256 = true;
-                    case "extractOutputHash" -> sawExtractOutputHash = true;
-                    default -> { /* no-op */ }
-                }
+        // Issue #116: the change segment is now gated on `_changeAmount != 0`, so
+        // the buildChangeOutput call lives inside the then-branch of an `if`
+        // node. Collect calls recursively (descending into if/loop branches).
+        java.util.Set<String> funcs = new java.util.HashSet<>();
+        collectCallFuncs(inc.body(), funcs);
+        assertTrue(funcs.contains("buildChangeOutput"), "expected a buildChangeOutput call");
+        assertTrue(funcs.contains("computeStateOutput"), "expected a computeStateOutput call");
+        assertTrue(funcs.contains("hash256"), "expected a hash256 call");
+        assertTrue(funcs.contains("extractOutputHash"), "expected an extractOutputHash call");
+
+        // The change segment is a runtime conditional (`_changeAmount != 0`),
+        // not an unconditional buildChangeOutput at the top level.
+        boolean topLevelChangeCall = inc.body().stream()
+            .anyMatch(b -> b.value() instanceof Call c && "buildChangeOutput".equals(c.func()));
+        assertFalse(topLevelChangeCall,
+            "buildChangeOutput must be gated inside an if, not a top-level call");
+        boolean changeGate = inc.body().stream()
+            .anyMatch(b -> b.value() instanceof If iv && ifContainsCall(iv, "buildChangeOutput"));
+        assertTrue(changeGate, "expected an if gate wrapping buildChangeOutput");
+    }
+
+    /** Recursively collect the func names of every Call binding, descending
+     * into if-branches and loop bodies (issue #116 gate awareness). */
+    private static void collectCallFuncs(List<AnfBinding> body, java.util.Set<String> out) {
+        for (AnfBinding b : body) {
+            AnfValue v = b.value();
+            if (v instanceof Call c) {
+                out.add(c.func());
+            } else if (v instanceof If iv) {
+                collectCallFuncs(iv.thenBranch(), out);
+                collectCallFuncs(iv.elseBranch(), out);
+            } else if (v instanceof Loop lp) {
+                collectCallFuncs(lp.body(), out);
             }
         }
-        assertTrue(sawBuildChangeOutput, "expected a buildChangeOutput call");
-        assertTrue(sawComputeStateOutput, "expected a computeStateOutput call");
-        assertTrue(sawHash256, "expected a hash256 call");
-        assertTrue(sawExtractOutputHash, "expected an extractOutputHash call");
+    }
+
+    private static boolean ifContainsCall(If iv, String func) {
+        java.util.Set<String> funcs = new java.util.HashSet<>();
+        collectCallFuncs(iv.thenBranch(), funcs);
+        collectCallFuncs(iv.elseBranch(), funcs);
+        return funcs.contains(func);
     }
 
     // ---------------------------------------------------------------
@@ -383,7 +407,8 @@ class AnfLowerTest {
     }
 
     @Test
-    void throwsForNonZeroStartLoop() {
+    void lowersNonZeroStartLoop() {
+        // Issue #121: start=1, step=+1, count=3.
         String src = """
             public class C extends SmartContract {
                 @Readonly Bigint x;
@@ -398,16 +423,16 @@ class AnfLowerTest {
             }
             """;
         ContractNode contract = parse(src, "C.runar.java");
-        IllegalStateException e = assertThrows(
-            IllegalStateException.class,
-            () -> AnfLower.run(contract)
-        );
-        assertTrue(e.getMessage().contains("must start at 0"),
-            "expected non-zero-start error, got " + e.getMessage());
+        AnfProgram prog = AnfLower.run(contract);
+        Loop loop = findLoop(findMethod(prog, "m").body());
+        assertEquals(java.math.BigInteger.ONE, loop.start());
+        assertEquals(1, loop.step());
+        assertEquals(3, loop.count());
     }
 
     @Test
-    void throwsForCountdownLoop() {
+    void lowersCountdownLoop() {
+        // Issue #121: start=3, step=-1, count=3.
         String src = """
             public class C extends SmartContract {
                 @Readonly Bigint x;
@@ -422,12 +447,35 @@ class AnfLowerTest {
             }
             """;
         ContractNode contract = parse(src, "C.runar.java");
-        IllegalStateException e = assertThrows(
-            IllegalStateException.class,
-            () -> AnfLower.run(contract)
-        );
-        assertTrue(e.getMessage().toLowerCase().contains("countdown"),
-            "expected countdown error, got " + e.getMessage());
+        AnfProgram prog = AnfLower.run(contract);
+        Loop loop = findLoop(findMethod(prog, "m").body());
+        assertEquals(java.math.BigInteger.valueOf(3), loop.start());
+        assertEquals(-1, loop.step());
+        assertEquals(3, loop.count());
+    }
+
+    @Test
+    void lowersInclusiveCountdownLoop() {
+        // Issue #121: start=3, step=-1, count=3 (i >= 1).
+        String src = """
+            public class C extends SmartContract {
+                @Readonly Bigint x;
+                public C(Bigint x) { super(x); this.x = x; }
+                @Public
+                public void m() {
+                    for (Bigint i = 3; i >= 1; i--) {
+                        assertThat(true);
+                    }
+                    assertThat(true);
+                }
+            }
+            """;
+        ContractNode contract = parse(src, "C.runar.java");
+        AnfProgram prog = AnfLower.run(contract);
+        Loop loop = findLoop(findMethod(prog, "m").body());
+        assertEquals(java.math.BigInteger.valueOf(3), loop.start());
+        assertEquals(-1, loop.step());
+        assertEquals(3, loop.count());
     }
 
     @Test
@@ -449,6 +497,8 @@ class AnfLowerTest {
         AnfProgram prog = AnfLower.run(contract);
         AnfMethod m = findMethod(prog, "m");
         Loop loop = findLoop(m.body());
+        assertEquals(java.math.BigInteger.ZERO, loop.start());
+        assertEquals(1, loop.step());
         assertEquals(4, loop.count());
     }
 

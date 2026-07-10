@@ -254,6 +254,7 @@ module RunarCompiler
       "Integer"         => "bigint",
       "Int"             => "bigint",
       "Boolean"         => "boolean",
+      "Bool"            => "boolean",
       "ByteString"      => "ByteString",
       "PubKey"          => "PubKey",
       "Sig"             => "Sig",
@@ -1269,7 +1270,12 @@ module RunarCompiler
 
         start_expr = parse_expression
 
-        # Expect range operator +..+ (inclusive) or +...+ (exclusive)
+        # Expect range operator +..+ (inclusive) or +...+ (exclusive).
+        # Non-zero-start counting-up loops (e.g. +for i in 1...4+) are now
+        # supported by the ANF loop node's start/step fields (#121); a native
+        # countdown spelling for +.runar.rb+ is intentionally NOT added here —
+        # the TS reference Ruby-format parser has none, so introducing one only
+        # in this tier would break the cross-tier frontend-parity invariant.
         is_exclusive = false
         if peek.kind == TOK_DOTDOTDOT
           is_exclusive = true

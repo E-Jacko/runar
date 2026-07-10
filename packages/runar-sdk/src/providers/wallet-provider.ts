@@ -14,6 +14,7 @@ import { buildP2PKHScript } from '../script-utils.js';
 import {
   Transaction,
   type WalletClient,
+  type Broadcaster,
 } from '@bsv/sdk';
 
 // ---------------------------------------------------------------------------
@@ -39,6 +40,15 @@ export interface WalletProviderOptions {
   network?: 'mainnet' | 'testnet';
   /** Fee rate in sats/KB (default: 100, i.e. 0.1 sat/byte). */
   feeRate?: number;
+  /**
+   * Injected `@bsv/sdk` Broadcaster (issue #107). When provided, `broadcast()`
+   * delegates to this instance instead of the hardcoded ARC URL, so the SDK
+   * and a downstream layer (e.g. wallet-toolbox) share ONE broadcaster/config
+   * — keeping parent and child txs at the same ARC deployment (avoids
+   * `SEEN_IN_ORPHAN_MEMPOOL`). Additive and non-breaking; omit for the default
+   * ARC path.
+   */
+  broadcaster?: Broadcaster;
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +65,7 @@ export class WalletProvider implements Provider {
   protected readonly overlayTopics: string[] | undefined;
   protected readonly _network: 'mainnet' | 'testnet';
   protected readonly _feeRate: number;
+  protected readonly broadcaster: Broadcaster | undefined;
   protected readonly txCache = new Map<string, string>();
 
   constructor(options: WalletProviderOptions) {
@@ -67,6 +78,7 @@ export class WalletProvider implements Provider {
     this.overlayTopics = options.overlayTopics;
     this._network = options.network ?? 'mainnet';
     this._feeRate = options.feeRate ?? 100;
+    this.broadcaster = options.broadcaster;
   }
 
   // -------------------------------------------------------------------------
@@ -137,6 +149,26 @@ export class WalletProvider implements Provider {
       if (!parentTxid) continue;
       const parentHex = await this.fetchRawTx(parentTxid);
       input.sourceTransaction = Transaction.fromHex(parentHex);
+    }
+
+    // Issue #107: when a broadcaster is injected, delegate to it so the SDK and
+    // the calling layer share ONE broadcaster instance/config (keeps parent +
+    // child at the same ARC deployment → avoids SEEN_IN_ORPHAN_MEMPOOL). The
+    // structured BroadcastFailure is flattened into a thrown Error to preserve
+    // the existing `broadcast()` contract.
+    if (this.broadcaster) {
+      const result = await this.broadcaster.broadcast(tx);
+      if (result.status === 'error') {
+        throw new Error(
+          `WalletProvider: injected broadcaster failed (${result.code}): ${result.description}`,
+        );
+      }
+      const txid = result.txid;
+      this.txCache.set(txid, tx.toHex());
+      if (this.overlayUrl && this.overlayTopics && this.overlayTopics.length > 0) {
+        this.submitToOverlay(tx).catch(() => {});
+      }
+      return txid;
     }
 
     const efBytes = tx.toEFUint8Array();

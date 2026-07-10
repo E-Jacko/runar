@@ -82,6 +82,14 @@ pub struct ANFMethod {
     pub body: Vec<ANFBinding>,
     #[serde(rename = "isPublic")]
     pub is_public: bool,
+    /// Issue #123: the method's declared `@sighash` type (e.g. `0x43` for
+    /// SINGLE|FORKID), `None` for the default `ALL|FORKID`. In-memory carrier
+    /// ONLY (`#[serde(skip)]`, like `ANFProgram::parent_class`) so it never
+    /// appears in the emitted ANF IR JSON the conformance suite compares
+    /// cross-tier; the artifact assembler copies a non-default value into
+    /// `ABIMethod.sigHashType` so the SDK builds the matching preimage.
+    #[serde(skip, default)]
+    pub sighash_type: Option<i64>,
 }
 
 /// A method parameter.
@@ -109,6 +117,17 @@ pub struct ANFBinding {
 // ---------------------------------------------------------------------------
 // ANF value types (discriminated on `kind`)
 // ---------------------------------------------------------------------------
+
+/// Default `Loop::start` for IR payloads that predate issue #121: a zero-start
+/// counting-up loop (`i = 0..count-1`).
+fn default_loop_start() -> serde_json::Value {
+    serde_json::Value::Number(serde_json::Number::from(0))
+}
+
+/// Default `Loop::step` for IR payloads that predate issue #121: +1 (counting up).
+fn default_loop_step() -> i64 {
+    1
+}
 
 /// Discriminated union of all ANF value types.
 ///
@@ -169,6 +188,18 @@ pub enum ANFValue {
         body: Vec<ANFBinding>,
         #[serde(rename = "iterVar")]
         iter_var: String,
+        // Iterator start value and step direction (issue #121). The loop is
+        // unrolled `count` times; on iteration `i` (0-based) the iterator
+        // variable holds `start + i * step`. Zero-start counting-up loops carry
+        // `start = 0` and `step = 1`, reproducing the historical
+        // `i = 0..count-1` lowering byte-for-byte. Countdown loops carry
+        // `step = -1`. Serialised as a JS-style decimal (number or `Nn`
+        // string) via `bigint_to_json`; older payloads without the fields
+        // default to a zero-start counting-up loop.
+        #[serde(default = "default_loop_start")]
+        start: serde_json::Value,
+        #[serde(default = "default_loop_step")]
+        step: i64,
     },
 
     #[serde(rename = "assert")]
@@ -196,7 +227,16 @@ pub enum ANFValue {
     GetStateScript {},
 
     #[serde(rename = "check_preimage")]
-    CheckPreimage { preimage: String },
+    CheckPreimage {
+        preimage: String,
+        /// Issue #123: BIP-143 sighash flag the on-chain OP_PUSH_TX binding
+        /// appends to the derived signature. Absent = default `ALL|FORKID`
+        /// (0x41), byte-identical to the pinned cross-tier binding blob. Only
+        /// set for a method that declares a non-default `@sighash` mode, so
+        /// golden ANF stays unchanged for every existing contract.
+        #[serde(rename = "sighashFlag", skip_serializing_if = "Option::is_none", default)]
+        sighash_flag: Option<i64>,
+    },
 
     #[serde(rename = "deserialize_state")]
     DeserializeState { preimage: String },

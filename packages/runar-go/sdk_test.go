@@ -1929,6 +1929,78 @@ func TestStatefulDeployCallLifecycle(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// #133: call() selects smallest-sufficient funding, not all wallet UTXOs.
+// ---------------------------------------------------------------------------
+
+func makeCounterArtifactForFunding() *RunarArtifact {
+	stateFields := []StateField{{Name: "count", Type: "bigint", Index: 0}}
+	return makeArtifact("51", ABI{
+		Constructor: ABIConstructor{Params: []ABIParam{{Name: "count", Type: "bigint"}}},
+		Methods:     []ABIMethod{{Name: "increment", Params: nil, IsPublic: true}},
+	}, func(a *RunarArtifact) { a.StateFields = stateFields })
+}
+
+func TestCall_FundingSelectsSmallestSufficient_Issue133(t *testing.T) {
+	// A wallet with 3 spare 100k UTXOs must build a 2-input call tx (1 contract
+	// + 1 funding), NOT sweep all 3 into a 4-input tx (issue #133).
+	contract := NewRunarContract(makeCounterArtifactForFunding(), []interface{}{int64(0)})
+	provider := NewMockProvider("testnet")
+	mockAddr := strings.Repeat("00", 20)
+	signer := NewMockSigner("", mockAddr)
+	script := "76a914" + strings.Repeat("00", 20) + "88ac"
+	for i := 0; i < 3; i++ {
+		provider.AddUtxo(mockAddr, UTXO{Txid: strings.Repeat(fmt.Sprintf("%02d", i+1), 32), OutputIndex: 0, Satoshis: 100000, Script: script})
+	}
+
+	if _, _, err := contract.Deploy(provider, signer, DeployOptions{Satoshis: 50000}); err != nil {
+		t.Fatalf("Deploy error: %v", err)
+	}
+	if _, _, err := contract.Call("increment", nil, provider, signer, &CallOptions{
+		NewState: map[string]interface{}{"count": int64(1)},
+	}); err != nil {
+		t.Fatalf("Call error: %v", err)
+	}
+
+	callTxHex := provider.GetBroadcastedTxs()[1]
+	parsed := parseTxHex(callTxHex)
+	// 1 contract input + exactly 1 funding input = 2. The bug swept all 3 => 4.
+	if parsed.inputCount != 2 {
+		t.Errorf("expected 2 inputs (1 contract + 1 funding), got %d", parsed.inputCount)
+	}
+}
+
+func TestCall_MaxFundingInputsCapErrors_Issue133(t *testing.T) {
+	// Small coins force >1 funding input for a value-increasing continuation;
+	// capping at 1 must fail loudly rather than broadcast underfunded.
+	contract := NewRunarContract(makeCounterArtifactForFunding(), []interface{}{int64(0)})
+	provider := NewMockProvider("testnet")
+	mockAddr := strings.Repeat("00", 20)
+	signer := NewMockSigner("", mockAddr)
+	script := "76a914" + strings.Repeat("00", 20) + "88ac"
+	for i := 0; i < 4; i++ {
+		provider.AddUtxo(mockAddr, UTXO{Txid: strings.Repeat(fmt.Sprintf("%02d", i+1), 32), OutputIndex: 0, Satoshis: 3000, Script: script})
+	}
+	if _, _, err := contract.Deploy(provider, signer, DeployOptions{Satoshis: 1000}); err != nil {
+		t.Fatalf("Deploy error: %v", err)
+	}
+
+	// Continuation grows to 5000 sats => funding must cover ~4000 + fee, needing
+	// 2 of the 3000-sat coins. Cap at 1 => must error.
+	cap1 := 1
+	_, _, err := contract.Call("increment", nil, provider, signer, &CallOptions{
+		Satoshis:         5000,
+		NewState:         map[string]interface{}{"count": int64(1)},
+		MaxFundingInputs: &cap1,
+	})
+	if err == nil {
+		t.Fatal("expected error from maxFundingInputs cap")
+	}
+	if !strings.Contains(err.Error(), "maxFundingInputs") {
+		t.Errorf("expected maxFundingInputs error, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Bigint roundtrip edge cases (matching TS tests)
 // ---------------------------------------------------------------------------
 
@@ -2573,6 +2645,59 @@ func TestBuildCallTransaction_AllSequences(t *testing.T) {
 	for i, inp := range parsed.inputs {
 		if inp.sequence != 0xffffffff {
 			t.Errorf("input %d: expected sequence 0xffffffff, got %d", i, inp.sequence)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #131: honor CallOptions.Sequence; non-final input sequences under locktime.
+// ---------------------------------------------------------------------------
+
+func TestBuildCallTransaction_LocktimeDefaultsNonFinalSequence(t *testing.T) {
+	// A non-zero locktime must default EVERY input to 0xfffffffe (non-final) so
+	// consensus actually enforces nLockTime (issue #131).
+	utxo := makeUtxo(100000, 0)
+	additional := []UTXO{makeUtxo(50000, 1), makeUtxo(30000, 2)}
+	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
+	lt := uint32(800000)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100, &BuildCallOptions{Locktime: &lt})
+	parsed := parseTxHex(callTxObj.Hex())
+	if parsed.locktime != 800000 {
+		t.Errorf("expected locktime 800000, got %d", parsed.locktime)
+	}
+	if len(parsed.inputs) != 3 {
+		t.Fatalf("expected 3 inputs, got %d", len(parsed.inputs))
+	}
+	for i, inp := range parsed.inputs {
+		if inp.sequence != 0xfffffffe {
+			t.Errorf("input %d: expected sequence 0xfffffffe under locktime, got %#x", i, inp.sequence)
+		}
+	}
+}
+
+func TestBuildCallTransaction_LocktimeZeroKeepsFinalSequence(t *testing.T) {
+	// An explicit locktime of 0 keeps the legacy final 0xffffffff (issue #131).
+	utxo := makeUtxo(100000, 0)
+	lt := uint32(0)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{Locktime: &lt})
+	parsed := parseTxHex(callTxObj.Hex())
+	if parsed.inputs[0].sequence != 0xffffffff {
+		t.Errorf("expected sequence 0xffffffff with locktime 0, got %#x", parsed.inputs[0].sequence)
+	}
+}
+
+func TestBuildCallTransaction_ExplicitSequenceWins(t *testing.T) {
+	// An explicit Sequence override wins on every input, even under locktime.
+	utxo := makeUtxo(100000, 0)
+	additional := []UTXO{makeUtxo(50000, 1)}
+	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
+	lt := uint32(800000)
+	seq := uint32(0x12345678)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100, &BuildCallOptions{Locktime: &lt, Sequence: &seq})
+	parsed := parseTxHex(callTxObj.Hex())
+	for i, inp := range parsed.inputs {
+		if inp.sequence != 0x12345678 {
+			t.Errorf("input %d: expected explicit sequence 0x12345678, got %#x", i, inp.sequence)
 		}
 	}
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import hashlib
+import warnings
 from runar.sdk.types import (
     RunarArtifact, Utxo, TransactionData, TxOutput,
     DeployOptions, CallOptions, OutputSpec, TerminalOutput, PreparedCall,
@@ -14,7 +15,10 @@ from runar.sdk.deployment import (
     build_deploy_transaction, select_utxos, build_p2pkh_script,
     _to_le32, _to_le64, _encode_varint, _reverse_hex,
 )
-from runar.sdk.calling import build_call_transaction, insert_unlocking_script
+from runar.sdk.calling import (
+    build_call_transaction, insert_unlocking_script, resolve_input_sequence,
+)
+from runar.sdk.script_utils import restore_constructor_args
 from runar.sdk.state import (
     serialize_state, extract_state_from_script, find_last_op_return,
     encode_push_data,
@@ -25,6 +29,37 @@ from runar.sdk.anf_interpreter import compute_new_state, compute_new_state_and_d
 from runar.sdk.ordinals import (
     Inscription, build_inscription_envelope, parse_inscription_envelope,
 )
+
+
+class _EmptySig:
+    """Producer-side marker type (issue #106) for the deliberately-empty branch
+    of an OR-CHECKSIG method — ``checkSig(sigA, pkA) || checkSig(sigB, pkB)``,
+    where ``||`` lowers to the non-lazy ``OP_BOOLOR`` so BOTH ``OP_CHECKSIG``s
+    run. Only the matching branch supplies a real signature; the failing branch
+    MUST push an empty signature (OP_0) or BIP146 NULLFAIL rejects the spend.
+
+    Pass :data:`EMPTY_SIG` as the call arg for the non-matching ``Sig`` slot: the
+    SDK pushes OP_0 for it and never signs it, distinct from ``None`` (auto-sign)
+    and an explicit hex-bytes value. ``call('execute', [None, EMPTY_SIG])`` signs
+    only slot 0.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "EMPTY_SIG"
+
+
+#: Singleton marker for the empty OR-CHECKSIG branch (issue #106).
+EMPTY_SIG = _EmptySig()
+
+
+def is_empty_sig(value: object) -> bool:
+    """Type guard: is this call arg the :data:`EMPTY_SIG` marker (issue #106)?
+
+    Uses ``isinstance`` so identity holds even if the module is imported twice.
+    """
+    return isinstance(value, _EmptySig)
 
 
 class RunarContract:
@@ -205,12 +240,15 @@ class RunarContract:
             locking_script, utxos, opts.satoshis, change_address, change_script, fee_rate,
         )
 
-        # Sign all inputs
+        # Sign all inputs. Funding inputs are signed by funding_signer when set
+        # (issue #134): the deploy signer may not own the funding coins.
+        # Defaults to the connected signer (zero behaviour change).
+        funding_signer = opts.funding_signer or signer
         signed_tx = tx_hex
-        pub_key = signer.get_public_key()
+        pub_key = funding_signer.get_public_key()
         for i in range(input_count):
             utxo = utxos[i]
-            sig = signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
+            sig = funding_signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
             unlock_script = encode_push_data(sig) + encode_push_data(pub_key)
             signed_tx = insert_unlocking_script(signed_tx, i, unlock_script)
 
@@ -382,6 +420,11 @@ class RunarContract:
                 "RunarContract.prepare_call: no provider/signer. Call connect() or pass them."
             )
 
+        # Funding (and terminal fee) inputs are signed by funding_signer when
+        # set (issue #134). The method's own Sig args stay with the connected
+        # signer. Defaults to the connected signer (zero behaviour change).
+        funding_signer = (options.funding_signer if options and options.funding_signer else signer)
+
         args = args or []
         method = self._find_method(method_name)
         if method is None:
@@ -481,6 +524,24 @@ class RunarContract:
                 prevouts_indices.append(i)
                 # Placeholder: 36 bytes per estimated input
                 resolved_args[i] = '00' * (36 * estimated_inputs)
+            # EMPTY_SIG (issue #106) is intentionally NOT handled here: it is not
+            # None, so it is never added to `sig_indices` and never signed. It
+            # stays in `resolved_args` and `_encode_arg` emits OP_0 for it.
+
+        # Soft heuristic (issue #106): more than one auto-signed Sig slot usually
+        # means an OR-CHECKSIG method whose non-matching branch should use
+        # EMPTY_SIG instead — otherwise every branch gets the same real signature
+        # and the failing CHECKSIG trips BIP146 NULLFAIL on broadcast. Legitimate
+        # AND-CHECKSIG multi-signer flows also use multiple auto slots, so this is
+        # informational only (the ABI does not encode OR-vs-AND topology).
+        if len(sig_indices) >= 2:
+            warnings.warn(
+                f"runar-sdk: {self.artifact.contract_name}.call('{method_name}') "
+                f"has {len(sig_indices)} auto-signed Sig slots. If this is an "
+                f"OR-CHECKSIG method, pass EMPTY_SIG for the non-matching "
+                f"branch(es) to satisfy BIP146 NULLFAIL (issue #106).",
+                stacklevel=2,
+            )
 
         # If any param uses SigHashPreimage, or this is stateful,
         # the compiler injects an implicit _opPushTxSig.
@@ -498,6 +559,11 @@ class RunarContract:
 
         # Compute code separator index for this method
         code_sep_idx = self._get_code_sep_index(self._find_method_index(method_name))
+
+        # Issue #123: build every preimage for this call under the method's
+        # declared @sighash mode (default 0x41). A method with no directive
+        # carries no sigHashType → falls back to 0x41 (unchanged behaviour).
+        method_sig_hash_type = self._method_sig_hash_type(method_name)
 
         # Compute change PKH for stateful methods that need it
         change_pkh_hex = ''
@@ -653,10 +719,53 @@ class RunarContract:
         change_script = build_p2pkh_script(change_address)
         all_funding_utxos = provider.get_utxos(address)
         # Filter out the contract UTXO to avoid duplicate inputs
-        additional_utxos: list[Utxo] = [
+        candidate_funding_utxos: list[Utxo] = [
             u for u in all_funding_utxos
             if not (u.txid == self._current_utxo.txid and u.output_index == self._current_utxo.output_index)
         ]
+
+        # Coin selection for funding inputs (issue #133): don't sweep the whole
+        # wallet. Compute how much the funding must cover -- the contract's own
+        # input value already offsets the contract/data outputs -- and pick the
+        # smallest largest-first set via select_utxos (the strategy deploy uses).
+        contract_output_sats = (
+            (sum(co['satoshis'] for co in contract_outputs)
+             if contract_outputs else (new_satoshis or 0))
+            + sum(do['satoshis'] for do in resolved_data_outputs)
+        )
+        contract_input_sats = (
+            self._current_utxo.satoshis
+            + sum(u.satoshis for u in extra_contract_utxos)
+        )
+        funding_target = max(0, contract_output_sats - contract_input_sats)
+        # Fee sizing hint for select_utxos: the continuation script length
+        # (falls back to the first multi-output script, else 0 for stateless).
+        if new_locking_script:
+            funding_lock_len = len(new_locking_script) // 2
+        elif contract_outputs:
+            funding_lock_len = len(contract_outputs[0]['script']) // 2
+        else:
+            funding_lock_len = 0
+        additional_utxos: list[Utxo] = (
+            select_utxos(candidate_funding_utxos, funding_target, funding_lock_len, fee_rate)
+            if candidate_funding_utxos else []
+        )
+
+        # Cap funding inputs when the caller sets max_funding_inputs. select_utxos
+        # returns the minimal largest-first set; if that still exceeds the cap the
+        # funding can't cover outputs + fee within the budget, so fail loudly
+        # instead of broadcasting an underfunded tx.
+        if (
+            options is not None
+            and options.max_funding_inputs is not None
+            and len(additional_utxos) > options.max_funding_inputs
+        ):
+            raise ValueError(
+                f"RunarContract.call({method_name}): funding requires "
+                f"{len(additional_utxos)} input(s) but "
+                f"max_funding_inputs={options.max_funding_inputs}. Increase "
+                f"max_funding_inputs, use larger UTXOs, or consolidate."
+            )
 
         # Resolve per-input args for additional contract inputs (same Sig/PubKey/ByteString handling)
         resolved_per_input_args: list[list] | None = None
@@ -697,17 +806,23 @@ class RunarContract:
             # Thread CallOptions.locktime so contracts asserting
             # extractLocktime(preimage) can succeed. None → 0 (legacy).
             locktime=opts.locktime,
+            # Thread CallOptions.sequence (issue #131): a non-zero locktime
+            # needs non-final input sequences or consensus ignores nLockTime.
+            sequence=opts.sequence,
         )
 
-        # Sign P2PKH funding inputs (after contract inputs)
+        # Sign P2PKH funding inputs (after contract inputs). Funding inputs are
+        # signed by funding_signer when set (issue #134): the method signer may
+        # not own the funding coins. The method's own Sig args keep the
+        # connected signer. Defaults to the connected signer.
         signed_tx = tx_hex
-        pub_key = signer.get_public_key()
+        pub_key = funding_signer.get_public_key()
         p2pkh_start_idx = 1 + len(extra_contract_utxos)
         for i in range(p2pkh_start_idx, input_count):
             utxo_idx = i - p2pkh_start_idx
             if utxo_idx < len(additional_utxos):
                 utxo = additional_utxos[utxo_idx]
-                sig = signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
+                sig = funding_signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
                 unlock_script = encode_push_data(sig) + encode_push_data(pub_key)
                 signed_tx = insert_unlocking_script(signed_tx, i, unlock_script)
 
@@ -719,7 +834,7 @@ class RunarContract:
             # keeps placeholder Sig params.  For input_idx>0 (extra), signs
             # with signer.
             def _build_stateful_unlock(tx: str, input_idx: int, subscript: str, sats: int, args_override: list | None = None, tx_change_amount: int = 0, pi: list[int] | None = None) -> tuple[str, str, str]:
-                op_sig, preimage = compute_op_push_tx(tx, input_idx, subscript, sats, code_sep_idx)
+                op_sig, preimage = compute_op_push_tx(tx, input_idx, subscript, sats, code_sep_idx, method_sig_hash_type)
                 base_args = args_override if args_override is not None else resolved_args
                 input_args = list(base_args)
                 # Only sign Sig params for extra inputs, not the primary
@@ -787,16 +902,19 @@ class RunarContract:
                 # Rebuild path must honor the override too: a preimage computed
                 # on a rebuilt tx with locktime 0 would mismatch the final tx.
                 locktime=opts.locktime,
+                # Same for sequence — the second-pass preimage must see the
+                # final input sequences (issue #131).
+                sequence=opts.sequence,
             )
             signed_tx = tx_hex
 
-            # Re-sign P2PKH funding inputs after rebuild
+            # Re-sign P2PKH funding inputs after rebuild (funding_signer — #134)
             p2pkh_start_idx = 1 + len(extra_contract_utxos)
             for i in range(p2pkh_start_idx, input_count):
                 utxo_idx = i - p2pkh_start_idx
                 if utxo_idx < len(additional_utxos):
                     utxo = additional_utxos[utxo_idx]
-                    sig = signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
+                    sig = funding_signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
                     unlock_script = encode_push_data(sig) + encode_push_data(pub_key)
                     signed_tx = insert_unlocking_script(signed_tx, i, unlock_script)
 
@@ -819,12 +937,12 @@ class RunarContract:
                 )
                 signed_tx = insert_unlocking_script(signed_tx, i + 1, final_merge_unlock)
 
-            # Re-sign P2PKH funding inputs after second pass
+            # Re-sign P2PKH funding inputs after second pass (funding_signer — #134)
             for i in range(p2pkh_start_idx, input_count):
                 utxo_idx = i - p2pkh_start_idx
                 if utxo_idx < len(additional_utxos):
                     utxo = additional_utxos[utxo_idx]
-                    sig = signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
+                    sig = funding_signer.sign(signed_tx, i, utxo.script, utxo.satoshis)
                     unlock_script = encode_push_data(sig) + encode_push_data(pub_key)
                     signed_tx = insert_unlocking_script(signed_tx, i, unlock_script)
 
@@ -840,6 +958,7 @@ class RunarContract:
             if needs_op_push_tx:
                 sig_hex, preimage_hex = compute_op_push_tx(
                     signed_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+                    method_sig_hash_type,
                 )
                 final_op_push_tx_sig = sig_hex
                 resolved_args[preimage_index] = preimage_hex
@@ -850,6 +969,7 @@ class RunarContract:
                 tmp_tx = insert_unlocking_script(signed_tx, 0, real_unlocking_script)
                 final_sig, final_pre = compute_op_push_tx(
                     tmp_tx, 0, contract_utxo.script, contract_utxo.satoshis, code_sep_idx,
+                    method_sig_hash_type,
                 )
                 resolved_args[preimage_index] = final_pre
                 final_op_push_tx_sig = final_sig
@@ -987,8 +1107,14 @@ class RunarContract:
         UTXO data is already available (e.g. from an overlay service or cache)
         without needing a Provider to fetch the transaction.
         """
-        dummy_args = [0] * len(artifact.abi.constructor_params)
-        contract = cls(artifact, dummy_args)
+        # Issue #119: recover the real baked-in constructor args from the
+        # deployed script rather than seeding zeros. Readonly ctor params feed
+        # the state-continuation formula and adjust_code_sep_offset, so zero
+        # placeholders make a restored stateful spend unspendable. Params with
+        # no ctor slot (mutable state fields) fall back to 0 and are overwritten
+        # by extract_state_from_script below.
+        restored_args = restore_constructor_args(artifact, utxo.script)
+        contract = cls(artifact, restored_args)
 
         if artifact.state_fields:
             last_op_return = find_last_op_return(utxo.script)
@@ -1155,6 +1281,11 @@ class RunarContract:
             term_unlock_script = self.build_unlocking_script(method_name, resolved_args)
         term_unlock_script += witness_hex
 
+        # Funding (and terminal fee) inputs are signed by funding_signer when
+        # set (issue #134). The method's own Sig args stay with the connected
+        # signer. Defaults to the connected signer.
+        funding_signer = opts.funding_signer or signer
+
         # Resolve funding UTXOs for terminal methods
         funding_utxos = opts.funding_utxos or []
 
@@ -1163,9 +1294,22 @@ class RunarContract:
         # behavior for contracts that don't check locktime.
         terminal_locktime = opts.locktime if opts.locktime is not None else 0
 
-        # Build raw terminal transaction: contract input + optional funding inputs, exact outputs
+        # Sequence (issue #131): all-final inputs make nLockTime a consensus
+        # no-op — when a non-zero locktime is set, default to 0xfffffffe so the
+        # terminal method's extractLocktime assertion is actually enforced.
+        term_sequence_hex = _to_le32(resolve_input_sequence(opts.locktime, opts.sequence))
+
+        # Fee input (issue #118): a single plain P2PKH UTXO added BEFORE the
+        # OP_PUSH_TX preimage is computed (so hashPrevouts covers it), consumed
+        # entirely as fee — no change output. It sits at index 1, right after
+        # the primary contract input, so the covenant's terminal output
+        # assertions (which don't touch the input side) stay valid.
+        fee_utxo = opts.fee_utxo
+
+        # Build raw terminal transaction: contract input + optional fee input +
+        # optional funding inputs, exact outputs.
         def build_terminal_tx(unlock: str) -> str:
-            num_inputs = 1 + len(funding_utxos)
+            num_inputs = 1 + (1 if fee_utxo else 0) + len(funding_utxos)
             tx = ''
             tx += _to_le32(1)  # version
             tx += _encode_varint(num_inputs)
@@ -1174,13 +1318,19 @@ class RunarContract:
             tx += _to_le32(contract_utxo.output_index)
             tx += _encode_varint(len(unlock) // 2)
             tx += unlock
-            tx += 'ffffffff'
+            tx += term_sequence_hex
+            # Fee input (unsigned placeholder; signed after tx is final)
+            if fee_utxo:
+                tx += _reverse_hex(fee_utxo.txid)
+                tx += _to_le32(fee_utxo.output_index)
+                tx += '00'  # empty scriptSig
+                tx += term_sequence_hex
             # Funding inputs (unsigned placeholders)
             for fu in funding_utxos:
                 tx += _reverse_hex(fu.txid)
                 tx += _to_le32(fu.output_index)
                 tx += '00'  # empty scriptSig
-                tx += 'ffffffff'
+                tx += term_sequence_hex
             tx += _encode_varint(len(term_outputs))
             for out in term_outputs:
                 tx += _to_le64(out.satoshis)
@@ -1194,11 +1344,13 @@ class RunarContract:
         final_preimage = ''
 
         term_code_sep_idx = self._get_code_sep_index(self._find_method_index(method_name))
+        # Issue #123: terminal preimages also honour the declared @sighash mode.
+        term_sig_hash_type = self._method_sig_hash_type(method_name)
 
         if is_stateful:
             # Build stateful terminal unlock with PLACEHOLDER user sigs
             def build_stateful_terminal_unlock(tx: str) -> tuple[str, str, str]:
-                op_sig, preimage = compute_op_push_tx(tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx)
+                op_sig, preimage = compute_op_push_tx(tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx, term_sig_hash_type)
                 # Keep placeholder Sig params (don't sign for primary)
                 args_hex = ''
                 for arg in resolved_args:
@@ -1232,6 +1384,7 @@ class RunarContract:
             if needs_op_push_tx:
                 sig_hex, preimage_hex = compute_op_push_tx(
                     term_tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx,
+                    term_sig_hash_type,
                 )
                 final_op_push_tx_sig = sig_hex
                 resolved_args[preimage_index] = preimage_hex
@@ -1243,6 +1396,7 @@ class RunarContract:
                 tmp_tx = insert_unlocking_script(term_tx, 0, real_unlock)
                 final_sig, final_pre = compute_op_push_tx(
                     tmp_tx, 0, contract_utxo.script, contract_utxo.satoshis, term_code_sep_idx,
+                    term_sig_hash_type,
                 )
                 resolved_args[preimage_index] = final_pre
                 final_op_push_tx_sig = final_sig
@@ -1252,6 +1406,20 @@ class RunarContract:
             term_tx = insert_unlocking_script(term_tx, 0, real_unlock)
             if not final_preimage and needs_op_push_tx:
                 final_preimage = resolved_args[preimage_index]
+
+        # Sign the fee input (issue #118). Its BIP-143 P2PKH sighash covers only
+        # hashPrevouts / hashOutputs / its own outpoint — NOT input 0's scriptSig
+        # — so it stays valid even after finalize_call rewrites input 0. Owned by
+        # funding_signer (composes with #134). The fee input sits at index 1,
+        # right after the primary contract input.
+        if fee_utxo:
+            fee_input_idx = 1
+            fee_sig = funding_signer.sign(
+                term_tx, fee_input_idx, fee_utxo.script, fee_utxo.satoshis,
+            )
+            fee_pub_key = funding_signer.get_public_key()
+            fee_unlock = encode_push_data(fee_sig) + encode_push_data(fee_pub_key)
+            term_tx = insert_unlocking_script(term_tx, fee_input_idx, fee_unlock)
 
         # Compute sighash from preimage
         sighash = ''
@@ -1462,6 +1630,17 @@ class RunarContract:
     def _get_public_methods(self):
         return [m for m in self.artifact.abi.methods if m.is_public]
 
+    def _method_sig_hash_type(self, method_name: str) -> int:
+        """Issue #123: resolve the BIP-143 sighash type for ``method_name`` from
+        the ABI (default 0x41 = ALL|FORKID). Drives both the OP_PUSH_TX binding
+        derivation and the SDK-built BIP-143 preimage so they commit to the same
+        fields the on-chain covenant expects.
+        """
+        for m in self.artifact.abi.methods:
+            if m.name == method_name:
+                return m.sig_hash_type if m.sig_hash_type is not None else 0x41
+        return 0x41
+
 
 # ---------------------------------------------------------------------------
 # Argument encoding
@@ -1608,6 +1787,9 @@ def _normalize_witness_bytes(value) -> str:
 
 
 def _encode_arg(value) -> str:
+    if is_empty_sig(value):
+        # OP_0 — empty signature push for the failing OR-CHECKSIG branch (#106).
+        return '00'
     if isinstance(value, bool):
         return '51' if value else '00'
     if isinstance(value, int):

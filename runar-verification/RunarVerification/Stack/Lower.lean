@@ -630,9 +630,16 @@ def binopOpcode (op : String) (resultType : Option String) : String :=
       | some "bytes" => "OP_EQUAL"
       | _            => "OP_NUMEQUAL"
   | "!==" =>
+      -- Issue #116: mirror TS `BINOP_OPCODES['!=='] = ['OP_NUMEQUAL','OP_NOT']`
+      -- (`05-stack-lower.ts:132-133`). `!==` always emits the EQUALITY opcode
+      -- followed by `OP_NOT` (appended by the binOp lowering arms below): bytes
+      -- use `OP_EQUAL`, numeric uses `OP_NUMEQUAL`. All 7 reference compilers
+      -- emit this 2-opcode pair; the single `OP_NUMNOTEQUAL` opcode is never
+      -- emitted. The semantic bridge `runOps [OP_NUMEQUAL, OP_NOT] = runOps
+      -- [OP_NUMNOTEQUAL]` is `Stack.Sim.runOps_numEqualNot_eq_numNotEqual`.
       match resultType with
-      | some "bytes" => "OP_EQUAL"        -- followed by OP_NOT (peephole-fused later)
-      | _            => "OP_NUMNOTEQUAL"
+      | some "bytes" => "OP_EQUAL"
+      | _            => "OP_NUMEQUAL"
   | "&"  => "OP_AND"
   | "|"  => "OP_OR"
   | "^"  => "OP_XOR"
@@ -2825,7 +2832,7 @@ def lowerValue (sm : StackMap) (bindingName : String) :
       (emitConst c, sm.push bindingName)
   | .binOp op l r rt =>
       let base := loadRef sm l ++ loadRef (sm.push l) r ++ [.opcode (binopOpcode op rt)]
-      let ops := if op == "!==" && rt == some "bytes" then base ++ [.opcode "OP_NOT"] else base
+      let ops := if op == "!==" then base ++ [.opcode "OP_NOT"] else base
       (ops, sm.push bindingName)
   | .unaryOp op operand _ =>
       (loadRef sm operand ++ [.opcode (unaryOpcode op)], sm.push bindingName)
@@ -3042,7 +3049,7 @@ def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budge
       let (lOps, sm1) := loadRefOperand sm l [l, r] currentIndex lastUses outerProtected
       let (rOps, sm2) := loadRefOperand sm1 r [l, r] currentIndex lastUses outerProtected
       let base := lOps ++ rOps ++ [.opcode (binopOpcode op rt)]
-      let ops := if op == "!==" && rt == some "bytes" then base ++ [.opcode "OP_NOT"] else base
+      let ops := if op == "!==" then base ++ [.opcode "OP_NOT"] else base
       -- Binop pops 2, pushes 1 (the named result).
       let sm3 := (sm2.popN 2).push bindingName
       (ops, sm3, localBindings)

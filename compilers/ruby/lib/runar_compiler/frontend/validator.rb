@@ -7,6 +7,7 @@
 
 require_relative "ast_nodes"
 require_relative "diagnostic"
+require_relative "sighash_validate"
 
 module RunarCompiler
   module Frontend
@@ -61,6 +62,15 @@ module RunarCompiler
       ctx.validate_constructor
       ctx.validate_methods
       ctx.check_no_recursion
+
+      # Issue #123: reject preimage-field reads / output bindings that are
+      # unsound under a method's declared @sighash mode (security core). This
+      # pass emits both errors (unsound usages) and warnings (e.g. an explicit
+      # single-output SINGLE covenant whose same-index value cannot be pinned
+      # statically), so route each diagnostic to the matching bucket.
+      SighashValidate.validate_sighash_usage(contract).each do |d|
+        (d.severity == Severity::WARNING ? ctx.warnings : ctx.errors) << d
+      end
 
       ValidationResult.new(errors: ctx.errors, warnings: ctx.warnings)
     end
@@ -292,6 +302,13 @@ module RunarCompiler
           warn_manual_preimage_usage(method)
         end
 
+        # #131: warn when a public method gates on extractLocktime but never
+        # asserts the spending tx is non-final (extractSequence < 0xffffffff).
+        # Advisory only.
+        if method.visibility == "public"
+          warn_locktime_without_sequence_guard(method)
+        end
+
         # Gate asm({...}) calls on UnsafeSmartContract and check the structural args.
         validate_asm_usage(method)
 
@@ -344,49 +361,18 @@ module RunarCompiler
       def validate_for_statement(stmt)
         validate_expression(stmt.condition)
 
-        # Check constant bounds
+        # Check that the loop bound is a compile-time constant. Non-zero starts
+        # and countdown loops (`i--` with `>`/`>=`) are supported: the ANF loop
+        # node carries an explicit start value and step direction (#121), so
+        # lowering binds iterVar = start + i*step on each unrolled iteration.
         if stmt.condition.is_a?(BinaryExpr)
           unless compile_time_constant?(stmt.condition.right)
             add_error("for loop bound must be a compile-time constant")
           end
-
-          # The ANF loop node carries only an iteration count, so lowering always
-          # iterates i = 0..count-1. Reject the loop shapes that representation
-          # cannot express -- a non-zero start or a countdown would otherwise be
-          # silently compiled as a zero-start counting-up loop while the
-          # interpreter runs the true source semantics.
-          if stmt.condition.op == ">" || stmt.condition.op == ">="
-            add_error(
-              "For loop condition must count up with '<' or '<=' — countdown loops are not supported; " \
-              "iterate i = 0..N-1 and index backwards instead",
-              loc: stmt.source_location
-            )
-          end
-        end
-
-        start_val = extract_literal_bigint(stmt.init&.init)
-        if !start_val.nil? && start_val != 0
-          add_error(
-            "For loop iterator must start at 0 (got #{start_val}n) — " \
-            "loops compile to i = 0..count-1; offset the iterator inside the body instead",
-            loc: stmt.source_location
-          )
         end
 
         validate_expression(stmt.init.init)
         stmt.body.each { |s| validate_statement(s) }
-      end
-
-      # Extract a literal bigint value from an expression, or nil if the
-      # expression is not a (possibly negated) bigint literal.
-      def extract_literal_bigint(expr)
-        return nil if expr.nil?
-        return expr.value if expr.is_a?(BigIntLiteral)
-        if expr.is_a?(UnaryExpr) && expr.op == "-"
-          inner = extract_literal_bigint(expr.operand)
-          return inner.nil? ? nil : -inner
-        end
-        nil
       end
 
       # -------------------------------------------------------------------
@@ -610,11 +596,15 @@ module RunarCompiler
       # Helper: compile-time constant check
       # -------------------------------------------------------------------
 
+      # Only integer literals (and their negation) can be unrolled into fixed
+      # Bitcoin Script by anf-lower. A bare identifier bound (e.g. `const N`) or
+      # a runtime member access (`this.x`) is NOT resolvable and must be
+      # rejected here with a graceful diagnostic — anf-lower's
+      # _extract_loop_shape would otherwise raise. Mirrors the reference TS
+      # compiler's observable behavior: only literal loop bounds compile.
       def compile_time_constant?(expr)
         return false if expr.nil?
         return true if expr.is_a?(BigIntLiteral)
-        return true if expr.is_a?(BoolLiteral)
-        return true if expr.is_a?(Identifier) # trust it's a const
 
         if expr.is_a?(UnaryExpr) && expr.op == "-"
           return compile_time_constant?(expr.operand)
@@ -672,6 +662,100 @@ module RunarCompiler
         return callee.property if callee.is_a?(MemberExpr)
 
         nil
+      end
+
+      # -------------------------------------------------------------------
+      # #131: locktime soundness -- extractLocktime needs an extractSequence guard
+      # -------------------------------------------------------------------
+
+      # Sentinel maximum nSequence: a tx is FINAL (ignores locktime) at this value.
+      SEQUENCE_FINAL = 0xffffffff
+
+      # True when +expr+ is a direct call to the named intrinsic, e.g. +f(...)+.
+      def call_to_named?(expr, name)
+        expr.is_a?(CallExpr) &&
+          expr.callee.is_a?(Identifier) &&
+          expr.callee.name == name
+      end
+
+      # True when +expr+ reads the transaction locktime. Both the raw intrinsic
+      # +extractLocktime(preimage)+ and its ergonomic sugar
+      # +currentBlockHeight()+ (which the ANF pass desugars to
+      # +extractLocktime(txPreimage)+) count -- either read is unsound without a
+      # sequence-finality guard.
+      def locktime_read?(expr)
+        call_to_named?(expr, "extractLocktime") || call_to_named?(expr, "currentBlockHeight")
+      end
+
+      # True when +expr+ is an +extractSequence(...) < <final>+-style comparison
+      # (the guard that makes a locktime gate consensus-enforced). Accepts the
+      # two natural spellings: +extractSequence(pre) < N+ / +<= N+, and the
+      # reversed +N > extractSequence(pre)+ / +>= ...+. +N+ must be a bigint
+      # literal no greater than the finality sentinel, so the guard genuinely
+      # forces non-finality.
+      def sequence_finality_guard?(expr)
+        return false unless expr.is_a?(BinaryExpr)
+
+        bound_ok = ->(e) { e.is_a?(BigIntLiteral) && e.value <= SEQUENCE_FINAL }
+
+        if ["<", "<="].include?(expr.op) &&
+           call_to_named?(expr.left, "extractSequence") && bound_ok.call(expr.right)
+          return true
+        end
+        if [">", ">="].include?(expr.op) &&
+           call_to_named?(expr.right, "extractSequence") && bound_ok.call(expr.left)
+          return true
+        end
+
+        false
+      end
+
+      # #131: warn when +method+ (transitively, through the private-helper call
+      # graph) reads the tx locktime but never asserts the tx is non-final. A
+      # locktime gate is not consensus-enforced unless
+      # +extractSequence < 0xffffffff+ is also asserted -- otherwise an
+      # all-final-sequence spend bypasses it. Advisory (warning) only -- no
+      # effect on emitted bytecode.
+      def warn_locktime_without_sequence_guard(method)
+        private_methods = {}
+        @contract.methods.each do |m|
+          private_methods[m.name] = m if m.visibility == "private"
+        end
+
+        reads_locktime = false
+        has_sequence_guard = false
+        visited = Set.new([method.name])
+        queue = [method]
+
+        until queue.empty?
+          current = queue.shift
+          walk_expressions_in_body(current.body, proc do |expr|
+            reads_locktime = true if locktime_read?(expr)
+            has_sequence_guard = true if sequence_finality_guard?(expr)
+          end)
+
+          # Follow calls into private helpers so a guard (or locktime read)
+          # supplied by an inlined helper is seen by the public entry point.
+          calls = Set.new
+          collect_method_calls(current.body, calls)
+          calls.each do |callee|
+            next if visited.include?(callee) || !private_methods.key?(callee)
+
+            visited.add(callee)
+            queue << private_methods[callee]
+          end
+        end
+
+        return unless reads_locktime && !has_sequence_guard
+
+        @warnings << Diagnostic.new(
+          message: "method '#{method.name}' reads extractLocktime but does not assert " \
+                   "extractSequence < 0xffffffff; a locktime gate is not consensus-enforced " \
+                   "unless the tx is non-final — add " \
+                   "assert(extractSequence(this.txPreimage) < 0xffffffffn)",
+          severity: Severity::WARNING,
+          loc: method.source_location
+        )
       end
 
       # -------------------------------------------------------------------

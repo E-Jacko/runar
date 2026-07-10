@@ -49,6 +49,19 @@ func Validate(contract *ContractNode) *ValidationResult {
 	ctx.validateMethods()
 	ctx.checkNoRecursion()
 
+	// Issue #123: reject preimage-field reads / output bindings that are
+	// unsound under a method's declared @sighash mode (security core). This
+	// pass emits both errors (unsound usages) and warnings (e.g. an explicit
+	// single-output SINGLE covenant whose same-index value cannot be pinned
+	// statically), so route each diagnostic to the matching bucket.
+	for _, d := range ValidateSighashUsage(contract) {
+		if d.Severity == SeverityWarning {
+			ctx.warnings = append(ctx.warnings, d)
+		} else {
+			ctx.errors = append(ctx.errors, d)
+		}
+	}
+
 	return &ValidationResult{
 		Errors:   ctx.errors,
 		Warnings: ctx.warnings,
@@ -348,6 +361,12 @@ func (ctx *validationContext) validateMethod(method MethodNode) {
 		ctx.warnManualPreimageUsage(method)
 	}
 
+	// #131: warn when a public method gates on extractLocktime but never asserts
+	// the spending tx is non-final (extractSequence < 0xffffffff). Advisory only.
+	if method.Visibility == "public" {
+		ctx.warnLocktimeWithoutSequenceGuard(method)
+	}
+
 	// Gate asm({...}) calls on UnsafeSmartContract and check the structural args.
 	ctx.validateAsmUsage(method)
 
@@ -538,31 +557,14 @@ func (ctx *validationContext) validateStatement(stmt Statement) {
 func (ctx *validationContext) validateForStatement(stmt ForStmt) {
 	ctx.validateExpression(stmt.Condition)
 
-	// Check constant bounds
+	// Check constant bounds. Non-zero starts and countdown loops (`i--` with
+	// `>`/`>=`) are supported: the ANF loop node carries an explicit start value
+	// and step direction (issue #121), so lowering binds `iterVar = start +
+	// i*step` on each unrolled iteration.
 	if bin, ok := stmt.Condition.(BinaryExpr); ok {
 		if !isCompileTimeConstant(bin.Right) {
 			ctx.addError("for loop bound must be a compile-time constant")
 		}
-
-		// The ANF loop node carries only an iteration count, so lowering always
-		// iterates i = 0..count-1. Reject the loop shapes that representation
-		// cannot express — a non-zero start or a countdown would otherwise be
-		// silently compiled as a zero-start counting-up loop while the
-		// interpreter runs the true source semantics.
-		if bin.Op == ">" || bin.Op == ">=" {
-			ctx.addErrorWithLoc(
-				"For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead",
-				&stmt.SourceLocation,
-			)
-		}
-	}
-
-	startVal := extractBigIntValue(stmt.Init.Init)
-	if startVal != nil && startVal.Sign() != 0 {
-		ctx.addErrorWithLoc(
-			fmt.Sprintf("For loop iterator must start at 0 (got %sn) — loops compile to i = 0..count-1; offset the iterator inside the body instead", startVal.String()),
-			&stmt.SourceLocation,
-		)
 	}
 
 	ctx.validateExpression(stmt.Init.Init)
@@ -571,14 +573,16 @@ func (ctx *validationContext) validateForStatement(stmt ForStmt) {
 	}
 }
 
+// isCompileTimeConstant reports whether a for-loop bound can be unrolled into
+// fixed Bitcoin Script. Only integer literals (and their negation) qualify: a
+// bare identifier bound (e.g. `const N`) or a runtime member access (`this.x`)
+// is NOT resolvable and must be rejected here with a graceful diagnostic —
+// anf-lower's extractLoopShape would otherwise panic. Mirrors the reference TS
+// compiler's observable behavior: only literal loop bounds compile.
 func isCompileTimeConstant(expr Expression) bool {
 	switch e := expr.(type) {
 	case BigIntLiteral:
 		return true
-	case BoolLiteral:
-		return true
-	case Identifier:
-		return true // trust it's a const
 	case UnaryExpr:
 		if e.Op == "-" {
 			return isCompileTimeConstant(e.Operand)
@@ -663,6 +667,110 @@ func (ctx *validationContext) warnManualPreimageUsage(method MethodNode) {
 			}
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// #131: locktime soundness — extractLocktime needs an extractSequence guard
+// ---------------------------------------------------------------------------
+
+// sequenceFinal is the sentinel maximum nSequence: a tx is FINAL (ignores
+// locktime) at this value.
+var sequenceFinal = new(big.Int).SetUint64(0xffffffff)
+
+// isCallToNamed reports whether expr is a direct call to the named intrinsic,
+// e.g. `f(...)`.
+func isCallToNamed(expr Expression, name string) bool {
+	call, ok := expr.(CallExpr)
+	if !ok {
+		return false
+	}
+	id, ok := call.Callee.(Identifier)
+	return ok && id.Name == name
+}
+
+// isLocktimeRead reports whether expr reads the transaction locktime. Both the
+// raw intrinsic extractLocktime(preimage) and its ergonomic sugar
+// currentBlockHeight() (which the ANF pass desugars to extractLocktime) count —
+// either read is unsound without a sequence-finality guard.
+func isLocktimeRead(expr Expression) bool {
+	return isCallToNamed(expr, "extractLocktime") || isCallToNamed(expr, "currentBlockHeight")
+}
+
+// isSequenceFinalityGuard reports whether expr is an
+// `extractSequence(...) < <final>`-style comparison (the guard that makes a
+// locktime gate consensus-enforced). Accepts the two natural spellings:
+// `extractSequence(pre) < N` / `<= N`, and the reversed `N > extractSequence(pre)`
+// / `>= ...`. N must be a bigint literal no greater than the finality sentinel,
+// so the guard genuinely forces non-finality.
+func isSequenceFinalityGuard(expr Expression) bool {
+	bin, ok := expr.(BinaryExpr)
+	if !ok {
+		return false
+	}
+	boundOk := func(e Expression) bool {
+		lit, ok := e.(BigIntLiteral)
+		return ok && lit.Value != nil && lit.Value.Cmp(sequenceFinal) <= 0
+	}
+	if (bin.Op == "<" || bin.Op == "<=") && isCallToNamed(bin.Left, "extractSequence") && boundOk(bin.Right) {
+		return true
+	}
+	if (bin.Op == ">" || bin.Op == ">=") && isCallToNamed(bin.Right, "extractSequence") && boundOk(bin.Left) {
+		return true
+	}
+	return false
+}
+
+// warnLocktimeWithoutSequenceGuard warns when method (transitively, through the
+// private-helper call graph) reads the tx locktime but never asserts the tx is
+// non-final. A locktime gate is not consensus-enforced unless
+// extractSequence < 0xffffffff is also asserted — otherwise an all-final-sequence
+// spend bypasses it. Advisory (warning) only — no effect on emitted bytecode.
+func (ctx *validationContext) warnLocktimeWithoutSequenceGuard(method MethodNode) {
+	privateMethods := make(map[string]MethodNode)
+	for _, m := range ctx.contract.Methods {
+		if m.Visibility == "private" {
+			privateMethods[m.Name] = m
+		}
+	}
+
+	readsLocktime := false
+	hasSequenceGuard := false
+	visited := map[string]bool{method.Name: true}
+	queue := []MethodNode{method}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		walkExpressionsInBody(current.Body, func(expr Expression) {
+			if isLocktimeRead(expr) {
+				readsLocktime = true
+			}
+			if isSequenceFinalityGuard(expr) {
+				hasSequenceGuard = true
+			}
+		})
+		// Follow calls into private helpers so a guard (or locktime read) supplied
+		// by an inlined helper is seen by the public entry point.
+		calls := make(map[string]bool)
+		collectMethodCalls(current.Body, calls)
+		for callee := range calls {
+			if visited[callee] {
+				continue
+			}
+			if pm, ok := privateMethods[callee]; ok {
+				visited[callee] = true
+				queue = append(queue, pm)
+			}
+		}
+	}
+
+	if readsLocktime && !hasSequenceGuard {
+		ctx.addWarningWithLoc(fmt.Sprintf(
+			"method '%s' reads extractLocktime but does not assert extractSequence < 0xffffffff; "+
+				"a locktime gate is not consensus-enforced unless the tx is non-final — add "+
+				"assert(extractSequence(this.txPreimage) < 0xffffffffn)",
+			method.Name), &method.SourceLocation)
+	}
 }
 
 func walkExpressionsInBody(stmts []Statement, visitor func(Expression)) {

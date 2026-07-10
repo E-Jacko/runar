@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const types = @import("../ir/types.zig");
+const sighash_validate = @import("sighash_validate.zig");
 
 const Allocator = std.mem.Allocator;
 const ContractNode = types.ContractNode;
@@ -69,6 +70,24 @@ fn validateWithMode(
     try validateConstructor(allocator, contract, mode, &errors);
     try validateMethods(allocator, contract, &errors, &warnings);
     try checkNoRecursion(allocator, contract, &errors);
+
+    // Issue #123: reject preimage-field reads / output bindings that are
+    // unsound under a method's declared @sighash mode (security core). The pass
+    // emits both errors (unsound usages) and warnings (e.g. an explicit
+    // single-output SINGLE covenant whose same-index value cannot be pinned
+    // statically), so route each diagnostic to the matching bucket.
+    {
+        var sighash_diags: std.ArrayListUnmanaged(CompilerDiagnostic) = .empty;
+        defer sighash_diags.deinit(allocator);
+        try sighash_validate.validateSighashUsage(allocator, contract, &sighash_diags);
+        for (sighash_diags.items) |d| {
+            if (d.severity == .warning) {
+                try warnings.append(allocator, d);
+            } else {
+                try errors.append(allocator, d);
+            }
+        }
+    }
 
     return .{
         .errors = try errors.toOwnedSlice(allocator),
@@ -296,6 +315,13 @@ fn validateMethods(
         // V24/V25: Warn on manual preimage/state-script boilerplate in StatefulSmartContract
         if (contract.parent_class == .stateful_smart_contract and method.is_public) {
             try warnManualPreimageUsage(allocator, method, warnings);
+        }
+
+        // #131: warn when a public method gates on extractLocktime but never
+        // asserts the spending tx is non-final (extractSequence < 0xffffffff).
+        // Advisory only — no effect on emitted bytecode.
+        if (method.is_public) {
+            try warnLocktimeWithoutSequenceGuard(allocator, contract, method, warnings);
         }
 
         // Gate asm({...}) calls on UnsafeSmartContract + check structural args.
@@ -558,22 +584,17 @@ fn validateStatement(
 ) !void {
     switch (stmt) {
         .for_stmt => |f| {
-            // For loops in the Zig IR already have concrete i64 bounds (init_value, bound),
-            // so they are inherently compile-time constants. However, the ANF loop node
-            // carries only an iteration count — no start value or step direction — so
-            // lowering always iterates i = 0..count-1. Reject the loop shapes that
-            // representation cannot express: a countdown ('>'/'>=') or a non-zero start
-            // would otherwise be silently compiled as a zero-start counting-up loop while
-            // the interpreter runs the true source semantics.
-            if (f.descending) {
+            // The parser collapses a for-loop bound to a concrete i64, but a
+            // runtime bound (`i < this.x`) or an identifier bound (`i < N`)
+            // is not unrollable and would otherwise silently become a
+            // 0-iteration loop. Reject it here with the same diagnostic the
+            // reference TS compiler emits — only genuine integer-literal bounds
+            // compile. Issue #121: non-zero-start and countdown (`>`/`>=`)
+            // loops with literal bounds remain supported (anf-lower binds
+            // `iterVar = start + i*step` on each unrolled iteration).
+            if (!f.bound_is_const) {
                 try errors.append(allocator, .{
-                    .message = "For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead",
-                    .severity = .@"error",
-                });
-            }
-            if (f.init_value != 0) {
-                try errors.append(allocator, .{
-                    .message = "For loop iterator must start at 0 — loops compile to i = 0..count-1; offset the iterator inside the body instead",
+                    .message = "For loop bound must be a compile-time constant (literal or const variable)",
                     .severity = .@"error",
                 });
             }
@@ -680,6 +701,190 @@ fn walkExprForPreimage(
         .literal_int, .literal_bigint, .literal_bool, .literal_bytes, .identifier,
         .property_access, .array_literal,
         => {},
+    }
+}
+
+// ============================================================================
+// #131: locktime soundness — extractLocktime needs an extractSequence guard
+// ============================================================================
+
+/// Sentinel maximum nSequence: a tx is FINAL (ignores locktime) at this value.
+const SEQUENCE_FINAL: i128 = 0xffffffff;
+
+/// True when `expr` is a direct call to the named intrinsic, e.g. `f(...)`. Bare
+/// intrinsic calls are `.call`; a `this.foo()` method call is `.method_call`.
+fn isCallToNamed(expr: Expression, name: []const u8) bool {
+    return switch (expr) {
+        .call => |c| std.mem.eql(u8, c.callee, name),
+        else => false,
+    };
+}
+
+/// True when `expr` reads the transaction locktime. Both the raw intrinsic
+/// `extractLocktime(preimage)` and its ergonomic sugar `currentBlockHeight()`
+/// (which the ANF pass desugars to `extractLocktime`) count — either read is
+/// unsound without a sequence-finality guard.
+fn isLocktimeRead(expr: Expression) bool {
+    return isCallToNamed(expr, "extractLocktime") or isCallToNamed(expr, "currentBlockHeight");
+}
+
+/// True when `expr` is an int/bigint literal no greater than the finality
+/// sentinel (0xffffffff), so a guard against it genuinely forces non-finality.
+/// The TS reference matches a `bigint_literal`; the Zig frontend lowers small
+/// bigints to `literal_int` and only oversize values to `literal_bigint`, so
+/// both variants are accepted here.
+fn sequenceBoundOk(expr: Expression) bool {
+    return switch (expr) {
+        .literal_int => |v| @as(i128, v) <= SEQUENCE_FINAL,
+        .literal_bigint => |s| blk: {
+            const n = std.fmt.parseInt(i128, s, 10) catch break :blk false;
+            break :blk n <= SEQUENCE_FINAL;
+        },
+        else => false,
+    };
+}
+
+/// True when `expr` is an `extractSequence(...) < <final>`-style comparison
+/// (the guard that makes a locktime gate consensus-enforced). Accepts the two
+/// natural spellings: `extractSequence(pre) < N` / `<= N`, and the reversed
+/// `N > extractSequence(pre)` / `>= ...`. `N` must be an int/bigint literal no
+/// greater than the finality sentinel.
+fn isSequenceFinalityGuard(expr: Expression) bool {
+    const b = switch (expr) {
+        .binary_op => |bp| bp,
+        else => return false,
+    };
+    if ((b.op == .lt or b.op == .lte) and
+        isCallToNamed(b.left, "extractSequence") and sequenceBoundOk(b.right))
+    {
+        return true;
+    }
+    if ((b.op == .gt or b.op == .gte) and
+        isCallToNamed(b.right, "extractSequence") and sequenceBoundOk(b.left))
+    {
+        return true;
+    }
+    return false;
+}
+
+/// Recursively scan an expression for a locktime read and/or a sequence guard,
+/// setting the respective flags. Pure — no allocation.
+fn scanExprForLocktime(expr: Expression, reads_locktime: *bool, has_guard: *bool) void {
+    if (isLocktimeRead(expr)) reads_locktime.* = true;
+    if (isSequenceFinalityGuard(expr)) has_guard.* = true;
+    switch (expr) {
+        .call => |c| for (c.args) |arg| scanExprForLocktime(arg, reads_locktime, has_guard),
+        .method_call => |mc| for (mc.args) |arg| scanExprForLocktime(arg, reads_locktime, has_guard),
+        .binary_op => |b| {
+            scanExprForLocktime(b.left, reads_locktime, has_guard);
+            scanExprForLocktime(b.right, reads_locktime, has_guard);
+        },
+        .unary_op => |u| scanExprForLocktime(u.operand, reads_locktime, has_guard),
+        .ternary => |t| {
+            scanExprForLocktime(t.condition, reads_locktime, has_guard);
+            scanExprForLocktime(t.then_expr, reads_locktime, has_guard);
+            scanExprForLocktime(t.else_expr, reads_locktime, has_guard);
+        },
+        .index_access => |ia| {
+            scanExprForLocktime(ia.object, reads_locktime, has_guard);
+            scanExprForLocktime(ia.index, reads_locktime, has_guard);
+        },
+        .increment => |inc| scanExprForLocktime(inc.operand, reads_locktime, has_guard),
+        .decrement => |dec| scanExprForLocktime(dec.operand, reads_locktime, has_guard),
+        .literal_int, .literal_bigint, .literal_bool, .literal_bytes, .identifier,
+        .property_access, .array_literal,
+        => {},
+    }
+}
+
+/// Statement walker feeding `scanExprForLocktime`.
+fn scanStmtForLocktime(stmt: Statement, reads_locktime: *bool, has_guard: *bool) void {
+    switch (stmt) {
+        .expr_stmt => |expr| scanExprForLocktime(expr, reads_locktime, has_guard),
+        .const_decl => |cd| scanExprForLocktime(cd.value, reads_locktime, has_guard),
+        .let_decl => |ld| {
+            if (ld.value) |v| scanExprForLocktime(v, reads_locktime, has_guard);
+        },
+        .assign => |a| scanExprForLocktime(a.value, reads_locktime, has_guard),
+        .if_stmt => |if_s| {
+            scanExprForLocktime(if_s.condition, reads_locktime, has_guard);
+            for (if_s.then_body) |s| scanStmtForLocktime(s, reads_locktime, has_guard);
+            if (if_s.else_body) |eb| {
+                for (eb) |s| scanStmtForLocktime(s, reads_locktime, has_guard);
+            }
+        },
+        .for_stmt => |fs| {
+            for (fs.body) |s| scanStmtForLocktime(s, reads_locktime, has_guard);
+        },
+        .assert_stmt => |a| scanExprForLocktime(a.condition, reads_locktime, has_guard),
+        .return_stmt => |opt_expr| {
+            if (opt_expr) |expr| scanExprForLocktime(expr, reads_locktime, has_guard);
+        },
+    }
+}
+
+/// #131: warn when `method` (transitively, through the private-helper call
+/// graph) reads the tx locktime but never asserts the tx is non-final. A
+/// locktime gate is not consensus-enforced unless `extractSequence < 0xffffffff`
+/// is also asserted — otherwise an all-final-sequence spend bypasses it.
+/// Advisory (warning) only — no effect on emitted bytecode. The message is
+/// allocator-owned (matches sighash_validate's allocPrint'd diagnostics).
+fn warnLocktimeWithoutSequenceGuard(
+    allocator: Allocator,
+    contract: ContractNode,
+    method: MethodNode,
+    warnings: *std.ArrayListUnmanaged(CompilerDiagnostic),
+) !void {
+    var reads_locktime = false;
+    var has_sequence_guard = false;
+
+    var visited = StringSet{};
+    defer visited.deinit(allocator);
+    try visited.put(allocator, method.name, {});
+
+    var queue: std.ArrayListUnmanaged(MethodNode) = .empty;
+    defer queue.deinit(allocator);
+    try queue.append(allocator, method);
+
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const current = queue.items[head];
+        for (current.body) |stmt| {
+            scanStmtForLocktime(stmt, &reads_locktime, &has_sequence_guard);
+        }
+        // Follow calls into private helpers so a guard (or locktime read)
+        // supplied by an inlined helper is seen by the public entry point.
+        var calls = StringSet{};
+        defer calls.deinit(allocator);
+        for (current.body) |stmt| {
+            try collectMethodCalls(allocator, stmt, &calls);
+        }
+        var it = calls.iterator();
+        while (it.next()) |entry| {
+            const callee = entry.key_ptr.*;
+            if (visited.get(callee) != null) continue;
+            for (contract.methods) |m| {
+                if (!m.is_public and std.mem.eql(u8, m.name, callee)) {
+                    try visited.put(allocator, callee, {});
+                    try queue.append(allocator, m);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (reads_locktime and !has_sequence_guard) {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "method '{s}' reads extractLocktime but does not assert extractSequence " ++
+                "< 0xffffffff; a locktime gate is not consensus-enforced unless the tx " ++
+                "is non-final — add assert(extractSequence(this.txPreimage) < 0xffffffffn)",
+            .{method.name},
+        );
+        try warnings.append(allocator, .{
+            .message = msg,
+            .severity = .warning,
+        });
     }
 }
 
@@ -1160,6 +1365,50 @@ test "public method without assert reports error for SmartContract" {
     try testing.expect(found);
 }
 
+test "for loop with non-constant bound is rejected" {
+    const allocator = testing.allocator;
+    const props = [_]PropertyNode{
+        makeProperty("x", .bigint, true),
+    };
+    // for (let i = 0; i < <runtime>; i++) {}  — bound_is_const = false marks a
+    // runtime/identifier bound that the parser could not resolve to a literal.
+    var loop_body = [_]Statement{};
+    var body = [_]Statement{
+        .{ .for_stmt = .{
+            .var_name = "i",
+            .init_value = 0,
+            .bound = 0,
+            .bound_is_const = false,
+            .body = &loop_body,
+        } },
+        .{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } },
+    };
+    var methods = [_]MethodNode{
+        .{ .name = "run", .is_public = true, .params = &.{}, .body = &body },
+    };
+    var assignments = [_]types.AssignmentNode{makeAssignment("x")};
+    var super_args = [_]Expression{.{ .identifier = "x" }};
+    var params = [_]types.ParamNode{makeParam("x")};
+    const contract = ContractNode{
+        .name = "LoopRuntime",
+        .parent_class = .smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &methods,
+    };
+    const result = try validate(allocator, contract);
+    defer freeResult(allocator, result);
+
+    var found = false;
+    for (result.errors) |err| {
+        if (std.mem.indexOf(u8, err.message, "compile-time constant") != null) {
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
 test "public method ending with assert_stmt passes" {
     const allocator = testing.allocator;
     const props = [_]PropertyNode{
@@ -1519,7 +1768,7 @@ test "contract with a public method does not report no-public-methods error" {
     try testing.expect(!hasErrorContaining(result, "no public methods"));
 }
 
-// -- #127: reject non-zero-start and countdown loops --
+// -- #121: non-zero-start and countdown loops are supported (no longer rejected) --
 
 /// Validate a stateless contract with a single public method `m` whose body is
 /// the given for-loop followed by a terminal assert. Returns whether any error
@@ -1548,16 +1797,16 @@ fn validateLoopHasError(allocator: Allocator, for_stmt: types.ForStmt, needle: [
     return hasErrorContaining(result, needle);
 }
 
-test "for loop with non-zero start reports error" {
+test "for loop with non-zero start is accepted (#121)" {
     // for (let i = 1; i <= 3; i++)
-    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 1, .bound = 3, .body = &.{} };
-    try testing.expect(try validateLoopHasError(testing.allocator, for_stmt, "must start at 0"));
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 1, .bound = 3, .inclusive = true, .body = &.{} };
+    try testing.expect(!try validateLoopHasError(testing.allocator, for_stmt, "must start at 0"));
 }
 
-test "countdown for loop reports error" {
+test "countdown for loop is accepted (#121)" {
     // for (let i = 3; i > 0; i--)
     const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 3, .bound = 0, .descending = true, .body = &.{} };
-    try testing.expect(try validateLoopHasError(testing.allocator, for_stmt, "countdown"));
+    try testing.expect(!try validateLoopHasError(testing.allocator, for_stmt, "countdown"));
 }
 
 test "zero-start counting-up for loop is accepted" {
@@ -1565,4 +1814,248 @@ test "zero-start counting-up for loop is accepted" {
     const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 0, .bound = 4, .body = &.{} };
     try testing.expect(!try validateLoopHasError(testing.allocator, for_stmt, "must start at 0"));
     try testing.expect(!try validateLoopHasError(testing.allocator, for_stmt, "countdown"));
+}
+
+// -- #131 (H2): extractLocktime without extractSequence guard ----------------
+
+const LOCKTIME_NEEDLE = "does not assert extractSequence";
+
+fn locktimeWarning(result: ValidationResult) ?CompilerDiagnostic {
+    for (result.warnings) |w| {
+        if (std.mem.indexOf(u8, w.message, LOCKTIME_NEEDLE) != null) return w;
+    }
+    return null;
+}
+
+fn hasLocktimeWarning(result: ValidationResult) bool {
+    return locktimeWarning(result) != null;
+}
+
+/// freeResult only frees the diagnostic slices; the locktime warning's message
+/// is allocator-owned (allocPrint'd), so free those messages first to keep the
+/// leak-checking test allocator happy. Static-literal messages are left alone.
+fn freeLocktimeResult(allocator: Allocator, result: ValidationResult) void {
+    for (result.warnings) |w| {
+        if (std.mem.indexOf(u8, w.message, LOCKTIME_NEEDLE) != null) {
+            allocator.free(w.message);
+        }
+    }
+    freeResult(allocator, result);
+}
+
+test "H2: warns when a public method reads extractLocktime without a sequence guard" {
+    const allocator = testing.allocator;
+
+    // assert(extractLocktime(this.txPreimage) >= this.deadline)
+    var lt_args = [_]Expression{.{ .property_access = .{ .object = "this", .property = "txPreimage" } }};
+    var lt_call = types.CallExpr{ .callee = "extractLocktime", .args = &lt_args };
+    var lt_cmp = types.BinaryOp{
+        .op = .gte,
+        .left = .{ .call = &lt_call },
+        .right = .{ .property_access = .{ .object = "this", .property = "deadline" } },
+    };
+    var inc = types.IncrementExpr{ .operand = .{ .property_access = .{ .object = "this", .property = "count" } }, .prefix = false };
+    var body = [_]Statement{
+        .{ .assert_stmt = .{ .condition = .{ .binary_op = &lt_cmp } } },
+        .{ .expr_stmt = .{ .increment = &inc } },
+    };
+    var methods = [_]MethodNode{
+        .{ .name = "unlock", .is_public = true, .params = &.{}, .body = &body },
+    };
+    const props = [_]PropertyNode{
+        makeProperty("count", .bigint, false),
+        makeProperty("deadline", .bigint, true),
+    };
+    var assignments = [_]types.AssignmentNode{ makeAssignment("count"), makeAssignment("deadline") };
+    var super_args = [_]Expression{ .{ .identifier = "count" }, .{ .identifier = "deadline" } };
+    var params = [_]types.ParamNode{ makeParam("count"), makeParam("deadline") };
+    const contract = ContractNode{
+        .name = "TimeLock",
+        .parent_class = .stateful_smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &methods,
+    };
+    const result = try validate(allocator, contract);
+    defer freeLocktimeResult(allocator, result);
+
+    try testing.expect(hasLocktimeWarning(result));
+    const w = locktimeWarning(result).?;
+    try testing.expect(w.severity == .warning);
+    try testing.expect(std.mem.indexOf(u8, w.message, "unlock") != null);
+    try testing.expect(std.mem.indexOf(u8, w.message, "0xffffffff") != null);
+}
+
+test "H2: does NOT warn when the method also asserts extractSequence < final" {
+    const allocator = testing.allocator;
+
+    // assert(extractSequence(this.txPreimage) < 0xffffffffn)
+    var seq_args = [_]Expression{.{ .property_access = .{ .object = "this", .property = "txPreimage" } }};
+    var seq_call = types.CallExpr{ .callee = "extractSequence", .args = &seq_args };
+    var seq_cmp = types.BinaryOp{ .op = .lt, .left = .{ .call = &seq_call }, .right = .{ .literal_int = 0xffffffff } };
+    // assert(extractLocktime(this.txPreimage) >= this.deadline)
+    var lt_args = [_]Expression{.{ .property_access = .{ .object = "this", .property = "txPreimage" } }};
+    var lt_call = types.CallExpr{ .callee = "extractLocktime", .args = &lt_args };
+    var lt_cmp = types.BinaryOp{
+        .op = .gte,
+        .left = .{ .call = &lt_call },
+        .right = .{ .property_access = .{ .object = "this", .property = "deadline" } },
+    };
+    var inc = types.IncrementExpr{ .operand = .{ .property_access = .{ .object = "this", .property = "count" } }, .prefix = false };
+    var body = [_]Statement{
+        .{ .assert_stmt = .{ .condition = .{ .binary_op = &seq_cmp } } },
+        .{ .assert_stmt = .{ .condition = .{ .binary_op = &lt_cmp } } },
+        .{ .expr_stmt = .{ .increment = &inc } },
+    };
+    var methods = [_]MethodNode{
+        .{ .name = "unlock", .is_public = true, .params = &.{}, .body = &body },
+    };
+    const props = [_]PropertyNode{
+        makeProperty("count", .bigint, false),
+        makeProperty("deadline", .bigint, true),
+    };
+    var assignments = [_]types.AssignmentNode{ makeAssignment("count"), makeAssignment("deadline") };
+    var super_args = [_]Expression{ .{ .identifier = "count" }, .{ .identifier = "deadline" } };
+    var params = [_]types.ParamNode{ makeParam("count"), makeParam("deadline") };
+    const contract = ContractNode{
+        .name = "TimeLock",
+        .parent_class = .stateful_smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &methods,
+    };
+    const result = try validate(allocator, contract);
+    defer freeLocktimeResult(allocator, result);
+
+    try testing.expect(!hasLocktimeWarning(result));
+}
+
+test "H2: does NOT warn for a method that never reads extractLocktime" {
+    const allocator = testing.allocator;
+
+    var inc = types.IncrementExpr{ .operand = .{ .property_access = .{ .object = "this", .property = "count" } }, .prefix = false };
+    var body = [_]Statement{
+        .{ .expr_stmt = .{ .increment = &inc } },
+    };
+    var methods = [_]MethodNode{
+        .{ .name = "increment", .is_public = true, .params = &.{}, .body = &body },
+    };
+    const props = [_]PropertyNode{
+        makeProperty("count", .bigint, false),
+    };
+    var assignments = [_]types.AssignmentNode{makeAssignment("count")};
+    var super_args = [_]Expression{.{ .identifier = "count" }};
+    var params = [_]types.ParamNode{makeParam("count")};
+    const contract = ContractNode{
+        .name = "Counter",
+        .parent_class = .stateful_smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &methods,
+    };
+    const result = try validate(allocator, contract);
+    defer freeLocktimeResult(allocator, result);
+
+    try testing.expect(!hasLocktimeWarning(result));
+}
+
+test "H2: sees a sequence guard supplied transitively through a private helper" {
+    const allocator = testing.allocator;
+
+    // private requireNonFinal(): assert(extractSequence(this.txPreimage) < 0xffffffffn)
+    var seq_args = [_]Expression{.{ .property_access = .{ .object = "this", .property = "txPreimage" } }};
+    var seq_call = types.CallExpr{ .callee = "extractSequence", .args = &seq_args };
+    var seq_cmp = types.BinaryOp{ .op = .lt, .left = .{ .call = &seq_call }, .right = .{ .literal_int = 0xffffffff } };
+    var req_body = [_]Statement{
+        .{ .assert_stmt = .{ .condition = .{ .binary_op = &seq_cmp } } },
+    };
+
+    // public unlock(): this.requireNonFinal(); assert(extractLocktime(this.txPreimage) >= this.deadline); this.count++
+    var req_call = types.MethodCall{ .object = "this", .method = "requireNonFinal", .args = &.{} };
+    var lt_args = [_]Expression{.{ .property_access = .{ .object = "this", .property = "txPreimage" } }};
+    var lt_call = types.CallExpr{ .callee = "extractLocktime", .args = &lt_args };
+    var lt_cmp = types.BinaryOp{
+        .op = .gte,
+        .left = .{ .call = &lt_call },
+        .right = .{ .property_access = .{ .object = "this", .property = "deadline" } },
+    };
+    var inc = types.IncrementExpr{ .operand = .{ .property_access = .{ .object = "this", .property = "count" } }, .prefix = false };
+    var unlock_body = [_]Statement{
+        .{ .expr_stmt = .{ .method_call = &req_call } },
+        .{ .assert_stmt = .{ .condition = .{ .binary_op = &lt_cmp } } },
+        .{ .expr_stmt = .{ .increment = &inc } },
+    };
+
+    var methods = [_]MethodNode{
+        .{ .name = "unlock", .is_public = true, .params = &.{}, .body = &unlock_body },
+        .{ .name = "requireNonFinal", .is_public = false, .params = &.{}, .body = &req_body },
+    };
+    const props = [_]PropertyNode{
+        makeProperty("count", .bigint, false),
+        makeProperty("deadline", .bigint, true),
+    };
+    var assignments = [_]types.AssignmentNode{ makeAssignment("count"), makeAssignment("deadline") };
+    var super_args = [_]Expression{ .{ .identifier = "count" }, .{ .identifier = "deadline" } };
+    var params = [_]types.ParamNode{ makeParam("count"), makeParam("deadline") };
+    const contract = ContractNode{
+        .name = "TimeLock",
+        .parent_class = .stateful_smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &methods,
+    };
+    const result = try validate(allocator, contract);
+    defer freeLocktimeResult(allocator, result);
+
+    try testing.expect(!hasLocktimeWarning(result));
+}
+
+test "H2: warns when the locktime read is in a private helper but no sequence guard exists" {
+    const allocator = testing.allocator;
+
+    // private checkDeadline(): assert(extractLocktime(this.txPreimage) >= this.deadline)
+    var lt_args = [_]Expression{.{ .property_access = .{ .object = "this", .property = "txPreimage" } }};
+    var lt_call = types.CallExpr{ .callee = "extractLocktime", .args = &lt_args };
+    var lt_cmp = types.BinaryOp{
+        .op = .gte,
+        .left = .{ .call = &lt_call },
+        .right = .{ .property_access = .{ .object = "this", .property = "deadline" } },
+    };
+    var check_body = [_]Statement{
+        .{ .assert_stmt = .{ .condition = .{ .binary_op = &lt_cmp } } },
+    };
+
+    // public unlock(): this.checkDeadline(); this.count++
+    var check_call = types.MethodCall{ .object = "this", .method = "checkDeadline", .args = &.{} };
+    var inc = types.IncrementExpr{ .operand = .{ .property_access = .{ .object = "this", .property = "count" } }, .prefix = false };
+    var unlock_body = [_]Statement{
+        .{ .expr_stmt = .{ .method_call = &check_call } },
+        .{ .expr_stmt = .{ .increment = &inc } },
+    };
+
+    var methods = [_]MethodNode{
+        .{ .name = "unlock", .is_public = true, .params = &.{}, .body = &unlock_body },
+        .{ .name = "checkDeadline", .is_public = false, .params = &.{}, .body = &check_body },
+    };
+    const props = [_]PropertyNode{
+        makeProperty("count", .bigint, false),
+        makeProperty("deadline", .bigint, true),
+    };
+    var assignments = [_]types.AssignmentNode{ makeAssignment("count"), makeAssignment("deadline") };
+    var super_args = [_]Expression{ .{ .identifier = "count" }, .{ .identifier = "deadline" } };
+    var params = [_]types.ParamNode{ makeParam("count"), makeParam("deadline") };
+    const contract = ContractNode{
+        .name = "TimeLock",
+        .parent_class = .stateful_smart_contract,
+        .properties = @constCast(&props),
+        .constructor = .{ .params = &params, .super_args = &super_args, .assignments = &assignments },
+        .methods = &methods,
+    };
+    const result = try validate(allocator, contract);
+    defer freeLocktimeResult(allocator, result);
+
+    try testing.expect(hasLocktimeWarning(result));
+    const w = locktimeWarning(result).?;
+    // The warning names the public entry point, not the helper.
+    try testing.expect(std.mem.indexOf(u8, w.message, "unlock") != null);
 }

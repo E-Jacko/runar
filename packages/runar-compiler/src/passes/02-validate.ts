@@ -16,6 +16,7 @@ import type {
 } from '../ir/index.js';
 import type { CompilerDiagnostic } from '../errors.js';
 import { makeDiagnostic } from '../errors.js';
+import { validateSighashUsage } from './sighash-validate.js';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -44,6 +45,15 @@ export function validate(contract: ContractNode): ValidationResult {
   validateConstructor(ctx);
   validateMethods(ctx);
   checkNoRecursion(ctx);
+
+  // Issue #123: reject preimage-field reads / output bindings that are unsound
+  // under a method's declared @sighash mode (security core). This pass emits
+  // both errors (unsound usages) and warnings (e.g. an explicit single-output
+  // SINGLE covenant whose same-index value cannot be pinned statically), so
+  // route each diagnostic to the matching bucket.
+  for (const d of validateSighashUsage(contract)) {
+    (d.severity === 'warning' ? warnings : errors).push(d);
+  }
 
   return { errors, warnings };
 }
@@ -363,6 +373,12 @@ function validateMethod(method: MethodNode, ctx: ValidationContext): void {
     warnManualPreimageUsage(method, ctx);
   }
 
+  // #131: warn when a public method gates on extractLocktime but never asserts
+  // the spending tx is non-final (extractSequence < 0xffffffff). Advisory only.
+  if (method.visibility === 'public') {
+    warnLocktimeWithoutSequenceGuard(method, ctx);
+  }
+
   // Gate `asm({...})` calls on UnsafeSmartContract and check the
   // structural args. Walking the body once here keeps the diagnostic
   // close to the call site.
@@ -610,7 +626,10 @@ function validateForStatement(
   // The condition should compare the iter var to a constant
   validateExpression(stmt.condition, ctx);
 
-  // Check that the loop bound is a compile-time constant
+  // Check that the loop bound is a compile-time constant. Non-zero starts and
+  // countdown loops (`i--` with `>`/`>=`) are supported: the ANF loop node
+  // carries an explicit start value and step direction (issue #121), so
+  // lowering binds `iterVar = start + i*step` on each unrolled iteration.
   if (stmt.condition.kind === 'binary_expr') {
     const bound = stmt.condition.right;
     if (!isCompileTimeConstant(bound)) {
@@ -620,28 +639,6 @@ function validateForStatement(
         stmt.sourceLocation,
       ));
     }
-
-    // The ANF loop node carries only an iteration count, so lowering always
-    // iterates i = 0..count-1. Reject the loop shapes that representation
-    // cannot express — a non-zero start or a countdown would otherwise be
-    // silently compiled as a zero-start counting-up loop while the
-    // interpreter runs the true source semantics.
-    if (stmt.condition.op === '>' || stmt.condition.op === '>=') {
-      ctx.errors.push(makeDiagnostic(
-        `For loop condition must count up with '<' or '<=' — countdown loops are not supported; iterate i = 0..N-1 and index backwards instead`,
-        'error',
-        stmt.sourceLocation,
-      ));
-    }
-  }
-
-  const startVal = extractLiteralBigInt(stmt.init.init);
-  if (startVal !== null && startVal !== 0n) {
-    ctx.errors.push(makeDiagnostic(
-      `For loop iterator must start at 0 (got ${startVal}n) — loops compile to i = 0..count-1; offset the iterator inside the body instead`,
-      'error',
-      stmt.sourceLocation,
-    ));
   }
 
   // Validate init
@@ -651,15 +648,6 @@ function validateForStatement(
   for (const s of stmt.body) {
     validateStatement(s, ctx);
   }
-}
-
-function extractLiteralBigInt(expr: Expression): bigint | null {
-  if (expr.kind === 'bigint_literal') return expr.value;
-  if (expr.kind === 'unary_expr' && expr.op === '-') {
-    const inner = extractLiteralBigInt(expr.operand);
-    return inner !== null ? -inner : null;
-  }
-  return null;
 }
 
 function isCompileTimeConstant(expr: Expression): boolean {
@@ -943,6 +931,104 @@ function warnManualPreimageUsage(method: MethodNode, ctx: ValidationContext): vo
       ));
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// #131: locktime soundness — extractLocktime needs an extractSequence guard
+// ---------------------------------------------------------------------------
+
+/** Sentinel maximum nSequence: a tx is FINAL (ignores locktime) at this value. */
+const SEQUENCE_FINAL = 0xffffffffn;
+
+/** True when `expr` is a direct call to the named intrinsic, e.g. `f(...)`. */
+function isCallToNamed(expr: Expression, name: string): boolean {
+  return (
+    expr.kind === 'call_expr' &&
+    expr.callee.kind === 'identifier' &&
+    expr.callee.name === name
+  );
+}
+
+/**
+ * True when `expr` reads the transaction locktime. Both the raw intrinsic
+ * `extractLocktime(preimage)` and its ergonomic sugar `currentBlockHeight()`
+ * (which the ANF pass desugars to `extractLocktime(txPreimage)`) count —
+ * either read is unsound without a sequence-finality guard.
+ */
+function isLocktimeRead(expr: Expression): boolean {
+  return isCallToNamed(expr, 'extractLocktime') || isCallToNamed(expr, 'currentBlockHeight');
+}
+
+/**
+ * True when `expr` is an `extractSequence(...) < <final>`-style comparison
+ * (the guard that makes a locktime gate consensus-enforced). Accepts the two
+ * natural spellings: `extractSequence(pre) < N` / `<= N`, and the reversed
+ * `N > extractSequence(pre)` / `>= ...`. `N` must be a bigint literal no
+ * greater than the finality sentinel, so the guard genuinely forces
+ * non-finality.
+ */
+function isSequenceFinalityGuard(expr: Expression): boolean {
+  if (expr.kind !== 'binary_expr') return false;
+  const boundOk = (e: Expression): boolean =>
+    e.kind === 'bigint_literal' && e.value <= SEQUENCE_FINAL;
+  if ((expr.op === '<' || expr.op === '<=') &&
+      isCallToNamed(expr.left, 'extractSequence') && boundOk(expr.right)) {
+    return true;
+  }
+  if ((expr.op === '>' || expr.op === '>=') &&
+      isCallToNamed(expr.right, 'extractSequence') && boundOk(expr.left)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * #131: warn when `method` (transitively, through the private-helper call
+ * graph) reads the tx locktime but never asserts the tx is non-final. A
+ * locktime gate is not consensus-enforced unless `extractSequence < 0xffffffff`
+ * is also asserted — otherwise an all-final-sequence spend bypasses it.
+ * Advisory (warning) only — no effect on emitted bytecode.
+ */
+function warnLocktimeWithoutSequenceGuard(method: MethodNode, ctx: ValidationContext): void {
+  const privateMethods = new Map(
+    ctx.contract.methods
+      .filter(m => m.visibility === 'private')
+      .map(m => [m.name, m] as const),
+  );
+
+  let readsLocktime = false;
+  let hasSequenceGuard = false;
+  const visited = new Set<string>([method.name]);
+  const queue: MethodNode[] = [method];
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    walkExpressionsInBody(current.body, (expr) => {
+      if (isLocktimeRead(expr)) readsLocktime = true;
+      if (isSequenceFinalityGuard(expr)) hasSequenceGuard = true;
+    });
+    // Follow calls into private helpers so a guard (or locktime read) supplied
+    // by an inlined helper is seen by the public entry point.
+    const calls = new Set<string>();
+    collectMethodCalls(current.body, calls);
+    for (const callee of calls) {
+      if (!visited.has(callee) && privateMethods.has(callee)) {
+        visited.add(callee);
+        queue.push(privateMethods.get(callee)!);
+      }
+    }
+  }
+
+  if (readsLocktime && !hasSequenceGuard) {
+    ctx.warnings.push(makeDiagnostic(
+      `method '${method.name}' reads extractLocktime but does not assert ` +
+        `extractSequence < 0xffffffff; a locktime gate is not consensus-enforced ` +
+        `unless the tx is non-final — add ` +
+        `assert(extractSequence(this.txPreimage) < 0xffffffffn)`,
+      'warning',
+      method.sourceLocation,
+    ));
+  }
 }
 
 function walkExpressionsInBody(

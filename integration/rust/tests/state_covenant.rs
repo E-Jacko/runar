@@ -143,6 +143,7 @@ fn deploy_state_covenant() -> (RunarContract, Box<dyn runar_lang::sdk::Signer>, 
             &DeployOptions {
                 satoshis: 10000,
                 change_address: None,
+                ..Default::default()
             },
         )
         .expect("deploy failed");

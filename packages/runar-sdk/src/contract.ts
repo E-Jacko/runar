@@ -10,14 +10,36 @@ import type { Signer } from './signers/signer.js';
 import type { TransactionData, UTXO, DeployOptions, CallOptions, PreparedCall } from './types.js';
 import type { Inscription } from './ordinals/types.js';
 import { buildDeployTransaction, selectUtxos } from './deployment.js';
-import { buildCallTransaction } from './calling.js';
+import { buildCallTransaction, resolveInputSequence } from './calling.js';
 import { serializeState, extractStateFromScript, findLastOpReturn } from './state.js';
 import { computeOpPushTx } from './oppushtx.js';
-import { buildP2PKHScript } from './script-utils.js';
+import { buildP2PKHScript, extractConstructorArgs } from './script-utils.js';
 import { computeNewStateAndDataOutputs } from './anf-interpreter.js';
 import { buildInscriptionEnvelope, parseInscriptionEnvelope } from './ordinals/envelope.js';
 import { Utils, Hash, Transaction as BsvTransaction, LockingScript, UnlockingScript } from '@bsv/sdk';
 import { WalletProvider } from './providers/wallet-provider.js';
+
+/**
+ * Producer-side marker (issue #106) for the deliberately-empty branch of an
+ * OR-CHECKSIG method — `checkSig(sigA, pkA) || checkSig(sigB, pkB)`, where
+ * `||` lowers to the non-lazy `OP_BOOLOR` so BOTH `OP_CHECKSIG`s run. Only the
+ * matching branch supplies a real signature; the failing branch MUST push an
+ * empty signature (OP_0) or BIP146 NULLFAIL rejects the whole spend.
+ *
+ * Pass `EMPTY_SIG` as the call arg for the non-matching `Sig` slot: the SDK
+ * pushes OP_0 for it and never signs it, distinct from `null` (auto-sign) and
+ * an explicit hex-bytes value. Coexists with `null` at the same call —
+ * `call('execute', [null, EMPTY_SIG])` signs only slot 0.
+ *
+ * Uses the global symbol registry so identity holds across duplicate module
+ * instances (bundlers).
+ */
+export const EMPTY_SIG: unique symbol = Symbol.for('runar.sdk.emptySig');
+
+/** Type guard: is this call arg the {@link EMPTY_SIG} marker (issue #106)? */
+export function isEmptySig(value: unknown): value is typeof EMPTY_SIG {
+  return value === EMPTY_SIG;
+}
 
 /**
  * Invalidate the @bsv/sdk Transaction's serialization caches after
@@ -322,12 +344,15 @@ export class RunarContract {
       feeRate,
     );
 
-    // Sign all inputs — need unsigned hex for signer
+    // Sign all inputs — need unsigned hex for signer. Funding inputs are
+    // signed by fundingSigner when set (issue #134): the deploy signer may not
+    // own the funding coins. Defaults to the connected signer.
+    const fundingSigner = options.fundingSigner ?? signer;
     const unsignedHex = tx.toHex();
     for (let i = 0; i < inputCount; i++) {
       const utxo = utxos[i]!;
-      const sig = await signer.sign(unsignedHex, i, utxo.script, utxo.satoshis);
-      const pubKey = await signer.getPublicKey();
+      const sig = await fundingSigner.sign(unsignedHex, i, utxo.script, utxo.satoshis);
+      const pubKey = await fundingSigner.getPublicKey();
       // Build P2PKH unlocking script: <sig> <pubkey>
       const unlockScript = encodePushData(sig) + encodePushData(pubKey);
       tx.inputs[i]!.unlockingScript = UnlockingScript.fromHex(unlockScript);
@@ -561,6 +586,9 @@ export class RunarContract {
     options?: CallOptions,
   ): Promise<PreparedCall> {
     const { provider, signer } = this.resolveProviderSigner();
+    // Funding (and terminal fee) inputs are signed by fundingSigner when set
+    // (issue #134). The method's own Sig args stay with the connected signer.
+    const fundingSigner = options?.fundingSigner ?? signer;
 
     const method = this.findMethod(methodName);
     if (!method) {
@@ -654,6 +682,24 @@ export class RunarContract {
         const estimatedInputs = 1 + (options?.additionalContractInputs?.length ?? 0) + 1;
         resolvedArgs[i] = '00'.repeat(36 * estimatedInputs);
       }
+      // EMPTY_SIG (issue #106) is intentionally NOT handled here: it is not
+      // `null`, so it is never added to `sigIndices` and never signed. It stays
+      // in `resolvedArgs` and `encodeArg` emits OP_0 (empty sig) for it.
+    }
+
+    // Soft heuristic (issue #106): more than one auto-signed Sig slot usually
+    // means an OR-CHECKSIG method whose non-matching branch should use
+    // EMPTY_SIG instead — otherwise every branch gets the same real signature
+    // and the failing CHECKSIG trips BIP146 NULLFAIL on broadcast. Legitimate
+    // AND-CHECKSIG multi-signer flows also use multiple auto slots, so this is
+    // informational only (the ABI does not encode OR-vs-AND topology).
+    if (sigIndices.length >= 2) {
+      console.warn(
+        `runar-sdk: ${this.artifact.contractName}.call('${methodName}') has ` +
+          `${sigIndices.length} auto-signed Sig slots. If this is an OR-CHECKSIG ` +
+          `method, pass EMPTY_SIG for the non-matching branch(es) to satisfy ` +
+          `BIP146 NULLFAIL (issue #106).`,
+      );
     }
 
     const needsOpPushTx = preimageIndex >= 0 || isStateful;
@@ -706,6 +752,11 @@ export class RunarContract {
       // `buildUnlock` below which inserts witnessHex in the correct ABI slot).
       termUnlockScript += witnessHex;
 
+      // Sequence (issue #131): all-final inputs make nLockTime a consensus
+      // no-op — when a non-zero locktime is set, default to 0xfffffffe so the
+      // terminal method's extractLocktime assertion is actually enforced.
+      const termSequence = resolveInputSequence(options?.locktime, options?.sequence);
+
       const buildTerminalTx = (unlock: string): BsvTransaction => {
         const ttx = new BsvTransaction();
         // Terminal calls (auction close/claim/withdraw) typically assert
@@ -716,8 +767,21 @@ export class RunarContract {
           sourceTXID: contractUtxo.txid,
           sourceOutputIndex: contractUtxo.outputIndex,
           unlockingScript: UnlockingScript.fromHex(unlock),
-          sequence: 0xffffffff,
+          sequence: termSequence,
         });
+        // Fee input (issue #118): a plain P2PKH input added BEFORE the
+        // OP_PUSH_TX preimage is computed so hashPrevouts covers it. Consumed
+        // entirely as fee (no change output) — the covenant's terminal output
+        // assertions are untouched; only the input side grows. Its P2PKH sig is
+        // filled in after the tx structure is final (below).
+        if (options?.feeUtxo) {
+          ttx.addInput({
+            sourceTXID: options.feeUtxo.txid,
+            sourceOutputIndex: options.feeUtxo.outputIndex,
+            unlockingScript: new UnlockingScript(),
+            sequence: termSequence,
+          });
+        }
         for (const out of terminalOutputs) {
           ttx.addOutput({
             satoshis: out.satoshis,
@@ -789,6 +853,55 @@ export class RunarContract {
         invalidateTxCache(termTx);
         if (!finalPreimage && needsOpPushTx) {
           finalPreimage = resolvedArgs[preimageIndex] as string;
+        }
+      }
+
+      // Sign the fee input (issue #118). Its BIP-143 P2PKH sighash covers only
+      // hashPrevouts / hashOutputs / its own outpoint — NOT input 0's scriptSig
+      // — so it stays valid even after finalizeCall rewrites input 0. Owned by
+      // fundingSigner ?? signer (composes with #134). The fee input sits at
+      // index 1 (right after the primary contract input).
+      if (options?.feeUtxo) {
+        const feeInputIdx = 1;
+        const feeTxHex = termTx.toHex();
+        const feeSig = await fundingSigner.sign(
+          feeTxHex, feeInputIdx, options.feeUtxo.script, options.feeUtxo.satoshis,
+        );
+        const feePubKey = await fundingSigner.getPublicKey();
+        termTx.inputs[feeInputIdx]!.unlockingScript = UnlockingScript.fromHex(
+          encodePushData(feeSig) + encodePushData(feePubKey),
+        );
+        invalidateTxCache(termTx);
+
+        // #118: a feeUtxo is consumed ENTIRELY as fee — there is no change
+        // output, because the covenant binds the exact terminal output set.
+        // An oversized feeUtxo therefore silently BURNS the excess. Warn (but
+        // never block) when it dwarfs the terminal tx's estimated fee.
+        // Heuristic: excess is burned if the feeUtxo is > 5x the estimated fee
+        // AND at least ~1000 sats of excess would be burned (an absolute floor
+        // so a slightly-generous fee on a tiny tx does not nag). Best-effort:
+        // any failure fetching the fee rate skips the advisory silently.
+        try {
+          const feeRate = await provider.getFeeRate(); // sat/KB
+          const termTxSizeBytes = termTx.toHex().length / 2;
+          const estimatedFee = Math.max(1, Math.ceil((termTxSizeBytes * feeRate) / 1000));
+          const excess = options.feeUtxo.satoshis - estimatedFee;
+          const OVERSIZE_FEE_MULTIPLE = 5;
+          const OVERSIZE_MIN_EXCESS_SATS = 1000;
+          if (
+            options.feeUtxo.satoshis > estimatedFee * OVERSIZE_FEE_MULTIPLE &&
+            excess > OVERSIZE_MIN_EXCESS_SATS
+          ) {
+            console.warn(
+              `runar-sdk: ${this.artifact.contractName}.call('${methodName}'): feeUtxo is ` +
+                `${options.feeUtxo.satoshis} sats but the terminal tx needs only ~${estimatedFee} sats ` +
+                `of fee. A feeUtxo is consumed ENTIRELY as fee (no change output — the covenant binds ` +
+                `the exact terminal outputs), so ~${excess} sats will be BURNED. Size the feeUtxo close ` +
+                `to the intended fee (issue #118).`,
+            );
+          }
+        } catch {
+          // Advisory only — never fail a call because the fee-rate lookup threw.
         }
       }
 
@@ -917,9 +1030,46 @@ export class RunarContract {
     const feeRate = await provider.getFeeRate();
     const changeScript = buildP2PKHScript(changeAddress);
     const allFundingUtxos = await provider.getUtxos(address);
-    const additionalUtxos = allFundingUtxos.filter(
+    const candidateFundingUtxos = allFundingUtxos.filter(
       (u) => !(u.txid === this.currentUtxo!.txid && u.outputIndex === this.currentUtxo!.outputIndex),
     );
+
+    // Coin selection for funding inputs (issue #133): don't sweep the whole
+    // wallet. Compute how much the funding must cover — the contract's own
+    // input value already offsets the contract/data outputs — and pick the
+    // smallest largest-first set via selectUtxos (the strategy deploy uses).
+    const contractOutputSats =
+      (contractOutputs
+        ? contractOutputs.reduce((sum, o) => sum + o.satoshis, 0)
+        : (newSatoshis ?? 0))
+      + resolvedDataOutputs.reduce((sum, o) => sum + o.satoshis, 0);
+    const contractInputSats =
+      this.currentUtxo.satoshis
+      + extraContractUtxos.reduce((sum, u) => sum + u.satoshis, 0);
+    const fundingTarget = Math.max(0, contractOutputSats - contractInputSats);
+    // Fee sizing hint for selectUtxos: the continuation script length (falls
+    // back to the first multi-output script, else 0 for stateless calls).
+    const fundingLockLen =
+      (newLockingScript?.length ?? contractOutputs?.[0]?.script.length ?? 0) / 2;
+    const additionalUtxos =
+      candidateFundingUtxos.length > 0
+        ? selectUtxos(candidateFundingUtxos, fundingTarget, fundingLockLen, feeRate)
+        : [];
+
+    // Cap funding inputs when the caller sets maxFundingInputs. selectUtxos
+    // returns the minimal largest-first set; if that still exceeds the cap the
+    // funding can't cover outputs + fee within the budget, so fail loudly
+    // instead of broadcasting an underfunded tx.
+    if (
+      options?.maxFundingInputs !== undefined &&
+      additionalUtxos.length > options.maxFundingInputs
+    ) {
+      throw new Error(
+        `RunarContract.call(${methodName}): funding requires ${additionalUtxos.length} input(s) ` +
+          `but maxFundingInputs=${options.maxFundingInputs}. Increase maxFundingInputs, ` +
+          `use larger UTXOs, or consolidate.`,
+      );
+    }
 
     // Resolve per-input args for additional contract inputs
     const resolvedPerInputArgs: unknown[][] | undefined = options?.additionalContractInputArgs
@@ -966,17 +1116,20 @@ export class RunarContract {
         // Thread CallOptions.locktime so contracts asserting
         // extractLocktime(preimage) can succeed. Default unset → 0.
         locktime: options?.locktime,
+        // Thread CallOptions.sequence (issue #131): a non-zero locktime needs
+        // non-final input sequences or consensus ignores nLockTime.
+        sequence: options?.sequence,
       },
     );
 
-    // Sign P2PKH funding inputs
+    // Sign P2PKH funding inputs (with fundingSigner — issue #134)
     let txHex = tx.toHex();
     const p2pkhStartIdx = 1 + extraContractUtxos.length;
     for (let i = p2pkhStartIdx; i < inputCount; i++) {
       const utxo = additionalUtxos[i - p2pkhStartIdx];
       if (utxo) {
-        const sig = await signer.sign(txHex, i, utxo.script, utxo.satoshis);
-        const pubKey = await signer.getPublicKey();
+        const sig = await fundingSigner.sign(txHex, i, utxo.script, utxo.satoshis);
+        const pubKey = await fundingSigner.getPublicKey();
         const unlockScript = encodePushData(sig) + encodePushData(pubKey);
         tx.inputs[i]!.unlockingScript = UnlockingScript.fromHex(unlockScript);
         invalidateTxCache(tx);
@@ -1068,6 +1221,9 @@ export class RunarContract {
           // Rebuild path must honor the override too: a preimage computed on a
           // rebuilt tx with locktime 0 would mismatch the final on-chain tx.
           locktime: options?.locktime,
+          // Same for sequence — the second-pass preimage must see the final
+          // input sequences (issue #131).
+          sequence: options?.sequence,
         },
       ));
 
@@ -1089,13 +1245,13 @@ export class RunarContract {
         invalidateTxCache(tx);
       }
 
-      // Re-sign P2PKH funding inputs
+      // Re-sign P2PKH funding inputs (with fundingSigner — issue #134)
       txHex = tx.toHex();
       for (let i = p2pkhStartIdx; i < inputCount; i++) {
         const utxo = additionalUtxos[i - p2pkhStartIdx];
         if (utxo) {
-          const sig = await signer.sign(txHex, i, utxo.script, utxo.satoshis);
-          const pubKey = await signer.getPublicKey();
+          const sig = await fundingSigner.sign(txHex, i, utxo.script, utxo.satoshis);
+          const pubKey = await fundingSigner.getPublicKey();
           const unlockScript = encodePushData(sig) + encodePushData(pubKey);
           tx.inputs[i]!.unlockingScript = UnlockingScript.fromHex(unlockScript);
           invalidateTxCache(tx);
@@ -1637,6 +1793,14 @@ export class RunarContract {
    * byte offset. Uses codeSeparatorIndices[methodIndex] if available, otherwise
    * falls back to the single codeSeparatorIndex.
    *
+   * When `_codeScript` is set (chain-loaded, or a deploy script already built
+   * from real constructor args), byte-walk the actual script for the true
+   * on-chain OP_CODESEPARATOR offset — mirroring `getSubscriptForSigning`.
+   * `adjustCodeSepOffset` derives the shift from the in-memory
+   * `constructorArgs`, which are placeholders on the restore path (issue #132);
+   * the byte-walk is independent of those args. The template `adjustCodeSepOffset`
+   * path remains only for template-built (deploy-time) contracts.
+   *
    * Public low-level assembly surface: each covenant input of a
    * multi-contract tx needs its own OP_PUSH_TX signature + BIP-143 preimage
    * computed against ITS artifact's code separator layout.
@@ -1648,17 +1812,45 @@ export class RunarContract {
     satoshis: number,
     methodIndex?: number,
   ): { sigHex: string; preimageHex: string } {
-    let codeSepIdx = this.artifact.codeSeparatorIndex;
-    const indices = this.artifact.codeSeparatorIndices;
-    if (indices && methodIndex !== undefined && methodIndex < indices.length) {
-      codeSepIdx = indices[methodIndex];
+    let codeSepIdx: number | undefined;
+
+    if (this._codeScript !== null) {
+      const realOffsets = findCodesepOffsets(this._codeScript);
+      if (realOffsets.length > 0) {
+        const indices = this.artifact.codeSeparatorIndices;
+        if (indices && methodIndex !== undefined && methodIndex < indices.length
+            && methodIndex < realOffsets.length) {
+          codeSepIdx = realOffsets[methodIndex];
+        } else if (this.artifact.codeSeparatorIndex !== undefined) {
+          codeSepIdx = realOffsets[0];
+        }
+      }
     }
-    if (codeSepIdx !== undefined) {
-      codeSepIdx = this.adjustCodeSepOffset(codeSepIdx);
+
+    if (codeSepIdx === undefined) {
+      // Template (deploy-time) path: derive the shifted offset from the args.
+      codeSepIdx = this.artifact.codeSeparatorIndex;
+      const indices = this.artifact.codeSeparatorIndices;
+      if (indices && methodIndex !== undefined && methodIndex < indices.length) {
+        codeSepIdx = indices[methodIndex];
+      }
+      if (codeSepIdx !== undefined) {
+        codeSepIdx = this.adjustCodeSepOffset(codeSepIdx);
+      }
     }
+
+    // Issue #123: build the preimage under the method's declared @sighash mode.
+    // `methodIndex` indexes the public-methods list (same convention as the
+    // codeSeparatorIndices lookup above); a method with no directive carries no
+    // `sigHashType` and falls back to 0x41 (ALL|FORKID), unchanged behaviour.
+    const publicMethods = this.artifact.abi.methods.filter((m) => m.isPublic);
+    const sigHashType =
+      (methodIndex !== undefined ? publicMethods[methodIndex]?.sigHashType : undefined) ?? 0x41;
+
     return computeOpPushTx(
       tx, inputIndex, subscript, satoshis,
       codeSepIdx,
+      sigHashType,
     );
   }
 
@@ -1703,7 +1895,7 @@ export class RunarContract {
   ): RunarContract {
     const contract = new RunarContract(
       artifact,
-      new Array(artifact.abi.constructor.params.length).fill(0n) as unknown[],
+      restoreConstructorArgs(artifact, utxo.script),
     );
 
     if (artifact.stateFields && artifact.stateFields.length > 0) {
@@ -2024,6 +2216,30 @@ function flattenFixedArrayArgs(
 }
 
 /**
+ * Recover the positional constructor argument list from a deployed locking
+ * script, so a restored contract (`fromUtxo` / `fromTxId`) operates on the real
+ * baked-in values rather than `0n` placeholders.
+ *
+ * `extractConstructorArgs` returns a name→value map keyed by ABI param name;
+ * `abi.constructor.params` is already ordered by paramIndex, so mapping over it
+ * yields the positional `unknown[]` the `RunarContract` constructor expects.
+ *
+ * Params that carry no constructor slot (mutable state fields — their value
+ * lives in the OP_RETURN state section, restored separately) are absent from
+ * the extracted map; they fall back to `0n`, matching the prior placeholder
+ * behaviour, and are immediately overwritten by `extractStateFromScript`.
+ *
+ * FixedArray constructor params are rejected by the compiler ("Constructor
+ * parameter cannot be a FixedArray"), so no FixedArray grouping arises here.
+ */
+function restoreConstructorArgs(artifact: RunarArtifact, scriptHex: string): unknown[] {
+  const params = artifact.abi.constructor.params;
+  if (params.length === 0) return [];
+  const extracted = extractConstructorArgs(artifact, scriptHex);
+  return params.map((p) => (Object.prototype.hasOwnProperty.call(extracted, p.name) ? extracted[p.name] : 0n));
+}
+
+/**
  * Build a named argument map from positional args and user-visible params.
  * Used to feed the ANF interpreter for auto-state computation.
  */
@@ -2051,6 +2267,9 @@ function buildNamedArgs(
  * byte-identically to `buildUnlockingScript` — share this, don't copy it.
  */
 export function encodeArg(value: unknown): string {
+  if (isEmptySig(value)) {
+    return '00'; // OP_0 — empty signature push for the failing OR-CHECKSIG branch (issue #106)
+  }
   if (typeof value === 'bigint') {
     return encodeScriptNumber(value);
   }

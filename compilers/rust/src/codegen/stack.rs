@@ -425,7 +425,7 @@ fn collect_refs(value: &ANFValue) -> Vec<String> {
         ANFValue::UpdateProp { value, .. } => {
             refs.push(value.clone());
         }
-        ANFValue::CheckPreimage { preimage } => {
+        ANFValue::CheckPreimage { preimage, .. } => {
             refs.push(preimage.clone());
         }
         ANFValue::DeserializeState { preimage } => {
@@ -485,6 +485,12 @@ struct LoweringContext {
     array_lengths: HashMap<String, usize>,
     /// Element refs for array_literal bindings (used by checkMultiSig).
     array_elements: HashMap<String, Vec<String>>,
+    /// Method params whose names collide with a MUTABLE property. Maps the
+    /// param name to the reserved stack-slot name its witness value lives
+    /// under, so `lower_load_param` reads the param and not the same-named
+    /// deserialized property slot (issue #130). Empty for the common
+    /// no-collision case, so all other contracts are byte-identical.
+    renamed_params: HashMap<String, String>,
 }
 
 impl LoweringContext {
@@ -503,7 +509,35 @@ impl LoweringContext {
             const_values: HashMap::new(),
             array_lengths: HashMap::new(),
             array_elements: HashMap::new(),
+            renamed_params: HashMap::new(),
         };
+
+        // Issue #130 (stack layer): a method param whose name collides with a
+        // MUTABLE property gets a duplicate stackMap slot once
+        // `deserialize_state` pushes that property under the same name. Name
+        // lookups resolve to the shallowest match (the deserialized property),
+        // so `load_param` would read the stale on-chain state instead of the
+        // witness value. Rename the colliding param's slot to a reserved,
+        // collision-proof name up front and remember the mapping so
+        // `lower_load_param` targets the real param slot. Only mutable
+        // properties are deserialized onto the stack, so readonly shadows
+        // (handled purely by ANF resolution) never enter this map, and
+        // non-colliding contracts get an empty map — byte-identical output.
+        let mutable_prop_names: HashSet<&str> = properties
+            .iter()
+            .filter(|p| !p.readonly)
+            .map(|p| p.name.as_str())
+            .collect();
+        for name in params {
+            if mutable_prop_names.contains(name.as_str()) {
+                if let Some(depth) = ctx.sm.find_depth(name) {
+                    let renamed = format!("__param_{}", name);
+                    ctx.sm.rename_at_depth(depth, &renamed);
+                    ctx.renamed_params.insert(name.clone(), renamed);
+                }
+            }
+        }
+
         ctx.track_depth();
         ctx
     }
@@ -1067,8 +1101,10 @@ impl LoweringContext {
                 count,
                 body,
                 iter_var,
+                start,
+                step,
             } => {
-                self.lower_loop(name, *count, body, iter_var, Some(binding_index), Some(last_uses));
+                self.lower_loop(name, *count, body, iter_var, start, *step, Some(binding_index), Some(last_uses));
             }
             ANFValue::Assert { value, .. } => {
                 self.lower_assert(value, binding_index, last_uses, false);
@@ -1082,8 +1118,8 @@ impl LoweringContext {
             ANFValue::GetStateScript {} => {
                 self.lower_get_state_script(name);
             }
-            ANFValue::CheckPreimage { preimage } => {
-                self.lower_check_preimage(name, preimage, binding_index, last_uses);
+            ANFValue::CheckPreimage { preimage, sighash_flag } => {
+                self.lower_check_preimage(name, preimage, *sighash_flag, binding_index, last_uses);
             }
             ANFValue::DeserializeState { preimage } => {
                 self.lower_deserialize_state(preimage, binding_index, last_uses);
@@ -1119,9 +1155,18 @@ impl LoweringContext {
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
-        if self.sm.has(param_name) {
+        // The parameter is on the stack under its original name — or, for a
+        // param that shadows a mutable property, under a reserved renamed slot
+        // (issue #130) so it is not confused with the deserialized property
+        // slot.
+        let slot_name = self
+            .renamed_params
+            .get(param_name)
+            .cloned()
+            .unwrap_or_else(|| param_name.to_string());
+        if self.sm.has(&slot_name) {
             let is_last = self.is_last_use(param_name, binding_index, last_uses);
-            self.bring_to_top(param_name, is_last);
+            self.bring_to_top(&slot_name, is_last);
             self.sm.pop();
             self.sm.push(binding_name);
         } else {
@@ -1155,31 +1200,68 @@ impl LoweringContext {
             } else {
                 // Property value will be provided at deployment time; emit a placeholder.
                 // The emitter records byte offsets so the SDK can splice in real values.
-                let param_index = self
-                    .properties
-                    .iter()
-                    .filter(|p| p.initial_value.is_none())
-                    .position(|p| p.name == prop_name)
-                    .unwrap_or(0);
+                let param_index = self.ctor_param_index_or_panic(prop_name);
                 self.emit_op(StackOp::Placeholder {
                     param_index,
                     param_name: prop_name.to_string(),
                 });
             }
         } else {
-            // Property not found and not on stack — emit placeholder with index 0.
-            let param_index = self
-                .properties
-                .iter()
-                .filter(|p| p.initial_value.is_none())
-                .position(|p| p.name == prop_name)
-                .unwrap_or(0);
+            // Property not found and not on stack — must still be a real
+            // constructor-param slot, otherwise there is nothing to splice.
+            let param_index = self.ctor_param_index_or_panic(prop_name);
             self.emit_op(StackOp::Placeholder {
                 param_index,
                 param_name: prop_name.to_string(),
             });
         }
         self.sm.push(binding_name);
+    }
+
+    /// Resolve `prop_name`'s constructor slot for a placeholder, or fail loudly.
+    ///
+    /// #119 tail (H1): a property that reaches the placeholder fallback with no
+    /// matching constructor slot has no deploy-time bytes of its own. The
+    /// previous behaviour coerced it onto slot 0 (`.unwrap_or(0)`), silently
+    /// splicing an UNRELATED constructor argument's placeholder into the
+    /// locking script — a silent-wrong-code path. Fail loudly instead. (A real
+    /// constructor-param property — readonly, or a mutable state field whose
+    /// initial value is spliced at deploy — is found by `position` and is
+    /// unaffected: zero golden churn.)
+    fn ctor_param_index_or_panic(&self, prop_name: &str) -> usize {
+        // Initialized properties are excluded from the constructor, so only
+        // uninitialized (deploy-time) properties own a constructor slot.
+        match self
+            .properties
+            .iter()
+            .filter(|p| p.initial_value.is_none())
+            .position(|p| p.name == prop_name)
+        {
+            Some(idx) => idx,
+            None => {
+                let loc = self
+                    .current_source_loc
+                    .as_ref()
+                    .map(|l| format!(" at {}:{}:{}", l.file, l.line, l.column))
+                    .unwrap_or_default();
+                let ctor_props: Vec<&str> = self
+                    .properties
+                    .iter()
+                    .filter(|p| p.initial_value.is_none())
+                    .map(|p| p.name.as_str())
+                    .collect();
+                panic!(
+                    "Stack lowering: property '{}'{} is neither on the stack, \
+                     initialized, nor a constructor parameter, so it has no \
+                     deploy-time slot. Refusing to emit a placeholder for an \
+                     unrelated constructor argument (slot 0). Known \
+                     constructor-param properties: [{}].",
+                    prop_name,
+                    loc,
+                    ctor_props.join(", ")
+                );
+            }
+        }
     }
 
     fn push_json_value(&mut self, val: &serde_json::Value) {
@@ -2032,9 +2114,19 @@ impl LoweringContext {
         count: usize,
         body: &[ANFBinding],
         iter_var: &str,
+        start: &serde_json::Value,
+        step: i64,
         loop_binding_index: Option<usize>,
         enclosing_last_uses: Option<&HashMap<String, usize>>,
     ) {
+        // Iteration `i` binds `iterVar = start + i*step` (issue #121).
+        // Zero-start counting-up loops (start=0, step=1) reduce to `BigInt(i)`,
+        // preserving the historical byte-for-byte lowering.
+        let start_bigint = match crate::ir::parse_const_value(start) {
+            Some(ConstValue::Int(n)) => n,
+            _ => BigInt::from(0),
+        };
+        let step_bigint = BigInt::from(step);
         // Names (re)defined anywhere inside the loop body, nested branches
         // included. A name the body itself binds is NOT an outer ref —
         // reassigned locals (e.g. `off = off + ...` inside an if) flow through
@@ -2064,7 +2156,9 @@ impl LoweringContext {
         self.local_bindings = self.local_bindings.union(&body_binding_names).cloned().collect();
 
         for i in 0..count {
-            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(i as i128))));
+            // Push the iteration variable value: start + i*step (issue #121).
+            let iter_val = &start_bigint + BigInt::from(i as i128) * &step_bigint;
+            self.emit_op(StackOp::Push(PushValue::Int(iter_val)));
             self.sm.push(iter_var);
 
             let mut last_uses = compute_last_uses(body);
@@ -2784,6 +2878,7 @@ impl LoweringContext {
         &mut self,
         binding_name: &str,
         preimage: &str,
+        sighash_flag: Option<i64>,
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
@@ -2803,9 +2898,12 @@ impl LoweringContext {
         let is_last = self.is_last_use(preimage, binding_index, last_uses);
         self.bring_to_top(preimage, is_last);
 
-        // Derive + verify the signature on-chain (single opaque raw_bytes blob,
-        // byte-identical across all 7 tiers). Net stack effect is zero.
-        self.emit_check_preimage_binding();
+        // Derive + verify the signature on-chain (single opaque raw_bytes blob).
+        // For the default ALL|FORKID (sighash_flag None) the blob is
+        // byte-identical to the pinned cross-tier constant; issue #123 lets a
+        // method declare a different mode, which only changes the appended
+        // sighash flag byte. Net stack effect is zero.
+        self.emit_check_preimage_binding(sighash_flag);
 
         // The preimage is now on top. Rename to binding name so field extractors
         // can reference it.
@@ -2819,9 +2917,9 @@ impl LoweringContext {
     /// effect is 0 (preimage in → preimage out), declared as in=1/out=1 so the
     /// static analyzer keeps the depth consistent. The stack tracker is updated
     /// by the caller (`lower_check_preimage`), mirroring the Go reference.
-    fn emit_check_preimage_binding(&mut self) {
+    fn emit_check_preimage_binding(&mut self, sighash_flag: Option<i64>) {
         self.emit_op(StackOp::RawBytes {
-            bytes: super::oppushtx::check_preimage_binding_bytes(),
+            bytes: super::oppushtx::check_preimage_binding_bytes_with_flag(sighash_flag),
             in_arity: 1,
             out_arity: 1,
         });
@@ -4955,6 +5053,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         }
     }
@@ -5156,6 +5255,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5261,6 +5361,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5335,6 +5436,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5386,6 +5488,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5443,6 +5546,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5509,6 +5613,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5560,6 +5665,8 @@ mod tests {
                         name: "t_loop".to_string(),
                         value: ANFValue::Loop {
                             count: 3,
+                            start: serde_json::json!(0),
+                            step: 1,
                             body: vec![
                                 // Body uses x but not iter var __i, and asserts consume
                                 ANFBinding {
@@ -5591,6 +5698,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5709,6 +5817,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5790,6 +5899,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5860,6 +5970,7 @@ mod tests {
                     params: vec![],
                     body: vec![],
                     is_public: false,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "method1".to_string(),
@@ -5897,6 +6008,7 @@ mod tests {
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "method2".to_string(),
@@ -5934,6 +6046,7 @@ mod tests {
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
             ],
         };
@@ -5985,6 +6098,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -6073,6 +6187,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -6198,6 +6313,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -6270,6 +6386,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 

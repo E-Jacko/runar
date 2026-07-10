@@ -17,6 +17,11 @@ export {
 } from './generator.js';
 export type { GeneratorConfig } from './generator.js';
 
+// Tri-modal execution-oracle generator (issue #124): loops + byte-ops +
+// post-loop param reads, with concrete inputs for fast-check property shrinking.
+export { arbExecCase } from './generator.js';
+export type { ExecCase, ExecArg } from './generator.js';
+
 // Contract IR types
 export type {
   GeneratedContract,

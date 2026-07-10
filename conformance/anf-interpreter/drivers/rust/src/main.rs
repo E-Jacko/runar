@@ -364,6 +364,10 @@ fn encode_sdk_value(v: &SdkValue) -> Value {
         SdkValue::Bool(b) => Value::Bool(*b),
         SdkValue::Bytes(s) => Value::String(s.clone()),
         SdkValue::Auto => Value::Null,
+        // EmptySig (#106) is an OR-CHECKSIG empty-branch marker; like Auto it is a
+        // signature-slot marker that never feeds state/data-output computation, so it
+        // re-encodes to null (matching the Rust SDK's ANF interpreter, which maps it to Undefined).
+        SdkValue::EmptySig => Value::Null,
         SdkValue::Array(arr) => Value::Array(arr.iter().map(encode_sdk_value).collect()),
     }
 }

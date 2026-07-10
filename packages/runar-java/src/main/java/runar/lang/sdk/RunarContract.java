@@ -19,6 +19,28 @@ import runar.lang.sdk.RunarArtifact.StateField;
  */
 public final class RunarContract {
 
+    /**
+     * Producer-side marker (issue #106) for the deliberately-empty branch of an
+     * OR-CHECKSIG method — {@code checkSig(sigA, pkA) || checkSig(sigB, pkB)},
+     * where {@code ||} lowers to the non-lazy {@code OP_BOOLOR} so BOTH
+     * {@code OP_CHECKSIG}s run. Only the matching branch supplies a real
+     * signature; the failing branch MUST push an empty signature (OP_0) or
+     * BIP146 NULLFAIL rejects the whole spend.
+     *
+     * <p>Pass {@code EMPTY_SIG} as the call arg for the non-matching {@code Sig}
+     * slot: the SDK pushes OP_0 for it and never signs it — distinct from
+     * {@code null} (auto-sign) and an explicit hex-bytes value. Coexists with
+     * {@code null} at the same call: {@code call("execute", List.of(NULL,
+     * EMPTY_SIG))} signs only slot 0. ({@code null} entries must be added to the
+     * arg list explicitly, e.g. via a mutable list.)
+     */
+    public static final Object EMPTY_SIG = new Object();
+
+    /** Type guard: is this call arg the {@link #EMPTY_SIG} marker (issue #106)? */
+    public static boolean isEmptySig(Object value) {
+        return value == EMPTY_SIG;
+    }
+
     private final RunarArtifact artifact;
     private final List<Object> constructorArgs;
     private final Map<String, Object> state;
@@ -62,14 +84,20 @@ public final class RunarContract {
 
     /**
      * Internal constructor used by {@link #fromUtxo} / {@link #fromTxId}
-     * to re-attach to an existing on-chain UTXO without re-running the
-     * constructor-arg pipeline. Constructor args are intentionally
-     * empty: the deployed locking script already encodes them, and
-     * subsequent calls do not need them re-run through ContractScript.
+     * to re-attach to an existing on-chain UTXO.
+     *
+     * <p>Issue #119: the constructor args are recovered from the deployed
+     * locking script via {@link ContractScript#extractConstructorArgs} rather
+     * than left empty. Restored stateful spends feed readonly ctor params into
+     * the ANF interpreter's state-continuation formula, so a placeholder
+     * (empty / zero) arg list computed the wrong new state and left the spend
+     * unspendable. Params without a constructor slot (mutable state fields)
+     * fall back to 0 and are overwritten by {@link StateSerializer} below.
      */
     private RunarContract(RunarArtifact artifact, UTXO utxo) {
         this.artifact = artifact;
-        this.constructorArgs = List.of();
+        this.constructorArgs = List.copyOf(
+            ContractScript.extractConstructorArgs(artifact, utxo.scriptHex()));
         this.state = new HashMap<>();
         this.currentUtxo = utxo;
         if (artifact.isStateful()) {
@@ -280,6 +308,36 @@ public final class RunarContract {
         return deploy(provider, signer, satoshis, null);
     }
 
+    /**
+     * Rich-options deploy overload. Mirrors the TS SDK's
+     * {@code deploy(provider, signer, options)}: {@link DeployOptions#satoshis}
+     * (default 1) and {@link DeployOptions#changeAddress} (default the deploy
+     * signer's address) configure the contract output + change, while
+     * {@link DeployOptions#fundingSigner} (issue #134) signs the P2PKH funding
+     * inputs when they are owned by a different key than the deploy signer.
+     * When {@code fundingSigner} is unset the deploy signer signs them (zero
+     * behaviour change vs the positional overloads).
+     */
+    public DeployOutcome deploy(Provider provider, Signer signer, DeployOptions options) {
+        long satoshis = (options != null && options.satoshis != null) ? options.satoshis : 1L;
+        String changeAddress = options != null ? options.changeAddress : null;
+        Signer fundingSigner = (options != null && options.fundingSigner != null)
+            ? options.fundingSigner : signer;
+
+        String lockingScript = lockingScript();
+        // DoS-bound: reject pathological scripts BEFORE any signing / broadcast.
+        ScriptSizeExceededError.assertScriptHexUnderLimit(
+            lockingScript, InputLimits.MAX_SCRIPT_BYTES,
+            artifact.contractName() + ".deploy"
+        );
+        TransactionBuilder.DeployResult r = TransactionBuilder.buildDeployWithLockingScript(
+            lockingScript, provider, signer, satoshis, changeAddress, fundingSigner
+        );
+        String txid = provider.broadcastRaw(r.txHex());
+        this.currentUtxo = new UTXO(txid, 0, satoshis, lockingScript);
+        return new DeployOutcome(txid, r.txHex(), currentUtxo);
+    }
+
     public record DeployOutcome(String txid, String rawTxHex, UTXO deployedUtxo) {}
 
     /**
@@ -431,7 +489,7 @@ public final class RunarContract {
                 m, methodName, resolved, sigIndices,
                 methodNeedsChange, methodNeedsNewAmount,
                 isStateful, parentStateful, terminalOutputs, fundingUtxos, provider, signer,
-                terminalLocktime
+                terminalLocktime, options
             );
         }
 
@@ -452,7 +510,8 @@ public final class RunarContract {
         return callWithPushTx(
             m, methodName, resolved, sigIndices,
             methodNeedsChange, methodNeedsNewAmount,
-            isStateful, parentStateful, resolvedDataOutputs, provider, signer, pushTxLocktime
+            isStateful, parentStateful, resolvedDataOutputs, provider, signer, pushTxLocktime,
+            options
         );
     }
 
@@ -480,11 +539,13 @@ public final class RunarContract {
         String txHex = result.txHex();
 
         if (!sigIndices.isEmpty()) {
-            byte[] sighash = computeContractSighash(txHex, 0);
+            // Issue #123: sign under the method's declared @sighash mode (default 0x41).
+            int methodSigHash = m.sigHashType() != null ? m.sigHashType() : RawTx.SIGHASH_ALL_FORKID;
+            byte[] sighash = computeContractSighash(txHex, 0, methodSigHash);
             for (int idx : sigIndices) {
                 byte[] der = signer.sign(sighash, null);
                 String sigHex = ScriptUtils.bytesToHex(der)
-                    + String.format("%02x", RawTx.SIGHASH_ALL_FORKID);
+                    + String.format("%02x", methodSigHash & 0xff);
                 resolved.set(idx, sigHex);
             }
             unlockHex = buildUnlockingScript(m, resolved) + intentWitnessHex;
@@ -518,8 +579,19 @@ public final class RunarContract {
         List<TransactionBuilder.DataOutput> dataOutputs,
         Provider provider,
         Signer signer,
-        int locktime
+        int locktime,
+        CallOptions options
     ) {
+        // Funding inputs are signed by fundingSigner when set (issue #134): the
+        // method signer may not own the funding coins. Defaults to the connected
+        // signer (zero behaviour change). The method's own Sig args keep the
+        // connected signer.
+        Signer fundingSigner = (options != null && options.fundingSigner != null)
+            ? options.fundingSigner : signer;
+        Integer optSequence = options != null ? options.sequence : null;
+        Integer optLocktime = options != null ? options.locktime : null;
+        Integer maxFundingInputs = options != null ? options.maxFundingInputs : null;
+
         // Pre-resolve intent-intrinsic witness hex. Throws
         // WitnessValueMissingError if a `_prevOutScript_<i>` or
         // `_serialisedOutputs` param wasn't set on the contract — raised
@@ -610,29 +682,58 @@ public final class RunarContract {
         long finalChangeAmount = secondPass.changeAmount();
         RawTx tx = secondPass.tx();
 
+        // Funding inputs actually placed on the tx (issue #133): the builder
+        // coin-selects the smallest largest-first set that covers outputs + fee,
+        // so sign THOSE — not the whole swept wallet. Iterating the full sweep
+        // both over-signs and (when selected < swept) indexes past the tx's
+        // inputs. Cap the funding-input count when maxFundingInputs is set:
+        // selection is minimal, so exceeding the cap means outputs + fee cannot
+        // be covered within the budget — fail loudly instead of broadcasting an
+        // underfunded tx.
+        List<UTXO> usedFunding = secondPass.fundingUtxos();
+        if (maxFundingInputs != null && usedFunding.size() > maxFundingInputs) {
+            throw new IllegalStateException(
+                "RunarContract.call(" + methodName + "): funding requires "
+                    + usedFunding.size() + " input(s) but maxFundingInputs="
+                    + maxFundingInputs + ". Increase maxFundingInputs, use larger UTXOs, "
+                    + "or consolidate.");
+        }
+
+        // Sequence (issue #131): an all-0xffffffff input set makes nLockTime a
+        // consensus no-op. When a non-zero locktime is set, default every input
+        // to 0xfffffffe (non-final) so the locktime is actually enforced.
+        // Explicit options.sequence always wins. Set BEFORE the OP_PUSH_TX
+        // preimage / BIP-143 sighashes are computed so they cover the final
+        // sequences.
+        tx.setAllSequences(resolveInputSequence(optLocktime, optSequence));
+
         // Compute the OP_PUSH_TX (k=1, d=1) signature + the preimage now
         // that the tx layout is settled. The on-chain script re-derives
         // the same sighash from the spliced preimage and verifies the
         // signature against G; if either differs by a single byte the
         // node rejects the spend.
+        // Issue #123: build the covenant preimage + derived signature under the
+        // method's declared @sighash mode (default 0x41 = ALL|FORKID). The mode
+        // drives both which BIP-143 fields are zeroed and the appended flag byte.
+        int methodSigHash = m.sigHashType() != null ? m.sigHashType() : OpPushTx.SIGHASH_ALL_FORKID;
         byte[] preimage = OpPushTx.preimage(
             tx, 0, ScriptUtils.hexToBytes(sighashSubscript),
-            currentUtxo.satoshis(), OpPushTx.SIGHASH_ALL_FORKID
+            currentUtxo.satoshis(), methodSigHash
         );
         byte[] opPushTxSig = OpPushTx.computePushTxSig(
-            tx, 0, sighashSubscript, currentUtxo.satoshis()
+            tx, 0, sighashSubscript, currentUtxo.satoshis(), methodSigHash
         );
 
         // Sign Sig placeholders against the same code-separator-aware
-        // sighash the contract input enforces.
+        // sighash the contract input enforces (issue #123: under the method's mode).
         if (!sigIndices.isEmpty()) {
             byte[] userSighash = tx.sighashBIP143(
-                0, sighashSubscript, currentUtxo.satoshis(), RawTx.SIGHASH_ALL_FORKID
+                0, sighashSubscript, currentUtxo.satoshis(), methodSigHash
             );
             for (int idx : sigIndices) {
                 byte[] der = signer.sign(userSighash, null);
                 String sigHex = ScriptUtils.bytesToHex(der)
-                    + String.format("%02x", RawTx.SIGHASH_ALL_FORKID);
+                    + String.format("%02x", methodSigHash & 0xff);
                 resolved.set(idx, sigHex);
             }
         }
@@ -647,18 +748,21 @@ public final class RunarContract {
         );
         tx.setUnlockingScript(0, finalUnlock);
 
-        // Sign each P2PKH funding input (input index >= 1).
-        for (int i = 0; i < additional.size(); i++) {
+        // Sign each P2PKH funding input (input index >= 1). Signed by
+        // fundingSigner (issue #134); the method's own Sig args stay with the
+        // connected signer. Only the coin-selected funding inputs are on the tx
+        // (issue #133), so iterate those.
+        for (int i = 0; i < usedFunding.size(); i++) {
             int inputIdx = 1 + i;
-            UTXO u = additional.get(i);
+            UTXO u = usedFunding.get(i);
             byte[] fundSighash = tx.sighashBIP143(
                 inputIdx, u.scriptHex(), u.satoshis(), RawTx.SIGHASH_ALL_FORKID
             );
-            byte[] der = signer.sign(fundSighash, null);
+            byte[] der = fundingSigner.sign(fundSighash, null);
             String fundSigHex = ScriptUtils.bytesToHex(der)
                 + String.format("%02x", RawTx.SIGHASH_ALL_FORKID);
             String fundUnlock = ScriptUtils.encodePushData(fundSigHex)
-                + ScriptUtils.encodePushData(ScriptUtils.bytesToHex(signer.pubKey()));
+                + ScriptUtils.encodePushData(ScriptUtils.bytesToHex(fundingSigner.pubKey()));
             tx.setUnlockingScript(inputIdx, fundUnlock);
         }
 
@@ -702,8 +806,32 @@ public final class RunarContract {
         List<UTXO> fundingUtxos,
         Provider provider,
         Signer signer,
-        int locktime
+        int locktime,
+        CallOptions options
     ) {
+        // Funding (and terminal fee) inputs are signed by fundingSigner when set
+        // (issue #134); the method's own Sig args stay with the connected signer.
+        Signer fundingSigner = (options != null && options.fundingSigner != null)
+            ? options.fundingSigner : signer;
+        Integer optSequence = options != null ? options.sequence : null;
+        Integer optLocktime = options != null ? options.locktime : null;
+        long termSequence = resolveInputSequence(optLocktime, optSequence);
+
+        // Fee input (issue #118): a single plain P2PKH UTXO added to the
+        // terminal tx purely to pay the miner fee. A true terminal method pays
+        // out the full contract balance, so fee would be 0 and ARC rejects; the
+        // covenant asserts its exact output set, so no change output can absorb a
+        // fee. The fee input is added BEFORE the OP_PUSH_TX preimage (so
+        // hashPrevouts covers it) and consumed entirely as fee — no change
+        // output. Reconciled with the existing terminal funding mechanism by
+        // prepending it to the funding list so it sits at input index 1 (right
+        // after the primary contract input) and is signed like any funding
+        // input (with fundingSigner).
+        UTXO feeUtxo = options != null ? options.feeUtxo : null;
+        List<UTXO> effectiveFunding = new ArrayList<>();
+        if (feeUtxo != null) effectiveFunding.add(feeUtxo);
+        effectiveFunding.addAll(fundingUtxos);
+
         // Pre-resolve intent-intrinsic witness hex. Throws
         // WitnessValueMissingError BEFORE any signing / broadcast.
         String intentWitnessHex = buildIntentWitnessHex(m);
@@ -726,9 +854,10 @@ public final class RunarContract {
             termOutSats += s;
         }
 
-        // Sanity: contract balance + funding must cover output sum.
+        // Sanity: contract balance + funding (incl. any feeUtxo) must cover
+        // output sum. The surplus over outputs becomes the miner fee.
         long fundingSats = 0;
-        for (UTXO fu : fundingUtxos) fundingSats += fu.satoshis();
+        for (UTXO fu : effectiveFunding) fundingSats += fu.satoshis();
         if (contractSats + fundingSats < termOutSats) {
             throw new IllegalStateException(
                 "RunarContract.call: terminal outputs (" + termOutSats
@@ -737,11 +866,12 @@ public final class RunarContract {
             );
         }
 
-        // Build a tx layout: contract input + funding inputs + terminal
-        // outputs. The unlocking script for the contract input is sized
-        // up front (placeholder for stateful, real for stateless+no-Sig)
-        // so OP_PUSH_TX preimage / Sig sighashes can be computed against
-        // the final tx bytes.
+        // Build a tx layout: contract input + funding inputs (feeUtxo first, at
+        // index 1) + terminal outputs. The unlocking script for the contract
+        // input is sized up front (placeholder for stateful, real for
+        // stateless+no-Sig) so OP_PUSH_TX preimage / Sig sighashes can be
+        // computed against the final tx bytes. Input sequences are set for
+        // issue #131 (non-final when a non-zero locktime is enforced).
         java.util.function.Supplier<RawTx> buildTx = () -> {
             RawTx t = new RawTx();
             // Terminal calls (auction close/claim/withdraw) typically assert
@@ -749,18 +879,22 @@ public final class RunarContract {
             // behavior for contracts that don't check locktime.
             t.locktime = locktime;
             t.addInput(currentUtxo.txid(), currentUtxo.outputIndex(), "");
-            for (UTXO fu : fundingUtxos) {
+            for (UTXO fu : effectiveFunding) {
                 t.addInput(fu.txid(), fu.outputIndex(), "");
             }
             for (OutEntry o : outs) {
                 t.addOutput(o.sats(), o.scriptHex());
             }
+            t.setAllSequences(termSequence);
             return t;
         };
 
         String contractUnlock;
         String opPushTxSigHex = null;
         String preimageHex = null;
+
+        // Issue #123: the terminal method's declared @sighash mode (default 0x41).
+        int methodSigHash = m.sigHashType() != null ? m.sigHashType() : OpPushTx.SIGHASH_ALL_FORKID;
 
         if (isStateful || needsOpPushTx) {
             // Code-separator-aware sighash subscript for the contract input.
@@ -784,24 +918,24 @@ public final class RunarContract {
             tx.setUnlockingScript(0, placeholderUnlock);
             byte[] preimage = OpPushTx.preimage(
                 tx, 0, ScriptUtils.hexToBytes(sighashSubscript),
-                contractSats, OpPushTx.SIGHASH_ALL_FORKID
+                contractSats, methodSigHash
             );
             byte[] opPushTxSig = OpPushTx.computePushTxSig(
-                tx, 0, sighashSubscript, contractSats
+                tx, 0, sighashSubscript, contractSats, methodSigHash
             );
             opPushTxSigHex = ScriptUtils.bytesToHex(opPushTxSig);
             preimageHex = ScriptUtils.bytesToHex(preimage);
 
             // Sign Sig placeholders against the same code-separator-aware
-            // sighash the contract input enforces.
+            // sighash the contract input enforces (issue #123: under the method's mode).
             if (!sigIndices.isEmpty()) {
                 byte[] userSighash = tx.sighashBIP143(
-                    0, sighashSubscript, contractSats, RawTx.SIGHASH_ALL_FORKID
+                    0, sighashSubscript, contractSats, methodSigHash
                 );
                 for (int idx : sigIndices) {
                     byte[] der = signer.sign(userSighash, null);
                     String sigHex = ScriptUtils.bytesToHex(der)
-                        + String.format("%02x", RawTx.SIGHASH_ALL_FORKID);
+                        + String.format("%02x", methodSigHash & 0xff);
                     resolved.set(idx, sigHex);
                 }
             }
@@ -821,12 +955,12 @@ public final class RunarContract {
             tx.setUnlockingScript(0, placeholderUnlock);
             if (!sigIndices.isEmpty()) {
                 byte[] sighash = tx.sighashBIP143(
-                    0, currentUtxo.scriptHex(), contractSats, RawTx.SIGHASH_ALL_FORKID
+                    0, currentUtxo.scriptHex(), contractSats, methodSigHash
                 );
                 for (int idx : sigIndices) {
                     byte[] der = signer.sign(sighash, null);
                     String sigHex = ScriptUtils.bytesToHex(der)
-                        + String.format("%02x", RawTx.SIGHASH_ALL_FORKID);
+                        + String.format("%02x", methodSigHash & 0xff);
                     resolved.set(idx, sigHex);
                 }
             }
@@ -836,18 +970,21 @@ public final class RunarContract {
         RawTx finalTx = buildTx.get();
         finalTx.setUnlockingScript(0, contractUnlock);
 
-        // Sign each funding input.
-        for (int i = 0; i < fundingUtxos.size(); i++) {
+        // Sign each funding input (feeUtxo first, at index 1 — issue #118),
+        // signed by fundingSigner (issue #134). Each P2PKH BIP-143 sighash
+        // covers only hashPrevouts / hashOutputs / its own outpoint — NOT input
+        // 0's scriptSig — so it stays valid regardless of the covenant unlock.
+        for (int i = 0; i < effectiveFunding.size(); i++) {
             int inputIdx = 1 + i;
-            UTXO fu = fundingUtxos.get(i);
+            UTXO fu = effectiveFunding.get(i);
             byte[] fundSighash = finalTx.sighashBIP143(
                 inputIdx, fu.scriptHex(), fu.satoshis(), RawTx.SIGHASH_ALL_FORKID
             );
-            byte[] der = signer.sign(fundSighash, null);
+            byte[] der = fundingSigner.sign(fundSighash, null);
             String fundSigHex = ScriptUtils.bytesToHex(der)
                 + String.format("%02x", RawTx.SIGHASH_ALL_FORKID);
             String fundUnlock = ScriptUtils.encodePushData(fundSigHex)
-                + ScriptUtils.encodePushData(ScriptUtils.bytesToHex(signer.pubKey()));
+                + ScriptUtils.encodePushData(ScriptUtils.bytesToHex(fundingSigner.pubKey()));
             finalTx.setUnlockingScript(inputIdx, fundUnlock);
         }
 
@@ -976,7 +1113,9 @@ public final class RunarContract {
      * <p>Falls back to the legacy template-adjusted offset for synthetic /
      * unit-test paths that have no live script available.
      */
-    private int getCodeSepIndex(int methodIndex) {
+    // Package-private (not private) so the #132 regression test can assert the
+    // byte-walk behaviour directly. See RunarContractSdkFixesTest.
+    int getCodeSepIndex(int methodIndex) {
         if (currentUtxo != null && currentUtxo.scriptHex() != null) {
             java.util.List<Integer> realOffsets =
                 findCodesepOffsets(currentUtxo.scriptHex());
@@ -1012,6 +1151,23 @@ public final class RunarContract {
      * offsets when the in-memory constructor args don't reflect what was
      * actually baked into the locking script.
      */
+    /**
+     * Resolve the nSequence for a call tx's inputs (issue #131).
+     *
+     * <p>An all-{@code 0xffffffff} input set makes nLockTime a consensus no-op,
+     * so a locktime-gated method would be script-enforced (via extractLocktime)
+     * yet NOT consensus-enforced. When a non-zero locktime is set we therefore
+     * default every input to {@code 0xfffffffe} (non-final, enforceable).
+     * Explicit {@code sequence} always wins; with no/zero locktime we keep the
+     * legacy {@code 0xffffffff}. Shared by the non-terminal and terminal build
+     * sites so both stay byte-consistent.
+     */
+    static long resolveInputSequence(Integer locktime, Integer sequence) {
+        if (sequence != null) return sequence & 0xffffffffL;
+        if (locktime != null && locktime != 0) return 0xfffffffeL;
+        return 0xffffffffL;
+    }
+
     static java.util.List<Integer> findCodesepOffsets(String scriptHex) {
         java.util.List<Integer> out = new java.util.ArrayList<>();
         int off = 0;
@@ -1237,7 +1393,9 @@ public final class RunarContract {
         // SDKs.
         byte[] sighash = new byte[0];
         if (!sigIndices.isEmpty()) {
-            sighash = computeContractSighash(txHex, 0);
+            // Issue #123: digest under the method's declared @sighash mode (default 0x41).
+            int methodSigHash = m.sigHashType() != null ? m.sigHashType() : RawTx.SIGHASH_ALL_FORKID;
+            sighash = computeContractSighash(txHex, 0, methodSigHash);
         }
         List<byte[]> sighashes = new ArrayList<>(sigIndices.size());
         for (int i = 0; i < sigIndices.size(); i++) sighashes.add(sighash);
@@ -1352,7 +1510,38 @@ public final class RunarContract {
         // funding inputs + caller-supplied outputs. No continuation, no
         // change, no automatic funding selection.
         long contractSats = currentUtxo.satoshis();
-        List<UTXO> fundingUtxos = options.fundingUtxos == null ? List.of() : options.fundingUtxos;
+        // Funding (and terminal fee) inputs are signed by fundingSigner when set
+        // (issue #134); the method's own Sig args stay with the connected signer.
+        Signer fundingSigner = options.fundingSigner != null ? options.fundingSigner : signer;
+        // Fee input (issue #118): a single plain P2PKH UTXO consumed entirely as
+        // fee. Prepended to the funding list so it sits at input index 1 (right
+        // after the primary contract input) and is signed like any funding input.
+        UTXO feeUtxo = options.feeUtxo;
+        List<UTXO> callerFunding = options.fundingUtxos == null ? List.of() : options.fundingUtxos;
+        List<UTXO> effectiveFunding = new ArrayList<>();
+        if (feeUtxo != null) effectiveFunding.add(feeUtxo);
+        effectiveFunding.addAll(callerFunding);
+
+        // Sanity: contract balance + funding (incl. any feeUtxo) must cover the
+        // output sum; the surplus over outputs becomes the miner fee.
+        long termOutSats = 0;
+        for (CallOptions.TerminalOutput o : options.terminalOutputs) {
+            termOutSats += o.satoshis().longValueExact();
+        }
+        long fundingSats = 0;
+        for (UTXO fu : effectiveFunding) fundingSats += fu.satoshis();
+        if (contractSats + fundingSats < termOutSats) {
+            throw new IllegalStateException(
+                "RunarContract.prepareCall: terminal outputs (" + termOutSats
+                    + " sats) exceed contract balance (" + contractSats
+                    + ") + funding (" + fundingSats + ")"
+            );
+        }
+
+        // Sequence (issue #131): all-final inputs make nLockTime a consensus
+        // no-op — when a non-zero locktime is set, default to 0xfffffffe so the
+        // terminal method's extractLocktime assertion is actually enforced.
+        long termSequence = resolveInputSequence(options.locktime, options.sequence);
         // Terminal calls typically assert extractLocktime(preimage) >= deadline.
         // Default 0 preserves legacy behavior for non-locktime contracts.
         int terminalLocktime = options.locktime != null ? options.locktime : 0;
@@ -1360,17 +1549,22 @@ public final class RunarContract {
             RawTx t = new RawTx();
             t.locktime = terminalLocktime;
             t.addInput(currentUtxo.txid(), currentUtxo.outputIndex(), "");
-            for (UTXO fu : fundingUtxos) {
+            for (UTXO fu : effectiveFunding) {
                 t.addInput(fu.txid(), fu.outputIndex(), "");
             }
             for (CallOptions.TerminalOutput o : options.terminalOutputs) {
                 t.addOutput(o.satoshis().longValueExact(), o.resolveScriptHex());
             }
+            t.setAllSequences(termSequence);
             return t;
         };
 
         String contractUnlock;
         List<byte[]> sighashes;
+
+        // Issue #123: the method's declared @sighash mode (default 0x41). Threaded
+        // into the covenant preimage/sig AND the digest external signers produce.
+        int methodSigHash = m.sigHashType() != null ? m.sigHashType() : OpPushTx.SIGHASH_ALL_FORKID;
 
         if (needsOpPushTx) {
             int methodIndex = findPublicMethodIndex(methodName);
@@ -1390,10 +1584,10 @@ public final class RunarContract {
             tx.setUnlockingScript(0, placeholderUnlock);
             byte[] preimage = OpPushTx.preimage(
                 tx, 0, ScriptUtils.hexToBytes(sighashSubscript),
-                contractSats, OpPushTx.SIGHASH_ALL_FORKID
+                contractSats, methodSigHash
             );
             byte[] opPushTxSig = OpPushTx.computePushTxSig(
-                tx, 0, sighashSubscript, contractSats
+                tx, 0, sighashSubscript, contractSats, methodSigHash
             );
             String opPushTxSigHex = ScriptUtils.bytesToHex(opPushTxSig);
             String preimageHex = ScriptUtils.bytesToHex(preimage);
@@ -1403,7 +1597,7 @@ public final class RunarContract {
             byte[] userSighash = sigIndices.isEmpty()
                 ? new byte[0]
                 : tx.sighashBIP143(
-                    0, sighashSubscript, contractSats, RawTx.SIGHASH_ALL_FORKID
+                    0, sighashSubscript, contractSats, methodSigHash
                 );
             sighashes = new ArrayList<>(sigIndices.size());
             for (int i = 0; i < sigIndices.size(); i++) sighashes.add(userSighash.clone());
@@ -1423,7 +1617,7 @@ public final class RunarContract {
             byte[] sh = sigIndices.isEmpty()
                 ? new byte[0]
                 : tx.sighashBIP143(
-                    0, currentUtxo.scriptHex(), contractSats, RawTx.SIGHASH_ALL_FORKID
+                    0, currentUtxo.scriptHex(), contractSats, methodSigHash
                 );
             sighashes = new ArrayList<>(sigIndices.size());
             for (int i = 0; i < sigIndices.size(); i++) sighashes.add(sh.clone());
@@ -1435,20 +1629,23 @@ public final class RunarContract {
         RawTx finalTx = buildTx.get();
         finalTx.setUnlockingScript(0, contractUnlock);
 
-        // Sign every funding input now — only the contract-input Sig
-        // values remain for the external signer to fill in.
-        if (signer != null) {
-            for (int i = 0; i < fundingUtxos.size(); i++) {
+        // Sign every funding input now (feeUtxo first, at index 1 — issue #118),
+        // with fundingSigner (issue #134) — only the contract-input Sig values
+        // remain for the external signer to fill in. Each P2PKH BIP-143 sighash
+        // covers only hashPrevouts / hashOutputs / its own outpoint — NOT input
+        // 0's scriptSig — so it stays valid after finalizeCall rewrites input 0.
+        if (fundingSigner != null) {
+            for (int i = 0; i < effectiveFunding.size(); i++) {
                 int inputIdx = 1 + i;
-                UTXO fu = fundingUtxos.get(i);
+                UTXO fu = effectiveFunding.get(i);
                 byte[] fundSighash = finalTx.sighashBIP143(
                     inputIdx, fu.scriptHex(), fu.satoshis(), RawTx.SIGHASH_ALL_FORKID
                 );
-                byte[] der = signer.sign(fundSighash, null);
+                byte[] der = fundingSigner.sign(fundSighash, null);
                 String fundSigHex = ScriptUtils.bytesToHex(der)
                     + String.format("%02x", RawTx.SIGHASH_ALL_FORKID);
                 String fundUnlock = ScriptUtils.encodePushData(fundSigHex)
-                    + ScriptUtils.encodePushData(ScriptUtils.bytesToHex(signer.pubKey()));
+                    + ScriptUtils.encodePushData(ScriptUtils.bytesToHex(fundingSigner.pubKey()));
                 finalTx.setUnlockingScript(inputIdx, fundUnlock);
             }
         }
@@ -1512,13 +1709,16 @@ public final class RunarContract {
             );
         }
 
-        // Splice real signatures into the resolved-args list.
+        // Splice real signatures into the resolved-args list. Issue #123: the
+        // appended flag byte must match the mode the prepared sighash digest was
+        // built under (see prepareTerminalCall), so external signers verify.
+        int methodSigHash = m.sigHashType() != null ? m.sigHashType() : RawTx.SIGHASH_ALL_FORKID;
         List<Object> resolved = new ArrayList<>(prepared.resolvedArgs);
         for (int i = 0; i < prepared.sigIndices().size(); i++) {
             int argIdx = prepared.sigIndices().get(i);
             byte[] der = signatures.get(i);
             String sigHex = ScriptUtils.bytesToHex(der)
-                + String.format("%02x", RawTx.SIGHASH_ALL_FORKID);
+                + String.format("%02x", methodSigHash & 0xff);
             resolved.set(argIdx, sigHex);
         }
         String unlockHex = buildUnlockingScript(m, resolved) + prepared.intentWitnessHex;
@@ -1573,8 +1773,13 @@ public final class RunarContract {
 
     /** Computes the BIP-143 sighash over the first input of a rendered tx. */
     private byte[] computeContractSighash(String txHex, int inputIndex) {
+        return computeContractSighash(txHex, inputIndex, RawTx.SIGHASH_ALL_FORKID);
+    }
+
+    /** Issue #123: BIP-143 sighash over the first input under a declared mode. */
+    private byte[] computeContractSighash(String txHex, int inputIndex, int sigHashType) {
         RawTx parsed = RawTxParser.parse(txHex);
         return parsed.sighashBIP143(inputIndex, currentUtxo.scriptHex(), currentUtxo.satoshis(),
-            RawTx.SIGHASH_ALL_FORKID);
+            sigHashType);
     }
 }

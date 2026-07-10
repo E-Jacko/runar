@@ -273,6 +273,7 @@ mod tests {
                         ],
                         is_public: true,
                         is_terminal: None, uses_code_part: None,
+                        sig_hash_type: None,
                     },
                     AbiMethod {
                         name: "merge".to_string(),
@@ -283,6 +284,7 @@ mod tests {
                         ],
                         is_public: true,
                         is_terminal: None, uses_code_part: None,
+                        sig_hash_type: None,
                     },
                 ],
             },

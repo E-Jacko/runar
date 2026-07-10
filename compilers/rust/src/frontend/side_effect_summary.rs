@@ -171,6 +171,9 @@ fn collect_stmt(
                     into.mutates_state = true;
                 }
             }
+            // Both sides may still contain calls (output intrinsics could hide
+            // in the target's index/object as well as the value).
+            collect_expr(target, into, mutable_props, private_by_name, summary, in_progress);
             collect_expr(value, into, mutable_props, private_by_name, summary, in_progress);
         }
         Statement::ExpressionStatement { expression, .. } => {
@@ -192,7 +195,11 @@ fn collect_stmt(
                 }
             }
         }
-        Statement::ForStatement { update, body, .. } => {
+        Statement::ForStatement { init, condition, update, body, .. } => {
+            // Walk the full loop header: an output intrinsic can hide in init or
+            // condition, not only in update/body.
+            collect_stmt(init, into, mutable_props, private_by_name, summary, in_progress);
+            collect_expr(condition, into, mutable_props, private_by_name, summary, in_progress);
             collect_stmt(update, into, mutable_props, private_by_name, summary, in_progress);
             for inner in body {
                 collect_stmt(inner, into, mutable_props, private_by_name, summary, in_progress);

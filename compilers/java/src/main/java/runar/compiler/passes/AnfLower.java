@@ -177,11 +177,48 @@ public final class AnfLower {
             ));
         }
 
+        // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+        // must survive DCE into the locking script. A readonly field no method
+        // references lowers to no `load_prop`, so no constructor slot is emitted
+        // and the field's deploy-time bytes vanish. We inject a `load_prop` + a
+        // `@ref:` alias (the exact shape `const _bind = this.field;` produces)
+        // into the first public method's body — the alias keeps the `load_prop`
+        // alive through dead-binding DCE, and stack lowering threads the pushed
+        // value through and cleans it up (OP_NIP) at method end.
+        List<PropertyNode> embedFields = new ArrayList<>();
+        for (PropertyNode p : contract.properties()) {
+            if (p.readonly() && p.embedAlways()) {
+                embedFields.add(p);
+            }
+        }
+        boolean embedInjected = false;
+
         // Methods
         for (MethodNode method : contract.methods()) {
             LowerCtx ctx = new LowerCtx(contract);
             for (ParamNode p : method.params()) {
                 ctx.registerParamType(p.name(), typeToString(p.type()));
+            }
+
+            // Register the declared param NAMES so a bare identifier resolves
+            // to `load_param` before falling through to `load_prop` (issue
+            // #130). Without this, a param whose name collides with a mutable
+            // state property lowered to the stale deserialized property value
+            // instead of the witness param. Explicit `this.x` is unaffected: it
+            // lowers via lowerMemberExpr (always load_prop) and the reordered
+            // property_access branch (isProperty checked before isParam).
+            for (ParamNode p : method.params()) {
+                ctx.addParam(p.name());
+            }
+
+            // Issue #123: a non-default @sighash mode drives the OP_PUSH_TX
+            // binding flag for any checkPreimage (auto-injected below, or a
+            // manual call) in this method.
+            int sighashMode = method.sighashType() != null
+                ? method.sighashType() : SighashDirective.SIGHASH_DEFAULT;
+            boolean isDefaultSighash = sighashMode == SighashDirective.SIGHASH_DEFAULT;
+            if (!isDefaultSighash) {
+                ctx.sighashFlag = sighashMode;
             }
 
             boolean isStatefulPublic = contract.parentClass() == ParentClass.STATEFUL_SMART_CONTRACT
@@ -207,21 +244,24 @@ public final class AnfLower {
                 ctx.addParam("txPreimage");
                 ctx.registerParamType("txPreimage", "SigHashPreimage");
 
-                // checkPreimage(txPreimage) at the start
+                // checkPreimage(txPreimage) at the start. Issue #123: a
+                // non-default @sighash mode changes only the appended OP_PUSH_TX
+                // binding flag byte (omit for the default so the ANF + pinned
+                // binding blob stay byte-identical for every existing contract).
                 String preimageRef = ctx.emit(new LoadParam("txPreimage"));
-                String checkResult = ctx.emit(new CheckPreimage(preimageRef));
+                String checkResult = ctx.emit(
+                    new CheckPreimage(preimageRef, isDefaultSighash ? null : sighashMode));
                 ctx.emit(new Assert(checkResult));
 
-                // GAP-302: pin the sighash type to SIGHASH_ALL | FORKID (0x41) so the
-                // auto-injected covenant cannot be spent under a permissive sighash
-                // flag (ANYONECANPAY / SINGLE / NONE) that zeroes out preimage fields
-                // a contract may read. The hashOutputs continuation already fails
-                // under non-ALL flags, so this is a no-op on spendability for
-                // continuation-using methods and closes the field-zeroing exposure
-                // for the rest.
+                // GAP-302 / #123: pin the sighash type to the declared mode
+                // (default SIGHASH_ALL|FORKID, 0x41). Without this the spend
+                // could use a DIFFERENT sighash flag than declared that zeroes
+                // out preimage fields the contract (or its continuation) relies
+                // on (hashOutputs / hashPrevouts / hashSequence). The default
+                // 0x41 keeps existing contracts byte-identical.
                 String sigHashPreimageRef = ctx.emit(new LoadParam("txPreimage"));
                 String sigHashTypeRef = ctx.emit(new Call("extractSigHashType", List.of(sigHashPreimageRef)));
-                String expectedSigHashRef = ctx.emit(makeLoadConstInt(BigInteger.valueOf(0x41)));
+                String expectedSigHashRef = ctx.emit(makeLoadConstInt(BigInteger.valueOf(sighashMode)));
                 String sigHashOkRef = ctx.emit(new BinOp("===", sigHashTypeRef, expectedSigHashRef, null));
                 ctx.emit(new Assert(sigHashOkRef));
 
@@ -235,6 +275,14 @@ public final class AnfLower {
                     ctx.emit(new DeserializeState(preimageRef3));
                 }
 
+                // Issue #109: preserve @embedAlways fields at the first
+                // user-statement position (after the checkPreimage/deserialize
+                // preamble), mirroring where a `const _bind = this.field;` would sit.
+                if (!embedInjected && !embedFields.isEmpty()) {
+                    emitEmbedAlwaysPreservation(ctx, embedFields);
+                    embedInjected = true;
+                }
+
                 // Developer's method body
                 ctx.lowerStatements(method.body());
 
@@ -242,9 +290,29 @@ public final class AnfLower {
                 List<String> addOutputRefs = ctx.addOutputRefs;
                 List<String> addDataOutputRefs = ctx.addDataOutputRefs;
                 if (!addOutputRefs.isEmpty() || !addDataOutputRefs.isEmpty() || mutates) {
+                    // Build the P2PKH change output for hashOutputs verification.
+                    //
+                    // Issue #116: the SDK's buildCallTransaction OMITS the change
+                    // output when `change <= 0` (an exact-cover call) and passes
+                    // `_changeAmount = 0`. Gate the change segment on
+                    // `_changeAmount != 0` at runtime so the hashed output set
+                    // matches the SDK at the exact-zero boundary — the segment is
+                    // the P2PKH change output when non-zero, and empty bytes (cat
+                    // with empty is a no-op) when zero, reproducing the omission.
+                    // For any change > 0 the hashed bytes are unchanged; only the
+                    // emitted script gains the guard.
                     String changePkhRef = ctx.emit(new LoadParam("_changePKH"));
                     String changeAmountRef = ctx.emit(new LoadParam("_changeAmount"));
-                    String changeOutputRef = ctx.emit(new Call("buildChangeOutput", List.of(changePkhRef, changeAmountRef)));
+                    String zeroRef = ctx.emit(makeLoadConstInt(BigInteger.ZERO));
+                    String changeNonZeroRef = ctx.emit(new BinOp("!==", changeAmountRef, zeroRef, null));
+                    LowerCtx changeThenCtx = ctx.subContext();
+                    changeThenCtx.emit(new Call("buildChangeOutput", List.of(changePkhRef, changeAmountRef)));
+                    ctx.syncCounter(changeThenCtx);
+                    LowerCtx changeElseCtx = ctx.subContext();
+                    changeElseCtx.emit(makeLoadConstString(""));
+                    ctx.syncCounter(changeElseCtx);
+                    String changeOutputRef = ctx.emit(new If(
+                        changeNonZeroRef, changeThenCtx.bindings, changeElseCtx.bindings));
 
                     if (!addOutputRefs.isEmpty()) {
                         String accumulated = addOutputRefs.get(0);
@@ -298,6 +366,14 @@ public final class AnfLower {
 
                 out.add(new AnfMethod(method.name(), augmented, ctx.bindings, true));
             } else {
+                // Issue #109: stateless public methods (and non-stateful
+                // spending entry points) are lowered here — inject @embedAlways
+                // preservation into the first PUBLIC one before its body.
+                if (!embedInjected && !embedFields.isEmpty()
+                        && method.visibility() == Visibility.PUBLIC) {
+                    emitEmbedAlwaysPreservation(ctx, embedFields);
+                    embedInjected = true;
+                }
                 ctx.lowerStatements(method.body());
                 List<AnfParam> privAugmented = new ArrayList<>(lowerParams(method.params()));
                 // Private methods can also call the intent intrinsics; capture
@@ -388,6 +464,10 @@ public final class AnfLower {
         // every sub-context (if/else branches, ternaries). Mirrors the
         // method-scoped param-type tracking in the TS reference compiler.
         Map<String, String> methodParamTypes = new HashMap<>();
+        // Issue #123: the declared non-default @sighash flag for the method
+        // being lowered, so a MANUAL checkPreimage(pre) call binds under the
+        // same mode as the method's declared sighash. null = default ALL|FORKID.
+        Integer sighashFlag = null;
 
         LowerCtx(ContractNode contract) {
             this.contract = contract;
@@ -560,6 +640,10 @@ public final class AnfLower {
             // analysis inside if/else / ternary sub-contexts resolves params
             // against THIS method's ABI, not every method's.
             sub.methodParamTypes = this.methodParamTypes;
+            // Issue #123: propagate the method's declared @sighash flag so a
+            // manual checkPreimage() inside an if/else / ternary / inlined
+            // branch binds under the same mode instead of the default.
+            sub.sighashFlag = this.sighashFlag;
             // GAP-002: inherit the outer statement's source location so
             // bindings emitted inside an if/else / loop branch are still
             // mapped back to the originating AST statement.
@@ -747,14 +831,17 @@ public final class AnfLower {
         }
 
         void lowerForStatement(ForStatement stmt) {
-            int count = extractLoopCount(stmt);
+            // Resolve the loop's compile-time shape: start value, step
+            // direction, and iteration count. Rúnar requires bounded loops, so
+            // all three must be statically determinable (issue #121).
+            LoopShape shape = extractLoopShape(stmt);
 
             LowerCtx bodyCtx = subContext();
             bodyCtx.lowerStatements(stmt.body());
             syncCounter(bodyCtx);
 
             String iterVar = stmt.init() != null ? stmt.init().name() : "";
-            emit(new Loop(count, bodyCtx.bindings, iterVar));
+            emit(new Loop(shape.count, bodyCtx.bindings, iterVar, shape.start, shape.step));
         }
 
         // -----------------------------------------------------------
@@ -778,6 +865,14 @@ public final class AnfLower {
                 return lowerIdentifier(id);
             }
             if (expr instanceof PropertyAccessExpr pa) {
+                // Explicit `this.x`: a real contract property always wins, even
+                // when a method param shares the name (issue #130). Now that
+                // declared params are registered, the isParam branch below must
+                // not shadow a stored property. The isParam branch is only for
+                // the implicit injected `this.txPreimage` member.
+                if (isProperty(pa.property())) {
+                    return emit(new LoadProp(pa.property()));
+                }
                 if (isParam(pa.property())) {
                     return emit(new LoadParam(pa.property()));
                 }
@@ -932,7 +1027,8 @@ public final class AnfLower {
             if (callee instanceof Identifier id2 && "checkPreimage".equals(id2.name())) {
                 if (!e.args().isEmpty()) {
                     String preimageRef = lowerExprToRef(e.args().get(0));
-                    return emit(new CheckPreimage(preimageRef));
+                    // Issue #123: honour the method's declared @sighash on manual calls.
+                    return emit(new CheckPreimage(preimageRef, sighashFlag));
                 }
             }
 
@@ -1306,6 +1402,24 @@ public final class AnfLower {
         return new LoadConst(new BytesConst(v));
     }
 
+    /**
+     * Issue #109: emit the DCE-surviving preservation pair for each
+     * {@code @embedAlways} readonly field, into the given (public) method
+     * context. Reproduces exactly what a hand-written {@code const _bind =
+     * this.field;} lowers to: a {@code load_prop} followed by a
+     * {@code load_const("@ref:<t>")} alias. The alias marks the {@code load_prop}
+     * as referenced, so dead-binding DCE keeps it; stack lowering then emits the
+     * field's constructor-slot placeholder and NIPs the unused value off the
+     * stack at method end. The field's bytes therefore remain in the deployed
+     * locking script for downstream recovery.
+     */
+    private static void emitEmbedAlwaysPreservation(LowerCtx ctx, List<PropertyNode> fields) {
+        for (PropertyNode field : fields) {
+            String loadRef = ctx.emit(new LoadProp(field.name()));
+            ctx.emitNamed("__embedAlways_" + field.name(), makeLoadConstString("@ref:" + loadRef));
+        }
+    }
+
     private static List<Expression> flattenAddOutputArgs(List<Expression> args) {
         if (args.size() == 2 && args.get(1) instanceof ArrayLiteralExpr al) {
             List<Expression> out = new ArrayList<>(1 + al.elements().size());
@@ -1325,7 +1439,9 @@ public final class AnfLower {
     // addDataOutput to a private helper is correctly classified.
     // 2026-04-30 audit fix for findings F1 (Critical) and F3 (High).
 
-    private static MethodNode lookupPrivateMethod(ContractNode contract, String name) {
+    // Package-visible so SighashValidate (issue #123) can reuse the same
+    // transitive continuation-shape predicates the ANF lowering uses.
+    static MethodNode lookupPrivateMethod(ContractNode contract, String name) {
         if (name == null) return null;
         for (MethodNode m : contract.methods()) {
             if (name.equals(m.name()) && m.visibility() != Visibility.PUBLIC) return m;
@@ -1340,7 +1456,7 @@ public final class AnfLower {
         return null;
     }
 
-    private static boolean methodMutatesState(MethodNode method, ContractNode contract) {
+    static boolean methodMutatesState(MethodNode method, ContractNode contract) {
         Set<String> mutable = new HashSet<>();
         for (PropertyNode p : contract.properties()) {
             if (!p.readonly()) mutable.add(p.name());
@@ -1409,7 +1525,7 @@ public final class AnfLower {
     // addOutput / addDataOutput detection (recursive across private calls)
     // ------------------------------------------------------------------
 
-    private static boolean methodHasAddOutput(MethodNode m, ContractNode contract) {
+    static boolean methodHasAddOutput(MethodNode m, ContractNode contract) {
         return bodyHasAddOutput(m.body(), contract, new HashSet<>());
     }
 
@@ -1457,7 +1573,7 @@ public final class AnfLower {
         return false;
     }
 
-    private static boolean methodHasAddDataOutput(MethodNode m, ContractNode contract) {
+    static boolean methodHasAddDataOutput(MethodNode m, ContractNode contract) {
         return bodyHasAddDataOutput(m.body(), contract, new HashSet<>());
     }
 
@@ -1507,47 +1623,93 @@ public final class AnfLower {
     // Loop count extraction
     // ------------------------------------------------------------------
 
-    private static int extractLoopCount(ForStatement stmt) {
-        // The ANF loop node carries only the count — no start value or step
-        // direction — so lowering (and the ANF interpreter) always iterates
-        // i = 0..count-1. Loop shapes that representation cannot express are
-        // rejected here (mirroring the source-located errors in Validate)
-        // rather than silently compiled as a zero-start counting-up loop.
-        //
-        // A countdown loop necessarily also has a non-zero start, so check the
-        // condition direction first — it is the more precise diagnosis.
-        if (stmt.condition() instanceof BinaryExpr be) {
-            String op = be.op().canonical();
-            if (op.equals(">") || op.equals(">=")) {
-                throw new IllegalStateException(
-                    "For loop condition must count up with '<' or '<=' — countdown loops are "
-                        + "not supported; iterate i = 0..N-1 and index backwards instead.");
-            }
-        }
+    /** Compile-time loop shape resolved from a for-statement (issue #121). */
+    private record LoopShape(BigInteger start, int step, int count) {}
 
-        BigInteger startVal = null;
-        if (stmt.init() != null) {
-            startVal = extractBigintValue(stmt.init().init());
-        }
-
-        if (startVal != null && startVal.signum() != 0) {
+    /**
+     * Resolve a for-statement's compile-time loop shape (issue #121).
+     *
+     * <p>Supports counting-up and counting-down loops:
+     * <pre>
+     *   for (i = 0; i &lt; 10; i++)   -&gt; start 0, step +1, count 10
+     *   for (i = 1; i &lt;= 3; i++)   -&gt; start 1, step +1, count 3
+     *   for (i = 3; i &gt; 0; i--)    -&gt; start 3, step -1, count 3
+     *   for (i = 3; i &gt;= 1; i--)   -&gt; start 3, step -1, count 3
+     * </pre>
+     *
+     * <p>The loop is unrolled {@code count} times; on iteration {@code i} the
+     * iterator holds {@code start + i * step}. Start and bound must be
+     * compile-time integer literals.
+     */
+    private static LoopShape extractLoopShape(ForStatement stmt) {
+        BigInteger start = stmt.init() != null ? extractBigintValue(stmt.init().init()) : null;
+        if (start == null) {
             throw new IllegalStateException(
-                "For loop iterator must start at 0 (got " + startVal + "n) — loops compile "
-                    + "to i = 0..count-1; offset the iterator inside the body instead.");
+                "Cannot determine loop start at compile time. For-loop iterators must start at "
+                    + "an integer literal.");
         }
 
-        if (stmt.condition() instanceof BinaryExpr be) {
-            String op = be.op().canonical();
-            BigInteger boundVal = extractBigintValue(be.right());
-            if (boundVal != null) {
-                return switch (op) {
-                    case "<" -> Math.max(0, boundVal.intValue());
-                    case "<=" -> Math.max(0, boundVal.add(BigInteger.ONE).intValue());
-                    default -> 0;
-                };
+        if (!(stmt.condition() instanceof BinaryExpr be)) {
+            throw new IllegalStateException(
+                "Cannot determine loop bound at compile time. For-loop bounds must be integer "
+                    + "literals.");
+        }
+        String op = be.op().canonical();
+        BigInteger bound = extractBigintValue(be.right());
+        if (bound == null) {
+            throw new IllegalStateException(
+                "Cannot determine loop bound at compile time. For-loop bounds must be integer "
+                    + "literals.");
+        }
+
+        int step = extractLoopStep(stmt);
+
+        // Count = number of iterations before the condition first turns false.
+        BigInteger count;
+        if (step == 1) {
+            if (op.equals("<")) {
+                count = bound.subtract(start);
+            } else if (op.equals("<=")) {
+                count = bound.subtract(start).add(BigInteger.ONE);
+            } else {
+                throw new IllegalStateException(
+                    "For loop counting up (i++) must use '<' or '<=' (got '" + op + "').");
+            }
+        } else {
+            if (op.equals(">")) {
+                count = start.subtract(bound);
+            } else if (op.equals(">=")) {
+                count = start.subtract(bound).add(BigInteger.ONE);
+            } else {
+                throw new IllegalStateException(
+                    "For loop counting down (i--) must use '>' or '>=' (got '" + op + "').");
             }
         }
-        return 0;
+
+        int c = count.signum() <= 0 ? 0 : count.intValueExact();
+        return new LoopShape(start, step, c);
+    }
+
+    /**
+     * Determine the iterator step direction (+1 / -1) from the for-statement's
+     * update clause, falling back to the condition direction (issue #121). Only
+     * unit steps are supported; a non-unit update (e.g. {@code i += 2}) is out
+     * of the loop model.
+     */
+    private static int extractLoopStep(ForStatement stmt) {
+        Statement update = stmt.update();
+        if (update instanceof ExpressionStatement es) {
+            Expression e = es.expression();
+            if (e instanceof IncrementExpr) return 1;
+            if (e instanceof DecrementExpr) return -1;
+        }
+        // Fall back to the comparison direction for other unit-step spellings
+        // (e.g. `i = i + 1`): `<`/`<=` counts up, `>`/`>=` counts down.
+        if (stmt.condition() instanceof BinaryExpr be) {
+            String op = be.op().canonical();
+            if (op.equals(">") || op.equals(">=")) return -1;
+        }
+        return 1;
     }
 
     private static BigInteger extractBigintValue(Expression expr) {
@@ -1761,7 +1923,7 @@ public final class AnfLower {
             return new If(mapOr(ifv.cond(), nameMap), ifv.thenBranch(), ifv.elseBranch());
         }
         if (value instanceof Loop lp) {
-            return new Loop(lp.count(), lp.body(), lp.iterVar());
+            return new Loop(lp.count(), lp.body(), lp.iterVar(), lp.start(), lp.step());
         }
         if (value instanceof Assert asv) {
             return new Assert(mapOr(asv.value(), nameMap));
@@ -1770,7 +1932,7 @@ public final class AnfLower {
             return new UpdateProp(up.name(), mapOr(up.value(), nameMap));
         }
         if (value instanceof CheckPreimage cp) {
-            return new CheckPreimage(mapOr(cp.preimage(), nameMap));
+            return new CheckPreimage(mapOr(cp.preimage(), nameMap), cp.sighashFlag());
         }
         if (value instanceof DeserializeState ds) {
             return new DeserializeState(mapOr(ds.preimage(), nameMap));

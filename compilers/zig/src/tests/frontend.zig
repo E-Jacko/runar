@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const compiler_api = @import("../compiler_api.zig");
+const input_limits = @import("../frontend/input_limits.zig");
 const types = @import("../ir/types.zig");
 const parse_ts = @import("../passes/parse_ts.zig");
 const parse_sol = @import("../passes/parse_sol.zig");
@@ -560,4 +561,72 @@ test "frontend: compileSource end-to-end for every non-Zig parser produces hex" 
         defer std.testing.allocator.free(hex);
         try std.testing.expect(hex.len > 0);
     }
+}
+
+// The @sighash (#123) and @embedAlways (#109) comment directives are now
+// honoured on the TypeScript (.runar.ts) surface parser, matching the TS
+// reference compiler. The eight non-TS surface parsers do NOT read comments,
+// so the parse dispatch fails closed on those formats rather than silently
+// drop a security-critical directive. These tests pin both halves of that
+// policy (mirrors the Go tier's repurposed guard tests).
+
+test "frontend guard: .runar.ts honours @sighash directive (compiles, not rejected)" {
+    const src =
+        \\class Counter extends SmartContract {
+        \\  readonly x: bigint;
+        \\  constructor(x: bigint) { super(x); this.x = x; }
+        \\  /** @sighash SINGLE|FORKID */
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    const hex = try compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.ts");
+    defer std.testing.allocator.free(hex);
+    try std.testing.expect(hex.len > 0);
+}
+
+test "frontend guard: .runar.ts honours @embedAlways directive (compiles, not rejected)" {
+    const src =
+        \\class Counter extends SmartContract {
+        \\  /** @embedAlways */
+        \\  readonly x: bigint;
+        \\  constructor(x: bigint) { super(x); this.x = x; }
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    const hex = try compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.ts");
+    defer std.testing.allocator.free(hex);
+    try std.testing.expect(hex.len > 0);
+}
+
+test "frontend guard: non-TS surface rejects @sighash directive (fail closed)" {
+    // A .runar.sol surface parser ignores comments, so the guard must fire.
+    const src =
+        \\contract Counter {
+        \\  // @sighash SINGLE|FORKID
+        \\  function unlock() public {}
+        \\}
+    ;
+    const result = compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.sol");
+    try std.testing.expectError(error.ParseFailed, result);
+}
+
+test "frontend guard: non-TS surface rejects @embedAlways directive (fail closed)" {
+    const src =
+        \\contract Counter {
+        \\  // @embedAlways
+        \\  uint x;
+        \\}
+    ;
+    const result = compiler_api.compileSourceToHex(std.testing.allocator, src, "Counter.runar.sol");
+    try std.testing.expectError(error.ParseFailed, result);
+}
+
+test "frontend guard: word boundary — sighashType identifier does not trip" {
+    // Directive present → detected.
+    try std.testing.expect(input_limits.containsDirectiveToken("/** @sighash ALL */", "@sighash"));
+    try std.testing.expect(input_limits.containsDirectiveToken("// @embedAlways\n", "@embedAlways"));
+    // Word-boundary: an identifier that merely starts with the marker text
+    // must NOT be flagged.
+    try std.testing.expect(!input_limits.containsDirectiveToken("readonly sighashType: bigint;", "@sighash"));
+    try std.testing.expect(!input_limits.containsDirectiveToken("@sighashTag", "@sighash"));
 }
