@@ -1544,7 +1544,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap
     (n1 n2 bn bcap : String) (tail : List String)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap m opName n1 n2 bn bcap tail rt src srcCap)
-    (hNotNeqBytes : (opName == "!==" && rt == some "bytes") = false) :
+    (hNotNeqBytes : (opName == "!==") = false) :
     lowerMethodUserRawOps progMethods props m
       = [.swap, .swap, .opcode (Stack.Lower.binopOpcode opName rt),
          .push (.bool true)] := by
@@ -1614,6 +1614,80 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap
   unfold Stack.Lower.lowerBindingsP
   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
   -- Tail of lowerBindingsP on [] reduces to ([], _).
+  simp [Stack.Lower.lowerBindingsP, Stack.Lower.StackMap.push]
+
+-- Issue #116: `!==` peer of `lowerMethodUserRawOps_singletonBinOpWithCap`.
+-- For `opName = "!=="` the binOp arm appends a trailing `OP_NOT` (mirroring the
+-- TS `BINOP_OPCODES['!==']` pair), so the raw ops gain `.opcode "OP_NOT"` before
+-- the cap push. Identical to the shared lemma except the if-guard picks the
+-- THEN branch.
+set_option maxHeartbeats 4000000 in
+set_option linter.unusedSimpArgs false in
+private theorem lowerMethodUserRawOps_singletonBinNeqWithCap
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (m : ANFMethod) (opName : String)
+    (n1 n2 bn bcap : String) (tail : List String)
+    (rt : Option String) (src srcCap : Option SourceLoc)
+    (hCap : singletonBinOpWithCap m opName n1 n2 bn bcap tail rt src srcCap)
+    (hIsNeq : opName = "!==") :
+    lowerMethodUserRawOps progMethods props m
+      = [.swap, .swap, .opcode (Stack.Lower.binopOpcode opName rt),
+         .opcode "OP_NOT", .push (.bool true)] := by
+  obtain ⟨hBody, hRev, hne, _hBnCap, _hBcapN1, _hBcapN2⟩ := hCap
+  unfold lowerMethodUserRawOps
+  rw [hBody, hRev]
+  rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne]
+  rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
+  have hFind1 : (n2 :: n1 :: tail).findIdx? (· == n1) = some 1 := by
+    have hne2 : (n2 == n1) = false := by
+      have h : n2 ≠ n1 := fun h => hne h.symm
+      simp [beq_iff_eq, h]
+    unfold List.findIdx?
+    simp [List.findIdx?.go, hne2]
+  have hFind2 : (n1 :: n2 :: tail).findIdx? (· == n2) = some 1 := by
+    have hne1 : (n1 == n2) = false := by
+      have h : n1 ≠ n2 := hne
+      simp [beq_iff_eq, h]
+    unfold List.findIdx?
+    simp [List.findIdx?.go, hne1]
+  have hLoadN1 :
+      Stack.Lower.loadRefLive (n2 :: n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
+        = ([.swap], n1 :: n2 :: tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    rw [hFind1]
+    simp
+  have hLoadN2 :
+      Stack.Lower.loadRefLive (n1 :: n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
+        = ([.swap], n2 :: n1 :: tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    rw [hFind2]
+    simp
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne
+  simp only [hOperandL, hOperandR]
+  rw [hLoadN1]
+  simp only [hLoadN2]
+  -- Issue #116: opName = "!==" so the guard is TRUE; pick the THEN branch.
+  have hIsNeqB : (opName == "!==") = true := by simp [hIsNeq]
+  rw [hIsNeqB]
+  simp only [if_true, reduceIte]
+  unfold Stack.Lower.StackMap.popN
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
   simp [Stack.Lower.lowerBindingsP, Stack.Lower.StackMap.push]
 
 /-! ### Two-value top-of-stack extraction
@@ -1876,7 +1950,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAdd_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("+" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("+" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "+" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -1926,7 +2000,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinSub_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("-" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("-" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "-" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -1975,7 +2049,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMul_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("*" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("*" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "*" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -2379,6 +2453,51 @@ private theorem runOps_swap_swap_eq_pushTrue_of_agreesTagged
   rw [hSubstrate]
   simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Except.toOption]
 
+/-- Issue #116: runtime success of the 2-opcode numeric `!==` tail
+`[.swap, .swap, OP_NUMEQUAL, OP_NOT, .push true]`. Reuses the `OP_NUMEQUAL`
+substrate (which lands a `.vBool` on top), then `OP_NOT` inverts it and the cap
+push succeeds. -/
+private theorem runOps_swap_swap_neqTail_pushTrue_of_agreesTagged
+    (n1 n2 : String) (tsm_rest : TaggedStackMap)
+    (anfSt : State) (initialStack : StackState) (a b : Int)
+    (hAgrees : agreesTagged
+      ((n2, .param) :: (n1, .param) :: tsm_rest) anfSt initialStack)
+    (hLookupL : anfSt.lookupParam n1 = some (.vBigint a))
+    (hLookupR : anfSt.lookupParam n2 = some (.vBigint b)) :
+    (Stack.Eval.runOps
+        [.swap, .swap, .opcode "OP_NUMEQUAL", .opcode "OP_NOT", .push (.bool true)]
+        initialStack).toOption.isSome := by
+  obtain ⟨rest, hStk⟩ :=
+    initialStack_top_two_vBigint_of_agreesTagged n1 n2 tsm_rest anfSt
+      initialStack a b hAgrees hLookupL hLookupR
+  have hEq :
+      Stack.Eval.runOpcode "OP_NUMEQUAL" initialStack
+        = .ok ({initialStack with stack := rest}.push (.vBool (decide (a = b)))) :=
+    Stack.Sim.runOpcode_NUMEQUAL_intInt initialStack a b rest hStk
+  have hTailTail : initialStack.stack.tail.tail = rest := by
+    rw [hStk]; rfl
+  have hEq' :
+      Stack.Eval.runOpcode "OP_NUMEQUAL" initialStack
+        = .ok ({initialStack with stack := initialStack.stack.tail.tail}.push
+                 (.vBool (decide (a = b)))) := by
+    rw [hEq, hTailTail]
+  have hSubstrate :
+      Stack.Eval.runOps [.swap, .swap, .opcode "OP_NUMEQUAL"] initialStack
+        = .ok ({initialStack with stack := initialStack.stack.tail.tail}.push
+                 (.vBool (decide (a = b)))) :=
+    stageC_simpleStep_binOp_d1d0_consume_core
+      n2 n1 .param .param tsm_rest anfSt initialStack a b
+      "OP_NUMEQUAL" (.vBool (decide (a = b)))
+      [.swap, .swap, .opcode "OP_NUMEQUAL"]
+      hAgrees hLookupL hLookupR rfl hEq'
+  show (Stack.Eval.runOps
+          ([.swap, .swap, .opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT", .push (.bool true)])
+          initialStack).toOption.isSome
+  rw [Stack.Sim.runOps_append, hSubstrate]
+  simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Stack.Eval.runOpcode,
+    Except.toOption, Stack.Eval.StackState.pop?, Stack.Eval.asBool?,
+    Stack.Eval.StackState.push]
+
 /-- Runtime success of `[.swap, .swap, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]`. -/
 private theorem runOps_swap_swap_neq_pushTrue_of_agreesTagged
     (n1 n2 : String) (tsm_rest : TaggedStackMap)
@@ -2635,7 +2754,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinDiv_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("/" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("/" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "/" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -2685,7 +2804,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMod_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("%" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("%" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "%" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -2734,7 +2853,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLt_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "<" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -2783,7 +2902,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLe_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "<=" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -2832,7 +2951,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGt_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m ">" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -2881,7 +3000,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGe_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m ">=" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -2934,7 +3053,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinEq_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("===" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("===" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "===" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -2997,21 +3116,11 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  -- For "!==" with rt ≠ some "bytes" the `!== && rt == some "bytes"`
-  -- guard is `true && false = false`.
-  have hNotNeqBytes : (("!==" == "!==") && rt == some "bytes") = false := by
-    have hRt : (rt == some "bytes") = false := by
-      cases hRt' : rt with
-      | none => rfl
-      | some s =>
-          by_cases hBytes : s = "bytes"
-          · exact absurd (by rw [hRt', hBytes]) hRtNotBytes
-          · simp [hBytes]
-    simp [hRt]
-  rw [lowerMethodUserRawOps_singletonBinOpWithCap
-        methods props m "!==" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
-  -- Reduce `binopOpcode "!==" rt` to "OP_NUMNOTEQUAL" using hRtNotBytes.
-  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMNOTEQUAL" := by
+  -- Issue #116: `!==` lowers to the 2-opcode tail `[OP_NUMEQUAL, OP_NOT]`.
+  rw [lowerMethodUserRawOps_singletonBinNeqWithCap
+        methods props m "!==" n1 n2 bn bcap tail rt src srcCap hCap rfl]
+  -- Reduce `binopOpcode "!==" rt` to "OP_NUMEQUAL" using hRtNotBytes.
+  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMEQUAL" := by
     unfold Stack.Lower.binopOpcode
     cases hRt : rt with
     | none => rfl
@@ -3021,9 +3130,9 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_isSome
         · simp [hBytes]
   rw [hOpcode]
   show (Stack.Eval.runOps
-          [.swap, .swap, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]
+          [.swap, .swap, .opcode "OP_NUMEQUAL", .opcode "OP_NOT", .push (.bool true)]
           initialStack).toOption.isSome
-  exact runOps_swap_swap_neq_pushTrue_of_agreesTagged n1 n2 tsm_rest anfSt
+  exact runOps_swap_swap_neqTail_pushTrue_of_agreesTagged n1 n2 tsm_rest anfSt
     initialStack a b hAgrees hLookupL hLookupR
 
 /-- **Method-level runtime-success wrapper for `singletonBinAndWithCap`.** -/
@@ -3065,7 +3174,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAnd_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("&&" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("&&" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "&&" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -3114,7 +3223,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinOr_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("||" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("||" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "||" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -3163,7 +3272,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShl_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m "<<" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -3212,7 +3321,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShr_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">>" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">>" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap
         methods props m ">>" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -3296,7 +3405,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
     (n1 n2 bn bcap : String) (tail : List String)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_d0d1 m opName n1 n2 bn bcap tail rt src srcCap)
-    (hNotNeqBytes : (opName == "!==" && rt == some "bytes") = false) :
+    (hNotNeqBytes : (opName == "!==") = false) :
     lowerMethodUserRawOps progMethods props m
       = [.swap, .opcode (Stack.Lower.binopOpcode opName rt),
          .push (.bool true)] := by
@@ -3364,6 +3473,73 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
   unfold Stack.Lower.lowerBindingsP
   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
   -- Tail of lowerBindingsP on [] reduces to ([], _).
+  simp [Stack.Lower.lowerBindingsP, Stack.Lower.StackMap.push]
+
+-- Issue #116: `!==` peer of `lowerMethodUserRawOps_singletonBinOpWithCap_d0d1`
+-- (appends trailing `OP_NOT`; if-guard picks THEN).
+set_option maxHeartbeats 4000000 in
+set_option linter.unusedSimpArgs false in
+private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0d1
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (m : ANFMethod) (opName : String)
+    (n1 n2 bn bcap : String) (tail : List String)
+    (rt : Option String) (src srcCap : Option SourceLoc)
+    (hCap : singletonBinOpWithCap_d0d1 m opName n1 n2 bn bcap tail rt src srcCap)
+    (hIsNeq : opName = "!==") :
+    lowerMethodUserRawOps progMethods props m
+      = [.swap, .opcode (Stack.Lower.binopOpcode opName rt),
+         .opcode "OP_NOT", .push (.bool true)] := by
+  obtain ⟨hBody, hRev, hne, _hBnCap, _hBcapN1, _hBcapN2⟩ := hCap
+  unfold lowerMethodUserRawOps
+  rw [hBody, hRev]
+  rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne]
+  rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
+  have hFind1 : (n1 :: n2 :: tail).findIdx? (· == n1) = some 0 := by
+    unfold List.findIdx?
+    simp [List.findIdx?.go]
+  have hFind2 : (n1 :: n2 :: tail).findIdx? (· == n2) = some 1 := by
+    have hne1 : (n1 == n2) = false := by
+      have h : n1 ≠ n2 := hne
+      simp [beq_iff_eq, h]
+    unfold List.findIdx?
+    simp [List.findIdx?.go, hne1]
+  have hLoadN1 :
+      Stack.Lower.loadRefLive (n1 :: n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
+        = ([], n1 :: n2 :: tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    rw [hFind1]
+    simp
+  have hLoadN2 :
+      Stack.Lower.loadRefLive (n1 :: n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
+        = ([.swap], n2 :: n1 :: tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    rw [hFind2]
+    simp
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne
+  simp only [hOperandL, hOperandR]
+  rw [hLoadN1]
+  simp only [hLoadN2]
+  have hIsNeqB : (opName == "!==") = true := by simp [hIsNeq]
+  rw [hIsNeqB]
+  simp only [if_true, reduceIte]
+  unfold Stack.Lower.StackMap.popN
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
   simp [Stack.Lower.lowerBindingsP, Stack.Lower.StackMap.push]
 
 /-! ### Two-value top-of-stack extraction at depth pair (0, 1)
@@ -3795,6 +3971,40 @@ private theorem runOps_swap_eq_pushTrue_of_agreesTagged_d0d1
   rw [hChain]
   simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Except.toOption]
 
+/-- Issue #116: `[.swap, OP_NUMEQUAL, OP_NOT, .push true]` runtime success (d0d1). -/
+private theorem runOps_swap_neqTail_pushTrue_of_agreesTagged_d0d1
+    (n1 n2 : String) (tsm_rest : TaggedStackMap)
+    (anfSt : State) (initialStack : StackState) (a b : Int)
+    (hAgrees : agreesTagged
+      ((n1, .param) :: (n2, .param) :: tsm_rest) anfSt initialStack)
+    (hLookupL : anfSt.lookupParam n1 = some (.vBigint a))
+    (hLookupR : anfSt.lookupParam n2 = some (.vBigint b)) :
+    (Stack.Eval.runOps
+        [.swap, .opcode "OP_NUMEQUAL", .opcode "OP_NOT", .push (.bool true)]
+        initialStack).toOption.isSome := by
+  obtain ⟨rest, _hStk, hSwap⟩ :=
+    runOps_swap_post_state_d0d1 n1 n2 tsm_rest anfSt initialStack a b
+      hAgrees hLookupL hLookupR
+  let stkSwap : StackState :=
+    {initialStack with stack := .vBigint b :: .vBigint a :: rest}
+  have hStkSwap : stkSwap.stack = .vBigint b :: .vBigint a :: rest := rfl
+  have hEq :
+      Stack.Eval.runOpcode "OP_NUMEQUAL" stkSwap
+        = .ok ({stkSwap with stack := rest}.push (.vBool (decide (a = b)))) :=
+    Stack.Sim.runOpcode_NUMEQUAL_intInt stkSwap a b rest hStkSwap
+  have hChain :
+      Stack.Eval.runOps [.swap, .opcode "OP_NUMEQUAL"] initialStack
+        = .ok ({stkSwap with stack := rest}.push (.vBool (decide (a = b)))) :=
+    runOps_loadThenOpcode_unconditional [.swap] "OP_NUMEQUAL" initialStack
+      stkSwap _ hSwap hEq
+  show (Stack.Eval.runOps
+          ([.swap, .opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT", .push (.bool true)])
+          initialStack).toOption.isSome
+  rw [Stack.Sim.runOps_append, hChain]
+  simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Stack.Eval.runOpcode,
+    Except.toOption, Stack.Eval.StackState.pop?, Stack.Eval.asBool?,
+    Stack.Eval.StackState.push]
+
 /-- Runtime success of `[.swap, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]`. -/
 private theorem runOps_swap_neq_pushTrue_of_agreesTagged_d0d1
     (n1 n2 : String) (tsm_rest : TaggedStackMap)
@@ -4006,7 +4216,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAdd_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("+" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("+" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "+" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4056,7 +4266,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinSub_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("-" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("-" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "-" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4105,7 +4315,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMul_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("*" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("*" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "*" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4155,7 +4365,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinDiv_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("/" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("/" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "/" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4205,7 +4415,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMod_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("%" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("%" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "%" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4254,7 +4464,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLt_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "<" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4303,7 +4513,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLe_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "<=" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4352,7 +4562,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGt_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m ">" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4401,7 +4611,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGe_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m ">=" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4453,7 +4663,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinEq_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("===" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("===" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "===" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4515,18 +4725,10 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("!==" == "!==") && rt == some "bytes") = false := by
-    have hRt : (rt == some "bytes") = false := by
-      cases hRt' : rt with
-      | none => rfl
-      | some s =>
-          by_cases hBytes : s = "bytes"
-          · exact absurd (by rw [hRt', hBytes]) hRtNotBytes
-          · simp [hBytes]
-    simp [hRt]
-  rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
-        methods props m "!==" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
-  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMNOTEQUAL" := by
+  -- Issue #116: `!==` lowers to the 2-opcode tail `[OP_NUMEQUAL, OP_NOT]`.
+  rw [lowerMethodUserRawOps_singletonBinNeqWithCap_d0d1
+        methods props m "!==" n1 n2 bn bcap tail rt src srcCap hCap rfl]
+  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMEQUAL" := by
     unfold Stack.Lower.binopOpcode
     cases hRt : rt with
     | none => rfl
@@ -4536,9 +4738,9 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0d1_isSome
         · simp [hBytes]
   rw [hOpcode]
   show (Stack.Eval.runOps
-          [.swap, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]
+          [.swap, .opcode "OP_NUMEQUAL", .opcode "OP_NOT", .push (.bool true)]
           initialStack).toOption.isSome
-  exact runOps_swap_neq_pushTrue_of_agreesTagged_d0d1 n1 n2 tsm_rest anfSt
+  exact runOps_swap_neqTail_pushTrue_of_agreesTagged_d0d1 n1 n2 tsm_rest anfSt
     initialStack a b hAgrees hLookupL hLookupR
 
 /-- **Method-level runtime-success wrapper for `&&` at d0d1 consume.** -/
@@ -4580,7 +4782,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAnd_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("&&" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("&&" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "&&" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4629,7 +4831,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinOr_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("||" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("||" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "||" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4678,7 +4880,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShl_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m "<<" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4727,7 +4929,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShr_d0d1_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">>" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">>" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0d1
         methods props m ">>" n1 n2 bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -4803,7 +5005,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
     (n1 n2 nm bn bcap : String) (tail : List String)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_dge2_d0 m opName n1 n2 nm bn bcap tail rt src srcCap)
-    (hNotNeqBytes : (opName == "!==" && rt == some "bytes") = false) :
+    (hNotNeqBytes : (opName == "!==") = false) :
     lowerMethodUserRawOps progMethods props m
       = [.rot, .swap, .opcode (Stack.Lower.binopOpcode opName rt),
          .push (.bool true)] := by
@@ -4865,6 +5067,77 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
   simp only [hLoadN2]
   rw [hNotNeqBytes]
   simp only [Bool.false_eq_true, if_false, reduceIte]
+  unfold Stack.Lower.StackMap.popN
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
+  simp [Stack.Lower.lowerBindingsP, Stack.Lower.StackMap.push]
+
+-- Issue #116: `!==` peer of `lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0`.
+set_option maxHeartbeats 4000000 in
+set_option linter.unusedSimpArgs false in
+private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_dge2_d0
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (m : ANFMethod) (opName : String)
+    (n1 n2 nm bn bcap : String) (tail : List String)
+    (rt : Option String) (src srcCap : Option SourceLoc)
+    (hCap : singletonBinOpWithCap_dge2_d0 m opName n1 n2 nm bn bcap tail rt src srcCap)
+    (hIsNeq : opName = "!==") :
+    lowerMethodUserRawOps progMethods props m
+      = [.rot, .swap, .opcode (Stack.Lower.binopOpcode opName rt),
+         .opcode "OP_NOT", .push (.bool true)] := by
+  obtain ⟨hBody, hRev, hne12, hne1m, hne2m, _hBnCap, _hBcapN1, _hBcapN2⟩ := hCap
+  unfold lowerMethodUserRawOps
+  rw [hBody, hRev]
+  rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne12]
+  rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
+  have hFind1 : (n2 :: nm :: n1 :: tail).findIdx? (· == n1) = some 2 := by
+    have h21 : (n2 == n1) = false := by
+      have h : n2 ≠ n1 := fun h => hne12 h.symm
+      simp [beq_iff_eq, h]
+    have hm1 : (nm == n1) = false := by
+      have h : nm ≠ n1 := fun h => hne1m h.symm
+      simp [beq_iff_eq, h]
+    unfold List.findIdx?
+    simp [List.findIdx?.go, h21, hm1]
+  have hFind2 : (n1 :: n2 :: nm :: tail).findIdx? (· == n2) = some 1 := by
+    have h12 : (n1 == n2) = false := by
+      simp [beq_iff_eq, hne12]
+    unfold List.findIdx?
+    simp [List.findIdx?.go, h12]
+  have hLoadN1 :
+      Stack.Lower.loadRefLive (n2 :: nm :: n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
+        = ([.rot], n1 :: n2 :: nm :: tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    rw [hFind1]
+    simp [Stack.Lower.StackMap.removeAtDepth, Stack.Lower.StackMap.push]
+  have hLoadN2 :
+      Stack.Lower.loadRefLive (n1 :: n2 :: nm :: tail) n2 0 [(n2, 0), (n1, 0)] []
+        = ([.swap], n2 :: n1 :: nm :: tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    rw [hFind2]
+    simp
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  simp only [hOperandL, hOperandR]
+  rw [hLoadN1]
+  simp only [hLoadN2]
+  have hIsNeqB : (opName == "!==") = true := by simp [hIsNeq]
+  rw [hIsNeqB]
+  simp only [if_true, reduceIte]
   unfold Stack.Lower.StackMap.popN
   unfold Stack.Lower.lowerBindingsP
   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
@@ -5308,6 +5581,41 @@ private theorem runOps_rot_swap_eq_pushTrue_of_agreesTagged_dge2_d0
   rw [hChain]
   simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Except.toOption]
 
+/-- Issue #116: `[.rot, .swap, OP_NUMEQUAL, OP_NOT, .push true]` success (dge2_d0). -/
+private theorem runOps_rot_swap_neqTail_pushTrue_of_agreesTagged_dge2_d0
+    (n1 n2 nm : String) (tsm_rest : TaggedStackMap)
+    (anfSt : State) (initialStack : StackState) (a b : Int)
+    (hAgrees : agreesTagged
+      ((n2, .param) :: (nm, .param) :: (n1, .param) :: tsm_rest) anfSt initialStack)
+    (hLookupL : anfSt.lookupParam n1 = some (.vBigint a))
+    (hLookupR : anfSt.lookupParam n2 = some (.vBigint b))
+    :
+    (Stack.Eval.runOps
+        [.rot, .swap, .opcode "OP_NUMEQUAL", .opcode "OP_NOT", .push (.bool true)]
+        initialStack).toOption.isSome := by
+  obtain ⟨midV, rest, _hStk, hLoad⟩ :=
+    runOps_rot_swap_post_state_dge2_d0 n1 n2 nm tsm_rest anfSt initialStack a b
+      hAgrees hLookupL hLookupR
+  let stkLoad : StackState :=
+    {initialStack with stack := .vBigint b :: .vBigint a :: midV :: rest}
+  have hStkLoad : stkLoad.stack = .vBigint b :: .vBigint a :: midV :: rest := rfl
+  have hOp :
+      Stack.Eval.runOpcode "OP_NUMEQUAL" stkLoad
+        = .ok ({stkLoad with stack := midV :: rest}.push (.vBool (decide (a = b)))) :=
+    Stack.Sim.runOpcode_NUMEQUAL_intInt stkLoad a b (midV :: rest) hStkLoad
+  have hChain :
+      Stack.Eval.runOps [.rot, .swap, .opcode "OP_NUMEQUAL"] initialStack
+        = .ok ({stkLoad with stack := midV :: rest}.push (.vBool (decide (a = b)))) :=
+    runOps_loadThenOpcode_unconditional [.rot, .swap] "OP_NUMEQUAL" initialStack
+      stkLoad _ hLoad hOp
+  show (Stack.Eval.runOps
+          ([.rot, .swap, .opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT", .push (.bool true)])
+          initialStack).toOption.isSome
+  rw [Stack.Sim.runOps_append, hChain]
+  simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Stack.Eval.runOpcode,
+    Except.toOption, Stack.Eval.StackState.pop?, Stack.Eval.asBool?,
+    Stack.Eval.StackState.push]
+
 /-- Runtime success of `[.rot, .swap, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]`
 under `agreesTagged + two-int lookups` at depth pair (2, 0). -/
 private theorem runOps_rot_swap_neq_pushTrue_of_agreesTagged_dge2_d0
@@ -5528,7 +5836,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAdd_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("+" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("+" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "+" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -5578,7 +5886,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinSub_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("-" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("-" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "-" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -5628,7 +5936,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMul_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("*" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("*" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "*" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -5679,7 +5987,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinDiv_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("/" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("/" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "/" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -5730,7 +6038,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMod_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("%" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("%" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "%" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -5780,7 +6088,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLt_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "<" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -5830,7 +6138,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLe_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "<=" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -5880,7 +6188,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGt_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m ">" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -5930,7 +6238,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGe_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m ">=" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -5981,7 +6289,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinEq_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("===" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("===" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "===" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -6041,18 +6349,10 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("!==" == "!==") && rt == some "bytes") = false := by
-    have hRt : (rt == some "bytes") = false := by
-      cases hRt' : rt with
-      | none => rfl
-      | some s =>
-          by_cases hBytes : s = "bytes"
-          · exact absurd (by rw [hRt', hBytes]) hRtNotBytes
-          · simp [hBytes]
-    simp [hRt]
-  rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
-        methods props m "!==" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
-  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMNOTEQUAL" := by
+  -- Issue #116: `!==` lowers to the 2-opcode tail `[OP_NUMEQUAL, OP_NOT]`.
+  rw [lowerMethodUserRawOps_singletonBinNeqWithCap_dge2_d0
+        methods props m "!==" n1 n2 nm bn bcap tail rt src srcCap hCap rfl]
+  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMEQUAL" := by
     unfold Stack.Lower.binopOpcode
     cases hRt : rt with
     | none => rfl
@@ -6062,9 +6362,9 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_dge2_d0_isSome
         · simp [hBytes]
   rw [hOpcode]
   show (Stack.Eval.runOps
-          [.rot, .swap, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]
+          [.rot, .swap, .opcode "OP_NUMEQUAL", .opcode "OP_NOT", .push (.bool true)]
           initialStack).toOption.isSome
-  exact runOps_rot_swap_neq_pushTrue_of_agreesTagged_dge2_d0 n1 n2 nm tsm_rest anfSt
+  exact runOps_rot_swap_neqTail_pushTrue_of_agreesTagged_dge2_d0 n1 n2 nm tsm_rest anfSt
     initialStack a b hAgrees hLookupL hLookupR
 
 /-- **Method-level runtime-success wrapper for `&&` at depth pair (2, 0)
@@ -6107,7 +6407,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAnd_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("&&" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("&&" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "&&" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -6157,7 +6457,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinOr_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("||" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("||" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "||" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -6207,7 +6507,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShl_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m "<<" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -6257,7 +6557,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShr_dge2_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">>" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">>" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge2_d0
         methods props m ">>" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -6298,7 +6598,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
     (n1 n2 nm bn bcap : String) (tail : List String)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_d0_dge2 m opName n1 n2 nm bn bcap tail rt src srcCap)
-    (hNotNeqBytes : (opName == "!==" && rt == some "bytes") = false) :
+    (hNotNeqBytes : (opName == "!==") = false) :
     lowerMethodUserRawOps progMethods props m
       = [.rot, .opcode (Stack.Lower.binopOpcode opName rt),
          .push (.bool true)] := by
@@ -6357,6 +6657,74 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
   simp only [hLoadN2]
   rw [hNotNeqBytes]
   simp only [Bool.false_eq_true, if_false, reduceIte]
+  unfold Stack.Lower.StackMap.popN
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
+  simp [Stack.Lower.lowerBindingsP, Stack.Lower.StackMap.push]
+
+-- Issue #116: `!==` peer of `lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2`.
+set_option maxHeartbeats 4000000 in
+set_option linter.unusedSimpArgs false in
+private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge2
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (m : ANFMethod) (opName : String)
+    (n1 n2 nm bn bcap : String) (tail : List String)
+    (rt : Option String) (src srcCap : Option SourceLoc)
+    (hCap : singletonBinOpWithCap_d0_dge2 m opName n1 n2 nm bn bcap tail rt src srcCap)
+    (hIsNeq : opName = "!==") :
+    lowerMethodUserRawOps progMethods props m
+      = [.rot, .opcode (Stack.Lower.binopOpcode opName rt),
+         .opcode "OP_NOT", .push (.bool true)] := by
+  obtain ⟨hBody, hRev, hne12, hne1m, hne2m, _hBnCap, _hBcapN1, _hBcapN2⟩ := hCap
+  unfold lowerMethodUserRawOps
+  rw [hBody, hRev]
+  rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne12]
+  rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
+  have hFind1 : (n1 :: nm :: n2 :: tail).findIdx? (· == n1) = some 0 := by
+    unfold List.findIdx?
+    simp [List.findIdx?.go]
+  have hFind2 : (n1 :: nm :: n2 :: tail).findIdx? (· == n2) = some 2 := by
+    have h12 : (n1 == n2) = false := by
+      simp [beq_iff_eq, hne12]
+    have hm2 : (nm == n2) = false := by
+      have h : nm ≠ n2 := fun h => hne2m h.symm
+      simp [beq_iff_eq, h]
+    unfold List.findIdx?
+    simp [List.findIdx?.go, h12, hm2]
+  have hLoadN1 :
+      Stack.Lower.loadRefLive (n1 :: nm :: n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
+        = ([], n1 :: nm :: n2 :: tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    rw [hFind1]
+    simp
+  have hLoadN2 :
+      Stack.Lower.loadRefLive (n1 :: nm :: n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
+        = ([.rot], n2 :: n1 :: nm :: tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    rw [hFind2]
+    simp [Stack.Lower.StackMap.removeAtDepth, Stack.Lower.StackMap.push]
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  simp only [hOperandL, hOperandR]
+  rw [hLoadN1]
+  simp only [hLoadN2]
+  have hIsNeqB : (opName == "!==") = true := by simp [hIsNeq]
+  rw [hIsNeqB]
+  simp only [if_true, reduceIte]
   unfold Stack.Lower.StackMap.popN
   unfold Stack.Lower.lowerBindingsP
   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
@@ -6792,6 +7160,41 @@ private theorem runOps_rot_eq_pushTrue_of_agreesTagged_d0_dge2
   rw [hChain]
   simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Except.toOption]
 
+/-- Issue #116: `[.rot, OP_NUMEQUAL, OP_NOT, .push true]` success (d0_dge2). -/
+private theorem runOps_rot_neqTail_pushTrue_of_agreesTagged_d0_dge2
+    (n1 n2 nm : String) (tsm_rest : TaggedStackMap)
+    (anfSt : State) (initialStack : StackState) (a b : Int)
+    (hAgrees : agreesTagged
+      ((n1, .param) :: (nm, .param) :: (n2, .param) :: tsm_rest) anfSt initialStack)
+    (hLookupL : anfSt.lookupParam n1 = some (.vBigint a))
+    (hLookupR : anfSt.lookupParam n2 = some (.vBigint b))
+    :
+    (Stack.Eval.runOps
+        [.rot, .opcode "OP_NUMEQUAL", .opcode "OP_NOT", .push (.bool true)]
+        initialStack).toOption.isSome := by
+  obtain ⟨midV, rest, _hStk, hLoad⟩ :=
+    runOps_rot_post_state_d0_dge2 n1 n2 nm tsm_rest anfSt initialStack a b
+      hAgrees hLookupL hLookupR
+  let stkLoad : StackState :=
+    {initialStack with stack := .vBigint b :: .vBigint a :: midV :: rest}
+  have hStkLoad : stkLoad.stack = .vBigint b :: .vBigint a :: midV :: rest := rfl
+  have hOp :
+      Stack.Eval.runOpcode "OP_NUMEQUAL" stkLoad
+        = .ok ({stkLoad with stack := midV :: rest}.push (.vBool (decide (a = b)))) :=
+    Stack.Sim.runOpcode_NUMEQUAL_intInt stkLoad a b (midV :: rest) hStkLoad
+  have hChain :
+      Stack.Eval.runOps [.rot, .opcode "OP_NUMEQUAL"] initialStack
+        = .ok ({stkLoad with stack := midV :: rest}.push (.vBool (decide (a = b)))) :=
+    runOps_loadThenOpcode_unconditional [.rot] "OP_NUMEQUAL" initialStack
+      stkLoad _ hLoad hOp
+  show (Stack.Eval.runOps
+          ([.rot, .opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT", .push (.bool true)])
+          initialStack).toOption.isSome
+  rw [Stack.Sim.runOps_append, hChain]
+  simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Stack.Eval.runOpcode,
+    Except.toOption, Stack.Eval.StackState.pop?, Stack.Eval.asBool?,
+    Stack.Eval.StackState.push]
+
 /-- Runtime success of `[.rot, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]`
 under `agreesTagged + two-int lookups` at depth pair (0, 2). -/
 private theorem runOps_rot_neq_pushTrue_of_agreesTagged_d0_dge2
@@ -7009,7 +7412,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAdd_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("+" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("+" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "+" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7059,7 +7462,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinSub_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("-" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("-" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "-" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7109,7 +7512,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMul_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("*" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("*" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "*" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7160,7 +7563,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinDiv_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("/" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("/" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "/" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7211,7 +7614,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMod_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("%" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("%" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "%" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7261,7 +7664,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLt_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "<" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7311,7 +7714,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLe_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "<=" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7361,7 +7764,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGt_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m ">" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7411,7 +7814,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGe_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m ">=" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7462,7 +7865,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinEq_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("===" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("===" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "===" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7522,18 +7925,10 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("!==" == "!==") && rt == some "bytes") = false := by
-    have hRt : (rt == some "bytes") = false := by
-      cases hRt' : rt with
-      | none => rfl
-      | some s =>
-          by_cases hBytes : s = "bytes"
-          · exact absurd (by rw [hRt', hBytes]) hRtNotBytes
-          · simp [hBytes]
-    simp [hRt]
-  rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
-        methods props m "!==" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
-  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMNOTEQUAL" := by
+  -- Issue #116: `!==` lowers to the 2-opcode tail `[OP_NUMEQUAL, OP_NOT]`.
+  rw [lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge2
+        methods props m "!==" n1 n2 nm bn bcap tail rt src srcCap hCap rfl]
+  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMEQUAL" := by
     unfold Stack.Lower.binopOpcode
     cases hRt : rt with
     | none => rfl
@@ -7543,9 +7938,9 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0_dge2_isSome
         · simp [hBytes]
   rw [hOpcode]
   show (Stack.Eval.runOps
-          [.rot, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]
+          [.rot, .opcode "OP_NUMEQUAL", .opcode "OP_NOT", .push (.bool true)]
           initialStack).toOption.isSome
-  exact runOps_rot_neq_pushTrue_of_agreesTagged_d0_dge2 n1 n2 nm tsm_rest anfSt
+  exact runOps_rot_neqTail_pushTrue_of_agreesTagged_d0_dge2 n1 n2 nm tsm_rest anfSt
     initialStack a b hAgrees hLookupL hLookupR
 
 /-- **Method-level runtime-success wrapper for `&&` at depth pair (0, 2)
@@ -7588,7 +7983,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAnd_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("&&" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("&&" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "&&" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7638,7 +8033,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinOr_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("||" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("||" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "||" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7688,7 +8083,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShl_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m "<<" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7738,7 +8133,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShr_d0_dge2_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">>" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">>" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge2
         methods props m ">>" n1 n2 nm bn bcap tail rt src srcCap hCap hNotNeqBytes]
@@ -7867,7 +8262,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
     (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_dge3_d0 m opName n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap)
-    (hNotNeqBytes : (opName == "!==" && rt == some "bytes") = false) :
+    (hNotNeqBytes : (opName == "!==") = false) :
     lowerMethodUserRawOps progMethods props m
       = [.roll (midsRest.length + 3), .swap,
          .opcode (Stack.Lower.binopOpcode opName rt), .push (.bool true)] := by
@@ -7936,6 +8331,87 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
   simp only [hLoadN2]
   rw [hNotNeqBytes]
   simp only [Bool.false_eq_true, if_false, reduceIte]
+  unfold Stack.Lower.StackMap.popN
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
+  simp [Stack.Lower.lowerBindingsP, Stack.Lower.StackMap.push]
+
+-- Issue #116: `!==` peer of `lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0`.
+set_option maxHeartbeats 4000000 in
+set_option linter.unusedSimpArgs false in
+private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_dge3_d0
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (m : ANFMethod) (opName : String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (rt : Option String) (src srcCap : Option SourceLoc)
+    (hCap : singletonBinOpWithCap_dge3_d0 m opName n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap)
+    (hIsNeq : opName = "!==") :
+    lowerMethodUserRawOps progMethods props m
+      = [.roll (midsRest.length + 3), .swap,
+         .opcode (Stack.Lower.binopOpcode opName rt), .opcode "OP_NOT",
+         .push (.bool true)] := by
+  obtain ⟨hBody, hRev, hne12, hPre, _hBnCap, _hBcapN1, _hBcapN2⟩ := hCap
+  unfold lowerMethodUserRawOps
+  rw [hBody, hRev]
+  rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne12]
+  rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
+  have hLoadN1 :
+      Stack.Lower.loadRefLive
+          (n2 :: m1 :: m2 :: midsRest ++ n1 :: tail) n1 0 [(n2, 0), (n1, 0)] []
+        = ([.roll (midsRest.length + 3)],
+           n1 :: n2 :: m1 :: m2 :: midsRest ++ tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    have hFind :
+        (n2 :: m1 :: m2 :: midsRest ++ n1 :: tail).findIdx? (· == n1)
+          = some (n2 :: m1 :: m2 :: midsRest).length := by
+      have := findIdx_skip_pre n1 (n2 :: m1 :: m2 :: midsRest) tail hPre
+      simpa using this
+    rw [hFind]
+    simp only [List.length_cons]
+    have hRem :
+        Stack.Lower.StackMap.removeAtDepth
+            (n2 :: m1 :: m2 :: midsRest ++ n1 :: tail)
+            (n2 :: m1 :: m2 :: midsRest).length
+          = n2 :: m1 :: m2 :: midsRest ++ tail := by
+      have := removeAt_skip_pre n1 (n2 :: m1 :: m2 :: midsRest) tail
+      simpa using this
+    simp only [List.length_cons] at hRem
+    rw [hRem]
+    rfl
+  have hLoadN2 :
+      Stack.Lower.loadRefLive
+          (n1 :: n2 :: m1 :: m2 :: midsRest ++ tail) n2 0 [(n2, 0), (n1, 0)] []
+        = ([.swap], n2 :: n1 :: m1 :: m2 :: midsRest ++ tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    have hFind2 :
+        (n1 :: n2 :: m1 :: m2 :: midsRest ++ tail).findIdx? (· == n2) = some 1 := by
+      have h12 : (n1 == n2) = false := by simp [beq_iff_eq, hne12]
+      unfold List.findIdx?
+      simp [List.findIdx?.go, h12]
+    rw [hFind2]
+    simp
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  simp only [hOperandL, hOperandR]
+  rw [hLoadN1]
+  simp only [hLoadN2]
+  have hIsNeqB : (opName == "!==") = true := by simp [hIsNeq]
+  rw [hIsNeqB]
+  simp only [if_true, reduceIte]
   unfold Stack.Lower.StackMap.popN
   unfold Stack.Lower.lowerBindingsP
   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
@@ -8121,7 +8597,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAdd_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("+" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("+" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "+" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -8443,6 +8919,42 @@ private theorem runOps_rollSwap_eq_pushTrue_of_agreesTagged_dge3_d0
   rw [hChain]
   simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Except.toOption]
 
+/-- Issue #116: `[.roll d, .swap, OP_NUMEQUAL, OP_NOT, .push true]` success (dge3_d0). -/
+private theorem runOps_rollSwap_neqTail_pushTrue_of_agreesTagged_dge3_d0
+    (n1 n2 : String) (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap)
+    (anfSt : State) (initialStack : StackState) (a b : Int)
+    (hAgrees : agreesTagged
+      ((n2, .param) :: midTags ++ (n1, .param) :: tsm_rest) anfSt initialStack)
+    (hLookupL : anfSt.lookupParam n1 = some (.vBigint a))
+    (hLookupR : anfSt.lookupParam n2 = some (.vBigint b)) :
+    (Stack.Eval.runOps
+        [.roll (midTags.length + 1), .swap, .opcode "OP_NUMEQUAL", .opcode "OP_NOT",
+         .push (.bool true)]
+        initialStack).toOption.isSome := by
+  obtain ⟨midTail, hLoad⟩ :=
+    runOps_rollSwap_post_state_dge3_d0 n1 n2 midTags tsm_rest anfSt initialStack a b
+      hAgrees hLookupL hLookupR
+  let stkLoad : StackState :=
+    {initialStack with stack := .vBigint b :: .vBigint a :: midTail}
+  have hStkLoad : stkLoad.stack = .vBigint b :: .vBigint a :: midTail := rfl
+  have hOp :
+      Stack.Eval.runOpcode "OP_NUMEQUAL" stkLoad
+        = .ok ({stkLoad with stack := midTail}.push (.vBool (decide (a = b)))) :=
+    Stack.Sim.runOpcode_NUMEQUAL_intInt stkLoad a b midTail hStkLoad
+  have hChain :
+      Stack.Eval.runOps [.roll (midTags.length + 1), .swap, .opcode "OP_NUMEQUAL"] initialStack
+        = .ok ({stkLoad with stack := midTail}.push (.vBool (decide (a = b)))) :=
+    runOps_loadThenOpcode_unconditional [.roll (midTags.length + 1), .swap]
+      "OP_NUMEQUAL" initialStack stkLoad _ hLoad hOp
+  show (Stack.Eval.runOps
+          ([.roll (midTags.length + 1), .swap, .opcode "OP_NUMEQUAL"]
+            ++ [.opcode "OP_NOT", .push (.bool true)])
+          initialStack).toOption.isSome
+  rw [Stack.Sim.runOps_append, hChain]
+  simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Stack.Eval.runOpcode,
+    Except.toOption, Stack.Eval.StackState.pop?, Stack.Eval.asBool?,
+    Stack.Eval.StackState.push]
+
 /-- Runtime success of `[.roll d, .swap, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]`
 under `agreesTagged + two-int lookups` at depth pair (d ≥ 3, 0). -/
 private theorem runOps_rollSwap_neq_pushTrue_of_agreesTagged_dge3_d0
@@ -8655,7 +9167,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinSub_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("-" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("-" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "-" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -8707,7 +9219,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMul_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("*" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("*" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "*" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -8760,7 +9272,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinDiv_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("/" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("/" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "/" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -8813,7 +9325,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMod_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("%" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("%" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "%" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -8865,7 +9377,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLt_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "<" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -8917,7 +9429,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLe_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "<=" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -8969,7 +9481,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGt_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m ">" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -9021,7 +9533,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGe_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m ">=" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -9074,7 +9586,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinEq_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("===" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("===" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "===" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -9136,18 +9648,10 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("!==" == "!==") && rt == some "bytes") = false := by
-    have hRt : (rt == some "bytes") = false := by
-      cases hRt' : rt with
-      | none => rfl
-      | some s =>
-          by_cases hBytes : s = "bytes"
-          · exact absurd (by rw [hRt', hBytes]) hRtNotBytes
-          · simp [hBytes]
-    simp [hRt]
-  rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
-        methods props m "!==" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
-  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMNOTEQUAL" := by
+  -- Issue #116: `!==` lowers to the 2-opcode tail `[OP_NUMEQUAL, OP_NOT]`.
+  rw [lowerMethodUserRawOps_singletonBinNeqWithCap_dge3_d0
+        methods props m "!==" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap rfl]
+  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMEQUAL" := by
     unfold Stack.Lower.binopOpcode
     cases hRt : rt with
     | none => rfl
@@ -9159,9 +9663,10 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_dge3_d0_isSome
   have hDepthEq : midsRest.length + 3 = midTags.length + 1 := by omega
   rw [hDepthEq]
   show (Stack.Eval.runOps
-          [.roll (midTags.length + 1), .swap, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]
+          [.roll (midTags.length + 1), .swap, .opcode "OP_NUMEQUAL", .opcode "OP_NOT",
+           .push (.bool true)]
           initialStack).toOption.isSome
-  exact runOps_rollSwap_neq_pushTrue_of_agreesTagged_dge3_d0 n1 n2 midTags tsm_rest
+  exact runOps_rollSwap_neqTail_pushTrue_of_agreesTagged_dge3_d0 n1 n2 midTags tsm_rest
     anfSt initialStack a b hAgrees hLookupL hLookupR
 
 /-- **Method-level runtime-success wrapper for `&&` at depth pair
@@ -9204,7 +9709,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAnd_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("&&" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("&&" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "&&" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -9256,7 +9761,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinOr_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("||" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("||" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "||" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -9308,7 +9813,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShl_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m "<<" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -9360,7 +9865,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShr_dge3_d0_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">>" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">>" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_dge3_d0
         methods props m ">>" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -9407,7 +9912,7 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
     (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
     (rt : Option String) (src srcCap : Option SourceLoc)
     (hCap : singletonBinOpWithCap_d0_dge3 m opName n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap)
-    (hNotNeqBytes : (opName == "!==" && rt == some "bytes") = false) :
+    (hNotNeqBytes : (opName == "!==") = false) :
     lowerMethodUserRawOps progMethods props m
       = [.roll (midsRest.length + 3),
          .opcode (Stack.Lower.binopOpcode opName rt), .push (.bool true)] := by
@@ -9475,6 +9980,86 @@ private theorem lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
   simp only [hLoadN2]
   rw [hNotNeqBytes]
   simp only [Bool.false_eq_true, if_false, reduceIte]
+  unfold Stack.Lower.StackMap.popN
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
+  simp [Stack.Lower.lowerBindingsP, Stack.Lower.StackMap.push]
+
+-- Issue #116: `!==` peer of `lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3`.
+set_option maxHeartbeats 4000000 in
+set_option linter.unusedSimpArgs false in
+private theorem lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge3
+    (progMethods : List ANFMethod) (props : List ANFProperty)
+    (m : ANFMethod) (opName : String)
+    (n1 n2 m1 m2 bn bcap : String) (midsRest tail : List String)
+    (rt : Option String) (src srcCap : Option SourceLoc)
+    (hCap : singletonBinOpWithCap_d0_dge3 m opName n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap)
+    (hIsNeq : opName = "!==") :
+    lowerMethodUserRawOps progMethods props m
+      = [.roll (midsRest.length + 3),
+         .opcode (Stack.Lower.binopOpcode opName rt), .opcode "OP_NOT",
+         .push (.bool true)] := by
+  obtain ⟨hBody, hRev, hne12, hPre, _hBnCap, _hBcapN1, _hBcapN2⟩ := hCap
+  unfold lowerMethodUserRawOps
+  rw [hBody, hRev]
+  rw [computeLastUses_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap hne12]
+  rw [collectConstInts_singletonBinOpWithCap opName bn bcap n1 n2 rt src srcCap]
+  have hLoadN1 :
+      Stack.Lower.loadRefLive
+          (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail) n1 0 [(n2, 0), (n1, 0)] []
+        = ([], n1 :: m1 :: m2 :: midsRest ++ n2 :: tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n1, isLastUse_two_first n1 n2 hne12]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    have hFind1 : (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail).findIdx? (· == n1) = some 0 := by
+      simp only [List.cons_append]
+      rw [List.findIdx?_cons]
+      simp
+    rw [hFind1]
+    simp
+  have hLoadN2 :
+      Stack.Lower.loadRefLive
+          (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail) n2 0 [(n2, 0), (n1, 0)] []
+        = ([.roll (midsRest.length + 3)],
+           n2 :: n1 :: m1 :: m2 :: midsRest ++ tail) := by
+    unfold Stack.Lower.loadRefLive Stack.Lower.bringToTop
+    rw [listContains_nil_local n2, isLastUse_two_second n1 n2]
+    simp only [Bool.not_false, Bool.true_and]
+    unfold Stack.Lower.StackMap.depth?
+    have hFind2 :
+        (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail).findIdx? (· == n2)
+          = some (n1 :: m1 :: m2 :: midsRest).length := by
+      have := findIdx_skip_pre n2 (n1 :: m1 :: m2 :: midsRest) tail hPre
+      simpa using this
+    rw [hFind2]
+    simp only [List.length_cons]
+    have hRem :
+        Stack.Lower.StackMap.removeAtDepth
+            (n1 :: m1 :: m2 :: midsRest ++ n2 :: tail)
+            (n1 :: m1 :: m2 :: midsRest).length
+          = n1 :: m1 :: m2 :: midsRest ++ tail := by
+      have := removeAt_skip_pre n2 (n1 :: m1 :: m2 :: midsRest) tail
+      simpa using this
+    simp only [List.length_cons] at hRem
+    rw [hRem]
+    rfl
+  unfold Stack.Lower.lowerBindingsP
+  unfold Stack.Lower.lowerValueP
+  have hOperandL : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n1 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n1 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_left sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  have hOperandR : ∀ sm : Stack.Lower.StackMap,
+      Stack.Lower.loadRefOperand sm n2 [n1, n2] 0 [(n2, 0), (n1, 0)] []
+        = Stack.Lower.loadRefLive sm n2 0 [(n2, 0), (n1, 0)] [] :=
+    fun sm => Stack.Lower.loadRefOperand_pair_right sm n1 n2 0 [(n2, 0), (n1, 0)] [] hne12
+  simp only [hOperandL, hOperandR]
+  rw [hLoadN1]
+  simp only [hLoadN2]
+  have hIsNeqB : (opName == "!==") = true := by simp [hIsNeq]
+  rw [hIsNeqB]
+  simp only [if_true, reduceIte]
   unfold Stack.Lower.StackMap.popN
   unfold Stack.Lower.lowerBindingsP
   unfold Stack.Lower.lowerValueP Stack.Lower.emitConst
@@ -9628,7 +10213,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAdd_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("+" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("+" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "+" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -9948,6 +10533,42 @@ private theorem runOps_roll_eq_pushTrue_of_agreesTagged_d0_dge3
   rw [hChain]
   simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Except.toOption]
 
+/-- Issue #116: `[.roll d, OP_NUMEQUAL, OP_NOT, .push true]` success (d0_dge3). -/
+private theorem runOps_roll_neqTail_pushTrue_of_agreesTagged_d0_dge3
+    (n1 n2 : String) (midTags : TaggedStackMap) (tsm_rest : TaggedStackMap)
+    (anfSt : State) (initialStack : StackState) (a b : Int)
+    (hAgrees : agreesTagged
+      ((n1, .param) :: midTags ++ (n2, .param) :: tsm_rest) anfSt initialStack)
+    (hLookupL : anfSt.lookupParam n1 = some (.vBigint a))
+    (hLookupR : anfSt.lookupParam n2 = some (.vBigint b)) :
+    (Stack.Eval.runOps
+        [.roll (midTags.length + 1), .opcode "OP_NUMEQUAL", .opcode "OP_NOT",
+         .push (.bool true)]
+        initialStack).toOption.isSome := by
+  obtain ⟨midTail, hLoad⟩ :=
+    runOps_roll_post_state_d0_dge3 n1 n2 midTags tsm_rest anfSt initialStack a b
+      hAgrees hLookupL hLookupR
+  let stkLoad : StackState :=
+    {initialStack with stack := .vBigint b :: .vBigint a :: midTail}
+  have hStkLoad : stkLoad.stack = .vBigint b :: .vBigint a :: midTail := rfl
+  have hOp :
+      Stack.Eval.runOpcode "OP_NUMEQUAL" stkLoad
+        = .ok ({stkLoad with stack := midTail}.push (.vBool (decide (a = b)))) :=
+    Stack.Sim.runOpcode_NUMEQUAL_intInt stkLoad a b midTail hStkLoad
+  have hChain :
+      Stack.Eval.runOps [.roll (midTags.length + 1), .opcode "OP_NUMEQUAL"] initialStack
+        = .ok ({stkLoad with stack := midTail}.push (.vBool (decide (a = b)))) :=
+    runOps_loadThenOpcode_unconditional [.roll (midTags.length + 1)]
+      "OP_NUMEQUAL" initialStack stkLoad _ hLoad hOp
+  show (Stack.Eval.runOps
+          ([.roll (midTags.length + 1), .opcode "OP_NUMEQUAL"]
+            ++ [.opcode "OP_NOT", .push (.bool true)])
+          initialStack).toOption.isSome
+  rw [Stack.Sim.runOps_append, hChain]
+  simp [Stack.Eval.runOps, Stack.Eval.stepNonIf, Stack.Eval.runOpcode,
+    Except.toOption, Stack.Eval.StackState.pop?, Stack.Eval.asBool?,
+    Stack.Eval.StackState.push]
+
 /-- Runtime success of `[.roll d, .opcode "OP_NUMNOTEQUAL", .push (.bool true)]`
 under `agreesTagged + two-int lookups` at depth pair (0, d ≥ 3). -/
 private theorem runOps_roll_neq_pushTrue_of_agreesTagged_d0_dge3
@@ -10160,7 +10781,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinSub_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("-" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("-" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "-" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10212,7 +10833,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMul_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("*" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("*" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "*" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10265,7 +10886,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinDiv_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("/" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("/" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "/" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10318,7 +10939,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinMod_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("%" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("%" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "%" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10370,7 +10991,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLt_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "<" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10422,7 +11043,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinLe_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "<=" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10474,7 +11095,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGt_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m ">" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10526,7 +11147,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinGe_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">=" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">=" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m ">=" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10579,7 +11200,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinEq_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("===" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("===" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "===" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10641,18 +11262,10 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("!==" == "!==") && rt == some "bytes") = false := by
-    have hRt : (rt == some "bytes") = false := by
-      cases hRt' : rt with
-      | none => rfl
-      | some s =>
-          by_cases hBytes : s = "bytes"
-          · exact absurd (by rw [hRt', hBytes]) hRtNotBytes
-          · simp [hBytes]
-    simp [hRt]
-  rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
-        methods props m "!==" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
-  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMNOTEQUAL" := by
+  -- Issue #116: `!==` lowers to the 2-opcode tail `[OP_NUMEQUAL, OP_NOT]`.
+  rw [lowerMethodUserRawOps_singletonBinNeqWithCap_d0_dge3
+        methods props m "!==" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap rfl]
+  have hOpcode : Stack.Lower.binopOpcode "!==" rt = "OP_NUMEQUAL" := by
     unfold Stack.Lower.binopOpcode
     cases hRt : rt with
     | none => rfl
@@ -10664,9 +11277,10 @@ theorem runMethod_lower_public_unique_no_post_singletonBinNeq_d0_dge3_isSome
   have hDepthEq : midsRest.length + 3 = midTags.length + 1 := by omega
   rw [hDepthEq]
   show (Stack.Eval.runOps
-          [.roll (midTags.length + 1), .opcode "OP_NUMNOTEQUAL", .push (.bool true)]
+          [.roll (midTags.length + 1), .opcode "OP_NUMEQUAL", .opcode "OP_NOT",
+           .push (.bool true)]
           initialStack).toOption.isSome
-  exact runOps_roll_neq_pushTrue_of_agreesTagged_d0_dge3 n1 n2 midTags tsm_rest
+  exact runOps_roll_neqTail_pushTrue_of_agreesTagged_d0_dge3 n1 n2 midTags tsm_rest
     anfSt initialStack a b hAgrees hLookupL hLookupR
 
 /-- **Method-level runtime-success wrapper for `&&` at depth pair
@@ -10709,7 +11323,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinAnd_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("&&" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("&&" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "&&" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10761,7 +11375,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinOr_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("||" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("||" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "||" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10813,7 +11427,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShl_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : (("<<" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : ("<<" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m "<<" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -10865,7 +11479,7 @@ theorem runMethod_lower_public_unique_no_post_singletonBinShr_d0_dge3_isSome
   rw [runMethod_lower_public_unique_no_post_eq_userRaw
         contractName props methods m initialStack hMem hPublic hUnique
         hNoPreimage hNoCode hNoTerminalAssert hNoDeserialize]
-  have hNotNeqBytes : ((">>" == "!==") && rt == some "bytes") = false := by
+  have hNotNeqBytes : (">>" == "!==") = false := by
     simp
   rw [lowerMethodUserRawOps_singletonBinOpWithCap_d0_dge3
         methods props m ">>" n1 n2 m1 m2 bn bcap midsRest tail rt src srcCap hCap hNotNeqBytes]
@@ -11618,7 +12232,7 @@ theorem build_consume_binOp_witness_d0d1
     (hDepthR : sm.depth? r = some 1)
     (hLastUseL : Stack.Lower.isLastUse lastUses l currentIndex = true)
     (hLastUseR : Stack.Lower.isLastUse lastUses r currentIndex = true)
-    (hNotBytes : (op == "!==" && rt == some "bytes") = false)
+    (hNotBytes : (op == "!==") = false)
     (hAgrees : agreesTagged ((l, k_l) :: (r, k_r) :: tsm_rest) anfSt stkSt)
     (hLookupL : lookupAnfByKind anfSt (l, k_l) = some (.vBigint a))
     (hLookupR : lookupAnfByKind anfSt (r, k_r) = some (.vBigint b))
@@ -11747,7 +12361,7 @@ theorem build_consume_binOp_witness
     (hDepthR : sm.depth? r = some 1)
     (hLastUseL : Stack.Lower.isLastUse lastUses l currentIndex = true)
     (hLastUseR : Stack.Lower.isLastUse lastUses r currentIndex = true)
-    (hNotBytes : (op == "!==" && rt == some "bytes") = false)
+    (hNotBytes : (op == "!==") = false)
     (hAgrees : agreesTagged ((l, k_l) :: (r, k_r) :: tsm_rest) anfSt stkSt)
     (hLookupL : lookupAnfByKind anfSt (l, k_l) = some (.vBigint a))
     (hLookupR : lookupAnfByKind anfSt (r, k_r) = some (.vBigint b))
@@ -11791,7 +12405,7 @@ def structuralArithConsumeValueBool
       Stack.Lower.isLastUse lastUses l currentIndex &&
       (!Stack.Lower.listContains outerProtected r) &&
       Stack.Lower.isLastUse lastUses r currentIndex &&
-      (!(op == "!==" && rt == some "bytes"))
+      (!(op == "!=="))
   | .unaryOp _op operand _rt =>
       decide (sm.depth? operand = some 0) &&
       (!Stack.Lower.listContains outerProtected operand) &&
@@ -11873,7 +12487,7 @@ theorem structuralArithConsumeBodyBool_reflect_consBinOp
   obtain ⟨⟨⟨⟨⟨⟨hDl, hDr⟩, _hOpL⟩, hLuL⟩, _hOpR⟩, hLuR⟩, hNB⟩ := hShape
   have hDl : sm.depth? l = some 0 := of_decide_eq_true hDl
   have hDr : sm.depth? r = some 1 := of_decide_eq_true hDr
-  have hNotBytes : (op == "!==" && rt == some "bytes") = false :=
+  have hNotBytes : (op == "!==") = false :=
     Bool.not_eq_true' _ |>.mp hNB
   have hRun :
       runOps (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
@@ -12483,7 +13097,7 @@ theorem structuralArithConsumeBody_d0d1d0_of_entry_agreesTagged
     (hD0_p0 : sm.depth? p0 = some 0) (hD0_p1 : sm.depth? p1 = some 1)
     (hLU_p0 : Stack.Lower.isLastUse lastUses p0 0 = true)
     (hLU_p1 : Stack.Lower.isLastUse lastUses p1 0 = true)
-    (hNB0 : (op0 == "!==" && rt0 == some "bytes") = false)
+    (hNB0 : (op0 == "!==") = false)
     (hD1_n0 : (Stack.Lower.lowerValueP progMethods props budget 0 lastUses
                 [] localBindings constInts sm n0 (.binOp op0 p0 p1 rt0)).2.1.depth? n0
                 = some 0)
@@ -12492,7 +13106,7 @@ theorem structuralArithConsumeBody_d0d1d0_of_entry_agreesTagged
                 = some 1)
     (hLU_n0 : Stack.Lower.isLastUse lastUses n0 1 = true)
     (hLU_p2 : Stack.Lower.isLastUse lastUses p2 1 = true)
-    (hNB1 : (op1 == "!==" && rt1 == some "bytes") = false)
+    (hNB1 : (op1 == "!==") = false)
     (hD2_n1 : (Stack.Lower.lowerValueP progMethods props budget 1 lastUses []
                 localBindings constInts
                 (Stack.Lower.lowerValueP progMethods props budget 0 lastUses
@@ -13445,7 +14059,7 @@ private theorem emittableBinOpShapeBool_facts
     sm.depth? l = some 0 ∧ sm.depth? r = some 1 ∧
     Stack.Lower.isLastUse lastUses l currentIndex = true ∧
     Stack.Lower.isLastUse lastUses r currentIndex = true ∧
-    (op == "!==" && rt == some "bytes") = false := by
+    (op == "!==") = false := by
   simp only [structuralArithConsumeValueBool, Bool.and_eq_true] at hShape
   obtain ⟨⟨⟨⟨⟨⟨hDl, hDr⟩, _⟩, hLu_l⟩, _⟩, hLu_r⟩, hNB⟩ := hShape
   refine ⟨of_decide_eq_true hDl, of_decide_eq_true hDr, hLu_l, hLu_r, ?_⟩
@@ -13476,7 +14090,7 @@ private theorem lowerValueP_binOp_d0d1_ops
     (hDepthR : sm.depth? r = some 1)
     (hLastUseL : Stack.Lower.isLastUse lastUses l currentIndex = true)
     (hLastUseR : Stack.Lower.isLastUse lastUses r currentIndex = true)
-    (hNotBytes : (op == "!==" && rt == some "bytes") = false) :
+    (hNotBytes : (op == "!==") = false) :
     (Stack.Lower.lowerValueP progMethods props budget currentIndex lastUses
         [] localBindings constInts sm name (.binOp op l r rt)).1
       = [StackOp.swap, .opcode (Stack.Lower.binopOpcode op rt)] := by
@@ -15410,7 +16024,7 @@ theorem agrees_success_step_binOp
     (hDepthR : sm.depth? r = some 1)
     (hLastUseL : Stack.Lower.isLastUse lastUses l currentIndex = true)
     (hLastUseR : Stack.Lower.isLastUse lastUses r currentIndex = true)
-    (hNotBytes : (op == "!==" && rt == some "bytes") = false)
+    (hNotBytes : (op == "!==") = false)
     (hAgrees : agreesTagged ((l, k_l) :: (r, k_r) :: tsm_rest) anfSt stkSt)
     (hHeadCorrL : anfSt.resolveRef l = lookupAnfByKind anfSt (l, k_l))
     (hHeadCorrR : anfSt.resolveRef r = lookupAnfByKind anfSt (r, k_r))
@@ -15900,7 +16514,7 @@ theorem agreesTagged_arith_walk_iff
           obtain ⟨⟨⟨⟨⟨⟨hDl, hDr⟩, _hNCl⟩, hLuL⟩, _hNCr⟩, hLuR⟩, hNotBytes⟩ := hShapeCopy
           have hDl : sm.depth? l = some 0 := of_decide_eq_true hDl
           have hDr : sm.depth? r = some 1 := of_decide_eq_true hDr
-          have hNotBytes' : (op == "!==" && rt == some "bytes") = false :=
+          have hNotBytes' : (op == "!==") = false :=
             Bool.not_eq_true' _ ▸ hNotBytes
           -- Decompose `tsm = (l,k_l)::(r,k_r)::tsm_rest`.
           obtain ⟨k_l, k_r, tsm_rest, hTsmEq, hUntagRest⟩ :=
@@ -16322,7 +16936,7 @@ theorem build_consume_binOp_witness_d1d0
     (hNeq : (r == l) = false)
     (hLastUseL : Stack.Lower.isLastUse lastUses l currentIndex = true)
     (hLastUseR : Stack.Lower.isLastUse lastUses r currentIndex = true)
-    (hNotBytes : (op == "!==" && rt == some "bytes") = false)
+    (hNotBytes : (op == "!==") = false)
     (hAgrees : agreesTagged ((r, k_r) :: (l, k_l) :: tsm_rest) anfSt stkSt)
     (hLookupL : lookupAnfByKind anfSt (l, k_l) = some (.vBigint a))
     (hLookupR : lookupAnfByKind anfSt (r, k_r) = some (.vBigint b))

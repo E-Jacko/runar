@@ -119,9 +119,15 @@ theorem lower_binOp_numEq (sm : StackMap) (bn : String) (l r : String) :
     lowerValue sm bn (.binOp "===" l r none) =
       (loadRef sm l ++ loadRef (sm.push l) r ++ [.opcode "OP_NUMEQUAL"], sm.push bn) := rfl
 
+/-- Issue #116: numeric `!==` now lowers to the 2-opcode tail
+`[OP_NUMEQUAL, OP_NOT]` (mirroring the TS `BINOP_OPCODES['!==']` table),
+matching the byte-equality variant `lower_binOp_neq_bytes`. The single
+`OP_NUMNOTEQUAL` opcode is no longer emitted; its runtime meaning is
+recovered by the bridge `runOps_numEqualNot_eq_numNotEqual` below. -/
 theorem lower_binOp_numNeq (sm : StackMap) (bn : String) (l r : String) :
     lowerValue sm bn (.binOp "!==" l r none) =
-      (loadRef sm l ++ loadRef (sm.push l) r ++ [.opcode "OP_NUMNOTEQUAL"], sm.push bn) := rfl
+      (loadRef sm l ++ loadRef (sm.push l) r ++
+        [.opcode (binopOpcode "!==" none)] ++ [.opcode "OP_NOT"], sm.push bn) := rfl
 
 theorem lower_binOp_bytesEq (sm : StackMap) (bn : String) (l r : String) :
     lowerValue sm bn (.binOp "===" l r (some "bytes")) =
@@ -1212,6 +1218,35 @@ theorem run_OP_CAT_bytesBytes
   unfold runOps
   rw [stepNonIf_opcode, runOpcode_CAT_bytesBytes s a b rest hStk]
   simp [run_empty]
+
+/-- **Issue #116 semantic bridge.** The 2-opcode numeric `!==` tail
+`[OP_NUMEQUAL, OP_NOT]` computes exactly the same result on two integer
+operands as the single `OP_NUMNOTEQUAL` opcode did (compare
+`runOpcode_NUMNOTEQUAL_intInt`): `OP_NUMEQUAL` pushes `decide (a = b)`, and
+`OP_NOT` inverts it to `!(decide (a = b)) = decide (a ≠ b)`. This lets the
+`!==` operational proofs migrate from the old single-opcode lowering to the
+new pair without weakening any guarantee. -/
+theorem runOps_numEqualNot_eq_numNotEqual
+    (s : StackState) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    runOps [.opcode "OP_NUMEQUAL", .opcode "OP_NOT"] s
+      = .ok ({ s with stack := rest }.push (.vBool (decide (a ≠ b)))) := by
+  have hval : (!decide (a = b)) = decide (a ≠ b) := by
+    by_cases h : a = b <;> simp [h]
+  have hEq1 : runOps [.opcode "OP_NUMEQUAL"] s
+      = .ok ({ s with stack := rest }.push (.vBool (decide (a = b)))) :=
+    run_OP_NUMEQUAL_intInt s a b rest hStk
+  have hStk2 : ({ s with stack := rest }.push (.vBool (decide (a = b)))).stack
+      = .vBool (decide (a = b)) :: rest := rfl
+  have hEq2 : runOps [.opcode "OP_NOT"]
+        ({ s with stack := rest }.push (.vBool (decide (a = b))))
+      = .ok ({ s with stack := rest }.push (.vBool (!decide (a = b)))) :=
+    run_OP_NOT_bool _ (decide (a = b)) rest hStk2
+  show runOps ([.opcode "OP_NUMEQUAL"] ++ [.opcode "OP_NOT"]) s = _
+  rw [runOps_append, hEq1]
+  show runOps [.opcode "OP_NOT"]
+        ({ s with stack := rest }.push (.vBool (decide (a = b)))) = _
+  rw [hEq2, hval]
 
 /-- `runOps [OP_SPLIT]` on a bytes/index stack. Top is the suffix, with
 the prefix retained below it, matching Bitcoin Script `OP_SPLIT`. -/
