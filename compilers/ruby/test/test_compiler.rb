@@ -273,4 +273,35 @@ class TestCompiler < Minitest::Test
     assert_equal 'unlock', artifact.abi.methods.first.name
     assert artifact.abi.methods.first.is_public
   end
+
+  # Regression: the `Bool` type alias must compile through the full pipeline
+  # (parse -> validate -> typecheck -> emit) exactly like `Boolean`. The cross-
+  # tier IR fuzzer's Ruby renderer emits `prop :x, Bool` / `param: Bool`, and
+  # the TS reference (plus all other 6 tiers) accept boolean properties/params.
+  # Ruby only mapped `Boolean`, so `Bool` fell through to a CustomType and the
+  # validator/typechecker rejected it, over-rejecting contracts the other tiers
+  # accept.
+  def test_compile_bool_alias_rb
+    source = <<~RB
+      class BoolAlias < Runar::SmartContract
+        prop :flag1, Bool
+        prop :flag2, Bool
+
+        def initialize(flag1, flag2)
+          super(flag1, flag2)
+          @flag1 = flag1
+          @flag2 = flag2
+        end
+
+        runar_public a: Bool, b: Bool
+        def check(a, b)
+          assert (a && b) || (!(@flag1) || @flag2)
+        end
+      end
+    RB
+
+    artifact = compile_rb_source(source, 'BoolAlias.runar.rb')
+    assert_equal 'BoolAlias', artifact.contract_name
+    assert artifact.script.length > 0, "script should be non-empty"
+  end
 end
