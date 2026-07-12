@@ -916,44 +916,11 @@ export class RunarContract {
       (u) => !(u.txid === this.currentUtxo!.txid && u.outputIndex === this.currentUtxo!.outputIndex),
     );
 
-    // Coin selection for funding inputs (issue #133): don't sweep the whole
-    // wallet. Compute how much the funding must cover — the contract's own
-    // input value already offsets the contract/data outputs — and pick the
-    // smallest largest-first set via selectUtxos (the strategy deploy uses).
-    const contractOutputSats =
-      (contractOutputs
-        ? contractOutputs.reduce((sum, o) => sum + o.satoshis, 0)
-        : (newSatoshis ?? 0))
-      + resolvedDataOutputs.reduce((sum, o) => sum + o.satoshis, 0);
-    const contractInputSats =
-      this.currentUtxo.satoshis
-      + extraContractUtxos.reduce((sum, u) => sum + u.satoshis, 0);
-    const fundingTarget = Math.max(0, contractOutputSats - contractInputSats);
-    // Fee sizing hint for selectUtxos: the continuation script length (falls
-    // back to the first multi-output script, else 0 for stateless calls).
-    const fundingLockLen =
-      (newLockingScript?.length ?? contractOutputs?.[0]?.script.length ?? 0) / 2;
-    const additionalUtxos =
-      candidateFundingUtxos.length > 0
-        ? selectUtxos(candidateFundingUtxos, fundingTarget, fundingLockLen, feeRate)
-        : [];
-
-    // Cap funding inputs when the caller sets maxFundingInputs. selectUtxos
-    // returns the minimal largest-first set; if that still exceeds the cap the
-    // funding can't cover outputs + fee within the budget, so fail loudly
-    // instead of broadcasting an underfunded tx.
-    if (
-      options?.maxFundingInputs !== undefined &&
-      additionalUtxos.length > options.maxFundingInputs
-    ) {
-      throw new Error(
-        `RunarContract.call(${methodName}): funding requires ${additionalUtxos.length} input(s) ` +
-          `but maxFundingInputs=${options.maxFundingInputs}. Increase maxFundingInputs, ` +
-          `use larger UTXOs, or consolidate.`,
-      );
-    }
-
-    // Resolve per-input args for additional contract inputs
+    // Resolve per-input args for additional contract inputs. Hoisted ABOVE the
+    // funding coin-selection (was below it) so the merge unlock placeholders —
+    // and therefore the contract-input byte size the funding fee must cover —
+    // are known before we size the funding. Consumed again later when the real
+    // merge unlocks are built.
     const resolvedPerInputArgs: unknown[][] | undefined = options?.additionalContractInputArgs
       ? options.additionalContractInputArgs.map((inputArgs) => {
           const resolved = [...inputArgs];
@@ -979,6 +946,82 @@ export class RunarContract {
       const argsForPlaceholder = resolvedPerInputArgs?.[i] ?? resolvedArgs;
       return encodePushData('00'.repeat(72)) + this.buildUnlockingScript(methodName, argsForPlaceholder) + witnessHex;
     });
+
+    // Coin selection for funding inputs (issue #133): don't sweep the whole
+    // wallet. Compute how much the funding must cover — the contract's own
+    // input value already offsets the contract/data outputs — and pick the
+    // smallest largest-first set via selectUtxos (the strategy deploy uses).
+    const contractOutputSats =
+      (contractOutputs
+        ? contractOutputs.reduce((sum, o) => sum + o.satoshis, 0)
+        : (newSatoshis ?? 0))
+      + resolvedDataOutputs.reduce((sum, o) => sum + o.satoshis, 0);
+    const contractInputSats =
+      this.currentUtxo.satoshis
+      + extraContractUtxos.reduce((sum, u) => sum + u.satoshis, 0);
+    const fundingTarget = Math.max(0, contractOutputSats - contractInputSats);
+    // Fee sizing hint for selectUtxos: the continuation script length (falls
+    // back to the first multi-output script, else 0 for stateless calls).
+    const fundingLockLen =
+      (newLockingScript?.length ?? contractOutputs?.[0]?.script.length ?? 0) / 2;
+    // Contract-input unlock bytes. selectUtxos/estimateDeployFee otherwise model
+    // ONLY the funding inputs (148-byte P2PKH each) + continuation + change —
+    // they are blind to the contract input(s) being spent. For a MERGE each
+    // covenant input embeds both parent txs as method args (tens of KB), so
+    // ignoring them under-provisions the funding; buildCallTransaction then sees
+    // change <= 0 and DROPS the change output, and the merge covenant — which
+    // reconstructs [continuation][P2PKH change] UNCONDITIONALLY — fails its
+    // hashOutputs OP_VERIFY. Size the funding fee against the SAME serialized
+    // per-input bytes buildCallTransaction uses (32 outpoint + 4 index + varint +
+    // script + 4 sequence) for the primary contract input plus every extra one.
+    // Over-estimating is safe (a little more funding / higher change); under-
+    // estimating is the bug. Small ops (single covenant input, tiny unlock) add
+    // a correspondingly small term and are unaffected.
+    const perInputBytes = (unlockHex: string): number => {
+      const len = unlockHex.length / 2;
+      const vi = len < 0xfd ? 1 : len <= 0xffff ? 3 : len <= 0xffffffff ? 5 : 9;
+      return 32 + 4 + vi + len + 4;
+    };
+    // The `unlockingScript` / `extraUnlockPlaceholders` above are SIZING
+    // placeholders: `encodePushData(sig72) + buildUnlockingScript(args) +
+    // witnessHex`. For a stateful call the REAL unlock buildStatefulUnlock emits
+    // is larger — it prepends the opSig codePart prefix and appends the BIP-143
+    // preimage (whose scriptCode ≈ the locking script), the change + new-amount
+    // pushes, and the method selector. That gap (~6.5 KB per input for the EAC
+    // merge) is exactly what would make selectUtxos stop one UTXO short, leaving
+    // change <= 0 so the covenant's [continuation][change] reconstruction fails.
+    // Add a per-contract-input overestimate covering those omitted components:
+    // codePart (≈ locking script) + preimage scriptCode (≈ locking script) + a
+    // fixed buffer for sig/amount/selector/varint framing. Over-estimating only
+    // pulls slightly more funding (bigger change) — always safe.
+    const numContractInputs = 1 + extraContractUtxos.length;
+    const perContractInputOverhead = 2 * Math.ceil(fundingLockLen) + 512;
+    const contractInputBytes =
+      perInputBytes(unlockingScript)
+      + extraUnlockPlaceholders.reduce((sum, u) => sum + perInputBytes(u), 0)
+      + numContractInputs * perContractInputOverhead;
+    const additionalUtxos =
+      candidateFundingUtxos.length > 0
+        ? selectUtxos(candidateFundingUtxos, fundingTarget, fundingLockLen, feeRate, contractInputBytes)
+        : [];
+
+    // Cap funding inputs when the caller sets maxFundingInputs. selectUtxos
+    // returns the minimal largest-first set; if that still exceeds the cap the
+    // funding can't cover outputs + fee within the budget, so fail loudly
+    // instead of broadcasting an underfunded tx.
+    if (
+      options?.maxFundingInputs !== undefined &&
+      additionalUtxos.length > options.maxFundingInputs
+    ) {
+      throw new Error(
+        `RunarContract.call(${methodName}): funding requires ${additionalUtxos.length} input(s) ` +
+          `but maxFundingInputs=${options.maxFundingInputs}. Increase maxFundingInputs, ` +
+          `use larger UTXOs, or consolidate.`,
+      );
+    }
+
+    // (resolvedPerInputArgs + extraUnlockPlaceholders are computed above, before
+    // funding coin-selection, so their byte sizes feed the funding fee estimate.)
 
     let { tx, inputCount, changeAmount } = buildCallTransaction(
       this.currentUtxo,
