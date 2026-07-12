@@ -189,24 +189,30 @@ class ConstantFoldTest {
     // ---------------------------------------------------------------
 
     @Test
-    void foldsBitwiseAndOrXor() {
-        // t0=0b1100=12, t1=0b1010=10
+    void doesNotFoldBitwiseAndOrXor() {
+        // OP_AND/OP_OR/OP_XOR operate on the operands' raw script-number bytes
+        // and require equal length — the numeric fold (12 & 10 == 8) disagrees
+        // with the on-chain result (e.g. 255 & 1 ABORTS on a length mismatch).
+        // Never fold; leave the bin_ops for the runtime opcode.
         List<AnfBinding> body = List.of(
             bigIntConst("t0", 12),
             bigIntConst("t1", 10),
-            bind("a", new BinOp("&", "t0", "t1", null)),  // 0b1000 = 8
-            bind("o", new BinOp("|", "t0", "t1", null)),  // 0b1110 = 14
-            bind("x", new BinOp("^", "t0", "t1", null))   // 0b0110 = 6
+            bind("a", new BinOp("&", "t0", "t1", null)),
+            bind("o", new BinOp("|", "t0", "t1", null)),
+            bind("x", new BinOp("^", "t0", "t1", null))
         );
         AnfMethod m = soleMethod(ConstantFold.run(singleMethodProgram(body)));
-        assertEquals(BigInteger.valueOf(8),  bigInt(findBinding(m, "a").value()));
-        assertEquals(BigInteger.valueOf(14), bigInt(findBinding(m, "o").value()));
-        assertEquals(BigInteger.valueOf(6),  bigInt(findBinding(m, "x").value()));
+        assertTrue(findBinding(m, "a").value() instanceof BinOp);
+        assertTrue(findBinding(m, "o").value() instanceof BinOp);
+        assertTrue(findBinding(m, "x").value() instanceof BinOp);
     }
 
     @Test
-    void foldsShiftsAndBitNot() {
-        // t0=5, t1=2, shl=20, shr=1, neg=~5=-6
+    void doesNotFoldShiftsAndBitNot() {
+        // OP_LSHIFT/OP_RSHIFT/OP_INVERT are byte-array ops: 255 << 1 is 254
+        // on-chain (not 510) and ~5 is -122 (not -6). Native BigInteger folding
+        // would bake a wrong constant into the deployed script, so leave these
+        // as bin_op/unary_op for the runtime opcode.
         List<AnfBinding> body = List.of(
             bigIntConst("t0", 5),
             bigIntConst("t1", 2),
@@ -215,9 +221,9 @@ class ConstantFoldTest {
             bind("neg", new UnaryOp("~", "t0", null))
         );
         AnfMethod m = soleMethod(ConstantFold.run(singleMethodProgram(body)));
-        assertEquals(BigInteger.valueOf(20), bigInt(findBinding(m, "shl").value()));
-        assertEquals(BigInteger.valueOf(1),  bigInt(findBinding(m, "shr").value()));
-        assertEquals(BigInteger.valueOf(-6), bigInt(findBinding(m, "neg").value()));
+        assertTrue(findBinding(m, "shl").value() instanceof BinOp);
+        assertTrue(findBinding(m, "shr").value() instanceof BinOp);
+        assertTrue(findBinding(m, "neg").value() instanceof UnaryOp);
     }
 
     @Test

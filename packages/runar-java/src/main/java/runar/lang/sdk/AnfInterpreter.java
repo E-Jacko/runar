@@ -884,11 +884,12 @@ public final class AnfInterpreter {
             case ">=": return l.compareTo(r) >= 0;
             case "&&": case "and": return isTruthy(left) && isTruthy(right);
             case "||": case "or":  return isTruthy(left) || isTruthy(right);
-            case "&":  return l.and(r);
-            case "|":  return l.or(r);
-            case "^":  return l.xor(r);
-            case "<<": return l.shiftLeft(r.intValueExact());
-            case ">>": return l.shiftRight(r.intValueExact());
+            // & | ^ << >> compile to OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT,
+            // which operate on the operands' minimal script-number BYTES, not
+            // their numeric value. Route through the byte-array helpers so the
+            // interpreter agrees with the deployed script byte-for-byte.
+            case "&":  case "|":  case "^":  return scriptNumberBitwise(op, l, r);
+            case "<<": case ">>": return scriptNumberShift(op, l, r);
             default:   return BigInteger.ZERO;
         }
     }
@@ -916,9 +917,88 @@ public final class AnfInterpreter {
         switch (op) {
             case "-":  return v.negate();
             case "!":  case "not": return !isTruthy(operand);
-            case "~":  return v.not();
+            // OP_INVERT flips the operand's script-number BYTES, not native
+            // two's-complement ~n (~5 is -122 on-chain, not -6).
+            case "~":  return scriptNumberInvert(v);
             default:   return v;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Script-number bitwise / shift semantics (byte-array ops, NOT numeric)
+    // ------------------------------------------------------------------
+    //
+    // OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT operate on the RAW BYTES
+    // of the operands' minimal script-number encoding, not on their numeric
+    // value (spec/opcodes.md). AND/OR/XOR require equal-length operands and
+    // abort otherwise; shifts treat the byte array as a big-endian bit string
+    // and preserve its length (LSHIFT masks off overflow MSBs). These helpers
+    // reproduce EXACTLY what the deployed script's opcode handlers do, so the
+    // interpreter (which models values as BigInteger) agrees with the on-chain
+    // script byte-for-byte. Mirrors the TS reference
+    // packages/runar-testing/src/vm/utils.ts scriptNumber*. Callers convert
+    // BigInteger -> minimal bytes -> byte op -> BigInteger.
+
+    /** OP_AND/OP_OR/OP_XOR on two script-number-valued BigIntegers. Aborts on
+     *  length mismatch, exactly like the on-chain opcodes. */
+    static BigInteger scriptNumberBitwise(String op, BigInteger a, BigInteger b) {
+        byte[] av = MockCrypto.encodeScriptNumber(a);
+        byte[] bv = MockCrypto.encodeScriptNumber(b);
+        if (av.length != bv.length) {
+            String name = "&".equals(op) ? "OP_AND" : "|".equals(op) ? "OP_OR" : "OP_XOR";
+            throw new InterpreterException(name + ": operands must be same length");
+        }
+        byte[] result = new byte[av.length];
+        for (int i = 0; i < av.length; i++) {
+            int x = av[i] & 0xff;
+            int y = bv[i] & 0xff;
+            int r = "&".equals(op) ? (x & y) : "|".equals(op) ? (x | y) : (x ^ y);
+            result[i] = (byte) r;
+        }
+        return MockCrypto.decodeScriptNumber(result);
+    }
+
+    /** OP_INVERT: flip every bit of the operand's minimal script-number bytes. */
+    static BigInteger scriptNumberInvert(BigInteger a) {
+        byte[] av = MockCrypto.encodeScriptNumber(a);
+        byte[] result = new byte[av.length];
+        for (int i = 0; i < av.length; i++) {
+            result[i] = (byte) (~av[i] & 0xff);
+        }
+        return MockCrypto.decodeScriptNumber(result);
+    }
+
+    /** OP_LSHIFT/OP_RSHIFT: shift the operand's bytes as a big-endian bit string,
+     *  preserving byte length (LSHIFT masks off overflow MSBs). Negative shifts
+     *  abort like the opcodes. */
+    static BigInteger scriptNumberShift(String op, BigInteger a, BigInteger shift) {
+        if (shift.signum() < 0) {
+            throw new InterpreterException(
+                ("<<".equals(op) ? "OP_LSHIFT" : "OP_RSHIFT") + ": negative shift");
+        }
+        byte[] val = MockCrypto.encodeScriptNumber(a);
+        int n = shift.intValueExact();
+        if (val.length == 0 || n == 0) {
+            return MockCrypto.decodeScriptNumber(val);
+        }
+        // Interpret the (little-endian) script-number bytes as a big-endian bit
+        // string: val[0] is the most-significant byte of `num`.
+        BigInteger num = BigInteger.ZERO;
+        for (int i = 0; i < val.length; i++) {
+            num = num.shiftLeft(8).or(BigInteger.valueOf(val[i] & 0xff));
+        }
+        if ("<<".equals(op)) {
+            int bitLen = val.length * 8;
+            num = num.shiftLeft(n).and(BigInteger.ONE.shiftLeft(bitLen).subtract(BigInteger.ONE));
+        } else {
+            num = num.shiftRight(n);
+        }
+        byte[] result = new byte[val.length];
+        for (int i = val.length - 1; i >= 0; i--) {
+            result[i] = (byte) num.and(BigInteger.valueOf(0xff)).intValueExact();
+            num = num.shiftRight(8);
+        }
+        return MockCrypto.decodeScriptNumber(result);
     }
 
     // ------------------------------------------------------------------

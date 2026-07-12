@@ -54,29 +54,13 @@ fn eval_bin_op(op: &str, left: &ConstValue, right: &ConstValue) -> Option<ConstV
             ">" => Some(ConstValue::Bool(a > b)),
             "<=" => Some(ConstValue::Bool(a <= b)),
             ">=" => Some(ConstValue::Bool(a >= b)),
-            "&" => Some(ConstValue::Int(a & b)),
-            "|" => Some(ConstValue::Int(a | b)),
-            "^" => Some(ConstValue::Int(a ^ b)),
-            "<<" => {
-                if a.is_negative() {
-                    return None; // skip for negative left operand (BSV shifts are logical)
-                }
-                let shift = b.to_u32()?;
-                if shift > 128 {
-                    return None;
-                }
-                Some(ConstValue::Int(a << shift))
-            }
-            ">>" => {
-                if a.is_negative() {
-                    return None; // skip for negative left operand (BSV shifts are logical)
-                }
-                let shift = b.to_u32()?;
-                if shift > 128 {
-                    return None;
-                }
-                Some(ConstValue::Int(a >> shift))
-            }
+            // OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT operate on the operands'
+            // raw script-number BYTES, not their numeric value — native BigInt
+            // folding produces results that differ from the deployed script
+            // (e.g. 255 << 1 is 254 on-chain, not 510; 255 & 1 aborts). Never
+            // fold them; emit the opcode so runtime byte-array semantics govern.
+            // Matches constant-fold.ts + the ANF interpreter.
+            "&" | "|" | "^" | "<<" | ">>" => None,
             _ => None,
         };
     }
@@ -135,7 +119,9 @@ fn eval_unary_op(op: &str, operand: &ConstValue) -> Option<ConstValue> {
         },
         ConstValue::Int(n) => match op {
             "-" => Some(ConstValue::Int(-n)),
-            "~" => Some(ConstValue::Int(!n)),
+            // OP_INVERT flips the operand's script-number bytes, not native !n
+            // (e.g. ~5 == -122, not -6). Never fold; emit the opcode.
+            "~" => None,
             "!" => Some(ConstValue::Bool(n.is_zero())),
             _ => None,
         },
@@ -769,26 +755,30 @@ mod tests {
     // 2. Shift operators
     // -----------------------------------------------------------------------
 
+    // `<<` / `>>` compile to OP_LSHIFT / OP_RSHIFT, which shift the operand's
+    // minimal script-number BYTES (not its numeric value), so native BigInt
+    // folding would diverge from the deployed script. Never fold — emit the
+    // opcode so the runtime byte-array semantics govern. Matches constant-fold.ts.
     #[test]
-    fn test_fold_left_shift() {
+    fn test_no_fold_left_shift() {
         let p = make_program(vec![make_method("m", vec![
             b("t0", mk_int(1)),
             b("t1", mk_int(3)),
             b("t2", bin_op("<<", "t0", "t1")),
         ])]);
         let r = fold_constants_only(&p);
-        assert_load_const_int(&r.methods[0].body[2].value, 8);
+        assert_not_folded(&r.methods[0].body[2].value, "bin_op");
     }
 
     #[test]
-    fn test_fold_right_shift() {
+    fn test_no_fold_right_shift() {
         let p = make_program(vec![make_method("m", vec![
             b("t0", mk_int(16)),
             b("t1", mk_int(2)),
             b("t2", bin_op(">>", "t0", "t1")),
         ])]);
         let r = fold_constants_only(&p);
-        assert_load_const_int(&r.methods[0].body[2].value, 4);
+        assert_not_folded(&r.methods[0].body[2].value, "bin_op");
     }
 
     #[test]
@@ -806,9 +796,11 @@ mod tests {
     // 3. Bitwise operators
     // -----------------------------------------------------------------------
 
+    // `&` / `|` / `^` compile to OP_AND / OP_OR / OP_XOR, which act on the
+    // operands' minimal script-number BYTES and abort on a length mismatch.
+    // Native folding diverges from the deployed script — never fold.
     #[test]
-    fn test_fold_bitwise() {
-        // AND: 0b1100 & 0b1010 = 0b1000 = 8
+    fn test_no_fold_bitwise() {
         let p = make_program(vec![make_method("m", vec![
             b("t0", mk_int(0b1100)),
             b("t1", mk_int(0b1010)),
@@ -817,9 +809,9 @@ mod tests {
             b("t4", bin_op("^", "t0", "t1")),
         ])]);
         let r = fold_constants_only(&p);
-        assert_load_const_int(&r.methods[0].body[2].value, 8);
-        assert_load_const_int(&r.methods[0].body[3].value, 14);
-        assert_load_const_int(&r.methods[0].body[4].value, 6);
+        assert_not_folded(&r.methods[0].body[2].value, "bin_op");
+        assert_not_folded(&r.methods[0].body[3].value, "bin_op");
+        assert_not_folded(&r.methods[0].body[4].value, "bin_op");
     }
 
     // -----------------------------------------------------------------------
@@ -911,14 +903,16 @@ mod tests {
         assert_load_const_int(&r.methods[0].body[1].value, -42);
     }
 
+    // `~` compiles to OP_INVERT, which flips the operand's script-number
+    // BYTES (e.g. ~5 == -122, not -6). Never fold — emit the opcode.
     #[test]
-    fn test_fold_bitwise_not() {
+    fn test_no_fold_bitwise_not() {
         let p = make_program(vec![make_method("m", vec![
             b("t0", mk_int(0)),
             b("t1", unary_op("~", "t0")),
         ])]);
         let r = fold_constants_only(&p);
-        assert_load_const_int(&r.methods[0].body[1].value, -1);
+        assert_not_folded(&r.methods[0].body[1].value, "unary_op");
     }
 
     #[test]

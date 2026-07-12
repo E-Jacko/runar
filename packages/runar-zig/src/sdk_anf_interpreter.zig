@@ -168,6 +168,12 @@ pub const StrictError = error{
     /// not bind it via `MockEnv.setPrevOutScript` / `setSerialisedOutputs`.
     /// Mirrors the TS interpreter's "requires witness bytes" error.
     MissingWitness,
+    /// A bigint `& | ^` was applied to operands whose minimal script-number
+    /// encodings differ in length, or a `<< >>` used a negative shift count.
+    /// On-chain OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT abort the script in
+    /// exactly these cases; the interpreter surfaces the same failure so
+    /// off-chain simulation agrees with the deployed script byte-for-byte.
+    ScriptNumberError,
 };
 
 /// Context for strict-mode evaluation. Carries the public method name being
@@ -673,7 +679,7 @@ fn evalBindings(
     raw_outputs: *std.ArrayList(DataOutputEntry),
     anf: *const ANFProgram,
     eval_ctx: EvalCtx,
-) error{ OutOfMemory, AssertionFailure, MissingWitness }!void {
+) error{ OutOfMemory, AssertionFailure, MissingWitness, ScriptNumberError }!void {
     for (bindings) |binding| {
         if (eval_ctx.strict) |ctx| ctx.last_binding_name = binding.name;
         const val = try evalNode(allocator, binding.value, env, state_delta, data_outputs, raw_outputs, anf, eval_ctx);
@@ -690,7 +696,7 @@ fn evalNode(
     raw_outputs: *std.ArrayList(DataOutputEntry),
     anf: *const ANFProgram,
     eval_ctx: EvalCtx,
-) error{ OutOfMemory, AssertionFailure, MissingWitness }!ANFValue {
+) error{ OutOfMemory, AssertionFailure, MissingWitness, ScriptNumberError }!ANFValue {
     const strict_ctx = eval_ctx.strict;
     switch (node) {
         .load_param => |lp| {
@@ -739,7 +745,7 @@ fn evalNode(
         .bin_op => |bo| {
             const left = env.get(bo.left) orelse anf_none;
             const right = env.get(bo.right) orelse anf_none;
-            return evalBinOp(allocator, bo.op, left, right, bo.result_type);
+            return try evalBinOp(allocator, bo.op, left, right, bo.result_type);
         },
         .unary_op => |uo| {
             const operand = env.get(uo.operand) orelse anf_none;
@@ -888,10 +894,122 @@ fn evalNode(
 }
 
 // ---------------------------------------------------------------------------
+// Script-number bitwise / shift semantics (byte-array ops, NOT numeric)
+// ---------------------------------------------------------------------------
+//
+// `& | ^ ~ << >>` on bigint compile to OP_AND/OP_OR/OP_XOR/OP_INVERT/
+// OP_LSHIFT/OP_RSHIFT, which operate on the RAW BYTES of each operand's
+// minimal script-number encoding, not on its numeric value. AND/OR/XOR require
+// equal-length operands (abort otherwise); shifts treat the bytes as a
+// big-endian bit string and preserve length (LSHIFT masks off overflow MSBs).
+// These helpers reproduce what the deployed script does, so the i64-valued
+// interpreter agrees with it byte-for-byte. Mirrors
+// packages/runar-testing/src/vm/utils.ts scriptNumber*.
+
+/// Encode an i64 as minimal little-endian sign-magnitude bytes; 0 -> empty.
+/// Writes into `buf` (needs 9 bytes for the full i64 range) and returns the
+/// used sub-slice.
+fn scriptNumEncode(n: i64, buf: *[9]u8) []u8 {
+    if (n == 0) return buf[0..0];
+    const negative = n < 0;
+    // Magnitude via i128 so i64's most-negative value doesn't overflow.
+    var abs: u64 = if (negative) @intCast(-@as(i128, n)) else @intCast(n);
+    var len: usize = 0;
+    while (abs > 0) : (len += 1) {
+        buf[len] = @intCast(abs & 0xff);
+        abs >>= 8;
+    }
+    const last = buf[len - 1];
+    if (last & 0x80 != 0) {
+        buf[len] = if (negative) 0x80 else 0x00;
+        len += 1;
+    } else if (negative) {
+        buf[len - 1] = last | 0x80;
+    }
+    return buf[0..len];
+}
+
+/// Decode minimal little-endian sign-magnitude bytes to i64; empty -> 0.
+/// Accumulates in u128 so a 9-byte encoding (e.g. i64's most-negative value)
+/// never overflows a u64 shift.
+fn scriptNumDecode(bytes: []const u8) i64 {
+    if (bytes.len == 0) return 0;
+    var result: u128 = 0;
+    for (bytes, 0..) |b, i| {
+        result |= @as(u128, b) << @intCast(8 * i);
+    }
+    const last = bytes[bytes.len - 1];
+    if (last & 0x80 != 0) {
+        // Clear the sign bit (MSB of the last byte) and negate.
+        result &= ~(@as(u128, 0x80) << @intCast(8 * (bytes.len - 1)));
+        return @intCast(-@as(i128, @intCast(result)));
+    }
+    return @intCast(result);
+}
+
+/// OP_AND/OP_OR/OP_XOR. `op` is '&' | '|' | '^'. Aborts on length mismatch,
+/// exactly like the on-chain opcodes.
+fn scriptNumBitwise(op: u8, a: i64, b: i64) error{ScriptNumberError}!i64 {
+    var abuf: [9]u8 = undefined;
+    var bbuf: [9]u8 = undefined;
+    const av = scriptNumEncode(a, &abuf);
+    const bv = scriptNumEncode(b, &bbuf);
+    if (av.len != bv.len) return error.ScriptNumberError;
+    var rbuf: [9]u8 = undefined;
+    for (av, 0..) |x, i| {
+        const y = bv[i];
+        rbuf[i] = switch (op) {
+            '&' => x & y,
+            '|' => x | y,
+            else => x ^ y,
+        };
+    }
+    return scriptNumDecode(rbuf[0..av.len]);
+}
+
+/// OP_INVERT: flip every bit of the operand's minimal script-number bytes.
+fn scriptNumInvert(a: i64) i64 {
+    var abuf: [9]u8 = undefined;
+    const av = scriptNumEncode(a, &abuf);
+    var rbuf: [9]u8 = undefined;
+    for (av, 0..) |x, i| rbuf[i] = ~x;
+    return scriptNumDecode(rbuf[0..av.len]);
+}
+
+/// OP_LSHIFT/OP_RSHIFT. `op` is '<' (<<) | '>' (>>). Shifts the operand's bytes
+/// as a big-endian bit string, preserving byte length (LSHIFT masks off the
+/// overflow MSBs). A negative shift count aborts, like the opcodes.
+fn scriptNumShift(op: u8, a: i64, shift: i64) error{ScriptNumberError}!i64 {
+    if (shift < 0) return error.ScriptNumberError;
+    var abuf: [9]u8 = undefined;
+    const val = scriptNumEncode(a, &abuf);
+    const n: usize = @intCast(shift);
+    if (val.len == 0 or n == 0) return scriptNumDecode(val);
+    var num: u128 = 0;
+    for (val) |byte| num = (num << 8) | @as(u128, byte);
+    if (op == '<') {
+        num = std.math.shl(u128, num, n);
+        const bit_len: usize = val.len * 8;
+        const mask: u128 = std.math.shl(u128, @as(u128, 1), bit_len) -% 1;
+        num &= mask;
+    } else {
+        num = std.math.shr(u128, num, n);
+    }
+    var rbuf: [9]u8 = undefined;
+    var idx: usize = val.len;
+    while (idx > 0) {
+        idx -= 1;
+        rbuf[idx] = @intCast(num & 0xff);
+        num = std.math.shr(u128, num, 8);
+    }
+    return scriptNumDecode(rbuf[0..val.len]);
+}
+
+// ---------------------------------------------------------------------------
 // Binary operations
 // ---------------------------------------------------------------------------
 
-fn evalBinOp(allocator: std.mem.Allocator, op: []const u8, left: ANFValue, right: ANFValue, result_type: []const u8) ANFValue {
+fn evalBinOp(allocator: std.mem.Allocator, op: []const u8, left: ANFValue, right: ANFValue, result_type: []const u8) error{ScriptNumberError}!ANFValue {
     // Bytes operations
     if (std.mem.eql(u8, result_type, "bytes") or (left == .bytes and right == .bytes)) {
         return evalBytesBinOp(allocator, op, left, right);
@@ -913,17 +1031,12 @@ fn evalBinOp(allocator: std.mem.Allocator, op: []const u8, left: ANFValue, right
     if (std.mem.eql(u8, op, ">=")) return .{ .boolean = l >= r };
     if (std.mem.eql(u8, op, "&&")) return .{ .boolean = isTruthy(left) and isTruthy(right) };
     if (std.mem.eql(u8, op, "||")) return .{ .boolean = isTruthy(left) or isTruthy(right) };
-    if (std.mem.eql(u8, op, "&")) return .{ .int = l & r };
-    if (std.mem.eql(u8, op, "|")) return .{ .int = l | r };
-    if (std.mem.eql(u8, op, "^")) return .{ .int = l ^ r };
-    if (std.mem.eql(u8, op, "<<")) {
-        if (r >= 0 and r < 64) return .{ .int = l << @intCast(r) };
-        return .{ .int = 0 };
-    }
-    if (std.mem.eql(u8, op, ">>")) {
-        if (r >= 0 and r < 64) return .{ .int = l >> @intCast(r) };
-        return .{ .int = 0 };
-    }
+    // Bitwise / shift: byte-array script-number semantics (see scriptNum*).
+    if (std.mem.eql(u8, op, "&")) return .{ .int = try scriptNumBitwise('&', l, r) };
+    if (std.mem.eql(u8, op, "|")) return .{ .int = try scriptNumBitwise('|', l, r) };
+    if (std.mem.eql(u8, op, "^")) return .{ .int = try scriptNumBitwise('^', l, r) };
+    if (std.mem.eql(u8, op, "<<")) return .{ .int = try scriptNumShift('<', l, r) };
+    if (std.mem.eql(u8, op, ">>")) return .{ .int = try scriptNumShift('>', l, r) };
 
     return .{ .int = 0 };
 }
@@ -989,7 +1102,8 @@ fn evalUnaryOp(allocator: std.mem.Allocator, op: []const u8, operand: ANFValue, 
 
     if (std.mem.eql(u8, op, "-")) return .{ .int = -%val };
     if (std.mem.eql(u8, op, "!")) return .{ .boolean = !isTruthy(operand) };
-    if (std.mem.eql(u8, op, "~")) return .{ .int = ~val };
+    // OP_INVERT flips the operand's minimal script-number bytes, not native ~n.
+    if (std.mem.eql(u8, op, "~")) return .{ .int = scriptNumInvert(val) };
 
     return .{ .int = val };
 }
@@ -1306,7 +1420,7 @@ fn evalMethodCall(
     raw_outputs: *std.ArrayList(DataOutputEntry),
     anf: *const ANFProgram,
     eval_ctx: EvalCtx,
-) error{ OutOfMemory, AssertionFailure, MissingWitness }!ANFValue {
+) error{ OutOfMemory, AssertionFailure, MissingWitness, ScriptNumberError }!ANFValue {
     // Find the private method
     for (anf.methods) |*m| {
         if (!m.is_public and std.mem.eql(u8, m.name, method_name)) {
@@ -2122,7 +2236,7 @@ test "computeNewState returns error for unknown method" {
 
 test "evalBinOp bytes concatenation" {
     const allocator = std.testing.allocator;
-    const result = evalBinOp(allocator, "+", .{ .bytes = "aabb" }, .{ .bytes = "ccdd" }, "bytes");
+    const result = try evalBinOp(allocator, "+", .{ .bytes = "aabb" }, .{ .bytes = "ccdd" }, "bytes");
     switch (result) {
         .bytes => |b| {
             try std.testing.expectEqualStrings("aabbccdd", b);
@@ -2130,6 +2244,48 @@ test "evalBinOp bytes concatenation" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "bigint bitwise/shift use script-number byte semantics (truth table)" {
+    const H = struct {
+        // Evaluate a bigint binary op through the interpreter, returning the
+        // i64 result (or propagating the on-chain ABORT as error).
+        fn bin(op: []const u8, a: i64, b: i64) !i64 {
+            const r = try evalBinOp(std.testing.allocator, op, .{ .int = a }, .{ .int = b }, "int");
+            return switch (r) {
+                .int => |v| v,
+                else => error.TestUnexpectedResult,
+            };
+        }
+        fn un(op: []const u8, a: i64) i64 {
+            const r = evalUnaryOp(std.testing.allocator, op, .{ .int = a }, "int");
+            return switch (r) {
+                .int => |v| v,
+                else => 0,
+            };
+        }
+    };
+
+    // Shifts operate on the minimal script-number BYTES, not the numeric value.
+    try std.testing.expectEqual(@as(i64, 254), try H.bin("<<", 255, 1)); // NOT 510
+    try std.testing.expectEqual(@as(i64, 512), try H.bin("<<", 256, 1));
+    try std.testing.expectEqual(@as(i64, 40), try H.bin("<<", 5, 3));
+    try std.testing.expectEqual(@as(i64, 4), try H.bin(">>", 32, 3));
+    try std.testing.expectEqual(@as(i64, -127), try H.bin(">>", 255, 1));
+
+    // Bitwise NOT flips the operand's script-number bytes.
+    try std.testing.expectEqual(@as(i64, -122), H.un("~", 5)); // NOT -6
+    try std.testing.expectEqual(@as(i64, -32512), H.un("~", 255));
+    try std.testing.expectEqual(@as(i64, 0), H.un("~", 0)); // encode(0) is empty
+
+    // AND/OR/XOR require equal-length operands.
+    try std.testing.expectEqual(@as(i64, 1), try H.bin("&", 5, 3));
+    try std.testing.expectEqual(@as(i64, 1), try H.bin("&", -1, 5)); // NOT 5
+
+    // Length mismatch / negative shift ABORT, exactly like the opcodes.
+    try std.testing.expectError(error.ScriptNumberError, H.bin("&", 255, 1));
+    try std.testing.expectError(error.ScriptNumberError, H.bin("|", 7, 0));
+    try std.testing.expectError(error.ScriptNumberError, H.bin("<<", 5, -1));
 }
 
 test "num2bin and bin2num roundtrip" {

@@ -217,31 +217,30 @@ func TestFoldConstants_Comparisons(t *testing.T) {
 // Shift operators
 // ---------------------------------------------------------------------------
 
-func TestFoldConstants_LeftShift(t *testing.T) {
+// TestFoldConstants_ShiftsNotFolded: Bitcoin Script's OP_LSHIFT/OP_RSHIFT
+// operate on the operands' raw script-number bytes, preserving byte length —
+// 255 << 1 is 254 on-chain, not 510. Folding with native big.Int would bake
+// a wrong constant into the deployed script, so the folder must leave these
+// as bin_ops for the runtime opcode (anfEvalBinOp models the same byte
+// semantics in the interpreter).
+func TestFoldConstants_ShiftsNotFolded(t *testing.T) {
 	p := makeTestANFProgram([]ir.ANFMethod{
 		makeTestMethod("m", []ir.ANFBinding{
-			b("t0", mkInt(1)),
-			b("t1", mkInt(3)),
+			b("t0", mkInt(255)),
+			b("t1", mkInt(1)),
 			b("t2", binOp("<<", "t0", "t1")),
+			b("t3", binOp(">>", "t0", "t1")),
 		}),
 	})
 	result := foldConstantsOnly(p)
-	assertLoadConstBigInt(t, result.Methods[0].Body[2], 8)
-}
-
-func TestFoldConstants_RightShiftNonNegative(t *testing.T) {
-	p := makeTestANFProgram([]ir.ANFMethod{
-		makeTestMethod("m", []ir.ANFBinding{
-			b("t0", mkInt(16)),
-			b("t1", mkInt(2)),
-			b("t2", binOp(">>", "t0", "t1")),
-		}),
-	})
-	result := foldConstantsOnly(p)
-	assertLoadConstBigInt(t, result.Methods[0].Body[2], 4)
+	assertNotFolded(t, result.Methods[0].Body[2], "bin_op")
+	assertNotFolded(t, result.Methods[0].Body[3], "bin_op")
 }
 
 func TestFoldConstants_RightShiftNegativeNotFolded(t *testing.T) {
+	// Subsumed by TestFoldConstants_ShiftsNotFolded above (shifts are never
+	// folded regardless of operand sign), but kept as an explicit regression
+	// anchor for Fix #17.
 	p := makeTestANFProgram([]ir.ANFMethod{
 		makeTestMethod("m", []ir.ANFBinding{
 			b("t0", mkInt(-8)),
@@ -257,7 +256,11 @@ func TestFoldConstants_RightShiftNegativeNotFolded(t *testing.T) {
 // Bitwise operators
 // ---------------------------------------------------------------------------
 
-func TestFoldConstants_BitwiseOps(t *testing.T) {
+// TestFoldConstants_BitwiseOpsNotFolded: OP_AND/OP_OR/OP_XOR require
+// equal-length operand bytes and operate bytewise — the numeric fold (e.g.
+// 255 & 1 == 1) disagrees with the on-chain result (255 & 1 ABORTS on a
+// length mismatch). Never fold; emit the opcode.
+func TestFoldConstants_BitwiseOpsNotFolded(t *testing.T) {
 	p := makeTestANFProgram([]ir.ANFMethod{
 		makeTestMethod("m", []ir.ANFBinding{
 			b("t0", mkInt(0b1100)),
@@ -268,9 +271,9 @@ func TestFoldConstants_BitwiseOps(t *testing.T) {
 		}),
 	})
 	result := foldConstantsOnly(p)
-	assertLoadConstBigInt(t, result.Methods[0].Body[2], 0b1000)
-	assertLoadConstBigInt(t, result.Methods[0].Body[3], 0b1110)
-	assertLoadConstBigInt(t, result.Methods[0].Body[4], 0b0110)
+	assertNotFolded(t, result.Methods[0].Body[2], "bin_op")
+	assertNotFolded(t, result.Methods[0].Body[3], "bin_op")
+	assertNotFolded(t, result.Methods[0].Body[4], "bin_op")
 }
 
 // ---------------------------------------------------------------------------
@@ -381,15 +384,18 @@ func TestFoldConstants_BigIntNegation(t *testing.T) {
 	assertLoadConstBigInt(t, result.Methods[0].Body[1], -42)
 }
 
-func TestFoldConstants_BitwiseComplement(t *testing.T) {
+// TestFoldConstants_BitwiseComplementNotFolded: OP_INVERT flips the
+// operand's script-number bytes, not native big.Int.Not (~5 is -122
+// on-chain, not -6). Never fold; emit the opcode.
+func TestFoldConstants_BitwiseComplementNotFolded(t *testing.T) {
 	p := makeTestANFProgram([]ir.ANFMethod{
 		makeTestMethod("m", []ir.ANFBinding{
-			b("t0", mkInt(0)),
+			b("t0", mkInt(5)),
 			b("t1", unaryOp("~", "t0")),
 		}),
 	})
 	result := foldConstantsOnly(p)
-	assertLoadConstBigInt(t, result.Methods[0].Body[1], -1)
+	assertNotFolded(t, result.Methods[0].Body[1], "unary_op")
 }
 
 func TestFoldConstants_NotOnBigIntZero(t *testing.T) {

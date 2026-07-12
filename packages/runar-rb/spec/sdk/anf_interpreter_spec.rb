@@ -451,12 +451,59 @@ RSpec.describe 'Runar::SDK::ANFInterpreter' do
     end
 
     it 'applies bitwise not' do
-      expect(mod.eval_unary_op('~', 0)).to eq(-1)
+      # OP_INVERT flips the operand's minimal script-number BYTES. 0 encodes to
+      # the empty byte string, so ~0 is 0 (not native Ruby -1). See the
+      # script-number byte-semantics block below.
+      expect(mod.eval_unary_op('~', 0)).to eq(0)
     end
 
     it 'applies bitwise not to bytes when result_type is bytes' do
       # ~0x00 = 0xff; ~0xff = 0x00
       expect(mod.eval_unary_op('~', '00ff', 'bytes')).to eq('ff00')
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Script-number byte semantics for & | ^ ~ << >>
+  #
+  # These ops lower to OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT, which
+  # operate on the operands' MINIMAL script-number BYTES, not their numeric
+  # value. The interpreter must agree with the deployed script byte-for-byte:
+  # AND/OR/XOR abort on unequal operand lengths, shifts preserve byte length and
+  # abort on negative counts, and INVERT flips each byte of the minimal
+  # encoding. Mirrors packages/runar-testing/src/vm/utils.ts scriptNumber*.
+  # ---------------------------------------------------------------------------
+
+  describe 'script-number byte semantics' do
+    it 'left-shifts on the byte string, not the numeric value' do
+      expect(mod.eval_bin_op('<<', 255, 1)).to eq(254) # NOT 510
+      expect(mod.eval_bin_op('<<', 256, 1)).to eq(512)
+      expect(mod.eval_bin_op('<<', 5, 3)).to eq(40)
+    end
+
+    it 'right-shifts on the byte string, not the numeric value' do
+      expect(mod.eval_bin_op('>>', 32, 3)).to eq(4)
+      expect(mod.eval_bin_op('>>', 255, 1)).to eq(-127)
+    end
+
+    it 'inverts the minimal script-number bytes' do
+      expect(mod.eval_unary_op('~', 5)).to eq(-122) # NOT -6
+      expect(mod.eval_unary_op('~', 255)).to eq(-32512)
+      expect(mod.eval_unary_op('~', 0)).to eq(0)
+    end
+
+    it 'AND/OR/XOR operate bytewise on equal-length operands' do
+      expect(mod.eval_bin_op('&', 5, 3)).to eq(1)
+      expect(mod.eval_bin_op('&', -1, 5)).to eq(1) # NOT 5
+    end
+
+    it 'aborts AND/OR when operand byte-lengths differ' do
+      expect { mod.eval_bin_op('&', 255, 1) }.to raise_error(/OP_AND: operands must be same length/)
+      expect { mod.eval_bin_op('|', 7, 0) }.to raise_error(/OP_OR: operands must be same length/)
+    end
+
+    it 'aborts on a negative shift count' do
+      expect { mod.eval_bin_op('<<', 5, -1) }.to raise_error(/OP_LSHIFT: negative shift/)
     end
   end
 

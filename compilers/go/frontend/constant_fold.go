@@ -102,28 +102,15 @@ func evalBinOp(op string, left, right *constValue) *constValue {
 			return &constValue{kind: constBool, b: a.Cmp(b) <= 0}
 		case ">=":
 			return &constValue{kind: constBool, b: a.Cmp(b) >= 0}
-		case "&":
-			return &constValue{kind: constBigInt, bigint: new(big.Int).And(a, b)}
-		case "|":
-			return &constValue{kind: constBigInt, bigint: new(big.Int).Or(a, b)}
-		case "^":
-			return &constValue{kind: constBigInt, bigint: new(big.Int).Xor(a, b)}
-		case "<<":
-			if a.Sign() < 0 {
-				return nil // skip for negative left operand (BSV shifts are logical)
-			}
-			if b.Sign() < 0 || !b.IsInt64() {
-				return nil
-			}
-			return &constValue{kind: constBigInt, bigint: new(big.Int).Lsh(a, uint(b.Int64()))}
-		case ">>":
-			if a.Sign() < 0 {
-				return nil // skip for negative left operand (BSV shifts are logical)
-			}
-			if b.Sign() < 0 || !b.IsInt64() {
-				return nil
-			}
-			return &constValue{kind: constBigInt, bigint: new(big.Int).Rsh(a, uint(b.Int64()))}
+		// OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT operate on the operands'
+		// raw script-number BYTES, not their numeric value — native big.Int
+		// folding produces results that differ from the deployed script (e.g.
+		// 255 << 1 is 254 on-chain, not 510; 255 & 1 aborts). Never fold them;
+		// emit the opcode so runtime byte-array semantics govern. (See
+		// packages/runar-go/anf_interpreter.go's anfEvalBinOp, which models the
+		// same semantics for the interpreter.)
+		case "&", "|", "^", "<<", ">>":
+			return nil
 		}
 		return nil
 	}
@@ -193,8 +180,11 @@ func evalUnaryOp(op string, operand *constValue) *constValue {
 		switch op {
 		case "-":
 			return &constValue{kind: constBigInt, bigint: new(big.Int).Neg(operand.bigint)}
+		// OP_INVERT flips the operand's script-number bytes, not native
+		// big.Int.Not (two's-complement ~n). Never fold; emit the opcode so
+		// runtime byte-array semantics govern.
 		case "~":
-			return &constValue{kind: constBigInt, bigint: new(big.Int).Not(operand.bigint)}
+			return nil
 		case "!":
 			return &constValue{kind: constBool, b: operand.bigint.Sign() == 0}
 		}

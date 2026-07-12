@@ -647,11 +647,13 @@ module Runar
         when '>=' then l >= r
         when '&&', 'and' then is_truthy(left) && is_truthy(right)
         when '||', 'or'  then is_truthy(left) || is_truthy(right)
-        when '&'  then l & r
-        when '|'  then l | r
-        when '^'  then l ^ r
-        when '<<' then l << r
-        when '>>' then l >> r
+        # OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT operate on the operands'
+        # minimal script-number BYTES, not their numeric value. Native integer
+        # ops disagree with the deployed script (e.g. 255 << 1 is 254 on-chain,
+        # not 510; 255 & 1 aborts). Delegate to the byte-array helpers so the
+        # simulator matches the on-chain semantics byte-for-byte.
+        when '&', '|', '^' then scriptnum_bitwise(op, l, r)
+        when '<<', '>>'    then scriptnum_shift(op, l, r)
         else 0
         end
       end
@@ -716,7 +718,10 @@ module Runar
         case op
         when '-'      then -val
         when '!', 'not' then !is_truthy(operand)
-        when '~'      then ~val
+        # OP_INVERT flips every bit of the operand's minimal script-number
+        # bytes, not native Ruby ~val (e.g. ~5 is -122 on-chain, not -6; ~0 is
+        # 0 because 0 encodes to the empty byte string).
+        when '~'      then scriptnum_invert(val)
         else val
         end
       end
@@ -1211,6 +1216,118 @@ module Runar
         result_bytes.each_with_index { |b, i| result |= b << (8 * i) }
 
         negative ? -result : result
+      end
+
+      # ---------------------------------------------------------------------------
+      # Script-number bitwise / shift semantics (byte-array ops, NOT numeric)
+      #
+      # OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT operate on the RAW BYTES
+      # of the operands' minimal script-number encoding, not on their numeric
+      # value. AND/OR/XOR require equal-length operands and abort otherwise;
+      # shifts treat the byte array as a big-endian bit string, preserve its
+      # length, and abort on a negative count. These helpers reproduce exactly
+      # what the on-chain opcodes do so the interpreter (which models values as
+      # integers) agrees with the deployed script byte-for-byte. Mirrors
+      # packages/runar-testing/src/vm/utils.ts scriptNumber{Bitwise,Invert,Shift}.
+      # ---------------------------------------------------------------------------
+
+      # Encode an integer as minimal little-endian sign-magnitude bytes (Bitcoin
+      # script-number format). 0 → []. Matches encode_script_number in the
+      # compiler codegen and the TS vm/utils encodeScriptNumber.
+      #
+      # @param n [Integer]
+      # @return [Array<Integer>] minimal byte values
+      def encode_scriptnum_bytes(n)
+        return [] if n == 0
+
+        negative = n < 0
+        abs_n    = n.abs
+        bytes    = []
+        while abs_n > 0
+          bytes << (abs_n & 0xff)
+          abs_n >>= 8
+        end
+        if (bytes.last & 0x80) != 0
+          bytes << (negative ? 0x80 : 0x00)
+        elsif negative
+          bytes[-1] |= 0x80
+        end
+        bytes
+      end
+
+      # Decode minimal little-endian sign-magnitude bytes back to an integer.
+      # [] → 0. Reuses the existing #bin2num_int decoder.
+      #
+      # @param bytes [Array<Integer>]
+      # @return [Integer]
+      def decode_scriptnum_bytes(bytes)
+        return 0 if bytes.empty?
+
+        bin2num_int(bytes.map { |b| format('%02x', b) }.join)
+      end
+
+      # OP_AND/OP_OR/OP_XOR on two script-number-valued integers. Aborts on a
+      # length mismatch, exactly like the on-chain opcodes.
+      #
+      # @param op [String] '&', '|', or '^'
+      # @return [Integer]
+      def scriptnum_bitwise(op, a, b)
+        av = encode_scriptnum_bytes(a)
+        bv = encode_scriptnum_bytes(b)
+        if av.length != bv.length
+          name = op == '&' ? 'OP_AND' : op == '|' ? 'OP_OR' : 'OP_XOR'
+          raise "#{name}: operands must be same length"
+        end
+        result = av.each_index.map do |i|
+          case op
+          when '&' then av[i] & bv[i]
+          when '|' then av[i] | bv[i]
+          else av[i] ^ bv[i]
+          end
+        end
+        decode_scriptnum_bytes(result)
+      end
+
+      # OP_INVERT: flip every bit of the operand's minimal script-number bytes.
+      #
+      # @param a [Integer]
+      # @return [Integer]
+      def scriptnum_invert(a)
+        av = encode_scriptnum_bytes(a)
+        decode_scriptnum_bytes(av.map { |x| (~x) & 0xff })
+      end
+
+      # OP_LSHIFT/OP_RSHIFT: shift the operand's bytes as a big-endian bit
+      # string, preserving byte length (LSHIFT masks off overflow MSBs). Aborts
+      # on a negative shift count.
+      #
+      # @param op    [String] '<<' or '>>'
+      # @param a     [Integer]
+      # @param shift [Integer]
+      # @return [Integer]
+      def scriptnum_shift(op, a, shift)
+        if shift < 0
+          raise(op == '<<' ? 'OP_LSHIFT: negative shift' : 'OP_RSHIFT: negative shift')
+        end
+
+        val = encode_scriptnum_bytes(a)
+        n   = shift.to_i
+        return decode_scriptnum_bytes(val) if val.empty? || n == 0
+
+        num = 0
+        val.each { |byte| num = (num << 8) | byte }
+        if op == '<<'
+          bit_len = val.length * 8
+          num = (num << n) & ((1 << bit_len) - 1)
+        else
+          num >>= n
+        end
+        result = Array.new(val.length, 0)
+        (val.length - 1).downto(0) do |i|
+          result[i] = num & 0xff
+          num >>= 8
+        end
+        decode_scriptnum_bytes(result)
       end
 
       # ---------------------------------------------------------------------------

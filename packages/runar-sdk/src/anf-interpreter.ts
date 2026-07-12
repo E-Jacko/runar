@@ -46,6 +46,7 @@ import { Hash, Utils, PublicKey, Signature, BigNumber } from '@bsv/sdk';
 // matching the on-chain CHECKSIG semantic where ECDSA verifies against
 // the BIP-143 sighash directly with no extra hashing.
 import { verify as ecdsaVerifyRaw } from '@bsv/sdk/primitives/ECDSA';
+import { decodeScriptNumber } from './script-utils.js';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -506,6 +507,97 @@ function evalValue(
 }
 
 // ---------------------------------------------------------------------------
+// Script-number bitwise / shift semantics (byte-array ops, NOT numeric)
+// ---------------------------------------------------------------------------
+//
+// OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT operate on the RAW BYTES
+// of the operands' minimal script-number encoding, not on their numeric
+// value (spec/opcodes.md). AND/OR/XOR require equal-length operands and
+// fail otherwise; shifts treat the byte array as a big-endian bit string
+// and preserve its length. This reproduces EXACTLY what
+// packages/runar-testing/src/vm/utils.ts's
+// scriptNumberBitwise/scriptNumberInvert/scriptNumberShift do, so the SDK's
+// off-chain state derivation agrees with the deployed script byte-for-byte.
+// runar-sdk does not depend on runar-testing, so this is a local port using
+// this package's own script-number decoder (`decodeScriptNumber` from
+// ./script-utils.js). Note: `encodeScriptNumber` in ./contract.js is NOT
+// reusable here — it returns the full *script push* encoding (with
+// OP_0/OP_1..OP_16/OP_1NEGATE shortcuts), not the raw minimal bytes the
+// bitwise/shift opcodes operate on, so `minimalScriptNumberBytes` below
+// re-derives just the raw-byte core of that algorithm.
+
+/** Minimal sign-magnitude bytes of a script-number-valued bigint
+ *  (little-endian, no push-opcode wrapping). */
+function minimalScriptNumberBytes(n: bigint): number[] {
+  if (n === 0n) return [];
+  const negative = n < 0n;
+  let abs = negative ? -n : n;
+  const bytes: number[] = [];
+  while (abs > 0n) {
+    bytes.push(Number(abs & 0xffn));
+    abs >>= 8n;
+  }
+  const last = bytes[bytes.length - 1]!;
+  if (last & 0x80) {
+    bytes.push(negative ? 0x80 : 0x00);
+  } else if (negative) {
+    bytes[bytes.length - 1] = last | 0x80;
+  }
+  return bytes;
+}
+
+/** OP_AND/OP_OR/OP_XOR on two script-number-valued bigints. Throws on length
+ *  mismatch, exactly like the on-chain opcodes. */
+function scriptNumberBitwise(op: '&' | '|' | '^', a: bigint, b: bigint): bigint {
+  const av = minimalScriptNumberBytes(a);
+  const bv = minimalScriptNumberBytes(b);
+  if (av.length !== bv.length) {
+    const name = op === '&' ? 'OP_AND' : op === '|' ? 'OP_OR' : 'OP_XOR';
+    throw new Error(`${name}: operands must be same length`);
+  }
+  const result: number[] = new Array(av.length);
+  for (let i = 0; i < av.length; i++) {
+    const x = av[i]!;
+    const y = bv[i]!;
+    result[i] = op === '&' ? x & y : op === '|' ? x | y : x ^ y;
+  }
+  return decodeScriptNumber(Utils.toHex(result));
+}
+
+/** OP_INVERT: flip every bit of the operand's minimal script-number bytes. */
+function scriptNumberInvert(a: bigint): bigint {
+  const av = minimalScriptNumberBytes(a);
+  const result = av.map((b) => ~b & 0xff);
+  return decodeScriptNumber(Utils.toHex(result));
+}
+
+/** OP_LSHIFT/OP_RSHIFT: shift the operand's bytes as a big-endian bit string,
+ *  preserving byte length (LSHIFT masks off overflow MSBs). `shift` is the
+ *  script-number shift count; negative shifts fail like the opcodes. */
+function scriptNumberShift(op: '<<' | '>>', a: bigint, shift: bigint): bigint {
+  if (shift < 0n) {
+    throw new Error(op === '<<' ? 'OP_LSHIFT: negative shift' : 'OP_RSHIFT: negative shift');
+  }
+  const val = minimalScriptNumberBytes(a);
+  const n = Number(shift);
+  if (val.length === 0 || n === 0) return decodeScriptNumber(Utils.toHex(val));
+  let num = 0n;
+  for (let i = 0; i < val.length; i++) num = (num << 8n) | BigInt(val[i]!);
+  if (op === '<<') {
+    const bitLen = BigInt(val.length * 8);
+    num = (num << BigInt(n)) & ((1n << bitLen) - 1n);
+  } else {
+    num >>= BigInt(n);
+  }
+  const result: number[] = new Array(val.length);
+  for (let i = val.length - 1; i >= 0; i--) {
+    result[i] = Number(num & 0xffn);
+    num >>= 8n;
+  }
+  return decodeScriptNumber(Utils.toHex(result));
+}
+
+// ---------------------------------------------------------------------------
 // Binary operations
 // ---------------------------------------------------------------------------
 
@@ -536,11 +628,11 @@ function evalBinOp(
     case '>=': return l >= r;
     case '&&': return isTruthy(left) && isTruthy(right);
     case '||': return isTruthy(left) || isTruthy(right);
-    case '&': return l & r;
-    case '|': return l | r;
-    case '^': return l ^ r;
-    case '<<': return l << r;
-    case '>>': return l >> r;
+    case '&': return scriptNumberBitwise('&', l, r);
+    case '|': return scriptNumberBitwise('|', l, r);
+    case '^': return scriptNumberBitwise('^', l, r);
+    case '<<': return scriptNumberShift('<<', l, r);
+    case '>>': return scriptNumberShift('>>', l, r);
     default: return 0n;
   }
 }
@@ -578,7 +670,7 @@ function evalUnaryOp(op: string, operand: unknown, resultType?: string): unknown
   switch (op) {
     case '-': return -val;
     case '!': return !isTruthy(operand);
-    case '~': return ~val;
+    case '~': return scriptNumberInvert(val);
     default: return val;
   }
 }

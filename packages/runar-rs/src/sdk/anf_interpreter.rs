@@ -820,7 +820,13 @@ fn eval_value(
             let result_type = value.get("resultType").and_then(|v| v.as_str()).unwrap_or("");
             let left = env.get(&left_name).cloned().unwrap_or(Val::Undefined);
             let right = env.get(&right_name).cloned().unwrap_or(Val::Undefined);
-            eval_bin_op(&op, &left, &right, result_type)
+            // A byte-array bitwise/shift op that aborts on-chain (length
+            // mismatch or negative shift) fails the spend; surface it through
+            // the interpreter's rejection channel just like a false assert.
+            eval_bin_op(&op, &left, &right, result_type).map_err(|_| AssertionFailureError {
+                method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                binding_name: binding_name.to_string(),
+            })?
         }
 
         "unary_op" => {
@@ -1041,26 +1047,128 @@ fn eval_value(
 }
 
 // ---------------------------------------------------------------------------
+// Script-number byte-array bitwise / shift semantics
+// ---------------------------------------------------------------------------
+//
+// OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT operate on the RAW BYTES of
+// the operands' minimal script-number encoding, not on their numeric value.
+// The interpreter models script numbers as `i64`, so these helpers encode to
+// minimal bytes, apply the byte op, and decode back — reproducing exactly what
+// the deployed Bitcoin Script does. AND/OR/XOR fail on unequal length and
+// shifts fail on a negative count, matching the on-chain opcodes (`Err(())`).
+// Mirrors packages/runar-testing/src/vm/utils.ts scriptNumber* helpers.
+
+/// Encode an `i64` as minimal little-endian sign-magnitude script-number bytes.
+/// `0` -> empty vector.
+fn encode_script_num(n: i64) -> Vec<u8> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let negative = n < 0;
+    let mut abs: u128 = (n as i128).unsigned_abs();
+    let mut bytes: Vec<u8> = Vec::new();
+    while abs > 0 {
+        bytes.push((abs & 0xff) as u8);
+        abs >>= 8;
+    }
+    let last = *bytes.last().unwrap();
+    if last & 0x80 != 0 {
+        // High bit of the top byte would read as the sign bit — add a byte.
+        bytes.push(if negative { 0x80 } else { 0x00 });
+    } else if negative {
+        let idx = bytes.len() - 1;
+        bytes[idx] = last | 0x80;
+    }
+    bytes
+}
+
+/// Decode minimal little-endian sign-magnitude script-number bytes to `i64`.
+/// Empty -> 0. Reuses the tier's existing `bin2num_i64` decoder.
+fn decode_script_num(bytes: &[u8]) -> i64 {
+    bin2num_i64(&bytes_to_hex(bytes))
+}
+
+/// OP_AND / OP_OR / OP_XOR on two script-number-valued `i64`s. `Err(())` on a
+/// length mismatch, exactly like the on-chain opcodes.
+fn script_num_bitwise(op: &str, a: i64, b: i64) -> Result<i64, ()> {
+    let av = encode_script_num(a);
+    let bv = encode_script_num(b);
+    if av.len() != bv.len() {
+        return Err(());
+    }
+    let result: Vec<u8> = av
+        .iter()
+        .zip(bv.iter())
+        .map(|(x, y)| match op {
+            "&" => x & y,
+            "|" => x | y,
+            _ => x ^ y, // "^"
+        })
+        .collect();
+    Ok(decode_script_num(&result))
+}
+
+/// OP_INVERT: flip every bit of the operand's minimal script-number bytes.
+fn script_num_invert(a: i64) -> i64 {
+    let av = encode_script_num(a);
+    let result: Vec<u8> = av.iter().map(|b| !b).collect();
+    decode_script_num(&result)
+}
+
+/// OP_LSHIFT / OP_RSHIFT: shift the operand's bytes as a big-endian bit string,
+/// preserving byte length (LSHIFT masks off overflow MSBs). `Err(())` on a
+/// negative shift, like the on-chain opcodes. Uses `BigUint` so the shift math
+/// is exact for the full script-number range (matches the TS BigInt reference).
+fn script_num_shift(op: &str, a: i64, shift: i64) -> Result<i64, ()> {
+    if shift < 0 {
+        return Err(());
+    }
+    let val = encode_script_num(a);
+    let n = shift as usize;
+    if val.is_empty() || n == 0 {
+        return Ok(decode_script_num(&val));
+    }
+    let mut num = num_bigint::BigUint::from(0u32);
+    for &byte in &val {
+        num = (num << 8usize) | num_bigint::BigUint::from(byte);
+    }
+    if op == "<<" {
+        let bit_len = val.len() * 8;
+        let mask = (num_bigint::BigUint::from(1u32) << bit_len) - num_bigint::BigUint::from(1u32);
+        num = (num << n) & mask;
+    } else {
+        num >>= n;
+    }
+    let ff = num_bigint::BigUint::from(0xffu32);
+    let mut result = vec![0u8; val.len()];
+    for i in (0..val.len()).rev() {
+        result[i] = (&num & &ff).to_bytes_le().first().copied().unwrap_or(0);
+        num >>= 8usize;
+    }
+    Ok(decode_script_num(&result))
+}
+
+// ---------------------------------------------------------------------------
 // Binary operations
 // ---------------------------------------------------------------------------
 
-fn eval_bin_op(op: &str, left: &Val, right: &Val, result_type: &str) -> Val {
+fn eval_bin_op(op: &str, left: &Val, right: &Val, result_type: &str) -> Result<Val, ()> {
     // Bytes mode
     if result_type == "bytes" || (left.is_bytes() && right.is_bytes()) {
         let lh = left.as_hex();
         let rh = right.as_hex();
-        return match op {
+        return Ok(match op {
             "+" => Val::Bytes(format!("{}{}", lh, rh)),
             "==" | "===" => Val::Bool(lh == rh),
             "!=" | "!==" => Val::Bool(lh != rh),
             _ => Val::Bytes(String::new()),
-        };
+        });
     }
 
     let l = left.to_i64();
     let r = right.to_i64();
 
-    match op {
+    Ok(match op {
         "+" => Val::Int(l.wrapping_add(r)),
         "-" => Val::Int(l.wrapping_sub(r)),
         "*" => Val::Int(l.wrapping_mul(r)),
@@ -1074,13 +1182,13 @@ fn eval_bin_op(op: &str, left: &Val, right: &Val, result_type: &str) -> Val {
         ">=" => Val::Bool(l >= r),
         "&&" => Val::Bool(left.is_truthy() && right.is_truthy()),
         "||" => Val::Bool(left.is_truthy() || right.is_truthy()),
-        "&" => Val::Int(l & r),
-        "|" => Val::Int(l | r),
-        "^" => Val::Int(l ^ r),
-        "<<" => Val::Int(l.wrapping_shl(r as u32)),
-        ">>" => Val::Int(l.wrapping_shr(r as u32)),
+        // OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT act on the operands' minimal
+        // script-number bytes, not their numeric value. `Err(())` (length
+        // mismatch / negative shift) aborts the spend, like the opcode.
+        "&" | "|" | "^" => return script_num_bitwise(op, l, r).map(Val::Int),
+        "<<" | ">>" => return script_num_shift(op, l, r).map(Val::Int),
         _ => Val::Int(0),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,7 +1214,9 @@ fn eval_unary_op(op: &str, operand: &Val, result_type: &str) -> Val {
     match op {
         "-" => Val::Int(-v),
         "!" => Val::Bool(!operand.is_truthy()),
-        "~" => Val::Int(!v),
+        // OP_INVERT flips the operand's minimal script-number bytes, not
+        // native !v (e.g. ~5 == -122, not -6).
+        "~" => Val::Int(script_num_invert(v)),
         _ => Val::Int(v),
     }
 }
@@ -1691,6 +1801,43 @@ mod tests {
 
         let result = compute_new_state(&anf, "increment", &state, &HashMap::new(), &[]).unwrap();
         assert_eq!(result.get("count"), Some(&SdkValue::Int(6)));
+    }
+
+    // Byte-array (on-chain OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT)
+    // semantics for bigint bitwise/shift. The interpreter models script
+    // numbers as i64 but must agree byte-for-byte with the deployed script:
+    // ops act on the operands' minimal script-number bytes, NOT their numeric
+    // value. AND/OR/XOR abort on length mismatch; shifts abort on a negative
+    // count. Mirrors packages/runar-testing vm/utils scriptNumber* helpers.
+    #[test]
+    fn test_bitwise_shift_byte_array_semantics() {
+        fn bin(op: &str, a: i64, b: i64) -> Result<i64, ()> {
+            eval_bin_op(op, &Val::Int(a), &Val::Int(b), "").map(|v| v.to_i64())
+        }
+        fn inv(a: i64) -> i64 {
+            eval_unary_op("~", &Val::Int(a), "").to_i64()
+        }
+
+        // Shifts operate on bytes, not value.
+        assert_eq!(bin("<<", 255, 1), Ok(254)); // NOT 510
+        assert_eq!(bin("<<", 256, 1), Ok(512));
+        assert_eq!(bin("<<", 5, 3), Ok(40));
+        assert_eq!(bin(">>", 32, 3), Ok(4));
+        assert_eq!(bin(">>", 255, 1), Ok(-127));
+
+        // Invert flips the script-number bytes, not native !n.
+        assert_eq!(inv(5), -122); // NOT -6
+        assert_eq!(inv(255), -32512);
+        assert_eq!(inv(0), 0);
+
+        // AND/OR/XOR on equal-length operands.
+        assert_eq!(bin("&", 5, 3), Ok(1));
+        assert_eq!(bin("&", -1, 5), Ok(1)); // NOT 5
+
+        // Aborts: length mismatch or negative shift fail the spend.
+        assert_eq!(bin("&", 255, 1), Err(()));
+        assert_eq!(bin("|", 7, 0), Err(()));
+        assert_eq!(bin("<<", 5, -1), Err(()));
     }
 
     #[test]

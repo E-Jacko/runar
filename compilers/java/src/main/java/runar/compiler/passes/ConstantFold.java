@@ -288,21 +288,19 @@ public final class ConstantFold {
                 case ">":  return ConstSlot.ofBool(a.compareTo(b) >  0);
                 case "<=": return ConstSlot.ofBool(a.compareTo(b) <= 0);
                 case ">=": return ConstSlot.ofBool(a.compareTo(b) >= 0);
-                case "&":  return ConstSlot.ofInt(a.and(b));
-                case "|":  return ConstSlot.ofInt(a.or(b));
-                case "^":  return ConstSlot.ofInt(a.xor(b));
-                case "<<": {
-                    if (a.signum() < 0) return null;        // BSV shifts are logical
-                    if (b.signum() < 0) return null;
-                    if (b.compareTo(BigInteger.valueOf(128)) > 0) return null;
-                    return ConstSlot.ofInt(a.shiftLeft(b.intValue()));
-                }
-                case ">>": {
-                    if (a.signum() < 0) return null;        // BSV shifts are logical
-                    if (b.signum() < 0) return null;
-                    if (b.compareTo(BigInteger.valueOf(128)) > 0) return null;
-                    return ConstSlot.ofInt(a.shiftRight(b.intValue()));
-                }
+                // OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT operate on the
+                // operands' raw script-number BYTES, not their numeric value —
+                // native BigInteger folding produces results that differ from
+                // the deployed script (e.g. 255 << 1 is 254 on-chain, not 510;
+                // 255 & 1 aborts). Never fold them; emit the opcode so runtime
+                // byte-array semantics govern. Matches TS constant-fold.ts +
+                // the AnfInterpreter scriptNumber* helpers.
+                case "&":
+                case "|":
+                case "^":
+                case "<<":
+                case ">>":
+                    return null;
                 default: return null;
             }
         }
@@ -360,7 +358,10 @@ public final class ConstantFold {
             BigInteger n = operand.bigInt();
             switch (op) {
                 case "-": return ConstSlot.ofInt(n.negate());
-                case "~": return ConstSlot.ofInt(n.not());
+                // OP_INVERT flips the operand's script-number BYTES, not native
+                // BigInteger.not() (~5 is -122 on-chain, not -6). Never fold;
+                // emit the opcode so runtime byte-array semantics govern.
+                case "~": return null;
                 case "!": return ConstSlot.ofBool(n.signum() == 0);
                 default: return null;
             }

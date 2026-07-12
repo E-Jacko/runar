@@ -198,25 +198,24 @@ class TestBinaryOps:
 # ---------------------------------------------------------------------------
 
 class TestShiftOps:
-    def test_fold_left_shift(self):
+    def test_no_fold_shifts(self):
+        # OP_LSHIFT/OP_RSHIFT operate on the operands' raw script-number bytes,
+        # preserving byte length -- 255 << 1 is 254 on-chain, not 510. Folding
+        # with native int would bake a wrong constant into the deployed script,
+        # so the folder must leave these as bin_ops for the runtime opcode (the
+        # SDK ANF interpreter models the same byte semantics).
         p = _make_program([_make_method("m", [
-            _b("t0", _mk_int(1)),
-            _b("t1", _mk_int(3)),
+            _b("t0", _mk_int(255)),
+            _b("t1", _mk_int(1)),
             _b("t2", _bin_op("<<", "t0", "t1")),
+            _b("t3", _bin_op(">>", "t0", "t1")),
         ])])
         r = fold_constants(p)
-        _assert_load_const_int(r.methods[0].body[2].value, 8)
-
-    def test_fold_right_shift(self):
-        p = _make_program([_make_method("m", [
-            _b("t0", _mk_int(16)),
-            _b("t1", _mk_int(2)),
-            _b("t2", _bin_op(">>", "t0", "t1")),
-        ])])
-        r = fold_constants(p)
-        _assert_load_const_int(r.methods[0].body[2].value, 4)
+        _assert_not_folded(r.methods[0].body[2].value, "bin_op")
+        _assert_not_folded(r.methods[0].body[3].value, "bin_op")
 
     def test_no_fold_negative_shift(self):
+        # Subsumed by the rule above, but kept as an explicit regression anchor.
         p = _make_program([_make_method("m", [
             _b("t0", _mk_int(-8)),
             _b("t1", _mk_int(1)),
@@ -231,8 +230,11 @@ class TestShiftOps:
 # ---------------------------------------------------------------------------
 
 class TestBitwiseOps:
-    def test_fold_bitwise(self):
-        # AND: 0b1100 & 0b1010 = 0b1000 = 8
+    def test_no_fold_bitwise(self):
+        # OP_AND/OP_OR/OP_XOR require equal-length operand bytes and operate
+        # bytewise -- the numeric fold (e.g. 255 & 1 == 1) disagrees with the
+        # on-chain result (255 & 1 ABORTS on a length mismatch). Never fold;
+        # emit the opcode so runtime byte-array semantics govern.
         p = _make_program([_make_method("m", [
             _b("t0", _mk_int(0b1100)),
             _b("t1", _mk_int(0b1010)),
@@ -241,9 +243,9 @@ class TestBitwiseOps:
             _b("t4", _bin_op("^", "t0", "t1")),
         ])])
         r = fold_constants(p)
-        _assert_load_const_int(r.methods[0].body[2].value, 8)
-        _assert_load_const_int(r.methods[0].body[3].value, 14)
-        _assert_load_const_int(r.methods[0].body[4].value, 6)
+        _assert_not_folded(r.methods[0].body[2].value, "bin_op")
+        _assert_not_folded(r.methods[0].body[3].value, "bin_op")
+        _assert_not_folded(r.methods[0].body[4].value, "bin_op")
 
 
 # ---------------------------------------------------------------------------
@@ -326,13 +328,15 @@ class TestUnaryOps:
         r = fold_constants(p)
         _assert_load_const_int(r.methods[0].body[1].value, -42)
 
-    def test_fold_bitwise_not(self):
+    def test_no_fold_bitwise_not(self):
+        # OP_INVERT flips the operand's script-number bytes, not native ~n
+        # (~5 is -122 on-chain, not -6). Never fold; emit the opcode.
         p = _make_program([_make_method("m", [
-            _b("t0", _mk_int(0)),
+            _b("t0", _mk_int(5)),
             _b("t1", _unary_op("~", "t0")),
         ])])
         r = fold_constants(p)
-        _assert_load_const_int(r.methods[0].body[1].value, -1)
+        _assert_not_folded(r.methods[0].body[1].value, "unary_op")
 
     def test_fold_bang_on_zero(self):
         """!0n should produce True (boolean), not 1."""

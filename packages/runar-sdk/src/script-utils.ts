@@ -87,7 +87,7 @@ function readScriptElement(
   return { dataHex: '', totalHexChars: 2, opcode };
 }
 
-function decodeScriptNumber(dataHex: string): bigint {
+export function decodeScriptNumber(dataHex: string): bigint {
   if (dataHex.length === 0) return 0n;
   const bytes: number[] = [];
   for (let i = 0; i < dataHex.length; i += 2) bytes.push(parseInt(dataHex.slice(i, i + 2), 16));

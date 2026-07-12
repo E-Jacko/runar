@@ -963,16 +963,14 @@ def _eval_bin_op(op: str, left: Any, right: Any, result_type: Optional[str] = No
         return _is_truthy(left) and _is_truthy(right)
     if op in ('||', 'or'):
         return _is_truthy(left) or _is_truthy(right)
-    if op == '&':
-        return l & r
-    if op == '|':
-        return l | r
-    if op == '^':
-        return l ^ r
-    if op == '<<':
-        return l << r
-    if op == '>>':
-        return l >> r
+    # Bitwise/shift on ints are byte-array Script ops: OP_AND/OP_OR/OP_XOR/
+    # OP_LSHIFT/OP_RSHIFT operate on the operands' script-number bytes, not
+    # their numeric value, so match the deployed script exactly (see the
+    # _script_number_* helpers) instead of using native int semantics.
+    if op in ('&', '|', '^'):
+        return _script_number_bitwise(op, l, r)
+    if op in ('<<', '>>'):
+        return _script_number_shift(op, l, r)
     return 0
 
 
@@ -1014,7 +1012,9 @@ def _eval_unary_op(op: str, operand: Any, result_type: Optional[str] = None) -> 
     if op in ('!', 'not'):
         return not _is_truthy(operand)
     if op == '~':
-        return ~val
+        # OP_INVERT flips the operand's script-number bytes, not native ~n
+        # (~5 is -122 on-chain, not -6). Match the deployed script.
+        return _script_number_invert(val)
     return val
 
 
@@ -1361,6 +1361,91 @@ def _bin2num_int(hex_str: str) -> int:
         result = (result << 8) | result_bytes[i]
 
     return -result if negative else result
+
+
+# ---------------------------------------------------------------------------
+# Script-number bitwise / shift semantics (byte-array ops, NOT numeric)
+# ---------------------------------------------------------------------------
+#
+# OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT operate on the RAW BYTES of
+# the operands' minimal script-number encoding, not on their numeric value
+# (spec/opcodes.md). AND/OR/XOR require equal-length operands and abort
+# otherwise; shifts treat the byte array as a big-endian bit string and
+# preserve its length. These reproduce exactly what the deployed script does,
+# so the interpreter (which models values as int) agrees with on-chain
+# execution byte-for-byte. Ported from the TS reference
+# packages/runar-testing/src/vm/utils.ts (scriptNumber* helpers); decode reuses
+# the tier's existing minimal script-number decoder (`_bin2num_int`).
+
+def _snum_encode(n: int) -> bytes:
+    """Minimal Bitcoin script-number bytes (little-endian sign-magnitude).
+
+    0 encodes to the empty byte string, matching OP_0 / an empty stack element.
+    """
+    if n == 0:
+        return b''
+    negative = n < 0
+    val = -n if negative else n
+    out = bytearray()
+    while val > 0:
+        out.append(val & 0xFF)
+        val >>= 8
+    # If the high bit of the last byte is set we need an extra sign byte.
+    if out[-1] & 0x80:
+        out.append(0x80 if negative else 0x00)
+    elif negative:
+        out[-1] |= 0x80
+    return bytes(out)
+
+
+def _script_number_bitwise(op: str, a: int, b: int) -> int:
+    """OP_AND/OP_OR/OP_XOR on two script-number ints.
+
+    Raises ValueError (execution abort) on a length mismatch, exactly like the
+    on-chain opcodes.
+    """
+    av = _snum_encode(a)
+    bv = _snum_encode(b)
+    if len(av) != len(bv):
+        name = {'&': 'OP_AND', '|': 'OP_OR', '^': 'OP_XOR'}[op]
+        raise ValueError(f'{name}: operands must be same length')
+    if op == '&':
+        result = bytes(x & y for x, y in zip(av, bv))
+    elif op == '|':
+        result = bytes(x | y for x, y in zip(av, bv))
+    else:
+        result = bytes(x ^ y for x, y in zip(av, bv))
+    return _bin2num_int(result.hex())
+
+
+def _script_number_invert(a: int) -> int:
+    """OP_INVERT: flip every bit of the operand's minimal script-number bytes."""
+    av = _snum_encode(a)
+    result = bytes((~x) & 0xFF for x in av)
+    return _bin2num_int(result.hex())
+
+
+def _script_number_shift(op: str, a: int, shift: int) -> int:
+    """OP_LSHIFT/OP_RSHIFT: shift the operand's bytes as a big-endian bit string,
+    preserving byte length (LSHIFT masks off overflow MSBs).
+
+    Raises ValueError (execution abort) on a negative shift, like the opcodes.
+    """
+    if shift < 0:
+        raise ValueError(
+            'OP_LSHIFT: negative shift' if op == '<<' else 'OP_RSHIFT: negative shift'
+        )
+    val = _snum_encode(a)
+    n = int(shift)
+    if len(val) == 0 or n == 0:
+        return _bin2num_int(val.hex())
+    num = int.from_bytes(val, 'big')
+    if op == '<<':
+        num = (num << n) & ((1 << (len(val) * 8)) - 1)
+    else:
+        num >>= n
+    result = num.to_bytes(len(val), 'big')
+    return _bin2num_int(result.hex())
 
 
 # ---------------------------------------------------------------------------
