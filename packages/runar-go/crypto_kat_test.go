@@ -265,32 +265,34 @@ func TestOfficialKAT_SLHDSA_ACVP(t *testing.T) {
 				t.Fatalf("bad signature hex: %v", err)
 			}
 
-			// The NIST-published signature MUST verify.
-			//
-			// CONFIRMED CONFORMANCE BUG (BUG-101 class): the native SLH-DSA
-			// round-trips its OWN signatures (see TestSLHDSA_SelfConsistency)
-			// but is NOT FIPS-205 conformant, so it rejects this authoritative
-			// NIST ACVP signature. The vector is copied verbatim from NIST
-			// (see slh-dsa-acvp-kat.json _source) — the impl is at fault, NOT
-			// the vector. At least one deviation is confirmed: slhHmsg's MGF1
+			// The NIST-published signature is EXPECTED TO FAIL verification
+			// today — this is a self-clearing xfail pinned to issue #137, NOT
+			// a skip. CONFIRMED CONFORMANCE BUG (BUG-101 class): the native
+			// SLH-DSA round-trips its OWN signatures (see
+			// TestSLHDSA_SelfConsistency) but is NOT FIPS-205 conformant, so
+			// it currently rejects this authoritative NIST ACVP signature.
+			// The vector is copied verbatim from NIST (see
+			// slh-dsa-acvp-kat.json _source) — the impl is at fault, NOT the
+			// vector. At least one deviation is confirmed: slhHmsg's MGF1
 			// seed omits the R||PK.seed prefix that FIPS-205 §11.2 mandates
 			// (added to mitigate multi-target long-message 2nd-preimage
-			// attacks); a patch experiment shows further verify-path deviations
-			// remain beyond it, so a full FIPS-205 audit is required.
+			// attacks); a patch experiment shows further verify-path
+			// deviations remain beyond it, so a full FIPS-205 audit is
+			// required (tracked in #137).
 			//
-			// This vendored vector is the regression GATE. The instant the impl
-			// becomes conformant, SLHVerify returns true, the Skip below is
-			// bypassed, and the assertions ENFORCE automatically — at which
-			// point delete this guard.
-			if !SLHVerify(params, msg, sig, pk) {
-				t.Skipf("KNOWN FIPS-205 NON-CONFORMANCE: native SLHVerify REJECTS the official NIST ACVP %s signature (self-consistent but non-standard — BUG-101 class). Vector is authoritative; the impl is at fault. Remove this guard once the impl is fixed.", v.ParamSet)
+			// When #137 is fixed and SLHVerify starts ACCEPTING the standard
+			// vector, THIS ASSERTION FLIPS TO A FAILURE — that is the point:
+			// it forces whoever fixes #137 to replace the block below with
+			// `if !SLHVerify(...) { t.Fatalf(...) }` and delete this xfail
+			// comment, instead of the bug rotting silently behind a skip.
+			if SLHVerify(params, msg, sig, pk) {
+				t.Fatalf("SLHVerify ACCEPTED the official NIST ACVP %s signature — issue #137 appears FIXED. Flip this xfail to require acceptance and delete the xfail comment.", v.ParamSet)
 			}
 
-			// --- Enforced once the impl is FIPS-205 conformant ---
-			if !SLHVerify(params, msg, sig, pk) {
-				t.Fatalf("SLHVerify rejected the official NIST ACVP %s signature", v.ParamSet)
-			}
-			// A 1-bit-flipped signature MUST be rejected.
+			// A genuinely tampered signature MUST be rejected regardless of
+			// #137 — that property holds whether or not the impl is
+			// FIPS-205 conformant, so it runs unconditionally (it used to be
+			// dead code behind the t.Skipf this xfail replaces).
 			tampered := make([]byte, len(sig))
 			copy(tampered, sig)
 			tampered[len(tampered)-1] ^= 0x01
