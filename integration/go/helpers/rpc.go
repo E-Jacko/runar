@@ -182,6 +182,28 @@ func GetRawTransaction(txid string) (map[string]interface{}, error) {
 	return tx, nil
 }
 
+// GetTxOut returns UTXO info for a given (txid, vout) via the node's UTXO
+// set, or nil if the output is spent (or its transaction was never mined).
+// Unlike GetRawTransaction, this only reflects confirmed chain state, so it's
+// the right check for "did this spend ever actually get mined" — SV Node
+// accepts non-final transactions (future nLockTime + non-final nSequence)
+// into the mempool for relay but excludes them from block templates, so
+// sendrawtransaction succeeding is NOT evidence a spend is consensus-final.
+func GetTxOut(txid string, vout int) (map[string]interface{}, error) {
+	result, err := RPCCall("gettxout", txid, vout)
+	if err != nil {
+		return nil, err
+	}
+	if string(result) == "null" {
+		return nil, nil
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(result, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EnsureRegtest verifies that the connected Bitcoin node is running on regtest.
 // Calls log.Fatalf if the node is unreachable or reports a different network,
 // preventing accidental transactions on mainnet or testnet.

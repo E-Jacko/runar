@@ -123,6 +123,37 @@ func SignInput(tx *transaction.Transaction, inputIdx int, key *ec.PrivateKey) (s
 	return hex.EncodeToString(sigWithFlag), nil
 }
 
+// SignInputWithCodeSep is like SignInput but computes the sighash over a
+// scriptCode trimmed at an OP_CODESEPARATOR byte offset within the previous
+// output's locking script, instead of the full script. Required whenever the
+// signed opcode (e.g. a user checkSig(...) call) executes AFTER an
+// OP_CODESEPARATOR — as with StatefulSmartContract's auto-injected
+// checkPreimage, which inserts OP_CODESEPARATOR at method entry before any
+// user code runs. codeSepIdx < 0 means no trim (use the full script, matching
+// SignInput). Mirrors the trim SignOpPushTxWithCodeSep already applies to the
+// OP_PUSH_TX signature.
+func SignInputWithCodeSep(tx *transaction.Transaction, inputIdx int, key *ec.PrivateKey, codeSepIdx int) (string, error) {
+	prevOutput := tx.Inputs[inputIdx].SourceTxOutput()
+	if prevOutput == nil {
+		return "", fmt.Errorf("input %d has no source output set", inputIdx)
+	}
+	if codeSepIdx >= 0 {
+		fullHex := hex.EncodeToString(*prevOutput.LockingScript)
+		if (codeSepIdx+1)*2 > len(fullHex) {
+			return "", fmt.Errorf("codesep offset %d out of range for %d-byte script", codeSepIdx, len(fullHex)/2)
+		}
+		trimmedScript, err := script.NewFromHex(fullHex[(codeSepIdx+1)*2:])
+		if err != nil {
+			return "", fmt.Errorf("trim subscript at codesep %d: %w", codeSepIdx, err)
+		}
+		origScript := prevOutput.LockingScript
+		prevOutput.LockingScript = trimmedScript
+		defer func() { prevOutput.LockingScript = origScript }()
+	}
+
+	return SignInput(tx, inputIdx, key)
+}
+
 // BroadcastAndMine broadcasts a raw transaction and mines a block.
 func BroadcastAndMine(txHex string) (string, error) {
 	txid, err := SendRawTransaction(txHex)
