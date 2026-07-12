@@ -99,6 +99,16 @@ function arbNonZeroDivisorLiteral(): fc.Arbitrary<string> {
 }
 
 /**
+ * Non-negative bounded shift count (0..16). OP_LSHIFT/OP_RSHIFT abort on a
+ * negative shift, so the RHS of a generated shift is always a small
+ * non-negative literal — the shift then reaches the execution oracle with a
+ * defined result (interpreter and script share the byte-array shift semantics).
+ */
+function arbSmallShiftLiteral(): fc.Arbitrary<string> {
+  return fc.integer({ min: 0, max: 16 }).map((n) => `${n}n`);
+}
+
+/**
  * Generate a random arithmetic expression using available bigint variables.
  */
 function arbArithExpr(bigintVars: string[], depth: number): fc.Arbitrary<string> {
@@ -131,6 +141,25 @@ function arbArithExpr(bigintVars: string[], depth: number): fc.Arbitrary<string>
         arbArithExpr(bigintVars, depth - 1),
         fc.constantFrom('/' as const, '%' as const),
         arbNonZeroDivisorLiteral(),
+      )
+      .map(([l, op, r]) => `(${l} ${op} ${r})`),
+    // Shifts (bounded non-negative literal count) and bitwise ops. These lower
+    // to byte-array Script opcodes (OP_LSHIFT/OP_RSHIFT/OP_AND/OP_OR/OP_XOR);
+    // the interpreter now models the same byte semantics, so they reach the
+    // execution oracle in agreement — a length-mismatch `& | ^` aborts on BOTH
+    // the interpreter and the script (audit #10 / the shift-bitwise fix).
+    fc
+      .tuple(
+        arbArithExpr(bigintVars, depth - 1),
+        fc.constantFrom('<<' as const, '>>' as const),
+        arbSmallShiftLiteral(),
+      )
+      .map(([l, op, r]) => `(${l} ${op} ${r})`),
+    fc
+      .tuple(
+        arbArithExpr(bigintVars, depth - 1),
+        fc.constantFrom('&' as const, '|' as const, '^' as const),
+        arbArithExpr(bigintVars, depth - 1),
       )
       .map(([l, op, r]) => `(${l} ${op} ${r})`),
   );
