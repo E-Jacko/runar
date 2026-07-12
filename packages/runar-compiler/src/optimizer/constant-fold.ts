@@ -44,21 +44,19 @@ function evalBinOp(op: string, left: ConstValue, right: ConstValue): ConstValue 
       case '>': return left > right;
       case '<=': return left <= right;
       case '>=': return left >= right;
-      case '&': return left & right;
-      case '|': return left | right;
-      case '^': return left ^ right;
+      // OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT operate on the operands'
+      // raw script-number BYTES, not their numeric value — native bigint
+      // folding produces results that differ from the deployed script (e.g.
+      // 255 << 1 is 254 on-chain, not 510; 255 & 1 aborts). Never fold them;
+      // emit the opcode so runtime byte-array semantics govern. (See
+      // vm/utils scriptNumber* + the interpreter, which model the same
+      // semantics for TestContract.)
+      case '&':
+      case '|':
+      case '^':
       case '<<':
-        // Bitcoin Script's OP_LSHIFT operates on raw byte arrays (big-endian
-        // unsigned shift), not Script numbers. Skip folding for negative left
-        // operands to avoid producing incorrect results at compile time.
-        if (left < 0n) return null;
-        return left << right;
       case '>>':
-        // JavaScript's >> is arithmetic (sign-extending) but Bitcoin Script's
-        // OP_RSHIFT is logical. Skip folding for negative left operands to
-        // avoid producing incorrect results at compile time.
-        if (left < 0n) return null;
-        return left >> right;
+        return null;
       default: return null;
     }
   }
@@ -109,7 +107,9 @@ function evalUnaryOp(op: string, operand: ConstValue): ConstValue | null {
   if (typeof operand === 'bigint') {
     switch (op) {
       case '-': return -operand;
-      case '~': return ~operand;
+      // OP_INVERT flips the operand's script-number bytes, not native ~n.
+      // Never fold; emit the opcode so runtime semantics govern.
+      case '~': return null;
       case '!': return operand === 0n;
       default: return null;
     }

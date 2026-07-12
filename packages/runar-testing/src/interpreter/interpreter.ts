@@ -27,7 +27,12 @@ import type {
   BinaryOp,
   UnaryOp,
 } from 'runar-ir-schema';
-import { hexToBytes } from '../vm/utils.js';
+import {
+  hexToBytes,
+  scriptNumberBitwise,
+  scriptNumberInvert,
+  scriptNumberShift,
+} from '../vm/utils.js';
 
 // ---------------------------------------------------------------------------
 // Interpreter value types
@@ -484,11 +489,17 @@ export class RunarInterpreter {
           if (right.value === 0n) throw new Error('Modulo by zero');
           return { kind: 'bigint', value: left.value % right.value };
         }
-        case '&': return { kind: 'bigint', value: left.value & right.value };
-        case '|': return { kind: 'bigint', value: left.value | right.value };
-        case '^': return { kind: 'bigint', value: left.value ^ right.value };
-        case '<<': return { kind: 'bigint', value: left.value << right.value };
-        case '>>': return { kind: 'bigint', value: left.value >> right.value };
+        // Bitwise/shift are byte-array Script ops (OP_AND/OP_OR/OP_XOR/
+        // OP_LSHIFT/OP_RSHIFT operate on the operands' script-number bytes, not
+        // their numeric value), so match the deployed script exactly rather
+        // than using native bigint semantics. See vm/utils scriptNumber* + spec.
+        case '&':
+        case '|':
+        case '^':
+          return { kind: 'bigint', value: scriptNumberBitwise(op, left.value, right.value) };
+        case '<<':
+        case '>>':
+          return { kind: 'bigint', value: scriptNumberShift(op, left.value, right.value) };
         case '===': return { kind: 'boolean', value: left.value === right.value };
         case '!==': return { kind: 'boolean', value: left.value !== right.value };
         case '<': return { kind: 'boolean', value: left.value < right.value };
@@ -552,8 +563,9 @@ export class RunarInterpreter {
         if (operand.kind !== 'bigint') {
           throw new Error(`Cannot bitwise-not ${operand.kind}`);
         }
-        // Bitwise NOT for bigint: ~n = -(n + 1)
-        return { kind: 'bigint', value: ~operand.value };
+        // OP_INVERT flips the bits of the operand's script-number bytes, not
+        // the numeric two's-complement ~n. Match the deployed script.
+        return { kind: 'bigint', value: scriptNumberInvert(operand.value) };
       }
     }
   }

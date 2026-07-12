@@ -72,6 +72,71 @@ export function decodeScriptNumber(bytes: Uint8Array): bigint {
 }
 
 // ---------------------------------------------------------------------------
+// Script-number bitwise / shift semantics (byte-array ops, NOT numeric)
+// ---------------------------------------------------------------------------
+//
+// OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT operate on the RAW BYTES of
+// the operands' minimal script-number encoding, not on their numeric value
+// (spec/opcodes.md). AND/OR/XOR require equal-length operands and fail
+// otherwise; shifts treat the byte array as a big-endian bit string and
+// preserve its length. These helpers reproduce EXACTLY what ScriptVM's opcode
+// handlers do, so the interpreter (which models values as bigint) agrees with
+// the deployed script byte-for-byte. A differential fuzz test pins the two
+// together. Callers convert bigint -> minimal bytes -> byte op -> bigint.
+
+/** OP_AND/OP_OR/OP_XOR on two script-number-valued bigints. Throws on length
+ *  mismatch, exactly like the on-chain opcodes. */
+export function scriptNumberBitwise(op: '&' | '|' | '^', a: bigint, b: bigint): bigint {
+  const av = encodeScriptNumber(a);
+  const bv = encodeScriptNumber(b);
+  if (av.length !== bv.length) {
+    const name = op === '&' ? 'OP_AND' : op === '|' ? 'OP_OR' : 'OP_XOR';
+    throw new Error(`${name}: operands must be same length`);
+  }
+  const result = new Uint8Array(av.length);
+  for (let i = 0; i < av.length; i++) {
+    const x = av[i]!;
+    const y = bv[i]!;
+    result[i] = op === '&' ? x & y : op === '|' ? x | y : x ^ y;
+  }
+  return decodeScriptNumber(result);
+}
+
+/** OP_INVERT: flip every bit of the operand's minimal script-number bytes. */
+export function scriptNumberInvert(a: bigint): bigint {
+  const av = encodeScriptNumber(a);
+  const result = new Uint8Array(av.length);
+  for (let i = 0; i < av.length; i++) result[i] = ~av[i]! & 0xff;
+  return decodeScriptNumber(result);
+}
+
+/** OP_LSHIFT/OP_RSHIFT: shift the operand's bytes as a big-endian bit string,
+ *  preserving byte length (LSHIFT masks off overflow MSBs). `shift` is the
+ *  script-number shift count; negative shifts fail like the opcodes. */
+export function scriptNumberShift(op: '<<' | '>>', a: bigint, shift: bigint): bigint {
+  if (shift < 0n) {
+    throw new Error(op === '<<' ? 'OP_LSHIFT: negative shift' : 'OP_RSHIFT: negative shift');
+  }
+  const val = encodeScriptNumber(a);
+  const n = Number(shift);
+  if (val.length === 0 || n === 0) return decodeScriptNumber(val);
+  let num = 0n;
+  for (let i = 0; i < val.length; i++) num = (num << 8n) | BigInt(val[i]!);
+  if (op === '<<') {
+    const bitLen = BigInt(val.length * 8);
+    num = (num << BigInt(n)) & ((1n << bitLen) - 1n);
+  } else {
+    num >>= BigInt(n);
+  }
+  const result = new Uint8Array(val.length);
+  for (let i = val.length - 1; i >= 0; i--) {
+    result[i] = Number(num & 0xffn);
+    num >>= 8n;
+  }
+  return decodeScriptNumber(result);
+}
+
+// ---------------------------------------------------------------------------
 // Stack element truthiness
 // ---------------------------------------------------------------------------
 
