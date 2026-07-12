@@ -151,7 +151,14 @@ function classifyEncoded(
     if (b0 === 0x00) return { encoding: 'op-0', pushHeaderBytes: 0 };
     if (b0 === 0x4f) return { encoding: 'op-1negate', pushHeaderBytes: 0 };
     if (b0 >= 0x51 && b0 <= 0x60) return { encoding: 'op-n', pushHeaderBytes: 0 };
-    return { encoding: 'scriptnum-push', pushHeaderBytes: 1 };
+    // Otherwise a script-number push. Derive the header width from the actual
+    // push opcode rather than assuming 1 byte: a sign-magnitude payload > 75
+    // bytes uses OP_PUSHDATA1/2/4 (2/3/5-byte headers), which would otherwise
+    // shift the excision window and corrupt the template hash.
+    if (b0 <= 0x4b) return { encoding: 'scriptnum-push', pushHeaderBytes: 1 };
+    if (b0 === 0x4c) return { encoding: 'scriptnum-push', pushHeaderBytes: 2 };
+    if (b0 === 0x4d) return { encoding: 'scriptnum-push', pushHeaderBytes: 3 };
+    return { encoding: 'scriptnum-push', pushHeaderBytes: 5 }; // 0x4e
   }
   // Data (hex string): OP_0 for empty, else direct push / PUSHDATA1/2/4.
   if (b0 === 0x00) return { encoding: 'op-0', pushHeaderBytes: 0 };
