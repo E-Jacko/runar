@@ -912,9 +912,46 @@ export class RunarContract {
     const feeRate = await provider.getFeeRate();
     const changeScript = buildP2PKHScript(changeAddress);
     const allFundingUtxos = await provider.getUtxos(address);
-    const additionalUtxos = allFundingUtxos.filter(
+    const candidateFundingUtxos = allFundingUtxos.filter(
       (u) => !(u.txid === this.currentUtxo!.txid && u.outputIndex === this.currentUtxo!.outputIndex),
     );
+
+    // Coin selection for funding inputs (issue #133): don't sweep the whole
+    // wallet. Compute how much the funding must cover — the contract's own
+    // input value already offsets the contract/data outputs — and pick the
+    // smallest largest-first set via selectUtxos (the strategy deploy uses).
+    const contractOutputSats =
+      (contractOutputs
+        ? contractOutputs.reduce((sum, o) => sum + o.satoshis, 0)
+        : (newSatoshis ?? 0))
+      + resolvedDataOutputs.reduce((sum, o) => sum + o.satoshis, 0);
+    const contractInputSats =
+      this.currentUtxo.satoshis
+      + extraContractUtxos.reduce((sum, u) => sum + u.satoshis, 0);
+    const fundingTarget = Math.max(0, contractOutputSats - contractInputSats);
+    // Fee sizing hint for selectUtxos: the continuation script length (falls
+    // back to the first multi-output script, else 0 for stateless calls).
+    const fundingLockLen =
+      (newLockingScript?.length ?? contractOutputs?.[0]?.script.length ?? 0) / 2;
+    const additionalUtxos =
+      candidateFundingUtxos.length > 0
+        ? selectUtxos(candidateFundingUtxos, fundingTarget, fundingLockLen, feeRate)
+        : [];
+
+    // Cap funding inputs when the caller sets maxFundingInputs. selectUtxos
+    // returns the minimal largest-first set; if that still exceeds the cap the
+    // funding can't cover outputs + fee within the budget, so fail loudly
+    // instead of broadcasting an underfunded tx.
+    if (
+      options?.maxFundingInputs !== undefined &&
+      additionalUtxos.length > options.maxFundingInputs
+    ) {
+      throw new Error(
+        `RunarContract.call(${methodName}): funding requires ${additionalUtxos.length} input(s) ` +
+          `but maxFundingInputs=${options.maxFundingInputs}. Increase maxFundingInputs, ` +
+          `use larger UTXOs, or consolidate.`,
+      );
+    }
 
     // Resolve per-input args for additional contract inputs
     const resolvedPerInputArgs: unknown[][] | undefined = options?.additionalContractInputArgs

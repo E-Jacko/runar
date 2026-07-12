@@ -171,4 +171,13 @@ export interface CallOptions {
    * Threaded through both the non-terminal and terminal call-tx build sites.
    */
   locktime?: number;
+
+  /**
+   * Cap the number of P2PKH funding inputs added to a non-terminal call tx
+   * (issue #133). Funding is chosen by smallest-sufficient, largest-first
+   * selection (the same `selectUtxos` strategy deploy uses). If covering the
+   * outputs + fee would need more than this many inputs, the call throws
+   * rather than silently sweeping the wallet. Unset → no cap.
+   */
+  maxFundingInputs?: number;
 }
