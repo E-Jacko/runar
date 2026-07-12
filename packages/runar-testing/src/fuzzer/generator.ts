@@ -84,6 +84,21 @@ export function arbByteStringLiteral(): fc.Arbitrary<string> {
 }
 
 /**
+ * A non-zero divisor literal for `/` and `%`. Always a fixed literal (never
+ * a variable) so the resulting expression is well-defined regardless of the
+ * random witness value drawn for the left-hand side at spend time — the
+ * execution oracle (`runDifferentialExecution`, driven by
+ * `arbArithmeticContract` / `arbStatelessContract`) synthesizes fresh
+ * bigint witnesses per spend and cannot itself guarantee a variable operand
+ * is non-zero.
+ */
+function arbNonZeroDivisorLiteral(): fc.Arbitrary<string> {
+  return fc.integer({ min: 1, max: 20 }).chain((n) =>
+    fc.constantFrom(`${n}n`, `${-n}n`),
+  );
+}
+
+/**
  * Generate a random arithmetic expression using available bigint variables.
  */
 function arbArithExpr(bigintVars: string[], depth: number): fc.Arbitrary<string> {
@@ -106,6 +121,16 @@ function arbArithExpr(bigintVars: string[], depth: number): fc.Arbitrary<string>
         arbArithExpr(bigintVars, depth - 1),
         fc.constantFrom(...binOps),
         arbArithExpr(bigintVars, depth - 1),
+      )
+      .map(([l, op, r]) => `(${l} ${op} ${r})`),
+    // Division / modulo — RHS is always a non-zero literal (see
+    // arbNonZeroDivisorLiteral) so `/`/`%` reach the execution oracle with a
+    // well-defined result instead of a div-by-zero reject on both engines.
+    fc
+      .tuple(
+        arbArithExpr(bigintVars, depth - 1),
+        fc.constantFrom('/' as const, '%' as const),
+        arbNonZeroDivisorLiteral(),
       )
       .map(([l, op, r]) => `(${l} ${op} ${r})`),
   );
@@ -585,6 +610,21 @@ export function arbByteStringLiteralIR(): fc.Arbitrary<Expr> {
     }));
 }
 
+/**
+ * A non-zero divisor literal for `/` and `%` (IR form). See
+ * `arbNonZeroDivisorLiteral` above — same rationale: `arbGeneratedContract`
+ * feeds `execute-differential.ts`'s witness-driven execution oracle, so the
+ * divisor must be fixed at generation time, not left to a runtime witness.
+ */
+function arbNonZeroDivisorLiteralIR(): fc.Arbitrary<Expr> {
+  return fc.integer({ min: 1, max: 20 }).chain((n) =>
+    fc.constantFrom<Expr>(
+      { kind: 'bigint_literal', value: BigInt(n) },
+      { kind: 'bigint_literal', value: BigInt(-n) },
+    ),
+  );
+}
+
 /** Generate a bigint-typed expression using available vars. */
 function arbBigintExprIR(
   bigintVars: string[],
@@ -612,6 +652,14 @@ function arbBigintExprIR(
       arbBigintExprIR(bigintVars, depth - 1),
       fc.constantFrom(...ops),
       arbBigintExprIR(bigintVars, depth - 1),
+    ).map(([left, op, right]): Expr => ({ kind: 'binary', op, left, right })),
+    // Division / modulo — RHS restricted to a non-zero literal (see
+    // arbNonZeroDivisorLiteralIR) so OP_DIV/OP_MOD reach the execution
+    // oracle with a well-defined result on every synthesized witness.
+    fc.tuple(
+      arbBigintExprIR(bigintVars, depth - 1),
+      fc.constantFrom('/' as const, '%' as const),
+      arbNonZeroDivisorLiteralIR(),
     ).map(([left, op, right]): Expr => ({ kind: 'binary', op, left, right })),
     // Math builtins
     fc.tuple(

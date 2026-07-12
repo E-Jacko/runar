@@ -234,6 +234,17 @@ function ensureBool(rng: Rng, ctx: GenContext): TypedBinding {
 const BIGINT_BIN_OPS = ['+', '-', '*'] as const;
 const CMP_BIN_OPS = ['===', '!==', '<', '>', '<=', '>='] as const;
 const BOOL_BIN_OPS = ['&&', '||'] as const;
+// Division / modulo — routed through a DEDICATED emitter (emitDivModOp)
+// with a guaranteed non-zero RHS rather than the generic twoDistinct()
+// picker, so `x / 0` / `x % 0` never appear in the generated corpus.
+const DIV_MOD_OPS = ['/', '%'] as const;
+// Shift ops — RHS is a small non-negative literal amount (emitShiftOp),
+// matching the consensus rule that OP_LSHIFT/OP_RSHIFT's shift-amount
+// operand must be non-negative (see @bsv/sdk Spend.ts, which hard-rejects
+// a negative shift amount).
+const SHIFT_OPS = ['<<', '>>'] as const;
+// Bitwise ops — plain twoDistinct() operands, same as BIGINT_BIN_OPS.
+const BITWISE_BIN_OPS = ['&', '|', '^'] as const;
 
 function emitBinOp(rng: Rng, ctx: GenContext, kind: 'bigint' | 'cmp' | 'bool'): TypedBinding {
   if (kind === 'bigint') {
@@ -299,14 +310,82 @@ function twoDistinct(
   return { left, right };
 }
 
+/**
+ * A fresh, guaranteed-non-zero `load_const` bigint binding (small magnitude,
+ * either sign). Used as the RHS of `/` / `%` so a generated program's
+ * division is always well-defined — never routed through `twoDistinct()`
+ * (which can pick an existing `load_const 0` binding).
+ */
+function emitNonZeroConst(rng: Rng, ctx: GenContext): TypedBinding {
+  const name = freshName(ctx);
+  const mag = rng.nextInt(1, 20);
+  const value = rng.nextBoolean() ? BigInt(mag) : BigInt(-mag);
+  const b: TypedBinding = { name, ty: 'bigint', value: { kind: 'load_const', value } };
+  return pushRef(ctx, b);
+}
+
+/** `/` or `%` with a guaranteed non-zero literal RHS (see DIV_MOD_OPS). */
+function emitDivModOp(rng: Rng, ctx: GenContext): TypedBinding {
+  const left = ensureBigint(rng, ctx);
+  const right = emitNonZeroConst(rng, ctx);
+  const op = pickAny(rng, DIV_MOD_OPS);
+  const name = freshName(ctx);
+  const b: TypedBinding = {
+    name,
+    ty: 'bigint',
+    value: { kind: 'bin_op', op, left: left.name, right: right.name },
+  };
+  return pushRef(ctx, b);
+}
+
+/**
+ * `<<` or `>>` with a small non-negative literal shift amount (see
+ * SHIFT_OPS) — a fresh `load_const` rather than a `twoDistinct()` pick so
+ * the amount can never be negative (a negative shift amount is a hard
+ * consensus-level reject, uninteresting for a byte-parity probe).
+ */
+function emitShiftOp(rng: Rng, ctx: GenContext): TypedBinding {
+  const left = ensureBigint(rng, ctx);
+  const amtName = freshName(ctx);
+  const amt: TypedBinding = pushRef(ctx, {
+    name: amtName,
+    ty: 'bigint',
+    value: { kind: 'load_const', value: BigInt(rng.nextInt(0, 7)) },
+  });
+  const op = pickAny(rng, SHIFT_OPS);
+  const name = freshName(ctx);
+  const b: TypedBinding = {
+    name,
+    ty: 'bigint',
+    value: { kind: 'bin_op', op, left: left.name, right: amt.name },
+  };
+  return pushRef(ctx, b);
+}
+
+/** `&`, `|`, or `^` — plain twoDistinct() operands (see BITWISE_BIN_OPS). */
+function emitBitwiseOp(rng: Rng, ctx: GenContext): TypedBinding {
+  const { left, right } = twoDistinct(rng, ctx, 'bigint');
+  const op = pickAny(rng, BITWISE_BIN_OPS);
+  const name = freshName(ctx);
+  const b: TypedBinding = {
+    name,
+    ty: 'bigint',
+    value: { kind: 'bin_op', op, left: left.name, right: right.name },
+  };
+  return pushRef(ctx, b);
+}
+
 function emitUnaryOp(rng: Rng, ctx: GenContext, kind: 'bigint' | 'bool'): TypedBinding {
   if (kind === 'bigint') {
     const operand = ensureBigint(rng, ctx);
     const name = freshName(ctx);
+    // '~' (bitwise NOT) alongside the existing '-' (negate) — both are
+    // legal Rúnar unary ops on bigint (UnaryOp = '!' | '-' | '~').
+    const op = rng.nextBoolean() ? '-' : '~';
     const b: TypedBinding = {
       name,
       ty: 'bigint',
-      value: { kind: 'unary_op', op: '-', operand: operand.name },
+      value: { kind: 'unary_op', op, operand: operand.name },
     };
     return pushRef(ctx, b);
   }
@@ -460,7 +539,7 @@ function generateProgram(rng: Rng, opts: GenOpts): AnfProgram {
 
     const numBindings = rng.nextInt(1, opts.maxBindingsPerMethod);
     for (let b = 0; b < numBindings; b++) {
-      const choice = rng.nextInt(0, 11);
+      const choice = rng.nextInt(0, 14);
       try {
         if (choice === 0) emitConst(rng, ctx, 'bigint');
         else if (choice === 1) emitConst(rng, ctx, 'boolean');
@@ -474,6 +553,9 @@ function generateProgram(rng: Rng, opts: GenOpts): AnfProgram {
         else if (choice === 9) emitCallAbs(rng, ctx);
         else if (choice === 10) emitArrayLiteral(rng, ctx);
         else if (choice === 11 && properties.length > 0) emitUpdateProp(rng, ctx, pickAny(rng, properties));
+        else if (choice === 12) emitDivModOp(rng, ctx);
+        else if (choice === 13) emitShiftOp(rng, ctx);
+        else if (choice === 14) emitBitwiseOp(rng, ctx);
         else emitConst(rng, ctx, 'bigint');
       } catch {
         // Defensive: a generation primitive that can't satisfy its
@@ -761,6 +843,74 @@ function saveFinding(dir: string, f: Finding): string {
 }
 
 // ---------------------------------------------------------------------------
+// Per-program tier-result classification (finding #16).
+//
+// Pulled out of the main loop so the "is this program a mismatch?" decision
+// is independently unit-testable with synthetic tier outputs, instead of
+// only reachable by driving the full generate-and-compile pipeline.
+//
+// A program is a mismatch when EITHER:
+//   - two or more tiers produced output and they disagree (existing hex-
+//     divergence check), OR
+//   - one or more tiers with an installed binary FAILED/rejected the
+//     program, REGARDLESS of how many other tiers agreed. Previously this
+//     was only checked when fewer than 2 tiers produced output, so a tier
+//     that crashed while >=2 OTHER tiers agreed was silently dropped —
+//     contradicting the harness's documented contract ("fails the job on
+//     ... any compiler crash that doesn't reproduce on every other tier").
+//
+// `failed` (binary present, rejected the program) is intentionally
+// distinct from tiers that were never run (no installed binary /
+// `skipMissingTiers`) — see the `perTierAvailable` / `skipped` split in the
+// caller. Only `failed` tiers count toward a mismatch.
+// ---------------------------------------------------------------------------
+
+export type ProgramClassification =
+  | { status: 'ok' }
+  | { status: 'mismatch'; reason: string }
+  | { status: 'insufficient' };
+
+export function classifyTierResults(
+  outputs: Partial<Record<CompilerName, string>>,
+  failed: readonly CompilerName[],
+): ProgramClassification {
+  const tierKeys = Object.keys(outputs) as CompilerName[];
+
+  if (tierKeys.length >= 2) {
+    const ref = outputs[tierKeys[0]!]!;
+    const divergent: CompilerName[] = [];
+    for (let j = 1; j < tierKeys.length; j++) {
+      if (outputs[tierKeys[j]!] !== ref) divergent.push(tierKeys[j]!);
+    }
+
+    const reasons: string[] = [];
+    if (divergent.length > 0) {
+      reasons.push(`hex divergence: ${tierKeys[0]} vs ${divergent.join(',')}`);
+    }
+    if (failed.length > 0) {
+      reasons.push(
+        `tier(s) crashed/rejected while ${tierKeys.length} other tier(s) agreed: ${failed.join(',')}`,
+      );
+    }
+    if (reasons.length > 0) {
+      return { status: 'mismatch', reason: reasons.join('; ') };
+    }
+    return { status: 'ok' };
+  }
+
+  if (failed.length > 0) {
+    // Fewer than 2 tiers produced output AND one or more tier with an
+    // installed binary failed — flag it.
+    return {
+      status: 'mismatch',
+      reason: `tier(s) rejected program: ${failed.join(',')}; accepted: ${tierKeys.join(',')}`,
+    };
+  }
+
+  return { status: 'insufficient' };
+}
+
+// ---------------------------------------------------------------------------
 // Public harness
 // ---------------------------------------------------------------------------
 
@@ -904,42 +1054,23 @@ export async function runAnfDifferential(
 
     // 3) compare
     const tierKeys = Object.keys(outputs) as CompilerName[];
-    if (tierKeys.length >= 2) {
-      const ref = outputs[tierKeys[0]!]!;
-      const divergent: CompilerName[] = [];
-      for (let j = 1; j < tierKeys.length; j++) {
-        if (outputs[tierKeys[j]!] !== ref) divergent.push(tierKeys[j]!);
-      }
-      if (divergent.length > 0) {
-        mismatchCount += 1;
-        const dir = saveFinding(findingsDir, {
-          seed: opts.seed,
-          programIndex: i,
-          programJson: canonical,
-          outputs,
-          reason: `hex divergence: ${tierKeys[0]} vs ${divergent.join(',')}`,
-        });
-        findings.push(dir);
-        if (opts.verbose) {
-          console.log(`  [${i}] MISMATCH: ${tierKeys[0]} vs ${divergent.join(',')} -> ${dir}`);
-        }
-      } else if (opts.verbose) {
-        console.log(`  [${i}] OK (${tierKeys.join(',')})`);
-      }
-    } else if (failed.length > 0) {
-      // Less than 2 tiers produced output AND one or more tier with an
-      // installed binary failed — flag it.
+    const classification = classifyTierResults(outputs, failed);
+    if (classification.status === 'mismatch') {
       mismatchCount += 1;
       const dir = saveFinding(findingsDir, {
         seed: opts.seed,
         programIndex: i,
         programJson: canonical,
         outputs,
-        reason: `tier(s) rejected program: ${failed.join(',')}; accepted: ${tierKeys.join(',')}`,
+        reason: classification.reason,
       });
       findings.push(dir);
       if (opts.verbose) {
-        console.log(`  [${i}] REJECTED by ${failed.join(',')} -> ${dir}`);
+        console.log(`  [${i}] MISMATCH: ${classification.reason} -> ${dir}`);
+      }
+    } else if (classification.status === 'ok') {
+      if (opts.verbose) {
+        console.log(`  [${i}] OK (${tierKeys.join(',')})`);
       }
     } else if (opts.verbose) {
       console.log(`  [${i}] SKIPPED (only ${tierKeys.length} tier(s) available)`);
