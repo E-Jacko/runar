@@ -1,12 +1,66 @@
 {
-  "_doc": "Non-crypto fixtures the in-process differential oracle cannot execute for a STRUCTURAL reason (not a missing crypto witness). Post-mortem remediation #1 added a real deploy->call->Spend path (conformance/witnesses/real-crypto/ via runar-testing runStatefulSpend) and MOVED every stateful fixture whose continuation could be driven and re-validated on @bsv/sdk Spend with a real checkPreimage binding out of this list. What REMAINS: (1) GO-ONLY — compilers:[go]; the TypeScript tier ships no Stack-IR codegen (compile() cannot emit bytes). (2) INTERPRETER-UNSUPPORTED — the ANF interpreter does not model the raw-script intrinsic. (3) STATEFUL-HARNESS-GAP — a StatefulSmartContract whose continuation the SDK call() path could NOT build into a Spend-valid tx in this harness (multi-output raw-output funding, branched var-length state OP_NUM2BIN, or output/prevout-introspection that needs a specific tx shape the SDK does not emit). These stay covered by the Go tx-context path (conformance/script_execution_test.go executeScriptWithTx) and are honest FOLLOW-UPS, not silent caps. See conformance/witnesses/README.md.",
+  "_doc": "Non-crypto fixtures the in-process differential oracle cannot execute for a STRUCTURAL reason (not a missing crypto witness). Post-mortem remediation #1 added a real deploy->call->Spend path (conformance/witnesses/real-crypto/ via runar-testing runStatefulSpend) and MOVED every stateful fixture whose continuation could be driven and re-validated on @bsv/sdk Spend with a real checkPreimage binding out of this list. The free-text `reason` is for humans; the machine-checked truth of each entry's claim lives in its `coveredBy` field (see coverage-claims.test.ts) — membership in this list is NOT itself treated as coverage. See conformance/witnesses/README.md.",
   "inapplicable": [
-    { "fixture": "asm-raw-script", "cause": "interpreter-unsupported", "reason": "UnsafeSmartContract asm({body:'51'}) raw-script intrinsic is not implemented by the ANF interpreter (source-semantics engine reports 'Unknown function: asm'); the compiled OP_1 is anyone-can-spend with no rejecting witness" },
-    { "fixture": "babybear", "cause": "go-only", "reason": "BabyBear field proof-system primitive is Go-only (compilers:[go]); no TypeScript Stack-IR codegen, compile() cannot emit deployed bytes" },
-    { "fixture": "babybear-ext4", "cause": "go-only", "reason": "BabyBear quartic-extension proof-system primitive is Go-only (compilers:[go]); no TypeScript codegen" },
-    { "fixture": "add-raw-output", "cause": "stateful-harness-gap", "reason": "sendToScript(): a TWO-output method — addRawOutput(1000, scriptBytes) plus the addOutput(0, count) state continuation. The SDK call() path funds a single continuation output; it does not fund/emit the separate 1000-sat raw output, so the real Spend rejects (checkPreimage output binding fails). FOLLOW-UP: build the raw output via CallOptions.outputs. Covered by the Go tx-context path" },
-    { "fixture": "branched-readonly-len", "cause": "stateful-harness-gap", "reason": "spend(): branched mutation of count + a fixed-width ByteString state field re-encodes state via OP_NUM2BIN. Driven through the SDK call() path the recomputed continuation width does not match (OP_NUM2BIN 'size not large enough') — the harness cannot reconstruct the exact branched serialisation. FOLLOW-UP: port the Go witness construction. Covered by the Go tx-context path" },
-    { "fixture": "intent-output-p2pkh", "cause": "stateful-harness-gap", "reason": "payBond(): requireOutputP2PKH(0, bondPKH, bondAmount) demands output 0 be a specific P2PKH, but the SDK continuation places the STATE output at index 0 — the harness cannot compose the required output layout. FOLLOW-UP: use CallOptions.outputs to place the bond output. Covered by the Go tx-context path" },
-    { "fixture": "intent-prev-output-script", "cause": "stateful-harness-gap", "reason": "bind(): extractPrevOutputScript(0, expectedHash) asserts the input's prevout script hashes to a constructor-baked expectedHash — a value only known after the deploy locking script exists (circular for a synthetic harness). FOLLOW-UP: deploy, read back the real prevout script, then re-deploy with its hash. Covered by the Go tx-context path" }
+    {
+      "fixture": "asm-raw-script",
+      "cause": "interpreter-unsupported",
+      "reason": "UnsafeSmartContract asm({body:'51'}) raw-script intrinsic is not implemented by the ANF interpreter (source-semantics engine reports 'Unknown function: asm'), so the differential / real-crypto oracles cannot execute it. Instead the compiled OP_1 is executed directly on the go-sdk Bitcoin Script engine (anyone-can-spend, empty unlocking → clean TRUE); deliberately no reject case, since universal acceptance is the contract's semantics.",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "asm-raw-script"
+      }
+    },
+    {
+      "fixture": "babybear",
+      "cause": "go-only",
+      "reason": "BabyBear field proof-system primitive is Go-only (compilers:[go]); no TypeScript Stack-IR codegen, compile() cannot emit deployed bytes",
+      "coveredBy": { "kind": "go-only-nocodegen" }
+    },
+    {
+      "fixture": "babybear-ext4",
+      "cause": "go-only",
+      "reason": "BabyBear quartic-extension proof-system primitive is Go-only (compilers:[go]); no TypeScript codegen",
+      "coveredBy": { "kind": "go-only-nocodegen" }
+    },
+    {
+      "fixture": "add-raw-output",
+      "cause": "stateful-harness-gap",
+      "reason": "sendToScript(): a TWO-output method — addRawOutput(1000, scriptBytes) plus the addOutput(0, count) state continuation. The SDK deploy->call->Spend path (real-crypto/ style) funds a single continuation output; it does not fund/emit the separate 1000-sat raw output, so a real Spend rejects (checkPreimage output binding fails). FOLLOW-UP: build the raw output via CallOptions.outputs so this can also get a tx-context accept/reject differential.",
+      "coveredBy": {
+        "kind": "anf-cross-tier-parity",
+        "input": "add-raw-output-publish.json",
+        "note": "conformance/anf-interpreter/cross-interpreter.test.ts runs sendToScript(scriptBytes) through the ANF interpreter (TS reference + Go/Python/Rust/Java/Zig/Ruby drivers where built) and asserts the resulting state + rawOutputs match a pinned golden (conformance/anf-interpreter/expected/add-raw-output-publish.json). This proves cross-tier interpreter correctness of the raw-output intrinsic; it is NOT a tx-context accept/reject differential against compiled Bitcoin Script bytes (no witness/signature-failure path is exercised)."
+      }
+    },
+    {
+      "fixture": "branched-readonly-len",
+      "cause": "stateful-harness-gap",
+      "reason": "spend(): branched mutation of count + a fixed-width ByteString state field re-encodes state via OP_NUM2BIN. Driven through the SDK call() path the recomputed continuation width does not match (OP_NUM2BIN 'size not large enough') — the harness cannot reconstruct the exact branched serialisation. FOLLOW-UP: port the Go witness construction.",
+      "coveredBy": {
+        "kind": "interpreter-witness-exec",
+        "path": "packages/runar-testing/src/__tests__/intent-intrinsics-interpreter.test.ts",
+        "note": "both branches (then/else of the len(scratch)-driven conditional) executed via the ANF interpreter with realistic args; TS tier only, not a full Bitcoin Script byte execution, and this particular fixture's spec is accept-only by design (both arms succeed — the branching logic itself is what's under test, not a checkSig/checkPreimage guard)."
+      }
+    },
+    {
+      "fixture": "intent-output-p2pkh",
+      "cause": "stateful-harness-gap",
+      "reason": "payBond(): requireOutputP2PKH(0, bondPKH, bondAmount) demands output 0 be a specific P2PKH, but the SDK continuation places the STATE output at index 0 — the harness cannot compose the required output layout. FOLLOW-UP: use CallOptions.outputs to place the bond output.",
+      "coveredBy": {
+        "kind": "interpreter-witness-exec",
+        "path": "packages/runar-testing/src/__tests__/intent-intrinsics-interpreter.test.ts",
+        "note": "1 accept + 2 reject (wrong PKH, wrong hashOutputs) executed via the ANF interpreter with witness-injected serialised outputs (TestContract.setSerialisedOutputs / setMockPreimageBytes); TS tier only, not a full Bitcoin Script byte execution."
+      }
+    },
+    {
+      "fixture": "intent-prev-output-script",
+      "cause": "stateful-harness-gap",
+      "reason": "bind(): extractPrevOutputScript(0, expectedHash) asserts the input's prevout script hashes to a constructor-baked expectedHash — a value only known after the deploy locking script exists (circular for a synthetic harness). FOLLOW-UP: deploy, read back the real prevout script, then re-deploy with its hash.",
+      "coveredBy": {
+        "kind": "interpreter-witness-exec",
+        "path": "packages/runar-testing/src/__tests__/intent-intrinsics-interpreter.test.ts",
+        "note": "1 accept + 2 reject (hash mismatch, no witness supplied) executed via the ANF interpreter with witness-injected prevout script bytes (TestContract.setPrevOutScript); TS tier only, not a full Bitcoin Script byte execution."
+      }
+    }
   ]
 }

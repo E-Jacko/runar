@@ -29,10 +29,14 @@ Schema:
   contract with more than one public method, the oracle appends the compiled
   method-selector index automatically; witness authors only list the method's
   own args.
-- Each fixture SHOULD have ≥1 `accept` and ≥1 `reject` (near-miss) spend, where
-  a rejecting witness exists. A few contracts have only tautological asserts
-  (`x >= 0 || x < 0`) or are anyone-can-spend, so no rejecting witness exists;
-  those carry accept-only spends and say so in each `note`.
+- Every fixture MUST have ≥1 `accept` and ≥1 `reject` (near-miss) spend, ENFORCED
+  in code by `coverage-claims.test.ts` — not just documented here. A few
+  contracts have only tautological asserts (`x >= 0 || x < 0`) or are
+  anyone-can-spend, so no rejecting witness exists; those set a top-level
+  `"acceptOnly": true` field (see `bitwise-ops.json` / `shift-ops.json`) as an
+  explicit, machine-checked opt-out — a silently absent reject spend fails the
+  gate. `coverage-claims.test.ts` also flags a spec that sets `acceptOnly` but
+  actually has a reject spend (a stale opt-out).
 
 ## Real-crypto execution (`real-crypto/`) — post-mortem remediation #1
 
@@ -61,13 +65,14 @@ interpreter — real secp256k1, real BIP-143 sighash, real `OP_CHECKSIG` /
   (`runStatefulSpend`). This exercises the real auto-injected `checkPreimage`
   on-chain state binding (BUG-100) plus any user `checkSig`.
 
-Each fixture carries ≥1 accept and ≥1 reject/near-miss. A near-miss is a wrong
-key, a wrong signer (`owner` ≠ the call signer), or a **tampered continuation
-output** (`tamperOutput: true` — corrupts output 0 so the recomputed sighash no
-longer matches the on-stack preimage; the exact BUG-100 property). Because the
-interpreter models crypto with real-but-fixed `TEST_MESSAGE` checks it cannot
-model an arbitrary tx-context rejection, so a crypto near-miss is a script-only
-rejection flagged `cryptoNearMiss: true`.
+Each fixture carries ≥1 accept and ≥1 reject/near-miss, ENFORCED in code by
+`coverage-claims.test.ts` (same `acceptOnly` opt-out convention as above). A
+near-miss is a wrong key, a wrong signer (`owner` ≠ the call signer), or a
+**tampered continuation output** (`tamperOutput: true` — corrupts output 0 so
+the recomputed sighash no longer matches the on-stack preimage; the exact
+BUG-100 property). Because the interpreter models crypto with real-but-fixed
+`TEST_MESSAGE` checks it cannot model an arbitrary tx-context rejection, so a
+crypto near-miss is a script-only rejection flagged `cryptoNearMiss: true`.
 
 Placeholders resolve against `runar-testing`'s deterministic `TEST_KEYS`:
 `{"$pubkey":"alice"}`, `{"$pkh":"alice"}` (ctor + args), `{"$sig":"alice"}`
@@ -81,21 +86,67 @@ explicit `addOutput(<sats>, …)`; `lockTime` threads `nLockTime` for
 
 `completeness.test.ts` fails CI if any `conformance/tests/<fixture>` is neither
 witnessed here, executed in `real-crypto/`, nor listed in one of the two
-exemption files (and fails if a `real-crypto/` fixture is ALSO still listed as
-exempt — a stale over-claim guard):
+exemption files with a `coveredBy` claim that is NOT `"UNCOVERED"` (and fails if
+a `real-crypto/` fixture is ALSO still listed as exempt — a stale over-claim
+guard).
 
 - **`crypto-exempt.json`** — fixtures whose spend needs a REAL cryptographic
   witness (ECDSA/Schnorr checkSig, secp256k1 / NIST-P EC, SHA-256 / BLAKE3 /
   RIPEMD / Merkle hash-preimage, Rabin, or a post-quantum SLH-DSA / WOTS+
-  signature). The in-process oracle synthesises witnesses from plain args and
-  cannot forge a signature or hash preimage, so these are covered by the Go
-  `script_execution_test.go` real-crypto path and the per-family codegen
-  goldens. Each entry names the primitive.
+  signature) that the in-process oracle cannot synthesise from plain args.
 - **`harness-inapplicable.json`** — non-crypto fixtures the oracle cannot
-  execute for a structural reason: (1) **stateful** — a `StatefulSmartContract`
-  auto-injects `checkPreimage` + a state-continuation output, which need a
-  tx-context BIP-143 sighash preimage witness the tx-less TS `ScriptVM` cannot
-  synthesise (covered by the Go `executeScriptWithTx` tx-context path);
-  (2) **go-only** — `compilers:[go]` fixtures have no TypeScript codegen;
-  (3) **interpreter-unsupported** — the ANF interpreter does not model the
-  raw-script (`asm`) intrinsic. Each entry states its cause and reason.
+  execute for a structural reason: (1) **stateful-harness-gap** — the SDK
+  `call()` continuation path cannot reconstruct the exact tx shape a
+  `StatefulSmartContract` method demands; (2) **go-only** — `compilers:[go]`
+  fixtures have no TypeScript codegen; (3) **interpreter-unsupported** — the
+  ANF interpreter does not model the raw-script (`asm`) intrinsic.
+
+Each entry's free-text `reason`/`cause` is for humans only. The MACHINE-CHECKED
+truth of "what actually covers this fixture" lives in a structured `coveredBy`
+field, verified by `coverage-claims.test.ts` — list membership alone is never
+treated as coverage (this is the fix for a past bug where several entries
+claimed "Covered by the Go tx-context path" / `script_execution_test.go`
+without that file actually referencing the fixture). `coveredBy.kind` is one of:
+
+- `"go-script-exec"` — the fixture's exact name is compiled and executed by
+  `conformance/script_execution_test.go` (`compileRúnar("<fixture>", ...)`).
+  Verified by grepping that literal call.
+- `"go-family-exec"` — the fixture's underlying primitive (not the literal
+  fixture contract) is exercised by a real Go test function
+  (`coveredBy.marker`, e.g. `"TestSha256Compress_"`) in
+  `script_execution_test.go`, via an inline reconstruction of the same
+  codegen — real execution, but not of this exact fixture's bytes.
+- `"integration"` — an on-chain regtest integration test (`coveredBy.path`
+  under `integration/<tier>/`) deploys and spends the fixture's actual
+  `.runar.ts` source. Verified by checking the file exists and references the
+  fixture name.
+- `"interpreter-witness-exec"` — the ANF interpreter (TS tier only) executes
+  the fixture with realistic tx-context witness bytes injected via
+  `TestContract.setPrevOutScript` / `setSerialisedOutputs` /
+  `setMockPreimageBytes` (`coveredBy.path`). Real execution of the desugared
+  intrinsics, but not full Bitcoin Script bytes.
+- `"anf-cross-tier-parity"` — `conformance/anf-interpreter/cross-interpreter.test.ts`
+  runs the fixture's method through the ANF interpreter across all 7 tiers
+  (TS reference + per-language drivers under `conformance/anf-interpreter/drivers/`)
+  and asserts the resulting state/outputs match a pinned golden
+  (`coveredBy.input` names the `conformance/anf-interpreter/inputs/<file>.json`
+  case). Proves cross-tier interpreter correctness; it is a DIFFERENT
+  guarantee than the source-vs-script differential above (it does not compare
+  against compiled Bitcoin Script bytes and has no accept/reject witness
+  concept), so it is called out as its own kind rather than folded into
+  `interpreter-witness-exec`.
+- `"codegen-golden"` — byte-golden only, NOT executed by any engine. An honest
+  opt-out: requires the fixture's own `expected-script.hex` to exist and,
+  where a family has one, its dedicated codegen module
+  (`packages/runar-compiler/src/passes/<family>-codegen.ts`) to exist.
+- `"go-only-nocodegen"` — `compilers:["go"]` proof-system fixture; verified
+  against the fixture's `source.json`.
+- `"sdk-corner"` — an acknowledged SDK/harness limitation with no further
+  machine-checkable evidence beyond a non-empty `reason`.
+- `"UNCOVERED"` — genuinely unexecuted anywhere today. Requires a non-empty
+  `issue` field describing the follow-up. `completeness.test.ts` does NOT
+  count an `"UNCOVERED"` fixture as covered — the top-level completeness gate
+  fails on it BY DESIGN, so a real coverage hole cannot hide behind list
+  membership. As of this writing `asm-raw-script` is the one fixture in this
+  state (the ANF interpreter explicitly rejects the `asm` intrinsic, so it
+  cannot even enter the cross-tier interpreter parity suite below).

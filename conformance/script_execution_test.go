@@ -334,6 +334,30 @@ func TestArithmetic_ScriptExecution_Fail(t *testing.T) {
 	}
 }
 
+// TestAsmRawScript_ScriptExecution executes the `asm-raw-script` fixture
+// (Anyone — an UnsafeSmartContract whose unlock() is asm({body:'51'}),
+// compiling to a single OP_1). It is intentionally anyone-can-spend: an empty
+// unlocking script leaves OP_1's TRUE on a clean stack. There is deliberately
+// no near-miss reject case — universal acceptance IS this contract's semantics.
+// This is the ONLY engine that executes the fixture: the ANF interpreter
+// rejects the `asm` intrinsic outright, so the differential / real-crypto
+// oracles cannot cover it. Its witnesses ledger entry therefore points here
+// (coveredBy: go-script-exec) instead of being marked UNCOVERED.
+func TestAsmRawScript_ScriptExecution(t *testing.T) {
+	lockingHex, err := compileRúnar("asm-raw-script", `{}`)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if lockingHex != "51" {
+		t.Fatalf("expected OP_1 (51) locking script, got %q", lockingHex)
+	}
+
+	// Anyone-can-spend: empty unlocking script; OP_1 alone leaves TRUE.
+	if err := executeScript(lockingHex, ""); err != nil {
+		t.Fatalf("execution failed: %v", err)
+	}
+}
+
 func TestBooleanLogic_ScriptExecution(t *testing.T) {
 	lockingHex, err := compileRúnar("boolean-logic", `{"threshold":"2"}`)
 	if err != nil {

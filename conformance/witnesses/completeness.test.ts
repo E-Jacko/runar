@@ -30,17 +30,30 @@ it('every conformance fixture is witnessed, real-crypto-executed, crypto-exempt,
       .map((f) => f.replace(/\.json$/, '')),
   );
 
-  const cryptoExempt = new Set(
-    (JSON.parse(readFileSync(join(__dirname, 'crypto-exempt.json'), 'utf-8')).exempt as {
-      fixture: string;
-    }[]).map((e) => e.fixture),
-  );
+  // An exempt/inapplicable entry only counts as COVERAGE if its `coveredBy`
+  // claim names a real engine. `coveredBy.kind === "UNCOVERED"` is an honest
+  // admission that nothing executes the fixture — coverage-claims.test.ts
+  // verifies every OTHER kind's claim is literally true, but "UNCOVERED"
+  // fixtures must still surface here as uncovered so the hole cannot hide
+  // behind list membership (audit findings #P0-1, #11, #14, #24).
+  type LedgerEntry = { fixture: string; coveredBy?: { kind: string } };
+  const isCovered = (e: LedgerEntry) => e.coveredBy?.kind !== 'UNCOVERED';
 
-  const inapplicable = new Set(
-    (JSON.parse(readFileSync(join(__dirname, 'harness-inapplicable.json'), 'utf-8')).inapplicable as {
-      fixture: string;
-    }[]).map((e) => e.fixture),
-  );
+  const cryptoExemptEntries = JSON.parse(readFileSync(join(__dirname, 'crypto-exempt.json'), 'utf-8'))
+    .exempt as LedgerEntry[];
+  const inapplicableEntries = JSON.parse(
+    readFileSync(join(__dirname, 'harness-inapplicable.json'), 'utf-8'),
+  ).inapplicable as LedgerEntry[];
+
+  // Used for the "uncovered" computation below: UNCOVERED-kind entries do
+  // NOT count as coverage, so their fixture is excluded here on purpose.
+  const cryptoExempt = new Set(cryptoExemptEntries.filter(isCovered).map((e) => e.fixture));
+  const inapplicable = new Set(inapplicableEntries.filter(isCovered).map((e) => e.fixture));
+
+  // Used for the stray-fixture-name typo guard below: ALL listed entries
+  // (including honest UNCOVERED ones) must still name a real fixture.
+  const cryptoExemptAll = new Set(cryptoExemptEntries.map((e) => e.fixture));
+  const inapplicableAll = new Set(inapplicableEntries.map((e) => e.fixture));
 
   const uncovered = fixtures.filter(
     (f) =>
@@ -51,13 +64,13 @@ it('every conformance fixture is witnessed, real-crypto-executed, crypto-exempt,
   );
   expect(
     uncovered,
-    `fixtures with no witness/execution and no exemption: ${uncovered.join(', ')}`,
+    `fixtures with no witness/execution and no exemption (includes fixtures whose exempt/inapplicable entry is honestly marked coveredBy.kind "UNCOVERED" — see conformance/witnesses/*.json for the follow-up issue): ${uncovered.join(', ')}`,
   ).toEqual([]);
 
   // Guard against typos: an exemption naming a fixture that does not exist.
   const known = new Set(fixtures);
-  const strayCrypto = [...cryptoExempt].filter((f) => !known.has(f));
-  const strayInapplicable = [...inapplicable].filter((f) => !known.has(f));
+  const strayCrypto = [...cryptoExemptAll].filter((f) => !known.has(f));
+  const strayInapplicable = [...inapplicableAll].filter((f) => !known.has(f));
   const strayRealCrypto = [...realCryptoExecuted].filter((f) => !known.has(f));
   expect(strayCrypto, `crypto-exempt lists unknown fixtures: ${strayCrypto.join(', ')}`).toEqual([]);
   expect(
@@ -73,7 +86,7 @@ it('every conformance fixture is witnessed, real-crypto-executed, crypto-exempt,
   // exempt list (a stale "routed out" claim). This is what keeps the exempt
   // lists from silently over-claiming coverage.
   const doubleListed = [...realCryptoExecuted].filter(
-    (f) => cryptoExempt.has(f) || inapplicable.has(f),
+    (f) => cryptoExemptAll.has(f) || inapplicableAll.has(f),
   );
   expect(
     doubleListed,
