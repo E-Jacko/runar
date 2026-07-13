@@ -152,6 +152,24 @@ function resolveStatefulArgs(raw: unknown[]): unknown[] {
 
 const specFiles = readdirSync(SPEC_DIR).filter((f) => f.endsWith('.json'));
 
+/** A crypto near-miss reject must be rejected BY THE SCRIPT GUARD on the real
+ *  Spend engine, not by a harness/SDK error before the engine ran — otherwise a
+ *  reject that fails for an unrelated SDK reason silently passes and the guard it
+ *  was meant to exercise stops being tested (audit #12). */
+function assertNearMissReachedEngine(
+  fixture: string,
+  s: SpendSpec,
+  r: { reachedEngine?: boolean; vmError?: string },
+): void {
+  if (s.expect !== 'reject' || !s.cryptoNearMiss) return;
+  expect(
+    r.reachedEngine,
+    `${fixture}.${s.method}: crypto near-miss reject must reach the Spend engine ` +
+      `(reachedEngine=${r.reachedEngine}, vmErr=${r.vmError}) — a false here means it failed ` +
+      `at the SDK/harness before the script guard ran (audit #12)`,
+  ).toBe(true);
+}
+
 describe('real-crypto execution (source vs real @bsv/sdk Spend, fold-ON)', () => {
   for (const specFile of specFiles) {
     const spec: Spec = JSON.parse(readFileSync(join(SPEC_DIR, specFile), 'utf-8'));
@@ -183,6 +201,7 @@ describe('real-crypto execution (source vs real @bsv/sdk Spend, fold-ON)', () =>
                 `interpreter=${r.interpreterAccepted} vm=${r.vmAccepted} interpErr=${r.interpreterError}`,
               ).toBe(r.vmAccepted);
             }
+            assertNearMissReachedEngine(spec.fixture, s, r);
           } else {
             const r = await runStatefulSpend({
               source,
@@ -196,6 +215,7 @@ describe('real-crypto execution (source vs real @bsv/sdk Spend, fold-ON)', () =>
               tamperOutput: s.tamperOutput,
             });
             expect(r.vmAccepted, `real Spend: vmErr=${r.vmError}`).toBe(s.expect === 'accept');
+            assertNearMissReachedEngine(spec.fixture, s, r);
             // Independent state-VALUE check (audit #4): accept/reject is blind to
             // an ANF state-transition miscompile that produces the same wrong
             // state in both the SDK-built output and the covenant. Decode the

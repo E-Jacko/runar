@@ -80,6 +80,15 @@ export interface RealExecResult {
    *  SDK-built output and the covenant that validates it (audit #4). `undefined`
    *  when the spend was rejected/tampered or the contract has no state fields. */
   continuationState?: Record<string, unknown> | null;
+  /** Did execution actually reach the real Spend engine (`spend.validate()` /
+   *  `validateSpend()` was invoked)? `false` means a harness/SDK error occurred
+   *  BEFORE the engine ran (e.g. `RunarContract.call()` threw pre-broadcast, a
+   *  missing broadcast tx, a malformed unlocking script). A rejection with
+   *  `reachedEngine === false` did NOT come from the on-chain script guard, so a
+   *  near-miss that relies on the guard must assert `reachedEngine === true` —
+   *  otherwise a reject that fails for an unrelated SDK reason silently passes
+   *  and the guard it was meant to exercise stops being tested (audit #12). */
+  reachedEngine?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +270,7 @@ export function runStatelessSigned(opts: StatelessSignedOptions): RealExecResult
   // Execute on the real @bsv/sdk Spend interpreter.
   let vmAccepted = false;
   let vmError: string | undefined;
+  let reachedEngine = false;
   try {
     const spend = new Spend({
       sourceTXID: '00'.repeat(32),
@@ -275,6 +285,9 @@ export function runStatelessSigned(opts: StatelessSignedOptions): RealExecResult
       inputSequence: 0xffffffff,
       lockTime: 0,
     });
+    // The engine is now running: a subsequent false/throw is a genuine script
+    // rejection, not a harness error before the guard ran.
+    reachedEngine = true;
     vmAccepted = spend.validate();
   } catch (e) {
     vmAccepted = false;
@@ -310,7 +323,7 @@ export function runStatelessSigned(opts: StatelessSignedOptions): RealExecResult
     }
   }
 
-  return { vmAccepted, vmError, interpreterAccepted, interpreterError, lockingHex, unlockingHex };
+  return { vmAccepted, vmError, interpreterAccepted, interpreterError, lockingHex, unlockingHex, reachedEngine };
 }
 
 // ---------------------------------------------------------------------------
@@ -427,12 +440,16 @@ export async function runStatefulSpend(opts: StatefulSpendOptions): Promise<Real
   let vmAccepted = false;
   let vmError: string | undefined;
   let continuationState: Record<string, unknown> | null | undefined;
+  let reachedEngine = false;
   try {
     const callOpts: { locktime?: number; satoshis?: number } = {};
     if (opts.lockTime !== undefined) callOpts.locktime = opts.lockTime;
     if (opts.satoshis !== undefined) callOpts.satoshis = opts.satoshis;
     await contract.call(opts.method, opts.args, provider, signer, callOpts);
     const callTx = Transaction.fromHex(provider.getBroadcastedTxs()[1]!);
+    // We have a broadcast call tx to validate: a subsequent reject is a genuine
+    // script-guard rejection, not an SDK error before the guard ran (audit #12).
+    reachedEngine = true;
     vmAccepted = validateSpend(callTx, 0, deployTx, 0, opts.tamperOutput === true);
     // Independent readback of the state VALUE: decode the continuation output's
     // state straight from the on-chain call tx bytes (byte layout only, NOT the
@@ -449,5 +466,5 @@ export async function runStatefulSpend(opts: StatefulSpendOptions): Promise<Real
     vmError = e instanceof Error ? e.message : String(e);
   }
 
-  return { vmAccepted, vmError, continuationState };
+  return { vmAccepted, vmError, continuationState, reachedEngine };
 }

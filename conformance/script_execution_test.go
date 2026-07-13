@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -169,15 +170,27 @@ func encodePushBytes(data []byte) string {
 	return fmt.Sprintf("4e%02x%02x%02x%02x", n&0xff, (n>>8)&0xff, (n>>16)&0xff, (n>>24)&0xff) + hex.EncodeToString(data)
 }
 
+// errHarnessSetup marks an error from test-harness setup (e.g. malformed
+// script hex) rather than a genuine script-verify rejection by the engine.
+var errHarnessSetup = errors.New("harness setup error")
+
+// scriptRejected reports whether err is a real rejection BY THE SCRIPT ENGINE
+// (not a harness setup error before the engine ran). A must-fail test must use
+// this instead of a bare `err != nil` so a reject that fails at the harness
+// silently stops exercising the script guard (audit #12).
+func scriptRejected(err error) bool {
+	return err != nil && !errors.Is(err, errHarnessSetup)
+}
+
 // executeScript runs unlocking+locking scripts through the Go BSV SDK interpreter.
 func executeScript(lockingHex, unlockingHex string) error {
 	locking, err := script.NewFromHex(lockingHex)
 	if err != nil {
-		return fmt.Errorf("invalid locking script hex: %w", err)
+		return fmt.Errorf("%w: invalid locking script hex: %v", errHarnessSetup, err)
 	}
 	unlocking, err := script.NewFromHex(unlockingHex)
 	if err != nil {
-		return fmt.Errorf("invalid unlocking script hex: %w", err)
+		return fmt.Errorf("%w: invalid unlocking script hex: %v", errHarnessSetup, err)
 	}
 
 	eng := interpreter.NewEngine()
@@ -192,11 +205,11 @@ func executeScript(lockingHex, unlockingHex string) error {
 func executeScriptWithTx(lockingHex, unlockingHex string, tx *transaction.Transaction, inputIdx int, prevOutput *transaction.TransactionOutput) error {
 	locking, err := script.NewFromHex(lockingHex)
 	if err != nil {
-		return fmt.Errorf("invalid locking script hex: %w", err)
+		return fmt.Errorf("%w: invalid locking script hex: %v", errHarnessSetup, err)
 	}
 	unlocking, err := script.NewFromHex(unlockingHex)
 	if err != nil {
-		return fmt.Errorf("invalid unlocking script hex: %w", err)
+		return fmt.Errorf("%w: invalid unlocking script hex: %v", errHarnessSetup, err)
 	}
 
 	eng := interpreter.NewEngine()
@@ -329,7 +342,7 @@ func TestArithmetic_ScriptExecution_Fail(t *testing.T) {
 	}
 
 	unlockingHex := buildUnlockingScript(3, 7)
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure but execution succeeded")
 	}
 }
@@ -404,7 +417,7 @@ func TestIfWithoutElse_ScriptExecution(t *testing.T) {
 
 	// check(3, 2) → neither > 5, count=0, assert fails
 	unlockingHex = buildUnlockingScript(3, 2)
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure (neither above threshold) but execution succeeded")
 	}
 }
@@ -509,7 +522,7 @@ func TestP2PKH_ScriptExecution_WrongKey(t *testing.T) {
 	unlockScript, _ := script.NewFromHex(unlockingHex)
 	spendTx.Inputs[0].UnlockingScript = unlockScript
 
-	if err := executeScriptWithTx(lockingHex, unlockingHex, spendTx, 0, prevOutput); err == nil {
+	if !scriptRejected(executeScriptWithTx(lockingHex, unlockingHex, spendTx, 0, prevOutput)) {
 		t.Fatal("expected script failure with wrong key but execution succeeded")
 	}
 }
@@ -617,7 +630,7 @@ func TestMultiMethod_SpendWithOwner_ThresholdFail(t *testing.T) {
 	unlockScript, _ := script.NewFromHex(unlockingHex)
 	spendTx.Inputs[0].UnlockingScript = unlockScript
 
-	if err := executeScriptWithTx(lockingHex, unlockingHex, spendTx, 0, prevOutput); err == nil {
+	if !scriptRejected(executeScriptWithTx(lockingHex, unlockingHex, spendTx, 0, prevOutput)) {
 		t.Fatal("expected threshold failure but execution succeeded")
 	}
 }
@@ -943,7 +956,7 @@ func TestStateful_WrongState_Fail(t *testing.T) {
 	unlockScript, _ := script.NewFromHex(unlockingHex)
 	spendTx.Inputs[0].UnlockingScript = unlockScript
 
-	if err := executeScriptWithTx(fullLockingHex, unlockingHex, spendTx, 0, prevOutput); err == nil {
+	if !scriptRejected(executeScriptWithTx(fullLockingHex, unlockingHex, spendTx, 0, prevOutput)) {
 		t.Fatal("expected failure with wrong state but execution succeeded")
 	}
 }
@@ -957,9 +970,9 @@ const (
 	wotsW    = 16
 	wotsN    = 32
 	wotsLogW = 4
-	wotsLen1 = 64  // ceil(8*N / LOG_W) = 256/4
-	wotsLen2 = 3   // floor(log2(LEN1*(W-1)) / LOG_W) + 1
-	wotsLen  = 67  // LEN1 + LEN2
+	wotsLen1 = 64 // ceil(8*N / LOG_W) = 256/4
+	wotsLen2 = 3  // floor(log2(LEN1*(W-1)) / LOG_W) + 1
+	wotsLen  = 67 // LEN1 + LEN2
 )
 
 // wotsSha256 computes SHA-256 of input.
@@ -1131,7 +1144,7 @@ func TestWOTS_ScriptExecution_TamperedSig(t *testing.T) {
 
 	unlockingHex := encodePushBytes(msg) + encodePushBytes(tampered)
 
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure with tampered signature but execution succeeded")
 	}
 }
@@ -1158,7 +1171,7 @@ func TestWOTS_ScriptExecution_WrongMessage(t *testing.T) {
 
 	unlockingHex := encodePushBytes(wrongMsg) + encodePushBytes(sig)
 
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure with wrong message but execution succeeded")
 	}
 }
@@ -1258,7 +1271,7 @@ func TestSLHDSA_ScriptExecution_TamperedSig(t *testing.T) {
 
 	unlockingHex := encodePushBytes(msgBytes) + encodePushBytes(tampered)
 
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure with tampered SLH-DSA signature but execution succeeded")
 	}
 }
@@ -1288,7 +1301,7 @@ func TestSLHDSA_ScriptExecution_WrongMessage(t *testing.T) {
 	wrongMsg := []byte("wrong message for slh-dsa")
 	unlockingHex := encodePushBytes(wrongMsg) + encodePushBytes(sigBytes)
 
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure with wrong message but execution succeeded")
 	}
 }
@@ -1497,7 +1510,7 @@ func TestECPrimitives_CheckX_Fail(t *testing.T) {
 
 	// Pass wrong expected value (42 instead of Gx) — should fail
 	unlockingHex := encodePushInt(42) + encodePushInt(0)
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure with wrong expected X but execution succeeded")
 	}
 }
@@ -1695,7 +1708,7 @@ func TestECPrimitives_CheckAdd_Fail(t *testing.T) {
 		encodePushBigInt(big.NewInt(42)) +
 		encodePushBigInt(big.NewInt(42)) +
 		encodePushInt(5)
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure with wrong expected point but execution succeeded")
 	}
 }
@@ -1861,7 +1874,7 @@ func TestSha256Compress_RejectsWrongHash(t *testing.T) {
 	blockBytes, _ := hex.DecodeString(block)
 	unlockingHex := encodePushBytes(stateBytes) + encodePushBytes(blockBytes)
 
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure with wrong hash but execution succeeded")
 	}
 }
@@ -1921,8 +1934,8 @@ func TestSha256Compress_TwoBlock(t *testing.T) {
 				t.Fatalf("expected 128-byte padded result, got %d bytes", len(padded)/2)
 			}
 
-			block1 := padded[:128]  // first 64 bytes
-			block2 := padded[128:]  // second 64 bytes
+			block1 := padded[:128] // first 64 bytes
+			block2 := padded[128:] // second 64 bytes
 
 			lockingHex, err := compileRúnarInline(sha256TwoBlockSource,
 				fmt.Sprintf(`{"initState":"%s"}`, sha256Init), "Sha256TwoBlock.runar.ts")
@@ -2014,8 +2027,14 @@ func referenceSha256Compress(stateHex, blockHex string) string {
 		S0 := rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
 		maj := (a & b) ^ (a & c) ^ (b & c)
 		T2 := S0 + maj
-		h = g; g = f; f = e; e = d + T1
-		d = c; c = b; b = a; a = T1 + T2
+		h = g
+		g = f
+		f = e
+		e = d + T1
+		d = c
+		c = b
+		b = a
+		a = T1 + T2
 	}
 
 	result := make([]byte, 32)
@@ -2132,7 +2151,7 @@ func TestSha256Finalize_RejectsWrongHash(t *testing.T) {
 	remaining, _ := hex.DecodeString("616263")
 	unlockingHex := encodePushBytes(stateBytes) + encodePushBytes(remaining) + encodePushInt(24)
 
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure with wrong hash but execution succeeded")
 	}
 }
@@ -2200,9 +2219,9 @@ func TestSha256Finalize_TwoBlock(t *testing.T) {
 func TestSha256Finalize_Chained(t *testing.T) {
 	// 120-byte message: compress first 64 bytes, finalize remaining 56
 	fullMsg := strings.Repeat("ee", 120)
-	firstBlock := fullMsg[:128]   // first 64 bytes (128 hex chars)
-	remaining := fullMsg[128:]    // remaining 56 bytes
-	totalBitLen := int64(960)     // 120 * 8
+	firstBlock := fullMsg[:128] // first 64 bytes (128 hex chars)
+	remaining := fullMsg[128:]  // remaining 56 bytes
+	totalBitLen := int64(960)   // 120 * 8
 
 	lockingHex, err := compileRúnarInline(sha256FinalizeChainedSource,
 		fmt.Sprintf(`{"initState":"%s"}`, sha256Init), "Sha256FinalizeChained.runar.ts")
@@ -2402,7 +2421,7 @@ func TestBlake3Compress_RejectsWrongHash(t *testing.T) {
 	blockBytes, _ := hex.DecodeString(block)
 	unlockingHex := encodePushBytes(cvBytes) + encodePushBytes(blockBytes)
 
-	if err := executeScript(lockingHex, unlockingHex); err == nil {
+	if !scriptRejected(executeScript(lockingHex, unlockingHex)) {
 		t.Fatal("expected script failure with wrong hash but execution succeeded")
 	}
 }
