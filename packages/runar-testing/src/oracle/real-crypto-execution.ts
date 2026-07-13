@@ -43,7 +43,7 @@ import {
   Hash,
   TransactionSignature,
 } from '@bsv/sdk';
-import { RunarContract, MockProvider, LocalSigner } from 'runar-sdk';
+import { RunarContract, MockProvider, LocalSigner, extractStateFromScript } from 'runar-sdk';
 import type { RunarArtifact, ABIMethod, ABIParam } from 'runar-ir-schema';
 import { TestContract } from '../test-contract.js';
 import { TEST_KEYS } from '../test-keys.js';
@@ -72,6 +72,14 @@ export interface RealExecResult {
   interpreterError?: string;
   lockingHex?: string;
   unlockingHex?: string;
+  /** For an ACCEPTED stateful spend: the continuation output's state decoded
+   *  from the on-chain call tx (via `extractStateFromScript`), so the caller can
+   *  check it against an INDEPENDENT hand-authored expectation. This is the only
+   *  check of the state *value* — accept/reject alone cannot catch an ANF-level
+   *  state-transition miscompile, which produces the same wrong state in both the
+   *  SDK-built output and the covenant that validates it (audit #4). `undefined`
+   *  when the spend was rejected/tampered or the contract has no state fields. */
+  continuationState?: Record<string, unknown> | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +426,7 @@ export async function runStatefulSpend(opts: StatefulSpendOptions): Promise<Real
 
   let vmAccepted = false;
   let vmError: string | undefined;
+  let continuationState: Record<string, unknown> | null | undefined;
   try {
     const callOpts: { locktime?: number; satoshis?: number } = {};
     if (opts.lockTime !== undefined) callOpts.locktime = opts.lockTime;
@@ -425,10 +434,20 @@ export async function runStatefulSpend(opts: StatefulSpendOptions): Promise<Real
     await contract.call(opts.method, opts.args, provider, signer, callOpts);
     const callTx = Transaction.fromHex(provider.getBroadcastedTxs()[1]!);
     vmAccepted = validateSpend(callTx, 0, deployTx, 0, opts.tamperOutput === true);
+    // Independent readback of the state VALUE: decode the continuation output's
+    // state straight from the on-chain call tx bytes (byte layout only, NOT the
+    // transition), so the caller can assert it equals a hand-authored expected
+    // state. Only meaningful for a genuinely accepted (untampered) continuation.
+    if (vmAccepted && !opts.tamperOutput) {
+      const contOutput = callTx.outputs[0];
+      if (contOutput) {
+        continuationState = extractStateFromScript(artifact, contOutput.lockingScript.toHex());
+      }
+    }
   } catch (e) {
     vmAccepted = false;
     vmError = e instanceof Error ? e.message : String(e);
   }
 
-  return { vmAccepted, vmError };
+  return { vmAccepted, vmError, continuationState };
 }

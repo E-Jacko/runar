@@ -3,9 +3,30 @@
   "kind": "stateful",
   "signerKey": "alice",
   "note": "HashRegistry update(): a Ripemd160 (20-byte) state field with a real checkPreimage continuation.",
-  "constructorArgs": ["0000000000000000000000000000000000000000"],
+  "constructorArgs": [
+    "0000000000000000000000000000000000000000"
+  ],
   "spends": [
-    { "method": "update", "args": ["0x1111111111111111111111111111111111111111"], "expect": "accept", "note": "currentHash -> new 20-byte hash" },
-    { "method": "update", "args": ["0x1111111111111111111111111111111111111111"], "tamperOutput": true, "cryptoNearMiss": true, "expect": "reject", "note": "tampered continuation output" }
+    {
+      "method": "update",
+      "args": [
+        "0x1111111111111111111111111111111111111111"
+      ],
+      "expect": "accept",
+      "note": "currentHash -> new 20-byte hash",
+      "expectedState": {
+        "currentHash": "0x1111111111111111111111111111111111111111"
+      }
+    },
+    {
+      "method": "update",
+      "args": [
+        "0x1111111111111111111111111111111111111111"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output"
+    }
   ]
 }

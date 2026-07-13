@@ -3,8 +3,57 @@
   "kind": "stateful",
   "note": "MessageBoard: post() updates a ByteString state field (no sig); burn() verifies real checkSig(owner). Real checkPreimage continuation.",
   "spends": [
-    { "method": "post", "args": ["0xdeadbeef"], "constructorArgs": ["00", {"$pubkey":"alice"}], "signerKey": "alice", "expect": "accept", "note": "message '00' -> deadbeef (matched-length? see below)" },
-    { "method": "burn", "args": [null], "constructorArgs": ["00", {"$pubkey":"alice"}], "signerKey": "alice", "expect": "accept", "note": "owner burn: real checkSig(alice) passes" },
-    { "method": "burn", "args": [null], "constructorArgs": ["00", {"$pubkey":"bob"}], "signerKey": "alice", "cryptoNearMiss": true, "expect": "reject", "note": "wrong signer: owner=bob signed by alice -> checkSig fails" }
+    {
+      "method": "post",
+      "args": [
+        "0xdeadbeef"
+      ],
+      "constructorArgs": [
+        "00",
+        {
+          "$pubkey": "alice"
+        }
+      ],
+      "signerKey": "alice",
+      "expect": "accept",
+      "note": "message '00' -> deadbeef (matched-length? see below)",
+      "expectedState": {
+        "message": "0xdeadbeef"
+      }
+    },
+    {
+      "method": "burn",
+      "args": [
+        null
+      ],
+      "constructorArgs": [
+        "00",
+        {
+          "$pubkey": "alice"
+        }
+      ],
+      "signerKey": "alice",
+      "expect": "accept",
+      "note": "owner burn: real checkSig(alice) passes",
+      "expectedState": {
+        "message": "0x"
+      }
+    },
+    {
+      "method": "burn",
+      "args": [
+        null
+      ],
+      "constructorArgs": [
+        "00",
+        {
+          "$pubkey": "bob"
+        }
+      ],
+      "signerKey": "alice",
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "wrong signer: owner=bob signed by alice -> checkSig fails"
+    }
   ]
 }

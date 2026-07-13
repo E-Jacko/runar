@@ -3,10 +3,39 @@
   "kind": "stateful",
   "signerKey": "alice",
   "note": "Initialized properties (count=0, active=true) excluded from ctor; only maxCount is a ctor arg. Real checkPreimage continuation.",
-  "constructorArgs": ["10n"],
+  "constructorArgs": [
+    "10n"
+  ],
   "spends": [
-    { "method": "increment", "args": ["3n"], "expect": "accept", "note": "active, count 0->3 <= 10" },
-    { "method": "increment", "args": ["3n"], "tamperOutput": true, "cryptoNearMiss": true, "expect": "reject", "note": "tampered continuation output" },
-    { "method": "reset", "args": [], "expect": "accept", "note": "count -> 0" }
+    {
+      "method": "increment",
+      "args": [
+        "3n"
+      ],
+      "expect": "accept",
+      "note": "active, count 0->3 <= 10",
+      "expectedState": {
+        "count": "3n"
+      }
+    },
+    {
+      "method": "increment",
+      "args": [
+        "3n"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output"
+    },
+    {
+      "method": "reset",
+      "args": [],
+      "expect": "accept",
+      "note": "count -> 0",
+      "expectedState": {
+        "count": "0n"
+      }
+    }
   ]
 }

@@ -3,10 +3,40 @@
   "kind": "stateful",
   "signerKey": "alice",
   "note": "BUG-100 class: increment/reset drive a real checkPreimage-bound state continuation validated on @bsv/sdk Spend. Near-miss corrupts the continuation output so the on-stack preimage no longer matches the recomputed sighash.",
-  "constructorArgs": ["5n", "10n"],
+  "constructorArgs": [
+    "5n",
+    "10n"
+  ],
   "spends": [
-    { "method": "increment", "args": ["1n"], "expect": "accept", "note": "count 5->6 <= max 10" },
-    { "method": "increment", "args": ["1n"], "tamperOutput": true, "cryptoNearMiss": true, "expect": "reject", "note": "tampered continuation output breaks the checkPreimage binding" },
-    { "method": "reset", "args": [], "expect": "accept", "note": "count -> 0 continuation binds" }
+    {
+      "method": "increment",
+      "args": [
+        "1n"
+      ],
+      "expect": "accept",
+      "note": "count 5->6 <= max 10",
+      "expectedState": {
+        "count": "6n"
+      }
+    },
+    {
+      "method": "increment",
+      "args": [
+        "1n"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output breaks the checkPreimage binding"
+    },
+    {
+      "method": "reset",
+      "args": [],
+      "expect": "accept",
+      "note": "count -> 0 continuation binds",
+      "expectedState": {
+        "count": "0n"
+      }
+    }
   ]
 }

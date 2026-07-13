@@ -2,10 +2,30 @@
   "fixture": "intent-current-block-height",
   "kind": "stateful",
   "note": "spend(): currentBlockHeight() (nLockTime read as a block height) must be <= deadline, then count++. The call nLockTime is threaded via CallOptions.locktime. Real checkPreimage continuation.",
-  "constructorArgs": ["1000000n", "1n"],
+  "constructorArgs": [
+    "1000000n",
+    "1n"
+  ],
   "signerKey": "alice",
   "spends": [
-    { "method": "spend", "args": [], "lockTime": 500000, "expect": "accept", "note": "height 500000 <= deadline 1000000, count 1->2" },
-    { "method": "spend", "args": [], "lockTime": 500000, "tamperOutput": true, "cryptoNearMiss": true, "expect": "reject", "note": "tampered continuation output" }
+    {
+      "method": "spend",
+      "args": [],
+      "lockTime": 500000,
+      "expect": "accept",
+      "note": "height 500000 <= deadline 1000000, count 1->2",
+      "expectedState": {
+        "count": "2n"
+      }
+    },
+    {
+      "method": "spend",
+      "args": [],
+      "lockTime": 500000,
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output"
+    }
   ]
 }

@@ -15,7 +15,11 @@
       ],
       "expect": "accept",
       "note": "flag>0: a+1,b+2 update branch",
-      "satoshis": 1000
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "1n",
+        "b": "2n"
+      }
     },
     {
       "method": "bump",
@@ -24,7 +28,11 @@
       ],
       "expect": "accept",
       "note": "flag==0: skip branch, state unchanged",
-      "satoshis": 1000
+      "satoshis": 1000,
+      "expectedState": {
+        "a": "0n",
+        "b": "0n"
+      }
     },
     {
       "method": "bump",
