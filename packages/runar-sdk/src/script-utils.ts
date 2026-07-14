@@ -137,18 +137,26 @@ export function extractConstructorArgs(
     if (opReturnPos !== -1) codeHex = scriptHex.slice(0, opReturnPos);
   }
 
-  const seen = new Set<number>();
-  const slots = [...artifact.constructorSlots]
-    .sort((a, b) => a.byteOffset - b.byteOffset)
-    .filter((slot) => { if (seen.has(slot.paramIndex)) return false; seen.add(slot.paramIndex); return true; });
+  // Walk EVERY slot in byte order. A constructor param referenced more than
+  // once in the contract body emits one slot per reference, and each
+  // occurrence's encoded width contributes to the cumulative offset shift —
+  // deduplicating before the walk drops those widths and mis-aligns every
+  // later slot on artifacts with repeated references. The VALUE is taken
+  // from the first occurrence per param.
+  const slots = [...artifact.constructorSlots].sort((a, b) => a.byteOffset - b.byteOffset);
 
   const result: Record<string, unknown> = {};
+  const assigned = new Set<number>();
   let cumulativeShift = 0;
 
   for (const slot of slots) {
     const adjustedHexOffset = (slot.byteOffset + cumulativeShift) * 2;
     const elem = readScriptElement(codeHex, adjustedHexOffset);
+    // Template placeholders are exactly 1 byte, so the shift contributed by
+    // each occurrence is its encoded width minus that byte.
     cumulativeShift += elem.totalHexChars / 2 - 1;
+    if (assigned.has(slot.paramIndex)) continue;
+    assigned.add(slot.paramIndex);
     const param = artifact.abi.constructor.params[slot.paramIndex];
     if (!param) continue;
     result[param.name] = interpretScriptElement(elem.opcode, elem.dataHex, param.type);
