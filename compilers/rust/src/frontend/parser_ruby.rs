@@ -40,6 +40,8 @@
 //! - `unless` -> if with negated condition
 //! - snake_case identifiers -> camelCase in AST
 
+use num_bigint::BigInt;
+use num_traits::{Num, ToPrimitive};
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -68,7 +70,7 @@ pub fn parse_ruby(source: &str, file_name: Option<&str>) -> ParseResult {
         .map(|msg| Diagnostic::error(msg, None))
         .collect();
 
-    ParseResult { contract, errors }
+    ParseResult { contract, errors, source_size_err: None }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +145,7 @@ fn map_builtin_name(name: &str) -> String {
         "bin2num" => return "bin2num".to_string(),
         "add_output" => return "addOutput".to_string(),
         "add_raw_output" => return "addRawOutput".to_string(),
+        "add_data_output" => return "addDataOutput".to_string(),
         "get_state_script" => return "getStateScript".to_string(),
         // SHA-256 partial verification
         "sha256_compress" => return "sha256Compress".to_string(),
@@ -160,6 +163,20 @@ fn map_builtin_name(name: &str) -> String {
         "EC_P" => return "EC_P".to_string(),
         "EC_N" => return "EC_N".to_string(),
         "EC_G" => return "EC_G".to_string(),
+        "p256_add" => return "p256Add".to_string(),
+        "p256_mul" => return "p256Mul".to_string(),
+        "p256_mul_gen" => return "p256MulGen".to_string(),
+        "p256_negate" => return "p256Negate".to_string(),
+        "p256_on_curve" => return "p256OnCurve".to_string(),
+        "p256_encode_compressed" => return "p256EncodeCompressed".to_string(),
+        "verify_ecdsa_p256" => return "verifyECDSA_P256".to_string(),
+        "p384_add" => return "p384Add".to_string(),
+        "p384_mul" => return "p384Mul".to_string(),
+        "p384_mul_gen" => return "p384MulGen".to_string(),
+        "p384_negate" => return "p384Negate".to_string(),
+        "p384_on_curve" => return "p384OnCurve".to_string(),
+        "p384_encode_compressed" => return "p384EncodeCompressed".to_string(),
+        "verify_ecdsa_p384" => return "verifyECDSA_P384".to_string(),
         _ => {}
     }
 
@@ -186,11 +203,14 @@ fn map_rb_type(name: &str) -> &str {
         "Sig" => "Sig",
         "Addr" => "Addr",
         "Sha256" => "Sha256",
+        "Sha256Digest" => "Sha256",
         "Ripemd160" => "Ripemd160",
         "SigHashPreimage" => "SigHashPreimage",
         "RabinSig" => "RabinSig",
         "RabinPubKey" => "RabinPubKey",
         "Point" => "Point",
+        "P256Point" => "P256Point",
+        "P384Point" => "P384Point",
         _ => name,
     }
 }
@@ -225,7 +245,7 @@ enum Token {
 
     // Identifiers and literals
     Ident(String),
-    NumberLit(i128),
+    NumberLit(BigInt),
     HexStringLit(String),  // single-quoted strings
     StringLit(String),      // double-quoted strings
     Symbol(String),         // :name
@@ -639,9 +659,11 @@ fn tokenize(source: &str) -> Vec<Token> {
                     }
                 }
                 let val = if num_str.starts_with("0x") || num_str.starts_with("0X") {
-                    i128::from_str_radix(&num_str[2..], 16).unwrap_or(0)
+                    <BigInt as Num>::from_str_radix(&num_str[2..], 16)
+                        .unwrap_or_else(|_| BigInt::from(0))
                 } else {
-                    num_str.parse::<i128>().unwrap_or(0)
+                    <BigInt as Num>::from_str_radix(&num_str, 10)
+                        .unwrap_or_else(|_| BigInt::from(0))
                 };
                 tokens.push(Token::NumberLit(val));
                 continue;
@@ -827,7 +849,10 @@ impl<'a> RbParser<'a> {
 
         self.skip_newlines();
 
-        if parent_class != "SmartContract" && parent_class != "StatefulSmartContract" {
+        if parent_class != "SmartContract"
+            && parent_class != "StatefulSmartContract"
+            && parent_class != "UnsafeSmartContract"
+        {
             self.errors.push(format!(
                 "Unknown parent class: {}",
                 parent_class
@@ -921,6 +946,7 @@ impl<'a> RbParser<'a> {
         // Intrinsic methods that must also be rewritten to property_access style.
         method_names.insert("addOutput".to_string());
         method_names.insert("addRawOutput".to_string());
+        method_names.insert("addDataOutput".to_string());
         method_names.insert("getStateScript".to_string());
         for method in &mut methods {
             rewrite_bare_method_calls(&mut method.body, &method_names);
@@ -1068,8 +1094,9 @@ impl<'a> RbParser<'a> {
             }
         }
 
-        // In stateless contracts, all properties are readonly
-        if parent_class == "SmartContract" {
+        // In stateless contracts (SmartContract and UnsafeSmartContract), all
+        // properties are readonly.
+        if parent_class == "SmartContract" || parent_class == "UnsafeSmartContract" {
             is_readonly = true;
         }
 
@@ -1087,6 +1114,8 @@ impl<'a> RbParser<'a> {
             readonly: is_readonly,
             initializer,
             source_location: self.loc(),
+            synthetic_array_chain: None,
+            embed_always: false,
         })
     }
 
@@ -1103,7 +1132,7 @@ impl<'a> RbParser<'a> {
             let element = self.parse_type();
             self.expect(&Token::Comma);
             let length = match self.advance() {
-                Token::NumberLit(n) => n as usize,
+                Token::NumberLit(n) => n.to_usize().unwrap_or(0),
                 _ => {
                     self.errors
                         .push("FixedArray requires numeric length".to_string());
@@ -1173,6 +1202,7 @@ impl<'a> RbParser<'a> {
                 body,
                 visibility: Visibility::Public,
                 source_location: self.loc(),
+                sighash_type: None,
             };
         }
 
@@ -1189,6 +1219,7 @@ impl<'a> RbParser<'a> {
                 Visibility::Private
             },
             source_location: self.loc(),
+            sighash_type: None,
         }
     }
 
@@ -1297,6 +1328,7 @@ impl<'a> RbParser<'a> {
                     name: "assert".to_string(),
                 }),
                 args: vec![expr],
+                asm_return_type: None,
             },
             source_location: self.loc(),
         }
@@ -1309,15 +1341,26 @@ impl<'a> RbParser<'a> {
         self.match_tok(&Token::Newline);
         self.skip_newlines();
 
+        // Variables declared inside an if/elsif/else branch are scoped to
+        // that branch. Snapshot+restore declared_locals so a sibling
+        // branch (or sibling top-level if-without-else block) can
+        // re-declare the same local without it being treated as an
+        // assignment to an out-of-scope variable. Mirrors the canonical
+        // TS / Python lexical-scope semantics.
+        let locals_before_then = self.declared_locals.clone();
         let then_branch = self.parse_statements();
+        self.declared_locals = locals_before_then.clone();
 
         let else_branch = if *self.peek() == Token::Elsif {
             // elsif -> else { if ... }
-            Some(vec![self.parse_elsif_statement()])
+            let res = Some(vec![self.parse_elsif_statement()]);
+            self.declared_locals = locals_before_then.clone();
+            res
         } else if *self.peek() == Token::Else {
             self.advance(); // 'else'
             self.skip_newlines();
             let stmts = self.parse_statements();
+            self.declared_locals = locals_before_then.clone();
             Some(stmts)
         } else {
             None
@@ -1338,14 +1381,20 @@ impl<'a> RbParser<'a> {
         let condition = self.parse_expression();
         self.skip_newlines();
 
+        // Same scope discipline as parse_if_statement.
+        let locals_before_then = self.declared_locals.clone();
         let then_branch = self.parse_statements();
+        self.declared_locals = locals_before_then.clone();
 
         let else_branch = if *self.peek() == Token::Elsif {
-            Some(vec![self.parse_elsif_statement()])
+            let res = Some(vec![self.parse_elsif_statement()]);
+            self.declared_locals = locals_before_then.clone();
+            res
         } else if *self.peek() == Token::Else {
             self.advance(); // 'else'
             self.skip_newlines();
             let stmts = self.parse_statements();
+            self.declared_locals = locals_before_then.clone();
             Some(stmts)
         } else {
             None
@@ -1493,23 +1542,36 @@ impl<'a> RbParser<'a> {
                     name: "super".to_string(),
                 }),
                 args,
+                asm_return_type: None,
             },
             source_location: self.loc(),
         }
     }
 
     fn parse_ivar_statement(&mut self) -> Statement {
-        // @var = expr or @var += expr or @var as expression
+        // @var = expr | @var[i] = expr | @var += expr | @var as expression
         let raw_name = match self.advance() {
             Token::Ivar(name) => name,
             _ => "_error".to_string(),
         };
         let prop_name = snake_to_camel(&raw_name);
-        let target = Expression::PropertyAccess {
+        let mut target = Expression::PropertyAccess {
             property: prop_name,
         };
 
-        // Simple assignment: @var = expr
+        // Consume index-access postfixes on the LHS so `@var[i] = expr`
+        // is recognised as an assignment statement.
+        while *self.peek() == Token::LBracket {
+            self.advance();
+            let index = self.parse_expression();
+            self.expect(&Token::RBracket);
+            target = Expression::IndexAccess {
+                object: Box::new(target),
+                index: Box::new(index),
+            };
+        }
+
+        // Simple assignment: @var = expr  |  @var[i] = expr
         if self.match_tok(&Token::Eq) {
             let value = self.parse_expression();
             return Statement::Assignment {
@@ -1956,6 +2018,7 @@ impl<'a> RbParser<'a> {
                     name: "pow".to_string(),
                 }),
                 args: vec![base, exp],
+                asm_return_type: None,
             }
         } else {
             base
@@ -1989,6 +2052,7 @@ impl<'a> RbParser<'a> {
                                     property: prop,
                                 }),
                                 args,
+                                asm_return_type: None,
                             };
                         } else {
                             expr = Expression::CallExpr {
@@ -1997,6 +2061,7 @@ impl<'a> RbParser<'a> {
                                     property: prop,
                                 }),
                                 args,
+                                asm_return_type: None,
                             };
                         }
                     } else {
@@ -2016,6 +2081,7 @@ impl<'a> RbParser<'a> {
                     expr = Expression::CallExpr {
                         callee: Box::new(expr),
                         args,
+                        asm_return_type: None,
                     };
                 }
                 Token::LBracket => {
@@ -2039,7 +2105,7 @@ impl<'a> RbParser<'a> {
             Token::NumberLit(v) => Expression::BigIntLiteral { value: v },
             Token::TrueLit => Expression::BoolLiteral { value: true },
             Token::FalseLit => Expression::BoolLiteral { value: false },
-            Token::NilLit => Expression::BigIntLiteral { value: 0 },
+            Token::NilLit => Expression::BigIntLiteral { value: BigInt::from(0) },
             Token::HexStringLit(v) => Expression::ByteStringLiteral { value: v },
             Token::StringLit(v) => Expression::ByteStringLiteral { value: v },
             Token::Ivar(name) => {
@@ -2084,7 +2150,7 @@ impl<'a> RbParser<'a> {
             other => {
                 self.errors
                     .push(format!("Unexpected token in expression: {:?}", other));
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             }
         }
     }
@@ -2135,6 +2201,7 @@ fn build_constructor(properties: &[PropertyNode], file: &str) -> MethodNode {
                 name: "super".to_string(),
             }),
             args: super_args,
+            asm_return_type: None,
         },
         source_location: SourceLocation {
             file: file.to_string(),
@@ -2170,6 +2237,7 @@ fn build_constructor(properties: &[PropertyNode], file: &str) -> MethodNode {
             line: 1,
             column: 0,
         },
+        sighash_type: None,
     }
 }
 
@@ -2187,7 +2255,7 @@ fn rewrite_bare_method_calls(stmts: &mut [Statement], method_names: &std::collec
 
 fn rewrite_expr(expr: &mut Expression, method_names: &std::collections::HashSet<String>) {
     match expr {
-        Expression::CallExpr { callee, args } => {
+        Expression::CallExpr { callee, args, .. } => {
             for arg in args.iter_mut() {
                 rewrite_expr(arg, method_names);
             }

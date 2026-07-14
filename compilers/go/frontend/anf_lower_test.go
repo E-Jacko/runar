@@ -1,8 +1,11 @@
 package frontend
 
 import (
+	"math/big"
 	"strings"
 	"testing"
+
+	"github.com/icellan/runar/compilers/go/ir"
 )
 
 // ---------------------------------------------------------------------------
@@ -818,6 +821,323 @@ class Counter extends StatefulSmartContract {
 }
 
 // ---------------------------------------------------------------------------
+// Test: Method calling this.addDataOutput produces add_data_output binding(s)
+// and excludes them from the state-output accumulator so the continuation
+// hash keeps the correct ordering. Mirrors the TS reference compiler's
+// 04-anf-lower tests for addDataOutput.
+// ---------------------------------------------------------------------------
+
+func TestANFLower_Stateful_AddDataOutput_EmitsNode(t *testing.T) {
+	source := `
+import { StatefulSmartContract, ByteString } from 'runar-lang';
+
+class Counter extends StatefulSmartContract {
+  count: bigint;
+
+  constructor(count: bigint) {
+    super(count);
+    this.count = count;
+  }
+
+  public bump(payload: ByteString): void {
+    this.count = this.count + 1n;
+    this.addDataOutput(0n, payload);
+  }
+}
+`
+	contract, _ := mustLowerToANF(t, source)
+	program := LowerToANF(contract)
+
+	var bumpIdx int = -1
+	for i, m := range program.Methods {
+		if m.Name == "bump" {
+			bumpIdx = i
+			break
+		}
+	}
+	if bumpIdx == -1 {
+		t.Fatal("could not find 'bump' method in ANF output")
+	}
+	method := program.Methods[bumpIdx]
+
+	var dataOutputs int
+	var firstDataOutput *struct{ sat, scriptBytes string }
+	for _, b := range method.Body {
+		if b.Value.Kind == "add_data_output" {
+			dataOutputs++
+			if firstDataOutput == nil {
+				firstDataOutput = &struct{ sat, scriptBytes string }{
+					sat: b.Value.Satoshis, scriptBytes: b.Value.ScriptBytes,
+				}
+			}
+		}
+	}
+	if dataOutputs != 1 {
+		t.Fatalf("expected 1 add_data_output binding, got %d", dataOutputs)
+	}
+	if firstDataOutput.sat == "" || firstDataOutput.scriptBytes == "" {
+		t.Errorf("add_data_output must carry both Satoshis and ScriptBytes refs, got %+v", *firstDataOutput)
+	}
+}
+
+func TestANFLower_Stateful_AddDataOutput_ContinuationOrdering(t *testing.T) {
+	// When a method has both addOutput and addDataOutput, the continuation
+	// hash must concat state outputs first, then data outputs, then change.
+	source := `
+import { StatefulSmartContract, PubKey, ByteString } from 'runar-lang';
+
+class FT extends StatefulSmartContract {
+  owner: PubKey;
+  balance: bigint;
+
+  constructor(owner: PubKey, balance: bigint) {
+    super(owner, balance);
+    this.owner = owner;
+    this.balance = balance;
+  }
+
+  public transfer(to: PubKey, amount: bigint, sats: bigint, note: ByteString): void {
+    this.addOutput(sats, to, amount);
+    this.addOutput(sats, this.owner, this.balance - amount);
+    this.addDataOutput(0n, note);
+  }
+}
+`
+	contract, _ := mustLowerToANF(t, source)
+	program := LowerToANF(contract)
+
+	var transfer int = -1
+	for i, m := range program.Methods {
+		if m.Name == "transfer" {
+			transfer = i
+			break
+		}
+	}
+	if transfer == -1 {
+		t.Fatal("could not find 'transfer' method in ANF output")
+	}
+	body := program.Methods[transfer].Body
+
+	// Count bindings by kind and capture refs in declaration order.
+	//
+	// Issue #116: the change segment is now gated on `_changeAmount != 0`, so
+	// buildChangeOutput lives inside the then-branch of an `if` node, and the
+	// continuation cats the `if` node's result (not buildChangeOutput directly).
+	var stateOutputRefs []string
+	var dataOutputRefs []string
+	var catArgs [][]string
+	var changeRef string
+	var hasBuildChangeCall bool
+	// containsBuildChangeCall reports whether a binding slice (deeply) contains
+	// a buildChangeOutput call.
+	var containsBuildChangeCall func(bs []ir.ANFBinding) bool
+	containsBuildChangeCall = func(bs []ir.ANFBinding) bool {
+		for _, b := range bs {
+			if b.Value.Kind == "call" && b.Value.Func == "buildChangeOutput" {
+				return true
+			}
+			if b.Value.Kind == "if" && (containsBuildChangeCall(b.Value.Then) || containsBuildChangeCall(b.Value.Else)) {
+				return true
+			}
+			if b.Value.Kind == "loop" && containsBuildChangeCall(b.Value.Body) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, b := range body {
+		switch b.Value.Kind {
+		case "add_output":
+			stateOutputRefs = append(stateOutputRefs, b.Name)
+		case "add_data_output":
+			dataOutputRefs = append(dataOutputRefs, b.Name)
+		case "call":
+			if b.Value.Func == "cat" {
+				catArgs = append(catArgs, append([]string(nil), b.Value.Args...))
+			}
+		case "if":
+			if containsBuildChangeCall(b.Value.Then) || containsBuildChangeCall(b.Value.Else) {
+				changeRef = b.Name
+				hasBuildChangeCall = true
+			}
+		}
+	}
+	if len(stateOutputRefs) != 2 {
+		t.Fatalf("expected 2 add_output bindings, got %d", len(stateOutputRefs))
+	}
+	if len(dataOutputRefs) != 1 {
+		t.Fatalf("expected 1 add_data_output binding, got %d", len(dataOutputRefs))
+	}
+	if !hasBuildChangeCall || changeRef == "" {
+		t.Fatal("expected an `if` node gating a buildChangeOutput call (issue #116)")
+	}
+	if len(catArgs) < 3 {
+		t.Fatalf("expected at least 3 cat calls (state1+state2, +data, +change), got %d", len(catArgs))
+	}
+	// First cat: addOutput0 + addOutput1
+	if catArgs[0][0] != stateOutputRefs[0] || catArgs[0][1] != stateOutputRefs[1] {
+		t.Errorf("first cat must concat the two state outputs in order, got %v", catArgs[0])
+	}
+	// Second cat: (prev) + dataOutput
+	if catArgs[1][1] != dataOutputRefs[0] {
+		t.Errorf("second cat must append the data output, got %v", catArgs[1])
+	}
+	// Third cat: (prev) + changeOutput
+	if catArgs[2][1] != changeRef {
+		t.Errorf("third cat must append the change output, got %v (change=%s)", catArgs[2], changeRef)
+	}
+}
+
+func TestANFLower_Stateful_AddDataOutput_SingleOutputPath(t *testing.T) {
+	// Single-output continuation path: state mutation + data output, no
+	// explicit addOutput. The continuation should compute the state output
+	// via computeStateOutput, then concat the data output, then change.
+	// _newAmount must be present in the method ABI.
+	source := `
+import { StatefulSmartContract, ByteString } from 'runar-lang';
+
+class Counter extends StatefulSmartContract {
+  count: bigint;
+
+  constructor(count: bigint) {
+    super(count);
+    this.count = count;
+  }
+
+  public bump(payload: ByteString): void {
+    this.count = this.count + 1n;
+    this.addDataOutput(0n, payload);
+  }
+}
+`
+	contract, _ := mustLowerToANF(t, source)
+	program := LowerToANF(contract)
+
+	var bumpIdx int = -1
+	for i, m := range program.Methods {
+		if m.Name == "bump" {
+			bumpIdx = i
+			break
+		}
+	}
+	if bumpIdx == -1 {
+		t.Fatal("could not find 'bump' method in ANF output")
+	}
+	method := program.Methods[bumpIdx]
+
+	// No state outputs should be present
+	var stateOutputs, dataOutputs int
+	var computeStateOutputRef string
+	var dataRef string
+	var catArgs [][]string
+	for _, b := range method.Body {
+		switch b.Value.Kind {
+		case "add_output":
+			stateOutputs++
+		case "add_data_output":
+			dataOutputs++
+			dataRef = b.Name
+		case "call":
+			if b.Value.Func == "computeStateOutput" {
+				computeStateOutputRef = b.Name
+			}
+			if b.Value.Func == "cat" {
+				catArgs = append(catArgs, append([]string(nil), b.Value.Args...))
+			}
+		}
+	}
+	if stateOutputs != 0 {
+		t.Errorf("single-output path should not emit add_output bindings, got %d", stateOutputs)
+	}
+	if dataOutputs != 1 {
+		t.Errorf("expected 1 add_data_output, got %d", dataOutputs)
+	}
+	if computeStateOutputRef == "" {
+		t.Error("expected a computeStateOutput call in single-output continuation")
+	}
+	if len(catArgs) < 2 {
+		t.Fatalf("expected at least 2 cat calls, got %d", len(catArgs))
+	}
+	// First cat should append the data output to the state output
+	firstCatContainsData := catArgs[0][0] == dataRef || catArgs[0][1] == dataRef
+	if !firstCatContainsData {
+		t.Errorf("first cat must reference the data output binding, got %v (data=%s)", catArgs[0], dataRef)
+	}
+
+	// _newAmount must be present (single-output continuation needs it)
+	var hasNewAmount bool
+	for _, p := range method.Params {
+		if p.Name == "_newAmount" {
+			hasNewAmount = true
+		}
+	}
+	if !hasNewAmount {
+		t.Error("expected _newAmount implicit param for single-output continuation")
+	}
+}
+
+func TestANFLower_Stateful_AddDataOutput_NonMutating(t *testing.T) {
+	// A method that emits only a data output but does NOT mutate state still
+	// commits the (unchanged) contract state continuation + the data output
+	// + the change output. _newAmount must be injected so the output value
+	// can be adjusted.
+	source := `
+import { StatefulSmartContract, ByteString } from 'runar-lang';
+
+class Counter extends StatefulSmartContract {
+  count: bigint;
+
+  constructor(count: bigint) {
+    super(count);
+    this.count = count;
+  }
+
+  public ping(payload: ByteString): void {
+    this.addDataOutput(0n, payload);
+  }
+}
+`
+	contract, _ := mustLowerToANF(t, source)
+	program := LowerToANF(contract)
+
+	var pingIdx int = -1
+	for i, m := range program.Methods {
+		if m.Name == "ping" {
+			pingIdx = i
+			break
+		}
+	}
+	if pingIdx == -1 {
+		t.Fatal("could not find 'ping' method in ANF output")
+	}
+	method := program.Methods[pingIdx]
+
+	var dataOutputs int
+	for _, b := range method.Body {
+		if b.Value.Kind == "add_data_output" {
+			dataOutputs++
+		}
+	}
+	if dataOutputs != 1 {
+		t.Fatalf("expected 1 add_data_output binding, got %d", dataOutputs)
+	}
+
+	wantParams := []string{"_changePKH", "_changeAmount", "_newAmount"}
+	for _, name := range wantParams {
+		var found bool
+		for _, p := range method.Params {
+			if p.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected implicit param %q for data-output-only method, got params=%+v", name, method.Params)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Test: State-mutating method WITHOUT addOutput has _newAmount as implicit param
 //
 // _newAmount is injected only when a method mutates state but does NOT use
@@ -1522,4 +1842,189 @@ class Counter extends StatefulSmartContract {
 	}
 	// If txPreimage not referenced at all, that's also fine for this simple case
 	t.Logf("txPreimage not found as explicit binding (may be injected internally)")
+}
+
+// ---------------------------------------------------------------------------
+// Test: Ternary expression lowers to an `if` ANF node (T-5)
+//
+// Mirrors the Java peer test
+// (compilers/java/src/test/java/runar/compiler/passes/StackLowerTest.java
+// `ternaryLowersToIfOpStructural`). Localized regression detection for the
+// ternary → if-lowering path, which is otherwise only exercised via the
+// cross-tier golden harness.
+// ---------------------------------------------------------------------------
+
+func TestANFLower_Ternary(t *testing.T) {
+	source := `
+import { SmartContract, assert } from 'runar-lang';
+
+class TernaryDemo extends SmartContract {
+  readonly limit: bigint;
+
+  constructor(limit: bigint) {
+    super(limit);
+    this.limit = limit;
+  }
+
+  public check(flag: boolean): void {
+    const result: bigint = flag ? this.limit + 1n : this.limit - 1n;
+    assert(result > 0n);
+  }
+}
+`
+	contract, _ := mustLowerToANF(t, source)
+	program := LowerToANF(contract)
+
+	var checkIdx = -1
+	for i, m := range program.Methods {
+		if m.Name == "check" {
+			checkIdx = i
+			break
+		}
+	}
+	if checkIdx == -1 {
+		t.Fatal("could not find 'check' method in ANF output")
+	}
+
+	method := program.Methods[checkIdx]
+
+	foundIf := false
+	for _, b := range method.Body {
+		if b.Value.Kind == "if" {
+			foundIf = true
+			if len(b.Value.Then) == 0 || len(b.Value.Else) == 0 {
+				t.Errorf("ternary `if` ANF node missing then/else bindings: then=%d else=%d",
+					len(b.Value.Then), len(b.Value.Else))
+			}
+			break
+		}
+	}
+	if !foundIf {
+		var kinds []string
+		for _, b := range method.Body {
+			kinds = append(kinds, b.Value.Kind)
+		}
+		t.Errorf("expected ternary to lower to `if` ANF node; got kinds: %v", kinds)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #121: extractLoopShape supports non-zero-start and countdown loops (was #127,
+// which rejected them). It returns the iterator start, step direction, and
+// iteration count.
+// ---------------------------------------------------------------------------
+
+func TestExtractLoopShape_NonZeroStart(t *testing.T) {
+	// for (let i = 1n; i <= 3n; i++) → start 1, step +1, count 3
+	stmt := ForStmt{
+		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(1)}},
+		Condition: BinaryExpr{Op: "<=", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(3)}},
+		Update:    ExpressionStmt{Expr: IncrementExpr{Operand: Identifier{Name: "i"}}},
+	}
+	start, step, count := extractLoopShape(stmt)
+	if start.Int64() != 1 || step != 1 || count != 3 {
+		t.Errorf("expected (start=1, step=1, count=3), got (%s, %d, %d)", start.String(), step, count)
+	}
+}
+
+func TestExtractLoopShape_Countdown(t *testing.T) {
+	// for (let i = 3n; i > 0n; i--) → start 3, step -1, count 3
+	stmt := ForStmt{
+		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(3)}},
+		Condition: BinaryExpr{Op: ">", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(0)}},
+		Update:    ExpressionStmt{Expr: DecrementExpr{Operand: Identifier{Name: "i"}}},
+	}
+	start, step, count := extractLoopShape(stmt)
+	if start.Int64() != 3 || step != -1 || count != 3 {
+		t.Errorf("expected (start=3, step=-1, count=3), got (%s, %d, %d)", start.String(), step, count)
+	}
+
+	// for (let i = 3n; i >= 1n; i--) → start 3, step -1, count 3
+	stmt2 := ForStmt{
+		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(3)}},
+		Condition: BinaryExpr{Op: ">=", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(1)}},
+		Update:    ExpressionStmt{Expr: DecrementExpr{Operand: Identifier{Name: "i"}}},
+	}
+	start2, step2, count2 := extractLoopShape(stmt2)
+	if start2.Int64() != 3 || step2 != -1 || count2 != 3 {
+		t.Errorf("expected (start=3, step=-1, count=3), got (%s, %d, %d)", start2.String(), step2, count2)
+	}
+}
+
+func TestExtractLoopShape_ZeroStartCountingUp(t *testing.T) {
+	// for (let i = 0n; i <= 3n; i++) → start 0, step +1, count 4
+	stmt := ForStmt{
+		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(0)}},
+		Condition: BinaryExpr{Op: "<=", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(3)}},
+		Update:    ExpressionStmt{Expr: IncrementExpr{Operand: Identifier{Name: "i"}}},
+	}
+	if start, step, count := extractLoopShape(stmt); start.Int64() != 0 || step != 1 || count != 4 {
+		t.Errorf("expected (start=0, step=1, count=4), got (%s, %d, %d)", start.String(), step, count)
+	}
+
+	// for (let i = 0n; i < 10n; i++) → start 0, step +1, count 10
+	stmt2 := ForStmt{
+		Init:      VariableDeclStmt{Name: "i", Init: BigIntLiteral{Value: big.NewInt(0)}},
+		Condition: BinaryExpr{Op: "<", Left: Identifier{Name: "i"}, Right: BigIntLiteral{Value: big.NewInt(10)}},
+		Update:    ExpressionStmt{Expr: IncrementExpr{Operand: Identifier{Name: "i"}}},
+	}
+	if start, step, count := extractLoopShape(stmt2); start.Int64() != 0 || step != 1 || count != 10 {
+		t.Errorf("expected (start=0, step=1, count=10), got (%s, %d, %d)", start.String(), step, count)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #130: a method param shadowing a property — both resolution directions.
+// A bare identifier `x` resolves to the param (load_param); explicit `this.x`
+// still resolves to the property (load_prop).
+// ---------------------------------------------------------------------------
+
+func TestParamShadowingProperty_Issue130(t *testing.T) {
+	source := `
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(x: bigint): void {
+    assert(x === this.x);
+  }
+}
+`
+	contract, _ := mustLowerToANF(t, source)
+	program := LowerToANF(contract)
+
+	methodIdx := -1
+	for i := range program.Methods {
+		if program.Methods[i].Name == "m" {
+			methodIdx = i
+			break
+		}
+	}
+	if methodIdx == -1 {
+		t.Fatal("could not find method 'm'")
+	}
+	method := program.Methods[methodIdx]
+
+	loadParamX, loadPropX := 0, 0
+	for _, b := range method.Body {
+		switch b.Value.Kind {
+		case "load_param":
+			if b.Value.Name == "x" {
+				loadParamX++
+			}
+		case "load_prop":
+			if b.Value.Name == "x" {
+				loadPropX++
+			}
+		}
+	}
+	// Bare `x` -> load_param (the witness value, not stale state).
+	if loadParamX != 1 {
+		t.Errorf("expected 1 load_param for bare `x` (issue #130), got %d", loadParamX)
+	}
+	// Explicit `this.x` -> load_prop.
+	if loadPropX != 1 {
+		t.Errorf("expected 1 load_prop for `this.x` (issue #130), got %d", loadPropX)
+	}
 }

@@ -43,7 +43,6 @@ pub struct CovenantVault {
     pub min_amount: Bigint,
 }
 
-#[runar::methods(CovenantVault)]
 impl CovenantVault {
     /// Spend funds held by this covenant.
     ///
@@ -52,16 +51,13 @@ impl CovenantVault {
     ///
     /// - `sig`         -- ECDSA signature from the owner (~72 bytes DER).
     /// - `tx_preimage` -- Sighash preimage for `check_preimage` verification.
-    #[public]
     pub fn spend(&self, sig: &Sig, tx_preimage: &SigHashPreimage) {
         assert!(check_sig(sig, &self.owner));
         assert!(check_preimage(tx_preimage));
 
         // Construct expected P2PKH output and verify against hashOutputs
-        let script_prefix = cat("1976a914", &self.recipient);
-        let p2pkh_script = cat(&script_prefix, "88ac");
-        let amount_bytes = num2bin(&self.min_amount, 8);
-        let expected_output = cat(&amount_bytes, &p2pkh_script);
+        let p2pkh_script = cat(&cat("1976a914", &self.recipient), "88ac");
+        let expected_output = cat(&num2bin(&self.min_amount, 8), &p2pkh_script);
         assert!(hash256(&expected_output) == extract_output_hash(tx_preimage));
     }
 }

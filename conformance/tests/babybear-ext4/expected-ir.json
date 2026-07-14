@@ -1,0 +1,1671 @@
+{
+  "contractName": "BabyBearExt4Demo",
+  "methods": [
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "args": [],
+            "func": "super",
+            "kind": "call"
+          }
+        }
+      ],
+      "isPublic": false,
+      "name": "constructor",
+      "params": []
+    },
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t1",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t2",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t3",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t4",
+          "value": {
+            "kind": "load_param",
+            "name": "b0"
+          }
+        },
+        {
+          "name": "t5",
+          "value": {
+            "kind": "load_param",
+            "name": "b1"
+          }
+        },
+        {
+          "name": "t6",
+          "value": {
+            "kind": "load_param",
+            "name": "b2"
+          }
+        },
+        {
+          "name": "t7",
+          "value": {
+            "kind": "load_param",
+            "name": "b3"
+          }
+        },
+        {
+          "name": "t8",
+          "value": {
+            "args": [
+              "t0",
+              "t1",
+              "t2",
+              "t3",
+              "t4",
+              "t5",
+              "t6",
+              "t7"
+            ],
+            "func": "bbExt4Mul0",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t9",
+          "value": {
+            "kind": "load_param",
+            "name": "e0"
+          }
+        },
+        {
+          "name": "t10",
+          "value": {
+            "kind": "bin_op",
+            "left": "t8",
+            "op": "===",
+            "right": "t9"
+          }
+        },
+        {
+          "name": "t11",
+          "value": {
+            "kind": "assert",
+            "value": "t10"
+          }
+        },
+        {
+          "name": "t12",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t13",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t14",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t15",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t16",
+          "value": {
+            "kind": "load_param",
+            "name": "b0"
+          }
+        },
+        {
+          "name": "t17",
+          "value": {
+            "kind": "load_param",
+            "name": "b1"
+          }
+        },
+        {
+          "name": "t18",
+          "value": {
+            "kind": "load_param",
+            "name": "b2"
+          }
+        },
+        {
+          "name": "t19",
+          "value": {
+            "kind": "load_param",
+            "name": "b3"
+          }
+        },
+        {
+          "name": "t20",
+          "value": {
+            "args": [
+              "t12",
+              "t13",
+              "t14",
+              "t15",
+              "t16",
+              "t17",
+              "t18",
+              "t19"
+            ],
+            "func": "bbExt4Mul1",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t21",
+          "value": {
+            "kind": "load_param",
+            "name": "e1"
+          }
+        },
+        {
+          "name": "t22",
+          "value": {
+            "kind": "bin_op",
+            "left": "t20",
+            "op": "===",
+            "right": "t21"
+          }
+        },
+        {
+          "name": "t23",
+          "value": {
+            "kind": "assert",
+            "value": "t22"
+          }
+        },
+        {
+          "name": "t24",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t25",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t26",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t27",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t28",
+          "value": {
+            "kind": "load_param",
+            "name": "b0"
+          }
+        },
+        {
+          "name": "t29",
+          "value": {
+            "kind": "load_param",
+            "name": "b1"
+          }
+        },
+        {
+          "name": "t30",
+          "value": {
+            "kind": "load_param",
+            "name": "b2"
+          }
+        },
+        {
+          "name": "t31",
+          "value": {
+            "kind": "load_param",
+            "name": "b3"
+          }
+        },
+        {
+          "name": "t32",
+          "value": {
+            "args": [
+              "t24",
+              "t25",
+              "t26",
+              "t27",
+              "t28",
+              "t29",
+              "t30",
+              "t31"
+            ],
+            "func": "bbExt4Mul2",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t33",
+          "value": {
+            "kind": "load_param",
+            "name": "e2"
+          }
+        },
+        {
+          "name": "t34",
+          "value": {
+            "kind": "bin_op",
+            "left": "t32",
+            "op": "===",
+            "right": "t33"
+          }
+        },
+        {
+          "name": "t35",
+          "value": {
+            "kind": "assert",
+            "value": "t34"
+          }
+        },
+        {
+          "name": "t36",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t37",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t38",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t39",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t40",
+          "value": {
+            "kind": "load_param",
+            "name": "b0"
+          }
+        },
+        {
+          "name": "t41",
+          "value": {
+            "kind": "load_param",
+            "name": "b1"
+          }
+        },
+        {
+          "name": "t42",
+          "value": {
+            "kind": "load_param",
+            "name": "b2"
+          }
+        },
+        {
+          "name": "t43",
+          "value": {
+            "kind": "load_param",
+            "name": "b3"
+          }
+        },
+        {
+          "name": "t44",
+          "value": {
+            "args": [
+              "t36",
+              "t37",
+              "t38",
+              "t39",
+              "t40",
+              "t41",
+              "t42",
+              "t43"
+            ],
+            "func": "bbExt4Mul3",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t45",
+          "value": {
+            "kind": "load_param",
+            "name": "e3"
+          }
+        },
+        {
+          "name": "t46",
+          "value": {
+            "kind": "bin_op",
+            "left": "t44",
+            "op": "===",
+            "right": "t45"
+          }
+        },
+        {
+          "name": "t47",
+          "value": {
+            "kind": "assert",
+            "value": "t46"
+          }
+        }
+      ],
+      "isPublic": true,
+      "name": "checkMul",
+      "params": [
+        {
+          "name": "a0",
+          "type": "bigint"
+        },
+        {
+          "name": "a1",
+          "type": "bigint"
+        },
+        {
+          "name": "a2",
+          "type": "bigint"
+        },
+        {
+          "name": "a3",
+          "type": "bigint"
+        },
+        {
+          "name": "b0",
+          "type": "bigint"
+        },
+        {
+          "name": "b1",
+          "type": "bigint"
+        },
+        {
+          "name": "b2",
+          "type": "bigint"
+        },
+        {
+          "name": "b3",
+          "type": "bigint"
+        },
+        {
+          "name": "e0",
+          "type": "bigint"
+        },
+        {
+          "name": "e1",
+          "type": "bigint"
+        },
+        {
+          "name": "e2",
+          "type": "bigint"
+        },
+        {
+          "name": "e3",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t1",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t2",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t3",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t4",
+          "value": {
+            "args": [
+              "t0",
+              "t1",
+              "t2",
+              "t3"
+            ],
+            "func": "bbExt4Inv0",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t5",
+          "value": {
+            "kind": "load_param",
+            "name": "e0"
+          }
+        },
+        {
+          "name": "t6",
+          "value": {
+            "kind": "bin_op",
+            "left": "t4",
+            "op": "===",
+            "right": "t5"
+          }
+        },
+        {
+          "name": "t7",
+          "value": {
+            "kind": "assert",
+            "value": "t6"
+          }
+        },
+        {
+          "name": "t8",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t9",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t10",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t11",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t12",
+          "value": {
+            "args": [
+              "t8",
+              "t9",
+              "t10",
+              "t11"
+            ],
+            "func": "bbExt4Inv1",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t13",
+          "value": {
+            "kind": "load_param",
+            "name": "e1"
+          }
+        },
+        {
+          "name": "t14",
+          "value": {
+            "kind": "bin_op",
+            "left": "t12",
+            "op": "===",
+            "right": "t13"
+          }
+        },
+        {
+          "name": "t15",
+          "value": {
+            "kind": "assert",
+            "value": "t14"
+          }
+        },
+        {
+          "name": "t16",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t17",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t18",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t19",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t20",
+          "value": {
+            "args": [
+              "t16",
+              "t17",
+              "t18",
+              "t19"
+            ],
+            "func": "bbExt4Inv2",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t21",
+          "value": {
+            "kind": "load_param",
+            "name": "e2"
+          }
+        },
+        {
+          "name": "t22",
+          "value": {
+            "kind": "bin_op",
+            "left": "t20",
+            "op": "===",
+            "right": "t21"
+          }
+        },
+        {
+          "name": "t23",
+          "value": {
+            "kind": "assert",
+            "value": "t22"
+          }
+        },
+        {
+          "name": "t24",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t25",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t26",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t27",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t28",
+          "value": {
+            "args": [
+              "t24",
+              "t25",
+              "t26",
+              "t27"
+            ],
+            "func": "bbExt4Inv3",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t29",
+          "value": {
+            "kind": "load_param",
+            "name": "e3"
+          }
+        },
+        {
+          "name": "t30",
+          "value": {
+            "kind": "bin_op",
+            "left": "t28",
+            "op": "===",
+            "right": "t29"
+          }
+        },
+        {
+          "name": "t31",
+          "value": {
+            "kind": "assert",
+            "value": "t30"
+          }
+        }
+      ],
+      "isPublic": true,
+      "name": "checkInv",
+      "params": [
+        {
+          "name": "a0",
+          "type": "bigint"
+        },
+        {
+          "name": "a1",
+          "type": "bigint"
+        },
+        {
+          "name": "a2",
+          "type": "bigint"
+        },
+        {
+          "name": "a3",
+          "type": "bigint"
+        },
+        {
+          "name": "e0",
+          "type": "bigint"
+        },
+        {
+          "name": "e1",
+          "type": "bigint"
+        },
+        {
+          "name": "e2",
+          "type": "bigint"
+        },
+        {
+          "name": "e3",
+          "type": "bigint"
+        }
+      ]
+    },
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "kind": "load_param",
+            "name": "fx0"
+          }
+        },
+        {
+          "name": "t1",
+          "value": {
+            "kind": "load_param",
+            "name": "fnx0"
+          }
+        },
+        {
+          "name": "t2",
+          "value": {
+            "args": [
+              "t0",
+              "t1"
+            ],
+            "func": "bbFieldAdd",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "s0",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t2"
+          }
+        },
+        {
+          "name": "t3",
+          "value": {
+            "kind": "load_param",
+            "name": "fx1"
+          }
+        },
+        {
+          "name": "t4",
+          "value": {
+            "kind": "load_param",
+            "name": "fnx1"
+          }
+        },
+        {
+          "name": "t5",
+          "value": {
+            "args": [
+              "t3",
+              "t4"
+            ],
+            "func": "bbFieldAdd",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "s1",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t5"
+          }
+        },
+        {
+          "name": "t6",
+          "value": {
+            "kind": "load_param",
+            "name": "fx2"
+          }
+        },
+        {
+          "name": "t7",
+          "value": {
+            "kind": "load_param",
+            "name": "fnx2"
+          }
+        },
+        {
+          "name": "t8",
+          "value": {
+            "args": [
+              "t6",
+              "t7"
+            ],
+            "func": "bbFieldAdd",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "s2",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t8"
+          }
+        },
+        {
+          "name": "t9",
+          "value": {
+            "kind": "load_param",
+            "name": "fx3"
+          }
+        },
+        {
+          "name": "t10",
+          "value": {
+            "kind": "load_param",
+            "name": "fnx3"
+          }
+        },
+        {
+          "name": "t11",
+          "value": {
+            "args": [
+              "t9",
+              "t10"
+            ],
+            "func": "bbFieldAdd",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "s3",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t11"
+          }
+        },
+        {
+          "name": "t12",
+          "value": {
+            "kind": "load_const",
+            "value": 2
+          }
+        },
+        {
+          "name": "t13",
+          "value": {
+            "args": [
+              "t12"
+            ],
+            "func": "bbFieldInv",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "inv2",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t13"
+          }
+        },
+        {
+          "name": "t14",
+          "value": {
+            "args": [
+              "s0",
+              "inv2"
+            ],
+            "func": "bbFieldMul",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "hs0",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t14"
+          }
+        },
+        {
+          "name": "t15",
+          "value": {
+            "args": [
+              "s1",
+              "inv2"
+            ],
+            "func": "bbFieldMul",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "hs1",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t15"
+          }
+        },
+        {
+          "name": "t16",
+          "value": {
+            "args": [
+              "s2",
+              "inv2"
+            ],
+            "func": "bbFieldMul",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "hs2",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t16"
+          }
+        },
+        {
+          "name": "t17",
+          "value": {
+            "args": [
+              "s3",
+              "inv2"
+            ],
+            "func": "bbFieldMul",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "hs3",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t17"
+          }
+        },
+        {
+          "name": "t18",
+          "value": {
+            "kind": "load_param",
+            "name": "fx0"
+          }
+        },
+        {
+          "name": "t19",
+          "value": {
+            "kind": "load_param",
+            "name": "fnx0"
+          }
+        },
+        {
+          "name": "t20",
+          "value": {
+            "args": [
+              "t18",
+              "t19"
+            ],
+            "func": "bbFieldSub",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "d0",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t20"
+          }
+        },
+        {
+          "name": "t21",
+          "value": {
+            "kind": "load_param",
+            "name": "fx1"
+          }
+        },
+        {
+          "name": "t22",
+          "value": {
+            "kind": "load_param",
+            "name": "fnx1"
+          }
+        },
+        {
+          "name": "t23",
+          "value": {
+            "args": [
+              "t21",
+              "t22"
+            ],
+            "func": "bbFieldSub",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "d1",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t23"
+          }
+        },
+        {
+          "name": "t24",
+          "value": {
+            "kind": "load_param",
+            "name": "fx2"
+          }
+        },
+        {
+          "name": "t25",
+          "value": {
+            "kind": "load_param",
+            "name": "fnx2"
+          }
+        },
+        {
+          "name": "t26",
+          "value": {
+            "args": [
+              "t24",
+              "t25"
+            ],
+            "func": "bbFieldSub",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "d2",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t26"
+          }
+        },
+        {
+          "name": "t27",
+          "value": {
+            "kind": "load_param",
+            "name": "fx3"
+          }
+        },
+        {
+          "name": "t28",
+          "value": {
+            "kind": "load_param",
+            "name": "fnx3"
+          }
+        },
+        {
+          "name": "t29",
+          "value": {
+            "args": [
+              "t27",
+              "t28"
+            ],
+            "func": "bbFieldSub",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "d3",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t29"
+          }
+        },
+        {
+          "name": "t30",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t31",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t32",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t33",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t34",
+          "value": {
+            "args": [
+              "t30",
+              "t31",
+              "t32",
+              "t33",
+              "d0",
+              "d1",
+              "d2",
+              "d3"
+            ],
+            "func": "bbExt4Mul0",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "ad0",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t34"
+          }
+        },
+        {
+          "name": "t35",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t36",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t37",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t38",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t39",
+          "value": {
+            "args": [
+              "t35",
+              "t36",
+              "t37",
+              "t38",
+              "d0",
+              "d1",
+              "d2",
+              "d3"
+            ],
+            "func": "bbExt4Mul1",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "ad1",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t39"
+          }
+        },
+        {
+          "name": "t40",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t41",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t42",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t43",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t44",
+          "value": {
+            "args": [
+              "t40",
+              "t41",
+              "t42",
+              "t43",
+              "d0",
+              "d1",
+              "d2",
+              "d3"
+            ],
+            "func": "bbExt4Mul2",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "ad2",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t44"
+          }
+        },
+        {
+          "name": "t45",
+          "value": {
+            "kind": "load_param",
+            "name": "a0"
+          }
+        },
+        {
+          "name": "t46",
+          "value": {
+            "kind": "load_param",
+            "name": "a1"
+          }
+        },
+        {
+          "name": "t47",
+          "value": {
+            "kind": "load_param",
+            "name": "a2"
+          }
+        },
+        {
+          "name": "t48",
+          "value": {
+            "kind": "load_param",
+            "name": "a3"
+          }
+        },
+        {
+          "name": "t49",
+          "value": {
+            "args": [
+              "t45",
+              "t46",
+              "t47",
+              "t48",
+              "d0",
+              "d1",
+              "d2",
+              "d3"
+            ],
+            "func": "bbExt4Mul3",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "ad3",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t49"
+          }
+        },
+        {
+          "name": "t50",
+          "value": {
+            "kind": "load_const",
+            "value": 2
+          }
+        },
+        {
+          "name": "t51",
+          "value": {
+            "kind": "load_param",
+            "name": "x"
+          }
+        },
+        {
+          "name": "t52",
+          "value": {
+            "args": [
+              "t50",
+              "t51"
+            ],
+            "func": "bbFieldMul",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t53",
+          "value": {
+            "args": [
+              "t52"
+            ],
+            "func": "bbFieldInv",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "inv2x",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t53"
+          }
+        },
+        {
+          "name": "t54",
+          "value": {
+            "args": [
+              "ad0",
+              "inv2x"
+            ],
+            "func": "bbFieldMul",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "at0",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t54"
+          }
+        },
+        {
+          "name": "t55",
+          "value": {
+            "args": [
+              "ad1",
+              "inv2x"
+            ],
+            "func": "bbFieldMul",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "at1",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t55"
+          }
+        },
+        {
+          "name": "t56",
+          "value": {
+            "args": [
+              "ad2",
+              "inv2x"
+            ],
+            "func": "bbFieldMul",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "at2",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t56"
+          }
+        },
+        {
+          "name": "t57",
+          "value": {
+            "args": [
+              "ad3",
+              "inv2x"
+            ],
+            "func": "bbFieldMul",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "at3",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t57"
+          }
+        },
+        {
+          "name": "t58",
+          "value": {
+            "args": [
+              "hs0",
+              "at0"
+            ],
+            "func": "bbFieldAdd",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "g0",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t58"
+          }
+        },
+        {
+          "name": "t59",
+          "value": {
+            "args": [
+              "hs1",
+              "at1"
+            ],
+            "func": "bbFieldAdd",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "g1",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t59"
+          }
+        },
+        {
+          "name": "t60",
+          "value": {
+            "args": [
+              "hs2",
+              "at2"
+            ],
+            "func": "bbFieldAdd",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "g2",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t60"
+          }
+        },
+        {
+          "name": "t61",
+          "value": {
+            "args": [
+              "hs3",
+              "at3"
+            ],
+            "func": "bbFieldAdd",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "g3",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t61"
+          }
+        },
+        {
+          "name": "t62",
+          "value": {
+            "kind": "load_param",
+            "name": "eg0"
+          }
+        },
+        {
+          "name": "t63",
+          "value": {
+            "kind": "bin_op",
+            "left": "g0",
+            "op": "===",
+            "right": "t62"
+          }
+        },
+        {
+          "name": "t64",
+          "value": {
+            "kind": "assert",
+            "value": "t63"
+          }
+        },
+        {
+          "name": "t65",
+          "value": {
+            "kind": "load_param",
+            "name": "eg1"
+          }
+        },
+        {
+          "name": "t66",
+          "value": {
+            "kind": "bin_op",
+            "left": "g1",
+            "op": "===",
+            "right": "t65"
+          }
+        },
+        {
+          "name": "t67",
+          "value": {
+            "kind": "assert",
+            "value": "t66"
+          }
+        },
+        {
+          "name": "t68",
+          "value": {
+            "kind": "load_param",
+            "name": "eg2"
+          }
+        },
+        {
+          "name": "t69",
+          "value": {
+            "kind": "bin_op",
+            "left": "g2",
+            "op": "===",
+            "right": "t68"
+          }
+        },
+        {
+          "name": "t70",
+          "value": {
+            "kind": "assert",
+            "value": "t69"
+          }
+        },
+        {
+          "name": "t71",
+          "value": {
+            "kind": "load_param",
+            "name": "eg3"
+          }
+        },
+        {
+          "name": "t72",
+          "value": {
+            "kind": "bin_op",
+            "left": "g3",
+            "op": "===",
+            "right": "t71"
+          }
+        },
+        {
+          "name": "t73",
+          "value": {
+            "kind": "assert",
+            "value": "t72"
+          }
+        }
+      ],
+      "isPublic": true,
+      "name": "checkFriFold",
+      "params": [
+        {
+          "name": "x",
+          "type": "bigint"
+        },
+        {
+          "name": "fx0",
+          "type": "bigint"
+        },
+        {
+          "name": "fx1",
+          "type": "bigint"
+        },
+        {
+          "name": "fx2",
+          "type": "bigint"
+        },
+        {
+          "name": "fx3",
+          "type": "bigint"
+        },
+        {
+          "name": "fnx0",
+          "type": "bigint"
+        },
+        {
+          "name": "fnx1",
+          "type": "bigint"
+        },
+        {
+          "name": "fnx2",
+          "type": "bigint"
+        },
+        {
+          "name": "fnx3",
+          "type": "bigint"
+        },
+        {
+          "name": "a0",
+          "type": "bigint"
+        },
+        {
+          "name": "a1",
+          "type": "bigint"
+        },
+        {
+          "name": "a2",
+          "type": "bigint"
+        },
+        {
+          "name": "a3",
+          "type": "bigint"
+        },
+        {
+          "name": "eg0",
+          "type": "bigint"
+        },
+        {
+          "name": "eg1",
+          "type": "bigint"
+        },
+        {
+          "name": "eg2",
+          "type": "bigint"
+        },
+        {
+          "name": "eg3",
+          "type": "bigint"
+        }
+      ]
+    }
+  ],
+  "properties": []
+}

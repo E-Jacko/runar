@@ -37,10 +37,11 @@ pub fn build(b: *std.Build) void {
 
     const has_bsvz_runar_harness = blk: {
         const harness_path = b.pathFromRoot("../../../bsvz/tests/support/runar_harness.zig");
-        std.fs.cwd().access(harness_path, .{}) catch |err| switch (err) {
+        const file = b.build_root.handle.openFile(b.graph.io, harness_path, .{}) catch |err| switch (err) {
             error.FileNotFound => break :blk false,
             else => break :blk false,
         };
+        file.close(b.graph.io);
         break :blk true;
     };
 
@@ -85,4 +86,35 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run runar-zig tests");
     test_step.dependOn(&run_tests.step);
+
+    // ── Analyzer CLI executable (used by tools/analyzer-runner/zig.sh) ──
+    const analyzer_cli_module = b.createModule(.{
+        .root_source_file = b.path("src/analyzer_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const analyzer_exe = b.addExecutable(.{
+        .name = "runar-analyzer",
+        .root_module = analyzer_cli_module,
+    });
+    const install_analyzer = b.addInstallArtifact(analyzer_exe, .{});
+    const analyzer_step = b.step("analyzer", "Build the runar-analyzer CLI executable");
+    analyzer_step.dependOn(&install_analyzer.step);
+
+    // ── canonicalise CLI shim (cross-tier canonicalJson differential fuzzer) ──
+    // conformance/fuzzer/canonical-json-differential.ts shells out to this
+    // binary. It only needs sdk_envelope.zig + std, so it gets a bare module
+    // with no extra imports.
+    const canonicalise_cli_module = b.createModule(.{
+        .root_source_file = b.path("src/canonicalise_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const canonicalise_exe = b.addExecutable(.{
+        .name = "runar-canonicalise",
+        .root_module = canonicalise_cli_module,
+    });
+    const install_canonicalise = b.addInstallArtifact(canonicalise_exe, .{});
+    const canonicalise_step = b.step("canonicalise", "Build the runar-canonicalise CLI shim");
+    canonicalise_step.dependOn(&install_canonicalise.step);
 }

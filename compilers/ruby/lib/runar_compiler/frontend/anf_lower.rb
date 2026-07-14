@@ -12,9 +12,14 @@
 require "json"
 require_relative "../ir/types"
 require_relative "ast_nodes"
+require_relative "sighash_directive"
 
 module RunarCompiler
   module Frontend
+    # SIGHASH_ALL | SIGHASH_FORKID — the default @sighash mode (issue #123).
+    # Byte-identical to the historically-pinned covenant binding blob.
+    SIGHASH_DEFAULT = SighashDirective::SIGHASH_DEFAULT
+
     # -------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------
@@ -38,7 +43,8 @@ module RunarCompiler
       IR::ANFProgram.new(
         contract_name: contract.name,
         properties: properties,
-        methods: methods
+        methods: methods,
+        parent_class: contract.parent_class
       )
     end
 
@@ -48,7 +54,7 @@ module RunarCompiler
 
     BYTE_TYPES = %w[
       ByteString PubKey Sig Sha256 Ripemd160 Addr SigHashPreimage
-      RabinSig RabinPubKey Point
+      RabinSig RabinPubKey Point P256Point P384Point
     ].to_set.freeze
     private_constant :BYTE_TYPES
 
@@ -56,6 +62,8 @@ module RunarCompiler
       sha256 ripemd160 hash160 hash256 cat substr num2bin reverseBytes
       left right int2str toByteString pack ecAdd ecMul ecMulGen ecNegate
       ecMakePoint ecEncodeCompressed blake3Compress blake3Hash
+      p256Add p256Mul p256MulGen p256Negate p256EncodeCompressed
+      p384Add p384Mul p384MulGen p384Negate p384EncodeCompressed
     ].to_set.freeze
     private_constant :BYTE_RETURNING_FUNCTIONS
 
@@ -92,6 +100,8 @@ module RunarCompiler
 
       if expr.is_a?(CallExpr)
         if expr.callee.is_a?(Identifier)
+          # Expression-form asm<ByteString>({...}) yields a byte value.
+          return expr.asm_return_type == "ByteString" if expr.callee.name == "asm"
           return true if BYTE_RETURNING_FUNCTIONS.include?(expr.callee.name)
           return true if expr.callee.name.length >= 7 && expr.callee.name[0, 7] == "extract"
         end
@@ -117,6 +127,12 @@ module RunarCompiler
         )
         unless prop.initializer.nil?
           anf_prop.initial_value = _extract_literal_value(prop.initializer)
+        end
+        # Propagate the FixedArray-expansion marker so the artifact assembler
+        # can re-group the synthetic scalar run back into a logical FixedArray
+        # state field.
+        if prop.respond_to?(:synthetic_array_chain) && !prop.synthetic_array_chain.nil?
+          anf_prop.synthetic_array_chain = prop.synthetic_array_chain
         end
         anf_prop
       end
@@ -147,6 +163,9 @@ module RunarCompiler
 
       # Lower constructor
       ctor_ctx = LoweringContext.new(contract)
+      contract.constructor.params.each do |p|
+        ctor_ctx.register_param_type(p.name, _type_node_to_string(p.type))
+      end
       ctor_ctx.lower_statements(contract.constructor.body)
       result << IR::ANFMethod.new(
         name: "constructor",
@@ -155,33 +174,109 @@ module RunarCompiler
         is_public: false
       )
 
+      # Issue #109: readonly fields carrying a +/** @embedAlways */+ directive
+      # must survive DCE into the locking script. A readonly field no method
+      # references lowers to no +load_prop+, so no constructor slot is emitted
+      # and the field's deploy-time bytes vanish. Inject a +load_prop+ + a
+      # +@ref:+ alias (the exact shape +const _bind = this.field;+ produces)
+      # into the first public method's body — the alias keeps the +load_prop+
+      # alive through dead-binding DCE, and stack lowering threads the pushed
+      # value through and cleans it up at method end. One slot in the deployed
+      # script suffices; every spending branch shares it.
+      embed_fields = contract.properties.select { |p| p.readonly && _embed_always?(p) }
+      embed_injected = false
+
       # Lower each method
       contract.methods.each do |method|
         method_ctx = LoweringContext.new(contract)
 
+        # Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+        # flag for any checkPreimage (auto-injected below, or a manual call) in
+        # this method. Omitted for the default so the ANF (and pinned binding
+        # blob) is unchanged.
+        method_sighash = method.respond_to?(:sighash_type) ? method.sighash_type : nil
+        if !method_sighash.nil? && method_sighash != SIGHASH_DEFAULT
+          method_ctx.sighash_flag = method_sighash
+        end
+
+        # Register the developer-declared param types scoped to this method
+        # before lowering its body, so byte-type analysis sees only this
+        # method's params (issue #34).
+        method.params.each do |p|
+          method_ctx.register_param_type(p.name, _type_node_to_string(p.type))
+        end
+
+        # Register the declared param NAMES so a bare identifier resolves to
+        # load_param before falling through to load_prop (#130). Without this,
+        # a param whose name collides with a mutable state property lowered to
+        # the stale deserialized property value instead of the witness param.
+        # Explicit this.x is unaffected: PropertyAccessExpr lowering checks
+        # property? before param? (below), so a stored property still wins.
+        method.params.each do |p|
+          method_ctx.add_param(p.name)
+        end
+
         if contract.parent_class == "StatefulSmartContract" && method.visibility == "public"
           # Determine if this method verifies hashOutputs (needs change output support).
+          # Methods that use addOutput / addDataOutput or mutate state need hashOutputs
+          # verification.
+          has_data_output = _method_has_add_data_output(method, contract)
           needs_change_output = (
             _method_mutates_state(method, contract) ||
-            _method_has_add_output(method)
+            _method_has_add_output(method, contract) ||
+            has_data_output
           )
 
           # Register implicit parameters
           if needs_change_output
             method_ctx.add_param("_changePKH")
             method_ctx.add_param("_changeAmount")
+            method_ctx.register_param_type("_changePKH", "Ripemd160")
+            method_ctx.register_param_type("_changeAmount", "bigint")
           end
           # Single-output continuation needs _newAmount to allow changing the UTXO satoshis.
-          needs_new_amount = _method_mutates_state(method, contract) && !_method_has_add_output(method)
+          # Methods that emit only data outputs (no addOutput) still run the
+          # single-output continuation path for their state continuation, so
+          # they also need _newAmount.
+          needs_new_amount = (_method_mutates_state(method, contract) || has_data_output) &&
+                             !_method_has_add_output(method, contract)
           if needs_new_amount
             method_ctx.add_param("_newAmount")
+            method_ctx.register_param_type("_newAmount", "bigint")
           end
           method_ctx.add_param("txPreimage")
+          method_ctx.register_param_type("txPreimage", "SigHashPreimage")
+
+          # Issue #123: the declared per-method sighash mode (default ALL|FORKID).
+          # Drives BOTH the OP_PUSH_TX binding flag (so the derived sig re-computes
+          # the tx sighash under this mode) AND the runtime preimage-type assert.
+          sighash_mode = method_sighash.nil? ? SIGHASH_DEFAULT : method_sighash
+          is_default_sighash = sighash_mode == SIGHASH_DEFAULT
 
           # Inject checkPreimage(txPreimage) at the start
           preimage_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
-          check_result = method_ctx.emit(IR::ANFValue.new(kind: "check_preimage").tap { |v| v.preimage = preimage_ref })
+          check_result = method_ctx.emit(IR::ANFValue.new(kind: "check_preimage").tap do |v|
+            v.preimage = preimage_ref
+            # Omit for the default so the ANF (and pinned binding blob) is unchanged.
+            v.sighash_flag = sighash_mode unless is_default_sighash
+          end)
           method_ctx.emit(_make_assert(check_result))
+
+          # GAP-302 / #123: pin the sighash type to the declared mode. The
+          # auto-injected covenant verifies a real tx preimage, but without this
+          # check the spend could use a DIFFERENT sighash flag than declared that
+          # zeroes out preimage fields the contract (or its continuation) relies
+          # on (hashOutputs / hashPrevouts / hashSequence). The value defaults to
+          # 0x41 (SIGHASH_ALL|FORKID) so existing contracts emit byte-identical ANF.
+          sig_hash_preimage_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
+          sig_hash_type_ref = method_ctx.emit(_make_call("extractSigHashType", [sig_hash_preimage_ref]))
+          expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(sighash_mode))
+          sig_hash_ok_ref = method_ctx.emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
+            v.op = "==="
+            v.left = sig_hash_type_ref
+            v.right = expected_sig_hash_ref
+          end)
+          method_ctx.emit(_make_assert(sig_hash_ok_ref))
 
           # Deserialize mutable state from the preimage's scriptCode
           has_state_prop = contract.properties.any? { |p| !p.readonly }
@@ -190,22 +285,73 @@ module RunarCompiler
             method_ctx.emit(IR::ANFValue.new(kind: "deserialize_state").tap { |v| v.preimage = preimage_ref3 })
           end
 
+          # Issue #109: preserve @embedAlways fields at the first user-statement
+          # position (after the checkPreimage/deserialize preamble), mirroring
+          # where a `const _bind = this.field;` idiom would sit.
+          if !embed_injected && embed_fields.any?
+            _emit_embed_always_preservation(method_ctx, embed_fields)
+            embed_injected = true
+          end
+
           # Lower the developer's method body
           method_ctx.lower_statements(method.body)
 
-          # Determine state continuation type
+          # Determine state continuation type.
+          #
+          # === Continuation-hash construction ===
+          #
+          # Outputs are concatenated in the following order before hashing
+          # with hash256:
+          #   1. state outputs  (addOutput / addRawOutput, via addOutputRef)
+          #   2. data outputs   (addDataOutput, via addDataOutputRef)
+          #   3. change output  (P2PKH to _changePKH, value = _changeAmount)
+          #
+          # For the "single-output" fast path (no addOutput, but state mutates
+          # or a data output is emitted), the state output is computed on the
+          # fly from (preimage, stateScript, _newAmount); data outputs are
+          # inserted BETWEEN the single state output and the change output.
           add_output_refs = method_ctx.get_add_output_refs
-          if add_output_refs.any? || _method_mutates_state(method, contract)
+          add_data_output_refs = method_ctx.get_add_data_output_refs
+          if add_output_refs.any? || add_data_output_refs.any? || _method_mutates_state(method, contract)
             # Build the P2PKH change output for hashOutputs verification
+            #
+            # #116: the SDK's buildCallTransaction OMITS the change output when
+            # change <= 0 (an exact-cover call) and passes _changeAmount = 0.
+            # Gate the change segment on _changeAmount != 0 at runtime so the
+            # hashed output set matches the SDK at the exact-zero boundary -- the
+            # segment is the P2PKH change output when non-zero, and empty bytes
+            # (cat with empty is a no-op) when zero, reproducing the omission.
+            # For any change > 0 the hashed bytes are unchanged; only the emitted
+            # script gains the guard.
             change_pkh_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "_changePKH" })
             change_amount_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "_changeAmount" })
-            change_output_ref = method_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+            zero_ref = method_ctx.emit(_make_load_const_int(0))
+            change_nonzero_ref = method_ctx.emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
+              v.op = "!=="
+              v.left = change_amount_ref
+              v.right = zero_ref
+            end)
+            change_then_ctx = method_ctx.sub_context
+            change_then_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+            method_ctx.sync_counter(change_then_ctx)
+            change_else_ctx = method_ctx.sub_context
+            change_else_ctx.emit(_make_load_const_string(""))
+            method_ctx.sync_counter(change_else_ctx)
+            change_output_ref = method_ctx.emit(IR::ANFValue.new(kind: "if").tap do |v|
+              v.cond = change_nonzero_ref
+              v.then = change_then_ctx.bindings
+              v.else_ = change_else_ctx.bindings
+            end)
 
             if add_output_refs.any?
-              # Multi-output continuation: concat all outputs + change output, hash
+              # Multi-output continuation: concat all state outputs, then all
+              # data outputs, then change output, then hash.
               accumulated = add_output_refs[0]
               (1...add_output_refs.length).each do |i|
                 accumulated = method_ctx.emit(_make_call("cat", [accumulated, add_output_refs[i]]))
+              end
+              add_data_output_refs.each do |data_ref|
+                accumulated = method_ctx.emit(_make_call("cat", [accumulated, data_ref]))
               end
               accumulated = method_ctx.emit(_make_call("cat", [accumulated, change_output_ref]))
               hash_ref = method_ctx.emit(_make_call("hash256", [accumulated]))
@@ -217,14 +363,20 @@ module RunarCompiler
                 v.right = output_hash_ref
                 v.result_type = "bytes"
               end)
-              method_ctx.emit(_make_assert(eq_ref))
+              method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
             else
-              # Single-output continuation: build raw output bytes, concat with change, hash
+              # Single-output continuation: build raw output bytes, then
+              # splice in any declared data outputs, then concat with
+              # change, then hash.
               state_script_ref = method_ctx.emit(IR::ANFValue.new(kind: "get_state_script"))
               preimage_ref2 = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
               new_amount_ref = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "_newAmount" })
               contract_output_ref = method_ctx.emit(_make_call("computeStateOutput", [preimage_ref2, state_script_ref, new_amount_ref]))
-              all_outputs = method_ctx.emit(_make_call("cat", [contract_output_ref, change_output_ref]))
+              accumulated = contract_output_ref
+              add_data_output_refs.each do |data_ref|
+                accumulated = method_ctx.emit(_make_call("cat", [accumulated, data_ref]))
+              end
+              all_outputs = method_ctx.emit(_make_call("cat", [accumulated, change_output_ref]))
               hash_ref = method_ctx.emit(_make_call("hash256", [all_outputs]))
               preimage_ref4 = method_ctx.emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
               output_hash_ref = method_ctx.emit(_make_call("extractOutputHash", [preimage_ref4]))
@@ -234,7 +386,7 @@ module RunarCompiler
                 v.right = output_hash_ref
                 v.result_type = "bytes"
               end)
-              method_ctx.emit(_make_assert(eq_ref))
+              method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
             end
           end
 
@@ -251,21 +403,45 @@ module RunarCompiler
           end
           augmented_params << IR::ANFParam.new(name: "txPreimage", type: "SigHashPreimage")
 
+          # Intent sub-covenant intrinsic auto-injected witness params
+          # (BSVM Phase 13). Appended AFTER txPreimage so unlocking scripts
+          # push them adjacent to the preimage anchor. Mirrors Go ordering.
+          method_ctx.method_scope.auto_injected_params.each do |p|
+            augmented_params << p
+          end
+
           result << IR::ANFMethod.new(
             name: method.name,
             params: augmented_params,
             body: method_ctx.bindings,
-            is_public: true
+            is_public: true,
+            sighash_type: method_sighash
           )
         else
+          # Issue #109: stateless public methods (and stateless contracts'
+          # spending entry points) are lowered here — inject @embedAlways
+          # preservation into the first PUBLIC one before its body.
+          if !embed_injected && embed_fields.any? && method.visibility == "public"
+            _emit_embed_always_preservation(method_ctx, embed_fields)
+            embed_injected = true
+          end
           method_ctx.lower_statements(method.body)
+          augmented = _lower_params(
+            method.params.reject { |p| _is_stateful_context_param(p) }
+          )
+          # Private methods can also call the intent intrinsics; capture
+          # their auto-injected witness params so a public method that
+          # inlines this private picks them up via the shared methodScope.
+          # The non-inlined ABI is still informative for callees.
+          method_ctx.method_scope.auto_injected_params.each do |p|
+            augmented << p
+          end
           result << IR::ANFMethod.new(
             name: method.name,
-            params: _lower_params(
-              method.params.reject { |p| _is_stateful_context_param(p) }
-            ),
+            params: augmented,
             body: method_ctx.bindings,
-            is_public: method.visibility == "public"
+            is_public: method.visibility == "public",
+            sighash_type: method_sighash
           )
         end
       end
@@ -273,6 +449,33 @@ module RunarCompiler
       result
     end
     private_class_method :_lower_methods
+
+    # True when a property carries the +/** @embedAlways */+ directive (#109).
+    # PropertyNode gained the +embed_always+ field with the directive; guard
+    # +respond_to?+ so ANF lowering still works on AST nodes from formats /
+    # code paths that predate the field.
+    def self._embed_always?(prop)
+      prop.respond_to?(:embed_always) && prop.embed_always == true
+    end
+    private_class_method :_embed_always?
+
+    # Issue #109: emit the DCE-surviving preservation pair for each
+    # +@embedAlways+ readonly field into the given (public) method context.
+    #
+    # Reproduces exactly what a hand-written +const _bind = this.field;+ lowers
+    # to: a +load_prop+ followed by a +load_const("@ref:<t>")+ alias. The alias
+    # marks the +load_prop+ as referenced (see collect_refs_from_value in
+    # constant_fold.rb / dce.rb), so dead-binding DCE keeps it; stack lowering
+    # then emits the field's constructor-slot placeholder and NIPs the unused
+    # value off the stack at method end. The field's bytes therefore remain in
+    # the deployed locking script for downstream recovery.
+    def self._emit_embed_always_preservation(ctx, fields)
+      fields.each do |field|
+        load_ref = ctx.emit(IR::ANFValue.new(kind: "load_prop").tap { |v| v.name = field.name })
+        ctx.emit_named("__embedAlways_#{field.name}", _make_load_const_string("@ref:#{load_ref}"))
+      end
+    end
+    private_class_method :_emit_embed_always_preservation
 
     # Check if a parameter is a StatefulContext parameter (should be filtered from ANF).
     def self._is_stateful_context_param(param)
@@ -293,6 +496,29 @@ module RunarCompiler
     # Lowering context
     # -------------------------------------------------------------------
 
+    # Per-method bookkeeping shared between a LoweringContext and all its
+    # sub-contexts (if/else branches, ternaries). The ABI-augmentation pass
+    # in _lower_methods reads auto_injected_params after the method body is
+    # lowered to append witness params to the final ABI. Mirrors the Go
+    # reference compiler's methodScopeT struct.
+    class MethodScope
+      attr_reader :auto_injected_params
+      attr_accessor :did_emit_hash_outputs_check
+
+      def initialize
+        @auto_injected_params = []
+        @auto_injected_set = {}
+        @did_emit_hash_outputs_check = false
+      end
+
+      # Idempotent: second call with the same name is a no-op.
+      def record_auto_injected_param(name, type)
+        return if @auto_injected_set[name]
+        @auto_injected_set[name] = true
+        @auto_injected_params << IR::ANFParam.new(name: name, type: type)
+      end
+    end
+
     # Manages temp variable generation and binding emission.
     #
     # Mirrors the Go lowerCtx struct exactly.
@@ -309,10 +535,114 @@ module RunarCompiler
         @contract = contract
         @local_names = Set.new
         @param_names = Set.new
+        # Method-scoped parameter types: name => type string. Populated once
+        # per method/constructor before its body is lowered, and shared into
+        # if/else sub-contexts. The byte-type analysis reads ONLY this hash so
+        # a local in one method never matches a same-named param of a DIFFERENT
+        # method. Mirrors the per-method scoping of the TS reference compiler.
+        @param_types = {}
         @add_output_refs = []
+        @add_data_output_refs = []
         @local_aliases = {}
         @local_byte_vars = Set.new
         @current_source_loc = nil
+        # Param substitution stack used when inlining a private method's body
+        # directly into this context. Mirrors TS / Go reference compilers'
+        # paramAliasStack — see _inline_private_method_call below for usage.
+        @param_alias_stack = {}
+        # Intent sub-covenant intrinsic bookkeeping (BSVM Phase 13). Shared
+        # with sub-contexts (if/else branches) so witness-param registrations
+        # inside a branch surface at the parent method's ABI. Mirrors the
+        # Go reference compiler's methodScopeT.
+        @method_scope = MethodScope.new
+        # Issue #123: non-default @sighash flag for this method (nil = default).
+        @sighash_flag = nil
+      end
+
+      # @return [MethodScope] shared per-method bookkeeping for intent intrinsics
+      attr_reader :method_scope
+
+      # Issue #123: the declared non-default +@sighash+ flag for the method being
+      # lowered, so a MANUAL +checkPreimage(pre)+ call binds under the same mode
+      # as the method's declared sighash. nil = default ALL|FORKID.
+      attr_accessor :sighash_flag
+
+      # Push an alias for a parameter name, used while inlining the body of
+      # a private method into this context: identifier references to that
+      # param resolve to the caller's arg ref instead of emitting load_param.
+      def push_param_alias(name, alias_ref)
+        (@param_alias_stack[name] ||= []) << alias_ref
+      end
+
+      def pop_param_alias(name)
+        stack = @param_alias_stack[name]
+        return if stack.nil? || stack.empty?
+        stack.pop
+        @param_alias_stack.delete(name) if stack.empty?
+      end
+
+      def get_param_alias(name)
+        stack = @param_alias_stack[name]
+        return nil if stack.nil? || stack.empty?
+        stack.last
+      end
+
+      # Look up a private method by name; returns the MethodNode or nil.
+      def get_private_method(name)
+        @contract.methods.find do |m|
+          m.name == name && m.name != "constructor" && m.visibility != "public"
+        end
+      end
+
+      # Whether a call to `name` should be ANF-inlined rather than emitted as
+      # a method_call. True iff `name` is a private method that (transitively)
+      # emits state outputs (addOutput / addRawOutput) or data outputs
+      # (addDataOutput). Those refs MUST appear in the caller's binding stream
+      # so they participate in the continuation hash; without ANF-level
+      # inlining they would live in a sibling ANF method and the public
+      # method's continuation hash would miss them.
+      #
+      # Mutation-only private helpers (no output intrinsics) are intentionally
+      # NOT inlined — state mutation flows through state continuity.
+      def should_inline_private?(name)
+        m = get_private_method(name)
+        return false if m.nil?
+        RunarCompiler::Frontend.send(:_method_has_add_output, m, @contract) ||
+          RunarCompiler::Frontend.send(:_method_has_add_data_output, m, @contract)
+      end
+
+      # Inline a private method's body directly into this context. Mirrors
+      # TS/Go/Rust/Python reference compilers' inlinePrivateMethodCall.
+      def inline_private_method_call(method_name, arg_refs)
+        method = get_private_method(method_name)
+        if method.nil?
+          this_ref = emit(Frontend._make_load_const_string("@this"))
+          return emit(IR::ANFValue.new(kind: "method_call").tap do |v|
+            v.object = this_ref
+            v.method = method_name
+            v.args = arg_refs
+          end)
+        end
+
+        aliased_params = []
+        n = [method.params.size, arg_refs.size].min
+        n.times do |i|
+          param_name = method.params[i].name
+          push_param_alias(param_name, arg_refs[i])
+          aliased_params << param_name
+        end
+
+        start_index = @bindings.size
+        lower_statements(method.body)
+        end_index = @bindings.size
+
+        aliased_params.reverse_each { |p| pop_param_alias(p) }
+
+        if end_index > start_index
+          @bindings[end_index - 1].name
+        else
+          emit(Frontend._make_load_const_string("@void"))
+        end
       end
 
       # Generate a fresh temp name.
@@ -358,6 +688,12 @@ module RunarCompiler
         @param_names.add(name)
       end
 
+      # Register the type of a parameter scoped to the current method/constructor.
+      # Read back by get_param_type for byte-type analysis.
+      def register_param_type(name, type)
+        @param_types[name] = type
+      end
+
       # @return [Boolean]
       def param?(name)
         @param_names.include?(name)
@@ -384,6 +720,18 @@ module RunarCompiler
         @add_output_refs
       end
 
+      # Track an addDataOutput reference -- distinct from state outputs.
+      # Data outputs are included in the continuation hash AFTER state
+      # outputs and BEFORE the change output.
+      def add_data_output_ref(ref)
+        @add_data_output_refs << ref
+      end
+
+      # @return [Array<String>]
+      def get_add_data_output_refs
+        @add_data_output_refs
+      end
+
       # Flatten addOutput args: if the second arg is an array literal,
       # expand its elements inline (e.g., [satoshis, [a, b, c]] -> [satoshis, a, b, c]).
       def _flatten_add_output_args(args)
@@ -399,18 +747,23 @@ module RunarCompiler
         @contract.properties.any? { |p| p.name == name }
       end
 
-      # Look up a parameter type by name across constructor and methods.
+      # Whether `name` is a private (non-public) method on the contract.
+      # Used to route bare-identifier calls through the method_call inlining
+      # path so Move's free-function helpers match TypeScript's `this.foo()`.
+      # @return [Boolean]
+      def _is_private_method(name)
+        @contract.methods.any? do |m|
+          m.name == name && m.name != "constructor" && m.visibility != "public"
+        end
+      end
+
+      # Look up a parameter type by name. METHOD-SCOPED: only the current
+      # method's (or constructor's) parameters are visible, so a local named
+      # `x` in one method never matches a same-named param of a DIFFERENT
+      # method. Populated via register_param_type before the body is lowered.
       # @return [String, nil]
       def get_param_type(name)
-        @contract.constructor.params.each do |p|
-          return Frontend._type_node_to_string(p.type) if p.name == name
-        end
-        @contract.methods.each do |m|
-          m.params.each do |p|
-            return Frontend._type_node_to_string(p.type) if p.name == name
-          end
-        end
-        nil
+        @param_types[name]
       end
 
       # Look up a property type by name.
@@ -437,8 +790,16 @@ module RunarCompiler
         sub.instance_variable_set(:@counter, @counter)
         sub.instance_variable_set(:@local_names, @local_names.dup)
         sub.instance_variable_set(:@param_names, @param_names.dup)
+        sub.instance_variable_set(:@param_types, @param_types.dup)
         sub.instance_variable_set(:@local_aliases, @local_aliases.dup)
         sub.instance_variable_set(:@local_byte_vars, @local_byte_vars.dup)
+        # Share the per-method intent-intrinsic bookkeeping so witness-param
+        # registrations and the once-per-method hashOutputs flag propagate up
+        # from if/else branches. Mirrors Go subContext.methodScope sharing.
+        sub.instance_variable_set(:@method_scope, @method_scope)
+        # Propagate the method's declared @sighash flag (issue #123) so a manual
+        # checkPreimage inside an if/else branch binds under the same mode.
+        sub.sighash_flag = @sighash_flag
         sub
       end
 
@@ -532,7 +893,14 @@ module RunarCompiler
         when Identifier
           _lower_identifier(expr)
         when PropertyAccessExpr
-          # this.txPreimage in StatefulSmartContract -> load_param
+          # Explicit this.x: a real contract property always wins, even when a
+          # method param shares the name (#130). Now that declared params are
+          # registered, the param? branch below must not shadow a stored property.
+          if property?(expr.property)
+            return emit(IR::ANFValue.new(kind: "load_prop").tap { |v| v.name = expr.property })
+          end
+          # this.txPreimage in StatefulSmartContract -> load_param (it's an
+          # implicit injected param, not a stored property).
           if param?(expr.property)
             return emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = expr.property })
           end
@@ -645,9 +1013,25 @@ module RunarCompiler
         end
         sync_counter(else_ctx)
 
-        # Propagate addOutput refs from sub-contexts
-        then_has_outputs = then_ctx.get_add_output_refs.any?
-        else_has_outputs = else_ctx.get_add_output_refs.any?
+        # 2026-04-30 audit finding F2: when a branch contains output
+        # intrinsics, append a cat-chain inside each branch so the
+        # branch's terminal value is the concat of its output bytes
+        # (state then data, in declaration order). Balances runtime
+        # stack effects across branches and lets the parent's
+        # continuation hash see one ref per if representing the
+        # chosen branch's full output set.
+        branch_has_state_output =
+          then_ctx.get_add_output_refs.any? ||
+          else_ctx.get_add_output_refs.any?
+        branch_has_outputs =
+          branch_has_state_output ||
+          then_ctx.get_add_data_output_refs.any? ||
+          else_ctx.get_add_data_output_refs.any?
+
+        if branch_has_outputs
+          Frontend._append_branch_output_concat(then_ctx)
+          Frontend._append_branch_output_concat(else_ctx)
+        end
 
         if_name = emit(IR::ANFValue.new(kind: "if").tap do |v|
           v.cond = cond_ref
@@ -655,8 +1039,24 @@ module RunarCompiler
           v.else_ = else_ctx.bindings
         end)
 
-        if then_has_outputs || else_has_outputs
-          add_output_ref(if_name)
+        if branch_has_outputs
+          # Register the if's value once with the parent's continuation
+          # tracker. CRITICAL: pick the right tracker. If either
+          # branch produces a STATE output, the parent must take the
+          # multi-output continuation path, so we register as a state
+          # output ref. If neither branch produces a state output and
+          # at least one branch produces a data output, we register
+          # as a DATA output ref so the parent keeps its single-output
+          # `computeStateOutput` continuation and the data-output
+          # bytes splice in BETWEEN the state output and the change
+          # output. Without this, a branch with only `addDataOutput`
+          # was incorrectly forced onto the multi-output path,
+          # dropping the canonical state continuation.
+          if branch_has_state_output
+            add_output_ref(if_name)
+          else
+            add_data_output_ref(if_name)
+          end
         end
 
         # If both branches end by reassigning the same local variable,
@@ -672,7 +1072,10 @@ module RunarCompiler
 
       # @param stmt [ForStmt]
       def _lower_for_statement(stmt)
-        count = Frontend._extract_loop_count(stmt)
+        # Resolve the loop's compile-time shape: start value, step direction,
+        # and iteration count. Non-zero starts and countdown loops are
+        # supported (#121) — on iteration i the iterator holds start + i*step.
+        shape = Frontend._extract_loop_shape(stmt)
 
         # Lower body into sub-context
         body_ctx = sub_context
@@ -680,9 +1083,11 @@ module RunarCompiler
         sync_counter(body_ctx)
 
         emit(IR::ANFValue.new(kind: "loop").tap do |v|
-          v.count = count
+          v.count = shape[:count]
           v.body = body_ctx.bindings
           v.iter_var = stmt.init ? stmt.init.name : ""
+          v.start = shape[:start]
+          v.step = shape[:step]
         end)
       end
 
@@ -693,6 +1098,12 @@ module RunarCompiler
 
         # 'this' is not a value in ANF
         return emit(Frontend._make_load_const_string("@this")) if name == "this"
+
+        # Param alias takes precedence over normal param lookup. Set when a
+        # private method's body is being inlined into this context — the
+        # private's param names map to the caller's arg refs.
+        param_alias = get_param_alias(name)
+        return param_alias unless param_alias.nil?
 
         # Check if it's a registered parameter (e.g. txPreimage)
         return emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = name }) if param?(name)
@@ -768,8 +1179,152 @@ module RunarCompiler
         if callee.is_a?(Identifier) && callee.name == "checkPreimage"
           if e.args.length >= 1
             preimage_ref = lower_expr_to_ref(e.args[0])
-            return emit(IR::ANFValue.new(kind: "check_preimage").tap { |v| v.preimage = preimage_ref })
+            return emit(IR::ANFValue.new(kind: "check_preimage").tap do |v|
+              v.preimage = preimage_ref
+              # Issue #123: honour the method's declared @sighash on manual calls.
+              v.sighash_flag = @sighash_flag unless @sighash_flag.nil?
+            end)
           end
+        end
+
+        # ---- Intent sub-covenant intrinsics (BSVM Phase 13) -------------
+        # See docs/cross-covenant-pattern.md. All three are pure frontend
+        # sugar that desugars to existing ANF primitives + auto-injected
+        # method params; no new ANF kinds, no Stack-IR codegen changes.
+
+        # extractPrevOutputScript(inputIndex_literal, expectedScriptHash) -> ByteString
+        # extractPrevOutputScript(inputIndex_literal, expectedScriptPrefixHash, prefixLen_literal) -> ByteString
+        #
+        # Witness-bridge sugar. Auto-injects a hidden method parameter named
+        # `_prevOutScript_<inputIndex>` (one per distinct index in the method
+        # body), emits a hash assertion, and returns the witness ref for
+        # caller substring extraction.
+        #
+        # 2-arg form: hash256(witness) === expectedScriptHash. Pins the full
+        #   prev-output script byte-for-byte.
+        # 3-arg form: hash256(substr(witness, 0, prefixLen)) ===
+        #   expectedScriptPrefixHash. Pins the policy prefix only, leaving the
+        #   pushdata tail free to vary. Required for the intent-template
+        #   matching use case where each successor intent UTXO has a unique
+        #   tail (BSVM Mode 3 permissionless step-in, Crit-2).
+        if callee.is_a?(Identifier) && callee.name == "extractPrevOutputScript"
+          if e.args.length != 2 && e.args.length != 3
+            return emit(Frontend._make_load_const_string(""))
+          end
+          idx_lit = e.args[0]
+          unless idx_lit.is_a?(BigIntLiteral) && !idx_lit.value.nil?
+            return emit(Frontend._make_load_const_string(""))
+          end
+          idx = idx_lit.value.to_i
+          param_name = "_prevOutScript_#{idx}"
+          @method_scope.record_auto_injected_param(param_name, "ByteString")
+          add_param(param_name)
+          register_param_type(param_name, "ByteString")
+          witness_ref = emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = param_name })
+          expected_hash_ref = lower_expr_to_ref(e.args[1])
+
+          # Determine which bytes to hash: full witness (2-arg) or prefix
+          # (3-arg). The substr happens at script-execution time; the literal
+          # prefixLen is baked into the emitted Stack-IR.
+          if e.args.length == 3
+            prefix_len_lit = e.args[2]
+            unless prefix_len_lit.is_a?(BigIntLiteral) && !prefix_len_lit.value.nil?
+              return emit(Frontend._make_load_const_string(""))
+            end
+            zero_ref = emit(Frontend._make_load_const_int(0))
+            prefix_len_ref = emit(Frontend._make_load_const_int(prefix_len_lit.value.to_i))
+            bytes_to_hash_ref = emit(Frontend._make_call("substr", [witness_ref, zero_ref, prefix_len_ref]))
+          else
+            bytes_to_hash_ref = witness_ref
+          end
+
+          actual_hash_ref = emit(Frontend._make_call("hash256", [bytes_to_hash_ref]))
+          eq_ref = emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
+            v.op = "==="
+            v.left = actual_hash_ref
+            v.right = expected_hash_ref
+            v.result_type = "bytes"
+          end)
+          emit(Frontend._make_assert(eq_ref))
+          return witness_ref
+        end
+
+        # requireOutputP2PKH(outputIndex_literal, pubkeyHash, amount) -> void.
+        # Asserts that the tx's output at outputIndex is a standard P2PKH
+        # paying `amount` satoshis to `pubkeyHash`. Auto-injects
+        # `_serialisedOutputs` (once per method) and emits
+        # hash256(serialisedOutputs) == extractOutputHash(txPreimage) the
+        # first time the intrinsic is called in a method body. Subsequent
+        # calls in the same method skip the hashOutputs check and emit only
+        # the per-output substring assertion.
+        #
+        # v1 assumes all outputs in the serialised set are exactly 34 bytes
+        # (8-byte LE amount ‖ 0x19 length ‖ 25-byte P2PKH script). Byte
+        # offset of output i is i*34.
+        if callee.is_a?(Identifier) && callee.name == "requireOutputP2PKH"
+          return emit(Frontend._make_load_const_string("")) if e.args.length != 3
+          idx_lit = e.args[0]
+          unless idx_lit.is_a?(BigIntLiteral) && !idx_lit.value.nil?
+            return emit(Frontend._make_load_const_string(""))
+          end
+          idx = idx_lit.value.to_i
+
+          @method_scope.record_auto_injected_param("_serialisedOutputs", "ByteString")
+          add_param("_serialisedOutputs")
+          register_param_type("_serialisedOutputs", "ByteString")
+
+          # Emit the hashOutputs(preimage) check exactly once per method.
+          unless @method_scope.did_emit_hash_outputs_check
+            @method_scope.did_emit_hash_outputs_check = true
+            serialised_ref = emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "_serialisedOutputs" })
+            actual_out_hash_ref = emit(Frontend._make_call("hash256", [serialised_ref]))
+            preimage_ref = emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
+            expected_out_hash_ref = emit(Frontend._make_call("extractOutputHash", [preimage_ref]))
+            hash_eq_ref = emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
+              v.op = "==="
+              v.left = actual_out_hash_ref
+              v.right = expected_out_hash_ref
+              v.result_type = "bytes"
+            end)
+            emit(Frontend._make_assert(hash_eq_ref))
+          end
+
+          # Lower the user-supplied args (pubkeyHash, amount).
+          pubkey_hash_ref = lower_expr_to_ref(e.args[1])
+          amount_ref = lower_expr_to_ref(e.args[2])
+
+          # Construct expected P2PKH output bytes:
+          #   <amount: 8-byte LE> ‖ 0x19 0x76 0xa9 0x14 ‖ <pubkeyHash: 20 bytes> ‖ 0x88 0xac
+          eight_ref = emit(Frontend._make_load_const_int(8))
+          amount_bytes_ref = emit(Frontend._make_call("num2bin", [amount_ref, eight_ref]))
+          # 0x19 0x76 0xa9 0x14 — script length byte + OP_DUP OP_HASH160 OP_PUSH20
+          prefix_ref = emit(Frontend._make_load_const_string("1976a914"))
+          # 0x88 0xac — OP_EQUALVERIFY OP_CHECKSIG
+          suffix_ref = emit(Frontend._make_load_const_string("88ac"))
+          cat1_ref = emit(Frontend._make_call("cat", [amount_bytes_ref, prefix_ref]))
+          cat2_ref = emit(Frontend._make_call("cat", [cat1_ref, pubkey_hash_ref]))
+          expected_output_ref = emit(Frontend._make_call("cat", [cat2_ref, suffix_ref]))
+
+          # Substring extract at idx*34 length 34, assert equal.
+          serialised_ref2 = emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "_serialisedOutputs" })
+          offset_ref = emit(Frontend._make_load_const_int(idx * 34))
+          length_ref = emit(Frontend._make_load_const_int(34))
+          extracted_ref = emit(Frontend._make_call("substr", [serialised_ref2, offset_ref, length_ref]))
+          out_eq_ref = emit(IR::ANFValue.new(kind: "bin_op").tap do |v|
+            v.op = "==="
+            v.left = extracted_ref
+            v.right = expected_output_ref
+            v.result_type = "bytes"
+          end)
+          return emit(Frontend._make_assert(out_eq_ref))
+        end
+
+        # currentBlockHeight() -> bigint. Pure source-level desugar to
+        # extractLocktime(this.txPreimage). Only valid in StatefulSmartContract
+        # methods (typecheck enforces).
+        if callee.is_a?(Identifier) && callee.name == "currentBlockHeight"
+          preimage_ref = emit(IR::ANFValue.new(kind: "load_param").tap { |v| v.name = "txPreimage" })
+          return emit(Frontend._make_call("extractLocktime", [preimage_ref]))
         end
 
         # this.addOutput(satoshis, val1, val2, ...) via PropertyAccessExpr
@@ -797,6 +1352,21 @@ module RunarCompiler
             v.script_bytes = script_bytes_ref
           end)
           add_output_ref(ref)
+          return ref
+        end
+
+        # this.addDataOutput(satoshis, scriptBytes) via PropertyAccessExpr. Like
+        # addRawOutput in wire shape, but included in the continuation hash
+        # AFTER state outputs and BEFORE the change output.
+        if callee.is_a?(PropertyAccessExpr) && callee.property == "addDataOutput"
+          arg_refs = _lower_args(e.args)
+          satoshis = arg_refs[0]
+          script_bytes_ref = arg_refs[1]
+          ref = emit(IR::ANFValue.new(kind: "add_data_output").tap do |v|
+            v.satoshis = satoshis
+            v.script_bytes = script_bytes_ref
+          end)
+          add_data_output_ref(ref)
           return ref
         end
 
@@ -834,6 +1404,22 @@ module RunarCompiler
           return ref
         end
 
+        # this.addDataOutput(satoshis, scriptBytes) via MemberExpr
+        if callee.is_a?(MemberExpr) &&
+           callee.object.is_a?(Identifier) &&
+           callee.object.name == "this" &&
+           callee.property == "addDataOutput"
+          arg_refs = _lower_args(e.args)
+          satoshis = arg_refs[0]
+          script_bytes_ref = arg_refs[1]
+          ref = emit(IR::ANFValue.new(kind: "add_data_output").tap do |v|
+            v.satoshis = satoshis
+            v.script_bytes = script_bytes_ref
+          end)
+          add_data_output_ref(ref)
+          return ref
+        end
+
         # this.getStateScript() via PropertyAccessExpr
         if callee.is_a?(PropertyAccessExpr) && callee.property == "getStateScript"
           return emit(IR::ANFValue.new(kind: "get_state_script"))
@@ -850,6 +1436,9 @@ module RunarCompiler
         # this.method(...) via PropertyAccessExpr
         if callee.is_a?(PropertyAccessExpr)
           arg_refs = _lower_args(e.args)
+          if should_inline_private?(callee.property)
+            return inline_private_method_call(callee.property, arg_refs)
+          end
           this_ref = emit(Frontend._make_load_const_string("@this"))
           return emit(IR::ANFValue.new(kind: "method_call").tap do |v|
             v.object = this_ref
@@ -863,6 +1452,9 @@ module RunarCompiler
            callee.object.is_a?(Identifier) &&
            callee.object.name == "this"
           arg_refs = _lower_args(e.args)
+          if should_inline_private?(callee.property)
+            return inline_private_method_call(callee.property, arg_refs)
+          end
           this_ref = emit(Frontend._make_load_const_string("@this"))
           return emit(IR::ANFValue.new(kind: "method_call").tap do |v|
             v.object = this_ref
@@ -871,9 +1463,51 @@ module RunarCompiler
           end)
         end
 
+        # asm({...}) compiler intrinsic -- the parser has already normalised
+        # the object-literal argument into three positional args
+        # (body, in_arity, out_arity). Lower it to a single opaque raw_script
+        # ANF binding; the hex body passes through unchanged. Diagnostics for
+        # malformed args were already pushed by the validator -- here we
+        # defensively coerce missing values to safe defaults.
+        if callee.is_a?(Identifier) && callee.name == "asm"
+          bytes = ""
+          in_arity = 0
+          out_arity = 1
+          if e.args.length >= 1 && e.args[0].is_a?(ByteStringLiteral)
+            bytes = e.args[0].value
+          end
+          if e.args.length >= 2 && e.args[1].is_a?(BigIntLiteral)
+            in_arity = e.args[1].value.to_i
+          end
+          if e.args.length >= 3 && e.args[2].is_a?(BigIntLiteral)
+            out_arity = e.args[2].value.to_i
+          end
+          return emit(IR::ANFValue.new(kind: "raw_script").tap do |v|
+            v.bytes = bytes
+            v.in_arity = in_arity
+            v.out_arity = out_arity
+          end)
+        end
+
         # Direct function call: sha256(x), checkSig(sig, pk), etc.
         if callee.is_a?(Identifier)
           arg_refs = _lower_args(e.args)
+          # Bare identifier calls that match a private method on the contract
+          # (e.g. Move's `require_owner(contract, sig)` which the parser strips
+          # to `requireOwner(sig)`) must be routed through the same inlining
+          # path as `this.requireOwner(sig)` so downstream stack lowering can
+          # inline the body. Keeps .runar.move in sync with .runar.ts.
+          if _is_private_method(callee.name)
+            if should_inline_private?(callee.name)
+              return inline_private_method_call(callee.name, arg_refs)
+            end
+            this_ref = emit(Frontend._make_load_const_string("@this"))
+            return emit(IR::ANFValue.new(kind: "method_call").tap do |v|
+              v.object = this_ref
+              v.method = callee.name
+              v.args = arg_refs
+            end)
+          end
           return emit(Frontend._make_call(callee.name, arg_refs))
         end
 
@@ -964,8 +1598,25 @@ module RunarCompiler
 
     # @param val [Integer]
     # @return [IR::ANFValue]
+    INT64_MAX_LOAD_CONST = 9_223_372_036_854_775_807
+    INT64_MIN_LOAD_CONST = -9_223_372_036_854_775_808
+
     def self._make_load_const_int(val)
-      raw = JSON.generate(val)
+      # JSON numbers in JavaScript are IEEE-754 doubles (~53 bits of integer
+      # precision), and Go's encoding/json silently degrades JSON numbers
+      # above 2^53 into scientific notation. Emit values that exceed the
+      # int64 range as a quoted decimal string with the canonical JS BigInt
+      # `n` suffix so 256-bit constants (e.g. the secp256k1 group order
+      # used in schnorr-zkp's s-bound assert) survive the JSON round-trip
+      # losslessly AND so consuming IR decoders can distinguish a decimal-
+      # encoded big integer from a hex-encoded ByteString literal. Mirrors
+      # compilers/python/runar_compiler/frontend/anf_lower.py::_make_load_const_int
+      # and compilers/go/frontend/anf_lower.go::makeLoadConstInt.
+      raw = if val > INT64_MAX_LOAD_CONST || val < INT64_MIN_LOAD_CONST
+              JSON.generate("#{val}n")
+            else
+              JSON.generate(val)
+            end
       IR::ANFValue.new(kind: "load_const").tap do |v|
         v.raw_value = raw
         v.const_big_int = val
@@ -1003,6 +1654,26 @@ module RunarCompiler
       end
     end
 
+    # Concatenate a branch's output refs (state then data, in
+    # declaration order) into a single bytes-ref appended to the
+    # branch's bindings. If the branch has no outputs, emits an empty
+    # +load_const+ so the branch still leaves one item on the stack —
+    # required to balance the if's branch shapes when the OTHER
+    # branch has outputs. 2026-04-30 audit finding F2 fix.
+    def self._append_branch_output_concat(branch_ctx)
+      all_refs = branch_ctx.get_add_output_refs.dup
+      all_refs.concat(branch_ctx.get_add_data_output_refs)
+      if all_refs.empty?
+        return branch_ctx.emit(_make_load_const_string(""))
+      end
+      return all_refs[0] if all_refs.length == 1
+      accumulated = all_refs[0]
+      all_refs[1..].each do |ref|
+        accumulated = branch_ctx.emit(_make_call("cat", [accumulated, ref]))
+      end
+      accumulated
+    end
+
     # @param value_ref [String]
     # @return [IR::ANFValue]
     def self._make_assert(value_ref)
@@ -1010,6 +1681,22 @@ module RunarCompiler
       IR::ANFValue.new(kind: "assert").tap do |v|
         v.raw_value = raw
         v.value_ref = value_ref
+      end
+    end
+
+    # Build the auto-injected stateful-continuation hash-equality assert.
+    # Carries +is_auto_injected_state_check = true+ so off-chain SDK
+    # interpreters can skip the equality check via a direct marker lookup
+    # instead of structural / taint heuristics that misfire on developer
+    # code with identical IR shape (covenant rules).
+    # @param value_ref [String]
+    # @return [IR::ANFValue]
+    def self._make_auto_injected_state_check_assert(value_ref)
+      raw = JSON.generate(value_ref)
+      IR::ANFValue.new(kind: "assert").tap do |v|
+        v.raw_value = raw
+        v.value_ref = value_ref
+        v.is_auto_injected_state_check = true
       end
     end
 
@@ -1030,29 +1717,32 @@ module RunarCompiler
     # -------------------------------------------------------------------
 
     # Determine whether a method mutates any mutable (non-readonly) property.
-    # Conservative: if ANY code path can mutate state, returns true.
+    # Conservative: if ANY code path can mutate state, returns true. Walks
+    # the private-method call graph so a public method that delegates the
+    # mutation to a private helper is correctly classified — fix for the
+    # 2026-04-30 audit's F1 finding.
     def self._method_mutates_state(method, contract)
       mutable_props = Set.new
       contract.properties.each do |p|
         mutable_props.add(p.name) unless p.readonly
       end
       return false if mutable_props.empty?
-      _body_mutates_state(method.body, mutable_props)
+      _body_mutates_state(method.body, mutable_props, contract, [].to_set)
     end
     private_class_method :_method_mutates_state
 
     # @param stmts [Array<Statement>]
     # @param mutable_props [Set<String>]
+    # @param contract [ContractNode]
+    # @param seen [Set<String>] private methods currently on the recursion stack
     # @return [Boolean]
-    def self._body_mutates_state(stmts, mutable_props)
-      stmts.any? { |stmt| _stmt_mutates_state(stmt, mutable_props) }
+    def self._body_mutates_state(stmts, mutable_props, contract, seen)
+      stmts.any? { |stmt| _stmt_mutates_state(stmt, mutable_props, contract, seen) }
     end
     private_class_method :_body_mutates_state
 
-    # @param stmt [Statement]
-    # @param mutable_props [Set<String>]
     # @return [Boolean]
-    def self._stmt_mutates_state(stmt, mutable_props)
+    def self._stmt_mutates_state(stmt, mutable_props, contract, seen)
       if stmt.is_a?(AssignmentStmt)
         if stmt.target.is_a?(PropertyAccessExpr)
           return mutable_props.include?(stmt.target.property)
@@ -1061,32 +1751,34 @@ module RunarCompiler
       end
 
       if stmt.is_a?(ExpressionStmt)
-        return _expr_mutates_state(stmt.expr, mutable_props)
+        return _expr_mutates_state(stmt.expr, mutable_props, contract, seen)
       end
 
       if stmt.is_a?(IfStmt)
-        return true if _body_mutates_state(stmt.then, mutable_props)
+        return true if _body_mutates_state(stmt.then, mutable_props, contract, seen)
         if stmt.else_ && stmt.else_.any?
-          return true if _body_mutates_state(stmt.else_, mutable_props)
+          return true if _body_mutates_state(stmt.else_, mutable_props, contract, seen)
         end
         return false
       end
 
       if stmt.is_a?(ForStmt)
-        if stmt.update && _stmt_mutates_state(stmt.update, mutable_props)
+        if stmt.update && _stmt_mutates_state(stmt.update, mutable_props, contract, seen)
           return true
         end
-        return _body_mutates_state(stmt.body, mutable_props)
+        return _body_mutates_state(stmt.body, mutable_props, contract, seen)
+      end
+
+      if stmt.is_a?(ReturnStmt) && stmt.value
+        return _expr_mutates_state(stmt.value, mutable_props, contract, seen)
       end
 
       false
     end
     private_class_method :_stmt_mutates_state
 
-    # @param expr [Expression, nil]
-    # @param mutable_props [Set<String>]
     # @return [Boolean]
-    def self._expr_mutates_state(expr, mutable_props)
+    def self._expr_mutates_state(expr, mutable_props, contract, seen)
       return false if expr.nil?
       if expr.is_a?(IncrementExpr)
         if expr.operand.is_a?(PropertyAccessExpr)
@@ -1098,50 +1790,79 @@ module RunarCompiler
           return mutable_props.include?(expr.operand.property)
         end
       end
+      if expr.is_a?(CallExpr)
+        target = _resolve_private_method(expr.callee, contract)
+        if target && !seen.include?(target.name)
+          new_seen = seen.dup.add(target.name)
+          return true if _body_mutates_state(target.body, mutable_props, contract, new_seen)
+        end
+      end
       false
     end
     private_class_method :_expr_mutates_state
+
+    # Resolve a CallExpr callee to a private method on the contract, or
+    # nil if the callee is a builtin / external / unresolved.
+    def self._resolve_private_method(callee, contract)
+      return nil if callee.nil?
+      name =
+        if callee.is_a?(PropertyAccessExpr)
+          callee.property
+        elsif callee.is_a?(MemberExpr)
+          callee.property
+        elsif callee.is_a?(Identifier)
+          callee.name
+        end
+      return nil if name.nil?
+      contract.methods.find { |m| m.name == name && m.visibility != "public" }
+    end
+    private_class_method :_resolve_private_method
 
     # -------------------------------------------------------------------
     # addOutput detection for determining change output necessity
     # -------------------------------------------------------------------
 
-    # Check if a method body contains any this.addOutput() calls.
-    def self._method_has_add_output(method)
-      _body_has_add_output(method.body)
+    # Check if a method body contains any this.addOutput() calls,
+    # including those reachable via private-helper calls.
+    def self._method_has_add_output(method, contract)
+      _body_has_add_output(method.body, contract, [].to_set)
     end
     private_class_method :_method_has_add_output
 
-    # @param stmts [Array<Statement>]
     # @return [Boolean]
-    def self._body_has_add_output(stmts)
-      stmts.any? { |stmt| _stmt_has_add_output(stmt) }
+    def self._body_has_add_output(stmts, contract, seen)
+      stmts.any? { |stmt| _stmt_has_add_output(stmt, contract, seen) }
     end
     private_class_method :_body_has_add_output
 
-    # @param stmt [Statement]
     # @return [Boolean]
-    def self._stmt_has_add_output(stmt)
+    def self._stmt_has_add_output(stmt, contract, seen)
       if stmt.is_a?(ExpressionStmt)
-        return _expr_has_add_output(stmt.expr)
+        return _expr_has_add_output(stmt.expr, contract, seen)
       end
       if stmt.is_a?(IfStmt)
-        return true if _body_has_add_output(stmt.then)
+        return true if _body_has_add_output(stmt.then, contract, seen)
         if stmt.else_ && stmt.else_.any?
-          return true if _body_has_add_output(stmt.else_)
+          return true if _body_has_add_output(stmt.else_, contract, seen)
         end
         return false
       end
       if stmt.is_a?(ForStmt)
-        return _body_has_add_output(stmt.body)
+        return _body_has_add_output(stmt.body, contract, seen)
+      end
+      # Ruby's parser_ruby promotes a private method's trailing
+      # ExpressionStmt to a ReturnStmt for implicit-return semantics, so
+      # `add_output(...)` calls in helper bodies wind up here. Walk the
+      # return value the same way an ExpressionStmt would be walked.
+      if stmt.is_a?(ReturnStmt) && stmt.value
+        return _expr_has_add_output(stmt.value, contract, seen)
       end
       false
     end
     private_class_method :_stmt_has_add_output
 
-    # @param expr [Expression, nil]
     # @return [Boolean]
-    def self._expr_has_add_output(expr)
+    def self._expr_has_add_output(expr, contract, seen)
       return false if expr.nil?
       if expr.is_a?(CallExpr)
         callee = expr.callee
@@ -1154,41 +1875,154 @@ module RunarCompiler
            %w[addOutput addRawOutput].include?(callee.property)
           return true
         end
+        target = _resolve_private_method(callee, contract)
+        if target && !seen.include?(target.name)
+          new_seen = seen.dup.add(target.name)
+          return true if _body_has_add_output(target.body, contract, new_seen)
+        end
       end
       false
     end
     private_class_method :_expr_has_add_output
 
     # -------------------------------------------------------------------
-    # Loop count extraction
+    # addDataOutput detection (distinct from state outputs)
     # -------------------------------------------------------------------
 
-    # @param stmt [ForStmt]
-    # @return [Integer]
-    def self._extract_loop_count(stmt)
-      start_val = _extract_bigint_value(stmt.init&.init)
+    # Check if a method body contains any this.addDataOutput() calls,
+    # including those reachable via private-helper calls.
+    def self._method_has_add_data_output(method, contract)
+      _body_has_add_data_output(method.body, contract, [].to_set)
+    end
+    private_class_method :_method_has_add_data_output
 
-      if stmt.condition.is_a?(BinaryExpr)
-        bound_val = _extract_bigint_value(stmt.condition.right)
+    # @return [Boolean]
+    def self._body_has_add_data_output(stmts, contract, seen)
+      stmts.any? { |stmt| _stmt_has_add_data_output(stmt, contract, seen) }
+    end
+    private_class_method :_body_has_add_data_output
 
-        if start_val && bound_val
-          start = start_val
-          bound = bound_val
-          op = stmt.condition.op
-          return [0, bound - start].max if op == "<"
-          return [0, bound - start + 1].max if op == "<="
-          return [0, start - bound].max if op == ">"
-          return [0, start - bound + 1].max if op == ">="
+    # @return [Boolean]
+    def self._stmt_has_add_data_output(stmt, contract, seen)
+      if stmt.is_a?(ExpressionStmt)
+        return _expr_has_add_data_output(stmt.expr, contract, seen)
+      end
+      if stmt.is_a?(IfStmt)
+        return true if _body_has_add_data_output(stmt.then, contract, seen)
+        if stmt.else_ && stmt.else_.any?
+          return true if _body_has_add_data_output(stmt.else_, contract, seen)
         end
+        return false
+      end
+      if stmt.is_a?(ForStmt)
+        return _body_has_add_data_output(stmt.body, contract, seen)
+      end
+      if stmt.is_a?(ReturnStmt) && stmt.value
+        return _expr_has_add_data_output(stmt.value, contract, seen)
+      end
+      false
+    end
+    private_class_method :_stmt_has_add_data_output
 
-        if bound_val
-          op = stmt.condition.op
-          return bound_val if op == "<"
-          return bound_val + 1 if op == "<="
+    # @return [Boolean]
+    def self._expr_has_add_data_output(expr, contract, seen)
+      return false if expr.nil?
+      if expr.is_a?(CallExpr)
+        callee = expr.callee
+        if callee.is_a?(PropertyAccessExpr) && callee.property == "addDataOutput"
+          return true
+        end
+        if callee.is_a?(MemberExpr) &&
+           callee.object.is_a?(Identifier) &&
+           callee.object.name == "this" &&
+           callee.property == "addDataOutput"
+          return true
+        end
+        target = _resolve_private_method(callee, contract)
+        if target && !seen.include?(target.name)
+          new_seen = seen.dup.add(target.name)
+          return true if _body_has_add_data_output(target.body, contract, new_seen)
+        end
+      end
+      false
+    end
+    private_class_method :_expr_has_add_data_output
+
+    # -------------------------------------------------------------------
+    # Loop shape extraction (#121)
+    # -------------------------------------------------------------------
+
+    # Resolve a for-statement's compile-time loop shape: start value, step
+    # direction, and iteration count. Supports counting-up and counting-down
+    # loops:
+    #   for (let i = 0n; i < 10n; i++)  -> start 0, step +1, count 10
+    #   for (let i = 1n; i <= 3n; i++)  -> start 1, step +1, count 3
+    #   for (let i = 3n; i > 0n; i--)   -> start 3, step -1, count 3
+    #   for (let i = 3n; i >= 1n; i--)  -> start 3, step -1, count 3
+    #
+    # The loop is unrolled +count+ times; on iteration +i+ the iterator holds
+    # +start + i*step+. Start and bound must be compile-time integer literals.
+    #
+    # @param stmt [ForStmt]
+    # @return [Hash] { start: Integer, step: Integer, count: Integer }
+    def self._extract_loop_shape(stmt)
+      start = _extract_bigint_value(stmt.init&.init)
+      if start.nil?
+        raise "Cannot determine loop start at compile time. " \
+              "For-loop iterators must start at an integer literal."
+      end
+
+      unless stmt.condition.is_a?(BinaryExpr)
+        raise "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+      end
+      op = stmt.condition.op
+      bound = _extract_bigint_value(stmt.condition.right)
+      if bound.nil?
+        raise "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+      end
+
+      step = _extract_loop_step(stmt)
+
+      # Count = number of iterations before the condition first turns false.
+      if step == 1
+        case op
+        when "<"  then count = bound - start
+        when "<=" then count = bound - start + 1
+        else
+          raise "For loop counting up (i++) must use '<' or '<=' (got '#{op}')."
+        end
+      else
+        case op
+        when ">"  then count = start - bound
+        when ">=" then count = start - bound + 1
+        else
+          raise "For loop counting down (i--) must use '>' or '>=' (got '#{op}')."
         end
       end
 
-      0
+      { start: start, step: step, count: [0, count].max }
+    end
+
+    # Determine the iterator step direction (+1 / -1) from the for-statement's
+    # update clause, falling back to the condition direction. Only unit steps
+    # are supported.
+    #
+    # @param stmt [ForStmt]
+    # @return [Integer] +1 or -1
+    def self._extract_loop_step(stmt)
+      update = stmt.update
+      if update.is_a?(ExpressionStmt)
+        e = update.expr
+        return 1 if e.is_a?(IncrementExpr)
+        return -1 if e.is_a?(DecrementExpr)
+      end
+      # Fall back to the comparison direction for other unit-step spellings
+      # (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
+      if stmt.condition.is_a?(BinaryExpr)
+        op = stmt.condition.op
+        return -1 if op == ">" || op == ">="
+      end
+      1
     end
 
     # @param expr [Expression, nil]
@@ -1434,8 +2268,26 @@ module RunarCompiler
         new_v.satoshis = r.call(value.satoshis)
         new_v.script_bytes = r.call(value.script_bytes)
         new_v
-      else
+      when "add_data_output"
+        new_v = _clone_anf_value(value)
+        new_v.satoshis = r.call(value.satoshis)
+        new_v.script_bytes = r.call(value.script_bytes)
+        new_v
+      when "loop"
+        # No top-level refs to remap (body is walked by the caller).
         value
+      when "array_literal"
+        new_v = _clone_anf_value(value)
+        new_v.elements = (value.elements || []).map { |e| r.call(e) }
+        new_v
+      when "raw_script"
+        # Opaque byte span -- no SSA operand refs to remap.
+        value
+      else
+        # Exhaustiveness guard. If a new ANFValue variant is added without
+        # wiring it through this dispatch, fail loudly so the regression is
+        # caught at the first call site instead of corrupting downstream IR.
+        raise ::RunarCompiler::IR::UnknownANFKindError.new(value.kind, "anf-lower.remapValueRefs")
       end
     end
     private_class_method :_remap_value_refs
@@ -1464,12 +2316,17 @@ module RunarCompiler
       new_v.count = v.count
       new_v.iter_var = v.iter_var
       new_v.body = v.body
+      new_v.start = v.start
+      new_v.step = v.step
       new_v.value_ref = v.value_ref
       new_v.preimage = v.preimage
       new_v.satoshis = v.satoshis
       new_v.state_values = v.state_values
       new_v.script_bytes = v.script_bytes
       new_v.elements = v.elements
+      new_v.bytes = v.bytes
+      new_v.in_arity = v.in_arity
+      new_v.out_arity = v.out_arity
       new_v
     end
     private_class_method :_clone_anf_value

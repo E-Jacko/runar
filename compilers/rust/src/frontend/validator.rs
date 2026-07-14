@@ -39,6 +39,18 @@ pub fn validate(contract: &ContractNode) -> ValidationResult {
     validate_methods(contract, &mut errors, &mut warnings);
     check_no_recursion(contract, &mut errors);
 
+    // Issue #123: reject preimage-field reads / output bindings that are
+    // unsound under a method's declared @sighash mode (security core). This
+    // pass emits both errors (unsound usages) and warnings (e.g. an explicit
+    // single-output SINGLE covenant whose same-index value cannot be pinned
+    // statically), so route each diagnostic to the matching bucket.
+    for d in super::sighash_validate::validate_sighash_usage(contract) {
+        match d.severity {
+            super::diagnostic::Severity::Warning => warnings.push(d),
+            _ => errors.push(d),
+        }
+    }
+
     ValidationResult { errors, warnings }
 }
 
@@ -59,7 +71,9 @@ fn is_valid_property_primitive(name: &PrimitiveTypeName) -> bool {
         | PrimitiveTypeName::SigHashPreimage
         | PrimitiveTypeName::RabinSig
         | PrimitiveTypeName::RabinPubKey
-        | PrimitiveTypeName::Point => true,
+        | PrimitiveTypeName::Point
+        | PrimitiveTypeName::P256Point
+        | PrimitiveTypeName::P384Point => true,
         PrimitiveTypeName::Void => false,
     }
 }
@@ -80,13 +94,14 @@ fn validate_properties(contract: &ContractNode, errors: &mut Vec<Diagnostic>, wa
         }
     }
 
-    // SmartContract requires all properties to be readonly
-    if contract.parent_class == "SmartContract" {
+    // SmartContract (and the asm-escape-hatch UnsafeSmartContract) require all
+    // properties to be readonly.
+    if contract.parent_class == "SmartContract" || contract.parent_class == "UnsafeSmartContract" {
         for prop in &contract.properties {
             if !prop.readonly {
                 errors.push(Diagnostic::error(format!(
-                    "property '{}' in SmartContract must be readonly. Use StatefulSmartContract for mutable state.",
-                    prop.name
+                    "property '{}' in {} must be readonly. Use StatefulSmartContract for mutable state.",
+                    prop.name, contract.parent_class
                 ), Some(prop.source_location.clone())));
             }
         }
@@ -118,7 +133,7 @@ fn validate_property_type(type_node: &TypeNode, loc: &SourceLocation, errors: &m
         }
         TypeNode::Custom(name) => {
             errors.push(Diagnostic::error(format!(
-                "Unsupported type '{}' in property declaration. Use one of: bigint, boolean, ByteString, PubKey, Sig, Sha256, Ripemd160, Addr, SigHashPreimage, RabinSig, RabinPubKey, or FixedArray<T, N>",
+                "Unsupported type '{}' in property declaration. Use one of: bigint, boolean, ByteString, PubKey, Sig, Sha256, Ripemd160, Addr, SigHashPreimage, RabinSig, RabinPubKey, Point, P256Point, P384Point, or FixedArray<T, N>",
                 name
             ), Some(loc.clone())));
         }
@@ -180,6 +195,15 @@ fn validate_constructor(contract: &ContractNode, errors: &mut Vec<Diagnostic>) {
                 ), Some(ctor.source_location.clone())));
             }
         }
+        if matches!(param.param_type, TypeNode::FixedArray { .. }) {
+            errors.push(Diagnostic::error(
+                format!(
+                    "Constructor parameter '{}' cannot be a FixedArray. Use initialized properties or pass each element as a separate parameter.",
+                    param.name
+                ),
+                Some(ctor.source_location.clone()),
+            ));
+        }
     }
 
     // Validate statements in constructor body
@@ -204,12 +228,32 @@ fn is_super_call(stmt: &Statement) -> bool {
 // ---------------------------------------------------------------------------
 
 fn validate_methods(contract: &ContractNode, errors: &mut Vec<Diagnostic>, warnings: &mut Vec<Diagnostic>) {
+    // A contract with no public methods has no spending entry points and
+    // compiles to an empty script — never what the author meant (usually a
+    // missing `public` modifier; methods default to private).
+    if !contract.methods.iter().any(|m| m.visibility == Visibility::Public) {
+        errors.push(Diagnostic::error(
+            format!(
+                "Contract '{}' has no public methods — no spending entry points; add 'public' to at least one method",
+                contract.name
+            ),
+            None,
+        ));
+    }
+
     for method in &contract.methods {
         validate_method(method, contract, errors);
 
         // V24, V25: Warn when StatefulSmartContract public method calls checkPreimage or getStateScript explicitly
         if contract.parent_class == "StatefulSmartContract" && method.visibility == Visibility::Public {
             warn_manual_preimage_usage(method, warnings);
+        }
+
+        // #131: warn when a public method gates on extractLocktime but never
+        // asserts the spending tx is non-final (extractSequence < 0xffffffff).
+        // Advisory only.
+        if method.visibility == Visibility::Public {
+            warn_locktime_without_sequence_guard(method, contract, warnings);
         }
     }
 }
@@ -225,6 +269,15 @@ fn validate_method(method: &MethodNode, contract: &ContractNode, errors: &mut Ve
                 ), Some(method.source_location.clone())));
             }
         }
+        if matches!(param.param_type, TypeNode::FixedArray { .. }) {
+            errors.push(Diagnostic::error(
+                format!(
+                    "Parameter '{}' in method '{}' cannot be a FixedArray. Arrays are only allowed as contract properties.",
+                    param.name, method.name
+                ),
+                Some(method.source_location.clone()),
+            ));
+        }
     }
 
     // Public methods must end with an assert() call (unless StatefulSmartContract,
@@ -238,10 +291,191 @@ fn validate_method(method: &MethodNode, contract: &ContractNode, errors: &mut Ve
         }
     }
 
+    // UnsafeSmartContract public methods must end with either an assert() call
+    // or a terminal asm({..., out_arity: 1}) — either way the script has to
+    // leave a truthy value on the stack.
+    if method.visibility == Visibility::Public && contract.parent_class == "UnsafeSmartContract" {
+        if !ends_with_assert(&method.body) && !ends_with_terminal_asm(&method.body) {
+            errors.push(Diagnostic::error(format!(
+                "public method '{}' must end with an assert() call or a terminal asm({{...}}) with out_arity 1",
+                method.name
+            ), Some(method.source_location.clone())));
+        }
+    }
+
+    // Gate asm({...}) calls on UnsafeSmartContract and check the structural args.
+    validate_asm_usage(method, contract, errors);
+
     // Validate all statements in method body
     for stmt in &method.body {
         validate_statement(stmt, errors);
     }
+}
+
+/// Reports whether `expr` is a call to the `asm` compiler intrinsic.
+fn is_asm_call(expr: &Expression) -> bool {
+    if let Expression::CallExpr { callee, .. } = expr {
+        if let Expression::Identifier { name } = callee.as_ref() {
+            return name == "asm";
+        }
+    }
+    false
+}
+
+/// Reports whether the last statement of `body` is an asm({...}) call with the
+/// parser-normalised positional args (body, in_arity, out_arity) and an
+/// out_arity literal equal to 1.
+///
+/// If/else branches that both terminate in a terminal asm (or assert) also
+/// count, mirroring the asserts-on-both-branches rule.
+fn ends_with_terminal_asm(body: &[Statement]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    let last = &body[body.len() - 1];
+
+    if let Statement::ExpressionStatement { expression, .. } = last {
+        if !is_asm_call(expression) {
+            return false;
+        }
+        if let Expression::CallExpr { args, .. } = expression {
+            // The parser always rewrites asm({...}) into positional
+            // (body, in_arity, out_arity).
+            if args.len() == 3 {
+                if let Expression::BigIntLiteral { value } = &args[2] {
+                    use num_traits::One;
+                    return value.is_one();
+                }
+            }
+        }
+        return false;
+    }
+
+    if let Statement::IfStatement {
+        then_branch,
+        else_branch,
+        ..
+    } = last
+    {
+        let then_ends = ends_with_terminal_asm(then_branch) || ends_with_assert(then_branch);
+        let else_ends = else_branch
+            .as_ref()
+            .map_or(false, |e| ends_with_terminal_asm(e) || ends_with_assert(e));
+        return then_ends && else_ends;
+    }
+
+    false
+}
+
+/// Walks a method body and validates every asm({...}) call:
+///
+///   - Reject any asm() outside an UnsafeSmartContract.
+///   - Confirm the parser-normalised arg shape: (body, in_arity, out_arity)
+///     where body is a ByteString literal with even-length hex and the arities
+///     are non-negative bigint literals.
+///   - Expression-form asm<T>({...}) must have out_arity 1.
+///
+/// The parser already pushes most hex diagnostics; this pass is the back-stop
+/// that runs even when the parser shape is well-formed and is the only layer
+/// that knows about the contract's parentClass.
+fn validate_asm_usage(
+    method: &MethodNode,
+    contract: &ContractNode,
+    errors: &mut Vec<Diagnostic>,
+) {
+    walk_expressions_in_body(&method.body, &mut |expr| {
+        if !is_asm_call(expr) {
+            return;
+        }
+        let (args, asm_return_type) = match expr {
+            Expression::CallExpr {
+                args,
+                asm_return_type,
+                ..
+            } => (args, asm_return_type),
+            _ => return,
+        };
+
+        if contract.parent_class != "UnsafeSmartContract" {
+            errors.push(Diagnostic::error(format!(
+                "'asm' is only available in contracts extending UnsafeSmartContract; got {}. Move the call into a class that extends UnsafeSmartContract (and import {{ UnsafeSmartContract }} from 'runar-lang').",
+                contract.parent_class
+            ), None));
+            return;
+        }
+
+        if args.len() != 3 {
+            errors.push(Diagnostic::error(
+                "asm() expects exactly one object-literal argument { body, in_arity?, out_arity? }",
+                None,
+            ));
+            return;
+        }
+
+        match &args[0] {
+            Expression::ByteStringLiteral { value } => {
+                if value.is_empty() {
+                    errors.push(Diagnostic::error(
+                        "asm() body must be a non-empty hex string literal",
+                        None,
+                    ));
+                } else if value.len() % 2 != 0 {
+                    errors.push(Diagnostic::error(format!(
+                        "asm() body has odd hex length ({}); each opcode byte requires two hex characters",
+                        value.len()
+                    ), None));
+                } else if !is_hex_string(value) {
+                    errors.push(Diagnostic::error(
+                        "asm() body contains non-hex characters; only 0-9, a-f, A-F are allowed",
+                        None,
+                    ));
+                }
+            }
+            _ => {
+                errors.push(Diagnostic::error(
+                    "asm() body must be a hex string literal",
+                    None,
+                ));
+                return;
+            }
+        }
+
+        use num_traits::{Signed, ToPrimitive};
+        match &args[1] {
+            Expression::BigIntLiteral { value } if !value.is_negative() => {}
+            _ => errors.push(Diagnostic::error(
+                "asm() in_arity must be a non-negative integer literal",
+                None,
+            )),
+        }
+
+        let out_arity_val: Option<i128> = match &args[2] {
+            Expression::BigIntLiteral { value } if !value.is_negative() => value.to_i128(),
+            _ => {
+                errors.push(Diagnostic::error(
+                    "asm() out_arity must be a non-negative integer literal",
+                    None,
+                ));
+                None
+            }
+        };
+
+        // Expression-form asm<T>({...}) returns a value that flows into a
+        // let-binding — exactly ONE stack value, so out_arity must be 1.
+        if let (Some(ret), Some(out)) = (asm_return_type.as_deref(), out_arity_val) {
+            if out != 1 {
+                errors.push(Diagnostic::error(format!(
+                    "Expression-form asm<{}>() must have out_arity 1 (got {}); only a single stack value can be bound to the result variable.",
+                    ret, out
+                ), None));
+            }
+        }
+    });
+}
+
+/// Reports whether `s` contains only hex digits (0-9, a-f, A-F).
+fn is_hex_string(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn ends_with_assert(body: &[Statement]) -> bool {
@@ -290,7 +524,16 @@ fn is_assert_call(expr: &Expression) -> bool {
 
 fn validate_statement(stmt: &Statement, errors: &mut Vec<Diagnostic>) {
     match stmt {
-        Statement::VariableDecl { init, .. } => {
+        Statement::VariableDecl { name, var_type, init, .. } => {
+            if let Some(TypeNode::FixedArray { .. }) = var_type {
+                errors.push(Diagnostic::error(
+                    format!(
+                        "Local variable '{}' cannot be a FixedArray. Arrays are only allowed as contract properties.",
+                        name
+                    ),
+                    None,
+                ));
+            }
             validate_expression(init, errors);
         }
         Statement::Assignment { target, value, .. } => {
@@ -321,7 +564,11 @@ fn validate_statement(stmt: &Statement, errors: &mut Vec<Diagnostic>) {
         } => {
             validate_expression(condition, errors);
 
-            // Check that the loop bound is a compile-time constant
+            // Check that the loop bound is a compile-time constant. Non-zero
+            // starts and countdown loops (`i--` with `>`/`>=`) are supported:
+            // the ANF loop node carries an explicit start value and step
+            // direction (issue #121), so lowering binds `iterVar = start +
+            // i*step` on each unrolled iteration.
             if let Expression::BinaryExpr { right, .. } = condition {
                 if !is_compile_time_constant(right) {
                     errors.push(Diagnostic::error(
@@ -353,10 +600,14 @@ fn validate_statement(stmt: &Statement, errors: &mut Vec<Diagnostic>) {
 }
 
 fn is_compile_time_constant(expr: &Expression) -> bool {
+    // Only integer literals (and their negation) can be unrolled into fixed
+    // Bitcoin Script by anf-lower. A bare identifier bound (e.g. `const N`) or a
+    // runtime member access (`this.x`) is NOT resolvable and must be rejected
+    // here with a graceful diagnostic — anf-lower's `extract_loop_shape` would
+    // otherwise panic. This mirrors the reference TS compiler's observable
+    // behavior: only literal loop bounds compile.
     match expr {
         Expression::BigIntLiteral { .. } => true,
-        Expression::BoolLiteral { .. } => true,
-        Expression::Identifier { .. } => true, // Could be a const
         Expression::UnaryExpr { op, operand } if *op == UnaryOp::Neg => {
             is_compile_time_constant(operand)
         }
@@ -637,6 +888,118 @@ fn warn_manual_preimage_usage(method: &MethodNode, warnings: &mut Vec<Diagnostic
     });
 }
 
+// ---------------------------------------------------------------------------
+// #131: locktime soundness — extractLocktime needs an extractSequence guard
+// ---------------------------------------------------------------------------
+
+/// Sentinel maximum nSequence: a tx is FINAL (ignores locktime) at this value.
+const SEQUENCE_FINAL: u64 = 0xffff_ffff;
+
+/// True when `expr` is a direct call to the named intrinsic, e.g. `f(...)`.
+fn is_call_to_named(expr: &Expression, name: &str) -> bool {
+    if let Expression::CallExpr { callee, .. } = expr {
+        if let Expression::Identifier { name: callee_name } = callee.as_ref() {
+            return callee_name == name;
+        }
+    }
+    false
+}
+
+/// True when `expr` reads the transaction locktime. Both the raw intrinsic
+/// `extractLocktime(preimage)` and its ergonomic sugar `currentBlockHeight()`
+/// (which the ANF pass desugars to `extractLocktime(txPreimage)`) count —
+/// either read is unsound without a sequence-finality guard.
+fn is_locktime_read(expr: &Expression) -> bool {
+    is_call_to_named(expr, "extractLocktime") || is_call_to_named(expr, "currentBlockHeight")
+}
+
+/// True when `expr` is an `extractSequence(...) < <final>`-style comparison
+/// (the guard that makes a locktime gate consensus-enforced). Accepts the two
+/// natural spellings: `extractSequence(pre) < N` / `<= N`, and the reversed
+/// `N > extractSequence(pre)` / `>= ...`. `N` must be a bigint literal no
+/// greater than the finality sentinel, so the guard genuinely forces
+/// non-finality.
+fn is_sequence_finality_guard(expr: &Expression) -> bool {
+    let Expression::BinaryExpr { op, left, right } = expr else {
+        return false;
+    };
+    let bound_ok = |e: &Expression| -> bool {
+        matches!(
+            e,
+            Expression::BigIntLiteral { value }
+                if *value <= num_bigint::BigInt::from(SEQUENCE_FINAL)
+        )
+    };
+    match op {
+        BinaryOp::Lt | BinaryOp::Le => is_call_to_named(left, "extractSequence") && bound_ok(right),
+        BinaryOp::Gt | BinaryOp::Ge => is_call_to_named(right, "extractSequence") && bound_ok(left),
+        _ => false,
+    }
+}
+
+/// #131: warn when `method` (transitively, through the private-helper call
+/// graph) reads the tx locktime but never asserts the tx is non-final. A
+/// locktime gate is not consensus-enforced unless `extractSequence < 0xffffffff`
+/// is also asserted — otherwise an all-final-sequence spend bypasses it.
+/// Advisory (warning) only — no effect on emitted bytecode.
+fn warn_locktime_without_sequence_guard(
+    method: &MethodNode,
+    contract: &ContractNode,
+    warnings: &mut Vec<Diagnostic>,
+) {
+    // Map of private helper methods by name (BFS follows calls into these).
+    let private_methods: HashMap<&str, &MethodNode> = contract
+        .methods
+        .iter()
+        .filter(|m| m.visibility == Visibility::Private)
+        .map(|m| (m.name.as_str(), m))
+        .collect();
+
+    let mut reads_locktime = false;
+    let mut has_sequence_guard = false;
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(method.name.clone());
+    let mut queue: std::collections::VecDeque<&MethodNode> = std::collections::VecDeque::new();
+    queue.push_back(method);
+
+    while let Some(current) = queue.pop_front() {
+        walk_expressions_in_body(&current.body, &mut |expr| {
+            if is_locktime_read(expr) {
+                reads_locktime = true;
+            }
+            if is_sequence_finality_guard(expr) {
+                has_sequence_guard = true;
+            }
+        });
+        // Follow calls into private helpers so a guard (or locktime read)
+        // supplied by an inlined helper is seen by the public entry point.
+        // Reuses the shared `collect_method_calls` recursion-detection helper.
+        let mut calls = HashSet::new();
+        collect_method_calls(&current.body, &mut calls);
+        for callee in calls {
+            if !visited.contains(&callee) {
+                if let Some(m) = private_methods.get(callee.as_str()) {
+                    visited.insert(callee.clone());
+                    queue.push_back(m);
+                }
+            }
+        }
+    }
+
+    if reads_locktime && !has_sequence_guard {
+        warnings.push(Diagnostic::warning(
+            format!(
+                "method '{}' reads extractLocktime but does not assert \
+                 extractSequence < 0xffffffff; a locktime gate is not \
+                 consensus-enforced unless the tx is non-final — add \
+                 assert(extractSequence(this.txPreimage) < 0xffffffffn)",
+                method.name
+            ),
+            Some(method.source_location.clone()),
+        ));
+    }
+}
+
 fn walk_expressions_in_body(stmts: &[Statement], visitor: &mut impl FnMut(&Expression)) {
     for stmt in stmts {
         walk_expressions_in_statement(stmt, visitor);
@@ -684,7 +1047,7 @@ fn walk_expressions_in_statement(stmt: &Statement, visitor: &mut impl FnMut(&Exp
 fn walk_expression(expr: &Expression, visitor: &mut impl FnMut(&Expression)) {
     visitor(expr);
     match expr {
-        Expression::CallExpr { callee, args } => {
+        Expression::CallExpr { callee, args, .. } => {
             walk_expression(callee, visitor);
             for arg in args {
                 walk_expression(arg, visitor);
@@ -996,6 +1359,215 @@ class Rec extends SmartContract {
                 .iter()
                 .any(|e| e.message.to_lowercase().contains("recursion") || e.message.to_lowercase().contains("recursive")),
             "expected error about recursion, got: {:?}",
+            result.errors
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #126: contract with no public methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_no_public_methods_produces_error() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class NoPub extends SmartContract {
+    readonly x: bigint;
+
+    constructor(x: bigint) {
+        super(x);
+        this.x = x;
+    }
+
+    private helper(v: bigint): bigint {
+        return v + this.x;
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("no public methods")),
+            "expected 'no public methods' error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_public_method_passes_no_public_methods_check() {
+        let source = r#"
+import { SmartContract, Addr, PubKey, Sig } from 'runar-lang';
+
+class P2PKH extends SmartContract {
+    readonly pubKeyHash: Addr;
+
+    constructor(pubKeyHash: Addr) {
+        super(pubKeyHash);
+        this.pubKeyHash = pubKeyHash;
+    }
+
+    public unlock(sig: Sig, pubKey: PubKey) {
+        assert(hash160(pubKey) === this.pubKeyHash);
+        assert(checkSig(sig, pubKey));
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("no public methods")),
+            "did not expect 'no public methods' error, got: {:?}",
+            result.errors
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #121: non-zero-start and countdown loops are now accepted (were rejected
+    // under the earlier count-only ANF loop node).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_countdown_loop_gt_accepted() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Countdown extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 3n; i > 0n; i--) {
+            sum = sum + i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")),
+            "countdown loop should be accepted (#121), got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_countdown_loop_ge_accepted() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Countdown extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 3n; i >= 1n; i--) {
+            sum = sum + i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")),
+            "countdown loop should be accepted (#121), got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_non_zero_start_loop_accepted() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class NonZeroStart extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 1n; i < 3n; i++) {
+            sum = sum + i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")),
+            "non-zero-start loop should be accepted (#121), got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_zero_start_count_up_loop_passes() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class ZeroStart extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 0n; i < 3n; i++) {
+            sum += i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_contract(source);
+        let result = validate(&contract);
+        assert!(
+            !result.errors.iter().any(|e| {
+                e.message.contains("countdown loops are not supported")
+                    || e.message.contains("must start at 0")
+            }),
+            "zero-start counting-up loop should not trigger loop-shape errors, got: {:?}",
             result.errors
         );
     }

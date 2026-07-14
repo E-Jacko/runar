@@ -1,0 +1,375 @@
+package runar.compiler.frontend;
+
+import org.junit.jupiter.api.Test;
+import runar.compiler.ir.ast.AssignmentStatement;
+import runar.compiler.ir.ast.BinaryExpr;
+import runar.compiler.ir.ast.CallExpr;
+import runar.compiler.ir.ast.ContractNode;
+import runar.compiler.ir.ast.Expression;
+import runar.compiler.ir.ast.ExpressionStatement;
+import runar.compiler.ir.ast.Identifier;
+import runar.compiler.ir.ast.MemberExpr;
+import runar.compiler.ir.ast.ParentClass;
+import runar.compiler.ir.ast.PrimitiveType;
+import runar.compiler.ir.ast.PrimitiveTypeName;
+import runar.compiler.ir.ast.PropertyAccessExpr;
+import runar.compiler.ir.ast.UnaryExpr;
+import runar.compiler.ir.ast.Visibility;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class JavaParserTest {
+
+    private static final String P2PKH_SOURCE = """
+        package runar.examples.p2pkh;
+
+        import runar.lang.SmartContract;
+        import runar.lang.annotations.Public;
+        import runar.lang.annotations.Readonly;
+        import runar.lang.types.Addr;
+        import runar.lang.types.PubKey;
+        import runar.lang.types.Sig;
+        import static runar.lang.Builtins.assertThat;
+        import static runar.lang.Builtins.checkSig;
+        import static runar.lang.Builtins.hash160;
+
+        class P2PKH extends SmartContract {
+            @Readonly Addr pubKeyHash;
+
+            P2PKH(Addr pubKeyHash) {
+                super(pubKeyHash);
+                this.pubKeyHash = pubKeyHash;
+            }
+
+            @Public
+            void unlock(Sig sig, PubKey pubKey) {
+                assertThat(hash160(pubKey).equals(pubKeyHash));
+                assertThat(checkSig(sig, pubKey));
+            }
+        }
+        """;
+
+    @Test
+    void parsesP2pkhIntoExpectedContractShape() {
+        ContractNode c = JavaParser.parse(P2PKH_SOURCE, "P2PKH.runar.java");
+        assertEquals("P2PKH", c.name());
+        assertEquals(ParentClass.SMART_CONTRACT, c.parentClass());
+        assertEquals("P2PKH.runar.java", c.sourceFile());
+        assertEquals(1, c.properties().size());
+        var pkh = c.properties().get(0);
+        assertEquals("pubKeyHash", pkh.name());
+        assertTrue(pkh.readonly());
+        assertEquals(new PrimitiveType(PrimitiveTypeName.ADDR), pkh.type());
+        assertNull(pkh.initializer());
+    }
+
+    @Test
+    void parsesConstructorWithSuperAndThisAssignment() {
+        ContractNode c = JavaParser.parse(P2PKH_SOURCE, "P2PKH.runar.java");
+        var ctor = c.constructor();
+        assertEquals("constructor", ctor.name());
+        assertEquals(1, ctor.params().size());
+        assertEquals("pubKeyHash", ctor.params().get(0).name());
+
+        assertEquals(2, ctor.body().size());
+        // super(pubKeyHash)
+        var superStmt = (ExpressionStatement) ctor.body().get(0);
+        var superCall = (CallExpr) superStmt.expression();
+        assertEquals("super", ((Identifier) superCall.callee()).name());
+        assertEquals(1, superCall.args().size());
+        assertEquals("pubKeyHash", ((Identifier) superCall.args().get(0)).name());
+
+        // this.pubKeyHash = pubKeyHash
+        var assignStmt = (AssignmentStatement) ctor.body().get(1);
+        assertEquals("pubKeyHash", ((PropertyAccessExpr) assignStmt.target()).property());
+        assertEquals("pubKeyHash", ((Identifier) assignStmt.value()).name());
+    }
+
+    @Test
+    void parsesUnlockMethodWithStaticImportedCalls() {
+        ContractNode c = JavaParser.parse(P2PKH_SOURCE, "P2PKH.runar.java");
+        assertEquals(1, c.methods().size());
+        var unlock = c.methods().get(0);
+        assertEquals("unlock", unlock.name());
+        assertEquals(Visibility.PUBLIC, unlock.visibility());
+        assertEquals(2, unlock.params().size());
+        assertEquals(new PrimitiveType(PrimitiveTypeName.SIG), unlock.params().get(0).type());
+        assertEquals(new PrimitiveType(PrimitiveTypeName.PUB_KEY), unlock.params().get(1).type());
+
+        assertEquals(2, unlock.body().size());
+
+        // assertThat(hash160(pubKey).equals(pubKeyHash)) — the parser lowers
+        // the native-Java `.equals(...)` value-equality method to the canonical
+        // BinaryExpr(EQ, ...), so cross-format compilation produces identical
+        // IR and script.
+        var firstAssert = (ExpressionStatement) unlock.body().get(0);
+        var firstCall = (CallExpr) firstAssert.expression();
+        assertEquals("assertThat", ((Identifier) firstCall.callee()).name());
+        assertEquals(1, firstCall.args().size());
+
+        var equalsCmp = (BinaryExpr) firstCall.args().get(0);
+        assertEquals(Expression.BinaryOp.EQ, equalsCmp.op());
+        var hash160Call = (CallExpr) equalsCmp.left();
+        assertEquals("hash160", ((Identifier) hash160Call.callee()).name());
+        assertEquals("pubKeyHash", ((Identifier) equalsCmp.right()).name());
+    }
+
+    @Test
+    void rejectsContractWithoutExtendsClause() {
+        String src = "class Bad { @Readonly Addr pkh; }";
+        JavaParser.ParseException e = assertThrows(JavaParser.ParseException.class,
+            () -> JavaParser.parse(src, "Bad.runar.java")
+        );
+        assertTrue(e.getMessage().contains("must extend"));
+    }
+
+    @Test
+    void rejectsContractExtendingUnknownBaseClass() {
+        String src = "class Bad extends Frobulator { }";
+        JavaParser.ParseException e = assertThrows(JavaParser.ParseException.class,
+            () -> JavaParser.parse(src, "Bad.runar.java")
+        );
+        assertTrue(e.getMessage().contains("Frobulator"));
+    }
+
+    @Test
+    void acceptsStatefulSmartContract() {
+        String src = """
+            class Counter extends StatefulSmartContract {
+                Bigint count;
+                Counter(Bigint count) {
+                    super(count);
+                    this.count = count;
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "Counter.runar.java");
+        assertEquals(ParentClass.STATEFUL_SMART_CONTRACT, c.parentClass());
+        assertEquals(1, c.properties().size());
+        assertEquals(new PrimitiveType(PrimitiveTypeName.BIGINT), c.properties().get(0).type());
+        // count is not @Readonly so it becomes mutable state.
+        assertFalse(c.properties().get(0).readonly());
+    }
+
+    @Test
+    void parsesPropertyInitializer() {
+        String src = """
+            class Counter extends StatefulSmartContract {
+                Bigint count = BigInteger.ZERO;
+                @Readonly PubKey owner;
+                Counter(PubKey owner) { super(owner); this.owner = owner; }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "Counter.runar.java");
+        assertEquals(2, c.properties().size());
+        var count = c.properties().stream().filter(p -> p.name().equals("count")).findFirst().orElseThrow();
+        assertNotNull(count.initializer(), "count should carry its initializer");
+    }
+
+    @Test
+    void parsesBigIntegerValueOfAsLiteral() {
+        String src = """
+            class C extends SmartContract {
+                @Readonly Bigint threshold;
+                @Public void check(Bigint x) {
+                    assertThat(x == BigInteger.valueOf(7));
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        var check = c.methods().get(0);
+        var stmt = (ExpressionStatement) check.body().get(0);
+        var assertCall = (CallExpr) stmt.expression();
+        var cmp = (BinaryExpr) assertCall.args().get(0);
+        assertEquals(Expression.BinaryOp.EQ, cmp.op());
+        // LHS: identifier x
+        assertEquals("x", ((Identifier) cmp.left()).name());
+        // RHS: BigIntLiteral(7) — should not be a CallExpr
+        assertInstanceOf(runar.compiler.ir.ast.BigIntLiteral.class, cmp.right());
+    }
+
+    @Test
+    void parsesByteStringFromHexAsLiteral() {
+        String src = """
+            class C extends SmartContract {
+                @Readonly ByteString magic;
+                @Public void check() {
+                    assertThat(magic.equals(ByteString.fromHex("deadbeef")));
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        var stmt = (ExpressionStatement) c.methods().get(0).body().get(0);
+        var assertCall = (CallExpr) stmt.expression();
+        // `.equals(...)` is now lowered to a canonical BinaryExpr(EQ, ...)
+        // with a ByteStringLiteral on the right (via fromHex).
+        var equalsCmp = (BinaryExpr) assertCall.args().get(0);
+        assertEquals(Expression.BinaryOp.EQ, equalsCmp.op());
+        assertInstanceOf(runar.compiler.ir.ast.ByteStringLiteral.class, equalsCmp.right());
+        var lit = (runar.compiler.ir.ast.ByteStringLiteral) equalsCmp.right();
+        assertEquals("deadbeef", lit.value());
+    }
+
+    @Test
+    void rejectsMultipleConstructors() {
+        String src = """
+            class Bad extends SmartContract {
+                @Readonly Addr a;
+                Bad() { super(); }
+                Bad(Addr a) { super(a); this.a = a; }
+            }
+            """;
+        JavaParser.ParseException e = assertThrows(JavaParser.ParseException.class,
+            () -> JavaParser.parse(src, "Bad.runar.java")
+        );
+        assertTrue(e.getMessage().contains("more than one constructor"));
+    }
+
+    @Test
+    void reportsJavacSyntaxErrors() {
+        String src = "class Bad extends SmartContract { @Readonly Addr a }"; // missing semicolon
+        JavaParser.ParseException e = assertThrows(JavaParser.ParseException.class,
+            () -> JavaParser.parse(src, "Bad.runar.java")
+        );
+        assertTrue(e.getMessage().contains("javac reported errors"));
+    }
+
+    // -----------------------------------------------------------------
+    // Bigint-wrapper method lowering (task 2 of M12 part 2)
+    // -----------------------------------------------------------------
+
+    @Test
+    void lowersBigintPlusIntoBinaryAddExpr() {
+        String src = """
+            import runar.lang.types.Bigint;
+            class C extends StatefulSmartContract {
+                Bigint count;
+                C(Bigint count) { super(count); this.count = count; }
+                @Public void bump(Bigint delta) {
+                    this.count = this.count.plus(delta);
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        var bump = c.methods().stream().filter(m -> m.name().equals("bump")).findFirst().orElseThrow();
+        var assign = (AssignmentStatement) bump.body().get(0);
+        var rhs = (BinaryExpr) assign.value();
+        assertEquals(Expression.BinaryOp.ADD, rhs.op());
+        // LHS of the ADD is `this.count` (PropertyAccessExpr), RHS is `delta`.
+        assertEquals("count", ((PropertyAccessExpr) rhs.left()).property());
+        assertEquals("delta", ((Identifier) rhs.right()).name());
+    }
+
+    @Test
+    void lowersBigintGtIntoBinaryGtExpr() {
+        String src = """
+            import runar.lang.types.Bigint;
+            class C extends StatefulSmartContract {
+                Bigint count;
+                C(Bigint count) { super(count); this.count = count; }
+                @Public void check(Bigint threshold) {
+                    assertThat(this.count.gt(threshold));
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        var check = c.methods().stream().filter(m -> m.name().equals("check")).findFirst().orElseThrow();
+        var stmt = (ExpressionStatement) check.body().get(0);
+        var call = (CallExpr) stmt.expression();
+        var cmp = (BinaryExpr) call.args().get(0);
+        assertEquals(Expression.BinaryOp.GT, cmp.op());
+    }
+
+    @Test
+    void lowersBigintNegIntoUnaryNegExpr() {
+        String src = """
+            import runar.lang.types.Bigint;
+            class C extends SmartContract {
+                @Readonly Bigint a;
+                C(Bigint a) { super(a); this.a = a; }
+                @Public void check(Bigint x) {
+                    assertThat(x.neg().eq(this.a));
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        var check = c.methods().get(0);
+        var stmt = (ExpressionStatement) check.body().get(0);
+        var call = (CallExpr) stmt.expression();
+        // assertThat(x.neg().eq(this.a)) → BinaryExpr(EQ, UnaryExpr(NEG, x), this.a)
+        var eq = (BinaryExpr) call.args().get(0);
+        assertEquals(Expression.BinaryOp.EQ, eq.op());
+        var neg = (UnaryExpr) eq.left();
+        assertEquals(Expression.UnaryOp.NEG, neg.op());
+        assertEquals("x", ((Identifier) neg.operand()).name());
+    }
+
+    @Test
+    void lowersBigintBitwiseMethods() {
+        String src = """
+            import runar.lang.types.Bigint;
+            class C extends SmartContract {
+                @Readonly Bigint a;
+                @Readonly Bigint b;
+                C(Bigint a, Bigint b) { super(a, b); this.a = a; this.b = b; }
+                @Public void op() {
+                    assertThat(this.a.and(this.b).eq(this.a.xor(this.b)));
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        var op = c.methods().get(0);
+        var stmt = (ExpressionStatement) op.body().get(0);
+        var call = (CallExpr) stmt.expression();
+        var eq = (BinaryExpr) call.args().get(0);
+        var lhs = (BinaryExpr) eq.left();
+        var rhs = (BinaryExpr) eq.right();
+        assertEquals(Expression.BinaryOp.BIT_AND, lhs.op());
+        assertEquals(Expression.BinaryOp.BIT_XOR, rhs.op());
+    }
+
+    @Test
+    void lowersBigintAbsMethodToCallExpr() {
+        String src = """
+            import runar.lang.types.Bigint;
+            class C extends StatefulSmartContract {
+                Bigint value;
+                C(Bigint value) { super(value); this.value = value; }
+                @Public void normalise() {
+                    this.value = this.value.abs();
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        var m = c.methods().get(0);
+        var assign = (AssignmentStatement) m.body().get(0);
+        var rhs = (CallExpr) assign.value();
+        assertEquals("abs", ((Identifier) rhs.callee()).name());
+        assertEquals(1, rhs.args().size());
+        assertEquals("value", ((PropertyAccessExpr) rhs.args().get(0)).property());
+    }
+
+    @Test
+    void lowersByteStringEqualsToCanonicalBinaryExpr() {
+        // The native-Java `.equals(...)` value-equality method on ByteString-
+        // family receivers is lowered to a canonical BinaryExpr(EQ, ...) so
+        // cross-format compilation produces identical IR and script. The
+        // typechecker rejects misuse (e.g. equality on incompatible types).
+        String src = """
+            class C extends SmartContract {
+                @Readonly Addr a;
+                C(Addr a) { super(a); this.a = a; }
+                @Public void check(Addr other) {
+                    assertThat(other.equals(this.a));
+                }
+            }
+            """;
+        ContractNode c = JavaParser.parse(src, "C.runar.java");
+        var stmt = (ExpressionStatement) c.methods().get(0).body().get(0);
+        var assertCall = (CallExpr) stmt.expression();
+        var equalsCmp = (BinaryExpr) assertCall.args().get(0);
+        assertEquals(Expression.BinaryOp.EQ, equalsCmp.op());
+        assertEquals("other", ((Identifier) equalsCmp.left()).name());
+        assertEquals("a", ((PropertyAccessExpr) equalsCmp.right()).property());
+    }
+}

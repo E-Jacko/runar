@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from runar_compiler.ir.types import ANFProgram
+from runar_compiler.frontend.sighash_directive import SIGHASH_DEFAULT as _SIGHASH_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +26,9 @@ class ABIParam:
 
     name: str = ""
     type: str = ""
+    # Present when this param represents an expanded FixedArray<T, N>.
+    # ``fixed_array`` holds ``{"elementType", "length", "syntheticNames"}``.
+    fixed_array: dict | None = None
 
 
 @dataclass
@@ -42,6 +46,12 @@ class ABIMethod:
     params: list[ABIParam] = field(default_factory=list)
     is_public: bool = False
     is_terminal: bool | None = None
+    # Unlocking script is prefixed with _codePart (issue #100).
+    uses_code_part: bool | None = None
+    # Issue #123: BIP-143 sighash type from a @sighash directive (e.g. 0x43 for
+    # SINGLE|FORKID). ``None`` = default ALL|FORKID (0x41); the SDK falls back to
+    # 0x41 so existing artifacts are unchanged and older SDKs keep working.
+    sig_hash_type: int | None = None
 
 
 @dataclass
@@ -59,7 +69,11 @@ class StateField:
     name: str = ""
     type: str = ""
     index: int = 0
-    initial_value: str | int | bool | None = None
+    initial_value: Any = None
+    # Present for grouped FixedArray state fields. Holds
+    # ``{"elementType", "length", "syntheticNames"}`` so the SDK can
+    # flatten/unflatten array values on state read/write.
+    fixed_array: dict | None = None
 
 
 @dataclass
@@ -77,6 +91,10 @@ class Artifact:
     version: str = ""
     compiler_version: str = ""
     contract_name: str = ""
+    # Base class the source contract extends. Authoritative stateful signal
+    # for the issue-#42/#44 terminal sighash subscript trim (a
+    # StatefulSmartContract with zero mutable fields still needs the trim).
+    parent_class: str = ""
     abi: ABI = field(default_factory=ABI)
     script: str = ""
     asm: str = ""
@@ -84,14 +102,17 @@ class Artifact:
     ir: dict | None = None  # {"anf": ..., "stack": ...}
     state_fields: list[StateField] = field(default_factory=list)
     constructor_slots: list[ConstructorSlot] = field(default_factory=list)
+    code_sep_index_slots: list[dict] = field(default_factory=list)
     code_separator_index: int | None = None
     code_separator_indices: list[int] | None = None
     build_timestamp: str = ""
     anf: ANFProgram | None = None
+    # Byte ranges produced by raw_script ANF nodes (asm({...}) calls).
+    raw_script_spans: list | None = None
 
 
-SCHEMA_VERSION = "runar-v0.4.4"
-COMPILER_VERSION = "0.4.4-python"
+SCHEMA_VERSION = "runar-v1.0.0-rc.1"
+COMPILER_VERSION = "1.0.0-rc.1-python"
 
 
 # ---------------------------------------------------------------------------
@@ -128,10 +149,13 @@ def _parse_source(source: bytes, file_name: str) -> Any:
     elif lower.endswith(".runar.zig"):
         from runar_compiler.frontend.parser_zig import parse_zig
         return parse_zig(source, file_name)
+    elif lower.endswith(".runar.java"):
+        from runar_compiler.frontend.parser_java import parse_java
+        return parse_java(source, file_name)
     else:
         raise ValueError(
             f"Unsupported source format: {file_name}. "
-            f"Expected .runar.ts, .runar.sol, .runar.move, .runar.go, .runar.rs, .runar.py, .runar.rb, or .runar.zig"
+            f"Expected .runar.ts, .runar.sol, .runar.move, .runar.go, .runar.rs, .runar.py, .runar.rb, .runar.zig, or .runar.java"
         )
 
 
@@ -159,6 +183,17 @@ def _lower_to_anf(contract: Any) -> ANFProgram:
     return lower_to_anf(contract)
 
 
+def _expand_fixed_arrays(contract: Any) -> Any:
+    """Pass 3b: Expand FixedArray properties into scalar siblings.
+
+    Returns a tuple ``(rewritten_contract, errors)``. On any error the
+    original contract is returned unchanged.
+    """
+    from runar_compiler.frontend.expand_fixed_arrays import expand_fixed_arrays
+    result = expand_fixed_arrays(contract)
+    return result.contract, result.errors
+
+
 # ---------------------------------------------------------------------------
 # Backend stub imports
 # ---------------------------------------------------------------------------
@@ -173,6 +208,17 @@ def _optimize_ec(program: ANFProgram) -> ANFProgram:
     """Optimize EC operations in ANF IR (Pass 4.5)."""
     from runar_compiler.frontend.anf_optimize import optimize_ec
     return optimize_ec(program)
+
+
+def _eliminate_dead_code(program: ANFProgram) -> ANFProgram:
+    """Dead Code Elimination (Pass 4.75) -- discrete named pass.
+
+    See frontend/dce.py. Idempotent w.r.t. the EC optimizer's internal DCE;
+    runs as a safety net for any post-EC residual dead bindings and to
+    mirror the standalone DCE pass shape used by the Zig reference compiler.
+    """
+    from runar_compiler.frontend.dce import eliminate_dead_code
+    return eliminate_dead_code(program)
 
 
 def _lower_to_stack(program: ANFProgram) -> list[Any]:
@@ -211,24 +257,185 @@ def _load_ir_from_bytes(data: bytes) -> ANFProgram:
 
 
 def _apply_constructor_args(program: ANFProgram, args: dict[str, object] | None) -> None:
-    """Bake constructor arg values into ANF property initial_values."""
+    """Bake constructor arg values into ANF property initial_values.
+
+    Validates the args before and after baking so a mistyped or ill-shaped
+    ``constructorArgs`` fails loudly instead of silently baking nothing and
+    emitting OP_0 placeholder scripts that fail opaquely at runtime. The
+    no-args placeholder path (``args`` falsy) stays byte-identical + unchecked.
+    """
     if not args:
         return
+
+    shape_errors = _validate_constructor_args_shape(program, args)
+    if shape_errors:
+        raise CompilationError("constructorArgs errors:\n  " + "\n  ".join(shape_errors))
+
     for prop in program.properties:
         if prop.name in args:
             prop.initial_value = args[prop.name]
 
+    unbaked_errors = _find_unbaked_referenced_readonly(program)
+    if unbaked_errors:
+        raise CompilationError("constructorArgs errors:\n  " + "\n  ".join(unbaked_errors))
 
+
+def _validate_constructor_args_shape(program: ANFProgram, args: object) -> list[str]:
+    """Validate the shape of ``constructorArgs`` against the contract's
+    properties BEFORE baking. Returns a list of error messages (empty = valid).
+
+    Rejects:
+     (a) positional arrays/sequences -- ``constructorArgs`` must be a record
+         keyed by property name. A positional array matches no property names,
+         so nothing would be baked and the script would silently keep its OP_0
+         placeholders (failing opaquely at runtime).
+     (b) keys that do not match any contract property name (typos would
+         otherwise silently bake nothing for that key).
+    """
+    errors: list[str] = []
+
+    if isinstance(args, (list, tuple)):
+        prop_names = ", ".join(p.name for p in program.properties)
+        first = program.properties[0].name if program.properties else "propName"
+        errors.append(
+            f"constructorArgs must be a record keyed by property name, not a "
+            f"positional array. Contract '{program.contract_name}' properties: "
+            f"[{prop_names}]. Example: {{ {first}: <value> }}"
+        )
+        return errors
+
+    prop_name_set = {p.name for p in program.properties}
+    for key in args.keys():  # type: ignore[union-attr]
+        if key not in prop_name_set:
+            prop_names = ", ".join(p.name for p in program.properties)
+            errors.append(
+                f"constructorArgs key '{key}' does not match any property of "
+                f"contract '{program.contract_name}' (properties: [{prop_names}]). "
+                f"Nothing would be baked for this key."
+            )
+
+    return errors
+
+
+def _find_unbaked_referenced_readonly(program: ANFProgram) -> list[str]:
+    """After baking ``constructorArgs``, find readonly properties that are
+    REFERENCED by at least one method body but still have no baked
+    ``initial_value``. Such properties would be emitted as OP_0 placeholders,
+    making the compiled script fail opaquely at runtime.
+
+    Only applies when the caller asked for baking -- unbaked placeholder
+    compilation (no ``constructorArgs``) is the normal deploy-artifact path
+    where the SDK substitutes values via ``constructorSlots``.
+    """
+    referenced = _collect_referenced_props(program)
+
+    errors: list[str] = []
+    for prop in program.properties:
+        if prop.readonly and prop.initial_value is None and prop.name in referenced:
+            errors.append(
+                f"readonly property '{prop.name}' is referenced by a method but "
+                f"has no value after baking constructorArgs -- the emitted script "
+                f"would carry an OP_0 placeholder that fails at runtime. Provide "
+                f"'{prop.name}' in constructorArgs (or give the property an "
+                f"initializer)."
+            )
+    return errors
+
+
+def _collect_referenced_props(program: ANFProgram) -> set[str]:
+    """Collect the property names actually referenced by method bodies.
+
+    The raw ANF from pass 4 loads every property at method entry; only after
+    dead-binding elimination do the surviving ``load_prop`` nodes reflect real
+    references. DCE mutates in place in this tier, so it runs on a deep-copied
+    probe here and does not perturb the main pipeline.
+    """
+    import copy
+
+    from runar_compiler.frontend.dce import eliminate_dead_code
+
+    probe = copy.deepcopy(program)
+    eliminate_dead_code(probe)
+
+    referenced: set[str] = set()
+    for method in probe.methods:
+        # The constructor's super(...) call references every property but is
+        # never emitted as script code -- only real method bodies count.
+        if method.name == "constructor":
+            continue
+        _collect_load_prop_refs(method.body, referenced)
+    return referenced
+
+
+def _collect_load_prop_refs(bindings: list[Any], out: set[str]) -> None:
+    """Recursively collect ``load_prop`` property names from ANF bindings."""
+    for binding in bindings:
+        v = binding.value
+        if v.kind == "load_prop":
+            if v.name is not None:
+                out.add(v.name)
+        elif v.kind == "if":
+            _collect_load_prop_refs(v.then or [], out)
+            _collect_load_prop_refs(v.else_ or [], out)
+        elif v.kind == "loop":
+            _collect_load_prop_refs(v.body or [], out)
+
+
+def _warn_dropped_readonly_fields(result: Any, Diagnostic: Any, Severity: Any) -> None:
+    """Issue #109: emit a warning for each un-annotated, unreferenced readonly
+    field that DCE eliminated (no initializer, no method reference). The
+    ``result.anf`` is already DCE-optimized here, so its surviving ``load_prop``
+    nodes are the authoritative reference set — ``@embedAlways`` fields were
+    forced back in during ANF lowering, so they appear referenced and never
+    warn. Rides the existing diagnostics channel (non-fatal).
+    """
+    contract = result.contract
+    if contract is None or result.anf is None:
+        return
+
+    referenced: set[str] = set()
+    for method in result.anf.methods:
+        if method.name == "constructor":
+            continue
+        _collect_load_prop_refs(method.body, referenced)
+
+    for prop in contract.properties:
+        if (
+            prop.readonly
+            and not getattr(prop, "embed_always", False)
+            and prop.initializer is None
+            and prop.name not in referenced
+        ):
+            result.diagnostics.append(
+                Diagnostic(
+                    message=(
+                        f"readonly field '{prop.name}' is not referenced in any "
+                        f"method body and was eliminated by DCE; annotate it "
+                        f"/** @embedAlways */ to preserve it in the on-chain script"
+                    ),
+                    severity=Severity.WARNING,
+                    loc=prop.source_location,
+                )
+            )
+
+
+# Constant folding is a source-pipeline optimization; never re-run it on
+# already-lowered ANF IR (the ``--ir`` path). Re-folding pre-lowered IR rewrites
+# bin_ops to constants but leaves the now-dead operand bindings in place (the
+# fold does no dead-binding elimination), which stack-lowering then emits as
+# wasteful push+drop sequences — diverging from both the fold-OFF goldens and
+# the Zig tier, whose compileFromIR never folds IR input. So the IR entry points
+# force folding off regardless of the flag; the peephole optimizer still folds.
 def compile_from_ir(ir_path: str, disable_constant_folding: bool = False) -> Artifact:
     """Read an ANF IR JSON file and compile it to a Runar artifact."""
     program = _load_ir(ir_path)
-    return compile_from_program(program, disable_constant_folding=disable_constant_folding)
+    return compile_from_program(program, disable_constant_folding=True)
 
 
 def compile_from_ir_bytes(data: bytes, disable_constant_folding: bool = False) -> Artifact:
     """Compile from raw ANF IR JSON bytes."""
     program = _load_ir_from_bytes(data)
-    return compile_from_program(program, disable_constant_folding=disable_constant_folding)
+    return compile_from_program(program, disable_constant_folding=True)
 
 
 def compile_from_program(program: ANFProgram, disable_constant_folding: bool = False) -> Artifact:
@@ -237,7 +444,8 @@ def compile_from_program(program: ANFProgram, disable_constant_folding: bool = F
     if not disable_constant_folding:
         program = _fold_constants(program)
 
-    # Pass 4.5: EC optimization
+    # Pass 4.5: EC optimization. Delegates internally to frontend/dce.py for
+    # dead-binding cleanup -- see anf_optimize._eliminate_dead_bindings.
     program = _optimize_ec(program)
 
     # Pass 5: Stack lowering
@@ -255,10 +463,12 @@ def compile_from_program(program: ANFProgram, disable_constant_folding: bool = F
         emit_result.script_hex,
         emit_result.script_asm,
         emit_result.constructor_slots,
+        emit_result.code_sep_index_slots,
         emit_result.code_separator_index,
         emit_result.code_separator_indices,
         source_map=emit_result.source_map,
         stack_methods=stack_methods,
+        raw_script_spans=emit_result.raw_script_spans,
     )
 
 
@@ -291,8 +501,14 @@ def compile_from_source(
     if tc_result.errors:
         raise CompilationError("type check errors:\n  " + "\n  ".join(tc_result.error_strings()))
 
+    # Pass 3b: Expand FixedArray properties
+    expanded_contract, expand_errors = _expand_fixed_arrays(parse_result.contract)
+    if expand_errors:
+        msgs = [d.format_message() if hasattr(d, "format_message") else str(d) for d in expand_errors]
+        raise CompilationError("expand-fixed-arrays errors:\n  " + "\n  ".join(msgs))
+
     # Pass 4: ANF lowering
-    program = _lower_to_anf(parse_result.contract)
+    program = _lower_to_anf(expanded_contract)
 
     # Bake constructor args into ANF properties.
     _apply_constructor_args(program, constructor_args)
@@ -323,7 +539,13 @@ def compile_source_to_ir(
     if tc_result.errors:
         raise CompilationError("type check errors:\n  " + "\n  ".join(tc_result.error_strings()))
 
-    program = _lower_to_anf(parse_result.contract)
+    # Pass 3b: Expand FixedArray properties
+    expanded_contract, expand_errors = _expand_fixed_arrays(parse_result.contract)
+    if expand_errors:
+        msgs = [d.format_message() if hasattr(d, "format_message") else str(d) for d in expand_errors]
+        raise CompilationError("expand-fixed-arrays errors:\n  " + "\n  ".join(msgs))
+
+    program = _lower_to_anf(expanded_contract)
 
     # Bake constructor args into ANF properties.
     _apply_constructor_args(program, constructor_args)
@@ -332,7 +554,7 @@ def compile_source_to_ir(
     if not disable_constant_folding:
         program = _fold_constants(program)
 
-    # Pass 4.5: EC optimization
+    # Pass 4.5: EC optimization (delegates internally to frontend/dce.py).
     program = _optimize_ec(program)
 
     return program
@@ -342,37 +564,172 @@ def compile_source_to_ir(
 # Artifact assembly
 # ---------------------------------------------------------------------------
 
+def _entry_to_abi_param(e: dict) -> ABIParam:
+    p = ABIParam(name=e["name"], type=e["type"])
+    if e.get("fixed_array"):
+        p.fixed_array = {
+            "elementType": e["fixed_array"]["elementType"],
+            "length": e["fixed_array"]["length"],
+            "syntheticNames": list(e["fixed_array"]["syntheticNames"]),
+        }
+    return p
+
+
+def _regroup_one_pass(entries: list[dict]) -> tuple[list[dict], bool]:
+    """Collapse contiguous synthetic runs by one nesting level.
+
+    Mirrors ``regroupOnePass`` in
+    ``packages/runar-compiler/src/artifact/assembler.ts``. Each entry has
+    ``name``, ``type``, ``chain`` (innermost last), optional
+    ``initial_value``, optional ``fixed_array``, and ``index``.
+    """
+    out: list[dict] = []
+    changed = False
+    i = 0
+    n = len(entries)
+    while i < n:
+        entry = entries[i]
+        chain = entry["chain"]
+        if not chain:
+            out.append(entry)
+            i += 1
+            continue
+        marker = chain[-1]
+        if marker["index"] != 0:
+            out.append(entry)
+            i += 1
+            continue
+
+        # Greedy extend: collect run of sequential siblings.
+        run_entries = [entry]
+        k = 1
+        j = i + 1
+        marker_base = marker["base"]
+        marker_len = marker["length"]
+        while j < n and k < marker_len:
+            nxt = entries[j]
+            if not nxt["chain"]:
+                break
+            m2 = nxt["chain"][-1]
+            if (
+                m2["base"] != marker_base
+                or m2["length"] != marker_len
+                or m2["index"] != k
+                or nxt["type"] != entry["type"]
+            ):
+                break
+            run_entries.append(nxt)
+            k += 1
+            j += 1
+
+        if len(run_entries) != marker_len:
+            out.append(entry)
+            i += 1
+            continue
+
+        inner_type = entry["type"]
+        grouped_type = f"FixedArray<{inner_type}, {marker_len}>"
+
+        synthetic_names: list[str] = []
+        for e in run_entries:
+            if e.get("fixed_array"):
+                synthetic_names.extend(e["fixed_array"]["syntheticNames"])
+            else:
+                synthetic_names.append(e["name"])
+
+        collapsed_init = None
+        if all("initial_value" in e and e["initial_value"] is not None for e in run_entries):
+            collapsed_init = [e["initial_value"] for e in run_entries]
+
+        grouped: dict = {
+            "name": marker_base,
+            "type": grouped_type,
+            "chain": list(chain[:-1]),
+            "fixed_array": {
+                "elementType": inner_type,
+                "length": marker_len,
+                "syntheticNames": synthetic_names,
+            },
+            "index": run_entries[0]["index"],
+        }
+        if collapsed_init is not None:
+            grouped["initial_value"] = collapsed_init
+        out.append(grouped)
+        i = j
+        changed = True
+    return out, changed
+
+
+def _regroup_synthetic_runs(entries: list[dict]) -> list[dict]:
+    current = entries
+    for _ in range(1024):
+        current, changed = _regroup_one_pass(current)
+        if not changed:
+            return current
+    raise RuntimeError("regroup_synthetic_runs: exceeded iteration cap")
+
+
 def _assemble_artifact(
     program: ANFProgram,
     script_hex: str,
     script_asm: str,
     constructor_slots: list[ConstructorSlot],
+    code_sep_index_slots: list[dict] | None = None,
     code_separator_index: int = -1,
     code_separator_indices: list[int] | None = None,
     source_map: list | None = None,
     stack_methods: list | None = None,
     include_ir: bool = False,
     include_source_map: bool = True,
+    raw_script_spans: list | None = None,
 ) -> Artifact:
     """Build the final output artifact from the compilation products."""
     # Build ABI
     # Initialized properties are excluded from constructor params — they
     # get their values from the initializer, not from the caller.
-    constructor_params = [
-        ABIParam(name=prop.name, type=prop.type)
+    constructor_params_raw = [
+        {"name": prop.name, "type": prop.type, "chain": []}
         for prop in program.properties
         if prop.initial_value is None
     ]
+    constructor_params = [
+        _entry_to_abi_param(e) for e in _regroup_synthetic_runs(constructor_params_raw)
+    ]
 
-    # Build state fields for stateful contracts
-    # index = position in constructor args (not sequential among state fields)
-    state_fields: list[StateField] = []
+    # Build state fields for stateful contracts — stream each mutable
+    # property into a flat entry carrying the full synthetic-array chain,
+    # then iteratively regroup. Scalars with empty chains pass through.
+    flat: list[dict] = []
     for i, prop in enumerate(program.properties):
-        if not prop.readonly:
-            sf = StateField(name=prop.name, type=prop.type, index=i)
-            if prop.initial_value is not None:
-                sf.initial_value = prop.initial_value
-            state_fields.append(sf)
+        if prop.readonly:
+            continue
+        entry: dict = {
+            "name": prop.name,
+            "type": prop.type,
+            "chain": [dict(c) for c in getattr(prop, "synthetic_array_chain", [])],
+            "index": i,
+        }
+        if prop.initial_value is not None:
+            entry["initial_value"] = prop.initial_value
+        flat.append(entry)
+
+    regrouped = _regroup_synthetic_runs(flat)
+    state_fields: list[StateField] = []
+    for e in regrouped:
+        sf = StateField(
+            name=e["name"],
+            type=e["type"],
+            index=e.get("index", 0),
+        )
+        if "initial_value" in e and e["initial_value"] is not None:
+            sf.initial_value = e["initial_value"]
+        if e.get("fixed_array"):
+            sf.fixed_array = {
+                "elementType": e["fixed_array"]["elementType"],
+                "length": e["fixed_array"]["length"],
+                "syntheticNames": list(e["fixed_array"]["syntheticNames"]),
+            }
+        state_fields.append(sf)
 
     is_stateful = len(state_fields) > 0
 
@@ -388,11 +745,29 @@ def _assemble_artifact(
             has_change = any(p.name == "_changePKH" for p in method.params)
             if not has_change:
                 is_terminal = True
+        # Propagate the authoritative _codePart decision from stack-lowering
+        # into the ABI so the SDK supplies _codePart for terminal var-length
+        # reads (issue #100).
+        uses_code_part: bool | None = None
+        if stack_methods:
+            for sm in stack_methods:
+                if getattr(sm, "name", None) == method.name and getattr(sm, "uses_code_part", False):
+                    uses_code_part = True
+                    break
+        # Issue #123: carry a non-default @sighash mode into the ABI so the SDK
+        # builds the BIP-143 preimage under the same flags the covenant expects.
+        # Omitted for the default (0x41) → existing artifacts are byte-identical.
+        sig_hash_type: int | None = None
+        m_sig = getattr(method, "sighash_type", None)
+        if method.is_public and m_sig is not None and m_sig != _SIGHASH_DEFAULT:
+            sig_hash_type = m_sig
         methods.append(ABIMethod(
             name=method.name,
             params=params,
             is_public=method.is_public,
             is_terminal=is_terminal,
+            uses_code_part=uses_code_part,
+            sig_hash_type=sig_hash_type,
         ))
 
     cs_index = code_separator_index if code_separator_index >= 0 else None
@@ -415,6 +790,7 @@ def _assemble_artifact(
         version=SCHEMA_VERSION,
         compiler_version=COMPILER_VERSION,
         contract_name=program.contract_name,
+        parent_class=program.parent_class,
         abi=ABI(
             constructor=ABIConstructor(params=constructor_params),
             methods=methods,
@@ -425,9 +801,11 @@ def _assemble_artifact(
         ir=ir_snapshot,
         state_fields=state_fields,
         constructor_slots=constructor_slots,
+        code_sep_index_slots=code_sep_index_slots or [],
         code_separator_index=cs_index,
         code_separator_indices=cs_indices,
         build_timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        raw_script_spans=raw_script_spans if raw_script_spans else None,
     )
 
     # Always include ANF IR for stateful contracts — the SDK uses it
@@ -442,25 +820,41 @@ def _assemble_artifact(
 # JSON serialization
 # ---------------------------------------------------------------------------
 
+def _abi_param_to_dict(p: ABIParam) -> dict[str, Any]:
+    d: dict[str, Any] = {"name": p.name, "type": p.type}
+    if p.fixed_array:
+        d["fixedArray"] = {
+            "elementType": p.fixed_array["elementType"],
+            "length": p.fixed_array["length"],
+            "syntheticNames": list(p.fixed_array["syntheticNames"]),
+        }
+    return d
+
+
 def artifact_to_json(artifact: Artifact) -> str:
     """Serialize an artifact to pretty-printed JSON."""
     d: dict[str, Any] = {
         "version": artifact.version,
         "compilerVersion": artifact.compiler_version,
         "contractName": artifact.contract_name,
+        # parentClass (when present) is inserted here so it sits right after
+        # contractName, matching the other tiers' artifact field order.
+        **({"parentClass": artifact.parent_class} if artifact.parent_class else {}),
         "abi": {
             "constructor": {
                 "params": [
-                    {"name": p.name, "type": p.type}
+                    _abi_param_to_dict(p)
                     for p in artifact.abi.constructor.params
                 ],
             },
             "methods": [
                 {
                     "name": m.name,
-                    "params": [{"name": p.name, "type": p.type} for p in m.params],
+                    "params": [_abi_param_to_dict(p) for p in m.params],
                     "isPublic": m.is_public,
                     **({"isTerminal": m.is_terminal} if m.is_terminal is not None else {}),
+                    **({"usesCodePart": m.uses_code_part} if m.uses_code_part is not None else {}),
+                    **({"sigHashType": m.sig_hash_type} if getattr(m, "sig_hash_type", None) is not None else {}),
                 }
                 for m in artifact.abi.methods
             ],
@@ -492,22 +886,42 @@ def artifact_to_json(artifact: Artifact) -> str:
         if ir_dict:
             d["ir"] = ir_dict
     if artifact.state_fields:
-        d["stateFields"] = [
-            {
+        state_fields_out: list[dict[str, Any]] = []
+        for sf in artifact.state_fields:
+            sf_dict: dict[str, Any] = {
                 "name": sf.name, "type": sf.type, "index": sf.index,
-                **({"initialValue": sf.initial_value} if sf.initial_value is not None else {}),
             }
-            for sf in artifact.state_fields
-        ]
+            if sf.initial_value is not None:
+                sf_dict["initialValue"] = sf.initial_value
+            if sf.fixed_array:
+                sf_dict["fixedArray"] = {
+                    "elementType": sf.fixed_array["elementType"],
+                    "length": sf.fixed_array["length"],
+                    "syntheticNames": list(sf.fixed_array["syntheticNames"]),
+                }
+            state_fields_out.append(sf_dict)
+        d["stateFields"] = state_fields_out
     if artifact.constructor_slots:
         d["constructorSlots"] = [
             {"paramIndex": cs.param_index, "byteOffset": cs.byte_offset}
             for cs in artifact.constructor_slots
         ]
+    if artifact.code_sep_index_slots:
+        d["codeSepIndexSlots"] = artifact.code_sep_index_slots
     if artifact.code_separator_index is not None:
         d["codeSeparatorIndex"] = artifact.code_separator_index
     if artifact.code_separator_indices is not None:
         d["codeSeparatorIndices"] = artifact.code_separator_indices
+    if artifact.raw_script_spans:
+        d["rawScriptSpans"] = [
+            {
+                "offset": s.offset,
+                "length": s.length,
+                "inArity": s.in_arity,
+                "outArity": s.out_arity,
+            }
+            for s in artifact.raw_script_spans
+        ]
     d["buildTimestamp"] = artifact.build_timestamp
     if artifact.anf is not None:
         d["anf"] = _serialize_anf_program(artifact.anf)
@@ -556,18 +970,37 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
             d["count"] = v.count
         if v.iter_var is not None:
             d["iterVar"] = v.iter_var
+        # Loop start/step (issue #121). Emitted as plain integers to match the
+        # TS reference tier after the conformance runner's bigint reviver
+        # normalizes its ``"0n"`` artifact form to a JSON number.
+        if v.start is not None:
+            d["start"] = v.start
+        if v.step is not None:
+            d["step"] = v.step
         if v.body is not None:
             d["body"] = [_ser_binding(b) for b in v.body]
         if v.value_ref is not None:
             d["value"] = v.value_ref
+        if v.kind == "assert" and v.is_auto_injected_state_check:
+            d["isAutoInjectedStateCheck"] = True
         if v.preimage is not None:
             d["preimage"] = v.preimage
+        # Issue #123: non-default @sighash flag on a check_preimage node. Omitted
+        # for the default (None) so existing ANF is byte-identical.
+        if v.kind == "check_preimage" and v.sighash_flag is not None:
+            d["sighashFlag"] = v.sighash_flag
         if v.satoshis is not None:
             d["satoshis"] = v.satoshis
         if v.state_values is not None:
             d["stateValues"] = v.state_values
         if v.script_bytes is not None:
             d["scriptBytes"] = v.script_bytes
+        if v.kind == "raw_script":
+            # Opaque opcode-byte span -- emit bytes + arities explicitly so
+            # in_arity 0 / out_arity 0 survive the round-trip.
+            d["bytes"] = v.bytes or ""
+            d["in_arity"] = v.in_arity or 0
+            d["out_arity"] = v.out_arity or 0
         return d
 
     def _ser_binding(b: Any) -> dict[str, Any]:
@@ -590,6 +1023,10 @@ def _serialize_anf_program(program: ANFProgram) -> dict[str, Any]:
                 "params": [{"name": p.name, "type": p.type} for p in m.params],
                 "body": [_ser_binding(b) for b in m.body],
                 "isPublic": m.is_public,
+                # Omit the default (and None) so explicit ``@sighash ALL|FORKID``
+                # and no-directive produce byte-identical ANF (zero golden churn).
+                **({"sigHashType": m.sighash_type}
+                   if getattr(m, "sighash_type", None) not in (None, _SIGHASH_DEFAULT) else {}),
             }
             for m in program.methods
         ],
@@ -822,6 +1259,20 @@ def _compile_from_source_str_with_result(
         result.success = not result.has_errors()
         return result
 
+    # Pass 3b: Expand FixedArray properties
+    try:
+        expanded_contract, expand_errors = _expand_fixed_arrays(result.contract)
+        result.diagnostics.extend(expand_errors)
+        result.contract = expanded_contract
+    except Exception as e:
+        result.diagnostics.append(
+            Diagnostic(message=f"expand-fixed-arrays error: {e}", severity=Severity.ERROR)
+        )
+        return result
+
+    if result.has_errors():
+        return result
+
     # Pass 4: ANF lowering
     try:
         result.anf = _lower_to_anf(result.contract)
@@ -846,7 +1297,7 @@ def _compile_from_source_str_with_result(
             )
             return result
 
-    # Pass 4.5: EC optimization
+    # Pass 4.5: EC optimization (delegates internally to frontend/dce.py).
     try:
         result.anf = _optimize_ec(result.anf)
     except Exception as e:
@@ -854,6 +1305,14 @@ def _compile_from_source_str_with_result(
             Diagnostic(message=f"EC optimization error: {e}", severity=Severity.ERROR)
         )
         return result
+
+    # Issue #109: warn when DCE strips an un-annotated readonly field. Such a
+    # field carries no compile-time value (no initializer) and is referenced by
+    # no method, so it is eliminated from the locking script entirely — silently
+    # dropping deploy-time metadata an author may intend to recover from the
+    # on-chain script later. ``@embedAlways`` fields were forced back in during
+    # ANF lowering, so they are "referenced" here and never warn.
+    _warn_dropped_readonly_fields(result, Diagnostic, Severity)
 
     # Pass 5: Stack lowering
     try:
@@ -885,10 +1344,12 @@ def _compile_from_source_str_with_result(
         emit_result.script_hex,
         emit_result.script_asm,
         emit_result.constructor_slots,
+        emit_result.code_sep_index_slots,
         emit_result.code_separator_index,
         emit_result.code_separator_indices,
         source_map=emit_result.source_map,
         stack_methods=stack_methods,
+        raw_script_spans=emit_result.raw_script_spans,
     )
     result.artifact = artifact
     result.script_hex = emit_result.script_hex

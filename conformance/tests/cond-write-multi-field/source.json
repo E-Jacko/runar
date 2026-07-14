@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "../../../examples/ts/cond-write-multi-field/CondWriteMultiField.runar.ts",
+    ".runar.sol": "../../../examples/sol/cond-write-multi-field/CondWriteMultiField.runar.sol",
+    ".runar.move": "../../../examples/move/cond-write-multi-field/CondWriteMultiField.runar.move",
+    ".runar.go": "../../../examples/go/cond-write-multi-field/CondWriteMultiField.runar.go",
+    ".runar.rs": "../../../examples/rust/cond-write-multi-field/CondWriteMultiField.runar.rs",
+    ".runar.py": "../../../examples/python/cond-write-multi-field/CondWriteMultiField.runar.py",
+    ".runar.zig": "../../../examples/zig/cond-write-multi-field/CondWriteMultiField.runar.zig",
+    ".runar.rb": "../../../examples/ruby/cond-write-multi-field/CondWriteMultiField.runar.rb",
+    ".runar.java": "../../../examples/java/src/main/java/runar/examples/cond-write-multi-field/CondWriteMultiField.runar.java"
+  }
+}

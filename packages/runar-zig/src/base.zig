@@ -8,11 +8,17 @@ pub const Sig = []const u8;
 pub const Addr = []const u8;
 pub const ByteString = []const u8;
 pub const Sha256 = []const u8;
+/// Alias for Sha256. Cross-language parity with the Go SDK, where the type
+/// had to be renamed to Sha256Digest to free the identifier `Sha256` for a
+/// real hash function.
+pub const Sha256Digest = Sha256;
 pub const Ripemd160 = []const u8;
 pub const SigHashPreimage = []const u8;
 pub const RabinSig = []const u8;
 pub const RabinPubKey = []const u8;
 pub const Point = []const u8;
+pub const P256Point = ByteString;
+pub const P384Point = ByteString;
 
 pub fn Readonly(comptime T: type) type {
     return T;
@@ -52,6 +58,49 @@ pub const OutputSnapshot = struct {
 };
 
 pub const SmartContract = struct {};
+
+/// UnsafeSmartContract is the base struct for stateless Rúnar contracts that
+/// need the raw-script escape hatch (`asm`). Embed (or assign as the parent
+/// marker on Zig-DSL contracts) so the Rúnar compiler routes the source
+/// through the `UnsafeSmartContract` parent-class branch. Like
+/// `SmartContract`, all properties must be readonly — `UnsafeSmartContract`
+/// trades the type-checked subset only for the bytes inside `asm` calls, not
+/// for mutable state. Use `StatefulSmartContract` for mutable state.
+pub const UnsafeSmartContract = struct {};
+
+/// Structured argument for the `asm` compiler intrinsic. The Rúnar Zig-DSL
+/// frontend intercepts `asm(...)` calls at parse time and lowers them to a
+/// `raw_script` ANF node; this struct only exists so native `zig build test`
+/// compilation of contract source succeeds.
+pub const AsmArgs = struct {
+    /// Even-length hex string of raw Bitcoin Script opcode bytes to embed
+    /// verbatim. The compiler does not re-encode or validate the semantics
+    /// of these bytes — only that the string is valid hex with an even
+    /// length.
+    body: []const u8,
+    /// Number of stack items the embedded bytes consume on entry. Defaults
+    /// to 0.
+    in_arity: i64 = 0,
+    /// Number of stack items the embedded bytes leave on exit. Defaults to
+    /// 1 so the common "terminal value of a public method" case works
+    /// without ceremony.
+    out_arity: i64 = 1,
+};
+
+/// Embeds a raw Bitcoin Script byte sequence in a contract method. Only
+/// callable from inside a contract that uses `UnsafeSmartContract` as the
+/// parent marker — the compiler enforces this. The Zig-DSL surface spelling
+/// is the positional form `asm(body, in_arity, out_arity)`; the compiler
+/// normalises every frontend to the same `raw_script` ANF node.
+///
+/// This runtime stub panics: `asm` is a compile-time intrinsic and cannot be
+/// executed off-chain.
+pub fn asm_(body: []const u8, in_arity: i64, out_arity: i64) void {
+    _ = body;
+    _ = in_arity;
+    _ = out_arity;
+    @panic("asm() cannot be called at runtime — compile this contract with the Rúnar compiler");
+}
 
 pub const StatefulSmartContractError = error{
     UnsupportedOutputValue,
@@ -187,6 +236,14 @@ pub const StatefulSmartContract = struct {
         });
     }
 
+    /// Record an extra transaction output that is NOT a state continuation.
+    /// Wire shape matches addRawOutput; the compiler-emitted continuation
+    /// hash places these outputs after state outputs and before the change
+    /// output, preserving declaration order.
+    pub fn addDataOutput(self: *StatefulSmartContract, satoshis: Bigint, script_bytes: ByteString) StatefulRuntimeError!void {
+        return self.addRawOutput(satoshis, script_bytes);
+    }
+
     pub fn getStateScript(self: *const StatefulSmartContract) ByteString {
         return self._current_state_script;
     }
@@ -211,6 +268,10 @@ pub const StatefulContext = struct {
 
     pub fn addRawOutput(self: StatefulContext, satoshis: Bigint, script_bytes: ByteString) void {
         self.runtime.addRawOutput(satoshis, script_bytes) catch @panic("failed to record raw output");
+    }
+
+    pub fn addDataOutput(self: StatefulContext, satoshis: Bigint, script_bytes: ByteString) void {
+        self.runtime.addDataOutput(satoshis, script_bytes) catch @panic("failed to record data output");
     }
 
     pub fn getStateScript(self: StatefulContext) ByteString {
@@ -292,7 +353,7 @@ fn freeOutputValues(allocator: std.mem.Allocator, values: []OutputValue) void {
 const test_state_magic = "rnrt";
 
 fn serializeOutputValueSlice(allocator: std.mem.Allocator, values: []const OutputValue) StatefulRuntimeError![]u8 {
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     try out.appendSlice(allocator, test_state_magic);
@@ -326,7 +387,7 @@ fn wrapContinuationScript(
     state_script: ByteString,
     suffix: ByteString,
 ) StatefulRuntimeError![]u8 {
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     try out.appendSlice(allocator, prefix);
@@ -337,7 +398,7 @@ fn wrapContinuationScript(
 }
 
 fn serializeRecordedOutput(allocator: std.mem.Allocator, output: OutputSnapshot) StatefulRuntimeError![]u8 {
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     try appendRecordedOutput(&out, allocator, output);
     return out.toOwnedSlice(allocator);
@@ -421,6 +482,29 @@ test "StatefulContext exposes txPreimage and mutating output helpers" {
     try std.testing.expectEqual(@as(usize, 32), output_hash.len);
 }
 
+test "addDataOutput records output with the same wire shape as addRawOutput" {
+    var runtime = StatefulSmartContract.init(std.testing.allocator);
+    defer runtime.deinit();
+
+    try runtime.addRawOutput(3, "raw-bytes");
+    try runtime.addDataOutput(4, "data-bytes");
+    try std.testing.expectEqual(@as(usize, 2), runtime.outputs().len);
+    try std.testing.expectEqual(@as(i64, 4), runtime.outputs()[1].satoshis);
+    try std.testing.expectEqualSlices(u8, "data-bytes", runtime.outputs()[1].continuationScript);
+    try std.testing.expectEqual(@as(usize, 0), runtime.outputs()[1].stateScript.len);
+}
+
+test "StatefulContext.addDataOutput forwards to the underlying runtime" {
+    var runtime = StatefulSmartContract.init(std.testing.allocator);
+    defer runtime.deinit();
+
+    const ctx = try StatefulContext.init(&runtime, "preimage");
+    ctx.addDataOutput(9, "data-payload");
+    try std.testing.expectEqual(@as(usize, 1), ctx.outputs().len);
+    try std.testing.expectEqual(@as(i64, 9), ctx.outputs()[0].satoshis);
+    try std.testing.expectEqualSlices(u8, "data-payload", ctx.outputs()[0].continuationScript);
+}
+
 test "stateful runtime supports explicit current-state and continuation envelopes" {
     var runtime = StatefulSmartContract.init(std.testing.allocator);
     defer runtime.deinit();
@@ -454,4 +538,31 @@ test "serialize helpers produce explicit deterministic test state bytes" {
 
     try std.testing.expect(std.mem.startsWith(u8, continuation, "prefix:"));
     try std.testing.expect(std.mem.endsWith(u8, continuation, ":suffix"));
+}
+
+test "Sha256Digest aliases Sha256 and serializes through test state helpers" {
+    const allocator = std.testing.allocator;
+
+    // Sha256Digest is a byte-string alias for Sha256. Using the alias for a
+    // state-field-like value must preserve the wire shape of the raw bytes.
+    const digest_bytes = [_]u8{ 0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81 } ** 4;
+    const digest: Sha256Digest = &digest_bytes;
+    try std.testing.expectEqual(@as(usize, 32), digest.len);
+
+    // Round-trip a Sha256Digest as a test state value and confirm the bytes
+    // are present in the serialized output (a Sha256Digest is a ByteString at
+    // runtime, so serialization is byte-identical).
+    const serialized = try serializeTestStateValues(allocator, .{digest});
+    defer allocator.free(serialized);
+    try std.testing.expect(std.mem.startsWith(u8, serialized, test_state_magic));
+    // The raw digest bytes should appear somewhere after the magic prefix.
+    try std.testing.expect(std.mem.indexOf(u8, serialized, &digest_bytes) != null);
+
+    // Sha256Digest end-to-end through the stateful runtime: the continuation
+    // wrapper should include the digest bytes when passed as a state value.
+    const continuation = try wrapTestContinuationScript(allocator, "p:", .{digest}, ":s");
+    defer allocator.free(continuation);
+    try std.testing.expect(std.mem.startsWith(u8, continuation, "p:"));
+    try std.testing.expect(std.mem.endsWith(u8, continuation, ":s"));
+    try std.testing.expect(std.mem.indexOf(u8, continuation, &digest_bytes) != null);
 }

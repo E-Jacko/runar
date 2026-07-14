@@ -160,7 +160,25 @@ function tokenize(source: string): GoToken[] {
       while (pos < source.length && peek() !== '"') {
         if (peek() === '\\') {
           advance(); // skip backslash
-          val += advance(); // take escaped char
+          const esc = peek();
+          if (esc === 'n') { val += '\n'; advance(); }
+          else if (esc === 't') { val += '\t'; advance(); }
+          else if (esc === 'r') { val += '\r'; advance(); }
+          else if (esc === '0') { val += '\0'; advance(); }
+          else if (esc === '\\') { val += '\\'; advance(); }
+          else if (esc === '"') { val += '"'; advance(); }
+          else if (esc === 'x') {
+            advance(); // consume 'x'
+            const h1 = peek();
+            const h2 = source[pos + 1] ?? '';
+            if (/[0-9a-fA-F]/.test(h1) && /[0-9a-fA-F]/.test(h2)) {
+              advance(); advance();
+              val += String.fromCharCode(parseInt(h1 + h2, 16));
+            } else {
+              val += '\\x';
+            }
+          }
+          else { val += advance(); }
         } else {
           val += advance();
         }
@@ -234,14 +252,16 @@ function goToCamel(name: string): string {
 // ---------------------------------------------------------------------------
 
 const GO_TYPE_MAP: Record<string, string> = {
-  Int: 'bigint', Bigint: 'bigint',
+  Int: 'bigint', Bigint: 'bigint', BigintBig: 'bigint',
   Bool: 'boolean', bool: 'boolean', int: 'bigint',
   ByteString: 'ByteString',
-  PubKey: 'PubKey', Sig: 'Sig', Sha256: 'Sha256',
+  PubKey: 'PubKey', Sig: 'Sig', Sha256: 'Sha256', Sha256Digest: 'Sha256',
   Ripemd160: 'Ripemd160', Addr: 'Addr',
   SigHashPreimage: 'SigHashPreimage',
   RabinSig: 'RabinSig', RabinPubKey: 'RabinPubKey',
   Point: 'Point',
+  P256Point: 'P256Point',
+  P384Point: 'P384Point',
 };
 
 function mapGoType(name: string): string {
@@ -250,7 +270,8 @@ function mapGoType(name: string): string {
 
 const PRIMITIVE_TYPES = new Set([
   'bigint', 'boolean', 'ByteString', 'PubKey', 'Sig', 'Sha256',
-  'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point', 'void',
+  'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey',
+  'Point', 'P256Point', 'P384Point', 'void',
 ]);
 
 function makePrimitiveOrCustom(name: string): TypeNode {
@@ -268,7 +289,7 @@ const GO_BUILTIN_MAP: Record<string, string> = {
   // Assertions
   Assert: 'assert',
   // Hashing
-  Hash160: 'hash160', Hash256: 'hash256', Sha256: 'sha256', Ripemd160: 'ripemd160',
+  Hash160: 'hash160', Hash256: 'hash256', Sha256: 'sha256', Sha256Hash: 'sha256', Ripemd160: 'ripemd160',
   // Signature verification
   CheckSig: 'checkSig', CheckMultiSig: 'checkMultiSig',
   CheckPreimage: 'checkPreimage', VerifyRabinSig: 'verifyRabinSig',
@@ -300,27 +321,44 @@ const GO_BUILTIN_MAP: Record<string, string> = {
   ExtractOutputHash: 'extractOutputHash',
   ExtractAmount: 'extractAmount',
   ExtractLocktime: 'extractLocktime',
+  // Intent sub-covenant intrinsics (BSVM Phase 13)
+  ExtractPrevOutputScript: 'extractPrevOutputScript',
+  RequireOutputP2PKH: 'requireOutputP2PKH',
+  CurrentBlockHeight: 'currentBlockHeight',
   // Output construction
-  AddOutput: 'addOutput', AddRawOutput: 'addRawOutput',
+  AddOutput: 'addOutput', AddRawOutput: 'addRawOutput', AddDataOutput: 'addDataOutput',
   GetStateScript: 'getStateScript',
   // Math builtins
   Abs: 'abs', Min: 'min', Max: 'max', Within: 'within',
   Safediv: 'safediv', Safemod: 'safemod', Clamp: 'clamp', Sign: 'sign',
   Pow: 'pow', MulDiv: 'mulDiv', PercentOf: 'percentOf', Sqrt: 'sqrt',
   Gcd: 'gcd', Divmod: 'divmod', Log2: 'log2',
-  // EC builtins
+  // EC builtins (secp256k1)
   EcAdd: 'ecAdd', EcMul: 'ecMul', EcMulGen: 'ecMulGen',
   EcNegate: 'ecNegate', EcOnCurve: 'ecOnCurve', EcModReduce: 'ecModReduce',
   EcEncodeCompressed: 'ecEncodeCompressed', EcMakePoint: 'ecMakePoint',
   EcPointX: 'ecPointX', EcPointY: 'ecPointY',
+  // EC builtins (P-256 / secp256r1)
+  P256Add: 'p256Add', P256Mul: 'p256Mul', P256MulGen: 'p256MulGen',
+  P256Negate: 'p256Negate', P256OnCurve: 'p256OnCurve',
+  P256EncodeCompressed: 'p256EncodeCompressed',
+  VerifyECDSAP256: 'verifyECDSA_P256',
+  // EC builtins (P-384 / secp384r1)
+  VerifyECDSAP384: 'verifyECDSA_P384',
+  // Baby Bear field arithmetic
+  BbFieldAdd: 'bbFieldAdd', BbFieldSub: 'bbFieldSub',
+  BbFieldMul: 'bbFieldMul', BbFieldInv: 'bbFieldInv',
+  // Merkle proof verification
+  MerkleRootSha256: 'merkleRootSha256', MerkleRootHash256: 'merkleRootHash256',
   // SHA-256 partial
   Sha256Compress: 'sha256Compress', Sha256Finalize: 'sha256Finalize',
 };
 
 /** Known type names used for type cast detection. */
 const GO_CAST_TYPES = new Set([
-  'Int', 'Bigint', 'Bool', 'ByteString', 'PubKey', 'Sig', 'Sha256',
-  'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point',
+  'Int', 'Bigint', 'BigintBig', 'Bool', 'ByteString', 'PubKey', 'Sig', 'Sha256',
+  'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey',
+  'Point', 'P256Point', 'P384Point',
 ]);
 
 function mapGoBuiltin(name: string): string {
@@ -356,7 +394,7 @@ class GoParser extends ParserCore<GoToken> {
     // Skip `import runar "..."`
     this.skipImports();
 
-    let parentClass: 'SmartContract' | 'StatefulSmartContract' = 'SmartContract';
+    let parentClass: 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract' = 'SmartContract';
     const properties: PropertyNode[] = [];
     const methods: MethodNode[] = [];
 
@@ -475,7 +513,7 @@ class GoParser extends ParserCore<GoToken> {
 
   private parseStructDecl(): {
     name: string;
-    parentClass: 'SmartContract' | 'StatefulSmartContract';
+    parentClass: 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract';
     properties: PropertyNode[];
   } | null {
     this.expect('type');
@@ -484,13 +522,14 @@ class GoParser extends ParserCore<GoToken> {
     this.expect('struct');
     this.expect('{');
 
-    let parentClass: 'SmartContract' | 'StatefulSmartContract' = 'SmartContract';
+    let parentClass: 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract' = 'SmartContract';
     const properties: PropertyNode[] = [];
 
     while (this.current().type !== '}' && this.current().type !== 'eof') {
       const propLoc = this.loc();
 
-      // Check for embedded type: runar.SmartContract / runar.StatefulSmartContract
+      // Check for embedded type: runar.SmartContract /
+      // runar.StatefulSmartContract / runar.UnsafeSmartContract
       if (this.current().type === 'ident' && this.current().value === 'runar' &&
           this.tokens[this.pos + 1]?.type === '.') {
         this.advance(); // skip 'runar'
@@ -498,6 +537,8 @@ class GoParser extends ParserCore<GoToken> {
         const embedName = this.expect('ident').value;
         if (embedName === 'StatefulSmartContract') {
           parentClass = 'StatefulSmartContract';
+        } else if (embedName === 'UnsafeSmartContract') {
+          parentClass = 'UnsafeSmartContract';
         }
         continue;
       }
@@ -1069,9 +1110,48 @@ class GoParser extends ParserCore<GoToken> {
       return expr;
     }
 
-    // Array literal: [expr, expr, ...]
+    // Go composite literal for arrays: [N]Type{elements} or [N][M]Type{{...},{...}}
+    // Also accept plain `[expr, expr, ...]` form for compatibility with earlier
+    // Go example contracts that used TS-style bracket literal syntax.
     if (t.type === '[') {
-      this.advance();
+      // Look ahead to decide between Go composite literal (`[N]...{...}`)
+      // and the legacy bracket-list form (`[a, b, c]`).
+      const saved = this.pos;
+      this.advance(); // skip '['
+      const isCompositeDims: number[] = [];
+      // Collect all leading `[N]` dimensions.
+      if (this.current().type === 'number') {
+        const maybeLen = parseInt(this.current().value, 10);
+        // Peek one more token to see if it's ']'.
+        if (this.tokens[this.pos + 1]?.type === ']') {
+          // Composite path: consume `N]` plus any additional `[M]` dims.
+          this.advance(); // skip number
+          this.advance(); // skip ']'
+          isCompositeDims.push(maybeLen);
+          while (this.current().type === '[' && this.tokens[this.pos + 1]?.type === 'number' && this.tokens[this.pos + 2]?.type === ']') {
+            this.advance(); // '['
+            isCompositeDims.push(parseInt(this.advance().value, 10));
+            this.advance(); // ']'
+          }
+          // Consume the element type: `runar.Bigint`, `bool`, etc.
+          if (this.current().type === 'ident' && this.current().value === 'runar' && this.tokens[this.pos + 1]?.type === '.') {
+            this.advance(); // runar
+            this.advance(); // .
+            this.advance(); // type name
+          } else if (this.current().type === 'ident') {
+            this.advance();
+          }
+          // Now expect `{` — composite literal body.
+          if (this.current().type === '{') {
+            return this.parseGoBraceLiteral();
+          }
+          // Not a composite literal after all — roll back.
+          this.pos = saved;
+        }
+      }
+      if (this.pos === saved) {
+        this.advance(); // skip '['
+      }
       const elements: Expression[] = [];
       while (this.current().type !== ']' && this.current().type !== 'eof') {
         elements.push(this.parseExpression());
@@ -1079,6 +1159,11 @@ class GoParser extends ParserCore<GoToken> {
       }
       this.expect(']');
       return { kind: 'array_literal', elements };
+    }
+
+    // Nested composite literal body: `{elem, elem, ...}` or `{ {..}, {..} }`.
+    if (t.type === '{') {
+      return this.parseGoBraceLiteral();
     }
 
     // Identifier — handles runar.X, receiver.Field, plain idents
@@ -1089,6 +1174,25 @@ class GoParser extends ParserCore<GoToken> {
       if (t.value === 'runar' && this.current().type === '.') {
         this.advance(); // skip '.'
         const memberName = this.expect('ident').value;
+
+        // Special-case: runar.ByteString("literal") — hex-encode the raw bytes
+        // of the string literal and emit a ByteString literal node directly.
+        // runar.ByteString(variable) falls through to the generic type cast
+        // unwrap below.
+        if (memberName === 'ByteString' && this.current().type === '(' &&
+            this.tokens[this.pos + 1]?.type === 'string' &&
+            this.tokens[this.pos + 2]?.type === ')') {
+          this.advance(); // '('
+          const strTok = this.advance(); // consume string
+          this.advance(); // ')'
+          // Hex-encode the raw bytes of the string literal (tokenizer has
+          // already decoded Go escape sequences like \x00 into real bytes).
+          let hex = '';
+          for (let i = 0; i < strTok.value.length; i++) {
+            hex += strTok.value.charCodeAt(i).toString(16).padStart(2, '0');
+          }
+          return { kind: 'bytestring_literal', value: hex };
+        }
 
         // Check for type cast: runar.Bigint(expr), runar.Bool(expr), etc.
         if (GO_CAST_TYPES.has(memberName) && this.current().type === '(') {
@@ -1115,6 +1219,25 @@ class GoParser extends ParserCore<GoToken> {
     // Fallback
     this.advance();
     return { kind: 'identifier', name: t.value };
+  }
+
+  /**
+   * Parse a Go composite literal body: `{elem, elem, ...}`. Each element may
+   * itself be a nested `{ ... }` for multi-dimensional arrays.
+   */
+  private parseGoBraceLiteral(): Expression {
+    this.expect('{');
+    const elements: Expression[] = [];
+    while (this.current().type !== '}' && this.current().type !== 'eof') {
+      if (this.current().type === '{') {
+        elements.push(this.parseGoBraceLiteral());
+      } else {
+        elements.push(this.parseExpression());
+      }
+      if (this.current().type === ',') this.advance();
+    }
+    this.expect('}');
+    return { kind: 'array_literal', elements };
   }
 }
 

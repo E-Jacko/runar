@@ -2,12 +2,12 @@
 
 *Old Norse plural for "runes" (rún = secret/script/mystery). Pronounced ROO-nar.*
 
-**Write Bitcoin smart contracts in TypeScript, Go, Rust, Ruby, Python, Zig, Solidity, or Move. Compile to Bitcoin Script.**
+**Write Bitcoin smart contracts in TypeScript, Go, Rust, Java, Ruby, Python, Zig, Solidity, or Move. Compile to Bitcoin Script.**
 
 <!-- Badges -->
-![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
+[![CI](https://github.com/icellan/runar/actions/workflows/ci.yml/badge.svg)](https://github.com/icellan/runar/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![npm version](https://img.shields.io/badge/npm-v0.3.2-orange)
+![version](https://img.shields.io/badge/version-1.0.0--rc.1-orange)
 
 ---
 
@@ -63,9 +63,7 @@ pub struct P2PKH {
     pub pub_key_hash: Addr,
 }
 
-#[runar::methods(P2PKH)]
 impl P2PKH {
-    #[public]
     pub fn unlock(&self, sig: &Sig, pub_key: &PubKey) {
         assert!(hash160(pub_key) == self.pub_key_hash);
         assert!(check_sig(sig, pub_key));
@@ -179,7 +177,7 @@ pub const P2PKH = struct {
 };
 ```
 
-All eight formats produce the same Bitcoin Script: `OP_DUP OP_HASH160 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG`
+All nine formats produce the same Bitcoin Script: `OP_DUP OP_HASH160 <pubKeyHash> OP_EQUALVERIFY OP_CHECKSIG`
 
 ---
 
@@ -188,10 +186,10 @@ All eight formats produce the same Bitcoin Script: `OP_DUP OP_HASH160 <pubKeyHas
 Bitcoin Script development today forces a choice between hand-writing opcodes (error-prone, unauditable) or adopting a framework with heavy decorator-based DSLs that obscure what happens on-chain. Rúnar takes a different path:
 
 - **No decorators** — uses native language keywords (`readonly`, `public`, `immutable`, `#[readonly]`, `prop`)
-- **Write in your language** — TypeScript, Go, Rust, Ruby, Python, Zig, Solidity-like, or Move-style
-- **Test natively** — `vitest` for TS, `go test` for Go, `cargo test` for Rust, `rspec` for Ruby, `pytest` for Python, `zig build test` for Zig examples
-- **Five compilers** — TypeScript (reference), Go, Rust, Python, Zig — all produce byte-identical output
-- **Post-quantum ready** — WOTS+ and SLH-DSA (FIPS 205) signature verification in Bitcoin Script
+- **Write in your language** — TypeScript, Go, Rust, Ruby, Python, Zig, Java, Solidity-like, or Move-style
+- **Test natively** — `vitest` for TS, `go test` for Go, `cargo test` for Rust, `rspec` for Ruby, `pytest` for Python, `zig build test` for Zig, JUnit for Java examples
+- **Seven compilers** — TypeScript (reference), Go, Rust, Python, Zig, Ruby, Java — all produce byte-identical output
+- **Post-quantum (experimental)** — WOTS+ and SLH-DSA (FIPS 205) signature verification in Bitcoin Script. The shipped wallet examples are deliberately naive constructions (see `examples/ts/post-quantum-*-naive-INSECURE*`); treat the PQ surface as experimental, not production-ready.
 - **Nanopass architecture** — 6 small passes, each auditable in a single sitting
 - **Full IDE support** — type checking, autocompletion, go-to-definition in every language
 
@@ -210,7 +208,7 @@ runar compile MyContract.runar.ts    # => artifacts/MyContract.runar.json
 
 ```bash
 # In your go.mod, add:
-#   require github.com/icellan/runar/packages/runar-go v0.1.0
+#   require github.com/icellan/runar/packages/runar-go v1.0.0-rc.1
 # Contracts are real Go — test with go test, compile with the Rúnar Go compiler
 go test ./...
 ```
@@ -218,7 +216,7 @@ go test ./...
 ### Rust
 
 ```bash
-# In Cargo.toml: runar = { package = "runar-lang", version = "0.1.0" }
+# In Cargo.toml: runar = { package = "runar-lang", version = "1.0.0-rc.1" }
 # Contracts are real Rust — test with cargo test, compile with the Rúnar Rust compiler
 cargo test
 ```
@@ -246,6 +244,28 @@ cd examples/zig && zig build test
 cd ../..
 cd compilers/zig && zig build run -- compile ../../examples/zig/p2pkh/P2PKH.runar.zig
 ```
+
+---
+
+## SDKs & Deployment
+
+Rúnar ships seven deployment SDKs with equivalent capabilities. Each one wraps a compiled artifact, exposes pluggable `Provider` and `Signer` interfaces, deploys contracts on-chain, and calls public methods. Each SDK README is a complete, self-contained reference: install, quick start, core concepts, deploy, call, multi-signer flows, BRC-100 wallet signing, stateful contracts, UTXO and fee management, codegen, testing, provider configuration, full API reference, error handling.
+
+| Language | Package | Install | Reference |
+|----------|---------|---------|-----------|
+| TypeScript | [`runar-sdk`](packages/runar-sdk/) | `pnpm add runar-sdk` | [README](packages/runar-sdk/README.md) |
+| Go | [`runar-go`](packages/runar-go/) | `go get github.com/icellan/runar/packages/runar-go` | [README](packages/runar-go/README.md) |
+| Rust | [`runar-rs`](packages/runar-rs/) | `cargo add runar` | [README](packages/runar-rs/README.md) |
+| Python | [`runar-py`](packages/runar-py/) | `pip install runar-lang` | [README](packages/runar-py/README.md) |
+| Java | [`runar-java`](packages/runar-java/) | `implementation("build.runar:runar-java")` | [README](packages/runar-java/README.md) |
+| Ruby | [`runar-rb`](packages/runar-rb/) | `gem install runar-lang` | [README](packages/runar-rb/README.md) |
+| Zig | [`runar-zig`](packages/runar-zig/) | `zig fetch --save runar-zig` | [README](packages/runar-zig/README.md) |
+
+Each SDK's Quick Start deploys the same `Counter` contract (stateful, two methods, single `bigint` field) end-to-end, so a developer comparing languages sees identical functionality with idiomatic differences. SDK output is byte-identical across all seven — verified by [`conformance/sdk-output/`](conformance/sdk-output/).
+
+> **On "verified":** the byte-identity above is an *empirical* cross-tier conformance result. Separately, the compiler's back-half pipeline (ANF → Stack IR → Bitcoin Script) carries a *machine-checked Lean proof* of observational correctness **modulo 70 explicitly-enumerated codegen axioms** — not an end-to-end formal guarantee. See [`runar-verification/TRUST_MANIFEST.md`](runar-verification/TRUST_MANIFEST.md) for the precise trust boundary.
+
+For an in-progress comparison of the codegen surface across SDKs, see [`RUNAR-SDK-PARITY.md`](RUNAR-SDK-PARITY.md).
 
 ---
 
@@ -340,16 +360,24 @@ Zig example tests live next to the contracts under `examples/zig/` and use `pack
 
 ## Supported Formats
 
+All seven compilers parse all nine formats (frontend parity is enforced in CI
+by the all-tier parser-only matrix). The **Status** column tracks language-surface
+maturity, not parser coverage.
+
 | Format | Extension | Compilers | IDE Support | Status |
 |--------|-----------|-----------|-------------|--------|
-| TypeScript | `.runar.ts` | TS, Go, Rust, Python, Zig | Full (`tsc`) | **Stable** |
-| Zig | `.runar.zig` | TS, Zig | Full (`zls`) | Experimental |
-| Go | `.runar.go` | Go, Python | Full (`gopls`) | Experimental |
-| Rust DSL | `.runar.rs` | Rust, Python | Full (`rust-analyzer`) | Experimental |
-| Ruby | `.runar.rb` | TS, Go, Rust, Python | Full (Ruby LSP) | Experimental |
-| Python | `.runar.py` | TS, Go, Rust, Python | Full (`pyright`) | Experimental |
-| Solidity-like | `.runar.sol` | TS, Go, Rust, Python | Syntax highlighting | Experimental |
-| Move-style | `.runar.move` | TS, Go, Rust, Python | Syntax highlighting | Experimental |
+| TypeScript | `.runar.ts` | All 7 | Full (`tsc`) | **Stable** |
+| Zig | `.runar.zig` | All 7 | Full (`zls`) | Experimental |
+| Go | `.runar.go` | All 7 | Full (`gopls`) | Experimental |
+| Rust DSL | `.runar.rs` | All 7 | Full (`rust-analyzer`) | Experimental |
+| Ruby | `.runar.rb` | All 7 | Full (Ruby LSP) | Experimental |
+| Python | `.runar.py` | All 7 | Full (`pyright`) | Experimental |
+| Java | `.runar.java` | All 7 | Full (IntelliJ, Eclipse) | Experimental |
+| Solidity-like | `.runar.sol` | All 7 | Syntax highlighting | Experimental |
+| Move-style | `.runar.move` | All 7 | Syntax highlighting | Experimental |
+
+"All 7" = TypeScript (reference), Go, Rust, Python, Zig, Ruby, Java. Only the
+TypeScript surface is **Stable**; every other language surface is **Experimental**.
 
 All formats parse into the same `ContractNode` AST. From there, the pipeline is identical:
 
@@ -358,7 +386,8 @@ All formats parse into the same `ContractNode` AST. From there, the pipeline is 
   .runar.zig ──┤
   .runar.sol ──┤
   .runar.move ─┤
-  .runar.py ───┼──► ContractNode AST ──► Validate ──► TypeCheck ──► ANF ──► Stack ──► Bitcoin Script
+  .runar.py ───┤
+  .runar.java ─┼──► ContractNode AST ──► Validate ──► TypeCheck ──► ANF ──► Stack ──► Bitcoin Script
   .runar.rb ───┤
   .runar.go ───┤
   .runar.rs ───┘
@@ -368,7 +397,7 @@ All formats parse into the same `ContractNode` AST. From there, the pipeline is 
 
 ## Example Contracts
 
-21 example contracts demonstrate the major contract patterns implemented across the maintained native-language frontends:
+24 example contracts demonstrate the major contract patterns implemented across the maintained native-language frontends:
 
 | Contract | Pattern | Stateful | Multi-method |
 |----------|---------|----------|-------------|
@@ -393,8 +422,11 @@ All formats parse into the same `ContractNode` AST. From there, the pipeline is 
 | [Blake3Test](examples/ts/blake3/) | BLAKE3 compression/hash built-ins | No | No |
 | [Sha256CompressTest](examples/ts/sha256-compress/) | SHA-256 compression builtin | No | No |
 | [Sha256FinalizeTest](examples/ts/sha256-finalize/) | SHA-256 finalize builtin | No | No |
+| [OrdinalNFT](examples/ts/ordinal-nft/) | 1sat ordinal NFT inscription | No | No |
+| [BSV20Token](examples/ts/bsv20-token/) | BSV-20 fungible token inscription | No | No |
+| [BSV21Token](examples/ts/bsv21-token/) | BSV-21 fungible token inscription | No | No |
 
-All 21 examples are available in `ts/`, `go/`, `rust/`, `python/`, and `zig/`. 11 contracts are available in all 8 formats (TypeScript, Go, Rust, Ruby, Python, Zig, Solidity, Move). FunctionPatterns, PostQuantumWallet, SPHINCSWallet, SchnorrZKP, and ConvergenceProof are available in TypeScript, Go, Rust, Ruby, and Python. A 16-contract subset is also available in `sol/` and `move/`.
+All 24 examples are available in `ts/`, `go/`, `rust/`, `python/`, and `zig/`. 71 contracts are available in all 9 formats (TypeScript, Go, Rust, Ruby, Python, Zig, Java, Solidity, Move). FunctionPatterns, PostQuantumWallet, SPHINCSWallet, SchnorrZKP, and ConvergenceProof are available in TypeScript, Go, Rust, Ruby, and Python. The full example set is also mirrored in `sol/` and `move/` (72 contracts each).
 ```
 examples/
   ts/p2pkh/          P2PKH.runar.ts + P2PKH.test.ts
@@ -408,6 +440,20 @@ examples/
 ```
 
 The Zig example tree is backed by `packages/runar-zig` and a shared runner at `examples/zig/examples_test.zig`.
+
+---
+
+## Documentation
+
+| Guide | Description |
+|-------|-------------|
+| [Getting Started](docs/getting-started.md) | Installation, first contract, compile, test, deploy |
+| [Language Reference](docs/language-reference.md) | Types, operators, built-in functions |
+| [Contract Patterns](docs/contract-patterns.md) | P2PKH, escrow, tokens, auctions, covenants |
+| [1sat Ordinals & Tokens](docs/ordinals-guide.md) | NFT inscriptions, BSV-20/BSV-21 fungible tokens |
+| [Integration Guide](docs/integration-guide.md) | Full lifecycle: local dev, deploy, interact on-chain |
+| [Testing Guide](docs/testing-guide.md) | TestContract, VM, fuzzer, cross-compiler testing |
+| [SDK READMEs](#sdks--deployment) | Per-language deployment SDK reference (TS, Go, Rust, Python, Java, Ruby, Zig) |
 
 ---
 
@@ -426,19 +472,16 @@ The compiler is structured as six small, composable nanopass transforms. Each pa
 | 5 | **Stack Lower** | ANF IR | Stack IR |
 | 6 | **Emit** | Stack IR | Bitcoin Script |
 
-The constant folding optimizer (+ dead binding elimination) is available between passes 4 and 5 but is disabled by default to preserve ANF conformance. The peephole optimizer runs between passes 5 and 6 (always enabled).
+The constant folding optimizer (+ dead binding elimination) is available between passes 4 and 5; it is enabled by default at the user-facing TS API and CI enforces cross-tier parity in BOTH fold-on and fold-off modes (`conformance/fold-on-allowlist.json` is the registry for any fixture×format pairs allowlisted under fold-on with a documented reason; it is currently empty — no exemptions). The peephole optimizer runs between passes 5 and 6 (always enabled).
 
 ### Multi-Compiler Strategy
 
-Rúnar defines a **canonical IR conformance boundary** at the ANF level. Any compiler that produces byte-identical ANF IR for a given source file is conformant:
+Rúnar defines a **canonical IR conformance boundary** at the ANF level. The seven reference compilers (TypeScript, Go, Rust, Python, Zig, Ruby, Java) each accept all nine source formats (`.runar.{ts,sol,move,go,rs,py,zig,rb,java}`) and target two layers of conformance:
 
-- The **TypeScript compiler** is the reference implementation
-- The **Go compiler** produces identical output for all example contracts including post-quantum
-- The **Rust compiler** produces identical output for all example contracts including post-quantum
-- The **Python compiler** produces identical output for all example contracts including post-quantum
-- The **Zig compiler** produces identical output for the conformance suite and benchmarked example workloads
+- **Frontend parity (mandatory for every tier).** Every fixture must parse cleanly through every compiler in every one of the nine source formats. There are no per-tier carve-outs at the parser layer. Enforced in CI by the `--parser-only` runner mode (`pnpm --filter runar-conformance test:parser-only` locally; CI step "Run all-tier parser-only coverage"): every available compiler runs `--parse-only` against every (fixture, format) pair, ignoring the per-fixture `compilers` allowlist (which only scopes Stack-IR / hex parity).
+- **Stack-IR + hex parity (scoped per fixture).** Fixtures without a `compilers` allowlist in `source.json` must produce byte-identical Stack IR + Bitcoin Script hex across all seven tiers. Fixtures that opt out — the four Go-only fixtures `babybear`, `babybear-ext4`, `merkle-proof`, and `state-covenant` — carry an explicit `compilers` array + `compilersJustification` rationale string.
 
-The conformance suite in `conformance/` contains 27 golden-file tests (including WOTS+, SLH-DSA, SHA-256, BLAKE3, and EC primitives). The maintained compilers target the same suite.
+The TypeScript compiler is the reference implementation; Go, Rust, Python, Zig, Ruby, and Java are full peers. The conformance suite in `conformance/` contains 64 fixtures spanning P2PKH, stateful counters, escrow, oracle covenants, WOTS+/SLH-DSA, SHA-256, BLAKE3, EC, NIST P-256/P-384, BabyBear / KoalaBear / Merkle / FRI primitives. The cross-tier audit (`conformance/runner/__tests__/allowlist-audit.test.ts`) gates the allowlist set so opt-outs don't grow silently.
 
 ### Contract Model
 
@@ -470,7 +513,7 @@ packages/
   runar-go/            # Go package: types, mock crypto, real hashes, CompileCheck(), deployment SDK
   runar-rb/            # Ruby gem: types, DSL, mock crypto, real hashes, EC operations, deployment SDK
   runar-rs/            # Rust crate: prelude types, mock crypto, real hashes, compile_check(), deployment SDK
-  runar-rs-macros/     # Rust proc-macros (#[runar::contract], #[public], etc.)
+  runar-rs-macros/     # Rust proc-macros (#[runar::contract], #[runar::stateful_contract])
   runar-py/            # Python package: types, mock crypto, real hashes, deployment SDK
   runar-zig/           # Zig package: native testing/runtime helpers and compile checks
 compilers/
@@ -489,7 +532,7 @@ examples/
   move/               # Move-style contracts + tests
   zig/                # Zig contracts + adjacent Zig tests
   sdk-usage/          # SDK usage reference docs (not runnable)
-end2end-example/      # End-to-end example (ts, go, rust, sol, move, webapp, webapp-blackjack)
+  end2end-example/    # End-to-end example (ts, go, rust, sol, move, webapp, webapp-blackjack)
 spec/                 # Language specification
 docs/                 # Documentation + format guides
 ```
@@ -511,7 +554,19 @@ docs/                 # Documentation + format guides
 ```bash
 git clone https://github.com/icellan/runar.git && cd runar
 pnpm install && pnpm build
+```
 
+Three layered local-test entry points — pick the one matching your loop:
+
+| Command | Scope | Use when |
+|---|---|---|
+| `pnpm test` | TS unit suites only (workspace `turbo run test`). ~30 s. | Iterating on a single TS package. |
+| `pnpm test:all` | `test` + `conformance:all` + `examples:all` + `e2e:all` + `wallet-client:all`. Excludes regtest integration. ~10–20 min. | Pre-PR sanity. Every cross-tier check the project owns *except* the live BSV regtest node. |
+| `pnpm test:ci` | `test:all` + `integration:all`. Requires `pnpm integration:svnode:start` first. ~20–40 min. | Mirrors what CI gates on. The contract is: green here → green CI. |
+
+Per-tier escape hatches (run an individual compiler / SDK / examples suite):
+
+```bash
 # TypeScript (packages + all format examples)
 npx vitest run
 
@@ -530,6 +585,15 @@ cd examples/ruby && bundle exec rspec
 cd packages/runar-py && python3 -m pytest
 cd examples/python && PYTHONPATH=../../packages/runar-py python3 -m pytest
 ```
+
+> **On test skips.** The full corpus has a small number of legitimate skips
+> (slow WOTS+/SLH-DSA/Groth16 scripts gated by `-short`, BRC-100 wallet
+> round-trips gated by `RUNAR_WALLET_ENDPOINT`, regtest integration suite
+> gated by `-Drunar.integration=true` / `-tags=integration`, cross-compiler
+> suites gated on installed toolchains). Every skip is inventoried with its
+> rationale in [`docs/test-skips.md`](docs/test-skips.md). The audit deliberately
+> contains zero "Stale" or "Gap" skips — any new skip should fall into one
+> bucket and join that document.
 
 ---
 

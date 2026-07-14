@@ -69,6 +69,15 @@ pub fn parseSol(allocator: Allocator, source: []const u8, file_name: []const u8)
     return parser.parse();
 }
 
+/// True if every byte in `s` is an ASCII digit (0-9).
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Token Types
 // ============================================================================
@@ -446,7 +455,7 @@ const Parser = struct {
             if (ParentClass.fromTsString(parent_tok.text)) |pc| {
                 parent_class = pc;
             } else {
-                self.addErrorFmt("unknown parent class: '{s}', expected SmartContract or StatefulSmartContract", .{parent_tok.text});
+                self.addErrorFmt("unknown parent class: '{s}', expected SmartContract, StatefulSmartContract, or UnsafeSmartContract", .{parent_tok.text});
                 return null;
             }
         }
@@ -506,6 +515,10 @@ const Parser = struct {
 
         const type_tok = self.bump();
         const type_name = type_tok.text;
+        // Wrap with any trailing `[N]` bracket suffixes — Solidity native
+        // outer-to-inner declaration order, so `T[A][B]` lowers to
+        // FixedArray<FixedArray<T, A>, B>.
+        const type_node = self.parseSolFixedArraySuffix(.{ .primitive_type = .void }, type_name);
 
         // Check for immutable keyword
         var is_readonly = false;
@@ -532,13 +545,83 @@ const Parser = struct {
         _ = self.match(.semicolon);
 
         // For SmartContract, all fields are readonly
-        const readonly = if (parent_class == .smart_contract) true else is_readonly;
+        const readonly = if (parent_class == .smart_contract or parent_class == .unsafe_smart_contract) true else is_readonly;
+
+        // Capture FixedArray shape (outer + nested) so expand_fixed_arrays
+        // can see the property after typecheck.
+        var fa_len: u32 = 0;
+        var fa_elem: RunarType = .unknown;
+        var fa_nested_len: u32 = 0;
+        if (type_node == .fixed_array_type) {
+            fa_len = type_node.fixed_array_type.length;
+            const inner = type_node.fixed_array_type.element.*;
+            fa_elem = types.typeNodeToRunarType(inner);
+            if (inner == .fixed_array_type) {
+                fa_nested_len = inner.fixed_array_type.length;
+            }
+        }
 
         return .{
             .name = name_tok.text,
-            .type_info = resolveSolType(type_name),
+            .type_info = types.typeNodeToRunarType(type_node),
             .readonly = readonly,
             .initializer = initializer,
+            .fixed_array_length = fa_len,
+            .fixed_array_element = fa_elem,
+            .fixed_array_nested_length = fa_nested_len,
+        };
+    }
+
+    /// Wrap the base type (named by `type_name`) with any trailing `[N]`
+    /// bracket suffixes, producing a `TypeNode` that may be a nested
+    /// `FixedArrayType`. The first call passes a dummy base; the real
+    /// base is computed from `type_name` so we can resolve the inner
+    /// primitive lazily and avoid heap-allocating when no brackets follow.
+    fn parseSolFixedArraySuffix(self: *Parser, _: TypeNode, type_name: []const u8) TypeNode {
+        const base_runar = resolveSolType(type_name);
+        var base: TypeNode = if (base_runar == .unknown)
+            .{ .custom_type = type_name }
+        else
+            runarTypeToTypeNode(base_runar);
+        while (self.current.kind == .lbracket) {
+            _ = self.bump();
+            if (self.current.kind != .number) {
+                self.addError("FixedArray length must be a non-negative integer literal");
+                while (self.current.kind != .rbracket and self.current.kind != .eof) _ = self.bump();
+                _ = self.match(.rbracket);
+                return base;
+            }
+            const size_tok = self.bump();
+            const size = std.fmt.parseInt(u32, size_tok.text, 10) catch 0;
+            _ = self.expect(.rbracket);
+            const elem_ptr = self.allocator.create(TypeNode) catch return base;
+            elem_ptr.* = base;
+            base = .{ .fixed_array_type = .{ .element = elem_ptr, .length = size } };
+        }
+        return base;
+    }
+
+    /// Inverse of typeNodeToRunarType for the primitive subset — we need
+    /// this so the FixedArray suffix wrapper can lift a primitive RunarType
+    /// back into a TypeNode for `element` storage.
+    fn runarTypeToTypeNode(rt: RunarType) TypeNode {
+        return switch (rt) {
+            .bigint => .{ .primitive_type = .bigint },
+            .boolean => .{ .primitive_type = .boolean },
+            .byte_string => .{ .primitive_type = .byte_string },
+            .pub_key => .{ .primitive_type = .pub_key },
+            .sig => .{ .primitive_type = .sig },
+            .sha256 => .{ .primitive_type = .sha256 },
+            .ripemd160 => .{ .primitive_type = .ripemd160 },
+            .addr => .{ .primitive_type = .addr },
+            .sig_hash_preimage => .{ .primitive_type = .sig_hash_preimage },
+            .rabin_sig => .{ .primitive_type = .rabin_sig },
+            .rabin_pub_key => .{ .primitive_type = .rabin_pub_key },
+            .point => .{ .primitive_type = .point },
+            .p256_point => .{ .primitive_type = .p256_point },
+            .p384_point => .{ .primitive_type = .p384_point },
+            .void => .{ .primitive_type = .void },
+            else => .{ .custom_type = "unknown" },
         };
     }
 
@@ -565,12 +648,14 @@ const Parser = struct {
         if (std.mem.eql(u8, name, "Sig")) return .sig;
         if (std.mem.eql(u8, name, "Addr")) return .addr;
         if (std.mem.eql(u8, name, "ByteString")) return .byte_string;
-        if (std.mem.eql(u8, name, "Sha256")) return .sha256;
+        if (std.mem.eql(u8, name, "Sha256") or std.mem.eql(u8, name, "Sha256Digest")) return .sha256;
         if (std.mem.eql(u8, name, "Ripemd160")) return .ripemd160;
         if (std.mem.eql(u8, name, "SigHashPreimage")) return .sig_hash_preimage;
         if (std.mem.eql(u8, name, "RabinSig")) return .rabin_sig;
         if (std.mem.eql(u8, name, "RabinPubKey")) return .rabin_pub_key;
         if (std.mem.eql(u8, name, "Point")) return .point;
+        if (std.mem.eql(u8, name, "P256Point")) return .p256_point;
+        if (std.mem.eql(u8, name, "P384Point")) return .p384_point;
         if (std.mem.eql(u8, name, "void")) return .void;
 
         // Also check via PrimitiveTypeName for any we missed
@@ -599,12 +684,17 @@ const Parser = struct {
             super_args.append(self.allocator, .{ .identifier = param.name }) catch {};
         }
 
-        // Extract assignments from body (name = _name patterns)
+        // Extract assignments from body (name = _name patterns).
+        // Constructor params are stored without the leading underscore, but the
+        // body may still reference `_name` — rewrite those references back to
+        // the stripped param name so the ANF lowerer treats them consistently
+        // with the other compilers (TS/Go/Rust/Python/Ruby).
         var assignments: std.ArrayListUnmanaged(AssignmentNode) = .empty;
         for (body) |stmt| {
             switch (stmt) {
                 .assign => |assign| {
-                    assignments.append(self.allocator, .{ .target = assign.target, .value = assign.value }) catch {};
+                    const renamed_value = self.solRenameUnderscoreIdents(assign.value, params);
+                    assignments.append(self.allocator, .{ .target = assign.target, .value = renamed_value }) catch {};
                 },
                 .expr_stmt => |expr| {
                     // Check if it's a call to assert/require (skip)
@@ -797,6 +887,15 @@ const Parser = struct {
         // return ...;
         if (self.checkIdent("return")) return self.parseReturnStmt();
 
+        // `let Type name = expr;` — Rúnar-Solidity local variable declaration.
+        // The Sol surface syntax requires the explicit `let` keyword in front
+        // of the type so the parser can disambiguate against a free-standing
+        // call expression like `numToBin(...)`.
+        if (self.checkIdent("let")) {
+            _ = self.bump(); // consume 'let'
+            return self.parseSolVarDecl();
+        }
+
         // Variable declaration: Type name = expr;
         // We detect this by checking if current is a type identifier followed by another identifier
         if (self.current.kind == .ident and self.isTypeStart()) {
@@ -904,6 +1003,8 @@ const Parser = struct {
         var var_name: []const u8 = "_i";
         var init_value: i64 = 0;
         var bound: i64 = 0;
+        var descending: bool = false;
+        var inclusive: bool = false;
 
         // Initializer: Type varname = expr OR let/const varname = expr
         if (self.current.kind == .ident and self.isTypeStart()) {
@@ -945,6 +1046,9 @@ const Parser = struct {
             if (cond_expr) |expr| {
                 switch (expr) {
                     .binary_op => |bop| {
+                        descending = bop.op == .gt or bop.op == .gte;
+                        // Issue #121: record inclusivity (`<=`/`>=`).
+                        inclusive = bop.op == .lte or bop.op == .gte;
                         switch (bop.right) {
                             .literal_int => |v| {
                                 bound = v;
@@ -966,7 +1070,7 @@ const Parser = struct {
 
         const body = self.parseBlockOrStatement();
 
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .body = body } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .body = body } };
     }
 
     fn parseReturnStmt(self: *Parser) ?Statement {
@@ -1060,6 +1164,58 @@ const Parser = struct {
         const bop = self.allocator.create(BinaryOp) catch return null;
         bop.* = .{ .op = op, .left = left, .right = right };
         return .{ .binary_op = bop };
+    }
+
+    /// Recursively rewrite identifiers `_name` -> `name` whenever `name` is the
+    /// stripped form of a constructor parameter. Used to clean constructor body
+    /// expressions so that the ANF lowerer doesn't see stale `_xxx` references.
+    fn solRenameUnderscoreIdents(self: *Parser, expr: Expression, params: []const ParamNode) Expression {
+        switch (expr) {
+            .identifier => |name| {
+                if (name.len > 1 and name[0] == '_') {
+                    const stripped = name[1..];
+                    for (params) |p| {
+                        if (std.mem.eql(u8, p.name, stripped)) {
+                            return .{ .identifier = stripped };
+                        }
+                    }
+                }
+                return expr;
+            },
+            .binary_op => |bop| {
+                bop.left = self.solRenameUnderscoreIdents(bop.left, params);
+                bop.right = self.solRenameUnderscoreIdents(bop.right, params);
+                return expr;
+            },
+            .unary_op => |uop| {
+                uop.operand = self.solRenameUnderscoreIdents(uop.operand, params);
+                return expr;
+            },
+            .call => |c| {
+                for (c.args, 0..) |arg, i| {
+                    c.args[i] = self.solRenameUnderscoreIdents(arg, params);
+                }
+                return expr;
+            },
+            .method_call => |mc| {
+                for (mc.args, 0..) |arg, i| {
+                    mc.args[i] = self.solRenameUnderscoreIdents(arg, params);
+                }
+                return expr;
+            },
+            .ternary => |t| {
+                t.condition = self.solRenameUnderscoreIdents(t.condition, params);
+                t.then_expr = self.solRenameUnderscoreIdents(t.then_expr, params);
+                t.else_expr = self.solRenameUnderscoreIdents(t.else_expr, params);
+                return expr;
+            },
+            .index_access => |ia| {
+                ia.object = self.solRenameUnderscoreIdents(ia.object, params);
+                ia.index = self.solRenameUnderscoreIdents(ia.index, params);
+                return expr;
+            },
+            else => return expr,
+        }
     }
 
     // ---- Expressions ----
@@ -1352,14 +1508,23 @@ const Parser = struct {
         return switch (self.current.kind) {
             .number => blk: {
                 const tok = self.bump();
-                // Strip underscores from number text
-                var stripped_buf: [64]u8 = undefined;
+                // Strip underscores from number text. Buffer sized for 256-bit
+                // decimal literals (78 digits) with headroom.
+                var stripped_buf: [160]u8 = undefined;
                 var stripped_len: usize = 0;
+                var overflow = false;
                 for (tok.text) |ch| {
-                    if (ch != '_' and stripped_len < stripped_buf.len) {
-                        stripped_buf[stripped_len] = ch;
-                        stripped_len += 1;
+                    if (ch == '_') continue;
+                    if (stripped_len >= stripped_buf.len) {
+                        overflow = true;
+                        break;
                     }
+                    stripped_buf[stripped_len] = ch;
+                    stripped_len += 1;
+                }
+                if (overflow) {
+                    self.addErrorFmt("integer literal too long: '{s}'", .{tok.text});
+                    break :blk null;
                 }
                 const stripped = stripped_buf[0..stripped_len];
                 // Hex literals with even digit count → ByteString (Solidity convention)
@@ -1371,11 +1536,21 @@ const Parser = struct {
                         break :blk Expression{ .literal_bytes = duped };
                     }
                 }
-                const val = std.fmt.parseInt(i64, stripped, 0) catch {
+                if (std.fmt.parseInt(i64, stripped, 0)) |val| {
+                    break :blk Expression{ .literal_int = val };
+                } else |_| {
+                    // Oversize decimal literal (e.g. the 256-bit secp256k1
+                    // group order in schnorr-zkp). Carry the canonical
+                    // decimal text on a `literal_bigint` AST node — codegen
+                    // widens this to a decimal-string-backed push that
+                    // matches TS / Go / Python byte-for-byte.
+                    if (isAllAsciiDigits(stripped)) {
+                        const decimal = self.allocator.dupe(u8, stripped) catch break :blk null;
+                        break :blk Expression{ .literal_bigint = decimal };
+                    }
                     self.addErrorFmt("invalid integer: '{s}'", .{tok.text});
                     break :blk null;
-                };
-                break :blk Expression{ .literal_int = val };
+                }
             },
             .string_literal => blk: {
                 const tok = self.bump();

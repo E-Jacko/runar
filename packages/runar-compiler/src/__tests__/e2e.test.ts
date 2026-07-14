@@ -110,9 +110,8 @@ describe('End-to-end: compile()', () => {
       const result = compile(P2PKH_SOURCE);
       expect(result.success).toBe(true);
       expect(typeof result.scriptHex).toBe('string');
-      const hex = (result.scriptHex as string).toLowerCase();
-      // OP_CHECKSIG = 0xac
-      expect(hex).toContain('ac');
+      // Use ASM check to avoid spurious matches inside push data
+      expect(result.scriptAsm).toContain('OP_CHECKSIG');
     });
   });
 
@@ -204,15 +203,11 @@ describe('End-to-end: compile()', () => {
       const result = compile(HASH_LOCK_SOURCE);
       expect(result.success).toBe(true);
       expect(typeof result.scriptHex).toBe('string');
-      const hex = (result.scriptHex as string).toLowerCase();
-      // OP_SHA256 = 0xa8, OP_EQUAL = 0x87
-      expect(hex).toContain('a8');
-      expect(hex).toContain('87');
-      // Should NOT contain OP_CHECKSIG (0xac) — this is a hash lock, not a signature check
-      // Note: 'ac' could appear in push data, so we check the script ends without it
-      // as the final opcode
-      const lastByte = hex.slice(-2);
-      expect(lastByte).not.toBe('ac');
+      // Use ASM checks to avoid spurious matches inside push data
+      expect(result.scriptAsm).toContain('OP_SHA256');
+      expect(result.scriptAsm).toContain('OP_EQUAL');
+      // Should NOT contain OP_CHECKSIG — this is a hash lock, not a signature check
+      expect(result.scriptAsm).not.toContain('OP_CHECKSIG');
     });
   });
 

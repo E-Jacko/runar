@@ -2,22 +2,25 @@
 //!
 //! The contract verifies that R_A - R_B = deltaO * G on secp256k1.
 //! We verify compile, deploy, and spend (valid + invalid deltaO).
+//!
+//! **Gating**: all on-chain tests are gated with
+//! `#[cfg_attr(not(feature = "regtest"), ignore)]`. They require a local Bitcoin
+//! regtest node (see `integration/rust/README.md`). Run with:
+//!     cargo test --features regtest
+//! Tests without the gate (pure compile/script-size checks) run by default.
 
 use crate::helpers::*;
 use crate::helpers::crypto::ec_mul_gen_point;
 use runar_lang::sdk::{DeployOptions, RunarContract, SdkValue};
 
 #[test]
-#[ignore]
 fn test_convergence_proof_compile() {
-    skip_if_no_node();
-
     let artifact = compile_contract("examples/ts/convergence-proof/ConvergenceProof.runar.ts");
     assert_eq!(artifact.contract_name, "ConvergenceProof");
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_convergence_proof_deploy() {
     skip_if_no_node();
 
@@ -39,6 +42,7 @@ fn test_convergence_proof_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -46,7 +50,7 @@ fn test_convergence_proof_deploy() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_convergence_proof_spend_valid() {
     skip_if_no_node();
 
@@ -72,6 +76,7 @@ fn test_convergence_proof_spend_valid() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -89,7 +94,7 @@ fn test_convergence_proof_spend_valid() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_convergence_proof_spend_invalid_rejected() {
     skip_if_no_node();
 
@@ -110,6 +115,7 @@ fn test_convergence_proof_spend_invalid_rejected() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

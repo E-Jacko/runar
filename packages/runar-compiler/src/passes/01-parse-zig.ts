@@ -219,12 +219,15 @@ const ZIG_TYPE_MAP: Record<string, string> = {
   PubKey: 'PubKey',
   Sig: 'Sig',
   Sha256: 'Sha256',
+  Sha256Digest: 'Sha256',
   Ripemd160: 'Ripemd160',
   Addr: 'Addr',
   SigHashPreimage: 'SigHashPreimage',
   RabinSig: 'RabinSig',
   RabinPubKey: 'RabinPubKey',
   Point: 'Point',
+  P256Point: 'P256Point',
+  P384Point: 'P384Point',
 };
 
 const PRIMITIVE_TYPES = new Set<PrimitiveTypeName>([
@@ -240,8 +243,16 @@ const PRIMITIVE_TYPES = new Set<PrimitiveTypeName>([
   'RabinSig',
   'RabinPubKey',
   'Point',
+  'P256Point',
+  'P384Point',
   'void',
 ]);
+
+/** Map Zig-style builtin names to canonical Rúnar camelCase names. */
+const ZIG_BUILTIN_MAP: Record<string, string> = {
+  verifyECDSAP256: 'verifyECDSA_P256',
+  verifyECDSAP384: 'verifyECDSA_P384',
+};
 
 function mapZigType(name: string): string {
   return ZIG_TYPE_MAP[name] || name;
@@ -266,7 +277,7 @@ interface ParsedType {
 
 class ZigParser extends ParserCore<ZigToken> {
   private contractName = 'UnnamedContract';
-  private parentClass: 'SmartContract' | 'StatefulSmartContract' = 'SmartContract';
+  private parentClass: 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract' = 'SmartContract';
   private properties: PropertyNode[] = [];
   private methods: MethodNode[] = [];
   private constructorNode: MethodNode | null = null;
@@ -395,9 +406,21 @@ class ZigParser extends ParserCore<ZigToken> {
     this.expect('}');
     if (this.current().type === ';') this.advance();
 
+    // Strip property initializers for properties that are also explicit
+    // constructor params: the constructor argument overrides any default,
+    // and the Zig compiler reference implementation omits `initialValue`
+    // in this case so every compiler must do the same to keep IR identical.
+    // Cast is needed: TS 5.9 flow analysis keeps `this.constructorNode`
+    // narrowed to `null` from the reset on line 361 and collapses the
+    // optional-chain's non-null branch to `never`.
+    const ctor = this.constructorNode as MethodNode | null;
+    const ctorParamNames = new Set<string>(
+      ctor ? ctor.params.map((p) => p.name) : [],
+    );
     this.properties = this.properties.map((property) => ({
       ...property,
-      readonly: this.parentClass === 'SmartContract' || property.readonly || property.initializer === undefined,
+      initializer: ctorParamNames.has(property.name) ? undefined : property.initializer,
+      readonly: this.parentClass === 'SmartContract' || this.parentClass === 'UnsafeSmartContract' || property.readonly || (this.parentClass === 'StatefulSmartContract' && !property.readonly && property.initializer === undefined && !this.methodsMutateProperty(property.name)),
     }));
 
     const methodNames = new Set(this.methods.map(method => method.name));
@@ -429,9 +452,13 @@ class ZigParser extends ParserCore<ZigToken> {
       this.advance();
       this.expect('.');
       const parent = this.expect('ident').value;
-      this.parentClass = parent === 'StatefulSmartContract'
-        ? 'StatefulSmartContract'
-        : 'SmartContract';
+      if (parent === 'StatefulSmartContract') {
+        this.parentClass = 'StatefulSmartContract';
+      } else if (parent === 'UnsafeSmartContract') {
+        this.parentClass = 'UnsafeSmartContract';
+      } else {
+        this.parentClass = 'SmartContract';
+      }
     }
 
     if (this.current().type === ';') this.advance();
@@ -962,6 +989,16 @@ class ZigParser extends ParserCore<ZigToken> {
       this.advance();
       return { kind: 'unary_expr', op: '~', operand: this.parseUnary() };
     }
+    // Zig's `&` is the address-of operator used for slice coercion at call
+    // sites like `&.{sig1, sig2}` (an anonymous-struct literal coerced to a
+    // slice). Slices have no Rúnar IR analogue — the inner array literal IS
+    // the IR node — so we simply skip the `&` and parse the operand. Recurse
+    // into parsePrimary directly: `&.foo()` is not legal Zig and `&` never
+    // pairs with a postfix chain in practice.
+    if (this.current().type === '&') {
+      this.advance();
+      return this.parsePrimary();
+    }
 
     let expr = this.parsePrimary();
     expr = this.parsePostfixChain(expr, this.selfNames);
@@ -970,6 +1007,28 @@ class ZigParser extends ParserCore<ZigToken> {
 
   protected parsePrimary(): Expression {
     const token = this.current();
+
+    // `&.{ ... }` — Zig slice-literal syntax used to coerce an anonymous
+    // tuple to a `[]const T` slice (e.g. `&.{ sig1, sig2 }` for
+    // `runar.checkMultiSig`). Treat as an array literal; the leading `&`
+    // carries no Rúnar semantics. `&` is otherwise a binary bitwise-and
+    // consumed by ParserCore and cannot appear at primary position.
+    if (
+      token.type === '&' &&
+      this.tokens[this.pos + 1]?.type === '.' &&
+      this.tokens[this.pos + 2]?.type === '{'
+    ) {
+      this.advance();
+      this.advance();
+      this.advance();
+      const elements: Expression[] = [];
+      while (this.current().type !== '}' && this.current().type !== 'eof') {
+        elements.push(this.parseExpression());
+        if (this.current().type === ',') this.advance();
+      }
+      this.expect('}');
+      return { kind: 'array_literal', elements };
+    }
 
     if (token.type === '.' && this.tokens[this.pos + 1]?.type === '{') {
       this.advance();
@@ -1011,6 +1070,26 @@ class ZigParser extends ParserCore<ZigToken> {
     }
 
     if (token.type === '[') {
+      // `[_]T{...}` — typed array literal with inferred length. The element
+      // type is parsed and discarded; Rúnar infers element types from the
+      // literal contents. The element list is the same `{...}` form used by
+      // `.{...}` anon-struct literals.
+      const next = this.tokens[this.pos + 1];
+      const after = this.tokens[this.pos + 2];
+      if (next?.type === 'ident' && next.value === '_' && after?.type === ']') {
+        this.advance(); // '['
+        this.advance(); // '_'
+        this.advance(); // ']'
+        this.parseType(); // discard element type
+        this.expect('{');
+        const elements: Expression[] = [];
+        while (this.current().type !== '}' && this.current().type !== 'eof') {
+          elements.push(this.parseExpression());
+          if (this.current().type === ',') this.advance();
+        }
+        this.expect('}');
+        return { kind: 'array_literal', elements };
+      }
       this.advance();
       const elements: Expression[] = [];
       while (this.current().type !== ']' && this.current().type !== 'eof') {
@@ -1120,7 +1199,25 @@ class ZigParser extends ParserCore<ZigToken> {
           this.expect(')');
           return { kind: 'binary_expr', op: '===', left, right };
         }
-        return { kind: 'identifier', name: builtin };
+        // runar.hexToBytes("deadbeef") → bytestring literal "deadbeef".
+        // The native Zig runtime exposes this as a comptime helper that
+        // returns a fixed-byte array, so the same source compiles natively.
+        // Mirrors parse_zig.zig and parse_python.zig's bytes.fromhex(...).
+        if (builtin === 'hexToBytes' && this.current().type === '(') {
+          this.advance();
+          const arg = this.parseExpression();
+          this.expect(')');
+          if (arg.kind === 'bytestring_literal') {
+            return { kind: 'bytestring_literal', value: arg.value };
+          }
+          this.errors.push(makeDiagnostic(
+            "runar.hexToBytes expects a string literal argument",
+            'error',
+            { file: this.file, line: token.line, column: token.column },
+          ));
+          return { kind: 'bytestring_literal', value: '' };
+        }
+        return { kind: 'identifier', name: ZIG_BUILTIN_MAP[builtin] ?? builtin };
       }
 
       return { kind: 'identifier', name: token.value };
@@ -1128,6 +1225,39 @@ class ZigParser extends ParserCore<ZigToken> {
 
     this.advance();
     return { kind: 'identifier', name: token.value || 'unknown' };
+  }
+
+  /** Check if any method body contains an assignment to self.<propName>. */
+  private methodsMutateProperty(propName: string): boolean {
+    const camelName = propName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+    const walk = (node: unknown): boolean => {
+      if (!node || typeof node !== 'object') return false;
+      const obj = node as Record<string, unknown>;
+      if (obj.kind === 'assignment') {
+        const target = obj.target as Record<string, unknown> | undefined;
+        if (target) {
+          // Check member_access: this.<propName>
+          if (target.kind === 'member_access') {
+            const prop = target.property as string;
+            if (prop === propName || prop === camelName) return true;
+          }
+          // Check property_access: self.<propName>
+          if (target.kind === 'property_access') {
+            const prop = (target.property ?? target.name) as string;
+            if (prop === propName || prop === camelName) return true;
+          }
+          // Check string target like "this.propName"
+          if (typeof obj.target === 'string') {
+            const t = obj.target as string;
+            if (t === `this.${propName}` || t === `this.${camelName}`) return true;
+          }
+        }
+      }
+      return Object.values(obj).some(v =>
+        Array.isArray(v) ? v.some(walk) : walk(v),
+      );
+    };
+    return this.methods.some(m => m.body.some(walk));
   }
 
   private rewriteBareMethodCalls(method: MethodNode, methodNames: Set<string>): MethodNode {
@@ -1297,7 +1427,7 @@ class ZigParser extends ParserCore<ZigToken> {
         } else if (
           expr.kind === 'identifier' &&
           this.statefulContextNames.has(expr.name) &&
-          (prop === 'txPreimage' || prop === 'getStateScript' || prop === 'addOutput' || prop === 'addRawOutput')
+          (prop === 'txPreimage' || prop === 'getStateScript' || prop === 'addOutput' || prop === 'addRawOutput' || prop === 'addDataOutput')
         ) {
           expr = { kind: 'property_access', property: prop };
         } else {

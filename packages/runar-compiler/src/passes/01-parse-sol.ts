@@ -33,6 +33,7 @@ type TokenType =
   | '(' | ')' | '{' | '}' | '[' | ']' | ';' | ',' | '.' | ':'
   | '+' | '-' | '*' | '/' | '%'
   | '==' | '!=' | '<' | '<=' | '>' | '>=' | '&&' | '||'
+  | '<<' | '>>'
   | '&' | '|' | '^' | '~' | '!'
   | '=' | '+=' | '-='
   | '++' | '--'
@@ -105,6 +106,8 @@ function tokenize(source: string): Token[] {
     if (ch === '!' && peekN(1) === '=') { advance(); advance(); add('!=', '!=', l, c); continue; }
     if (ch === '<' && peekN(1) === '=') { advance(); advance(); add('<=', '<=', l, c); continue; }
     if (ch === '>' && peekN(1) === '=') { advance(); advance(); add('>=', '>=', l, c); continue; }
+    if (ch === '<' && peekN(1) === '<') { advance(); advance(); add('<<', '<<', l, c); continue; }
+    if (ch === '>' && peekN(1) === '>') { advance(); advance(); add('>>', '>>', l, c); continue; }
     if (ch === '&' && peekN(1) === '&') { advance(); advance(); add('&&', '&&', l, c); continue; }
     if (ch === '|' && peekN(1) === '|') { advance(); advance(); add('||', '||', l, c); continue; }
     if (ch === '+' && peekN(1) === '+') { advance(); advance(); add('++', '++', l, c); continue; }
@@ -169,6 +172,11 @@ function mapSolType(name: string): string {
   const typeMap: Record<string, string> = {
     int: 'bigint', uint: 'bigint',
     int256: 'bigint', uint256: 'bigint',
+    // Capitalised aliases — `Int` is used in cross-format fixtures that
+    // mirror Go DSL `runar.BigintBig` / Move `u256` where lowercase `int`
+    // would be ambiguous with the Solidity native modulo type. Both lower
+    // to the same `bigint` Rúnar primitive.
+    Int: 'bigint', Uint: 'bigint',
     address: 'Addr', bytes: 'ByteString', bool: 'boolean',
   };
   return typeMap[name] || name;
@@ -222,11 +230,12 @@ class SolParser {
     const nameToken = this.expect('ident');
     const contractName = nameToken.value;
 
-    // Optional: is SmartContract / StatefulSmartContract
-    let parentClass: 'SmartContract' | 'StatefulSmartContract' = 'SmartContract';
+    // Optional: is SmartContract / StatefulSmartContract / UnsafeSmartContract
+    let parentClass: 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract' = 'SmartContract';
     if (this.match('is')) {
       const parent = this.expect('ident').value;
       if (parent === 'StatefulSmartContract') parentClass = 'StatefulSmartContract';
+      else if (parent === 'UnsafeSmartContract') parentClass = 'UnsafeSmartContract';
     }
 
     this.expect('{');
@@ -279,13 +288,21 @@ class SolParser {
       };
     }
 
+    // Resolve bare property references in method bodies (Solidity allows
+    // referencing state variables without `this.` prefix)
+    const propNames = new Set(properties.map(p => p.name));
+    const resolvedMethods = methods.map(m => {
+      const paramNameSet = new Set(m.params.map(p => p.name));
+      return { ...m, body: m.body.map(s => resolvePropertyAccess(s, propNames, paramNameSet)) };
+    });
+
     const contract: ContractNode = {
       kind: 'contract',
       name: contractName,
       parentClass,
       properties,
       constructor: constructorNode,
-      methods,
+      methods: resolvedMethods,
       sourceFile: this.file,
     };
 
@@ -324,24 +341,30 @@ class SolParser {
   private parseType(): TypeNode {
     const name = this.expect('ident').value;
     const mapped = mapSolType(name);
-    // Check for FixedArray<T, N> — would be Type[N] in Solidity style
-    if (this.current().type === '[') {
+    let result: TypeNode = this.makePrimitiveOrCustom(mapped);
+    // Solidity native fixed-array suffixes: T[N], T[N][M], ...
+    // Per Solidity convention, `T[N][M]` is read left-to-right when
+    // *declaring* but the outer dimension grows leftmost when *indexing*:
+    // `T[N][M]` means "M arrays of (N of T)". So each successive `[L]`
+    // wraps the type seen so far as `FixedArray<previous, L>`.
+    while (this.current().type === '[') {
       this.advance();
       const length = parseInt(this.expect('number').value, 10);
       this.expect(']');
-      return {
+      result = {
         kind: 'fixed_array_type',
-        element: this.makePrimitiveOrCustom(mapped),
+        element: result,
         length,
       };
     }
-    return this.makePrimitiveOrCustom(mapped);
+    return result;
   }
 
   private makePrimitiveOrCustom(name: string): TypeNode {
     const primitives = new Set([
       'bigint', 'boolean', 'ByteString', 'PubKey', 'Sig', 'Sha256',
-      'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point', 'void',
+      'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point',
+      'P256Point', 'P384Point', 'void',
     ]);
     if (primitives.has(name)) {
       return { kind: 'primitive_type', name: name as PrimitiveTypeName };
@@ -728,8 +751,17 @@ class SolParser {
   }
 
   private parseComparison(): Expression {
-    let left = this.parseAddSub();
+    let left = this.parseShift();
     while (['<', '<=', '>', '>='].includes(this.current().type)) {
+      const op = this.advance().value as BinaryOp;
+      left = { kind: 'binary_expr', op, left, right: this.parseShift() };
+    }
+    return left;
+  }
+
+  private parseShift(): Expression {
+    let left = this.parseAddSub();
+    while (this.current().type === '<<' || this.current().type === '>>') {
       const op = this.advance().value as BinaryOp;
       left = { kind: 'binary_expr', op, left, right: this.parseAddSub() };
     }
@@ -916,6 +948,73 @@ function renameIdentifiers(stmt: Statement, map: Map<string, string>): Statement
       };
     case 'return_statement':
       return stmt.value ? { ...stmt, value: renameExpr(stmt.value) } : stmt;
+    default:
+      return stmt;
+  }
+}
+
+/**
+ * Convert bare identifiers that match property names to property_access nodes.
+ * In Solidity, contract state variables can be referenced without `this.`.
+ */
+function resolvePropertyAccess(stmt: Statement, propNames: Set<string>, paramNames: Set<string>): Statement {
+  function resolveExpr(expr: Expression): Expression {
+    switch (expr.kind) {
+      case 'identifier': {
+        // Only convert if it's a property name and NOT a local variable/parameter
+        if (propNames.has(expr.name) && !paramNames.has(expr.name)) {
+          return { kind: 'property_access', property: expr.name };
+        }
+        return expr;
+      }
+      case 'binary_expr':
+        return { ...expr, left: resolveExpr(expr.left), right: resolveExpr(expr.right) };
+      case 'unary_expr':
+        return { ...expr, operand: resolveExpr(expr.operand) };
+      case 'call_expr':
+        return { ...expr, callee: resolveExpr(expr.callee), args: expr.args.map(resolveExpr) };
+      case 'member_expr':
+        return { ...expr, object: resolveExpr(expr.object) };
+      case 'ternary_expr':
+        return { ...expr, condition: resolveExpr(expr.condition), consequent: resolveExpr(expr.consequent), alternate: resolveExpr(expr.alternate) };
+      case 'index_access':
+        return { ...expr, object: resolveExpr(expr.object), index: resolveExpr(expr.index) };
+      case 'increment_expr':
+      case 'decrement_expr':
+        return { ...expr, operand: resolveExpr(expr.operand) };
+      default:
+        return expr;
+    }
+  }
+
+  switch (stmt.kind) {
+    case 'variable_decl': {
+      const resolved = { ...stmt, init: resolveExpr(stmt.init) };
+      // The declared variable shadows any property with the same name
+      paramNames.add(stmt.name);
+      return resolved;
+    }
+    case 'assignment':
+      return { ...stmt, target: resolveExpr(stmt.target), value: resolveExpr(stmt.value) };
+    case 'expression_statement':
+      return { ...stmt, expression: resolveExpr(stmt.expression) };
+    case 'if_statement':
+      return {
+        ...stmt,
+        condition: resolveExpr(stmt.condition),
+        then: stmt.then.map(s => resolvePropertyAccess(s, propNames, new Set(paramNames))),
+        else: stmt.else?.map(s => resolvePropertyAccess(s, propNames, new Set(paramNames))),
+      };
+    case 'for_statement':
+      return {
+        ...stmt,
+        init: resolvePropertyAccess(stmt.init, propNames, paramNames) as typeof stmt.init,
+        condition: resolveExpr(stmt.condition),
+        update: resolvePropertyAccess(stmt.update, propNames, paramNames),
+        body: stmt.body.map(s => resolvePropertyAccess(s, propNames, new Set(paramNames))),
+      };
+    case 'return_statement':
+      return stmt.value ? { ...stmt, value: resolveExpr(stmt.value) } : stmt;
     default:
       return stmt;
   }

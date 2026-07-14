@@ -1,0 +1,73 @@
+{
+  "artifact": {
+    "version": "runar-v1.0.0-rc.1",
+    "compilerVersion": "1.0.0-rc.1",
+    "contractName": "MerkleProofDemo",
+    "parentClass": "SmartContract",
+    "abi": {
+      "constructor": {
+        "params": [
+          {
+            "name": "expectedRoot",
+            "type": "ByteString"
+          }
+        ]
+      },
+      "methods": [
+        {
+          "name": "verifySha256",
+          "params": [
+            {
+              "name": "leaf",
+              "type": "ByteString"
+            },
+            {
+              "name": "proof",
+              "type": "ByteString"
+            },
+            {
+              "name": "index",
+              "type": "bigint"
+            }
+          ],
+          "isPublic": true
+        },
+        {
+          "name": "verifyHash256",
+          "params": [
+            {
+              "name": "leaf",
+              "type": "ByteString"
+            },
+            {
+              "name": "proof",
+              "type": "ByteString"
+            },
+            {
+              "name": "index",
+              "type": "bigint"
+            }
+          ],
+          "isPublic": true
+        }
+      ]
+    },
+    "script": "76009c63757b7b7b7b7b7b7c01207f6b7c7652977c6b7b7b7b637c687ea86c6c01207f6b7c768e52977c6b7b7b7b637c687ea86c6c01207f6b7c7652b752977c6b7b7b7b637c687ea86c6c01207f6b7c7653b752977c6b7b7b7b637c687ea86c6c7c6d008767519d7b7b7b7b7b7b7c01207f6b7c7652977c6b7b7b7b637c687eaa6c6c01207f6b7c768e52977c6b7b7b7b637c687eaa6c6c01207f6b7c7652b752977c6b7b7b7b637c687eaa6c6c01207f6b7c7653b752977c6b7b7b7b637c687eaa6c6c7c6d008768",
+    "constructorSlots": [
+      {
+        "paramIndex": 0,
+        "byteOffset": 99
+      },
+      {
+        "paramIndex": 0,
+        "byteOffset": 198
+      }
+    ]
+  },
+  "constructorArgs": [
+    {
+      "type": "ByteString",
+      "value": "0000000000000000000000000000000000000000000000000000000000000001"
+    }
+  ]
+}

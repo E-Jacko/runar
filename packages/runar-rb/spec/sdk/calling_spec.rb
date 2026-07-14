@@ -283,6 +283,96 @@ RSpec.describe 'Runar::SDK calling helpers' do
   end
 
   # ---------------------------------------------------------------------------
+  # build_call_transaction — locktime override (issue #40)
+  # ---------------------------------------------------------------------------
+  describe 'build_call_transaction with locktime override' do
+    let(:contract_utxo) { make_utxo(CONTRACT_TXID, 1_000_000) }
+
+    it 'writes a caller-supplied non-zero locktime into the tx' do
+      tx_hex, = Runar::SDK.build_call_transaction(
+        contract_utxo, '', CONTRACT_SCRIPT, 10_000, CALL_ADDRESS, '',
+        nil, options: { locktime: 800_000 }
+      )
+      # 800000 = 0x000C3500 → little-endian hex "00350c00"
+      expect(tx_hex).to end_with('00350c00')
+    end
+
+    it 'defaults to locktime 00000000 when the option is unset (back-compatible)' do
+      tx_hex, = Runar::SDK.build_call_transaction(
+        contract_utxo, '', CONTRACT_SCRIPT, 10_000, CALL_ADDRESS, '',
+        nil, options: {}
+      )
+      expect(tx_hex).to end_with('00000000')
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # build_call_transaction — nSequence honors locktime (issue #131)
+  # ---------------------------------------------------------------------------
+  describe 'build_call_transaction sequence honors locktime (#131)' do
+    let(:contract_utxo) { make_utxo(CONTRACT_TXID, 1_000_000) }
+    let(:funding_utxo)  { make_utxo(FUNDING_TXID, 1_000_000) }
+
+    # Parse the nSequence (as an Integer) of every input from a raw tx hex.
+    def input_sequences(tx_hex)
+      pos = 8 # version
+      count, ic = Runar::SDK.read_varint_hex(tx_hex, pos)
+      pos += ic
+      seqs = []
+      count.times do
+        pos += 64 + 8 # prev txid + output index
+        script_len, sl = Runar::SDK.read_varint_hex(tx_hex, pos)
+        pos += sl + script_len * 2
+        seqs << tx_hex[pos, 8].scan(/../).reverse.join.to_i(16) # LE hex -> Integer
+        pos += 8
+      end
+      seqs
+    end
+
+    it 'defaults every input sequence to 0xfffffffe when a non-zero locktime is set' do
+      tx_hex, = Runar::SDK.build_call_transaction(
+        contract_utxo, '', CONTRACT_SCRIPT, 10_000, CALL_ADDRESS, '',
+        [funding_utxo], options: { locktime: 800_000 }
+      )
+      seqs = input_sequences(tx_hex)
+      expect(seqs.length).to eq(2)
+      expect(seqs).to all(eq(0xfffffffe))
+    end
+
+    it 'keeps sequences at 0xffffffff when no locktime is set (back-compatible)' do
+      tx_hex, = Runar::SDK.build_call_transaction(
+        contract_utxo, '', CONTRACT_SCRIPT, 10_000, CALL_ADDRESS, '',
+        [funding_utxo], options: {}
+      )
+      expect(input_sequences(tx_hex)).to all(eq(0xffffffff))
+    end
+
+    it 'keeps sequences at 0xffffffff when locktime is explicitly 0' do
+      tx_hex, = Runar::SDK.build_call_transaction(
+        contract_utxo, '', CONTRACT_SCRIPT, 10_000, CALL_ADDRESS, '',
+        [funding_utxo], options: { locktime: 0 }
+      )
+      expect(input_sequences(tx_hex)).to all(eq(0xffffffff))
+    end
+
+    it 'honors an explicit sequence override on every input' do
+      tx_hex, = Runar::SDK.build_call_transaction(
+        contract_utxo, '', CONTRACT_SCRIPT, 10_000, CALL_ADDRESS, '',
+        [funding_utxo], options: { locktime: 800_000, sequence: 0x12345678 }
+      )
+      expect(input_sequences(tx_hex)).to all(eq(0x12345678))
+    end
+
+    it 'resolve_input_sequence returns the documented defaults' do
+      expect(Runar::SDK.resolve_input_sequence(nil, nil)).to eq(0xffffffff)
+      expect(Runar::SDK.resolve_input_sequence(0, nil)).to eq(0xffffffff)
+      expect(Runar::SDK.resolve_input_sequence(800_000, nil)).to eq(0xfffffffe)
+      expect(Runar::SDK.resolve_input_sequence(800_000, 0x11)).to eq(0x11)
+      expect(Runar::SDK.resolve_input_sequence(nil, 0x22)).to eq(0x22)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # insert_unlocking_script
   # ---------------------------------------------------------------------------
   describe 'insert_unlocking_script' do

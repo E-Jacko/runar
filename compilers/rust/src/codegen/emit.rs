@@ -4,6 +4,7 @@
 //! Script opcodes, producing both a hex-encoded script and a human-readable
 //! ASM representation.
 
+use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 
 use super::opcodes::opcode_byte;
@@ -22,6 +23,35 @@ pub struct ConstructorSlot {
     pub param_index: usize,
     #[serde(rename = "byteOffset")]
     pub byte_offset: usize,
+}
+
+/// Records the byte offset of a codeSepIndex placeholder (OP_0) in the
+/// emitted script. The SDK replaces it with the adjusted codeSeparatorIndex
+/// at deployment time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeSepIndexSlot {
+    #[serde(rename = "byteOffset")]
+    pub byte_offset: usize,
+    #[serde(rename = "codeSepIndex")]
+    pub code_sep_index: usize,
+}
+
+// ---------------------------------------------------------------------------
+// RawScriptSpan
+// ---------------------------------------------------------------------------
+
+/// Records a byte range produced by a `raw_script` ANF node. The bytes are
+/// emitted verbatim by `emit_raw_bytes`; the static analyzer reads these spans
+/// so it can skip the contents (which are opaque, peephole-barrier-protected,
+/// and not guaranteed to form a well-formed opcode stream).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawScriptSpan {
+    pub offset: usize,
+    pub length: usize,
+    #[serde(rename = "inArity")]
+    pub in_arity: usize,
+    #[serde(rename = "outArity")]
+    pub out_arity: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,10 +79,13 @@ pub struct EmitResult {
     pub script_hex: String,
     pub script_asm: String,
     pub constructor_slots: Vec<ConstructorSlot>,
+    pub code_sep_index_slots: Vec<CodeSepIndexSlot>,
     pub code_separator_index: i64,
     pub code_separator_indices: Vec<usize>,
     /// Source mappings (opcode index to source location).
     pub source_map: Vec<SourceMapping>,
+    /// Byte ranges produced by `raw_script` ANF nodes.
+    pub raw_script_spans: Vec<RawScriptSpan>,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,12 +97,14 @@ struct EmitContext {
     asm_parts: Vec<String>,
     byte_length: usize,
     constructor_slots: Vec<ConstructorSlot>,
+    code_sep_index_slots: Vec<CodeSepIndexSlot>,
     code_separator_index: i64,
     code_separator_indices: Vec<usize>,
     opcode_index: usize,
     source_map: Vec<SourceMapping>,
     /// Pending source location to attach to the next emitted opcode.
     pending_source_loc: Option<crate::ir::SourceLocation>,
+    raw_script_spans: Vec<RawScriptSpan>,
 }
 
 impl EmitContext {
@@ -79,11 +114,13 @@ impl EmitContext {
             asm_parts: Vec::new(),
             byte_length: 0,
             constructor_slots: Vec::new(),
+            code_sep_index_slots: Vec::new(),
             code_separator_index: -1,
             code_separator_indices: Vec::new(),
             opcode_index: 0,
             source_map: Vec::new(),
             pending_source_loc: None,
+            raw_script_spans: Vec::new(),
         }
     }
 
@@ -138,6 +175,30 @@ impl EmitContext {
         });
     }
 
+    /// Write a verbatim byte span emitted by a `raw_bytes` StackOp.
+    ///
+    /// No re-encoding takes place — the bytes go out as supplied. The ASM
+    /// column shows `<raw N bytes>` so the human-readable disassembly is honest
+    /// about the opacity. A `RawScriptSpan` capturing the span's offset,
+    /// length, and declared stack-effect arities is recorded so the static
+    /// analyzer can treat the span as one opaque stack-effect step.
+    fn emit_raw_bytes(&mut self, bytes: &[u8], in_arity: usize, out_arity: usize) {
+        if bytes.is_empty() {
+            return;
+        }
+        let offset = self.byte_length;
+        self.record_source_mapping();
+        self.append_hex(&hex::encode(bytes));
+        self.asm_parts.push(format!("<raw {} bytes>", bytes.len()));
+        self.opcode_index += 1;
+        self.raw_script_spans.push(RawScriptSpan {
+            offset,
+            length: bytes.len(),
+            in_arity,
+            out_arity,
+        });
+    }
+
     fn get_hex(&self) -> String {
         self.hex_parts.join("")
     }
@@ -151,21 +212,20 @@ impl EmitContext {
 // Script number encoding
 // ---------------------------------------------------------------------------
 
-/// Encode an i128 as a Bitcoin Script number (little-endian, sign-magnitude).
-/// Bitcoin Script numbers can be up to 2^252, so i128 is needed.
-pub fn encode_script_number(n: i128) -> Vec<u8> {
-    if n == 0 {
+/// Encode a `BigInt` as a Bitcoin Script number (little-endian,
+/// sign-magnitude with the sign bit in the MSB).
+///
+/// Widened from `i128` so 256-bit constants (e.g. the secp256k1 group
+/// order in schnorr-zkp's s-bound assert) survive without truncation.
+/// Mirrors `compilers/go/codegen/emit.go::encodeScriptNumber`.
+pub fn encode_script_number(n: &num_bigint::BigInt) -> Vec<u8> {
+    use num_bigint::Sign;
+    if n.sign() == Sign::NoSign {
         return Vec::new();
     }
 
-    let negative = n < 0;
-    let mut abs = if negative { (-n) as u128 } else { n as u128 };
-
-    let mut bytes = Vec::new();
-    while abs > 0 {
-        bytes.push((abs & 0xff) as u8);
-        abs >>= 8;
-    }
+    let negative = n.sign() == Sign::Minus;
+    let mut bytes = n.magnitude().to_bytes_le(); // little-endian byte representation of |n|
 
     let last_byte = *bytes.last().unwrap();
     if last_byte & 0x80 != 0 {
@@ -242,7 +302,7 @@ fn encode_push_value(value: &PushValue) -> (String, String) {
                 ("00".to_string(), "OP_FALSE".to_string())
             }
         }
-        PushValue::Int(n) => encode_push_int(*n),
+        PushValue::Int(n) => encode_push_int(n),
         PushValue::Bytes(bytes) => {
             let encoded = encode_push_data(bytes);
             let h = hex::encode(&encoded);
@@ -256,18 +316,24 @@ fn encode_push_value(value: &PushValue) -> (String, String) {
 }
 
 /// Encode an integer push, using small-integer opcodes where possible.
-pub fn encode_push_int(n: i128) -> (String, String) {
-    if n == 0 {
+pub fn encode_push_int(n: &num_bigint::BigInt) -> (String, String) {
+    use num_bigint::Sign;
+    use num_traits::ToPrimitive;
+
+    if n.sign() == Sign::NoSign {
         return ("00".to_string(), "OP_0".to_string());
     }
 
-    if n == -1 {
-        return ("4f".to_string(), "OP_1NEGATE".to_string());
-    }
-
-    if n >= 1 && n <= 16 {
-        let opcode = 0x50 + n as u8;
-        return (format!("{:02x}", opcode), format!("OP_{}", n));
+    // Check for OP_1NEGATE / OP_1..OP_16 — these all fit in i8 so a cheap
+    // to_i64() guard suffices before falling through to general encoding.
+    if let Some(small) = n.to_i64() {
+        if small == -1 {
+            return ("4f".to_string(), "OP_1NEGATE".to_string());
+        }
+        if (1..=16).contains(&small) {
+            let opcode = 0x50 + small as u8;
+            return (format!("{:02x}", opcode), format!("OP_{}", small));
+        }
     }
 
     let num_bytes = encode_script_number(n);
@@ -306,14 +372,35 @@ fn emit_stack_op(op: &StackOp, ctx: &mut EmitContext) -> Result<(), String> {
             ctx.emit_placeholder(*param_index, param_name);
             Ok(())
         }
+        StackOp::RawBytes {
+            bytes,
+            in_arity,
+            out_arity,
+        } => {
+            // Opaque opcode-byte span from a raw_script ANF node. Written
+            // verbatim with no re-encoding; the declared arities are recorded
+            // into the artifact's rawScriptSpans so the analyzer can treat the
+            // span as one opaque stack-effect step.
+            ctx.emit_raw_bytes(bytes, *in_arity, *out_arity);
+            Ok(())
+        }
         StackOp::PushCodeSepIndex => {
-            // Push the codeSeparatorIndex as a numeric constant.
-            let idx = if ctx.code_separator_index < 0 {
+            // Emit an OP_0 placeholder that the SDK will replace with the
+            // adjusted codeSeparatorIndex at runtime.
+            let code_sep_idx = if ctx.code_separator_index < 0 {
                 0i64
             } else {
                 ctx.code_separator_index
             };
-            ctx.emit_push(&PushValue::Int(idx as i128));
+            let byte_offset = ctx.byte_length;
+            ctx.record_source_mapping();
+            ctx.append_hex("00"); // OP_0 placeholder
+            ctx.asm_parts.push("OP_0".to_string());
+            ctx.opcode_index += 1;
+            ctx.code_sep_index_slots.push(CodeSepIndexSlot {
+                byte_offset,
+                code_sep_index: code_sep_idx as usize,
+            });
             Ok(())
         }
     }
@@ -370,9 +457,11 @@ pub fn emit(methods: &[StackMethod]) -> Result<EmitResult, String> {
             script_hex: String::new(),
             script_asm: String::new(),
             constructor_slots: Vec::new(),
+            code_sep_index_slots: Vec::new(),
             code_separator_index: -1,
             code_separator_indices: Vec::new(),
             source_map: Vec::new(),
+            raw_script_spans: Vec::new(),
         });
     }
 
@@ -391,9 +480,11 @@ pub fn emit(methods: &[StackMethod]) -> Result<EmitResult, String> {
         script_hex: ctx.get_hex(),
         script_asm: ctx.get_asm(),
         constructor_slots: ctx.constructor_slots,
+        code_sep_index_slots: ctx.code_sep_index_slots,
         code_separator_index: ctx.code_separator_index,
         code_separator_indices: ctx.code_separator_indices,
         source_map: ctx.source_map,
+        raw_script_spans: ctx.raw_script_spans,
     })
 }
 
@@ -406,13 +497,13 @@ fn emit_method_dispatch(
 
         if !is_last {
             ctx.emit_opcode("OP_DUP")?;
-            ctx.emit_push(&PushValue::Int(i as i128));
+            ctx.emit_push(&PushValue::Int(BigInt::from(i as i128)));
             ctx.emit_opcode("OP_NUMEQUAL")?;
             ctx.emit_opcode("OP_IF")?;
             ctx.emit_opcode("OP_DROP")?;
         } else {
             // Last method — verify the index matches (fail-closed for invalid selectors)
-            ctx.emit_push(&PushValue::Int(i as i128));
+            ctx.emit_push(&PushValue::Int(BigInt::from(i as i128)));
             ctx.emit_opcode("OP_NUMEQUALVERIFY")?;
         }
 
@@ -445,9 +536,11 @@ pub fn emit_method(method: &StackMethod) -> Result<EmitResult, String> {
         script_hex: ctx.get_hex(),
         script_asm: ctx.get_asm(),
         constructor_slots: ctx.constructor_slots,
+        code_sep_index_slots: ctx.code_sep_index_slots,
         code_separator_index: ctx.code_separator_index,
         code_separator_indices: ctx.code_separator_indices,
         source_map: ctx.source_map,
+        raw_script_spans: ctx.raw_script_spans,
     })
 }
 
@@ -469,6 +562,7 @@ mod tests {
             }],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -497,6 +591,7 @@ mod tests {
             ],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -526,7 +621,7 @@ mod tests {
         let method = StackMethod {
             name: "test".to_string(),
             ops: vec![
-                StackOp::Push(PushValue::Int(42)), // some bytes before
+                StackOp::Push(PushValue::Int(BigInt::from(42))), // some bytes before
                 StackOp::Placeholder {
                     param_index: 0,
                     param_name: "x".to_string(),
@@ -534,6 +629,7 @@ mod tests {
             ],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -558,12 +654,13 @@ mod tests {
         let method = StackMethod {
             name: "check".to_string(),
             ops: vec![
-                StackOp::Push(PushValue::Int(42)),
+                StackOp::Push(PushValue::Int(BigInt::from(42))),
                 StackOp::Opcode("OP_NUMEQUAL".to_string()),
                 StackOp::Opcode("OP_VERIFY".to_string()),
             ],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         // Apply peephole optimization before emit (as the compiler pipeline does)
@@ -572,6 +669,7 @@ mod tests {
             ops: optimize_stack_ops(&method.ops),
             max_stack_depth: method.max_stack_depth,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit(&[optimized_method]).expect("emit should succeed");
@@ -607,6 +705,7 @@ mod tests {
             ],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -636,7 +735,7 @@ mod tests {
         let method = StackMethod {
             name: "check".to_string(),
             ops: vec![
-                StackOp::Push(PushValue::Int(17)), // 2 bytes: 01 11
+                StackOp::Push(PushValue::Int(BigInt::from(17))), // 2 bytes: 01 11
                 StackOp::Placeholder {
                     param_index: 0,
                     param_name: "x".to_string(),
@@ -645,6 +744,7 @@ mod tests {
             ],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -677,6 +777,7 @@ mod tests {
             ],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -708,6 +809,7 @@ mod tests {
             ops: optimized_ops,
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -736,6 +838,7 @@ mod tests {
 
         let program = ANFProgram {
             contract_name: "Multi".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![
                 ANFMethod {
@@ -743,6 +846,7 @@ mod tests {
                     params: vec![],
                     body: vec![],
                     is_public: false,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "m1".to_string(),
@@ -775,11 +879,12 @@ mod tests {
                         },
                         ANFBinding {
                             name: "t3".to_string(),
-                            value: ANFValue::Assert { value: "t2".to_string() },
+                            value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                             source_loc: None,
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "m2".to_string(),
@@ -812,11 +917,12 @@ mod tests {
                         },
                         ANFBinding {
                             name: "t3".to_string(),
-                            value: ANFValue::Assert { value: "t2".to_string() },
+                            value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                             source_loc: None,
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
             ],
         };
@@ -832,6 +938,7 @@ mod tests {
                 ops: optimize_stack_ops(&m.ops),
                 max_stack_depth: m.max_stack_depth,
                 source_locs: vec![],
+                uses_code_part: false,
             })
             .collect();
 
@@ -878,6 +985,7 @@ mod tests {
             ],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
 
         let result = emit_method(&method).expect("emit should succeed");
@@ -904,11 +1012,13 @@ mod tests {
 
         let program = ANFProgram {
             contract_name: "P2PKH".to_string(),
+            parent_class: String::new(),
             properties: vec![ANFProperty {
                 name: "pubKeyHash".to_string(),
                 prop_type: "Addr".to_string(),
                 readonly: true,
                 initial_value: None,
+                synthetic_array_chain: None,
             }],
             methods: vec![ANFMethod {
                 name: "unlock".to_string(),
@@ -947,7 +1057,7 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t4".to_string(),
-                        value: ANFValue::Assert { value: "t3".to_string() },
+                        value: ANFValue::Assert { value: "t3".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                     ANFBinding {
@@ -970,11 +1080,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t8".to_string(),
-                        value: ANFValue::Assert { value: "t7".to_string() },
+                        value: ANFValue::Assert { value: "t7".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -999,9 +1110,10 @@ mod tests {
     fn test_m10_integer_17_uses_push_prefix_not_op17() {
         let method = StackMethod {
             name: "test".to_string(),
-            ops: vec![StackOp::Push(PushValue::Int(17))],
+            ops: vec![StackOp::Push(PushValue::Int(BigInt::from(17)))],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
         let result = emit_method(&method).expect("emit should succeed");
         // OP_17 would be 0x61. A push-data encoded 17 would be "0111" (length 1, value 0x11).
@@ -1031,6 +1143,7 @@ mod tests {
             ops: vec![StackOp::Push(PushValue::Bytes(data))],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
         let result = emit_method(&method).expect("emit should succeed");
         // OP_PUSHDATA2 = 0x4d, followed by length in 2 bytes LE: 256 = 0x0001 LE = 00 01
@@ -1052,6 +1165,7 @@ mod tests {
 
         let program = ANFProgram {
             contract_name: "Sha256Test".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -1075,11 +1189,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t2".to_string(),
-                        value: ANFValue::Assert { value: "t1".to_string() },
+                        value: ANFValue::Assert { value: "t1".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -1103,6 +1218,7 @@ mod tests {
             ops: vec![StackOp::Dup],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
         let result = emit_method(&method).expect("emit should succeed");
         assert_eq!(
@@ -1123,6 +1239,7 @@ mod tests {
             ops: vec![StackOp::Swap],
             max_stack_depth: 2,
             source_locs: vec![],
+                uses_code_part: false,
         };
         let result = emit_method(&method).expect("emit should succeed");
         assert_eq!(
@@ -1146,6 +1263,7 @@ mod tests {
             }],
             max_stack_depth: 1,
             source_locs: vec![],
+                uses_code_part: false,
         };
         let result = emit_method(&method).expect("emit should succeed");
         assert!(
@@ -1172,11 +1290,13 @@ mod tests {
         // A program with a single public method (plus constructor) — no method dispatch needed
         let program = ANFProgram {
             contract_name: "Single".to_string(),
+            parent_class: String::new(),
             properties: vec![ANFProperty {
                 name: "x".to_string(),
                 prop_type: "bigint".to_string(),
                 readonly: true,
                 initial_value: None,
+                synthetic_array_chain: None,
             }],
             methods: vec![
                 ANFMethod {
@@ -1187,6 +1307,7 @@ mod tests {
                     }],
                     body: vec![],
                     is_public: false,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "check".to_string(),
@@ -1217,11 +1338,12 @@ mod tests {
                         },
                         ANFBinding {
                             name: "t3".to_string(),
-                            value: ANFValue::Assert { value: "t2".to_string() },
+                            value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                             source_loc: None,
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
             ],
         };
@@ -1236,5 +1358,275 @@ mod tests {
             "single public method should NOT produce OP_IF dispatch; got asm: {}",
             result.script_asm
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // encode_script_number: Bitcoin Script sign-magnitude boundary values
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_script_number_boundaries() {
+        // (value, expected_hex_of_raw_bytes)
+        // Zero returns an empty Vec (the push layer maps that to OP_0 = 0x00),
+        // so its expected hex is the empty string.
+        let cases: &[(i128, &str)] = &[
+            (0, ""),
+            (1, "01"),
+            (-1, "81"),
+            (127, "7f"),
+            (-127, "ff"),
+            (128, "8000"),
+            (-128, "8080"),
+            (32767, "ff7f"),
+            (32768, "008000"),
+            (2147483647, "ffffff7f"),
+            (2147483648, "0000008000"),
+        ];
+
+        for &(val, expected_hex) in cases {
+            let raw = encode_script_number(&BigInt::from(val as i128));
+            let got_hex = hex::encode(&raw);
+            assert_eq!(
+                got_hex, expected_hex,
+                "encode_script_number({}) = {:?} (hex: {:?}), want {:?}",
+                val, raw, got_hex, expected_hex
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // encode_push_data: boundary values
+    // -------------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Test: raw_script ANF JSON round-trip — load, lower, emit; the emitted hex
+    // must contain the input bytes verbatim, and a RawScriptSpan must be
+    // recorded. Mirrors Go's TestEmit_RawScriptRoundTrip.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_emit_raw_script_round_trip() {
+        use super::super::stack::{lower_to_stack, StackOp};
+        use crate::ir::loader::load_ir_from_str;
+
+        // A minimal UnsafeSmartContract `unlock` method whose body is a single
+        // raw_script binding (the ANF shape produced by `asm({...})`). Bytes
+        // "5152935987" = OP_1 OP_2 OP_ADD OP_3 OP_EQUAL — an arbitrary opaque
+        // span the emitter must write verbatim.
+        const RAW_HEX: &str = "5152935987";
+        let ir_json = format!(
+            r#"{{
+                "contractName": "Anyone",
+                "properties": [],
+                "methods": [
+                    {{
+                        "name": "unlock",
+                        "params": [],
+                        "isPublic": true,
+                        "body": [
+                            {{ "name": "t0", "value": {{ "kind": "raw_script", "bytes": "{}", "in_arity": 0, "out_arity": 1 }} }}
+                        ]
+                    }}
+                ]
+            }}"#,
+            RAW_HEX
+        );
+
+        let program = load_ir_from_str(&ir_json).expect("load_ir_from_str should succeed");
+
+        // Round-trip the loaded IR: in_arity 0 must survive.
+        match &program.methods[0].body[0].value {
+            crate::ir::ANFValue::RawScript { bytes, in_arity, out_arity } => {
+                assert_eq!(bytes, RAW_HEX, "loaded raw_script bytes");
+                assert_eq!(*in_arity, 0, "loaded raw_script in_arity");
+                assert_eq!(*out_arity, 1, "loaded raw_script out_arity");
+            }
+            other => panic!("expected RawScript binding, got {:?}", other),
+        }
+
+        let methods = lower_to_stack(&program).expect("lower_to_stack should succeed");
+
+        // The lowered method must contain exactly one raw_bytes op carrying the
+        // decoded bytes.
+        let mut raw_ops = 0;
+        for m in &methods {
+            for op in &m.ops {
+                if let StackOp::RawBytes { bytes, in_arity, out_arity } = op {
+                    raw_ops += 1;
+                    assert_eq!(hex::encode(bytes), RAW_HEX, "raw_bytes op bytes");
+                    assert_eq!(*in_arity, 0, "raw_bytes op in_arity");
+                    assert_eq!(*out_arity, 1, "raw_bytes op out_arity");
+                }
+            }
+        }
+        assert_eq!(raw_ops, 1, "expected exactly 1 raw_bytes op");
+
+        let result = emit(&methods).expect("emit should succeed");
+
+        // The emitted hex must equal the input bytes verbatim (single-method
+        // contract, no dispatch preamble).
+        assert_eq!(result.script_hex, RAW_HEX, "emitted hex must be verbatim");
+
+        // A RawScriptSpan covering the whole span must be recorded.
+        assert_eq!(result.raw_script_spans.len(), 1, "expected 1 RawScriptSpan");
+        let span = &result.raw_script_spans[0];
+        assert_eq!(span.offset, 0, "span offset");
+        assert_eq!(span.length, RAW_HEX.len() / 2, "span length");
+        assert_eq!(span.in_arity, 0, "span in_arity");
+        assert_eq!(span.out_arity, 1, "span out_arity");
+    }
+
+    #[test]
+    fn test_encode_push_data_boundaries() {
+        // (data_len, expected_prefix_hex)
+        let cases: &[(usize, &str)] = &[
+            // 75 bytes: direct push — single length byte 0x4b = 75
+            (75, "4b"),
+            // 76 bytes: OP_PUSHDATA1 (0x4c) + length byte 0x4c = 76
+            (76, "4c4c"),
+            // 255 bytes: OP_PUSHDATA1 (0x4c) + length byte 0xff = 255
+            (255, "4cff"),
+            // 256 bytes: OP_PUSHDATA2 (0x4d) + 2-byte LE length 0x0001 = 256
+            (256, "4d0001"),
+        ];
+
+        for &(data_len, want_prefix) in cases {
+            let data = vec![0xabu8; data_len];
+            let encoded = encode_push_data(&data);
+            let got = hex::encode(&encoded);
+            assert!(
+                got.starts_with(want_prefix),
+                "encode_push_data({} bytes) hex prefix = {:?}, want prefix {:?} (full hex starts: {})",
+                data_len,
+                &got[..got.len().min(20)],
+                want_prefix,
+                &got[..got.len().min(12)],
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Exact-byte goldens (T-10 from
+    // audits/cross-language-completeness-20260514.md §5.2).
+    //
+    // The inline emit tests above check opcode-presence (`assert!(hex.contains("ac"))`)
+    // or length, not byte sequences — byte correctness rests on the cross-tier
+    // golden harness. These tests pin the exact hex for three representative
+    // contracts under fold-OFF, matching the checked-in conformance goldens
+    // (e.g. `conformance/tests/basic-p2pkh/expected-script.hex` = "76a90088ac")
+    // and the TS peer assertions in `06-emit.test.ts` describe block
+    // "exact-byte goldens (T-10)". A drift in any pre-emit pass surfaces here
+    // as a localized regression instead of an opaque cross-tier mismatch.
+    // -----------------------------------------------------------------------
+
+    fn compile_to_fold_off_hex(source: &str, file_name: &str) -> String {
+        let opts = crate::CompileOptions {
+            disable_constant_folding: true,
+            ..Default::default()
+        };
+        let artifact = crate::compile_from_source_str_with_options(source, Some(file_name), &opts)
+            .expect("compile should succeed");
+        artifact.script
+    }
+
+    #[test]
+    fn test_p2pkh_exact_byte_golden() {
+        // Canonical P2PKH locking script (fold-OFF). The 0x00 byte is the
+        // OP_0 placeholder for the constructor `pubKeyHash` slot — the SDK
+        // splices the real 20-byte address in at deploy time. Matches
+        // conformance/tests/basic-p2pkh/expected-script.hex byte-for-byte.
+        let source = r#"
+            import { SmartContract, assert, PubKey, Sig, Addr, hash160, checkSig } from 'runar-lang';
+            class P2PKH extends SmartContract {
+              readonly pubKeyHash: Addr;
+              constructor(pubKeyHash: Addr) { super(pubKeyHash); this.pubKeyHash = pubKeyHash; }
+              public unlock(sig: Sig, pubKey: PubKey) {
+                assert(hash160(pubKey) === this.pubKeyHash);
+                assert(checkSig(sig, pubKey));
+              }
+            }
+        "#;
+        let hex = compile_to_fold_off_hex(source, "P2PKH.runar.ts");
+        assert_eq!(hex, "76a90088ac");
+    }
+
+    #[test]
+    fn test_minimal_checksig_exact_byte_golden() {
+        // Smallest signature-gated contract. Emits OP_0 (placeholder for
+        // `owner: PubKey`) + OP_CHECKSIG = "00ac".
+        let source = r#"
+            import { SmartContract, assert, checkSig, PubKey, Sig } from 'runar-lang';
+            class Owned extends SmartContract {
+              readonly owner: PubKey;
+              constructor(owner: PubKey) { super(owner); this.owner = owner; }
+              public unlock(sig: Sig): void {
+                assert(checkSig(sig, this.owner));
+              }
+            }
+        "#;
+        let hex = compile_to_fold_off_hex(source, "Owned.runar.ts");
+        assert_eq!(hex, "00ac");
+    }
+
+    #[test]
+    fn test_stateful_counter_exact_byte_golden() {
+        // Stateful contract with implicit txPreimage + state-continuation +
+        // change-output plumbing. The asserted hex covers OP_CODESEPARATOR
+        // injection (0xab at position 2), the BIP-143 generator pubkey
+        // (0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798),
+        // the GAP-302 sighash-type pin (OP_SIZE 4 OP_SUB OP_SPLIT OP_NIP
+        // OP_BIN2NUM <0x41> OP_NUMEQUALVERIFY, right after checkPreimage), and
+        // the addOutput serialization path. Cross-checked against the TS peer
+        // test in `06-emit.test.ts` (exact-byte goldens describe block).
+        let source = r#"
+            import { StatefulSmartContract, assert } from 'runar-lang';
+            class Counter extends StatefulSmartContract {
+              count: bigint;
+              constructor(count: bigint) { super(count); this.count = count; }
+              public increment(): void {
+                this.count = this.count + 1n;
+                this.addOutput(1000n, this.count);
+              }
+            }
+        "#;
+        // NOTE (BUG-100): the checkPreimage tail is now a fixed opaque raw_bytes
+        // blob (the long `517f7b7b7c7e`-heavy region), so OP_CHECKSIG lives INSIDE
+        // that blob rather than as a discrete tail opcode, and the stateful
+        // unlocking script no longer carries the `_opPushTxSig` witness push.
+        //
+        // NOTE (#116): the change-output segment is now gated behind a runtime
+        // `_changeAmount != 0` guard (the `00787c9c9163 ... 67007b7577687e`
+        // OP_IF/ELSE/ENDIF wrapper around the `1976a914..88ac` P2PKH change
+        // output), so an exact-cover call (change 0) validates. These bytes are
+        // byte-identical to the post-#116 TS reference.
+        let hex = compile_to_fold_off_hex(source, "Counter.runar.ts");
+        let expected = concat!(
+            "76ab76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b",
+            "7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c",
+            "517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b",
+            "7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e",
+            "7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f",
+            "7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c",
+            "7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f",
+            "04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f95",
+            "21414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b75",
+            "78937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f",
+            "a07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d",
+            "7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e",
+            "7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f",
+            "7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c",
+            "7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c51",
+            "7f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b",
+            "7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c",
+            "517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6",
+            "047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e",
+            "7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817",
+            "98ad69768254947f778101419d7601687f7782012c947f758258947f758258947f7781768b77",
+            "02e803785679016a7e7c58807e827602fd009f635280517f756776030000019f635380527f75",
+            "01fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e",
+            "7c58807c7e547a547a00787c9c9163041976a9147b7e0288ac7e7c58807c7e67007b7577687e",
+            "aa7b820128947f7701207f75877777",
+        );
+        assert_eq!(hex, expected);
     }
 }

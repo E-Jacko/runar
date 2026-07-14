@@ -30,6 +30,7 @@ func LowerToANF(contract *ContractNode) *ir.ANFProgram {
 		ContractName: contract.Name,
 		Properties:   properties,
 		Methods:      methods,
+		ParentClass:  contract.ParentClass,
 	}
 }
 
@@ -44,32 +45,44 @@ var byteTypes = map[string]bool{
 	"RabinSig":        true,
 	"RabinPubKey":     true,
 	"Point":           true,
+	"P256Point":       true,
+	"P384Point":       true,
 }
 
 var byteReturningFunctions = map[string]bool{
-	"sha256":       true,
-	"ripemd160":    true,
-	"hash160":      true,
-	"hash256":      true,
-	"cat":          true,
-	"substr":       true,
-	"num2bin":      true,
-	"reverseBytes": true,
-	"left":         true,
-	"right":        true,
-	"int2str":      true,
-	"toByteString":       true,
-	"pack":               true,
-	"ecAdd":              true,
-	"ecMul":              true,
-	"ecMulGen":           true,
-	"ecNegate":           true,
-	"ecMakePoint":        true,
-	"ecEncodeCompressed": true,
-	"sha256Compress":     true,
-	"sha256Finalize":     true,
-	"blake3Compress":     true,
-	"blake3Hash":         true,
+	"sha256":               true,
+	"ripemd160":            true,
+	"hash160":              true,
+	"hash256":              true,
+	"cat":                  true,
+	"substr":               true,
+	"num2bin":              true,
+	"reverseBytes":         true,
+	"left":                 true,
+	"right":                true,
+	"int2str":              true,
+	"toByteString":         true,
+	"pack":                 true,
+	"ecAdd":                true,
+	"ecMul":                true,
+	"ecMulGen":             true,
+	"ecNegate":             true,
+	"ecMakePoint":          true,
+	"ecEncodeCompressed":   true,
+	"p256Add":              true,
+	"p256Mul":              true,
+	"p256MulGen":           true,
+	"p256Negate":           true,
+	"p256EncodeCompressed": true,
+	"p384Add":              true,
+	"p384Mul":              true,
+	"p384MulGen":           true,
+	"p384Negate":           true,
+	"p384EncodeCompressed": true,
+	"sha256Compress":       true,
+	"sha256Finalize":       true,
+	"blake3Compress":       true,
+	"blake3Hash":           true,
 }
 
 func isByteTypedExpr(expr Expression, ctx *lowerCtx) bool {
@@ -105,6 +118,10 @@ func isByteTypedExpr(expr Expression, ctx *lowerCtx) bool {
 
 	case CallExpr:
 		if id, ok := e.Callee.(Identifier); ok {
+			// Expression-form asm<ByteString>({...}) yields a byte value.
+			if id.Name == "asm" {
+				return e.AsmReturnType == "ByteString"
+			}
 			if byteReturningFunctions[id.Name] {
 				return true
 			}
@@ -133,6 +150,17 @@ func lowerProperties(contract *ContractNode) []ir.ANFProperty {
 		}
 		if prop.Initializer != nil {
 			props[i].InitialValue = extractLiteralValue(prop.Initializer)
+		}
+		if len(prop.SyntheticArrayChain) > 0 {
+			chain := make([]ir.ANFSyntheticArrayLevel, len(prop.SyntheticArrayChain))
+			for k, lvl := range prop.SyntheticArrayChain {
+				chain[k] = ir.ANFSyntheticArrayLevel{
+					Base:   lvl.Base,
+					Index:  lvl.Index,
+					Length: lvl.Length,
+				}
+			}
+			props[i].SyntheticArrayChain = chain
 		}
 	}
 	return props
@@ -163,8 +191,15 @@ func extractLiteralValue(expr Expression) interface{} {
 func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 	var result []ir.ANFMethod
 
+	// Single source of truth for "does this method (transitively) mutate
+	// state, emit outputs, or use the preimage?" Shared across the lowering
+	// pass so every public method's auto-injection sees private-helper
+	// effects, not just direct ones.
+	sideEffects := ComputeSideEffectSummary(contract)
+
 	// Lower constructor (the TS reference includes the constructor in output)
-	ctorCtx := newLowerCtx(contract)
+	ctorCtx := newLowerCtxWithEffects(contract, sideEffects)
+	ctorCtx.setMethodParamTypes(contract.Constructor.Params)
 	ctorCtx.lowerStatements(contract.Constructor.Body)
 	result = append(result, ir.ANFMethod{
 		Name:     "constructor",
@@ -173,34 +208,101 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 		IsPublic: false,
 	})
 
+	// Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+	// must survive DCE into the locking script. A readonly field no method
+	// references lowers to no load_prop, so no constructor slot is emitted and
+	// the field's deploy-time bytes vanish. We inject a load_prop + a `@ref:`
+	// alias (the exact shape the `const _bind = this.field;` idiom produces)
+	// into the FIRST public method's body — the alias keeps the load_prop alive
+	// through dead-binding DCE, and stack lowering threads the pushed value
+	// through and cleans it up at method end. One slot in the deployed script
+	// suffices; every spending branch shares it.
+	var embedFields []PropertyNode
+	for _, p := range contract.Properties {
+		if p.Readonly && p.EmbedAlways {
+			embedFields = append(embedFields, p)
+		}
+	}
+	embedInjected := false
+
 	// Lower each method (including private methods as separate entries)
 	for _, method := range contract.Methods {
-		methodCtx := newLowerCtx(contract)
+		methodCtx := newLowerCtxWithEffects(contract, sideEffects)
+		methodCtx.setMethodParamTypes(method.Params)
+
+		// Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+		// flag for any checkPreimage (auto-injected below, or a manual call) in
+		// this method, and rides on the ANF method as a carrier the artifact
+		// assembler copies to ABIMethod.SigHashType (omitted for the default).
+		var methodSigHash *int
+		if method.SighashType != nil && *method.SighashType != SighashDefault {
+			methodCtx.sighashFlag = method.SighashType
+			methodSigHash = method.SighashType
+		}
+
+		// Register the declared param NAMES so a bare identifier resolves to
+		// load_param before falling through to load_prop (issue #130). Without
+		// this, a param whose name collides with a mutable state property
+		// lowered to the stale deserialized property value instead of the
+		// witness param. Explicit `this.x` is unaffected: it lowers via
+		// lowerMemberExpr / the property_access isProperty branch, which always
+		// emit load_prop regardless of param registration.
+		for _, p := range method.Params {
+			methodCtx.addParam(p.Name)
+		}
 
 		if contract.ParentClass == "StatefulSmartContract" && method.Visibility == "public" {
-			// Determine if this method verifies hashOutputs (needs change output support).
-			// Methods that use addOutput or mutate state need hashOutputs verification.
-			// Non-mutating methods (like close/destroy) don't verify outputs.
-			needsChangeOutput := methodMutatesState(method, contract) || methodHasAddOutput(method)
-
-			// Single-output continuation needs _newAmount to allow changing the UTXO satoshis.
-			// Multi-output (addOutput) methods already specify amounts explicitly per output.
-			needsNewAmount := methodMutatesState(method, contract) && !methodHasAddOutput(method)
+			// Continuation requirements come from the side-effect summary,
+			// which walks the private-method call graph. A public method
+			// that calls a private helper which mutates state or emits an
+			// output must therefore inject the same continuation params
+			// as if the public body did so directly.
+			eff := sideEffects[method.Name]
+			shape := ContinuationShapeFor(eff)
+			needsChangeOutput := shape.NeedsChange
+			needsNewAmount := shape.NeedsNewAmount
 
 			// Register implicit parameters
 			if needsChangeOutput {
-				methodCtx.addParam("_changePKH")
-				methodCtx.addParam("_changeAmount")
+				methodCtx.addParam("_changePKH", "Ripemd160")
+				methodCtx.addParam("_changeAmount", "bigint")
 			}
 			if needsNewAmount {
-				methodCtx.addParam("_newAmount")
+				methodCtx.addParam("_newAmount", "bigint")
 			}
-			methodCtx.addParam("txPreimage")
+			methodCtx.addParam("txPreimage", "SigHashPreimage")
 
-			// Inject checkPreimage(txPreimage) at the start
+			// Issue #123: the declared per-method sighash mode (default
+			// ALL|FORKID). Drives BOTH the OP_PUSH_TX binding flag (so the
+			// derived sig re-computes the tx sighash under this mode) AND the
+			// runtime preimage-type assert.
+			sighashMode := SighashDefault
+			if method.SighashType != nil {
+				sighashMode = *method.SighashType
+			}
+			isDefaultSighash := sighashMode == SighashDefault
+
+			// Inject checkPreimage(txPreimage) at the start.
 			preimageRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
-			checkResult := methodCtx.emit(ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef})
+			checkPre := ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef}
+			// Omit for the default so the ANF (and pinned binding blob) is unchanged.
+			if !isDefaultSighash {
+				checkPre.SighashFlag = sighashMode
+			}
+			checkResult := methodCtx.emit(checkPre)
 			methodCtx.emit(makeAssert(checkResult))
+
+			// GAP-302 / #123: pin the sighash type to the declared mode. Without
+			// this check the spend could use a DIFFERENT sighash flag than
+			// declared that zeroes out preimage fields the contract (or its
+			// continuation) relies on (hashOutputs / hashPrevouts / hashSequence).
+			// The value defaults to 0x41 (SIGHASH_ALL|FORKID) so existing
+			// contracts emit byte-identical ANF.
+			sigHashPreimageRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
+			sigHashTypeRef := methodCtx.emit(makeCall("extractSigHashType", []string{sigHashPreimageRef}))
+			expectedSigHashRef := methodCtx.emit(makeLoadConstInt(big.NewInt(int64(sighashMode))))
+			sigHashOkRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: sigHashTypeRef, Right: expectedSigHashRef})
+			methodCtx.emit(makeAssert(sigHashOkRef))
 
 			// Deserialize mutable state from the preimage's scriptCode.
 			// On subsequent spends, the state is embedded in the script (after OP_RETURN),
@@ -217,41 +319,104 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 				methodCtx.emit(ir.ANFValue{Kind: "deserialize_state", Preimage: preimageRef3})
 			}
 
+			// Issue #109: preserve @embedAlways fields at the first user-statement
+			// position (after the checkPreimage/deserialize preamble), mirroring
+			// where a `const _bind = this.field;` idiom would sit.
+			if !embedInjected && len(embedFields) > 0 {
+				emitEmbedAlwaysPreservation(methodCtx, embedFields)
+				embedInjected = true
+			}
+
 			// Lower the developer's method body
 			methodCtx.lowerStatements(method.Body)
 
-			// Determine state continuation type
+			// Determine state continuation type.
+			//
+			// === Continuation-hash construction ===
+			//
+			// The auto-injected continuation assertion verifies that the spending
+			// transaction's hashOutputs field matches a compiler-constructed hash
+			// over the outputs this method declares. Outputs are concatenated in
+			// the following order before hashing with hash256:
+			//
+			//   1. state outputs   (from this.addOutput / this.addRawOutput)
+			//   2. data outputs    (from this.addDataOutput)
+			//   3. change output   (P2PKH to _changePKH, value = _changeAmount)
+			//
+			// For the "single-output" fast path (no addOutput used, but state is
+			// mutated OR data outputs were declared), the state output is
+			// computed on the fly from (preimage, stateScript, _newAmount)
+			// instead of coming from addOutputRefs. Data outputs may still be
+			// declared in this mode and are inserted BETWEEN the single state
+			// output and the change output.
 			addOutputRefs := methodCtx.getAddOutputRefs()
-			if len(addOutputRefs) > 0 || methodMutatesState(method, contract) {
-				// Build the P2PKH change output for hashOutputs verification
+			addDataOutputRefs := methodCtx.getAddDataOutputRefs()
+			// Gate the continuation assertion on the same shape used for
+			// param injection. Both must agree or the deployed locking
+			// script will not match the auto-injected parameter list.
+			if needsChangeOutput {
+				// Build the P2PKH change output for hashOutputs verification.
+				//
+				// Issue #116: the SDK's BuildCallTransaction OMITS the change
+				// output when `change <= 0` (an exact-cover call) and passes
+				// `_changeAmount = 0`. Gate the change segment on `_changeAmount
+				// != 0` at runtime so the hashed output set matches the SDK at
+				// the exact-zero boundary — the segment is the P2PKH change
+				// output when non-zero, and empty bytes (cat with empty is a
+				// no-op) when zero, reproducing the omission. For any change > 0
+				// the hashed bytes are unchanged; only the emitted script gains
+				// the guard.
 				changePKHRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "_changePKH"})
 				changeAmountRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "_changeAmount"})
-				changeOutputRef := methodCtx.emit(makeCall("buildChangeOutput", []string{changePKHRef, changeAmountRef}))
+				zeroRef := methodCtx.emit(makeLoadConstInt(big.NewInt(0)))
+				changeNonZeroRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "!==", Left: changeAmountRef, Right: zeroRef})
+				changeThenCtx := methodCtx.subContext()
+				changeThenCtx.emit(makeCall("buildChangeOutput", []string{changePKHRef, changeAmountRef}))
+				methodCtx.syncCounter(changeThenCtx)
+				changeElseCtx := methodCtx.subContext()
+				changeElseCtx.emit(makeLoadConstString(""))
+				methodCtx.syncCounter(changeElseCtx)
+				changeOutputRef := methodCtx.emit(ir.ANFValue{
+					Kind: "if",
+					Cond: changeNonZeroRef,
+					Then: changeThenCtx.bindings,
+					Else: changeElseCtx.bindings,
+				})
 
 				if len(addOutputRefs) > 0 {
-					// Multi-output continuation: concat all outputs + change output, hash
+					// Multi-output continuation: concat all state outputs, then
+					// all data outputs, then change output, then hash.
 					accumulated := addOutputRefs[0]
 					for i := 1; i < len(addOutputRefs); i++ {
 						accumulated = methodCtx.emit(makeCall("cat", []string{accumulated, addOutputRefs[i]}))
+					}
+					for _, dataRef := range addDataOutputRefs {
+						accumulated = methodCtx.emit(makeCall("cat", []string{accumulated, dataRef}))
 					}
 					accumulated = methodCtx.emit(makeCall("cat", []string{accumulated, changeOutputRef}))
 					hashRef := methodCtx.emit(makeCall("hash256", []string{accumulated}))
 					preimageRef2 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
 					outputHashRef := methodCtx.emit(makeCall("extractOutputHash", []string{preimageRef2}))
 					eqRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: hashRef, Right: outputHashRef, ResultType: "bytes"})
-					methodCtx.emit(makeAssert(eqRef))
+					methodCtx.emit(makeAutoInjectedStateCheckAssert(eqRef))
 				} else {
-					// Single-output continuation: build raw output bytes, concat with change, hash
+					// Single-output continuation: build raw output bytes, then
+					// splice in any declared data outputs, then concat with
+					// change, then hash.
 					stateScriptRef := methodCtx.emit(ir.ANFValue{Kind: "get_state_script"})
 					preimageRef2 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
 					newAmountRef := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "_newAmount"})
 					contractOutputRef := methodCtx.emit(makeCall("computeStateOutput", []string{preimageRef2, stateScriptRef, newAmountRef}))
-					allOutputs := methodCtx.emit(makeCall("cat", []string{contractOutputRef, changeOutputRef}))
+					accumulated := contractOutputRef
+					for _, dataRef := range addDataOutputRefs {
+						accumulated = methodCtx.emit(makeCall("cat", []string{accumulated, dataRef}))
+					}
+					allOutputs := methodCtx.emit(makeCall("cat", []string{accumulated, changeOutputRef}))
 					hashRef := methodCtx.emit(makeCall("hash256", []string{allOutputs}))
 					preimageRef4 := methodCtx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
 					outputHashRef := methodCtx.emit(makeCall("extractOutputHash", []string{preimageRef4}))
 					eqRef := methodCtx.emit(ir.ANFValue{Kind: "bin_op", Op: "===", Left: hashRef, Right: outputHashRef, ResultType: "bytes"})
-					methodCtx.emit(makeAssert(eqRef))
+					methodCtx.emit(makeAutoInjectedStateCheckAssert(eqRef))
 				}
 			}
 
@@ -271,24 +436,70 @@ func lowerMethods(contract *ContractNode) []ir.ANFMethod {
 				Type: "SigHashPreimage",
 			})
 
+			// Intent-covenant intrinsic auto-injected witness params:
+			// extractPrevOutputScript adds `_prevOutScript_<inputIndex>`
+			// (one per distinct literal index referenced in the method);
+			// requireOutputP2PKH adds a single `_serialisedOutputs`. Order
+			// follows insertion order via methodScope.autoInjectedParams.
+			// Appended AFTER txPreimage so unlocking scripts push them
+			// adjacent to the preimage (matches existing _changePKH /
+			// _changeAmount / _newAmount convention of trailing the user
+			// args before the preimage anchor).
+			augmentedParams = append(augmentedParams, methodCtx.methodScope.autoInjectedParams...)
+
 			result = append(result, ir.ANFMethod{
-				Name:     method.Name,
-				Params:   augmentedParams,
-				Body:     methodCtx.bindings,
-				IsPublic: true,
+				Name:        method.Name,
+				Params:      augmentedParams,
+				Body:        methodCtx.bindings,
+				IsPublic:    true,
+				SigHashType: methodSigHash,
 			})
 		} else {
+			// Issue #109: stateless public methods (and stateless contracts'
+			// spending entry points) are lowered here — inject @embedAlways
+			// preservation into the first PUBLIC one before its body.
+			if !embedInjected && len(embedFields) > 0 && method.Visibility == "public" {
+				emitEmbedAlwaysPreservation(methodCtx, embedFields)
+				embedInjected = true
+			}
 			methodCtx.lowerStatements(method.Body)
+			augmented := lowerParams(method.Params)
+			// Private methods can also call the intent intrinsics; capture
+			// their auto-injected witness params so a public method that
+			// inlines this private picks them up via the shared methodScope.
+			// (Private methods are inlined into public bodies via
+			// inlinePrivateMethodCall — that path reuses the public's
+			// methodScope, so the auto-injection registers at the public
+			// method's ABI augmentation step above. The private's own ABI
+			// is still informative for non-inlined callees.)
+			augmented = append(augmented, methodCtx.methodScope.autoInjectedParams...)
 			result = append(result, ir.ANFMethod{
-				Name:     method.Name,
-				Params:   lowerParams(method.Params),
-				Body:     methodCtx.bindings,
-				IsPublic: method.Visibility == "public",
+				Name:        method.Name,
+				Params:      augmented,
+				Body:        methodCtx.bindings,
+				IsPublic:    method.Visibility == "public",
+				SigHashType: methodSigHash,
 			})
 		}
 	}
 
 	return result
+}
+
+// emitEmbedAlwaysPreservation emits the DCE-surviving preservation pair for
+// each `@embedAlways` readonly field into the given (public) method context
+// (issue #109). Reproduces exactly what a hand-written `const _bind =
+// this.field;` lowers to: a load_prop followed by a load_const("@ref:<t>")
+// alias. The alias marks the load_prop as referenced (see dce.go), so
+// dead-binding DCE keeps it; stack lowering then emits the field's
+// constructor-slot placeholder and NIPs the unused value off the stack at
+// method end. The field's bytes therefore remain in the deployed locking
+// script for downstream recovery.
+func emitEmbedAlwaysPreservation(ctx *lowerCtx, fields []PropertyNode) {
+	for _, field := range fields {
+		loadRef := ctx.emit(ir.ANFValue{Kind: "load_prop", Name: field.Name})
+		ctx.emitNamed("__embedAlways_"+field.Name, makeLoadConstString("@ref:"+loadRef))
+	}
 }
 
 func lowerParams(params []ParamNode) []ir.ANFParam {
@@ -313,25 +524,150 @@ func lowerParams(params []ParamNode) []ir.ANFParam {
 // ---------------------------------------------------------------------------
 
 type lowerCtx struct {
-	bindings         []ir.ANFBinding
-	counter          int
-	contract         *ContractNode
-	localNames       map[string]bool   // tracks variable names registered via addLocal
-	paramNames       map[string]bool   // tracks parameter names registered via addParam
-	addOutputRefs    []string          // tracks addOutput binding refs for multi-output continuation
-	localAliases     map[string]string // maps local variable names to their current ANF binding name (updated after if-statements that reassign locals in both branches)
-	localByteVars    map[string]bool   // tracks local variables known to be byte-typed
-	currentSourceLoc *ir.SourceLocation // Debug: source location to attach to emitted ANF bindings
+	bindings          []ir.ANFBinding
+	counter           int
+	contract          *ContractNode
+	localNames        map[string]bool    // tracks variable names registered via addLocal
+	paramNames        map[string]bool    // tracks parameter names registered via addParam
+	methodParamTypes  map[string]string  // tracks the CURRENT method's parameter types (issue #34); copied into sub-contexts
+	addOutputRefs     []string           // tracks addOutput / addRawOutput binding refs (state outputs)
+	addDataOutputRefs []string           // tracks addDataOutput binding refs — data outputs are included in the continuation hash AFTER state outputs and BEFORE the change output
+	localAliases      map[string]string  // maps local variable names to their current ANF binding name (updated after if-statements that reassign locals in both branches)
+	localByteVars     map[string]bool    // tracks local variables known to be byte-typed
+	currentSourceLoc  *ir.SourceLocation // Debug: source location to attach to emitted ANF bindings
+	// Param substitution stack used when inlining a private method's body
+	// directly into this context. Each entry on top is the active alias
+	// for that param. When the inlined body references that param, the
+	// lowered identifier resolves to the aliased ref instead of emitting
+	// load_param. Stacked so nested inlines compose correctly.
+	paramAliasStack map[string][]string
+	// Side-effect summary shared with auto-injection decisions. Used at
+	// lowering time to decide whether a private call should be inlined
+	// (so that helper's add_output / add_data_output ANF nodes register
+	// on the caller's continuation hash) or remain a method_call for
+	// stack lowering to inline later.
+	sideEffects SideEffectSummary
+	// methodScope is per-method state shared with all sub-contexts. Tracks
+	// auto-injected witness parameters needed by intent-covenant intrinsics
+	// (extractPrevOutputScript, requireOutputP2PKH) regardless of whether
+	// the intrinsic is called from the method's top-level body or from
+	// inside a nested block (if/else, ternary). See methodScopeT.
+	methodScope *methodScopeT
+	// sighashFlag is the declared non-default `@sighash` flag for the method
+	// being lowered (issue #123), so a MANUAL checkPreimage(pre) call binds
+	// under the same mode as the method's declared sighash. nil = default
+	// ALL|FORKID, keeping the pinned binding blob unchanged. Propagated into
+	// sub-contexts so a manual call inside an if/for body picks it up.
+	sighashFlag *int
+}
+
+// methodScopeT holds per-method bookkeeping shared by parent and
+// sub-contexts. The ABI augmentation pass (after method body lowering)
+// reads autoInjectedParams to append witness params to the final method
+// param list.
+type methodScopeT struct {
+	autoInjectedParams      []ir.ANFParam   // append-only, insertion order
+	autoInjectedSet         map[string]bool // dedup
+	didEmitHashOutputsCheck bool            // requireOutputP2PKH emits its hashOutputs(preimage) check at most once per method
+}
+
+func newMethodScope() *methodScopeT {
+	return &methodScopeT{autoInjectedSet: make(map[string]bool)}
+}
+
+// recordAutoInjectedParam adds a witness param to the method's ABI
+// augmentation list (idempotent — second call with same name is a no-op).
+func (ms *methodScopeT) recordAutoInjectedParam(name, typ string) {
+	if ms.autoInjectedSet[name] {
+		return
+	}
+	ms.autoInjectedSet[name] = true
+	ms.autoInjectedParams = append(ms.autoInjectedParams, ir.ANFParam{Name: name, Type: typ})
 }
 
 func newLowerCtx(contract *ContractNode) *lowerCtx {
+	return newLowerCtxWithEffects(contract, nil)
+}
+
+func newLowerCtxWithEffects(contract *ContractNode, summary SideEffectSummary) *lowerCtx {
 	return &lowerCtx{
-		contract:      contract,
-		localNames:    make(map[string]bool),
-		paramNames:    make(map[string]bool),
-		localAliases:  make(map[string]string),
-		localByteVars: make(map[string]bool),
+		contract:         contract,
+		localNames:       make(map[string]bool),
+		paramNames:       make(map[string]bool),
+		methodParamTypes: make(map[string]string),
+		localAliases:     make(map[string]string),
+		localByteVars:    make(map[string]bool),
+		paramAliasStack:  make(map[string][]string),
+		sideEffects:      summary,
+		methodScope:      newMethodScope(),
 	}
+}
+
+// pushParamAlias records that subsequent identifier lookups for `name`
+// should resolve to `aliasRef` until the matching pop. Stacked so
+// nested inlines compose: pop returns the previous frame.
+func (ctx *lowerCtx) pushParamAlias(name, aliasRef string) {
+	ctx.paramAliasStack[name] = append(ctx.paramAliasStack[name], aliasRef)
+}
+
+func (ctx *lowerCtx) popParamAlias(name string) {
+	stack := ctx.paramAliasStack[name]
+	if len(stack) == 0 {
+		return
+	}
+	stack = stack[:len(stack)-1]
+	if len(stack) == 0 {
+		delete(ctx.paramAliasStack, name)
+	} else {
+		ctx.paramAliasStack[name] = stack
+	}
+}
+
+func (ctx *lowerCtx) getParamAlias(name string) (string, bool) {
+	stack := ctx.paramAliasStack[name]
+	if len(stack) == 0 {
+		return "", false
+	}
+	return stack[len(stack)-1], true
+}
+
+// shouldInlinePrivate reports whether a call to `name` should be ANF-inlined
+// rather than emitted as a method_call. True iff `name` is a private method
+// that (transitively) emits state outputs (addOutput / addRawOutput) or data
+// outputs (addDataOutput). Those refs MUST appear in the caller's binding
+// stream so they participate in the continuation hash; without ANF-level
+// inlining they would live in a sibling ANF method and the public method's
+// continuation hash would miss them.
+//
+// Mutation-only private helpers (no output intrinsics) are intentionally
+// NOT inlined — state mutation flows through state continuity (the
+// continuation hash reads state via get_state_script after all mutations
+// apply), not through output refs. Keeping the existing method_call +
+// stack-lowering inlining path for those preserves byte-equality with the
+// pre-fix corpus.
+func (ctx *lowerCtx) shouldInlinePrivate(name string) bool {
+	if ctx.sideEffects == nil {
+		return false
+	}
+	if !ctx.isPrivateMethod(name) {
+		return false
+	}
+	eff, ok := ctx.sideEffects[name]
+	if !ok {
+		return false
+	}
+	return eff.HasStateOutput || eff.HasDataOutput
+}
+
+// getPrivateMethod looks up a private method by name. Returns the method
+// and true if found, zero value and false otherwise.
+func (ctx *lowerCtx) getPrivateMethod(name string) (MethodNode, bool) {
+	for _, m := range ctx.contract.Methods {
+		if m.Name == name && m.Visibility == "private" {
+			return m, true
+		}
+	}
+	return MethodNode{}, false
 }
 
 // freshTemp generates a fresh temporary variable name.
@@ -372,8 +708,24 @@ func (ctx *lowerCtx) isLocal(name string) bool {
 }
 
 // addParam records a parameter name so we know to use load_param for it.
-func (ctx *lowerCtx) addParam(name string) {
+// An optional type (variadic, at most one element) records the param's
+// type in the method-scoped type table — used for auto-injected
+// continuation params so getParamType still finds them (issue #34).
+func (ctx *lowerCtx) addParam(name string, typ ...string) {
 	ctx.paramNames[name] = true
+	if len(typ) > 0 {
+		ctx.methodParamTypes[name] = typ[0]
+	}
+}
+
+// setMethodParamTypes records the current method's parameter types in the
+// method-scoped table. Must be called once per method/constructor before
+// lowering its body so getParamType only sees THIS method's params (issue #34).
+func (ctx *lowerCtx) setMethodParamTypes(params []ParamNode) {
+	ctx.methodParamTypes = make(map[string]string, len(params))
+	for _, p := range params {
+		ctx.methodParamTypes[p.Name] = typeNodeToString(p.Type)
+	}
 }
 
 // isParam checks if a name is a registered parameter.
@@ -401,7 +753,31 @@ func (ctx *lowerCtx) getAddOutputRefs() []string {
 	return ctx.addOutputRefs
 }
 
+// addDataOutputRef tracks an addDataOutput binding ref — distinct from
+// state outputs. Data outputs are concatenated into the continuation hash
+// after all state outputs and before the change output.
+func (ctx *lowerCtx) addDataOutputRef(ref string) {
+	ctx.addDataOutputRefs = append(ctx.addDataOutputRefs, ref)
+}
+
+// getAddDataOutputRefs returns all addDataOutput refs collected during lowering.
+func (ctx *lowerCtx) getAddDataOutputRefs() []string {
+	return ctx.addDataOutputRefs
+}
+
 // isProperty checks if a name is a contract property.
+// isPrivateMethod reports whether `name` is a private (non-public) method
+// on the contract — matching the TypeScript compiler's check used for
+// routing bare-identifier calls through the method_call inlining path.
+func (ctx *lowerCtx) isPrivateMethod(name string) bool {
+	for _, m := range ctx.contract.Methods {
+		if m.Name == name && m.Visibility != "public" && m.Name != "constructor" {
+			return true
+		}
+	}
+	return false
+}
+
 func (ctx *lowerCtx) isProperty(name string) bool {
 	for _, p := range ctx.contract.Properties {
 		if p.Name == name {
@@ -412,19 +788,13 @@ func (ctx *lowerCtx) isProperty(name string) bool {
 }
 
 func (ctx *lowerCtx) getParamType(name string) (string, bool) {
-	for _, p := range ctx.contract.Constructor.Params {
-		if p.Name == name {
-			return typeNodeToString(p.Type), true
-		}
-	}
-	for _, method := range ctx.contract.Methods {
-		for _, p := range method.Params {
-			if p.Name == name {
-				return typeNodeToString(p.Type), true
-			}
-		}
-	}
-	return "", false
+	// Restricted to the CURRENT method's parameters (issue #34). A cross-method
+	// lookup poisoned the byte-type analysis when two methods shared a parameter
+	// name (e.g. one method's local `x: bigint` collided with another method's
+	// `x: ByteString` parameter), which flipped result_type to 'bytes' and made
+	// stack lowering emit OP_CAT for an integer add.
+	t, ok := ctx.methodParamTypes[name]
+	return t, ok
 }
 
 func (ctx *lowerCtx) getPropertyType(name string) (string, bool) {
@@ -440,12 +810,15 @@ func (ctx *lowerCtx) getPropertyType(name string) (string, bool) {
 // The counter continues from the parent. Local names and param names are shared.
 func (ctx *lowerCtx) subContext() *lowerCtx {
 	sub := &lowerCtx{
-		contract:      ctx.contract,
-		counter:       ctx.counter,
-		localNames:    make(map[string]bool),
-		paramNames:    make(map[string]bool),
-		localAliases:  make(map[string]string),
-		localByteVars: make(map[string]bool),
+		contract:         ctx.contract,
+		counter:          ctx.counter,
+		localNames:       make(map[string]bool),
+		paramNames:       make(map[string]bool),
+		methodParamTypes: make(map[string]string),
+		localAliases:     make(map[string]string),
+		localByteVars:    make(map[string]bool),
+		methodScope:      ctx.methodScope, // shared pointer — auto-injection registers propagate up
+		sighashFlag:      ctx.sighashFlag, // #123: nested manual checkPreimage inherits the method's mode
 	}
 	// Share local name set
 	for k := range ctx.localNames {
@@ -454,6 +827,11 @@ func (ctx *lowerCtx) subContext() *lowerCtx {
 	// Share param name set
 	for k := range ctx.paramNames {
 		sub.paramNames[k] = true
+	}
+	// Share method-scoped param types (issue #34) so nested blocks see the
+	// same current-method param types and not other methods' params.
+	for k, v := range ctx.methodParamTypes {
+		sub.methodParamTypes[k] = v
 	}
 	// Share local byte var set
 	for k := range ctx.localByteVars {
@@ -627,6 +1005,25 @@ func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt) {
 	}
 	ctx.syncCounter(elseCtx)
 
+	// 2026-04-30 audit finding F2: when a branch contains output
+	// intrinsics, append a cat-chain inside each branch so the
+	// branch's terminal value is the concat of its output bytes
+	// (state then data, in declaration order). This balances
+	// runtime stack effects across branches and lets the parent's
+	// continuation hash see a single ref representing the chosen
+	// branch's full output set.
+	thenOutputRefs := thenCtx.getAddOutputRefs()
+	elseOutputRefs := elseCtx.getAddOutputRefs()
+	thenDataRefs := thenCtx.getAddDataOutputRefs()
+	elseDataRefs := elseCtx.getAddDataOutputRefs()
+	branchHasOutputs := len(thenOutputRefs) > 0 || len(elseOutputRefs) > 0 ||
+		len(thenDataRefs) > 0 || len(elseDataRefs) > 0
+
+	if branchHasOutputs {
+		appendBranchOutputConcat(thenCtx)
+		appendBranchOutputConcat(elseCtx)
+	}
+
 	elseBindings := elseCtx.bindings
 	if elseBindings == nil {
 		elseBindings = []ir.ANFBinding{}
@@ -638,13 +1035,25 @@ func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt) {
 		Else: elseBindings,
 	})
 
-	// Propagate addOutput refs from sub-contexts: when either branch produces
-	// addOutput calls, the if-expression result represents each addOutput
-	// (only one branch executes at runtime).
-	thenOutputRefs := thenCtx.getAddOutputRefs()
-	elseOutputRefs := elseCtx.getAddOutputRefs()
-	if len(thenOutputRefs) > 0 || len(elseOutputRefs) > 0 {
-		ctx.addOutputRef(ifName)
+	if branchHasOutputs {
+		// Register the if's value once with the parent's continuation
+		// tracker. CRITICAL: pick the right tracker. If either branch
+		// produces a STATE output (addOutput / addRawOutput), the
+		// parent must take the multi-output continuation path, so we
+		// register as a state output ref. If neither branch produces a
+		// state output and at least one branch produces a data output,
+		// we register as a DATA output ref so the parent keeps its
+		// single-output `computeStateOutput` continuation and the
+		// data-output bytes splice in BETWEEN the state output and
+		// the change output. Without this, a branch with only
+		// `addDataOutput` was incorrectly forced onto the multi-output
+		// path, dropping the canonical state continuation.
+		branchHasStateOutput := len(thenOutputRefs) > 0 || len(elseOutputRefs) > 0
+		if branchHasStateOutput {
+			ctx.addOutputRef(ifName)
+		} else {
+			ctx.addDataOutputRef(ifName)
+		}
 	}
 
 	// If both branches end by reassigning the same local variable,
@@ -659,8 +1068,33 @@ func (ctx *lowerCtx) lowerIfStatement(stmt IfStmt) {
 	}
 }
 
+// appendBranchOutputConcat concatenates a branch's output refs (state
+// then data, in declaration order) into a single bytes-ref appended to
+// the branch's bindings. If the branch has no outputs, emits an empty
+// `load_const` so the branch still leaves one item on the stack —
+// required to balance the if's branch shapes when the OTHER branch
+// has outputs. 2026-04-30 audit finding F2 fix.
+func appendBranchOutputConcat(branchCtx *lowerCtx) string {
+	allRefs := append([]string{}, branchCtx.getAddOutputRefs()...)
+	allRefs = append(allRefs, branchCtx.getAddDataOutputRefs()...)
+	if len(allRefs) == 0 {
+		return branchCtx.emit(makeLoadConstString(""))
+	}
+	if len(allRefs) == 1 {
+		return allRefs[0]
+	}
+	accumulated := allRefs[0]
+	for i := 1; i < len(allRefs); i++ {
+		accumulated = branchCtx.emit(makeCall("cat", []string{accumulated, allRefs[i]}))
+	}
+	return accumulated
+}
+
 func (ctx *lowerCtx) lowerForStatement(stmt ForStmt) {
-	count := extractLoopCount(stmt)
+	// Resolve the loop's compile-time shape: start value, step direction, and
+	// iteration count. Rúnar requires bounded loops, so all three must be
+	// statically determinable (issue #121).
+	start, step, count := extractLoopShape(stmt)
 
 	// Lower body into sub-context
 	bodyCtx := ctx.subContext()
@@ -668,62 +1102,107 @@ func (ctx *lowerCtx) lowerForStatement(stmt ForStmt) {
 	ctx.syncCounter(bodyCtx)
 
 	ctx.emit(ir.ANFValue{
-		Kind:    "loop",
-		Count:   count,
-		Body:    bodyCtx.bindings,
-		IterVar: stmt.Init.Name,
+		Kind:     "loop",
+		Count:    count,
+		Body:     bodyCtx.bindings,
+		IterVar:  stmt.Init.Name,
+		Start:    start,
+		StartRaw: bigIntStartRaw(start),
+		Step:     step,
 	})
 }
 
-func extractLoopCount(stmt ForStmt) int {
-	startVal := extractBigIntValue(stmt.Init.Init)
+// extractLoopShape resolves a for-statement's compile-time loop shape (issue
+// #121): the iterator start value, step direction (+1/-1), and iteration count.
+//
+// Supports counting-up and counting-down loops:
+//
+//	for (let i = 0n; i < 10n; i++)  -> start 0, step +1, count 10
+//	for (let i = 1n; i <= 3n; i++)  -> start 1, step +1, count 3
+//	for (let i = 3n; i > 0n; i--)   -> start 3, step -1, count 3
+//	for (let i = 3n; i >= 1n; i--)  -> start 3, step -1, count 3
+//
+// The loop is unrolled `count` times; on iteration i the iterator holds
+// `start + i*step`. Start and bound must be compile-time integer literals; in
+// the normal pipeline the validate pass rejects non-literal bounds first, so
+// these panics guard callers that lower without validating.
+func extractLoopShape(stmt ForStmt) (*big.Int, int, int) {
+	start := extractBigIntValue(stmt.Init.Init)
+	if start == nil {
+		panic("Cannot determine loop start at compile time. For-loop iterators must start at an integer literal.")
+	}
 
-	if bin, ok := stmt.Condition.(BinaryExpr); ok {
-		boundVal := extractBigIntValue(bin.Right)
+	bin, ok := stmt.Condition.(BinaryExpr)
+	if !ok {
+		panic("Cannot determine loop bound at compile time. For-loop bounds must be integer literals.")
+	}
+	bound := extractBigIntValue(bin.Right)
+	if bound == nil {
+		panic("Cannot determine loop bound at compile time. For-loop bounds must be integer literals.")
+	}
 
-		if startVal != nil && boundVal != nil {
-			start := startVal.Int64()
-			bound := boundVal.Int64()
-			switch bin.Op {
-			case "<":
-				v := int(bound - start)
-				if v < 0 {
-					v = 0
-				}
-				return v
-			case "<=":
-				v := int(bound - start + 1)
-				if v < 0 {
-					v = 0
-				}
-				return v
-			case ">":
-				v := int(start - bound)
-				if v < 0 {
-					v = 0
-				}
-				return v
-			case ">=":
-				v := int(start - bound + 1)
-				if v < 0 {
-					v = 0
-				}
-				return v
-			}
+	step := extractLoopStep(stmt)
+
+	// Count = number of iterations before the condition first turns false.
+	var count *big.Int
+	if step == 1 {
+		switch bin.Op {
+		case "<":
+			count = new(big.Int).Sub(bound, start)
+		case "<=":
+			count = new(big.Int).Add(new(big.Int).Sub(bound, start), big.NewInt(1))
+		default:
+			panic(fmt.Sprintf("For loop counting up (i++) must use '<' or '<=' (got '%s').", bin.Op))
 		}
-
-		if boundVal != nil {
-			bound := boundVal.Int64()
-			switch bin.Op {
-			case "<":
-				return int(bound)
-			case "<=":
-				return int(bound) + 1
-			}
+	} else {
+		switch bin.Op {
+		case ">":
+			count = new(big.Int).Sub(start, bound)
+		case ">=":
+			count = new(big.Int).Add(new(big.Int).Sub(start, bound), big.NewInt(1))
+		default:
+			panic(fmt.Sprintf("For loop counting down (i--) must use '>' or '>=' (got '%s').", bin.Op))
 		}
 	}
 
-	return 0
+	n := 0
+	if count.Sign() > 0 {
+		n = int(count.Int64())
+	}
+	return start, step, n
+}
+
+// extractLoopStep determines the iterator step direction (+1/-1) from the
+// for-statement's update clause, falling back to the condition direction. Only
+// unit steps are supported (issue #121).
+func extractLoopStep(stmt ForStmt) int {
+	if u, ok := stmt.Update.(ExpressionStmt); ok {
+		switch u.Expr.(type) {
+		case IncrementExpr:
+			return 1
+		case DecrementExpr:
+			return -1
+		}
+	}
+	// Fall back to the comparison direction for other unit-step spellings
+	// (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
+	if bin, ok := stmt.Condition.(BinaryExpr); ok {
+		if bin.Op == ">" || bin.Op == ">=" {
+			return -1
+		}
+	}
+	return 1
+}
+
+// bigIntStartRaw encodes a loop iterator start value into the raw JSON form the
+// loop ANF node emits (issue #121), mirroring the load_const bigint encoding.
+func bigIntStartRaw(val *big.Int) json.RawMessage {
+	if val.IsInt64() {
+		raw, _ := json.Marshal(val.Int64())
+		return raw
+	}
+	raw, _ := json.Marshal(val.String() + "n")
+	return raw
 }
 
 func extractBigIntValue(expr Expression) *big.Int {
@@ -762,7 +1241,15 @@ func (ctx *lowerCtx) lowerExprToRef(expr Expression) string {
 		return ctx.lowerIdentifier(e)
 
 	case PropertyAccessExpr:
-		// this.txPreimage in StatefulSmartContract -> load_param (it's an implicit param, not a stored property)
+		// Explicit `this.x`: a real contract property always wins, even when a
+		// method param shares the name (issue #130). Now that declared params
+		// are registered, the isParam branch below must not shadow a stored
+		// property.
+		if ctx.isProperty(e.Property) {
+			return ctx.emit(ir.ANFValue{Kind: "load_prop", Name: e.Property})
+		}
+		// this.txPreimage in StatefulSmartContract -> load_param (it's an
+		// implicit injected param, not a stored property).
 		if ctx.isParam(e.Property) {
 			return ctx.emit(ir.ANFValue{Kind: "load_param", Name: e.Property})
 		}
@@ -842,6 +1329,13 @@ func (ctx *lowerCtx) lowerIdentifier(id Identifier) string {
 		return ctx.emit(makeLoadConstString("@this"))
 	}
 
+	// Param alias takes precedence over normal param lookup. Set when a
+	// private method's body is being inlined into this context — the
+	// private's param names map to the caller's arg refs.
+	if alias, ok := ctx.getParamAlias(name); ok {
+		return alias
+	}
+
 	// Check if it's a registered parameter (e.g. txPreimage in StatefulSmartContract)
 	if ctx.isParam(name) {
 		return ctx.emit(ir.ANFValue{Kind: "load_param", Name: name})
@@ -913,13 +1407,159 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 	if id, ok := callee.(Identifier); ok && id.Name == "checkPreimage" {
 		if len(e.Args) >= 1 {
 			preimageRef := ctx.lowerExprToRef(e.Args[0])
-			return ctx.emit(ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef})
+			cp := ir.ANFValue{Kind: "check_preimage", Preimage: preimageRef}
+			// Issue #123: honour the method's declared @sighash on manual calls.
+			if ctx.sighashFlag != nil {
+				cp.SighashFlag = *ctx.sighashFlag
+			}
+			return ctx.emit(cp)
 		}
 	}
 
-	// this.addOutput(satoshis, val1, val2, ...) -> special node
+	// extractPrevOutputScript(inputIndex_literal, expectedScriptHash) -> ByteString
+	// extractPrevOutputScript(inputIndex_literal, expectedScriptPrefixHash, prefixLen_literal) -> ByteString
+	//
+	// Witness-bridge sugar (BSVM Phase 13). Auto-injects a hidden method
+	// parameter named `_prevOutScript_<inputIndex>` (one per distinct index
+	// in the method body), emits a hash assertion, and returns the witness
+	// ref for caller substring extraction.
+	//
+	// 2-arg form: hash256(witness) === expectedScriptHash. Pins the full
+	//   prev-output script byte-for-byte. Use when the prev-output is a
+	//   single fixed-shape contract (e.g. bridge.runar.go pattern).
+	// 3-arg form: hash256(substr(witness, 0, prefixLen)) ===
+	//   expectedScriptPrefixHash. Pins the policy prefix only, leaving the
+	//   pushdata tail free to vary. Required for the intent-template
+	//   matching use case where each successor intent UTXO has a unique
+	//   tail (BSVM Mode 3 permissionless step-in).
+	if id, ok := callee.(Identifier); ok && id.Name == "extractPrevOutputScript" {
+		if len(e.Args) != 2 && len(e.Args) != 3 {
+			return ctx.emit(makeLoadConstString(""))
+		}
+		idxLit, ok := e.Args[0].(BigIntLiteral)
+		if !ok || idxLit.Value == nil {
+			return ctx.emit(makeLoadConstString(""))
+		}
+		idx := idxLit.Value.Int64()
+		paramName := fmt.Sprintf("_prevOutScript_%d", idx)
+		ctx.methodScope.recordAutoInjectedParam(paramName, "ByteString")
+		ctx.addParam(paramName)
+		witnessRef := ctx.emit(ir.ANFValue{Kind: "load_param", Name: paramName})
+		expectedHashRef := ctx.lowerExprToRef(e.Args[1])
+
+		// Determine which bytes to hash: full witness (2-arg) or
+		// prefix (3-arg). The substr happens at script-execution time;
+		// the literal prefixLen is baked into the emitted Stack-IR.
+		var bytesToHashRef string
+		if len(e.Args) == 3 {
+			prefixLenLit, ok := e.Args[2].(BigIntLiteral)
+			if !ok || prefixLenLit.Value == nil {
+				return ctx.emit(makeLoadConstString(""))
+			}
+			zeroRef := ctx.emit(makeLoadConstInt(big.NewInt(0)))
+			prefixLenRef := ctx.emit(makeLoadConstInt(new(big.Int).Set(prefixLenLit.Value)))
+			bytesToHashRef = ctx.emit(makeCall("substr", []string{witnessRef, zeroRef, prefixLenRef}))
+		} else {
+			bytesToHashRef = witnessRef
+		}
+
+		actualHashRef := ctx.emit(makeCall("hash256", []string{bytesToHashRef}))
+		eqRef := ctx.emit(ir.ANFValue{
+			Kind: "bin_op", Op: "===",
+			Left: actualHashRef, Right: expectedHashRef,
+			ResultType: "bytes",
+		})
+		ctx.emit(makeAssert(eqRef))
+		return witnessRef
+	}
+
+	// requireOutputP2PKH(outputIndex_literal, pubkeyHash, amount) -> void.
+	// Asserts that the tx's output at outputIndex is a standard P2PKH paying
+	// `amount` satoshis to `pubkeyHash`. Auto-injects `_serialisedOutputs`
+	// (once per method) and emits hash256(serialisedOutputs) ==
+	// extractOutputHash(txPreimage) the first time the intrinsic is called
+	// in a method body. Subsequent calls in the same method skip the
+	// hashOutputs check (already established) and emit only the per-output
+	// substring assertion.
+	//
+	// v1 assumes all outputs in the serialised set are exactly 34 bytes
+	// (8-byte LE amount ‖ 0x19 length ‖ 25-byte P2PKH script). Byte offset
+	// of output i is i*34. If the method also calls c.AddDataOutput(...)
+	// the assumption breaks (variable-length OP_RETURN) — typecheck
+	// rejects that mix; see checkMethod in typecheck.go (Crit-3).
+	if id, ok := callee.(Identifier); ok && id.Name == "requireOutputP2PKH" {
+		if len(e.Args) != 3 {
+			return ctx.emit(makeLoadConstString(""))
+		}
+		idxLit, ok := e.Args[0].(BigIntLiteral)
+		if !ok || idxLit.Value == nil {
+			return ctx.emit(makeLoadConstString(""))
+		}
+		idx := idxLit.Value.Int64()
+
+		ctx.methodScope.recordAutoInjectedParam("_serialisedOutputs", "ByteString")
+		ctx.addParam("_serialisedOutputs")
+
+		// Emit the hashOutputs(preimage) check exactly once per method.
+		if !ctx.methodScope.didEmitHashOutputsCheck {
+			ctx.methodScope.didEmitHashOutputsCheck = true
+			serialisedRef := ctx.emit(ir.ANFValue{Kind: "load_param", Name: "_serialisedOutputs"})
+			actualOutHashRef := ctx.emit(makeCall("hash256", []string{serialisedRef}))
+			preimageRef := ctx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
+			expectedOutHashRef := ctx.emit(makeCall("extractOutputHash", []string{preimageRef}))
+			hashEqRef := ctx.emit(ir.ANFValue{
+				Kind: "bin_op", Op: "===",
+				Left: actualOutHashRef, Right: expectedOutHashRef,
+				ResultType: "bytes",
+			})
+			ctx.emit(makeAssert(hashEqRef))
+		}
+
+		// Lower the user-supplied args (pubkeyHash, amount).
+		pubkeyHashRef := ctx.lowerExprToRef(e.Args[1])
+		amountRef := ctx.lowerExprToRef(e.Args[2])
+
+		// Construct expected P2PKH output bytes:
+		//   <amount: 8-byte LE> ‖ 0x19 0x76 0xa9 0x14 ‖ <pubkeyHash: 20 bytes> ‖ 0x88 0xac
+		eightRef := ctx.emit(makeLoadConstInt(big.NewInt(8)))
+		amountBytesRef := ctx.emit(makeCall("num2bin", []string{amountRef, eightRef}))
+		// 0x19 0x76 0xa9 0x14 — script length byte + OP_DUP OP_HASH160 OP_PUSH20
+		prefixRef := ctx.emit(makeLoadConstString("1976a914"))
+		// 0x88 0xac — OP_EQUALVERIFY OP_CHECKSIG
+		suffixRef := ctx.emit(makeLoadConstString("88ac"))
+		cat1Ref := ctx.emit(makeCall("cat", []string{amountBytesRef, prefixRef}))
+		cat2Ref := ctx.emit(makeCall("cat", []string{cat1Ref, pubkeyHashRef}))
+		expectedOutputRef := ctx.emit(makeCall("cat", []string{cat2Ref, suffixRef}))
+
+		// Substring extract at idx*34 length 34, assert equal.
+		serialisedRef := ctx.emit(ir.ANFValue{Kind: "load_param", Name: "_serialisedOutputs"})
+		offsetRef := ctx.emit(makeLoadConstInt(big.NewInt(idx * 34)))
+		lengthRef := ctx.emit(makeLoadConstInt(big.NewInt(34)))
+		extractedRef := ctx.emit(makeCall("substr", []string{serialisedRef, offsetRef, lengthRef}))
+		outEqRef := ctx.emit(ir.ANFValue{
+			Kind: "bin_op", Op: "===",
+			Left: extractedRef, Right: expectedOutputRef,
+			ResultType: "bytes",
+		})
+		return ctx.emit(makeAssert(outEqRef))
+	}
+
+	// currentBlockHeight() -> bigint. Pure source-level desugar to
+	// extractLocktime(this.txPreimage). Only valid in StatefulSmartContract
+	// methods (typecheck enforces). No new ANF kind or stack codegen needed.
+	if id, ok := callee.(Identifier); ok && id.Name == "currentBlockHeight" {
+		preimageRef := ctx.emit(ir.ANFValue{Kind: "load_param", Name: "txPreimage"})
+		return ctx.emit(makeCall("extractLocktime", []string{preimageRef}))
+	}
+
+	// this.addOutput(satoshis, val1, val2, ...) -> special node.
+	// Mirrors flattenAddOutputArgs in 04-anf-lower.ts: when addOutput is
+	// called as `this.addOutput(satoshis, .{ v1, v2, ... })` (the surface
+	// form Zig / Move tuple syntax produce), unwrap the trailing array
+	// literal so each element becomes an individual state value.
 	if pa, ok := callee.(PropertyAccessExpr); ok && pa.Property == "addOutput" {
-		argRefs := ctx.lowerArgs(e.Args)
+		flatArgs := flattenAddOutputArgs(e.Args)
+		argRefs := ctx.lowerArgs(flatArgs)
 		satoshis := argRefs[0]
 		stateValues := argRefs[1:]
 		ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues, Preimage: ""})
@@ -928,7 +1568,8 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 	}
 	if me, ok := callee.(MemberExpr); ok {
 		if id, ok := me.Object.(Identifier); ok && id.Name == "this" && me.Property == "addOutput" {
-			argRefs := ctx.lowerArgs(e.Args)
+			flatArgs := flattenAddOutputArgs(e.Args)
+			argRefs := ctx.lowerArgs(flatArgs)
 			satoshis := argRefs[0]
 			stateValues := argRefs[1:]
 			ref := ctx.emit(ir.ANFValue{Kind: "add_output", Satoshis: satoshis, StateValues: stateValues, Preimage: ""})
@@ -957,6 +1598,28 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 		}
 	}
 
+	// this.addDataOutput(satoshis, scriptBytes) -> special node. Wire shape
+	// is identical to addRawOutput, but the continuation hash includes these
+	// AFTER state outputs and BEFORE the change output.
+	if pa, ok := callee.(PropertyAccessExpr); ok && pa.Property == "addDataOutput" {
+		argRefs := ctx.lowerArgs(e.Args)
+		satoshis := argRefs[0]
+		scriptBytes := argRefs[1]
+		ref := ctx.emit(ir.ANFValue{Kind: "add_data_output", Satoshis: satoshis, ScriptBytes: scriptBytes})
+		ctx.addDataOutputRef(ref)
+		return ref
+	}
+	if me, ok := callee.(MemberExpr); ok {
+		if id, ok := me.Object.(Identifier); ok && id.Name == "this" && me.Property == "addDataOutput" {
+			argRefs := ctx.lowerArgs(e.Args)
+			satoshis := argRefs[0]
+			scriptBytes := argRefs[1]
+			ref := ctx.emit(ir.ANFValue{Kind: "add_data_output", Satoshis: satoshis, ScriptBytes: scriptBytes})
+			ctx.addDataOutputRef(ref)
+			return ref
+		}
+	}
+
 	// this.getStateScript()
 	if pa, ok := callee.(PropertyAccessExpr); ok && pa.Property == "getStateScript" {
 		return ctx.emit(ir.ANFValue{Kind: "get_state_script"})
@@ -967,9 +1630,13 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 		}
 	}
 
-	// this.method(...) via PropertyAccessExpr
+	// this.method(...) via PropertyAccessExpr (or inlined if the target
+	// is a private method with continuation-relevant side effects).
 	if pa, ok := callee.(PropertyAccessExpr); ok {
 		argRefs := ctx.lowerArgs(e.Args)
+		if ctx.shouldInlinePrivate(pa.Property) {
+			return ctx.inlinePrivateMethodCall(pa.Property, argRefs)
+		}
 		thisRef := ctx.emit(makeLoadConstString("@this"))
 		return ctx.emit(ir.ANFValue{Kind: "method_call", Object: thisRef, Method: pa.Property, Args: argRefs})
 	}
@@ -978,14 +1645,63 @@ func (ctx *lowerCtx) lowerCallExpr(e CallExpr) string {
 	if me, ok := callee.(MemberExpr); ok {
 		if id, ok := me.Object.(Identifier); ok && id.Name == "this" {
 			argRefs := ctx.lowerArgs(e.Args)
+			if ctx.shouldInlinePrivate(me.Property) {
+				return ctx.inlinePrivateMethodCall(me.Property, argRefs)
+			}
 			thisRef := ctx.emit(makeLoadConstString("@this"))
 			return ctx.emit(ir.ANFValue{Kind: "method_call", Object: thisRef, Method: me.Property, Args: argRefs})
 		}
 	}
 
+	// asm({...}) compiler intrinsic — the parser has already normalised the
+	// object-literal argument into three positional args
+	// (body, in_arity, out_arity). Lower it to a single opaque raw_script
+	// ANF binding; the hex body passes through unchanged. Diagnostics for
+	// malformed args were already pushed by the validator — here we
+	// defensively coerce missing values to safe defaults.
+	if id, ok := callee.(Identifier); ok && id.Name == "asm" {
+		bytes := ""
+		inArity := 0
+		outArity := 1
+		if len(e.Args) >= 1 {
+			if bs, ok := e.Args[0].(ByteStringLiteral); ok {
+				bytes = bs.Value
+			}
+		}
+		if len(e.Args) >= 2 {
+			if bi, ok := e.Args[1].(BigIntLiteral); ok && bi.Value != nil {
+				inArity = int(bi.Value.Int64())
+			}
+		}
+		if len(e.Args) >= 3 {
+			if bi, ok := e.Args[2].(BigIntLiteral); ok && bi.Value != nil {
+				outArity = int(bi.Value.Int64())
+			}
+		}
+		return ctx.emit(ir.ANFValue{
+			Kind:     "raw_script",
+			Bytes:    bytes,
+			InArity:  inArity,
+			OutArity: outArity,
+		})
+	}
+
 	// Direct function call: sha256(x), checkSig(sig, pk), etc.
 	if id, ok := callee.(Identifier); ok {
 		argRefs := ctx.lowerArgs(e.Args)
+		// Bare identifier calls that match a private method on the contract
+		// (e.g. Move's `require_owner(contract, sig)` which the parser strips
+		// to `requireOwner(sig)`) must be routed through the same inlining
+		// path as `this.requireOwner(sig)` so downstream stack lowering can
+		// inline the body. This keeps .runar.move, .runar.go, and .runar.ts
+		// lowering in sync.
+		if ctx.isPrivateMethod(id.Name) {
+			if ctx.shouldInlinePrivate(id.Name) {
+				return ctx.inlinePrivateMethodCall(id.Name, argRefs)
+			}
+			thisRef := ctx.emit(makeLoadConstString("@this"))
+			return ctx.emit(ir.ANFValue{Kind: "method_call", Object: thisRef, Method: id.Name, Args: argRefs})
+		}
 		return ctx.emit(makeCall(id.Name, argRefs))
 	}
 
@@ -1069,7 +1785,20 @@ func (ctx *lowerCtx) lowerDecrementExpr(e DecrementExpr) string {
 // ---------------------------------------------------------------------------
 
 func makeLoadConstInt(val *big.Int) ir.ANFValue {
-	raw, _ := json.Marshal(val)
+	// big.Int's default JSON marshaler emits the value as a JSON number,
+	// which Go's encoding/json prints in scientific notation for magnitudes
+	// > ~1e15 — silently losing precision for 256-bit constants like the
+	// secp256k1 group order used in schnorr-zkp's s-bound assert. Emit
+	// oversize bigints as a quoted decimal string with the canonical JS
+	// BigInt `n` suffix so the IR round-trips losslessly across tiers AND
+	// so the consuming IR decoder can distinguish a decimal-encoded big
+	// integer from a hex-encoded ByteString literal.
+	var raw json.RawMessage
+	if val.IsInt64() {
+		raw, _ = json.Marshal(val.Int64())
+	} else {
+		raw, _ = json.Marshal(val.String() + "n")
+	}
 	v := ir.ANFValue{
 		Kind:        "load_const",
 		RawValue:    raw,
@@ -1119,6 +1848,22 @@ func makeAssert(valueRef string) ir.ANFValue {
 	}
 }
 
+// makeAutoInjectedStateCheckAssert builds the auto-injected
+// stateful-continuation hash-equality assert with the
+// IsAutoInjectedStateCheck marker set. Off-chain SDK interpreters use
+// this marker to skip the equality check via a direct lookup instead of
+// structural / taint heuristics that misfire on developer covenant
+// asserts whose IR shape is identical.
+func makeAutoInjectedStateCheckAssert(valueRef string) ir.ANFValue {
+	raw, _ := json.Marshal(valueRef)
+	return ir.ANFValue{
+		Kind:                     "assert",
+		RawValue:                 raw,
+		ValueRef:                 valueRef,
+		IsAutoInjectedStateCheck: true,
+	}
+}
+
 func makeUpdateProp(name, valueRef string) ir.ANFValue {
 	raw, _ := json.Marshal(valueRef)
 	return ir.ANFValue{
@@ -1129,125 +1874,73 @@ func makeUpdateProp(name, valueRef string) ir.ANFValue {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// State mutation analysis for StatefulSmartContract
-// ---------------------------------------------------------------------------
+// inlinePrivateMethodCall lowers a private method's body directly into
+// the caller's context. Used when the private has continuation-relevant
+// side effects (state mutation, addOutput, addRawOutput, addDataOutput)
+// so the helper's emitted ANF nodes register output refs on the caller.
+//
+// Caller's arg refs are mapped onto the private's parameter names via
+// pushParamAlias. While the private's body lowers, any identifier
+// expression matching one of those param names resolves to the caller's
+// ref (see lowerIdentifier). The aliases are popped afterwards so
+// subsequent lowering in the caller's body sees its own scope.
+//
+// Recursion across private helpers is forbidden by validation, so this
+// always terminates. Nested inlining (private A calls private B) works
+// naturally: when we lower A's body and hit the call to B, the same
+// dispatch path runs and inlines B too.
+func (ctx *lowerCtx) inlinePrivateMethodCall(methodName string, argRefs []string) string {
+	method, ok := ctx.getPrivateMethod(methodName)
+	if !ok {
+		// Should not happen — caller checked shouldInlinePrivate which
+		// requires the method to exist. Fall back to a method_call so
+		// the stack lowering pass surfaces a clear error.
+		thisRef := ctx.emit(makeLoadConstString("@this"))
+		return ctx.emit(ir.ANFValue{Kind: "method_call", Object: thisRef, Method: methodName, Args: argRefs})
+	}
 
-// methodMutatesState determines whether a method mutates any mutable
-// (non-readonly) property. Conservative: if ANY code path can mutate state,
-// returns true.
-func methodMutatesState(method MethodNode, contract *ContractNode) bool {
-	mutableProps := make(map[string]bool)
-	for _, p := range contract.Properties {
-		if !p.Readonly {
-			mutableProps[p.Name] = true
-		}
+	// Bind caller arg refs to the private's parameter names.
+	var aliasedParams []string
+	for i := 0; i < len(method.Params) && i < len(argRefs); i++ {
+		paramName := method.Params[i].Name
+		ctx.pushParamAlias(paramName, argRefs[i])
+		aliasedParams = append(aliasedParams, paramName)
 	}
-	if len(mutableProps) == 0 {
-		return false
+
+	startIndex := len(ctx.bindings)
+	ctx.lowerStatements(method.Body)
+	endIndex := len(ctx.bindings)
+
+	// Pop aliases in reverse order so nested inlines compose correctly.
+	for i := len(aliasedParams) - 1; i >= 0; i-- {
+		ctx.popParamAlias(aliasedParams[i])
 	}
-	return bodyMutatesState(method.Body, mutableProps)
+
+	// Method's "return value" is the last binding emitted by the body.
+	// Void methods (e.g., a private helper that just calls addOutput)
+	// still produce a binding which the caller expression-statement
+	// path will discard.
+	if endIndex > startIndex {
+		return ctx.bindings[endIndex-1].Name
+	}
+	// Empty body — emit a load_const placeholder so the caller has a ref.
+	return ctx.emit(makeLoadConstString("@void"))
 }
 
-func bodyMutatesState(stmts []Statement, mutableProps map[string]bool) bool {
-	for _, stmt := range stmts {
-		if stmtMutatesState(stmt, mutableProps) {
-			return true
+// flattenAddOutputArgs mirrors flattenAddOutputArgs in 04-anf-lower.ts:
+// when this.addOutput is called as `this.addOutput(satoshis, .{ v1, v2, ... })`
+// (the surface form Zig / Move tuple syntax produce), unwrap the trailing
+// array literal so each element becomes an individual state value.
+func flattenAddOutputArgs(args []Expression) []Expression {
+	if len(args) == 2 {
+		if al, ok := args[1].(ArrayLiteralExpr); ok {
+			out := make([]Expression, 0, 1+len(al.Elements))
+			out = append(out, args[0])
+			out = append(out, al.Elements...)
+			return out
 		}
 	}
-	return false
-}
-
-func stmtMutatesState(stmt Statement, mutableProps map[string]bool) bool {
-	switch s := stmt.(type) {
-	case AssignmentStmt:
-		if pa, ok := s.Target.(PropertyAccessExpr); ok && mutableProps[pa.Property] {
-			return true
-		}
-		return false
-	case ExpressionStmt:
-		return exprMutatesState(s.Expr, mutableProps)
-	case IfStmt:
-		if bodyMutatesState(s.Then, mutableProps) {
-			return true
-		}
-		if len(s.Else) > 0 && bodyMutatesState(s.Else, mutableProps) {
-			return true
-		}
-		return false
-	case ForStmt:
-		if stmtMutatesState(s.Update, mutableProps) {
-			return true
-		}
-		return bodyMutatesState(s.Body, mutableProps)
-	default:
-		return false
-	}
-}
-
-func exprMutatesState(expr Expression, mutableProps map[string]bool) bool {
-	switch e := expr.(type) {
-	case IncrementExpr:
-		if pa, ok := e.Operand.(PropertyAccessExpr); ok && mutableProps[pa.Property] {
-			return true
-		}
-	case DecrementExpr:
-		if pa, ok := e.Operand.(PropertyAccessExpr); ok && mutableProps[pa.Property] {
-			return true
-		}
-	}
-	return false
-}
-
-// ---------------------------------------------------------------------------
-// addOutput detection for determining change output necessity
-// ---------------------------------------------------------------------------
-
-// methodHasAddOutput checks if a method body contains any this.addOutput() calls.
-func methodHasAddOutput(method MethodNode) bool {
-	return bodyHasAddOutput(method.Body)
-}
-
-func bodyHasAddOutput(stmts []Statement) bool {
-	for _, stmt := range stmts {
-		if stmtHasAddOutput(stmt) {
-			return true
-		}
-	}
-	return false
-}
-
-func stmtHasAddOutput(stmt Statement) bool {
-	switch s := stmt.(type) {
-	case ExpressionStmt:
-		return exprHasAddOutput(s.Expr)
-	case IfStmt:
-		if bodyHasAddOutput(s.Then) {
-			return true
-		}
-		if len(s.Else) > 0 && bodyHasAddOutput(s.Else) {
-			return true
-		}
-		return false
-	case ForStmt:
-		return bodyHasAddOutput(s.Body)
-	default:
-		return false
-	}
-}
-
-func exprHasAddOutput(expr Expression) bool {
-	if ce, ok := expr.(CallExpr); ok {
-		if pa, ok := ce.Callee.(PropertyAccessExpr); ok && (pa.Property == "addOutput" || pa.Property == "addRawOutput") {
-			return true
-		}
-		if me, ok := ce.Callee.(MemberExpr); ok {
-			if id, ok := me.Object.(Identifier); ok && id.Name == "this" && (me.Property == "addOutput" || me.Property == "addRawOutput") {
-				return true
-			}
-		}
-	}
-	return false
+	return args
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,12 +2007,26 @@ func maxTempIndex(bindings []ir.ANFBinding) int {
 }
 
 // isSideEffectFree checks if an ANF value kind is side-effect-free.
+// Both sides of the discriminant are enumerated explicitly so an
+// unknown kind cannot silently default to "has side effect" (which
+// would conservatively preserve the binding but mask a missing
+// dispatch wire-up in the rest of the pipeline).
 func isSideEffectFree(v *ir.ANFValue) bool {
 	switch v.Kind {
-	case "load_prop", "load_param", "load_const", "bin_op", "unary_op":
+	case "load_prop", "load_param", "load_const", "bin_op", "unary_op",
+		"get_state_script", "if", "loop", "array_literal":
 		return true
+	case "assert", "update_prop", "check_preimage", "deserialize_state",
+		"add_output", "add_raw_output", "add_data_output",
+		"call", "method_call", "raw_script":
+		return false
+	default:
+		// Exhaustiveness guard. A silent default here would either
+		// preserve every unknown binding (masking a missing dispatch)
+		// or — depending on caller polarity — strand a side-effecting
+		// new kind in dead-code-elimination's path.
+		panic(&ir.UnknownANFKindError{Kind: v.Kind, Location: "anf-lower.isSideEffectFree"})
 	}
-	return false
 }
 
 func allBindingsSideEffectFree(bindings []ir.ANFBinding) bool {
@@ -1375,10 +2082,10 @@ func collectUpdateBranches(ifCond string, thenBindings, elseBindings []ir.ANFBin
 	}
 
 	branches := []updateBranch{{
-		condRef:      &ifCond,
-		propName:     propName,
+		condRef:       &ifCond,
+		propName:      propName,
 		valueBindings: valBindings,
-		valueRef:     valRef,
+		valueRef:      valRef,
 	}}
 
 	if len(elseBindings) == 0 {
@@ -1503,13 +2210,22 @@ func remapValueRefs(v ir.ANFValue, nameMap map[string]string) ir.ANFValue {
 		v.Satoshis = r(v.Satoshis)
 		v.ScriptBytes = r(v.ScriptBytes)
 		return v
+	case "add_data_output":
+		v.Satoshis = r(v.Satoshis)
+		v.ScriptBytes = r(v.ScriptBytes)
+		return v
 	case "if":
 		v.Cond = r(v.Cond)
 		return v
 	case "loop":
 		return v
+	default:
+		// Exhaustiveness guard. A silent fall-through here would return
+		// the value unchanged when a remap was actually required —
+		// resulting in a binding that references a hoisted/renamed
+		// temp by its pre-remap name, producing dangling SSA refs.
+		panic(&ir.UnknownANFKindError{Kind: v.Kind, Location: "anf-lower.remapValueRefs"})
 	}
-	return v
 }
 
 // liftBranchUpdateProps transforms if-bindings whose branches all end

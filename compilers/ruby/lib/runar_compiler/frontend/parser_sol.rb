@@ -70,6 +70,7 @@ module RunarCompiler
       TOK_QUESTION     = 40  # ?
       TOK_LSHIFT       = 41  # <<
       TOK_RSHIFT       = 42  # >>
+      TOK_HEXSTRING    = 43  # 0x... ByteString literal
 
       # A single token produced by the tokenizer.
       Token = Struct.new(:kind, :value, :line, :col, keyword_init: true)
@@ -246,21 +247,23 @@ module RunarCompiler
             next
           end
 
-          # Numbers (including hex 0x... and BigInt suffix 'n')
+          # Numbers (and hex byte string literals: 0x... -> ByteString)
           if ch >= "0" && ch <= "9"
-            start = i
             if ch == "0" && i + 1 < n && (source[i + 1] == "x" || source[i + 1] == "X")
               i += 2
               col += 2
+              hex_start = i
               while i < n && hex_digit?(source[i])
                 i += 1
                 col += 1
               end
-            else
-              while i < n && source[i] >= "0" && source[i] <= "9"
-                i += 1
-                col += 1
-              end
+              tokens << Token.new(kind: TOK_HEXSTRING, value: source[hex_start...i], line: line, col: start_col)
+              next
+            end
+            start = i
+            while i < n && source[i] >= "0" && source[i] <= "9"
+              i += 1
+              col += 1
             end
             # Skip trailing BigInt suffix 'n' (from TS syntax)
             if i < n && source[i] == "n"
@@ -476,7 +479,7 @@ module RunarCompiler
           parent_class = "StatefulSmartContract"
         end
 
-        unless %w[SmartContract StatefulSmartContract].include?(parent_class)
+        unless %w[SmartContract StatefulSmartContract UnsafeSmartContract].include?(parent_class)
           raise "unknown parent class: #{parent_class}"
         end
 
@@ -585,10 +588,13 @@ module RunarCompiler
       # -- Type parsing -----------------------------------------------------
 
       def parse_sol_type_from_name(name)
-        mapped = Frontend.parse_sol_type_name(name)
+        result = Frontend.parse_sol_type_name(name)
 
-        # Check for array type: Type[N]
-        if check(TOK_LBRACKET)
+        # Trailing `[N]` brackets nest as FixedArray. Per Solidity's
+        # outer-to-inner declaration order `T[A][B]` reads as outer B
+        # of inner A of T, so each successive `[L]` wraps the type
+        # seen so far as FixedArray<previous, L>.
+        while check(TOK_LBRACKET)
           advance # [
           size_tok = expect(TOK_NUMBER)
           size = begin
@@ -598,10 +604,10 @@ module RunarCompiler
             0
           end
           expect(TOK_RBRACKET)
-          return FixedArrayType.new(element: mapped, length: size)
+          result = FixedArrayType.new(element: result, length: size)
         end
 
-        mapped
+        result
       end
 
       # -- Constructor parsing: constructor(Type _name, ...) { ... } --------
@@ -1226,6 +1232,11 @@ module RunarCompiler
           return parse_sol_number(tok.value)
         end
 
+        if tok.kind == TOK_HEXSTRING
+          advance
+          return ByteStringLiteral.new(value: tok.value)
+        end
+
         if tok.kind == TOK_STRING
           advance
           return ByteStringLiteral.new(value: tok.value)
@@ -1284,7 +1295,7 @@ module RunarCompiler
           break unless match(TOK_COMMA)
         end
         expect(TOK_RBRACKET)
-        CallExpr.new(callee: Identifier.new(name: "FixedArray"), args: elements)
+        ArrayLiteralExpr.new(elements: elements)
       end
 
       def parse_sol_number(s)
@@ -1427,15 +1438,13 @@ module RunarCompiler
 
     def self.rewrite_sol_stmt(stmt, prop_names, param_names, method_names)
       rw = lambda { |e| rewrite_sol_expr(e, prop_names, param_names, method_names) }
-      rs = lambda { |s| rewrite_sol_stmt(s, prop_names, param_names, method_names) }
       case stmt
       when ExpressionStmt
         ExpressionStmt.new(expr: rw.call(stmt.expr), source_location: stmt.source_location)
       when VariableDeclStmt
-        new_params = param_names | Set[stmt.name]
         VariableDeclStmt.new(
           name: stmt.name, type: stmt.type, mutable: stmt.mutable,
-          init: stmt.init ? rewrite_sol_expr(stmt.init, prop_names, new_params, method_names) : nil,
+          init: stmt.init ? rw.call(stmt.init) : nil,
           source_location: stmt.source_location
         )
       when AssignmentStmt
@@ -1445,21 +1454,40 @@ module RunarCompiler
       when IfStmt
         IfStmt.new(
           condition: rw.call(stmt.condition),
-          then: stmt.then.map { |s| rs.call(s) },
-          else_: stmt.else_ ? stmt.else_.map { |s| rs.call(s) } : [],
+          then: rewrite_sol_stmt_block(stmt.then, prop_names, param_names.dup, method_names),
+          else_: stmt.else_ ? rewrite_sol_stmt_block(stmt.else_, prop_names, param_names.dup, method_names) : [],
           source_location: stmt.source_location
         )
       when ForStmt
+        for_params = param_names.dup
+        new_init = nil
+        if stmt.init
+          new_init = rewrite_sol_stmt(stmt.init, prop_names, for_params, method_names)
+          for_params.add(stmt.init.name) if stmt.init.is_a?(VariableDeclStmt)
+        end
+        new_cond = stmt.condition ? rewrite_sol_expr(stmt.condition, prop_names, for_params, method_names) : nil
+        new_update = stmt.update ? rewrite_sol_stmt(stmt.update, prop_names, for_params, method_names) : nil
         ForStmt.new(
-          init: stmt.init ? rs.call(stmt.init) : nil,
-          condition: stmt.condition ? rw.call(stmt.condition) : nil,
-          update: stmt.update ? rs.call(stmt.update) : nil,
-          body: stmt.body.map { |s| rs.call(s) },
+          init: new_init,
+          condition: new_cond,
+          update: new_update,
+          body: rewrite_sol_stmt_block(stmt.body, prop_names, for_params.dup, method_names),
           source_location: stmt.source_location
         )
       else
         stmt
       end
+    end
+
+    # Rewrite a block of statements, propagating local-variable shadow names
+    # across successive statements.
+    def self.rewrite_sol_stmt_block(stmts, prop_names, param_names, method_names)
+      result = []
+      stmts.each do |s|
+        result << rewrite_sol_stmt(s, prop_names, param_names, method_names)
+        param_names.add(s.name) if s.is_a?(VariableDeclStmt)
+      end
+      result
     end
 
     def self.rewrite_sol_contract_props(contract)
@@ -1470,7 +1498,7 @@ module RunarCompiler
       contract.methods.each do |method|
         param_names = method.params.map(&:name).to_set
         method.body.replace(
-          method.body.map { |s| rewrite_sol_stmt(s, prop_names, param_names, method_names) }
+          rewrite_sol_stmt_block(method.body, prop_names, param_names, method_names)
         )
       end
     end

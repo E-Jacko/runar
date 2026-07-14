@@ -3,22 +3,25 @@
 //!
 //! All methods require a Sig parameter via requireOwner(sig), so spending requires
 //! raw transaction construction. We test compile + deploy via the SDK.
+//!
+//! **Gating**: all on-chain tests are gated with
+//! `#[cfg_attr(not(feature = "regtest"), ignore)]`. They require a local Bitcoin
+//! regtest node (see `integration/rust/README.md`). Run with:
+//!     cargo test --features regtest
+//! Tests without the gate (pure compile/script-size checks) run by default.
 
 use crate::helpers::*;
 use runar_lang::sdk::{CallOptions, DeployOptions, RunarContract, SdkValue};
 use std::collections::HashMap;
 
 #[test]
-#[ignore]
 fn test_function_patterns_compile() {
-    skip_if_no_node();
-
     let artifact = compile_contract("examples/ts/function-patterns/FunctionPatterns.runar.ts");
     assert_eq!(artifact.contract_name, "FunctionPatterns");
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_function_patterns_deploy() {
     skip_if_no_node();
 
@@ -38,6 +41,7 @@ fn test_function_patterns_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -45,7 +49,7 @@ fn test_function_patterns_deploy() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_function_patterns_deploy_zero_balance() {
     skip_if_no_node();
 
@@ -64,13 +68,14 @@ fn test_function_patterns_deploy_zero_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_function_patterns_deploy_large_balance() {
     skip_if_no_node();
 
@@ -89,13 +94,14 @@ fn test_function_patterns_deploy_large_balance() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_function_patterns_distinct_deploy_txids() {
     skip_if_no_node();
 
@@ -114,6 +120,7 @@ fn test_function_patterns_distinct_deploy_txids() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy 1 failed");
 
@@ -125,6 +132,7 @@ fn test_function_patterns_distinct_deploy_txids() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 10000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy 2 failed");
 
@@ -134,7 +142,7 @@ fn test_function_patterns_distinct_deploy_txids() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_function_patterns_deposit() {
     skip_if_no_node();
 
@@ -151,6 +159,7 @@ fn test_function_patterns_deposit() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -167,7 +176,7 @@ fn test_function_patterns_deposit() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_function_patterns_deposit_then_withdraw() {
     skip_if_no_node();
 
@@ -184,6 +193,7 @@ fn test_function_patterns_deposit_then_withdraw() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -211,7 +221,7 @@ fn test_function_patterns_deposit_then_withdraw() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_function_patterns_wrong_owner_rejected() {
     skip_if_no_node();
 
@@ -229,6 +239,7 @@ fn test_function_patterns_wrong_owner_rejected() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

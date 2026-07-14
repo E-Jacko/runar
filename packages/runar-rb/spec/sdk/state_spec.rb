@@ -49,6 +49,36 @@ RSpec.describe 'Runar::SDK::State' do
       # 1000 = 0x03E8 in little-endian → e803
       expect(mod.encode_push_data(data)).to eq("4de803#{data}")
     end
+
+    # MINIMALDATA (SCRIPT_VERIFY_MINIMALDATA): a 1-byte payload in
+    # {0x00, 0x01..0x10, 0x81} must use the minimal opcode, not a direct push.
+    context 'MINIMALDATA single-byte pushes' do
+      it 'encodes 0x00 as OP_0 (00)' do
+        expect(mod.encode_push_data('00')).to eq('00')
+      end
+
+      it 'encodes 0x05 as OP_5 (55)' do
+        expect(mod.encode_push_data('05')).to eq('55')
+      end
+
+      it 'encodes 0x81 as OP_1NEGATE (4f)' do
+        expect(mod.encode_push_data('81')).to eq('4f')
+      end
+
+      it 'encodes 0x01..0x10 as OP_1..OP_16' do
+        (1..16).each do |n|
+          expect(mod.encode_push_data(format('%02x', n))).to eq(format('%02x', 0x50 + n))
+        end
+      end
+
+      it 'still direct-pushes a single byte outside the range (0x11 -> 0111)' do
+        expect(mod.encode_push_data('11')).to eq('0111')
+      end
+
+      it 'still direct-pushes a two-byte payload (0x0011 -> 020011)' do
+        expect(mod.encode_push_data('0011')).to eq('020011')
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -324,6 +354,54 @@ RSpec.describe 'Runar::SDK::State' do
       result = mod.extract_state_from_script(artifact, script_hex)
       expect(result['count']).to eq(1)
       expect(result['active']).to be true
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # FixedArray state round-trips
+  # ---------------------------------------------------------------------------
+
+  describe '.serialize_state and .deserialize_state with FixedArray fields' do
+    it 'flattens and regroups a flat FixedArray<bigint, 3>' do
+      fa = { element_type: 'bigint', length: 3, synthetic_names: %w[board__0 board__1 board__2] }
+      field = Runar::SDK::StateField.new(
+        name: 'board',
+        type: 'FixedArray<bigint, 3>',
+        index: 0,
+        fixed_array: fa
+      )
+      values = { 'board' => [1, 2, 3] }
+      hex = Runar::SDK::State.serialize_state([field], values)
+      # 3 × 8 bytes = 48 hex chars.
+      expect(hex.length).to eq(48)
+      result = Runar::SDK::State.deserialize_state([field], hex)
+      expect(result['board']).to eq([1, 2, 3])
+    end
+
+    it 'flattens and regroups a nested FixedArray<FixedArray<bigint, 2>, 2>' do
+      fa = {
+        element_type: 'FixedArray<bigint, 2>',
+        length: 2,
+        synthetic_names: %w[grid__0__0 grid__0__1 grid__1__0 grid__1__1]
+      }
+      field = Runar::SDK::StateField.new(
+        name: 'grid',
+        type: 'FixedArray<FixedArray<bigint, 2>, 2>',
+        index: 0,
+        fixed_array: fa
+      )
+      values = { 'grid' => [[1, 2], [3, 4]] }
+      hex = Runar::SDK::State.serialize_state([field], values)
+      expect(hex.length).to eq(64) # 4 × 8 bytes
+      result = Runar::SDK::State.deserialize_state([field], hex)
+      expect(result['grid']).to eq([[1, 2], [3, 4]])
+    end
+
+    it 'reshapes a flat array into the declared outer dimensions' do
+      expect(Runar::SDK::State.parse_fixed_array_dims('FixedArray<bigint, 9>')).to eq([9])
+      expect(Runar::SDK::State.parse_fixed_array_dims('FixedArray<FixedArray<bigint, 2>, 3>')).to eq([3, 2])
+      expect(Runar::SDK::State.parse_fixed_array_dims('FixedArray<FixedArray<FixedArray<bigint, 2>, 3>, 4>')).to eq([4, 3, 2])
+      expect(Runar::SDK::State.unwrap_fixed_array_leaf('FixedArray<FixedArray<bigint, 2>, 3>')).to eq('bigint')
     end
   end
 end

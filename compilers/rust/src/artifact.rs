@@ -4,18 +4,32 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codegen::emit::{ConstructorSlot, SourceMapping};
-use crate::ir::ANFProgram;
+use crate::codegen::emit::{CodeSepIndexSlot, ConstructorSlot, RawScriptSpan, SourceMapping};
+use crate::ir::{ANFProgram, ANFProperty, ANFSyntheticArrayLevel};
 
 // ---------------------------------------------------------------------------
 // ABI types
 // ---------------------------------------------------------------------------
+
+/// Metadata attached to an expanded FixedArray ABI/state entry so the
+/// SDK can flatten/unflatten nested JS arrays back into the underlying
+/// synthetic scalar slots. Mirrors the TS `fixedArray` annotation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixedArrayAbiInfo {
+    #[serde(rename = "elementType")]
+    pub element_type: String,
+    pub length: usize,
+    #[serde(rename = "syntheticNames")]
+    pub synthetic_names: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ABIParam {
     pub name: String,
     #[serde(rename = "type")]
     pub param_type: String,
+    #[serde(rename = "fixedArray", skip_serializing_if = "Option::is_none")]
+    pub fixed_array: Option<FixedArrayAbiInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +45,15 @@ pub struct ABIMethod {
     pub is_public: bool,
     #[serde(rename = "isTerminal", skip_serializing_if = "Option::is_none")]
     pub is_terminal: Option<bool>,
+    /// Unlocking script is prefixed with `_codePart` (issue #100).
+    #[serde(rename = "usesCodePart", skip_serializing_if = "Option::is_none")]
+    pub uses_code_part: Option<bool>,
+    /// Issue #123: the BIP-143 sighash type this method's preimage/covenant is
+    /// built under (from a `@sighash` directive), e.g. `0x43` for SINGLE|FORKID.
+    /// Absent = default `ALL|FORKID` (0x41); the SDK falls back to 0x41 so
+    /// existing artifacts are unchanged and older SDKs keep working.
+    #[serde(rename = "sigHashType", skip_serializing_if = "Option::is_none")]
+    pub sig_hash_type: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +74,8 @@ pub struct StateField {
     pub index: usize,
     #[serde(rename = "initialValue", skip_serializing_if = "Option::is_none")]
     pub initial_value: Option<serde_json::Value>,
+    #[serde(rename = "fixedArray", skip_serializing_if = "Option::is_none")]
+    pub fixed_array: Option<FixedArrayAbiInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +106,11 @@ pub struct RunarArtifact {
     pub compiler_version: String,
     #[serde(rename = "contractName")]
     pub contract_name: String,
+    /// Base class the source contract extends. Authoritative stateful signal
+    /// for the issue-#42/#44 terminal sighash subscript trim (a
+    /// StatefulSmartContract with zero mutable fields still needs the trim).
+    #[serde(rename = "parentClass", skip_serializing_if = "String::is_empty", default)]
+    pub parent_class: String,
     pub abi: ABI,
     pub script: String,
     pub asm: String,
@@ -92,10 +122,14 @@ pub struct RunarArtifact {
     pub state_fields: Vec<StateField>,
     #[serde(rename = "constructorSlots", skip_serializing_if = "Vec::is_empty", default)]
     pub constructor_slots: Vec<ConstructorSlot>,
+    #[serde(rename = "codeSepIndexSlots", skip_serializing_if = "Vec::is_empty", default)]
+    pub code_sep_index_slots: Vec<CodeSepIndexSlot>,
     #[serde(rename = "codeSeparatorIndex", skip_serializing_if = "Option::is_none")]
     pub code_separator_index: Option<usize>,
     #[serde(rename = "codeSeparatorIndices", skip_serializing_if = "Option::is_none")]
     pub code_separator_indices: Option<Vec<usize>>,
+    #[serde(rename = "rawScriptSpans", skip_serializing_if = "Vec::is_empty", default)]
+    pub raw_script_spans: Vec<RawScriptSpan>,
     #[serde(rename = "buildTimestamp")]
     pub build_timestamp: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,8 +140,8 @@ pub struct RunarArtifact {
 // Assembly
 // ---------------------------------------------------------------------------
 
-const SCHEMA_VERSION: &str = "runar-v0.4.4";
-const COMPILER_VERSION: &str = "0.4.4-rust";
+const SCHEMA_VERSION: &str = "runar-v1.0.0-rc.1";
+const COMPILER_VERSION: &str = "1.0.0-rc.1-rust";
 
 /// Build a RunarArtifact from the compilation products.
 pub fn assemble_artifact(
@@ -115,36 +149,58 @@ pub fn assemble_artifact(
     script_hex: &str,
     script_asm: &str,
     constructor_slots: Vec<ConstructorSlot>,
+    code_sep_index_slots: Vec<CodeSepIndexSlot>,
     code_separator_index: i64,
     code_separator_indices: Vec<usize>,
     include_anf: bool,
     source_mappings: Vec<SourceMapping>,
+    raw_script_spans: Vec<RawScriptSpan>,
+    stack_methods: &[crate::codegen::stack::StackMethod],
 ) -> RunarArtifact {
     // Build constructor params from properties, excluding those with initializers
     // (properties with default values are not constructor parameters).
-    let constructor_params: Vec<ABIParam> = program
+    // Group contiguous synthetic FixedArray leaves back into a single
+    // FixedArray-typed ABI param via the iterative regrouper.
+    let ctor_entries: Vec<RegroupEntry> = program
         .properties
         .iter()
         .filter(|p| p.initial_value.is_none())
-        .map(|p| ABIParam {
-            name: p.name.clone(),
-            param_type: p.prop_type.clone(),
+        .map(regroup_entry_from_property)
+        .collect();
+    let ctor_regrouped = regroup_synthetic_runs(ctor_entries);
+    let constructor_params: Vec<ABIParam> = ctor_regrouped
+        .iter()
+        .map(|e| ABIParam {
+            name: e.name.clone(),
+            param_type: e.r#type.clone(),
+            fixed_array: e.fixed_array.clone(),
         })
         .collect();
 
     // Build state fields for stateful contracts.
     // Index = property position (matching constructor arg order), not sequential mutable index.
-    let mut state_fields = Vec::new();
-    for (i, prop) in program.properties.iter().enumerate() {
-        if !prop.readonly {
-            state_fields.push(StateField {
-                name: prop.name.clone(),
-                field_type: prop.prop_type.clone(),
-                index: i,
-                initial_value: prop.initial_value.clone(),
-            });
-        }
-    }
+    let state_entries: Vec<RegroupEntry> = program
+        .properties
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.readonly)
+        .map(|(i, p)| {
+            let mut e = regroup_entry_from_property(p);
+            e.index = Some(i);
+            e
+        })
+        .collect();
+    let state_regrouped = regroup_synthetic_runs(state_entries);
+    let state_fields: Vec<StateField> = state_regrouped
+        .iter()
+        .map(|e| StateField {
+            name: e.name.clone(),
+            field_type: e.r#type.clone(),
+            index: e.index.unwrap_or(0),
+            initial_value: e.initial_value.clone(),
+            fixed_array: e.fixed_array.clone(),
+        })
+        .collect();
     let is_stateful = !state_fields.is_empty();
 
     // Build method ABIs (exclude constructor — it's in abi.constructor, not methods)
@@ -160,6 +216,26 @@ pub fn assemble_artifact(
             } else {
                 None
             };
+            // Propagate the authoritative `_codePart` decision from
+            // stack-lowering into the ABI so the SDK supplies `_codePart` for
+            // terminal var-length reads (issue #100).
+            let uses_code_part = if stack_methods
+                .iter()
+                .any(|sm| sm.name == m.name && sm.uses_code_part)
+            {
+                Some(true)
+            } else {
+                None
+            };
+            // Issue #123: carry a non-default @sighash mode into the ABI so the
+            // SDK builds the BIP-143 preimage under the same flags the covenant
+            // expects. Omitted for the default (0x41) → byte-identical artifacts.
+            let sig_hash_type = match m.sighash_type {
+                Some(v) if m.is_public && v != crate::frontend::sighash_directive::SIGHASH_DEFAULT => {
+                    Some(v)
+                }
+                _ => None,
+            };
             ABIMethod {
                 name: m.name.clone(),
                 params: m
@@ -168,10 +244,13 @@ pub fn assemble_artifact(
                     .map(|p| ABIParam {
                         name: p.name.clone(),
                         param_type: p.param_type.clone(),
+                        fixed_array: None,
                     })
                     .collect(),
                 is_public: m.is_public,
                 is_terminal,
+                uses_code_part,
+                sig_hash_type,
             }
         })
         .collect();
@@ -216,6 +295,7 @@ pub fn assemble_artifact(
         version: SCHEMA_VERSION.to_string(),
         compiler_version: COMPILER_VERSION.to_string(),
         contract_name: program.contract_name.clone(),
+        parent_class: program.parent_class.clone(),
         abi: ABI {
             constructor: ABIConstructor {
                 params: constructor_params,
@@ -228,8 +308,10 @@ pub fn assemble_artifact(
         ir,
         state_fields,
         constructor_slots,
+        code_sep_index_slots,
         code_separator_index: cs_index,
         code_separator_indices: cs_indices,
+        raw_script_spans,
         build_timestamp: now,
         anf,
     }
@@ -274,4 +356,162 @@ fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
     (year, m, d)
+}
+
+// ---------------------------------------------------------------------------
+// FixedArray regrouping
+// ---------------------------------------------------------------------------
+//
+// Pass 3b expands FixedArray properties into scalar siblings. The assembler
+// re-groups contiguous synthetic runs back into a single `fixedArray`-tagged
+// ABI/state entry so SDK callers see the declared array shape.
+//
+// Grouping is marker-driven: every participating entry must carry a
+// `synthetic_array_chain` attached at expansion time. Hand-named properties
+// with underscore suffixes will never match and remain as scalars.
+//
+// The regrouper runs iteratively: each pass collapses one level of the
+// innermost FixedArray (popping one entry off the end of every chain) and
+// wraps the resulting group's type in an extra FixedArray layer. Repeat until
+// no entry has any remaining chain.
+
+#[derive(Debug, Clone)]
+struct RegroupEntry {
+    name: String,
+    r#type: String,
+    chain: Vec<ANFSyntheticArrayLevel>,
+    initial_value: Option<serde_json::Value>,
+    fixed_array: Option<FixedArrayAbiInfo>,
+    index: Option<usize>,
+}
+
+fn regroup_entry_from_property(prop: &ANFProperty) -> RegroupEntry {
+    RegroupEntry {
+        name: prop.name.clone(),
+        r#type: prop.prop_type.clone(),
+        chain: prop
+            .synthetic_array_chain
+            .as_ref()
+            .map(|c| c.clone())
+            .unwrap_or_default(),
+        initial_value: prop.initial_value.clone(),
+        fixed_array: None,
+        index: None,
+    }
+}
+
+/// Iteratively regroup synthetic FixedArray runs until no entry has any
+/// remaining chain.
+fn regroup_synthetic_runs(entries: Vec<RegroupEntry>) -> Vec<RegroupEntry> {
+    let mut current = entries;
+    for _ in 0..1024 {
+        let (out, changed) = regroup_one_pass(current);
+        current = out;
+        if !changed {
+            return current;
+        }
+    }
+    panic!("regroup_synthetic_runs: exceeded iteration cap (pathological chain nesting?)");
+}
+
+/// Run one pass of the iterative regrouper.
+fn regroup_one_pass(entries: Vec<RegroupEntry>) -> (Vec<RegroupEntry>, bool) {
+    let mut out: Vec<RegroupEntry> = Vec::with_capacity(entries.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < entries.len() {
+        let entry = &entries[i];
+        let chain_len = entry.chain.len();
+        if chain_len == 0 {
+            out.push(entry.clone());
+            i += 1;
+            continue;
+        }
+        let marker = &entry.chain[chain_len - 1];
+        if marker.index != 0 {
+            out.push(entry.clone());
+            i += 1;
+            continue;
+        }
+
+        // Greedily extend: every follower shares the same innermost
+        // `{base, length}`, carries the expected index k, and has the
+        // identical current `type`.
+        let mut run_indices: Vec<usize> = vec![i];
+        let mut k = 1usize;
+        let mut j = i + 1;
+        while j < entries.len() && k < marker.length {
+            let next = &entries[j];
+            if next.chain.is_empty() {
+                break;
+            }
+            let m2 = &next.chain[next.chain.len() - 1];
+            if m2.base != marker.base
+                || m2.length != marker.length
+                || m2.index != k
+                || next.r#type != entry.r#type
+            {
+                break;
+            }
+            run_indices.push(j);
+            k += 1;
+            j += 1;
+        }
+
+        if run_indices.len() != marker.length {
+            // Partial/broken run — leave as-is.
+            out.push(entry.clone());
+            i += 1;
+            continue;
+        }
+
+        let inner_type = entry.r#type.clone();
+        let grouped_type = format!("FixedArray<{}, {}>", inner_type, marker.length);
+
+        // Collect synthetic names — leaves contribute their own name,
+        // already-grouped children contribute their `synthetic_names`.
+        let mut synthetic_names: Vec<String> = Vec::new();
+        for &idx in &run_indices {
+            let e = &entries[idx];
+            if let Some(fa) = &e.fixed_array {
+                synthetic_names.extend(fa.synthetic_names.iter().cloned());
+            } else {
+                synthetic_names.push(e.name.clone());
+            }
+        }
+
+        // Collapse initial values into a JSON array when every child has one.
+        let all_have_init = run_indices.iter().all(|&idx| entries[idx].initial_value.is_some());
+        let collapsed_init: Option<serde_json::Value> = if all_have_init {
+            Some(serde_json::Value::Array(
+                run_indices
+                    .iter()
+                    .map(|&idx| entries[idx].initial_value.clone().unwrap())
+                    .collect(),
+            ))
+        } else {
+            None
+        };
+
+        let mut new_chain = entry.chain.clone();
+        new_chain.pop();
+
+        let grouped = RegroupEntry {
+            name: marker.base.clone(),
+            r#type: grouped_type,
+            chain: new_chain,
+            initial_value: collapsed_init,
+            fixed_array: Some(FixedArrayAbiInfo {
+                element_type: inner_type,
+                length: marker.length,
+                synthetic_names,
+            }),
+            index: entries[run_indices[0]].index,
+        };
+
+        out.push(grouped);
+        i = j;
+        changed = true;
+    }
+    (out, changed)
 }

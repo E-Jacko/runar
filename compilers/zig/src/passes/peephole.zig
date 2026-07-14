@@ -17,11 +17,23 @@ const max_iterations = 100;
 // Matching helpers
 // ============================================================================
 
-/// Returns true if the instruction is any push variant (push_int, push_data, push_bool).
+/// Returns true if the instruction is any push variant (push_int, push_data,
+/// push_bool, push_big_int_decimal).
 fn isPush(inst: Inst) bool {
     return switch (inst) {
-        .push_int, .push_data, .push_bool, .push_codesep_index, .placeholder => true,
-        .op => false,
+        .push_int, .push_data, .push_bool, .push_big_int_decimal, .push_codesep_index, .placeholder => true,
+        .op, .raw_bytes => false,
+    };
+}
+
+/// Returns true if the instruction is an opaque raw_bytes span emitted by a
+/// raw_script ANF node. raw_bytes is a hard peephole barrier — no rewrite
+/// window may span or cross it, because the bytes are opaque and not
+/// guaranteed to form a well-formed opcode stream.
+fn isRawBytes(inst: Inst) bool {
+    return switch (inst) {
+        .raw_bytes => true,
+        else => false,
     };
 }
 
@@ -60,8 +72,13 @@ fn instEql(a: Inst, b: Inst) bool {
         .push_int => |va| va == b.push_int,
         .push_bool => |ba| ba == b.push_bool,
         .push_data => |da| std.mem.eql(u8, da, b.push_data),
+        .push_big_int_decimal => |sa| std.mem.eql(u8, sa, b.push_big_int_decimal),
         .push_codesep_index => true,
         .placeholder => |pa| pa.param_index == b.placeholder.param_index,
+        // raw_bytes is opaque; we never compare or rewrite across it, so
+        // equality here is purely for completeness.
+        .raw_bytes => |ra| std.mem.eql(u8, ra.bytes, b.raw_bytes.bytes) and
+            ra.in_arity == b.raw_bytes.in_arity and ra.out_arity == b.raw_bytes.out_arity,
     };
 }
 
@@ -79,18 +96,140 @@ fn sliceEql(a: []const Inst, b: []const Inst) bool {
 // ============================================================================
 
 /// Optimize all methods in a StackMethod slice. Returns a new slice (caller owns).
+///
+/// GAP-002: also carries `instruction_source_locs` through the optimizer so
+/// the artifact's sourceMap survives the pass. Each collapsed window keeps
+/// the source location of its HEAD input instruction; pass-through
+/// instructions copy their loc verbatim.
 pub fn optimize(allocator: Allocator, methods: []const types.StackMethod) ![]types.StackMethod {
     const result = try allocator.alloc(types.StackMethod, methods.len);
     for (methods, 0..) |method, i| {
-        const optimized_insts = try optimizeOps(allocator, method.instructions);
+        const opt = try optimizeOpsAndLocs(allocator, method.instructions, method.instruction_source_locs);
         result[i] = .{
             .name = method.name,
-            .instructions = optimized_insts,
+            .instructions = opt.insts,
+            .instruction_source_locs = opt.locs,
             .ops = method.ops,
             .max_stack_depth = method.max_stack_depth,
         };
     }
     return result;
+}
+
+const OptOut = struct {
+    insts: []Inst,
+    locs: []?types.SourceLocation,
+};
+
+/// Run the iterative peephole pass while keeping a parallel
+/// source-location array aligned with the instruction stream.
+fn optimizeOpsAndLocs(
+    allocator: Allocator,
+    ops: []const Inst,
+    src_locs: []const ?types.SourceLocation,
+) !OptOut {
+    var buf_a_insts = std.ArrayListUnmanaged(Inst).empty;
+    defer buf_a_insts.deinit(allocator);
+    var buf_a_locs = std.ArrayListUnmanaged(?types.SourceLocation).empty;
+    defer buf_a_locs.deinit(allocator);
+    var buf_b_insts = std.ArrayListUnmanaged(Inst).empty;
+    defer buf_b_insts.deinit(allocator);
+    var buf_b_locs = std.ArrayListUnmanaged(?types.SourceLocation).empty;
+    defer buf_b_locs.deinit(allocator);
+
+    try buf_a_insts.ensureTotalCapacity(allocator, ops.len);
+    try buf_a_locs.ensureTotalCapacity(allocator, ops.len);
+    buf_a_insts.appendSliceAssumeCapacity(ops);
+    // Initial loc array — pad to ops.len if the stack-lower output array is
+    // shorter / empty (defensive: should already match in practice).
+    var k: usize = 0;
+    while (k < ops.len) : (k += 1) {
+        const loc = if (k < src_locs.len) src_locs[k] else null;
+        buf_a_locs.appendAssumeCapacity(loc);
+    }
+
+    var iteration: usize = 0;
+    while (iteration < max_iterations) : (iteration += 1) {
+        const changed = try runOnePassWithLocs(allocator, buf_a_insts.items, buf_a_locs.items, &buf_b_insts, &buf_b_locs);
+        if (!changed) break;
+        const tmp_i = buf_a_insts;
+        buf_a_insts = buf_b_insts;
+        buf_b_insts = tmp_i;
+        const tmp_l = buf_a_locs;
+        buf_a_locs = buf_b_locs;
+        buf_b_locs = tmp_l;
+    }
+
+    const insts = try allocator.alloc(Inst, buf_a_insts.items.len);
+    @memcpy(insts, buf_a_insts.items);
+    const locs = try allocator.alloc(?types.SourceLocation, buf_a_locs.items.len);
+    @memcpy(locs, buf_a_locs.items);
+    return .{ .insts = insts, .locs = locs };
+}
+
+fn runOnePassWithLocs(
+    allocator: Allocator,
+    ops: []const Inst,
+    src_locs: []const ?types.SourceLocation,
+    out_insts: *std.ArrayListUnmanaged(Inst),
+    out_locs: *std.ArrayListUnmanaged(?types.SourceLocation),
+) !bool {
+    out_insts.clearRetainingCapacity();
+    out_locs.clearRetainingCapacity();
+    var changed = false;
+
+    var i: usize = 0;
+    while (i < ops.len) {
+        const head_loc = if (i < src_locs.len) src_locs[i] else null;
+        // Window 4
+        if (i + 4 <= ops.len) {
+            if (tryWindow4(ops[i..][0..4])) |replacement| {
+                for (replacement) |inst| {
+                    if (inst) |r| {
+                        try out_insts.append(allocator, r);
+                        try out_locs.append(allocator, head_loc);
+                    }
+                }
+                i += 4;
+                changed = true;
+                continue;
+            }
+        }
+        // Window 3
+        if (i + 3 <= ops.len) {
+            if (tryWindow3(ops[i..][0..3])) |replacement| {
+                for (replacement) |inst| {
+                    if (inst) |r| {
+                        try out_insts.append(allocator, r);
+                        try out_locs.append(allocator, head_loc);
+                    }
+                }
+                i += 3;
+                changed = true;
+                continue;
+            }
+        }
+        // Window 2
+        if (i + 2 <= ops.len) {
+            if (tryWindow2(ops[i..][0..2])) |replacement| {
+                for (replacement) |inst| {
+                    if (inst) |r| {
+                        try out_insts.append(allocator, r);
+                        try out_locs.append(allocator, head_loc);
+                    }
+                }
+                i += 2;
+                changed = true;
+                continue;
+            }
+        }
+        // No rule matched — emit instruction as-is, keep its loc
+        try out_insts.append(allocator, ops[i]);
+        try out_locs.append(allocator, head_loc);
+        i += 1;
+    }
+
+    return changed;
 }
 
 /// Optimize a single instruction sequence. Returns a new slice (caller owns).
@@ -184,6 +323,9 @@ fn tryWindow2(w: *const [2]Inst) ?Replacement2 {
     const a = w[0];
     const b = w[1];
 
+    // raw_bytes is a hard peephole barrier — never rewrite across it.
+    if (isRawBytes(a) or isRawBytes(b)) return null;
+
     // Rule 1: PUSH(x) + DROP -> (removed)
     if (isPush(a) and isOp(b, .op_drop)) return .{ null, null };
 
@@ -236,6 +378,15 @@ fn tryWindow2(w: *const [2]Inst) ?Replacement2 {
     // Rule 17: PUSH(0) + ROLL -> (removed, roll 0 = no-op)
     if (isPushInt(a, 0) and isOp(b, .op_roll)) return .{ null, null };
 
+    // NOTE: PUSH(1) + ROLL -> SWAP and PUSH(2) + ROLL -> ROT are intentionally
+    // NOT folded as 2-window peephole rules. The TS reference compiler
+    // distinguishes typed `RollOp` (which carries a depth field and IS folded
+    // by peephole) from untyped post-if reconciliation rolls (`push d +
+    // roll(depth=d+1) + drop`, which are NOT folded). The Zig instruction
+    // stream collapses both into `op_roll`, so we cannot tell them apart at
+    // the peephole level. To preserve byte-equivalence with the canonical TS
+    // output, we leave these rolls unfolded.
+
     // Rule 20: PUSH(0) + PICK -> DUP
     if (isPushInt(a, 0) and isOp(b, .op_pick)) return .{ Inst{ .op = .op_dup }, null };
 
@@ -244,6 +395,11 @@ fn tryWindow2(w: *const [2]Inst) ?Replacement2 {
 
     // Rule 22: OP_SHA256 + OP_SHA256 -> OP_HASH256
     if (isOp(a, .op_sha256) and isOp(b, .op_sha256)) return .{ Inst{ .op = .op_hash256 }, null };
+
+    // Rule 23: PUSH(0) + OP_NUMEQUAL -> OP_NOT
+    // Mirrors the TS reference compiler's peephole rule
+    // (packages/runar-compiler/src/optimizer/peephole.ts).
+    if (isPushInt(a, 0) and isOp(b, .op_numequal)) return .{ Inst{ .op = .op_not }, null };
 
     return null;
 }
@@ -255,6 +411,8 @@ fn tryWindow2(w: *const [2]Inst) ?Replacement2 {
 const Replacement3 = [3]?Inst;
 
 fn tryWindow3(w: *const [3]Inst) ?Replacement3 {
+    // raw_bytes is a hard peephole barrier — never rewrite across it.
+    if (isRawBytes(w[0]) or isRawBytes(w[1]) or isRawBytes(w[2])) return null;
     const va = getPushIntValue(w[0]) orelse return null;
     const vb = getPushIntValue(w[1]) orelse return null;
 
@@ -286,6 +444,8 @@ fn tryWindow3(w: *const [3]Inst) ?Replacement3 {
 const Replacement4 = [4]?Inst;
 
 fn tryWindow4(w: *const [4]Inst) ?Replacement4 {
+    // raw_bytes is a hard peephole barrier — never rewrite across it.
+    if (isRawBytes(w[0]) or isRawBytes(w[1]) or isRawBytes(w[2]) or isRawBytes(w[3])) return null;
     // Rule 27: PUSH(a) + OP_ADD + PUSH(b) + OP_ADD -> PUSH(a+b) + OP_ADD
     if (isOp(w[1], .op_add) and isOp(w[3], .op_add)) {
         const va = getPushIntValue(w[0]) orelse return null;
@@ -751,7 +911,13 @@ test "optimize methods" {
 
     const result = try optimize(alloc, &methods);
     defer {
-        for (result) |m| alloc.free(m.instructions);
+        for (result) |m| {
+            alloc.free(m.instructions);
+            // GAP-002: optimize now allocates a parallel
+            // instruction_source_locs slice — free it too to avoid the
+            // test-runner leak detector flagging it as a leak.
+            if (m.instruction_source_locs.len > 0) alloc.free(m.instruction_source_locs);
+        }
         alloc.free(result);
     }
 

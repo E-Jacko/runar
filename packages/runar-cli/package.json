@@ -1,6 +1,6 @@
 {
   "name": "runar-cli",
-  "version": "0.4.4",
+  "version": "1.0.0-rc.1",
   "type": "module",
   "description": "Rúnar CLI: compile, test, deploy, and manage smart contracts",
   "main": "dist/index.js",
@@ -27,6 +27,8 @@
   "dependencies": {
     "commander": "^12.1.0",
     "runar-compiler": "workspace:*",
+    "runar-decompiler": "workspace:*",
+    "runar-ir-schema": "workspace:*",
     "runar-sdk": "workspace:*",
     "runar-testing": "workspace:*"
   },

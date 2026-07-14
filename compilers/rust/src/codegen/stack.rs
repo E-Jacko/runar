@@ -12,6 +12,7 @@
 //! - @this is a compile-time placeholder (push 0)
 //! - super() is a no-op at stack level
 
+use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::{ANFBinding, ANFMethod, ANFProgram, ANFProperty, ANFValue, ConstValue};
@@ -49,13 +50,29 @@ pub enum StackOp {
         param_name: String,
     },
     PushCodeSepIndex,
+    /// An opaque opcode-byte span emitted verbatim by a `raw_script` ANF node.
+    /// The stack effect is declared via `in_arity` / `out_arity`; the bytes are
+    /// never inspected and the peephole optimizer treats this op as a hard
+    /// barrier.
+    RawBytes {
+        bytes: Vec<u8>,
+        in_arity: usize,
+        out_arity: usize,
+    },
 }
 
 /// Typed value for push operations.
 #[derive(Debug, Clone)]
 pub enum PushValue {
     Bool(bool),
-    Int(i128),
+    /// Arbitrary-precision integer push.
+    ///
+    /// Widened from `i128` to `num_bigint::BigInt` so 256-bit constants
+    /// (e.g. the secp256k1 group order in schnorr-zkp's s-bound assert)
+    /// round-trip through the stack-IR and into the final push-encoded
+    /// Bitcoin Script bytes without truncation. Mirrors Go's
+    /// `PushValue.Kind="bigint"` (carries `*big.Int`).
+    Int(num_bigint::BigInt),
     Bytes(Vec<u8>),
 }
 
@@ -68,6 +85,10 @@ pub struct StackMethod {
     /// Parallel to `ops`: optional source location for each stack operation.
     /// Used for generating source maps in the emit phase.
     pub source_locs: Vec<Option<crate::ir::SourceLocation>>,
+    /// True if the unlocking script is prefixed with `_codePart` — needed for
+    /// continuation builders OR terminal methods that read variable-length
+    /// (ByteString) state (issue #100). Propagated to ABIMethod.uses_code_part.
+    pub uses_code_part: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +109,65 @@ fn is_ec_builtin(name: &str) -> bool {
             | "ecPointX"
             | "ecPointY"
     )
+}
+
+fn is_bb_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "bbFieldAdd" | "bbFieldSub" | "bbFieldMul" | "bbFieldInv"
+            | "bbExt4Mul0" | "bbExt4Mul1" | "bbExt4Mul2" | "bbExt4Mul3"
+            | "bbExt4Inv0" | "bbExt4Inv1" | "bbExt4Inv2" | "bbExt4Inv3"
+    )
+}
+
+fn is_kb_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "kbFieldAdd" | "kbFieldSub" | "kbFieldMul" | "kbFieldInv"
+            | "kbExt4Mul0" | "kbExt4Mul1" | "kbExt4Mul2" | "kbExt4Mul3"
+            | "kbExt4Inv0" | "kbExt4Inv1" | "kbExt4Inv2" | "kbExt4Inv3"
+    )
+}
+
+fn is_bn254_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "bn254FieldAdd"
+            | "bn254FieldSub"
+            | "bn254FieldMul"
+            | "bn254FieldInv"
+            | "bn254FieldNeg"
+            | "bn254G1Add"
+            | "bn254G1ScalarMul"
+            | "bn254G1Negate"
+            | "bn254G1OnCurve"
+    )
+}
+
+fn is_nist_ec_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "p256Add" | "p256Mul" | "p256MulGen"
+            | "p256Negate" | "p256OnCurve" | "p256EncodeCompressed"
+            | "p384Add" | "p384Mul" | "p384MulGen"
+            | "p384Negate" | "p384OnCurve" | "p384EncodeCompressed"
+    )
+}
+
+fn is_merkle_builtin(name: &str) -> bool {
+    matches!(name, "merkleRootSha256" | "merkleRootHash256" | "merkleRootPoseidon2KB")
+}
+
+/// State-field types that are stored as script numbers (require OP_BIN2NUM
+/// after extraction). `RabinSig`/`RabinPubKey` are bigint aliases.
+fn is_numeric_state_type(t: &str) -> bool {
+    matches!(t, "bigint" | "boolean" | "RabinSig" | "RabinPubKey")
+}
+
+/// State-field types that are stored with a push-data length prefix and thus
+/// require `emit_push_data_decode` instead of a fixed OP_SPLIT.
+fn is_variable_length_state_type(t: &str) -> bool {
+    matches!(t, "ByteString" | "Sig" | "SigHashPreimage")
 }
 
 fn builtin_opcodes(name: &str) -> Option<Vec<&'static str>> {
@@ -222,6 +302,11 @@ impl StackMap {
     fn named_slots(&self) -> HashSet<String> {
         self.slots.iter().filter(|s| !s.is_empty()).cloned().collect()
     }
+
+    /// Debug string of the slot names (bottom -> top) for error messages.
+    fn debug_slots(&self) -> String {
+        self.slots.join(", ")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,12 +315,56 @@ impl StackMap {
 
 fn compute_last_uses(bindings: &[ANFBinding]) -> HashMap<String, usize> {
     let mut last_use = HashMap::new();
+    // Pre-scan: map each array_literal binding to its element refs. Used to
+    // propagate last-use across the array indirection (the array binding is
+    // pure metadata in lower_array_literal — its elements must remain live
+    // until the array's consumer, not until the array_literal binding itself).
+    let mut array_elems: HashMap<String, Vec<String>> = HashMap::new();
+    for b in bindings {
+        if let ANFValue::ArrayLiteral { elements } = &b.value {
+            array_elems.insert(b.name.clone(), elements.clone());
+        }
+    }
     for (i, binding) in bindings.iter().enumerate() {
+        // array_literal is metadata-only — do NOT advance its elements'
+        // last-use to here; defer to the array's consumer.
+        if matches!(&binding.value, ANFValue::ArrayLiteral { .. }) {
+            continue;
+        }
         for r in collect_refs(&binding.value) {
+            if let Some(elems) = array_elems.get(&r) {
+                for e in elems {
+                    last_use.insert(e.clone(), i);
+                }
+            }
             last_use.insert(r, i);
         }
     }
     last_use
+}
+
+/// Collect every binding name defined anywhere in a binding sequence,
+/// recursing into nested if-branches and loop bodies. Used by lower_loop to
+/// distinguish loop-internal (re)definitions from true outer-scope refs.
+fn collect_deep_binding_names(bindings: &[ANFBinding]) -> HashSet<String> {
+    fn walk(bindings: &[ANFBinding], names: &mut HashSet<String>) {
+        for b in bindings {
+            names.insert(b.name.clone());
+            match &b.value {
+                ANFValue::If { then, else_branch, .. } => {
+                    walk(then, names);
+                    walk(else_branch, names);
+                }
+                ANFValue::Loop { body, .. } => {
+                    walk(body, names);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut names = HashSet::new();
+    walk(bindings, &mut names);
+    names
 }
 
 fn collect_refs(value: &ANFValue) -> Vec<String> {
@@ -290,13 +419,13 @@ fn collect_refs(value: &ANFValue) -> Vec<String> {
                 refs.extend(collect_refs(&b.value));
             }
         }
-        ANFValue::Assert { value } => {
+        ANFValue::Assert { value, .. } => {
             refs.push(value.clone());
         }
         ANFValue::UpdateProp { value, .. } => {
             refs.push(value.clone());
         }
-        ANFValue::CheckPreimage { preimage } => {
+        ANFValue::CheckPreimage { preimage, .. } => {
             refs.push(preimage.clone());
         }
         ANFValue::DeserializeState { preimage } => {
@@ -313,8 +442,16 @@ fn collect_refs(value: &ANFValue) -> Vec<String> {
             refs.push(satoshis.clone());
             refs.push(script_bytes.clone());
         }
+        ANFValue::AddDataOutput { satoshis, script_bytes } => {
+            refs.push(satoshis.clone());
+            refs.push(script_bytes.clone());
+        }
         ANFValue::ArrayLiteral { elements } => {
             refs.extend(elements.iter().cloned());
+        }
+        ANFValue::RawScript { .. } => {
+            // Opaque byte span — no SSA operand refs. Stack effect is declared
+            // via in_arity / out_arity.
         }
     }
     refs
@@ -342,6 +479,18 @@ struct LoweringContext {
     inside_branch: bool,
     /// Current source location from the ANF binding being lowered.
     current_source_loc: Option<crate::ir::SourceLocation>,
+    /// Tracks compile-time constant values by binding name (for Merkle depth extraction, etc.).
+    const_values: HashMap<String, ConstValue>,
+    /// Element counts for array_literal bindings (used by checkMultiSig).
+    array_lengths: HashMap<String, usize>,
+    /// Element refs for array_literal bindings (used by checkMultiSig).
+    array_elements: HashMap<String, Vec<String>>,
+    /// Method params whose names collide with a MUTABLE property. Maps the
+    /// param name to the reserved stack-slot name its witness value lives
+    /// under, so `lower_load_param` reads the param and not the same-named
+    /// deserialized property slot (issue #130). Empty for the common
+    /// no-collision case, so all other contracts are byte-identical.
+    renamed_params: HashMap<String, String>,
 }
 
 impl LoweringContext {
@@ -357,7 +506,38 @@ impl LoweringContext {
             outer_protected_refs: None,
             inside_branch: false,
             current_source_loc: None,
+            const_values: HashMap::new(),
+            array_lengths: HashMap::new(),
+            array_elements: HashMap::new(),
+            renamed_params: HashMap::new(),
         };
+
+        // Issue #130 (stack layer): a method param whose name collides with a
+        // MUTABLE property gets a duplicate stackMap slot once
+        // `deserialize_state` pushes that property under the same name. Name
+        // lookups resolve to the shallowest match (the deserialized property),
+        // so `load_param` would read the stale on-chain state instead of the
+        // witness value. Rename the colliding param's slot to a reserved,
+        // collision-proof name up front and remember the mapping so
+        // `lower_load_param` targets the real param slot. Only mutable
+        // properties are deserialized onto the stack, so readonly shadows
+        // (handled purely by ANF resolution) never enter this map, and
+        // non-colliding contracts get an empty map — byte-identical output.
+        let mutable_prop_names: HashSet<&str> = properties
+            .iter()
+            .filter(|p| !p.readonly)
+            .map(|p| p.name.as_str())
+            .collect();
+        for name in params {
+            if mutable_prop_names.contains(name.as_str()) {
+                if let Some(depth) = ctx.sm.find_depth(name) {
+                    let renamed = format!("__param_{}", name);
+                    ctx.sm.rename_at_depth(depth, &renamed);
+                    ctx.renamed_params.insert(name.clone(), renamed);
+                }
+            }
+        }
+
         ctx.track_depth();
         ctx
     }
@@ -379,72 +559,115 @@ impl LoweringContext {
     /// Expects stack: `[..., script, len]`
     /// Leaves stack:  `[..., script, varint_bytes]`
     ///
-    /// OP_NUM2BIN uses sign-magnitude encoding where values 128-255 need 2 bytes
-    /// (sign bit). To produce a correct 1-byte unsigned varint, we use
-    /// OP_NUM2BIN 2 then SPLIT to extract only the low byte.
-    /// Similarly for 2-byte unsigned varint, we use OP_NUM2BIN 4 then SPLIT.
+    /// Bitcoin varint format:
+    ///   len < 0xfd:        1 byte (len itself)
+    ///   len <= 0xffff:     0xfd + 2 bytes LE                (3 bytes)
+    ///   len <= 0xffffffff: 0xfe + 4 bytes LE                (5 bytes)
+    ///   otherwise:         0xff + 8 bytes LE                (9 bytes — never used in
+    ///                                                        practice for BSV scripts)
+    ///
+    /// We must support all four shapes; emitting a 3-byte varint for a script whose
+    /// length exceeds 0xffff produces a truncated value that no longer matches what
+    /// the BSV node uses for hashOutputs, breaking the state-continuation hash
+    /// equality assertion downstream. (This is the second of the two bugs fixed
+    /// alongside `parse_variable_length_state_fields`'s varint stripping — see
+    /// `integration/go/contracts/RollupBug.runar.go`.)
+    ///
+    /// OP_NUM2BIN uses sign-magnitude encoding where high-bit values need an extra
+    /// sign byte; we generate one extra byte and then SPLIT off the unsigned low
+    /// bytes to get the correct unsigned varint payload.
     fn emit_varint_encoding(&mut self) {
         // Stack: [..., script, len]
-        self.emit_op(StackOp::Dup); // [script, len, len]
+
+        // emit_num_to_low_bytes: [..., len] -> [..., low_n_bytes]. Uses
+        // NUM2BIN(n+1) then SPLIT(n) DROP to drop the sign byte.
+        fn emit_num_to_low_bytes(ctx: &mut LoweringContext, n_bytes: i128) {
+            ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(n_bytes + 1))));
+            ctx.sm.push("");
+            ctx.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
+            ctx.sm.pop();
+            ctx.sm.pop();
+            ctx.sm.push("");
+            ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(n_bytes))));
+            ctx.sm.push("");
+            ctx.emit_op(StackOp::Opcode("OP_SPLIT".into()));
+            ctx.sm.pop();
+            ctx.sm.pop();
+            ctx.sm.push("");
+            ctx.sm.push("");
+            ctx.emit_op(StackOp::Drop);
+            ctx.sm.pop();
+        }
+
+        // emit_prefix: [..., script, low_bytes] -> [..., script, prefix||low_bytes].
+        fn emit_prefix(ctx: &mut LoweringContext, prefix_byte: u8) {
+            ctx.emit_op(StackOp::Push(PushValue::Bytes(vec![prefix_byte])));
+            ctx.sm.push("");
+            ctx.emit_op(StackOp::Swap);
+            ctx.sm.swap();
+            ctx.sm.pop();
+            ctx.sm.pop();
+            ctx.emit_op(StackOp::Opcode("OP_CAT".into()));
+            ctx.sm.push("");
+        }
+
+        // IF len < 253: 1-byte varint.
+        self.emit_op(StackOp::Dup);
         self.sm.dup();
-        self.emit_op(StackOp::Push(PushValue::Int(253))); // [script, len, len, 253]
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(253))));
         self.sm.push("");
-        self.emit_op(StackOp::Opcode("OP_LESSTHAN".into())); // [script, len, isSmall]
+        self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop();
         self.sm.pop();
         self.sm.push("");
-
         self.emit_op(StackOp::Opcode("OP_IF".into()));
-        self.sm.pop(); // pop condition
-
-        // Then: 1-byte varint (len < 253)
-        // Use NUM2BIN 2 to avoid sign-magnitude issue for values 128-252,
-        // then take only the first (low) byte via SPLIT.
-        self.emit_op(StackOp::Push(PushValue::Int(2))); // [script, len, 2]
-        self.sm.push("");
-        self.emit_op(StackOp::Opcode("OP_NUM2BIN".into())); // [script, len_2bytes]
         self.sm.pop();
-        self.sm.pop();
-        self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(1))); // [script, len_2bytes, 1]
-        self.sm.push("");
-        self.emit_op(StackOp::Opcode("OP_SPLIT".into())); // [script, lowByte, highByte]
-        self.sm.pop();
-        self.sm.pop();
-        self.sm.push(""); // lowByte
-        self.sm.push(""); // highByte
-        self.emit_op(StackOp::Drop); // [script, lowByte]
-        self.sm.pop();
-
+        let sm_at_1_byte = self.sm.clone();
+        emit_num_to_low_bytes(self, 1);
         self.emit_op(StackOp::Opcode("OP_ELSE".into()));
+        self.sm = sm_at_1_byte.clone();
 
-        // Else: 0xfd + 2-byte LE varint (len >= 253)
-        // Use NUM2BIN 4 to avoid sign-magnitude issue for values >= 32768,
-        // then take only the first 2 (low) bytes via SPLIT.
-        self.emit_op(StackOp::Push(PushValue::Int(4))); // [script, len, 4]
+        // ELSE-IF len <= 0xffff: 0xfd + 2-byte LE.
+        self.emit_op(StackOp::Dup);
+        self.sm.dup();
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0x10000i64))));
         self.sm.push("");
-        self.emit_op(StackOp::Opcode("OP_NUM2BIN".into())); // [script, len_4bytes]
+        self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop();
         self.sm.pop();
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(2))); // [script, len_4bytes, 2]
-        self.sm.push("");
-        self.emit_op(StackOp::Opcode("OP_SPLIT".into())); // [script, low2bytes, high2bytes]
+        self.emit_op(StackOp::Opcode("OP_IF".into()));
         self.sm.pop();
-        self.sm.pop();
-        self.sm.push(""); // low2bytes
-        self.sm.push(""); // high2bytes
-        self.emit_op(StackOp::Drop); // [script, low2bytes]
-        self.sm.pop();
-        self.emit_op(StackOp::Push(PushValue::Bytes(vec![0xfd])));
-        self.sm.push("");
-        self.emit_op(StackOp::Swap);
-        self.sm.swap();
-        self.sm.pop();
-        self.sm.pop();
-        self.emit_op(StackOp::Opcode("OP_CAT".into()));
-        self.sm.push("");
+        let sm_at_3_byte = self.sm.clone();
+        emit_num_to_low_bytes(self, 2);
+        emit_prefix(self, 0xfd);
+        self.emit_op(StackOp::Opcode("OP_ELSE".into()));
+        self.sm = sm_at_3_byte.clone();
 
+        // ELSE-IF len <= 0xffffffff: 0xfe + 4-byte LE.
+        self.emit_op(StackOp::Dup);
+        self.sm.dup();
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0x100000000i64))));
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
+        self.sm.pop();
+        self.sm.pop();
+        self.sm.push("");
+        self.emit_op(StackOp::Opcode("OP_IF".into()));
+        self.sm.pop();
+        let sm_at_5_byte = self.sm.clone();
+        emit_num_to_low_bytes(self, 4);
+        emit_prefix(self, 0xfe);
+        self.emit_op(StackOp::Opcode("OP_ELSE".into()));
+        self.sm = sm_at_5_byte.clone();
+
+        // ELSE: 0xff + 8-byte LE. (>= 4 GiB script — practically unreachable on
+        // BSV but kept for spec completeness so we never silently truncate.)
+        emit_num_to_low_bytes(self, 8);
+        emit_prefix(self, 0xff);
+
+        self.emit_op(StackOp::Opcode("OP_ENDIF".into()));
+        self.emit_op(StackOp::Opcode("OP_ENDIF".into()));
         self.emit_op(StackOp::Opcode("OP_ENDIF".into()));
         // --- Stack: [..., script, varint] ---
     }
@@ -458,7 +681,7 @@ impl LoweringContext {
         self.sm.push("");
         self.emit_op(StackOp::Dup);
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(76)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(76))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop(); self.sm.pop();
@@ -469,12 +692,12 @@ impl LoweringContext {
         let sm_after_outer_if = self.sm.clone();
 
         // THEN: len <= 75
-        self.emit_op(StackOp::Push(PushValue::Int(2)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(2))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
         self.sm.pop(); self.sm.pop();
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -491,7 +714,7 @@ impl LoweringContext {
 
         self.emit_op(StackOp::Dup);
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(256)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(256))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop(); self.sm.pop();
@@ -502,12 +725,12 @@ impl LoweringContext {
         let sm_after_inner_if = self.sm.clone();
 
         // THEN: 76-255 → 0x4c + 1-byte
-        self.emit_op(StackOp::Push(PushValue::Int(2)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(2))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
         self.sm.pop(); self.sm.pop();
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -528,12 +751,12 @@ impl LoweringContext {
         self.sm = sm_after_inner_if;
 
         // ELSE: >= 256 → 0x4d + 2-byte LE
-        self.emit_op(StackOp::Push(PushValue::Int(4)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
         self.sm.pop(); self.sm.pop();
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(2)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(2))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -560,7 +783,7 @@ impl LoweringContext {
     /// Expects stack: [..., state_bytes]
     /// Leaves stack:  [..., data, remaining_state]
     fn emit_push_data_decode(&mut self) {
-        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -569,7 +792,7 @@ impl LoweringContext {
         self.emit_op(StackOp::Opcode("OP_BIN2NUM".into()));
         self.emit_op(StackOp::Dup);
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(76)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(76))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
         self.sm.pop(); self.sm.pop();
@@ -590,7 +813,7 @@ impl LoweringContext {
 
         self.emit_op(StackOp::Dup);
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(77)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(77))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUMEQUAL".into()));
         self.sm.pop(); self.sm.pop();
@@ -602,7 +825,7 @@ impl LoweringContext {
 
         // THEN: fb == 77 → 2-byte LE
         self.emit_op(StackOp::Drop); self.sm.pop();
-        self.emit_op(StackOp::Push(PushValue::Int(2)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(2))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -618,7 +841,7 @@ impl LoweringContext {
 
         // ELSE: fb == 76 → 1-byte
         self.emit_op(StackOp::Drop); self.sm.pop();
-        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
         self.sm.pop(); self.sm.pop();
@@ -639,6 +862,38 @@ impl LoweringContext {
             None => true,
             Some(&last) => last <= current_index,
         }
+    }
+
+    /// Consume-vs-copy decision for one operand of a multi-operand ANF value.
+    ///
+    /// `operands` is the FULL operand-ref list of the value (including
+    /// `operand_ref` itself). The load may consume (ROLL / move) the ref only
+    /// when this binding is the ref's last use AND the ref occurs exactly
+    /// once in the operand list. A ref that is read at more than one operand
+    /// position of the same value must be copied (PICK / DUP) at EVERY
+    /// position: each operand position needs its own stack slot, and a
+    /// consume-mode load of a ref that is already on top of the stack is a
+    /// no-op (see `bring_to_top`), so two consume-mode loads of the same ref
+    /// would leave a single slot for an opcode that pops one item per operand
+    /// (e.g. `t := x + x` underflowing OP_ADD), or — when the ref sits below
+    /// other live slots — silently pair the opcode with the wrong slot. The
+    /// original value then simply stays on the stack, exactly like any ref
+    /// whose last use is a later binding.
+    ///
+    /// Unreachable from the frontend (ANF lowering gives every operand a
+    /// fresh temp); reachable via `compile_from_ir` / CLI `--ir` hand-written
+    /// ANF.
+    fn operand_consume<S: AsRef<str>>(
+        &self,
+        operand_ref: &str,
+        operands: &[S],
+        current_index: usize,
+        last_uses: &HashMap<String, usize>,
+    ) -> bool {
+        if !self.is_last_use(operand_ref, current_index, last_uses) {
+            return false;
+        }
+        operands.iter().filter(|o| o.as_ref() == operand_ref).count() <= 1
     }
 
     fn bring_to_top(&mut self, name: &str, consume: bool) {
@@ -667,7 +922,7 @@ impl LoweringContext {
                 let removed = self.sm.remove_at_depth(2);
                 self.sm.push(&removed);
             } else {
-                self.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
                 self.sm.push(""); // temporary depth literal
                 self.emit_op(StackOp::Roll { depth });
                 self.sm.pop(); // remove depth literal
@@ -680,7 +935,7 @@ impl LoweringContext {
                 let picked = self.sm.peek_at_depth(1).to_string();
                 self.sm.push(&picked);
             } else {
-                self.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
                 self.sm.push(""); // temporary
                 self.emit_op(StackOp::Pick { depth });
                 self.sm.pop(); // remove depth literal
@@ -690,6 +945,51 @@ impl LoweringContext {
         }
 
         self.track_depth();
+    }
+
+    /// Drain branch-private residue from below TOS at the end of a branch
+    /// body, so both branches converge to a layout the parent stack model can
+    /// faithfully describe before OP_ENDIF (issue #36).
+    ///
+    /// A slot is residue when its name is NOT in `pre_if_names` (the snapshot
+    /// of the parent's named slots taken before the branch ran). This catches
+    /// both anonymous slots (empty-named, pushed by intrinsics like substr's
+    /// OP_SPLIT residue) and named branch-local bindings that lingered past
+    /// their last-use (e.g. dead-code load_const intermediates the optimizer
+    /// didn't fold).
+    ///
+    /// Slots whose name was already in `pre_if_names` are kept — including
+    /// duplicates created by reassigning an outer-scope local from inside the
+    /// branch. The TOS slot is also kept regardless.
+    fn drain_branch_private_residue(&mut self, pre_if_names: &HashSet<String>) {
+        let mut drain_depths: Vec<usize> = Vec::new();
+        for d in 1..self.sm.depth() {
+            let name = self.sm.peek_at_depth(d);
+            if name.is_empty() {
+                drain_depths.push(d);
+            } else if !pre_if_names.contains(name) {
+                drain_depths.push(d);
+            }
+        }
+        if drain_depths.is_empty() {
+            return;
+        }
+        drain_depths.sort_by(|a, b| b.cmp(a));
+        for depth in drain_depths {
+            if depth == 1 {
+                self.emit_op(StackOp::Nip);
+                self.sm.remove_at_depth(1);
+            } else {
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
+                self.sm.push("");
+                self.emit_op(StackOp::Roll { depth });
+                self.sm.pop();
+                let rolled = self.sm.remove_at_depth(depth);
+                self.sm.push(&rolled);
+                self.emit_op(StackOp::Drop);
+                self.sm.pop();
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -734,7 +1034,7 @@ impl LoweringContext {
 
             if matches!(&binding.value, ANFValue::Assert { .. }) && i as isize == last_assert_idx {
                 // Terminal assert: leave value on stack instead of OP_VERIFY
-                if let ANFValue::Assert { value } = &binding.value {
+                if let ANFValue::Assert { value, .. } = &binding.value {
                     self.lower_assert(value, i, &last_uses, true);
                 }
             } else if matches!(&binding.value, ANFValue::If { .. }) && i as isize == terminal_if_idx {
@@ -801,10 +1101,12 @@ impl LoweringContext {
                 count,
                 body,
                 iter_var,
+                start,
+                step,
             } => {
-                self.lower_loop(name, *count, body, iter_var);
+                self.lower_loop(name, *count, body, iter_var, start, *step, Some(binding_index), Some(last_uses));
             }
-            ANFValue::Assert { value } => {
+            ANFValue::Assert { value, .. } => {
                 self.lower_assert(value, binding_index, last_uses, false);
             }
             ANFValue::UpdateProp {
@@ -816,8 +1118,8 @@ impl LoweringContext {
             ANFValue::GetStateScript {} => {
                 self.lower_get_state_script(name);
             }
-            ANFValue::CheckPreimage { preimage } => {
-                self.lower_check_preimage(name, preimage, binding_index, last_uses);
+            ANFValue::CheckPreimage { preimage, sighash_flag } => {
+                self.lower_check_preimage(name, preimage, *sighash_flag, binding_index, last_uses);
             }
             ANFValue::DeserializeState { preimage } => {
                 self.lower_deserialize_state(preimage, binding_index, last_uses);
@@ -828,8 +1130,16 @@ impl LoweringContext {
             ANFValue::AddRawOutput { satoshis, script_bytes } => {
                 self.lower_add_raw_output(name, satoshis, script_bytes, binding_index, last_uses);
             }
+            ANFValue::AddDataOutput { satoshis, script_bytes } => {
+                // Wire shape matches add_raw_output: amount(8LE) + varint(scriptLen) + scriptBytes.
+                // The distinction lives in the continuation-hash composition (ANF lowering).
+                self.lower_add_raw_output(name, satoshis, script_bytes, binding_index, last_uses);
+            }
             ANFValue::ArrayLiteral { elements } => {
                 self.lower_array_literal(name, elements, binding_index, last_uses);
+            }
+            ANFValue::RawScript { bytes, in_arity, out_arity } => {
+                self.lower_raw_script(name, bytes, *in_arity, *out_arity);
             }
         }
     }
@@ -845,14 +1155,33 @@ impl LoweringContext {
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
-        if self.sm.has(param_name) {
+        // The parameter is on the stack under its original name — or, for a
+        // param that shadows a mutable property, under a reserved renamed slot
+        // (issue #130) so it is not confused with the deserialized property
+        // slot.
+        let slot_name = self
+            .renamed_params
+            .get(param_name)
+            .cloned()
+            .unwrap_or_else(|| param_name.to_string());
+        if self.sm.has(&slot_name) {
             let is_last = self.is_last_use(param_name, binding_index, last_uses);
-            self.bring_to_top(param_name, is_last);
+            self.bring_to_top(&slot_name, is_last);
             self.sm.pop();
             self.sm.push(binding_name);
         } else {
-            self.emit_op(StackOp::Push(PushValue::Int(0)));
-            self.sm.push(binding_name);
+            // Parameter no longer on the stack — a compiler invariant violation
+            // (historically caused by unrolled loops consuming outer refs; see
+            // lower_loop). Silently emitting OP_0 here produced scripts that
+            // compiled, passed the env-based interpreter, and then failed on
+            // chain — fail loudly instead.
+            panic!(
+                "Stack lowering: method parameter '{}' is not on the stack at a \
+                 post-consumption reference (stack: [{}]). Refusing to emit a \
+                 silent OP_0 placeholder.",
+                param_name,
+                self.sm.debug_slots()
+            );
         }
     }
 
@@ -871,29 +1200,68 @@ impl LoweringContext {
             } else {
                 // Property value will be provided at deployment time; emit a placeholder.
                 // The emitter records byte offsets so the SDK can splice in real values.
-                let param_index = self
-                    .properties
-                    .iter()
-                    .position(|p2| p2.name == prop_name)
-                    .unwrap_or(0);
+                let param_index = self.ctor_param_index_or_panic(prop_name);
                 self.emit_op(StackOp::Placeholder {
                     param_index,
                     param_name: prop_name.to_string(),
                 });
             }
         } else {
-            // Property not found and not on stack — emit placeholder with index 0.
-            let param_index = self
-                .properties
-                .iter()
-                .position(|p2| p2.name == prop_name)
-                .unwrap_or(0);
+            // Property not found and not on stack — must still be a real
+            // constructor-param slot, otherwise there is nothing to splice.
+            let param_index = self.ctor_param_index_or_panic(prop_name);
             self.emit_op(StackOp::Placeholder {
                 param_index,
                 param_name: prop_name.to_string(),
             });
         }
         self.sm.push(binding_name);
+    }
+
+    /// Resolve `prop_name`'s constructor slot for a placeholder, or fail loudly.
+    ///
+    /// #119 tail (H1): a property that reaches the placeholder fallback with no
+    /// matching constructor slot has no deploy-time bytes of its own. The
+    /// previous behaviour coerced it onto slot 0 (`.unwrap_or(0)`), silently
+    /// splicing an UNRELATED constructor argument's placeholder into the
+    /// locking script — a silent-wrong-code path. Fail loudly instead. (A real
+    /// constructor-param property — readonly, or a mutable state field whose
+    /// initial value is spliced at deploy — is found by `position` and is
+    /// unaffected: zero golden churn.)
+    fn ctor_param_index_or_panic(&self, prop_name: &str) -> usize {
+        // Initialized properties are excluded from the constructor, so only
+        // uninitialized (deploy-time) properties own a constructor slot.
+        match self
+            .properties
+            .iter()
+            .filter(|p| p.initial_value.is_none())
+            .position(|p| p.name == prop_name)
+        {
+            Some(idx) => idx,
+            None => {
+                let loc = self
+                    .current_source_loc
+                    .as_ref()
+                    .map(|l| format!(" at {}:{}:{}", l.file, l.line, l.column))
+                    .unwrap_or_default();
+                let ctor_props: Vec<&str> = self
+                    .properties
+                    .iter()
+                    .filter(|p| p.initial_value.is_none())
+                    .map(|p| p.name.as_str())
+                    .collect();
+                panic!(
+                    "Stack lowering: property '{}'{} is neither on the stack, \
+                     initialized, nor a constructor parameter, so it has no \
+                     deploy-time slot. Refusing to emit a placeholder for an \
+                     unrelated constructor argument (slot 0). Known \
+                     constructor-param properties: [{}].",
+                    prop_name,
+                    loc,
+                    ctor_props.join(", ")
+                );
+            }
+        }
     }
 
     fn push_json_value(&mut self, val: &serde_json::Value) {
@@ -903,14 +1271,14 @@ impl LoweringContext {
             }
             serde_json::Value::Number(n) => {
                 let i = n.as_i64().map(|v| v as i128).unwrap_or(0);
-                self.emit_op(StackOp::Push(PushValue::Int(i)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(i))));
             }
             serde_json::Value::String(s) => {
                 let bytes = hex_to_bytes(s);
                 self.emit_op(StackOp::Push(PushValue::Bytes(bytes)));
             }
             _ => {
-                self.emit_op(StackOp::Push(PushValue::Int(0)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
             }
         }
     }
@@ -923,6 +1291,16 @@ impl LoweringContext {
         if let Some(ConstValue::Str(ref s)) = value.const_value() {
             if s.len() > 5 && &s[..5] == "@ref:" {
                 let ref_name = &s[5..];
+                // Special case: aliasing an array_literal (metadata-only
+                // binding, not present in the stack-map). Copy the array
+                // metadata under the new binding name and emit no stack moves.
+                if let Some(refs) = self.array_elements.get(ref_name).cloned() {
+                    self.array_elements.insert(binding_name.to_string(), refs);
+                    if let Some(len) = self.array_lengths.get(ref_name).copied() {
+                        self.array_lengths.insert(binding_name.to_string(), len);
+                    }
+                    return;
+                }
                 if self.sm.has(ref_name) {
                     // Only consume (ROLL) if the ref target is a local binding in the
                     // current scope. Outer-scope refs must be copied (PICK) so that the
@@ -934,34 +1312,47 @@ impl LoweringContext {
                     self.sm.pop();
                     self.sm.push(binding_name);
                 } else {
-                    // Referenced value not on stack -- push a placeholder
-                    self.emit_op(StackOp::Push(PushValue::Int(0)));
-                    self.sm.push(binding_name);
+                    // Referenced value no longer on the stack — a compiler
+                    // invariant violation (see lower_load_param for the loop-
+                    // consumption history). Fail loudly instead of silently
+                    // emitting OP_0.
+                    panic!(
+                        "Stack lowering: value '{}' referenced by '{}' is not on the \
+                         stack (stack: [{}]). Refusing to emit a silent OP_0 placeholder.",
+                        ref_name,
+                        binding_name,
+                        self.sm.debug_slots()
+                    );
                 }
                 return;
             }
             // Handle @this marker -- compile-time concept, not a runtime value
             if s == "@this" {
-                self.emit_op(StackOp::Push(PushValue::Int(0)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
                 self.sm.push(binding_name);
                 return;
             }
         }
 
-        match value.const_value() {
+        let cv = value.const_value();
+        match &cv {
             Some(ConstValue::Bool(b)) => {
-                self.emit_op(StackOp::Push(PushValue::Bool(b)));
+                self.emit_op(StackOp::Push(PushValue::Bool(*b)));
             }
             Some(ConstValue::Int(n)) => {
-                self.emit_op(StackOp::Push(PushValue::Int(n)));
+                self.emit_op(StackOp::Push(PushValue::Int(n.clone())));
             }
             Some(ConstValue::Str(s)) => {
-                let bytes = hex_to_bytes(&s);
+                let bytes = hex_to_bytes(s);
                 self.emit_op(StackOp::Push(PushValue::Bytes(bytes)));
             }
             None => {
-                self.emit_op(StackOp::Push(PushValue::Int(0)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
             }
+        }
+        // Track constant values for compile-time extraction (e.g., Merkle depth)
+        if let Some(c) = cv {
+            self.const_values.insert(binding_name.to_string(), c);
         }
         self.sm.push(binding_name);
     }
@@ -976,11 +1367,11 @@ impl LoweringContext {
         last_uses: &HashMap<String, usize>,
         result_type: Option<&str>,
     ) {
-        let left_is_last = self.is_last_use(left, binding_index, last_uses);
-        self.bring_to_top(left, left_is_last);
+        let left_consume = self.operand_consume(left, &[left, right], binding_index, last_uses);
+        self.bring_to_top(left, left_consume);
 
-        let right_is_last = self.is_last_use(right, binding_index, last_uses);
-        self.bring_to_top(right, right_is_last);
+        let right_consume = self.operand_consume(right, &[left, right], binding_index, last_uses);
+        self.bring_to_top(right, right_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -1130,6 +1521,36 @@ impl LoweringContext {
             return;
         }
 
+        if is_nist_ec_builtin(func_name) {
+            self.lower_nist_ec_builtin(binding_name, func_name, args, binding_index, last_uses);
+            return;
+        }
+
+        if func_name == "verifyECDSA_P256" || func_name == "verifyECDSA_P384" {
+            self.lower_verify_ecdsa(binding_name, func_name, args, binding_index, last_uses);
+            return;
+        }
+
+        if is_bb_builtin(func_name) {
+            self.lower_bb_field_builtin(binding_name, func_name, args, binding_index, last_uses);
+            return;
+        }
+
+        if is_kb_builtin(func_name) {
+            self.lower_kb_field_builtin(binding_name, func_name, args, binding_index, last_uses);
+            return;
+        }
+
+        if is_bn254_builtin(func_name) {
+            self.lower_bn254_builtin(binding_name, func_name, args, binding_index, last_uses);
+            return;
+        }
+
+        if is_merkle_builtin(func_name) {
+            self.lower_merkle_root(binding_name, func_name, args, binding_index, last_uses);
+            return;
+        }
+
         if func_name == "safediv" {
             self.lower_safediv(binding_name, args, binding_index, last_uses);
             return;
@@ -1235,8 +1656,8 @@ impl LoweringContext {
 
         // General builtin: push args in order, then emit opcodes
         for arg in args {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
 
         for _ in args {
@@ -1249,7 +1670,7 @@ impl LoweringContext {
             }
         } else {
             // Unknown function -- push a placeholder
-            self.emit_op(StackOp::Push(PushValue::Int(0)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
             self.sm.push(binding_name);
             return;
         }
@@ -1258,8 +1679,10 @@ impl LoweringContext {
             self.sm.push("");
             self.sm.push(binding_name);
         } else if func_name == "len" {
-            self.sm.push("");
-            self.sm.push(binding_name);
+            // OP_SIZE leaves original on stack and pushes length on top.
+            // Emit OP_NIP to remove the original value, keeping only the size.
+            self.emit_op(StackOp::Opcode("OP_NIP".to_string()));
+            self.sm.push(binding_name); // size only
         } else {
             self.sm.push(binding_name);
         }
@@ -1318,8 +1741,8 @@ impl LoweringContext {
         // Bind call arguments to private method params.
         for (i, arg) in args.iter().enumerate() {
             if i < method.params.len() {
-                let is_last = self.is_last_use(arg, binding_index, last_uses);
-                self.bring_to_top(arg, is_last);
+                let consume = self.operand_consume(arg, args, binding_index, last_uses);
+                self.bring_to_top(arg, consume);
                 self.sm.pop();
 
                 let param_name = &method.params[i].name;
@@ -1395,6 +1818,8 @@ impl LoweringContext {
         then_ctx.inside_branch = true;
         then_ctx.lower_bindings(then_bindings, terminal_assert);
 
+        then_ctx.drain_branch_private_residue(&pre_if_names);
+
         if terminal_assert && then_ctx.sm.depth() > 1 {
             let excess = then_ctx.sm.depth() - 1;
             for _ in 0..excess {
@@ -1409,6 +1834,8 @@ impl LoweringContext {
         else_ctx.outer_protected_refs = Some(protected_refs);
         else_ctx.inside_branch = true;
         else_ctx.lower_bindings(else_bindings, terminal_assert);
+
+        else_ctx.drain_branch_private_residue(&pre_if_names);
 
         if terminal_assert && else_ctx.sm.depth() > 1 {
             let excess = else_ctx.sm.depth() - 1;
@@ -1461,7 +1888,7 @@ impl LoweringContext {
                     else_ctx.emit_op(StackOp::Nip);
                     else_ctx.sm.remove_at_depth(1);
                 } else {
-                    else_ctx.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
+                    else_ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
                     else_ctx.sm.push("");
                     else_ctx.emit_op(StackOp::Roll { depth });
                     else_ctx.sm.pop();
@@ -1486,7 +1913,7 @@ impl LoweringContext {
                     then_ctx.emit_op(StackOp::Nip);
                     then_ctx.sm.remove_at_depth(1);
                 } else {
-                    then_ctx.emit_op(StackOp::Push(PushValue::Int(depth as i128)));
+                    then_ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(depth as i128))));
                     then_ctx.sm.push("");
                     then_ctx.emit_op(StackOp::Roll { depth });
                     then_ctx.sm.pop();
@@ -1498,31 +1925,51 @@ impl LoweringContext {
             }
         }
 
-        // Phase 3: single depth-balance check after ALL drops.
-        // Push placeholder only if one branch is still deeper than the other.
-        if then_ctx.sm.depth() > else_ctx.sm.depth() {
-            // When the then-branch reassigned a local variable (if-without-else),
-            // push a COPY of that variable in the else-branch instead of a generic
-            // placeholder.
-            let then_top_p3 = then_ctx.sm.peek_at_depth(0).to_string();
-            if else_bindings.is_empty() && !then_top_p3.is_empty() && else_ctx.sm.has(&then_top_p3) {
-                let var_depth = else_ctx.sm.find_depth(&then_top_p3).unwrap();
+        // Phase 3: depth-balance reconciliation after ALL drops.
+        //
+        // Compensate the FULL depth difference between the branches — NOT just a
+        // single item. A conditional write of N state fields leaves N result
+        // values on the then-branch, so the (empty) else-branch must preserve N
+        // old values. Issue #99 Bug 1: the previous single-shot check only
+        // balanced a 1-item difference, leaving N>=2 conditional writes
+        // imbalanced by (N-1) and the update branch unspendable.
+        while then_ctx.sm.depth() > else_ctx.sm.depth() {
+            let result_depth = then_ctx.sm.depth() - else_ctx.sm.depth() - 1;
+            let then_name = then_ctx.sm.peek_at_depth(result_depth).to_string();
+            if else_bindings.is_empty() && !then_name.is_empty() && else_ctx.sm.has(&then_name) {
+                let var_depth = else_ctx.sm.find_depth(&then_name).unwrap();
                 if var_depth == 0 {
                     else_ctx.emit_op(StackOp::Dup);
                 } else {
-                    else_ctx.emit_op(StackOp::Push(PushValue::Int(var_depth as i128)));
+                    else_ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(var_depth as i128))));
                     else_ctx.sm.push("");
                     else_ctx.emit_op(StackOp::Pick { depth: var_depth });
                     else_ctx.sm.pop();
                 }
-                else_ctx.sm.push(&then_top_p3);
+                else_ctx.sm.push(&then_name);
             } else {
                 else_ctx.emit_op(StackOp::Push(PushValue::Bytes(Vec::new())));
                 else_ctx.sm.push("");
             }
-        } else if else_ctx.sm.depth() > then_ctx.sm.depth() {
+        }
+        while else_ctx.sm.depth() > then_ctx.sm.depth() {
             then_ctx.emit_op(StackOp::Push(PushValue::Bytes(Vec::new())));
             then_ctx.sm.push("");
+        }
+
+        // Layer B — branch-balance invariant (#99 Bug 1 guard). After
+        // reconciliation the two arms of an OP_IF/OP_ELSE MUST leave the stack
+        // at identical depth; otherwise the post-ENDIF code (generated against a
+        // single assumed depth) is only correct for the branch the spender does
+        // not take, producing a silently-unspendable script. The VM does not
+        // enforce branch balance, so this is the compiler's responsibility.
+        if then_ctx.sm.depth() != else_ctx.sm.depth() {
+            panic!(
+                "internal codegen error: conditional emitted stack-imbalanced branches (then depth {} != else depth {}); would produce an unspendable script (see GitHub issue #99); binding={:?}",
+                then_ctx.sm.depth(),
+                else_ctx.sm.depth(),
+                binding_name
+            );
         }
 
         let then_ops = then_ctx.ops;
@@ -1548,7 +1995,46 @@ impl LoweringContext {
         }
 
         // The if expression may produce a result value on top.
-        if then_ctx.sm.depth() > self.sm.depth() {
+        if else_bindings.is_empty()
+            && then_ctx.sm.depth() > self.sm.depth()
+            && then_ctx.sm.depth() - self.sm.depth() >= 2
+        {
+            // #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+            // values on top (new values if taken, preserved old values if
+            // skipped). Record the N results in their on-stack order, then
+            // physically remove the N stale old property values beneath them.
+            let result_count = then_ctx.sm.depth() - self.sm.depth();
+            for i in (0..result_count).rev() {
+                let mut name = then_ctx.sm.peek_at_depth(i).to_string();
+                if name.is_empty() {
+                    name = binding_name.to_string();
+                }
+                self.sm.push(&name);
+            }
+            let result_names: Vec<String> = (0..result_count)
+                .map(|i| self.sm.peek_at_depth(i).to_string())
+                .collect();
+            for name in &result_names {
+                if name.is_empty() {
+                    continue;
+                }
+                let mut d = result_count;
+                while d < self.sm.depth() {
+                    if self.sm.peek_at_depth(d) == name.as_str() {
+                        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(d as i128))));
+                        self.sm.push("");
+                        self.emit_op(StackOp::Roll { depth: d + 1 });
+                        self.sm.pop();
+                        let rolled = self.sm.remove_at_depth(d);
+                        self.sm.push(&rolled);
+                        self.emit_op(StackOp::Drop);
+                        self.sm.pop();
+                        break;
+                    }
+                    d += 1;
+                }
+            }
+        } else if then_ctx.sm.depth() > self.sm.depth() {
             let then_top = then_ctx.sm.peek_at_depth(0).to_string();
             let else_top = if else_ctx.sm.depth() > 0 {
                 else_ctx.sm.peek_at_depth(0).to_string()
@@ -1567,7 +2053,7 @@ impl LoweringContext {
                             self.emit_op(StackOp::Nip);
                             self.sm.remove_at_depth(1);
                         } else {
-                            self.emit_op(StackOp::Push(PushValue::Int(d as i128)));
+                            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(d as i128))));
                             self.sm.push("");
                             self.emit_op(StackOp::Roll { depth: d + 1 });
                             self.sm.pop();
@@ -1592,7 +2078,7 @@ impl LoweringContext {
                             self.emit_op(StackOp::Nip);
                             self.sm.remove_at_depth(1);
                         } else {
-                            self.emit_op(StackOp::Push(PushValue::Int(d as i128)));
+                            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(d as i128))));
                             self.sm.push("");
                             self.emit_op(StackOp::Roll { depth: d + 1 });
                             self.sm.pop();
@@ -1628,26 +2114,38 @@ impl LoweringContext {
         count: usize,
         body: &[ANFBinding],
         iter_var: &str,
+        start: &serde_json::Value,
+        step: i64,
+        loop_binding_index: Option<usize>,
+        enclosing_last_uses: Option<&HashMap<String, usize>>,
     ) {
-        // Collect outer-scope names referenced in the loop body.
-        // These must not be consumed in non-final iterations.
+        // Iteration `i` binds `iterVar = start + i*step` (issue #121).
+        // Zero-start counting-up loops (start=0, step=1) reduce to `BigInt(i)`,
+        // preserving the historical byte-for-byte lowering.
+        let start_bigint = match crate::ir::parse_const_value(start) {
+            Some(ConstValue::Int(n)) => n,
+            _ => BigInt::from(0),
+        };
+        let step_bigint = BigInt::from(step);
+        // Names (re)defined anywhere inside the loop body, nested branches
+        // included. A name the body itself binds is NOT an outer ref —
+        // reassigned locals (e.g. `off = off + ...` inside an if) flow through
+        // lower_if's branch-reassignment reconciliation, not through protection
+        // here.
+        let deep_body_binding_names = collect_deep_binding_names(body);
         let body_binding_names: HashSet<String> = body.iter().map(|b| b.name.clone()).collect();
+
+        // Collect ALL outer-scope refs used anywhere in the body — including
+        // refs that only occur inside nested if-branches (collect_refs recurses).
+        // The previous top-level-only scan missed nested references: a const
+        // defined before the loop and referenced only inside an if-branch was
+        // consumed by the first iteration, making iteration 2 fail with
+        // "value 'X' not found on stack".
         let mut outer_refs = HashSet::new();
         for b in body {
-            if let ANFValue::LoadParam { name } = &b.value {
-                if name != iter_var {
-                    outer_refs.insert(name.clone());
-                }
-            }
-            // Also protect @ref: targets from outer scope (not redefined in body)
-            if let ANFValue::LoadConst { value: v } = &b.value {
-                if let Some(s) = v.as_str() {
-                    if s.len() > 5 && &s[..5] == "@ref:" {
-                        let ref_name = &s[5..];
-                        if !body_binding_names.contains(ref_name) {
-                            outer_refs.insert(ref_name.to_string());
-                        }
-                    }
+            for r in collect_refs(&b.value) {
+                if r.as_str() != iter_var && !deep_body_binding_names.contains(&r) {
+                    outer_refs.insert(r);
                 }
             }
         }
@@ -1658,15 +2156,30 @@ impl LoweringContext {
         self.local_bindings = self.local_bindings.union(&body_binding_names).cloned().collect();
 
         for i in 0..count {
-            self.emit_op(StackOp::Push(PushValue::Int(i as i128)));
+            // Push the iteration variable value: start + i*step (issue #121).
+            let iter_val = &start_bigint + BigInt::from(i as i128) * &step_bigint;
+            self.emit_op(StackOp::Push(PushValue::Int(iter_val)));
             self.sm.push(iter_var);
 
             let mut last_uses = compute_last_uses(body);
 
-            // In non-final iterations, prevent outer-scope refs from being
-            // consumed by setting their last-use beyond any body binding index.
-            if i < count - 1 {
-                for ref_name in &outer_refs {
+            // Prevent outer-scope refs from being consumed by setting their
+            // last-use beyond any body binding index:
+            //  - in non-final iterations: always (the next iteration re-reads them);
+            //  - in the FINAL iteration: when the enclosing scope still references
+            //    them AFTER the loop. Previously the final iteration consumed
+            //    every outer ref at its last body use, so a method param (or
+            //    const) referenced after the loop was gone from the stack and was
+            //    silently lowered to an OP_0/empty push — compilation succeeded,
+            //    the env-based interpreter passed, but the emitted Script failed
+            //    at runtime (silent interpreter <-> Script divergence).
+            let is_final_iteration = i == count - 1;
+            for ref_name in &outer_refs {
+                let used_after_loop = match (loop_binding_index, enclosing_last_uses) {
+                    (Some(idx), Some(elu)) => elu.get(ref_name).map_or(false, |&lu| lu > idx),
+                    _ => false,
+                };
+                if !is_final_iteration || used_after_loop {
                     last_uses.insert(ref_name.clone(), body.len());
                 }
             }
@@ -1736,7 +2249,7 @@ impl LoweringContext {
                         self.emit_op(StackOp::Nip);
                         self.sm.remove_at_depth(1);
                     } else {
-                        self.emit_op(StackOp::Push(PushValue::Int(d as i128)));
+                        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(d as i128))));
                         self.sm.push("");
                         self.emit_op(StackOp::Roll { depth: d + 1 });
                         self.sm.pop();
@@ -1775,18 +2288,18 @@ impl LoweringContext {
                 self.push_json_value(val);
                 self.sm.push("");
             } else {
-                self.emit_op(StackOp::Push(PushValue::Int(0)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
                 self.sm.push("");
             }
 
             // Convert numeric/boolean values to fixed-width bytes via OP_NUM2BIN
             if prop.prop_type == "bigint" {
-                self.emit_op(StackOp::Push(PushValue::Int(8)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
                 self.sm.pop(); // pop the width
             } else if prop.prop_type == "boolean" {
-                self.emit_op(StackOp::Push(PushValue::Int(1)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
                 self.sm.pop(); // pop the width
@@ -1824,17 +2337,19 @@ impl LoweringContext {
         let state_bytes_ref = &args[1];
 
         // Bring stateBytes to stack first.
-        let sb_last = self.is_last_use(state_bytes_ref, binding_index, last_uses);
-        self.bring_to_top(state_bytes_ref, sb_last);
+        let sb_consume =
+            self.operand_consume(state_bytes_ref, &[preimage_ref, state_bytes_ref], binding_index, last_uses);
+        self.bring_to_top(state_bytes_ref, sb_consume);
 
         // Extract amount from preimage for the continuation output.
-        let pre_last = self.is_last_use(preimage_ref, binding_index, last_uses);
-        self.bring_to_top(preimage_ref, pre_last);
+        let pre_consume =
+            self.operand_consume(preimage_ref, &[preimage_ref, state_bytes_ref], binding_index, last_uses);
+        self.bring_to_top(preimage_ref, pre_consume);
 
         // Extract amount: last 52 bytes, take 8 bytes at offset 0.
         self.emit_op(StackOp::Opcode("OP_SIZE".into()));
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(52))); // 8 (amount) + 44 (tail)
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(52)))); // 8 (amount) + 44 (tail)
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SUB".into()));
         self.sm.pop();
@@ -1849,7 +2364,7 @@ impl LoweringContext {
         self.sm.pop();
         self.sm.pop();
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".into())); // [amount(8), tail(44)]
         self.sm.pop();
@@ -1930,16 +2445,18 @@ impl LoweringContext {
         let state_bytes_ref = &args[1];
         let new_amount_ref = &args[2];
 
+        let cso_operands = [preimage_ref, state_bytes_ref, new_amount_ref];
+
         // Consume preimage ref (no longer needed — we use _codePart and _newAmount).
-        let pre_last = self.is_last_use(preimage_ref, binding_index, last_uses);
-        self.bring_to_top(preimage_ref, pre_last);
+        let pre_consume = self.operand_consume(preimage_ref, &cso_operands, binding_index, last_uses);
+        self.bring_to_top(preimage_ref, pre_consume);
         self.emit_op(StackOp::Drop);
         self.sm.pop();
 
         // Step 1: Convert _newAmount to 8-byte LE and save to altstack.
-        let amount_last = self.is_last_use(new_amount_ref, binding_index, last_uses);
-        self.bring_to_top(new_amount_ref, amount_last);
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        let amount_consume = self.operand_consume(new_amount_ref, &cso_operands, binding_index, last_uses);
+        self.bring_to_top(new_amount_ref, amount_consume);
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
         self.sm.pop();
@@ -1949,8 +2466,8 @@ impl LoweringContext {
         self.sm.pop();
 
         // Step 2: Bring stateBytes to stack.
-        let sb_last = self.is_last_use(state_bytes_ref, binding_index, last_uses);
-        self.bring_to_top(state_bytes_ref, sb_last);
+        let sb_consume = self.operand_consume(state_bytes_ref, &cso_operands, binding_index, last_uses);
+        self.bring_to_top(state_bytes_ref, sb_consume);
 
         // Step 3: Bring _codePart to top (PICK — never consume, reused across outputs)
         self.bring_to_top("_codePart", false);
@@ -2021,8 +2538,8 @@ impl LoweringContext {
         self.sm.push("");
 
         // Push the 20-byte PKH
-        let pkh_last = self.is_last_use(pkh_ref, binding_index, last_uses);
-        self.bring_to_top(pkh_ref, pkh_last);
+        let pkh_consume = self.operand_consume(pkh_ref, &[pkh_ref, amount_ref], binding_index, last_uses);
+        self.bring_to_top(pkh_ref, pkh_consume);
         // CAT: prefix || pkh
         self.emit_op(StackOp::Opcode("OP_CAT".into()));
         self.sm.pop();
@@ -2040,9 +2557,9 @@ impl LoweringContext {
         // --- Stack: [..., 0x1976a914{pkh}88ac] ---
 
         // Step 2: Prepend amount as 8-byte LE.
-        let amount_last = self.is_last_use(amount_ref, binding_index, last_uses);
-        self.bring_to_top(amount_ref, amount_last);
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        let amount_consume = self.operand_consume(amount_ref, &[pkh_ref, amount_ref], binding_index, last_uses);
+        self.bring_to_top(amount_ref, amount_consume);
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
         self.sm.pop(); // pop width
@@ -2081,6 +2598,9 @@ impl LoweringContext {
             .filter(|p| !p.readonly)
             .cloned()
             .collect();
+        let output_operands: Vec<&str> = std::iter::once(satoshis)
+            .chain(state_values.iter().map(|s| s.as_str()))
+            .collect();
 
         // Step 1: Bring _codePart to top (PICK — never consume, reused across outputs)
         self.bring_to_top("_codePart", false);
@@ -2102,16 +2622,16 @@ impl LoweringContext {
             }
             let prop = &state_props[i];
 
-            let is_last = self.is_last_use(value_ref, binding_index, last_uses);
-            self.bring_to_top(value_ref, is_last);
+            let consume = self.operand_consume(value_ref, &output_operands, binding_index, last_uses);
+            self.bring_to_top(value_ref, consume);
 
             if prop.prop_type == "bigint" {
-                self.emit_op(StackOp::Push(PushValue::Int(8)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
                 self.sm.pop();
             } else if prop.prop_type == "boolean" {
-                self.emit_op(StackOp::Push(PushValue::Int(1)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
                 self.sm.pop();
@@ -2143,9 +2663,9 @@ impl LoweringContext {
         // --- Stack: [..., varint+script] ---
 
         // Step 6: Prepend satoshis as 8-byte LE.
-        let is_last_satoshis = self.is_last_use(satoshis, binding_index, last_uses);
-        self.bring_to_top(satoshis, is_last_satoshis);
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        let satoshis_consume = self.operand_consume(satoshis, &output_operands, binding_index, last_uses);
+        self.bring_to_top(satoshis, satoshis_consume);
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
         self.sm.pop(); // pop the width
@@ -2176,8 +2696,9 @@ impl LoweringContext {
         last_uses: &HashMap<String, usize>,
     ) {
         // Step 1: Bring scriptBytes to top
-        let script_is_last = self.is_last_use(script_bytes, binding_index, last_uses);
-        self.bring_to_top(script_bytes, script_is_last);
+        let script_consume =
+            self.operand_consume(script_bytes, &[satoshis, script_bytes], binding_index, last_uses);
+        self.bring_to_top(script_bytes, script_consume);
 
         // Step 2: Compute varint prefix for script length
         self.emit_op(StackOp::Opcode("OP_SIZE".to_string())); // [script, len]
@@ -2194,9 +2715,10 @@ impl LoweringContext {
         self.sm.push("");
 
         // Step 4: Prepend satoshis as 8-byte LE
-        let sat_is_last = self.is_last_use(satoshis, binding_index, last_uses);
-        self.bring_to_top(satoshis, sat_is_last);
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        let sat_consume =
+            self.operand_consume(satoshis, &[satoshis, script_bytes], binding_index, last_uses);
+        self.bring_to_top(satoshis, sat_consume);
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_NUM2BIN".to_string()));
         self.sm.pop(); // pop width
@@ -2218,23 +2740,64 @@ impl LoweringContext {
         &mut self,
         binding_name: &str,
         elements: &[String],
-        binding_index: usize,
-        last_uses: &HashMap<String, usize>,
+        _binding_index: usize,
+        _last_uses: &HashMap<String, usize>,
     ) {
-        // An array_literal brings each element to the top of the stack.
-        // The elements remain as individual stack entries; the binding name tracks
-        // the last element so that callers (e.g. checkMultiSig) can find them.
-        for elem in elements {
-            let is_last = self.is_last_use(elem, binding_index, last_uses);
-            self.bring_to_top(elem, is_last);
-            self.sm.pop();
-            self.sm.push(""); // anonymous stack entry for intermediate elements
+        // Metadata-only. Array literals in Rúnar today only feed into
+        // checkMultiSig. Pre-laying the elements onto the runtime stack here
+        // would desync the stack-map from the runtime stack (the map can only
+        // model one slot per binding, but an array binding spans N runtime
+        // slots). lower_check_multi_sig pulls each element to TOS at the use site.
+        self.array_lengths
+            .insert(binding_name.to_string(), elements.len());
+        self.array_elements
+            .insert(binding_name.to_string(), elements.to_vec());
+    }
+
+    /// Lower a `raw_script` ANF node to a single opaque `raw_bytes` StackOp.
+    ///
+    /// The bytes pass through verbatim — the emit pass writes them as-is, and
+    /// the peephole optimizer must not bridge across them. Stack-tracker
+    /// bookkeeping consumes `in_arity` items and pushes `out_arity` items named
+    /// after the binding so downstream PICK/ROLL/DROP refer to the correct
+    /// logical slot.
+    fn lower_raw_script(
+        &mut self,
+        binding_name: &str,
+        bytes_hex: &str,
+        in_arity: usize,
+        out_arity: usize,
+    ) {
+        if self.sm.depth() < in_arity {
+            panic!(
+                "raw_script binding '{}' requires {} stack items but only {} are present",
+                binding_name,
+                in_arity,
+                self.sm.depth()
+            );
         }
-        // Rename the topmost entry to the binding name
-        if !elements.is_empty() {
+        let bytes = hex::decode(bytes_hex).unwrap_or_else(|e| {
+            panic!(
+                "raw_script binding '{}' has invalid hex bytes: {}",
+                binding_name, e
+            )
+        });
+        self.emit_op(StackOp::RawBytes {
+            bytes,
+            in_arity,
+            out_arity,
+        });
+        for _ in 0..in_arity {
             self.sm.pop();
         }
-        self.sm.push(binding_name);
+        for i in 0..out_arity {
+            let slot_name = if out_arity != 1 {
+                format!("{}.{}", binding_name, i)
+            } else {
+                binding_name.to_string()
+            };
+            self.sm.push(&slot_name);
+        }
         self.track_depth();
     }
 
@@ -2245,29 +2808,66 @@ impl LoweringContext {
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
-        // checkMultiSig(sigs, pks) — emits the OP_CHECKMULTISIG sequence.
-        // Bitcoin Script stack layout:
-        //   OP_0 <sig1> ... <sigN> <nSigs> <pk1> ... <pkM> <nPKs> OP_CHECKMULTISIG
+        // Lower checkMultiSig([sig1..sigN], [pk1..pkM]).
         //
-        // The two args reference array_literal bindings whose individual elements
-        // are already on the stack.
+        // OP_CHECKMULTISIG expects the stack (bottom -> top):
+        //   <dummy=OP_0> <sig1> ... <sigN> <N> <pk1> ... <pkM> <M>
+        //
+        // args[0] and args[1] are bindings produced by array_literal. Those
+        // bindings are NOT physical stack slots — their element refs live on
+        // the stack-map as individual named bindings. We pull each element to
+        // TOS via bring_to_top. compute_last_uses propagates each element's
+        // last-use through the array indirection to THIS binding.
+        let sigs_ref = &args[0];
+        let pks_ref = &args[1];
+        let sig_elems = self
+            .array_elements
+            .get(sigs_ref)
+            .cloned()
+            .unwrap_or_else(|| panic!("checkMultiSig: array_literal metadata missing for sigs={}", sigs_ref));
+        let pk_elems = self
+            .array_elements
+            .get(pks_ref)
+            .cloned()
+            .unwrap_or_else(|| panic!("checkMultiSig: array_literal metadata missing for pks={}", pks_ref));
 
-        // Push OP_0 dummy (Bitcoin CHECKMULTISIG off-by-one bug workaround)
-        self.emit_op(StackOp::Push(PushValue::Int(0)));
+        // Dummy OP_0 (historical CHECKMULTISIG off-by-one).
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
         self.sm.push("");
 
-        // Bring sigs array ref to top
-        let sigs_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], sigs_is_last);
+        // A ref repeated across the combined element list (e.g. the same
+        // pubkey twice) must be copied at every position — see operand_consume.
+        let msig_operands: Vec<&str> = sig_elems
+            .iter()
+            .map(|s| s.as_str())
+            .chain(pk_elems.iter().map(|s| s.as_str()))
+            .collect();
 
-        // Bring pks array ref to top
-        let pks_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], pks_is_last);
+        // Bring each sig element to TOS in declaration order.
+        for sig in &sig_elems {
+            let consume = self.operand_consume(sig, &msig_operands, binding_index, last_uses);
+            self.bring_to_top(sig, consume);
+        }
 
-        // Pop all args + dummy
-        self.sm.pop(); // pks
-        self.sm.pop(); // sigs
-        self.sm.pop(); // OP_0 dummy
+        // Push nSigs.
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(sig_elems.len()))));
+        self.sm.push("");
+
+        // Bring each pubkey element to TOS in declaration order.
+        for pk in &pk_elems {
+            let consume = self.operand_consume(pk, &msig_operands, binding_index, last_uses);
+            self.bring_to_top(pk, consume);
+        }
+
+        // Push nPKs.
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(pk_elems.len()))));
+        self.sm.push("");
+
+        // OP_CHECKMULTISIG consumes: dummy + N sigs + nSigs + M pks + nPKs.
+        let consumed = 1 + sig_elems.len() + 1 + pk_elems.len() + 1;
+        for _ in 0..consumed {
+            self.sm.pop();
+        }
 
         self.emit_op(StackOp::Opcode("OP_CHECKMULTISIG".to_string()));
         self.sm.push(binding_name);
@@ -2278,80 +2878,51 @@ impl LoweringContext {
         &mut self,
         binding_name: &str,
         preimage: &str,
+        sighash_flag: Option<i64>,
         binding_index: usize,
         last_uses: &HashMap<String, usize>,
     ) {
-        // OP_PUSH_TX: verify the sighash preimage matches the current spending
-        // transaction.  See https://wiki.bitcoinsv.io/index.php/OP_PUSH_TX
-        //
-        // The technique uses a well-known ECDSA keypair where private key = 1
-        // (so the public key is the secp256k1 generator point G, compressed:
-        //   0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798).
-        //
-        // At spending time the SDK must:
-        //   1. Serialise the BIP-143 sighash preimage for the current input.
-        //   2. Compute sighash = SHA256(SHA256(preimage)).
-        //   3. Derive an ECDSA signature (r, s) with privkey = 1:
-        //        r = Gx  (x-coordinate of the generator point, constant)
-        //        s = (sighash + r) mod n
-        //   4. DER-encode (r, s) and append the SIGHASH_ALL|FORKID byte (0x41).
-        //   5. Push <sig> <preimage> (plus any other method args) as the
-        //      unlocking script.
-        //
-        // The locking script sequence:
-        //   [bring preimage to top]     -- via PICK or ROLL
-        //   [bring _opPushTxSig to top] -- via ROLL (consuming)
-        //   <G>                         -- push compressed generator point
-        //   OP_CHECKSIG                 -- verify sig over SHA256(SHA256(preimage))
-        //   OP_VERIFY                   -- abort if invalid
-        //   -- preimage remains on stack for field extractors
-        //
-        // Stack map trace:
-        //   After bring_to_top(preimage):  [..., preimage]
-        //   After bring_to_top(sig, true): [..., preimage, _opPushTxSig]
-        //   After push G:                  [..., preimage, _opPushTxSig, null(G)]
-        //   After OP_CHECKSIG:             [..., preimage, null(result)]
-        //   After OP_VERIFY:               [..., preimage]
+        // OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
+        // current spending transaction. The signature is DERIVED FROM THE PREIMAGE
+        // ON CHAIN (Optimal OP_PUSH_TX): s = (hash256(preimage) + r)*k⁻¹ mod n, with
+        // fixed nonce k and privkey d=1 (pubkey = G). OP_CHECKSIG(sig, G) then passes
+        // iff hash256(preimage) equals the node's real tx sighash — closing BUG-100.
+        // The unlocking script pushes ONLY <preimage> (no witness signature).
+        // See emit_check_preimage_binding (oppushtx.rs) for the construction.
 
-        // Step 0: Emit OP_CODESEPARATOR so that the scriptCode in the BIP-143
-        // preimage is only the code after this point. This reduces preimage size
-        // for large scripts and is required for scripts > ~32KB.
+        // Emit OP_CODESEPARATOR so the scriptCode in the BIP-143 preimage is only
+        // the code after this point (smaller preimage; required for large scripts).
         self.emit_op(StackOp::Opcode("OP_CODESEPARATOR".to_string()));
 
-        // Step 1: Bring preimage to top.
+        // Bring the preimage to the top (kept for field extractors below).
         let is_last = self.is_last_use(preimage, binding_index, last_uses);
         self.bring_to_top(preimage, is_last);
 
-        // Step 2: Bring the implicit _opPushTxSig to top (consuming).
-        self.bring_to_top("_opPushTxSig", true);
+        // Derive + verify the signature on-chain (single opaque raw_bytes blob).
+        // For the default ALL|FORKID (sighash_flag None) the blob is
+        // byte-identical to the pinned cross-tier constant; issue #123 lets a
+        // method declare a different mode, which only changes the appended
+        // sighash flag byte. Net stack effect is zero.
+        self.emit_check_preimage_binding(sighash_flag);
 
-        // Step 3: Push compressed secp256k1 generator point G (33 bytes).
-        let g: Vec<u8> = vec![
-            0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB,
-            0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
-            0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28,
-            0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17,
-            0x98,
-        ];
-        self.emit_op(StackOp::Push(PushValue::Bytes(g)));
-        self.sm.push(""); // G on stack
-
-        // Step 4: OP_CHECKSIG -- pops pubkey (G) and sig, pushes boolean result.
-        self.emit_op(StackOp::Opcode("OP_CHECKSIG".to_string()));
-        self.sm.pop(); // G consumed
-        self.sm.pop(); // _opPushTxSig consumed
-        self.sm.push(""); // boolean result
-
-        // Step 5: OP_VERIFY -- abort if false, removes result from stack.
-        self.emit_op(StackOp::Opcode("OP_VERIFY".to_string()));
-        self.sm.pop(); // result consumed
-
-        // The preimage is now on top (from Step 1). Rename to binding name
-        // so field extractors can reference it.
+        // The preimage is now on top. Rename to binding name so field extractors
+        // can reference it.
         self.sm.pop();
         self.sm.push(binding_name);
 
         self.track_depth();
+    }
+
+    /// Emit the on-chain preimage binding as one opaque `raw_bytes` op. Net stack
+    /// effect is 0 (preimage in → preimage out), declared as in=1/out=1 so the
+    /// static analyzer keeps the depth consistent. The stack tracker is updated
+    /// by the caller (`lower_check_preimage`), mirroring the Go reference.
+    fn emit_check_preimage_binding(&mut self, sighash_flag: Option<i64>) {
+        self.emit_op(StackOp::RawBytes {
+            bytes: super::oppushtx::check_preimage_binding_bytes_with_flag(sighash_flag),
+            in_arity: 1,
+            out_arity: 1,
+        });
     }
 
     /// Lower `deserialize_state(preimage)` — extracts mutable property values
@@ -2381,12 +2952,22 @@ impl LoweringContext {
             prop_types.push(p.prop_type.clone());
             let sz: i128 = match p.prop_type.as_str() {
                 "bigint" => 8,
+                // RabinSig / RabinPubKey are bigint aliases — same 8-byte layout.
+                "RabinSig" | "RabinPubKey" => 8,
                 "boolean" => 1,
                 "PubKey" => 33,
                 "Addr" => 20,
+                // Ripemd160 is 20 bytes (same underlying type as Addr).
+                "Ripemd160" => 20,
                 "Sha256" => 32,
                 "Point" => 64,
-                "ByteString" => { has_variable_length = true; -1 },
+                // P-256 point: x[32] || y[32] = 64 bytes (same shape as Point).
+                "P256Point" => 64,
+                // P-384 point: x[48] || y[48] = 96 bytes.
+                "P384Point" => 96,
+                // ByteString-typed variable-length fields — treated the same as
+                // ByteString (push-data-prefixed in state).
+                "ByteString" | "Sig" | "SigHashPreimage" => { has_variable_length = true; -1 },
                 _ => panic!("deserialize_state: unsupported type: {}", p.prop_type),
             };
             prop_sizes.push(sz);
@@ -2400,7 +2981,7 @@ impl LoweringContext {
         self.bring_to_top(preimage_ref, is_last);
 
         // 1. Skip first 104 bytes (header), drop prefix.
-        self.emit_op(StackOp::Push(PushValue::Int(104)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(104))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
         self.sm.pop(); self.sm.pop();
@@ -2412,7 +2993,7 @@ impl LoweringContext {
         // 2. Drop tail 44 bytes.
         self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(44)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(44))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
         self.sm.pop(); self.sm.pop();
@@ -2426,7 +3007,7 @@ impl LoweringContext {
         // 3. Drop amount (last 8 bytes).
         self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
         self.sm.push("");
-        self.emit_op(StackOp::Push(PushValue::Int(8)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
         self.sm.push("");
         self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
         self.sm.pop(); self.sm.pop();
@@ -2443,7 +3024,7 @@ impl LoweringContext {
             // 4. Extract last stateLen bytes.
             self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
             self.sm.push("");
-            self.emit_op(StackOp::Push(PushValue::Int(state_len)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(state_len))));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
             self.sm.pop(); self.sm.pop();
@@ -2463,47 +3044,113 @@ impl LoweringContext {
             self.sm.pop();
         } else {
             // Variable-length path: strip varint, use _codePart to find state
-            self.emit_op(StackOp::Push(PushValue::Int(1)));
+            // Strip varint prefix from varint+scriptCode.
+            //
+            // BIP-143 scriptCode is prefixed by a Bitcoin varint:
+            //   length < 0xfd:        1 byte (length itself)
+            //   length <= 0xffff:     0xfd + 2 bytes LE                (3 bytes)
+            //   length <= 0xffffffff: 0xfe + 4 bytes LE                (5 bytes)
+            //   otherwise:            0xff + 8 bytes LE                (9 bytes)
+            //
+            // We must support all four shapes, otherwise scripts whose scriptCode
+            // exceeds 65,535 bytes (e.g. embedded BN254 verifiers) silently
+            // strip too few varint bytes and corrupt the subsequent
+            // state-extraction OP_SPLITs (this is the bug fixed here — see
+            // `integration/go/contracts/RollupBug.runar.go`).
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
             self.sm.pop(); self.sm.pop();
-            self.sm.push(""); self.sm.push("");
+            self.sm.push(""); // firstByte
+            self.sm.push(""); // rest
             self.emit_op(StackOp::Swap);
             self.sm.swap();
-            self.emit_op(StackOp::Dup);
-            self.sm.push("");
-            // Zero-pad before BIN2NUM to prevent sign-bit misinterpretation (0xfd → -125 without pad)
+            // Zero-pad firstByte before BIN2NUM so 0xfd/0xfe/0xff aren't read
+            // as negative script numbers.
             self.emit_op(StackOp::Push(PushValue::Bytes(vec![0])));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_CAT".into()));
             self.sm.pop(); self.sm.pop();
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_BIN2NUM".into()));
-            self.emit_op(StackOp::Push(PushValue::Int(253)));
+            // Stack: [..., rest, fb_num]
+
+            // emit_drop_more_varint_bytes drops `n` additional varint bytes
+            // from the top-of-stack `rest`. Stack in: [..., rest], stack out:
+            // [..., rest_minus_n].
+            fn emit_drop_more_varint_bytes(ctx: &mut LoweringContext, n: i128) {
+                ctx.emit_op(StackOp::Push(PushValue::Int(BigInt::from(n))));
+                ctx.sm.push("");
+                ctx.emit_op(StackOp::Opcode("OP_SPLIT".into()));
+                ctx.sm.pop();
+                ctx.sm.pop();
+                ctx.sm.push("");
+                ctx.sm.push("");
+                ctx.emit_op(StackOp::Nip);
+                ctx.sm.pop();
+                ctx.sm.pop();
+                ctx.sm.push("");
+            }
+
+            // IF fb_num < 253: 1-byte varint, drop fb_num.
+            self.emit_op(StackOp::Dup);
+            let top0 = self.sm.peek_at_depth(0).to_string();
+            self.sm.push(&top0);
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(253))));
             self.sm.push("");
             self.emit_op(StackOp::Opcode("OP_LESSTHAN".into()));
             self.sm.pop(); self.sm.pop();
             self.sm.push("");
-
             self.emit_op(StackOp::Opcode("OP_IF".into()));
             self.sm.pop();
-            let sm_at_varint_if = self.sm.clone();
+            let sm_at_1_byte_if = self.sm.clone();
+            // THEN: 1-byte varint
             self.emit_op(StackOp::Drop);
             self.sm.pop();
-
             self.emit_op(StackOp::Opcode("OP_ELSE".into()));
-            self.sm = sm_at_varint_if.clone();
+            self.sm = sm_at_1_byte_if.clone();
+            // ELSE: fb_num >= 253. Check 0xfe (5-byte varint) next.
+            self.emit_op(StackOp::Dup);
+            let top1 = self.sm.peek_at_depth(0).to_string();
+            self.sm.push(&top1);
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(254))));
+            self.sm.push("");
+            self.emit_op(StackOp::Opcode("OP_NUMEQUAL".into()));
+            self.sm.pop(); self.sm.pop();
+            self.sm.push("");
+            self.emit_op(StackOp::Opcode("OP_IF".into()));
+            self.sm.pop();
+            let sm_at_fe_if = self.sm.clone();
+            // THEN: 5-byte varint (0xfe + 4 bytes LE).
             self.emit_op(StackOp::Drop);
             self.sm.pop();
-            self.emit_op(StackOp::Push(PushValue::Int(2)));
+            emit_drop_more_varint_bytes(self, 4);
+            self.emit_op(StackOp::Opcode("OP_ELSE".into()));
+            self.sm = sm_at_fe_if.clone();
+            // ELSE: fb_num != 254. Check 0xff (9-byte varint) next.
+            self.emit_op(StackOp::Dup);
+            let top2 = self.sm.peek_at_depth(0).to_string();
+            self.sm.push(&top2);
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(255))));
             self.sm.push("");
-            self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
-            self.sm.pop(); self.sm.pop();
-            self.sm.push(""); self.sm.push("");
-            self.emit_op(StackOp::Nip);
+            self.emit_op(StackOp::Opcode("OP_NUMEQUAL".into()));
             self.sm.pop(); self.sm.pop();
             self.sm.push("");
-
+            self.emit_op(StackOp::Opcode("OP_IF".into()));
+            self.sm.pop();
+            let sm_at_ff_if = self.sm.clone();
+            // THEN: 9-byte varint (0xff + 8 bytes LE).
+            self.emit_op(StackOp::Drop);
+            self.sm.pop();
+            emit_drop_more_varint_bytes(self, 8);
+            self.emit_op(StackOp::Opcode("OP_ELSE".into()));
+            self.sm = sm_at_ff_if.clone();
+            // ELSE: fb_num must be 253 (0xfd) — 3-byte varint.
+            self.emit_op(StackOp::Drop);
+            self.sm.pop();
+            emit_drop_more_varint_bytes(self, 2);
+            self.emit_op(StackOp::Opcode("OP_ENDIF".into()));
+            self.emit_op(StackOp::Opcode("OP_ENDIF".into()));
             self.emit_op(StackOp::Opcode("OP_ENDIF".into()));
 
             // Compute skip = SIZE(_codePart) - codeSepIdx
@@ -2542,7 +3189,7 @@ impl LoweringContext {
     ) {
         let num_props = prop_names.len();
         if num_props == 1 {
-            if prop_types[0] == "bigint" || prop_types[0] == "boolean" {
+            if is_numeric_state_type(&prop_types[0]) {
                 self.emit_op(StackOp::Opcode("OP_BIN2NUM".to_string()));
             }
             self.sm.pop();
@@ -2551,14 +3198,14 @@ impl LoweringContext {
             for i in 0..num_props {
                 let sz = prop_sizes[i];
                 if i < num_props - 1 {
-                    self.emit_op(StackOp::Push(PushValue::Int(sz)));
+                    self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(sz))));
                     self.sm.push("");
                     self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                     self.sm.pop(); self.sm.pop();
                     self.sm.push(""); self.sm.push("");
                     self.emit_op(StackOp::Swap);
                     self.sm.swap();
-                    if prop_types[i] == "bigint" || prop_types[i] == "boolean" {
+                    if is_numeric_state_type(&prop_types[i]) {
                         self.emit_op(StackOp::Opcode("OP_BIN2NUM".to_string()));
                     }
                     self.emit_op(StackOp::Swap);
@@ -2567,7 +3214,7 @@ impl LoweringContext {
                     self.sm.push(&prop_names[i]);
                     self.sm.push("");
                 } else {
-                    if prop_types[i] == "bigint" || prop_types[i] == "boolean" {
+                    if is_numeric_state_type(&prop_types[i]) {
                         self.emit_op(StackOp::Opcode("OP_BIN2NUM".to_string()));
                     }
                     self.sm.pop();
@@ -2585,11 +3232,11 @@ impl LoweringContext {
     ) {
         let num_props = prop_names.len();
         if num_props == 1 {
-            if prop_types[0] == "ByteString" {
-                // Single ByteString field: decode push-data prefix, drop trailing empty
+            if is_variable_length_state_type(&prop_types[0]) {
+                // Variable-length byte-string: decode push-data prefix, drop trailing empty
                 self.emit_push_data_decode(); // [..., data, remaining]
                 self.emit_op(StackOp::Drop); self.sm.pop();
-            } else if prop_types[0] == "bigint" || prop_types[0] == "boolean" {
+            } else if is_numeric_state_type(&prop_types[0]) {
                 self.emit_op(StackOp::Opcode("OP_BIN2NUM".into()));
             }
             self.sm.pop();
@@ -2597,20 +3244,20 @@ impl LoweringContext {
         } else {
             for i in 0..num_props {
                 if i < num_props - 1 {
-                    if prop_types[i] == "ByteString" {
-                        // ByteString: decode push-data prefix, extract data
+                    if is_variable_length_state_type(&prop_types[i]) {
+                        // Variable-length byte-string: decode push-data prefix, extract data
                         self.emit_push_data_decode(); // [..., data, rest]
                         self.sm.pop(); self.sm.pop();
                         self.sm.push(&prop_names[i]);
                         self.sm.push(""); // rest on top
                     } else {
-                        self.emit_op(StackOp::Push(PushValue::Int(prop_sizes[i])));
+                        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(prop_sizes[i]))));
                         self.sm.push("");
                         self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
                         self.sm.pop(); self.sm.pop();
                         self.sm.push(""); self.sm.push("");
                         self.emit_op(StackOp::Swap); self.sm.swap();
-                        if prop_types[i] == "bigint" || prop_types[i] == "boolean" {
+                        if is_numeric_state_type(&prop_types[i]) {
                             self.emit_op(StackOp::Opcode("OP_BIN2NUM".into()));
                         }
                         self.emit_op(StackOp::Swap); self.sm.swap();
@@ -2619,11 +3266,11 @@ impl LoweringContext {
                         self.sm.push("");
                     }
                 } else {
-                    if prop_types[i] == "ByteString" {
-                        // Last ByteString: decode push-data prefix, drop trailing empty
+                    if is_variable_length_state_type(&prop_types[i]) {
+                        // Last variable-length field: decode push-data prefix, drop trailing empty
                         self.emit_push_data_decode(); // [..., data, remaining]
                         self.emit_op(StackOp::Drop); self.sm.pop();
-                    } else if prop_types[i] == "bigint" || prop_types[i] == "boolean" {
+                    } else if is_numeric_state_type(&prop_types[i]) {
                         self.emit_op(StackOp::Opcode("OP_BIN2NUM".into()));
                     }
                     self.sm.pop();
@@ -2668,7 +3315,7 @@ impl LoweringContext {
         match func_name {
             "extractVersion" => {
                 // <preimage> 4 OP_SPLIT OP_DROP OP_BIN2NUM
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -2680,7 +3327,7 @@ impl LoweringContext {
             }
             "extractHashPrevouts" => {
                 // <preimage> 4 OP_SPLIT OP_NIP 32 OP_SPLIT OP_DROP
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -2690,7 +3337,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(32)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(32))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (32)
@@ -2702,7 +3349,7 @@ impl LoweringContext {
             }
             "extractHashSequence" => {
                 // <preimage> 36 OP_SPLIT OP_NIP 32 OP_SPLIT OP_DROP
-                self.emit_op(StackOp::Push(PushValue::Int(36)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(36))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -2712,7 +3359,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(32)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(32))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (32)
@@ -2724,7 +3371,7 @@ impl LoweringContext {
             }
             "extractOutpoint" => {
                 // <preimage> 68 OP_SPLIT OP_NIP 36 OP_SPLIT OP_DROP
-                self.emit_op(StackOp::Push(PushValue::Int(68)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(68))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -2734,7 +3381,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(36)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(36))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (36)
@@ -2750,7 +3397,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -2773,7 +3420,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(8)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -2788,7 +3435,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (4)
@@ -2805,7 +3452,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(40)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(40))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -2820,7 +3467,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(32)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(32))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (32)
@@ -2836,7 +3483,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(52)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(52))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -2851,7 +3498,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(8)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(8))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (8)
@@ -2868,7 +3515,7 @@ impl LoweringContext {
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(44)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(44))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -2883,7 +3530,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (4)
@@ -2897,7 +3544,7 @@ impl LoweringContext {
             "extractScriptCode" => {
                 // Variable-length field at offset 104. End-relative tail = 52 bytes.
                 // <preimage> 104 OP_SPLIT OP_NIP OP_SIZE 52 OP_SUB OP_SPLIT OP_DROP
-                self.emit_op(StackOp::Push(PushValue::Int(104)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(104))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -2909,7 +3556,7 @@ impl LoweringContext {
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SIZE".to_string()));
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(52)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(52))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SUB".to_string()));
                 self.sm.pop();
@@ -2926,7 +3573,7 @@ impl LoweringContext {
             "extractInputIndex" => {
                 // Input index = vout field of outpoint, at offset 100, 4 bytes.
                 // <preimage> 100 OP_SPLIT OP_NIP 4 OP_SPLIT OP_DROP OP_BIN2NUM
-                self.emit_op(StackOp::Push(PushValue::Int(100)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(100))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop();
@@ -2936,7 +3583,7 @@ impl LoweringContext {
                 self.sm.pop();
                 self.sm.pop();
                 self.sm.push("");
-                self.emit_op(StackOp::Push(PushValue::Int(4)));
+                self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(4))));
                 self.sm.push("");
                 self.emit_op(StackOp::Opcode("OP_SPLIT".to_string()));
                 self.sm.pop(); // pop position (4)
@@ -2982,12 +3629,12 @@ impl LoweringContext {
         let index = &args[1];
 
         // Push the data (ByteString) onto the stack
-        let obj_is_last = self.is_last_use(obj, binding_index, last_uses);
-        self.bring_to_top(obj, obj_is_last);
+        let obj_consume = self.operand_consume(obj, args, binding_index, last_uses);
+        self.bring_to_top(obj, obj_consume);
 
         // Push the index onto the stack
-        let index_is_last = self.is_last_use(index, binding_index, last_uses);
-        self.bring_to_top(index, index_is_last);
+        let index_consume = self.operand_consume(index, args, binding_index, last_uses);
+        self.bring_to_top(index, index_consume);
 
         // OP_SPLIT at index: stack = [..., left, right]
         self.sm.pop();  // index consumed
@@ -3003,7 +3650,7 @@ impl LoweringContext {
         self.sm.push(&right_part);
 
         // Push 1 for the next split (extract 1 byte)
-        self.emit_op(StackOp::Push(PushValue::Int(1)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));
         self.sm.push("");
 
         // OP_SPLIT: split off first byte: stack = [..., firstByte, rest]
@@ -3044,7 +3691,7 @@ impl LoweringContext {
         self.sm.pop();
 
         // Push empty result (OP_0), swap so data is on top
-        self.emit_op(StackOp::Push(PushValue::Int(0)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0))));
         self.emit_op(StackOp::Swap);
 
         // 520 iterations (max BSV element size)
@@ -3055,7 +3702,7 @@ impl LoweringContext {
             self.emit_op(StackOp::Nip);
             self.emit_op(StackOp::If {
                 then_ops: vec![
-                    StackOp::Push(PushValue::Int(1)),
+                    StackOp::Push(PushValue::Int(BigInt::from(1))),
                     StackOp::Opcode("OP_SPLIT".to_string()),
                     StackOp::Swap,
                     StackOp::Rot,
@@ -3086,11 +3733,11 @@ impl LoweringContext {
         let start = &args[1];
         let length = &args[2];
 
-        let data_is_last = self.is_last_use(data, binding_index, last_uses);
-        self.bring_to_top(data, data_is_last);
+        let data_consume = self.operand_consume(data, args, binding_index, last_uses);
+        self.bring_to_top(data, data_consume);
 
-        let start_is_last = self.is_last_use(start, binding_index, last_uses);
-        self.bring_to_top(start, start_is_last);
+        let start_consume = self.operand_consume(start, args, binding_index, last_uses);
+        self.bring_to_top(start, start_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -3103,8 +3750,8 @@ impl LoweringContext {
         let right_part = self.sm.pop();
         self.sm.push(&right_part);
 
-        let len_is_last = self.is_last_use(length, binding_index, last_uses);
-        self.bring_to_top(length, len_is_last);
+        let len_consume = self.operand_consume(length, args, binding_index, last_uses);
+        self.bring_to_top(length, len_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -3119,6 +3766,11 @@ impl LoweringContext {
         self.sm.push(binding_name);
         self.track_depth();
     }
+    /// Lower verifyRabinSig(msg, sig, padding, pubKey).
+    /// The 10-opcode emission delegates to `super::rabin`.
+    ///
+    /// Stack input (bottom->top): msg sig padding pubKey
+    /// Stack output:              bool
     fn lower_verify_rabin_sig(
         &mut self,
         binding_name: &str,
@@ -3128,25 +3780,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 4, "verifyRabinSig requires 4 arguments");
 
-        // Stack input: <msg> <sig> <padding> <pubKey>
-        // Computation: (sig^2 + padding) mod pubKey == SHA256(msg)
-        // Opcode sequence: OP_SWAP OP_ROT OP_DUP OP_MUL OP_ADD OP_SWAP OP_MOD OP_SWAP OP_SHA256 OP_EQUAL
-        let msg = &args[0];
-        let sig = &args[1];
-        let padding = &args[2];
-        let pub_key = &args[3];
-
-        let msg_is_last = self.is_last_use(msg, binding_index, last_uses);
-        self.bring_to_top(msg, msg_is_last);
-
-        let sig_is_last = self.is_last_use(sig, binding_index, last_uses);
-        self.bring_to_top(sig, sig_is_last);
-
-        let padding_is_last = self.is_last_use(padding, binding_index, last_uses);
-        self.bring_to_top(padding, padding_is_last);
-
-        let pub_key_is_last = self.is_last_use(pub_key, binding_index, last_uses);
-        self.bring_to_top(pub_key, pub_key_is_last);
+        // Bring all 4 args to the top in argument order: msg sig padding pubKey
+        for arg in args {
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
+        }
 
         // Pop all 4 args from stack map
         self.sm.pop();
@@ -3154,18 +3792,7 @@ impl LoweringContext {
         self.sm.pop();
         self.sm.pop();
 
-        // Emit the Rabin signature verification opcode sequence
-        // Stack: msg(3) sig(2) padding(1) pubKey(0)
-        self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));  // msg sig pubKey padding
-        self.emit_op(StackOp::Opcode("OP_ROT".to_string()));   // msg pubKey padding sig
-        self.emit_op(StackOp::Opcode("OP_DUP".to_string()));
-        self.emit_op(StackOp::Opcode("OP_MUL".to_string()));   // msg pubKey padding sig^2
-        self.emit_op(StackOp::Opcode("OP_ADD".to_string()));   // msg pubKey (sig^2+padding)
-        self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));  // msg (sig^2+padding) pubKey
-        self.emit_op(StackOp::Opcode("OP_MOD".to_string()));   // msg ((sig^2+padding) mod pubKey)
-        self.emit_op(StackOp::Opcode("OP_SWAP".to_string()));  // ((sig^2+padding) mod pubKey) msg
-        self.emit_op(StackOp::Opcode("OP_SHA256".to_string()));
-        self.emit_op(StackOp::Opcode("OP_EQUAL".to_string()));
+        super::rabin::emit_verify_rabin_sig(&mut |op| self.ops.push(op));
 
         self.sm.push(binding_name);
         self.track_depth();
@@ -3215,11 +3842,11 @@ impl LoweringContext {
         let data = &args[0];
         let length = &args[1];
 
-        let data_is_last = self.is_last_use(data, binding_index, last_uses);
-        self.bring_to_top(data, data_is_last);
+        let data_consume = self.operand_consume(data, args, binding_index, last_uses);
+        self.bring_to_top(data, data_consume);
 
-        let length_is_last = self.is_last_use(length, binding_index, last_uses);
-        self.bring_to_top(length, length_is_last);
+        let length_consume = self.operand_consume(length, args, binding_index, last_uses);
+        self.bring_to_top(length, length_consume);
 
         self.sm.pop(); // len
         self.sm.pop(); // data
@@ -3235,79 +3862,9 @@ impl LoweringContext {
         self.track_depth();
     }
 
-    /// Emit one WOTS+ chain with RFC 8391 tweakable hash.
-    /// Stack entry: pubSeed(bottom) sig csum endpt digit(top)
-    /// Stack exit:  pubSeed(bottom) sigRest newCsum newEndpt
-    fn emit_wots_one_chain(&mut self, chain_index: usize) {
-        // Save steps_copy = 15 - digit to alt (for checksum accumulation later)
-        self.emit_op(StackOp::Opcode("OP_DUP".into()));
-        self.emit_op(StackOp::Push(PushValue::Int(15)));
-        self.emit_op(StackOp::Swap);
-        self.emit_op(StackOp::Opcode("OP_SUB".into()));
-        self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into())); // push#1: steps_copy
-
-        // Save endpt, csum to alt. Leave pubSeed+sig+digit on main.
-        self.emit_op(StackOp::Swap);
-        self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into())); // push#2: endpt
-        self.emit_op(StackOp::Swap);
-        self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into())); // push#3: csum
-        // main: pubSeed sig digit
-
-        // Split 32B sig element
-        self.emit_op(StackOp::Swap);
-        self.emit_op(StackOp::Push(PushValue::Int(32)));
-        self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
-        self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into())); // push#4: sigRest
-        self.emit_op(StackOp::Swap);
-        // main: pubSeed sigElem digit
-
-        // Hash loop: skip first `digit` iterations, then apply F for the rest.
-        // When digit > 0: decrement (skip). When digit == 0: hash at step j.
-        // Stack: pubSeed(depth2) sigElem(depth1) digit(depth0=top)
-        for j in 0..15usize {
-            let adrs_bytes = vec![chain_index as u8, j as u8];
-            self.emit_op(StackOp::Opcode("OP_DUP".into()));
-            self.emit_op(StackOp::Opcode("OP_0NOTEQUAL".into()));
-            self.emit_op(StackOp::If {
-                then_ops: vec![
-                    StackOp::Opcode("OP_1SUB".into()),            // skip: digit--
-                ],
-                else_ops: vec![
-                    StackOp::Swap,                                  // pubSeed digit X
-                    StackOp::Push(PushValue::Int(2)),
-                    StackOp::Opcode("OP_PICK".into()),            // copy pubSeed
-                    StackOp::Push(PushValue::Bytes(adrs_bytes)),   // ADRS [chainIndex, j]
-                    StackOp::Opcode("OP_CAT".into()),              // pubSeed || adrs
-                    StackOp::Swap,                                  // bring X to top
-                    StackOp::Opcode("OP_CAT".into()),              // pubSeed || adrs || X
-                    StackOp::Opcode("OP_SHA256".into()),           // F result
-                    StackOp::Swap,                                  // pubSeed new_X digit(=0)
-                ],
-            });
-        }
-        self.emit_op(StackOp::Drop); // drop digit (now 0)
-        // main: pubSeed endpoint
-
-        // Restore from alt (LIFO): sigRest, csum, endpt_acc, steps_copy
-        self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into()));
-        self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into()));
-        self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into()));
-        self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into()));
-
-        // csum += steps_copy
-        self.emit_op(StackOp::Rot);
-        self.emit_op(StackOp::Opcode("OP_ADD".into()));
-
-        // Concat endpoint to endpt_acc
-        self.emit_op(StackOp::Swap);
-        self.emit_op(StackOp::Push(PushValue::Int(3)));
-        self.emit_op(StackOp::Opcode("OP_ROLL".into()));
-        self.emit_op(StackOp::Opcode("OP_CAT".into()));
-    }
-
     /// WOTS+ signature verification with RFC 8391 tweakable hash (post-quantum).
-    /// Parameters: w=16, n=32 (SHA-256), len=67 chains.
-    /// pubkey is 64 bytes: pubSeed(32) || pkRoot(32).
+    /// Brings all 3 args to the top, pops them, delegates to wots::emit_verify_wots,
+    /// and pushes the boolean result.
     fn lower_verify_wots(
         &mut self,
         binding_name: &str,
@@ -3318,119 +3875,13 @@ impl LoweringContext {
         assert!(args.len() >= 3, "verifyWOTS requires 3 arguments: msg, sig, pubkey");
 
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..3 { self.sm.pop(); }
-        // main: msg sig pubkey(64B: pubSeed||pkRoot)
 
-        // Split 64-byte pubkey into pubSeed(32) and pkRoot(32)
-        self.emit_op(StackOp::Push(PushValue::Int(32)));
-        self.emit_op(StackOp::Opcode("OP_SPLIT".into()));          // msg sig pubSeed pkRoot
-        self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into()));    // pkRoot → alt
-
-        // Rearrange: put pubSeed at bottom, hash msg
-        self.emit_op(StackOp::Rot);                                 // sig pubSeed msg
-        self.emit_op(StackOp::Rot);                                 // pubSeed msg sig
-        self.emit_op(StackOp::Swap);                                // pubSeed sig msg
-        self.emit_op(StackOp::Opcode("OP_SHA256".into()));         // pubSeed sig msgHash
-
-        // Canonical layout: pubSeed(bottom) sig csum=0 endptAcc=empty hashRem(top)
-        self.emit_op(StackOp::Swap);
-        self.emit_op(StackOp::Push(PushValue::Int(0)));
-        self.emit_op(StackOp::Opcode("OP_0".into()));
-        self.emit_op(StackOp::Push(PushValue::Int(3)));
-        self.emit_op(StackOp::Opcode("OP_ROLL".into()));
-
-        // Process 32 bytes → 64 message chains
-        for byte_idx in 0..32 {
-            if byte_idx < 31 {
-                self.emit_op(StackOp::Push(PushValue::Int(1)));
-                self.emit_op(StackOp::Opcode("OP_SPLIT".into()));
-                self.emit_op(StackOp::Swap);
-            }
-            // Unsigned byte conversion
-            self.emit_op(StackOp::Push(PushValue::Int(0)));
-            self.emit_op(StackOp::Push(PushValue::Int(1)));
-            self.emit_op(StackOp::Opcode("OP_NUM2BIN".into()));
-            self.emit_op(StackOp::Opcode("OP_CAT".into()));
-            self.emit_op(StackOp::Opcode("OP_BIN2NUM".into()));
-            // Extract nibbles
-            self.emit_op(StackOp::Opcode("OP_DUP".into()));
-            self.emit_op(StackOp::Push(PushValue::Int(16)));
-            self.emit_op(StackOp::Opcode("OP_DIV".into()));
-            self.emit_op(StackOp::Swap);
-            self.emit_op(StackOp::Push(PushValue::Int(16)));
-            self.emit_op(StackOp::Opcode("OP_MOD".into()));
-
-            if byte_idx < 31 {
-                self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into()));
-                self.emit_op(StackOp::Swap);
-                self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into()));
-            } else {
-                self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into()));
-            }
-
-            self.emit_wots_one_chain(byte_idx * 2); // high nibble chain
-
-            if byte_idx < 31 {
-                self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into()));
-                self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into()));
-                self.emit_op(StackOp::Swap);
-                self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into()));
-            } else {
-                self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into()));
-            }
-
-            self.emit_wots_one_chain(byte_idx * 2 + 1); // low nibble chain
-
-            if byte_idx < 31 {
-                self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into()));
-            }
-        }
-
-        // Checksum digits
-        self.emit_op(StackOp::Swap);
-        // d66
-        self.emit_op(StackOp::Opcode("OP_DUP".into()));
-        self.emit_op(StackOp::Push(PushValue::Int(16)));
-        self.emit_op(StackOp::Opcode("OP_MOD".into()));
-        self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into()));
-        // d65
-        self.emit_op(StackOp::Opcode("OP_DUP".into()));
-        self.emit_op(StackOp::Push(PushValue::Int(16)));
-        self.emit_op(StackOp::Opcode("OP_DIV".into()));
-        self.emit_op(StackOp::Push(PushValue::Int(16)));
-        self.emit_op(StackOp::Opcode("OP_MOD".into()));
-        self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into()));
-        // d64
-        self.emit_op(StackOp::Push(PushValue::Int(256)));
-        self.emit_op(StackOp::Opcode("OP_DIV".into()));
-        self.emit_op(StackOp::Push(PushValue::Int(16)));
-        self.emit_op(StackOp::Opcode("OP_MOD".into()));
-        self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into()));
-
-        // 3 checksum chains (indices 64, 65, 66)
-        for ci in 0..3 {
-            self.emit_op(StackOp::Opcode("OP_TOALTSTACK".into()));
-            self.emit_op(StackOp::Push(PushValue::Int(0)));
-            self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into()));
-            self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into()));
-            self.emit_wots_one_chain(64 + ci);
-            self.emit_op(StackOp::Swap);
-            self.emit_op(StackOp::Drop);
-        }
-
-        // Final comparison
-        self.emit_op(StackOp::Swap);
-        self.emit_op(StackOp::Drop);
-        // main: pubSeed endptAcc
-        self.emit_op(StackOp::Opcode("OP_SHA256".into()));
-        self.emit_op(StackOp::Opcode("OP_FROMALTSTACK".into())); // pkRoot
-        self.emit_op(StackOp::Opcode("OP_EQUAL".into()));
-        // Clean up pubSeed
-        self.emit_op(StackOp::Swap);
-        self.emit_op(StackOp::Drop);
+        // Delegate to wots module
+        super::wots::emit_verify_wots(&mut |op| self.ops.push(op));
 
         self.sm.push(binding_name);
         self.track_depth();
@@ -3454,8 +3905,8 @@ impl LoweringContext {
 
         // Bring args to top in order: msg, sig, pubkey
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..3 {
             self.sm.pop();
@@ -3484,8 +3935,8 @@ impl LoweringContext {
             "sha256Compress requires 2 arguments: state, block"
         );
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..2 {
             self.sm.pop();
@@ -3509,8 +3960,8 @@ impl LoweringContext {
             "sha256Finalize requires 3 arguments: state, remaining, msgBitLen"
         );
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..3 {
             self.sm.pop();
@@ -3534,8 +3985,8 @@ impl LoweringContext {
             "blake3Compress requires 2 arguments: chainingValue, block"
         );
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..2 {
             self.sm.pop();
@@ -3559,8 +4010,8 @@ impl LoweringContext {
             "blake3Hash requires 1 argument: message"
         );
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in 0..1 {
             self.sm.pop();
@@ -3582,8 +4033,8 @@ impl LoweringContext {
     ) {
         // Bring args to top in order
         for arg in args.iter() {
-            let is_last = self.is_last_use(arg, binding_index, last_uses);
-            self.bring_to_top(arg, is_last);
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
         }
         for _ in args {
             self.sm.pop();
@@ -3609,6 +4060,286 @@ impl LoweringContext {
         self.track_depth();
     }
 
+    // -----------------------------------------------------------------------
+    // NIST EC operations (P-256 / P-384) -- delegates to p256_p384.rs
+    // -----------------------------------------------------------------------
+
+    fn lower_nist_ec_builtin(
+        &mut self,
+        binding_name: &str,
+        func_name: &str,
+        args: &[String],
+        binding_index: usize,
+        last_uses: &HashMap<String, usize>,
+    ) {
+        // Bring args to top in order
+        for arg in args.iter() {
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
+        }
+        for _ in args {
+            self.sm.pop();
+        }
+
+        let emit = &mut |op: StackOp| self.ops.push(op);
+
+        match func_name {
+            "p256Add" => super::p256_p384::emit_p256_add(emit),
+            "p256Mul" => super::p256_p384::emit_p256_mul(emit),
+            "p256MulGen" => super::p256_p384::emit_p256_mul_gen(emit),
+            "p256Negate" => super::p256_p384::emit_p256_negate(emit),
+            "p256OnCurve" => super::p256_p384::emit_p256_on_curve(emit),
+            "p256EncodeCompressed" => super::p256_p384::emit_p256_encode_compressed(emit),
+            "p384Add" => super::p256_p384::emit_p384_add(emit),
+            "p384Mul" => super::p256_p384::emit_p384_mul(emit),
+            "p384MulGen" => super::p256_p384::emit_p384_mul_gen(emit),
+            "p384Negate" => super::p256_p384::emit_p384_negate(emit),
+            "p384OnCurve" => super::p256_p384::emit_p384_on_curve(emit),
+            "p384EncodeCompressed" => super::p256_p384::emit_p384_encode_compressed(emit),
+            _ => panic!("unknown NIST EC builtin: {}", func_name),
+        }
+
+        self.sm.push(binding_name);
+        self.track_depth();
+    }
+
+    // -----------------------------------------------------------------------
+    // ECDSA verification (P-256 / P-384) -- delegates to p256_p384.rs
+    // -----------------------------------------------------------------------
+
+    fn lower_verify_ecdsa(
+        &mut self,
+        binding_name: &str,
+        func_name: &str,
+        args: &[String],
+        binding_index: usize,
+        last_uses: &HashMap<String, usize>,
+    ) {
+        assert!(
+            args.len() == 3,
+            "{} requires exactly 3 arguments (msg, sig, pubkey)",
+            func_name
+        );
+        // Bring all 3 args to top in order: msg, sig, pubkey
+        for arg in args.iter() {
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
+        }
+        self.sm.pop(); // pubkey
+        self.sm.pop(); // sig
+        self.sm.pop(); // msg
+
+        let emit = &mut |op: StackOp| self.ops.push(op);
+
+        if func_name == "verifyECDSA_P256" {
+            super::p256_p384::emit_verify_ecdsa_p256(emit);
+        } else {
+            super::p256_p384::emit_verify_ecdsa_p384(emit);
+        }
+
+        self.sm.push(binding_name);
+        self.track_depth();
+    }
+
+    // -----------------------------------------------------------------------
+    // Baby Bear field arithmetic -- delegates to babybear.rs
+    // -----------------------------------------------------------------------
+
+    fn lower_bb_field_builtin(
+        &mut self,
+        binding_name: &str,
+        func_name: &str,
+        args: &[String],
+        binding_index: usize,
+        last_uses: &HashMap<String, usize>,
+    ) {
+        // Bring all args to stack top
+        for arg in args.iter() {
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
+        }
+        for _ in args {
+            self.sm.pop();
+        }
+
+        let emit = &mut |op: StackOp| self.ops.push(op);
+
+        match func_name {
+            "bbFieldAdd" => super::babybear::emit_bb_field_add(emit),
+            "bbFieldSub" => super::babybear::emit_bb_field_sub(emit),
+            "bbFieldMul" => super::babybear::emit_bb_field_mul(emit),
+            "bbFieldInv" => super::babybear::emit_bb_field_inv(emit),
+            "bbExt4Mul0" => super::babybear::emit_bb_ext4_mul_0(emit),
+            "bbExt4Mul1" => super::babybear::emit_bb_ext4_mul_1(emit),
+            "bbExt4Mul2" => super::babybear::emit_bb_ext4_mul_2(emit),
+            "bbExt4Mul3" => super::babybear::emit_bb_ext4_mul_3(emit),
+            "bbExt4Inv0" => super::babybear::emit_bb_ext4_inv_0(emit),
+            "bbExt4Inv1" => super::babybear::emit_bb_ext4_inv_1(emit),
+            "bbExt4Inv2" => super::babybear::emit_bb_ext4_inv_2(emit),
+            "bbExt4Inv3" => super::babybear::emit_bb_ext4_inv_3(emit),
+            _ => panic!("unknown Baby Bear builtin: {}", func_name),
+        }
+
+        self.sm.push(binding_name);
+        self.track_depth();
+    }
+
+    // -----------------------------------------------------------------------
+    // KoalaBear field arithmetic -- delegates to koalabear.rs
+    // -----------------------------------------------------------------------
+
+    fn lower_kb_field_builtin(
+        &mut self,
+        binding_name: &str,
+        func_name: &str,
+        args: &[String],
+        binding_index: usize,
+        last_uses: &HashMap<String, usize>,
+    ) {
+        // Bring all args to stack top
+        for arg in args.iter() {
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
+        }
+        for _ in args {
+            self.sm.pop();
+        }
+
+        let emit = &mut |op: StackOp| self.ops.push(op);
+
+        match func_name {
+            "kbFieldAdd" => super::koalabear::emit_kb_field_add(emit),
+            "kbFieldSub" => super::koalabear::emit_kb_field_sub(emit),
+            "kbFieldMul" => super::koalabear::emit_kb_field_mul(emit),
+            "kbFieldInv" => super::koalabear::emit_kb_field_inv(emit),
+            "kbExt4Mul0" => super::koalabear::emit_kb_ext4_mul_0(emit),
+            "kbExt4Mul1" => super::koalabear::emit_kb_ext4_mul_1(emit),
+            "kbExt4Mul2" => super::koalabear::emit_kb_ext4_mul_2(emit),
+            "kbExt4Mul3" => super::koalabear::emit_kb_ext4_mul_3(emit),
+            "kbExt4Inv0" => super::koalabear::emit_kb_ext4_inv_0(emit),
+            "kbExt4Inv1" => super::koalabear::emit_kb_ext4_inv_1(emit),
+            "kbExt4Inv2" => super::koalabear::emit_kb_ext4_inv_2(emit),
+            "kbExt4Inv3" => super::koalabear::emit_kb_ext4_inv_3(emit),
+            _ => panic!("unknown KoalaBear builtin: {}", func_name),
+        }
+
+        self.sm.push(binding_name);
+        self.track_depth();
+    }
+
+    // -----------------------------------------------------------------------
+    // BN254 field + G1 operations -- delegates to bn254.rs
+    // -----------------------------------------------------------------------
+
+    fn lower_bn254_builtin(
+        &mut self,
+        binding_name: &str,
+        func_name: &str,
+        args: &[String],
+        binding_index: usize,
+        last_uses: &HashMap<String, usize>,
+    ) {
+        // Bring all args to stack top in order
+        for arg in args.iter() {
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
+        }
+        for _ in args {
+            self.sm.pop();
+        }
+
+        let emit = &mut |op: StackOp| self.ops.push(op);
+
+        match func_name {
+            "bn254FieldAdd" => super::bn254::emit_bn254_field_add(emit),
+            "bn254FieldSub" => super::bn254::emit_bn254_field_sub(emit),
+            "bn254FieldMul" => super::bn254::emit_bn254_field_mul(emit),
+            "bn254FieldInv" => super::bn254::emit_bn254_field_inv(emit),
+            "bn254FieldNeg" => super::bn254::emit_bn254_field_neg(emit),
+            "bn254G1Add" => super::bn254::emit_bn254_g1_add(emit),
+            "bn254G1ScalarMul" => super::bn254::emit_bn254_g1_scalar_mul(emit),
+            "bn254G1Negate" => super::bn254::emit_bn254_g1_negate(emit),
+            "bn254G1OnCurve" => super::bn254::emit_bn254_g1_on_curve(emit),
+            _ => panic!("unknown BN254 builtin: {}", func_name),
+        }
+
+        self.sm.push(binding_name);
+        self.track_depth();
+    }
+
+    // -----------------------------------------------------------------------
+    // Merkle proof verification -- delegates to merkle.rs
+    // -----------------------------------------------------------------------
+
+    fn lower_merkle_root(
+        &mut self,
+        binding_name: &str,
+        func_name: &str,
+        args: &[String],
+        binding_index: usize,
+        last_uses: &HashMap<String, usize>,
+    ) {
+        // args: [leaf, proof, index, depth]
+        // depth must be a compile-time constant
+        assert!(
+            args.len() == 4,
+            "{} requires exactly 4 arguments (leaf, proof, index, depth)",
+            func_name
+        );
+
+        // Extract depth constant from ANF binding
+        let depth_arg = &args[3];
+        let depth_value = self.const_values.get(depth_arg).cloned();
+        let depth = match depth_value {
+            Some(ConstValue::Int(n)) => {
+                use num_traits::ToPrimitive;
+                n.to_usize().unwrap_or_else(|| panic!(
+                    "{}: depth (4th argument) must fit in usize, got {}", func_name, n
+                ))
+            }
+            _ => panic!(
+                "{}: depth (4th argument) must be a compile-time constant integer literal. \
+                 Got a runtime value for '{}'.",
+                func_name, depth_arg
+            ),
+        };
+        assert!(
+            depth >= 1 && depth <= 64,
+            "{}: depth must be between 1 and 64, got {}",
+            func_name, depth
+        );
+
+        // Remove depth from the real stack FIRST (compile-time constant, not runtime).
+        if self.sm.has(depth_arg) {
+            self.bring_to_top(depth_arg, true);
+            self.emit_op(StackOp::Drop);
+            self.sm.pop();
+        }
+
+        // Bring leaf, proof, index to stack top for the codegen
+        for i in 0..3 {
+            let arg = &args[i];
+            let consume = self.operand_consume(arg, args, binding_index, last_uses);
+            self.bring_to_top(arg, consume);
+        }
+        // Pop the 3 args -- the codegen consumes them and produces 1 result
+        for _ in 0..3 {
+            self.sm.pop();
+        }
+
+        let emit = &mut |op: StackOp| self.ops.push(op);
+
+        match func_name {
+            "merkleRootSha256" => super::merkle::emit_merkle_root_sha256(emit, depth),
+            "merkleRootHash256" => super::merkle::emit_merkle_root_hash256(emit, depth),
+            "merkleRootPoseidon2KB" => super::poseidon2_merkle::emit_poseidon2_merkle_root(emit, depth),
+            _ => panic!("unknown Merkle builtin: {}", func_name),
+        }
+
+        self.sm.push(binding_name);
+        self.track_depth();
+    }
+
     /// safediv(a, b): a / b with division-by-zero check.
     /// Stack: a b -> OP_DUP OP_0NOTEQUAL OP_VERIFY OP_DIV -> result
     fn lower_safediv(
@@ -3620,11 +4351,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "safediv requires 2 arguments");
 
-        let a_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], a_is_last);
+        let a_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], a_consume);
 
-        let b_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], b_is_last);
+        let b_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], b_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -3649,11 +4380,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "safemod requires 2 arguments");
 
-        let a_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], a_is_last);
+        let a_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], a_consume);
 
-        let b_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], b_is_last);
+        let b_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], b_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -3678,19 +4409,19 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 3, "clamp requires 3 arguments");
 
-        let val_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], val_is_last);
+        let val_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], val_consume);
 
-        let lo_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], lo_is_last);
+        let lo_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], lo_consume);
 
         self.sm.pop();
         self.sm.pop();
         self.emit_op(StackOp::Opcode("OP_MAX".to_string()));
         self.sm.push(""); // intermediate result
 
-        let hi_is_last = self.is_last_use(&args[2], binding_index, last_uses);
-        self.bring_to_top(&args[2], hi_is_last);
+        let hi_consume = self.operand_consume(&args[2], args, binding_index, last_uses);
+        self.bring_to_top(&args[2], hi_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -3713,24 +4444,24 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "pow requires 2 arguments");
 
-        let base_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], base_is_last);
+        let base_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], base_consume);
 
-        let exp_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], exp_is_last);
+        let exp_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], exp_consume);
 
         self.sm.pop();
         self.sm.pop();
 
         // Stack: base exp
         self.emit_op(StackOp::Swap);                                  // exp base
-        self.emit_op(StackOp::Push(PushValue::Int(1)));               // exp base 1(acc)
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));               // exp base 1(acc)
 
         for i in 0..32 {
             // Stack: exp base acc
-            self.emit_op(StackOp::Push(PushValue::Int(2)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(2))));
             self.emit_op(StackOp::Opcode("OP_PICK".to_string()));     // exp base acc exp
-            self.emit_op(StackOp::Push(PushValue::Int(i)));
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(i))));
             self.emit_op(StackOp::Opcode("OP_GREATERTHAN".to_string())); // exp base acc (exp > i)
             self.emit_op(StackOp::If {
                 then_ops: vec![
@@ -3759,19 +4490,19 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 3, "mulDiv requires 3 arguments");
 
-        let a_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], a_is_last);
+        let a_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], a_consume);
 
-        let b_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], b_is_last);
+        let b_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], b_consume);
 
         self.sm.pop();
         self.sm.pop();
         self.emit_op(StackOp::Opcode("OP_MUL".to_string()));
         self.sm.push(""); // a*b
 
-        let c_is_last = self.is_last_use(&args[2], binding_index, last_uses);
-        self.bring_to_top(&args[2], c_is_last);
+        let c_consume = self.operand_consume(&args[2], args, binding_index, last_uses);
+        self.bring_to_top(&args[2], c_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -3792,17 +4523,17 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "percentOf requires 2 arguments");
 
-        let amount_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], amount_is_last);
+        let amount_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], amount_consume);
 
-        let bps_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], bps_is_last);
+        let bps_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], bps_consume);
 
         self.sm.pop();
         self.sm.pop();
 
         self.emit_op(StackOp::Opcode("OP_MUL".to_string()));
-        self.emit_op(StackOp::Push(PushValue::Int(10000)));
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(10000))));
         self.emit_op(StackOp::Opcode("OP_DIV".to_string()));
 
         self.sm.push(binding_name);
@@ -3845,7 +4576,7 @@ impl LoweringContext {
             newton_ops.push(StackOp::Over);                               // n guess n guess
             newton_ops.push(StackOp::Opcode("OP_DIV".to_string()));      // n guess (n/guess)
             newton_ops.push(StackOp::Opcode("OP_ADD".to_string()));      // n (guess + n/guess)
-            newton_ops.push(StackOp::Push(PushValue::Int(2)));            // n (guess + n/guess) 2
+            newton_ops.push(StackOp::Push(PushValue::Int(BigInt::from(2))));            // n (guess + n/guess) 2
             newton_ops.push(StackOp::Opcode("OP_DIV".to_string()));      // n new_guess
         }
 
@@ -3873,11 +4604,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "gcd requires 2 arguments");
 
-        let a_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], a_is_last);
+        let a_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], a_consume);
 
-        let b_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], b_is_last);
+        let b_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], b_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -3929,11 +4660,11 @@ impl LoweringContext {
     ) {
         assert!(args.len() >= 2, "divmod requires 2 arguments");
 
-        let a_is_last = self.is_last_use(&args[0], binding_index, last_uses);
-        self.bring_to_top(&args[0], a_is_last);
+        let a_consume = self.operand_consume(&args[0], args, binding_index, last_uses);
+        self.bring_to_top(&args[0], a_consume);
 
-        let b_is_last = self.is_last_use(&args[1], binding_index, last_uses);
-        self.bring_to_top(&args[1], b_is_last);
+        let b_consume = self.operand_consume(&args[1], args, binding_index, last_uses);
+        self.bring_to_top(&args[1], b_consume);
 
         self.sm.pop();
         self.sm.pop();
@@ -3978,7 +4709,7 @@ impl LoweringContext {
 
         // Stack: <n>
         // Push counter = 0
-        self.emit_op(StackOp::Push(PushValue::Int(0))); // n 0
+        self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(0)))); // n 0
 
         // 64 iterations (sufficient for Bitcoin Script bigint range)
         const LOG2_ITERATIONS: usize = 64;
@@ -3986,11 +4717,11 @@ impl LoweringContext {
             // Stack: input counter
             self.emit_op(StackOp::Swap);                                     // counter input
             self.emit_op(StackOp::Opcode("OP_DUP".to_string()));            // counter input input
-            self.emit_op(StackOp::Push(PushValue::Int(1)));                  // counter input input 1
+            self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(1))));                  // counter input input 1
             self.emit_op(StackOp::Opcode("OP_GREATERTHAN".to_string()));     // counter input (input>1)
             self.emit_op(StackOp::If {
                 then_ops: vec![
-                    StackOp::Push(PushValue::Int(2)),                        // counter input 2
+                    StackOp::Push(PushValue::Int(BigInt::from(2))),                        // counter input 2
                     StackOp::Opcode("OP_DIV".to_string()),                   // counter (input/2)
                     StackOp::Swap,                                           // (input/2) counter
                     StackOp::Opcode("OP_1ADD".to_string()),                  // (input/2) (counter+1)
@@ -4059,11 +4790,56 @@ fn lower_to_stack_inner(program: &ANFProgram) -> Result<Vec<StackMethod>, String
     Ok(methods)
 }
 
-/// Check whether a method's body contains a CheckPreimage binding.
-/// If found, the unlocking script will push an implicit <sig> parameter before
-/// all declared parameters (OP_PUSH_TX pattern).
-fn method_uses_check_preimage(bindings: &[ANFBinding]) -> bool {
-    bindings.iter().any(|b| matches!(&b.value, ANFValue::CheckPreimage { .. }))
+/// Check whether a method's body contains a CheckPreimage binding,
+/// recursing through if/loop branches and into private-method bodies.
+/// If found, the unlocking script will push an implicit <sig>
+/// parameter before all declared parameters (OP_PUSH_TX pattern).
+/// Recursion is the 2026-04-30 audit finding F7 fix.
+fn method_uses_check_preimage(
+    bindings: &[ANFBinding],
+    private_methods: Option<&HashMap<String, ANFMethod>>,
+) -> bool {
+    let mut seen: HashSet<String> = HashSet::new();
+    method_uses_check_preimage_rec(bindings, private_methods, &mut seen)
+}
+
+fn method_uses_check_preimage_rec(
+    bindings: &[ANFBinding],
+    private_methods: Option<&HashMap<String, ANFMethod>>,
+    seen: &mut HashSet<String>,
+) -> bool {
+    for b in bindings {
+        match &b.value {
+            ANFValue::CheckPreimage { .. } => return true,
+            ANFValue::If { then, else_branch, .. } => {
+                if method_uses_check_preimage_rec(then, private_methods, seen) {
+                    return true;
+                }
+                if method_uses_check_preimage_rec(else_branch, private_methods, seen) {
+                    return true;
+                }
+            }
+            ANFValue::Loop { body, .. } => {
+                if method_uses_check_preimage_rec(body, private_methods, seen) {
+                    return true;
+                }
+            }
+            ANFValue::MethodCall { method, .. } => {
+                if let Some(privs) = private_methods {
+                    if let Some(target) = privs.get(method) {
+                        if !seen.contains(&target.name) {
+                            seen.insert(target.name.clone());
+                            if method_uses_check_preimage_rec(&target.body, private_methods, seen) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Check whether a method has add_output, add_raw_output, or computeStateOutput/
@@ -4079,6 +4855,28 @@ fn method_uses_code_part(bindings: &[ANFBinding]) -> bool {
     })
 }
 
+/// Whether a method READS a mutable variable-length (ByteString) state field's
+/// value (via `load_prop`), recursing into branches and loops. Issue #100: such
+/// a terminal method needs `_codePart` for the preimage-relative state offset.
+/// A method that only reads readonly fields (baked into the locking script) or
+/// fixed-size mutable fields does NOT need `_codePart` — narrowing to the live
+/// var-length read avoids over-provisioning (e.g. MessageBoard.burn reads only
+/// the readonly owner and must keep its original terminal codegen).
+fn method_reads_var_len_state(
+    bindings: &[ANFBinding],
+    var_len_props: &std::collections::HashSet<String>,
+) -> bool {
+    bindings.iter().any(|b| match &b.value {
+        ANFValue::LoadProp { name } => var_len_props.contains(name),
+        ANFValue::If { then, else_branch, .. } => {
+            method_reads_var_len_state(then, var_len_props)
+                || method_reads_var_len_state(else_branch, var_len_props)
+        }
+        ANFValue::Loop { body, .. } => method_reads_var_len_state(body, var_len_props),
+        _ => false,
+    })
+}
+
 fn lower_method_with_private_methods(
     method: &ANFMethod,
     properties: &[ANFProperty],
@@ -4088,17 +4886,24 @@ fn lower_method_with_private_methods(
 
     // If the method uses checkPreimage, the unlocking script pushes implicit
     // params before all declared parameters (OP_PUSH_TX pattern).
-    // _codePart: full code script (locking script minus state) as ByteString
-    // _opPushTxSig: ECDSA signature for OP_PUSH_TX verification
-    // These are inserted at the base of the stack so they can be consumed later.
-    if method_uses_check_preimage(&method.body) {
-        param_names.insert(0, "_opPushTxSig".to_string());
-        // _codePart is needed when the method has add_output or add_raw_output
-        // (it provides the code script for continuation output construction),
-        // or when deserializing variable-length (ByteString) state fields.
-        if method_uses_code_part(&method.body) {
-            param_names.insert(0, "_codePart".to_string());
-        }
+    // _codePart: full code script (locking script minus state) as ByteString.
+    // (BUG-100 fix: the OP_PUSH_TX signature is now derived on-chain from the
+    // preimage — see lower_check_preimage — so NO _opPushTxSig witness item is
+    // pushed. The unlocking script provides only the preimage.)
+    // _codePart is needed for continuation builders (add_output/add_raw_output)
+    // OR when the method reads a mutable variable-length (ByteString) state
+    // field — the deserialization needs it for the preimage-relative offset
+    // (issue #100).
+    let var_len_props: std::collections::HashSet<String> = properties
+        .iter()
+        .filter(|p| !p.readonly && p.prop_type == "ByteString")
+        .map(|p| p.name.clone())
+        .collect();
+    let uses_code_part = method_uses_check_preimage(&method.body, Some(private_methods))
+        && (method_uses_code_part(&method.body)
+            || method_reads_var_len_state(&method.body, &var_len_props));
+    if uses_code_part {
+        param_names.insert(0, "_codePart".to_string());
     }
 
     let mut ctx = LoweringContext::new(&param_names, properties);
@@ -4107,9 +4912,12 @@ fn lower_method_with_private_methods(
     // its value on the stack (Bitcoin Script requires a truthy top-of-stack).
     ctx.lower_bindings(&method.body, method.is_public);
 
-    // Clean up excess stack items left by deserialize_state.
-    let has_deserialize_state = method.body.iter().any(|b| matches!(&b.value, ANFValue::DeserializeState { .. }));
-    if method.is_public && has_deserialize_state && ctx.sm.depth() > 1 {
+    // Clean up excess stack items below the top-of-stack boolean (CLEANSTACK).
+    // Excess items can come from deserialize_state (stateful methods reading
+    // mutable fields) or from readonly-field-binding patterns in all-readonly
+    // terminal methods. The depth>1 guard keeps this a no-op for already-clean
+    // methods.
+    if method.is_public && ctx.sm.depth() > 1 {
         let excess = ctx.sm.depth() - 1;
         for _ in 0..excess {
             ctx.emit_op(StackOp::Nip);
@@ -4129,6 +4937,7 @@ fn lower_method_with_private_methods(
         source_locs: ctx.source_locs,
         ops: ctx.ops,
         max_stack_depth: ctx.max_depth,
+        uses_code_part,
     })
 }
 
@@ -4164,11 +4973,13 @@ mod tests {
     fn p2pkh_program() -> ANFProgram {
         ANFProgram {
             contract_name: "P2PKH".to_string(),
+            parent_class: String::new(),
             properties: vec![ANFProperty {
                 name: "pubKeyHash".to_string(),
                 prop_type: "Addr".to_string(),
                 readonly: true,
                 initial_value: None,
+                synthetic_array_chain: None,
             }],
             methods: vec![ANFMethod {
                 name: "unlock".to_string(),
@@ -4224,9 +5035,7 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t5".to_string(),
-                        value: ANFValue::Assert {
-                            value: "t4".to_string(),
-                        },
+                        value: ANFValue::Assert { value: "t4".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                     ANFBinding {
@@ -4239,13 +5048,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t7".to_string(),
-                        value: ANFValue::Assert {
-                            value: "t6".to_string(),
-                        },
+                        value: ANFValue::Assert { value: "t6".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         }
     }
@@ -4408,11 +5216,13 @@ mod tests {
         // Build a stateful contract that calls extractOutputHash on a preimage
         let program = ANFProgram {
             contract_name: "TestExtract".to_string(),
+            parent_class: String::new(),
             properties: vec![ANFProperty {
                 name: "val".to_string(),
                 prop_type: "bigint".to_string(),
                 readonly: false,
                 initial_value: Some(serde_json::Value::Number(serde_json::Number::from(0))),
+                synthetic_array_chain: None,
             }],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -4440,11 +5250,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t3".to_string(),
-                        value: ANFValue::Assert { value: "t2".to_string() },
+                        value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -4474,6 +5285,7 @@ mod tests {
         // The terminal asserts in both branches should NOT emit OP_VERIFY.
         let program = ANFProgram {
             contract_name: "TerminalIf".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -4516,7 +5328,7 @@ mod tests {
                                 },
                                 ANFBinding {
                                     name: "t5".to_string(),
-                                    value: ANFValue::Assert { value: "t4".to_string() },
+                                    value: ANFValue::Assert { value: "t4".to_string(), is_auto_injected_state_check: false },
                                     source_loc: None,
                                 },
                             ],
@@ -4540,7 +5352,7 @@ mod tests {
                                 },
                                 ANFBinding {
                                     name: "t8".to_string(),
-                                    value: ANFValue::Assert { value: "t7".to_string() },
+                                    value: ANFValue::Assert { value: "t7".to_string(), is_auto_injected_state_check: false },
                                     source_loc: None,
                                 },
                             ],
@@ -4549,6 +5361,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -4578,6 +5391,7 @@ mod tests {
     fn test_unpack_emits_bin2num() {
         let program = ANFProgram {
             contract_name: "TestUnpack".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -4617,11 +5431,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t4".to_string(),
-                        value: ANFValue::Assert { value: "t3".to_string() },
+                        value: ANFValue::Assert { value: "t3".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -4638,6 +5453,7 @@ mod tests {
     fn test_pack_is_noop() {
         let program = ANFProgram {
             contract_name: "TestPack".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -4667,11 +5483,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t3".to_string(),
-                        value: ANFValue::Assert { value: "t2".to_string() },
+                        value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -4694,6 +5511,7 @@ mod tests {
     fn test_to_byte_string_is_noop() {
         let program = ANFProgram {
             contract_name: "TestToByteString".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -4723,11 +5541,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t3".to_string(),
-                        value: ANFValue::Assert { value: "t2".to_string() },
+                        value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -4749,6 +5568,7 @@ mod tests {
     fn test_sqrt_has_zero_guard() {
         let program = ANFProgram {
             contract_name: "TestSqrt".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -4788,11 +5608,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t4".to_string(),
-                        value: ANFValue::Assert { value: "t3".to_string() },
+                        value: ANFValue::Assert { value: "t3".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -4827,6 +5648,7 @@ mod tests {
         // so it should be dropped. The TS reference does this cleanup.
         let program = ANFProgram {
             contract_name: "TestLoopCleanup".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -4843,6 +5665,8 @@ mod tests {
                         name: "t_loop".to_string(),
                         value: ANFValue::Loop {
                             count: 3,
+                            start: serde_json::json!(0),
+                            step: 1,
                             body: vec![
                                 // Body uses x but not iter var __i, and asserts consume
                                 ANFBinding {
@@ -4852,7 +5676,7 @@ mod tests {
                                 },
                                 ANFBinding {
                                     name: "t2".to_string(),
-                                    value: ANFValue::Assert { value: "t1".to_string() },
+                                    value: ANFValue::Assert { value: "t1".to_string(), is_auto_injected_state_check: false },
                                     source_loc: None,
                                 },
                             ],
@@ -4869,11 +5693,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t_assert".to_string(),
-                        value: ANFValue::Assert { value: "t_final".to_string() },
+                        value: ANFValue::Assert { value: "t_final".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -4898,20 +5723,21 @@ mod tests {
 
     #[test]
     fn test_push_value_int_large_values() {
+        use num_traits::ToPrimitive;
         // Verify that PushValue::Int can hold values larger than i64::MAX
         let large_val: i128 = (i64::MAX as i128) + 1;
-        let push = PushValue::Int(large_val);
+        let push = PushValue::Int(BigInt::from(large_val));
         if let PushValue::Int(v) = push {
-            assert_eq!(v, large_val, "PushValue::Int should store values > i64::MAX without truncation");
+            assert_eq!(v.to_i128(), Some(large_val), "PushValue::Int should store values > i64::MAX without truncation");
         } else {
             panic!("expected PushValue::Int");
         }
 
         // Also test negative extreme
         let neg_val: i128 = (i64::MIN as i128) - 1;
-        let push_neg = PushValue::Int(neg_val);
+        let push_neg = PushValue::Int(BigInt::from(neg_val));
         if let PushValue::Int(v) = push_neg {
-            assert_eq!(v, neg_val, "PushValue::Int should store values < i64::MIN without truncation");
+            assert_eq!(v.to_i128(), Some(neg_val), "PushValue::Int should store values < i64::MIN without truncation");
         } else {
             panic!("expected PushValue::Int");
         }
@@ -4923,7 +5749,7 @@ mod tests {
         use crate::codegen::emit::encode_push_int;
 
         let large_val: i128 = 1i128 << 100;
-        let (hex, _asm) = encode_push_int(large_val);
+        let (hex, _asm) = encode_push_int(&BigInt::from(large_val));
         // Should produce a valid hex encoding, not panic or truncate
         assert!(!hex.is_empty(), "encoding of 2^100 should produce non-empty hex");
 
@@ -4946,6 +5772,7 @@ mod tests {
     fn test_log2_uses_bit_scanning_not_byte_approx() {
         let program = ANFProgram {
             contract_name: "TestLog2".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -4985,11 +5812,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t4".to_string(),
-                        value: ANFValue::Assert { value: "t3".to_string() },
+                        value: ANFValue::Assert { value: "t3".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5036,6 +5864,7 @@ mod tests {
     fn test_reverse_bytes_uses_split_cat_not_op_reverse() {
         let program = ANFProgram {
             contract_name: "TestReverse".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -5065,11 +5894,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t3".to_string(),
-                        value: ANFValue::Assert { value: "t2".to_string() },
+                        value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5132,6 +5962,7 @@ mod tests {
     fn test_multi_method_dispatch() {
         let program = ANFProgram {
             contract_name: "Multi".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![
                 ANFMethod {
@@ -5139,6 +5970,7 @@ mod tests {
                     params: vec![],
                     body: vec![],
                     is_public: false,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "method1".to_string(),
@@ -5171,11 +6003,12 @@ mod tests {
                         },
                         ANFBinding {
                             name: "t3".to_string(),
-                            value: ANFValue::Assert { value: "t2".to_string() },
+                            value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                             source_loc: None,
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
                 ANFMethod {
                     name: "method2".to_string(),
@@ -5208,11 +6041,12 @@ mod tests {
                         },
                         ANFBinding {
                             name: "t3".to_string(),
-                            value: ANFValue::Assert { value: "t2".to_string() },
+                            value: ANFValue::Assert { value: "t2".to_string(), is_auto_injected_state_check: false },
                             source_loc: None,
                         },
                     ],
                     is_public: true,
+                    sighash_type: None,
                 },
             ],
         };
@@ -5235,6 +6069,7 @@ mod tests {
     fn test_extract_outputs_uses_offset_40() {
         let program = ANFProgram {
             contract_name: "OutputsCheck".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -5258,11 +6093,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t2".to_string(),
-                        value: ANFValue::Assert { value: "t1".to_string() },
+                        value: ANFValue::Assert { value: "t1".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5294,11 +6130,13 @@ mod tests {
         // Contract: verify(a, b) { assert(a + b === target) }
         let program = ANFProgram {
             contract_name: "ArithCheck".to_string(),
+            parent_class: String::new(),
             properties: vec![ANFProperty {
                 name: "target".to_string(),
                 prop_type: "bigint".to_string(),
                 readonly: true,
                 initial_value: None,
+                synthetic_array_chain: None,
             }],
             methods: vec![ANFMethod {
                 name: "verify".to_string(),
@@ -5344,11 +6182,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t5".to_string(),
-                        value: ANFValue::Assert { value: "t4".to_string() },
+                        value: ANFValue::Assert { value: "t4".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5422,6 +6261,7 @@ mod tests {
     fn test_bytestring_concat_emits_op_cat() {
         let program = ANFProgram {
             contract_name: "CatCheck".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "verify".to_string(),
@@ -5468,11 +6308,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t5".to_string(),
-                        value: ANFValue::Assert { value: "t4".to_string() },
+                        value: ANFValue::Assert { value: "t4".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -5500,6 +6341,7 @@ mod tests {
     fn test_log2_emits_64_if_ops() {
         let program = ANFProgram {
             contract_name: "TestLog2Count".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -5539,11 +6381,12 @@ mod tests {
                     },
                     ANFBinding {
                         name: "t4".to_string(),
-                        value: ANFValue::Assert { value: "t3".to_string() },
+                        value: ANFValue::Assert { value: "t3".to_string(), is_auto_injected_state_check: false },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 

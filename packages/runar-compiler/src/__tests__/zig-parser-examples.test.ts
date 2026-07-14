@@ -37,9 +37,34 @@ const TS_EXAMPLES = findExampleFiles(EXAMPLES_TS_DIR, '.runar.ts')
   .map((file) => file.replace(/\.runar\.ts$/, '.runar.zig'))
   .sort();
 
+// TS examples that don't yet have a Zig port. Listed explicitly so future
+// TS-only landings can be tracked here rather than silently dropped from
+// parity.
+const ZIG_PORT_PENDING: readonly string[] = [
+  // Intentionally TS-only: a compiler regression fixture for issue #34
+  // (cross-method param-name shadowing). The fix it guards lives in all 7
+  // tiers and is verified via the .runar.ts conformance fixture compiled by
+  // every tier; it needs no per-format example port.
+  'nested-if-multi-reassign/StackTrackerRepro.runar.zig',
+  // TS-only until the non-TS tiers receive the outer-scope-refs-across-
+  // unrolled-loops stack-lowering fix (the TS fix landed in
+  // 05-stack-lower.ts): CompanionVerifier's bounded multi-input walk
+  // references `inCount`/`off` inside an unrolled loop, which the Go/Rust
+  // stack lowerers still reject with "value 'inCount' not found on stack".
+  // Port these alongside that fix.
+  'companion-verifier/AttributedToken.runar.zig',
+  'companion-verifier/CompanionVerifier.runar.zig',
+];
+
 describe('Zig parser: example inventory', () => {
-  it('ships a Zig example for every native example contract', () => {
-    expect(ZIG_EXAMPLES).toEqual(TS_EXAMPLES);
+  it('ships a Zig example for every native example contract (minus known pending ports)', () => {
+    // Every TS example must have a Zig counterpart, except those explicitly
+    // listed as pending. Zig may carry format-specific extras (e.g. Zig-only
+    // demos like ec-unit or bitwise-ops) that have no TS analogue; those
+    // don't break parity.
+    const expected = TS_EXAMPLES.filter((rel) => !ZIG_PORT_PENDING.includes(rel));
+    const missing = expected.filter((rel) => !ZIG_EXAMPLES.includes(rel));
+    expect(missing).toEqual([]);
   });
 });
 

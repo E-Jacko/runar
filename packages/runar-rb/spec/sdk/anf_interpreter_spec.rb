@@ -811,6 +811,39 @@ RSpec.describe 'Runar::SDK::ANFInterpreter' do
       new_state = mod.compute_new_state(loop_anf, 'run', { 'result' => 0 }, {})
       expect(new_state['result']).to eq(6)
     end
+
+    # #121: honor start/step. Build a loop that accumulates the iterator value.
+    def start_step_loop_anf(count, start, step)
+      body = {
+        'kind' => 'loop', 'count' => count, 'iterVar' => 'i',
+        'start' => "#{start}n", 'step' => step,
+        'body' => [
+          { 'name' => 'li0', 'value' => { 'kind' => 'load_prop', 'name' => 'result' } },
+          { 'name' => 'li1', 'value' => { 'kind' => 'load_param', 'name' => 'i' } },
+          { 'name' => 'li2', 'value' => { 'kind' => 'bin_op', 'op' => '+', 'left' => 'li0', 'right' => 'li1' } },
+          { 'name' => 'li3', 'value' => { 'kind' => 'update_prop', 'name' => 'result', 'value' => 'li2' } },
+        ],
+      }
+      {
+        'contractName' => 'LoopTest',
+        'properties' => [{ 'name' => 'result', 'type' => 'bigint', 'readonly' => false }],
+        'methods' => [
+          { 'name' => 'constructor', 'params' => [], 'body' => [], 'isPublic' => false },
+          { 'name' => 'run', 'params' => [],
+            'body' => [{ 'name' => 'lresult', 'value' => body }], 'isPublic' => true },
+        ],
+      }
+    end
+
+    it 'honors a non-zero start (sum of 1+2+3 = 6)' do
+      new_state = mod.compute_new_state(start_step_loop_anf(3, 1, 1), 'run', { 'result' => 0 }, {})
+      expect(new_state['result']).to eq(6)
+    end
+
+    it 'honors a countdown step (sum of 3+2+1 = 6)' do
+      new_state = mod.compute_new_state(start_step_loop_anf(3, 3, -1), 'run', { 'result' => 0 }, {})
+      expect(new_state['result']).to eq(6)
+    end
   end
 
   # ---------------------------------------------------------------------------

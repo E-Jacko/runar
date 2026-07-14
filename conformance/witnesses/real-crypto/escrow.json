@@ -1,0 +1,30 @@
+{
+  "fixture": "escrow",
+  "kind": "stateless-signed",
+  "note": "Three-party escrow: each spending path verifies TWO real ECDSA signatures (party + arbiter). buyer=alice, seller=bob, arbiter=charlie.",
+  "constructorArgs": {
+    "buyer": { "$pubkey": "alice" },
+    "seller": { "$pubkey": "bob" },
+    "arbiter": { "$pubkey": "charlie" }
+  },
+  "spends": [
+    {
+      "method": "release",
+      "args": [{ "$sig": "bob" }, { "$sig": "charlie" }],
+      "expect": "accept",
+      "note": "seller + arbiter both sign — releases to seller"
+    },
+    {
+      "method": "release",
+      "args": [{ "$sig": "bob" }, { "$sig": "dave" }],
+      "expect": "reject",
+      "note": "crypto near-miss: dave is not the arbiter — second checkSig fails"
+    },
+    {
+      "method": "refund",
+      "args": [{ "$sig": "alice" }, { "$sig": "charlie" }],
+      "expect": "accept",
+      "note": "buyer + arbiter both sign — refunds to buyer"
+    }
+  ]
+}

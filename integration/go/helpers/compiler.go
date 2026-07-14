@@ -1,14 +1,19 @@
 package helpers
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/icellan/runar/compilers/go/codegen"
+	"github.com/icellan/runar/compilers/go/compiler"
 	"github.com/icellan/runar/compilers/go/frontend"
 	"github.com/icellan/runar/compilers/go/ir"
 	runar "github.com/icellan/runar/packages/runar-go"
@@ -53,7 +58,7 @@ func CompileContract(sourcePath string, constructorArgs map[string]interface{}) 
 		return nil, fmt.Errorf("parse errors: %v", parseResult.Errors)
 	}
 	if parseResult.Contract == nil {
-		return nil, fmt.Errorf("no contract found in %s", sourcePath)
+		return nil, fmt.Errorf("no contract found in %s", absPath)
 	}
 
 	validResult := frontend.Validate(parseResult.Contract)
@@ -93,7 +98,23 @@ func CompileContract(sourcePath string, constructorArgs map[string]interface{}) 
 	return compileFromProgram(program)
 }
 
+// optimizeANF runs the same ANF passes the shipped Go compiler applies before
+// stack lowering (see compilers/go/compiler/compiler.go CompileFromProgram):
+// constant folding (fold-ON, the compiler default) followed by the EC
+// optimizer, which also performs dead-binding elimination. The integration
+// helper previously skipped both, so its output diverged from the bytes a Go
+// user actually deploys (TS-BUG-001). Compiling always happens from source
+// here (parse → LowerToANF), never from pre-lowered `--ir` input, so folding
+// is unconditionally correct — matching the compiler's source path.
+func optimizeANF(program *ir.ANFProgram) *ir.ANFProgram {
+	program = frontend.FoldConstants(program)
+	program = frontend.OptimizeEC(program)
+	return program
+}
+
 func compileFromProgram(program *ir.ANFProgram) (*Artifact, error) {
+	program = optimizeANF(program)
+
 	stackMethods, err := codegen.LowerToStack(program)
 	if err != nil {
 		return nil, fmt.Errorf("stack lowering: %w", err)
@@ -124,10 +145,51 @@ func compileFromProgram(program *ir.ANFProgram) (*Artifact, error) {
 	}, nil
 }
 
-// CompileToSDKArtifact compiles a source file and returns a runar.RunarArtifact
-// suitable for use with RunarContract from the SDK.
+// CompileToSDKArtifactAbs compiles a source file at an absolute path and
+// returns a runar.RunarArtifact suitable for use with RunarContract.
+// Use this when the contract source is outside the Rúnar project tree.
+func CompileToSDKArtifactAbs(absPath string) (*runar.RunarArtifact, error) {
+	return compileToSDKArtifact(absPath)
+}
+
+// CompileToSDKArtifactWithGroth16WAVKey compiles a Mode 3 stateful contract
+// (one whose method body calls runar.AssertGroth16WitnessAssisted) by
+// supplying the SP1-format Groth16 verifying key path that the codegen will
+// load and bake into the witness-assisted verifier preamble. The resulting
+// artifact is otherwise a standard SDK artifact and can be deployed and
+// called via RunarContract just like any other.
+//
+// vkAbsPath must be an absolute path to a vk.json file matching the schema
+// in tests/vectors/sp1/v6.0.0/README.md.
+func CompileToSDKArtifactWithGroth16WAVKey(sourcePath string, vkAbsPath string) (*runar.RunarArtifact, error) {
+	absPath := filepath.Join(projectRoot(), sourcePath)
+	return compileToSDKArtifactWithOptions(absPath, vkAbsPath)
+}
+
+// CompileToSDKArtifactAbsWithGroth16WAVKey is the absolute-path variant of
+// CompileToSDKArtifactWithGroth16WAVKey. Use this when the contract source
+// lives outside the Rúnar project tree (e.g. bsv-evm's
+// pkg/covenant/contracts/rollup_groth16_wa.runar.go).
+func CompileToSDKArtifactAbsWithGroth16WAVKey(absSourcePath string, vkAbsPath string) (*runar.RunarArtifact, error) {
+	return compileToSDKArtifactWithOptions(absSourcePath, vkAbsPath)
+}
+
+// CompileToSDKArtifact compiles a source file relative to the Rúnar project
+// root and returns a runar.RunarArtifact suitable for use with RunarContract.
 func CompileToSDKArtifact(sourcePath string, constructorArgs map[string]interface{}) (*runar.RunarArtifact, error) {
 	absPath := filepath.Join(projectRoot(), sourcePath)
+	return compileToSDKArtifact(absPath)
+}
+
+func compileToSDKArtifact(absPath string) (*runar.RunarArtifact, error) {
+	return compileToSDKArtifactWithOptions(absPath, "")
+}
+
+// compileToSDKArtifactWithOptions is the worker behind both compileToSDKArtifact
+// and CompileToSDKArtifactWithGroth16WAVKey. When groth16WAVKey is non-empty,
+// the codegen pass is given a LowerToStackOptions with the loaded VK so the
+// witness-assisted Groth16 verifier preamble emitter has access to it.
+func compileToSDKArtifactWithOptions(absPath, groth16WAVKey string) (*runar.RunarArtifact, error) {
 	source, err := os.ReadFile(absPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading source: %w", err)
@@ -138,7 +200,7 @@ func CompileToSDKArtifact(sourcePath string, constructorArgs map[string]interfac
 		return nil, fmt.Errorf("parse errors: %v", parseResult.Errors)
 	}
 	if parseResult.Contract == nil {
-		return nil, fmt.Errorf("no contract found in %s", sourcePath)
+		return nil, fmt.Errorf("no contract found in %s", absPath)
 	}
 
 	validResult := frontend.Validate(parseResult.Contract)
@@ -159,7 +221,27 @@ func CompileToSDKArtifact(sourcePath string, constructorArgs map[string]interfac
 	// actual values at deployment time. Setting InitialValue would bake values
 	// into the script AND the SDK would append them again (CLEANSTACK bug).
 
-	stackMethods, err := codegen.LowerToStack(program)
+	var lowerOpts codegen.LowerToStackOptions
+	if groth16WAVKey != "" {
+		// Mode 3 path: load the SP1 vk.json into a Groth16Config so the
+		// codegen preamble emitter can bake the verifying key into the
+		// inlined witness-assisted verifier ops. The compiler package
+		// owns this loader (it can import bn254witness; the codegen
+		// package cannot, due to an import cycle).
+		cfg, cfgErr := compiler.LoadGroth16WAConfigForTests(groth16WAVKey)
+		if cfgErr != nil {
+			return nil, fmt.Errorf("loading groth16 vk %q: %w", groth16WAVKey, cfgErr)
+		}
+		lowerOpts.Groth16WAConfig = &cfg
+	}
+
+	// Match the shipped compiler pipeline: fold + EC on ANF before stack
+	// lowering (TS-BUG-001). Constant folding leaves load_prop unchanged, so
+	// the constructor-slot placeholders emitted for readonly properties are
+	// preserved exactly as the shipped SDK compile path produces them.
+	program = optimizeANF(program)
+
+	stackMethods, err := codegen.LowerToStack(program, lowerOpts)
 	if err != nil {
 		return nil, fmt.Errorf("stack lowering: %w", err)
 	}
@@ -191,7 +273,7 @@ func CompileToSDKArtifact(sourcePath string, constructorArgs map[string]interfac
 	for _, p := range contract.Constructor.Params {
 		typeName := "bigint"
 		if p.Type != nil {
-			typeName = astTypeName(p.Type)
+			typeName = AstTypeName(p.Type)
 		}
 		ctorParams = append(ctorParams, runar.ABIParam{Name: p.Name, Type: typeName})
 	}
@@ -205,7 +287,7 @@ func CompileToSDKArtifact(sourcePath string, constructorArgs map[string]interfac
 			}
 			typeName := "bigint"
 			if p.Type != nil {
-				typeName = astTypeName(p.Type)
+				typeName = AstTypeName(p.Type)
 			}
 			field := runar.StateField{
 				Name:  p.Name,
@@ -233,7 +315,7 @@ func CompileToSDKArtifact(sourcePath string, constructorArgs map[string]interfac
 	}
 
 	// Convert compiler IR ANF to SDK ANF for auto-state computation
-	sdkANF := convertIRANFToSDK(program)
+	sdkANF := ConvertIRANFToSDK(program)
 
 	artifact := &runar.RunarArtifact{
 		Version:          "runar-v0.1.0",
@@ -255,6 +337,14 @@ func CompileToSDKArtifact(sourcePath string, constructorArgs map[string]interfac
 	}
 	if len(emitResult.CodeSeparatorIndices) > 0 {
 		artifact.CodeSeparatorIndices = emitResult.CodeSeparatorIndices
+	}
+	if len(emitResult.CodeSepIndexSlots) > 0 {
+		for _, s := range emitResult.CodeSepIndexSlots {
+			artifact.CodeSepIndexSlots = append(artifact.CodeSepIndexSlots, runar.CodeSepIndexSlot{
+				ByteOffset:   s.ByteOffset,
+				CodeSepIndex: s.CodeSepIndex,
+			})
+		}
 	}
 	return artifact, nil
 }
@@ -329,6 +419,12 @@ func CompileSourceStringToSDKArtifact(source, fileName string, constructorArgs m
 
 	program := frontend.LowerToANF(parseResult.Contract)
 
+	// Match the shipped compiler pipeline: fold + EC on ANF before stack
+	// lowering (TS-BUG-001). load_prop is left unchanged by folding, so the
+	// constructor-slot placeholders spliced by RunarContract.buildCodeScript
+	// remain byte-identical to the shipped SDK compile path.
+	program = optimizeANF(program)
+
 	stackMethods, err := codegen.LowerToStack(program)
 	if err != nil {
 		return nil, fmt.Errorf("stack lowering: %w", err)
@@ -355,9 +451,40 @@ func CompileSourceStringToSDKArtifact(source, fileName string, constructorArgs m
 		})
 	}
 
+	contract := parseResult.Contract
 	var ctorParams []runar.ABIParam
-	for _, p := range program.Properties {
-		ctorParams = append(ctorParams, runar.ABIParam{Name: p.Name, Type: p.Type})
+	for _, p := range contract.Constructor.Params {
+		typeName := "bigint"
+		if p.Type != nil {
+			typeName = AstTypeName(p.Type)
+		}
+		ctorParams = append(ctorParams, runar.ABIParam{Name: p.Name, Type: typeName})
+	}
+
+	// Build state fields for stateful contracts
+	var stateFields []runar.StateField
+	if contract.ParentClass == "StatefulSmartContract" {
+		for i, p := range contract.Properties {
+			if p.Readonly {
+				continue
+			}
+			typeName := "bigint"
+			if p.Type != nil {
+				typeName = AstTypeName(p.Type)
+			}
+			field := runar.StateField{
+				Name:  p.Name,
+				Type:  typeName,
+				Index: i,
+			}
+			for _, anfProp := range program.Properties {
+				if anfProp.Name == p.Name && anfProp.InitialValue != nil {
+					field.InitialValue = anfProp.InitialValue
+					break
+				}
+			}
+			stateFields = append(stateFields, field)
+		}
 	}
 
 	var cSlots []runar.ConstructorSlot
@@ -368,27 +495,47 @@ func CompileSourceStringToSDKArtifact(source, fileName string, constructorArgs m
 		})
 	}
 
-	return &runar.RunarArtifact{
+	sdkANF := ConvertIRANFToSDK(program)
+
+	artifact := &runar.RunarArtifact{
 		Version:          "runar-v0.1.0",
 		CompilerVersion:  "integration-test",
 		ContractName:     program.ContractName,
 		Script:           emitResult.ScriptHex,
 		ASM:              emitResult.ScriptAsm,
 		ConstructorSlots: cSlots,
+		StateFields:      stateFields,
+		ANF:              sdkANF,
 		ABI: runar.ABI{
 			Constructor: runar.ABIConstructor{Params: ctorParams},
 			Methods:     abiMethods,
 		},
-	}, nil
+	}
+	if emitResult.CodeSeparatorIndex >= 0 {
+		idx := emitResult.CodeSeparatorIndex
+		artifact.CodeSeparatorIndex = &idx
+	}
+	if len(emitResult.CodeSeparatorIndices) > 0 {
+		artifact.CodeSeparatorIndices = emitResult.CodeSeparatorIndices
+	}
+	if len(emitResult.CodeSepIndexSlots) > 0 {
+		for _, s := range emitResult.CodeSepIndexSlots {
+			artifact.CodeSepIndexSlots = append(artifact.CodeSepIndexSlots, runar.CodeSepIndexSlot{
+				ByteOffset:   s.ByteOffset,
+				CodeSepIndex: s.CodeSepIndex,
+			})
+		}
+	}
+	return artifact, nil
 }
 
-// astTypeName extracts the type name string from a frontend.TypeNode.
-func astTypeName(t frontend.TypeNode) string {
+// AstTypeName extracts the type name string from a frontend.TypeNode.
+func AstTypeName(t frontend.TypeNode) string {
 	switch v := t.(type) {
 	case frontend.PrimitiveType:
 		return v.Name
 	case frontend.FixedArrayType:
-		return fmt.Sprintf("FixedArray<%s,%d>", astTypeName(v.Element), v.Length)
+		return fmt.Sprintf("FixedArray<%s,%d>", AstTypeName(v.Element), v.Length)
 	case frontend.CustomType:
 		return v.Name
 	default:
@@ -400,10 +547,10 @@ func astTypeName(t frontend.TypeNode) string {
 // IR → SDK ANF conversion
 // ---------------------------------------------------------------------------
 
-// convertIRANFToSDK converts the compiler's ir.ANFProgram (typed structs) to
+// ConvertIRANFToSDK converts the compiler's ir.ANFProgram (typed structs) to
 // the SDK's runar.ANFProgram (map[string]interface{} values) so the SDK's
 // auto-state computation (ComputeNewState) can interpret the ANF.
-func convertIRANFToSDK(program *ir.ANFProgram) *runar.ANFProgram {
+func ConvertIRANFToSDK(program *ir.ANFProgram) *runar.ANFProgram {
 	sdkProps := make([]runar.ANFProperty, len(program.Properties))
 	for i, p := range program.Properties {
 		sdkProps[i] = runar.ANFProperty{
@@ -423,7 +570,7 @@ func convertIRANFToSDK(program *ir.ANFProgram) *runar.ANFProgram {
 		sdkMethods[i] = runar.ANFMethod{
 			Name:     m.Name,
 			Params:   sdkParams,
-			Body:     convertIRBindings(m.Body),
+			Body:     ConvertIRBindings(m.Body),
 			IsPublic: m.IsPublic,
 		}
 	}
@@ -435,18 +582,18 @@ func convertIRANFToSDK(program *ir.ANFProgram) *runar.ANFProgram {
 	}
 }
 
-func convertIRBindings(bindings []ir.ANFBinding) []runar.ANFBinding {
+func ConvertIRBindings(bindings []ir.ANFBinding) []runar.ANFBinding {
 	result := make([]runar.ANFBinding, len(bindings))
 	for i, b := range bindings {
 		result[i] = runar.ANFBinding{
 			Name:  b.Name,
-			Value: convertIRValue(b.Value),
+			Value: ConvertIRValue(b.Value),
 		}
 	}
 	return result
 }
 
-func convertIRValue(v ir.ANFValue) map[string]interface{} {
+func ConvertIRValue(v ir.ANFValue) map[string]interface{} {
 	m := map[string]interface{}{
 		"kind": v.Kind,
 	}
@@ -506,13 +653,13 @@ func convertIRValue(v ir.ANFValue) map[string]interface{} {
 
 	case "if":
 		m["cond"] = v.Cond
-		m["then"] = convertBindingsToInterface(v.Then)
-		m["else"] = convertBindingsToInterface(v.Else)
+		m["then"] = ConvertBindingsToInterface(v.Then)
+		m["else"] = ConvertBindingsToInterface(v.Else)
 
 	case "loop":
 		m["count"] = v.Count
 		m["iterVar"] = v.IterVar
-		m["body"] = convertBindingsToInterface(v.Body)
+		m["body"] = ConvertBindingsToInterface(v.Body)
 
 	case "assert":
 		m["value"] = v.ValueRef
@@ -544,6 +691,10 @@ func convertIRValue(v ir.ANFValue) map[string]interface{} {
 		m["satoshis"] = v.Satoshis
 		m["scriptBytes"] = v.ScriptBytes
 
+	case "add_data_output":
+		m["satoshis"] = v.Satoshis
+		m["scriptBytes"] = v.ScriptBytes
+
 	case "get_state_script":
 		// no extra fields needed
 	}
@@ -551,15 +702,148 @@ func convertIRValue(v ir.ANFValue) map[string]interface{} {
 	return m
 }
 
-// convertBindingsToInterface converts IR bindings to []interface{} of maps,
+// ConvertBindingsToInterface converts IR bindings to []interface{} of maps,
 // matching the format that anfGetBindings expects in the SDK interpreter.
-func convertBindingsToInterface(bindings []ir.ANFBinding) []interface{} {
+func ConvertBindingsToInterface(bindings []ir.ANFBinding) []interface{} {
 	result := make([]interface{}, len(bindings))
 	for i, b := range bindings {
 		result[i] = map[string]interface{}{
 			"name":  b.Name,
-			"value": convertIRValue(b.Value),
+			"value": ConvertIRValue(b.Value),
 		}
 	}
 	return result
+}
+
+// ComputeHashOutputsFromTxHex manually parses a raw TX hex and computes
+// the BIP-143 hashOutputs (double-SHA256 of serialized outputs).
+func ComputeHashOutputsFromTxHex(txHex string) string {
+	pos := 8 // skip version
+	// Input count
+	ic, icl := readVI(txHex, pos)
+	pos += icl
+	// Skip all inputs
+	for i := 0; i < ic; i++ {
+		pos += 64 + 8 // prevtxid + vout
+		sl, sll := readVI(txHex, pos)
+		pos += sll + sl*2 + 8 // scriptSig + sequence
+	}
+	// Output count
+	oc, ocl := readVI(txHex, pos)
+	pos += ocl
+	// Serialize all outputs
+	var outputsHex string
+	for i := 0; i < oc; i++ {
+		valHex := txHex[pos : pos+16]
+		pos += 16
+		sl, sll := readVI(txHex, pos)
+		viHex := txHex[pos : pos+sll]
+		pos += sll
+		scriptHex := txHex[pos : pos+sl*2]
+		pos += sl * 2
+		outputsHex += valHex + viHex + scriptHex
+		_ = i
+	}
+	outputsBytes, _ := hex.DecodeString(outputsHex)
+	h1 := sha256Sum(outputsBytes)
+	h2 := sha256Sum(h1)
+	return hex.EncodeToString(h2)
+}
+
+func readVI(h string, pos int) (int, int) {
+	fb, _ := strconv.ParseUint(h[pos:pos+2], 16, 8)
+	if fb < 0xfd {
+		return int(fb), 2
+	}
+	if fb == 0xfd {
+		lo, _ := strconv.ParseUint(h[pos+2:pos+4], 16, 8)
+		hi, _ := strconv.ParseUint(h[pos+4:pos+6], 16, 8)
+		return int(lo) | int(hi)<<8, 6
+	}
+	if fb == 0xfe {
+		b0, _ := strconv.ParseUint(h[pos+2:pos+4], 16, 8)
+		b1, _ := strconv.ParseUint(h[pos+4:pos+6], 16, 8)
+		b2, _ := strconv.ParseUint(h[pos+6:pos+8], 16, 8)
+		b3, _ := strconv.ParseUint(h[pos+8:pos+10], 16, 8)
+		return int(b0) | int(b1)<<8 | int(b2)<<16 | int(b3)<<24, 10
+	}
+	// fb == 0xff: 8-byte little-endian value
+	b0, _ := strconv.ParseUint(h[pos+2:pos+4], 16, 8)
+	b1, _ := strconv.ParseUint(h[pos+4:pos+6], 16, 8)
+	b2, _ := strconv.ParseUint(h[pos+6:pos+8], 16, 8)
+	b3, _ := strconv.ParseUint(h[pos+8:pos+10], 16, 8)
+	b4, _ := strconv.ParseUint(h[pos+10:pos+12], 16, 8)
+	b5, _ := strconv.ParseUint(h[pos+12:pos+14], 16, 8)
+	b6, _ := strconv.ParseUint(h[pos+14:pos+16], 16, 8)
+	b7, _ := strconv.ParseUint(h[pos+16:pos+18], 16, 8)
+	return int(b0) | int(b1)<<8 | int(b2)<<16 | int(b3)<<24 |
+		int(b4)<<32 | int(b5)<<40 | int(b6)<<48 | int(b7)<<56, 18
+}
+
+func sha256Sum(data []byte) []byte {
+	h := sha256.Sum256(data)
+	return h[:]
+}
+
+// CompileWithTSCompiler compiles a source string using the TypeScript compiler
+// via the Node CLI. Returns the raw artifact JSON bytes.
+//
+// Performance note: invokes `node --import <tsx-loader-url>` directly
+// instead of `npx tsx ...`. The latter pays ~50-200ms of package-manager
+// resolution per call which dominates short-test wall time when run in a
+// loop.
+func CompileWithTSCompiler(source, fileName string) ([]byte, error) {
+	// Write source to temp file
+	tmpDir, err := os.MkdirTemp("", "runar-ts-compile-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	srcPath := filepath.Join(tmpDir, fileName)
+	if err := os.WriteFile(srcPath, []byte(source), 0644); err != nil {
+		return nil, err
+	}
+
+	outDir := filepath.Join(tmpDir, "out")
+	os.MkdirAll(outDir, 0755)
+
+	// Run TS compiler
+	root := projectRoot()
+	tsxLoader := resolveTsxLoader(root)
+	cmd := fmt.Sprintf("node --import %s %s/packages/runar-cli/src/bin.ts compile %s -o %s",
+		tsxLoader, root, srcPath, outDir)
+	out, err := runCmd(cmd, root, 60*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("TS compile: %s: %w", out, err)
+	}
+
+	// Read the artifact JSON (filename without the extension + .json)
+	baseName := fileName[:len(fileName)-3] // strip .ts
+	artifactPath := filepath.Join(outDir, baseName+".json")
+	return os.ReadFile(artifactPath)
+}
+
+// resolveTsxLoader returns a `file://` URL pointing at tsx's loader.mjs,
+// suitable for `node --import <url>`. Falls back to the literal "tsx" if no
+// loader is found (Node will then resolve via the cwd's node_modules).
+func resolveTsxLoader(root string) string {
+	candidates := []string{
+		filepath.Join(root, "conformance/node_modules/tsx/dist/loader.mjs"),
+		filepath.Join(root, "node_modules/tsx/dist/loader.mjs"),
+		filepath.Join(root, "integration/ts/node_modules/tsx/dist/loader.mjs"),
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return "file://" + p
+		}
+	}
+	return "tsx"
+}
+
+func runCmd(cmdStr, dir string, timeout time.Duration) (string, error) {
+	cmd := exec.Command("sh", "-c", cmdStr)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }

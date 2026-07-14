@@ -3,6 +3,8 @@
 //! Parses Rust-style contract definitions using a hand-written tokenizer
 //! and recursive descent parser. Produces the same AST as the TypeScript parser.
 
+use num_bigint::BigInt;
+use num_traits::Num;
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName,
     PropertyNode, SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -27,7 +29,7 @@ enum TokenType {
     Semi, Comma, Dot, DotDot, Colon, ColonColon, Arrow,
     // Operators
     Plus, Minus, Star, Slash, Percent,
-    EqEq, BangEq, Lt, LtEq, Gt, GtEq,
+    EqEq, BangEq, Lt, LtEq, Gt, GtEq, Shl, Shr,
     AmpAmp, PipePipe,
     Amp, Pipe, Caret, Tilde, Bang,
     Eq, PlusEq, MinusEq,
@@ -99,6 +101,8 @@ fn tokenize(source: &str) -> Vec<Token> {
                 "!=" => Some(TokenType::BangEq),
                 "<=" => Some(TokenType::LtEq),
                 ">=" => Some(TokenType::GtEq),
+                "<<" => Some(TokenType::Shl),
+                ">>" => Some(TokenType::Shr),
                 "&&" => Some(TokenType::AmpAmp),
                 "||" => Some(TokenType::PipePipe),
                 "+=" => Some(TokenType::PlusEq),
@@ -289,9 +293,14 @@ impl RustDslParser {
             if matches!(self.current().typ, TokenType::HashBracket) {
                 let attr = self.parse_attribute();
 
-                if attr == "runar::contract" || attr == "runar::stateful_contract" {
+                if attr == "runar::contract"
+                    || attr == "runar::stateful_contract"
+                    || attr == "runar::unsafe_contract"
+                {
                     if attr == "runar::stateful_contract" {
                         parent_class = "StatefulSmartContract".to_string();
+                    } else if attr == "runar::unsafe_contract" {
+                        parent_class = "UnsafeSmartContract".to_string();
                     }
                     // Parse struct
                     if matches!(self.current().typ, TokenType::Pub) { self.advance_clone(); }
@@ -308,6 +317,11 @@ impl RustDslParser {
                         if matches!(self.current().typ, TokenType::HashBracket) {
                             let field_attr = self.parse_attribute();
                             if field_attr == "readonly" { readonly = true; }
+                        }
+
+                        // Skip optional `pub` visibility modifier
+                        if matches!(self.current().typ, TokenType::Pub) {
+                            self.advance_clone();
                         }
 
                         let loc = self.loc();
@@ -330,6 +344,8 @@ impl RustDslParser {
                                     readonly,
                                     initializer: None,
                                     source_location: loc,
+                                    synthetic_array_chain: None,
+                                    embed_always: false,
                                 });
                             }
                         } else {
@@ -338,30 +354,21 @@ impl RustDslParser {
                     }
                     self.expect(&TokenType::RBrace);
                 } else if attr.starts_with("runar::methods") {
-                    // Parse impl block
-                    if matches!(self.current().typ, TokenType::Impl) { self.advance_clone(); }
-                    // Skip type name
-                    if let TokenType::Ident(_) = self.current().typ { self.advance_clone(); }
-                    self.expect(&TokenType::LBrace);
-
-                    while !matches!(self.current().typ, TokenType::RBrace | TokenType::Eof) {
-                        // Check for #[public] attribute
-                        let mut visibility = Visibility::Private;
-                        if matches!(self.current().typ, TokenType::HashBracket) {
-                            let method_attr = self.parse_attribute();
-                            if method_attr == "public" { visibility = Visibility::Public; }
-                        }
-                        if matches!(self.current().typ, TokenType::Pub) {
-                            self.advance_clone();
-                            visibility = Visibility::Public;
-                        }
-                        methods.push(self.parse_function(visibility));
-                    }
-                    self.expect(&TokenType::RBrace);
+                    // #[runar::methods] is no longer supported — bare `impl` blocks
+                    // are discovered directly. Emit a migration diagnostic; the
+                    // `impl` branch below still parses the block on the next pass.
+                    self.errors.push(Diagnostic::error(
+                        "#[runar::methods] is no longer supported — write a bare 'impl ContractName { ... }' block instead",
+                        None,
+                    ));
+                    continue;
                 } else {
                     // Unknown attribute, skip
                     continue;
                 }
+            } else if matches!(self.current().typ, TokenType::Impl) {
+                let impl_methods = self.parse_impl_block();
+                methods.extend(impl_methods);
             } else {
                 self.advance_clone();
             }
@@ -374,7 +381,7 @@ impl RustDslParser {
 
         if contract_name.is_empty() {
             self.errors.push(Diagnostic::error("No Rúnar contract struct found", None));
-            return ParseResult { contract: None, errors: self.errors };
+            return ParseResult { contract: None, errors: self.errors, source_size_err: None };
         }
 
         // Extract init() method as property initializers, if present.
@@ -415,6 +422,7 @@ impl RustDslParser {
             expression: Expression::CallExpr {
                 callee: Box::new(Expression::Identifier { name: "super".to_string() }),
                 args: super_args,
+                asm_return_type: None,
             },
             source_location: loc.clone(),
         };
@@ -438,6 +446,7 @@ impl RustDslParser {
             body: ctor_body,
             visibility: Visibility::Public,
             source_location: loc,
+            sighash_type: None,
         };
 
         let contract = ContractNode {
@@ -449,7 +458,41 @@ impl RustDslParser {
             source_file: self.file.clone(),
         };
 
-        ParseResult { contract: Some(contract), errors: self.errors }
+        ParseResult { contract: Some(contract), errors: self.errors, source_size_err: None }
+    }
+
+    /// Parse a bare `impl ContractName { ... }` block and return its methods.
+    /// The type name is consumed and discarded (unrelated `impl` blocks merge
+    /// the same way they did under the old `#[runar::methods]` gate). `pub fn`
+    /// marks a public spending entry point; bare `fn` is a private helper.
+    fn parse_impl_block(&mut self) -> Vec<MethodNode> {
+        let mut methods: Vec<MethodNode> = Vec::new();
+        self.expect(&TokenType::Impl);
+        // Skip the type name.
+        if let TokenType::Ident(_) = self.current().typ { self.advance_clone(); }
+        self.expect(&TokenType::LBrace);
+
+        while !matches!(self.current().typ, TokenType::RBrace | TokenType::Eof) {
+            // #[public] is no longer supported — `pub fn` marks public methods.
+            while matches!(self.current().typ, TokenType::HashBracket) {
+                let method_attr = self.parse_attribute();
+                if method_attr == "public" {
+                    self.errors.push(Diagnostic::error(
+                        "#[public] is no longer supported — use 'pub fn' for public methods",
+                        None,
+                    ));
+                }
+            }
+
+            let mut visibility = Visibility::Private;
+            if matches!(self.current().typ, TokenType::Pub) {
+                self.advance_clone();
+                visibility = Visibility::Public;
+            }
+            methods.push(self.parse_function(visibility));
+        }
+        self.expect(&TokenType::RBrace);
+        methods
     }
 
     fn parse_attribute(&mut self) -> String {
@@ -476,6 +519,25 @@ impl RustDslParser {
     }
 
     fn parse_rust_type(&mut self) -> TypeNode {
+        // Fixed-size array: `[T; N]` — maps to TypeNode::FixedArray.
+        if matches!(self.current().typ, TokenType::LBracket) {
+            self.advance_clone(); // consume [
+            let element = self.parse_rust_type();
+            // Expect `;`
+            self.match_tok(&TokenType::Semi);
+            // Length must be a numeric literal.
+            let length = if let TokenType::Number(val) = self.current().typ.clone() {
+                self.advance_clone();
+                val.parse::<usize>().unwrap_or(0)
+            } else {
+                0
+            };
+            self.match_tok(&TokenType::RBracket);
+            return TypeNode::FixedArray {
+                element: Box::new(element),
+                length,
+            };
+        }
         if let TokenType::Ident(name) = self.current().typ.clone() {
             self.advance_clone();
             let mapped = map_rust_type(&name);
@@ -558,7 +620,7 @@ impl RustDslParser {
         }
         self.expect(&TokenType::RBrace);
 
-        MethodNode { name, params, body, visibility, source_location: loc }
+        MethodNode { name, params, body, visibility, sighash_type: None, source_location: loc }
     }
 
     fn parse_statement(&mut self) -> Option<Statement> {
@@ -575,6 +637,7 @@ impl RustDslParser {
                 expression: Expression::CallExpr {
                     callee: Box::new(Expression::Identifier { name: "assert".to_string() }),
                     args: vec![expr],
+                    asm_return_type: None,
                 },
                 source_location: loc,
             });
@@ -597,6 +660,7 @@ impl RustDslParser {
                         left: Box::new(left),
                         right: Box::new(right),
                     }],
+                    asm_return_type: None,
                 },
                 source_location: loc,
             });
@@ -641,13 +705,23 @@ impl RustDslParser {
             self.expect(&TokenType::RBrace);
             let else_branch = if matches!(self.current().typ, TokenType::Else) {
                 self.advance_clone();
-                self.expect(&TokenType::LBrace);
-                let mut eb = Vec::new();
-                while !matches!(self.current().typ, TokenType::RBrace | TokenType::Eof) {
-                    if let Some(s) = self.parse_statement() { eb.push(s); }
+                // `else if <cond> { ... }` -> treat the `if` as a nested
+                // statement so else chains compose correctly.
+                if matches!(self.current().typ, TokenType::If) {
+                    if let Some(nested) = self.parse_statement() {
+                        Some(vec![nested])
+                    } else {
+                        Some(Vec::new())
+                    }
+                } else {
+                    self.expect(&TokenType::LBrace);
+                    let mut eb = Vec::new();
+                    while !matches!(self.current().typ, TokenType::RBrace | TokenType::Eof) {
+                        if let Some(s) = self.parse_statement() { eb.push(s); }
+                    }
+                    self.expect(&TokenType::RBrace);
+                    Some(eb)
                 }
-                self.expect(&TokenType::RBrace);
-                Some(eb)
             } else {
                 None
             };
@@ -771,6 +845,16 @@ impl RustDslParser {
                 }
             }
         }
+        // Recurse into `self.board[idx]` so the inner MemberExpr becomes a
+        // PropertyAccess. The expand-fixed-arrays pass matches on
+        // `PropertyAccess` inside `IndexAccess.object`.
+        if let Expression::IndexAccess { object, index } = expr {
+            let new_obj = self.convert_self_access(*object);
+            return Expression::IndexAccess {
+                object: Box::new(new_obj),
+                index,
+            };
+        }
         expr
     }
 
@@ -839,13 +923,27 @@ impl RustDslParser {
     }
 
     fn parse_comparison(&mut self) -> Expression {
-        let mut left = self.parse_add_sub();
+        let mut left = self.parse_shift();
         loop {
             let op = match self.current().typ {
                 TokenType::Lt => BinaryOp::Lt,
                 TokenType::LtEq => BinaryOp::Le,
                 TokenType::Gt => BinaryOp::Gt,
                 TokenType::GtEq => BinaryOp::Ge,
+                _ => break,
+            };
+            self.advance_clone();
+            left = Expression::BinaryExpr { op, left: Box::new(left), right: Box::new(self.parse_shift()) };
+        }
+        left
+    }
+
+    fn parse_shift(&mut self) -> Expression {
+        let mut left = self.parse_add_sub();
+        loop {
+            let op = match self.current().typ {
+                TokenType::Shl => BinaryOp::Shl,
+                TokenType::Shr => BinaryOp::Shr,
                 _ => break,
             };
             self.advance_clone();
@@ -908,7 +1006,20 @@ impl RustDslParser {
                     if matches!(self.current().typ, TokenType::Comma) { self.advance_clone(); }
                 }
                 self.expect(&TokenType::RParen);
-                expr = Expression::CallExpr { callee: Box::new(expr), args };
+                // `.clone()` is a Rust borrow-checker artifact — in Rúnar,
+                // values are copied by default, so strip it and keep the
+                // receiver. Without this the IR emits a spurious
+                // method_call(clone) followed by a general-call fallback,
+                // which lowers to OP_DROP OP_0 padding.
+                if args.is_empty() {
+                    if let Expression::MemberExpr { object, property } = &expr {
+                        if property == "clone" {
+                            expr = (**object).clone();
+                            continue;
+                        }
+                    }
+                }
+                expr = Expression::CallExpr { callee: Box::new(expr), args, asm_return_type: None };
             } else if matches!(self.current().typ, TokenType::Dot) {
                 self.advance_clone();
                 let prop = if let TokenType::Ident(name) = self.current().typ.clone() {
@@ -948,7 +1059,8 @@ impl RustDslParser {
         match self.current().typ.clone() {
             TokenType::Number(val) => {
                 self.advance_clone();
-                let n: i128 = val.parse().unwrap_or(0);
+                let n = <BigInt as Num>::from_str_radix(&val, 10)
+                    .unwrap_or_else(|_| BigInt::from(0));
                 Expression::BigIntLiteral { value: n }
             }
             TokenType::HexString(val) => {
@@ -966,6 +1078,24 @@ impl RustDslParser {
                 let expr = self.parse_expression();
                 self.expect(&TokenType::RParen);
                 expr
+            }
+            TokenType::LBracket => {
+                // Array literal: `[e0, e1, ...]` — used for FixedArray
+                // property initializers in init(). Also supports nested
+                // array literals for nested FixedArrays.
+                self.advance_clone(); // consume [
+                let mut elements: Vec<Expression> = Vec::new();
+                while !matches!(self.current().typ, TokenType::RBracket | TokenType::Eof) {
+                    let e = self.parse_expression();
+                    elements.push(e);
+                    if matches!(self.current().typ, TokenType::Comma) {
+                        self.advance_clone();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&TokenType::RBracket);
+                Expression::ArrayLiteral { elements }
             }
             TokenType::Ident(name) => {
                 self.advance_clone();
@@ -1029,6 +1159,13 @@ fn map_rust_builtin(name: &str) -> String {
         "bin_2_num" => return "bin2num".to_string(),
         "int_2_str" => return "int2str".to_string(),
         "to_byte_string" => return "toByteString".to_string(),
+        "verify_ecdsa_p256" => return "verifyECDSA_P256".to_string(),
+        "verify_ecdsa_p384" => return "verifyECDSA_P384".to_string(),
+        // Intent sub-covenant intrinsics (BSVM Phase 13). The P2PKH acronym
+        // doesn't survive snake_to_camel (it would lowercase the `P`), so map
+        // explicitly. extract_prev_output_script and current_block_height
+        // round-trip cleanly but are listed in the post-camel block below.
+        "require_output_p2pkh" => return "requireOutputP2PKH".to_string(),
         _ => {}
     }
 
@@ -1049,6 +1186,8 @@ fn map_rust_builtin(name: &str) -> String {
         "int2str" => "int2str".to_string(),
         "extractLocktime" => "extractLocktime".to_string(),
         "extractOutputHash" => "extractOutputHash".to_string(),
+        "extractPrevOutputScript" => "extractPrevOutputScript".to_string(),
+        "currentBlockHeight" => "currentBlockHeight".to_string(),
         "extractVersion" => "extractVersion".to_string(),
         "extractHashPrevouts" => "extractHashPrevouts".to_string(),
         "extractHashSequence" => "extractHashSequence".to_string(),
@@ -1060,6 +1199,8 @@ fn map_rust_builtin(name: &str) -> String {
         "extractOutputs" => "extractOutputs".to_string(),
         "extractSigHashType" => "extractSigHashType".to_string(),
         "addOutput" => "addOutput".to_string(),
+        "addRawOutput" => "addRawOutput".to_string(),
+        "addDataOutput" => "addDataOutput".to_string(),
         "reverseBytes" => "reverseBytes".to_string(),
         "toByteString" => "toByteString".to_string(),
         _ => camel,
@@ -1095,10 +1236,8 @@ pub struct P2PKH {
     pub_key_hash: Addr,
 }
 
-#[runar::methods]
 impl P2PKH {
-    #[public]
-    fn unlock(&self, sig: Sig, pub_key: PubKey) {
+    pub fn unlock(&self, sig: Sig, pub_key: PubKey) {
         assert!(hash160(pub_key) == self.pub_key_hash);
         assert!(check_sig(sig, pub_key));
     }
@@ -1144,7 +1283,7 @@ impl P2PKH {
     }
 
     #[test]
-    fn test_public_attribute_makes_method_public() {
+    fn test_pub_fn_makes_method_public() {
         let source = r#"
 use runar::prelude::*;
 
@@ -1154,10 +1293,8 @@ pub struct Test {
     x: bigint,
 }
 
-#[runar::methods]
 impl Test {
-    #[public]
-    fn public_method(&self, v: i64) {
+    pub fn public_method(&self, v: i64) {
         assert!(v == self.x);
     }
 
@@ -1172,11 +1309,11 @@ impl Test {
         let contract = result.contract.unwrap();
         assert_eq!(contract.methods.len(), 2);
 
-        // First method should be public (has #[public])
+        // First method should be public (`pub fn`)
         assert_eq!(contract.methods[0].name, "publicMethod");
         assert_eq!(contract.methods[0].visibility, Visibility::Public);
 
-        // Second method should be private (no #[public])
+        // Second method should be private (bare `fn`)
         assert_eq!(contract.methods[1].name, "privateMethod");
         assert_eq!(contract.methods[1].visibility, Visibility::Private);
     }
@@ -1191,10 +1328,8 @@ pub struct MyFancyContract {
     value: bigint,
 }
 
-#[runar::methods]
 impl MyFancyContract {
-    #[public]
-    fn check(&self, v: i64) {
+    pub fn check(&self, v: i64) {
         assert!(v == self.value);
     }
 }
@@ -1217,10 +1352,8 @@ pub struct Test {
     my_value: bigint,
 }
 
-#[runar::methods]
 impl Test {
-    #[public]
-    fn check(&self, v: i64) {
+    pub fn check(&self, v: i64) {
         assert!(v == self.my_value);
     }
 }
@@ -1243,10 +1376,8 @@ pub struct Counter {
     count: bigint,
 }
 
-#[runar::methods]
 impl Counter {
-    #[public]
-    fn increment(&mut self) {
+    pub fn increment(&mut self) {
         self.count = self.count + 1;
     }
 }
@@ -1270,10 +1401,8 @@ pub struct Test {
     b: PubKey,
 }
 
-#[runar::methods]
 impl Test {
-    #[public]
-    fn check(&self) {
+    pub fn check(&self) {
         assert!(self.a > 0);
     }
 }
@@ -1299,10 +1428,8 @@ pub struct Test {
     x: bigint,
 }
 
-#[runar::methods]
 impl Test {
-    #[public]
-    fn check(&self, v: i64) {
+    pub fn check(&self, v: i64) {
         assert_eq!(self.x, v);
     }
 }
@@ -1316,7 +1443,7 @@ impl Test {
 
         // Should be assert(self.x === v)
         if let Statement::ExpressionStatement { expression, .. } = &body[0] {
-            if let Expression::CallExpr { callee, args } = expression {
+            if let Expression::CallExpr { callee, args, .. } = expression {
                 if let Expression::Identifier { name } = callee.as_ref() {
                     assert_eq!(name, "assert");
                 }
@@ -1387,13 +1514,11 @@ impl Test {
 use runar::prelude::*;
 #[runar::contract]
 pub struct Foo { #[readonly] pub x: Bigint }
-#[runar::methods(Foo)]
 impl Foo {
     fn compute(&self, a: Bigint, b: Bigint) -> Bigint {
         let sum = a + b;
         sum
     }
-    #[public]
     pub fn check(&self) {
         assert!(self.x > 0);
     }
@@ -1409,5 +1534,142 @@ impl Foo {
             Statement::ReturnStatement { value: Some(_), .. } => {}
             other => panic!("expected ReturnStatement, got {:?}", other),
         }
+    }
+
+    // -- New-style bare `impl` parsing -------------------------------------
+
+    #[test]
+    fn test_bare_impl_without_methods_attribute() {
+        // `impl ContractName` with no `#[runar::methods]` attribute is parsed.
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::contract]
+pub struct Counter {
+    count: Bigint,
+}
+
+impl Counter {
+    pub fn increment(&mut self) {
+        self.count = self.count + 1;
+    }
+}
+"#;
+        let result = parse_rust_dsl(source, Some("Counter.runar.rs"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.methods.len(), 1);
+        assert_eq!(contract.methods[0].name, "increment");
+        assert_eq!(contract.methods[0].visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn test_multiple_impl_blocks_merge_in_order() {
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::contract]
+pub struct Multi {
+    #[readonly]
+    x: Bigint,
+}
+
+impl Multi {
+    pub fn first(&self) {
+        assert!(self.x > 0);
+    }
+}
+
+impl Multi {
+    pub fn second(&self) {
+        assert!(self.x < 100);
+    }
+}
+"#;
+        let result = parse_rust_dsl(source, Some("Multi.runar.rs"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.methods.len(), 2);
+        assert_eq!(contract.methods[0].name, "first");
+        assert_eq!(contract.methods[1].name, "second");
+    }
+
+    #[test]
+    fn test_impl_before_struct() {
+        // Single-pass parsing tolerates the `impl` block appearing before the
+        // contract struct.
+        let source = r#"
+use runar::prelude::*;
+
+impl Early {
+    pub fn check(&self) {
+        assert!(self.x > 0);
+    }
+}
+
+#[runar::contract]
+pub struct Early {
+    #[readonly]
+    x: Bigint,
+}
+"#;
+        let result = parse_rust_dsl(source, Some("Early.runar.rs"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.unwrap();
+        assert_eq!(contract.name, "Early");
+        assert_eq!(contract.methods.len(), 1);
+        assert_eq!(contract.methods[0].name, "check");
+    }
+
+    #[test]
+    fn test_runar_methods_attribute_rejected() {
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::contract]
+pub struct Old {
+    #[readonly]
+    x: Bigint,
+}
+
+#[runar::methods(Old)]
+impl Old {
+    pub fn check(&self) {
+        assert!(self.x > 0);
+    }
+}
+"#;
+        let result = parse_rust_dsl(source, Some("Old.runar.rs"));
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("#[runar::methods]")),
+            "expected a migration diagnostic, got: {:?}",
+            result.errors,
+        );
+    }
+
+    #[test]
+    fn test_public_attribute_rejected() {
+        let source = r#"
+use runar::prelude::*;
+
+#[runar::contract]
+pub struct Old {
+    #[readonly]
+    x: Bigint,
+}
+
+impl Old {
+    #[public]
+    pub fn check(&self) {
+        assert!(self.x > 0);
+    }
+}
+"#;
+        let result = parse_rust_dsl(source, Some("Old.runar.rs"));
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("#[public]")),
+            "expected a migration diagnostic, got: {:?}",
+            result.errors,
+        );
     }
 }

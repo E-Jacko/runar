@@ -33,6 +33,7 @@ type TokenType =
   | '(' | ')' | '{' | '}' | '[' | ']' | ';' | ',' | '.' | ':' | '::' | '->'
   | '+' | '-' | '*' | '/' | '%'
   | '==' | '!=' | '<' | '<=' | '>' | '>=' | '&&' | '||'
+  | '<<' | '>>'
   | '&' | '|' | '^' | '~' | '!'
   | '=' | '+=' | '-='
   | 'eof';
@@ -96,6 +97,8 @@ function tokenize(source: string): Token[] {
     if (ch === '!' && peekN(1) === '=') { advance(); advance(); add('!=', '!=', l, c); continue; }
     if (ch === '<' && peekN(1) === '=') { advance(); advance(); add('<=', '<=', l, c); continue; }
     if (ch === '>' && peekN(1) === '=') { advance(); advance(); add('>=', '>=', l, c); continue; }
+    if (ch === '<' && peekN(1) === '<') { advance(); advance(); add('<<', '<<', l, c); continue; }
+    if (ch === '>' && peekN(1) === '>') { advance(); advance(); add('>>', '>>', l, c); continue; }
     if (ch === '&' && peekN(1) === '&') { advance(); advance(); add('&&', '&&', l, c); continue; }
     if (ch === '|' && peekN(1) === '|') { advance(); advance(); add('||', '||', l, c); continue; }
     if (ch === '+' && peekN(1) === '=') { advance(); advance(); add('+=', '+=', l, c); continue; }
@@ -198,6 +201,15 @@ class MoveParser {
   }
 
   parse(): ParseResult {
+    // `unsafe module Name { ... }` marks an UnsafeSmartContract — the
+    // asm-escape-hatch base class. Plain `module Name { ... }` infers
+    // SmartContract / StatefulSmartContract structurally as before.
+    let isUnsafe = false;
+    if (this.current().type === 'ident' && this.current().value === 'unsafe') {
+      this.advance();
+      isUnsafe = true;
+    }
+
     // module ContractName { ... }
     this.expect('module');
     const contractName = this.expect('ident').value;
@@ -209,7 +221,8 @@ class MoveParser {
       if (this.current().type === ';') this.advance();
     }
 
-    let parentClass: 'SmartContract' | 'StatefulSmartContract' = 'SmartContract';
+    let parentClass: 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract' =
+      isUnsafe ? 'UnsafeSmartContract' : 'SmartContract';
     const properties: PropertyNode[] = [];
     const methods: MethodNode[] = [];
 
@@ -268,21 +281,26 @@ class MoveParser {
         }
         this.expect('}');
 
-        // If the struct is not marked resource, check for "stateful" marker
-        if (isResource || hasMutableField) {
+        // If the struct is not marked resource, check for "stateful" marker.
+        // `unsafe module` opts out of structural inference — the user has
+        // explicitly chosen UnsafeSmartContract.
+        if (!isUnsafe && (isResource || hasMutableField)) {
           parentClass = 'StatefulSmartContract';
         }
       } else if (this.current().type === 'public' || this.current().type === 'fun') {
-        methods.push(this.parseFunction());
+        const { method, hasMutReceiver: hasMut } = this.parseFunction();
+        if (hasMut && !isUnsafe) parentClass = 'StatefulSmartContract';
+        methods.push(method);
       } else {
         this.advance(); // skip unknown
       }
     }
     this.expect('}');
 
-    // Determine parent class from property mutability
+    // Determine parent class from property mutability. `unsafe module`
+    // opts out of structural inference.
     const hasMutable = properties.some(p => !p.readonly);
-    if (hasMutable) parentClass = 'StatefulSmartContract';
+    if (hasMutable && !isUnsafe) parentClass = 'StatefulSmartContract';
 
     // Build constructor — only non-initialized properties become params
     const loc = { file: this.file, line: 1, column: 1 };
@@ -330,17 +348,31 @@ class MoveParser {
     const name = this.expect('ident').value;
     const mapped = mapMoveType(name);
 
+    // FixedArray<T, N> — nestable: FixedArray<FixedArray<bigint, 2>, 2>.
+    // The `>>` lexer eagerly forms a shift token, so when we see `>>` while
+    // closing a FixedArray generic, we split it into two `>` by patching
+    // the token in place and falling through to the next `>` close.
+    if (name === 'FixedArray' && this.current().type === '<') {
+      this.advance();
+      const inner = this.parseMoveType();
+      this.expect(',');
+      const length = parseInt(this.expect('number').value, 10);
+      this.consumeGenericClose();
+      return { kind: 'fixed_array_type', element: inner, length };
+    }
+
     // vector<T> => FixedArray<T, N> (we treat it as ByteString for now)
     if (name === 'vector' && this.current().type === '<') {
       this.advance();
       const innerType = this.parseMoveType();
-      this.expect('>');
+      this.consumeGenericClose();
       return innerType; // Simplify: vector<u8> -> ByteString
     }
 
     const primitives = new Set([
       'bigint', 'boolean', 'ByteString', 'PubKey', 'Sig', 'Sha256',
-      'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point', 'void',
+      'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point',
+      'P256Point', 'P384Point', 'void',
     ]);
     if (primitives.has(mapped)) {
       return { kind: 'primitive_type', name: mapped as PrimitiveTypeName };
@@ -348,7 +380,28 @@ class MoveParser {
     return { kind: 'custom_type', name: mapped };
   }
 
-  private parseFunction(): MethodNode {
+  /**
+   * Close a generic-argument list. Accepts either a plain `>` or splits a
+   * `>>` shift token into two `>` (consuming the first half here and
+   * leaving a `>` for an outer generic close).
+   */
+  private consumeGenericClose(): void {
+    const t = this.current();
+    if (t.type === '>') {
+      this.advance();
+      return;
+    }
+    if (t.type === '>>') {
+      // Split `>>` into two `>` tokens in-place: consume one half here,
+      // and mutate the remaining token to a single `>` so the outer
+      // close sees it.
+      this.tokens[this.pos] = { type: '>', value: '>', line: t.line, column: t.column + 1 };
+      return;
+    }
+    this.expect('>');
+  }
+
+  private parseFunction(): { method: MethodNode; hasMutReceiver: boolean } {
     const location = this.loc();
     let visibility: 'public' | 'private' = 'private';
     if (this.current().type === 'public') {
@@ -367,11 +420,15 @@ class MoveParser {
 
     this.expect('(');
     const params: ParamNode[] = [];
+    let hasMutReceiver = false;
     while (this.current().type !== ')' && this.current().type !== 'eof') {
       // Skip &self, &mut self, contract: &ContractName
       if (this.current().type === '&') {
         this.advance();
-        if (this.current().type === 'mut') this.advance();
+        if (this.current().type === 'mut') {
+          hasMutReceiver = true;
+          this.advance();
+        }
         if (this.current().type === 'ident' && this.current().value === 'self') {
           this.advance();
           if (this.current().type === ',') this.advance();
@@ -392,7 +449,10 @@ class MoveParser {
         // Skip reference markers
         if (this.current().type === '&') {
           this.advance();
-          if (this.current().type === 'mut') this.advance();
+          if (this.current().type === 'mut') {
+            hasMutReceiver = true;
+            this.advance();
+          }
         }
         const pType = this.parseMoveType();
 
@@ -414,19 +474,45 @@ class MoveParser {
     this.expect(')');
 
     // Optional return type
+    let hasReturnType = false;
     if (this.current().type === ':') {
       this.advance();
       this.parseMoveType();
+      hasReturnType = true;
     }
 
     this.expect('{');
-    const body: Statement[] = [];
+    const rawBody: Statement[] = [];
     while (this.current().type !== '}' && this.current().type !== 'eof') {
-      body.push(this.parseStatement());
+      // Skip stray semicolons (e.g. `};` after an if/while block).
+      if (this.current().type === ';') { this.advance(); continue; }
+      rawBody.push(this.parseStatement());
     }
     this.expect('}');
 
-    return { kind: 'method', name, params, body, visibility, sourceLocation: location };
+    // Fold canonical `let i = K; while (i < N) { ... ; i = i + 1; }` pattern
+    // into a single for_statement so the ANF lowering produces the same bounded
+    // loop IR as TypeScript's native `for (let i = 0n; i < N; i++) { ... }`.
+    const body = foldWhileAsFor(rawBody);
+
+    // Move allows an implicit return of the final expression when the function
+    // declares a return type. Convert the trailing expression statement into
+    // an explicit return statement so the type checker can infer it.
+    if (hasReturnType && body.length > 0) {
+      const last = body[body.length - 1];
+      if (last && last.kind === 'expression_statement') {
+        body[body.length - 1] = {
+          kind: 'return_statement',
+          value: last.expression,
+          sourceLocation: last.sourceLocation,
+        };
+      }
+    }
+
+    return {
+      method: { kind: 'method', name, params, body, visibility, sourceLocation: location },
+      hasMutReceiver,
+    };
   }
 
   private parseStatement(): Statement {
@@ -505,6 +591,16 @@ class MoveParser {
       return this.parseIfStatement();
     }
 
+    // while (cond) { ... }
+    if (this.current().type === 'while') {
+      return this.parseWhileStatement();
+    }
+
+    // loop { ... }
+    if (this.current().type === 'loop') {
+      return this.parseLoopStatement();
+    }
+
     // return
     if (this.current().type === 'return') {
       this.advance();
@@ -552,6 +648,73 @@ class MoveParser {
     return expr;
   }
 
+  private parseWhileStatement(): Statement {
+    const location = this.loc();
+    this.expect('while');
+    // Optional parentheses around condition
+    const hasParen = this.current().type === '(';
+    if (hasParen) this.advance();
+    const condition = this.parseExpression();
+    if (hasParen) this.expect(')');
+    this.expect('{');
+    const body: Statement[] = [];
+    while (this.current().type !== '}' && this.current().type !== 'eof') {
+      if (this.current().type === ';') { this.advance(); continue; }
+      body.push(this.parseStatement());
+    }
+    this.expect('}');
+    // Move while → for_statement with dummy init/update so downstream IR passes
+    // treat it as a bounded loop.
+    return {
+      kind: 'for_statement',
+      init: {
+        kind: 'variable_decl',
+        name: '_w',
+        mutable: true,
+        init: { kind: 'bigint_literal', value: 0n },
+        sourceLocation: location,
+      },
+      condition,
+      update: {
+        kind: 'expression_statement',
+        expression: { kind: 'bigint_literal', value: 0n },
+        sourceLocation: location,
+      },
+      body,
+      sourceLocation: location,
+    };
+  }
+
+  private parseLoopStatement(): Statement {
+    const location = this.loc();
+    this.expect('loop');
+    this.expect('{');
+    const body: Statement[] = [];
+    while (this.current().type !== '}' && this.current().type !== 'eof') {
+      if (this.current().type === ';') { this.advance(); continue; }
+      body.push(this.parseStatement());
+    }
+    this.expect('}');
+    return {
+      kind: 'for_statement',
+      init: {
+        kind: 'variable_decl',
+        name: '_l',
+        mutable: true,
+        init: { kind: 'bigint_literal', value: 0n },
+        sourceLocation: location,
+      },
+      condition: { kind: 'bool_literal', value: true },
+      update: {
+        kind: 'expression_statement',
+        expression: { kind: 'bigint_literal', value: 0n },
+        sourceLocation: location,
+      },
+      body,
+      sourceLocation: location,
+    };
+  }
+
   private parseIfStatement(): Statement {
     const location = this.loc();
     this.expect('if');
@@ -561,6 +724,7 @@ class MoveParser {
     this.expect('{');
     const thenBranch: Statement[] = [];
     while (this.current().type !== '}' && this.current().type !== 'eof') {
+      if (this.current().type === ';') { this.advance(); continue; }
       thenBranch.push(this.parseStatement());
     }
     this.expect('}');
@@ -571,6 +735,7 @@ class MoveParser {
       this.expect('{');
       elseBranch = [];
       while (this.current().type !== '}' && this.current().type !== 'eof') {
+        if (this.current().type === ';') { this.advance(); continue; }
         elseBranch.push(this.parseStatement());
       }
       this.expect('}');
@@ -616,8 +781,16 @@ class MoveParser {
     return left;
   }
   private parseComparison(): Expression {
-    let left = this.parseAddSub();
+    let left = this.parseShift();
     while (['<', '<=', '>', '>='].includes(this.current().type)) {
+      const op = this.advance().value as BinaryOp;
+      left = { kind: 'binary_expr', op, left, right: this.parseShift() };
+    }
+    return left;
+  }
+  private parseShift(): Expression {
+    let left = this.parseAddSub();
+    while (this.current().type === '<<' || this.current().type === '>>') {
       const op = this.advance().value as BinaryOp;
       left = { kind: 'binary_expr', op, left, right: this.parseAddSub() };
     }
@@ -664,7 +837,20 @@ class MoveParser {
           if (this.current().type === ',') this.advance();
         }
         this.expect(')');
-        expr = { kind: 'call_expr', callee: expr, args };
+        // Free helper functions in Move take `contract: &Self` as the first
+        // argument. The parser drops `contract` from helper parameter lists on
+        // the definition side, so strip a matching `contract`/`self` identifier
+        // as the first argument at call sites too.
+        let callArgs = args;
+        if (
+          expr.kind === 'identifier' &&
+          callArgs.length > 0 &&
+          callArgs[0]?.kind === 'identifier' &&
+          (callArgs[0].name === 'contract' || callArgs[0].name === 'self')
+        ) {
+          callArgs = callArgs.slice(1);
+        }
+        expr = { kind: 'call_expr', callee: expr, args: callArgs };
       } else if (this.current().type === '.') {
         this.advance();
         const prop = snakeToCamel(this.expect('ident').value);
@@ -771,12 +957,102 @@ class MoveParser {
         ecNegate: 'ecNegate', ecOnCurve: 'ecOnCurve', ecModReduce: 'ecModReduce',
         ecEncodeCompressed: 'ecEncodeCompressed', ecMakePoint: 'ecMakePoint',
         ecPointX: 'ecPointX', ecPointY: 'ecPointY',
+        // Baby Bear field arithmetic
+        bbFieldAdd: 'bbFieldAdd', bbFieldSub: 'bbFieldSub',
+        bbFieldMul: 'bbFieldMul', bbFieldInv: 'bbFieldInv',
+        // Merkle proof verification
+        merkleRootSha256: 'merkleRootSha256', merkleRootHash256: 'merkleRootHash256',
       };
       return { kind: 'identifier', name: builtinMap[name] || name };
     }
     this.advance();
     return { kind: 'identifier', name: t.value };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pattern folding: `let i = K; while (i < N) { ...; i = i + S; }` → for_statement
+// ---------------------------------------------------------------------------
+
+/**
+ * Move lacks a native C-style `for` loop, so developers express bounded
+ * iteration with:
+ *
+ *   let i: Int = 0;
+ *   while (i < 5) {
+ *     ...
+ *     i = i + 1;
+ *   }
+ *
+ * This helper walks a statement list and folds that canonical pattern into a
+ * single for_statement whose init/condition/update match what TypeScript's
+ * native for-loop would produce, so downstream ANF lowering emits the same
+ * bounded-loop IR across all formats.
+ */
+function foldWhileAsFor(stmts: Statement[]): Statement[] {
+  const out: Statement[] = [];
+  for (let i = 0; i < stmts.length; i++) {
+    const s = stmts[i]!;
+    const next = stmts[i + 1];
+    if (
+      s.kind === 'variable_decl' &&
+      next && next.kind === 'for_statement' &&
+      next.init.kind === 'variable_decl' &&
+      next.init.name === '_w'
+    ) {
+      const iterName = s.name;
+      const cond = next.condition;
+      // Condition must reference the loop variable on the left.
+      const condMatches =
+        cond.kind === 'binary_expr' &&
+        cond.left.kind === 'identifier' &&
+        cond.left.name === iterName;
+      if (!condMatches) { out.push(s); continue; }
+
+      // Find the increment assignment at the end of the while body.
+      const whileBody = next.body;
+      if (whileBody.length === 0) { out.push(s); continue; }
+      const last = whileBody[whileBody.length - 1]!;
+      const incMatches =
+        last.kind === 'assignment' &&
+        last.target.kind === 'identifier' && last.target.name === iterName &&
+        last.value.kind === 'binary_expr' &&
+        last.value.op === '+' &&
+        last.value.left.kind === 'identifier' && last.value.left.name === iterName;
+      if (!incMatches) { out.push(s); continue; }
+
+      // Drop the trailing increment and build a for_statement with real init/update.
+      const trimmedBody = whileBody.slice(0, -1);
+      const forStmt: Statement = {
+        kind: 'for_statement',
+        init: {
+          kind: 'variable_decl',
+          name: iterName,
+          type: s.type,
+          mutable: true,
+          init: s.init,
+          sourceLocation: s.sourceLocation,
+        },
+        condition: cond,
+        update: {
+          kind: 'expression_statement',
+          expression: {
+            kind: 'increment_expr',
+            operand: { kind: 'identifier', name: iterName },
+            prefix: false,
+          },
+          sourceLocation: next.sourceLocation,
+        },
+        body: trimmedBody,
+        sourceLocation: next.sourceLocation,
+      };
+      out.push(forStmt);
+      i++; // skip the consumed while
+      continue;
+    }
+    out.push(s);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

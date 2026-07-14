@@ -13,6 +13,7 @@
 require "json"
 require "set"
 require_relative "../ir/types"
+require_relative "dce"
 
 module RunarCompiler
   module Frontend
@@ -66,7 +67,8 @@ module RunarCompiler
         IR::ANFProgram.new(
           contract_name: program.contract_name,
           properties: program.properties.map(&:dup),
-          methods: program.methods.map { |m| deep_copy_method(m) }
+          methods: program.methods.map { |m| deep_copy_method(m) },
+          parent_class: program.parent_class
         )
       end
       private_class_method :deep_copy_program
@@ -76,7 +78,9 @@ module RunarCompiler
           name: method.name,
           params: method.params.map(&:dup),
           body: method.body.map { |b| deep_copy_binding(b) },
-          is_public: method.is_public
+          is_public: method.is_public,
+          # Issue #123: preserve the declared @sighash mode across EC deep-copy.
+          sighash_type: method.sighash_type
         )
       end
       private_class_method :deep_copy_method
@@ -112,6 +116,7 @@ module RunarCompiler
         nv.iter_var     = v.iter_var
         nv.value_ref    = v.value_ref
         nv.preimage     = v.preimage
+        nv.sighash_flag = v.sighash_flag
         nv.satoshis     = v.satoshis
         nv.state_values = v.state_values&.dup
         nv.script_bytes = v.script_bytes
@@ -404,74 +409,23 @@ module RunarCompiler
       # -----------------------------------------------------------------
       # Dead binding elimination
       # -----------------------------------------------------------------
-
-      SIDE_EFFECT_KINDS = %w[
-        assert update_prop check_preimage deserialize_state
-        add_output if loop call method_call
-      ].to_set.freeze
-
-      # Remove bindings whose results are never referenced.
       #
-      # Uses iterative elimination to handle transitive dead code
-      # (e.g., if A references B and A is dead, B may also become dead).
+      # The DCE pass lives in its own discrete module now
+      # (frontend/dce.rb). The thin delegates below keep the existing
+      # ANFOptimize-private API working for in-tree tests; new callers
+      # should go through RunarCompiler::Frontend::DCE directly.
       def self.eliminate_dead_bindings(method)
-        current = method.body
-        changed = true
-
-        while changed
-          changed = false
-          used = Set.new
-          current.each { |binding| collect_refs(binding.value, used) }
-
-          filtered = []
-          current.each do |binding|
-            if used.include?(binding.name) || has_side_effect?(binding.value)
-              filtered << binding
-            else
-              changed = true
-            end
-          end
-
-          current = filtered
-        end
-
-        method.body = current
+        RunarCompiler::Frontend::DCE.eliminate_dead_bindings(method)
       end
       private_class_method :eliminate_dead_bindings
 
-      # Walk an ANFValue and collect all binding name references.
       def self.collect_refs(v, used)
-        if v.kind == "load_param"
-          return
-        end
-
-        if v.kind == "load_const"
-          if v.const_string && v.const_string.start_with?("@ref:")
-            used.add(v.const_string[5..])
-          end
-          return
-        end
-
-        return if v.kind == "load_prop" || v.kind == "get_state_script"
-
-        used.add(v.left)      if v.left
-        used.add(v.right)     if v.right
-        used.add(v.operand)   if v.operand
-        used.add(v.cond)      if v.cond
-        used.add(v.value_ref) if v.value_ref
-        used.add(v.object)    if v.object
-        used.add(v.satoshis)  if v.satoshis
-        used.add(v.preimage)  if v.preimage
-        v.args&.each         { |a| used.add(a) }
-        v.state_values&.each { |sv| used.add(sv) }
-        v.then&.each  { |b| collect_refs(b.value, used) }
-        v.else_&.each { |b| collect_refs(b.value, used) }
-        v.body&.each  { |b| collect_refs(b.value, used) }
+        RunarCompiler::Frontend::DCE.collect_refs(v, used)
       end
       private_class_method :collect_refs
 
       def self.has_side_effect?(v)
-        SIDE_EFFECT_KINDS.include?(v.kind)
+        RunarCompiler::Frontend::DCE.has_side_effect?(v)
       end
       private_class_method :has_side_effect?
     end

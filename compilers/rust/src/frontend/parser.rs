@@ -3,16 +3,18 @@
 //! Uses SWC to parse a TypeScript source file and extract the SmartContract
 //! subclass into a Rúnar AST.
 
+use num_bigint::BigInt;
+use swc_common::comments::{Comments, SingleThreadedComments};
 use swc_common::sync::Lrc;
-use swc_common::{FileName, SourceMap};
+use swc_common::{BytePos, FileName, SourceMap, Spanned};
 use swc_ecma_ast as swc;
 use swc_ecma_ast::{
     Accessibility, AssignExpr, AssignOp, AssignTarget, CallExpr, Callee, Class, ClassDecl,
-    ClassMember, Decl, EsVersion, Expr, ForStmt, IfStmt, Lit, MemberExpr as SwcMemberExpr,
-    MemberProp, ModuleDecl, ModuleItem, Param, ParamOrTsParamProp, Pat, PropName, ReturnStmt,
-    SimpleAssignTarget, Stmt, SuperProp, TsEntityName, TsKeywordTypeKind, TsLit,
-    TsParamPropParam, TsType, UnaryExpr as SwcUnaryExpr, UpdateExpr, UpdateOp, VarDecl,
-    VarDeclKind, VarDeclOrExpr,
+    ClassMember, Decl, EsVersion, Expr, ExprOrSpread, ForStmt, IfStmt, Lit,
+    MemberExpr as SwcMemberExpr, MemberProp, ModuleDecl, ModuleItem, Param, ParamOrTsParamProp,
+    Pat, Prop, PropName, PropOrSpread, ReturnStmt, SimpleAssignTarget, Stmt, SuperProp,
+    TsEntityName, TsKeywordTypeKind, TsLit, TsParamPropParam, TsType, UnaryExpr as SwcUnaryExpr,
+    UpdateExpr, UpdateOp, VarDecl, VarDeclKind, VarDeclOrExpr,
 };
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsSyntax};
 
@@ -27,9 +29,15 @@ use super::diagnostic::Diagnostic;
 // ---------------------------------------------------------------------------
 
 /// Result of parsing a source file.
+#[derive(Default)]
 pub struct ParseResult {
     pub contract: Option<ContractNode>,
     pub errors: Vec<Diagnostic>,
+    /// Non-`None` iff [`parse_source`]/[`parse`] rejected the input via the
+    /// DoS-bound source-size guard. Callers wanting typed detection can
+    /// inspect this field instead of string-matching the diagnostic
+    /// message. BUG-008 follow-up.
+    pub source_size_err: Option<super::input_limits::SourceSizeExceededError>,
 }
 
 impl ParseResult {
@@ -41,12 +49,24 @@ impl ParseResult {
 
 /// Parse a TypeScript source string and extract the Rúnar contract AST.
 pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
+    // DoS-bound size guard. Reject oversized source BEFORE the tokenizer
+    // touches the input. BUG-008 follow-up.
+    if let Some(sse) = super::input_limits::assert_source_bytes_under_limit(source) {
+        return ParseResult {
+            contract: None,
+            errors: vec![Diagnostic::error(sse.to_string(), None)],
+            source_size_err: Some(sse),
+        };
+    }
     let mut errors: Vec<Diagnostic> = Vec::new();
     let file = file_name.unwrap_or("contract.ts");
 
-    // Set up SWC parser
+    // Set up SWC parser. Collect comments so the author-facing directives
+    // `/** @embedAlways */` (#109) and `/** @sighash <FLAGS> */` (#123) — which
+    // SWC otherwise discards — can be recovered by member position.
     let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
     let fm = cm.new_source_file(Lrc::new(FileName::Custom(file.to_string())), source.to_string());
+    let comments = SingleThreadedComments::default();
     let lexer = Lexer::new(
         Syntax::Typescript(TsSyntax {
             tsx: false,
@@ -55,7 +75,7 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
         }),
         EsVersion::Es2022,
         StringInput::from(&*fm),
-        None,
+        Some(&comments),
     );
     let mut parser = Parser::new_from(lexer);
 
@@ -63,10 +83,7 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
         Ok(m) => m,
         Err(e) => {
             errors.push(Diagnostic::error(format!("Parse error: {:?}", e), None));
-            return ParseResult {
-                contract: None,
-                errors,
-            };
+            return ParseResult { contract: None, errors, source_size_err: None };
         }
     };
 
@@ -117,11 +134,8 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
     let class_decl = match contract_class {
         Some(c) => c,
         None => {
-            errors.push(Diagnostic::error("No class extending SmartContract or StatefulSmartContract found", None));
-            return ParseResult {
-                contract: None,
-                errors,
-            };
+            errors.push(Diagnostic::error("No class extending SmartContract, StatefulSmartContract, or UnsafeSmartContract found", None));
+            return ParseResult { contract: None, errors, source_size_err: None };
         }
     };
 
@@ -129,13 +143,13 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
     let class = &class_decl.class;
 
     // Extract properties
-    let properties = parse_properties(class, file, &mut errors);
+    let properties = parse_properties(class, file, &mut errors, &comments);
 
     // Extract constructor
     let constructor_node = parse_constructor(class, file, &mut errors);
 
     // Extract methods
-    let methods = parse_methods(class, file, &mut errors);
+    let methods = parse_methods(class, file, &mut errors, &comments);
 
     let contract = ContractNode {
         name: contract_name,
@@ -146,10 +160,7 @@ pub fn parse(source: &str, file_name: Option<&str>) -> ParseResult {
         source_file: file.to_string(),
     };
 
-    ParseResult {
-        contract: Some(contract),
-        errors,
-    }
+    ParseResult { contract: Some(contract), errors, source_size_err: None }
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +171,10 @@ fn get_base_class_name(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Ident(ident) => {
             let name = ident.sym.as_ref();
-            if name == "SmartContract" || name == "StatefulSmartContract" {
+            if name == "SmartContract"
+                || name == "StatefulSmartContract"
+                || name == "UnsafeSmartContract"
+            {
                 Some(name)
             } else {
                 None
@@ -186,7 +200,12 @@ fn default_loc(file: &str) -> SourceLocation {
 // Properties
 // ---------------------------------------------------------------------------
 
-fn parse_properties(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) -> Vec<PropertyNode> {
+fn parse_properties(
+    class: &Class,
+    file: &str,
+    errors: &mut Vec<Diagnostic>,
+    comments: &SingleThreadedComments,
+) -> Vec<PropertyNode> {
     let mut result = Vec::new();
 
     for member in &class.body {
@@ -214,12 +233,20 @@ fn parse_properties(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) -> 
             // Parse initializer if present (SWC ClassProp.value)
             let initializer = prop.value.as_ref().map(|v| parse_expression(v, file, errors));
 
+            // Issue #109: a `/** @embedAlways */` (or `// @embedAlways`)
+            // directive immediately preceding the field opts it out of DCE.
+            let embed_always = leading_comment_text(comments, prop.span().lo)
+                .map(|t| directive_present(&t, "@embedAlways"))
+                .unwrap_or(false);
+
             result.push(PropertyNode {
                 name,
                 prop_type,
                 readonly,
                 initializer,
+                embed_always,
                 source_location: default_loc(file),
+                synthetic_array_chain: None,
             });
         }
     }
@@ -246,6 +273,7 @@ fn parse_constructor(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) ->
                 params,
                 body,
                 visibility: Visibility::Public,
+                sighash_type: None,
                 source_location: default_loc(file),
             };
         }
@@ -257,6 +285,7 @@ fn parse_constructor(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) ->
         params: Vec::new(),
         body: Vec::new(),
         visibility: Visibility::Public,
+        sighash_type: None,
         source_location: default_loc(file),
     }
 }
@@ -305,7 +334,12 @@ fn parse_constructor_params(
 // Methods
 // ---------------------------------------------------------------------------
 
-fn parse_methods(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) -> Vec<MethodNode> {
+fn parse_methods(
+    class: &Class,
+    file: &str,
+    errors: &mut Vec<Diagnostic>,
+    comments: &SingleThreadedComments,
+) -> Vec<MethodNode> {
     let mut result = Vec::new();
 
     for member in &class.body {
@@ -332,17 +366,136 @@ fn parse_methods(class: &Class, file: &str, errors: &mut Vec<Diagnostic>) -> Vec
                 Vec::new()
             };
 
+            // Issue #123: `/** @sighash <FLAGS> */` directive → per-method type.
+            let sighash_type =
+                parse_sighash_on_method(comments, method.span().lo, &name, &visibility, file, errors);
+
             result.push(MethodNode {
                 name,
                 params,
                 body,
                 visibility,
+                sighash_type,
                 source_location: default_loc(file),
             });
         }
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Author-facing comment directives (#109 @embedAlways, #123 @sighash)
+// ---------------------------------------------------------------------------
+
+/// Concatenated text of the leading comments attached to `pos` (the `.lo` of a
+/// class member), or `None` when the member has no leading comment. SWC keys
+/// leading comments by the byte position of the token that follows them, so a
+/// JSDoc block / line comment immediately preceding a field or method surfaces
+/// here. Both JSDoc blocks and ordinary `//` / `/* */` trivia are collected.
+fn leading_comment_text(comments: &SingleThreadedComments, pos: BytePos) -> Option<String> {
+    let list = comments.get_leading(pos)?;
+    if list.is_empty() {
+        return None;
+    }
+    Some(
+        list.iter()
+            .map(|c| c.text.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// True when `marker` (e.g. `@sighash`, `@embedAlways`) appears in `text`
+/// followed by a word boundary — mirroring the TS reference's `/@sighash\b/`
+/// and `/@embedAlways\b/` scans so an identifier like `sighashType` inside a
+/// comment does not trip detection.
+fn directive_present(text: &str, marker: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(marker) {
+        let after = start + pos + marker.len();
+        let boundary =
+            after >= bytes.len() || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+        if boundary {
+            return true;
+        }
+        start += pos + 1;
+    }
+    false
+}
+
+/// Fail-closed guard for author-facing comment directives on non-TS surfaces.
+/// `@sighash` (#123, per-method sighash type) and `@embedAlways` (#109,
+/// readonly-field DCE opt-out) are honoured only by the TypeScript (.runar.ts)
+/// parser, which reads leading trivia. The eight non-TS surface parsers ignore
+/// comments, so a directive there would be silently dropped and change signing
+/// / DCE semantics — reject rather than miscompile. Word-boundary matched (via
+/// `directive_present`) so an identifier like `sighashType` does not trip it.
+/// Returns a diagnostic message, or `None` when the source is clean.
+fn unsupported_directive_error(source: &str, surface_name: &str) -> Option<String> {
+    if directive_present(source, "@sighash") {
+        return Some(format!(
+            "@sighash directive (issue #123) is not supported by the {surface_name} surface parser; write the contract in TypeScript (.runar.ts) where @sighash is honoured"
+        ));
+    }
+    if directive_present(source, "@embedAlways") {
+        return Some(format!(
+            "@embedAlways directive (issue #109) is not supported by the {surface_name} surface parser; write the contract in TypeScript (.runar.ts) where @embedAlways is honoured"
+        ));
+    }
+    None
+}
+
+/// Build a fail-closed [`ParseResult`] carrying a single directive-guard error.
+fn directive_guard_result(msg: String) -> ParseResult {
+    ParseResult {
+        contract: None,
+        errors: vec![Diagnostic::error(msg, None)],
+        ..Default::default()
+    }
+}
+
+/// Detect + parse a `/** @sighash <FLAGS> */` directive on a method by its
+/// leading comment. Returns the numeric sighash type, or `None` when absent.
+/// Pushes an error for a malformed flag list or a directive on a non-public
+/// method (only public methods are spending entry points). Mirrors the TS
+/// reference `parseSighashOnMethod`.
+fn parse_sighash_on_method(
+    comments: &SingleThreadedComments,
+    pos: BytePos,
+    name: &str,
+    visibility: &Visibility,
+    file: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<i64> {
+    let text = leading_comment_text(comments, pos)?;
+    if !directive_present(&text, "@sighash") {
+        return None;
+    }
+
+    if *visibility != Visibility::Public {
+        errors.push(Diagnostic::error(
+            format!(
+                "@sighash directive on non-public method '{}' has no effect — only public methods are spending entry points",
+                name
+            ),
+            Some(default_loc(file)),
+        ));
+        return None;
+    }
+
+    match super::sighash_directive::extract_sighash_directive(&text) {
+        None => None,
+        Some(Ok(value)) => Some(value),
+        Some(Err(msg)) => {
+            errors.push(Diagnostic::error(
+                format!("Method '{}': {}", name, msg),
+                Some(default_loc(file)),
+            ));
+            None
+        }
+    }
 }
 
 fn parse_method_params(
@@ -560,7 +713,7 @@ fn parse_variable_statement(
         parse_expression(init_expr, file, errors)
     } else {
         errors.push(Diagnostic::error(format!("Variable '{}' must have an initializer", name), None));
-        Expression::BigIntLiteral { value: 0 }
+        Expression::BigIntLiteral { value: BigInt::from(0) }
     };
 
     let var_type = if let Pat::Ident(ident) = &decl.name {
@@ -755,7 +908,7 @@ fn parse_for_statement(for_stmt: &ForStmt, file: &str, errors: &mut Vec<Diagnost
     } else {
         errors.push(Diagnostic::error("For loop must have an update expression", None));
         Statement::ExpressionStatement {
-            expression: Expression::BigIntLiteral { value: 0 },
+            expression: Expression::BigIntLiteral { value: BigInt::from(0) },
             source_location: default_loc(file),
         }
     };
@@ -828,7 +981,7 @@ fn make_default_for_init(file: &str) -> Statement {
         name: "_i".to_string(),
         var_type: None,
         mutable: true,
-        init: Expression::BigIntLiteral { value: 0 },
+        init: Expression::BigIntLiteral { value: BigInt::from(0) },
         source_location: default_loc(file),
     }
 }
@@ -873,15 +1026,21 @@ fn parse_expression(expr: &Expr, file: &str, errors: &mut Vec<Diagnostic>) -> Ex
         },
 
         Expr::Lit(Lit::BigInt(bigint)) => {
-            // Parse the BigInt value -- SWC gives the numeric part
-            let val = bigint_to_i128(bigint);
-            Expression::BigIntLiteral { value: val }
+            // SWC parses the BigInt literal into a `num_bigint::BigInt`
+            // with arbitrary precision — use it as-is so 256-bit constants
+            // (e.g. the secp256k1 group order in schnorr-zkp's s-bound
+            // assert) survive intact. The previous funnel through
+            // `i128::from_str` truncated to 0 for any value outside i128
+            // range.
+            Expression::BigIntLiteral {
+                value: (*bigint.value).clone(),
+            }
         }
 
         Expr::Lit(Lit::Num(num)) => {
             // Plain numeric literal -- treat as bigint for Rúnar
             Expression::BigIntLiteral {
-                value: num.value as i128,
+                value: BigInt::from(num.value as i128),
             }
         }
 
@@ -943,9 +1102,35 @@ fn parse_expression(expr: &Expr, file: &str, errors: &mut Vec<Diagnostic>) -> Ex
             value
         }
 
+        Expr::Array(arr) => {
+            // Array literal: `[e0, e1, ...]`. Used as a FixedArray property
+            // initializer. Sparse/spread elements are rejected.
+            let mut elements: Vec<Expression> = Vec::new();
+            for el in &arr.elems {
+                match el {
+                    Some(swc::ExprOrSpread { spread: None, expr }) => {
+                        elements.push(parse_expression(expr, file, errors));
+                    }
+                    Some(_) => {
+                        errors.push(Diagnostic::error(
+                            "Spread elements are not supported in array literals",
+                            None,
+                        ));
+                    }
+                    None => {
+                        errors.push(Diagnostic::error(
+                            "Sparse array literals are not supported",
+                            None,
+                        ));
+                    }
+                }
+            }
+            Expression::ArrayLiteral { elements }
+        }
+
         _ => {
             errors.push(Diagnostic::error(format!("Unsupported expression: {:?}", expr), None));
-            Expression::BigIntLiteral { value: 0 }
+            Expression::BigIntLiteral { value: BigInt::from(0) }
         }
     }
 }
@@ -975,6 +1160,8 @@ fn parse_binary_expression(
         swc::BinaryOp::BitAnd => BinaryOp::BitAnd,
         swc::BinaryOp::BitOr => BinaryOp::BitOr,
         swc::BinaryOp::BitXor => BinaryOp::BitXor,
+        swc::BinaryOp::LShift => BinaryOp::Shl,
+        swc::BinaryOp::RShift => BinaryOp::Shr,
         swc::BinaryOp::EqEq => {
             // Accept == and map to === (same as TS and Go parsers)
             BinaryOp::StrictEq
@@ -1044,6 +1231,22 @@ fn parse_call_expression(
     file: &str,
     errors: &mut Vec<Diagnostic>,
 ) -> Expression {
+    // Special-case asm({ body, in_arity?, out_arity? }) — normalise the
+    // object-literal argument into a CallExpr with three positional args
+    // (body, in_arity, out_arity) so downstream passes only have to know how
+    // to walk a CallExpr. Both the hex-string body form and the array-form
+    // body are supported; the array form is encoded to a hex string at parse
+    // time so all downstream passes see identical IR. The optional generic
+    // type argument asm<T>(...) flags the expression form, captured on
+    // CallExpr.asm_return_type.
+    if let Callee::Expr(callee_expr) = &call.callee {
+        if let Expr::Ident(ident) = callee_expr.as_ref() {
+            if ident.sym.as_ref() == "asm" {
+                return parse_asm_call(call, file, errors);
+            }
+        }
+    }
+
     let callee = match &call.callee {
         Callee::Expr(e) => parse_expression(e, file, errors),
         Callee::Super(_) => Expression::Identifier {
@@ -1066,6 +1269,444 @@ fn parse_call_expression(
     Expression::CallExpr {
         callee: Box::new(callee),
         args,
+        asm_return_type: None,
+    }
+}
+
+/// Decode an `asm({ body, in_arity?, out_arity? })` call into a CallExpr whose
+/// positional args are
+///
+///   [ByteStringLiteral(body), BigIntLiteral(in_arity), BigIntLiteral(out_arity)].
+///
+/// Two surface body shapes are accepted:
+///   - Hex string literal:  body: '76a90088ac'
+///   - Array of opcode names / push() calls:
+///     body: [OP_DUP, OP_HASH160, push('1234abcd'), OP_EQUALVERIFY]
+///     Each element is encoded to its byte representation at parse time, so
+///     the resulting IR is byte-identical to the equivalent hex body.
+///
+/// The optional generic type argument asm<T>({...}) marks the expression form;
+/// the captured T is stashed on CallExpr.asm_return_type. T must be one of
+/// bigint, boolean, or ByteString.
+///
+/// On malformed input we still return a syntactically valid CallExpr so later
+/// passes can produce additional diagnostics without crashing.
+fn parse_asm_call(call: &CallExpr, file: &str, errors: &mut Vec<Diagnostic>) -> Expression {
+    let callee = Box::new(Expression::Identifier {
+        name: "asm".to_string(),
+    });
+
+    // Capture the generic type argument asm<T>({...}) if present, BEFORE
+    // arg-shape diagnostics so the expression form still records its return
+    // type even when other args are malformed.
+    let asm_return_type = parse_asm_generic_type_arg(call, errors);
+
+    if call.args.len() != 1 {
+        errors.push(Diagnostic::error(
+            format!(
+                "asm() expects exactly one object-literal argument {{ body, in_arity?, out_arity? }}, got {} arguments",
+                call.args.len()
+            ),
+            None,
+        ));
+        return Expression::CallExpr {
+            callee,
+            args: Vec::new(),
+            asm_return_type,
+        };
+    }
+
+    let obj = match call.args[0].expr.as_ref() {
+        Expr::Object(obj) => obj,
+        other => {
+            errors.push(Diagnostic::error(
+                format!(
+                    "asm() argument must be an object literal {{ body: '<hex>', in_arity?: <int>, out_arity?: <int> }}, got '{}'",
+                    expr_kind_name(other)
+                ),
+                None,
+            ));
+            return Expression::CallExpr {
+                callee,
+                args: Vec::new(),
+                asm_return_type,
+            };
+        }
+    };
+
+    let mut body_expr: Option<Expression> = None;
+    let mut in_arity_expr: Option<Expression> = None;
+    let mut out_arity_expr: Option<Expression> = None;
+
+    for prop in &obj.props {
+        let kv = match prop {
+            PropOrSpread::Prop(p) => match p.as_ref() {
+                Prop::KeyValue(kv) => kv,
+                _ => continue,
+            },
+            PropOrSpread::Spread(_) => continue,
+        };
+        let key = match &kv.key {
+            PropName::Ident(id) => id.sym.to_string(),
+            PropName::Str(s) => s.value.to_string(),
+            _ => continue,
+        };
+
+        match key.as_str() {
+            "body" => match kv.value.as_ref() {
+                Expr::Lit(Lit::Str(s)) => {
+                    body_expr = Some(Expression::ByteStringLiteral {
+                        value: s.value.to_string(),
+                    });
+                }
+                Expr::Tpl(tpl) if tpl.exprs.is_empty() && tpl.quasis.len() == 1 => {
+                    body_expr = Some(Expression::ByteStringLiteral {
+                        value: tpl.quasis[0].raw.to_string(),
+                    });
+                }
+                Expr::Array(arr) => {
+                    let encoded = encode_asm_array_body(arr, errors);
+                    body_expr = Some(Expression::ByteStringLiteral { value: encoded });
+                }
+                other => {
+                    errors.push(Diagnostic::error(
+                        format!(
+                            "asm() body must be a hex string literal or an array of opcode names / push() calls; got '{}'.",
+                            expr_kind_name(other)
+                        ),
+                        None,
+                    ));
+                    body_expr = Some(Expression::ByteStringLiteral {
+                        value: String::new(),
+                    });
+                }
+            },
+            "in_arity" => {
+                if let Some(v) = parse_arity_literal(&kv.value, "in_arity", errors) {
+                    in_arity_expr = Some(Expression::BigIntLiteral { value: BigInt::from(v) });
+                }
+            }
+            "out_arity" => {
+                if let Some(v) = parse_arity_literal(&kv.value, "out_arity", errors) {
+                    out_arity_expr = Some(Expression::BigIntLiteral { value: BigInt::from(v) });
+                }
+            }
+            other => {
+                errors.push(Diagnostic::error(
+                    format!(
+                        "asm() does not accept the '{}' field; valid fields are 'body', 'in_arity', 'out_arity'.",
+                        other
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+
+    let body_expr = body_expr.unwrap_or_else(|| {
+        errors.push(Diagnostic::error(
+            "asm() requires a 'body' field with a hex string literal value",
+            None,
+        ));
+        Expression::ByteStringLiteral {
+            value: String::new(),
+        }
+    });
+    // Defaults: in_arity=0, out_arity=1. The out_arity=1 default reflects the
+    // public-method-must-terminate-truthy invariant.
+    let in_arity_expr = in_arity_expr.unwrap_or(Expression::BigIntLiteral { value: BigInt::from(0) });
+    let out_arity_expr = out_arity_expr.unwrap_or(Expression::BigIntLiteral { value: BigInt::from(1) });
+
+    let _ = file;
+    Expression::CallExpr {
+        callee,
+        args: vec![body_expr, in_arity_expr, out_arity_expr],
+        asm_return_type,
+    }
+}
+
+/// Parse the optional generic type argument on asm<T>({...}). Returns the
+/// captured primitive type name when present and valid, or `None` if the call
+/// has no type argument. Pushes a diagnostic (and returns `None`) when the
+/// type argument is present but not a primitive value type
+/// (bigint / boolean / ByteString).
+fn parse_asm_generic_type_arg(call: &CallExpr, errors: &mut Vec<Diagnostic>) -> Option<String> {
+    let type_args = call.type_args.as_ref()?;
+    if type_args.params.is_empty() {
+        return None;
+    }
+    if type_args.params.len() > 1 {
+        errors.push(Diagnostic::error(
+            format!(
+                "asm<T>() takes at most one type argument, got {}",
+                type_args.params.len()
+            ),
+            None,
+        ));
+        return None;
+    }
+    let name = match type_args.params[0].as_ref() {
+        TsType::TsKeywordType(kw) => match kw.kind {
+            TsKeywordTypeKind::TsBigIntKeyword => "bigint".to_string(),
+            TsKeywordTypeKind::TsBooleanKeyword => "boolean".to_string(),
+            other => format!("{:?}", other),
+        },
+        TsType::TsTypeRef(tref) => match &tref.type_name {
+            TsEntityName::Ident(id) => id.sym.to_string(),
+            TsEntityName::TsQualifiedName(_) => "<qualified>".to_string(),
+        },
+        other => format!("{:?}", other),
+    };
+    if name == "bigint" || name == "boolean" || name == "ByteString" {
+        Some(name)
+    } else {
+        errors.push(Diagnostic::error(
+            format!(
+                "asm<T>() return type must be 'bigint', 'boolean', or 'ByteString'; got '{}'",
+                name
+            ),
+            None,
+        ));
+        None
+    }
+}
+
+/// Encode an asm({ body: [OP_DUP, push(0x42), ...] }) array literal to its hex
+/// byte representation. Uses the same push-encoding helpers as the emit pass
+/// so the resulting bytes are byte-identical to what the emitter would produce
+/// for the equivalent literal.
+fn encode_asm_array_body(
+    arr: &swc_ecma_ast::ArrayLit,
+    errors: &mut Vec<Diagnostic>,
+) -> String {
+    use crate::codegen::opcodes::opcode_byte;
+    let mut hex_str = String::new();
+    for elem in &arr.elems {
+        let elem = match elem {
+            Some(ExprOrSpread { spread: None, expr }) => expr,
+            Some(_) => {
+                errors.push(Diagnostic::error(
+                    "Spread elements are not supported in asm() body arrays",
+                    None,
+                ));
+                continue;
+            }
+            None => {
+                errors.push(Diagnostic::error(
+                    "Sparse asm() body arrays are not supported",
+                    None,
+                ));
+                continue;
+            }
+        };
+        match elem.as_ref() {
+            Expr::Ident(id) => {
+                let name = id.sym.as_ref();
+                match opcode_byte(name) {
+                    Some(b) => hex_str.push_str(&format!("{:02x}", b)),
+                    None => errors.push(Diagnostic::error(
+                        format!(
+                            "Unknown opcode '{}' in asm() body array. Expected an OP_* identifier (e.g. OP_DUP, OP_HASH160) or a push(...) call.",
+                            name
+                        ),
+                        None,
+                    )),
+                }
+            }
+            Expr::Call(call) => {
+                let is_push = matches!(&call.callee, Callee::Expr(e)
+                    if matches!(e.as_ref(), Expr::Ident(id) if id.sym.as_ref() == "push"));
+                if !is_push {
+                    let callee_text = match &call.callee {
+                        Callee::Expr(e) => match e.as_ref() {
+                            Expr::Ident(id) => id.sym.to_string(),
+                            _ => "<expr>".to_string(),
+                        },
+                        _ => "<expr>".to_string(),
+                    };
+                    errors.push(Diagnostic::error(
+                        format!(
+                            "asm() body array call must be 'push(<literal>)', got '{}(...)'",
+                            callee_text
+                        ),
+                        None,
+                    ));
+                    continue;
+                }
+                if call.args.len() != 1 {
+                    errors.push(Diagnostic::error(
+                        format!(
+                            "push() takes exactly one literal argument, got {}",
+                            call.args.len()
+                        ),
+                        None,
+                    ));
+                    continue;
+                }
+                if let Some(pushed) = encode_asm_push_literal(&call.args[0].expr, errors) {
+                    hex_str.push_str(&pushed);
+                }
+            }
+            other => errors.push(Diagnostic::error(
+                format!(
+                    "asm() body array element must be an opcode identifier (e.g. OP_DUP) or a push(<literal>) call; got '{}'",
+                    expr_kind_name(other)
+                ),
+                None,
+            )),
+        }
+    }
+    hex_str
+}
+
+/// Encode a literal argument passed to push(...) inside an asm() body array.
+/// Returns the encoded hex string, or `None` if the literal is unrecognised
+/// (with a diagnostic pushed).
+fn encode_asm_push_literal(expr: &Expr, errors: &mut Vec<Diagnostic>) -> Option<String> {
+    use crate::codegen::emit::encode_push_int;
+    match expr {
+        Expr::Lit(Lit::Num(num)) => {
+            let (h, _) = encode_push_int(&BigInt::from(num.value as i128));
+            Some(h)
+        }
+        Expr::Lit(Lit::BigInt(bi)) => {
+            let v: BigInt = (*bi.value).clone();
+            let (h, _) = encode_push_int(&v);
+            Some(h)
+        }
+        Expr::Unary(unary) if unary.op == swc::UnaryOp::Minus => {
+            match unary.arg.as_ref() {
+                Expr::Lit(Lit::Num(num)) => {
+                    let (h, _) = encode_push_int(&BigInt::from(-(num.value as i128)));
+                    Some(h)
+                }
+                Expr::Lit(Lit::BigInt(bi)) => {
+                    let v: BigInt = (*bi.value).clone();
+                    let (h, _) = encode_push_int(&(-v));
+                    Some(h)
+                }
+                _ => {
+                    errors.push(Diagnostic::error(
+                        "push() argument must be a literal value (bigint, number, boolean, or hex string), got prefix expression",
+                        None,
+                    ));
+                    None
+                }
+            }
+        }
+        Expr::Lit(Lit::Bool(b)) => {
+            // OP_TRUE = 0x51, OP_FALSE = 0x00 (alias of OP_0)
+            Some(if b.value { "51".to_string() } else { "00".to_string() })
+        }
+        Expr::Lit(Lit::Str(s)) => encode_asm_push_hex(&s.value, errors),
+        Expr::Tpl(tpl) if tpl.exprs.is_empty() && tpl.quasis.len() == 1 => {
+            encode_asm_push_hex(&tpl.quasis[0].raw, errors)
+        }
+        other => {
+            errors.push(Diagnostic::error(
+                format!(
+                    "push() argument must be a literal value (bigint, number, boolean, or hex string), got '{}'",
+                    expr_kind_name(other)
+                ),
+                None,
+            ));
+            None
+        }
+    }
+}
+
+/// Encode a hex-string ByteString literal argument to push(...) into its
+/// push-data byte representation.
+fn encode_asm_push_hex(raw: &str, errors: &mut Vec<Diagnostic>) -> Option<String> {
+    use crate::codegen::emit::encode_push_data;
+    if raw.len() % 2 != 0 || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        errors.push(Diagnostic::error(
+            format!(
+                "push() ByteString argument must be even-length hex (got '{}')",
+                raw
+            ),
+            None,
+        ));
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(raw.len() / 2);
+    for i in (0..raw.len()).step_by(2) {
+        bytes.push(u8::from_str_radix(&raw[i..i + 2], 16).unwrap());
+    }
+    Some(hex::encode(encode_push_data(&bytes)))
+}
+
+/// Decode a non-negative integer literal arity field for asm(). Returns the
+/// value, or `None` (with a diagnostic) on error.
+fn parse_arity_literal(
+    expr: &Expr,
+    field_name: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<i128> {
+    match expr {
+        Expr::Lit(Lit::Num(num)) => {
+            let v = num.value;
+            if v < 0.0 || v.fract() != 0.0 {
+                errors.push(Diagnostic::error(
+                    format!(
+                        "asm() {} must be a non-negative integer literal, got '{}'",
+                        field_name, v
+                    ),
+                    None,
+                ));
+                return None;
+            }
+            Some(v as i128)
+        }
+        Expr::Lit(Lit::BigInt(bi)) => {
+            let v = bigint_to_i128(bi);
+            if v < 0 {
+                errors.push(Diagnostic::error(
+                    format!(
+                        "asm() {} must be a non-negative integer literal, got '{}'",
+                        field_name, v
+                    ),
+                    None,
+                ));
+                return None;
+            }
+            Some(v)
+        }
+        Expr::Unary(_) => {
+            errors.push(Diagnostic::error(
+                format!("asm() {} must be a non-negative integer literal", field_name),
+                None,
+            ));
+            None
+        }
+        other => {
+            errors.push(Diagnostic::error(
+                format!(
+                    "asm() {} must be a non-negative integer literal, got '{}'",
+                    field_name,
+                    expr_kind_name(other)
+                ),
+                None,
+            ));
+            None
+        }
+    }
+}
+
+/// Short human-readable kind name for an SWC expression, for diagnostics.
+fn expr_kind_name(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::Object(_) => "object",
+        Expr::Array(_) => "array",
+        Expr::Lit(Lit::Str(_)) => "string",
+        Expr::Lit(Lit::Num(_)) => "number",
+        Expr::Lit(Lit::Bool(_)) => "boolean",
+        Expr::Lit(Lit::BigInt(_)) => "bigint",
+        Expr::Tpl(_) => "template_string",
+        Expr::Ident(_) => "identifier",
+        Expr::Call(_) => "call_expression",
+        Expr::Unary(_) => "unary_expression",
+        _ => "expression",
     }
 }
 
@@ -1130,29 +1771,70 @@ fn bigint_to_i128(bigint_lit: &swc::BigInt) -> i128 {
 /// - `.runar.move` -> Move-style parser
 /// - `.runar.rs` -> Rust DSL parser
 /// - `.runar.py` -> Python parser
+/// - `.runar.java` -> Java parser
 /// - anything else (including `.runar.ts`) -> TypeScript parser (default)
 pub fn parse_source(source: &str, file_name: Option<&str>) -> ParseResult {
+    // DoS-bound size guard. Reject oversized source BEFORE any
+    // format-specific parser touches the input. BUG-008 follow-up.
+    if let Some(sse) = super::input_limits::assert_source_bytes_under_limit(source) {
+        return ParseResult {
+            contract: None,
+            errors: vec![Diagnostic::error(sse.to_string(), None)],
+            source_size_err: Some(sse),
+        };
+    }
     let name = file_name.unwrap_or("contract.ts");
+    // Fail-closed directive guard: `@sighash` / `@embedAlways` are honoured only
+    // on the TypeScript (.runar.ts) surface; the eight non-TS surface parsers
+    // below ignore comments, so a directive there would be silently dropped.
+    // Reject rather than miscompile. The default TS branch is exempt.
     if name.ends_with(".runar.sol") {
+        if let Some(msg) = unsupported_directive_error(source, "Solidity") {
+            return directive_guard_result(msg);
+        }
         return super::parser_sol::parse_solidity(source, file_name);
     }
     if name.ends_with(".runar.move") {
+        if let Some(msg) = unsupported_directive_error(source, "Move") {
+            return directive_guard_result(msg);
+        }
         return super::parser_move::parse_move(source, file_name);
     }
     if name.ends_with(".runar.rs") {
+        if let Some(msg) = unsupported_directive_error(source, "Rust") {
+            return directive_guard_result(msg);
+        }
         return super::parser_rustmacro::parse_rust_dsl(source, file_name);
     }
     if name.ends_with(".runar.py") {
+        if let Some(msg) = unsupported_directive_error(source, "Python") {
+            return directive_guard_result(msg);
+        }
         return super::parser_python::parse_python(source, file_name);
     }
     if name.ends_with(".runar.go") {
+        if let Some(msg) = unsupported_directive_error(source, "Go DSL") {
+            return directive_guard_result(msg);
+        }
         return super::parser_gocontract::parse_go_contract(source, file_name);
     }
     if name.ends_with(".runar.rb") {
+        if let Some(msg) = unsupported_directive_error(source, "Ruby") {
+            return directive_guard_result(msg);
+        }
         return super::parser_ruby::parse_ruby(source, file_name);
     }
     if name.ends_with(".runar.zig") {
+        if let Some(msg) = unsupported_directive_error(source, "Zig") {
+            return directive_guard_result(msg);
+        }
         return super::parser_zig::parse_zig(source, file_name);
+    }
+    if name.ends_with(".runar.java") {
+        if let Some(msg) = unsupported_directive_error(source, "Java") {
+            return directive_guard_result(msg);
+        }
+        return super::parser_java::parse_java(source, file_name);
     }
     // Default: TypeScript parser
     parse(source, file_name)
@@ -1165,6 +1847,199 @@ pub fn parse_source(source: &str, file_name: Option<&str>) -> ParseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_source_allows_non_directive_identifier() {
+        // A field named `sighashType` must NOT trip the word-boundary guard.
+        let src = r#"
+            class Counter extends SmartContract {
+                readonly sighashType: bigint;
+                constructor(sighashType: bigint) { super(sighashType); }
+                public unlock() {}
+            }
+        "#;
+        let result = parse_source(src, Some("Counter.runar.ts"));
+        assert!(
+            !result.error_strings().iter().any(|m| m.contains("not supported")),
+            "directive guard tripped on a non-directive identifier: {:?}",
+            result.error_strings()
+        );
+    }
+
+    #[test]
+    fn test_non_ts_surface_rejects_sighash_directive() {
+        // A .runar.sol surface parser ignores comments, so the guard must fire.
+        let src = r#"
+            contract Counter {
+                // @sighash SINGLE|FORKID
+                function unlock() public {}
+            }
+        "#;
+        let joined = parse_source(src, Some("Counter.runar.sol")).error_strings().join("\n");
+        assert!(
+            joined.contains("@sighash") && joined.contains("#123"),
+            "expected @sighash/#123 fail-closed error on .runar.sol, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_non_ts_surface_rejects_embed_always_directive() {
+        let src = r#"
+            module Counter {
+                // @embedAlways
+                x: u64;
+            }
+        "#;
+        let joined = parse_source(src, Some("Counter.runar.move")).error_strings().join("\n");
+        assert!(
+            joined.contains("@embedAlways") && joined.contains("#109"),
+            "expected @embedAlways/#109 fail-closed error on .runar.move, got: {joined}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #109 @embedAlways directive detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_embed_always_jsdoc_directive_sets_flag() {
+        let src = r#"
+            class Meta extends SmartContract {
+                readonly pubKeyHash: Ripemd160;
+                /** @embedAlways */
+                readonly metadataId: ByteString;
+                constructor(pubKeyHash: Ripemd160, metadataId: ByteString) {
+                    super(pubKeyHash, metadataId);
+                    this.pubKeyHash = pubKeyHash;
+                    this.metadataId = metadataId;
+                }
+                public unlock(sig: Sig, pubKey: PubKey) {
+                    assert(hash160(pubKey) === this.pubKeyHash);
+                    assert(checkSig(sig, pubKey));
+                }
+            }
+        "#;
+        let r = parse_source(src, Some("Meta.runar.ts"));
+        assert!(r.errors.is_empty(), "unexpected errors: {:?}", r.error_strings());
+        let c = r.contract.unwrap();
+        let meta = c.properties.iter().find(|p| p.name == "metadataId").unwrap();
+        assert!(meta.embed_always, "metadataId should carry embed_always");
+        let pkh = c.properties.iter().find(|p| p.name == "pubKeyHash").unwrap();
+        assert!(!pkh.embed_always, "un-annotated field must stay unset");
+    }
+
+    #[test]
+    fn test_embed_always_line_comment_directive() {
+        let src = r#"
+            class Meta extends SmartContract {
+                // @embedAlways
+                readonly metadataId: ByteString;
+                constructor(metadataId: ByteString) { super(metadataId); this.metadataId = metadataId; }
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("Meta.runar.ts"));
+        let c = r.contract.unwrap();
+        let meta = c.properties.iter().find(|p| p.name == "metadataId").unwrap();
+        assert!(meta.embed_always, "line-comment @embedAlways should set flag");
+    }
+
+    #[test]
+    fn test_embed_always_absent() {
+        let src = r#"
+            class Meta extends SmartContract {
+                readonly metadataId: ByteString;
+                constructor(metadataId: ByteString) { super(metadataId); this.metadataId = metadataId; }
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("Meta.runar.ts"));
+        let c = r.contract.unwrap();
+        let meta = c.properties.iter().find(|p| p.name == "metadataId").unwrap();
+        assert!(!meta.embed_always);
+    }
+
+    // -----------------------------------------------------------------------
+    // #123 @sighash directive detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sighash_directive_single_forkid() {
+        let src = r#"
+            class C extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); this.x = x; }
+                /** @sighash SINGLE|FORKID */
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("C.runar.ts"));
+        assert!(r.errors.is_empty(), "unexpected errors: {:?}", r.error_strings());
+        let c = r.contract.unwrap();
+        let m = c.methods.iter().find(|m| m.name == "unlock").unwrap();
+        assert_eq!(m.sighash_type, Some(0x43));
+    }
+
+    #[test]
+    fn test_sighash_absent_defaults_none() {
+        let src = r#"
+            class C extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); this.x = x; }
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("C.runar.ts"));
+        let c = r.contract.unwrap();
+        let m = c.methods.iter().find(|m| m.name == "unlock").unwrap();
+        assert_eq!(m.sighash_type, None);
+    }
+
+    #[test]
+    fn test_sighash_on_private_method_errors() {
+        let src = r#"
+            class C extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); this.x = x; }
+                /** @sighash SINGLE|FORKID */
+                private helper() {}
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("C.runar.ts"));
+        let joined = r.error_strings().join("\n");
+        assert!(joined.contains("non-public method"), "expected non-public error, got: {joined}");
+    }
+
+    #[test]
+    fn test_sighash_unknown_flag_errors() {
+        let src = r#"
+            class C extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); this.x = x; }
+                /** @sighash BOGUS|FORKID */
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("C.runar.ts"));
+        let joined = r.error_strings().join("\n");
+        assert!(joined.contains("unknown flag"), "expected unknown-flag error, got: {joined}");
+    }
+
+    #[test]
+    fn test_sighash_missing_forkid_errors() {
+        let src = r#"
+            class C extends SmartContract {
+                readonly x: bigint;
+                constructor(x: bigint) { super(x); this.x = x; }
+                /** @sighash SINGLE */
+                public unlock() {}
+            }
+        "#;
+        let r = parse_source(src, Some("C.runar.ts"));
+        let joined = r.error_strings().join("\n");
+        assert!(joined.contains("FORKID is mandatory"), "expected FORKID error, got: {joined}");
+    }
 
     // -----------------------------------------------------------------------
     // Basic P2PKH contract

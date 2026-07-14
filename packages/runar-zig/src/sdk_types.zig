@@ -69,6 +69,11 @@ pub const TxOutput = struct {
 pub const DeployOptions = struct {
     satoshis: i64,
     change_address: ?[]const u8 = null,
+    /// Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+    /// are owned by a different key than the connected deploy signer, set this so
+    /// the funding inputs are signed by their real owner. Defaults to the
+    /// connected signer (zero behaviour change).
+    funding_signer: ?@import("sdk_signer.zig").Signer = null,
 };
 
 /// CallOptions specifies options for calling a contract method.
@@ -76,12 +81,112 @@ pub const CallOptions = struct {
     satoshis: i64 = 0,
     change_address: ?[]const u8 = null,
     new_state: ?[]const StateValue = null,
+    /// Multiple continuation outputs for multi-output methods (e.g.
+    /// `transfer` on a fungible token where the contract emits one output
+    /// for the receiver and one residual change output, both back into
+    /// the same locking-script template with different state). Each
+    /// `OutputSpec` is `{ satoshis, state: [positional StateValue] }` —
+    /// the SDK builds one continuation output per entry, replacing the
+    /// single-continuation path that `new_state` drives. Mutually
+    /// exclusive with `new_state`; when both are set, `outputs` wins.
+    outputs: ?[]const OutputSpec = null,
+    /// Optional explicit override for data outputs emitted via
+    /// `this.addDataOutput(...)` in the method body. When null, the SDK
+    /// resolves data outputs automatically by running the ANF interpreter.
+    /// Scripts must be hex-encoded.
+    data_outputs: ?[]const ContractOutput = null,
+    /// Terminal outputs for methods that fully spend the contract UTXO
+    /// (no continuation). When set, the transaction is built with the
+    /// contract UTXO as the only signed input (plus optional
+    /// `funding_utxos` as P2PKH funding inputs); outputs are exactly
+    /// `terminal_outputs` with no automatic state continuation and no
+    /// change. The fee comes from the contract balance + any funding
+    /// UTXOs. After a terminal call the contract is fully spent
+    /// (`current_utxo` becomes null). Scripts in each entry are
+    /// hex-encoded — the `TerminalOutput` resolver in generated wrapper
+    /// code converts user-supplied addresses into P2PKH scripts before
+    /// passing them here.
+    terminal_outputs: ?[]const ContractOutput = null,
+    /// Additional P2PKH funding UTXOs to include as inputs for terminal
+    /// method calls. Used when the contract balance is insufficient for
+    /// `terminal_outputs` + fee. Ignored unless `terminal_outputs` is
+    /// non-null. Each UTXO is signed with the configured signer's key.
+    funding_utxos: ?[]const UTXO = null,
+    /// A single plain P2PKH UTXO added to a terminal call tx purely to pay the
+    /// miner fee (issue #118). A true terminal method pays out the full contract
+    /// balance, so fee would be 0 and ARC rejects; the covenant asserts its exact
+    /// output set, so no change output can absorb a fee. The fee input is added
+    /// BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers it) and
+    /// is consumed entirely as fee — no change output is created. Signed with
+    /// `funding_signer ?? signer` (composes with #134). Merges into the same
+    /// terminal P2PKH funding-input path as `funding_utxos`; the covenant's
+    /// output assertions are untouched.
+    fee_utxo: ?UTXO = null,
+    /// Additional contract UTXOs to include as inputs (e.g. `merge` on a
+    /// fungible token spends two contract UTXOs into one). Each entry is
+    /// unlocked with the same method + arg shape as the primary call;
+    /// `Sig` params are auto-signed per input (same as the primary
+    /// unlocking script). Mirrors Go's `AdditionalContractInputs`.
+    additional_contract_inputs: ?[]const UTXO = null,
+    /// Per-input arg overrides for `additional_contract_inputs`. Slot `i`
+    /// applies to additional input `i`. nil entries inside a slot mean
+    /// "auto-resolve" (same as the primary unlocking — Sig auto-signs,
+    /// `_allPrevouts` auto-fills). Use this when a multi-input call
+    /// passes different per-input args (e.g. each additional input has
+    /// its own `otherBalance` value). Mirrors Go's
+    /// `AdditionalContractInputArgs`.
+    additional_contract_input_args: ?[]const []const StateValue = null,
+    /// Override the call tx's nLockTime field. `null` → SDK uses 0 (legacy
+    /// behavior, preserves existing contracts). Set for contracts that assert
+    /// `extractLocktime(preimage) >= deadline` (e.g. auction close/claim).
+    /// Threaded through every call-tx build site (stateless, stateful,
+    /// rebuild, terminal).
+    locktime: ?u32 = null,
+    /// Override the nSequence written onto EVERY input of the call tx (issue
+    /// #131). Zero-config: when `locktime` is set and non-zero, sequence defaults
+    /// to 0xfffffffe (non-final, so consensus actually enforces nLockTime);
+    /// otherwise it stays 0xffffffff (final, legacy). Set explicitly only for RBF
+    /// or custom relative-locktime scenarios. Threaded through the non-terminal
+    /// and terminal call-tx build sites.
+    sequence: ?u32 = null,
+    /// Signer for the P2PKH funding (and terminal fee) inputs (issue #134). When
+    /// the funding/fee UTXOs are owned by a different key than the connected
+    /// method signer, set this so those inputs are signed by their real owner.
+    /// The method's own `Sig` args are still signed by the connected signer.
+    /// Defaults to the connected signer (zero behaviour change).
+    funding_signer: ?@import("sdk_signer.zig").Signer = null,
+    /// Cap the number of P2PKH funding inputs added to a non-terminal call tx
+    /// (issue #133). Funding is chosen by smallest-sufficient, largest-first
+    /// selection (the same selectUtxos strategy deploy uses). If covering the
+    /// outputs + fee would need more than this many inputs, the call fails
+    /// (InsufficientFunds) rather than silently sweeping the wallet. null → no
+    /// cap.
+    max_funding_inputs: ?usize = null,
+};
+
+/// OutputSpec describes one continuation output for a multi-output method.
+/// `state` is the positional state slice for the continuation, encoded the
+/// same way as `CallOptions.new_state`.
+pub const OutputSpec = struct {
+    satoshis: i64,
+    state: []const StateValue,
 };
 
 /// ContractOutput describes one contract continuation output.
 pub const ContractOutput = struct {
     script: []const u8,
     satoshis: i64,
+};
+
+/// TerminalOutput is the user-facing record for a single output in a
+/// terminal method call. Either `address` (resolved to P2PKH) or
+/// `script_hex` (raw locking script) must be set. Generated wrapper code
+/// converts these into `ContractOutput` before passing them to
+/// `CallOptions.terminal_outputs`.
+pub const TerminalOutput = struct {
+    satoshis: i64,
+    address: ?[]const u8 = null,
+    script_hex: ?[]const u8 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,17 +199,35 @@ pub const RunarArtifact = struct {
     version: []const u8 = &.{},
     compiler_version: []const u8 = &.{},
     contract_name: []const u8 = &.{},
+    // Base class the source contract extends. Authoritative stateful signal
+    // for the issue-#42/#44 terminal sighash subscript trim: a
+    // StatefulSmartContract with zero mutable fields still needs the trim even
+    // though state_fields is empty. Empty for older artifacts.
+    parent_class: []const u8 = &.{},
     abi: ABI = .{},
     script: []const u8 = &.{},
     asm_text: []const u8 = &.{},
     state_fields: []StateField = &.{},
     constructor_slots: []ConstructorSlot = &.{},
+    code_sep_index_slots: []CodeSepIndexSlot = &.{},
     build_timestamp: []const u8 = &.{},
     code_separator_index: ?i32 = null,
     code_separator_indices: []i32 = &.{},
+    anf_json: ?[]const u8 = null, // raw JSON of the ANF IR (for SDK auto-state computation)
 
     pub fn isStateful(self: *const RunarArtifact) bool {
         return self.state_fields.len > 0;
+    }
+
+    /// True when the contract extends StatefulSmartContract (from
+    /// `parent_class`), independent of whether it has mutable state fields.
+    /// Gates the issue-#42/#44 terminal sighash subscript trim. Falls back to
+    /// `isStateful()` for older artifacts that predate the parentClass field.
+    pub fn parentStateful(self: *const RunarArtifact) bool {
+        if (self.parent_class.len > 0) {
+            return std.mem.eql(u8, self.parent_class, "StatefulSmartContract");
+        }
+        return self.isStateful();
     }
 
     pub fn deinit(self: *RunarArtifact) void {
@@ -112,6 +235,7 @@ pub const RunarArtifact = struct {
         if (self.version.len > 0) a.free(self.version);
         if (self.compiler_version.len > 0) a.free(self.compiler_version);
         if (self.contract_name.len > 0) a.free(self.contract_name);
+        if (self.parent_class.len > 0) a.free(self.parent_class);
         if (self.script.len > 0) a.free(self.script);
         if (self.asm_text.len > 0) a.free(self.asm_text);
         if (self.build_timestamp.len > 0) a.free(self.build_timestamp);
@@ -119,7 +243,9 @@ pub const RunarArtifact = struct {
         for (self.state_fields) |*sf| sf.deinit(a);
         if (self.state_fields.len > 0) a.free(self.state_fields);
         if (self.constructor_slots.len > 0) a.free(self.constructor_slots);
+        if (self.code_sep_index_slots.len > 0) a.free(self.code_sep_index_slots);
         if (self.code_separator_indices.len > 0) a.free(self.code_separator_indices);
+        if (self.anf_json) |aj| a.free(aj);
         self.* = .{ .allocator = a };
     }
 
@@ -135,6 +261,9 @@ pub const RunarArtifact = struct {
 
         if (root.get("contractName")) |v| {
             if (v == .string) artifact.contract_name = try allocator.dupe(u8, v.string);
+        }
+        if (root.get("parentClass")) |v| {
+            if (v == .string) artifact.parent_class = try allocator.dupe(u8, v.string);
         }
         if (root.get("version")) |v| {
             if (v == .string) artifact.version = try allocator.dupe(u8, v.string);
@@ -184,6 +313,17 @@ pub const RunarArtifact = struct {
             }
         }
 
+        // Store raw ANF JSON for the SDK ANF interpreter
+        if (root.get("anf")) |anf_val| {
+            if (anf_val == .object) {
+                // Re-stringify the ANF object so the interpreter can parse it independently
+                const anf_str = std.json.Stringify.valueAlloc(allocator, anf_val, .{}) catch null;
+                if (anf_str) |s| {
+                    artifact.anf_json = s;
+                }
+            }
+        }
+
         // Parse constructorSlots
         if (root.get("constructorSlots")) |cs_val| {
             if (cs_val == .array) {
@@ -197,6 +337,22 @@ pub const RunarArtifact = struct {
                     };
                 }
                 artifact.constructor_slots = slots;
+            }
+        }
+
+        // Parse codeSepIndexSlots
+        if (root.get("codeSepIndexSlots")) |csis_val| {
+            if (csis_val == .array) {
+                const items = csis_val.array.items;
+                var csis = try allocator.alloc(CodeSepIndexSlot, items.len);
+                for (items, 0..) |item, i| {
+                    const obj = item.object;
+                    csis[i] = .{
+                        .byte_offset = if (obj.get("byteOffset")) |bo| @intCast(bo.integer) else 0,
+                        .code_sep_index = if (obj.get("codeSepIndex")) |ci| @intCast(ci.integer) else 0,
+                    };
+                }
+                artifact.code_sep_index_slots = csis;
             }
         }
 
@@ -274,6 +430,12 @@ pub const ABIMethod = struct {
     params: []ABIParam = &.{},
     is_public: bool = false,
     is_terminal: ?bool = null,
+    /// Unlocking script is prefixed with _codePart (issue #100).
+    uses_code_part: ?bool = null,
+    /// The BIP-143 sighash type this method's preimage is built under (from a
+    /// `@sighash` directive, issue #123), e.g. 0x43 for SINGLE|FORKID. Absent =
+    /// default ALL|FORKID (0x41).
+    sig_hash_type: ?i64 = null,
 
     pub fn deinit(self: *ABIMethod, allocator: std.mem.Allocator) void {
         if (self.name.len > 0) allocator.free(self.name);
@@ -294,6 +456,12 @@ pub const ABIMethod = struct {
         }
         if (obj.get("isTerminal")) |v| {
             if (v == .bool) method.is_terminal = v.bool;
+        }
+        if (obj.get("usesCodePart")) |v| {
+            if (v == .bool) method.uses_code_part = v.bool;
+        }
+        if (obj.get("sigHashType")) |v| {
+            if (v == .integer) method.sig_hash_type = v.integer;
         }
         if (obj.get("params")) |params_val| {
             if (params_val == .array) {
@@ -336,17 +504,39 @@ pub const ABIParam = struct {
     }
 };
 
+/// FixedArrayInfo carries the metadata the SDK needs to flatten nested
+/// FixedArray state values into their scalar leaf slots at encode time and
+/// regroup them back at decode time. Populated from the `fixedArray` object
+/// on a StateField JSON entry when the compiler emits one.
+pub const FixedArrayInfo = struct {
+    element_type: []const u8 = &.{},
+    length: u32 = 0,
+    synthetic_names: [][]const u8 = &.{},
+
+    pub fn deinit(self: *FixedArrayInfo, allocator: std.mem.Allocator) void {
+        if (self.element_type.len > 0) allocator.free(self.element_type);
+        for (self.synthetic_names) |n| allocator.free(n);
+        if (self.synthetic_names.len > 0) allocator.free(self.synthetic_names);
+        self.* = .{};
+    }
+};
+
 /// StateField describes a state field in a stateful contract.
 pub const StateField = struct {
     name: []const u8 = &.{},
     type_name: []const u8 = &.{},
     index: i32 = 0,
     initial_value: ?[]const u8 = null, // stored as string representation
+    /// When non-null, this state field is a logical FixedArray that expands
+    /// into `fixed_array.synthetic_names.len` scalar slots. The SDK flattens
+    /// array-typed state values on write and regroups them on read.
+    fixed_array: ?FixedArrayInfo = null,
 
     pub fn deinit(self: *StateField, allocator: std.mem.Allocator) void {
         if (self.name.len > 0) allocator.free(self.name);
         if (self.type_name.len > 0) allocator.free(self.type_name);
         if (self.initial_value) |iv| allocator.free(iv);
+        if (self.fixed_array) |*fa| fa.deinit(allocator);
         self.* = .{};
     }
 
@@ -375,6 +565,36 @@ pub const StateField = struct {
                 else => {},
             }
         }
+        if (obj.get("fixedArray")) |v| {
+            if (v == .object) {
+                var fa = FixedArrayInfo{};
+                errdefer fa.deinit(allocator);
+                if (v.object.get("elementType")) |et| {
+                    if (et == .string) fa.element_type = try allocator.dupe(u8, et.string);
+                }
+                if (v.object.get("length")) |ln| {
+                    if (ln == .integer) fa.length = @intCast(ln.integer);
+                }
+                if (v.object.get("syntheticNames")) |sn| {
+                    if (sn == .array) {
+                        var names = try allocator.alloc([]const u8, sn.array.items.len);
+                        var filled: usize = 0;
+                        errdefer {
+                            for (0..filled) |i| allocator.free(names[i]);
+                            allocator.free(names);
+                        }
+                        for (sn.array.items) |it| {
+                            if (it == .string) {
+                                names[filled] = try allocator.dupe(u8, it.string);
+                                filled += 1;
+                            }
+                        }
+                        fa.synthetic_names = names;
+                    }
+                }
+                field.fixed_array = fa;
+            }
+        }
 
         return field;
     }
@@ -387,6 +607,15 @@ pub const ConstructorSlot = struct {
     byte_offset: i32,
 };
 
+/// CodeSepIndexSlot describes where a codeSeparatorIndex placeholder (OP_0)
+/// resides in the template script. The SDK substitutes these at deployment
+/// time with the adjusted codeSeparatorIndex value that accounts for
+/// constructor arg expansion.
+pub const CodeSepIndexSlot = struct {
+    byte_offset: i32,
+    code_sep_index: i32,
+};
+
 // ---------------------------------------------------------------------------
 // StateValue — dynamically-typed value used in contract state
 // ---------------------------------------------------------------------------
@@ -394,12 +623,34 @@ pub const ConstructorSlot = struct {
 /// StateValue is a tagged union for contract state values and method arguments.
 pub const StateValue = union(enum) {
     int: i64,
+    /// Arbitrary-precision integer stored as a decimal string (owned).
+    /// Used for values that exceed the i64 range.
+    big_int: []const u8,
     boolean: bool,
     bytes: []const u8, // hex-encoded
+    /// A (possibly nested) array of scalar StateValues — produced when the
+    /// SDK deserializes a FixedArray state field, or passed by the user when
+    /// constructing such a field. Leaves may only be scalar StateValues; the
+    /// flatten/regroup helpers in `sdk_state.zig` walk the tree linearly.
+    array_value: []const StateValue,
+    /// Issue #106: the producer-side EmptySig marker for the deliberately-empty
+    /// branch of an OR-CHECKSIG method — `checkSig(sigA, pkA) || checkSig(sigB,
+    /// pkB)`, where `||` lowers to the non-lazy OP_BOOLOR so BOTH OP_CHECKSIGs
+    /// run. Only the matching branch supplies a real signature; the failing
+    /// branch MUST push an empty signature (OP_0) or BIP146 NULLFAIL rejects the
+    /// whole spend. Distinct from `.int = 0` (the auto-sign sentinel), so the
+    /// auto-sign collectors never treat it as auto-sign and never sign it —
+    /// `encodeArg` emits OP_0 (00) for it. See `EMPTY_SIG`.
+    empty_sig,
 
     pub fn deinit(self: StateValue, allocator: std.mem.Allocator) void {
         switch (self) {
             .bytes => |b| allocator.free(b),
+            .big_int => |s| allocator.free(s),
+            .array_value => |items| {
+                for (items) |it| it.deinit(allocator);
+                allocator.free(items);
+            },
             else => {},
         }
     }
@@ -407,8 +658,121 @@ pub const StateValue = union(enum) {
     pub fn clone(self: StateValue, allocator: std.mem.Allocator) !StateValue {
         return switch (self) {
             .int => |n| .{ .int = n },
+            .big_int => |s| .{ .big_int = try allocator.dupe(u8, s) },
             .boolean => |b| .{ .boolean = b },
             .bytes => |b| .{ .bytes = try allocator.dupe(u8, b) },
+            .empty_sig => .empty_sig,
+            .array_value => |items| blk: {
+                var copy = try allocator.alloc(StateValue, items.len);
+                for (items, 0..) |it, i| copy[i] = try it.clone(allocator);
+                break :blk .{ .array_value = copy };
+            },
+        };
+    }
+};
+
+/// Issue #106: the EmptySig marker value. Pass as the call arg for the
+/// non-matching Sig slot of an OR-CHECKSIG method: the SDK pushes OP_0 for it
+/// and never signs it, distinct from `.int = 0` (auto-sign) and an explicit
+/// hex-bytes value. Wire-byte parity with the TS SDK (which encodes "00").
+pub const EMPTY_SIG: StateValue = .empty_sig;
+
+// ---------------------------------------------------------------------------
+// PreparedCall — deferred-signing handoff for multi-signer flows
+// ---------------------------------------------------------------------------
+//
+// Returned by `RunarContract.prepareCall(...)`. Contains:
+//   - the prepared (unsigned-as-to-Sig-params) tx hex
+//   - one BIP-143 sighash per `Sig` placeholder, parallel to `sig_indices`
+//   - opaque internals consumed by `RunarContract.finalizeCall(...)`
+//
+// Mirrors Go `PreparedCall`, Rust `PreparedCall`, Java `PreparedCall`,
+// Python `PreparedCall`, Ruby `PreparedCall`. The opaque fields (after
+// the public coordination surface) are an intentionally-narrow subset of
+// what the corresponding Ruby/Go structs carry — Zig's prepareCall
+// initially supports stateless contracts only, where the only opaque
+// state needed at finalize time is the resolved-args list, the contract
+// utxo, and the prepared tx hex. Stateful prepareCall lands in a
+// follow-up alongside its OP_PUSH_TX preimage convergence.
+
+pub const PreparedCall = struct {
+    /// Tx hex with 72-byte zero-filled placeholders at every Sig slot.
+    /// Public so external signing UIs can display / inspect the tx.
+    tx_hex: []u8,
+    /// One 32-byte BIP-143 digest per `Sig` placeholder, parallel to
+    /// `sig_indices`. Each entry is hex-encoded (64 chars).
+    sighashes: [][]const u8,
+    /// User-arg index (in the user-visible parameter list) that each
+    /// sighash corresponds to. Same order as `sighashes`.
+    sig_indices: []usize,
+
+    // ------------------ opaque, consumed by finalizeCall -----------------
+    method_name: []u8,
+    /// Owned copies of resolved args (with placeholder Sigs).
+    resolved_args: []StateValue,
+    contract_utxo: UTXO,
+    is_stateful: bool,
+    /// New locking script for stateful continuation; empty for stateless.
+    new_locking_script: []u8,
+    new_satoshis: i64,
+
+    // -------- stateful-only opaque plumbing (zero-sized for stateless) ---
+    /// Hex-encoded k=1 OP_PUSH_TX signature, captured after preimage
+    /// convergence so finalizeCall can rebuild the stateful unlock with
+    /// the same OP_PUSH_TX evidence.
+    op_push_tx_sig: []u8 = &.{},
+    /// Hex-encoded BIP-143 preimage embedded in the stateful unlock.
+    preimage: []u8 = &.{},
+    /// Hex-encoded method-selector push (for multi-method stateful contracts);
+    /// empty when the contract has only one public method.
+    method_selector: []u8 = &.{},
+    /// True when the method's ABI declared a `_changePKH` parameter.
+    needs_change: bool = false,
+    /// Unlocking script is prefixed with _codePart (issue #100).
+    method_uses_code_part: bool = false,
+    /// Hex-encoded change-recipient PKH; null for terminal-stateful methods.
+    change_pkh: []u8 = &.{},
+    /// Change amount that was baked into the unlock script's
+    /// `_changeAmount` push during convergence.
+    change_amount: i64 = 0,
+    /// True when the method's ABI declared a `_newAmount` parameter.
+    needs_new_amount: bool = false,
+    /// OP_CODESEPARATOR byte offset, or -1 if absent. Needed at finalize
+    /// time so the rebuilt unlock keeps the same subscript boundary the
+    /// preimage was computed over.
+    code_sep_idx: i32 = -1,
+    /// Pre-resolved intent-intrinsic witness hex (PUSHDATA-encoded
+    /// `_prevOutScript_*` followed by `_serialisedOutputs`, ABI order).
+    /// Empty when the method has no auto-injected intent params. The
+    /// stateful unlock script reuses this verbatim at finalize time.
+    intent_witness_hex: []u8 = &.{},
+
+    pub fn deinit(self: *PreparedCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.tx_hex);
+        for (self.sighashes) |sh| allocator.free(sh);
+        if (self.sighashes.len > 0) allocator.free(self.sighashes);
+        if (self.sig_indices.len > 0) allocator.free(self.sig_indices);
+        allocator.free(self.method_name);
+        for (self.resolved_args) |a| a.deinit(allocator);
+        if (self.resolved_args.len > 0) allocator.free(self.resolved_args);
+        var u = self.contract_utxo;
+        u.deinit(allocator);
+        if (self.new_locking_script.len > 0) allocator.free(self.new_locking_script);
+        if (self.op_push_tx_sig.len > 0) allocator.free(self.op_push_tx_sig);
+        if (self.preimage.len > 0) allocator.free(self.preimage);
+        if (self.method_selector.len > 0) allocator.free(self.method_selector);
+        if (self.change_pkh.len > 0) allocator.free(self.change_pkh);
+        if (self.intent_witness_hex.len > 0) allocator.free(self.intent_witness_hex);
+        self.* = .{
+            .tx_hex = &.{},
+            .sighashes = &.{},
+            .sig_indices = &.{},
+            .method_name = &.{},
+            .resolved_args = &.{},
+            .contract_utxo = .{ .txid = &.{}, .output_index = 0, .satoshis = 0, .script = &.{} },
+            .is_stateful = false,
+            .new_locking_script = &.{},
+            .new_satoshis = 0,
         };
     }
 };

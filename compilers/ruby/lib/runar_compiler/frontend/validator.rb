@@ -7,6 +7,7 @@
 
 require_relative "ast_nodes"
 require_relative "diagnostic"
+require_relative "sighash_validate"
 
 module RunarCompiler
   module Frontend
@@ -44,6 +45,8 @@ module RunarCompiler
       RabinSig
       RabinPubKey
       Point
+      P256Point
+      P384Point
     ].to_set.freeze
 
     # Validate a Runar AST against language subset constraints.
@@ -59,6 +62,15 @@ module RunarCompiler
       ctx.validate_constructor
       ctx.validate_methods
       ctx.check_no_recursion
+
+      # Issue #123: reject preimage-field reads / output bindings that are
+      # unsound under a method's declared @sighash mode (security core). This
+      # pass emits both errors (unsound usages) and warnings (e.g. an explicit
+      # single-output SINGLE covenant whose same-index value cannot be pinned
+      # statically), so route each diagnostic to the matching bucket.
+      SighashValidate.validate_sighash_usage(contract).each do |d|
+        (d.severity == Severity::WARNING ? ctx.warnings : ctx.errors) << d
+      end
 
       ValidationResult.new(errors: ctx.errors, warnings: ctx.warnings)
     end
@@ -91,12 +103,13 @@ module RunarCompiler
           end
         end
 
-        # SmartContract requires all properties to be readonly
-        if @contract.parent_class == "SmartContract"
+        # SmartContract (and the asm-escape-hatch UnsafeSmartContract) require
+        # all properties to be readonly.
+        if @contract.parent_class == "SmartContract" || @contract.parent_class == "UnsafeSmartContract"
           @contract.properties.each do |prop|
             unless prop.readonly
               add_error(
-                "Property '#{prop.name}' in SmartContract must be declared readonly",
+                "Property '#{prop.name}' in #{@contract.parent_class} must be declared readonly",
                 loc: prop.source_location
               )
             end
@@ -167,6 +180,16 @@ module RunarCompiler
       # -------------------------------------------------------------------
 
       def validate_methods
+        # A contract with no public methods has no spending entry points and
+        # compiles to an empty script -- never what the author meant (usually a
+        # missing `public` modifier; methods default to private).
+        unless @contract.methods.any? { |m| m.visibility == "public" }
+          add_error(
+            "Contract '#{@contract.name}' has no public methods — no spending entry points; " \
+            "add 'public' to at least one method"
+          )
+        end
+
         @contract.methods.each { |method| validate_method(method) }
       end
 
@@ -228,6 +251,12 @@ module RunarCompiler
               loc: loc
             )
           end
+          if type_node.element.is_a?(PrimitiveType) && type_node.element.name == "void"
+            add_error(
+              "FixedArray element type 'void' is not valid at #{loc.file}:#{loc.line}",
+              loc: loc
+            )
+          end
           validate_property_type(type_node.element, loc)
         elsif type_node.is_a?(CustomType)
           add_error(
@@ -242,9 +271,11 @@ module RunarCompiler
       # -------------------------------------------------------------------
 
       def validate_method(method)
-        # Public methods must end with assert() (unless StatefulSmartContract,
-        # where the compiler auto-injects the final assert)
-        if method.visibility == "public" && @contract.parent_class != "StatefulSmartContract"
+        # Public methods must end with an assert() call (unless
+        # StatefulSmartContract, where the compiler auto-injects the final
+        # assert; or UnsafeSmartContract, where a terminal asm({..., out_arity:
+        # 1}) provides the truthy stack value).
+        if method.visibility == "public" && @contract.parent_class == "SmartContract"
           unless ends_with_assert?(method.body)
             add_error(
               "public method '#{method.name}' must end with an assert() call",
@@ -253,9 +284,44 @@ module RunarCompiler
           end
         end
 
+        # UnsafeSmartContract public methods must end with either an assert()
+        # call or a terminal asm({..., out_arity: 1}) -- either way the script
+        # has to leave a truthy value on the stack.
+        if method.visibility == "public" && @contract.parent_class == "UnsafeSmartContract"
+          unless ends_with_assert?(method.body) || ends_with_terminal_asm?(method.body)
+            add_error(
+              "public method '#{method.name}' must end with an assert() call " \
+              "or a terminal asm({...}) with out_arity 1",
+              loc: method.source_location
+            )
+          end
+        end
+
         # V24/V25: Warn on manual preimage/state-script boilerplate in StatefulSmartContract
         if @contract.parent_class == "StatefulSmartContract" && method.visibility == "public"
           warn_manual_preimage_usage(method)
+        end
+
+        # #131: warn when a public method gates on extractLocktime but never
+        # asserts the spending tx is non-final (extractSequence < 0xffffffff).
+        # Advisory only.
+        if method.visibility == "public"
+          warn_locktime_without_sequence_guard(method)
+        end
+
+        # Gate asm({...}) calls on UnsafeSmartContract and check the structural args.
+        validate_asm_usage(method)
+
+        # FixedArray is not allowed as a method parameter type.  The SDK
+        # accepts FixedArray constructor args and flattens them on behalf of
+        # the caller, but method params carry no expansion pass.
+        method.params.each do |param|
+          if param.type.is_a?(FixedArrayType)
+            add_error(
+              "FixedArray is not allowed as a parameter type for method '#{method.name}' (param '#{param.name}')",
+              loc: method.source_location
+            )
+          end
         end
 
         # Validate statements
@@ -269,6 +335,12 @@ module RunarCompiler
       def validate_statement(stmt)
         case stmt
         when VariableDeclStmt
+          if stmt.type.is_a?(FixedArrayType)
+            add_error(
+              "FixedArray is not allowed as a local variable type (variable '#{stmt.name}')",
+              loc: stmt.source_location
+            )
+          end
           validate_expression(stmt.init)
         when AssignmentStmt
           validate_expression(stmt.target)
@@ -289,7 +361,10 @@ module RunarCompiler
       def validate_for_statement(stmt)
         validate_expression(stmt.condition)
 
-        # Check constant bounds
+        # Check that the loop bound is a compile-time constant. Non-zero starts
+        # and countdown loops (`i--` with `>`/`>=`) are supported: the ANF loop
+        # node carries an explicit start value and step direction (#121), so
+        # lowering binds iterVar = start + i*step on each unrolled iteration.
         if stmt.condition.is_a?(BinaryExpr)
           unless compile_time_constant?(stmt.condition.right)
             add_error("for loop bound must be a compile-time constant")
@@ -402,14 +477,134 @@ module RunarCompiler
       end
 
       # -------------------------------------------------------------------
+      # Helper: asm({...}) intrinsic validation
+      # -------------------------------------------------------------------
+
+      # Return true if +expr+ is a call to the asm compiler intrinsic.
+      def asm_call?(expr)
+        return false unless expr.is_a?(CallExpr)
+        return false unless expr.callee.is_a?(Identifier)
+
+        expr.callee.name == "asm"
+      end
+
+      # Return true if the last statement of +body+ is an asm({...}) call with
+      # the parser-normalised positional args (body, in_arity, out_arity) and
+      # an out_arity literal equal to 1.
+      #
+      # If/else branches that both terminate in a terminal asm (or assert)
+      # also count, mirroring the asserts-on-both-branches rule.
+      def ends_with_terminal_asm?(body)
+        return false if body.empty?
+
+        last = body.last
+
+        if last.is_a?(ExpressionStmt)
+          return false unless asm_call?(last.expr)
+
+          call = last.expr
+          # The parser always rewrites asm({...}) into positional
+          # (body, in_arity, out_arity).
+          if call.args.length == 3
+            out_arity = call.args[2]
+            return out_arity.is_a?(BigIntLiteral) && out_arity.value.to_i == 1
+          end
+          return false
+        end
+
+        if last.is_a?(IfStmt)
+          then_ends = ends_with_terminal_asm?(last.then) || ends_with_assert?(last.then)
+          else_ends = !last.else_.empty? &&
+                      (ends_with_terminal_asm?(last.else_) || ends_with_assert?(last.else_))
+          return then_ends && else_ends
+        end
+
+        false
+      end
+
+      # Walk a method body and validate every asm({...}) call:
+      #
+      #   - Reject any asm() outside an UnsafeSmartContract.
+      #   - Confirm the parser-normalised arg shape: (body, in_arity,
+      #     out_arity) where body is a ByteString literal with even-length
+      #     hex and the arities are non-negative bigint literals.
+      #   - Expression-form asm<T>({...}) must have out_arity 1.
+      #
+      # The parser already pushes most hex diagnostics; this pass is the
+      # back-stop that runs even when the parser shape is well-formed and is
+      # the only layer that knows about the contract's parentClass.
+      def validate_asm_usage(method)
+        walk_expressions_in_body(method.body, proc do |expr|
+          next unless asm_call?(expr)
+
+          call = expr
+
+          if @contract.parent_class != "UnsafeSmartContract"
+            add_error(
+              "'asm' is only available in contracts extending UnsafeSmartContract; " \
+              "got #{@contract.parent_class}. Move the call into a class that extends " \
+              "UnsafeSmartContract (and import { UnsafeSmartContract } from 'runar-lang')."
+            )
+            next
+          end
+
+          if call.args.length != 3
+            add_error("asm() expects exactly one object-literal argument { body, in_arity?, out_arity? }")
+            next
+          end
+
+          body_arg = call.args[0]
+          unless body_arg.is_a?(ByteStringLiteral)
+            add_error("asm() body must be a hex string literal")
+            next
+          end
+          body = body_arg.value
+          if body.empty?
+            add_error("asm() body must be a non-empty hex string literal")
+          elsif body.length.odd?
+            add_error(
+              "asm() body has odd hex length (#{body.length}); " \
+              "each opcode byte requires two hex characters"
+            )
+          elsif !body.match?(/\A[0-9a-fA-F]*\z/)
+            add_error("asm() body contains non-hex characters; only 0-9, a-f, A-F are allowed")
+          end
+
+          in_arity = call.args[1]
+          if !in_arity.is_a?(BigIntLiteral) || in_arity.value.to_i < 0
+            add_error("asm() in_arity must be a non-negative integer literal")
+          end
+
+          out_arity = call.args[2]
+          if !out_arity.is_a?(BigIntLiteral) || out_arity.value.to_i < 0
+            add_error("asm() out_arity must be a non-negative integer literal")
+          end
+
+          # Expression-form asm<T>({...}) returns a value that flows into a
+          # let-binding -- exactly ONE stack value, so out_arity must be 1.
+          if call.asm_return_type && out_arity.is_a?(BigIntLiteral) && out_arity.value.to_i != 1
+            add_error(
+              "Expression-form asm<#{call.asm_return_type}>() must have out_arity 1 " \
+              "(got #{out_arity.value}); only a single stack value can be bound to " \
+              "the result variable."
+            )
+          end
+        end)
+      end
+
+      # -------------------------------------------------------------------
       # Helper: compile-time constant check
       # -------------------------------------------------------------------
 
+      # Only integer literals (and their negation) can be unrolled into fixed
+      # Bitcoin Script by anf-lower. A bare identifier bound (e.g. `const N`) or
+      # a runtime member access (`this.x`) is NOT resolvable and must be
+      # rejected here with a graceful diagnostic — anf-lower's
+      # _extract_loop_shape would otherwise raise. Mirrors the reference TS
+      # compiler's observable behavior: only literal loop bounds compile.
       def compile_time_constant?(expr)
         return false if expr.nil?
         return true if expr.is_a?(BigIntLiteral)
-        return true if expr.is_a?(BoolLiteral)
-        return true if expr.is_a?(Identifier) # trust it's a const
 
         if expr.is_a?(UnaryExpr) && expr.op == "-"
           return compile_time_constant?(expr.operand)
@@ -467,6 +662,100 @@ module RunarCompiler
         return callee.property if callee.is_a?(MemberExpr)
 
         nil
+      end
+
+      # -------------------------------------------------------------------
+      # #131: locktime soundness -- extractLocktime needs an extractSequence guard
+      # -------------------------------------------------------------------
+
+      # Sentinel maximum nSequence: a tx is FINAL (ignores locktime) at this value.
+      SEQUENCE_FINAL = 0xffffffff
+
+      # True when +expr+ is a direct call to the named intrinsic, e.g. +f(...)+.
+      def call_to_named?(expr, name)
+        expr.is_a?(CallExpr) &&
+          expr.callee.is_a?(Identifier) &&
+          expr.callee.name == name
+      end
+
+      # True when +expr+ reads the transaction locktime. Both the raw intrinsic
+      # +extractLocktime(preimage)+ and its ergonomic sugar
+      # +currentBlockHeight()+ (which the ANF pass desugars to
+      # +extractLocktime(txPreimage)+) count -- either read is unsound without a
+      # sequence-finality guard.
+      def locktime_read?(expr)
+        call_to_named?(expr, "extractLocktime") || call_to_named?(expr, "currentBlockHeight")
+      end
+
+      # True when +expr+ is an +extractSequence(...) < <final>+-style comparison
+      # (the guard that makes a locktime gate consensus-enforced). Accepts the
+      # two natural spellings: +extractSequence(pre) < N+ / +<= N+, and the
+      # reversed +N > extractSequence(pre)+ / +>= ...+. +N+ must be a bigint
+      # literal no greater than the finality sentinel, so the guard genuinely
+      # forces non-finality.
+      def sequence_finality_guard?(expr)
+        return false unless expr.is_a?(BinaryExpr)
+
+        bound_ok = ->(e) { e.is_a?(BigIntLiteral) && e.value <= SEQUENCE_FINAL }
+
+        if ["<", "<="].include?(expr.op) &&
+           call_to_named?(expr.left, "extractSequence") && bound_ok.call(expr.right)
+          return true
+        end
+        if [">", ">="].include?(expr.op) &&
+           call_to_named?(expr.right, "extractSequence") && bound_ok.call(expr.left)
+          return true
+        end
+
+        false
+      end
+
+      # #131: warn when +method+ (transitively, through the private-helper call
+      # graph) reads the tx locktime but never asserts the tx is non-final. A
+      # locktime gate is not consensus-enforced unless
+      # +extractSequence < 0xffffffff+ is also asserted -- otherwise an
+      # all-final-sequence spend bypasses it. Advisory (warning) only -- no
+      # effect on emitted bytecode.
+      def warn_locktime_without_sequence_guard(method)
+        private_methods = {}
+        @contract.methods.each do |m|
+          private_methods[m.name] = m if m.visibility == "private"
+        end
+
+        reads_locktime = false
+        has_sequence_guard = false
+        visited = Set.new([method.name])
+        queue = [method]
+
+        until queue.empty?
+          current = queue.shift
+          walk_expressions_in_body(current.body, proc do |expr|
+            reads_locktime = true if locktime_read?(expr)
+            has_sequence_guard = true if sequence_finality_guard?(expr)
+          end)
+
+          # Follow calls into private helpers so a guard (or locktime read)
+          # supplied by an inlined helper is seen by the public entry point.
+          calls = Set.new
+          collect_method_calls(current.body, calls)
+          calls.each do |callee|
+            next if visited.include?(callee) || !private_methods.key?(callee)
+
+            visited.add(callee)
+            queue << private_methods[callee]
+          end
+        end
+
+        return unless reads_locktime && !has_sequence_guard
+
+        @warnings << Diagnostic.new(
+          message: "method '#{method.name}' reads extractLocktime but does not assert " \
+                   "extractSequence < 0xffffffff; a locktime gate is not consensus-enforced " \
+                   "unless the tx is non-final — add " \
+                   "assert(extractSequence(this.txPreimage) < 0xffffffffn)",
+          severity: Severity::WARNING,
+          loc: method.source_location
+        )
       end
 
       # -------------------------------------------------------------------

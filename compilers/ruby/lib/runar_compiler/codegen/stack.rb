@@ -77,6 +77,40 @@ module RunarCompiler::Codegen
     ecPointX ecPointY
   ]).freeze
 
+  # NIST EC (P-256 / P-384) builtin function names
+  NIST_EC_BUILTIN_NAMES = Set.new(%w[
+    p256Add p256Mul p256MulGen p256Negate p256OnCurve p256EncodeCompressed
+    p384Add p384Mul p384MulGen p384Negate p384OnCurve p384EncodeCompressed
+  ]).freeze
+
+  # ECDSA verification function names
+  VERIFY_ECDSA_NAMES = Set.new(%w[verifyECDSA_P256 verifyECDSA_P384]).freeze
+
+  # Baby Bear field arithmetic builtin function names
+  BB_BUILTIN_NAMES = Set.new(%w[
+    bbFieldAdd bbFieldSub bbFieldMul bbFieldInv
+    bbExt4Mul0 bbExt4Mul1 bbExt4Mul2 bbExt4Mul3
+    bbExt4Inv0 bbExt4Inv1 bbExt4Inv2 bbExt4Inv3
+  ]).freeze
+
+  # KoalaBear field arithmetic builtin function names
+  KB_BUILTIN_NAMES = Set.new(%w[
+    kbFieldAdd kbFieldSub kbFieldMul kbFieldInv
+    kbExt4Mul0 kbExt4Mul1 kbExt4Mul2 kbExt4Mul3
+    kbExt4Inv0 kbExt4Inv1 kbExt4Inv2 kbExt4Inv3
+  ]).freeze
+
+  # BN254 field arithmetic and G1 curve builtin function names
+  BN254_BUILTIN_NAMES = Set.new(%w[
+    bn254FieldAdd bn254FieldSub bn254FieldMul bn254FieldInv bn254FieldNeg
+    bn254G1Add bn254G1ScalarMul bn254G1Negate bn254G1OnCurve
+  ]).freeze
+
+  # Merkle proof verification builtin function names
+  MERKLE_BUILTIN_NAMES = Set.new(%w[
+    merkleRootSha256 merkleRootHash256
+  ]).freeze
+
   # -----------------------------------------------------------------------
   # StackMap -- tracks named values on the stack
   # -----------------------------------------------------------------------
@@ -194,9 +228,26 @@ module RunarCompiler::Codegen
   # @return [Hash{String => Integer}]
   def self.compute_last_uses(bindings)
     last_use = {}
+    # Pre-scan: map each array_literal binding to its element refs. Used to
+    # propagate last-use across the array indirection (the array binding is
+    # pure metadata in _lower_array_literal -- its elements must remain live
+    # until the array's consumer, not until the array_literal binding itself).
+    array_elems = {}
+    bindings.each do |b|
+      array_elems[b.name] = Array(b.value.elements).dup if b.value.kind == "array_literal"
+    end
     bindings.each_with_index do |binding, i|
+      # array_literal is metadata-only -- do NOT advance its elements'
+      # last-use to here; defer to the array's consumer.
+      next if binding.value.kind == "array_literal"
+
       refs = collect_refs(binding.value)
-      refs.each { |ref| last_use[ref] = i }
+      refs.each do |ref|
+        last_use[ref] = i
+        if array_elems.key?(ref)
+          array_elems[ref].each { |e| last_use[e] = i }
+        end
+      end
     end
     last_use
   end
@@ -249,11 +300,44 @@ module RunarCompiler::Codegen
     when "add_raw_output"
       refs << value.satoshis
       refs << value.script_bytes
+    when "add_data_output"
+      refs << value.satoshis
+      refs << value.script_bytes
     when "array_literal"
       refs.concat(value.elements) if value.elements
+    when "raw_script"
+      # Opaque byte span -- no SSA operand refs. Stack effect is declared
+      # via in_arity / out_arity.
+    else
+      # Exhaustiveness guard. A silent empty-refs fall-through would let
+      # compute_last_uses miss a live operand and corrupt the stack plan.
+      raise ::RunarCompiler::IR::UnknownANFKindError.new(kind, "stack-lower.collectRefs")
     end
 
     refs
+  end
+
+  # Collect every binding name defined anywhere in a binding sequence,
+  # recursing into nested if-branches and loop bodies. Used by _lower_loop
+  # to distinguish loop-internal (re)definitions from true outer-scope refs.
+  #
+  # @param bindings [Array<IR::ANFBinding>]
+  # @return [Set<String>]
+  def self.collect_deep_binding_names(bindings)
+    names = Set.new
+    walk = lambda do |bs|
+      (bs || []).each do |b|
+        names.add(b.name)
+        if b.value.kind == "if"
+          walk.call(b.value.then)
+          walk.call(b.value.else_)
+        elsif b.value.kind == "loop"
+          walk.call(b.value.body)
+        end
+      end
+    end
+    walk.call(bindings)
+    names
   end
 
   # -----------------------------------------------------------------------
@@ -282,24 +366,86 @@ module RunarCompiler::Codegen
     EC_BUILTIN_NAMES.include?(name)
   end
 
+  # @param name [String]
+  # @return [Boolean]
+  def self.nist_ec_builtin?(name)
+    NIST_EC_BUILTIN_NAMES.include?(name)
+  end
+
+  # @param name [String]
+  # @return [Boolean]
+  def self.verify_ecdsa_builtin?(name)
+    VERIFY_ECDSA_NAMES.include?(name)
+  end
+
+  # @param name [String]
+  # @return [Boolean]
+  def self.bb_builtin?(name)
+    BB_BUILTIN_NAMES.include?(name)
+  end
+
+  # @param name [String]
+  # @return [Boolean]
+  def self.kb_builtin?(name)
+    KB_BUILTIN_NAMES.include?(name)
+  end
+
+  # @param name [String]
+  # @return [Boolean]
+  def self.bn254_builtin?(name)
+    BN254_BUILTIN_NAMES.include?(name)
+  end
+
+  # @param name [String]
+  # @return [Boolean]
+  def self.merkle_builtin?(name)
+    MERKLE_BUILTIN_NAMES.include?(name)
+  end
+
   # -----------------------------------------------------------------------
   # Method analysis helpers
   # -----------------------------------------------------------------------
 
+  # Recursively check whether `bindings` (and any private method bodies
+  # they call, transitively) contain a check_preimage. 2026-04-30
+  # audit finding F7: previous shallow scan missed manual
+  # checkPreimage calls inside if/loop bodies and private helpers,
+  # causing stack lowering to fail.
+  #
   # @param bindings [Array<IR::ANFBinding>]
+  # @param private_methods [Hash{String => IR::ANFMethod}, nil]
+  # @param seen [Set<String>] private methods currently on the recursion stack
   # @return [Boolean]
-  def self.method_uses_check_preimage?(bindings)
-    bindings.any? { |b| b.value.kind == "check_preimage" }
+  def self.method_uses_check_preimage?(bindings, private_methods = nil, seen = nil)
+    seen ||= [].to_set
+    bindings.each do |b|
+      return true if b.value.kind == "check_preimage"
+      if b.value.kind == "if"
+        return true if method_uses_check_preimage?(b.value.then, private_methods, seen)
+        return true if b.value.else_ && method_uses_check_preimage?(b.value.else_, private_methods, seen)
+      end
+      if b.value.kind == "loop"
+        return true if method_uses_check_preimage?(b.value.body, private_methods, seen)
+      end
+      if b.value.kind == "method_call" && private_methods
+        target = private_methods[b.value.method]
+        if target && !seen.include?(target.name)
+          new_seen = seen.dup.add(target.name)
+          return true if method_uses_check_preimage?(target.body, private_methods, new_seen)
+        end
+      end
+    end
+    false
   end
 
-  # Check whether a method has add_output, add_raw_output, or
-  # computeStateOutput/computeStateOutputHash calls (recursively).
+  # Check whether a method has add_output, add_raw_output, add_data_output,
+  # or computeStateOutput/computeStateOutputHash calls (recursively).
   #
   # @param bindings [Array<IR::ANFBinding>]
   # @return [Boolean]
   def self.method_uses_code_part?(bindings)
     bindings.each do |b|
-      return true if %w[add_output add_raw_output].include?(b.value.kind)
+      return true if %w[add_output add_raw_output add_data_output].include?(b.value.kind)
       if b.value.kind == "call" && %w[computeStateOutput computeStateOutputHash].include?(b.value.func)
         return true
       end
@@ -316,6 +462,50 @@ module RunarCompiler::Codegen
     false
   end
 
+  # Whether a method READS a mutable variable-length (ByteString) state field's
+  # value (via load_prop). Issue #100: such a terminal method needs _codePart
+  # for the preimage-relative state offset. Narrowed to the live var-length read
+  # so methods that only read readonly fields (baked into the locking script) or
+  # fixed-size fields keep their original terminal codegen.
+  def self.method_reads_var_len_state?(bindings, var_len_props)
+    bindings.each do |b|
+      return true if b.value.kind == "load_prop" && var_len_props.include?(b.value.name)
+
+      if b.value.kind == "if"
+        return true if method_reads_var_len_state?(b.value.then || [], var_len_props) ||
+                       method_reads_var_len_state?(b.value.else_ || [], var_len_props)
+      end
+      if b.value.kind == "loop"
+        return true if method_reads_var_len_state?(b.value.body || [], var_len_props)
+      end
+    end
+    false
+  end
+
+  # -----------------------------------------------------------------------
+  # State-property type classification helpers
+  # -----------------------------------------------------------------------
+
+  # State-field types that are stored as script numbers (require OP_BIN2NUM
+  # after extraction). `RabinSig`/`RabinPubKey` are bigint aliases.
+  NUMERIC_STATE_TYPES = %w[bigint boolean RabinSig RabinPubKey].to_set.freeze
+
+  # State-field types that are stored with a push-data length prefix and thus
+  # require `emit_push_data_decode` instead of a fixed OP_SPLIT.
+  VARIABLE_LENGTH_STATE_TYPES = %w[ByteString Sig SigHashPreimage].to_set.freeze
+
+  # @param t [String]
+  # @return [Boolean]
+  def self.numeric_state_type?(t)
+    NUMERIC_STATE_TYPES.include?(t)
+  end
+
+  # @param t [String]
+  # @return [Boolean]
+  def self.variable_length_state_type?(t)
+    VARIABLE_LENGTH_STATE_TYPES.include?(t)
+  end
+
   # -----------------------------------------------------------------------
   # LoweringContext -- mutable state for the stack-lowering pass
   # -----------------------------------------------------------------------
@@ -324,6 +514,52 @@ module RunarCompiler::Codegen
     attr_accessor :sm, :ops, :max_depth, :properties, :private_methods,
                   :local_bindings, :outer_protected_refs, :inside_branch,
                   :current_source_loc
+
+    # OP_PUSH_TX on-chain signature derivation (BUG-100 fix).
+    #
+    # The insecure legacy checkPreimage accepted a witness signature over the
+    # real spending transaction and checked it against pubkey G, never reading
+    # the pushed preimage -- so the preimage was decoupled from the tx. This
+    # derives the ECDSA signature FROM the preimage on-chain (s =
+    # (hash256(preimage) + r)*kinv mod n, fixed nonce k=2, privkey d=1, low-S,
+    # minimal DER), so OP_CHECKSIG passes only when hash256(preimage) equals the
+    # real tx sighash.
+    #
+    # The construction compiles to a FIXED byte sequence identical across all
+    # seven tiers; it is the canonical output of the TypeScript reference
+    # (packages/runar-compiler/src/passes/oppushtx-codegen.ts). Emitted as a
+    # single opaque raw_bytes op (peephole barrier). The cross-tier conformance
+    # suite guards that this constant matches every other tier byte-for-byte.
+    CHECK_PREIMAGE_BINDING_HEX =
+      "76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad"
+    CHECK_PREIMAGE_BINDING_BYTES = [CHECK_PREIMAGE_BINDING_HEX].pack("H*")
+
+    # Byte offset (in the 760-byte binding blob) of the appended BIP-143 sighash
+    # flag byte. The blob ends with `...7c7e 01 41 7e 21 02 79be...` — `01` is
+    # OP_DATA_1, `41` is the flag byte (SIGHASH_ALL|FORKID), `7e` is OP_CAT that
+    # appends it to the derived DER signature. Issue #123 rewrites ONLY this one
+    # byte for a non-default @sighash mode; every other byte is byte-identical to
+    # the pinned cross-tier constant (matching the TS reference, whose procedural
+    # blob differs only in this appended flag byte).
+    SIGHASH_FLAG_BYTE_OFFSET = 723
+
+    # Return the check_preimage binding blob for a given BIP-143 sighash flag.
+    # For the default 0x41 (or nil) this is the pinned constant unchanged; for a
+    # non-default mode only the single appended sighash flag byte differs.
+    def self.check_preimage_binding_bytes(sighash_flag = nil)
+      return CHECK_PREIMAGE_BINDING_BYTES if sighash_flag.nil? || (sighash_flag & 0xff) == 0x41
+
+      # Fail loudly if the pinned blob ever changes such that the offset no
+      # longer points at the default 0x41 flag byte — otherwise a non-default
+      # mode would silently corrupt an unrelated opcode.
+      unless CHECK_PREIMAGE_BINDING_BYTES.getbyte(SIGHASH_FLAG_BYTE_OFFSET) == 0x41
+        raise "check_preimage binding blob changed: byte @#{SIGHASH_FLAG_BYTE_OFFSET} is not the 0x41 sighash flag"
+      end
+
+      bytes = CHECK_PREIMAGE_BINDING_BYTES.dup
+      bytes.setbyte(SIGHASH_FLAG_BYTE_OFFSET, sighash_flag & 0xff)
+      bytes.freeze
+    end
 
     # @param params [Array<String>, nil] initial stack parameter names
     # @param properties [Array<IR::ANFProperty>]
@@ -335,9 +571,32 @@ module RunarCompiler::Codegen
       @private_methods = {}
       @local_bindings = {}
       @array_lengths = {}
+      @array_elements = {}
+      @const_values = {}
       @outer_protected_refs = nil
       @inside_branch = false
       @current_source_loc = nil
+
+      # #130 (stack layer): a method param whose name collides with a MUTABLE
+      # property gets a duplicate stackMap slot once deserialize_state pushes
+      # that property under the same name. Name lookups resolve to the
+      # shallowest match (the deserialized property), so load_param would read
+      # stale on-chain state instead of the witness value. Rename the colliding
+      # param's slot to a reserved, collision-proof name up front and remember
+      # the mapping so _lower_load_param targets the real param slot. Only
+      # mutable properties are deserialized onto the stack, so readonly shadows
+      # (handled purely by ANF resolution) never enter this map, and
+      # non-colliding contracts get an empty map -- byte-identical output.
+      @renamed_params = {}
+      mutable_prop_names = (properties || []).reject(&:readonly).map(&:name)
+      (params || []).each do |name|
+        next unless mutable_prop_names.include?(name)
+
+        renamed = "__param_#{name}"
+        @sm.rename_at_depth(@sm.find_depth(name), renamed)
+        @renamed_params[name] = renamed
+      end
+
       _track_depth
     end
 
@@ -440,51 +699,103 @@ module RunarCompiler::Codegen
     #
     # Expects stack: [..., script, len]
     # Leaves stack:  [..., script, varint_bytes]
+    #
+    # Bitcoin varint format:
+    #   len < 0xfd:        1 byte (len itself)
+    #   len <= 0xffff:     0xfd + 2 bytes LE                (3 bytes)
+    #   len <= 0xffffffff: 0xfe + 4 bytes LE                (5 bytes)
+    #   otherwise:         0xff + 8 bytes LE                (9 bytes — never
+    #                                                        used in practice
+    #                                                        for BSV scripts)
+    #
+    # We must support all four shapes; emitting a 3-byte varint for a script
+    # whose length exceeds 0xffff produces a truncated value that no longer
+    # matches what the BSV node uses for hashOutputs, breaking the
+    # state-continuation hash equality assertion downstream.
+    #
+    # OP_NUM2BIN uses sign-magnitude encoding so high-bit values need an
+    # extra sign byte; we generate one extra byte and then SPLIT off the
+    # unsigned low bytes to get the correct unsigned varint payload.
     def emit_varint_encoding
       # Stack: [..., script, len]
+
+      # emit_num_to_low_bytes: [..., len] -> [..., low_n_bytes]. Uses
+      # NUM2BIN(n+1) then SPLIT(n) DROP to drop the sign byte.
+      emit_num_to_low_bytes = lambda do |n_bytes|
+        emit_push_int(n_bytes + 1)
+        @sm.push("")
+        emit_opcode("OP_NUM2BIN")
+        @sm.pop; @sm.pop; @sm.push("")
+        emit_push_int(n_bytes)
+        @sm.push("")
+        emit_opcode("OP_SPLIT")
+        @sm.pop; @sm.pop; @sm.push(""); @sm.push("")
+        emit_op({ op: "drop" })
+        @sm.pop
+      end
+
+      # emit_prefix: [..., script, low_bytes] -> [..., script, prefix||low_bytes].
+      emit_prefix = lambda do |prefix_byte|
+        emit_push_bytes([prefix_byte].pack("C"))
+        @sm.push("")
+        emit_op({ op: "swap" })
+        @sm.swap
+        @sm.pop; @sm.pop
+        emit_opcode("OP_CAT")
+        @sm.push("")
+      end
+
+      # IF len < 253: 1-byte varint.
       emit_op({ op: "dup" })
       @sm.dup
       emit_push_int(253)
       @sm.push("")
       emit_opcode("OP_LESSTHAN")
       @sm.pop; @sm.pop; @sm.push("")
-
       emit_opcode("OP_IF")
-      @sm.pop # pop condition
-
-      # Then: 1-byte varint (len < 253)
-      emit_push_int(2)
-      @sm.push("")
-      emit_opcode("OP_NUM2BIN")
-      @sm.pop; @sm.pop; @sm.push("")
-      emit_push_int(1)
-      @sm.push("")
-      emit_opcode("OP_SPLIT")
-      @sm.pop; @sm.pop; @sm.push(""); @sm.push("")
-      emit_op({ op: "drop" })
       @sm.pop
-
+      sm_at_1byte = @sm.clone
+      emit_num_to_low_bytes.call(1)
       emit_opcode("OP_ELSE")
+      @sm = sm_at_1byte.clone
 
-      # Else: 0xfd + 2-byte LE varint (len >= 253)
-      emit_push_int(4)
+      # ELSE-IF len <= 0xffff: 0xfd + 2-byte LE.
+      emit_op({ op: "dup" })
+      @sm.dup
+      emit_push_int(0x10000)
       @sm.push("")
-      emit_opcode("OP_NUM2BIN")
+      emit_opcode("OP_LESSTHAN")
       @sm.pop; @sm.pop; @sm.push("")
-      emit_push_int(2)
-      @sm.push("")
-      emit_opcode("OP_SPLIT")
-      @sm.pop; @sm.pop; @sm.push(""); @sm.push("")
-      emit_op({ op: "drop" })
+      emit_opcode("OP_IF")
       @sm.pop
-      emit_push_bytes([0xFD].pack("C"))
-      @sm.push("")
-      emit_op({ op: "swap" })
-      @sm.swap
-      @sm.pop; @sm.pop
-      emit_opcode("OP_CAT")
-      @sm.push("")
+      sm_at_3byte = @sm.clone
+      emit_num_to_low_bytes.call(2)
+      emit_prefix.call(0xfd)
+      emit_opcode("OP_ELSE")
+      @sm = sm_at_3byte.clone
 
+      # ELSE-IF len <= 0xffffffff: 0xfe + 4-byte LE.
+      emit_op({ op: "dup" })
+      @sm.dup
+      emit_push_int(0x100000000)
+      @sm.push("")
+      emit_opcode("OP_LESSTHAN")
+      @sm.pop; @sm.pop; @sm.push("")
+      emit_opcode("OP_IF")
+      @sm.pop
+      sm_at_5byte = @sm.clone
+      emit_num_to_low_bytes.call(4)
+      emit_prefix.call(0xfe)
+      emit_opcode("OP_ELSE")
+      @sm = sm_at_5byte.clone
+
+      # ELSE: 0xff + 8-byte LE. (>= 4 GiB script — practically unreachable on
+      # BSV but kept for spec completeness so we never silently truncate.)
+      emit_num_to_low_bytes.call(8)
+      emit_prefix.call(0xff)
+
+      emit_opcode("OP_ENDIF")
+      emit_opcode("OP_ENDIF")
       emit_opcode("OP_ENDIF")
       # --- Stack: [..., script, varint] ---
     end
@@ -720,6 +1031,52 @@ module RunarCompiler::Codegen
       _track_depth
     end
 
+    # Drain branch-private residue from below TOS at the end of a branch
+    # body, so both branches converge to a layout the parent stack model can
+    # faithfully describe before OP_ENDIF (issue #36).
+    #
+    # A slot is residue when its name is NOT in pre_if_names (the snapshot of
+    # the parent's named slots taken before the branch ran). This catches
+    # both anonymous slots (empty-named, pushed by intrinsics like substr's
+    # OP_SPLIT residue) and named branch-local bindings that lingered past
+    # their last-use (e.g. dead-code load_const intermediates the optimizer
+    # didn't fold). Slots whose name was already in pre_if_names are kept.
+    # Process deepest-first so removing a deeper slot doesn't shift a
+    # shallower slot's depth-from-top.
+    #
+    # @param pre_if_names [Set<String>] parent named slots before the branch
+    def drain_branch_private_residue(pre_if_names)
+      drain_depths = []
+      d = 1
+      while d < @sm.depth
+        name = @sm.peek_at_depth(d)
+        if name.nil? || name.empty?
+          drain_depths << d
+        elsif !pre_if_names.include?(name)
+          drain_depths << d
+        end
+        d += 1
+      end
+      return if drain_depths.empty?
+
+      drain_depths.sort! { |a, b| b <=> a }
+      drain_depths.each do |depth|
+        if depth == 1
+          emit_op({ op: "nip" })
+          @sm.remove_at_depth(1)
+        else
+          emit_op({ op: "push", value: RunarCompiler::Codegen.big_int_push(depth) })
+          @sm.push("")
+          emit_op({ op: "roll", depth: depth })
+          @sm.pop
+          rolled = @sm.remove_at_depth(depth)
+          @sm.push(rolled)
+          emit_op({ op: "drop" })
+          @sm.pop
+        end
+      end
+    end
+
     # -----------------------------------------------------------------
     # resolve_ref -- resolve a binding name to bring it to top of stack
     # -----------------------------------------------------------------
@@ -849,28 +1206,29 @@ module RunarCompiler::Codegen
       when "if"
         _lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
       when "loop"
-        _lower_loop(name, value.count, value.body, value.iter_var)
+        _lower_loop(name, value.count, value.body, value.iter_var, value.start, value.step, binding_index, last_uses)
       when "check_preimage"
-        _lower_check_preimage(name, value.preimage, binding_index, last_uses)
+        _lower_check_preimage(name, value.preimage, value.sighash_flag, binding_index, last_uses)
       when "deserialize_state"
         _lower_deserialize_state(value.preimage, binding_index, last_uses)
       when "add_output"
         _lower_add_output(name, value.satoshis, value.state_values || [], value.preimage, binding_index, last_uses)
       when "add_raw_output"
         _lower_add_raw_output(name, value.satoshis, value.script_bytes, binding_index, last_uses)
+      when "add_data_output"
+        # Wire shape is identical to add_raw_output; the distinction only
+        # matters at the continuation-hash composition stage in ANF.
+        _lower_add_raw_output(name, value.satoshis, value.script_bytes, binding_index, last_uses)
       when "get_state_script"
         _lower_get_state_script(name)
       when "array_literal"
         _lower_array_literal(name, value.elements || [], binding_index, last_uses)
-      when "compute_state_output"
-        # handled through call dispatch
-        @sm.push(name)
-      when "extract_output_hash"
-        # handled through call dispatch
-        @sm.push(name)
-      when "build_change_output"
-        # handled through call dispatch
-        @sm.push(name)
+      when "raw_script"
+        _lower_raw_script(name, value.bytes || "", value.in_arity || 0, value.out_arity || 1)
+      else
+        # Exhaustiveness guard. A silent no-op would emit a binding name
+        # with no producing ops, corrupting downstream stack tracking.
+        raise ::RunarCompiler::IR::UnknownANFKindError.new(kind, "stack-lower.lowerBinding")
       end
     end
 
@@ -891,19 +1249,49 @@ module RunarCompiler::Codegen
       last <= current_index
     end
 
+    # Consume-vs-copy decision for one operand of a multi-operand ANF value.
+    #
+    # `operands` is the FULL operand-ref list of the value (including `ref`
+    # itself). The load may consume (ROLL / move) the ref only when this
+    # binding is the ref's last use AND the ref occurs exactly once in the
+    # operand list. A ref read at more than one operand position of the same
+    # value must be copied (PICK / DUP) at EVERY position: a consume-mode
+    # bring_to_top of a ref already on top of the stack is a no-op, so two
+    # consume-mode loads of the same ref would leave a single slot for an
+    # opcode that pops one item per operand (e.g. `t := x + x` underflowing
+    # OP_ADD), or silently pair the opcode with the wrong slot. The original
+    # then stays on the stack and the existing method epilogue cleans it up.
+    # Unreachable from the frontend (every operand gets a fresh temp);
+    # reachable via compile_from_ir hand-written ANF.
+    def _operand_consume(ref, operands, binding_index, last_uses)
+      return false unless _is_last_use(ref, binding_index, last_uses)
+
+      operands.count(ref) <= 1
+    end
+
     # -----------------------------------------------------------------
     # load_param
     # -----------------------------------------------------------------
 
     def _lower_load_param(binding_name, param_name, binding_index, last_uses)
-      if @sm.has?(param_name)
+      # The parameter is already on the stack under its original name -- or, for
+      # a param that shadows a mutable property, under a reserved renamed slot
+      # (#130) so it is not confused with the deserialized property slot.
+      slot_name = @renamed_params.fetch(param_name, param_name)
+      if @sm.has?(slot_name)
         is_last = _is_last_use(param_name, binding_index, last_uses)
-        bring_to_top(param_name, is_last)
+        bring_to_top(slot_name, is_last)
         @sm.pop
         @sm.push(binding_name)
       else
-        emit_push_int(0)
-        @sm.push(binding_name)
+        # Parameter no longer on the stack -- a compiler invariant violation
+        # (historically caused by unrolled loops consuming outer refs; see
+        # _lower_loop). Silently emitting OP_0 here produced scripts that
+        # compiled, passed the env-based interpreter, and then failed on
+        # chain -- fail loudly instead.
+        raise "Stack lowering: method parameter '#{param_name}' is not on the stack " \
+              "at a post-consumption reference (stack: [#{@sm.slots.join(', ')}]). " \
+              "Refusing to emit a silent OP_0 placeholder."
       end
     end
 
@@ -921,13 +1309,29 @@ module RunarCompiler::Codegen
       elsif prop && !prop.initial_value.nil?
         _push_property_value(prop.initial_value)
       else
-        # Property value will be provided at deployment time; emit placeholder
-        param_index = 0
-        @properties.each_with_index do |p, i|
-          if p.name == prop_name
-            param_index = i
-            break
+        # Property value will be provided at deployment time; emit placeholder.
+        # Initialized properties are excluded from the constructor, so the
+        # deploy-time slot index counts only non-initialized props.
+        ctor_props = @properties.reject { |p| p.initial_value }
+        param_index = ctor_props.find_index { |p| p.name == prop_name }
+        # #119 tail (H1): a property that reaches the placeholder fallback with
+        # no matching constructor slot (param_index nil) has no deploy-time
+        # bytes of its own. The previous behaviour coerced it onto slot 0 (the
+        # non-initialized-prop count), silently splicing an UNRELATED
+        # constructor argument's placeholder into the locking script -- a
+        # silent-wrong-code path. Fail loudly instead. (A real constructor-param
+        # property -- readonly or a mutable state field whose initial value is
+        # spliced at deploy -- has param_index >= 0 and is unaffected.)
+        if param_index.nil?
+          loc = ""
+          if @current_source_loc && !@current_source_loc.file.to_s.empty?
+            loc = " at #{@current_source_loc.file}:#{@current_source_loc.line}:#{@current_source_loc.column}"
           end
+          raise "Stack lowering: property '#{prop_name}'#{loc} is neither on the stack, " \
+                "initialized, nor a constructor parameter, so it has no deploy-time " \
+                "slot. Refusing to emit a placeholder for an unrelated constructor " \
+                "argument (slot 0). Known constructor-param properties: " \
+                "[#{ctor_props.map(&:name).join(', ')}]."
         end
         emit_op({ op: "placeholder", param_index: param_index, param_name: prop_name })
       end
@@ -957,6 +1361,14 @@ module RunarCompiler::Codegen
       # Handle @ref: aliases (ANF variable aliasing)
       if value.const_string && value.const_string.length > 5 && value.const_string[0, 5] == "@ref:"
         ref_name = value.const_string[5..]
+        # Special case: aliasing an array_literal (metadata-only binding,
+        # not present in the stack-map). Copy the array metadata under the
+        # new binding name and emit no stack moves.
+        if @array_elements.key?(ref_name)
+          @array_elements[binding_name] = @array_elements[ref_name].dup
+          @array_lengths[binding_name] = @array_lengths[ref_name] if @array_lengths.key?(ref_name)
+          return
+        end
         if @sm.has?(ref_name)
           # CRITICAL: Only consume (ROLL) if the ref target is a local binding
           # in the current scope.  Outer-scope refs must be copied (PICK) so
@@ -966,9 +1378,12 @@ module RunarCompiler::Codegen
           @sm.pop
           @sm.push(binding_name)
         else
-          # Referenced value not on stack -- push placeholder
-          emit_push_int(0)
-          @sm.push(binding_name)
+          # Referenced value no longer on the stack -- a compiler invariant
+          # violation (see _lower_load_param for the loop-consumption history).
+          # Fail loudly instead of silently emitting OP_0.
+          raise "Stack lowering: value '#{ref_name}' referenced by '#{binding_name}' is not " \
+                "on the stack (stack: [#{@sm.slots.join(', ')}]). " \
+                "Refusing to emit a silent OP_0 placeholder."
         end
         return
       end
@@ -982,10 +1397,13 @@ module RunarCompiler::Codegen
 
       if !value.const_bool.nil?
         emit_push_bool(value.const_bool)
+        @const_values[binding_name] = value.const_bool
       elsif !value.const_int.nil?
         emit_push_int(value.const_int)
+        @const_values[binding_name] = value.const_int
       elsif !value.const_string.nil?
         emit_push_bytes(RunarCompiler::Codegen.hex_to_bytes(value.const_string))
+        @const_values[binding_name] = value.const_string
       else
         # Fallback: push 0
         emit_push_int(0)
@@ -993,16 +1411,24 @@ module RunarCompiler::Codegen
       @sm.push(binding_name)
     end
 
+    # Look up a compile-time constant value by binding name.
+    #
+    # @param binding_name [String]
+    # @return [Object, nil] the constant value, or nil if not a constant
+    def get_constant_value(binding_name)
+      @const_values[binding_name]
+    end
+
     # -----------------------------------------------------------------
     # bin_op
     # -----------------------------------------------------------------
 
     def _lower_bin_op(binding_name, op, left, right, binding_index, last_uses, result_type)
-      left_is_last = _is_last_use(left, binding_index, last_uses)
-      bring_to_top(left, left_is_last)
+      left_consume = _operand_consume(left, [left, right], binding_index, last_uses)
+      bring_to_top(left, left_consume)
 
-      right_is_last = _is_last_use(right, binding_index, last_uses)
-      bring_to_top(right, right_is_last)
+      right_consume = _operand_consume(right, [left, right], binding_index, last_uses)
+      bring_to_top(right, right_consume)
 
       @sm.pop
       @sm.pop
@@ -1135,6 +1561,48 @@ module RunarCompiler::Codegen
         return
       end
 
+      # NIST EC builtins (P-256 / P-384)
+      if RunarCompiler::Codegen.nist_ec_builtin?(func_name)
+        _lower_nist_ec_builtin(binding_name, func_name, args, binding_index, last_uses)
+        return
+      end
+
+      # ECDSA verification builtins
+      if RunarCompiler::Codegen.verify_ecdsa_builtin?(func_name)
+        _lower_verify_ecdsa(binding_name, func_name, args, binding_index, last_uses)
+        return
+      end
+
+      # Baby Bear field arithmetic builtins
+      if RunarCompiler::Codegen.bb_builtin?(func_name)
+        _lower_bb_builtin(binding_name, func_name, args, binding_index, last_uses)
+        return
+      end
+
+      # KoalaBear field arithmetic builtins
+      if RunarCompiler::Codegen.kb_builtin?(func_name)
+        _lower_kb_builtin(binding_name, func_name, args, binding_index, last_uses)
+        return
+      end
+
+      # BN254 field arithmetic and G1 curve builtins
+      if RunarCompiler::Codegen.bn254_builtin?(func_name)
+        _lower_bn254_builtin(binding_name, func_name, args, binding_index, last_uses)
+        return
+      end
+
+      # Poseidon2 KoalaBear Merkle root
+      if func_name == "merkleRootPoseidon2KB"
+        _lower_merkle_root_poseidon2_kb(binding_name, args, binding_index, last_uses)
+        return
+      end
+
+      # Merkle proof verification builtins
+      if RunarCompiler::Codegen.merkle_builtin?(func_name)
+        _lower_merkle_root(binding_name, func_name, args, binding_index, last_uses)
+        return
+      end
+
       # Rabin signature verification
       if func_name == "verifyRabinSig"
         _lower_verify_rabin_sig(binding_name, args, binding_index, last_uses)
@@ -1225,8 +1693,8 @@ module RunarCompiler::Codegen
 
       # General builtin: push args in order, then emit opcodes
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
 
       # Pop all args
@@ -1247,8 +1715,8 @@ module RunarCompiler::Codegen
         @sm.push("")           # left part
         @sm.push(binding_name) # right part (top)
       elsif func_name == "len"
-        @sm.push("")           # original value still present
-        @sm.push(binding_name) # size on top
+        emit_opcode("OP_NIP")  # remove original value, keep only size
+        @sm.push(binding_name)
       else
         @sm.push(binding_name)
       end
@@ -1298,8 +1766,8 @@ module RunarCompiler::Codegen
         next unless i < method.params.length
 
         param_name = method.params[i].name
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
         @sm.pop
 
         # If param_name already exists on the stack, temporarily rename
@@ -1369,6 +1837,8 @@ module RunarCompiler::Codegen
       then_ctx.private_methods = @private_methods
       then_ctx.lower_bindings(then_bindings, terminal_assert)
 
+      then_ctx.drain_branch_private_residue(pre_if_names)
+
       if terminal_assert && then_ctx.sm.depth > 1
         excess = then_ctx.sm.depth - 1
         excess.times do
@@ -1384,6 +1854,8 @@ module RunarCompiler::Codegen
       else_ctx.inside_branch = true
       else_ctx.private_methods = @private_methods
       else_ctx.lower_bindings(else_bindings, terminal_assert)
+
+      else_ctx.drain_branch_private_residue(pre_if_names)
 
       if terminal_assert && else_ctx.sm.depth > 1
         excess = else_ctx.sm.depth - 1
@@ -1443,11 +1915,18 @@ module RunarCompiler::Codegen
         end
       end
 
-      # Phase 3: single depth-balance check after ALL drops.
-      if then_ctx.sm.depth > else_ctx.sm.depth
-        then_top_p3 = then_ctx.sm.peek_at_depth(0)
-        if else_bindings.empty? && then_top_p3 && !then_top_p3.empty? && else_ctx.sm.has?(then_top_p3)
-          var_depth = else_ctx.sm.find_depth(then_top_p3)
+      # Phase 3: depth-balance reconciliation after ALL drops.
+      #
+      # Compensate the FULL depth difference between the branches -- NOT just a
+      # single item. A conditional write of N state fields leaves N result
+      # values on the then-branch, so the (empty) else-branch must preserve N
+      # old values. Issue #99 Bug 1: the previous single-shot check only balanced
+      # a 1-item difference, leaving N>=2 conditional writes imbalanced by (N-1).
+      while then_ctx.sm.depth > else_ctx.sm.depth
+        result_depth = then_ctx.sm.depth - else_ctx.sm.depth - 1
+        then_name = then_ctx.sm.peek_at_depth(result_depth)
+        if else_bindings.empty? && then_name && !then_name.empty? && else_ctx.sm.has?(then_name)
+          var_depth = else_ctx.sm.find_depth(then_name)
           if var_depth == 0
             else_ctx.emit_op({ op: "dup" })
           else
@@ -1456,14 +1935,27 @@ module RunarCompiler::Codegen
             else_ctx.emit_op({ op: "pick", depth: var_depth })
             else_ctx.sm.pop
           end
-          else_ctx.sm.push(then_top_p3)
+          else_ctx.sm.push(then_name)
         else
           else_ctx.emit_op({ op: "push", value: { kind: "bytes", bytes_val: "".b } })
           else_ctx.sm.push("")
         end
-      elsif else_ctx.sm.depth > then_ctx.sm.depth
+      end
+      while else_ctx.sm.depth > then_ctx.sm.depth
         then_ctx.emit_op({ op: "push", value: { kind: "bytes", bytes_val: "".b } })
         then_ctx.sm.push("")
+      end
+
+      # Layer B -- branch-balance invariant (#99 Bug 1 guard). After
+      # reconciliation the two arms of an OP_IF/OP_ELSE MUST leave the stack at
+      # identical depth; otherwise the post-ENDIF code (generated against a
+      # single assumed depth) is only correct for the branch the spender does
+      # not take, producing a silently-unspendable script.
+      if then_ctx.sm.depth != else_ctx.sm.depth
+        raise "internal codegen error: conditional emitted stack-imbalanced " \
+              "branches (then depth #{then_ctx.sm.depth} != else depth " \
+              "#{else_ctx.sm.depth}); would produce an unspendable script " \
+              "(see GitHub issue #99); binding=#{binding_name.inspect}"
       end
 
       then_ops = then_ctx.ops
@@ -1483,7 +1975,36 @@ module RunarCompiler::Codegen
       end
 
       # The if expression may produce a result value on top.
-      if then_ctx.sm.depth > @sm.depth
+      if else_bindings.empty? && then_ctx.sm.depth > @sm.depth && then_ctx.sm.depth - @sm.depth >= 2
+        # #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+        # values on top; record them in their on-stack order, then remove the
+        # N stale old property values beneath them.
+        result_count = then_ctx.sm.depth - @sm.depth
+        (result_count - 1).downto(0) do |i|
+          name = then_ctx.sm.peek_at_depth(i)
+          @sm.push(name.nil? || name.empty? ? binding_name : name)
+        end
+        result_names = (0...result_count).map { |i| @sm.peek_at_depth(i) }
+        result_names.each do |name|
+          next if name.nil? || name.empty?
+
+          d = result_count
+          while d < @sm.depth
+            if @sm.peek_at_depth(d) == name
+              emit_push_int(d)
+              @sm.push("")
+              emit_op({ op: "roll", depth: d + 1 })
+              @sm.pop
+              rolled = @sm.remove_at_depth(d)
+              @sm.push(rolled)
+              emit_op({ op: "drop" })
+              @sm.pop
+              break
+            end
+            d += 1
+          end
+        end
+      elsif then_ctx.sm.depth > @sm.depth
         then_top = then_ctx.sm.peek_at_depth(0)
         else_top = else_ctx.sm.depth > 0 ? else_ctx.sm.peek_at_depth(0) : ""
         is_property = @properties.any? { |p| p.name == then_top }
@@ -1547,24 +2068,35 @@ module RunarCompiler::Codegen
     # loop
     # -----------------------------------------------------------------
 
-    def _lower_loop(binding_name, count, body, iter_var)
+    def _lower_loop(binding_name, count, body, iter_var, start = 0, step = 1, loop_binding_index = nil, enclosing_last_uses = nil)
       body ||= []
       count ||= 0
+      # Iteration i binds iterVar = start + i*step (#121). Older ANF payloads
+      # without start/step describe zero-start counting-up loops.
+      start ||= 0
+      step ||= 1
 
-      # Collect body binding names
+      # Names (re)defined anywhere inside the loop body, nested branches
+      # included. A name the body itself binds is NOT an outer ref --
+      # reassigned locals (e.g. `off = off + ...` inside an if) flow through
+      # _lower_if's branch-reassignment reconciliation, not through the
+      # protection here.
+      deep_body_binding_names = RunarCompiler::Codegen.collect_deep_binding_names(body)
+
+      # Collect body binding names (top-level only) for the local-bindings merge.
       body_binding_names = {}
       body.each { |b| body_binding_names[b.name] = true }
 
-      # Collect outer-scope names referenced in the loop body
+      # Collect ALL outer-scope refs used anywhere in the body -- including
+      # refs that only occur inside nested if-branches (collect_refs recurses).
+      # The previous top-level-only scan missed nested references: a const
+      # defined before the loop and referenced only inside an if-branch was
+      # consumed by the first iteration, making iteration 2 fail with
+      # "Value 'X' not found on stack".
       outer_refs = Set.new
       body.each do |b|
-        if b.value.kind == "load_param" && b.value.name != iter_var
-          outer_refs.add(b.value.name)
-        end
-        if b.value.kind == "load_const" && b.value.const_string &&
-           b.value.const_string.length > 5 && b.value.const_string[0, 5] == "@ref:"
-          ref_name = b.value.const_string[5..]
-          outer_refs.add(ref_name) unless body_binding_names[ref_name]
+        RunarCompiler::Codegen.collect_refs(b.value).each do |ref|
+          outer_refs.add(ref) if ref != iter_var && !deep_body_binding_names.include?(ref)
         end
       end
 
@@ -1575,14 +2107,31 @@ module RunarCompiler::Codegen
       @local_bindings = new_local_bindings
 
       count.times do |i|
-        emit_push_int(i)
+        # Push the iteration variable value (in case the loop body uses it).
+        # Iteration i binds start + i*step (#121); zero-start counting-up loops
+        # (start=0, step=1) reduce to i, preserving byte-for-byte lowering.
+        emit_push_int(start + i * step)
         @sm.push(iter_var)
 
         lu = RunarCompiler::Codegen.compute_last_uses(body)
 
-        # In non-final iterations, prevent outer-scope refs from being consumed
-        if i < count - 1
-          outer_refs.each { |ref_name| lu[ref_name] = body.length }
+        # Prevent outer-scope refs from being consumed by setting their
+        # last-use beyond any body binding index:
+        #  - non-final iterations: always (the next iteration re-reads them);
+        #  - final iteration: when the enclosing scope still references them
+        #    AFTER the loop. Previously the final iteration consumed every
+        #    outer ref at its last body use, so a method param (or const)
+        #    referenced after the loop was gone from the stack and was
+        #    silently lowered to an OP_0/empty push -- compilation succeeded,
+        #    the env-based interpreter passed, but the emitted Script failed
+        #    at runtime (silent interpreter <-> Script divergence).
+        is_final_iteration = i == count - 1
+        outer_refs.each do |ref_name|
+          used_after_loop =
+            !enclosing_last_uses.nil? &&
+            !loop_binding_index.nil? &&
+            (enclosing_last_uses[ref_name] || -1) > loop_binding_index
+          lu[ref_name] = body.length if !is_final_iteration || used_after_loop
         end
 
         body.each_with_index do |b, j|
@@ -1718,9 +2267,7 @@ module RunarCompiler::Codegen
     end
 
     # -----------------------------------------------------------------
-    # Specialized call lowering stubs
-    # These will be fully implemented in Part 2 for advanced kinds.
-    # For now, provide the basic structure or delegate to codegen modules.
+    # Specialized call lowering
     # -----------------------------------------------------------------
 
     def _lower_check_multi_sig(binding_name, args, binding_index, last_uses)
@@ -1728,29 +2275,43 @@ module RunarCompiler::Codegen
 
       sigs_ref = args[0]
       pks_ref = args[1]
-      n_sigs = @array_lengths[sigs_ref] || 1
-      n_pks = @array_lengths[pks_ref] || 1
+      sig_elems = @array_elements[sigs_ref]
+      pk_elems = @array_elements[pks_ref]
+      if sig_elems.nil? || pk_elems.nil?
+        raise "checkMultiSig: array_literal metadata missing (sigs=#{sigs_ref.inspect}, pks=#{pks_ref.inspect})"
+      end
 
-      # Push OP_0 dummy (required by Bitcoin's OP_CHECKMULTISIG bug)
-      emit_op({ op: "push", value: 0 })
+      # Dummy OP_0 (historical CHECKMULTISIG off-by-one).
+      emit_op({ op: "push", value: RunarCompiler::Codegen.big_int_push(0) })
       @sm.push(nil)
 
-      # Bring sigs array to top
-      bring_to_top(sigs_ref, _is_last_use(sigs_ref, binding_index, last_uses))
+      # Bring each sig element to TOS in declaration order.
+      # A ref repeated across the combined element list (e.g. the same
+      # pubkey twice) must be copied at every position -- see _operand_consume.
+      msig_operands = sig_elems + pk_elems
 
-      # Push nSigs count
-      emit_op({ op: "push", value: n_sigs })
+      sig_elems.each do |sig|
+        consume = _operand_consume(sig, msig_operands, binding_index, last_uses)
+        bring_to_top(sig, consume)
+      end
+
+      # Push nSigs.
+      emit_op({ op: "push", value: RunarCompiler::Codegen.big_int_push(sig_elems.length) })
       @sm.push(nil)
 
-      # Bring pubkeys array to top
-      bring_to_top(pks_ref, _is_last_use(pks_ref, binding_index, last_uses))
+      # Bring each pubkey element to TOS in declaration order.
+      pk_elems.each do |pk|
+        consume = _operand_consume(pk, msig_operands, binding_index, last_uses)
+        bring_to_top(pk, consume)
+      end
 
-      # Push nPKs count
-      emit_op({ op: "push", value: n_pks })
+      # Push nPKs.
+      emit_op({ op: "push", value: RunarCompiler::Codegen.big_int_push(pk_elems.length) })
       @sm.push(nil)
 
-      # Pop everything: OP_0 + sigs + nSigs + pks + nPKs
-      5.times { @sm.pop }
+      # OP_CHECKMULTISIG consumes: dummy + N sigs + nSigs + M pks + nPKs.
+      consumed = 1 + sig_elems.length + 1 + pk_elems.length + 1
+      consumed.times { @sm.pop }
 
       emit_opcode("OP_CHECKMULTISIG")
       @sm.push(binding_name)
@@ -1805,8 +2366,8 @@ module RunarCompiler::Codegen
 
       data, start, length = args[0], args[1], args[2]
 
-      bring_to_top(data, _is_last_use(data, binding_index, last_uses))
-      bring_to_top(start, _is_last_use(start, binding_index, last_uses))
+      bring_to_top(data, _operand_consume(data, args, binding_index, last_uses))
+      bring_to_top(start, _operand_consume(start, args, binding_index, last_uses))
 
       # Split at start position
       @sm.pop; @sm.pop
@@ -1821,7 +2382,7 @@ module RunarCompiler::Codegen
       @sm.push(right_part)
 
       # Push length
-      bring_to_top(length, _is_last_use(length, binding_index, last_uses))
+      bring_to_top(length, _operand_consume(length, args, binding_index, last_uses))
 
       # Split at length
       @sm.pop; @sm.pop
@@ -1838,14 +2399,14 @@ module RunarCompiler::Codegen
     end
 
     def _lower_verify_wots(binding_name, args, binding_index, last_uses)
-      require_relative "slh_dsa"
+      require_relative "wots"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
-      SLHDSA.emit_verify_wots(emit_fn)
+      RunarCompiler::Codegen::WOTS.emit_verify_wots(emit_fn)
       @sm.push(binding_name)
       _track_depth
     end
@@ -1853,8 +2414,8 @@ module RunarCompiler::Codegen
     def _lower_verify_slh_dsa(binding_name, param_key, args, binding_index, last_uses)
       require_relative "slh_dsa"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -1866,8 +2427,8 @@ module RunarCompiler::Codegen
     def _lower_sha256_compress(binding_name, args, binding_index, last_uses)
       require_relative "sha256"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -1879,8 +2440,8 @@ module RunarCompiler::Codegen
     def _lower_sha256_finalize(binding_name, args, binding_index, last_uses)
       require_relative "sha256"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -1892,8 +2453,8 @@ module RunarCompiler::Codegen
     def _lower_blake3_compress(binding_name, args, binding_index, last_uses)
       require_relative "blake3"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -1905,8 +2466,8 @@ module RunarCompiler::Codegen
     def _lower_blake3_hash(binding_name, args, binding_index, last_uses)
       require_relative "blake3"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
       emit_fn = ->(op) { emit_op(op) }
@@ -1918,8 +2479,8 @@ module RunarCompiler::Codegen
     def _lower_ec_builtin(binding_name, func_name, args, binding_index, last_uses)
       require_relative "ec"
       args.each do |arg|
-        is_last = _is_last_use(arg, binding_index, last_uses)
-        bring_to_top(arg, is_last)
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
       end
       args.length.times { @sm.pop }
 
@@ -1930,14 +2491,196 @@ module RunarCompiler::Codegen
       _track_depth
     end
 
+    def _lower_nist_ec_builtin(binding_name, func_name, args, binding_index, last_uses)
+      require_relative "p256_p384"
+      args.each do |arg|
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
+      end
+      args.length.times { @sm.pop }
+
+      emit_fn = ->(op) { emit_op(op) }
+      NISTEC.dispatch_nist_ec_builtin(func_name, emit_fn)
+
+      @sm.push(binding_name)
+      _track_depth
+    end
+
+    def _lower_verify_ecdsa(binding_name, func_name, args, binding_index, last_uses)
+      require_relative "p256_p384"
+      if args.length < 3
+        raise "#{func_name} requires 3 arguments: msg, sig, pubkey"
+      end
+      # Bring all 3 args to top in order: msg, sig, pubkey
+      args.each do |arg|
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
+      end
+      @sm.pop # pubkey
+      @sm.pop # sig
+      @sm.pop # msg
+
+      emit_fn = ->(op) { emit_op(op) }
+      NISTEC.dispatch_verify_ecdsa(func_name, emit_fn)
+
+      @sm.push(binding_name)
+      _track_depth
+    end
+
+    def _lower_bb_builtin(binding_name, func_name, args, binding_index, last_uses)
+      require_relative "babybear"
+      args.each do |arg|
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
+      end
+      args.length.times { @sm.pop }
+
+      emit_fn = ->(op) { emit_op(op) }
+      BabyBear.dispatch_bb_builtin(func_name, emit_fn)
+
+      @sm.push(binding_name)
+      _track_depth
+    end
+
+    def _lower_kb_builtin(binding_name, func_name, args, binding_index, last_uses)
+      require_relative "koalabear"
+      args.each do |arg|
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
+      end
+      args.length.times { @sm.pop }
+
+      emit_fn = ->(op) { emit_op(op) }
+      KoalaBear.dispatch_kb_builtin(func_name, emit_fn)
+
+      @sm.push(binding_name)
+      _track_depth
+    end
+
+    def _lower_bn254_builtin(binding_name, func_name, args, binding_index, last_uses)
+      require_relative "bn254"
+      args.each do |arg|
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
+      end
+      args.length.times { @sm.pop }
+
+      emit_fn = ->(op) { emit_op(op) }
+      BN254.dispatch_bn254_builtin(func_name, emit_fn)
+
+      @sm.push(binding_name)
+      _track_depth
+    end
+
+    def _lower_merkle_root_poseidon2_kb(binding_name, args, binding_index, last_uses)
+      require_relative "poseidon2_merkle"
+      # args: [leaf_0..leaf_7, sib0_0..sib0_7, ..., sib(D-1)_0..sib(D-1)_7, index, depth]
+      # depth must be a compile-time constant (last argument)
+      n_args = args.length
+      raise "merkleRootPoseidon2KB requires at least 10 arguments, got #{n_args}" if n_args < 10
+
+      # Extract depth constant from ANF binding (last arg)
+      depth_arg = args[n_args - 1]
+      depth_value = get_constant_value(depth_arg)
+      if depth_value.nil? || !depth_value.is_a?(Integer)
+        raise "merkleRootPoseidon2KB: depth (last argument) must be a compile-time constant " \
+              "integer literal. Got a runtime value for '#{depth_arg}'."
+      end
+      depth = depth_value
+      if depth < 1 || depth > 64
+        raise "merkleRootPoseidon2KB: depth must be between 1 and 64, got #{depth}"
+      end
+
+      # Validate argument count: 8 leaf + depth*8 proof + 1 index + 1 depth
+      expected_args = 8 + depth * 8 + 1 + 1
+      unless n_args == expected_args
+        raise "merkleRootPoseidon2KB: expected #{expected_args} arguments " \
+              "(8 leaf + #{depth}*8 proof + index + depth), got #{n_args}"
+      end
+
+      # Remove depth from the real stack FIRST (compile-time constant, not runtime)
+      if @sm.has?(depth_arg)
+        bring_to_top(depth_arg, true)
+        emit_op({ op: "drop" })
+        @sm.pop
+      end
+
+      # Bring all runtime args (leaf*8 + proof*depth*8 + index) to stack top in order
+      runtime_arg_count = n_args - 1 # all except depth
+      runtime_arg_count.times do |i|
+        arg = args[i]
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
+      end
+      # Pop all runtime args — the codegen consumes them and produces 8 results
+      runtime_arg_count.times { @sm.pop }
+
+      emit_fn = ->(op) { emit_op(op) }
+      Poseidon2Merkle.emit_poseidon2_merkle_root(emit_fn, depth)
+
+      # The codegen leaves 8 elements on the stack (root_0..root_7, root_7 on top).
+      # The type system returns a single bigint, so only root_7 (top) is accessible.
+      # Drop the lower 7 elements with OP_NIP to keep the stack clean.
+      7.times { emit_op({ op: "nip" }) }
+
+      @sm.push(binding_name)
+      _track_depth
+    end
+
+    def _lower_merkle_root(binding_name, func_name, args, binding_index, last_uses)
+      require_relative "merkle"
+      # args: [leaf, proof, index, depth]
+      # depth must be a compile-time constant
+      raise "#{func_name} requires exactly 4 arguments (leaf, proof, index, depth)" if args.length != 4
+
+      # Extract depth constant from ANF binding
+      depth_arg = args[3]
+      depth_value = get_constant_value(depth_arg)
+      if depth_value.nil? || !depth_value.is_a?(Integer)
+        raise "#{func_name}: depth (4th argument) must be a compile-time constant integer literal. " \
+              "Got a runtime value for '#{depth_arg}'."
+      end
+      depth = depth_value
+      if depth < 1 || depth > 64
+        raise "#{func_name}: depth must be between 1 and 64, got #{depth}"
+      end
+
+      # Remove depth from the real stack FIRST (compile-time constant, not runtime).
+      if @sm.has?(depth_arg)
+        bring_to_top(depth_arg, true)
+        emit_op({ op: "drop" })
+        @sm.pop
+      end
+
+      # Bring leaf, proof, index to stack top for the codegen
+      3.times do |i|
+        arg = args[i]
+        consume = _operand_consume(arg, args, binding_index, last_uses)
+        bring_to_top(arg, consume)
+      end
+      # Pop the 3 args -- the codegen consumes them and produces 1 result
+      3.times { @sm.pop }
+
+      emit_fn = ->(op) { emit_op(op) }
+
+      if func_name == "merkleRootSha256"
+        Merkle.emit_merkle_root_sha256(emit_fn, depth)
+      else
+        Merkle.emit_merkle_root_hash256(emit_fn, depth)
+      end
+
+      @sm.push(binding_name)
+      _track_depth
+    end
+
     def _lower_safe_div_mod(binding_name, func_name, args, binding_index, last_uses)
       # safediv(a, b) / safemod(a, b): assert b != 0, then div/mod
       raise "#{func_name} requires 2 arguments" if args.length < 2
 
-      is_last_a = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_a)
-      is_last_b = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_b)
+      consume_a = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_a)
+      consume_b = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_b)
 
       # DUP b, check non-zero, then divide/mod
       emit_opcode("OP_DUP"); @sm.push("")
@@ -1956,13 +2699,13 @@ module RunarCompiler::Codegen
       # clamp(val, lo, hi) -> min(max(val, lo), hi)
       raise "clamp requires 3 arguments" if args.length < 3
 
-      bring_to_top(args[0], _is_last_use(args[0], binding_index, last_uses))
-      bring_to_top(args[1], _is_last_use(args[1], binding_index, last_uses))
+      bring_to_top(args[0], _operand_consume(args[0], args, binding_index, last_uses))
+      bring_to_top(args[1], _operand_consume(args[1], args, binding_index, last_uses))
 
       @sm.pop; @sm.pop
       emit_opcode("OP_MAX"); @sm.push("")
 
-      bring_to_top(args[2], _is_last_use(args[2], binding_index, last_uses))
+      bring_to_top(args[2], _operand_consume(args[2], args, binding_index, last_uses))
 
       @sm.pop; @sm.pop
       emit_opcode("OP_MIN")
@@ -1974,10 +2717,10 @@ module RunarCompiler::Codegen
     def _lower_pow(binding_name, args, binding_index, last_uses)
       raise "pow requires 2 arguments" if args.length < 2
 
-      is_last_base = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_base)
-      is_last_exp = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_exp)
+      consume_base = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_base)
+      consume_exp = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_exp)
 
       @sm.pop; @sm.pop
 
@@ -2005,16 +2748,16 @@ module RunarCompiler::Codegen
     def _lower_mul_div(binding_name, args, binding_index, last_uses)
       raise "mulDiv requires 3 arguments" if args.length < 3
 
-      is_last_a = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_a)
-      is_last_b = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_b)
+      consume_a = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_a)
+      consume_b = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_b)
 
       @sm.pop; @sm.pop
       emit_opcode("OP_MUL"); @sm.push("")
 
-      is_last_c = _is_last_use(args[2], binding_index, last_uses)
-      bring_to_top(args[2], is_last_c)
+      consume_c = _operand_consume(args[2], args, binding_index, last_uses)
+      bring_to_top(args[2], consume_c)
 
       @sm.pop; @sm.pop
       emit_opcode("OP_DIV")
@@ -2027,10 +2770,10 @@ module RunarCompiler::Codegen
       # percentOf(amount, bps) -> (amount * bps) / 10000
       raise "percentOf requires 2 arguments" if args.length < 2
 
-      is_last_a = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_a)
-      is_last_b = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_b)
+      consume_a = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_a)
+      consume_b = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_b)
 
       @sm.pop; @sm.pop
       emit_opcode("OP_MUL"); @sm.push("")
@@ -2078,10 +2821,10 @@ module RunarCompiler::Codegen
     def _lower_gcd(binding_name, args, binding_index, last_uses)
       raise "gcd requires 2 arguments" if args.length < 2
 
-      is_last_a = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_a)
-      is_last_b = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_b)
+      consume_a = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_a)
+      consume_b = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_b)
 
       @sm.pop; @sm.pop
 
@@ -2110,10 +2853,10 @@ module RunarCompiler::Codegen
     def _lower_divmod(binding_name, args, binding_index, last_uses)
       raise "divmod requires 2 arguments" if args.length < 2
 
-      is_last_a = _is_last_use(args[0], binding_index, last_uses)
-      bring_to_top(args[0], is_last_a)
-      is_last_b = _is_last_use(args[1], binding_index, last_uses)
-      bring_to_top(args[1], is_last_b)
+      consume_a = _operand_consume(args[0], args, binding_index, last_uses)
+      bring_to_top(args[0], consume_a)
+      consume_b = _operand_consume(args[1], args, binding_index, last_uses)
+      bring_to_top(args[1], consume_b)
 
       @sm.pop; @sm.pop
 
@@ -2183,10 +2926,10 @@ module RunarCompiler::Codegen
     def _lower_right(binding_name, args, binding_index, last_uses)
       # right(bs, n) -> last n bytes of bs
       if args.length >= 2
-        is_last_bs = _is_last_use(args[0], binding_index, last_uses)
-        bring_to_top(args[0], is_last_bs)
-        is_last_n = _is_last_use(args[1], binding_index, last_uses)
-        bring_to_top(args[1], is_last_n)
+        consume_bs = _operand_consume(args[0], args, binding_index, last_uses)
+        bring_to_top(args[0], consume_bs)
+        consume_n = _operand_consume(args[1], args, binding_index, last_uses)
+        bring_to_top(args[1], consume_n)
 
         # Stack: [bs, n]
         # Compute skip = SIZE - n, then SPLIT, NIP
@@ -2214,32 +2957,31 @@ module RunarCompiler::Codegen
     # check_preimage (OP_PUSH_TX)
     # -----------------------------------------------------------------
 
-    def _lower_check_preimage(binding_name, preimage, binding_index, last_uses)
-      # Step 0: Emit OP_CODESEPARATOR
+    def _lower_check_preimage(binding_name, preimage, sighash_flag, binding_index, last_uses)
+      # OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
+      # current spending transaction. The signature is DERIVED FROM THE PREIMAGE
+      # ON CHAIN (Optimal OP_PUSH_TX): s = (hash256(preimage) + r)*k^-1 mod n,
+      # with fixed nonce k and privkey d=1 (pubkey = G). OP_CHECKSIG(sig, G) then
+      # passes iff hash256(preimage) equals the node's real tx sighash --
+      # closing BUG-100. The unlocking script pushes ONLY <preimage> (no witness
+      # signature). See CHECK_PREIMAGE_BINDING_BYTES for the construction.
+
+      # Step 0: Emit OP_CODESEPARATOR so the scriptCode in the BIP-143 preimage
+      # is only the code after this point (smaller preimage; required for large
+      # scripts).
       emit_opcode("OP_CODESEPARATOR")
 
-      # Step 1: Bring preimage to top
+      # Step 1: Bring the preimage to the top (kept for field extractors below).
       is_last = _is_last_use(preimage, binding_index, last_uses)
       bring_to_top(preimage, is_last)
 
-      # Step 2: Bring _opPushTxSig to top (consuming)
-      bring_to_top("_opPushTxSig", true)
-
-      # Step 3: Push compressed secp256k1 generator point G (33 bytes)
-      g_bytes = [
-        0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB,
-        0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
-        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28,
-        0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17,
-        0x98,
-      ].pack("C*")
-      emit_push_bytes(g_bytes)
-      @sm.push("")
-
-      # Step 4: OP_CHECKSIGVERIFY
-      emit_opcode("OP_CHECKSIGVERIFY")
-      @sm.pop # G consumed
-      @sm.pop # _opPushTxSig consumed
+      # Step 2: Derive + verify the signature on-chain (single opaque raw_bytes
+      # blob). For the default ALL|FORKID (sighash_flag nil/0x41) the blob is
+      # byte-identical to the pinned cross-tier constant; issue #123 lets a
+      # method declare a non-default mode, which only changes the appended
+      # sighash flag byte. Declared in=1/out=1 so the static analyzer keeps the
+      # depth consistent; net stack effect is zero.
+      emit_op({ op: "raw_bytes", raw_bytes: LoweringContext.check_preimage_binding_bytes(sighash_flag), in_arity: 1, out_arity: 1 })
 
       # Preimage remains on top. Rename for field extractors.
       @sm.pop
@@ -2433,12 +3175,22 @@ module RunarCompiler::Codegen
         state_props << p
         sz = case p.type
              when "bigint" then 8
+             # RabinSig / RabinPubKey are bigint aliases — same 8-byte layout.
+             when "RabinSig", "RabinPubKey" then 8
              when "boolean" then 1
              when "PubKey" then 33
              when "Addr" then 20
+             # Ripemd160 is 20 bytes (same underlying shape as Addr).
+             when "Ripemd160" then 20
              when "Sha256" then 32
              when "Point" then 64
-             when "ByteString"
+             # P-256 point: x[32] || y[32] = 64 bytes (same shape as Point).
+             when "P256Point" then 64
+             # P-384 point: x[48] || y[48] = 96 bytes.
+             when "P384Point" then 96
+             # ByteString-typed variable-length fields — treated the same
+             # as ByteString (push-data-prefixed in state).
+             when "ByteString", "Sig", "SigHashPreimage"
                has_variable_length = true
                -1
              else
@@ -2487,30 +3239,75 @@ module RunarCompiler::Codegen
         # Variable-length state but _codePart not available (terminal method)
         emit_op({ op: "drop" }); @sm.pop
       else
-        # Variable-length path: strip varint, use _codePart
+        # Variable-length path: strip varint, use _codePart to find state.
+        #
+        # BIP-143 scriptCode is prefixed by a Bitcoin varint:
+        #   length < 0xfd:        1 byte (length itself)
+        #   length <= 0xffff:     0xfd + 2 bytes LE                (3 bytes)
+        #   length <= 0xffffffff: 0xfe + 4 bytes LE                (5 bytes)
+        #   otherwise:            0xff + 8 bytes LE                (9 bytes)
+        #
+        # We must support all four shapes, otherwise scripts whose
+        # scriptCode exceeds 65,535 bytes (e.g. embedded BN254 verifiers)
+        # silently strip too few varint bytes and corrupt the subsequent
+        # state-extraction OP_SPLITs — this surfaces as
+        # `Invalid OP_SPLIT range` on regtest.
         emit_push_int(1); @sm.push("")
         emit_opcode("OP_SPLIT"); @sm.pop; @sm.pop; @sm.push(""); @sm.push("")
         emit_op({ op: "swap" }); @sm.swap
-        emit_op({ op: "dup" }); @sm.push(@sm.peek_at_depth(0))
-        # Zero-pad before BIN2NUM
+        # Zero-pad firstByte before BIN2NUM so 0xfd/0xfe/0xff aren't read
+        # as negative script numbers.
         emit_push_bytes([0].pack("C"))
         @sm.push("")
         emit_opcode("OP_CAT"); @sm.pop; @sm.pop; @sm.push("")
         emit_opcode("OP_BIN2NUM")
+        # Stack: [..., rest, fb_num]
+
+        # emit_drop_more_varint_bytes drops `n` additional varint bytes
+        # from the top of stack `rest`. [..., rest] -> [..., rest_minus_n].
+        emit_drop_more_varint_bytes = lambda do |n|
+          emit_push_int(n); @sm.push("")
+          emit_opcode("OP_SPLIT"); @sm.pop; @sm.pop; @sm.push(""); @sm.push("")
+          emit_op({ op: "nip" }); @sm.pop; @sm.pop; @sm.push("")
+        end
+
+        # IF fb_num < 253: 1-byte varint, drop fb_num.
+        emit_op({ op: "dup" }); @sm.dup
         emit_push_int(253); @sm.push("")
         emit_opcode("OP_LESSTHAN"); @sm.pop; @sm.pop; @sm.push("")
-
         emit_opcode("OP_IF"); @sm.pop
-        sm_at_varint_if = @sm.clone
+        sm_at_1byte_if = @sm.clone
+        # THEN: 1-byte varint
         emit_op({ op: "drop" }); @sm.pop
-
         emit_opcode("OP_ELSE")
-        @sm = sm_at_varint_if.clone
+        @sm = sm_at_1byte_if.clone
+        # ELSE: fb_num >= 253. Check 0xfe (5-byte varint) next.
+        emit_op({ op: "dup" }); @sm.dup
+        emit_push_int(254); @sm.push("")
+        emit_opcode("OP_NUMEQUAL"); @sm.pop; @sm.pop; @sm.push("")
+        emit_opcode("OP_IF"); @sm.pop
+        sm_at_fe_if = @sm.clone
+        # THEN: 5-byte varint (0xfe + 4 bytes LE).
         emit_op({ op: "drop" }); @sm.pop
-        emit_push_int(2); @sm.push("")
-        emit_opcode("OP_SPLIT"); @sm.pop; @sm.pop; @sm.push(""); @sm.push("")
-        emit_op({ op: "nip" }); @sm.pop; @sm.pop; @sm.push("")
-
+        emit_drop_more_varint_bytes.call(4)
+        emit_opcode("OP_ELSE")
+        @sm = sm_at_fe_if.clone
+        # ELSE: fb_num != 254. Check 0xff (9-byte varint) next.
+        emit_op({ op: "dup" }); @sm.dup
+        emit_push_int(255); @sm.push("")
+        emit_opcode("OP_NUMEQUAL"); @sm.pop; @sm.pop; @sm.push("")
+        emit_opcode("OP_IF"); @sm.pop
+        sm_at_ff_if = @sm.clone
+        # THEN: 9-byte varint (0xff + 8 bytes LE).
+        emit_op({ op: "drop" }); @sm.pop
+        emit_drop_more_varint_bytes.call(8)
+        emit_opcode("OP_ELSE")
+        @sm = sm_at_ff_if.clone
+        # ELSE: fb_num must be 253 (0xfd) — 3-byte varint.
+        emit_op({ op: "drop" }); @sm.pop
+        emit_drop_more_varint_bytes.call(2)
+        emit_opcode("OP_ENDIF")
+        emit_opcode("OP_ENDIF")
         emit_opcode("OP_ENDIF")
 
         # Compute skip = SIZE(_codePart) - codeSepIdx
@@ -2534,7 +3331,7 @@ module RunarCompiler::Codegen
     def _split_fixed_state_fields(state_props, prop_sizes)
       if state_props.length == 1
         prop = state_props[0]
-        emit_opcode("OP_BIN2NUM") if %w[bigint boolean].include?(prop.type)
+        emit_opcode("OP_BIN2NUM") if RunarCompiler::Codegen.numeric_state_type?(prop.type)
         @sm.pop
         @sm.push(prop.name)
       else
@@ -2544,12 +3341,12 @@ module RunarCompiler::Codegen
             emit_push_int(sz); @sm.push("")
             emit_opcode("OP_SPLIT"); @sm.pop; @sm.pop; @sm.push(""); @sm.push("")
             emit_op({ op: "swap" }); @sm.swap
-            emit_opcode("OP_BIN2NUM") if %w[bigint boolean].include?(prop.type)
+            emit_opcode("OP_BIN2NUM") if RunarCompiler::Codegen.numeric_state_type?(prop.type)
             emit_op({ op: "swap" }); @sm.swap
             @sm.pop; @sm.pop
             @sm.push(prop.name); @sm.push("")
           else
-            emit_opcode("OP_BIN2NUM") if %w[bigint boolean].include?(prop.type)
+            emit_opcode("OP_BIN2NUM") if RunarCompiler::Codegen.numeric_state_type?(prop.type)
             @sm.pop
             @sm.push(prop.name)
           end
@@ -2560,10 +3357,10 @@ module RunarCompiler::Codegen
     def _parse_variable_length_state_fields(state_props, prop_sizes)
       if state_props.length == 1
         prop = state_props[0]
-        if prop.type == "ByteString"
+        if RunarCompiler::Codegen.variable_length_state_type?(prop.type)
           emit_push_data_decode
           emit_op({ op: "drop" }); @sm.pop
-        elsif %w[bigint boolean].include?(prop.type)
+        elsif RunarCompiler::Codegen.numeric_state_type?(prop.type)
           emit_opcode("OP_BIN2NUM")
         end
         @sm.pop
@@ -2571,7 +3368,7 @@ module RunarCompiler::Codegen
       else
         state_props.each_with_index do |prop, i|
           if i < state_props.length - 1
-            if prop.type == "ByteString"
+            if RunarCompiler::Codegen.variable_length_state_type?(prop.type)
               emit_push_data_decode
               @sm.pop; @sm.pop
               @sm.push(prop.name); @sm.push("")
@@ -2580,16 +3377,16 @@ module RunarCompiler::Codegen
               emit_push_int(sz); @sm.push("")
               emit_opcode("OP_SPLIT"); @sm.pop; @sm.pop; @sm.push(""); @sm.push("")
               emit_op({ op: "swap" }); @sm.swap
-              emit_opcode("OP_BIN2NUM") if %w[bigint boolean].include?(prop.type)
+              emit_opcode("OP_BIN2NUM") if RunarCompiler::Codegen.numeric_state_type?(prop.type)
               emit_op({ op: "swap" }); @sm.swap
               @sm.pop; @sm.pop
               @sm.push(prop.name); @sm.push("")
             end
           else
-            if prop.type == "ByteString"
+            if RunarCompiler::Codegen.variable_length_state_type?(prop.type)
               emit_push_data_decode
               emit_op({ op: "drop" }); @sm.pop
-            elsif %w[bigint boolean].include?(prop.type)
+            elsif RunarCompiler::Codegen.numeric_state_type?(prop.type)
               emit_opcode("OP_BIN2NUM")
             end
             @sm.pop
@@ -2605,6 +3402,7 @@ module RunarCompiler::Codegen
 
     def _lower_add_output(binding_name, satoshis, state_values, _preimage, binding_index, last_uses)
       state_props = @properties.reject(&:readonly)
+      output_operands = [satoshis] + state_values
 
       # Step 1: Bring _codePart to top (PICK -- never consume)
       bring_to_top("_codePart", false)
@@ -2619,8 +3417,8 @@ module RunarCompiler::Codegen
         value_ref = state_values[i]
         prop = state_props[i]
 
-        is_last = _is_last_use(value_ref, binding_index, last_uses)
-        bring_to_top(value_ref, is_last)
+        consume = _operand_consume(value_ref, output_operands, binding_index, last_uses)
+        bring_to_top(value_ref, consume)
 
         if prop.type == "bigint"
           emit_push_int(8); @sm.push("")
@@ -2646,8 +3444,8 @@ module RunarCompiler::Codegen
       emit_opcode("OP_CAT"); @sm.push("")
 
       # Step 6: Prepend satoshis as 8-byte LE
-      is_last_sat = _is_last_use(satoshis, binding_index, last_uses)
-      bring_to_top(satoshis, is_last_sat)
+      sat_consume = _operand_consume(satoshis, output_operands, binding_index, last_uses)
+      bring_to_top(satoshis, sat_consume)
       emit_push_int(8); @sm.push("")
       emit_opcode("OP_NUM2BIN"); @sm.pop
       emit_op({ op: "swap" }); @sm.swap
@@ -2665,8 +3463,8 @@ module RunarCompiler::Codegen
 
     def _lower_add_raw_output(binding_name, satoshis, script_bytes, binding_index, last_uses)
       # Step 1: Bring scriptBytes to top
-      script_is_last = _is_last_use(script_bytes, binding_index, last_uses)
-      bring_to_top(script_bytes, script_is_last)
+      script_consume = _operand_consume(script_bytes, [satoshis, script_bytes], binding_index, last_uses)
+      bring_to_top(script_bytes, script_consume)
 
       # Step 2: Compute varint prefix for script length
       emit_opcode("OP_SIZE"); @sm.push("")
@@ -2678,8 +3476,8 @@ module RunarCompiler::Codegen
       emit_opcode("OP_CAT"); @sm.push("")
 
       # Step 4: Prepend satoshis as 8-byte LE
-      sat_is_last = _is_last_use(satoshis, binding_index, last_uses)
-      bring_to_top(satoshis, sat_is_last)
+      sat_consume = _operand_consume(satoshis, [satoshis, script_bytes], binding_index, last_uses)
+      bring_to_top(satoshis, sat_consume)
       emit_push_int(8); @sm.push("")
       emit_opcode("OP_NUM2BIN"); @sm.pop
       emit_op({ op: "swap" }); @sm.swap
@@ -2695,16 +3493,42 @@ module RunarCompiler::Codegen
     # array_literal
     # -----------------------------------------------------------------
 
-    def _lower_array_literal(binding_name, elements, binding_index, last_uses)
+    def _lower_array_literal(binding_name, elements, _binding_index, _last_uses)
+      # Metadata-only. Array literals in Rúnar today only feed into
+      # checkMultiSig. Pre-laying the elements onto the runtime stack here
+      # would desync the stack-map from the runtime stack (the map can only
+      # model one slot per binding, but an array binding spans N runtime
+      # slots). _lower_check_multi_sig pulls each element to TOS at the use site.
       @array_lengths[binding_name] = elements.length
-      elements.each do |elem|
-        is_last = _is_last_use(elem, binding_index, last_uses)
-        bring_to_top(elem, is_last)
-        @sm.pop
-        @sm.push("") # anonymous stack entry for intermediate elements
+      @array_elements[binding_name] = elements.dup
+    end
+
+    # -----------------------------------------------------------------
+    # raw_script
+    # -----------------------------------------------------------------
+
+    # Lower a raw_script ANF node to a single opaque raw_bytes StackOp.
+    #
+    # The bytes pass through verbatim -- the emit pass writes them as-is, and
+    # the peephole optimizer must not bridge across them. Stack-tracker
+    # bookkeeping consumes in_arity items and pushes out_arity items named
+    # after the binding so downstream PICK/ROLL/DROP refer to the correct
+    # logical slot.
+    def _lower_raw_script(binding_name, bytes_hex, in_arity, out_arity)
+      if @sm.depth < in_arity
+        raise "raw_script binding '#{binding_name}' requires #{in_arity} " \
+              "stack items but only #{@sm.depth} are present"
       end
-      @sm.pop if elements.any?
-      @sm.push(binding_name)
+      unless bytes_hex.match?(/\A[0-9a-fA-F]*\z/) && bytes_hex.length.even?
+        raise "raw_script binding '#{binding_name}' has invalid hex bytes: #{bytes_hex.inspect}"
+      end
+      bytes = [bytes_hex].pack("H*")
+      emit_op({ op: "raw_bytes", raw_bytes: bytes, in_arity: in_arity, out_arity: out_arity })
+      in_arity.times { @sm.pop }
+      out_arity.times do |i|
+        slot_name = out_arity == 1 ? binding_name : "#{binding_name}.#{i}"
+        @sm.push(slot_name)
+      end
       _track_depth
     end
 
@@ -2717,12 +3541,12 @@ module RunarCompiler::Codegen
       state_bytes_ref = args[1]
 
       # Bring stateBytes to stack first
-      state_last = _is_last_use(state_bytes_ref, binding_index, last_uses)
-      bring_to_top(state_bytes_ref, state_last)
+      state_consume = _operand_consume(state_bytes_ref, [preimage_ref, state_bytes_ref], binding_index, last_uses)
+      bring_to_top(state_bytes_ref, state_consume)
 
       # Extract amount from preimage for the continuation output
-      pre_last = _is_last_use(preimage_ref, binding_index, last_uses)
-      bring_to_top(preimage_ref, pre_last)
+      pre_consume = _operand_consume(preimage_ref, [preimage_ref, state_bytes_ref], binding_index, last_uses)
+      bring_to_top(preimage_ref, pre_consume)
 
       # Extract amount: last 52 bytes, take 8 bytes at offset 0
       emit_opcode("OP_SIZE"); @sm.push("")
@@ -2778,21 +3602,23 @@ module RunarCompiler::Codegen
       state_bytes_ref = args[1]
       new_amount_ref = args[2]
 
+      cso_operands = [preimage_ref, state_bytes_ref, new_amount_ref]
+
       # Consume preimage ref (no longer needed)
-      pre_last = _is_last_use(preimage_ref, binding_index, last_uses)
-      bring_to_top(preimage_ref, pre_last)
+      pre_consume = _operand_consume(preimage_ref, cso_operands, binding_index, last_uses)
+      bring_to_top(preimage_ref, pre_consume)
       emit_op({ op: "drop" }); @sm.pop
 
       # Step 1: Convert _newAmount to 8-byte LE and save to altstack
-      amount_last = _is_last_use(new_amount_ref, binding_index, last_uses)
-      bring_to_top(new_amount_ref, amount_last)
+      amount_consume = _operand_consume(new_amount_ref, cso_operands, binding_index, last_uses)
+      bring_to_top(new_amount_ref, amount_consume)
       emit_push_int(8); @sm.push("")
       emit_opcode("OP_NUM2BIN"); @sm.pop; @sm.pop; @sm.push("")
       emit_opcode("OP_TOALTSTACK"); @sm.pop
 
       # Step 2: Bring stateBytes to stack
-      state_last = _is_last_use(state_bytes_ref, binding_index, last_uses)
-      bring_to_top(state_bytes_ref, state_last)
+      state_consume = _operand_consume(state_bytes_ref, cso_operands, binding_index, last_uses)
+      bring_to_top(state_bytes_ref, state_consume)
 
       # Step 3: Bring _codePart to top (PICK -- never consume)
       bring_to_top("_codePart", false)
@@ -2836,7 +3662,7 @@ module RunarCompiler::Codegen
       @sm.push("")
 
       # Push the 20-byte PKH
-      bring_to_top(pkh_ref, _is_last_use(pkh_ref, binding_index, last_uses))
+      bring_to_top(pkh_ref, _operand_consume(pkh_ref, [pkh_ref, amount_ref], binding_index, last_uses))
       # CAT: prefix || pkh
       emit_opcode("OP_CAT"); @sm.pop; @sm.pop; @sm.push("")
 
@@ -2847,7 +3673,7 @@ module RunarCompiler::Codegen
       emit_opcode("OP_CAT"); @sm.pop; @sm.pop; @sm.push("")
 
       # Step 2: Prepend amount as 8-byte LE
-      bring_to_top(amount_ref, _is_last_use(amount_ref, binding_index, last_uses))
+      bring_to_top(amount_ref, _operand_consume(amount_ref, [pkh_ref, amount_ref], binding_index, last_uses))
       emit_push_int(8); @sm.push("")
       emit_opcode("OP_NUM2BIN"); @sm.pop
       emit_op({ op: "swap" }); @sm.swap
@@ -2858,29 +3684,23 @@ module RunarCompiler::Codegen
       _track_depth
     end
 
+    # Lower verifyRabinSig(msg, sig, padding, pubKey).
+    # The 10-opcode emission delegates to the standalone Rabin module.
+    #
+    # Stack input (bottom->top): msg sig padding pubKey -> Stack output: bool
     def _lower_verify_rabin_sig(binding_name, args, binding_index, last_uses)
       raise "verifyRabinSig requires 4 arguments" if args.length < 4
 
-      msg, sig, padding, pub_key = args[0], args[1], args[2], args[3]
+      require_relative "rabin"
 
-      bring_to_top(msg, _is_last_use(msg, binding_index, last_uses))
-      bring_to_top(sig, _is_last_use(sig, binding_index, last_uses))
-      bring_to_top(padding, _is_last_use(padding, binding_index, last_uses))
-      bring_to_top(pub_key, _is_last_use(pub_key, binding_index, last_uses))
+      args.each do |arg|
+        bring_to_top(arg, _operand_consume(arg, args, binding_index, last_uses))
+      end
 
       4.times { @sm.pop }
 
-      # Rabin sig verification opcode sequence
-      emit_opcode("OP_SWAP")
-      emit_opcode("OP_ROT")
-      emit_opcode("OP_DUP")
-      emit_opcode("OP_MUL")
-      emit_opcode("OP_ADD")
-      emit_opcode("OP_SWAP")
-      emit_opcode("OP_MOD")
-      emit_opcode("OP_SWAP")
-      emit_opcode("OP_SHA256")
-      emit_opcode("OP_EQUAL")
+      emit_fn = ->(op) { emit_op(op) }
+      RunarCompiler::Codegen::Rabin.emit_verify_rabin_sig(emit_fn)
 
       @sm.push(binding_name)
       _track_depth
@@ -2901,6 +3721,10 @@ module RunarCompiler::Codegen
   def self.lower_to_stack(program)
     _lower_to_stack_inner(program)
   rescue RuntimeError
+    raise
+  rescue ::RunarCompiler::IR::UnknownANFKindError
+    # Typed dispatch-site guards must surface untouched so callers (and
+    # the F-003 regression test) can identify the missed kind directly.
     raise
   rescue => e
     raise RuntimeError, "stack lowering: #{e}"
@@ -2932,14 +3756,20 @@ module RunarCompiler::Codegen
   def self._lower_method_with_private_methods(method, properties, private_methods)
     param_names = method.params.map(&:name)
 
-    # If the method uses checkPreimage, the unlocking script pushes implicit
-    # params before all declared parameters (OP_PUSH_TX pattern).
-    if method_uses_check_preimage?(method.body)
-      param_names = ["_opPushTxSig"] + param_names
-      # _codePart is needed when the method has add_output or add_raw_output
-      if method_uses_code_part?(method.body)
-        param_names = ["_codePart"] + param_names
-      end
+    # _codePart is needed for continuation builders (add_output/add_raw_output)
+    # OR when the method reads a mutable variable-length (ByteString) state
+    # field -- the deserialization needs it for the preimage-relative offset
+    # (issue #100).
+    var_len_props = properties.select { |p| !p.readonly && p.type == "ByteString" }.map(&:name)
+    uses_code_part = method_uses_check_preimage?(method.body, private_methods) &&
+                     (method_uses_code_part?(method.body) ||
+                      method_reads_var_len_state?(method.body, var_len_props))
+    # BUG-100 fix: the OP_PUSH_TX signature is now derived on-chain from the
+    # preimage (see _lower_check_preimage), so NO _opPushTxSig witness item is
+    # pushed -- the unlocking script provides only the preimage (and _codePart
+    # when needed).
+    if method_uses_check_preimage?(method.body, private_methods) && uses_code_part
+      param_names = ["_codePart"] + param_names
     end
 
     ctx = LoweringContext.new(param_names, properties)
@@ -2947,9 +3777,12 @@ module RunarCompiler::Codegen
     # Pass terminalAssert=true for public methods
     ctx.lower_bindings(method.body, method.is_public)
 
-    # Clean up excess stack items left by deserialize_state.
-    has_deserialize_state = method.body.any? { |b| b.value.kind == "deserialize_state" }
-    if method.is_public && has_deserialize_state && ctx.sm.depth > 1
+    # Clean up excess stack items below the top-of-stack boolean (CLEANSTACK).
+    # Excess items can come from deserialize_state (stateful methods reading
+    # mutable fields) or from readonly-field-binding patterns in all-readonly
+    # terminal methods. The depth > 1 guard keeps this a no-op for already-clean
+    # methods.
+    if method.is_public && ctx.sm.depth > 1
       excess = ctx.sm.depth - 1
       excess.times do
         ctx.emit_op({ op: "nip" })
@@ -2963,7 +3796,7 @@ module RunarCompiler::Codegen
             "(actual: #{ctx.max_depth}). Simplify the contract logic"
     end
 
-    { name: method.name, ops: ctx.ops, max_stack_depth: ctx.max_depth }
+    { name: method.name, ops: ctx.ops, max_stack_depth: ctx.max_depth, uses_code_part: uses_code_part }
   end
   private_class_method :_lower_method_with_private_methods
 
@@ -2976,9 +3809,12 @@ module RunarCompiler::Codegen
     ctx = LoweringContext.new(param_names, properties)
     ctx.lower_bindings(method.body, method.is_public)
 
-    # Clean up excess stack items left by deserialize_state.
-    has_deserialize_state = method.body.any? { |b| b.value.kind == "deserialize_state" }
-    if method.is_public && has_deserialize_state && ctx.sm.depth > 1
+    # Clean up excess stack items below the top-of-stack boolean (CLEANSTACK).
+    # Excess items can come from deserialize_state (stateful methods reading
+    # mutable fields) or from readonly-field-binding patterns in all-readonly
+    # terminal methods. The depth > 1 guard keeps this a no-op for already-clean
+    # methods.
+    if method.is_public && ctx.sm.depth > 1
       excess = ctx.sm.depth - 1
       excess.times do
         ctx.emit_op({ op: "nip" })

@@ -125,6 +125,11 @@ class CallExpr:
 
     callee: Expression
     args: list[Expression] = field(default_factory=list)
+    # Set only for the expression form ``asm<T>({...})`` of the asm compiler
+    # intrinsic. Carries the captured primitive return type ("bigint",
+    # "boolean", or "ByteString"); empty for the statement form and for
+    # every non-asm call.
+    asm_return_type: str = ""
 
 
 @dataclass
@@ -271,6 +276,20 @@ class ParamNode:
 
 
 @dataclass
+class SyntheticArrayChainEntry:
+    """One level of a FixedArray expansion chain.
+
+    Attached to synthetic scalar properties minted by ``expand_fixed_arrays``
+    so the artifact assembler can iteratively re-group them back into one
+    (possibly nested) FixedArray state field. Outermost level first.
+    """
+
+    base: str = ""
+    index: int = 0
+    length: int = 0
+
+
+@dataclass
 class PropertyNode:
     """A contract property declaration."""
 
@@ -278,7 +297,20 @@ class PropertyNode:
     type: TypeNode | None = None
     readonly: bool = False
     initializer: Expression | None = None
+    # Issue #109: set by the parser when a ``/** @embedAlways */`` (or
+    # ``// @embedAlways``) comment directive immediately precedes a readonly
+    # field declaration. It opts the field OUT of dead-code elimination: a
+    # readonly field no method references is normally stripped from the locking
+    # script (its ``load_prop`` is dead, so no constructor slot is emitted),
+    # silently removing deploy-time metadata an author intends to recover from
+    # the on-chain script later. When set, the compiler forces the field into
+    # the script (a constructor slot) so its bytes survive. Only meaningful on
+    # readonly fields.
+    embed_always: bool = False
     source_location: SourceLocation = field(default_factory=SourceLocation)
+    # Populated by ``expand_fixed_arrays`` on synthetic scalar leaves.
+    # Empty for user-declared non-FixedArray properties.
+    synthetic_array_chain: list[SyntheticArrayChainEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -289,6 +321,13 @@ class MethodNode:
     params: list[ParamNode] = field(default_factory=list)
     body: list[Statement] = field(default_factory=list)
     visibility: str = "public"  # "public" or "private"
+    # Issue #123: the BIP-143 sighash type declared via a
+    # ``/** @sighash <FLAGS> */`` directive on a public method (e.g. ``0x43``
+    # for SINGLE|FORKID). ``None`` = the default ``ALL|FORKID`` (0x41),
+    # byte-identical to the historically-pinned mode. Drives the auto-injected
+    # preimage-type assert, the OP_PUSH_TX binding flag, the ABI ``sigHashType``,
+    # and the SDK-side preimage/signature construction.
+    sighash_type: int | None = None
     source_location: SourceLocation = field(default_factory=SourceLocation)
 
 
@@ -322,6 +361,8 @@ PRIMITIVE_TYPE_NAMES: frozenset[str] = frozenset({
     "RabinPubKey",
     "void",
     "Point",
+    "P256Point",
+    "P384Point",
 })
 
 

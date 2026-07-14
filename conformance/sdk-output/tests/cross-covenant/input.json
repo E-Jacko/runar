@@ -1,0 +1,77 @@
+{
+  "artifact": {
+    "version": "runar-v1.0.0-rc.1",
+    "compilerVersion": "1.0.0-rc.1",
+    "contractName": "CrossCovenantRef",
+    "parentClass": "SmartContract",
+    "abi": {
+      "constructor": {
+        "params": [
+          {
+            "name": "sourceScriptHash",
+            "type": "Sha256"
+          }
+        ]
+      },
+      "methods": [
+        {
+          "name": "verifyAndExtract",
+          "params": [
+            {
+              "name": "referencedOutput",
+              "type": "ByteString"
+            },
+            {
+              "name": "expectedStateRoot",
+              "type": "ByteString"
+            },
+            {
+              "name": "stateRootOffset",
+              "type": "bigint"
+            }
+          ],
+          "isPublic": true
+        },
+        {
+          "name": "verifyAndExtractNumeric",
+          "params": [
+            {
+              "name": "referencedOutput",
+              "type": "ByteString"
+            },
+            {
+              "name": "expectedValue",
+              "type": "bigint"
+            },
+            {
+              "name": "valueOffset",
+              "type": "bigint"
+            },
+            {
+              "name": "valueLen",
+              "type": "bigint"
+            }
+          ],
+          "isPublic": true
+        }
+      ]
+    },
+    "script": "76009c63755279aa00887b7c01207b7b7f777c7f757c8767519d5379aa0088537a7b7b7b7b7f777c7f75817c9c68",
+    "constructorSlots": [
+      {
+        "paramIndex": 0,
+        "byteOffset": 8
+      },
+      {
+        "paramIndex": 0,
+        "byteOffset": 29
+      }
+    ]
+  },
+  "constructorArgs": [
+    {
+      "type": "Sha256",
+      "value": "0000000000000000000000000000000000000000000000000000000000000001"
+    }
+  ]
+}

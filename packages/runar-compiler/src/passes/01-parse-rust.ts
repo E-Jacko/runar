@@ -7,8 +7,8 @@
  *
  * Rust contract syntax conventions:
  *   - `#[runar::contract]` attribute on struct
- *   - `#[runar::methods(Name)]` attribute on impl block
- *   - `#[public]` attribute on public methods
+ *   - plain `impl ContractName { ... }` block (no attribute required)
+ *   - `pub fn` = public spending entry point, `fn` = private helper
  *   - `#[readonly]` attribute on readonly fields
  *   - `&self` / `&mut self` method receivers (stripped)
  *   - `&Type` reference parameters (stripped)
@@ -33,6 +33,7 @@ import type {
 import type { ParseResult } from './01-parse.js';
 import { ParserCore } from './parser-core.js';
 import type { Token } from './parser-core.js';
+import { makeDiagnostic } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // Lexer
@@ -251,18 +252,30 @@ const RUST_BUILTIN_MAP: Record<string, string> = {
   extractLocktime: 'extractLocktime',
   extractOutputHash: 'extractOutputHash',
   // Output construction
-  addOutput: 'addOutput', addRawOutput: 'addRawOutput',
+  addOutput: 'addOutput', addRawOutput: 'addRawOutput', addDataOutput: 'addDataOutput',
   getStateScript: 'getStateScript',
   // Math builtins
   abs: 'abs', min: 'min', max: 'max', within: 'within',
   safediv: 'safediv', safemod: 'safemod', clamp: 'clamp', sign: 'sign',
   pow: 'pow', mulDiv: 'mulDiv', percentOf: 'percentOf', sqrt: 'sqrt',
   gcd: 'gcd', divmod: 'divmod', log2: 'log2',
-  // EC builtins
+  // EC builtins (secp256k1)
   ecAdd: 'ecAdd', ecMul: 'ecMul', ecMulGen: 'ecMulGen',
   ecNegate: 'ecNegate', ecOnCurve: 'ecOnCurve', ecModReduce: 'ecModReduce',
   ecEncodeCompressed: 'ecEncodeCompressed', ecMakePoint: 'ecMakePoint',
   ecPointX: 'ecPointX', ecPointY: 'ecPointY',
+  // EC builtins (P-256 / secp256r1)
+  p256Add: 'p256Add', p256Mul: 'p256Mul', p256MulGen: 'p256MulGen',
+  p256Negate: 'p256Negate', p256OnCurve: 'p256OnCurve',
+  p256EncodeCompressed: 'p256EncodeCompressed',
+  verify_ecdsa_p256: 'verifyECDSA_P256', verifyEcdsaP256: 'verifyECDSA_P256',
+  // EC builtins (P-384 / secp384r1)
+  verify_ecdsa_p384: 'verifyECDSA_P384', verifyEcdsaP384: 'verifyECDSA_P384',
+  // Baby Bear field arithmetic
+  bb_field_add: 'bbFieldAdd', bb_field_sub: 'bbFieldSub',
+  bb_field_mul: 'bbFieldMul', bb_field_inv: 'bbFieldInv',
+  // Merkle proof verification
+  merkle_root_sha256: 'merkleRootSha256', merkle_root_hash256: 'merkleRootHash256',
   // SHA-256 partial
   sha256Compress: 'sha256Compress', sha256Finalize: 'sha256Finalize',
   // BLAKE3
@@ -286,11 +299,13 @@ const RUST_TYPE_MAP: Record<string, string> = {
   i128: 'bigint', u128: 'bigint', i256: 'bigint', u256: 'bigint',
   Bool: 'boolean', bool: 'boolean',
   ByteString: 'ByteString',
-  PubKey: 'PubKey', Sig: 'Sig', Sha256: 'Sha256',
+  PubKey: 'PubKey', Sig: 'Sig', Sha256: 'Sha256', Sha256Digest: 'Sha256',
   Ripemd160: 'Ripemd160', Addr: 'Addr',
   SigHashPreimage: 'SigHashPreimage',
   RabinSig: 'RabinSig', RabinPubKey: 'RabinPubKey',
   Point: 'Point',
+  P256Point: 'P256Point',
+  P384Point: 'P384Point',
 };
 
 function mapRustType(name: string): string {
@@ -299,7 +314,8 @@ function mapRustType(name: string): string {
 
 const PRIMITIVE_TYPES = new Set([
   'bigint', 'boolean', 'ByteString', 'PubKey', 'Sig', 'Sha256',
-  'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point', 'void',
+  'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey',
+  'Point', 'P256Point', 'P384Point', 'void',
 ]);
 
 function makePrimitiveOrCustom(name: string): TypeNode {
@@ -324,7 +340,7 @@ class RustParser extends ParserCore<RustToken> {
     // Skip `use runar::prelude::*;` and other use declarations
     this.skipUseDecls();
 
-    let parentClass: 'SmartContract' | 'StatefulSmartContract' = 'SmartContract';
+    let parentClass: 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract' = 'SmartContract';
     const properties: PropertyNode[] = [];
     const methods: MethodNode[] = [];
 
@@ -333,8 +349,13 @@ class RustParser extends ParserCore<RustToken> {
       // Skip attributes at top level (handled within struct/impl parsing)
       if (this.current().type === '#') {
         const attr = this.parseAttribute();
-        // Check for #[runar::contract] -> next should be struct
-        if (attr === 'runar::contract') {
+        // Check for #[runar::contract] / #[runar::stateful_contract] /
+        // #[runar::unsafe_contract] -> next should be struct
+        if (
+          attr === 'runar::contract' ||
+          attr === 'runar::stateful_contract' ||
+          attr === 'runar::unsafe_contract'
+        ) {
           // Optional pub keyword before struct
           if (this.current().type === 'pub') this.advance();
           if (this.current().type === 'struct') {
@@ -342,17 +363,25 @@ class RustParser extends ParserCore<RustToken> {
             if (result) {
               this.contractName = result.name;
               parentClass = result.parentClass;
+              if (attr === 'runar::stateful_contract') {
+                parentClass = 'StatefulSmartContract';
+              } else if (attr === 'runar::unsafe_contract') {
+                parentClass = 'UnsafeSmartContract';
+              }
               properties.push(...result.properties);
             }
           }
           continue;
         }
-        // Check for #[runar::methods(Name)] -> next should be impl
+        // #[runar::methods] is no longer supported — bare `impl` blocks are
+        // discovered directly. Emit a migration diagnostic; the `impl` branch
+        // below still parses the block so recovery is clean.
         if (attr.startsWith('runar::methods')) {
-          if (this.current().type === 'impl') {
-            const implMethods = this.parseImplBlock();
-            methods.push(...implMethods);
-          }
+          this.errors.push(makeDiagnostic(
+            "#[runar::methods] is no longer supported — write a bare 'impl ContractName { ... }' block instead",
+            'error',
+            this.loc(),
+          ));
           continue;
         }
         // Other top-level attributes — skip
@@ -493,7 +522,7 @@ class RustParser extends ParserCore<RustToken> {
 
   private parseStructDecl(): {
     name: string;
-    parentClass: 'SmartContract' | 'StatefulSmartContract';
+    parentClass: 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract';
     properties: PropertyNode[];
   } | null {
     this.expect('struct');
@@ -607,19 +636,27 @@ class RustParser extends ParserCore<RustToken> {
 
     const methods: MethodNode[] = [];
     while (this.current().type !== '}' && this.current().type !== 'eof') {
-      // Check for attributes (#[public])
-      let isPublic = false;
+      // #[public] is no longer supported — `pub fn` marks public methods.
+      // Emit a migration diagnostic for any leftover attribute, then recover.
       while (this.current().type === '#') {
         const attr = this.parseAttribute();
         if (attr === 'public') {
-          isPublic = true;
+          this.errors.push(makeDiagnostic(
+            "#[public] is no longer supported — use 'pub fn' for public methods",
+            'error',
+            this.loc(),
+          ));
         }
       }
 
       // Doc comments are already handled by the tokenizer (skipped)
 
-      // Skip optional `pub` keyword
-      if (this.current().type === 'pub') this.advance();
+      // `pub fn` marks a public spending entry point; bare `fn` is a private helper.
+      let isPublic = false;
+      if (this.current().type === 'pub') {
+        isPublic = true;
+        this.advance();
+      }
 
       if (this.current().type === 'fn') {
         const method = this.parseFnDecl(isPublic);

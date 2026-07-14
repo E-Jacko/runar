@@ -40,7 +40,7 @@ function bigintToBytes32(n: bigint): Uint8Array {
 // ECTracker — named stack state tracker (mirrors SLHTracker)
 // ===========================================================================
 
-class ECTracker {
+export class ECTracker {
   nm: (string | null)[];
   _e: (op: StackOp) => void;
 
@@ -198,6 +198,20 @@ function fieldMul(t: ECTracker, aName: string, bName: string, resultName: string
     e({ op: 'opcode', code: 'OP_MUL' });
   });
   fieldMod(t, '_fmul_prod', resultName);
+}
+
+/** fieldMulConst: (a * c) mod p where c is a small constant. Uses OP_2MUL for c=2. */
+function fieldMulConst(t: ECTracker, aName: string, c: bigint, resultName: string): void {
+  t.toTop(aName);
+  t.rawBlock([aName], '_fmc_prod', (e) => {
+    if (c === 2n) {
+      e({ op: 'opcode', code: 'OP_2MUL' });
+    } else {
+      e({ op: 'push', value: c });
+      e({ op: 'opcode', code: 'OP_MUL' });
+    }
+  });
+  fieldMod(t, '_fmc_prod', resultName);
 }
 
 /** fieldSqr: (a * a) mod p */
@@ -437,8 +451,7 @@ function jacobianDouble(t: ECTracker): void {
   t.copyToTop('_B', '_B_save');
   fieldSqr(t, '_D', '_D2');
   t.copyToTop('_B', '_B1');
-  t.pushInt('_two1', 2n);
-  fieldMul(t, '_B1', '_two1', '_2B');
+  fieldMulConst(t, '_B1', 2n, '_2B');
   fieldSub(t, '_D2', '_2B', '_nx');
 
   // ny = D*(B - nx) - C
@@ -449,8 +462,7 @@ function jacobianDouble(t: ECTracker): void {
 
   // nz = 2 * Y * Z
   fieldMul(t, '_jy_save', '_jz_save', '_yz');
-  t.pushInt('_two2', 2n);
-  fieldMul(t, '_yz', '_two2', '_nz');
+  fieldMulConst(t, '_yz', 2n, '_nz');
 
   // Clean up leftovers: _B (used via _B_save/_B1) and old jz (only copied, never consumed)
   t.toTop('_B'); t.drop();
@@ -540,8 +552,7 @@ function buildJacobianAddAffineInline(e: (op: StackOp) => void, t: ECTracker): v
   // X3 = R² - H3 - 2*U1H2
   fieldSqr(it, '_R', '_R2');
   fieldSub(it, '_R2', '_H3', '_x3_tmp');
-  it.pushInt('_two', 2n);
-  fieldMul(it, '_U1H2', '_two', '_2U1H2');
+  fieldMulConst(it, '_U1H2', 2n, '_2U1H2');
   fieldSub(it, '_x3_tmp', '_2U1H2', '_X3');
 
   // Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
@@ -619,13 +630,18 @@ export function emitEcMul(emit: (op: StackOp) => void): void {
   for (let bit = 256; bit >= 0; bit--) {
     jacobianDouble(t);
 
-    // Extract bit: (k >> bit) % 2
+    // Extract bit: (k >> bit) & 1, using OP_RSHIFTNUM / OP_2DIV
     t.copyToTop('_k', '_k_copy');
-    if (bit > 0) {
-      const divisor = 1n << BigInt(bit);
-      t.pushInt('_div', divisor);
-      t.rawBlock(['_k_copy', '_div'], '_shifted', (e) => {
-        e({ op: 'opcode', code: 'OP_DIV' });
+    if (bit === 1) {
+      // Single-bit shift: OP_2DIV (no push needed)
+      t.rawBlock(['_k_copy'], '_shifted', (e) => {
+        e({ op: 'opcode', code: 'OP_2DIV' });
+      });
+    } else if (bit > 1) {
+      // Multi-bit shift: push shift amount, OP_RSHIFTNUM
+      t.pushInt('_shift', BigInt(bit));
+      t.rawBlock(['_k_copy', '_shift'], '_shifted', (e) => {
+        e({ op: 'opcode', code: 'OP_RSHIFTNUM' });
       });
     } else {
       t.rename('_shifted');
@@ -692,6 +708,28 @@ export function emitEcOnCurve(emit: (op: StackOp) => void): void {
   const t = new ECTracker(['_pt'], emit);
   decomposePoint(t, '_pt', '_x', '_y');
 
+  // GAP-301: coordinate canonicity. `decomposePoint` BIN2NUMs each coordinate
+  // as an unsigned value that may be ≥ p; the field arithmetic below would
+  // silently reduce it mod p, so a non-canonical encoding of a valid point
+  // would pass. Reject it: require x < p AND y < p (coordinates are unsigned,
+  // so the 0 ≤ lower bound holds by construction). Combined with the curve
+  // equation at the end via OP_BOOLAND so ecOnCurve still returns a boolean.
+  t.copyToTop('_x', '_x_lt');
+  pushFieldP(t, '_p_for_x');
+  t.rawBlock(['_x_lt', '_p_for_x'], '_x_canon', (e) => {
+    e({ op: 'opcode', code: 'OP_LESSTHAN' });
+  });
+  t.copyToTop('_y', '_y_lt');
+  pushFieldP(t, '_p_for_y');
+  t.rawBlock(['_y_lt', '_p_for_y'], '_y_canon', (e) => {
+    e({ op: 'opcode', code: 'OP_LESSTHAN' });
+  });
+  t.toTop('_x_canon');
+  t.toTop('_y_canon');
+  t.rawBlock(['_x_canon', '_y_canon'], '_canon', (e) => {
+    e({ op: 'opcode', code: 'OP_BOOLAND' });
+  });
+
   // lhs = y²
   fieldSqr(t, '_y', '_y2');
 
@@ -702,11 +740,18 @@ export function emitEcOnCurve(emit: (op: StackOp) => void): void {
   t.pushInt('_seven', 7n);
   fieldAdd(t, '_x3', '_seven', '_rhs');
 
-  // Compare
+  // Compare curve equation
   t.toTop('_y2');
   t.toTop('_rhs');
-  t.rawBlock(['_y2', '_rhs'], '_result', (e) => {
+  t.rawBlock(['_y2', '_rhs'], '_curve_eq', (e) => {
     e({ op: 'opcode', code: 'OP_EQUAL' });
+  });
+
+  // on-curve = canonical AND curve-equation
+  t.toTop('_canon');
+  t.toTop('_curve_eq');
+  t.rawBlock(['_canon', '_curve_eq'], '_result', (e) => {
+    e({ op: 'opcode', code: 'OP_BOOLAND' });
   });
 }
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from runar_compiler.frontend.ast_nodes import (
+    ArrayLiteralExpr,
     AssignmentStmt,
     BigIntLiteral,
     BinaryExpr,
@@ -112,10 +113,65 @@ BUILTIN_FUNCTIONS: dict[str, FuncSig] = {
     "ecMakePoint":        FuncSig(params=["bigint", "bigint"], return_type="Point"),
     "ecPointX":           FuncSig(params=["Point"], return_type="bigint"),
     "ecPointY":           FuncSig(params=["Point"], return_type="bigint"),
+    # Elliptic curve operations (P-256 / NIST P-256 / secp256r1)
+    "p256Add":              FuncSig(params=["P256Point", "P256Point"], return_type="P256Point"),
+    "p256Mul":              FuncSig(params=["P256Point", "bigint"], return_type="P256Point"),
+    "p256MulGen":           FuncSig(params=["bigint"], return_type="P256Point"),
+    "p256Negate":           FuncSig(params=["P256Point"], return_type="P256Point"),
+    "p256OnCurve":          FuncSig(params=["P256Point"], return_type="boolean"),
+    "p256EncodeCompressed": FuncSig(params=["P256Point"], return_type="ByteString"),
+    "verifyECDSA_P256":     FuncSig(params=["ByteString", "ByteString", "ByteString"], return_type="boolean"),
+    # Elliptic curve operations (P-384 / NIST P-384 / secp384r1)
+    "p384Add":              FuncSig(params=["P384Point", "P384Point"], return_type="P384Point"),
+    "p384Mul":              FuncSig(params=["P384Point", "bigint"], return_type="P384Point"),
+    "p384MulGen":           FuncSig(params=["bigint"], return_type="P384Point"),
+    "p384Negate":           FuncSig(params=["P384Point"], return_type="P384Point"),
+    "p384OnCurve":          FuncSig(params=["P384Point"], return_type="boolean"),
+    "p384EncodeCompressed": FuncSig(params=["P384Point"], return_type="ByteString"),
+    "verifyECDSA_P384":     FuncSig(params=["ByteString", "ByteString", "ByteString"], return_type="boolean"),
     "sha256Compress":    FuncSig(params=["ByteString", "ByteString"], return_type="ByteString"),
     "sha256Finalize":    FuncSig(params=["ByteString", "ByteString", "bigint"], return_type="ByteString"),
     "blake3Compress":    FuncSig(params=["ByteString", "ByteString"], return_type="ByteString"),
     "blake3Hash":        FuncSig(params=["ByteString"], return_type="ByteString"),
+    "bbFieldAdd":        FuncSig(params=["bigint", "bigint"], return_type="bigint"),
+    "bbFieldSub":        FuncSig(params=["bigint", "bigint"], return_type="bigint"),
+    "bbFieldMul":        FuncSig(params=["bigint", "bigint"], return_type="bigint"),
+    "bbFieldInv":        FuncSig(params=["bigint"], return_type="bigint"),
+    "bbExt4Mul0":        FuncSig(params=["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "bbExt4Mul1":        FuncSig(params=["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "bbExt4Mul2":        FuncSig(params=["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "bbExt4Mul3":        FuncSig(params=["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "bbExt4Inv0":        FuncSig(params=["bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "bbExt4Inv1":        FuncSig(params=["bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "bbExt4Inv2":        FuncSig(params=["bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "bbExt4Inv3":        FuncSig(params=["bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    # KoalaBear field arithmetic (p = 2130706433)
+    "kbFieldAdd":        FuncSig(params=["bigint", "bigint"], return_type="bigint"),
+    "kbFieldSub":        FuncSig(params=["bigint", "bigint"], return_type="bigint"),
+    "kbFieldMul":        FuncSig(params=["bigint", "bigint"], return_type="bigint"),
+    "kbFieldInv":        FuncSig(params=["bigint"], return_type="bigint"),
+    # KoalaBear quartic extension field (W = 3)
+    "kbExt4Mul0":        FuncSig(params=["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "kbExt4Mul1":        FuncSig(params=["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "kbExt4Mul2":        FuncSig(params=["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "kbExt4Mul3":        FuncSig(params=["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "kbExt4Inv0":        FuncSig(params=["bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "kbExt4Inv1":        FuncSig(params=["bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "kbExt4Inv2":        FuncSig(params=["bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    "kbExt4Inv3":        FuncSig(params=["bigint", "bigint", "bigint", "bigint"], return_type="bigint"),
+    # BN254 field arithmetic
+    "bn254FieldAdd":     FuncSig(params=["bigint", "bigint"], return_type="bigint"),
+    "bn254FieldSub":     FuncSig(params=["bigint", "bigint"], return_type="bigint"),
+    "bn254FieldMul":     FuncSig(params=["bigint", "bigint"], return_type="bigint"),
+    "bn254FieldInv":     FuncSig(params=["bigint"], return_type="bigint"),
+    "bn254FieldNeg":     FuncSig(params=["bigint"], return_type="bigint"),
+    # BN254 G1 curve operations
+    "bn254G1Add":        FuncSig(params=["Point", "Point"], return_type="Point"),
+    "bn254G1ScalarMul":  FuncSig(params=["Point", "bigint"], return_type="Point"),
+    "bn254G1Negate":     FuncSig(params=["Point"], return_type="Point"),
+    "bn254G1OnCurve":    FuncSig(params=["Point"], return_type="boolean"),
+    "merkleRootSha256":  FuncSig(params=["ByteString", "ByteString", "bigint", "bigint"], return_type="ByteString"),
+    "merkleRootHash256": FuncSig(params=["ByteString", "ByteString", "bigint", "bigint"], return_type="ByteString"),
     "abs":               FuncSig(params=["bigint"], return_type="bigint"),
     "min":               FuncSig(params=["bigint", "bigint"], return_type="bigint"),
     "max":               FuncSig(params=["bigint", "bigint"], return_type="bigint"),
@@ -154,6 +210,15 @@ BUILTIN_FUNCTIONS: dict[str, FuncSig] = {
     "extractSigHashType":   FuncSig(params=["SigHashPreimage"], return_type="bigint"),
     "split":                FuncSig(params=["ByteString", "bigint"], return_type="ByteString"),
     "buildChangeOutput":    FuncSig(params=["ByteString", "bigint"], return_type="ByteString"),
+    # Intent sub-covenant intrinsics (BSVM Phase 13). Witness-bridge wrappers
+    # that compile down to standard primitives + auto-injected method params.
+    # See docs/cross-covenant-pattern.md.
+    #
+    # First arg of extractPrevOutputScript / requireOutputP2PKH MUST be an
+    # integer literal — enforced as a special case in _check_call_args.
+    "extractPrevOutputScript": FuncSig(params=["bigint", "ByteString"], return_type="ByteString"),
+    "requireOutputP2PKH":      FuncSig(params=["bigint", "ByteString", "bigint"], return_type="void"),
+    "currentBlockHeight":      FuncSig(params=[], return_type="bigint"),
 }
 
 
@@ -170,6 +235,8 @@ _BYTESTRING_SUBTYPES: frozenset[str] = frozenset({
     "Addr",
     "SigHashPreimage",
     "Point",
+    "P256Point",
+    "P384Point",
 })
 
 _BIGINT_SUBTYPES: frozenset[str] = frozenset({
@@ -257,7 +324,13 @@ class _TypeChecker:
         self.errors: list[Diagnostic] = []
         self.prop_types: dict[str, str] = {}
         self.method_sigs: dict[str, FuncSig] = {}
+        # Origin keys of affine values consumed in the current scope.
+        # 2026-04-30 audit finding F6.
         self.consumed_values: dict[str, bool] = {}
+        # Maps a local variable name to the canonical affine origin
+        # it aliases. Populated when a VariableDeclStmt of affine
+        # type is initialized from another affine origin.
+        self.affine_aliases: dict[str, str] = {}
         self._current_method_loc: SourceLocation | None = None
         self._current_stmt_loc: SourceLocation | None = None
 
@@ -288,6 +361,7 @@ class _TypeChecker:
 
         # Reset affine tracking
         self.consumed_values = {}
+        self.affine_aliases = {}
 
         for param in ctor.params:
             env.define(param.name, _type_node_to_string(param.type))
@@ -304,11 +378,31 @@ class _TypeChecker:
 
         # Reset affine tracking
         self.consumed_values = {}
+        self.affine_aliases = {}
 
         for param in method.params:
             env.define(param.name, _type_node_to_string(param.type))
 
         self._check_statements(method.body, env)
+
+        # Crit-3 — reject mixing requireOutputP2PKH with addDataOutput in the
+        # same method body. The intrinsic's compile-time output-offset
+        # computation assumes a fixed 34-byte stride per output, which is
+        # silently wrong when an OP_RETURN output (variable length) precedes
+        # the indexed P2PKH output. Caller would get a runtime
+        # OP_EQUALVERIFY failure only if the specific output index is
+        # exercised — attackers could route the bond P2PKH through an
+        # unmatched index. v1 forbids the mix; v2 may relax with a
+        # variable-stride decoder.
+        has_require_p2pkh = _body_calls_builtin(method.body, "requireOutputP2PKH")
+        has_add_data_output = _body_calls_add_data_output(method.body)
+        if has_require_p2pkh and has_add_data_output:
+            self._add_error(
+                f"method '{method.name}' mixes requireOutputP2PKH() with addDataOutput() — "
+                "v1 of the intrinsic assumes a fixed 34-byte output stride and "
+                "variable-length OP_RETURN outputs break the offset computation; "
+                "split the addDataOutput call into a separate method"
+            )
 
     def _check_statements(self, stmts: list[Statement], env: _TypeEnv) -> None:
         for stmt in stmts:
@@ -330,8 +424,18 @@ class _TypeChecker:
                         f"type '{init_type}' is not assignable to type '{declared_type}'"
                     )
                 env.define(stmt.name, declared_type)
+                decl_type = declared_type
             else:
                 env.define(stmt.name, init_type)
+                decl_type = init_type
+            # Record affine alias when the new local is affine-typed
+            # and its initializer is itself an affine origin
+            # (parameter or contract property). 2026-04-30 audit
+            # finding F6.
+            if decl_type in _AFFINE_TYPES and stmt.init is not None:
+                origin = self._affine_origin_of_expr(stmt.init)
+                if origin is not None:
+                    self.affine_aliases[stmt.name] = origin
 
         elif isinstance(stmt, AssignmentStmt):
             target_type = self._infer_expr_type(stmt.target, env)
@@ -600,6 +704,18 @@ class _TypeChecker:
         # Direct builtin call
         if isinstance(e.callee, Identifier):
             name = e.callee.name
+            # asm is a compile-time intrinsic -- the parser has already
+            # rewritten the { body, in_arity?, out_arity? } object-literal
+            # argument into three positional args (body, in_arity, out_arity).
+            # The statement form returns void; the expression form
+            # asm<T>({...}) carries the captured return type on
+            # asm_return_type and produces a value of that type.
+            if name == "asm":
+                for arg in e.args:
+                    self._infer_expr_type(arg, env)
+                if e.asm_return_type:
+                    return e.asm_return_type
+                return "void"
             if name in BUILTIN_FUNCTIONS:
                 return self._check_call_args(name, BUILTIN_FUNCTIONS[name], e.args, env)
             # Check if it's a known contract method
@@ -632,6 +748,10 @@ class _TypeChecker:
                 for arg in e.args:
                     self._infer_expr_type(arg, env)
                 return "void"
+            if prop == "addDataOutput":
+                for arg in e.args:
+                    self._infer_expr_type(arg, env)
+                return "void"
             if prop in self.method_sigs:
                 return self._check_call_args(prop, self.method_sigs[prop], e.args, env)
             self._add_error(
@@ -656,6 +776,10 @@ class _TypeChecker:
                         self._infer_expr_type(arg, env)
                     return "void"
                 if e.callee.property == "addRawOutput":
+                    for arg in e.args:
+                        self._infer_expr_type(arg, env)
+                    return "void"
+                if e.callee.property == "addDataOutput":
                     for arg in e.args:
                         self._infer_expr_type(arg, env)
                     return "void"
@@ -715,12 +839,109 @@ class _TypeChecker:
                 self._infer_expr_type(args[1], env)
             return sig.return_type
 
-        # checkMultiSig special case
+        # checkMultiSig special case (Sig[] / PubKey[] arrays). Only
+        # arity is special; arg-type validation falls through to the
+        # standard subtype loop below so callers cannot pass
+        # bigint[] or other element types. 2026-04-30 audit finding
+        # F5.
         if func_name == "checkMultiSig":
-            for arg in args:
-                self._infer_expr_type(arg, env)
-            self._check_affine_consumption(func_name, args, env)
+            if len(args) != 2:
+                self._add_error(
+                    f"checkMultiSig() expects 2 arguments, got {len(args)}"
+                )
+                for arg in args:
+                    self._infer_expr_type(arg, env)
+                self._check_affine_consumption(func_name, args, env)
+                return sig.return_type
+            # Fall through to the standard subtype check below.
+
+        # extractPrevOutputScript / requireOutputP2PKH — the index arg MUST
+        # be a compile-time integer literal so the ANF lowering can derive a
+        # stable auto-injected witness-param name (extractPrevOutputScript) or
+        # a constant byte offset (requireOutputP2PKH).
+        if func_name in ("extractPrevOutputScript", "requireOutputP2PKH"):
+            if len(args) >= 1:
+                idx_lit: BigIntLiteral | None = None
+                if isinstance(args[0], BigIntLiteral):
+                    idx_lit = args[0]
+                # Accept `-N` (UnaryExpr "-" over BigIntLiteral) so the bounds
+                # check below produces a clear "must be >= 0" rather than the
+                # misleading "must be an integer literal" message.
+                elif (
+                    isinstance(args[0], UnaryExpr)
+                    and args[0].op == "-"
+                    and isinstance(args[0].operand, BigIntLiteral)
+                ):
+                    idx_lit = BigIntLiteral(value=-args[0].operand.value)
+                if idx_lit is None:
+                    self._add_error(
+                        f"{func_name}() argument 1 (index) must be an integer literal"
+                    )
+                else:
+                    # R-2: bound the index literal. For requireOutputP2PKH, the
+                    # emitted Stack-IR computes byte-offset = idx * 34; require
+                    # 0 <= idx <= 1000 to keep the offset well under script-int
+                    # max and to reject obvious nonsense (e.g. negative or
+                    # astronomically large).
+                    idx = idx_lit.value
+                    if idx < 0:
+                        self._add_error(
+                            f"{func_name}() argument 1 (index) must be >= 0; got {idx}"
+                        )
+                    if func_name == "requireOutputP2PKH" and idx > 1000:
+                        self._add_error(
+                            f"requireOutputP2PKH() argument 1 (outputIndex) bound to <= 1000; got {idx} (the emitted Stack-IR computes byte-offset = idx*34; unrealistic indexes indicate a programming error)"
+                        )
+
+        # extractPrevOutputScript variable-arity special case (2-arg full-hash
+        # or 3-arg prefix-hash form). Validates types + literal-only on the
+        # optional prefixLen, then returns the signature's return type to
+        # bypass the standard arg-count check below (which would reject the
+        # 3-arg form against the 2-arg sig table entry).
+        if func_name == "extractPrevOutputScript":
+            if len(args) != 2 and len(args) != 3:
+                self._add_error(
+                    f"extractPrevOutputScript() expects 2 or 3 arguments, got {len(args)}"
+                )
+            if len(args) >= 1:
+                self._infer_expr_type(args[0], env)  # already validated as literal above
+            if len(args) >= 2:
+                arg_type = self._infer_expr_type(args[1], env)
+                if not is_subtype(arg_type, "ByteString") and arg_type != "<unknown>":
+                    self._add_error(
+                        f"argument 2 of extractPrevOutputScript(): expected 'ByteString', got '{arg_type}'"
+                    )
+            if len(args) == 3:
+                if not isinstance(args[2], BigIntLiteral):
+                    self._add_error(
+                        "extractPrevOutputScript() argument 3 (prefixLen) must be an integer literal when supplied"
+                    )
+                else:
+                    # R-4: bound the prefixLen literal. The intrinsic hashes
+                    # substr(witness, 0, prefixLen) and compares against a
+                    # 32-byte SHA-256 hash. prefixLen < 32 is suspicious (the
+                    # prefix bytes don't even cover a hash-sized chunk).
+                    # prefixLen > 4 MiB exceeds MAX_SCRIPT_BYTES — wouldn't
+                    # fit in a legal Bitcoin Script anyway.
+                    n = args[2].value
+                    if n < 32:
+                        self._add_error(
+                            f"extractPrevOutputScript() argument 3 (prefixLen) must be >= 32 (the hash assertion compares a 32-byte SHA-256); got {n}"
+                        )
+                    if n > 4 * 1024 * 1024:
+                        self._add_error(
+                            f"extractPrevOutputScript() argument 3 (prefixLen) must be <= MAX_SCRIPT_BYTES (4 MiB); got {n}"
+                        )
+                self._infer_expr_type(args[2], env)
             return sig.return_type
+
+        # requireOutputP2PKH and currentBlockHeight need the auto-injected
+        # txPreimage -- only available in StatefulSmartContract methods.
+        if func_name in ("requireOutputP2PKH", "currentBlockHeight"):
+            if self.contract is not None and self.contract.parent_class != "StatefulSmartContract":
+                self._add_error(
+                    f"{func_name}() is only available in StatefulSmartContract methods"
+                )
 
         # Standard arg count check
         if len(args) != len(sig.params):
@@ -757,6 +978,10 @@ class _TypeChecker:
         args: list[Expression],
         env: _TypeEnv,
     ) -> None:
+        """Track consumption by *origin*, not variable name, so aliases
+        (`const again = sig`) and property accesses (`this.sig`) cannot
+        launder a double-consumption past the affine check.
+        2026-04-30 audit finding F6."""
         consumed_indices = _CONSUMING_FUNCTIONS.get(func_name)
         if consumed_indices is None:
             return
@@ -766,19 +991,47 @@ class _TypeChecker:
                 continue
 
             arg = args[param_index]
-            if not isinstance(arg, Identifier):
+            arg_type = self._affine_expr_type(arg, env)
+            if arg_type is None or arg_type not in _AFFINE_TYPES:
                 continue
 
-            arg_type, found = env.lookup(arg.name)
-            if not found or arg_type not in _AFFINE_TYPES:
+            origin = self._affine_origin_of_expr(arg)
+            if origin is None:
                 continue
 
-            if self.consumed_values.get(arg.name, False):
+            # Render a short label (source-form) for the diagnostic.
+            if isinstance(arg, Identifier):
+                label = arg.name
+            elif isinstance(arg, PropertyAccessExpr):
+                label = f"this.{arg.property}"
+            else:
+                label = origin
+
+            if self.consumed_values.get(origin, False):
                 self._add_error(
-                    f"affine value '{arg.name}' has already been consumed"
+                    f"affine value '{label}' has already been consumed"
                 )
             else:
-                self.consumed_values[arg.name] = True
+                self.consumed_values[origin] = True
+
+    def _affine_origin_of_expr(self, expr: Expression) -> str | None:
+        """Resolve the canonical affine origin for an expression.
+        Identifiers consult the alias map; property accesses use a
+        ``prop:<name>`` namespace."""
+        if isinstance(expr, Identifier):
+            return self.affine_aliases.get(expr.name, expr.name)
+        if isinstance(expr, PropertyAccessExpr):
+            return f"prop:{expr.property}"
+        return None
+
+    def _affine_expr_type(self, expr: Expression, env: _TypeEnv) -> str | None:
+        """Look up the type of an expression for affine purposes."""
+        if isinstance(expr, Identifier):
+            arg_type, found = env.lookup(expr.name)
+            return arg_type if found else None
+        if isinstance(expr, PropertyAccessExpr):
+            return self.prop_types.get(expr.property)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -860,6 +1113,9 @@ def _infer_expr_type_static(expr: Expression | None) -> str:
 
     if isinstance(expr, CallExpr):
         if isinstance(expr.callee, Identifier):
+            # Expression-form asm<T>({...}) statically yields type T.
+            if expr.callee.name == "asm" and expr.asm_return_type:
+                return expr.asm_return_type
             sig = BUILTIN_FUNCTIONS.get(expr.callee.name)
             if sig is not None:
                 return sig.return_type
@@ -904,3 +1160,162 @@ def _stmt_source_location(stmt: Statement) -> SourceLocation | None:
     if loc is not None and (loc.file or loc.line > 0):
         return loc
     return None
+
+
+# ---------------------------------------------------------------------------
+# Recursive call-site walkers (Crit-3: requireOutputP2PKH + addDataOutput mix)
+# ---------------------------------------------------------------------------
+
+def _body_calls_builtin(body: list[Statement], name: str) -> bool:
+    """Return True if any statement in *body* (recursively) contains a
+    top-level call expression to a builtin identifier named *name*."""
+    for stmt in body:
+        if _stmt_contains_call_to(stmt, name):
+            return True
+    return False
+
+
+def _body_calls_add_data_output(body: list[Statement]) -> bool:
+    """Return True if any statement in *body* (recursively) contains a call
+    to ``this.addDataOutput(...)`` or ``c.addDataOutput(...)`` — matched by
+    the ``addDataOutput`` property on a PropertyAccessExpr or MemberExpr
+    callee."""
+    for stmt in body:
+        if _stmt_contains_add_data_output(stmt):
+            return True
+    return False
+
+
+def _stmt_contains_call_to(stmt: Statement, name: str) -> bool:
+    if isinstance(stmt, ExpressionStmt):
+        return _expr_contains_call_to(stmt.expr, name)
+    if isinstance(stmt, VariableDeclStmt):
+        return _expr_contains_call_to(stmt.init, name)
+    if isinstance(stmt, AssignmentStmt):
+        return (
+            _expr_contains_call_to(stmt.value, name)
+            or _expr_contains_call_to(stmt.target, name)
+        )
+    if isinstance(stmt, IfStmt):
+        if _expr_contains_call_to(stmt.condition, name):
+            return True
+        for t in stmt.then:
+            if _stmt_contains_call_to(t, name):
+                return True
+        for e in stmt.else_:
+            if _stmt_contains_call_to(e, name):
+                return True
+        return False
+    if isinstance(stmt, ForStmt):
+        for t in stmt.body:
+            if _stmt_contains_call_to(t, name):
+                return True
+        return False
+    if isinstance(stmt, ReturnStmt):
+        if stmt.value is not None:
+            return _expr_contains_call_to(stmt.value, name)
+    return False
+
+
+def _expr_contains_call_to(expr: Expression | None, name: str) -> bool:
+    if expr is None:
+        return False
+    if isinstance(expr, CallExpr):
+        if isinstance(expr.callee, Identifier) and expr.callee.name == name:
+            return True
+        for a in expr.args:
+            if _expr_contains_call_to(a, name):
+                return True
+        return False
+    if isinstance(expr, BinaryExpr):
+        return (
+            _expr_contains_call_to(expr.left, name)
+            or _expr_contains_call_to(expr.right, name)
+        )
+    if isinstance(expr, UnaryExpr):
+        return _expr_contains_call_to(expr.operand, name)
+    if isinstance(expr, TernaryExpr):
+        return (
+            _expr_contains_call_to(expr.condition, name)
+            or _expr_contains_call_to(expr.consequent, name)
+            or _expr_contains_call_to(expr.alternate, name)
+        )
+    if isinstance(expr, IndexAccessExpr):
+        return (
+            _expr_contains_call_to(expr.object, name)
+            or _expr_contains_call_to(expr.index, name)
+        )
+    if isinstance(expr, ArrayLiteralExpr):
+        for el in expr.elements:
+            if _expr_contains_call_to(el, name):
+                return True
+    return False
+
+
+def _stmt_contains_add_data_output(stmt: Statement) -> bool:
+    if isinstance(stmt, ExpressionStmt):
+        return _expr_contains_add_data_output(stmt.expr)
+    if isinstance(stmt, VariableDeclStmt):
+        return _expr_contains_add_data_output(stmt.init)
+    if isinstance(stmt, AssignmentStmt):
+        return (
+            _expr_contains_add_data_output(stmt.value)
+            or _expr_contains_add_data_output(stmt.target)
+        )
+    if isinstance(stmt, IfStmt):
+        if _expr_contains_add_data_output(stmt.condition):
+            return True
+        for t in stmt.then:
+            if _stmt_contains_add_data_output(t):
+                return True
+        for e in stmt.else_:
+            if _stmt_contains_add_data_output(e):
+                return True
+        return False
+    if isinstance(stmt, ForStmt):
+        for t in stmt.body:
+            if _stmt_contains_add_data_output(t):
+                return True
+        return False
+    if isinstance(stmt, ReturnStmt):
+        if stmt.value is not None:
+            return _expr_contains_add_data_output(stmt.value)
+    return False
+
+
+def _expr_contains_add_data_output(expr: Expression | None) -> bool:
+    if expr is None:
+        return False
+    if isinstance(expr, CallExpr):
+        callee = expr.callee
+        if isinstance(callee, PropertyAccessExpr) and callee.property == "addDataOutput":
+            return True
+        if isinstance(callee, MemberExpr) and callee.property == "addDataOutput":
+            return True
+        for a in expr.args:
+            if _expr_contains_add_data_output(a):
+                return True
+        return False
+    if isinstance(expr, BinaryExpr):
+        return (
+            _expr_contains_add_data_output(expr.left)
+            or _expr_contains_add_data_output(expr.right)
+        )
+    if isinstance(expr, UnaryExpr):
+        return _expr_contains_add_data_output(expr.operand)
+    if isinstance(expr, TernaryExpr):
+        return (
+            _expr_contains_add_data_output(expr.condition)
+            or _expr_contains_add_data_output(expr.consequent)
+            or _expr_contains_add_data_output(expr.alternate)
+        )
+    if isinstance(expr, IndexAccessExpr):
+        return (
+            _expr_contains_add_data_output(expr.object)
+            or _expr_contains_add_data_output(expr.index)
+        )
+    if isinstance(expr, ArrayLiteralExpr):
+        for el in expr.elements:
+            if _expr_contains_add_data_output(el):
+                return True
+    return False

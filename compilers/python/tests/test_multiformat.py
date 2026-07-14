@@ -19,22 +19,43 @@ from runar_compiler.frontend.anf_lower import lower_to_anf
 from conftest import conformance_dir
 
 
-def _read_source(test_name: str, ext: str) -> str | None:
-    """Read a conformance test source file, returning None if not found."""
+def _resolve_source(test_name: str, ext: str) -> Path | None:
+    """Resolve the source-file path for a conformance test+extension.
+
+    Tries the legacy in-tree layout (conformance/tests/<name>/<name><ext>)
+    first, then falls back to source.json indirection used by post-migration
+    fixtures that point into examples/.
+    """
     source_dir = conformance_dir() / test_name
+    if not source_dir.is_dir():
+        return None
+    # Legacy in-tree
     for f in source_dir.iterdir():
         if f.name.endswith(ext):
-            return f.read_text(encoding="utf-8")
-    return None
+            return f
+    # source.json indirection
+    manifest_path = source_dir / "source.json"
+    if not manifest_path.exists():
+        return None
+    import json
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ref = manifest.get("sources", {}).get(ext)
+    if ref is None:
+        return None
+    resolved = (source_dir / ref).resolve()
+    return resolved if resolved.exists() else None
+
+
+def _read_source(test_name: str, ext: str) -> str | None:
+    """Read a conformance test source file, returning None if not found."""
+    resolved = _resolve_source(test_name, ext)
+    return resolved.read_text(encoding="utf-8") if resolved is not None else None
 
 
 def _file_name(test_name: str, ext: str) -> str | None:
     """Get the file name for a conformance test source."""
-    source_dir = conformance_dir() / test_name
-    for f in source_dir.iterdir():
-        if f.name.endswith(ext):
-            return f.name
-    return None
+    resolved = _resolve_source(test_name, ext)
+    return resolved.name if resolved is not None else None
 
 
 def _parse_and_lower(test_name: str, ext: str):
@@ -300,7 +321,7 @@ class TestFormatSpecificParsing:
     def test_parse_ruby_post_quantum_wots(self):
         program = _parse_and_lower("post-quantum-wots", ".runar.rb")
 
-        assert program.contract_name == "PostQuantumWOTS"
+        assert program.contract_name == "PostQuantumWOTSNaiveInsecure"
         spend = [m for m in program.methods if m.name == "spend"][0]
         # verifyWOTS should appear in the ANF bindings (``call`` nodes have a ``func`` field)
         funcs = [b.value.func for b in spend.body if b.value.kind == "call"]
@@ -309,7 +330,7 @@ class TestFormatSpecificParsing:
     def test_parse_ruby_post_quantum_slhdsa(self):
         program = _parse_and_lower("post-quantum-slhdsa", ".runar.rb")
 
-        assert program.contract_name == "PostQuantumSLHDSA"
+        assert program.contract_name == "PostQuantumSLHDSANaiveInsecure"
         spend = [m for m in program.methods if m.name == "spend"][0]
         funcs = [b.value.func for b in spend.body if b.value.kind == "call"]
         assert "verifySLHDSA_SHA2_128s" in funcs

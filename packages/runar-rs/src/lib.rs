@@ -8,8 +8,11 @@
 //! use runar::prelude::*;
 //! ```
 
+pub mod analyzer;
 pub mod ec;
 pub mod ecdsa;
+pub mod p256;
+pub mod p384;
 pub mod prelude;
 pub mod rabin;
 pub mod sdk;
@@ -18,7 +21,7 @@ pub mod test_keys;
 pub mod wots;
 
 // Re-export proc-macro attributes so `#[runar::contract]` works.
-pub use runar_lang_macros::{contract, methods, public, stateful_contract};
+pub use runar_lang_macros::{contract, stateful_contract};
 
 /// Runs the Rúnar frontend (parse → validate → typecheck) on a `.runar.rs`
 /// source string. Returns `Ok(())` if the contract is valid Rúnar, or an
@@ -50,6 +53,14 @@ pub fn compile_check(source: &str, file_name: &str) -> Result<(), String> {
     let tc = runar_compiler_rust::frontend::typecheck::typecheck(&contract);
     if !tc.errors.is_empty() {
         return Err(format!("type check errors: {}", tc.error_strings().join("; ")));
+    }
+
+    // Pass 3b: expand fixed arrays (also runs in compile pipeline).
+    let expand =
+        runar_compiler_rust::frontend::expand_fixed_arrays::expand_fixed_arrays(&contract);
+    if !expand.errors.is_empty() {
+        let msgs: Vec<String> = expand.errors.iter().map(|e| e.format_message()).collect();
+        return Err(format!("expand-fixed-arrays errors: {}", msgs.join("; ")));
     }
 
     Ok(())

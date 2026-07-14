@@ -15,14 +15,16 @@ func TestMain(m *testing.M) {
 	fmt.Fprintf(os.Stderr, "Integration tests using node type: %s\n", nodeType)
 
 	if !helpers.IsNodeAvailable() {
-		fmt.Fprintln(os.Stderr, "Regtest node not running. Skipping integration tests.")
+		fmt.Fprintln(os.Stderr, "Regtest node not running. Integration tests require a live node.")
 		if helpers.IsTeranode() {
 			fmt.Fprintln(os.Stderr, "Start with: cd integration && ./teranode.sh start")
 		} else {
 			fmt.Fprintln(os.Stderr, "Start with: cd integration && ./regtest.sh start")
 		}
-		os.Exit(0)
+		os.Exit(1)
 	}
+
+	helpers.EnsureRegtest()
 
 	// Mine initial blocks so coinbase UTXOs mature (100 block maturity).
 	// On Teranode regtest, GenesisActivationHeight=10000 (hardcoded in go-chaincfg),
@@ -34,7 +36,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	targetHeight := 101 // SV Node: genesis at height 1
+	targetHeight := 501 // SV Node: genesis at height 1, extra headroom for parallel tests
 	if helpers.IsTeranode() {
 		targetHeight = 10_101 // regtest genesis at 10000 + 101 for coinbase maturity
 	}

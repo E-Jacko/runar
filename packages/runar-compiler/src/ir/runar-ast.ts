@@ -33,6 +33,8 @@ export type PrimitiveTypeName =
   | 'RabinSig'
   | 'RabinPubKey'
   | 'Point'
+  | 'P256Point'
+  | 'P384Point'
   | 'void';
 
 export interface PrimitiveTypeNode {
@@ -60,7 +62,7 @@ export type TypeNode = PrimitiveTypeNode | FixedArrayTypeNode | CustomTypeNode;
 export interface ContractNode {
   kind: 'contract';
   name: string;
-  parentClass: 'SmartContract' | 'StatefulSmartContract';
+  parentClass: 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract';
   properties: PropertyNode[];
   constructor: MethodNode;
   methods: MethodNode[];
@@ -73,7 +75,46 @@ export interface PropertyNode {
   type: TypeNode;
   readonly: boolean;
   initializer?: Expression;
+  /**
+   * Set by the parser when a `/** @embedAlways *\/` (or `// @embedAlways`)
+   * comment directive immediately precedes a readonly field declaration
+   * (issue #109). It opts the field OUT of dead-code elimination: a
+   * readonly field no method references is normally stripped from the
+   * locking script (its `load_prop` is dead, so no constructor slot is
+   * emitted), silently removing deploy-time metadata an author intends to
+   * recover from the on-chain script later. When set, the compiler forces
+   * the field into the script (a constructor slot) so its bytes survive.
+   * Comment-directive form (not a decorator) keeps it portable across all
+   * nine surface formats. Only meaningful on readonly fields.
+   */
+  embedAlways?: boolean;
   sourceLocation: SourceLocation;
+  /**
+   * Set by pass 3b (`expand-fixed-arrays`) on every scalar sibling
+   * produced from a `FixedArray<T, N>` property expansion. The chain
+   * records the full nesting of FixedArray levels this scalar came
+   * from: element `[0]` is the OUTERMOST level (the user-declared
+   * property name), and the last element is the INNERMOST. For a
+   * flat `FixedArray<bigint, 9>` property `Board`, each leaf has a
+   * one-element chain `[{base: "Board", index: i, length: 9}]`. For
+   * a nested `FixedArray<FixedArray<bigint, 2>, 2>` property `Grid`,
+   * leaf `Grid__0__1` has chain
+   * `[{base: "Grid", index: 0, length: 2}, {base: "Grid__0", index: 1, length: 2}]`.
+   *
+   * Downstream passes use this marker to re-group the expanded
+   * siblings back into a nested FixedArray entry on the ABI /
+   * state-field list via an iterative, innermost-first pass.
+   *
+   * Only compiler-synthesised properties carry this marker — a
+   * hand-written contract with literal `foo__0 / foo__1` property
+   * names will NOT have it set, so the regrouper leaves those as
+   * independent scalars.
+   */
+  __syntheticArrayChain?: ReadonlyArray<{
+    base: string;
+    index: number;
+    length: number;
+  }>;
 }
 
 export interface MethodNode {
@@ -82,6 +123,14 @@ export interface MethodNode {
   params: ParamNode[];
   body: Statement[];
   visibility: 'public' | 'private';
+  /**
+   * Issue #123: the BIP-143 sighash type declared via a `/** @sighash <FLAGS> *\/`
+   * directive on a public method (e.g. `0x43` for SINGLE|FORKID). Absent = the
+   * default `ALL|FORKID` (0x41), byte-identical to the historically-pinned mode.
+   * Drives the auto-injected preimage-type assert, the OP_PUSH_TX binding flag,
+   * the ABI `sigHashType`, and the SDK-side preimage/signature construction.
+   */
+  sighashType?: number;
   sourceLocation: SourceLocation;
 }
 
@@ -194,6 +243,18 @@ export interface CallExpr {
   callee: Expression;
   args: Expression[];
   sourceLocation?: SourceLocation;
+  /**
+   * Only set on the synthetic `call_expr` that the parser emits for the
+   * expression-form `asm<T>({...})` intrinsic. `T` must be one of the
+   * primitive value types (`bigint`, `boolean`, `ByteString`); other
+   * type arguments are rejected by the parser.
+   *
+   * When set, the typechecker treats the call as producing a value of
+   * this type instead of `void`, and the validator skips the
+   * "terminal-truthy asm" check for occurrences of the call in mid-
+   * method position (since the value is consumed by a let-binding).
+   */
+  asmReturnType?: PrimitiveTypeName;
 }
 
 export interface MemberExpr {

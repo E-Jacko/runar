@@ -1,0 +1,902 @@
+{
+  "contractName": "StackTrackerReproV10min",
+  "methods": [
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "args": [],
+            "func": "super",
+            "kind": "call"
+          }
+        }
+      ],
+      "isPublic": false,
+      "name": "constructor",
+      "params": []
+    },
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "kind": "load_const",
+            "value": 46
+          }
+        },
+        {
+          "name": "p",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t0"
+          }
+        },
+        {
+          "name": "t1",
+          "value": {
+            "kind": "load_param",
+            "name": "rawTx"
+          }
+        },
+        {
+          "name": "t2",
+          "value": {
+            "kind": "load_const",
+            "value": 1
+          }
+        },
+        {
+          "name": "t3",
+          "value": {
+            "args": [
+              "t1",
+              "p",
+              "t2"
+            ],
+            "func": "substr",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t4",
+          "value": {
+            "kind": "load_const",
+            "value": 0
+          }
+        },
+        {
+          "name": "t5",
+          "value": {
+            "kind": "load_const",
+            "value": 1
+          }
+        },
+        {
+          "name": "t6",
+          "value": {
+            "args": [
+              "t4",
+              "t5"
+            ],
+            "func": "num2bin",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t7",
+          "value": {
+            "args": [
+              "t3",
+              "t6"
+            ],
+            "func": "cat",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "t8",
+          "value": {
+            "args": [
+              "t7"
+            ],
+            "func": "bin2num",
+            "kind": "call"
+          }
+        },
+        {
+          "name": "outCount",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t8"
+          }
+        },
+        {
+          "name": "t9",
+          "value": {
+            "kind": "load_const",
+            "value": 253
+          }
+        },
+        {
+          "name": "t10",
+          "value": {
+            "kind": "bin_op",
+            "left": "outCount",
+            "op": "<",
+            "right": "t9"
+          }
+        },
+        {
+          "name": "t11",
+          "value": {
+            "kind": "assert",
+            "value": "t10"
+          }
+        },
+        {
+          "name": "t12",
+          "value": {
+            "kind": "load_const",
+            "value": 8
+          }
+        },
+        {
+          "name": "t13",
+          "value": {
+            "kind": "bin_op",
+            "left": "outCount",
+            "op": "<=",
+            "right": "t12"
+          }
+        },
+        {
+          "name": "t14",
+          "value": {
+            "kind": "assert",
+            "value": "t13"
+          }
+        },
+        {
+          "name": "t15",
+          "value": {
+            "kind": "load_const",
+            "value": 1
+          }
+        },
+        {
+          "name": "t16",
+          "value": {
+            "kind": "bin_op",
+            "left": "p",
+            "op": "+",
+            "right": "t15"
+          }
+        },
+        {
+          "name": "p",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t16"
+          }
+        },
+        {
+          "name": "t17",
+          "value": {
+            "kind": "load_const",
+            "value": false
+          }
+        },
+        {
+          "name": "foundMnee",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t17"
+          }
+        },
+        {
+          "name": "t18",
+          "value": {
+            "kind": "load_const",
+            "value": false
+          }
+        },
+        {
+          "name": "foundExtra",
+          "value": {
+            "kind": "load_const",
+            "value": "@ref:t18"
+          }
+        },
+        {
+          "name": "t19",
+          "value": {
+            "kind": "load_const",
+            "value": 0
+          }
+        },
+        {
+          "name": "t20",
+          "value": {
+            "kind": "bin_op",
+            "left": "t19",
+            "op": "<",
+            "right": "outCount"
+          }
+        },
+        {
+          "name": "t49",
+          "value": {
+            "cond": "t20",
+            "else": [],
+            "kind": "if",
+            "then": [
+              {
+                "name": "t21",
+                "value": {
+                  "kind": "load_param",
+                  "name": "rawTx"
+                }
+              },
+              {
+                "name": "t22",
+                "value": {
+                  "kind": "load_const",
+                  "value": 8
+                }
+              },
+              {
+                "name": "t23",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "p",
+                  "op": "+",
+                  "right": "t22"
+                }
+              },
+              {
+                "name": "t24",
+                "value": {
+                  "kind": "load_const",
+                  "value": 1
+                }
+              },
+              {
+                "name": "t25",
+                "value": {
+                  "args": [
+                    "t21",
+                    "t23",
+                    "t24"
+                  ],
+                  "func": "substr",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "t26",
+                "value": {
+                  "kind": "load_const",
+                  "value": 0
+                }
+              },
+              {
+                "name": "t27",
+                "value": {
+                  "kind": "load_const",
+                  "value": 1
+                }
+              },
+              {
+                "name": "t28",
+                "value": {
+                  "args": [
+                    "t26",
+                    "t27"
+                  ],
+                  "func": "num2bin",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "t29",
+                "value": {
+                  "args": [
+                    "t25",
+                    "t28"
+                  ],
+                  "func": "cat",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "t30",
+                "value": {
+                  "args": [
+                    "t29"
+                  ],
+                  "func": "bin2num",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "scriptLen",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t30"
+                }
+              },
+              {
+                "name": "t31",
+                "value": {
+                  "kind": "load_const",
+                  "value": 253
+                }
+              },
+              {
+                "name": "t32",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "scriptLen",
+                  "op": "<",
+                  "right": "t31"
+                }
+              },
+              {
+                "name": "t33",
+                "value": {
+                  "kind": "assert",
+                  "value": "t32"
+                }
+              },
+              {
+                "name": "t34",
+                "value": {
+                  "kind": "load_const",
+                  "value": 8
+                }
+              },
+              {
+                "name": "t35",
+                "value": {
+                  "kind": "load_const",
+                  "value": 1
+                }
+              },
+              {
+                "name": "t36",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "t34",
+                  "op": "+",
+                  "right": "t35"
+                }
+              },
+              {
+                "name": "t37",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "t36",
+                  "op": "+",
+                  "right": "scriptLen"
+                }
+              },
+              {
+                "name": "blobLen",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t37"
+                }
+              },
+              {
+                "name": "t38",
+                "value": {
+                  "kind": "load_param",
+                  "name": "rawTx"
+                }
+              },
+              {
+                "name": "t39",
+                "value": {
+                  "args": [
+                    "t38",
+                    "p",
+                    "blobLen"
+                  ],
+                  "func": "substr",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "blob",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t39"
+                }
+              },
+              {
+                "name": "t40",
+                "value": {
+                  "kind": "load_param",
+                  "name": "expectedMneeOutputBytes"
+                }
+              },
+              {
+                "name": "t41",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "blob",
+                  "op": "===",
+                  "result_type": "bytes",
+                  "right": "t40"
+                }
+              },
+              {
+                "name": "t43",
+                "value": {
+                  "cond": "t41",
+                  "else": [],
+                  "kind": "if",
+                  "then": [
+                    {
+                      "name": "t42",
+                      "value": {
+                        "kind": "load_const",
+                        "value": true
+                      }
+                    },
+                    {
+                      "name": "foundMnee",
+                      "value": {
+                        "kind": "load_const",
+                        "value": "@ref:t42"
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "t44",
+                "value": {
+                  "kind": "load_param",
+                  "name": "expectedExtraDataOutputBytes"
+                }
+              },
+              {
+                "name": "t45",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "blob",
+                  "op": "===",
+                  "result_type": "bytes",
+                  "right": "t44"
+                }
+              },
+              {
+                "name": "t47",
+                "value": {
+                  "cond": "t45",
+                  "else": [],
+                  "kind": "if",
+                  "then": [
+                    {
+                      "name": "t46",
+                      "value": {
+                        "kind": "load_const",
+                        "value": true
+                      }
+                    },
+                    {
+                      "name": "foundExtra",
+                      "value": {
+                        "kind": "load_const",
+                        "value": "@ref:t46"
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "t48",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "p",
+                  "op": "+",
+                  "right": "blobLen"
+                }
+              },
+              {
+                "name": "p",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t48"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "t50",
+          "value": {
+            "kind": "load_const",
+            "value": 1
+          }
+        },
+        {
+          "name": "t51",
+          "value": {
+            "kind": "bin_op",
+            "left": "t50",
+            "op": "<",
+            "right": "outCount"
+          }
+        },
+        {
+          "name": "t80",
+          "value": {
+            "cond": "t51",
+            "else": [],
+            "kind": "if",
+            "then": [
+              {
+                "name": "t52",
+                "value": {
+                  "kind": "load_param",
+                  "name": "rawTx"
+                }
+              },
+              {
+                "name": "t53",
+                "value": {
+                  "kind": "load_const",
+                  "value": 8
+                }
+              },
+              {
+                "name": "t54",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "p",
+                  "op": "+",
+                  "right": "t53"
+                }
+              },
+              {
+                "name": "t55",
+                "value": {
+                  "kind": "load_const",
+                  "value": 1
+                }
+              },
+              {
+                "name": "t56",
+                "value": {
+                  "args": [
+                    "t52",
+                    "t54",
+                    "t55"
+                  ],
+                  "func": "substr",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "t57",
+                "value": {
+                  "kind": "load_const",
+                  "value": 0
+                }
+              },
+              {
+                "name": "t58",
+                "value": {
+                  "kind": "load_const",
+                  "value": 1
+                }
+              },
+              {
+                "name": "t59",
+                "value": {
+                  "args": [
+                    "t57",
+                    "t58"
+                  ],
+                  "func": "num2bin",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "t60",
+                "value": {
+                  "args": [
+                    "t56",
+                    "t59"
+                  ],
+                  "func": "cat",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "t61",
+                "value": {
+                  "args": [
+                    "t60"
+                  ],
+                  "func": "bin2num",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "scriptLen",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t61"
+                }
+              },
+              {
+                "name": "t62",
+                "value": {
+                  "kind": "load_const",
+                  "value": 253
+                }
+              },
+              {
+                "name": "t63",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "scriptLen",
+                  "op": "<",
+                  "right": "t62"
+                }
+              },
+              {
+                "name": "t64",
+                "value": {
+                  "kind": "assert",
+                  "value": "t63"
+                }
+              },
+              {
+                "name": "t65",
+                "value": {
+                  "kind": "load_const",
+                  "value": 8
+                }
+              },
+              {
+                "name": "t66",
+                "value": {
+                  "kind": "load_const",
+                  "value": 1
+                }
+              },
+              {
+                "name": "t67",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "t65",
+                  "op": "+",
+                  "right": "t66"
+                }
+              },
+              {
+                "name": "t68",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "t67",
+                  "op": "+",
+                  "right": "scriptLen"
+                }
+              },
+              {
+                "name": "blobLen",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t68"
+                }
+              },
+              {
+                "name": "t69",
+                "value": {
+                  "kind": "load_param",
+                  "name": "rawTx"
+                }
+              },
+              {
+                "name": "t70",
+                "value": {
+                  "args": [
+                    "t69",
+                    "p",
+                    "blobLen"
+                  ],
+                  "func": "substr",
+                  "kind": "call"
+                }
+              },
+              {
+                "name": "blob",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t70"
+                }
+              },
+              {
+                "name": "t71",
+                "value": {
+                  "kind": "load_param",
+                  "name": "expectedMneeOutputBytes"
+                }
+              },
+              {
+                "name": "t72",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "blob",
+                  "op": "===",
+                  "result_type": "bytes",
+                  "right": "t71"
+                }
+              },
+              {
+                "name": "t74",
+                "value": {
+                  "cond": "t72",
+                  "else": [],
+                  "kind": "if",
+                  "then": [
+                    {
+                      "name": "t73",
+                      "value": {
+                        "kind": "load_const",
+                        "value": true
+                      }
+                    },
+                    {
+                      "name": "foundMnee",
+                      "value": {
+                        "kind": "load_const",
+                        "value": "@ref:t73"
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "t75",
+                "value": {
+                  "kind": "load_param",
+                  "name": "expectedExtraDataOutputBytes"
+                }
+              },
+              {
+                "name": "t76",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "blob",
+                  "op": "===",
+                  "result_type": "bytes",
+                  "right": "t75"
+                }
+              },
+              {
+                "name": "t78",
+                "value": {
+                  "cond": "t76",
+                  "else": [],
+                  "kind": "if",
+                  "then": [
+                    {
+                      "name": "t77",
+                      "value": {
+                        "kind": "load_const",
+                        "value": true
+                      }
+                    },
+                    {
+                      "name": "foundExtra",
+                      "value": {
+                        "kind": "load_const",
+                        "value": "@ref:t77"
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "t79",
+                "value": {
+                  "kind": "bin_op",
+                  "left": "p",
+                  "op": "+",
+                  "right": "blobLen"
+                }
+              },
+              {
+                "name": "p",
+                "value": {
+                  "kind": "load_const",
+                  "value": "@ref:t79"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "t81",
+          "value": {
+            "kind": "assert",
+            "value": "foundMnee"
+          }
+        },
+        {
+          "name": "t82",
+          "value": {
+            "kind": "assert",
+            "value": "foundExtra"
+          }
+        }
+      ],
+      "isPublic": true,
+      "name": "verifyMneeTxContainsBothOutputs",
+      "params": [
+        {
+          "name": "rawTx",
+          "type": "ByteString"
+        },
+        {
+          "name": "expectedMneeOutputBytes",
+          "type": "ByteString"
+        },
+        {
+          "name": "expectedExtraDataOutputBytes",
+          "type": "ByteString"
+        }
+      ]
+    },
+    {
+      "body": [
+        {
+          "name": "t0",
+          "value": {
+            "kind": "load_param",
+            "name": "x"
+          }
+        },
+        {
+          "name": "t1",
+          "value": {
+            "kind": "load_param",
+            "name": "x"
+          }
+        },
+        {
+          "name": "t2",
+          "value": {
+            "kind": "bin_op",
+            "left": "t0",
+            "op": "===",
+            "result_type": "bytes",
+            "right": "t1"
+          }
+        },
+        {
+          "name": "t3",
+          "value": {
+            "kind": "assert",
+            "value": "t2"
+          }
+        }
+      ],
+      "isPublic": true,
+      "name": "other",
+      "params": [
+        {
+          "name": "x",
+          "type": "ByteString"
+        }
+      ]
+    }
+  ],
+  "properties": []
+}

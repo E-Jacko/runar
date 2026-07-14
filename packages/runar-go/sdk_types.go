@@ -1,5 +1,9 @@
 package runar
 
+import (
+	"github.com/icellan/runar/packages/runar-go/bn254witness"
+)
+
 // ---------------------------------------------------------------------------
 // SDK types for deploying and interacting with compiled Runar contracts on BSV
 // ---------------------------------------------------------------------------
@@ -26,7 +30,7 @@ type TransactionData struct {
 type TxInput struct {
 	Txid        string `json:"txid"`
 	OutputIndex int    `json:"outputIndex"`
-	Script      string `json:"script"`   // hex-encoded scriptSig
+	Script      string `json:"script"` // hex-encoded scriptSig
 	Sequence    uint32 `json:"sequence"`
 }
 
@@ -40,6 +44,12 @@ type TxOutput struct {
 type DeployOptions struct {
 	Satoshis      int64  `json:"satoshis"`
 	ChangeAddress string `json:"changeAddress,omitempty"`
+
+	// FundingSigner signs the P2PKH funding inputs (issue #134). When the
+	// funding UTXOs are owned by a different key than the connected deploy
+	// signer, set this so the funding inputs are signed by their real owner.
+	// nil → the connected signer (zero behaviour change).
+	FundingSigner Signer `json:"-"`
 }
 
 // CallOptions specifies options for calling a contract method.
@@ -76,6 +86,68 @@ type CallOptions struct {
 	// method calls. Enables terminal methods to receive additional funds
 	// when the contract's own balance is insufficient for outputs + fees.
 	FundingUtxos []UTXO `json:"fundingUtxos,omitempty"`
+
+	// Groth16WAWitness is the prover-supplied witness bundle for a Mode 3
+	// stateful contract whose method begins with a call to
+	// runar.AssertGroth16WitnessAssisted. When set, the SDK splices the
+	// witness's stack pushes into the unlocking script ON TOP of the
+	// regular ABI argument pushes (i.e., immediately before the method
+	// selector), so the verifier preamble in the locking script consumes
+	// them before the method body sees its declared parameters.
+	//
+	// nil for normal Rúnar contract calls. The witness is generated
+	// off-chain via bn254witness.GenerateWitness from a real Groth16
+	// proof + the same VK that was baked into the contract at compile
+	// time via CompileOptions.Groth16WAVKey.
+	Groth16WAWitness *bn254witness.Witness `json:"-"`
+
+	// DataOutputs is an optional explicit override for data outputs
+	// emitted via this.addDataOutput(...) in the method body. When nil,
+	// the SDK resolves data outputs automatically by running the ANF
+	// interpreter on the method body (the common case). Pass a non-nil
+	// slice to bypass the interpreter — useful when the caller already
+	// knows the exact (satoshis, script) pairs and does not want the SDK
+	// to re-derive them from method arguments.
+	DataOutputs []ContractOutput `json:"dataOutputs,omitempty"`
+
+	// Locktime overrides the call tx's nLockTime field. nil → SDK uses 0
+	// (legacy behavior, preserves existing contracts). Set for contracts that
+	// assert extractLocktime(preimage) >= deadline (e.g. auction close/claim).
+	// Threaded through both the non-terminal and terminal call-tx build sites.
+	Locktime *uint32 `json:"locktime,omitempty"`
+
+	// Sequence overrides the nSequence written onto EVERY input of the call tx
+	// (issue #131). Defaults are zero-config: when Locktime is set and non-zero,
+	// sequence defaults to 0xfffffffe (non-final, so consensus actually enforces
+	// nLockTime); otherwise it stays 0xffffffff (final, legacy). Set explicitly
+	// only for RBF or custom relative-locktime scenarios. Threaded through the
+	// non-terminal and terminal call-tx build sites.
+	Sequence *uint32 `json:"sequence,omitempty"`
+
+	// MaxFundingInputs caps the number of P2PKH funding inputs added to a
+	// non-terminal call tx (issue #133). Funding is chosen by smallest-
+	// sufficient, largest-first selection (the same SelectUtxos strategy deploy
+	// uses). If covering the outputs + fee would need more than this many
+	// inputs, the call fails loudly rather than silently sweeping the wallet.
+	// nil → no cap.
+	MaxFundingInputs *int `json:"maxFundingInputs,omitempty"`
+
+	// FundingSigner signs the P2PKH funding (and terminal fee) inputs (issue
+	// #134). When the funding/fee UTXOs are owned by a different key than the
+	// connected method signer, set this so those inputs are signed by their real
+	// owner. The method's own Sig args are still signed by the connected signer.
+	// nil → the connected signer (zero behaviour change).
+	FundingSigner Signer `json:"-"`
+
+	// FeeUtxo is a single plain P2PKH UTXO added to a terminal call tx purely to
+	// pay the miner fee (issue #118). A true terminal method pays out the full
+	// contract balance, so fee would be 0 and ARC rejects; the covenant asserts
+	// its exact output set, so no change output can absorb a fee. The fee input
+	// is added BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers
+	// it) and is consumed entirely as fee — no change output is created. Signed
+	// with FundingSigner ?? signer. The covenant's output assertions are
+	// untouched. nil → no fee input.
+	FeeUtxo *UTXO `json:"feeUtxo,omitempty"`
 }
 
 // TerminalOutput specifies an exact output for a terminal method call.
@@ -106,40 +178,89 @@ type PreparedCall struct {
 	resolvedArgs      []interface{}
 	methodSelectorHex string
 	isStateful        bool
-	isTerminal        bool
-	needsOpPushTx     bool
-	methodNeedsChange bool
-	changePKHHex      string
-	changeAmount      int64
+	// parentStateful is true when the contract extends StatefulSmartContract
+	// (from artifact ParentClass), independent of whether it has mutable
+	// state fields. Gates the issue-#42/#44 terminal sighash subscript trim.
+	parentStateful       bool
+	isTerminal           bool
+	needsOpPushTx        bool
+	methodNeedsChange    bool
+	methodUsesCodePart   bool
+	changePKHHex         string
+	changeAmount         int64
 	methodNeedsNewAmount bool
-	newAmount         int64
-	preimageIndex     int
-	contractUtxo      UTXO
-	newLockingScript  string
-	newSatoshis       int64
-	hasMultiOutput    bool
-	contractOutputs   []ContractOutput
-	codeSepIdx        int // adjusted OP_CODESEPARATOR byte offset, -1 if none
+	newAmount            int64
+	preimageIndex        int
+	contractUtxo         UTXO
+	newLockingScript     string
+	newSatoshis          int64
+	hasMultiOutput       bool
+	contractOutputs      []ContractOutput
+	codeSepIdx           int // adjusted OP_CODESEPARATOR byte offset, -1 if none
+
+	// Mode 3: pre-encoded witness-assisted Groth16 prover bundle hex,
+	// spliced into the unlock script BEFORE the stateful prefix so the
+	// witness items end up at the deepest stack positions (with q at
+	// the bottom). FinalizeCall must replay the same splice when it
+	// rebuilds the primary unlock from this PreparedCall, otherwise
+	// the witness ends up missing and the verifier preamble fails.
+	groth16WAWitnessHex string
+
+	// Pre-resolved intent-intrinsic witness hex (PUSHDATA-encoded
+	// `_prevOutScript_*` followed by `_serialisedOutputs`, ABI order).
+	// Empty when the method has no auto-injected intent params.
+	intentWitnessHex string
 }
 
 // ---------------------------------------------------------------------------
 // Artifact types (compiled contract output)
 // ---------------------------------------------------------------------------
 
+// Groth16WAMeta records metadata about a witness-assisted Groth16 verifier
+// artifact produced by the `runarc groth16-wa` compiler backend. Downstream
+// consumers can sanity-check NumPubInputs and VKDigest to confirm which VK
+// was baked into the script without having to re-derive anything from the
+// raw script bytes.
+type Groth16WAMeta struct {
+	// NumPubInputs is the number of public inputs the Groth16 circuit
+	// was parameterised with. Matches `vk.numPubInputs` from the input
+	// VK JSON.
+	NumPubInputs int `json:"numPubInputs"`
+
+	// VKDigest is the SHA-256 hex of the RAW bytes of the source VK JSON
+	// file (not a canonical form). It is a pure reproducibility marker:
+	// if two artifacts share a VKDigest, they were compiled from
+	// byte-identical VK files. It is NOT a cryptographic commitment to
+	// the VK semantics and should not be used for anything load-bearing.
+	VKDigest string `json:"vkDigest"`
+}
+
 // RunarArtifact is the compiled output of a Runar compiler.
 type RunarArtifact struct {
-	Version                string            `json:"version"`
-	CompilerVersion        string            `json:"compilerVersion"`
-	ContractName           string            `json:"contractName"`
-	ABI                    ABI               `json:"abi"`
-	Script                 string            `json:"script"`
-	ASM                    string            `json:"asm"`
-	StateFields            []StateField      `json:"stateFields,omitempty"`
-	ConstructorSlots       []ConstructorSlot `json:"constructorSlots,omitempty"`
-	BuildTimestamp         string            `json:"buildTimestamp"`
-	CodeSeparatorIndex     *int              `json:"codeSeparatorIndex,omitempty"`
-	CodeSeparatorIndices   []int             `json:"codeSeparatorIndices,omitempty"`
-	ANF                    *ANFProgram       `json:"anf,omitempty"`
+	Version         string `json:"version"`
+	CompilerVersion string `json:"compilerVersion"`
+	ContractName    string `json:"contractName"`
+	// ParentClass is the base class the source contract extends. It is the
+	// authoritative stateful signal for the issue-#42/#44 terminal sighash
+	// subscript trim: a StatefulSmartContract with zero mutable fields still
+	// needs the trim even though StateFields is empty. Older artifacts that
+	// predate this field leave it empty.
+	ParentClass          string             `json:"parentClass,omitempty"`
+	ABI                  ABI                `json:"abi"`
+	Script               string             `json:"script"`
+	ASM                  string             `json:"asm"`
+	StateFields          []StateField       `json:"stateFields,omitempty"`
+	ConstructorSlots     []ConstructorSlot  `json:"constructorSlots,omitempty"`
+	CodeSepIndexSlots    []CodeSepIndexSlot `json:"codeSepIndexSlots,omitempty"`
+	BuildTimestamp       string             `json:"buildTimestamp"`
+	CodeSeparatorIndex   *int               `json:"codeSeparatorIndex,omitempty"`
+	CodeSeparatorIndices []int              `json:"codeSeparatorIndices,omitempty"`
+	ANF                  *ANFProgram        `json:"anf,omitempty"`
+
+	// Groth16WA is populated only for artifacts produced by the
+	// `runarc groth16-wa` backend. Nil for normal Rúnar contract
+	// compilations.
+	Groth16WA *Groth16WAMeta `json:"groth16WA,omitempty"`
 }
 
 // ABI describes the contract's public interface.
@@ -159,20 +280,38 @@ type ABIMethod struct {
 	Params     []ABIParam `json:"params"`
 	IsPublic   bool       `json:"isPublic"`
 	IsTerminal *bool      `json:"isTerminal,omitempty"`
+	// UsesCodePart: unlocking script is prefixed with _codePart (issue #100).
+	UsesCodePart *bool `json:"usesCodePart,omitempty"`
+	// SigHashType: the BIP-143 sighash type this method's preimage is built
+	// under (from a @sighash directive, issue #123), e.g. 0x43 for
+	// SINGLE|FORKID. Absent = default ALL|FORKID (0x41).
+	SigHashType *int `json:"sigHashType,omitempty"`
+}
+
+// ABIFixedArray describes the fixed-array shape of a grouped ABI
+// parameter or state field. `ElementType` is the immediate child type
+// (possibly itself a nested `FixedArray<...>` string) and
+// `SyntheticNames` is the flat leaf list in declaration order.
+type ABIFixedArray struct {
+	ElementType    string   `json:"elementType"`
+	Length         int      `json:"length"`
+	SyntheticNames []string `json:"syntheticNames"`
 }
 
 // ABIParam describes a single parameter.
 type ABIParam struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name       string         `json:"name"`
+	Type       string         `json:"type"`
+	FixedArray *ABIFixedArray `json:"fixedArray,omitempty"`
 }
 
 // StateField describes a state field in a stateful contract.
 type StateField struct {
-	Name         string      `json:"name"`
-	Type         string      `json:"type"`
-	Index        int         `json:"index"`
-	InitialValue interface{} `json:"initialValue,omitempty"`
+	Name         string         `json:"name"`
+	Type         string         `json:"type"`
+	Index        int            `json:"index"`
+	InitialValue interface{}    `json:"initialValue,omitempty"`
+	FixedArray   *ABIFixedArray `json:"fixedArray,omitempty"`
 }
 
 // ConstructorSlot describes where a constructor parameter placeholder
@@ -180,4 +319,13 @@ type StateField struct {
 type ConstructorSlot struct {
 	ParamIndex int `json:"paramIndex"`
 	ByteOffset int `json:"byteOffset"`
+}
+
+// CodeSepIndexSlot describes where a codeSeparatorIndex placeholder (OP_0)
+// resides in the template script. The SDK substitutes these at deployment
+// time with the adjusted codeSeparatorIndex value that accounts for
+// constructor arg expansion.
+type CodeSepIndexSlot struct {
+	ByteOffset   int `json:"byteOffset"`
+	CodeSepIndex int `json:"codeSepIndex"`
 }

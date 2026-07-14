@@ -16,18 +16,19 @@ pub const RpcError = error{
 };
 
 fn rpcUrl() []const u8 {
-    return std.posix.getenv("RPC_URL") orelse "http://localhost:18332";
+    return std.testing.environ.getPosix("RPC_URL") orelse "http://localhost:18332";
 }
 
 fn rpcUser() []const u8 {
-    return std.posix.getenv("RPC_USER") orelse "bitcoin";
+    return std.testing.environ.getPosix("RPC_USER") orelse "bitcoin";
 }
 
 fn rpcPass() []const u8 {
-    return std.posix.getenv("RPC_PASS") orelse "bitcoin";
+    return std.testing.environ.getPosix("RPC_PASS") orelse "bitcoin";
 }
 
 /// Make a JSON-RPC 1.0 call to the Bitcoin node. Returns the raw "result" JSON string.
+/// Uses a temp file for the request body to avoid ARG_MAX limits on large transactions.
 pub fn rpcCall(allocator: std.mem.Allocator, method: []const u8, params_json: []const u8) ![]u8 {
     const body = try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"{s}\",\"params\":{s}}}", .{ method, params_json });
     defer allocator.free(body);
@@ -35,8 +36,26 @@ pub fn rpcCall(allocator: std.mem.Allocator, method: []const u8, params_json: []
     const user_pass = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ rpcUser(), rpcPass() });
     defer allocator.free(user_pass);
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    // Write body to a unique temp file to avoid ARG_MAX limits for large transactions.
+    // curl's @filename syntax reads the POST body from the file.
+    const io = std.testing.io;
+    var tmp_name_buf: [64]u8 = undefined;
+    const thread_id = std.Thread.getCurrentId();
+    const tmp_name_len = (std.fmt.bufPrint(&tmp_name_buf, "/tmp/runar_rpc_{d}.json", .{thread_id}) catch return RpcError.ConnectionFailed).len;
+    const tmp_path = tmp_name_buf[0..tmp_name_len];
+
+    var tmp_file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch return RpcError.ConnectionFailed;
+    tmp_file.writeStreamingAll(io, body) catch {
+        tmp_file.close(io);
+        return RpcError.ConnectionFailed;
+    };
+    tmp_file.close(io);
+    defer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+
+    const at_path = std.fmt.allocPrint(allocator, "@{s}", .{tmp_path}) catch return RpcError.ConnectionFailed;
+    defer allocator.free(at_path);
+
+    const result = std.process.run(allocator, io, .{
         .argv = &.{
             "curl",
             "-s",
@@ -49,9 +68,10 @@ pub fn rpcCall(allocator: std.mem.Allocator, method: []const u8, params_json: []
             "-H",
             "Content-Type: application/json",
             "-d",
-            body,
+            at_path,
             rpcUrl(),
         },
+        .stdout_limit = .limited(10 * 1024 * 1024),
     }) catch return RpcError.ConnectionFailed;
     defer {
         allocator.free(result.stdout);
@@ -77,7 +97,7 @@ fn extractJsonResult(allocator: std.mem.Allocator, response_body: []const u8) ![
             if (err_val == .object) {
                 if (err_val.object.get("message")) |msg| {
                     if (msg == .string) {
-                        std.log.err("RPC error: {s}", .{msg.string});
+                        std.log.warn("RPC error: {s}", .{msg.string});
                     }
                 }
             }
@@ -105,6 +125,19 @@ pub fn isNodeAvailable(allocator: std.mem.Allocator) bool {
     const result = rpcCall(allocator, "getblockchaininfo", "[]") catch return false;
     allocator.free(result);
     return true;
+}
+
+/// Hard-fail if the regtest node is not reachable. Call this at the start of
+/// every integration test so a missing node is a real failure rather than a
+/// silent pass. Matches the fail-fast behaviour of the Go / Python / Ruby /
+/// Rust / TypeScript integration suites.
+pub fn requireNodeAvailable(allocator: std.mem.Allocator) void {
+    if (!isNodeAvailable(allocator)) {
+        @panic(
+            "regtest node not available. Integration tests require a live node. " ++
+            "Start with: cd integration && ./regtest.sh start",
+        );
+    }
 }
 
 /// Get the current block height.
@@ -157,7 +190,12 @@ pub fn importAddress(allocator: std.mem.Allocator, address: []const u8) !void {
 }
 
 /// Broadcast a raw transaction hex. Returns the txid.
+///
+/// Logs a per-broadcast tx-size line to stderr in the shared integration
+/// format ("[runar-integration] tx broadcast: <N> bytes") so CI logs are
+/// scannable across all 7 language suites.
 pub fn sendRawTransaction(allocator: std.mem.Allocator, tx_hex: []const u8) ![]u8 {
+    std.debug.print("[runar-integration] tx broadcast: {d} bytes\n", .{tx_hex.len / 2});
     const params = try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{tx_hex});
     defer allocator.free(params);
     const result = try rpcCall(allocator, "sendrawtransaction", params);
@@ -231,9 +269,9 @@ pub const Wallet = struct {
 
 /// Generate a random ECDSA wallet for regtest.
 pub fn newWallet(allocator: std.mem.Allocator) !Wallet {
-    // Generate 32 random bytes for the private key
+    // Generate 32 random bytes for the private key using the test-context Io.
     var key_bytes: [32]u8 = undefined;
-    std.crypto.random.bytes(&key_bytes);
+    std.testing.io.random(&key_bytes);
 
     // Ensure the key is valid for secp256k1 (not zero, not >= order)
     key_bytes[0] &= 0x7f;

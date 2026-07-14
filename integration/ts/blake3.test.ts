@@ -23,7 +23,27 @@ const BLAKE3_IV = [
   0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
-const BLAKE3_IV_HEX = BLAKE3_IV.map(w => w.toString(16).padStart(8, '0')).join('');
+
+// hex string -> byte array
+function hexToBytes(hex: string): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < hex.length; i += 2) out.push(parseInt(hex.substring(i, i + 2), 16));
+  return out;
+}
+// read a little-endian 32-bit word from a byte array at offset `off`
+function leWord(bytes: number[], off: number): number {
+  return (bytes[off]! | (bytes[off + 1]! << 8) | (bytes[off + 2]! << 16) | (bytes[off + 3]! << 24)) >>> 0;
+}
+// emit a 32-bit word as little-endian hex (4 bytes, low byte first)
+function wordToLEHex(w: number): string {
+  const bytes = [w & 0xff, (w >>> 8) & 0xff, (w >>> 16) & 0xff, (w >>> 24) & 0xff];
+  return bytes.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Standard BLAKE3 (BUG-101): the IV is encoded as little-endian bytes, so each
+// 32-bit word is emitted low-byte-first (0x6a09e667 -> "67e6096a"). This yields
+// 67e6096a...19cde05b, NOT the big-endian 6a09e667... word order.
+const BLAKE3_IV_HEX = BLAKE3_IV.map(wordToLEHex).join('');
 const MSG_PERM = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
 function rotr32(x: number, n: number): number {
@@ -55,17 +75,23 @@ function blake3Round(state: number[], m: number[]): void {
   g(state, 2, 7, 8, 13, m[12]!, m[13]!);
   g(state, 3, 4, 9, 14, m[14]!, m[15]!);
 }
-function referenceBlake3Compress(cvHex: string, blockHex: string): string {
+// Standard BLAKE3 (BUG-101): chaining value + message words are loaded as
+// little-endian 32-bit words, the digest is stored little-endian, and blockLen
+// is the message-byte length (64 for a full block, the true length for
+// blake3Hash).
+function referenceBlake3Compress(cvHex: string, blockHex: string, blockLen: number): string {
+  const cvBytes = hexToBytes(cvHex);
+  const blockBytes = hexToBytes(blockHex);
   const cv: number[] = [];
-  for (let i = 0; i < 8; i++) cv.push(parseInt(cvHex.substring(i * 8, i * 8 + 8), 16));
+  for (let i = 0; i < 8; i++) cv.push(leWord(cvBytes, i * 4));
   const m: number[] = [];
-  for (let i = 0; i < 16; i++) m.push(parseInt(blockHex.substring(i * 8, i * 8 + 8), 16));
+  for (let i = 0; i < 16; i++) m.push(leWord(blockBytes, i * 4));
 
   const state: number[] = [
     cv[0]!, cv[1]!, cv[2]!, cv[3]!,
     cv[4]!, cv[5]!, cv[6]!, cv[7]!,
     BLAKE3_IV[0]!, BLAKE3_IV[1]!, BLAKE3_IV[2]!, BLAKE3_IV[3]!,
-    0, 0, 64, 11,
+    0, 0, blockLen, 11,
   ];
 
   let msg = [...m];
@@ -76,11 +102,12 @@ function referenceBlake3Compress(cvHex: string, blockHex: string): string {
 
   const output: number[] = [];
   for (let i = 0; i < 8; i++) output.push((state[i]! ^ state[i + 8]!) >>> 0);
-  return output.map(w => w.toString(16).padStart(8, '0')).join('');
+  return output.map(wordToLEHex).join('');
 }
 function referenceBlake3Hash(msgHex: string): string {
+  const blockLen = msgHex.length / 2;
   const padded = msgHex.padEnd(128, '0');
-  return referenceBlake3Compress(BLAKE3_IV_HEX, padded);
+  return referenceBlake3Compress(BLAKE3_IV_HEX, padded, blockLen);
 }
 
 // ---- Tests ----
@@ -107,7 +134,7 @@ class Blake3CompressEmpty extends SmartContract {
 }
 `;
       const block = '00'.repeat(64);
-      const expected = referenceBlake3Compress(BLAKE3_IV_HEX, block);
+      const expected = referenceBlake3Compress(BLAKE3_IV_HEX, block, 64);
 
       const artifact = compileSource(source, 'Blake3CompressEmpty.runar.ts');
       const contract = new RunarContract(artifact, [expected]);
@@ -145,7 +172,7 @@ class Blake3CompressAbc extends SmartContract {
 }
 `;
       const block = '616263' + '00'.repeat(61);
-      const expected = referenceBlake3Compress(BLAKE3_IV_HEX, block);
+      const expected = referenceBlake3Compress(BLAKE3_IV_HEX, block, 64);
 
       const artifact = compileSource(source, 'Blake3CompressAbc.runar.ts');
       const contract = new RunarContract(artifact, [expected]);
@@ -183,7 +210,7 @@ class Blake3CompressNonIV extends SmartContract {
 `;
       const customCV = 'deadbeef'.repeat(8);
       const block = 'ff'.repeat(64);
-      const expected = referenceBlake3Compress(customCV, block);
+      const expected = referenceBlake3Compress(customCV, block, 64);
 
       const artifact = compileSource(source, 'Blake3CompressNonIV.runar.ts');
       const contract = new RunarContract(artifact, [expected]);

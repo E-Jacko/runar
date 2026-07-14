@@ -1,0 +1,1480 @@
+import RunarVerification.Stack.Syntax
+import RunarVerification.Stack.NumEncoding
+import RunarVerification.ANF.Eval
+
+/-!
+# Stack IR — Big-step evaluation
+
+A big-step semantics for Stack programs operating on `RunarVerification.ANF.Eval.Value`s.
+
+The semantics is designed to make the simulation theorem in `Sim.lean`
+straightforward: every primitive opcode either manipulates the stack
+typewise (`dup`, `swap`, …) or computes a concrete arithmetic / bytes
+operation. Cryptographic opcodes (`OP_SHA256`, `OP_CHECKSIG`, …)
+delegate to the existing assumptions and backend parameters in
+`RunarVerification.ANF.Eval.Crypto` so that the Stack VM and the ANF
+evaluator share a single trusted crypto base.
+
+**Scope.** The opcode dispatch covers exactly the ~52 opcodes the Rúnar
+emit pass can produce (see `06-emit.ts:20–123`). Any other opcode name
+returns `EvalError.unsupported`; this matches the user-confirmed
+"Rúnar-emitted subset" as the *semantic* scope even though the syntax
+captures the full BSV opcode set.
+-/
+
+namespace RunarVerification.Stack
+namespace Eval
+
+open RunarVerification.ANF.Eval (Value EvalError EvalResult Output)
+open RunarVerification.ANF.Eval.Crypto
+
+/-! ## VM state -/
+
+/--
+Stack VM state.
+
+* `stack`     — the main evaluation stack (head = top).
+* `altstack`  — auxiliary stack (`OP_TOALTSTACK` / `OP_FROMALTSTACK`).
+* `outputs`   — emitted `Output`s in canonical declaration order.
+* `props`     — contract property slots, used by `update_prop`-lowered ops.
+* `preimage`  — abstract BIP-143 preimage threaded for `OP_CHECKSIG` /
+                `OP_CHECKSIGVERIFY`; it defaults to empty until a
+                concrete transaction context is supplied.
+-/
+structure StackState where
+  stack    : List Value := []
+  altstack : List Value := []
+  outputs  : List Output := []
+  props    : List (String × Value) := []
+  preimage : ByteArray := ByteArray.empty
+  deriving Inhabited
+
+namespace StackState
+
+def push (s : StackState) (v : Value) : StackState :=
+  { s with stack := v :: s.stack }
+
+def pop? (s : StackState) : Option (Value × StackState) :=
+  match s.stack with
+  | []      => none
+  | v :: vs => some (v, { s with stack := vs })
+
+end StackState
+
+/-! ## Helper: pop N values, returning them in pop-order (top first) -/
+
+def popN (s : StackState) : Nat → EvalResult (List Value × StackState)
+  | 0 => .ok ([], s)
+  | Nat.succ k =>
+      match s.pop? with
+      | none           => .error (.unsupported "stack underflow")
+      | some (v, s')   =>
+          match popN s' k with
+          | .error e => .error e
+          | .ok (vs, s'') => .ok (v :: vs, s'')
+
+/-! ## Coercions
+
+Bitcoin Script values are byte-strings; numeric ops interpret them as
+sign-magnitude little-endian integers, and `OP_VERIFY` interprets them
+as boolean (zero-vs-non-zero). Our typed `Value` already tracks the
+intended interpretation; these helpers bridge the two representations
+where ops care.
+-/
+
+def asInt? : Value → Option Int
+  | .vBigint i => some i
+  | .vBool b   => some (if b then 1 else 0)
+  | _          => none
+
+def asBool? : Value → Option Bool
+  | .vBool b   => some b
+  | .vBigint i => some (decide (i ≠ 0))
+  | .vBytes b  => some (decide (b.size > 0))
+  | _          => none
+
+def asBytes? : Value → Option ByteArray
+  | .vBytes b  => some b
+  | .vOpaque b => some b
+  -- Bitcoin faithfulness: on a real Script stack every element is a byte vector;
+  -- the number 0 IS the empty byte vector (its minimal sign-magnitude little-endian
+  -- encoding `encodeMinimalLE 0 = ByteArray.empty`).  `OP_0` pushes that empty vector
+  -- and `OP_CAT(empty, x) = x`.  Our parser turns the wire byte `0x00` (the `OP_0`
+  -- encoding) into `vBigint 0`, so for the byte-oriented ops to behave as on real
+  -- Script we must coerce `vBigint 0` to the empty byte vector here.  This is the
+  -- NARROW slice of full numeric→bytes coercion: only the zero literal, which is the
+  -- only int value the EC `reverse32` accumulator initialization (`OP_0`) produces.
+  -- Non-zero `vBigint` is left rejected to avoid disturbing the existing typed-VM
+  -- semantics of `OP_EQUAL` / `OP_SIZE` / `OP_CHECKSIG` proofs (a full
+  -- `vBigint n → encodeMinimalLE n` total form is faithful too but cascades).
+  | .vBigint 0 => some ByteArray.empty
+  | _          => none
+
+/-- The Bitcoin-faithful `asBytes?` of the zero literal is the empty byte vector. -/
+@[simp] theorem asBytes?_vBigint_zero : asBytes? (.vBigint 0) = some ByteArray.empty := rfl
+
+/-- A non-zero integer value has no byte coercion (only the zero literal does). -/
+theorem asBytes?_vBigint_ne_zero {x : Int} (hx : x ≠ 0) : asBytes? (.vBigint x) = none := by
+  match x, hx with
+  | (0 : Int), hx => exact absurd rfl hx
+  | (n + 1 : Nat), _ => rfl
+  | Int.negSucc n, _ => rfl
+
+def asNonNegativeNat? (v : Value) : Option Nat :=
+  match asInt? v with
+  | some i => if i < 0 then none else some i.toNat
+  | none => none
+
+/-- **Consensus CScriptNum coercion (2026-06-11 stateful-widening repair).**
+
+On a real Bitcoin Script stack every element is a byte vector, and the
+numeric opcodes decode their operands as little-endian sign-magnitude
+numbers (`CScriptNum`, operand size ≤ 4 bytes pre-Genesis).  Our typed
+VM mostly keeps numbers as `vBigint` — but PARSED scripts re-enter
+numeric pushes above `OP_16` as raw `vBytes` (the wire encodes them as
+pushdata), so a deployed script like the auto-injected stateful
+epilogue's varint encoder (`… push 253; OP_LESSTHAN …`) feeds a byte
+vector to a numeric opcode.  Consensus ACCEPTS that (the bytes ARE the
+number); the bare `asInt?` rejects it.
+
+`asNum?` is the faithful operand coercion: byte vectors of ≤ 4 bytes
+decode via `decodeMinimalLE`; every other value falls back to `asInt?`.
+It is wired into the COMPARISON and numeric-SELECT opcodes that the
+deployed-bytes machinery feeds byte-encoded literals to:
+`OP_LESSTHAN`, `OP_GREATERTHAN`, `OP_LESSTHANOREQUAL`,
+`OP_GREATERTHANOREQUAL`, `OP_NUMEQUAL`, `OP_NUMNOTEQUAL`, `OP_MIN`,
+`OP_MAX` (the varint encoder pushes 253; num2bin's size-dispatch feeds
+`push 254`/`push 77` to `OP_NUMEQUAL`; clamp/pow feed `push i` to
+`OP_MAX`/`OP_MIN`/`OP_GREATERTHAN`).  These coercions are safe because
+`asNum?` agrees with `asInt?` on `vBigint`/`vBool` operands
+(`asNum?_vBigint` / `asNum?_vBool`), so every success-direction
+lockstep theorem (which only ever runs on typed operands) is unchanged,
+and NO failure-direction theorem asserts these opcodes error on a byte
+top.
+
+The ARITHMETIC opcodes (`OP_ADD`, `OP_SUB`, `OP_MUL`, `OP_NEGATE`, and
+the shift ops) deliberately keep the strictly-typed `liftIntBin`,
+because the Wave-30 failure-lockstep theorems
+(`AgreesA3.liftIntBin_nonInt_top_isError`,
+`AgreesA3.runOpcode_binopOpcode_emittable_nonInt_top_isError` — covers
+EXACTLY `+`/`-`/`*`) pin the ANF type-error ⟷ Stack type-error
+agreement for those ops on byte operands, and widening the coercion
+there would falsify them.  Extend further opcode-by-opcode (with the
+matching ANF-side story) as future walks require. -/
+def asNum? (v : Value) : Option Int :=
+  match v with
+  | .vBytes b => if b.size ≤ 4 then some (decodeMinimalLE b) else none
+  | v => asInt? v
+
+@[simp] theorem asNum?_vBigint (i : Int) : asNum? (.vBigint i) = some i := rfl
+@[simp] theorem asNum?_vBool (b : Bool) :
+    asNum? (.vBool b) = some (if b then 1 else 0) := rfl
+
+/-! ## Primitive stack-manipulation ops -/
+
+def applyDup (s : StackState) : EvalResult StackState :=
+  match s.stack with
+  | []      => .error (.unsupported "OP_DUP: empty stack")
+  | v :: _  => .ok (s.push v)
+
+def applySwap (s : StackState) : EvalResult StackState :=
+  match s.stack with
+  | a :: b :: rest => .ok { s with stack := b :: a :: rest }
+  | _              => .error (.unsupported "OP_SWAP: <2 elements")
+
+def applyDrop (s : StackState) : EvalResult StackState :=
+  match s.stack with
+  | _ :: rest => .ok { s with stack := rest }
+  | _         => .error (.unsupported "OP_DROP: empty stack")
+
+def applyNip (s : StackState) : EvalResult StackState :=
+  match s.stack with
+  | a :: _ :: rest => .ok { s with stack := a :: rest }
+  | _              => .error (.unsupported "OP_NIP: <2 elements")
+
+def applyOver (s : StackState) : EvalResult StackState :=
+  match s.stack with
+  | a :: b :: rest => .ok { s with stack := b :: a :: b :: rest }
+  | _              => .error (.unsupported "OP_OVER: <2 elements")
+
+def applyRot (s : StackState) : EvalResult StackState :=
+  match s.stack with
+  | a :: b :: c :: rest => .ok { s with stack := c :: a :: b :: rest }
+  | _                   => .error (.unsupported "OP_ROT: <3 elements")
+
+def applyTuck (s : StackState) : EvalResult StackState :=
+  match s.stack with
+  | a :: b :: rest => .ok { s with stack := a :: b :: a :: rest }
+  | _              => .error (.unsupported "OP_TUCK: <2 elements")
+
+/-- `roll d`: rolls the element at structural depth `d` to the top of the stack.
+
+This is the *bundled* Stack-IR op exactly as produced by `Stack.Lower` — a bare
+`.roll d` with no preceding depth push. `Script/Emit.lean` encodes it as the byte
+pair `[push d, OP_ROLL]`, so the IR op models the *combined* effect of that pair:
+`runOps [.roll d] s` equals running the parsed bytecode `[push d, OP_ROLL]` on
+`s` (the named `OP_ROLL` opcode below pops that pushed depth first). Keeping the
+IR op no-pop is what makes the producer (`Lower`), the evaluator (`runOps`), and
+the emit/parse round-trip agree. `roll 0` is the identity. -/
+def applyRoll (s : StackState) (d : Nat) : EvalResult StackState :=
+  if d ≥ s.stack.length then
+    .error (.unsupported s!"OP_ROLL: depth {d} ≥ stack size {s.stack.length}")
+  else
+    let v := s.stack[d]!
+    let rest := s.stack.eraseIdx d
+    .ok { s with stack := v :: rest }
+
+/-- `pick d`: copies the element at structural depth `d` to the top of the stack.
+
+Like `applyRoll`, this is the bundled Stack-IR op (a bare `.pick d`) that
+`Script/Emit.lean` encodes as the byte pair `[push d, OP_PICK]`; the IR op models
+the combined effect of that pair. It is definitionally identical to
+`applyPickStruct`. `pick 0` duplicates the top of stack. -/
+def applyPick (s : StackState) (d : Nat) : EvalResult StackState :=
+  if d ≥ s.stack.length then
+    .error (.unsupported s!"OP_PICK: depth {d} ≥ stack size {s.stack.length}")
+  else
+    .ok (s.push s.stack[d]!)
+
+/-- `pickStruct d`: structural pick (no-pop). Copies the element at
+structural depth `d` to the top without popping a runtime depth first.
+Matches the semantics of `Stack.Lower.loadRef`'s `[.pickStruct d]`
+emission for d≥2 — the lowering does not push a separate depth value;
+`Script.Emit` synthesises the depth push at the byte level. -/
+def applyPickStruct (s : StackState) (d : Nat) : EvalResult StackState :=
+  if d ≥ s.stack.length then
+    .error (.unsupported s!"pickStruct: depth {d} ≥ stack size {s.stack.length}")
+  else
+    .ok (s.push s.stack[d]!)
+
+/-! ## Arithmetic on top-of-stack -/
+
+def liftIntBin (s : StackState) (f : Int → Int → Value) : EvalResult StackState :=
+  match popN s 2 with
+  | .error e => .error e
+  | .ok (vs, s') =>
+      match vs with
+      | [b, a] =>
+          match asInt? a, asInt? b with
+          | some ai, some bi => .ok (s'.push (f ai bi))
+          | _, _ => .error (.typeError "binary numeric op expects two ints")
+      | _ => .error (.unsupported "binary op popN bug")
+
+/-- `liftIntBin` with the consensus `asNum?` operand coercion (see the
+`asNum?` docstring): byte-vector operands of ≤ 4 bytes decode as
+CScriptNum numbers instead of type-erroring.  Used by `OP_LESSTHAN`
+only (for now). -/
+def liftIntBinNum (s : StackState) (f : Int → Int → Value) : EvalResult StackState :=
+  match popN s 2 with
+  | .error e => .error e
+  | .ok (vs, s') =>
+      match vs with
+      | [b, a] =>
+          match asNum? a, asNum? b with
+          | some ai, some bi => .ok (s'.push (f ai bi))
+          | _, _ => .error (.typeError "binary numeric op expects two numbers")
+      | _ => .error (.unsupported "binary op popN bug")
+
+def liftIntUnary (s : StackState) (f : Int → Value) : EvalResult StackState :=
+  match s.pop? with
+  | none => .error (.unsupported "unary op: empty stack")
+  | some (v, s') =>
+      match asInt? v with
+      | some i => .ok (s'.push (f i))
+      | none   => .error (.typeError "unary numeric op expects int")
+
+def liftBytesBin (s : StackState) (f : ByteArray → ByteArray → Value) : EvalResult StackState :=
+  match popN s 2 with
+  | .error e => .error e
+  | .ok (vs, s') =>
+      match vs with
+      | [b, a] =>
+          match asBytes? a, asBytes? b with
+          | some ab, some bb => .ok (s'.push (f ab bb))
+          | _, _ => .error (.typeError "binary bytes op expects two byte values")
+      | _ => .error (.unsupported "binary bytes op popN bug")
+
+def liftBytesUnary (s : StackState) (f : ByteArray → Value) : EvalResult StackState :=
+  match s.pop? with
+  | none => .error (.unsupported "unary bytes op: empty stack")
+  | some (v, s') =>
+      match asBytes? v with
+      | some b => .ok (s'.push (f b))
+      | none   => .error (.typeError "unary bytes op expects bytes")
+
+def liftBytesBinChecked (s : StackState)
+    (f : ByteArray → ByteArray → EvalResult Value) : EvalResult StackState :=
+  match popN s 2 with
+  | .error e => .error e
+  | .ok (vs, s') =>
+      match vs with
+      | [b, a] =>
+          match asBytes? a, asBytes? b with
+          | some ab, some bb =>
+              match f ab bb with
+              | .ok v => .ok (s'.push v)
+              | .error e => .error e
+          | _, _ => .error (.typeError "binary bytes op expects two byte values")
+      | _ => .error (.unsupported "binary bytes op popN bug")
+
+def invertBytes (bs : ByteArray) : ByteArray :=
+  ByteArray.mk (bs.toList.map (fun b => ~~~b)).toArray
+
+def bitwiseBytes (name : String) (f : UInt8 → UInt8 → UInt8)
+    (a b : ByteArray) : EvalResult Value :=
+  match zipBytesWith? f a b with
+  | some out => .ok (.vBytes out)
+  | none => .error (.typeError s!"{name} expects equal-length byte values")
+
+/-! ## Opcode dispatch
+
+Each named opcode either:
+1. consumes/produces stack values via a small helper above,
+2. delegates to a `Crypto.*` assumption/backend function, or
+3. is unsupported (returns `.error .unsupported`).
+
+This dispatch table mirrors the **Rúnar-emitted subset** identified in
+`06-emit.ts:20–123` plus the Chronicle extensions (l:82–121).
+-/
+
+/-- Local adapter for `OP_CHECKMULTISIG` / `OP_CHECKMULTISIGVERIFY` semantics.
+
+The Stack VM still models multisig under abstract single-pop semantics
+(see comment on `OP_CHECKMULTISIG` in `runOpcode` below), so this adapter
+routes the raw stack payload into the explicit auth backend field. The
+backend has fail-fast codegen; there is no executable `false` default. -/
+def checkMultiSigStub (payload : ByteArray) : Bool :=
+  checkMultiSigStack payload
+
+def popBytesN (role : String) : Nat → StackState →
+    EvalResult (List ByteArray × StackState)
+  | 0, s => .ok ([], s)
+  | n + 1, s =>
+      match s.pop? with
+      | none => .error (.unsupported s!"{role}: stack underflow")
+      | some (v, s') =>
+          match asBytes? v with
+          | none => .error (.typeError s!"{role}: expected bytes")
+          | some b =>
+              match popBytesN role n s' with
+              | .error e => .error e
+              | .ok (bs, s'') => .ok (b :: bs, s'')
+
+/--
+Parse the full Bitcoin `OP_CHECKMULTISIG` stack frame.
+
+Stack head is the top. The opcode consumes:
+
+* `n`
+* `n` public keys
+* `m`
+* `m` signatures
+* the historical dummy value
+
+The byte lists are returned in source order rather than pop order.
+-/
+def parseCheckMultiSigFrame (s : StackState) :
+    EvalResult (List ByteArray × List ByteArray × StackState) :=
+  match s.pop? with
+  | none => .error (.unsupported "OP_CHECKMULTISIG: empty stack")
+  | some (nVal, s1) =>
+      match asNonNegativeNat? nVal with
+      | none => .error (.typeError "OP_CHECKMULTISIG expects pubkey count")
+      | some n =>
+          match popBytesN "OP_CHECKMULTISIG pubkeys" n s1 with
+          | .error e => .error e
+          | .ok (pubkeysPop, s2) =>
+              match s2.pop? with
+              | none => .error (.unsupported "OP_CHECKMULTISIG: missing signature count")
+              | some (mVal, s3) =>
+                  match asNonNegativeNat? mVal with
+                  | none => .error (.typeError "OP_CHECKMULTISIG expects signature count")
+                  | some m =>
+                      if m > n then
+                        .error (.typeError "OP_CHECKMULTISIG signature count exceeds pubkey count")
+                      else
+                        match popBytesN "OP_CHECKMULTISIG signatures" m s3 with
+                        | .error e => .error e
+                        | .ok (sigsPop, s4) =>
+                            match s4.pop? with
+                            | none => .error (.unsupported "OP_CHECKMULTISIG: missing dummy")
+                            | some (_dummy, s5) => .ok (sigsPop.reverse, pubkeysPop.reverse, s5)
+
+def runCheckMultiSigFull (verifyOnly : Bool) (s : StackState) :
+    EvalResult StackState :=
+  match parseCheckMultiSigFrame s with
+  | .error e => .error e
+  | .ok (sigs, pubkeys, s') =>
+      let ok := checkMultiSig sigs pubkeys
+      if verifyOnly then
+        if ok then .ok s' else .error .assertFailed
+      else
+        .ok (s'.push (.vBool ok))
+
+def runCheckMultiSigFallback (verifyOnly : Bool) (s : StackState) :
+    EvalResult StackState :=
+  match s.pop? with
+  | none =>
+      if verifyOnly then
+        .error (.unsupported "OP_CHECKMULTISIGVERIFY: empty stack")
+      else
+        .error (.unsupported "OP_CHECKMULTISIG: empty stack")
+  | some (v, s') =>
+      match asBytes? v with
+      | some b =>
+          let ok := checkMultiSigStub b
+          if verifyOnly then
+            if ok then .ok s' else .error .assertFailed
+          else
+            .ok (s'.push (.vBool ok))
+      | none =>
+          if verifyOnly then
+            .error (.typeError "OP_CHECKMULTISIGVERIFY expects frame count or bytes")
+          else
+            .error (.typeError "OP_CHECKMULTISIG expects frame count or bytes")
+
+def runCheckMultiSig (verifyOnly : Bool) (s : StackState) : EvalResult StackState :=
+  match s.stack with
+  | [] => runCheckMultiSigFallback verifyOnly s
+  | top :: _ =>
+      match asNonNegativeNat? top with
+      | some _ => runCheckMultiSigFull verifyOnly s
+      | none => runCheckMultiSigFallback verifyOnly s
+
+def runOpcode (code : String) (s : StackState) : EvalResult StackState :=
+  match code with
+  -- ---------------------------------------------------------------- stack
+  | "OP_DUP"     => applyDup s
+  | "OP_SWAP"    => applySwap s
+  | "OP_DROP"    => applyDrop s
+  | "OP_NIP"     => applyNip s
+  | "OP_OVER"    => applyOver s
+  | "OP_ROT"     => applyRot s
+  | "OP_TUCK"    => applyTuck s
+  | "OP_ROLL" =>
+      -- Parsed-bytecode path: the depth is a runtime stack value. Pop it, then
+      -- apply the bundled `roll` op (which is itself no-pop) to the remainder.
+      match s.pop? with
+      | none => .error (.unsupported "OP_ROLL: empty stack")
+      | some (v, s') =>
+          match asNonNegativeNat? v with
+          | some d => applyRoll s' d
+          | none => .error (.typeError "OP_ROLL expects non-negative depth")
+  | "OP_PICK" =>
+      -- Parsed-bytecode path: pop the runtime depth, then apply the bundled
+      -- `pick` op (no-pop) to the remainder.
+      match s.pop? with
+      | none => .error (.unsupported "OP_PICK: empty stack")
+      | some (v, s') =>
+          match asNonNegativeNat? v with
+          | some d => applyPick s' d
+          | none => .error (.typeError "OP_PICK expects non-negative depth")
+  | "OP_2DUP" =>
+      match applyOver s with
+      | .error e => .error e
+      | .ok s1 => applyOver s1
+  | "OP_2DROP" =>
+      match applyDrop s with
+      | .error e => .error e
+      | .ok s1 => applyDrop s1
+  | "OP_TOALTSTACK" =>
+      match s.pop? with
+      | none => .error (.unsupported "OP_TOALTSTACK: empty stack")
+      | some (v, s') => .ok { s' with altstack := v :: s'.altstack }
+  | "OP_FROMALTSTACK" =>
+      match s.altstack with
+      | []      => .error (.unsupported "OP_FROMALTSTACK: empty altstack")
+      | v :: rs => .ok ({ s with altstack := rs }.push v)
+  | "OP_DEPTH"   => .ok (s.push (.vBigint s.stack.length))
+  | "OP_IFDUP" =>
+      match s.stack with
+      | [] => .error (.unsupported "OP_IFDUP: empty stack")
+      | v :: _ =>
+          match asBool? v with
+          | some true  => .ok (s.push v)
+          | some false => .ok s
+          | none       => .error (.typeError "OP_IFDUP: non-bool")
+  -- ---------------------------------------------------------------- pushes
+  | "OP_0"  => .ok (s.push (.vBigint 0))
+  | "OP_1NEGATE" => .ok (s.push (.vBigint (-1)))
+  | "OP_1"  => .ok (s.push (.vBigint 1))
+  | "OP_2"  => .ok (s.push (.vBigint 2))
+  | "OP_3"  => .ok (s.push (.vBigint 3))
+  | "OP_4"  => .ok (s.push (.vBigint 4))
+  | "OP_5"  => .ok (s.push (.vBigint 5))
+  | "OP_6"  => .ok (s.push (.vBigint 6))
+  | "OP_7"  => .ok (s.push (.vBigint 7))
+  | "OP_8"  => .ok (s.push (.vBigint 8))
+  | "OP_9"  => .ok (s.push (.vBigint 9))
+  | "OP_10" => .ok (s.push (.vBigint 10))
+  | "OP_11" => .ok (s.push (.vBigint 11))
+  | "OP_12" => .ok (s.push (.vBigint 12))
+  | "OP_13" => .ok (s.push (.vBigint 13))
+  | "OP_14" => .ok (s.push (.vBigint 14))
+  | "OP_15" => .ok (s.push (.vBigint 15))
+  | "OP_16" => .ok (s.push (.vBigint 16))
+  -- ---------------------------------------------------------------- numeric
+  | "OP_ADD"     => liftIntBin s (fun a b => .vBigint (a + b))
+  | "OP_SUB"     => liftIntBin s (fun a b => .vBigint (a - b))
+  | "OP_MUL"     => liftIntBin s (fun a b => .vBigint (a * b))
+  | "OP_DIV" =>
+      match popN s 2 with
+      | .error e => .error e
+      | .ok (vs, s') =>
+          match vs with
+          | [b, a] =>
+              match asInt? a, asInt? b with
+              | some ai, some bi =>
+                  if bi == 0 then .error .divByZero else .ok (s'.push (.vBigint (ai / bi)))
+              | _, _ => .error (.typeError "OP_DIV expects ints")
+          | _ => .error (.unsupported "OP_DIV popN bug")
+  | "OP_MOD" =>
+      match popN s 2 with
+      | .error e => .error e
+      | .ok (vs, s') =>
+          match vs with
+          | [b, a] =>
+              match asInt? a, asInt? b with
+              | some ai, some bi =>
+                  if bi == 0 then .error .divByZero else .ok (s'.push (.vBigint (ai % bi)))
+              | _, _ => .error (.typeError "OP_MOD expects ints")
+          | _ => .error (.unsupported "OP_MOD popN bug")
+  | "OP_NEGATE"  => liftIntUnary s (fun i => .vBigint (-i))
+  | "OP_ABS"     => liftIntUnary s (fun i => .vBigint i.natAbs)
+  | "OP_1ADD"    => liftIntUnary s (fun i => .vBigint (i + 1))
+  | "OP_1SUB"    => liftIntUnary s (fun i => .vBigint (i - 1))
+  | "OP_2MUL"    => liftIntUnary s (fun i => .vBigint (2 * i))
+  | "OP_2DIV"    => liftIntUnary s (fun i => .vBigint (i / 2))
+  | "OP_LSHIFT"  => liftIntBin s (fun a b => .vBigint (a * (2 ^ b.toNat)))
+  | "OP_RSHIFT"  => liftIntBin s (fun a b => .vBigint (a / (2 ^ b.toNat)))
+  | "OP_LSHIFTNUM" => liftIntBin s (fun a b => .vBigint (a * (2 ^ b.toNat)))
+  | "OP_RSHIFTNUM" => liftIntBin s (fun a b => .vBigint (a / (2 ^ b.toNat)))
+  -- ---------------------------------------------------------------- comparison
+  -- Consensus CScriptNum coercion (see `asNum?`): parsed numeric pushes
+  -- above OP_16 re-enter as `vBytes`; the comparison + numeric-select
+  -- opcodes decode them like the real VM does (the stateful epilogue's
+  -- varint encoder pushes 253; num2bin/clamp feed byte literals here).
+  | "OP_LESSTHAN"           => liftIntBinNum s (fun a b => .vBool (decide (a < b)))
+  | "OP_GREATERTHAN"        => liftIntBinNum s (fun a b => .vBool (decide (a > b)))
+  | "OP_LESSTHANOREQUAL"    => liftIntBinNum s (fun a b => .vBool (decide (a ≤ b)))
+  | "OP_GREATERTHANOREQUAL" => liftIntBinNum s (fun a b => .vBool (decide (a ≥ b)))
+  | "OP_NUMEQUAL"           => liftIntBinNum s (fun a b => .vBool (decide (a = b)))
+  | "OP_NUMNOTEQUAL"        => liftIntBinNum s (fun a b => .vBool (decide (a ≠ b)))
+  | "OP_BOOLAND"            => liftIntBin s (fun a b => .vBool (decide (a ≠ 0 ∧ b ≠ 0)))
+  | "OP_BOOLOR"             => liftIntBin s (fun a b => .vBool (decide (a ≠ 0 ∨ b ≠ 0)))
+  | "OP_MIN"                => liftIntBinNum s (fun a b => .vBigint (min a b))
+  | "OP_MAX"                => liftIntBinNum s (fun a b => .vBigint (max a b))
+  | "OP_WITHIN" =>
+      match popN s 3 with
+      | .error e => .error e
+      | .ok (vs, s') =>
+          match vs with
+          | [hi, lo, x] =>
+              match asInt? x, asInt? lo, asInt? hi with
+              | some xi, some li, some hii => .ok (s'.push (.vBool (decide (li ≤ xi ∧ xi < hii))))
+              | _, _, _ => .error (.typeError "OP_WITHIN expects ints")
+          | _ => .error (.unsupported "OP_WITHIN popN bug")
+  -- ---------------------------------------------------------------- logic
+  | "OP_NOT" =>
+      match s.pop? with
+      | none => .error (.unsupported "OP_NOT: empty stack")
+      | some (v, s') =>
+          match asBool? v with
+          | some b => .ok (s'.push (.vBool (!b)))
+          | none   => .error (.typeError "OP_NOT non-bool")
+  | "OP_0NOTEQUAL" =>
+      match s.pop? with
+      | none => .error (.unsupported "OP_0NOTEQUAL: empty stack")
+      | some (v, s') =>
+          match asInt? v with
+          | some i => .ok (s'.push (.vBool (decide (i ≠ 0))))
+          | none   => .error (.typeError "OP_0NOTEQUAL: not int")
+  | "OP_EQUAL" =>
+      match popN s 2 with
+      | .error e => .error e
+      | .ok (vs, s') =>
+          match vs with
+          | [b, a] =>
+              let eq := match asBytes? a, asBytes? b with
+                | some ab, some bb => decide (ab.toList = bb.toList)
+                | _, _ =>
+                    match asInt? a, asInt? b with
+                    | some ai, some bi => decide (ai = bi)
+                    | _, _ =>
+                        -- BSV consensus int↔bytes coercion (Phase B10-prep).
+                        -- When the two operands carry a mixed numeric / bytes
+                        -- representation, real Bitcoin Script compares them
+                        -- after coercing the integer side to its canonical
+                        -- minimal-LE Script-number byte encoding. See
+                        -- `Stack.NumEncoding.encodeMinimalLE` and
+                        -- `Script.Emit.encodeScriptNumber` — the two are
+                        -- pinned byte-identical.
+                        match asInt? a, asBytes? b with
+                        | some ai, some bb =>
+                            decide ((encodeMinimalLE ai).toList = bb.toList)
+                        | _, _ =>
+                            match asBytes? a, asInt? b with
+                            | some ab, some bi =>
+                                decide (ab.toList = (encodeMinimalLE bi).toList)
+                            | _, _ => false
+              .ok (s'.push (.vBool eq))
+          | _ => .error (.unsupported "OP_EQUAL popN bug")
+  -- ---------------------------------------------------------------- bytes
+  | "OP_CAT" => liftBytesBin s (fun a b => .vBytes (a ++ b))
+  | "OP_SPLIT" =>
+      match popN s 2 with
+      | .error e => .error e
+      | .ok (vs, s') =>
+          match vs with
+          | [idx, v] =>
+              match asBytes? v, asNonNegativeNat? idx with
+              | some bs, some i =>
+                  if i > bs.size then
+                    .error (.unsupported "OP_SPLIT: index past end")
+                  else
+                    .ok ((s'.push (.vBytes (bs.extract 0 i))).push
+                      (.vBytes (bs.extract i bs.size)))
+              | _, _ => .error (.typeError "OP_SPLIT expects bytes and non-negative index")
+          | _ => .error (.unsupported "OP_SPLIT popN bug")
+  | "OP_SIZE" =>
+      match s.stack with
+      | [] => .error (.unsupported "OP_SIZE: empty stack")
+      | v :: _ =>
+          match asBytes? v with
+          | some b => .ok (s.push (.vBigint b.size))
+          | none   => .error (.typeError "OP_SIZE: not bytes")
+  | "OP_BIN2NUM" =>
+      match s.pop? with
+      | none => .error (.unsupported "OP_BIN2NUM: empty stack")
+      | some (v, s') =>
+          match asBytes? v with
+          | some b => .ok (s'.push (.vBigint (decodeMinimalLE b)))
+          | none   => .error (.typeError "OP_BIN2NUM: not bytes")
+  | "OP_NUM2BIN" =>
+      match popN s 2 with
+      | .error e => .error e
+      | .ok (vs, s') =>
+          match vs with
+          | [size, val] =>
+              match asInt? val, asInt? size with
+              | some n, some target =>
+                  if target < 0 then
+                    .error (.typeError "OP_NUM2BIN expects non-negative size")
+                  else
+                    match num2binEncode? n target.toNat with
+                    | some encoded => .ok (s'.push (.vBytes encoded))
+                    | none => .error (.unsupported "OP_NUM2BIN: value does not fit target size")
+              | _, _ => .error (.typeError "OP_NUM2BIN expects int value and size")
+          | _ => .error (.unsupported "OP_NUM2BIN popN bug")
+  | "OP_INVERT" => liftBytesUnary s (fun b => .vBytes (invertBytes b))
+  | "OP_AND"    => liftBytesBinChecked s (bitwiseBytes "OP_AND" (· &&& ·))
+  | "OP_OR"     => liftBytesBinChecked s (bitwiseBytes "OP_OR" (· ||| ·))
+  | "OP_XOR"    => liftBytesBinChecked s (bitwiseBytes "OP_XOR" (· ^^^ ·))
+  -- ---------------------------------------------------------------- crypto (delegated to Eval.Crypto)
+  | "OP_SHA256"    => liftBytesUnary s (fun b => .vBytes (sha256 b))
+  | "OP_HASH160"   => liftBytesUnary s (fun b => .vBytes (hash160 b))
+  | "OP_HASH256"   => liftBytesUnary s (fun b => .vBytes (hash256 b))
+  | "OP_RIPEMD160" => liftBytesUnary s (fun b => .vBytes (ripemd160 b))
+  | "OP_CHECKSIG" =>
+      match popN s 2 with
+      | .error e => .error e
+      | .ok (vs, s') =>
+          match vs with
+          | [pk, sig] =>
+              match asBytes? sig, asBytes? pk with
+              | some sigB, some pkB => .ok (s'.push (.vBool (checkSig sigB pkB)))
+              | _, _ => .error (.typeError "OP_CHECKSIG expects bytes")
+          | _ => .error (.unsupported "OP_CHECKSIG popN bug")
+  | "OP_VERIFY" =>
+      match s.pop? with
+      | none => .error (.unsupported "OP_VERIFY: empty stack")
+      | some (v, s') =>
+          match asBool? v with
+          | some true  => .ok s'
+          | some false => .error .assertFailed
+          | none       => .error (.typeError "OP_VERIFY: non-bool")
+  | "OP_CHECKSIGVERIFY" =>
+      match popN s 2 with
+      | .error e => .error e
+      | .ok (vs, s') =>
+          match vs with
+          | [pk, sig] =>
+              match asBytes? sig, asBytes? pk with
+              | some sigB, some pkB =>
+                  if checkSig sigB pkB then .ok s' else .error .assertFailed
+              | _, _ => .error (.typeError "OP_CHECKSIGVERIFY expects bytes")
+          | _ => .error (.unsupported "OP_CHECKSIGVERIFY popN bug")
+  | "OP_EQUALVERIFY" =>
+      match popN s 2 with
+      | .error e => .error e
+      | .ok (vs, s') =>
+          match vs with
+          | [b, a] =>
+              let eq := match asBytes? a, asBytes? b with
+                | some ab, some bb => decide (ab.toList = bb.toList)
+                | _, _ =>
+                    match asInt? a, asInt? b with
+                    | some ai, some bi => decide (ai = bi)
+                    | _, _ =>
+                        -- BSV consensus int↔bytes coercion (Phase B10-prep);
+                        -- mirrors the `OP_EQUAL` arm above.
+                        match asInt? a, asBytes? b with
+                        | some ai, some bb =>
+                            decide ((encodeMinimalLE ai).toList = bb.toList)
+                        | _, _ =>
+                            match asBytes? a, asInt? b with
+                            | some ab, some bi =>
+                                decide (ab.toList = (encodeMinimalLE bi).toList)
+                            | _, _ => false
+              if eq then .ok s' else .error .assertFailed
+          | _ => .error (.unsupported "OP_EQUALVERIFY popN bug")
+  | "OP_NUMEQUALVERIFY" =>
+      match popN s 2 with
+      | .error e => .error e
+      | .ok (vs, s') =>
+          match vs with
+          | [b, a] =>
+              match asInt? a, asInt? b with
+              | some ai, some bi =>
+                  if decide (ai = bi) then .ok s' else .error .assertFailed
+              | _, _ => .error (.typeError "OP_NUMEQUALVERIFY expects ints")
+          | _ => .error (.unsupported "OP_NUMEQUALVERIFY popN bug")
+  | "OP_CHECKMULTISIG" =>
+      -- Full frame semantics when the top value is a count; the older
+      -- single-payload adapter remains as fallback for peephole proofs over
+      -- abstract multisig payloads.
+      runCheckMultiSig false s
+  | "OP_CHECKMULTISIGVERIFY" =>
+      runCheckMultiSig true s
+  | "OP_CODESEPARATOR" => .ok s
+      -- Legacy `runOps` keeps the proof-facing state unchanged here.
+      -- Use `runOpsPc` when code-separator index tracking is required.
+  | "OP_RETURN" => .error (.unsupported "OP_RETURN")
+  | _ => .error (.unsupported s!"opcode {code} not in the Rúnar-emitted subset")
+
+/-! ### Concrete byte / number opcode samples
+
+These executable sample theorems pin the Stack VM wiring to
+`Stack.NumEncoding` and the bytewise helpers above. They avoid comparing
+whole `StackState` values, whose payload types intentionally do not carry
+global decidable equality instances.
+-/
+
+theorem runOpcode_BIN2NUM_sample :
+    (match runOpcode "OP_BIN2NUM"
+        { stack := [.vBytes (ByteArray.mk #[0x80, 0x80])] } with
+     | .ok s =>
+         match s.stack with
+         | [.vBigint n] => n == -128
+         | _ => false
+     | .error _ => false) = true := by
+  native_decide
+
+theorem runOpcode_NUM2BIN_sample :
+    (match runOpcode "OP_NUM2BIN"
+        { stack := [.vBigint 4, .vBigint (-128)] } with
+     | .ok s =>
+         match s.stack with
+         | [.vBytes out] => out.toList == [0x80, 0x00, 0x00, 0x80]
+         | _ => false
+     | .error _ => false) = true := by
+  native_decide
+
+theorem runOpcode_XOR_sample :
+    (match runOpcode "OP_XOR"
+        { stack := [.vBytes (ByteArray.mk #[0x0f]),
+                    .vBytes (ByteArray.mk #[0xf0])] } with
+     | .ok s =>
+         match s.stack with
+         | [.vBytes out] => out.toList == [0xff]
+         | _ => false
+     | .error _ => false) = true := by
+  native_decide
+
+theorem runOpcode_SPLIT_sample :
+    (match runOpcode "OP_SPLIT"
+        { stack := [.vBigint 2,
+                    .vBytes (ByteArray.mk #[0xaa, 0xbb, 0xcc])] } with
+     | .ok s =>
+         match s.stack with
+         | [.vBytes suffix, .vBytes pref] =>
+             suffix.toList == [0xcc] && pref.toList == [0xaa, 0xbb]
+         | _ => false
+     | .error _ => false) = true := by
+  native_decide
+
+theorem runOpcode_ROLL_sample :
+    (match runOpcode "OP_ROLL"
+        { stack := [.vBigint 1,
+                    .vBytes (ByteArray.mk #[0xaa]),
+                    .vBytes (ByteArray.mk #[0xbb])] } with
+     | .ok s =>
+         match s.stack with
+         | [.vBytes a, .vBytes b] => a.toList == [0xbb] && b.toList == [0xaa]
+         | _ => false
+     | .error _ => false) = true := by
+  native_decide
+
+theorem runOpcode_PICK_sample :
+    (match runOpcode "OP_PICK"
+        { stack := [.vBigint 1,
+                    .vBytes (ByteArray.mk #[0xaa]),
+                    .vBytes (ByteArray.mk #[0xbb])] } with
+     | .ok s =>
+         match s.stack with
+         | [.vBytes a, .vBytes b, .vBytes c] =>
+             a.toList == [0xbb] && b.toList == [0xaa] && c.toList == [0xbb]
+         | _ => false
+     | .error _ => false) = true := by
+  native_decide
+
+theorem runOpcode_AND_length_mismatch_errors :
+    (match runOpcode "OP_AND"
+        { stack := [.vBytes (ByteArray.mk #[0x0f]),
+                    .vBytes (ByteArray.mk #[0xf0, 0x00])] } with
+     | .error (.typeError _) => true
+     | _ => false) = true := by
+  native_decide
+
+theorem parseCheckMultiSigFrame_sample :
+    (match parseCheckMultiSigFrame
+        { stack := [
+            .vBigint 2,
+            .vBytes (ByteArray.mk #[0x02]),
+            .vBytes (ByteArray.mk #[0x01]),
+            .vBigint 1,
+            .vBytes (ByteArray.mk #[0xaa]),
+            .vBigint 0,
+            .vBigint 99
+          ] } with
+     | .ok (sigs, pubkeys, s') =>
+         sigs.map ByteArray.toList == [[0xaa]]
+           && pubkeys.map ByteArray.toList == [[0x01], [0x02]]
+           && (match s'.stack with
+               | [.vBigint 99] => true
+               | _ => false)
+     | .error _ => false) = true := by
+  native_decide
+
+/-! ## Big-step run
+
+Recurses over the op list. `ifOp` dispatches on the boolean
+interpretation of the popped condition value, then descends into the
+selected branch.
+-/
+
+/--
+Single-step evaluation excluding `.ifOp`. The `.ifOp` case is handled
+inline by `runOps` (so we avoid mutual recursion and stay structural
+on the op-list size).
+-/
+def stepNonIf (op : StackOp) (s : StackState) : EvalResult StackState :=
+  match op with
+  | .push (.bigint i) => .ok (s.push (.vBigint i))
+  | .push (.bool b)   => .ok (s.push (.vBool b))
+  | .push (.bytes b)  => .ok (s.push (.vBytes b))
+  | .dup    => applyDup s
+  | .swap   => applySwap s
+  | .roll d => applyRoll s d
+  | .pick d => applyPick s d
+  | .pickStruct d => applyPickStruct s d
+  | .drop   => applyDrop s
+  | .nip    => applyNip s
+  | .over   => applyOver s
+  | .rot    => applyRot s
+  | .tuck   => applyTuck s
+  | .opcode code => runOpcode code s
+  | .ifOp _ _   => .error (.unsupported "ifOp must be handled by runOps")
+  | .placeholder _ _   => .ok (s.push (.vBigint 0))
+  | .pushCodesepIndex  => .ok (s.push (.vBigint 0))
+  | .rawBytes b        => .ok (s.push (.vBytes b))
+
+/--
+Run a list of ops sequentially, threading the state. Inlines the
+`.ifOp` case so the recursive structure is bound by op-list size and
+needs no mutual block.
+-/
+def runOps : List StackOp → StackState → EvalResult StackState
+  | [],       s => .ok s
+  | .ifOp thn els :: rest, s =>
+      match s.pop? with
+      | none => .error (.unsupported "OP_IF: empty stack")
+      | some (v, s') =>
+          match asBool? v with
+          | some true =>
+              match runOps thn s' with
+              | .error e => .error e
+              | .ok s''  => runOps rest s''
+          | some false =>
+              match els with
+              | none =>
+                  runOps rest s'
+              | some elsB =>
+                  match runOps elsB s' with
+                  | .error e => .error e
+                  | .ok s''  => runOps rest s''
+          | none => .error (.typeError "OP_IF: non-bool condition")
+  | op :: rest, s =>
+      match stepNonIf op s with
+      | .error e => .error e
+      | .ok s'   => runOps rest s'
+termination_by ops _ => sizeOf ops
+decreasing_by
+  all_goals
+    simp_wf
+    omega
+
+/-! ## Program-counter-aware run
+
+The legacy `runOps` relation is intentionally kept stable for the
+existing peephole proof surface. `runOpsPc` layers an executable
+instruction-index counter on top, recording the last executed
+`OP_CODESEPARATOR` and making `pushCodesepIndex` push that index instead
+of the legacy zero placeholder.
+-/
+
+structure PcState where
+  state : StackState := {}
+  pc : Nat := 0
+  lastCodeSeparator : Option Nat := none
+  deriving Inhabited
+
+def stepNonIfPc (op : StackOp) (s : PcState) : EvalResult PcState :=
+  match op with
+  | .opcode "OP_CODESEPARATOR" =>
+      .ok { s with pc := s.pc + 1, lastCodeSeparator := some s.pc }
+  | .pushCodesepIndex =>
+      .ok { s with
+        state := s.state.push (.vBigint (s.lastCodeSeparator.getD 0)),
+        pc := s.pc + 1 }
+  | .ifOp _ _ =>
+      .error (.unsupported "ifOp must be handled by runOpsPc")
+  | _ =>
+      match stepNonIf op s.state with
+      | .error e => .error e
+      | .ok state' => .ok { s with state := state', pc := s.pc + 1 }
+
+def runOpsPc : List StackOp → PcState → EvalResult PcState
+  | [],       s => .ok s
+  | .ifOp thn els :: rest, s =>
+      match s.state.pop? with
+      | none => .error (.unsupported "OP_IF: empty stack")
+      | some (v, s') =>
+          let branchStart : PcState := { s with state := s', pc := s.pc + 1 }
+          match asBool? v with
+          | some true =>
+              match runOpsPc thn branchStart with
+              | .error e => .error e
+              | .ok s''  => runOpsPc rest s''
+          | some false =>
+              match els with
+              | none =>
+                  runOpsPc rest branchStart
+              | some elsB =>
+                  match runOpsPc elsB branchStart with
+                  | .error e => .error e
+                  | .ok s''  => runOpsPc rest s''
+          | none => .error (.typeError "OP_IF: non-bool condition")
+  | op :: rest, s =>
+      match stepNonIfPc op s with
+      | .error e => .error e
+      | .ok s'   => runOpsPc rest s'
+termination_by ops _ => sizeOf ops
+decreasing_by
+  all_goals
+    simp_wf
+    omega
+
+theorem runOpsPc_codeSeparator_sample :
+    (match runOpsPc
+        [.push (.bigint 7), .opcode "OP_CODESEPARATOR", .pushCodesepIndex]
+        {} with
+     | .ok s =>
+         s.pc == 3
+           && s.lastCodeSeparator == some 1
+           && (match s.state.stack with
+               | [.vBigint idx, .vBigint value] => idx == 1 && value == 7
+               | _ => false)
+     | .error _ => false) = true := by
+  native_decide
+
+/-! ## Reduction lemmas (Phase 3c)
+
+`rfl`-level identities that pin down the shape of `stepNonIf` and
+`runOpcode` for the most common ops. These are referenced from the
+operational soundness proofs in `Stack.Sim` and `Stack.Peephole`.
+-/
+
+theorem stepNonIf_push_bigint (s : StackState) (i : Int) :
+    stepNonIf (.push (.bigint i)) s = .ok (s.push (.vBigint i)) := rfl
+
+theorem stepNonIf_push_bool (s : StackState) (b : Bool) :
+    stepNonIf (.push (.bool b)) s = .ok (s.push (.vBool b)) := rfl
+
+theorem stepNonIf_push_bytes (s : StackState) (b : ByteArray) :
+    stepNonIf (.push (.bytes b)) s = .ok (s.push (.vBytes b)) := rfl
+
+theorem stepNonIf_dup (s : StackState) :
+    stepNonIf .dup s = applyDup s := rfl
+
+theorem stepNonIf_drop (s : StackState) :
+    stepNonIf .drop s = applyDrop s := rfl
+
+theorem stepNonIf_swap (s : StackState) :
+    stepNonIf .swap s = applySwap s := rfl
+
+theorem stepNonIf_opcode (code : String) (s : StackState) :
+    stepNonIf (.opcode code) s = runOpcode code s := rfl
+
+theorem stepNonIf_rawBytes (s : StackState) (b : ByteArray) :
+    stepNonIf (.rawBytes b) s = .ok (s.push (.vBytes b)) := rfl
+
+theorem runOps_nil (s : StackState) : runOps [] s = .ok s := by
+  unfold runOps; rfl
+
+/-! Match-on-`Except.ok` reduction helper.
+
+`(match Except.ok x with | .error _ => f e | .ok s' => g s') = g x` is a
+definitional reduction, but Lean's `rfl` doesn't always pull it through
+when the surrounding term is already partially reduced. Exposing it as
+a `@[simp]` lemma makes downstream proofs (esp. `_extends_<typed>`
+lemmas in `Stack.Peephole`) one-line.
+-/
+
+@[simp]
+theorem match_Except_ok_runOps (x : StackState) (rest : List StackOp) :
+    (match (Except.ok x : EvalResult StackState) with
+     | .error e => .error e
+     | .ok s'  => runOps rest s') = runOps rest x := rfl
+
+/-- A more general `match`-on-Except.ok reduction that doesn't constrain
+the match body. Use this when the body involves `runOps` applied to a
+concrete cons like `.drop :: rest_outer`. -/
+@[simp]
+theorem match_Except_ok_general (α β : Type) (x : α) (f : β) (g : α → β) :
+    (match (Except.ok x : Except EvalError α) with
+     | .error _ => f
+     | .ok s'   => g s') = g x := rfl
+
+/-! ## Sequencing: `runOps_append`
+
+The fundamental compositional property: running concatenated op-lists
+is the same as running the first then sequencing the result through
+the second. Originally lived in `Stack.Sim` (where it was first
+needed by Stage C's per-binding induction). It is hoisted here so
+that downstream modules like `Stack.Merkle` — which sit **upstream**
+of `Stack.Sim` in the import graph — can also use it for codegen-to-
+spec proofs that decompose a primitive's emitted op-list into
+per-step pieces.
+
+`Stack.Sim` re-exports both lemmas under their original names so
+existing call sites (`Stack.Sim.runOps_append`,
+`Stack.Sim.runOps_cons_nonIf_eq`) keep compiling unchanged. -/
+
+/-- Local copy of the non-`.ifOp` cons reduction (`runOps.eq_3`).
+Re-derived from the auto-generated `runOps.eq_3` plus `StackOp.noConfusion`
+on the side condition (importing the equivalent lemma from
+`Stack.Peephole` would create an import cycle). -/
+theorem runOps_cons_nonIf_eq
+    (op : StackOp) (rest : List StackOp) (s : StackState)
+    (hNotIf : ∀ thn els, op ≠ .ifOp thn els) :
+    runOps (op :: rest) s
+    = match stepNonIf op s with
+      | .error e => .error e
+      | .ok s'   => runOps rest s' := by
+  apply runOps.eq_3
+  intro thn els h
+  exact (hNotIf thn els h).elim
+
+/-- `runOps` distributes over list append. -/
+theorem runOps_append : ∀ (ops1 ops2 : List StackOp) (s : StackState),
+    runOps (ops1 ++ ops2) s
+    = match runOps ops1 s with
+      | .error e => .error e
+      | .ok s'   => runOps ops2 s' := by
+  intro ops1
+  induction ops1 with
+  | nil =>
+      intro ops2 s
+      show runOps ops2 s = _
+      rw [runOps_nil]
+  | cons op rest ih =>
+      intro ops2 s
+      -- Split on whether `op` is `.ifOp`.
+      cases op with
+      | ifOp thn els =>
+          -- runOps (.ifOp thn els :: rest ++ ops2) s — branches on top-of-stack bool.
+          show runOps (.ifOp thn els :: (rest ++ ops2)) s
+              = match runOps (.ifOp thn els :: rest) s with
+                | Except.error e => Except.error e
+                | Except.ok s' => runOps ops2 s'
+          rw [runOps.eq_2 s thn els (rest ++ ops2),
+              runOps.eq_2 s thn els rest]
+          cases hPop : s.pop? with
+          | none => rfl
+          | some popResult =>
+              obtain ⟨v, s'⟩ := popResult
+              simp only []
+              cases hBool : asBool? v with
+              | none => rfl
+              | some condV =>
+                  cases condV with
+                  | true =>
+                      simp only []
+                      cases hThn : runOps thn s' with
+                      | error e => rfl
+                      | ok s'' =>
+                          simp only []
+                          exact ih ops2 s''
+                  | false =>
+                      simp only []
+                      cases els with
+                      | none =>
+                          simp only []
+                          exact ih ops2 s'
+                      | some elsB =>
+                          simp only []
+                          cases hEls : runOps elsB s' with
+                          | error e => rfl
+                          | ok s'' =>
+                              simp only []
+                              exact ih ops2 s''
+      | push v =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq (.push v) (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq (.push v) rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf (.push v) s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | dup =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq .dup (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq .dup rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf .dup s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | swap =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq .swap (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq .swap rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf .swap s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | roll d =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq (.roll d) (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq (.roll d) rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf (.roll d) s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | pick d =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq (.pick d) (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq (.pick d) rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf (.pick d) s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | pickStruct d =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq (.pickStruct d) (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq (.pickStruct d) rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf (.pickStruct d) s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | drop =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq .drop (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq .drop rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf .drop s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | nip =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq .nip (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq .nip rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf .nip s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | over =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq .over (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq .over rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf .over s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | rot =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq .rot (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq .rot rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf .rot s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | tuck =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq .tuck (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq .tuck rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf .tuck s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | opcode code =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq (.opcode code) (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq (.opcode code) rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf (.opcode code) s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | placeholder i n =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq (.placeholder i n) (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq (.placeholder i n) rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf (.placeholder i n) s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | pushCodesepIndex =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq .pushCodesepIndex (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq .pushCodesepIndex rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf .pushCodesepIndex s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+      | rawBytes b =>
+          rw [List.cons_append,
+              runOps_cons_nonIf_eq (.rawBytes b) (rest ++ ops2) s
+                (fun _ _ h => StackOp.noConfusion h),
+              runOps_cons_nonIf_eq (.rawBytes b) rest s
+                (fun _ _ h => StackOp.noConfusion h)]
+          cases stepNonIf (.rawBytes b) s with
+          | error e => rfl
+          | ok s' => exact ih ops2 s'
+
+/-! ## Cons-step note
+
+Lean's `rfl` doesn't reduce `runOps (op :: rest) s` to its
+match-on-`stepNonIf` body for an abstract `op` (the inner
+match-on-`rest, s'` makes the unfolding non-definitional). Proofs
+that need the cons-step shape apply `unfold runOps` followed by
+`rw [stepNonIf_<op>]` and `cases` on the match alternatives — see
+the verify-fuse proofs in `Stack.Peephole` for the recipe.
+-/
+
+/-! ## Wave 32 Deliverable B — per-binding SUCCESS cons-step (stack side)
+
+The success-direction stack cons-step, stated at the BARE-opcode layer
+(`Stack.Lower.binopOpcode` post-dates this module — it does not import
+`Stack.Eval` — so the cons-step is keyed on the concrete emittable opcode
+strings `"OP_ADD"` / `"OP_SUB"` / `"OP_MUL"` / `"OP_NEGATE"`).  When the
+top two stack values are `.vBigint`, the opcode reduces (via `liftIntBin`)
+to a push of the result, so `runOps (.opcode code :: rest)` UNFOLDS to
+`runOps rest` on the consumed-and-pushed stack.  The per-binding op chunk
+is the swap/load prefix `++ [.opcode …]`; the chunk-level packaging
+`runOps (chunk ++ restOps) = runOps restOps stkSt'` is assembled by the
+caller via `runOps_append` (smoke B exercises that shape).
+
+These need ONLY the top-two operands' bigint-ness, not whole-state typing. -/
+
+/-- `popN _ 2` on a two-deep stack returns the top two in pop-order with
+the residual stack underneath.  In-module reduction (no `Stack.Sim`). -/
+theorem popN_two_bigint_local
+    (s : StackState) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    popN s 2 = .ok ([.vBigint b, .vBigint a], { s with stack := rest }) := by
+  show (match s.pop? with
+        | none => Except.error (.unsupported "stack underflow")
+        | some (v, s') =>
+            match popN s' 1 with
+            | Except.error e => Except.error e
+            | Except.ok (vs, s'') => Except.ok (v :: vs, s''))
+      = Except.ok ([Value.vBigint b, Value.vBigint a], { s with stack := rest })
+  unfold StackState.pop?
+  rw [hStk]
+  rfl
+
+/-- `liftIntBin` on a bigint top-two reduces to a push of `f a b` (with `a`
+the second-from-top, `b` the top).  In-module. -/
+theorem liftIntBin_bigint_local
+    (s : StackState) (f : Int → Int → Value) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    liftIntBin s f = .ok ({ s with stack := rest }.push (f a b)) := by
+  unfold liftIntBin
+  rw [popN_two_bigint_local s a b rest hStk]
+  simp only [asInt?]
+
+/-- `liftIntBinNum` on a bigint top-two reduces to a push of `f a b`, exactly
+like `liftIntBin_bigint_local`.  The consensus `asNum?` coercion agrees with
+`asInt?` on `vBigint` operands (`asNum?_vBigint`), so the comparison /
+numeric-select opcodes wired through `liftIntBinNum` keep their bigint-operand
+success behaviour bit-for-bit.  In-module. -/
+theorem liftIntBinNum_bigint_local
+    (s : StackState) (f : Int → Int → Value) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    liftIntBinNum s f = .ok ({ s with stack := rest }.push (f a b)) := by
+  unfold liftIntBinNum
+  rw [popN_two_bigint_local s a b rest hStk]
+  simp only [asNum?, asInt?]
+
+/-- `liftIntUnary` on a bigint top reduces to a push of `f a`.  In-module. -/
+theorem liftIntUnary_bigint_local
+    (s : StackState) (f : Int → Value) (a : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint a :: rest) :
+    liftIntUnary s f = .ok ({ s with stack := rest }.push (f a)) := by
+  unfold liftIntUnary StackState.pop?
+  rw [hStk]
+  simp only [asInt?]
+
+/-- The three emittable arith opcodes each reduce to a bigint push on a
+bigint top-two (`a` second-from-top, `b` top).  The pushed result is the
+op applied with the source operand order (`a ⊙ b`). -/
+theorem runOpcode_ADD_bigint_local
+    (s : StackState) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    runOpcode "OP_ADD" s = .ok ({ s with stack := rest }.push (.vBigint (a + b))) := by
+  show liftIntBin s (fun a b => .vBigint (a + b)) = _
+  exact liftIntBin_bigint_local s _ a b rest hStk
+
+theorem runOpcode_SUB_bigint_local
+    (s : StackState) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    runOpcode "OP_SUB" s = .ok ({ s with stack := rest }.push (.vBigint (a - b))) := by
+  show liftIntBin s (fun a b => .vBigint (a - b)) = _
+  exact liftIntBin_bigint_local s _ a b rest hStk
+
+theorem runOpcode_MUL_bigint_local
+    (s : StackState) (a b : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    runOpcode "OP_MUL" s = .ok ({ s with stack := rest }.push (.vBigint (a * b))) := by
+  show liftIntBin s (fun a b => .vBigint (a * b)) = _
+  exact liftIntBin_bigint_local s _ a b rest hStk
+
+theorem runOpcode_NEGATE_bigint_local
+    (s : StackState) (a : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint a :: rest) :
+    runOpcode "OP_NEGATE" s = .ok ({ s with stack := rest }.push (.vBigint (-a))) := by
+  show liftIntUnary s (fun i => .vBigint (-i)) = _
+  exact liftIntUnary_bigint_local s _ a rest hStk
+
+/-- The result `Int` of an emittable arith binOpcode on a bigint top-two
+(`a` second-from-top, `b` top).  Stated on the OPCODE string so it sits in
+`Stack.Eval` (the surface-level `op` is mapped to the opcode by the caller
+via `Stack.Lower.binopOpcode`). -/
+def binOpcodeResultInt (code : String) (a b : Int) : Int :=
+  match code with
+  | "OP_ADD" => a + b
+  | "OP_SUB" => a - b
+  | "OP_MUL" => a * b
+  | _        => 0
+
+/-- An emittable arith binOpcode reduces to a push of `binOpcodeResultInt`
+on a bigint top-two.  Folds the three opcode-specific reductions. -/
+theorem runOpcode_binOpcode_bigint_local
+    (code : String) (s : StackState) (a b : Int) (rest : List Value)
+    (hCode : code = "OP_ADD" ∨ code = "OP_SUB" ∨ code = "OP_MUL")
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    runOpcode code s
+      = .ok ({ s with stack := rest }.push (.vBigint (binOpcodeResultInt code a b))) := by
+  rcases hCode with h | h | h <;> subst h
+  · exact runOpcode_ADD_bigint_local s a b rest hStk
+  · exact runOpcode_SUB_bigint_local s a b rest hStk
+  · exact runOpcode_MUL_bigint_local s a b rest hStk
+
+/-- **Wave 32 Deliverable B — stack binOpcode SUCCESS cons-step.**
+
+For an emittable arith opcode `code ∈ {OP_ADD, OP_SUB, OP_MUL}` whose top
+two stack values are `.vBigint b` (top) and `.vBigint a`, `runOps` of the
+opcode cons advances by exactly one binding: it equals `runOps` of `stkRest`
+on the state with the two operands consumed and the bigint result pushed. -/
+theorem runOps_binopOpcode_bigint_cons_step
+    (code : String) (stkRest : List StackOp) (s : StackState)
+    (a b : Int) (rest : List Value)
+    (hCode : code = "OP_ADD" ∨ code = "OP_SUB" ∨ code = "OP_MUL")
+    (hStk : s.stack = .vBigint b :: .vBigint a :: rest) :
+    runOps (.opcode code :: stkRest) s
+      = runOps stkRest
+          ({ s with stack := rest }.push (.vBigint (binOpcodeResultInt code a b))) := by
+  rw [runOps_cons_nonIf_eq (.opcode code) stkRest s
+        (fun _ _ h => StackOp.noConfusion h), stepNonIf_opcode,
+      runOpcode_binOpcode_bigint_local code s a b rest hCode hStk]
+
+/-- **Wave 32 Deliverable B (unary peer) — stack unaryOpcode SUCCESS
+cons-step (`OP_NEGATE`).** -/
+theorem runOps_unaryOpcode_bigint_cons_step
+    (stkRest : List StackOp) (s : StackState)
+    (a : Int) (rest : List Value)
+    (hStk : s.stack = .vBigint a :: rest) :
+    runOps (.opcode "OP_NEGATE" :: stkRest) s
+      = runOps stkRest ({ s with stack := rest }.push (.vBigint (-a))) := by
+  rw [runOps_cons_nonIf_eq (.opcode "OP_NEGATE") stkRest s
+        (fun _ _ h => StackOp.noConfusion h), stepNonIf_opcode,
+      runOpcode_NEGATE_bigint_local s a rest hStk]
+
+/-- **Wave 32 — MANDATORY smoke B.** A concrete per-binding op chunk
+`[.swap, .opcode "OP_ADD"]` (a swap-prefix chunk in the wave-27/28 shape)
+followed by trailing ops, on a bigint top-two, reduces by exactly one
+binding via `runOps_append` + the cons-step.  Concretely: stack `[3, 4, 9]`
+(top `3`), the swap yields `[4, 3, 9]`, `OP_ADD` consumes the top two and
+pushes `4 + 3 = 7`, leaving `[7, 9]`; a trailing `OP_NEGATE` then negates
+to `[-7, 9]`.  This exercises the chunk-`++`-rest packaging the glue uses. -/
+theorem wave32_stack_cons_step_smoke :
+    runOps
+        ([StackOp.swap, StackOp.opcode "OP_ADD"] ++ [StackOp.opcode "OP_NEGATE"])
+        ({ stack := [.vBigint 3, .vBigint 4, .vBigint 9] } : StackState)
+      = .ok ({ stack := [.vBigint (-7), .vBigint 9] } : StackState) := by
+  rw [runOps_append]
+  -- Run the swap-prefix chunk: swap then OP_ADD.
+  have hChunk :
+      runOps [StackOp.swap, StackOp.opcode "OP_ADD"]
+          ({ stack := [.vBigint 3, .vBigint 4, .vBigint 9] } : StackState)
+        = .ok ({ stack := [.vBigint 7, .vBigint 9] } : StackState) := by
+    rw [runOps_cons_nonIf_eq StackOp.swap [StackOp.opcode "OP_ADD"]
+          ({ stack := [.vBigint 3, .vBigint 4, .vBigint 9] } : StackState)
+          (fun _ _ h => StackOp.noConfusion h), stepNonIf_swap]
+    show runOps [StackOp.opcode "OP_ADD"]
+        ({ stack := [.vBigint 4, .vBigint 3, .vBigint 9] } : StackState) = _
+    rw [runOps_binopOpcode_bigint_cons_step "OP_ADD" []
+          ({ stack := [.vBigint 4, .vBigint 3, .vBigint 9] } : StackState) 3 4 [.vBigint 9]
+          (Or.inl rfl) rfl]
+    simp only [binOpcodeResultInt, runOps_nil, StackState.push]
+    rfl
+  rw [hChunk]
+  -- Run the trailing OP_NEGATE via the unary cons-step.
+  show runOps [StackOp.opcode "OP_NEGATE"]
+      ({ stack := [.vBigint 7, .vBigint 9] } : StackState) = _
+  rw [runOps_unaryOpcode_bigint_cons_step []
+        ({ stack := [.vBigint 7, .vBigint 9] } : StackState)
+        7 [.vBigint 9] rfl]
+  simp only [runOps_nil, StackState.push]
+
+/-- Convenience: run a program's named method against an initial state. -/
+def runMethod (p : StackProgram) (methodName : String) (initial : StackState) :
+    EvalResult StackState :=
+  runOps (p.bodyOf methodName) initial
+
+end Eval
+end RunarVerification.Stack

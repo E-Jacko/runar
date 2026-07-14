@@ -1,0 +1,55 @@
+{
+  "artifact": {
+    "version": "runar-v1.0.0-rc.1",
+    "compilerVersion": "1.0.0-rc.1",
+    "contractName": "BooleanLogic",
+    "parentClass": "SmartContract",
+    "abi": {
+      "constructor": {
+        "params": [
+          {
+            "name": "threshold",
+            "type": "bigint"
+          }
+        ]
+      },
+      "methods": [
+        {
+          "name": "verify",
+          "params": [
+            {
+              "name": "a",
+              "type": "bigint"
+            },
+            {
+              "name": "b",
+              "type": "bigint"
+            },
+            {
+              "name": "flag",
+              "type": "boolean"
+            }
+          ],
+          "isPublic": true
+        }
+      ]
+    },
+    "script": "7b00a07b00a06e9a7b7b9b7b919a9b",
+    "constructorSlots": [
+      {
+        "paramIndex": 0,
+        "byteOffset": 1
+      },
+      {
+        "paramIndex": 0,
+        "byteOffset": 4
+      }
+    ]
+  },
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "10"
+    }
+  ]
+}

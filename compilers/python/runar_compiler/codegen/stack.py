@@ -28,6 +28,46 @@ from runar_compiler.ir.types import (
 
 MAX_STACK_DEPTH = 800
 
+
+# ---------------------------------------------------------------------------
+# State-field type classification helpers.
+#
+# These mirror ``is_numeric_state_type`` / ``is_variable_length_state_type`` in
+# ``compilers/rust/src/codegen/stack.rs``.  The validator accepts 14 property
+# types but only three shapes matter for deserialization:
+#
+#   * Numeric / script-number:   require OP_BIN2NUM after extraction.
+#   * Variable-length:           stored with a push-data length prefix and
+#                                must be parsed with ``emit_push_data_decode``
+#                                instead of a fixed OP_SPLIT.
+#   * Fixed-length byte strings: extracted with a plain fixed-size OP_SPLIT.
+# ---------------------------------------------------------------------------
+
+_NUMERIC_STATE_TYPES: frozenset[str] = frozenset({
+    "bigint",
+    "boolean",
+    # RabinSig / RabinPubKey are bigint aliases -- same 8-byte script-number
+    # layout in state.
+    "RabinSig",
+    "RabinPubKey",
+})
+
+_VARIABLE_LENGTH_STATE_TYPES: frozenset[str] = frozenset({
+    "ByteString",
+    "Sig",
+    "SigHashPreimage",
+})
+
+
+def is_numeric_state_type(t: str) -> bool:
+    """State types that are stored as script numbers (need OP_BIN2NUM)."""
+    return t in _NUMERIC_STATE_TYPES
+
+
+def is_variable_length_state_type(t: str) -> bool:
+    """State types that are stored with a push-data length prefix."""
+    return t in _VARIABLE_LENGTH_STATE_TYPES
+
 # ---------------------------------------------------------------------------
 # Stack IR types
 # ---------------------------------------------------------------------------
@@ -49,7 +89,7 @@ class StackOp:
 
     op: str = ""             # "push", "dup", "swap", "roll", "pick", "drop",
                              # "opcode", "if", "nip", "over", "rot", "tuck",
-                             # "placeholder"
+                             # "placeholder", "raw_bytes"
     value: Optional[PushValue] = None   # for push ops
     depth: int = 0           # for roll/pick (informational)
     code: str = ""           # for opcode ops (e.g. "OP_ADD")
@@ -59,6 +99,14 @@ class StackOp:
     param_name: str = ""     # for placeholder ops -- name of constructor param
     source_loc: Optional[SourceLocation] = None  # debug source location for source maps
 
+    # raw_bytes -- opaque opcode-byte span emitted verbatim by a raw_script
+    # ANF node. Stack effect is declared via in_arity / out_arity; the bytes
+    # are never inspected and the peephole optimizer treats this op as a
+    # hard barrier.
+    raw_bytes: Optional[bytes] = None
+    in_arity: int = 0
+    out_arity: int = 0
+
 
 @dataclass
 class StackMethod:
@@ -67,6 +115,73 @@ class StackMethod:
     name: str = ""
     ops: list[StackOp] = field(default_factory=list)
     max_stack_depth: int = 0
+    # True if the unlocking script is prefixed with _codePart — needed for
+    # continuation builders OR terminal methods that read variable-length
+    # (ByteString) state (issue #100). Propagated to ABIMethod.usesCodePart.
+    uses_code_part: bool = False
+
+
+# ---------------------------------------------------------------------------
+# OP_PUSH_TX on-chain signature derivation (BUG-100 fix)
+# ---------------------------------------------------------------------------
+#
+# The insecure legacy checkPreimage accepted a witness signature over the real
+# spending transaction and checked it against pubkey G, never reading the pushed
+# preimage — so the preimage was decoupled from the tx. This derives the ECDSA
+# signature FROM the preimage on-chain (s = (hash256(preimage) + r)*k^-1 mod n,
+# fixed nonce, privkey d=1, low-S, minimal DER), so OP_CHECKSIG passes only when
+# hash256(preimage) equals the real tx sighash.
+#
+# The construction compiles to a FIXED byte sequence identical across all seven
+# tiers; it is the canonical output of the TypeScript reference
+# (packages/runar-compiler/src/passes/oppushtx-codegen.ts). Emitted as a single
+# opaque raw_bytes op (peephole barrier). The cross-tier conformance suite
+# guards that this constant matches every other tier byte-for-byte.
+_CHECK_PREIMAGE_BINDING_HEX = (
+    "76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e"
+    "7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f"
+    "7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c"
+    "7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c51"
+    "7f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b"
+    "7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c"
+    "7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6"
+    "009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f952141"
+    "4136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b757893"
+    "7c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa078"
+    "21414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c94"
+    "9594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c51"
+    "7f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b"
+    "7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c"
+    "517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b"
+    "7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e"
+    "7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f"
+    "7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f"
+    "9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e"
+    "01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad"
+)
+
+# SIGHASH_ALL | SIGHASH_FORKID — default appended sighash flag byte in the
+# binding blob above. The append is encoded ``01<flag>7e`` (OP_DATA_1, flag byte,
+# OP_CAT); this pattern occurs exactly once in the canonical blob (issue #123).
+_SIGHASH_ALL_FORKID = 0x41
+_DEFAULT_SIGHASH_APPEND = "01417e"
+
+
+def _binding_hex_with_sighash_flag(sighash_flag: int) -> str:
+    """Return the canonical preimage-binding blob with its appended sighash flag
+    byte swapped for ``sighash_flag`` (issue #123).
+
+    The default blob appends ``push(0x41) OP_CAT`` (``01417e``) exactly once. A
+    non-default @sighash mode changes ONLY that byte — byte-exact equivalent to
+    the TS reference regenerating the blob with a different flag.
+    """
+    replacement = f"01{sighash_flag & 0xFF:02x}7e"
+    if _CHECK_PREIMAGE_BINDING_HEX.count(_DEFAULT_SIGHASH_APPEND) != 1:
+        # Defensive: the anchor must be unique or the substitution is unsafe.
+        raise AssertionError(
+            "check-preimage binding blob no longer has a unique sighash-flag anchor"
+        )
+    return _CHECK_PREIMAGE_BINDING_HEX.replace(_DEFAULT_SIGHASH_APPEND, replacement)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +323,10 @@ class StackMap:
         """Return the set of all non-empty slot names."""
         return {s for s in self.slots if s}
 
+    def debug_slots(self) -> str:
+        """Debug string of the slot names (bottom -> top) for error messages."""
+        return ", ".join(self.slots)
+
 
 # ---------------------------------------------------------------------------
 # Use analysis -- determine last-use sites for each variable
@@ -215,11 +334,46 @@ class StackMap:
 
 def compute_last_uses(bindings: list[ANFBinding]) -> dict[str, int]:
     last_use: dict[str, int] = {}
+    # Pre-scan: map each array_literal binding to its element refs. Used to
+    # propagate last-use across the array indirection (the array binding is
+    # pure metadata in _lower_array_literal -- its elements must remain live
+    # until the array's consumer, not until the array_literal binding itself).
+    array_elems: dict[str, list[str]] = {}
+    for b in bindings:
+        if b.value.kind == "array_literal":
+            array_elems[b.name] = list(b.value.elements)
     for i, binding in enumerate(bindings):
+        # array_literal is metadata-only -- do NOT advance its elements'
+        # last-use to here; defer to the array's consumer.
+        if binding.value.kind == "array_literal":
+            continue
         refs = collect_refs(binding.value)
         for ref in refs:
             last_use[ref] = i
+            if ref in array_elems:
+                for e in array_elems[ref]:
+                    last_use[e] = i
     return last_use
+
+
+def collect_deep_binding_names(bindings: list[ANFBinding]) -> set[str]:
+    """Collect every binding name defined anywhere in a binding sequence,
+    recursing into nested if-branches and loop bodies. Used by _lower_loop to
+    distinguish loop-internal (re)definitions from true outer-scope refs.
+    """
+    names: set[str] = set()
+
+    def walk(bs: list[ANFBinding]) -> None:
+        for b in bs:
+            names.add(b.name)
+            if b.value.kind == "if":
+                walk(b.value.then)
+                walk(b.value.else_)
+            elif b.value.kind == "loop":
+                walk(b.value.body)
+
+    walk(bindings)
+    return names
 
 
 def collect_refs(value: ANFValue) -> list[str]:
@@ -268,8 +422,20 @@ def collect_refs(value: ANFValue) -> list[str]:
     elif kind == "add_raw_output":
         refs.append(value.satoshis)
         refs.append(value.script_bytes)
+    elif kind == "add_data_output":
+        refs.append(value.satoshis)
+        refs.append(value.script_bytes)
     elif kind == "array_literal":
         refs.extend(value.elements)
+    elif kind == "raw_script":
+        # Opaque byte span -- no SSA operand refs. Stack effect is declared
+        # via in_arity / out_arity.
+        pass
+    else:
+        # Exhaustiveness guard. A silent empty-refs fall-through would let
+        # computeLastUses miss a live operand and corrupt the stack plan.
+        from runar_compiler.ir.unknown_anf_kind_error import UnknownANFKindError
+        raise UnknownANFKindError(kind, "stack.collect_refs")
 
     return refs
 
@@ -303,6 +469,31 @@ class _LoweringContext:
         self.outer_protected_refs: Optional[set[str]] = None
         self.inside_branch: bool = False
         self.current_source_loc: Optional[SourceLocation] = None
+        self.const_values: dict[str, int | str | bool] = {}
+        # Element counts for array_literal bindings (used by checkMultiSig).
+        self.array_lengths: dict[str, int] = {}
+        # Element refs for array_literal bindings (used by checkMultiSig).
+        self.array_elements: dict[str, list[str]] = {}
+
+        # Issue #130 (stack layer): a method param whose name collides with a
+        # MUTABLE property gets a duplicate stackMap slot once
+        # ``deserialize_state`` pushes that property under the same name. Name
+        # lookups resolve to the shallowest match (the deserialized property),
+        # so ``load_param`` would read the stale on-chain state instead of the
+        # witness value. Rename the colliding param's slot to a reserved,
+        # collision-proof name up front and remember the mapping so
+        # ``_lower_load_param`` targets the real param slot. Only mutable
+        # properties are deserialized onto the stack, so readonly shadows
+        # (handled purely by ANF resolution) never enter this map, and
+        # non-colliding contracts get an empty map -- byte-identical output.
+        self.renamed_params: dict[str, str] = {}
+        mutable_prop_names = {p.name for p in properties if not p.readonly}
+        for name in (params or []):
+            if name in mutable_prop_names:
+                renamed = f"__param_{name}"
+                self.sm.rename_at_depth(self.sm.find_depth(name), renamed)
+                self.renamed_params[name] = renamed
+
         self._track_depth()
 
     def _track_depth(self) -> None:
@@ -321,13 +512,59 @@ class _LoweringContext:
         Expects stack: [..., script, len]
         Leaves stack:  [..., script, varint_bytes]
 
-        OP_NUM2BIN uses sign-magnitude encoding where values 128-255 need
-        2 bytes (sign bit). To produce a correct 1-byte unsigned varint,
-        we use OP_NUM2BIN 2 then SPLIT to extract only the low byte.
-        Similarly for 2-byte unsigned varint, we use OP_NUM2BIN 4 then SPLIT.
+        Bitcoin varint format:
+          len < 0xfd:        1 byte (len itself)
+          len <= 0xffff:     0xfd + 2 bytes LE                (3 bytes)
+          len <= 0xffffffff: 0xfe + 4 bytes LE                (5 bytes)
+          otherwise:         0xff + 8 bytes LE                (9 bytes — never
+                                                               used in practice
+                                                               for BSV scripts)
+
+        We must support all four shapes; emitting a 3-byte varint for a script
+        whose length exceeds 0xffff produces a truncated value that no longer
+        matches what the BSV node uses for hashOutputs, breaking the
+        state-continuation hash equality assertion downstream. (This is the
+        second of the two bugs fixed alongside the variable-length state
+        varint stripping — see `integration/go/contracts/RollupBug.runar.go`.)
+
+        OP_NUM2BIN uses sign-magnitude encoding where high-bit values need an
+        extra sign byte; we generate one extra byte and then SPLIT off the
+        unsigned low bytes to get the correct unsigned varint payload.
         """
         # Stack: [..., script, len]
-        self.emit_op(StackOp(op="dup"))  # [script, len, len]
+
+        # emit_num_to_low_bytes: [..., len] -> [..., low_n_bytes]. Uses
+        # NUM2BIN(n+1) then SPLIT(n) DROP to drop the sign byte.
+        def emit_num_to_low_bytes(n_bytes: int) -> None:
+            self.emit_op(StackOp(op="push", value=big_int_push(n_bytes + 1)))
+            self.sm.push("")
+            self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
+            self.sm.pop()
+            self.sm.pop()
+            self.sm.push("")
+            self.emit_op(StackOp(op="push", value=big_int_push(n_bytes)))
+            self.sm.push("")
+            self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
+            self.sm.pop()
+            self.sm.pop()
+            self.sm.push("")
+            self.sm.push("")
+            self.emit_op(StackOp(op="drop"))
+            self.sm.pop()
+
+        # emit_prefix: [..., script, low_bytes] -> [..., script, prefix||low_bytes].
+        def emit_prefix(prefix_byte: int) -> None:
+            self.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=bytes([prefix_byte]))))
+            self.sm.push("")
+            self.emit_op(StackOp(op="swap"))
+            self.sm.swap()
+            self.sm.pop()
+            self.sm.pop()
+            self.emit_op(StackOp(op="opcode", code="OP_CAT"))
+            self.sm.push("")
+
+        # IF len < 253: 1-byte varint.
+        self.emit_op(StackOp(op="dup"))
         self.sm.dup()
         self.emit_op(StackOp(op="push", value=big_int_push(253)))
         self.sm.push("")
@@ -335,54 +572,54 @@ class _LoweringContext:
         self.sm.pop()
         self.sm.pop()
         self.sm.push("")
-
         self.emit_op(StackOp(op="opcode", code="OP_IF"))
-        self.sm.pop()  # pop condition
-
-        # Then: 1-byte varint (len < 253)
-        self.emit_op(StackOp(op="push", value=big_int_push(2)))
-        self.sm.push("")
-        self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
         self.sm.pop()
-        self.sm.pop()
-        self.sm.push("")
-        self.emit_op(StackOp(op="push", value=big_int_push(1)))
-        self.sm.push("")
-        self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
-        self.sm.pop()
-        self.sm.pop()
-        self.sm.push("")  # lowByte
-        self.sm.push("")  # highByte
-        self.emit_op(StackOp(op="drop"))
-        self.sm.pop()
-
+        sm_at_1_byte = self.sm.clone()
+        emit_num_to_low_bytes(1)
         self.emit_op(StackOp(op="opcode", code="OP_ELSE"))
+        self.sm = sm_at_1_byte.clone()
 
-        # Else: 0xfd + 2-byte LE varint (len >= 253)
-        self.emit_op(StackOp(op="push", value=big_int_push(4)))
+        # ELSE-IF len <= 0xffff: 0xfd + 2-byte LE.
+        self.emit_op(StackOp(op="dup"))
+        self.sm.dup()
+        self.emit_op(StackOp(op="push", value=big_int_push(0x10000)))
         self.sm.push("")
-        self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
+        self.emit_op(StackOp(op="opcode", code="OP_LESSTHAN"))
         self.sm.pop()
         self.sm.pop()
         self.sm.push("")
-        self.emit_op(StackOp(op="push", value=big_int_push(2)))
-        self.sm.push("")
-        self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
+        self.emit_op(StackOp(op="opcode", code="OP_IF"))
         self.sm.pop()
-        self.sm.pop()
-        self.sm.push("")  # low2bytes
-        self.sm.push("")  # high2bytes
-        self.emit_op(StackOp(op="drop"))
-        self.sm.pop()
-        self.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=bytes([0xFD]))))
-        self.sm.push("")
-        self.emit_op(StackOp(op="swap"))
-        self.sm.swap()
-        self.sm.pop()
-        self.sm.pop()
-        self.emit_op(StackOp(op="opcode", code="OP_CAT"))
-        self.sm.push("")
+        sm_at_3_byte = self.sm.clone()
+        emit_num_to_low_bytes(2)
+        emit_prefix(0xFD)
+        self.emit_op(StackOp(op="opcode", code="OP_ELSE"))
+        self.sm = sm_at_3_byte.clone()
 
+        # ELSE-IF len <= 0xffffffff: 0xfe + 4-byte LE.
+        self.emit_op(StackOp(op="dup"))
+        self.sm.dup()
+        self.emit_op(StackOp(op="push", value=big_int_push(0x100000000)))
+        self.sm.push("")
+        self.emit_op(StackOp(op="opcode", code="OP_LESSTHAN"))
+        self.sm.pop()
+        self.sm.pop()
+        self.sm.push("")
+        self.emit_op(StackOp(op="opcode", code="OP_IF"))
+        self.sm.pop()
+        sm_at_5_byte = self.sm.clone()
+        emit_num_to_low_bytes(4)
+        emit_prefix(0xFE)
+        self.emit_op(StackOp(op="opcode", code="OP_ELSE"))
+        self.sm = sm_at_5_byte.clone()
+
+        # ELSE: 0xff + 8-byte LE. (>= 4 GiB script — practically unreachable
+        # on BSV but kept for spec completeness so we never silently truncate.)
+        emit_num_to_low_bytes(8)
+        emit_prefix(0xFF)
+
+        self.emit_op(StackOp(op="opcode", code="OP_ENDIF"))
+        self.emit_op(StackOp(op="opcode", code="OP_ENDIF"))
         self.emit_op(StackOp(op="opcode", code="OP_ENDIF"))
         # --- Stack: [..., script, varint] ---
 
@@ -620,11 +857,72 @@ class _LoweringContext:
 
         self._track_depth()
 
+    def drain_branch_private_residue(self, pre_if_names: set[str]) -> None:
+        """Drain branch-private residue from below TOS at the end of a branch
+        body, so both branches converge to a layout the parent stack model can
+        faithfully describe before OP_ENDIF (issue #36).
+
+        A slot is residue when its name is NOT in ``pre_if_names`` (the
+        snapshot of the parent's named slots taken before the branch ran).
+        This catches both anonymous slots (empty-named, pushed by intrinsics
+        like substr's OP_SPLIT residue) and named branch-local bindings that
+        lingered past their last-use (e.g. dead-code load_const intermediates
+        the optimizer didn't fold).
+
+        Slots whose name was already in ``pre_if_names`` are kept --
+        including duplicates created by reassigning an outer-scope local from
+        inside the branch. The TOS slot is also kept regardless.
+        """
+        drain_depths: list[int] = []
+        for d in range(1, self.sm.depth()):
+            name = self.sm.peek_at_depth(d)
+            if not name:
+                drain_depths.append(d)
+            elif name not in pre_if_names:
+                drain_depths.append(d)
+        if not drain_depths:
+            return
+        drain_depths.sort(reverse=True)
+        for depth in drain_depths:
+            if depth == 1:
+                self.emit_op(StackOp(op="nip"))
+                self.sm.remove_at_depth(1)
+            else:
+                self.emit_op(StackOp(op="push", value=big_int_push(depth)))
+                self.sm.push("")
+                self.emit_op(StackOp(op="roll", depth=depth))
+                self.sm.pop()
+                rolled = self.sm.remove_at_depth(depth)
+                self.sm.push(rolled)
+                self.emit_op(StackOp(op="drop"))
+                self.sm.pop()
+
     def _is_last_use(self, ref: str, current_index: int, last_uses: dict[str, int]) -> bool:
         last = last_uses.get(ref)
         if last is None:
             return True
         return last <= current_index
+
+    def _operand_consume(self, ref: str, operands: list[str], binding_index: int,
+                         last_uses: dict[str, int]) -> bool:
+        """Consume-vs-copy decision for one operand of a multi-operand ANF value.
+
+        ``operands`` is the FULL operand-ref list of the value (including
+        ``ref`` itself). The load may consume (ROLL / move) the ref only when
+        this binding is the ref's last use AND the ref occurs exactly once in
+        the operand list. A ref read at more than one operand position of the
+        same value must be copied (PICK / DUP) at EVERY position: a
+        consume-mode bring_to_top of a ref already on top of the stack is a
+        no-op, so two consume-mode loads of the same ref would leave a single
+        slot for an opcode that pops one item per operand (e.g. ``t := x + x``
+        underflowing OP_ADD), or silently pair the opcode with the wrong slot.
+        The original then stays on the stack and the existing method epilogue
+        cleans it up. Unreachable from the frontend (pass 04 gives every
+        operand a fresh temp); reachable via compile_from_ir hand-written ANF.
+        """
+        if not self._is_last_use(ref, binding_index, last_uses):
+            return False
+        return operands.count(ref) <= 1
 
     # -----------------------------------------------------------------
     # lower_bindings
@@ -708,7 +1006,8 @@ class _LoweringContext:
         elif kind == "if":
             self._lower_if(name, value.cond, value.then, value.else_, binding_index, last_uses)
         elif kind == "loop":
-            self._lower_loop(name, value.count, value.body, value.iter_var)
+            self._lower_loop(name, value.count, value.body, value.iter_var,
+                             value.start, value.step, binding_index, last_uses)
         elif kind == "assert":
             self._lower_assert(value.value_ref, binding_index, last_uses, False)
         elif kind == "update_prop":
@@ -716,15 +1015,27 @@ class _LoweringContext:
         elif kind == "get_state_script":
             self._lower_get_state_script(name)
         elif kind == "check_preimage":
-            self._lower_check_preimage(name, value.preimage, binding_index, last_uses)
+            self._lower_check_preimage(name, value.preimage, value.sighash_flag, binding_index, last_uses)
         elif kind == "deserialize_state":
             self._lower_deserialize_state(value.preimage, binding_index, last_uses)
         elif kind == "add_output":
             self._lower_add_output(name, value.satoshis, value.state_values, value.preimage, binding_index, last_uses)
         elif kind == "add_raw_output":
             self._lower_add_raw_output(name, value.satoshis, value.script_bytes, binding_index, last_uses)
+        elif kind == "add_data_output":
+            # Wire shape is identical to add_raw_output; the distinction only
+            # matters at the continuation-hash composition stage in ANF.
+            self._lower_add_raw_output(name, value.satoshis, value.script_bytes, binding_index, last_uses)
         elif kind == "array_literal":
             self._lower_array_literal(name, value.elements, binding_index, last_uses)
+        elif kind == "raw_script":
+            self._lower_raw_script(name, value.bytes, value.in_arity, value.out_arity)
+        else:
+            # Exhaustiveness guard. A silent no-op fall-through would emit
+            # zero opcodes for a binding the caller expects to leave a value
+            # on the stack, desynchronizing every subsequent lowering step.
+            from runar_compiler.ir.unknown_anf_kind_error import UnknownANFKindError
+            raise UnknownANFKindError(kind, "stack.lower_binding")
 
     # -----------------------------------------------------------------
     # Individual lowering methods
@@ -732,14 +1043,27 @@ class _LoweringContext:
 
     def _lower_load_param(self, binding_name: str, param_name: str,
                           binding_index: int, last_uses: dict[str, int]) -> None:
-        if self.sm.has(param_name):
+        # The parameter is already on the stack under its original name -- or,
+        # for a param that shadows a mutable property, under a reserved renamed
+        # slot (issue #130) so it is not confused with the deserialized
+        # property slot.
+        slot_name = self.renamed_params.get(param_name, param_name)
+        if self.sm.has(slot_name):
             is_last = self._is_last_use(param_name, binding_index, last_uses)
-            self.bring_to_top(param_name, is_last)
+            self.bring_to_top(slot_name, is_last)
             self.sm.pop()
             self.sm.push(binding_name)
         else:
-            self.emit_op(StackOp(op="push", value=big_int_push(0)))
-            self.sm.push(binding_name)
+            # Parameter no longer on the stack -- a compiler invariant
+            # violation (historically caused by unrolled loops consuming outer
+            # refs; see _lower_loop). Silently emitting OP_0 here produced
+            # scripts that compiled, passed the env-based interpreter, and then
+            # failed on chain -- fail loudly instead.
+            raise RuntimeError(
+                f"Stack lowering: method parameter '{param_name}' is not on the "
+                f"stack at a post-consumption reference (stack: [{self.sm.debug_slots()}]). "
+                f"Refusing to emit a silent OP_0 placeholder."
+            )
 
     def _lower_load_prop(self, binding_name: str, prop_name: str) -> None:
         prop: Optional[ANFProperty] = None
@@ -756,11 +1080,49 @@ class _LoweringContext:
             self._push_property_value(prop.initial_value)
         else:
             # Property value will be provided at deployment time; emit placeholder
+            # for its constructor slot.
+            #
+            # #119 tail (H1): a property that reaches this fallback with no
+            # matching constructor slot has no deploy-time bytes of its own. The
+            # previous behaviour left param_index at the count of ctor-param
+            # props, silently emitting a placeholder for an UNRELATED
+            # constructor argument's slot and splicing the wrong deploy-time
+            # bytes into the locking script -- a silent-wrong-code path. Fail
+            # loudly instead. (A real constructor-param property -- readonly, or
+            # a mutable state field whose initial value is spliced at deploy --
+            # is found here and is unaffected.)
             param_index = 0
-            for i, p in enumerate(self.properties):
+            found = False
+            ctor_params: list[str] = []
+            for p in self.properties:
+                if p.initial_value is not None:
+                    continue
+                ctor_params.append(p.name)
                 if p.name == prop_name:
-                    param_index = i
+                    found = True
                     break
+                param_index += 1
+            # A true ghost is a name absent from a NON-EMPTY registered
+            # constructor-param list -- exactly the silent-wrong-code case where
+            # the old code coerced it onto an unrelated registered slot. When no
+            # constructor-param property is registered (an empty ``ctor_params``
+            # -- e.g. a ``.runar.ts`` contract whose only constructor param is
+            # declared inline as ``readonly n`` and never surfaces as a property
+            # in this tier's TS parser), the name may still be a legitimate
+            # slot-0 argument, so preserve the historical placeholder rather than
+            # false-positive on a valid deploy-time slot.
+            if not found and ctor_params:
+                loc = ""
+                if self.current_source_loc is not None:
+                    sl = self.current_source_loc
+                    loc = f" at {sl.file}:{sl.line}:{sl.column}"
+                raise RuntimeError(
+                    f"Stack lowering: property '{prop_name}'{loc} is neither on "
+                    f"the stack, initialized, nor a constructor parameter, so it "
+                    f"has no deploy-time slot. Refusing to emit a placeholder for "
+                    f"an unrelated constructor argument (slot 0). Known "
+                    f"constructor-param properties: [{', '.join(ctor_params)}]."
+                )
             self.emit_op(StackOp(op="placeholder", param_index=param_index, param_name=prop_name))
         self.sm.push(binding_name)
 
@@ -783,6 +1145,14 @@ class _LoweringContext:
                 and len(value.const_string) > 5
                 and value.const_string[:5] == "@ref:"):
             ref_name = value.const_string[5:]
+            # Special case: aliasing an array_literal (metadata-only binding,
+            # not present in the stack-map). Copy the array metadata under
+            # the new binding name and emit no stack moves.
+            if ref_name in self.array_elements:
+                self.array_elements[binding_name] = list(self.array_elements[ref_name])
+                if ref_name in self.array_lengths:
+                    self.array_lengths[binding_name] = self.array_lengths[ref_name]
+                return
             if self.sm.has(ref_name):
                 # CRITICAL: Only consume (ROLL) if the ref target is a local binding
                 # in the current scope.  Outer-scope refs must be copied (PICK) so
@@ -795,9 +1165,16 @@ class _LoweringContext:
                 self.sm.pop()
                 self.sm.push(binding_name)
             else:
-                # Referenced value not on stack -- push placeholder
-                self.emit_op(StackOp(op="push", value=big_int_push(0)))
-                self.sm.push(binding_name)
+                # Referenced value no longer on the stack -- a compiler
+                # invariant violation (see _lower_load_param for the
+                # loop-consumption history). Fail loudly instead of silently
+                # emitting OP_0.
+                raise RuntimeError(
+                    f"Stack lowering: value '{ref_name}' referenced by "
+                    f"'{binding_name}' is not on the stack "
+                    f"(stack: [{self.sm.debug_slots()}]). "
+                    f"Refusing to emit a silent OP_0 placeholder."
+                )
             return
 
         # Handle @this marker -- compile-time concept, not a runtime value
@@ -808,10 +1185,13 @@ class _LoweringContext:
 
         if value.const_bool is not None:
             self.emit_op(StackOp(op="push", value=PushValue(kind="bool", bool_val=value.const_bool)))
+            self.const_values[binding_name] = value.const_bool
         elif value.const_int is not None:
             self.emit_op(StackOp(op="push", value=big_int_push(value.const_int)))
+            self.const_values[binding_name] = value.const_int
         elif value.const_string is not None:
             self.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=_hex_to_bytes(value.const_string))))
+            self.const_values[binding_name] = value.const_string
         else:
             # Fallback: push 0
             self.emit_op(StackOp(op="push", value=big_int_push(0)))
@@ -823,11 +1203,11 @@ class _LoweringContext:
 
     def _lower_bin_op(self, binding_name: str, op: str, left: str, right: str,
                       binding_index: int, last_uses: dict[str, int], result_type: str) -> None:
-        left_is_last = self._is_last_use(left, binding_index, last_uses)
-        self.bring_to_top(left, left_is_last)
+        left_consume = self._operand_consume(left, [left, right], binding_index, last_uses)
+        self.bring_to_top(left, left_consume)
 
-        right_is_last = self._is_last_use(right, binding_index, last_uses)
-        self.bring_to_top(right, right_is_last)
+        right_consume = self._operand_consume(right, [left, right], binding_index, last_uses)
+        self.bring_to_top(right, right_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -946,6 +1326,34 @@ class _LoweringContext:
             self._lower_ec_builtin(binding_name, func_name, args, binding_index, last_uses)
             return
 
+        if _is_nist_ec_builtin(func_name):
+            self._lower_nist_ec_builtin(binding_name, func_name, args, binding_index, last_uses)
+            return
+
+        if func_name in ("verifyECDSA_P256", "verifyECDSA_P384"):
+            self._lower_verify_ecdsa(binding_name, func_name, args, binding_index, last_uses)
+            return
+
+        if _is_bb_builtin(func_name):
+            self._lower_bb_builtin(binding_name, func_name, args, binding_index, last_uses)
+            return
+
+        if _is_kb_builtin(func_name):
+            self._lower_kb_builtin(binding_name, func_name, args, binding_index, last_uses)
+            return
+
+        if _is_bn254_builtin(func_name):
+            self._lower_bn254_builtin(binding_name, func_name, args, binding_index, last_uses)
+            return
+
+        if func_name == "merkleRootPoseidon2KB":
+            self._lower_merkle_root_poseidon2_kb(binding_name, args, binding_index, last_uses)
+            return
+
+        if _is_merkle_builtin(func_name):
+            self._lower_merkle_root(binding_name, func_name, args, binding_index, last_uses)
+            return
+
         if func_name in ("safediv", "safemod"):
             self._lower_safe_div_mod(binding_name, func_name, args, binding_index, last_uses)
             return
@@ -1023,8 +1431,8 @@ class _LoweringContext:
 
         # General builtin: push args in order, then emit opcodes
         for arg in args:
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
 
         # Pop all args
         for _ in args:
@@ -1045,8 +1453,8 @@ class _LoweringContext:
             self.sm.push("")            # left part
             self.sm.push(binding_name)  # right part (top)
         elif func_name == "len":
-            self.sm.push("")            # original value still present
-            self.sm.push(binding_name)  # size on top
+            self.emit_op(StackOp(op="opcode", code="OP_NIP"))  # remove original value, keep only size
+            self.sm.push(binding_name)
         else:
             self.sm.push(binding_name)
 
@@ -1094,8 +1502,8 @@ class _LoweringContext:
         for i, arg in enumerate(args):
             if i < len(method.params):
                 param_name = method.params[i].name
-                is_last = self._is_last_use(arg, binding_index, last_uses)
-                self.bring_to_top(arg, is_last)
+                consume = self._operand_consume(arg, args, binding_index, last_uses)
+                self.bring_to_top(arg, consume)
                 self.sm.pop()
 
                 # If param_name already exists on the stack, temporarily rename
@@ -1157,6 +1565,8 @@ class _LoweringContext:
         then_ctx.inside_branch = True
         then_ctx.lower_bindings(then_bindings, terminal_assert)
 
+        then_ctx.drain_branch_private_residue(pre_if_names)
+
         if terminal_assert and then_ctx.sm.depth() > 1:
             excess = then_ctx.sm.depth() - 1
             for _ in range(excess):
@@ -1169,6 +1579,8 @@ class _LoweringContext:
         else_ctx.outer_protected_refs = protected_refs
         else_ctx.inside_branch = True
         else_ctx.lower_bindings(else_bindings, terminal_assert)
+
+        else_ctx.drain_branch_private_residue(pre_if_names)
 
         if terminal_assert and else_ctx.sm.depth() > 1:
             excess = else_ctx.sm.depth() - 1
@@ -1233,16 +1645,20 @@ class _LoweringContext:
                     then_ctx.emit_op(StackOp(op="drop"))
                     then_ctx.sm.pop()
 
-        # Phase 3: single depth-balance check after ALL drops.
-        # Push placeholder only if one branch is still deeper than the other.
-        if then_ctx.sm.depth() > else_ctx.sm.depth():
-            # When the then-branch reassigned a local variable (if-without-else),
-            # push a COPY of that variable in the else-branch instead of a generic
-            # placeholder.
-            then_top_p3 = then_ctx.sm.peek_at_depth(0)
-            if (not else_bindings and then_top_p3
-                    and else_ctx.sm.has(then_top_p3)):
-                var_depth = else_ctx.sm.find_depth(then_top_p3)
+        # Phase 3: depth-balance reconciliation after ALL drops.
+        #
+        # Compensate the FULL depth difference between the branches — NOT just a
+        # single item. A conditional write of N state fields leaves N result
+        # values on the then-branch, so the (empty) else-branch must preserve N
+        # old values. Issue #99 Bug 1: the previous single-shot check only
+        # balanced a 1-item difference, leaving N>=2 conditional writes
+        # imbalanced by (N-1) and the update branch unspendable.
+        while then_ctx.sm.depth() > else_ctx.sm.depth():
+            result_depth = then_ctx.sm.depth() - else_ctx.sm.depth() - 1
+            then_name = then_ctx.sm.peek_at_depth(result_depth)
+            if (not else_bindings and then_name
+                    and else_ctx.sm.has(then_name)):
+                var_depth = else_ctx.sm.find_depth(then_name)
                 if var_depth == 0:
                     else_ctx.emit_op(StackOp(op="dup"))
                 else:
@@ -1250,13 +1666,26 @@ class _LoweringContext:
                     else_ctx.sm.push("")
                     else_ctx.emit_op(StackOp(op="pick", depth=var_depth))
                     else_ctx.sm.pop()
-                else_ctx.sm.push(then_top_p3)
+                else_ctx.sm.push(then_name)
             else:
                 else_ctx.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=b"")))
                 else_ctx.sm.push("")
-        elif else_ctx.sm.depth() > then_ctx.sm.depth():
+        while else_ctx.sm.depth() > then_ctx.sm.depth():
             then_ctx.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=b"")))
             then_ctx.sm.push("")
+
+        # Layer B — branch-balance invariant (#99 Bug 1 guard). After
+        # reconciliation the two arms of an OP_IF/OP_ELSE MUST leave the stack at
+        # identical depth; otherwise the post-ENDIF code (generated against a
+        # single assumed depth) is only correct for the branch the spender does
+        # not take, producing a silently-unspendable script.
+        if then_ctx.sm.depth() != else_ctx.sm.depth():
+            raise RuntimeError(
+                "internal codegen error: conditional emitted stack-imbalanced "
+                f"branches (then depth {then_ctx.sm.depth()} != else depth "
+                f"{else_ctx.sm.depth()}); would produce an unspendable script "
+                f"(see GitHub issue #99); binding={binding_name!r}"
+            )
 
         then_ops = then_ctx.ops
         else_ops = else_ctx.ops
@@ -1274,7 +1703,35 @@ class _LoweringContext:
                 self.sm.remove_at_depth(depth)
 
         # The if expression may produce a result value on top.
-        if then_ctx.sm.depth() > self.sm.depth():
+        if (not else_bindings
+                and then_ctx.sm.depth() > self.sm.depth()
+                and then_ctx.sm.depth() - self.sm.depth() >= 2):
+            # #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+            # values on top (new values if taken, preserved old values if
+            # skipped). Record the N results in their on-stack order, then
+            # physically remove the N stale old property values beneath them.
+            result_count = then_ctx.sm.depth() - self.sm.depth()
+            for i in range(result_count - 1, -1, -1):
+                name = then_ctx.sm.peek_at_depth(i) or binding_name
+                self.sm.push(name)
+            result_names = [self.sm.peek_at_depth(i) for i in range(result_count)]
+            for name in result_names:
+                if not name:
+                    continue
+                d = result_count
+                while d < self.sm.depth():
+                    if self.sm.peek_at_depth(d) == name:
+                        self.emit_op(StackOp(op="push", value=big_int_push(d)))
+                        self.sm.push("")
+                        self.emit_op(StackOp(op="roll", depth=d + 1))
+                        self.sm.pop()
+                        rolled = self.sm.remove_at_depth(d)
+                        self.sm.push(rolled)
+                        self.emit_op(StackOp(op="drop"))
+                        self.sm.pop()
+                        break
+                    d += 1
+        elif then_ctx.sm.depth() > self.sm.depth():
             then_top = then_ctx.sm.peek_at_depth(0)
             else_top = else_ctx.sm.peek_at_depth(0) if else_ctx.sm.depth() > 0 else ""
             is_property = any(p.name == then_top for p in self.properties)
@@ -1337,23 +1794,35 @@ class _LoweringContext:
     # -----------------------------------------------------------------
 
     def _lower_loop(self, binding_name: str, count: int,
-                    body: list[ANFBinding], iter_var: str) -> None:
+                    body: list[ANFBinding], iter_var: str,
+                    start: Optional[int] = None, step: Optional[int] = None,
+                    loop_binding_index: Optional[int] = None,
+                    enclosing_last_uses: Optional[dict[str, int]] = None) -> None:
+        # Iterator start value and step direction (issue #121). Older ANF
+        # payloads without start/step describe zero-start counting-up loops.
+        start_val = start if start is not None else 0
+        step_val = step if step is not None else 1
         # Collect body binding names
         body_binding_names: dict[str, bool] = {b.name: True for b in body}
 
-        # Collect outer-scope names referenced in the loop body
+        # Names (re)defined anywhere inside the loop body, nested branches
+        # included. A name the body itself binds is NOT an outer ref --
+        # reassigned locals (e.g. `off = off + ...` inside an if) flow through
+        # _lower_if's branch-reassignment reconciliation, not through
+        # protection here.
+        deep_body_binding_names = collect_deep_binding_names(body)
+
+        # Collect ALL outer-scope refs used anywhere in the body -- including
+        # refs that only occur inside nested if-branches (collect_refs
+        # recurses). The previous top-level-only scan missed nested references:
+        # a const defined before the loop and referenced only inside an
+        # if-branch was consumed by the first iteration, making iteration 2
+        # fail with "Value 'X' not found on stack".
         outer_refs: set[str] = set()
         for b in body:
-            if b.value.kind == "load_param" and b.value.name != iter_var:
-                outer_refs.add(b.value.name)
-            # Also protect @ref: targets from outer scope (not redefined in body)
-            if (b.value.kind == "load_const"
-                    and b.value.const_string is not None
-                    and len(b.value.const_string) > 5
-                    and b.value.const_string[:5] == "@ref:"):
-                ref_name = b.value.const_string[5:]
-                if ref_name not in body_binding_names:
-                    outer_refs.add(ref_name)
+            for ref in collect_refs(b.value):
+                if ref != iter_var and ref not in deep_body_binding_names:
+                    outer_refs.add(ref)
 
         # Temporarily extend localBindings with body binding names
         prev_local_bindings = self.local_bindings
@@ -1362,14 +1831,35 @@ class _LoweringContext:
         self.local_bindings = new_local_bindings
 
         for i in range(count):
-            self.emit_op(StackOp(op="push", value=big_int_push(i)))
+            # Push the iteration variable value (in case the loop body uses it).
+            # Iteration ``i`` binds ``start + i*step`` (issue #121); zero-start
+            # counting-up loops (start=0, step=1) reduce to ``i``, preserving
+            # the historical byte-for-byte lowering.
+            self.emit_op(StackOp(op="push", value=big_int_push(start_val + i * step_val)))
             self.sm.push(iter_var)
 
             last_uses = compute_last_uses(body)
 
-            # In non-final iterations, prevent outer-scope refs from being consumed
-            if i < count - 1:
-                for ref_name in outer_refs:
+            # Prevent outer-scope refs from being consumed by setting their
+            # last-use beyond any body binding index:
+            #  - in non-final iterations: always (the next iteration re-reads
+            #    them);
+            #  - in the FINAL iteration: when the enclosing scope still
+            #    references them AFTER the loop. Previously the final iteration
+            #    consumed every outer ref at its last body use, so a method
+            #    param (or const) referenced after the loop was gone from the
+            #    stack and was silently lowered to an OP_0/empty push --
+            #    compilation succeeded, the env-based interpreter passed, but
+            #    the emitted Script failed at runtime (silent interpreter <->
+            #    Script divergence).
+            is_final_iteration = i == count - 1
+            for ref_name in outer_refs:
+                used_after_loop = (
+                    enclosing_last_uses is not None
+                    and loop_binding_index is not None
+                    and enclosing_last_uses.get(ref_name, -1) > loop_binding_index
+                )
+                if (not is_final_iteration) or used_after_loop:
                     last_uses[ref_name] = len(body)
 
             for j, binding in enumerate(body):
@@ -1504,12 +1994,14 @@ class _LoweringContext:
         state_bytes_ref = args[1]
 
         # Bring stateBytes to stack first.
-        state_last = self._is_last_use(state_bytes_ref, binding_index, last_uses)
-        self.bring_to_top(state_bytes_ref, state_last)
+        state_consume = self._operand_consume(
+            state_bytes_ref, [preimage_ref, state_bytes_ref], binding_index, last_uses)
+        self.bring_to_top(state_bytes_ref, state_consume)
 
         # Extract amount from preimage for the continuation output.
-        pre_last = self._is_last_use(preimage_ref, binding_index, last_uses)
-        self.bring_to_top(preimage_ref, pre_last)
+        pre_consume = self._operand_consume(
+            preimage_ref, [preimage_ref, state_bytes_ref], binding_index, last_uses)
+        self.bring_to_top(preimage_ref, pre_consume)
 
         # Extract amount: last 52 bytes, take 8 bytes at offset 0.
         self.emit_op(StackOp(op="opcode", code="OP_SIZE"))
@@ -1610,15 +2102,17 @@ class _LoweringContext:
         state_bytes_ref = args[1]
         new_amount_ref = args[2]
 
+        cso_operands = [preimage_ref, state_bytes_ref, new_amount_ref]
+
         # Consume preimage ref (no longer needed -- we use _codePart and _newAmount).
-        pre_last = self._is_last_use(preimage_ref, binding_index, last_uses)
-        self.bring_to_top(preimage_ref, pre_last)
+        pre_consume = self._operand_consume(preimage_ref, cso_operands, binding_index, last_uses)
+        self.bring_to_top(preimage_ref, pre_consume)
         self.emit_op(StackOp(op="drop"))
         self.sm.pop()
 
         # Step 1: Convert _newAmount to 8-byte LE and save to altstack.
-        amount_last = self._is_last_use(new_amount_ref, binding_index, last_uses)
-        self.bring_to_top(new_amount_ref, amount_last)
+        amount_consume = self._operand_consume(new_amount_ref, cso_operands, binding_index, last_uses)
+        self.bring_to_top(new_amount_ref, amount_consume)
         self.emit_op(StackOp(op="push", value=big_int_push(8)))
         self.sm.push("")
         self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
@@ -1629,8 +2123,8 @@ class _LoweringContext:
         self.sm.pop()
 
         # Step 2: Bring stateBytes to stack.
-        state_last = self._is_last_use(state_bytes_ref, binding_index, last_uses)
-        self.bring_to_top(state_bytes_ref, state_last)
+        state_consume = self._operand_consume(state_bytes_ref, cso_operands, binding_index, last_uses)
+        self.bring_to_top(state_bytes_ref, state_consume)
 
         # Step 3: Bring _codePart to top (PICK -- never consume, reused across outputs)
         self.bring_to_top("_codePart", False)
@@ -1698,7 +2192,9 @@ class _LoweringContext:
         self.sm.push("")
 
         # Push the 20-byte PKH
-        self.bring_to_top(pkh_ref, self._is_last_use(pkh_ref, binding_index, last_uses))
+        self.bring_to_top(
+            pkh_ref,
+            self._operand_consume(pkh_ref, [pkh_ref, amount_ref], binding_index, last_uses))
         # CAT: prefix || pkh
         self.emit_op(StackOp(op="opcode", code="OP_CAT"))
         self.sm.pop()
@@ -1716,7 +2212,9 @@ class _LoweringContext:
         # --- Stack: [..., 0x1976a914{pkh}88ac] ---
 
         # Step 2: Prepend amount as 8-byte LE.
-        self.bring_to_top(amount_ref, self._is_last_use(amount_ref, binding_index, last_uses))
+        self.bring_to_top(
+            amount_ref,
+            self._operand_consume(amount_ref, [pkh_ref, amount_ref], binding_index, last_uses))
         self.emit_op(StackOp(op="push", value=big_int_push(8)))
         self.sm.push("")
         self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
@@ -1750,17 +2248,31 @@ class _LoweringContext:
             state_props.append(p)
             if p.type == "bigint":
                 sz = 8
+            # RabinSig / RabinPubKey are bigint aliases -- same 8-byte layout.
+            elif p.type in ("RabinSig", "RabinPubKey"):
+                sz = 8
             elif p.type == "boolean":
                 sz = 1
             elif p.type == "PubKey":
                 sz = 33
             elif p.type == "Addr":
                 sz = 20
+            # Ripemd160 is 20 bytes (same underlying size as Addr).
+            elif p.type == "Ripemd160":
+                sz = 20
             elif p.type == "Sha256":
                 sz = 32
             elif p.type == "Point":
                 sz = 64
-            elif p.type == "ByteString":
+            # P-256 point: x[32] || y[32] = 64 bytes (same shape as Point).
+            elif p.type == "P256Point":
+                sz = 64
+            # P-384 point: x[48] || y[48] = 96 bytes.
+            elif p.type == "P384Point":
+                sz = 96
+            # ByteString-typed variable-length fields -- treated the same as
+            # ByteString (push-data prefixed in state).
+            elif p.type in ("ByteString", "Sig", "SigHashPreimage"):
                 sz = -1
                 has_variable_length = True
             else:
@@ -1836,48 +2348,105 @@ class _LoweringContext:
             self.emit_op(StackOp(op="drop"))
             self.sm.pop()
         else:
-            # Variable-length path: strip varint, use _codePart
+            # Variable-length path: strip varint, use _codePart to find state.
+            #
+            # BIP-143 scriptCode is prefixed by a Bitcoin varint:
+            #   length < 0xfd:        1 byte (length itself)
+            #   length <= 0xffff:     0xfd + 2 bytes LE                (3 bytes)
+            #   length <= 0xffffffff: 0xfe + 4 bytes LE                (5 bytes)
+            #   otherwise:            0xff + 8 bytes LE                (9 bytes)
+            #
+            # We must support all four shapes, otherwise scripts whose scriptCode
+            # exceeds 65,535 bytes (e.g. embedded BN254 verifiers) silently
+            # strip too few varint bytes and corrupt the subsequent
+            # state-extraction OP_SPLITs (this is the bug fixed here — see
+            # `integration/go/contracts/RollupBug.runar.go`).
             self.emit_op(StackOp(op="push", value=big_int_push(1)))
             self.sm.push("")
             self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
             self.sm.pop(); self.sm.pop()
-            self.sm.push(""); self.sm.push("")
+            self.sm.push("")  # firstByte
+            self.sm.push("")  # rest
             self.emit_op(StackOp(op="swap"))
             self.sm.swap()
-            self.emit_op(StackOp(op="dup"))
-            self.sm.push(self.sm.peek_at_depth(0))
-            # Zero-pad before BIN2NUM to prevent sign-bit misinterpretation (0xfd → -125 without pad)
+            # Zero-pad firstByte before BIN2NUM so 0xfd/0xfe/0xff aren't read
+            # as negative script numbers.
             self.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=bytes([0]))))
             self.sm.push("")
             self.emit_op(StackOp(op="opcode", code="OP_CAT"))
             self.sm.pop(); self.sm.pop()
             self.sm.push("")
             self.emit_op(StackOp(op="opcode", code="OP_BIN2NUM"))
+            # Stack: [..., rest, fb_num]
+
+            # emit_drop_more_varint_bytes drops `n` additional varint bytes
+            # from the top-of-stack `rest`. [..., rest] -> [..., rest_minus_n].
+            def emit_drop_more_varint_bytes(n: int) -> None:
+                self.emit_op(StackOp(op="push", value=big_int_push(n)))
+                self.sm.push("")
+                self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
+                self.sm.pop(); self.sm.pop()
+                self.sm.push(""); self.sm.push("")
+                self.emit_op(StackOp(op="nip"))
+                self.sm.pop(); self.sm.pop()
+                self.sm.push("")
+
+            # IF fb_num < 253: 1-byte varint, drop fb_num.
+            self.emit_op(StackOp(op="dup"))
+            self.sm.dup()
             self.emit_op(StackOp(op="push", value=big_int_push(253)))
             self.sm.push("")
             self.emit_op(StackOp(op="opcode", code="OP_LESSTHAN"))
             self.sm.pop(); self.sm.pop()
             self.sm.push("")
-
             self.emit_op(StackOp(op="opcode", code="OP_IF"))
             self.sm.pop()
-            sm_at_varint_if = self.sm.clone()
+            sm_at_1_byte_if = self.sm.clone()
+            # THEN: 1-byte varint.
             self.emit_op(StackOp(op="drop"))
             self.sm.pop()
-
             self.emit_op(StackOp(op="opcode", code="OP_ELSE"))
-            self.sm = sm_at_varint_if.clone()
+            self.sm = sm_at_1_byte_if.clone()
+            # ELSE: fb_num >= 253. Check 0xfe (5-byte varint) next.
+            self.emit_op(StackOp(op="dup"))
+            self.sm.dup()
+            self.emit_op(StackOp(op="push", value=big_int_push(254)))
+            self.sm.push("")
+            self.emit_op(StackOp(op="opcode", code="OP_NUMEQUAL"))
+            self.sm.pop(); self.sm.pop()
+            self.sm.push("")
+            self.emit_op(StackOp(op="opcode", code="OP_IF"))
+            self.sm.pop()
+            sm_at_fe_if = self.sm.clone()
+            # THEN: 5-byte varint (0xfe + 4 bytes LE).
             self.emit_op(StackOp(op="drop"))
             self.sm.pop()
-            self.emit_op(StackOp(op="push", value=big_int_push(2)))
+            emit_drop_more_varint_bytes(4)
+            self.emit_op(StackOp(op="opcode", code="OP_ELSE"))
+            self.sm = sm_at_fe_if.clone()
+            # ELSE: fb_num != 254. Check 0xff (9-byte varint) next.
+            self.emit_op(StackOp(op="dup"))
+            self.sm.dup()
+            self.emit_op(StackOp(op="push", value=big_int_push(255)))
             self.sm.push("")
-            self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
-            self.sm.pop(); self.sm.pop()
-            self.sm.push(""); self.sm.push("")
-            self.emit_op(StackOp(op="nip"))
+            self.emit_op(StackOp(op="opcode", code="OP_NUMEQUAL"))
             self.sm.pop(); self.sm.pop()
             self.sm.push("")
-
+            self.emit_op(StackOp(op="opcode", code="OP_IF"))
+            self.sm.pop()
+            sm_at_ff_if = self.sm.clone()
+            # THEN: 9-byte varint (0xff + 8 bytes LE).
+            self.emit_op(StackOp(op="drop"))
+            self.sm.pop()
+            emit_drop_more_varint_bytes(8)
+            self.emit_op(StackOp(op="opcode", code="OP_ELSE"))
+            self.sm = sm_at_ff_if.clone()
+            # ELSE: fb_num must be 253 (0xfd) — 3-byte varint.
+            self.emit_op(StackOp(op="drop"))
+            self.sm.pop()
+            emit_drop_more_varint_bytes(2)
+            self.emit_op(StackOp(op="opcode", code="OP_ENDIF"))
+            self.emit_op(StackOp(op="opcode", code="OP_ENDIF"))
             self.emit_op(StackOp(op="opcode", code="OP_ENDIF"))
 
             # Compute skip = SIZE(_codePart) - codeSepIdx
@@ -1909,7 +2478,7 @@ class _LoweringContext:
     def _split_fixed_state_fields(self, state_props: list[ANFProperty], prop_sizes: list[int]) -> None:
         if len(state_props) == 1:
             prop = state_props[0]
-            if prop.type in ("bigint", "boolean"):
+            if is_numeric_state_type(prop.type):
                 self.emit_op(StackOp(op="opcode", code="OP_BIN2NUM"))
             self.sm.pop()
             self.sm.push(prop.name)
@@ -1924,7 +2493,7 @@ class _LoweringContext:
                     self.sm.push(""); self.sm.push("")
                     self.emit_op(StackOp(op="swap"))
                     self.sm.swap()
-                    if prop.type in ("bigint", "boolean"):
+                    if is_numeric_state_type(prop.type):
                         self.emit_op(StackOp(op="opcode", code="OP_BIN2NUM"))
                     self.emit_op(StackOp(op="swap"))
                     self.sm.swap()
@@ -1932,7 +2501,7 @@ class _LoweringContext:
                     self.sm.push(prop.name)
                     self.sm.push("")
                 else:
-                    if prop.type in ("bigint", "boolean"):
+                    if is_numeric_state_type(prop.type):
                         self.emit_op(StackOp(op="opcode", code="OP_BIN2NUM"))
                     self.sm.pop()
                     self.sm.push(prop.name)
@@ -1940,19 +2509,21 @@ class _LoweringContext:
     def _parse_variable_length_state_fields(self, state_props: list[ANFProperty], prop_sizes: list[int]) -> None:
         if len(state_props) == 1:
             prop = state_props[0]
-            if prop.type == "ByteString":
-                # Single ByteString field: decode push-data prefix, drop trailing empty
+            if is_variable_length_state_type(prop.type):
+                # Single variable-length byte-string: decode push-data prefix,
+                # drop the trailing empty remainder.
                 self.emit_push_data_decode()  # [..., data, remaining]
                 self.emit_op(StackOp(op="drop")); self.sm.pop()
-            elif prop.type in ("bigint", "boolean"):
+            elif is_numeric_state_type(prop.type):
                 self.emit_op(StackOp(op="opcode", code="OP_BIN2NUM"))
             self.sm.pop()
             self.sm.push(prop.name)
         else:
             for i, prop in enumerate(state_props):
                 if i < len(state_props) - 1:
-                    if prop.type == "ByteString":
-                        # ByteString: decode push-data prefix, extract data
+                    if is_variable_length_state_type(prop.type):
+                        # Variable-length field: decode push-data prefix,
+                        # extract data.
                         self.emit_push_data_decode()  # [..., data, rest]
                         self.sm.pop(); self.sm.pop()
                         self.sm.push(prop.name)
@@ -1965,18 +2536,19 @@ class _LoweringContext:
                         self.sm.pop(); self.sm.pop()
                         self.sm.push(""); self.sm.push("")
                         self.emit_op(StackOp(op="swap")); self.sm.swap()
-                        if prop.type in ("bigint", "boolean"):
+                        if is_numeric_state_type(prop.type):
                             self.emit_op(StackOp(op="opcode", code="OP_BIN2NUM"))
                         self.emit_op(StackOp(op="swap")); self.sm.swap()
                         self.sm.pop(); self.sm.pop()
                         self.sm.push(prop.name)
                         self.sm.push("")
                 else:
-                    if prop.type == "ByteString":
-                        # Last ByteString: decode push-data prefix, drop trailing empty
+                    if is_variable_length_state_type(prop.type):
+                        # Last variable-length field: decode push-data prefix,
+                        # drop the trailing empty remainder.
                         self.emit_push_data_decode()  # [..., data, remaining]
                         self.emit_op(StackOp(op="drop")); self.sm.pop()
-                    elif prop.type in ("bigint", "boolean"):
+                    elif is_numeric_state_type(prop.type):
                         self.emit_op(StackOp(op="opcode", code="OP_BIN2NUM"))
                     self.sm.pop()
                     self.sm.push(prop.name)
@@ -1994,6 +2566,7 @@ class _LoweringContext:
         # Uses _codePart implicit parameter (passed by SDK) instead of extracting
         # codePart from the preimage. This is simpler and works with OP_CODESEPARATOR.
         state_props = [p for p in self.properties if not p.readonly]
+        output_operands = [satoshis, *state_values]
 
         # Step 1: Bring _codePart to top (PICK -- never consume, reused across outputs)
         self.bring_to_top("_codePart", False)
@@ -2013,8 +2586,8 @@ class _LoweringContext:
             value_ref = state_values[i]
             prop = state_props[i]
 
-            is_last = self._is_last_use(value_ref, binding_index, last_uses)
-            self.bring_to_top(value_ref, is_last)
+            consume = self._operand_consume(value_ref, output_operands, binding_index, last_uses)
+            self.bring_to_top(value_ref, consume)
 
             # Convert numeric/boolean values to fixed-width bytes
             if prop.type == "bigint":
@@ -2056,8 +2629,8 @@ class _LoweringContext:
         # --- Stack: [..., varint+script] ---
 
         # Step 6: Prepend satoshis as 8-byte LE.
-        is_last_sat = self._is_last_use(satoshis, binding_index, last_uses)
-        self.bring_to_top(satoshis, is_last_sat)
+        satoshis_consume = self._operand_consume(satoshis, output_operands, binding_index, last_uses)
+        self.bring_to_top(satoshis, satoshis_consume)
         self.emit_op(StackOp(op="push", value=big_int_push(8)))
         self.sm.push("")
         self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
@@ -2088,8 +2661,9 @@ class _LoweringContext:
         The scriptBytes are used as-is (no codePart/state insertion).
         """
         # Step 1: Bring scriptBytes to top
-        script_is_last = self._is_last_use(script_bytes, binding_index, last_uses)
-        self.bring_to_top(script_bytes, script_is_last)
+        script_consume = self._operand_consume(
+            script_bytes, [satoshis, script_bytes], binding_index, last_uses)
+        self.bring_to_top(script_bytes, script_consume)
 
         # Step 2: Compute varint prefix for script length
         self.emit_op(StackOp(op="opcode", code="OP_SIZE"))
@@ -2106,8 +2680,9 @@ class _LoweringContext:
         self.sm.push("")
 
         # Step 4: Prepend satoshis as 8-byte LE
-        sat_is_last = self._is_last_use(satoshis, binding_index, last_uses)
-        self.bring_to_top(satoshis, sat_is_last)
+        sat_consume = self._operand_consume(
+            satoshis, [satoshis, script_bytes], binding_index, last_uses)
+        self.bring_to_top(satoshis, sat_consume)
         self.emit_op(StackOp(op="push", value=big_int_push(8)))
         self.sm.push("")
         self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
@@ -2131,20 +2706,56 @@ class _LoweringContext:
 
     def _lower_array_literal(self, binding_name: str, elements: list[str],
                               binding_index: int, last_uses: dict[str, int]) -> None:
-        """Lower an array_literal by bringing each element to the top of the stack.
-
-        The elements remain as individual stack entries; the binding name tracks
-        the last element so that callers (e.g. checkMultiSig) can find them.
+        """Metadata-only. Array literals in Rúnar today only feed into
+        checkMultiSig. Pre-laying the elements onto the runtime stack here
+        would desync the stack-map from the runtime stack (the map can only
+        model one slot per binding, but an array binding spans N runtime
+        slots). _lower_check_multi_sig pulls each element to TOS at the use site.
         """
-        for elem in elements:
-            is_last = self._is_last_use(elem, binding_index, last_uses)
-            self.bring_to_top(elem, is_last)
+        del binding_index, last_uses
+        self.array_lengths[binding_name] = len(elements)
+        self.array_elements[binding_name] = list(elements)
+
+    # -----------------------------------------------------------------
+    # raw_script
+    # -----------------------------------------------------------------
+
+    def _lower_raw_script(self, binding_name: str, bytes_hex: str | None,
+                          in_arity: int | None, out_arity: int | None) -> None:
+        """Lower a raw_script ANF node to a single opaque raw_bytes StackOp.
+
+        The bytes pass through verbatim -- the emit pass writes them as-is,
+        and the peephole optimizer must not bridge across them. Stack-tracker
+        bookkeeping consumes in_arity items and pushes out_arity items named
+        after the binding so downstream PICK/ROLL/DROP refer to the correct
+        logical slot.
+        """
+        in_arity = in_arity or 0
+        out_arity = out_arity or 0
+        if self.sm.depth() < in_arity:
+            raise ValueError(
+                f"raw_script binding '{binding_name}' requires {in_arity} "
+                f"stack items but only {self.sm.depth()} are present"
+            )
+        try:
+            raw = bytes.fromhex(bytes_hex or "")
+        except ValueError as exc:
+            raise ValueError(
+                f"raw_script binding '{binding_name}' has invalid hex bytes: {exc}"
+            ) from exc
+        self.emit_op(StackOp(
+            op="raw_bytes",
+            raw_bytes=raw,
+            in_arity=in_arity,
+            out_arity=out_arity,
+        ))
+        for _ in range(in_arity):
             self.sm.pop()
-            self.sm.push("")  # anonymous stack entry for intermediate elements
-        # Rename the topmost entry to the binding name
-        if elements:
-            self.sm.pop()
-        self.sm.push(binding_name)
+        for i in range(out_arity):
+            slot_name = binding_name
+            if out_arity != 1:
+                slot_name = f"{binding_name}.{i}"
+            self.sm.push(slot_name)
         self._track_depth()
 
     # -----------------------------------------------------------------
@@ -2153,30 +2764,56 @@ class _LoweringContext:
 
     def _lower_check_multi_sig(self, binding_name: str, args: list[str],
                                 binding_index: int, last_uses: dict[str, int]) -> None:
-        """Emit OP_CHECKMULTISIG with the OP_0 dummy workaround.
+        """Lower checkMultiSig([sig1..sigN], [pk1..pkM]).
 
-        Bitcoin Script stack layout:
-          OP_0 <sig1> ... <sigN> <nSigs> <pk1> ... <pkM> <nPKs> OP_CHECKMULTISIG
+        OP_CHECKMULTISIG expects the stack (bottom -> top):
+          <dummy=OP_0> <sig1> ... <sigN> <N> <pk1> ... <pkM> <M>
 
-        The two args reference array_literal bindings whose individual elements
-        are already on the stack.
+        args[0] and args[1] are bindings produced by array_literal. Those
+        bindings are NOT physical stack slots -- their element refs live on
+        the stack-map as individual named bindings. We pull each element to
+        TOS via bring_to_top. compute_last_uses propagates each element's
+        last-use through the array indirection to THIS binding.
         """
-        # Push OP_0 dummy (Bitcoin CHECKMULTISIG off-by-one bug workaround)
+        sigs_ref = args[0]
+        pks_ref = args[1]
+        sig_elems = self.array_elements.get(sigs_ref)
+        pk_elems = self.array_elements.get(pks_ref)
+        if sig_elems is None or pk_elems is None:
+            raise RuntimeError(
+                f"checkMultiSig: array_literal metadata missing (sigs={sigs_ref!r}, pks={pks_ref!r})"
+            )
+
+        # Dummy OP_0 (historical CHECKMULTISIG off-by-one).
         self.emit_op(StackOp(op="push", value=big_int_push(0)))
         self.sm.push("")
 
-        # Bring sigs array ref to top
-        sigs_is_last = self._is_last_use(args[0], binding_index, last_uses)
-        self.bring_to_top(args[0], sigs_is_last)
+        # A ref repeated across the combined element list (e.g. the same
+        # pubkey twice) must be copied at every position -- see _operand_consume.
+        msig_operands = [*sig_elems, *pk_elems]
 
-        # Bring pks array ref to top
-        pks_is_last = self._is_last_use(args[1], binding_index, last_uses)
-        self.bring_to_top(args[1], pks_is_last)
+        # Bring each sig element to TOS in declaration order.
+        for sig in sig_elems:
+            consume = self._operand_consume(sig, msig_operands, binding_index, last_uses)
+            self.bring_to_top(sig, consume)
 
-        # Pop all args + dummy
-        self.sm.pop()  # pks
-        self.sm.pop()  # sigs
-        self.sm.pop()  # OP_0 dummy
+        # Push nSigs.
+        self.emit_op(StackOp(op="push", value=big_int_push(len(sig_elems))))
+        self.sm.push("")
+
+        # Bring each pubkey element to TOS in declaration order.
+        for pk in pk_elems:
+            consume = self._operand_consume(pk, msig_operands, binding_index, last_uses)
+            self.bring_to_top(pk, consume)
+
+        # Push nPKs.
+        self.emit_op(StackOp(op="push", value=big_int_push(len(pk_elems))))
+        self.sm.push("")
+
+        # OP_CHECKMULTISIG consumes: dummy + N sigs + nSigs + M pks + nPKs.
+        consumed = 1 + len(sig_elems) + 1 + len(pk_elems) + 1
+        for _ in range(consumed):
+            self.sm.pop()
 
         self.emit_op(StackOp(op="opcode", code="OP_CHECKMULTISIG"))
         self.sm.push(binding_name)
@@ -2187,39 +2824,63 @@ class _LoweringContext:
     # -----------------------------------------------------------------
 
     def _lower_check_preimage(self, binding_name: str, preimage: str,
+                              sighash_flag: int | None,
                               binding_index: int, last_uses: dict[str, int]) -> None:
+        # OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
+        # current spending transaction. The signature is DERIVED FROM THE PREIMAGE
+        # ON CHAIN (Optimal OP_PUSH_TX): s = (hash256(preimage) + r)*k^-1 mod n,
+        # with fixed nonce k and privkey d=1 (pubkey = G). OP_CHECKSIG(sig, G)
+        # then passes iff hash256(preimage) equals the node's real tx sighash —
+        # closing BUG-100. The unlocking script pushes ONLY <preimage> (no
+        # witness signature). See _emit_check_preimage_binding for the
+        # construction.
+
         # Step 0: Emit OP_CODESEPARATOR so that the scriptCode in the BIP-143
         # preimage is only the code after this point. This reduces preimage size
         # for large scripts and is required for scripts > ~32KB.
         self.emit_op(StackOp(op="opcode", code="OP_CODESEPARATOR"))
 
-        # Step 1: Bring preimage to top (non-consuming)
+        # Step 1: Bring preimage to top (non-consuming; kept for field extractors)
         is_last = self._is_last_use(preimage, binding_index, last_uses)
         self.bring_to_top(preimage, is_last)
 
-        # Step 2: Bring the implicit _opPushTxSig to top (consuming)
-        self.bring_to_top("_opPushTxSig", True)
-
-        # Step 3: Push compressed secp256k1 generator point G (33 bytes)
-        G = bytes([
-            0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB,
-            0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
-            0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28,
-            0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17,
-            0x98,
-        ])
-        self.emit_op(StackOp(op="push", value=PushValue(kind="bytes", bytes_val=G)))
-        self.sm.push("")  # G on stack
-
-        # Step 4: OP_CHECKSIGVERIFY
-        self.emit_op(StackOp(op="opcode", code="OP_CHECKSIGVERIFY"))
-        self.sm.pop()  # G consumed
-        self.sm.pop()  # _opPushTxSig consumed
+        # Step 2: Derive + verify the signature on-chain (single opaque raw_bytes
+        # blob). For the default ALL|FORKID (sighash_flag None) the blob is
+        # byte-identical to the pinned cross-tier constant; issue #123 lets a
+        # method declare a different mode, which only changes the appended
+        # sighash flag byte. Net stack effect is zero.
+        self._emit_check_preimage_binding(sighash_flag)
 
         # Preimage remains on top.  Rename for field extractors.
         self.sm.pop()
         self.sm.push(binding_name)
         self._track_depth()
+
+    def _emit_check_preimage_binding(self, sighash_flag: int | None = None) -> None:
+        """Emit the on-chain preimage binding as one opaque raw_bytes op.
+
+        Net stack effect is 0 (preimage in -> preimage out), declared as
+        in_arity=1 / out_arity=1 so the static analyzer keeps the depth
+        consistent. The bytes are the canonical BUG-100 construction, identical
+        across all seven tiers and guarded by the cross-tier conformance suite.
+
+        Issue #123: a non-default @sighash mode changes ONLY the single appended
+        sighash flag byte in the derived DER signature (``push(flag) OP_CAT``,
+        encoded ``01<flag>7e`` in the blob). This substitution is byte-exact
+        equivalent to regenerating the blob with a different flag (the TS
+        reference's ``emitCheckPreimageBinding(emit, sighashFlag)`` differs only
+        in that push), so the default (None) blob is unchanged (zero golden
+        churn) and every other mode swaps exactly that one byte.
+        """
+        blob_hex = _CHECK_PREIMAGE_BINDING_HEX
+        if sighash_flag is not None and sighash_flag != _SIGHASH_ALL_FORKID:
+            blob_hex = _binding_hex_with_sighash_flag(sighash_flag)
+        self.emit_op(StackOp(
+            op="raw_bytes",
+            raw_bytes=bytes.fromhex(blob_hex),
+            in_arity=1,
+            out_arity=1,
+        ))
 
     # -----------------------------------------------------------------
     # Preimage field extractors
@@ -2560,11 +3221,11 @@ class _LoweringContext:
 
         obj, index = args[0], args[1]
 
-        obj_is_last = self._is_last_use(obj, binding_index, last_uses)
-        self.bring_to_top(obj, obj_is_last)
+        obj_consume = self._operand_consume(obj, args, binding_index, last_uses)
+        self.bring_to_top(obj, obj_consume)
 
-        index_is_last = self._is_last_use(index, binding_index, last_uses)
-        self.bring_to_top(index, index_is_last)
+        index_consume = self._operand_consume(index, args, binding_index, last_uses)
+        self.bring_to_top(index, index_consume)
 
         # OP_SPLIT at index
         self.sm.pop()
@@ -2614,11 +3275,11 @@ class _LoweringContext:
 
         data, start, length = args[0], args[1], args[2]
 
-        data_is_last = self._is_last_use(data, binding_index, last_uses)
-        self.bring_to_top(data, data_is_last)
+        data_consume = self._operand_consume(data, args, binding_index, last_uses)
+        self.bring_to_top(data, data_consume)
 
-        start_is_last = self._is_last_use(start, binding_index, last_uses)
-        self.bring_to_top(start, start_is_last)
+        start_consume = self._operand_consume(start, args, binding_index, last_uses)
+        self.bring_to_top(start, start_consume)
 
         # Split at start position
         self.sm.pop()
@@ -2634,8 +3295,8 @@ class _LoweringContext:
         self.sm.push(right_part)
 
         # Push length
-        len_is_last = self._is_last_use(length, binding_index, last_uses)
-        self.bring_to_top(length, len_is_last)
+        len_consume = self._operand_consume(length, args, binding_index, last_uses)
+        self.bring_to_top(length, len_consume)
 
         # Split at length
         self.sm.pop()
@@ -2658,38 +3319,24 @@ class _LoweringContext:
 
     def _lower_verify_rabin_sig(self, binding_name: str, args: list[str],
                                 binding_index: int, last_uses: dict[str, int]) -> None:
+        """Lower verifyRabinSig(msg, sig, padding, pubKey).
+
+        The 10-opcode emission delegates to ``codegen.rabin``.
+        Stack input (bottom->top): msg sig padding pubKey -> Stack output: bool
+        """
         if len(args) < 4:
             raise RuntimeError("verifyRabinSig requires 4 arguments")
 
-        msg, sig, padding, pub_key = args[0], args[1], args[2], args[3]
-
-        msg_is_last = self._is_last_use(msg, binding_index, last_uses)
-        self.bring_to_top(msg, msg_is_last)
-
-        sig_is_last = self._is_last_use(sig, binding_index, last_uses)
-        self.bring_to_top(sig, sig_is_last)
-
-        padding_is_last = self._is_last_use(padding, binding_index, last_uses)
-        self.bring_to_top(padding, padding_is_last)
-
-        pub_key_is_last = self._is_last_use(pub_key, binding_index, last_uses)
-        self.bring_to_top(pub_key, pub_key_is_last)
+        # Bring all 4 args to the top in argument order: msg sig padding pubKey
+        for arg in args:
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
 
         # Pop all 4 args
         for _ in range(4):
             self.sm.pop()
 
-        # Rabin sig verification opcode sequence
-        self.emit_op(StackOp(op="opcode", code="OP_SWAP"))
-        self.emit_op(StackOp(op="opcode", code="OP_ROT"))
-        self.emit_op(StackOp(op="opcode", code="OP_DUP"))
-        self.emit_op(StackOp(op="opcode", code="OP_MUL"))
-        self.emit_op(StackOp(op="opcode", code="OP_ADD"))
-        self.emit_op(StackOp(op="opcode", code="OP_SWAP"))
-        self.emit_op(StackOp(op="opcode", code="OP_MOD"))
-        self.emit_op(StackOp(op="opcode", code="OP_SWAP"))
-        self.emit_op(StackOp(op="opcode", code="OP_SHA256"))
-        self.emit_op(StackOp(op="opcode", code="OP_EQUAL"))
+        from runar_compiler.codegen.rabin import emit_verify_rabin_sig
+        emit_verify_rabin_sig(lambda op: self.emit_op(op))
 
         self.sm.push(binding_name)
         self._track_depth()
@@ -2732,11 +3379,11 @@ class _LoweringContext:
             raise RuntimeError("right requires 2 arguments")
         data, length = args[0], args[1]
 
-        data_is_last = self._is_last_use(data, binding_index, last_uses)
-        self.bring_to_top(data, data_is_last)
+        data_consume = self._operand_consume(data, args, binding_index, last_uses)
+        self.bring_to_top(data, data_consume)
 
-        length_is_last = self._is_last_use(length, binding_index, last_uses)
-        self.bring_to_top(length, length_is_last)
+        length_consume = self._operand_consume(length, args, binding_index, last_uses)
+        self.bring_to_top(length, length_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -2762,11 +3409,11 @@ class _LoweringContext:
             raise RuntimeError(f"{func_name} requires 2 arguments")
         a, b = args[0], args[1]
 
-        a_is_last = self._is_last_use(a, binding_index, last_uses)
-        self.bring_to_top(a, a_is_last)
+        a_consume = self._operand_consume(a, args, binding_index, last_uses)
+        self.bring_to_top(a, a_consume)
 
-        b_is_last = self._is_last_use(b, binding_index, last_uses)
-        self.bring_to_top(b, b_is_last)
+        b_consume = self._operand_consume(b, args, binding_index, last_uses)
+        self.bring_to_top(b, b_consume)
 
         # DUP b, check non-zero, then divide/mod
         self.emit_op(StackOp(op="opcode", code="OP_DUP"))
@@ -2789,19 +3436,19 @@ class _LoweringContext:
             raise RuntimeError("clamp requires 3 arguments")
         val, lo, hi = args[0], args[1], args[2]
 
-        val_is_last = self._is_last_use(val, binding_index, last_uses)
-        self.bring_to_top(val, val_is_last)
+        val_consume = self._operand_consume(val, args, binding_index, last_uses)
+        self.bring_to_top(val, val_consume)
 
-        lo_is_last = self._is_last_use(lo, binding_index, last_uses)
-        self.bring_to_top(lo, lo_is_last)
+        lo_consume = self._operand_consume(lo, args, binding_index, last_uses)
+        self.bring_to_top(lo, lo_consume)
 
         self.sm.pop()
         self.sm.pop()
         self.emit_op(StackOp(op="opcode", code="OP_MAX"))
         self.sm.push("")
 
-        hi_is_last = self._is_last_use(hi, binding_index, last_uses)
-        self.bring_to_top(hi, hi_is_last)
+        hi_consume = self._operand_consume(hi, args, binding_index, last_uses)
+        self.bring_to_top(hi, hi_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -2816,11 +3463,11 @@ class _LoweringContext:
             raise RuntimeError("pow requires 2 arguments")
         base, exp = args[0], args[1]
 
-        base_is_last = self._is_last_use(base, binding_index, last_uses)
-        self.bring_to_top(base, base_is_last)
+        base_consume = self._operand_consume(base, args, binding_index, last_uses)
+        self.bring_to_top(base, base_consume)
 
-        exp_is_last = self._is_last_use(exp, binding_index, last_uses)
-        self.bring_to_top(exp, exp_is_last)
+        exp_consume = self._operand_consume(exp, args, binding_index, last_uses)
+        self.bring_to_top(exp, exp_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -2854,18 +3501,18 @@ class _LoweringContext:
             raise RuntimeError("mulDiv requires 3 arguments")
         a, b, c = args[0], args[1], args[2]
 
-        a_is_last = self._is_last_use(a, binding_index, last_uses)
-        self.bring_to_top(a, a_is_last)
-        b_is_last = self._is_last_use(b, binding_index, last_uses)
-        self.bring_to_top(b, b_is_last)
+        a_consume = self._operand_consume(a, args, binding_index, last_uses)
+        self.bring_to_top(a, a_consume)
+        b_consume = self._operand_consume(b, args, binding_index, last_uses)
+        self.bring_to_top(b, b_consume)
 
         self.sm.pop()
         self.sm.pop()
         self.emit_op(StackOp(op="opcode", code="OP_MUL"))
         self.sm.push("")
 
-        c_is_last = self._is_last_use(c, binding_index, last_uses)
-        self.bring_to_top(c, c_is_last)
+        c_consume = self._operand_consume(c, args, binding_index, last_uses)
+        self.bring_to_top(c, c_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -2880,10 +3527,10 @@ class _LoweringContext:
             raise RuntimeError("percentOf requires 2 arguments")
         amount, bps = args[0], args[1]
 
-        amount_is_last = self._is_last_use(amount, binding_index, last_uses)
-        self.bring_to_top(amount, amount_is_last)
-        bps_is_last = self._is_last_use(bps, binding_index, last_uses)
-        self.bring_to_top(bps, bps_is_last)
+        amount_consume = self._operand_consume(amount, args, binding_index, last_uses)
+        self.bring_to_top(amount, amount_consume)
+        bps_consume = self._operand_consume(bps, args, binding_index, last_uses)
+        self.bring_to_top(bps, bps_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -2938,10 +3585,10 @@ class _LoweringContext:
             raise RuntimeError("gcd requires 2 arguments")
         a, b = args[0], args[1]
 
-        a_is_last = self._is_last_use(a, binding_index, last_uses)
-        self.bring_to_top(a, a_is_last)
-        b_is_last = self._is_last_use(b, binding_index, last_uses)
-        self.bring_to_top(b, b_is_last)
+        a_consume = self._operand_consume(a, args, binding_index, last_uses)
+        self.bring_to_top(a, a_consume)
+        b_consume = self._operand_consume(b, args, binding_index, last_uses)
+        self.bring_to_top(b, b_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -2975,10 +3622,10 @@ class _LoweringContext:
             raise RuntimeError("divmod requires 2 arguments")
         a, b = args[0], args[1]
 
-        a_is_last = self._is_last_use(a, binding_index, last_uses)
-        self.bring_to_top(a, a_is_last)
-        b_is_last = self._is_last_use(b, binding_index, last_uses)
-        self.bring_to_top(b, b_is_last)
+        a_consume = self._operand_consume(a, args, binding_index, last_uses)
+        self.bring_to_top(a, a_consume)
+        b_consume = self._operand_consume(b, args, binding_index, last_uses)
+        self.bring_to_top(b, b_consume)
 
         self.sm.pop()
         self.sm.pop()
@@ -3034,179 +3681,22 @@ class _LoweringContext:
     # WOTS+ signature verification
     # -----------------------------------------------------------------
 
-    def _emit_wots_one_chain(self, chain_index: int) -> None:
-        """Emit one WOTS+ chain verification."""
-        # Save steps_copy = 15 - digit to alt
-        self.emit_op(StackOp(op="opcode", code="OP_DUP"))
-        self.emit_op(StackOp(op="push", value=big_int_push(15)))
-        self.emit_op(StackOp(op="swap"))
-        self.emit_op(StackOp(op="opcode", code="OP_SUB"))
-        self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-
-        # Save endpt, csum to alt
-        self.emit_op(StackOp(op="swap"))
-        self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-        self.emit_op(StackOp(op="swap"))
-        self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-
-        # Split 32B sig element
-        self.emit_op(StackOp(op="swap"))
-        self.emit_op(StackOp(op="push", value=big_int_push(32)))
-        self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
-        self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-        self.emit_op(StackOp(op="swap"))
-
-        # Hash loop
-        for j in range(15):
-            adrs_bytes = bytes([chain_index, j])
-            self.emit_op(StackOp(op="opcode", code="OP_DUP"))
-            self.emit_op(StackOp(op="opcode", code="OP_0NOTEQUAL"))
-            self.emit_op(StackOp(
-                op="if",
-                then=[
-                    StackOp(op="opcode", code="OP_1SUB"),
-                ],
-                else_ops=[
-                    StackOp(op="swap"),
-                    StackOp(op="push", value=big_int_push(2)),
-                    StackOp(op="opcode", code="OP_PICK"),
-                    StackOp(op="push", value=PushValue(kind="bytes", bytes_val=adrs_bytes)),
-                    StackOp(op="opcode", code="OP_CAT"),
-                    StackOp(op="swap"),
-                    StackOp(op="opcode", code="OP_CAT"),
-                    StackOp(op="opcode", code="OP_SHA256"),
-                    StackOp(op="swap"),
-                ],
-            ))
-        self.emit_op(StackOp(op="drop"))
-
-        # Restore from altstack
-        self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-        self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-        self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-        self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-
-        # csum += steps_copy
-        self.emit_op(StackOp(op="opcode", code="OP_ROT"))
-        self.emit_op(StackOp(op="opcode", code="OP_ADD"))
-
-        # Concat endpoint to endpt_acc
-        self.emit_op(StackOp(op="swap"))
-        self.emit_op(StackOp(op="push", value=big_int_push(3)))
-        self.emit_op(StackOp(op="opcode", code="OP_ROLL"))
-        self.emit_op(StackOp(op="opcode", code="OP_CAT"))
-
     def _lower_verify_wots(self, binding_name: str, args: list[str],
                            binding_index: int, last_uses: dict[str, int]) -> None:
+        """Brings all 3 args to the top, pops them, delegates to
+        wots.emit_verify_wots, and pushes the boolean result."""
         if len(args) < 3:
             raise RuntimeError("verifyWOTS requires 3 arguments: msg, sig, pubkey")
 
         # Bring args to top
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(3):
             self.sm.pop()
 
-        # Split 64-byte pubkey into pubSeed(32) and pkRoot(32)
-        self.emit_op(StackOp(op="push", value=big_int_push(32)))
-        self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
-        self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-
-        # Rearrange: put pubSeed at bottom, hash msg
-        self.emit_op(StackOp(op="opcode", code="OP_ROT"))
-        self.emit_op(StackOp(op="opcode", code="OP_ROT"))
-        self.emit_op(StackOp(op="swap"))
-        self.emit_op(StackOp(op="opcode", code="OP_SHA256"))
-
-        # Canonical layout
-        self.emit_op(StackOp(op="swap"))
-        self.emit_op(StackOp(op="push", value=big_int_push(0)))
-        self.emit_op(StackOp(op="opcode", code="OP_0"))
-        self.emit_op(StackOp(op="push", value=big_int_push(3)))
-        self.emit_op(StackOp(op="opcode", code="OP_ROLL"))
-
-        # Process 32 bytes -> 64 message chains
-        for byte_idx in range(32):
-            if byte_idx < 31:
-                self.emit_op(StackOp(op="push", value=big_int_push(1)))
-                self.emit_op(StackOp(op="opcode", code="OP_SPLIT"))
-                self.emit_op(StackOp(op="swap"))
-            # Unsigned byte conversion
-            self.emit_op(StackOp(op="push", value=big_int_push(0)))
-            self.emit_op(StackOp(op="push", value=big_int_push(1)))
-            self.emit_op(StackOp(op="opcode", code="OP_NUM2BIN"))
-            self.emit_op(StackOp(op="opcode", code="OP_CAT"))
-            self.emit_op(StackOp(op="opcode", code="OP_BIN2NUM"))
-            # Extract nibbles
-            self.emit_op(StackOp(op="opcode", code="OP_DUP"))
-            self.emit_op(StackOp(op="push", value=big_int_push(16)))
-            self.emit_op(StackOp(op="opcode", code="OP_DIV"))
-            self.emit_op(StackOp(op="swap"))
-            self.emit_op(StackOp(op="push", value=big_int_push(16)))
-            self.emit_op(StackOp(op="opcode", code="OP_MOD"))
-
-            if byte_idx < 31:
-                self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-                self.emit_op(StackOp(op="swap"))
-                self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-            else:
-                self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-
-            self._emit_wots_one_chain(byte_idx * 2)  # high nibble chain
-
-            if byte_idx < 31:
-                self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-                self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-                self.emit_op(StackOp(op="swap"))
-                self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-            else:
-                self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-
-            self._emit_wots_one_chain(byte_idx * 2 + 1)  # low nibble chain
-
-            if byte_idx < 31:
-                self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-
-        # Checksum digits
-        self.emit_op(StackOp(op="swap"))
-        # d66
-        self.emit_op(StackOp(op="opcode", code="OP_DUP"))
-        self.emit_op(StackOp(op="push", value=big_int_push(16)))
-        self.emit_op(StackOp(op="opcode", code="OP_MOD"))
-        self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-        # d65
-        self.emit_op(StackOp(op="opcode", code="OP_DUP"))
-        self.emit_op(StackOp(op="push", value=big_int_push(16)))
-        self.emit_op(StackOp(op="opcode", code="OP_DIV"))
-        self.emit_op(StackOp(op="push", value=big_int_push(16)))
-        self.emit_op(StackOp(op="opcode", code="OP_MOD"))
-        self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-        # d64
-        self.emit_op(StackOp(op="push", value=big_int_push(256)))
-        self.emit_op(StackOp(op="opcode", code="OP_DIV"))
-        self.emit_op(StackOp(op="push", value=big_int_push(16)))
-        self.emit_op(StackOp(op="opcode", code="OP_MOD"))
-        self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-
-        # 3 checksum chains (indices 64, 65, 66)
-        for ci in range(3):
-            self.emit_op(StackOp(op="opcode", code="OP_TOALTSTACK"))
-            self.emit_op(StackOp(op="push", value=big_int_push(0)))
-            self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-            self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-            self._emit_wots_one_chain(64 + ci)
-            self.emit_op(StackOp(op="swap"))
-            self.emit_op(StackOp(op="drop"))
-
-        # Final comparison
-        self.emit_op(StackOp(op="swap"))
-        self.emit_op(StackOp(op="drop"))
-        self.emit_op(StackOp(op="opcode", code="OP_SHA256"))
-        self.emit_op(StackOp(op="opcode", code="OP_FROMALTSTACK"))
-        self.emit_op(StackOp(op="opcode", code="OP_EQUAL"))
-        # Clean up pubSeed
-        self.emit_op(StackOp(op="swap"))
-        self.emit_op(StackOp(op="drop"))
+        # Delegate to the WOTS+ codegen module
+        from runar_compiler.codegen.wots import emit_verify_wots
+        emit_verify_wots(lambda op: self.emit_op(op))
 
         self.sm.push(binding_name)
         self._track_depth()
@@ -3222,7 +3712,7 @@ class _LoweringContext:
             raise RuntimeError("verifySLHDSA requires 3 arguments: msg, sig, pubkey")
 
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(3):
             self.sm.pop()
 
@@ -3248,7 +3738,7 @@ class _LoweringContext:
         if len(args) < 2:
             raise RuntimeError("sha256Compress requires 2 arguments: state, block")
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(2):
             self.sm.pop()
 
@@ -3263,7 +3753,7 @@ class _LoweringContext:
         if len(args) < 3:
             raise RuntimeError("sha256Finalize requires 3 arguments: state, remaining, msgBitLen")
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(3):
             self.sm.pop()
 
@@ -3282,7 +3772,7 @@ class _LoweringContext:
         if len(args) < 2:
             raise RuntimeError("blake3Compress requires 2 arguments: chainingValue, block")
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(2):
             self.sm.pop()
 
@@ -3297,7 +3787,7 @@ class _LoweringContext:
         if len(args) < 1:
             raise RuntimeError("blake3Hash requires 1 argument: message")
         for arg in args:
-            self.bring_to_top(arg, self._is_last_use(arg, binding_index, last_uses))
+            self.bring_to_top(arg, self._operand_consume(arg, args, binding_index, last_uses))
         for _ in range(1):
             self.sm.pop()
 
@@ -3316,8 +3806,8 @@ class _LoweringContext:
                           last_uses: dict[str, int]) -> None:
         # Bring args to top in order
         for arg in args:
-            is_last = self._is_last_use(arg, binding_index, last_uses)
-            self.bring_to_top(arg, is_last)
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
         for _ in args:
             self.sm.pop()
 
@@ -3353,6 +3843,252 @@ class _LoweringContext:
         self.sm.push(binding_name)
         self._track_depth()
 
+    # -----------------------------------------------------------------
+    # NIST EC builtins (P-256 and P-384)
+    # -----------------------------------------------------------------
+
+    def _lower_nist_ec_builtin(self, binding_name: str, func_name: str,
+                               args: list[str], binding_index: int,
+                               last_uses: dict[str, int]) -> None:
+        for arg in args:
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
+        for _ in args:
+            self.sm.pop()
+
+        from runar_compiler.codegen import p256_p384 as nist_mod
+
+        dispatch = {
+            "p256Add":              nist_mod.emit_p256_add,
+            "p256Mul":              nist_mod.emit_p256_mul,
+            "p256MulGen":           nist_mod.emit_p256_mul_gen,
+            "p256Negate":           nist_mod.emit_p256_negate,
+            "p256OnCurve":          nist_mod.emit_p256_on_curve,
+            "p256EncodeCompressed": nist_mod.emit_p256_encode_compressed,
+            "p384Add":              nist_mod.emit_p384_add,
+            "p384Mul":              nist_mod.emit_p384_mul,
+            "p384MulGen":           nist_mod.emit_p384_mul_gen,
+            "p384Negate":           nist_mod.emit_p384_negate,
+            "p384OnCurve":          nist_mod.emit_p384_on_curve,
+            "p384EncodeCompressed": nist_mod.emit_p384_encode_compressed,
+        }
+
+        fn = dispatch.get(func_name)
+        if fn is None:
+            raise RuntimeError(f"unknown NIST EC builtin: {func_name}")
+        fn(lambda op: self.emit_op(op))
+
+        self.sm.push(binding_name)
+        self._track_depth()
+
+    def _lower_verify_ecdsa(self, binding_name: str, func_name: str,
+                            args: list[str], binding_index: int,
+                            last_uses: dict[str, int]) -> None:
+        for arg in args:
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
+        for _ in args:
+            self.sm.pop()
+
+        from runar_compiler.codegen import p256_p384 as nist_mod
+
+        emit_fn = lambda op: self.emit_op(op)
+        if func_name == "verifyECDSA_P256":
+            nist_mod.emit_verify_ecdsa_p256(emit_fn)
+        else:
+            nist_mod.emit_verify_ecdsa_p384(emit_fn)
+
+        self.sm.push(binding_name)
+        self._track_depth()
+
+    # -----------------------------------------------------------------
+    # Baby Bear field arithmetic builtins
+    # -----------------------------------------------------------------
+
+    def _lower_bb_builtin(self, binding_name: str, func_name: str,
+                          args: list[str], binding_index: int,
+                          last_uses: dict[str, int]) -> None:
+        # Bring args to top in order
+        for arg in args:
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
+        for _ in args:
+            self.sm.pop()
+
+        # Delegate to the Baby Bear codegen module
+        from runar_compiler.codegen.babybear import dispatch_bb_builtin
+        emit_fn = lambda op: self.emit_op(op)
+        dispatch_bb_builtin(func_name, emit_fn)
+
+        self.sm.push(binding_name)
+        self._track_depth()
+
+    # -----------------------------------------------------------------
+    # KoalaBear field arithmetic builtins
+    # -----------------------------------------------------------------
+
+    def _lower_kb_builtin(self, binding_name: str, func_name: str,
+                          args: list[str], binding_index: int,
+                          last_uses: dict[str, int]) -> None:
+        # Bring args to top in order
+        for arg in args:
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
+        for _ in args:
+            self.sm.pop()
+
+        # Delegate to the KoalaBear codegen module
+        from runar_compiler.codegen.koalabear import dispatch_kb_builtin
+        emit_fn = lambda op: self.emit_op(op)
+        dispatch_kb_builtin(func_name, emit_fn)
+
+        self.sm.push(binding_name)
+        self._track_depth()
+
+    # -----------------------------------------------------------------
+    # BN254 field and G1 builtins
+    # -----------------------------------------------------------------
+
+    def _lower_bn254_builtin(self, binding_name: str, func_name: str,
+                             args: list[str], binding_index: int,
+                             last_uses: dict[str, int]) -> None:
+        # Bring args to top in order
+        for arg in args:
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
+        for _ in args:
+            self.sm.pop()
+
+        # Delegate to the BN254 codegen module
+        from runar_compiler.codegen.bn254 import dispatch_bn254_builtin
+        emit_fn = lambda op: self.emit_op(op)
+        dispatch_bn254_builtin(func_name, emit_fn)
+
+        self.sm.push(binding_name)
+        self._track_depth()
+
+    # -----------------------------------------------------------------
+    # Poseidon2 KoalaBear Merkle proof verification
+    # -----------------------------------------------------------------
+
+    def _lower_merkle_root_poseidon2_kb(self, binding_name: str, args: list[str],
+                                         binding_index: int,
+                                         last_uses: dict[str, int]) -> None:
+        # args: [leaf_0..leaf_7, sib0_0..sib0_7, ..., sib(D-1)_0..sib(D-1)_7, index, depth]
+        # depth must be a compile-time constant (last argument)
+        n_args = len(args)
+        if n_args < 10:
+            raise RuntimeError(
+                f"merkleRootPoseidon2KB requires at least 10 arguments, got {n_args}"
+            )
+
+        # Extract depth constant from tracked constant values (last arg)
+        depth_arg = args[n_args - 1]
+        depth_value = self.const_values.get(depth_arg)
+        if depth_value is None or not isinstance(depth_value, int):
+            raise RuntimeError(
+                f"merkleRootPoseidon2KB: depth (last argument) must be a compile-time "
+                f"constant integer literal. Got a runtime value for '{depth_arg}'."
+            )
+        depth = int(depth_value)
+        if depth < 1 or depth > 64:
+            raise RuntimeError(
+                f"merkleRootPoseidon2KB: depth must be between 1 and 64, got {depth}"
+            )
+
+        # Validate argument count: 8 leaf + depth*8 proof + 1 index + 1 depth
+        expected_args = 8 + depth * 8 + 1 + 1
+        if n_args != expected_args:
+            raise RuntimeError(
+                f"merkleRootPoseidon2KB: expected {expected_args} arguments "
+                f"(8 leaf + {depth}*8 proof + index + depth), got {n_args}"
+            )
+
+        # Remove depth from the real stack FIRST (compile-time constant, not runtime)
+        if self.sm.has(depth_arg):
+            self.bring_to_top(depth_arg, True)
+            self.emit_op(StackOp(op="drop"))
+            self.sm.pop()
+
+        # Bring all runtime args (leaf*8 + proof*depth*8 + index) to stack top in order
+        runtime_arg_count = n_args - 1  # all except depth
+        for i in range(runtime_arg_count):
+            arg = args[i]
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
+        # Pop all runtime args -- the codegen consumes them and produces 8 results
+        for _ in range(runtime_arg_count):
+            self.sm.pop()
+
+        from runar_compiler.codegen.poseidon2_merkle import emit_poseidon2_merkle_root
+        emit_fn = lambda op: self.emit_op(op)
+        emit_poseidon2_merkle_root(emit_fn, depth)
+
+        # The codegen leaves 8 elements on the stack (root_0..root_7, root_7 on top).
+        # The type system returns a single bigint, so only root_7 (top) is accessible.
+        # Drop the lower 7 elements with OP_NIP to keep the stack clean.
+        for _ in range(7):
+            self.emit_op(StackOp(op="nip"))
+        self.sm.push(binding_name)
+        self._track_depth()
+
+    # -----------------------------------------------------------------
+    # Merkle proof verification builtins
+    # -----------------------------------------------------------------
+
+    def _lower_merkle_root(self, binding_name: str, func_name: str,
+                           args: list[str], binding_index: int,
+                           last_uses: dict[str, int]) -> None:
+        # args: [leaf, proof, index, depth]
+        # depth must be a compile-time constant
+        if len(args) != 4:
+            raise RuntimeError(
+                f"{func_name} requires exactly 4 arguments (leaf, proof, index, depth)"
+            )
+
+        # Extract depth constant from ANF binding
+        depth_arg = args[3]
+        depth_value = self.const_values.get(depth_arg)
+        if depth_value is None or not isinstance(depth_value, int):
+            raise RuntimeError(
+                f"{func_name}: depth (4th argument) must be a compile-time constant "
+                f"integer literal. Got a runtime value for '{depth_arg}'."
+            )
+        depth = int(depth_value)
+        if depth < 1 or depth > 64:
+            raise RuntimeError(
+                f"{func_name}: depth must be between 1 and 64, got {depth}"
+            )
+
+        # Remove depth from the real stack FIRST (compile-time constant, not runtime).
+        if self.sm.has(depth_arg):
+            self.bring_to_top(depth_arg, True)
+            self.emit_op(StackOp(op="drop"))
+            self.sm.pop()
+
+        # Bring leaf, proof, index to stack top for the codegen
+        for i in range(3):
+            arg = args[i]
+            consume = self._operand_consume(arg, args, binding_index, last_uses)
+            self.bring_to_top(arg, consume)
+        # Pop the 3 args -- the codegen consumes them and produces 1 result
+        for _ in range(3):
+            self.sm.pop()
+
+        from runar_compiler.codegen.merkle import (
+            emit_merkle_root_sha256,
+            emit_merkle_root_hash256,
+        )
+        emit_fn = lambda op: self.emit_op(op)
+
+        if func_name == "merkleRootSha256":
+            emit_merkle_root_sha256(emit_fn, depth)
+        else:
+            emit_merkle_root_hash256(emit_fn, depth)
+
+        self.sm.push(binding_name)
+        self._track_depth()
+
 
 # ---------------------------------------------------------------------------
 # EC builtin names
@@ -3371,22 +4107,124 @@ def _is_ec_builtin(name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# NIST EC builtin names (P-256 and P-384)
+# ---------------------------------------------------------------------------
+
+_NIST_EC_BUILTIN_NAMES = frozenset({
+    "p256Add", "p256Mul", "p256MulGen",
+    "p256Negate", "p256OnCurve", "p256EncodeCompressed",
+    "p384Add", "p384Mul", "p384MulGen",
+    "p384Negate", "p384OnCurve", "p384EncodeCompressed",
+})
+
+
+def _is_nist_ec_builtin(name: str) -> bool:
+    return name in _NIST_EC_BUILTIN_NAMES
+
+
+# ---------------------------------------------------------------------------
+# Baby Bear builtin names
+# ---------------------------------------------------------------------------
+
+_BB_BUILTIN_NAMES = frozenset({
+    "bbFieldAdd", "bbFieldSub", "bbFieldMul", "bbFieldInv",
+    "bbExt4Mul0", "bbExt4Mul1", "bbExt4Mul2", "bbExt4Mul3",
+    "bbExt4Inv0", "bbExt4Inv1", "bbExt4Inv2", "bbExt4Inv3",
+})
+
+
+def _is_bb_builtin(name: str) -> bool:
+    return name in _BB_BUILTIN_NAMES
+
+
+# ---------------------------------------------------------------------------
+# KoalaBear builtin names
+# ---------------------------------------------------------------------------
+
+_KB_BUILTIN_NAMES = frozenset({
+    "kbFieldAdd", "kbFieldSub", "kbFieldMul", "kbFieldInv",
+    "kbExt4Mul0", "kbExt4Mul1", "kbExt4Mul2", "kbExt4Mul3",
+    "kbExt4Inv0", "kbExt4Inv1", "kbExt4Inv2", "kbExt4Inv3",
+})
+
+
+def _is_kb_builtin(name: str) -> bool:
+    return name in _KB_BUILTIN_NAMES
+
+
+# ---------------------------------------------------------------------------
+# BN254 builtin names
+# ---------------------------------------------------------------------------
+
+_BN254_BUILTIN_NAMES = frozenset({
+    "bn254FieldAdd", "bn254FieldSub", "bn254FieldMul",
+    "bn254FieldInv", "bn254FieldNeg",
+    "bn254G1Add", "bn254G1ScalarMul",
+    "bn254G1Negate", "bn254G1OnCurve",
+})
+
+
+def _is_bn254_builtin(name: str) -> bool:
+    return name in _BN254_BUILTIN_NAMES
+
+
+# ---------------------------------------------------------------------------
+# Merkle builtin names
+# ---------------------------------------------------------------------------
+
+_MERKLE_BUILTIN_NAMES = frozenset({
+    "merkleRootSha256", "merkleRootHash256",
+})
+
+
+def _is_merkle_builtin(name: str) -> bool:
+    return name in _MERKLE_BUILTIN_NAMES
+
+
+# ---------------------------------------------------------------------------
 # methodUsesCheckPreimage
 # ---------------------------------------------------------------------------
 
-def _method_uses_check_preimage(bindings: list[ANFBinding]) -> bool:
+def _method_uses_check_preimage(
+    bindings: list[ANFBinding],
+    private_methods: dict | None = None,
+    seen: set[str] | None = None,
+) -> bool:
+    """Recursively check whether `bindings` (and any private methods
+    they call, transitively) contain a check_preimage. 2026-04-30
+    audit finding F7: previous implementation was a shallow scan that
+    missed manual checkPreimage calls inside if/loop bodies and
+    private helpers, causing stack lowering to fail with
+    `Value '_opPushTxSig' not found on stack`."""
+    if seen is None:
+        seen = set()
     for b in bindings:
         if b.value.kind == "check_preimage":
             return True
+        if b.value.kind == "if":
+            if _method_uses_check_preimage(b.value.then, private_methods, seen):
+                return True
+            if _method_uses_check_preimage(b.value.else_ or [], private_methods, seen):
+                return True
+        if b.value.kind == "loop":
+            if _method_uses_check_preimage(b.value.body, private_methods, seen):
+                return True
+        if b.value.kind == "method_call" and private_methods is not None:
+            target = private_methods.get(b.value.method)
+            if target is not None and target.name not in seen:
+                next_seen = seen | {target.name}
+                if _method_uses_check_preimage(target.body, private_methods, next_seen):
+                    return True
     return False
 
 
 def _method_uses_code_part(bindings: list[ANFBinding]) -> bool:
-    """Check whether a method has add_output, add_raw_output, or computeStateOutput/
-    computeStateOutputHash calls (recursively). Only methods that construct
-    continuation outputs need the _codePart implicit parameter."""
+    """Check whether a method has add_output, add_raw_output, add_data_output,
+    or computeStateOutput/computeStateOutputHash calls (recursively). Only
+    methods that construct continuation outputs need the _codePart implicit
+    parameter."""
     for b in bindings:
-        if b.value.kind in ("add_output", "add_raw_output"):
+        if b.value.kind in ("add_output", "add_raw_output", "add_data_output"):
             return True
         # Single-output stateful continuation uses computeStateOutput/computeStateOutputHash
         if b.value.kind == "call" and getattr(b.value, "func", None) in ("computeStateOutput", "computeStateOutputHash"):
@@ -3400,6 +4238,31 @@ def _method_uses_code_part(bindings: list[ANFBinding]) -> bool:
         if b.value.kind == "loop":
             body_bindings = getattr(b.value, "body", None) or []
             if _method_uses_code_part(body_bindings):
+                return True
+    return False
+
+
+def _method_reads_var_len_state(
+    bindings: list[ANFBinding],
+    var_len_props: set[str],
+) -> bool:
+    """Whether a method READS a mutable variable-length (ByteString) state
+    field's value (via load_prop). Issue #100: such a terminal method needs
+    _codePart for the preimage-relative state offset. Narrowed to the live
+    var-length read so methods that only read readonly fields (baked into the
+    locking script) or fixed-size fields keep their original terminal codegen."""
+    for b in bindings:
+        if b.value.kind == "load_prop" and getattr(b.value, "name", None) in var_len_props:
+            return True
+        if b.value.kind == "if":
+            then_bindings = getattr(b.value, "then", None) or []
+            else_bindings = getattr(b.value, "else_", None) or []
+            if (_method_reads_var_len_state(then_bindings, var_len_props)
+                    or _method_reads_var_len_state(else_bindings, var_len_props)):
+                return True
+        if b.value.kind == "loop":
+            body_bindings = getattr(b.value, "body", None) or []
+            if _method_reads_var_len_state(body_bindings, var_len_props):
                 return True
     return False
 
@@ -3418,12 +4281,17 @@ def lower_to_stack(program: ANFProgram) -> list[StackMethod]:
     mismatches, etc.) and converts them to RuntimeError with a descriptive
     message instead of letting raw exceptions propagate.
     """
+    from runar_compiler.ir.unknown_anf_kind_error import UnknownANFKindError
     try:
         return _lower_to_stack_inner(program)
     except RuntimeError:
         # RuntimeError messages are already descriptive (e.g. "stack underflow",
         # "unknown binary operator: ...", "value 'x' not found on stack").
         # Re-raise as-is so callers get a clear error.
+        raise
+    except UnknownANFKindError:
+        # Typed exhaustiveness guard -- preserve the kind / location so the
+        # regression test (and any caller) can pattern-match on it.
         raise
     except Exception as e:
         raise RuntimeError(f"stack lowering: {e}") from e
@@ -3458,26 +4326,36 @@ def _lower_method_with_private_methods(
 
     # If the method uses checkPreimage, the unlocking script pushes implicit
     # params before all declared parameters (OP_PUSH_TX pattern).
-    # _codePart: full code script (locking script minus state) as ByteString
-    # _opPushTxSig: ECDSA signature for OP_PUSH_TX verification
-    # These are inserted at the base of the stack so they can be consumed later.
-    if _method_uses_check_preimage(method.body):
-        param_names = ["_opPushTxSig"] + param_names
-        # _codePart is needed when the method has add_output or add_raw_output
-        # (it provides the code script for continuation output construction),
-        # or when deserializing variable-length (ByteString) state fields.
-        if _method_uses_code_part(method.body):
-            param_names = ["_codePart"] + param_names
-        # No else needed — terminal methods without addOutput don't need _codePart
+    # _codePart: full code script (locking script minus state) as ByteString.
+    # (BUG-100 fix: the OP_PUSH_TX signature is now derived on-chain from the
+    # preimage — see _lower_check_preimage — so NO _opPushTxSig witness item is
+    # pushed. The unlocking script provides only the preimage.)
+    # _codePart is needed for continuation builders (add_output/add_raw_output)
+    # OR when the method reads a mutable variable-length (ByteString) state
+    # field — the deserialization needs it for the preimage-relative offset
+    # (issue #100).
+    var_len_props = {
+        p.name for p in properties if not p.readonly and p.type == "ByteString"
+    }
+    uses_code_part = (
+        _method_uses_check_preimage(method.body, private_methods)
+        and (_method_uses_code_part(method.body)
+             or _method_reads_var_len_state(method.body, var_len_props))
+    )
+    if _method_uses_check_preimage(method.body, private_methods) and uses_code_part:
+        param_names = ["_codePart"] + param_names
 
     ctx = _LoweringContext(param_names, properties)
     ctx.private_methods = private_methods
     # Pass terminalAssert=true for public methods
     ctx.lower_bindings(method.body, method.is_public)
 
-    # Clean up excess stack items left by deserialize_state.
-    has_deserialize_state = any(b.value.kind == "deserialize_state" for b in method.body)
-    if method.is_public and has_deserialize_state and ctx.sm.depth() > 1:
+    # Clean up excess stack items below the top-of-stack boolean (CLEANSTACK).
+    # Excess items can come from deserialize_state (stateful methods reading
+    # mutable fields) or from readonly-field-binding patterns in all-readonly
+    # terminal methods. The depth>1 guard keeps this a no-op for already-clean
+    # methods.
+    if method.is_public and ctx.sm.depth() > 1:
         excess = ctx.sm.depth() - 1
         for _ in range(excess):
             ctx.emit_op(StackOp(op="nip"))
@@ -3493,6 +4371,7 @@ def _lower_method_with_private_methods(
         name=method.name,
         ops=ctx.ops,
         max_stack_depth=ctx.max_depth,
+        uses_code_part=uses_code_part,
     )
 
 
@@ -3505,9 +4384,12 @@ def _lower_method(
     ctx = _LoweringContext(param_names, properties)
     ctx.lower_bindings(method.body, method.is_public)
 
-    # Clean up excess stack items left by deserialize_state.
-    has_deserialize_state = any(b.value.kind == "deserialize_state" for b in method.body)
-    if method.is_public and has_deserialize_state and ctx.sm.depth() > 1:
+    # Clean up excess stack items below the top-of-stack boolean (CLEANSTACK).
+    # Excess items can come from deserialize_state (stateful methods reading
+    # mutable fields) or from readonly-field-binding patterns in all-readonly
+    # terminal methods. The depth>1 guard keeps this a no-op for already-clean
+    # methods.
+    if method.is_public and ctx.sm.depth() > 1:
         excess = ctx.sm.depth() - 1
         for _ in range(excess):
             ctx.emit_op(StackOp(op="nip"))

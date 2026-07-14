@@ -4,8 +4,15 @@ use std::fs;
 use std::path::Path;
 
 use super::{ANFBinding, ANFProgram, ANFValue};
+use super::input_limits::{
+    assert_ir_bytes_under_limit, assert_ir_nesting_under_limit,
+};
 
 /// Load an ANF IR program from a JSON file on disk.
+///
+/// Rejects oversized (>MAX_IR_BYTES) or deeply-nested (>MAX_IR_NESTING)
+/// payloads with a typed-error-derived error string BEFORE `serde_json`
+/// runs. BUG-008 follow-up.
 pub fn load_ir(path: &Path) -> Result<ANFProgram, String> {
     let data = fs::read_to_string(path)
         .map_err(|e| format!("reading IR file: {}", e))?;
@@ -13,12 +20,66 @@ pub fn load_ir(path: &Path) -> Result<ANFProgram, String> {
 }
 
 /// Load an ANF IR program from a JSON string.
+///
+/// Rejects oversized (>MAX_IR_BYTES) or deeply-nested (>MAX_IR_NESTING)
+/// payloads BEFORE `serde_json::from_str` runs. BUG-008 follow-up.
 pub fn load_ir_from_str(json_str: &str) -> Result<ANFProgram, String> {
+    // DoS-bound guards run before serde_json::from_str so a malicious
+    // payload cannot exhaust memory (size) or the thread stack (nesting)
+    // inside the deserializer.
+    if let Some(e) = assert_ir_bytes_under_limit(json_str.as_bytes()) {
+        return Err(e.to_string());
+    }
+    if let Some(e) = assert_ir_nesting_under_limit(json_str.as_bytes()) {
+        return Err(e.to_string());
+    }
     let program: ANFProgram = serde_json::from_str(json_str)
         .map_err(|e| format!("invalid IR JSON: {}", e))?;
     validate_ir(&program)?;
     Ok(program)
 }
+
+/// Load an ANF IR program from a JSON string, returning typed errors on
+/// DoS-bound rejection. Wraps `load_ir_from_str`; callers wanting
+/// `errors.As`-style typed inspection use this entry point. BUG-008
+/// follow-up.
+pub fn load_ir_from_str_typed(
+    json_str: &str,
+) -> Result<ANFProgram, IRLoaderError> {
+    if let Some(e) = assert_ir_bytes_under_limit(json_str.as_bytes()) {
+        return Err(IRLoaderError::Size(e));
+    }
+    if let Some(e) = assert_ir_nesting_under_limit(json_str.as_bytes()) {
+        return Err(IRLoaderError::Nesting(e));
+    }
+    serde_json::from_str::<ANFProgram>(json_str)
+        .map_err(|e| IRLoaderError::Other(format!("invalid IR JSON: {}", e)))
+        .and_then(|p| {
+            validate_ir(&p).map_err(IRLoaderError::Other)?;
+            Ok(p)
+        })
+}
+
+/// Typed-error variant returned by `load_ir_from_str_typed`. BUG-008
+/// follow-up.
+#[derive(Debug)]
+pub enum IRLoaderError {
+    Size(super::input_limits::IRSizeExceededError),
+    Nesting(super::input_limits::IRNestingExceededError),
+    Other(String),
+}
+
+impl std::fmt::Display for IRLoaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IRLoaderError::Size(e) => write!(f, "{}", e),
+            IRLoaderError::Nesting(e) => write!(f, "{}", e),
+            IRLoaderError::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for IRLoaderError {}
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -42,7 +103,9 @@ const KNOWN_KINDS: &[&str] = &[
     "deserialize_state",
     "add_output",
     "add_raw_output",
+    "add_data_output",
     "array_literal",
+    "raw_script",
 ];
 
 fn kind_name(value: &ANFValue) -> &'static str {
@@ -63,8 +126,16 @@ fn kind_name(value: &ANFValue) -> &'static str {
         ANFValue::DeserializeState { .. } => "deserialize_state",
         ANFValue::AddOutput { .. } => "add_output",
         ANFValue::AddRawOutput { .. } => "add_raw_output",
+        ANFValue::AddDataOutput { .. } => "add_data_output",
         ANFValue::ArrayLiteral { .. } => "array_literal",
+        ANFValue::RawScript { .. } => "raw_script",
     }
+}
+
+/// Reports whether `s` contains only hex digits (0-9, a-f, A-F).
+/// An empty string is considered valid hex.
+fn is_hex_string(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn validate_ir(program: &ANFProgram) -> Result<(), String> {
@@ -135,6 +206,23 @@ fn validate_bindings(bindings: &[ANFBinding], method_name: &str) -> Result<(), S
             }
             ANFValue::Loop { body, .. } => {
                 validate_bindings(body, method_name)?;
+            }
+            ANFValue::RawScript { bytes, .. } => {
+                // Opaque opcode-byte span — the bytes must be a well-formed
+                // even-length hex string. in_arity / out_arity are usize, so
+                // non-negativity is enforced at the type level.
+                if bytes.len() % 2 != 0 {
+                    return Err(format!(
+                        "IR validation: method {} binding {} raw_script bytes have odd hex length {}",
+                        method_name, binding.name, bytes.len()
+                    ));
+                }
+                if !is_hex_string(bytes) {
+                    return Err(format!(
+                        "IR validation: method {} binding {} raw_script bytes contain non-hex characters",
+                        method_name, binding.name
+                    ));
+                }
             }
             _ => {}
         }
@@ -435,11 +523,13 @@ mod tests {
     fn test_round_trip_serialize_deserialize() {
         let program = ANFProgram {
             contract_name: "RoundTrip".to_string(),
+            parent_class: String::new(),
             properties: vec![ANFProperty {
                 name: "count".to_string(),
                 prop_type: "bigint".to_string(),
                 readonly: false,
                 initial_value: None,
+                synthetic_array_chain: None,
             }],
             methods: vec![ANFMethod {
                 name: "increment".to_string(),
@@ -482,6 +572,7 @@ mod tests {
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -508,11 +599,13 @@ mod tests {
     fn test_round_trip_with_initial_value() {
         let program = ANFProgram {
             contract_name: "InitTest".to_string(),
+            parent_class: String::new(),
             properties: vec![ANFProperty {
                 name: "value".to_string(),
                 prop_type: "bigint".to_string(),
                 readonly: true,
                 initial_value: Some(serde_json::json!(100)),
+                synthetic_array_chain: None,
             }],
             methods: vec![ANFMethod {
                 name: "check".to_string(),
@@ -529,11 +622,13 @@ mod tests {
                         name: "_t1".to_string(),
                         value: ANFValue::Assert {
                             value: "_t0".to_string(),
+                            is_auto_injected_state_check: false,
                         },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -547,6 +642,7 @@ mod tests {
     fn test_round_trip_if_and_loop() {
         let program = ANFProgram {
             contract_name: "Nested".to_string(),
+            parent_class: String::new(),
             properties: vec![],
             methods: vec![ANFMethod {
                 name: "test".to_string(),
@@ -592,11 +688,14 @@ mod tests {
                                 source_loc: None,
                             }],
                             iter_var: "i".to_string(),
+                            start: serde_json::json!(0),
+                            step: 1,
                         },
                         source_loc: None,
                     },
                 ],
                 is_public: true,
+                sighash_type: None,
             }],
         };
 
@@ -613,10 +712,12 @@ mod tests {
         }
 
         // Verify Loop survived
-        if let ANFValue::Loop { count, body, iter_var } = &loaded.methods[0].body[2].value {
+        if let ANFValue::Loop { count, body, iter_var, start, step } = &loaded.methods[0].body[2].value {
             assert_eq!(*count, 5);
             assert_eq!(body.len(), 1);
             assert_eq!(iter_var, "i");
+            assert_eq!(*start, serde_json::json!(0));
+            assert_eq!(*step, 1);
         } else {
             panic!("expected Loop binding");
         }

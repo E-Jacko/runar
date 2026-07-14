@@ -16,6 +16,13 @@ require 'digest'
 
 module Runar
   module RabinSig
+    # Upper bound (exclusive) on the padding value, mirroring the on-chain
+    # Rabin codegen's `OP_WITHIN 0 65536` check. Without this bound the
+    # off-chain verifier would accept a universal forgery the deployed script
+    # rejects: setting sig = 0 and padding = SHA256(msg) makes
+    # (0^2 + SHA256(msg)) mod n == SHA256(msg) mod n trivially true.
+    RABIN_PADDING_LIMIT = 65_536
+
     # Verify a Rabin signature.
     #
     # All parameters are hex-encoded strings. sig, padding, and pubkey are
@@ -47,6 +54,11 @@ module Runar
 
       sig_int = bytes_to_unsigned_le([sig_hex].pack('H*'))
       pad_int = bytes_to_unsigned_le([pad_hex].pack('H*'))
+
+      # Enforce the on-chain OP_WITHIN bound: 0 <= padding < RABIN_PADDING_LIMIT.
+      # bytes_to_unsigned_le never yields a negative value, but the >= 0 guard
+      # documents the lower bound that the on-chain check also enforces.
+      return false if pad_int < 0 || pad_int >= RABIN_PADDING_LIMIT
 
       msg_bytes = [msg_hex].pack('H*')
       hash_bytes = Digest::SHA256.digest(msg_bytes)

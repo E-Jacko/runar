@@ -7,6 +7,7 @@ Hand-written tokenizer with INDENT/DEDENT + recursive descent parser.
 from __future__ import annotations
 
 from runar_compiler.frontend.ast_nodes import (
+    ArrayLiteralExpr,
     ContractNode, PropertyNode, MethodNode, ParamNode, SourceLocation,
     PrimitiveType, FixedArrayType, CustomType, TypeNode,
     BigIntLiteral, BoolLiteral, ByteStringLiteral, Identifier,
@@ -110,7 +111,25 @@ _SPECIAL_NAMES: dict[str, str] = {
     "ec_make_point": "ecMakePoint",
     "ec_point_x": "ecPointX",
     "ec_point_y": "ecPointY",
+    # P-256 (NIST secp256r1)
+    "p256_add":               "p256Add",
+    "p256_mul":               "p256Mul",
+    "p256_mul_gen":           "p256MulGen",
+    "p256_negate":            "p256Negate",
+    "p256_on_curve":          "p256OnCurve",
+    "p256_encode_compressed": "p256EncodeCompressed",
+    "verify_ecdsa_p256":      "verifyECDSA_P256",
+    # P-384 (NIST secp384r1)
+    "p384_add":               "p384Add",
+    "p384_mul":               "p384Mul",
+    "p384_mul_gen":           "p384MulGen",
+    "p384_negate":            "p384Negate",
+    "p384_on_curve":          "p384OnCurve",
+    "p384_encode_compressed": "p384EncodeCompressed",
+    "verify_ecdsa_p384":      "verifyECDSA_P384",
     "add_output": "addOutput",
+    "add_raw_output": "addRawOutput",
+    "add_data_output": "addDataOutput",
     "get_state_script": "getStateScript",
     "extract_locktime": "extractLocktime",
     "extract_output_hash": "extractOutputHash",
@@ -124,6 +143,10 @@ _SPECIAL_NAMES: dict[str, str] = {
     "extract_input_index": "extractInputIndex",
     "extract_sig_hash_type": "extractSigHashType",
     "extract_outputs": "extractOutputs",
+    # Intent sub-covenant intrinsics (BSVM Phase 13).
+    "extract_prev_output_script": "extractPrevOutputScript",
+    "require_output_p2pkh":       "requireOutputP2PKH",
+    "current_block_height":       "currentBlockHeight",
     "mul_div": "mulDiv",
     "percent_of": "percentOf",
     "reverse_bytes": "reverseBytes",
@@ -135,6 +158,7 @@ _SPECIAL_NAMES: dict[str, str] = {
     "hash256": "hash256",
     "num2bin": "num2bin",
     "bin2num": "bin2num",
+    "int_to_str": "int2str",
     "log2": "log2",
     "div_mod": "divmod",
     "EC_P": "EC_P",
@@ -214,18 +238,22 @@ _TYPE_MAP: dict[str, str] = {
     "Bigint": "bigint",
     "bigint": "bigint",
     "bool": "boolean",
+    "Bool": "boolean",
     "boolean": "boolean",
     "bytes": "ByteString",
     "ByteString": "ByteString",
     "PubKey": "PubKey",
     "Sig": "Sig",
     "Sha256": "Sha256",
+    "Sha256Digest": "Sha256",
     "Ripemd160": "Ripemd160",
     "Addr": "Addr",
     "SigHashPreimage": "SigHashPreimage",
     "RabinSig": "RabinSig",
     "RabinPubKey": "RabinPubKey",
     "Point": "Point",
+    "P256Point": "P256Point",
+    "P384Point": "P384Point",
 }
 
 
@@ -316,11 +344,10 @@ def _tokenize_raw(source: str) -> list[Token]:
         # String literals
         if ch in ("'", '"'):
             quote = ch
-            # Triple-quote
+            # Triple-quote — always a docstring in Rúnar. Skip without emitting a token.
             if i + 2 < n and source[i + 1] == quote and source[i + 2] == quote:
                 i += 3
                 col += 3
-                start = i
                 while i + 2 < n:
                     if source[i] == quote and source[i + 1] == quote and source[i + 2] == quote:
                         break
@@ -330,11 +357,9 @@ def _tokenize_raw(source: str) -> list[Token]:
                     else:
                         col += 1
                     i += 1
-                val = source[start:i]
                 if i + 2 < n:
                     i += 3
                     col += 3
-                tokens.append(Token(TOK_STRING, val, line, start_col))
                 continue
             i += 1
             col += 1
@@ -651,7 +676,11 @@ class _PyParser:
             parent_class = parent_tok.value
             self.expect(TOK_RPAREN)
 
-        if parent_class not in ("SmartContract", "StatefulSmartContract"):
+        if parent_class not in (
+            "SmartContract",
+            "StatefulSmartContract",
+            "UnsafeSmartContract",
+        ):
             raise ValueError(f"unknown parent class: {parent_class}")
 
         self.expect(TOK_COLON)
@@ -740,7 +769,9 @@ class _PyParser:
         is_readonly = False
         if self.check_ident("Readonly"):
             is_readonly = True
-        if parent_class == "SmartContract":
+        # In SmartContract (and UnsafeSmartContract), all properties are
+        # automatically readonly.
+        if parent_class in ("SmartContract", "UnsafeSmartContract"):
             is_readonly = True
 
         typ_node = self.parse_type_annotation()
@@ -907,6 +938,17 @@ class _PyParser:
             self.skip_newlines()
             return None
 
+        if self.check_ident("break") or self.check_ident("continue"):
+            kw = self.peek().value
+            self.advance()
+            self.skip_newlines()
+            self.errors.append(Diagnostic(
+                message=f"Unsupported statement kind: {kw} — Rúnar does not support loop early-exit",
+                severity=Severity.ERROR,
+                loc=location,
+            ))
+            return None
+
         return self._parse_expr_or_assign(location)
 
     def _parse_assert(self, loc: SourceLocation) -> Statement:
@@ -979,9 +1021,15 @@ class _PyParser:
 
         first = self.parse_expression()
 
+        step_expr: Expression | None = None
         if self.match(TOK_COMMA):
             init_expr = first
             limit_expr = self.parse_expression()
+            # Optional third range() argument: the step (issue #121). Only unit
+            # steps (+1 / -1) are supported by the loop model; a negative step
+            # is a countdown (range(3, 0, -1) -> 3, 2, 1).
+            if self.match(TOK_COMMA):
+                step_expr = self.parse_expression()
         else:
             init_expr = BigIntLiteral(value=0)
             limit_expr = first
@@ -999,16 +1047,28 @@ class _PyParser:
             source_location=loc,
         )
 
+        # A negative literal step means a countdown loop: iterate while
+        # `var > stop` and decrement (issue #121). Any other step (absent, or a
+        # positive literal) counts up with `<` / `i++`, preserving the historical
+        # zero-config `range(n)` / `range(a, b)` behaviour byte-for-byte.
+        is_countdown = _is_negative_literal(step_expr)
+
         condition = BinaryExpr(
-            op="<",
+            op=">" if is_countdown else "<",
             left=Identifier(name=var_name),
             right=limit_expr,
         )
 
-        update = ExpressionStmt(
-            expr=IncrementExpr(operand=Identifier(name=var_name), prefix=False),
-            source_location=loc,
-        )
+        if is_countdown:
+            update = ExpressionStmt(
+                expr=DecrementExpr(operand=Identifier(name=var_name), prefix=False),
+                source_location=loc,
+            )
+        else:
+            update = ExpressionStmt(
+                expr=IncrementExpr(operand=Identifier(name=var_name), prefix=False),
+                source_location=loc,
+            )
 
         return ForStmt(
             init=init_stmt,
@@ -1359,7 +1419,7 @@ class _PyParser:
             if not self.match(TOK_COMMA):
                 break
         self.expect(TOK_RBRACKET)
-        return CallExpr(callee=Identifier(name="FixedArray"), args=elements)
+        return ArrayLiteralExpr(elements=elements)
 
     def _parse_call_args(self) -> list[Expression]:
         self.expect(TOK_LPAREN)
@@ -1379,6 +1439,23 @@ def _parse_number(s: str) -> Expression:
     except ValueError:
         val = 0
     return BigIntLiteral(value=val)
+
+
+def _is_negative_literal(expr: Expression | None) -> bool:
+    """True if *expr* is a negative integer literal (``-1``), spelled either as
+    a unary-minus over a literal or a directly-negative BigIntLiteral. Used to
+    detect a countdown ``range(start, stop, -1)`` step (issue #121)."""
+    if expr is None:
+        return False
+    if isinstance(expr, UnaryExpr) and expr.op == "-":
+        return _is_positive_or_zero_literal(expr.operand)
+    if isinstance(expr, BigIntLiteral):
+        return expr.value < 0
+    return False
+
+
+def _is_positive_or_zero_literal(expr: Expression | None) -> bool:
+    return isinstance(expr, BigIntLiteral) and expr.value >= 0
 
 
 # ---------------------------------------------------------------------------

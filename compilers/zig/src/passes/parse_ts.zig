@@ -19,6 +19,10 @@
 
 const std = @import("std");
 const types = @import("../ir/types.zig");
+const opcodes = @import("../codegen/opcodes.zig");
+const sighash_directive = @import("../frontend/sighash_directive.zig");
+const input_limits = @import("../frontend/input_limits.zig");
+const containsDirectiveToken = input_limits.containsDirectiveToken;
 
 const Allocator = std.mem.Allocator;
 const Expression = types.Expression;
@@ -63,6 +67,18 @@ pub const ParseResult = struct {
 pub fn parseTs(allocator: Allocator, source: []const u8, file_name: []const u8) ParseResult {
     var parser = Parser.init(allocator, source, file_name);
     return parser.parse();
+}
+
+/// True if every byte in `s` is an ASCII digit (0-9). Used to identify
+/// decimal integer literals that overflow `i64` (e.g. the secp256k1 group
+/// order) so the parser can route them to a `literal_bigint` AST node
+/// instead of truncating to `i64`.
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -123,6 +139,14 @@ const Token = struct {
     text: []const u8,
     line: u32,
     col: u32,
+    /// Byte offset into the source where this token's lexeme starts (after any
+    /// leading whitespace/comment trivia). Issue #109/#123: lets the parser
+    /// recover the leading comment trivia of a class member — the source region
+    /// between the previous token's `end` and this token's `start` — to detect
+    /// `@embedAlways` / `@sighash` directives that the tokenizer discards.
+    start: usize = 0,
+    /// Byte offset one past this token's lexeme (self.pos after scanning it).
+    end: usize = 0,
 };
 
 // ============================================================================
@@ -187,8 +211,18 @@ const Tokenizer = struct {
         }
     }
 
+    /// Public entry: skip leading trivia, scan one token, and stamp its byte
+    /// span (`start`..`end`) so the parser can recover leading comment trivia.
     fn next(self: *Tokenizer) Token {
         self.skipWhitespaceAndComments();
+        const start_off = self.pos;
+        var tok = self.scanToken();
+        tok.start = start_off;
+        tok.end = self.pos;
+        return tok;
+    }
+
+    fn scanToken(self: *Tokenizer) Token {
         if (self.pos >= self.source.len) return .{ .kind = .eof, .text = "", .line = self.line, .col = self.col };
 
         const sl = self.line;
@@ -375,13 +409,30 @@ const Parser = struct {
     file_name: []const u8,
     errors: std.ArrayListUnmanaged([]const u8),
     depth: u32,
+    /// Byte offset one past the token most recently consumed by `bump()`. The
+    /// leading comment trivia of `self.current` is `source[prev_token_end ..
+    /// current.start]`. Used to detect `@embedAlways` / `@sighash` directives.
+    prev_token_end: usize = 0,
 
     const max_depth: u32 = 256;
 
     fn init(allocator: Allocator, source: []const u8, file_name: []const u8) Parser {
         var tokenizer = Tokenizer.init(source);
         const first = tokenizer.next();
-        return .{ .allocator = allocator, .tokenizer = tokenizer, .current = first, .file_name = file_name, .errors = .empty, .depth = 0 };
+        return .{ .allocator = allocator, .tokenizer = tokenizer, .current = first, .file_name = file_name, .errors = .empty, .depth = 0, .prev_token_end = 0 };
+    }
+
+    /// The leading comment/whitespace trivia immediately preceding `self.current`
+    /// — the raw source between the previous consumed token and this one. A
+    /// `/** @embedAlways */` or `/** @sighash ... */` directive that annotates a
+    /// class member lives here (the tokenizer discards comments, so this is how
+    /// the parser recovers directives). Empty when `current` is the first token.
+    fn leadingTrivia(self: *const Parser) []const u8 {
+        const src = self.tokenizer.source;
+        const start = self.prev_token_end;
+        const end = self.current.start;
+        if (start >= end or end > src.len) return "";
+        return src[start..end];
     }
 
     fn addError(self: *Parser, msg: []const u8) void {
@@ -398,6 +449,7 @@ const Parser = struct {
 
     fn bump(self: *Parser) Token {
         const prev = self.current;
+        self.prev_token_end = prev.end;
         self.current = self.tokenizer.next();
         return prev;
     }
@@ -530,7 +582,7 @@ const Parser = struct {
             if (ParentClass.fromTsString(parent_tok.text)) |pc| {
                 parent_class = pc;
             } else {
-                self.addErrorFmt("unknown parent class: '{s}', expected SmartContract or StatefulSmartContract", .{parent_tok.text});
+                self.addErrorFmt("unknown parent class: '{s}', expected SmartContract, StatefulSmartContract, or UnsafeSmartContract", .{parent_tok.text});
                 return null;
             }
         }
@@ -586,6 +638,13 @@ const Parser = struct {
     };
 
     fn parseClassMember(self: *Parser, parent_class: ParentClass) ClassMember {
+        // Capture the leading comment trivia BEFORE consuming any tokens, so a
+        // `/** @embedAlways */` (issue #109) or `/** @sighash <FLAGS> */`
+        // (issue #123) directive that annotates this member is available. The
+        // tokenizer discards comments; leadingTrivia() recovers the raw source
+        // between the previous token and this member's first token.
+        const member_trivia = self.leadingTrivia();
+
         // Skip TypeScript decorators: @prop(), @method(), etc.
         while (self.current.kind == .ident and self.current.text.len == 1 and self.current.text[0] == '@') {
             _ = self.bump(); // consume '@'
@@ -635,7 +694,11 @@ const Parser = struct {
 
         // Method: name(...)
         if (self.current.kind == .lparen) {
-            const m = self.parseMethod(member_name, is_public);
+            var m = self.parseMethod(member_name, is_public);
+            // Issue #123: honour a `/** @sighash <FLAGS> */` directive in the
+            // method's leading comment trivia. Only public methods are spending
+            // entry points, so a directive on a private helper is meaningless.
+            m.sighash_type = self.parseSighashDirective(member_trivia, member_name, is_public);
             return .{ .method = m };
         }
 
@@ -657,11 +720,35 @@ const Parser = struct {
             // For StatefulSmartContract, readonly depends on the keyword.
             const readonly = if (parent_class == .smart_contract) true else is_readonly;
 
+            // Issue #109: `/** @embedAlways */` (or `// @embedAlways`) directive
+            // in the field's leading comment trivia opts it out of DCE. Matches
+            // the TS `/@embedAlways\b/` scan: the marker must be at a word
+            // boundary so `embedAlwaysX` does not trip.
+            const embed_always = containsDirectiveToken(member_trivia, "@embedAlways");
+
+            // Capture FixedArray length + element type so expand_fixed_arrays
+            // can see the shape after typecheck.
+            var fa_len: u32 = 0;
+            var fa_elem: types.RunarType = .unknown;
+            var fa_nested_len: u32 = 0;
+            if (type_node == .fixed_array_type) {
+                fa_len = type_node.fixed_array_type.length;
+                const inner = type_node.fixed_array_type.element.*;
+                fa_elem = typeNodeToRunarType(inner);
+                if (inner == .fixed_array_type) {
+                    fa_nested_len = inner.fixed_array_type.length;
+                }
+            }
+
             return .{ .property = .{
                 .name = member_name,
                 .type_info = type_info,
                 .readonly = readonly,
                 .initializer = initializer,
+                .fixed_array_length = fa_len,
+                .fixed_array_element = fa_elem,
+                .fixed_array_nested_length = fa_nested_len,
+                .embed_always = embed_always,
             } };
         }
 
@@ -782,6 +869,32 @@ const Parser = struct {
 
         const body = self.parseBlock();
         return .{ .name = name, .is_public = is_public, .params = params, .body = body };
+    }
+
+    /// Detect + parse a `/** @sighash <FLAGS> */` (or `// @sighash ...`)
+    /// directive on a method from its leading comment trivia (issue #123).
+    /// Returns the numeric sighash type, or null when no directive is present.
+    /// Pushes an error for a malformed flag list, or a directive on a
+    /// non-public method (only public methods are spending entry points, so a
+    /// `@sighash` on a private helper is meaningless). Mirrors the Go
+    /// parseSighashOnMethod / TS parseSighashOnMethod.
+    fn parseSighashDirective(self: *Parser, trivia: []const u8, name: []const u8, is_public: bool) ?i32 {
+        // Fast reject: no directive token present (word-boundary matched).
+        if (!containsDirectiveToken(trivia, "@sighash")) return null;
+
+        if (!is_public) {
+            self.addErrorFmt("@sighash directive on non-public method '{s}' has no effect — only public methods are spending entry points", .{name});
+            return null;
+        }
+
+        const result = sighash_directive.extractDirective(self.allocator, trivia) orelse return null;
+        switch (result) {
+            .value => |v| return v,
+            .err => |msg| {
+                self.addErrorFmt("Method '{s}': {s}", .{ name, msg });
+                return null;
+            },
+        }
     }
 
     // ---- Parameters ----
@@ -912,11 +1025,13 @@ const Parser = struct {
         if (std.mem.eql(u8, name, "Addr")) return .{ .primitive_type = .addr };
         if (std.mem.eql(u8, name, "Ripemd160")) return .{ .primitive_type = .ripemd160 };
         if (std.mem.eql(u8, name, "ByteString")) return .{ .primitive_type = .byte_string };
-        if (std.mem.eql(u8, name, "Sha256")) return .{ .primitive_type = .sha256 };
+        if (std.mem.eql(u8, name, "Sha256") or std.mem.eql(u8, name, "Sha256Digest")) return .{ .primitive_type = .sha256 };
         if (std.mem.eql(u8, name, "SigHashPreimage")) return .{ .primitive_type = .sig_hash_preimage };
         if (std.mem.eql(u8, name, "RabinSig")) return .{ .primitive_type = .rabin_sig };
         if (std.mem.eql(u8, name, "RabinPubKey")) return .{ .primitive_type = .rabin_pub_key };
         if (std.mem.eql(u8, name, "Point")) return .{ .primitive_type = .point };
+        if (std.mem.eql(u8, name, "P256Point")) return .{ .primitive_type = .p256_point };
+        if (std.mem.eql(u8, name, "P384Point")) return .{ .primitive_type = .p384_point };
         // Also check via PrimitiveTypeName
         if (PrimitiveTypeName.fromTsString(name)) |ptn| return .{ .primitive_type = ptn };
         return .{ .custom_type = name };
@@ -1036,6 +1151,12 @@ const Parser = struct {
         var var_name: []const u8 = "_i";
         var init_value: i64 = 0;
         var bound: i64 = 0;
+        var descending: bool = false;
+        var inclusive: bool = false;
+        // Only a genuine integer-literal bound is unrollable. A runtime bound
+        // (`i < this.x`) or an identifier bound (`i < N`) must be rejected by
+        // the validator rather than silently collapsing to a 0-iteration loop.
+        var bound_is_const: bool = false;
 
         // Initializer: let/const varname = expr
         if (self.checkIdent("let") or self.checkIdent("const")) {
@@ -1068,9 +1189,14 @@ const Parser = struct {
             if (cond_expr) |expr| {
                 switch (expr) {
                     .binary_op => |bop| {
+                        descending = bop.op == .gt or bop.op == .gte;
+                        // Issue #121: record inclusivity (`<=`/`>=`) so anf-lower
+                        // adds one to the iteration count.
+                        inclusive = bop.op == .lte or bop.op == .gte;
                         switch (bop.right) {
                             .literal_int => |v| {
                                 bound = v;
+                                bound_is_const = true;
                             },
                             else => {},
                         }
@@ -1089,7 +1215,7 @@ const Parser = struct {
 
         const body = self.parseBlockOrStatement();
 
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .body = body } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .bound_is_const = bound_is_const, .body = body } };
     }
 
     fn parseReturnStmt(self: *Parser) ?Statement {
@@ -1146,6 +1272,23 @@ const Parser = struct {
             },
             .identifier => |id| {
                 return .{ .assign = .{ .target = id, .value = value } };
+            },
+            .index_access => |ia| {
+                // this.arr[idx] = value — carry the full index-access target on
+                // the Assign so expand_fixed_arrays can rewrite it into
+                // dispatch form. The `target` field stores the base property
+                // name (when the object is `this.<name>`) so downstream
+                // pretty-printing and debug output remains meaningful.
+                const base_name: []const u8 = switch (ia.object) {
+                    .property_access => |pa| pa.property,
+                    .identifier => |id| id,
+                    else => "unknown",
+                };
+                return .{ .assign = .{
+                    .target = base_name,
+                    .value = value,
+                    .index_target = ia,
+                } };
             },
             else => {
                 // For more complex targets, use identifier name if possible
@@ -1456,21 +1599,43 @@ const Parser = struct {
         return switch (self.current.kind) {
             .number => blk: {
                 const tok = self.bump();
-                // Strip underscores from number text
-                var stripped_buf: [64]u8 = undefined;
+                // Strip underscores from number text. Buffer sized for 256-bit
+                // decimal literals (78 digits) with headroom; oversize tokens
+                // are rejected explicitly so byte-level parity is preserved.
+                var stripped_buf: [160]u8 = undefined;
                 var stripped_len: usize = 0;
+                var overflow = false;
                 for (tok.text) |ch| {
-                    if (ch != '_' and stripped_len < stripped_buf.len) {
-                        stripped_buf[stripped_len] = ch;
-                        stripped_len += 1;
+                    if (ch == '_') continue;
+                    if (stripped_len >= stripped_buf.len) {
+                        overflow = true;
+                        break;
                     }
+                    stripped_buf[stripped_len] = ch;
+                    stripped_len += 1;
+                }
+                if (overflow) {
+                    self.addErrorFmt("integer literal too long: '{s}'", .{tok.text});
+                    break :blk null;
                 }
                 const stripped = stripped_buf[0..stripped_len];
-                const val = std.fmt.parseInt(i64, stripped, 0) catch {
+                if (std.fmt.parseInt(i64, stripped, 0)) |val| {
+                    break :blk Expression{ .literal_int = val };
+                } else |_| {
+                    // Oversize decimal literal (e.g. the 256-bit secp256k1
+                    // group order used in schnorr-zkp's s-bound assert).
+                    // Carry the canonical decimal text on a `literal_bigint`
+                    // node so the value survives ANF / IR JSON / codegen
+                    // intact; the Zig codegen tier widens this to a
+                    // decimal-string-backed push during emit, matching
+                    // TS / Go / Python byte-for-byte.
+                    if (isAllAsciiDigits(stripped)) {
+                        const decimal = self.allocator.dupe(u8, stripped) catch break :blk null;
+                        break :blk Expression{ .literal_bigint = decimal };
+                    }
                     self.addErrorFmt("invalid integer: '{s}'", .{tok.text});
                     break :blk null;
-                };
-                break :blk Expression{ .literal_int = val };
+                }
             },
             .string_literal => blk: {
                 const tok = self.bump();
@@ -1494,6 +1659,29 @@ const Parser = struct {
                 if (std.mem.eql(u8, name, "false")) break :blk Expression{ .literal_bool = false };
                 if (std.mem.eql(u8, name, "this")) break :blk Expression{ .identifier = "this" };
                 if (std.mem.eql(u8, name, "super")) break :blk Expression{ .identifier = "super" };
+
+                // asm<T>({...}) — TS expression-form generic type argument.
+                // The captured T flags the expression form and is stashed
+                // on CallExpr.asm_return_type. T must be one of bigint,
+                // boolean, or ByteString.
+                var asm_return_type: []const u8 = "";
+                if (std.mem.eql(u8, name, "asm") and self.current.kind == .lt) {
+                    asm_return_type = self.parseAsmGenericTypeArg();
+                }
+
+                // asm({...}) — special-case so the parser doesn't have to
+                // grow general object-literal support. The object literal is
+                // decoded inline into three positional args
+                // (body, in_arity, out_arity) so downstream passes treat
+                // asm() like any other normalised CallExpr.
+                if (std.mem.eql(u8, name, "asm") and self.current.kind == .lparen) {
+                    _ = self.bump(); // consume '('
+                    const args = self.parseAsmArgs();
+                    _ = self.expect(.rparen);
+                    const call = self.allocator.create(CallExpr) catch break :blk null;
+                    call.* = .{ .callee = "asm", .args = args, .asm_return_type = asm_return_type };
+                    break :blk Expression{ .call = call };
+                }
 
                 // Function call: name(...)
                 if (self.current.kind == .lparen) {
@@ -1538,6 +1726,261 @@ const Parser = struct {
         }
         _ = self.expect(.rbracket);
         return .{ .array_literal = elements.items };
+    }
+
+    // ---- asm({...}) parsing ------------------------------------------------
+
+    /// Parse the optional asm<T>(...) generic type argument. The parser
+    /// reaches this function only when `current.kind == .lt`, immediately
+    /// after the `asm` identifier. Returns the captured primitive type name
+    /// when present and valid ("bigint", "boolean", or "ByteString"); empty
+    /// string when missing. Pushes a diagnostic for any other type.
+    fn parseAsmGenericTypeArg(self: *Parser) []const u8 {
+        if (self.current.kind != .lt) return "";
+        _ = self.bump(); // '<'
+        var captured: []const u8 = "";
+        if (self.current.kind == .ident) {
+            const tok = self.bump();
+            if (std.mem.eql(u8, tok.text, "bigint") or
+                std.mem.eql(u8, tok.text, "boolean") or
+                std.mem.eql(u8, tok.text, "ByteString"))
+            {
+                captured = tok.text;
+            } else {
+                self.addErrorFmt("asm<T>() return type must be 'bigint', 'boolean', or 'ByteString'; got '{s}'", .{tok.text});
+            }
+        }
+        // Consume the rest of the type argument list permissively until '>'.
+        var depth: u32 = 1;
+        while (depth > 0 and self.current.kind != .eof) {
+            switch (self.current.kind) {
+                .lt => depth += 1,
+                .gt => {
+                    depth -= 1;
+                    _ = self.bump();
+                    if (depth == 0) break;
+                    continue;
+                },
+                else => {},
+            }
+            _ = self.bump();
+        }
+        return captured;
+    }
+
+    /// Decode an asm({ body, in_arity?, out_arity? }) argument into the
+    /// three positional CallExpr args [ByteString(body), bigint(in_arity),
+    /// bigint(out_arity)]. The body can be a hex string literal or an array
+    /// of opcode-name / push() elements (encoded to hex at parse time).
+    /// Defaults are in_arity = 0, out_arity = 1 — the latter reflects the
+    /// public-method-must-leave-truthy invariant.
+    fn parseAsmArgs(self: *Parser) []Expression {
+        var args: std.ArrayListUnmanaged(Expression) = .empty;
+
+        if (self.current.kind != .lbrace) {
+            self.addError("asm() argument must be an object literal { body: '<hex>', in_arity?: <int>, out_arity?: <int> }");
+            return args.items;
+        }
+        _ = self.bump(); // '{'
+
+        var body_expr: ?Expression = null;
+        var in_arity_expr: ?Expression = null;
+        var out_arity_expr: ?Expression = null;
+
+        while (self.current.kind != .rbrace and self.current.kind != .eof) {
+            if (self.current.kind != .ident) {
+                _ = self.bump();
+                continue;
+            }
+            const key_tok = self.bump();
+            if (self.expect(.colon) == null) break;
+            const key = key_tok.text;
+
+            if (std.mem.eql(u8, key, "body")) {
+                if (self.current.kind == .string_literal) {
+                    const tok = self.bump();
+                    body_expr = Expression{ .literal_bytes = tok.text };
+                } else if (self.current.kind == .lbracket) {
+                    const encoded = self.encodeAsmArrayBody();
+                    body_expr = Expression{ .literal_bytes = encoded };
+                } else {
+                    self.addError("asm() body must be a hex string literal or an array of opcode names / push() calls");
+                    // Best-effort skip past the value
+                    _ = self.parseExpression();
+                }
+            } else if (std.mem.eql(u8, key, "in_arity")) {
+                in_arity_expr = self.parseAsmArityLiteral("in_arity");
+            } else if (std.mem.eql(u8, key, "out_arity")) {
+                out_arity_expr = self.parseAsmArityLiteral("out_arity");
+            } else {
+                self.addErrorFmt("asm() does not accept the '{s}' field; valid fields are 'body', 'in_arity', 'out_arity'", .{key});
+                _ = self.parseExpression();
+            }
+
+            if (self.current.kind == .comma) _ = self.bump();
+        }
+        _ = self.expect(.rbrace);
+
+        if (body_expr == null) {
+            self.addError("asm() requires a 'body' field with a hex string literal value");
+            body_expr = Expression{ .literal_bytes = "" };
+        }
+        // Defaults: in_arity = 0, out_arity = 1.
+        const in_a = in_arity_expr orelse Expression{ .literal_int = 0 };
+        const out_a = out_arity_expr orelse Expression{ .literal_int = 1 };
+
+        args.append(self.allocator, body_expr.?) catch {};
+        args.append(self.allocator, in_a) catch {};
+        args.append(self.allocator, out_a) catch {};
+        return args.items;
+    }
+
+    /// Parse a non-negative integer literal for an asm() arity field. Allows
+    /// either a bare number or a unary `-` followed by a number (which is
+    /// flagged as a diagnostic — arity must be non-negative).
+    fn parseAsmArityLiteral(self: *Parser, field_name: []const u8) Expression {
+        if (self.current.kind == .number) {
+            const tok = self.bump();
+            // Strip underscores from number text
+            var stripped_buf: [64]u8 = undefined;
+            var stripped_len: usize = 0;
+            for (tok.text) |ch| {
+                if (ch != '_' and stripped_len < stripped_buf.len) {
+                    stripped_buf[stripped_len] = ch;
+                    stripped_len += 1;
+                }
+            }
+            const stripped = stripped_buf[0..stripped_len];
+            const val = std.fmt.parseInt(i64, stripped, 0) catch {
+                self.addErrorFmt("asm() {s} must be a non-negative integer literal, got '{s}'", .{ field_name, tok.text });
+                return Expression{ .literal_int = 0 };
+            };
+            return Expression{ .literal_int = val };
+        }
+        self.addErrorFmt("asm() {s} must be a non-negative integer literal", .{field_name});
+        // Best-effort skip past the value
+        _ = self.parseExpression();
+        return Expression{ .literal_int = 0 };
+    }
+
+    /// Encode an asm({ body: [OP_DUP, push(0x42), ...] }) array literal to
+    /// its hex byte representation, byte-identical to the equivalent hex
+    /// body. Pushed at parse-time so every downstream pass sees the same
+    /// normalised raw_script binding regardless of which body shape the
+    /// developer used.
+    fn encodeAsmArrayBody(self: *Parser) []const u8 {
+        _ = self.expect(.lbracket);
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        const w = opcodes.ArrayListWriter{ .list = &buf, .allocator = self.allocator };
+
+        while (self.current.kind != .rbracket and self.current.kind != .eof) {
+            if (self.current.kind == .ident) {
+                const tok = self.bump();
+                // push(<literal>) is a function call — handled below if `(` follows.
+                if (std.mem.eql(u8, tok.text, "push") and self.current.kind == .lparen) {
+                    _ = self.bump(); // '('
+                    self.encodeAsmPushLiteral(w) catch {};
+                    _ = self.expect(.rparen);
+                } else if (opcodes.byName(tok.text)) |op| {
+                    buf.append(self.allocator, op.toByte()) catch {};
+                } else {
+                    self.addErrorFmt("Unknown opcode '{s}' in asm() body array. Expected an OP_* identifier or a push(...) call.", .{tok.text});
+                }
+            } else {
+                // Skip unexpected tokens until comma or `]`.
+                _ = self.bump();
+            }
+
+            if (self.current.kind == .comma) {
+                _ = self.bump();
+            } else if (self.current.kind != .rbracket) {
+                // Allow newlines/separators inside the array — keep scanning.
+            }
+        }
+        _ = self.expect(.rbracket);
+
+        // Convert raw bytes to hex string; arena-style ownership via allocator.
+        const hex = opcodes.bytesToHex(self.allocator, buf.items) catch return "";
+        buf.deinit(self.allocator);
+        return hex;
+    }
+
+    /// Encode a single literal argument of push(...) inside an asm() body
+    /// array. Writes the encoded bytes to `writer`. Returns false (with a
+    /// diagnostic pushed) if the literal is unrecognised.
+    fn encodeAsmPushLiteral(self: *Parser, writer: anytype) !void {
+        if (self.current.kind == .number) {
+            const tok = self.bump();
+            var stripped_buf: [64]u8 = undefined;
+            var stripped_len: usize = 0;
+            for (tok.text) |ch| {
+                if (ch != '_' and stripped_len < stripped_buf.len) {
+                    stripped_buf[stripped_len] = ch;
+                    stripped_len += 1;
+                }
+            }
+            const stripped = stripped_buf[0..stripped_len];
+            const val = std.fmt.parseInt(i64, stripped, 0) catch {
+                self.addErrorFmt("push() argument is not a valid integer literal: '{s}'", .{tok.text});
+                return;
+            };
+            try opcodes.encodeScriptNumber(writer, val);
+            return;
+        }
+        if (self.current.kind == .minus) {
+            _ = self.bump();
+            if (self.current.kind != .number) {
+                self.addError("push() argument must be a literal value (bigint, number, boolean, or hex string)");
+                return;
+            }
+            const tok = self.bump();
+            var stripped_buf: [64]u8 = undefined;
+            var stripped_len: usize = 0;
+            for (tok.text) |ch| {
+                if (ch != '_' and stripped_len < stripped_buf.len) {
+                    stripped_buf[stripped_len] = ch;
+                    stripped_len += 1;
+                }
+            }
+            const stripped = stripped_buf[0..stripped_len];
+            const val_abs = std.fmt.parseInt(i64, stripped, 0) catch {
+                self.addErrorFmt("push() argument is not a valid integer literal: '{s}'", .{tok.text});
+                return;
+            };
+            try opcodes.encodeScriptNumber(writer, -val_abs);
+            return;
+        }
+        if (self.current.kind == .ident) {
+            const tok = self.bump();
+            if (std.mem.eql(u8, tok.text, "true")) {
+                try writer.writeByte(0x51); // OP_TRUE
+                return;
+            }
+            if (std.mem.eql(u8, tok.text, "false")) {
+                try writer.writeByte(0x00); // OP_FALSE (alias of OP_0)
+                return;
+            }
+            self.addErrorFmt("push() argument must be a literal value (bigint, number, boolean, or hex string), got identifier '{s}'", .{tok.text});
+            return;
+        }
+        if (self.current.kind == .string_literal) {
+            const tok = self.bump();
+            // Decode the hex string to bytes
+            if (tok.text.len % 2 != 0) {
+                self.addError("push() ByteString argument must be even-length hex");
+                return;
+            }
+            const decoded = self.allocator.alloc(u8, tok.text.len / 2) catch return;
+            _ = std.fmt.hexToBytes(decoded, tok.text) catch {
+                self.allocator.free(decoded);
+                self.addError("push() ByteString argument is not valid hex");
+                return;
+            };
+            try opcodes.encodePushData(writer, decoded);
+            self.allocator.free(decoded);
+            return;
+        }
+        self.addError("push() argument must be a literal value (bigint, number, boolean, or hex string)");
     }
 
     // ---- Helpers ----
@@ -2234,3 +2677,178 @@ test "multiple imports skipped (TS)" {
 }
 
 const UnexpectedVariant = error{UnexpectedVariant};
+
+// ---------------------------------------------------------------------------
+// #109 / #123 — author-facing comment directive parsing (.runar.ts surface)
+// ---------------------------------------------------------------------------
+
+test "parse @embedAlways directive sets PropertyNode.embed_always" {
+    const source =
+        \\import { SmartContract, Addr, ByteString } from 'runar-lang';
+        \\class Meta extends SmartContract {
+        \\  readonly pubKeyHash: Addr;
+        \\  /** @embedAlways */
+        \\  readonly metadataId: ByteString;
+        \\  constructor(pubKeyHash: Addr, metadataId: ByteString) {
+        \\    super(pubKeyHash, metadataId);
+        \\    this.pubKeyHash = pubKeyHash;
+        \\    this.metadataId = metadataId;
+        \\  }
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "Meta.runar.ts");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    const c = r.contract.?;
+    // metadataId annotated; pubKeyHash sibling stays unset.
+    try std.testing.expect(!c.properties[0].embed_always); // pubKeyHash
+    try std.testing.expect(c.properties[1].embed_always); // metadataId
+}
+
+test "parse // @embedAlways line-comment sets embed_always" {
+    const source =
+        \\import { SmartContract, ByteString } from 'runar-lang';
+        \\class Meta extends SmartContract {
+        \\  // @embedAlways
+        \\  readonly metadataId: ByteString;
+        \\  constructor(metadataId: ByteString) { super(metadataId); this.metadataId = metadataId; }
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "Meta.runar.ts");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expect(r.contract.?.properties[0].embed_always);
+}
+
+test "no directive leaves embed_always unset and sighash_type null" {
+    const source =
+        \\import { SmartContract, ByteString } from 'runar-lang';
+        \\class Meta extends SmartContract {
+        \\  readonly metadataId: ByteString;
+        \\  constructor(metadataId: ByteString) { super(metadataId); this.metadataId = metadataId; }
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "Meta.runar.ts");
+    try std.testing.expect(!r.contract.?.properties[0].embed_always);
+    try std.testing.expect(r.contract.?.methods[0].sighash_type == null);
+}
+
+test "parse @sighash directive sets MethodNode.sighash_type" {
+    const source =
+        \\import { StatefulSmartContract } from 'runar-lang';
+        \\class C extends StatefulSmartContract {
+        \\  n: bigint;
+        \\  constructor(n: bigint) { super(n); this.n = n; }
+        \\  /** @sighash SINGLE|FORKID */
+        \\  public bump() { this.addOutput(1000n, this.n); }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    const m = r.contract.?.methods[0];
+    try std.testing.expect(m.sighash_type != null);
+    try std.testing.expectEqual(@as(i32, 0x43), m.sighash_type.?);
+}
+
+test "parse @sighash line-comment NONE|FORKID -> 0x42" {
+    const source =
+        \\import { StatefulSmartContract } from 'runar-lang';
+        \\class C extends StatefulSmartContract {
+        \\  n: bigint;
+        \\  constructor(n: bigint) { super(n); this.n = n; }
+        \\  // @sighash NONE|FORKID
+        \\  public wipe() { this.n = 0n; }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expectEqual(@as(i32, 0x42), r.contract.?.methods[0].sighash_type.?);
+}
+
+test "parse @sighash bad combo pushes an error" {
+    const source =
+        \\import { StatefulSmartContract } from 'runar-lang';
+        \\class C extends StatefulSmartContract {
+        \\  n: bigint;
+        \\  constructor(n: bigint) { super(n); this.n = n; }
+        \\  /** @sighash ALL|NONE|FORKID */
+        \\  public bump() { this.n = this.n + 1n; }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    var found = false;
+    for (r.errors) |e| {
+        if (std.mem.indexOf(u8, e, "cannot combine base types") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "parse @sighash on private method pushes an error" {
+    const source =
+        \\import { StatefulSmartContract } from 'runar-lang';
+        \\class C extends StatefulSmartContract {
+        \\  n: bigint;
+        \\  constructor(n: bigint) { super(n); this.n = n; }
+        \\  /** @sighash SINGLE|FORKID */
+        \\  helper() { assert(true); }
+        \\  public bump() { this.n = this.n + 1n; }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    var found = false;
+    for (r.errors) |e| {
+        if (std.mem.indexOf(u8, e, "non-public method") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "parse @sighash missing FORKID pushes an error" {
+    const source =
+        \\import { StatefulSmartContract } from 'runar-lang';
+        \\class C extends StatefulSmartContract {
+        \\  n: bigint;
+        \\  constructor(n: bigint) { super(n); this.n = n; }
+        \\  /** @sighash SINGLE */
+        \\  public bump() { this.n = this.n + 1n; }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    var found = false;
+    for (r.errors) |e| {
+        if (std.mem.indexOf(u8, e, "FORKID is mandatory on BSV") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "sighashType identifier does not trip the @sighash directive scan" {
+    const source =
+        \\import { SmartContract } from 'runar-lang';
+        \\class C extends SmartContract {
+        \\  readonly sighashType: bigint;
+        \\  constructor(sighashType: bigint) { super(sighashType); this.sighashType = sighashType; }
+        \\  public unlock() { assert(true); }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseTs(arena.allocator(), source, "C.runar.ts");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expect(r.contract.?.methods[0].sighash_type == null);
+}

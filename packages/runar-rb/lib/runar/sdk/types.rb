@@ -35,11 +35,27 @@ module Runar
     Transaction = TransactionData
 
     # A single ABI parameter.
-    ABIParam = Struct.new(:name, :type, keyword_init: true)
+    #
+    # +fixed_array+ is populated by +RunarArtifact.from_hash+ when the ABI
+    # param represents an expanded +FixedArray<T, N>+ that the compiler's
+    # iterative re-grouper collapsed.  Callers can pass a plain array of
+    # length N and the SDK flattens it into the underlying positional slots.
+    #   fixed_array[:element_type] — element type string (may itself be nested FixedArray)
+    #   fixed_array[:length]       — outer dimension N
+    #   fixed_array[:synthetic_names] — flat leaf names in declaration order
+    ABIParam = Struct.new(:name, :type, :fixed_array, keyword_init: true) do
+      def initialize(name:, type:, fixed_array: nil)
+        super
+      end
+    end
 
     # A contract method descriptor.
-    ABIMethod = Struct.new(:name, :params, :is_public, :is_terminal, keyword_init: true) do
-      def initialize(name:, params: [], is_public: true, is_terminal: nil)
+    # +sig_hash_type+ (issue #123): the BIP-143 sighash type this method's
+    # covenant is built under, from a @sighash directive (e.g. 0x43 for
+    # SINGLE|FORKID). nil = default ALL|FORKID (0x41); the SDK falls back to
+    # 0x41 so older artifacts keep working.
+    ABIMethod = Struct.new(:name, :params, :is_public, :is_terminal, :uses_code_part, :sig_hash_type, keyword_init: true) do
+      def initialize(name:, params: [], is_public: true, is_terminal: nil, uses_code_part: nil, sig_hash_type: nil)
         super
       end
     end
@@ -52,8 +68,12 @@ module Runar
     end
 
     # A state field in a stateful contract.
-    StateField = Struct.new(:name, :type, :index, :initial_value, keyword_init: true) do
-      def initialize(name:, type:, index:, initial_value: nil)
+    #
+    # +fixed_array+ mirrors +ABIParam#fixed_array+ — it is set when the field
+    # represents an expanded +FixedArray<T, N>+ so the SDK can flatten/unflatten
+    # values across the underlying scalar slots during state (de)serialisation.
+    StateField = Struct.new(:name, :type, :index, :initial_value, :fixed_array, keyword_init: true) do
+      def initialize(name:, type:, index:, initial_value: nil, fixed_array: nil)
         super
       end
     end
@@ -61,13 +81,17 @@ module Runar
     # Where a constructor placeholder resides in the compiled script.
     ConstructorSlot = Struct.new(:param_index, :byte_offset, keyword_init: true)
 
+    # Slot recording a push_codesep_index placeholder in the template script.
+    CodeSepIndexSlot = Struct.new(:byte_offset, :code_sep_index, keyword_init: true)
+
     # Compiled output of a Runar compiler.
     #
     # Use RunarArtifact.from_hash to load from a JSON-parsed Hash, or
     # RunarArtifact.from_json to parse a raw JSON string.
     class RunarArtifact
-      attr_reader :version, :compiler_version, :contract_name, :abi,
+      attr_reader :version, :compiler_version, :contract_name, :parent_class, :abi,
                   :script, :asm, :state_fields, :constructor_slots,
+                  :code_sep_index_slots,
                   :build_timestamp, :code_separator_index, :code_separator_indices,
                   :anf
 
@@ -75,11 +99,17 @@ module Runar
         version: '',
         compiler_version: '',
         contract_name: '',
+        # Base class the source contract extends. Authoritative stateful signal
+        # for the issue-#42/#44 terminal sighash subscript trim: a
+        # StatefulSmartContract with zero mutable fields still needs the trim
+        # even though state_fields is empty. Older artifacts leave it empty.
+        parent_class: '',
         abi: ABI.new,
         script: '',
         asm: '',
         state_fields: [],
         constructor_slots: [],
+        code_sep_index_slots: [],
         build_timestamp: '',
         code_separator_index: nil,
         code_separator_indices: nil,
@@ -88,15 +118,32 @@ module Runar
         @version                = version
         @compiler_version       = compiler_version
         @contract_name          = contract_name
+        @parent_class           = parent_class
         @abi                    = abi
         @script                 = script
         @asm                    = asm
         @state_fields           = state_fields
         @constructor_slots      = constructor_slots
+        @code_sep_index_slots   = code_sep_index_slots
         @build_timestamp        = build_timestamp
         @code_separator_index   = code_separator_index
         @code_separator_indices = code_separator_indices
         @anf                    = anf
+      end
+
+      # Parse a camelCase FixedArray metadata hash into SDK-native shape.
+      #
+      # The compiler emits +{"elementType" => ..., "length" => N, "syntheticNames" => [...]}+
+      # under +fixedArray+.  We flatten to symbol keys so the SDK can read
+      # +fa[:length]+ without guessing the casing.
+      def self._parse_fixed_array(raw)
+        return nil if raw.nil?
+
+        {
+          element_type: raw['elementType'] || raw[:element_type],
+          length: raw['length'] || raw[:length],
+          synthetic_names: Array(raw['syntheticNames'] || raw[:synthetic_names])
+        }
       end
 
       # Load an artifact from a JSON-parsed Hash (keys may be camelCase strings).
@@ -104,16 +151,28 @@ module Runar
         abi_raw = hash.fetch('abi', {})
 
         ctor_params = Array(abi_raw.dig('constructor', 'params')).map do |p|
-          ABIParam.new(name: p['name'], type: p['type'])
+          ABIParam.new(
+            name: p['name'],
+            type: p['type'],
+            fixed_array: _parse_fixed_array(p['fixedArray'])
+          )
         end
 
         methods = Array(abi_raw['methods']).map do |m|
-          params = Array(m['params']).map { |p| ABIParam.new(name: p['name'], type: p['type']) }
+          params = Array(m['params']).map do |p|
+            ABIParam.new(
+              name: p['name'],
+              type: p['type'],
+              fixed_array: _parse_fixed_array(p['fixedArray'])
+            )
+          end
           ABIMethod.new(
             name: m['name'],
             params: params,
             is_public: m.fetch('isPublic', true),
-            is_terminal: m['isTerminal']
+            is_terminal: m['isTerminal'],
+            uses_code_part: m['usesCodePart'],
+            sig_hash_type: m['sigHashType']
           )
         end
 
@@ -122,7 +181,8 @@ module Runar
             name: sf['name'],
             type: sf['type'],
             index: sf['index'],
-            initial_value: sf['initialValue']
+            initial_value: sf['initialValue'],
+            fixed_array: _parse_fixed_array(sf['fixedArray'])
           )
         end
 
@@ -130,15 +190,21 @@ module Runar
           ConstructorSlot.new(param_index: cs['paramIndex'], byte_offset: cs['byteOffset'])
         end
 
+        code_sep_index_slots = Array(hash['codeSepIndexSlots']).map do |cs|
+          CodeSepIndexSlot.new(byte_offset: cs['byteOffset'], code_sep_index: cs['codeSepIndex'])
+        end
+
         new(
           version:                hash.fetch('version', ''),
           compiler_version:       hash.fetch('compilerVersion', ''),
           contract_name:          hash.fetch('contractName', ''),
+          parent_class:           hash.fetch('parentClass', ''),
           abi:                    ABI.new(constructor_params: ctor_params, methods: methods),
           script:                 hash.fetch('script', ''),
           asm:                    hash.fetch('asm', ''),
           state_fields:           state_fields,
           constructor_slots:      constructor_slots,
+          code_sep_index_slots:   code_sep_index_slots,
           build_timestamp:        hash.fetch('buildTimestamp', ''),
           code_separator_index:   hash['codeSeparatorIndex'],
           code_separator_indices: hash['codeSeparatorIndices'],
@@ -154,8 +220,11 @@ module Runar
     end
 
     # Options for deploying a contract.
-    DeployOptions = Struct.new(:satoshis, :change_address, keyword_init: true) do
-      def initialize(satoshis: 10_000, change_address: '')
+    DeployOptions = Struct.new(:satoshis, :change_address, :funding_signer, keyword_init: true) do
+      def initialize(satoshis: 10_000, change_address: '', funding_signer: nil)
+        # funding_signer (#134): signs the P2PKH funding inputs when the deploy
+        # funding UTXOs are owned by a different key than the connected deploy
+        # signer. nil → the connected signer (zero behaviour change).
         super
       end
     end
@@ -186,6 +255,12 @@ module Runar
       :additional_contract_input_args,
       :terminal_outputs,
       :funding_utxos,
+      :data_outputs,
+      :locktime,
+      :sequence,
+      :max_funding_inputs,
+      :funding_signer,
+      :fee_utxo,
       keyword_init: true
     ) do
       def initialize(
@@ -197,7 +272,38 @@ module Runar
         additional_contract_inputs: nil,
         additional_contract_input_args: nil,
         terminal_outputs: nil,
-        funding_utxos: nil
+        funding_utxos: nil,
+        data_outputs: nil,
+        # Override the call tx's nLockTime field. nil → SDK uses 0 (legacy
+        # behavior). Set for contracts that assert
+        # extractLocktime(preimage) >= deadline (e.g. auction close/claim).
+        locktime: nil,
+        # Override the nSequence written onto EVERY input of the call tx (#131).
+        # Defaults are zero-config: when +locktime+ is set and non-zero,
+        # sequence defaults to 0xfffffffe (non-final, so consensus actually
+        # enforces nLockTime); otherwise it stays 0xffffffff (final, legacy).
+        # Set explicitly only for RBF or custom relative-locktime scenarios.
+        sequence: nil,
+        # Cap the number of P2PKH funding inputs added to a non-terminal call
+        # tx (#133). Funding is chosen by smallest-sufficient, largest-first
+        # selection (the same select_utxos strategy deploy uses). If covering
+        # outputs + fee would need more inputs than this, the call raises rather
+        # than silently sweeping the wallet. nil → no cap.
+        max_funding_inputs: nil,
+        # Signer for the P2PKH funding (and terminal fee) inputs (#134). When
+        # the funding/fee UTXOs are owned by a different key than the connected
+        # method signer, set this so those inputs are signed by their real
+        # owner. The method's own Sig args are still signed by the connected
+        # signer. nil → the connected signer (zero behaviour change).
+        funding_signer: nil,
+        # A single plain P2PKH UTXO added to a terminal call tx purely to pay
+        # the miner fee (#118). A true terminal method pays out the full
+        # contract balance, so fee would be 0 and ARC rejects; the covenant
+        # asserts its exact output set, so no change output can absorb a fee.
+        # The fee input is added BEFORE the OP_PUSH_TX preimage is computed (so
+        # hashPrevouts covers it) and consumed entirely as fee -- no change
+        # output. Signed with funding_signer || signer. nil → no fee input.
+        fee_utxo: nil
       )
         super
       end
@@ -222,9 +328,14 @@ module Runar
       :resolved_args,
       :method_selector_hex,
       :is_stateful,
+      # True when the contract extends StatefulSmartContract (from artifact
+      # parent_class), independent of mutable state fields. Gates the
+      # issue-#42/#44 terminal sighash subscript trim.
+      :parent_stateful,
       :is_terminal,
       :needs_op_push_tx,
       :method_needs_change,
+      :method_uses_code_part,
       :change_pkh_hex,
       :change_amount,
       :method_needs_new_amount,
@@ -236,6 +347,10 @@ module Runar
       :has_multi_output,
       :contract_outputs,
       :code_sep_idx,
+      # Pre-resolved intent-intrinsic witness hex (PUSHDATA-encoded
+      # `_prevOutScript_*` followed by `_serialisedOutputs`, ABI order).
+      # Empty when the method has no auto-injected intent params.
+      :intent_witness_hex,
       keyword_init: true
     ) do
       # rubocop:disable Metrics/ParameterLists
@@ -249,14 +364,17 @@ module Runar
         resolved_args: [],
         method_selector_hex: '',
         is_stateful: false,
+        parent_stateful: false,
         is_terminal: false,
         needs_op_push_tx: false,
         method_needs_change: false,
+        method_uses_code_part: false,
         change_pkh_hex: '',
         change_amount: 0,
         method_needs_new_amount: false,
         new_amount: 0,
         preimage_index: -1,
+        intent_witness_hex: '',
         contract_utxo: nil,
         new_locking_script: '',
         new_satoshis: 0,

@@ -75,6 +75,15 @@ pub fn parseRuby(allocator: Allocator, source: []const u8, file_name: []const u8
     return parser.parse();
 }
 
+/// True if every byte in `s` is an ASCII digit (0-9).
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Token Types
 // ============================================================================
@@ -529,9 +538,26 @@ fn rbConvertName(allocator: Allocator, name: []const u8) []const u8 {
         .{ "ec_make_point", "ecMakePoint" },
         .{ "ec_point_x", "ecPointX" },
         .{ "ec_point_y", "ecPointY" },
+        // NIST P-256 builtins
+        .{ "verify_ecdsa_p256", "verifyECDSA_P256" },
+        .{ "p256_add", "p256Add" },
+        .{ "p256_mul", "p256Mul" },
+        .{ "p256_mul_gen", "p256MulGen" },
+        .{ "p256_negate", "p256Negate" },
+        .{ "p256_on_curve", "p256OnCurve" },
+        .{ "p256_encode_compressed", "p256EncodeCompressed" },
+        // NIST P-384 builtins
+        .{ "verify_ecdsa_p384", "verifyECDSA_P384" },
+        .{ "p384_add", "p384Add" },
+        .{ "p384_mul", "p384Mul" },
+        .{ "p384_mul_gen", "p384MulGen" },
+        .{ "p384_negate", "p384Negate" },
+        .{ "p384_on_curve", "p384OnCurve" },
+        .{ "p384_encode_compressed", "p384EncodeCompressed" },
         // Intrinsics
         .{ "add_output", "addOutput" },
         .{ "add_raw_output", "addRawOutput" },
+        .{ "add_data_output", "addDataOutput" },
         .{ "get_state_script", "getStateScript" },
         // SHA-256 partial verification
         .{ "sha256_compress", "sha256Compress" },
@@ -616,11 +642,14 @@ fn rbMapType(name: []const u8) RunarType {
         .{ "Sig", .sig },
         .{ "Addr", .addr },
         .{ "Sha256", .sha256 },
+        .{ "Sha256Digest", .sha256 },
         .{ "Ripemd160", .ripemd160 },
         .{ "SigHashPreimage", .sig_hash_preimage },
         .{ "RabinSig", .rabin_sig },
         .{ "RabinPubKey", .rabin_pub_key },
         .{ "Point", .point },
+        .{ "P256Point", .p256_point },
+        .{ "P384Point", .p384_point },
     });
     return map.get(name) orelse .unknown;
 }
@@ -642,6 +671,8 @@ fn rbMapTypeName(name: []const u8) []const u8 {
         .{ "RabinSig", "RabinSig" },
         .{ "RabinPubKey", "RabinPubKey" },
         .{ "Point", "Point" },
+        .{ "P256Point", "P256Point" },
+        .{ "P384Point", "P384Point" },
     });
     return map.get(name) orelse types.runarTypeToString(.unknown);
 }
@@ -673,6 +704,23 @@ const Parser = struct {
             .depth = 0,
             .declared_locals = .empty,
         };
+    }
+
+    fn cloneDeclaredLocals(self: *Parser) std.StringHashMapUnmanaged(void) {
+        var out: std.StringHashMapUnmanaged(void) = .empty;
+        var it = self.declared_locals.iterator();
+        while (it.next()) |entry| {
+            out.put(self.allocator, entry.key_ptr.*, {}) catch {};
+        }
+        return out;
+    }
+
+    fn restoreDeclaredLocals(self: *Parser, snapshot: std.StringHashMapUnmanaged(void)) void {
+        self.declared_locals = .empty;
+        var it = snapshot.iterator();
+        while (it.next()) |entry| {
+            self.declared_locals.put(self.allocator, entry.key_ptr.*, {}) catch {};
+        }
     }
 
     fn peek(self: *const Parser) Token {
@@ -786,8 +834,10 @@ const Parser = struct {
         var parent_class: ParentClass = .smart_contract;
         if (std.mem.eql(u8, parent_class_name, "StatefulSmartContract")) {
             parent_class = .stateful_smart_contract;
+        } else if (std.mem.eql(u8, parent_class_name, "UnsafeSmartContract")) {
+            parent_class = .unsafe_smart_contract;
         } else if (!std.mem.eql(u8, parent_class_name, "SmartContract")) {
-            self.addErrorFmt("unknown parent class: '{s}', expected SmartContract or StatefulSmartContract", .{parent_class_name});
+            self.addErrorFmt("unknown parent class: '{s}', expected SmartContract, StatefulSmartContract, or UnsafeSmartContract", .{parent_class_name});
             return null;
         }
 
@@ -873,6 +923,7 @@ const Parser = struct {
         // Intrinsic methods that must also be rewritten
         method_names.put(self.allocator, "addOutput", {}) catch {};
         method_names.put(self.allocator, "addRawOutput", {}) catch {};
+        method_names.put(self.allocator, "addDataOutput", {}) catch {};
         method_names.put(self.allocator, "getStateScript", {}) catch {};
 
         for (methods.items) |*m| {
@@ -944,6 +995,56 @@ const Parser = struct {
 
     // ==== Property parsing ====
 
+    /// Type descriptor used during `prop` parsing. Captures either a scalar
+    /// Rúnar type or a (possibly nested) FixedArray shape.
+    const RbType = struct {
+        info: RunarType,
+        /// Outer length when `info == .fixed_array`. Zero otherwise.
+        length: u32 = 0,
+        /// Element type when `info == .fixed_array`. `.unknown` otherwise.
+        element: RunarType = .unknown,
+        /// Inner length when the element is itself a FixedArray. Zero otherwise.
+        nested_length: u32 = 0,
+    };
+
+    /// Parse a Ruby type, mirroring `parser_ruby.rb` / `parser_ruby.go` /
+    /// `parser_ruby.py`. Recognises `FixedArray[T, N]` (and the nested
+    /// `FixedArray[FixedArray[T, M], N]` form) so the rest of the pipeline
+    /// sees the length + element type.
+    fn parseRbType(self: *Parser) RbType {
+        if (!self.check(.ident)) {
+            self.addError("expected type name");
+            return .{ .info = .unknown };
+        }
+        const tok = self.bump();
+        const info = rbMapType(tok.text);
+
+        // FixedArray[ElemType, N]
+        if (std.mem.eql(u8, tok.text, "FixedArray") and self.check(.lbracket)) {
+            _ = self.bump(); // '['
+            const inner = self.parseRbType();
+            _ = self.expect(.comma);
+            var size: u32 = 0;
+            if (self.check(.number)) {
+                const size_tok = self.bump();
+                size = std.fmt.parseInt(u32, size_tok.text, 10) catch 0;
+            } else {
+                self.addError("FixedArray length must be a positive integer literal");
+            }
+            _ = self.expect(.rbracket);
+
+            const element_info = if (inner.info == .fixed_array) RunarType.fixed_array else inner.info;
+            return .{
+                .info = .fixed_array,
+                .length = size,
+                .element = element_info,
+                .nested_length = if (inner.info == .fixed_array) inner.length else 0,
+            };
+        }
+
+        return .{ .info = info };
+    }
+
     fn parseProp(self: *Parser, parent_class: ParentClass) ?PropertyNode {
         _ = self.bump(); // 'prop'
 
@@ -957,28 +1058,8 @@ const Parser = struct {
         const raw_name = self.bump().text; // symbol value (without colon)
         if (self.expect(.comma) == null) return null;
 
-        // Parse type
-        if (!self.check(.ident)) {
-            self.addError("expected type name after comma in prop");
-            return null;
-        }
-        const type_tok = self.bump();
-        var type_info = rbMapType(type_tok.text);
-
-        // Check for FixedArray[T, N]
-        if (std.mem.eql(u8, type_tok.text, "FixedArray") and self.check(.lbracket)) {
-            _ = self.bump(); // '['
-            // Element type
-            if (self.check(.ident)) {
-                const elem_tok = self.bump();
-                _ = rbMapType(elem_tok.text);
-            }
-            _ = self.match(.comma);
-            // Size
-            if (self.check(.number)) _ = self.bump();
-            _ = self.match(.rbracket);
-            type_info = .fixed_array;
-        }
+        // Parse type (supports FixedArray[T, N] and nested forms).
+        const rb_type = self.parseRbType();
 
         // Check for optional trailing options: readonly: true/false, default: <literal>
         var is_readonly = false;
@@ -1006,8 +1087,9 @@ const Parser = struct {
             }
         }
 
-        // In stateless contracts, all properties are readonly
-        if (parent_class == .smart_contract) {
+        // In stateless contracts (SmartContract and UnsafeSmartContract),
+        // all properties are readonly.
+        if (parent_class == .smart_contract or parent_class == .unsafe_smart_contract) {
             is_readonly = true;
         }
 
@@ -1016,9 +1098,12 @@ const Parser = struct {
 
         return PropertyNode{
             .name = rbConvertName(self.allocator, raw_name),
-            .type_info = type_info,
+            .type_info = rb_type.info,
             .readonly = is_readonly,
             .initializer = initializer,
+            .fixed_array_length = rb_type.length,
+            .fixed_array_element = rb_type.element,
+            .fixed_array_nested_length = rb_type.nested_length,
         };
     }
 
@@ -1316,7 +1401,15 @@ const Parser = struct {
         const condition = self.parseExpression() orelse return null;
         self.skipNewlines();
 
+        // Variables declared inside an if/elsif/else branch are scoped to
+        // that branch. Snapshot+restore declared_locals so a sibling
+        // branch (or sibling top-level if-without-else block) can
+        // re-declare the same local without it being treated as an
+        // assignment to an out-of-scope variable. Mirrors the canonical
+        // TS / Python lexical-scope semantics.
+        const locals_before_then = self.cloneDeclaredLocals();
         const then_body = self.parseStatements();
+        self.restoreDeclaredLocals(locals_before_then);
 
         var else_body: ?[]Statement = null;
 
@@ -1325,9 +1418,11 @@ const Parser = struct {
             const a = self.allocator.alloc(Statement, 1) catch return null;
             a[0] = elif;
             else_body = a;
+            self.restoreDeclaredLocals(locals_before_then);
         } else if (self.match(.kw_else)) {
             self.skipNewlines();
             else_body = self.parseStatements();
+            self.restoreDeclaredLocals(locals_before_then);
         }
 
         _ = self.expect(.kw_end);
@@ -1340,7 +1435,10 @@ const Parser = struct {
         const condition = self.parseExpression() orelse return null;
         self.skipNewlines();
 
+        // Same scope discipline as parseIfStatement.
+        const locals_before_then = self.cloneDeclaredLocals();
         const then_body = self.parseStatements();
+        self.restoreDeclaredLocals(locals_before_then);
 
         var else_body: ?[]Statement = null;
 
@@ -1349,9 +1447,11 @@ const Parser = struct {
             const a = self.allocator.alloc(Statement, 1) catch return null;
             a[0] = elif;
             else_body = a;
+            self.restoreDeclaredLocals(locals_before_then);
         } else if (self.match(.kw_else)) {
             self.skipNewlines();
             else_body = self.parseStatements();
+            self.restoreDeclaredLocals(locals_before_then);
         }
 
         // Note: the outer `end` is consumed by the parent parseIfStatement;
@@ -1460,10 +1560,26 @@ const Parser = struct {
         const ivar_tok = self.bump(); // ivar token
         const prop_name = rbConvertName(self.allocator, ivar_tok.text);
 
-        // Simple assignment: @var = expr
+        // Build the LHS target, consuming `[index]` postfixes so that
+        // `@var[i] = expr` lands on the assignment path rather than being
+        // split into an orphan read and a rogue rhs.
+        var target_expr: Expression = .{ .property_access = .{ .object = "this", .property = prop_name } };
+        while (self.check(.lbracket)) {
+            _ = self.bump();
+            const index = self.parseExpression() orelse return null;
+            if (!self.match(.rbracket)) {
+                self.addError("expected ']'");
+                return null;
+            }
+            const ia = self.allocator.create(IndexAccess) catch return null;
+            ia.* = .{ .object = target_expr, .index = index };
+            target_expr = .{ .index_access = ia };
+        }
+
+        // Simple assignment: @var = expr  |  @var[i] = expr
         if (self.match(.assign)) {
             const value = self.parseExpression() orelse return null;
-            return .{ .assign = .{ .target = prop_name, .value = value } };
+            return self.buildAssignment(target_expr, value);
         }
 
         // Compound assignments: @var += expr, etc.
@@ -1472,14 +1588,12 @@ const Parser = struct {
             _ = self.bump();
             const rhs = self.parseExpression() orelse return null;
             const bin_op = binOpFromCompoundAssign(op_kind);
-            const target_expr: Expression = .{ .property_access = .{ .object = "this", .property = prop_name } };
             const compound_rhs = self.makeBinaryExpr(bin_op, target_expr, rhs) orelse return null;
-            return .{ .assign = .{ .target = prop_name, .value = compound_rhs } };
+            return self.buildAssignment(target_expr, compound_rhs);
         }
 
         // Expression statement (e.g. @var.method(...))
-        var expr: Expression = .{ .property_access = .{ .object = "this", .property = prop_name } };
-        expr = self.parsePostfixFrom(expr);
+        const expr = self.parsePostfixFrom(target_expr);
         return .{ .expr_stmt = expr };
     }
 
@@ -1578,6 +1692,23 @@ const Parser = struct {
             },
             .identifier => |id| {
                 return .{ .assign = .{ .target = id, .value = value } };
+            },
+            .index_access => |ia| {
+                // @arr[idx] = value — carry the full index-access target on
+                // the Assign so `expand_fixed_arrays` can rewrite it into
+                // dispatch form. `target` stores the base property name (when
+                // the object is `this.<name>`) so downstream pretty-printing
+                // and debug output remain meaningful.
+                const base_name: []const u8 = switch (ia.object) {
+                    .property_access => |pa| pa.property,
+                    .identifier => |id| id,
+                    else => "unknown",
+                };
+                return .{ .assign = .{
+                    .target = base_name,
+                    .value = value,
+                    .index_target = ia,
+                } };
             },
             else => {
                 return .{ .assign = .{ .target = "unknown", .value = value } };
@@ -2032,21 +2163,36 @@ const Parser = struct {
     }
 
     fn parseRbNumber(self: *Parser, text: []const u8) ?Expression {
-        // Strip underscores from number text
-        var stripped_buf: [64]u8 = undefined;
+        // Strip underscores from number text. Buffer sized for 256-bit
+        // decimal literals (78 digits) with headroom.
+        var stripped_buf: [160]u8 = undefined;
         var stripped_len: usize = 0;
+        var overflow = false;
         for (text) |ch| {
-            if (ch != '_' and stripped_len < stripped_buf.len) {
-                stripped_buf[stripped_len] = ch;
-                stripped_len += 1;
+            if (ch == '_') continue;
+            if (stripped_len >= stripped_buf.len) {
+                overflow = true;
+                break;
             }
+            stripped_buf[stripped_len] = ch;
+            stripped_len += 1;
+        }
+        if (overflow) {
+            self.addErrorFmt("integer literal too long: '{s}'", .{text});
+            return Expression{ .literal_int = 0 };
         }
         const stripped = stripped_buf[0..stripped_len];
-        const val = std.fmt.parseInt(i64, stripped, 0) catch {
+        if (std.fmt.parseInt(i64, stripped, 0)) |val| {
+            return Expression{ .literal_int = val };
+        } else |_| {
+            // Oversize decimal literal — carry as `literal_bigint`.
+            if (isAllAsciiDigits(stripped)) {
+                const decimal = self.allocator.dupe(u8, stripped) catch return Expression{ .literal_int = 0 };
+                return Expression{ .literal_bigint = decimal };
+            }
             self.addErrorFmt("invalid integer: '{s}'", .{text});
             return Expression{ .literal_int = 0 };
-        };
-        return Expression{ .literal_int = val };
+        }
     }
 
     // ==== Helpers ====

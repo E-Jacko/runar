@@ -1,0 +1,4230 @@
+import RunarVerification.ANF.Syntax
+import RunarVerification.ANF.WF
+import RunarVerification.Stack.Syntax
+import RunarVerification.Stack.Blake3
+import RunarVerification.Stack.Wots
+import RunarVerification.Stack.Ec
+import RunarVerification.Stack.P256P384
+import RunarVerification.Stack.SlhDsa
+import RunarVerification.Stack.BabyBear
+import RunarVerification.Stack.Merkle
+
+/-!
+# Stack IR — Lowering pass (Phase 3a, simple-constructor subset)
+
+A pure Lean function `lower : ANFProgram → StackProgram` mirroring the
+TypeScript reference at `packages/runar-compiler/src/passes/05-stack-lower.ts`.
+
+**Scope (Phase 3a).** This module handles a tractable subset of the 18
+ANFValue constructors — concretely the ten that are common to the
+simplest conformance fixtures and that allow byte-exact mirroring
+without the multi-page expansions used by `addOutput`,
+`getStateScript`, and friends. The supported subset is captured by the
+`SimpleANF` predicate at the bottom of this file; programs outside it
+are still lowered (so `lake build` passes), but the simulation theorem
+in `Sim.lean` only quantifies over `SimpleANF` programs. Phase 3b will
+extend coverage to the framework intrinsics.
+
+Supported (concrete):
+
+* `loadParam`, `loadProp`, `loadConst` (all five `ConstValue` forms)
+* `binOp` and `unaryOp`
+* `call` (built-ins; argument loads + a single opcode)
+* `assert`, `updateProp`, `ifVal`, `methodCall`
+
+Out-of-scope (placeholder emission — proven only at the
+shape-preservation level, not byte-exact):
+
+* `loop` — bounded unroll, but nested-binding scope tracking is non-trivial
+* `addOutput`, `addRawOutput`, `addDataOutput` — full BIP-143 output construction
+* `getStateScript`, `checkPreimage`, `deserializeState` — framework intrinsics
+* `arrayLiteral` — packed byte layout
+
+For these out-of-scope cases the lower emits a single
+`StackOp.opcode "OP_RUNAR_UNSUPPORTED"` sentinel so the program type
+checks; the `SimpleANF` predicate forbids their occurrence so the
+simulation theorem never has to reason about them.
+-/
+
+namespace RunarVerification.Stack
+namespace Lower
+
+open RunarVerification.ANF
+
+/-! ## Stack tracking
+
+The TS lowering pass threads a `stackMap : Map<string, number>` where
+each entry tracks the depth of an in-scope binding from the top of the
+runtime stack. Inserting a new binding pushes onto the map at depth 0
+and shifts all others up by one; consuming a stack value pops one
+entry. We model this as a flat ordered list of names, head = top of
+stack.
+-/
+
+abbrev StackMap := List String
+
+/-- Depth-from-top of `name` in `sm`, or `none` if absent. -/
+def StackMap.depth? (sm : StackMap) (name : String) : Option Nat :=
+  sm.findIdx? (· == name)
+
+/-- Push a fresh binding name onto the top of the tracked stack. -/
+def StackMap.push (sm : StackMap) (name : String) : StackMap :=
+  name :: sm
+
+/--
+Remove the entry at the given depth (counted from the top), shifting all
+deeper entries up by one. Mirrors the `removeAtDepth` calls inside the TS
+`bringToTop` (`05-stack-lower.ts:819-828`). Out-of-range depths return
+the input unchanged.
+-/
+def StackMap.removeAtDepth : StackMap → Nat → StackMap
+  | [],      _       => []
+  | _ :: xs, 0       => xs
+  | x :: xs, n + 1   => x :: StackMap.removeAtDepth xs n
+
+/-! ## Liveness analysis (Phase 3x)
+
+Mirrors the TS `computeLastUses` / `collectRefs` / `isLastUse` trio at
+`05-stack-lower.ts:247-332` and `:973-976`. Maps each ref name to the
+**last** binding index (within the current sequence) that reads it; on
+the final read we may consume the slot via ROLL/SWAP/ROT instead of
+copying via PICK/OVER/DUP.
+
+The map is represented as an associative `List (String × Nat)` (no
+`Std.RBMap` dependency, no `mathlib`). Lookups are `O(n)` in the size
+of the binding list — fine at the scales the conformance suite uses.
+-/
+
+/-- Set (or overwrite) `name`'s last-use index in the assoc list. -/
+def lastUsesUpdate (m : List (String × Nat)) (name : String) (idx : Nat) :
+    List (String × Nat) :=
+  (name, idx) :: m.filter (fun p => p.1 != name)
+
+/-- Look up the last-use index for `name`, or `none` if absent. -/
+def lastUsesLookup (m : List (String × Nat)) (name : String) : Option Nat :=
+  (m.find? (fun p => p.1 == name)).map (·.2)
+
+/-! ## `collectRefs` — which names does an ANFValue read?
+
+Mirrors `collectRefs` in `05-stack-lower.ts:260-332` for the
+constructors covered by `simpleValue`. Crypto-only constructors that
+are never reached under `SimpleANF` return `[]`.
+-/
+
+mutual
+
+/-- Names referenced by an ANFValue, in left-to-right read order. -/
+def collectRefs : ANFValue → List String
+  | .loadParam n              => [n]
+  | .loadProp _               => []
+  | .loadConst (.refAlias n)  => [n]
+  | .loadConst _              => []
+  | .binOp _ l r _            => [l, r]
+  | .unaryOp _ operand _      => [operand]
+  | .call _ args              => args
+  | .methodCall obj _ args    => (obj :: args : List String)
+  | .ifVal cond thn els       =>
+      (cond :: collectRefsBindings thn) ++ collectRefsBindings els
+  | .loop _ body _            => collectRefsBindings body
+  | .assert ref               => [ref]
+  | .updateProp _ ref         => [ref]
+  | .checkPreimage pre        => [pre]
+  | .deserializeState pre     => [pre]
+  | .arrayLiteral elems       => elems
+  | .addRawOutput sat scr     => [sat, scr]
+  | .addDataOutput sat scr    => [sat, scr]
+  | .addOutput sat vals pre   => (sat :: vals) ++ [pre]
+  | .getStateScript           => []
+  | .rawScript _ _ _          => []
+
+def collectRefsBindings : List ANFBinding → List String
+  | []                  => []
+  | (.mk _ v _) :: rest =>
+      collectRefs v ++ collectRefsBindings rest
+
+end
+
+/--
+Compute last-use indices for a binding list. Mirrors
+`computeLastUses` in `05-stack-lower.ts:247-258`: walk the bindings in
+order, and for every ref read by `b_i.value`, set
+`lastUse[ref] = i` (later writes override earlier ones, so the last
+binding that reads `ref` "wins").
+-/
+def computeLastUses (bs : List ANFBinding) : List (String × Nat) :=
+  let rec go (acc : List (String × Nat)) (idx : Nat) :
+      List ANFBinding → List (String × Nat)
+    | [] => acc
+    | (.mk _ v _) :: rest =>
+        let acc' :=
+          (collectRefs v).foldl (init := acc) fun a r => lastUsesUpdate a r idx
+        go acc' (idx + 1) rest
+  go [] 0 bs
+
+/-! ### `constInts` — binding-name → integer literal map (Phase 4-K)
+
+Mirrors the `constValues` tracking in `compilers/go/codegen/stack.go:345`
+(see also `getConstantValue` in `packages/runar-compiler/src/passes/05-stack-lower.ts`).
+For every binding of the form `name = loadConst (.int i)` in the method
+body (including any nested if-branch / loop-body / methodCall-body)
+the map records `name → i`. Used by the Merkle codegen dispatch to
+extract the compile-time depth literal that becomes the unrolled-loop
+bound (`merkleRootSha256(_, _, _, depth)` etc.).
+
+The map is method-wide and immutable for the duration of one
+`lowerMethod` call; it is built once at `lowerMethod` entry and threaded
+through `lowerValueP` / `lowerBindingsP` like `lastUses`. -/
+
+mutual
+
+/-- Collect `(name, i)` pairs for every `name = loadConst (.int i)`
+binding reachable from `bs`, descending into if-branches and loop
+bodies so const literals defined in outer scopes remain visible to
+inner-scope dispatch arms. -/
+def collectConstInts : List ANFBinding → List (String × Int)
+  | []                    => []
+  | (.mk name v _) :: rest =>
+      let here : List (String × Int) :=
+        match v with
+        | .loadConst (.int i)   => [(name, i)]
+        | .ifVal _ thn els      => collectConstInts thn ++ collectConstInts els
+        | .loop _ body _        => collectConstInts body
+        | _                     => []
+      here ++ collectConstInts rest
+
+end
+
+/-- Look up `name` in the const-int map; return `none` if absent. -/
+def constIntsLookup (m : List (String × Int)) (name : String) : Option Int :=
+  (m.find? (fun p => p.1 == name)).map (·.2)
+
+/--
+Whether reading `ref` at position `currentIndex` is the **final** read
+of `ref` within the current binding sequence. Mirrors `isLastUse` in
+`05-stack-lower.ts:973-976`: returns `true` when the recorded last-use
+index is at or before `currentIndex` (or when `ref` was never recorded).
+-/
+def isLastUse (m : List (String × Nat)) (ref : String) (currentIndex : Nat) : Bool :=
+  match lastUsesLookup m ref with
+  | none      => true
+  | some last => last ≤ currentIndex
+
+/--
+Set membership over `List String` (no mathlib).
+
+Used to discriminate locally-bound names (consume-eligible) from
+outer-scope names (must be PICK-copied even on their last use, because
+the parent scope's stack map still expects them). Mirrors the TS
+`localBindings` field at `05-stack-lower.ts:856-857`.
+-/
+def listContains (xs : List String) (x : String) : Bool :=
+  xs.any (· == x)
+
+/--
+Consume-vs-copy decision for one operand of a multi-operand ANF value.
+Mirrors TS `operandConsume` (`05-stack-lower.ts:1143-1156`, PRs
+#62/#67/#68, implemented identically in all 7 production compilers):
+
+> consume = isLastUse(ref, bindingIndex) AND ref occurs exactly once in
+> the value's FULL operand list.
+
+`operands` is the full operand-ref list of the value (including `ref`
+itself). A ref that is read at more than one operand position of the
+same value must be copied (PICK / DUP) at EVERY position: a consume-mode
+load of a ref already on top of the stack is a no-op (`bringToTop` d0
+consume = `[]`), so two consume-mode loads of the same ref would leave a
+single slot for an opcode that pops one item per operand (e.g.
+`t := x + x` underflowing OP_ADD). The original value then simply stays
+on the stack, like any ref whose last use is a later binding. Reduces
+exactly to the old `isLastUse` form when `ref` occurs at most once.
+
+The Lean model additionally keeps the `outerProtected` gate that
+`loadRefLive` applies (the TS equivalent lives in `bringToTop`'s caller
+context). The repeated-operand clause is deliberately LAST so that
+copy-mode proofs (first conjuncts `false`) short-circuit without
+needing operand-distinctness facts.
+-/
+def operandConsume (lastUses : List (String × Nat)) (outerProtected : List String)
+    (ref : String) (operands : List String) (currentIndex : Nat) : Bool :=
+  !listContains outerProtected ref && isLastUse lastUses ref currentIndex
+    && ((operands.filter (· == ref)).length ≤ 1)
+
+/-- Names bound by a binding sequence — i.e. the LHS of every binding
+plus, for `update_prop`, the property name (which the binding writes to). -/
+def collectBoundNames : List ANFBinding → List String
+  | []                         => []
+  | (.mk name v _) :: rest =>
+      let here :=
+        match v with
+        | .updateProp p _ => [name, p]
+        | _              => [name]
+      here ++ collectBoundNames rest
+
+/-- Outer-scope refs referenced by `body`. Mirrors TS
+`lowerLoop`'s `outerRefs` computation (`05-stack-lower.ts:2115-2133`)
+EXACTLY: the TS reference iterates over body bindings and adds outer
+refs ONLY for
+
+* `load_param` values whose name is not the iter var, and
+* `load_const "@ref:..."` values whose target name is not in
+  `bodyBindingNames` (= the plain binding-name set, NOT
+  `collectBoundNames` — TS does not include `update_prop` targets).
+
+A previous version of this function approximated the set by collecting
+EVERY read name not bound in the body. That over-approximation
+PROTECTED outer non-param locals read as raw binop/call operands, so
+the model accepted (and emitted bytes for) loop shapes the TS reference
+REJECTS with "Value not found on stack" — the consumed ref simply
+fails to resolve in the next iteration. With the faithful narrow set,
+those shapes now reach `bringToTop`'s unresolved branch
+(`OP_RUNAR_UNRESOLVED_*`) and `compileSafe` rejects them, matching the
+TS compile error. -/
+def bodyOuterRefs (body : List ANFBinding) (iterVar : String) :
+    List String :=
+  let bound := body.map (fun b => b.name)
+  body.foldl (init := ([] : List String)) fun acc b =>
+    match b.value with
+    | .loadParam n =>
+        if n == iterVar || listContains acc n then acc else acc ++ [n]
+    | .loadConst (.refAlias r) =>
+        if listContains bound r || listContains acc r then acc
+        else acc ++ [r]
+    | _ => acc
+
+/-- For non-final loop iters, bump the recorded last-use index of every
+outer ref to `clampTo` so they cannot be considered last-use within the
+body. Mirrors TS `lowerLoop` (`05-stack-lower.ts:2149-2154`). -/
+def clampLastUsesForOuter (m : List (String × Nat))
+    (outerRefs : List String) (clampTo : Nat) : List (String × Nat) :=
+  outerRefs.foldl (init := m) fun acc r => lastUsesUpdate acc r clampTo
+
+/-- Names present in `before` but absent from `after`. Used by `lowerIf`
+to identify parent-scope items that one branch consumed (asymmetrically)
+so the other branch can emit matching ROLL+DROP cleanup. -/
+def consumedNames (before : List String) (after : List String) :
+    List String :=
+  before.foldl (init := ([] : List String)) fun acc n =>
+    if listContains acc n then acc
+    else if listContains after n then acc
+    else acc ++ [n]
+
+/-- Insertion-sort descending on `Nat`. -/
+def sortDesc : List Nat → List Nat
+  | []      => []
+  | x :: xs =>
+      let rec insert (y : Nat) : List Nat → List Nat
+        | []      => [y]
+        | a :: as => if y ≥ a then y :: a :: as else a :: insert y as
+      insert x (sortDesc xs)
+
+/-- Emit ROLL+DROP cleanup for `names` from a stackmap's perspective.
+Mirrors TS `lowerIf`'s asymmetric-consumption fix
+(`05-stack-lower.ts:1731-1772`).
+
+For each name we look up its depth, then sort the depths descending so
+that deeper drops execute first (avoiding shifts in shallower entries).
+Per-depth ops:
+* `d = 0` → `[.drop]`
+* `d = 1` → `[.nip]`
+* `d ≥ 2` → `[push d, OP_ROLL, .drop]`. The literal `push d` consumes
+  one slot, ROLL brings the entry from depth `d+1` (after the push) to
+  top, DROP removes it.
+
+The stackmap is updated to remove the consumed names. Returns the op
+list and the updated stackmap. -/
+def removeConsumedAtDepths (sm : StackMap) (names : List String) :
+    (List StackOp × StackMap) :=
+  -- Collect depths for names that exist in sm.
+  let depths : List Nat :=
+    names.foldl (init := ([] : List Nat)) fun acc n =>
+      match sm.depth? n with
+      | some d => acc ++ [d]
+      | none   => acc
+  let sorted := sortDesc depths
+  -- Walk sorted depths; for each emit cleanup and remove from sm.
+  let rec go (sm : StackMap) : List Nat → (List StackOp × StackMap)
+    | []      => ([], sm)
+    | d :: ds =>
+        let ops : List StackOp :=
+          if d = 0 then [.drop]
+          else if d = 1 then [.nip]
+          else if d = 2 then [.opcode "OP_ROT", .drop]
+          else [.push (.bigint (Int.ofNat d)), .opcode "OP_ROLL", .drop]
+        let sm' := sm.removeAtDepth d
+        let (rest, smF) := go sm' ds
+        (ops ++ rest, smF)
+  go sm sorted
+
+/-- Compute the set of parent-scope refs that branches must NOT consume.
+
+Mirrors TS `lowerIf` (`05-stack-lower.ts:1660-1667`):
+```
+const protectedRefs = new Set<string>();
+for (const [ref, lastIdx] of lastUses.entries()) {
+  if (lastIdx > bindingIndex && this.stackMap.has(ref)) {
+    protectedRefs.add(ref);
+  }
+}
+```
+
+Plus the implicit propagation TS achieves via `lowerBindings`'
+clamp at `05-stack-lower.ts:862-866` — outer-outer protected refs get
+`lastIdx = bindings.length` which is always > the current `bindingIndex`,
+so they re-appear in the new `protectedRefs`.
+
+We mirror that here by ALSO including any parent `outerProtected` ref
+that is still in `smBranch` (regardless of its lastUses lookup).
+
+`smBranch` is the parent stackmap with the cond peeled off; `lastUses`
+is the OUTER scope's last-use table; `currentIndex` is the if-binding's
+index in the outer body. -/
+def computeBranchProtected (smBranch : StackMap)
+    (lastUses : List (String × Nat)) (currentIndex : Nat)
+    (parentOuterProtected : List String) : List String :=
+  smBranch.foldl (init := ([] : List String)) fun acc ref =>
+    if listContains acc ref then acc
+    else
+      let aliveAfter : Bool :=
+        match lastUsesLookup lastUses ref with
+        | some idx => decide (idx > currentIndex)
+        | none     => false
+      let parentProtected : Bool := listContains parentOuterProtected ref
+      if aliveAfter || parentProtected then acc ++ [ref]
+      else acc
+
+/-! ## `bringToTop` — liveness-aware load (Phase 3x)
+
+Mirrors the TS `bringToTop` dispatch table at `05-stack-lower.ts:797-847`:
+
+| depth | consume=false              | consume=true              |
+|-------|----------------------------|----------------------------|
+| 0     | `[.dup]`                   | `[]`                       |
+| 1     | `[.over]`                  | `[.swap]`                  |
+| 2     | `[push 2, .pick 2]`        | `[.rot]`                   |
+| ≥3    | `[push d, .pick d]`        | `[push d, .roll d]`        |
+
+In the consume path the original entry is removed from the stack map
+(`removeAtDepth`) and the name is re-pushed on top. In the copy path
+the original entry stays and a fresh copy of the name is pushed on top
+(the runtime stack now holds two values associated with the same name;
+`StackMap.depth?` returns the **shallower** one, matching TS
+`peekAtDepth` semantics).
+
+Returns the op list and the updated stack map. If `name` is not in
+`sm`, falls back to a placeholder opcode (matching `loadRef`'s
+unresolved branch).
+-/
+def bringToTop (sm : StackMap) (name : String) (consume : Bool) :
+    (List StackOp × StackMap) :=
+  match sm.depth? name with
+  | none =>
+      ([.opcode s!"OP_RUNAR_UNRESOLVED_{name}"], sm)
+  | some 0 =>
+      if consume then
+        ([], sm)
+      else
+        ([.dup], sm.push name)
+  | some 1 =>
+      if consume then
+        -- SWAP: top two entries flip.
+        match sm with
+        | a :: b :: rest => ([.swap], b :: a :: rest)
+        | _              => ([.swap], sm)
+      else
+        ([.over], sm.push name)
+  | some 2 =>
+      if consume then
+        ([.rot], (sm.removeAtDepth 2).push name)
+      else
+        -- `.pickStruct 2` encodes byte-identically to `.pick 2` (`[push 2, OP_PICK]`)
+        -- in `Emit.lean`, but has no-pop runtime semantics matching the
+        -- copy-only `bringToTop` lowering (no preceding push of depth).
+        ([.pickStruct 2], sm.push name)
+  | some d =>
+      if consume then
+        ([.roll d], (sm.removeAtDepth d).push name)
+      else
+        ([.pickStruct d], sm.push name)
+
+/-- Pop `n` entries off the top of the stack map. -/
+def StackMap.popN : StackMap → Nat → StackMap
+  | sm,            0     => sm
+  | [],            _ + 1 => []
+  | _ :: rest, n + 1     => StackMap.popN rest n
+
+/--
+Liveness-aware single-ref load. Decides between PICK/OVER/DUP (copy)
+and ROLL/SWAP/ROT (consume) using `isLastUse` plus the
+outer-protected gate (refs that pre-existed the current scope cannot
+be consumed; mirrors the TS `outerProtectedRefs` mechanism in
+`05-stack-lower.ts:856-902`).
+
+`outerProtected` should be the snapshot of the parent scope's stack
+map at the point this inner scope was entered. At the top-level
+method body it is `[]`.
+-/
+def loadRefLive (sm : StackMap) (name : String) (currentIndex : Nat)
+    (lastUses : List (String × Nat)) (outerProtected : List String) :
+    (List StackOp × StackMap) :=
+  let consume := !listContains outerProtected name
+              && isLastUse lastUses name currentIndex
+  bringToTop sm name consume
+
+/-- Liveness-aware param load. Mirrors TS `lowerLoadParam`
+(`05-stack-lower.ts:982-1003`): consumes the param on its last use
+within the current scope, without the `localBindings` check that
+`loadConst .refAlias` applies. Phase 7.1: also checks `outerProtected`
+to prevent consumption of params that an enclosing scope still needs
+(e.g. a param used in BOTH branches of sibling ifs — the first if's
+THEN body must NOT ROLL the param when the second if also reads it). -/
+def loadRefLiveParam (sm : StackMap) (name : String) (currentIndex : Nat)
+    (lastUses : List (String × Nat)) (outerProtected : List String) :
+    (List StackOp × StackMap) :=
+  let consume := !listContains outerProtected name
+              && isLastUse lastUses name currentIndex
+  bringToTop sm name consume
+
+/-- Always-copy load (`bringToTop` with `consume=false`) used by
+`loadProp` per TS `05-stack-lower.ts:1004-1029`: properties are shared
+mutable state, so reading them never consumes. -/
+def loadRefLiveCopy (sm : StackMap) (name : String) :
+    (List StackOp × StackMap) :=
+  bringToTop sm name false
+
+/--
+Liveness-aware single-operand load for MULTI-operand ANF values.
+Identical to `loadRefLive` except the consume decision goes through
+`operandConsume` against the value's FULL operand list (TS
+`operandConsume` call sites: binOp, generic call args, checkMultiSig,
+methodCall arg binding, computeStateOutput*/buildChangeOutput,
+addOutput/addRawOutput, math helpers, crypto builtins). Single-operand
+sites (loadParam, unaryOp, assert, if-cond, updateProp,
+deserializeState, extractors, checkPreimage, blake3Hash, sqrt, log2,
+sign) keep `loadRefLive` — TS uses bare `isLastUse` there.
+-/
+def loadRefOperand (sm : StackMap) (name : String) (operands : List String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  bringToTop sm name
+    (operandConsume lastUses outerProtected name operands currentIndex)
+
+/-- When `name` occurs at most once in `operands`, the repeated-operand
+clause is vacuous and `operandConsume` reduces to the old
+`loadRefLive` consume decision. -/
+theorem operandConsume_eq_of_unique (lastUses : List (String × Nat))
+    (outerProtected : List String) (ref : String) (operands : List String)
+    (currentIndex : Nat)
+    (h : (operands.filter (· == ref)).length ≤ 1) :
+    operandConsume lastUses outerProtected ref operands currentIndex
+      = (!listContains outerProtected ref && isLastUse lastUses ref currentIndex) := by
+  unfold operandConsume
+  simp [h]
+
+/-- `loadRefOperand` collapses to `loadRefLive` whenever the ref occurs
+at most once in the operand list (i.e. for every non-aliased value). -/
+theorem loadRefOperand_eq_of_unique (sm : StackMap) (name : String)
+    (operands : List String) (currentIndex : Nat)
+    (lastUses : List (String × Nat)) (outerProtected : List String)
+    (h : (operands.filter (· == name)).length ≤ 1) :
+    loadRefOperand sm name operands currentIndex lastUses outerProtected
+      = loadRefLive sm name currentIndex lastUses outerProtected := by
+  unfold loadRefOperand loadRefLive
+  rw [operandConsume_eq_of_unique _ _ _ _ _ h]
+
+/-- Distinct-pair bridge, left operand: `loadRefOperand` over `[l, r]`
+with `l ≠ r` equals the old `loadRefLive`. -/
+theorem loadRefOperand_pair_left (sm : StackMap) (l r : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (hne : l ≠ r) :
+    loadRefOperand sm l [l, r] currentIndex lastUses outerProtected
+      = loadRefLive sm l currentIndex lastUses outerProtected := by
+  apply loadRefOperand_eq_of_unique
+  have h : (r == l) = false := beq_eq_false_iff_ne.mpr (Ne.symm hne)
+  simp [List.filter, h]
+
+/-- Distinct-pair bridge, right operand. -/
+theorem loadRefOperand_pair_right (sm : StackMap) (l r : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (hne : l ≠ r) :
+    loadRefOperand sm r [l, r] currentIndex lastUses outerProtected
+      = loadRefLive sm r currentIndex lastUses outerProtected := by
+  apply loadRefOperand_eq_of_unique
+  have h : (l == r) = false := beq_eq_false_iff_ne.mpr hne
+  simp [List.filter, h]
+
+/-- Singleton bridge: a one-element operand list never repeats. -/
+@[simp] theorem loadRefOperand_singleton (sm : StackMap) (x : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) :
+    loadRefOperand sm x [x] currentIndex lastUses outerProtected
+      = loadRefLive sm x currentIndex lastUses outerProtected := by
+  apply loadRefOperand_eq_of_unique
+  simp [List.filter]
+
+/--
+Liveness-aware multi-arg loader. Threads `sm` through each load (so
+later args observe the depth-shifts caused by earlier consumes) and
+uses the same `(currentIndex, lastUses, outerProtected)` triple for
+every arg (mirroring TS `lowerCall` / `lowerBinOp`, which compute all
+`isLast*` flags at the same `bindingIndex`).
+
+`allOperands` is the FULL operand list of the value (TS passes the
+complete `args` list to `operandConsume` for every element, so each
+element is checked against ALL operands, not just the unprocessed
+tail). Callers pass the same list twice at the top level.
+-/
+def lowerArgsLive (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (allOperands : List String) :
+    StackMap → List String → (List StackOp × StackMap)
+  | sm, [] => ([], sm)
+  | sm, a :: rest =>
+      let (load, sm1) := loadRefOperand sm a allOperands currentIndex lastUses outerProtected
+      let (restOps, sm2) := lowerArgsLive currentIndex lastUses outerProtected allOperands sm1 rest
+      (load ++ restOps, sm2)
+
+/--
+Liveness-aware variant of `loadAndBindArgs` for `methodCall` inlining.
+Loads each arg via `bringToTop` (consume on last use, modulo
+`outerProtected` and the repeated-operand clause — TS `inlineMethodCall`
+calls `operandConsume(arg, args, …)` per arg) and renames the new
+top-of-stack slot to the corresponding callee param name. `allOperands`
+is the full call arg list (the `obj` ref is NOT part of it, matching TS).
+-/
+def loadAndBindArgsLive (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (allOperands : List String) :
+    StackMap → List String → List String → (List StackOp × StackMap)
+  | sm, [], _ => ([], sm)
+  | sm, _ :: _, [] => ([], sm)
+  | sm, a :: rargs, p :: rparams =>
+      let (load, sm1) := loadRefOperand sm a allOperands currentIndex lastUses outerProtected
+      -- Rename the new top entry from `a` to `p` (the callee's param name).
+      let sm2 := match sm1 with
+                 | _ :: rest => p :: rest
+                 | []        => [p]
+      let (rest, sm3) := loadAndBindArgsLive currentIndex lastUses outerProtected allOperands sm2 rargs rparams
+      (load ++ rest, sm3)
+
+/-! ## Operator name → Bitcoin Script opcode -/
+
+/--
+Mirrors the `BINOP_OPCODES` table in `05-stack-lower.ts:102-125`. Every
+ANF binary operator maps to exactly one Bitcoin Script opcode (with the
+exception of `===`, which selects between `OP_EQUAL` and `OP_NUMEQUAL`
+based on the optional `result_type`).
+-/
+def binopOpcode (op : String) (resultType : Option String) : String :=
+  match op with
+  | "+"  => "OP_ADD"
+  | "-"  => "OP_SUB"
+  | "*"  => "OP_MUL"
+  | "/"  => "OP_DIV"
+  | "%"  => "OP_MOD"
+  | "<"  => "OP_LESSTHAN"
+  | "<=" => "OP_LESSTHANOREQUAL"
+  | ">"  => "OP_GREATERTHAN"
+  | ">=" => "OP_GREATERTHANOREQUAL"
+  | "&&" => "OP_BOOLAND"
+  | "||" => "OP_BOOLOR"
+  | "===" =>
+      match resultType with
+      | some "bytes" => "OP_EQUAL"
+      | _            => "OP_NUMEQUAL"
+  | "!==" =>
+      -- Issue #116: mirror TS `BINOP_OPCODES['!=='] = ['OP_NUMEQUAL','OP_NOT']`
+      -- (`05-stack-lower.ts:132-133`). `!==` always emits the EQUALITY opcode
+      -- followed by `OP_NOT` (appended by the binOp lowering arms below): bytes
+      -- use `OP_EQUAL`, numeric uses `OP_NUMEQUAL`. All 7 reference compilers
+      -- emit this 2-opcode pair; the single `OP_NUMNOTEQUAL` opcode is never
+      -- emitted. The semantic bridge `runOps [OP_NUMEQUAL, OP_NOT] = runOps
+      -- [OP_NUMNOTEQUAL]` is `Stack.Sim.runOps_numEqualNot_eq_numNotEqual`.
+      match resultType with
+      | some "bytes" => "OP_EQUAL"
+      | _            => "OP_NUMEQUAL"
+  | "&"  => "OP_AND"
+  | "|"  => "OP_OR"
+  | "^"  => "OP_XOR"
+  | "<<" => "OP_LSHIFT"
+  | ">>" => "OP_RSHIFT"
+  | _    => "OP_RUNAR_UNKNOWN_BINOP"
+
+/-- Mirrors `UNARYOP_OPCODES` in `05-stack-lower.ts:127-131`. -/
+def unaryOpcode (op : String) : String :=
+  match op with
+  | "!" => "OP_NOT"
+  | "-" => "OP_NEGATE"
+  | "~" => "OP_INVERT"
+  | _   => "OP_RUNAR_UNKNOWN_UNARYOP"
+
+/--
+Built-in function name → emitted opcode (or opcode list for builtins
+that fuse).
+
+Handles the common scalar / hash builtins. Anything not in this table
+returns `OP_RUNAR_UNKNOWN_BUILTIN` and is rejected by `SimpleANF`.
+-/
+def builtinOpcode (name : String) : List String :=
+  match name with
+  -- Hashes
+  | "sha256"      => ["OP_SHA256"]
+  | "ripemd160"   => ["OP_RIPEMD160"]
+  | "hash160"     => ["OP_HASH160"]
+  | "hash256"     => ["OP_HASH256"]
+  -- Signature ops
+  | "checkSig"    => ["OP_CHECKSIG"]
+  -- Multisig: the dedicated dispatch arm in `lowerValueP` emits the full
+  -- TS-faithful sequence (`OP_0 dummy + sigs + nSigs + pubKeys + nPKs +
+  -- OP_CHECKMULTISIG`). The unparameterized `lowerValue` fallback below
+  -- collapses to a bare `OP_CHECKMULTISIG` after the arg loads — that's
+  -- enough for `compileSafe` to accept the fixture (real opcode, not an
+  -- `OP_RUNAR_*` sentinel) even though it is not byte-exact. The
+  -- byte-exact emit lives in `lowerValueP` via `lowerCheckMultiSigOpsLive`.
+  | "checkMultiSig" => ["OP_CHECKMULTISIG"]
+  -- Byte ops
+  | "cat"         => ["OP_CAT"]
+  | "len"         => ["OP_SIZE", "OP_NIP"]   -- mirrors 05-stack-lower.ts:1168
+  | "split"       => ["OP_SPLIT"]
+  -- Numeric helpers
+  | "abs"         => ["OP_ABS"]
+  | "min"         => ["OP_MIN"]
+  | "max"         => ["OP_MAX"]
+  | "within"      => ["OP_WITHIN"]
+  -- Boolean coercion: `bool(x)` ↦ `OP_0NOTEQUAL` (mirrors TS
+  -- `BUILTIN_OPCODES.bool` at `05-stack-lower.ts:108`).
+  | "bool"        => ["OP_0NOTEQUAL"]
+  -- ByteString ⇄ Int coercions
+  | "num2bin"     => ["OP_NUM2BIN"]
+  | "bin2num"     => ["OP_BIN2NUM"]
+  -- Casts (no-op — argument is already on the stack with the right repr)
+  | "toByteString" => []
+  | "pack"         => []
+  -- substr(data, start, length) → SPLIT NIP SPLIT DROP (TS lowerSubstr)
+  | "substr"       => ["OP_SPLIT", "OP_NIP", "OP_SPLIT", "OP_DROP"]
+  -- __array_access(data, index) → SPLIT NIP <1> SPLIT DROP BIN2NUM. Note
+  -- the literal `<1>` is *between* opcodes and emitted as `51` (OP_1), so
+  -- we treat it as an opcode (`OP_1`) rather than a `.push` to keep this
+  -- helper opcode-only. Mirrors TS `lowerArrayAccess` (`05-stack-lower.ts:4773`).
+  | "__array_access" =>
+      ["OP_SPLIT", "OP_NIP", "OP_1", "OP_SPLIT", "OP_DROP", "OP_BIN2NUM"]
+  | _              => ["OP_RUNAR_UNKNOWN_BUILTIN"]
+
+/--
+Whether `func` names a preimage-field extractor (e.g. `extractVersion`,
+`extractOutputHash`, `extractAmount`, …). Mirrors TS `lowerExtractor`
+dispatch (`05-stack-lower.ts:2957-3220`): every extractor takes one
+argument (the BIP-143 preimage) and emits a fixed `OP_SPLIT` sequence
+that selects the relevant field.
+-/
+def isExtractor (func : String) : Bool :=
+  func.startsWith "extract"
+
+/-- Body sequence (sans the leading `bringToTop preimage` load) for a
+preimage-field extractor. Mirrors TS `lowerExtractor`'s switch arms in
+`05-stack-lower.ts:2975-3220`. The two-character literal pushes (e.g.
+`push 40`) emit as `01 28` (push 1 byte 0x28) so byte-exact match
+holds against the TS reference. Returns `[]` for unknown extractors,
+which keeps a robust no-op fallback for non-supported field names.
+-/
+def extractorBody (func : String) : List StackOp :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  match func with
+  | "extractVersion" =>
+      [push 4, opc "OP_SPLIT", .drop, opc "OP_BIN2NUM"]
+  | "extractHashPrevouts" =>
+      [push 4, opc "OP_SPLIT", .nip, push 32, opc "OP_SPLIT", .drop]
+  | "extractHashSequence" =>
+      [push 36, opc "OP_SPLIT", .nip, push 32, opc "OP_SPLIT", .drop]
+  | "extractHashOutputs" =>
+      -- End-relative: 32 bytes before the last 8 (nLocktime + sighashType).
+      [opc "OP_SIZE", push 40, opc "OP_SUB", opc "OP_SPLIT", .nip,
+       push 32, opc "OP_SPLIT", .drop]
+  | "extractOutpoint" =>
+      -- TS `lowerExtractor` case `extractOutpoint` (`05-stack-lower.ts:
+      -- 3039-3061`): skip first 68 bytes (version 4 + hashPrevouts 32 +
+      -- hashSequence 32), then take next 36 bytes (txid 32 + vout 4).
+      [push 68, opc "OP_SPLIT", .nip, push 36, opc "OP_SPLIT", .drop]
+  | "extractOutputHash" =>
+      [opc "OP_SIZE", push 40, opc "OP_SUB", opc "OP_SPLIT", .nip,
+       push 32, opc "OP_SPLIT", .drop]
+  | "extractOutputs" =>
+      [opc "OP_SIZE", push 40, opc "OP_SUB", opc "OP_SPLIT", .nip,
+       push 32, opc "OP_SPLIT", .drop]
+  | "extractNLocktime" =>
+      [opc "OP_SIZE", push 8, opc "OP_SUB", opc "OP_SPLIT", .nip,
+       push 4, opc "OP_SPLIT", .drop, opc "OP_BIN2NUM"]
+  | "extractLocktime" =>
+      -- TS `lowerExtractor` case `extractLocktime` (`05-stack-lower.ts:3087-3115`):
+      -- end-relative 4 bytes before the last 4 (sighashType).
+      [opc "OP_SIZE", push 8, opc "OP_SUB", opc "OP_SPLIT", .nip,
+       push 4, opc "OP_SPLIT", .drop, opc "OP_BIN2NUM"]
+  | "extractSigHashType" =>
+      [opc "OP_SIZE", push 4, opc "OP_SUB", opc "OP_SPLIT", .nip,
+       opc "OP_BIN2NUM"]
+  | "extractAmount" =>
+      -- Amount is 8 bytes immediately after scriptCode (nSeq is 4 after).
+      -- Layout from end: nSeq(4) + hashOutputs(32) + nLocktime(4) + hashType(4) = 44 from end,
+      -- amount(8) precedes that → amount starts at SIZE-52.
+      [opc "OP_SIZE", push 52, opc "OP_SUB", opc "OP_SPLIT", .nip,
+       push 8, opc "OP_SPLIT", .drop, opc "OP_BIN2NUM"]
+  | "extractScriptCode" =>
+      -- scriptCode lives between the prevout (36 + outpoint stuff) and
+      -- the trailing fixed-size fields. The TS reference uses a custom
+      -- multi-split sequence that we do not reproduce here; downstream
+      -- fixtures using extractScriptCode go through the dedicated state
+      -- helpers (deserialize_state) instead.
+      []
+  | _ => []
+
+/-! ## Per-binding lowering
+
+We thread `(StackMap, List StackOp)` through the binding sequence. Each
+case produces a list of stack ops and returns the updated stack map.
+
+`loadRef name`: emit `pick depth(name)`, leaving a copy on top.
+`pushAndName name v`: pushes value `v`, then names the new top.
+-/
+
+def loadRef (sm : StackMap) (name : String) : List StackOp :=
+  match sm.depth? name with
+  | some 0 => [.dup]
+  | some 1 => [.over]
+  | some d => [.pickStruct d]   -- no-pop pick; emits `[push d, OP_PICK]` bytes
+  | none   => [.opcode s!"OP_RUNAR_UNRESOLVED_{name}"]
+
+def emitConst : ConstValue → List StackOp
+  | .int i      => [.push (.bigint i)]
+  | .bool b     => [.push (.bool b)]
+  | .bytes b    => [.push (.bytes b)]
+  | .refAlias _ => []     -- aliases dispatch below via `loadRef`
+  | .thisRef    => []     -- `@this` doesn't materialize anything on the stack
+
+/-! ## Argument-list lowering helper
+
+`lowerArgs` loads each ref in turn, threading the stackMap. Pure
+structural recursion on the ref-name list (no recursion through
+`lowerValue` / `lowerBindings`), so it lives outside the mutual
+block.
+-/
+
+def lowerArgs (sm : StackMap) : List String → (List StackOp × StackMap)
+  | [] => ([], sm)
+  | a :: rest =>
+      let load := loadRef sm a
+      let (restOps, sm') := lowerArgs (sm.push a) rest
+      (load ++ restOps, sm')
+
+/-! ## arrayLiteral helper
+
+Concatenates element loads with `OP_CAT`. Pure structural recursion on
+the element list — no nested binding recursion.
+-/
+
+def lowerArrayElems (sm : StackMap) : List String → List StackOp
+  | [] => []
+  | [single] => loadRef sm single
+  | first :: rest =>
+      rest.foldl (init := loadRef sm first) fun acc el =>
+        acc ++ loadRef (sm.push first) el ++ [.opcode "OP_CAT"]
+
+/-- Per-iteration iteration-variable cleanup gate for the faithful
+loop arm (TS `lowerLoop` `05-stack-lower.ts:2158-2167`): emit a single
+`OP_DROP` iff the iter var survives the body at EXACTLY depth 0 of the
+stack map; a survivor buried deeper (or absent) emits nothing and the
+map is left unchanged (stranded values are cleaned by the
+end-of-method NIP pass). Named (rather than inlined in
+`lowerLoopItersP`) so proof hypotheses about the gate are plain
+equations on a constant application. -/
+def iterVarCleanup (smBody : StackMap) (iterVar : String) :
+    List StackOp × StackMap :=
+  match smBody.depth? iterVar with
+  | some 0 => ([.drop], smBody.removeAtDepth 0)
+  | _      => ([], smBody)
+
+/-! ## Loop unroll helper
+
+Unrolls a precomputed body op list `count` times, prefixing each
+iteration with the iteration index push and suffixing with `OP_DROP`
+(to discard the index after the body consumes it).
+
+Pure structural recursion on `Nat`, defined outside the mutual block
+because the recursive cycle is not through `lowerValue` /
+`lowerBindings`. The body is computed once by `lowerValue`'s `loop`
+case (via the mutual `lowerBindings`) and then iterated here.
+-/
+
+def unrollIter (innerOps : List StackOp) : Nat → List StackOp
+  | 0       => []
+  | n + 1   => unrollIter innerOps n
+                  ++ [.push (.bigint (Int.ofNat n))]
+                  ++ innerOps
+                  ++ [.drop]
+
+/-! ## Method-call inlining helpers
+
+`methodCall` lowering inlines the called method's body in place
+(mirroring `inlineMethodCall` in `05-stack-lower.ts:1591-1644`). The TS
+reference rolls each argument to the top of the stack and renames it
+to the corresponding param; we emit a `loadRef` per arg (placing a
+copy on top) and bind the param name onto the stack map.
+
+The resolution is by `name` against the program's full method list.
+Lean's structural-recursion checker can't see method bodies as
+"smaller" than the calling site, so termination is bounded by an
+explicit fuel parameter (`budget`); on overflow we emit a placeholder
+opcode rather than diverging.
+-/
+
+/-- Find a method by name in the program's method list. -/
+def lookupMethod (methods : List ANFMethod) (name : String) : Option ANFMethod :=
+  methods.find? (fun m => m.name == name)
+
+/-- Default inlining budget. The TS compiler implicitly bounds inlining
+because Rúnar forbids recursive private methods; we mirror that with a
+fixed fuel large enough for every conformance fixture. -/
+def defaultInlineBudget : Nat := 8
+
+/--
+Bind the call-site arg list to the callee's params on the stack map.
+
+For each `(arg, param)` pair we emit `loadRef sm arg` (placing a copy
+on top) and push `param` onto the stack map so subsequent body
+bindings see the param name. Extra args (without a matching param)
+are silently dropped — the same shape Rúnar's typechecker enforces
+upstream.
+-/
+def loadAndBindArgs (sm : StackMap) :
+    List String → List String → (List StackOp × StackMap)
+  | [], _ => ([], sm)
+  | _ :: _, [] => ([], sm)
+  | a :: rargs, p :: rparams =>
+      let load := loadRef sm a
+      let (rest, sm') := loadAndBindArgs (sm.push p) rargs rparams
+      (load ++ rest, sm')
+
+/-! ## Framework intrinsic helpers
+
+These helpers mirror the BIP-143 / output-construction lowering
+sequences from `05-stack-lower.ts`. They are pure constants /
+pure functions of their byte payloads — they never recurse through
+`lowerValue` / `lowerBindings`, so they live outside the mutual
+block.
+
+The Lean lowering uses PICK-style (`loadRef`) loads throughout
+(matching the rest of `Lower.lean`), even where the TS reference
+sometimes uses ROLL (`bringToTop` with `consume=true`) to avoid
+the depth tracking required by liveness analysis. The byte-exact
+match against the TS reference for fixtures that exercise these
+intrinsics requires a future pass that threads `lastUses`; the
+present lowering is byte-exact in the **shape** of the intrinsic
+body but may differ in the load sequence.
+-/
+
+/--
+Mirrors `emitVarintEncoding` in `05-stack-lower.ts:425-518`. On
+entry, the runtime stack is `[..., script, len]`. On exit it is
+`[..., script, varint(len)]`. The encoding is the standard Bitcoin
+compact-size varint: 1, 3, 5, or 9 bytes depending on the length
+range, gated by nested OP_IF / OP_ELSE / OP_ENDIF opcode triples.
+
+The TS reference emits `OP_IF` / `OP_ELSE` / `OP_ENDIF` as opcode
+strings (not as a structured `StackOp.ifOp`); we mirror that
+verbatim so the resulting hex is byte-identical.
+-/
+def varintEncodingOps : List StackOp :=
+  let push (n : Int) : StackOp := .push (.bigint n)
+  let opc (s : String) : StackOp := .opcode s
+  -- numToLowBytes(nBytes): [..., len] -> [..., low_n_bytes]
+  -- Sequence: push (n+1); OP_NUM2BIN; push n; OP_SPLIT; drop
+  let numToLowBytes (n : Int) : List StackOp :=
+    [push (n + 1), opc "OP_NUM2BIN", push n, opc "OP_SPLIT", .drop]
+  -- emitPrefix(b): [..., script, low_bytes] -> [..., script, prefix||low_bytes]
+  -- Sequence: push #[b]; swap; OP_CAT
+  let emitPrefix (b : UInt8) : List StackOp :=
+    [.push (.bytes (ByteArray.mk #[b])), .swap, opc "OP_CAT"]
+  -- IF len < 253: 1-byte varint
+  [.dup, push 253, opc "OP_LESSTHAN", opc "OP_IF"]
+    ++ numToLowBytes 1
+    ++ [opc "OP_ELSE"]
+    -- ELSE-IF len <= 0xffff: 0xfd + 2-byte LE
+    ++ [.dup, push 0x10000, opc "OP_LESSTHAN", opc "OP_IF"]
+    ++ numToLowBytes 2
+    ++ emitPrefix 0xfd
+    ++ [opc "OP_ELSE"]
+    -- ELSE-IF len <= 0xffffffff: 0xfe + 4-byte LE
+    ++ [.dup, push 0x100000000, opc "OP_LESSTHAN", opc "OP_IF"]
+    ++ numToLowBytes 4
+    ++ emitPrefix 0xfe
+    ++ [opc "OP_ELSE"]
+    -- ELSE: 0xff + 8-byte LE
+    ++ numToLowBytes 8
+    ++ emitPrefix 0xff
+    ++ [opc "OP_ENDIF", opc "OP_ENDIF", opc "OP_ENDIF"]
+
+/--
+Lowering for `add_raw_output(satoshis, scriptBytes)` and
+`add_data_output(satoshis, scriptBytes)` (their stack-IR shape is
+identical — see `05-stack-lower.ts:961-965`). Builds a raw output
+serialization on the stack:
+
+  amount(8 LE) ++ varint(scriptLen) ++ scriptBytes
+
+Mirrors `lowerAddRawOutput` in `05-stack-lower.ts:2467-2511`.
+
+Returns the op list and the updated `StackMap` with `bindingName`
+named on top of the stack.
+-/
+def lowerAddRawOutputOps (sm : StackMap) (bindingName : String)
+    (satoshis scriptBytes : String) : (List StackOp × StackMap) :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  -- Step 1: bring scriptBytes to top (PICK-style copy via loadRef).
+  let s1 := loadRef sm scriptBytes
+  -- Step 2: OP_SIZE, then varint encoding -> [..., script, varint]
+  let s2 := [opc "OP_SIZE"] ++ varintEncodingOps
+  -- Step 3: SWAP + OP_CAT -> [..., varint+script]
+  let s3 := [.swap, opc "OP_CAT"]
+  -- Step 4: bring satoshis to top, NUM2BIN(8), SWAP, OP_CAT -> [..., satoshis(8LE)+varint+script]
+  -- After steps 1-3, the stack-map top is the (un-named) "varint+script" slot;
+  -- we model that with a single push of bindingName as a placeholder so
+  -- subsequent loadRef calls remain consistent. We use the *original* sm
+  -- (where scriptBytes lives) for satoshis lookup since scriptBytes was
+  -- copied (not consumed); after CATs the top is unnamed.
+  let smAfterCat := sm.push bindingName
+  let s4Load := loadRef smAfterCat satoshis
+  let s4 := s4Load ++ [push 8, opc "OP_NUM2BIN", .swap, opc "OP_CAT"]
+  (s1 ++ s2 ++ s3 ++ s4, smAfterCat)
+
+/--
+Liveness-aware variant of `lowerAddRawOutputOps`. Mirrors TS
+`lowerAddRawOutput` (`05-stack-lower.ts:2467-2511`) more faithfully by
+using `bringToTop` with consume semantics on last-use refs (matching
+TS `bringToTop(ref, isLast)`), threading the stack map through each
+load. This lets PICK→ROLL collapse on dead refs and OVER→SWAP / DUP→
+no-op collapse on top-of-stack last uses, producing byte-identical hex
+to the TS reference for fixtures whose `_opPushTxSig` / `_codePart`
+implicit params live below the user-visible stack region.
+-/
+def lowerAddRawOutputOpsLive (sm : StackMap) (bindingName : String)
+    (satoshis scriptBytes : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  -- Full operand list for the repeated-operand consume gate (TS
+  -- `lowerAddRawOutput` passes `[satoshis, scriptBytes]`).
+  let rawOperands : List String := [satoshis, scriptBytes]
+  -- Step 1: bring scriptBytes to top, consuming on last use.
+  let (s1, sm1) := loadRefOperand sm scriptBytes rawOperands currentIndex lastUses outerProtected
+  -- Step 2: OP_SIZE, then varint encoding -> [..., script, varint]
+  let s2 := [opc "OP_SIZE"] ++ varintEncodingOps
+  -- After s2, the top entry on the stack map is the unnamed varint slot
+  -- (TS pushes null after OP_SIZE then leaves the IF/ELSE chain depth-
+  -- neutral). We model that with a single anonymous push.
+  let smAfterVarint := sm1.push "_varint"
+  -- Step 3: SWAP + OP_CAT -> [..., varint+script]. SWAP pops 2 / pushes 2;
+  -- CAT pops 2 / pushes 1. Net stack-map: pop 1.
+  let s3 := [.swap, opc "OP_CAT"]
+  let smAfterS3 := smAfterVarint.popN 1
+  -- Step 4: bring satoshis to top, NUM2BIN(8), SWAP, OP_CAT.
+  let (s4Load, sm4) := loadRefOperand smAfterS3 satoshis rawOperands currentIndex lastUses outerProtected
+  let s4 := s4Load ++ [push 8, opc "OP_NUM2BIN", .swap, opc "OP_CAT"]
+  -- The final SWAP+CAT pair fuses the satoshis slot with the varint+script
+  -- accumulator left on top after step 3 into a single output-bytes slot.
+  -- Pop BOTH (popN 2) before pushing bindingName — the earlier `popN 1`
+  -- form left the varint+script slot lingering at depth 1 and shifted
+  -- every subsequent PICK/ROLL/SWAP by +1 (visible in the token-nft /
+  -- auction / add-data-output fixtures' post-add_output emission).
+  let smFinal := (sm4.popN 2).push bindingName
+  (s1 ++ s2 ++ s3 ++ s4, smFinal)
+
+/--
+The fixed 760-byte on-chain OP_PUSH_TX preimage-binding blob (BUG-100).
+
+Byte-identical to the TS reference `CHECK_PREIMAGE_BINDING_HEX`
+(`packages/runar-compiler/src/passes/oppushtx-codegen.ts`): a single opaque
+opcode span that derives the ECDSA signature on-chain from `hash256(preimage)`
+(Optimal OP_PUSH_TX: `z = hash256(preimage)`, `s = (z + r)·k⁻¹ mod n`, fixed
+nonce k=2 / privkey d=1, branchless low-S, minimal DER) and runs
+`OP_CHECKSIGVERIFY` against the generator `G`. `OP_CHECKSIG` passes iff
+`hash256(preimage)` equals the real tx sighash — i.e. iff the pushed preimage
+IS the spending transaction's BIP-143 preimage. Net stack effect is zero
+(preimage in → preimage out). Emitted as a single `.rawBytes` StackOp so the
+peephole optimizer treats it as a hard barrier and all seven tiers pin the
+same constant. -/
+def checkPreimageBindingBytes : ByteArray := ByteArray.mk #[
+    0x76, 0xaa, 0x00, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51,
+    0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e,
+    0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b,
+    0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f,
+    0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c,
+    0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c,
+    0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b,
+    0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51,
+    0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e,
+    0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b,
+    0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f,
+    0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c,
+    0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c,
+    0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b,
+    0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51,
+    0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e,
+    0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b,
+    0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f,
+    0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c,
+    0x75, 0x01, 0x00, 0x7e, 0x81, 0x21, 0xe5, 0x9e, 0x70, 0x5c, 0xb9, 0x09,
+    0xac, 0xab, 0xa7, 0x3c, 0xef, 0x8c, 0x4b, 0x8e, 0x77, 0x5c, 0xd8, 0x7c,
+    0xc0, 0x95, 0x6e, 0x40, 0x45, 0x30, 0x6d, 0x7d, 0xed, 0x41, 0x94, 0x7f,
+    0x04, 0xc6, 0x00, 0x93, 0x20, 0xa1, 0x20, 0x1b, 0x68, 0x46, 0x2f, 0xe9,
+    0xdf, 0x1d, 0x50, 0xa4, 0x57, 0x73, 0x6e, 0x57, 0x5d, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x7f, 0x95, 0x21, 0x41, 0x41, 0x36, 0xd0, 0x8c, 0x5e, 0xd2, 0xbf, 0x3b,
+    0xa0, 0x48, 0xaf, 0xe6, 0xdc, 0xae, 0xba, 0xfe, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+    0x6e, 0x97, 0x7b, 0x75, 0x78, 0x93, 0x7c, 0x97, 0x76, 0x20, 0xa0, 0x20,
+    0x1b, 0x68, 0x46, 0x2f, 0xe9, 0xdf, 0x1d, 0x50, 0xa4, 0x57, 0x73, 0x6e,
+    0x57, 0x5d, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0xa0, 0x78, 0x21, 0x41, 0x41, 0x36,
+    0xd0, 0x8c, 0x5e, 0xd2, 0xbf, 0x3b, 0xa0, 0x48, 0xaf, 0xe6, 0xdc, 0xae,
+    0xba, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x7c, 0x8d, 0x7c, 0x94, 0x95, 0x94,
+    0x82, 0x6b, 0x01, 0x20, 0x80, 0x00, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c,
+    0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b,
+    0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51,
+    0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e,
+    0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b,
+    0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f,
+    0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c,
+    0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c,
+    0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b,
+    0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51,
+    0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e,
+    0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b,
+    0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f,
+    0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c,
+    0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c,
+    0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b,
+    0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51,
+    0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e,
+    0x7c, 0x51, 0x7f, 0x7b, 0x7b, 0x7c, 0x7e, 0x7c, 0x51, 0x7f, 0x7b, 0x7b,
+    0x7c, 0x7e, 0x7c, 0x75, 0x6c, 0x01, 0x20, 0x7c, 0x94, 0x7f, 0x77, 0x76,
+    0x82, 0x77, 0x51, 0x80, 0x52, 0x7c, 0x7e, 0x7c, 0x7e, 0x76, 0x82, 0x77,
+    0x01, 0x23, 0x93, 0x51, 0x80, 0x23, 0x02, 0x21, 0x00, 0xc6, 0x04, 0x7f,
+    0x94, 0x41, 0xed, 0x7d, 0x6d, 0x30, 0x45, 0x40, 0x6e, 0x95, 0xc0, 0x7c,
+    0xd8, 0x5c, 0x77, 0x8e, 0x4b, 0x8c, 0xef, 0x3c, 0xa7, 0xab, 0xac, 0x09,
+    0xb9, 0x5c, 0x70, 0x9e, 0xe5, 0x01, 0x30, 0x52, 0x7a, 0x7e, 0x7c, 0x7e,
+    0x7c, 0x7e, 0x01, 0x41, 0x7e, 0x21, 0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9,
+    0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b, 0x07, 0x02,
+    0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
+    0xf8, 0x17, 0x98, 0xad]
+
+/--
+Lowering for `check_preimage(preimage)` (BUG-100 on-chain binding). Mirrors
+`lowerCheckPreimage` in `05-stack-lower.ts:3156-3197`.
+
+Op sequence:
+
+  OP_CODESEPARATOR
+  <bring preimage to top>
+  <the fixed 760-byte OP_PUSH_TX binding blob (raw_bytes)>
+
+The blob derives the ECDSA signature on-chain from `hash256(preimage)` and
+runs `OP_CHECKSIGVERIFY` against `G`, aborting unless the pushed preimage
+binds to the real spending transaction. Net stack effect is zero: the
+preimage remains on top, renamed to `bindingName` so downstream extractors
+can reference it. The old spender-supplied `_opPushTxSig` witness is gone.
+-/
+def lowerCheckPreimageOps (sm : StackMap) (bindingName : String)
+    (preimage : String) : (List StackOp × StackMap) :=
+  let s0 : List StackOp := [.opcode "OP_CODESEPARATOR"]
+  -- Bring preimage to top.
+  let s1 := loadRef sm preimage
+  -- Derive + verify the signature on-chain (single opaque raw_bytes blob).
+  let s2 : List StackOp := [.rawBytes checkPreimageBindingBytes]
+  (s0 ++ s1 ++ s2, sm.push bindingName)
+
+/--
+Liveness-aware variant of `lowerCheckPreimageOps` (BUG-100 on-chain
+binding). Mirrors TS `lowerCheckPreimage` (`05-stack-lower.ts:3156-3197`):
+`OP_CODESEPARATOR`, bring the preimage to top (ROLL-on-last-use), then emit
+the fixed 760-byte OP_PUSH_TX binding blob as a single opaque `.rawBytes`
+op. Net stack effect is zero — the preimage stays on top, renamed to
+`bindingName`. No `_opPushTxSig` witness is loaded (the signature is derived
+on-chain from the preimage), so `lowerMethod` no longer prepends it.
+-/
+def lowerCheckPreimageOpsLive (sm : StackMap) (bindingName : String)
+    (preimage : String) (currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let s0 : List StackOp := [.opcode "OP_CODESEPARATOR"]
+  -- Step 1: bring preimage to top, consuming on last use.
+  let (s1, sm1) := loadRefLive sm preimage currentIndex lastUses outerProtected
+  -- Step 2: derive + verify the signature on-chain (single opaque raw_bytes
+  -- blob; net stack effect 0 — preimage in → preimage out).
+  let s2 : List StackOp := [.rawBytes checkPreimageBindingBytes]
+  -- The preimage stays on top; rename the slot to bindingName.
+  let smFinal :=
+    match sm1 with
+    | _ :: rest => bindingName :: rest
+    | []        => [bindingName]
+  (s0 ++ s1 ++ s2, smFinal)
+
+/-! ## Phase 3z-E framework intrinsics: change & state-output helpers
+
+Mirrors three TS builtins that the parser surfaces as `.call` ANF
+nodes with reserved names, but which the TS pass lowers via dedicated
+multi-op sequences (not the `BUILTIN_OPCODES` table):
+
+* `buildChangeOutput(pkh, amount)`        — `lowerBuildChangeOutput`
+  (`05-stack-lower.ts:2306-2360`)
+* `computeStateOutput(pre, state, amt)`   — `lowerComputeStateOutput`
+  (`05-stack-lower.ts:2216-2303`)
+* `computeStateOutputHash(pre, state)`    — `lowerComputeStateOutputHash`
+  (`05-stack-lower.ts:2097-2213`)
+
+Each uses `bringToTop` with consume-on-last-use for user refs and
+PICK-style copy (`bringToTop _ _codePart false`) for the implicit
+`_codePart` slot prepended by `lowerMethod`.
+-/
+
+/-- Lowering for `buildChangeOutput(pkh, amount)`. Builds a P2PKH
+output serialization on the stack:
+
+  amount(8 LE) ++ 0x19 ++ 0x76 0xa9 0x14 ++ pkh(20 bytes) ++ 0x88 0xac
+
+Mirrors `lowerBuildChangeOutput` (`05-stack-lower.ts:2306-2360`). -/
+def lowerBuildChangeOutputOps (sm : StackMap) (bindingName : String)
+    (pkh amount : String) (currentIndex : Nat)
+    (lastUses : List (String × Nat)) (outerProtected : List String) :
+    (List StackOp × StackMap) :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  -- Step 1: push prefix bytes (varint(25) + OP_DUP + OP_HASH160 + OP_PUSHBYTES_20).
+  let s1 : List StackOp :=
+    [.push (.bytes (ByteArray.mk #[0x19, 0x76, 0xa9, 0x14]))]
+  let smAfterPrefix := sm.push "_prefix"
+  -- Step 2: bring pkh to top (consume on last use, modulo the repeated-
+  -- operand gate over `[pkh, amount]`), CAT prefix||pkh.
+  let (s2Load, sm2) :=
+    loadRefOperand smAfterPrefix pkh [pkh, amount] currentIndex lastUses outerProtected
+  let s2 : List StackOp := s2Load ++ [opc "OP_CAT"]
+  let smAfterPkhCat := (sm2.popN 2).push "_acc"
+  -- Step 3: push suffix (OP_EQUALVERIFY + OP_CHECKSIG = 0x88ac), CAT.
+  let s3 : List StackOp :=
+    [.push (.bytes (ByteArray.mk #[0x88, 0xac])), opc "OP_CAT"]
+  let smAfterSuffix := (smAfterPkhCat.push "_suffix").popN 2 |>.push "_acc"
+  -- Step 4: bring amount to top, NUM2BIN(8), SWAP, CAT (prepend).
+  let (s4Load, sm4) :=
+    loadRefOperand smAfterSuffix amount [pkh, amount] currentIndex lastUses outerProtected
+  let s4 : List StackOp :=
+    s4Load ++ [push 8, opc "OP_NUM2BIN", .swap, opc "OP_CAT"]
+  -- Net stack-map effect: the SWAP+CAT pair fuses the amount slot with the
+  -- accumulator (`_acc` after step 3) into a single output-bytes slot.
+  -- Pop BOTH the amount slot and the `_acc` slot (popN 2) before pushing
+  -- bindingName. The earlier `popN 1` form left `_acc` lingering at depth 1
+  -- and shifted every subsequent PICK/ROLL by +1 — the off-by-one observed
+  -- in the stateful / stateful-counter / state-ripemd160 / token-nft /
+  -- auction fixtures' computeStateOutput emission.
+  let smFinal := (sm4.popN 2).push bindingName
+  (s1 ++ s2 ++ s3 ++ s4, smFinal)
+
+/-- Lowering for `computeStateOutput(preimage, stateBytes, newAmount)`.
+Drops the `preimage` ref (uses `_codePart` instead), builds:
+
+  amount(8 LE) ++ varint(scriptLen) ++ codePart ++ OP_RETURN ++ stateBytes
+
+Mirrors `lowerComputeStateOutput` (`05-stack-lower.ts:2220-2303`). -/
+def lowerComputeStateOutputOps (sm : StackMap) (bindingName : String)
+    (preimage stateBytes newAmount : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  -- Full operand list (TS `csoOperands = [preimageRef, stateBytesRef,
+  -- newAmountRef]`) for the repeated-operand consume gate.
+  let csoOperands : List String := [preimage, stateBytes, newAmount]
+  -- Step A: bring preimage to top (consume on last use), then DROP it.
+  --         The preimage is unused — `_codePart` and `_newAmount` carry
+  --         all the information needed for the continuation output.
+  let (sA, smA) :=
+    loadRefOperand sm preimage csoOperands currentIndex lastUses outerProtected
+  let sA' : List StackOp := sA ++ [.drop]
+  let smA' := smA.popN 1
+  -- Step B: bring newAmount to top, NUM2BIN(8), TOALTSTACK.
+  let (sB, smB) :=
+    loadRefOperand smA' newAmount csoOperands currentIndex lastUses outerProtected
+  let sB' : List StackOp :=
+    sB ++ [push 8, opc "OP_NUM2BIN", opc "OP_TOALTSTACK"]
+  -- Net stack-map after step B: the named amount slot is replaced by
+  -- NUM2BIN's anon result, then TOALTSTACK pops it. Pop one entry.
+  let smB' := smB.popN 1
+  -- Step C: bring stateBytes to top.
+  let (sC, smC) :=
+    loadRefOperand smB' stateBytes csoOperands currentIndex lastUses outerProtected
+  -- Step D: bring _codePart to top (PICK, never consume).
+  let (sD, smD) := bringToTop smC "_codePart" false
+  -- Stack: [..., stateBytes, codePart]
+  -- Step E: push 0x6a; OP_CAT. codePart || OP_RETURN.
+  let sE : List StackOp :=
+    [.push (.bytes (ByteArray.mk #[0x6a])), opc "OP_CAT"]
+  -- After push: pushes 1 (anon). After CAT: pops 2 / pushes 1.
+  -- smD has codePart on top, then stateBytes; CAT consumes top + push.
+  let smE := (smD.popN 1).push "_codeRet"
+  -- Step F: SWAP, OP_CAT. Now top = codePart||OP_RETURN||stateBytes.
+  let sF : List StackOp := [.swap, opc "OP_CAT"]
+  -- swap then CAT: net pop 1.
+  let smF := smE.popN 1
+  -- Step G: OP_SIZE, varintEncodingOps. Computes varint over the script.
+  let sG : List StackOp := [opc "OP_SIZE"] ++ varintEncodingOps
+  -- After OP_SIZE: pushes 1 (the size). varintEncoding leaves top = varint.
+  let smG := smF.push "_varint"
+  -- Step H: SWAP, OP_CAT. Prepends varint to script.
+  let sH : List StackOp := [.swap, opc "OP_CAT"]
+  let smH := smG.popN 1
+  -- Step I: OP_FROMALTSTACK; SWAP; OP_CAT. Prepends amount.
+  let sI : List StackOp :=
+    [opc "OP_FROMALTSTACK", .swap, opc "OP_CAT"]
+  -- FROMALTSTACK pushes 1 (the amount); SWAP is 0; CAT pops 2 / pushes 1.
+  -- Net stack-map change: 0. The top of smH (the SWAP+CAT result from step
+  -- H) is then RENAMED to bindingName — not pushed on top of smH, which
+  -- would leave smH's varint+script slot lingering at depth 1 and shift
+  -- every subsequent PICK/ROLL by +1 (the off-by-one observed in the
+  -- stateful / stateful-counter / state-ripemd160 / token-nft / auction
+  -- fixtures before Phase 3z-G).
+  let smFinal := (smH.popN 1).push bindingName
+  (sA' ++ sB' ++ sC ++ sD ++ sE ++ sF ++ sG ++ sH ++ sI, smFinal)
+
+/-- Lowering for `computeStateOutputHash(preimage, stateBytes)`. Same as
+`computeStateOutput` but extracts the amount from the preimage's
+scriptCode field (last 52 bytes − last 44 = an 8-byte LE field) and
+hashes the result with OP_HASH256.
+
+Mirrors `lowerComputeStateOutputHash` (`05-stack-lower.ts:2106-2213`). -/
+def lowerComputeStateOutputHashOps (sm : StackMap) (bindingName : String)
+    (preimage stateBytes : String) (currentIndex : Nat)
+    (lastUses : List (String × Nat)) (outerProtected : List String) :
+    (List StackOp × StackMap) :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  -- Step A: bring stateBytes to top (operand gate over the TS list
+  -- `[preimageRef, stateBytesRef]`).
+  let (sA, smA) :=
+    loadRefOperand sm stateBytes [preimage, stateBytes] currentIndex lastUses outerProtected
+  -- Step B: bring preimage to top.
+  let (sB, smB) :=
+    loadRefOperand smA preimage [preimage, stateBytes] currentIndex lastUses outerProtected
+  -- Step C: extract amount from preimage. End-relative: SIZE - 52 → split
+  -- off prefix; then DROP prefix, take 8 bytes, drop tail.
+  -- TS sequence (verbatim, modulo stack-map bookkeeping):
+  --   OP_SIZE; push 52; OP_SUB; OP_SPLIT; OP_NIP;
+  --   push 8;          OP_SPLIT; OP_DROP
+  let sC : List StackOp :=
+    [opc "OP_SIZE", push 52, opc "OP_SUB", opc "OP_SPLIT", .nip,
+     push 8, opc "OP_SPLIT", .drop]
+  -- Net effect on stack-map: top went from preimage to amount(8 LE);
+  -- we model this with a single rename via popN 1 + push.
+  let smC := (smB.popN 1).push "_amount"
+  -- Step D: TOALTSTACK (save amount).
+  let sD : List StackOp := [opc "OP_TOALTSTACK"]
+  let smD := smC.popN 1
+  -- Step E: bring _codePart to top (PICK, never consume).
+  let (sE, smE) := bringToTop smD "_codePart" false
+  -- Step F: push 0x6a; OP_CAT. codePart || OP_RETURN.
+  let sF : List StackOp :=
+    [.push (.bytes (ByteArray.mk #[0x6a])), opc "OP_CAT"]
+  let smF := (smE.popN 1).push "_codeRet"
+  -- Step G: SWAP, OP_CAT.
+  let sG : List StackOp := [.swap, opc "OP_CAT"]
+  let smG := smF.popN 1
+  -- Step H: OP_SIZE, varint encoding.
+  let sH : List StackOp := [opc "OP_SIZE"] ++ varintEncodingOps
+  let smH := smG.push "_varint"
+  -- Step I: SWAP, OP_CAT.
+  let sI : List StackOp := [.swap, opc "OP_CAT"]
+  let smI := smH.popN 1
+  -- Step J: FROMALTSTACK; SWAP; OP_CAT. Prepends amount.
+  let sJ : List StackOp :=
+    [opc "OP_FROMALTSTACK", .swap, opc "OP_CAT"]
+  -- Step K: OP_HASH256.
+  let sK : List StackOp := [opc "OP_HASH256"]
+  -- Step J net 0 (FROMALTSTACK +1, SWAP 0, CAT -1) and Step K net 0
+  -- (HASH256 pops 1 / pushes 1). The top of smI (the SWAP+CAT result of
+  -- step I) is RENAMED to bindingName — pushing on top of smI would
+  -- leave a stale slot at depth 1 and trigger the same +1 depth shift
+  -- as `lowerComputeStateOutputOps` did before Phase 3z-G.
+  let smFinal := (smI.popN 1).push bindingName
+  (sA ++ sB ++ sC ++ sD ++ sE ++ sF ++ sG ++ sH ++ sI ++ sJ ++ sK, smFinal)
+
+/-- Lowering for `verifyRabinSig(msg, sig, padding, pubKey)`.
+
+Rabin signature verification checks `(sig^2 + padding) mod pubKey == SHA256(msg)`.
+
+Mirrors `lowerVerifyRabinSig` (TS `05-stack-lower.ts:3884-3931`). The TS
+sequence brings the four args to the top of the stack via
+`bringToTop(arg, isLast)` — Lean uses the equivalent
+`loadRefLive` — yielding the layout
+
+  bottom→top: msg(3) sig(2) padding(1) pubKey(0)
+
+then emits:
+
+  OP_SWAP  OP_ROT  OP_DUP  OP_MUL  OP_ADD
+  OP_SWAP  OP_MOD  OP_SWAP  OP_SHA256  OP_EQUAL
+
+Net stack-map effect: pop 4 arg slots, push the boolean result under
+`bindingName`. -/
+def lowerVerifyRabinSigOpsLive (sm : StackMap) (bindingName : String)
+    (msg sig padding pubKey : String) (currentIndex : Nat)
+    (lastUses : List (String × Nat)) (outerProtected : List String) :
+    (List StackOp × StackMap) :=
+  let rabinOperands : List String := [msg, sig, padding, pubKey]
+  let (loadMsg, sm1) :=
+    loadRefOperand sm msg rabinOperands currentIndex lastUses outerProtected
+  let (loadSig, sm2) :=
+    loadRefOperand sm1 sig rabinOperands currentIndex lastUses outerProtected
+  let (loadPad, sm3) :=
+    loadRefOperand sm2 padding rabinOperands currentIndex lastUses outerProtected
+  let (loadPk, sm4) :=
+    loadRefOperand sm3 pubKey rabinOperands currentIndex lastUses outerProtected
+  -- Stack bottom→top: msg sig padding pubKey
+  -- KNOWN DIVERGENCE (2026-06-25): BUG-010 added a 5-opcode `OP_WITHIN` range
+  -- check (`0 ≤ padding < 65536`) right after this first `swap` in the 7 real
+  -- compilers, and regenerated the `oracle-price` golden. This model lowering
+  -- does NOT yet emit that gate, so `oracle-price` is tracked in
+  -- `lowerDivergencePending` (PipelineGolden). Porting it (insert
+  -- `dup, push 0, push 65536, OP_WITHIN, OP_VERIFY` here) is byte-exact but
+  -- requires re-proving `Stack/Rabin.runOps_rabinBodyOps_eq` with a
+  -- `0 ≤ padding < 65536` hypothesis threading the within+verify gate — a
+  -- per-primitive codegen-to-spec follow-up.
+  let body : List StackOp :=
+    [ StackOp.swap                    -- msg sig pubKey padding
+    , StackOp.rot                     -- msg pubKey padding sig
+    , StackOp.dup                     -- msg pubKey padding sig sig
+    , StackOp.opcode "OP_MUL"         -- msg pubKey padding sig^2
+    , StackOp.opcode "OP_ADD"         -- msg pubKey (sig^2+padding)
+    , StackOp.swap                    -- msg (sig^2+padding) pubKey
+    , StackOp.opcode "OP_MOD"         -- msg ((sig^2+padding) mod pubKey)
+    , StackOp.swap                    -- ((sig^2+padding) mod pubKey) msg
+    , StackOp.opcode "OP_SHA256"
+    , StackOp.opcode "OP_EQUAL"
+    ]
+  -- Net: pop 4 args, push 1 result under bindingName.
+  let smFinal := (sm4.popN 4).push bindingName
+  (loadMsg ++ loadSig ++ loadPad ++ loadPk ++ body, smFinal)
+
+/-! ## State serialization helpers (Phase 3z-A)
+
+These helpers mirror the property-table-aware lowering of three
+framework intrinsics from `05-stack-lower.ts`:
+
+* `getStateScript`     — `lowerGetStateScript` (TS lines 2029-2095)
+* `addOutput`          — `lowerAddOutput`      (TS lines 2362-2460)
+* `deserializeState`   — `lowerDeserializeState` (TS lines 2523-2831)
+
+They are pure functions of the property table plus runtime stack map,
+with no recursion through `lowerValue` / `lowerBindings`, so they live
+outside the mutual block.
+
+The Lean lowering uses PICK-style (`loadRef`) loads everywhere the TS
+reference uses `bringToTop(name, isLast)`. Liveness-aware ROLL
+threading would require deeper integration with the per-binding
+last-uses table; the current helpers produce byte-identical opcode
+sequences for the *intrinsic body* but may differ in the load
+opcodes for refs that the TS chooses to consume. SimpleANF coverage
+flips to `true` regardless; full byte-exact match for the wider
+state-of-the-art fixtures additionally needs concrete `update_prop`
+lowering, which is tracked separately (see HANDOFF.md).
+-/
+
+/-- Property-type → fixed serialized byte width (for fixed-size fields).
+Mirrors the size table in `05-stack-lower.ts:2535-2554`. Returns 0 for
+variable-length (ByteString) — caller must special-case. -/
+def propTypeFixedSize : ANFType → Nat
+  | .bigint          => 8
+  | .rabinSig        => 8
+  | .rabinPubKey     => 8
+  | .bool            => 1
+  | .pubKey          => 33
+  | .addr            => 20
+  | .ripemd160       => 20
+  | .sha256          => 32
+  | .point           => 64
+  | .p256Point       => 64
+  | .p384Point       => 96
+  | .sig             => 0   -- not used in fixed-state serialization
+  | .sigHashPreimage => 0   -- not used
+  | .byteString      => 0   -- variable-length sentinel
+  | .array _         => 0   -- arrays are never fixed-size state fields
+
+/-- True iff the property type's stored representation is a script
+number (bigint, boolean, RabinSig, RabinPubKey). Such props go through
+`OP_NUM2BIN` on serialization and `OP_BIN2NUM` on deserialization. -/
+def propTypeIsNumeric : ANFType → Bool
+  | .bigint      => true
+  | .bool        => true
+  | .rabinSig    => true
+  | .rabinPubKey => true
+  | _            => false
+
+/-- Mirrors `pushValue` in `05-stack-lower.ts:1077-1086`: emits a
+single push for a property's `initialValue`. -/
+def pushInitialValue : ConstValue → StackOp
+  | .int i      => .push (.bigint i)
+  | .bool b     => .push (.bool b)
+  | .bytes b    => .push (.bytes b)
+  | .refAlias _ => .push (.bigint 0)   -- unreachable for property defaults
+  | .thisRef    => .push (.bigint 0)   -- unreachable
+
+/-- Push-data encode (length-prefix encode a ByteString as Bitcoin
+script push-data). On entry stack top is the ByteString value; on
+exit it is `prefix || value` (1-byte length, 0x4c||1byte, or
+0x4d||2byteLE). Mirrors TS `emitPushDataEncode`
+(`05-stack-lower.ts:534-671`). -/
+def pushDataEncodeOps : List StackOp :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  -- [..., bs] OP_SIZE OP_DUP push 76 OP_LESSTHAN OP_IF
+  [opc "OP_SIZE", .dup, push 76, opc "OP_LESSTHAN", opc "OP_IF"]
+  -- THEN: len <= 75 → 1-byte length prefix
+  ++ [push 2, opc "OP_NUM2BIN", push 1, opc "OP_SPLIT", .drop,
+      .swap, opc "OP_CAT"]
+  ++ [opc "OP_ELSE"]
+  -- ELSE: len >= 76, OP_DUP push 256 OP_LESSTHAN OP_IF
+  ++ [.dup, push 256, opc "OP_LESSTHAN", opc "OP_IF"]
+  -- THEN: 76..255 → OP_PUSHDATA1: 0x4c + 1-byte length
+  ++ [push 2, opc "OP_NUM2BIN", push 1, opc "OP_SPLIT", .drop,
+      .push (.bytes (ByteArray.mk #[0x4c])), .swap, opc "OP_CAT",
+      .swap, opc "OP_CAT"]
+  ++ [opc "OP_ELSE"]
+  -- ELSE: >= 256 → OP_PUSHDATA2: 0x4d + 2-byte LE length
+  ++ [push 4, opc "OP_NUM2BIN", push 2, opc "OP_SPLIT", .drop,
+      .push (.bytes (ByteArray.mk #[0x4d])), .swap, opc "OP_CAT",
+      .swap, opc "OP_CAT"]
+  ++ [opc "OP_ENDIF", opc "OP_ENDIF"]
+
+/-- Per-property serialization for `getStateScript` / `addOutput`:
+load the property's value onto the stack, then apply the type-aware
+NUM2BIN width prefix. Mirrors the inner loop body of
+`lowerGetStateScript` (TS 2049-2089) and `lowerAddOutput` (TS 2391-2422).
+
+`sm` is the stack map immediately before this property's load (the
+caller threads `sm.push bindingName` in between props). Returns the op
+list for this single property's load+convert. -/
+def serializeProperty (sm : StackMap) (prop : ANFProperty) :
+    List StackOp :=
+  -- Step 1: load the property value onto the stack.
+  let load : List StackOp :=
+    match sm.depth? prop.name with
+    | some _ =>
+        -- On stack: PICK-style copy (Lean uses copy uniformly; see
+        -- helper docstring). Byte-identical when the prop is at depth 0.
+        loadRef sm prop.name
+    | none =>
+        match prop.initialValue with
+        | some iv => [pushInitialValue iv]
+        | none    => [.push (.bigint 0)]
+  -- Step 2: type-aware width prefix.
+  let conv : List StackOp :=
+    if propTypeIsNumeric prop.type then
+      [.push (.bigint (Int.ofNat (propTypeFixedSize prop.type))), .opcode "OP_NUM2BIN"]
+    else if prop.type = .byteString then
+      pushDataEncodeOps
+    else
+      []  -- other byte types: no conversion needed
+  load ++ conv
+
+/-- Concatenate the serialized bytes for `props` (filtered to
+non-readonly), interleaving `OP_CAT` between successive entries.
+
+Returns `(opList, finalSm)` where `finalSm` has `bindingName` on top.
+Mirrors `lowerGetStateScript` in `05-stack-lower.ts:2029-2095`. -/
+def lowerGetStateScriptOps (sm : StackMap) (bindingName : String)
+    (props : List ANFProperty) : (List StackOp × StackMap) :=
+  let stateProps := props.filter (fun p => !p.readonly)
+  match stateProps with
+  | [] =>
+      -- Empty state: push empty bytes.
+      ([.push (.bytes (ByteArray.mk #[]))], sm.push bindingName)
+  | first :: rest =>
+      -- Emit first prop's serialized form (no leading CAT).
+      let firstOps := serializeProperty sm first
+      -- Each subsequent prop: serialize against `sm` (we model the
+      -- accumulator as anonymous, leaving `sm` unchanged across props
+      -- — it would normally have an unnamed top-of-stack slot).
+      let restOps : List StackOp :=
+        rest.foldl (init := []) fun acc p =>
+          acc ++ serializeProperty sm p ++ [.opcode "OP_CAT"]
+      (firstOps ++ restOps, sm.push bindingName)
+
+/-- Per-property serialize step for `lowerGetStateScriptOpsLive`. Mirrors
+the inner loop body of TS `lowerGetStateScript` (`05-stack-lower.ts:
+2049-2089`): for each state prop, bring it to top with `consume=true`
+when it is currently on the stack, applying the type-aware width prefix,
+then OP_CAT onto the running accumulator (modeled as the anonymous slot
+already on top of `sm` — caller seeds it as `_acc`).
+
+`outerProtected` is honored just like in `loadRefLive`; if the prop name
+would have been protected (e.g. it pre-existed the current scope), we
+fall back to a PICK-style copy via `bringToTop _ _ false`. -/
+private def getStateScriptPropLive
+    (outerProtected : List String) :
+    StackMap → ANFProperty → (List StackOp × StackMap)
+  | sm, prop =>
+    let opc (s : String) : StackOp := .opcode s
+    let push (n : Int) : StackOp := .push (.bigint n)
+    -- Step 1: load (or push initial / placeholder).
+    let (load, sm1) :=
+      match sm.depth? prop.name with
+      | some _ =>
+          -- On stack — consume unless the prop name is in outerProtected.
+          let consume := !listContains outerProtected prop.name
+          bringToTop sm prop.name consume
+      | none =>
+          let pushed : List StackOp :=
+            match prop.initialValue with
+            | some iv => [pushInitialValue iv]
+            | none    => [push 0]
+          (pushed, sm.push prop.name)
+    -- Step 2: type-aware width prefix.
+    let conv : List StackOp :=
+      if propTypeIsNumeric prop.type then
+        [push (Int.ofNat (propTypeFixedSize prop.type)), opc "OP_NUM2BIN"]
+      else if prop.type = .byteString then
+        pushDataEncodeOps
+      else
+        []  -- other byte types: no conversion needed
+    -- After NUM2BIN: pop the named value + width (2 entries) and push
+    -- the (anonymous) converted value. For non-numeric, the named entry
+    -- stays as-is; we still pop+push to anonymize since it's about to
+    -- be CAT'd into the accumulator.
+    let smPostConv : StackMap :=
+      if propTypeIsNumeric prop.type then (sm1.popN 1).push "_conv"
+      else
+        match sm1 with
+        | _ :: rest => "_conv" :: rest
+        | []        => ["_conv"]
+    (load ++ conv, smPostConv)
+
+/-- Liveness-aware variant of `lowerGetStateScriptOps`. Mirrors TS
+`lowerGetStateScript` (`05-stack-lower.ts:2029-2095`) including the
+`bringToTop(prop.name, true)` consume-on-load semantics for state
+properties currently on the stack: the prop slot is removed from the
+stack map by ROLL/SWAP/ROT and replaced by its serialized byte form,
+which then OP_CATs onto the running accumulator.
+
+`outerProtected` is the snapshot of the parent scope's stack map at the
+point this binding was reached. Props that pre-existed the current
+scope (e.g. in an inner `if` branch) cannot be consumed and fall back to
+PICK-style copies, matching TS's `outerProtectedRefs` mechanism. -/
+def lowerGetStateScriptOpsLive (sm : StackMap) (bindingName : String)
+    (props : List ANFProperty) (_currentIndex : Nat)
+    (_lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let stateProps := props.filter (fun p => !p.readonly)
+  match stateProps with
+  | [] =>
+      ([.push (.bytes (ByteArray.mk #[]))], sm.push bindingName)
+  | first :: rest =>
+      -- First prop: serialize then leave on stack as the running acc.
+      let (firstOps, sm1) := getStateScriptPropLive outerProtected sm first
+      -- For each subsequent prop, serialize (against the current sm) and
+      -- emit OP_CAT to fold into the accumulator.
+      let foldStep
+          (acc : List StackOp × StackMap) (p : ANFProperty) :
+          List StackOp × StackMap :=
+        let (accOps, accSm) := acc
+        let (pOps, smP) := getStateScriptPropLive outerProtected accSm p
+        -- After OP_CAT: pops 2 anon entries (acc + conv) and pushes 1 (new acc).
+        let smCat := (smP.popN 2).push "_acc"
+        (accOps ++ pOps ++ [.opcode "OP_CAT"], smCat)
+      let (restOps, smRest) :=
+        rest.foldl (init := (firstOps, sm1)) foldStep
+      -- Rename top from `_conv` / `_acc` to `bindingName`.
+      let smFinal : StackMap :=
+        match smRest with
+        | _ :: tl => bindingName :: tl
+        | []      => [bindingName]
+      (restOps, smFinal)
+
+/-- Lowering for `add_output(satoshis, stateValues, preimage)`. Builds
+a full BIP-143 output serialization on the stack:
+
+  amount(8 LE) ++ varint(scriptLen) ++ codePart ++ OP_RETURN ++ stateBytes
+
+Mirrors `lowerAddOutput` in `05-stack-lower.ts:2362-2460`. -/
+def lowerAddOutputOps (sm : StackMap) (bindingName : String)
+    (satoshis : String) (stateValues : List String)
+    (props : List ANFProperty) : (List StackOp × StackMap) :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  let stateProps := props.filter (fun p => !p.readonly)
+  -- Step 1: bring _codePart to top (PICK — never consume).
+  let s1 := loadRef sm "_codePart"
+  -- Step 2: append OP_RETURN byte (0x6a).
+  let s2 : List StackOp :=
+    [.push (.bytes (ByteArray.mk #[0x6a])), opc "OP_CAT"]
+  -- Step 3: serialize each state value, paired with its property type.
+  --   For each (valueRef, prop): bring valueRef to top, type-convert,
+  --   then OP_CAT onto the accumulator.
+  let smAfterCodePart := sm.push bindingName
+  let rec go : List String → List ANFProperty → List StackOp
+    | [], _ => []
+    | _, [] => []
+    | v :: vs, p :: ps =>
+        let load := loadRef smAfterCodePart v
+        let conv : List StackOp :=
+          if propTypeIsNumeric p.type then
+            [push (Int.ofNat (propTypeFixedSize p.type)), opc "OP_NUM2BIN"]
+          else
+            []
+        load ++ conv ++ [opc "OP_CAT"] ++ go vs ps
+  let s3 := go stateValues stateProps
+  -- Step 4: compute varint prefix for the script length.
+  let s4 : List StackOp := [opc "OP_SIZE"] ++ varintEncodingOps
+  -- Step 5: prepend varint to script.
+  let s5 : List StackOp := [.swap, opc "OP_CAT"]
+  -- Step 6: prepend satoshis as 8-byte LE.
+  let s6Load := loadRef smAfterCodePart satoshis
+  let s6 : List StackOp :=
+    s6Load ++ [push 8, opc "OP_NUM2BIN", .swap, opc "OP_CAT"]
+  (s1 ++ s2 ++ s3 ++ s4 ++ s5 ++ s6, smAfterCodePart)
+
+/--
+Per-state-value serialize step inside `lowerAddOutputOps`. The TS
+reference brings each value to top with consume=isLast (`05-stack-
+lower.ts:2391-2422`); we mirror that with `bringToTop`. Each iteration
+consumes the value's stack slot, applies the type-aware width prefix,
+then OP_CATs onto the accumulator (which is below the value on the
+runtime stack but unnamed in the stack map — we model it with a
+single `_acc` placeholder pushed by the caller).
+
+(De-`private`d 2026-06-11 so the stateful-widening lowering reduction in
+`Stack/AgreesStateful.lean` can unfold it by name — no semantic change.)
+-/
+def addOutputStateValuesLive (currentIndex : Nat)
+    (lastUses : List (String × Nat)) (outerProtected : List String)
+    (allOperands : List String) :
+    StackMap → List String → List ANFProperty → (List StackOp × StackMap)
+  | sm, [], _ => ([], sm)
+  | sm, _, [] => ([], sm)
+  | sm, v :: vs, p :: ps =>
+      let opc (s : String) : StackOp := .opcode s
+      let push (n : Int) : StackOp := .push (.bigint n)
+      let (load, sm1) := loadRefOperand sm v allOperands currentIndex lastUses outerProtected
+      let conv : List StackOp :=
+        if propTypeIsNumeric p.type then
+          [push (Int.ofNat (propTypeFixedSize p.type)), opc "OP_NUM2BIN"]
+        else
+          []
+      -- After load: top is the value (named on sm1).
+      -- After conv (numeric): NUM2BIN pops 2 / pushes 1 → net 0 on sm,
+      -- but the TS `lowerAddOutput` calls `stackMap.push(null)` then pops
+      -- after NUM2BIN — net 0 anyway. We model the post-conv top as the
+      -- (anonymous) converted value: pop the named value, push anon.
+      let smAfterConv :=
+        if propTypeIsNumeric p.type then (sm1.popN 1).push "_conv" else sm1
+      -- After OP_CAT: pops 2 / pushes 1 (the new accumulator).
+      let smAfterCat := (smAfterConv.popN 2).push "_acc"
+      let (restOps, smRest) :=
+        addOutputStateValuesLive currentIndex lastUses outerProtected
+          allOperands smAfterCat vs ps
+      (load ++ conv ++ [opc "OP_CAT"] ++ restOps, smRest)
+
+/--
+Liveness-aware variant of `lowerAddOutputOps`. Mirrors TS
+`lowerAddOutput` (`05-stack-lower.ts:2362-2460`). Uses `bringToTop`
+with `consume=false` for `_codePart` (always copied — reused across
+outputs) and `consume=isLast` for state values + satoshis. Threads
+the stack map through all loads so depth shifts induced by consumed
+state values (typically the last use of post-update_prop names)
+propagate to subsequent loads.
+-/
+def lowerAddOutputOpsLive (sm : StackMap) (bindingName : String)
+    (satoshis : String) (stateValues : List String)
+    (props : List ANFProperty) (currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  let stateProps := props.filter (fun p => !p.readonly)
+  -- Full operand list (TS `outputOperands = [satoshis, ...stateValues]`)
+  -- for the repeated-operand consume gate.
+  let outputOperands : List String := satoshis :: stateValues
+  -- Step 1: bring _codePart to top (PICK — never consume, reused).
+  let (s1, sm1) := bringToTop sm "_codePart" false
+  -- Step 2: append OP_RETURN byte (0x6a). Push pops 0 / pushes 1, then
+  -- CAT pops 2 / pushes 1 → net +0 on sm.
+  let s2 : List StackOp :=
+    [.push (.bytes (ByteArray.mk #[0x6a])), opc "OP_CAT"]
+  -- After step 1 sm1 has `_codePart` on top (named); after step 2 the
+  -- top is the unnamed acc bytes. Pop+push anon to reflect that.
+  let smAcc := (sm1.popN 1).push "_acc"
+  -- Step 3: serialize each state value.
+  let (s3, sm3) :=
+    addOutputStateValuesLive currentIndex lastUses outerProtected
+      outputOperands smAcc stateValues stateProps
+  -- Step 4: compute varint prefix.
+  let s4 : List StackOp := [opc "OP_SIZE"] ++ varintEncodingOps
+  -- After s4: top is the unnamed varint slot.
+  let smAfterVarint := sm3.push "_varint"
+  -- Step 5: prepend varint via SWAP+CAT. Net pop 1.
+  let s5 : List StackOp := [.swap, opc "OP_CAT"]
+  let smAfterS5 := smAfterVarint.popN 1
+  -- Step 6: prepend satoshis as 8-byte LE.
+  let (s6Load, sm6) :=
+    loadRefOperand smAfterS5 satoshis outputOperands currentIndex lastUses outerProtected
+  let s6Ops : List StackOp :=
+    [push 8, opc "OP_NUM2BIN", .swap, opc "OP_CAT"]
+  -- The final SWAP+CAT pair fuses the satoshis slot with the varint+script
+  -- accumulator left on top after step 5 into a single output-bytes slot.
+  -- Pop BOTH (popN 2) before pushing bindingName — the earlier `popN 1`
+  -- form left the varint+script slot lingering at depth 1 and shifted
+  -- every subsequent PICK/ROLL/SWAP by +1.
+  let smFinal := (sm6.popN 2).push bindingName
+  (s1 ++ s2 ++ s3 ++ s4 ++ s5 ++ s6Load ++ s6Ops, smFinal)
+
+/-- Per-property field extractor for `deserializeState` (fixed-size,
+non-final case). Mirrors `splitFixedStateFields` middle-iteration in
+`05-stack-lower.ts:2849-2868`. Layout:
+
+  [..., remaining]
+  → push N, OP_SPLIT          [..., field, rest]
+  → OP_SWAP                   [..., rest, field]
+  → (if numeric) OP_BIN2NUM   [..., rest, field-as-num]
+  → OP_SWAP                   [..., field-as-num, rest]
+-/
+def deserializeFixedFieldNonFinal (prop : ANFProperty) : List StackOp :=
+  let opc (s : String) : StackOp := .opcode s
+  let size := propTypeFixedSize prop.type
+  let split : List StackOp :=
+    [.push (.bigint (Int.ofNat size)), opc "OP_SPLIT", .swap]
+  let conv : List StackOp :=
+    if propTypeIsNumeric prop.type then [opc "OP_BIN2NUM"] else []
+  split ++ conv ++ [.swap]
+
+/-- Final-property variant. Just type-converts; the remaining bytes
+ARE the field.
+-/
+def deserializeFixedFieldFinal (prop : ANFProperty) : List StackOp :=
+  if propTypeIsNumeric prop.type then [.opcode "OP_BIN2NUM"] else []
+
+/-- Lower the all-fixed-size case of `deserialize_state`. Iterates
+left-to-right, splitting each field and naming it on the stack map.
+Mirrors `splitFixedStateFields` in `05-stack-lower.ts:2837-2877`. -/
+def splitFixedStateFieldsOps : List ANFProperty → List StackOp
+  | []      => []
+  | [p]     => deserializeFixedFieldFinal p
+  | p :: ps => deserializeFixedFieldNonFinal p ++ splitFixedStateFieldsOps ps
+
+/-! ### Variable-length deserializeState helpers (Phase 3z-I)
+
+The TS reference (`05-stack-lower.ts:2628-2828`) handles ByteString
+state fields by parsing the BIP-143 scriptCode varint at runtime,
+locating the state region via `_codePart` + `push_codesep_index`, and
+decoding each ByteString as a Bitcoin push-data prefix. The helpers
+below are pure op-list builders mirroring those byte-for-byte.
+-/
+
+/-- Strip BIP-143 scriptCode varint prefix (1/3/5/9-byte). On entry the
+top of stack is `varint || scriptCode`; on exit it is `scriptCode`.
+Mirrors TS `05-stack-lower.ts:2643-2730`. -/
+def varintStripOps : List StackOp :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  let dropMore (n : Int) : List StackOp :=
+    [push n, opc "OP_SPLIT", .nip]
+  -- Split first byte, swap so [..., rest, fb], pad+BIN2NUM
+  [push 1, opc "OP_SPLIT", .swap,
+   .push (.bytes (ByteArray.mk #[0x00])), opc "OP_CAT", opc "OP_BIN2NUM"]
+  -- Outer IF: fb < 253 → 1-byte (drop fb)
+  ++ [.dup, push 253, opc "OP_LESSTHAN", opc "OP_IF", .drop, opc "OP_ELSE"]
+  -- Middle IF: fb == 254 → 5-byte (drop fb, then 4 more)
+  ++ [.dup, push 254, opc "OP_NUMEQUAL", opc "OP_IF", .drop]
+  ++ dropMore 4
+  ++ [opc "OP_ELSE"]
+  -- Inner IF: fb == 255 → 9-byte (drop fb, then 8 more)
+  ++ [.dup, push 255, opc "OP_NUMEQUAL", opc "OP_IF", .drop]
+  ++ dropMore 8
+  ++ [opc "OP_ELSE"]
+  -- Else: fb == 253 → 3-byte (drop fb, then 2 more)
+  ++ [.drop]
+  ++ dropMore 2
+  ++ [opc "OP_ENDIF", opc "OP_ENDIF", opc "OP_ENDIF"]
+
+/-- Push-data prefix decode. On entry stack is `[..., bytes]`; on exit
+`[..., data, remaining]`. Mirrors TS `emitPushDataDecode`
+(`05-stack-lower.ts:687-790`). -/
+def pushDataDecodeOps : List StackOp :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  -- Split first byte and convert to num: [..., rest, fb_num]
+  [push 1, opc "OP_SPLIT", .swap, opc "OP_BIN2NUM"]
+  -- Outer IF: fb < 76 → fb IS the length (OP_SPLIT directly)
+  ++ [.dup, push 76, opc "OP_LESSTHAN", opc "OP_IF", opc "OP_SPLIT", opc "OP_ELSE"]
+  -- Middle IF: fb == 77 → 2-byte LE length
+  ++ [.dup, push 77, opc "OP_NUMEQUAL", opc "OP_IF",
+      .drop, push 2, opc "OP_SPLIT", .swap, opc "OP_BIN2NUM", opc "OP_SPLIT",
+      opc "OP_ELSE"]
+  -- Else: fb == 76 → 1-byte length
+  ++ [.drop, push 1, opc "OP_SPLIT", .swap, opc "OP_BIN2NUM", opc "OP_SPLIT"]
+  ++ [opc "OP_ENDIF", opc "OP_ENDIF"]
+
+/-- Per-property decoder for variable-length state, non-final case.
+Mirrors TS `05-stack-lower.ts:2782-2812`. On entry top is
+`remaining_state`; on exit top is the new `remaining_state` and the
+property value lives at depth 1. -/
+def deserializeVarFieldNonFinal (prop : ANFProperty) : List StackOp :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  match prop.type with
+  | .byteString =>
+      -- pushDataDecode: [..., remaining] → [..., data, rest]
+      pushDataDecodeOps
+  | _ =>
+      -- fixed-size: split, swap to bring field on top, optional BIN2NUM, swap back
+      let size := propTypeFixedSize prop.type
+      let conv : List StackOp :=
+        if propTypeIsNumeric prop.type then [opc "OP_BIN2NUM"] else []
+      [push (Int.ofNat size), opc "OP_SPLIT", .swap]
+        ++ conv
+        ++ [.swap]
+
+/-- Per-property decoder for variable-length state, final case.
+Mirrors TS `05-stack-lower.ts:2814-2825`. On entry top is the entire
+remaining state; on exit top is the property value (drop trailing
+empty for ByteString, BIN2NUM for numeric). -/
+def deserializeVarFieldFinal (prop : ANFProperty) : List StackOp :=
+  let opc (s : String) : StackOp := .opcode s
+  match prop.type with
+  | .byteString =>
+      -- pushDataDecode then drop the trailing empty remainder.
+      pushDataDecodeOps ++ [.drop]
+  | _ =>
+      if propTypeIsNumeric prop.type then [opc "OP_BIN2NUM"] else []
+
+/-- Per-property loop (variable-length path). Iterates left-to-right
+and emits the appropriate decoder for each. Last property uses the
+"final" form. -/
+def deserializeVarFields : List ANFProperty → List StackOp
+  | []      => []
+  | [p]     => deserializeVarFieldFinal p
+  | p :: ps => deserializeVarFieldNonFinal p ++ deserializeVarFields ps
+
+/-- Lowering for `deserialize_state(preimage)`. Extracts the mutable
+state bytes from the BIP-143 preimage's scriptCode field and unpacks
+them into individual property values on the stack.
+
+Handles both the all-fixed-size path and the variable-length path
+(when ByteString state fields are present). The variable-length path
+uses `_codePart` and `push_codesep_index` to locate the state region
+inside the scriptCode at runtime.
+
+Mirrors `lowerDeserializeState` in `05-stack-lower.ts:2523-2831`. -/
+def lowerDeserializeStateOps (sm : StackMap) (preimage : String)
+    (props : List ANFProperty) : (List StackOp × StackMap) :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  let stateProps := props.filter (fun p => !p.readonly)
+  match stateProps with
+  | [] =>
+      -- No state — emit no ops, leave sm unchanged.
+      ([], sm)
+  | _ =>
+    -- Bring preimage to top.
+    let s0 := loadRef sm preimage
+    -- 1. Skip first 104 bytes (header), drop prefix via OP_NIP.
+    let s1 : List StackOp := [push 104, opc "OP_SPLIT", .nip]
+    -- 2. Drop tail 44 bytes (nSeq + hashOutputs + nLocktime + sighashType).
+    let s2 : List StackOp :=
+      [opc "OP_SIZE", push 44, opc "OP_SUB", opc "OP_SPLIT", .drop]
+    -- 3. Drop amount (last 8 bytes).
+    let s3 : List StackOp :=
+      [opc "OP_SIZE", push 8, opc "OP_SUB", opc "OP_SPLIT", .drop]
+    let allFixed := stateProps.all (fun p => p.type ≠ .byteString)
+    if allFixed then
+      -- 4. Extract last stateLen bytes (skip varint+codePart+OP_RETURN prefix).
+      let stateLen : Nat := stateProps.foldl (fun acc p => acc + propTypeFixedSize p.type) 0
+      let s4 : List StackOp :=
+        [opc "OP_SIZE", push (Int.ofNat stateLen), opc "OP_SUB", opc "OP_SPLIT", .nip]
+      -- 5. Split state bytes into individual property values, naming each.
+      let s5 := splitFixedStateFieldsOps stateProps
+      -- Stack-map updates: each property is pushed (named) onto the map.
+      let smAfter : StackMap :=
+        stateProps.foldl (fun m p => m.push p.name) sm
+      (s0 ++ s1 ++ s2 ++ s3 ++ s4 ++ s5, smAfter)
+    else
+      -- Variable-length path requires `_codePart` to be live; if it isn't,
+      -- the body cannot reconstruct the state region — emit a single
+      -- OP_DROP to discard the leftover varint+scriptCode and skip
+      -- deserialization entirely (mirrors TS line 2622-2627).
+      match sm.depth? "_codePart" with
+      | none =>
+          (s0 ++ s1 ++ s2 ++ s3 ++ [.drop], sm)
+      | some _ =>
+          -- 4a. Strip BIP-143 varint prefix.
+          let sVar := varintStripOps
+          -- 4b. PICK _codePart, OP_SIZE, OP_NIP (drop _codePart, keep size).
+          let sCode := loadRef sm "_codePart"
+                    ++ [opc "OP_SIZE", .nip,
+                        .pushCodesepIndex,
+                        opc "OP_SUB",
+                        opc "OP_SPLIT", .nip]
+          -- 5. Per-property var-field decode.
+          let sFields := deserializeVarFields stateProps
+          -- Stack-map updates: each property is pushed (named) onto the map.
+          let smAfter : StackMap :=
+            stateProps.foldl (fun m p => m.push p.name) sm
+          (s0 ++ s1 ++ s2 ++ s3 ++ sVar ++ sCode ++ sFields, smAfter)
+
+/--
+Liveness-aware variant of `lowerDeserializeStateOps`. Mirrors TS
+`lowerDeserializeState` (`05-stack-lower.ts:2523-2831`) including the
+`bringToTop(preimage, isLast)` semantics: when `preimage` is at depth
+0 and used for the last time the deserialization runs in-place
+(consuming the preimage slot rather than DUP-ing it), so the post-
+deserialize stack does not gain an extra slot. The state values
+replace the original preimage slot at depth 0.
+-/
+def lowerDeserializeStateOpsLive (sm : StackMap) (preimage : String)
+    (props : List ANFProperty) (currentIndex : Nat)
+    (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let opc (s : String) : StackOp := .opcode s
+  let push (n : Int) : StackOp := .push (.bigint n)
+  let stateProps := props.filter (fun p => !p.readonly)
+  match stateProps with
+  | [] =>
+      ([], sm)
+  | _ =>
+    -- Bring preimage to top, consuming on last use.
+    let (s0, sm1) := loadRefLive sm preimage currentIndex lastUses outerProtected
+    -- 1. Skip first 104 bytes (header), drop prefix via OP_NIP.
+    let s1 : List StackOp := [push 104, opc "OP_SPLIT", .nip]
+    -- 2. Drop tail 44 bytes (nSeq + hashOutputs + nLocktime + sighashType).
+    let s2 : List StackOp :=
+      [opc "OP_SIZE", push 44, opc "OP_SUB", opc "OP_SPLIT", .drop]
+    -- 3. Drop amount (last 8 bytes).
+    let s3 : List StackOp :=
+      [opc "OP_SIZE", push 8, opc "OP_SUB", opc "OP_SPLIT", .drop]
+    let allFixed := stateProps.all (fun p => p.type ≠ .byteString)
+    if allFixed then
+      -- 4. Extract last stateLen bytes.
+      let stateLen : Nat :=
+        stateProps.foldl (fun acc p => acc + propTypeFixedSize p.type) 0
+      let s4 : List StackOp :=
+        [opc "OP_SIZE", push (Int.ofNat stateLen), opc "OP_SUB",
+         opc "OP_SPLIT", .nip]
+      -- 5. Split state bytes into individual property values, naming each.
+      let s5 := splitFixedStateFieldsOps stateProps
+      let smPostLoad := sm1.popN 1
+      let smAfter : StackMap :=
+        stateProps.foldl (fun m p => m.push p.name) smPostLoad
+      (s0 ++ s1 ++ s2 ++ s3 ++ s4 ++ s5, smAfter)
+    else
+      -- Variable-length path: needs `_codePart` to be live; if it isn't,
+      -- discard the leftover varint+scriptCode and skip state decoding
+      -- (mirrors TS line 2622-2627).
+      match sm.depth? "_codePart" with
+      | none =>
+          let smPostLoad := sm1.popN 1
+          (s0 ++ s1 ++ s2 ++ s3 ++ [.drop], smPostLoad)
+      | some _ =>
+          -- 4a. Strip BIP-143 varint prefix.
+          let sVar := varintStripOps
+          -- 4b. PICK _codePart, OP_SIZE, OP_NIP, push_codesep_index, OP_SUB,
+          -- OP_SPLIT, OP_NIP — extracts state bytes from scriptCode.
+          let sCode := loadRef sm1 "_codePart"
+                    ++ [opc "OP_SIZE", .nip,
+                        .pushCodesepIndex,
+                        opc "OP_SUB",
+                        opc "OP_SPLIT", .nip]
+          -- 5. Per-property var-field decode.
+          let sFields := deserializeVarFields stateProps
+          let smPostLoad := sm1.popN 1
+          let smAfter : StackMap :=
+            stateProps.foldl (fun m p => m.push p.name) smPostLoad
+          (s0 ++ s1 ++ s2 ++ s3 ++ sVar ++ sCode ++ sFields, smAfter)
+
+/-! ## `update_prop` cleanup helper (Phase 3z-C)
+
+After `lowerUpdateProp` brings the new value to top and renames it to
+`propName`, the OLD entry for `propName` (if any) lives somewhere
+below. The TS reference (`05-stack-lower.ts:2005-2024`) walks depths
+1..(depth-1) and removes the FIRST matching entry it finds, breaking
+out as soon as one is removed.
+
+Mirrors the dispatch:
+* `d = 1`  → emit `OP_NIP`, drop the `rest[0]` entry.
+* `d ≥ 2`  → emit `[push d, roll d+1, drop]`. The literal `push d`
+  consumes one extra slot, then `roll d+1` brings the prop entry
+  (now at depth d+1) to top, and `drop` removes it.
+
+Recurses on the depth index `d` and the tail of the stackmap, so it
+terminates on the length of `rest`.
+-/
+
+/-- Internal: scan `tail` for `propName` starting at depth `d` (1-indexed
+from the top of the renamed stackmap). Returns the cleanup ops and the
+updated tail.
+
+For `d ≥ 2` we mirror the TS reference (`05-stack-lower.ts:2012-2019`)
+which emits a *single* push of the depth `d`, immediately followed by a
+bare `OP_ROLL` opcode (the `roll` StackOp's `depth` field there is
+*metadata* — the encoder strips it; see `06-emit.ts:467-469`). The Lean
+encoder bundles `push d` *into* `.roll d` (`Script/Emit.lean:176`), so
+emitting `[push d, .roll (d + 1)]` would double-push the depth literal
+(producing the spurious `OP_2 OP_3 OP_ROLL` prefix observed in the
+auction / add-raw-output / cross-covenant fixtures pre-Phase 3z-G). We
+emit `[.push d, .opcode "OP_ROLL", .drop]` to match TS byte-for-byte. -/
+def removePropEntryAux (propName : String) :
+    Nat → List String → (List StackOp × List String)
+  | _,  []        => ([], [])
+  | d,  x :: xs   =>
+      if x = propName then
+        if d = 1 then
+          ([.nip], xs)
+        else
+          ([.push (.bigint (Int.ofNat d)), .opcode "OP_ROLL", .drop], xs)
+      else
+        let (ops, xs') := removePropEntryAux propName (d + 1) xs
+        (ops, x :: xs')
+
+/-- Top-level helper: takes the stackmap *after* the rename (top =
+`propName`), produces the cleanup ops + updated stackmap. The new
+top entry is preserved; only the deeper duplicate (if any) is
+removed. -/
+def removePropEntryOps (sm : StackMap) (propName : String) :
+    (List StackOp × StackMap) :=
+  match sm with
+  | []        => ([], [])
+  | top :: rest =>
+      let (ops, rest') := removePropEntryAux propName 1 rest
+      (ops, top :: rest')
+
+/-! ## SHA-256 partial-block codegen (Phase 4-D)
+
+Mirrors the TypeScript reference at
+`packages/runar-compiler/src/passes/sha256-codegen.ts`. The TS reference
+implements `sha256Compress(state, block)` (one-block compression, no
+padding) and `sha256Finalize(state, remaining, msgBitLen)` (padding +
+1-or-2-block compression behind an OP_IF/OP_ELSE branch).
+
+The TS `Emitter` tracks main- and alt-stack depth at codegen time,
+emitting `pushI(BigInt(d))` + a `pick`/`roll` op pair for non-trivial
+depths. Lean's `StackOp.pick d` / `StackOp.roll d` already encode the
+depth-push during the `Emit` pass, so a single Lean StackOp corresponds
+to a TS `pushI` + `pick` pair. Depth tracking in Lean is therefore not
+needed inside these helpers — the bodies are pure StackOp lists.
+
+The codegen produces byte-identical output to the TS reference. The
+sub-helpers (`sha_*`) follow the TS naming and structure 1:1; readers
+should consult `sha256-codegen.ts` for high-level semantics. -/
+
+/-- TS `oc(code)` — single opcode StackOp. -/
+@[inline] private def shaOpc (s : String) : StackOp := .opcode s
+/-- TS `pushI(BigInt n)` — single bigint push. -/
+@[inline] private def shaPushI (n : Int) : StackOp := .push (.bigint n)
+/-- TS `pushB(u32ToLE n)` — encode 32-bit `n` as 4 LE bytes and push.
+The cast `n.toUInt32` truncates to 32 bits (matching JS bitwise ops). -/
+@[inline] private def shaPushU32LE (n : UInt32) : StackOp :=
+  let b0 : UInt8 := (n &&& 0xff).toUInt8
+  let b1 : UInt8 := ((n >>> 8) &&& 0xff).toUInt8
+  let b2 : UInt8 := ((n >>> 16) &&& 0xff).toUInt8
+  let b3 : UInt8 := ((n >>> 24) &&& 0xff).toUInt8
+  .push (.bytes (ByteArray.mk #[b0, b1, b2, b3]))
+
+/-- Emit `pick(d)` per TS Emitter: 0 → dup, 1 → over, else `pickStruct d`.
+The TS reference does NOT push a separate depth before its `pick` opcode
+at the StackOp layer (the depth becomes a byte-level push inside `Emit`),
+so we use `pickStruct` (no-pop) for byte parity. -/
+@[inline] private def shaPick (d : Nat) : List StackOp :=
+  match d with
+  | 0     => [.dup]
+  | 1     => [.over]
+  | n + 2 => [.pickStruct (n + 2)]
+
+/-- Emit `roll(d)` per TS Emitter: 0 → [], 1 → swap, 2 → rot, else `roll d`. -/
+@[inline] private def shaRoll (d : Nat) : List StackOp :=
+  match d with
+  | 0     => []
+  | 1     => [.swap]
+  | 2     => [.rot]
+  | n + 3 => [.roll (n + 3)]
+
+/-- Reverse 4 bytes on TOS (LE↔BE conversion). 12 ops. Mirrors
+TS `Emitter.reverseBytes4`. -/
+private def shaReverseBytes4 : List StackOp :=
+  [ shaPushI 1, shaOpc "OP_SPLIT"
+  , shaPushI 1, shaOpc "OP_SPLIT"
+  , shaPushI 1, shaOpc "OP_SPLIT"
+  , .swap, shaOpc "OP_CAT"
+  , .swap, shaOpc "OP_CAT"
+  , .swap, shaOpc "OP_CAT" ]
+
+/-- LE → numeric. 3 ops. -/
+private def shaLe2Num : List StackOp :=
+  [ .push (.bytes (ByteArray.mk #[0x00]))
+  , shaOpc "OP_CAT"
+  , shaOpc "OP_BIN2NUM" ]
+
+/-- numeric → 4-byte LE. 5 ops. -/
+private def shaNum2Le : List StackOp :=
+  [ shaPushI 5, shaOpc "OP_NUM2BIN"
+  , shaPushI 4, shaOpc "OP_SPLIT", .drop ]
+
+/-- ROTR(x, n) on a 4-byte BE value. 7 ops. -/
+private def shaRotrBE (n : Nat) : List StackOp :=
+  [ .dup
+  , shaPushI (Int.ofNat n), shaOpc "OP_RSHIFT"
+  , .swap
+  , shaPushI (Int.ofNat (32 - n)), shaOpc "OP_LSHIFT"
+  , shaOpc "OP_OR" ]
+
+/-- SHR(x, n) on a 4-byte BE value. 2 ops. -/
+private def shaShrBE (n : Nat) : List StackOp :=
+  [ shaPushI (Int.ofNat n), shaOpc "OP_RSHIFT" ]
+
+/-- 32-bit add on LE values. Net: -1. 13 ops. -/
+private def shaAdd32 : List StackOp :=
+  shaLe2Num ++ [.swap] ++ shaLe2Num ++ [shaOpc "OP_ADD"] ++ shaNum2Le
+
+/-- Add N LE values: top N are converted, summed, packed back. -/
+private def shaAddNAux : Nat → List StackOp
+  | 0     => []
+  | n + 1 => [.swap] ++ shaLe2Num ++ [shaOpc "OP_ADD"] ++ shaAddNAux n
+
+private def shaAddN (n : Nat) : List StackOp :=
+  if n < 2 then []
+  else shaLe2Num ++ shaAddNAux (n - 1) ++ shaNum2Le
+
+/-- TS `bigSigma0` Σ0(a) = ROTR(2)^ROTR(13)^ROTR(22). [a(LE)] → [Σ0(LE)]. -/
+private def shaBigSigma0 : List StackOp :=
+  shaReverseBytes4
+  ++ [.dup, .dup]
+  ++ shaRotrBE 2 ++ [.swap] ++ shaRotrBE 13
+  ++ [shaOpc "OP_XOR"]
+  ++ [.swap] ++ shaRotrBE 22
+  ++ [shaOpc "OP_XOR"]
+  ++ shaReverseBytes4
+
+/-- TS `bigSigma1` Σ1(e) = ROTR(6)^ROTR(11)^ROTR(25). -/
+private def shaBigSigma1 : List StackOp :=
+  shaReverseBytes4
+  ++ [.dup, .dup]
+  ++ shaRotrBE 6 ++ [.swap] ++ shaRotrBE 11
+  ++ [shaOpc "OP_XOR"]
+  ++ [.swap] ++ shaRotrBE 25
+  ++ [shaOpc "OP_XOR"]
+  ++ shaReverseBytes4
+
+/-- TS `smallSigma0` σ0(x) = ROTR(7)^ROTR(18)^SHR(3). -/
+private def shaSmallSigma0 : List StackOp :=
+  shaReverseBytes4
+  ++ [.dup, .dup]
+  ++ shaRotrBE 7 ++ [.swap] ++ shaRotrBE 18
+  ++ [shaOpc "OP_XOR"]
+  ++ [.swap] ++ shaShrBE 3
+  ++ [shaOpc "OP_XOR"]
+  ++ shaReverseBytes4
+
+/-- TS `smallSigma1` σ1(x) = ROTR(17)^ROTR(19)^SHR(10). -/
+private def shaSmallSigma1 : List StackOp :=
+  shaReverseBytes4
+  ++ [.dup, .dup]
+  ++ shaRotrBE 17 ++ [.swap] ++ shaRotrBE 19
+  ++ [shaOpc "OP_XOR"]
+  ++ [.swap] ++ shaShrBE 10
+  ++ [shaOpc "OP_XOR"]
+  ++ shaReverseBytes4
+
+/-- TS `ch` Ch(e,f,g) = (e&f)^(~e&g). [e, f, g] (g=TOS) → [Ch(LE)]. Net: -2. -/
+private def shaCh : List StackOp :=
+  [ .rot, .dup, shaOpc "OP_INVERT", .rot
+  , shaOpc "OP_AND", shaOpc "OP_TOALTSTACK"
+  , shaOpc "OP_AND", shaOpc "OP_FROMALTSTACK"
+  , shaOpc "OP_XOR" ]
+
+/-- TS `maj` Maj(a,b,c) = (a&b)|(c&(a^b)). [a, b, c] (c=TOS) → [Maj(LE)]. Net: -2. -/
+private def shaMaj : List StackOp :=
+  [ shaOpc "OP_TOALTSTACK", shaOpc "OP_2DUP"
+  , shaOpc "OP_AND", shaOpc "OP_TOALTSTACK"
+  , shaOpc "OP_XOR", shaOpc "OP_FROMALTSTACK"
+  , .swap, shaOpc "OP_FROMALTSTACK"
+  , shaOpc "OP_AND", shaOpc "OP_OR" ]
+
+/-- N-fold concat helper for `beWordsToLE` — emit N×(reverseBytes4 ++ TOALT)
+followed by N×FROMALT. Order-preserving alt round-trip. -/
+private def shaBeWordsToLEAux1 : Nat → List StackOp
+  | 0     => []
+  | n + 1 => shaReverseBytes4 ++ [shaOpc "OP_TOALTSTACK"] ++ shaBeWordsToLEAux1 n
+
+private def shaBeWordsToLEAux2 : Nat → List StackOp
+  | 0     => []
+  | n + 1 => [shaOpc "OP_FROMALTSTACK"] ++ shaBeWordsToLEAux2 n
+
+private def shaBeWordsToLE (n : Nat) : List StackOp :=
+  shaBeWordsToLEAux1 n ++ shaBeWordsToLEAux2 n
+
+/-- Convert 8 BE words to LE AND reverse order. TS `beWordsToLEReversed8`.
+For i = 7 .. 0: roll i, reverseBytes4, TOALT. Then 8× FROMALT. -/
+private def shaBeWordsToLEReversed8Phase1 : Nat → List StackOp
+  | 0     => shaRoll 0 ++ shaReverseBytes4 ++ [shaOpc "OP_TOALTSTACK"]
+  | n + 1 =>
+      shaBeWordsToLEReversed8Phase1 n ++
+      shaRoll (n + 1) ++ shaReverseBytes4 ++ [shaOpc "OP_TOALTSTACK"]
+
+-- Note: TS iterates `for i = 7; i >= 0; i--`. So order is roll(7), roll(6), ..., roll(0).
+-- Our recursive Aux1 above iterates `0 .. n` which gives the *reverse* order — wrong.
+-- Define the correct recursion: take the count `n+1` and emit roll(n), then count down.
+
+/-- Phase 1 (correct order): roll(7), roll(6), ..., roll(0). -/
+private def shaBeWordsToLEReversed8P1 : Nat → List StackOp
+  | 0     => shaRoll 0 ++ shaReverseBytes4 ++ [shaOpc "OP_TOALTSTACK"]
+  | n + 1 =>
+      shaRoll (n + 1) ++ shaReverseBytes4 ++ [shaOpc "OP_TOALTSTACK"] ++
+      shaBeWordsToLEReversed8P1 n
+
+private def shaBeWordsToLEReversed8 : List StackOp :=
+  shaBeWordsToLEReversed8P1 7 ++ shaBeWordsToLEAux2 8
+
+/-- SHA-256 round constant K[t] for t < 64. Values match FIPS 180-4. -/
+private def shaK : Nat → UInt32
+  | 0  => 0x428a2f98 | 1  => 0x71374491 | 2  => 0xb5c0fbcf | 3  => 0xe9b5dba5
+  | 4  => 0x3956c25b | 5  => 0x59f111f1 | 6  => 0x923f82a4 | 7  => 0xab1c5ed5
+  | 8  => 0xd807aa98 | 9  => 0x12835b01 | 10 => 0x243185be | 11 => 0x550c7dc3
+  | 12 => 0x72be5d74 | 13 => 0x80deb1fe | 14 => 0x9bdc06a7 | 15 => 0xc19bf174
+  | 16 => 0xe49b69c1 | 17 => 0xefbe4786 | 18 => 0x0fc19dc6 | 19 => 0x240ca1cc
+  | 20 => 0x2de92c6f | 21 => 0x4a7484aa | 22 => 0x5cb0a9dc | 23 => 0x76f988da
+  | 24 => 0x983e5152 | 25 => 0xa831c66d | 26 => 0xb00327c8 | 27 => 0xbf597fc7
+  | 28 => 0xc6e00bf3 | 29 => 0xd5a79147 | 30 => 0x06ca6351 | 31 => 0x14292967
+  | 32 => 0x27b70a85 | 33 => 0x2e1b2138 | 34 => 0x4d2c6dfc | 35 => 0x53380d13
+  | 36 => 0x650a7354 | 37 => 0x766a0abb | 38 => 0x81c2c92e | 39 => 0x92722c85
+  | 40 => 0xa2bfe8a1 | 41 => 0xa81a664b | 42 => 0xc24b8b70 | 43 => 0xc76c51a3
+  | 44 => 0xd192e819 | 45 => 0xd6990624 | 46 => 0xf40e3585 | 47 => 0x106aa070
+  | 48 => 0x19a4c116 | 49 => 0x1e376c08 | 50 => 0x2748774c | 51 => 0x34b0bcb5
+  | 52 => 0x391c0cb3 | 53 => 0x4ed8aa4a | 54 => 0x5b9cca4f | 55 => 0x682e6ff3
+  | 56 => 0x748f82ee | 57 => 0x78a5636f | 58 => 0x84c87814 | 59 => 0x8cc70208
+  | 60 => 0x90befffa | 61 => 0xa4506ceb | 62 => 0xbef9a3f7 | 63 => 0xc67178f2
+  | _  => 0
+
+/-- One SHA-256 compression round at index `t`. Stack: [W0..W63, a..h] (a=TOS).
+Net: 0. Mirrors TS `emitRound` (`sha256-codegen.ts:314-365`). -/
+private def shaEmitRound (t : Nat) : List StackOp :=
+  -- T1 = Σ1(e) + Ch(e,f,g) + h + K[t] + W[t]
+  shaPick 4 ++ shaBigSigma1
+  ++ shaPick 5 ++ shaPick 7 ++ shaPick 9 ++ shaCh
+  ++ shaPick 9
+  ++ [shaPushU32LE (shaK t)]
+  ++ shaPick (75 - t)
+  ++ shaAddN 5
+  -- T2 = Σ0(a) + Maj(a,b,c); first save a copy of T1 to alt
+  ++ [.dup, shaOpc "OP_TOALTSTACK"]
+  ++ shaPick 1 ++ shaBigSigma0
+  ++ shaPick 2 ++ shaPick 4 ++ shaPick 6 ++ shaMaj
+  ++ shaAdd32
+  -- new_a = T1 + T2; pull T1 back from alt
+  ++ [shaOpc "OP_FROMALTSTACK"]
+  ++ [.swap] ++ shaAdd32
+  -- new_e = d + T1
+  ++ [.swap] ++ shaRoll 5 ++ shaAdd32
+  -- drop h
+  ++ shaRoll 8 ++ [.drop]
+  -- rotate: [ne,na,a,b,c,e,f,g] → [na,a,b,c,ne,e,f,g]
+  ++ [.swap] ++ shaRoll 4 ++ shaRoll 4 ++ shaRoll 4 ++ shaRoll 3
+
+/-- Unroll W expansion: for t = 16..63 emit
+    over;σ1; pick(7); pick(16);σ0; pick(18); addN(4) -/
+private def shaWExpand : Nat → List StackOp
+  | 0     => []   -- t = 16: handled in helper below
+  | _     => []
+
+private def shaWExpandFromTo (t : Nat) (count : Nat) : List StackOp :=
+  match count with
+  | 0     => []
+  | n + 1 =>
+      ([.over] ++ shaSmallSigma1
+        ++ shaPick (6 + 1)
+        ++ shaPick (14 + 2) ++ shaSmallSigma0
+        ++ shaPick (15 + 3)
+        ++ shaAddN 4)
+      ++ shaWExpandFromTo (t + 1) n
+
+/-- Unrolled SHA-256 round loop t = 0..63. -/
+private def shaRoundsFromTo (t : Nat) (count : Nat) : List StackOp :=
+  match count with
+  | 0     => []
+  | n + 1 => shaEmitRound t ++ shaRoundsFromTo (t + 1) n
+
+/-- Final-add helper: 8 iterations of (roll(8-i); add32; TOALT) for i = 0..7. -/
+private def shaFinalAdd (i : Nat) : List StackOp :=
+  match i with
+  | 0     => shaRoll 8 ++ shaAdd32 ++ [shaOpc "OP_TOALTSTACK"]
+  | n + 1 =>
+      shaRoll (8 - (n + 1)) ++ shaAdd32 ++ [shaOpc "OP_TOALTSTACK"]
+      ++ shaFinalAdd n
+
+private def shaFinalAddSeq : List StackOp :=
+  -- TS: for (let i = 0; i < 8; i++) { roll(8-i); add32; TOALT; }
+  -- Indices: i=0..7 ⇒ rolls 8,7,6,5,4,3,2,1.
+  let mk (i : Nat) := shaRoll (8 - i) ++ shaAdd32 ++ [shaOpc "OP_TOALTSTACK"]
+  mk 0 ++ mk 1 ++ mk 2 ++ mk 3 ++ mk 4 ++ mk 5 ++ mk 6 ++ mk 7
+
+/-- Final pack helper: for i = 1..7 emit FROMALT, reverseBytes4, swap, OP_CAT. -/
+private def shaFinalPack : Nat → List StackOp
+  | 0     => []
+  | n + 1 =>
+      [shaOpc "OP_FROMALTSTACK"] ++ shaReverseBytes4 ++ [.swap, shaOpc "OP_CAT"]
+      ++ shaFinalPack n
+
+/-- Drop 64 leftover items from the W array: 64×(swap; drop). -/
+private def shaDropN : Nat → List StackOp
+  | 0     => []
+  | n + 1 => [.swap, .drop] ++ shaDropN n
+
+/-- Repeat `split4` (push 4; OP_SPLIT) `n` times. -/
+private def shaSplit4N : Nat → List StackOp
+  | 0     => []
+  | n + 1 => [shaPushI 4, shaOpc "OP_SPLIT"] ++ shaSplit4N n
+
+/-- Full SHA-256 compression op list. Stack on entry: [..., state(32 BE), block(64 BE)].
+Stack on exit: [..., newState(32 BE)]. Mirrors TS `generateCompressOps`. -/
+private def shaCompressOps : List StackOp :=
+  -- Phase 1: save initial state to alt, unpack block to 16 LE words
+  [.swap, .dup, shaOpc "OP_TOALTSTACK", shaOpc "OP_TOALTSTACK"]
+  ++ shaSplit4N 15
+  ++ shaBeWordsToLE 16
+  -- Phase 2: W expansion (t = 16..63 ⇒ 48 iterations)
+  ++ shaWExpandFromTo 16 48
+  -- Phase 3: unpack state into 8 LE working vars
+  ++ [shaOpc "OP_FROMALTSTACK"]
+  ++ shaSplit4N 7
+  ++ shaBeWordsToLEReversed8
+  -- Phase 4: 64 compression rounds
+  ++ shaRoundsFromTo 0 64
+  -- Phase 5: add initial state, pack result
+  ++ [shaOpc "OP_FROMALTSTACK"]
+  ++ shaSplit4N 7
+  ++ shaBeWordsToLEReversed8
+  ++ shaFinalAddSeq
+  -- pack: pull from alt, reverse, build result
+  ++ [shaOpc "OP_FROMALTSTACK"]
+  ++ shaReverseBytes4
+  ++ shaFinalPack 7
+  -- drop the 64 W slots remaining below the result
+  ++ shaDropN 64
+
+/-- TS `emitSha256Compress` entry point. -/
+private def shaEmitCompress : List StackOp := shaCompressOps
+
+/-- TS `emitSha256Finalize` op list. Stack on entry:
+[..., state(32 BE), remaining(var len), msgBitLen(bigint)].
+Stack on exit: [..., hash(32 BE)]. Mirrors TS `emitSha256Finalize`. -/
+private def shaEmitFinalize : List StackOp :=
+  -- Step 1: convert msgBitLen → 8-byte BE; save to alt
+  [ shaPushI 9, shaOpc "OP_NUM2BIN"
+  , shaPushI 8, shaOpc "OP_SPLIT", .drop
+  , shaPushI 4, shaOpc "OP_SPLIT" ]
+  ++ shaReverseBytes4
+  ++ [.swap]
+  ++ shaReverseBytes4
+  ++ [ shaOpc "OP_CAT", shaOpc "OP_TOALTSTACK" ]
+  -- Step 2: pad remaining with 0x80
+  ++ [ .push (.bytes (ByteArray.mk #[0x80])), shaOpc "OP_CAT" ]
+  -- Get padded length
+  ++ [ shaOpc "OP_SIZE" ]
+  -- Branch on paddedLen < 57
+  ++ [ .dup, shaPushI 57, shaOpc "OP_LESSTHAN" ]
+  ++ [ shaOpc "OP_IF" ]
+  -- 1-block path: pad to 56 bytes
+  ++ [ shaPushI 56, .swap, shaOpc "OP_SUB"
+     , shaPushI 0, .swap, shaOpc "OP_NUM2BIN"
+     , shaOpc "OP_CAT"
+     , shaOpc "OP_FROMALTSTACK", shaOpc "OP_CAT" ]
+  ++ shaCompressOps
+  ++ [ shaOpc "OP_ELSE" ]
+  -- 2-block path: pad to 120 bytes
+  ++ [ shaPushI 120, .swap, shaOpc "OP_SUB"
+     , shaPushI 0, .swap, shaOpc "OP_NUM2BIN"
+     , shaOpc "OP_CAT"
+     , shaOpc "OP_FROMALTSTACK", shaOpc "OP_CAT"
+     , shaPushI 64, shaOpc "OP_SPLIT", shaOpc "OP_TOALTSTACK" ]
+  ++ shaCompressOps
+  ++ [ shaOpc "OP_FROMALTSTACK" ]
+  ++ shaCompressOps
+  ++ [ shaOpc "OP_ENDIF" ]
+
+/-- Lowering for `sha256Compress(state, block)`. The TS reference loads
+both args (PICK-style for non-last-uses, ROLL for last-uses) then splices
+`shaEmitCompress`. We mirror with `loadRefLive` / `loadRefLiveCopy` so
+the Lean output matches TS hex for fixtures with consume semantics. -/
+def lowerSha256CompressOpsLive (sm : StackMap) (bindingName : String)
+    (state block : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let (loadState, sm1) := loadRefOperand sm state [state, block] currentIndex lastUses outerProtected
+  let (loadBlock, sm2) := loadRefOperand sm1 block [state, block] currentIndex lastUses outerProtected
+  -- After compress: pop state+block (2 slots) and push the new state
+  -- (named under `bindingName`). The compress body is depth-neutral: -1.
+  let smFinal := (sm2.popN 2).push bindingName
+  (loadState ++ loadBlock ++ shaEmitCompress, smFinal)
+
+/-- Non-liveness variant: PICK-style copies for both args. -/
+def lowerSha256CompressOps (sm : StackMap) (bindingName : String)
+    (state block : String) : (List StackOp × StackMap) :=
+  let s1 := loadRef sm state
+  let s2 := loadRef (sm.push state) block
+  let smFinal := sm.push bindingName
+  (s1 ++ s2 ++ shaEmitCompress, smFinal)
+
+/-- Lowering for `sha256Finalize(state, remaining, msgBitLen)`. -/
+def lowerSha256FinalizeOpsLive (sm : StackMap) (bindingName : String)
+    (state remaining msgBitLen : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let finOperands : List String := [state, remaining, msgBitLen]
+  let (loadState, sm1) := loadRefOperand sm state finOperands currentIndex lastUses outerProtected
+  let (loadRem, sm2)   := loadRefOperand sm1 remaining finOperands currentIndex lastUses outerProtected
+  let (loadBits, sm3)  := loadRefOperand sm2 msgBitLen finOperands currentIndex lastUses outerProtected
+  -- After finalize: pop 3 args, push 1 result.
+  let smFinal := (sm3.popN 3).push bindingName
+  (loadState ++ loadRem ++ loadBits ++ shaEmitFinalize, smFinal)
+
+/-- Non-liveness variant. -/
+def lowerSha256FinalizeOps (sm : StackMap) (bindingName : String)
+    (state remaining msgBitLen : String) : (List StackOp × StackMap) :=
+  let s1 := loadRef sm state
+  let s2 := loadRef (sm.push state) remaining
+  let s3 := loadRef ((sm.push state).push remaining) msgBitLen
+  let smFinal := sm.push bindingName
+  (s1 ++ s2 ++ s3 ++ shaEmitFinalize, smFinal)
+
+/-! ## BLAKE3 codegen — Phase 4-E
+
+Mirrors the TypeScript reference at
+`packages/runar-compiler/src/passes/blake3-codegen.ts`. The TS reference
+implements `blake3Compress(chainingValue, block)` (single-block
+compression, no padding) and `blake3Hash(message)` (zero-pad message
+to 64 bytes, hash with IV as chaining value).
+
+The ops themselves are precomputed in `Stack.Blake3` (pure StackOp
+lists). Here we just thread the live stack-map through the two-arg /
+one-arg load + splice pattern. -/
+
+open RunarVerification.Stack.Blake3 in
+/-- Lowering for `blake3Compress(chainingValue, block)`. After compress:
+2 args popped, 1 result pushed. Net: -1. -/
+def lowerBlake3CompressOpsLive (sm : StackMap) (bindingName : String)
+    (chainingValue block : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let (loadCV, sm1) := loadRefOperand sm chainingValue [chainingValue, block] currentIndex lastUses outerProtected
+  let (loadBlock, sm2) := loadRefOperand sm1 block [chainingValue, block] currentIndex lastUses outerProtected
+  let smFinal := (sm2.popN 2).push bindingName
+  (loadCV ++ loadBlock ++ b3CompressOps, smFinal)
+
+open RunarVerification.Stack.Blake3 in
+/-- Lowering for `blake3Hash(message)`. After hash: 1 arg popped,
+1 result pushed. Net: 0. -/
+def lowerBlake3HashOpsLive (sm : StackMap) (bindingName : String)
+    (message : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let (loadMsg, sm1) := loadRefLive sm message currentIndex lastUses outerProtected
+  let smFinal := (sm1.popN 1).push bindingName
+  (loadMsg ++ b3HashOps, smFinal)
+
+/-! ## WOTS+ codegen — Phase 4-F
+
+Mirrors `lowerVerifyWOTS` (TS `05-stack-lower.ts:4022-4175`). The body
+itself is precomputed in `Stack.Wots` (`wotsBodyOps`). Here we just
+thread the live stack-map through a 3-arg load + splice, matching the
+TS pattern of `bringToTop` for each of `[msg, sig, pubkey]` followed
+by 3 stack-map pops. -/
+
+open RunarVerification.Stack.Wots in
+/-- Lowering for `verifyWOTS(msg, sig, pubkey)`. After body: 3 args
+popped, 1 boolean result pushed. Net: -2. -/
+def lowerVerifyWotsOpsLive (sm : StackMap) (bindingName : String)
+    (msg sig pubkey : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let (loadMsg, sm1) := loadRefOperand sm msg [msg, sig, pubkey] currentIndex lastUses outerProtected
+  let (loadSig, sm2) := loadRefOperand sm1 sig [msg, sig, pubkey] currentIndex lastUses outerProtected
+  let (loadPk,  sm3) := loadRefOperand sm2 pubkey [msg, sig, pubkey] currentIndex lastUses outerProtected
+  let smFinal := (sm3.popN 3).push bindingName
+  (loadMsg ++ loadSig ++ loadPk ++ wotsBodyOps, smFinal)
+
+/-! ## secp256k1 EC codegen — Phase 4-G
+
+Mirrors `lowerEcBuiltin` (TS `05-stack-lower.ts:4290-4325`). Each EC
+builtin loads its arguments to TOS via `loadRefLive`, pops the arg slots
+from the stack map, splices the precomputed op list from `Stack.Ec`,
+then pushes the result slot under `bindingName`.
+
+All EC builtins are pop-N push-1 except `ecAdd` (pop 2 push 1),
+`ecMul` (pop 2 push 1), `ecMulGen` (pop 1 push 1), `ecMakePoint`
+(pop 2 push 1), and the rest pop 1 push 1. The shape is captured by
+`args.length` per call site. -/
+
+open RunarVerification.Stack.Ec in
+/-- Lowering for an EC builtin. Loads each arg to TOS, then splices the
+appropriate static op list. Net stack-map effect: pop `args.length`,
+push `bindingName`. -/
+def lowerEcBuiltinOpsLive (sm : StackMap) (bindingName : String)
+    (func : String) (args : List String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  -- Load all args to TOS
+  let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected args sm args
+  -- Pick the right op list
+  let body : List StackOp :=
+    if func = "ecAdd" then emitEcAdd
+    else if func = "ecMul" then emitEcMul
+    else if func = "ecMulGen" then emitEcMulGen
+    else if func = "ecNegate" then emitEcNegate
+    else if func = "ecOnCurve" then emitEcOnCurve
+    else if func = "ecModReduce" then emitEcModReduce
+    else if func = "ecEncodeCompressed" then emitEcEncodeCompressed
+    else if func = "ecMakePoint" then emitEcMakePoint
+    else if func = "ecPointX" then emitEcPointX
+    else if func = "ecPointY" then emitEcPointY
+    else [.opcode "OP_RUNAR_UNKNOWN_EC_BUILTIN"]
+  let smFinal := (sm1.popN args.length).push bindingName
+  (argOps ++ body, smFinal)
+
+/-! ## NIST P-256 / P-384 EC codegen — Phase 4-H
+
+Mirrors `lowerNistEcBuiltin` and `lowerVerifyECDSA` (TS
+`05-stack-lower.ts:4386-4441`). The body op lists for each builtin
+are precomputed in `Stack.P256P384`. The dispatch arm here follows the
+exact pattern of `lowerEcBuiltinOpsLive` above. -/
+
+open RunarVerification.Stack.P256P384 in
+/-- Lowering for a NIST P-256 / P-384 builtin. Loads each arg to TOS,
+splices the appropriate static op list. Net stack-map effect: pop
+`args.length`, push `bindingName`. -/
+def lowerP256P384BuiltinOpsLive (sm : StackMap) (bindingName : String)
+    (func : String) (args : List String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected args sm args
+  let body : List StackOp :=
+    if func = "p256Add" then emitP256Add
+    else if func = "p256Mul" then emitP256Mul
+    else if func = "p256MulGen" then emitP256MulGen
+    else if func = "p256Negate" then emitP256Negate
+    else if func = "p256OnCurve" then emitP256OnCurve
+    else if func = "p256EncodeCompressed" then emitP256EncodeCompressed
+    else if func = "verifyECDSA_P256" then emitVerifyECDSA_P256
+    else if func = "p384Add" then emitP384Add
+    else if func = "p384Mul" then emitP384Mul
+    else if func = "p384MulGen" then emitP384MulGen
+    else if func = "p384Negate" then emitP384Negate
+    else if func = "p384OnCurve" then emitP384OnCurve
+    else if func = "p384EncodeCompressed" then emitP384EncodeCompressed
+    else if func = "verifyECDSA_P384" then emitVerifyECDSA_P384
+    else [.opcode "OP_RUNAR_UNKNOWN_P256P384_BUILTIN"]
+  let smFinal := (sm1.popN args.length).push bindingName
+  (argOps ++ body, smFinal)
+
+/-! ## SLH-DSA (FIPS 205) codegen — Phase 4-I
+
+Mirrors `lowerVerifySLHDSA` (TS `05-stack-lower.ts` →
+`packages/runar-compiler/src/passes/slh-dsa-codegen.ts:emitVerifySLHDSA`).
+The body op list is precomputed in `Stack.SlhDsa`. The dispatch arm here
+follows the same pattern as `lowerVerifyWotsOpsLive`. -/
+
+open RunarVerification.Stack.SlhDsa in
+/-- Lowering for `verifySLHDSA_SHA2_*(msg, sig, pubkey)`. After body: 3
+args popped, 1 boolean result pushed. -/
+def lowerVerifySlhDsaOpsLive (sm : StackMap) (bindingName : String)
+    (paramKey : String) (msg sig pubkey : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let (loadMsg, sm1) := loadRefOperand sm  msg    [msg, sig, pubkey] currentIndex lastUses outerProtected
+  let (loadSig, sm2) := loadRefOperand sm1 sig    [msg, sig, pubkey] currentIndex lastUses outerProtected
+  let (loadPk,  sm3) := loadRefOperand sm2 pubkey [msg, sig, pubkey] currentIndex lastUses outerProtected
+  let smFinal := (sm3.popN 3).push bindingName
+  (loadMsg ++ loadSig ++ loadPk ++ emitVerifySLHDSABody paramKey, smFinal)
+
+/-! ## BabyBear field codegen — Phase 4-J
+
+Mirrors the TS reference dispatch at `05-stack-lower.ts` for the
+`bbField{Add,Sub,Mul,Inv}` and `bbExt4{Mul,Inv}{0..3}` builtins. The
+body op lists are precomputed in `Stack.BabyBear`. The dispatch arm
+here follows the same pattern as `lowerEcBuiltinOpsLive`. -/
+
+open RunarVerification.Stack.BabyBear in
+/-- Lowering for a BabyBear builtin. Loads each arg to TOS, then splices
+the appropriate static op list. Net stack-map effect: pop `args.length`,
+push `bindingName`. -/
+def lowerBabyBearBuiltinOpsLive (sm : StackMap) (bindingName : String)
+    (func : String) (args : List String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected args sm args
+  let body : List StackOp :=
+    if func = "bbFieldAdd" then emitBBFieldAdd
+    else if func = "bbFieldSub" then emitBBFieldSub
+    else if func = "bbFieldMul" then emitBBFieldMul
+    else if func = "bbFieldInv" then emitBBFieldInv
+    else if func = "bbExt4Mul0" then emitBBExt4Mul0
+    else if func = "bbExt4Mul1" then emitBBExt4Mul1
+    else if func = "bbExt4Mul2" then emitBBExt4Mul2
+    else if func = "bbExt4Mul3" then emitBBExt4Mul3
+    else if func = "bbExt4Inv0" then emitBBExt4Inv0
+    else if func = "bbExt4Inv1" then emitBBExt4Inv1
+    else if func = "bbExt4Inv2" then emitBBExt4Inv2
+    else if func = "bbExt4Inv3" then emitBBExt4Inv3
+    else [.opcode "OP_RUNAR_UNKNOWN_BABYBEAR_BUILTIN"]
+  let smFinal := (sm1.popN args.length).push bindingName
+  (argOps ++ body, smFinal)
+
+/-! ## Merkle proof codegen — Phase 4-K
+
+Mirrors `lowerMerkleRoot` (TS `05-stack-lower.ts:4652-4706`) and its Go
+peer at `compilers/go/codegen/stack.go:4870-4919`. Both variants
+(`merkleRootSha256` and `merkleRootHash256`) take 4 args:
+`[leaf, proof, index, depth]` where `depth` MUST be a compile-time
+constant integer literal — it becomes the unrolled-loop bound for the
+Merkle climb.
+
+The TS / Go references implement this by:
+
+1. Looking up `args[3]` in the per-method `constValues` map (populated
+   while emitting `loadConst (.int _)` bindings).
+2. Bringing the depth slot to top with `consume=true`, emitting `OP_DROP`,
+   and popping the slot from the stack map (the depth literal is
+   compile-time only — it does not flow into the body op list).
+3. Bringing `[leaf, proof, index]` to top via the standard
+   `bringToTop(_, isLastUse)` dance.
+4. Splicing the precomputed body from `merkle-codegen.ts`.
+
+This Lean port reuses `Stack.Merkle.merkleRootSha256Ops` /
+`merkleRootHash256Ops` for the body. The depth comes from the new
+`constInts` parameter threaded through `lowerValueP`. -/
+
+open RunarVerification.Stack.Merkle in
+/-- Lowering for `merkleRootSha256` / `merkleRootHash256`. Args:
+`[leaf, proof, index, depth]`. Depth must be a compile-time int literal
+recorded in `constInts`. After the body: 4 args popped, 1 result pushed. -/
+def lowerMerkleRootOpsLive (sm : StackMap) (bindingName : String)
+    (func : String) (args : List String)
+    (constInts : List (String × Int))
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  match args with
+  | [leaf, proof, index, depthArg] =>
+      -- Resolve the depth literal. Out-of-range / missing constants emit
+      -- a sentinel opcode (matching the existing `OP_RUNAR_*_ARITY`
+      -- pattern); this is reachable only on malformed IR.
+      match constIntsLookup constInts depthArg with
+      | none =>
+          ([.opcode "OP_RUNAR_MERKLE_DEPTH_NOT_CONST"], sm.push bindingName)
+      | some di =>
+          if di < 1 ∨ di > 64 then
+            ([.opcode "OP_RUNAR_MERKLE_DEPTH_OUT_OF_RANGE"], sm.push bindingName)
+          else
+            let depth : Nat := di.toNat
+            -- Step 1: drop the depth slot from runtime stack.
+            -- `bringToTop(_, true)` emits ROLL/SWAP as appropriate; the
+            -- subsequent OP_DROP consumes the brought-to-top slot.
+            let (depthDropOps, smPostDepth) :=
+              match sm.depth? depthArg with
+              | some _ =>
+                  let (toTop, sm1) := bringToTop sm depthArg true
+                  (toTop ++ [StackOp.drop], sm1.popN 1)
+              | none   => ([], sm)
+            -- Step 2: bring leaf, proof, index to TOS via the standard
+            -- liveness-aware load helper. Each call updates `sm` so the
+            -- next bringToTop sees the prior arg sitting on top. The
+            -- repeated-operand gate checks against the FULL 4-element
+            -- arg list (TS `operandConsume(arg, args, …)` — `args`
+            -- includes the compile-time `depth` ref).
+            let (loadLeaf,  sm2) := loadRefOperand smPostDepth leaf  args currentIndex lastUses outerProtected
+            let (loadProof, sm3) := loadRefOperand sm2        proof args currentIndex lastUses outerProtected
+            let (loadIndex, sm4) := loadRefOperand sm3        index args currentIndex lastUses outerProtected
+            -- Step 3: splice the precomputed body. Body net: pop 3, push 1.
+            let body : List StackOp :=
+              if func = "merkleRootSha256" then merkleRootSha256Ops depth
+              else merkleRootHash256Ops depth
+            let smFinal : StackMap := (sm4.popN 3).push bindingName
+            (depthDropOps ++ loadLeaf ++ loadProof ++ loadIndex ++ body, smFinal)
+  | _ =>
+      ([.opcode "OP_RUNAR_MERKLEROOT_ARITY"], sm.push bindingName)
+
+/-! ## checkMultiSig codegen
+
+Mirrors `lowerCheckMultiSig` (TS `05-stack-lower.ts:1619-1663`). The TS
+reference layout for `checkMultiSig([sig1,…], [pk1,…])`:
+
+```
+OP_0                       -- Bitcoin's CHECKMULTISIG dummy
+<sig1> <sig2> … <sigN>     -- elements of the sigs array
+<nSigs>                    -- pushed as an integer literal
+<pk1> <pk2> … <pkM>        -- elements of the pubkeys array
+<nPKs>                     -- pushed as an integer literal
+OP_CHECKMULTISIG
+```
+
+The Lean `lowerArrayLiteral` (see `lowerArrayElems`) coalesces the array
+elements into a single concatenated payload via `OP_CAT`, so by the time
+we reach the `checkMultiSig` call the two array slots on the stack are
+each a single byte-string. We mirror the TS *shape* faithfully — push
+the dummy `0`, bring each array slot to TOS, push a placeholder count
+for each, and emit `OP_CHECKMULTISIG`.
+
+Byte-exact match against the TS golden is intentionally out of scope at
+this tier: the dedicated `arrayLengths` tracking that TS uses to compute
+the per-array count pushes is not threaded through `lowerValueP`. The
+counts emitted here are `0` placeholders. The fixture remains in the
+crypto-pending bucket (no `compileSafe` rejection, no byte-exact gate). -/
+
+def lowerCheckMultiSigOpsLive (sm : StackMap) (bindingName : String)
+    (sigs pubkeys : String)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) : (List StackOp × StackMap) :=
+  -- Dummy `0` required by Bitcoin's OP_CHECKMULTISIG off-by-one bug.
+  let dummy : List StackOp := [StackOp.push (.bigint 0)]
+  let sm0 : StackMap := sm.push "_checkmultisig_dummy"
+  -- Bring sigs array to TOS. The repeated-operand gate checks against
+  -- the combined operand list (TS `msigOperands = [...sigElems,
+  -- ...pkElems]`; the Lean model operates on the two array refs).
+  let (loadSigs, sm1) := loadRefOperand sm0 sigs [sigs, pubkeys] currentIndex lastUses outerProtected
+  -- Placeholder nSigs count. Byte-exact emit requires `arrayLengths`
+  -- tracking which is not yet threaded through `lowerValueP`.
+  let nSigs : List StackOp := [StackOp.push (.bigint 0)]
+  let sm2 : StackMap := sm1.push "_checkmultisig_nsigs"
+  -- Bring pubkeys array to TOS.
+  let (loadPks, sm3) := loadRefOperand sm2 pubkeys [sigs, pubkeys] currentIndex lastUses outerProtected
+  -- Placeholder nPKs count (same reason as nSigs).
+  let nPks : List StackOp := [StackOp.push (.bigint 0)]
+  let sm4 : StackMap := sm3.push "_checkmultisig_npks"
+  -- Stack map net: pop dummy + sigs + nSigs + pks + nPKs (5 slots), push bindingName.
+  let smFinal : StackMap := (sm4.popN 5).push bindingName
+  (dummy ++ loadSigs ++ nSigs ++ loadPks ++ nPks
+    ++ [StackOp.opcode "OP_CHECKMULTISIG"], smFinal)
+
+/-! ## Mutual lowering
+
+`lowerValue` and `lowerBindings` recurse via the `ifVal` and `loop`
+cases (which descend into branch / body bindings). Termination is by
+the auto-derived `sizeOf` on the ANFValue / List ANFBinding inputs:
+every recursive call descends to a structurally-smaller payload.
+
+Switching from `partial def` to `def` + `termination_by` unlocks the
+`rfl`-level equation lemmas that downstream simulation lemmas depend
+on. See HANDOFF.md §7c for the rationale.
+-/
+
+mutual
+
+def lowerValue (sm : StackMap) (bindingName : String) :
+    ANFValue → (List StackOp × StackMap)
+  | .loadParam n =>
+      (loadRef sm n, sm.push bindingName)
+  | .loadProp n =>
+      (loadRef sm n, sm.push bindingName)
+  | .loadConst (.refAlias n) =>
+      (loadRef sm n, sm.push bindingName)
+  | .loadConst .thisRef =>
+      ([], sm)
+  | .loadConst c =>
+      (emitConst c, sm.push bindingName)
+  | .binOp op l r rt =>
+      let base := loadRef sm l ++ loadRef (sm.push l) r ++ [.opcode (binopOpcode op rt)]
+      let ops := if op == "!==" then base ++ [.opcode "OP_NOT"] else base
+      (ops, sm.push bindingName)
+  | .unaryOp op operand _ =>
+      (loadRef sm operand ++ [.opcode (unaryOpcode op)], sm.push bindingName)
+  | .call func args =>
+      let (argOps, _) := lowerArgs sm args
+      let opcodeOps := (builtinOpcode func).map (.opcode)
+      (argOps ++ opcodeOps, sm.push bindingName)
+  | .methodCall _obj _method _args =>
+      -- The unparameterized `lowerValue` has no access to the program's
+      -- method table, so it can't inline. Real lowering goes through
+      -- `lowerValueP` (below) — see `lowerMethod` and `lower`. This
+      -- placeholder is preserved only for Sim.lean's `rfl`-level rewrite
+      -- lemmas covering the simple `Phase 3a` constructors.
+      ([.opcode "OP_RUNAR_METHODCALL_NOPROG"], sm.push bindingName)
+  | .ifVal cond thn els =>
+      -- Phase 3c: concrete IF/ELSE/ENDIF lowering. Both branches lower
+      -- independently against the *original* stack map (each branch is
+      -- popped on entry and restored on exit by Bitcoin's IF semantics).
+      let (thnOps, _) := lowerBindings sm thn
+      let (elsOps, _) := lowerBindings sm els
+      (loadRef sm cond ++ [.ifOp thnOps (some elsOps)], sm.push bindingName)
+  | .assert ref =>
+      (loadRef sm ref ++ [.opcode "OP_VERIFY"], sm)
+  | .updateProp _ ref =>
+      (loadRef sm ref ++ [.opcode "OP_RUNAR_UPDATEPROP_UNSUPPORTED"], sm)
+  | .loop count body iterVar =>
+      -- Phase 3d: full count-bounded unroll. The body is lowered once
+      -- (with `iterVar` registered as a synthetic param at depth 0);
+      -- `unrollIter` then iterates the body `count` times, each
+      -- iteration prefixing with `push i` and suffixing with `OP_DROP`.
+      --
+      -- ⚠ NON-FAITHFUL / LEGACY (2026-06-11 loop-fidelity audit): this
+      -- arm is NOT byte-faithful to the TS reference — it lowers the
+      -- body once and replays it, drops unconditionally, ignores
+      -- liveness, and pushes a phantom `bindingName` entry (loops are
+      -- statements in TS). It is EXCLUDED from the production path:
+      -- `lowerMethod` / `lower` / `compileSafe` go through
+      -- `lowerBindingsP`, whose `.loop` arm performs faithful
+      -- per-iteration re-lowering via `lowerLoopItersP`. This
+      -- placeholder is preserved only because Sim.lean / Agrees*-era
+      -- `rfl`-level lemmas reduce the unparameterized `lowerValue` on
+      -- loop-FREE fragments and must keep their existing shape; no
+      -- proof may rely on this arm's bytes for a loop-CONTAINING body.
+      let (bodyOps, _) := lowerBindings (sm.push iterVar) body
+      (unrollIter bodyOps count, sm.push bindingName)
+  | .arrayLiteral elems =>
+      (lowerArrayElems sm elems, sm.push bindingName)
+  -- Phase 3w-b: framework intrinsics with concrete lowering.
+  -- `addRawOutput` / `addDataOutput` share the same stack-IR shape (see
+  -- `05-stack-lower.ts:961-965`); only the continuation-hash composition
+  -- in ANF lowering distinguishes them.
+  | .addRawOutput sat scr    => lowerAddRawOutputOps sm bindingName sat scr
+  | .addDataOutput sat scr   => lowerAddRawOutputOps sm bindingName sat scr
+  | .checkPreimage pre       => lowerCheckPreimageOps sm bindingName pre
+  -- Out-of-scope: depend on the program's property table (which
+  -- `lowerValue` doesn't have access to). Tracked as Phase 3y deferred.
+  | .getStateScript          => ([.opcode "OP_RUNAR_GETSTATESCRIPT_UNSUPPORTED"], sm.push bindingName)
+  | .deserializeState _      => ([.opcode "OP_RUNAR_DESERIALIZESTATE_UNSUPPORTED"], sm)
+  | .addOutput _ _ _         => ([.opcode "OP_RUNAR_ADDOUTPUT_UNSUPPORTED"], sm)
+  -- A14 follow-up: raw_script splices pre-encoded bytes verbatim. We
+  -- model the stack effect as pushing the bytes themselves; downstream
+  -- emitters output the bytes with no opcode prefix.
+  | .rawScript bytes _ _     => ([.rawBytes bytes], sm.push bindingName)
+
+def lowerBindings (sm : StackMap) :
+    List ANFBinding → (List StackOp × StackMap)
+  | [] => ([], sm)
+  | (.mk name v _) :: rest =>
+      let (ops, sm') := lowerValue sm name v
+      let (ops', sm'') := lowerBindings sm' rest
+      (ops ++ ops', sm'')
+
+end
+
+/-! ## Program-aware lowering (with `methodCall` inlining)
+
+`lowerValueP` and `lowerBindingsP` mirror the unparameterized
+`lowerValue` / `lowerBindings` above but additionally thread the
+program's method table and an inlining budget so the `methodCall`
+case can resolve and recursively lower the callee's body.
+
+Termination uses lexicographic order on `(budget, sizeOf payload,
+iterations)`: the `methodCall` recursion decrements `budget` (and may
+grow the payload arbitrarily); every other recursion preserves `budget`
+and descends to a structurally-smaller payload — except the
+per-iteration loop fold `lowerLoopItersP`, which keeps the loop body
+fixed (already structurally smaller than the `.loop` value that
+entered it) and descends on the third component, its remaining
+iteration count. Together this is well-founded and Lean's
+`decreasing_by` can discharge it.
+-/
+
+/-! ### Liveness-aware program lowering (Phase 3x)
+
+`lowerValueP` and `lowerBindingsP` thread last-use information so loads
+of refs being read for the **last** time emit consume-style ops
+(ROLL / SWAP / ROT) instead of copy-style ops (PICK / OVER / DUP).
+
+Extra parameters compared to the unparameterized `lowerValue` /
+`lowerBindings`:
+
+* `currentIndex : Nat` — the binding's position within its enclosing
+  sequence. `lowerBindingsP` increments it as it walks the list.
+* `lastUses : List (String × Nat)` — assoc list keyed on ref name,
+  computed once per binding sequence by `computeLastUses`.
+* `outerProtected : List String` — names that pre-existed the
+  current scope and therefore cannot be consumed (mirrors the TS
+  `outerProtectedRefs` set at `05-stack-lower.ts:856-866`). At the
+  top-level method body this is `[]`. When recursing into an `if`
+  branch, a `loop` body, or a `methodCall` body, `outerProtected` is
+  set to the parent scope's stack map at branch entry (a superset of
+  the TS computation that achieves the same protection guarantee).
+
+The `consume` flag for each ref is computed by `loadRefLive`:
+
+  consume = (ref ∉ outerProtected) ∧ isLastUse(ref, currentIndex, lastUses)
+-/
+
+mutual
+
+/-- Mirrors TS `LoweringContext.localBindings` (`05-stack-lower.ts:856-857`).
+The set of binding names of the *currently-active* `lowerBindings`
+invocation. TS sets this once at the top of `lowerBindings` and does NOT
+restore it after `inlineMethodCall` returns — so once a methodCall has
+been inlined, all subsequent `.refAlias` loads in the OUTER body see
+the INNER body's names as `localBindings` and therefore decline to
+consume their referent (since outer-scope refs aren't in the stale
+inner set). This quirk is load-bearing for byte-exact match in
+fixtures with `methodCall` followed by `@ref:` rebinds (e.g.
+`function-patterns` `withdraw`, where `fee = @ref:t15` and
+`total = @ref:t17` BOTH emit `OP_DUP` instead of consuming).
+
+`lowerValueP` returns the (possibly updated) `localBindings` as part of
+its tuple so `lowerBindingsP` can thread it through subsequent
+bindings. The methodCall arm overwrites it with the inlined body's
+names; every other arm returns it unchanged. -/
+def lowerValueP (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (localBindings : List String)
+    (constInts : List (String × Int))
+    (sm : StackMap) (bindingName : String) :
+    ANFValue → (List StackOp × StackMap × List String)
+  | .loadParam n =>
+      -- Phase 7.1: thread outerProtected so params used in sibling
+      -- inner scopes (e.g. both branches of separate ifs) aren't
+      -- consumed prematurely inside one branch.
+      let (load, sm1) := loadRefLiveParam sm n currentIndex lastUses outerProtected
+      let sm2 := match sm1 with
+                 | _ :: rest => bindingName :: rest
+                 | []        => [bindingName]
+      (load, sm2, localBindings)
+  | .loadProp n =>
+      -- Mirrors TS `lowerLoadProp` (05-stack-lower.ts:1004-1029):
+      --   * If the prop is on the stack (post-update_prop), ALWAYS copy
+      --     to top — props are shared mutable state, never consumed.
+      --   * Else if the prop has an initialValue, push the constant.
+      --   * Else emit a `.placeholder` op (encoded as OP_0; deployment SDK
+      --     splices in the actual constructor arg byte sequence).
+      match sm.depth? n with
+      | some _ =>
+          let (load, sm1) := loadRefLiveCopy sm n
+          let sm2 := match sm1 with
+                     | _ :: rest => bindingName :: rest
+                     | []        => [bindingName]
+          (load, sm2, localBindings)
+      | none =>
+          match props.find? (·.name = n) with
+          | some prop =>
+              match prop.initialValue with
+              | some iv => (emitConst iv, sm.push bindingName, localBindings)
+              | none =>
+                  let ctorProps := props.filter (·.initialValue.isNone)
+                  let paramIndex := ctorProps.findIdx? (·.name = n) |>.getD 0
+                  ([.placeholder paramIndex n], sm.push bindingName, localBindings)
+          | none =>
+              ([.placeholder 0 n], sm.push bindingName, localBindings)
+  | .loadConst (.refAlias n) =>
+      -- Mirror TS `lowerLoadConst @ref:` (`05-stack-lower.ts:1039-1057`):
+      --   const consume = this.localBindings.has(refName)
+      --                && this.isLastUse(refName, bindingIndex, lastUses);
+      -- We thread `localBindings` to capture TS's quirk where it remains
+      -- stale (= inlined-body names) after a `methodCall` returns. Without
+      -- the localBindings gate the `function-patterns` `withdraw` body's
+      -- `fee = @ref:t15` and `total = @ref:t17` rebinds would consume
+      -- their referent (no DUP) and the byte sequence drifts.
+      let onStack : Bool :=
+        match sm.depth? n with
+        | some _ => true
+        | none   => false
+      if onStack then
+        let consume :=
+          listContains localBindings n
+          && !listContains outerProtected n
+          && isLastUse lastUses n currentIndex
+        let (load, sm1) := bringToTop sm n consume
+        let sm2 := match sm1 with
+                   | _ :: rest => bindingName :: rest
+                   | []        => [bindingName]
+        (load, sm2, localBindings)
+      else
+        -- Mirror TS line 1052-1054: ref target not on stack → push 0n.
+        ([.push (.bigint 0)], sm.push bindingName, localBindings)
+  | .loadConst .thisRef =>
+      -- Mirror TS `lowerLoadConst @this` (`05-stack-lower.ts:1059-1064`):
+      -- emit `push 0n` and bind the binding name on top so downstream
+      -- loadRef calls resolve. (Closes Gap 4.)
+      ([.push (.bigint 0)], sm.push bindingName, localBindings)
+  | .loadConst c =>
+      (emitConst c, sm.push bindingName, localBindings)
+  | .binOp op l r rt =>
+      -- Repeated-operand gate (PRs #62/#67/#68): a ref reading BOTH
+      -- operand positions (`t := x + x`) is COPIED at every position;
+      -- consume only when the ref occurs exactly once in `[l, r]`.
+      let (lOps, sm1) := loadRefOperand sm l [l, r] currentIndex lastUses outerProtected
+      let (rOps, sm2) := loadRefOperand sm1 r [l, r] currentIndex lastUses outerProtected
+      let base := lOps ++ rOps ++ [.opcode (binopOpcode op rt)]
+      let ops := if op == "!==" then base ++ [.opcode "OP_NOT"] else base
+      -- Binop pops 2, pushes 1 (the named result).
+      let sm3 := (sm2.popN 2).push bindingName
+      (ops, sm3, localBindings)
+  | .unaryOp op operand _ =>
+      let (load, sm1) := loadRefLive sm operand currentIndex lastUses outerProtected
+      let ops := load ++ [.opcode (unaryOpcode op)]
+      let sm2 := (sm1.popN 1).push bindingName
+      (ops, sm2, localBindings)
+  | .call func args =>
+      let withLB (p : List StackOp × StackMap) : List StackOp × StackMap × List String :=
+        (p.1, p.2, localBindings)
+      if isExtractor func then
+        -- Preimage-field extractor: bring single arg (preimage) to top via
+        -- liveness-aware load, then emit the fixed split sequence. Net
+        -- stack-map effect: pop arg, push bindingName.
+        match args with
+        | [preimage] =>
+            let (argOps, sm1) :=
+              loadRefLive sm preimage currentIndex lastUses outerProtected
+            let body := extractorBody func
+            let sm2 := (sm1.popN 1).push bindingName
+            (argOps ++ body, sm2, localBindings)
+        | _ =>
+            -- Malformed extractor (wrong arity) — fall back to builtin path.
+            let (argOps, sm1) :=
+              lowerArgsLive currentIndex lastUses outerProtected args sm args
+            let opcodeOps := (builtinOpcode func).map (.opcode)
+            let sm2 := (sm1.popN args.length).push bindingName
+            (argOps ++ opcodeOps, sm2, localBindings)
+      else if func = "buildChangeOutput" then
+        -- Phase 3z-E: dedicated multi-op lowering (mirrors TS
+        -- `lowerBuildChangeOutput` at `05-stack-lower.ts:2306-2360`).
+        match args with
+        | [pkh, amount] =>
+            withLB <| lowerBuildChangeOutputOps sm bindingName pkh amount
+              currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_BUILDCHANGEOUTPUT_ARITY"], sm.push bindingName, localBindings)
+      else if func = "computeStateOutput" then
+        -- Phase 3z-E: dedicated lowering (mirrors TS
+        -- `lowerComputeStateOutput` at `05-stack-lower.ts:2220-2303`).
+        match args with
+        | [preimage, stateBytes, newAmount] =>
+            withLB <| lowerComputeStateOutputOps sm bindingName preimage stateBytes newAmount
+              currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_COMPUTESTATEOUTPUT_ARITY"], sm.push bindingName, localBindings)
+      else if func = "computeStateOutputHash" then
+        -- Phase 3z-E: dedicated lowering (mirrors TS
+        -- `lowerComputeStateOutputHash` at `05-stack-lower.ts:2106-2213`).
+        match args with
+        | [preimage, stateBytes] =>
+            withLB <| lowerComputeStateOutputHashOps sm bindingName preimage stateBytes
+              currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_COMPUTESTATEOUTPUTHASH_ARITY"], sm.push bindingName, localBindings)
+      else if func = "substr" then
+        -- Phase 3z-H: dedicated lowering mirroring TS `lowerSubstr`
+        -- (`05-stack-lower.ts:4703-4756`). The TS reference INTERLEAVES
+        -- the load of the third arg (`length`) between the two SPLITs.
+        -- The simple "preload then opcodes" path would put `length` on
+        -- top before the first SPLIT — corrupting the byte sequence.
+        match args with
+        | [data, start, length] =>
+            let (loadData, sm1) := loadRefOperand sm data [data, start, length] currentIndex lastUses outerProtected
+            let (loadStart, sm2) := loadRefOperand sm1 start [data, start, length] currentIndex lastUses outerProtected
+            -- After SPLIT NIP we've popped (data, start) and pushed `right`.
+            let smAfterFirst : StackMap := (sm2.popN 2).push "_substr_right"
+            let (loadLen, sm3) :=
+              loadRefOperand smAfterFirst length [data, start, length] currentIndex lastUses outerProtected
+            -- After SPLIT DROP we've popped (right, length) and pushed
+            -- the substr result under `bindingName`.
+            let smFinal : StackMap := (sm3.popN 2).push bindingName
+            ( loadData ++ loadStart
+                ++ [StackOp.opcode "OP_SPLIT", StackOp.nip]
+                ++ loadLen
+                ++ [StackOp.opcode "OP_SPLIT", StackOp.drop]
+            , smFinal, localBindings )
+        | _ =>
+            ([.opcode "OP_RUNAR_SUBSTR_ARITY"], sm.push bindingName, localBindings)
+      else if func = "percentOf" then
+        -- TS `lowerPercentOf` (`05-stack-lower.ts:3520-3552`): emit
+        -- `<amount> <bps> OP_MUL <push 10000> OP_DIV`. Net stack effect:
+        -- pop 2 args, push 1 result.
+        match args with
+        | [amount, bps] =>
+            let (loadA, sm1) := loadRefOperand sm amount [amount, bps] currentIndex lastUses outerProtected
+            let (loadB, sm2) := loadRefOperand sm1 bps [amount, bps] currentIndex lastUses outerProtected
+            let smFinal : StackMap := (sm2.popN 2).push bindingName
+            (loadA ++ loadB ++
+              [StackOp.opcode "OP_MUL",
+               StackOp.push (.bigint 10000),
+               StackOp.opcode "OP_DIV"],
+             smFinal, localBindings)
+        | _ =>
+            ([.opcode "OP_RUNAR_PERCENTOF_ARITY"], sm.push bindingName, localBindings)
+      else if func = "mulDiv" then
+        -- TS `lowerMulDiv` (`05-stack-lower.ts:3490-3518`): emit
+        -- `<a> <b> OP_MUL <c> OP_DIV` with the third arg loaded AFTER the
+        -- multiply. The interleaved load matters because OP_MUL pops both
+        -- before `c` is pushed.
+        match args with
+        | [a, b, c] =>
+            let (loadA, sm1) := loadRefOperand sm a [a, b, c] currentIndex lastUses outerProtected
+            let (loadB, sm2) := loadRefOperand sm1 b [a, b, c] currentIndex lastUses outerProtected
+            let smPostMul : StackMap := (sm2.popN 2).push "_mulDiv_intermediate"
+            let (loadC, sm3) :=
+              loadRefOperand smPostMul c [a, b, c] currentIndex lastUses outerProtected
+            let smFinal : StackMap := (sm3.popN 2).push bindingName
+            (loadA ++ loadB
+              ++ [StackOp.opcode "OP_MUL"]
+              ++ loadC
+              ++ [StackOp.opcode "OP_DIV"],
+             smFinal, localBindings)
+        | _ =>
+            ([.opcode "OP_RUNAR_MULDIV_ARITY"], sm.push bindingName, localBindings)
+      else if func = "safediv" || func = "safemod" then
+        -- TS `lowerSafeDivMod` (`05-stack-lower.ts:3328-3363`): emit
+        -- `<a> <b> OP_DUP OP_0NOTEQUAL OP_VERIFY <DIV|MOD>` to abort if
+        -- `b == 0` before the division/mod.
+        match args with
+        | [a, b] =>
+            let (loadA, sm1) := loadRefOperand sm a [a, b] currentIndex lastUses outerProtected
+            let (loadB, sm2) := loadRefOperand sm1 b [a, b] currentIndex lastUses outerProtected
+            let opc := if func = "safediv" then "OP_DIV" else "OP_MOD"
+            let smFinal : StackMap := (sm2.popN 2).push bindingName
+            (loadA ++ loadB ++
+              [StackOp.opcode "OP_DUP",
+               StackOp.opcode "OP_0NOTEQUAL",
+               StackOp.opcode "OP_VERIFY",
+               StackOp.opcode opc],
+             smFinal, localBindings)
+        | _ =>
+            ([.opcode "OP_RUNAR_SAFEDIVMOD_ARITY"], sm.push bindingName, localBindings)
+      else if func = "clamp" then
+        -- TS `lowerClamp` (`05-stack-lower.ts:3369-3400`): emit
+        -- `<val> <lo> OP_MAX <hi> OP_MIN`. Interleaves the third load
+        -- between the two opcode emissions.
+        match args with
+        | [val, lo, hi] =>
+            let (loadV, sm1) := loadRefOperand sm val [val, lo, hi] currentIndex lastUses outerProtected
+            let (loadL, sm2) := loadRefOperand sm1 lo [val, lo, hi] currentIndex lastUses outerProtected
+            let smPostMax : StackMap := (sm2.popN 2).push "_clamp_intermediate"
+            let (loadH, sm3) :=
+              loadRefOperand smPostMax hi [val, lo, hi] currentIndex lastUses outerProtected
+            let smFinal : StackMap := (sm3.popN 2).push bindingName
+            (loadV ++ loadL
+              ++ [StackOp.opcode "OP_MAX"]
+              ++ loadH
+              ++ [StackOp.opcode "OP_MIN"],
+             smFinal, localBindings)
+        | _ =>
+            ([.opcode "OP_RUNAR_CLAMP_ARITY"], sm.push bindingName, localBindings)
+      else if func = "pow" then
+        -- TS `lowerPow` (`05-stack-lower.ts:3407-3483`): bounded
+        -- 32-iteration multiply. The loop body is a flat opcode sequence
+        -- (no structured if-blocks at the StackMap level — each iteration
+        -- emits a `StackOp.ifOp` whose body multiplies into the accumulator).
+        --
+        --   <base> <exp>
+        --   OP_SWAP OP_1                       -- exp base 1
+        --   for i in 0..32:                    -- exp base acc
+        --     <2> OP_PICK                       -- exp base acc exp
+        --     <i> OP_GREATERTHAN                -- exp base acc (exp > i)
+        --     OP_IF OP_OVER OP_MUL OP_ENDIF     -- exp base acc'
+        --   OP_NIP OP_NIP                       -- result
+        match args with
+        | [base, exp] =>
+            let (loadB, sm1) := loadRefOperand sm base [base, exp] currentIndex lastUses outerProtected
+            let (loadE, sm2) := loadRefOperand sm1 exp [base, exp] currentIndex lastUses outerProtected
+            let smFinal : StackMap := (sm2.popN 2).push bindingName
+            let header : List StackOp :=
+              [StackOp.swap, StackOp.push (.bigint 1)]
+            let iter (i : Nat) : List StackOp :=
+              [ StackOp.push (.bigint 2)
+              , StackOp.opcode "OP_PICK"
+              , StackOp.push (.bigint (Int.ofNat i))
+              , StackOp.opcode "OP_GREATERTHAN"
+              , StackOp.ifOp [StackOp.over, StackOp.opcode "OP_MUL"] none ]
+            let body : List StackOp :=
+              (List.range 32).flatMap iter
+            let trailer : List StackOp := [StackOp.nip, StackOp.nip]
+            (loadB ++ loadE ++ header ++ body ++ trailer, smFinal, localBindings)
+        | _ =>
+            ([.opcode "OP_RUNAR_POW_ARITY"], sm.push bindingName, localBindings)
+      else if func = "sqrt" then
+        -- TS `lowerSqrt` (`05-stack-lower.ts:3564-3610`): integer square
+        -- root via Newton's method, guarded by `OP_DUP OP_IF ... OP_ENDIF`
+        -- so that `n == 0` skips the iteration (avoids div-by-zero) and
+        -- the original 0 remains on the stack.
+        --
+        --   <n> OP_DUP
+        --   OP_IF
+        --     OP_DUP                           -- n guess(=n)
+        --     16x: OP_OVER OP_OVER OP_DIV OP_ADD <2> OP_DIV
+        --     OP_NIP                           -- result
+        --   OP_ENDIF
+        match args with
+        | [n] =>
+            let (loadN, sm1) := loadRefLive sm n currentIndex lastUses outerProtected
+            let smFinal : StackMap := (sm1.popN 1).push bindingName
+            let iter : List StackOp :=
+              [ StackOp.over, StackOp.over
+              , StackOp.opcode "OP_DIV"
+              , StackOp.opcode "OP_ADD"
+              , StackOp.push (.bigint 2)
+              , StackOp.opcode "OP_DIV" ]
+            let newtonOps : List StackOp :=
+              StackOp.opcode "OP_DUP"
+                :: ((List.range 16).flatMap (fun _ => iter)) ++ [StackOp.nip]
+            let body : List StackOp :=
+              [ StackOp.opcode "OP_DUP"
+              , StackOp.ifOp newtonOps none ]
+            (loadN ++ body, smFinal, localBindings)
+        | _ =>
+            ([.opcode "OP_RUNAR_SQRT_ARITY"], sm.push bindingName, localBindings)
+      else if func = "gcd" then
+        -- TS `lowerGcd` (`05-stack-lower.ts:3617-3663`): bounded
+        -- Euclidean algorithm with 256 unrolled iterations.
+        --
+        --   <a> <b>
+        --   OP_ABS OP_SWAP OP_ABS OP_SWAP            -- |a| |b|
+        --   for _ in 0..256:                          -- a b
+        --     OP_DUP OP_0NOTEQUAL
+        --     OP_IF OP_TUCK OP_MOD OP_ENDIF
+        --   OP_DROP                                   -- result
+        match args with
+        | [a, b] =>
+            let (loadA, sm1) := loadRefOperand sm a [a, b] currentIndex lastUses outerProtected
+            let (loadB, sm2) := loadRefOperand sm1 b [a, b] currentIndex lastUses outerProtected
+            let smFinal : StackMap := (sm2.popN 2).push bindingName
+            let header : List StackOp :=
+              [ StackOp.opcode "OP_ABS"
+              , StackOp.swap
+              , StackOp.opcode "OP_ABS"
+              , StackOp.swap ]
+            let iter : List StackOp :=
+              [ StackOp.opcode "OP_DUP"
+              , StackOp.opcode "OP_0NOTEQUAL"
+              , StackOp.ifOp
+                  [ StackOp.opcode "OP_TUCK", StackOp.opcode "OP_MOD" ]
+                  none ]
+            let body : List StackOp :=
+              (List.range 256).flatMap (fun _ => iter)
+            let trailer : List StackOp := [StackOp.drop]
+            (loadA ++ loadB ++ header ++ body ++ trailer, smFinal, localBindings)
+        | _ =>
+            ([.opcode "OP_RUNAR_GCD_ARITY"], sm.push bindingName, localBindings)
+      else if func = "log2" then
+        -- TS `lowerLog2` (`05-stack-lower.ts:3721-3767`): floor(log2(n))
+        -- via 64-iteration bit-scan. Each iteration shifts the input right
+        -- and increments the counter when input > 1.
+        --
+        --   <n> <0>                                   -- input counter
+        --   for _ in 0..64:
+        --     OP_SWAP OP_DUP <1> OP_GREATERTHAN
+        --     OP_IF <2> OP_DIV OP_SWAP OP_1ADD OP_SWAP OP_ENDIF
+        --     OP_SWAP                                 -- input counter
+        --   OP_NIP                                    -- counter
+        match args with
+        | [n] =>
+            let (loadN, sm1) := loadRefLive sm n currentIndex lastUses outerProtected
+            let smFinal : StackMap := (sm1.popN 1).push bindingName
+            let iter : List StackOp :=
+              [ StackOp.swap
+              , StackOp.opcode "OP_DUP"
+              , StackOp.push (.bigint 1)
+              , StackOp.opcode "OP_GREATERTHAN"
+              , StackOp.ifOp
+                  [ StackOp.push (.bigint 2)
+                  , StackOp.opcode "OP_DIV"
+                  , StackOp.swap
+                  , StackOp.opcode "OP_1ADD"
+                  , StackOp.swap ]
+                  none
+              , StackOp.swap ]
+            let body : List StackOp :=
+              StackOp.push (.bigint 0)
+                :: ((List.range 64).flatMap (fun _ => iter)) ++ [StackOp.nip]
+            (loadN ++ body, smFinal, localBindings)
+        | _ =>
+            ([.opcode "OP_RUNAR_LOG2_ARITY"], sm.push bindingName, localBindings)
+      else if func = "sign" then
+        -- TS `lowerSign` (`05-stack-lower.ts:3779-3812`): -1 / 0 / 1
+        -- dispatch using OP_DUP + OP_IF guard so that `x == 0` short-circuits
+        -- the division.
+        --
+        --   <x> OP_DUP
+        --   OP_IF OP_DUP OP_ABS OP_SWAP OP_DIV OP_ENDIF
+        match args with
+        | [x] =>
+            let (loadX, sm1) := loadRefLive sm x currentIndex lastUses outerProtected
+            let smFinal : StackMap := (sm1.popN 1).push bindingName
+            let body : List StackOp :=
+              [ StackOp.opcode "OP_DUP"
+              , StackOp.ifOp
+                  [ StackOp.opcode "OP_DUP"
+                  , StackOp.opcode "OP_ABS"
+                  , StackOp.swap
+                  , StackOp.opcode "OP_DIV" ]
+                  none ]
+            (loadX ++ body, smFinal, localBindings)
+        | _ =>
+            ([.opcode "OP_RUNAR_SIGN_ARITY"], sm.push bindingName, localBindings)
+      else if func = "divmod" then
+        -- TS `lowerDivmod` (`05-stack-lower.ts:3792-3824`): emit
+        -- `OP_2DUP OP_DIV OP_ROT OP_ROT OP_MOD OP_DROP` and keep only
+        -- the quotient on the stack (the remainder is dropped). Net
+        -- stack effect: pop 2, push 1.
+        match args with
+        | [a, b] =>
+            let (loadA, sm1) := loadRefOperand sm a [a, b] currentIndex lastUses outerProtected
+            let (loadB, sm2) := loadRefOperand sm1 b [a, b] currentIndex lastUses outerProtected
+            let smFinal : StackMap := (sm2.popN 2).push bindingName
+            (loadA ++ loadB ++
+              [StackOp.opcode "OP_2DUP",
+               StackOp.opcode "OP_DIV",
+               StackOp.opcode "OP_ROT",
+               StackOp.opcode "OP_ROT",
+               StackOp.opcode "OP_MOD",
+               StackOp.drop],
+             smFinal, localBindings)
+        | _ =>
+            ([.opcode "OP_RUNAR_DIVMOD_ARITY"], sm.push bindingName, localBindings)
+      else if func = "verifyRabinSig" then
+        -- Phase 3z-K: dedicated lowering (mirrors TS `lowerVerifyRabinSig`
+        -- at `05-stack-lower.ts:3884-3931`). Verifies the Rabin equation
+        -- `(sig^2 + padding) mod pubKey == SHA256(msg)`.
+        match args with
+        | [msg, sig, padding, pubKey] =>
+            withLB <|
+              lowerVerifyRabinSigOpsLive sm bindingName msg sig padding pubKey
+                currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_VERIFYRABINSIG_ARITY"], sm.push bindingName, localBindings)
+      else if func = "sha256Compress" then
+        -- Phase 4-D: dedicated lowering (mirrors TS `emitSha256Compress`
+        -- at `sha256-codegen.ts:217-219`).
+        match args with
+        | [state, block] =>
+            withLB <|
+              lowerSha256CompressOpsLive sm bindingName state block
+                currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_SHA256COMPRESS_ARITY"], sm.push bindingName, localBindings)
+      else if func = "sha256Finalize" then
+        -- Phase 4-D: dedicated lowering (mirrors TS `emitSha256Finalize`
+        -- at `sha256-codegen.ts:229-311`).
+        match args with
+        | [state, remaining, msgBitLen] =>
+            withLB <|
+              lowerSha256FinalizeOpsLive sm bindingName state remaining msgBitLen
+                currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_SHA256FINALIZE_ARITY"], sm.push bindingName, localBindings)
+      else if func = "blake3Compress" then
+        -- Phase 4-E: dedicated lowering (mirrors TS `emitBlake3Compress`
+        -- at `blake3-codegen.ts:406-408`).
+        match args with
+        | [chainingValue, block] =>
+            withLB <|
+              lowerBlake3CompressOpsLive sm bindingName chainingValue block
+                currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_BLAKE3COMPRESS_ARITY"], sm.push bindingName, localBindings)
+      else if func = "blake3Hash" then
+        -- Phase 4-E: dedicated lowering (mirrors TS `emitBlake3Hash`
+        -- at `blake3-codegen.ts:418-447`).
+        match args with
+        | [message] =>
+            withLB <|
+              lowerBlake3HashOpsLive sm bindingName message
+                currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_BLAKE3HASH_ARITY"], sm.push bindingName, localBindings)
+      else if func = "verifyWOTS" then
+        -- Phase 4-F: dedicated lowering (mirrors TS `lowerVerifyWOTS`
+        -- at `05-stack-lower.ts:4022-4175`).
+        match args with
+        | [msg, sig, pubkey] =>
+            withLB <|
+              lowerVerifyWotsOpsLive sm bindingName msg sig pubkey
+                currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_VERIFYWOTS_ARITY"], sm.push bindingName, localBindings)
+      else if func = "ecAdd" || func = "ecMul" || func = "ecMulGen" ||
+              func = "ecNegate" || func = "ecOnCurve" || func = "ecModReduce" ||
+              func = "ecEncodeCompressed" || func = "ecMakePoint" ||
+              func = "ecPointX" || func = "ecPointY" then
+        -- Phase 4-G: secp256k1 EC builtins (mirrors TS `lowerEcBuiltin`
+        -- at `05-stack-lower.ts:4294-4325`).
+        withLB <|
+          lowerEcBuiltinOpsLive sm bindingName func args
+            currentIndex lastUses outerProtected
+      else if func = "p256Add" || func = "p256Mul" || func = "p256MulGen" ||
+              func = "p256Negate" || func = "p256OnCurve" ||
+              func = "p256EncodeCompressed" || func = "verifyECDSA_P256" ||
+              func = "p384Add" || func = "p384Mul" || func = "p384MulGen" ||
+              func = "p384Negate" || func = "p384OnCurve" ||
+              func = "p384EncodeCompressed" || func = "verifyECDSA_P384" then
+        -- Phase 4-H: NIST P-256 / P-384 EC builtins (mirrors TS
+        -- `lowerNistEcBuiltin` / `lowerVerifyECDSA`
+        -- at `05-stack-lower.ts:4386-4441`).
+        withLB <|
+          lowerP256P384BuiltinOpsLive sm bindingName func args
+            currentIndex lastUses outerProtected
+      else if func = "verifySLHDSA_SHA2_128s" || func = "verifySLHDSA_SHA2_128f" ||
+              func = "verifySLHDSA_SHA2_192s" || func = "verifySLHDSA_SHA2_192f" ||
+              func = "verifySLHDSA_SHA2_256s" || func = "verifySLHDSA_SHA2_256f" then
+        -- Phase 4-I: SLH-DSA (FIPS 205) verify (mirrors TS
+        -- `slh-dsa-codegen.ts:emitVerifySLHDSA`).
+        match args with
+        | [msg, sig, pubkey] =>
+            let paramKey : String := (func.drop "verifySLHDSA_".length).toString
+            withLB <|
+              lowerVerifySlhDsaOpsLive sm bindingName paramKey msg sig pubkey
+                currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_VERIFYSLHDSA_ARITY"], sm.push bindingName, localBindings)
+      else if func = "bbFieldAdd" || func = "bbFieldSub" ||
+              func = "bbFieldMul" || func = "bbFieldInv" ||
+              func = "bbExt4Mul0" || func = "bbExt4Mul1" ||
+              func = "bbExt4Mul2" || func = "bbExt4Mul3" ||
+              func = "bbExt4Inv0" || func = "bbExt4Inv1" ||
+              func = "bbExt4Inv2" || func = "bbExt4Inv3" then
+        -- Phase 4-J: BabyBear prime-field + ext4 builtins (mirrors TS
+        -- `babybear-codegen.ts`).
+        withLB <|
+          lowerBabyBearBuiltinOpsLive sm bindingName func args
+            currentIndex lastUses outerProtected
+      else if func = "merkleRootSha256" || func = "merkleRootHash256" then
+        -- Phase 4-K: Merkle proof verification (mirrors TS
+        -- `lowerMerkleRoot` at `05-stack-lower.ts:4652-4706` and Go
+        -- peer at `compilers/go/codegen/stack.go:4870-4919`). The
+        -- `depth` argument is a compile-time constant resolved via the
+        -- `constInts` map.
+        withLB <|
+          lowerMerkleRootOpsLive sm bindingName func args constInts
+            currentIndex lastUses outerProtected
+      else if func = "checkMultiSig" then
+        -- Multisig: dedicated dispatch mirroring TS `lowerCheckMultiSig`
+        -- (`05-stack-lower.ts:1619-1663`). Args: `[sigsArrayRef, pubkeysArrayRef]`
+        -- (each ref is an `array_literal` binding). Emits the canonical
+        -- `OP_0 dummy + sigs + nSigs + pubkeys + nPKs + OP_CHECKMULTISIG`
+        -- shape with placeholder zero counts (full `arrayLengths` tracking
+        -- to come in a follow-up; the fixture is not in the byte-exact
+        -- baseline).
+        match args with
+        | [sigsRef, pubkeysRef] =>
+            withLB <|
+              lowerCheckMultiSigOpsLive sm bindingName sigsRef pubkeysRef
+                currentIndex lastUses outerProtected
+        | _ =>
+            ([.opcode "OP_RUNAR_CHECKMULTISIG_ARITY"], sm.push bindingName, localBindings)
+      else
+        let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected args sm args
+        let opcodeOps := (builtinOpcode func).map (.opcode)
+        -- Most builtins are pop-N push-1; we approximate with that shape.
+        let sm2 := (sm1.popN args.length).push bindingName
+        (argOps ++ opcodeOps, sm2, localBindings)
+  | .methodCall obj method args =>
+      match budget with
+      | 0 =>
+          ([.opcode "OP_RUNAR_METHODCALL_BUDGET_EXHAUSTED"], sm.push bindingName, localBindings)
+      | budget' + 1 =>
+          match lookupMethod progMethods method with
+          | none =>
+              -- Unresolved method — fall back to a builtin-style call.
+              let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected args sm args
+              let opcodeOps := (builtinOpcode method).map (.opcode)
+              let sm2 := (sm1.popN args.length).push bindingName
+              (argOps ++ opcodeOps, sm2, localBindings)
+          | some m =>
+              -- Mirror TS `lowerMethodCall` (`05-stack-lower.ts:1574-1585`):
+              -- when the object reference (e.g. `@this` placeholder) is on
+              -- the stack, bring it to top consuming, emit OP_DROP, and pop
+              -- the slot. This sheds the compile-time `@this` push before
+              -- inlining the callee body.
+              let (objDropOps, smPostObj) : (List StackOp × StackMap) :=
+                match sm.depth? obj with
+                | some _ =>
+                    let (toTop, sm1) := bringToTop sm obj true
+                    (toTop ++ [StackOp.drop], sm1.popN 1)
+                | none   => ([], sm)
+              let paramNames := m.params.map (·.name)
+              let (argLoads, smArgs) :=
+                loadAndBindArgsLive currentIndex lastUses outerProtected args smPostObj args paramNames
+              -- TS `inlineMethodCall` (`05-stack-lower.ts:1591-1644`) reuses
+              -- the SAME `LoweringContext` (and thus the same
+              -- `outerProtectedRefs`) when it calls `lowerBindings` on the
+              -- callee body. We mirror that by propagating the OUTER scope's
+              -- `outerProtected` rather than the post-arg-binding stackmap
+              -- snapshot. Snapshotting the local stack would falsely protect
+              -- inner-body bindings whose names happen to collide with outer
+              -- temporaries (e.g. both bodies using `t0`/`t1`).
+              --
+              -- TS quirk (load-bearing): `LoweringContext.localBindings` is
+              -- RESET inside the recursive `lowerBindings(method.body)` call
+              -- and NOT restored on return. We mirror by using the inner
+              -- body's binding names as the post-call `localBindings`, so
+              -- subsequent outer `.refAlias` rebinds (e.g. `fee = @ref:t15`)
+              -- skip consumption and emit DUP/PICK.
+              let innerLocalBindings := m.body.map (fun b => b.name)
+              let bodyLastUses := computeLastUses m.body
+              -- Merge the callee body's const-int contributions onto the
+              -- outer-scope map. The outer map keeps its entries (visible
+              -- through scope) while the callee adds its own literals.
+              let bodyConstInts := constInts ++ collectConstInts m.body
+              let (bodyOps, smAfterBody) :=
+                lowerBindingsP progMethods props budget' 0 bodyLastUses outerProtected
+                  innerLocalBindings bodyConstInts smArgs m.body
+              -- After inlining, the callee body has either left its return
+              -- value on top (named after its last binding) or — if its
+              -- last binding was an assert — left whatever was below
+              -- exposed. Mirror TS `inlineMethodCall` (`05-stack-lower.ts:
+              -- 1637-1643`): rename top to `bindingName` ONLY when the top
+              -- IS the method's last binding name. Otherwise the inlined
+              -- body produced no return value (e.g. `requireOwner` in
+              -- function-patterns ends in `assert`) and the outer scope's
+              -- pre-existing top entry must be preserved.
+              let smFinal : StackMap :=
+                match m.body.reverse with
+                | (.mk lastName _ _) :: _ =>
+                    match smAfterBody with
+                    | top :: rest =>
+                        if top = lastName then bindingName :: rest
+                        else smAfterBody
+                    | [] => smAfterBody
+                | [] => smAfterBody
+              -- Propagate the inner `localBindings` to the outer continuation
+              -- (the load-bearing TS bug).
+              (objDropOps ++ argLoads ++ bodyOps, smFinal, innerLocalBindings)
+  | .ifVal cond thn els =>
+      -- Bring the cond to top (consume on last use, modulo outerProtected).
+      let (condOps, sm1) := loadRefLive sm cond currentIndex lastUses outerProtected
+      -- The IF block consumes the cond, so peel it off the stack map for
+      -- the branch lowering. Branches inherit `sm1` minus the cond top —
+      -- which matches Bitcoin Script's IF semantics: cond is popped at
+      -- entry, the active branch runs against the remaining stack.
+      let smBranch := sm1.popN 1
+      -- Mirror TS `lowerIf` (`05-stack-lower.ts:1660-1667`): only protect
+      -- parent refs that are STILL ALIVE AFTER the if-expression. Refs
+      -- whose last use is at-or-before the if can be consumed (ROLLed)
+      -- inside a branch — TS does this and the byte-exact reference
+      -- relies on it (e.g. token-ft transfer's `amount` is consumed
+      -- inside the empty-else then-branch). Pre-fix we used the full
+      -- `smBranch` here, which over-protected and forced PICK where
+      -- TS emits ROLL, causing a +1 stack-depth drift downstream.
+      let innerProtected := computeBranchProtected smBranch lastUses currentIndex outerProtected
+      let thnLastUses := computeLastUses thn
+      let elsLastUses := computeLastUses els
+      -- TS `lowerIf` creates a new `LoweringContext` per branch, so each
+      -- branch's `localBindings` is reset to its own bindings (line 1673,
+      -- 1688). Mirror that.
+      let thnLocal := thn.map (fun b => b.name)
+      let elsLocal := els.map (fun b => b.name)
+      let (thnOps, smThn) := lowerBindingsP progMethods props budget 0 thnLastUses innerProtected thnLocal constInts smBranch thn
+      let (elsOps, smEls) := lowerBindingsP progMethods props budget 0 elsLastUses innerProtected elsLocal constInts smBranch els
+      -- Phase 3z-F: empty-else shadow-rebind synthesis. When the THEN
+      -- branch's top-of-stack name was already in `smBranch` (a property
+      -- shadow-rebind like `count = @ref:t5`) and `els = []`, TS
+      -- (`05-stack-lower.ts:1776-1796`, `1850-1875`) emits a DUP/PICK in
+      -- the empty else and a NIP after ENDIF to remove the stale slot.
+      -- This is distinct from the asymmetric-consumption path below: the
+      -- shadow case does NOT involve THEN consuming parent items, so
+      -- `smThn` and `smBranch` differ ONLY by the new top.
+      -- Recognise both the legacy empty-else shape (`els = []`) and the
+      -- newer canonical TS shape (`els = [{name = topName, value =
+      -- load_const ""}]`). Commit `3fed3295` ("close cross-compiler test
+      -- gaps + fixes") flipped the TS reference to always emit the
+      -- explicit single-binding else; the byte-exact lowering it
+      -- generates is identical to the empty-else case (DUP/PICK in
+      -- else, NIP after ENDIF). Treat both shapes as the shadow-rebind
+      -- path. token-ft is the regression that surfaces this.
+      let isEmptyBytesRebind (b : ANFBinding) (topName : String) : Bool :=
+        b.name = topName &&
+        match b.value with
+        | .loadConst (.bytes ba) => ba.size = 0
+        | _ => false
+      let shadowRebind : Option (StackMap × Nat × String) :=
+        match els, smThn with
+        | [], topName :: _ =>
+            match smBranch.depth? topName with
+            | some d =>
+                -- Only treat as shadow-rebind if NO parent items were
+                -- consumed by THEN (else asymmetric path applies).
+                let consumedByThen := consumedNames smBranch (smThn.tail)
+                if consumedByThen.isEmpty then some (smBranch, d, topName)
+                else none
+            | none => none
+        | [b], topName :: _ =>
+            if isEmptyBytesRebind b topName then
+              match smBranch.depth? topName with
+              | some d =>
+                  let consumedByThen := consumedNames smBranch (smThn.tail)
+                  if consumedByThen.isEmpty then some (smBranch, d, topName)
+                  else none
+              | none => none
+            else none
+        | _, _ => none
+      match shadowRebind with
+      | some (_smB, d, topName) =>
+          -- Phase 7.1.c: Mirror TS `lowerIf` (`05-stack-lower.ts:1839-1846`)
+          -- and the post-ENDIF stale-removal loop (`1905-1929`).
+          --
+          -- elseSynth: TS emits `push(d), pick(d)` where the TS `pick`
+          -- opcode is bare `OP_PICK` (`06-emit.ts:471-473`), giving
+          -- on-wire bytes `OP_<d> OP_PICK`. Our `StackOp.pick d` already
+          -- encodes as `pushBigInt(d) ++ OP_PICK` (`Script/Emit.lean:177`),
+          -- so a standalone `[.pickStruct d]` is byte-identical to TS's
+          -- `[push d, pick]` pair. Adding an explicit `[.push d]` before
+          -- it would double-emit the depth (the bug closed here).
+          --
+          -- cleanup: TS emits `push(d'), roll(d'+1), drop` where d' is
+          -- the post-ENDIF stale depth = `d + 1` (the elseSynth pushed
+          -- a new top, displacing the original `topName` by 1). Bytes:
+          -- `OP_<d+1> OP_ROLL OP_DROP`. `StackOp.roll k` already encodes
+          -- as `pushBigInt(k) ++ OP_ROLL` (`Script/Emit.lean:176`), so
+          -- `[.roll (d+1), .drop]` matches TS bytes exactly. The pre-fix
+          -- `[.push d, .roll (d+1), .drop]` emitted an extraneous leading
+          -- `OP_<d>` (4 bytes vs 3).
+          --
+          -- d == 1 cleanup (theoretical — no current fixture exercises
+          -- it): post-ENDIF stale depth = 2 ⇒ `[.roll 2, .drop]`, NOT
+          -- `[.nip]` as previously coded.
+          let elseSynth : List StackOp :=
+            if d == 0 then [.dup]
+            else [.pickStruct d]
+          let cleanup : List StackOp :=
+            if d == 0 then [.nip]
+            else [.roll (d + 1), .drop]
+          let smCleaned : StackMap := (smBranch.removeAtDepth d).push topName
+          (condOps ++ [.ifOp thnOps (some elseSynth)] ++ cleanup, smCleaned, localBindings)
+      | none =>
+          -- Mirror TS asymmetric-consumption reconciliation
+          -- (`05-stack-lower.ts:1712-1800`):
+          -- 1. Names consumed by THEN that still exist in ELSE → emit
+          --    cleanup ROLL+DROPs in ELSE.
+          -- 2. Names consumed by ELSE that still exist in THEN → emit
+          --    cleanup ROLL+DROPs in THEN.
+          -- 3. After both cleanups, balance depth via empty-bytes push
+          --    (OP_0 is the empty bytestring placeholder TS uses).
+          -- 4. Reconcile parent sm: remove names consumed by both branches.
+          -- Mirrors TS `lowerIf` (`05-stack-lower.ts:1714-1727`).
+          -- `preIfNames` (= smBranch) restricts to parent-scope items;
+          -- branch-local pushes are NOT eligible for cleanup.
+          --
+          -- `dropsForEls` = parent items missing from smThn but still in smEls
+          --              ⇒ THEN consumed them; ELSE must drop them too.
+          -- `dropsForThn` = parent items missing from smEls but still in smThn
+          --              ⇒ ELSE consumed them; THEN must drop them too.
+          let parentInBoth (refSm : StackMap) (otherSm : StackMap) :
+              List String :=
+            smBranch.foldl (init := ([] : List String)) fun acc n =>
+              if listContains acc n then acc
+              else
+                match refSm.depth? n, otherSm.depth? n with
+                | some _, none => acc ++ [n]   -- present in refSm, missing from otherSm
+                | _, _         => acc
+          let dropsForEls := parentInBoth smEls smThn
+          let dropsForThn := parentInBoth smThn smEls
+          let (elsCleanupOps, smElsAfter) :=
+            removeConsumedAtDepths smEls dropsForEls
+          let (thnCleanupOps, smThnAfter) :=
+            removeConsumedAtDepths smThn dropsForThn
+          -- Depth balance: if THEN deeper, push empty bytes in ELSE; vice versa.
+          let thnDepth := smThnAfter.length
+          let elsDepth := smElsAfter.length
+          let (extraEls, extraThn) : (List StackOp × List StackOp) :=
+            if thnDepth > elsDepth then ([.push (.bytes ByteArray.empty)], [])
+            else if elsDepth > thnDepth then ([], [.push (.bytes ByteArray.empty)])
+            else ([], [])
+          let elsFinalOps := elsOps ++ elsCleanupOps ++ extraEls
+          let thnFinalOps := thnOps ++ thnCleanupOps ++ extraThn
+          -- Reconcile parent sm: drop entries consumed by THEN (use THEN
+          -- as canonical reference, mirroring TS line 1813).
+          let parentConsumed := consumedNames smBranch smThn
+          let smParentReconciled : StackMap :=
+            parentConsumed.foldl (init := smBranch) fun m n =>
+              match m.depth? n with
+              | some d => m.removeAtDepth d
+              | none   => m
+          -- Determine post-IF top: if branches added a value, push bindingName.
+          let smPostIf : StackMap :=
+            if smThnAfter.length > smParentReconciled.length then
+              smParentReconciled.push bindingName
+            else
+              smParentReconciled
+          let elseOpt : Option (List StackOp) :=
+            if elsFinalOps.isEmpty then none else some elsFinalOps
+          (condOps ++ [.ifOp thnFinalOps elseOpt], smPostIf, localBindings)
+  | .assert ref =>
+      let (load, sm1) := loadRefLive sm ref currentIndex lastUses outerProtected
+      let ops := load ++ [.opcode "OP_VERIFY"]
+      let sm2 := sm1.popN 1
+      (ops, sm2, localBindings)
+  | .updateProp propName ref =>
+      -- Phase 3z-C: mirror TS `lowerUpdateProp` (`05-stack-lower.ts:1985-2027`).
+      -- 1. Bring the new value to top via liveness-aware load.
+      -- 2. Rename top from `ref` to `propName` so subsequent `loadProp`
+      --    finds the updated value.
+      -- 3. If the OLD `propName` entry survives below (depth ≥ 1), the TS
+      --    reference removes it via NIP (depth 1) or [push d, roll d+1,
+      --    drop] (depth ≥ 2). The TS pass `liftBranchUpdateProps` lifts
+      --    branch-local update_props to the top level, so the
+      --    `_insideBranch=true` skip-cleanup path of TS is unreachable
+      --    in the IRs we lower; we always perform the cleanup here.
+      -- The binding name `_bindingName` is the t-temporary the IR assigns
+      -- to the update_prop result; subsequent code references the prop by
+      -- its property name, not the temporary.
+      let (load, sm1) := loadRefLive sm ref currentIndex lastUses outerProtected
+      let smRenamed : StackMap :=
+        match sm1 with
+        | _ :: rest => propName :: rest
+        | []        => [propName]
+      let (cleanup, sm2) := removePropEntryOps smRenamed propName
+      (load ++ cleanup, sm2, localBindings)
+  | .loop count body iterVar =>
+      -- Loop-fidelity rewrite (2026-06-11; replaces the Phase 3z-F
+      -- lower-once-and-replay arm): per-ITERATION re-lowering against the
+      -- live threaded stack map, mirroring TS `lowerLoop` at
+      -- `05-stack-lower.ts:2109-2176`.
+      --
+      -- The TS reference unrolls the loop at compile time and lowers the
+      -- body EVERY iteration in the SAME context, so PICK/ROLL depths GROW
+      -- across iterations when values strand (e.g. an unreferenced iter
+      -- var buried under the accumulator). `lowerLoopItersP` (below in
+      -- this mutual block) reproduces that fold; the old arm lowered the
+      -- body once per liveness mode and replayed the iteration-0 depths,
+      -- which produced semantically wrong bytes for every body whose
+      -- ending map shape differs from its starting one (the pinned
+      -- `loopCx*` divergence in `Pipeline.lean`).
+      --
+      -- * `outerRefs` (TS 2115-2133): only `load_param` names (≠ iterVar)
+      --   and `@ref:` targets not body-bound. Non-final iterations clamp
+      --   their recorded last-use to `body.length` so they are never
+      --   consumed (TS 2149-2154); ONLY the final iteration sees natural
+      --   last-uses, allowing ROLL/SWAP consumption on the last access.
+      -- * `localBindings` (TS 2136-2138): the body is lowered with the
+      --   ENCLOSING localBindings extended by the body's binding names
+      --   (`new Set([...this.localBindings, ...bodyBindingNames])`), so
+      --   the final-iteration `@ref:` consume gate sees outer locals too
+      --   (ROLL where the previous body-names-only set wrongly PICKed).
+      --   TS restores the enclosing set after the loop (2171); we return
+      --   the unmodified `localBindings`.
+      -- * per-iteration iterVar cleanup (TS 2158-2167): drop iff the iter
+      --   var survives at EXACTLY depth 0. A survivor buried deeper emits
+      --   NOTHING and stays on the map (stranded values are cleaned by
+      --   the end-of-method NIP pass) — the old arm's any-depth `.drop`
+      --   destroyed the body's last value instead.
+      --
+      -- TS does NOT use a generic `outerProtected` set inside loop bodies
+      -- — it relies on the lastUses clamping for outer-refs and on
+      -- `localBindings` for the `@ref:` consume gate — so the body is
+      -- lowered with `outerProtected = []` (the `[]` literal below).
+      let outerRefs := bodyOuterRefs body iterVar
+      let naturalLU := computeLastUses body
+      let nonFinalLU := clampLastUsesForOuter naturalLU outerRefs body.length
+      let loopLocal := localBindings ++ body.map (fun b => b.name)
+      let (ops, smPostLoop) :=
+        lowerLoopItersP progMethods props budget naturalLU nonFinalLU
+          loopLocal constInts body iterVar count sm count
+      -- Loops are statements, not expressions — no stack value is produced
+      -- (TS 2172-2175) and the enclosing localBindings set is restored
+      -- (TS 2171). The post-loop sm is the THREADED map from the final
+      -- iteration, including any stranded iter-var entries (TS leaves
+      -- them on `this.stackMap`; the public-method epilogue NIPs them).
+      (ops, smPostLoop, localBindings)
+  | .arrayLiteral elems =>
+      (lowerArrayElems sm elems, sm.push bindingName, localBindings)
+  -- Phase 3w-b: framework intrinsics with concrete lowering. The
+  -- liveness-aware variants (`*OpsLive`) thread `currentIndex` /
+  -- `lastUses` / `outerProtected` so PICK→ROLL collapse on dead refs
+  -- and OVER→SWAP / DUP→nop collapse on top-of-stack last uses, which
+  -- is required to produce byte-identical hex against the TS reference
+  -- once `lowerMethod` prepends the `_codePart` / `_opPushTxSig`
+  -- implicit param entries to the initial stack map (see Phase 3z-D).
+  | .addRawOutput sat scr    =>
+      let (ops, sm') := lowerAddRawOutputOpsLive sm bindingName sat scr currentIndex lastUses outerProtected
+      (ops, sm', localBindings)
+  | .addDataOutput sat scr   =>
+      let (ops, sm') := lowerAddRawOutputOpsLive sm bindingName sat scr currentIndex lastUses outerProtected
+      (ops, sm', localBindings)
+  | .checkPreimage pre       =>
+      let (ops, sm') := lowerCheckPreimageOpsLive sm bindingName pre currentIndex lastUses outerProtected
+      (ops, sm', localBindings)
+  -- Phase 3z-A: property-table-aware framework intrinsics.
+  | .getStateScript          =>
+      let (ops, sm') := lowerGetStateScriptOpsLive sm bindingName props currentIndex lastUses outerProtected
+      (ops, sm', localBindings)
+  | .deserializeState pre    =>
+      let (ops, sm') := lowerDeserializeStateOpsLive sm pre props currentIndex lastUses outerProtected
+      (ops, sm', localBindings)
+  | .addOutput sat vs _      =>
+      let (ops, sm') := lowerAddOutputOpsLive sm bindingName sat vs props currentIndex lastUses outerProtected
+      (ops, sm', localBindings)
+  -- A14 follow-up: raw_script is also emitted verbatim by the
+  -- program-aware lowerer. No liveness analysis is needed because the
+  -- value carries no temp refs.
+  | .rawScript bytes _ _     =>
+      ([.rawBytes bytes], sm.push bindingName, localBindings)
+termination_by v => (budget, sizeOf v, 0)
+
+/-- Per-iteration loop unrolling for the program-aware lowerer. Mirrors
+the iteration loop `for (let i = 0; i < count; i++)` of TS `lowerLoop`
+(`05-stack-lower.ts:2140-2169`): each iteration
+
+1. pushes the iteration index constant and registers `iterVar` on the
+   LIVE threaded stack map,
+2. RE-LOWERS the body against that map (so PICK/ROLL depths grow when
+   values strand across iterations — TS re-runs `lowerBinding` per
+   iteration in the same context),
+3. drops the iter var iff it survives the body at EXACTLY depth 0
+   (TS 2158-2167); a buried survivor is left stranded on map + stack.
+
+`remaining` counts down from `count`; the iteration index is
+`count - remaining`. The FINAL iteration (`remaining = 1`) lowers under
+the natural last-uses (`naturalLU`) while every earlier iteration uses
+the outer-clamped ones (`nonFinalLU`) so outer refs are only consumable
+on the last pass (TS 2149-2154). `loopLocal` is the enclosing
+localBindings ∪ body binding names (TS 2136-2138); `outerProtected` is
+`[]` inside loop bodies (TS has no such set — see the `.loop` arm). -/
+def lowerLoopItersP (progMethods : List ANFMethod) (props : List ANFProperty)
+    (budget : Nat) (naturalLU nonFinalLU : List (String × Nat))
+    (loopLocal : List String) (constInts : List (String × Int))
+    (body : List ANFBinding) (iterVar : String) (count : Nat) :
+    StackMap → Nat → (List StackOp × StackMap)
+  | sm, 0 => ([], sm)
+  | sm, remaining + 1 =>
+      let i := count - (remaining + 1)
+      let lu := if remaining == 0 then naturalLU else nonFinalLU
+      let smInner := sm.push iterVar
+      let (bodyOps, smBody) :=
+        lowerBindingsP progMethods props budget 0 lu [] loopLocal constInts smInner body
+      let (dropOps, smIter) := iterVarCleanup smBody iterVar
+      let (restOps, smFinal) :=
+        lowerLoopItersP progMethods props budget naturalLU nonFinalLU
+          loopLocal constInts body iterVar count smIter remaining
+      ([StackOp.push (.bigint (Int.ofNat i))] ++ bodyOps ++ dropOps ++ restOps,
+       smFinal)
+termination_by _ n => (budget, sizeOf body, n)
+
+def lowerBindingsP (progMethods : List ANFMethod) (props : List ANFProperty) (budget : Nat)
+    (currentIndex : Nat) (lastUses : List (String × Nat))
+    (outerProtected : List String) (localBindings : List String)
+    (constInts : List (String × Int)) (sm : StackMap) :
+    List ANFBinding → (List StackOp × StackMap)
+  | [] => ([], sm)
+  | (.mk name v _) :: rest =>
+      let (ops, sm', localBindings') :=
+        lowerValueP progMethods props budget currentIndex lastUses outerProtected localBindings constInts sm name v
+      let (ops', sm'') :=
+        lowerBindingsP progMethods props budget (currentIndex + 1) lastUses outerProtected localBindings' constInts sm' rest
+      (ops ++ ops', sm'')
+termination_by bs => (budget, sizeOf bs, 0)
+
+end
+
+/-- Body's last binding is `.assert _`. Used by `lowerMethod` to decide
+whether to elide the terminal `OP_VERIFY` from a public method's spend
+script — Bitcoin Script treats the boolean left on top of the stack as
+the implicit return value, so a public method's terminal assert can drop
+its `OP_VERIFY`. Mirrors TS `05-stack-lower.ts:856-902`. -/
+def bodyEndsInAssert : List ANFBinding → Bool
+  | []        => false
+  | [.mk _ (.assert _) _] => true
+  | _ :: rest => bodyEndsInAssert rest
+
+/--
+Whether a method body contains a `check_preimage` binding (recursing
+through if-branches and loops). Mirrors TS `methodUsesCheckPreimage`
+(`05-stack-lower.ts:4889-4894`). When this returns true, the unlocking
+script pushes an implicit `_opPushTxSig` parameter at the bottom of
+the stack; `lowerMethod` must prepend it to the initial stack map.
+
+Recurses on the binding list `sizeOf` to keep termination structural.
+-/
+def bindingsUseCheckPreimage : List ANFBinding → Bool
+  | []                  => false
+  | (.mk _ v _) :: rest =>
+      let here : Bool :=
+        match v with
+        | .checkPreimage _    => true
+        | .ifVal _ thn els    =>
+            bindingsUseCheckPreimage thn || bindingsUseCheckPreimage els
+        | .loop _ body _      => bindingsUseCheckPreimage body
+        | _                   => false
+      here || bindingsUseCheckPreimage rest
+
+/--
+Whether a method body needs the implicit `_codePart` parameter. Mirrors
+TS `methodUsesCodePart` (`05-stack-lower.ts:4896-4908`):
+* `add_output`, `add_raw_output` — both reference `_codePart` directly
+* `call computeStateOutput` / `call computeStateOutputHash` — single-
+  output stateful continuations.
+
+Note: `add_data_output` is intentionally excluded (the TS reference's
+`lowerAddDataOutput` does not reference `_codePart`).
+-/
+def bindingsUseCodePart : List ANFBinding → Bool
+  | []                  => false
+  | (.mk _ v _) :: rest =>
+      let here : Bool :=
+        match v with
+        | .addOutput _ _ _    => true
+        | .addRawOutput _ _   => true
+        | .call f _           =>
+            f = "computeStateOutput" || f = "computeStateOutputHash"
+        | .ifVal _ thn els    =>
+            bindingsUseCodePart thn || bindingsUseCodePart els
+        | .loop _ body _      => bindingsUseCodePart body
+        | _                   => false
+      here || bindingsUseCodePart rest
+
+/--
+Whether a method body contains a `deserialize_state` binding. Mirrors the
+TS `lowerMethod` post-pass at `05-stack-lower.ts:4937-4942`:
+
+```
+const hasDeserializeState =
+  method.body.some(b => b.value.kind === 'deserialize_state');
+if (method.isPublic && hasDeserializeState) {
+  ctx.cleanupExcessStack();
+}
+```
+
+When the method body deserialized state from the preimage (and is public),
+we must follow the body with `(stack-depth - 1)` `OP_NIP` opcodes so the
+spend script returns a single boolean on top — matching Bitcoin Script's
+truthy-top-of-stack contract.
+
+Recurses into if-branches and loop bodies so nested deserialize_state
+nodes (rare but legal in some hand-written ANF) trigger the cleanup.
+-/
+def bindingsUseDeserializeState : List ANFBinding → Bool
+  | []                  => false
+  | (.mk _ v _) :: rest =>
+      let here : Bool :=
+        match v with
+        | .deserializeState _ => true
+        | .ifVal _ thn els    =>
+            bindingsUseDeserializeState thn || bindingsUseDeserializeState els
+        | .loop _ body _      => bindingsUseDeserializeState body
+        | _                   => false
+      here || bindingsUseDeserializeState rest
+
+def lowerMethod (progMethods : List ANFMethod) (props : List ANFProperty) (m : ANFMethod) : StackMethod :=
+  -- Initial stack map: parameter names in declaration order, top = last param.
+  -- For methods that call `check_preimage`, the unlocking script pushes ONE
+  -- implicit param before the user-visible params (BUG-100: the OP_PUSH_TX
+  -- signature is now derived on-chain from the preimage, so there is NO
+  -- `_opPushTxSig` witness — see TS lowerMethod at `05-stack-lower.ts:4956-4980`):
+  --   * `_codePart` — the code portion of the locking script, prepended only
+  --                   when add_output / add_raw_output / computeStateOutput*
+  --                   reference it.
+  -- It sits at the bottom of the stack; in our top-first list it is at the
+  -- *tail*. The user params (which get DUP/PICK loads) remain on top.
+  let userMap : StackMap := m.params.map (·.name) |>.reverse
+  let usesPreimage := bindingsUseCheckPreimage m.body
+  let usesCode     := bindingsUseCodePart m.body
+  -- Nested form (BUG-100): a `check_preimage` method prepends `_codePart` only
+  -- when the continuation builders need it, and NEVER `_opPushTxSig`. The
+  -- outer `if usesPreimage` is kept so non-stateful methods reduce through the
+  -- same `if_false` path their proofs already use.
+  let initialMap : StackMap :=
+    if usesPreimage then
+      if usesCode then
+        userMap ++ ["_codePart"]
+      else
+        userMap
+    else
+      userMap
+  -- Liveness analysis is per-binding-list. At the top-level method body
+  -- there is no outer scope, so `outerProtected = []` and parameters can
+  -- be consumed (ROLLed away) on their last use.
+  let bodyLastUses := computeLastUses m.body
+  let topLevelLocal := m.body.map (fun b => b.name)
+  -- Phase 4-K: collect compile-time integer literals (binding name → int)
+  -- for the entire method body, including nested if-branches and loop
+  -- bodies. Used by the Merkle codegen dispatch arm to extract the
+  -- depth literal that becomes the unrolled-loop bound.
+  let bodyConstInts := collectConstInts m.body
+  let (rawOps, finalSm) :=
+    lowerBindingsP progMethods props defaultInlineBudget 0 bodyLastUses [] topLevelLocal bodyConstInts initialMap m.body
+  -- Terminal-assert elision:
+  -- A public method whose body ends in `.assert _` drops the trailing
+  -- `OP_VERIFY` — the boolean stays on top of the stack as the script's
+  -- implicit return value.
+  let endsInOpVerify : Bool :=
+    match rawOps.getLast? with
+    | some (.opcode "OP_VERIFY") => true
+    | _                          => false
+  let opsAfterAssert :=
+    if m.isPublic && bodyEndsInAssert m.body && endsInOpVerify then
+      rawOps.dropLast
+    else
+      rawOps
+  -- Excess-stack cleanup. Mirrors TS `lowerMethod`'s post-pass
+  -- (`05-stack-lower.ts:4920-4935` + `cleanupExcessStack`): public
+  -- methods emit `OP_NIP` repeatedly until only the truthy boolean (the
+  -- terminal assert's residue) remains on top of the runtime stack.
+  -- The TS reference runs `cleanupExcessStack()` UNCONDITIONALLY for
+  -- public methods (the old `hasDeserializeState` gate missed the
+  -- readonly-field-binding path and failed mainnet CLEANSTACK; it also
+  -- removes refs left behind by the repeated-operand COPY rule of PRs
+  -- #62/#67/#68 — the canonical `t := x + x` fixtures end with a NIP
+  -- that removes the lingering `x`).
+  --
+  -- The Lean gate is `isPublic && bodyEndsInAssert && depth > 1`. The
+  -- extra `bodyEndsInAssert` conjunct is byte-IDENTICAL to TS on every
+  -- validator-accepted program: `02-validate.ts:325-344` REQUIRES public
+  -- methods to end with `assert()` (stateful contracts auto-inject it),
+  -- so `bodyEndsInAssert = true` whenever the TS epilogue can differ
+  -- from a no-op. The conjunct exists so the `*_no_post` bridge lemmas
+  -- (keyed on `bodyEndsInAssert = false` — shapes reachable only via
+  -- hand-written `--ir` input) remain true as stated. Known residual
+  -- model-vs-TS divergence: a hand-written public IR body that does NOT
+  -- end in assert and leaves ≥ 2 stack slots gets TS NIPs but no model
+  -- NIPs — degenerate (validator-rejected) and outside every pinned
+  -- fixture.
+  --
+  -- The TS reference computes `excess = stackMap.depth - 1` against the
+  -- depth *after* the body has run, including the terminal assert's
+  -- residue (TS leaves it on the stack via the `terminal=true` path of
+  -- `lowerAssert`). Our `.assert` arm above always pops after emitting
+  -- `OP_VERIFY`, and the terminal trailing `OP_VERIFY` is later stripped
+  -- by `dropLast`. To re-align with the TS depth model we add `+1` to
+  -- `finalSm.length` whenever the terminal-assert elision actually fires.
+  let droppedTerminalVerify : Bool :=
+    m.isPublic && bodyEndsInAssert m.body && endsInOpVerify
+  let depthAfterBody : Nat :=
+    finalSm.length + (if droppedTerminalVerify then 1 else 0)
+  let nipCount : Nat :=
+    if m.isPublic && bodyEndsInAssert m.body && depthAfterBody > 1 then
+      depthAfterBody - 1
+    else
+      0
+  let nipOps : List StackOp := List.replicate nipCount StackOp.nip
+  let ops := opsAfterAssert ++ nipOps
+  { name := m.name
+    ops := ops
+    maxStackDepth := 0 }
+
+def lower (p : ANFProgram) : StackProgram :=
+  -- Mirror TS: only public methods become top-level `StackMethod` entries.
+  -- Private methods are inlined at call sites by `lowerValueP`'s `.methodCall`
+  -- arm. Constructors are also excluded (their bodies populate property slots
+  -- at deploy time, not at runtime).
+  { contractName := p.contractName
+    methods := (p.methods.filter (·.isPublic)).map (lowerMethod p.methods p.properties) }
+
+/-! ## SimpleANF predicate
+
+A program is `SimpleANF` when every binding-value uses one of the ten
+concretely-handled constructors and every method body is similarly
+restricted. Programs satisfying this predicate are byte-exact under
+`lower`, peephole-stable, and provably correct via the simulation
+theorem in `Sim.lean`.
+-/
+
+mutual
+
+/--
+Phase 3d admits eleven constructors: the ten Phase 3b "simple" cases
+plus `methodCall` (which inlines via `lowerValueP` against the
+program's method table; see `lookupMethod` and `loadAndBindArgs`).
+The predicate doesn't recursively check the *callee's* body — that
+check is performed during top-level lowering when the callee itself
+is visited as a method in the program.
+
+Out-of-scope (`OP_RUNAR_*_UNSUPPORTED` sentinels): `getStateScript`,
+`checkPreimage`, `deserializeState`, `addOutput`, `addRawOutput`,
+`addDataOutput`. These require full BIP-143 byte construction.
+-/
+def simpleValue : ANFValue → Bool
+  | .loadParam _              => true
+  | .loadProp _               => true
+  | .loadConst _              => true
+  | .binOp _ _ _ _            => true
+  | .unaryOp _ _ _            => true
+  | .call _ _                 => true
+  | .assert _                 => true
+  | .updateProp _ _           => true
+  | .arrayLiteral _           => true
+  | .methodCall _ _ _         => true
+  | .ifVal _ thn els          =>
+      simpleBindings thn && simpleBindings els
+  | .loop _ body _            =>
+      simpleBindings body
+  -- Phase 3w-b — concretely lowered framework intrinsics:
+  | .checkPreimage _          => true
+  | .addRawOutput _ _         => true
+  | .addDataOutput _ _        => true
+  -- Phase 3z-A — property-table-aware framework intrinsics:
+  | .getStateScript           => true
+  | .deserializeState _       => true
+  | .addOutput _ _ _          => true
+  -- A14 follow-up — raw_script lowers to a single `.rawBytes` op:
+  | .rawScript _ _ _          => true
+
+def simpleBindings : List ANFBinding → Bool
+  | [] => true
+  | (.mk _ v _) :: rest => simpleValue v && simpleBindings rest
+
+end
+
+def simpleMethod (m : ANFMethod) : Bool :=
+  simpleBindings m.body
+
+def SimpleANF (p : ANFProgram) : Prop :=
+  p.methods.all simpleMethod = true
+
+instance (p : ANFProgram) : Decidable (SimpleANF p) :=
+  inferInstanceAs (Decidable (_ = true))
+
+/-! ## Generic-else bridge lemmas for `lowerValueP (.call …)`
+
+When `func` is not in the set of specially-cased builtins, `lowerValueP`
+falls through to the generic else branch:
+
+```lean
+let (argOps, sm1) := lowerArgsLive currentIndex lastUses outerProtected sm args
+let sm2 := (sm1.popN args.length).push bindingName
+(argOps ++ (builtinOpcode func).map (.opcode), sm2, localBindings)
+```
+
+The predicate `isSpecialCallFunc` captures ALL special-case function names
+so that bridge lemmas in `Agrees.lean` can avoid triggering kernel whnf
+evaluation of the 60-guard chain by using `native_decide` for closed-term
+string checks.
+-/
+
+/-- Boolean guard: `true` iff `func` is handled by a special-case branch
+in `lowerValueP`'s `.call` arm (i.e. anything **except** the generic-else
+fallthrough). -/
+def isSpecialCallFunc (func : String) : Bool :=
+  func.startsWith "extract" ||
+  func == "buildChangeOutput" || func == "computeStateOutput" ||
+  func == "computeStateOutputHash" || func == "substr" ||
+  func == "percentOf" || func == "mulDiv" ||
+  func == "safediv" || func == "safemod" ||
+  func == "clamp" || func == "pow" || func == "sqrt" ||
+  func == "gcd" || func == "log2" || func == "sign" ||
+  func == "verifyRabinSig" ||
+  func == "sha256Compress" || func == "sha256Finalize" ||
+  func == "blake3Compress" || func == "blake3Hash" ||
+  func == "verifyWOTS" ||
+  func == "ecAdd" || func == "ecMul" || func == "ecMulGen" ||
+  func == "ecNegate" || func == "ecOnCurve" || func == "ecModReduce" ||
+  func == "ecEncodeCompressed" || func == "ecMakePoint" ||
+  func == "ecPointX" || func == "ecPointY" ||
+  func == "p256Add" || func == "p256Mul" || func == "p256MulGen" ||
+  func == "p256Negate" || func == "p256OnCurve" ||
+  func == "p256EncodeCompressed" || func == "verifyECDSA_P256" ||
+  func == "p384Add" || func == "p384Mul" || func == "p384MulGen" ||
+  func == "p384Negate" || func == "p384OnCurve" ||
+  func == "p384EncodeCompressed" || func == "verifyECDSA_P384" ||
+  func == "verifySLHDSA_SHA2_128s" || func == "verifySLHDSA_SHA2_128f" ||
+  func == "verifySLHDSA_SHA2_192s" || func == "verifySLHDSA_SHA2_192f" ||
+  func == "verifySLHDSA_SHA2_256s" || func == "verifySLHDSA_SHA2_256f" ||
+  func == "bbFieldAdd" || func == "bbFieldSub" ||
+  func == "bbFieldMul" || func == "bbFieldInv" ||
+  func == "bbExt4Mul0" || func == "bbExt4Mul1" ||
+  func == "bbExt4Mul2" || func == "bbExt4Mul3" ||
+  func == "bbExt4Inv0" || func == "bbExt4Inv1" ||
+  func == "bbExt4Inv2" || func == "bbExt4Inv3" ||
+  func == "merkleRootSha256" || func == "merkleRootHash256"
+
+-- NOTE: The abstract `lowerValueP_call_not_special` theorem cannot be proved
+-- in Lean 4.29.1 because `simp only [lowerValueP]` for abstract `func` triggers
+-- a whnf timeout (the well-founded fixpoint unfolding exhausts 200k heartbeats).
+-- Bridge lemmas in Agrees.lean instead case-split on the concrete function name
+-- first (via `rcases hFunc with rfl | ...`), then use `unfold lowerValueP` on
+-- the resulting concrete `.call "abs" [x]` goal, which IS reducible cheaply.
+-- See `section A4BridgeLemmas` in Agrees.lean for the implementation.
+
+end Lower
+end RunarVerification.Stack

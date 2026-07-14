@@ -269,8 +269,8 @@ func TestRPCProvider_GetFeeRate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetFeeRate failed: %v", err)
 	}
-	if rate != 1 {
-		t.Fatalf("expected fee rate 1, got %d", rate)
+	if rate != 100 {
+		t.Fatalf("expected fee rate 100, got %d", rate)
 	}
 }
 
@@ -280,8 +280,8 @@ func TestRPCProvider_GetFeeRate(t *testing.T) {
 
 func TestRPCProvider_GetNetwork_Default(t *testing.T) {
 	provider := NewRPCProvider("http://unused", "user", "pass")
-	if provider.GetNetwork() != "mainnet" {
-		t.Fatalf("expected mainnet, got %s", provider.GetNetwork())
+	if provider.GetNetwork() != "testnet" {
+		t.Fatalf("expected testnet, got %s", provider.GetNetwork())
 	}
 }
 

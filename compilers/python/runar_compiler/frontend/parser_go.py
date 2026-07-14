@@ -9,6 +9,7 @@ from __future__ import annotations
 from runar_compiler.frontend.ast_nodes import (
     ContractNode, PropertyNode, MethodNode, ParamNode, SourceLocation,
     PrimitiveType, FixedArrayType, CustomType, TypeNode,
+    ArrayLiteralExpr,
     BigIntLiteral, BoolLiteral, ByteStringLiteral, Identifier,
     PropertyAccessExpr, MemberExpr, BinaryExpr, UnaryExpr, CallExpr,
     TernaryExpr, IndexAccessExpr, IncrementExpr, DecrementExpr,
@@ -87,17 +88,21 @@ class Token:
 _GO_TYPE_MAP: dict[str, str] = {
     "Int": "bigint",
     "Bigint": "bigint",
+    "BigintBig": "bigint",
     "Bool": "boolean",
     "ByteString": "ByteString",
     "PubKey": "PubKey",
     "Sig": "Sig",
     "Sha256": "Sha256",
+    "Sha256Digest": "Sha256",
     "Ripemd160": "Ripemd160",
     "Addr": "Addr",
     "SigHashPreimage": "SigHashPreimage",
     "RabinSig": "RabinSig",
     "RabinPubKey": "RabinPubKey",
     "Point": "Point",
+    "P256Point": "P256Point",
+    "P384Point": "P384Point",
 }
 
 # Native Go types that map to Runar types
@@ -128,6 +133,7 @@ _GO_BUILTIN_MAP: dict[str, str] = {
     "Hash160": "hash160",
     "Hash256": "hash256",
     "Sha256": "sha256",
+    "Sha256Hash": "sha256",
     "Ripemd160": "ripemd160",
     "CheckSig": "checkSig",
     "CheckMultiSig": "checkMultiSig",
@@ -154,7 +160,13 @@ _GO_BUILTIN_MAP: dict[str, str] = {
     "ExtractInputIndex": "extractInputIndex",
     "ExtractSigHashType": "extractSigHashType",
     "ExtractOutputs": "extractOutputs",
+    # Intent sub-covenant intrinsics (BSVM Phase 13).
+    "ExtractPrevOutputScript": "extractPrevOutputScript",
+    "RequireOutputP2PKH":      "requireOutputP2PKH",
+    "CurrentBlockHeight":      "currentBlockHeight",
     "AddOutput": "addOutput",
+    "AddRawOutput": "addRawOutput",
+    "AddDataOutput": "addDataOutput",
     "GetStateScript": "getStateScript",
     "Safediv": "safediv",
     "Safemod": "safemod",
@@ -182,6 +194,22 @@ _GO_BUILTIN_MAP: dict[str, str] = {
     "EC_P": "EC_P",
     "EC_N": "EC_N",
     "EC_G": "EC_G",
+    # P-256 (NIST secp256r1)
+    "VerifyECDSAP256":         "verifyECDSA_P256",
+    "P256Add":                 "p256Add",
+    "P256Mul":                 "p256Mul",
+    "P256MulGen":              "p256MulGen",
+    "P256Negate":              "p256Negate",
+    "P256OnCurve":             "p256OnCurve",
+    "P256EncodeCompressed":    "p256EncodeCompressed",
+    # P-384 (NIST secp384r1)
+    "VerifyECDSAP384":         "verifyECDSA_P384",
+    "P384Add":                 "p384Add",
+    "P384Mul":                 "p384Mul",
+    "P384MulGen":              "p384MulGen",
+    "P384Negate":              "p384Negate",
+    "P384OnCurve":             "p384OnCurve",
+    "P384EncodeCompressed":    "p384EncodeCompressed",
 }
 
 
@@ -743,13 +771,16 @@ class _GoParser:
 
             field_loc = self.loc()
 
-            # Check for embedded type: runar.SmartContract or runar.StatefulSmartContract
+            # Check for embedded type: runar.SmartContract,
+            # runar.StatefulSmartContract, or runar.UnsafeSmartContract
             if self.check(TOK_IDENT) and self._is_embed_field():
                 embed_name = self._parse_embedded_type()
                 if embed_name == "SmartContract":
                     parent_class = "SmartContract"
                 elif embed_name == "StatefulSmartContract":
                     parent_class = "StatefulSmartContract"
+                elif embed_name == "UnsafeSmartContract":
+                    parent_class = "UnsafeSmartContract"
                 self.skip_semicolons()
                 continue
 
@@ -1553,12 +1584,34 @@ class _GoParser:
                 sel_tok = self.expect(TOK_IDENT)
                 sel_name = sel_tok.value
 
-                # Type conversion: runar.Int(0), runar.Bigint(x), runar.Bool(x)
-                if sel_name in ("Int", "Bigint", "Bool") and self.check(TOK_LPAREN):
+                # Type conversion: runar.Int(0), runar.Bigint(x), runar.BigintBig(x), runar.Bool(x)
+                if sel_name in ("Int", "Bigint", "BigintBig", "Bool") and self.check(TOK_LPAREN):
                     args = self._parse_call_args()
                     if len(args) == 1:
                         return args[0]
                     return BigIntLiteral(value=0)
+
+                # runar.ByteString("literal") -> ByteStringLiteral (hex-encoded bytes);
+                # runar.ByteString(variable) -> unwrap (type conversion no-op).
+                if sel_name == "ByteString" and self.check(TOK_LPAREN):
+                    saved_pos = self.pos
+                    self.advance()  # consume '('
+                    if self.check(TOK_STRING):
+                        str_tok = self.advance()
+                        if self.check(TOK_RPAREN):
+                            self.advance()  # consume ')'
+                            # Hex-encode raw bytes of the string literal.
+                            hex_str = str_tok.value.encode("latin-1", errors="replace").hex()
+                            return ByteStringLiteral(value=hex_str)
+                    # Fall back: restore and parse as args for type-conversion unwrap.
+                    self.pos = saved_pos
+                    args = self._parse_call_args()
+                    if len(args) == 1:
+                        return args[0]
+                    return CallExpr(
+                        callee=Identifier(name="byteString"),
+                        args=args,
+                    )
 
                 builtin_name = _map_go_builtin(sel_name)
 
@@ -1600,9 +1653,86 @@ class _GoParser:
             self.expect(TOK_RPAREN)
             return expr
 
+        # Array literal: bare `[a, b, c]` OR Go composite literal
+        # `[N]T{a, b}` (also `[]T{a, b}` and multi-dim `[N][M]T{...}`).
+        if tok.kind == TOK_LBRACKET:
+            return self._parse_go_array_or_composite_literal()
+
+        # Nested composite-literal body for multi-dim arrays:
+        # `[2][2]Bigint{{1, 2}, {3, 4}}`.
+        if tok.kind == TOK_LBRACE:
+            return self._parse_go_brace_literal()
+
         self.add_error(f"line {tok.line}: unexpected token {tok.value!r}")
         self.advance()
         return BigIntLiteral(value=0)
+
+    def _parse_go_array_or_composite_literal(self) -> Expression:
+        """Parse either a bare `[a, b, …]` array literal or a Go composite
+        literal `[N]T{a, b, …}` (also `[]T{...}` and nested-dim variants).
+
+        Both surfaces emit an ArrayLiteralExpr so all 7 tiers lower to the
+        same `array_literal` ANF node.
+        """
+        saved_pos = self.pos
+        self.expect(TOK_LBRACKET)
+        # Try to recognise the composite-literal head: `[ <number>? ] <type>+ {`.
+        composite = False
+        if self.check(TOK_NUMBER) or self.check(TOK_RBRACKET):
+            if self.check(TOK_NUMBER):
+                self.advance()
+            if self.check(TOK_RBRACKET):
+                self.advance()  # consume ']'
+                # Consume any additional `[N]` dims for multi-dim arrays.
+                while self.check(TOK_LBRACKET):
+                    dim_saved = self.pos
+                    self.advance()
+                    if self.check(TOK_NUMBER):
+                        self.advance()
+                    if not self.check(TOK_RBRACKET):
+                        self.pos = dim_saved
+                        break
+                    self.advance()
+                # Consume the element type: `*T`, `T`, or `runar.T`.
+                if self.check(TOK_STAR):
+                    self.advance()
+                if self.check(TOK_IDENT):
+                    self.advance()
+                    while self.check(TOK_DOT):
+                        self.advance()
+                        if self.check(TOK_IDENT):
+                            self.advance()
+                        else:
+                            break
+                if self.check(TOK_LBRACE):
+                    composite = True
+                    return self._parse_go_brace_literal()
+        if not composite:
+            self.pos = saved_pos
+            self.expect(TOK_LBRACKET)
+        elements: list[Expression] = []
+        while not self.check(TOK_RBRACKET) and not self.check(TOK_EOF):
+            elements.append(self._parse_expression())
+            if not self.match(TOK_COMMA):
+                break
+        self.expect(TOK_RBRACKET)
+        return ArrayLiteralExpr(elements=elements)
+
+    def _parse_go_brace_literal(self) -> Expression:
+        """Parse `{e, e, …}` — the body of a Go composite literal. Nested
+        `{ … }` bodies are recursively parsed for multi-dim arrays.
+        """
+        self.expect(TOK_LBRACE)
+        elements: list[Expression] = []
+        while not self.check(TOK_RBRACE) and not self.check(TOK_EOF):
+            if self.check(TOK_LBRACE):
+                elements.append(self._parse_go_brace_literal())
+            else:
+                elements.append(self._parse_expression())
+            if not self.match(TOK_COMMA):
+                break
+        self.expect(TOK_RBRACE)
+        return ArrayLiteralExpr(elements=elements)
 
     def _parse_call_args(self) -> list[Expression]:
         """Parse a function call argument list: (expr, expr, ...)"""

@@ -243,6 +243,106 @@ The following TypeScript types are **not permitted** in Rúnar:
 - Object types, interfaces, type aliases, union types, intersection types
 - `Map`, `Set`, `Promise`, and all standard library types
 
+### Fixed-Size Arrays
+
+`FixedArray<T, N>` declares a compile-time-sized array of `N` elements of
+type `T`. It is the only array type Rúnar supports -- there is no
+dynamic `T[]`, no slices, no push/pop, and no length introspection
+beyond the static `N`.
+
+**Surface syntax (by format):**
+
+| Format         | Declaration                                         |
+|----------------|-----------------------------------------------------|
+| TypeScript     | `board: FixedArray<bigint, 9> = [0n, 0n, ...];`     |
+| Solidity-like  | `bigint[9] board;`                                  |
+| Move-style     | `board: vector<bigint> /*size=9*/;`                 |
+| Go DSL         | `Board [9]runar.Bigint`                             |
+| Rust DSL       | `board: [Bigint; 9]`                                |
+| Python         | `board: FixedArray[Bigint, 9]`                      |
+| Zig            | `board: [9]runar.Bigint`                            |
+| Ruby           | `board: FixedArray[Bigint, 9]`                      |
+
+The TypeScript parser is the reference. Other formats may not yet
+implement fixed arrays in v1 of this feature; they are listed here so
+the surface shape is agreed across compilers.
+
+**Allowed element types:** any Rúnar primitive (`bigint`, `boolean`,
+`ByteString`, `PubKey`, `Sig`, `Sha256`, `Ripemd160`, `Addr`, `Point`,
+`SigHashPreimage`) plus a nested `FixedArray<T, M>`. `FixedArray<void,
+N>` is a compile error.
+
+**Length rule:** `N` must be a bigint literal `≥ 1`. `N = 0` and
+negative lengths are compile errors. `N` may not be a constant
+expression or an identifier.
+
+**Allowed positions:** `FixedArray` types may appear **only** as a
+property of a contract class. They are **not** permitted as:
+
+- method parameters
+- constructor parameters
+- local variables (`let` / `const`)
+- method return types
+
+The validator rejects all four uses with a source-located error. If a
+caller needs to pass N elements to a method, the caller must pass them
+as N individual scalar parameters.
+
+**Initializer:** optional. If present, the initializer must be an
+array literal with exactly `N` elements, each of which is a literal
+value of the element type (or, for nested `FixedArray<FixedArray<T,
+M>, N>`, a nested array literal of the correct shape). Function-call
+initializers are rejected. A mismatched length is a compile error.
+
+```ts
+// ok: literal initializer
+board: FixedArray<bigint, 3> = [0n, 0n, 0n];
+
+// ok: no initializer — must then be assigned in the constructor
+data: FixedArray<ByteString, 2>;
+
+// error: length mismatch
+bad: FixedArray<bigint, 3> = [0n, 0n];
+
+// error: non-literal element
+bad: FixedArray<bigint, 3> = [0n, hash(x), 0n];
+```
+
+**Indexing semantics:**
+
+- `this.arr[K]` where `K` is a bigint literal in `[0, N)` lowers to a
+  direct field access. The emitted Bitcoin Script is identical to a
+  hand-rolled `this.arr_K` reference -- there is no array-like runtime
+  object, no per-access cost, and no bounds check.
+- `this.arr[K]` where `K` is a literal outside `[0, N)` is a compile
+  error.
+- `this.arr[expr]` where `expr` is a runtime expression lowers to an
+  N-way dispatch. **Writes** hard-fail with `assert(false)` on
+  out-of-range indices. **Reads** silently fall through to the last
+  slot -- there is no implicit bounds check. If the caller cares, they
+  must write `assert(i < N)` explicitly. This asymmetry is intentional:
+  a bounds-checked read would require a preamble `assert` injected
+  around every expression, which is awkward to thread through
+  sub-expression contexts.
+- Nested literal-index chains are supported: `this.grid[0][1]` lowers
+  to a direct access on `grid__0__1`. Runtime indexing on a nested
+  `FixedArray` is not supported in v1 and is a compile error.
+
+**Internal lowering.** The `expand-fixed-arrays` pass rewrites every
+`FixedArray` property into `N` scalar sibling properties
+`<base>__<i>` (for `i = 0..N-1`). Downstream passes (ANF lowering,
+stack lowering, emit) see and operate on the siblings as if they were
+hand-written. State serialization, ABI, and SDK all transparently
+re-group the siblings back into a single logical array on read.
+
+**Marker invariant.** The expansion pass attaches a synthetic marker
+(`__syntheticArrayBase`) to each sibling it creates. The ABI / state
+re-grouping step uses the marker to recognise compiler-generated
+siblings. A hand-written contract that happens to have properties
+named `foo__0`, `foo__1`, `foo__2` of the same type is **not**
+re-grouped -- the marker is missing, so the regrouper leaves them as
+independent scalars.
+
 ---
 
 ## 9. Statements
@@ -614,10 +714,24 @@ BuiltinFunction_Preimage
 ```ebnf
 BuiltinFunction_State
     = 'addOutput'          /* this.addOutput(satoshis: bigint, ...stateValues): void */
+    | 'addRawOutput'       /* this.addRawOutput(satoshis: bigint, scriptBytes: ByteString): void */
+    | 'addDataOutput'      /* this.addDataOutput(satoshis: bigint, scriptBytes: ByteString): void */
     ;
 ```
 
 **Constraint:** The type checker enforces that `addOutput` receives exactly `1 + N` arguments, where `N` is the number of mutable (non-`readonly`) properties on the contract. The first argument is the satoshi amount (`bigint`). The remaining `N` arguments are the new state values, which must match the types of the mutable properties in declaration order.
+
+`addRawOutput(satoshis, scriptBytes)` registers a state output whose script is given verbatim by the caller (instead of the contract's own code part). It is treated as a state output for continuation-hash purposes.
+
+`addDataOutput(satoshis, scriptBytes)` registers an **additional** transaction output that is NOT a state continuation. Typical use is emitting an `OP_RETURN` data payload alongside the contract's next state.
+
+**Continuation-hash generalization.** For a stateful public method, the compiler asserts that the spending transaction's `hashOutputs` field matches the hash256 of the concatenation of, in order:
+
+1. state outputs — either the single auto-computed state continuation, or every `addOutput` / `addRawOutput` call in source order,
+2. data outputs — every `addDataOutput` call in source order,
+3. the change output — a P2PKH to the SDK-supplied `_changePKH` with value `_changeAmount`.
+
+This is the equation `hashOutputs(txPreimage) == hash256([state outputs] || [data outputs] || changeOutput)`. Both single-output and multi-output state continuations support interleaving data outputs.
 
 The complete set of built-in functions is:
 

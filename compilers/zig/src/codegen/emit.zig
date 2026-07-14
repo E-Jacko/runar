@@ -11,6 +11,7 @@
 const std = @import("std");
 const types = @import("../ir/types.zig");
 const opcodes = @import("opcodes.zig");
+const stack_lower = @import("../passes/stack_lower.zig");
 const Opcode = opcodes.Opcode;
 
 // ============================================================================
@@ -30,8 +31,16 @@ pub const EmitContext = struct {
     byte_offset: u32 = 0,
     /// Constructor slot positions: (param_index, byte_offset) pairs.
     constructor_slots: std.ArrayListUnmanaged(types.ConstructorSlot) = .empty,
+    /// CodeSepIndex placeholder slots: OP_0 placeholders that the SDK replaces
+    /// with the adjusted codeSeparatorIndex at deployment time.
+    code_sep_index_slots: std.ArrayListUnmanaged(types.CodeSepIndexSlot) = .empty,
     /// Byte offsets of OP_CODESEPARATOR instructions.
     code_separator_indices: std.ArrayListUnmanaged(u32) = .empty,
+    /// Byte ranges produced by raw_script ANF nodes (asm({...}) intrinsic).
+    /// Each entry records the (offset, length, in_arity, out_arity) span so
+    /// the static analyzer can treat the bytes as one opaque stack-effect
+    /// step. Empty when no asm() calls were emitted.
+    raw_script_spans: std.ArrayListUnmanaged(types.RawScriptSpan) = .empty,
     /// Source map: records which opcode corresponds to which source location.
     source_map: std.ArrayListUnmanaged(types.SourceMapping) = .empty,
     /// Pending source location to record on the next emitted opcode.
@@ -53,7 +62,9 @@ pub const EmitContext = struct {
         self.owned_asm_parts.deinit(self.allocator);
         self.asm_parts.deinit(self.allocator);
         self.constructor_slots.deinit(self.allocator);
+        self.code_sep_index_slots.deinit(self.allocator);
         self.code_separator_indices.deinit(self.allocator);
+        self.raw_script_spans.deinit(self.allocator);
         self.source_map.deinit(self.allocator);
     }
 
@@ -109,7 +120,8 @@ pub const EmitContext = struct {
 
         try self.recordSourceMapping();
         const start = self.script_bytes.items.len;
-        try opcodes.encodePushData(self.script_bytes.writer(self.allocator), data);
+        const pd_writer = opcodes.ArrayListWriter{ .list = &self.script_bytes, .allocator = self.allocator };
+        try opcodes.encodePushData(pd_writer, data);
         const bytes_written: u32 = @intCast(self.script_bytes.items.len - start);
         self.byte_offset += bytes_written;
         self.opcode_index += 1;
@@ -123,7 +135,8 @@ pub const EmitContext = struct {
     pub fn emitScriptNumber(self: *EmitContext, n: i64) !void {
         try self.recordSourceMapping();
         const start = self.script_bytes.items.len;
-        try opcodes.encodeScriptNumber(self.script_bytes.writer(self.allocator), n);
+        const sn_writer = opcodes.ArrayListWriter{ .list = &self.script_bytes, .allocator = self.allocator };
+        try opcodes.encodeScriptNumber(sn_writer, n);
         const bytes_written: u32 = @intCast(self.script_bytes.items.len - start);
         self.byte_offset += bytes_written;
         self.opcode_index += 1;
@@ -144,6 +157,30 @@ pub const EmitContext = struct {
         }
     }
 
+    /// Emit a Bitcoin Script number whose magnitude exceeds `i64` range,
+    /// given as a decimal-string literal (optional leading `-`, ASCII
+    /// digits 0-9, no underscores, no `n` suffix). The bytes are encoded
+    /// little-endian sign-magnitude with a length-prefixed push, matching
+    /// the reference Go / TS / Python emitters byte-for-byte for the 256-bit
+    /// constants exercised by the schnorr-zkp fixture. Callers that hold a
+    /// value already known to fit `i64` must use `emitScriptNumber` instead
+    /// so the existing small-int OP_N / OP_1NEGATE shortcuts are honoured.
+    pub fn emitScriptNumberFromDecimal(self: *EmitContext, decimal: []const u8) !void {
+        try self.recordSourceMapping();
+        const start = self.script_bytes.items.len;
+        const sn_writer = opcodes.ArrayListWriter{ .list = &self.script_bytes, .allocator = self.allocator };
+        try opcodes.encodeScriptNumberFromDecimal(self.allocator, sn_writer, decimal);
+        const bytes_written: u32 = @intCast(self.script_bytes.items.len - start);
+        self.byte_offset += bytes_written;
+        self.opcode_index += 1;
+
+        // ASM: just show the decimal representation verbatim (the value is
+        // oversize by construction; small-int OP_N is unreachable here).
+        const num_str = try self.allocator.dupe(u8, decimal);
+        try self.owned_asm_parts.append(self.allocator, num_str);
+        try self.asm_parts.append(self.allocator, num_str);
+    }
+
     /// Emit a push bool: true -> OP_TRUE (OP_1), false -> OP_FALSE (OP_0).
     /// Note: delegates to emitOpcode which handles recordSourceMapping + opcode_index.
     pub fn emitPushBool(self: *EmitContext, b: bool) !void {
@@ -159,6 +196,30 @@ pub const EmitContext = struct {
         try self.constructor_slots.append(self.allocator, .{
             .param_index = param_index,
             .byte_offset = self.byte_offset,
+        });
+    }
+
+    /// Emit an opaque raw_bytes span produced by a raw_script ANF node. The
+    /// bytes pass through verbatim — no re-encoding takes place. The ASM
+    /// column shows `<raw N bytes>` so the human-readable disassembly is
+    /// honest about the opacity. A RawScriptSpan capturing (offset, length,
+    /// in_arity, out_arity) is recorded so the static analyzer can treat the
+    /// span as one opaque stack-effect step.
+    pub fn emitRawBytes(self: *EmitContext, bytes: []const u8, in_arity: i32, out_arity: i32) !void {
+        if (bytes.len == 0) return;
+        const offset = self.byte_offset;
+        try self.recordSourceMapping();
+        try self.script_bytes.appendSlice(self.allocator, bytes);
+        self.byte_offset += @intCast(bytes.len);
+        self.opcode_index += 1;
+        const asm_str = try std.fmt.allocPrint(self.allocator, "<raw {d} bytes>", .{bytes.len});
+        try self.owned_asm_parts.append(self.allocator, asm_str);
+        try self.asm_parts.append(self.allocator, asm_str);
+        try self.raw_script_spans.append(self.allocator, .{
+            .offset = offset,
+            .length = @intCast(bytes.len),
+            .in_arity = in_arity,
+            .out_arity = out_arity,
         });
     }
 
@@ -203,6 +264,7 @@ pub fn emitStackOp(ctx: *EmitContext, op: types.StackOp) !void {
             .bytes => |data| try ctx.emitPushData(data),
             .integer => |n| try ctx.emitScriptNumber(n),
             .boolean => |b| try ctx.emitPushBool(b),
+            .big_int_decimal => |s| try ctx.emitScriptNumberFromDecimal(s),
         },
         .dup => try ctx.emitOpcode(.op_dup),
         .swap => try ctx.emitOpcode(.op_swap),
@@ -248,18 +310,35 @@ pub fn emitStackInstruction(ctx: *EmitContext, inst: types.StackInstruction) !vo
         .push_data => |data| try ctx.emitPushData(data),
         .push_int => |n| try ctx.emitScriptNumber(n),
         .push_bool => |b| try ctx.emitPushBool(b),
+        .push_big_int_decimal => |s| try ctx.emitScriptNumberFromDecimal(s),
         .push_codesep_index => {
-            // Push the byte offset of the last OP_CODESEPARATOR as a numeric constant.
-            // This value is known at emit time (tracked when OP_CODESEPARATOR was emitted).
-            const idx: i64 = if (ctx.code_separator_indices.items.len > 0)
+            // Emit an OP_0 placeholder that the SDK will replace with the
+            // adjusted codeSeparatorIndex at runtime.
+            const code_sep_idx: usize = if (ctx.code_separator_indices.items.len > 0)
                 @intCast(ctx.code_separator_indices.items[ctx.code_separator_indices.items.len - 1])
             else
                 0;
-            try ctx.emitScriptNumber(idx);
+            const byte_off = ctx.byte_offset;
+            try ctx.recordSourceMapping();
+            try ctx.script_bytes.append(ctx.allocator, 0x00); // OP_0 placeholder byte
+            try ctx.asm_parts.append(ctx.allocator, "OP_0");
+            ctx.byte_offset += 1;
+            ctx.opcode_index += 1;
+            try ctx.code_sep_index_slots.append(ctx.allocator, .{
+                .byte_offset = byte_off,
+                .code_sep_index = code_sep_idx,
+            });
         },
         .placeholder => |ph| {
             try ctx.recordConstructorSlot(ph.param_index);
             try ctx.emitOpcode(.op_0);
+        },
+        .raw_bytes => |rb| {
+            // Opaque opcode-byte span from a raw_script ANF node. Written
+            // verbatim with no re-encoding; the declared arities are recorded
+            // into the artifact's rawScriptSpans so the analyzer can treat
+            // the span as one opaque stack-effect step.
+            try ctx.emitRawBytes(rb.bytes, rb.in_arity, rb.out_arity);
         },
     }
 }
@@ -336,6 +415,17 @@ fn findMethodSourceLoc(anf_methods: []const types.ANFMethod, method_name: []cons
 }
 
 /// Emit dispatch table with source map support (looks up source locs from ANF methods).
+///
+/// Mirrors the TS reference compiler's emitMethodDispatch
+/// (packages/runar-compiler/src/passes/06-emit.ts).
+///
+/// Pattern (N >= 2 public methods):
+///   OP_DUP <0> OP_NUMEQUAL OP_IF OP_DROP <body0> OP_ELSE
+///     OP_DUP <1> OP_NUMEQUAL OP_IF OP_DROP <body1> OP_ELSE
+///       ...
+///       <N-1> OP_NUMEQUALVERIFY <bodyN-1>
+///     OP_ENDIF
+///   OP_ENDIF (×(N-1) total ENDIFs)
 fn emitDispatchTableWithSourceMap(ctx: *EmitContext, methods: []const types.StackMethod, anf_methods: []const types.ANFMethod) !void {
     if (methods.len == 0) return;
 
@@ -346,22 +436,25 @@ fn emitDispatchTableWithSourceMap(ctx: *EmitContext, methods: []const types.Stac
     }
 
     for (methods, 0..) |method, i| {
-        try ctx.emitOpcode(.op_dup);
-        try ctx.emitScriptNumber(@intCast(i));
-        try ctx.emitOpcode(.op_numequal);
-        try ctx.emitOpcode(.op_if);
-        try ctx.emitOpcode(.op_drop);
+        const is_last = i == methods.len - 1;
+        if (!is_last) {
+            try ctx.emitOpcode(.op_dup);
+            try ctx.emitScriptNumber(@intCast(i));
+            try ctx.emitOpcode(.op_numequal);
+            try ctx.emitOpcode(.op_if);
+            try ctx.emitOpcode(.op_drop);
+        } else {
+            try ctx.emitScriptNumber(@intCast(i));
+            try ctx.emitOpcode(.op_numequalverify);
+        }
         ctx.pending_source_loc = findMethodSourceLoc(anf_methods, method.name);
         try emitMethodBody(ctx, method);
-        if (i < methods.len - 1) {
+        if (!is_last) {
             try ctx.emitOpcode(.op_else);
-        } else {
-            try ctx.emitOpcode(.op_else);
-            try ctx.emitOpcode(.op_return);
-            try ctx.emitOpcode(.op_endif);
         }
     }
 
+    // Close all the nested OP_IF / OP_ELSE blocks (one OP_ENDIF per non-last method).
     var closes: usize = methods.len - 1;
     while (closes > 0) : (closes -= 1) {
         try ctx.emitOpcode(.op_endif);
@@ -369,9 +462,8 @@ fn emitDispatchTableWithSourceMap(ctx: *EmitContext, methods: []const types.Stac
 }
 
 /// Emit the dispatch table for a multi-method contract.
-/// Pattern: OP_DUP <idx> OP_NUMEQUAL OP_IF OP_DROP <body> OP_ELSE ... OP_ENDIF
-/// For a single method, no dispatch table is needed — just emit the body.
-fn emitDispatchTable(ctx: *EmitContext, methods: []const types.StackMethod) !void {
+/// Pattern: see `emitDispatchTableWithSourceMap`.
+pub fn emitDispatchTable(ctx: *EmitContext, methods: []const types.StackMethod) !void {
     if (methods.len == 0) return;
 
     if (methods.len == 1) {
@@ -380,36 +472,28 @@ fn emitDispatchTable(ctx: *EmitContext, methods: []const types.StackMethod) !voi
         return;
     }
 
-    // Multi-method dispatch:
-    // The method index is expected on top of the stack.
-    // OP_DUP <0> OP_NUMEQUAL OP_IF OP_DROP <body0> OP_ELSE
-    //   OP_DUP <1> OP_NUMEQUAL OP_IF OP_DROP <body1> OP_ELSE
-    //     ...
-    //     OP_DUP <N-1> OP_NUMEQUAL OP_IF OP_DROP <bodyN-1> OP_ELSE OP_RETURN OP_ENDIF
-    //   OP_ENDIF
-    // OP_ENDIF
-
     for (methods, 0..) |method, i| {
-        try ctx.emitOpcode(.op_dup);
-        try ctx.emitScriptNumber(@intCast(i));
-        try ctx.emitOpcode(.op_numequal);
-        try ctx.emitOpcode(.op_if);
-        try ctx.emitOpcode(.op_drop); // consume the method index
+        const is_last = i == methods.len - 1;
+        if (!is_last) {
+            try ctx.emitOpcode(.op_dup);
+            try ctx.emitScriptNumber(@intCast(i));
+            try ctx.emitOpcode(.op_numequal);
+            try ctx.emitOpcode(.op_if);
+            try ctx.emitOpcode(.op_drop); // consume the method index
+        } else {
+            try ctx.emitScriptNumber(@intCast(i));
+            try ctx.emitOpcode(.op_numequalverify);
+        }
 
         // Emit method body
         try emitMethodBody(ctx, method);
 
-        if (i < methods.len - 1) {
+        if (!is_last) {
             try ctx.emitOpcode(.op_else);
-        } else {
-            // Last method: else branch is OP_RETURN (invalid method index)
-            try ctx.emitOpcode(.op_else);
-            try ctx.emitOpcode(.op_return);
-            try ctx.emitOpcode(.op_endif);
         }
     }
 
-    // Close all the nested if/else blocks (one OP_ENDIF per method except last which already closed)
+    // Close all the nested OP_IF / OP_ELSE blocks.
     var closes: usize = methods.len - 1;
     while (closes > 0) : (closes -= 1) {
         try ctx.emitOpcode(.op_endif);
@@ -468,19 +552,28 @@ pub fn emitArtifact(
     // Build JSON output
     var json_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer json_buf.deinit(allocator);
-    const w = json_buf.writer(allocator);
+    const w = opcodes.ArrayListWriter{ .list = &json_buf, .allocator = allocator };
 
     try w.writeAll("{");
 
     // version
-    try w.writeAll("\"version\":\"runar-v0.4.4\",");
+    try w.writeAll("\"version\":\"runar-v1.0.0-rc.1\",");
 
     // compilerVersion
-    try w.writeAll("\"compilerVersion\":\"0.4.4-zig\",");
+    try w.writeAll("\"compilerVersion\":\"1.0.0-rc.1-zig\",");
 
     // contractName
     try w.writeAll("\"contractName\":");
     try writeJsonString(w, stack_program.contract_name);
+    try w.writeByte(',');
+
+    // parentClass — authoritative stateful signal for the issue-#42/#44
+    // terminal sighash subscript trim (a StatefulSmartContract with zero
+    // mutable fields still needs the trim). Sourced from the ANF program; it
+    // is deliberately NOT part of the emitted ANF IR JSON, so cross-tier
+    // conformance parity is unaffected.
+    try w.writeAll("\"parentClass\":");
+    try writeJsonString(w, anf_program.parent_class.toTsString());
     try w.writeByte(',');
 
     // abi
@@ -528,6 +621,19 @@ pub fn emitArtifact(
             }
             try w.writeAll("],\"isPublic\":");
             try w.writeAll(if (method.is_public) "true" else "false");
+            // usesCodePart: unlocking script is prefixed with _codePart (#100).
+            if (stack_lower.methodUsesCodePartFull(stack_lower.methodBindings(method), anf_program.properties)) {
+                try w.writeAll(",\"usesCodePart\":true");
+            }
+            // Issue #123: carry a non-default @sighash mode into the ABI so the
+            // SDK builds the BIP-143 preimage under the same flags the covenant
+            // expects. Omitted for the default (0x41) so existing artifacts are
+            // byte-identical.
+            if (method.is_public) {
+                if (method.sighash_type) |st| {
+                    try w.print(",\"sigHashType\":{d}", .{st});
+                }
+            }
             try w.writeByte('}');
         }
     }
@@ -551,20 +657,41 @@ pub fn emitArtifact(
     }
     try w.writeAll("],");
 
-    // stateFields — mutable (non-readonly) properties
+    // codeSepIndexSlots — OP_0 placeholders for codeSeparatorIndex values
+    if (ctx.code_sep_index_slots.items.len > 0) {
+        try w.writeAll("\"codeSepIndexSlots\":[");
+        for (ctx.code_sep_index_slots.items, 0..) |slot, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.print("{{\"byteOffset\":{d},\"codeSepIndex\":{d}}}", .{ slot.byte_offset, slot.code_sep_index });
+        }
+        try w.writeAll("],");
+    }
+
+    // stateFields — mutable (non-readonly) properties, with synthetic
+    // FixedArray runs re-grouped into a single logical entry via the
+    // iterative marker-driven regrouper (mirrors the TS assembler).
     try w.writeAll("\"stateFields\":[");
     {
-        var state_idx: u32 = 0;
-        for (anf_program.properties) |prop| {
-            if (!prop.readonly) {
-                if (state_idx > 0) try w.writeByte(',');
-                try w.writeAll("{\"name\":");
-                try writeJsonString(w, prop.name);
-                try w.writeAll(",\"type\":");
-                try writeJsonString(w, prop.type_name);
-                try w.print(",\"index\":{d}}}", .{state_idx});
-                state_idx += 1;
+        const regrouped = try regroupStateFields(allocator, anf_program.properties);
+        defer freeRegroupedEntries(allocator, regrouped);
+        for (regrouped, 0..) |entry, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll("{\"name\":");
+            try writeJsonString(w, entry.name);
+            try w.writeAll(",\"type\":");
+            try writeJsonString(w, entry.type_str);
+            try w.print(",\"index\":{d}", .{entry.index});
+            if (entry.fixed_array) |fa| {
+                try w.writeAll(",\"fixedArray\":{\"elementType\":");
+                try writeJsonString(w, fa.element_type);
+                try w.print(",\"length\":{d},\"syntheticNames\":[", .{fa.length});
+                for (fa.synthetic_names, 0..) |sn, j| {
+                    if (j > 0) try w.writeByte(',');
+                    try writeJsonString(w, sn);
+                }
+                try w.writeAll("]}");
             }
+            try w.writeByte('}');
         }
     }
     try w.writeAll("],");
@@ -587,9 +714,11 @@ pub fn emitArtifact(
         try w.writeAll("]");
     }
 
-    // sourceMap — opcode-to-source-location mappings
+    // sourceMap — opcode-to-source-location mappings.
+    // Wrapped in {"mappings":[...]} to match the canonical schema declared
+    // in packages/runar-ir-schema/src/schemas/artifact.schema.json#SourceMap.
     if (ctx.source_map.items.len > 0) {
-        try w.writeAll(",\"sourceMap\":[");
+        try w.writeAll(",\"sourceMap\":{\"mappings\":[");
         for (ctx.source_map.items, 0..) |mapping, i| {
             if (i > 0) try w.writeByte(',');
             try w.writeAll("{\"opcodeIndex\":");
@@ -602,12 +731,286 @@ pub fn emitArtifact(
             try w.print("{d}", .{mapping.column});
             try w.writeByte('}');
         }
-        try w.writeAll("]");
+        try w.writeAll("]}");
     }
+
+    // anf — full ANF IR for SDK auto-state computation
+    try w.writeAll(",\"anf\":");
+    try emitANFProgramJson(w, anf_program);
 
     try w.writeByte('}');
 
     return try json_buf.toOwnedSlice(allocator);
+}
+
+// ---------------------------------------------------------------------------
+// ANF IR JSON serialization (for inclusion in artifact)
+// ---------------------------------------------------------------------------
+
+fn emitANFProgramJson(w: anytype, program: types.ANFProgram) !void {
+    try w.writeAll("{\"contractName\":");
+    try writeJsonString(w, program.contract_name);
+
+    // properties
+    try w.writeAll(",\"properties\":[");
+    for (program.properties, 0..) |prop, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"name\":");
+        try writeJsonString(w, prop.name);
+        try w.writeAll(",\"type\":");
+        try writeJsonString(w, prop.type_name);
+        try w.writeAll(",\"readonly\":");
+        try w.writeAll(if (prop.readonly) "true" else "false");
+        if (prop.initial_value) |iv| {
+            try w.writeAll(",\"initialValue\":");
+            try emitConstValueJson(w, iv);
+        }
+        try w.writeByte('}');
+    }
+    try w.writeAll("]");
+
+    // methods (including constructor as a non-public method named "constructor")
+    try w.writeAll(",\"methods\":[");
+    {
+        var first = true;
+        // Emit constructor as a method
+        if (program.constructor.params.len > 0 or program.constructor.assertions.len > 0) {
+            try w.writeAll("{\"name\":\"constructor\",\"params\":[");
+            for (program.constructor.params, 0..) |param, j| {
+                if (j > 0) try w.writeByte(',');
+                try w.writeAll("{\"name\":");
+                try writeJsonString(w, param.name);
+                try w.writeAll(",\"type\":");
+                try writeJsonString(w, param.type_name);
+                try w.writeByte('}');
+            }
+            try w.writeAll("],\"body\":[");
+            for (program.constructor.assertions, 0..) |binding, j| {
+                if (j > 0) try w.writeByte(',');
+                try emitANFBindingJson(w, binding);
+            }
+            try w.writeAll("],\"isPublic\":false}");
+            first = false;
+        }
+
+        // Emit regular methods
+        for (program.methods) |method| {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.writeAll("{\"name\":");
+            try writeJsonString(w, method.name);
+            try w.writeAll(",\"params\":[");
+            for (method.params, 0..) |param, j| {
+                if (j > 0) try w.writeByte(',');
+                try w.writeAll("{\"name\":");
+                try writeJsonString(w, param.name);
+                try w.writeAll(",\"type\":");
+                try writeJsonString(w, param.type_name);
+                try w.writeByte('}');
+            }
+            try w.writeAll("],\"body\":[");
+            // Use .body if available (populated by ANF lower), fallback to .bindings
+            const body = if (method.body.len > 0) method.body else method.bindings;
+            for (body, 0..) |binding, j| {
+                if (j > 0) try w.writeByte(',');
+                try emitANFBindingJson(w, binding);
+            }
+            try w.writeAll("],\"isPublic\":");
+            try w.writeAll(if (method.is_public) "true" else "false");
+            try w.writeByte('}');
+        }
+    }
+    try w.writeAll("]");
+
+    try w.writeByte('}');
+}
+
+fn emitANFBindingJson(w: anytype, binding: types.ANFBinding) error{OutOfMemory}!void {
+    try w.writeAll("{\"name\":");
+    try writeJsonString(w, binding.name);
+    try w.writeAll(",\"value\":");
+    try emitANFValueJson(w, binding.value);
+    if (binding.source_loc) |loc| {
+        try w.writeAll(",\"sourceLoc\":{\"file\":");
+        try writeJsonString(w, loc.file);
+        try w.print(",\"line\":{d},\"column\":{d}}}", .{ loc.line, loc.column });
+    }
+    try w.writeByte('}');
+}
+
+fn emitANFValueJson(w: anytype, value: types.ANFValue) error{OutOfMemory}!void {
+    switch (value) {
+        .load_param => |lp| {
+            try w.writeAll("{\"kind\":\"load_param\",\"name\":");
+            try writeJsonString(w, lp.name);
+            try w.writeByte('}');
+        },
+        .load_prop => |lp| {
+            try w.writeAll("{\"kind\":\"load_prop\",\"name\":");
+            try writeJsonString(w, lp.name);
+            try w.writeByte('}');
+        },
+        .load_const => |lc| {
+            try w.writeAll("{\"kind\":\"load_const\",\"value\":");
+            try emitConstValueJson(w, lc.value);
+            try w.writeByte('}');
+        },
+        .bin_op => |bo| {
+            try w.writeAll("{\"kind\":\"bin_op\",\"op\":");
+            try writeJsonString(w, bo.op);
+            try w.writeAll(",\"left\":");
+            try writeJsonString(w, bo.left);
+            try w.writeAll(",\"right\":");
+            try writeJsonString(w, bo.right);
+            if (bo.result_type) |rt| {
+                try w.writeAll(",\"result_type\":");
+                try writeJsonString(w, rt);
+            }
+            try w.writeByte('}');
+        },
+        .unary_op => |uo| {
+            try w.writeAll("{\"kind\":\"unary_op\",\"op\":");
+            try writeJsonString(w, uo.op);
+            try w.writeAll(",\"operand\":");
+            try writeJsonString(w, uo.operand);
+            if (uo.result_type) |rt| {
+                try w.writeAll(",\"result_type\":");
+                try writeJsonString(w, rt);
+            }
+            try w.writeByte('}');
+        },
+        .call => |c| {
+            try w.writeAll("{\"kind\":\"call\",\"func\":");
+            try writeJsonString(w, c.func);
+            try w.writeAll(",\"args\":[");
+            for (c.args, 0..) |arg, j| {
+                if (j > 0) try w.writeByte(',');
+                try writeJsonString(w, arg);
+            }
+            try w.writeAll("]}");
+        },
+        .method_call => |mc| {
+            try w.writeAll("{\"kind\":\"method_call\",\"method\":");
+            try writeJsonString(w, mc.method);
+            try w.writeAll(",\"args\":[");
+            for (mc.args, 0..) |arg, j| {
+                if (j > 0) try w.writeByte(',');
+                try writeJsonString(w, arg);
+            }
+            try w.writeAll("]}");
+        },
+        .@"if" => |ifn| {
+            try w.writeAll("{\"kind\":\"if\",\"cond\":");
+            try writeJsonString(w, ifn.cond);
+            try w.writeAll(",\"then\":[");
+            for (ifn.then, 0..) |binding, j| {
+                if (j > 0) try w.writeByte(',');
+                try emitANFBindingJson(w, binding);
+            }
+            try w.writeAll("],\"else\":[");
+            for (ifn.@"else", 0..) |binding, j| {
+                if (j > 0) try w.writeByte(',');
+                try emitANFBindingJson(w, binding);
+            }
+            try w.writeAll("]}");
+        },
+        .loop => |ln| {
+            try w.writeAll("{\"kind\":\"loop\",\"count\":");
+            try w.print("{d}", .{ln.count});
+            try w.writeAll(",\"iterVar\":");
+            try writeJsonString(w, ln.iter_var);
+            try w.writeAll(",\"body\":[");
+            for (ln.body, 0..) |binding, j| {
+                if (j > 0) try w.writeByte(',');
+                try emitANFBindingJson(w, binding);
+            }
+            try w.writeAll("]}");
+        },
+        .assert => |a| {
+            try w.writeAll("{\"kind\":\"assert\",\"value\":");
+            try writeJsonString(w, a.value);
+            try w.writeByte('}');
+        },
+        .update_prop => |up| {
+            try w.writeAll("{\"kind\":\"update_prop\",\"name\":");
+            try writeJsonString(w, up.name);
+            try w.writeAll(",\"value\":");
+            try writeJsonString(w, up.value);
+            try w.writeByte('}');
+        },
+        .add_output => |ao| {
+            try w.writeAll("{\"kind\":\"add_output\",\"satoshis\":");
+            try writeJsonString(w, ao.satoshis);
+            if (ao.state_values.len > 0) {
+                try w.writeAll(",\"stateValues\":[");
+                for (ao.state_values, 0..) |sv, j| {
+                    if (j > 0) try w.writeByte(',');
+                    try writeJsonString(w, sv);
+                }
+                try w.writeByte(']');
+            }
+            try w.writeByte('}');
+        },
+        .add_raw_output => |aro| {
+            try w.writeAll("{\"kind\":\"add_raw_output\",\"satoshis\":");
+            try writeJsonString(w, aro.satoshis);
+            try w.writeAll(",\"scriptBytes\":");
+            try writeJsonString(w, aro.script_bytes);
+            try w.writeByte('}');
+        },
+        .add_data_output => |ado| {
+            try w.writeAll("{\"kind\":\"add_data_output\",\"satoshis\":");
+            try writeJsonString(w, ado.satoshis);
+            try w.writeAll(",\"scriptBytes\":");
+            try writeJsonString(w, ado.script_bytes);
+            try w.writeByte('}');
+        },
+        .get_state_script => {
+            try w.writeAll("{\"kind\":\"get_state_script\"}");
+        },
+        .check_preimage => |cp| {
+            try w.writeAll("{\"kind\":\"check_preimage\",\"preimage\":");
+            try writeJsonString(w, cp.preimage);
+            // Issue #123: emit the non-default sighash flag only when set, so
+            // the golden ANF for every existing (default ALL|FORKID) contract
+            // is byte-identical.
+            if (cp.sighash_flag != 0) {
+                try w.print(",\"sighashFlag\":{d}", .{cp.sighash_flag});
+            }
+            try w.writeByte('}');
+        },
+        .deserialize_state => |ds| {
+            try w.writeAll("{\"kind\":\"deserialize_state\",\"preimage\":");
+            try writeJsonString(w, ds.preimage);
+            try w.writeByte('}');
+        },
+        .array_literal => {
+            try w.writeAll("{\"kind\":\"array_literal\"}");
+        },
+        .raw_script => |rs| {
+            try w.writeAll("{\"kind\":\"raw_script\",\"bytes\":");
+            try writeJsonString(w, rs.bytes);
+            try w.print(",\"in_arity\":{d},\"out_arity\":{d}", .{ rs.in_arity, rs.out_arity });
+            try w.writeByte('}');
+        },
+    }
+}
+
+fn emitConstValueJson(w: anytype, cv: types.ConstValue) !void {
+    switch (cv) {
+        .boolean => |b| try w.writeAll(if (b) "true" else "false"),
+        .integer => |n| try w.print("{d}", .{n}),
+        .big_integer => |s| {
+            // Canonical JS-BigInt encoding: quoted decimal string with `n`
+            // suffix. Matches Go's `makeLoadConstInt` and Python's
+            // `_make_load_const_int` so the ANF JSON round-trips byte-identically
+            // across tiers for oversize literals.
+            try w.writeByte('"');
+            try w.writeAll(s);
+            try w.writeAll("n\"");
+        },
+        .string => |s| try writeJsonString(w, s),
+    }
 }
 
 // ============================================================================
@@ -664,6 +1067,66 @@ test "emitStackInstruction — push_int large" {
     // 1000 = 0x03E8 LE -> e8 03, push: 02 e8 03
     try std.testing.expectEqualSlices(u8, &.{ 0x02, 0xe8, 0x03 }, ctx.script_bytes.items);
     try std.testing.expectEqualStrings("1000", ctx.asm_parts.items[0]);
+}
+
+test "emitStackInstruction — push_big_int_decimal secp256k1 group order" {
+    // 256-bit constant from schnorr-zkp's s-bound assert.
+    // Hex: FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    // Expected push: OP_PUSHBYTES_33 (0x21) followed by 33 magnitude bytes:
+    //   value bytes in LE order, then a 0x00 sign byte (MSB of LE-last byte
+    //   is 0xff so a 33rd zero byte is required to keep the value positive
+    //   under Bitcoin Script's sign-magnitude convention).
+    const allocator = std.testing.allocator;
+    var ctx = EmitContext.init(allocator);
+    defer ctx.deinit();
+
+    const decimal: []const u8 = "115792089237316195423570985008687907852837564279074904382605163141518161494337";
+    try emitStackInstruction(&ctx, .{ .push_big_int_decimal = decimal });
+
+    const expected = [_]u8{
+        0x21, // OP_PUSHBYTES_33
+        0x41, 0x41, 0x36, 0xd0, 0x8c, 0x5e, 0xd2, 0xbf,
+        0x3b, 0xa0, 0x48, 0xaf, 0xe6, 0xdc, 0xae, 0xba,
+        0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x00, // positive sign byte
+    };
+    try std.testing.expectEqualSlices(u8, &expected, ctx.script_bytes.items);
+}
+
+test "emitStackInstruction — push_big_int_decimal small positive" {
+    // Verify the helper also handles small in-range values correctly. The
+    // caller is supposed to route these through `push_int` for the OP_N
+    // shortcut, but the path itself must still emit a valid push.
+    const allocator = std.testing.allocator;
+    var ctx = EmitContext.init(allocator);
+    defer ctx.deinit();
+
+    try emitStackInstruction(&ctx, .{ .push_big_int_decimal = "1000" });
+    // 1000 = 0x03E8 LE -> e8 03, push: 02 e8 03
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0xe8, 0x03 }, ctx.script_bytes.items);
+}
+
+test "emitStackInstruction — push_big_int_decimal negative oversize" {
+    // Sanity-check the negative path: a value whose magnitude already has
+    // MSB set still gets a sign-extension byte, with the high bit flipped
+    // by the caller.
+    const allocator = std.testing.allocator;
+    var ctx = EmitContext.init(allocator);
+    defer ctx.deinit();
+
+    // -((1 << 256) - 1) — magnitude is 32 bytes of 0xff; needs a 33rd 0x80 byte.
+    const decimal: []const u8 = "-115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    try emitStackInstruction(&ctx, .{ .push_big_int_decimal = decimal });
+    try std.testing.expectEqual(@as(usize, 34), ctx.script_bytes.items.len);
+    try std.testing.expectEqual(@as(u8, 0x21), ctx.script_bytes.items[0]);
+    // All 32 magnitude bytes are 0xff …
+    var i: usize = 1;
+    while (i <= 32) : (i += 1) {
+        try std.testing.expectEqual(@as(u8, 0xff), ctx.script_bytes.items[i]);
+    }
+    // … and the trailing sign byte is 0x80.
+    try std.testing.expectEqual(@as(u8, 0x80), ctx.script_bytes.items[33]);
 }
 
 test "emitStackInstruction — push_bool true" {
@@ -995,17 +1458,16 @@ test "dispatch table — two methods" {
     const hex = try ctx.getHex();
     defer allocator.free(hex);
 
-    // Expected pattern:
-    // OP_DUP(76) OP_0(00) OP_NUMEQUAL(9c) OP_IF(63) OP_DROP(75) OP_ADD(93) OP_ELSE(67)
-    // OP_DUP(76) OP_1(51) OP_NUMEQUAL(9c) OP_IF(63) OP_DROP(75) OP_SUB(94) OP_ELSE(67) OP_RETURN(6a) OP_ENDIF(68)
-    // OP_ENDIF(68)
-    try std.testing.expectEqualStrings("76009c6375936776519c637594676a6868", hex);
+    // Expected pattern (matches TS reference compiler):
+    // method 0 (non-last): OP_DUP(76) OP_0(00) OP_NUMEQUAL(9c) OP_IF(63) OP_DROP(75) OP_ADD(93) OP_ELSE(67)
+    // method 1 (last):     OP_1(51) OP_NUMEQUALVERIFY(9d) OP_SUB(94)
+    // close:               OP_ENDIF(68)
+    try std.testing.expectEqualStrings("76009c63759367519d9468", hex);
 
     const asm_text = try ctx.getAsm();
     defer allocator.free(asm_text);
-
     try std.testing.expectEqualStrings(
-        "OP_DUP OP_0 OP_NUMEQUAL OP_IF OP_DROP OP_ADD OP_ELSE OP_DUP OP_1 OP_NUMEQUAL OP_IF OP_DROP OP_SUB OP_ELSE OP_RETURN OP_ENDIF OP_ENDIF",
+        "OP_DUP OP_0 OP_NUMEQUAL OP_IF OP_DROP OP_ADD OP_ELSE OP_1 OP_NUMEQUALVERIFY OP_SUB OP_ENDIF",
         asm_text,
     );
 }
@@ -1029,11 +1491,12 @@ test "dispatch table — three methods" {
     const hex = try ctx.getHex();
     defer allocator.free(hex);
 
-    // method 0: DUP 0 NUMEQUAL IF DROP ADD ELSE
-    // method 1: DUP 1 NUMEQUAL IF DROP SUB ELSE
-    // method 2: DUP 2 NUMEQUAL IF DROP MUL ELSE RETURN ENDIF
-    // close:    ENDIF ENDIF
-    const expected = "76009c6375936776519c6375946776529c637595676a686868";
+    // Expected pattern (matches TS reference compiler):
+    // method 0 (non-last): OP_DUP(76) OP_0(00) OP_NUMEQUAL(9c) OP_IF(63) OP_DROP(75) OP_ADD(93) OP_ELSE(67)
+    // method 1 (non-last): OP_DUP(76) OP_1(51) OP_NUMEQUAL(9c) OP_IF(63) OP_DROP(75) OP_SUB(94) OP_ELSE(67)
+    // method 2 (last):     OP_2(52) OP_NUMEQUALVERIFY(9d) OP_MUL(95)
+    // close:               OP_ENDIF(68) OP_ENDIF(68)
+    const expected = "76009c6375936776519c6375946752" ++ "9d" ++ "956868";
     try std.testing.expectEqualStrings(expected, hex);
 }
 
@@ -1180,7 +1643,7 @@ test "writeJsonString — escaping" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    const w = opcodes.ArrayListWriter{ .list = &buf, .allocator = allocator };
 
     try writeJsonString(w, "hello \"world\"");
     try std.testing.expectEqualStrings("\"hello \\\"world\\\"\"", buf.items);
@@ -1245,6 +1708,142 @@ test "push value encoding — bool false is OP_0" {
     try std.testing.expectEqualSlices(u8, &.{0x00}, ctx.script_bytes.items);
 }
 
+// ---------------------------------------------------------------------------
+// StateField re-grouping (FixedArray collapse)
+// ---------------------------------------------------------------------------
+//
+// Mirrors packages/runar-compiler/src/artifact/assembler.ts `regroupOnePass`/
+// `regroupSyntheticRuns`. Walks mutable (non-readonly) ANF properties and
+// collapses runs whose innermost `synthetic_array_chain` level forms a
+// contiguous 0..N-1 sequence under the same `base` name. Iterated until no
+// chain has any unconsumed levels, so nested arrays collapse from innermost
+// outward.
+
+const RegroupFA = struct {
+    element_type: []const u8,
+    length: u32,
+    synthetic_names: [][]const u8,
+};
+
+const RegroupEntry = struct {
+    name: []const u8,
+    type_str: []const u8,
+    chain: []const types.SyntheticArrayLevel,
+    index: u32,
+    fixed_array: ?RegroupFA,
+};
+
+fn regroupStateFields(allocator: std.mem.Allocator, props: []const types.ANFProperty) ![]RegroupEntry {
+    var flat: std.ArrayListUnmanaged(RegroupEntry) = .empty;
+    var state_idx: u32 = 0;
+    for (props) |p| {
+        if (p.readonly) continue;
+        const chain: []const types.SyntheticArrayLevel = if (p.synthetic_array_chain) |c| c else &.{};
+        try flat.append(allocator, .{
+            .name = p.name,
+            .type_str = p.type_name,
+            .chain = chain,
+            .index = state_idx,
+            .fixed_array = null,
+        });
+        state_idx += 1;
+    }
+
+    var current = try flat.toOwnedSlice(allocator);
+    var iter: usize = 0;
+    while (iter < 1024) : (iter += 1) {
+        const res = try regroupOnePass(allocator, current);
+        allocator.free(current);
+        current = res.out;
+        if (!res.changed) return current;
+    }
+    return current;
+}
+
+fn freeRegroupedEntries(allocator: std.mem.Allocator, entries: []RegroupEntry) void {
+    for (entries) |e| {
+        if (e.fixed_array) |fa| {
+            allocator.free(fa.synthetic_names);
+        }
+    }
+    allocator.free(entries);
+}
+
+const PassResult = struct { out: []RegroupEntry, changed: bool };
+
+fn regroupOnePass(allocator: std.mem.Allocator, entries: []const RegroupEntry) !PassResult {
+    var out: std.ArrayListUnmanaged(RegroupEntry) = .empty;
+    var changed = false;
+    var i: usize = 0;
+    while (i < entries.len) {
+        const entry = entries[i];
+        const chain_len = entry.chain.len;
+        if (chain_len == 0) {
+            try out.append(allocator, entry);
+            i += 1;
+            continue;
+        }
+        const marker = entry.chain[chain_len - 1];
+        if (marker.index != 0) {
+            try out.append(allocator, entry);
+            i += 1;
+            continue;
+        }
+
+        // Greedily extend: every follower must share the same innermost
+        // {base, length}, carry the expected index = k, and have identical
+        // current type.
+        var run_count: u32 = 1;
+        var j: usize = i + 1;
+        while (j < entries.len and run_count < marker.length) : (j += 1) {
+            const next = entries[j];
+            if (next.chain.len == 0) break;
+            const m2 = next.chain[next.chain.len - 1];
+            if (!std.mem.eql(u8, m2.base, marker.base)) break;
+            if (m2.length != marker.length) break;
+            if (m2.index != run_count) break;
+            if (!std.mem.eql(u8, next.type_str, entry.type_str)) break;
+            run_count += 1;
+        }
+        if (run_count != marker.length) {
+            try out.append(allocator, entry);
+            i += 1;
+            continue;
+        }
+
+        // Collapse the run.
+        const inner_type = entry.type_str;
+        const grouped_type = try std.fmt.allocPrint(allocator, "FixedArray<{s}, {d}>", .{ inner_type, marker.length });
+
+        // Flatten synthetic names.
+        var synth: std.ArrayListUnmanaged([]const u8) = .empty;
+        var k: usize = 0;
+        while (k < run_count) : (k += 1) {
+            const child = entries[i + k];
+            if (child.fixed_array) |fa| {
+                for (fa.synthetic_names) |sn| try synth.append(allocator, sn);
+            } else {
+                try synth.append(allocator, child.name);
+            }
+        }
+
+        try out.append(allocator, .{
+            .name = marker.base,
+            .type_str = grouped_type,
+            .chain = entry.chain[0 .. chain_len - 1],
+            .index = entry.index,
+            .fixed_array = .{
+                .element_type = inner_type,
+                .length = marker.length,
+                .synthetic_names = try synth.toOwnedSlice(allocator),
+            },
+        });
+        i += run_count;
+        changed = true;
+    }
+    return .{ .out = try out.toOwnedSlice(allocator), .changed = changed };
+}
+
 test "byte offset tracking" {
     const allocator = std.testing.allocator;
     var ctx = EmitContext.init(allocator);
@@ -1261,4 +1860,41 @@ test "byte offset tracking" {
 
     try ctx.emitScriptNumber(1000); // 1 len + 2 data = 3 bytes
     try std.testing.expectEqual(@as(u32, 9), ctx.byte_offset);
+}
+
+// ---------------------------------------------------------------------------
+// raw_script ANF round-trip: lower a single raw_script binding to stack IR,
+// emit, and verify the output hex equals the input bytes verbatim and a
+// RawScriptSpan was recorded. Mirrors Go's TestEmit_RawScriptRoundTrip.
+// ---------------------------------------------------------------------------
+
+test "emit raw_script round-trip writes bytes verbatim and records a span" {
+    const allocator = std.testing.allocator;
+
+    // Bytes "5152935987" = OP_1 OP_2 OP_ADD OP_3 OP_EQUAL — an arbitrary
+    // opaque span the emitter must write verbatim. The Go reference uses
+    // the same bytes for parity.
+    const raw_hex = "5152935987";
+    const raw_bytes = try opcodes.hexToBytes(allocator, raw_hex);
+    defer allocator.free(raw_bytes);
+
+    var ctx = EmitContext.init(allocator);
+    defer ctx.deinit();
+
+    try emitStackInstruction(&ctx, .{ .raw_bytes = .{
+        .bytes = raw_bytes,
+        .in_arity = 0,
+        .out_arity = 1,
+    } });
+
+    const hex = try ctx.getHex();
+    defer allocator.free(hex);
+
+    try std.testing.expectEqualStrings(raw_hex, hex);
+    try std.testing.expectEqual(@as(usize, 1), ctx.raw_script_spans.items.len);
+    const span = ctx.raw_script_spans.items[0];
+    try std.testing.expectEqual(@as(u32, 0), span.offset);
+    try std.testing.expectEqual(@as(u32, raw_hex.len / 2), span.length);
+    try std.testing.expectEqual(@as(i32, 0), span.in_arity);
+    try std.testing.expectEqual(@as(i32, 1), span.out_arity);
 }

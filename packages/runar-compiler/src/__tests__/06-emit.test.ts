@@ -4,6 +4,7 @@ import { lowerToANF } from '../passes/04-anf-lower.js';
 import { lowerToStack } from '../passes/05-stack-lower.js';
 import { emit, emitMethod, OPCODES } from '../passes/06-emit.js';
 import { optimizeStackIR } from '../optimizer/peephole.js';
+import { CHECK_PREIMAGE_BINDING_HEX } from '../passes/oppushtx-codegen.js';
 import type { StackMethod, StackOp } from '../ir/index.js';
 import type { EmitResult } from '../passes/06-emit.js';
 import type { ContractNode } from '../ir/index.js';
@@ -659,6 +660,96 @@ describe('Pass 6: Emit', () => {
       expect(OPCODES['OP_SWAP']).toBe(0x7c);
       expect(OPCODES['OP_ROLL']).toBe(0x7a);
       expect(OPCODES['OP_PICK']).toBe(0x79);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Exact-byte goldens (T-10 from
+  // audits/cross-language-completeness-20260514.md §5.2).
+  //
+  // The other test blocks above check "valid hex" / length / opcode-presence;
+  // they catch a crash or gross regression but not byte-level codegen drift.
+  // The bytes asserted here were captured under the same pipeline as
+  // `compileToEmit` (parse → ANF → stack → peephole → emit, with constant
+  // folding NOT applied) and match the conformance goldens stamped under
+  // fold-OFF. A change to any pre-emit pass that nudges the bytes will fail
+  // here as a localized regression instead of an opaque cross-tier mismatch.
+  // ---------------------------------------------------------------------------
+
+  describe('exact-byte goldens (T-10)', () => {
+    it('canonical P2PKH compiles to OP_DUP OP_HASH160 OP_0 OP_EQUALVERIFY OP_CHECKSIG', () => {
+      // Fold-OFF emit of the canonical P2PKH locking script. The 0x00 (OP_0)
+      // is the placeholder for the constructor's `pubKeyHash` slot — the SDK
+      // splices the real 20-byte address in at deploy time. This matches the
+      // checked-in conformance golden
+      // `conformance/tests/basic-p2pkh/expected-script.hex`.
+      const source = `
+        import { SmartContract, assert, PubKey, Sig, Addr, hash160, checkSig } from 'runar-lang';
+        class P2PKH extends SmartContract {
+          readonly pubKeyHash: Addr;
+          constructor(pubKeyHash: Addr) { super(pubKeyHash); this.pubKeyHash = pubKeyHash; }
+          public unlock(sig: Sig, pubKey: PubKey) {
+            assert(hash160(pubKey) === this.pubKeyHash);
+            assert(checkSig(sig, pubKey));
+          }
+        }
+      `;
+      const result = compileToEmit(source);
+      expect(result.scriptHex).toBe('76a90088ac');
+    });
+
+    it('minimal stateless checkSig contract compiles to OP_0 OP_CHECKSIG', () => {
+      // Smallest possible signature-gated contract: one PubKey slot, one
+      // `checkSig(sig, this.owner)` call. The 0x00 byte is the OP_0
+      // placeholder for the constructor's `owner` slot.
+      const source = `
+        import { SmartContract, assert, checkSig, PubKey, Sig } from 'runar-lang';
+        class Owned extends SmartContract {
+          readonly owner: PubKey;
+          constructor(owner: PubKey) { super(owner); this.owner = owner; }
+          public unlock(sig: Sig): void {
+            assert(checkSig(sig, this.owner));
+          }
+        }
+      `;
+      const result = compileToEmit(source);
+      expect(result.scriptHex).toBe('00ac');
+    });
+
+    it('canonical stateful Counter (StatefulSmartContract + addOutput) emits exact bytes', () => {
+      // Stateful contract with implicit txPreimage / state-continuation /
+      // change-output plumbing. The asserted hex covers OP_CODESEPARATOR
+      // injection (0xab at position 2), the BUG-100 on-chain OP_PUSH_TX
+      // preimage-binding construction (the opaque 760-byte blob starting `76aa00…`
+      // and ending `…ad` OP_CHECKSIGVERIFY — see oppushtx-codegen.ts; the BIP-143
+      // generator pubkey 0279be…f81798 lives inside it), the GAP-302 sighash-type
+      // pin (OP_SIZE 4 OP_SUB OP_SPLIT OP_NIP OP_BIN2NUM <0x41> OP_NUMEQUALVERIFY,
+      // right after checkPreimage), and the addOutput serialization path. A
+      // regression in any of these emits would shift the bytes here.
+      const source = `
+        import { StatefulSmartContract, assert } from 'runar-lang';
+        class Counter extends StatefulSmartContract {
+          count: bigint;
+          constructor(count: bigint) { super(count); this.count = count; }
+          public increment(): void {
+            this.count = this.count + 1n;
+            this.addOutput(1000n, this.count);
+          }
+        }
+      `;
+      const result = compileToEmit(source);
+      // Issue #116: the change segment is now gated on `_changeAmount != 0` at
+      // runtime, so the tail carries the guard (`…547a547a 00787c9c9163` OP_IF
+      // … OP_ELSE `67007b7577687e` OP_ENDIF) around the P2PKH change output
+      // instead of catting it unconditionally.
+      expect(result.scriptHex).toBe(
+        '76ab' + CHECK_PREIMAGE_BINDING_HEX +
+        '69768254947f778101419d7601687f7782012c947f758258947f758258947f7781768b7702' +
+        'e803785679016a7e7c58807e827602fd009f635280517f756776030000019f635380527f7501' +
+        'fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e7c' +
+        '58807c7e547a547a00787c9c9163041976a9147b7e0288ac7e7c58807c7e67007b7577687eaa' +
+        '7b820128947f7701207f75877777'
+      );
     });
   });
 });

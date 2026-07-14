@@ -3,6 +3,7 @@ const bsvz = @import("bsvz");
 const types = @import("sdk_types.zig");
 const state_mod = @import("sdk_state.zig");
 const deploy_mod = @import("sdk_deploy.zig");
+const provider_mod = @import("sdk_provider.zig");
 
 // ---------------------------------------------------------------------------
 // Transaction construction for method invocation
@@ -10,6 +11,49 @@ const deploy_mod = @import("sdk_deploy.zig");
 
 pub const CallBuildOptions = struct {
     contract_outputs: []const types.ContractOutput = &.{},
+    /// Data outputs declared via `this.addDataOutput(...)` in the method
+    /// body. Emitted between the contract (state) outputs and the change
+    /// output, in declaration order — matching the compile-time
+    /// continuation-hash layout.
+    data_outputs: []const types.ContractOutput = &.{},
+    /// Extra contract inputs (e.g. `merge` on a fungible token spends two
+    /// contract UTXOs into one). Each entry carries its own pre-built
+    /// unlocking script (typically a stateful unlock with placeholder
+    /// preimage during the pre-convergence pass). Inserted in the input
+    /// list immediately after the primary contract input and before any
+    /// P2PKH funding inputs. Mirrors Go's `AdditionalContractInputs`
+    /// inside `BuildCallOptions`.
+    additional_contract_inputs: []const AdditionalContractInput = &.{},
+    /// Override the call tx's nLockTime. `null` → defaults to 0 (legacy).
+    /// Non-null writes the value into the locktime field. Required for
+    /// contracts that assert `extractLocktime(preimage) >= deadline`
+    /// (e.g. auction close/claim).
+    locktime: ?u32 = null,
+    /// Override the nSequence written onto EVERY input of the call tx (issue
+    /// #131). `null` → zero-config default: 0xfffffffe when `locktime` is set
+    /// and non-zero (non-final, so consensus actually enforces nLockTime), else
+    /// 0xffffffff (final, legacy). Set explicitly only for RBF or custom
+    /// relative-locktime scenarios.
+    sequence: ?u32 = null,
+};
+
+/// Resolve the nSequence written onto every call-tx input (issue #131). An
+/// explicit `sequence` always wins; otherwise all-0xffffffff (final) inputs make
+/// nLockTime a consensus no-op, so default to 0xfffffffe (non-final) when a
+/// non-zero locktime is set, else keep 0xffffffff. Shared by buildCallTransaction
+/// and the terminal-path tx builder so both sites stay byte-consistent.
+pub fn resolveInputSequence(locktime: u32, sequence: ?u32) u32 {
+    if (sequence) |s| return s;
+    if (locktime != 0) return 0xfffffffe;
+    return 0xffffffff;
+}
+
+/// AdditionalContractInput pairs an extra contract UTXO with its
+/// (placeholder-or-real) unlocking script for the same tx. Mirrors Go's
+/// `AdditionalContractInput`.
+pub const AdditionalContractInput = struct {
+    utxo: types.UTXO,
+    unlocking_script: []const u8,
 };
 
 pub const CallResult = struct {
@@ -51,22 +95,39 @@ pub fn buildCallTransaction(
         try contract_outputs.append(allocator, .{ .script = new_locking_script_hex, .satoshis = sats });
     }
 
+    const data_outputs: []const types.ContractOutput =
+        if (opts != null) opts.?.data_outputs else &.{};
+
+    const extra_contract_inputs: []const AdditionalContractInput =
+        if (opts != null) opts.?.additional_contract_inputs else &.{};
+
     // Calculate total inputs
     var total_input: i64 = current_utxo.satoshis;
+    for (extra_contract_inputs) |ci| total_input += ci.utxo.satoshis;
     for (additional_utxos) |u| total_input += u.satoshis;
 
     var contract_output_sats: i64 = 0;
     for (contract_outputs.items) |co| contract_output_sats += co.satoshis;
+    for (data_outputs) |do_| contract_output_sats += do_.satoshis;
 
     // Estimate fee
     const input0_script_len = unlocking_script_hex.len / 2;
     const input0_size = 32 + 4 + varIntByteSize(input0_script_len) + input0_script_len + 4;
+    var extra_contract_inputs_size: usize = 0;
+    for (extra_contract_inputs) |ci| {
+        const ci_script_len = ci.unlocking_script.len / 2;
+        extra_contract_inputs_size += 32 + 4 + varIntByteSize(ci_script_len) + ci_script_len + 4;
+    }
     const p2pkh_inputs_size = additional_utxos.len * 148;
-    const inputs_size = input0_size + p2pkh_inputs_size;
+    const inputs_size = input0_size + extra_contract_inputs_size + p2pkh_inputs_size;
 
     var outputs_size: usize = 0;
     for (contract_outputs.items) |co| {
         const script_len = co.script.len / 2;
+        outputs_size += 8 + varIntByteSize(script_len) + script_len;
+    }
+    for (data_outputs) |do_| {
+        const script_len = do_.script.len / 2;
         outputs_size += 8 + varIntByteSize(script_len) + script_len;
     }
     if (change_address != null) {
@@ -81,6 +142,20 @@ pub fn buildCallTransaction(
     // Build transaction using bsvz Builder
     var builder = bsvz.transaction.Builder.init(allocator);
     defer builder.deinit();
+
+    // Locktime: default 0 (legacy); overridable via CallBuildOptions.locktime
+    // for contracts asserting extractLocktime(preimage) >= deadline.
+    var lock_time: u32 = 0;
+    var seq_override: ?u32 = null;
+    if (opts) |o| {
+        if (o.locktime) |lt| lock_time = lt;
+        seq_override = o.sequence;
+    }
+    builder.lock_time = lock_time;
+    // nSequence for every input (issue #131): non-final (0xfffffffe) when a
+    // non-zero locktime is set so consensus enforces nLockTime, else final
+    // (0xffffffff); an explicit override always wins.
+    const input_sequence = resolveInputSequence(lock_time, seq_override);
 
     // Input 0: contract UTXO with unlocking script
     {
@@ -97,10 +172,33 @@ pub fn buildCallTransaction(
                 .index = @intCast(current_utxo.output_index),
             },
             .unlocking_script = bsvz.script.Script.init(unlock_bytes),
-            .sequence = 0xffffffff,
+            .sequence = input_sequence,
             .source_output = .{
                 .satoshis = current_utxo.satoshis,
                 .locking_script = bsvz.script.Script.init(utxo_script_bytes),
+            },
+        });
+    }
+
+    // Additional contract inputs (each with its own pre-built unlocking script)
+    for (extra_contract_inputs) |ci| {
+        const txid_chain = bsvz.primitives.chainhash.Hash.fromHex(ci.utxo.txid) catch return error.OutOfMemory;
+        const txid_hash = bsvz.crypto.Hash256{ .bytes = txid_chain.bytes };
+        const ci_unlock_bytes = try bsvz.primitives.hex.decode(allocator, ci.unlocking_script);
+        defer allocator.free(ci_unlock_bytes);
+        const ci_script_bytes = try bsvz.primitives.hex.decode(allocator, ci.utxo.script);
+        defer allocator.free(ci_script_bytes);
+
+        try builder.addInput(.{
+            .previous_outpoint = .{
+                .txid = txid_hash,
+                .index = @intCast(ci.utxo.output_index),
+            },
+            .unlocking_script = bsvz.script.Script.init(ci_unlock_bytes),
+            .sequence = input_sequence,
+            .source_output = .{
+                .satoshis = ci.utxo.satoshis,
+                .locking_script = bsvz.script.Script.init(ci_script_bytes),
             },
         });
     }
@@ -118,7 +216,7 @@ pub fn buildCallTransaction(
                 .index = @intCast(utxo.output_index),
             },
             .unlocking_script = .empty(),
-            .sequence = 0xffffffff,
+            .sequence = input_sequence,
             .source_output = .{
                 .satoshis = utxo.satoshis,
                 .locking_script = bsvz.script.Script.init(utxo_script_bytes),
@@ -133,6 +231,18 @@ pub fn buildCallTransaction(
         try builder.addOutput(.{
             .satoshis = co.satoshis,
             .locking_script = bsvz.script.Script.init(co_bytes),
+        });
+    }
+
+    // Data outputs (from this.addDataOutput in method body). Emitted
+    // after state outputs and before change to match the continuation
+    // hash the compiler embedded in the locking script.
+    for (data_outputs) |do_| {
+        const do_bytes = try bsvz.primitives.hex.decode(allocator, do_.script);
+        defer allocator.free(do_bytes);
+        try builder.addOutput(.{
+            .satoshis = do_.satoshis,
+            .locking_script = bsvz.script.Script.init(do_bytes),
         });
     }
 
@@ -155,9 +265,47 @@ pub fn buildCallTransaction(
 
     return .{
         .tx_hex = hex_buf,
-        .input_count = 1 + additional_utxos.len,
+        .input_count = 1 + extra_contract_inputs.len + additional_utxos.len,
         .change_amount = if (change > 0) change else 0,
     };
+}
+
+/// Resolve a list of user-facing TerminalOutput records (with optional
+/// `address` or `script_hex`) into the SDK-internal `ContractOutput`
+/// list expected by `CallOptions.terminal_outputs`. Each entry must
+/// supply exactly one of `address` (which is converted to a P2PKH
+/// locking script) or `script_hex` (used as the locking script
+/// directly). The returned slice and every entry's `script` field are
+/// allocated from `allocator`; the caller owns them.
+pub fn resolveTerminalOutputs(
+    allocator: std.mem.Allocator,
+    outputs: []const types.TerminalOutput,
+) ![]types.ContractOutput {
+    var resolved = try allocator.alloc(types.ContractOutput, outputs.len);
+    errdefer {
+        for (resolved) |co| if (co.script.len > 0) allocator.free(@constCast(co.script));
+        allocator.free(resolved);
+    }
+    for (outputs, 0..) |o, i| {
+        const script_hex: []u8 = if (o.script_hex) |sh|
+            try allocator.dupe(u8, sh)
+        else if (o.address) |addr|
+            try deploy_mod.buildP2PKHScript(allocator, addr)
+        else
+            return error.InvalidTerminalOutput;
+        resolved[i] = .{ .script = script_hex, .satoshis = o.satoshis };
+    }
+    return resolved;
+}
+
+/// Free a list of resolved terminal outputs allocated by
+/// `resolveTerminalOutputs`.
+pub fn freeResolvedTerminalOutputs(
+    allocator: std.mem.Allocator,
+    outputs: []types.ContractOutput,
+) void {
+    for (outputs) |co| if (co.script.len > 0) allocator.free(@constCast(co.script));
+    allocator.free(outputs);
 }
 
 fn varIntByteSize(n: usize) usize {
@@ -165,6 +313,31 @@ fn varIntByteSize(n: usize) usize {
     if (n <= 0xffff) return 3;
     if (n <= 0xffffffff) return 5;
     return 9;
+}
+
+/// EstimateCallFee estimates the fee for a call transaction. Mirrors the TS
+/// `estimateCallFee` semantics: accounts for the contract spending input
+/// (including its unlocking script), any P2PKH funding inputs (148 bytes each),
+/// each contract continuation output, and an optional P2PKH change output.
+/// `fee_rate_in` is satoshis per KB (0 defaults to 100).
+pub fn estimateCallFee(
+    unlocking_script_byte_len: usize,
+    continuation_script_byte_lens: []const usize,
+    num_additional_utxos: usize,
+    has_change: bool,
+    fee_rate_in: i64,
+) i64 {
+    const tx_overhead: usize = 10;
+    const input0_size: usize = 32 + 4 + varIntByteSize(unlocking_script_byte_len) + unlocking_script_byte_len + 4;
+    const p2pkh_inputs_size: usize = num_additional_utxos * 148;
+    var outputs_size: usize = 0;
+    for (continuation_script_byte_lens) |n| {
+        outputs_size += 8 + varIntByteSize(n) + n;
+    }
+    if (has_change) outputs_size += 34;
+    const total: i64 = @intCast(tx_overhead + input0_size + p2pkh_inputs_size + outputs_size);
+    const rate: i64 = if (fee_rate_in > 0) fee_rate_in else 100;
+    return @divTrunc(total * rate + 999, 1000);
 }
 
 // ---------------------------------------------------------------------------
@@ -197,4 +370,231 @@ test "buildCallTransaction with stateless contract" {
 
     try std.testing.expect(result.tx_hex.len > 0);
     try std.testing.expectEqual(@as(usize, 1), result.input_count);
+}
+
+test "buildCallTransaction locktime override appears in tx (issue #40)" {
+    const allocator = std.testing.allocator;
+
+    const contract_utxo = types.UTXO{
+        .txid = "aa" ** 32,
+        .output_index = 0,
+        .satoshis = 1000,
+        .script = "5100",
+    };
+
+    // Caller-supplied non-zero locktime must appear in the tx's nLockTime
+    // (the last 4 bytes / 8 hex chars of the serialized tx).
+    const opts = CallBuildOptions{ .locktime = 800_000 };
+    var result = try buildCallTransaction(
+        allocator,
+        contract_utxo,
+        "51",
+        "",
+        0,
+        null,
+        &.{},
+        100,
+        &opts,
+    );
+    defer result.deinit(allocator);
+
+    const tail = result.tx_hex[result.tx_hex.len - 8 ..];
+    // 800000 = 0x000C3500 → little-endian hex "00350c00"
+    try std.testing.expectEqualStrings("00350c00", tail);
+}
+
+test "buildCallTransaction locktime defaults to zero (issue #40)" {
+    const allocator = std.testing.allocator;
+
+    const contract_utxo = types.UTXO{
+        .txid = "aa" ** 32,
+        .output_index = 0,
+        .satoshis = 1000,
+        .script = "5100",
+    };
+
+    // Default (unset) must still write 0 — back-compatible.
+    const opts = CallBuildOptions{};
+    var result = try buildCallTransaction(
+        allocator,
+        contract_utxo,
+        "51",
+        "",
+        0,
+        null,
+        &.{},
+        100,
+        &opts,
+    );
+    defer result.deinit(allocator);
+
+    const tail = result.tx_hex[result.tx_hex.len - 8 ..];
+    try std.testing.expectEqualStrings("00000000", tail);
+}
+
+test "resolveInputSequence defaults to non-final when locktime set (issue #131)" {
+    // Explicit override always wins.
+    try std.testing.expectEqual(@as(u32, 0x12345678), resolveInputSequence(0, 0x12345678));
+    try std.testing.expectEqual(@as(u32, 0x12345678), resolveInputSequence(800_000, 0x12345678));
+    // No override, non-zero locktime → 0xfffffffe (non-final, consensus-enforced).
+    try std.testing.expectEqual(@as(u32, 0xfffffffe), resolveInputSequence(800_000, null));
+    // No override, zero locktime → 0xffffffff (final, legacy).
+    try std.testing.expectEqual(@as(u32, 0xffffffff), resolveInputSequence(0, null));
+}
+
+test "buildCallTransaction writes non-final input sequence when locktime set (issue #131)" {
+    const allocator = std.testing.allocator;
+
+    const contract_utxo = types.UTXO{
+        .txid = "aa" ** 32,
+        .output_index = 0,
+        .satoshis = 1000,
+        .script = "5100",
+    };
+
+    // Raw tx layout for a single input with a 1-byte unlocking script "51":
+    //   version(4) | in_count(1) | txid(32) | index(4) | scriptlen(1) | script(1)
+    //   | sequence(4) ...
+    // So nSequence occupies hex chars [86..94).
+    const seq_off = (4 + 1 + 32 + 4 + 1 + 1) * 2;
+
+    // Non-zero locktime, no explicit sequence → 0xfffffffe (LE "feffffff").
+    {
+        const opts = CallBuildOptions{ .locktime = 800_000 };
+        var result = try buildCallTransaction(allocator, contract_utxo, "51", "", 0, null, &.{}, 100, &opts);
+        defer result.deinit(allocator);
+        try std.testing.expectEqualStrings("feffffff", result.tx_hex[seq_off .. seq_off + 8]);
+    }
+
+    // No locktime → 0xffffffff (LE "ffffffff"), legacy.
+    {
+        const opts = CallBuildOptions{};
+        var result = try buildCallTransaction(allocator, contract_utxo, "51", "", 0, null, &.{}, 100, &opts);
+        defer result.deinit(allocator);
+        try std.testing.expectEqualStrings("ffffffff", result.tx_hex[seq_off .. seq_off + 8]);
+    }
+
+    // Explicit sequence override wins even without a locktime.
+    {
+        const opts = CallBuildOptions{ .sequence = 0xfffffffd };
+        var result = try buildCallTransaction(allocator, contract_utxo, "51", "", 0, null, &.{}, 100, &opts);
+        defer result.deinit(allocator);
+        try std.testing.expectEqualStrings("fdffffff", result.tx_hex[seq_off .. seq_off + 8]);
+    }
+}
+
+test "estimateCallFee mirrors TS semantics" {
+    // No continuation outputs, no change, no extra inputs
+    const fee0 = estimateCallFee(1, &.{}, 0, false, 100);
+    try std.testing.expect(fee0 > 0);
+
+    // Adding an extra P2PKH input raises the fee
+    const fee1 = estimateCallFee(1, &.{}, 1, false, 100);
+    try std.testing.expect(fee1 > fee0);
+
+    // Adding a continuation output raises the fee
+    const fee2 = estimateCallFee(1, &.{100}, 0, false, 100);
+    try std.testing.expect(fee2 > fee0);
+
+    // Adding change output raises the fee
+    const fee3 = estimateCallFee(1, &.{}, 0, true, 100);
+    try std.testing.expect(fee3 > fee0);
+
+    // Default fee rate (0 → 100)
+    const fee4 = estimateCallFee(1, &.{}, 0, false, 0);
+    try std.testing.expectEqual(fee0, fee4);
+}
+
+// E2E: deploy → broadcast via MockProvider → consume deploy output in a call tx.
+// Uses a trivial stateful-like locking script (OP_1) and a trivial unlock (OP_1)
+// to exercise the plumbing end-to-end without needing full compiler output here.
+test "deploy->broadcast->call lifecycle via MockProvider" {
+    const allocator = std.testing.allocator;
+
+    // Set up MockProvider with a funding UTXO for "deployer" address.
+    var mock = provider_mod.MockProvider.init(allocator, "testnet");
+    defer mock.deinit();
+
+    const fund_utxo = types.UTXO{
+        .txid = "bb" ** 32,
+        .output_index = 0,
+        .satoshis = 100_000,
+        .script = "76a914" ++ ("11" ** 20) ++ "88ac",
+    };
+    try mock.addUtxo("deployer", fund_utxo);
+
+    var prov = mock.provider();
+    const utxos = try prov.getUtxos(allocator, "deployer");
+    defer {
+        for (utxos) |*u| {
+            var mu = u.*;
+            mu.deinit(allocator);
+        }
+        allocator.free(utxos);
+    }
+    try std.testing.expect(utxos.len >= 1);
+
+    // Build deploy tx that creates a contract output with locking script "51" (OP_1).
+    const contract_script_hex = "51";
+    var deploy_res = try deploy_mod.buildDeployTransaction(
+        allocator,
+        contract_script_hex,
+        utxos,
+        1000,
+        "1BitcoinEaterAddressDontSendf59kuE",
+        100,
+    );
+    defer deploy_res.deinit(allocator);
+
+    try std.testing.expect(deploy_res.tx_hex.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), deploy_res.input_count);
+
+    // "Broadcast" via MockProvider — returns a fake txid and stores the raw tx.
+    const deploy_txid = try prov.broadcast(allocator, deploy_res.tx_hex);
+    defer allocator.free(deploy_txid);
+    try std.testing.expectEqual(@as(usize, 64), deploy_txid.len);
+
+    // Provider should recall the raw tx by txid.
+    const recalled = try prov.getRawTransaction(allocator, deploy_txid);
+    defer allocator.free(recalled);
+    try std.testing.expectEqualStrings(deploy_res.tx_hex, recalled);
+
+    // Build a call tx that consumes the deploy output (index 0).
+    const deploy_outpoint = types.UTXO{
+        .txid = deploy_txid,
+        .output_index = 0,
+        .satoshis = 1000,
+        .script = contract_script_hex,
+    };
+
+    var call_res = try buildCallTransaction(
+        allocator,
+        deploy_outpoint,
+        "51", // unlocking: OP_1
+        "", // stateless call — no continuation
+        0,
+        null,
+        &.{},
+        100,
+        null,
+    );
+    defer call_res.deinit(allocator);
+
+    try std.testing.expect(call_res.tx_hex.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), call_res.input_count);
+
+    // The call tx must reference the deploy txid in its first input.
+    // Raw tx layout: version(4) | input_count varint | input0{ prev_txid(32 LE) prev_idx(4) script_varint script sequence(4) } ...
+    // We check the hex string contains the prev txid bytes in little-endian.
+    // deploy_txid is display order (big-endian); the serialized tx has it LE-reversed.
+    var le_txid_buf: [64]u8 = undefined;
+    for (0..32) |i| {
+        le_txid_buf[i * 2] = deploy_txid[(31 - i) * 2];
+        le_txid_buf[i * 2 + 1] = deploy_txid[(31 - i) * 2 + 1];
+    }
+    const le_txid: []const u8 = le_txid_buf[0..];
+    try std.testing.expect(std.mem.indexOf(u8, call_res.tx_hex, le_txid) != null);
+
+    // And it should contain the OP_1 unlocking script push (after the script-len varint 0x01).
+    try std.testing.expect(std.mem.indexOf(u8, call_res.tx_hex, "0151") != null);
 }

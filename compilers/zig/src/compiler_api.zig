@@ -1,6 +1,14 @@
 const std = @import("std");
 const types = @import("ir/types.zig");
 const parse_zig = @import("passes/parse_zig.zig");
+const parse_ts = @import("passes/parse_ts.zig");
+const parse_sol = @import("passes/parse_sol.zig");
+const parse_move = @import("passes/parse_move.zig");
+const parse_go = @import("passes/parse_go.zig");
+const parse_rust = @import("passes/parse_rust.zig");
+const parse_python = @import("passes/parse_python.zig");
+const parse_ruby = @import("passes/parse_ruby.zig");
+const parse_java = @import("passes/parse_java.zig");
 const validate_pass = @import("passes/validate.zig");
 const typecheck_pass = @import("passes/typecheck.zig");
 const anf_lower = @import("passes/anf_lower.zig");
@@ -9,6 +17,10 @@ const ec_optimizer = @import("passes/ec_optimizer.zig");
 const stack_lower = @import("passes/stack_lower.zig");
 const peephole = @import("passes/peephole.zig");
 const emit = @import("codegen/emit.zig");
+const input_limits = @import("frontend/input_limits.zig");
+
+pub const SourceSizeExceededError = input_limits.SourceSizeError;
+pub const MAX_SOURCE_BYTES = input_limits.MAX_SOURCE_BYTES;
 
 pub const CompileError = error{
     ParseFailed,
@@ -18,6 +30,8 @@ pub const CompileError = error{
     ANFLowerFailed,
     StackLowerFailed,
     EmitFailed,
+    // BUG-008 follow-up: typed DoS-bound rejection of oversized source.
+    SourceSizeExceeded,
 };
 
 pub const CompileResult = struct {
@@ -30,24 +44,110 @@ pub const CompileResult = struct {
     }
 };
 
-// Compile a .runar.zig source string through the full pipeline,
+const FileFormat = enum { runar_zig, runar_ts, runar_sol, runar_move, runar_go, runar_rs, runar_py, runar_rb, runar_java, unknown };
+
+fn detectFormat(path: []const u8) FileFormat {
+    if (std.mem.endsWith(u8, path, ".runar.zig")) return .runar_zig;
+    if (std.mem.endsWith(u8, path, ".runar.ts")) return .runar_ts;
+    if (std.mem.endsWith(u8, path, ".runar.sol")) return .runar_sol;
+    if (std.mem.endsWith(u8, path, ".runar.move")) return .runar_move;
+    if (std.mem.endsWith(u8, path, ".runar.go")) return .runar_go;
+    if (std.mem.endsWith(u8, path, ".runar.rs")) return .runar_rs;
+    if (std.mem.endsWith(u8, path, ".runar.py")) return .runar_py;
+    if (std.mem.endsWith(u8, path, ".runar.rb")) return .runar_rb;
+    if (std.mem.endsWith(u8, path, ".runar.java")) return .runar_java;
+    return .unknown;
+}
+
+fn parseSource(work: std.mem.Allocator, source: []const u8, file_name: []const u8) struct { contract: ?types.ContractNode, errors: []const []const u8 } {
+    const format = detectFormat(file_name);
+
+    // Fail-closed guard: the `@sighash` (#123) / `@embedAlways` (#109) comment
+    // directives are honoured ONLY on the `.runar.ts` surface (which implements
+    // them). The other eight surface parsers ignore comments, so they must
+    // reject a directive rather than silently drop it and change signing / DCE
+    // semantics. `.runar.ts` is exempt — its parser honours the directives.
+    if (format != .runar_ts) {
+        if (input_limits.containsDirectiveToken(source, "@sighash")) {
+            return .{ .contract = null, .errors = &.{input_limits.SIGHASH_DIRECTIVE_ERROR} };
+        }
+        if (input_limits.containsDirectiveToken(source, "@embedAlways")) {
+            return .{ .contract = null, .errors = &.{input_limits.EMBED_ALWAYS_DIRECTIVE_ERROR} };
+        }
+    }
+
+    return switch (format) {
+        .runar_zig => blk: {
+            const r = parse_zig.parseZig(work, source, file_name);
+            break :blk .{ .contract = r.contract, .errors = r.errors };
+        },
+        .runar_ts => blk: {
+            const r = parse_ts.parseTs(work, source, file_name);
+            break :blk .{ .contract = r.contract, .errors = r.errors };
+        },
+        .runar_sol => blk: {
+            const r = parse_sol.parseSol(work, source, file_name);
+            break :blk .{ .contract = r.contract, .errors = r.errors };
+        },
+        .runar_move => blk: {
+            const r = parse_move.parseMove(work, source, file_name);
+            break :blk .{ .contract = r.contract, .errors = r.errors };
+        },
+        .runar_go => blk: {
+            const r = parse_go.parseGo(work, source, file_name);
+            break :blk .{ .contract = r.contract, .errors = r.errors };
+        },
+        .runar_rs => blk: {
+            const r = parse_rust.parseRust(work, source, file_name);
+            break :blk .{ .contract = r.contract, .errors = r.errors };
+        },
+        .runar_py => blk: {
+            const r = parse_python.parsePython(work, source, file_name);
+            break :blk .{ .contract = r.contract, .errors = r.errors };
+        },
+        .runar_rb => blk: {
+            const r = parse_ruby.parseRuby(work, source, file_name);
+            break :blk .{ .contract = r.contract, .errors = r.errors };
+        },
+        .runar_java => blk: {
+            const r = parse_java.parseJava(work, source, file_name);
+            break :blk .{ .contract = r.contract, .errors = r.errors };
+        },
+        .unknown => blk: {
+            // Fall back to Zig parser for unknown extensions
+            const r = parse_zig.parseZig(work, source, file_name);
+            break :blk .{ .contract = r.contract, .errors = r.errors };
+        },
+    };
+}
+
+// Compile a source string through the full pipeline,
 // returning both the hex script and the JSON artifact.
+// Automatically detects the input format from the file_name extension.
 pub fn compileSource(
     allocator: std.mem.Allocator,
     source: []const u8,
     file_name: []const u8,
 ) CompileError!CompileResult {
+    // Pass 0: DoS-bound size guard. Reject oversized source BEFORE any
+    // tokenizer / arena allocator touches the input. BUG-008 follow-up.
+    input_limits.assertSourceBytesUnderLimit(source) catch return error.SourceSizeExceeded;
+
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const work = arena.allocator();
 
-    // Pass 1: Parse
-    const parse_result = parse_zig.parseZig(work, source, file_name);
+    // Pass 1: Parse (auto-detect format from file extension)
+    const parse_result = parseSource(work, source, file_name);
     if (parse_result.errors.len > 0) return error.ParseFailed;
     const contract = parse_result.contract orelse return error.ParseFailed;
 
-    // Pass 2: Validate (Zig mode — relaxes super() constructor requirement)
-    const val_result = validate_pass.validateZig(work, contract) catch return error.ValidationFailed;
+    // Pass 2: Validate (Zig mode for .runar.zig — relaxes super() constructor requirement)
+    const format = detectFormat(file_name);
+    const val_result = if (format == .runar_zig)
+        validate_pass.validateZig(work, contract) catch return error.ValidationFailed
+    else
+        validate_pass.validate(work, contract) catch return error.ValidationFailed;
     if (val_result.errors.len > 0) return error.ValidationFailed;
 
     // Pass 3: Typecheck
@@ -109,6 +209,18 @@ pub fn compileSourceToHex(
     return result.script_hex;
 }
 
+/// Check that a hex string contains a given opcode hex byte at a byte-aligned boundary.
+/// Steps by 2 chars (1 byte) to avoid matching bytes that are part of push data values.
+fn hexContainsOpcode(hex: []const u8, opcode: []const u8) bool {
+    std.debug.assert(opcode.len == 2);
+    if (hex.len < 2) return false;
+    var i: usize = 0;
+    while (i + 1 < hex.len) : (i += 2) {
+        if (hex[i] == opcode[0] and hex[i + 1] == opcode[1]) return true;
+    }
+    return false;
+}
+
 test "compile P2PKH contract to hex" {
     const source =
         \\const runar = @import("runar");
@@ -136,10 +248,11 @@ test "compile P2PKH contract to hex" {
     try std.testing.expect(hex.len > 0);
 
     // P2PKH script should contain OP_DUP (76), OP_HASH160 (a9),
-    // OP_EQUALVERIFY (88), OP_CHECKSIG (ac) somewhere in the output
-    try std.testing.expect(std.mem.indexOf(u8, hex, "76") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hex, "a9") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hex, "ac") != null);
+    // OP_EQUALVERIFY (88), OP_CHECKSIG (ac) — use byte-aligned checks to
+    // avoid spurious matches inside push data values.
+    try std.testing.expect(hexContainsOpcode(hex, "76")); // OP_DUP
+    try std.testing.expect(hexContainsOpcode(hex, "a9")); // OP_HASH160
+    try std.testing.expect(hexContainsOpcode(hex, "ac")); // OP_CHECKSIG
 }
 
 test "artifact contains source map entries" {
@@ -168,7 +281,9 @@ test "artifact contains source map entries" {
     // Artifact JSON should contain sourceMap
     try std.testing.expect(result.artifact_json != null);
     const json = result.artifact_json.?;
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"sourceMap\":[") != null);
+    // GAP-002: sourceMap is now wrapped in {"mappings":[...]} per the
+    // canonical schema. The substring check shifts accordingly.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sourceMap\":{\"mappings\":[") != null);
     // sourceMap should reference the source file
     try std.testing.expect(std.mem.indexOf(u8, json, "P2PKH.runar.zig") != null);
 }
@@ -179,4 +294,280 @@ test "compile returns error for invalid contract" {
         error.ParseFailed,
         compileSourceToHex(std.testing.allocator, source, "bad.runar.zig"),
     );
+}
+
+test "addDataOutput produces add_data_output ANF node" {
+    // Stateful contract that declares a data output alongside a state
+    // continuation. The ANF output must include both an add_data_output
+    // node (tracked separately) and the continuation-hash machinery wiring
+    // the data output between state outputs and the change output.
+    const source =
+        \\const runar = @import("runar");
+        \\
+        \\pub const DataCounter = struct {
+        \\    pub const Contract = runar.StatefulSmartContract;
+        \\
+        \\    count: i64 = 0,
+        \\
+        \\    pub fn init(count: i64) DataCounter {
+        \\        return .{ .count = count };
+        \\    }
+        \\
+        \\    pub fn tick(self: *DataCounter, data: runar.ByteString) void {
+        \\        self.count = self.count + 1;
+        \\        self.addDataOutput(0, data);
+        \\    }
+        \\};
+    ;
+
+    const result = try compileSource(std.testing.allocator, source, "DataCounter.runar.zig");
+    defer result.deinit(std.testing.allocator);
+
+    const json = result.artifact_json orelse return error.TestExpectedJson;
+    try std.testing.expect(std.mem.indexOf(u8, json, "add_data_output") != null);
+    // The hex script should be non-empty and include the state-output
+    // continuation path (bsvz OP_HASH256 followed by OP_EQUALVERIFY-ish
+    // structure). Presence of any non-empty script is enough here.
+    try std.testing.expect(result.script_hex.len > 0);
+}
+
+test "addDataOutput emits the raw-output wire-shape opcodes in compiled hex" {
+    // GAP-m3: a dedicated codegen op-shape pin for the addDataOutput
+    // intrinsic. The conformance suite gates cross-tier byte parity, but
+    // this test catches a wrong-opcode regression in the Zig stack lowerer
+    // locally. add_data_output lowers to the same wire shape as
+    // add_raw_output: OP_SIZE + varint + OP_CAT + 8-byte LE amount via
+    // OP_NUM2BIN + OP_CAT (mirrors Go's TestStack_AddDataOutput_WireShape).
+    const source =
+        \\const runar = @import("runar");
+        \\
+        \\pub const DataLogger = struct {
+        \\    pub const Contract = runar.StatefulSmartContract;
+        \\
+        \\    count: i64 = 0,
+        \\
+        \\    pub fn init(count: i64) DataLogger {
+        \\        return .{ .count = count };
+        \\    }
+        \\
+        \\    pub fn log(self: *DataLogger, note: runar.ByteString) void {
+        \\        self.count = self.count + 1;
+        \\        self.addDataOutput(0, note);
+        \\    }
+        \\};
+    ;
+
+    const hex = try compileSourceToHex(std.testing.allocator, source, "DataLogger.runar.zig");
+    defer std.testing.allocator.free(hex);
+
+    // The data-output serialization building blocks must be present:
+    //   OP_SIZE (0x82), OP_CAT (0x7e), OP_NUM2BIN (0x80).
+    try std.testing.expect(hexContainsOpcode(hex, "82")); // OP_SIZE — script-len prefix
+    try std.testing.expect(hexContainsOpcode(hex, "7e")); // OP_CAT — output assembly
+    try std.testing.expect(hexContainsOpcode(hex, "80")); // OP_NUM2BIN — 8-byte LE satoshis
+}
+
+test "addDataOutput without state mutation still emits continuation hash" {
+    // A stateful method that does NOT mutate state but declares a data
+    // output must still trigger the continuation-hash machinery
+    // (needs_change_output = true, needs_new_amount = true).
+    const source =
+        \\const runar = @import("runar");
+        \\
+        \\pub const DataOnly = struct {
+        \\    pub const Contract = runar.StatefulSmartContract;
+        \\
+        \\    owner: runar.Addr,
+        \\
+        \\    pub fn init(owner: runar.Addr) DataOnly {
+        \\        return .{ .owner = owner };
+        \\    }
+        \\
+        \\    pub fn emit(self: *DataOnly, data: runar.ByteString) void {
+        \\        _ = self;
+        \\        self.addDataOutput(0, data);
+        \\    }
+        \\};
+    ;
+
+    const result = try compileSource(std.testing.allocator, source, "DataOnly.runar.zig");
+    defer result.deinit(std.testing.allocator);
+
+    const json = result.artifact_json orelse return error.TestExpectedJson;
+    try std.testing.expect(std.mem.indexOf(u8, json, "add_data_output") != null);
+    // Change-output / newAmount implicit params must appear in the ABI.
+    try std.testing.expect(std.mem.indexOf(u8, json, "_changePKH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "_changeAmount") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "_newAmount") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Rabin signature codegen — end-to-end source -> hex pin
+// ---------------------------------------------------------------------------
+//
+// GAP-040 (audits/cross-language-completeness-20260510.md, Section 4 / F14):
+// The Zig Rabin emitter (`compilers/zig/src/passes/helpers/crypto_emitters.zig
+// :appendVerifyRabinSig`) had only a low-level instruction-list unit test
+// (line 191: "implemented crypto emitters append instructions"); there was
+// no test exercising the full source -> parse -> validate -> typecheck ->
+// ANF -> stack-lower -> emit pipeline for `verifyRabinSig`. The conformance
+// fixture `oracle-price` hits this path transitively, but a regression
+// in Zig stack-lower's dispatch (`stack_lower.zig:1465`) or in the
+// crypto-emitter dispatch (`stack_lower.zig:1580`) would only surface as a
+// hex divergence in the cross-tier conformance step rather than as a
+// targeted failure inside `zig build test`.
+//
+// The reference Rabin opcode sequence (mirrored across all 7 compilers):
+//   OP_SWAP OP_ROT OP_DUP OP_MUL OP_ADD OP_SWAP OP_MOD OP_SWAP OP_SHA256 OP_EQUAL
+// = bytes 7c 7b 76 95 93 7c 97 7c a8 87 (all single-byte opcodes).
+
+test "verifyRabinSig end-to-end source compiles and emits Rabin opcode sequence" {
+    // Minimal stateless contract that calls verifyRabinSig directly.
+    // Mirrors the structure of `examples/zig/oracle-price/OraclePriceFeed.runar.zig`
+    // but without the surrounding price + checkSig wiring so the assertions
+    // below isolate the Rabin opcode pattern. Stateless to avoid the
+    // checkPreimage continuation injection masking the Rabin tail.
+    const source =
+        \\const runar = @import("runar");
+        \\
+        \\pub const RabinOnly = struct {
+        \\    pub const Contract = runar.SmartContract;
+        \\
+        \\    pubKey: runar.RabinPubKey,
+        \\
+        \\    pub fn init(pubKey: runar.RabinPubKey) RabinOnly {
+        \\        return .{ .pubKey = pubKey };
+        \\    }
+        \\
+        \\    pub fn unlock(
+        \\        self: *const RabinOnly,
+        \\        msg: runar.ByteString,
+        \\        sig: runar.RabinSig,
+        \\        padding: runar.ByteString,
+        \\    ) void {
+        \\        runar.assert(runar.verifyRabinSig(msg, sig, padding, self.pubKey));
+        \\    }
+        \\};
+    ;
+
+    const hex = try compileSourceToHex(std.testing.allocator, source, "RabinOnly.runar.zig");
+    defer std.testing.allocator.free(hex);
+
+    // 1. Hex must be non-empty.
+    try std.testing.expect(hex.len > 0);
+
+    // 2. The Rabin verifier emits 10 single-byte opcodes. Each must appear
+    //    at least once in the script. Use byte-aligned hex matching to avoid
+    //    spurious matches inside push-data payloads.
+    //    Reference (crypto_emitters.zig:67-78):
+    //      OP_SWAP=7c OP_ROT=7b OP_DUP=76 OP_MUL=95 OP_ADD=93
+    //      OP_SWAP=7c OP_MOD=97 OP_SWAP=7c OP_SHA256=a8 OP_EQUAL=87
+    //    OP_SWAP and OP_ADD also appear naturally elsewhere in stateless-contract
+    //    boilerplate; we therefore pin only the Rabin-specific pair (OP_MUL,
+    //    OP_MOD) plus the closing OP_SHA256/OP_EQUAL to disambiguate.
+    try std.testing.expect(hexContainsOpcode(hex, "95")); // OP_MUL — Rabin sig^2
+    try std.testing.expect(hexContainsOpcode(hex, "97")); // OP_MOD — sig^2 mod n
+    try std.testing.expect(hexContainsOpcode(hex, "a8")); // OP_SHA256 — hash(msg)
+    try std.testing.expect(hexContainsOpcode(hex, "87")); // OP_EQUAL — final check
+}
+
+test "verifyRabinSig hex contains contiguous Rabin opcode subsequence" {
+    // Stronger pin: assert the EXACT Rabin opcode subsequence appears
+    // contiguously in the emitted hex. The expected substring is the
+    // byte concatenation of (post BUG-010, 15 opcodes / 18 hex bytes):
+    //   SWAP=7c DUP=76 OP_0=00 PUSH3(65536)=03000001 WITHIN=a5 VERIFY=69
+    //   ROT=7b DUP=76 MUL=95 ADD=93 SWAP=7c MOD=97 SWAP=7c SHA256=a8 EQUAL=87
+    // The leading 5-opcode prefix (DUP OP_0 PUSH3 65536 WITHIN VERIFY) is
+    // the BUG-010 padding range check (0 <= padding < 65536).
+    const source =
+        \\const runar = @import("runar");
+        \\
+        \\pub const RabinOnly = struct {
+        \\    pub const Contract = runar.SmartContract;
+        \\
+        \\    pubKey: runar.RabinPubKey,
+        \\
+        \\    pub fn init(pubKey: runar.RabinPubKey) RabinOnly {
+        \\        return .{ .pubKey = pubKey };
+        \\    }
+        \\
+        \\    pub fn unlock(
+        \\        self: *const RabinOnly,
+        \\        msg: runar.ByteString,
+        \\        sig: runar.RabinSig,
+        \\        padding: runar.ByteString,
+        \\    ) void {
+        \\        runar.assert(runar.verifyRabinSig(msg, sig, padding, self.pubKey));
+        \\    }
+        \\};
+    ;
+
+    const hex = try compileSourceToHex(std.testing.allocator, source, "RabinOnly.runar.zig");
+    defer std.testing.allocator.free(hex);
+
+    // Contiguous Rabin opcode subsequence (15 ops post-BUG-010; the PUSH 65536
+    // contributes 1 length byte + 3 data bytes = 4 hex octets in the middle).
+    // Bytes:
+    //   7c          OP_SWAP
+    //   76 00       OP_DUP OP_0           (BUG-010 range check)
+    //   03 00 00 01 PUSH 65536 (LE)
+    //   a5 69       OP_WITHIN OP_VERIFY
+    //   7b          OP_ROT
+    //   76 95 93 7c 97 7c a8 87           original tail
+    const rabin_subseq = "7c7600" ++ "03000001" ++ "a5697b" ++ "769593" ++ "7c977ca887";
+    const found = std.mem.indexOf(u8, hex, rabin_subseq);
+    if (found == null) {
+        std.debug.print(
+            "Rabin opcode subsequence {s} not found in script hex.\nFull hex:\n{s}\n",
+            .{ rabin_subseq, hex },
+        );
+    }
+    try std.testing.expect(found != null);
+}
+
+test "verifyRabinSig appendVerifyRabinSig emits exactly 15 opcodes" {
+    // Direct emitter pin: the appendVerifyRabinSig builder helper must
+    // emit exactly 15 instructions (matching the cross-tier reference,
+    // post BUG-010: 10 original + 5 padding-range-check ops).
+    const crypto_emitters = @import("passes/helpers/crypto_emitters.zig");
+    const registry = @import("passes/helpers/crypto_builtins.zig");
+
+    var list: std.ArrayListUnmanaged(crypto_emitters.CryptoInstruction) = .empty;
+    defer list.deinit(std.testing.allocator);
+
+    try crypto_emitters.appendBuiltinInstructions(&list, std.testing.allocator, registry.CryptoBuiltin.verify_rabin_sig);
+    try std.testing.expectEqual(@as(usize, 15), list.items.len);
+
+    // Pin the exact opcode order (the cross-compiler reference). Position 3
+    // is a push of the BUG-010 padding limit (65536) — checked separately.
+    const expected_opcodes = [_]?[]const u8{
+        "OP_SWAP",
+        "OP_DUP",
+        "OP_0",
+        null, // push_int(65536)
+        "OP_WITHIN",
+        "OP_VERIFY",
+        "OP_ROT",
+        "OP_DUP",
+        "OP_MUL",
+        "OP_ADD",
+        "OP_SWAP",
+        "OP_MOD",
+        "OP_SWAP",
+        "OP_SHA256",
+        "OP_EQUAL",
+    };
+    for (expected_opcodes, 0..) |maybe_name, i| {
+        if (maybe_name) |name| {
+            switch (list.items[i]) {
+                .op_name => |op| try std.testing.expectEqualStrings(name, op),
+                else => return error.UnexpectedInstructionKind,
+            }
+        } else {
+            switch (list.items[i]) {
+                .push_int => |v| try std.testing.expectEqual(@as(i64, 65536), v),
+                else => return error.UnexpectedInstructionKind,
+            }
+        }
+    }
 }

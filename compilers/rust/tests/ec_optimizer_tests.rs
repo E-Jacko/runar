@@ -27,12 +27,14 @@ fn some_point_hex() -> String {
 fn make_program(bindings: Vec<ANFBinding>) -> ANFProgram {
     ANFProgram {
         contract_name: "Test".to_string(),
+        parent_class: String::new(),
         properties: vec![],
         methods: vec![ANFMethod {
             name: "test".to_string(),
             params: vec![],
             body: bindings,
             is_public: true,
+            sighash_type: None,
         }],
     }
 }
@@ -81,6 +83,7 @@ fn assert_binding(name: &str, val_ref: &str) -> ANFBinding {
         name: name.to_string(),
         value: ANFValue::Assert {
             value: val_ref.to_string(),
+            is_auto_injected_state_check: false,
         },
         source_loc: None,
     }
@@ -494,12 +497,14 @@ fn test_contract_metadata_preserved() {
 
     let program = ANFProgram {
         contract_name: "P2PKH".to_string(),
+        parent_class: String::new(),
         properties: vec![
             ANFProperty {
                 name: "pubKeyHash".to_string(),
                 prop_type: "Addr".to_string(),
                 readonly: true,
                 initial_value: None,
+                synthetic_array_chain: None,
             },
         ],
         methods: vec![ANFMethod {
@@ -510,6 +515,7 @@ fn test_contract_metadata_preserved() {
                 assert_binding("t1", "t0"),
             ],
             is_public: true,
+            sighash_type: None,
         }],
     };
 
@@ -541,6 +547,7 @@ fn test_multiple_methods_all_optimized() {
     ];
     let program = ANFProgram {
         contract_name: "TwoMethods".to_string(),
+        parent_class: String::new(),
         properties: vec![],
         methods: vec![
             ANFMethod {
@@ -548,12 +555,14 @@ fn test_multiple_methods_all_optimized() {
                 params: vec![],
                 body: method1_body,
                 is_public: true,
+                sighash_type: None,
             },
             ANFMethod {
                 name: "method2".to_string(),
                 params: vec![],
                 body: method2_body,
                 is_public: true,
+                sighash_type: None,
             },
         ],
     };
@@ -592,12 +601,14 @@ fn test_multiple_methods_all_optimized() {
 fn test_empty_method_body_unchanged() {
     let program = ANFProgram {
         contract_name: "Empty".to_string(),
+        parent_class: String::new(),
         properties: vec![],
         methods: vec![ANFMethod {
             name: "check".to_string(),
             params: vec![],
             body: vec![],
             is_public: true,
+            sighash_type: None,
         }],
     };
     let result = optimize_ec(program);
@@ -696,8 +707,8 @@ fn test_chained_rules_12_then_5() {
             // Both are correct optimizer outputs; we just verify no crash.
             let s = value.as_str().unwrap_or("");
             assert!(
-                s == INFINITY_HEX || value.as_str().is_some(),
-                "expected valid constant, got {value}"
+                s == INFINITY_HEX || (s.len() == 128 && s.chars().all(|c| c.is_ascii_hexdigit())),
+                "expected INFINITY or 64-byte hex point, got '{s}'"
             );
         }
         ANFValue::Call { func, .. } => {

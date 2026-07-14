@@ -2,6 +2,7 @@ package frontend
 
 import (
 	"fmt"
+	"math/big"
 	"strings"
 )
 
@@ -70,6 +71,7 @@ var builtinFunctions = map[string]funcSig{
 	"verifySLHDSA_SHA2_192f": {params: []string{"ByteString", "ByteString", "ByteString"}, returnType: "boolean"},
 	"verifySLHDSA_SHA2_256s": {params: []string{"ByteString", "ByteString", "ByteString"}, returnType: "boolean"},
 	"verifySLHDSA_SHA2_256f": {params: []string{"ByteString", "ByteString", "ByteString"}, returnType: "boolean"},
+	"verifySP1FRI":       {params: []string{"ByteString", "ByteString", "ByteString"}, returnType: "boolean"},
 	"ecAdd":              {params: []string{"Point", "Point"}, returnType: "Point"},
 	"ecMul":              {params: []string{"Point", "bigint"}, returnType: "Point"},
 	"ecMulGen":           {params: []string{"bigint"}, returnType: "Point"},
@@ -80,10 +82,92 @@ var builtinFunctions = map[string]funcSig{
 	"ecMakePoint":        {params: []string{"bigint", "bigint"}, returnType: "Point"},
 	"ecPointX":           {params: []string{"Point"}, returnType: "bigint"},
 	"ecPointY":           {params: []string{"Point"}, returnType: "bigint"},
+	// Elliptic curve operations (P-256 / NIST P-256 / secp256r1)
+	"p256Add":              {params: []string{"P256Point", "P256Point"}, returnType: "P256Point"},
+	"p256Mul":              {params: []string{"P256Point", "bigint"}, returnType: "P256Point"},
+	"p256MulGen":           {params: []string{"bigint"}, returnType: "P256Point"},
+	"p256Negate":           {params: []string{"P256Point"}, returnType: "P256Point"},
+	"p256OnCurve":          {params: []string{"P256Point"}, returnType: "boolean"},
+	"p256EncodeCompressed": {params: []string{"P256Point"}, returnType: "ByteString"},
+	"verifyECDSA_P256":     {params: []string{"ByteString", "ByteString", "ByteString"}, returnType: "boolean"},
+	// Elliptic curve operations (P-384 / NIST P-384 / secp384r1)
+	"p384Add":              {params: []string{"P384Point", "P384Point"}, returnType: "P384Point"},
+	"p384Mul":              {params: []string{"P384Point", "bigint"}, returnType: "P384Point"},
+	"p384MulGen":           {params: []string{"bigint"}, returnType: "P384Point"},
+	"p384Negate":           {params: []string{"P384Point"}, returnType: "P384Point"},
+	"p384OnCurve":          {params: []string{"P384Point"}, returnType: "boolean"},
+	"p384EncodeCompressed": {params: []string{"P384Point"}, returnType: "ByteString"},
+	"verifyECDSA_P384":     {params: []string{"ByteString", "ByteString", "ByteString"}, returnType: "boolean"},
 	"sha256Compress":    {params: []string{"ByteString", "ByteString"}, returnType: "ByteString"},
 	"sha256Finalize":    {params: []string{"ByteString", "ByteString", "bigint"}, returnType: "ByteString"},
 	"blake3Compress":    {params: []string{"ByteString", "ByteString"}, returnType: "ByteString"},
 	"blake3Hash":        {params: []string{"ByteString"}, returnType: "ByteString"},
+	"bbFieldAdd":        {params: []string{"bigint", "bigint"}, returnType: "bigint"},
+	"bbFieldSub":        {params: []string{"bigint", "bigint"}, returnType: "bigint"},
+	"bbFieldMul":        {params: []string{"bigint", "bigint"}, returnType: "bigint"},
+	"bbFieldInv":        {params: []string{"bigint"}, returnType: "bigint"},
+	"bbExt4Mul0":        {params: []string{"bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"bbExt4Mul1":        {params: []string{"bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"bbExt4Mul2":        {params: []string{"bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"bbExt4Mul3":        {params: []string{"bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"bbExt4Inv0":        {params: []string{"bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"bbExt4Inv1":        {params: []string{"bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"bbExt4Inv2":        {params: []string{"bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"bbExt4Inv3":        {params: []string{"bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"kbFieldAdd":        {params: []string{"bigint", "bigint"}, returnType: "bigint"},
+	"kbFieldSub":        {params: []string{"bigint", "bigint"}, returnType: "bigint"},
+	"kbFieldMul":        {params: []string{"bigint", "bigint"}, returnType: "bigint"},
+	"kbFieldInv":        {params: []string{"bigint"}, returnType: "bigint"},
+	"kbExt4Mul0":        {params: []string{"bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"kbExt4Mul1":        {params: []string{"bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"kbExt4Mul2":        {params: []string{"bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"kbExt4Mul3":        {params: []string{"bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"kbExt4Inv0":        {params: []string{"bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"kbExt4Inv1":        {params: []string{"bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"kbExt4Inv2":        {params: []string{"bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"kbExt4Inv3":        {params: []string{"bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"bn254FieldAdd":     {params: []string{"bigint", "bigint"}, returnType: "bigint"},
+	"bn254FieldSub":     {params: []string{"bigint", "bigint"}, returnType: "bigint"},
+	"bn254FieldMul":     {params: []string{"bigint", "bigint"}, returnType: "bigint"},
+	"bn254FieldInv":     {params: []string{"bigint"}, returnType: "bigint"},
+	"bn254FieldNeg":     {params: []string{"bigint"}, returnType: "bigint"},
+	"bn254G1Add":        {params: []string{"Point", "Point"}, returnType: "Point"},
+	"bn254G1ScalarMul":  {params: []string{"Point", "bigint"}, returnType: "Point"},
+	"bn254G1Negate":     {params: []string{"Point"}, returnType: "Point"},
+	"bn254G1OnCurve":    {params: []string{"Point"}, returnType: "boolean"},
+	"bn254Pairing":        {params: []string{"Point", "bigint", "bigint", "bigint", "bigint"}, returnType: "bigint"},
+	"bn254MultiPairing4": {params: []string{"Point", "bigint", "bigint", "bigint", "bigint", "Point", "bigint", "bigint", "bigint", "bigint", "Point", "bigint", "bigint", "bigint", "bigint", "Point", "bigint", "bigint", "bigint", "bigint"}, returnType: "boolean"},
+	"bn254MultiPairing3": {params: []string{
+		"Point", "bigint", "bigint", "bigint", "bigint",
+		"Point", "bigint", "bigint", "bigint", "bigint",
+		"Point", "bigint", "bigint", "bigint", "bigint",
+		"bigint", "bigint", "bigint", "bigint", "bigint", "bigint",
+		"bigint", "bigint", "bigint", "bigint", "bigint", "bigint",
+	}, returnType: "boolean"},
+	// groth16Verify is intentionally omitted — it cannot be lowered to stack ops
+	// directly. Contracts must use bn254MultiPairing4 with explicit proof
+	// preparation (see Groth16Verifier.runar.go for the correct pattern).
+	//
+	// assertGroth16WitnessAssisted is the Mode 3 entry: it takes no Rúnar
+	// args and returns void. The codegen recognises a method body containing
+	// this call as needing the witness-assisted Groth16 verifier as a
+	// method-entry preamble. The verifying key is supplied at compile time
+	// via CompileOptions.Groth16WAVKey, and the prover-side witness bundle
+	// is pushed onto the stack at spend time by the SDK helper before the
+	// regular ABI argument pushes.
+	"assertGroth16WitnessAssisted": {params: []string{}, returnType: "void"},
+	// assertGroth16WitnessAssistedWithMSM is the soundness-strict sibling
+	// of assertGroth16WitnessAssisted. It triggers the witness-assisted
+	// verifier variant that also recomputes the SP1 MSM on-chain and binds
+	// the 5 public-input scalars to compile-time-pinned VK domain values.
+	"assertGroth16WitnessAssistedWithMSM": {params: []string{}, returnType: "void"},
+	// groth16PublicInput reads one of the 5 SP1 public-input scalars left
+	// on the stack by the MSM-binding preamble. Parameter must be a
+	// constant in [0, 4]; the typechecker only enforces the type here.
+	"groth16PublicInput": {params: []string{"bigint"}, returnType: "bigint"},
+	"merkleRootSha256":      {params: []string{"ByteString", "ByteString", "bigint", "bigint"}, returnType: "ByteString"},
+	"merkleRootHash256":     {params: []string{"ByteString", "ByteString", "bigint", "bigint"}, returnType: "ByteString"},
+	"merkleRootPoseidon2KB": {params: nil, returnType: "bigint"}, // variable arity: 8 leaf + depth*8 proof + index + depth; validated in checkCallArgs
 	"abs":               {params: []string{"bigint"}, returnType: "bigint"},
 	"min":               {params: []string{"bigint", "bigint"}, returnType: "bigint"},
 	"max":               {params: []string{"bigint", "bigint"}, returnType: "bigint"},
@@ -121,6 +205,15 @@ var builtinFunctions = map[string]funcSig{
 	"extractOutputs":       {params: []string{"SigHashPreimage"}, returnType: "Sha256"},
 	"extractLocktime":      {params: []string{"SigHashPreimage"}, returnType: "bigint"},
 	"extractSigHashType":   {params: []string{"SigHashPreimage"}, returnType: "bigint"},
+	// Intent sub-covenant intrinsics (BSVM Phase 13). Witness-bridge wrappers
+	// that compile down to standard primitives + auto-injected method params.
+	// See docs/cross-covenant-pattern.md.
+	//
+	// First arg of extractPrevOutputScript / requireOutputP2PKH MUST be an
+	// integer literal — enforced as a special case in checkCallArgs.
+	"extractPrevOutputScript": {params: []string{"bigint", "ByteString"}, returnType: "ByteString"},
+	"requireOutputP2PKH":      {params: []string{"bigint", "ByteString", "bigint"}, returnType: "void"},
+	"currentBlockHeight":      {params: []string{}, returnType: "bigint"},
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +229,8 @@ var byteStringSubtypes = map[string]bool{
 	"Addr":           true,
 	"SigHashPreimage": true,
 	"Point":          true,
+	"P256Point":      true,
+	"P384Point":      true,
 }
 
 var bigintSubtypes = map[string]bool{
@@ -233,7 +328,16 @@ type typeChecker struct {
 	errors           []Diagnostic
 	propTypes        map[string]string
 	methodSigs       map[string]funcSig
+	// consumedValues records affine-value origins consumed within
+	// the current method/constructor. Origin keys are: parameter
+	// names, "prop:<name>" for contract properties, and aliased
+	// origins resolved via affineAliases. 2026-04-30 audit finding
+	// F6.
 	consumedValues   map[string]bool
+	// affineAliases maps a local variable name to the canonical
+	// affine origin it aliases. Populated when a variable_decl of
+	// affine type is initialized from another affine origin.
+	affineAliases    map[string]string
 	currentMethodLoc *SourceLocation
 	currentStmtLoc   *SourceLocation
 }
@@ -244,6 +348,7 @@ func newTypeChecker(contract *ContractNode) *typeChecker {
 		propTypes:      make(map[string]string),
 		methodSigs:     make(map[string]funcSig),
 		consumedValues: make(map[string]bool),
+		affineAliases:  make(map[string]string),
 	}
 
 	for _, prop := range contract.Properties {
@@ -291,6 +396,7 @@ func (tc *typeChecker) checkConstructor() {
 
 	// Reset affine tracking for this scope
 	tc.consumedValues = make(map[string]bool)
+	tc.affineAliases = make(map[string]string)
 
 	for _, param := range ctor.Params {
 		env.define(param.Name, typeNodeToString(param.Type))
@@ -310,12 +416,201 @@ func (tc *typeChecker) checkMethod(method MethodNode) {
 
 	// Reset affine tracking for this method
 	tc.consumedValues = make(map[string]bool)
+	tc.affineAliases = make(map[string]string)
 
 	for _, param := range method.Params {
 		env.define(param.Name, typeNodeToString(param.Type))
 	}
 
 	tc.checkStatements(method.Body, env)
+
+	// Crit-3 — reject mixing requireOutputP2PKH with addDataOutput in the
+	// same method body. The intrinsic's compile-time output-offset
+	// computation assumes a fixed 34-byte stride per output, which is
+	// silently wrong when an OP_RETURN output (variable length) precedes
+	// the indexed P2PKH output. Caller would get a runtime
+	// OP_EQUALVERIFY failure only if the specific output index is
+	// exercised — attackers could route the bond P2PKH through an
+	// unmatched index. v1 forbids the mix; v2 may relax with a
+	// variable-stride decoder.
+	hasRequireP2PKH := bodyCallsBuiltin(method.Body, "requireOutputP2PKH")
+	hasAddDataOutput := bodyCallsAddDataOutput(method.Body)
+	if hasRequireP2PKH && hasAddDataOutput {
+		tc.addError(fmt.Sprintf(
+			"method '%s' mixes requireOutputP2PKH() with addDataOutput() — "+
+				"v1 of the intrinsic assumes a fixed 34-byte output stride and "+
+				"variable-length OP_RETURN outputs break the offset computation; "+
+				"split the addDataOutput call into a separate method", method.Name))
+	}
+}
+
+// bodyCallsBuiltin reports whether any statement in `body` (recursively)
+// contains a top-level call expression to a builtin function named `name`.
+// Used by the Crit-3 typecheck rejection for requireOutputP2PKH +
+// addDataOutput mixing.
+func bodyCallsBuiltin(body []Statement, name string) bool {
+	for _, stmt := range body {
+		if stmtContainsCallTo(stmt, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// bodyCallsAddDataOutput reports whether any statement in `body`
+// (recursively) contains a call to `this.addDataOutput(...)` or
+// `c.addDataOutput(...)` — matched by the Property name "addDataOutput"
+// on a PropertyAccessExpr or MemberExpr callee.
+func bodyCallsAddDataOutput(body []Statement) bool {
+	for _, stmt := range body {
+		if stmtContainsAddDataOutput(stmt) {
+			return true
+		}
+	}
+	return false
+}
+
+func stmtContainsCallTo(stmt Statement, name string) bool {
+	switch s := stmt.(type) {
+	case ExpressionStmt:
+		return exprContainsCallTo(s.Expr, name)
+	case VariableDeclStmt:
+		return exprContainsCallTo(s.Init, name)
+	case AssignmentStmt:
+		return exprContainsCallTo(s.Value, name) || exprContainsCallTo(s.Target, name)
+	case IfStmt:
+		if exprContainsCallTo(s.Condition, name) {
+			return true
+		}
+		for _, t := range s.Then {
+			if stmtContainsCallTo(t, name) {
+				return true
+			}
+		}
+		for _, e := range s.Else {
+			if stmtContainsCallTo(e, name) {
+				return true
+			}
+		}
+	case ForStmt:
+		for _, t := range s.Body {
+			if stmtContainsCallTo(t, name) {
+				return true
+			}
+		}
+	case ReturnStmt:
+		if s.Value != nil {
+			return exprContainsCallTo(s.Value, name)
+		}
+	}
+	return false
+}
+
+func exprContainsCallTo(expr Expression, name string) bool {
+	if expr == nil {
+		return false
+	}
+	switch e := expr.(type) {
+	case CallExpr:
+		if id, ok := e.Callee.(Identifier); ok && id.Name == name {
+			return true
+		}
+		for _, a := range e.Args {
+			if exprContainsCallTo(a, name) {
+				return true
+			}
+		}
+	case BinaryExpr:
+		return exprContainsCallTo(e.Left, name) || exprContainsCallTo(e.Right, name)
+	case UnaryExpr:
+		return exprContainsCallTo(e.Operand, name)
+	case TernaryExpr:
+		return exprContainsCallTo(e.Condition, name) ||
+			exprContainsCallTo(e.Consequent, name) ||
+			exprContainsCallTo(e.Alternate, name)
+	case IndexAccessExpr:
+		return exprContainsCallTo(e.Object, name) || exprContainsCallTo(e.Index, name)
+	case ArrayLiteralExpr:
+		for _, el := range e.Elements {
+			if exprContainsCallTo(el, name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func stmtContainsAddDataOutput(stmt Statement) bool {
+	switch s := stmt.(type) {
+	case ExpressionStmt:
+		return exprContainsAddDataOutput(s.Expr)
+	case VariableDeclStmt:
+		return exprContainsAddDataOutput(s.Init)
+	case AssignmentStmt:
+		return exprContainsAddDataOutput(s.Value) || exprContainsAddDataOutput(s.Target)
+	case IfStmt:
+		if exprContainsAddDataOutput(s.Condition) {
+			return true
+		}
+		for _, t := range s.Then {
+			if stmtContainsAddDataOutput(t) {
+				return true
+			}
+		}
+		for _, e := range s.Else {
+			if stmtContainsAddDataOutput(e) {
+				return true
+			}
+		}
+	case ForStmt:
+		for _, t := range s.Body {
+			if stmtContainsAddDataOutput(t) {
+				return true
+			}
+		}
+	case ReturnStmt:
+		if s.Value != nil {
+			return exprContainsAddDataOutput(s.Value)
+		}
+	}
+	return false
+}
+
+func exprContainsAddDataOutput(expr Expression) bool {
+	if expr == nil {
+		return false
+	}
+	switch e := expr.(type) {
+	case CallExpr:
+		if pa, ok := e.Callee.(PropertyAccessExpr); ok && pa.Property == "addDataOutput" {
+			return true
+		}
+		if me, ok := e.Callee.(MemberExpr); ok && me.Property == "addDataOutput" {
+			return true
+		}
+		for _, a := range e.Args {
+			if exprContainsAddDataOutput(a) {
+				return true
+			}
+		}
+	case BinaryExpr:
+		return exprContainsAddDataOutput(e.Left) || exprContainsAddDataOutput(e.Right)
+	case UnaryExpr:
+		return exprContainsAddDataOutput(e.Operand)
+	case TernaryExpr:
+		return exprContainsAddDataOutput(e.Condition) ||
+			exprContainsAddDataOutput(e.Consequent) ||
+			exprContainsAddDataOutput(e.Alternate)
+	case IndexAccessExpr:
+		return exprContainsAddDataOutput(e.Object) || exprContainsAddDataOutput(e.Index)
+	case ArrayLiteralExpr:
+		for _, el := range e.Elements {
+			if exprContainsAddDataOutput(el) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (tc *typeChecker) checkStatements(stmts []Statement, env *typeEnv) {
@@ -334,14 +629,24 @@ func (tc *typeChecker) checkStatement(stmt Statement, env *typeEnv) {
 	switch s := stmt.(type) {
 	case VariableDeclStmt:
 		initType := tc.inferExprType(s.Init, env)
+		var declType string
 		if s.Type != nil {
-			declaredType := typeNodeToString(s.Type)
-			if !isSubtype(initType, declaredType) {
-				tc.addError(fmt.Sprintf("type '%s' is not assignable to type '%s'", initType, declaredType))
+			declType = typeNodeToString(s.Type)
+			if !isSubtype(initType, declType) {
+				tc.addError(fmt.Sprintf("type '%s' is not assignable to type '%s'", initType, declType))
 			}
-			env.define(s.Name, declaredType)
+			env.define(s.Name, declType)
 		} else {
+			declType = initType
 			env.define(s.Name, initType)
+		}
+		// Record affine alias when the new local is affine-typed and
+		// its initializer is itself an affine origin (param or
+		// contract property). 2026-04-30 audit finding F6.
+		if affineTypes[declType] {
+			if origin := tc.affineOriginOfExpr(s.Init); origin != "" {
+				tc.affineAliases[s.Name] = origin
+			}
 		}
 
 	case AssignmentStmt:
@@ -650,6 +955,21 @@ func (tc *typeChecker) checkCallExpr(e CallExpr, env *typeEnv) string {
 
 	// Direct builtin call
 	if id, ok := e.Callee.(Identifier); ok {
+		// asm is a compile-time intrinsic — the parser has already rewritten
+		// the { body, in_arity?, out_arity? } object-literal argument into
+		// three positional args (body, in_arity, out_arity). The statement
+		// form returns void; the expression form asm<T>({...}) carries the
+		// captured return type on AsmReturnType and produces a value of that
+		// type.
+		if id.Name == "asm" {
+			for _, arg := range e.Args {
+				tc.inferExprType(arg, env)
+			}
+			if e.AsmReturnType != "" {
+				return e.AsmReturnType
+			}
+			return "void"
+		}
 		if sig, ok := builtinFunctions[id.Name]; ok {
 			return tc.checkCallArgs(id.Name, sig, e.Args, env)
 		}
@@ -659,6 +979,18 @@ func (tc *typeChecker) checkCallExpr(e CallExpr, env *typeEnv) string {
 		}
 		// Check if it's a local variable
 		if _, found := env.lookup(id.Name); found {
+			for _, arg := range e.Args {
+				tc.inferExprType(arg, env)
+			}
+			return "<unknown>"
+		}
+		// Give a targeted hint for the deliberately-omitted groth16Verify
+		// orchestrator so users who try it don't get a bare "unknown
+		// function" error.
+		if id.Name == "groth16Verify" {
+			tc.addError("groth16Verify() is not a lowerable builtin — use bn254MultiPairing4() with explicit proof preparation, " +
+				"or declare the method body as assertGroth16WitnessAssisted() and compile with CompileOptions.Groth16WAVKey set. " +
+				"See integration/go/contracts/Groth16Verifier.runar.go and RollupGroth16WA.runar.go for reference patterns.")
 			for _, arg := range e.Args {
 				tc.inferExprType(arg, env)
 			}
@@ -677,7 +1009,7 @@ func (tc *typeChecker) checkCallExpr(e CallExpr, env *typeEnv) string {
 		if pa.Property == "getStateScript" {
 			return "ByteString"
 		}
-		if pa.Property == "addOutput" || pa.Property == "addRawOutput" {
+		if pa.Property == "addOutput" || pa.Property == "addRawOutput" || pa.Property == "addDataOutput" {
 			for _, arg := range e.Args {
 				tc.inferExprType(arg, env)
 			}
@@ -703,6 +1035,12 @@ func (tc *typeChecker) checkCallExpr(e CallExpr, env *typeEnv) string {
 		})() {
 			if me.Property == "getStateScript" {
 				return "ByteString"
+			}
+			if me.Property == "addOutput" || me.Property == "addRawOutput" || me.Property == "addDataOutput" {
+				for _, arg := range e.Args {
+					tc.inferExprType(arg, env)
+				}
+				return "void"
 			}
 			if sig, ok := tc.methodSigs[me.Property]; ok {
 				return tc.checkCallArgs(me.Property, sig, e.Args, env)
@@ -749,12 +1087,135 @@ func (tc *typeChecker) checkCallArgs(funcName string, sig funcSig, args []Expres
 		return sig.returnType
 	}
 
-	// checkMultiSig special case
+	// checkMultiSig special case (Sig[] / PubKey[] arrays). Only the
+	// arity is special; arg-type validation falls through to the
+	// standard subtype loop below so callers cannot pass `bigint[]`
+	// or other element types. 2026-04-30 audit finding F5.
 	if funcName == "checkMultiSig" {
-		for _, arg := range args {
-			tc.inferExprType(arg, env)
+		if len(args) != 2 {
+			tc.addError(fmt.Sprintf("checkMultiSig() expects 2 arguments, got %d", len(args)))
+			for _, arg := range args {
+				tc.inferExprType(arg, env)
+			}
+			tc.checkAffineConsumption(funcName, args, env)
+			return sig.returnType
 		}
-		tc.checkAffineConsumption(funcName, args, env)
+		// Fall through to the standard subtype check below.
+	}
+
+	// extractPrevOutputScript / requireOutputP2PKH — the index arg MUST
+	// be a compile-time integer literal so the ANF lowering can derive a
+	// stable auto-injected witness-param name (extractPrevOutputScript) or
+	// a constant byte offset (requireOutputP2PKH).
+	if funcName == "extractPrevOutputScript" || funcName == "requireOutputP2PKH" {
+		if len(args) >= 1 {
+			lit, ok := args[0].(BigIntLiteral)
+			// Accept `-N` (UnaryExpr "-" over BigIntLiteral) so the bounds
+			// check below produces a clear "must be >= 0" rather than the
+			// misleading "must be an integer literal" message.
+			if !ok {
+				if u, isUnary := args[0].(UnaryExpr); isUnary && u.Op == "-" {
+					if inner, innerOk := u.Operand.(BigIntLiteral); innerOk && inner.Value != nil {
+						neg := new(big.Int).Neg(inner.Value)
+						lit = BigIntLiteral{Value: neg}
+						ok = true
+					}
+				}
+			}
+			if !ok {
+				tc.addError(fmt.Sprintf("%s() argument 1 (index) must be an integer literal", funcName))
+			} else if lit.Value != nil {
+				// R-2: bound the index literal. For requireOutputP2PKH, the
+				// emitted Stack-IR computes byte-offset = idx * 34; require
+				// 0 <= idx <= 1000 to keep the offset well under script-int
+				// max and to reject obvious nonsense (e.g. negative or
+				// astronomically large).
+				if !lit.Value.IsInt64() {
+					tc.addError(fmt.Sprintf("%s() argument 1 (index) must fit in int64; got %s", funcName, lit.Value.String()))
+				} else {
+					idx := lit.Value.Int64()
+					if idx < 0 {
+						tc.addError(fmt.Sprintf("%s() argument 1 (index) must be >= 0; got %d", funcName, idx))
+					}
+					if funcName == "requireOutputP2PKH" && idx > 1000 {
+						tc.addError(fmt.Sprintf("requireOutputP2PKH() argument 1 (outputIndex) bound to <= 1000; got %d (the emitted Stack-IR computes byte-offset = idx*34; unrealistic indexes indicate a programming error)", idx))
+					}
+				}
+			}
+		}
+	}
+
+	// extractPrevOutputScript variable-arity special case (2-arg full-hash
+	// or 3-arg prefix-hash form). Validates types + literal-only on the
+	// optional prefixLen, then returns the signature's return type to
+	// bypass the standard arg-count check below (which would reject the
+	// 3-arg form against the 2-arg sig table entry).
+	if funcName == "extractPrevOutputScript" {
+		if len(args) != 2 && len(args) != 3 {
+			tc.addError(fmt.Sprintf("extractPrevOutputScript() expects 2 or 3 arguments, got %d", len(args)))
+		}
+		if len(args) >= 1 {
+			tc.inferExprType(args[0], env) // already validated as literal above
+		}
+		if len(args) >= 2 {
+			argType := tc.inferExprType(args[1], env)
+			if !isSubtype(argType, "ByteString") && argType != "<unknown>" {
+				tc.addError(fmt.Sprintf("argument 2 of extractPrevOutputScript(): expected 'ByteString', got '%s'", argType))
+			}
+		}
+		if len(args) == 3 {
+			lit, ok := args[2].(BigIntLiteral)
+			if !ok {
+				tc.addError("extractPrevOutputScript() argument 3 (prefixLen) must be an integer literal when supplied")
+			} else if lit.Value != nil {
+				// R-4: bound the prefixLen literal. The intrinsic hashes
+				// substr(witness, 0, prefixLen) and compares against a
+				// 32-byte SHA-256 hash. prefixLen < 32 is suspicious (the
+				// prefix bytes don't even cover a hash-sized chunk).
+				// prefixLen > 4 MiB exceeds MAX_SCRIPT_BYTES — wouldn't
+				// fit in a legal Bitcoin Script anyway.
+				if !lit.Value.IsInt64() {
+					tc.addError(fmt.Sprintf("extractPrevOutputScript() argument 3 (prefixLen) must fit in int64; got %s", lit.Value.String()))
+				} else {
+					n := lit.Value.Int64()
+					if n < 32 {
+						tc.addError(fmt.Sprintf("extractPrevOutputScript() argument 3 (prefixLen) must be >= 32 (the hash assertion compares a 32-byte SHA-256); got %d", n))
+					}
+					if n > 4*1024*1024 {
+						tc.addError(fmt.Sprintf("extractPrevOutputScript() argument 3 (prefixLen) must be <= MAX_SCRIPT_BYTES (4 MiB); got %d", n))
+					}
+				}
+			}
+			tc.inferExprType(args[2], env)
+		}
+		return sig.returnType
+	}
+
+	// requireOutputP2PKH and currentBlockHeight need the auto-injected
+	// txPreimage — only available in StatefulSmartContract methods.
+	if funcName == "requireOutputP2PKH" || funcName == "currentBlockHeight" {
+		if tc.contract != nil && tc.contract.ParentClass != "StatefulSmartContract" {
+			tc.addError(fmt.Sprintf("%s() is only available in StatefulSmartContract methods", funcName))
+		}
+	}
+
+	// merkleRootPoseidon2KB special case — variable arity:
+	//   8 leaf elems + depth*8 proof elems + index + depth = depth*8 + 10
+	// All arguments must be bigint. The last argument (depth) must be a
+	// literal integer so that the codegen can unroll the loop.
+	if funcName == "merkleRootPoseidon2KB" {
+		for _, arg := range args {
+			argType := tc.inferExprType(arg, env)
+			if argType != "bigint" && argType != "<unknown>" {
+				tc.addError(fmt.Sprintf("merkleRootPoseidon2KB() arguments must be bigint, got '%s'", argType))
+			}
+		}
+		nArgs := len(args)
+		if nArgs < 10 {
+			tc.addError(fmt.Sprintf("merkleRootPoseidon2KB() requires at least 10 arguments (8 leaf + index + depth), got %d", nArgs))
+		} else if (nArgs-10)%8 != 0 {
+			tc.addError(fmt.Sprintf("merkleRootPoseidon2KB() argument count must be 8*depth + 10, got %d (remainder %d)", nArgs, (nArgs-10)%8))
+		}
 		return sig.returnType
 	}
 
@@ -788,6 +1249,10 @@ func (tc *typeChecker) checkCallArgs(funcName string, sig funcSig, args []Expres
 
 // checkAffineConsumption enforces that affine-typed values (Sig,
 // SigHashPreimage) are consumed at most once by a consuming function.
+// Tracks consumption by *origin*, not variable name, so aliases
+// (`const again = sig`) and property accesses (`this.sig`) cannot
+// be used to launder a double-consumption past the affine check.
+// 2026-04-30 audit finding F6.
 func (tc *typeChecker) checkAffineConsumption(funcName string, args []Expression, env *typeEnv) {
 	consumedIndices, ok := consumingFunctions[funcName]
 	if !ok {
@@ -800,22 +1265,63 @@ func (tc *typeChecker) checkAffineConsumption(funcName string, args []Expression
 		}
 
 		arg := args[paramIndex]
-		id, isIdent := arg.(Identifier)
-		if !isIdent {
+		argType := tc.affineExprType(arg, env)
+		if argType == "" || !affineTypes[argType] {
 			continue
 		}
 
-		argType, found := env.lookup(id.Name)
-		if !found || !affineTypes[argType] {
+		origin := tc.affineOriginOfExpr(arg)
+		if origin == "" {
 			continue
 		}
 
-		if tc.consumedValues[id.Name] {
-			tc.addError(fmt.Sprintf("affine value '%s' has already been consumed", id.Name))
+		// Render a short label (source-form) for the diagnostic.
+		label := origin
+		if id, ok := arg.(Identifier); ok {
+			label = id.Name
+		} else if pa, ok := arg.(PropertyAccessExpr); ok {
+			label = "this." + pa.Property
+		}
+
+		if tc.consumedValues[origin] {
+			tc.addError(fmt.Sprintf("affine value '%s' has already been consumed", label))
 		} else {
-			tc.consumedValues[id.Name] = true
+			tc.consumedValues[origin] = true
 		}
 	}
+}
+
+// affineOriginOfExpr returns the canonical origin key for affine
+// tracking. Identifiers resolve through the alias map; property
+// accesses use a "prop:<name>" namespace. Returns "" when the
+// expression has no traceable affine origin.
+func (tc *typeChecker) affineOriginOfExpr(expr Expression) string {
+	if id, ok := expr.(Identifier); ok {
+		if aliased, exists := tc.affineAliases[id.Name]; exists {
+			return aliased
+		}
+		return id.Name
+	}
+	if pa, ok := expr.(PropertyAccessExpr); ok {
+		return "prop:" + pa.Property
+	}
+	return ""
+}
+
+// affineExprType returns the type of an expression for affine
+// purposes (env lookup for identifiers; property-type map for
+// `this.x`). Returns "" when no type can be resolved.
+func (tc *typeChecker) affineExprType(expr Expression, env *typeEnv) string {
+	if id, ok := expr.(Identifier); ok {
+		if t, found := env.lookup(id.Name); found {
+			return t
+		}
+		return ""
+	}
+	if pa, ok := expr.(PropertyAccessExpr); ok {
+		return tc.propTypes[pa.Property]
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -939,6 +1445,10 @@ func inferExprTypeStatic(expr Expression) string {
 		return "bigint" // '-' and '~'
 	case CallExpr:
 		if id, ok := e.Callee.(Identifier); ok {
+			// Expression-form asm<T>({...}) statically yields type T.
+			if id.Name == "asm" && e.AsmReturnType != "" {
+				return e.AsmReturnType
+			}
 			if sig, ok := builtinFunctions[id.Name]; ok {
 				return sig.returnType
 			}

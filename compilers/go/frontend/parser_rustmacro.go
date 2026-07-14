@@ -91,6 +91,9 @@ const (
 	rustTokEq
 	rustTokPlusEq
 	rustTokMinusEq
+	rustTokDotDot
+	rustTokShl
+	rustTokShr
 )
 
 type rustToken struct {
@@ -192,6 +195,12 @@ func rustTokenize(source string) []rustToken {
 				kind = rustTokPlusEq
 			case "-=":
 				kind = rustTokMinusEq
+			case "..":
+				kind = rustTokDotDot
+			case "<<":
+				kind = rustTokShl
+			case ">>":
+				kind = rustTokShr
 			default:
 				matched = false
 			}
@@ -464,9 +473,11 @@ func (p *rustMacroParser) parse() *ContractNode {
 			attr := p.parseAttribute()
 
 			switch {
-			case attr == "runar::contract" || attr == "runar::stateful_contract":
+			case attr == "runar::contract" || attr == "runar::stateful_contract" || attr == "runar::unsafe_contract":
 				if attr == "runar::stateful_contract" {
 					parentClass = "StatefulSmartContract"
+				} else if attr == "runar::unsafe_contract" {
+					parentClass = "UnsafeSmartContract"
 				}
 				// Parse: (pub)? struct Name { ... }
 				p.match(rustTokPub)
@@ -515,35 +526,19 @@ func (p *rustMacroParser) parse() *ContractNode {
 				p.expect(rustTokRBrace)
 
 			case strings.HasPrefix(attr, "runar::methods"):
-				// Parse: impl Name { ... }
-				p.match(rustTokImpl)
-				// Skip type name
-				if p.current().kind == rustTokIdent {
-					p.advance()
-				}
-				p.expect(rustTokLBrace)
-
-				for p.current().kind != rustTokRBrace && p.current().kind != rustTokEOF {
-					visibility := "private"
-					if p.current().kind == rustTokHashBracket {
-						methodAttr := p.parseAttribute()
-						if methodAttr == "public" {
-							visibility = "public"
-						}
-					}
-					// `pub fn` also makes it public
-					if p.current().kind == rustTokPub {
-						p.advance()
-						visibility = "public"
-					}
-					m := p.parseFunction(visibility)
-					methods = append(methods, m)
-				}
-				p.expect(rustTokRBrace)
+				// #[runar::methods] is no longer supported — bare `impl` blocks
+				// are discovered directly. Emit a migration diagnostic; the
+				// `impl` branch below still parses the block.
+				p.errors = append(p.errors, Diagnostic{
+					Message:  "#[runar::methods] is no longer supported — write a bare 'impl ContractName { ... }' block instead",
+					Severity: SeverityError,
+				})
 
 			default:
 				// Unknown attribute — skip
 			}
+		} else if p.current().kind == rustTokImpl {
+			methods = append(methods, p.parseImplBlock()...)
 		} else {
 			p.advance()
 		}
@@ -717,6 +712,46 @@ func rustMapType(name string) string {
 	}
 	// Pass through Rúnar primitives: PubKey, Sig, Addr, Sha256, Ripemd160, etc.
 	return name
+}
+
+// ---------------------------------------------------------------------------
+// Impl block parsing
+// ---------------------------------------------------------------------------
+
+// parseImplBlock parses a bare `impl ContractName { ... }` block and returns its
+// methods. The type name is consumed and discarded (unrelated `impl` blocks
+// merge the same way they did under the old `#[runar::methods]` gate). `pub fn`
+// marks a public spending entry point; bare `fn` is a private helper.
+func (p *rustMacroParser) parseImplBlock() []MethodNode {
+	var methods []MethodNode
+	p.expect(rustTokImpl)
+	// Skip the type name.
+	if p.current().kind == rustTokIdent {
+		p.advance()
+	}
+	p.expect(rustTokLBrace)
+
+	for p.current().kind != rustTokRBrace && p.current().kind != rustTokEOF {
+		// #[public] is no longer supported — `pub fn` marks public methods.
+		for p.current().kind == rustTokHashBracket {
+			methodAttr := p.parseAttribute()
+			if methodAttr == "public" {
+				p.errors = append(p.errors, Diagnostic{
+					Message:  "#[public] is no longer supported — use 'pub fn' for public methods",
+					Severity: SeverityError,
+				})
+			}
+		}
+
+		visibility := "private"
+		if p.current().kind == rustTokPub {
+			p.advance()
+			visibility = "public"
+		}
+		methods = append(methods, p.parseFunction(visibility))
+	}
+	p.expect(rustTokRBrace)
+	return methods
 }
 
 // ---------------------------------------------------------------------------
@@ -905,7 +940,9 @@ func (p *rustMacroParser) parseStatement() Statement {
 			p.advance()
 		}
 		p.match(rustTokIn)
-		rangeExpr := p.parseExpression()
+		startExpr := p.parseExpression()
+		p.expect(rustTokDotDot)
+		endExpr := p.parseExpression()
 		p.expect(rustTokLBrace)
 		var body []Statement
 		for p.current().kind != rustTokRBrace && p.current().kind != rustTokEOF {
@@ -914,17 +951,17 @@ func (p *rustMacroParser) parseStatement() Statement {
 			}
 		}
 		p.expect(rustTokRBrace)
-		// Desugar: for i in 0..n { body } → for (let i = 0; i < n; i++) { body }
+		// Desugar: for i in start..end { body } → for (let i = start; i < end; i++) { body }
 		initStmt := VariableDeclStmt{
 			Name:           varName,
 			Mutable:        true,
-			Init:           BigIntLiteral{Value: big.NewInt(0)},
+			Init:           startExpr,
 			SourceLocation: loc,
 		}
 		cond := BinaryExpr{
 			Op:    "<",
 			Left:  Identifier{Name: varName},
-			Right: rangeExpr,
+			Right: endExpr,
 		}
 		update := ExpressionStmt{
 			Expr:           IncrementExpr{Operand: Identifier{Name: varName}, Prefix: false},
@@ -1079,7 +1116,7 @@ func (p *rustMacroParser) parseEquality() Expression {
 }
 
 func (p *rustMacroParser) parseComparison() Expression {
-	left := p.parseAddSub()
+	left := p.parseShift()
 	for {
 		var op string
 		switch p.current().kind {
@@ -1091,6 +1128,23 @@ func (p *rustMacroParser) parseComparison() Expression {
 			op = ">"
 		case rustTokGtEq:
 			op = ">="
+		default:
+			return left
+		}
+		p.advance()
+		left = BinaryExpr{Op: op, Left: left, Right: p.parseShift()}
+	}
+}
+
+func (p *rustMacroParser) parseShift() Expression {
+	left := p.parseAddSub()
+	for {
+		var op string
+		switch p.current().kind {
+		case rustTokShl:
+			op = "<<"
+		case rustTokShr:
+			op = ">>"
 		default:
 			return left
 		}
@@ -1168,6 +1222,14 @@ func (p *rustMacroParser) parsePostfix() Expression {
 				p.match(rustTokComma)
 			}
 			p.expect(rustTokRParen)
+			// `.clone()` is a Rust borrow-checker artifact — in Rúnar, values
+			// are copied by default, so strip it and keep the receiver.
+			if len(args) == 0 {
+				if me, ok := expr.(MemberExpr); ok && me.Property == "clone" {
+					expr = me.Object
+					continue
+				}
+			}
 			expr = CallExpr{Callee: expr, Args: args}
 
 		case rustTokDot:
@@ -1245,6 +1307,10 @@ func (p *rustMacroParser) parsePrimary() Expression {
 		p.expect(rustTokRParen)
 		return expr
 
+	case rustTokLBracket:
+		// Array literal: [a, b, c]
+		return p.parseRustArrayLiteral()
+
 	case rustTokIdent:
 		p.advance()
 		mapped := rustMapBuiltin(t.value)
@@ -1259,6 +1325,23 @@ func (p *rustMacroParser) parsePrimary() Expression {
 		})
 		return Identifier{Name: "unknown"}
 	}
+}
+
+// parseRustArrayLiteral handles bare [a, b, c] array-literal expressions in
+// the Rust DSL parser. References (`&expr`) are stripped at the unary layer
+// by `parseUnary`, so element parsing simply delegates to parseExpression.
+func (p *rustMacroParser) parseRustArrayLiteral() Expression {
+	p.expect(rustTokLBracket)
+	var elements []Expression
+	for p.current().kind != rustTokRBracket && p.current().kind != rustTokEOF {
+		elem := p.parseExpression()
+		elements = append(elements, elem)
+		if !p.match(rustTokComma) {
+			break
+		}
+	}
+	p.expect(rustTokRBracket)
+	return ArrayLiteralExpr{Elements: elements}
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,6 +1394,10 @@ func rustMapBuiltin(name string) string {
 		return "num2bin"
 	case "to_byte_string":
 		return "toByteString"
+	case "verify_ecdsa_p256":
+		return "verifyECDSA_P256"
+	case "verify_ecdsa_p384":
+		return "verifyECDSA_P384"
 	}
 	// General: snake_case → camelCase, then return as-is
 	return rustSnakeToCamel(name)

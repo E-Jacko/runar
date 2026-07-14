@@ -9,6 +9,8 @@ require "set"
 require_relative "ast_nodes"
 require_relative "diagnostic"
 require_relative "parse_result"
+require_relative "sighash_directive"
+require_relative "../codegen/emit"
 
 module RunarCompiler
   module Frontend
@@ -79,12 +81,15 @@ module RunarCompiler
       "PubKey"          => "PubKey",
       "Sig"             => "Sig",
       "Sha256"          => "Sha256",
+      "Sha256Digest"    => "Sha256",
       "Ripemd160"       => "Ripemd160",
       "Addr"            => "Addr",
       "SigHashPreimage" => "SigHashPreimage",
       "RabinSig"        => "RabinSig",
       "RabinPubKey"     => "RabinPubKey",
       "Point"           => "Point",
+      "P256Point"       => "P256Point",
+      "P384Point"       => "P384Point",
       "void"            => "void",
     }.freeze
 
@@ -175,12 +180,26 @@ module RunarCompiler
         "?" => TOK_QUESTION,
       }.freeze
 
+      # Matches the author-facing comment directives (issue #109 @embedAlways,
+      # issue #123 @sighash). Word-boundary anchored to mirror the TS reference
+      # compiler's +/@embedAlways\b/+ / +/@sighash\b/+ scans so an identifier
+      # like +sighashType+ inside a comment does not register a directive.
+      DIRECTIVE_RE = /@(?:embedAlways|sighash)\b/
+
       # Tokenize a source string into an array of Token structs.
       #
+      # Comments are stripped from the token stream, but any comment carrying an
+      # +@embedAlways+ / +@sighash+ directive is recorded (with its start line)
+      # in the returned +directives+ list so the parser can attach it to the
+      # class member it immediately precedes — the TS reference gets this from
+      # ts-morph's leading-comment trivia; the Ruby tokenizer discards comments,
+      # so we capture directive comments here instead.
+      #
       # @param source [String]
-      # @return [Array<Token>]
+      # @return [Array(Array<Token>, Array<Hash>)] tokens and directive records
       def self.tokenize(source)
       tokens = []
+      directives = []
       line = 1
       col = 0
       i = 0
@@ -215,14 +234,20 @@ module RunarCompiler
 
         # Single-line comment //
         if ch == "/" && i + 1 < n && source[i + 1] == "/"
+          c_start = i
+          c_line = line
           while i < n && source[i] != "\n" && source[i] != "\r"
             i += 1
           end
+          ctext = source[c_start...i]
+          directives << { line: c_line, text: ctext } if ctext&.match?(DIRECTIVE_RE)
           next
         end
 
         # Multi-line comment /* ... */
         if ch == "/" && i + 1 < n && source[i + 1] == "*"
+          c_start = i
+          c_line = line
           i += 2
           col += 2
           found_end = false
@@ -245,6 +270,8 @@ module RunarCompiler
             # Reached end without finding */
             i += 1 if i < n
           end
+          ctext = source[c_start...i]
+          directives << { line: c_line, text: ctext } if ctext&.match?(DIRECTIVE_RE)
           next
         end
 
@@ -395,7 +422,7 @@ module RunarCompiler
       end
 
       tokens << Token.new(kind: TOK_EOF, value: "", line: line, col: col)
-      tokens
+      [tokens, directives]
     end
     end # module TsTokens
 
@@ -416,9 +443,18 @@ module RunarCompiler
         @tokens = []
         @pos = 0
         @errors = []
+        # Directive records ({line:, text:}) collected by the tokenizer for
+        # every @embedAlways / @sighash comment. Attached to the member each
+        # immediately precedes (see gather_member_directives). Set by parse_ts.
+        @directives = []
+        # Start line of the most recently parsed member (or the class body's
+        # opening brace). A directive attaches to a member only when it sits in
+        # the source gap AFTER the previous member and BEFORE this one, so a
+        # directive is claimed by exactly the member it immediately precedes.
+        @last_member_line = 0
       end
 
-      attr_accessor :tokens, :pos, :errors
+      attr_accessor :tokens, :pos, :errors, :directives
 
       # -- Error helpers ----------------------------------------------------
 
@@ -529,7 +565,7 @@ module RunarCompiler
           skip_statement
         end
 
-        raise "no class extending SmartContract or StatefulSmartContract found"
+        raise "no class extending SmartContract, StatefulSmartContract, or UnsafeSmartContract found"
       end
 
       # -- Skip helpers -----------------------------------------------------
@@ -588,11 +624,15 @@ module RunarCompiler
           parent_class = parent_tok.value
         end
 
-        unless %w[SmartContract StatefulSmartContract].include?(parent_class)
-          raise "no class extending SmartContract or StatefulSmartContract found"
+        unless %w[SmartContract StatefulSmartContract UnsafeSmartContract].include?(parent_class)
+          raise "no class extending SmartContract, StatefulSmartContract, or UnsafeSmartContract found"
         end
 
-        expect(TOK_LBRACE)
+        lbrace = expect(TOK_LBRACE)
+        # Anchor directive attribution at the class body's opening brace so a
+        # stray directive comment ABOVE the class does not attach to the first
+        # member.
+        @last_member_line = lbrace.line
 
         properties = []
         constructor = nil
@@ -647,6 +687,12 @@ module RunarCompiler
       def parse_class_member(parent_class)
         location = loc
 
+        # Claim any @embedAlways / @sighash directive comments sitting in the
+        # source gap immediately before this member (issue #109 / #123).
+        member_directives = gather_member_directives(location.line)
+        embed_always = member_directives.any? { |d| d[:text].match?(/@embedAlways\b/) }
+        sighash_text = member_directives.map { |d| d[:text] }.find { |t| t.match?(/@sighash\b/) }
+
         # Collect modifiers: public, private, readonly
         visibility = "private"
         is_readonly = false
@@ -687,7 +733,7 @@ module RunarCompiler
 
         # Method: name(...)
         if check(TOK_LPAREN)
-          return parse_method(member_name, visibility, location)
+          return parse_method(member_name, visibility, location, sighash_text)
         end
 
         # Property: name: Type (possibly with ; at end)
@@ -709,7 +755,8 @@ module RunarCompiler
             type: type_node,
             readonly: is_readonly,
             initializer: initializer,
-            source_location: location
+            source_location: location,
+            embed_always: embed_always
           )
         end
 
@@ -721,13 +768,26 @@ module RunarCompiler
             name: member_name,
             type: CustomType.new(name: "unknown"),
             readonly: is_readonly,
-            source_location: location
+            source_location: location,
+            embed_always: embed_always
           )
         end
 
         # Skip unknown
         skip_to_next_member
         nil
+      end
+
+      # Return the directive records that attach to a member starting at
+      # +member_line+: those recorded AFTER the previous member (or the class
+      # brace) and BEFORE this member, i.e. the ones this member immediately
+      # follows. Advances +@last_member_line+ so each directive is claimed once.
+      def gather_member_directives(member_line)
+        claimed = @directives.select do |d|
+          d[:line] > @last_member_line && d[:line] < member_line
+        end
+        @last_member_line = member_line
+        claimed
       end
 
       def skip_to_next_member
@@ -776,7 +836,7 @@ module RunarCompiler
 
       # -- Methods ----------------------------------------------------------
 
-      def parse_method(name, visibility, location)
+      def parse_method(name, visibility, location, sighash_text = nil)
         params = parse_params
 
         # Skip optional return type annotation
@@ -787,13 +847,41 @@ module RunarCompiler
 
         body = parse_block
 
+        # Issue #123: `/** @sighash <FLAGS> */` directive -> per-method sighash
+        # type. Only public methods are spending entry points, so a directive on
+        # a private helper is meaningless (error). Malformed flag lists error too.
+        sighash_type = parse_sighash_on_method(name, visibility, sighash_text)
+
         MethodNode.new(
           name: name,
           params: params,
           body: body,
           visibility: visibility,
-          source_location: location
+          source_location: location,
+          sighash_type: sighash_type
         )
+      end
+
+      # Resolve a method's `@sighash` directive text to a numeric sighash type,
+      # or nil when there is no directive. Pushes a parse error for a directive
+      # on a non-public method or for a malformed flag list.
+      def parse_sighash_on_method(name, visibility, sighash_text)
+        return nil if sighash_text.nil?
+
+        if visibility != "public"
+          add_error("@sighash directive on non-public method '#{name}' has no effect — " \
+                    "only public methods are spending entry points")
+          return nil
+        end
+
+        result = SighashDirective.extract_sighash_directive(sighash_text)
+        return nil if result.nil?
+
+        if result.key?(:error)
+          add_error("Method '#{name}': #{result[:error]}")
+          return nil
+        end
+        result[:value]
       end
 
       # -- Parameters -------------------------------------------------------
@@ -1409,6 +1497,270 @@ module RunarCompiler
         args
       end
 
+      # -- asm() compiler intrinsic ----------------------------------------
+
+      # Decode an asm({ body, in_arity?, out_arity? }) call into a CallExpr
+      # whose positional args are
+      #   [ByteStringLiteral(body), BigIntLiteral(in_arity), BigIntLiteral(out_arity)].
+      #
+      # Two surface body shapes are accepted:
+      #   - Hex string literal:  body: '76a90088ac'
+      #   - Array of opcode names / push() calls:
+      #     body: [OP_DUP, OP_HASH160, push('1234abcd'), OP_EQUALVERIFY]
+      #     Each element is encoded to its byte representation at parse time,
+      #     so the resulting IR is byte-identical to the equivalent hex body.
+      #
+      # The optional generic type argument asm<T>({...}) marks the expression
+      # form; the captured T is stashed on CallExpr#asm_return_type. T must be
+      # one of bigint, boolean, or ByteString.
+      #
+      # On malformed input we still return a syntactically valid CallExpr so
+      # later passes can produce additional diagnostics without crashing.
+      def parse_asm_call
+        callee = Identifier.new(name: "asm")
+
+        # Capture the optional generic type argument asm<T>({...}) BEFORE
+        # arg-shape diagnostics so the expression form still records its
+        # return type even when other args are malformed.
+        asm_return_type = parse_asm_generic_type_arg
+
+        unless check(TOK_LPAREN)
+          add_error("asm() expects a call argument list '(...)'")
+          return CallExpr.new(callee: callee, args: [], asm_return_type: asm_return_type)
+        end
+        advance # consume '('
+
+        # Collect the single object-literal argument.
+        if check(TOK_RPAREN)
+          advance
+          add_error("asm() expects exactly one object-literal argument { body, in_arity?, out_arity? }, got 0 arguments")
+          return CallExpr.new(callee: callee, args: [], asm_return_type: asm_return_type)
+        end
+
+        unless check(TOK_LBRACE)
+          add_error("asm() argument must be an object literal { body: '<hex>', in_arity?: <int>, out_arity?: <int> }")
+          # Skip to the closing paren so the parser can recover.
+          advance until check(TOK_RPAREN) || check(TOK_EOF)
+          match(TOK_RPAREN)
+          return CallExpr.new(callee: callee, args: [], asm_return_type: asm_return_type)
+        end
+
+        body_expr, in_arity_expr, out_arity_expr = parse_asm_object_literal
+
+        # Allow (and ignore) a trailing comma, then expect the closing paren.
+        match(TOK_COMMA)
+        if check(TOK_RPAREN)
+          advance
+        else
+          add_error("asm() expects exactly one object-literal argument { body, in_arity?, out_arity? }")
+          advance until check(TOK_RPAREN) || check(TOK_EOF)
+          match(TOK_RPAREN)
+        end
+
+        if body_expr.nil?
+          add_error("asm() requires a 'body' field with a hex string literal value")
+          body_expr = ByteStringLiteral.new(value: "")
+        end
+        # Defaults: in_arity=0, out_arity=1. The out_arity=1 default reflects
+        # the public-method-must-terminate-truthy invariant.
+        in_arity_expr ||= BigIntLiteral.new(value: 0)
+        out_arity_expr ||= BigIntLiteral.new(value: 1)
+
+        CallExpr.new(
+          callee: callee,
+          args: [body_expr, in_arity_expr, out_arity_expr],
+          asm_return_type: asm_return_type
+        )
+      end
+
+      # Parse the optional generic type argument on asm<T>({...}). Returns the
+      # captured primitive type name when present and valid, or nil if the
+      # call has no type argument. Pushes a diagnostic (and returns nil) when
+      # the type argument is present but not a primitive value type.
+      def parse_asm_generic_type_arg
+        return nil unless check(TOK_LT)
+
+        advance # consume '<'
+        type_args = []
+        until check(TOK_GT) || check(TOK_EOF)
+          if check(TOK_IDENT)
+            type_args << advance.value
+          else
+            advance
+          end
+          break unless match(TOK_COMMA)
+        end
+        match(TOK_GT)
+
+        if type_args.empty?
+          return nil
+        end
+        if type_args.length > 1
+          add_error("asm<T>() takes at most one type argument, got #{type_args.length}")
+          return nil
+        end
+        text = type_args[0]
+        return text if %w[bigint boolean ByteString].include?(text)
+
+        add_error("asm<T>() return type must be 'bigint', 'boolean', or 'ByteString'; got '#{text}'")
+        nil
+      end
+
+      # Parse the asm() object literal body. Returns
+      # [body_expr_or_nil, in_arity_expr_or_nil, out_arity_expr_or_nil].
+      def parse_asm_object_literal
+        expect(TOK_LBRACE)
+
+        body_expr = nil
+        in_arity_expr = nil
+        out_arity_expr = nil
+
+        while !check(TOK_RBRACE) && !check(TOK_EOF)
+          key_tok = peek
+          unless key_tok.kind == TOK_IDENT
+            advance
+            next
+          end
+          key = advance.value
+          expect(TOK_COLON)
+
+          case key
+          when "body"
+            if check(TOK_STRING)
+              body_expr = ByteStringLiteral.new(value: advance.value)
+            elsif check(TOK_LBRACKET)
+              body_expr = ByteStringLiteral.new(value: encode_asm_array_body)
+            else
+              add_error("asm() body must be a hex string literal or an array of opcode names / push() calls.")
+              # consume the offending value expression for recovery
+              parse_expression
+              body_expr = ByteStringLiteral.new(value: "")
+            end
+          when "in_arity"
+            in_arity_expr = parse_asm_arity_literal("in_arity")
+          when "out_arity"
+            out_arity_expr = parse_asm_arity_literal("out_arity")
+          else
+            add_error("asm() does not accept the '#{key}' field; valid fields are 'body', 'in_arity', 'out_arity'.")
+            parse_expression # consume the value for recovery
+          end
+
+          break unless match(TOK_COMMA)
+        end
+
+        expect(TOK_RBRACE)
+        [body_expr, in_arity_expr, out_arity_expr]
+      end
+
+      # Decode a non-negative integer literal arity field for asm(). Returns a
+      # BigIntLiteral, or nil (with a diagnostic) on error.
+      def parse_asm_arity_literal(field_name)
+        if check(TOK_NUMBER)
+          lit = TsParser.parse_number(advance.value)
+          if lit.is_a?(BigIntLiteral) && lit.value >= 0
+            return lit
+          end
+          add_error("asm() #{field_name} must be a non-negative integer literal")
+          return nil
+        end
+        if check(TOK_MINUS)
+          add_error("asm() #{field_name} must be a non-negative integer literal")
+          parse_expression # consume for recovery
+          return nil
+        end
+        add_error("asm() #{field_name} must be a non-negative integer literal")
+        parse_expression # consume for recovery
+        nil
+      end
+
+      # Encode an asm({ body: [OP_DUP, push(0x42), ...] }) array literal to its
+      # hex byte representation. Uses the same push-encoding helpers as the
+      # emit pass so the bytes are byte-identical to what the emitter would
+      # produce for the equivalent literal.
+      def encode_asm_array_body
+        expect(TOK_LBRACKET)
+        hex_str = +""
+
+        while !check(TOK_RBRACKET) && !check(TOK_EOF)
+          if check(TOK_IDENT)
+            name = advance.value
+            # push(<literal>) call
+            if name == "push" && check(TOK_LPAREN)
+              advance # consume '('
+              if check(TOK_RPAREN)
+                advance
+                add_error("push() takes exactly one literal argument, got 0")
+              else
+                encoded = encode_asm_push_literal
+                hex_str << encoded if encoded
+                # tolerate (and report) extra args
+                if match(TOK_COMMA)
+                  add_error("push() takes exactly one literal argument")
+                  advance until check(TOK_RPAREN) || check(TOK_EOF)
+                end
+                match(TOK_RPAREN)
+              end
+            else
+              b = Codegen.opcode_byte(name)
+              if b.nil?
+                add_error("Unknown opcode '#{name}' in asm() body array. Expected an OP_* identifier (e.g. OP_DUP, OP_HASH160) or a push(...) call.")
+              else
+                hex_str << format("%02x", b)
+              end
+            end
+          else
+            add_error("asm() body array element must be an opcode identifier (e.g. OP_DUP) or a push(<literal>) call")
+            advance
+          end
+
+          break unless match(TOK_COMMA)
+        end
+
+        expect(TOK_RBRACKET)
+        hex_str
+      end
+
+      # Encode a literal argument passed to push(...) inside an asm() body
+      # array. Returns the encoded hex string, or nil on error (with a
+      # diagnostic pushed).
+      def encode_asm_push_literal
+        if check(TOK_NUMBER)
+          lit = TsParser.parse_number(advance.value)
+          h, = Codegen.encode_push_big_int(lit.value)
+          return h
+        end
+        if check(TOK_MINUS)
+          advance
+          unless check(TOK_NUMBER)
+            add_error("push() argument must be a literal value (bigint, number, boolean, or hex string), got prefix expression")
+            return nil
+          end
+          lit = TsParser.parse_number(advance.value)
+          h, = Codegen.encode_push_big_int(-lit.value)
+          return h
+        end
+        if check_ident("true")
+          advance
+          return "51" # OP_TRUE
+        end
+        if check_ident("false")
+          advance
+          return "00" # OP_FALSE (alias of OP_0)
+        end
+        if check(TOK_STRING)
+          raw = advance.value
+          if raw.length.odd? || !raw.match?(/\A[0-9a-fA-F]*\z/)
+            add_error("push() ByteString argument must be even-length hex (got '#{raw}')")
+            return nil
+          end
+          return Codegen.encode_push_bytes_hex([raw].pack("H*"))
+        end
+
+        add_error("push() argument must be a literal value (bigint, number, boolean, or hex string)")
+        parse_expression # consume for recovery
+        nil
+      end
+
       def parse_primary
         tok = peek
 
@@ -1433,6 +1785,16 @@ module RunarCompiler
           return BoolLiteral.new(value: false) if name == "false"
           return Identifier.new(name: "this") if name == "this"
           return Identifier.new(name: "super") if name == "super"
+
+          # asm({ body, in_arity?, out_arity? }) compiler intrinsic --
+          # normalise the object-literal argument into a CallExpr with three
+          # positional args (body, in_arity, out_arity) so downstream passes
+          # only have to walk a CallExpr. The optional generic type argument
+          # asm<T>(...) flags the expression form, captured on
+          # CallExpr#asm_return_type.
+          if name == "asm" && (check(TOK_LT) || check(TOK_LPAREN))
+            return parse_asm_call
+          end
 
           # Function call: name(...)
           if check(TOK_LPAREN)
@@ -1470,13 +1832,16 @@ module RunarCompiler
           break unless match(TOK_COMMA)
         end
         expect(TOK_RBRACKET)
-        CallExpr.new(callee: Identifier.new(name: "FixedArray"), args: elements)
+        # Emit a dedicated ArrayLiteralExpr so downstream passes
+        # (typecheck, ANF-lowering for +checkMultiSig+) see the same
+        # array_literal node shape used by every other format parser.
+        # The +expand_fixed_arrays+ pass still accepts the legacy
+        # +CallExpr(FixedArray, args)+ shape for backwards compatibility
+        # with property-initializer paths in other format parsers.
+        ArrayLiteralExpr.new(elements: elements)
       end
 
       # -- Number parsing ---------------------------------------------------
-
-      INT64_MAX = 9_223_372_036_854_775_807
-      INT64_MIN = -9_223_372_036_854_775_808
 
       def self.parse_number(s)
         val = begin
@@ -1484,10 +1849,12 @@ module RunarCompiler
         rescue ArgumentError
           0
         end
-        # Check int64 overflow
-        if val > INT64_MAX || val < INT64_MIN
-          return BigIntLiteral.new(value: 0)
-        end
+        # No int64 clamp: BigIntLiteral carries arbitrary-precision Integer
+        # values end-to-end. The IR JSON encoder in _make_load_const_int
+        # promotes oversize values to the `"...n"` decimal-string discriminator
+        # so cross-tier consumers (Go encoding/json, Python json) can round-
+        # trip 256-bit constants like the secp256k1 group order used by
+        # schnorr-zkp's s-bound assert without precision loss.
         BigIntLiteral.new(value: val)
       end
     end
@@ -1503,7 +1870,9 @@ module RunarCompiler
     # @return [ParseResult]
     def self.parse_ts(source, file_name)
       p = TsParser.new(file_name)
-      p.tokens = TsTokens.tokenize(source)
+      toks, directives = TsTokens.tokenize(source)
+      p.tokens = toks
+      p.directives = directives
       p.pos = 0
 
       begin

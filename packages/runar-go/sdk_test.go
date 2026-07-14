@@ -1,6 +1,7 @@
 package runar
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -1016,6 +1017,28 @@ func TestBuildCallTransaction_BasicStructure(t *testing.T) {
 	}
 }
 
+func TestBuildCallTransaction_LocktimeOverride(t *testing.T) {
+	// Issue #40: a caller-supplied non-zero locktime must appear in the
+	// built call tx's nLockTime field.
+	utxo := makeUtxo(100000, 0)
+	lt := uint32(800000)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{Locktime: &lt})
+	parsed := parseTxHex(callTxObj.Hex())
+	if parsed.locktime != 800000 {
+		t.Errorf("expected locktime 800000, got %d", parsed.locktime)
+	}
+}
+
+func TestBuildCallTransaction_LocktimeDefaultZero(t *testing.T) {
+	// Default (unset) must still write 0 — back-compatible.
+	utxo := makeUtxo(100000, 0)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{})
+	parsed := parseTxHex(callTxObj.Hex())
+	if parsed.locktime != 0 {
+		t.Errorf("expected locktime 0, got %d", parsed.locktime)
+	}
+}
+
 func TestBuildCallTransaction_UnlockingScriptInInput0(t *testing.T) {
 	utxo := makeUtxo(100000, 0)
 	callTxObj, _, _ := BuildCallTransaction(utxo, "aabb", "", 0, "", "", nil, 100)
@@ -1906,6 +1929,78 @@ func TestStatefulDeployCallLifecycle(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// #133: call() selects smallest-sufficient funding, not all wallet UTXOs.
+// ---------------------------------------------------------------------------
+
+func makeCounterArtifactForFunding() *RunarArtifact {
+	stateFields := []StateField{{Name: "count", Type: "bigint", Index: 0}}
+	return makeArtifact("51", ABI{
+		Constructor: ABIConstructor{Params: []ABIParam{{Name: "count", Type: "bigint"}}},
+		Methods:     []ABIMethod{{Name: "increment", Params: nil, IsPublic: true}},
+	}, func(a *RunarArtifact) { a.StateFields = stateFields })
+}
+
+func TestCall_FundingSelectsSmallestSufficient_Issue133(t *testing.T) {
+	// A wallet with 3 spare 100k UTXOs must build a 2-input call tx (1 contract
+	// + 1 funding), NOT sweep all 3 into a 4-input tx (issue #133).
+	contract := NewRunarContract(makeCounterArtifactForFunding(), []interface{}{int64(0)})
+	provider := NewMockProvider("testnet")
+	mockAddr := strings.Repeat("00", 20)
+	signer := NewMockSigner("", mockAddr)
+	script := "76a914" + strings.Repeat("00", 20) + "88ac"
+	for i := 0; i < 3; i++ {
+		provider.AddUtxo(mockAddr, UTXO{Txid: strings.Repeat(fmt.Sprintf("%02d", i+1), 32), OutputIndex: 0, Satoshis: 100000, Script: script})
+	}
+
+	if _, _, err := contract.Deploy(provider, signer, DeployOptions{Satoshis: 50000}); err != nil {
+		t.Fatalf("Deploy error: %v", err)
+	}
+	if _, _, err := contract.Call("increment", nil, provider, signer, &CallOptions{
+		NewState: map[string]interface{}{"count": int64(1)},
+	}); err != nil {
+		t.Fatalf("Call error: %v", err)
+	}
+
+	callTxHex := provider.GetBroadcastedTxs()[1]
+	parsed := parseTxHex(callTxHex)
+	// 1 contract input + exactly 1 funding input = 2. The bug swept all 3 => 4.
+	if parsed.inputCount != 2 {
+		t.Errorf("expected 2 inputs (1 contract + 1 funding), got %d", parsed.inputCount)
+	}
+}
+
+func TestCall_MaxFundingInputsCapErrors_Issue133(t *testing.T) {
+	// Small coins force >1 funding input for a value-increasing continuation;
+	// capping at 1 must fail loudly rather than broadcast underfunded.
+	contract := NewRunarContract(makeCounterArtifactForFunding(), []interface{}{int64(0)})
+	provider := NewMockProvider("testnet")
+	mockAddr := strings.Repeat("00", 20)
+	signer := NewMockSigner("", mockAddr)
+	script := "76a914" + strings.Repeat("00", 20) + "88ac"
+	for i := 0; i < 4; i++ {
+		provider.AddUtxo(mockAddr, UTXO{Txid: strings.Repeat(fmt.Sprintf("%02d", i+1), 32), OutputIndex: 0, Satoshis: 3000, Script: script})
+	}
+	if _, _, err := contract.Deploy(provider, signer, DeployOptions{Satoshis: 1000}); err != nil {
+		t.Fatalf("Deploy error: %v", err)
+	}
+
+	// Continuation grows to 5000 sats => funding must cover ~4000 + fee, needing
+	// 2 of the 3000-sat coins. Cap at 1 => must error.
+	cap1 := 1
+	_, _, err := contract.Call("increment", nil, provider, signer, &CallOptions{
+		Satoshis:         5000,
+		NewState:         map[string]interface{}{"count": int64(1)},
+		MaxFundingInputs: &cap1,
+	})
+	if err == nil {
+		t.Fatal("expected error from maxFundingInputs cap")
+	}
+	if !strings.Contains(err.Error(), "maxFundingInputs") {
+		t.Errorf("expected maxFundingInputs error, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Bigint roundtrip edge cases (matching TS tests)
 // ---------------------------------------------------------------------------
 
@@ -2184,6 +2279,62 @@ func TestLocalSigner_DifferentKeysDifferentSigs(t *testing.T) {
 	sig2, _ := signer2.Sign(txHex, 0, "51", 100, nil)
 	if sig1 == sig2 {
 		t.Error("different keys should produce different signatures")
+	}
+}
+
+func TestLocalSigner_ProducesLowS(t *testing.T) {
+	halfN, _ := new(big.Int).SetString("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0", 16)
+	signer, err := NewLocalSigner("0000000000000000000000000000000000000000000000000000000000000001")
+	if err != nil {
+		t.Fatalf("NewLocalSigner: %v", err)
+	}
+
+	// Base transaction template: version(4) + 1 input(41 bytes) + 1 output + locktime(4)
+	// We vary the satoshis to produce different sighash preimages and thus different signatures.
+	baseTxPrefix := "01000000" + // version 1
+		"01" + // 1 input
+		strings.Repeat("00", 32) + // prevTxid
+		"00000000" + // prevIndex 0
+		"00" + // empty scriptSig
+		"ffffffff" + // sequence
+		"01" // 1 output
+
+	for i := 0; i < 20; i++ {
+		// Encode (100 + i) satoshis as 8-byte little-endian
+		satoshis := int64(100 + i)
+		var satLE [8]byte
+		for j := 0; j < 8; j++ {
+			satLE[j] = byte(satoshis >> (8 * j))
+		}
+		satHex := fmt.Sprintf("%02x%02x%02x%02x%02x%02x%02x%02x",
+			satLE[0], satLE[1], satLE[2], satLE[3],
+			satLE[4], satLE[5], satLE[6], satLE[7])
+		txHex := baseTxPrefix + satHex + "01" + "51" + "00000000"
+
+		sig, err := signer.Sign(txHex, 0, "51", satoshis, nil)
+		if err != nil {
+			t.Fatalf("iteration %d: Sign: %v", i, err)
+		}
+
+		// Decode DER from hex: 30 <len> 02 <rlen> <R> 02 <slen> <S> [hashtype]
+		sigBytes, err := hex.DecodeString(sig)
+		if err != nil {
+			t.Fatalf("iteration %d: invalid hex signature: %v", i, err)
+		}
+		if len(sigBytes) < 6 || sigBytes[0] != 0x30 {
+			t.Fatalf("iteration %d: invalid DER signature (no 0x30 tag)", i)
+		}
+		rLen := int(sigBytes[3])
+		sOffset := 4 + rLen + 1
+		if sOffset >= len(sigBytes) {
+			t.Fatalf("iteration %d: DER too short to contain S", i)
+		}
+		sLen := int(sigBytes[sOffset])
+		sBytes := sigBytes[sOffset+1 : sOffset+1+sLen]
+		s := new(big.Int).SetBytes(sBytes)
+		if s.Cmp(halfN) > 0 {
+			t.Errorf("iteration %d: S value exceeds N/2 (BIP-62 low-S violation)", i)
+		}
 	}
 }
 
@@ -2499,6 +2650,59 @@ func TestBuildCallTransaction_AllSequences(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// #131: honor CallOptions.Sequence; non-final input sequences under locktime.
+// ---------------------------------------------------------------------------
+
+func TestBuildCallTransaction_LocktimeDefaultsNonFinalSequence(t *testing.T) {
+	// A non-zero locktime must default EVERY input to 0xfffffffe (non-final) so
+	// consensus actually enforces nLockTime (issue #131).
+	utxo := makeUtxo(100000, 0)
+	additional := []UTXO{makeUtxo(50000, 1), makeUtxo(30000, 2)}
+	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
+	lt := uint32(800000)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100, &BuildCallOptions{Locktime: &lt})
+	parsed := parseTxHex(callTxObj.Hex())
+	if parsed.locktime != 800000 {
+		t.Errorf("expected locktime 800000, got %d", parsed.locktime)
+	}
+	if len(parsed.inputs) != 3 {
+		t.Fatalf("expected 3 inputs, got %d", len(parsed.inputs))
+	}
+	for i, inp := range parsed.inputs {
+		if inp.sequence != 0xfffffffe {
+			t.Errorf("input %d: expected sequence 0xfffffffe under locktime, got %#x", i, inp.sequence)
+		}
+	}
+}
+
+func TestBuildCallTransaction_LocktimeZeroKeepsFinalSequence(t *testing.T) {
+	// An explicit locktime of 0 keeps the legacy final 0xffffffff (issue #131).
+	utxo := makeUtxo(100000, 0)
+	lt := uint32(0)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "", "", nil, 100, &BuildCallOptions{Locktime: &lt})
+	parsed := parseTxHex(callTxObj.Hex())
+	if parsed.inputs[0].sequence != 0xffffffff {
+		t.Errorf("expected sequence 0xffffffff with locktime 0, got %#x", parsed.inputs[0].sequence)
+	}
+}
+
+func TestBuildCallTransaction_ExplicitSequenceWins(t *testing.T) {
+	// An explicit Sequence override wins on every input, even under locktime.
+	utxo := makeUtxo(100000, 0)
+	additional := []UTXO{makeUtxo(50000, 1)}
+	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
+	lt := uint32(800000)
+	seq := uint32(0x12345678)
+	callTxObj, _, _ := BuildCallTransaction(utxo, "51", "", 0, "changeaddr", changeScript, additional, 100, &BuildCallOptions{Locktime: &lt, Sequence: &seq})
+	parsed := parseTxHex(callTxObj.Hex())
+	for i, inp := range parsed.inputs {
+		if inp.sequence != 0x12345678 {
+			t.Errorf("input %d: expected explicit sequence 0x12345678, got %#x", i, inp.sequence)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Row 363: InsertUnlockingScript with out-of-range input index panics
 // ---------------------------------------------------------------------------
 
@@ -2584,6 +2788,47 @@ func TestPushData_76Bytes_UsesPUSHDATA1(t *testing.T) {
 	encoded := EncodePushData(data)
 	if !strings.HasPrefix(encoded, "4c") {
 		t.Errorf("expected 76-byte push to start with '4c' (OP_PUSHDATA1), got: %s", encoded[:4])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MINIMALDATA (SCRIPT_VERIFY_MINIMALDATA): a 1-byte payload in
+// {0x00, 0x01..0x10, 0x81} must use the minimal opcode (OP_0 / OP_1..OP_16 /
+// OP_1NEGATE), not a direct push "01 NN". Byte-identical with the other SDKs.
+// ---------------------------------------------------------------------------
+
+func TestPushData_MinimalData_SingleByte(t *testing.T) {
+	cases := map[string]string{
+		"00": "00", // OP_0
+		"05": "55", // OP_5
+		"81": "4f", // OP_1NEGATE
+	}
+	for input, want := range cases {
+		if got := EncodePushData(input); got != want {
+			t.Errorf("EncodePushData(%q) = %q, want %q", input, got, want)
+		}
+	}
+	// 0x01..0x10 -> OP_1..OP_16 (0x51..0x60)
+	for n := 1; n <= 16; n++ {
+		input := fmt.Sprintf("%02x", n)
+		want := fmt.Sprintf("%02x", 0x50+n)
+		if got := EncodePushData(input); got != want {
+			t.Errorf("EncodePushData(%q) = %q, want %q (OP_%d)", input, got, want, n)
+		}
+	}
+}
+
+func TestPushData_MinimalData_OutsideRangeStillDirectPush(t *testing.T) {
+	for _, b := range []int{0x11, 0x4f, 0x50, 0x60, 0x80, 0x82, 0xff} {
+		input := fmt.Sprintf("%02x", b)
+		want := fmt.Sprintf("01%02x", b)
+		if got := EncodePushData(input); got != want {
+			t.Errorf("EncodePushData(%q) = %q, want %q", input, got, want)
+		}
+	}
+	// Two-byte payload is unaffected.
+	if got := EncodePushData("0011"); got != "020011" {
+		t.Errorf("EncodePushData(\"0011\") = %q, want \"020011\"", got)
 	}
 }
 
@@ -2845,7 +3090,7 @@ func TestComputeNewState_Counter_Increment(t *testing.T) {
 	}
 
 	currentState := map[string]interface{}{"count": big.NewInt(0)}
-	newState, err := ComputeNewState(anf, "increment", currentState, nil)
+	newState, err := ComputeNewState(anf, "increment", currentState, nil, nil)
 	if err != nil {
 		t.Fatalf("ComputeNewState failed: %v", err)
 	}
@@ -2876,8 +3121,184 @@ func TestComputeNewState_UnknownMethod_Error(t *testing.T) {
 		},
 	}
 
-	_, err := ComputeNewState(anf, "nonexistent", map[string]interface{}{"count": big.NewInt(0)}, nil)
+	_, err := ComputeNewState(anf, "nonexistent", map[string]interface{}{"count": big.NewInt(0)}, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown method")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// addDataOutput SDK emission — BSVM R9
+// The spec's continuation hash for a stateful method that calls
+// addDataOutput commits to `[state outputs] || [data outputs] ||
+// changeOutput`. These tests verify BuildCallTransaction emits the
+// data outputs at the right position with correct fee accounting and
+// that the ANF interpreter resolves them from the method body.
+// ---------------------------------------------------------------------------
+
+func TestBuildCallTransaction_DataOutputsOrder(t *testing.T) {
+	utxo := makeUtxo(100000, 0)
+	stateScript := "76a914" + strings.Repeat("dd", 20) + "88ac"
+	data0 := "6a0474657374"   // OP_RETURN "test"
+	data1 := "6a056c6162656c" // OP_RETURN "label"
+	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
+
+	opts := &BuildCallOptions{
+		DataOutputs: []ContractOutput{
+			{Script: data0, Satoshis: 0},
+			{Script: data1, Satoshis: 0},
+		},
+	}
+	callTxObj, _, _ := BuildCallTransaction(
+		utxo, "51", stateScript, 50000, "changeaddr", changeScript, nil, 100, opts,
+	)
+	parsed := parseTxHex(callTxObj.Hex())
+
+	if parsed.outputCount != 4 {
+		t.Fatalf("expected 4 outputs (state, data0, data1, change), got %d", parsed.outputCount)
+	}
+	if parsed.outputs[0].script != stateScript {
+		t.Errorf("output 0 (state): expected state script, got %s", parsed.outputs[0].script)
+	}
+	if parsed.outputs[1].script != data0 {
+		t.Errorf("output 1 (data0): expected %s, got %s", data0, parsed.outputs[1].script)
+	}
+	if parsed.outputs[2].script != data1 {
+		t.Errorf("output 2 (data1): expected %s, got %s", data1, parsed.outputs[2].script)
+	}
+	if parsed.outputs[3].script != changeScript {
+		t.Errorf("output 3 (change): expected change script, got %s", parsed.outputs[3].script)
+	}
+}
+
+func TestBuildCallTransaction_DataOutputsFeeEstimate(t *testing.T) {
+	makeTx := func(opts *BuildCallOptions) int64 {
+		utxo := makeUtxo(100000, 0)
+		stateScript := "76a914" + strings.Repeat("dd", 20) + "88ac"
+		changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
+		var variadic []*BuildCallOptions
+		if opts != nil {
+			variadic = []*BuildCallOptions{opts}
+		}
+		_, _, change := BuildCallTransaction(
+			utxo, "51", stateScript, 50000, "changeaddr", changeScript, nil, 100, variadic...,
+		)
+		return change
+	}
+
+	changeWithout := makeTx(nil)
+	dataScript := "6a" + strings.Repeat("ab", 30) // 32-byte OP_RETURN payload
+	changeWith := makeTx(&BuildCallOptions{
+		DataOutputs: []ContractOutput{{Script: dataScript, Satoshis: 0}},
+	})
+
+	dataByteLen := len(dataScript) / 2
+	// Output on wire: 8 (value) + varint(scriptLen) + scriptLen. scriptLen < 0xfd ⇒ varint=1.
+	extraOutputBytes := int64(8 + 1 + dataByteLen)
+	feeRate := int64(100)
+	expectedFeeDelta := (extraOutputBytes*feeRate + 999) / 1000
+	diff := changeWithout - changeWith
+	if diff != expectedFeeDelta {
+		t.Errorf("expected change to drop by %d sat (fee for %d extra bytes @ %d/kB), got drop of %d (without=%d, with=%d)",
+			expectedFeeDelta, extraOutputBytes, feeRate, diff, changeWithout, changeWith)
+	}
+}
+
+func TestBuildCallTransaction_DataOutputsWithNonZeroSats(t *testing.T) {
+	utxo := makeUtxo(100000, 0)
+	stateScript := "76a914" + strings.Repeat("dd", 20) + "88ac"
+	changeScript := "76a914" + strings.Repeat("ff", 20) + "88ac"
+
+	// Same tx without data output for baseline change calc
+	_, _, baselineChange := BuildCallTransaction(
+		utxo, "51", stateScript, 50000, "changeaddr", changeScript, nil, 100,
+	)
+
+	dataScript := "76a914" + strings.Repeat("cc", 20) + "88ac"
+	opts := &BuildCallOptions{
+		DataOutputs: []ContractOutput{{Script: dataScript, Satoshis: 1000}},
+	}
+	callTxObj, _, changeWith := BuildCallTransaction(
+		utxo, "51", stateScript, 50000, "changeaddr", changeScript, nil, 100, opts,
+	)
+	parsed := parseTxHex(callTxObj.Hex())
+
+	// The data output must carry its declared 1000 satoshis
+	if parsed.outputs[1].satoshis != 1000 {
+		t.Errorf("expected data output to carry 1000 sats, got %d", parsed.outputs[1].satoshis)
+	}
+	if parsed.outputs[1].script != dataScript {
+		t.Errorf("expected data output script, got %s", parsed.outputs[1].script)
+	}
+
+	// Fee only goes up by the extra output bytes. So change = baseline - 1000 - feeDelta.
+	dataByteLen := len(dataScript) / 2
+	extraOutputBytes := int64(8 + 1 + dataByteLen)
+	feeDelta := (extraOutputBytes*100 + 999) / 1000
+	expected := baselineChange - 1000 - feeDelta
+	if changeWith != expected {
+		t.Errorf("expected change=%d (baseline %d - 1000 sats - %d fee), got %d",
+			expected, baselineChange, feeDelta, changeWith)
+	}
+}
+
+func TestComputeDataOutputs_FromANF(t *testing.T) {
+	// Minimal ANF with a single add_data_output binding. The satoshis
+	// come from a load_const bigint; the scriptBytes come from a
+	// load_const hex-encoded ByteString.
+	opReturnHex := "6a0474657374" // OP_RETURN "test"
+	anf := &ANFProgram{
+		ContractName: "DataEmitter",
+		Properties: []ANFProperty{
+			{Name: "counter", Type: "bigint", Readonly: false},
+		},
+		Methods: []ANFMethod{
+			{Name: "constructor", IsPublic: false, Body: []ANFBinding{}},
+			{
+				Name:     "emit",
+				IsPublic: true,
+				Params: []ANFParam{
+					{Name: "txPreimage", Type: "SigHashPreimage"},
+					{Name: "_changePKH", Type: "Addr"},
+					{Name: "_changeAmount", Type: "bigint"},
+				},
+				Body: []ANFBinding{
+					{Name: "t_sats", Value: map[string]interface{}{"kind": "load_const", "value": float64(0)}},
+					{Name: "t_script", Value: map[string]interface{}{"kind": "load_const", "value": opReturnHex}},
+					{Name: "t_emit", Value: map[string]interface{}{
+						"kind":        "add_data_output",
+						"satoshis":    "t_sats",
+						"scriptBytes": "t_script",
+					}},
+					// Keep the counter mutating so this exercises state transition too
+					{Name: "t_prop", Value: map[string]interface{}{"kind": "load_prop", "name": "counter"}},
+					{Name: "t_one", Value: map[string]interface{}{"kind": "load_const", "value": float64(1)}},
+					{Name: "t_sum", Value: map[string]interface{}{"kind": "bin_op", "op": "+", "left": "t_prop", "right": "t_one", "resultType": "bigint"}},
+					{Name: "t_update", Value: map[string]interface{}{"kind": "update_prop", "name": "counter", "value": "t_sum"}},
+				},
+			},
+		},
+	}
+
+	currentState := map[string]interface{}{"counter": big.NewInt(0)}
+	newState, dataOutputs, _, err := ComputeNewStateAndDataOutputs(
+		anf, "emit", currentState, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("ComputeNewStateAndDataOutputs failed: %v", err)
+	}
+	if len(dataOutputs) != 1 {
+		t.Fatalf("expected 1 data output, got %d", len(dataOutputs))
+	}
+	if dataOutputs[0].Satoshis != 0 {
+		t.Errorf("expected 0 sats, got %d", dataOutputs[0].Satoshis)
+	}
+	if dataOutputs[0].Script != opReturnHex {
+		t.Errorf("expected script %s, got %s", opReturnHex, dataOutputs[0].Script)
+	}
+	// Also assert state transition still worked
+	countVal, ok := newState["counter"].(*big.Int)
+	if !ok || countVal.Int64() != 1 {
+		t.Errorf("expected counter=1 after emit, got %v", newState["counter"])
 	}
 }

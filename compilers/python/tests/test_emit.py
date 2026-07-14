@@ -18,7 +18,7 @@ from runar_compiler.ir.types import (
     ANFValue,
 )
 from runar_compiler.codegen.stack import lower_to_stack, StackOp, StackMethod, PushValue
-from runar_compiler.codegen.emit import emit, emit_method, EmitResult, ConstructorSlot
+from runar_compiler.codegen.emit import emit, emit_method, EmitResult, ConstructorSlot, encode_script_number, encode_push_data
 from runar_compiler.codegen.optimizer import optimize_stack_ops
 
 
@@ -537,7 +537,7 @@ class TestEmitGaps:
 
     # M24: if without else → no OP_ELSE in hex
     def test_m24_if_without_else_no_op_else(self):
-        """If with empty else → hex does not contain the OP_ELSE byte (63)."""
+        """If with empty else → ASM does not contain OP_ELSE."""
         method = StackMethod(
             name="test",
             ops=[
@@ -549,16 +549,16 @@ class TestEmitGaps:
             ],
         )
         result = emit_method(method)
-        # OP_ELSE = 0x67. It should NOT appear when else branch is empty.
-        assert "67" not in result.script_hex, (
-            f"expected no OP_ELSE (67) for if-without-else, got hex: {result.script_hex}"
+        # Use ASM checks to avoid spurious matches inside push data bytes
+        assert "OP_ELSE" not in result.script_asm, (
+            f"expected no OP_ELSE for if-without-else, got asm: {result.script_asm}"
         )
-        # But OP_IF (0x63) and OP_ENDIF (0x68) must still appear
-        assert "63" in result.script_hex, (
-            f"expected OP_IF (63) in hex, got: {result.script_hex}"
+        # But OP_IF and OP_ENDIF must still appear
+        assert "OP_IF" in result.script_asm, (
+            f"expected OP_IF in asm, got: {result.script_asm}"
         )
-        assert "68" in result.script_hex, (
-            f"expected OP_ENDIF (68) in hex, got: {result.script_hex}"
+        assert "OP_ENDIF" in result.script_asm, (
+            f"expected OP_ENDIF in asm, got: {result.script_asm}"
         )
 
     # M25: single method → no dispatch preamble
@@ -674,11 +674,10 @@ class TestEmitOpcodeEncodings:
             ],
         )
         result = emit_method(method)
-        # OP_IF=63, OP_ELSE=67, OP_ENDIF=68
-        hex_str = result.script_hex
-        assert "63" in hex_str, f"expected OP_IF (63) in {hex_str}"
-        assert "67" in hex_str, f"expected OP_ELSE (67) in {hex_str}"
-        assert "68" in hex_str, f"expected OP_ENDIF (68) in {hex_str}"
+        # Use ASM checks to avoid spurious matches inside push data bytes
+        assert "OP_IF" in result.script_asm, f"expected OP_IF in ASM, got: {result.script_asm}"
+        assert "OP_ELSE" in result.script_asm, f"expected OP_ELSE in ASM, got: {result.script_asm}"
+        assert "OP_ENDIF" in result.script_asm, f"expected OP_ENDIF in ASM, got: {result.script_asm}"
 
 
 class TestEmitMultiMethodDispatchFull:
@@ -776,4 +775,69 @@ class TestEmitTerminalCheckSig:
         # The terminal CHECKSIG should be the last opcode.
         assert hex_str.endswith("ac"), (
             f"expected OP_CHECKSIG (ac) as last opcode for terminal assert, got tail: {hex_str[-4:]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# encode_script_number: Bitcoin Script sign-magnitude boundary values
+# ---------------------------------------------------------------------------
+
+class TestEncodeScriptNumber_Boundaries:
+    """Verify Bitcoin Script sign-magnitude encoding at boundary values.
+
+    Zero returns an empty bytes object (the push layer maps that to OP_0 =
+    0x00), so its expected hex is the empty string.
+    """
+
+    @pytest.mark.parametrize("val,expected_hex", [
+        (0,           ""),
+        (1,           "01"),
+        (-1,          "81"),
+        (127,         "7f"),
+        (-127,        "ff"),
+        (128,         "8000"),
+        (-128,        "8080"),
+        (32767,       "ff7f"),
+        (32768,       "008000"),
+        (2147483647,  "ffffff7f"),
+        (2147483648,  "0000008000"),
+    ])
+    def test_boundary(self, val: int, expected_hex: str) -> None:
+        raw = encode_script_number(val)
+        got_hex = raw.hex()
+        assert got_hex == expected_hex, (
+            f"encode_script_number({val}) = {raw!r} (hex: {got_hex!r}), want {expected_hex!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# encode_push_data: boundary values
+# ---------------------------------------------------------------------------
+
+class TestEncodePushData_Boundaries:
+    """Verify push-data prefix encoding at boundary values.
+
+    Bitcoin Script push-data encoding transitions:
+      1–75 bytes  → single length byte (direct push)
+      76–255 bytes → OP_PUSHDATA1 (0x4c) + 1-byte length
+      256–65535 bytes → OP_PUSHDATA2 (0x4d) + 2-byte LE length
+    """
+
+    @pytest.mark.parametrize("data_len,want_prefix", [
+        # 75 bytes: direct push, single length byte 0x4b = 75
+        (75,  "4b"),
+        # 76 bytes: OP_PUSHDATA1 (0x4c) + length byte 0x4c = 76
+        (76,  "4c4c"),
+        # 255 bytes: OP_PUSHDATA1 (0x4c) + length byte 0xff = 255
+        (255, "4cff"),
+        # 256 bytes: OP_PUSHDATA2 (0x4d) + 2-byte LE length 0x0001 = 256
+        (256, "4d0001"),
+    ])
+    def test_boundary(self, data_len: int, want_prefix: str) -> None:
+        data = bytes([0xab] * data_len)
+        encoded = encode_push_data(data)
+        got = encoded.hex()
+        assert got.startswith(want_prefix), (
+            f"encode_push_data({data_len} bytes) hex prefix = {got[:20]!r}, "
+            f"want prefix {want_prefix!r} (full hex starts: {got[:12]!r})"
         )

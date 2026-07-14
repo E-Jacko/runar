@@ -1,0 +1,67 @@
+{
+  "artifact": {
+    "version": "runar-v1.0.0-rc.1",
+    "compilerVersion": "1.0.0-rc.1",
+    "contractName": "OraclePriceFeed",
+    "parentClass": "SmartContract",
+    "abi": {
+      "constructor": {
+        "params": [
+          {
+            "name": "oraclePubKey",
+            "type": "RabinPubKey"
+          },
+          {
+            "name": "receiver",
+            "type": "PubKey"
+          }
+        ]
+      },
+      "methods": [
+        {
+          "name": "settle",
+          "params": [
+            {
+              "name": "price",
+              "type": "bigint"
+            },
+            {
+              "name": "rabinSig",
+              "type": "RabinSig"
+            },
+            {
+              "name": "padding",
+              "type": "ByteString"
+            },
+            {
+              "name": "sig",
+              "type": "Sig"
+            }
+          ],
+          "isPublic": true
+        }
+      ]
+    },
+    "script": "53795880537a537a00537a537a537a537a7c760003000001a5697b7695937c977ca8887c0350c300a06900ac",
+    "constructorSlots": [
+      {
+        "paramIndex": 0,
+        "byteOffset": 8
+      },
+      {
+        "paramIndex": 1,
+        "byteOffset": 42
+      }
+    ]
+  },
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "12345678901234567890"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ]
+}

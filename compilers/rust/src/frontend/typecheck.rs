@@ -83,6 +83,51 @@ fn builtin_functions() -> HashMap<&'static str, FuncSig> {
     m.insert("verifySLHDSA_SHA2_192f", FuncSig { params: vec!["ByteString", "ByteString", "ByteString"], return_type: "boolean" });
     m.insert("verifySLHDSA_SHA2_256s", FuncSig { params: vec!["ByteString", "ByteString", "ByteString"], return_type: "boolean" });
     m.insert("verifySLHDSA_SHA2_256f", FuncSig { params: vec!["ByteString", "ByteString", "ByteString"], return_type: "boolean" });
+    // Baby Bear field arithmetic
+    m.insert("bbFieldAdd", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
+    m.insert("bbFieldSub", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
+    m.insert("bbFieldMul", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
+    m.insert("bbFieldInv", FuncSig { params: vec!["bigint"], return_type: "bigint" });
+    // Baby Bear ext4 field arithmetic
+    m.insert("bbExt4Mul0", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("bbExt4Mul1", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("bbExt4Mul2", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("bbExt4Mul3", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("bbExt4Inv0", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("bbExt4Inv1", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("bbExt4Inv2", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("bbExt4Inv3", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+
+    // KoalaBear field arithmetic (p = 2130706433)
+    m.insert("kbFieldAdd", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
+    m.insert("kbFieldSub", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
+    m.insert("kbFieldMul", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
+    m.insert("kbFieldInv", FuncSig { params: vec!["bigint"], return_type: "bigint" });
+    // KoalaBear quartic extension field (W = 3)
+    m.insert("kbExt4Mul0", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("kbExt4Mul1", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("kbExt4Mul2", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("kbExt4Mul3", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("kbExt4Inv0", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("kbExt4Inv1", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("kbExt4Inv2", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    m.insert("kbExt4Inv3", FuncSig { params: vec!["bigint", "bigint", "bigint", "bigint"], return_type: "bigint" });
+    // BN254 field arithmetic
+    m.insert("bn254FieldAdd", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
+    m.insert("bn254FieldSub", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
+    m.insert("bn254FieldMul", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
+    m.insert("bn254FieldInv", FuncSig { params: vec!["bigint"], return_type: "bigint" });
+    m.insert("bn254FieldNeg", FuncSig { params: vec!["bigint"], return_type: "bigint" });
+    // BN254 G1 curve operations
+    m.insert("bn254G1Add", FuncSig { params: vec!["Point", "Point"], return_type: "Point" });
+    m.insert("bn254G1ScalarMul", FuncSig { params: vec!["Point", "bigint"], return_type: "Point" });
+    m.insert("bn254G1Negate", FuncSig { params: vec!["Point"], return_type: "Point" });
+    m.insert("bn254G1OnCurve", FuncSig { params: vec!["Point"], return_type: "boolean" });
+
+    // Merkle proof verification
+    m.insert("merkleRootSha256", FuncSig { params: vec!["ByteString", "ByteString", "bigint", "bigint"], return_type: "ByteString" });
+    m.insert("merkleRootHash256", FuncSig { params: vec!["ByteString", "ByteString", "bigint", "bigint"], return_type: "ByteString" });
+
     m.insert("ecAdd", FuncSig { params: vec!["Point", "Point"], return_type: "Point" });
     m.insert("ecMul", FuncSig { params: vec!["Point", "bigint"], return_type: "Point" });
     m.insert("ecMulGen", FuncSig { params: vec!["bigint"], return_type: "Point" });
@@ -93,6 +138,22 @@ fn builtin_functions() -> HashMap<&'static str, FuncSig> {
     m.insert("ecMakePoint", FuncSig { params: vec!["bigint", "bigint"], return_type: "Point" });
     m.insert("ecPointX", FuncSig { params: vec!["Point"], return_type: "bigint" });
     m.insert("ecPointY", FuncSig { params: vec!["Point"], return_type: "bigint" });
+    // Elliptic curve operations (P-256 / NIST P-256 / secp256r1)
+    m.insert("p256Add", FuncSig { params: vec!["P256Point", "P256Point"], return_type: "P256Point" });
+    m.insert("p256Mul", FuncSig { params: vec!["P256Point", "bigint"], return_type: "P256Point" });
+    m.insert("p256MulGen", FuncSig { params: vec!["bigint"], return_type: "P256Point" });
+    m.insert("p256Negate", FuncSig { params: vec!["P256Point"], return_type: "P256Point" });
+    m.insert("p256OnCurve", FuncSig { params: vec!["P256Point"], return_type: "boolean" });
+    m.insert("p256EncodeCompressed", FuncSig { params: vec!["P256Point"], return_type: "ByteString" });
+    m.insert("verifyECDSA_P256", FuncSig { params: vec!["ByteString", "ByteString", "ByteString"], return_type: "boolean" });
+    // Elliptic curve operations (P-384 / NIST P-384 / secp384r1)
+    m.insert("p384Add", FuncSig { params: vec!["P384Point", "P384Point"], return_type: "P384Point" });
+    m.insert("p384Mul", FuncSig { params: vec!["P384Point", "bigint"], return_type: "P384Point" });
+    m.insert("p384MulGen", FuncSig { params: vec!["bigint"], return_type: "P384Point" });
+    m.insert("p384Negate", FuncSig { params: vec!["P384Point"], return_type: "P384Point" });
+    m.insert("p384OnCurve", FuncSig { params: vec!["P384Point"], return_type: "boolean" });
+    m.insert("p384EncodeCompressed", FuncSig { params: vec!["P384Point"], return_type: "ByteString" });
+    m.insert("verifyECDSA_P384", FuncSig { params: vec!["ByteString", "ByteString", "ByteString"], return_type: "boolean" });
     m.insert("abs", FuncSig { params: vec!["bigint"], return_type: "bigint" });
     m.insert("min", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
     m.insert("max", FuncSig { params: vec!["bigint", "bigint"], return_type: "bigint" });
@@ -137,6 +198,16 @@ fn builtin_functions() -> HashMap<&'static str, FuncSig> {
     m.insert("extractLocktime", FuncSig { params: vec!["SigHashPreimage"], return_type: "bigint" });
     m.insert("extractSigHashType", FuncSig { params: vec!["SigHashPreimage"], return_type: "bigint" });
 
+    // Intent sub-covenant intrinsics (BSVM Phase 13). Witness-bridge wrappers
+    // that compile down to standard primitives + auto-injected method params.
+    // See docs/cross-covenant-pattern.md.
+    //
+    // First arg of extractPrevOutputScript / requireOutputP2PKH MUST be an
+    // integer literal — enforced as a special case in check_call_args.
+    m.insert("extractPrevOutputScript", FuncSig { params: vec!["bigint", "ByteString"], return_type: "ByteString" });
+    m.insert("requireOutputP2PKH", FuncSig { params: vec!["bigint", "ByteString", "bigint"], return_type: "void" });
+    m.insert("currentBlockHeight", FuncSig { params: vec![], return_type: "bigint" });
+
     m
 }
 
@@ -148,7 +219,7 @@ fn builtin_functions() -> HashMap<&'static str, FuncSig> {
 fn is_bytestring_subtype(t: &str) -> bool {
     matches!(
         t,
-        "ByteString" | "PubKey" | "Sig" | "Sha256" | "Ripemd160" | "Addr" | "SigHashPreimage" | "Point"
+        "ByteString" | "PubKey" | "Sig" | "Sha256" | "Ripemd160" | "Addr" | "SigHashPreimage" | "Point" | "P256Point" | "P384Point"
     )
 }
 
@@ -268,7 +339,15 @@ struct TypeChecker<'a> {
     prop_types: HashMap<String, TType>,
     method_sigs: HashMap<String, (Vec<TType>, TType)>,
     builtins: HashMap<&'static str, FuncSig>,
+    /// Origin keys of affine values consumed in the current scope. Origin
+    /// keys are: parameter names, "prop:<name>" for contract properties,
+    /// and aliased origins resolved via affine_aliases. 2026-04-30 audit
+    /// finding F6.
     consumed_values: HashSet<String>,
+    /// Maps a local variable name to the canonical affine origin it
+    /// aliases. Populated when a variable_decl of affine type is
+    /// initialized from another affine origin.
+    affine_aliases: HashMap<String, String>,
     current_method_loc: Option<SourceLocation>,
 }
 
@@ -306,6 +385,7 @@ impl<'a> TypeChecker<'a> {
             method_sigs,
             builtins: builtin_functions(),
             consumed_values: HashSet::new(),
+            affine_aliases: HashMap::new(),
             current_method_loc: None,
         }
     }
@@ -324,6 +404,7 @@ impl<'a> TypeChecker<'a> {
 
         // Reset affine tracking for this scope
         self.consumed_values.clear();
+        self.affine_aliases.clear();
 
         // Add constructor params to env
         for param in &ctor.params {
@@ -346,6 +427,7 @@ impl<'a> TypeChecker<'a> {
 
         // Reset affine tracking for this method
         self.consumed_values.clear();
+        self.affine_aliases.clear();
 
         // Add method params to env
         for param in &method.params {
@@ -353,6 +435,24 @@ impl<'a> TypeChecker<'a> {
         }
 
         self.check_statements(&method.body, &mut env);
+
+        // Crit-3 — reject mixing requireOutputP2PKH with addDataOutput in
+        // the same method body. The intrinsic's compile-time output-offset
+        // computation assumes a fixed 34-byte stride per output, which is
+        // silently wrong when an OP_RETURN output (variable length)
+        // precedes the indexed P2PKH output. v1 forbids the mix; v2 may
+        // relax with a variable-stride decoder.
+        let has_require_p2pkh = body_calls_builtin(&method.body, "requireOutputP2PKH");
+        let has_add_data_output = body_calls_add_data_output(&method.body);
+        if has_require_p2pkh && has_add_data_output {
+            self.add_error(format!(
+                "method '{}' mixes requireOutputP2PKH() with addDataOutput() — \
+v1 of the intrinsic assumes a fixed 34-byte output stride and \
+variable-length OP_RETURN outputs break the offset computation; \
+split the addDataOutput call into a separate method",
+                method.name
+            ));
+        }
     }
 
     fn check_statements(&mut self, stmts: &[Statement], env: &mut TypeEnv) {
@@ -370,7 +470,7 @@ impl<'a> TypeChecker<'a> {
                 ..
             } => {
                 let init_type = self.infer_expr_type(init, env);
-                if let Some(declared) = var_type {
+                let decl_type = if let Some(declared) = var_type {
                     let declared_type = type_node_to_ttype(declared);
                     if !is_subtype(&init_type, &declared_type) {
                         self.add_error(format!(
@@ -378,9 +478,19 @@ impl<'a> TypeChecker<'a> {
                             init_type, declared_type
                         ));
                     }
-                    env.define(name, declared_type);
+                    env.define(name, declared_type.clone());
+                    declared_type
                 } else {
-                    env.define(name, init_type);
+                    env.define(name, init_type.clone());
+                    init_type
+                };
+                // Record affine alias so a subsequent consume of the
+                // local resolves back to the original origin.
+                // 2026-04-30 audit finding F6.
+                if is_affine_type(&decl_type) {
+                    if let Some(origin) = self.affine_origin_of_expr(init) {
+                        self.affine_aliases.insert(name.clone(), origin);
+                    }
                 }
             }
 
@@ -533,7 +643,11 @@ impl<'a> TypeChecker<'a> {
 
             Expression::UnaryExpr { op, operand } => self.check_unary_expr(op, operand, env),
 
-            Expression::CallExpr { callee, args } => self.check_call_expr(callee, args, env),
+            Expression::CallExpr {
+                callee,
+                args,
+                asm_return_type,
+            } => self.check_call_expr(callee, args, asm_return_type.as_deref(), env),
 
             Expression::TernaryExpr {
                 condition,
@@ -808,6 +922,7 @@ impl<'a> TypeChecker<'a> {
         &mut self,
         callee: &Expression,
         args: &[Expression],
+        asm_return_type: Option<&str>,
         env: &mut TypeEnv,
     ) -> TType {
         // super() call in constructor
@@ -815,6 +930,24 @@ impl<'a> TypeChecker<'a> {
             if name == "super" {
                 for arg in args {
                     self.infer_expr_type(arg, env);
+                }
+                return VOID.to_string();
+            }
+        }
+
+        // asm is a compile-time intrinsic — the parser has already rewritten
+        // the { body, in_arity?, out_arity? } object-literal argument into
+        // three positional args (body, in_arity, out_arity). The statement
+        // form returns void; the expression form asm<T>({...}) carries the
+        // captured return type on asm_return_type and produces a value of that
+        // type.
+        if let Expression::Identifier { name } = callee {
+            if name == "asm" {
+                for arg in args {
+                    self.infer_expr_type(arg, env);
+                }
+                if let Some(t) = asm_return_type {
+                    return t.to_string();
                 }
                 return VOID.to_string();
             }
@@ -861,7 +994,7 @@ impl<'a> TypeChecker<'a> {
                 return BYTESTRING.to_string();
             }
 
-            if property == "addOutput" || property == "addRawOutput" {
+            if property == "addOutput" || property == "addRawOutput" || property == "addDataOutput" {
                 for arg in args {
                     self.infer_expr_type(arg, env);
                 }
@@ -898,6 +1031,13 @@ impl<'a> TypeChecker<'a> {
             {
                 if property == "getStateScript" {
                     return BYTESTRING.to_string();
+                }
+
+                if property == "addOutput" || property == "addRawOutput" || property == "addDataOutput" {
+                    for arg in args {
+                        self.infer_expr_type(arg, env);
+                    }
+                    return VOID.to_string();
                 }
 
                 if let Some((params, return_type)) = self.method_sigs.get(property).cloned() {
@@ -1007,19 +1147,146 @@ impl<'a> TypeChecker<'a> {
             return return_type.to_string();
         }
 
-        // Special case: checkMultiSig
+        // extractPrevOutputScript / requireOutputP2PKH — the index arg
+        // MUST be a compile-time integer literal so the ANF lowering can
+        // derive a stable auto-injected witness-param name
+        // (extractPrevOutputScript) or a constant byte offset
+        // (requireOutputP2PKH).
+        if func_name == "extractPrevOutputScript" || func_name == "requireOutputP2PKH" {
+            if !args.is_empty() {
+                // Accept `-N` (UnaryExpr "-" over BigIntLiteral) so the
+                // bounds check below produces a clear "must be >= 0"
+                // rather than the misleading "must be an integer literal"
+                // message.
+                use num_traits::ToPrimitive;
+                let idx_lit: Option<i128> = match &args[0] {
+                    Expression::BigIntLiteral { value } => value.to_i128(),
+                    Expression::UnaryExpr { op: UnaryOp::Neg, operand } => {
+                        if let Expression::BigIntLiteral { value } = operand.as_ref() {
+                            (-value).to_i128()
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if idx_lit.is_none() {
+                    self.add_error(format!(
+                        "{}() argument 1 (index) must be an integer literal",
+                        func_name
+                    ));
+                } else if let Some(idx) = idx_lit {
+                    // R-2: bound the index literal. For requireOutputP2PKH,
+                    // the emitted Stack-IR computes byte-offset = idx * 34;
+                    // require 0 <= idx <= 1000 to keep the offset well
+                    // under script-int max and to reject obvious nonsense
+                    // (e.g. negative or astronomically large).
+                    if idx < 0 {
+                        self.add_error(format!(
+                            "{}() argument 1 (index) must be >= 0; got {}",
+                            func_name, idx
+                        ));
+                    }
+                    if func_name == "requireOutputP2PKH" && idx > 1000 {
+                        self.add_error(format!(
+                            "requireOutputP2PKH() argument 1 (outputIndex) bound to <= 1000; got {} (the emitted Stack-IR computes byte-offset = idx*34; unrealistic indexes indicate a programming error)",
+                            idx
+                        ));
+                    }
+                }
+            }
+        }
+
+        // extractPrevOutputScript variable-arity special case (2-arg
+        // full-hash or 3-arg prefix-hash form). Validates types +
+        // literal-only on the optional prefixLen, then returns the
+        // signature's return type to bypass the standard arg-count check
+        // below (which would reject the 3-arg form against the 2-arg sig
+        // table entry).
+        if func_name == "extractPrevOutputScript" {
+            if args.len() != 2 && args.len() != 3 {
+                self.add_error(format!(
+                    "extractPrevOutputScript() expects 2 or 3 arguments, got {}",
+                    args.len()
+                ));
+            }
+            if !args.is_empty() {
+                // arg 0 already validated as a literal above
+                self.infer_expr_type(&args[0], env);
+            }
+            if args.len() >= 2 {
+                let arg_type = self.infer_expr_type(&args[1], env);
+                if !is_subtype(&arg_type, "ByteString") && arg_type != "<unknown>" {
+                    self.add_error(format!(
+                        "argument 2 of extractPrevOutputScript(): expected 'ByteString', got '{}'",
+                        arg_type
+                    ));
+                }
+            }
+            if args.len() == 3 {
+                if let Expression::BigIntLiteral { value } = &args[2] {
+                    // R-4: bound the prefixLen literal. The intrinsic
+                    // hashes substr(witness, 0, prefixLen) and compares
+                    // against a 32-byte SHA-256 hash. prefixLen < 32 is
+                    // suspicious (the prefix bytes don't even cover a
+                    // hash-sized chunk). prefixLen > 4 MiB exceeds
+                    // MAX_SCRIPT_BYTES — wouldn't fit in a legal Bitcoin
+                    // Script anyway.
+                    use num_traits::ToPrimitive;
+                    let n: i128 = value.to_i128().unwrap_or(i128::MAX);
+                    if n < 32 {
+                        self.add_error(format!(
+                            "extractPrevOutputScript() argument 3 (prefixLen) must be >= 32 (the hash assertion compares a 32-byte SHA-256); got {}",
+                            n
+                        ));
+                    }
+                    if n > 4 * 1024 * 1024 {
+                        self.add_error(format!(
+                            "extractPrevOutputScript() argument 3 (prefixLen) must be <= MAX_SCRIPT_BYTES (4 MiB); got {}",
+                            n
+                        ));
+                    }
+                } else {
+                    self.add_error(
+                        "extractPrevOutputScript() argument 3 (prefixLen) must be an integer literal when supplied",
+                    );
+                }
+                self.infer_expr_type(&args[2], env);
+            }
+            self.check_affine_consumption(func_name, args, env);
+            return return_type.to_string();
+        }
+
+        // requireOutputP2PKH and currentBlockHeight need the
+        // auto-injected txPreimage — only available in
+        // StatefulSmartContract methods.
+        if func_name == "requireOutputP2PKH" || func_name == "currentBlockHeight" {
+            if self.contract.parent_class != "StatefulSmartContract" {
+                self.add_error(format!(
+                    "{}() is only available in StatefulSmartContract methods",
+                    func_name
+                ));
+            }
+        }
+
+        // Special case: checkMultiSig (Sig[] / PubKey[] arrays). Only
+        // arity is special; arg-type validation falls through to the
+        // standard subtype loop below so callers cannot pass
+        // `bigint[]` or other element types. 2026-04-30 audit
+        // finding F5.
         if func_name == "checkMultiSig" {
             if args.len() != 2 {
                 self.add_error(format!(
                     "checkMultiSig() expects 2 arguments, got {}",
                     args.len()
                 ));
+                for arg in args {
+                    self.infer_expr_type(arg, env);
+                }
+                self.check_affine_consumption(func_name, args, env);
+                return return_type.to_string();
             }
-            for arg in args {
-                self.infer_expr_type(arg, env);
-            }
-            self.check_affine_consumption(func_name, args, env);
-            return return_type.to_string();
+            // Fall through to the standard subtype check below.
         }
 
         // Standard argument count check
@@ -1060,7 +1327,11 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Check affine type constraints: Sig and SigHashPreimage values may
-    /// only be consumed once by a consuming function.
+    /// only be consumed once by a consuming function. Tracks
+    /// consumption by *origin*, not variable name, so aliases (`const
+    /// again = sig`) and property accesses (`this.sig`) cannot be
+    /// used to launder a double-consumption past the affine check.
+    /// 2026-04-30 audit finding F6.
     fn check_affine_consumption(
         &mut self,
         func_name: &str,
@@ -1078,23 +1349,61 @@ impl<'a> TypeChecker<'a> {
             }
 
             let arg = &args[param_index];
-            if let Expression::Identifier { name } = arg {
-                if let Some(arg_type) = env.lookup(name) {
-                    let arg_type = arg_type.clone();
-                    if !is_affine_type(&arg_type) {
-                        continue;
-                    }
-
-                    if self.consumed_values.contains(name) {
-                        self.add_error(format!(
-                            "affine value '{}' has already been consumed",
-                            name
-                        ));
-                    } else {
-                        self.consumed_values.insert(name.clone());
-                    }
-                }
+            let arg_type = match self.affine_expr_type(arg, env) {
+                Some(t) => t,
+                None => continue,
+            };
+            if !is_affine_type(&arg_type) {
+                continue;
             }
+
+            let origin = match self.affine_origin_of_expr(arg) {
+                Some(o) => o,
+                None => continue,
+            };
+
+            // Render a short label (source-form) for the diagnostic.
+            let label = match arg {
+                Expression::Identifier { name } => name.clone(),
+                Expression::PropertyAccess { property } => format!("this.{}", property),
+                _ => origin.clone(),
+            };
+
+            if self.consumed_values.contains(&origin) {
+                self.add_error(format!(
+                    "affine value '{}' has already been consumed",
+                    label
+                ));
+            } else {
+                self.consumed_values.insert(origin);
+            }
+        }
+    }
+
+    /// Resolve the canonical origin key for affine tracking.
+    /// Identifiers consult the alias map; property accesses use the
+    /// "prop:<name>" namespace; everything else returns None.
+    fn affine_origin_of_expr(&self, expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::Identifier { name } => Some(
+                self.affine_aliases
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone()),
+            ),
+            Expression::PropertyAccess { property } => Some(format!("prop:{}", property)),
+            _ => None,
+        }
+    }
+
+    /// Look up the type of an expression for affine purposes.
+    /// Identifiers come from the env; property accesses from the
+    /// prop-types map.
+    fn affine_expr_type(&self, expr: &Expression, env: &TypeEnv) -> Option<TType> {
+        match expr {
+            Expression::Identifier { name } => env.lookup(name).cloned(),
+            Expression::PropertyAccess { property } => self.prop_types.get(property).cloned(),
+            _ => None,
         }
     }
 }
@@ -1203,9 +1512,19 @@ fn infer_expr_type_static(expr: &Expression) -> TType {
             UnaryOp::Not => BOOLEAN.to_string(),
             _ => BIGINT.to_string(),
         },
-        Expression::CallExpr { callee, .. } => {
+        Expression::CallExpr {
+            callee,
+            asm_return_type,
+            ..
+        } => {
             let builtins = builtin_functions();
             if let Expression::Identifier { name } = callee.as_ref() {
+                // Expression-form asm<T>({...}) statically yields type T.
+                if name == "asm" {
+                    if let Some(t) = asm_return_type {
+                        return t.to_string();
+                    }
+                }
                 if let Some(sig) = builtins.get(name.as_str()) {
                     return sig.return_type.to_string();
                 }
@@ -1249,6 +1568,155 @@ fn type_node_to_ttype(node: &TypeNode) -> TType {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Body-walk helpers for the Crit-3 requireOutputP2PKH / addDataOutput
+// rejection. Recursively scans every statement and expression in a method
+// body looking for a top-level builtin call by identifier name (Identifier
+// callee) or an `obj.addDataOutput(...)` / `this.addDataOutput()` call
+// (MemberExpr / PropertyAccess callee). Mirrors the Go reference impl in
+// compilers/go/frontend/typecheck.go.
+// ---------------------------------------------------------------------------
+
+fn body_calls_builtin(body: &[Statement], name: &str) -> bool {
+    body.iter().any(|s| stmt_contains_call_to(s, name))
+}
+
+fn body_calls_add_data_output(body: &[Statement]) -> bool {
+    body.iter().any(stmt_contains_add_data_output)
+}
+
+fn stmt_contains_call_to(stmt: &Statement, name: &str) -> bool {
+    match stmt {
+        Statement::ExpressionStatement { expression, .. } => {
+            expr_contains_call_to(expression, name)
+        }
+        Statement::VariableDecl { init, .. } => expr_contains_call_to(init, name),
+        Statement::Assignment { target, value, .. } => {
+            expr_contains_call_to(target, name) || expr_contains_call_to(value, name)
+        }
+        Statement::IfStatement { condition, then_branch, else_branch, .. } => {
+            if expr_contains_call_to(condition, name) {
+                return true;
+            }
+            if then_branch.iter().any(|s| stmt_contains_call_to(s, name)) {
+                return true;
+            }
+            if let Some(else_b) = else_branch {
+                if else_b.iter().any(|s| stmt_contains_call_to(s, name)) {
+                    return true;
+                }
+            }
+            false
+        }
+        Statement::ForStatement { body, .. } => {
+            body.iter().any(|s| stmt_contains_call_to(s, name))
+        }
+        Statement::ReturnStatement { value, .. } => {
+            value.as_ref().map_or(false, |e| expr_contains_call_to(e, name))
+        }
+    }
+}
+
+fn expr_contains_call_to(expr: &Expression, name: &str) -> bool {
+    match expr {
+        Expression::CallExpr { callee, args, .. } => {
+            if let Expression::Identifier { name: id_name } = callee.as_ref() {
+                if id_name == name {
+                    return true;
+                }
+            }
+            args.iter().any(|a| expr_contains_call_to(a, name))
+        }
+        Expression::BinaryExpr { left, right, .. } => {
+            expr_contains_call_to(left, name) || expr_contains_call_to(right, name)
+        }
+        Expression::UnaryExpr { operand, .. } => expr_contains_call_to(operand, name),
+        Expression::TernaryExpr { condition, consequent, alternate } => {
+            expr_contains_call_to(condition, name)
+                || expr_contains_call_to(consequent, name)
+                || expr_contains_call_to(alternate, name)
+        }
+        Expression::IndexAccess { object, index } => {
+            expr_contains_call_to(object, name) || expr_contains_call_to(index, name)
+        }
+        Expression::ArrayLiteral { elements } => {
+            elements.iter().any(|e| expr_contains_call_to(e, name))
+        }
+        Expression::IncrementExpr { operand, .. }
+        | Expression::DecrementExpr { operand, .. } => expr_contains_call_to(operand, name),
+        Expression::MemberExpr { object, .. } => expr_contains_call_to(object, name),
+        _ => false,
+    }
+}
+
+fn stmt_contains_add_data_output(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::ExpressionStatement { expression, .. } => {
+            expr_contains_add_data_output(expression)
+        }
+        Statement::VariableDecl { init, .. } => expr_contains_add_data_output(init),
+        Statement::Assignment { target, value, .. } => {
+            expr_contains_add_data_output(target) || expr_contains_add_data_output(value)
+        }
+        Statement::IfStatement { condition, then_branch, else_branch, .. } => {
+            if expr_contains_add_data_output(condition) {
+                return true;
+            }
+            if then_branch.iter().any(stmt_contains_add_data_output) {
+                return true;
+            }
+            if let Some(else_b) = else_branch {
+                if else_b.iter().any(stmt_contains_add_data_output) {
+                    return true;
+                }
+            }
+            false
+        }
+        Statement::ForStatement { body, .. } => {
+            body.iter().any(stmt_contains_add_data_output)
+        }
+        Statement::ReturnStatement { value, .. } => {
+            value.as_ref().map_or(false, expr_contains_add_data_output)
+        }
+    }
+}
+
+fn expr_contains_add_data_output(expr: &Expression) -> bool {
+    match expr {
+        Expression::CallExpr { callee, args, .. } => {
+            match callee.as_ref() {
+                Expression::PropertyAccess { property } if property == "addDataOutput" => {
+                    return true;
+                }
+                Expression::MemberExpr { property, .. } if property == "addDataOutput" => {
+                    return true;
+                }
+                _ => {}
+            }
+            args.iter().any(expr_contains_add_data_output)
+        }
+        Expression::BinaryExpr { left, right, .. } => {
+            expr_contains_add_data_output(left) || expr_contains_add_data_output(right)
+        }
+        Expression::UnaryExpr { operand, .. } => expr_contains_add_data_output(operand),
+        Expression::TernaryExpr { condition, consequent, alternate } => {
+            expr_contains_add_data_output(condition)
+                || expr_contains_add_data_output(consequent)
+                || expr_contains_add_data_output(alternate)
+        }
+        Expression::IndexAccess { object, index } => {
+            expr_contains_add_data_output(object) || expr_contains_add_data_output(index)
+        }
+        Expression::ArrayLiteral { elements } => {
+            elements.iter().any(expr_contains_add_data_output)
+        }
+        Expression::IncrementExpr { operand, .. }
+        | Expression::DecrementExpr { operand, .. } => expr_contains_add_data_output(operand),
+        Expression::MemberExpr { object, .. } => expr_contains_add_data_output(object),
+        _ => false,
+    }
+}
 
 #[cfg(test)]
 mod tests {

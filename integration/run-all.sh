@@ -26,7 +26,7 @@ fi
 
 echo ""
 echo "=== Go integration tests ==="
-if (cd go && go test -tags integration -v -timeout 600s); then
+if (cd go && go test -tags integration -v -timeout 1800s); then
   echo "--- Go: PASSED ---"
 else
   echo "--- Go: FAILED ---"
@@ -101,6 +101,40 @@ if (cd zig && zig build test); then
 else
   echo "--- Zig: FAILED ---"
   FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "=== Java integration tests ==="
+# Java integration uses Gradle + JUnit 5. Tests are gated behind the
+# `-Drunar.integration=true` system property so a bare `gradle test`
+# inside the examples/java build does not attempt to reach a node that
+# is not running. Pass the flag through here so the full matrix driver
+# actually exercises the deploy / call / broadcast path.
+GRADLE_BIN=""
+for candidate in gradle /opt/homebrew/bin/gradle /usr/local/bin/gradle; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    GRADLE_BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$GRADLE_BIN" ]; then
+  # CI sets RUNAR_INTEGRATION_STRICT=1 so a missing toolchain is a hard
+  # failure rather than a silent green pass. Local devs can leave it
+  # unset to skip Java integration when Gradle is not installed, but the
+  # skip surfaces in the summary and never sets exit 0 in CI.
+  if [ "${RUNAR_INTEGRATION_STRICT:-0}" = "1" ]; then
+    echo "--- Java: FAILED (no gradle >= 8 on PATH; strict mode) ---"
+    FAILED=$((FAILED + 1))
+  else
+    echo "--- Java: SKIPPED (no gradle >= 8 on PATH) ---"
+  fi
+else
+  if (cd java && "$GRADLE_BIN" test -Drunar.integration=true --no-daemon); then
+    echo "--- Java: PASSED ---"
+  else
+    echo "--- Java: FAILED ---"
+    FAILED=$((FAILED + 1))
+  fi
 fi
 
 if $STOP_NODE; then

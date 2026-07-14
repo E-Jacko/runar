@@ -34,6 +34,8 @@
 //! - `for i in range(n):` -> ForStatement
 //! - snake_case identifiers -> camelCase in AST
 
+use num_bigint::BigInt;
+use num_traits::{Num, ToPrimitive};
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -55,7 +57,7 @@ pub fn parse_python(source: &str, file_name: Option<&str>) -> ParseResult {
 
     let contract = parser.parse_contract();
 
-    ParseResult { contract, errors }
+    ParseResult { contract, errors, source_size_err: None }
 }
 
 // ---------------------------------------------------------------------------
@@ -65,12 +67,23 @@ pub fn parse_python(source: &str, file_name: Option<&str>) -> ParseResult {
 /// Convert snake_case to camelCase. Single words pass through unchanged.
 /// Strips trailing underscore (e.g. `sum_` -> `sum`, `assert_` -> `assert`).
 fn snake_to_camel(name: &str) -> String {
+    // Preserve dunder names (__init__, __foo__) unchanged
+    if name.len() >= 4 && name.starts_with("__") && name.ends_with("__") {
+        return name.to_string();
+    }
+
     // Strip trailing underscore (e.g. assert_ -> assert)
-    let n = if name.ends_with('_') && name != "_" {
+    let mut n: &str = if name.ends_with('_') && name != "_" {
         &name[..name.len() - 1]
     } else {
         name
     };
+
+    // Strip leading single underscore for private methods (Python convention:
+    // _helper -> helper). Matches Go/Python/Zig/Ruby parser behavior.
+    if n.starts_with('_') && !n.starts_with("__") {
+        n = &n[1..];
+    }
 
     let mut result = String::new();
     let mut capitalize_next = false;
@@ -129,7 +142,23 @@ fn map_builtin_name(name: &str) -> String {
         "mul_div" => return "mulDiv".to_string(),
         "percent_of" => return "percentOf".to_string(),
         "add_output" => return "addOutput".to_string(),
+        "add_raw_output" => return "addRawOutput".to_string(),
+        "add_data_output" => return "addDataOutput".to_string(),
         "get_state_script" => return "getStateScript".to_string(),
+        "p256_add" => return "p256Add".to_string(),
+        "p256_mul" => return "p256Mul".to_string(),
+        "p256_mul_gen" => return "p256MulGen".to_string(),
+        "p256_negate" => return "p256Negate".to_string(),
+        "p256_on_curve" => return "p256OnCurve".to_string(),
+        "p256_encode_compressed" => return "p256EncodeCompressed".to_string(),
+        "verify_ecdsa_p256" => return "verifyECDSA_P256".to_string(),
+        "p384_add" => return "p384Add".to_string(),
+        "p384_mul" => return "p384Mul".to_string(),
+        "p384_mul_gen" => return "p384MulGen".to_string(),
+        "p384_negate" => return "p384Negate".to_string(),
+        "p384_on_curve" => return "p384OnCurve".to_string(),
+        "p384_encode_compressed" => return "p384EncodeCompressed".to_string(),
+        "verify_ecdsa_p384" => return "verifyECDSA_P384".to_string(),
         _ => {}
     }
 
@@ -150,17 +179,20 @@ fn map_builtin_name(name: &str) -> String {
 fn map_py_type(name: &str) -> &str {
     match name {
         "Bigint" | "int" | "Int" => "bigint",
-        "bool" => "boolean",
+        "bool" | "Bool" => "boolean",
         "ByteString" | "bytes" => "ByteString",
         "PubKey" => "PubKey",
         "Sig" => "Sig",
         "Addr" => "Addr",
         "Sha256" => "Sha256",
+        "Sha256Digest" => "Sha256",
         "Ripemd160" => "Ripemd160",
         "SigHashPreimage" => "SigHashPreimage",
         "RabinSig" => "RabinSig",
         "RabinPubKey" => "RabinPubKey",
         "Point" => "Point",
+        "P256Point" => "P256Point",
+        "P384Point" => "P384Point",
         _ => name,
     }
 }
@@ -196,7 +228,7 @@ enum Token {
 
     // Identifiers and literals
     Ident(String),
-    NumberLit(i128),
+    NumberLit(BigInt),
     HexStringLit(String),
     StringLit(String),
 
@@ -256,6 +288,10 @@ fn tokenize(source: &str) -> Vec<Token> {
     let lines: Vec<&str> = source.split('\n').collect();
     let mut indent_stack: Vec<usize> = vec![0];
     let mut paren_depth: usize = 0;
+    // When Some(c), we're inside a multi-line triple-quoted string and c is
+    // the quote character (' or ").  Each line is skipped until we find the
+    // closing triple-quote.
+    let mut in_triple_quote: Option<char> = None;
 
     for raw_line in &lines {
         // Strip trailing \r
@@ -265,9 +301,34 @@ fn tokenize(source: &str) -> Vec<Token> {
             raw_line
         };
 
+        // If we're inside a multi-line triple-quoted docstring, skip lines
+        // until we find the closing triple-quote.
+        if let Some(q) = in_triple_quote {
+            let needle: String = std::iter::repeat(q).take(3).collect();
+            if line.contains(&needle) {
+                in_triple_quote = None;
+            }
+            continue;
+        }
+
         // Skip blank lines and comment-only lines (they don't affect indentation)
         let stripped = line.trim_start();
         if stripped.is_empty() || stripped.starts_with('#') {
+            continue;
+        }
+
+        // Skip lines that start with a triple-quoted docstring
+        if stripped.starts_with("\"\"\"") || stripped.starts_with("'''") {
+            let q = stripped.chars().next().unwrap();
+            let needle: String = std::iter::repeat(q).take(3).collect();
+            // Check for closing triple-quote on the same line (after the opener)
+            let after_open = &stripped[3..];
+            if after_open.contains(&needle) {
+                // Single-line docstring
+            } else {
+                // Multi-line docstring
+                in_triple_quote = Some(q);
+            }
             continue;
         }
 
@@ -553,9 +614,29 @@ fn tokenize(source: &str) -> Vec<Token> {
                 continue;
             }
 
-            // String literals (single or double quoted)
+            // String literals (single or double quoted, including triple-quoted)
             if ch == '\'' || ch == '"' {
                 let quote = ch;
+                // Triple-quoted string — always a docstring in Rúnar.
+                // Skip it without emitting a token.
+                if pos + 2 < chars.len() && chars[pos + 1] == quote && chars[pos + 2] == quote {
+                    pos += 3;
+                    while pos + 2 < chars.len() {
+                        if chars[pos] == quote
+                            && chars[pos + 1] == quote
+                            && chars[pos + 2] == quote
+                        {
+                            break;
+                        }
+                        pos += 1;
+                    }
+                    if pos + 2 < chars.len() {
+                        pos += 3;
+                    } else {
+                        pos = chars.len();
+                    }
+                    continue;
+                }
                 pos += 1;
                 let mut val = String::new();
                 while pos < chars.len() && chars[pos] != quote {
@@ -604,9 +685,11 @@ fn tokenize(source: &str) -> Vec<Token> {
                     }
                 }
                 let val = if num_str.starts_with("0x") || num_str.starts_with("0X") {
-                    i128::from_str_radix(&num_str[2..], 16).unwrap_or(0)
+                    <BigInt as Num>::from_str_radix(&num_str[2..], 16)
+                        .unwrap_or_else(|_| BigInt::from(0))
                 } else {
-                    num_str.parse::<i128>().unwrap_or(0)
+                    <BigInt as Num>::from_str_radix(&num_str, 10)
+                        .unwrap_or_else(|_| BigInt::from(0))
                 };
                 tokens.push(Token::NumberLit(val));
                 continue;
@@ -779,7 +862,10 @@ impl<'a> PyParser<'a> {
         self.expect(&Token::Indent);
         self.skip_newlines();
 
-        if parent_class != "SmartContract" && parent_class != "StatefulSmartContract" {
+        if parent_class != "SmartContract"
+            && parent_class != "StatefulSmartContract"
+            && parent_class != "UnsafeSmartContract"
+        {
             self.errors.push(Diagnostic::error(format!(
                 "Unknown parent class: {}",
                 parent_class
@@ -915,8 +1001,9 @@ impl<'a> PyParser<'a> {
             type_node = self.parse_type();
         }
 
-        // In stateless contracts, all properties are readonly
-        if parent_class == "SmartContract" {
+        // In stateless contracts (SmartContract and UnsafeSmartContract), all
+        // properties are readonly.
+        if parent_class == "SmartContract" || parent_class == "UnsafeSmartContract" {
             is_readonly = true;
         }
 
@@ -942,6 +1029,8 @@ impl<'a> PyParser<'a> {
             readonly: is_readonly,
             initializer,
             source_location: self.loc(),
+            synthetic_array_chain: None,
+            embed_always: false,
         })
     }
 
@@ -958,7 +1047,7 @@ impl<'a> PyParser<'a> {
             let element = self.parse_type();
             self.expect(&Token::Comma);
             let length = match self.advance() {
-                Token::NumberLit(n) => n as usize,
+                Token::NumberLit(n) => n.to_usize().unwrap_or(0),
                 _ => {
                     self.errors
                         .push(Diagnostic::error("FixedArray requires numeric length", None));
@@ -1021,6 +1110,7 @@ impl<'a> PyParser<'a> {
                 body,
                 visibility: Visibility::Public,
                 source_location: self.loc(),
+                sighash_type: None,
             };
         }
 
@@ -1037,6 +1127,7 @@ impl<'a> PyParser<'a> {
                 Visibility::Private
             },
             source_location: self.loc(),
+            sighash_type: None,
         }
     }
 
@@ -1141,6 +1232,7 @@ impl<'a> PyParser<'a> {
                     name: "assert".to_string(),
                 }),
                 args: vec![expr],
+                asm_return_type: None,
             },
             source_location: self.loc(),
         }
@@ -1227,7 +1319,7 @@ impl<'a> PyParser<'a> {
             let second_arg = self.parse_expression();
             (first_arg, second_arg)
         } else {
-            (Expression::BigIntLiteral { value: 0 }, first_arg)
+            (Expression::BigIntLiteral { value: BigInt::from(0) }, first_arg)
         };
 
         self.expect(&Token::RParen);
@@ -1320,6 +1412,7 @@ impl<'a> PyParser<'a> {
                     name: "super".to_string(),
                 }),
                 args,
+                asm_return_type: None,
             },
             source_location: self.loc(),
         }
@@ -1442,7 +1535,7 @@ impl<'a> PyParser<'a> {
             let init = if self.match_tok(&Token::Eq) {
                 self.parse_expression()
             } else {
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             };
 
             return Statement::VariableDecl {
@@ -1903,6 +1996,7 @@ impl<'a> PyParser<'a> {
                                     property: prop,
                                 }),
                                 args,
+                                asm_return_type: None,
                             };
                         } else {
                             expr = Expression::CallExpr {
@@ -1911,6 +2005,7 @@ impl<'a> PyParser<'a> {
                                     property: prop,
                                 }),
                                 args,
+                                asm_return_type: None,
                             };
                         }
                     } else {
@@ -1930,6 +2025,7 @@ impl<'a> PyParser<'a> {
                     expr = Expression::CallExpr {
                         callee: Box::new(expr),
                         args,
+                        asm_return_type: None,
                     };
                 }
                 Token::LBracket => {
@@ -1953,7 +2049,7 @@ impl<'a> PyParser<'a> {
             Token::NumberLit(v) => Expression::BigIntLiteral { value: v },
             Token::TrueLit => Expression::BoolLiteral { value: true },
             Token::FalseLit => Expression::BoolLiteral { value: false },
-            Token::NoneLit => Expression::BigIntLiteral { value: 0 },
+            Token::NoneLit => Expression::BigIntLiteral { value: BigInt::from(0) },
             Token::HexStringLit(v) => Expression::ByteStringLiteral { value: v },
             Token::StringLit(v) => Expression::ByteStringLiteral { value: v },
             Token::SelfKw => {
@@ -2000,10 +2096,23 @@ impl<'a> PyParser<'a> {
                 self.expect(&Token::RParen);
                 expr
             }
+            Token::LBracket => {
+                // Array literal: [a, b, c]
+                let mut elements: Vec<Expression> = Vec::new();
+                while !matches!(self.peek(), Token::RBracket | Token::Eof) {
+                    elements.push(self.parse_expression());
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    self.advance();
+                }
+                self.expect(&Token::RBracket);
+                Expression::ArrayLiteral { elements }
+            }
             other => {
                 self.errors
                     .push(Diagnostic::error(format!("Unexpected token in expression: {:?}", other), None));
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             }
         }
     }
@@ -2056,6 +2165,7 @@ fn build_constructor(properties: &[PropertyNode], file: &str) -> MethodNode {
                 name: "super".to_string(),
             }),
             args: super_args,
+            asm_return_type: None,
         },
         source_location: SourceLocation {
             file: file.to_string(),
@@ -2091,6 +2201,7 @@ fn build_constructor(properties: &[PropertyNode], file: &str) -> MethodNode {
             line: 1,
             column: 0,
         },
+        sighash_type: None,
     }
 }
 

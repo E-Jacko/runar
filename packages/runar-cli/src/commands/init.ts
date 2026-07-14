@@ -5,7 +5,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-type Lang = 'ts' | 'zig';
+type Lang = 'ts' | 'zig' | 'go' | 'rust' | 'python' | 'ruby';
+
+const SUPPORTED_LANGS: readonly Lang[] = ['ts', 'zig', 'go', 'rust', 'python', 'ruby'] as const;
 
 interface InitOptions {
   lang: Lang;
@@ -17,8 +19,8 @@ interface InitOptions {
  */
 export async function initCommand(name: string | undefined, options: InitOptions): Promise<void> {
   const lang = options.lang;
-  if (lang !== 'ts' && lang !== 'zig') {
-    console.error(`Unsupported language: ${lang}. Supported: ts, zig`);
+  if (!SUPPORTED_LANGS.includes(lang)) {
+    console.error(`Unsupported language: ${lang}. Supported: ${SUPPORTED_LANGS.join(', ')}`);
     process.exitCode = 1;
     return;
   }
@@ -32,11 +34,30 @@ export async function initCommand(name: string | undefined, options: InitOptions
     scaffoldZig(projectDir, projectName);
     return;
   }
+  if (lang === 'go') {
+    scaffoldGo(projectDir, projectName);
+    return;
+  }
+  if (lang === 'rust') {
+    scaffoldRust(projectDir, projectName);
+    return;
+  }
+  if (lang === 'python') {
+    scaffoldPython(projectDir, projectName);
+    return;
+  }
+  if (lang === 'ruby') {
+    scaffoldRuby(projectDir, projectName);
+    return;
+  }
 
-  // Create directory structure
+  // Create directory structure. Matches the documented reference layout
+  // in `runar-tic-tac-toe` (single root package.json, namespaced scripts,
+  // artifact output under `contract/artifacts/`).
   const dirs = [
     projectDir,
     path.join(projectDir, 'contract'),
+    path.join(projectDir, 'contract', 'artifacts'),
     path.join(projectDir, 'contract', 'integration'),
     path.join(projectDir, 'src'),
     path.join(projectDir, 'src', 'generated'),
@@ -45,36 +66,6 @@ export async function initCommand(name: string | undefined, options: InitOptions
   for (const dir of dirs) {
     fs.mkdirSync(dir, { recursive: true });
   }
-
-  // -------------------------------------------------------------------------
-  // contract/package.json
-  // -------------------------------------------------------------------------
-  const contractPackageJson = {
-    name: `${projectName}-contract`,
-    version: '0.1.0',
-    private: true,
-    type: 'module',
-    scripts: {
-      compile: 'runar compile P2PKH.runar.ts -o .',
-      test: 'vitest run',
-      'test:watch': 'vitest',
-      typecheck: 'tsc --noEmit',
-      debug: 'runar debug P2PKH.runar.json',
-    },
-    devDependencies: {
-      'fast-check': '^3.22.0',
-      'runar-cli': '^0.3.0',
-      'runar-compiler': '^0.3.0',
-      'runar-lang': '^0.3.0',
-      'runar-testing': '^0.3.0',
-      typescript: '^5.6.0',
-      vitest: '^2.1.0',
-    },
-  };
-  fs.writeFileSync(
-    path.join(projectDir, 'contract', 'package.json'),
-    JSON.stringify(contractPackageJson, null, 2) + '\n',
-  );
 
   // -------------------------------------------------------------------------
   // contract/tsconfig.json
@@ -105,6 +96,21 @@ export async function initCommand(name: string | undefined, options: InitOptions
     `import { defineConfig } from 'vitest/config';
 
 export default defineConfig({});
+`,
+  );
+
+  // -------------------------------------------------------------------------
+  // contract/integration/vitest.config.ts
+  // -------------------------------------------------------------------------
+  fs.writeFileSync(
+    path.join(projectDir, 'contract', 'integration', 'vitest.config.ts'),
+    `import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    testTimeout: 60_000,
+  },
+});
 `,
   );
 
@@ -188,34 +194,10 @@ describe('P2PKH', () => {
   );
 
   // -------------------------------------------------------------------------
-  // contract/integration/package.json
-  // -------------------------------------------------------------------------
-  const integrationPackageJson = {
-    name: `${projectName}-integration`,
-    version: '0.1.0',
-    private: true,
-    type: 'module',
-    scripts: {
-      test: 'vitest run',
-    },
-    dependencies: {
-      'runar-compiler': '^0.3.0',
-      'runar-sdk': '^0.3.0',
-      'runar-lang': '^0.3.0',
-      'runar-ir-schema': '^0.3.0',
-      '@bsv/sdk': '^2.0.7',
-    },
-    devDependencies: {
-      vitest: '^2.1.0',
-    },
-  };
-  fs.writeFileSync(
-    path.join(projectDir, 'contract', 'integration', 'package.json'),
-    JSON.stringify(integrationPackageJson, null, 2) + '\n',
-  );
-
-  // -------------------------------------------------------------------------
-  // Root package.json
+  // Single root package.json. Namespaced scripts (`contract:test`,
+  // `contract:compile`, `codegen`, etc.) keep the project to one
+  // `npm install`, one `node_modules`, one lockfile. Matches the
+  // documented reference layout in `runar-tic-tac-toe`.
   // -------------------------------------------------------------------------
   const rootPackageJson = {
     name: projectName,
@@ -224,19 +206,30 @@ describe('P2PKH', () => {
     private: true,
     type: 'module',
     scripts: {
-      compile: 'cd contract && npm run compile',
-      codegen: 'runar codegen contract/*.runar.json -o src/generated/ --lang ts',
-      build: 'npm run compile && npm run codegen',
-      test: 'cd contract && npm test',
-      'test:integration': 'cd contract/integration && npm test',
+      'contract:compile': 'cd contract && runar compile P2PKH.runar.ts -o artifacts',
+      'contract:test': 'cd contract && vitest run',
+      'contract:test:watch': 'cd contract && vitest',
+      'contract:test:integration': 'cd contract/integration && vitest run',
+      'contract:typecheck': 'cd contract && tsc --noEmit',
+      'contract:debug': 'cd contract && runar debug artifacts/P2PKH.runar.json',
+      codegen:
+        'npm run contract:compile && runar codegen contract/artifacts/P2PKH.runar.json -o src/generated/ --lang ts',
+      build: 'npm run codegen',
+      test: 'npm run contract:test',
     },
     dependencies: {
-      'runar-lang': '^0.3.0',
-      'runar-sdk': '^0.3.0',
+      '@bsv/sdk': '^2.0.7',
+      'runar-lang': '^0.5.0',
+      'runar-sdk': '^0.5.0',
     },
     devDependencies: {
-      'runar-cli': '^0.3.0',
+      '@types/node': '^20.0.0',
+      'runar-cli': '^0.5.0',
+      'runar-compiler': '^0.5.0',
+      'runar-ir-schema': '^0.5.0',
+      'runar-testing': '^0.5.0',
       typescript: '^5.6.0',
+      vitest: '^2.1.0',
     },
   };
   fs.writeFileSync(
@@ -273,7 +266,7 @@ describe('P2PKH', () => {
   const gitignore = `node_modules/
 dist/
 src/generated/
-contract/*.runar.json
+contract/artifacts/
 .env
 `;
   fs.writeFileSync(path.join(projectDir, '.gitignore'), gitignore);
@@ -288,110 +281,106 @@ A [Rúnar](https://github.com/icellan/runar) smart contract project.
 ## Project Structure
 
 \`\`\`
-contract/           Smart contract source, unit tests, and integration tests
-src/generated/      Compiled artifacts and generated typed wrappers (auto-generated)
-src/                Application source code
+package.json            Single root install — namespaced scripts (no per-subdir npm install)
+contract/
+  P2PKH.runar.ts        Smart contract source
+  P2PKH.test.ts         Unit tests (vitest + TestContract)
+  artifacts/            Compiled artifact JSON (gitignored, produced by \`contract:compile\`)
+  integration/          On-chain regtest tests
+src/
+  generated/            Codegen output (typed wrapper) — gitignored
 \`\`\`
 
 ## Getting Started
 
-### 1. Install dependencies
+### 1. Install
 
 \`\`\`bash
-cd contract
-npm install
-cd ..
 npm install
 \`\`\`
+
+One install at the root covers contract, tests, codegen, and integration tests.
 
 ### 2. Run contract unit tests
 
 \`\`\`bash
-cd contract
-npm test
+npm run contract:test
 \`\`\`
 
-This runs the contract through the TestContract interpreter with mocked crypto.
+Runs the contract through the \`TestContract\` interpreter with mocked crypto.
 No blockchain needed — fast feedback during development.
 
 ### 3. Compile the contract
 
 \`\`\`bash
-cd contract
-npm run compile
+npm run contract:compile
 \`\`\`
 
-This produces \`P2PKH.runar.json\` — the compiled artifact containing the
-Bitcoin Script, ABI, state fields, and constructor slots.
+Produces \`contract/artifacts/P2PKH.runar.json\` — the compiled artifact
+containing the Bitcoin Script, ABI, state fields, and constructor slots.
 
-### 4. Debug contract execution (optional)
+### 4. Generate the typed wrapper
 
 \`\`\`bash
-cd contract
-npm run debug
+npm run codegen
+\`\`\`
+
+Compiles the contract and regenerates \`src/generated/P2PKHContract.ts\` — the
+typed client wrapper your application code imports.
+
+### 5. Debug contract execution (optional)
+
+\`\`\`bash
+npm run contract:debug
 \`\`\`
 
 Step through the compiled Bitcoin Script opcode-by-opcode with source mapping.
 
 ## Workflow
 
-### Phase 1: Develop the contract
-
-Work entirely in \`contract/\`. Write your contract logic, run unit tests,
-and iterate until the contract behaves correctly.
+### Develop the contract
 
 \`\`\`bash
-cd contract
-npm test              # run unit tests
-npm run test:watch    # re-run on file changes
-npm run typecheck     # verify types
-npm run compile       # compile to artifact
-npm run debug         # step through Bitcoin Script
+npm run contract:test          # run unit tests
+npm run contract:test:watch    # watch mode
+npm run contract:typecheck     # type-check contract + tests
+npm run contract:compile       # compile to artifact
+npm run contract:debug         # step through Bitcoin Script
 \`\`\`
 
-### Phase 2: Integration test against regtest (optional)
+### Integration test against regtest (optional)
 
 Once unit tests pass, test on-chain behavior against a local regtest node.
 
 \`\`\`bash
-cd contract/integration
-npm install
-npm test
+npm run contract:test:integration
 \`\`\`
 
-This deploys the contract to regtest, calls methods, and verifies
-on-chain state. Requires a running BSV regtest node.
+Deploys the contract to regtest, calls methods, and verifies on-chain state.
+Requires a running BSV regtest node.
 
-### Phase 3: Generate the typed wrapper
-
-From the project root:
+### Build the typed wrapper
 
 \`\`\`bash
 npm run build
 \`\`\`
 
-This runs \`compile\` then \`codegen\`, producing:
-- \`src/generated/P2PKH.runar.json\` — compiled artifact
+Runs \`contract:compile\` then \`codegen\`, producing:
+- \`contract/artifacts/P2PKH.runar.json\` — compiled artifact
 - \`src/generated/P2PKHContract.ts\` — typed wrapper class
 
-### Phase 4: Build your application
-
-Import the generated wrapper in your application code:
+### Use the wrapper in your application
 
 \`\`\`typescript
 import { P2PKHContract } from './generated/P2PKHContract.js';
-import artifact from './generated/P2PKH.runar.json';
+import artifact from '../contract/artifacts/P2PKH.runar.json' with { type: 'json' };
 
 const contract = new P2PKHContract(artifact, { pubKeyHash: '...' });
 contract.connect(provider, signer);
 await contract.deploy({ satoshis: 1000 });
 \`\`\`
 
-The wrapper provides type-safe method stubs matching your contract's ABI.
-
-### Phase 5: Deploy to mainnet
-
-Configure a mainnet provider and signer, then deploy:
+### Deploy to mainnet
 
 \`\`\`typescript
 import { WhatsOnChainProvider, LocalSigner } from 'runar-sdk';
@@ -403,25 +392,17 @@ contract.connect(provider, signer);
 
 ## Available Scripts
 
-### In \`contract/\`
-
-| Script              | Description                              |
-|---------------------|------------------------------------------|
-| \`npm test\`          | Run unit tests                           |
-| \`npm run test:watch\`| Run tests in watch mode                  |
-| \`npm run compile\`   | Compile contract to artifact (.json)     |
-| \`npm run typecheck\` | Type-check contract and tests            |
-| \`npm run debug\`     | Debug compiled script step-by-step       |
-
-### In project root
-
-| Script                    | Description                            |
-|---------------------------|----------------------------------------|
-| \`npm run compile\`         | Compile contract (delegates to contract/) |
-| \`npm run codegen\`         | Generate typed wrapper from artifact   |
-| \`npm run build\`           | Compile + codegen                      |
-| \`npm test\`                | Run contract unit tests                |
-| \`npm run test:integration\`| Run integration tests (regtest)        |
+| Script                            | Description                                |
+|-----------------------------------|--------------------------------------------|
+| \`npm run contract:compile\`         | Compile contract → \`contract/artifacts/\`     |
+| \`npm run contract:test\`            | Run unit tests (interpreter, no chain)     |
+| \`npm run contract:test:watch\`      | Unit tests in watch mode                   |
+| \`npm run contract:test:integration\`| Integration tests (regtest, requires node) |
+| \`npm run contract:typecheck\`       | Type-check contract and tests              |
+| \`npm run contract:debug\`           | Step through compiled Bitcoin Script       |
+| \`npm run codegen\`                  | Compile + generate typed wrapper           |
+| \`npm run build\`                    | Alias for \`codegen\`                         |
+| \`npm test\`                         | Alias for \`contract:test\`                   |
 `;
   fs.writeFileSync(path.join(projectDir, 'README.md'), readme);
 
@@ -431,15 +412,10 @@ contract.connect(provider, signer);
   console.log(`Project created at: ${projectDir}`);
   console.log('');
   console.log('Next steps:');
-  console.log(`  cd ${projectName}/contract`);
-  console.log('  npm install');
-  console.log('  npm test                    # run contract unit tests');
-  console.log('  npm run compile             # compile to artifact');
-  console.log('');
-  console.log('Then from the project root:');
   console.log(`  cd ${projectName}`);
   console.log('  npm install');
-  console.log('  npm run build               # compile + codegen');
+  console.log('  npm run contract:test       # run contract unit tests');
+  console.log('  npm run build               # compile + generate typed wrapper');
 }
 
 // ---------------------------------------------------------------------------
@@ -542,4 +518,285 @@ test "compile-check P2PKH.runar.zig" {
   console.log('Next steps:');
   console.log(`  cd ${projectName}`);
   console.log('  zig build test              # run contract compile-check tests');
+}
+
+// ---------------------------------------------------------------------------
+// Go scaffolding
+// ---------------------------------------------------------------------------
+
+function scaffoldGo(projectDir: string, projectName: string): void {
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  fs.writeFileSync(path.join(projectDir, 'go.mod'), `module ${projectName}
+
+go 1.22
+
+require github.com/icellan/runar v0.0.0
+`);
+
+  fs.writeFileSync(path.join(projectDir, 'Counter.runar.go'), `package contract
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+// Counter is a minimal stateful contract.
+//
+// Because this struct embeds runar.StatefulSmartContract, the compiler
+// injects checkPreimage on entry and state continuation on exit.
+type Counter struct {
+\truncar.StatefulSmartContract
+\tCount runar.Bigint // no tag = mutable (stateful)
+}
+
+func (c *Counter) Increment() {
+\tc.Count++
+}
+
+func (c *Counter) Decrement() {
+\trunar.Assert(c.Count > 0)
+\tc.Count--
+}
+`);
+
+  fs.writeFileSync(path.join(projectDir, 'Counter_test.go'), `package contract
+
+import (
+\t"testing"
+\trunar "github.com/icellan/runar/packages/runar-go"
+)
+
+func TestCounter_Increment(t *testing.T) {
+\tc := &Counter{Count: 0}
+\tc.Increment()
+\tif c.Count != 1 {
+\t\tt.Errorf("expected Count=1, got %d", c.Count)
+\t}
+}
+
+func TestCounter_Compile(t *testing.T) {
+\tif err := runar.CompileCheck("Counter.runar.go"); err != nil {
+\t\tt.Fatalf("Runar compile check failed: %v", err)
+\t}
+}
+`);
+
+  fs.writeFileSync(path.join(projectDir, '.gitignore'), `*.exe
+*.test
+*.out
+`);
+
+  console.log(`Project created at: ${projectDir}`);
+  console.log('');
+  console.log('Next steps:');
+  console.log(`  cd ${projectName}`);
+  console.log('  go test ./...               # run contract + compile-check tests');
+}
+
+// ---------------------------------------------------------------------------
+// Rust scaffolding
+// ---------------------------------------------------------------------------
+
+function scaffoldRust(projectDir: string, projectName: string): void {
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(path.join(projectDir, 'tests'), { recursive: true });
+
+  fs.writeFileSync(path.join(projectDir, 'Cargo.toml'), `[package]
+name = "${projectName}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+runar = { path = "../packages/runar-rs", package = "runar-rs" }
+
+[[test]]
+name = "counter_test"
+path = "tests/Counter_test.rs"
+`);
+
+  fs.writeFileSync(path.join(projectDir, 'Counter.runar.rs'), `use runar::prelude::*;
+
+/// Counter — a minimal stateful smart contract.
+#[runar::contract]
+pub struct Counter {
+    pub count: Bigint,
+}
+
+impl Counter {
+    pub fn increment(&mut self) {
+        self.count += 1;
+    }
+
+    pub fn decrement(&mut self) {
+        assert!(self.count > 0);
+        self.count -= 1;
+    }
+}
+`);
+
+  fs.writeFileSync(path.join(projectDir, 'tests', 'Counter_test.rs'), `#[path = "../Counter.runar.rs"]
+mod contract;
+
+use contract::*;
+
+#[test]
+fn test_increment() {
+    let mut c = Counter { count: 0 };
+    c.increment();
+    assert_eq!(c.count, 1);
+}
+
+#[test]
+fn test_compile() {
+    runar::compile_check(include_str!("../Counter.runar.rs"), "Counter.runar.rs").unwrap();
+}
+`);
+
+  fs.writeFileSync(path.join(projectDir, '.gitignore'), `target/
+Cargo.lock
+`);
+
+  console.log(`Project created at: ${projectDir}`);
+  console.log('');
+  console.log('Next steps:');
+  console.log(`  cd ${projectName}`);
+  console.log('  cargo test                  # run contract + compile-check tests');
+}
+
+// ---------------------------------------------------------------------------
+// Python scaffolding
+// ---------------------------------------------------------------------------
+
+function scaffoldPython(projectDir: string, projectName: string): void {
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  fs.writeFileSync(path.join(projectDir, 'Counter.runar.py'), `from runar import StatefulSmartContract, Bigint, public, assert_
+
+
+class Counter(StatefulSmartContract):
+    """Counter -- a minimal stateful smart contract."""
+
+    count: Bigint  # mutable (stateful)
+
+    def __init__(self, count: Bigint):
+        super().__init__(count)
+        self.count = count
+
+    @public
+    def increment(self):
+        self.count += 1
+
+    @public
+    def decrement(self):
+        assert_(self.count > 0)
+        self.count -= 1
+`);
+
+  fs.writeFileSync(path.join(projectDir, 'test_counter.py'), `import importlib.util
+from pathlib import Path
+
+
+def load_contract(path: str):
+    spec = importlib.util.spec_from_file_location("contract", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+contract_mod = load_contract(str(Path(__file__).parent / "Counter.runar.py"))
+Counter = contract_mod.Counter
+
+
+def test_increment():
+    c = Counter(count=0)
+    c.increment()
+    assert c.count == 1
+
+
+def test_compile():
+    from runar import compile_check
+    source_path = Path(__file__).parent / "Counter.runar.py"
+    compile_check(source_path.read_text(), "Counter.runar.py")
+`);
+
+  fs.writeFileSync(path.join(projectDir, 'requirements.txt'), `# Point PYTHONPATH at packages/runar-py to import the runar module.
+`);
+
+  fs.writeFileSync(path.join(projectDir, '.gitignore'), `__pycache__/
+*.pyc
+.venv/
+`);
+
+  console.log(`Project created at: ${projectDir}`);
+  console.log('');
+  console.log('Next steps:');
+  console.log(`  cd ${projectName}`);
+  console.log('  PYTHONPATH=../packages/runar-py python3 -m pytest');
+}
+
+// ---------------------------------------------------------------------------
+// Ruby scaffolding
+// ---------------------------------------------------------------------------
+
+function scaffoldRuby(projectDir: string, projectName: string): void {
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  fs.writeFileSync(path.join(projectDir, 'Gemfile'), `source 'https://rubygems.org'
+
+gem 'rspec'
+# Uses the local runar-rb gem checkout.
+gem 'runar', path: '../packages/runar-rb'
+`);
+
+  fs.writeFileSync(path.join(projectDir, 'Counter.runar.rb'), `require 'runar'
+
+class Counter < Runar::StatefulSmartContract
+  prop :count, Bigint
+
+  def initialize(count)
+    super(count)
+    @count = count
+  end
+
+  runar_public
+  def increment
+    @count += 1
+  end
+
+  runar_public
+  def decrement
+    assert @count > 0
+    @count -= 1
+  end
+end
+`);
+
+  fs.writeFileSync(path.join(projectDir, 'counter_spec.rb'), `# frozen_string_literal: true
+
+require 'rspec'
+require_relative 'Counter.runar'
+
+RSpec.describe Counter do
+  it 'increments' do
+    c = Counter.new(0)
+    c.increment
+    expect(c.count).to eq(1)
+  end
+
+  it 'fails to decrement at zero' do
+    c = Counter.new(0)
+    expect { c.decrement }.to raise_error(RuntimeError)
+  end
+end
+`);
+
+  fs.writeFileSync(path.join(projectDir, '.gitignore'), `*.gem
+.bundle/
+vendor/bundle/
+`);
+
+  console.log(`Project created at: ${projectDir}`);
+  console.log('');
+  console.log('Next steps:');
+  console.log(`  cd ${projectName}`);
+  console.log('  bundle install');
+  console.log('  bundle exec rspec counter_spec.rb');
 }

@@ -100,6 +100,9 @@ module RunarCompiler
       "verify_slh_dsa_sha2_256s"     => "verifySLHDSA_SHA2_256s",
       "verify_slh_dsa_sha2_256f"     => "verifySLHDSA_SHA2_256f",
       "verify_rabin_sig"             => "verifyRabinSig",
+      # NIST EC curves -- snake_case forms used in Python contracts.
+      "verify_ecdsa_p256"            => "verifyECDSA_P256",
+      "verify_ecdsa_p384"            => "verifyECDSA_P384",
       "ec_add"                       => "ecAdd",
       "ec_mul"                       => "ecMul",
       "ec_mul_gen"                   => "ecMulGen",
@@ -112,6 +115,7 @@ module RunarCompiler
       "ec_point_y"                   => "ecPointY",
       "add_output"                   => "addOutput",
       "add_raw_output"               => "addRawOutput",
+      "add_data_output"              => "addDataOutput",
       "get_state_script"             => "getStateScript",
       "extract_locktime"             => "extractLocktime",
       "extract_output_hash"          => "extractOutputHash",
@@ -227,6 +231,7 @@ module RunarCompiler
       "PubKey"          => "PubKey",
       "Sig"             => "Sig",
       "Sha256"          => "Sha256",
+      "Sha256Digest"    => "Sha256",
       "Ripemd160"       => "Ripemd160",
       "Addr"            => "Addr",
       "SigHashPreimage" => "SigHashPreimage",
@@ -688,7 +693,7 @@ module RunarCompiler
         expect(TOK_INDENT)
         skip_newlines
 
-        unless %w[SmartContract StatefulSmartContract].include?(parent_class)
+        unless %w[SmartContract StatefulSmartContract UnsafeSmartContract].include?(parent_class)
           add_error("Unknown parent class: #{parent_class}")
           raise "Unknown parent class: #{parent_class}"
         end
@@ -779,8 +784,9 @@ module RunarCompiler
           type_node = parse_type
         end
 
-        # In stateless contracts, all properties are readonly
-        is_readonly = true if parent_class == "SmartContract"
+        # In stateless contracts (SmartContract and UnsafeSmartContract), all
+        # properties are readonly.
+        is_readonly = true if parent_class == "SmartContract" || parent_class == "UnsafeSmartContract"
 
         # Check for initializer: = value
         initializer = nil
@@ -1586,7 +1592,7 @@ module RunarCompiler
             break unless match_tok(TOK_COMMA)
           end
           expect(TOK_RBRACKET)
-          return CallExpr.new(callee: Identifier.new(name: "FixedArray"), args: elements)
+          return ArrayLiteralExpr.new(elements: elements)
         end
 
         # bytes.fromhex("...")
@@ -1640,9 +1646,9 @@ module RunarCompiler
         rescue ArgumentError
           0
         end
-        if val > INT64_MAX || val < INT64_MIN
-          return BigIntLiteral.new(value: 0)
-        end
+        # No int64 clamp: BigIntLiteral carries arbitrary-precision Integer
+        # values end-to-end. _make_load_const_int promotes oversize values to
+        # a `"...n"` decimal-string for cross-tier JSON round-trip parity.
         BigIntLiteral.new(value: val)
       end
     end

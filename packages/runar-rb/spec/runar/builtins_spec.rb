@@ -51,40 +51,52 @@ RSpec.describe Runar::Builtins do
       expect(ctx.verify_rabin_sig('a', 'b', 'c', 'd')).to be false
     end
 
-    it 'verify_wots returns true' do
-      expect(ctx.verify_wots('a', 'b', 'c')).to be true
+    it 'verify_wots rejects obviously invalid inputs' do
+      # Previously this mock returned true for any input; the real verifier
+      # must return false for garbage. See wots_spec.rb for round-trip tests.
+      expect(ctx.verify_wots('a', 'b', 'c')).to be false
     end
 
-    it 'SLH-DSA variants all return true' do
+    it 'SLH-DSA variants all reject obviously invalid inputs' do
+      # Previously these mocks returned true for any input; the real
+      # verifiers must return false for garbage. See slh_dsa_spec.rb for
+      # round-trip tests.
       %i[
         verify_slh_dsa_sha2_128s verify_slh_dsa_sha2_128f
         verify_slh_dsa_sha2_192s verify_slh_dsa_sha2_192f
         verify_slh_dsa_sha2_256s verify_slh_dsa_sha2_256f
       ].each do |method|
-        expect(ctx.send(method, 'a', 'b', 'c')).to be true
+        expect(ctx.send(method, 'a', 'b', 'c')).to be false
       end
     end
 
-    it 'blake3_compress returns 64-char hex string of zeros' do
+    it 'blake3_compress returns a 64-char hex string' do
       result = ctx.blake3_compress('00' * 32, '00' * 64)
-      expect(result).to eq('00' * 32)
+      expect(result.length).to eq(64)
+      expect(result).to match(/\A[0-9a-f]{64}\z/)
+      # Real implementation: compressing all-zero CV+block is non-zero.
+      expect(result).not_to eq('00' * 32)
+    end
+
+    it 'blake3_compress is deterministic over arbitrary hex input' do
+      result1 = ctx.blake3_compress('ab' * 32, 'cd' * 64)
+      result2 = ctx.blake3_compress('ab' * 32, 'cd' * 64)
+      expect(result1).to eq(result2)
+      expect(result1.length).to eq(64)
+    end
+
+    it 'blake3_hash returns a 64-char hex string with pinned empty-input value' do
+      # Empty input → official BLAKE3 KAT (standard single-block, 0..64 bytes).
+      result = ctx.blake3_hash('')
+      expect(result).to eq('af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262')
       expect(result.length).to eq(64)
     end
 
-    it 'blake3_compress accepts arbitrary hex input' do
-      result = ctx.blake3_compress('ab' * 32, 'cd' * 64)
-      expect(result).to eq('00' * 32)
-    end
-
-    it 'blake3_hash returns 64-char hex string of zeros' do
-      result = ctx.blake3_hash('deadbeef')
-      expect(result).to eq('00' * 32)
-      expect(result.length).to eq(64)
-    end
-
-    it 'blake3_hash accepts arbitrary hex input' do
-      result = ctx.blake3_hash('ff' * 64)
-      expect(result).to eq('00' * 32)
+    it 'blake3_hash accepts arbitrary hex input and agrees cross-language' do
+      # 'abc' hex-encoded — official BLAKE3 KAT, same value as TS and Python runtime.
+      expect(ctx.blake3_hash('616263')).to eq(
+        '6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85'
+      )
     end
   end
 

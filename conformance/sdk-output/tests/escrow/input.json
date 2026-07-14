@@ -1,0 +1,89 @@
+{
+  "artifact": {
+    "version": "runar-v1.0.0-rc.1",
+    "compilerVersion": "1.0.0-rc.1",
+    "contractName": "Escrow",
+    "parentClass": "SmartContract",
+    "abi": {
+      "constructor": {
+        "params": [
+          {
+            "name": "buyer",
+            "type": "PubKey"
+          },
+          {
+            "name": "seller",
+            "type": "PubKey"
+          },
+          {
+            "name": "arbiter",
+            "type": "PubKey"
+          }
+        ]
+      },
+      "methods": [
+        {
+          "name": "release",
+          "params": [
+            {
+              "name": "sellerSig",
+              "type": "Sig"
+            },
+            {
+              "name": "arbiterSig",
+              "type": "Sig"
+            }
+          ],
+          "isPublic": true
+        },
+        {
+          "name": "refund",
+          "params": [
+            {
+              "name": "buyerSig",
+              "type": "Sig"
+            },
+            {
+              "name": "arbiterSig",
+              "type": "Sig"
+            }
+          ],
+          "isPublic": true
+        }
+      ]
+    },
+    "script": "76009c63757c00ad00ac67519d7c00ad00ac68",
+    "constructorSlots": [
+      {
+        "paramIndex": 1,
+        "byteOffset": 6
+      },
+      {
+        "paramIndex": 2,
+        "byteOffset": 8
+      },
+      {
+        "paramIndex": 0,
+        "byteOffset": 14
+      },
+      {
+        "paramIndex": 2,
+        "byteOffset": 16
+      }
+    ]
+  },
+  "constructorArgs": [
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    },
+    {
+      "type": "PubKey",
+      "value": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    }
+  ]
+}

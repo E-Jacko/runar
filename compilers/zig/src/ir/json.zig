@@ -5,6 +5,8 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const opcodes = @import("../codegen/opcodes.zig");
+const unknown_anf_kind = @import("unknown_anf_kind.zig");
 
 const ParseError = error{
     MissingField,
@@ -14,17 +16,82 @@ const ParseError = error{
     InvalidConstValue,
     UnexpectedValueType,
     MaxRecursionDepthExceeded,
+    // BUG-008 follow-up: typed DoS-bound rejection of oversized IR JSON.
+    IRSizeExceeded,
 };
 
 const max_parse_depth: u32 = 256;
+
+/// Mirrors InputLimits.MAX_IR_BYTES (16 MiB) from the TS schema package.
+/// Any ANF IR JSON larger than this is rejected at parseANFProgram BEFORE
+/// std.json.parseFromSlice runs so a malicious caller cannot exhaust
+/// memory / CPU with a giant payload. BUG-008 follow-up.
+pub const MAX_IR_BYTES: usize = 16 * 1024 * 1024;
+
+/// Mirrors InputLimits.MAX_NESTING (512) from the TS schema package
+/// for the structural-depth pre-walk. Note that the existing
+/// per-binding parser also enforces max_parse_depth = 256 as a defense
+/// in depth; whichever fires first wins. BUG-008 follow-up.
+pub const MAX_IR_NESTING: usize = 512;
+
+/// Walks the raw JSON bytes and returns ParseError.MaxRecursionDepthExceeded
+/// the first time the structural nesting (objects + arrays) exceeds
+/// MAX_IR_NESTING. Runs BEFORE std.json.parseFromSlice so a deeply-nested
+/// payload cannot exhaust the thread stack inside the deserializer.
+///
+/// Skips strings (respecting backslash-escapes).
+fn assertIRNestingUnderLimit(data: []const u8) ParseError!void {
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    for (data) |b| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (b == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (b == '"') in_string = false;
+            continue;
+        }
+        switch (b) {
+            '"' => in_string = true,
+            '{', '[' => {
+                depth += 1;
+                if (depth > MAX_IR_NESTING) {
+                    return ParseError.MaxRecursionDepthExceeded;
+                }
+            },
+            '}', ']' => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+    }
+}
 
 // ============================================================================
 // Public API
 // ============================================================================
 
 /// Parse a JSON string into an ANFProgram.
+///
+/// Rejects oversized (>MAX_IR_BYTES) payloads with the typed
+/// ParseError.IRSizeExceeded BEFORE std.json.parseFromSlice runs.
+/// Depth is bounded by std.json's parseFromSlice with max_value_len /
+/// max_parse_depth; the structural-nesting cap is enforced indirectly
+/// by max_parse_depth = 256 inside this module. BUG-008 follow-up.
 pub fn parseANFProgram(allocator: std.mem.Allocator, json_source: []const u8) !types.ANFProgram {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_source, .{});
+    if (json_source.len > MAX_IR_BYTES) {
+        return ParseError.IRSizeExceeded;
+    }
+    try assertIRNestingUnderLimit(json_source);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_source, .{
+        .max_value_len = MAX_IR_BYTES,
+    });
     defer parsed.deinit();
 
     const root = parsed.value;
@@ -37,7 +104,8 @@ pub fn serializeCanonicalJSON(allocator: std.mem.Allocator, program: types.ANFPr
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
-    try writeCanonicalProgram(buf.writer(allocator), program, 0);
+    const w = opcodes.ArrayListWriter{ .list = &buf, .allocator = allocator };
+    try writeCanonicalProgram(w, program, 0);
     try buf.append(allocator, '\n');
 
     return buf.toOwnedSlice(allocator);
@@ -48,7 +116,8 @@ pub fn serializeArtifact(allocator: std.mem.Allocator, artifact: types.Artifact)
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
-    try writeCanonicalArtifact(buf.writer(allocator), artifact, 0);
+    const w = opcodes.ArrayListWriter{ .list = &buf, .allocator = allocator };
+    try writeCanonicalArtifact(w, artifact, 0);
     try buf.append(allocator, '\n');
 
     return buf.toOwnedSlice(allocator);
@@ -98,7 +167,16 @@ fn parseProperties(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]typ
                 break :blk @as(?types.ConstValue, .{ .integer = int_val });
             },
             .bool => |b| @as(?types.ConstValue, .{ .boolean = b }),
-            .string => |s| @as(?types.ConstValue, .{ .string = try allocator.dupe(u8, s) }),
+            .string => |s| blk: {
+                // Same `n`-suffix discriminator used by parseLoadConst —
+                // oversize bigint initializers (e.g. property defaults) round
+                // through the same encoding as inline literals.
+                if (isDecimalBigIntLiteral(s)) {
+                    const decimal = try allocator.dupe(u8, s[0 .. s.len - 1]);
+                    break :blk @as(?types.ConstValue, .{ .big_integer = decimal });
+                }
+                break :blk @as(?types.ConstValue, .{ .string = try allocator.dupe(u8, s) });
+            },
             else => return ParseError.InvalidConstValue,
         } else null;
         result[i] = .{
@@ -148,7 +226,7 @@ fn parseParams(allocator: std.mem.Allocator, method_obj: std.json.ObjectMap) ![]
     return result;
 }
 
-const BindingError = ParseError || std.mem.Allocator.Error;
+const BindingError = ParseError || std.mem.Allocator.Error || unknown_anf_kind.UnknownAnfKindError;
 
 fn parseBindings(allocator: std.mem.Allocator, arr: std.json.Array, depth: u32) BindingError![]types.ANFBinding {
     var result = try allocator.alloc(types.ANFBinding, arr.items.len);
@@ -172,7 +250,8 @@ fn parseBinding(allocator: std.mem.Allocator, obj: std.json.ObjectMap, depth: u3
 const KindTag = enum {
     load_param, load_prop, load_const, bin_op, unary_op, call, method_call,
     @"if", loop, assert, update_prop, get_state_script, check_preimage,
-    deserialize_state, add_output, add_raw_output, array_literal,
+    deserialize_state, add_output, add_raw_output, add_data_output, array_literal,
+    raw_script,
 };
 
 const kind_map = std.StaticStringMap(KindTag).initComptime(.{
@@ -192,14 +271,20 @@ const kind_map = std.StaticStringMap(KindTag).initComptime(.{
     .{ "deserialize_state", .deserialize_state },
     .{ "add_output", .add_output },
     .{ "add_raw_output", .add_raw_output },
+    .{ "add_data_output", .add_data_output },
     .{ "array_literal", .array_literal },
+    .{ "raw_script", .raw_script },
 });
 
 fn parseANFValue(allocator: std.mem.Allocator, obj: std.json.ObjectMap, depth: u32) BindingError!types.ANFValue {
     if (depth >= max_parse_depth) return ParseError.MaxRecursionDepthExceeded;
 
     const kind = try getString(obj, "kind");
-    const tag = kind_map.get(kind) orelse return ParseError.InvalidKind;
+    // F-003: unknown ANF kinds used to return a generic InvalidKind; now they
+    // raise UnknownAnfKind via the typed helper so a missing ANFValue variant
+    // fails loudly with a useful diagnostic.
+    const tag = kind_map.get(kind) orelse
+        return unknown_anf_kind.unknownAnfKind(kind, "ir.json.parseANFValue");
 
     return switch (tag) {
         .load_param => .{ .load_param = .{
@@ -220,16 +305,63 @@ fn parseANFValue(allocator: std.mem.Allocator, obj: std.json.ObjectMap, depth: u
         .get_state_script => .{ .get_state_script = {} },
         .check_preimage => .{ .check_preimage = .{
             .preimage = try allocator.dupe(u8, try getString(obj, "preimage")),
+            // #123: optional non-default sighash flag (default 0 = ALL|FORKID).
+            .sighash_flag = getOptionalI32(obj, "sighashFlag"),
         } },
         .deserialize_state => .{ .deserialize_state = .{
             .preimage = try allocator.dupe(u8, try getString(obj, "preimage")),
         } },
         .add_output => try parseAddOutput(allocator, obj),
         .add_raw_output => try parseAddRawOutput(allocator, obj),
+        .add_data_output => try parseAddDataOutput(allocator, obj),
         .array_literal => .{ .array_literal = .{
             .elements = try parseStringArray(allocator, obj, "elements"),
         } },
+        .raw_script => try parseRawScript(allocator, obj),
     };
+}
+
+/// Parse a raw_script ANF value from JSON. Validates the hex-shape of the
+/// `bytes` field (even length, hex-only) and rejects negative arities.
+fn parseRawScript(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.ANFValue {
+    const bytes_str = try getString(obj, "bytes");
+    if (bytes_str.len % 2 != 0) return ParseError.InvalidConstValue;
+    for (bytes_str) |c| {
+        const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!is_hex) return ParseError.InvalidConstValue;
+    }
+
+    const in_arity_val = obj.get("in_arity") orelse return ParseError.MissingField;
+    const in_arity: i32 = switch (in_arity_val) {
+        .integer => |i| @intCast(i),
+        .float => |f| blk: {
+            const i: i64 = @intFromFloat(f);
+            const roundtrip: f64 = @floatFromInt(i);
+            if (roundtrip != f) return ParseError.InvalidConstValue;
+            break :blk @intCast(i);
+        },
+        else => return ParseError.UnexpectedValueType,
+    };
+    if (in_arity < 0) return ParseError.InvalidConstValue;
+
+    const out_arity_val = obj.get("out_arity") orelse return ParseError.MissingField;
+    const out_arity: i32 = switch (out_arity_val) {
+        .integer => |i| @intCast(i),
+        .float => |f| blk: {
+            const i: i64 = @intFromFloat(f);
+            const roundtrip: f64 = @floatFromInt(i);
+            if (roundtrip != f) return ParseError.InvalidConstValue;
+            break :blk @intCast(i);
+        },
+        else => return ParseError.UnexpectedValueType,
+    };
+    if (out_arity < 0) return ParseError.InvalidConstValue;
+
+    return .{ .raw_script = .{
+        .bytes = try allocator.dupe(u8, bytes_str),
+        .in_arity = in_arity,
+        .out_arity = out_arity,
+    } };
 }
 
 fn parseLoadConst(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.ANFValue {
@@ -244,9 +376,38 @@ fn parseLoadConst(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.
             return .{ .load_const = .{ .value = .{ .integer = int_val } } };
         },
         .bool => |b| return .{ .load_const = .{ .value = .{ .boolean = b } } },
-        .string => |s| return .{ .load_const = .{ .value = .{ .string = try allocator.dupe(u8, s) } } },
+        .string => |s| {
+            // Cross-tier IR producers (TS / Go / Python) emit oversize bigints
+            // as a quoted decimal string with the canonical JS BigInt `n`
+            // suffix so the value survives JSON precision loss. Distinguish
+            // this shape from hex-encoded ByteString literals (which never
+            // carry the suffix) before falling back to `string`.
+            if (isDecimalBigIntLiteral(s)) {
+                const decimal = try allocator.dupe(u8, s[0 .. s.len - 1]);
+                return .{ .load_const = .{ .value = .{ .big_integer = decimal } } };
+            }
+            return .{ .load_const = .{ .value = .{ .string = try allocator.dupe(u8, s) } } };
+        },
         else => return ParseError.InvalidConstValue,
     }
+}
+
+/// True if `s` matches the canonical JS BigInt decimal-literal encoding used
+/// by the TS / Go / Python IR emitters for oversize values: optional leading
+/// `-`, one or more ASCII digits, and a REQUIRED trailing `n` marker. The
+/// trailing `n` is the discriminator that separates a decimal-encoded BigInt
+/// from a hex-encoded ByteString literal (which never carries the suffix),
+/// so a hex string like "3030" is not mis-decoded as the integer 3030.
+fn isDecimalBigIntLiteral(s: []const u8) bool {
+    if (s.len < 2 or s[s.len - 1] != 'n') return false;
+    var start: usize = 0;
+    if (s[0] == '-') start = 1;
+    const body = s[start .. s.len - 1];
+    if (body.len == 0) return false;
+    for (body) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
 }
 
 fn parseBinOp(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.ANFValue {
@@ -334,11 +495,31 @@ fn parseLoop(allocator: std.mem.Allocator, obj: std.json.ObjectMap, depth: u32) 
     const body_val = obj.get("body") orelse return ParseError.MissingField;
     const body_bindings = try parseBindings(allocator, body_val.array, depth + 1);
 
+    // Issue #121: decode the iterator start value (a bare number, or a decimal
+    // `Nn` string for oversize starts) and step direction. Older ANF payloads
+    // without start/step describe zero-start counting-up loops (start=0, step=1).
+    const start: i64 = if (obj.get("start")) |v| switch (v) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        .string => |s| blk: {
+            const text = if (s.len > 0 and s[s.len - 1] == 'n') s[0 .. s.len - 1] else s;
+            break :blk std.fmt.parseInt(i64, text, 10) catch 0;
+        },
+        else => 0,
+    } else 0;
+    const step: i8 = if (obj.get("step")) |v| switch (v) {
+        .integer => |i| if (i < 0) @as(i8, -1) else 1,
+        .float => |f| if (f < 0) @as(i8, -1) else 1,
+        else => 1,
+    } else 1;
+
     const loop_node = try allocator.create(types.ANFLoop);
     loop_node.* = .{
         .count = count,
         .body = body_bindings,
         .iter_var = try allocator.dupe(u8, iter_var),
+        .start = start,
+        .step = step,
     };
 
     return .{ .loop = loop_node };
@@ -346,9 +527,14 @@ fn parseLoop(allocator: std.mem.Allocator, obj: std.json.ObjectMap, depth: u32) 
 
 fn parseAssert(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.ANFValue {
     const val_ref = try getString(obj, "value");
+    const marker = if (obj.get("isAutoInjectedStateCheck")) |v|
+        v == .bool and v.bool
+    else
+        false;
 
     return .{ .assert = .{
         .value = try allocator.dupe(u8, val_ref),
+        .is_auto_injected_state_check = marker,
     } };
 }
 
@@ -392,6 +578,16 @@ fn parseAddRawOutput(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !typ
     } };
 }
 
+fn parseAddDataOutput(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.ANFValue {
+    const satoshis = try getString(obj, "satoshis");
+    const script_bytes = try getString(obj, "scriptBytes");
+
+    return .{ .add_data_output = .{
+        .satoshis = try allocator.dupe(u8, satoshis),
+        .script_bytes = try allocator.dupe(u8, script_bytes),
+    } };
+}
+
 // ============================================================================
 // Helper functions for JSON value extraction
 // ============================================================================
@@ -401,6 +597,16 @@ fn getString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
     return switch (val) {
         .string => |s| s,
         else => ParseError.UnexpectedValueType,
+    };
+}
+
+/// Read an optional integer field, returning 0 when absent or not an integer.
+/// Used for the #123 check_preimage `sighashFlag` (default 0 = ALL|FORKID).
+fn getOptionalI32(obj: std.json.ObjectMap, key: []const u8) i32 {
+    const val = obj.get(key) orelse return 0;
+    return switch (val) {
+        .integer => |i| @intCast(i),
+        else => 0,
     };
 }
 
@@ -813,7 +1019,7 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
         },
         .loop => |lp| {
             try writer.writeAll("{\n");
-            // Sorted keys: body, count, iterVar, kind
+            // Sorted keys: body, count, iterVar, kind, start, step
             try writeIndent(writer, depth + 1);
             try writeJsonString(writer, "body");
             try writer.writeAll(": ");
@@ -836,6 +1042,22 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
             try writeJsonString(writer, "kind");
             try writer.writeAll(": ");
             try writeJsonString(writer, "loop");
+            try writer.writeAll(",\n");
+
+            // Issue #121: iterator start value and step direction. `start` is an
+            // int64 loop start, emitted as a bare JSON number — byte-identical
+            // to the TypeScript ANF JSON, whose reviver collapses int64-range
+            // `Nn` strings back to plain numbers.
+            try writeIndent(writer, depth + 1);
+            try writeJsonString(writer, "start");
+            try writer.writeAll(": ");
+            try writer.print("{d}", .{lp.start});
+            try writer.writeAll(",\n");
+
+            try writeIndent(writer, depth + 1);
+            try writeJsonString(writer, "step");
+            try writer.writeAll(": ");
+            try writer.print("{d}", .{lp.step});
             try writer.writeByte('\n');
 
             try writeIndent(writer, depth);
@@ -843,7 +1065,15 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
         },
         .assert => |a| {
             try writer.writeAll("{\n");
-            // Sorted keys: kind, value
+            // Sorted keys: isAutoInjectedStateCheck (when true), kind, value
+            // The marker is omitted entirely when false to keep the
+            // checked-in fold-OFF goldens stable for developer asserts.
+            if (a.is_auto_injected_state_check) {
+                try writeIndent(writer, depth + 1);
+                try writeJsonString(writer, "isAutoInjectedStateCheck");
+                try writer.writeAll(": true,\n");
+            }
+
             try writeIndent(writer, depth + 1);
             try writeJsonString(writer, "kind");
             try writer.writeAll(": ");
@@ -892,7 +1122,7 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
         },
         .check_preimage => |cp| {
             try writer.writeAll("{\n");
-            // Sorted keys: kind, preimage
+            // Sorted keys: kind, preimage, sighashFlag (#123, only when non-default)
             try writeIndent(writer, depth + 1);
             try writeJsonString(writer, "kind");
             try writer.writeAll(": ");
@@ -902,6 +1132,12 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
             try writeJsonString(writer, "preimage");
             try writer.writeAll(": ");
             try writeJsonString(writer, cp.preimage);
+            if (cp.sighash_flag != 0) {
+                try writer.writeAll(",\n");
+                try writeIndent(writer, depth + 1);
+                try writeJsonString(writer, "sighashFlag");
+                try writer.print(": {d}", .{cp.sighash_flag});
+            }
             try writer.writeByte('\n');
             try writeIndent(writer, depth);
             try writer.writeByte('}');
@@ -976,6 +1212,32 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
             try writeIndent(writer, depth);
             try writer.writeByte('}');
         },
+        .add_data_output => |ado| {
+            try writer.writeAll("{\n");
+            // Sorted keys: kind, satoshis, scriptBytes. Wire shape identical to
+            // add_raw_output; distinguished only by position in the
+            // continuation-hash concatenation.
+            try writeIndent(writer, depth + 1);
+            try writeJsonString(writer, "kind");
+            try writer.writeAll(": ");
+            try writeJsonString(writer, "add_data_output");
+            try writer.writeAll(",\n");
+
+            try writeIndent(writer, depth + 1);
+            try writeJsonString(writer, "satoshis");
+            try writer.writeAll(": ");
+            try writeJsonString(writer, ado.satoshis);
+            try writer.writeAll(",\n");
+
+            try writeIndent(writer, depth + 1);
+            try writeJsonString(writer, "scriptBytes");
+            try writer.writeAll(": ");
+            try writeJsonString(writer, ado.script_bytes);
+            try writer.writeByte('\n');
+
+            try writeIndent(writer, depth);
+            try writer.writeByte('}');
+        },
         .array_literal => |al| {
             try writer.writeAll("{\n");
             // Sorted keys: elements, kind
@@ -992,14 +1254,35 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
             try writeIndent(writer, depth);
             try writer.writeByte('}');
         },
-        // Legacy variants — write as generic object with kind
-        else => {
+        .raw_script => |rs| {
             try writer.writeAll("{\n");
+            // Sorted keys: bytes, in_arity, kind, out_arity. The arities are
+            // emitted unconditionally so in_arity 0 / out_arity 0 survive
+            // round-trips (matches the Go reference compiler).
+            try writeIndent(writer, depth + 1);
+            try writeJsonString(writer, "bytes");
+            try writer.writeAll(": ");
+            try writeJsonString(writer, rs.bytes);
+            try writer.writeAll(",\n");
+
+            try writeIndent(writer, depth + 1);
+            try writeJsonString(writer, "in_arity");
+            try writer.writeAll(": ");
+            try writer.print("{d}", .{rs.in_arity});
+            try writer.writeAll(",\n");
+
             try writeIndent(writer, depth + 1);
             try writeJsonString(writer, "kind");
             try writer.writeAll(": ");
-            try writeJsonString(writer, "unknown");
+            try writeJsonString(writer, "raw_script");
+            try writer.writeAll(",\n");
+
+            try writeIndent(writer, depth + 1);
+            try writeJsonString(writer, "out_arity");
+            try writer.writeAll(": ");
+            try writer.print("{d}", .{rs.out_arity});
             try writer.writeByte('\n');
+
             try writeIndent(writer, depth);
             try writer.writeByte('}');
         },
@@ -1009,6 +1292,16 @@ fn writeANFValue(writer: anytype, value: types.ANFValue, depth: usize) anyerror!
 fn writeConstValue(writer: anytype, value: types.ConstValue) !void {
     switch (value) {
         .integer => |i| try writer.print("{d}", .{i}),
+        .big_integer => |s| {
+            // Canonical JS BigInt encoding: quoted decimal string with the
+            // trailing `n` discriminator. Matches the TS / Go / Python
+            // emitters so the IR JSON is byte-identical across tiers for
+            // oversize literals (e.g. the 256-bit secp256k1 group order in
+            // schnorr-zkp).
+            try writer.writeByte('"');
+            try writer.writeAll(s);
+            try writer.writeAll("n\"");
+        },
         .boolean => |b| {
             if (b) {
                 try writer.writeAll("true");
@@ -1073,6 +1366,17 @@ fn writeCanonicalArtifact(writer: anytype, artifact: types.Artifact, depth: usiz
         for (indices, 0..) |idx, i| {
             if (i > 0) try writer.writeAll(", ");
             try writer.print("{d}", .{idx});
+        }
+        try writer.writeAll("],\n");
+    }
+
+    if (artifact.code_sep_index_slots) |slots| {
+        try writeIndent(writer, depth + 1);
+        try writeJsonString(writer, "code_sep_index_slots");
+        try writer.writeAll(": [");
+        for (slots, 0..) |slot, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try writer.print("{{\"byte_offset\": {d}, \"code_sep_index\": {d}}}", .{ slot.byte_offset, slot.code_sep_index });
         }
         try writer.writeAll("],\n");
     }

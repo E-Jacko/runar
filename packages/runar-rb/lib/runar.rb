@@ -13,6 +13,9 @@ require_relative 'runar/ec'
 require_relative 'runar/ec_primitives'
 require_relative 'runar/ecdsa'
 require_relative 'runar/rabin_sig'
+require_relative 'runar/wots'
+require_relative 'runar/slh_dsa'
+require_relative 'runar/nist_ecdsa'
 require_relative 'runar/test_keys'
 require_relative 'runar/compile_check'
 
@@ -36,6 +39,8 @@ SigHashPreimage = Runar::Types::SigHashPreimage
 RabinSig     = Runar::Types::RabinSig
 RabinPubKey  = Runar::Types::RabinPubKey
 Point        = Runar::Types::Point
+P256Point    = Runar::Types::P256Point
+P384Point    = Runar::Types::P384Point
 OpCodeType   = Runar::Types::OpCodeType
 Boolean      = Runar::Types::Boolean
 
@@ -97,6 +102,14 @@ module Kernel
     Runar.sha256(data)
   end
 
+  # Alias for sha256. Provides an explicitly-named spelling so cross-format
+  # contract sources that reference the `Sha256Hash` identifier (resolved by
+  # every parser to the `sha256` builtin) have a matching runtime function
+  # on the Ruby side too.
+  def sha256_hash(data)
+    sha256(data)
+  end
+
   def ripemd160(data)
     Runar.ripemd160(data)
   end
@@ -112,6 +125,13 @@ module Kernel
 
   def check_preimage(preimage)
     Runar.check_preimage(preimage)
+  end
+
+  # asm() compiler intrinsic — a compile-time-only escape hatch. The runtime
+  # stub raises; contracts must be run through the Runar compiler. Exposed
+  # here so native Ruby execution of contract source resolves the call.
+  def asm(*args)
+    Runar.asm(*args)
   end
 
   def verify_rabin_sig(msg, sig, padding, pk)
@@ -144,6 +164,15 @@ module Kernel
 
   def verify_slh_dsa_sha2_256f(msg, sig, pubkey)
     Runar.verify_slh_dsa_sha2_256f(msg, sig, pubkey)
+  end
+
+  # NIST P-256 / P-384 ECDSA verification (real, via OpenSSL).
+  def verify_ecdsa_p256(msg, sig, pubkey)
+    Runar.verify_ecdsa_p256(msg, sig, pubkey)
+  end
+
+  def verify_ecdsa_p384(msg, sig, pubkey)
+    Runar.verify_ecdsa_p384(msg, sig, pubkey)
   end
 
   def sha256_compress(state, block)

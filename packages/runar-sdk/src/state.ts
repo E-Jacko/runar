@@ -12,12 +12,19 @@
 // ---------------------------------------------------------------------------
 
 import type { StateField, RunarArtifact } from 'runar-ir-schema';
+import { STATE_FIELD_WIDTHS } from 'runar-ir-schema';
 
 /**
  * Serialize a set of state values into a hex-encoded Bitcoin Script data
  * section (without the OP_RETURN prefix -- that is handled by the caller).
  *
  * Field order is determined by the `index` property of each StateField.
+ *
+ * Fields with a `fixedArray` annotation are expanded into N element writes
+ * in declaration order; callers may supply either a plain array on the
+ * grouped name (`values.Board = [...]`) or the underlying scalar fields
+ * (`values.Board__0 = ..., values.Board__1 = ..., ...`) — scalars win if
+ * both are present, for backward compatibility.
  */
 export function serializeState(
   fields: StateField[],
@@ -27,11 +34,122 @@ export function serializeState(
   let hex = '';
 
   for (const field of sorted) {
-    const value = values[field.name];
-    hex += encodeStateValue(value, field.type);
+    if (field.fixedArray) {
+      const arr = values[field.name];
+      const names = field.fixedArray.syntheticNames;
+      // Derive the leaf scalar type by peeling off every FixedArray
+      // layer from the declared `field.type`. The grouped entry's
+      // `elementType` is only the immediate child — for nested arrays
+      // it is itself another FixedArray<...>, which `encodeStateValue`
+      // does not know how to serialise.
+      const leafType = unwrapFixedArrayLeaf(field.type);
+      const dims = parseFixedArrayDims(field.type);
+      const flatFromArr = Array.isArray(arr) ? flattenNested(arr, dims) : null;
+      for (let i = 0; i < names.length; i++) {
+        let elem: unknown;
+        const synthName = names[i]!;
+        if (synthName in values) {
+          elem = values[synthName];
+        } else if (flatFromArr) {
+          elem = flatFromArr[i];
+        } else {
+          elem = undefined;
+        }
+        hex += encodeStateValue(elem, leafType);
+      }
+    } else {
+      const value = values[field.name];
+      hex += encodeStateValue(value, field.type);
+    }
   }
 
   return hex;
+}
+
+/**
+ * Parse a nested `FixedArray<...>` type string into its outer
+ * dimensions: `"FixedArray<FixedArray<bigint, 2>, 3>"` → `[3, 2]`.
+ * Non-FixedArray types return `[]`.
+ */
+function parseFixedArrayDims(type: string): number[] {
+  const dims: number[] = [];
+  let current = type.trim();
+  while (current.startsWith('FixedArray<')) {
+    const inner = current.slice('FixedArray<'.length, -1);
+    let depth = 0;
+    let splitAt = -1;
+    for (let i = inner.length - 1; i >= 0; i--) {
+      const ch = inner[i]!;
+      if (ch === '>') depth++;
+      else if (ch === '<') depth--;
+      else if (ch === ',' && depth === 0) {
+        splitAt = i;
+        break;
+      }
+    }
+    if (splitAt < 0) return dims;
+    const elemType = inner.slice(0, splitAt).trim();
+    const lenStr = inner.slice(splitAt + 1).trim();
+    const len = Number.parseInt(lenStr, 10);
+    if (!Number.isFinite(len) || len <= 0) return dims;
+    dims.push(len);
+    current = elemType;
+  }
+  return dims;
+}
+
+/** Return the innermost scalar type of a (possibly nested) FixedArray string. */
+function unwrapFixedArrayLeaf(type: string): string {
+  let current = type.trim();
+  while (current.startsWith('FixedArray<')) {
+    const inner = current.slice('FixedArray<'.length, -1);
+    let depth = 0;
+    let splitAt = -1;
+    for (let i = inner.length - 1; i >= 0; i--) {
+      const ch = inner[i]!;
+      if (ch === '>') depth++;
+      else if (ch === '<') depth--;
+      else if (ch === ',' && depth === 0) {
+        splitAt = i;
+        break;
+      }
+    }
+    if (splitAt < 0) return current;
+    current = inner.slice(0, splitAt).trim();
+  }
+  return current;
+}
+
+/** Flatten a nested JS array of depth `dims.length` to a flat leaf list. */
+function flattenNested(value: unknown, dims: number[]): unknown[] {
+  if (dims.length === 0) return [value];
+  if (!Array.isArray(value)) {
+    const total = dims.reduce((a, b) => a * b, 1);
+    return new Array(total).fill(undefined);
+  }
+  const rest = dims.slice(1);
+  const out: unknown[] = [];
+  for (const v of value) out.push(...flattenNested(v, rest));
+  return out;
+}
+
+/** Rebuild a nested JS array of depth `dims.length` from a flat leaf list. */
+function regroupNested(flat: unknown[], dims: number[], offset = 0): { value: unknown[]; consumed: number } {
+  const [outerLen, ...rest] = dims;
+  if (outerLen === undefined) return { value: [], consumed: 0 };
+  const value: unknown[] = new Array(outerLen);
+  let consumed = 0;
+  if (rest.length === 0) {
+    for (let i = 0; i < outerLen; i++) value[i] = flat[offset + i];
+    consumed = outerLen;
+  } else {
+    for (let i = 0; i < outerLen; i++) {
+      const sub = regroupNested(flat, rest, offset + consumed);
+      value[i] = sub.value;
+      consumed += sub.consumed;
+    }
+  }
+  return { value, consumed };
 }
 
 /**
@@ -39,6 +157,9 @@ export function serializeState(
  *
  * The caller must strip the code prefix and OP_RETURN byte before passing
  * the data section.
+ *
+ * Fields with a `fixedArray` annotation are returned as a plain JS array on
+ * the grouped name, not as N individual scalar fields.
  */
 export function deserializeState(
   fields: StateField[],
@@ -49,9 +170,22 @@ export function deserializeState(
   let offset = 0;
 
   for (const field of sorted) {
-    const { value, bytesRead } = decodeStateValue(scriptHex, offset, field.type);
-    result[field.name] = value;
-    offset += bytesRead;
+    if (field.fixedArray) {
+      const leafType = unwrapFixedArrayLeaf(field.type);
+      const dims = parseFixedArrayDims(field.type);
+      const total = field.fixedArray.syntheticNames.length;
+      const flat: unknown[] = new Array(total);
+      for (let i = 0; i < total; i++) {
+        const { value, bytesRead } = decodeStateValue(scriptHex, offset, leafType);
+        flat[i] = value;
+        offset += bytesRead;
+      }
+      result[field.name] = regroupNested(flat, dims).value;
+    } else {
+      const { value, bytesRead } = decodeStateValue(scriptHex, offset, field.type);
+      result[field.name] = value;
+      offset += bytesRead;
+    }
   }
 
   return result;
@@ -156,8 +290,16 @@ function encodeStateValue(value: unknown, type: string): string {
       }
       return encodeNum2Bin(n, 8);
     }
-    case 'bool': {
-      return value ? '01' : '00'; // 1 raw byte
+    case 'bool':
+    case 'boolean': {
+      // 1 raw byte — matches on-chain serialization (05-stack-lower.ts
+      // `case 'boolean': propSizes.push(1)`), decodeStateValue, and the shared
+      // STATE_FIELD_WIDTHS table. The canonical Rúnar primitive name is
+      // `boolean`; `bool` is accepted as an alias. Without the `boolean` case
+      // a real boolean state field fell through to the push-data `default`,
+      // silently disagreeing with all three (the descriptor drift #115's
+      // review flagged).
+      return value ? '01' : '00';
     }
     case 'PubKey':
     case 'Addr':
@@ -201,9 +343,27 @@ function encodeNum2Bin(n: bigint, width: number): string {
 
 /**
  * Encode variable-length data as Bitcoin Script push data (with length prefix).
+ *
+ * Applies BSV consensus rule `SCRIPT_VERIFY_MINIMALDATA` for single-byte
+ * pushes: a 1-byte payload whose value is in `{0x00, 0x01..=0x10, 0x81}`
+ * MUST use the corresponding minimal opcode (`OP_0` / `OP_1..OP_16` /
+ * `OP_1NEGATE`) rather than the direct push `01 NN`. Non-minimal direct
+ * pushes are rejected by ARC, TAAL ARC, and WhatsOnChain at the relay
+ * layer with: `non-mandatory-script-verify-flag (Data push larger than necessary)`.
  */
 function encodePushDataState(dataHex: string): string {
   const len = dataHex.length / 2;
+  // MINIMALDATA: single-byte payloads in the OP_N range must use the
+  // corresponding minimal opcode. The `encodeScriptNumber` path for Int
+  // fields already short-circuits to OP_N; this brings the ByteString path
+  // to the same standard so a 1-byte ByteString state field does not emit a
+  // relay-rejected non-minimal direct push.
+  if (len === 1) {
+    const byte = parseInt(dataHex, 16);
+    if (byte === 0x00) return '00'; // OP_0
+    if (byte >= 0x01 && byte <= 0x10) return (0x50 + byte).toString(16).padStart(2, '0'); // OP_1..OP_16
+    if (byte === 0x81) return '4f'; // OP_1NEGATE
+  }
   if (len <= 75) {
     return len.toString(16).padStart(2, '0') + dataHex;
   } else if (len <= 0xff) {
@@ -229,33 +389,28 @@ function decodeStateValue(
   offset: number,
   type: string,
 ): { value: unknown; bytesRead: number } {
-  switch (type) {
-    case 'bool': {
-      // 1 raw byte: 0x00 = false, 0x01 = true
-      return { value: hex.slice(offset, offset + 2) !== '00', bytesRead: 2 };
-    }
-    case 'int':
-    case 'bigint': {
-      // 8 raw bytes LE sign-magnitude (NUM2BIN 8)
-      const hexWidth = 16; // 8 bytes * 2
-      const data = hex.slice(offset, offset + hexWidth);
-      return { value: decodeNum2Bin(data), bytesRead: hexWidth };
-    }
-    case 'PubKey':
-      return { value: hex.slice(offset, offset + 66), bytesRead: 66 }; // 33 bytes
-    case 'Addr':
-    case 'Ripemd160':
-      return { value: hex.slice(offset, offset + 40), bytesRead: 40 }; // 20 bytes
-    case 'Sha256':
-      return { value: hex.slice(offset, offset + 64), bytesRead: 64 }; // 32 bytes
-    case 'Point':
-      return { value: hex.slice(offset, offset + 128), bytesRead: 128 }; // 64 bytes
-    default: {
-      // For unknown types, fall back to push-data decoding
-      const { data, bytesRead } = decodePushData(hex, offset);
-      return { value: data, bytesRead };
+  // Fixed-width types read exactly `size` raw bytes; widths come from the
+  // shared runar-ir-schema table so the codec, the compiler's stateField
+  // layout annotations, and verifier tooling can never drift apart.
+  const width = STATE_FIELD_WIDTHS[type];
+  if (width) {
+    const hexWidth = width.size * 2;
+    const data = hex.slice(offset, offset + hexWidth);
+    switch (width.encoding) {
+      case 'bool1':
+        // 1 raw byte: 0x00 = false, 0x01 = true
+        return { value: data !== '00', bytesRead: hexWidth };
+      case 'num2bin-le8':
+        // 8 raw bytes LE sign-magnitude (NUM2BIN 8)
+        return { value: decodeNum2Bin(data), bytesRead: hexWidth };
+      default:
+        // Raw fixed-size byte types (PubKey 33, Addr/Ripemd160 20, Sha256 32, Point 64)
+        return { value: data, bytesRead: hexWidth };
     }
   }
+  // For variable-length / unknown types, fall back to push-data decoding
+  const { data, bytesRead } = decodePushData(hex, offset);
+  return { value: data, bytesRead };
 }
 
 /**

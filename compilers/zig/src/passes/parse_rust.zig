@@ -7,10 +7,9 @@
 //!   - `#[runar::contract]` or `#[runar::stateful_contract]` attribute on struct
 //!   - `struct Name { field: Type, ... }` declares properties
 //!   - `#[readonly]` attribute makes fields readonly
-//!   - `#[runar::methods(Name)]` attribute on impl block
-//!   - `impl Name { ... }` contains methods
-//!   - `#[public] fn method(&self, params) { ... }` for public methods
-//!   - `fn method(&self, params) { ... }` for private methods
+//!   - plain `impl Name { ... }` block contains methods (no attribute required)
+//!   - `pub fn method(&self, params) { ... }` for public spending entry points
+//!   - `fn method(&self, params) { ... }` for private helpers
 //!   - `self.field` maps to `this.camelCaseField` (snake_case → camelCase)
 //!   - `assert!(expr)` maps to assert statement
 //!   - `assert_eq!(a, b)` maps to `assert(a === b)`
@@ -404,6 +403,20 @@ fn mapBuiltin(allocator: Allocator, name: []const u8) []const u8 {
         .{ "bin_2_num", "bin2num" },
         .{ "num_2_bin", "num2bin" },
         .{ "to_byte_string", "toByteString" },
+        .{ "verify_ecdsa_p256", "verifyECDSA_P256" },
+        .{ "p256_add", "p256Add" },
+        .{ "p256_mul", "p256Mul" },
+        .{ "p256_mul_gen", "p256MulGen" },
+        .{ "p256_negate", "p256Negate" },
+        .{ "p256_on_curve", "p256OnCurve" },
+        .{ "p256_encode_compressed", "p256EncodeCompressed" },
+        .{ "verify_ecdsa_p384", "verifyECDSA_P384" },
+        .{ "p384_add", "p384Add" },
+        .{ "p384_mul", "p384Mul" },
+        .{ "p384_mul_gen", "p384MulGen" },
+        .{ "p384_negate", "p384Negate" },
+        .{ "p384_on_curve", "p384OnCurve" },
+        .{ "p384_encode_compressed", "p384EncodeCompressed" },
     });
     if (map.get(name)) |mapped| return mapped;
     return snakeToCamel(allocator, name);
@@ -526,9 +539,11 @@ const Parser = struct {
             if (self.current.kind == .hash_bracket) {
                 const attr = self.parseAttribute();
 
-                if (std.mem.eql(u8, attr, "runar::contract") or std.mem.eql(u8, attr, "runar::stateful_contract")) {
+                if (std.mem.eql(u8, attr, "runar::contract") or std.mem.eql(u8, attr, "runar::stateful_contract") or std.mem.eql(u8, attr, "runar::unsafe_contract")) {
                     if (std.mem.eql(u8, attr, "runar::stateful_contract")) {
                         parent_class = .stateful_smart_contract;
+                    } else if (std.mem.eql(u8, attr, "runar::unsafe_contract")) {
+                        parent_class = .unsafe_smart_contract;
                     }
                     // Parse: [pub] struct Name { fields... }
                     _ = self.matchIdent("pub");
@@ -580,31 +595,14 @@ const Parser = struct {
                     }
                     _ = self.expect(.rbrace);
                 } else if (std.mem.startsWith(u8, attr, "runar::methods")) {
-                    // Parse: impl Name { methods... }
-                    _ = self.matchIdent("impl");
-                    // Skip type name
-                    if (self.current.kind == .ident) _ = self.bump();
-                    if (self.expect(.lbrace) == null) continue;
-
-                    while (self.current.kind != .rbrace and self.current.kind != .eof) {
-                        var visibility_public = false;
-                        if (self.current.kind == .hash_bracket) {
-                            const method_attr = self.parseAttribute();
-                            if (std.mem.eql(u8, method_attr, "public")) {
-                                visibility_public = true;
-                            }
-                        }
-                        // `pub fn` also makes it public
-                        if (self.checkIdent("pub")) {
-                            _ = self.bump();
-                            visibility_public = true;
-                        }
-                        const m = self.parseFunction(visibility_public);
-                        methods.append(self.allocator, m) catch {};
-                    }
-                    _ = self.expect(.rbrace);
+                    // #[runar::methods] is no longer supported — bare `impl`
+                    // blocks are discovered directly. Emit a migration
+                    // diagnostic; the `impl` branch below still parses the block.
+                    self.addError("#[runar::methods] is no longer supported — write a bare 'impl ContractName { ... }' block instead");
                 }
                 // Unknown attribute — skip
+            } else if (self.checkIdent("impl")) {
+                self.parseImplBlock(&methods);
             } else {
                 _ = self.bump();
             }
@@ -785,6 +783,41 @@ const Parser = struct {
 
     fn runarTypeToTypeName(t: RunarType) []const u8 {
         return types.runarTypeToString(t);
+    }
+
+    // ==================================================================
+    // Impl block parsing
+    // ==================================================================
+
+    /// Parse a bare `impl ContractName { ... }` block, appending its methods to
+    /// `methods`. The type name is consumed and discarded (unrelated `impl`
+    /// blocks merge the same way they did under the old `#[runar::methods]`
+    /// gate). `pub fn` marks a public spending entry point; bare `fn` is a
+    /// private helper.
+    fn parseImplBlock(self: *Parser, methods: *std.ArrayListUnmanaged(MethodNode)) void {
+        _ = self.matchIdent("impl");
+        // Skip the type name.
+        if (self.current.kind == .ident) _ = self.bump();
+        if (self.expect(.lbrace) == null) return;
+
+        while (self.current.kind != .rbrace and self.current.kind != .eof) {
+            // #[public] is no longer supported — `pub fn` marks public methods.
+            while (self.current.kind == .hash_bracket) {
+                const method_attr = self.parseAttribute();
+                if (std.mem.eql(u8, method_attr, "public")) {
+                    self.addError("#[public] is no longer supported — use 'pub fn' for public methods");
+                }
+            }
+
+            var visibility_public = false;
+            if (self.checkIdent("pub")) {
+                _ = self.bump();
+                visibility_public = true;
+            }
+            const m = self.parseFunction(visibility_public);
+            methods.append(self.allocator, m) catch {};
+        }
+        _ = self.expect(.rbrace);
     }
 
     // ==================================================================
@@ -1350,6 +1383,12 @@ const Parser = struct {
                     // Method call: expr.method(args)
                     _ = self.bump();
                     const args = self.parseArgList();
+                    // `.clone()` is a Rust borrow-checker artifact — in Runar
+                    // values are copied by default, so strip it and keep the
+                    // receiver expression unchanged.
+                    if (args.len == 0 and std.mem.eql(u8, member, "clone")) {
+                        continue;
+                    }
                     switch (expr) {
                         .identifier => |id| {
                             if (std.mem.eql(u8, id, "self")) {
@@ -1421,8 +1460,8 @@ const Parser = struct {
         return switch (self.current.kind) {
             .number => blk: {
                 const tok = self.bump();
-                const val = parseNumberLiteral(tok.text);
-                break :blk Expression{ .literal_int = val };
+                if (self.parseNumberExpr(tok.text)) |expr| break :blk expr;
+                break :blk null;
             },
             .hex_string => blk: {
                 const tok = self.bump();
@@ -1490,6 +1529,34 @@ const Parser = struct {
 
     // ---- Helpers ----
 
+    /// Strip underscores + Rust type suffix from a numeric token, then route
+    /// to either `literal_int` (fits `i64`) or `literal_bigint` (overflows).
+    /// Used by parsePrimary's `.number` arm so the 256-bit secp256k1 group
+    /// order survives the Rust DSL frontend with full precision.
+    fn parseNumberExpr(self: *Parser, text: []const u8) ?Expression {
+        var stripped_buf: [128]u8 = undefined;
+        var stripped_len: usize = 0;
+        for (text) |ch| {
+            if ((ch == 'i' or ch == 'u') and stripped_len > 0) break;
+            if (ch != '_' and stripped_len < stripped_buf.len) {
+                stripped_buf[stripped_len] = ch;
+                stripped_len += 1;
+            }
+        }
+        const stripped = stripped_buf[0..stripped_len];
+        if (std.fmt.parseInt(i64, stripped, 0)) |val| {
+            return Expression{ .literal_int = val };
+        } else |_| {
+            // Oversize decimal literal — carry as `literal_bigint`.
+            if (isAllAsciiDigitsRust(stripped)) {
+                const decimal = self.allocator.dupe(u8, stripped) catch return null;
+                return Expression{ .literal_bigint = decimal };
+            }
+            self.addErrorFmt("invalid integer: '{s}'", .{text});
+            return null;
+        }
+    }
+
     fn isCompoundAssignOp(k: TokenKind) bool {
         return k == .plus_eq or k == .minus_eq or k == .star_eq or k == .slash_eq or k == .percent_eq;
     }
@@ -1505,6 +1572,17 @@ const Parser = struct {
         };
     }
 };
+
+/// True if every byte in `s` is an ASCII digit (0-9). Used to identify
+/// decimal integer literals that overflow `i64` and need to be routed to
+/// the `literal_bigint` AST node instead.
+fn isAllAsciiDigitsRust(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
 
 /// Parse a number literal, stripping underscores and type suffixes.
 fn parseNumberLiteral(text: []const u8) i64 {
@@ -1615,10 +1693,8 @@ test "parse P2PKH contract (Rust DSL)" {
         \\    pub_key_hash: Addr,
         \\}
         \\
-        \\#[runar::methods(P2PKH)]
         \\impl P2PKH {
-        \\    #[public]
-        \\    fn unlock(&self, sig: Sig, pub_key: PubKey) {
+        \\    pub fn unlock(&self, sig: Sig, pub_key: PubKey) {
         \\        assert!(hash160(pub_key) == self.pub_key_hash);
         \\        assert!(check_sig(sig, pub_key));
         \\    }
@@ -1654,14 +1730,11 @@ test "parse Counter contract (stateful, Rust DSL)" {
         \\    pub count: Bigint,
         \\}
         \\
-        \\#[runar::methods(Counter)]
         \\impl Counter {
-        \\    #[public]
         \\    pub fn increment(&mut self) {
         \\        self.count += 1;
         \\    }
         \\
-        \\    #[public]
         \\    pub fn decrement(&mut self) {
         \\        assert!(self.count > 0);
         \\        self.count -= 1;
@@ -1699,18 +1772,15 @@ test "parse Auction contract (Rust DSL)" {
         \\    deadline: Bigint,
         \\}
         \\
-        \\#[runar::methods(Auction)]
         \\impl Auction {
-        \\    #[public]
-        \\    fn bid(&mut self, sig: Sig, bidder: PubKey, bid_amount: Bigint) {
+        \\    pub fn bid(&mut self, sig: Sig, bidder: PubKey, bid_amount: Bigint) {
         \\        assert!(check_sig(sig, bidder));
         \\        assert!(bid_amount > self.highest_bid);
         \\        self.highest_bidder = bidder;
         \\        self.highest_bid = bid_amount;
         \\    }
         \\
-        \\    #[public]
-        \\    fn close(&mut self, sig: Sig) {
+        \\    pub fn close(&mut self, sig: Sig) {
         \\        assert!(check_sig(sig, self.auctioneer));
         \\    }
         \\}
@@ -1740,10 +1810,8 @@ test "parse BoundedLoop contract with for..in range (Rust DSL)" {
         \\    expected_sum: Int,
         \\}
         \\
-        \\#[runar::methods(BoundedLoop)]
         \\impl BoundedLoop {
-        \\    #[public]
-        \\    fn verify(&self, start: Int) {
+        \\    pub fn verify(&self, start: Int) {
         \\        let mut sum: Int = 0;
         \\        for i in 0..5 {
         \\            sum = sum + start + i;
@@ -1782,22 +1850,19 @@ test "parse PropertyInitializers with init method (Rust DSL)" {
         \\    active: Bool,
         \\}
         \\
-        \\#[runar::methods(PropertyInitializers)]
         \\impl PropertyInitializers {
         \\    fn init(&mut self) {
         \\        self.count = 0;
         \\        self.active = true;
         \\    }
         \\
-        \\    #[public]
-        \\    fn increment(&mut self, amount: Int) {
+        \\    pub fn increment(&mut self, amount: Int) {
         \\        assert!(self.active);
         \\        self.count = self.count + amount;
         \\        assert!(self.count <= self.max_count);
         \\    }
         \\
-        \\    #[public]
-        \\    fn reset(&mut self) {
+        \\    pub fn reset(&mut self) {
         \\        self.count = 0;
         \\    }
         \\}
@@ -1829,4 +1894,147 @@ test "parse number literal with underscores and suffix" {
     try std.testing.expectEqual(@as(i64, 42), parseNumberLiteral("42i128"));
     try std.testing.expectEqual(@as(i64, 100), parseNumberLiteral("100u64"));
     try std.testing.expectEqual(@as(i64, 0), parseNumberLiteral("0"));
+}
+
+test "parse bare impl without #[runar::methods] (Rust DSL)" {
+    const source =
+        \\use runar::prelude::*;
+        \\
+        \\#[runar::contract]
+        \\pub struct Counter {
+        \\    count: Bigint,
+        \\}
+        \\
+        \\impl Counter {
+        \\    pub fn increment(&mut self) {
+        \\        self.count += 1;
+        \\    }
+        \\
+        \\    fn helper(&self) {
+        \\        assert!(self.count > 0);
+        \\    }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseRust(arena.allocator(), source, "Counter.runar.rs");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    const c = r.contract.?;
+    try std.testing.expectEqual(@as(usize, 2), c.methods.len);
+    try std.testing.expectEqualStrings("increment", c.methods[0].name);
+    try std.testing.expect(c.methods[0].is_public);
+    try std.testing.expectEqualStrings("helper", c.methods[1].name);
+    try std.testing.expect(!c.methods[1].is_public);
+}
+
+test "parse multiple impl blocks merge in order (Rust DSL)" {
+    const source =
+        \\use runar::prelude::*;
+        \\
+        \\#[runar::contract]
+        \\struct Multi {
+        \\    #[readonly]
+        \\    x: Bigint,
+        \\}
+        \\
+        \\impl Multi {
+        \\    pub fn first(&self) {
+        \\        assert!(self.x > 0);
+        \\    }
+        \\}
+        \\
+        \\impl Multi {
+        \\    pub fn second(&self) {
+        \\        assert!(self.x < 100);
+        \\    }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseRust(arena.allocator(), source, "Multi.runar.rs");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    const c = r.contract.?;
+    try std.testing.expectEqual(@as(usize, 2), c.methods.len);
+    try std.testing.expectEqualStrings("first", c.methods[0].name);
+    try std.testing.expectEqualStrings("second", c.methods[1].name);
+}
+
+test "parse impl before struct (Rust DSL)" {
+    const source =
+        \\use runar::prelude::*;
+        \\
+        \\impl Early {
+        \\    pub fn check(&self) {
+        \\        assert!(self.x > 0);
+        \\    }
+        \\}
+        \\
+        \\#[runar::contract]
+        \\struct Early {
+        \\    #[readonly]
+        \\    x: Bigint,
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseRust(arena.allocator(), source, "Early.runar.rs");
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    const c = r.contract.?;
+    try std.testing.expectEqualStrings("Early", c.name);
+    try std.testing.expectEqual(@as(usize, 1), c.methods.len);
+    try std.testing.expectEqualStrings("check", c.methods[0].name);
+}
+
+test "reject #[runar::methods] attribute (Rust DSL)" {
+    const source =
+        \\use runar::prelude::*;
+        \\
+        \\#[runar::contract]
+        \\struct Old {
+        \\    #[readonly]
+        \\    x: Bigint,
+        \\}
+        \\
+        \\#[runar::methods(Old)]
+        \\impl Old {
+        \\    pub fn check(&self) {
+        \\        assert!(self.x > 0);
+        \\    }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseRust(arena.allocator(), source, "Old.runar.rs");
+    var found = false;
+    for (r.errors) |err| {
+        if (std.mem.indexOf(u8, err, "#[runar::methods]") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "reject #[public] attribute (Rust DSL)" {
+    const source =
+        \\use runar::prelude::*;
+        \\
+        \\#[runar::contract]
+        \\struct Old {
+        \\    #[readonly]
+        \\    x: Bigint,
+        \\}
+        \\
+        \\impl Old {
+        \\    #[public]
+        \\    pub fn check(&self) {
+        \\        assert!(self.x > 0);
+        \\    }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseRust(arena.allocator(), source, "Old.runar.rs");
+    var found = false;
+    for (r.errors) |err| {
+        if (std.mem.indexOf(u8, err, "#[public]") != null) found = true;
+    }
+    try std.testing.expect(found);
 }

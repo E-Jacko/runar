@@ -1,0 +1,725 @@
+{
+  "hash": "sha256",
+  "vectors": [
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 0,
+      "leaf": "99dd7fc1ad584d9b174275ef9de7bda04fc61e38899fdce22fd31a49f3fc47d6",
+      "proof": "126242834c575d4ccd51fa7081775c09746305ab0889844fff09c2018a5548bd1ca75994cf1367abc773af2669eb04ba82f816339a52bca1ab326c38fb7da315d534d59b01e73786f8fdd65564c917328ad2b1dbbe9fe20dcc3e3a3f6baec8b4",
+      "root": "1dd978870d66b0a054e57c96817818cfe2ca5fbb8995f9c3310ebe242a88ee99",
+      "expected": "accept",
+      "description": "valid proof: tree=8, leaf=0"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 3,
+      "leaf": "8b527fb68aa6b019590b094879162b737efb08ff13412191cd4647d97aaec0d7",
+      "proof": "440adaf1522f26e3d981d114c137090c6bf627ebb163b5cbb449c73f9659a0033cb1a835e4997429594c5796010e7a422bcea8ee00664ba440df3de7007834aad534d59b01e73786f8fdd65564c917328ad2b1dbbe9fe20dcc3e3a3f6baec8b4",
+      "root": "1dd978870d66b0a054e57c96817818cfe2ca5fbb8995f9c3310ebe242a88ee99",
+      "expected": "accept",
+      "description": "valid proof: tree=8, leaf=3"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 4,
+      "leaf": "f8c834b1f520d7b652fc197e175be06114b8dab635ae94d844688781896fa6b6",
+      "proof": "89d91dad1e9169b750ba86431b90050e8cb98aa30250d83859b06887bc139a679a5591401b06cb1e6c43a501f5583f32c98b03c131d9c5d9896a57480d6c434dd02341b5e991c206a11e6c071e8fe08067bc2612337a88278251bd01d25f6fac",
+      "root": "1dd978870d66b0a054e57c96817818cfe2ca5fbb8995f9c3310ebe242a88ee99",
+      "expected": "accept",
+      "description": "valid proof: tree=8, leaf=4"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 5,
+      "leaf": "89d91dad1e9169b750ba86431b90050e8cb98aa30250d83859b06887bc139a67",
+      "proof": "f8c834b1f520d7b652fc197e175be06114b8dab635ae94d844688781896fa6b69a5591401b06cb1e6c43a501f5583f32c98b03c131d9c5d9896a57480d6c434dd02341b5e991c206a11e6c071e8fe08067bc2612337a88278251bd01d25f6fac",
+      "root": "1dd978870d66b0a054e57c96817818cfe2ca5fbb8995f9c3310ebe242a88ee99",
+      "expected": "accept",
+      "description": "valid proof: tree=8, leaf=5"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 6,
+      "leaf": "03da24f4dda619a4d3c84feaecb624d33cefed5ea53aba13be6bfdb5c50f0907",
+      "proof": "d907bc76180bb11eeb9d2f6fe1cf7200d30bfc2406a3da22db4bcf670602aba64ec99862bb1143d8b7caded29df53f06c05adab7c7b48a7a0203aba8c22d9193d02341b5e991c206a11e6c071e8fe08067bc2612337a88278251bd01d25f6fac",
+      "root": "1dd978870d66b0a054e57c96817818cfe2ca5fbb8995f9c3310ebe242a88ee99",
+      "expected": "accept",
+      "description": "valid proof: tree=8, leaf=6"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 7,
+      "leaf": "d907bc76180bb11eeb9d2f6fe1cf7200d30bfc2406a3da22db4bcf670602aba6",
+      "proof": "03da24f4dda619a4d3c84feaecb624d33cefed5ea53aba13be6bfdb5c50f09074ec99862bb1143d8b7caded29df53f06c05adab7c7b48a7a0203aba8c22d9193d02341b5e991c206a11e6c071e8fe08067bc2612337a88278251bd01d25f6fac",
+      "root": "1dd978870d66b0a054e57c96817818cfe2ca5fbb8995f9c3310ebe242a88ee99",
+      "expected": "accept",
+      "description": "valid proof: tree=8, leaf=7"
+    },
+    {
+      "tree_size": 16,
+      "depth": 4,
+      "leaf_index": 0,
+      "leaf": "ddaf3f969d27cafcc9885677d3826bc3a942c3bc19eced184d621a911e2a7b9d",
+      "proof": "a71b439efd47a7ec85d7a28d7cbc43d770b052c38aac950e2e0b106bf53195d38785563ed6623fd8288bcb41a68091701ced3cc49e02e7fe4e2d20f58fbbcd7e2512c0554e6d12ab891fcc713ba51b3541844a7e1583a9322e6e9263c6161d1005969e8544191e33a643e2fcad6a6417638f8a05eefc36efe7f8726db350af4f",
+      "root": "d3062a6277a506102d50aa35c61dd53a8bfeea25ca685a26994e9711a7081545",
+      "expected": "accept",
+      "description": "valid proof: tree=16, leaf=0"
+    },
+    {
+      "tree_size": 16,
+      "depth": 4,
+      "leaf_index": 2,
+      "leaf": "454be7795de47c200037f22831d26658a4b1017066c7ccb4c20950427be989ca",
+      "proof": "438c03dfdc22560a87c37180e62cd815762a15f70d131dc44c6f227d0b7a18953e101d1a0c7592043ac16ff6402a4f6378c8f710c6b566ef841a25e366525d732512c0554e6d12ab891fcc713ba51b3541844a7e1583a9322e6e9263c6161d1005969e8544191e33a643e2fcad6a6417638f8a05eefc36efe7f8726db350af4f",
+      "root": "d3062a6277a506102d50aa35c61dd53a8bfeea25ca685a26994e9711a7081545",
+      "expected": "accept",
+      "description": "valid proof: tree=16, leaf=2"
+    },
+    {
+      "tree_size": 16,
+      "depth": 4,
+      "leaf_index": 6,
+      "leaf": "d0f0309ab5949f3c5b582a7b0e624ce45e8a7c4710ec1d7c4396a1b2a3ce466f",
+      "proof": "13257c7ddfd8f4c936b9739f1a21d8333245cdc285987910162c21ba1cccdc72d03e9132493a9ae3eed1eb9978867c01b3118cb15d859f71512cce8863b7164a836bcb456d77df0b31e66c6e7e13088d5835125f0ff81bbb188e31e3d0a6c69b05969e8544191e33a643e2fcad6a6417638f8a05eefc36efe7f8726db350af4f",
+      "root": "d3062a6277a506102d50aa35c61dd53a8bfeea25ca685a26994e9711a7081545",
+      "expected": "accept",
+      "description": "valid proof: tree=16, leaf=6"
+    },
+    {
+      "tree_size": 16,
+      "depth": 4,
+      "leaf_index": 8,
+      "leaf": "89c187cb5b579b96d8ba8629cae28c44a26440870c017a4c9ce87c714a2d8a4a",
+      "proof": "8d1397fe79f7e4179040dbb0d53fadae1a4cdb63a06dd3c0eb16b35f809e319c56d5a96340bccc868bde2e412b2d8292f76200fd94026a2a51004192ba539c5a9766c49897622173ff2ea79f436e86ce737d71ea7a7d9e071c3de46cd4e655b139e0a089f80e765a273206fc653eacd2bdf302714a5d520a98927e7d9d45c3ff",
+      "root": "d3062a6277a506102d50aa35c61dd53a8bfeea25ca685a26994e9711a7081545",
+      "expected": "accept",
+      "description": "valid proof: tree=16, leaf=8"
+    },
+    {
+      "tree_size": 16,
+      "depth": 4,
+      "leaf_index": 9,
+      "leaf": "8d1397fe79f7e4179040dbb0d53fadae1a4cdb63a06dd3c0eb16b35f809e319c",
+      "proof": "89c187cb5b579b96d8ba8629cae28c44a26440870c017a4c9ce87c714a2d8a4a56d5a96340bccc868bde2e412b2d8292f76200fd94026a2a51004192ba539c5a9766c49897622173ff2ea79f436e86ce737d71ea7a7d9e071c3de46cd4e655b139e0a089f80e765a273206fc653eacd2bdf302714a5d520a98927e7d9d45c3ff",
+      "root": "d3062a6277a506102d50aa35c61dd53a8bfeea25ca685a26994e9711a7081545",
+      "expected": "accept",
+      "description": "valid proof: tree=16, leaf=9"
+    },
+    {
+      "tree_size": 16,
+      "depth": 4,
+      "leaf_index": 11,
+      "leaf": "11cc0319409f449d0782019aa1d11c80adc383e98f015748437e5eeec1469aef",
+      "proof": "b3e10e43a5aa0c5a64f5e870f9ff773cd4a6c0a32367a0de620209561e733c4683cc0992a26c15cc5d0dba7bae465b6c261d6d40b09dc5923450535c3e965dc89766c49897622173ff2ea79f436e86ce737d71ea7a7d9e071c3de46cd4e655b139e0a089f80e765a273206fc653eacd2bdf302714a5d520a98927e7d9d45c3ff",
+      "root": "d3062a6277a506102d50aa35c61dd53a8bfeea25ca685a26994e9711a7081545",
+      "expected": "accept",
+      "description": "valid proof: tree=16, leaf=11"
+    },
+    {
+      "tree_size": 16,
+      "depth": 4,
+      "leaf_index": 14,
+      "leaf": "37c00c4f27601809eac01e50ca9f920a4a6219472ccec40f3ae43108cb0512ae",
+      "proof": "a1374d949591661a794336d414390fd3e3bd6d8896b0c6f8102b73760b3f92ad5bddd8b5893459eae650fdab3c4d6be6831f5fcdbd2e2772689fce4241a37e70b0bffef50fc91d559456371ba1415700df5428682d3a5a29add634cc414d60ed39e0a089f80e765a273206fc653eacd2bdf302714a5d520a98927e7d9d45c3ff",
+      "root": "d3062a6277a506102d50aa35c61dd53a8bfeea25ca685a26994e9711a7081545",
+      "expected": "accept",
+      "description": "valid proof: tree=16, leaf=14"
+    },
+    {
+      "tree_size": 16,
+      "depth": 4,
+      "leaf_index": 15,
+      "leaf": "a1374d949591661a794336d414390fd3e3bd6d8896b0c6f8102b73760b3f92ad",
+      "proof": "37c00c4f27601809eac01e50ca9f920a4a6219472ccec40f3ae43108cb0512ae5bddd8b5893459eae650fdab3c4d6be6831f5fcdbd2e2772689fce4241a37e70b0bffef50fc91d559456371ba1415700df5428682d3a5a29add634cc414d60ed39e0a089f80e765a273206fc653eacd2bdf302714a5d520a98927e7d9d45c3ff",
+      "root": "d3062a6277a506102d50aa35c61dd53a8bfeea25ca685a26994e9711a7081545",
+      "expected": "accept",
+      "description": "valid proof: tree=16, leaf=15"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 0,
+      "leaf": "b0f22dbac8d3d461e7e147aedbb3ecbe1ac043d460199bf33e56f42d2d1d16a3",
+      "proof": "baa7a85165d51c357c42454e7175ed4dc4bd170afaaaa375e2265c0c645db636aad36cba62be36af7ab035a2b2607e45a00274dd6d5fe1cd740b9574e4d427ef1ca32b36833d4490c6bd3c101042a7b0081ced5f2c4e2b130804389c0323137462b089403c66041922401c5970ac7e8ddca355b1471778902748ba65beec88db8ba7ebae47ad9822326eb9b218d7c500a2b14b81e1b30d39f9c9f0f4f4e391b5",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=0"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 3,
+      "leaf": "16063e60ea215625738e2af85019eb8239259b7886b71035124a8fa8f7f38964",
+      "proof": "584658a5f754b3766f037a59257428a66eb875a7c8ae27561b1848f333613407e22a090044f89c164b86d4c843c24f954be38f861981df16c4fb3cb9892b79531ca32b36833d4490c6bd3c101042a7b0081ced5f2c4e2b130804389c0323137462b089403c66041922401c5970ac7e8ddca355b1471778902748ba65beec88db8ba7ebae47ad9822326eb9b218d7c500a2b14b81e1b30d39f9c9f0f4f4e391b5",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=3"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 5,
+      "leaf": "f655d61d3d79d6c1be5ef55790fe6571b04fdff5b08141af1e343027d6541829",
+      "proof": "66230a9b0b044b1534d49687115427a14787dfe243b9d12e089c771c0afa29db566900eaa3ce468abcb77e07c804c7c8b65f28e56a5f846785f306866408494e35ccb7d42393b06ebedc67c3443e5473270911ca83e72055a1a815723fabdf4962b089403c66041922401c5970ac7e8ddca355b1471778902748ba65beec88db8ba7ebae47ad9822326eb9b218d7c500a2b14b81e1b30d39f9c9f0f4f4e391b5",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=5"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 8,
+      "leaf": "ba14116089ff88fa2e250ba05c5c583b03e6e624cfabf359d6b46d6607e0a8b0",
+      "proof": "c7547983bf93588186d4e656c98bf4709c0a5642910fdecf51928bb66d1ee7df3a69c00e88343279afea354c3d380d67c4c877dc6923dcb05ac6635e6b7af68dc1b77b9e113b9e68275e35a693c8e03aa5cc2550e85dcbdcc7a9566314d9e6fca27a1f8dbc452f62ff90d9b8e1182341c1440e5b68787956d1359b0b1e18a57f8ba7ebae47ad9822326eb9b218d7c500a2b14b81e1b30d39f9c9f0f4f4e391b5",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=8"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 11,
+      "leaf": "5fc1622a18fe9c35903d22654a34053200db75137ee7986dd0d5996b4cbf4281",
+      "proof": "870d4c204756cd18d8737c99d526a4c9ad25171ed980abb6db714dc26598cf8ca1a24b0c8d8dcc7c6d6359ac0fb0dbe915d7186d48a5a4c6d386eff08737fa59c1b77b9e113b9e68275e35a693c8e03aa5cc2550e85dcbdcc7a9566314d9e6fca27a1f8dbc452f62ff90d9b8e1182341c1440e5b68787956d1359b0b1e18a57f8ba7ebae47ad9822326eb9b218d7c500a2b14b81e1b30d39f9c9f0f4f4e391b5",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=11"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 13,
+      "leaf": "dc6c14abd0cfb7970ea61032ac004ea2e63072d891cef1464d77a1e932cbaeba",
+      "proof": "8facb5210023ae01dca98aaebfec941cfa071bba4e043ce40cd4792e1940c10fa1db4e621933f9ab9b445f8af0f5956d8a2f0ee31b5cfd98b6024b248150c1e3cd8701c1d8f5a62e6333a335c5656ed9009cc3d317f597c978dd85640c5f3868a27a1f8dbc452f62ff90d9b8e1182341c1440e5b68787956d1359b0b1e18a57f8ba7ebae47ad9822326eb9b218d7c500a2b14b81e1b30d39f9c9f0f4f4e391b5",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=13"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 16,
+      "leaf": "8d719346a42c614526912441e95d808df1e859744154f4d28bd836cde7719fda",
+      "proof": "cd650e7dbd6488c5e48dfa1035278fc35b463373f68e5b8cdc5bc25c685fb7683e6a5527eba274f5fe285965709f14ecb550db0aff13e91ff53ff39076e2768cf0c8e27a5995e5536832dafd673a1413992f2dc342018c7081566c0a00a34c353758cd7aae28cd12590ca4a3c48072e1346bb7870cbaa8af4d58e3369b8de8020c2a24dc03749803195438dd48d8d1f06952e7445221d7b9f1753094c26d6900",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=16"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 22,
+      "leaf": "984dea2de10ef9bde433956ec1aa0e7cf43c8c982a56f89beeda0edbe31d91e7",
+      "proof": "9b9ca45be5608bd6198e9e689cabbef051f7e51070b3d6107239418ab402737e99868fb3c094e4a50e8228621bc692fcc809239604a4ba40d3b7e7b3ad48947c27aedf9c3a71b5b711ac0608bb3f35854708158b86d98422b7c592139b1805823758cd7aae28cd12590ca4a3c48072e1346bb7870cbaa8af4d58e3369b8de8020c2a24dc03749803195438dd48d8d1f06952e7445221d7b9f1753094c26d6900",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=22"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 23,
+      "leaf": "9b9ca45be5608bd6198e9e689cabbef051f7e51070b3d6107239418ab402737e",
+      "proof": "984dea2de10ef9bde433956ec1aa0e7cf43c8c982a56f89beeda0edbe31d91e799868fb3c094e4a50e8228621bc692fcc809239604a4ba40d3b7e7b3ad48947c27aedf9c3a71b5b711ac0608bb3f35854708158b86d98422b7c592139b1805823758cd7aae28cd12590ca4a3c48072e1346bb7870cbaa8af4d58e3369b8de8020c2a24dc03749803195438dd48d8d1f06952e7445221d7b9f1753094c26d6900",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=23"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 27,
+      "leaf": "c8363e97960315a2781f74c5f091f73f4e34fc0070161cd99eaa5a46326d9049",
+      "proof": "a2eb509111e87bde41dea1bd64487029e70fb5b599cd33481f6d32438dbc3aba32272658d314fee7f6d033e5ada83fa83dc42c5b2765478d5ecd53fea79394d9463be1d3c13cbfd88daa0b07047d53e8bdfc00eab9232023c5ca74e3bc4918dc36bfeb40e0a95ec9c955b75b76c1b5a00058e2342d8ae8fb494be2e5c12c008b0c2a24dc03749803195438dd48d8d1f06952e7445221d7b9f1753094c26d6900",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=27"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 28,
+      "leaf": "d9c83cc65f0b645addfc052151a73ed3b786dc496a63185bd76603cecf9d5ac1",
+      "proof": "2b5e4e0863ea5bd074a4986648d8a21e644bd0ccd918297725f657e81e378a774546fef3ec3323e9e69dfcb2911a585841c93dd6cacfba42b8ff014507bdeebae27ccc2875cdb36155e81d4775c481ac4273e84737c38c67e0a58f22a37a72e436bfeb40e0a95ec9c955b75b76c1b5a00058e2342d8ae8fb494be2e5c12c008b0c2a24dc03749803195438dd48d8d1f06952e7445221d7b9f1753094c26d6900",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=28"
+    },
+    {
+      "tree_size": 32,
+      "depth": 5,
+      "leaf_index": 31,
+      "leaf": "61a60c04a82d6621ce26a5cc2538b11da282fb4c1d8b8baad7a2144725b3437b",
+      "proof": "f70db1ef2fdd73d7b0bada0aa1edeee33d53ec66400d604a803bbb1de606efbcde32c2ce9942530f487f787c8416dc04c618192910652d4925e4a139630ba44ae27ccc2875cdb36155e81d4775c481ac4273e84737c38c67e0a58f22a37a72e436bfeb40e0a95ec9c955b75b76c1b5a00058e2342d8ae8fb494be2e5c12c008b0c2a24dc03749803195438dd48d8d1f06952e7445221d7b9f1753094c26d6900",
+      "root": "938a372f0ec1bdf9afe60edc1cf16509acd3ac5f115ec08f3b899fa4550a9c78",
+      "expected": "accept",
+      "description": "valid proof: tree=32, leaf=31"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 0,
+      "leaf": "06840187f3900af522927cf278323004a7b76832c3fd08814bf37b6f7ac82f39",
+      "proof": "ddc54f99fde9696f01dbc30b651cbe28f3f63b5deef7153c25d7ed5b97faaf0dc60970d22ec14e2d037b9ac6526ccbffb78d86056452f66f77f3e40765830cc0f9c09a4959e4c49ed1f5fd57ec30c4a163210dfd94ef29dc29b2c5611d6c7d41142b69392fd406daa3843c20d06b93be30c878d43bf8c952ac4075e4cbee17a0e8fa98ec83797e1e7b0ab71c7174b7866ba329f6a14b84123dab8d76d8a4be5e69401e7caf37ead7d4e75bdc8f5762e27b4849806985a70b531545d7bb8d865b",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=0"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 10,
+      "leaf": "4921f6a984ae5552b94ff27150eca11fd27b6aa34cd942ef4d623d13a8439d26",
+      "proof": "a1c7056236226857feca8eced4087fa584e9c5c3acd0842247a56d40d495dcf34b1f24689dd2e5d0dfe681897c6c9b8350a356aecb0efb15d897e4a85c16373568a70fed706e35374d7fc0dc5a779ca7f41ec63e267a1525e906bef1a1b4dbec3f5e31784874fd2973af8466c0df884fd2dfda84c1aa787dfbf7d53308334ec5e8fa98ec83797e1e7b0ab71c7174b7866ba329f6a14b84123dab8d76d8a4be5e69401e7caf37ead7d4e75bdc8f5762e27b4849806985a70b531545d7bb8d865b",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=10"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 25,
+      "leaf": "8245cf6bfa2051ca3dc42488f2e4e7d5a57529329f8fafca343ea579cd572cfb",
+      "proof": "664791e88da972ecdddfa5891a3b5baf1c33eca0c6bb6cf62da51bff52b3b461ef31740439561e92ce7415b0f453786f61f9867a76692f59a84dd398168b5bf3e44038d025919039ee7ccf9917c9f19875e5b5d2b3ea68d7cd4239f3fd0460768f5ec5bd4608d8671729e722a30917682495506fd0fe3535e94e8e58450cb26f223686bee5ef221698885ffcc1987e274b1b8d25bcb406b1a2a3922124003ef069401e7caf37ead7d4e75bdc8f5762e27b4849806985a70b531545d7bb8d865b",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=25"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 32,
+      "leaf": "853298fffb1d09d3bcc4aa320033527de8d3fd95d67dd901cb35846129c91ffd",
+      "proof": "6fba83accebdfaf0b6aeff82140e33f289591d74985e3bed062eb4f46e0097c20c2a66148f5af1c5ec60a84c763ef454be66f9e7c2734eecd82d9b2206b3b4b46f5e1d41c4e1041647a39ce596aa33b4487c2d4e42a29e0779b089fb16edfc0e2abd9457a809620bed76a1d769706c3b4cac10030cb4f1ab7b9128418df8e69d4aaf05611aabb6d2699f43bf7f40e88133e1d13ae293397649b2da347ad575d9ebfa7c9fdfe4b253e5c413a19270940042bb329ea078e75c213b2036d0716772",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=32"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 38,
+      "leaf": "63d8eb07cb8d56829c4f5e9ca33bde88be47a08e7193496e663f85ec5ffb2b28",
+      "proof": "fc5c578b970d26bcfedff3562d7b22e2664ae2f4cd01cf95da0f2134df71169dc30a530c4c4fe506893148c240b0c52aa12c27aff7ad6c07b6a3897cd6e1f3260b4e2170e4f12479a4018361368c49ba28c1606c844bccc7561afdcf104641fd2abd9457a809620bed76a1d769706c3b4cac10030cb4f1ab7b9128418df8e69d4aaf05611aabb6d2699f43bf7f40e88133e1d13ae293397649b2da347ad575d9ebfa7c9fdfe4b253e5c413a19270940042bb329ea078e75c213b2036d0716772",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=38"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 45,
+      "leaf": "da4732af0b8a44489f03a7689b870d267c6845bedc1a15748701b72c386345ca",
+      "proof": "45755d6b766b070035b6d4f976d20ef2168d4cc422d235e69469a8cc04ee2d1598b18ab26206f69b5079ca81b9f9aa3fa2babcd8e4fd321927b08ebccd39a062b9a63c208b9ce2b1026712a1db95aa924cc60520782606e50bfe0fa1b6cfdb5aa30bc08f411db9d7eb5aa998078805cafa2f2ed64f920072533c29a173c22f214aaf05611aabb6d2699f43bf7f40e88133e1d13ae293397649b2da347ad575d9ebfa7c9fdfe4b253e5c413a19270940042bb329ea078e75c213b2036d0716772",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=45"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 47,
+      "leaf": "bfac2a6f1918f3e7ef54afd8562cf2a87156cd6eaa13005b0b2a8396edd22485",
+      "proof": "f0a1f3b61ba9c9edc87295b301db7d10b06fd432023fc143bc3dc1977fbae9084f0f56948834dc1178eb12b07962dba7721ff814bc77c95f2142aaf5cc2fbe88b9a63c208b9ce2b1026712a1db95aa924cc60520782606e50bfe0fa1b6cfdb5aa30bc08f411db9d7eb5aa998078805cafa2f2ed64f920072533c29a173c22f214aaf05611aabb6d2699f43bf7f40e88133e1d13ae293397649b2da347ad575d9ebfa7c9fdfe4b253e5c413a19270940042bb329ea078e75c213b2036d0716772",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=47"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 48,
+      "leaf": "ad4e3aa5c11ac44cae6add1d77f3ef9afffce577195841ffc392c537972f0f9c",
+      "proof": "aefc5182e10b8aa473e46c2e160d93b7ef879bc990da9b7ca31af8406124d6241cb60605adffe498a1580ec856eb700f0cd6c2b0170e5185db4a393fa77b9e619cd0a7eeba10f25b6c206fabe3cd5e85efe3915b15ebfe19838bdc6c277e730d01fa4aed09f703fc07f11d90544b8625a7704e67d09fa9802ba3cf50b8e86bc410d01567892531f580c56f8475aa41d4a3dde34b77f382d2718a01dd1a72173aebfa7c9fdfe4b253e5c413a19270940042bb329ea078e75c213b2036d0716772",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=48"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 51,
+      "leaf": "135704c81df6590b9e1811c8604e5d37bdb57d1240356df89e114828a719c001",
+      "proof": "f8a57133215d1fd6ab8f565ed70daf8124bd51c776f979095eea16ec6f7d9b3ceb32e2555293725540814ae48383fbcc3a73520cdd390ac165300df5122d67639cd0a7eeba10f25b6c206fabe3cd5e85efe3915b15ebfe19838bdc6c277e730d01fa4aed09f703fc07f11d90544b8625a7704e67d09fa9802ba3cf50b8e86bc410d01567892531f580c56f8475aa41d4a3dde34b77f382d2718a01dd1a72173aebfa7c9fdfe4b253e5c413a19270940042bb329ea078e75c213b2036d0716772",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=51"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 52,
+      "leaf": "83d1496173c7192191c35115382d4bbd2f1b2f3d457c858213fdfda419d68bc0",
+      "proof": "771b422cf384e037f3527796e9288515142fd823f3022b71fbbfdc9fa19be0c00fe33b537b86e7eb152859c79e2bfc775d1397673a8e6bf01257d343e1e81247cca9dc997b75c19a21359228645c02a9e0895ee6d35a3f47f5705b6e1c05f0b001fa4aed09f703fc07f11d90544b8625a7704e67d09fa9802ba3cf50b8e86bc410d01567892531f580c56f8475aa41d4a3dde34b77f382d2718a01dd1a72173aebfa7c9fdfe4b253e5c413a19270940042bb329ea078e75c213b2036d0716772",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=52"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 56,
+      "leaf": "02a8826413d12064b8f1e776565641e3fbf2f693af132dc85b9d0762a639d760",
+      "proof": "2c8408a6335030065315b721fb8ec96db93f68f829e7275ae3635deb6c4b7451088b1a60a233dd6e3832cd0893b30596a04b1a8d3571194e47743ce3890d62f787e987534063648e10f2e189cb63619784020786fc788453c08a964fe828d0d540e3d9aea60f7d32a5a43fcfc14afaf5f6938bb6e07f5e4105b0d712af52baad10d01567892531f580c56f8475aa41d4a3dde34b77f382d2718a01dd1a72173aebfa7c9fdfe4b253e5c413a19270940042bb329ea078e75c213b2036d0716772",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=56"
+    },
+    {
+      "tree_size": 64,
+      "depth": 6,
+      "leaf_index": 63,
+      "leaf": "81f087640483dbc542ed87457c4e45920e8d3f9f432a2cb493e61d4e2603c161",
+      "proof": "fdb45bc7a1298c86c3fe37a7bf4154646a4462b368dbc0957532998c350363c270fb007a3125cce5b625d9a0d76e69085181c2fba97f8f891e8e93079ebf85de55bff6d70475b09895b546ac3a84babb9320fbb33688d11112335709ab6fbcfe40e3d9aea60f7d32a5a43fcfc14afaf5f6938bb6e07f5e4105b0d712af52baad10d01567892531f580c56f8475aa41d4a3dde34b77f382d2718a01dd1a72173aebfa7c9fdfe4b253e5c413a19270940042bb329ea078e75c213b2036d0716772",
+      "root": "99312d491be9b4026c163c3ae1c4047277568909f66ce4f6be5ba96d58189d54",
+      "expected": "accept",
+      "description": "valid proof: tree=64, leaf=63"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 0,
+      "leaf": "c3d3875ef95397b840e8f29935166d7ee81870a24a22561136578201d28ae363",
+      "proof": "5d6c025281371d924e04f9fe8ccdbcd311ad2e4cf0877104e0bc2fb4360eec9f0aee92d89d2701afe57ae87805253d9112630413550bb0b231eaf7bd0383eff36685f68551543c643a91027edbafaac42a9901c68c3134221a998ccde6f556d3df11432e0a3b1f17810ddc72003b5d120acd9af13f91b93c5363c8a3bd1d3f608121a1d8041429afb742f418ab30a3cfbcbac6d4178be1e19959e5e7a2333bc43affd636b7978cdd66aaf64eaddd6d030ec7b59207e80579afc0be4a1c0730d96f9c1f236c8540d3669c1fc3bdfd1fdb1369c24c37e9b5a7e57b485cac35a64a1906ee0022c2a251f19c8928628122aecaf6214887a8879cf1b1dd0de403033f",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=0"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 43,
+      "leaf": "4338285d42f6521c6168974081ef7e359e418ab3dab0c4b39567619c42c01c3e",
+      "proof": "42fe7d112b5af506550ee2e984469d4cc29cd144392075d75f3ba550e8e378cdeece722d55384fa3522ec53af458e34fc37edcb4d0a9c95e992fb79abab7687f68953239ffefd4d43506e68e17a5c8ca70b2fc9509f6c0f8f476b01c367a594bf3c24a29f5dd8f1f6c8202fce70872c0208cb0c7ce04bae35cedf075140e92b05ad69dc96a9cb14ada2ef9238c065ca7ca7c650adfd4b0cde3764f25153afdf731e73fb550f37afd48b698af27440149d496e75421046dca684adb4ff7b578876f9c1f236c8540d3669c1fc3bdfd1fdb1369c24c37e9b5a7e57b485cac35a64a1906ee0022c2a251f19c8928628122aecaf6214887a8879cf1b1dd0de403033f",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=43"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 52,
+      "leaf": "3e3141c50c961322af6aae45d0b14b21591b16efd64ca8a840b6156824f6c488",
+      "proof": "c83fc45c960bc00a216ea7faf4fee6a7319b8085a6498cba2cf55c26869087a211dc69549a158626ccebed361dfe5a8f82a9ef0871121a8fd48565f21116d51f1c1f691365ab495cba8403dae8bba59b2bb0701c568099e2bead14a468f5565701814e3b546040bb5d6e71cebf978b1e5aa6f776781c946abb2d1f0fb81df1160c6fa90670d9e5b6464cea9dc8810e726034252ef5fda924c60383bf0c5c1eb431e73fb550f37afd48b698af27440149d496e75421046dca684adb4ff7b578876f9c1f236c8540d3669c1fc3bdfd1fdb1369c24c37e9b5a7e57b485cac35a64a1906ee0022c2a251f19c8928628122aecaf6214887a8879cf1b1dd0de403033f",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=52"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 56,
+      "leaf": "8ed671d236e81df84f0df4d49321b66115f0a42fc6b056f854c1af8d29c06fa2",
+      "proof": "ba7974abb31fafdc83420ab8a11b2cfd9b5693887599bed1b9a76226c60d60c798d74fe13a406d79178dbfce95076097410e09bbb67b628d490b87b346c66647e3eefdb303d451a97ff640e9e2d8c2200f29ef69344d99735810f9ee40e3b07913e0490e49e5b579830e33d3fd661a7239fbf31c1c37374410971203af7ab2c10c6fa90670d9e5b6464cea9dc8810e726034252ef5fda924c60383bf0c5c1eb431e73fb550f37afd48b698af27440149d496e75421046dca684adb4ff7b578876f9c1f236c8540d3669c1fc3bdfd1fdb1369c24c37e9b5a7e57b485cac35a64a1906ee0022c2a251f19c8928628122aecaf6214887a8879cf1b1dd0de403033f",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=56"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 79,
+      "leaf": "75e8c92a81aa19d9bd600c1c3ab8b61555c2a197cf5bfbc2303bfd38037d12bd",
+      "proof": "0d53dc141ef3c961f15533bc854b40fdae2826b7645a30a0a0e6b48168a8247aa319f01ffa8c7306fea6368f0e832aac7adedf6bd4eaab232e5ff7613fb6c19ad61c9c5e0d1677f8f277e76105c8e0e4a419bafa1ef34b325842340b7383c8451ae49fad162385e728980109cd2ff075679b4ab8d4ef0d2055c338dbe8dd60990bcb85656c2e8330aaf4dea74a5a40844037b940327b669dc7710543250c9a7b2fcfea76fbf7b68ccd9598fecc807f71bedc41f7205d77f2554400ceab9f5e448c8b4ca9b4764f8d871ba6885e744f86034e2b054ced0385afc5ad8a3aad7a091906ee0022c2a251f19c8928628122aecaf6214887a8879cf1b1dd0de403033f",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=79"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 86,
+      "leaf": "5f1b30c5177b43b25a0630ad27e6e49ee8ed816690fbb01074993a20a21b99fd",
+      "proof": "db3f3cee4af062283b326d9008b66f2f28a0816e5779f911ac3eb679190baba54e26c7904d2538872ecd702881b7f28c98dda91de5ecb141698dbc03ee7c42fbbe1e0dbea54eba2f64984fa1e2ecd73b042be15287d88aee40276d12b686dc2c089ed4d5195acd7e48fc91690a63507ecd338846a1569f7ca1b0194ddfd0c9e7dcacb84b567a020e1cdb0324ce2211be202e49d9d64dbbf6870d6882ce5c98242fcfea76fbf7b68ccd9598fecc807f71bedc41f7205d77f2554400ceab9f5e448c8b4ca9b4764f8d871ba6885e744f86034e2b054ced0385afc5ad8a3aad7a091906ee0022c2a251f19c8928628122aecaf6214887a8879cf1b1dd0de403033f",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=86"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 102,
+      "leaf": "bc3d33bf1b348fbb13d325b45aab63fd6b373aa147c6ed9e007c55e79024fa9f",
+      "proof": "5f506ffd115ee563221d36db566a53dfb08a15c246170e46ba0af6dde315ae478b530207112101b43cc880ddc5de812fb1056588458d4880a3c546695e7a2875905ac0e089fe17059719f8a98be512683b6618632358c6351ebc26222b2076de4cb05de03592dbdd9b34d385971e553b05e4b8e2dcfaf9a2cdd1d1583e9d0fdd462f3ade21cbe009f02bb903d526ba37e87490f873e27cebeb4eebb9bdbf56bba88df39057c225a488f68c226be88b5edfc4b6c8c9e98e1c1a9b262b32fb89048c8b4ca9b4764f8d871ba6885e744f86034e2b054ced0385afc5ad8a3aad7a091906ee0022c2a251f19c8928628122aecaf6214887a8879cf1b1dd0de403033f",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=102"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 128,
+      "leaf": "3786d72185bb01f000a3d29550972d29b2cc9efeb92798aaf9688dd31f48b781",
+      "proof": "b63d945192621f5bab82343be10f9f844445cba2c7b5e1b5512b9c5613f15342d84aaf61d4cdb5e40d6539315547b29de1dfda9afd474031f9946836533a413451af01990f84c5ee5022d4058f7d34c05a1b8c05113f0acba825edc70daf4f94075dddeaa72d92835654afb152ae62278f9f3bb089b02a799605ad32c0ff660f30238387a29e0a26896d4ff6f197ff619420c1eff77850199f91ec11028369f731b953730017ba52f24dd4362553e6c3019114cb18e9a5ba8053fe938b9341d75c6fa595e5c51d6c593321bb99115a784d543ea96e8733e892aa449861869b8a8022a0dfd4089734345fb5629c22d53bfeee3b15b01805f34336e5f65c21f61b",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=128"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 142,
+      "leaf": "d2c700d528752cd61567e59db412d371ee40ae15db99f5ac9eed332e52789dd7",
+      "proof": "b67f127a9df32100abc3ff4e51300842314f0a18e6780dee63696425f96771c0ebc43715aafc08c0ae9a908f61c756203fcae2d54d3e298c72617df7d07c2016c71bba73bdf1bf41e51fe2fe4a812e0e075ccc52d3f9c8d65d3e2c8026fea40e8c50d115a39fc2a70e237a26eade57525dbd9f46449497c460b4ebf0fa43cf4230238387a29e0a26896d4ff6f197ff619420c1eff77850199f91ec11028369f731b953730017ba52f24dd4362553e6c3019114cb18e9a5ba8053fe938b9341d75c6fa595e5c51d6c593321bb99115a784d543ea96e8733e892aa449861869b8a8022a0dfd4089734345fb5629c22d53bfeee3b15b01805f34336e5f65c21f61b",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=142"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 146,
+      "leaf": "de82909150ed257af520d4772fdd70af48c5b258a4629d83052504492be93181",
+      "proof": "ba35836d68ace206b3f2803f0f87629307124f9750ac7c4314cb7d2d104256149d3236c6963317e2045505109eb5d5ebb9ef2cba2929a09aef4d6c72601bbf04d334f6131ad8b0e1b1e238198af97be26f214bf3dd249c8ddac2a05c457261d4fbfe2b1b1c1c187845bde51bc666c83da8703a11cbfeaa0c72b7afad8d693b87cea887c7f84bd1bcc9fd0bde15ee43be5a60bfefe4ac158efe9a087fa918373d31b953730017ba52f24dd4362553e6c3019114cb18e9a5ba8053fe938b9341d75c6fa595e5c51d6c593321bb99115a784d543ea96e8733e892aa449861869b8a8022a0dfd4089734345fb5629c22d53bfeee3b15b01805f34336e5f65c21f61b",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=146"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 243,
+      "leaf": "a2108a66c0bc574cfa4642f5d27a27f007c6a7b3f0b697f95bdcac919cf73cc8",
+      "proof": "3a2fc0f1e270697c4cce92a587db12dbe93af3902ce31b11563aea5c429c15f5b28d6b8d6048fa5f27a0710ae185d8eb78909fd349e8602b40b3c5cb080f7da4bf3ce8fdda3a4e67ac10e9165da781268b8fe0465d59001ac09e2f1db20f56254115a8b671f73f52f7b45453b545f322dc5f245355c5f9bc4e949ca1f6d3537ae9c725180fe41476b1aa08de794488b3d5dadaf2a11022cb962aea0a4f0365743baf96aab265c8d0e35d8769709ccc3630a69120ba3da1af5e6e373e9125b6182823ac2f7a1594aba4abb363d6e1e3ebb29699d5cff1be6ee9fb15e11906a3e48022a0dfd4089734345fb5629c22d53bfeee3b15b01805f34336e5f65c21f61b",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=243"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 247,
+      "leaf": "c10bbb55abd1e9f8a52574213bfb6fa05ea881352641aba76911045be73e52c2",
+      "proof": "4d313ad210f88606b6f205b1312779e6b808fd6408863d29b64b8d5de38403cb32148bc5173b620bc4474d1ba6f6878638c6cc5ec69d549acbed02512a4de668e16b67e17bcd61de29d062c842fc0e262f68ddbf0e39a993bbfae3d9c017c2864115a8b671f73f52f7b45453b545f322dc5f245355c5f9bc4e949ca1f6d3537ae9c725180fe41476b1aa08de794488b3d5dadaf2a11022cb962aea0a4f0365743baf96aab265c8d0e35d8769709ccc3630a69120ba3da1af5e6e373e9125b6182823ac2f7a1594aba4abb363d6e1e3ebb29699d5cff1be6ee9fb15e11906a3e48022a0dfd4089734345fb5629c22d53bfeee3b15b01805f34336e5f65c21f61b",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=247"
+    },
+    {
+      "tree_size": 256,
+      "depth": 8,
+      "leaf_index": 255,
+      "leaf": "2421aeb1e8259a9173f429bf124f6b2151af9619773480bc8988f8acf60e4b85",
+      "proof": "0f7ad0c86dbf7c5d7d353a68ad2538951753d9f231f85a8119d28fe26ab38481750a3e77f5cd089fdd83e54556e6adc37d7b565f52c596f12d8129964737d3ff855bdd83b6e48099ae1d0d48be739a210931faa7182b1ee293af1ebce68f9da79515a3435761aed5f5b6b78370c0ecebb56478b5c150ce8d0a4168490f8aea95e9c725180fe41476b1aa08de794488b3d5dadaf2a11022cb962aea0a4f0365743baf96aab265c8d0e35d8769709ccc3630a69120ba3da1af5e6e373e9125b6182823ac2f7a1594aba4abb363d6e1e3ebb29699d5cff1be6ee9fb15e11906a3e48022a0dfd4089734345fb5629c22d53bfeee3b15b01805f34336e5f65c21f61b",
+      "root": "eba3ff5723a6ec8b7eb5ad8b767f08eee8771d93eac7eaf8caf43e901abc3ec9",
+      "expected": "accept",
+      "description": "valid proof: tree=256, leaf=255"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 0,
+      "leaf": "25c8c584337c8626031fd0f346041f2b8f9feeceecc335dc6a8a27630df57b15",
+      "proof": "75d28eb6504fa07afc07beccb391f352eae1cf82e1511e64eec82b0d238c210db6943da680db045bec6367ec96180df88feccc0f640ac67e1fc44287e5de8bc1f717bfadaa6d72b49d1ffc35a7b1a9c4cb07075fa790eb34e7ae5eac1ec9f5c7e75c9e94d967f2948dbfe0f22c3d8220e6edf3e7bf6621703a83a3f5ebcd34a4386c0857d4d37a08ad1f9ec7470221a1bbcfe9699a4a1fca83160e09200fac3057eac7092ce0d22802cc2ce6c2b87daf1e7e601e4a32ef824e17edccb2d2302d074963bd7864952ac8fb04b1ed665357b9d2f0adcbde70522beff02a0d4b5b51be5b7bd5f46314009c2cda4aabdb6be0ffb8890916e465eab8a0dd858422d5ef5308efdb4b879a4bfa0c35a89dd915e5fef783436e3ed65fe1999f959ab4962e1a86f25d9ba9e8dd534ef76d81da78e7a99ead9a682080b293cd638eaa535847",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=0"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 179,
+      "leaf": "34cac43b19bf66ce44c75c1e018f27f974b4b4ec63d9fee706c9bd1e962e0120",
+      "proof": "de571a735cedffec0f05cb570ee6900f6379d3f2606a2cb0e982b86d82320e3ff735e42bde0e99e6074d25bb775f289d31203f51f588db83bff0d600aa2d2b572e77389e68af25c717e96343a0c986c0912ea83cc77e831a84256eec22ca3b943bb0bd5433012100f4f50003ab88a39dfd3ee53baaad4b1d88681a6407608345b4ded6dbdc76e9ce137b6cdd3d24c0aa5b45a8653e5e86209341c776f06ab2fc1493513778e1707f4402344e8f21956e0ca810687940af6c2cb26e13a88a24d5abcef0a38fa3c0dd4be4ad78530a671f9a30b6df593a33ebe59308bee28dabdb21917d231ea4c354b359fe307932ee61ab0ad28a6f0a15b4f287c583c9a1c4955308efdb4b879a4bfa0c35a89dd915e5fef783436e3ed65fe1999f959ab4962e1a86f25d9ba9e8dd534ef76d81da78e7a99ead9a682080b293cd638eaa535847",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=179"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 211,
+      "leaf": "ef6bce86886f23e64cb3f8321e6c50b883b393a68ee51b0d79e75c25c1ec45c0",
+      "proof": "f543b1ede00bba6cd7a70d7c6389be64a4bf1bd9aa0871e76184731ed959cc290b34a6626d3b9c5b82108079085aaa172599e0d97a4289605f2bd4354ae4bfa178ccb56b87dfff9624d57185802af401583b3836faa0f0898d5e4472c746365fb3da1ec47754ed45c21de2f219ec018fdee09c7976085ae0beda44bfc6e66971c4f6755c1f71582fa99111ff4ee08cd410f75d182b0cf538cd79c6be97636fb44ca00b00ccebe9085972071bd63908783c7b7ecf1bc2190816807ad93de06a094704579dfbe0992197a662750b65ceef11c84285606d6fe6a217db2fe9132bdb21917d231ea4c354b359fe307932ee61ab0ad28a6f0a15b4f287c583c9a1c4955308efdb4b879a4bfa0c35a89dd915e5fef783436e3ed65fe1999f959ab4962e1a86f25d9ba9e8dd534ef76d81da78e7a99ead9a682080b293cd638eaa535847",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=211"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 336,
+      "leaf": "9b2795b1fe8b1c5bf58d724d96f711f8da2b9987e5d9ad860d6e416f9c67ddc4",
+      "proof": "137f49b3342e5b47c51e2dd0d0710ded710c98ece32425efd362ef6973682104203c2b4749fbbe3f550506beac052cceecd4f6dd8238ac64efaef17335b922afaa161cb684658d96e85b1d45bd77f1dde8aa2c3a4b700e48ebba58a4df60cbb8103a0a61b7a82570d613a7e3b8942b8a6e5a19157cfb05e35eca977b776d503630ac7b4bf124bf36b008139cd18357c52878a14482e062515de933f2ddfe19566b781d0168ef58e6412fb153dd8b6ed20c99e50247819137248274c00091268f5abc95e60bbc84e4c448d7bc64e9f870fbbb1312c6c7ed782e7d0c9170df8e91113f4600367f6babdd3bddc40bb194203a417c04654ae1942bbd0a028bff39b6f0ab9026e891c3cc42069b43b99a00101647b4738622dc404a1ee232f21abcaa1a86f25d9ba9e8dd534ef76d81da78e7a99ead9a682080b293cd638eaa535847",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=336"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 418,
+      "leaf": "367d02f3a17e5297b3fd27a20762fafc08b2aa28d600c96534bd5c19926e830b",
+      "proof": "da0c0419f04880eec1998619a84efbc8bb26b3566a624d696fd8e1bcb1bad0649959e223d7d5af4c36fadd8231420a7fefa45ff5e579963d9c90d069f5e3339c8d41b26836f5916fc737c00452c9f5e1461099a9f4ac5e95e60dc26945705d2d60bc8db8283227771bbf7ebe9c9daf741d32137e8ff38a33401268a9f3442299f0b44d370805192af990d8e8a62de4f319ea3d2ffcb754ada61c34f3c5d2687ee10de7659698c685cff3b53441e9cfd3fb83842f644fcbbca42ac4b9a609c00784648e5cdb3fac78082578b8e779d5279ce50119f9441118cdab0f8d10886c8813811bffab8756fd099919ac784566efcb0c8e050b5639477622505773b262a4f0ab9026e891c3cc42069b43b99a00101647b4738622dc404a1ee232f21abcaa1a86f25d9ba9e8dd534ef76d81da78e7a99ead9a682080b293cd638eaa535847",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=418"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 512,
+      "leaf": "46bc77507c714196f69616dc566f81ae3d88035d098bdc7a53a35f887edcdfab",
+      "proof": "5c9e4b067a722c141830c83ff9dee3f7415fae415a76508c831954549b112e58f6845a5a10fbad70ee1763502576f0c3f78acfd97ddcdcf965ee686876a69d2c55516a2cfb6746563b52b4030ac6a14863527025da4b1059b3d6cb987ea4626e4a2a7a6a22ec203b604eae49fa4cf9dee82e551955e47efdf5543c7077342c3b42d211ea575abe6152f18b246ae2ea0fce781a48896fa6ca90f60ed208f5438ca76dd9542a4fb43fde1f6d234d0e604d801a63a07e29757c15ae6b3501ea4a7169ae46b3087e01a20b05cf0e106a33e268d888998f4a79d20445b09e1ca97a16b68d44c05929d871254640ca049eb8ffd4549b8170079c9f2502365652463633d0b9bd65b3ea59eb0265add13ca89126efcd207e7a71c5b843b112186e576d482cc3ecf1df9a1fd21a507f12fbda78ba04efbc6cddfc8fc8ef9c43c655e18304",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=512"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 541,
+      "leaf": "5b377f8716cf49522352e324df5af9e991afd3dd79bacfca6ff8629fb824ec41",
+      "proof": "ce59c1e4177edc505fcb2258259bc9514913662e28ff34f9e08ea7ca86076bdb6e4f83f5fba03304eeb616d68d517aefd25a236ea5f9e4ef521e77a106c22d80665371fc7d5542590ba0b99ac4a206110b3aa791f1ed1d5c2b4e3fe6471a055049fd343f2d5c1d595f3767791bbbc900be882173308e60806a9f1c2dff98590e0bdb638599e83a8513865cbf2fc113d1d6b29d6d1e86ffee9f8653df795c03b7a76dd9542a4fb43fde1f6d234d0e604d801a63a07e29757c15ae6b3501ea4a7169ae46b3087e01a20b05cf0e106a33e268d888998f4a79d20445b09e1ca97a16b68d44c05929d871254640ca049eb8ffd4549b8170079c9f2502365652463633d0b9bd65b3ea59eb0265add13ca89126efcd207e7a71c5b843b112186e576d482cc3ecf1df9a1fd21a507f12fbda78ba04efbc6cddfc8fc8ef9c43c655e18304",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=541"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 570,
+      "leaf": "a09b118851200aad2fda1f7d25d2acaa352ad14eba9dc73812110db7b23bc342",
+      "proof": "89ad912911302b2949e4105f17e45bb11c3831b0b89b2b094c596248fc6e18fa35b219df0f9b4b0ce04cf5048f003aa27e0667916ab5efb93f06469cc734c9160bcd56d274d96f08494134e6e2ccba2ba104c5b01d7adc3894775354100a9090d89df9ac8c23145fec222ce40f2eb2a3a2b56eadd8e1174cbd8915659d25c63c06fbd8b03e9183252de740ff4ed36c468a95d47957c5cde3664e4027938c3a692018d33613ccc3a722887f4b7716c59b9e712fbc976759fc536c0ade3f4f472f69ae46b3087e01a20b05cf0e106a33e268d888998f4a79d20445b09e1ca97a16b68d44c05929d871254640ca049eb8ffd4549b8170079c9f2502365652463633d0b9bd65b3ea59eb0265add13ca89126efcd207e7a71c5b843b112186e576d482cc3ecf1df9a1fd21a507f12fbda78ba04efbc6cddfc8fc8ef9c43c655e18304",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=570"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 668,
+      "leaf": "a28e242dfbd7ea51f0415966c7c7e9b9516b5b0cccdfe17cb31fb36e5667b3ab",
+      "proof": "607137323eceb78e318bbbf6b6ce671a1bfd2f43fce084bc702593c07ce764ca74c6db4b4236ace574aaa1c034ed9ea26ff4d3903642235ff880563e60325c759e4d4b54339df772eade57b7691f311555e4a448a1affd17bc3021edec6dff2273d722e944b12de8cd6db832deab61c8d835c3457a91fa36c310348814e46cc77ad8cdce14976cb3430616c68b49f93a60e4ec6142cde7d93869e6a378b8f16eaa7d502e0e5026f2c647571895d8db5ef1649270d862922de5da649c51845a3783255e4c7aea271f64306292e38fb10974619280aec8014ee0062da87a415879b4fa16f26a9267d93b6f0408cd7f1baa6a92ca88bf4df590047f617d8b769656d0b9bd65b3ea59eb0265add13ca89126efcd207e7a71c5b843b112186e576d482cc3ecf1df9a1fd21a507f12fbda78ba04efbc6cddfc8fc8ef9c43c655e18304",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=668"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 692,
+      "leaf": "82dace6767297a4bd63810b67cb3bf79812ea6a9d459a43b0a246f5615dabeb1",
+      "proof": "eb47dabd2bb4c1b9864407e80d06b68e7c56bb6ff8067ad40c50d92f8a5cbc957edc321d0a9b6cecef1475029d197ff14707fd5aa095755d6be2dc5feb9c33503e274d68e072813b54b66c3a2a4d4cfefa4ac5f823362374554700d62c4f0d66599636b60d250e86f999ce59e9c303fb26e38c48f7faff5f6fe28fcbfc22b0145cec8ef059b722c1927469a10bc30da6e9d49e886b454c971a00fd15748b479e7487c85beaf30c630a45e21fb8312127327dc58e3081b4cb0b23da8aae7ab56583255e4c7aea271f64306292e38fb10974619280aec8014ee0062da87a415879b4fa16f26a9267d93b6f0408cd7f1baa6a92ca88bf4df590047f617d8b769656d0b9bd65b3ea59eb0265add13ca89126efcd207e7a71c5b843b112186e576d482cc3ecf1df9a1fd21a507f12fbda78ba04efbc6cddfc8fc8ef9c43c655e18304",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=692"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 875,
+      "leaf": "712a4ba47006eff400b8fd6b6c7dc308d72dfdfec81f18ad4f146429a0c4b118",
+      "proof": "fb0bb4528a47dc6991c0e52b34437d08796e68f6a0c3bbf23b626ef3f7a8a1b37a4b1e33a712ff2944db01a7d5742db5090af9762b5e4cb6a2b10c1448447f77bae6d15ae384ad28f7c0cec23e5f5baec651fd24041fbf6f75bf5f5f09e9d807117b9cefc80ee123195cc40d0a4001e27b3133ca9d9634cbdfcfe9713166cffde35f1fa55b0f10d5b4c855380d308c0367422603dfec80bf38d4bed6d11c3f1dca7ca491e7d94dffd112fb96b79893e416abc699c4c207768f473ff7951643db0da15f538db71e145d4ec2b7ec0b048c79b66258f8105319c0d80459b355191ae710bff454d2ffac3c22ed209ddcc3b4fdd9cb890e258e97a50d6da25631f5d912b9c1bc398325fd57669f9b796d37a2c79b324032cf64d932dc1c78e54e47ed2cc3ecf1df9a1fd21a507f12fbda78ba04efbc6cddfc8fc8ef9c43c655e18304",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=875"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 999,
+      "leaf": "c6e2ec06cd75c32693e111a5af02c9bf21f3fb00b903cfab2d282689dbc359ef",
+      "proof": "27eb172dc0da9d20750c871686cd3ea714f87bbba116055139f1ea2613e0355ba41f5fa6d4d72dc43e5839eb8593775d4ea4be399abdb5a9805e59351c95019232b180b65b6cc4764fa78694f8a5e4ee58e6964a83e827710dcb53c3695f7050029bedec1f2e0a5480fc636f1d99b0e39dc8345567bf1fccd02be24d0f2ab8b085567e13367bf3b6aa8b99f5ddeefa0638941cb503b49c258d831e36f25ec6e972f7bb02c070752de97c9e0aa9598ca2f11b4691a439c3799d1dc3cda1c7fb5311c3869c12153a2bc60c94626f079c907e1fe8660e0819543377d6b8419be0ce6ecaf90f214bc946f91a5491a6d5e8afead6bce92bfc9e537ec342ad53a5027212b9c1bc398325fd57669f9b796d37a2c79b324032cf64d932dc1c78e54e47ed2cc3ecf1df9a1fd21a507f12fbda78ba04efbc6cddfc8fc8ef9c43c655e18304",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=999"
+    },
+    {
+      "tree_size": 1024,
+      "depth": 10,
+      "leaf_index": 1023,
+      "leaf": "a7bfe2599f65518547955d4d4268198f14e8bccfc4ab7296b544b8d4164c80a8",
+      "proof": "5e66a54cee94ecce927ea83b9e434211d1564cfaa307e7f890ea09c40f9abdb3eefedb1ce12d4bc1e059701ab280b34b2dd15f5762d24553a8b8fe29c12b9f3ad7a37d6358bbe28061b155173ef3cb64a4634177b14b7e1e4f3be078660e99bc17e1468dc135d88ff4bcc25bdc8b7caa26709c785f147b7af357306c673c29e7572f696b05ae513e34bea36e695a0deaf875d7d0831973c51b8fe2207a1f6cde72f7bb02c070752de97c9e0aa9598ca2f11b4691a439c3799d1dc3cda1c7fb5311c3869c12153a2bc60c94626f079c907e1fe8660e0819543377d6b8419be0ce6ecaf90f214bc946f91a5491a6d5e8afead6bce92bfc9e537ec342ad53a5027212b9c1bc398325fd57669f9b796d37a2c79b324032cf64d932dc1c78e54e47ed2cc3ecf1df9a1fd21a507f12fbda78ba04efbc6cddfc8fc8ef9c43c655e18304",
+      "root": "792bf12efdae202cf79b6913fc6dd86ad09521428e6288a44768e290a5fa7dd0",
+      "expected": "accept",
+      "description": "valid proof: tree=1024, leaf=1023"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 0,
+      "leaf": "0000000000000000000000000000000000000000000000000000000000000000",
+      "proof": "0000000000000000000000000000000000000000000000000000000000000001a774c351cf3882b36b2c541586b0b59c6dfd119ae831ef3c6b2e269f7a6be220564ad5882547f199bbe82f40f4e5ddbd3836859c2e5caf3ff5b0989caf614af0",
+      "root": "32e0fe0539aeca5782542f7232d32185eebec2e6dc258177456dcdebbbf18f8b",
+      "expected": "accept",
+      "description": "deterministic small tree: leaf 0"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 1,
+      "leaf": "0000000000000000000000000000000000000000000000000000000000000001",
+      "proof": "0000000000000000000000000000000000000000000000000000000000000000a774c351cf3882b36b2c541586b0b59c6dfd119ae831ef3c6b2e269f7a6be220564ad5882547f199bbe82f40f4e5ddbd3836859c2e5caf3ff5b0989caf614af0",
+      "root": "32e0fe0539aeca5782542f7232d32185eebec2e6dc258177456dcdebbbf18f8b",
+      "expected": "accept",
+      "description": "deterministic small tree: leaf 1"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 2,
+      "leaf": "0000000000000000000000000000000000000000000000000000000000000002",
+      "proof": "000000000000000000000000000000000000000000000000000000000000000390f4b39548df55ad6187a1d20d731ecee78c545b94afd16f42ef7592d99cd365564ad5882547f199bbe82f40f4e5ddbd3836859c2e5caf3ff5b0989caf614af0",
+      "root": "32e0fe0539aeca5782542f7232d32185eebec2e6dc258177456dcdebbbf18f8b",
+      "expected": "accept",
+      "description": "deterministic small tree: leaf 2"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 3,
+      "leaf": "0000000000000000000000000000000000000000000000000000000000000003",
+      "proof": "000000000000000000000000000000000000000000000000000000000000000290f4b39548df55ad6187a1d20d731ecee78c545b94afd16f42ef7592d99cd365564ad5882547f199bbe82f40f4e5ddbd3836859c2e5caf3ff5b0989caf614af0",
+      "root": "32e0fe0539aeca5782542f7232d32185eebec2e6dc258177456dcdebbbf18f8b",
+      "expected": "accept",
+      "description": "deterministic small tree: leaf 3"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 4,
+      "leaf": "0000000000000000000000000000000000000000000000000000000000000004",
+      "proof": "0000000000000000000000000000000000000000000000000000000000000005277752261a13c9c81c37ea894efe5dc3af8b7ffecbedce75d0ec09862e74a2cbd1d79b01cacccaa40e6a3825db8ff96f38858092ea71689ce31dc6df3cf31df2",
+      "root": "32e0fe0539aeca5782542f7232d32185eebec2e6dc258177456dcdebbbf18f8b",
+      "expected": "accept",
+      "description": "deterministic small tree: leaf 4"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 5,
+      "leaf": "0000000000000000000000000000000000000000000000000000000000000005",
+      "proof": "0000000000000000000000000000000000000000000000000000000000000004277752261a13c9c81c37ea894efe5dc3af8b7ffecbedce75d0ec09862e74a2cbd1d79b01cacccaa40e6a3825db8ff96f38858092ea71689ce31dc6df3cf31df2",
+      "root": "32e0fe0539aeca5782542f7232d32185eebec2e6dc258177456dcdebbbf18f8b",
+      "expected": "accept",
+      "description": "deterministic small tree: leaf 5"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 6,
+      "leaf": "0000000000000000000000000000000000000000000000000000000000000006",
+      "proof": "0000000000000000000000000000000000000000000000000000000000000007b023893dc819559da606f81778f566532801f428570db5fd3d3088491bb292c2d1d79b01cacccaa40e6a3825db8ff96f38858092ea71689ce31dc6df3cf31df2",
+      "root": "32e0fe0539aeca5782542f7232d32185eebec2e6dc258177456dcdebbbf18f8b",
+      "expected": "accept",
+      "description": "deterministic small tree: leaf 6"
+    },
+    {
+      "tree_size": 8,
+      "depth": 3,
+      "leaf_index": 7,
+      "leaf": "0000000000000000000000000000000000000000000000000000000000000007",
+      "proof": "0000000000000000000000000000000000000000000000000000000000000006b023893dc819559da606f81778f566532801f428570db5fd3d3088491bb292c2d1d79b01cacccaa40e6a3825db8ff96f38858092ea71689ce31dc6df3cf31df2",
+      "root": "32e0fe0539aeca5782542f7232d32185eebec2e6dc258177456dcdebbbf18f8b",
+      "expected": "accept",
+      "description": "deterministic small tree: leaf 7"
+    }
+  ]
+}

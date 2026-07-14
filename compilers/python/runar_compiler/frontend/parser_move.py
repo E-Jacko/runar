@@ -10,6 +10,7 @@ from __future__ import annotations
 from runar_compiler.frontend.ast_nodes import (
     ContractNode, PropertyNode, MethodNode, ParamNode, SourceLocation,
     PrimitiveType, FixedArrayType, CustomType, TypeNode,
+    ArrayLiteralExpr,
     BigIntLiteral, BoolLiteral, ByteStringLiteral, Identifier,
     PropertyAccessExpr, MemberExpr, BinaryExpr, UnaryExpr, CallExpr,
     TernaryExpr, IndexAccessExpr, IncrementExpr, DecrementExpr,
@@ -67,6 +68,8 @@ TOK_SLASHEQ = 39
 TOK_PERCENTEQ = 40
 TOK_QUESTION = 41
 TOK_ARROW = 42
+TOK_SHL = 43
+TOK_SHR = 44
 
 
 class Token:
@@ -118,6 +121,55 @@ _MOVE_BUILTIN_MAP: dict[str, str] = {
     "len":             "len",
     "pack":            "pack",
     "unpack":          "unpack",
+    # Post-quantum signature verification (FIPS 205 SLH-DSA parameter sets).
+    # Both snake_case and pre-camelCased forms are accepted.
+    "verify_wots":              "verifyWOTS",
+    "verifyWots":               "verifyWOTS",
+    "verifyWOTS":               "verifyWOTS",
+    "verify_slhdsa_sha2_128s":  "verifySLHDSA_SHA2_128s",
+    "verify_slh_dsa_sha2_128s": "verifySLHDSA_SHA2_128s",
+    "verifySlhdsaSha2128s":     "verifySLHDSA_SHA2_128s",
+    "verifySlhDsaSha2128s":     "verifySLHDSA_SHA2_128s",
+    "verify_slhdsa_sha2_128f":  "verifySLHDSA_SHA2_128f",
+    "verify_slh_dsa_sha2_128f": "verifySLHDSA_SHA2_128f",
+    "verifySlhdsaSha2128f":     "verifySLHDSA_SHA2_128f",
+    "verifySlhDsaSha2128f":     "verifySLHDSA_SHA2_128f",
+    "verify_slhdsa_sha2_192s":  "verifySLHDSA_SHA2_192s",
+    "verify_slh_dsa_sha2_192s": "verifySLHDSA_SHA2_192s",
+    "verifySlhdsaSha2192s":     "verifySLHDSA_SHA2_192s",
+    "verifySlhDsaSha2192s":     "verifySLHDSA_SHA2_192s",
+    "verify_slhdsa_sha2_192f":  "verifySLHDSA_SHA2_192f",
+    "verify_slh_dsa_sha2_192f": "verifySLHDSA_SHA2_192f",
+    "verifySlhdsaSha2192f":     "verifySLHDSA_SHA2_192f",
+    "verifySlhDsaSha2192f":     "verifySLHDSA_SHA2_192f",
+    "verify_slhdsa_sha2_256s":  "verifySLHDSA_SHA2_256s",
+    "verify_slh_dsa_sha2_256s": "verifySLHDSA_SHA2_256s",
+    "verifySlhdsaSha2256s":     "verifySLHDSA_SHA2_256s",
+    "verifySlhDsaSha2256s":     "verifySLHDSA_SHA2_256s",
+    "verify_slhdsa_sha2_256f":  "verifySLHDSA_SHA2_256f",
+    "verify_slh_dsa_sha2_256f": "verifySLHDSA_SHA2_256f",
+    "verifySlhdsaSha2256f":     "verifySLHDSA_SHA2_256f",
+    "verifySlhDsaSha2256f":     "verifySLHDSA_SHA2_256f",
+    # P-256 (NIST secp256r1)
+    "p256_add":               "p256Add",
+    "p256_mul":               "p256Mul",
+    "p256_mul_gen":           "p256MulGen",
+    "p256_negate":            "p256Negate",
+    "p256_on_curve":          "p256OnCurve",
+    "p256_encode_compressed": "p256EncodeCompressed",
+    "verify_ecdsa_p256":      "verifyECDSA_P256",
+    # P-384 (NIST secp384r1)
+    "p384_add":               "p384Add",
+    "p384_mul":               "p384Mul",
+    "p384_mul_gen":           "p384MulGen",
+    "p384_negate":            "p384Negate",
+    "p384_on_curve":          "p384OnCurve",
+    "p384_encode_compressed": "p384EncodeCompressed",
+    "verify_ecdsa_p384":      "verifyECDSA_P384",
+    # Pre-camelCased forms also accepted (matches the canonical TS Move parser,
+    # whose regex preserves the literal `_P` boundary).
+    "verifyECDSA_P256":        "verifyECDSA_P256",
+    "verifyECDSA_P384":        "verifyECDSA_P384",
 }
 
 
@@ -134,7 +186,7 @@ def _move_map_builtin(name: str) -> str:
 def _move_map_type(name: str) -> TypeNode:
     if name in ("u64", "u128", "u256", "Int", "Bigint"):
         return PrimitiveType(name="bigint")
-    if name == "bool":
+    if name in ("bool", "Bool"):
         return PrimitiveType(name="boolean")
     if name == "vector":
         return PrimitiveType(name="ByteString")
@@ -243,7 +295,9 @@ def _tokenize(source: str) -> list[Token]:
         # Numbers
         if "0" <= ch <= "9":
             start = i
+            is_hex = False
             if ch == "0" and i + 1 < n and source[i + 1] in ("x", "X"):
+                is_hex = True
                 i += 2
                 col += 2
                 while i < n and _is_hex_digit(source[i]):
@@ -254,12 +308,19 @@ def _tokenize(source: str) -> list[Token]:
                     i += 1
                     col += 1
             # Skip trailing type suffixes like u8, u64, etc.
-            if i < n and source[i] == "u":
+            if not is_hex and i < n and source[i] == "u":
                 i += 1
                 col += 1
                 while i < n and "0" <= source[i] <= "9":
                     i += 1
                     col += 1
+            # Hex literals with even digit count → ByteString token; otherwise
+            # fall back to a numeric literal.
+            if is_hex:
+                hex_digits = source[start + 2 : i]
+                if len(hex_digits) > 0 and len(hex_digits) % 2 == 0:
+                    tokens.append(Token(TOK_STRING, hex_digits, line, start_col))
+                    continue
             tokens.append(Token(TOK_NUMBER, source[start:i], line, start_col))
             continue
 
@@ -297,6 +358,8 @@ def _tokenize(source: str) -> list[Token]:
                 "/=": TOK_SLASHEQ,
                 "%=": TOK_PERCENTEQ,
                 "->": TOK_ARROW,
+                "<<": TOK_SHL,
+                ">>": TOK_SHR,
             }.get(two)
             if two_kind is not None:
                 tokens.append(Token(two_kind, two, line, start_col))
@@ -416,6 +479,11 @@ class _MoveParser:
         while self.check_ident("use"):
             self._skip_use_decl()
 
+        # `unsafe module Name { ... }` marks an UnsafeSmartContract -- the
+        # asm-escape-hatch base class. Plain `module Name { ... }` infers
+        # SmartContract / StatefulSmartContract structurally as before.
+        is_unsafe = self.match_ident("unsafe")
+
         # module Name { ... }
         if not self.match_ident("module"):
             raise ValueError("expected 'module' keyword")
@@ -428,6 +496,8 @@ class _MoveParser:
         properties: list[PropertyNode] = []
         methods: list[MethodNode] = []
         parent_class = "SmartContract"  # default
+        if is_unsafe:
+            parent_class = "UnsafeSmartContract"
 
         while not self.check(TOK_RBRACE) and not self.check(TOK_EOF):
             # Skip use declarations inside the module
@@ -441,15 +511,17 @@ class _MoveParser:
                 if is_resource:
                     self.advance()  # skip "resource"
                 props = self._parse_move_struct()
-                properties.extend(props)
-                if is_resource or any(not p.readonly for p in props):
+                if not is_unsafe and (
+                    is_resource or any(not p.readonly for p in props)
+                ):
                     parent_class = "StatefulSmartContract"
+                properties.extend(props)
                 continue
 
             # public fun or fun
             if self.check_ident("public") or self.check_ident("fun"):
                 method, has_mut = self._parse_move_function()
-                if has_mut:
+                if has_mut and not is_unsafe:
                     parent_class = "StatefulSmartContract"
                 methods.append(method)
                 continue
@@ -507,8 +579,7 @@ class _MoveParser:
                 and self.tokens[self.pos + 1].kind == TOK_IDENT
                 and self.tokens[self.pos + 1].value == "mut"
             )
-            type_name = self._parse_move_type_name()
-            type_node = _move_map_type(type_name)
+            type_node = self._parse_move_type_node()
 
             # &mut fields are mutable; all others are readonly
             readonly = not is_mut
@@ -516,7 +587,7 @@ class _MoveParser:
             # Parse optional initializer: = value
             initializer = None
             if self.match(TOK_ASSIGN):
-                initializer = self.parse_expression()
+                initializer = self._parse_move_expression()
 
             props.append(PropertyNode(
                 name=field_name,
@@ -545,17 +616,102 @@ class _MoveParser:
             next_tok = self.expect(TOK_IDENT)
             name = next_tok.value  # use the final component
 
-        # Handle generic types: Type<T>
+        # Handle generic types: Type<T> — balance nested generics, accepting
+        # `>>` as a two-`>` close so `FixedArray<FixedArray<T, N>, M>` parses
+        # via the legacy name-only path too.
         if self.match(TOK_LT):
             depth = 1
             while depth > 0 and not self.check(TOK_EOF):
                 if self.check(TOK_LT):
                     depth += 1
+                    self.advance()
+                    continue
                 if self.check(TOK_GT):
                     depth -= 1
+                    self.advance()
+                    continue
+                if self.check(TOK_SHR):
+                    depth -= 2
+                    if depth < 0:
+                        depth = 0
+                    self.advance()
+                    continue
                 self.advance()
 
         return name
+
+    def _parse_move_type_node(self) -> TypeNode:
+        """Move-style type parser that returns a TypeNode, with full nested
+        ``FixedArray<T, N>`` support. The lexer eagerly forms ``>>`` as a
+        shift token; ``_consume_move_generic_close`` splits it back into
+        two ``>`` when closing a nested generic argument list."""
+        if self.match(TOK_AMP):
+            self.match_ident("mut")
+
+        name_tok = self.expect(TOK_IDENT)
+        name = name_tok.value
+
+        while self.match(TOK_COLONCOLON):
+            next_tok = self.expect(TOK_IDENT)
+            name = next_tok.value
+
+        if name == "FixedArray" and self.check(TOK_LT):
+            self.advance()  # <
+            inner = self._parse_move_type_node()
+            self.expect(TOK_COMMA)
+            len_tok = self.expect(TOK_NUMBER)
+            try:
+                length = int(len_tok.value)
+                if length < 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                self.add_error(
+                    f"FixedArray length must be a non-negative integer literal, got {len_tok.value!r}"
+                )
+                length = 0
+            self._consume_move_generic_close()
+            return FixedArrayType(element=inner, length=length)
+
+        if name == "vector" and self.check(TOK_LT):
+            self.advance()
+            self._parse_move_type_node()  # discard inner type
+            self._consume_move_generic_close()
+            return PrimitiveType(name="ByteString")
+
+        # Generic type we don't model: skip the arg list, balancing generics.
+        if self.match(TOK_LT):
+            depth = 1
+            while depth > 0 and not self.check(TOK_EOF):
+                if self.check(TOK_LT):
+                    depth += 1
+                    self.advance()
+                    continue
+                if self.check(TOK_GT):
+                    depth -= 1
+                    self.advance()
+                    continue
+                if self.check(TOK_SHR):
+                    depth -= 2
+                    if depth < 0:
+                        depth = 0
+                    self.advance()
+                    continue
+                self.advance()
+
+        return _move_map_type(name)
+
+    def _consume_move_generic_close(self) -> None:
+        """Close a generic argument list, splitting ``>>`` into two ``>``."""
+        if self.check(TOK_GT):
+            self.advance()
+            return
+        if self.check(TOK_SHR):
+            # Rewrite the current `>>` token to `>` in place so the outer
+            # close can consume the remaining half.
+            tok = self.tokens[self.pos]
+            self.tokens[self.pos] = Token(TOK_GT, ">", tok.line, tok.col + 1)
+            return
+        self.expect(TOK_GT)
 
     # -- Function parsing ----------------------------------------------------
 
@@ -581,10 +737,24 @@ class _MoveParser:
         params, has_mut = self._parse_move_params()
 
         # Optional return type: : Type
+        has_return_type = False
         if self.match(TOK_COLON):
             self._parse_move_type_name()  # skip return type
+            has_return_type = True
 
         body = self._parse_move_block()
+
+        # Move allows an implicit return of the final expression when the
+        # function declares a return type. Convert the trailing expression
+        # statement into an explicit return statement so the type checker
+        # can infer the method's return type.
+        if has_return_type and body:
+            last = body[-1]
+            if isinstance(last, ExpressionStmt):
+                body[-1] = ReturnStmt(
+                    value=last.expr,
+                    source_location=last.source_location,
+                )
 
         return MethodNode(
             name=name,
@@ -664,7 +834,7 @@ class _MoveParser:
             if stmt is not None:
                 stmts.append(stmt)
         self.expect(TOK_RBRACE)
-        return stmts
+        return _fold_move_while_as_for(stmts)
 
     # -- Statement parsing ---------------------------------------------------
 
@@ -921,20 +1091,33 @@ class _MoveParser:
         return left
 
     def _parse_move_comparison(self) -> Expression:
-        left = self._parse_move_additive()
+        left = self._parse_move_shift()
         while True:
             if self.match(TOK_LT):
-                right = self._parse_move_additive()
+                right = self._parse_move_shift()
                 left = BinaryExpr(op="<", left=left, right=right)
             elif self.match(TOK_LTEQ):
-                right = self._parse_move_additive()
+                right = self._parse_move_shift()
                 left = BinaryExpr(op="<=", left=left, right=right)
             elif self.match(TOK_GT):
-                right = self._parse_move_additive()
+                right = self._parse_move_shift()
                 left = BinaryExpr(op=">", left=left, right=right)
             elif self.match(TOK_GTEQ):
-                right = self._parse_move_additive()
+                right = self._parse_move_shift()
                 left = BinaryExpr(op=">=", left=left, right=right)
+            else:
+                break
+        return left
+
+    def _parse_move_shift(self) -> Expression:
+        left = self._parse_move_additive()
+        while True:
+            if self.match(TOK_SHL):
+                right = self._parse_move_additive()
+                left = BinaryExpr(op="<<", left=left, right=right)
+            elif self.match(TOK_SHR):
+                right = self._parse_move_additive()
+                left = BinaryExpr(op=">>", left=left, right=right)
             else:
                 break
         return left
@@ -1080,6 +1263,13 @@ class _MoveParser:
             # Function call
             if self.check(TOK_LPAREN):
                 args = self._parse_move_call_args()
+                # Free helper functions in Move take `contract: &Self` as the
+                # first argument. The parser drops `contract` from helper
+                # parameter lists on the definition side, so strip a matching
+                # `contract`/`self` identifier as the first argument at call
+                # sites too.
+                if args and isinstance(args[0], Identifier) and args[0].name in ("contract", "self"):
+                    args = args[1:]
                 return CallExpr(callee=Identifier(name=mapped_name), args=args)
 
             return Identifier(name=mapped_name)
@@ -1090,9 +1280,23 @@ class _MoveParser:
             self.expect(TOK_RPAREN)
             return expr
 
+        if tok.kind == TOK_LBRACKET:
+            return self._parse_move_array_literal()
+
         self.add_error(f"line {tok.line}: unexpected token {tok.value!r}")
         self.advance()
         return BigIntLiteral(value=0)
+
+    def _parse_move_array_literal(self) -> Expression:
+        """Parse a bare array literal `[a, b, c]` and emit an ArrayLiteralExpr."""
+        self.expect(TOK_LBRACKET)
+        elements: list[Expression] = []
+        while not self.check(TOK_RBRACKET) and not self.check(TOK_EOF):
+            elements.append(self._parse_move_expression())
+            if not self.match(TOK_COMMA):
+                break
+        self.expect(TOK_RBRACKET)
+        return ArrayLiteralExpr(elements=elements)
 
     def _parse_move_call_args(self) -> list[Expression]:
         self.expect(TOK_LPAREN)
@@ -1153,6 +1357,61 @@ class _MoveParser:
 # ---------------------------------------------------------------------------
 # Number parsing
 # ---------------------------------------------------------------------------
+
+def _fold_move_while_as_for(stmts: list[Statement]) -> list[Statement]:
+    """Fold ``let i = K; while (i < N) { ...; i = i + S; }`` into a single
+    ForStmt so downstream ANF lowering produces identical bounded-loop IR
+    across all formats.
+    """
+    out: list[Statement] = []
+    i = 0
+    while i < len(stmts):
+        s = stmts[i]
+        if i + 1 < len(stmts) and isinstance(s, VariableDeclStmt):
+            nxt = stmts[i + 1]
+            if isinstance(nxt, ForStmt) and isinstance(nxt.init, VariableDeclStmt) and nxt.init.name == "_w":
+                iter_name = s.name
+                cond = nxt.condition
+                if (
+                    isinstance(cond, BinaryExpr)
+                    and isinstance(cond.left, Identifier)
+                    and cond.left.name == iter_name
+                    and len(nxt.body) > 0
+                ):
+                    last = nxt.body[-1]
+                    if (
+                        isinstance(last, AssignmentStmt)
+                        and isinstance(last.target, Identifier)
+                        and last.target.name == iter_name
+                        and isinstance(last.value, BinaryExpr)
+                        and last.value.op == "+"
+                        and isinstance(last.value.left, Identifier)
+                        and last.value.left.name == iter_name
+                    ):
+                        trimmed = list(nxt.body[:-1])
+                        new_for = ForStmt(
+                            init=VariableDeclStmt(
+                                name=iter_name,
+                                type=s.type,
+                                mutable=True,
+                                init=s.init,
+                                source_location=s.source_location,
+                            ),
+                            condition=cond,
+                            update=ExpressionStmt(
+                                expr=IncrementExpr(operand=Identifier(name=iter_name), prefix=False),
+                                source_location=nxt.source_location,
+                            ),
+                            body=trimmed,
+                            source_location=nxt.source_location,
+                        )
+                        out.append(new_for)
+                        i += 2
+                        continue
+        out.append(s)
+        i += 1
+    return out
+
 
 def _parse_move_number(s: str) -> Expression:
     # Strip type suffixes like u64, u128, etc.

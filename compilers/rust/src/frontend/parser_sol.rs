@@ -29,6 +29,8 @@
 //! - `!=` -> StrictNe (!==)
 //! - Types before names (Solidity convention)
 
+use num_bigint::{BigInt, Sign};
+use num_traits::{Num, ToPrimitive};
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -53,6 +55,7 @@ pub fn parse_solidity(source: &str, file_name: Option<&str>) -> ParseResult {
     ParseResult {
         contract,
         errors,
+        source_size_err: None,
     }
 }
 
@@ -82,7 +85,8 @@ enum Token {
 
     // Identifiers and literals
     Ident(String),
-    NumberLit(i128),
+    NumberLit(BigInt),
+    HexLit(String),
     StringLit(String),
 
     // Operators
@@ -99,6 +103,8 @@ enum Token {
     Le,
     Gt,
     Ge,
+    Shl,        // <<
+    Shr,        // >>
     And,        // &&
     Or,         // ||
     BitAnd,     // &
@@ -198,6 +204,16 @@ fn tokenize(source: &str) -> Vec<Token> {
             i += 2;
             continue;
         }
+        if ch == '<' && i + 1 < len && chars[i + 1] == '<' {
+            tokens.push(Token::Shl);
+            i += 2;
+            continue;
+        }
+        if ch == '>' && i + 1 < len && chars[i + 1] == '>' {
+            tokens.push(Token::Shr);
+            i += 2;
+            continue;
+        }
         if ch == '&' && i + 1 < len && chars[i + 1] == '&' {
             tokens.push(Token::And);
             i += 2;
@@ -292,15 +308,27 @@ fn tokenize(source: &str) -> Vec<Token> {
             continue;
         }
 
-        // Numbers
+        // Numbers (and hex byte string literals: 0x...)
         if ch.is_ascii_digit() {
+            // Hex byte string literal -> ByteString
+            if ch == '0' && i + 1 < len && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
+                i += 2;
+                let hex_start = i;
+                while i < len && chars[i].is_ascii_hexdigit() {
+                    i += 1;
+                }
+                let hex_str: String = chars[hex_start..i].iter().collect();
+                tokens.push(Token::HexLit(hex_str));
+                continue;
+            }
             let start = i;
             while i < len && (chars[i].is_ascii_digit() || chars[i] == 'n') {
                 i += 1;
             }
             let num_str: String = chars[start..i].iter().collect();
             let num_str = num_str.trim_end_matches('n');
-            let val = num_str.parse::<i128>().unwrap_or(0);
+            let val = <BigInt as Num>::from_str_radix(num_str, 10)
+                .unwrap_or_else(|_| BigInt::from(0));
             tokens.push(Token::NumberLit(val));
             continue;
         }
@@ -476,8 +504,30 @@ impl<'a> SolParser<'a> {
                 body: Vec::new(),
                 visibility: Visibility::Public,
                 source_location: self.loc(),
+                sighash_type: None,
             }
         });
+
+        // Resolve bare property references and bare contract-method calls in
+        // method bodies (Solidity allows referencing state variables and other
+        // contract methods without a `this.` prefix).
+        let prop_names: std::collections::HashSet<String> =
+            properties.iter().map(|p| p.name.clone()).collect();
+        let method_names: std::collections::HashSet<String> =
+            methods.iter().map(|m| m.name.clone()).collect();
+        let methods: Vec<MethodNode> = methods
+            .into_iter()
+            .map(|mut m| {
+                let mut locals: std::collections::HashSet<String> =
+                    m.params.iter().map(|p| p.name.clone()).collect();
+                m.body = m
+                    .body
+                    .into_iter()
+                    .map(|s| sol_rewrite_stmt_bare_props(s, &prop_names, &mut locals, &method_names))
+                    .collect();
+                m
+            })
+            .collect();
 
         Some(ContractNode {
             name,
@@ -526,6 +576,8 @@ impl<'a> SolParser<'a> {
             readonly: is_immutable,
             initializer,
             source_location: self.loc(),
+            synthetic_array_chain: None,
+            embed_always: false,
         }
     }
 
@@ -543,7 +595,7 @@ impl<'a> SolParser<'a> {
                 let element = self.parse_type();
                 self.expect(&Token::Comma);
                 let length = match self.advance() {
-                    Token::NumberLit(n) => n as usize,
+                    Token::NumberLit(n) => n.to_usize().unwrap_or(0),
                     _ => {
                         self.errors
                             .push(Diagnostic::error("FixedArray requires numeric length", None));
@@ -551,10 +603,11 @@ impl<'a> SolParser<'a> {
                     }
                 };
                 self.expect(&Token::Gt);
-                return TypeNode::FixedArray {
+                let base = TypeNode::FixedArray {
                     element: Box::new(element),
                     length,
                 };
+                return self.parse_sol_fixed_array_suffix(base);
             }
         }
 
@@ -567,11 +620,39 @@ impl<'a> SolParser<'a> {
             _ => &name,
         };
 
-        if let Some(prim) = PrimitiveTypeName::from_str(mapped) {
+        let base = if let Some(prim) = PrimitiveTypeName::from_str(mapped) {
             TypeNode::Primitive(prim)
         } else {
             TypeNode::Custom(mapped.to_string())
+        };
+
+        self.parse_sol_fixed_array_suffix(base)
+    }
+
+    // Consume any number of trailing `[N]` bracket suffixes, wrapping the
+    // type as `FixedArray<previous, N>` per Solidity's left-to-right
+    // outer-to-inner declaration order. `T[A][B]` ⇒ outer B of inner A of T.
+    fn parse_sol_fixed_array_suffix(&mut self, base: TypeNode) -> TypeNode {
+        let mut result = base;
+        while *self.peek() == Token::LBracket {
+            self.advance(); // [
+            let length = match self.advance() {
+                Token::NumberLit(n) if n.sign() != Sign::Minus => n.to_usize().unwrap_or(0),
+                other => {
+                    self.errors.push(Diagnostic::error(
+                        &format!("FixedArray length must be a non-negative integer literal, got {:?}", other),
+                        None,
+                    ));
+                    0
+                }
+            };
+            self.expect(&Token::RBracket);
+            result = TypeNode::FixedArray {
+                element: Box::new(result),
+                length,
+            };
         }
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -615,6 +696,7 @@ impl<'a> SolParser<'a> {
                 args: params.iter().map(|p| Expression::Identifier {
                     name: p.name.clone(),
                 }).collect(),
+                asm_return_type: None,
             },
             source_location: loc.clone(),
         };
@@ -634,6 +716,7 @@ impl<'a> SolParser<'a> {
             body: std::iter::once(super_call).chain(fixed_body).collect(),
             visibility: Visibility::Public,
             source_location: loc,
+            sighash_type: None,
         }
     }
 
@@ -648,18 +731,54 @@ impl<'a> SolParser<'a> {
         let params = self.parse_param_list();
         self.expect(&Token::RParen);
 
-        // Parse visibility modifier (Solidity puts it after params)
-        let visibility = match self.peek() {
-            Token::Public => {
-                self.advance();
-                Visibility::Public
+        // Parse Solidity-style modifiers in any order: visibility (public/private/
+        // external/internal), state mutability (view/pure/payable), and returns.
+        let mut visibility = Visibility::Private;
+        loop {
+            match self.peek().clone() {
+                Token::Public => {
+                    self.advance();
+                    visibility = Visibility::Public;
+                }
+                Token::Private => {
+                    self.advance();
+                    visibility = Visibility::Private;
+                }
+                Token::Ident(word) => {
+                    match word.as_str() {
+                        "external" => {
+                            self.advance();
+                            visibility = Visibility::Public;
+                        }
+                        "internal" | "view" | "pure" | "payable" => {
+                            self.advance();
+                        }
+                        "returns" => {
+                            self.advance();
+                            // Skip the parenthesised return type list
+                            if *self.peek() == Token::LParen {
+                                self.advance();
+                                let mut depth: i32 = 1;
+                                while depth > 0 && *self.peek() != Token::Eof {
+                                    if *self.peek() == Token::LParen {
+                                        depth += 1;
+                                    } else if *self.peek() == Token::RParen {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            self.advance();
+                                            break;
+                                        }
+                                    }
+                                    self.advance();
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                _ => break,
             }
-            Token::Private => {
-                self.advance();
-                Visibility::Private
-            }
-            _ => Visibility::Public,
-        };
+        }
 
         let body = self.parse_block();
 
@@ -669,6 +788,7 @@ impl<'a> SolParser<'a> {
             body,
             visibility,
             source_location: self.loc(),
+            sighash_type: None,
         }
     }
 
@@ -882,7 +1002,7 @@ impl<'a> SolParser<'a> {
             self.parse_expression()
         } else {
             // Type name; — declaration without initializer, default to 0
-            Expression::BigIntLiteral { value: 0 }
+            Expression::BigIntLiteral { value: BigInt::from(0) }
         };
 
         self.expect(&Token::Semicolon);
@@ -910,6 +1030,7 @@ impl<'a> SolParser<'a> {
                     name: "assert".to_string(),
                 }),
                 args: vec![expr],
+                asm_return_type: None,
             },
             source_location: self.loc(),
         }
@@ -948,9 +1069,12 @@ impl<'a> SolParser<'a> {
         self.advance(); // consume 'for'
         self.expect(&Token::LParen);
 
-        // Init
+        // Init: accept `let Type name = expr;`, `const ... = expr;`, or
+        // Solidity-style `Type name = expr;` (no leading keyword).
         let init = if *self.peek() == Token::Let || *self.peek() == Token::Const {
             self.parse_var_decl()
+        } else if self.is_type_then_name() {
+            self.parse_typed_var_decl()
         } else {
             self.errors
                 .push(Diagnostic::error("For loop init must be a variable declaration", None));
@@ -959,7 +1083,7 @@ impl<'a> SolParser<'a> {
                 name: "_i".to_string(),
                 var_type: None,
                 mutable: true,
-                init: Expression::BigIntLiteral { value: 0 },
+                init: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             }
         };
@@ -1171,12 +1295,12 @@ impl<'a> SolParser<'a> {
     }
 
     fn parse_comparison(&mut self) -> Expression {
-        let mut left = self.parse_additive();
+        let mut left = self.parse_shift();
         loop {
             match self.peek() {
                 Token::Lt => {
                     self.advance();
-                    let right = self.parse_additive();
+                    let right = self.parse_shift();
                     left = Expression::BinaryExpr {
                         op: BinaryOp::Lt,
                         left: Box::new(left),
@@ -1185,7 +1309,7 @@ impl<'a> SolParser<'a> {
                 }
                 Token::Le => {
                     self.advance();
-                    let right = self.parse_additive();
+                    let right = self.parse_shift();
                     left = Expression::BinaryExpr {
                         op: BinaryOp::Le,
                         left: Box::new(left),
@@ -1194,7 +1318,7 @@ impl<'a> SolParser<'a> {
                 }
                 Token::Gt => {
                     self.advance();
-                    let right = self.parse_additive();
+                    let right = self.parse_shift();
                     left = Expression::BinaryExpr {
                         op: BinaryOp::Gt,
                         left: Box::new(left),
@@ -1203,9 +1327,37 @@ impl<'a> SolParser<'a> {
                 }
                 Token::Ge => {
                     self.advance();
-                    let right = self.parse_additive();
+                    let right = self.parse_shift();
                     left = Expression::BinaryExpr {
                         op: BinaryOp::Ge,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    };
+                }
+                _ => break,
+            }
+        }
+        left
+    }
+
+    fn parse_shift(&mut self) -> Expression {
+        let mut left = self.parse_additive();
+        loop {
+            match self.peek() {
+                Token::Shl => {
+                    self.advance();
+                    let right = self.parse_additive();
+                    left = Expression::BinaryExpr {
+                        op: BinaryOp::Shl,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    };
+                }
+                Token::Shr => {
+                    self.advance();
+                    let right = self.parse_additive();
+                    left = Expression::BinaryExpr {
+                        op: BinaryOp::Shr,
                         left: Box::new(left),
                         right: Box::new(right),
                     };
@@ -1358,6 +1510,7 @@ impl<'a> SolParser<'a> {
                     expr = Expression::CallExpr {
                         callee: Box::new(expr),
                         args,
+                        asm_return_type: None,
                     };
                 }
                 Token::LBracket => {
@@ -1393,6 +1546,7 @@ impl<'a> SolParser<'a> {
     fn parse_primary(&mut self) -> Expression {
         match self.advance() {
             Token::NumberLit(v) => Expression::BigIntLiteral { value: v },
+            Token::HexLit(v) => Expression::ByteStringLiteral { value: v },
             Token::True => Expression::BoolLiteral { value: true },
             Token::False => Expression::BoolLiteral { value: false },
             Token::StringLit(v) => Expression::ByteStringLiteral { value: v },
@@ -1419,6 +1573,7 @@ impl<'a> SolParser<'a> {
                         name: "assert".to_string(),
                     }),
                     args: vec![arg],
+                    asm_return_type: None,
                 }
             }
             Token::LParen => {
@@ -1426,10 +1581,23 @@ impl<'a> SolParser<'a> {
                 self.expect(&Token::RParen);
                 expr
             }
+            Token::LBracket => {
+                // Array literal: [a, b, c]
+                let mut elements: Vec<Expression> = Vec::new();
+                while !matches!(self.peek(), Token::RBracket | Token::Eof) {
+                    elements.push(self.parse_expression());
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    self.advance();
+                }
+                self.expect(&Token::RBracket);
+                Expression::ArrayLiteral { elements }
+            }
             other => {
                 self.errors
                     .push(Diagnostic::error(format!("Unexpected token in expression: {:?}", other), None));
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             }
         }
     }
@@ -1523,12 +1691,13 @@ fn sol_rename_identifiers_in_expr(
                 Expression::Identifier { name }
             }
         }
-        Expression::CallExpr { callee, args } => Expression::CallExpr {
+        Expression::CallExpr { callee, args, .. } => Expression::CallExpr {
             callee: Box::new(sol_rename_identifiers_in_expr(*callee, rename_map)),
             args: args
                 .into_iter()
                 .map(|a| sol_rename_identifiers_in_expr(a, rename_map))
                 .collect(),
+            asm_return_type: None,
         },
         Expression::BinaryExpr { op, left, right } => Expression::BinaryExpr {
             op,
@@ -1591,6 +1760,198 @@ fn sol_fix_property_assignment(
         }
     } else {
         stmt
+    }
+}
+
+/// Recursively rewrite bare `Identifier(name)` references to
+/// `PropertyAccess { property: name }` when `name` matches a contract property
+/// (and is not shadowed by a local variable). Bare calls `foo(args)` to a
+/// contract method are rewritten to `this.foo(args)`.
+fn sol_rewrite_expr_bare_props(
+    expr: Expression,
+    prop_names: &std::collections::HashSet<String>,
+    locals: &std::collections::HashSet<String>,
+    method_names: &std::collections::HashSet<String>,
+) -> Expression {
+    match expr {
+        Expression::Identifier { name } => {
+            if prop_names.contains(&name) && !locals.contains(&name) {
+                Expression::PropertyAccess { property: name }
+            } else {
+                Expression::Identifier { name }
+            }
+        }
+        Expression::CallExpr { callee, args, .. } => {
+            if let Expression::Identifier { ref name } = *callee {
+                if method_names.contains(name) && !locals.contains(name) && !prop_names.contains(name) {
+                    let new_args: Vec<Expression> = args
+                        .into_iter()
+                        .map(|a| sol_rewrite_expr_bare_props(a, prop_names, locals, method_names))
+                        .collect();
+                    return Expression::CallExpr {
+                        callee: Box::new(Expression::MemberExpr {
+                            object: Box::new(Expression::Identifier {
+                                name: "this".to_string(),
+                            }),
+                            property: name.clone(),
+                        }),
+                        args: new_args,
+                        asm_return_type: None,
+                    };
+                }
+            }
+            Expression::CallExpr {
+                callee: Box::new(sol_rewrite_expr_bare_props(*callee, prop_names, locals, method_names)),
+                args: args
+                    .into_iter()
+                    .map(|a| sol_rewrite_expr_bare_props(a, prop_names, locals, method_names))
+                    .collect(),
+                asm_return_type: None,
+            }
+        }
+        Expression::BinaryExpr { op, left, right } => Expression::BinaryExpr {
+            op,
+            left: Box::new(sol_rewrite_expr_bare_props(*left, prop_names, locals, method_names)),
+            right: Box::new(sol_rewrite_expr_bare_props(*right, prop_names, locals, method_names)),
+        },
+        Expression::UnaryExpr { op, operand } => Expression::UnaryExpr {
+            op,
+            operand: Box::new(sol_rewrite_expr_bare_props(*operand, prop_names, locals, method_names)),
+        },
+        Expression::MemberExpr { object, property } => Expression::MemberExpr {
+            object: Box::new(sol_rewrite_expr_bare_props(*object, prop_names, locals, method_names)),
+            property,
+        },
+        Expression::TernaryExpr {
+            condition,
+            consequent,
+            alternate,
+        } => Expression::TernaryExpr {
+            condition: Box::new(sol_rewrite_expr_bare_props(*condition, prop_names, locals, method_names)),
+            consequent: Box::new(sol_rewrite_expr_bare_props(*consequent, prop_names, locals, method_names)),
+            alternate: Box::new(sol_rewrite_expr_bare_props(*alternate, prop_names, locals, method_names)),
+        },
+        Expression::IndexAccess { object, index } => Expression::IndexAccess {
+            object: Box::new(sol_rewrite_expr_bare_props(*object, prop_names, locals, method_names)),
+            index: Box::new(sol_rewrite_expr_bare_props(*index, prop_names, locals, method_names)),
+        },
+        Expression::IncrementExpr { operand, prefix } => Expression::IncrementExpr {
+            operand: Box::new(sol_rewrite_expr_bare_props(*operand, prop_names, locals, method_names)),
+            prefix,
+        },
+        Expression::DecrementExpr { operand, prefix } => Expression::DecrementExpr {
+            operand: Box::new(sol_rewrite_expr_bare_props(*operand, prop_names, locals, method_names)),
+            prefix,
+        },
+        Expression::ArrayLiteral { elements } => Expression::ArrayLiteral {
+            elements: elements
+                .into_iter()
+                .map(|e| sol_rewrite_expr_bare_props(e, prop_names, locals, method_names))
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+/// Recursively rewrite bare property references and method calls in a
+/// statement, threading newly-declared local variables through the local set
+/// so they shadow same-named properties.
+fn sol_rewrite_stmt_bare_props(
+    stmt: Statement,
+    prop_names: &std::collections::HashSet<String>,
+    locals: &mut std::collections::HashSet<String>,
+    method_names: &std::collections::HashSet<String>,
+) -> Statement {
+    match stmt {
+        Statement::ExpressionStatement {
+            expression,
+            source_location,
+        } => Statement::ExpressionStatement {
+            expression: sol_rewrite_expr_bare_props(expression, prop_names, locals, method_names),
+            source_location,
+        },
+        Statement::Assignment {
+            target,
+            value,
+            source_location,
+        } => Statement::Assignment {
+            target: sol_rewrite_expr_bare_props(target, prop_names, locals, method_names),
+            value: sol_rewrite_expr_bare_props(value, prop_names, locals, method_names),
+            source_location,
+        },
+        Statement::VariableDecl {
+            name,
+            var_type,
+            mutable,
+            init,
+            source_location,
+        } => {
+            let new_init = sol_rewrite_expr_bare_props(init, prop_names, locals, method_names);
+            locals.insert(name.clone());
+            Statement::VariableDecl {
+                name,
+                var_type,
+                mutable,
+                init: new_init,
+                source_location,
+            }
+        }
+        Statement::IfStatement {
+            condition,
+            then_branch,
+            else_branch,
+            source_location,
+        } => {
+            let new_cond = sol_rewrite_expr_bare_props(condition, prop_names, locals, method_names);
+            let mut then_locals = locals.clone();
+            let new_then: Vec<Statement> = then_branch
+                .into_iter()
+                .map(|s| sol_rewrite_stmt_bare_props(s, prop_names, &mut then_locals, method_names))
+                .collect();
+            let new_else = else_branch.map(|stmts| {
+                let mut else_locals = locals.clone();
+                stmts
+                    .into_iter()
+                    .map(|s| sol_rewrite_stmt_bare_props(s, prop_names, &mut else_locals, method_names))
+                    .collect()
+            });
+            Statement::IfStatement {
+                condition: new_cond,
+                then_branch: new_then,
+                else_branch: new_else,
+                source_location,
+            }
+        }
+        Statement::ForStatement {
+            init,
+            condition,
+            update,
+            body,
+            source_location,
+        } => {
+            let mut for_locals = locals.clone();
+            let new_init = sol_rewrite_stmt_bare_props(*init, prop_names, &mut for_locals, method_names);
+            let new_cond = sol_rewrite_expr_bare_props(condition, prop_names, &for_locals, method_names);
+            let new_update = sol_rewrite_stmt_bare_props(*update, prop_names, &mut for_locals, method_names);
+            let new_body: Vec<Statement> = body
+                .into_iter()
+                .map(|s| sol_rewrite_stmt_bare_props(s, prop_names, &mut for_locals, method_names))
+                .collect();
+            Statement::ForStatement {
+                init: Box::new(new_init),
+                condition: new_cond,
+                update: Box::new(new_update),
+                body: new_body,
+                source_location,
+            }
+        }
+        Statement::ReturnStatement {
+            value,
+            source_location,
+        } => Statement::ReturnStatement {
+            value: value.map(|v| sol_rewrite_expr_bare_props(v, prop_names, locals, method_names)),
+            source_location,
+        },
     }
 }
 

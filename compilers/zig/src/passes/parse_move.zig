@@ -71,6 +71,15 @@ pub fn parseMove(allocator: Allocator, source: []const u8, file_name: []const u8
     return parser.parse();
 }
 
+/// True if every byte in `s` is an ASCII digit (0-9).
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Token Types
 // ============================================================================
@@ -441,6 +450,20 @@ fn mapBuiltin(allocator: Allocator, name: []const u8) []const u8 {
         .{ "ec_make_point", "ecMakePoint" },
         .{ "ec_point_x", "ecPointX" },
         .{ "ec_point_y", "ecPointY" },
+        .{ "verify_ecdsa_p256", "verifyECDSA_P256" },
+        .{ "p256_add", "p256Add" },
+        .{ "p256_mul", "p256Mul" },
+        .{ "p256_mul_gen", "p256MulGen" },
+        .{ "p256_negate", "p256Negate" },
+        .{ "p256_on_curve", "p256OnCurve" },
+        .{ "p256_encode_compressed", "p256EncodeCompressed" },
+        .{ "verify_ecdsa_p384", "verifyECDSA_P384" },
+        .{ "p384_add", "p384Add" },
+        .{ "p384_mul", "p384Mul" },
+        .{ "p384_mul_gen", "p384MulGen" },
+        .{ "p384_negate", "p384Negate" },
+        .{ "p384_on_curve", "p384OnCurve" },
+        .{ "p384_encode_compressed", "p384EncodeCompressed" },
         .{ "sha256_compress", "sha256Compress" },
         .{ "sha256_finalize", "sha256Finalize" },
         .{ "verify_wots", "verifyWOTS" },
@@ -481,6 +504,10 @@ fn mapBuiltin(allocator: Allocator, name: []const u8) []const u8 {
         .{ "exit", "exit" },
         .{ "int2str", "int2str" },
         .{ "bool", "bool" },
+        // Pre-camelCased forms also accepted (matches the canonical TS Move
+        // parser, whose regex preserves the literal `_<uppercase>` boundary).
+        .{ "verifyECDSA_P256", "verifyECDSA_P256" },
+        .{ "verifyECDSA_P384", "verifyECDSA_P384" },
     });
     if (map.get(name)) |mapped| return mapped;
     return snakeToCamel(allocator, name);
@@ -503,16 +530,43 @@ fn mapMoveType(name: []const u8) RunarType {
         .{ "Sig", .sig },
         .{ "Addr", .addr },
         .{ "Sha256", .sha256 },
+        .{ "Sha256Digest", .sha256 },
         .{ "Ripemd160", .ripemd160 },
         .{ "SigHashPreimage", .sig_hash_preimage },
         .{ "RabinSig", .rabin_sig },
         .{ "RabinPubKey", .rabin_pub_key },
         .{ "Point", .point },
+        .{ "P256Point", .p256_point },
+        .{ "P384Point", .p384_point },
         .{ "void", .void },
     });
     if (map.get(name)) |rt| return rt;
     // Try camelCase conversion for snake_case type names
     return .unknown;
+}
+
+/// Inverse of `typeNodeToRunarType` for the primitive subset. Lifts a
+/// primitive `RunarType` back into a `TypeNode` so the FixedArray inner
+/// element can carry a real recursive `TypeNode`.
+fn runarTypeToTypeNodeMove(rt: RunarType) TypeNode {
+    return switch (rt) {
+        .bigint => .{ .primitive_type = .bigint },
+        .boolean => .{ .primitive_type = .boolean },
+        .byte_string => .{ .primitive_type = .byte_string },
+        .pub_key => .{ .primitive_type = .pub_key },
+        .sig => .{ .primitive_type = .sig },
+        .sha256 => .{ .primitive_type = .sha256 },
+        .ripemd160 => .{ .primitive_type = .ripemd160 },
+        .addr => .{ .primitive_type = .addr },
+        .sig_hash_preimage => .{ .primitive_type = .sig_hash_preimage },
+        .rabin_sig => .{ .primitive_type = .rabin_sig },
+        .rabin_pub_key => .{ .primitive_type = .rabin_pub_key },
+        .point => .{ .primitive_type = .point },
+        .p256_point => .{ .primitive_type = .p256_point },
+        .p384_point => .{ .primitive_type = .p384_point },
+        .void => .{ .primitive_type = .void },
+        else => .{ .custom_type = "unknown" },
+    };
 }
 
 fn runarTypeToTypeName(t: RunarType) []const u8 {
@@ -604,6 +658,11 @@ const Parser = struct {
             self.skipUseDecl();
         }
 
+        // `unsafe module Name { ... }` marks an UnsafeSmartContract — the
+        // asm-escape-hatch base class. Plain `module Name { ... }` infers
+        // SmartContract / StatefulSmartContract structurally as before.
+        const is_unsafe = self.matchIdent("unsafe");
+
         // module Name { ... }
         if (!self.matchIdent("module")) {
             self.addError("expected 'module' keyword");
@@ -622,7 +681,7 @@ const Parser = struct {
 
         var properties: std.ArrayListUnmanaged(PropertyNode) = .empty;
         var methods: std.ArrayListUnmanaged(MethodNode) = .empty;
-        var parent_class: ParentClass = .smart_contract;
+        var parent_class: ParentClass = if (is_unsafe) .unsafe_smart_contract else .smart_contract;
         var has_init_fn = false;
 
         while (self.current.kind != .rbrace and self.current.kind != .eof) {
@@ -637,7 +696,9 @@ const Parser = struct {
                 const is_resource = self.checkIdent("resource");
                 if (is_resource) {
                     _ = self.bump(); // consume "resource"
-                    parent_class = .stateful_smart_contract;
+                    if (!is_unsafe) {
+                        parent_class = .stateful_smart_contract;
+                    }
                 }
                 const props = self.parseMoveStruct(parent_class);
                 for (props) |p| properties.append(self.allocator, p) catch {};
@@ -666,11 +727,9 @@ const Parser = struct {
 
         // Finalize property readonly flags based on parent class
         if (parent_class == .stateful_smart_contract) {
-            for (properties.items) |*prop| {
-                // In stateful contracts, properties are mutable by default
-                // unless they had no &mut marker (readonly stays as set during struct parsing)
-                _ = prop;
-            }
+            // Properties with explicit &mut type marker are already mutable.
+            // Others remain as parsed (readonly by default in struct definitions).
+            _ = &properties; // intentional no-op — properties are finalized above
         }
 
         // Build constructor from properties (auto-generate)
@@ -737,10 +796,24 @@ const Parser = struct {
                 }
             }
 
-            const type_info = self.parseMoveTypeName();
+            const type_node = self.parseMoveTypeNode();
+            const type_info = types.typeNodeToRunarType(type_node);
+
+            // Capture FixedArray shape (outer + nested).
+            var fa_len: u32 = 0;
+            var fa_elem: RunarType = .unknown;
+            var fa_nested_len: u32 = 0;
+            if (type_node == .fixed_array_type) {
+                fa_len = type_node.fixed_array_type.length;
+                const inner = type_node.fixed_array_type.element.*;
+                fa_elem = types.typeNodeToRunarType(inner);
+                if (inner == .fixed_array_type) {
+                    fa_nested_len = inner.fixed_array_type.length;
+                }
+            }
 
             // Determine readonly based on parent class and mutability markers
-            const readonly = if (parent_class == .smart_contract)
+            const readonly = if (parent_class == .smart_contract or parent_class == .unsafe_smart_contract)
                 true
             else if (is_mutable)
                 false
@@ -759,6 +832,9 @@ const Parser = struct {
                 .type_info = type_info,
                 .readonly = readonly,
                 .initializer = initializer,
+                .fixed_array_length = fa_len,
+                .fixed_array_element = fa_elem,
+                .fixed_array_nested_length = fa_nested_len,
             }) catch {};
 
             _ = self.match(.comma);
@@ -817,10 +893,109 @@ const Parser = struct {
         _ = self.bump();
         var depth_count: i32 = 1;
         while (depth_count > 0 and self.current.kind != .eof) {
-            if (self.current.kind == .lt) depth_count += 1;
-            if (self.current.kind == .gt) depth_count -= 1;
+            if (self.current.kind == .lt) {
+                depth_count += 1;
+                _ = self.bump();
+                continue;
+            }
+            if (self.current.kind == .gt) {
+                depth_count -= 1;
+                _ = self.bump();
+                continue;
+            }
+            if (self.current.kind == .rshift) {
+                // `>>` closes two nested generic argument lists at once.
+                depth_count -= 2;
+                if (depth_count < 0) depth_count = 0;
+                _ = self.bump();
+                continue;
+            }
             _ = self.bump();
         }
+    }
+
+    /// Move-style type parser that returns a `TypeNode`, with full
+    /// nested `FixedArray<T, N>` support. The lexer eagerly forms `>>`
+    /// as a shift token; `consumeMoveGenericClose` splits it back into
+    /// two `>` when closing a nested generic argument list.
+    fn parseMoveTypeNode(self: *Parser) TypeNode {
+        // Handle & references — discard
+        if (self.current.kind == .ampersand) {
+            _ = self.bump();
+            _ = self.matchIdent("mut");
+        }
+
+        if (self.current.kind != .ident) {
+            self.addError("expected type name");
+            if (self.current.kind != .eof) _ = self.bump();
+            return .{ .custom_type = "unknown" };
+        }
+
+        const name_tok = self.bump();
+        var name = name_tok.text;
+
+        // Path types: module::Type — keep final component
+        while (self.current.kind == .colon_colon) {
+            _ = self.bump();
+            if (self.current.kind == .ident) {
+                name = self.bump().text;
+            }
+        }
+
+        // FixedArray<T, N> — nestable
+        if (std.mem.eql(u8, name, "FixedArray") and self.current.kind == .lt) {
+            _ = self.bump(); // <
+            const inner = self.parseMoveTypeNode();
+            _ = self.expect(.comma);
+            if (self.current.kind != .number) {
+                self.addError("FixedArray length must be a non-negative integer literal");
+                while (self.current.kind != .gt and self.current.kind != .rshift and self.current.kind != .eof) _ = self.bump();
+                self.consumeMoveGenericClose();
+                return .{ .custom_type = "FixedArray" };
+            }
+            const size_tok = self.bump();
+            const size = std.fmt.parseInt(u32, size_tok.text, 10) catch 0;
+            self.consumeMoveGenericClose();
+            const elem_ptr = self.allocator.create(TypeNode) catch return .{ .custom_type = "FixedArray" };
+            elem_ptr.* = inner;
+            return .{ .fixed_array_type = .{ .element = elem_ptr, .length = size } };
+        }
+
+        // vector<T> → ByteString (legacy)
+        if (std.mem.eql(u8, name, "vector") and self.current.kind == .lt) {
+            self.skipTypeArgs();
+            return .{ .primitive_type = .byte_string };
+        }
+
+        // Other generics: skip args
+        if (self.current.kind == .lt) {
+            self.skipTypeArgs();
+        }
+
+        const rt = mapMoveType(name);
+        if (rt == .unknown) return .{ .custom_type = name };
+        return runarTypeToTypeNodeMove(rt);
+    }
+
+    /// Close a generic-argument list. Accepts either a plain `>` or splits
+    /// a `>>` shift token in place into two `>`.
+    fn consumeMoveGenericClose(self: *Parser) void {
+        if (self.current.kind == .gt) {
+            _ = self.bump();
+            return;
+        }
+        if (self.current.kind == .rshift) {
+            // Mutate the current `>>` into `>` in place so the outer
+            // close consumes the remaining half.
+            self.current = .{
+                .kind = .gt,
+                .text = ">",
+                .line = self.current.line,
+                .col = self.current.col + 1,
+            };
+            return;
+        }
+        _ = self.expect(.gt);
     }
 
     // ---- Function parsing ----
@@ -966,7 +1141,35 @@ const Parser = struct {
         while (self.current.kind != .rbrace and self.current.kind != .eof) {
             self.skipSemicolons();
             if (self.current.kind == .rbrace or self.current.kind == .eof) break;
-            if (self.parseStatement()) |s| stmts.append(self.allocator, s) catch {};
+            if (self.parseStatement()) |s| {
+                // Fold `let i: Int = K; while (i < N) { ...; i = i + 1; }`
+                // into a single for_stmt by patching init_value from a
+                // preceding let/const decl whose name matches the loop variable.
+                if (s == .for_stmt and stmts.items.len > 0) {
+                    const last = &stmts.items[stmts.items.len - 1];
+                    var decl_name: ?[]const u8 = null;
+                    var decl_value: ?Expression = null;
+                    switch (last.*) {
+                        .let_decl => |ld| { decl_name = ld.name; decl_value = ld.value; },
+                        .const_decl => |cd| { decl_name = cd.name; decl_value = cd.value; },
+                        else => {},
+                    }
+                    if (decl_name) |dn| {
+                        if (std.mem.eql(u8, dn, s.for_stmt.var_name)) {
+                            const init_val: i64 = if (decl_value) |v| switch (v) {
+                                .literal_int => |n| n,
+                                else => 0,
+                            } else 0;
+                            stmts.items.len -= 1; // pop the decl
+                            var merged = s.for_stmt;
+                            merged.init_value = init_val;
+                            stmts.append(self.allocator, .{ .for_stmt = merged }) catch {};
+                            continue;
+                        }
+                    }
+                }
+                stmts.append(self.allocator, s) catch {};
+            }
         }
         _ = self.expect(.rbrace);
         return stmts.items;
@@ -1128,11 +1331,13 @@ const Parser = struct {
         const body = self.parseMoveBlock();
         self.skipSemicolons();
 
-        // Extract bound from condition if it's a simple comparison: var < N
+        // Extract var_name and bound from condition if it's a simple comparison: var < N
+        var var_name: []const u8 = "_w";
         var bound: i64 = 0;
         if (_cond) |cond| {
             switch (cond) {
                 .binary_op => |bop| {
+                    if (bop.left == .identifier) var_name = bop.left.identifier;
                     switch (bop.right) {
                         .literal_int => |v| {
                             bound = v;
@@ -1144,7 +1349,27 @@ const Parser = struct {
             }
         }
 
-        return .{ .for_stmt = .{ .var_name = "_w", .init_value = 0, .bound = bound, .body = body } };
+        // Drop a trailing `var_name = var_name + K` so the for_stmt's implicit
+        // iteration matches TypeScript's native `for (let i = 0n; i < N; i++)`.
+        var trimmed_body = body;
+        if (body.len > 0) {
+            const last = body[body.len - 1];
+            if (last == .assign) {
+                const a = last.assign;
+                if (std.mem.eql(u8, a.target, var_name)) {
+                    if (a.value == .binary_op) {
+                        const bop = a.value.binary_op;
+                        if (bop.op == .add and bop.left == .identifier and
+                            std.mem.eql(u8, bop.left.identifier, var_name))
+                        {
+                            trimmed_body = body[0 .. body.len - 1];
+                        }
+                    }
+                }
+            }
+        }
+
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = 0, .bound = bound, .body = trimmed_body } };
     }
 
     fn parseMoveLoop(self: *Parser) ?Statement {
@@ -1547,14 +1772,23 @@ const Parser = struct {
         return switch (self.current.kind) {
             .number => blk: {
                 const tok = self.bump();
-                // Strip underscores from number text
-                var stripped_buf: [64]u8 = undefined;
+                // Strip underscores from number text. Buffer sized for 256-bit
+                // decimal literals (78 digits) with headroom.
+                var stripped_buf: [160]u8 = undefined;
                 var stripped_len: usize = 0;
+                var overflow = false;
                 for (tok.text) |ch| {
-                    if (ch != '_' and stripped_len < stripped_buf.len) {
-                        stripped_buf[stripped_len] = ch;
-                        stripped_len += 1;
+                    if (ch == '_') continue;
+                    if (stripped_len >= stripped_buf.len) {
+                        overflow = true;
+                        break;
                     }
+                    stripped_buf[stripped_len] = ch;
+                    stripped_len += 1;
+                }
+                if (overflow) {
+                    self.addErrorFmt("integer literal too long: '{s}'", .{tok.text});
+                    break :blk null;
                 }
                 const stripped = stripped_buf[0..stripped_len];
                 // Hex literals with even digit count → ByteString
@@ -1565,11 +1799,17 @@ const Parser = struct {
                         break :blk Expression{ .literal_bytes = duped };
                     }
                 }
-                const val = std.fmt.parseInt(i64, stripped, 0) catch {
+                if (std.fmt.parseInt(i64, stripped, 0)) |val| {
+                    break :blk Expression{ .literal_int = val };
+                } else |_| {
+                    // Oversize decimal literal — carry as `literal_bigint`.
+                    if (isAllAsciiDigits(stripped)) {
+                        const decimal = self.allocator.dupe(u8, stripped) catch break :blk null;
+                        break :blk Expression{ .literal_bigint = decimal };
+                    }
                     self.addErrorFmt("invalid integer: '{s}'", .{tok.text});
                     break :blk null;
-                };
-                break :blk Expression{ .literal_int = val };
+                }
             },
             .string_literal => blk: {
                 const tok = self.bump();
@@ -1992,10 +2232,15 @@ test "parse BoundedLoop contract (Move)" {
     try std.testing.expectEqual(@as(usize, 0), r.errors.len);
     const c = r.contract.?;
     try std.testing.expectEqual(@as(usize, 1), c.methods.len);
-    // body: let sum, let i, while, assert_eq
-    try std.testing.expectEqual(@as(usize, 4), c.methods[0].body.len);
-    // while is mapped to for_stmt
-    try std.testing.expectEqual(std.meta.Tag(Statement).for_stmt, std.meta.activeTag(c.methods[0].body[2]));
+    // body: let sum, for_stmt (folded from `let i` + `while`), assert_eq.
+    // The parser folds the canonical `let i = 0; while (i < N) { ...; i = i + 1; }`
+    // pattern into a single for_stmt so ANF lowering matches TypeScript's native
+    // `for (let i = 0n; i < N; i++)` bounded-loop IR.
+    try std.testing.expectEqual(@as(usize, 3), c.methods[0].body.len);
+    // Second statement is the folded for_stmt
+    try std.testing.expectEqual(std.meta.Tag(Statement).for_stmt, std.meta.activeTag(c.methods[0].body[1]));
+    // Iter var should be `i`, not `_w`
+    try std.testing.expectEqualStrings("i", c.methods[0].body[1].for_stmt.var_name);
 }
 
 test "parse error: no module found" {

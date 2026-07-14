@@ -501,6 +501,37 @@ class TestValidator < Minitest::Test
            "expected error about non-constant loop bound, got: #{result.error_strings}"
   end
 
+  # A bare identifier bound (`const N`) is likewise not unrollable and must be
+  # rejected at the validator (never a panic/raise in anf-lower), matching the
+  # reference TS compiler: only integer-literal loop bounds compile.
+  def test_for_loop_identifier_bound_rejected
+    source = <<~TS
+      import { SmartContract, assert } from 'runar-lang';
+
+      const N: bigint = 5n;
+
+      class LoopIdent extends SmartContract {
+        readonly target: bigint;
+
+        constructor(target: bigint) {
+          super(target);
+          this.target = target;
+        }
+
+        public check(): void {
+          let total: bigint = 0n;
+          for (let i: bigint = 0n; i < N; i++) { total += i; }
+          assert(total > 0n);
+        }
+      }
+    TS
+
+    contract = parse_ts(source, "LoopIdent.runar.ts")
+    result = RunarCompiler::Frontend.validate(contract)
+    assert result.errors.any? { |e| e.message.downcase.include?("constant") || e.message.downcase.include?("bound") },
+           "expected identifier loop bound to be rejected, got: #{result.error_strings}"
+  end
+
   # ---------------------------------------------------------------------------
   # 16. ByteString literal with odd-length hex fails
   # ---------------------------------------------------------------------------
@@ -684,5 +715,137 @@ class TestValidator < Minitest::Test
     result = RunarCompiler::Frontend.validate(contract)
     assert result.errors.any? { |e| e.message.include?("txPreimage") },
            "expected error about txPreimage being implicit, got: #{result.error_strings}"
+  end
+
+  # ---------------------------------------------------------------------------
+  # #126 -- contract must have at least one public method
+  # ---------------------------------------------------------------------------
+
+  def test_no_public_methods_reports_error
+    source = <<~TS
+      import { SmartContract, assert, PubKey, Sig, checkSig } from 'runar-lang';
+
+      class Locked extends SmartContract {
+        readonly pk: PubKey;
+
+        constructor(pk: PubKey) {
+          super(pk);
+          this.pk = pk;
+        }
+
+        unlock(sig: Sig): void {
+          assert(checkSig(sig, this.pk));
+        }
+      }
+    TS
+
+    contract = parse_ts(source, "Locked.runar.ts")
+    result = RunarCompiler::Frontend.validate(contract)
+    assert result.errors.any? { |e| e.message.include?("no public methods") },
+           "expected error about no public methods, got: #{result.error_strings}"
+  end
+
+  def test_no_methods_at_all_reports_error
+    contract = minimal_contract(methods: [])
+    result = RunarCompiler::Frontend.validate(contract)
+    assert result.errors.any? { |e| e.message.include?("no public methods") },
+           "expected error about no public methods, got: #{result.error_strings}"
+  end
+
+  def test_at_least_one_public_method_passes
+    contract = minimal_contract
+    result = RunarCompiler::Frontend.validate(contract)
+    refute result.errors.any? { |e| e.message.include?("no public methods") },
+           "did not expect a no-public-methods error, got: #{result.error_strings}"
+  end
+
+  # ---------------------------------------------------------------------------
+  # #121 -- accept non-zero-start and countdown for-loops
+  # ---------------------------------------------------------------------------
+
+  def test_for_loop_non_zero_start_accepted
+    source = <<~TS
+      import { SmartContract, assert } from 'runar-lang';
+
+      class C extends SmartContract {
+        readonly x: bigint;
+
+        constructor(x: bigint) {
+          super(x);
+          this.x = x;
+        }
+
+        public m(): void {
+          let sum: bigint = 0n;
+          for (let i: bigint = 1n; i <= 3n; i++) {
+            sum = sum + i;
+          }
+          assert(sum > 0n);
+        }
+      }
+    TS
+
+    contract = parse_ts(source, "C.runar.ts")
+    result = RunarCompiler::Frontend.validate(contract)
+    refute result.errors.any? { |e| e.message.include?("must start at 0") },
+           "did not expect a non-zero start error (#121), got: #{result.error_strings}"
+  end
+
+  def test_for_loop_countdown_accepted
+    source = <<~TS
+      import { SmartContract, assert } from 'runar-lang';
+
+      class C extends SmartContract {
+        readonly x: bigint;
+
+        constructor(x: bigint) {
+          super(x);
+          this.x = x;
+        }
+
+        public m(): void {
+          let sum: bigint = 0n;
+          for (let i: bigint = 3n; i > 0n; i--) {
+            sum = sum + i;
+          }
+          assert(sum > 0n);
+        }
+      }
+    TS
+
+    contract = parse_ts(source, "C.runar.ts")
+    result = RunarCompiler::Frontend.validate(contract)
+    refute result.errors.any? { |e| e.message.include?("countdown") },
+           "did not expect a countdown error (#121), got: #{result.error_strings}"
+  end
+
+  def test_for_loop_zero_start_counting_up_passes
+    source = <<~TS
+      import { SmartContract, assert } from 'runar-lang';
+
+      class C extends SmartContract {
+        readonly x: bigint;
+
+        constructor(x: bigint) {
+          super(x);
+          this.x = x;
+        }
+
+        public m(): void {
+          let sum: bigint = 0n;
+          for (let i: bigint = 0n; i <= 3n; i++) {
+            sum = sum + i;
+          }
+          assert(sum > 0n);
+        }
+      }
+    TS
+
+    contract = parse_ts(source, "C.runar.ts")
+    result = RunarCompiler::Frontend.validate(contract)
+    refute result.errors.any? { |e| e.message.include?("must start at 0") },
+           "did not expect a non-zero start error, got: #{result.error_strings}"
+    refute result.errors.any? { |e| e.message.include?("countdown") },
+           "did not expect a countdown error, got: #{result.error_strings}"
   end
 end

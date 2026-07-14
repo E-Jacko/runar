@@ -12,6 +12,34 @@ import { describe, it, expect } from 'vitest';
 import { compile } from '../index.js';
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Check whether a hex string contains the given 2-char opcode byte at a
+ * byte-aligned position (i.e., at an even char offset). Prevents spurious
+ * matches when the opcode byte value appears inside push data.
+ */
+function hexContainsOpcode(hex: string, opcode: string): boolean {
+  for (let i = 0; i + 1 < hex.length; i += 2) {
+    if (hex[i] === opcode[0] && hex[i + 1] === opcode[1]) return true;
+  }
+  return false;
+}
+
+/**
+ * Count how many times the given 4-char hex sequence (two adjacent bytes) appears
+ * at byte-aligned positions in the hex string.
+ */
+function hexCountByteSequence(hex: string, seq: string): number {
+  let count = 0;
+  for (let i = 0; i + seq.length <= hex.length; i += 2) {
+    if (hex.slice(i, i + seq.length) === seq) count++;
+  }
+  return count;
+}
+
+// ---------------------------------------------------------------------------
 // Contract sources
 // ---------------------------------------------------------------------------
 
@@ -94,11 +122,11 @@ describe('if-without-else regression', () => {
 
     // The script should contain OP_NIP (0x77) after OP_ENDIF (0x68) to
     // remove the stale old-value copy left by the PICKed outer ref.
+    // Use byte-aligned search to avoid false matches inside push data.
     const script = result.artifact!.script;
-    const endifIdx = script.indexOf('68');
-    expect(endifIdx).toBeGreaterThan(-1);
-    // OP_NIP should follow OP_ENDIF
-    expect(script.substring(endifIdx, endifIdx + 4)).toBe('6877');
+    expect(hexContainsOpcode(script, '68')).toBe(true); // OP_ENDIF present
+    // OP_NIP should immediately follow OP_ENDIF (byte-aligned adjacency check)
+    expect(hexCountByteSequence(script, '6877')).toBeGreaterThan(0);
   });
 
   it('multiple sequential if-without-else compiles and removes stale copies', () => {
@@ -111,15 +139,10 @@ describe('if-without-else regression', () => {
     const ifBindings = method!.body.filter(b => b.value.kind === 'if');
     expect(ifBindings.length).toBe(3);
 
-    // Each OP_ENDIF should be followed by OP_NIP (stale removal)
+    // Each OP_ENDIF should be followed by OP_NIP (stale removal).
+    // Use byte-aligned count to avoid spurious matches inside push data.
     const script = result.artifact!.script;
-    let idx = 0;
-    let nipCount = 0;
-    while ((idx = script.indexOf('6877', idx)) !== -1) {
-      nipCount++;
-      idx += 4;
-    }
-    expect(nipCount).toBe(3);
+    expect(hexCountByteSequence(script, '6877')).toBe(3);
   });
 
   it('if-with-else still compiles correctly (no regression)', () => {
@@ -129,8 +152,8 @@ describe('if-without-else regression', () => {
 
     // The if-with-else case should NOT have OP_NIP after OP_ENDIF since
     // both branches properly produce the result without stale copies.
+    // Use byte-aligned count to avoid spurious matches inside push data.
     const script = result.artifact!.script;
-    // OP_ENDIF (68) should NOT be immediately followed by OP_NIP (77)
-    expect(script.indexOf('6877')).toBe(-1);
+    expect(hexCountByteSequence(script, '6877')).toBe(0);
   });
 });

@@ -92,6 +92,19 @@ export {
   ecMakePoint,
   ecPointX,
   ecPointY,
+  // Baby Bear field arithmetic
+  bbFieldAdd,
+  bbFieldSub,
+  bbFieldMul,
+  bbFieldInv,
+  // KoalaBear field arithmetic
+  kbFieldAdd,
+  kbFieldSub,
+  kbFieldMul,
+  kbFieldInv,
+  // Merkle proof verification
+  merkleRootSha256,
+  merkleRootHash256,
 } from './builtins.js';
 
 // Override preimage functions with mock implementations

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'digest'
+require_relative '../ecdsa'
 
 # Lightweight ANF interpreter for auto-computing state transitions.
 #
@@ -8,7 +9,11 @@ require 'digest'
 # method arguments, this interpreter walks the ANF bindings and computes
 # the new state. It handles +update_prop+ nodes to track state mutations,
 # while skipping on-chain-only operations like +check_preimage+,
-# +deserialize_state+, +get_state_script+, +add_output+, and +add_raw_output+.
+# +deserialize_state+, and +get_state_script+. +add_data_output+ entries
+# are surfaced through the +data_outputs+ array, and +add_raw_output+
+# entries through the +raw_outputs+ array — the simulator does not
+# introspect raw scripts (they're caller-supplied) but forwards them so
+# off-chain transaction builders can splice them in at the correct index.
 #
 # This enables the SDK to auto-compute +new_state+ for stateful contract
 # calls, so callers don't need to duplicate contract logic.
@@ -21,6 +26,68 @@ require 'digest'
 
 module Runar
   module SDK
+    # Raised by {ANFInterpreter.execute_strict} when an +assert(predicate)+
+    # in the ANF body evaluates to a falsy value during strict-mode
+    # interpretation. Carries the contract method name plus the ANF binding
+    # name (e.g. +t17+, +t8+) so a developer can pinpoint the exact failing
+    # guard. The +to_s+ / +message+ rendering matches the TS / Go / Java /
+    # Zig SDKs byte-for-byte so cross-tier diffing on the wire is stable.
+    class AssertionFailureError < StandardError
+      attr_reader :method_name, :binding_name
+
+      def initialize(method_name, binding_name)
+        @method_name = method_name
+        @binding_name = binding_name
+        super("assert failed in #{method_name}: binding '#{binding_name}' evaluated to false")
+      end
+    end
+
+    # Required cryptographic context for
+    # {ANFInterpreter.execute_on_chain_authoritative}.
+    #
+    # +sighash+ is the 32-byte BIP-143 sighash digest the on-chain VM would
+    # verify signatures against (and that the caller would have signed with
+    # +LocalSigner#sign+ before broadcasting). The interpreter:
+    #
+    # - verifies +checkSig(sig, pk)+ by parsing +pk+ as a SEC1 secp256k1 point
+    #   (compressed or uncompressed), parsing +sig+ as DER (with optional
+    #   trailing sighash type byte stripped), and ECDSA-verifying against the
+    #   sighash. Any mismatch returns +false+, which then trips the enclosing
+    #   +assert(...)+ and raises {AssertionFailureError}.
+    # - verifies +checkMultiSig(sigs, pks)+ by iterating signatures
+    #   left-to-right and consuming pubkeys greedily, mirroring Bitcoin's
+    #   +OP_CHECKMULTISIG+.
+    # - verifies +checkPreimage(preimage)+ by computing
+    #   +SHA256(SHA256(preimage))+ and comparing it to +sighash+ byte-for-byte
+    #   — the on-chain +OP_PUSH_TX+ semantic.
+    class OnChainCryptoContext
+      # @return [String] 32-byte binary sighash
+      attr_reader :sighash
+
+      # @param sighash [String] hex string (64 chars) or 32-byte binary string
+      def initialize(sighash)
+        bytes = if sighash.is_a?(String) && sighash.length == 64 && sighash.match?(/\A[0-9a-fA-F]+\z/)
+                  [sighash].pack('H*')
+                elsif sighash.is_a?(String) && sighash.bytesize == 32
+                  sighash.dup.force_encoding(Encoding::ASCII_8BIT)
+                else
+                  raise ArgumentError,
+                        "OnChainCryptoContext: sighash must be 32 bytes (binary) or 64 hex chars"
+                end
+        if bytes.bytesize != 32
+          raise ArgumentError,
+                "OnChainCryptoContext: sighash must be exactly 32 bytes, got #{bytes.bytesize}"
+        end
+        @sighash = bytes
+      end
+
+      # 32-byte sighash as a hex string.
+      # @return [String]
+      def sighash_hex
+        @sighash.unpack1('H*')
+      end
+    end
+
     module ANFInterpreter
       module_function
 
@@ -42,10 +109,192 @@ module Runar
       # @param method_name  [String] the method to execute (must be a public method)
       # @param current_state [Hash]  current contract state (property name → value)
       # @param args         [Hash]   method arguments (param name → value)
+      # @param constructor_args [Array] constructor arg values (declaration order) for readonly fields
       # @param max_loop_iterations [Integer] optional override for the loop iteration limit
       # @return [Hash] the updated state (merged with current_state)
       # @raise [ArgumentError] when method_name is not found as a public method in the ANF IR
-      def compute_new_state(anf, method_name, current_state, args, max_loop_iterations: MAX_LOOP_ITERATIONS)
+      def compute_new_state(anf, method_name, current_state, args, constructor_args: [], max_loop_iterations: MAX_LOOP_ITERATIONS)
+        state, _data_outputs, _raw_outputs = compute_new_state_and_data_outputs(
+          anf, method_name, current_state, args,
+          constructor_args: constructor_args,
+          max_loop_iterations: max_loop_iterations,
+        )
+        state
+      end
+
+      # Like #compute_new_state but also returns data outputs resolved
+      # from +this.addDataOutput(...)+ and raw outputs resolved from
+      # +this.addRawOutput(...)+ in declaration order. Each data-output
+      # entry is +{satoshis: Integer, script: String}+ where +script+ is
+      # the +OP_RETURN+ payload bytes; each raw-output entry shares the
+      # same shape but +script+ is the caller-supplied raw locking
+      # script. The SDK uses these to populate the tx between state
+      # outputs and the change output so the on-chain continuation-hash
+      # check matches.
+      #
+      # @return [Array(Hash, Array<Hash>, Array<Hash>)]
+      #   +[new_state, data_outputs, raw_outputs]+
+      def compute_new_state_and_data_outputs(anf, method_name, current_state, args, constructor_args: [], max_loop_iterations: MAX_LOOP_ITERATIONS)
+        run_method(anf, method_name, current_state, args, constructor_args, nil, max_loop_iterations)
+      end
+
+      # Strict-mode counterpart of #compute_new_state_and_data_outputs.
+      #
+      # Walks the same ANF body but raises {Runar::SDK::AssertionFailureError}
+      # on the first +assert(predicate)+ binding (or +call(func: 'assert')+
+      # lowering) whose predicate is falsy. Crypto built-ins (+checkSig+,
+      # +checkMultiSig+, +checkPreimage+) still mock-return +true+; only
+      # explicit +assert(...)+ predicates are enforced.
+      #
+      # @return [Array(Hash, Array<Hash>, Array<Hash>)]
+      #   +[new_state, data_outputs, raw_outputs]+
+      # @raise  [Runar::SDK::AssertionFailureError] on the first falsy assert
+      def execute_strict(anf, method_name, current_state, args, constructor_args = [], max_loop_iterations: MAX_LOOP_ITERATIONS)
+        run_method(anf, method_name, current_state, args, constructor_args, method_name, max_loop_iterations, nil)
+      end
+
+      # Strict-mode execution with intent-intrinsic witness routing.
+      #
+      # Mirrors the TS reference interpreter's
+      # {RunarInterpreter#setPrevOutScript} / {RunarInterpreter#setSerialisedOutputs}
+      # channel for the ANF-tier. The desugared intrinsics
+      # (+extractPrevOutputScript+, +requireOutputP2PKH+,
+      # +currentBlockHeight+) lower to +load_param+ of synthetic ABI slots
+      # (+_prevOutScript_<i>+ / +_serialisedOutputs+) plus a +hash256+ /
+      # +substr+ / +cat+ / +num2bin+ chain that the existing evaluator already
+      # supports. This entry point:
+      #
+      # - injects +witness_bytes+ into the +load_param+ lookup so the
+      #   desugared chain sees real bytes instead of +nil+;
+      # - overrides +extractLocktime+ / +extractOutputHash+ /
+      #   +extractAmount+ etc. to return the supplied +mock_preimage+ /
+      #   +mock_preimage_bytes+ values rather than the default zero
+      #   placeholder;
+      # - raises {AssertionFailureError} with a contextual message that
+      #   mirrors the TS source-level error string (matched by the
+      #   conformance tests' +.error+ regexes) when the assertion source
+      #   pattern is recognised; falls back to the generic
+      #   "assert failed in <method>" message otherwise.
+      #
+      # Witness / preimage values may be supplied as hex strings or raw
+      # 8-bit binary strings; the latter are converted via +unpack1('H*')+.
+      #
+      # @param anf                  [Hash]
+      # @param method_name          [String]
+      # @param current_state        [Hash]
+      # @param args                 [Hash]
+      # @param constructor_args     [Array]
+      # @param witness_bytes        [Hash{String => String}] synthetic
+      #   param name (+_prevOutScript_<i>+ / +_serialisedOutputs+) → bytes
+      # @param mock_preimage        [Hash{String,Symbol => Integer}]
+      #   locktime / amount / version / sequence overrides
+      # @param mock_preimage_bytes  [Hash{String,Symbol => String}]
+      #   outputHash / hashPrevouts / hashSequence / outpoint overrides
+      # @param max_loop_iterations  [Integer]
+      # @return [Array(Hash, Array<Hash>, Array<Hash>)]
+      # @raise  [AssertionFailureError, RuntimeError]
+      def execute_strict_with_witness(
+        anf, method_name, current_state, args,
+        constructor_args: [], witness_bytes: {}, mock_preimage: {},
+        mock_preimage_bytes: {}, max_loop_iterations: MAX_LOOP_ITERATIONS
+      )
+        Thread.current[:runar_witness_bytes] = normalize_byte_map(witness_bytes)
+        Thread.current[:runar_mock_preimage] = stringify_keys(mock_preimage)
+        Thread.current[:runar_mock_preimage_bytes] = normalize_byte_map(mock_preimage_bytes)
+        Thread.current[:runar_method_body_index] = nil
+        Thread.current[:runar_anf_for_context] = anf
+        state_outputs = []
+        Thread.current[:runar_state_outputs] = state_outputs
+        new_state, data_outputs, raw_outputs = run_method(
+          anf, method_name, current_state, args, constructor_args,
+          method_name, max_loop_iterations, nil,
+        )
+        [new_state, data_outputs, raw_outputs, state_outputs]
+      ensure
+        Thread.current[:runar_witness_bytes] = nil
+        Thread.current[:runar_mock_preimage] = nil
+        Thread.current[:runar_mock_preimage_bytes] = nil
+        Thread.current[:runar_method_body_index] = nil
+        Thread.current[:runar_anf_for_context] = nil
+        Thread.current[:runar_state_outputs] = nil
+      end
+
+      # Normalise a {name => bytes} map so values are hex strings.
+      # Accepts hex strings (pass through) or 8-bit binary strings
+      # (encoded). Other types are rejected.
+      def normalize_byte_map(map)
+        out = {}
+        return out if map.nil?
+
+        map.each do |k, v|
+          key = k.to_s
+          out[key] = case v
+                     when nil then nil
+                     when String
+                       if v.length.even? && v.match?(/\A[0-9a-fA-F]*\z/)
+                         v.downcase
+                       else
+                         v.dup.force_encoding(Encoding::ASCII_8BIT).unpack1('H*')
+                       end
+                     when Array
+                       v.pack('C*').unpack1('H*')
+                     else
+                       raise ArgumentError,
+                             "witness/preimage bytes must be hex string or binary string, got #{v.class}"
+                     end
+        end
+        out
+      end
+
+      # Stringify hash keys (allow symbol or string keys at the call site).
+      def stringify_keys(h)
+        return {} if h.nil?
+
+        h.each_with_object({}) { |(k, v), acc| acc[k.to_s] = v }
+      end
+
+      # On-chain authoritative counterpart of #execute_strict.
+      #
+      # Walks the same ANF body but additionally performs *real* cryptographic
+      # verification of +checkSig+, +checkMultiSig+, and +checkPreimage+
+      # against the supplied 32-byte sighash. Any failed predicate trips the
+      # enclosing +assert(...)+ and raises {AssertionFailureError}. Lenient
+      # and strict modes still mock-return +true+ for these built-ins; only
+      # this entry point performs real verification.
+      #
+      # @param anf              [Hash]   the ANF IR (plain Hash from JSON)
+      # @param method_name      [String] the public method to execute
+      # @param current_state    [Hash]   current contract state
+      # @param args             [Hash]   method arguments
+      # @param constructor_args [Array]  positional constructor args
+      # @param ctx              [OnChainCryptoContext] mandatory sighash ctx
+      # @param max_loop_iterations [Integer] optional override for loop cap
+      # @return [Array(Hash, Array<Hash>, Array<Hash>)]
+      # @raise  [AssertionFailureError] on the first falsy assert (incl. the
+      #         implicit one wrapping a failed crypto built-in)
+      def execute_on_chain_authoritative(
+        anf, method_name, current_state, args, constructor_args, ctx,
+        max_loop_iterations: MAX_LOOP_ITERATIONS
+      )
+        unless ctx.is_a?(OnChainCryptoContext)
+          raise ArgumentError,
+                "execute_on_chain_authoritative: ctx must be an OnChainCryptoContext"
+        end
+        run_method(
+          anf, method_name, current_state, args, constructor_args,
+          method_name, max_loop_iterations, ctx,
+        )
+      end
+
+      # Shared entry-point for lenient, strict, and on-chain modes.
+      #
+      # +strict_method_name+ == nil → lenient (asserts skipped).
+      # +strict_method_name+ != nil → strict (asserts enforced; first falsy
+      # predicate raises {Runar::SDK::AssertionFailureError}).
+      # +real_crypto_ctx+ != nil    → on-chain mode (real ECDSA + hash256
+      # checks for +checkSig+/+checkMultiSig+/+checkPreimage+; implies
+      # strict-mode assertions).
+      def run_method(anf, method_name, current_state, args, constructor_args, strict_method_name, max_loop_iterations, real_crypto_ctx = nil)
         method = find_public_method(anf, method_name)
 
         unless method
@@ -55,12 +304,37 @@ module Runar
 
         # Store the configurable loop limit for use in eval_value.
         Thread.current[:runar_max_loop_iterations] = max_loop_iterations
+        # Thread strict-mode state through the evaluator without changing
+        # the existing eval_bindings / eval_value signatures (mirrors the
+        # loop-limit pattern above). nil = lenient.
+        Thread.current[:runar_strict_method] = strict_method_name
+        # Thread real-crypto context through the evaluator. nil in lenient
+        # and strict modes; an OnChainCryptoContext in on-chain mode.
+        Thread.current[:runar_real_crypto] = real_crypto_ctx
+
+        # Build constructor param index: position among non-initialized properties.
+        # Properties with initialValue are excluded from the constructor, so
+        # constructor_args[i] corresponds to the i-th property without initialValue.
+        ctor_idx = {}
+        ci = 0
+        Array(anf['properties']).each do |prop|
+          if prop['initialValue'].nil?
+            ctor_idx[prop['name']] = ci
+            ci += 1
+          end
+        end
 
         # Initialize environment with property values.
         env = {}
         Array(anf['properties']).each do |prop|
           name = prop['name']
-          env[name] = current_state.fetch(name, prop['initialValue'])
+          if current_state.key?(name)
+            env[name] = current_state[name]
+          elsif !prop['initialValue'].nil?
+            env[name] = prop['initialValue']
+          elsif ctor_idx.key?(name) && ctor_idx[name] < constructor_args.length
+            env[name] = constructor_args[ctor_idx[name]]
+          end
         end
 
         # Load method params, skipping implicit compiler-injected ones.
@@ -73,11 +347,19 @@ module Runar
         end
 
         state_delta = {}
-        eval_bindings(Array(method['body']), env, state_delta, anf)
+        data_outputs = []
+        # +raw_outputs+ collects entries from +add_raw_output+ ANF kinds.
+        # The simulator does NOT introspect their script bytes (the script
+        # is caller-supplied); it surfaces them so an off-chain transaction
+        # builder can emit the output at the correct index.
+        raw_outputs = []
+        eval_bindings(Array(method['body']), env, state_delta, data_outputs, raw_outputs, anf)
 
-        current_state.merge(state_delta)
+        [current_state.merge(state_delta), data_outputs, raw_outputs]
       ensure
         Thread.current[:runar_max_loop_iterations] = nil
+        Thread.current[:runar_strict_method] = nil
+        Thread.current[:runar_real_crypto] = nil
       end
 
       # Walk a list of ANF bindings, updating env with each result.
@@ -85,27 +367,62 @@ module Runar
       # @param bindings    [Array<Hash>] list of { name:, value: } binding nodes
       # @param env         [Hash]        current name → value environment (mutated in place)
       # @param state_delta [Hash]        accumulated state mutations (mutated in place)
+      # @param data_outputs [Array<Hash>] accumulated +add_data_output+ entries
+      # @param raw_outputs  [Array<Hash>] accumulated +add_raw_output+ entries
       # @param anf         [Hash, nil]   full ANF IR (for method lookup)
-      def eval_bindings(bindings, env, state_delta, anf = nil)
+      def eval_bindings(bindings, env, state_delta, data_outputs, raw_outputs, anf = nil)
+        # Maintain a name → value-hash index so the assert error-message
+        # synthesis can walk the desugar chain (only populated under
+        # {execute_strict_with_witness}; lenient + plain strict modes leave
+        # the slot nil).
+        if Thread.current[:runar_witness_bytes]
+          index = Thread.current[:runar_method_body_index] ||= {}
+          bindings.each { |b| index[b['name']] = b['value'] }
+        end
         bindings.each do |binding|
-          val = eval_value(binding['value'], env, state_delta, anf)
+          val = eval_value(binding['value'], env, state_delta, data_outputs, raw_outputs, anf, binding['name'])
           env[binding['name']] = val
         end
       end
 
       # Evaluate a single ANF value node, dispatching on its kind.
       #
-      # @param value       [Hash]
-      # @param env         [Hash]
-      # @param state_delta [Hash]
-      # @param anf         [Hash, nil]
+      # @param value        [Hash]
+      # @param env          [Hash]
+      # @param state_delta  [Hash]
+      # @param data_outputs [Array<Hash>]
+      # @param raw_outputs  [Array<Hash>]
+      # @param anf          [Hash, nil]
       # @return [Object]
       # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/MethodLength, Metrics/PerceivedComplexity
-      def eval_value(value, env, state_delta, anf = nil)
+      def eval_value(value, env, state_delta, data_outputs, raw_outputs, anf = nil, binding_name = nil)
         kind = value['kind'].to_s
 
         case kind
-        when 'load_param', 'load_prop'
+        when 'load_param'
+          name = value['name']
+          if env.key?(name)
+            env[name]
+          else
+            witness = Thread.current[:runar_witness_bytes]
+            if witness && (name == '_serialisedOutputs' || name.start_with?('_prevOutScript_'))
+              if witness[name].nil?
+                if name.start_with?('_prevOutScript_')
+                  idx = name.sub('_prevOutScript_', '')
+                  raise "extractPrevOutputScript(#{idx}) requires witness bytes. " \
+                        "Call set_prev_out_script(#{idx}, bytes) before invoking the method."
+                else
+                  raise 'requireOutputP2PKH requires serialised-outputs witness bytes. ' \
+                        'Call set_serialised_outputs(bytes) before invoking the method.'
+                end
+              end
+              witness[name]
+            else
+              env[name]
+            end
+          end
+
+        when 'load_prop'
           env[value['name']]
 
         when 'load_const'
@@ -130,17 +447,29 @@ module Runar
 
         when 'call'
           call_args = Array(value['args']).map { |a| env[a] }
-          eval_call(value['func'], call_args)
+          # Strict mode: a +call(func: 'assert', args: [pred])+ lowering path
+          # enforces the predicate the same way the dedicated +assert+ ANF
+          # node does.
+          strict_method = Thread.current[:runar_strict_method]
+          if strict_method && value['func'] == 'assert'
+            unless is_truthy(call_args.first)
+              raise AssertionFailureError.new(strict_method, binding_name)
+            end
+
+            nil
+          else
+            eval_call(value['func'], call_args)
+          end
 
         when 'method_call'
           call_args = Array(value['args']).map { |a| env[a] }
-          eval_method_call(env[value['object']], value['method'], call_args, env, state_delta, anf)
+          eval_method_call(env[value['object']], value['method'], call_args, env, state_delta, data_outputs, raw_outputs, anf)
 
         when 'if'
           cond   = env[value['cond']]
           branch = is_truthy(cond) ? value['then'] : value['else']
           child_env = env.dup
-          eval_bindings(Array(branch), child_env, state_delta, anf)
+          eval_bindings(Array(branch), child_env, state_delta, data_outputs, raw_outputs, anf)
           env.merge!(child_env)
           branch && !branch.empty? ? child_env[branch.last['name']] : nil
 
@@ -153,17 +482,60 @@ module Runar
 
           body     = Array(value['body'])
           iter_var = value['iterVar'].to_s
+          # Iteration i binds iterVar = start + i*step (#121). Older ANF
+          # payloads without start/step describe zero-start counting-up loops.
+          start = to_int(value['start'] || 0)
+          step  = value.key?('step') ? to_int(value['step']) : 1
           last_val = nil
           count.times do |i|
-            env[iter_var] = i
+            env[iter_var] = start + i * step
             loop_env = env.dup
-            eval_bindings(body, loop_env, state_delta, anf)
+            eval_bindings(body, loop_env, state_delta, data_outputs, raw_outputs, anf)
             env.merge!(loop_env)
             last_val = body.empty? ? nil : loop_env[body.last['name']]
           end
           last_val
 
         when 'assert'
+          # Lenient mode: skip; the on-chain script enforces.
+          # Strict mode: enforce — falsy predicate raises AssertionFailureError.
+          # If the witness-routing channel is active, also walk the assert's
+          # source structure to emit a contextual error string that mirrors
+          # the TS source-level interpreter (so the conformance tests' .error
+          # regexes match).
+          strict_method = Thread.current[:runar_strict_method]
+          if strict_method
+            # Marker-based skip: the compiler auto-emits the final
+            # continuation-hash check on every stateful-contract method
+            # (hash256(stateOutput ‖ changeOutput) ==
+            # extractOutputHash(preimage)). The lowering pass in
+            # +compilers/ruby/lib/runar_compiler/frontend/anf_lower.rb+
+            # tags ONLY that assert with +isAutoInjectedStateCheck:
+            # true+. Under +execute_strict_with_witness+,
+            # +computeStateOutput+ / +get_state_script+ /
+            # +buildChangeOutput+ are not modelled off-chain so the assert
+            # is unenforceable — skip it. Developer-written covenant
+            # asserts with the identical IR shape carry no marker and ARE
+            # enforced (the previous structural recognizer misfired on
+            # them; see BUG-002).
+            if value['isAutoInjectedStateCheck'] == true
+              return nil
+            end
+            if Thread.current[:runar_witness_bytes] &&
+               check_preimage_assert?(value['value'])
+              return nil
+            end
+
+            pred = env[value['value']]
+            unless is_truthy(pred)
+              ctx_msg = intent_assert_context(value['value'])
+              if ctx_msg
+                raise ctx_msg
+              end
+
+              raise AssertionFailureError.new(strict_method, binding_name)
+            end
+          end
           nil
 
         when 'update_prop'
@@ -188,9 +560,47 @@ module Runar
               state_delta[prop_name] = resolved
             end
           end
+          # Surface state-output emissions to the caller under the
+          # witness-routing channel so the test harness can assert
+          # outputs.length / outputs[i].satoshis. Lenient + plain strict
+          # paths don't care (they only consume state).
+          state_outs = Thread.current[:runar_state_outputs]
+          if state_outs
+            sat_ref = value['satoshis']
+            sats = env[sat_ref]
+            sats = sats.to_i if sats
+            state_outs << { satoshis: sats || 0 }
+          end
           nil
 
-        when 'check_preimage', 'deserialize_state', 'get_state_script', 'add_raw_output'
+        when 'add_data_output'
+          # Resolve the two arg refs and record the data output.
+          sat_ref = value['satoshis']
+          script_ref = value['scriptBytes']
+          sats = env[sat_ref]
+          sats = sats.to_i if sats
+          script_val = env[script_ref]
+          script_hex = script_val.is_a?(String) ? script_val : ''
+          data_outputs << { satoshis: sats || 0, script: script_hex }
+          nil
+
+        when 'add_raw_output'
+          # +addRawOutput(satoshis, scriptBytes)+. The simulator does not
+          # introspect the script bytes (they are caller-supplied raw
+          # locking script); it forwards them in the result envelope so an
+          # off-chain transaction builder can emit the output at the
+          # correct index. Crypto built-ins remain mocked even in strict
+          # mode. Mirrors the +add_data_output+ arm above.
+          sat_ref = value['satoshis']
+          script_ref = value['scriptBytes']
+          sats = env[sat_ref]
+          sats = sats.to_i if sats
+          script_val = env[script_ref]
+          script_hex = script_val.is_a?(String) ? script_val : ''
+          raw_outputs << { satoshis: sats || 0, script: script_hex }
+          nil
+
+        when 'check_preimage', 'deserialize_state', 'get_state_script'
           # On-chain-only operations — skip in simulation.
           nil
 
@@ -334,10 +744,23 @@ module Runar
       # @return [Object]
       # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/MethodLength, Metrics/PerceivedComplexity
       def eval_call(func, args)
+        real_crypto = Thread.current[:runar_real_crypto]
+
         case func
-        # Mock crypto — always return true in simulation.
-        when 'checkSig', 'checkMultiSig', 'checkPreimage'
-          true
+        # Crypto built-ins:
+        #   - lenient + strict modes: mock-return true
+        #   - on-chain mode: real ECDSA / hash256 verification against the
+        #     32-byte sighash supplied via OnChainCryptoContext. Failed
+        #     verification returns false, which trips the enclosing
+        #     assert(...) and raises AssertionFailureError.
+        when 'checkSig'
+          real_crypto ? verify_ecdsa_real(args[0], args[1], real_crypto.sighash) : true
+
+        when 'checkMultiSig'
+          real_crypto ? verify_multi_sig_real(args[0], args[1], real_crypto.sighash) : true
+
+        when 'checkPreimage'
+          real_crypto ? verify_preimage_real(args[0], real_crypto.sighash) : true
 
         # Real hash functions.
         when 'sha256'   then hash_fn('sha256',   args[0])
@@ -440,9 +863,52 @@ module Runar
         when 'percentOf'
           truncate_div(to_int(args[0]) * to_int(args[1]), 10_000)
 
-        # Preimage intrinsics — return dummy values in simulation.
-        when 'extractOutputHash', 'extractAmount'
-          '00' * 32
+        # Preimage intrinsics — default to dummy values, but allow
+        # explicit overrides via the mock-preimage channel threaded
+        # through {execute_strict_with_witness}.
+        when 'extractOutputHash', 'extractOutputs'
+          mock_bytes = Thread.current[:runar_mock_preimage_bytes]
+          (mock_bytes && mock_bytes['outputHash']) || ('00' * 32)
+
+        when 'extractHashPrevouts'
+          mock_bytes = Thread.current[:runar_mock_preimage_bytes]
+          (mock_bytes && mock_bytes['hashPrevouts']) || ('00' * 32)
+
+        when 'extractHashSequence'
+          mock_bytes = Thread.current[:runar_mock_preimage_bytes]
+          (mock_bytes && mock_bytes['hashSequence']) || ('00' * 32)
+
+        when 'extractOutpoint'
+          mock_bytes = Thread.current[:runar_mock_preimage_bytes]
+          (mock_bytes && mock_bytes['outpoint']) || ('00' * 36)
+
+        when 'extractLocktime'
+          mock_pre = Thread.current[:runar_mock_preimage]
+          to_int((mock_pre && (mock_pre['locktime'] || mock_pre[:locktime])) || 0)
+
+        when 'extractAmount'
+          mock_pre = Thread.current[:runar_mock_preimage]
+          if mock_pre && (mock_pre.key?('amount') || mock_pre.key?(:amount))
+            to_int(mock_pre['amount'] || mock_pre[:amount])
+          else
+            '00' * 32
+          end
+
+        when 'extractVersion'
+          mock_pre = Thread.current[:runar_mock_preimage]
+          to_int((mock_pre && (mock_pre['version'] || mock_pre[:version])) || 1)
+
+        when 'extractSequence'
+          mock_pre = Thread.current[:runar_mock_preimage]
+          to_int((mock_pre && (mock_pre['sequence'] || mock_pre[:sequence])) || 0xfffffffe)
+
+        when 'extractSigHashType'
+          # GAP-302: the auto-injected stateful covenant pins the sighash type
+          # to SIGHASH_ALL | FORKID (0x41). The interpreter mocks a valid
+          # preimage (checkPreimage passes), so report the canonical pinned
+          # type here too -- otherwise the pin assert spuriously fails.
+          mock_pre = Thread.current[:runar_mock_preimage]
+          to_int((mock_pre && (mock_pre['sigHashType'] || mock_pre[:sigHashType])) || 0x41)
 
         else
           nil
@@ -461,14 +927,16 @@ module Runar
       # propagates any state mutations back to the caller, and returns the
       # value of the last binding.
       #
-      # @param _obj        [Object]      receiver (unused — all calls are this-calls)
-      # @param method_name [String, nil]
-      # @param args        [Array]
-      # @param caller_env  [Hash, nil]
-      # @param state_delta [Hash, nil]
-      # @param anf         [Hash, nil]
+      # @param _obj         [Object]      receiver (unused — all calls are this-calls)
+      # @param method_name  [String, nil]
+      # @param args         [Array]
+      # @param caller_env   [Hash, nil]
+      # @param state_delta  [Hash, nil]
+      # @param data_outputs [Array<Hash>]
+      # @param raw_outputs  [Array<Hash>]
+      # @param anf          [Hash, nil]
       # @return [Object]
-      def eval_method_call(_obj, method_name, args, caller_env = nil, state_delta = nil, anf = nil)
+      def eval_method_call(_obj, method_name, args, caller_env = nil, state_delta = nil, data_outputs = [], raw_outputs = [], anf = nil)
         return nil unless anf && method_name
 
         private_method = Array(anf['methods']).find do |m|
@@ -494,7 +962,17 @@ module Runar
 
         body = Array(private_method['body'])
         child_delta = {}
-        eval_bindings(body, new_env, child_delta, anf)
+        # Save & shadow the caller's body-index so this private method's
+        # binding names (which can collide with the caller's, e.g. +t0+)
+        # don't pollute intent-intrinsic assert-context lookups in the
+        # caller's frame after we return.
+        saved_index = Thread.current[:runar_method_body_index]
+        Thread.current[:runar_method_body_index] = {} if saved_index
+        begin
+          eval_bindings(body, new_env, child_delta, data_outputs, raw_outputs, anf)
+        ensure
+          Thread.current[:runar_method_body_index] = saved_index
+        end
 
         # Propagate state mutations back to the caller environment.
         state_delta&.merge!(child_delta)
@@ -525,6 +1003,90 @@ module Runar
         when 'hash160'  then Digest::RMD160.hexdigest(Digest::SHA256.digest(data))
         else ''
         end
+      end
+
+      # ---------------------------------------------------------------------------
+      # Real ECDSA / preimage verification (used by execute_on_chain_authoritative)
+      # ---------------------------------------------------------------------------
+
+      # Coerce a checkSig / checkPreimage arg into a hex string. Accepts
+      # hex strings (returned as-is) and 8-bit binary strings (encoded to
+      # hex). Returns nil if the value is not coercible to bytes.
+      def to_hex_arg(v)
+        return nil if v.nil?
+
+        case v
+        when String
+          # Even-length hex string: pass through.
+          if v.length.even? && v.match?(/\A[0-9a-fA-F]*\z/)
+            v
+          else
+            nil
+          end
+        else
+          nil
+        end
+      end
+
+      # Verify an ECDSA signature against a 32-byte sighash. Pubkey must be
+      # SEC1 (33-byte compressed or 65-byte uncompressed); signature must be
+      # DER with an optional trailing sighash type byte (stripped by
+      # +Runar::ECDSA.parse_der_signature_bytes+). Returns +false+ on any
+      # decode error so the enclosing +assert(...)+ fires.
+      #
+      # The 32-byte sighash is the ECDSA digest itself (no extra hash) — this
+      # mirrors the on-chain +OP_CHECKSIG+ semantic, where the script
+      # interpreter feeds the BIP-143 sighash directly into ECDSA-verify. The
+      # test fixtures' signatures are produced by +ECDSA-sign(sighash, priv)+
+      # against the same 32-byte sighash with no additional hashing.
+      def verify_ecdsa_real(sig_val, pk_val, sighash_bytes)
+        return false unless sighash_bytes.is_a?(String) && sighash_bytes.bytesize == 32
+
+        sig_hex = to_hex_arg(sig_val)
+        pk_hex  = to_hex_arg(pk_val)
+        return false if sig_hex.nil? || pk_hex.nil?
+
+        begin
+          Runar::ECDSA.verify(sighash_bytes.unpack1('H*'), sig_hex, pk_hex)
+        rescue StandardError
+          false
+        end
+      end
+
+      # Verify a list of signatures against a list of pubkeys. Mirrors
+      # Bitcoin's +OP_CHECKMULTISIG+: iterate sigs left-to-right, consume
+      # pubkeys greedily.
+      def verify_multi_sig_real(sigs_val, pks_val, sighash_bytes)
+        return false unless sigs_val.is_a?(Array) && pks_val.is_a?(Array)
+        return false if sigs_val.length > pks_val.length
+
+        pk_idx = 0
+        sigs_val.each do |sig|
+          matched = false
+          while pk_idx < pks_val.length
+            ok = verify_ecdsa_real(sig, pks_val[pk_idx], sighash_bytes)
+            pk_idx += 1
+            if ok
+              matched = true
+              break
+            end
+          end
+          return false unless matched
+        end
+        true
+      end
+
+      # Verify that +SHA256(SHA256(preimage)) == sighash+ — the on-chain
+      # +OP_PUSH_TX+ semantic for +checkPreimage+.
+      def verify_preimage_real(preimage_val, sighash_bytes)
+        return false unless sighash_bytes.is_a?(String) && sighash_bytes.bytesize == 32
+
+        pre_hex = to_hex_arg(preimage_val)
+        return false if pre_hex.nil?
+
+        pre_bytes = [pre_hex].pack('H*')
+        computed = Digest::SHA256.digest(Digest::SHA256.digest(pre_bytes))
+        computed == sighash_bytes
       end
 
       # ---------------------------------------------------------------------------
@@ -690,6 +1252,134 @@ module Runar
       # ---------------------------------------------------------------------------
       # Private helpers
       # ---------------------------------------------------------------------------
+
+      # Detect whether an assert predicate ref is +check_preimage(...)+.
+      # The check is unenforceable without a real sighash, so under
+      # +execute_strict_with_witness+ we skip it (mirroring the TS
+      # AST interpreter, which does not run check_preimage in the test
+      # harness either).
+      def check_preimage_assert?(pred_ref)
+        idx_map = Thread.current[:runar_method_body_index]
+        return false unless idx_map
+
+        pred = idx_map[pred_ref]
+        pred.is_a?(Hash) && pred['kind'] == 'check_preimage'
+      end
+
+      # Detect whether an assert predicate ref is the auto-emitted
+      # continuation-hash check the compiler appends to every
+      # stateful-contract public method. Pattern:
+      #
+      #   bin_op === bytes (hash256_ref, extractOutputHash_ref)
+      #     where hash256_ref = call hash256(cat_ref)
+      #       and cat_ref     = call cat(state_ref, change_ref)
+      #       and state_ref   = call computeStateOutput(...)
+      #             OR  state_ref upstream depends on get_state_script
+      #       and change_ref  = call buildChangeOutput(...)
+      #
+      # Only matches when the structural shape is unambiguously the
+      # compiler-emitted continuation check; otherwise returns false.
+      def continuation_hash_assert?(pred_ref)
+        idx_map = Thread.current[:runar_method_body_index]
+        return false unless idx_map
+
+        pred = idx_map[pred_ref]
+        return false unless pred.is_a?(Hash) && pred['kind'] == 'bin_op'
+        return false unless ['===', '==', '!==', '!='].include?(pred['op'])
+
+        left  = idx_map[pred['left']]
+        right = idx_map[pred['right']]
+        return false unless left.is_a?(Hash) && left['kind'] == 'call' && left['func'] == 'hash256'
+        return false unless right.is_a?(Hash) && right['kind'] == 'call' && right['func'] == 'extractOutputHash'
+
+        cat_ref = Array(left['args']).first
+        cat_node = cat_ref ? idx_map[cat_ref] : nil
+        return false unless cat_node.is_a?(Hash) && cat_node['kind'] == 'call' && cat_node['func'] == 'cat'
+
+        cat_args = Array(cat_node['args'])
+        state_node = cat_args[0] ? idx_map[cat_args[0]] : nil
+        change_node = cat_args[1] ? idx_map[cat_args[1]] : nil
+
+        # The "state half" of the cat is one of three shapes the compiler
+        # emits depending on the contract surface:
+        #   - +call computeStateOutput(...)+ — standard stateful contract
+        #     desugar path
+        #   - +get_state_script+ ANF kind — earlier IR shape some methods
+        #     bake out directly
+        #   - +add_output(...)+ — when the user's body calls
+        #     +this.addOutput(satoshis, ...stateValues)+, the compiler reuses
+        #     that node as the state-output reference and concats it with the
+        #     change output for the continuation hash.
+        state_ok = state_node.is_a?(Hash) && (
+          (state_node['kind'] == 'call' && state_node['func'] == 'computeStateOutput') ||
+          state_node['kind'] == 'get_state_script' ||
+          state_node['kind'] == 'add_output'
+        )
+        change_ok = change_node.is_a?(Hash) && change_node['kind'] == 'call' && change_node['func'] == 'buildChangeOutput'
+
+        state_ok && change_ok
+      end
+
+      # If the binding referenced by an +assert+ predicate originated in
+      # one of the three intent-intrinsic desugar shapes, return a
+      # contextual error string matching the TS source-level interpreter.
+      # Otherwise return +nil+ so the caller falls back to the generic
+      # {AssertionFailureError} message.
+      #
+      # Recognised shapes (LEFT = bin_op +===+ bytes operand):
+      # - +hash256(<load_param '_prevOutScript_<idx>'>)+ → emit
+      #   "extractPrevOutputScript(<idx>): hash256(witness) !== expectedHash"
+      # - +hash256(<load_param '_serialisedOutputs'>)+ → emit
+      #   "requireOutputP2PKH: hash256(serialisedOutputs) !== preimage.hashOutputs"
+      # - +substr(<load_param '_serialisedOutputs'>, 0, *)+ → emit
+      #   "requireOutputP2PKH(<idx>): output bytes mismatch" (with
+      #   +<idx> = offset / 34+)
+      #
+      # @param pred_ref [String] the +value['value']+ ref on the assert node
+      # @return [String, nil]
+      def intent_assert_context(pred_ref)
+        return nil unless Thread.current[:runar_witness_bytes]
+
+        idx_map = Thread.current[:runar_method_body_index]
+        return nil unless idx_map
+
+        pred = idx_map[pred_ref]
+        return nil unless pred.is_a?(Hash) && pred['kind'] == 'bin_op'
+        return nil unless ['===', '==', '!==', '!='].include?(pred['op'])
+
+        left = idx_map[pred['left']]
+        return nil unless left.is_a?(Hash) && left['kind'] == 'call'
+
+        call_args = Array(left['args'])
+        first_arg = call_args.first ? idx_map[call_args.first] : nil
+
+        if left['func'] == 'hash256' && first_arg.is_a?(Hash) && first_arg['kind'] == 'load_param'
+          name = first_arg['name'].to_s
+          if name.start_with?('_prevOutScript_')
+            idx = name.sub('_prevOutScript_', '')
+            return "extractPrevOutputScript(#{idx}): hash256(witness) !== expectedHash"
+          elsif name == '_serialisedOutputs'
+            return 'requireOutputP2PKH: hash256(serialisedOutputs) !== preimage.hashOutputs'
+          end
+        end
+
+        if left['func'] == 'substr' && first_arg.is_a?(Hash) && first_arg['kind'] == 'load_param' &&
+           first_arg['name'].to_s == '_serialisedOutputs'
+          offset_node = call_args[1] ? idx_map[call_args[1]] : nil
+          length_node = call_args[2] ? idx_map[call_args[2]] : nil
+          length_val = length_node.is_a?(Hash) ? length_node['value'] : nil
+          # Only emit the requireOutputP2PKH-substr error for the 34-byte
+          # canonical-P2PKH window; other substr( _serialisedOutputs, ...)
+          # callsites would be unrelated.
+          if length_val.to_i == 34
+            offset_val = offset_node.is_a?(Hash) ? offset_node['value'].to_i : 0
+            idx = offset_val / 34
+            return "requireOutputP2PKH(#{idx}): output bytes mismatch"
+          end
+        end
+
+        nil
+      end
 
       # Find a public method by name in the ANF IR.
       #

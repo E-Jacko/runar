@@ -1,0 +1,32 @@
+{
+  "fixture": "multi-method",
+  "kind": "stateless-signed",
+  "note": "Two spending entry points, each gated by a real ECDSA checkSig (owner / backup) plus a method-selector on the unlocking stack.",
+  "constructorArgs": { "owner": { "$pubkey": "charlie" }, "backup": { "$pubkey": "dave" } },
+  "spends": [
+    {
+      "method": "spendWithOwner",
+      "args": [{ "$sig": "charlie" }, "6n"],
+      "expect": "accept",
+      "note": "threshold 6*2+1=13>10 and owner sig verifies"
+    },
+    {
+      "method": "spendWithOwner",
+      "args": [{ "$sig": "charlie" }, "3n"],
+      "expect": "reject",
+      "note": "business near-miss: threshold 3*2+1=7 not >10 — both engines reject"
+    },
+    {
+      "method": "spendWithBackup",
+      "args": [{ "$sig": "dave" }],
+      "expect": "accept",
+      "note": "backup sig verifies"
+    },
+    {
+      "method": "spendWithBackup",
+      "args": [{ "$sig": "eve" }],
+      "expect": "reject",
+      "note": "crypto near-miss: eve is not the committed backup — checkSig fails"
+    }
+  ]
+}

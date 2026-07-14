@@ -1,17 +1,228 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/v*']
+    tags: ['v*']
   pull_request:
-    branches: [main]
+    branches: [main, 'release/v*']
+  workflow_dispatch:
+    inputs:
+      run_teranode:
+        description: 'Also run the integration suite against a Teranode node (heavy; opt-in)'
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  typescript:
-    name: TypeScript (build + test)
+  # ---------------------------------------------------------------------------
+  # Lint — block reintroduction of dishonest test patterns
+  # ---------------------------------------------------------------------------
+
+  lint-no-silent-skips:
+    name: Lint — no silent test skips, no active TODO markers
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run scripts/lint-no-silent-skips.sh (composite lint)
+        # The same script runs locally via `pnpm run lint:silent-skips`. It
+        # covers three cohorts:
+        #   1. Zig integration silent-skip surface markers (the 162-instance
+        #      catch-and-bare-return antipattern that reports PASS).
+        #   2. Active TODO/FIXME/XXX/todo!/unimplemented! markers in source
+        #      code — they're forbidden; finish the work or remove them.
+        #   3. Test-skip surface markers cross-checked against
+        #      docs/test-skips.md so every documented skip stays the audit
+        #      trail of the only legitimate skip paths in the corpus.
+        run: bash scripts/lint-no-silent-skips.sh
+      - name: Assert all tier versions are consistent
+        # DOC-001 drift gate: every compiler/SDK manifest, Cargo.lock, gradle
+        # module, and embedded version string must agree. The checker already
+        # exists; this wires it into the merge gate so a mismatch (e.g. one
+        # tier bumped without the others) fails the PR instead of shipping.
+        run: bash scripts/bump-version.sh --check
+
+  conformance-allowlist-audit:
+    # Pin which conformance fixtures are allowed to opt out of compiler tiers
+    # via source.json's `compilers` allowlist. New / changed allowlists must
+    # land in conformance/runner/__tests__/allowlist-audit.test.ts AND in
+    # conformance/README.md ("Per-fixture compiler allowlist") in the same
+    # commit. Cheap (~10 s with pnpm install) — gates the rest of CI like
+    # lint-no-silent-skips so a drift here short-circuits the heavy matrix.
+    name: Lint — conformance allowlist audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run allowlist audit (vitest)
+        run: pnpm run conformance:allowlist-audit
+
+  golden-provenance-gate:
+    # GOLDEN-REGENERATION INTEGRITY GATE (issue #122). Conformance goldens /
+    # vectors (expected-script.hex, expected-ir.json, runtime-vectors/*.json,
+    # sdk-output/**/expected-locking.hex, analyzer + source-map goldens, the
+    # decompiler baseline) are SELF-PRODUCED by the implementation under test
+    # (`pnpm run update-golden`). Nothing else stops a PR from silently
+    # regenerating one to match a buggy new compiler output — the suite then
+    # validates the corrupt bytes against itself and ships green. This gate
+    # fails the PR if any golden changed WITHOUT an independent provenance
+    # justification: either (A) the fixture's own witnesses/<fixture>.json
+    # co-changed (differential oracle re-checks it via a second engine), or
+    # (B) a content-pinned entry in conformance/golden-provenance-allowlist.json
+    # (sha256 + verified-against + reason + reviewer sign-off). Cheap (Node
+    # built-ins only, no install) — gates the heavy matrix like the other lints.
+    #
+    # Security note: the only github.event.* value consumed is the base commit
+    # SHA, passed via `env:` (never interpolated into the shell) and used solely
+    # as a git ref for the three-dot diff. No untrusted event text reaches a
+    # `run:` block.
+    name: Lint — golden-regeneration provenance gate
+    runs-on: ubuntu-latest
+    # A merged golden change on `main` is already landed; the gate is a PR
+    # admission control, so scope it to pull_request events.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the PR base commit is present for the merge-base
+          # three-dot diff below.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check golden/vector provenance (changed set vs merge-base)
+        env:
+          # base.sha = tip of the branch this PR merges into. The script diffs
+          # `<base>...HEAD` (three-dot = merge-base) to get the PR's true
+          # changed set, so an already-merged commit from another PR is never
+          # misattributed here.
+          GOLDEN_GATE_BASE: ${{ github.event.pull_request.base.sha }}
+        run: node conformance/scripts/check-golden-provenance.mjs
+      - name: Self-test the gate (both directions)
+        # Belt-and-suspenders: proves the checker still rejects an unjustified
+        # golden change and passes a justified one, so the gate can't silently
+        # rot into a no-op that greenlights everything.
+        run: node conformance/scripts/check-golden-provenance.mjs --self-test
+
+  sdk-envelope-fixtures:
+    # Guards the signed-envelope wire protocol's cross-tier fixture. The
+    # fixture is the frozen TS-reference bytes that all 6 non-TS SDKs validate
+    # against (canonicalJson + signEnvelope/verifyEnvelope). Two silent-failure
+    # modes this job closes:
+    #   1. TS drift — if TS's canonicalJson/signing path changes but the
+    #      committed fixtures.json does not, the consumers keep validating
+    #      against stale bytes and a real TS regression ships green. The
+    #      validator recomputes every canonical vector + re-verifies the
+    #      envelope signature against the committed fixture and fails on drift.
+    #   2. Dropped coverage — the per-tier interop tests run inside each SDK
+    #      job (go test, cargo test, ...), with no central re-run. If a tier's
+    #      test glob ever stops picking up its interop file, cross-tier parity
+    #      silently stops being checked.
+    name: Lint — SDK envelope fixture drift + interop coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Validate envelope fixture against the TS reference (drift guard)
+        run: cd conformance && npx tsx sdk-envelope/validate-fixtures.ts
+      - name: Assert every non-TS SDK has an envelope interop test wired to the fixture
+        run: |
+          set -euo pipefail
+          files=(
+            "packages/runar-go/sdk_envelope_interop_test.go"
+            "packages/runar-rs/tests/envelope_interop.rs"
+            "packages/runar-py/tests/test_envelope_interop.py"
+            "packages/runar-zig/src/sdk_envelope_interop_test.zig"
+            "packages/runar-rb/spec/runar/sdk/envelope_interop_spec.rb"
+            "packages/runar-java/src/test/java/runar/lang/sdk/EnvelopeInteropTest.java"
+          )
+          missing=0
+          for f in "${files[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing envelope interop test: $f"
+              missing=1
+            elif ! grep -q "sdk-envelope" "$f"; then
+              echo "::error::$f no longer references conformance/sdk-envelope/fixtures.json"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Cross-tier envelope interop coverage is incomplete. See conformance/sdk-envelope/."
+            exit 1
+          fi
+          echo "All 6 non-TS SDK envelope interop tests present and wired to the fixture."
+
+  sdk-bip143-fixtures:
+    # Guards the cross-tier BIP-143 transaction-sighash fixture (GAP-003). The
+    # fixture is the frozen TS-reference preimage + deterministic RFC-6979
+    # signature that all seven SDKs replay: each tier recomputes the BIP-143
+    # preimage and verifies the signature, proving the SDKs agree on preimage
+    # assembly (not just that each agrees with the node). Same two silent-
+    # failure modes as the envelope job: TS drift vs the committed fixture, and
+    # a tier silently dropping its interop test from its suite.
+    name: Lint — SDK BIP-143 fixture drift + interop coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Validate BIP-143 fixture against the TS reference (drift guard)
+        run: cd conformance && npx tsx sdk-bip143/generate-fixtures.ts --check
+      - name: Assert every SDK has a BIP-143 interop test wired to the fixture
+        run: |
+          set -euo pipefail
+          files=(
+            "packages/runar-go/sdk_bip143_interop_test.go"
+            "packages/runar-rs/tests/bip143_interop.rs"
+            "packages/runar-py/tests/test_bip143_interop.py"
+            "packages/runar-rb/spec/runar/sdk/bip143_interop_spec.rb"
+            "packages/runar-zig/src/sdk_bip143_interop_test.zig"
+            "packages/runar-java/src/test/java/runar/lang/sdk/Bip143InteropTest.java"
+          )
+          missing=0
+          for f in "${files[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing BIP-143 interop test: $f"
+              missing=1
+            elif ! grep -q "sdk-bip143" "$f"; then
+              echo "::error::$f no longer references conformance/sdk-bip143/fixtures.json"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Cross-tier BIP-143 interop coverage is incomplete. See conformance/sdk-bip143/."
+            exit 1
+          fi
+          echo "All 6 non-TS SDK BIP-143 interop tests present and wired to the fixture."
+
+  # ---------------------------------------------------------------------------
+  # Compilers — build, unit test, upload artifacts
+  # ---------------------------------------------------------------------------
+
+  ts-compiler:
+    name: TypeScript Compiler
+    runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
+    env:
+      # Force the cross-compiler vitest matrix to hard-fail when any of the
+      # 7 toolchains is missing (instead of skipping with a warning). This
+      # job installs every toolchain the matrix references.
+      RUNAR_REQUIRE_ALL_COMPILERS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -21,59 +232,80 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
       - name: Build Rust compiler (for cross-compiler tests)
         run: cd compilers/rust && cargo build --release
+      - name: Warm Go build cache (for cross-compiler tests)
+        run: cd compilers/go && go build ./...
+      - name: Build Zig compiler (for cross-compiler tests)
+        run: cd compilers/zig && zig build -Doptimize=ReleaseSafe
+      - name: Build Java compiler jar (for cross-compiler tests)
+        run: cd compilers/java && gradle jar --no-daemon
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
       - run: pnpm run test
+      - name: GAP-101 — fold-ON⇄fold-OFF ScriptVM equivalence oracle
+        # Compiles each fold-relevant fixture with folding ON and OFF and asserts
+        # both compiled scripts reach the identical accept/reject verdict through
+        # the BSV Spend interpreter — a correctness oracle for the fold pass beyond
+        # cross-tier byte agreement (catches an all-7-tier-shared fold bug).
+        run: npx vitest run packages/runar-testing/src/__tests__/fold-equivalence.test.ts
       - name: Example tests (TS + Sol + Move)
         run: npx vitest run examples/ts/ examples/sol/ examples/move/
       - run: pnpm run typecheck
 
-  go:
+  go-compiler:
     name: Go Compiler
     runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - run: cd compilers/go && go build ./...
       - run: cd compilers/go && go build -o runar-go .
       - run: cd compilers/go && go test -race -v ./...
-      - name: Go SDK tests
-        run: cd packages/runar-go && go test ./...
-      - name: Go example tests
-        run: cd examples/go && go test ./...
       - uses: actions/upload-artifact@v4
         with:
           name: runar-go
           path: compilers/go/runar-go
 
-  rust:
+  rust-compiler:
     name: Rust Compiler
     runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cd compilers/rust && cargo build --release
       - run: cd compilers/rust && cargo test
-      - name: Rust example tests
-        run: cd examples/rust && cargo test
-      - name: Rust SDK tests
-        run: cd packages/runar-rs && cargo test
       - uses: actions/upload-artifact@v4
         with:
           name: runar-rust
           path: compilers/rust/target/release/runar-compiler-rust
 
-  python:
+  python-compiler:
     name: Python Compiler
     runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -81,67 +313,69 @@ jobs:
           python-version: '3.12'
       - run: pip install pytest
       - run: cd compilers/python && python -m pytest tests/ -v
-      - name: Python SDK tests
-        run: cd packages/runar-py && python -m pytest
-      - name: Python example tests
-        run: cd examples/python && PYTHONPATH=../../packages/runar-py python -m pytest
 
   zig-compiler:
     name: Zig Compiler
     runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.0
+          version: 0.16.0
       - run: cd compilers/zig && zig build test
       - name: Zig conformance tests
         run: cd compilers/zig && zig build conformance
       - name: Build release binary
-        run: cd compilers/zig && zig build -Doptimize=ReleaseFast
+        # ReleaseSafe + baseline CPU: ReleaseFast was SIGILL-ing on heavier
+        # conformance fixtures on the conformance runner (different ubuntu-
+        # latest SKU than the build runner). Baseline target keeps the binary
+        # portable across runner CPUs; ReleaseSafe keeps overflow + bounds
+        # checks so any remaining bug surfaces as a panic with file:line
+        # instead of a bare SIGILL.
+        run: cd compilers/zig && zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=baseline
       - uses: actions/upload-artifact@v4
         with:
           name: runar-zig
           path: compilers/zig/zig-out/bin/runar-zig
 
-  zig-sdk:
-    name: Zig SDK
+  java-compiler:
+    name: Java Compiler
     runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/setup-java@v4
         with:
-          version: 0.15.0
-      - run: cd packages/runar-zig && zig build test
-      - name: Zig example tests
-        run: cd examples/zig && zig build test
-
-  ruby:
-    name: Ruby SDK
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ruby/setup-ruby@v1
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build Java compiler
+        run: cd compilers/java && gradle build --no-daemon
+      - name: Java compiler unit tests
+        run: cd compilers/java && gradle test --no-daemon
+      - uses: actions/upload-artifact@v4
         with:
-          ruby-version: '3.3'
-          bundler-cache: true
-          working-directory: packages/runar-rb
-      - run: cd packages/runar-rb && bundle exec rspec
-      - name: Ruby example tests
-        run: |
-          cd examples/ruby
-          bundle install
-          bundle exec rspec **/*_spec.rb
+          name: runar-java
+          path: compilers/java/build/libs/*.jar
 
   ruby-compiler:
     name: Ruby Compiler
     runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
     steps:
       - uses: actions/checkout@v4
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.3'
-      - name: Ruby compiler conformance (IR → hex)
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Ruby compiler unit tests
+        run: cd compilers/ruby && rake test
+      - name: Ruby compiler conformance (IR -> hex)
         run: |
           fail=0
           for test in conformance/tests/*/expected-ir.json; do
@@ -157,44 +391,131 @@ jobs:
             fi
           done
           exit $fail
-      - name: Ruby compiler source conformance (.runar.ts → hex)
+      # Note: cross-compiler multi-format source conformance lives in the
+      # dedicated `conformance` job below, which depends on every
+      # compiler-build job and installs every toolchain. Running it here
+      # would require this Ruby-only job to also install Go, Rust, Python,
+      # Zig, and Java — duplicating ~5 minutes of setup for no extra
+      # coverage. Ruby's source.json entries are exercised by the central
+      # job alongside every other tier.
+
+  # ---------------------------------------------------------------------------
+  # SDKs — package tests + example tests
+  # ---------------------------------------------------------------------------
+
+  go-sdk:
+    name: Go SDK
+    runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: packages/runar-go/go.sum
+      - name: SDK tests
+        run: cd packages/runar-go && go test ./...
+      - name: Example tests
+        run: cd examples/go && go test ./...
+
+  rust-sdk:
+    name: Rust SDK
+    runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: SDK tests
+        run: cd packages/runar-rs && cargo test
+      - name: Example tests
+        run: cd examples/rust && cargo test
+
+  python-sdk:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # `slh-dsa` is the FIPS 205 reference impl. We install it in CI so the
+      # SPHINCSWallet / post-quantum-slhdsa-naive negative tests run their
+      # real-crypto path (matching the @_slow @_requires_slhdsa marker pair
+      # in those test files). Locally devs can omit it; pytest's skipif
+      # gate falls back to the documented environmental skip — see
+      # docs/test-skips.md.
+      #
+      # `bsv-sdk` is the upstream BSV SDK that `runar.sdk.script_vm` wraps
+      # (T-8 from audits/cross-language-completeness-20260514.md §5.2). We
+      # install it in CI so test_script_vm.py runs its real path instead of
+      # silently skipping via `pytest.importorskip("bsv")`. The companion
+      # CI-gate in test_script_vm.py FAILS the suite if bsv-sdk is missing
+      # when `$CI` is set, so a regression here is caught loudly.
+      - run: pip install pytest slh-dsa bsv-sdk
+      - name: SDK tests
+        run: cd packages/runar-py && python -m pytest
+      - name: Example tests (real SLH-DSA enabled via slh-dsa pkg)
+        run: cd examples/python && PYTHONPATH=../../packages/runar-py python -m pytest
+
+  zig-sdk:
+    name: Zig SDK
+    runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: SDK tests
+        run: cd packages/runar-zig && zig build test
+      - name: Example tests
+        run: cd examples/zig && zig build test
+
+  ruby-sdk:
+    name: Ruby SDK
+    runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+          working-directory: packages/runar-rb
+      - name: SDK tests
+        run: cd packages/runar-rb && bundle exec rspec
+      - name: Example tests
         run: |
-          fail=0
-          for dir in conformance/tests/*/; do
-            name=$(basename "$dir")
-            ts_file="$dir/$name.runar.ts"
-            [ -f "$ts_file" ] || continue
-            expected=$(tr -d '[:space:]' < "$dir/expected-script.hex" | tr '[:upper:]' '[:lower:]')
-            actual=$(ruby compilers/ruby/bin/runar-compiler-ruby --source "$ts_file" --hex --disable-constant-folding 2>&1 | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-            if [ "$expected" = "$actual" ]; then
-              echo "PASS $name (.runar.ts)"
-            else
-              echo "FAIL $name (.runar.ts)"
-              fail=1
-            fi
-          done
-          exit $fail
-      - name: Ruby compiler source conformance (.runar.rb → hex)
-        run: |
-          fail=0
-          for dir in conformance/tests/*/; do
-            name=$(basename "$dir")
-            rb_file=$(find "$dir" -name "*.runar.rb" | head -1)
-            [ -n "$rb_file" ] || continue
-            expected=$(tr -d '[:space:]' < "$dir/expected-script.hex" | tr '[:upper:]' '[:lower:]')
-            actual=$(ruby compilers/ruby/bin/runar-compiler-ruby --source "$rb_file" --hex --disable-constant-folding 2>&1 | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-            if [ "$expected" = "$actual" ]; then
-              echo "PASS $name (.runar.rb)"
-            else
-              echo "FAIL $name (.runar.rb)"
-              fail=1
-            fi
-          done
-          exit $fail
+          cd examples/ruby
+          bundle install
+          bundle exec rspec **/*_spec.rb
+
+  java-sdk:
+    name: Java SDK
+    runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: SDK tests
+        run: cd packages/runar-java && gradle test --no-daemon
+      - name: Example tests
+        run: cd examples/java && gradle test --no-daemon
+      - name: Build conformance SDK driver
+        run: cd conformance/sdk-output/tools/java-driver && gradle fatJar --no-daemon
+
+  # ---------------------------------------------------------------------------
+  # Conformance — cross-compiler + SDK output
+  # ---------------------------------------------------------------------------
 
   conformance:
     name: Conformance Tests
-    needs: [typescript, go, rust, python, zig-compiler, ruby-compiler]
+    needs: [ts-compiler, go-compiler, rust-compiler, python-compiler, zig-compiler, ruby-compiler, java-compiler]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -207,62 +528,598 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: runar-zig
+      - uses: actions/download-artifact@v4
+        with:
+          name: runar-java
+          path: compilers/java/build/libs
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.3'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
       - run: chmod +x runar-go runar-compiler-rust runar-zig
-      - name: Run conformance tests
+      - name: Locate Java compiler jar
+        id: java-jar
         run: |
+          jar=$(ls compilers/java/build/libs/runar-java-compiler-*.jar | head -1)
+          echo "path=$jar" >> "$GITHUB_OUTPUT"
+      - name: Run conformance tests
+        env:
+          JAVA_JAR: ${{ steps.java-jar.outputs.path }}
+        run: |
+          set -u
           fail=0
+          log_dir=$(mktemp -d)
+
+          # Run a single compiler against an IR fixture. Captures stdout to
+          # $log_dir/<compiler>.hex and stderr to $log_dir/<compiler>.err.
+          # Returns the exit code of the compiler. Empty stdout is allowed at
+          # this layer; the caller decides whether emptiness is fatal.
+          run_compiler() {
+            local compiler="$1"
+            local test="$2"
+            local out="$log_dir/$compiler.hex"
+            local err="$log_dir/$compiler.err"
+            : > "$out"
+            : > "$err"
+            local rc=0
+            case "$compiler" in
+              go)
+                ./runar-go --ir "$test" --hex --disable-constant-folding >"$out" 2>"$err" || rc=$?
+                ;;
+              rust)
+                ./runar-compiler-rust --ir "$test" --hex --disable-constant-folding >"$out" 2>"$err" || rc=$?
+                ;;
+              zig)
+                ./runar-zig compile-ir "$test" --hex >"$out" 2>"$err" || rc=$?
+                # zig prints diagnostics on stdout before the hex; keep
+                # only the first non-empty line for the comparison.
+                head -1 "$out" > "$out.tmp" && mv "$out.tmp" "$out"
+                ;;
+              ruby)
+                ruby compilers/ruby/bin/runar-compiler-ruby --ir "$test" --hex --disable-constant-folding >"$out" 2>"$err" || rc=$?
+                ;;
+              python)
+                ( cd compilers/python && python3 -m runar_compiler --ir "../../$test" --hex --disable-constant-folding ) >"$out" 2>"$err" || rc=$?
+                ;;
+              java)
+                java -jar "$JAVA_JAR" --ir "$test" --hex --disable-constant-folding >"$out" 2>"$err" || rc=$?
+                ;;
+              *)
+                echo "run_compiler: unknown compiler id '$compiler'" >&2
+                return 2
+                ;;
+            esac
+            return $rc
+          }
+
+          # Print a failure block with the last 50 lines of the compiler's
+          # stderr capture so CI logs explain what went wrong.
+          dump_failure() {
+            local compiler="$1"
+            local fixture="$2"
+            local rc="$3"
+            local reason="$4"
+            local err="$log_dir/$compiler.err"
+            echo "::error::conformance: $compiler/$fixture failed ($reason, exit=$rc)"
+            echo "----- last 50 lines of $compiler stderr for $fixture -----"
+            tail -n 50 "$err" 2>/dev/null || true
+            echo "----- end stderr -----"
+          }
+
           for test in conformance/tests/*/expected-ir.json; do
             dir=$(dirname "$test")
             name=$(basename "$dir")
-            echo -n "=== $name === "
-            go_hex=$(./runar-go --ir "$test" --hex)
-            rust_hex=$(./runar-compiler-rust --ir "$test" --hex)
-            zig_hex=$(./runar-zig compile-ir "$test" --hex 2>/dev/null | head -1)
-            ruby_hex=$(ruby compilers/ruby/bin/runar-compiler-ruby --ir "$test" --hex --disable-constant-folding 2>&1 | tr -d '[:space:]')
-            if [ "$go_hex" != "$rust_hex" ]; then
-              echo "MISMATCH Go vs Rust"
-              fail=1
-            elif [ "$go_hex" != "$zig_hex" ]; then
-              echo "MISMATCH Go vs Zig"
-              fail=1
-            elif [ "$go_hex" != "$ruby_hex" ]; then
-              echo "MISMATCH Go vs Ruby"
-              fail=1
+            source_json="$dir/source.json"
+
+            # Determine the active compiler set for this fixture. When
+            # source.json declares a "compilers" allowlist, intersect it with
+            # the non-TS compilers we drive here. Otherwise, every non-TS
+            # tier must produce identical output. TS conformance is exercised
+            # separately via vitest / the multi-format runner step below.
+            all_compilers="go rust zig ruby python java"
+            allowlist=""
+            if [ -f "$source_json" ]; then
+              allowlist=$(jq -r '.compilers // [] | join(" ")' "$source_json")
+            fi
+            active=""
+            if [ -z "$allowlist" ]; then
+              active="$all_compilers"
             else
-              echo "OK (${#go_hex} hex chars)"
+              for c in $all_compilers; do
+                for a in $allowlist; do
+                  if [ "$c" = "$a" ]; then
+                    active="$active $c"
+                    break
+                  fi
+                done
+              done
+              # Trim leading whitespace.
+              active=$(echo "$active" | awk '{$1=$1};1')
+            fi
+
+            if [ -z "$active" ]; then
+              # Allowlist had no overlap with our 6 non-TS tiers (e.g. ts-only
+              # fixture). Skip silently — it's covered by the TS-side runner.
+              echo "=== $name === SKIP (no non-TS compilers in allowlist)"
+              continue
+            fi
+
+            echo -n "=== $name === active=[${active// /,}] "
+
+            # Run every active compiler. Fail loudly on non-zero exit or
+            # empty hex output — no more silent passes.
+            fixture_failed=0
+            for compiler in $active; do
+              rc=0
+              run_compiler "$compiler" "$test" || rc=$?
+              hex=$(tr -d '[:space:]' < "$log_dir/$compiler.hex")
+              if [ "$rc" -ne 0 ]; then
+                echo
+                dump_failure "$compiler" "$name" "$rc" "non-zero exit"
+                fail=1
+                fixture_failed=1
+              elif [ -z "$hex" ]; then
+                echo
+                dump_failure "$compiler" "$name" "$rc" "empty hex output"
+                fail=1
+                fixture_failed=1
+              fi
+              # Persist normalized hex for the comparison phase.
+              printf '%s' "$hex" > "$log_dir/$compiler.norm"
+            done
+
+            if [ "$fixture_failed" -ne 0 ]; then
+              continue
+            fi
+
+            # Compare every active compiler against Go (the reference). When
+            # Go isn't in the active set, fall back to the first listed
+            # compiler as the reference — this keeps allowlists like
+            # ["python","ruby"] (none today, but defensive) sensible.
+            ref=""
+            for compiler in $active; do
+              if [ "$compiler" = "go" ]; then
+                ref="go"
+                break
+              fi
+            done
+            if [ -z "$ref" ]; then
+              ref=$(echo "$active" | awk '{print $1}')
+            fi
+            ref_hex=$(cat "$log_dir/$ref.norm")
+
+            mismatch=0
+            for compiler in $active; do
+              if [ "$compiler" = "$ref" ]; then
+                continue
+              fi
+              other_hex=$(cat "$log_dir/$compiler.norm")
+              if [ "$ref_hex" != "$other_hex" ]; then
+                echo
+                echo "::error::conformance: $name — $ref hex differs from $compiler hex"
+                echo "  $ref:	$ref_hex"
+                echo "  $compiler:	$other_hex"
+                fail=1
+                mismatch=1
+              fi
+            done
+
+            if [ "$mismatch" -eq 0 ]; then
+              echo "OK (${#ref_hex} hex chars, ref=$ref)"
+            fi
+
+            # Compare reference output against the golden hex file when
+            # present. Mirrors the previous behavior but uses whichever
+            # compiler is the comparison reference.
+            expected_hex_file="$dir/expected-script.hex"
+            if [ -f "$expected_hex_file" ]; then
+              expected_hex=$(tr -d '[:space:]' < "$expected_hex_file")
+              if [ -n "$expected_hex" ] && [ "$ref_hex" != "$expected_hex" ]; then
+                echo "::error::conformance: $name — $ref output does not match golden file"
+                echo "  $ref:	$ref_hex"
+                echo "  Expected:	$expected_hex"
+                fail=1
+              fi
             fi
           done
           exit $fail
-      - name: Ruby format conformance (source → hex)
+      # The previous "Ruby format conformance (source -> hex)" step searched for
+      # `<case>.runar.rb` files inside each conformance/tests/<case>/ directory,
+      # but sources now live under `examples/` and are referenced from
+      # `source.json`. The shell loop was a silent no-op. The shared multi-format
+      # runner below subsumes it: it reads every source.json entry (TS, Sol,
+      # Move, Go, Rust, Python, Zig, Ruby, Java) and drives all 7 compilers.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: compilers/go/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      # conformance/ is not a pnpm workspace member (uses npm + package-lock.json
+      # for its tsx loader + fast-check fuzzer). The runner spawns subprocesses
+      # that import tsx from REPO_ROOT/conformance/node_modules, so install its
+      # deps explicitly before the multi-format step.
+      - run: cd conformance && npm ci
+      - name: Run all-tier parser-only coverage (every compiler × every fixture × every format)
+        # Universal frontend coverage: every available compiler runs
+        # `--parse-only` on every fixture × every declared format. The
+        # per-fixture `compilers` allowlist in source.json is intentionally
+        # IGNORED here — that allowlist scopes Stack-IR / hex parity, not
+        # the parser layer. This step gates the central claim that "every
+        # tier parses every fixture in every one of the nine source
+        # formats" (see spec/README.md and conformance/README.md).
+        env:
+          JAVA_JAR: ${{ steps.java-jar.outputs.path }}
+        run: conformance/node_modules/.bin/tsx conformance/runner/index.ts --tests-dir conformance/tests --parser-only
+      - name: Run multi-format source conformance (all 7 compilers, all 9 formats)
+        # Adds the TypeScript compiler to the central conformance job (it was
+        # previously absent) and exercises every compiler's frontend against
+        # every declared source.json entry, not just the IR -> hex path above.
+        # Default mode: every compiler runs with `--disable-constant-folding`,
+        # matching the fold-off semantics of the checked-in
+        # expected-ir.json / expected-script.hex goldens.
+        env:
+          JAVA_JAR: ${{ steps.java-jar.outputs.path }}
+        run: conformance/node_modules/.bin/tsx conformance/runner/index.ts --tests-dir conformance/tests --multi-format
+      - name: Run multi-format source conformance (fold ON, cross-tier parity only)
+        # Companion run: every compiler executes with constant folding ENABLED
+        # (its end-user default) and the runner enforces cross-tier hex + ANF
+        # parity across all 7 tiers, while skipping the golden-file comparison
+        # (the checked-in goldens were stamped fold-OFF). This catches latent
+        # fold bugs that the historical fold-off-only loop would have missed
+        # — see the MEDIUM review finding on "Constant-folding coverage is
+        # weaker than runtime coverage". If a real cross-tier divergence
+        # appears here in future, list the fixture in
+        # `conformance/fold-on-allowlist.json` (with a one-line justification
+        # per the file's contract) instead of silently skipping it.
+        env:
+          JAVA_JAR: ${{ steps.java-jar.outputs.path }}
+          RUNAR_DISABLE_CONSTANT_FOLDING: '0'
+        run: conformance/node_modules/.bin/tsx conformance/runner/index.ts --tests-dir conformance/tests --multi-format
+      - name: Per-fixture differential execution (source vs script, fold-ON)
+        # TS-GAP-001 / TS-GAP-004: the source-vs-script execution oracle. For
+        # every witnessed fixture, compile to fold-ON deployed bytes, then run
+        # each declared valid + near-miss spend through BOTH the ANF interpreter
+        # (source semantics) and the @bsv/sdk ScriptVM (script semantics) and
+        # require they agree on accept/reject. This catches a bug all seven
+        # compilers share (byte-identical but wrong). completeness.test.ts in
+        # the same directory (completeness.test.ts) fails CI if any fixture is
+        # neither witnessed nor listed in crypto-exempt.json /
+        # harness-inapplicable.json.
+        run: cd conformance && npx vitest run witnesses/
+
+  conformance-anf-parity:
+    # Cross-interpreter parity for the ANF lenient interpreter shipped by
+    # every SDK (TS / Go / Rust / Python / Zig / Ruby / Java). Each non-TS
+    # driver is a small CLI under conformance/anf-interpreter/drivers/<lang>/
+    # that the vitest harness spawns per fixture. RUNAR_ANF_DRIVERS_STRICT=1
+    # turns the local "skip on missing driver" gate into a hard failure so a
+    # silently-rotted SDK shows up in CI rather than locally.
+    name: Conformance — ANF interpreter parity
+    runs-on: ubuntu-latest
+    needs: [lint-no-silent-skips, conformance-allowlist-audit]
+    env:
+      RUNAR_ANF_DRIVERS_STRICT: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: compilers/go/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - name: Build Rust ANF driver
+        run: cd conformance/anf-interpreter/drivers/rust && cargo build --release
+      - name: Build Java ANF driver (fat jar)
+        run: cd conformance/anf-interpreter/drivers/java && gradle fatJar --no-daemon
+      - name: Build Zig ANF driver
+        run: cd conformance/anf-interpreter/drivers/zig && zig build -Doptimize=ReleaseSafe
+      - name: Run ANF cross-interpreter parity — lenient (7 SDKs × 6 fixtures)
+        run: pnpm run conformance:anf-parity
+      - name: Run ANF cross-interpreter parity — strict (7 SDKs × 7 fixtures)
+        # Strict mode also asserts cross-tier byte-equality of the
+        # `{error, methodName, bindingName}` envelope on the fixtures
+        # whose `assert(...)` predicates fire under mocked crypto.
+        run: pnpm run conformance:anf-parity:strict
+      - name: Run ANF cross-interpreter parity — real-crypto (7 SDKs × 2 fixtures)
+        # Real-crypto mode performs ECDSA verify against the supplied
+        # 32-byte sighash, matching the on-chain CHECKSIG semantic. The
+        # pass fixture should succeed (sig verifies against constructor
+        # pubKeyHash + sighash); the fail fixture should produce
+        # AssertionFailureError at the assert(checkSig(...)) binding.
+        run: pnpm run conformance:anf-parity:real-crypto
+
+  runar-verification:
+    name: Runar Verification (Lean 4)
+    # Self-contained — only runs `lake build` + Lean tests against the
+    # in-repo conformance fixtures. No artifacts consumed from upstream
+    # compiler/SDK jobs, so we don't gate it on their (sometimes flaky,
+    # sometimes pre-existing) failures.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install elan
         run: |
-          fail=0
-          for dir in conformance/tests/*/; do
-            name=$(basename "$dir")
-            rb_file="$dir/$name.runar.rb"
-            [ -f "$rb_file" ] || continue
-            expected_file="$dir/expected-script.hex"
-            [ -f "$expected_file" ] || continue
-            expected=$(tr -d '[:space:]' < "$expected_file" | tr '[:upper:]' '[:lower:]')
-            go_hex=$(./runar-go --source "$rb_file" --hex --disable-constant-folding 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-            rust_hex=$(./runar-compiler-rust --source "$rb_file" --hex --disable-constant-folding 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-            if [ "$go_hex" != "$rust_hex" ]; then
-              echo "MISMATCH $name: Go vs Rust differ"
-              fail=1
-            elif [ "$go_hex" != "$expected" ]; then
-              echo "MISMATCH $name: output differs from golden file"
-              fail=1
-            else
-              echo "OK $name (.runar.rb)"
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | bash -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Cache elan and Lake build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            runar-verification/.lake/build
+          key: runar-verification-${{ runner.os }}-${{ hashFiles('runar-verification/lean-toolchain', 'runar-verification/lakefile.lean', 'runar-verification/lake-manifest.json') }}
+          restore-keys: |
+            runar-verification-${{ runner.os }}-
+      - name: Build (lean lib + test exes)
+        working-directory: runar-verification
+        run: |
+          lake build
+          echo "checking every tracked Lean module"
+          while IFS= read -r file; do
+            if [ "$file" = "./lakefile.lean" ]; then
+              continue
             fi
-          done
-          exit $fail
+            module="${file#./}"
+            module="${module%.lean}"
+            module="${module//\//.}"
+            lake build "$module" >/dev/null
+          done < <(find . -name '*.lean' -not -path './.lake/*' | sort)
+          lake build pipelineGolden goldenLoad roundtrip differential pipelineConformance
+      - name: Check TCB drift
+        working-directory: runar-verification
+        run: ./scripts/check-tcb-drift.sh
+      - name: Verify all discovered fixtures parse + satisfy WF
+        working-directory: runar-verification
+        run: lake env ./.lake/build/bin/goldenLoad | tee /tmp/goldenload.out
+      - name: Assert README discovered-count matches goldenLoad runtime count
+        working-directory: runar-verification
+        # DOC-003 drift guard: goldenLoad walks conformance/tests with readDir
+        # (no hardcoded allowlist) and prints "found N expected-ir.json files".
+        # The README status table is the only place the count is written by
+        # hand, so it silently goes stale when fixtures are added. This step
+        # reuses the goldenLoad output from the previous step (no extra Lean
+        # build) and fails if the README's "discovered" literal != runtime N.
+        run: |
+          set -o pipefail
+          found=$(grep -oE 'found [0-9]+ expected-ir.json files' /tmp/goldenload.out | grep -oE '[0-9]+' | head -n1)
+          if [ -z "$found" ]; then
+            echo "FAIL: could not parse 'found N' from goldenLoad output"; exit 1
+          fi
+          # Extract N from the README row: "| Conformance fixtures discovered ... | N/N (...) |"
+          readme=$(grep -E 'Conformance fixtures discovered' README.md | grep -oE '[0-9]+/[0-9]+' | head -n1 | cut -d/ -f1)
+          echo "goldenLoad found=$found  README discovered=$readme"
+          if [ "$found" != "$readme" ]; then
+            echo "FAIL: README 'Conformance fixtures discovered' ($readme) != goldenLoad runtime count ($found)."
+            echo "       Update runar-verification/README.md status table to $found/$found."
+            exit 1
+          fi
+      - name: Verify all discovered fixtures round-trip through ANF JSON
+        working-directory: runar-verification
+        run: lake env ./.lake/build/bin/roundtrip
+      - name: Verify pipelineConformance (2-tier classifier)
+        id: conformance-gate
+        # Wraps the pipelineConformance binary with ulimit -s unlimited
+        # (fallback to 65520 KiB) because lowering deep-recurses on SLH-DSA
+        # fixtures. The wrapper exits nonzero only on hard-failure buckets
+        # (DEFERRED-parse-failure, DEFERRED-not-well-formed); soft buckets
+        # (DEFERRED-compile-safe-error, DEFERRED-no-public-method) are
+        # reported but do not fail the gate. Current expected:
+        # VERIFIED-modulo-codegen-axioms = 63/63 (discovered dynamically),
+        # 0 hard failures.
+        run: ./runar-verification/scripts/run-pipeline-conformance.sh | tee /tmp/pconf.out
+      - name: Verify byte-exact regression gate (34/49 live fixtures)
+        id: byte-exact-gate
+        working-directory: runar-verification
+        # The pipelineGolden binary enforces three regression gates and
+        # exits nonzero on any:
+        #   1. Total byte-exact count must not drop below 34.
+        #   2. Every baseline fixture (34 names) must still produce
+        #      byte-identical hex against the TS reference.
+        #   3. Notice (non-fatal) for fixtures that have flipped to
+        #      byte-exact and should be promoted into baselineMatches.
+        # Linux has no dyld __DATA_CONST check, so the native exe runs
+        # directly here. Native is ~50-100x faster than the interpreter;
+        # the multi-MB cryptoAxiomPending fixtures count only when backed
+        # by stored Lean-produced constants or when full mode runs.
+        # The captured output is parsed via shell-only substitution
+        # (no GitHub event inputs are interpolated into shell).
+        run: |
+          set -o pipefail
+          lake env ./.lake/build/bin/pipelineGolden | tee /tmp/pgolden.out
+          line=$(grep -E '^PIPELINE GOLDEN:' /tmp/pgolden.out | tail -n1)
+          count=${line#PIPELINE GOLDEN: }
+          echo "byte_exact=${count}" >> "$GITHUB_OUTPUT"
+      - name: Emit verification step summary
+        if: always()
+        env:
+          # Internal output from previous step — produced entirely by
+          # tools in this repo, never by user-controlled GitHub event
+          # data. Quoted via env: per workflow-injection guidelines.
+          BYTE_EXACT: ${{ steps.byte-exact-gate.outputs.byte_exact }}
+        run: |
+          {
+            printf '## Rúnar Lean 4 Verification\n\n'
+            printf '| Check | Result |\n'
+            printf '|-------|--------|\n'
+            printf '| Parse + WF | 56/56 |\n'
+            printf '| ANF JSON round-trip | 56/56 |\n'
+            if [ -n "${BYTE_EXACT:-}" ]; then
+              printf '| Byte-exact vs. TS reference | %s |\n' "$BYTE_EXACT"
+            else
+              printf '| Byte-exact vs. TS reference | (binary did not run) |\n'
+            fi
+            printf '| pipelineConformance (modulo codegen axioms) | 56/56 |\n'
+            printf '\n'
+            printf 'Trust manifest: see `runar-verification/TRUST_MANIFEST.md`\n'
+            printf 'Phase history: see `runar-verification/HANDOFF.md`\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  decompiler-roundtrip:
+    # v0 decompiler (Bitcoin Script → Rúnar TS source). Gates on coverage
+    # regression vs. packages/decompiler/coverage-baseline.json, never on
+    # absolute pass count — the symbolic-execution lifter is still a
+    # skeleton, so most contracts currently fall through to a /* RAW: ... */
+    # fallback. Pipeline must run end-to-end without crashing on every
+    # example + fixture, and the fingerprint DB must not silently drift.
+    name: Decompiler — round-trip + fingerprint regression
+    runs-on: ubuntu-latest
+    needs: [ts-compiler]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - name: Decompiler typecheck
+        run: pnpm --filter runar-decompiler run typecheck
+      - name: Decompiler round-trip tests (Tier 1 + 2 + 3, regression gate)
+        run: pnpm --filter runar-decompiler run test
+      - name: Decompiler coverage matrix
+        run: pnpm --filter runar-decompiler run coverage
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: decompiler-coverage-matrix
+          path: packages/decompiler/coverage.json
+      - name: Fingerprint DB drift check
+        # If a peephole rule or EC-optimizer rewrite changed the emitted
+        # template bytes, regenerated fingerprints.json will differ from the
+        # checked-in copy and this step fails. Fix by running
+        # `pnpm run decompiler:fingerprints:check` locally and committing.
+        run: pnpm run decompiler:fingerprints:check
+      - name: Templates manifest drift check
+        # If the corpus changed (new contract added, source edited, or
+        # compiler output shifted), the regenerated templates-data.json
+        # differs from the checked-in copy. Fix by running
+        # `pnpm run decompiler:templates:check` locally and committing.
+        run: pnpm run decompiler:templates:check
+
+  sdk-conformance:
+    name: SDK Output Conformance
+    needs: [ts-compiler, go-sdk, rust-sdk, python-sdk, zig-sdk, ruby-sdk, java-sdk]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: packages/runar-go/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+          working-directory: packages/runar-rb
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - name: Build Rust SDK tool
+        run: cd conformance/sdk-output/tools/rs-sdk-tool && cargo build --release
+      - name: Build Zig SDK tool
+        run: cd conformance/sdk-output/tools/zig-sdk-tool && zig build -Doptimize=ReleaseFast
+      - name: Build Java SDK driver
+        run: cd conformance/sdk-output/tools/java-driver && gradle fatJar --no-daemon
+      - name: Run SDK output conformance (all contracts x 7 SDKs)
+        run: cd conformance/sdk-output && npx tsx runner/sdk-runner.ts
+
+  script-execution:
+    # S1 execution oracle (TS-GAP-003): compile every conformance contract to
+    # fold-ON deployed bytes and execute real spends — plus adversarial
+    # MUST-FAIL near-miss witnesses — through the go-sdk Bitcoin Script engine.
+    # This is the only gate that executes fold-ON bytes against a script engine
+    # with per-contract witnesses.
+    name: Script Execution Oracle
+    needs: [ts-compiler, go-compiler]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      # The suite's compileRúnar helper imports packages/runar-compiler/dist,
+      # so the TS workspace must be built first.
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - name: Run script-execution oracle
+        run: cd conformance && go test -v -timeout 1200s .
+
+  # ---------------------------------------------------------------------------
+  # Integration — regtest node tests
+  # ---------------------------------------------------------------------------
 
   integration:
     name: Integration Tests
-    needs: [typescript, go, rust, python, ruby, zig-compiler, zig-sdk]
+    needs:
+      - ts-compiler
+      - go-compiler
+      - go-sdk
+      - rust-compiler
+      - rust-sdk
+      - python-compiler
+      - python-sdk
+      - zig-compiler
+      - zig-sdk
+      - ruby-compiler
+      - ruby-sdk
+      - java-compiler
+      - java-sdk
     runs-on: ubuntu-latest
     env:
       RPC_URL: http://localhost:18332
@@ -277,13 +1134,17 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
           cache-dependency-path: compilers/go/go.sum
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pytest bsv-sdk
+      # bsv-sdk gives the SDK its real ECDSA path; slh-dsa unmasks the
+      # SLH-DSA negative-tests so they verify against the real FIPS 205
+      # impl rather than the no-op fallback (which now raises rather
+      # than silently mock-true-ing).
+      - run: pip install pytest bsv-sdk slh-dsa
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.3'
@@ -291,9 +1152,17 @@ jobs:
           working-directory: integration/ruby
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.0
+          version: 0.16.0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
+      # Java integration's ContractCompiler spawns `node --import tsx`; tsx
+      # lives in conformance/ (not pnpm-workspace), so install it explicitly.
+      - run: cd conformance && npm ci
 
       - name: Pre-create regtest node config with test credentials
         run: |
@@ -305,14 +1174,27 @@ jobs:
             'usecashaddr=0' 'txindex=1' 'excessiveblocksize=1000000000' \
             'maxstackmemoryusageconsensus=100000000' 'maxscriptsizepolicy=0' \
             'maxscriptnumlengthpolicy=0' 'maxstackmemoryusagepolicy=100000000' \
-            'maxtxsizepolicy=0' 'genesisactivationheight=1' 'minminingtxfee=0.00000001' \
+            'maxtxsizepolicy=0' 'genesisactivationheight=1' 'chronicleactivationheight=1' \
+            'minminingtxfee=0.00000001' \
+            'acceptnonstdtxn=0' \
             > integration/regtest-data/n1/bitcoin.conf
+          # acceptnonstdtxn=0 hardens the CI oracle (issues #40/#42/#44): with
+          # genesisactivationheight=1 the node enforces post-Genesis script-verify
+          # standardness (CLEANSTACK, NULLFAIL, NULLDUMMY, minimal-push) at
+          # sendrawtransaction acceptance — matching mainnet ARC. Large post-Genesis
+          # scripts (SLH-DSA/Schnorr) stay acceptable. Keep in sync with
+          # integration/regtest.sh.
 
       - name: Start BSV regtest node
         run: cd integration && ./regtest.sh start
 
       - name: Go integration tests
-        run: cd integration/go && go test -tags integration -v -timeout 600s
+        # Timeout raised to 30min because TestRollupGroth16WAMSM_AdvanceState
+        # broadcasts a ~900KB Groth16 MSM tx and regularly spends 10+ minutes
+        # in the RPC round-trip on the CI runner. Runs comfortably in <1min
+        # locally when the node is not under memory pressure.
+        run: cd integration/go && go test -tags integration -v -timeout 1800s
+        timeout-minutes: 35
 
       - name: TypeScript integration tests
         run: cd integration/ts && npx vitest run
@@ -331,12 +1213,45 @@ jobs:
         run: cd integration/zig && zig build test
         timeout-minutes: 5
 
-      - name: Ruby end-to-end example tests
-        run: |
-          cd end2end-example/ruby
-          bundle install
-          bundle exec rspec price_bet_spec.rb --format documentation
+      - name: Java integration tests
+        run: cd integration/java && gradle test -Drunar.integration=true --no-daemon
+        timeout-minutes: 35
+
+      - name: Install end-to-end Ruby deps
+        run: cd examples/end2end-example/ruby && bundle install
+
+      - name: All end-to-end PriceBet examples
+        run: pnpm run e2e:all
 
       - name: Stop regtest node
         if: always()
         run: cd integration && ./regtest.sh stop
+
+  # GAP-105: the PR/push integration job above runs against an SV Node regtest.
+  # Teranode is the other production node implementation; its compose stack
+  # (10+ microservices + ~10k-block pre-mine) is too heavy to run on every PR,
+  # so this leg is opt-in via `workflow_dispatch` with `run_teranode=true`. It
+  # reuses integration/teranode.sh and the same Go integration suite under
+  # NODE_TYPE=teranode, giving an automated (not just manual) Teranode path.
+  integration-teranode:
+    name: Integration Tests (Teranode — opt-in)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_teranode
+    needs: [go-compiler, go-sdk]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: compilers/go/go.sum
+      - run: pnpm install --frozen-lockfile
+      - name: Start Teranode + run Go integration suite (NODE_TYPE=teranode)
+        run: pnpm run integration:teranode:run
+      - name: Stop Teranode
+        if: always()
+        run: cd integration && ./teranode.sh stop

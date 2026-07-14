@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"strings"
@@ -340,6 +341,9 @@ func TestEmit_TerminalAssert_NoVerify(t *testing.T) {
 	if !containsSubstring(result.ScriptAsm, "OP_CHECKSIG") {
 		t.Errorf("expected OP_CHECKSIG in terminal-assert P2PKH, got ASM: %s", result.ScriptAsm)
 	}
+	if strings.Contains(result.ScriptAsm, "OP_CHECKSIGVERIFY") {
+		t.Errorf("terminal assert should NOT produce OP_CHECKSIGVERIFY, got: %s", result.ScriptAsm)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +548,42 @@ func TestEmit_EmptyPush_EncodesAsOP0(t *testing.T) {
 	// Empty bytes should encode as OP_0 = 0x00
 	if result.ScriptHex != "00" {
 		t.Errorf("empty push should encode as '00' (OP_0), got: %s", result.ScriptHex)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// encodeScriptNumber: Bitcoin Script sign-magnitude boundary values
+// ---------------------------------------------------------------------------
+
+func TestEncodeScriptNumber_Boundaries(t *testing.T) {
+	tests := []struct {
+		name string
+		val  int64
+		// expected is the hex of the raw sign-magnitude bytes returned by
+		// encodeScriptNumber.  Zero returns an empty slice (encoded as OP_0 =
+		// 0x00 by the push layer), so its expected hex is the empty string.
+		hex string
+	}{
+		{"zero", 0, ""},
+		{"one", 1, "01"},
+		{"minus_one", -1, "81"},
+		{"max_1byte_positive", 127, "7f"},
+		{"max_1byte_negative", -127, "ff"},
+		{"needs_2bytes_128", 128, "8000"},
+		{"needs_2bytes_neg128", -128, "8080"},
+		{"max_2bytes", 32767, "ff7f"},
+		{"needs_3bytes", 32768, "008000"},
+		{"max_4bytes", 2147483647, "ffffff7f"},
+		{"needs_5bytes", 2147483648, "0000008000"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := encodeScriptNumber(big.NewInt(tc.val))
+			gotHex := hex.EncodeToString(got)
+			if gotHex != tc.hex {
+				t.Errorf("encodeScriptNumber(%d) = %q, want %q", tc.val, gotHex, tc.hex)
+			}
+		})
 	}
 }
 
@@ -978,4 +1018,126 @@ func TestEmit_SHA256InASM(t *testing.T) {
 	}
 
 	t.Logf("SHA256 contract ASM: %s", result.ScriptAsm)
+}
+
+// ---------------------------------------------------------------------------
+// Test: encodePushData boundary values
+// ---------------------------------------------------------------------------
+
+func TestEncodePushData_Boundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		dataLen   int
+		wantPrefix string // expected hex prefix of the encoding
+	}{
+		// 75 bytes: direct push (single length byte 0x4b = 75)
+		{"75_bytes_direct", 75, "4b"},
+		// 76 bytes: OP_PUSHDATA1 (0x4c) + length byte 0x4c = 76
+		{"76_bytes_pushdata1", 76, "4c4c"},
+		// 255 bytes: OP_PUSHDATA1 (0x4c) + length byte 0xff = 255
+		{"255_bytes_pushdata1", 255, "4cff"},
+		// 256 bytes: OP_PUSHDATA2 (0x4d) + 2-byte LE length 0x0001 = 256
+		{"256_bytes_pushdata2", 256, "4d0001"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := make([]byte, tc.dataLen)
+			for i := range data {
+				data[i] = 0xab
+			}
+			encoded := encodePushData(data)
+			got := hex.EncodeToString(encoded)
+			if !strings.HasPrefix(got, tc.wantPrefix) {
+				t.Errorf("encodePushData(%d bytes) hex prefix = %q, want prefix %q (full hex starts: %s)",
+					tc.dataLen, got[:min(len(got), 20)], tc.wantPrefix, got[:min(len(got), 12)])
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test: raw_script ANF JSON round-trip — load, lower, emit; the emitted hex
+// must contain the input bytes verbatim, and a RawScriptSpan must be recorded.
+// ---------------------------------------------------------------------------
+
+func TestEmit_RawScriptRoundTrip(t *testing.T) {
+	// A minimal UnsafeSmartContract `unlock` method whose body is a single
+	// raw_script binding (the ANF shape produced by `asm({...})`). Bytes
+	// "5152935987" = OP_1 OP_2 OP_ADD OP_3 OP_EQUAL — an arbitrary opaque
+	// span the emitter must write verbatim.
+	const rawHex = "5152935987"
+	irJSON := `{
+		"contractName": "Anyone",
+		"properties": [],
+		"methods": [
+			{
+				"name": "unlock",
+				"params": [],
+				"isPublic": true,
+				"body": [
+					{ "name": "t0", "value": { "kind": "raw_script", "bytes": "` + rawHex + `", "in_arity": 0, "out_arity": 1 } }
+				]
+			}
+		]
+	}`
+
+	program, err := ir.LoadIRFromBytes([]byte(irJSON))
+	if err != nil {
+		t.Fatalf("LoadIRFromBytes failed: %v", err)
+	}
+
+	// Round-trip the marshalled JSON: in_arity 0 must survive.
+	if program.Methods[0].Body[0].Value.Bytes != rawHex {
+		t.Errorf("loaded raw_script bytes = %q, want %q", program.Methods[0].Body[0].Value.Bytes, rawHex)
+	}
+	if program.Methods[0].Body[0].Value.OutArity != 1 {
+		t.Errorf("loaded raw_script out_arity = %d, want 1", program.Methods[0].Body[0].Value.OutArity)
+	}
+
+	methods, err := LowerToStack(program)
+	if err != nil {
+		t.Fatalf("LowerToStack failed: %v", err)
+	}
+
+	// The lowered method must contain exactly one raw_bytes op carrying the
+	// decoded bytes.
+	var rawOps int
+	for _, m := range methods {
+		for _, op := range m.Ops {
+			if op.Op == "raw_bytes" {
+				rawOps++
+				if got := hex.EncodeToString(op.RawBytes); got != rawHex {
+					t.Errorf("raw_bytes op bytes = %q, want %q", got, rawHex)
+				}
+				if op.InArity != 0 || op.OutArity != 1 {
+					t.Errorf("raw_bytes op arities = (%d, %d), want (0, 1)", op.InArity, op.OutArity)
+				}
+			}
+		}
+	}
+	if rawOps != 1 {
+		t.Fatalf("expected exactly 1 raw_bytes op, got %d", rawOps)
+	}
+
+	result, err := Emit(methods)
+	if err != nil {
+		t.Fatalf("Emit failed: %v", err)
+	}
+
+	// The emitted hex must equal the input bytes verbatim (single-method
+	// contract, no dispatch preamble).
+	if result.ScriptHex != rawHex {
+		t.Errorf("emitted hex = %q, want %q", result.ScriptHex, rawHex)
+	}
+
+	// A RawScriptSpan covering the whole span must be recorded.
+	if len(result.RawScriptSpans) != 1 {
+		t.Fatalf("expected 1 RawScriptSpan, got %d", len(result.RawScriptSpans))
+	}
+	span := result.RawScriptSpans[0]
+	wantLen := len(rawHex) / 2
+	if span.Offset != 0 || span.Length != wantLen || span.InArity != 0 || span.OutArity != 1 {
+		t.Errorf("RawScriptSpan = %+v, want {Offset:0 Length:%d InArity:0 OutArity:1}", span, wantLen)
+	}
 }

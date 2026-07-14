@@ -15,6 +15,7 @@ import {
   isTruthy,
   hexToBytes,
 } from './utils.js';
+import { InputLimits, CanonicalJsonError } from 'runar-ir-schema';
 
 // ---------------------------------------------------------------------------
 // Public interfaces
@@ -95,6 +96,15 @@ export class ScriptVM {
   private ifStack: boolean[] = [];
   private opsExecuted = 0;
   private maxStackDepth = 0;
+  /**
+   * Byte offset just AFTER the most recently executed OP_CODESEPARATOR in
+   * the currently running script, or -1 if none has executed. Post-Genesis
+   * BSV semantics: this marks where scriptCode starts for subsequent
+   * signature operations. With the mockable checkSigCallback the offset is
+   * informational — it is tracked and exposed so callers (and a future
+   * real-sighash mode) can compute the trimmed subscript.
+   */
+  private _lastCodeSeparator = -1;
 
   private readonly maxOps: number;
   private readonly maxStackSize: number;
@@ -131,6 +141,8 @@ export class ScriptVM {
    * of the locking script determines success.
    */
   execute(unlockingScript: Uint8Array, lockingScript: Uint8Array): VMResult {
+    this.assertScriptBytesUnderLimit(unlockingScript);
+    this.assertScriptBytesUnderLimit(lockingScript);
     this.reset();
 
     // Run unlocking script.
@@ -151,6 +163,7 @@ export class ScriptVM {
    * Execute a single script (convenience for testing).
    */
   executeScript(script: Uint8Array): VMResult {
+    this.assertScriptBytesUnderLimit(script);
     this.reset();
     return this.runScript(script);
   }
@@ -162,6 +175,23 @@ export class ScriptVM {
     return this.executeScript(hexToBytes(scriptHex));
   }
 
+  /**
+   * DoS-bound: reject scripts that exceed {@link InputLimits.MAX_SCRIPT_BYTES}
+   * BEFORE the interpreter loop starts. Each opcode iteration is cheap but
+   * a multi-megabyte script would still pin the event loop; the largest
+   * legitimate compiled Rúnar script (SLH-DSA-SHA2-256s, ~900 KB) fits
+   * comfortably under the 1 MiB cap.
+   */
+  private assertScriptBytesUnderLimit(script: Uint8Array): void {
+    if (script.length > InputLimits.MAX_SCRIPT_BYTES) {
+      throw new CanonicalJsonError(
+        'bytes',
+        `ScriptVM: script length ${script.length} exceeds InputLimits.MAX_SCRIPT_BYTES (${InputLimits.MAX_SCRIPT_BYTES})`,
+        { limit: InputLimits.MAX_SCRIPT_BYTES, actual: script.length },
+      );
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Step mode API
   // -------------------------------------------------------------------------
@@ -171,6 +201,8 @@ export class ScriptVM {
    * Call `step()` repeatedly to advance one opcode at a time.
    */
   load(unlockingScript: Uint8Array, lockingScript: Uint8Array): void {
+    this.assertScriptBytesUnderLimit(unlockingScript);
+    this.assertScriptBytesUnderLimit(lockingScript);
     this.reset();
     this._lockingScript = lockingScript;
     this._script = unlockingScript.length > 0 ? unlockingScript : lockingScript;
@@ -277,6 +309,14 @@ export class ScriptVM {
 
   /** Whether execution completed successfully (top of stack is truthy). */
   get isSuccess(): boolean { return this._isSuccess; }
+
+  /**
+   * Byte offset just after the most recently executed OP_CODESEPARATOR in
+   * the currently running script (-1 if none executed yet). This is the
+   * scriptCode start position for subsequent signature ops per post-Genesis
+   * BSV semantics.
+   */
+  get lastCodeSeparator(): number { return this._lastCodeSeparator; }
 
   /**
    * Get a human-readable name for the opcode at the given position.
@@ -387,6 +427,15 @@ export class ScriptVM {
     // Skip non-executing opcodes
     if (!this.isExecuting()) return i;
 
+    // OP_CODESEPARATOR: track the scriptCode start position relative to the
+    // CURRENT script (handled here rather than via the single-byte
+    // delegation below, which would lose the real byte offset).
+    if (byte === Opcode.OP_CODESEPARATOR) {
+      this.countOp();
+      this._lastCodeSeparator = i;
+      return i;
+    }
+
     // All remaining opcodes: delegate to runScript on a single-byte script.
     // Save and restore ifStack to bypass the end-of-script balance check.
     const savedIfStack = [...this.ifStack];
@@ -416,6 +465,7 @@ export class ScriptVM {
     this._isComplete = false;
     this._isSuccess = false;
     this._stepError = undefined;
+    this._lastCodeSeparator = -1;
   }
 
   // -------------------------------------------------------------------------
@@ -1329,6 +1379,19 @@ export class ScriptVM {
           const sha1 = createHash('sha256').update(data).digest();
           const sha2 = createHash('sha256').update(sha1).digest();
           this.push(new Uint8Array(sha2));
+          continue;
+        }
+
+        // OP_CODESEPARATOR (0xab) — post-Genesis BSV semantics: marks the
+        // position after itself as the new scriptCode start for subsequent
+        // signature operations. Execution continues; no stack effect.
+        // The offset is tracked so callers (and the mockable checkSig path)
+        // can compute the trimmed subscript. Compiled STATEFUL Rúnar
+        // contracts all carry an OP_CODESEPARATOR, so the VM must not
+        // reject it as unknown.
+        if (byte === Opcode.OP_CODESEPARATOR) {
+          this.countOp();
+          this._lastCodeSeparator = i;
           continue;
         }
 

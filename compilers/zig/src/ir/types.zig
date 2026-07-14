@@ -42,12 +42,13 @@ pub const CompilerDiagnostic = struct {
 pub const RunarType = enum {
     bigint, boolean, byte_string, pub_key, sig, addr, sha256, ripemd160,
     sig_hash_type, sig_hash_preimage, rabin_sig, rabin_pub_key, point,
+    p256_point, p384_point,
     op_code_type, fixed_array, void, unknown,
 };
 
 pub const PrimitiveTypeName = enum {
     bigint, boolean, byte_string, pub_key, sig, sha256, ripemd160, addr,
-    sig_hash_preimage, rabin_sig, rabin_pub_key, point, void,
+    sig_hash_preimage, rabin_sig, rabin_pub_key, point, p256_point, p384_point, void,
 
     pub fn toTsString(self: PrimitiveTypeName) []const u8 {
         return switch (self) {
@@ -55,7 +56,8 @@ pub const PrimitiveTypeName = enum {
             .pub_key => "PubKey", .sig => "Sig", .sha256 => "Sha256",
             .ripemd160 => "Ripemd160", .addr => "Addr",
             .sig_hash_preimage => "SigHashPreimage", .rabin_sig => "RabinSig",
-            .rabin_pub_key => "RabinPubKey", .point => "Point", .void => "void",
+            .rabin_pub_key => "RabinPubKey", .point => "Point",
+            .p256_point => "P256Point", .p384_point => "P384Point", .void => "void",
         };
     }
 
@@ -65,7 +67,8 @@ pub const PrimitiveTypeName = enum {
             .{ "PubKey", .pub_key }, .{ "Sig", .sig }, .{ "Sha256", .sha256 },
             .{ "Ripemd160", .ripemd160 }, .{ "Addr", .addr },
             .{ "SigHashPreimage", .sig_hash_preimage }, .{ "RabinSig", .rabin_sig },
-            .{ "RabinPubKey", .rabin_pub_key }, .{ "Point", .point }, .{ "void", .void },
+            .{ "RabinPubKey", .rabin_pub_key }, .{ "Point", .point },
+            .{ "P256Point", .p256_point }, .{ "P384Point", .p384_point }, .{ "void", .void },
         });
         return map.get(s);
     }
@@ -95,6 +98,8 @@ pub fn typeNodeToRunarType(tn: TypeNode) RunarType {
             .rabin_sig => .rabin_sig,
             .rabin_pub_key => .rabin_pub_key,
             .point => .point,
+            .p256_point => .p256_point,
+            .p384_point => .p384_point,
             .void => .void,
         },
         .fixed_array_type => .fixed_array,
@@ -103,22 +108,78 @@ pub fn typeNodeToRunarType(tn: TypeNode) RunarType {
 }
 
 pub const ParentClass = enum {
-    smart_contract, stateful_smart_contract,
+    smart_contract, stateful_smart_contract, unsafe_smart_contract,
 
     pub fn toTsString(self: ParentClass) []const u8 {
-        return switch (self) { .smart_contract => "SmartContract", .stateful_smart_contract => "StatefulSmartContract" };
+        return switch (self) {
+            .smart_contract => "SmartContract",
+            .stateful_smart_contract => "StatefulSmartContract",
+            .unsafe_smart_contract => "UnsafeSmartContract",
+        };
     }
     pub fn fromTsString(s: []const u8) ?ParentClass {
         if (std.mem.eql(u8, s, "SmartContract")) return .smart_contract;
         if (std.mem.eql(u8, s, "StatefulSmartContract")) return .stateful_smart_contract;
+        if (std.mem.eql(u8, s, "UnsafeSmartContract")) return .unsafe_smart_contract;
         return null;
     }
 };
 
 pub const ContractNode = struct { name: []const u8, parent_class: ParentClass, properties: []PropertyNode, constructor: ConstructorNode, methods: []MethodNode };
-pub const PropertyNode = struct { name: []const u8, type_info: RunarType, readonly: bool, initializer: ?Expression = null };
+
+/// Nesting level marker used by `expand_fixed_arrays.zig`. The full chain
+/// records every FixedArray level that produced a synthetic scalar leaf,
+/// outermost first. Consumed by the assembler (ABI re-grouping) and the SDK
+/// (state flatten/regroup).
+pub const SyntheticArrayLevel = struct {
+    base: []const u8,
+    index: u32,
+    length: u32,
+};
+
+pub const PropertyNode = struct {
+    name: []const u8,
+    type_info: RunarType,
+    readonly: bool,
+    initializer: ?Expression = null,
+    /// Set by the `.runar.ts` surface parser when a `/** @embedAlways */` (or
+    /// `// @embedAlways`) comment directive immediately precedes a readonly
+    /// field (issue #109). Opts the field OUT of dead-code elimination: a
+    /// readonly field no method references is normally stripped from the
+    /// locking script (its load_prop is dead, so no constructor slot is
+    /// emitted), silently dropping deploy-time metadata an author intends to
+    /// recover from the on-chain script later. When set, ANF lowering forces
+    /// the field into the script (a constructor slot) so its bytes survive.
+    /// Only meaningful on readonly fields; honoured only on the `.runar.ts`
+    /// surface (the other 8 formats fail closed at the parse dispatch).
+    embed_always: bool = false,
+    /// Non-zero when `type_info == .fixed_array` (set by the parser) or when
+    /// we want to remember the original outer length for post-expansion.
+    fixed_array_length: u32 = 0,
+    /// Element type when `type_info == .fixed_array`. .unknown otherwise.
+    fixed_array_element: RunarType = .unknown,
+    /// Nested element length for `FixedArray<FixedArray<T, M>, N>`. Zero for flat arrays.
+    fixed_array_nested_length: u32 = 0,
+    /// Synthetic-array chain attached by expand_fixed_arrays pass. Populated on
+    /// scalar leaves of an expanded FixedArray property. Null on non-expanded
+    /// properties. The chain is outermost-first.
+    synthetic_array_chain: ?[]const SyntheticArrayLevel = null,
+};
 pub const ConstructorNode = struct { params: []ParamNode, super_args: []Expression, assignments: []AssignmentNode };
-pub const MethodNode = struct { name: []const u8, is_public: bool, params: []ParamNode, body: []Statement, source_loc: ?SourceLocation = null };
+pub const MethodNode = struct {
+    name: []const u8,
+    is_public: bool,
+    params: []ParamNode,
+    body: []Statement,
+    source_loc: ?SourceLocation = null,
+    /// BIP-143 sighash type declared via a `/** @sighash <FLAGS> */` directive
+    /// on a public method (issue #123), e.g. 0x43 for SINGLE|FORKID. Null = no
+    /// directive = the default ALL|FORKID (0x41), byte-identical to the
+    /// historically-pinned mode. Drives the auto-injected preimage-type assert,
+    /// the OP_PUSH_TX binding flag, the ABI sigHashType, and the SDK-side
+    /// preimage construction. Honoured only on the `.runar.ts` surface.
+    sighash_type: ?i32 = null,
+};
 pub const ParamNode = struct { name: []const u8, type_info: RunarType = .unknown, type_name: []const u8 = "" };
 pub const ANFParam = ParamNode;
 pub const AssignmentNode = struct { target: []const u8, value: Expression };
@@ -126,13 +187,47 @@ pub const AssignmentNode = struct { target: []const u8, value: Expression };
 pub const Statement = union(enum) { const_decl: ConstDecl, let_decl: LetDecl, assign: Assign, if_stmt: IfStmt, for_stmt: ForStmt, expr_stmt: Expression, assert_stmt: AssertStmt, return_stmt: ?Expression };
 pub const ConstDecl = struct { name: []const u8, type_info: ?RunarType = null, value: Expression, source_loc: ?SourceLocation = null };
 pub const LetDecl = struct { name: []const u8, type_info: ?RunarType = null, value: ?Expression = null, source_loc: ?SourceLocation = null };
-pub const Assign = struct { target: []const u8, value: Expression, source_loc: ?SourceLocation = null };
+pub const Assign = struct {
+    target: []const u8,
+    value: Expression,
+    source_loc: ?SourceLocation = null,
+    /// When non-null, the assignment target is `this.<prop>[index]`, and
+    /// `target` is the base property name. Populated by the parser when it
+    /// sees an index-access LHS; consumed by `expand_fixed_arrays.zig` which
+    /// rewrites the statement into a direct-access (literal index) or
+    /// dispatch (runtime index) form before ANF lowering. Must be null by
+    /// the time ANF lowering runs.
+    index_target: ?*IndexAccess = null,
+};
 pub const IfStmt = struct { condition: Expression, then_body: []Statement, else_body: ?[]Statement = null, source_loc: ?SourceLocation = null };
-pub const ForStmt = struct { var_name: []const u8, init_value: i64, bound: i64, body: []Statement, source_loc: ?SourceLocation = null };
+// `descending` records whether the source condition counted down (`>`/`>=`).
+// `inclusive` records whether the source comparison was inclusive (`<=`/`>=`).
+// Issue #121: the ANF loop node now carries an explicit start value and step
+// direction, so countdown and non-zero-start loops are supported. anf-lower
+// computes count = |bound - start| (+1 when inclusive), so the C-style parsers
+// (TS/Sol/Go/Java) set `descending`/`inclusive` from the raw operator while
+// range-based parsers (Rust/Ruby/Python/Zig/Move) are ascending and fold any
+// inclusive endpoint into `bound` at parse time (leaving `inclusive = false`).
+// `bound_is_const` records whether the loop bound was a genuine integer
+// literal. The Zig parsers collapse the bound to a concrete i64 (defaulting to
+// 0), so a runtime bound (`i < this.x`) or an identifier bound (`i < N`) would
+// otherwise silently become a 0-iteration loop. When false, the validator
+// rejects the loop with a compile-time-constant diagnostic (matching the
+// reference TS compiler). Defaults to true so unrelated construction sites and
+// format parsers stay literal-bounded by default.
+pub const ForStmt = struct { var_name: []const u8, init_value: i64, bound: i64, body: []Statement, descending: bool = false, inclusive: bool = false, bound_is_const: bool = true, source_loc: ?SourceLocation = null };
 pub const AssertStmt = struct { condition: Expression, message: ?[]const u8 = null, source_loc: ?SourceLocation = null };
 
 pub const Expression = union(enum) {
     literal_int: i64, literal_bool: bool, literal_bytes: []const u8, identifier: []const u8,
+    /// Oversize decimal integer literal — produced by frontend parsers when the
+    /// source text is a base-10 integer that overflows `i64`. The payload is the
+    /// raw decimal text (optionally leading `-`, no `n` suffix, no underscores)
+    /// so the value survives the AST → ANF → IR JSON → codegen pipeline without
+    /// any width loss. Small values continue to use `literal_int`; this variant
+    /// is reserved for the cases (e.g. the 256-bit secp256k1 group order) where
+    /// `i64` truncation would silently corrupt the script bytes.
+    literal_bigint: []const u8,
     property_access: PropertyAccess, binary_op: *BinaryOp, unary_op: *UnaryOp,
     call: *CallExpr, method_call: *MethodCall, ternary: *Ternary, index_access: *IndexAccess,
     increment: *IncrementExpr, decrement: *DecrementExpr, array_literal: []const Expression,
@@ -140,7 +235,15 @@ pub const Expression = union(enum) {
 pub const PropertyAccess = struct { object: []const u8, property: []const u8 };
 pub const BinaryOp = struct { op: BinOperator, left: Expression, right: Expression };
 pub const UnaryOp = struct { op: UnaryOperator, operand: Expression };
-pub const CallExpr = struct { callee: []const u8, args: []Expression };
+pub const CallExpr = struct {
+    callee: []const u8,
+    args: []Expression,
+    /// Captured generic type argument for the expression-form
+    /// `asm<T>({...})` compiler intrinsic. One of "bigint", "boolean", or
+    /// "ByteString" when present; empty for the statement form and every
+    /// non-asm call.
+    asm_return_type: []const u8 = "",
+};
 pub const MethodCall = struct { object: []const u8, method: []const u8, args: []Expression };
 pub const Ternary = struct { condition: Expression, then_expr: Expression, else_expr: Expression };
 pub const IndexAccess = struct { object: Expression, index: Expression };
@@ -207,6 +310,9 @@ pub const ANFProperty = struct {
     type_info: RunarType = .unknown,
     readonly: bool,
     initial_value: ?ConstValue = null,
+    /// Synthetic-array chain, threaded through from the AST PropertyNode. Non-null
+    /// only on expanded FixedArray leaves. Consumed by the ABI re-grouper.
+    synthetic_array_chain: ?[]const SyntheticArrayLevel = null,
 };
 pub const ANFConstructor = struct { params: []ParamNode, assertions: []ANFBinding };
 pub const ANFMethod = struct {
@@ -215,22 +321,53 @@ pub const ANFMethod = struct {
     params: []ParamNode = &.{},
     bindings: []ANFBinding = &.{},
     body: []ANFBinding = &.{},
+    /// Non-default BIP-143 sighash mode a `@sighash` directive declared for
+    /// this (public) method (issue #123), e.g. 0x43 for SINGLE|FORKID. Null =
+    /// default ALL|FORKID (0x41). In-memory carrier only — never serialized
+    /// into the ANF IR JSON compared cross-tier (the codegen-relevant flag
+    /// rides on each check_preimage node's sighash_flag). The artifact
+    /// assembler copies it to ABIMethod.sighash_type so the SDK builds a
+    /// matching preimage.
+    sighash_type: ?i32 = null,
 };
 pub const ANFBinding = struct { name: []const u8, value: ANFValue, source_loc: ?SourceLocation = null };
 
 pub const ConstValue = union(enum) {
-    boolean: bool, integer: i128, string: []const u8,
+    boolean: bool,
+    integer: i128,
+    /// Arbitrary-precision integer carried as its canonical decimal text
+    /// (optionally leading `-`, no `n` suffix, no underscores). Used for
+    /// literals that overflow `i128` — primarily 256-bit constants such as
+    /// the secp256k1 group order in the schnorr-zkp fixture. Values that
+    /// fit `i128` MUST be stored in the `integer` variant so the existing
+    /// constant-fold / ec-optimizer / cross-tier JSON paths remain
+    /// byte-identical for ordinary inputs; `big_integer` is reserved
+    /// exclusively for the overflow case.
+    big_integer: []const u8,
+    string: []const u8,
     pub fn eql(self: ConstValue, other: ConstValue) bool {
         return switch (self) {
             .boolean => |b| switch (other) { .boolean => |ob| b == ob, else => false },
             .integer => |i| switch (other) { .integer => |oi| i == oi, else => false },
+            .big_integer => |s| switch (other) { .big_integer => |os| std.mem.eql(u8, s, os), else => false },
             .string => |s| switch (other) { .string => |os| std.mem.eql(u8, s, os), else => false },
         };
     }
 };
 
+// Canonical ANFValue union — every variant here mirrors the TypeScript
+// reference compiler's ANF IR (packages/runar-compiler/src/ir/anf-ir.ts)
+// one-to-one. Producers: ir/json.zig (fuzzer/differential input) and
+// passes/anf_lower.zig (Zig-native frontend). Consumers: passes/stack_lower
+// dispatch, passes/dce, codegen/emit, passes/ec_optimizer.
+//
+// The types.ANFBinaryOp / ANFIfExpr / ANFForLoop / ANFBuiltinCall /
+// ANFLegacyAssert / PropertyWrite structs that used to back a second
+// "legacy" variant family are retained below purely as internal lowering
+// helpers for stack_lower (it adapts the canonical variants into these
+// shapes to share one implementation with previous code paths). They are
+// NOT reachable through ANFValue itself.
 pub const ANFValue = union(enum) {
-    // TypeScript-matching variants (used by stack_lower.zig)
     load_param: LoadParam,
     load_prop: LoadProp,
     load_const: LoadConst,
@@ -247,47 +384,93 @@ pub const ANFValue = union(enum) {
     deserialize_state: DeserializeState,
     add_output: ANFAddOutput,
     add_raw_output: ANFAddRawOutput,
+    add_data_output: ANFAddDataOutput,
     array_literal: ANFArrayLiteral,
-    // Legacy variants (used by json.zig parser — will be migrated)
-    literal_int: i64,
-    literal_bigint: []const u8,
-    literal_bool: bool,
-    literal_bytes: []const u8,
-    ref: []const u8,
-    property_read: []const u8,
-    property_write: PropertyWrite,
-    binary_op: ANFBinaryOp,
-    builtin_call: ANFBuiltinCall,
-    if_expr: *ANFIfExpr,
-    for_loop: *ANFForLoop,
-    assert_op: ANFLegacyAssert,
-    nop: void,
+    /// Opaque opcode-byte span emitted verbatim by the asm({...}) intrinsic.
+    /// Bytes are an even-length hex string of raw Bitcoin Script opcode bytes
+    /// with declared stack effect (in_arity / out_arity). Treated as a hard
+    /// peephole barrier and never folded or DCE'd.
+    raw_script: ANFRawScript,
 };
 
 // -- TypeScript-matching value structs (used by stack_lower.zig) --
 pub const LoadParam = struct { name: []const u8 };
-pub const LoadProp = struct { name: []const u8 };
+pub const LoadProp = struct {
+    name: []const u8,
+    /// Issue #109 (@embedAlways): when true, dead-binding DCE must NOT remove
+    /// this load_prop even though nothing references it, so the readonly field
+    /// it loads survives into the deployed locking script (a constructor slot).
+    /// The TypeScript reference relies on a single-pass DCE + a `@ref` alias to
+    /// keep the load_prop alive; the Zig `ec_optimizer` runs a fixpoint DCE that
+    /// would strip such an unreferenced alias chain, so the Zig tier marks the
+    /// injected load_prop directly and teaches `dce.hasSideEffect` to honour it.
+    /// The observable output (constructor slot + OP_NIP cleanup) is byte-identical
+    /// to the TS reference. In-memory only — never serialized into the ANF JSON,
+    /// so existing (default false) load_props stay byte-identical cross-tier.
+    preserve: bool = false,
+};
 pub const LoadConst = struct { value: ConstValue };
 pub const BinOp = struct { op: []const u8, left: []const u8, right: []const u8, result_type: ?[]const u8 = null };
 pub const ANFUnaryOp = struct { op: []const u8, operand: []const u8, result_type: ?[]const u8 = null };
 pub const ANFCall = struct { func: []const u8, args: []const []const u8 };
 pub const ANFMethodCall = struct { object: []const u8, method: []const u8, args: []const []const u8 };
 pub const ANFIf = struct { cond: []const u8, then: []ANFBinding, @"else": []ANFBinding };
-pub const ANFLoop = struct { count: u32, body: []ANFBinding, iter_var: []const u8 };
-pub const ANFAssert = struct { value: []const u8 };
+// Iterator start value and step direction (issue #121). The loop is unrolled
+// `count` times; on iteration `i` (0-based) the iterator variable holds
+// `start + i * step`. Zero-start counting-up loops carry `start = 0`, `step = 1`,
+// reproducing the historical `i = 0..count-1` lowering byte-for-byte. Countdown
+// loops carry `step = -1`.
+pub const ANFLoop = struct { count: u32, body: []ANFBinding, iter_var: []const u8, start: i64 = 0, step: i8 = 1 };
+pub const ANFAssert = struct {
+    value: []const u8,
+    /// Optional marker: `true` only on the auto-injected
+    /// `hash256(continuationOutputs) === extractOutputHash(txPreimage)`
+    /// assert emitted by the StatefulSmartContract lowering. Off-chain
+    /// SDK interpreters use this to skip the equality check without
+    /// resorting to structural / taint heuristics that misfire on
+    /// developer covenant asserts whose IR shape is identical.
+    is_auto_injected_state_check: bool = false,
+};
 pub const UpdateProp = struct { name: []const u8, value: []const u8 };
-pub const CheckPreimage = struct { preimage: []const u8 };
+pub const CheckPreimage = struct {
+    preimage: []const u8,
+    /// Issue #123: the BIP-143 sighash flag the on-chain OP_PUSH_TX binding
+    /// appends to the derived signature (so the node re-derives the tx sighash
+    /// under this flag). 0 = default ALL|FORKID (0x41), byte-identical to the
+    /// pinned cross-tier binding blob. Only set for a method that declares a
+    /// non-default @sighash mode, keeping golden ANF unchanged for every
+    /// existing contract.
+    sighash_flag: i32 = 0,
+};
 pub const DeserializeState = struct { preimage: []const u8 };
 pub const ANFAddOutput = struct { satoshis: []const u8, state_values: []const []const u8 = &.{}, preimage: []const u8 = "", state_refs: []const []const u8 = &.{} };
-pub const ANFAddRawOutput = struct { satoshis: []const u8, script_bytes: []const u8 = "", script_ref: []const u8 = "" };
+pub const ANFAddRawOutput = struct { satoshis: []const u8, script_bytes: []const u8 = "" };
+/// AddDataOutput — an extra transaction output that is NOT a state
+/// continuation. Wire shape is identical to `add_raw_output`. Distinguished
+/// only at continuation-hash composition time: add_data_output refs are
+/// concatenated AFTER all add_output (state) refs and BEFORE the change
+/// output.
+pub const ANFAddDataOutput = struct { satoshis: []const u8, script_bytes: []const u8 = "" };
 pub const ANFArrayLiteral = struct { elements: []const []const u8 };
+/// Opaque opcode-byte span emitted by the asm({...}) compiler intrinsic.
+/// `bytes` is an even-length hex string of raw Bitcoin Script opcode bytes;
+/// `in_arity` / `out_arity` declare the stack effect.
+pub const ANFRawScript = struct { bytes: []const u8, in_arity: i32, out_arity: i32 };
 
-// -- Legacy value structs (used by json.zig parser) --
+// -- Internal lowering helpers (stack_lower-only). These are NOT ANFValue
+// -- variants; they are parameter shapes that stack_lower adapts the
+// -- canonical ANFValue variants into so that `lowerBinaryOp` / `lowerIfExpr`
+// -- / `lowerForLoop` / `lowerBuiltinCall` / `lowerAssertOp` /
+// -- `lowerPropertyWrite` share one implementation each. Keep them next to
+// -- the ANF types because stack_lower imports via `types.` namespace.
 pub const PropertyWrite = struct { name: []const u8, value_ref: []const u8 };
 pub const ANFBinaryOp = struct { op: BinOperator, left: []const u8, right: []const u8, result_type: ?[]const u8 = null };
 pub const ANFBuiltinCall = struct { name: []const u8, args: []const []const u8 };
 pub const ANFIfExpr = struct { condition: []const u8, then_bindings: []ANFBinding, else_bindings: ?[]ANFBinding };
-pub const ANFForLoop = struct { var_name: []const u8, init_val: i64, bound: i64, body_bindings: []ANFBinding };
+// Legacy bridge struct adapted from ANFLoop by stack_lower.zig's loop dispatch.
+// Issue #121: carries the iterator start value, step direction, and iteration
+// count directly; the unroll pushes `start + n*step` on iteration `n`.
+pub const ANFForLoop = struct { var_name: []const u8, start: i64, step: i64, count: u32, body_bindings: []ANFBinding };
 pub const ANFLegacyAssert = struct { condition: []const u8, message: ?[]const u8 = null };
 
 fn freeBindings(allocator: std.mem.Allocator, bindings: []ANFBinding) void {
@@ -295,8 +478,6 @@ fn freeBindings(allocator: std.mem.Allocator, bindings: []ANFBinding) void {
         switch (binding.value) {
             .@"if" => |v| { freeBindings(allocator, v.then); freeBindings(allocator, v.@"else"); allocator.destroy(v); },
             .loop => |v| { freeBindings(allocator, v.body); allocator.destroy(v); },
-            .if_expr => |v| { freeBindings(allocator, v.then_bindings); if (v.else_bindings) |eb| freeBindings(allocator, eb); allocator.destroy(v); },
-            .for_loop => |v| { freeBindings(allocator, v.body_bindings); allocator.destroy(v); },
             else => {},
         }
     }
@@ -340,9 +521,48 @@ pub const StackOp = union(enum) {
 };
 pub const StackIf = struct { then: []StackOp, @"else": ?[]StackOp = null };
 pub const Placeholder = struct { param_index: u32, param_name: []const u8 };
-pub const PushValue = union(enum) { bytes: []const u8, integer: i64, boolean: bool };
+pub const PushValue = union(enum) {
+    bytes: []const u8,
+    integer: i64,
+    boolean: bool,
+    /// Decimal-string-encoded big integer push for values that overflow `i64`.
+    /// Payload is the canonical decimal text (optional leading `-`, ASCII
+    /// digits, no `n` suffix, no underscores). The emitter converts it to a
+    /// little-endian sign-magnitude push-data sequence — the small-int
+    /// opcode shortcuts are unreachable here by construction.
+    big_int_decimal: []const u8,
+};
 
-pub const StackInstruction = union(enum) { op: Opcode, push_data: []const u8, push_int: i64, push_bool: bool, push_codesep_index: void, placeholder: Placeholder };
+pub const StackInstruction = union(enum) {
+    op: Opcode,
+    push_data: []const u8,
+    push_int: i64,
+    push_bool: bool,
+    /// Decimal-string-encoded big integer push (mirrors PushValue.big_int_decimal).
+    push_big_int_decimal: []const u8,
+    push_codesep_index: void,
+    placeholder: Placeholder,
+    /// Opaque opcode-byte span emitted verbatim by a raw_script ANF node.
+    /// The peephole optimizer treats this as a hard barrier; the emitter
+    /// writes the bytes as-is and records a `RawScriptSpan` in the artifact.
+    raw_bytes: RawBytes,
+};
+
+/// Backing payload for the `raw_bytes` StackInstruction variant. Bytes are
+/// emitted verbatim; in_arity / out_arity describe the declared stack effect
+/// and are recorded into the artifact's `rawScriptSpans` so the analyzer can
+/// treat the span as one opaque stack-effect step.
+pub const RawBytes = struct { bytes: []const u8, in_arity: i32, out_arity: i32 };
+
+/// Byte range produced by a raw_script ANF node. Emitted alongside the
+/// artifact so the static analyzer can skip the contents (which are opaque
+/// and not guaranteed to form a well-formed opcode stream).
+pub const RawScriptSpan = struct {
+    offset: u32,
+    length: u32,
+    in_arity: i32,
+    out_arity: i32,
+};
 
 // ============================================================================
 // Layer 4: Artifact Types (output of Pass 6: Emit) — maps to artifact.ts
@@ -353,15 +573,32 @@ pub const RunarArtifact = struct {
     abi: ABI, script: []const u8, asm_text: []const u8,
     source_map: ?SourceMap = null, anf: ?*const ANFProgram = null,
     state_fields: ?[]StateField = null, constructor_slots: ?[]ConstructorSlot = null,
+    code_sep_index_slots: ?[]CodeSepIndexSlot = null,
     code_separator_index: ?u32 = null, code_separator_indices: ?[]u32 = null,
+    /// Byte ranges produced by raw_script ANF nodes (asm({...}) intrinsic).
+    /// Null when no asm() calls were emitted. Static analyzers should skip
+    /// these spans — the contents are opaque and not guaranteed to form a
+    /// well-formed opcode stream.
+    raw_script_spans: ?[]RawScriptSpan = null,
     build_timestamp: []const u8,
 };
 pub const Artifact = RunarArtifact;
 pub const ABI = struct { constructor: ABIConstructor, methods: []ABIMethod };
 pub const ABIConstructor = struct { params: []ABIParam };
-pub const ABIMethod = struct { name: []const u8, params: []ABIParam, is_public: bool, is_terminal: bool = false };
+pub const ABIMethod = struct {
+    name: []const u8,
+    params: []ABIParam,
+    is_public: bool,
+    is_terminal: bool = false,
+    /// Issue #123: the BIP-143 sighash type this method's preimage/covenant is
+    /// built under (from a `@sighash` directive), e.g. 0x43 for SINGLE|FORKID.
+    /// Null = default ALL|FORKID (0x41); the SDK falls back to 0x41 so existing
+    /// artifacts are unchanged. Emitted into the artifact JSON only when set.
+    sighash_type: ?i32 = null,
+};
 pub const ABIParam = struct { name: []const u8, type_name: []const u8 };
 pub const ConstructorSlot = struct { param_index: usize, byte_offset: usize };
+pub const CodeSepIndexSlot = struct { byte_offset: usize, code_sep_index: usize };
 pub const StateField = struct { name: []const u8, type_name: []const u8, index: usize, initial_value: ?ConstValue = null };
 pub const SourceMapping = struct { opcode_index: u32, source_file: []const u8, line: u32, column: u32 };
 pub const SourceMap = struct { mappings: []SourceMapping };
@@ -385,6 +622,8 @@ const runar_type_map = std.StaticStringMap(RunarType).initComptime(.{
     .{ "RabinSig", .rabin_sig },
     .{ "RabinPubKey", .rabin_pub_key },
     .{ "Point", .point },
+    .{ "P256Point", .p256_point },
+    .{ "P384Point", .p384_point },
     .{ "OpCodeType", .op_code_type },
     .{ "FixedArray", .fixed_array },
     .{ "void", .void },
@@ -404,7 +643,9 @@ pub fn runarTypeToString(t: RunarType) []const u8 {
         .pub_key => "PubKey", .sig => "Sig", .addr => "Addr", .sha256 => "Sha256",
         .ripemd160 => "Ripemd160", .sig_hash_type => "SigHashType",
         .sig_hash_preimage => "SigHashPreimage", .rabin_sig => "RabinSig",
-        .rabin_pub_key => "RabinPubKey", .point => "Point", .op_code_type => "OpCodeType",
+        .rabin_pub_key => "RabinPubKey", .point => "Point",
+        .p256_point => "P256Point", .p384_point => "P384Point",
+        .op_code_type => "OpCodeType",
         .fixed_array => "FixedArray", .void => "void", .unknown => "unknown",
     };
 }
@@ -418,44 +659,27 @@ test "ANFProgram basic construction" {
     try std.testing.expect(program.contract_name.len > 0);
 }
 
-test "ANFValue TypeScript-matching variant tags" {
-    const variants = [_]ANFValue{
-        .{ .load_param = .{ .name = "x" } },
-        .{ .load_prop = .{ .name = "y" } },
-        .{ .load_const = .{ .value = .{ .integer = 42 } } },
-        .{ .bin_op = .{ .op = "+", .left = "a", .right = "b" } },
-        .{ .unary_op = .{ .op = "!", .operand = "c" } },
-        .{ .call = .{ .func = "hash160", .args = &.{"d"} } },
-        .{ .method_call = .{ .object = "e", .method = "unlock", .args = &.{} } },
-        .{ .assert = .{ .value = "f" } },
-        .{ .update_prop = .{ .name = "counter", .value = "g" } },
-        .{ .get_state_script = {} },
-        .{ .check_preimage = .{ .preimage = "h" } },
-        .{ .deserialize_state = .{ .preimage = "i" } },
-        .{ .add_output = .{ .satoshis = "j", .state_values = &.{}, .preimage = "k" } },
-        .{ .add_raw_output = .{ .satoshis = "l", .script_bytes = "m" } },
-        .{ .array_literal = .{ .elements = &.{ "n", "o" } } },
-    };
-    try std.testing.expectEqual(@as(usize, 15), variants.len);
-}
-
-test "ANFValue legacy variant tags" {
-    const variants = [_]ANFValue{
-        .{ .literal_int = 42 }, .{ .literal_bigint = "99999" }, .{ .literal_bool = true },
-        .{ .literal_bytes = "dead" }, .{ .ref = "t0" }, .{ .property_read = "x" },
-        .{ .property_write = .{ .name = "c", .value_ref = "t1" } },
-        .{ .binary_op = .{ .op = .add, .left = "a", .right = "b" } },
-        .{ .builtin_call = .{ .name = "h", .args = &.{"d"} } },
-        .{ .assert_op = .{ .condition = "c" } }, .{ .nop = {} },
-    };
-    try std.testing.expectEqual(@as(usize, 11), variants.len);
-}
-
-test "StackInstruction backward compatibility" {
-    const instructions = [_]StackInstruction{ .{ .op = .op_dup }, .{ .op = .op_hash160 }, .{ .push_data = &.{ 0xaa, 0xbb } }, .{ .op = .op_equalverify }, .{ .op = .op_checksig }, .{ .push_int = 42 }, .{ .push_bool = true } };
-    try std.testing.expectEqual(@as(usize, 7), instructions.len);
+test "critical opcode byte values match Bitcoin Script spec" {
     try std.testing.expectEqual(@as(u8, 0x76), @intFromEnum(Opcode.op_dup));
     try std.testing.expectEqual(@as(u8, 0xac), @intFromEnum(Opcode.op_checksig));
+    try std.testing.expectEqual(@as(u8, 0xa9), @intFromEnum(Opcode.op_hash160));
+    try std.testing.expectEqual(@as(u8, 0x87), @intFromEnum(Opcode.op_equal));
+    try std.testing.expectEqual(@as(u8, 0x88), @intFromEnum(Opcode.op_equalverify));
+    try std.testing.expectEqual(@as(u8, 0x63), @intFromEnum(Opcode.op_if));
+    try std.testing.expectEqual(@as(u8, 0x67), @intFromEnum(Opcode.op_else));
+    try std.testing.expectEqual(@as(u8, 0x68), @intFromEnum(Opcode.op_endif));
+    try std.testing.expectEqual(@as(u8, 0x6a), @intFromEnum(Opcode.op_return));
+    try std.testing.expectEqual(@as(u8, 0x00), @intFromEnum(Opcode.op_0));
+    try std.testing.expectEqual(@as(u8, 0x51), @intFromEnum(Opcode.op_1));
+    try std.testing.expectEqual(@as(u8, 0xab), @intFromEnum(Opcode.op_codeseparator));
+    try std.testing.expectEqual(@as(u8, 0x69), @intFromEnum(Opcode.op_verify));
+    try std.testing.expectEqual(@as(u8, 0x75), @intFromEnum(Opcode.op_drop));
+    try std.testing.expectEqual(@as(u8, 0x77), @intFromEnum(Opcode.op_nip));
+    try std.testing.expectEqual(@as(u8, 0x7c), @intFromEnum(Opcode.op_swap));
+    try std.testing.expectEqual(@as(u8, 0x93), @intFromEnum(Opcode.op_add));
+    try std.testing.expectEqual(@as(u8, 0x94), @intFromEnum(Opcode.op_sub));
+    try std.testing.expectEqual(@as(u8, 0x7e), @intFromEnum(Opcode.op_cat));
+    try std.testing.expectEqual(@as(u8, 0xa8), @intFromEnum(Opcode.op_sha256));
 }
 
 test "Opcode aliases" {
@@ -487,6 +711,7 @@ test "PrimitiveTypeName round-trip" {
 test "ParentClass round-trip" {
     try std.testing.expectEqual(ParentClass.smart_contract, ParentClass.fromTsString("SmartContract").?);
     try std.testing.expectEqual(ParentClass.stateful_smart_contract, ParentClass.fromTsString("StatefulSmartContract").?);
+    try std.testing.expectEqual(ParentClass.unsafe_smart_contract, ParentClass.fromTsString("UnsafeSmartContract").?);
 }
 
 test "ConstValue equality" {
@@ -496,15 +721,14 @@ test "ConstValue equality" {
     try std.testing.expect((ConstValue{ .string = "a" }).eql(.{ .string = "a" }));
 }
 
-test "StackOp all variant tags" {
-    const ops = [_]StackOp{
-        .{ .push = .{ .integer = 42 } }, .{ .dup = {} }, .{ .swap = {} }, .{ .drop = {} },
-        .{ .nip = {} }, .{ .over = {} }, .{ .rot = {} }, .{ .tuck = {} },
-        .{ .roll = 3 }, .{ .pick = 2 }, .{ .opcode = "OP_ADD" },
-        .{ .@"if" = .{ .then = &.{}, .@"else" = null } },
-        .{ .placeholder = .{ .param_index = 0, .param_name = "x" } },
-    };
-    try std.testing.expectEqual(@as(usize, 13), ops.len);
+test "StackOp union tags are constructible and distinguishable" {
+    const a = StackOp{ .dup = {} };
+    const b = StackOp{ .push = .{ .integer = 42 } };
+    const c = StackOp{ .opcode = "OP_ADD" };
+    try std.testing.expect(std.meta.activeTag(a) == .dup);
+    try std.testing.expect(std.meta.activeTag(b) == .push);
+    try std.testing.expect(std.meta.activeTag(c) == .opcode);
+    try std.testing.expect(std.meta.activeTag(a) != std.meta.activeTag(b));
 }
 
 test "DiagnosticSeverity and CompilerDiagnostic" {

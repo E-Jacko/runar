@@ -74,6 +74,15 @@ pub fn parsePython(allocator: Allocator, source: []const u8, file_name: []const 
     return parser.parse();
 }
 
+/// True if every byte in `s` is an ASCII digit (0-9).
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Token Types
 // ============================================================================
@@ -232,9 +241,10 @@ fn tokenizeRaw(allocator: Allocator, source: []const u8) []Token {
             const quote = ch;
             // Check for triple-quote
             if (i + 2 < source.len and source[i + 1] == quote and source[i + 2] == quote) {
+                // Triple-quoted string — always a docstring in Rúnar.
+                // Skip it without emitting a token.
                 i += 3;
                 col += 3;
-                const start = i;
                 while (i + 2 < source.len) {
                     if (source[i] == quote and source[i + 1] == quote and source[i + 2] == quote) break;
                     if (source[i] == '\n') {
@@ -245,12 +255,10 @@ fn tokenizeRaw(allocator: Allocator, source: []const u8) []Token {
                     }
                     i += 1;
                 }
-                const val = source[start..i];
                 if (i + 2 < source.len) {
                     i += 3;
                     col += 3;
                 }
-                tokens.append(allocator, .{ .kind = .string_literal, .text = val, .line = line, .col = start_col }) catch {};
                 continue;
             }
 
@@ -542,8 +550,23 @@ fn pyConvertName(allocator: Allocator, name: []const u8) []const u8 {
         .{ "ec_make_point", "ecMakePoint" },
         .{ "ec_point_x", "ecPointX" },
         .{ "ec_point_y", "ecPointY" },
+        .{ "verify_ecdsa_p256", "verifyECDSA_P256" },
+        .{ "p256_add", "p256Add" },
+        .{ "p256_mul", "p256Mul" },
+        .{ "p256_mul_gen", "p256MulGen" },
+        .{ "p256_negate", "p256Negate" },
+        .{ "p256_on_curve", "p256OnCurve" },
+        .{ "p256_encode_compressed", "p256EncodeCompressed" },
+        .{ "verify_ecdsa_p384", "verifyECDSA_P384" },
+        .{ "p384_add", "p384Add" },
+        .{ "p384_mul", "p384Mul" },
+        .{ "p384_mul_gen", "p384MulGen" },
+        .{ "p384_negate", "p384Negate" },
+        .{ "p384_on_curve", "p384OnCurve" },
+        .{ "p384_encode_compressed", "p384EncodeCompressed" },
         .{ "add_output", "addOutput" },
         .{ "add_raw_output", "addRawOutput" },
+        .{ "add_data_output", "addDataOutput" },
         .{ "get_state_script", "getStateScript" },
         .{ "extract_locktime", "extractLocktime" },
         .{ "extract_output_hash", "extractOutputHash" },
@@ -640,13 +663,15 @@ fn resolvePyTypeName(name: []const u8) TypeNode {
     if (std.mem.eql(u8, name, "bytes") or std.mem.eql(u8, name, "ByteString")) return .{ .primitive_type = .byte_string };
     if (std.mem.eql(u8, name, "PubKey")) return .{ .primitive_type = .pub_key };
     if (std.mem.eql(u8, name, "Sig")) return .{ .primitive_type = .sig };
-    if (std.mem.eql(u8, name, "Sha256")) return .{ .primitive_type = .sha256 };
+    if (std.mem.eql(u8, name, "Sha256") or std.mem.eql(u8, name, "Sha256Digest")) return .{ .primitive_type = .sha256 };
     if (std.mem.eql(u8, name, "Ripemd160")) return .{ .primitive_type = .ripemd160 };
     if (std.mem.eql(u8, name, "Addr")) return .{ .primitive_type = .addr };
     if (std.mem.eql(u8, name, "SigHashPreimage")) return .{ .primitive_type = .sig_hash_preimage };
     if (std.mem.eql(u8, name, "RabinSig")) return .{ .primitive_type = .rabin_sig };
     if (std.mem.eql(u8, name, "RabinPubKey")) return .{ .primitive_type = .rabin_pub_key };
     if (std.mem.eql(u8, name, "Point")) return .{ .primitive_type = .point };
+    if (std.mem.eql(u8, name, "P256Point")) return .{ .primitive_type = .p256_point };
+    if (std.mem.eql(u8, name, "P384Point")) return .{ .primitive_type = .p384_point };
     if (std.mem.eql(u8, name, "void")) return .{ .primitive_type = .void };
     // Try the canonical lookup
     if (PrimitiveTypeName.fromTsString(name)) |ptn| return .{ .primitive_type = ptn };
@@ -777,7 +802,7 @@ const Parser = struct {
             if (ParentClass.fromTsString(parent_tok.text)) |pc| {
                 parent_class = pc;
             } else {
-                self.addErrorFmt("unknown parent class: '{s}', expected SmartContract or StatefulSmartContract", .{parent_tok.text});
+                self.addErrorFmt("unknown parent class: '{s}', expected SmartContract, StatefulSmartContract, or UnsafeSmartContract", .{parent_tok.text});
                 return null;
             }
             _ = self.expect(.rparen);
@@ -877,8 +902,9 @@ const Parser = struct {
         if (self.checkIdent("Readonly")) {
             is_readonly = true;
         }
-        // In SmartContract, all properties are automatically readonly
-        if (parent_class == .smart_contract) {
+        // In SmartContract (and UnsafeSmartContract), all properties are
+        // automatically readonly.
+        if (parent_class == .smart_contract or parent_class == .unsafe_smart_contract) {
             is_readonly = true;
         }
 
@@ -894,11 +920,28 @@ const Parser = struct {
 
         self.skipNewlines();
 
+        // Capture FixedArray shape so expand_fixed_arrays.zig can see the
+        // length + element type after typecheck.
+        var fa_len: u32 = 0;
+        var fa_elem: types.RunarType = .unknown;
+        var fa_nested_len: u32 = 0;
+        if (type_node == .fixed_array_type) {
+            fa_len = type_node.fixed_array_type.length;
+            const inner = type_node.fixed_array_type.element.*;
+            fa_elem = typeNodeToRunarType(inner);
+            if (inner == .fixed_array_type) {
+                fa_nested_len = inner.fixed_array_type.length;
+            }
+        }
+
         return .{
             .name = prop_name,
             .type_info = type_info,
             .readonly = is_readonly,
             .initializer = initializer,
+            .fixed_array_length = fa_len,
+            .fixed_array_element = fa_elem,
+            .fixed_array_nested_length = fa_nested_len,
         };
     }
 
@@ -1410,17 +1453,30 @@ const Parser = struct {
     }
 
     fn buildAssignment(self: *Parser, target: Expression, value: Expression) ?Statement {
+        _ = self;
         switch (target) {
             .property_access => |pa| {
                 return .{ .assign = .{ .target = pa.property, .value = value } };
             },
             .identifier => |id| {
                 // In Python, bare `name = expr` in method body is a variable declaration
-                _ = self;
                 return .{ .let_decl = .{ .name = id, .value = value } };
             },
+            .index_access => |ia| {
+                // self.arr[idx] = value — carry the full target so
+                // expand_fixed_arrays can rewrite it into dispatch form.
+                const base_name: []const u8 = switch (ia.object) {
+                    .property_access => |pa| pa.property,
+                    .identifier => |id| id,
+                    else => "unknown",
+                };
+                return .{ .assign = .{
+                    .target = base_name,
+                    .value = value,
+                    .index_target = ia,
+                } };
+            },
             else => {
-                _ = self;
                 return .{ .assign = .{ .target = "unknown", .value = value } };
             },
         }
@@ -1752,21 +1808,39 @@ const Parser = struct {
         return switch (self.current.kind) {
             .number => blk: {
                 const tok = self.bump();
-                // Strip underscores from number text
-                var stripped_buf: [64]u8 = undefined;
+                // Strip underscores from number text. Buffer sized for 256-bit
+                // decimal literals (78 digits) with headroom; oversize tokens
+                // are rejected explicitly instead of being silently truncated.
+                var stripped_buf: [160]u8 = undefined;
                 var stripped_len: usize = 0;
+                var overflow = false;
                 for (tok.text) |ch| {
-                    if (ch != '_' and stripped_len < stripped_buf.len) {
-                        stripped_buf[stripped_len] = ch;
-                        stripped_len += 1;
+                    if (ch == '_') continue;
+                    if (stripped_len >= stripped_buf.len) {
+                        overflow = true;
+                        break;
                     }
+                    stripped_buf[stripped_len] = ch;
+                    stripped_len += 1;
+                }
+                if (overflow) {
+                    self.addErrorFmt("integer literal too long: '{s}'", .{tok.text});
+                    break :blk null;
                 }
                 const stripped = stripped_buf[0..stripped_len];
-                const val = std.fmt.parseInt(i64, stripped, 0) catch {
+                if (std.fmt.parseInt(i64, stripped, 0)) |val| {
+                    break :blk Expression{ .literal_int = val };
+                } else |_| {
+                    // Oversize decimal literal — carry the canonical decimal
+                    // text on a `literal_bigint` node so codegen emits the
+                    // correct push bytes (matches TS / Go / Python).
+                    if (isAllAsciiDigits(stripped)) {
+                        const decimal = self.allocator.dupe(u8, stripped) catch break :blk null;
+                        break :blk Expression{ .literal_bigint = decimal };
+                    }
                     self.addErrorFmt("invalid integer: '{s}'", .{tok.text});
                     break :blk null;
-                };
-                break :blk Expression{ .literal_int = val };
+                }
             },
             .string_literal => blk: {
                 const tok = self.bump();

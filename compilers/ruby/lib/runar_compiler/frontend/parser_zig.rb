@@ -115,12 +115,15 @@ module RunarCompiler
       "PubKey"      => "PubKey",
       "Sig"         => "Sig",
       "Sha256"      => "Sha256",
+      "Sha256Digest" => "Sha256",
       "Ripemd160"   => "Ripemd160",
       "Addr"        => "Addr",
       "SigHashPreimage" => "SigHashPreimage",
       "RabinSig"    => "RabinSig",
       "RabinPubKey" => "RabinPubKey",
       "Point"       => "Point",
+      "P256Point"   => "P256Point",
+      "P384Point"   => "P384Point",
     }.freeze
 
     ZIG_KEYWORDS = {
@@ -637,15 +640,41 @@ module RunarCompiler
         expect(TOK_RBRACE)
         match_tok(TOK_SEMICOLON)
 
-        # For SmartContract, all properties are readonly.
-        # For StatefulSmartContract, properties without initializers are readonly.
+        # Collect set of property names mutated in any method body so we can
+        # determine readonly flags in stateful contracts (matches TS rule).
+        mutated = Set.new
+        @methods.each do |m|
+          _collect_mutated_properties(m.body, mutated)
+        end
+
+        # Constructor param names (used to strip initializer overrides so the
+        # AST matches the Zig compiler reference which omits `initialValue`
+        # when the field is also an explicit constructor parameter).
+        ctor_param_names = Set.new
+        if @constructor_node
+          @constructor_node.params.each { |p| ctor_param_names.add(p.name) }
+        end
+
+        # For SmartContract (and UnsafeSmartContract), all properties are
+        # readonly. For StatefulSmartContract: readonly iff explicitly marked
+        # OR has no initializer AND is not mutated in any method body.
         @properties = @properties.map do |prop|
-          readonly = @parent_class == "SmartContract" || prop.readonly || prop.initializer.nil?
+          had_initializer = !prop.initializer.nil?
+          stripped_initializer = ctor_param_names.include?(prop.name) ? nil : prop.initializer
+          readonly = if @parent_class == "SmartContract" || @parent_class == "UnsafeSmartContract"
+                       true
+                     elsif prop.readonly
+                       true
+                     elsif !had_initializer && !mutated.include?(prop.name)
+                       true
+                     else
+                       false
+                     end
           PropertyNode.new(
             name: prop.name,
             type: prop.type,
             readonly: readonly,
-            initializer: prop.initializer,
+            initializer: stripped_initializer,
             source_location: prop.source_location
           )
         end
@@ -680,7 +709,11 @@ module RunarCompiler
           advance
           expect(TOK_DOT)
           parent_tok = expect(TOK_IDENT)
-          @parent_class = parent_tok.value == "StatefulSmartContract" ? "StatefulSmartContract" : "SmartContract"
+          @parent_class = case parent_tok.value
+                          when "StatefulSmartContract" then "StatefulSmartContract"
+                          when "UnsafeSmartContract"   then "UnsafeSmartContract"
+                          else "SmartContract"
+                          end
         end
 
         match_tok(TOK_SEMICOLON)
@@ -781,10 +814,17 @@ module RunarCompiler
 
           if is_receiver
             receiver_name = param_name
+          elsif parsed_type[:raw_name] == "StatefulContext"
+            # Zig stateful contracts thread an explicit StatefulContext
+            # parameter through every state-mutating method body
+            # (e.g. `ctx.txPreimage`, `ctx.addOutput(...)`). The compiler
+            # re-injects this context when lowering, so the parameter is
+            # dropped from the canonical IR -- matching the Zig compiler's
+            # own parse_zig.zig behavior. Recording the binding name lets
+            # later passes rewrite `ctx.txPreimage` -> `this.txPreimage`
+            # and `ctx.addOutput(...)` -> `this.addOutput(...)`.
+            stateful_context_names.add(param_name)
           else
-            if parsed_type[:raw_name] == "StatefulContext"
-              stateful_context_names.add(param_name)
-            end
             params << ParamNode.new(name: param_name, type: parsed_type[:type])
           end
 
@@ -1346,6 +1386,25 @@ module RunarCompiler
       def parse_primary
         tok = peek
 
+        # Slice-literal: &.{ ... } -> array literal. Zig coerces an
+        # anonymous tuple to []const T via this leading-`&` form (e.g.
+        # `&.{ sig1, sig2 }` for runar.checkMultiSig). The `&` carries
+        # no Rúnar semantics. `&` is otherwise a binary bitwise-and
+        # consumed at expression level and cannot appear at primary
+        # position.
+        if tok.kind == TOK_AMP && peek_at(1).kind == TOK_DOT && peek_at(2).kind == TOK_LBRACE
+          advance # consume &
+          advance # consume .
+          advance # consume {
+          elements = []
+          while !check(TOK_RBRACE) && !check(TOK_EOF)
+            elements << parse_expression
+            match_tok(TOK_COMMA)
+          end
+          expect(TOK_RBRACE)
+          return ArrayLiteralExpr.new(elements: elements)
+        end
+
         # Struct literal: .{ ... }
         if tok.kind == TOK_DOT && peek_at(1).kind == TOK_LBRACE
           advance # consume .
@@ -1534,7 +1593,7 @@ module RunarCompiler
               expr = PropertyAccessExpr.new(property: prop)
             elsif expr.is_a?(Identifier) &&
                   @stateful_context_names.include?(expr.name) &&
-                  %w[txPreimage getStateScript addOutput addRawOutput].include?(prop)
+                  %w[txPreimage getStateScript addOutput addRawOutput addDataOutput].include?(prop)
               expr = PropertyAccessExpr.new(property: prop)
             else
               expr = MemberExpr.new(object: expr, property: prop)
@@ -1720,6 +1779,70 @@ module RunarCompiler
           )
         else
           expr
+        end
+      end
+
+      # -- Mutation detection ---------------------------------------------
+      # Walks method bodies to find `self.<prop> = …` writes so we can
+      # correctly mark stateful contract fields as mutable.
+
+      def _collect_mutated_properties(body, out)
+        (body || []).each { |stmt| _collect_mutated_in_stmt(stmt, out) }
+      end
+
+      def _collect_mutated_in_stmt(stmt, out)
+        case stmt
+        when AssignmentStmt
+          if stmt.target.is_a?(PropertyAccessExpr)
+            out.add(stmt.target.property)
+          end
+          _collect_mutated_in_expr(stmt.target, out)
+          _collect_mutated_in_expr(stmt.value, out)
+        when VariableDeclStmt
+          _collect_mutated_in_expr(stmt.init, out)
+        when ExpressionStmt
+          _collect_mutated_in_expr(stmt.expr, out)
+        when ReturnStmt
+          _collect_mutated_in_expr(stmt.value, out)
+        when IfStmt
+          _collect_mutated_in_expr(stmt.condition, out)
+          _collect_mutated_properties(stmt.then, out)
+          _collect_mutated_properties(stmt.else_, out)
+        when ForStmt
+          _collect_mutated_in_expr(stmt.init&.init, out)
+          _collect_mutated_in_expr(stmt.condition, out)
+          _collect_mutated_in_stmt(stmt.update, out)
+          _collect_mutated_properties(stmt.body, out)
+        end
+      end
+
+      def _collect_mutated_in_expr(expr, out)
+        return if expr.nil?
+        case expr
+        when BinaryExpr
+          _collect_mutated_in_expr(expr.left, out)
+          _collect_mutated_in_expr(expr.right, out)
+        when UnaryExpr
+          _collect_mutated_in_expr(expr.operand, out)
+        when CallExpr
+          _collect_mutated_in_expr(expr.callee, out)
+          expr.args.each { |a| _collect_mutated_in_expr(a, out) }
+        when MemberExpr
+          _collect_mutated_in_expr(expr.object, out)
+        when TernaryExpr
+          _collect_mutated_in_expr(expr.condition, out)
+          _collect_mutated_in_expr(expr.consequent, out)
+          _collect_mutated_in_expr(expr.alternate, out)
+        when IndexAccessExpr
+          _collect_mutated_in_expr(expr.object, out)
+          _collect_mutated_in_expr(expr.index, out)
+        when IncrementExpr, DecrementExpr
+          if expr.operand.is_a?(PropertyAccessExpr)
+            out.add(expr.operand.property)
+          end
+          _collect_mutated_in_expr(expr.operand, out)
+        when ArrayLiteralExpr
+          expr.elements.each { |e| _collect_mutated_in_expr(e, out) }
         end
       end
     end

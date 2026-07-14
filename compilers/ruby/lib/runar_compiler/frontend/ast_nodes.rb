@@ -67,8 +67,13 @@ module RunarCompiler
     UnaryExpr = Struct.new(:op, :operand, keyword_init: true)
 
     # A function/method call.
-    CallExpr = Struct.new(:callee, :args, keyword_init: true) do
-      def initialize(callee: nil, args: [])
+    #
+    # +asm_return_type+ is set only for the expression form `asm<T>({...})`
+    # of the asm compiler intrinsic. It carries the captured primitive return
+    # type ("bigint", "boolean", or "ByteString"); nil for the statement form
+    # and for every non-asm call.
+    CallExpr = Struct.new(:callee, :args, :asm_return_type, keyword_init: true) do
+      def initialize(callee: nil, args: [], asm_return_type: nil)
         super
       end
     end
@@ -178,15 +183,42 @@ module RunarCompiler
     end
 
     # A contract property declaration.
-    PropertyNode = Struct.new(:name, :type, :readonly, :initializer, :source_location, keyword_init: true) do
-      def initialize(name: "", type: nil, readonly: false, initializer: nil, source_location: SourceLocation.new)
+    #
+    # +synthetic_array_chain+ is attached by the FixedArray expansion pass
+    # (+expand_fixed_arrays.rb+) on each synthetic scalar leaf created when a
+    # +FixedArray<T, N>+ property is desugared into N scalar siblings.  Each
+    # entry is a Hash with +:base+, +:index+, +:length+ keys, outermost first.
+    # The artifact assembler uses this marker to re-group the flat synthetic
+    # runs back into logical +FixedArray+ ABI and state entries.  User-written
+    # scalar properties leave this field as +nil+.
+    #
+    # +embed_always+ is set by the parser when a +/** @embedAlways */+ (or
+    # +// @embedAlways+) comment directive immediately precedes a readonly field
+    # (issue #109). It opts the field OUT of dead-code elimination: a readonly
+    # field no method references is normally stripped from the locking script
+    # (its +load_prop+ is dead, so no constructor slot is emitted), silently
+    # removing deploy-time metadata an author intends to recover from the
+    # on-chain script later. When set, ANF lowering forces the field into the
+    # script (a constructor slot) so its bytes survive. Honored ONLY on the
+    # +.runar.ts+ surface (matching the TypeScript reference). Only meaningful
+    # on readonly fields.
+    PropertyNode = Struct.new(:name, :type, :readonly, :initializer, :source_location, :synthetic_array_chain, :embed_always, keyword_init: true) do
+      def initialize(name: "", type: nil, readonly: false, initializer: nil, source_location: SourceLocation.new, synthetic_array_chain: nil, embed_always: false)
         super
       end
     end
 
     # A contract method.
-    MethodNode = Struct.new(:name, :params, :body, :visibility, :source_location, keyword_init: true) do
-      def initialize(name: "", params: [], body: [], visibility: "public", source_location: SourceLocation.new)
+    #
+    # +sighash_type+ is the BIP-143 sighash type declared via a
+    # +/** @sighash <FLAGS> */+ directive on a public method (e.g. +0x43+ for
+    # SINGLE|FORKID); issue #123. +nil+ = the default +ALL|FORKID+ (0x41),
+    # byte-identical to the historically-pinned mode. Honored ONLY on the
+    # +.runar.ts+ surface. Drives the auto-injected preimage-type assert, the
+    # OP_PUSH_TX binding flag, the ABI +sigHashType+, and the SDK-side
+    # preimage/signature construction.
+    MethodNode = Struct.new(:name, :params, :body, :visibility, :source_location, :sighash_type, keyword_init: true) do
+      def initialize(name: "", params: [], body: [], visibility: "public", source_location: SourceLocation.new, sighash_type: nil)
         super
       end
     end
@@ -223,6 +255,8 @@ module RunarCompiler
       RabinPubKey
       void
       Point
+      P256Point
+      P384Point
     ].to_set.freeze
 
     # Return true if +name+ is a recognized Runar primitive type.

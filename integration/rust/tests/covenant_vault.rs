@@ -24,21 +24,24 @@
 //!   what the contract expects (a P2PKH output to the recipient for minAmount satoshis).
 //!   The SDK's generic call() creates default outputs that don't match. For real
 //!   applications, developers use the SDK's raw transaction builder.
+//!
+//! **Gating**: all on-chain tests are gated with
+//! `#[cfg_attr(not(feature = "regtest"), ignore)]`. They require a local Bitcoin
+//! regtest node (see `integration/rust/README.md`). Run with:
+//!     cargo test --features regtest
+//! Tests without the gate (pure compile/script-size checks) run by default.
 
 use crate::helpers::*;
 use runar_lang::sdk::{DeployOptions, RunarContract, SdkValue};
 
 #[test]
-#[ignore]
 fn test_covenant_vault_compile() {
-    skip_if_no_node();
-
     let artifact = compile_contract("examples/ts/covenant-vault/CovenantVault.runar.ts");
     assert_eq!(artifact.contract_name, "CovenantVault");
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_covenant_vault_deploy() {
     skip_if_no_node();
 
@@ -61,6 +64,7 @@ fn test_covenant_vault_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -68,7 +72,7 @@ fn test_covenant_vault_deploy() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_covenant_vault_deploy_zero_min_amount() {
     skip_if_no_node();
 
@@ -89,13 +93,14 @@ fn test_covenant_vault_deploy_zero_min_amount() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_covenant_vault_deploy_large_min_amount() {
     skip_if_no_node();
 
@@ -116,13 +121,14 @@ fn test_covenant_vault_deploy_large_min_amount() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_covenant_vault_deploy_same_key_owner_recipient() {
     skip_if_no_node();
 
@@ -142,6 +148,7 @@ fn test_covenant_vault_deploy_same_key_owner_recipient() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -149,7 +156,7 @@ fn test_covenant_vault_deploy_same_key_owner_recipient() {
 
 /// Spend with the wrong signer should be rejected (checkSig fails before covenant check).
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_covenant_vault_wrong_signer_rejected() {
     skip_if_no_node();
 
@@ -171,6 +178,7 @@ fn test_covenant_vault_wrong_signer_rejected() {
         .deploy(&mut provider, &*owner_signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

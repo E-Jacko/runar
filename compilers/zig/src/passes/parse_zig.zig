@@ -65,6 +65,15 @@ pub fn parseZig(allocator: Allocator, source: []const u8, file_name: []const u8)
     return parser.parse();
 }
 
+/// True if every byte in `s` is an ASCII digit (0-9).
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Token Types
 // ============================================================================
@@ -306,6 +315,25 @@ const Parser = struct {
             }
             return self.makeBinOp(.eq, args[0], args[1]);
         }
+        // runar.hexToBytes("deadbeef") -> literal_bytes "deadbeef" (compile-time hex decode).
+        // Mirrors the Python parser's bytes.fromhex(...) handling — produces a
+        // ByteString literal that downstream emit decodes as 4-byte hex, not
+        // an 8-byte ASCII string. Allows the Zig DSL source to also compile
+        // as a native Zig file, where runar.hexToBytes is a comptime helper
+        // returning `*const [N]u8` (which coerces to ByteString).
+        if (std.mem.eql(u8, member, "hexToBytes")) {
+            if (args.len != 1) {
+                self.addError("runar.hexToBytes expects exactly 1 argument");
+                return null;
+            }
+            switch (args[0]) {
+                .literal_bytes => |s| return Expression{ .literal_bytes = s },
+                else => {
+                    self.addError("runar.hexToBytes expects a string literal argument");
+                    return null;
+                },
+            }
+        }
         return self.makeCall(member, args);
     }
 
@@ -407,7 +435,7 @@ const Parser = struct {
 
         const pc = parent_class.?;
         for (properties.items) |*prop| {
-            if (pc == .smart_contract) { prop.readonly = true; } else {
+            if (pc == .smart_contract or pc == .unsafe_smart_contract) { prop.readonly = true; } else {
                 var is_explicit_readonly = false;
                 for (explicit_readonly_fields.items) |fname| {
                     if (std.mem.eql(u8, fname, prop.name)) {
@@ -433,12 +461,13 @@ const Parser = struct {
     }
 
     fn parseParentClass(self: *Parser) ?ParentClass {
-        if (!self.checkIdent("runar")) { self.addError("expected 'runar.SmartContract' or 'runar.StatefulSmartContract'"); return null; }
+        if (!self.checkIdent("runar")) { self.addError("expected 'runar.SmartContract', 'runar.StatefulSmartContract', or 'runar.UnsafeSmartContract'"); return null; }
         _ = self.bump();
         if (self.expect(.dot) == null) return null;
         const ct = self.expect(.ident) orelse return null;
         if (std.mem.eql(u8, ct.text, "SmartContract")) return .smart_contract;
         if (std.mem.eql(u8, ct.text, "StatefulSmartContract")) return .stateful_smart_contract;
+        if (std.mem.eql(u8, ct.text, "UnsafeSmartContract")) return .unsafe_smart_contract;
         self.addErrorFmt("unknown contract type: '{s}'", .{ct.text});
         return null;
     }
@@ -466,7 +495,30 @@ const Parser = struct {
         if (parsed_type.explicit_readonly) explicit_readonly_fields.append(self.allocator, name_tok.text) catch {};
         if (self.current.kind == .comma) { _ = self.bump(); } else if (self.current.kind == .semicolon) { _ = self.bump(); }
         const expr_val: ?Expression = if (initializer) |init_ptr| init_ptr.* else null;
-        return PropertyNode{ .name = name_tok.text, .type_info = typeNodeToRunarType(parsed_type.type_node), .readonly = false, .initializer = expr_val };
+
+        // Capture FixedArray shape (outer + optional nested length) so
+        // `expand_fixed_arrays.zig` can see the property after typecheck.
+        var fa_len: u32 = 0;
+        var fa_elem: RunarType = .unknown;
+        var fa_nested_len: u32 = 0;
+        if (parsed_type.type_node == .fixed_array_type) {
+            fa_len = parsed_type.type_node.fixed_array_type.length;
+            const inner = parsed_type.type_node.fixed_array_type.element.*;
+            fa_elem = typeNodeToRunarType(inner);
+            if (inner == .fixed_array_type) {
+                fa_nested_len = inner.fixed_array_type.length;
+            }
+        }
+
+        return PropertyNode{
+            .name = name_tok.text,
+            .type_info = typeNodeToRunarType(parsed_type.type_node),
+            .readonly = false,
+            .initializer = expr_val,
+            .fixed_array_length = fa_len,
+            .fixed_array_element = fa_elem,
+            .fixed_array_nested_length = fa_nested_len,
+        };
     }
 
     fn parseFieldTypeNode(self: *Parser) ParsedFieldType {
@@ -498,6 +550,26 @@ const Parser = struct {
     }
 
     fn parseTypeNode(self: *Parser) TypeNode {
+        // Zig-style fixed array: `[N]T` (recursive for `[M][N]T`). The
+        // `[_]T` unsized form is rejected — Rúnar requires a concrete
+        // length.
+        if (self.current.kind == .lbracket) {
+            _ = self.bump(); // '['
+            if (self.current.kind != .number) {
+                self.addError("FixedArray length must be a positive integer literal");
+                // Recover: eat until ']' to keep the parser afloat.
+                while (self.current.kind != .rbracket and self.current.kind != .eof) _ = self.bump();
+                if (self.current.kind == .rbracket) _ = self.bump();
+                return .{ .custom_type = "unknown" };
+            }
+            const size_tok = self.bump();
+            const size = std.fmt.parseInt(u32, size_tok.text, 10) catch 0;
+            _ = self.expect(.rbracket);
+            const inner = self.parseTypeNode();
+            const inner_ptr = self.allocator.create(TypeNode) catch return .{ .custom_type = "unknown" };
+            inner_ptr.* = inner;
+            return .{ .fixed_array_type = .{ .element = inner_ptr, .length = size } };
+        }
         if (self.current.kind == .ident) {
             if (std.mem.eql(u8, self.current.text, "i64")) { _ = self.bump(); return .{ .primitive_type = .bigint }; }
             if (std.mem.eql(u8, self.current.text, "bool")) { _ = self.bump(); return .{ .primitive_type = .boolean }; }
@@ -523,12 +595,14 @@ const Parser = struct {
         if (std.mem.eql(u8, name, "Sig")) return .{ .primitive_type = .sig };
         if (std.mem.eql(u8, name, "Addr")) return .{ .primitive_type = .addr };
         if (std.mem.eql(u8, name, "ByteString")) return .{ .primitive_type = .byte_string };
-        if (std.mem.eql(u8, name, "Sha256")) return .{ .primitive_type = .sha256 };
+        if (std.mem.eql(u8, name, "Sha256") or std.mem.eql(u8, name, "Sha256Digest")) return .{ .primitive_type = .sha256 };
         if (std.mem.eql(u8, name, "Ripemd160")) return .{ .primitive_type = .ripemd160 };
         if (std.mem.eql(u8, name, "SigHashPreimage")) return .{ .primitive_type = .sig_hash_preimage };
         if (std.mem.eql(u8, name, "RabinSig")) return .{ .primitive_type = .rabin_sig };
         if (std.mem.eql(u8, name, "RabinPubKey")) return .{ .primitive_type = .rabin_pub_key };
         if (std.mem.eql(u8, name, "Point")) return .{ .primitive_type = .point };
+        if (std.mem.eql(u8, name, "P256Point")) return .{ .primitive_type = .p256_point };
+        if (std.mem.eql(u8, name, "P384Point")) return .{ .primitive_type = .p384_point };
         return .{ .custom_type = name };
     }
 
@@ -874,14 +948,19 @@ const Parser = struct {
             const target_name = extractAssignTarget(expr);
             const bin = self.allocator.create(BinaryOp) catch return null;
             bin.* = .{ .op = bo, .left = expr, .right = rhs };
-            return Statement{ .assign = .{ .target = target_name, .value = .{ .binary_op = bin }, .source_loc = loc } };
+            const index_tgt: ?*IndexAccess = if (expr == .index_access) expr.index_access else null;
+            return Statement{ .assign = .{ .target = target_name, .value = .{ .binary_op = bin }, .source_loc = loc, .index_target = index_tgt } };
         }
         if (self.current.kind == .assign) {
             _ = self.bump();
             const rhs = self.parseExpression() orelse return null;
             _ = self.expect(.semicolon);
             const target_name = extractAssignTarget(expr);
-            return Statement{ .assign = .{ .target = target_name, .value = rhs, .source_loc = loc } };
+            // `self.arr[idx] = value` — carry the index-access target on
+            // the Assign so `expand_fixed_arrays.zig` can rewrite it into
+            // dispatch form.
+            const index_tgt: ?*IndexAccess = if (expr == .index_access) expr.index_access else null;
+            return Statement{ .assign = .{ .target = target_name, .value = rhs, .source_loc = loc, .index_target = index_tgt } };
         }
         _ = self.expect(.semicolon);
         // Expression statements (including assert calls) — attach source location
@@ -890,11 +969,18 @@ const Parser = struct {
     }
 
     /// Extract a string target name from an expression for Assign.target.
-    /// For identifiers: returns the name. For property_access: returns the property name.
+    /// For identifiers: returns the name. For property_access: returns the
+    /// property name. For index_access, returns the base property name when
+    /// the object is `self.<name>`.
     fn extractAssignTarget(expr: Expression) []const u8 {
         return switch (expr) {
             .identifier => |id| id,
             .property_access => |pa| pa.property,
+            .index_access => |ia| switch (ia.object) {
+                .property_access => |pa| pa.property,
+                .identifier => |id| id,
+                else => "unknown",
+            },
             else => "unknown",
         };
     }
@@ -1006,6 +1092,12 @@ const Parser = struct {
         if (self.current.kind == .minus) { _ = self.bump(); const o = self.parseUnary() orelse return null; return self.makeUnaryOp(.negate, o); }
         if (self.current.kind == .bang) { _ = self.bump(); const o = self.parseUnary() orelse return null; return self.makeUnaryOp(.not, o); }
         if (self.current.kind == .tilde) { _ = self.bump(); const o = self.parseUnary() orelse return null; return self.makeUnaryOp(.bitnot, o); }
+        // Zig's `&` is the address-of operator used for slice coercion at
+        // call sites like `&.{sig1, sig2}` (an anonymous-struct literal
+        // coerced to a slice). Slices have no Rúnar IR analogue — the inner
+        // array literal IS the IR node — so we simply skip the `&` and parse
+        // the operand as a primary expression.
+        if (self.current.kind == .ampersand) { _ = self.bump(); return self.parsePrimary(); }
         return self.parsePostfix();
     }
 
@@ -1043,6 +1135,7 @@ const Parser = struct {
             } else if (self.current.kind == .lbracket) {
                 _ = self.bump();
                 const idx = self.parseExpression() orelse return null;
+                _ = self.expect(.rbracket);
                 const ia = self.allocator.create(IndexAccess) catch return null;
                 ia.* = .{ .object = expr, .index = idx };
                 expr = .{ .index_access = ia };
@@ -1053,6 +1146,26 @@ const Parser = struct {
 
     fn parsePrimary(self: *Parser) ?Expression {
         return switch (self.current.kind) {
+            .ampersand => blk: {
+                // `&.{ ... }` — Zig slice-literal syntax used to coerce an
+                // anonymous tuple to a `[]const T` slice (e.g. `&.{ sig1, sig2 }`).
+                // Treat as an array literal; the leading `&` carries no Rúnar
+                // semantics. `&` is otherwise a binary operator handled in
+                // parseBitwiseAnd, so it cannot appear at primary position.
+                _ = self.bump();
+                if (self.current.kind != .dot) { self.addError("expected '.' after '&'"); break :blk null; }
+                _ = self.bump();
+                if (self.current.kind != .lbrace) { self.addError("expected '{' after '&.'"); break :blk null; }
+                _ = self.bump();
+                var elems: std.ArrayListUnmanaged(Expression) = .empty;
+                while (self.current.kind != .rbrace and self.current.kind != .eof) {
+                    const elem = self.parseExpression() orelse return null;
+                    elems.append(self.allocator, elem) catch return null;
+                    if (self.current.kind == .comma) _ = self.bump();
+                }
+                _ = self.expect(.rbrace);
+                break :blk .{ .array_literal = elems.items };
+            },
             .dot => blk: {
                 _ = self.bump();
                 if (self.current.kind != .lbrace) break :blk null;
@@ -1066,7 +1179,20 @@ const Parser = struct {
                 _ = self.expect(.rbrace);
                 break :blk .{ .array_literal = elems.items };
             },
-            .number => blk: { const tok = self.bump(); break :blk Expression{ .literal_int = std.fmt.parseInt(i64, tok.text, 10) catch { self.addErrorFmt("invalid integer: '{s}'", .{tok.text}); break :blk null; } }; },
+            .number => blk: {
+                const tok = self.bump();
+                if (std.fmt.parseInt(i64, tok.text, 10)) |val| {
+                    break :blk Expression{ .literal_int = val };
+                } else |_| {
+                    // Oversize decimal literal — carry as `literal_bigint`.
+                    if (isAllAsciiDigits(tok.text)) {
+                        const decimal = self.allocator.dupe(u8, tok.text) catch break :blk null;
+                        break :blk Expression{ .literal_bigint = decimal };
+                    }
+                    self.addErrorFmt("invalid integer: '{s}'", .{tok.text});
+                    break :blk null;
+                }
+            },
             .kw_true => blk: { _ = self.bump(); break :blk Expression{ .literal_bool = true }; },
             .kw_false => blk: { _ = self.bump(); break :blk Expression{ .literal_bool = false }; },
             .string_literal => blk: { const tok = self.bump(); break :blk Expression{ .literal_bytes = tok.text }; },
@@ -1078,6 +1204,29 @@ const Parser = struct {
                 break :blk Expression{ .identifier = tok.text };
             },
             .lparen => blk: { _ = self.bump(); const inner = self.parseExpression() orelse break :blk null; _ = self.expect(.rparen); break :blk inner; },
+            .lbracket => blk: {
+                // `[_]T{...}` — typed array literal with inferred length. The
+                // element type is parsed and discarded; Rúnar infers element
+                // types from the literal contents. The element list is the
+                // same `{...}` form used by `.{...}` anon-struct literals.
+                _ = self.bump(); // '['
+                if (!(self.current.kind == .ident and std.mem.eql(u8, self.current.text, "_"))) {
+                    self.addError("expected '_' inside '[_]T{...}' typed array literal");
+                    break :blk null;
+                }
+                _ = self.bump(); // '_'
+                _ = self.expect(.rbracket) orelse break :blk null;
+                _ = self.parseTypeNode(); // discard element type
+                _ = self.expect(.lbrace) orelse break :blk null;
+                var elems: std.ArrayListUnmanaged(Expression) = .empty;
+                while (self.current.kind != .rbrace and self.current.kind != .eof) {
+                    const elem = self.parseExpression() orelse return null;
+                    elems.append(self.allocator, elem) catch return null;
+                    if (self.current.kind == .comma) _ = self.bump();
+                }
+                _ = self.expect(.rbrace);
+                break :blk .{ .array_literal = elems.items };
+            },
             .at_sign => blk: {
                 // Zig builtins: @divTrunc(a,b) → a/b, @rem(a,b) → a%b, @mod(a,b) → a%b,
                 // @intCast(expr) → expr, @as(T, expr) → expr

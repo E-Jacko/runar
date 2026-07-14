@@ -13,6 +13,13 @@ fn runCompileChecks(comptime basename: []const u8) !void {
     try root.runar.compileCheckFile(std.testing.allocator, contractPath(basename));
 }
 
+fn buildExpectedOutput(recipient: []const u8, min_amount: i64) []const u8 {
+    const script_prefix = runar.cat("1976a914", recipient);
+    const p2pkh_script = runar.cat(script_prefix, "88ac");
+    const amount_bytes = runar.num2bin(min_amount, 8);
+    return runar.cat(amount_bytes, p2pkh_script);
+}
+
 test "compile-check CovenantVault.runar.zig" {
     try runCompileChecks("CovenantVault.runar.zig");
 }
@@ -29,10 +36,10 @@ test "CovenantVault init stores owner recipient and amount" {
 test "CovenantVault spend accepts the expected output hash and signature" {
     const recipient = runar.BOB.pubKeyHash;
     const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
-    const expected_output = runar.testing.buildP2pkhOutput(recipient, 5000);
-    defer std.heap.page_allocator.free(expected_output);
-    const preimage = runar.testing.mockPreimageForOutputs(&.{expected_output});
-    defer std.heap.page_allocator.free(preimage);
+    const expected_output = buildExpectedOutput(recipient, 5000);
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(expected_output),
+    });
 
     vault.spend(runar.signTestMessage(runar.ALICE), preimage);
 }
@@ -43,4 +50,30 @@ test "CovenantVault spend rejects the wrong output hash" {
 
 test "CovenantVault spend rejects the wrong signature" {
     try root.expectAssertFailure("covenant-vault-wrong-sig");
+}
+
+// -- Adversarial: wrong output count --------------------------------------
+
+test "CovenantVault spend rejects a transaction that commits zero outputs" {
+    try root.expectAssertFailure("covenant-vault-zero-outputs");
+}
+
+test "CovenantVault spend rejects a transaction that commits an extra output" {
+    try root.expectAssertFailure("covenant-vault-extra-output");
+}
+
+// -- Adversarial: swapped output order ------------------------------------
+
+test "CovenantVault spend rejects a transaction with the required output reordered" {
+    try root.expectAssertFailure("covenant-vault-reordered");
+}
+
+// -- Adversarial: value at boundary ---------------------------------------
+
+test "CovenantVault spend rejects an output one satoshi below minAmount" {
+    try root.expectAssertFailure("covenant-vault-amount-minus-one");
+}
+
+test "CovenantVault spend rejects an output one satoshi above minAmount" {
+    try root.expectAssertFailure("covenant-vault-amount-plus-one");
 }

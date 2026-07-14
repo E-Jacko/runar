@@ -6,7 +6,10 @@ Hand-written tokenizer + recursive descent parser for TypeScript-like syntax.
 
 from __future__ import annotations
 
+import re
+
 from runar_compiler.frontend.ast_nodes import (
+    ArrayLiteralExpr,
     ContractNode, PropertyNode, MethodNode, ParamNode, SourceLocation,
     PrimitiveType, FixedArrayType, CustomType, TypeNode,
     BigIntLiteral, BoolLiteral, ByteStringLiteral, Identifier,
@@ -17,6 +20,7 @@ from runar_compiler.frontend.ast_nodes import (
 )
 from runar_compiler.frontend.parser_dispatch import ParseResult
 from runar_compiler.frontend.diagnostic import Diagnostic, Severity
+from runar_compiler.frontend.sighash_directive import extract_sighash_directive
 
 
 # ---------------------------------------------------------------------------
@@ -71,14 +75,29 @@ TOK_RSHIFT = 44      # >>
 TOK_ARROW = 45        # =>
 
 
-class Token:
-    __slots__ = ("kind", "value", "line", "col")
+# Issue #109: `@embedAlways` comment directive (word-boundary anchored so an
+# identifier like ``embedAlwaysFlag`` does not trip it), mirroring the TS
+# `/@embedAlways\b/` scan.
+_EMBED_ALWAYS_RE = re.compile(r"@embedAlways\b")
 
-    def __init__(self, kind: int, value: str, line: int, col: int):
+# Issue #123: `@sighash` comment directive token (word-boundary anchored),
+# mirroring the TS `/@sighash\b/` scan.
+_SIGHASH_TOKEN_RE = re.compile(r"@sighash\b")
+
+
+class Token:
+    __slots__ = ("kind", "value", "line", "col", "leading_comments")
+
+    def __init__(self, kind: int, value: str, line: int, col: int,
+                 leading_comments: str = ""):
         self.kind = kind
         self.value = value
         self.line = line
         self.col = col
+        # Issue #109/#123: the raw text of comment(s) immediately preceding this
+        # token (the token's "leading trivia"). Populated by the tokenizer so the
+        # parser can detect ``@embedAlways`` / ``@sighash`` comment directives.
+        self.leading_comments = leading_comments
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +111,7 @@ _TYPE_MAP: dict[str, str] = {
     "PubKey": "PubKey",
     "Sig": "Sig",
     "Sha256": "Sha256",
+    "Sha256Digest": "Sha256",
     "Ripemd160": "Ripemd160",
     "Addr": "Addr",
     "SigHashPreimage": "SigHashPreimage",
@@ -135,6 +155,17 @@ def _tokenize(source: str) -> list[Token]:
     i = 0
     n = len(source)
 
+    # Issue #109/#123: accumulate comment text so the *next* real token carries
+    # it as leading trivia. Comments are otherwise discarded; the parser needs
+    # the trivia to detect ``@embedAlways`` / ``@sighash`` directives.
+    pending_comments: list[str] = []
+
+    def _add(tok: Token) -> None:
+        if pending_comments:
+            tok.leading_comments = "\n".join(pending_comments)
+            pending_comments.clear()
+        tokens.append(tok)
+
     while i < n:
         ch = source[i]
 
@@ -160,12 +191,15 @@ def _tokenize(source: str) -> list[Token]:
 
         # Single-line comment //
         if ch == "/" and i + 1 < n and source[i + 1] == "/":
+            _comment_start = i
             while i < n and source[i] != "\n" and source[i] != "\r":
                 i += 1
+            pending_comments.append(source[_comment_start:i])
             continue
 
         # Multi-line comment /* ... */
         if ch == "/" and i + 1 < n and source[i + 1] == "*":
+            _comment_start = i
             i += 2
             col += 2
             while i + 1 < n:
@@ -182,6 +216,7 @@ def _tokenize(source: str) -> list[Token]:
             else:
                 if i < n:
                     i += 1
+            pending_comments.append(source[_comment_start:i])
             continue
 
         start_col = col
@@ -206,7 +241,7 @@ def _tokenize(source: str) -> list[Token]:
             if i < n:
                 i += 1
                 col += 1
-            tokens.append(Token(TOK_STRING, val, line, start_col))
+            _add(Token(TOK_STRING, val, line, start_col))
             continue
 
         # String literals: single or double quotes
@@ -226,7 +261,7 @@ def _tokenize(source: str) -> list[Token]:
             if i < n:
                 i += 1
                 col += 1
-            tokens.append(Token(TOK_STRING, val, line, start_col))
+            _add(Token(TOK_STRING, val, line, start_col))
             continue
 
         # Numbers (including BigInt suffix 'n')
@@ -259,7 +294,7 @@ def _tokenize(source: str) -> list[Token]:
             if i < n and source[i] == "n":
                 i += 1
                 col += 1
-            tokens.append(Token(TOK_NUMBER, num_str, line, start_col))
+            _add(Token(TOK_NUMBER, num_str, line, start_col))
             continue
 
         # Identifiers and keywords
@@ -269,7 +304,7 @@ def _tokenize(source: str) -> list[Token]:
                 i += 1
                 col += 1
             word = source[start:i]
-            tokens.append(Token(TOK_IDENT, word, line, start_col))
+            _add(Token(TOK_IDENT, word, line, start_col))
             continue
 
         # Three-character operators
@@ -280,7 +315,7 @@ def _tokenize(source: str) -> list[Token]:
                 "!==": TOK_NOTEQEQ,
             }.get(three)
             if three_kind is not None:
-                tokens.append(Token(three_kind, three, line, start_col))
+                _add(Token(three_kind, three, line, start_col))
                 i += 3
                 col += 3
                 continue
@@ -307,7 +342,7 @@ def _tokenize(source: str) -> list[Token]:
                 "=>": TOK_ARROW,
             }.get(two)
             if two_kind is not None:
-                tokens.append(Token(two_kind, two, line, start_col))
+                _add(Token(two_kind, two, line, start_col))
                 i += 2
                 col += 2
                 continue
@@ -341,7 +376,7 @@ def _tokenize(source: str) -> list[Token]:
         }
         one_kind = one_map.get(ch)
         if one_kind is not None:
-            tokens.append(Token(one_kind, ch, line, start_col))
+            _add(Token(one_kind, ch, line, start_col))
             i += 1
             col += 1
             continue
@@ -350,7 +385,7 @@ def _tokenize(source: str) -> list[Token]:
         i += 1
         col += 1
 
-    tokens.append(Token(TOK_EOF, "", line, col))
+    _add(Token(TOK_EOF, "", line, col))
     return tokens
 
 
@@ -454,7 +489,10 @@ class _TsParser:
             # Skip anything else at top level
             self._skip_statement()
 
-        raise ValueError("no class extending SmartContract or StatefulSmartContract found")
+        raise ValueError(
+            "no class extending SmartContract, StatefulSmartContract, "
+            "or UnsafeSmartContract found"
+        )
 
     def _skip_import(self) -> None:
         """Skip an import statement."""
@@ -507,9 +545,14 @@ class _TsParser:
             parent_tok = self.expect(TOK_IDENT)
             parent_class = parent_tok.value
 
-        if parent_class not in ("SmartContract", "StatefulSmartContract"):
+        if parent_class not in (
+            "SmartContract",
+            "StatefulSmartContract",
+            "UnsafeSmartContract",
+        ):
             raise ValueError(
-                f"no class extending SmartContract or StatefulSmartContract found"
+                f"no class extending SmartContract, StatefulSmartContract, "
+                f"or UnsafeSmartContract found"
             )
 
         self.expect(TOK_LBRACE)
@@ -564,6 +607,12 @@ class _TsParser:
         """Parse a property or method from inside a class body."""
         location = self.loc()
 
+        # Issue #109/#123: comment directives (``/** @embedAlways */`` /
+        # ``/** @sighash <FLAGS> */``) sit in the leading trivia of the member's
+        # first token, captured by the tokenizer. Grab it before consuming
+        # modifiers (which is where the trivia attaches).
+        leading = self.peek().leading_comments
+
         # Collect modifiers: public, private, readonly
         visibility = "private"
         is_readonly = False
@@ -600,7 +649,11 @@ class _TsParser:
 
         # Method: name(...)
         if self.check(TOK_LPAREN):
-            return self._parse_method(member_name, visibility, location)
+            return self._parse_method(member_name, visibility, location, leading)
+
+        # Issue #109: `/** @embedAlways */` (or `// @embedAlways`) directive
+        # immediately preceding the field opts it out of DCE elimination.
+        embed_always = _EMBED_ALWAYS_RE.search(leading) is not None
 
         # Property: name: Type (possibly with ; at end)
         if self.check(TOK_COLON):
@@ -620,6 +673,7 @@ class _TsParser:
                 type=type_node,
                 readonly=is_readonly,
                 initializer=initializer,
+                embed_always=embed_always,
                 source_location=location,
             )
 
@@ -633,6 +687,7 @@ class _TsParser:
                 name=member_name,
                 type=CustomType(name="unknown"),
                 readonly=is_readonly,
+                embed_always=embed_always,
                 source_location=location,
             )
 
@@ -684,7 +739,8 @@ class _TsParser:
     # -- Methods -------------------------------------------------------------
 
     def _parse_method(
-        self, name: str, visibility: str, location: SourceLocation
+        self, name: str, visibility: str, location: SourceLocation,
+        leading: str = "",
     ) -> MethodNode:
         params = self._parse_params()
 
@@ -695,13 +751,46 @@ class _TsParser:
 
         body = self._parse_block()
 
+        # Issue #123: `/** @sighash <FLAGS> */` (or `// @sighash ...`) directive
+        # in the method's leading trivia → per-method BIP-143 sighash type.
+        sighash_type = self._parse_sighash_directive(leading, name, visibility)
+
         return MethodNode(
             name=name,
             params=params,
             body=body,
             visibility=visibility,
+            sighash_type=sighash_type,
             source_location=location,
         )
+
+    def _parse_sighash_directive(
+        self, leading: str, name: str, visibility: str,
+    ) -> int | None:
+        """Detect + parse a ``@sighash`` directive on a method (issue #123).
+
+        Returns the numeric BIP-143 sighash type, or ``None`` when no directive
+        is present. Pushes an error for a malformed flag list or a directive on
+        a non-public method (only public methods are spending entry points, so a
+        ``@sighash`` on a private helper is meaningless).
+        """
+        if not _SIGHASH_TOKEN_RE.search(leading):
+            return None
+
+        if visibility != "public":
+            self.add_error(
+                f"@sighash directive on non-public method '{name}' has no effect "
+                f"— only public methods are spending entry points"
+            )
+            return None
+
+        result = extract_sighash_directive(leading)
+        if result is None:
+            return None
+        if result.error is not None:
+            self.add_error(f"Method '{name}': {result.error}")
+            return None
+        return result.value
 
     # -- Parameters ----------------------------------------------------------
 
@@ -1279,6 +1368,16 @@ class _TsParser:
             if name == "super":
                 return Identifier(name="super")
 
+            # asm({ body, in_arity?, out_arity? }) compiler intrinsic.
+            # Normalise into a CallExpr with three positional args so
+            # downstream passes only have to walk a CallExpr. Both the hex
+            # body and array body forms are accepted; the optional generic
+            # type argument asm<T>(...) flags the expression form.
+            if name == "asm" and (
+                self.check(TOK_LPAREN) or self.check(TOK_LT)
+            ):
+                return self._parse_asm_call()
+
             # Function call: name(...)
             if self.check(TOK_LPAREN):
                 args = self._parse_call_args()
@@ -1310,7 +1409,254 @@ class _TsParser:
             if not self.match(TOK_COMMA):
                 break
         self.expect(TOK_RBRACKET)
-        return CallExpr(callee=Identifier(name="FixedArray"), args=elements)
+        return ArrayLiteralExpr(elements=elements)
+
+    # -- asm() compiler intrinsic -------------------------------------------
+
+    def _parse_asm_call(self) -> Expression:
+        """Decode an ``asm({ body, in_arity?, out_arity? })`` call into a
+        CallExpr whose positional args are
+        ``[ByteStringLiteral(body), BigIntLiteral(in_arity), BigIntLiteral(out_arity)]``.
+
+        Two surface body shapes are accepted:
+          - Hex string literal:  ``body: '76a90088ac'``
+          - Array of opcode names / push() calls:
+            ``body: [OP_DUP, OP_HASH160, push('1234abcd'), OP_EQUALVERIFY]``
+
+        The optional generic type argument ``asm<T>({...})`` marks the
+        expression form; the captured T is stashed on
+        ``CallExpr.asm_return_type``. On malformed input we still return a
+        syntactically valid CallExpr so later passes can produce additional
+        diagnostics without crashing.
+        """
+        callee = Identifier(name="asm")
+
+        # Capture the generic type argument asm<T>({...}) if present, BEFORE
+        # arg-shape diagnostics so the expression form still records its
+        # return type even when other args are malformed.
+        asm_return_type = ""
+        if self.match(TOK_LT):
+            type_tok = self.expect(TOK_IDENT)
+            text = type_tok.value
+            if text in ("bigint", "boolean", "ByteString"):
+                asm_return_type = text
+            else:
+                self.add_error(
+                    f"asm<T>() return type must be 'bigint', 'boolean', or "
+                    f"'ByteString'; got {text!r}"
+                )
+            self.expect(TOK_GT)
+
+        self.expect(TOK_LPAREN)
+
+        body_expr: Expression | None = None
+        in_arity_expr: Expression | None = None
+        out_arity_expr: Expression | None = None
+
+        if not self.check(TOK_LBRACE):
+            tok = self.peek()
+            self.add_error(
+                "asm() argument must be an object literal "
+                "{ body: '<hex>', in_arity?: <int>, out_arity?: <int> }, "
+                f"got {tok.value!r}"
+            )
+            # Best-effort: consume to the closing paren.
+            while not self.check(TOK_RPAREN) and not self.check(TOK_EOF):
+                self.advance()
+            self.match(TOK_RPAREN)
+            return CallExpr(callee=callee, args=[], asm_return_type=asm_return_type)
+
+        self.expect(TOK_LBRACE)
+        while not self.check(TOK_RBRACE) and not self.check(TOK_EOF):
+            key_tok = self.expect(TOK_IDENT)
+            key = key_tok.value
+            self.expect(TOK_COLON)
+
+            if key == "body":
+                if self.check(TOK_STRING):
+                    str_tok = self.advance()
+                    body_expr = ByteStringLiteral(value=str_tok.value)
+                elif self.check(TOK_LBRACKET):
+                    body_expr = ByteStringLiteral(value=self._encode_asm_array_body())
+                else:
+                    tok = self.peek()
+                    self.add_error(
+                        "asm() body must be a hex string literal or an array "
+                        "of opcode names / push() calls; got "
+                        f"{tok.value!r}."
+                    )
+                    body_expr = ByteStringLiteral(value="")
+                    # skip the offending value token
+                    if not self.check(TOK_COMMA) and not self.check(TOK_RBRACE):
+                        self.advance()
+            elif key == "in_arity":
+                in_arity_expr = self._parse_asm_arity_literal("in_arity")
+            elif key == "out_arity":
+                out_arity_expr = self._parse_asm_arity_literal("out_arity")
+            else:
+                self.add_error(
+                    f"asm() does not accept the {key!r} field; valid fields "
+                    "are 'body', 'in_arity', 'out_arity'."
+                )
+                if not self.check(TOK_COMMA) and not self.check(TOK_RBRACE):
+                    self.advance()
+
+            if not self.match(TOK_COMMA):
+                break
+
+        self.expect(TOK_RBRACE)
+        self.expect(TOK_RPAREN)
+
+        if body_expr is None:
+            self.add_error(
+                "asm() requires a 'body' field with a hex string literal value"
+            )
+            body_expr = ByteStringLiteral(value="")
+        # Defaults: in_arity=0, out_arity=1. The out_arity=1 default reflects
+        # the public-method-must-terminate-truthy invariant.
+        if in_arity_expr is None:
+            in_arity_expr = BigIntLiteral(value=0)
+        if out_arity_expr is None:
+            out_arity_expr = BigIntLiteral(value=1)
+
+        return CallExpr(
+            callee=callee,
+            args=[body_expr, in_arity_expr, out_arity_expr],
+            asm_return_type=asm_return_type,
+        )
+
+    def _parse_asm_arity_literal(self, field_name: str) -> Expression:
+        """Parse a non-negative integer literal arity field for asm()."""
+        if self.check(TOK_NUMBER):
+            num_tok = self.advance()
+            try:
+                val = int(num_tok.value, 0)
+            except ValueError:
+                val = -1
+            if val < 0:
+                self.add_error(
+                    f"asm() {field_name} must be a non-negative integer "
+                    f"literal, got {num_tok.value!r}"
+                )
+                return BigIntLiteral(value=0)
+            return BigIntLiteral(value=val)
+        tok = self.peek()
+        self.add_error(
+            f"asm() {field_name} must be a non-negative integer literal, "
+            f"got {tok.value!r}"
+        )
+        if not self.check(TOK_COMMA) and not self.check(TOK_RBRACE):
+            self.advance()
+        return BigIntLiteral(value=0)
+
+    def _encode_asm_array_body(self) -> str:
+        """Encode an ``asm({ body: [OP_DUP, push(0x42), ...] })`` array literal
+        to its hex byte representation. Uses the same push-encoding helpers as
+        the emit pass so the bytes are byte-identical to what the emitter
+        would produce for the equivalent literal.
+        """
+        from runar_compiler.codegen.emit import (
+            OPCODES,
+            encode_push_big_int,
+            encode_push_data,
+        )
+
+        hex_str = ""
+        self.expect(TOK_LBRACKET)
+        while not self.check(TOK_RBRACKET) and not self.check(TOK_EOF):
+            if self.check(TOK_IDENT):
+                name = self.advance().value
+                # push(<literal>) call.
+                if name == "push" and self.check(TOK_LPAREN):
+                    self.expect(TOK_LPAREN)
+                    pushed = self._encode_asm_push_literal(
+                        OPCODES, encode_push_big_int, encode_push_data
+                    )
+                    self.expect(TOK_RPAREN)
+                    hex_str += pushed
+                else:
+                    b = OPCODES.get(name)
+                    if b is None:
+                        self.add_error(
+                            f"Unknown opcode {name!r} in asm() body array. "
+                            "Expected an OP_* identifier (e.g. OP_DUP, "
+                            "OP_HASH160) or a push(...) call."
+                        )
+                    else:
+                        hex_str += f"{b:02x}"
+            else:
+                tok = self.peek()
+                self.add_error(
+                    "asm() body array element must be an opcode identifier "
+                    "(e.g. OP_DUP) or a push(<literal>) call; got "
+                    f"{tok.value!r}"
+                )
+                self.advance()
+
+            if not self.match(TOK_COMMA):
+                break
+        self.expect(TOK_RBRACKET)
+        return hex_str
+
+    def _encode_asm_push_literal(
+        self, opcodes, encode_push_big_int, encode_push_data
+    ) -> str:
+        """Encode a literal argument passed to ``push(...)`` inside an asm()
+        body array. Returns the encoded hex string ('' on error).
+        """
+        tok = self.peek()
+        # Negative number: -<number>
+        if self.check(TOK_MINUS):
+            self.advance()
+            if self.check(TOK_NUMBER):
+                num_tok = self.advance()
+                try:
+                    val = -int(num_tok.value, 0)
+                except ValueError:
+                    self.add_error(
+                        "push() argument is not a valid integer literal: "
+                        f"{num_tok.value!r}"
+                    )
+                    return ""
+                h, _ = encode_push_big_int(val)
+                return h
+            self.add_error(
+                "push() argument must be a literal value (bigint, number, "
+                "boolean, or hex string), got prefix expression"
+            )
+            return ""
+        if self.check(TOK_NUMBER):
+            num_tok = self.advance()
+            try:
+                val = int(num_tok.value, 0)
+            except ValueError:
+                self.add_error(
+                    "push() argument is not a valid integer literal: "
+                    f"{num_tok.value!r}"
+                )
+                return ""
+            h, _ = encode_push_big_int(val)
+            return h
+        if self.check(TOK_IDENT) and tok.value in ("true", "false"):
+            self.advance()
+            return "51" if tok.value == "true" else "00"
+        if self.check(TOK_STRING):
+            str_tok = self.advance()
+            raw = str_tok.value
+            import re as _re
+            if len(raw) % 2 != 0 or not _re.fullmatch(r"[0-9a-fA-F]*", raw):
+                self.add_error(
+                    f"push() ByteString argument must be even-length hex "
+                    f"(got {raw!r})"
+                )
+                return ""
+            return encode_push_data(bytes.fromhex(raw)).hex()
+        self.add_error(
+            "push() argument must be a literal value (bigint, number, "
+            f"boolean, or hex string), got {tok.value!r}"
+        )
+        self.advance()
+        return ""
 
 
 def _parse_number(s: str) -> Expression:
@@ -1318,9 +1664,11 @@ def _parse_number(s: str) -> Expression:
         val = int(s, 0)
     except ValueError:
         val = 0
-    # Check int64 overflow
-    if val > 9223372036854775807 or val < -9223372036854775808:
-        return BigIntLiteral(value=0)
+    # Python ints are arbitrary-precision; Runar's BigIntLiteral carries the
+    # full Python int so 256-bit constants (e.g. the secp256k1 group order
+    # used in schnorr-zkp's s-bound assert) round-trip cleanly through
+    # codegen. Downstream consumers (load_const serializer) handle the
+    # arbitrary-precision case via decimal-string encoding.
     return BigIntLiteral(value=val)
 
 

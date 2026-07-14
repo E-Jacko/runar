@@ -656,3 +656,98 @@ class TestRefAliases:
         r = fold_constants(p)
         # x is a @ref: alias, not a real constant, so t2 should not be folded
         _assert_not_folded(r.methods[0].body[3].value, "bin_op")
+
+
+# ---------------------------------------------------------------------------
+# 14. Large integer division (float precision regression tests)
+# ---------------------------------------------------------------------------
+
+class TestLargeIntegerPrecision:
+    def test_fold_large_integer_division_no_precision_loss(self):
+        """Verify no precision loss for integers > 2^53 (float64 mantissa limit)."""
+        # 2^60 + 1 = 1152921504606846977
+        # Correct: 1152921504606846977 // 3 = 384307168202282325
+        # Broken float: int((2**60+1) / 3) = 384307168202282368
+        a = 2**60 + 1
+        b = 3
+        expected = 384307168202282325
+        prog = _make_program([_make_method("m", [
+            _b("t0", _mk_int(a)),
+            _b("t1", _mk_int(b)),
+            _b("t2", _bin_op("/", "t0", "t1")),
+        ])])
+        result = fold_constants(prog)
+        _assert_load_const_int(result.methods[0].body[2].value, expected)
+
+    def test_fold_large_negative_division_no_precision_loss(self):
+        """Large negative division must not lose precision."""
+        a = -(2**60 + 1)
+        b = 3
+        expected = -384307168202282325
+        prog = _make_program([_make_method("m", [
+            _b("t0", _mk_int(a)),
+            _b("t1", _mk_int(b)),
+            _b("t2", _bin_op("/", "t0", "t1")),
+        ])])
+        result = fold_constants(prog)
+        _assert_load_const_int(result.methods[0].body[2].value, expected)
+
+    def test_fold_large_modulo_no_precision_loss(self):
+        """Modulo with large values must use integer arithmetic."""
+        a = 2**60 + 1
+        b = 3
+        # 1152921504606846977 % 3 = 1152921504606846977 - 384307168202282325 * 3 = 2
+        expected = 2
+        prog = _make_program([_make_method("m", [
+            _b("t0", _mk_int(a)),
+            _b("t1", _mk_int(b)),
+            _b("t2", _bin_op("%", "t0", "t1")),
+        ])])
+        result = fold_constants(prog)
+        _assert_load_const_int(result.methods[0].body[2].value, expected)
+
+    def test_fold_safediv_large_no_precision_loss(self):
+        """safediv with large values must not lose precision."""
+        a = 2**60 + 1
+        b = 3
+        expected = 384307168202282325
+        prog = _make_program([_make_method("m", [
+            _b("t0", _mk_int(a)),
+            _b("t1", _mk_int(b)),
+            _b("t2", _call_func("safediv", ["t0", "t1"])),
+        ])])
+        result = fold_constants(prog)
+        _assert_load_const_int(result.methods[0].body[2].value, expected)
+
+    def test_fold_divmod_large_no_precision_loss(self):
+        """divmod with large values must not lose precision."""
+        a = 2**60 + 1
+        b = 3
+        expected = 384307168202282325
+        prog = _make_program([_make_method("m", [
+            _b("t0", _mk_int(a)),
+            _b("t1", _mk_int(b)),
+            _b("t2", _call_func("divmod", ["t0", "t1"])),
+        ])])
+        result = fold_constants(prog)
+        _assert_load_const_int(result.methods[0].body[2].value, expected)
+
+    def test_fold_division_truncates_toward_zero(self):
+        """Verify -7/2 = -3 (truncate toward zero), not -4 (Python floor division)."""
+        prog = _make_program([_make_method("m", [
+            _b("t0", _mk_int(-7)),
+            _b("t1", _mk_int(2)),
+            _b("t2", _bin_op("/", "t0", "t1")),
+        ])])
+        result = fold_constants(prog)
+        _assert_load_const_int(result.methods[0].body[2].value, -3)
+
+    def test_fold_modulo_negative_dividend(self):
+        """Verify -7 % 2 = -1 (sign follows dividend), not 1 (Python floor mod)."""
+        prog = _make_program([_make_method("m", [
+            _b("t0", _mk_int(-7)),
+            _b("t1", _mk_int(2)),
+            _b("t2", _bin_op("%", "t0", "t1")),
+        ])])
+        result = fold_constants(prog)
+        _assert_load_const_int(result.methods[0].body[2].value, -1)

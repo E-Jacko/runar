@@ -363,6 +363,9 @@ function mapBuiltinName(name: string): string {
     'verify_slh_dsa_sha2_256s': 'verifySLHDSA_SHA2_256s',
     'verify_slh_dsa_sha2_256f': 'verifySLHDSA_SHA2_256f',
     'verify_rabin_sig': 'verifyRabinSig',
+    // NIST EC curves -- snake_case forms used in Ruby contracts.
+    'verify_ecdsa_p256': 'verifyECDSA_P256',
+    'verify_ecdsa_p384': 'verifyECDSA_P384',
     'check_sig': 'checkSig',
     'check_multi_sig': 'checkMultiSig',
     'check_preimage': 'checkPreimage',
@@ -387,6 +390,12 @@ function mapBuiltinName(name: string): string {
     'ec_make_point': 'ecMakePoint',
     'ec_point_x': 'ecPointX',
     'ec_point_y': 'ecPointY',
+    'bb_field_add': 'bbFieldAdd',
+    'bb_field_sub': 'bbFieldSub',
+    'bb_field_mul': 'bbFieldMul',
+    'bb_field_inv': 'bbFieldInv',
+    'merkle_root_sha256': 'merkleRootSha256',
+    'merkle_root_hash256': 'merkleRootHash256',
     'mul_div': 'mulDiv',
     'percent_of': 'percentOf',
     'safe_div': 'safediv',
@@ -394,6 +403,7 @@ function mapBuiltinName(name: string): string {
     'div_mod': 'divmod',
     'add_output': 'addOutput',
     'add_raw_output': 'addRawOutput',
+    'add_data_output': 'addDataOutput',
     'get_state_script': 'getStateScript',
     // SHA-256 partial verification
     'sha256_compress': 'sha256Compress',
@@ -432,12 +442,14 @@ function mapBuiltinName(name: string): string {
 function mapRbType(name: string): string {
   switch (name) {
     case 'Bigint': case 'Integer': case 'Int': return 'bigint';
-    case 'Boolean': return 'boolean';
+    case 'Boolean': case 'Bool': return 'boolean';
     case 'ByteString': return 'ByteString';
     case 'PubKey': return 'PubKey';
     case 'Sig': return 'Sig';
     case 'Addr': return 'Addr';
-    case 'Sha256': return 'Sha256';
+    case 'Sha256':
+    case 'Sha256Digest':
+      return 'Sha256';
     case 'Ripemd160': return 'Ripemd160';
     case 'SigHashPreimage': return 'SigHashPreimage';
     case 'RabinSig': return 'RabinSig';
@@ -449,7 +461,8 @@ function mapRbType(name: string): string {
 
 const PRIMITIVE_TYPES = new Set<string>([
   'bigint', 'boolean', 'ByteString', 'PubKey', 'Sig', 'Sha256',
-  'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point', 'void',
+  'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point',
+  'P256Point', 'P384Point', 'void',
 ]);
 
 function makePrimitiveOrCustom(name: string): TypeNode {
@@ -653,7 +666,11 @@ class RbParser {
 
     this.skipNewlines();
 
-    if (parentClass !== 'SmartContract' && parentClass !== 'StatefulSmartContract') {
+    if (
+      parentClass !== 'SmartContract' &&
+      parentClass !== 'StatefulSmartContract' &&
+      parentClass !== 'UnsafeSmartContract'
+    ) {
       this.errors.push(makeDiagnostic(
         `Unknown parent class: ${parentClass}`,
         'error',
@@ -743,7 +760,7 @@ class RbParser {
     // Convert bare calls to declared methods and intrinsics into this.method() calls.
     // In Ruby, bare calls like `add_output(...)` are equivalent to
     // `self.add_output(...)` / `this.addOutput(...)`.
-    const intrinsicMethods = ['addOutput', 'addRawOutput', 'getStateScript'];
+    const intrinsicMethods = ['addOutput', 'addRawOutput', 'addDataOutput', 'getStateScript'];
     const methodNames = new Set([...methods.map(m => m.name), ...intrinsicMethods]);
     for (const method of methods) {
       rewriteBareMethodCalls(method.body, methodNames);
@@ -775,7 +792,7 @@ class RbParser {
     return {
       kind: 'contract',
       name: contractName,
-      parentClass: parentClass as 'SmartContract' | 'StatefulSmartContract',
+      parentClass: parentClass as 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract',
       properties,
       constructor,
       methods,
@@ -864,8 +881,9 @@ class RbParser {
       }
     }
 
-    // In stateless contracts, all properties are readonly
-    if (parentClass === 'SmartContract') {
+    // In stateless contracts (SmartContract and UnsafeSmartContract),
+    // all properties are always readonly.
+    if (parentClass === 'SmartContract' || parentClass === 'UnsafeSmartContract') {
       isReadonly = true;
     }
 
@@ -1116,17 +1134,29 @@ class RbParser {
     this.match('NEWLINE');
     this.skipNewlines();
 
+    // Variables declared inside an if/elsif/else branch are scoped to that
+    // branch in the typechecker (see 03-typecheck.ts case 'if_statement'
+    // which pushScope/popScope around each branch). The parser must mirror
+    // that scoping so a `name = expr` reappearing in a sibling branch is
+    // emitted as a fresh `variable_decl`, not an `assignment` against an
+    // out-of-scope local. Without this, sibling branches that re-declare
+    // the same local trigger spurious "Undefined variable" errors in the
+    // typechecker. Mirrors the canonical TS lexical-scope semantics.
+    const localsBeforeThen = new Set(this.declaredLocals);
     const thenBranch = this.parseStatements();
+    this.declaredLocals = new Set(localsBeforeThen);
 
     let elseBranch: Statement[] | undefined;
 
     if (this.peek().type === 'elsif') {
       const elifLoc = this.loc();
       elseBranch = [this.parseElsifStatement(elifLoc)];
+      this.declaredLocals = new Set(localsBeforeThen);
     } else if (this.peek().type === 'else') {
       this.advance(); // 'else'
       this.skipNewlines();
       elseBranch = this.parseStatements();
+      this.declaredLocals = new Set(localsBeforeThen);
     }
 
     this.expect('end');
@@ -1145,17 +1175,23 @@ class RbParser {
     const condition = this.parseExpression();
     this.skipNewlines();
 
+    // See parseIfStatement comment: snapshot/restore declaredLocals around
+    // each branch so the typechecker's per-branch lexical scoping matches.
+    const localsBeforeThen = new Set(this.declaredLocals);
     const thenBranch = this.parseStatements();
+    this.declaredLocals = new Set(localsBeforeThen);
 
     let elseBranch: Statement[] | undefined;
 
     if (this.peek().type === 'elsif') {
       const elifLoc = this.loc();
       elseBranch = [this.parseElsifStatement(elifLoc)];
+      this.declaredLocals = new Set(localsBeforeThen);
     } else if (this.peek().type === 'else') {
       this.advance(); // 'else'
       this.skipNewlines();
       elseBranch = this.parseStatements();
+      this.declaredLocals = new Set(localsBeforeThen);
     }
 
     // Note: the outer `end` is consumed by the parent parseIfStatement
@@ -1175,7 +1211,11 @@ class RbParser {
     const rawCondition = this.parseExpression();
     this.skipNewlines();
 
+    // See parseIfStatement comment: snapshot/restore declaredLocals around
+    // the body so locals declared inside `unless` don't leak into siblings.
+    const localsBeforeBody = new Set(this.declaredLocals);
     const body = this.parseStatements();
+    this.declaredLocals = new Set(localsBeforeBody);
 
     this.expect('end');
 
@@ -1223,7 +1263,15 @@ class RbParser {
     this.match('do');
     this.skipNewlines();
 
+    // Snapshot/restore declaredLocals around the loop body so locals
+    // declared inside the loop don't leak into the surrounding scope —
+    // matches how the typechecker treats the loop body.
+    const localsBeforeBody = new Set(this.declaredLocals);
+    // Pre-declare the iter var so the body parser sees `varName = ...`
+    // as an assignment rather than re-declaration.
+    this.declaredLocals.add(varName);
     const body = this.parseStatements();
+    this.declaredLocals = new Set(localsBeforeBody);
     this.expect('end');
 
     // Construct a C-style for loop AST node
@@ -1291,13 +1339,30 @@ class RbParser {
   }
 
   private parseIvarStatement(loc: SourceLocation): Statement {
-    // @var = expr or @var += expr or @var as expression
+    // @var = expr | @var += expr | @var[idx] = expr | @var.field = expr | @var as expression
     const ivarTok = this.advance(); // ivar token
     const rawName = ivarTok.value;
     const propName = snakeToCamel(rawName);
-    const target: Expression = { kind: 'property_access', property: propName };
+    let target: Expression = { kind: 'property_access', property: propName };
 
-    // Simple assignment: @var = expr
+    // Consume any postfix chain that can appear on the LHS of an
+    // assignment (index access, member access). We stop on `(` / method
+    // calls because a call cannot be an assignment target.
+    while (this.peek().type === '[' || this.peek().type === '.') {
+      if (this.peek().type === '[') {
+        this.advance();
+        const index = this.parseExpression();
+        this.expect(']');
+        target = { kind: 'index_access', object: target, index };
+      } else {
+        this.advance(); // .
+        const name = this.expect('ident').value;
+        const camel = snakeToCamel(name);
+        target = { kind: 'property_access', object: target, property: camel } as Expression;
+      }
+    }
+
+    // Simple assignment: @var = expr  |  @var[i] = expr  |  @var.field = expr
     if (this.match('=')) {
       const value = this.parseExpression();
       return { kind: 'assignment', target, value, sourceLocation: loc };
@@ -1318,8 +1383,8 @@ class RbParser {
     }
 
     // Expression statement (rare: just @var on its own line, or @var.method(...))
-    // Re-parse from ivar as an expression — but we already consumed the ivar token,
-    // so build the expression and parse any postfix operations
+    // Continue parsing any remaining postfix operations (e.g. method calls)
+    // that are not valid on the LHS of an assignment.
     let expr: Expression = target;
     expr = this.parsePostfixFrom(expr);
 

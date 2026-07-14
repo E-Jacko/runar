@@ -3,12 +3,18 @@
 //! P2PKH locks funds to a public key hash. Spending requires a valid
 //! signature and the matching public key. The SDK auto-computes Sig params
 //! when SdkValue::Auto is passed.
+//!
+//! **Gating**: all on-chain tests are gated with
+//! `#[cfg_attr(not(feature = "regtest"), ignore)]`. They require a local Bitcoin
+//! regtest node (see `integration/rust/README.md`). Run with:
+//!     cargo test --features regtest
+//! Tests without the gate (pure compile/script-size checks) run by default.
 
 use crate::helpers::*;
 use runar_lang::sdk::{DeployOptions, RunarContract, SdkValue};
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_p2pkh_compile_and_deploy() {
     skip_if_no_node();
 
@@ -25,6 +31,7 @@ fn test_p2pkh_compile_and_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -32,7 +39,7 @@ fn test_p2pkh_compile_and_deploy() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_p2pkh_deploy_and_spend() {
     skip_if_no_node();
 
@@ -50,6 +57,7 @@ fn test_p2pkh_deploy_and_spend() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -68,7 +76,7 @@ fn test_p2pkh_deploy_and_spend() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_p2pkh_deploy_different_pubkeyhash() {
     skip_if_no_node();
 
@@ -88,13 +96,14 @@ fn test_p2pkh_deploy_different_pubkeyhash() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_p2pkh_wrong_signer_rejected() {
     skip_if_no_node();
 
@@ -113,6 +122,7 @@ fn test_p2pkh_wrong_signer_rejected() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

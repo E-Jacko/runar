@@ -3,6 +3,7 @@
 // runar-cli/bin.ts — CLI entry point
 // ---------------------------------------------------------------------------
 
+import { createRequire } from 'node:module';
 import { program } from 'commander';
 import { initCommand } from './commands/init.js';
 import { compileCommand } from './commands/compile.js';
@@ -11,27 +12,41 @@ import { deployCommand } from './commands/deploy.js';
 import { verifyCommand } from './commands/verify.js';
 import { codegenCommand } from './commands/codegen.js';
 import { debugCommand } from './commands/debug.js';
+import { analyzeCommand } from './commands/analyze.js';
+import { decompileCommand } from './commands/decompile.js';
+
+// Read the published version from package.json so `runar --version` never drifts
+// from the shipped artifact. `../package.json` resolves identically whether this
+// module runs from src/ (tsx) or dist/ (built): both sit one level under the
+// package root.
+const { version } = createRequire(import.meta.url)('../package.json') as {
+  version: string;
+};
 
 program
   .name('runar')
   .description('Rúnar: TypeScript-to-Bitcoin Script compiler')
-  .version('0.1.0');
+  .version(version);
 
 program
   .command('init')
   .description('Initialize a new Rúnar project')
   .argument('[name]', 'project name')
-  .option('-l, --lang <lang>', 'project language (ts, zig)', 'ts')
+  .option('-l, --lang <lang>', 'project language (ts, zig, go, rust, python, ruby)', 'ts')
   .action(initCommand);
 
 program
   .command('compile')
   .description('Compile Rúnar contracts')
-  .argument('<files...>', 'contract files to compile')
+  .argument('[files...]', 'contract files to compile (omit when --from-ir is used)')
   .option('-o, --output <dir>', 'output directory', './artifacts')
   .option('--ir', 'include IR in artifact')
   .option('--asm', 'print ASM to stdout')
   .option('--disable-constant-folding', 'disable ANF constant folding pass')
+  .option('--from-ir <path>', 'compile from an ANF IR JSON file (skips parse/validate/typecheck/anf-lower)')
+  .option('--hex', 'print only the script hex to stdout (no artifact JSON)')
+  .option('--parse-only', 'stop after parse + validate; print "parser ok" on success (requires source input)')
+  .option('--emit-source-map <path>', 'after a successful compile, write artifact.sourceMap JSON to <path>')
   .action(compileCommand);
 
 program
@@ -74,5 +89,23 @@ program
   .option('-u, --unlock <hex>', 'raw unlocking script hex (alternative to --method)')
   .option('-b, --break <loc>', 'initial breakpoint (opcode# or file:line)')
   .action(debugCommand);
+
+program
+  .command('analyze')
+  .description('Analyze compiled Bitcoin Script for potential issues')
+  .argument('<input>', 'hex script, .hex file, or artifact JSON')
+  .option('--json', 'output findings as JSON')
+  .option('--verbose', 'include detailed path analysis')
+  .option('--severity <level>', 'minimum severity to report (error, warning, info)', 'info')
+  .action(analyzeCommand);
+
+program
+  .command('decompile')
+  .description('Recover Rúnar TypeScript source from a Bitcoin Script byte stream')
+  .argument('<input>', 'hex script, .hex file, artifact JSON, or "-" for stdin')
+  .option('-o, --out-file <path>', 'write recovered source to file (default: stdout)')
+  .option('-q, --quiet', 'suppress the round-trip status message on stderr')
+  .option('--raw', 'force the raw_script path: skip templates, wrap the entire input in an asm({...}) call. Honest output for arbitrary byte streams, byte-identical round-trip.')
+  .action(decompileCommand);
 
 program.parse();

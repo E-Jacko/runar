@@ -16,8 +16,14 @@ const crypto_builtins = @import("helpers/crypto_builtins.zig");
 const crypto_emitters = @import("helpers/crypto_emitters.zig");
 const blake3_emitters = @import("helpers/blake3_emitters.zig");
 const ec_emitters = @import("helpers/ec_emitters.zig");
+const nist_ec_emitters = @import("helpers/nist_ec_emitters.zig");
 const pq_emitters = @import("helpers/pq_emitters.zig");
 const sha256_emitters = @import("helpers/sha256_emitters.zig");
+const babybear_emitters = @import("helpers/babybear_emitters.zig");
+const koalabear_emitters = @import("helpers/koalabear_emitters.zig");
+const bn254_emitters = @import("helpers/bn254_emitters.zig");
+const poseidon2_merkle = @import("helpers/poseidon2_merkle.zig");
+const merkle_emitters = @import("helpers/merkle_emitters.zig");
 const Allocator = std.mem.Allocator;
 const Opcode = types.Opcode;
 
@@ -124,6 +130,18 @@ pub const StackMap = struct {
         return set;
     }
 
+    /// Debug string of the slot names (bottom -> top) for error messages.
+    /// Mirrors the TS reference compiler's `StackMap.debugSlots`.
+    pub fn debugSlots(self: *const StackMap, allocator: Allocator) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        for (self.slots.items, 0..) |slot, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            try buf.appendSlice(allocator, slot orelse "<null>");
+        }
+        return buf.toOwnedSlice(allocator);
+    }
+
     pub fn deinit(self: *StackMap, allocator: Allocator) void {
         self.slots.deinit(allocator);
         self.name_index.deinit(allocator);
@@ -140,6 +158,18 @@ const LowerError = error{
     InvalidBuiltin,
     UnsupportedOperation,
     BranchStackMismatch,
+    /// A ref (method param or @ref: value) is no longer on the stack at a
+    /// point that needs it — a compiler invariant violation historically
+    /// caused by unrolled loops consuming outer-scope refs (see lowerForLoop).
+    /// Emitting a silent OP_0 here produced scripts that compiled, passed the
+    /// env-based interpreter, and then failed on chain — so we fail loudly.
+    SilentOpZeroRefused,
+    /// #119 tail (H1): a `load_prop` for a property that is neither on the
+    /// stack, initialized, nor a constructor parameter has no deploy-time slot
+    /// of its own. Coercing it onto slot 0 silently splices an UNRELATED
+    /// constructor argument's placeholder into the locking script, so we fail
+    /// loudly instead.
+    LoadPropNoConstructorSlot,
 };
 
 const LowerCtx = struct {
@@ -152,13 +182,32 @@ const LowerCtx = struct {
     last_uses: std.StringHashMapUnmanaged(usize),
     local_bindings: std.StringHashMapUnmanaged(void),
     force_copy_bindings: std.StringHashMapUnmanaged(void),
+    /// Tracks the number of elements in array literal bindings so that
+    /// consumers like checkMultiSig can emit the count push. Mirrors TS
+    /// `arrayLengths` in `05-stack-lower.ts`.
+    array_lengths: std.StringHashMapUnmanaged(usize),
+    /// Tracks the element refs of array literal bindings so that consumers
+    /// like checkMultiSig can bring each element to TOS at the use site.
+    /// Mirrors TS `arrayElements` in `05-stack-lower.ts`.
+    array_elements: std.StringHashMapUnmanaged([]const []const u8),
     owned_push_data: std.ArrayListUnmanaged([]u8),
     scope_bindings: []const types.ANFBinding,
     copy_ref_aliases: bool,
     current_idx: usize,
     in_branch: bool,
+    /// Refs from the enclosing scope that must not be consumed inside branches
+    /// (used by lowerIfExpr to protect outer values). Mirrors TS
+    /// `outerProtectedRefs` — a pointer so it can be shared without copying.
+    outer_protected_refs: ?*const std.StringHashMapUnmanaged(void) = null,
     updated_props: std.StringHashMapUnmanaged(void),
     max_depth: u32,
+    /// Method params whose names collide with a MUTABLE property, mapped to the
+    /// reserved stack-slot name their witness value lives under (issue #130).
+    /// deserialize_state pushes each mutable property onto the stack under its
+    /// own name, so a same-named param slot would otherwise be shadowed and
+    /// lowerLoadParam would read the stale deserialized state. Empty for the
+    /// common no-collision case (byte-identical output).
+    renamed_params: std.StringHashMapUnmanaged([]const u8),
     /// Current ANF binding's source location — set before processing each binding.
     current_source_loc: ?types.SourceLocation = null,
 
@@ -172,6 +221,8 @@ const LowerCtx = struct {
             .last_uses = .empty,
             .local_bindings = .empty,
             .force_copy_bindings = .empty,
+            .array_lengths = .empty,
+            .array_elements = .empty,
             .owned_push_data = .empty,
             .scope_bindings = &.{},
             .copy_ref_aliases = false,
@@ -179,6 +230,7 @@ const LowerCtx = struct {
             .in_branch = false,
             .updated_props = .empty,
             .max_depth = 0,
+            .renamed_params = .empty,
         };
     }
 
@@ -189,9 +241,18 @@ const LowerCtx = struct {
         self.last_uses.deinit(self.allocator);
         self.local_bindings.deinit(self.allocator);
         self.force_copy_bindings.deinit(self.allocator);
+        self.array_lengths.deinit(self.allocator);
+        // Free the element slice arrays (the inner []const u8 strings are
+        // owned by the ANF program, not by us).
+        var it_ae = self.array_elements.iterator();
+        while (it_ae.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.array_elements.deinit(self.allocator);
         for (self.owned_push_data.items) |data| self.allocator.free(data);
         self.owned_push_data.deinit(self.allocator);
         self.updated_props.deinit(self.allocator);
+        self.renamed_params.deinit(self.allocator);
     }
 
     fn trackDepth(self: *LowerCtx) void {
@@ -224,6 +285,13 @@ const LowerCtx = struct {
 
     fn emitPushInt(self: *LowerCtx, n: i64) !void {
         try self.emit(.{ .push_int = n });
+    }
+
+    /// Emit a push for a decimal-string-encoded big integer (overflows `i64`).
+    /// The decoder side handles converting the canonical decimal text into
+    /// little-endian sign-magnitude bytes; see `encodeScriptNumberFromDecimal`.
+    fn emitPushBigIntDecimal(self: *LowerCtx, decimal: []const u8) !void {
+        try self.emit(.{ .push_big_int_decimal = decimal });
     }
 
     fn emitPushBool(self: *LowerCtx, b: bool) !void {
@@ -271,7 +339,62 @@ const LowerCtx = struct {
         return dst;
     }
 
+    /// Drop a value from arbitrary stack depth in the bilateral branch
+    /// reconciliation phase of `lowerIf`. Mirrors the TS reference compiler's
+    /// pre-IF reconciliation (`05-stack-lower.ts` ~line 1640), which emits
+    /// `push(depth) + roll(depth=depth) + drop`. TS's peephole folds
+    /// `push(1)+roll(depth=1) → swap` and `push(2)+roll(depth=2) → rot`, so
+    /// the byte output at depth 2 is `rot+drop` (2 bytes) instead of
+    /// `push(2)+roll+drop` (3 bytes). Zig's peephole cannot distinguish
+    /// foldable from non-foldable rolls at the instruction-stream level
+    /// (unlike Go/TS which retain a depth field on typed RollOp), so we
+    /// emit the folded form directly here.
     fn removeBranchValueAtDepth(ctx: *LowerCtx, depth: usize) !void {
+        if (depth == 0) {
+            try ctx.emitOp(.op_drop);
+            _ = ctx.stack.pop();
+            return;
+        }
+
+        if (depth == 1) {
+            // push(1)+roll(1)+drop → swap+drop, and Zig's peephole folds
+            // swap+drop → nip (or directly here).
+            try ctx.emitOp(.op_nip);
+            try ctx.stack.removeAtDepth(ctx.allocator, 1);
+            return;
+        }
+
+        if (depth == 2) {
+            // push(2)+roll(2)+drop → rot+drop (TS peephole fold).
+            try ctx.emitOp(.op_rot);
+            try ctx.stack.removeAtDepth(ctx.allocator, 2);
+            try ctx.stack.push(ctx.allocator, null);
+            try ctx.emitOp(.op_drop);
+            _ = ctx.stack.pop();
+            return;
+        }
+
+        try ctx.emitPushInt(@intCast(depth));
+        try ctx.stack.push(ctx.allocator, null);
+        try ctx.emitOp(.op_roll);
+        _ = ctx.stack.pop();
+        const rolled = ctx.stack.peekAtDepth(depth);
+        try ctx.stack.removeAtDepth(ctx.allocator, depth);
+        try ctx.stack.push(ctx.allocator, rolled);
+        try ctx.emitOp(.op_drop);
+        _ = ctx.stack.pop();
+    }
+
+    /// Drop a stale property entry after an if-else expression that wrote the
+    /// same property in both branches. Mirrors the TS reference compiler's
+    /// `lowerUpdateProp` post-if cleanup (`05-stack-lower.ts` ~line 1909),
+    /// which uses `push d + roll(depth=d+1) + drop`. The push value (`d`) is
+    /// the visible depth from the StackMap, but the runtime roll consumes the
+    /// extra temporary from the push (`d + 1`). The peephole rule
+    /// `push 2n + roll(depth=2) → rot` checks the *IR* depth, not the push
+    /// value, so this case never folds in TS. Keep the literal
+    /// `push d + OP_ROLL + OP_DROP` here for byte equivalence.
+    fn removeStalePropertyAtDepth(ctx: *LowerCtx, depth: usize) !void {
         if (depth == 0) {
             try ctx.emitOp(.op_drop);
             _ = ctx.stack.pop();
@@ -298,6 +421,10 @@ const LowerCtx = struct {
     fn duplicateBranchValueAtDepth(ctx: *LowerCtx, depth: usize, name: ?[]const u8) !void {
         if (depth == 0) {
             try ctx.emitOp(.op_dup);
+        } else if (depth == 1) {
+            // Foldable pick: depth 1 → OP_OVER. Mirrors TS peephole
+            // `push 1n + pick(depth=1) → over`.
+            try ctx.emitOp(.op_over);
         } else {
             try ctx.emitPushInt(@intCast(depth));
             try ctx.stack.push(ctx.allocator, null);
@@ -383,145 +510,224 @@ const LowerCtx = struct {
         try self.bringToTop(name, consume);
     }
 
+    /// Consume-vs-copy decision for one operand of a multi-operand ANF value.
+    ///
+    /// `operands` is the FULL operand-ref list of the value (including `name`
+    /// itself). The load may consume (ROLL / move) the ref only when this
+    /// binding is the ref's last use AND the ref occurs exactly once in the
+    /// operand list. A ref read at more than one operand position of the same
+    /// value must be copied (PICK / DUP) at EVERY position: a consume-mode
+    /// bringToTop of a ref already on top of the stack is a no-op, so two
+    /// consume-mode loads of the same ref would leave a single slot for an
+    /// opcode that pops one item per operand (e.g. `t := x + x` underflowing
+    /// OP_ADD), or silently pair the opcode with the wrong slot. The original
+    /// then stays on the stack and the existing method epilogue cleans it up.
+    /// Unreachable from the frontend (every operand gets a fresh temp);
+    /// reachable via compile-ir hand-written ANF.
+    fn operandConsume(self: *const LowerCtx, name: []const u8, operands: []const []const u8) bool {
+        if (!self.isLastUse(name)) return false;
+        var occurrences: usize = 0;
+        for (operands) |o| {
+            if (std.mem.eql(u8, o, name)) occurrences += 1;
+        }
+        return occurrences <= 1;
+    }
+
+    /// bringToTop with the repeated-operand-aware consume decision.
+    fn bringToTopOperand(self: *LowerCtx, name: []const u8, operands: []const []const u8) !void {
+        try self.bringToTop(name, self.operandConsume(name, operands));
+    }
+
+    /// Drain branch-private residue from below TOS at the end of a branch
+    /// body, so both branches converge to a layout the parent stack model can
+    /// faithfully describe before OP_ENDIF (issue #36).
+    ///
+    /// A slot is residue when its name is NOT in `pre_if_names` (the snapshot
+    /// of the parent's named slots taken before the branch ran). This catches
+    /// both anonymous slots (null-named, pushed by intrinsics like substr's
+    /// OP_SPLIT residue) and named branch-local bindings that lingered past
+    /// their last-use (e.g. dead-code load_const intermediates the optimizer
+    /// didn't fold). Slots whose name was already in `pre_if_names` are kept.
+    /// Process deepest-first so removing a deeper slot doesn't shift a
+    /// shallower slot's depth-from-top.
+    fn drainBranchPrivateResidue(self: *LowerCtx, pre_if_names: *const std.StringHashMapUnmanaged(void)) !void {
+        var drain_depths: std.ArrayListUnmanaged(usize) = .empty;
+        defer drain_depths.deinit(self.allocator);
+        var d: usize = 1;
+        while (d < self.stack.depth()) : (d += 1) {
+            const slot = self.stack.peekAtDepth(d);
+            if (slot) |name| {
+                if (!pre_if_names.contains(name)) {
+                    try drain_depths.append(self.allocator, d);
+                }
+            } else {
+                try drain_depths.append(self.allocator, d);
+            }
+        }
+        if (drain_depths.items.len == 0) return;
+        std.mem.sort(usize, drain_depths.items, {}, std.sort.desc(usize));
+        for (drain_depths.items) |depth| {
+            try removeBranchValueAtDepth(self, depth);
+        }
+    }
+
     // ========================================================================
     // Last-use analysis
     // ========================================================================
 
     fn computeLastUses(self: *LowerCtx, bindings: []const types.ANFBinding) !void {
         self.last_uses.clearRetainingCapacity();
+        // Pre-scan: map each array_literal binding to its element refs. Used
+        // to propagate last-use across the array indirection (the array
+        // binding is pure metadata in lowerArrayLiteral — its elements must
+        // remain live until the array's consumer, not until the array_literal
+        // binding itself). Stored on the lowering context for scanValueForRefs.
+        var array_elems = std.StringHashMapUnmanaged([]const []const u8){};
+        defer array_elems.deinit(self.allocator);
+        for (bindings) |binding| {
+            switch (binding.value) {
+                .array_literal => |al| {
+                    try array_elems.put(self.allocator, binding.name, al.elements);
+                },
+                else => {},
+            }
+        }
         for (bindings, 0..) |binding, idx| {
-            self.scanValueForRefs(binding.value, idx);
+            // array_literal is metadata-only — do NOT advance its elements'
+            // last-use to here; defer to the array's consumer.
+            switch (binding.value) {
+                .array_literal => continue,
+                else => {},
+            }
+            self.scanValueForRefs(binding.value, idx, &array_elems);
         }
     }
 
-    fn scanValueForRefs(self: *LowerCtx, value: types.ANFValue, idx: usize) void {
+    fn putLastUseExpanding(
+        self: *LowerCtx,
+        name: []const u8,
+        idx: usize,
+        array_elems: *const std.StringHashMapUnmanaged([]const []const u8),
+    ) void {
+        self.last_uses.put(self.allocator, name, idx) catch return;
+        if (array_elems.get(name)) |elems| {
+            for (elems) |e| {
+                self.last_uses.put(self.allocator, e, idx) catch return;
+            }
+        }
+    }
+
+    fn scanValueForRefs(
+        self: *LowerCtx,
+        value: types.ANFValue,
+        idx: usize,
+        array_elems: *const std.StringHashMapUnmanaged([]const []const u8),
+    ) void {
         switch (value) {
-            .literal_int, .literal_bigint, .literal_bool, .literal_bytes, .nop => {},
             .load_param => |lp| {
-                self.last_uses.put(self.allocator, lp.name, idx) catch return;
+                self.putLastUseExpanding(lp.name, idx, array_elems);
             },
             .load_prop, .get_state_script => {},
             .load_const => |lc| {
                 switch (lc.value) {
                     .string => |s| {
                         if (std.mem.startsWith(u8, s, "@ref:")) {
-                            self.last_uses.put(self.allocator, s[5..], idx) catch return;
+                            self.putLastUseExpanding(s[5..], idx, array_elems);
                         }
                     },
                     else => {},
                 }
             },
-            .ref => |name| {
-                self.last_uses.put(self.allocator, name, idx) catch return;
-            },
-            .property_read => {},
-            .property_write => |pw| {
-                self.last_uses.put(self.allocator, pw.value_ref, idx) catch return;
-            },
-            .binary_op => |bop| {
-                self.last_uses.put(self.allocator, bop.left, idx) catch return;
-                self.last_uses.put(self.allocator, bop.right, idx) catch return;
-            },
             .bin_op => |bop| {
-                self.last_uses.put(self.allocator, bop.left, idx) catch return;
-                self.last_uses.put(self.allocator, bop.right, idx) catch return;
+                self.putLastUseExpanding(bop.left, idx, array_elems);
+                self.putLastUseExpanding(bop.right, idx, array_elems);
             },
             .unary_op => |uop| {
-                self.last_uses.put(self.allocator, uop.operand, idx) catch return;
-            },
-            .builtin_call => |call| {
-                for (call.args) |arg| {
-                    self.last_uses.put(self.allocator, arg, idx) catch return;
-                }
+                self.putLastUseExpanding(uop.operand, idx, array_elems);
             },
             .call => |c| {
                 for (c.args) |arg| {
-                    self.last_uses.put(self.allocator, arg, idx) catch return;
+                    self.putLastUseExpanding(arg, idx, array_elems);
                 }
             },
             .method_call => |mc| {
                 if (mc.object.len > 0) {
-                    self.last_uses.put(self.allocator, mc.object, idx) catch return;
+                    self.putLastUseExpanding(mc.object, idx, array_elems);
                 }
                 for (mc.args) |arg| {
-                    self.last_uses.put(self.allocator, arg, idx) catch return;
+                    self.putLastUseExpanding(arg, idx, array_elems);
                 }
             },
             .@"if" => |ie| {
-                self.last_uses.put(self.allocator, ie.cond, idx) catch return;
+                self.putLastUseExpanding(ie.cond, idx, array_elems);
                 for (ie.then) |binding| {
-                    self.scanValueForRefs(binding.value, idx);
+                    self.scanValueForRefs(binding.value, idx, array_elems);
                 }
                 for (ie.@"else") |binding| {
-                    self.scanValueForRefs(binding.value, idx);
-                }
-            },
-            .if_expr => |ie| {
-                self.last_uses.put(self.allocator, ie.condition, idx) catch return;
-                for (ie.then_bindings) |binding| {
-                    self.scanValueForRefs(binding.value, idx);
-                }
-                if (ie.else_bindings) |else_bindings| {
-                    for (else_bindings) |binding| {
-                        self.scanValueForRefs(binding.value, idx);
-                    }
-                }
-            },
-            .for_loop => |fl| {
-                for (fl.body_bindings) |binding| {
-                    self.scanValueForRefs(binding.value, idx);
+                    self.scanValueForRefs(binding.value, idx, array_elems);
                 }
             },
             .loop => |lp| {
                 for (lp.body) |binding| {
-                    self.scanValueForRefs(binding.value, idx);
+                    self.scanValueForRefs(binding.value, idx, array_elems);
                 }
             },
-            .assert_op => |a| {
-                self.last_uses.put(self.allocator, a.condition, idx) catch return;
-            },
             .assert => |a| {
-                self.last_uses.put(self.allocator, a.value, idx) catch return;
+                self.putLastUseExpanding(a.value, idx, array_elems);
             },
             .update_prop => |up| {
-                self.last_uses.put(self.allocator, up.value, idx) catch return;
+                self.putLastUseExpanding(up.value, idx, array_elems);
             },
             .check_preimage => |cp| {
-                self.last_uses.put(self.allocator, cp.preimage, idx) catch return;
+                self.putLastUseExpanding(cp.preimage, idx, array_elems);
             },
             .deserialize_state => |ds| {
-                self.last_uses.put(self.allocator, ds.preimage, idx) catch return;
+                self.putLastUseExpanding(ds.preimage, idx, array_elems);
             },
             .add_output => |ao| {
                 if (ao.satoshis.len > 0) {
-                    self.last_uses.put(self.allocator, ao.satoshis, idx) catch return;
+                    self.putLastUseExpanding(ao.satoshis, idx, array_elems);
                 }
                 if (ao.preimage.len > 0) {
-                    self.last_uses.put(self.allocator, ao.preimage, idx) catch return;
+                    self.putLastUseExpanding(ao.preimage, idx, array_elems);
                 }
                 for (ao.state_values) |sv| {
                     if (sv.len > 0) {
-                        self.last_uses.put(self.allocator, sv, idx) catch return;
+                        self.putLastUseExpanding(sv, idx, array_elems);
                     }
                 }
                 for (ao.state_refs) |sr| {
                     if (sr.len > 0) {
-                        self.last_uses.put(self.allocator, sr, idx) catch return;
+                        self.putLastUseExpanding(sr, idx, array_elems);
                     }
                 }
             },
             .add_raw_output => |aro| {
                 if (aro.satoshis.len > 0) {
-                    self.last_uses.put(self.allocator, aro.satoshis, idx) catch return;
+                    self.putLastUseExpanding(aro.satoshis, idx, array_elems);
                 }
-                if (aro.script_ref.len > 0) {
-                    self.last_uses.put(self.allocator, aro.script_ref, idx) catch return;
+                if (aro.script_bytes.len > 0) {
+                    self.putLastUseExpanding(aro.script_bytes, idx, array_elems);
                 }
             },
-            .array_literal => |al| {
-                for (al.elements) |elem| {
-                    self.last_uses.put(self.allocator, elem, idx) catch return;
+            .add_data_output => |ado| {
+                if (ado.satoshis.len > 0) {
+                    self.putLastUseExpanding(ado.satoshis, idx, array_elems);
                 }
+                if (ado.script_bytes.len > 0) {
+                    self.putLastUseExpanding(ado.script_bytes, idx, array_elems);
+                }
+            },
+            .array_literal => {
+                // array_literal is metadata-only — skip; computeLastUses
+                // pre-screens these out so scanValueForRefs never receives a
+                // top-level array_literal, and nested ones (if-branches etc.)
+                // are similarly metadata-only.
+            },
+            .raw_script => {
+                // Opaque byte span — no SSA operand refs. Stack effect is
+                // declared via in_arity / out_arity and consumed by
+                // lowerRawScript directly.
             },
         }
     }
@@ -541,12 +747,40 @@ const LowerCtx = struct {
         }
         try self.computeLastUses(bindings);
 
+        // Protect parent-scope refs from consume inside this scope: extend
+        // their last-use index past the end of the bindings, mirroring TS
+        // `outerProtectedRefs` handling in `lowerBindings`.
+        if (self.outer_protected_refs) |protected| {
+            var it = protected.iterator();
+            while (it.next()) |entry| {
+                try self.last_uses.put(self.allocator, entry.key_ptr.*, bindings.len);
+            }
+        }
+
+        // Terminal-assert propagation mirrors TS reference compiler
+        // (`05-stack-lower.ts` lines 819-832): if the last binding is an
+        // `if`, mark it as the terminal-if point so its branches can
+        // propagate `terminalAssert=true` to their last assert. Otherwise
+        // scan backwards for the last plain assert.
         var terminal_assert_idx: ?usize = null;
+        var terminal_if_idx: ?usize = null;
         if (terminal_assert and bindings.len > 0) {
             const last_idx = bindings.len - 1;
             switch (bindings[last_idx].value) {
-                .assert, .assert_op => terminal_assert_idx = last_idx,
-                else => {},
+                .@"if" => terminal_if_idx = last_idx,
+                else => {
+                    var i: usize = bindings.len;
+                    while (i > 0) {
+                        i -= 1;
+                        switch (bindings[i].value) {
+                            .assert => {
+                                terminal_assert_idx = i;
+                                break;
+                            },
+                            else => {},
+                        }
+                    }
+                },
             }
         }
 
@@ -556,7 +790,16 @@ const LowerCtx = struct {
             if (terminal_assert_idx != null and idx == terminal_assert_idx.?) {
                 switch (binding.value) {
                     .assert => |a| try self.lowerAssertOp(binding.name, .{ .condition = a.value }, true),
-                    .assert_op => |a| try self.lowerAssertOp(binding.name, a, true),
+                    else => try self.lowerBinding(binding),
+                }
+            } else if (terminal_if_idx != null and idx == terminal_if_idx.?) {
+                switch (binding.value) {
+                    .@"if" => |ie| {
+                        const legacy = try self.allocator.create(types.ANFIfExpr);
+                        defer self.allocator.destroy(legacy);
+                        legacy.* = .{ .condition = ie.cond, .then_bindings = ie.then, .else_bindings = if (ie.@"else".len > 0) ie.@"else" else null };
+                        try self.lowerIfExprTerminal(binding.name, legacy, true);
+                    },
                     else => try self.lowerBinding(binding),
                 }
             } else {
@@ -581,17 +824,8 @@ const LowerCtx = struct {
                 .string => |s| return std.mem.startsWith(u8, s, "@ref:") and std.mem.eql(u8, s[5..], name),
                 else => return false,
             },
-            .ref => |ref_name| return std.mem.eql(u8, ref_name, name),
-            .property_write => |pw| return std.mem.eql(u8, pw.value_ref, name),
-            .binary_op => |bop| return std.mem.eql(u8, bop.left, name) or std.mem.eql(u8, bop.right, name),
             .bin_op => |bop| return std.mem.eql(u8, bop.left, name) or std.mem.eql(u8, bop.right, name),
             .unary_op => |uop| return std.mem.eql(u8, uop.operand, name),
-            .builtin_call => |call| {
-                for (call.args) |arg| {
-                    if (std.mem.eql(u8, arg, name)) return true;
-                }
-                return false;
-            },
             .call => |call| {
                 for (call.args) |arg| {
                     if (std.mem.eql(u8, arg, name)) return true;
@@ -605,7 +839,6 @@ const LowerCtx = struct {
                 }
                 return false;
             },
-            .assert_op => |a| return std.mem.eql(u8, a.condition, name),
             .assert => |a| return std.mem.eql(u8, a.value, name),
             .update_prop => |up| return std.mem.eql(u8, up.value, name),
             .check_preimage => |cp| return std.mem.eql(u8, cp.preimage, name),
@@ -623,7 +856,11 @@ const LowerCtx = struct {
             },
             .add_raw_output => |aro| {
                 if (aro.satoshis.len > 0 and std.mem.eql(u8, aro.satoshis, name)) return true;
-                return aro.script_ref.len > 0 and std.mem.eql(u8, aro.script_ref, name);
+                return aro.script_bytes.len > 0 and std.mem.eql(u8, aro.script_bytes, name);
+            },
+            .add_data_output => |ado| {
+                if (ado.satoshis.len > 0 and std.mem.eql(u8, ado.satoshis, name)) return true;
+                return ado.script_bytes.len > 0 and std.mem.eql(u8, ado.script_bytes, name);
             },
             .array_literal => |al| {
                 for (al.elements) |elem| {
@@ -631,7 +868,7 @@ const LowerCtx = struct {
                 }
                 return false;
             },
-            .@"if", .if_expr, .for_loop, .loop, .load_prop, .property_read, .get_state_script, .literal_int, .literal_bigint, .literal_bool, .literal_bytes, .nop => return false,
+            .@"if", .loop, .load_prop, .get_state_script => return false,
         }
     }
 
@@ -685,45 +922,18 @@ const LowerCtx = struct {
 
     fn lowerBinding(self: *LowerCtx, binding: types.ANFBinding) LowerError!void {
         switch (binding.value) {
-            .literal_int => |n| {
-                try self.emitPushInt(n);
-                try self.stack.push(self.allocator, binding.name);
-                self.trackDepth();
-            },
-            .literal_bigint => |s| {
-                try self.emitPushData(s);
-                try self.stack.push(self.allocator, binding.name);
-                self.trackDepth();
-            },
-            .literal_bool => |b| {
-                try self.emitPushBool(b);
-                try self.stack.push(self.allocator, binding.name);
-                self.trackDepth();
-            },
-            .literal_bytes => |data| {
-                try self.emitPushData(data);
-                try self.stack.push(self.allocator, binding.name);
-                self.trackDepth();
-            },
-            .ref => |name| try self.lowerRef(binding.name, name),
-            .property_read => |prop_name| try self.lowerPropertyRead(binding.name, prop_name),
-            .property_write => |pw| try self.lowerPropertyWrite(binding.name, pw),
-            .binary_op => |bop| try self.lowerBinaryOp(binding.name, bop),
-            .unary_op => |uop| try self.lowerUnaryOp(binding.name, uop),
-            .builtin_call => |call| try self.lowerBuiltinCall(binding.name, call),
-            .if_expr => |ie| try self.lowerIfExpr(binding.name, ie),
-            .for_loop => |fl| try self.lowerForLoop(binding.name, fl),
-            .assert_op => |a| try self.lowerAssertOp(binding.name, a, false),
             .add_output => |ao| try self.lowerAddOutput(binding.name, ao),
             .add_raw_output => |aro| try self.lowerAddRawOutput(binding.name, aro),
-            .nop => {},
+            .add_data_output => |ado| {
+                // Wire shape identical to add_raw_output; the ordering into
+                // the continuation hash is handled during ANF lowering.
+                try self.lowerAddRawOutput(binding.name, .{ .satoshis = ado.satoshis, .script_bytes = ado.script_bytes });
+            },
             .get_state_script => try self.lowerGetStateScript(binding.name),
-            // TypeScript-matching variants: delegate to equivalent legacy handlers
             .load_param => |lp| try self.lowerLoadParam(binding.name, lp.name),
             .load_prop => |lp| try self.lowerPropertyRead(binding.name, lp.name),
-            .load_const => |lc| {
-                try self.lowerLoadConst(binding.name, lc.value);
-            },
+            .load_const => |lc| try self.lowerLoadConst(binding.name, lc.value),
+            .unary_op => |uop| try self.lowerUnaryOp(binding.name, uop),
             .bin_op => |bop| {
                 const legacy_op = types.BinOperator.fromTsString(bop.op) orelse return LowerError.UnsupportedOperation;
                 try self.lowerBinaryOp(binding.name, .{ .op = legacy_op, .left = bop.left, .right = bop.right, .result_type = bop.result_type });
@@ -739,26 +949,83 @@ const LowerCtx = struct {
             .method_call => |mc| try self.lowerMethodCall(binding.name, mc),
             .@"if" => |ie| {
                 const legacy = try self.allocator.create(types.ANFIfExpr);
+                defer self.allocator.destroy(legacy);
                 legacy.* = .{ .condition = ie.cond, .then_bindings = ie.then, .else_bindings = if (ie.@"else".len > 0) ie.@"else" else null };
                 try self.lowerIfExpr(binding.name, legacy);
             },
             .loop => |lp| {
                 const legacy = try self.allocator.create(types.ANFForLoop);
-                legacy.* = .{ .var_name = lp.iter_var, .init_val = 0, .bound = @intCast(lp.count), .body_bindings = lp.body };
+                defer self.allocator.destroy(legacy);
+                // Issue #121: carry start/step so the unroll pushes
+                // `start + n*step` on iteration `n`.
+                legacy.* = .{ .var_name = lp.iter_var, .start = lp.start, .step = lp.step, .count = lp.count, .body_bindings = lp.body };
                 try self.lowerForLoop(binding.name, legacy);
             },
             .assert => |a| try self.lowerAssertOp(binding.name, .{ .condition = a.value }, false),
             .update_prop => |up| try self.lowerPropertyWrite(binding.name, .{ .name = up.name, .value_ref = up.value }),
-            .check_preimage => |cp| try self.lowerCheckPreimage(binding.name, &.{cp.preimage}),
+            .check_preimage => |cp| try self.lowerCheckPreimage(binding.name, &.{cp.preimage}, cp.sighash_flag),
             .deserialize_state => |ds| try self.lowerDeserializeState(binding.name, &.{ds.preimage}),
-            .array_literal => |al| {
-                for (al.elements) |elem| {
-                    try self.bringToTopAuto(elem);
-                }
-                try self.stack.push(self.allocator, binding.name);
-                self.trackDepth();
-            },
+            .array_literal => |al| try self.lowerArrayLiteral(binding.name, al.elements),
+            .raw_script => |rs| try self.lowerRawScript(binding.name, rs.bytes, rs.in_arity, rs.out_arity),
         }
+    }
+
+    /// Lower a raw_script ANF node to a single opaque raw_bytes
+    /// StackInstruction. The bytes pass through verbatim — the emit pass
+    /// writes them as-is, and the peephole optimizer must not bridge across
+    /// them. Stack-tracker bookkeeping consumes in_arity items and pushes
+    /// out_arity items named after the binding so downstream PICK/ROLL/DROP
+    /// refer to the correct logical slot.
+    fn lowerRawScript(self: *LowerCtx, bind_name: []const u8, bytes_hex: []const u8, in_arity: i32, out_arity: i32) !void {
+        if (in_arity < 0 or out_arity < 0) return LowerError.UnsupportedOperation;
+        const in_n: usize = @intCast(in_arity);
+        const out_n: usize = @intCast(out_arity);
+        if (self.stack.depth() < in_n) return LowerError.UnsupportedOperation;
+
+        if (bytes_hex.len % 2 != 0) return LowerError.UnsupportedOperation;
+        const decoded = try self.allocator.alloc(u8, bytes_hex.len / 2);
+        _ = std.fmt.hexToBytes(decoded, bytes_hex) catch {
+            self.allocator.free(decoded);
+            return LowerError.UnsupportedOperation;
+        };
+        // Track the buffer so it gets freed when the program is deinit'd.
+        try self.owned_push_data.append(self.allocator, decoded);
+
+        try self.emit(.{ .raw_bytes = .{ .bytes = decoded, .in_arity = in_arity, .out_arity = out_arity } });
+
+        var i: usize = 0;
+        while (i < in_n) : (i += 1) _ = self.stack.pop();
+
+        if (out_n == 1) {
+            try self.stack.push(self.allocator, bind_name);
+        } else {
+            var j: usize = 0;
+            while (j < out_n) : (j += 1) {
+                const slot = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ bind_name, j });
+                // The slot name is owned by the program lifetime alongside other
+                // allocations — track via owned_push_data ([]u8) cast to []const u8
+                // via append on slots list (StackMap stores []const u8 references).
+                try self.owned_push_data.append(self.allocator, slot);
+                try self.stack.push(self.allocator, slot);
+            }
+        }
+        self.trackDepth();
+    }
+
+    /// Metadata-only. Array literals in Rúnar today only feed into
+    /// `checkMultiSig`. Pre-laying the elements onto the runtime stack here
+    /// would desync the stack-map from the runtime stack (the map can only
+    /// model one slot per binding, but an array binding spans N runtime
+    /// slots). `lowerCheckMultiSig` pulls each element to TOS at the use site.
+    /// Mirrors TS `lowerArrayLiteral` in `05-stack-lower.ts`.
+    fn lowerArrayLiteral(self: *LowerCtx, bind_name: []const u8, elements: []const []const u8) !void {
+        try self.array_lengths.put(self.allocator, bind_name, elements.len);
+        // Duplicate the slice so it survives even if the source ANF buffer
+        // is freed (it's owned by the program, but defensive copying keeps
+        // the lifetime contract local).
+        const copy = try self.allocator.alloc([]const u8, elements.len);
+        @memcpy(copy, elements);
+        try self.array_elements.put(self.allocator, bind_name, copy);
     }
 
     // ========================================================================
@@ -775,16 +1042,31 @@ const LowerCtx = struct {
     }
 
     fn lowerLoadParam(self: *LowerCtx, bind_name: []const u8, param_name: []const u8) !void {
-        if (self.stack.findDepth(param_name) != null) {
+        // The parameter is already on the stack under its original name — or, for
+        // a param that shadows a mutable property, under a reserved renamed slot
+        // (issue #130) so it is not confused with the deserialized property slot.
+        const slot_name = self.renamed_params.get(param_name) orelse param_name;
+        if (self.stack.findDepth(slot_name) != null) {
             const consume = self.isLastUse(param_name);
-            try self.bringToTop(param_name, consume);
+            try self.bringToTop(slot_name, consume);
             try self.stack.renameAtDepth(self.allocator, 0, bind_name);
             return;
         }
 
-        try self.emitPushInt(0);
-        try self.stack.push(self.allocator, bind_name);
-        self.trackDepth();
+        // Parameter no longer on the stack — a compiler invariant violation
+        // (historically caused by unrolled loops consuming outer refs; see
+        // lowerForLoop). Silently emitting OP_0 here produced scripts that
+        // compiled, passed the env-based interpreter, and then failed on
+        // chain — fail loudly instead.
+        const slots_str = self.stack.debugSlots(self.allocator) catch null;
+        defer if (slots_str) |s| self.allocator.free(s);
+        std.log.warn(
+            "stack lowering: method parameter '{s}' is not on the stack at a " ++
+                "post-consumption reference (stack: [{s}]). Refusing to emit a " ++
+                "silent OP_0 placeholder.",
+            .{ param_name, slots_str orelse "<unavailable>" },
+        );
+        return LowerError.SilentOpZeroRefused;
     }
 
     fn lowerMethodCall(self: *LowerCtx, bind_name: []const u8, mc: types.ANFMethodCall) !void {
@@ -828,7 +1110,7 @@ const LowerCtx = struct {
         for (args, 0..) |arg, idx| {
             if (idx >= method.params.len) break;
             const param_name = method.params[idx].name;
-            const consume = self.isLastUse(arg);
+            const consume = self.operandConsume(arg, args);
             try self.bringToTop(arg, consume);
             _ = self.stack.pop();
 
@@ -842,13 +1124,21 @@ const LowerCtx = struct {
             self.trackDepth();
         }
 
+        // Match TS reference compiler: `inlineMethodCall` calls
+        // `this.lowerBindings(method.body)`, which overwrites
+        // `this.localBindings` with the inlined method's body binding names.
+        // TS does NOT restore the caller's localBindings afterwards — this
+        // "bug" is load-bearing: subsequent `@ref:<caller_binding>` lookups
+        // after the inlining miss the caller's scope and fall back to
+        // `consume=false` (PICK/DUP), keeping values alive. Zig previously
+        // restored local_bindings which caused divergent byte output.
+        //
+        // last_uses IS restored because in TS `lastUses` is a local variable
+        // inside each `lowerBindings` call, so the caller's analysis survives.
         const saved_last_uses = self.last_uses;
-        const saved_local_bindings = self.local_bindings;
         var saved_force_copy_bindings = self.force_copy_bindings;
         const saved_copy_ref_aliases = self.copy_ref_aliases;
         defer {
-            self.local_bindings.deinit(self.allocator);
-            self.local_bindings = saved_local_bindings;
             self.force_copy_bindings.deinit(self.allocator);
             self.force_copy_bindings = saved_force_copy_bindings;
             self.last_uses.deinit(self.allocator);
@@ -857,7 +1147,6 @@ const LowerCtx = struct {
         }
 
         self.last_uses = .empty;
-        self.local_bindings = .empty;
         self.force_copy_bindings = .empty;
         self.copy_ref_aliases = false;
         try self.lowerBindings(method.body, false);
@@ -877,7 +1166,7 @@ const LowerCtx = struct {
                     const should_force_copy =
                         self.isForceCopyBinding(last_binding_name) or
                         switch (last_binding.value) {
-                            .call, .builtin_call, .method_call => true,
+                            .call, .method_call => true,
                             else => false,
                         };
                     if (should_force_copy) {
@@ -892,17 +1181,45 @@ const LowerCtx = struct {
         switch (value) {
             .boolean => |b| try self.emitPushBool(b),
             .integer => |n| try self.emitPushInt(@intCast(n)),
+            .big_integer => |s| try self.emitPushBigIntDecimal(s),
             .string => |s| {
                 if (std.mem.startsWith(u8, s, "@ref:")) {
                     const ref_name = s[5..];
-                    const depends_on_private_result = self.isForceCopyBinding(ref_name);
-                    const forced_copy = depends_on_private_result and (self.futureUseCount(bind_name) > 1 or self.feedsLaterAliasedBinding(bind_name) or self.feedsPrivateMethodCall(bind_name));
-                    const consume = !self.copy_ref_aliases and !forced_copy and self.hasLocalBinding(ref_name) and self.isLastUse(ref_name);
+                    // Special case: if the referenced binding is an
+                    // array_literal (metadata-only — no physical stack slot),
+                    // alias the array metadata into the new binding name and
+                    // emit nothing. The downstream checkMultiSig consumer will
+                    // read elements via array_elements.
+                    if (self.array_elements.get(ref_name)) |elems| {
+                        const copy = try self.allocator.alloc([]const u8, elems.len);
+                        @memcpy(copy, elems);
+                        try self.array_elements.put(self.allocator, bind_name, copy);
+                        if (self.array_lengths.get(ref_name)) |len| {
+                            try self.array_lengths.put(self.allocator, bind_name, len);
+                        }
+                        return;
+                    }
+                    // Referenced value no longer on the stack — a compiler
+                    // invariant violation (see lowerForLoop for the loop-
+                    // consumption history). Fail loudly instead of relying on a
+                    // silent OP_0 placeholder / an opaque VariableNotFound.
+                    if (self.stack.findDepth(ref_name) == null) {
+                        const slots_str = self.stack.debugSlots(self.allocator) catch null;
+                        defer if (slots_str) |dbg| self.allocator.free(dbg);
+                        std.log.warn(
+                            "stack lowering: value '{s}' referenced by '{s}' is not on " ++
+                                "the stack (stack: [{s}]). Refusing to emit a silent OP_0 " ++
+                                "placeholder.",
+                            .{ ref_name, bind_name, slots_str orelse "<unavailable>" },
+                        );
+                        return LowerError.SilentOpZeroRefused;
+                    }
+                    // Match TS reference compiler: consume only if ref target is
+                    // a local binding in the current scope and this is the last
+                    // use. No force-copy tracking — TS does not have it.
+                    const consume = !self.copy_ref_aliases and self.hasLocalBinding(ref_name) and self.isLastUse(ref_name);
                     try self.bringToTop(ref_name, consume);
                     try self.stack.renameAtDepth(self.allocator, 0, bind_name);
-                    if (depends_on_private_result) {
-                        try self.force_copy_bindings.put(self.allocator, bind_name, {});
-                    }
                     return;
                 }
 
@@ -915,6 +1232,22 @@ const LowerCtx = struct {
         }
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
+    }
+
+    /// Comma-separated names of the constructor-param properties (those with no
+    /// initial value, i.e. the ones that occupy a deploy-time slot). Used only
+    /// for the H1 diagnostic in `lowerPropertyRead`.
+    fn knownCtorPropNames(self: *const LowerCtx) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        var first = true;
+        for (self.program.properties) |prop| {
+            if (prop.initial_value != null) continue;
+            if (!first) try buf.appendSlice(self.allocator, ", ");
+            first = false;
+            try buf.appendSlice(self.allocator, prop.name);
+        }
+        return buf.toOwnedSlice(self.allocator);
     }
 
     fn lowerPropertyRead(self: *LowerCtx, bind_name: []const u8, prop_name: []const u8) !void {
@@ -939,6 +1272,7 @@ const LowerCtx = struct {
                     switch (iv) {
                         .boolean => |b| try self.emitPushBool(b),
                         .integer => |n| try self.emitPushInt(@intCast(n)),
+                        .big_integer => |s| try self.emitPushBigIntDecimal(s),
                         .string => |s| try self.emitPushHexString(s),
                     }
                     try self.stack.push(self.allocator, bind_name);
@@ -947,12 +1281,50 @@ const LowerCtx = struct {
                 }
             }
         }
-        // Not found — push constructor param placeholder
-        // Determine param_index: count readonly properties before this one
+        // Not found on stack / initialized — push constructor param placeholder.
+        // Determine param_index: count properties without initial_value before
+        // this one. Zig signals "not a declared property" by never breaking, so
+        // track it explicitly with `found`.
         var param_idx: u32 = 0;
+        var found = false;
         for (self.program.properties) |prop| {
-            if (std.mem.eql(u8, prop.name, prop_name)) break;
-            if (prop.readonly and prop.initial_value == null) param_idx += 1;
+            if (std.mem.eql(u8, prop.name, prop_name)) {
+                found = true;
+                break;
+            }
+            if (prop.initial_value == null) param_idx += 1;
+        }
+        // #119 tail (H1): a property that reaches this fallback with no matching
+        // constructor slot (found == false) has no deploy-time bytes of its own.
+        // The previous behaviour left `param_idx` at the count of ctor-param
+        // properties and emitted a placeholder for an UNRELATED constructor
+        // argument — a silent-wrong-code path that splices the wrong value into
+        // the locking script. Fail loudly instead. (A real constructor-param
+        // property — readonly, or a mutable state field whose initial value is
+        // spliced at deploy — is found and unaffected.)
+        if (!found) {
+            const known = self.knownCtorPropNames() catch null;
+            defer if (known) |k| self.allocator.free(k);
+            if (self.current_source_loc) |loc| {
+                std.log.warn(
+                    "stack lowering: property '{s}' at {s}:{d}:{d} is neither on " ++
+                        "the stack, initialized, nor a constructor parameter, so it " ++
+                        "has no deploy-time slot. Refusing to emit a placeholder for " ++
+                        "an unrelated constructor argument (slot 0). Known " ++
+                        "constructor-param properties: [{s}].",
+                    .{ prop_name, loc.file, loc.line, loc.column, known orelse "<unavailable>" },
+                );
+            } else {
+                std.log.warn(
+                    "stack lowering: property '{s}' is neither on the stack, " ++
+                        "initialized, nor a constructor parameter, so it has no " ++
+                        "deploy-time slot. Refusing to emit a placeholder for an " ++
+                        "unrelated constructor argument (slot 0). Known " ++
+                        "constructor-param properties: [{s}].",
+                    .{ prop_name, known orelse "<unavailable>" },
+                );
+            }
+            return LowerError.LoadPropNoConstructorSlot;
         }
         try self.emit(.{ .placeholder = .{ .param_index = param_idx, .param_name = prop_name } });
         try self.stack.push(self.allocator, bind_name);
@@ -999,8 +1371,9 @@ const LowerCtx = struct {
     }
 
     fn lowerBinaryOp(self: *LowerCtx, bind_name: []const u8, bop: types.ANFBinaryOp) !void {
-        try self.bringToTopAuto(bop.left);
-        try self.bringToTopAuto(bop.right);
+        const bin_operands = [_][]const u8{ bop.left, bop.right };
+        try self.bringToTopOperand(bop.left, &bin_operands);
+        try self.bringToTopOperand(bop.right, &bin_operands);
 
         const is_bytes = if (bop.result_type) |t| std.mem.eql(u8, t, "bytes") else false;
 
@@ -1095,6 +1468,7 @@ const LowerCtx = struct {
         extractLocktime,
         extractOutpoint,
         extractOutputHash,
+        extractSigHashType,
         buildChangeOutput,
         getStateScript,
         buildStateOutput,
@@ -1120,6 +1494,66 @@ const LowerCtx = struct {
         ecPairing,
         slhDsaVerify,
         schnorrVerify,
+        // NIST P-256
+        verifyECDSA_P256,
+        p256Add,
+        p256Mul,
+        p256MulGen,
+        p256Negate,
+        p256OnCurve,
+        p256EncodeCompressed,
+        // NIST P-384
+        verifyECDSA_P384,
+        p384Add,
+        p384Mul,
+        p384MulGen,
+        p384Negate,
+        p384OnCurve,
+        p384EncodeCompressed,
+        // Baby Bear field arithmetic
+        bbFieldAdd,
+        bbFieldSub,
+        bbFieldMul,
+        bbFieldInv,
+        // Baby Bear quartic extension field arithmetic
+        bbExt4Mul0,
+        bbExt4Mul1,
+        bbExt4Mul2,
+        bbExt4Mul3,
+        bbExt4Inv0,
+        bbExt4Inv1,
+        bbExt4Inv2,
+        bbExt4Inv3,
+        // KoalaBear field arithmetic
+        kbFieldAdd,
+        kbFieldSub,
+        kbFieldMul,
+        kbFieldInv,
+        // KoalaBear quartic extension field arithmetic
+        kbExt4Mul0,
+        kbExt4Mul1,
+        kbExt4Mul2,
+        kbExt4Mul3,
+        kbExt4Inv0,
+        kbExt4Inv1,
+        kbExt4Inv2,
+        kbExt4Inv3,
+        // BN254 field arithmetic
+        bn254FieldAdd,
+        bn254FieldSub,
+        bn254FieldMul,
+        bn254FieldInv,
+        bn254FieldNeg,
+        // BN254 G1 point operations
+        bn254G1Add,
+        bn254G1ScalarMul,
+        bn254G1Negate,
+        bn254G1OnCurve,
+        // Poseidon2 KoalaBear Merkle
+        poseidon2MerkleRoot,
+        // Merkle proof verification
+        merkleRootSha256,
+        merkleRootHash256,
         super_call,
     };
 
@@ -1163,6 +1597,7 @@ const LowerCtx = struct {
         .{ "extractLocktime", .extractLocktime },
         .{ "extractOutpoint", .extractOutpoint },
         .{ "extractOutputHash", .extractOutputHash },
+        .{ "extractSigHashType", .extractSigHashType },
         .{ "buildChangeOutput", .buildChangeOutput },
         .{ "getStateScript", .getStateScript },
         .{ "buildStateOutput", .buildStateOutput },
@@ -1195,7 +1630,59 @@ const LowerCtx = struct {
         .{ "verifySLHDSA_SHA2_256f", .slhDsaVerify },
         .{ "slhDsaVerify", .slhDsaVerify },
         .{ "schnorrVerify", .schnorrVerify },
+        .{ "bbFieldAdd", .bbFieldAdd },
+        .{ "bbFieldSub", .bbFieldSub },
+        .{ "bbFieldMul", .bbFieldMul },
+        .{ "bbFieldInv", .bbFieldInv },
+        .{ "bbExt4Mul0", .bbExt4Mul0 },
+        .{ "bbExt4Mul1", .bbExt4Mul1 },
+        .{ "bbExt4Mul2", .bbExt4Mul2 },
+        .{ "bbExt4Mul3", .bbExt4Mul3 },
+        .{ "bbExt4Inv0", .bbExt4Inv0 },
+        .{ "bbExt4Inv1", .bbExt4Inv1 },
+        .{ "bbExt4Inv2", .bbExt4Inv2 },
+        .{ "bbExt4Inv3", .bbExt4Inv3 },
+        .{ "kbFieldAdd", .kbFieldAdd },
+        .{ "kbFieldSub", .kbFieldSub },
+        .{ "kbFieldMul", .kbFieldMul },
+        .{ "kbFieldInv", .kbFieldInv },
+        .{ "kbExt4Mul0", .kbExt4Mul0 },
+        .{ "kbExt4Mul1", .kbExt4Mul1 },
+        .{ "kbExt4Mul2", .kbExt4Mul2 },
+        .{ "kbExt4Mul3", .kbExt4Mul3 },
+        .{ "kbExt4Inv0", .kbExt4Inv0 },
+        .{ "kbExt4Inv1", .kbExt4Inv1 },
+        .{ "kbExt4Inv2", .kbExt4Inv2 },
+        .{ "kbExt4Inv3", .kbExt4Inv3 },
+        .{ "bn254FieldAdd", .bn254FieldAdd },
+        .{ "bn254FieldSub", .bn254FieldSub },
+        .{ "bn254FieldMul", .bn254FieldMul },
+        .{ "bn254FieldInv", .bn254FieldInv },
+        .{ "bn254FieldNeg", .bn254FieldNeg },
+        .{ "bn254G1Add", .bn254G1Add },
+        .{ "bn254G1ScalarMul", .bn254G1ScalarMul },
+        .{ "bn254G1Negate", .bn254G1Negate },
+        .{ "bn254G1OnCurve", .bn254G1OnCurve },
+        .{ "poseidon2MerkleRoot", .poseidon2MerkleRoot },
+        .{ "merkleRootSha256", .merkleRootSha256 },
+        .{ "merkleRootHash256", .merkleRootHash256 },
         .{ "super", .super_call },
+        // NIST P-256
+        .{ "verifyECDSA_P256", .verifyECDSA_P256 },
+        .{ "p256Add", .p256Add },
+        .{ "p256Mul", .p256Mul },
+        .{ "p256MulGen", .p256MulGen },
+        .{ "p256Negate", .p256Negate },
+        .{ "p256OnCurve", .p256OnCurve },
+        .{ "p256EncodeCompressed", .p256EncodeCompressed },
+        // NIST P-384
+        .{ "verifyECDSA_P384", .verifyECDSA_P384 },
+        .{ "p384Add", .p384Add },
+        .{ "p384Mul", .p384Mul },
+        .{ "p384MulGen", .p384MulGen },
+        .{ "p384Negate", .p384Negate },
+        .{ "p384OnCurve", .p384OnCurve },
+        .{ "p384EncodeCompressed", .p384EncodeCompressed },
     });
 
     fn lowerBuiltinCall(self: *LowerCtx, bind_name: []const u8, call: types.ANFBuiltinCall) LowerError!void {
@@ -1236,9 +1723,13 @@ const LowerCtx = struct {
             .divmod => try self.lowerDivMod(bind_name, args),
             .log2 => try self.lowerLog2(bind_name, args),
             .clamp => try self.lowerClamp(bind_name, args),
-            .checkPreimage => try self.lowerCheckPreimage(bind_name, args),
+            // Builtin-call dispatch path: reached only for a `call` node named
+            // checkPreimage, which anf_lower never emits (it lowers manual
+            // checkPreimage() into a dedicated check_preimage node carrying the
+            // sighash flag). Default flag (0 = ALL|FORKID) is correct here.
+            .checkPreimage => try self.lowerCheckPreimage(bind_name, args, 0),
             .deserializeState => try self.lowerDeserializeState(bind_name, args),
-            .extractHashPrevouts, .extractLocktime, .extractOutpoint, .extractOutputHash => try self.lowerExtractor(bind_name, id, args),
+            .extractHashPrevouts, .extractLocktime, .extractOutpoint, .extractOutputHash, .extractSigHashType => try self.lowerExtractor(bind_name, id, args),
             .sign => try self.lowerSign(bind_name, args),
             .buildChangeOutput => try self.lowerBuildChangeOutput(bind_name, args),
             .getStateScript => try self.lowerGetStateScript(bind_name),
@@ -1269,6 +1760,66 @@ const LowerCtx = struct {
                 const crypto_builtin = crypto_builtins.classify(call.name) orelse return LowerError.InvalidBuiltin;
                 try self.lowerPqBuiltin(bind_name, args, crypto_builtin);
             },
+            // Baby Bear field arithmetic
+            .bbFieldAdd => try self.lowerBBBuiltin(bind_name, args, .bb_field_add),
+            .bbFieldSub => try self.lowerBBBuiltin(bind_name, args, .bb_field_sub),
+            .bbFieldMul => try self.lowerBBBuiltin(bind_name, args, .bb_field_mul),
+            .bbFieldInv => try self.lowerBBBuiltin(bind_name, args, .bb_field_inv),
+            // Baby Bear quartic extension field arithmetic
+            .bbExt4Mul0 => try self.lowerBBBuiltin(bind_name, args, .bb_ext4_mul0),
+            .bbExt4Mul1 => try self.lowerBBBuiltin(bind_name, args, .bb_ext4_mul1),
+            .bbExt4Mul2 => try self.lowerBBBuiltin(bind_name, args, .bb_ext4_mul2),
+            .bbExt4Mul3 => try self.lowerBBBuiltin(bind_name, args, .bb_ext4_mul3),
+            .bbExt4Inv0 => try self.lowerBBBuiltin(bind_name, args, .bb_ext4_inv0),
+            .bbExt4Inv1 => try self.lowerBBBuiltin(bind_name, args, .bb_ext4_inv1),
+            .bbExt4Inv2 => try self.lowerBBBuiltin(bind_name, args, .bb_ext4_inv2),
+            .bbExt4Inv3 => try self.lowerBBBuiltin(bind_name, args, .bb_ext4_inv3),
+            // KoalaBear field arithmetic
+            .kbFieldAdd => try self.lowerKBBuiltin(bind_name, args, .kb_field_add),
+            .kbFieldSub => try self.lowerKBBuiltin(bind_name, args, .kb_field_sub),
+            .kbFieldMul => try self.lowerKBBuiltin(bind_name, args, .kb_field_mul),
+            .kbFieldInv => try self.lowerKBBuiltin(bind_name, args, .kb_field_inv),
+            // KoalaBear quartic extension field arithmetic
+            .kbExt4Mul0 => try self.lowerKBBuiltin(bind_name, args, .kb_ext4_mul0),
+            .kbExt4Mul1 => try self.lowerKBBuiltin(bind_name, args, .kb_ext4_mul1),
+            .kbExt4Mul2 => try self.lowerKBBuiltin(bind_name, args, .kb_ext4_mul2),
+            .kbExt4Mul3 => try self.lowerKBBuiltin(bind_name, args, .kb_ext4_mul3),
+            .kbExt4Inv0 => try self.lowerKBBuiltin(bind_name, args, .kb_ext4_inv0),
+            .kbExt4Inv1 => try self.lowerKBBuiltin(bind_name, args, .kb_ext4_inv1),
+            .kbExt4Inv2 => try self.lowerKBBuiltin(bind_name, args, .kb_ext4_inv2),
+            .kbExt4Inv3 => try self.lowerKBBuiltin(bind_name, args, .kb_ext4_inv3),
+            // BN254 field arithmetic
+            .bn254FieldAdd => try self.lowerBN254Builtin(bind_name, args, .bn254_field_add),
+            .bn254FieldSub => try self.lowerBN254Builtin(bind_name, args, .bn254_field_sub),
+            .bn254FieldMul => try self.lowerBN254Builtin(bind_name, args, .bn254_field_mul),
+            .bn254FieldInv => try self.lowerBN254Builtin(bind_name, args, .bn254_field_inv),
+            .bn254FieldNeg => try self.lowerBN254Builtin(bind_name, args, .bn254_field_neg),
+            // BN254 G1 point operations
+            .bn254G1Add => try self.lowerBN254Builtin(bind_name, args, .bn254_g1_add),
+            .bn254G1ScalarMul => try self.lowerBN254Builtin(bind_name, args, .bn254_g1_scalar_mul),
+            .bn254G1Negate => try self.lowerBN254Builtin(bind_name, args, .bn254_g1_negate),
+            .bn254G1OnCurve => try self.lowerBN254Builtin(bind_name, args, .bn254_g1_on_curve),
+            // Poseidon2 KoalaBear Merkle
+            .poseidon2MerkleRoot => try self.lowerPoseidon2MerkleBuiltin(bind_name, args),
+            // Merkle proof verification
+            .merkleRootSha256 => try self.lowerMerkleBuiltin(bind_name, args, call.name, .merkle_root_sha256),
+            .merkleRootHash256 => try self.lowerMerkleBuiltin(bind_name, args, call.name, .merkle_root_hash256),
+            // NIST P-256
+            .verifyECDSA_P256 => try self.lowerNistEcBuiltin(bind_name, args, .verify_ecdsa_p256),
+            .p256Add => try self.lowerNistEcBuiltin(bind_name, args, .p256_add),
+            .p256Mul => try self.lowerNistEcBuiltin(bind_name, args, .p256_mul),
+            .p256MulGen => try self.lowerNistEcBuiltin(bind_name, args, .p256_mul_gen),
+            .p256Negate => try self.lowerNistEcBuiltin(bind_name, args, .p256_negate),
+            .p256OnCurve => try self.lowerNistEcBuiltin(bind_name, args, .p256_on_curve),
+            .p256EncodeCompressed => try self.lowerNistEcBuiltin(bind_name, args, .p256_encode_compressed),
+            // NIST P-384
+            .verifyECDSA_P384 => try self.lowerNistEcBuiltin(bind_name, args, .verify_ecdsa_p384),
+            .p384Add => try self.lowerNistEcBuiltin(bind_name, args, .p384_add),
+            .p384Mul => try self.lowerNistEcBuiltin(bind_name, args, .p384_mul),
+            .p384MulGen => try self.lowerNistEcBuiltin(bind_name, args, .p384_mul_gen),
+            .p384Negate => try self.lowerNistEcBuiltin(bind_name, args, .p384_negate),
+            .p384OnCurve => try self.lowerNistEcBuiltin(bind_name, args, .p384_on_curve),
+            .p384EncodeCompressed => try self.lowerNistEcBuiltin(bind_name, args, .p384_encode_compressed),
             // super() is the constructor superclass call — no-op in Bitcoin Script
             .super_call => {
                 try self.stack.push(self.allocator, bind_name);
@@ -1277,7 +1828,7 @@ const LowerCtx = struct {
             // Wave 3 placeholders — consume args and push placeholder
             .ecPairing, .schnorrVerify => {
                 for (args) |arg| {
-                    try self.bringToTopAuto(arg);
+                    try self.bringToTopOperand(arg, args);
                     _ = self.stack.pop();
                 }
                 try self.emitPushInt(0);
@@ -1291,7 +1842,7 @@ const LowerCtx = struct {
         if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1323,7 +1874,7 @@ const LowerCtx = struct {
         if (args.len < sha256_emitters.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1361,7 +1912,7 @@ const LowerCtx = struct {
         if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1393,7 +1944,7 @@ const LowerCtx = struct {
         if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1470,7 +2021,7 @@ const LowerCtx = struct {
         if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
 
         for (args) |arg| {
-            try self.bringToTopAuto(arg);
+            try self.bringToTopOperand(arg, args);
         }
         for (args) |_| {
             _ = self.stack.pop();
@@ -1491,6 +2042,225 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
+    fn lowerNistEcBuiltin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, builtin: crypto_builtins.CryptoBuiltin) LowerError!void {
+        if (args.len < crypto_builtins.requiredArgCount(builtin)) return LowerError.InvalidBuiltin;
+
+        for (args) |arg| {
+            try self.bringToTopOperand(arg, args);
+        }
+        for (args) |_| {
+            _ = self.stack.pop();
+        }
+
+        var bundle = nist_ec_emitters.buildBuiltinOps(self.allocator, builtin) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedOperation,
+        };
+        defer bundle.deinit();
+
+        for (bundle.ops) |op| {
+            try self.emitEcStackOp(op);
+        }
+
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    fn lowerBBBuiltin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, builtin: babybear_emitters.BBBuiltin) LowerError!void {
+        const required: usize = switch (builtin) {
+            .bb_field_add, .bb_field_sub, .bb_field_mul => 2,
+            .bb_field_inv => 1,
+            .bb_ext4_mul0, .bb_ext4_mul1, .bb_ext4_mul2, .bb_ext4_mul3 => 8,
+            .bb_ext4_inv0, .bb_ext4_inv1, .bb_ext4_inv2, .bb_ext4_inv3 => 4,
+        };
+        if (args.len < required) return LowerError.InvalidBuiltin;
+
+        for (args) |arg| {
+            try self.bringToTopOperand(arg, args);
+        }
+        for (args) |_| {
+            _ = self.stack.pop();
+        }
+
+        var bundle = babybear_emitters.buildBuiltinOps(self.allocator, builtin) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedOperation,
+        };
+        defer bundle.deinit();
+
+        for (bundle.ops) |op| {
+            try self.emitEcStackOp(op);
+        }
+
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    fn lowerKBBuiltin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, builtin: koalabear_emitters.KBBuiltin) LowerError!void {
+        const required: usize = switch (builtin) {
+            .kb_field_add, .kb_field_sub, .kb_field_mul => 2,
+            .kb_field_inv => 1,
+            .kb_ext4_mul0, .kb_ext4_mul1, .kb_ext4_mul2, .kb_ext4_mul3 => 8,
+            .kb_ext4_inv0, .kb_ext4_inv1, .kb_ext4_inv2, .kb_ext4_inv3 => 4,
+        };
+        if (args.len < required) return LowerError.InvalidBuiltin;
+
+        for (args) |arg| {
+            try self.bringToTopOperand(arg, args);
+        }
+        for (args) |_| {
+            _ = self.stack.pop();
+        }
+
+        var bundle = koalabear_emitters.buildBuiltinOps(self.allocator, builtin) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedOperation,
+        };
+        defer bundle.deinit();
+
+        for (bundle.ops) |op| {
+            try self.emitEcStackOp(op);
+        }
+
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    fn lowerBN254Builtin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, builtin: bn254_emitters.BN254Builtin) LowerError!void {
+        const required: usize = switch (builtin) {
+            .bn254_field_add, .bn254_field_sub, .bn254_field_mul, .bn254_g1_add, .bn254_g1_scalar_mul => 2,
+            .bn254_field_inv, .bn254_field_neg, .bn254_g1_negate, .bn254_g1_on_curve => 1,
+        };
+        if (args.len < required) return LowerError.InvalidBuiltin;
+
+        for (args) |arg| {
+            try self.bringToTopOperand(arg, args);
+        }
+        for (args) |_| {
+            _ = self.stack.pop();
+        }
+
+        var bundle = bn254_emitters.buildBuiltinOps(self.allocator, builtin) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedOperation,
+        };
+        defer bundle.deinit();
+
+        for (bundle.ops) |op| {
+            try self.emitEcStackOp(op);
+        }
+
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    fn lowerPoseidon2MerkleBuiltin(
+        self: *LowerCtx,
+        bind_name: []const u8,
+        args: []const []const u8,
+    ) LowerError!void {
+        // args: [leaf_0..leaf_7(8), proof(depth*8 elems), index, depth]
+        // depth must be a compile-time constant
+        // The depth arg is always last.
+        if (args.len < 3) return LowerError.InvalidBuiltin;
+
+        const depth_arg = args[args.len - 1];
+        const depth_value = self.findConstantInt(depth_arg) orelse return LowerError.InvalidBuiltin;
+        if (depth_value < 1 or depth_value > 32) return LowerError.InvalidBuiltin;
+
+        // Remove depth from the real stack (compile-time constant, not runtime).
+        if (self.stack.findDepth(depth_arg) != null) {
+            try self.bringToTopAuto(depth_arg);
+            try self.emitOp(.op_drop);
+            _ = self.stack.pop();
+        }
+
+        // Bring remaining args to the stack top.
+        const runtime_args = args[0 .. args.len - 1];
+        for (runtime_args) |arg| {
+            try self.bringToTopOperand(arg, args);
+        }
+        for (runtime_args) |_| {
+            _ = self.stack.pop();
+        }
+
+        var bundle = poseidon2_merkle.buildPoseidon2MerkleRootOps(self.allocator, @intCast(depth_value)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedOperation,
+        };
+        defer bundle.deinit();
+
+        for (bundle.ops) |op| {
+            try self.emitEcStackOp(op);
+        }
+
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    fn lowerMerkleBuiltin(
+        self: *LowerCtx,
+        bind_name: []const u8,
+        args: []const []const u8,
+        func_name: []const u8,
+        builtin: merkle_emitters.MerkleBuiltin,
+    ) LowerError!void {
+        // args: [leaf, proof, index, depth]
+        // depth must be a compile-time constant
+        if (args.len != 4) return LowerError.InvalidBuiltin;
+        _ = func_name;
+
+        // Extract depth constant from ANF binding
+        const depth_arg = args[3];
+        const depth_value = self.findConstantInt(depth_arg) orelse return LowerError.InvalidBuiltin;
+        if (depth_value < 1 or depth_value > 64) return LowerError.InvalidBuiltin;
+
+        // Remove depth from the real stack FIRST (compile-time constant, not runtime).
+        if (self.stack.findDepth(depth_arg) != null) {
+            try self.bringToTopAuto(depth_arg);
+            try self.emitOp(.op_drop);
+            _ = self.stack.pop();
+        }
+
+        // Bring leaf, proof, index to stack top for the codegen
+        for (0..3) |i| {
+            try self.bringToTopOperand(args[i], args);
+        }
+        // Pop the 3 args -- the codegen consumes them and produces 1 result
+        for (0..3) |_| {
+            _ = self.stack.pop();
+        }
+
+        var bundle = merkle_emitters.buildBuiltinOps(self.allocator, builtin, @intCast(depth_value)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnsupportedOperation,
+        };
+        defer bundle.deinit();
+
+        for (bundle.ops) |op| {
+            try self.emitEcStackOp(op);
+        }
+
+        try self.stack.push(self.allocator, bind_name);
+        self.trackDepth();
+    }
+
+    /// Look up a binding name in scope_bindings to find a compile-time constant integer.
+    fn findConstantInt(self: *const LowerCtx, name: []const u8) ?i64 {
+        for (self.scope_bindings) |binding| {
+            if (std.mem.eql(u8, binding.name, name)) {
+                switch (binding.value) {
+                    .load_const => |lc| switch (lc.value) {
+                        .integer => |n| return std.math.cast(i64, n),
+                        else => return null,
+                    },
+                    else => return null,
+                }
+            }
+        }
+        return null;
+    }
+
     // ========================================================================
     // Simple builtin helpers
     // ========================================================================
@@ -1506,8 +2276,8 @@ const LowerCtx = struct {
 
     fn lowerSimpleBinaryBuiltin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, op: Opcode) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         try self.emitOp(op);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -1524,13 +2294,60 @@ const LowerCtx = struct {
     }
 
     fn lowerCheckMultiSig(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
-        for (args) |arg| {
-            try self.bringToTopAuto(arg);
+        // Lower checkMultiSig([sig1..sigN], [pk1..pkM]) to Bitcoin Script.
+        //
+        // OP_CHECKMULTISIG expects the stack (bottom -> top):
+        //   <dummy=OP_0> <sig1> ... <sigN> <N> <pk1> ... <pkM> <M>
+        //
+        // args[0] and args[1] are bindings produced by array_literal. Those
+        // bindings are NOT physical stack slots — their element refs live on
+        // the stack-map as individual named bindings. We pull each element to
+        // TOS via bringToTop. computeLastUses propagates each element's
+        // last-use through the array indirection to THIS binding. Mirrors
+        // TS `lowerCheckMultiSig` in `05-stack-lower.ts`.
+        if (args.len != 2) return LowerError.InvalidBuiltin;
+
+        const sigs_ref = args[0];
+        const pks_ref = args[1];
+        const sig_elems = self.array_elements.get(sigs_ref) orelse return LowerError.InvalidBuiltin;
+        const pk_elems = self.array_elements.get(pks_ref) orelse return LowerError.InvalidBuiltin;
+
+        // Dummy OP_0 (historical CHECKMULTISIG off-by-one).
+        try self.emitPushInt(0);
+        try self.stack.push(self.allocator, null);
+
+        // A ref repeated across the combined element list (e.g. the same
+        // pubkey twice) must be copied at every position — see operandConsume.
+        const msig_operands = try std.mem.concat(self.allocator, []const u8, &.{ sig_elems, pk_elems });
+        defer self.allocator.free(msig_operands);
+
+        // Bring each sig element to TOS in declaration order.
+        for (sig_elems) |sig| {
+            const consume = self.operandConsume(sig, msig_operands);
+            try self.bringToTop(sig, consume);
         }
-        try self.emitOp(.op_checkmultisig);
-        for (args) |_| {
+
+        // Push nSigs.
+        try self.emitPushInt(@intCast(sig_elems.len));
+        try self.stack.push(self.allocator, null);
+
+        // Bring each pubkey element to TOS in declaration order.
+        for (pk_elems) |pk| {
+            const consume = self.operandConsume(pk, msig_operands);
+            try self.bringToTop(pk, consume);
+        }
+
+        // Push nPKs.
+        try self.emitPushInt(@intCast(pk_elems.len));
+        try self.stack.push(self.allocator, null);
+
+        // OP_CHECKMULTISIG consumes: dummy + N sigs + nSigs + M pks + nPKs.
+        const consumed = 1 + sig_elems.len + 1 + pk_elems.len + 1;
+        for (0..consumed) |_| {
             _ = self.stack.pop();
         }
+
+        try self.emitOp(.op_checkmultisig);
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
     }
@@ -1555,9 +2372,9 @@ const LowerCtx = struct {
 
     fn lowerWithin(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 3) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
-        try self.bringToTopAuto(args[2]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
+        try self.bringToTopOperand(args[2], args);
         try self.emitOp(.op_within);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -1576,8 +2393,8 @@ const LowerCtx = struct {
 
     fn lowerSplit(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]); // data
-        try self.bringToTopAuto(args[1]); // position
+        try self.bringToTopOperand(args[0], args); // data
+        try self.bringToTopOperand(args[1], args); // position
         try self.emitOp(.op_split);
         // OP_SPLIT consumes data + position, produces left + right (two outputs)
         _ = self.stack.pop();
@@ -1589,8 +2406,8 @@ const LowerCtx = struct {
 
     fn lowerLeft(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]); // data
-        try self.bringToTopAuto(args[1]); // length
+        try self.bringToTopOperand(args[0], args); // data
+        try self.bringToTopOperand(args[1], args); // length
         try self.emitOp(.op_split);
         try self.emitOp(.op_drop); // drop right, keep left
         _ = self.stack.pop();
@@ -1601,8 +2418,8 @@ const LowerCtx = struct {
 
     fn lowerSubstr(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 3) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]); // s
-        try self.bringToTopAuto(args[1]); // start
+        try self.bringToTopOperand(args[0], args); // s
+        try self.bringToTopOperand(args[1], args); // start
         try self.emitOp(.op_split);
         try self.emitOp(.op_nip); // drop left, keep right
         _ = self.stack.pop();
@@ -1610,7 +2427,7 @@ const LowerCtx = struct {
         try self.stack.push(self.allocator, null);
         self.trackDepth();
 
-        try self.bringToTopAuto(args[2]); // length
+        try self.bringToTopOperand(args[2], args); // length
         try self.emitOp(.op_split);
         try self.emitOp(.op_drop); // drop rest, keep substr
         _ = self.stack.pop();
@@ -1631,8 +2448,8 @@ const LowerCtx = struct {
 
     fn lowerSafeDivMod(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, final_op: Opcode) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         try self.emitOp(.op_dup);
         try self.emitOp(.op_0notequal);
         try self.emitOp(.op_verify);
@@ -1653,8 +2470,8 @@ const LowerCtx = struct {
 
     fn lowerPow(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         _ = self.stack.pop();
         _ = self.stack.pop();
 
@@ -1680,14 +2497,14 @@ const LowerCtx = struct {
 
     fn lowerMulDiv(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 3) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         try self.emitOp(.op_mul);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
         self.trackDepth();
-        try self.bringToTopAuto(args[2]);
+        try self.bringToTopOperand(args[2], args);
         try self.emitOp(.op_div);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -1697,8 +2514,8 @@ const LowerCtx = struct {
 
     fn lowerPercentOf(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.emitOp(.op_mul);
@@ -1734,8 +2551,8 @@ const LowerCtx = struct {
 
     fn lowerGcd(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.emitOp(.op_abs);
@@ -1757,18 +2574,43 @@ const LowerCtx = struct {
     }
 
     fn lowerDivMod(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
+        // divmod(a, b): returns the quotient (drops the remainder).
+        // Mirrors TS / Go / Java / Rust / Python / Ruby:
+        //   OP_2DUP  -> a b a b
+        //   OP_DIV   -> a b (a/b)
+        //   OP_ROT   -> b (a/b) a
+        //   OP_ROT   -> (a/b) a b
+        //   OP_MOD   -> (a/b) (a%b)
+        //   OP_DROP  -> (a/b)
+        // The previous Zig implementation used OP_OVER OP_OVER OP_MOD
+        // OP_ROT OP_ROT OP_DIV which produced the quotient on top but a
+        // different intermediate stack shape, breaking byte-level parity
+        // with the other 6 tiers (caught by the math-demo conformance
+        // fixture once the divmod method was added).
         if (args.len < 2) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
-        try self.emitOp(.op_over);
-        try self.emitOp(.op_over);
-        try self.emitOp(.op_mod);
-        try self.emitOp(.op_rot);
-        try self.emitOp(.op_rot);
+        // divmod(a, b): returns the quotient (drops the remainder).
+        // Mirrors TS / Go / Java / Rust / Python / Ruby:
+        //   OP_2DUP  -> a b a b
+        //   OP_DIV   -> a b (a/b)
+        //   OP_ROT   -> b (a/b) a
+        //   OP_ROT   -> (a/b) a b
+        //   OP_MOD   -> (a/b) (a%b)
+        //   OP_DROP  -> (a/b)
+        // The previous Zig implementation used OP_OVER OP_OVER OP_MOD
+        // OP_ROT OP_ROT OP_DIV which produced the quotient on top but a
+        // different intermediate stack shape, breaking byte-level parity
+        // with the other 6 tiers (caught by the math-demo conformance
+        // fixture once the divmod method was added).
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.emitOp(.op_2dup);
         try self.emitOp(.op_div);
-        _ = self.stack.pop();
-        _ = self.stack.pop();
-        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_rot);
+        try self.emitOp(.op_rot);
+        try self.emitOp(.op_mod);
+        try self.emitOp(.op_drop);
         try self.stack.push(self.allocator, bind_name);
         self.trackDepth();
     }
@@ -1800,14 +2642,14 @@ const LowerCtx = struct {
 
     fn lowerClamp(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 3) return LowerError.InvalidBuiltin;
-        try self.bringToTopAuto(args[0]);
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[0], args);
+        try self.bringToTopOperand(args[1], args);
         try self.emitOp(.op_max);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
         self.trackDepth();
-        try self.bringToTopAuto(args[2]);
+        try self.bringToTopOperand(args[2], args);
         try self.emitOp(.op_min);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -1830,23 +2672,77 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
-    fn lowerCheckPreimage(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
+    fn lowerCheckPreimage(self: *LowerCtx, bind_name: []const u8, args: []const []const u8, sighash_flag: i32) !void {
         if (args.len < 1) return LowerError.InvalidBuiltin;
+        // OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
+        // current spending transaction. The signature is DERIVED FROM THE PREIMAGE
+        // ON CHAIN (Optimal OP_PUSH_TX): s = (hash256(preimage) + r)*k⁻¹ mod n, with
+        // fixed nonce k and privkey d=1 (pubkey = G). OP_CHECKSIG(sig, G) then passes
+        // iff hash256(preimage) equals the node's real tx sighash — closing BUG-100.
+        // The unlocking script pushes ONLY <preimage> (no witness signature).
+        // See emitCheckPreimageBinding for the construction.
+
+        // Emit OP_CODESEPARATOR so the scriptCode in the BIP-143 preimage is only
+        // the code after this point (smaller preimage; required for large scripts).
         try self.emitOp(.op_codeseparator);
+
+        // Bring the preimage to the top (kept for field extractors below).
         try self.bringToTopAuto(args[0]);
-        if (self.stack.findDepth("_opPushTxSig") == null) return LowerError.VariableNotFound;
-        try self.bringToTop("_opPushTxSig", true);
-        try self.emitPushData(&generator_point_g);
-        // Track the generator point in the stack map so pop accounting is correct
-        try self.stack.push(self.allocator, null);
-        self.trackDepth();
-        // OP_CHECKSIGVERIFY consumes top 2 items (sig/txsig + pubkey/G)
-        try self.emitOp(.op_checksigverify);
-        _ = self.stack.pop(); // G (generator point)
-        _ = self.stack.pop(); // _opPushTxSig
-        // preimage (args[0]) remains on stack — consumed by caller or used downstream
+
+        // Derive + verify the signature on-chain (single opaque raw_bytes blob).
+        // For the default ALL|FORKID (sighash_flag 0/0x41) the blob is
+        // byte-identical to the pinned cross-tier constant; issue #123 lets a
+        // method declare a different mode, which only changes the appended
+        // sighash flag byte. Net stack effect is zero.
+        try self.emitCheckPreimageBinding(sighash_flag);
+
+        // Preimage remains on top. Rename for field extractors.
         try self.stack.renameAtDepth(self.allocator, 0, bind_name);
         self.trackDepth();
+    }
+
+    /// Emit the on-chain preimage binding (BUG-100 fix) as one opaque raw_bytes
+    /// op. Net stack effect is 0 (preimage in → preimage out), declared as
+    /// in=1/out=1 so the static analyzer keeps the depth consistent and the
+    /// peephole optimizer treats it as a hard barrier. The construction is the
+    /// canonical output of the TypeScript reference, byte-identical across all
+    /// seven tiers (guarded by the cross-tier conformance suite).
+    fn emitCheckPreimageBinding(self: *LowerCtx, sighash_flag: i32) !void {
+        // The frozen binding hex pushes SIGHASH_ALL|FORKID (0x41) as the DER
+        // signature's appended sighash byte via the single `0141` push
+        // immediately before the fixed G-pubkey tail. Issue #123 lets a method
+        // declare a different mode, which only changes that one appended flag
+        // byte — byte-for-byte matching the TS reference's
+        // emitCheckPreimageBinding(flag). All valid (FORKID-required) sighash
+        // flags (0x41/0x42/0x43/0xc1/0xc2/0xc3) minimal-push as OP_DATA_1 + flag.
+        var flag: i32 = sighash_flag;
+        if (flag == 0) flag = 0x41;
+
+        var owned_hex: ?[]u8 = null;
+        defer if (owned_hex) |h| self.allocator.free(h);
+        const hex: []const u8 = if (flag == 0x41) check_preimage_binding_hex else blk: {
+            const suffix = "0141" ++ check_preimage_sighash_tail;
+            if (!std.mem.endsWith(u8, check_preimage_binding_hex, suffix)) {
+                return LowerError.UnsupportedOperation;
+            }
+            const prefix = check_preimage_binding_hex[0 .. check_preimage_binding_hex.len - suffix.len];
+            const new_hex = try std.fmt.allocPrint(self.allocator, "{s}01{x:0>2}{s}", .{
+                prefix,
+                @as(u8, @intCast(flag & 0xff)),
+                check_preimage_sighash_tail,
+            });
+            owned_hex = new_hex;
+            break :blk new_hex;
+        };
+
+        const decoded = try self.allocator.alloc(u8, hex.len / 2);
+        _ = std.fmt.hexToBytes(decoded, hex) catch {
+            self.allocator.free(decoded);
+            return LowerError.UnsupportedOperation;
+        };
+        // Track the buffer so it gets freed when the program is deinit'd.
+        try self.owned_push_data.append(self.allocator, decoded);
+        try self.emit(.{ .raw_bytes = .{ .bytes = decoded, .in_arity = 1, .out_arity = 1 } });
     }
 
     fn lowerDeserializeState(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
@@ -1949,9 +2845,19 @@ const LowerCtx = struct {
             try self.emitOp(.op_drop);
             _ = self.stack.pop();
         } else {
-            // Variable-length path: strip varint, use _codePart to find state
+            // Variable-length path: strip varint, use _codePart to find state.
+            //
+            // BIP-143 scriptCode is prefixed by a Bitcoin varint:
+            //   length < 0xfd:        1 byte (length itself)
+            //   length <= 0xffff:     0xfd + 2 bytes LE                (3 bytes)
+            //   length <= 0xffffffff: 0xfe + 4 bytes LE                (5 bytes)
+            //   otherwise:            0xff + 8 bytes LE                (9 bytes)
+            //
+            // We must support all four shapes, otherwise scripts whose
+            // scriptCode exceeds 65,535 bytes (e.g. embedded BN254 verifiers)
+            // silently strip too few varint bytes and corrupt the subsequent
+            // state-extraction OP_SPLITs.
 
-            // Strip varint prefix from varint+scriptCode
             // SPLIT 1 -> [..., firstByte, rest]
             try self.emitPushInt(1);
             try self.stack.push(self.allocator, null);
@@ -1966,65 +2872,86 @@ const LowerCtx = struct {
             const vt_next = self.stack.pop();
             try self.stack.push(self.allocator, vt_top);
             try self.stack.push(self.allocator, vt_next);
-            // DUP -> [..., rest, firstByte, firstByte]
-            try self.emitOp(.op_dup);
-            try self.stack.push(self.allocator, self.stack.peekAtDepth(0));
-            // Zero-pad before BIN2NUM to prevent sign-bit misinterpretation (0xfd -> -125 without pad)
-            // push 0x00
+            // Zero-pad firstByte before BIN2NUM so 0xfd/0xfe/0xff aren't read
+            // as negative script numbers.
             try self.emitPushData(&.{0x00});
             try self.stack.push(self.allocator, null);
-            // CAT -> [..., rest, firstByte, firstByte||0x00]
+            // CAT -> [..., rest, firstByte||0x00]
             try self.emitOp(.op_cat);
             _ = self.stack.pop();
             _ = self.stack.pop();
             try self.stack.push(self.allocator, null);
-            // BIN2NUM -> [..., rest, firstByte, fb_num]
+            // BIN2NUM -> [..., rest, fb_num]
             try self.emitOp(.op_bin2num);
-            // push 253
+
+            // IF fb_num < 253: 1-byte varint, drop fb_num.
+            try self.emitOp(.op_dup);
+            try self.stack.push(self.allocator, self.stack.peekAtDepth(0));
             try self.emitPushInt(253);
             try self.stack.push(self.allocator, null);
-            // OP_LESSTHAN -> [..., rest, firstByte, (fb<253)]
             try self.emitOp(.op_lessthan);
             _ = self.stack.pop();
             _ = self.stack.pop();
             try self.stack.push(self.allocator, null);
-
-            // OP_IF
             try self.emitOp(.op_if);
             _ = self.stack.pop();
-            var sm_at_varint_if = try self.stack.clone(self.allocator);
-
-            // THEN: fb < 253 -> 1-byte varint, already consumed by the SPLIT 1
-            // DROP firstByte (not needed anymore)
+            var sm_at_1byte_if = try self.stack.clone(self.allocator);
+            // THEN: 1-byte varint
             try self.emitOp(.op_drop);
             _ = self.stack.pop();
-
-            // OP_ELSE
             try self.emitOp(.op_else);
             self.stack.deinit(self.allocator);
-            self.stack = sm_at_varint_if;
-            sm_at_varint_if = .{};
+            self.stack = sm_at_1byte_if;
+            sm_at_1byte_if = .{};
 
-            // ELSE: fb >= 253 -> 2-byte varint follows, skip 2 more bytes
-            // DROP firstByte
+            // ELSE: fb_num >= 253. Check 0xfe (5-byte varint) next.
+            try self.emitOp(.op_dup);
+            try self.stack.push(self.allocator, self.stack.peekAtDepth(0));
+            try self.emitPushInt(254);
+            try self.stack.push(self.allocator, null);
+            try self.emitOp(.op_numequal);
+            _ = self.stack.pop();
+            _ = self.stack.pop();
+            try self.stack.push(self.allocator, null);
+            try self.emitOp(.op_if);
+            _ = self.stack.pop();
+            var sm_at_fe_if = try self.stack.clone(self.allocator);
+            // THEN: 5-byte varint (0xfe + 4 bytes LE).
             try self.emitOp(.op_drop);
             _ = self.stack.pop();
-            // push 2
-            try self.emitPushInt(2);
-            try self.stack.push(self.allocator, null);
-            // SPLIT -> [..., 2bytes, rest2]
-            try self.emitOp(.op_split);
-            _ = self.stack.pop();
-            _ = self.stack.pop();
-            try self.stack.push(self.allocator, null);
-            try self.stack.push(self.allocator, null);
-            // NIP -> [..., rest2]
-            try self.emitOp(.op_nip);
-            _ = self.stack.pop();
-            _ = self.stack.pop();
-            try self.stack.push(self.allocator, null);
+            try self.emitDropMoreVarintBytes(4);
+            try self.emitOp(.op_else);
+            self.stack.deinit(self.allocator);
+            self.stack = sm_at_fe_if;
+            sm_at_fe_if = .{};
 
-            // OP_ENDIF
+            // ELSE: fb_num != 254. Check 0xff (9-byte varint) next.
+            try self.emitOp(.op_dup);
+            try self.stack.push(self.allocator, self.stack.peekAtDepth(0));
+            try self.emitPushInt(255);
+            try self.stack.push(self.allocator, null);
+            try self.emitOp(.op_numequal);
+            _ = self.stack.pop();
+            _ = self.stack.pop();
+            try self.stack.push(self.allocator, null);
+            try self.emitOp(.op_if);
+            _ = self.stack.pop();
+            var sm_at_ff_if = try self.stack.clone(self.allocator);
+            // THEN: 9-byte varint (0xff + 8 bytes LE).
+            try self.emitOp(.op_drop);
+            _ = self.stack.pop();
+            try self.emitDropMoreVarintBytes(8);
+            try self.emitOp(.op_else);
+            self.stack.deinit(self.allocator);
+            self.stack = sm_at_ff_if;
+            sm_at_ff_if = .{};
+
+            // ELSE: fb_num must be 253 (0xfd) -- 3-byte varint.
+            try self.emitOp(.op_drop);
+            _ = self.stack.pop();
+            try self.emitDropMoreVarintBytes(2);
+            try self.emitOp(.op_endif);
+            try self.emitOp(.op_endif);
             try self.emitOp(.op_endif);
 
             // Compute skip = SIZE(_codePart) - codeSepIdx
@@ -2070,7 +2997,7 @@ const LowerCtx = struct {
         if (args.len < 2) return LowerError.InvalidBuiltin;
         try self.emitPushData(&stateful_templates.p2pkh_prefix_with_len);
         try self.stack.push(self.allocator, null);
-        try self.bringToTopAuto(args[0]);
+        try self.bringToTopOperand(args[0], args);
         try self.emitOp(.op_cat);
         _ = self.stack.pop();
         _ = self.stack.pop();
@@ -2083,7 +3010,7 @@ const LowerCtx = struct {
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
 
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[1], args);
         try self.emitPushInt(8);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
@@ -2125,6 +3052,7 @@ const LowerCtx = struct {
                 switch (iv) {
                     .boolean => |b| try self.emitPushBool(b),
                     .integer => |n| try self.emitPushInt(@intCast(n)),
+                    .big_integer => |s| try self.emitPushBigIntDecimal(s),
                     .string => |s| try self.emitPushData(s),
                 }
                 try self.stack.push(self.allocator, null);
@@ -2133,29 +3061,20 @@ const LowerCtx = struct {
                 try self.stack.push(self.allocator, null);
             }
 
-            switch (prop.type_info) {
-                .bigint => {
-                    try self.emitPushInt(8);
-                    try self.stack.push(self.allocator, null);
-                    try self.emitOp(.op_num2bin);
-                    _ = self.stack.pop();
-                    _ = self.stack.pop();
-                    try self.stack.push(self.allocator, null);
-                },
-                .boolean => {
-                    try self.emitPushInt(1);
-                    try self.stack.push(self.allocator, null);
-                    try self.emitOp(.op_num2bin);
-                    _ = self.stack.pop();
-                    _ = self.stack.pop();
-                    try self.stack.push(self.allocator, null);
-                },
-                .byte_string => {
-                    // Prepend push-data length prefix (matching SDK format)
-                    try self.emitPushDataEncode();
-                },
-                else => {},
+            if (isNumericStateType(prop.type_info)) {
+                const width: i64 = if (prop.type_info == .boolean) 1 else 8;
+                try self.emitPushInt(width);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_num2bin);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+            } else if (isVariableLengthStateType(prop.type_info)) {
+                // Prepend push-data length prefix (matching SDK format)
+                try self.emitPushDataEncode();
             }
+            // Fixed-width byte types (PubKey, Addr, Ripemd160, Sha256, Point,
+            // P256Point, P384Point) are already byte sequences and used as-is.
 
             if (!first) {
                 try self.emitOp(.op_cat);
@@ -2170,15 +3089,41 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
+    /// Returns true if the type is serialized as a fixed-size big-endian numeric
+    /// value via OP_NUM2BIN (and deserialized via OP_BIN2NUM). Covers bigint,
+    /// boolean and the Rabin primitives (treated as 8-byte scalars on the wire).
+    fn isNumericStateType(t: types.RunarType) bool {
+        return switch (t) {
+            .bigint, .boolean, .rabin_sig, .rabin_pub_key => true,
+            else => false,
+        };
+    }
+
+    /// Returns true if the type has no fixed wire length and must be serialized
+    /// with a push-data length prefix (ByteString, Sig, SigHashPreimage).
+    fn isVariableLengthStateType(t: types.RunarType) bool {
+        return switch (t) {
+            .byte_string, .sig, .sig_hash_preimage => true,
+            else => false,
+        };
+    }
+
+    /// Size in bytes of a state property on the wire, or -1 for variable-length
+    /// fields that carry a push-data length prefix.
+    ///
+    /// Covers all 14 validator-permitted property types. Keep in sync with
+    /// lowerGetStateScript, splitFixedStateFields, parseVariableLengthStateFields,
+    /// and lowerAddOutput — all of which dispatch on the same type set.
     fn statePropSize(prop: types.ANFProperty) LowerError!i64 {
         return switch (prop.type_info) {
-            .bigint => 8,
+            .bigint, .rabin_sig, .rabin_pub_key => 8,
             .boolean => 1,
-            .pub_key => 33,
             .addr, .ripemd160 => 20,
             .sha256 => 32,
-            .point => 64,
-            .byte_string => -1,
+            .pub_key => 33,
+            .point, .p256_point => 64,
+            .p384_point => 96,
+            .byte_string, .sig, .sig_hash_preimage => -1,
             else => LowerError.UnsupportedOperation,
         };
     }
@@ -2502,10 +3447,7 @@ const LowerCtx = struct {
     fn splitFixedStateFields(self: *LowerCtx, state_props: []const types.ANFProperty, prop_sizes: []const i64) !void {
         if (state_props.len == 1) {
             const prop = state_props[0];
-            switch (prop.type_info) {
-                .bigint, .boolean => try self.emitOp(.op_bin2num),
-                else => {},
-            }
+            if (isNumericStateType(prop.type_info)) try self.emitOp(.op_bin2num);
             try self.stack.renameAtDepth(self.allocator, 0, prop.name);
         } else {
             for (state_props, 0..) |prop, i| {
@@ -2525,10 +3467,7 @@ const LowerCtx = struct {
                     try self.stack.push(self.allocator, rest);
                     try self.stack.push(self.allocator, prop_bytes);
 
-                    switch (prop.type_info) {
-                        .bigint, .boolean => try self.emitOp(.op_bin2num),
-                        else => {},
-                    }
+                    if (isNumericStateType(prop.type_info)) try self.emitOp(.op_bin2num);
 
                     try self.emitOp(.op_swap);
                     const prop_value = self.stack.pop();
@@ -2537,37 +3476,32 @@ const LowerCtx = struct {
                     try self.stack.push(self.allocator, remainder);
                     try self.stack.renameAtDepth(self.allocator, 1, prop.name);
                 } else {
-                    switch (prop.type_info) {
-                        .bigint, .boolean => try self.emitOp(.op_bin2num),
-                        else => {},
-                    }
+                    if (isNumericStateType(prop.type_info)) try self.emitOp(.op_bin2num);
                     try self.stack.renameAtDepth(self.allocator, 0, prop.name);
                 }
             }
         }
     }
 
-    /// Parse state fields left-to-right, handling variable-length ByteString fields.
+    /// Parse state fields left-to-right, handling variable-length fields
+    /// (ByteString, Sig, SigHashPreimage) that carry a push-data length prefix.
     fn parseVariableLengthStateFields(self: *LowerCtx, state_props: []const types.ANFProperty, prop_sizes: []const i64) !void {
         if (state_props.len == 1) {
             const prop = state_props[0];
-            if (prop.type_info == .byte_string) {
-                // Single ByteString field: decode push-data prefix, drop trailing empty
+            if (isVariableLengthStateType(prop.type_info)) {
+                // Single variable-length field: decode push-data prefix, drop trailing empty
                 try self.emitPushDataDecode(); // [..., data, remaining]
                 try self.emitOp(.op_drop);
                 _ = self.stack.pop();
-            } else {
-                switch (prop.type_info) {
-                    .bigint, .boolean => try self.emitOp(.op_bin2num),
-                    else => {},
-                }
+            } else if (isNumericStateType(prop.type_info)) {
+                try self.emitOp(.op_bin2num);
             }
             try self.stack.renameAtDepth(self.allocator, 0, prop.name);
         } else {
             for (state_props, 0..) |prop, i| {
                 if (i < state_props.len - 1) {
-                    if (prop.type_info == .byte_string) {
-                        // ByteString: decode push-data prefix, extract data
+                    if (isVariableLengthStateType(prop.type_info)) {
+                        // Variable-length: decode push-data prefix, extract data
                         try self.emitPushDataDecode(); // [..., data, rest]
                         _ = self.stack.pop();
                         _ = self.stack.pop();
@@ -2586,10 +3520,7 @@ const LowerCtx = struct {
                         const sw_next = self.stack.pop();
                         try self.stack.push(self.allocator, sw_top);
                         try self.stack.push(self.allocator, sw_next);
-                        switch (prop.type_info) {
-                            .bigint, .boolean => try self.emitOp(.op_bin2num),
-                            else => {},
-                        }
+                        if (isNumericStateType(prop.type_info)) try self.emitOp(.op_bin2num);
                         try self.emitOp(.op_swap);
                         const prop_val = self.stack.pop();
                         const rest_val = self.stack.pop();
@@ -2598,16 +3529,13 @@ const LowerCtx = struct {
                         try self.stack.renameAtDepth(self.allocator, 1, prop.name);
                     }
                 } else {
-                    if (prop.type_info == .byte_string) {
-                        // Last ByteString: decode push-data prefix, drop trailing empty
+                    if (isVariableLengthStateType(prop.type_info)) {
+                        // Last variable-length field: decode push-data prefix, drop trailing empty
                         try self.emitPushDataDecode(); // [..., data, remaining]
                         try self.emitOp(.op_drop);
                         _ = self.stack.pop();
-                    } else {
-                        switch (prop.type_info) {
-                            .bigint, .boolean => try self.emitOp(.op_bin2num),
-                            else => {},
-                        }
+                    } else if (isNumericStateType(prop.type_info)) {
+                        try self.emitOp(.op_bin2num);
                     }
                     try self.stack.renameAtDepth(self.allocator, 0, prop.name);
                 }
@@ -2618,11 +3546,11 @@ const LowerCtx = struct {
     fn lowerComputeStateOutput(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 3) return LowerError.InvalidBuiltin;
 
-        try self.bringToTopAuto(args[0]);
+        try self.bringToTopOperand(args[0], args);
         try self.emitOp(.op_drop);
         _ = self.stack.pop();
 
-        try self.bringToTopAuto(args[2]);
+        try self.bringToTopOperand(args[2], args);
         try self.emitPushInt(8);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
@@ -2632,7 +3560,7 @@ const LowerCtx = struct {
         try self.emitOp(.op_toaltstack);
         _ = self.stack.pop();
 
-        try self.bringToTopAuto(args[1]);
+        try self.bringToTopOperand(args[1], args);
         try self.bringToTop("_codePart", false);
 
         try self.emitPushData(&stateful_templates.op_return_byte);
@@ -2683,8 +3611,8 @@ const LowerCtx = struct {
     fn lowerComputeStateOutputHash(self: *LowerCtx, bind_name: []const u8, args: []const []const u8) !void {
         if (args.len < 2) return LowerError.InvalidBuiltin;
 
-        try self.bringToTopAuto(args[1]);
-        try self.bringToTopAuto(args[0]);
+        try self.bringToTopOperand(args[1], args);
+        try self.bringToTopOperand(args[0], args);
 
         try self.emitOp(.op_size);
         try self.stack.push(self.allocator, null);
@@ -2831,6 +3759,30 @@ const LowerCtx = struct {
                 _ = self.stack.pop();
                 try self.emitOp(.op_bin2num);
             },
+            .extractSigHashType => {
+                // End-relative: last 4 bytes -> number.
+                // OP_SIZE 4 OP_SUB OP_SPLIT OP_NIP OP_BIN2NUM (matches TS
+                // 05-stack-lower extractSigHashType).
+                try self.emitOp(.op_size);
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitPushInt(4);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_sub);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_split);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_nip);
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_bin2num);
+            },
             .extractOutputHash => {
                 try self.emitOp(.op_size);
                 try self.stack.push(self.allocator, null);
@@ -2867,7 +3819,30 @@ const LowerCtx = struct {
         self.trackDepth();
     }
 
+    // emitVarintEncoding encodes a script number length on top of the stack
+    // as a Bitcoin varint byte sequence.
+    //
+    // Expects stack: [..., script, len]
+    // Leaves stack:  [..., script, varint_bytes]
+    //
+    // Bitcoin varint format:
+    //   len < 0xfd:        1 byte (len itself)
+    //   len <= 0xffff:     0xfd + 2 bytes LE                (3 bytes)
+    //   len <= 0xffffffff: 0xfe + 4 bytes LE                (5 bytes)
+    //   otherwise:         0xff + 8 bytes LE                (9 bytes)
+    //
+    // We must support all four shapes; emitting a 3-byte varint for a script
+    // whose length exceeds 0xffff produces a truncated value that no longer
+    // matches what the BSV node uses for hashOutputs, breaking the
+    // state-continuation hash equality assertion downstream.
+    //
+    // OP_NUM2BIN uses sign-magnitude encoding where high-bit values need an
+    // extra sign byte; we generate one extra byte and then SPLIT off the
+    // unsigned low bytes.
     fn emitVarintEncoding(self: *LowerCtx) !void {
+        // Stack: [..., script, len]
+
+        // IF len < 253: 1-byte varint.
         try self.emitOp(.op_dup);
         try self.stack.push(self.allocator, null);
         try self.emitPushInt(253);
@@ -2876,35 +3851,74 @@ const LowerCtx = struct {
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
-
         try self.emitOp(.op_if);
         _ = self.stack.pop();
-
-        try self.emitPushInt(2);
-        try self.stack.push(self.allocator, null);
-        try self.emitOp(.op_num2bin);
-        _ = self.stack.pop();
-        _ = self.stack.pop();
-        try self.stack.push(self.allocator, null);
-        try self.emitPushInt(1);
-        try self.stack.push(self.allocator, null);
-        try self.emitOp(.op_split);
-        _ = self.stack.pop();
-        _ = self.stack.pop();
-        try self.stack.push(self.allocator, null);
-        try self.stack.push(self.allocator, null);
-        try self.emitOp(.op_drop);
-        _ = self.stack.pop();
-
+        var sm_at_1byte = try self.stack.clone(self.allocator);
+        try self.emitNumToLowBytes(1);
         try self.emitOp(.op_else);
+        self.stack.deinit(self.allocator);
+        self.stack = sm_at_1byte;
+        sm_at_1byte = .{};
 
-        try self.emitPushInt(4);
+        // ELSE-IF len <= 0xffff: 0xfd + 2-byte LE.
+        try self.emitOp(.op_dup);
+        try self.stack.push(self.allocator, null);
+        try self.emitPushInt(0x10000);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_lessthan);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_if);
+        _ = self.stack.pop();
+        var sm_at_3byte = try self.stack.clone(self.allocator);
+        try self.emitNumToLowBytes(2);
+        try self.emitVarintPrefix(0xfd);
+        try self.emitOp(.op_else);
+        self.stack.deinit(self.allocator);
+        self.stack = sm_at_3byte;
+        sm_at_3byte = .{};
+
+        // ELSE-IF len <= 0xffffffff: 0xfe + 4-byte LE.
+        try self.emitOp(.op_dup);
+        try self.stack.push(self.allocator, null);
+        try self.emitPushInt(0x100000000);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_lessthan);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_if);
+        _ = self.stack.pop();
+        var sm_at_5byte = try self.stack.clone(self.allocator);
+        try self.emitNumToLowBytes(4);
+        try self.emitVarintPrefix(0xfe);
+        try self.emitOp(.op_else);
+        self.stack.deinit(self.allocator);
+        self.stack = sm_at_5byte;
+        sm_at_5byte = .{};
+
+        // ELSE: 0xff + 8-byte LE. (Practically unreachable on BSV but kept
+        // for spec completeness so we never silently truncate.)
+        try self.emitNumToLowBytes(8);
+        try self.emitVarintPrefix(0xff);
+
+        try self.emitOp(.op_endif);
+        try self.emitOp(.op_endif);
+        try self.emitOp(.op_endif);
+        // --- Stack: [..., script, varint] ---
+    }
+
+    // emitNumToLowBytes: [..., len] -> [..., low_n_bytes]. Uses
+    // NUM2BIN(n+1) then SPLIT(n) DROP to drop the sign byte.
+    fn emitNumToLowBytes(self: *LowerCtx, n_bytes: i64) !void {
+        try self.emitPushInt(n_bytes + 1);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.stack.push(self.allocator, null);
-        try self.emitPushInt(2);
+        try self.emitPushInt(n_bytes);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_split);
         _ = self.stack.pop();
@@ -2913,19 +3927,55 @@ const LowerCtx = struct {
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_drop);
         _ = self.stack.pop();
-        try self.emitPushData(&.{0xfd});
+    }
+
+    // emitVarintPrefix: [..., script, low_bytes] -> [..., script, prefix||low_bytes].
+    //
+    // The prefix slice MUST live in static memory (not the heap) because Zig's
+    // GeneralPurposeAllocator overwrites freed memory with the 0xaa debug
+    // pattern, and earlier attempts to heap-allocate the prefix byte caused
+    // every emitted varint prefix to read back as 0xaa after the lowering ctx
+    // was deinit'd. Static `&.{0xfd}` literals live in the binary's data
+    // segment forever, so we hard-code the three call sites instead of
+    // taking the byte as a runtime parameter.
+    const VARINT_PREFIX_FD: []const u8 = &.{0xfd};
+    const VARINT_PREFIX_FE: []const u8 = &.{0xfe};
+    const VARINT_PREFIX_FF: []const u8 = &.{0xff};
+
+    fn emitVarintPrefix(self: *LowerCtx, prefix_byte: u8) !void {
+        const data: []const u8 = switch (prefix_byte) {
+            0xfd => VARINT_PREFIX_FD,
+            0xfe => VARINT_PREFIX_FE,
+            0xff => VARINT_PREFIX_FF,
+            else => unreachable,
+        };
+        try self.emitPushData(data);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_swap);
-        const top = self.stack.pop();
-        const next = self.stack.pop();
-        try self.stack.push(self.allocator, top);
-        try self.stack.push(self.allocator, next);
+        const vp_top = self.stack.pop();
+        const vp_next = self.stack.pop();
+        try self.stack.push(self.allocator, vp_top);
+        try self.stack.push(self.allocator, vp_next);
         _ = self.stack.pop();
         _ = self.stack.pop();
         try self.emitOp(.op_cat);
         try self.stack.push(self.allocator, null);
+    }
 
-        try self.emitOp(.op_endif);
+    // emitDropMoreVarintBytes drops `n` additional varint bytes from the
+    // top of stack `rest`. Stack in: [..., rest], stack out: [..., rest_minus_n].
+    fn emitDropMoreVarintBytes(self: *LowerCtx, n: i64) !void {
+        try self.emitPushInt(n);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_split);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
+        try self.stack.push(self.allocator, null);
+        try self.emitOp(.op_nip);
+        _ = self.stack.pop();
+        _ = self.stack.pop();
+        try self.stack.push(self.allocator, null);
     }
 
     // ========================================================================
@@ -2945,7 +3995,15 @@ const LowerCtx = struct {
     // if_expr
     // ========================================================================
 
+    fn lowerIfExprTerminal(self: *LowerCtx, bind_name: []const u8, ie: *const types.ANFIfExpr, terminal_assert: bool) !void {
+        return self.lowerIfExprImpl(bind_name, ie, terminal_assert);
+    }
+
     fn lowerIfExpr(self: *LowerCtx, bind_name: []const u8, ie: *const types.ANFIfExpr) !void {
+        return self.lowerIfExprImpl(bind_name, ie, false);
+    }
+
+    fn lowerIfExprImpl(self: *LowerCtx, bind_name: []const u8, ie: *const types.ANFIfExpr, terminal_assert: bool) !void {
         try self.bringToTopAuto(ie.condition);
         _ = self.stack.pop();
         var base_stack = try self.stack.clone(self.allocator);
@@ -2970,17 +4028,16 @@ const LowerCtx = struct {
         then_ctx.in_branch = true;
         then_ctx.copy_ref_aliases = self.copy_ref_aliases;
         then_ctx.max_depth = self.max_depth;
-        for (ie.then_bindings) |binding| {
-            try then_ctx.local_bindings.put(self.allocator, binding.name, {});
-        }
-        try then_ctx.computeLastUses(ie.then_bindings);
-        var protected_then = protected_refs.iterator();
-        while (protected_then.next()) |entry| {
-            try then_ctx.last_uses.put(self.allocator, entry.key_ptr.*, ie.then_bindings.len);
-        }
-        for (ie.then_bindings, 0..) |binding, idx| {
-            then_ctx.current_idx = idx;
-            try then_ctx.lowerBinding(binding);
+        then_ctx.outer_protected_refs = &protected_refs;
+        try then_ctx.lowerBindings(ie.then_bindings, terminal_assert);
+        try then_ctx.drainBranchPrivateResidue(&pre_if_names);
+        if (terminal_assert and then_ctx.stack.depth() > 1) {
+            const excess = then_ctx.stack.depth() - 1;
+            var i: usize = 0;
+            while (i < excess) : (i += 1) {
+                try then_ctx.emitOp(.op_nip);
+                try then_ctx.stack.removeAtDepth(self.allocator, 1);
+            }
         }
 
         var else_ctx = LowerCtx.init(self.allocator, self.program);
@@ -2991,18 +4048,17 @@ const LowerCtx = struct {
         else_ctx.in_branch = true;
         else_ctx.copy_ref_aliases = self.copy_ref_aliases;
         else_ctx.max_depth = self.max_depth;
+        else_ctx.outer_protected_refs = &protected_refs;
         const else_bindings = ie.else_bindings orelse &.{};
-        for (else_bindings) |binding| {
-            try else_ctx.local_bindings.put(self.allocator, binding.name, {});
-        }
-        try else_ctx.computeLastUses(else_bindings);
-        var protected_else = protected_refs.iterator();
-        while (protected_else.next()) |entry| {
-            try else_ctx.last_uses.put(self.allocator, entry.key_ptr.*, else_bindings.len);
-        }
-        for (else_bindings, 0..) |binding, idx| {
-            else_ctx.current_idx = idx;
-            try else_ctx.lowerBinding(binding);
+        try else_ctx.lowerBindings(else_bindings, terminal_assert);
+        try else_ctx.drainBranchPrivateResidue(&pre_if_names);
+        if (terminal_assert and else_ctx.stack.depth() > 1) {
+            const excess = else_ctx.stack.depth() - 1;
+            var i: usize = 0;
+            while (i < excess) : (i += 1) {
+                try else_ctx.emitOp(.op_nip);
+                try else_ctx.stack.removeAtDepth(self.allocator, 1);
+            }
         }
 
         var post_then_names = try then_ctx.stack.namedSlots(self.allocator);
@@ -3041,27 +4097,31 @@ const LowerCtx = struct {
             try removeBranchValueAtDepth(&then_ctx, depth);
         }
 
-        if (then_ctx.stack.depth() > else_ctx.stack.depth()) {
-            const then_top = then_ctx.stack.peekAtDepth(0);
-            if (else_bindings.len == 0 and then_top != null) {
-                if (else_ctx.stack.findDepth(then_top.?)) |var_depth| {
-                    try duplicateBranchValueAtDepth(&else_ctx, var_depth, then_top);
-                } else {
-                    try else_ctx.emitPushData("");
-                    try else_ctx.stack.push(self.allocator, null);
-                    else_ctx.trackDepth();
-                }
+        // Phase 3: depth-balance reconciliation after ALL drops (issue #99 Bug 1).
+        // Compensate the FULL depth difference between the branches — NOT just a
+        // single item. A conditional write of N state fields leaves N result
+        // values on the then-branch, so the (empty) else-branch must preserve N
+        // old values. The previous single-shot check only balanced a 1-item
+        // difference, leaving N>=2 conditional writes imbalanced by (N-1).
+        while (then_ctx.stack.depth() > else_ctx.stack.depth()) {
+            const result_depth = then_ctx.stack.depth() - else_ctx.stack.depth() - 1;
+            const then_name = then_ctx.stack.peekAtDepth(result_depth);
+            if (else_bindings.len == 0 and then_name != null and else_ctx.stack.findDepth(then_name.?) != null) {
+                const var_depth = else_ctx.stack.findDepth(then_name.?).?;
+                try duplicateBranchValueAtDepth(&else_ctx, var_depth, then_name);
             } else {
                 try else_ctx.emitPushData("");
                 try else_ctx.stack.push(self.allocator, null);
                 else_ctx.trackDepth();
             }
-        } else if (else_ctx.stack.depth() > then_ctx.stack.depth()) {
+        }
+        while (else_ctx.stack.depth() > then_ctx.stack.depth()) {
             try then_ctx.emitPushData("");
             try then_ctx.stack.push(self.allocator, null);
             then_ctx.trackDepth();
         }
 
+        // Layer B — branch-balance invariant (#99 Bug 1 guard; pre-existing).
         if (then_ctx.stack.depth() != else_ctx.stack.depth()) {
             return LowerError.BranchStackMismatch;
         }
@@ -3074,6 +4134,18 @@ const LowerCtx = struct {
         }
         try self.emitOp(.op_endif);
 
+        // Transfer ownership of push_data buffers allocated by the branch
+        // contexts to self, so the `push_data` slices we just copied into
+        // self.instructions remain valid after then_ctx/else_ctx.deinit()
+        // runs and frees their owned buffers. Without this, branch-allocated
+        // buffers (e.g., hex-decoded ByteString property initial values)
+        // would be freed, and Debug mode fills freed memory with 0xaa,
+        // producing corrupt push_data output.
+        try self.owned_push_data.appendSlice(self.allocator, then_ctx.owned_push_data.items);
+        then_ctx.owned_push_data.clearRetainingCapacity();
+        try self.owned_push_data.appendSlice(self.allocator, else_ctx.owned_push_data.items);
+        else_ctx.owned_push_data.clearRetainingCapacity();
+
         var post_branch_names = try then_ctx.stack.namedSlots(self.allocator);
         defer post_branch_names.deinit(self.allocator);
         pre_it = pre_if_names.iterator();
@@ -3085,7 +4157,31 @@ const LowerCtx = struct {
             }
         }
 
-        if (then_ctx.stack.depth() > self.stack.depth()) {
+        if (else_bindings.len == 0 and then_ctx.stack.depth() > self.stack.depth() and then_ctx.stack.depth() - self.stack.depth() >= 2) {
+            // #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+            // values on top; record them in their on-stack order, then remove
+            // the N stale old property values beneath them.
+            const result_count = then_ctx.stack.depth() - self.stack.depth();
+            var ri: usize = result_count;
+            while (ri > 0) {
+                ri -= 1;
+                const nm = then_ctx.stack.peekAtDepth(ri);
+                try self.stack.push(self.allocator, if (nm) |n| n else bind_name);
+            }
+            var rj: usize = 0;
+            while (rj < result_count) : (rj += 1) {
+                const name = self.stack.peekAtDepth(rj) orelse continue;
+                var d: usize = result_count;
+                while (d < self.stack.depth()) : (d += 1) {
+                    if (self.stack.peekAtDepth(d)) |nm2| {
+                        if (std.mem.eql(u8, nm2, name)) {
+                            try removeStalePropertyAtDepth(self, d);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (then_ctx.stack.depth() > self.stack.depth()) {
             const then_top = then_ctx.stack.peekAtDepth(0);
             const else_top = else_ctx.stack.peekAtDepth(0);
             var is_property = false;
@@ -3104,7 +4200,7 @@ const LowerCtx = struct {
                 while (d < self.stack.depth()) : (d += 1) {
                     if (self.stack.peekAtDepth(d)) |name| {
                         if (std.mem.eql(u8, name, then_top.?)) {
-                            try removeBranchValueAtDepth(self, d);
+                            try removeStalePropertyAtDepth(self, d);
                             break;
                         }
                     }
@@ -3115,7 +4211,7 @@ const LowerCtx = struct {
                 while (d < self.stack.depth()) : (d += 1) {
                     if (self.stack.peekAtDepth(d)) |name| {
                         if (std.mem.eql(u8, name, then_top.?)) {
-                            try removeBranchValueAtDepth(self, d);
+                            try removeStalePropertyAtDepth(self, d);
                             break;
                         }
                     }
@@ -3136,6 +4232,102 @@ const LowerCtx = struct {
     // for_loop
     // ========================================================================
 
+    /// Collect every binding name defined anywhere in `bindings`, recursing
+    /// into nested if-branches and loop bodies. Mirrors the TS reference
+    /// compiler's `collectDeepBindingNames` (05-stack-lower.ts). Used by
+    /// `lowerForLoop` to distinguish loop-internal (re)definitions from true
+    /// outer-scope refs, so reassigned locals keep flowing through
+    /// `lowerIfExpr`'s branch-reassignment reconciliation instead of the
+    /// outer-ref protection path.
+    fn collectDeepBindingNames(
+        allocator: Allocator,
+        bindings: []const types.ANFBinding,
+        out: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        for (bindings) |b| {
+            try out.put(allocator, b.name, {});
+            switch (b.value) {
+                .@"if" => |ie| {
+                    try collectDeepBindingNames(allocator, ie.then, out);
+                    try collectDeepBindingNames(allocator, ie.@"else", out);
+                },
+                .loop => |lp| {
+                    try collectDeepBindingNames(allocator, lp.body, out);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Collect every SSA operand name referenced by a single ANF value,
+    /// recursing into nested if-branches and loop bodies. Mirrors the TS
+    /// reference compiler's `collectRefs` (05-stack-lower.ts). Used by
+    /// `lowerForLoop` to find outer-scope refs used anywhere in the body —
+    /// including refs that only occur inside a nested if-branch.
+    fn collectValueRefs(
+        allocator: Allocator,
+        value: types.ANFValue,
+        out: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        switch (value) {
+            .load_param => |lp| try out.put(allocator, lp.name, {}),
+            .load_prop, .get_state_script => {},
+            .load_const => |lc| {
+                switch (lc.value) {
+                    .string => |s| {
+                        if (std.mem.startsWith(u8, s, "@ref:")) {
+                            try out.put(allocator, s[5..], {});
+                        }
+                    },
+                    else => {},
+                }
+            },
+            .bin_op => |bop| {
+                try out.put(allocator, bop.left, {});
+                try out.put(allocator, bop.right, {});
+            },
+            .unary_op => |uop| try out.put(allocator, uop.operand, {}),
+            .call => |c| {
+                for (c.args) |arg| try out.put(allocator, arg, {});
+            },
+            .method_call => |mc| {
+                if (mc.object.len > 0) try out.put(allocator, mc.object, {});
+                for (mc.args) |arg| try out.put(allocator, arg, {});
+            },
+            .@"if" => |ie| {
+                try out.put(allocator, ie.cond, {});
+                for (ie.then) |b| try collectValueRefs(allocator, b.value, out);
+                for (ie.@"else") |b| try collectValueRefs(allocator, b.value, out);
+            },
+            .loop => |lp| {
+                for (lp.body) |b| try collectValueRefs(allocator, b.value, out);
+            },
+            .assert => |a| try out.put(allocator, a.value, {}),
+            .update_prop => |up| try out.put(allocator, up.value, {}),
+            .check_preimage => |cp| try out.put(allocator, cp.preimage, {}),
+            .deserialize_state => |ds| try out.put(allocator, ds.preimage, {}),
+            .add_output => |ao| {
+                if (ao.satoshis.len > 0) try out.put(allocator, ao.satoshis, {});
+                if (ao.preimage.len > 0) try out.put(allocator, ao.preimage, {});
+                for (ao.state_values) |sv| {
+                    if (sv.len > 0) try out.put(allocator, sv, {});
+                }
+            },
+            .add_raw_output => |aro| {
+                if (aro.satoshis.len > 0) try out.put(allocator, aro.satoshis, {});
+                if (aro.script_bytes.len > 0) try out.put(allocator, aro.script_bytes, {});
+            },
+            .add_data_output => |ado| {
+                if (ado.satoshis.len > 0) try out.put(allocator, ado.satoshis, {});
+                if (ado.script_bytes.len > 0) try out.put(allocator, ado.script_bytes, {});
+            },
+            .array_literal => |al| {
+                for (al.elements) |e| try out.put(allocator, e, {});
+            },
+            .raw_script => {},
+        }
+    }
+
     fn lowerForLoop(self: *LowerCtx, bind_name: []const u8, fl: *const types.ANFForLoop) !void {
         var body_binding_names: std.StringHashMapUnmanaged(void) = .empty;
         defer body_binding_names.deinit(self.allocator);
@@ -3143,29 +4335,35 @@ const LowerCtx = struct {
             try body_binding_names.put(self.allocator, binding.name, {});
         }
 
+        // Names (re)defined anywhere inside the loop body, nested if-branches
+        // and nested loops included. A name the body itself binds is NOT an
+        // outer ref — reassigned locals (e.g. `off = off + ...` inside an if)
+        // flow through lowerIfExpr's branch-reassignment reconciliation, not
+        // through the outer-ref protection here.
+        var deep_body_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer deep_body_names.deinit(self.allocator);
+        try collectDeepBindingNames(self.allocator, fl.body_bindings, &deep_body_names);
+
+        // Collect ALL outer-scope refs used anywhere in the body — including
+        // refs that only occur inside a nested if-branch (collectValueRefs
+        // recurses). The previous top-level-only scan (top-level load_param +
+        // top-level load_const @ref) missed nested references: a const defined
+        // before the loop and referenced only inside an if-branch was consumed
+        // by the first iteration, making iteration 2 fail with
+        // "Value 'X' not found on stack".
+        var all_refs: std.StringHashMapUnmanaged(void) = .empty;
+        defer all_refs.deinit(self.allocator);
+        for (fl.body_bindings) |binding| {
+            try collectValueRefs(self.allocator, binding.value, &all_refs);
+        }
+
         var outer_refs: std.StringHashMapUnmanaged(void) = .empty;
         defer outer_refs.deinit(self.allocator);
-        for (fl.body_bindings) |binding| {
-            switch (binding.value) {
-                .load_param => |lp| {
-                    if (!std.mem.eql(u8, lp.name, fl.var_name)) {
-                        try outer_refs.put(self.allocator, lp.name, {});
-                    }
-                },
-                .load_const => |lc| {
-                    switch (lc.value) {
-                        .string => |s| {
-                            if (std.mem.startsWith(u8, s, "@ref:")) {
-                                const ref_name = s[5..];
-                                if (!body_binding_names.contains(ref_name)) {
-                                    try outer_refs.put(self.allocator, ref_name, {});
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-                },
-                else => {},
+        var all_refs_it = all_refs.iterator();
+        while (all_refs_it.next()) |entry| {
+            const ref = entry.key_ptr.*;
+            if (!std.mem.eql(u8, ref, fl.var_name) and !deep_body_names.contains(ref)) {
+                try outer_refs.put(self.allocator, ref, {});
             }
         }
 
@@ -3184,27 +4382,59 @@ const LowerCtx = struct {
             try self.local_bindings.put(self.allocator, entry.key_ptr.*, {});
         }
 
-        var i: i64 = fl.init_val;
-        while (i < fl.bound) : (i += 1) {
-            try self.emitPushInt(i);
+        // The enclosing binding index of this loop, captured before the
+        // per-iteration body lowering clobbers `current_idx`. Combined with the
+        // enclosing scope's last-use map (still live in `self.last_uses` on
+        // entry), it tells us whether an outer ref is still needed AFTER the
+        // loop. Zig threads the enclosing index / last-use map implicitly via
+        // the shared LowerCtx (unlike the TS reference, which passes them as
+        // explicit params to lowerLoop).
+        const loop_binding_index = self.current_idx;
+
+        var n: u32 = 0;
+        while (n < fl.count) : (n += 1) {
+            // Iteration `n` binds `start + n*step` (issue #121). Zero-start
+            // counting-up loops (start=0, step=1) reduce to `n`, preserving the
+            // historical byte-for-byte lowering.
+            const iter_val: i64 = fl.start + @as(i64, @intCast(n)) * fl.step;
+            try self.emitPushInt(iter_val);
             try self.stack.push(self.allocator, fl.var_name);
             self.trackDepth();
 
-            const saved_lu = self.last_uses;
+            const enclosing_last_uses = self.last_uses;
             self.last_uses = .empty;
             try self.computeLastUses(fl.body_bindings);
-            if (i < fl.bound - 1) {
-                var outer_it = outer_refs.iterator();
-                while (outer_it.next()) |entry| {
-                    try self.last_uses.put(self.allocator, entry.key_ptr.*, fl.body_bindings.len);
+
+            // Prevent outer-scope refs from being consumed by pinning their
+            // last-use past every body binding index:
+            //  - in non-final iterations: always (the next iteration re-reads);
+            //  - in the FINAL iteration: only when the enclosing scope still
+            //    references the ref AFTER the loop. Previously the final
+            //    iteration consumed every outer ref at its last body use, so a
+            //    method param (or const) referenced after the loop was gone
+            //    from the stack and was silently lowered to an OP_0 — the
+            //    script compiled and the env interpreter passed, but the
+            //    emitted Script failed on chain (silent interpreter/Script
+            //    divergence).
+            const is_final_iteration = (n == fl.count - 1);
+            var outer_it = outer_refs.iterator();
+            while (outer_it.next()) |entry| {
+                const ref = entry.key_ptr.*;
+                const used_after_loop = if (enclosing_last_uses.get(ref)) |lu|
+                    lu > loop_binding_index
+                else
+                    false;
+                if (!is_final_iteration or used_after_loop) {
+                    try self.last_uses.put(self.allocator, ref, fl.body_bindings.len);
                 }
             }
+
             for (fl.body_bindings, 0..) |binding, idx| {
                 self.current_idx = idx;
                 try self.lowerBinding(binding);
             }
             self.last_uses.deinit(self.allocator);
-            self.last_uses = saved_lu;
+            self.last_uses = enclosing_last_uses;
 
             // Remove iteration variable if still on stack
             if (self.stack.findDepth(fl.var_name)) |d| {
@@ -3223,6 +4453,13 @@ const LowerCtx = struct {
     // ========================================================================
 
     fn lowerAddOutput(self: *LowerCtx, bind_name: []const u8, ao: types.ANFAddOutput) !void {
+        const output_operands = try std.mem.concat(
+            self.allocator,
+            []const u8,
+            &.{ &.{ao.satoshis}, ao.state_values },
+        );
+        defer self.allocator.free(output_operands);
+
         var state_prop_count: usize = 0;
         for (self.program.properties) |prop| {
             if (!prop.readonly) state_prop_count += 1;
@@ -3244,25 +4481,18 @@ const LowerCtx = struct {
             const value_ref = ao.state_values[state_index];
             state_index += 1;
 
-            try self.bringToTopAuto(value_ref);
-            switch (prop.type_info) {
-                .bigint => {
-                    try self.emitPushInt(8);
-                    try self.stack.push(self.allocator, null);
-                    try self.emitOp(.op_num2bin);
-                    _ = self.stack.pop();
-                },
-                .boolean => {
-                    try self.emitPushInt(1);
-                    try self.stack.push(self.allocator, null);
-                    try self.emitOp(.op_num2bin);
-                    _ = self.stack.pop();
-                },
-                .byte_string => {
-                    try self.emitPushDataEncode();
-                },
-                else => {},
+            try self.bringToTopOperand(value_ref, output_operands);
+            if (isNumericStateType(prop.type_info)) {
+                const width: i64 = if (prop.type_info == .boolean) 1 else 8;
+                try self.emitPushInt(width);
+                try self.stack.push(self.allocator, null);
+                try self.emitOp(.op_num2bin);
+                _ = self.stack.pop();
+            } else if (isVariableLengthStateType(prop.type_info)) {
+                try self.emitPushDataEncode();
             }
+            // Fixed-width byte types (PubKey, Addr, Ripemd160, Sha256, Point,
+            // P256Point, P384Point) are already byte sequences and used as-is.
 
             _ = self.stack.pop();
             _ = self.stack.pop();
@@ -3284,7 +4514,7 @@ const LowerCtx = struct {
         try self.stack.push(self.allocator, null);
         self.trackDepth();
 
-        try self.bringToTopAuto(ao.satoshis);
+        try self.bringToTopOperand(ao.satoshis, output_operands);
         try self.emitPushInt(8);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
@@ -3302,7 +4532,7 @@ const LowerCtx = struct {
     }
 
     fn lowerAddRawOutput(self: *LowerCtx, bind_name: []const u8, aro: types.ANFAddRawOutput) !void {
-        try self.bringToTopAuto(aro.script_ref);
+        try self.bringToTopOperand(aro.script_bytes, &.{ aro.satoshis, aro.script_bytes });
         try self.emitOp(.op_size);
         try self.stack.push(self.allocator, null);
         try self.emitVarintEncoding();
@@ -3317,7 +4547,7 @@ const LowerCtx = struct {
         try self.stack.push(self.allocator, null);
         self.trackDepth();
 
-        try self.bringToTopAuto(aro.satoshis);
+        try self.bringToTopOperand(aro.satoshis, &.{ aro.satoshis, aro.script_bytes });
         try self.emitPushInt(8);
         try self.stack.push(self.allocator, null);
         try self.emitOp(.op_num2bin);
@@ -3336,41 +4566,75 @@ const LowerCtx = struct {
 };
 
 // ============================================================================
-// Generator point G (secp256k1, compressed)
+// OP_PUSH_TX on-chain signature derivation (BUG-100 fix)
 // ============================================================================
+//
+// The insecure legacy checkPreimage accepted a witness signature over the real
+// spending transaction and checked it against pubkey G, never reading the pushed
+// preimage — so the preimage was decoupled from the tx. This derives the ECDSA
+// signature FROM the preimage on-chain (s = (hash256(preimage) + r)*kinv mod n,
+// fixed nonce k=2, privkey d=1, low-S, minimal DER), so OP_CHECKSIG passes only
+// when hash256(preimage) equals the real tx sighash.
+//
+// The construction compiles to a FIXED byte sequence identical across all seven
+// tiers; it is the canonical output of the TypeScript reference
+// (packages/runar-compiler/src/passes/oppushtx-codegen.ts). Emitted as a single
+// opaque raw_bytes op (peephole barrier). The cross-tier conformance suite
+// guards that this constant matches every other tier byte-for-byte.
+const check_preimage_binding_hex = "76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad";
 
-const generator_point_g = [33]u8{
-    0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb,
-    0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b,
-    0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28,
-    0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17,
-    0x98,
-};
+// The frozen binding hex above ends with `0141` (OP_DATA_1 SIGHASH_ALL|FORKID)
+// immediately before this fixed G-pubkey tail. Issue #123: a non-default
+// @sighash mode swaps only that single push (`0141` -> `01<flag>`), leaving the
+// tail intact — byte-for-byte matching the TS reference. Mirrors Go's
+// checkPreimageSighashTail (compilers/go/codegen/oppushtx.go).
+const check_preimage_sighash_tail = "7e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad";
 
 // ============================================================================
 // Public API
 // ============================================================================
 
 /// Lower an ANF program to Stack IR.
+///
+/// Each public method is lowered into its own StackMethod. The multi-method
+/// dispatch table is added at emit time (in emit.zig), matching the TS
+/// reference compiler's pipeline. This keeps the dispatch-table opcodes
+/// outside the peephole optimization window so that `OP_DUP, OP_0,
+/// OP_NUMEQUAL, OP_IF, OP_DROP` dispatch entries are not folded into
+/// `OP_DUP, OP_NOT, OP_IF, OP_DROP` (which is semantically equivalent
+/// but byte-divergent from the canonical TS output).
 pub fn lower(allocator: Allocator, program: types.ANFProgram) !types.StackProgram {
-    const public_methods = countPublicMethods(program.methods);
-    const needs_dispatch = public_methods > 1;
-
     var methods = std.ArrayListUnmanaged(types.StackMethod).empty;
     defer methods.deinit(allocator);
     var owned_push_data = std.ArrayListUnmanaged([]u8).empty;
     defer owned_push_data.deinit(allocator);
 
-    if (needs_dispatch) {
+    for (program.methods) |method| {
+        if (!method.is_public) continue;
+
         var ctx = LowerCtx.init(allocator, program);
         defer ctx.deinit();
 
-        try emitDispatchTable(&ctx, program);
+        try setupMethodStack(&ctx, program, method);
+        ctx.copy_ref_aliases = false;
+
+        // Use body or bindings (whichever is populated)
+        const bindings = if (method.body.len > 0) method.body else method.bindings;
+        try ctx.lowerBindings(bindings, method.is_public);
+        // CLEANSTACK: drop excess items left below the top-of-stack boolean.
+        // cleanupExcessStack() is a no-op when depth <= 1, so running it for
+        // every public method also fixes all-readonly stateful methods.
+        if (method.is_public) {
+            try ctx.cleanupExcessStack();
+        }
+        if (!method.is_public or (!endsWithAssert(bindings) and !endsWithTerminalRawScript(bindings))) {
+            try ctx.emitOp(.op_1);
+        }
 
         const instructions = try allocator.dupe(types.StackInstruction, ctx.instructions.items);
         const src_locs = try allocator.dupe(?types.SourceLocation, ctx.instruction_source_locs.items);
         try methods.append(allocator, .{
-            .name = "__dispatch",
+            .name = method.name,
             .instructions = instructions,
             .max_stack_depth = ctx.max_depth,
             .instruction_source_locs = src_locs,
@@ -3378,38 +4642,6 @@ pub fn lower(allocator: Allocator, program: types.ANFProgram) !types.StackProgra
         try owned_push_data.appendSlice(allocator, ctx.owned_push_data.items);
         ctx.owned_push_data.deinit(allocator);
         ctx.owned_push_data = .empty;
-    } else {
-        for (program.methods) |method| {
-            if (!method.is_public) continue;
-
-            var ctx = LowerCtx.init(allocator, program);
-            defer ctx.deinit();
-
-            try setupMethodStack(&ctx, program, method);
-            ctx.copy_ref_aliases = false;
-
-            // Use body or bindings (whichever is populated)
-            const bindings = if (method.body.len > 0) method.body else method.bindings;
-            try ctx.lowerBindings(bindings, method.is_public);
-            if (method.is_public and methodUsesDeserializeState(bindings)) {
-                try ctx.cleanupExcessStack();
-            }
-            if (!method.is_public or !endsWithAssert(bindings)) {
-                try ctx.emitOp(.op_1);
-            }
-
-            const instructions = try allocator.dupe(types.StackInstruction, ctx.instructions.items);
-            const src_locs = try allocator.dupe(?types.SourceLocation, ctx.instruction_source_locs.items);
-            try methods.append(allocator, .{
-                .name = method.name,
-                .instructions = instructions,
-                .max_stack_depth = ctx.max_depth,
-                .instruction_source_locs = src_locs,
-            });
-            try owned_push_data.appendSlice(allocator, ctx.owned_push_data.items);
-            ctx.owned_push_data.deinit(allocator);
-            ctx.owned_push_data = .empty;
-        }
     }
 
     return .{
@@ -3440,23 +4672,46 @@ fn isStateful(program: types.ANFProgram) bool {
     return program.parent_class == .stateful_smart_contract;
 }
 
-fn setupMethodStack(ctx: *LowerCtx, _: types.ANFProgram, method: types.ANFMethod) !void {
+fn setupMethodStack(ctx: *LowerCtx, program: types.ANFProgram, method: types.ANFMethod) !void {
     const bindings = methodBindings(method);
 
-    if (methodUsesCodePart(bindings)) {
+    if (methodUsesCodePartFull(bindings, program.properties)) {
         try ctx.stack.push(ctx.allocator, "_codePart");
         ctx.trackDepth();
     }
 
-    if (methodUsesCheckPreimage(bindings)) {
-        try ctx.stack.push(ctx.allocator, "_opPushTxSig");
-        ctx.trackDepth();
-    }
+    // BUG-100 fix: the OP_PUSH_TX signature is now derived on-chain from the
+    // preimage (see lowerCheckPreimage), so NO _opPushTxSig witness item is
+    // pushed. The unlocking script provides only the preimage.
 
     for (method.params) |param| {
         try ctx.stack.push(ctx.allocator, param.name);
     }
     ctx.trackDepth();
+
+    // Issue #130: a method param whose name collides with a MUTABLE property
+    // gets a duplicate stackMap slot once deserialize_state pushes that property
+    // under the same name. Name lookups resolve to the shallowest match (the
+    // deserialized property), so lowerLoadParam would read the stale on-chain
+    // state instead of the witness value. Rename the colliding param's slot to a
+    // reserved, collision-proof name up front and remember the mapping so
+    // lowerLoadParam targets the real param slot. Only mutable properties are
+    // deserialized onto the stack, so readonly shadows (handled purely by ANF
+    // resolution) never enter this map, and non-colliding contracts get an empty
+    // map — byte-identical output.
+    for (method.params) |param| {
+        const is_mutable_prop = for (program.properties) |prop| {
+            if (!prop.readonly and std.mem.eql(u8, prop.name, param.name)) break true;
+        } else false;
+        if (is_mutable_prop) {
+            if (ctx.stack.findDepth(param.name)) |d| {
+                const renamed = try std.fmt.allocPrint(ctx.allocator, "__param_{s}", .{param.name});
+                try ctx.owned_push_data.append(ctx.allocator, renamed);
+                try ctx.stack.renameAtDepth(ctx.allocator, d, renamed);
+                try ctx.renamed_params.put(ctx.allocator, param.name, renamed);
+            }
+        }
+    }
 }
 
 fn setupPropertyStack(ctx: *LowerCtx, program: types.ANFProgram) !void {
@@ -3464,14 +4719,34 @@ fn setupPropertyStack(ctx: *LowerCtx, program: types.ANFProgram) !void {
     _ = program;
 }
 
-fn methodBindings(method: types.ANFMethod) []const types.ANFBinding {
+pub fn methodBindings(method: types.ANFMethod) []const types.ANFBinding {
     return if (method.body.len > 0) method.body else method.bindings;
 }
 
 fn endsWithAssert(bindings: []const types.ANFBinding) bool {
     if (bindings.len == 0) return false;
     return switch (bindings[bindings.len - 1].value) {
-        .assert, .assert_op => true,
+        .assert => true,
+        // TS reference compiler propagates `terminalAssert=true` into the
+        // last `if` binding, and both branches leave a truthy value on the
+        // stack instead of executing OP_VERIFY. Treat such a terminal `if`
+        // as ending-with-assert so we don't append an extra OP_1 at the
+        // method tail.
+        .@"if" => |ie| endsWithAssert(ie.then) and endsWithAssert(ie.@"else"),
+        else => false,
+    };
+}
+
+/// Returns true when the last binding is a `raw_script` with declared
+/// out_arity 1. Mirrors the validator's `endsWithTerminalAsm` rule — such a
+/// terminal asm({...}) leaves a single truthy value on the stack, so the
+/// stack lowerer must NOT append a trailing OP_1.
+fn endsWithTerminalRawScript(bindings: []const types.ANFBinding) bool {
+    if (bindings.len == 0) return false;
+    return switch (bindings[bindings.len - 1].value) {
+        .raw_script => |rs| rs.out_arity == 1,
+        .@"if" => |ie| (endsWithAssert(ie.then) or endsWithTerminalRawScript(ie.then)) and
+            (endsWithAssert(ie.@"else") or endsWithTerminalRawScript(ie.@"else")),
         else => false,
     };
 }
@@ -3491,23 +4766,33 @@ fn anyMethodUsesCodePart(methods: []const types.ANFMethod) bool {
 }
 
 fn methodUsesCheckPreimage(bindings: []const types.ANFBinding) bool {
+    return methodUsesCheckPreimageRec(bindings, null, 0);
+}
+
+const MAX_PREIMAGE_RECURSION_DEPTH: u32 = 64;
+
+fn methodUsesCheckPreimageRec(
+    bindings: []const types.ANFBinding,
+    private_methods: ?std.StringHashMap(types.ANFMethod),
+    depth: u32,
+) bool {
+    if (depth > MAX_PREIMAGE_RECURSION_DEPTH) return false;
     for (bindings) |binding| {
         switch (binding.value) {
             .check_preimage => return true,
             .@"if" => |ie| {
-                if (methodUsesCheckPreimage(ie.then) or methodUsesCheckPreimage(ie.@"else")) return true;
-            },
-            .if_expr => |ie| {
-                if (methodUsesCheckPreimage(ie.then_bindings)) return true;
-                if (ie.else_bindings) |else_bindings| {
-                    if (methodUsesCheckPreimage(else_bindings)) return true;
-                }
+                if (methodUsesCheckPreimageRec(ie.then, private_methods, depth)) return true;
+                if (methodUsesCheckPreimageRec(ie.@"else", private_methods, depth)) return true;
             },
             .loop => |loop| {
-                if (methodUsesCheckPreimage(loop.body)) return true;
+                if (methodUsesCheckPreimageRec(loop.body, private_methods, depth)) return true;
             },
-            .for_loop => |loop| {
-                if (methodUsesCheckPreimage(loop.body_bindings)) return true;
+            .method_call => |mc| {
+                if (private_methods) |privs| {
+                    if (privs.get(mc.method)) |target| {
+                        if (methodUsesCheckPreimageRec(target.body, private_methods, depth + 1)) return true;
+                    }
+                }
             },
             else => {},
         }
@@ -3518,7 +4803,7 @@ fn methodUsesCheckPreimage(bindings: []const types.ANFBinding) bool {
 fn methodUsesCodePart(bindings: []const types.ANFBinding) bool {
     for (bindings) |binding| {
         switch (binding.value) {
-            .add_output, .add_raw_output => return true,
+            .add_output, .add_raw_output, .add_data_output => return true,
             .call => |call| {
                 if (std.mem.eql(u8, call.func, "computeStateOutput") or
                     std.mem.eql(u8, call.func, "computeStateOutputHash") or
@@ -3528,34 +4813,49 @@ fn methodUsesCodePart(bindings: []const types.ANFBinding) bool {
                     return true;
                 }
             },
-            .builtin_call => |call| {
-                if (std.mem.eql(u8, call.name, "computeStateOutput") or
-                    std.mem.eql(u8, call.name, "computeStateOutputHash") or
-                    std.mem.eql(u8, call.name, "buildChangeOutput") or
-                    std.mem.eql(u8, call.name, "buildStateOutput"))
-                {
-                    return true;
-                }
-            },
             .@"if" => |ie| {
                 if (methodUsesCodePart(ie.then) or methodUsesCodePart(ie.@"else")) return true;
             },
-            .if_expr => |ie| {
-                if (methodUsesCodePart(ie.then_bindings)) return true;
-                if (ie.else_bindings) |else_bindings| {
-                    if (methodUsesCodePart(else_bindings)) return true;
-                }
-            },
             .loop => |loop| {
                 if (methodUsesCodePart(loop.body)) return true;
-            },
-            .for_loop => |loop| {
-                if (methodUsesCodePart(loop.body_bindings)) return true;
             },
             else => {},
         }
     }
     return false;
+}
+
+/// Whether a method READS a mutable variable-length (ByteString) state field's
+/// value (via load_prop). Issue #100: such a terminal method needs _codePart for
+/// the preimage-relative state offset. Narrowed to the live var-length read so
+/// methods that only read readonly fields (baked into the locking script) or
+/// fixed-size fields keep their original terminal codegen.
+fn methodReadsVarLenState(bindings: []const types.ANFBinding, properties: []const types.ANFProperty) bool {
+    for (bindings) |binding| {
+        switch (binding.value) {
+            .load_prop => |lp| {
+                for (properties) |prop| {
+                    if (!prop.readonly and prop.type_info == .byte_string and std.mem.eql(u8, prop.name, lp.name)) return true;
+                }
+            },
+            .@"if" => |ie| {
+                if (methodReadsVarLenState(ie.then, properties) or methodReadsVarLenState(ie.@"else", properties)) return true;
+            },
+            .loop => |loop| {
+                if (methodReadsVarLenState(loop.body, properties)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Combined `_codePart` requirement (issue #100): continuation builders OR
+/// terminal methods that read a mutable variable-length state field. Gated on
+/// checkPreimage so the SDK side (which provisions _codePart) stays in sync.
+pub fn methodUsesCodePartFull(bindings: []const types.ANFBinding, properties: []const types.ANFProperty) bool {
+    return methodUsesCheckPreimage(bindings) and
+        (methodUsesCodePart(bindings) or methodReadsVarLenState(bindings, properties));
 }
 
 fn findPrivateMethod(methods: []const types.ANFMethod, name: []const u8) ?types.ANFMethod {
@@ -3564,32 +4864,6 @@ fn findPrivateMethod(methods: []const types.ANFMethod, name: []const u8) ?types.
         if (std.mem.eql(u8, method.name, name)) return method;
     }
     return null;
-}
-
-fn methodUsesDeserializeState(bindings: []const types.ANFBinding) bool {
-    for (bindings) |binding| {
-        switch (binding.value) {
-            .deserialize_state => return true,
-            .@"if" => |ie| {
-                if (methodUsesDeserializeState(ie.then)) return true;
-                if (methodUsesDeserializeState(ie.@"else")) return true;
-            },
-            .if_expr => |ie| {
-                if (methodUsesDeserializeState(ie.then_bindings)) return true;
-                if (ie.else_bindings) |else_bindings| {
-                    if (methodUsesDeserializeState(else_bindings)) return true;
-                }
-            },
-            .loop => |loop| {
-                if (methodUsesDeserializeState(loop.body)) return true;
-            },
-            .for_loop => |loop| {
-                if (methodUsesDeserializeState(loop.body_bindings)) return true;
-            },
-            else => {},
-        }
-    }
-    return false;
 }
 
 fn emitDispatchTable(ctx: *LowerCtx, program: types.ANFProgram) !void {
@@ -3616,10 +4890,8 @@ fn emitDispatchTable(ctx: *LowerCtx, program: types.ANFProgram) !void {
                     try inner_ctx.stack.push(inner_ctx.allocator, "_codePart");
                     inner_ctx.trackDepth();
                 }
-                if (methodUsesCheckPreimage(inner_bindings) and inner_ctx.stack.findDepth("_opPushTxSig") == null) {
-                    try inner_ctx.stack.push(inner_ctx.allocator, "_opPushTxSig");
-                    inner_ctx.trackDepth();
-                }
+                // BUG-100 fix: no _opPushTxSig — signature derived on-chain from
+                // the preimage (see lowerCheckPreimage).
                 for (inner_method.params) |param| {
                     try inner_ctx.stack.push(inner_ctx.allocator, param.name);
                 }
@@ -3642,7 +4914,10 @@ fn emitDispatchTable(ctx: *LowerCtx, program: types.ANFProgram) !void {
             try ensureMethodPrelude.apply(ctx, bindings, method);
 
             try ctx.lowerBindings(bindings, method.is_public);
-            if (method.is_public and methodUsesDeserializeState(bindings)) {
+            // CLEANSTACK: drop excess items left below the top-of-stack boolean.
+            // cleanupExcessStack() is a no-op when depth <= 1, so running it for
+            // every public method also fixes all-readonly stateful methods.
+            if (method.is_public) {
                 try ctx.cleanupExcessStack();
             }
             if (!endsWithAssert(bindings)) {
@@ -3662,7 +4937,10 @@ fn emitDispatchTable(ctx: *LowerCtx, program: types.ANFProgram) !void {
             try ensureMethodPrelude.apply(ctx, bindings, method);
 
             try ctx.lowerBindings(bindings, method.is_public);
-            if (method.is_public and methodUsesDeserializeState(bindings)) {
+            // CLEANSTACK: drop excess items left below the top-of-stack boolean.
+            // cleanupExcessStack() is a no-op when depth <= 1, so running it for
+            // every public method also fixes all-readonly stateful methods.
+            if (method.is_public) {
                 try ctx.cleanupExcessStack();
             }
             if (!endsWithAssert(bindings)) {
@@ -3888,16 +5166,14 @@ test "lower simple P2PKH contract" {
     const bindings = [_]types.ANFBinding{
         .{
             .name = "t0",
-            .value = .{ .builtin_call = .{
-                .name = "checkSig",
+            .value = .{ .call = .{
+                .func = "checkSig",
                 .args = &[_][]const u8{ "sig", "pubkey" },
             } },
         },
         .{
             .name = "t1",
-            .value = .{ .assert_op = .{
-                .condition = "t0",
-            } },
+            .value = .{ .assert = .{ .value = "t0" } },
         },
     };
 
@@ -3962,8 +5238,8 @@ test "lower arithmetic bindings" {
     const bindings = [_]types.ANFBinding{
         .{
             .name = "t0",
-            .value = .{ .binary_op = .{
-                .op = .add,
+            .value = .{ .bin_op = .{
+                .op = "+",
                 .left = "x",
                 .right = "y",
             } },
@@ -4012,8 +5288,8 @@ test "lower literal push" {
     const allocator = std.testing.allocator;
 
     const bindings = [_]types.ANFBinding{
-        .{ .name = "t0", .value = .{ .literal_int = 42 } },
-        .{ .name = "t1", .value = .{ .literal_bool = true } },
+        .{ .name = "t0", .value = .{ .load_const = .{ .value = .{ .integer = 42 } } } },
+        .{ .name = "t1", .value = .{ .load_const = .{ .value = .{ .boolean = true } } } },
     };
 
     const method = types.ANFMethod{
@@ -4050,8 +5326,8 @@ test "lower hash builtin" {
     const bindings = [_]types.ANFBinding{
         .{
             .name = "t0",
-            .value = .{ .builtin_call = .{
-                .name = "sha256",
+            .value = .{ .call = .{
+                .func = "sha256",
                 .args = &[_][]const u8{"data"},
             } },
         },
@@ -4099,8 +5375,8 @@ test "lower sha256Compress builtin" {
     const bindings = [_]types.ANFBinding{
         .{
             .name = "t0",
-            .value = .{ .builtin_call = .{
-                .name = "sha256Compress",
+            .value = .{ .call = .{
+                .func = "sha256Compress",
                 .args = &[_][]const u8{ "state", "block" },
             } },
         },
@@ -4155,8 +5431,8 @@ test "lower sha256Finalize builtin" {
     const bindings = [_]types.ANFBinding{
         .{
             .name = "t0",
-            .value = .{ .builtin_call = .{
-                .name = "sha256Finalize",
+            .value = .{ .call = .{
+                .func = "sha256Finalize",
                 .args = &[_][]const u8{ "state", "remaining", "bit_len" },
             } },
         },
@@ -4213,22 +5489,22 @@ test "lower if expression" {
     const allocator = std.testing.allocator;
 
     const then_bindings = [_]types.ANFBinding{
-        .{ .name = "t_then", .value = .{ .literal_int = 1 } },
+        .{ .name = "t_then", .value = .{ .load_const = .{ .value = .{ .integer = 1 } } } },
     };
 
     const else_bindings = [_]types.ANFBinding{
-        .{ .name = "t_else", .value = .{ .literal_int = 0 } },
+        .{ .name = "t_else", .value = .{ .load_const = .{ .value = .{ .integer = 0 } } } },
     };
 
-    var if_expr = types.ANFIfExpr{
-        .condition = "cond",
-        .then_bindings = @constCast(&then_bindings),
-        .else_bindings = @constCast(&else_bindings),
+    var if_expr = types.ANFIf{
+        .cond = "cond",
+        .then = @constCast(&then_bindings),
+        .@"else" = @constCast(&else_bindings),
     };
 
     const bindings = [_]types.ANFBinding{
-        .{ .name = "cond", .value = .{ .literal_bool = true } },
-        .{ .name = "result", .value = .{ .if_expr = &if_expr } },
+        .{ .name = "cond", .value = .{ .load_const = .{ .value = .{ .boolean = true } } } },
+        .{ .name = "result", .value = .{ .@"if" = &if_expr } },
     };
 
     const method = types.ANFMethod{
@@ -4275,18 +5551,17 @@ test "lower for loop unrolling" {
     const allocator = std.testing.allocator;
 
     const loop_body = [_]types.ANFBinding{
-        .{ .name = "t_body", .value = .{ .literal_int = 99 } },
+        .{ .name = "t_body", .value = .{ .load_const = .{ .value = .{ .integer = 99 } } } },
     };
 
-    var loop_val = types.ANFForLoop{
-        .var_name = "i",
-        .init_val = 0,
-        .bound = 3,
-        .body_bindings = @constCast(&loop_body),
+    var loop_val = types.ANFLoop{
+        .iter_var = "i",
+        .count = 3,
+        .body = @constCast(&loop_body),
     };
 
     const bindings = [_]types.ANFBinding{
-        .{ .name = "loop_result", .value = .{ .for_loop = &loop_val } },
+        .{ .name = "loop_result", .value = .{ .loop = &loop_val } },
     };
 
     const method = types.ANFMethod{
@@ -4322,14 +5597,153 @@ test "lower for loop unrolling" {
     try std.testing.expect(push_count >= 6);
 }
 
-test "lower multi-method dispatch" {
+test "lower for loop keeps outer const alive across iterations (fix 5)" {
+    // Regression: a const defined before the loop and referenced inside the
+    // body (here via bin_op `base + i`) was consumed by the first iteration,
+    // making iteration 2 fail with VariableNotFound. The deep outer-ref
+    // collection now protects `base` across the non-final iterations.
+    const allocator = std.testing.allocator;
+
+    const loop_body = [_]types.ANFBinding{
+        .{ .name = "t_sum", .value = .{ .bin_op = .{ .op = "+", .left = "base", .right = "i" } } },
+    };
+
+    var loop_val = types.ANFLoop{
+        .iter_var = "i",
+        .count = 3,
+        .body = @constCast(&loop_body),
+    };
+
+    const bindings = [_]types.ANFBinding{
+        .{ .name = "base", .value = .{ .load_const = .{ .value = .{ .integer = 5 } } } },
+        .{ .name = "loop_result", .value = .{ .loop = &loop_val } },
+    };
+
+    const method = types.ANFMethod{
+        .name = "looper",
+        .is_public = true,
+        .params = &.{},
+        .bindings = @constCast(&bindings),
+    };
+
+    const program = types.ANFProgram{
+        .contract_name = "OuterRefLooper",
+        .properties = &.{},
+        .methods = @constCast(&[_]types.ANFMethod{method}),
+    };
+
+    // Previously threw VariableNotFound on the second iteration; must now
+    // lower cleanly.
+    const result = try lower(allocator, program);
+    defer result.deinit(allocator);
+    try std.testing.expect(result.methods.len == 1);
+    try std.testing.expect(result.methods[0].instructions.len > 0);
+}
+
+test "lower rejects load_param of a missing param instead of emitting OP_0 (fix 5)" {
+    // Hand-written ANF referencing a parameter that is not on the stack.
+    // The old fallback silently pushed OP_0 (producing scripts that passed
+    // the interpreter but failed on chain); it must now hard-error.
+    const allocator = std.testing.allocator;
+
+    const bindings = [_]types.ANFBinding{
+        .{ .name = "t0", .value = .{ .load_param = .{ .name = "ghost" } } },
+        .{ .name = "t1", .value = .{ .assert = .{ .value = "t0" } } },
+    };
+
+    const method = types.ANFMethod{
+        .name = "spend",
+        .is_public = true,
+        .params = &.{},
+        .bindings = @constCast(&bindings),
+    };
+
+    const program = types.ANFProgram{
+        .contract_name = "GhostParam",
+        .properties = &.{},
+        .methods = @constCast(&[_]types.ANFMethod{method}),
+    };
+
+    try std.testing.expectError(LowerError.SilentOpZeroRefused, lower(allocator, program));
+}
+
+test "lower rejects load_prop for a property with no constructor slot (H1)" {
+    // #119 tail: a `load_prop` whose name is not a declared constructor-param
+    // property used to be coerced onto slot 0, silently splicing an UNRELATED
+    // constructor argument's placeholder into the locking script. It must now
+    // hard-error instead. The contract has a real ctor-param property `pk`, and
+    // the method reads a `ghost` property that is not declared at all.
+    const allocator = std.testing.allocator;
+
+    const bindings = [_]types.ANFBinding{
+        .{
+            .name = "t0",
+            .value = .{ .load_prop = .{ .name = "ghost" } },
+            .source_loc = .{ .file = "Ghost.runar.ts", .line = 7, .column = 4 },
+        },
+        .{ .name = "t1", .value = .{ .assert = .{ .value = "t0" } } },
+    };
+
+    var props = [_]types.ANFProperty{
+        .{ .name = "pk", .type_name = "PubKey", .readonly = true },
+    };
+    var methods_arr = [_]types.ANFMethod{
+        .{ .name = "spend", .is_public = true, .params = &.{}, .bindings = @constCast(&bindings) },
+    };
+    const program = types.ANFProgram{
+        .contract_name = "Ghost",
+        .properties = &props,
+        .methods = &methods_arr,
+    };
+
+    try std.testing.expectError(LowerError.LoadPropNoConstructorSlot, lower(allocator, program));
+}
+
+test "lower accepts load_prop for a real constructor-param property (H1)" {
+    // A genuine readonly constructor-param property has a deploy-time slot
+    // (found == true) and must still lower to a placeholder without error.
+    const allocator = std.testing.allocator;
+
+    const bindings = [_]types.ANFBinding{
+        .{ .name = "t0", .value = .{ .load_prop = .{ .name = "pk" } } },
+        .{ .name = "t1", .value = .{ .assert = .{ .value = "t0" } } },
+    };
+
+    var props = [_]types.ANFProperty{
+        .{ .name = "pk", .type_name = "PubKey", .readonly = true },
+    };
+    var methods_arr = [_]types.ANFMethod{
+        .{ .name = "spend", .is_public = true, .params = &.{}, .bindings = @constCast(&bindings) },
+    };
+    const ctor_params = [_]types.ParamNode{
+        .{ .name = "pk", .type_info = .pub_key },
+    };
+    const program = types.ANFProgram{
+        .contract_name = "Ok",
+        .properties = &props,
+        .methods = &methods_arr,
+        .constructor = .{ .params = @constCast(&ctor_params), .assertions = &.{} },
+    };
+
+    const result = try lower(allocator, program);
+    defer {
+        for (result.methods) |m| {
+            allocator.free(m.instructions);
+            if (m.instruction_source_locs.len > 0) allocator.free(m.instruction_source_locs);
+        }
+        allocator.free(result.methods);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.methods.len);
+}
+
+test "lower multi-method produces one StackMethod per public method" {
     const allocator = std.testing.allocator;
 
     const bindings1 = [_]types.ANFBinding{
-        .{ .name = "t0", .value = .{ .literal_int = 1 } },
+        .{ .name = "t0", .value = .{ .load_const = .{ .value = .{ .integer = 1 } } } },
     };
     const bindings2 = [_]types.ANFBinding{
-        .{ .name = "t0", .value = .{ .literal_int = 2 } },
+        .{ .name = "t0", .value = .{ .load_const = .{ .value = .{ .integer = 2 } } } },
     };
 
     var methods_arr = [_]types.ANFMethod{
@@ -4352,22 +5766,12 @@ test "lower multi-method dispatch" {
         allocator.free(result.methods);
     }
 
-    try std.testing.expectEqual(@as(usize, 1), result.methods.len);
-    try std.testing.expectEqualStrings("__dispatch", result.methods[0].name);
-
-    var found_numequal = false;
-    var found_numequalverify = false;
-    for (result.methods[0].instructions) |inst| {
-        switch (inst) {
-            .op => |op| {
-                if (op == .op_numequal) found_numequal = true;
-                if (op == .op_numequalverify) found_numequalverify = true;
-            },
-            else => {},
-        }
-    }
-    try std.testing.expect(found_numequal);
-    try std.testing.expect(found_numequalverify);
+    // Dispatch wrapping is added at emit time, so stack_lower produces one
+    // StackMethod per public method. The dispatch table opcodes (OP_DUP,
+    // OP_NUMEQUAL, OP_IF, OP_ELSE, OP_ENDIF, OP_NUMEQUALVERIFY) live in emit.zig.
+    try std.testing.expectEqual(@as(usize, 2), result.methods.len);
+    try std.testing.expectEqualStrings("methodA", result.methods[0].name);
+    try std.testing.expectEqualStrings("methodB", result.methods[1].name);
 }
 
 test "lower ecOnCurve preserves field prime pushdata" {
@@ -4432,4 +5836,98 @@ fn test_program() types.ANFProgram {
         .properties = &.{},
         .methods = &.{},
     };
+}
+
+/// Test-only shim exposing the private state-property size calculation.
+/// Kept together with the in-file tests that exercise it; not part of any
+/// public compiler API.
+fn testStatePropSize(t: types.RunarType) !i64 {
+    return LowerCtx.statePropSize(.{ .name = "p", .type_info = t, .readonly = false });
+}
+
+test "statePropSize P384Point is 96 bytes" {
+    try std.testing.expectEqual(@as(i64, 96), try testStatePropSize(.p384_point));
+}
+
+test "statePropSize P256Point is 64 bytes" {
+    try std.testing.expectEqual(@as(i64, 64), try testStatePropSize(.p256_point));
+}
+
+test "statePropSize covers all fixed-size state types" {
+    try std.testing.expectEqual(@as(i64, 8), try testStatePropSize(.bigint));
+    try std.testing.expectEqual(@as(i64, 1), try testStatePropSize(.boolean));
+    try std.testing.expectEqual(@as(i64, 20), try testStatePropSize(.addr));
+    try std.testing.expectEqual(@as(i64, 20), try testStatePropSize(.ripemd160));
+    try std.testing.expectEqual(@as(i64, 32), try testStatePropSize(.sha256));
+    try std.testing.expectEqual(@as(i64, 33), try testStatePropSize(.pub_key));
+    try std.testing.expectEqual(@as(i64, 64), try testStatePropSize(.point));
+    try std.testing.expectEqual(@as(i64, 8), try testStatePropSize(.rabin_sig));
+    try std.testing.expectEqual(@as(i64, 8), try testStatePropSize(.rabin_pub_key));
+}
+
+test "statePropSize covers all variable-length state types" {
+    try std.testing.expectEqual(@as(i64, -1), try testStatePropSize(.byte_string));
+    try std.testing.expectEqual(@as(i64, -1), try testStatePropSize(.sig));
+    try std.testing.expectEqual(@as(i64, -1), try testStatePropSize(.sig_hash_preimage));
+}
+
+// --- Integration: stateful contracts with uncommon state types compile ---
+
+fn loweredGetStateScript(allocator: std.mem.Allocator, prop_type: types.RunarType, type_name: []const u8) !types.StackProgram {
+    const bindings = try allocator.dupe(types.ANFBinding, &[_]types.ANFBinding{
+        .{ .name = "_state", .value = .{ .get_state_script = {} } },
+        .{ .name = "t0", .value = .{ .assert = .{ .value = "_state" } } },
+    });
+
+    const props = try allocator.dupe(types.ANFProperty, &[_]types.ANFProperty{
+        .{ .name = "field", .type_name = type_name, .type_info = prop_type, .readonly = false },
+    });
+
+    const methods = try allocator.dupe(types.ANFMethod, &[_]types.ANFMethod{
+        .{ .name = "snapshot", .is_public = true, .params = &.{}, .bindings = bindings },
+    });
+
+    const program = types.ANFProgram{
+        .contract_name = "S",
+        .parent_class = .stateful_smart_contract,
+        .properties = props,
+        .methods = methods,
+        .constructor = .{ .params = &.{}, .assertions = &.{} },
+    };
+    defer allocator.free(bindings);
+    defer allocator.free(props);
+    defer allocator.free(methods);
+    return try lower(allocator, program);
+}
+
+test "stateful contract with RabinSig state property compiles" {
+    const allocator = std.testing.allocator;
+    const result = try loweredGetStateScript(allocator, .rabin_sig, "RabinSig");
+    defer result.deinit(allocator);
+    try std.testing.expect(result.methods.len == 1);
+    try std.testing.expect(result.methods[0].instructions.len > 0);
+}
+
+test "stateful contract with Sig state property compiles" {
+    const allocator = std.testing.allocator;
+    const result = try loweredGetStateScript(allocator, .sig, "Sig");
+    defer result.deinit(allocator);
+    try std.testing.expect(result.methods.len == 1);
+    try std.testing.expect(result.methods[0].instructions.len > 0);
+}
+
+test "stateful contract with Ripemd160 state property compiles" {
+    const allocator = std.testing.allocator;
+    const result = try loweredGetStateScript(allocator, .ripemd160, "Ripemd160");
+    defer result.deinit(allocator);
+    try std.testing.expect(result.methods.len == 1);
+    try std.testing.expect(result.methods[0].instructions.len > 0);
+}
+
+test "stateful contract with P384Point state property compiles" {
+    const allocator = std.testing.allocator;
+    const result = try loweredGetStateScript(allocator, .p384_point, "P384Point");
+    defer result.deinit(allocator);
+    try std.testing.expect(result.methods.len == 1);
+    try std.testing.expect(result.methods[0].instructions.len > 0);
 }

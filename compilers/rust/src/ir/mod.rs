@@ -4,7 +4,11 @@
 //! Rúnar compiler produces byte-identical ANF IR (when serialised with canonical
 //! JSON), so these types serve as the universal interchange format.
 
+pub mod input_limits;
 pub mod loader;
+pub mod unknown_anf_kind_error;
+
+pub use unknown_anf_kind_error::UnknownAnfKindError;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +35,26 @@ pub struct ANFProgram {
     pub contract_name: String,
     pub properties: Vec<ANFProperty>,
     pub methods: Vec<ANFMethod>,
+    /// Base class the source contract extends ("SmartContract" |
+    /// "StatefulSmartContract" | "UnsafeSmartContract"). In-memory carrier
+    /// ONLY (`#[serde(skip)]`) so it never appears in the emitted ANF IR JSON
+    /// that the conformance suite compares cross-tier. The artifact assembler
+    /// copies it to the top-level artifact field so SDKs can gate the
+    /// issue-#42/#44 terminal sighash subscript trim on the authoritative
+    /// parent class (a StatefulSmartContract with zero mutable fields still
+    /// needs the trim even though state_fields is empty).
+    #[serde(skip, default)]
+    pub parent_class: String,
+}
+
+/// One level of a synthetic-array chain attached to expanded leaf
+/// properties produced by the expand-fixed-arrays pass. Outermost
+/// level first.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ANFSyntheticArrayLevel {
+    pub base: String,
+    pub index: usize,
+    pub length: usize,
 }
 
 /// A contract-level property (constructor parameter).
@@ -42,6 +66,12 @@ pub struct ANFProperty {
     pub readonly: bool,
     #[serde(rename = "initialValue", skip_serializing_if = "Option::is_none")]
     pub initial_value: Option<serde_json::Value>,
+    /// Non-empty for synthetic scalar leaves produced by the
+    /// expand-fixed-arrays pass. Outermost level first. Used by the
+    /// assembler to re-group these back into a single (possibly nested)
+    /// FixedArray ABI/state entry.
+    #[serde(rename = "__syntheticArrayChain", skip_serializing_if = "Option::is_none", default)]
+    pub synthetic_array_chain: Option<Vec<ANFSyntheticArrayLevel>>,
 }
 
 /// A single contract method.
@@ -52,6 +82,14 @@ pub struct ANFMethod {
     pub body: Vec<ANFBinding>,
     #[serde(rename = "isPublic")]
     pub is_public: bool,
+    /// Issue #123: the method's declared `@sighash` type (e.g. `0x43` for
+    /// SINGLE|FORKID), `None` for the default `ALL|FORKID`. In-memory carrier
+    /// ONLY (`#[serde(skip)]`, like `ANFProgram::parent_class`) so it never
+    /// appears in the emitted ANF IR JSON the conformance suite compares
+    /// cross-tier; the artifact assembler copies a non-default value into
+    /// `ABIMethod.sigHashType` so the SDK builds the matching preimage.
+    #[serde(skip, default)]
+    pub sighash_type: Option<i64>,
 }
 
 /// A method parameter.
@@ -79,6 +117,17 @@ pub struct ANFBinding {
 // ---------------------------------------------------------------------------
 // ANF value types (discriminated on `kind`)
 // ---------------------------------------------------------------------------
+
+/// Default `Loop::start` for IR payloads that predate issue #121: a zero-start
+/// counting-up loop (`i = 0..count-1`).
+fn default_loop_start() -> serde_json::Value {
+    serde_json::Value::Number(serde_json::Number::from(0))
+}
+
+/// Default `Loop::step` for IR payloads that predate issue #121: +1 (counting up).
+fn default_loop_step() -> i64 {
+    1
+}
 
 /// Discriminated union of all ANF value types.
 ///
@@ -139,10 +188,37 @@ pub enum ANFValue {
         body: Vec<ANFBinding>,
         #[serde(rename = "iterVar")]
         iter_var: String,
+        // Iterator start value and step direction (issue #121). The loop is
+        // unrolled `count` times; on iteration `i` (0-based) the iterator
+        // variable holds `start + i * step`. Zero-start counting-up loops carry
+        // `start = 0` and `step = 1`, reproducing the historical
+        // `i = 0..count-1` lowering byte-for-byte. Countdown loops carry
+        // `step = -1`. Serialised as a JS-style decimal (number or `Nn`
+        // string) via `bigint_to_json`; older payloads without the fields
+        // default to a zero-start counting-up loop.
+        #[serde(default = "default_loop_start")]
+        start: serde_json::Value,
+        #[serde(default = "default_loop_step")]
+        step: i64,
     },
 
     #[serde(rename = "assert")]
-    Assert { value: String },
+    Assert {
+        value: String,
+        // Optional marker: set to `true` only on the auto-injected
+        // `hash256(continuationOutputs) === extractOutputHash(txPreimage)`
+        // assert emitted by the StatefulSmartContract lowering. Off-chain
+        // SDK interpreters use this to skip the equality check without
+        // resorting to positional or structural heuristics that misfire on
+        // developer-written covenant asserts whose IR shape is identical.
+        // Absent => developer code.
+        #[serde(
+            rename = "isAutoInjectedStateCheck",
+            default,
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        is_auto_injected_state_check: bool,
+    },
 
     #[serde(rename = "update_prop")]
     UpdateProp { name: String, value: String },
@@ -151,7 +227,16 @@ pub enum ANFValue {
     GetStateScript {},
 
     #[serde(rename = "check_preimage")]
-    CheckPreimage { preimage: String },
+    CheckPreimage {
+        preimage: String,
+        /// Issue #123: BIP-143 sighash flag the on-chain OP_PUSH_TX binding
+        /// appends to the derived signature. Absent = default `ALL|FORKID`
+        /// (0x41), byte-identical to the pinned cross-tier binding blob. Only
+        /// set for a method that declares a non-default `@sighash` mode, so
+        /// golden ANF stays unchanged for every existing contract.
+        #[serde(rename = "sighashFlag", skip_serializing_if = "Option::is_none", default)]
+        sighash_flag: Option<i64>,
+    },
 
     #[serde(rename = "deserialize_state")]
     DeserializeState { preimage: String },
@@ -172,9 +257,35 @@ pub enum ANFValue {
         script_bytes: String,
     },
 
+    /// AddDataOutput — records an additional transaction output that is NOT a
+    /// state continuation. The output is included in the auto-computed
+    /// continuation hash in declaration order, after state outputs and before
+    /// the change output. The emit shape is identical to `add_raw_output`:
+    /// amount(8LE) + varint(scriptLen) + scriptBytes.
+    #[serde(rename = "add_data_output")]
+    AddDataOutput {
+        satoshis: String,
+        #[serde(rename = "scriptBytes")]
+        script_bytes: String,
+    },
+
     #[serde(rename = "array_literal")]
     ArrayLiteral {
         elements: Vec<String>,
+    },
+
+    /// RawScript — an opaque opcode-byte span emitted verbatim by the `asm`
+    /// compiler intrinsic. `bytes` is an even-length hex string of raw Bitcoin
+    /// Script opcode bytes; `in_arity` / `out_arity` declare the span's stack
+    /// effect. The bytes are never inspected — the peephole optimizer treats
+    /// the span as a hard barrier and constant folding never crosses it.
+    #[serde(rename = "raw_script")]
+    RawScript {
+        bytes: String,
+        #[serde(rename = "in_arity")]
+        in_arity: usize,
+        #[serde(rename = "out_arity")]
+        out_arity: usize,
     },
 }
 
@@ -186,7 +297,14 @@ pub enum ANFValue {
 #[derive(Debug, Clone)]
 pub enum ConstValue {
     Bool(bool),
-    Int(i128),
+    /// Arbitrary-precision integer constant.
+    ///
+    /// Widened from `i128` to `num_bigint::BigInt` so 256-bit constants
+    /// (e.g. the secp256k1 group order in schnorr-zkp's s-bound assert)
+    /// round-trip through the IR JSON ↔ stack-IR boundary without
+    /// truncation. Mirrors Go's `ConstBigInt *big.Int` field on
+    /// `ANFValue`.
+    Int(num_bigint::BigInt),
     Str(String),
 }
 
@@ -200,21 +318,71 @@ impl ANFValue {
     }
 }
 
+/// Reports whether `s` is a JS-style decimal `BigInt` literal: an optional
+/// leading `-`, one or more ASCII digits, and a required trailing `n`.
+///
+/// Mirrors:
+///   - Go: `compilers/go/ir/types.go::isDecimalBigIntLiteral` — the
+///     discriminator the Go IR decoder uses to distinguish a decimal
+///     `BigInt` from a hex-encoded `ByteString` in `load_const` JSON
+///     strings.
+///   - Python: `_is_decimal_bigint_literal`
+///   - TS: the conformance runner's BigInt canonicalisation
+///
+/// Without the `n` suffix the two cases are indistinguishable when the
+/// literal is all-digit (e.g. `"3030"` is both a valid decimal integer
+/// AND a valid hex bytestring).
+pub fn is_decimal_bigint_literal(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || *bytes.last().unwrap() != b'n' {
+        return false;
+    }
+    let start = if bytes[0] == b'-' { 1 } else { 0 };
+    let body = &bytes[start..bytes.len() - 1];
+    if body.is_empty() {
+        return false;
+    }
+    body.iter().all(|c| c.is_ascii_digit())
+}
+
 /// Parse a `serde_json::Value` into a `ConstValue`.
+///
+/// `load_const` values arrive in one of four shapes:
+/// - `true` / `false`                       → `ConstValue::Bool`
+/// - JSON number (any precision)            → `ConstValue::Int(BigInt)`
+/// - JSON string with trailing `n` suffix   → `ConstValue::Int(BigInt)`
+///   (JS-style decimal BigInt; cross-tier oversize-int encoding)
+/// - JSON string otherwise                  → `ConstValue::Str` (hex bytes)
 pub fn parse_const_value(v: &serde_json::Value) -> Option<ConstValue> {
+    use num_bigint::BigInt;
+    use std::str::FromStr;
     match v {
         serde_json::Value::Bool(b) => Some(ConstValue::Bool(*b)),
         serde_json::Value::Number(n) => {
-            // Try i64 first (covers most values), then fall back to f64 for larger numbers
-            if let Some(i) = n.as_i64() {
-                Some(ConstValue::Int(i as i128))
+            // serde_json preserves integer JSON-number precision through
+            // its string repr; parse via BigInt::from_str so 256-bit
+            // values survive without truncation. JSON floats (e.g.
+            // `1e20`) round-trip through a fractional string that
+            // BigInt rejects; fall back to f64 → i128 in that case for
+            // parity with the pre-widening behaviour.
+            let s = n.to_string();
+            if let Ok(bi) = BigInt::from_str(&s) {
+                Some(ConstValue::Int(bi))
             } else if let Some(f) = n.as_f64() {
-                Some(ConstValue::Int(f as i128))
+                Some(ConstValue::Int(BigInt::from(f as i128)))
             } else {
                 None
             }
         }
-        serde_json::Value::String(s) => Some(ConstValue::Str(s.clone())),
+        serde_json::Value::String(s) => {
+            if is_decimal_bigint_literal(s) {
+                // Strip the trailing 'n' and parse the digits as BigInt.
+                let body = &s[..s.len() - 1];
+                BigInt::from_str(body).ok().map(ConstValue::Int)
+            } else {
+                Some(ConstValue::Str(s.clone()))
+            }
+        }
         _ => None,
     }
 }

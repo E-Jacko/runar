@@ -1,0 +1,256 @@
+{
+  "fixture_version": 1,
+  "notes": "Cross-tier interop fixture for the signed-envelope wire protocol. Every Runar SDK (TS/Go/Rust/Python/Zig/Ruby/Java) must consume this and produce byte-identical canonical_json output + verify the valid envelope + reject each tampered envelope with the listed reason.",
+  "alice_priv_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+  "alice_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "nonce": 1700000000000,
+  "expires_at": 1700000030000,
+  "verify_now_ms": 1700000000500,
+  "canonical_json_vectors": [
+    {
+      "input": {
+        "a": 1,
+        "b": 2
+      },
+      "expected": "{\"a\":1,\"b\":2}"
+    },
+    {
+      "input": {
+        "b": 2,
+        "a": 1
+      },
+      "expected": "{\"a\":1,\"b\":2}"
+    },
+    {
+      "input": [
+        1,
+        2,
+        3
+      ],
+      "expected": "[1,2,3]"
+    },
+    {
+      "input": null,
+      "expected": "null"
+    },
+    {
+      "input": true,
+      "expected": "true"
+    },
+    {
+      "input": false,
+      "expected": "false"
+    },
+    {
+      "input": 42,
+      "expected": "42"
+    },
+    {
+      "input": 0,
+      "expected": "0"
+    },
+    {
+      "input": -7,
+      "expected": "-7"
+    },
+    {
+      "input": "hi",
+      "expected": "\"hi\""
+    },
+    {
+      "input": "",
+      "expected": "\"\""
+    },
+    {
+      "input": {
+        "kind": "hello",
+        "n": 7
+      },
+      "expected": "{\"kind\":\"hello\",\"n\":7}"
+    },
+    {
+      "input": {
+        "outer": {
+          "z": 1,
+          "a": [
+            3,
+            2,
+            1
+          ]
+        },
+        "list": [
+          {
+            "y": 1,
+            "x": 2
+          }
+        ],
+        "n": null,
+        "b": true,
+        "s": "hi"
+      },
+      "expected": "{\"b\":true,\"list\":[{\"x\":2,\"y\":1}],\"n\":null,\"outer\":{\"a\":[3,2,1],\"z\":1},\"s\":\"hi\"}"
+    },
+    {
+      "input": {
+        "t": "a\tb"
+      },
+      "expected": "{\"t\":\"a\\tb\"}"
+    },
+    {
+      "input": {
+        "q": "say \"hi\""
+      },
+      "expected": "{\"q\":\"say \\\"hi\\\"\"}"
+    },
+    {
+      "input": {
+        "b": "\\"
+      },
+      "expected": "{\"b\":\"\\\\\"}"
+    },
+    {
+      "_vector_id": "v18-empty-key-vs-astral",
+      "_audit_ref": "audits/canonical-json-rfc8785-parity.md §3 rec 1 (D1)",
+      "_notes": "Empty key MUST sort before astral plane char in UTF-16 code-unit order (not UTF-8 byte order). Gates Zig D1 fix.",
+      "input": {
+        "😀": 1,
+        "": 2
+      },
+      "expected": "{\"\":2,\"😀\":1}"
+    },
+    {
+      "_vector_id": "v18b-astral-vs-bmp-private-use",
+      "_audit_ref": "audits/canonical-json-rfc8785-parity.md §3 rec 1 (D1)",
+      "_notes": "Astral-plane char U+1F600 vs BMP char U+E000. UTF-16 sort: high surrogate 0xD83D < 0xE000 ⇒ astral first. UTF-8 byte sort: 0xF0… > 0xEE… ⇒ BMP first. Triggers a byte-vs-UTF-16 divergence that v18 misses (empty key compares equal under both orders).",
+      "input": {
+        "😀": 1,
+        "": 2
+      },
+      "expected": "{\"😀\":1,\"\":2}"
+    },
+    {
+      "_vector_id": "v19-boolean-false-preserved",
+      "_audit_ref": "audits/canonical-json-rfc8785-parity.md §3 rec 3 (D4)",
+      "_notes": "Boolean false MUST be preserved verbatim. Gates Ruby D4 fix (the `value[k] || value[k.to_sym]` fallthrough silently rewrote falsy values).",
+      "input": {
+        "k": false
+      },
+      "expected": "{\"k\":false}"
+    },
+    {
+      "_vector_id": "v20-float-1e21-scientific",
+      "_audit_ref": "audits/canonical-json-rfc8785-parity.md §3 rec 5 (D5)",
+      "_notes": "Float at the ECMA-262 1e21 boundary MUST emit `1e+21`. The D5 divergence is fixed: every tier now emits the spec ECMA-262 Number::toString form via its `*Ecma262Double` formatter (Go appendEcma262Double, Rust format_ecma262_double, Python _format_double, Zig appendEcma262Double, Ruby format_ecma262_double, Java formatEcma262Double; TS uses the native JS formatter). `expected` is the spec form and is enforced as a byte-parity gate across all tiers.",
+      "input": {
+        "big": 1e21
+      },
+      "expected": "{\"big\":1e+21}"
+    },
+    {
+      "_vector_id": "v21-float-1e-300-no-trailing-dotzero",
+      "_audit_ref": "audits/canonical-json-rfc8785-parity.md §3 rec 4 (D5)",
+      "_notes": "Tiny float MUST emit `1e-300` (no trailing `.0`). The D5 divergence is fixed: every tier's `*Ecma262Double` formatter now emits the spec ECMA-262 Number::toString form, so all tiers produce `1e-300` (no trailing `.0`). `expected` is the spec form and is enforced as a byte-parity gate across all tiers.",
+      "input": {
+        "r": 1e-300
+      },
+      "expected": "{\"r\":1e-300}"
+    }
+  ],
+  "canonical_json_rejection_vectors": [
+    {
+      "_vector_id": "v22-lone-surrogate-rejected",
+      "_audit_ref": "audits/canonical-json-rfc8785-parity.md §3 rec 6 (D6)",
+      "_notes": "Lone surrogate (U+D800 with no low-surrogate partner) is invalid Unicode per RFC 8785 and MUST be rejected. The D6 fix has landed: every tier now rejects this input — TS (canonical-json.ts: lone-surrogate code path), Go (sdk_envelope.go: WTF-8 0xED,0xA0..0xBF detection), Python (envelope.py: 0xD800..0xDFFF check), Zig (sdk_envelope.zig: error.LoneSurrogate), Ruby (envelope.rb: U+D800..U+DFFF raise), Java (Envelope.java: Character.isHighSurrogate/isLowSurrogate check). Rust cannot represent a lone surrogate in its `&str` type at all (structurally rejected at the type boundary). The Go interop test `packages/runar-go/sdk_envelope_interop_test.go` (TestEnvelopeInterop_CanonicalJSONRejectionVectors) asserts this rejection against this vector. This vector now ENFORCES rejection across all tiers. The input is supplied as a UTF-16 code-unit array so each tier constructs the string deterministically without relying on its JSON parser's lone-surrogate handling.",
+      "description": "object with a value containing the lone high surrogate U+D800",
+      "input_object_key": "surrogate",
+      "input_value_utf16_units": [55296]
+    }
+  ],
+  "valid_envelope": {
+    "payload": "{\"expiresAt\":1700000030000,\"kind\":\"hello\",\"n\":7,\"nonce\":1700000000000}",
+    "sig": "3045022100c038da9733f2f50b3ed1a85ecb1d55f90a585452a2061d55548eae5372d70e5202201cf82154d3787b4efba49cf86d157c0e35fcfda78de712aab804c135c5e41c31",
+    "pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "nonce": 1700000000000,
+    "expiresAt": 1700000030000
+  },
+  "rejection_vectors": [
+    {
+      "reason": "missing-fields",
+      "envelope": {
+        "payload": "{\"expiresAt\":1700000030000,\"kind\":\"hello\",\"n\":7,\"nonce\":1700000000000}",
+        "sig": "",
+        "pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "nonce": 1700000000000,
+        "expiresAt": 1700000030000
+      }
+    },
+    {
+      "reason": "expired",
+      "envelope": {
+        "payload": "{\"expiresAt\":1000000000001,\"nonce\":1000000000000,\"ok\":1}",
+        "sig": "3045022100c038da9733f2f50b3ed1a85ecb1d55f90a585452a2061d55548eae5372d70e5202201cf82154d3787b4efba49cf86d157c0e35fcfda78de712aab804c135c5e41c31",
+        "pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "nonce": 1000000000000,
+        "expiresAt": 1000000000001
+      }
+    },
+    {
+      "reason": "bad-json",
+      "envelope": {
+        "payload": "not json{",
+        "sig": "3045022100c038da9733f2f50b3ed1a85ecb1d55f90a585452a2061d55548eae5372d70e5202201cf82154d3787b4efba49cf86d157c0e35fcfda78de712aab804c135c5e41c31",
+        "pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "nonce": 1700000000000,
+        "expiresAt": 1700000030000
+      }
+    },
+    {
+      "reason": "envelope-mismatch",
+      "envelope": {
+        "payload": "{\"expiresAt\":1700000030000,\"kind\":\"hello\",\"n\":7,\"nonce\":1700000000000}",
+        "sig": "3045022100c038da9733f2f50b3ed1a85ecb1d55f90a585452a2061d55548eae5372d70e5202201cf82154d3787b4efba49cf86d157c0e35fcfda78de712aab804c135c5e41c31",
+        "pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "nonce": 1700000000001,
+        "expiresAt": 1700000030000
+      }
+    },
+    {
+      "reason": "bad-sig",
+      "envelope": {
+        "payload": "{\"expiresAt\":1700000030000,\"kind\":\"hello\",\"n\":7,\"nonce\":1700000000000}",
+        "sig": "3045022100c038da9733f2f50b3ed1a85ecb1d55f90a585452a2061d55548eae5372d7015202201cf82154d3787b4efba49cf86d157c0e35fcfda78de712aab804c135c5e41c31",
+        "pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "nonce": 1700000000000,
+        "expiresAt": 1700000030000
+      }
+    }
+  ],
+  "note_on_pubkey_not_allowed": "pubkey-not-allowed cannot be expressed in a tier-agnostic fixture: it depends on caller-supplied expected_keys. Each tier verifies this reason in its own unit tests by passing a non-matching allowlist; the wire bytes are independent.",
+  "signing_vectors_notes": "GAP-064 cross-tier signing reproduction. Each tier, signing the SAME payload with the SAME key (alice priv=1) via RFC 6979 deterministic ECDSA whose nonce HMAC uses PLAIN SHA-256, MUST produce the BYTE-IDENTICAL low-S DER signature listed in expected_sig. expected_payload = canonicalJson({...data, nonce, expiresAt}); expected_sig = low-S DER of deterministic ECDSA over sha256(expected_payload) signed directly (the digest is the message representative — do NOT re-hash). Generated via the TS reference (runar-ir-schema canonicalJsonStringify + @bsv/sdk primitives/ECDSA sign with forceLowS=true).",
+  "signing_vectors": [
+    {
+      "_vector_id": "sv1-ascii",
+      "data": {
+        "kind": "order",
+        "qty": 3
+      },
+      "nonce": 1700000000000,
+      "expiresAt": 1700000030000,
+      "expected_payload": "{\"expiresAt\":1700000030000,\"kind\":\"order\",\"nonce\":1700000000000,\"qty\":3}",
+      "expected_sig": "304402205682099f1b0aec291acfbf0ba9b0840d195682074b154edd3711d298a8ca33eb02200c634e5ec29636cda382624e3b15d28a94ac997fbbba830dbbe025bcac76b0b1"
+    },
+    {
+      "_vector_id": "sv2-nonascii-astral-keys",
+      "_notes": "Non-ASCII BMP key (用户), astral-plane emoji key (🔥 = U+1F525), and a Latin-1 value (héllo). Exercises UTF-16 code-unit key ordering AND UTF-8 payload-byte hashing simultaneously: any tier that diverges on either canonicalization or nonce-hash will produce a different signature.",
+      "data": {
+        "用户": "alice",
+        "🔥": "fire",
+        "msg": "héllo"
+      },
+      "nonce": 1700000000000,
+      "expiresAt": 1700000030000,
+      "expected_payload": "{\"expiresAt\":1700000030000,\"msg\":\"héllo\",\"nonce\":1700000000000,\"用户\":\"alice\",\"🔥\":\"fire\"}",
+      "expected_sig": "304402207e137858bb8427abbeb1036b6fda12640edce81eba423181507cd4027ece63ac0220160f849fc4f8cd4c2b352623d4cd6e15d1557a8126d5d085b2dd34333c096f1e"
+    }
+  ]
+}

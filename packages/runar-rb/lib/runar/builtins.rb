@@ -9,6 +9,9 @@
 require 'digest'
 require_relative 'ecdsa'
 require_relative 'rabin_sig'
+require_relative 'wots'
+require_relative 'slh_dsa'
+require_relative 'nist_ecdsa'
 
 module Runar
   module Builtins
@@ -64,32 +67,50 @@ module Runar
       Runar::RabinSig.rabin_verify(msg, sig, padding, pk)
     end
 
-    def verify_wots(_msg, _sig, _pubkey)
-      true
+    # Real WOTS+ signature verification using SHA-256 hash chains.
+    # All parameters are hex-encoded strings.
+    def verify_wots(msg, sig, pubkey)
+      Runar::WOTS.verify(msg, sig, pubkey)
     end
 
-    def verify_slh_dsa_sha2_128s(_msg, _sig, _pubkey)
-      true
+    # Real SLH-DSA (FIPS 205) signature verification. All 6 SHA-2 parameter
+    # sets are implemented in Runar::SLHDSA. Inputs are hex-encoded strings.
+    def verify_slh_dsa_sha2_128s(msg, sig, pubkey)
+      Runar::SLHDSA.verify(Runar::SLHDSA::PARAM_SETS[:sha2_128s], msg, sig, pubkey)
     end
 
-    def verify_slh_dsa_sha2_128f(_msg, _sig, _pubkey)
-      true
+    def verify_slh_dsa_sha2_128f(msg, sig, pubkey)
+      Runar::SLHDSA.verify(Runar::SLHDSA::PARAM_SETS[:sha2_128f], msg, sig, pubkey)
     end
 
-    def verify_slh_dsa_sha2_192s(_msg, _sig, _pubkey)
-      true
+    def verify_slh_dsa_sha2_192s(msg, sig, pubkey)
+      Runar::SLHDSA.verify(Runar::SLHDSA::PARAM_SETS[:sha2_192s], msg, sig, pubkey)
     end
 
-    def verify_slh_dsa_sha2_192f(_msg, _sig, _pubkey)
-      true
+    def verify_slh_dsa_sha2_192f(msg, sig, pubkey)
+      Runar::SLHDSA.verify(Runar::SLHDSA::PARAM_SETS[:sha2_192f], msg, sig, pubkey)
     end
 
-    def verify_slh_dsa_sha2_256s(_msg, _sig, _pubkey)
-      true
+    def verify_slh_dsa_sha2_256s(msg, sig, pubkey)
+      Runar::SLHDSA.verify(Runar::SLHDSA::PARAM_SETS[:sha2_256s], msg, sig, pubkey)
     end
 
-    def verify_slh_dsa_sha2_256f(_msg, _sig, _pubkey)
-      true
+    def verify_slh_dsa_sha2_256f(msg, sig, pubkey)
+      Runar::SLHDSA.verify(Runar::SLHDSA::PARAM_SETS[:sha2_256f], msg, sig, pubkey)
+    end
+
+    # Real NIST P-256 ECDSA verification using OpenSSL (prime256v1).
+    # Used by hybrid wallets that gate spending on a P-256 (WebAuthn / TPM) key.
+    # All inputs are hex-encoded strings; sig is raw 64-byte r||s.
+    def verify_ecdsa_p256(msg, sig, pubkey)
+      Runar::NistECDSA.p256_verify(msg, sig, pubkey)
+    end
+
+    # Real NIST P-384 ECDSA verification using OpenSSL (secp384r1).
+    # Used by hybrid wallets that gate spending on a P-384 (FIPS HSM) key.
+    # All inputs are hex-encoded strings; sig is raw 96-byte r||s.
+    def verify_ecdsa_p384(msg, sig, pubkey)
+      Runar::NistECDSA.p384_verify(msg, sig, pubkey)
     end
 
     # -- SHA-256 Compression (real implementation, FIPS 180-4) ----------------
@@ -220,21 +241,123 @@ module Runar
       end
     end
 
-    # -- Mock BLAKE3 Functions -------------------------------------------------
+    # -- Baby Bear Field Arithmetic (p = 2^31 - 2^27 + 1 = 2013265921) -------
 
-    # Mock BLAKE3 single-block compression.
-    # In compiled Bitcoin Script this expands to ~10,000 opcodes.
-    # Returns 32 zero bytes as hex for business-logic testing.
-    def blake3_compress(_chaining_value, _block)
-      '00' * 32
+    BB_P = 2013265921
+
+    # Baby Bear field addition: (a + b) mod p.
+    def bb_field_add(a, b)
+      (a + b) % BB_P
     end
 
-    # Mock BLAKE3 hash for messages up to 64 bytes.
-    # In compiled Bitcoin Script this uses the IV as the chaining value and
-    # applies zero-padding before calling the compression function.
-    # Returns 32 zero bytes as hex for business-logic testing.
-    def blake3_hash(_message)
-      '00' * 32
+    # Baby Bear field subtraction: (a - b + p) mod p.
+    def bb_field_sub(a, b)
+      ((a - b) % BB_P + BB_P) % BB_P
+    end
+
+    # Baby Bear field multiplication: (a * b) mod p.
+    def bb_field_mul(a, b)
+      (a * b) % BB_P
+    end
+
+    # Baby Bear field inverse via Fermat's little theorem: a^(p-2) mod p.
+    def bb_field_inv(a)
+      base = ((a % BB_P) + BB_P) % BB_P
+      base.pow(BB_P - 2, BB_P)
+    end
+
+    # -- Mock BLAKE3 Functions -------------------------------------------------
+
+    # -- BLAKE3 single-block compression (real implementation) ------------------
+    #
+    # Standard BLAKE3 (little-endian): the chaining value and block are parsed as
+    # little-endian 32-bit words and the digest is emitted as little-endian bytes.
+    # counter=0, flags=11 (CHUNK_START | CHUNK_END | ROOT). block_len is the real
+    # message length for blake3_hash (0..64) and the constant 64 for a full-block
+    # blake3_compress. Mirrors the TS interpreter reference blake3CompressImpl in
+    # packages/runar-testing/src/interpreter/interpreter.ts.
+
+    BLAKE3_IV_WORDS = [
+      0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ].freeze
+
+    BLAKE3_IV_BYTES = BLAKE3_IV_WORDS.pack('V*').freeze
+
+    BLAKE3_MSG_PERM = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8].freeze
+
+    def self._blake3_rotr32(x, n)
+      ((x >> n) | ((x << (32 - n)) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    end
+
+    def self._blake3_g(s, a, b, c, d, mx, my)
+      s[a] = (s[a] + s[b] + mx) & 0xFFFFFFFF
+      s[d] = _blake3_rotr32(s[d] ^ s[a], 16)
+      s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+      s[b] = _blake3_rotr32(s[b] ^ s[c], 12)
+      s[a] = (s[a] + s[b] + my) & 0xFFFFFFFF
+      s[d] = _blake3_rotr32(s[d] ^ s[a], 8)
+      s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+      s[b] = _blake3_rotr32(s[b] ^ s[c], 7)
+    end
+
+    def self._blake3_round(s, m)
+      _blake3_g(s, 0, 4, 8, 12, m[0], m[1])
+      _blake3_g(s, 1, 5, 9, 13, m[2], m[3])
+      _blake3_g(s, 2, 6, 10, 14, m[4], m[5])
+      _blake3_g(s, 3, 7, 11, 15, m[6], m[7])
+      _blake3_g(s, 0, 5, 10, 15, m[8], m[9])
+      _blake3_g(s, 1, 6, 11, 12, m[10], m[11])
+      _blake3_g(s, 2, 7, 8, 13, m[12], m[13])
+      _blake3_g(s, 3, 4, 9, 14, m[14], m[15])
+    end
+
+    def self._blake3_compress_impl(cv_bytes, block_bytes, block_len = 64)
+      raise ArgumentError, "blake3 cv must be 32 bytes" unless cv_bytes.bytesize == 32
+      raise ArgumentError, "blake3 block must be 64 bytes" unless block_bytes.bytesize == 64
+
+      # Parse chaining value (8 words) and block (16 words) as little-endian.
+      h = cv_bytes.unpack('V8')
+      m = block_bytes.unpack('V16')
+
+      state = [
+        h[0], h[1], h[2], h[3],
+        h[4], h[5], h[6], h[7],
+        BLAKE3_IV_WORDS[0], BLAKE3_IV_WORDS[1],
+        BLAKE3_IV_WORDS[2], BLAKE3_IV_WORDS[3],
+        0, 0, block_len, 11,
+      ]
+
+      msg = m.dup
+      7.times do |r|
+        _blake3_round(state, msg)
+        msg = BLAKE3_MSG_PERM.map { |i| msg[i] } if r < 6
+      end
+
+      # Output: XOR first 8 with last 8, encode as little-endian bytes.
+      out = (0...8).map { |i| (state[i] ^ state[i + 8]) & 0xFFFFFFFF }
+      out.pack('V8')
+    end
+
+    def self._hex_to_bytes(h)
+      return h if h.is_a?(String) && h.encoding == Encoding::ASCII_8BIT
+      return [h].pack('H*') if h.is_a?(String)
+      h.to_s
+    end
+
+    def blake3_compress(chaining_value, block)
+      cv_bytes = Builtins._hex_to_bytes(chaining_value)
+      block_bytes = Builtins._hex_to_bytes(block)
+      Builtins._blake3_compress_impl(cv_bytes, block_bytes).unpack1('H*')
+    end
+
+    def blake3_hash(message)
+      msg_bytes = Builtins._hex_to_bytes(message)
+      truncated = msg_bytes.byteslice(0, 64).to_s
+      block_len = truncated.bytesize # real message length (0..64) = v[14]
+      padded = truncated
+      padded = padded + ("\x00".b * (64 - padded.bytesize)) if padded.bytesize < 64
+      Builtins._blake3_compress_impl(BLAKE3_IV_BYTES, padded, block_len).unpack1('H*')
     end
 
     # -- Real Hash Functions ---------------------------------------------------
@@ -244,6 +367,13 @@ module Runar
     def sha256(data)
       raw = [data].pack('H*')
       Digest::SHA256.hexdigest(raw)
+    end
+
+    # Alias for sha256. Provides an explicitly-named spelling so cross-format
+    # contract sources that reference `Sha256Hash` (resolved by every parser
+    # to the `sha256` builtin) have a matching runtime function here too.
+    def sha256_hash(data)
+      sha256(data)
     end
 
     # RIPEMD-160 hash. Input and output are hex-encoded strings.
@@ -262,6 +392,31 @@ module Runar
     def hash256(data)
       sha_hex = sha256(data)
       sha256(sha_hex)
+    end
+
+    # -- Merkle Proof Verification ---------------------------------------------
+
+    # Compute Merkle root using SHA-256. All values are hex-encoded strings.
+    # proof is concatenated 32-byte siblings (depth * 64 hex chars).
+    # index determines left/right at each level (bit i = direction at level i).
+    def merkle_root_sha256(leaf, proof, index, depth)
+      merkle_root_impl(leaf, proof, index, depth, method(:sha256))
+    end
+
+    # Compute Merkle root using Hash256 (double SHA-256).
+    def merkle_root_hash256(leaf, proof, index, depth)
+      merkle_root_impl(leaf, proof, index, depth, method(:hash256))
+    end
+
+    def merkle_root_impl(leaf, proof, index, depth, hash_fn)
+      current = leaf
+      depth.times do |i|
+        sibling = proof[i * 64, 64]
+        bit = (index >> i) & 1
+        preimage = bit == 1 ? sibling + current : current + sibling
+        current = hash_fn.call(preimage)
+      end
+      current
     end
 
     # -- Mock Preimage Extraction ----------------------------------------------
@@ -305,6 +460,32 @@ module Runar
     # Returns 36 zero bytes (outpoint = txid[32] + vout[4]) in test mode.
     def extract_outpoint(_preimage)
       '00' * 36
+    end
+
+    # -- Intent sub-covenant intrinsics (BSVM Phase 13) ------------------------
+    # Test-mode stubs. On-chain the Ruby compiler desugars these into standard
+    # primitives + auto-injected witness params; the Ruby runtime mock can't
+    # see other inputs/outputs so the returns are no-ops/zeros. See
+    # docs/cross-covenant-pattern.md.
+
+    # extract_prev_output_script: compiler emits hash256(witness) ==
+    # expectedScriptHash on-chain (2-arg form), or
+    # hash256(substr(witness, 0, prefix_len)) == expectedScriptPrefixHash
+    # (3-arg form, BSVM Crit-2). Mock returns an empty ByteString.
+    def extract_prev_output_script(_input_index, _expected_script_hash, _prefix_len = nil)
+      ''
+    end
+
+    # require_output_p2pkh: compiler emits a hashOutputs reconstruction +
+    # substring assertion on-chain. Mock is a no-op.
+    def require_output_p2pkh(_output_index, _pubkey_hash, _amount)
+      nil
+    end
+
+    # current_block_height: on-chain the compiler desugars to
+    # extract_locktime(tx_preimage). Mock returns 0.
+    def current_block_height
+      0
     end
 
     # -- Math Utilities --------------------------------------------------------

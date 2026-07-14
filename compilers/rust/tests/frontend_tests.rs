@@ -1517,9 +1517,8 @@ class Bad extends SmartContract {
             // Error is fine; it should mention the property name
             let err = e.to_lowercase();
             assert!(
-                err.contains("nonexistent") || err.contains("property") || err.contains("does not exist") || err.contains("unknown") || !err.is_empty(),
-                "error should mention the property access issue; got: {}",
-                e
+                err.contains("nonexistent") || err.contains("property") || err.contains("does not exist") || err.contains("unknown"),
+                "expected error about nonexistent property, got: {e}"
             );
         }
     }
@@ -1730,9 +1729,7 @@ class WithDefault extends SmartContract {
             assert!(!artifact.script.is_empty(), "script should not be empty");
         }
         Err(e) => {
-            // If property initializers are not yet supported in the Rust parser,
-            // this is acceptable. The test just documents the current behavior.
-            let _ = e; // any parse/compile error is fine
+            panic!("property initializer compilation should succeed, got error: {e}");
         }
     }
 }
@@ -2106,11 +2103,18 @@ class EmptyMethod extends SmartContract {
 }
 
 // ---------------------------------------------------------------------------
-// V11: validator — identifier loop bound accepted
+// V11: validator — identifier loop bound rejected (cleanly, no panic)
 // ---------------------------------------------------------------------------
+//
+// A for-loop bound that is a bare identifier (e.g. `const N`) cannot be
+// unrolled into fixed Bitcoin Script — the reference TS compiler rejects it
+// with a graceful diagnostic (never a panic). The 6 non-TS tiers previously
+// PANICKED in anf-lower (`extract_loop_shape`) on such a bound; the fix moves
+// the rejection to the validator so compilation fails cleanly. Only genuine
+// integer-literal bounds compile.
 
 #[test]
-fn test_v11_validator_identifier_loop_bound_ok() {
+fn test_v11_validator_identifier_loop_bound_rejects() {
     let source = r#"
 import { SmartContract } from 'runar-lang';
 
@@ -2134,9 +2138,13 @@ class LoopWithIdent extends SmartContract {
 "#;
     let result = compile_ts(source);
     assert!(
-        result.is_ok(),
-        "for loop with identifier bound (const N) should pass validation; got: {:?}",
-        result.err()
+        result.is_err(),
+        "for loop with identifier bound (const N) must be rejected cleanly (no panic)"
+    );
+    let err = format!("{:?}", result.err());
+    assert!(
+        err.contains("compile-time constant"),
+        "expected a 'compile-time constant' loop-bound diagnostic, got: {err}"
     );
 }
 
@@ -3432,6 +3440,160 @@ class MultiOut extends StatefulSmartContract {
             // (addOutput syntax may differ). This is acceptable.
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// addDataOutput tests — data outputs live alongside state outputs in the
+// continuation hash: [state outputs] || [data outputs] || change.
+// ---------------------------------------------------------------------------
+
+/// Stateful method using both addOutput and addDataOutput emits the data
+/// output AFTER the state output and BEFORE the change output in the
+/// continuation-hash composition.
+#[test]
+fn test_add_data_output_with_add_output_ordering() {
+    use runar_compiler_rust::ir::ANFValue;
+
+    let source = r#"
+import { StatefulSmartContract, ByteString } from 'runar-lang';
+
+class MixedOutputs extends StatefulSmartContract {
+    count: bigint;
+
+    constructor(count: bigint) {
+        super(count);
+        this.count = count;
+    }
+
+    public bump(data: ByteString) {
+        this.count = this.count + 1n;
+        this.addOutput(1000n, this.count);
+        this.addDataOutput(0n, data);
+    }
+}
+"#;
+    let program = compile_ts_to_ir(source).expect("should lower to ANF");
+    let bump = program.methods.iter().find(|m| m.name == "bump").expect("expected bump");
+
+    // Collect the order of state-output / data-output emissions.
+    let mut state_output_index: Option<usize> = None;
+    let mut data_output_index: Option<usize> = None;
+    for (i, b) in bump.body.iter().enumerate() {
+        match &b.value {
+            ANFValue::AddOutput { .. } if state_output_index.is_none() => {
+                state_output_index = Some(i);
+            }
+            ANFValue::AddDataOutput { .. } if data_output_index.is_none() => {
+                data_output_index = Some(i);
+            }
+            _ => {}
+        }
+    }
+
+    let so = state_output_index.expect("expected AddOutput in bump method body");
+    let do_ = data_output_index.expect("expected AddDataOutput in bump method body");
+    assert!(so < do_, "AddOutput must appear before AddDataOutput; got so={}, do={}", so, do_);
+}
+
+/// Stateful method using ONLY addDataOutput (no addOutput, no state
+/// mutation) still compiles and still runs the single-output continuation
+/// path: _newAmount is injected and a data output exists in the body.
+#[test]
+fn test_add_data_output_only_compiles() {
+    use runar_compiler_rust::ir::ANFValue;
+
+    let source = r#"
+import { StatefulSmartContract, ByteString } from 'runar-lang';
+
+class DataOnly extends StatefulSmartContract {
+    count: bigint;
+
+    constructor(count: bigint) {
+        super(count);
+        this.count = count;
+    }
+
+    public emitData(data: ByteString) {
+        this.addDataOutput(0n, data);
+    }
+}
+"#;
+    let program = compile_ts_to_ir(source).expect("should lower to ANF");
+    let emit = program.methods.iter().find(|m| m.name == "emitData").expect("expected emitData");
+
+    // _newAmount should be injected because the state-continuation path is
+    // single-output (no addOutput used) but data outputs are declared.
+    let param_names: Vec<&str> = emit.params.iter().map(|p| p.name.as_str()).collect();
+    assert!(
+        param_names.contains(&"_newAmount"),
+        "data-output-only stateful method should have _newAmount param injected; got: {:?}",
+        param_names
+    );
+    assert!(
+        param_names.contains(&"_changePKH") && param_names.contains(&"_changeAmount"),
+        "data-output-only stateful method should have _changePKH/_changeAmount injected; got: {:?}",
+        param_names
+    );
+
+    // There should be at least one AddDataOutput binding.
+    let has_data_output = emit.body.iter().any(|b| matches!(&b.value, ANFValue::AddDataOutput { .. }));
+    assert!(
+        has_data_output,
+        "emitData body should contain an AddDataOutput binding; body kinds: {:?}",
+        emit.body.iter().map(|b| format!("{:?}", std::mem::discriminant(&b.value))).collect::<Vec<_>>()
+    );
+}
+
+/// The continuation-hash composition must include data outputs. Verify by
+/// counting the `cat` calls emitted after the first AddOutput: there must
+/// be one extra `cat` per data output (plus one for the change output).
+#[test]
+fn test_add_data_output_included_in_continuation_hash() {
+    use runar_compiler_rust::ir::ANFValue;
+
+    let source = r#"
+import { StatefulSmartContract, ByteString } from 'runar-lang';
+
+class CatCounts extends StatefulSmartContract {
+    count: bigint;
+
+    constructor(count: bigint) {
+        super(count);
+        this.count = count;
+    }
+
+    public bump(data1: ByteString, data2: ByteString) {
+        this.count = this.count + 1n;
+        this.addOutput(1000n, this.count);
+        this.addDataOutput(0n, data1);
+        this.addDataOutput(0n, data2);
+    }
+}
+"#;
+    let program = compile_ts_to_ir(source).expect("should lower to ANF");
+    let bump = program.methods.iter().find(|m| m.name == "bump").expect("expected bump");
+
+    // Count AddDataOutput bindings — must be 2.
+    let n_data_outputs = bump
+        .body
+        .iter()
+        .filter(|b| matches!(&b.value, ANFValue::AddDataOutput { .. }))
+        .count();
+    assert_eq!(n_data_outputs, 2, "expected 2 AddDataOutput bindings");
+
+    // Count `cat` calls. For N_state state outputs + N_data data outputs +
+    // change, we need (N_state - 1) + N_data + 1 cat calls. Here N_state=1,
+    // N_data=2, so expected cat count = 0 + 2 + 1 = 3.
+    let n_cats = bump
+        .body
+        .iter()
+        .filter(|b| matches!(&b.value, ANFValue::Call { func, .. } if func == "cat"))
+        .count();
+    assert_eq!(
+        n_cats, 3,
+        "continuation-hash composition should use 3 cat calls (2 data + 1 change); got {}",
+        n_cats
+    );
 }
 
 // ---------------------------------------------------------------------------

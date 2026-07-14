@@ -3,43 +3,45 @@ const runar = @import("runar");
 
 const Auction = @import("auction/Auction.runar.zig").Auction;
 const Blake3Test = @import("blake3/Blake3Test.runar.zig").Blake3Test;
+const BSV20Token = @import("bsv20-token/BSV20Token.runar.zig").BSV20Token;
+const BSV21Token = @import("bsv21-token/BSV21Token.runar.zig").BSV21Token;
 const ConvergenceProof = @import("convergence-proof/ConvergenceProof.runar.zig").ConvergenceProof;
 const CovenantVault = @import("covenant-vault/CovenantVault.runar.zig").CovenantVault;
 const ECDemo = @import("ec-demo/ECDemo.runar.zig").ECDemo;
 const FunctionPatterns = @import("function-patterns/FunctionPatterns.runar.zig").FunctionPatterns;
 const MathDemo = @import("math-demo/MathDemo.runar.zig").MathDemo;
 const OraclePriceFeed = @import("oracle-price/OraclePriceFeed.runar.zig").OraclePriceFeed;
+const OrdinalNFT = @import("ordinal-nft/OrdinalNFT.runar.zig").OrdinalNFT;
 const P2Blake3PKH = @import("p2blake3pkh/P2Blake3PKH.runar.zig").P2Blake3PKH;
 const P2PKH = @import("p2pkh/P2PKH.runar.zig").P2PKH;
 const PostQuantumWallet = @import("post-quantum-wallet/PostQuantumWallet.runar.zig").PostQuantumWallet;
 const BoundedCounter = @import("property-initializers/BoundedCounter.runar.zig").BoundedCounter;
-const SchnorrZKP = @import("schnorr-zkp/SchnorrZKP.runar.zig").SchnorrZKP;
+// SchnorrZKP omitted — see examples/zig/schnorr-zkp/SchnorrZKP_test.zig
+// for the BUG-001 rationale (native i64 Bigint can't hold the 256-bit
+// secp256k1 group order embedded in the malleability gate).
 const Sha256CompressTest = @import("sha256-compress/Sha256CompressTest.runar.zig").Sha256CompressTest;
 const Sha256FinalizeTest = @import("sha256-finalize/Sha256FinalizeTest.runar.zig").Sha256FinalizeTest;
 const sphincs_fixtures = @import("sphincs-wallet/fixtures.zig");
 const SPHINCSWallet = @import("sphincs-wallet/SPHINCSWallet.runar.zig").SPHINCSWallet;
 const Counter = @import("stateful-counter/Counter.runar.zig").Counter;
 const TicTacToe = @import("tic-tac-toe/TicTacToe.runar.zig").TicTacToe;
-const FungibleTokenExample = @import("token-ft/FungibleTokenExample.runar.zig").FungibleTokenExample;
-const NFTExample = @import("token-nft/NFTExample.runar.zig").NFTExample;
+const FungibleTokenExample = @import("token-ft/FungibleTokenExample.runar.zig").FungibleToken;
+const NFTExample = @import("token-nft/NFTExample.runar.zig").SimpleNFT;
 
 pub const assert_panic_tag = "RUNAR_ASSERT_PANIC";
 
 pub fn panic(msg: []const u8, st: ?*std.builtin.StackTrace, addr: ?usize) noreturn {
     _ = st;
     if (std.mem.eql(u8, msg, runar.assertFailureMessage)) {
-        var buf: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "{s}:{s}\n", .{ assert_panic_tag, msg }) catch assert_panic_tag ++ "\n";
-        std.fs.File.stderr().writeAll(line) catch {};
+        std.debug.print("{s}:{s}\n", .{ assert_panic_tag, msg });
     }
     std.debug.defaultPanic(msg, addr);
 }
 
-pub fn main() !void {
-    var args = try std.process.argsWithAllocator(std.heap.page_allocator);
-    defer args.deinit();
-    _ = args.next();
-    const probe_case = args.next() orelse return error.MissingProbeCase;
+pub fn main(init: std.process.Init) !void {
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args_iter.next();
+    const probe_case = args_iter.next() orelse return error.MissingProbeCase;
     try runCase(probe_case);
 }
 
@@ -48,6 +50,12 @@ fn runCase(probe_case: []const u8) !void {
     if (std.mem.eql(u8, probe_case, "p2pkh-wrong-sig")) return probeP2PKHWrongSig();
     if (std.mem.eql(u8, probe_case, "p2blake3pkh-wrong-pubkey")) return probeP2Blake3PKHWrongPubkey();
     if (std.mem.eql(u8, probe_case, "p2blake3pkh-wrong-sig")) return probeP2Blake3PKHWrongSig();
+    if (std.mem.eql(u8, probe_case, "bsv20-token-wrong-pubkey")) return probeBSV20TokenWrongPubkey();
+    if (std.mem.eql(u8, probe_case, "bsv20-token-wrong-sig")) return probeBSV20TokenWrongSig();
+    if (std.mem.eql(u8, probe_case, "bsv21-token-wrong-pubkey")) return probeBSV21TokenWrongPubkey();
+    if (std.mem.eql(u8, probe_case, "bsv21-token-wrong-sig")) return probeBSV21TokenWrongSig();
+    if (std.mem.eql(u8, probe_case, "ordinal-nft-wrong-pubkey")) return probeOrdinalNFTWrongPubkey();
+    if (std.mem.eql(u8, probe_case, "ordinal-nft-wrong-sig")) return probeOrdinalNFTWrongSig();
     if (std.mem.eql(u8, probe_case, "blake3-hash-mismatch")) return probeBlake3HashMismatch();
     if (std.mem.eql(u8, probe_case, "blake3-compress-mismatch")) return probeBlake3CompressMismatch();
     if (std.mem.eql(u8, probe_case, "sha256-compress-mismatch")) return probeSha256CompressMismatch();
@@ -64,6 +72,11 @@ fn runCase(probe_case: []const u8) !void {
     if (std.mem.eql(u8, probe_case, "auction-close-wrong-sig")) return probeAuctionCloseWrongSig();
     if (std.mem.eql(u8, probe_case, "covenant-vault-wrong-output")) return probeCovenantVaultWrongOutput();
     if (std.mem.eql(u8, probe_case, "covenant-vault-wrong-sig")) return probeCovenantVaultWrongSig();
+    if (std.mem.eql(u8, probe_case, "covenant-vault-zero-outputs")) return probeCovenantVaultZeroOutputs();
+    if (std.mem.eql(u8, probe_case, "covenant-vault-extra-output")) return probeCovenantVaultExtraOutput();
+    if (std.mem.eql(u8, probe_case, "covenant-vault-reordered")) return probeCovenantVaultReordered();
+    if (std.mem.eql(u8, probe_case, "covenant-vault-amount-minus-one")) return probeCovenantVaultAmountMinusOne();
+    if (std.mem.eql(u8, probe_case, "covenant-vault-amount-plus-one")) return probeCovenantVaultAmountPlusOne();
     if (std.mem.eql(u8, probe_case, "oracle-price-wrong-rabin-proof")) return probeOraclePriceWrongRabinProof();
     if (std.mem.eql(u8, probe_case, "oracle-price-below-threshold")) return probeOraclePriceBelowThreshold();
     if (std.mem.eql(u8, probe_case, "oracle-price-wrong-receiver-sig")) return probeOraclePriceWrongReceiverSig();
@@ -97,7 +110,7 @@ fn runCase(probe_case: []const u8) !void {
     if (std.mem.eql(u8, probe_case, "sphincs-wallet-wrong-ecdsa-sig")) return probeSPHINCSWalletWrongECDSASig();
     if (std.mem.eql(u8, probe_case, "sphincs-wallet-wrong-slhdsa-key")) return probeSPHINCSWalletWrongSLHDSAKey();
     if (std.mem.eql(u8, probe_case, "sphincs-wallet-invalid-slhdsa-proof")) return probeSPHINCSWalletInvalidSLHDSAProof();
-    if (std.mem.eql(u8, probe_case, "schnorr-zkp-invalid-r-point")) return probeSchnorrZKPInvalidRPoint();
+    // schnorr-zkp-invalid-r-point omitted — see SchnorrZKP_test.zig (BUG-001).
     return error.UnknownProbeCase;
 }
 
@@ -137,6 +150,36 @@ fn probeP2Blake3PKHWrongPubkey() !void {
 
 fn probeP2Blake3PKHWrongSig() !void {
     const contract = P2Blake3PKH.init(runar.blake3Hash(runar.ALICE.pubKey));
+    contract.unlock(runar.signTestMessage(runar.BOB), runar.ALICE.pubKey);
+}
+
+fn probeBSV20TokenWrongPubkey() !void {
+    const contract = BSV20Token.init(runar.hash160(runar.ALICE.pubKey));
+    contract.unlock(runar.signTestMessage(runar.ALICE), runar.BOB.pubKey);
+}
+
+fn probeBSV20TokenWrongSig() !void {
+    const contract = BSV20Token.init(runar.hash160(runar.ALICE.pubKey));
+    contract.unlock(runar.signTestMessage(runar.BOB), runar.ALICE.pubKey);
+}
+
+fn probeBSV21TokenWrongPubkey() !void {
+    const contract = BSV21Token.init(runar.hash160(runar.ALICE.pubKey));
+    contract.unlock(runar.signTestMessage(runar.ALICE), runar.BOB.pubKey);
+}
+
+fn probeBSV21TokenWrongSig() !void {
+    const contract = BSV21Token.init(runar.hash160(runar.ALICE.pubKey));
+    contract.unlock(runar.signTestMessage(runar.BOB), runar.ALICE.pubKey);
+}
+
+fn probeOrdinalNFTWrongPubkey() !void {
+    const contract = OrdinalNFT.init(runar.hash160(runar.ALICE.pubKey));
+    contract.unlock(runar.signTestMessage(runar.ALICE), runar.BOB.pubKey);
+}
+
+fn probeOrdinalNFTWrongSig() !void {
+    const contract = OrdinalNFT.init(runar.hash160(runar.ALICE.pubKey));
     contract.unlock(runar.signTestMessage(runar.BOB), runar.ALICE.pubKey);
 }
 
@@ -246,6 +289,74 @@ fn probeCovenantVaultWrongSig() !void {
         .outputHash = runar.hash256(expected_output),
     });
     vault.spend(runar.signTestMessage(runar.BOB), preimage);
+}
+
+// -- Adversarial output-shape probes ----------------------------------------
+//
+// These build the *contract-shaped* expected output (ASCII-bytes 1976a914 ‖
+// pkh ‖ 88ac — matching how `runar.cat("1976a914", recipient)` evaluates
+// natively in Zig). The happy-path test in CovenantVault_test.zig uses the
+// same helper, so the adversarial cases differ from it in exactly the
+// attacker-controlled dimension (count / order / value).
+fn covenantExpectedOutput(recipient: []const u8, amount: i64) []const u8 {
+    const script_prefix = runar.cat("1976a914", recipient);
+    const p2pkh_script = runar.cat(script_prefix, "88ac");
+    return runar.cat(runar.num2bin(amount, 8), p2pkh_script);
+}
+
+fn probeCovenantVaultZeroOutputs() !void {
+    const recipient = runar.BOB.pubKeyHash;
+    const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
+    // hashOutputs commits to *no* outputs at all (n-1).
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(""),
+    });
+    vault.spend(runar.signTestMessage(runar.ALICE), preimage);
+}
+
+fn probeCovenantVaultExtraOutput() !void {
+    const recipient = runar.BOB.pubKeyHash;
+    const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
+    const required = covenantExpectedOutput(recipient, 5000);
+    const extra_pkh = [_]u8{0xcc} ** 20;
+    const extra = covenantExpectedOutput(&extra_pkh, 1000);
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(runar.cat(required, extra)),
+    });
+    vault.spend(runar.signTestMessage(runar.ALICE), preimage);
+}
+
+fn probeCovenantVaultReordered() !void {
+    const recipient = runar.BOB.pubKeyHash;
+    const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
+    const required = covenantExpectedOutput(recipient, 5000);
+    const other_pkh = [_]u8{0xcc} ** 20;
+    const other = covenantExpectedOutput(&other_pkh, 5000);
+    // Place the unauthorised output BEFORE the required one.
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(runar.cat(other, required)),
+    });
+    vault.spend(runar.signTestMessage(runar.ALICE), preimage);
+}
+
+fn probeCovenantVaultAmountMinusOne() !void {
+    const recipient = runar.BOB.pubKeyHash;
+    const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
+    const candidate = covenantExpectedOutput(recipient, 4999);
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(candidate),
+    });
+    vault.spend(runar.signTestMessage(runar.ALICE), preimage);
+}
+
+fn probeCovenantVaultAmountPlusOne() !void {
+    const recipient = runar.BOB.pubKeyHash;
+    const vault = CovenantVault.init(runar.ALICE.pubKey, recipient, 5000);
+    const candidate = covenantExpectedOutput(recipient, 5001);
+    const preimage = runar.mockPreimage(.{
+        .outputHash = runar.hash256(candidate),
+    });
+    vault.spend(runar.signTestMessage(runar.ALICE), preimage);
 }
 
 fn probeOraclePriceWrongRabinProof() !void {
@@ -552,14 +663,4 @@ fn probeSPHINCSWalletInvalidSLHDSAProof() !void {
     contract.spend(slhdsa_sig, &sphincs_fixtures.slhdsa_pub_key, ecdsa_sig, runar.ALICE.pubKey);
 }
 
-fn probeSchnorrZKPInvalidRPoint() !void {
-    const pub_key = try runar.hex.decodeAlloc(
-        std.heap.page_allocator,
-        "fe8d1eb1bcb3432b1db5833ff5f2226d9cb5e65cee430558c18ed3a3c86ce1af" ++
-            "07b158f244cd0de2134ac7c1d371cffbfae4db40801a2572e531c573cda9b5b4",
-    );
-    defer std.heap.page_allocator.free(pub_key);
-    const contract = SchnorrZKP.init(pub_key);
-    const bad_point = [_]u8{0x01} ** 64;
-    contract.verify(&bad_point, runar.bigint(1));
-}
+// probeSchnorrZKPInvalidRPoint deleted — see SchnorrZKP_test.zig (BUG-001).

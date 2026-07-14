@@ -14,6 +14,42 @@ type BuildCallOptions struct {
 	ContractOutputs []ContractOutput
 	// Additional contract inputs with their own unlocking scripts (for merge).
 	AdditionalContractInputs []AdditionalContractInput
+	// Data outputs declared in the method body via this.addDataOutput(...).
+	// Emitted between the contract (state) outputs and the change output, in
+	// declaration order — matching the order the compiler's auto-injected
+	// continuation-hash check expects.
+	DataOutputs []ContractOutput
+	// Locktime overrides the call tx's nLockTime. nil → defaults to 0 (legacy).
+	// Non-nil writes the value into the locktime field. Required for contracts
+	// that assert extractLocktime(preimage) >= deadline (e.g. auction
+	// close/claim).
+	Locktime *uint32
+
+	// Sequence overrides the nSequence written onto every input (issue #131).
+	// nil → 0xfffffffe when a non-zero locktime is set (so nLockTime is
+	// consensus-enforced), else 0xffffffff (final, legacy).
+	Sequence *uint32
+}
+
+// resolveInputSequence resolves the nSequence for a call tx's inputs (issue
+// #131).
+//
+// An all-0xffffffff input set makes nLockTime a consensus no-op, so a
+// locktime-gated method would be script-enforced (via extractLocktime) yet NOT
+// consensus-enforced. When a non-zero locktime is set we therefore default
+// every input to 0xfffffffe (non-final, enforceable). An explicit sequence
+// always wins; with no/zero locktime we keep the legacy 0xffffffff.
+//
+// Shared by BuildCallTransaction and the terminal-path tx builder so both sites
+// stay byte-consistent.
+func resolveInputSequence(locktime uint32, sequence *uint32) uint32 {
+	if sequence != nil {
+		return *sequence
+	}
+	if locktime != 0 {
+		return 0xfffffffe
+	}
+	return 0xffffffff
 }
 
 // ContractOutput describes one contract continuation output.
@@ -56,10 +92,24 @@ func BuildCallTransaction(
 ) (tx *transaction.Transaction, inputCount int, changeAmount int64) {
 	var extraContractInputs []AdditionalContractInput
 	var contractOutputs []ContractOutput
+	var dataOutputs []ContractOutput
+	var locktime uint32
+	var sequencePtr *uint32
 	if len(opts) > 0 && opts[0] != nil {
 		extraContractInputs = opts[0].AdditionalContractInputs
 		contractOutputs = opts[0].ContractOutputs
+		dataOutputs = opts[0].DataOutputs
+		if opts[0].Locktime != nil {
+			locktime = *opts[0].Locktime
+		}
+		sequencePtr = opts[0].Sequence
 	}
+
+	// Sequence (issue #131): an all-0xffffffff input set makes nLockTime a
+	// consensus no-op. When a non-zero locktime is set, default every input to
+	// 0xfffffffe (non-final) so the locktime is actually enforced. An explicit
+	// options.Sequence always wins.
+	inputSequence := resolveInputSequence(locktime, sequencePtr)
 
 	// Build full input list: primary contract, extra contract inputs, P2PKH funding
 	allUtxos := []UTXO{currentUtxo}
@@ -86,6 +136,9 @@ func BuildCallTransaction(
 	for _, co := range contractOutputs {
 		contractOutputSats += co.Satoshis
 	}
+	for _, do := range dataOutputs {
+		contractOutputSats += do.Satoshis
+	}
 
 	// Estimate fee using actual script sizes
 	input0Size := 32 + 4 + varIntByteSize(len(unlockingScript)/2) +
@@ -103,6 +156,9 @@ func BuildCallTransaction(
 	for _, co := range contractOutputs {
 		outputsSize += 8 + varIntByteSize(len(co.Script)/2) + len(co.Script)/2
 	}
+	for _, do := range dataOutputs {
+		outputsSize += 8 + varIntByteSize(len(do.Script)/2) + len(do.Script)/2
+	}
 	if changeAddress != "" || changeScript != "" {
 		outputsSize += 34 // P2PKH change
 	}
@@ -118,6 +174,10 @@ func BuildCallTransaction(
 	// Build Transaction object
 	tx = transaction.NewTransaction()
 
+	// Locktime: default 0 (legacy); overridable via BuildCallOptions.Locktime
+	// for contracts asserting extractLocktime(preimage) >= deadline.
+	tx.LockTime = locktime
+
 	// Input 0: primary contract UTXO with unlocking script
 	unlockLS, _ := sdkscript.NewFromHex(unlockingScript)
 	hash0, _ := chainhash.NewHashFromHex(currentUtxo.Txid)
@@ -125,7 +185,7 @@ func BuildCallTransaction(
 		SourceTXID:       hash0,
 		SourceTxOutIndex: uint32(currentUtxo.OutputIndex),
 		UnlockingScript:  unlockLS,
-		SequenceNumber:   0xffffffff,
+		SequenceNumber:   inputSequence,
 	})
 
 	// Additional contract inputs (with their own unlocking scripts)
@@ -136,7 +196,7 @@ func BuildCallTransaction(
 			SourceTXID:       ciHash,
 			SourceTxOutIndex: uint32(ci.Utxo.OutputIndex),
 			UnlockingScript:  ciUnlock,
-			SequenceNumber:   0xffffffff,
+			SequenceNumber:   inputSequence,
 		})
 	}
 
@@ -147,7 +207,7 @@ func BuildCallTransaction(
 			SourceTXID:       fundHash,
 			SourceTxOutIndex: uint32(utxo.OutputIndex),
 			UnlockingScript:  &sdkscript.Script{},
-			SequenceNumber:   0xffffffff,
+			SequenceNumber:   inputSequence,
 		})
 	}
 
@@ -156,6 +216,17 @@ func BuildCallTransaction(
 		ls, _ := sdkscript.NewFromHex(co.Script)
 		tx.AddOutput(&transaction.TransactionOutput{
 			Satoshis:      uint64(co.Satoshis),
+			LockingScript: ls,
+		})
+	}
+
+	// Data outputs (from this.addDataOutput in the method body). Emitted
+	// after all state outputs and before the change output so the tx's
+	// hashOutputs matches the compile-time continuation-hash check.
+	for _, do := range dataOutputs {
+		ls, _ := sdkscript.NewFromHex(do.Script)
+		tx.AddOutput(&transaction.TransactionOutput{
+			Satoshis:      uint64(do.Satoshis),
 			LockingScript: ls,
 		})
 	}

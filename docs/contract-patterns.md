@@ -297,6 +297,16 @@ class CovenantVault extends SmartContract {
 
 The `checkPreimage` call gives the contract access to transaction details. The contract can then enforce rules about the outputs -- for example, that a minimum amount goes to the designated recipient. The owner's signature proves authorization, but the covenant rules constrain what the owner can actually do.
 
+> **Pin the sighash type in stateless covenants.** The compiler auto-injects a
+> `assert(extractSigHashType(txPreimage) === 0x41)` (SIGHASH_ALL | FORKID) pin for
+> `StatefulSmartContract`, but a stateless `SmartContract` that calls
+> `checkPreimage` manually gets no such pin. A permissive flag
+> (ANYONECANPAY / SINGLE / NONE) zeroes preimage fields such as
+> `hashPrevouts`, `hashOutputs`, and `sequence`, which can defeat a covenant that
+> reads them (e.g. via `extractHashOutputs` / `extractHashPrevouts` /
+> `extractSequence`). If your covenant relies on any of those fields, assert the
+> sighash type yourself: `assert(extractSigHashType(txPreimage) === 0x41n);`.
+
 ---
 
 ## On-Chain Auction
@@ -350,6 +360,20 @@ class Auction extends StatefulSmartContract {
 - **`close`**: Only the auctioneer can close. The locktime check ensures the deadline has passed. No state is propagated -- the auction UTXO is consumed, and the auctioneer receives the funds.
 
 This pattern demonstrates combining multiple stateful fields, time-based conditions via locktime, and two distinct spending paths with different authorization rules.
+
+> **Pair `extractLocktime` with an `extractSequence` finality guard.** A
+> transaction's `nLockTime` is only enforced by consensus when at least one
+> input is *non-final* — i.e. its `nSequence` is below `0xffffffff`. If every
+> input is final, miners ignore `nLockTime` entirely, so a
+> `extractLocktime(preimage) >= deadline` (or `< deadline`) assertion can be
+> bypassed by a hand-built all-final-sequence spend. To make a locktime gate
+> consensus-enforced, also assert the spend is non-final:
+> `assert(extractSequence(this.txPreimage) < 0xffffffffn);`. The compiler emits
+> an advisory warning for any method that reads `extractLocktime` without such a
+> guard. The SDK's `CallOptions` help on the tx side: when you set a non-zero
+> `locktime`, `sequence` defaults to `0xfffffffe` (non-final) automatically — but
+> the covenant itself must still assert the sequence bound so no other unlocking
+> path can supply an all-final tx.
 
 ---
 

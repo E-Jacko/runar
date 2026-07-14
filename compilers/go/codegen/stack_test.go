@@ -113,10 +113,7 @@ func TestLowerToStack_P2PKH_HasPlaceholderOps(t *testing.T) {
 		}
 	}
 	if !hasPlaceholder {
-		// Alternatively, the property might be pushed as OP_0 placeholder via "push"
-		// Check for any reference to the property in the ops
-		t.Logf("stack ops for unlock: %v", opsToString(unlock.Ops))
-		t.Log("Note: placeholder ops may be implemented differently — checking for property load")
+		t.Errorf("expected at least one placeholder op (prop_load or similar) in unlock method, got ops: %v", opsToString(unlock.Ops))
 	}
 }
 
@@ -1688,5 +1685,169 @@ func TestLowerToStack_ExitBuiltin_EmitsVerify(t *testing.T) {
 	// Should also contain OP_GREATERTHAN for the > comparison
 	if !strings.Contains(asm, "OP_GREATERTHAN") {
 		t.Errorf("expected OP_GREATERTHAN for > comparison, got: %s", asm)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test: add_data_output lowers to the same wire-shape opcodes as
+// add_raw_output: OP_SIZE + varint + OP_CAT + 8-byte LE amount + OP_CAT.
+// The ordering inside the continuation hash is handled entirely in anf_lower,
+// so at the stack-lowering layer these two kinds must be indistinguishable.
+// ---------------------------------------------------------------------------
+
+func TestStack_AddDataOutput_WireShapeMatchesAddRawOutput(t *testing.T) {
+	mk := func(kind string) *ir.ANFProgram {
+		return &ir.ANFProgram{
+			ContractName: "T",
+			Properties: []ir.ANFProperty{
+				{Name: "seed", Type: "bigint"},
+			},
+			Methods: []ir.ANFMethod{
+				{Name: "constructor", Params: []ir.ANFParam{{Name: "seed", Type: "bigint"}}, Body: nil},
+				{
+					Name: "emit",
+					Params: []ir.ANFParam{
+						{Name: "amount", Type: "bigint"},
+						{Name: "script", Type: "ByteString"},
+					},
+					IsPublic: true,
+					Body: []ir.ANFBinding{
+						{Name: "t0", Value: ir.ANFValue{Kind: "load_param", Name: "amount"}},
+						{Name: "t1", Value: ir.ANFValue{Kind: "load_param", Name: "script"}},
+						{Name: "t2", Value: ir.ANFValue{Kind: kind, Satoshis: "t0", ScriptBytes: "t1"}},
+					},
+				},
+			},
+		}
+	}
+
+	rawMethods := mustLowerToStackOps(t, mk("add_raw_output"))
+	dataMethods := mustLowerToStackOps(t, mk("add_data_output"))
+
+	pick := func(ms []StackMethod) *StackMethod {
+		for i := range ms {
+			if ms[i].Name == "emit" {
+				return &ms[i]
+			}
+		}
+		return nil
+	}
+	raw := pick(rawMethods)
+	data := pick(dataMethods)
+	if raw == nil || data == nil {
+		t.Fatal("could not find 'emit' stack method in both programs")
+	}
+	rawAsm := opsToString(raw.Ops)
+	dataAsm := opsToString(data.Ops)
+	if rawAsm != dataAsm {
+		t.Errorf("add_data_output stack op sequence must match add_raw_output exactly.\n raw: %s\ndata: %s", rawAsm, dataAsm)
+	}
+	// The emit sequence MUST contain the raw-output serialization building blocks.
+	// Note: SWAP is emitted as the string "SWAP" (not OP_SWAP) because it's a
+	// stack-manipulation directive handled later by the assembler.
+	for _, expected := range []string{"OP_SIZE", "OP_CAT", "OP_NUM2BIN", "SWAP"} {
+		if !strings.Contains(dataAsm, expected) {
+			t.Errorf("expected %q in add_data_output wire sequence, got: %s", expected, dataAsm)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// H1 (#119 tail): lowerLoadProp must NOT silently coerce an unknown property
+// onto a constructor slot.
+//
+// A `load_prop` binding whose name is not a declared constructor-param
+// property has no deploy-time bytes of its own. The previous behaviour let the
+// paramIndex scan run off the end (Go signals not-found by never breaking, so
+// paramIndex == count of non-initialized props) and emitted a placeholder for
+// an UNRELATED constructor argument — a silent-wrong-code path. The hardened
+// behaviour is a HARD panic (recovered into an error by LowerToStack) naming
+// the offending property, the source location, and the known ctor-param props.
+// ---------------------------------------------------------------------------
+
+// ghostLoadPropProgram builds a minimal ANF program with one real readonly
+// constructor-param property `pk` (slot 0) plus a public method whose body
+// loads a property `ghost` that is NOT declared on the contract. `ghost`
+// therefore reaches the placeholder fallback with no matching ctor slot.
+func ghostLoadPropProgram() *ir.ANFProgram {
+	assertT0, _ := marshalString("t0")
+	return &ir.ANFProgram{
+		ContractName: "Ghost",
+		Properties: []ir.ANFProperty{
+			{Name: "pk", Type: "PubKey", Readonly: true},
+		},
+		Methods: []ir.ANFMethod{
+			{
+				Name:     "constructor",
+				Params:   []ir.ANFParam{{Name: "pk", Type: "PubKey"}},
+				Body:     nil,
+				IsPublic: false,
+			},
+			{
+				Name:     "spend",
+				Params:   []ir.ANFParam{},
+				IsPublic: true,
+				Body: []ir.ANFBinding{
+					{
+						Name:      "t0",
+						Value:     ir.ANFValue{Kind: "load_prop", Name: "ghost"},
+						SourceLoc: &ir.SourceLocation{File: "Ghost.runar.ts", Line: 7, Column: 4},
+					},
+					{Name: "t1", Value: ir.ANFValue{Kind: "assert", RawValue: assertT0, ValueRef: "t0"}},
+				},
+			},
+		},
+	}
+}
+
+func TestLowerToStack_H1_GhostLoadPropIsHardError(t *testing.T) {
+	_, err := LowerToStack(ghostLoadPropProgram())
+	if err == nil {
+		t.Fatal("expected a hard error for load_prop of undeclared property 'ghost', got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "ghost") {
+		t.Errorf("expected error to name the ghost property, got: %s", msg)
+	}
+	if !strings.Contains(msg, "constructor") {
+		t.Errorf("expected error to mention the missing constructor slot, got: %s", msg)
+	}
+	// The known constructor-param property list must include the real prop 'pk'.
+	if !strings.Contains(msg, "pk") {
+		t.Errorf("expected error to list known ctor-param props (including 'pk'), got: %s", msg)
+	}
+	// Source location threaded from the ANF binding should appear.
+	if !strings.Contains(msg, "Ghost.runar.ts") {
+		t.Errorf("expected error to include the source location, got: %s", msg)
+	}
+}
+
+func TestLowerToStack_H1_RealCtorPropLowersWithoutError(t *testing.T) {
+	assertT0, _ := marshalString("t0")
+	program := &ir.ANFProgram{
+		ContractName: "Ok",
+		Properties: []ir.ANFProperty{
+			{Name: "pk", Type: "PubKey", Readonly: true},
+		},
+		Methods: []ir.ANFMethod{
+			{
+				Name:     "constructor",
+				Params:   []ir.ANFParam{{Name: "pk", Type: "PubKey"}},
+				Body:     nil,
+				IsPublic: false,
+			},
+			{
+				Name:     "spend",
+				Params:   []ir.ANFParam{},
+				IsPublic: true,
+				Body: []ir.ANFBinding{
+					{Name: "t0", Value: ir.ANFValue{Kind: "load_prop", Name: "pk"}},
+					{Name: "t1", Value: ir.ANFValue{Kind: "assert", RawValue: assertT0, ValueRef: "t0"}},
+				},
+			},
+		},
+	}
+	if _, err := LowerToStack(program); err != nil {
+		t.Fatalf("expected a real ctor-param property to lower without error, got: %v", err)
 	}
 }

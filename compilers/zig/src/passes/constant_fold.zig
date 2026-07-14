@@ -372,9 +372,16 @@ fn foldBindings(allocator: Allocator, bindings: []const ANFBinding, env: *ConstE
 fn foldBinding(allocator: Allocator, binding: ANFBinding, env: *ConstEnv) anyerror!ANFBinding {
     const folded_value = try foldValue(allocator, binding.value, env);
 
-    // If the folded value is a load_const, register in the environment
+    // If the folded value is a load_const, register in the environment.
+    // Skip @ref: values — they are symbolic references to runtime bindings, not foldable constants.
     if (anfValueToConst(folded_value)) |cv| {
-        try env.put(binding.name, cv);
+        const skip = switch (cv) {
+            .string => |s| std.mem.startsWith(u8, s, "@ref:"),
+            else => false,
+        };
+        if (!skip) {
+            try env.put(binding.name, cv);
+        }
     }
 
     return .{ .name = binding.name, .value = folded_value, .source_loc = binding.source_loc };
@@ -481,14 +488,29 @@ fn foldValue(allocator: Allocator, value: ANFValue, env: *ConstEnv) anyerror!ANF
                 .count = loop_node.count,
                 .body = folded_body,
                 .iter_var = loop_node.iter_var,
+                // Issue #121: preserve the iterator start value / step direction.
+                .start = loop_node.start,
+                .step = loop_node.step,
             };
             return .{ .loop = new_loop };
         },
 
-        // All other kinds (assert, update_prop, get_state_script, check_preimage,
-        // deserialize_state, add_output, add_raw_output, array_literal, legacy variants)
-        // pass through unchanged.
-        else => return value,
+        // F-003: every remaining variant is enumerated explicitly (no `else`
+        // arm) so that adding a new ANFValue variant becomes a Zig compile
+        // error here instead of silently passing through and corrupting fold
+        // output. Mirrors the `UnknownANFKindError` default in TS
+        // `optimizer/constant-fold.ts#foldValue`.
+        .assert,
+        .update_prop,
+        .get_state_script,
+        .check_preimage,
+        .deserialize_state,
+        .add_output,
+        .add_raw_output,
+        .add_data_output,
+        .array_literal,
+        .raw_script,
+        => return value,
     }
 }
 
@@ -531,6 +553,8 @@ pub fn foldMethod(allocator: Allocator, method: ANFMethod) !ANFMethod {
         .params = method.params,
         .bindings = method.bindings,
         .body = folded_body,
+        // #123: preserve the in-memory @sighash carrier across the rebuild.
+        .sighash_type = method.sighash_type,
     };
 }
 

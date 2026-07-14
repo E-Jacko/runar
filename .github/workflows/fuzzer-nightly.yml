@@ -1,0 +1,640 @@
+name: Fuzzer nightly
+
+# Item 7 — nightly cross-tier ANF differential fuzz. Generates 100 random
+# valid ANF programs (deterministic; varies per-run via GitHub's
+# `github.run_id` for unique coverage over time), feeds them through every
+# tier's `--ir --hex` pipeline, and fails the job on any byte-level hex
+# divergence across tiers or any compiler crash that doesn't reproduce on
+# every other tier.
+#
+# Triggers:
+#   - midnight UTC daily (always-on nightly coverage)
+#   - on push to main (immediate feedback when a compiler change lands)
+#   - on pull_request (PR merge gate — runs a small FIXED-seed corpus in
+#     BOTH fold modes; see the PR-scoped fuzz steps below)
+#   - manual workflow_dispatch (for ad-hoc investigation; seed input lets
+#     a developer replay a specific corpus)
+#
+# PR merge gate (GAP-001 / GAP-101): on `pull_request` the job runs the
+# fuzzer with a FIXED seed (424242) and a modest program count (40), TWICE
+# — once fold-OFF (default, matches the checked-in goldens) and once
+# `--fold-on` (constant-folding enabled) — each hard-failing on any
+# cross-tier hex divergence. Determinism (fixed seed) keeps the gate
+# reproducible and flake-free. The schedule/push path keeps the larger
+# run_id-seeded run for rotating coverage over time.
+#
+# Findings: a non-zero mismatch count fails the workflow AND uploads the
+# per-finding directory tree (canonical IR JSON + per-tier diverging hex)
+# as an artifact, so the failing case can be replayed offline via
+#   `compilers/<tier>/<bin> --ir program.json --hex --disable-constant-folding`
+# against any tier.
+#
+# Security: all workflow_dispatch inputs are routed through `env:` blocks
+# (never interpolated directly into `run:` shell scripts) so the fuzzer
+# binary receives them as untrusted argv values via the standard
+# `parseInt` path in the fuzzer's option parser. See
+# https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+
+on:
+  schedule:
+    # 00:00 UTC nightly
+    - cron: '0 0 * * *'
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: 'RNG seed (integer). Leave blank for run_id-based.'
+        required: false
+        default: ''
+      num_programs:
+        description: 'Number of random programs to generate'
+        required: false
+        default: '100'
+      time_budget_ms:
+        description: 'Wall-clock budget in ms (early-stop)'
+        required: false
+        default: '300000'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  fuzz:
+    name: ANF differential (7 tiers x N random programs)
+    runs-on: ubuntu-latest
+    # The fuzzer spawns each compiler twice per program (load + lower +
+    # hex emit). At 100 programs * 7 tiers = 700 process launches, the
+    # heavy-tail tiers (Java cold start, Python interpreter start) push
+    # the wall-clock above 15 min on a busy runner; budget 45.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ----- Toolchains for all 7 tiers (mirrors cross-compiler-bytewise) -----
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: compilers/go/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+
+      # ----- TypeScript workspace install + build (so the fuzzer can
+      # ----- in-process `import` the runar-compiler / runar-ir-schema)
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      # conformance/ is not a pnpm workspace member; install its own deps.
+      - run: cd conformance && npm ci
+
+      # ----- Build every native compiler the fuzzer dispatches to -----
+      - name: Build Go compiler
+        run: cd compilers/go && go build -o runar-go .
+      - name: Build Rust compiler
+        run: cd compilers/rust && cargo build --release
+      - name: Build Zig compiler
+        run: cd compilers/zig && zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=baseline
+      - name: Build Java compiler jar
+        run: cd compilers/java && gradle jar --no-daemon
+
+      # ----- PR merge gate (GAP-001): fixed-seed fold-OFF run hard-fails (the
+      # ----- fuzzer's own exit(1)) on any cross-tier hex divergence. A FIXED
+      # ----- seed (424242) + modest program count (40) keep it deterministic
+      # ----- and fast. All argv values are literal constants — no untrusted PR
+      # ----- input reaches the shell.
+      - name: Fuzz (PR gate — fold-OFF, fixed seed)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --anf \
+            --num 40 \
+            --seed 424242 \
+            --compilers ts,go,rust,python,zig,ruby,java \
+            --output /tmp/anf-fuzz-pr-foldoff.json
+
+      # ----- fold-ON is now a BLOCKING merge gate (GAP-101 closed). The earlier
+      # ----- cross-tier divergence was the ANF constant-fold being re-run on
+      # ----- the `--ir` path: it rewrote bin_ops to constants but left the
+      # ----- now-dead operand bindings, which the six non-Zig tiers emitted as
+      # ----- wasteful push+drop sequences (Zig's compileFromIR never folds IR
+      # ----- input). All seven IR entry points now skip the ANF fold on
+      # ----- pre-lowered IR (the peephole optimizer still folds), so fold-ON
+      # ----- `--ir` output is byte-identical to fold-OFF / the goldens across
+      # ----- all 7 tiers. Constant folding is still exercised on the source
+      # ----- path (the multi-format conformance gate).
+      - name: Fuzz (PR gate — fold-ON, fixed seed)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --anf \
+            --fold-on \
+            --num 40 \
+            --seed 424242 \
+            --compilers ts,go,rust,python,zig,ruby,java \
+            --output /tmp/anf-fuzz-pr-foldon.json
+
+      # ----- PR merge gate (TS-GAP-001 randomized half / TS-GAP-005): the
+      # ----- source-vs-script EXECUTION oracle. Unlike the parity gates above
+      # ----- (which only assert 7-tier byte-identical hex — seven tiers can
+      # ----- agree on the SAME wrong bytes), this generates stateless non-crypto
+      # ----- contracts, renders each to TS, and runs every generated spend
+      # ----- through the ANF interpreter AND the compiled fold-ON script on
+      # ----- ScriptVM, hard-failing (exit 1) on any accept/reject divergence.
+      # ----- The oracle is tier-independent (in-process TS compiler + @bsv/sdk
+      # ----- ScriptVM), so it needs no native compiler build. FIXED seed
+      # ----- (424242) keeps it deterministic and flake-free.
+      - name: Fuzz (PR gate — execution oracle, fixed seed)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --execute \
+            --num 60 \
+            --seed 424242 \
+            --output /tmp/anf-fuzz-pr-execute.json
+
+      # ----- PR merge gate (issue #124): the TRI-MODAL execution oracle in
+      # ----- fast-check PROPERTY mode. Generates stateless contracts with loops
+      # ----- (non-zero start + countdown), substr/cat/len byte-ops over
+      # ----- ByteString params, and post-loop param reads, then runs every spend
+      # ----- through THREE independent engines — the ANF interpreter, the
+      # ----- hand-rolled ScriptVM, and the upstream @bsv/sdk Spend interpreter
+      # ----- (which also enforces the consensus clean-stack + push-only +
+      # ----- minimal-push rules the hand-rolled VM does not). Property mode
+      # ----- SHRINKS any divergence to a minimal (contract, inputs) repro. The
+      # ----- oracle is tier-independent (in-process TS compiler + @bsv/sdk), so
+      # ----- it needs no native compiler build. FIXED seed keeps it flake-free;
+      # ----- ~200 property runs matches the other PR gates' budget.
+      - name: Fuzz (PR gate — tri-modal execution oracle, fixed seed)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --tri-modal \
+            --num 200 \
+            --seed 424242 \
+            --output /tmp/anf-fuzz-pr-trimodal.json
+
+      # ----- Contract-level (`--ir`) PR gate (TS-GAP-007). The ANF gates above
+      # ----- drive raw generated ANF programs; this gate drives the
+      # ----- contract-level generator (stateful + native renderers) through the
+      # ----- full `--ir` pipeline across all 7 tiers, fixed-seed for a
+      # ----- deterministic, flake-free merge gate. Hard-fails (fuzzer exit 1)
+      # ----- on any cross-tier divergence.
+      - name: Fuzz (PR gate — contract-level IR, fixed seed)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --ir \
+            --seed 424242 \
+            --num 40 \
+            --compilers ts,go,rust,python,zig,ruby,java \
+            --render native \
+            --output /tmp/ir-fuzz-pr.json
+
+      - name: Upload PR-gate fuzz findings
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: anf-fuzz-pr-findings
+          path: |
+            conformance/fuzz-findings-anf/
+            conformance/fuzz-findings-execute/
+            conformance/fuzz-findings-trimodal/
+            /tmp/anf-fuzz-pr-foldoff.json
+            /tmp/anf-fuzz-pr-foldon.json
+            /tmp/anf-fuzz-pr-execute.json
+            /tmp/anf-fuzz-pr-trimodal.json
+            /tmp/ir-fuzz-pr.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # ----- Resolve fuzz parameters via env (avoids `${{ inputs.* }}`
+      # ----- interpolation directly into shell scripts).
+      # ----- Schedule / push / workflow_dispatch only — the PR path above
+      # ----- uses fixed literal parameters instead.
+      - name: Resolve fuzz parameters
+        if: github.event_name != 'pull_request'
+        id: params
+        env:
+          INPUT_SEED: ${{ inputs.seed }}
+          INPUT_NUM: ${{ inputs.num_programs }}
+          INPUT_BUDGET: ${{ inputs.time_budget_ms }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          seed="$INPUT_SEED"
+          if [ -z "$seed" ]; then
+            seed=$(( RUN_ID % 2147483647 ))
+          fi
+          num="$INPUT_NUM"
+          if [ -z "$num" ]; then num=100; fi
+          budget="$INPUT_BUDGET"
+          if [ -z "$budget" ]; then budget=300000; fi
+          {
+            echo "seed=$seed"
+            echo "num=$num"
+            echo "budget=$budget"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fuzz (ANF differential, all 7 tiers)
+        if: github.event_name != 'pull_request'
+        id: fuzz
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.params.outputs.seed }}
+          NUM: ${{ steps.params.outputs.num }}
+          BUDGET: ${{ steps.params.outputs.budget }}
+        # All variable values come from `env:` (already validated as ints
+        # by the previous step) so they reach the fuzzer's argv as
+        # untrusted-but-typed values, never as shell-interpreted strings.
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --anf \
+            --num "$NUM" \
+            --seed "$SEED" \
+            --time-budget-ms "$BUDGET" \
+            --compilers ts,go,rust,python,zig,ruby,java \
+            --output /tmp/anf-fuzz-report.json
+
+      # ----- Nightly source-vs-script EXECUTION oracle (TS-GAP-001 randomized /
+      # ----- TS-GAP-005): a larger rotating-seed corpus than the fixed-seed PR
+      # ----- gate, hard-failing on any interpreter-vs-ScriptVM accept/reject
+      # ----- divergence. `$SEED` is the already-validated integer from the
+      # ----- Resolve step (reaches argv via env:, never shell-interpolated).
+      - name: Fuzz (execution oracle, rotating seed)
+        if: github.event_name != 'pull_request'
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.params.outputs.seed }}
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --execute \
+            --num 500 \
+            --seed "$SEED" \
+            --time-budget-ms 120000 \
+            --output /tmp/anf-exec-nightly.json
+
+      # ----- Nightly TRI-MODAL execution oracle (issue #124): a larger
+      # ----- rotating-seed property run than the fixed-seed PR gate, hard-failing
+      # ----- (exit 1) on any interpreter-vs-ScriptVM-vs-Spend disagreement and
+      # ----- SHRINKING it to a minimal repro. `$SEED` is the already-validated
+      # ----- integer from the Resolve step (reaches argv via env:, never
+      # ----- shell-interpolated).
+      - name: Fuzz (tri-modal execution oracle, rotating seed)
+        if: github.event_name != 'pull_request'
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.params.outputs.seed }}
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --tri-modal \
+            --num 1000 \
+            --seed "$SEED" \
+            --output /tmp/anf-trimodal-nightly.json
+
+      # ----- Always upload the per-finding artifact tree so a failing
+      # ----- run leaves behind a replayable repro corpus.
+      - name: Upload fuzz findings
+        if: always() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: anf-fuzz-findings-${{ steps.params.outputs.seed }}
+          path: |
+            conformance/fuzz-findings-anf/
+            conformance/fuzz-findings-execute/
+            conformance/fuzz-findings-trimodal/
+            /tmp/anf-fuzz-report.json
+            /tmp/anf-exec-nightly.json
+            /tmp/anf-trimodal-nightly.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Emit summary
+        if: always() && github.event_name != 'pull_request'
+        # This step only writes a cosmetic job summary; a malformed/empty
+        # report (or a missing jq) must never fail an otherwise-green fuzz
+        # run, so the whole block is best-effort (`set +e`) and the jq has a
+        # fallback. The Fuzz step itself is the real pass/fail signal.
+        env:
+          SEED: ${{ steps.params.outputs.seed }}
+          NUM: ${{ steps.params.outputs.num }}
+          BUDGET: ${{ steps.params.outputs.budget }}
+        run: |
+          set +e
+          {
+            printf '## ANF differential fuzzer\n\n'
+            printf '- Seed: `%s`\n' "$SEED"
+            printf '- Programs: `%s`\n' "$NUM"
+            printf '- Time budget: `%s` ms\n\n' "$BUDGET"
+            if [ -f /tmp/anf-fuzz-report.json ]; then
+              printf '### Report\n\n'
+              printf '```json\n'
+              # Top-level summary keys only (avoid dumping every per-program output).
+              jq '{
+                totalPrograms,
+                programsRun,
+                mismatchCount,
+                earlyStop,
+                durationMs,
+                perTierAvailable
+              }' /tmp/anf-fuzz-report.json 2>/dev/null \
+                || printf '_report present but could not be summarised_\n'
+              printf '\n```\n'
+            else
+              printf '_no report produced_\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+  # ---------------------------------------------------------------------------
+  # GAP-002 — cross-tier canonicalJson (RFC 8785 / JCS) differential fuzz.
+  #
+  # canonicalJson is a WIRE-PROTOCOL primitive (its bytes are hashed + signed;
+  # a signature from one tier must verify under every other tier). This job
+  # generates random JSON-shaped values spanning the tricky surface (UTF-16
+  # key ordering, ECMA-262 §6.1.6.1.13 float boundaries, lone surrogates,
+  # nesting) and asserts all 7 SDK tiers' canonicalJson produce byte-identical
+  # output OR an identical typed rejection. Each non-TS tier is driven via its
+  # `--canonicalise` CLI shim.
+  #
+  # Triggers: same as the ANF job. On `pull_request` it runs a FIXED-seed,
+  # modest-count gate over the six fast tiers (Java's per-invocation gradle
+  # JVM cold-start is too slow for a PR gate, so Java is covered nightly).
+  # Schedule / push / workflow_dispatch run all 7 tiers with a run_id-seeded
+  # corpus for rotating coverage.
+  # ---------------------------------------------------------------------------
+  fuzz-canonical:
+    name: canonicalJson differential (7 SDK tiers x N random JSON values)
+    runs-on: ubuntu-latest
+    # Java is driven via `gradle -q runCanonicalise`, one JVM cold-start per
+    # case; budget generously for the nightly 7-tier run.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ----- Toolchains for all 7 SDK tiers -----
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: packages/runar-go/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+
+      # ----- TS workspace install + build (the canonical fuzzer in-process
+      # ----- imports the TS reference `canonicalJsonStringify`). -----
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: cd conformance && npm ci
+
+      # ----- Build the Zig canonicalise shim binary the driver shells out to.
+      # ----- (Go uses `go run`, Rust `cargo run --example`, Python/Ruby are
+      # ----- interpreted, Java is `gradle -q runCanonicalise` — all built
+      # ----- lazily on first invocation, so only Zig needs a prebuild step.)
+      - name: Build Zig canonicalise shim
+        run: cd packages/runar-zig && zig build canonicalise
+
+      # ----- PR gate: fixed seed, six fast tiers, hard-fail on divergence.
+      - name: Canonical fuzz (PR gate — fixed seed, 6 fast tiers)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --canonical \
+            --num 64 \
+            --seed 20020602 \
+            --compilers ts,go,rust,python,zig,ruby \
+            --output /tmp/canonical-fuzz-pr.json
+
+      # ----- Schedule / push / dispatch: all 7 tiers, run_id-seeded corpus.
+      - name: Resolve canonical fuzz parameters
+        if: github.event_name != 'pull_request'
+        id: cparams
+        env:
+          INPUT_SEED: ${{ inputs.seed }}
+          INPUT_NUM: ${{ inputs.num_programs }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          seed="$INPUT_SEED"
+          if [ -z "$seed" ]; then
+            seed=$(( RUN_ID % 2147483647 ))
+          fi
+          num="$INPUT_NUM"
+          if [ -z "$num" ]; then num=100; fi
+          {
+            echo "seed=$seed"
+            echo "num=$num"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Canonical fuzz (all 7 SDK tiers)
+        if: github.event_name != 'pull_request'
+        working-directory: conformance
+        env:
+          SEED: ${{ steps.cparams.outputs.seed }}
+          NUM: ${{ steps.cparams.outputs.num }}
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/index.ts \
+            --canonical \
+            --num "$NUM" \
+            --seed "$SEED" \
+            --compilers ts,go,rust,python,zig,ruby,java \
+            --output /tmp/canonical-fuzz-report.json
+
+      - name: Upload canonical fuzz findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canonical-fuzz-findings-${{ github.run_id }}
+          path: |
+            conformance/fuzz-findings-canonical/
+            /tmp/canonical-fuzz-report.json
+            /tmp/canonical-fuzz-pr.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # TS-GAP-009 — metamorphic / EMI fuzz.
+  #
+  # Generates random stateless / arithmetic contracts, applies each
+  # semantics-preserving source transform (identifier rename, commutative
+  # operand reorder, let-introduction, dead-code insertion), and asserts the
+  # ORIGINAL and TRANSFORMED contracts produce the SAME executed accept/reject
+  # verdict on the BSV script engine. A pair where both compile but their
+  # verdicts differ is a real, latent compiler bug (a shared-design mistake all
+  # seven tiers would emit identically, invisible to cross-tier byte-parity).
+  #
+  # TS-only: the driver imports the compiler + differential-execution oracle
+  # in-process, so it needs just the Node toolchain and the TS build — no native
+  # compiler tiers. Deterministic (fixed seed 424242), so it also gates PRs.
+  # ---------------------------------------------------------------------------
+  fuzz-metamorphic:
+    name: Metamorphic / EMI fuzz (semantics-preserving transforms)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # The driver imports runar-compiler / runar-testing in-process, so the TS
+      # workspace must be installed + built; conformance is not a pnpm member.
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: cd conformance && npm ci
+
+      - name: Metamorphic fuzz (fixed seed, hard-fail on divergence)
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/metamorphic-fuzz.ts \
+            --num 200 \
+            --seed 424242
+
+      - name: Upload metamorphic fuzz findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metamorphic-fuzz-findings-${{ github.run_id }}
+          path: conformance/fuzz-findings-metamorphic/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # TS-GAP-006 — mutation scoring of the safety net.
+  #
+  # Applies a curated corpus of representative compiler bugs
+  # (conformance/mutation/mutants.json) to real TypeScript compiler source
+  # files, runs the mapped fast in-process gates (differential-witness,
+  # fold-equivalence, peephole-exhaustive), and records caught-vs-survived.
+  # The scorer ALWAYS reverts each mutant, so the working tree is left clean.
+  #
+  # The gates resolve runar-compiler/runar-testing through the root vitest SRC
+  # alias, so a mutated src file is observed without a rebuild.
+  #
+  # Nightly-only (not a PR gate): the run fails if any mutant that MUST be
+  # caught survives, AND a baseline-regression check fails if any mutant that
+  # was CAUGHT in conformance/mutation/baseline.json has become a survivor
+  # (i.e. the net weakened).
+  # ---------------------------------------------------------------------------
+  mutation-score:
+    name: Mutation score (safety-net detection power)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # The gates import runar-compiler / runar-testing in-process via the src
+      # alias; the workspace must be installed + built, and conformance needs
+      # its own tsx (it is not a pnpm member).
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: cd conformance && npm ci
+
+      - name: Mutation score (survivor gate)
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx mutation/run-mutation.ts \
+            --json-out /tmp/mutation-current.json
+
+      - name: Baseline regression check (previously-caught mutant must stay caught)
+        if: always()
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/mutation-current.json ]; then
+            echo "no current scorecard produced — scorer aborted; failing"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const base = JSON.parse(fs.readFileSync("mutation/baseline.json", "utf8")).results;
+            const cur = JSON.parse(fs.readFileSync("/tmp/mutation-current.json", "utf8")).results;
+            const curById = new Map(cur.map((r) => [r.id, r]));
+            const regressions = [];
+            for (const b of base) {
+              const c = curById.get(b.id);
+              if (!c) { regressions.push(b.id + " (missing from current run)"); continue; }
+              if (b.caught && c.survived) regressions.push(b.id + " (was caught, now SURVIVES)");
+            }
+            if (regressions.length) {
+              console.error("MUTATION REGRESSION — the net weakened:");
+              for (const r of regressions) console.error("  • " + r);
+              process.exit(1);
+            }
+            console.log("No mutation regressions vs baseline (" + base.length + " mutants).");
+          '
+
+      - name: Upload mutation scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-scorecard-${{ github.run_id }}
+          path: /tmp/mutation-current.json
+          if-no-files-found: ignore
+          retention-days: 30

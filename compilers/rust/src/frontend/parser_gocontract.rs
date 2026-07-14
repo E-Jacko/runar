@@ -36,6 +36,8 @@
 //! - `:=` -> VariableDecl (mutable)
 //! - standalone functions (no receiver) -> private helper methods
 
+use num_bigint::BigInt;
+use num_traits::{Num, ToPrimitive};
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -57,7 +59,7 @@ pub fn parse_go_contract(source: &str, file_name: Option<&str>) -> ParseResult {
 
     let contract = parser.parse();
 
-    ParseResult { contract, errors }
+    ParseResult { contract, errors, source_size_err: None }
 }
 
 // ---------------------------------------------------------------------------
@@ -84,20 +86,22 @@ fn go_to_camel(name: &str) -> String {
 /// Map Go/runar type names to Rúnar AST type nodes.
 fn map_go_type(name: &str) -> TypeNode {
     match name {
-        "Int" | "Bigint" | "int64" | "uint64" | "int" | "uint" => {
+        "Int" | "Bigint" | "BigintBig" | "int64" | "uint64" | "int" | "uint" => {
             TypeNode::Primitive(PrimitiveTypeName::Bigint)
         }
         "Bool" | "bool" => TypeNode::Primitive(PrimitiveTypeName::Boolean),
         "ByteString" | "[]byte" | "string" => TypeNode::Primitive(PrimitiveTypeName::ByteString),
         "PubKey" => TypeNode::Primitive(PrimitiveTypeName::PubKey),
         "Sig" => TypeNode::Primitive(PrimitiveTypeName::Sig),
-        "Sha256" => TypeNode::Primitive(PrimitiveTypeName::Sha256),
+        "Sha256" | "Sha256Digest" => TypeNode::Primitive(PrimitiveTypeName::Sha256),
         "Ripemd160" => TypeNode::Primitive(PrimitiveTypeName::Ripemd160),
         "Addr" => TypeNode::Primitive(PrimitiveTypeName::Addr),
         "SigHashPreimage" => TypeNode::Primitive(PrimitiveTypeName::SigHashPreimage),
         "RabinSig" => TypeNode::Primitive(PrimitiveTypeName::RabinSig),
         "RabinPubKey" => TypeNode::Primitive(PrimitiveTypeName::RabinPubKey),
         "Point" => TypeNode::Primitive(PrimitiveTypeName::Point),
+        "P256Point" => TypeNode::Primitive(PrimitiveTypeName::P256Point),
+        "P384Point" => TypeNode::Primitive(PrimitiveTypeName::P384Point),
         _ => TypeNode::Custom(name.to_string()),
     }
 }
@@ -109,6 +113,7 @@ fn map_go_builtin(name: &str) -> String {
         "Hash160" => "hash160".to_string(),
         "Hash256" => "hash256".to_string(),
         "Sha256" => "sha256".to_string(),
+        "Sha256Hash" => "sha256".to_string(),
         "Ripemd160" => "ripemd160".to_string(),
         "CheckSig" => "checkSig".to_string(),
         "CheckMultiSig" => "checkMultiSig".to_string(),
@@ -129,7 +134,13 @@ fn map_go_builtin(name: &str) -> String {
         "ReverseBytes" => "reverseBytes".to_string(),
         "ExtractLocktime" => "extractLocktime".to_string(),
         "ExtractOutputHash" => "extractOutputHash".to_string(),
+        // Intent sub-covenant intrinsics (BSVM Phase 13).
+        "ExtractPrevOutputScript" => "extractPrevOutputScript".to_string(),
+        "RequireOutputP2PKH" => "requireOutputP2PKH".to_string(),
+        "CurrentBlockHeight" => "currentBlockHeight".to_string(),
         "AddOutput" => "addOutput".to_string(),
+        "AddRawOutput" => "addRawOutput".to_string(),
+        "AddDataOutput" => "addDataOutput".to_string(),
         "GetStateScript" => "getStateScript".to_string(),
         "Safediv" => "safediv".to_string(),
         "Safemod" => "safemod".to_string(),
@@ -159,6 +170,8 @@ fn map_go_builtin(name: &str) -> String {
         "EcPointY" => "ecPointY".to_string(),
         "Sha256Compress" => "sha256Compress".to_string(),
         "Sha256Finalize" => "sha256Finalize".to_string(),
+        "VerifyECDSAP256" => "verifyECDSA_P256".to_string(),
+        "VerifyECDSAP384" => "verifyECDSA_P384".to_string(),
         _ => go_to_camel(name),
     }
 }
@@ -206,6 +219,8 @@ enum TokenType {
     LtEq,
     Gt,
     GtEq,
+    Shl,    // <<
+    Shr,    // >>
     AmpAmp, // &&
     PipePipe, // ||
     Amp,
@@ -221,7 +236,7 @@ enum TokenType {
     MinusMinus, // --
     // Literals
     Ident(String),
-    Number(i128),
+    Number(BigInt),
     StringLit(String), // backtick or double-quoted
     // End
     Eof,
@@ -320,8 +335,28 @@ fn tokenize(source: &str) -> Vec<Token> {
                     match chars[pos] {
                         'n' => val.push('\n'),
                         't' => val.push('\t'),
+                        'r' => val.push('\r'),
+                        '0' => val.push('\0'),
                         '\\' => val.push('\\'),
                         '"' => val.push('"'),
+                        'x' if pos + 2 < chars.len() => {
+                            let h1 = chars[pos + 1];
+                            let h2 = chars[pos + 2];
+                            if h1.is_ascii_hexdigit() && h2.is_ascii_hexdigit() {
+                                let hex_str: String = [h1, h2].iter().collect();
+                                if let Ok(b) = u8::from_str_radix(&hex_str, 16) {
+                                    val.push(b as char);
+                                    pos += 2;
+                                    col += 2;
+                                } else {
+                                    val.push('\\');
+                                    val.push('x');
+                                }
+                            } else {
+                                val.push('\\');
+                                val.push('x');
+                            }
+                        }
                         c => { val.push('\\'); val.push(c); }
                     }
                 } else {
@@ -360,6 +395,8 @@ fn tokenize(source: &str) -> Vec<Token> {
                 ('-', '=') => Some(TokenType::MinusEq),
                 ('+', '+') => Some(TokenType::PlusPlus),
                 ('-', '-') => Some(TokenType::MinusMinus),
+                ('<', '<') => Some(TokenType::Shl),
+                ('>', '>') => Some(TokenType::Shr),
                 _ => None,
             };
             if let Some(t) = tok {
@@ -414,7 +451,8 @@ fn tokenize(source: &str) -> Vec<Token> {
                 pos += 1;
                 col += 1;
             }
-            let n: i128 = val.parse().unwrap_or(0);
+            let n = <BigInt as Num>::from_str_radix(&val, 10)
+                .unwrap_or_else(|_| BigInt::from(0));
             tokens.push(Token { typ: TokenType::Number(n), line: l, col: c });
             continue;
         }
@@ -682,6 +720,7 @@ impl<'a> GoParser<'a> {
             expression: Expression::CallExpr {
                 callee: Box::new(Expression::Identifier { name: "super".to_string() }),
                 args: super_args,
+                asm_return_type: None,
             },
             source_location: super_loc.clone(),
         });
@@ -700,6 +739,7 @@ impl<'a> GoParser<'a> {
             body: constructor_body,
             visibility: Visibility::Public,
             source_location: Self::loc_at(&self.file, 1, 1),
+            sighash_type: None,
         };
 
         Some(ContractNode {
@@ -807,6 +847,9 @@ impl<'a> GoParser<'a> {
                         "StatefulSmartContract" => {
                             parent_class = Some("StatefulSmartContract".to_string());
                         }
+                        "UnsafeSmartContract" => {
+                            parent_class = Some("UnsafeSmartContract".to_string());
+                        }
                         _ => {
                             // Might be a field of type runar.Type — but we need a field name first
                             // This is unlikely in embedded form, skip
@@ -852,6 +895,8 @@ impl<'a> GoParser<'a> {
                 readonly,
                 initializer: None,
                 source_location: loc,
+                synthetic_array_chain: None,
+                embed_always: false,
             });
 
             self.skip_semis();
@@ -882,7 +927,7 @@ impl<'a> GoParser<'a> {
             // Fixed-size array [N]T
             let size = if let TokenType::Number(n) = self.current().typ.clone() {
                 self.advance();
-                n as usize
+                n.to_usize().unwrap_or(0)
             } else {
                 0
             };
@@ -980,6 +1025,7 @@ impl<'a> GoParser<'a> {
             body,
             visibility,
             source_location: loc,
+            sighash_type: None,
         })
     }
 
@@ -1025,6 +1071,7 @@ impl<'a> GoParser<'a> {
             body,
             visibility: Visibility::Private,
             source_location: loc,
+            sighash_type: None,
         })
     }
 
@@ -1034,23 +1081,70 @@ impl<'a> GoParser<'a> {
         let mut params = Vec::new();
 
         while !matches!(self.current().typ, TokenType::RParen | TokenType::Eof) {
-            // Could be `name runar.Type` or just `,`
+            // Could be `name runar.Type`, `name1, name2 runar.Type` or just `,`
             if matches!(self.current().typ, TokenType::Comma) {
                 self.advance();
                 continue;
             }
 
-            let name_raw = if let TokenType::Ident(n) = self.current().typ.clone() {
+            // Collect one or more grouped names sharing a single type.
+            // In Go: `(a, b, expected runar.Bigint)` means all three params
+            // have type `runar.Bigint`.
+            let mut param_names: Vec<String> = Vec::new();
+
+            let first = if let TokenType::Ident(n) = self.current().typ.clone() {
                 self.advance();
                 n
             } else {
                 break;
             };
+            param_names.push(first);
+
+            // While the next tokens look like another grouped name followed
+            // by either more names or a type, keep collecting.
+            // Pattern is: `, <ident>` where <ident> is NOT the start of the
+            // shared type (i.e. not followed by `.` for `runar.Type`, not
+            // followed by `[` for array types).
+            while matches!(self.current().typ, TokenType::Comma) {
+                // Peek the two tokens after the comma.
+                let next_typ = self.tokens.get(self.pos + 1).map(|t| t.typ.clone());
+                let after_next_typ = self.tokens.get(self.pos + 2).map(|t| t.typ.clone());
+
+                // Must have `, <ident>` to continue the group.
+                if !matches!(next_typ, Some(TokenType::Ident(_))) {
+                    break;
+                }
+
+                // If the ident is followed by `.` or `[`, it is the start of
+                // the shared type (e.g. `runar.Bigint`, `[N]T`) — stop so
+                // parse_type() can consume it as the type.
+                let ident_starts_type = matches!(
+                    after_next_typ,
+                    Some(TokenType::Dot) | Some(TokenType::LBracket)
+                );
+                if ident_starts_type {
+                    break;
+                }
+
+                // Otherwise, the ident is another grouped name. Consume the
+                // comma and the ident, then loop to check for more.
+                self.advance(); // `,`
+                if let TokenType::Ident(n) = self.current().typ.clone() {
+                    self.advance();
+                    param_names.push(n);
+                } else {
+                    break;
+                }
+            }
 
             let param_type = self.parse_type();
-            let param_name = go_to_camel(&name_raw);
-
-            params.push(ParamNode { name: param_name, param_type });
+            for raw in param_names {
+                let name = go_to_camel(&raw);
+                params.push(ParamNode {
+                    name,
+                    param_type: param_type.clone(),
+                });
+            }
 
             self.match_tok(&TokenType::Comma);
         }
@@ -1343,7 +1437,7 @@ impl<'a> GoParser<'a> {
                 name: "_i".to_string(),
                 var_type: None,
                 mutable: true,
-                init: Expression::BigIntLiteral { value: 0 },
+                init: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: loc.clone(),
             };
             let dummy_update = Statement::ExpressionStatement {
@@ -1515,13 +1609,28 @@ impl<'a> GoParser<'a> {
     }
 
     fn parse_relational(&mut self) -> Option<Expression> {
-        let mut left = self.parse_additive()?;
+        let mut left = self.parse_shift()?;
         loop {
             let op = match self.current().typ {
                 TokenType::Lt => BinaryOp::Lt,
                 TokenType::LtEq => BinaryOp::Le,
                 TokenType::Gt => BinaryOp::Gt,
                 TokenType::GtEq => BinaryOp::Ge,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_shift()?;
+            left = Expression::BinaryExpr { op, left: Box::new(left), right: Box::new(right) };
+        }
+        Some(left)
+    }
+
+    fn parse_shift(&mut self) -> Option<Expression> {
+        let mut left = self.parse_additive()?;
+        loop {
+            let op = match self.current().typ {
+                TokenType::Shl => BinaryOp::Shl,
+                TokenType::Shr => BinaryOp::Shr,
                 _ => break,
             };
             self.advance();
@@ -1602,6 +1711,7 @@ impl<'a> GoParser<'a> {
                                 property: prop,
                             }),
                             args,
+                            asm_return_type: None,
                         };
                     } else {
                         // field access
@@ -1619,7 +1729,7 @@ impl<'a> GoParser<'a> {
                 TokenType::LParen => {
                     // Direct call: func(...)
                     let args = self.parse_call_args();
-                    expr = Expression::CallExpr { callee: Box::new(expr), args };
+                    expr = Expression::CallExpr { callee: Box::new(expr), args, asm_return_type: None };
                 }
 
                 _ => break,
@@ -1658,6 +1768,87 @@ impl<'a> GoParser<'a> {
                 Some(expr)
             }
 
+            TokenType::LBracket => {
+                // Two shapes share the `[` prefix in the Go DSL:
+                //   1. Bare array literal `[a, b, c]` — emits ArrayLiteral.
+                //   2. Go composite literal `[N]T{a, b, c}` (also `[]T{...}`)
+                //      — peel off the leading `[N]…T` and emit ArrayLiteral
+                //      from the brace body so all 7 tiers lower to identical
+                //      Stack IR.
+                let saved = self.pos;
+                self.advance(); // consume '['
+                // Try to detect composite literal: `[ <number>? ] <type>+ {`.
+                let mut composite = false;
+                if matches!(self.current().typ, TokenType::Number(_) | TokenType::RBracket) {
+                    if matches!(self.current().typ, TokenType::Number(_)) {
+                        self.advance();
+                    }
+                    if matches!(self.current().typ, TokenType::RBracket) {
+                        self.advance(); // consume ']'
+                        // Consume any additional `[N]` dims for multi-dim arrays.
+                        while matches!(self.current().typ, TokenType::LBracket) {
+                            let dim_saved = self.pos;
+                            self.advance();
+                            if matches!(self.current().typ, TokenType::Number(_)) {
+                                self.advance();
+                            }
+                            if !matches!(self.current().typ, TokenType::RBracket) {
+                                self.pos = dim_saved;
+                                break;
+                            }
+                            self.advance();
+                        }
+                        // Consume the element type: `runar.Foo`, `Foo`, or `*Foo`.
+                        if matches!(self.current().typ, TokenType::Star) {
+                            self.advance();
+                        }
+                        if matches!(self.current().typ, TokenType::Ident(_)) {
+                            self.advance();
+                            while matches!(self.current().typ, TokenType::Dot) {
+                                self.advance();
+                                if matches!(self.current().typ, TokenType::Ident(_)) {
+                                    self.advance();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        if matches!(self.current().typ, TokenType::LBrace) {
+                            composite = true;
+                            return Some(self.parse_go_brace_literal());
+                        }
+                    }
+                }
+                if !composite {
+                    self.pos = saved;
+                    self.advance(); // re-consume '['
+                }
+                let mut elements: Vec<Expression> = Vec::new();
+                while !matches!(self.current().typ, TokenType::RBracket | TokenType::Eof) {
+                    if matches!(self.current().typ, TokenType::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    if let Some(elem) = self.parse_expr() {
+                        elements.push(elem);
+                    } else {
+                        break;
+                    }
+                    if !matches!(self.current().typ, TokenType::Comma) {
+                        break;
+                    }
+                    self.advance();
+                }
+                self.expect_tok(&TokenType::RBracket);
+                Some(Expression::ArrayLiteral { elements })
+            }
+
+            TokenType::LBrace => {
+                // Nested composite literal body inside an outer multi-dim
+                // composite literal: `{e, e, …}` or `{ {…}, {…} }`.
+                Some(self.parse_go_brace_literal())
+            }
+
             TokenType::Ident(name) => {
                 self.advance();
 
@@ -1666,8 +1857,8 @@ impl<'a> GoParser<'a> {
                     self.advance(); // consume '.'
                     let member_raw = self.expect_ident();
 
-                    // Type conversion: runar.Int(x), runar.Bigint(x), runar.Bool(x)
-                    if matches!(member_raw.as_str(), "Int" | "Bigint" | "Bool") {
+                    // Type conversion: runar.Int(x), runar.Bigint(x), runar.BigintBig(x), runar.Bool(x)
+                    if matches!(member_raw.as_str(), "Int" | "Bigint" | "BigintBig" | "Bool") {
                         if matches!(self.current().typ, TokenType::LParen) {
                             let args = self.parse_call_args();
                             // Unwrap: runar.Int(x) -> x
@@ -1677,6 +1868,37 @@ impl<'a> GoParser<'a> {
                         }
                     }
 
+                    // runar.ByteString("literal") -> ByteStringLiteral (hex-encoded);
+                    // runar.ByteString(variable) -> unwrap (type conversion no-op).
+                    if member_raw == "ByteString" && matches!(self.current().typ, TokenType::LParen) {
+                        // Peek at the next meaningful token to check for a string literal
+                        // argument (optionally preceded by LParen-only whitespace tokens — there aren't
+                        // any in this tokenizer, so we look directly after `(`).
+                        let saved = self.pos;
+                        self.advance(); // consume '('
+                        if let TokenType::StringLit(s) = self.current().typ.clone() {
+                            self.advance(); // consume string
+                            if matches!(self.current().typ, TokenType::RParen) {
+                                self.advance(); // consume ')'
+                                // Hex-encode the raw bytes of the literal.
+                                let hex_str: String = s.bytes().map(|b| format!("{:02x}", b)).collect();
+                                return Some(Expression::ByteStringLiteral { value: hex_str });
+                            }
+                        }
+                        // Roll back and fall through to default parse_call_args path.
+                        self.pos = saved;
+                        let args = self.parse_call_args();
+                        if args.len() == 1 {
+                            return Some(args.into_iter().next().unwrap());
+                        }
+                        // Not exactly one arg — leave as a call expression (will error downstream).
+                        return Some(Expression::CallExpr {
+                            callee: Box::new(Expression::Identifier { name: "byteString".to_string() }),
+                            args,
+                            asm_return_type: None,
+                        });
+                    }
+
                     let callee_name = map_go_builtin(&member_raw);
 
                     if matches!(self.current().typ, TokenType::LParen) {
@@ -1684,6 +1906,7 @@ impl<'a> GoParser<'a> {
                         return Some(Expression::CallExpr {
                             callee: Box::new(Expression::Identifier { name: callee_name }),
                             args,
+                            asm_return_type: None,
                         });
                     }
 
@@ -1709,6 +1932,7 @@ impl<'a> GoParser<'a> {
                                     property: prop,
                                 }),
                                 args,
+                                asm_return_type: None,
                             });
                         }
 
@@ -1724,6 +1948,30 @@ impl<'a> GoParser<'a> {
 
             _ => None,
         }
+    }
+
+    /// Parse a Go composite-literal body `{e, e, …}`. Each element may
+    /// itself be a nested `{ … }` body for multi-dimensional arrays.
+    /// Returns an `ArrayLiteral`.
+    fn parse_go_brace_literal(&mut self) -> Expression {
+        self.expect_tok(&TokenType::LBrace);
+        let mut elements: Vec<Expression> = Vec::new();
+        while !matches!(self.current().typ, TokenType::RBrace | TokenType::Eof) {
+            if matches!(self.current().typ, TokenType::LBrace) {
+                elements.push(self.parse_go_brace_literal());
+            } else if let Some(e) = self.parse_expr() {
+                elements.push(e);
+            } else {
+                break;
+            }
+            if matches!(self.current().typ, TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect_tok(&TokenType::RBrace);
+        Expression::ArrayLiteral { elements }
     }
 
     fn parse_call_args(&mut self) -> Vec<Expression> {
@@ -1772,5 +2020,377 @@ impl<'a> GoParser<'a> {
                 _ => { self.advance(); }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Test: basic stateless P2PKH contract
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_go_p2pkh() {
+        let source = r#"package contract
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type P2PKH struct {
+    runar.SmartContract
+    PubKeyHash runar.Addr `runar:"readonly"`
+}
+
+func (c *P2PKH) Unlock(sig runar.Sig, pubKey runar.PubKey) {
+    runar.Assert(runar.Hash160(pubKey) == c.PubKeyHash)
+    runar.Assert(runar.CheckSig(sig, pubKey))
+}
+"#;
+
+        let result = parse_go_contract(source, Some("P2PKH.runar.go"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract");
+        assert_eq!(contract.name, "P2PKH");
+        assert_eq!(contract.parent_class, "SmartContract");
+        assert_eq!(contract.properties.len(), 1);
+        assert_eq!(contract.properties[0].name, "pubKeyHash");
+        assert!(contract.properties[0].readonly);
+        assert_eq!(contract.methods.len(), 1);
+        assert_eq!(contract.methods[0].name, "unlock");
+        assert_eq!(contract.methods[0].visibility, Visibility::Public);
+        assert_eq!(contract.methods[0].params.len(), 2);
+        assert_eq!(contract.methods[0].params[0].name, "sig");
+        assert_eq!(contract.methods[0].params[1].name, "pubKey");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: stateful counter contract
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_go_stateful_counter() {
+        let source = r#"package contract
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type Counter struct {
+    runar.StatefulSmartContract
+    Count runar.Bigint
+}
+
+func (c *Counter) Increment() {
+    c.Count++
+}
+
+func (c *Counter) Decrement() {
+    runar.Assert(c.Count > 0)
+    c.Count--
+}
+"#;
+
+        let result = parse_go_contract(source, Some("Counter.runar.go"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract");
+        assert_eq!(contract.name, "Counter");
+        assert_eq!(contract.parent_class, "StatefulSmartContract");
+        assert_eq!(contract.properties.len(), 1);
+        assert!(!contract.properties[0].readonly, "count should be mutable");
+        assert_eq!(contract.methods.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: multiple readonly properties (Escrow-style)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_go_multiple_properties() {
+        let source = r#"package contract
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type Escrow struct {
+    runar.SmartContract
+    Buyer   runar.PubKey `runar:"readonly"`
+    Seller  runar.PubKey `runar:"readonly"`
+    Arbiter runar.PubKey `runar:"readonly"`
+}
+
+func (c *Escrow) Release(sellerSig runar.Sig, arbiterSig runar.Sig) {
+    runar.Assert(runar.CheckSig(sellerSig, c.Seller))
+    runar.Assert(runar.CheckSig(arbiterSig, c.Arbiter))
+}
+
+func (c *Escrow) Refund(buyerSig runar.Sig, arbiterSig runar.Sig) {
+    runar.Assert(runar.CheckSig(buyerSig, c.Buyer))
+    runar.Assert(runar.CheckSig(arbiterSig, c.Arbiter))
+}
+"#;
+
+        let result = parse_go_contract(source, Some("Escrow.runar.go"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract");
+        assert_eq!(contract.name, "Escrow");
+        assert_eq!(contract.properties.len(), 3);
+        assert_eq!(contract.properties[0].name, "buyer");
+        assert_eq!(contract.properties[1].name, "seller");
+        assert_eq!(contract.properties[2].name, "arbiter");
+        assert!(contract.properties[0].readonly);
+        assert!(contract.properties[1].readonly);
+        assert!(contract.properties[2].readonly);
+        assert_eq!(contract.methods.len(), 2);
+        let names: Vec<&str> = contract.methods.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"release"), "expected method 'release'");
+        assert!(names.contains(&"refund"), "expected method 'refund'");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: exported identifiers are lowercased (camelCase conversion)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_go_identifier_camel_case() {
+        let source = r#"package contract
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type MyContract struct {
+    runar.SmartContract
+    PubKeyHash runar.Addr `runar:"readonly"`
+}
+
+func (c *MyContract) CheckHash(sig runar.Sig, pubKey runar.PubKey) {
+    runar.Assert(runar.Hash160(pubKey) == c.PubKeyHash)
+}
+"#;
+
+        let result = parse_go_contract(source, Some("MyContract.runar.go"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract");
+        // Exported field name PubKeyHash -> pubKeyHash
+        assert_eq!(contract.properties[0].name, "pubKeyHash");
+        // Exported method name CheckHash -> checkHash
+        assert_eq!(contract.methods[0].name, "checkHash");
+        // Exported param name PubKey -> pubKey (params stay as provided)
+        assert_eq!(contract.methods[0].params[1].name, "pubKey");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: invalid/empty source produces an error or no contract
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_go_invalid_syntax() {
+        // No struct definition at all
+        let source = r#"package contract
+// no type definition here
+"#;
+
+        let result = parse_go_contract(source, Some("bad.runar.go"));
+        // Should produce no contract (empty source with no struct)
+        let is_bad = !result.errors.is_empty() || result.contract.is_none();
+        assert!(
+            is_bad,
+            "expected errors or no contract for source with no struct definition"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: property initializers via init() method
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_go_property_initializers() {
+        let source = r#"package contract
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type BoundedCounter struct {
+    runar.StatefulSmartContract
+    Count    runar.Bigint
+    MaxCount runar.Bigint `runar:"readonly"`
+    Active   runar.Bool   `runar:"readonly"`
+}
+
+func (c *BoundedCounter) init() {
+    c.Count = 0
+    c.Active = true
+}
+
+func (c *BoundedCounter) Increment(amount runar.Bigint) {
+    runar.Assert(c.Active)
+    c.Count = c.Count + amount
+    runar.Assert(c.Count <= c.MaxCount)
+}
+"#;
+
+        let result = parse_go_contract(source, Some("BoundedCounter.runar.go"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract");
+        assert_eq!(contract.name, "BoundedCounter");
+        assert_eq!(contract.parent_class, "StatefulSmartContract");
+        // init() should NOT appear as a regular method
+        let method_names: Vec<&str> = contract.methods.iter().map(|m| m.name.as_str()).collect();
+        assert!(
+            !method_names.contains(&"init"),
+            "init() should be consumed as initializers, not emitted as a method"
+        );
+        // Increment should be present
+        assert!(
+            method_names.contains(&"increment"),
+            "expected method 'increment'"
+        );
+    }
+
+    /// `runar.BigintBig` is a Go-side alias for arbitrary-precision math on the
+    /// mock side. In the DSL it must map to the same `bigint` primitive so
+    /// arithmetic against `runar.Bigint` typechecks cleanly.
+    #[test]
+    fn test_parse_go_bigint_big_is_bigint() {
+        let source = r#"package contract
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type BigMath struct {
+    runar.SmartContract
+    Target runar.BigintBig `runar:"readonly"`
+}
+
+func (c *BigMath) Check(a runar.Bigint, b runar.BigintBig) {
+    runar.Assert(a + b == c.Target)
+}
+"#;
+        let result = parse_go_contract(source, Some("BigMath.runar.go"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract");
+        // Property Target maps to bigint
+        let target = contract
+            .properties
+            .iter()
+            .find(|p| p.name == "target")
+            .expect("target prop");
+        match &target.prop_type {
+            TypeNode::Primitive(PrimitiveTypeName::Bigint) => {}
+            other => panic!("expected Bigint primitive for target, got {:?}", other),
+        }
+        // Method param `b runar.BigintBig` also maps to bigint
+        let m = &contract.methods[0];
+        match &m.params[1].param_type {
+            TypeNode::Primitive(PrimitiveTypeName::Bigint) => {}
+            other => panic!("expected Bigint primitive for param b, got {:?}", other),
+        }
+    }
+
+    /// `runar.ByteString("\x00\x6a")` emits a ByteString literal whose value
+    /// is the hex encoding of the raw literal bytes.
+    #[test]
+    fn test_parse_go_bytestring_literal() {
+        let source = r#"package contract
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type LitDemo struct {
+    runar.SmartContract
+    Expected runar.ByteString `runar:"readonly"`
+}
+
+func (c *LitDemo) Check() {
+    runar.Assert(runar.ByteString("\x00\x6a") == c.Expected)
+}
+"#;
+        let result = parse_go_contract(source, Some("LitDemo.runar.go"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract");
+        let m = &contract.methods[0];
+
+        // Walk the method body looking for a ByteString literal equal to "006a".
+        fn find_bytestring_lit(expr: &Expression) -> Option<String> {
+            match expr {
+                Expression::ByteStringLiteral { value } => Some(value.clone()),
+                Expression::CallExpr { callee, args, .. } => {
+                    if let Some(v) = find_bytestring_lit(callee) {
+                        return Some(v);
+                    }
+                    for a in args {
+                        if let Some(v) = find_bytestring_lit(a) {
+                            return Some(v);
+                        }
+                    }
+                    None
+                }
+                Expression::BinaryExpr { left, right, .. } => {
+                    find_bytestring_lit(left).or_else(|| find_bytestring_lit(right))
+                }
+                _ => None,
+            }
+        }
+
+        let mut found = None;
+        for stmt in &m.body {
+            if let Statement::ExpressionStatement { expression: expr, .. } = stmt {
+                if let Some(v) = find_bytestring_lit(expr) {
+                    found = Some(v);
+                    break;
+                }
+            }
+        }
+        assert_eq!(found.as_deref(), Some("006a"), "expected ByteStringLiteral '006a'");
+    }
+
+    /// `runar.ByteString(variable)` is a plain type-conversion no-op; the
+    /// inner identifier must flow through unchanged (no wrapping call).
+    #[test]
+    fn test_parse_go_bytestring_of_variable_unwraps() {
+        let source = r#"package contract
+
+import runar "github.com/icellan/runar/packages/runar-go"
+
+type VarDemo struct {
+    runar.SmartContract
+    Expected runar.ByteString `runar:"readonly"`
+}
+
+func (c *VarDemo) Check(data runar.ByteString) {
+    runar.Assert(runar.ByteString(data) == c.Expected)
+}
+"#;
+        let result = parse_go_contract(source, Some("VarDemo.runar.go"));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let contract = result.contract.expect("should produce a contract");
+        let m = &contract.methods[0];
+
+        fn has_plain_data_ident(expr: &Expression) -> bool {
+            match expr {
+                Expression::Identifier { name } => name == "data",
+                Expression::BinaryExpr { left, right, .. } => {
+                    has_plain_data_ident(left) || has_plain_data_ident(right)
+                }
+                Expression::CallExpr { callee, args, .. } => {
+                    // must not be a byteString(...) call
+                    if let Expression::Identifier { name } = &**callee {
+                        if name == "byteString" {
+                            return false;
+                        }
+                    }
+                    args.iter().any(has_plain_data_ident) || has_plain_data_ident(callee)
+                }
+                _ => false,
+            }
+        }
+
+        let mut ok = false;
+        for stmt in &m.body {
+            if let Statement::ExpressionStatement { expression: expr, .. } = stmt {
+                if has_plain_data_ident(expr) {
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        assert!(ok, "expected runar.ByteString(data) to unwrap to identifier 'data'");
     }
 }

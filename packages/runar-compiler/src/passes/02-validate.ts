@@ -16,6 +16,7 @@ import type {
 } from '../ir/index.js';
 import type { CompilerDiagnostic } from '../errors.js';
 import { makeDiagnostic } from '../errors.js';
+import { validateSighashUsage } from './sighash-validate.js';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -45,6 +46,15 @@ export function validate(contract: ContractNode): ValidationResult {
   validateMethods(ctx);
   checkNoRecursion(ctx);
 
+  // Issue #123: reject preimage-field reads / output bindings that are unsound
+  // under a method's declared @sighash mode (security core). This pass emits
+  // both errors (unsound usages) and warnings (e.g. an explicit single-output
+  // SINGLE covenant whose same-index value cannot be pinned statically), so
+  // route each diagnostic to the matching bucket.
+  for (const d of validateSighashUsage(contract)) {
+    (d.severity === 'warning' ? warnings : errors).push(d);
+  }
+
   return { errors, warnings };
 }
 
@@ -65,6 +75,7 @@ interface ValidationContext {
 const VALID_PRIMITIVE_TYPES = new Set<string>([
   'bigint', 'boolean', 'ByteString', 'PubKey', 'Sig', 'Sha256',
   'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point',
+  'P256Point', 'P384Point',
 ]);
 
 function validateProperties(ctx: ValidationContext): void {
@@ -82,7 +93,18 @@ function validateProperties(ctx: ValidationContext): void {
 
     // Validate initializer if present
     if (prop.initializer) {
-      if (!isLiteralExpression(prop.initializer)) {
+      // FixedArray properties may use an array literal of literal elements.
+      // The individual elements are still literal-restricted; nested arrays
+      // are allowed when the property type is a nested FixedArray.
+      if (prop.type.kind === 'fixed_array_type') {
+        if (!isArrayLiteralOfLiterals(prop.initializer)) {
+          ctx.errors.push(makeDiagnostic(
+            `Property '${prop.name}' initializer must be an array literal of literal values`,
+            'error',
+            prop.sourceLocation,
+          ));
+        }
+      } else if (!isLiteralExpression(prop.initializer)) {
         ctx.errors.push(makeDiagnostic(
           `Property '${prop.name}' initializer must be a literal value (number, boolean, or hex string)`,
           'error',
@@ -92,12 +114,17 @@ function validateProperties(ctx: ValidationContext): void {
     }
   }
 
-  // SmartContract requires all properties to be readonly
-  if (ctx.contract.parentClass === 'SmartContract') {
+  // SmartContract (and the asm-escape-hatch UnsafeSmartContract) require
+  // all properties to be readonly. State mutation is StatefulSmartContract
+  // territory.
+  if (
+    ctx.contract.parentClass === 'SmartContract' ||
+    ctx.contract.parentClass === 'UnsafeSmartContract'
+  ) {
     for (const prop of ctx.contract.properties) {
       if (!prop.readonly) {
         ctx.errors.push(makeDiagnostic(
-          `Property '${prop.name}' in SmartContract must be readonly. Use StatefulSmartContract for mutable state.`,
+          `Property '${prop.name}' in ${ctx.contract.parentClass} must be readonly. Use StatefulSmartContract for mutable state.`,
           'error',
           prop.sourceLocation,
         ));
@@ -126,6 +153,23 @@ function isLiteralExpression(expr: Expression): boolean {
   // Allow negative literals: -42n
   if (expr.kind === 'unary_expr' && expr.op === '-' && expr.operand.kind === 'bigint_literal') return true;
   return false;
+}
+
+/**
+ * Allow a property initializer of the form `[lit, lit, ...]` for
+ * FixedArray properties. Elements may themselves be array literals for
+ * nested FixedArrays. Each leaf must still be a literal value.
+ */
+function isArrayLiteralOfLiterals(expr: Expression): boolean {
+  if (expr.kind !== 'array_literal') return false;
+  for (const el of expr.elements) {
+    if (el.kind === 'array_literal') {
+      if (!isArrayLiteralOfLiterals(el)) return false;
+    } else if (!isLiteralExpression(el)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function validatePropertyType(
@@ -229,6 +273,13 @@ function validateConstructor(ctx: ValidationContext): void {
         ctor.sourceLocation,
       ));
     }
+    if (param.type.kind === 'fixed_array_type') {
+      ctx.errors.push(makeDiagnostic(
+        `Constructor parameter '${param.name}' cannot be a FixedArray. Use initialized properties or pass each element as a separate parameter.`,
+        'error',
+        ctor.sourceLocation,
+      ));
+    }
   }
 
   // Validate statements in constructor body
@@ -250,6 +301,16 @@ function isSuperCall(stmt: Statement): boolean {
 // ---------------------------------------------------------------------------
 
 function validateMethods(ctx: ValidationContext): void {
+  // A contract with no public methods has no spending entry points and
+  // compiles to an empty script — never what the author meant (usually a
+  // missing `public` modifier; methods default to private).
+  if (!ctx.contract.methods.some((m) => m.visibility === 'public')) {
+    ctx.errors.push(makeDiagnostic(
+      `Contract '${ctx.contract.name}' has no public methods — no spending entry points; add 'public' to at least one method`,
+      'error',
+    ));
+  }
+
   for (const method of ctx.contract.methods) {
     validateMethod(method, ctx);
   }
@@ -270,10 +331,20 @@ function validateMethod(method: MethodNode, ctx: ValidationContext): void {
     if (param.type.kind === 'primitive_type') {
       checkNoNumberType(param.type.name, method.sourceLocation, ctx);
     }
+
+    // FixedArray not allowed as method parameter
+    if (param.type.kind === 'fixed_array_type') {
+      ctx.errors.push(makeDiagnostic(
+        `Parameter '${param.name}' in method '${method.name}' cannot be a FixedArray. Arrays are only allowed as contract properties.`,
+        'error',
+        method.sourceLocation,
+      ));
+    }
   }
 
   // Public methods must end with an assert() call (unless StatefulSmartContract,
-  // where the compiler auto-injects the final assert)
+  // where the compiler auto-injects the final assert; or UnsafeSmartContract,
+  // where a terminal asm({...}) provides the truthy stack value).
   if (method.visibility === 'public' && ctx.contract.parentClass === 'SmartContract') {
     if (!endsWithAssert(method.body)) {
       ctx.errors.push(makeDiagnostic(
@@ -284,10 +355,34 @@ function validateMethod(method: MethodNode, ctx: ValidationContext): void {
     }
   }
 
+  // UnsafeSmartContract public methods must end with either an assert()
+  // call or a terminal asm({..., out_arity: 1}) — either way the script
+  // has to leave a truthy value on the stack.
+  if (method.visibility === 'public' && ctx.contract.parentClass === 'UnsafeSmartContract') {
+    if (!endsWithAssert(method.body) && !endsWithTerminalAsm(method.body)) {
+      ctx.errors.push(makeDiagnostic(
+        `Public method '${method.name}' must end with an assert() call or a terminal asm({...}) with out_arity 1`,
+        'error',
+        method.sourceLocation,
+      ));
+    }
+  }
+
   // Warn on manual preimage boilerplate in StatefulSmartContract
   if (ctx.contract.parentClass === 'StatefulSmartContract' && method.visibility === 'public') {
     warnManualPreimageUsage(method, ctx);
   }
+
+  // #131: warn when a public method gates on extractLocktime but never asserts
+  // the spending tx is non-final (extractSequence < 0xffffffff). Advisory only.
+  if (method.visibility === 'public') {
+    warnLocktimeWithoutSequenceGuard(method, ctx);
+  }
+
+  // Gate `asm({...})` calls on UnsafeSmartContract and check the
+  // structural args. Walking the body once here keeps the diagnostic
+  // close to the call site.
+  validateAsmUsage(method, ctx);
 
   // Validate all statements in method body
   for (const stmt of method.body) {
@@ -321,6 +416,149 @@ function isAssertCall(expr: Expression): boolean {
     return true;
   }
   return false;
+}
+
+function isAsmCall(expr: Expression): boolean {
+  return (
+    expr.kind === 'call_expr' &&
+    expr.callee.kind === 'identifier' &&
+    expr.callee.name === 'asm'
+  );
+}
+
+/**
+ * UnsafeSmartContract terminator check — the last statement is an
+ * `asm({...})` call with the parser-normalised positional args
+ * `(body, in_arity, out_arity)` and out_arity literal === 1n.
+ *
+ * If/else branches that both terminate in an asm({...}) with out_arity 1
+ * also count, mirroring the asserts-on-both-branches rule.
+ */
+function endsWithTerminalAsm(body: Statement[]): boolean {
+  if (body.length === 0) return false;
+  const last = body[body.length - 1]!;
+  if (last.kind === 'expression_statement' && isAsmCall(last.expression)) {
+    const call = last.expression as Extract<Expression, { kind: 'call_expr' }>;
+    // The parser always rewrites asm({...}) into positional (body, in_arity, out_arity).
+    if (call.args.length === 3) {
+      const outArity = call.args[2];
+      if (outArity && outArity.kind === 'bigint_literal' && outArity.value === 1n) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (last.kind === 'if_statement') {
+    const thenEnds = endsWithTerminalAsm(last.then) || endsWithAssert(last.then);
+    const elseEnds = last.else
+      ? endsWithTerminalAsm(last.else) || endsWithAssert(last.else)
+      : false;
+    return thenEnds && elseEnds;
+  }
+  return false;
+}
+
+/**
+ * Walk a method body and validate every `asm({...})` call:
+ *
+ *  - Reject any asm() outside an UnsafeSmartContract.
+ *  - Confirm the parser-normalised arg shape: (body, in_arity, out_arity)
+ *    where body is a bytestring literal with even-length hex and the
+ *    arities are non-negative bigint literals.
+ *
+ * The parser already pushes most of these diagnostics; this pass is
+ * the back-stop that runs even when the parser shape is technically
+ * well-formed (e.g. a hand-built AST loaded from JSON) and is the only
+ * layer that knows about the contract's parentClass.
+ */
+function validateAsmUsage(method: MethodNode, ctx: ValidationContext): void {
+  walkExpressionsInBody(method.body, (expr) => {
+    if (!isAsmCall(expr)) return;
+    if (expr.kind !== 'call_expr') return;
+    const loc = expr.sourceLocation;
+
+    if (ctx.contract.parentClass !== 'UnsafeSmartContract') {
+      ctx.errors.push(makeDiagnostic(
+        `'asm' is only available in contracts extending UnsafeSmartContract; got ${ctx.contract.parentClass}. Move the call into a class that extends UnsafeSmartContract (and import { UnsafeSmartContract } from 'runar-lang').`,
+        'error',
+        loc,
+      ));
+      return;
+    }
+
+    if (expr.args.length !== 3) {
+      ctx.errors.push(makeDiagnostic(
+        `asm() expects exactly one object-literal argument { body, in_arity?, out_arity? }`,
+        'error',
+        loc,
+      ));
+      return;
+    }
+
+    const [bodyArg, inArityArg, outArityArg] = expr.args;
+
+    if (!bodyArg || bodyArg.kind !== 'bytestring_literal') {
+      ctx.errors.push(makeDiagnostic(
+        `asm() body must be a hex string literal`,
+        'error',
+        loc,
+      ));
+      return;
+    }
+
+    const body = bodyArg.value;
+    if (body.length === 0) {
+      ctx.errors.push(makeDiagnostic(
+        `asm() body must be a non-empty hex string literal`,
+        'error',
+        loc,
+      ));
+    } else if (body.length % 2 !== 0) {
+      ctx.errors.push(makeDiagnostic(
+        `asm() body has odd hex length (${body.length}); each opcode byte requires two hex characters`,
+        'error',
+        loc,
+      ));
+    } else if (!/^[0-9a-fA-F]+$/.test(body)) {
+      ctx.errors.push(makeDiagnostic(
+        `asm() body contains non-hex characters; only 0-9, a-f, A-F are allowed`,
+        'error',
+        loc,
+      ));
+    }
+
+    if (!inArityArg || inArityArg.kind !== 'bigint_literal' || inArityArg.value < 0n) {
+      ctx.errors.push(makeDiagnostic(
+        `asm() in_arity must be a non-negative integer literal`,
+        'error',
+        loc,
+      ));
+    }
+
+    if (!outArityArg || outArityArg.kind !== 'bigint_literal' || outArityArg.value < 0n) {
+      ctx.errors.push(makeDiagnostic(
+        `asm() out_arity must be a non-negative integer literal`,
+        'error',
+        loc,
+      ));
+    }
+
+    // Expression-form `asm<T>({...})` returns a value that flows into
+    // a let-binding — exactly ONE stack value, so out_arity must be 1.
+    // Reject any explicit out_arity != 1 with a clear diagnostic.
+    if (
+      expr.asmReturnType !== undefined &&
+      outArityArg &&
+      outArityArg.kind === 'bigint_literal' &&
+      outArityArg.value !== 1n
+    ) {
+      ctx.errors.push(makeDiagnostic(
+        `Expression-form asm<${expr.asmReturnType}>() must have out_arity 1 (got ${outArityArg.value}); only a single stack value can be bound to the result variable.`,
+        'error',
+        loc,
+      ));
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +608,13 @@ function validateVariableDecl(
   if (stmt.type && stmt.type.kind === 'primitive_type') {
     checkNoNumberType(stmt.type.name, stmt.sourceLocation, ctx);
   }
+  if (stmt.type && stmt.type.kind === 'fixed_array_type') {
+    ctx.errors.push(makeDiagnostic(
+      `Local variable '${stmt.name}' cannot be a FixedArray. Arrays are only allowed as contract properties.`,
+      'error',
+      stmt.sourceLocation,
+    ));
+  }
   validateExpression(stmt.init, ctx);
 }
 
@@ -381,7 +626,10 @@ function validateForStatement(
   // The condition should compare the iter var to a constant
   validateExpression(stmt.condition, ctx);
 
-  // Check that the loop bound is a compile-time constant
+  // Check that the loop bound is a compile-time constant. Non-zero starts and
+  // countdown loops (`i--` with `>`/`>=`) are supported: the ANF loop node
+  // carries an explicit start value and step direction (issue #121), so
+  // lowering binds `iterVar = start + i*step` on each unrolled iteration.
   if (stmt.condition.kind === 'binary_expr') {
     const bound = stmt.condition.right;
     if (!isCompileTimeConstant(bound)) {
@@ -683,6 +931,104 @@ function warnManualPreimageUsage(method: MethodNode, ctx: ValidationContext): vo
       ));
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// #131: locktime soundness — extractLocktime needs an extractSequence guard
+// ---------------------------------------------------------------------------
+
+/** Sentinel maximum nSequence: a tx is FINAL (ignores locktime) at this value. */
+const SEQUENCE_FINAL = 0xffffffffn;
+
+/** True when `expr` is a direct call to the named intrinsic, e.g. `f(...)`. */
+function isCallToNamed(expr: Expression, name: string): boolean {
+  return (
+    expr.kind === 'call_expr' &&
+    expr.callee.kind === 'identifier' &&
+    expr.callee.name === name
+  );
+}
+
+/**
+ * True when `expr` reads the transaction locktime. Both the raw intrinsic
+ * `extractLocktime(preimage)` and its ergonomic sugar `currentBlockHeight()`
+ * (which the ANF pass desugars to `extractLocktime(txPreimage)`) count —
+ * either read is unsound without a sequence-finality guard.
+ */
+function isLocktimeRead(expr: Expression): boolean {
+  return isCallToNamed(expr, 'extractLocktime') || isCallToNamed(expr, 'currentBlockHeight');
+}
+
+/**
+ * True when `expr` is an `extractSequence(...) < <final>`-style comparison
+ * (the guard that makes a locktime gate consensus-enforced). Accepts the two
+ * natural spellings: `extractSequence(pre) < N` / `<= N`, and the reversed
+ * `N > extractSequence(pre)` / `>= ...`. `N` must be a bigint literal no
+ * greater than the finality sentinel, so the guard genuinely forces
+ * non-finality.
+ */
+function isSequenceFinalityGuard(expr: Expression): boolean {
+  if (expr.kind !== 'binary_expr') return false;
+  const boundOk = (e: Expression): boolean =>
+    e.kind === 'bigint_literal' && e.value <= SEQUENCE_FINAL;
+  if ((expr.op === '<' || expr.op === '<=') &&
+      isCallToNamed(expr.left, 'extractSequence') && boundOk(expr.right)) {
+    return true;
+  }
+  if ((expr.op === '>' || expr.op === '>=') &&
+      isCallToNamed(expr.right, 'extractSequence') && boundOk(expr.left)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * #131: warn when `method` (transitively, through the private-helper call
+ * graph) reads the tx locktime but never asserts the tx is non-final. A
+ * locktime gate is not consensus-enforced unless `extractSequence < 0xffffffff`
+ * is also asserted — otherwise an all-final-sequence spend bypasses it.
+ * Advisory (warning) only — no effect on emitted bytecode.
+ */
+function warnLocktimeWithoutSequenceGuard(method: MethodNode, ctx: ValidationContext): void {
+  const privateMethods = new Map(
+    ctx.contract.methods
+      .filter(m => m.visibility === 'private')
+      .map(m => [m.name, m] as const),
+  );
+
+  let readsLocktime = false;
+  let hasSequenceGuard = false;
+  const visited = new Set<string>([method.name]);
+  const queue: MethodNode[] = [method];
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    walkExpressionsInBody(current.body, (expr) => {
+      if (isLocktimeRead(expr)) readsLocktime = true;
+      if (isSequenceFinalityGuard(expr)) hasSequenceGuard = true;
+    });
+    // Follow calls into private helpers so a guard (or locktime read) supplied
+    // by an inlined helper is seen by the public entry point.
+    const calls = new Set<string>();
+    collectMethodCalls(current.body, calls);
+    for (const callee of calls) {
+      if (!visited.has(callee) && privateMethods.has(callee)) {
+        visited.add(callee);
+        queue.push(privateMethods.get(callee)!);
+      }
+    }
+  }
+
+  if (readsLocktime && !hasSequenceGuard) {
+    ctx.warnings.push(makeDiagnostic(
+      `method '${method.name}' reads extractLocktime but does not assert ` +
+        `extractSequence < 0xffffffff; a locktime gate is not consensus-enforced ` +
+        `unless the tx is non-final — add ` +
+        `assert(extractSequence(this.txPreimage) < 0xffffffffn)`,
+      'warning',
+      method.sourceLocation,
+    ));
+  }
 }
 
 function walkExpressionsInBody(

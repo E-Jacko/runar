@@ -422,12 +422,15 @@ var zigTypeMap = map[string]string{
 	"PubKey":       "PubKey",
 	"Sig":          "Sig",
 	"Sha256":       "Sha256",
+	"Sha256Digest": "Sha256",
 	"Ripemd160":    "Ripemd160",
 	"Addr":         "Addr",
 	"SigHashPreimage": "SigHashPreimage",
 	"RabinSig":     "RabinSig",
 	"RabinPubKey":  "RabinPubKey",
 	"Point":        "Point",
+	"P256Point":    "P256Point",
+	"P384Point":    "P384Point",
 }
 
 func zigMapType(name string) string {
@@ -703,23 +706,37 @@ func (p *zigParser) tryParseContractDecl() *ContractNode {
 	p.expect(zigTokRBrace)
 	p.match(zigTokSemicolon)
 
-	// Fix readonly flags: SmartContract -> all readonly; StatefulSmartContract -> readonly only if explicitly marked or has initializer
-	for i := range properties {
-		if p.parentClass == "SmartContract" {
-			properties[i].Readonly = true
-		} else {
-			// In stateful, readonly if explicitly marked or has initializer but no explicit readonly marker
-			// The field parser already sets readonly from runar.Readonly
-			if properties[i].Initializer != nil && !properties[i].Readonly {
-				// Properties with initializers in StatefulSmartContract remain as parsed
-			}
-		}
+	// Collect set of property names that are mutated in any method body.
+	mutatedProps := make(map[string]bool)
+	for _, m := range methods {
+		collectZigMutatedProperties(m.Body, mutatedProps)
 	}
 
 	// Auto-generate constructor if none provided
 	if constructor == nil {
 		ctor := p.autoGenerateConstructor(properties)
 		constructor = &ctor
+	}
+
+	// Strip initializers for properties that are also constructor params
+	// (the constructor param overrides the default; the Zig compiler reference
+	// omits `initialValue` in this case) and finalize readonly flags.
+	ctorParamSet := make(map[string]bool)
+	if constructor != nil {
+		for _, param := range constructor.Params {
+			ctorParamSet[param.Name] = true
+		}
+	}
+	for i := range properties {
+		hadInitializer := properties[i].Initializer != nil
+		if ctorParamSet[properties[i].Name] {
+			properties[i].Initializer = nil
+		}
+		if p.parentClass == "SmartContract" || p.parentClass == "UnsafeSmartContract" {
+			properties[i].Readonly = true
+		} else if !properties[i].Readonly && !hadInitializer && !mutatedProps[properties[i].Name] {
+			properties[i].Readonly = true
+		}
 	}
 
 	// Rewrite bare method calls to this.method() calls
@@ -729,6 +746,7 @@ func (p *zigParser) tryParseContractDecl() *ContractNode {
 	}
 	methodNames["addOutput"] = true
 	methodNames["addRawOutput"] = true
+	methodNames["addDataOutput"] = true
 	methodNames["getStateScript"] = true
 	for i := range methods {
 		rewriteBareMethodCallsGo(methods[i].Body, methodNames)
@@ -759,6 +777,8 @@ func (p *zigParser) parseContractMarker() {
 		parent := p.expect(zigTokIdent).value
 		if parent == "StatefulSmartContract" {
 			p.parentClass = "StatefulSmartContract"
+		} else if parent == "UnsafeSmartContract" {
+			p.parentClass = "UnsafeSmartContract"
 		} else {
 			p.parentClass = "SmartContract"
 		}
@@ -859,10 +879,17 @@ func (p *zigParser) parseParamList() (params []ParamNode, receiverName string, s
 
 		if isReceiver {
 			receiverName = paramName
+		} else if parsedType.rawName == "StatefulContext" {
+			// Zig stateful contracts thread an explicit StatefulContext
+			// parameter through every state-mutating method body
+			// (e.g. `ctx.txPreimage`, `ctx.addOutput(...)`). The compiler
+			// re-injects this context when lowering, so the parameter is
+			// dropped from the canonical IR — matching the Zig compiler's
+			// own parse_zig.zig behavior. Recording the binding name lets
+			// later passes rewrite `ctx.txPreimage` -> `this.txPreimage`
+			// and `ctx.addOutput(...)` -> `this.addOutput(...)`.
+			statefulCtxNames[paramName] = true
 		} else {
-			if parsedType.rawName == "StatefulContext" {
-				statefulCtxNames[paramName] = true
-			}
 			params = append(params, ParamNode{
 				Name: paramName,
 				Type: parsedType.typeNode,
@@ -1451,6 +1478,24 @@ func (p *zigParser) parseUnary() Expression {
 func (p *zigParser) parsePrimary() Expression {
 	tok := p.peek()
 
+	// Slice-literal: &.{ elem, ... } -> array literal. Zig coerces an
+	// anonymous tuple to []const T via this leading-`&` form (e.g.
+	// `&.{ sig1, sig2 }` for runar.checkMultiSig). The `&` carries no
+	// Rúnar semantics. `&` is otherwise a binary bitwise-and consumed
+	// in parseBitwiseAnd, so it cannot appear at primary position.
+	if tok.kind == zigTokAmp && p.peekAt(1).kind == zigTokDot && p.peekAt(2).kind == zigTokLBrace {
+		p.advance() // '&'
+		p.advance() // '.'
+		p.advance() // '{'
+		var elements []Expression
+		for !p.check(zigTokRBrace) && !p.check(zigTokEOF) {
+			elements = append(elements, p.parseExpression())
+			p.match(zigTokComma)
+		}
+		p.expect(zigTokRBrace)
+		return ArrayLiteralExpr{Elements: elements}
+	}
+
 	// Anonymous struct literal: .{ elem, ... } -> array literal
 	if tok.kind == zigTokDot && p.peekAt(1).kind == zigTokLBrace {
 		p.advance() // '.'
@@ -1643,7 +1688,7 @@ func (p *zigParser) parsePostfixChain(expr Expression) Expression {
 				expr = PropertyAccessExpr{Property: prop}
 			} else if ident, ok := expr.(Identifier); ok && p.statefulContextNames[ident.Name] {
 				// StatefulContext member access -> PropertyAccessExpr for intrinsics
-				if prop == "txPreimage" || prop == "getStateScript" || prop == "addOutput" || prop == "addRawOutput" {
+				if prop == "txPreimage" || prop == "getStateScript" || prop == "addOutput" || prop == "addRawOutput" || prop == "addDataOutput" {
 					expr = PropertyAccessExpr{Property: prop}
 				} else {
 					expr = MemberExpr{Object: expr, Property: prop}
@@ -1693,3 +1738,101 @@ func (p *zigParser) parseZigNumber(s string) Expression {
 
 // Ensure the strings import is used
 var _ = strings.HasPrefix
+
+// collectZigMutatedProperties walks a list of statements and records the
+// names of contract properties that are the target of an assignment or
+// increment/decrement. Used to determine which StatefulSmartContract fields
+// are mutable.
+func collectZigMutatedProperties(body []Statement, out map[string]bool) {
+	for _, stmt := range body {
+		collectZigMutatedInStmt(stmt, out)
+	}
+}
+
+func collectZigMutatedInStmt(stmt Statement, out map[string]bool) {
+	switch s := stmt.(type) {
+	case AssignmentStmt:
+		if pa, ok := s.Target.(PropertyAccessExpr); ok {
+			out[pa.Property] = true
+		}
+		collectZigMutatedInExpr(s.Target, out)
+		collectZigMutatedInExpr(s.Value, out)
+	case *AssignmentStmt:
+		if pa, ok := s.Target.(PropertyAccessExpr); ok {
+			out[pa.Property] = true
+		}
+		collectZigMutatedInExpr(s.Target, out)
+		collectZigMutatedInExpr(s.Value, out)
+	case VariableDeclStmt:
+		collectZigMutatedInExpr(s.Init, out)
+	case *VariableDeclStmt:
+		collectZigMutatedInExpr(s.Init, out)
+	case ExpressionStmt:
+		collectZigMutatedInExpr(s.Expr, out)
+	case *ExpressionStmt:
+		collectZigMutatedInExpr(s.Expr, out)
+	case ReturnStmt:
+		if s.Value != nil {
+			collectZigMutatedInExpr(s.Value, out)
+		}
+	case *ReturnStmt:
+		if s.Value != nil {
+			collectZigMutatedInExpr(s.Value, out)
+		}
+	case IfStmt:
+		collectZigMutatedInExpr(s.Condition, out)
+		collectZigMutatedProperties(s.Then, out)
+		collectZigMutatedProperties(s.Else, out)
+	case *IfStmt:
+		collectZigMutatedInExpr(s.Condition, out)
+		collectZigMutatedProperties(s.Then, out)
+		collectZigMutatedProperties(s.Else, out)
+	case ForStmt:
+		collectZigMutatedInExpr(s.Init.Init, out)
+		collectZigMutatedInExpr(s.Condition, out)
+		collectZigMutatedInStmt(s.Update, out)
+		collectZigMutatedProperties(s.Body, out)
+	case *ForStmt:
+		collectZigMutatedInExpr(s.Init.Init, out)
+		collectZigMutatedInExpr(s.Condition, out)
+		collectZigMutatedInStmt(s.Update, out)
+		collectZigMutatedProperties(s.Body, out)
+	}
+}
+
+func collectZigMutatedInExpr(expr Expression, out map[string]bool) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case BinaryExpr:
+		collectZigMutatedInExpr(e.Left, out)
+		collectZigMutatedInExpr(e.Right, out)
+	case UnaryExpr:
+		collectZigMutatedInExpr(e.Operand, out)
+	case CallExpr:
+		collectZigMutatedInExpr(e.Callee, out)
+		for _, a := range e.Args {
+			collectZigMutatedInExpr(a, out)
+		}
+	case MemberExpr:
+		collectZigMutatedInExpr(e.Object, out)
+	case TernaryExpr:
+		collectZigMutatedInExpr(e.Condition, out)
+		collectZigMutatedInExpr(e.Consequent, out)
+		collectZigMutatedInExpr(e.Alternate, out)
+	case IndexAccessExpr:
+		collectZigMutatedInExpr(e.Object, out)
+		collectZigMutatedInExpr(e.Index, out)
+	case IncrementExpr:
+		if pa, ok := e.Operand.(PropertyAccessExpr); ok {
+			out[pa.Property] = true
+		}
+		collectZigMutatedInExpr(e.Operand, out)
+	case DecrementExpr:
+		if pa, ok := e.Operand.(PropertyAccessExpr); ok {
+			out[pa.Property] = true
+		}
+		collectZigMutatedInExpr(e.Operand, out)
+	}
+}

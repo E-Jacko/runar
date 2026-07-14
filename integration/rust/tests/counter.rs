@@ -1,11 +1,17 @@
 //! Counter integration test — stateful contract (SDK Deploy/Call path).
+//!
+//! **Gating**: all on-chain tests are gated with
+//! `#[cfg_attr(not(feature = "regtest"), ignore)]`. They require a local Bitcoin
+//! regtest node (see `integration/rust/README.md`). Run with:
+//!     cargo test --features regtest
+//! Tests without the gate (pure compile/script-size checks) run by default.
 
 use crate::helpers::*;
 use runar_lang::sdk::{CallOptions, DeployOptions, RunarContract, SdkValue};
 use std::collections::HashMap;
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_counter_increment() {
     skip_if_no_node();
 
@@ -18,6 +24,7 @@ fn test_counter_increment() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -36,7 +43,7 @@ fn test_counter_increment() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_counter_chain() {
     skip_if_no_node();
 
@@ -49,6 +56,7 @@ fn test_counter_chain() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -76,7 +84,7 @@ fn test_counter_chain() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_counter_decrement() {
     skip_if_no_node();
 
@@ -89,6 +97,7 @@ fn test_counter_decrement() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -116,7 +125,7 @@ fn test_counter_decrement() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_counter_wrong_state() {
     skip_if_no_node();
 
@@ -129,6 +138,7 @@ fn test_counter_wrong_state() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -150,7 +160,7 @@ fn test_counter_wrong_state() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_counter_underflow() {
     skip_if_no_node();
 
@@ -163,6 +173,7 @@ fn test_counter_underflow() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

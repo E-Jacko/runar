@@ -209,6 +209,51 @@ describe('Pass 2: Validate', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Contract must have at least one public method
+  // ---------------------------------------------------------------------------
+
+  describe('no public methods', () => {
+    it('reports error when no method has the public modifier', () => {
+      const source = `
+        class Locked extends SmartContract {
+          readonly pk: PubKey;
+
+          constructor(pk: PubKey) {
+            super(pk);
+            this.pk = pk;
+          }
+
+          unlock(sig: Sig) {
+            assert(checkSig(sig, this.pk));
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, 'no public methods')).toBe(true);
+    });
+
+    it('reports error when a contract has no methods at all', () => {
+      const source = `
+        class Empty extends SmartContract {
+          readonly x: bigint;
+
+          constructor(x: bigint) {
+            super(x);
+            this.x = x;
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, 'no public methods')).toBe(true);
+    });
+
+    it('does not report when at least one method is public', () => {
+      const result = validateSource(VALID_P2PKH);
+      expect(hasError(result, 'no public methods')).toBe(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // For loop with non-constant bound
   // ---------------------------------------------------------------------------
 
@@ -283,6 +328,76 @@ describe('Pass 2: Validate', () => {
       const result = validateSource(source);
       // Identifier is treated as potentially const, so should pass
       expect(hasError(result, "compile-time constant")).toBe(false);
+    });
+
+    it('accepts a for-loop with a non-zero start value (issue #121)', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+
+          constructor(x: bigint) {
+            super(x);
+            this.x = x;
+          }
+
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 1n; i <= 3n; i++) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, 'must start at 0')).toBe(false);
+    });
+
+    it('accepts a countdown for-loop (issue #121)', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+
+          constructor(x: bigint) {
+            super(x);
+            this.x = x;
+          }
+
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 3n; i > 0n; i--) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, 'countdown')).toBe(false);
+    });
+
+    it('accepts a zero-start counting-up for-loop', () => {
+      const source = `
+        class C extends SmartContract {
+          readonly x: bigint;
+
+          constructor(x: bigint) {
+            super(x);
+            this.x = x;
+          }
+
+          public m() {
+            let sum: bigint = 0n;
+            for (let i: bigint = 0n; i <= 3n; i++) {
+              sum = sum + i;
+            }
+            assert(sum > 0n);
+          }
+        }
+      `;
+      const result = validateSource(source);
+      expect(hasError(result, 'must start at 0')).toBe(false);
+      expect(hasError(result, 'countdown')).toBe(false);
     });
   });
 

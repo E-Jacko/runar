@@ -38,10 +38,10 @@ pub const runar = struct {
         allocator: std.mem.Allocator,
         probe_case: []const u8,
     ) !void {
-        const result = try std.process.Child.run(.{
-            .allocator = allocator,
+        const result = try std.process.run(allocator, std.testing.io, .{
             .argv = &.{ assert_probe_path, probe_case },
-            .max_output_bytes = 64 * 1024,
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
         });
         defer {
             allocator.free(result.stdout);
@@ -49,8 +49,8 @@ pub const runar = struct {
         }
 
         switch (result.term) {
-            .Exited => |code| try std.testing.expect(code != 0),
-            .Signal => {},
+            .exited => |code| try std.testing.expect(code != 0),
+            .signal => {},
             else => return error.TestUnexpectedResult,
         }
 
@@ -75,15 +75,22 @@ pub fn expectAssertFailure(probe_case: []const u8) !void {
 
 test {
     _ = @import("./auction/Auction_test.zig");
+    _ = @import("./babybear/BabyBearDemo_test.zig");
     _ = @import("./blake3/Blake3Test_test.zig");
+    _ = @import("./bsv20-token/BSV20Token_test.zig");
+    _ = @import("./bsv21-token/BSV21Token_test.zig");
     _ = @import("./convergence-proof/ConvergenceProof_test.zig");
     _ = @import("./covenant-vault/CovenantVault_test.zig");
+    _ = @import("./cross-covenant/CrossCovenantRef_test.zig");
     _ = @import("./ec-demo/ECDemo_test.zig");
     _ = @import("./escrow/Escrow_test.zig");
     _ = @import("./function-patterns/FunctionPatterns_test.zig");
     _ = @import("./math-demo/MathDemo_test.zig");
+    _ = @import("./merkle-proof/MerkleProofDemo_test.zig");
     _ = @import("./message-board/MessageBoard_test.zig");
+    _ = @import("./multisig-2of3/MultiSig2of3_test.zig");
     _ = @import("./oracle-price/OraclePriceFeed_test.zig");
+    _ = @import("./ordinal-nft/OrdinalNFT_test.zig");
     _ = @import("./p2blake3pkh/P2Blake3PKH_test.zig");
     _ = @import("./p2pkh/P2PKH_test.zig");
     _ = @import("./post-quantum-wallet/PostQuantumWallet_test.zig");
@@ -92,8 +99,33 @@ test {
     _ = @import("./sha256-compress/Sha256CompressTest_test.zig");
     _ = @import("./sha256-finalize/Sha256FinalizeTest_test.zig");
     _ = @import("./sphincs-wallet/SPHINCSWallet_test.zig");
+    _ = @import("./state-covenant/StateCovenant_test.zig");
     _ = @import("./stateful-counter/Counter_test.zig");
     _ = @import("./tic-tac-toe/TicTacToe_test.zig");
     _ = @import("./token-ft/FungibleTokenExample_test.zig");
     _ = @import("./token-nft/NFTExample_test.zig");
+    _ = @import("./add-raw-output/RawOutputTest_test.zig");
+    _ = @import("./babybear-ext4/BabyBearExt4Demo_test.zig");
+    _ = @import("./bitwise-ops/BitwiseOps_test.zig");
+    _ = @import("./ec-unit/ECUnit_test.zig");
+    _ = @import("./fixed-array-nested/Grid2x2_test.zig");
+    _ = @import("./p256-wallet/P256Wallet_test.zig");
+    _ = @import("./p384-wallet/P384Wallet_test.zig");
+    _ = @import("./add-data-output/DataOutputTest_test.zig");
+    _ = @import("./private-helper-outputs/PrivateHelperOutputs_test.zig");
+    _ = @import("./arithmetic/Arithmetic_test.zig");
+    _ = @import("./boolean-logic/BooleanLogic_test.zig");
+    _ = @import("./bounded-loop/BoundedLoop_test.zig");
+    _ = @import("./ec-primitives/ECPrimitives_test.zig");
+    _ = @import("./if-else/IfElse_test.zig");
+    _ = @import("./if-without-else/IfWithoutElse_test.zig");
+    _ = @import("./if-without-else-multi-temp/StackTrackerReproV10min_test.zig");
+    _ = @import("./multi-method/MultiMethod_test.zig");
+    _ = @import("./p256-primitives/P256Primitives_test.zig");
+    _ = @import("./p384-primitives/P384Primitives_test.zig");
+    _ = @import("./shift-ops/ShiftOps_test.zig");
+    _ = @import("./state-ripemd160/HashRegistry_test.zig");
+    _ = @import("./stateful/Stateful_test.zig");
+    _ = @import("./post-quantum-wots-naive-INSECURE/PostQuantumWOTSNaiveInsecure_test.zig");
+    _ = @import("./post-quantum-slhdsa-naive-INSECURE/PostQuantumSLHDSANaiveInsecure_test.zig");
 }

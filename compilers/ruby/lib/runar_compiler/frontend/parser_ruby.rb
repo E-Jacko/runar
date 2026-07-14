@@ -153,8 +153,25 @@ module RunarCompiler
       "ec_make_point"              => "ecMakePoint",
       "ec_point_x"                 => "ecPointX",
       "ec_point_y"                 => "ecPointY",
+      # P-256
+      "p256_add"                   => "p256Add",
+      "p256_mul"                   => "p256Mul",
+      "p256_mul_gen"               => "p256MulGen",
+      "p256_negate"                => "p256Negate",
+      "p256_on_curve"              => "p256OnCurve",
+      "p256_encode_compressed"     => "p256EncodeCompressed",
+      "verify_ecdsa_p256"          => "verifyECDSA_P256",
+      # P-384
+      "p384_add"                   => "p384Add",
+      "p384_mul"                   => "p384Mul",
+      "p384_mul_gen"               => "p384MulGen",
+      "p384_negate"                => "p384Negate",
+      "p384_on_curve"              => "p384OnCurve",
+      "p384_encode_compressed"     => "p384EncodeCompressed",
+      "verify_ecdsa_p384"          => "verifyECDSA_P384",
       "add_output"                 => "addOutput",
       "add_raw_output"             => "addRawOutput",
+      "add_data_output"            => "addDataOutput",
       "get_state_script"           => "getStateScript",
       "extract_locktime"           => "extractLocktime",
       "extract_output_hash"        => "extractOutputHash",
@@ -169,6 +186,10 @@ module RunarCompiler
       "extract_input_index"        => "extractInputIndex",
       "extract_sig_hash_type"      => "extractSigHashType",
       "extract_outputs"            => "extractOutputs",
+      # Intent sub-covenant intrinsics (BSVM Phase 13)
+      "extract_prev_output_script" => "extractPrevOutputScript",
+      "require_output_p2pkh"       => "requireOutputP2PKH",
+      "current_block_height"       => "currentBlockHeight",
       "mul_div"                    => "mulDiv",
       "percent_of"                 => "percentOf",
       "reverse_bytes"              => "reverseBytes",
@@ -233,16 +254,20 @@ module RunarCompiler
       "Integer"         => "bigint",
       "Int"             => "bigint",
       "Boolean"         => "boolean",
+      "Bool"            => "boolean",
       "ByteString"      => "ByteString",
       "PubKey"          => "PubKey",
       "Sig"             => "Sig",
       "Addr"            => "Addr",
       "Sha256"          => "Sha256",
+      "Sha256Digest"    => "Sha256",
       "Ripemd160"       => "Ripemd160",
       "SigHashPreimage" => "SigHashPreimage",
       "RabinSig"        => "RabinSig",
       "RabinPubKey"     => "RabinPubKey",
       "Point"           => "Point",
+      "P256Point"       => "P256Point",
+      "P384Point"       => "P384Point",
     }.freeze
 
     # Map a Ruby type name to a Runar TypeNode.
@@ -755,7 +780,7 @@ module RunarCompiler
 
         skip_newlines
 
-        unless %w[SmartContract StatefulSmartContract].include?(parent_class)
+        unless %w[SmartContract StatefulSmartContract UnsafeSmartContract].include?(parent_class)
           @errors << "#{@file}:#{first_part.line}: unknown parent class: #{parent_class}"
           return nil
         end
@@ -836,7 +861,7 @@ module RunarCompiler
         # Rewrite bare calls to declared methods and intrinsics as this.method().
         # In Ruby, bare calls like +add_output(...)+ are equivalent to
         # +self.add_output(...)+ / +this.addOutput(...)+.
-        intrinsic_methods = Set.new(%w[addOutput addRawOutput getStateScript])
+        intrinsic_methods = Set.new(%w[addOutput addRawOutput addDataOutput getStateScript])
         method_names = methods.map(&:name).to_set | intrinsic_methods
         methods.each do |m|
           Frontend.rewrite_bare_method_calls(m.body, method_names)
@@ -936,8 +961,9 @@ module RunarCompiler
           end
         end
 
-        # In stateless contracts, all properties are always readonly
-        is_readonly = true if parent_class == "SmartContract"
+        # In stateless contracts (SmartContract and UnsafeSmartContract), all
+        # properties are always readonly.
+        is_readonly = true if parent_class == "SmartContract" || parent_class == "UnsafeSmartContract"
 
         # Skip rest of line
         advance while peek.kind != TOK_NEWLINE && peek.kind != TOK_EOF
@@ -1145,17 +1171,29 @@ module RunarCompiler
         condition = parse_expression
         skip_newlines
 
+        # Variables declared inside an if/elsif/else branch are scoped to
+        # that branch in the typechecker. The parser must mirror that
+        # scoping so a `name = expr` reappearing in a sibling branch (or in
+        # a sibling top-level if-without-else block) is emitted as a fresh
+        # variable_decl, not an assignment against an out-of-scope local.
+        # Without this, sibling re-declarations trigger spurious "Undefined
+        # variable" errors in the typechecker. Mirrors the canonical
+        # TS/Python lexical-scope semantics.
+        locals_before_then = @declared_locals.dup
         then_stmts = parse_statements
+        @declared_locals = locals_before_then.dup
 
         else_stmts = nil
 
         if peek.kind == TOK_ELSIF
           elif_loc = loc
           else_stmts = [parse_elsif_statement(elif_loc)]
+          @declared_locals = locals_before_then.dup
         elsif peek.kind == TOK_ELSE
           advance # 'else'
           skip_newlines
           else_stmts = parse_statements
+          @declared_locals = locals_before_then.dup
         end
 
         expect(TOK_END, "end")
@@ -1173,17 +1211,23 @@ module RunarCompiler
         condition = parse_expression
         skip_newlines
 
+        # Same scope discipline as parse_if_statement -- save and restore
+        # @declared_locals so a sibling branch can re-declare a local.
+        locals_before_then = @declared_locals.dup
         then_stmts = parse_statements
+        @declared_locals = locals_before_then.dup
 
         else_stmts = nil
 
         if peek.kind == TOK_ELSIF
           elif_loc = loc
           else_stmts = [parse_elsif_statement(elif_loc)]
+          @declared_locals = locals_before_then.dup
         elsif peek.kind == TOK_ELSE
           advance # 'else'
           skip_newlines
           else_stmts = parse_statements
+          @declared_locals = locals_before_then.dup
         end
 
         # Note: the outer +end+ is consumed by the parent +parse_if_statement+.
@@ -1226,7 +1270,12 @@ module RunarCompiler
 
         start_expr = parse_expression
 
-        # Expect range operator +..+ (inclusive) or +...+ (exclusive)
+        # Expect range operator +..+ (inclusive) or +...+ (exclusive).
+        # Non-zero-start counting-up loops (e.g. +for i in 1...4+) are now
+        # supported by the ANF loop node's start/step fields (#121); a native
+        # countdown spelling for +.runar.rb+ is intentionally NOT added here —
+        # the TS reference Ruby-format parser has none, so introducing one only
+        # in this tier would break the cross-tier frontend-parity invariant.
         is_exclusive = false
         if peek.kind == TOK_DOTDOTDOT
           is_exclusive = true
@@ -1309,13 +1358,27 @@ module RunarCompiler
       end
 
       def parse_ivar_statement(current_loc)
-        # Parse +@var = expr+, +@var += expr+, or +@var+ as expression.
+        # Parse +@var = expr+, +@var[i] = expr+, +@var += expr+, or
+        # +@var+ as expression.
         ivar_tok = advance # ivar token
         raw_name = ivar_tok.value
         prop_name = Frontend.snake_to_camel(raw_name)
         target = PropertyAccessExpr.new(property: prop_name)
 
-        # Simple assignment: @var = expr
+        # Consume +[index]+ postfixes so that +@var[i] = expr+ is
+        # recognised as an assignment statement rather than being
+        # split into an orphan read and a rogue rhs.
+        while peek.kind == TOK_LBRACKET
+          advance # '['
+          index = parse_expression
+          unless match_tok(TOK_RBRACKET)
+            # Recover gracefully; parser will emit a diagnostic.
+            break
+          end
+          target = IndexAccessExpr.new(object: target, index: index)
+        end
+
+        # Simple assignment: @var = expr | @var[i] = expr
         if match_tok(TOK_ASSIGN)
           value = parse_expression
           return AssignmentStmt.new(target: target, value: value, source_location: current_loc)

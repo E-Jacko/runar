@@ -22,6 +22,8 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+import sys
+
 from runar_compiler.compiler import compile_from_source, artifact_to_json
 from runar.sdk import RunarArtifact, RPCProvider, ExternalSigner
 from runar.sdk.local_signer import LocalSigner
@@ -88,7 +90,11 @@ def is_node_available() -> bool:
 
 def mine(blocks: int) -> None:
     """Mine blocks on regtest."""
-    rpc_call("generate", blocks)
+    try:
+        rpc_call("generate", blocks)
+    except Exception:
+        addr = rpc_call("getnewaddress")
+        rpc_call("generatetoaddress", blocks, addr)
 
 
 def fund_address(address: str, btc_amount: float = 1.0) -> None:
@@ -249,9 +255,33 @@ def compile_contract_ts(rel_path: str) -> RunarArtifact:
 # Provider helper
 # ---------------------------------------------------------------------------
 
+def _instrument_broadcast(provider: RPCProvider) -> RPCProvider:
+    """Patch ``provider.broadcast`` so each call logs the raw tx size in
+    bytes to stderr before delegating to the SDK implementation. The SDK
+    itself is left untouched — this wrapper lives only in the integration
+    suite to give CI logs a uniform per-broadcast tx-size line.
+    """
+    original = provider.broadcast
+
+    def broadcast(tx, *args, **kwargs):
+        # ``tx`` may be either a Transaction-like object exposing ``to_hex()``
+        # or already a hex string, depending on which SDK call path invoked
+        # the provider. Handle both shapes defensively.
+        try:
+            tx_hex = tx.to_hex()
+        except AttributeError:
+            tx_hex = tx if isinstance(tx, str) else ""
+        size_bytes = len(tx_hex) // 2
+        print(f"[runar-integration] tx broadcast: {size_bytes} bytes", file=sys.stderr, flush=True)
+        return original(tx, *args, **kwargs)
+
+    provider.broadcast = broadcast  # type: ignore[method-assign]
+    return provider
+
+
 def create_provider() -> RPCProvider:
     """Create an RPCProvider configured for regtest with auto-mine."""
-    return RPCProvider.regtest(RPC_URL, RPC_USER, RPC_PASS)
+    return _instrument_broadcast(RPCProvider.regtest(RPC_URL, RPC_USER, RPC_PASS))
 
 
 # ---------------------------------------------------------------------------
@@ -471,8 +501,36 @@ def _crt(a1: int, m1: int, a2: int, m2: int) -> int:
 # Pytest fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(autouse=True)
-def skip_if_no_node():
-    """Auto-skip all tests if the regtest node is not available."""
+@pytest.fixture(scope="session", autouse=True)
+def ensure_blocks():
+    """Ensure at least 101 blocks exist for coinbase maturity."""
+    try:
+        count = rpc_call('getblockcount')
+        if count < 101:
+            mine(101 - count)
+    except Exception:
+        pass  # Node might not be available; per-test skips handle that
+
+
+@pytest.fixture(scope="session", autouse=True)
+def ensure_regtest():
+    """Verify the connected node is on regtest before running any tests."""
     if not is_node_available():
-        pytest.skip("BSV regtest node not available")
+        return  # skip_if_no_node will handle per-test skipping
+    info = rpc_call('getblockchaininfo')
+    assert info['chain'] == 'regtest', f"SAFETY: Connected to {info['chain']}, not regtest!"
+
+
+@pytest.fixture(autouse=True)
+def fail_if_no_node():
+    """Hard-fail every test if the regtest node is not available.
+
+    A silent skip here would let CI pass even when the node is down — masking
+    broken deploy/call flows. Fail fast instead so the missing node is
+    visible in the first failing test's traceback.
+    """
+    if not is_node_available():
+        pytest.fail(
+            "BSV regtest node not available. Integration tests require a live node. "
+            "Start with: cd integration && ./regtest.sh start"
+        )

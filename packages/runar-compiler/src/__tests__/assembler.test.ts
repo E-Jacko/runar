@@ -122,7 +122,7 @@ describe('Assembler', () => {
     it('has correct contract name and version fields', () => {
       const artifact = assemble(P2PKH_SOURCE);
       expect(artifact.contractName).toBe('P2PKH');
-      expect(artifact.version).toBe('runar-v0.4.4');
+      expect(artifact.version).toBe('runar-v1.0.0-rc.1');
       expect(artifact.script).toBe('deadbeef');
       expect(artifact.asm).toBe('OP_DUP OP_HASH160');
     });
@@ -288,13 +288,36 @@ describe('Assembler', () => {
   // 7. Constructor slots and codeSeparator
   // -------------------------------------------------------------------------
   describe('constructor slots and codeSeparator', () => {
-    it('includes constructorSlots when provided', () => {
+    it('includes constructorSlots when provided (enriched with descriptor metadata)', () => {
       const slots = [
         { paramIndex: 0, byteOffset: 5 },
         { paramIndex: 1, byteOffset: 40 },
       ];
       const artifact = assemble(P2PKH_SOURCE, { constructorSlots: slots });
-      expect(artifact.constructorSlots).toEqual(slots);
+      // Raw emitter data is preserved...
+      expect(artifact.constructorSlots).toMatchObject(slots);
+      // ...and enriched with verification-descriptor metadata from the ABI.
+      // P2PKH has one ctor param (pk: PubKey) — slot 0 resolves, slot 1 has
+      // no matching param and stays bare.
+      expect(artifact.constructorSlots![0]).toMatchObject({
+        name: 'pk',
+        type: 'PubKey',
+        valueEncoding: 'data',
+        fixedValueByteLength: 33,
+        fixedPushHeaderBytes: 1,
+      });
+      expect(artifact.constructorSlots![1]).toEqual({ paramIndex: 1, byteOffset: 40 });
+      // A templateDigest recipe accompanies the slots.
+      expect(artifact.templateDigest).toEqual({
+        algorithm: 'hash256-excised-slots',
+        pieces: [
+          { kind: 'code' },
+          { kind: 'slot', slot: 'pk', byteOffset: 5 },
+          { kind: 'code' },
+          { kind: 'slot', byteOffset: 40 },
+          { kind: 'code' },
+        ],
+      });
     });
 
     it('omits constructorSlots when empty', () => {
@@ -370,7 +393,7 @@ describe('Assembler', () => {
   describe('compiler version', () => {
     it('uses default compiler version', () => {
       const artifact = assemble(P2PKH_SOURCE);
-      expect(artifact.compilerVersion).toBe('0.4.4');
+      expect(artifact.compilerVersion).toBe('1.0.0-rc.1');
     });
 
     it('allows overriding compiler version', () => {
@@ -384,6 +407,52 @@ describe('Assembler', () => {
       const artifact = assemble(P2PKH_SOURCE);
       const date = new Date(artifact.buildTimestamp);
       expect(date.getTime()).not.toBeNaN();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Synthetic-array marker guard
+  // -------------------------------------------------------------------------
+  //
+  // A contract with hand-written properties named `user__0`, `user__1`,
+  // `user__2` of the same type must NOT be re-grouped into a single
+  // `FixedArray<bigint, 3>` state field / ABI entry. The pattern matches
+  // the shape the expand-fixed-arrays pass produces, but without the
+  // `__syntheticArrayChain` marker the regrouper must leave them alone.
+  describe('FixedArray regrouping — marker guard', () => {
+    const HAND_NAMED_SOURCE = `
+      import { StatefulSmartContract } from 'runar-lang';
+      export class Scores extends StatefulSmartContract {
+        user__0: bigint;
+        user__1: bigint;
+        user__2: bigint;
+        constructor(user__0: bigint, user__1: bigint, user__2: bigint) {
+          super(user__0, user__1, user__2);
+        }
+        public bump(): void {
+          this.user__0 = this.user__0 + 1n;
+          this.user__1 = this.user__1 + 1n;
+          this.user__2 = this.user__2 + 1n;
+        }
+      }`;
+
+    it('keeps hand-named `user__0/1/2` properties as separate state fields', () => {
+      const artifact = assemble(HAND_NAMED_SOURCE);
+      const fields = artifact.stateFields ?? [];
+      expect(fields.map(f => f.name)).toEqual(['user__0', 'user__1', 'user__2']);
+      // None of them should carry a `fixedArray` annotation.
+      for (const f of fields) {
+        expect(f.fixedArray).toBeUndefined();
+      }
+    });
+
+    it('keeps hand-named constructor params as separate ABI params', () => {
+      const artifact = assemble(HAND_NAMED_SOURCE);
+      const params = artifact.abi.constructor.params;
+      expect(params.map(p => p.name)).toEqual(['user__0', 'user__1', 'user__2']);
+      for (const p of params) {
+        expect(p.fixedArray).toBeUndefined();
+      }
     });
   });
 });

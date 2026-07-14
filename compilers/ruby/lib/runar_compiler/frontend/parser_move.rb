@@ -56,6 +56,8 @@ module RunarCompiler
       TOK_MINUSEQ      = 36  # -=
       TOK_ASSERT_BANG  = 37  # assert!
       TOK_ASSERTEQ_BANG = 38 # assert_eq!
+      TOK_SHL          = 39  # <<
+      TOK_SHR          = 40  # >>
     end
 
     # A single token produced by the Move tokenizer.
@@ -82,16 +84,10 @@ module RunarCompiler
     # -------------------------------------------------------------------
 
     def self.move_snake_to_camel(name)
-      parts = name.split("_")
-      return name if parts.length <= 1
-
-      result = parts[0]
-      parts[1..].each do |part|
-        next if part.empty?
-
-        result += part[0].upcase + part[1..]
-      end
-      result
+      # Mirror the canonical TS Move parser regex `/_([a-z0-9])/g`: only
+      # collapse `_<lowercase|digit>` — preserve `_<uppercase>` boundaries
+      # (e.g. `verifyECDSA_P256`) so cross-format identifiers stay intact.
+      name.gsub(/_([a-z0-9])/) { ::Regexp.last_match(1).upcase }
     end
 
     # -------------------------------------------------------------------
@@ -137,6 +133,7 @@ module RunarCompiler
       "extractOutputHash" => "extractOutputHash",
       # Output construction
       "addOutput" => "addOutput", "addRawOutput" => "addRawOutput",
+      "addDataOutput" => "addDataOutput",
       # Math builtins
       "abs" => "abs", "min" => "min", "max" => "max", "within" => "within",
       "safediv" => "safediv", "safemod" => "safemod", "clamp" => "clamp", "sign" => "sign",
@@ -186,6 +183,8 @@ module RunarCompiler
       "||" => MoveTokens::TOK_PIPEPIPE,
       "+=" => MoveTokens::TOK_PLUSEQ,
       "-=" => MoveTokens::TOK_MINUSEQ,
+      "<<" => MoveTokens::TOK_SHL,
+      ">>" => MoveTokens::TOK_SHR,
     }.freeze
 
     ONE_CHAR_OPS_MOVE = {
@@ -438,6 +437,12 @@ module RunarCompiler
       # -- Top-level parsing -----------------------------------------------
 
       def parse_contract
+        # `unsafe module Name { ... }` marks an UnsafeSmartContract -- the
+        # asm-escape-hatch base class. Plain `module Name { ... }` infers
+        # SmartContract / StatefulSmartContract structurally as before.
+        is_unsafe = check_ident("unsafe")
+        advance if is_unsafe
+
         # module ContractName { ... }
         expect_ident("module")
         name_tok = expect(TOK_IDENT)
@@ -453,7 +458,7 @@ module RunarCompiler
           match_tok(TOK_SEMICOLON)
         end
 
-        parent_class = "SmartContract"
+        parent_class = is_unsafe ? "UnsafeSmartContract" : "SmartContract"
         properties = []
         methods = []
 
@@ -520,10 +525,10 @@ module RunarCompiler
             end
             expect(TOK_RBRACE)
 
-            parent_class = "StatefulSmartContract" if is_resource || has_mutable
+            parent_class = "StatefulSmartContract" if (is_resource || has_mutable) && !is_unsafe
           elsif check_ident("public") || check_ident("fun")
             method, has_mut_recv = parse_function_with_mut
-            parent_class = "StatefulSmartContract" if has_mut_recv
+            parent_class = "StatefulSmartContract" if has_mut_recv && !is_unsafe
             methods << method
           else
             advance # skip unknown
@@ -531,9 +536,10 @@ module RunarCompiler
         end
         expect(TOK_RBRACE)
 
-        # Determine parent class from property mutability
+        # Determine parent class from property mutability (skipped for the
+        # explicit `unsafe module` spelling, which is authoritative).
         has_mutable = properties.any? { |p| !p.readonly }
-        parent_class = "StatefulSmartContract" if has_mutable
+        parent_class = "StatefulSmartContract" if has_mutable && !is_unsafe
 
         # Build constructor -- only non-initialized properties become params
         default_loc = SourceLocation.new(file: @file_name, line: 1, column: 0)
@@ -589,15 +595,50 @@ module RunarCompiler
         name_tok = expect(TOK_IDENT)
         name = name_tok.value
 
+        # FixedArray<T, N> — nestable. The lexer forms `>>` as a shift
+        # token; `consume_generic_close` splits it back into two `>` so
+        # `FixedArray<FixedArray<bigint, 2>, 2>` closes cleanly.
+        if name == "FixedArray" && check(TOK_LT)
+          advance # <
+          inner = parse_move_type
+          expect(TOK_COMMA)
+          size_tok = expect(TOK_NUMBER)
+          size = begin
+            Integer(size_tok.value, 0)
+          rescue ArgumentError
+            add_error("line #{size_tok.line}: FixedArray length must be a non-negative integer literal")
+            0
+          end
+          consume_generic_close
+          return FixedArrayType.new(element: inner, length: size)
+        end
+
         # vector<T> => treat as ByteString
         if name == "vector" && check(TOK_LT)
           advance # <
           _inner = parse_move_type
-          expect(TOK_GT)
+          consume_generic_close
           return PrimitiveType.new(name: "ByteString")
         end
 
         Frontend.move_map_type(name)
+      end
+
+      # Close a generic-argument list. Accepts either a plain `>` or splits
+      # a `>>` shift token in place into two `>` so an enclosing close can
+      # consume the remaining half.
+      def consume_generic_close
+        if check(TOK_GT)
+          advance
+          return
+        end
+        if check(TOK_SHR)
+          # Rewrite the current `>>` to `>` so the outer close consumes it.
+          tok = @tokens[@pos]
+          @tokens[@pos] = MoveToken.new(kind: TOK_GT, value: ">", line: tok.line, col: tok.col + 1)
+          return
+        end
+        expect(TOK_GT)
       end
 
       # -- Function parsing -------------------------------------------------
@@ -677,17 +718,38 @@ module RunarCompiler
         expect(TOK_RPAREN)
 
         # Optional return type
+        has_return_type = false
         if check(TOK_COLON)
           advance
           parse_move_type
+          has_return_type = true
         end
 
         expect(TOK_LBRACE)
         body = []
         while !check(TOK_RBRACE) && !check(TOK_EOF)
+          # Skip stray semicolons (e.g. `};` after an if/while block).
+          if check(TOK_SEMICOLON)
+            advance
+            next
+          end
           body << parse_statement
         end
         expect(TOK_RBRACE)
+
+        body = fold_while_as_for(body)
+
+        # Move allows an implicit return of the final expression when the
+        # function declares a return type. Convert the trailing expression
+        # statement into an explicit return statement so the type checker
+        # can infer the method's return type.
+        if has_return_type && !body.empty? && body.last.is_a?(ExpressionStmt)
+          last = body.last
+          body[-1] = ReturnStmt.new(
+            value: last.expr,
+            source_location: last.source_location
+          )
+        end
 
         method = MethodNode.new(
           name: name,
@@ -772,6 +834,16 @@ module RunarCompiler
           return parse_if_statement(location)
         end
 
+        # while (cond) { ... }
+        if check_ident("while")
+          return parse_while_statement(location)
+        end
+
+        # loop { ... }
+        if check_ident("loop")
+          return parse_loop_statement(location)
+        end
+
         # return
         if check_ident("return")
           advance
@@ -839,6 +911,10 @@ module RunarCompiler
 
         then_block = []
         while !check(TOK_RBRACE) && !check(TOK_EOF)
+          if check(TOK_SEMICOLON)
+            advance
+            next
+          end
           then_block << parse_statement
         end
         expect(TOK_RBRACE)
@@ -848,6 +924,10 @@ module RunarCompiler
           advance
           expect(TOK_LBRACE)
           while !check(TOK_RBRACE) && !check(TOK_EOF)
+            if check(TOK_SEMICOLON)
+              advance
+              next
+            end
             else_block << parse_statement
           end
           expect(TOK_RBRACE)
@@ -857,6 +937,131 @@ module RunarCompiler
           condition: condition,
           then: then_block,
           else_: else_block,
+          source_location: location
+        )
+      end
+
+      def parse_while_statement(location)
+        expect_ident("while")
+        has_paren = match_tok(TOK_LPAREN)
+        condition = parse_expression
+        if has_paren
+          expect(TOK_RPAREN)
+        end
+        expect(TOK_LBRACE)
+        body = []
+        while !check(TOK_RBRACE) && !check(TOK_EOF)
+          if check(TOK_SEMICOLON)
+            advance
+            next
+          end
+          body << parse_statement
+        end
+        expect(TOK_RBRACE)
+        ForStmt.new(
+          init: VariableDeclStmt.new(
+            name: "_w",
+            type: nil,
+            mutable: true,
+            init: BigIntLiteral.new(value: 0),
+            source_location: location
+          ),
+          condition: condition,
+          update: ExpressionStmt.new(
+            expr: BigIntLiteral.new(value: 0),
+            source_location: location
+          ),
+          body: body,
+          source_location: location
+        )
+      end
+
+      # Fold the canonical Move bounded-loop pattern
+      #
+      #   let i: Int = K;
+      #   while (i < N) { ...; i = i + S; }
+      #
+      # into a single ForStmt whose init/condition/update match TypeScript's
+      # native `for (let i = 0n; i < N; i++)`, so downstream ANF lowering emits
+      # identical bounded-loop IR across all formats.
+      def fold_while_as_for(stmts)
+        out = []
+        i = 0
+        while i < stmts.length
+          s = stmts[i]
+          nxt = stmts[i + 1]
+          if s.is_a?(VariableDeclStmt) && nxt.is_a?(ForStmt) &&
+             nxt.init.is_a?(VariableDeclStmt) && nxt.init.name == "_w"
+            iter_name = s.name
+            cond = nxt.condition
+            matched = false
+            if cond.is_a?(BinaryExpr) && cond.left.is_a?(Identifier) && cond.left.name == iter_name
+              if !nxt.body.empty?
+                last = nxt.body.last
+                if last.is_a?(AssignmentStmt) &&
+                   last.target.is_a?(Identifier) && last.target.name == iter_name &&
+                   last.value.is_a?(BinaryExpr) && last.value.op == "+" &&
+                   last.value.left.is_a?(Identifier) && last.value.left.name == iter_name
+                  trimmed = nxt.body[0...-1]
+                  new_for = ForStmt.new(
+                    init: VariableDeclStmt.new(
+                      name: iter_name,
+                      type: s.type,
+                      mutable: true,
+                      init: s.init,
+                      source_location: s.source_location
+                    ),
+                    condition: cond,
+                    update: ExpressionStmt.new(
+                      expr: IncrementExpr.new(
+                        operand: Identifier.new(name: iter_name),
+                        prefix: false
+                      ),
+                      source_location: nxt.source_location
+                    ),
+                    body: trimmed,
+                    source_location: nxt.source_location
+                  )
+                  out << new_for
+                  i += 2
+                  matched = true
+                end
+              end
+            end
+            next if matched
+          end
+          out << s
+          i += 1
+        end
+        out
+      end
+
+      def parse_loop_statement(location)
+        expect_ident("loop")
+        expect(TOK_LBRACE)
+        body = []
+        while !check(TOK_RBRACE) && !check(TOK_EOF)
+          if check(TOK_SEMICOLON)
+            advance
+            next
+          end
+          body << parse_statement
+        end
+        expect(TOK_RBRACE)
+        ForStmt.new(
+          init: VariableDeclStmt.new(
+            name: "_l",
+            type: nil,
+            mutable: true,
+            init: BigIntLiteral.new(value: 0),
+            source_location: location
+          ),
+          condition: BoolLiteral.new(value: true),
+          update: ExpressionStmt.new(
+            expr: BigIntLiteral.new(value: 0),
+            source_location: location
+          ),
+          body: body,
           source_location: location
         )
       end
@@ -924,16 +1129,30 @@ module RunarCompiler
       end
 
       def parse_comparison
-        left = parse_additive
+        left = parse_shift
         loop do
           if match_tok(TOK_LT)
-            left = BinaryExpr.new(op: "<", left: left, right: parse_additive)
+            left = BinaryExpr.new(op: "<", left: left, right: parse_shift)
           elsif match_tok(TOK_LTEQ)
-            left = BinaryExpr.new(op: "<=", left: left, right: parse_additive)
+            left = BinaryExpr.new(op: "<=", left: left, right: parse_shift)
           elsif match_tok(TOK_GT)
-            left = BinaryExpr.new(op: ">", left: left, right: parse_additive)
+            left = BinaryExpr.new(op: ">", left: left, right: parse_shift)
           elsif match_tok(TOK_GTEQ)
-            left = BinaryExpr.new(op: ">=", left: left, right: parse_additive)
+            left = BinaryExpr.new(op: ">=", left: left, right: parse_shift)
+          else
+            break
+          end
+        end
+        left
+      end
+
+      def parse_shift
+        left = parse_additive
+        loop do
+          if match_tok(TOK_SHL)
+            left = BinaryExpr.new(op: "<<", left: left, right: parse_additive)
+          elsif match_tok(TOK_SHR)
+            left = BinaryExpr.new(op: ">>", left: left, right: parse_additive)
           else
             break
           end
@@ -1003,6 +1222,14 @@ module RunarCompiler
               match_tok(TOK_COMMA)
             end
             expect(TOK_RPAREN)
+            # Free helper functions in Move take `contract: &Self` as the first
+            # argument. The parser drops `contract` from parameter lists on the
+            # definition side, so strip a matching `contract`/`self` identifier
+            # as the first argument at call sites too.
+            if expr.is_a?(Identifier) && !args.empty? && args.first.is_a?(Identifier) &&
+               (args.first.name == "contract" || args.first.name == "self")
+              args = args[1..]
+            end
             expr = CallExpr.new(callee: expr, args: args)
           elsif match_tok(TOK_DOT)
             prop = Frontend.move_snake_to_camel(expect(TOK_IDENT).value)
@@ -1073,7 +1300,7 @@ module RunarCompiler
             match_tok(TOK_COMMA)
           end
           expect(TOK_RBRACKET)
-          return CallExpr.new(callee: Identifier.new(name: "FixedArray"), args: elements)
+          return ArrayLiteralExpr.new(elements: elements)
         end
 
         # Identifier

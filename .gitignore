@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.worktrees/
 .turbo/
 *.tsbuildinfo
 coverage/
@@ -10,6 +11,15 @@ coverage/
 .idea/
 .vscode/
 /conformance/.tmp/
+/conformance/artifacts/
+/artifacts/
+/conformance/fuzz-findings/
+/conformance/fuzz-findings-ir/
+/conformance/fuzz-findings-anf/
+/conformance/fuzz-findings-canonical/
+/conformance/fuzz-findings-execute/
+/conformance/fuzz-findings-trimodal/
+/conformance/.tmp/
 target/
 __pycache__/
 *.pyc
@@ -17,13 +27,32 @@ __pycache__/
 *.egg-info/
 .venv/
 compilers/go/runar*-go
+compilers/go/go
+tests/generate-vectors/bn254/runar-bn254-vectors
+
+# End-to-end webapp build outputs
+examples/end2end-example/webapp/runar-webapp
+examples/end2end-example/webapp-blackjack/runar-webapp-blackjack
 
 # runar-rb
 /packages/runar-rb/tmp/
 
 # Local Claude settings (user-specific, not shared)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/worktrees/
 .zig-cache/
 .zig-global-cache/
 .zig-local-cache/
 zig-out/
+zig-pkg/
+
+# Gradle / Java build outputs
+.gradle/
+compilers/java/build/
+packages/runar-java/build/
+examples/java/build/
+examples/end2end-example/java/build/
+integration/java/build/
+conformance/sdk-output/tools/java-driver/build/
+

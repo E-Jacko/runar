@@ -11,7 +11,7 @@ pub mod ir;
 
 use artifact::{assemble_artifact, RunarArtifact};
 use codegen::emit::emit;
-use codegen::optimizer::optimize_stack_ops;
+use codegen::optimizer::{optimize_stack_ops, optimize_stack_ops_with_locs};
 use codegen::stack::lower_to_stack;
 use ir::loader::{load_ir, load_ir_from_str};
 
@@ -45,14 +45,118 @@ impl Default for CompileOptions {
     }
 }
 
-/// Apply constructor args by setting ANF property initial_value fields.
-fn apply_constructor_args(program: &mut ir::ANFProgram, args: &std::collections::HashMap<String, serde_json::Value>) {
+/// Validate `constructor_args` shape/keys, bake them into the ANF, then verify
+/// no referenced readonly property is left unbaked. Returns a list of error
+/// messages (empty = OK). Mirrors the TypeScript `validateConstructorArgsShape`
+/// + `findUnbakedReferencedReadonly` pair in
+/// `packages/runar-compiler/src/index.ts` (PR #113, fix 1).
+///
+/// The no-args path returns no errors and mutates nothing — byte-identical to
+/// the previous behaviour.
+///
+/// Check (a) — "positional array" reject — is structurally N/A for the Rust
+/// tier: `constructor_args` is a `HashMap<String, serde_json::Value>`, already
+/// name-keyed, so no positional array can reach this typed API. Kept as a
+/// documented no-op to stay 1:1 with the dynamically-typed tiers.
+fn apply_constructor_args(
+    program: &mut ir::ANFProgram,
+    args: &std::collections::HashMap<String, serde_json::Value>,
+) -> Vec<String> {
     if args.is_empty() {
-        return;
+        return Vec::new();
     }
+
+    // (b) Unknown-key reject — every key must name a contract property.
+    let prop_name_set: std::collections::HashSet<&str> =
+        program.properties.iter().map(|p| p.name.as_str()).collect();
+    let mut shape_errors: Vec<String> = Vec::new();
+    for key in args.keys() {
+        if !prop_name_set.contains(key.as_str()) {
+            let prop_names: Vec<&str> =
+                program.properties.iter().map(|p| p.name.as_str()).collect();
+            shape_errors.push(format!(
+                "constructorArgs key '{}' does not match any property of contract '{}' \
+                 (properties: [{}]). Nothing would be baked for this key.",
+                key,
+                program.contract_name,
+                prop_names.join(", ")
+            ));
+        }
+    }
+    if !shape_errors.is_empty() {
+        return shape_errors;
+    }
+
+    // Bake.
     for prop in &mut program.properties {
         if let Some(val) = args.get(&prop.name) {
             prop.initial_value = Some(val.clone());
+        }
+    }
+
+    // (c) Unbaked-referenced-readonly reject.
+    find_unbaked_referenced_readonly(program)
+}
+
+/// After baking `constructor_args`, find readonly properties that are
+/// REFERENCED by at least one method body but still have no baked
+/// `initial_value`. Such properties would be emitted as OP_0 placeholders,
+/// making the compiled script fail opaquely at runtime.
+fn find_unbaked_referenced_readonly(program: &ir::ANFProgram) -> Vec<String> {
+    let referenced = collect_referenced_props(program);
+    let mut errors = Vec::new();
+    for prop in &program.properties {
+        if prop.readonly && prop.initial_value.is_none() && referenced.contains(&prop.name) {
+            errors.push(format!(
+                "readonly property '{}' is referenced by a method but has no value after \
+                 baking constructorArgs — the emitted script would carry an OP_0 placeholder \
+                 that fails at runtime. Provide '{}' in constructorArgs (or give the property \
+                 an initializer).",
+                prop.name, prop.name
+            ));
+        }
+    }
+    errors
+}
+
+/// Collect the property names actually referenced by method bodies.
+///
+/// The raw ANF may load properties that are ultimately dead; only after
+/// dead-binding elimination do the surviving `load_prop` nodes reflect real
+/// references. DCE is a pure function, so running it here on a probe copy does
+/// not perturb the main pipeline. The constructor's `super(...)` call
+/// references every property but is never emitted as script code, so it is
+/// excluded.
+fn collect_referenced_props(program: &ir::ANFProgram) -> std::collections::HashSet<String> {
+    let probe = frontend::dce::eliminate_dead_code(program.clone());
+    let mut referenced = std::collections::HashSet::new();
+    for method in &probe.methods {
+        if method.name == "constructor" {
+            continue;
+        }
+        collect_load_prop_refs(&method.body, &mut referenced);
+    }
+    referenced
+}
+
+/// Recursively collect `load_prop` property names from ANF bindings.
+fn collect_load_prop_refs(
+    bindings: &[ir::ANFBinding],
+    out: &mut std::collections::HashSet<String>,
+) {
+    for binding in bindings {
+        match &binding.value {
+            ir::ANFValue::LoadProp { name } => {
+                out.insert(name.clone());
+            }
+            ir::ANFValue::If { then, else_branch, .. } => {
+                collect_load_prop_refs(then, out);
+                collect_load_prop_refs(else_branch, out);
+            }
+            ir::ANFValue::Loop { body, .. } => {
+                collect_load_prop_refs(body, out);
+            }
+            _ => {}
         }
     }
 }
@@ -109,7 +213,7 @@ pub fn compile_from_ir(path: &Path) -> Result<RunarArtifact, String> {
 /// Compile from an ANF IR JSON file on disk, with options.
 pub fn compile_from_ir_with_options(path: &Path, opts: &CompileOptions) -> Result<RunarArtifact, String> {
     let program = load_ir(path)?;
-    compile_from_program_with_options(&program, opts)
+    compile_from_program_with_options(&program, &ir_input_options(opts))
 }
 
 /// Compile from an ANF IR JSON string.
@@ -120,7 +224,19 @@ pub fn compile_from_ir_str(json_str: &str) -> Result<RunarArtifact, String> {
 /// Compile from an ANF IR JSON string, with options.
 pub fn compile_from_ir_str_with_options(json_str: &str, opts: &CompileOptions) -> Result<RunarArtifact, String> {
     let program = load_ir_from_str(json_str)?;
-    compile_from_program_with_options(&program, opts)
+    compile_from_program_with_options(&program, &ir_input_options(opts))
+}
+
+/// Force the ANF constant-folding pass off when compiling already-lowered ANF
+/// IR (the `--ir` path). The ANF fold is a source-pipeline optimization;
+/// re-running it on pre-lowered IR rewrites `bin_op`s to constants but leaves
+/// the now-dead operand bindings in place (fold does no dead-binding
+/// elimination), which stack-lowering then emits as wasteful push+drop
+/// sequences — diverging from both the fold-OFF goldens and the Zig tier,
+/// whose `compileFromIR` never folds IR input (compilers/zig/src/main.zig).
+/// Folding stays enabled on the source path (`compile_from_source`).
+fn ir_input_options(opts: &CompileOptions) -> CompileOptions {
+    CompileOptions { disable_constant_folding: true, ..opts.clone() }
 }
 
 /// Compile from a `.runar.ts` source file on disk.
@@ -185,18 +301,40 @@ pub fn compile_from_source_str_with_options(
         ));
     }
 
+    // Pass 3b: Expand fixed-size array properties into scalar siblings.
+    let expand_result = frontend::expand_fixed_arrays::expand_fixed_arrays(&contract);
+    if !expand_result.errors.is_empty() {
+        let error_msgs: Vec<String> = expand_result
+            .errors
+            .iter()
+            .map(|e| e.format_message())
+            .collect();
+        return Err(format!(
+            "Expand-fixed-arrays errors:\n  {}",
+            error_msgs.join("\n  ")
+        ));
+    }
+    let contract = expand_result.contract;
+
     // Pass 4: ANF Lower
     let mut anf_program = frontend::anf_lower::lower_to_anf(&contract);
 
-    // Bake constructor args into ANF properties.
-    apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    // Bake constructor args into ANF properties (validated first).
+    let arg_errors = apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    if !arg_errors.is_empty() {
+        return Err(format!(
+            "constructorArgs errors:\n  {}",
+            arg_errors.join("\n  ")
+        ));
+    }
 
     // Pass 4.25: Constant folding (optional)
     if !opts.disable_constant_folding {
         anf_program = frontend::constant_fold::fold_constants(&anf_program);
     }
 
-    // Pass 4.5: EC optimization
+    // Pass 4.5: EC optimization. Delegates internally to frontend::dce
+    // for dead-binding cleanup after any EC rewrite.
     let anf_program = frontend::anf_optimize::optimize_ec(anf_program);
 
     // Passes 5-6: Backend (stack lowering + emit)
@@ -261,10 +399,31 @@ pub fn compile_source_str_to_ir_with_options(
         ));
     }
 
+    // Pass 3b: Expand fixed-size array properties into scalar siblings.
+    let expand_result = frontend::expand_fixed_arrays::expand_fixed_arrays(&contract);
+    if !expand_result.errors.is_empty() {
+        let error_msgs: Vec<String> = expand_result
+            .errors
+            .iter()
+            .map(|e| e.format_message())
+            .collect();
+        return Err(format!(
+            "Expand-fixed-arrays errors:\n  {}",
+            error_msgs.join("\n  ")
+        ));
+    }
+    let contract = expand_result.contract;
+
     let mut anf_program = frontend::anf_lower::lower_to_anf(&contract);
 
-    // Bake constructor args into ANF properties.
-    apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    // Bake constructor args into ANF properties (validated first).
+    let arg_errors = apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    if !arg_errors.is_empty() {
+        return Err(format!(
+            "constructorArgs errors:\n  {}",
+            arg_errors.join("\n  ")
+        ));
+    }
 
     // Pass 4.25: Constant folding (optional)
     if !opts.disable_constant_folding {
@@ -302,21 +461,21 @@ pub fn compile_from_program_with_options(program: &ir::ANFProgram, opts: &Compil
         program = frontend::constant_fold::fold_constants(&program);
     }
 
-    // Pass 4.5: EC optimization (in case we receive unoptimized ANF from IR)
+    // Pass 4.5: EC optimization (in case we receive unoptimized ANF from IR).
+    // Delegates internally to frontend::dce for dead-binding cleanup.
     let optimized = frontend::anf_optimize::optimize_ec(program);
 
     // Pass 5: Stack lowering
     let mut stack_methods = lower_to_stack(&optimized)?;
 
-    // Peephole optimization — runs on Stack IR before emission.
-    // Note: source_locs must be resized to match the new ops length since the
-    // peephole optimizer may combine adjacent ops (reducing the count).
+    // Peephole optimization — runs on Stack IR before emission. Uses the
+    // source-loc-preserving variant so the artifact's sourceMap survives
+    // the pass: each collapsed peephole window keeps the source location of
+    // its head input op.
     for method in &mut stack_methods {
-        let new_ops = optimize_stack_ops(&method.ops);
-        // After optimization the ops array may have a different length, so rebuild
-        // source_locs with the same length (None for new/merged ops).
-        method.source_locs = vec![None; new_ops.len()];
+        let (new_ops, new_locs) = optimize_stack_ops_with_locs(&method.ops, &method.source_locs);
         method.ops = new_ops;
+        method.source_locs = new_locs;
     }
 
     // Pass 6: Emit
@@ -327,10 +486,13 @@ pub fn compile_from_program_with_options(program: &ir::ANFProgram, opts: &Compil
         &emit_result.script_hex,
         &emit_result.script_asm,
         emit_result.constructor_slots,
+        emit_result.code_sep_index_slots,
         emit_result.code_separator_index,
         emit_result.code_separator_indices,
         true, // include ANF IR for SDK state auto-computation
         emit_result.source_map,
+        emit_result.raw_script_spans,
+        &stack_methods,
     );
     Ok(artifact)
 }
@@ -401,20 +563,70 @@ pub fn compile_from_source_str_with_result(
         return result;
     }
 
+    // Pass 3b: Expand fixed-size array properties into scalar siblings.
+    let expand_result = frontend::expand_fixed_arrays::expand_fixed_arrays(contract);
+    if !expand_result.errors.is_empty() {
+        result.diagnostics.extend(expand_result.errors);
+    }
+    if result.has_errors() {
+        return result;
+    }
+    let expanded_contract = expand_result.contract;
+    // Switch the working contract over to the expanded form. Downstream
+    // passes operate on this owned clone; the previously-borrowed `contract`
+    // reference from `result.contract.as_ref()` is no longer used below.
+    let contract = &expanded_contract;
+    // Keep result.contract as the pre-expansion AST (mirrors TS spike).
+
     // Pass 4: ANF lowering
     let mut anf_program = frontend::anf_lower::lower_to_anf(contract);
 
-    // Bake constructor args into ANF properties.
-    apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    // Bake constructor args into ANF properties (validated first).
+    let arg_errors = apply_constructor_args(&mut anf_program, &opts.constructor_args);
+    if !arg_errors.is_empty() {
+        for msg in arg_errors {
+            result.diagnostics.push(Diagnostic::error(msg, None));
+        }
+        return result;
+    }
 
     // Pass 4.25: Constant folding (optional)
     if !opts.disable_constant_folding {
         anf_program = frontend::constant_fold::fold_constants(&anf_program);
     }
 
-    // Pass 4.5: EC optimization
+    // Pass 4.5: EC optimization (delegates internally to frontend::dce)
     anf_program = frontend::anf_optimize::optimize_ec(anf_program);
     result.anf = Some(anf_program.clone());
+
+    // Issue #109: warn when DCE strips an un-annotated readonly field. Such a
+    // field carries no compile-time value (no initializer) and is referenced by
+    // no method, so it is eliminated from the locking script entirely —
+    // silently dropping deploy-time metadata an author may intend to recover
+    // from the on-chain script later. `@embedAlways` fields were forced back in
+    // during ANF lowering, so they are "referenced" here and never warn.
+    {
+        let referenced = collect_referenced_props(&anf_program);
+        if let Some(contract_ast) = result.contract.as_ref() {
+            for prop in &contract_ast.properties {
+                if prop.readonly
+                    && !prop.embed_always
+                    && prop.initializer.is_none()
+                    && !referenced.contains(&prop.name)
+                {
+                    result.diagnostics.push(Diagnostic::warning(
+                        format!(
+                            "readonly field '{}' is not referenced in any method body and was \
+                             eliminated by DCE; annotate it /** @embedAlways */ to preserve it in \
+                             the on-chain script",
+                            prop.name
+                        ),
+                        Some(prop.source_location.clone()),
+                    ));
+                }
+            }
+        }
+    }
 
     // Pass 5: Stack lowering (catch panics)
     let stack_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -443,10 +655,14 @@ pub fn compile_from_source_str_with_result(
         }
     };
 
-    // Peephole optimization
+    // Peephole optimization — same source_locs preservation rule as the
+    // primary path above: preserve 1:1 when the count is unchanged, fall
+    // back to all-None when the optimizer shrank the op stream.
     for method in &mut stack_methods {
         let new_ops = optimize_stack_ops(&method.ops);
-        method.source_locs = vec![None; new_ops.len()];
+        if new_ops.len() != method.source_locs.len() {
+            method.source_locs = vec![None; new_ops.len()];
+        }
         method.ops = new_ops;
     }
 
@@ -463,10 +679,13 @@ pub fn compile_from_source_str_with_result(
                 &emit_result.script_hex,
                 &emit_result.script_asm,
                 emit_result.constructor_slots,
+                emit_result.code_sep_index_slots,
                 emit_result.code_separator_index,
                 emit_result.code_separator_indices,
                 true,
                 emit_result.source_map,
+                emit_result.raw_script_spans,
+        &stack_methods,
             );
             result.script_hex = Some(emit_result.script_hex);
             result.script_asm = Some(emit_result.script_asm);

@@ -14,6 +14,7 @@ import { buildP2PKHScript } from '../script-utils.js';
 import {
   Transaction,
   type WalletClient,
+  type Broadcaster,
 } from '@bsv/sdk';
 
 // ---------------------------------------------------------------------------
@@ -39,6 +40,15 @@ export interface WalletProviderOptions {
   network?: 'mainnet' | 'testnet';
   /** Fee rate in sats/KB (default: 100, i.e. 0.1 sat/byte). */
   feeRate?: number;
+  /**
+   * Injected `@bsv/sdk` Broadcaster (issue #107). When provided, `broadcast()`
+   * delegates to this instance instead of the hardcoded ARC URL, so the SDK
+   * and a downstream layer (e.g. wallet-toolbox) share ONE broadcaster/config
+   * — keeping parent and child txs at the same ARC deployment (avoids
+   * `SEEN_IN_ORPHAN_MEMPOOL`). Additive and non-breaking; omit for the default
+   * ARC path.
+   */
+  broadcaster?: Broadcaster;
 }
 
 // ---------------------------------------------------------------------------
@@ -46,16 +56,17 @@ export interface WalletProviderOptions {
 // ---------------------------------------------------------------------------
 
 export class WalletProvider implements Provider {
-  private readonly wallet: WalletClient;
-  private readonly signer: Signer;
-  private readonly basket: string;
-  private readonly fundingTag: string;
-  private readonly arcUrl: string;
-  private readonly overlayUrl: string | undefined;
-  private readonly overlayTopics: string[] | undefined;
-  private readonly _network: 'mainnet' | 'testnet';
-  private readonly _feeRate: number;
-  private readonly txCache = new Map<string, string>();
+  protected readonly wallet: WalletClient;
+  protected readonly signer: Signer;
+  protected readonly basket: string;
+  protected readonly fundingTag: string;
+  protected readonly arcUrl: string;
+  protected readonly overlayUrl: string | undefined;
+  protected readonly overlayTopics: string[] | undefined;
+  protected readonly _network: 'mainnet' | 'testnet';
+  protected readonly _feeRate: number;
+  protected readonly broadcaster: Broadcaster | undefined;
+  protected readonly txCache = new Map<string, string>();
 
   constructor(options: WalletProviderOptions) {
     this.wallet = options.wallet;
@@ -67,6 +78,22 @@ export class WalletProvider implements Provider {
     this.overlayTopics = options.overlayTopics;
     this._network = options.network ?? 'mainnet';
     this._feeRate = options.feeRate ?? 100;
+    this.broadcaster = options.broadcaster;
+  }
+
+  // -------------------------------------------------------------------------
+  // Typed accessors (used by RunarContract.deployWithWallet; also lets
+  // consumers reach the wallet without reaching into internals)
+  // -------------------------------------------------------------------------
+
+  /** The BRC-100 wallet client this provider wraps. */
+  get walletClient(): WalletClient {
+    return this.wallet;
+  }
+
+  /** The wallet basket used for UTXO management. */
+  get basketName(): string {
+    return this.basket;
   }
 
   // -------------------------------------------------------------------------
@@ -78,8 +105,14 @@ export class WalletProvider implements Provider {
     this.txCache.set(txid, rawHex);
   }
 
-  /** Fetch raw tx hex: local cache → overlay → throw. */
-  private async fetchRawTx(txid: string): Promise<string> {
+  /**
+   * Fetch raw tx hex: local cache → overlay → throw.
+   *
+   * Protected so subclasses can supply parents from another source (their
+   * own index, a node RPC, …); the EF assembly in `broadcastTx` dispatches
+   * through the override.
+   */
+  protected async fetchRawTx(txid: string): Promise<string> {
     const cached = this.txCache.get(txid);
     if (cached) return cached;
 
@@ -101,8 +134,14 @@ export class WalletProvider implements Provider {
   // Broadcast
   // -------------------------------------------------------------------------
 
-  /** Broadcast a transaction via ARC in EF format. */
-  private async broadcastTx(tx: Transaction): Promise<string> {
+  /**
+   * Broadcast a transaction via ARC in EF format.
+   *
+   * Protected so subclasses can reroute broadcast (e.g. through an overlay
+   * that gates admission) while `broadcast()` and `ensureFunding()` keep
+   * dispatching through the override.
+   */
+  protected async broadcastTx(tx: Transaction): Promise<string> {
     // Attach source transactions for EF format
     for (const input of tx.inputs) {
       if (input.sourceTransaction) continue;
@@ -110,6 +149,26 @@ export class WalletProvider implements Provider {
       if (!parentTxid) continue;
       const parentHex = await this.fetchRawTx(parentTxid);
       input.sourceTransaction = Transaction.fromHex(parentHex);
+    }
+
+    // Issue #107: when a broadcaster is injected, delegate to it so the SDK and
+    // the calling layer share ONE broadcaster instance/config (keeps parent +
+    // child at the same ARC deployment → avoids SEEN_IN_ORPHAN_MEMPOOL). The
+    // structured BroadcastFailure is flattened into a thrown Error to preserve
+    // the existing `broadcast()` contract.
+    if (this.broadcaster) {
+      const result = await this.broadcaster.broadcast(tx);
+      if (result.status === 'error') {
+        throw new Error(
+          `WalletProvider: injected broadcaster failed (${result.code}): ${result.description}`,
+        );
+      }
+      const txid = result.txid;
+      this.txCache.set(txid, tx.toHex());
+      if (this.overlayUrl && this.overlayTopics && this.overlayTopics.length > 0) {
+        this.submitToOverlay(tx).catch(() => {});
+      }
+      return txid;
     }
 
     const efBytes = tx.toEFUint8Array();
@@ -137,8 +196,9 @@ export class WalletProvider implements Provider {
     return txid;
   }
 
-  /** Submit a transaction to the overlay for indexing (non-fatal). */
-  private async submitToOverlay(tx: Transaction): Promise<void> {
+  /** Submit a transaction to the overlay for indexing (non-fatal).
+   * Protected so subclasses can adapt the submit request to their overlay. */
+  protected async submitToOverlay(tx: Transaction): Promise<void> {
     if (!this.overlayUrl || !this.overlayTopics) return;
 
     const beef = tx.toBEEF();

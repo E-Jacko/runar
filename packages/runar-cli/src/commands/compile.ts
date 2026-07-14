@@ -5,12 +5,17 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { InputLimits, CanonicalJsonError } from 'runar-ir-schema';
 
 interface CompileOptions {
   output: string;
   ir?: boolean;
   asm?: boolean;
   disableConstantFolding?: boolean;
+  fromIr?: string;
+  hex?: boolean;
+  parseOnly?: boolean;
+  emitSourceMap?: string;
 }
 
 interface CompilerDiagnosticLike {
@@ -38,6 +43,26 @@ function jsonWithBigInt(value: unknown): string {
   );
 }
 
+// GAP-011: source-map sourceFile values must be repo-relative (POSIX) so
+// goldens stay stable across worktree paths and developer machines. Walk up
+// from the source file looking for pnpm-workspace.yaml (the canonical repo
+// root marker); fall back to the basename if no marker is found. Strings
+// that aren't absolute paths (e.g. already-basename "Counter.runar.ts") are
+// returned unchanged.
+function repoRelativeFileName(absSourcePath: string): string {
+  if (!path.isAbsolute(absSourcePath)) return absSourcePath;
+  let dir = path.dirname(absSourcePath);
+  while (true) {
+    if (fs.existsSync(path.join(dir, 'pnpm-workspace.yaml'))) {
+      return path.relative(dir, absSourcePath).split(path.sep).join('/');
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return path.basename(absSourcePath);
+}
+
 /**
  * Compile one or more Rúnar contract source files into artifact JSON.
  *
@@ -56,8 +81,16 @@ export async function compileCommand(
 
   // Dynamically import the compiler to avoid hard failures if it's not
   // yet fully built (the compiler package may still be under development).
-  type CompileFn = (source: string, options?: { fileName?: string; disableConstantFolding?: boolean }) => unknown;
+  type CompileFn = (source: string, options?: { fileName?: string; disableConstantFolding?: boolean; parseOnly?: boolean }) => unknown;
+  type CompileFromANFFn = (
+    program: unknown,
+    options?: { disableConstantFolding?: boolean },
+  ) => { scriptHex: string; scriptAsm: string };
+  type LoadANFFn = (json: string) => unknown;
+
   let compile: CompileFn | null = null;
+  let compileFromANF: CompileFromANFFn | null = null;
+  let loadANFFromJSON: LoadANFFn | null = null;
   try {
     // In monorepo/dev mode, prefer the source entry so conformance and CLI
     // runs always reflect the latest compiler implementation.
@@ -66,6 +99,12 @@ export async function compileCommand(
       const compiler = (await import(pathToFileURL(sourceEntry).href)) as Record<string, unknown>;
       if (typeof compiler.compile === 'function') {
         compile = compiler.compile as CompileFn;
+      }
+      if (typeof compiler.compileFromANF === 'function') {
+        compileFromANF = compiler.compileFromANF as CompileFromANFFn;
+      }
+      if (typeof compiler.loadANFFromJSON === 'function') {
+        loadANFFromJSON = compiler.loadANFFromJSON as LoadANFFn;
       }
     }
 
@@ -76,9 +115,104 @@ export async function compileCommand(
       if (typeof compiler.compile === 'function') {
         compile = compiler.compile as CompileFn;
       }
+      if (!compileFromANF && typeof compiler.compileFromANF === 'function') {
+        compileFromANF = compiler.compileFromANF as CompileFromANFFn;
+      }
+      if (!loadANFFromJSON && typeof compiler.loadANFFromJSON === 'function') {
+        loadANFFromJSON = compiler.loadANFFromJSON as LoadANFFn;
+      }
     }
   } catch {
     // Compiler not available — will fall back to error message below
+  }
+
+  // --from-ir mode: compile a single ANF IR JSON file straight to a
+  // locking script. Skips parse/validate/typecheck/anf-lower entirely.
+  if (options.fromIr) {
+    if (!compileFromANF || !loadANFFromJSON) {
+      console.error(
+        '  Error: runar-compiler does not expose compileFromANF / loadANFFromJSON. Ensure the package is built.',
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    const irPath = path.resolve(process.cwd(), options.fromIr);
+    let irJson: string;
+    try {
+      irJson = fs.readFileSync(irPath, 'utf-8');
+    } catch (err) {
+      console.error(`  Error reading IR file: ${(err as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    // DoS-bound: reject oversized IR files at the CLI boundary so the
+    // user gets a tier-agnostic, byte-precise error before the compiler
+    // is even invoked. Matches the inner loadANFFromJSON guard but
+    // surfaces a CLI-level message.
+    const irByteLen = Buffer.byteLength(irJson, 'utf8');
+    if (irByteLen > InputLimits.MAX_IR_BYTES) {
+      const err = new CanonicalJsonError(
+        'bytes',
+        `IR file ${irPath} is ${irByteLen} bytes; limit is ${InputLimits.MAX_IR_BYTES}`,
+        { limit: InputLimits.MAX_IR_BYTES, actual: irByteLen },
+      );
+      console.error(`  IR size error: ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    let program: unknown;
+    try {
+      program = loadANFFromJSON(irJson);
+    } catch (err) {
+      console.error(`  IR parse error: ${(err as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    let result: { scriptHex: string; scriptAsm: string };
+    try {
+      result = compileFromANF(program, { disableConstantFolding: options.disableConstantFolding });
+    } catch (err) {
+      console.error(`  Compilation error: ${(err as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    if (options.hex) {
+      // Print only the hex on stdout; no other chatter so the output
+      // can be piped into a hex-comparison harness.
+      process.stdout.write(result.scriptHex + '\n');
+      return;
+    }
+
+    const baseName = path.basename(irPath, path.extname(irPath));
+    const minimalArtifact = {
+      contractName: (program as { contractName?: string }).contractName ?? baseName,
+      script: result.scriptHex,
+      asm: result.scriptAsm,
+    };
+    const artifactPath = path.join(outputDir, `${baseName}.json`);
+    fs.writeFileSync(artifactPath, JSON.stringify(minimalArtifact, null, 2) + '\n');
+    console.log(`Compiling from IR: ${irPath}`);
+    console.log(`  Artifact written: ${artifactPath}`);
+    if (options.asm) {
+      console.log('');
+      console.log(`  ASM (${baseName}):`);
+      console.log(`  ${result.scriptAsm}`);
+      console.log('');
+    }
+    return;
+  }
+
+  // --parse-only requires source files. Bail out clearly so users don't
+  // get the silent "0 succeeded, 0 failed" summary.
+  if (options.parseOnly && files.length === 0) {
+    console.error('  Error: --parse-only requires at least one source file.');
+    process.exitCode = 1;
+    return;
   }
 
   let successCount = 0;
@@ -88,7 +222,9 @@ export async function compileCommand(
     const resolvedPath = path.resolve(process.cwd(), filePath);
     const baseName = path.basename(resolvedPath, path.extname(resolvedPath));
 
-    console.log(`Compiling: ${resolvedPath}`);
+    if (!options.hex && !options.parseOnly) {
+      console.log(`Compiling: ${resolvedPath}`);
+    }
 
     // Read source
     let source: string;
@@ -111,10 +247,40 @@ export async function compileCommand(
 
     let compileResult: CompileResultLike;
     try {
-      compileResult = compile(source, { fileName: resolvedPath, disableConstantFolding: options.disableConstantFolding }) as CompileResultLike;
+      compileResult = compile(source, {
+        fileName: resolvedPath,
+        disableConstantFolding: options.disableConstantFolding,
+        parseOnly: options.parseOnly,
+      }) as CompileResultLike;
     } catch (err) {
       console.error(`  Compilation error: ${(err as Error).message}`);
       errorCount++;
+      continue;
+    }
+
+    // --parse-only mode: success means parse + (early-exit) succeeded with
+    // no error diagnostics. There is no artifact to write — emit the same
+    // "parser ok" marker as the other 6 compilers' --parse-only mode so
+    // tooling (conformance runner, etc.) can rely on a uniform contract.
+    if (options.parseOnly) {
+      if (!compileResult.success) {
+        const errors = (compileResult.diagnostics ?? [])
+          .filter(d => d.severity === 'error')
+          .map(d => d.message)
+          .filter((m): m is string => typeof m === 'string' && m.length > 0);
+        if (errors.length > 0) {
+          console.error(`  Parse failed:`);
+          for (const msg of errors) {
+            console.error(`    - ${msg}`);
+          }
+        } else {
+          console.error('  Parse failed.');
+        }
+        errorCount++;
+        continue;
+      }
+      process.stdout.write('parser ok\n');
+      successCount++;
       continue;
     }
 
@@ -146,6 +312,21 @@ export async function compileCommand(
       };
     }
 
+    // --hex mode: print only the script hex on stdout (no artifact file
+    // written, no chatter). Matches the other 6 CLIs' --hex semantics for
+    // source input and the --from-ir + --hex pipeline above.
+    if (options.hex) {
+      const scriptHex = artifact['script'];
+      if (typeof scriptHex !== 'string') {
+        console.error('  Error: artifact has no script hex.');
+        errorCount++;
+        continue;
+      }
+      process.stdout.write(scriptHex + '\n');
+      successCount++;
+      continue;
+    }
+
     // Write artifact
     const artifactPath = path.join(outputDir, `${baseName}.json`);
     fs.writeFileSync(
@@ -153,6 +334,32 @@ export async function compileCommand(
       jsonWithBigInt(artifact) + '\n',
     );
     console.log(`  Artifact written: ${artifactPath}`);
+
+    // --emit-source-map: write artifact.sourceMap to the requested path.
+    // Emits the canonical {"mappings":[...]} object; if the artifact has
+    // no sourceMap (e.g. fold-on path with no source-loc tracking), emit
+    // an empty {"mappings":[]} object so downstream tooling can rely on a
+    // uniform shape.
+    if (options.emitSourceMap) {
+      const smPath = path.resolve(process.cwd(), options.emitSourceMap);
+      fs.mkdirSync(path.dirname(smPath), { recursive: true });
+      const sm = (artifact as { sourceMap?: unknown }).sourceMap;
+      const payload: { mappings: Array<{ sourceFile: string; [k: string]: unknown }> } =
+        sm && typeof sm === 'object' && 'mappings' in (sm as Record<string, unknown>)
+          ? (sm as { mappings: Array<{ sourceFile: string; [k: string]: unknown }> })
+          : { mappings: [] };
+      // GAP-011: normalize sourceFile to a repo-relative path (POSIX) so
+      // goldens stay stable across worktree paths and developer machines.
+      const normalized = {
+        ...payload,
+        mappings: payload.mappings.map((m) => ({
+          ...m,
+          sourceFile: repoRelativeFileName(m.sourceFile),
+        })),
+      };
+      fs.writeFileSync(smPath, JSON.stringify(normalized, null, 2) + '\n');
+      console.log(`  Source map written: ${smPath}`);
+    }
 
     // Print ASM if requested
     if (options.asm && typeof artifact['asm'] === 'string') {
@@ -165,10 +372,14 @@ export async function compileCommand(
     successCount++;
   }
 
-  console.log('');
-  console.log(
-    `Compilation complete: ${successCount} succeeded, ${errorCount} failed`,
-  );
+  // --hex / --parse-only modes are piping-friendly; suppress the summary so
+  // stdout stays a clean machine-readable line (matches --from-ir + --hex).
+  if (!options.hex && !options.parseOnly) {
+    console.log('');
+    console.log(
+      `Compilation complete: ${successCount} succeeded, ${errorCount} failed`,
+    );
+  }
 
   if (errorCount > 0) {
     process.exitCode = 1;

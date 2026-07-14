@@ -137,42 +137,45 @@ fn collectRefs(v: types.ANFValue, used: *std.StringHashMap(void)) !void {
         .add_raw_output => |aro| {
             try used.put(aro.satoshis, {});
             if (aro.script_bytes.len > 0) try used.put(aro.script_bytes, {});
-            if (aro.script_ref.len > 0) try used.put(aro.script_ref, {});
+        },
+        .add_data_output => |ado| {
+            try used.put(ado.satoshis, {});
+            if (ado.script_bytes.len > 0) try used.put(ado.script_bytes, {});
         },
         .array_literal => |al| {
             for (al.elements) |e| try used.put(e, {});
         },
-        // Legacy variants
-        .binary_op => |bo| {
-            try used.put(bo.left, {});
-            try used.put(bo.right, {});
+        .raw_script => {
+            // Opaque byte span — no SSA operand refs. Stack effect is declared
+            // via in_arity / out_arity and consumed by the stack lowerer.
         },
-        .builtin_call => |bc| {
-            for (bc.args) |arg| try used.put(arg, {});
-        },
-        .property_write => |pw| try used.put(pw.value_ref, {}),
-        .if_expr => |ie| {
-            try used.put(ie.condition, {});
-            for (ie.then_bindings) |b| try collectRefs(b.value, used);
-            if (ie.else_bindings) |eb| for (eb) |b| try collectRefs(b.value, used);
-        },
-        .for_loop => |fl| {
-            for (fl.body_bindings) |b| try collectRefs(b.value, used);
-        },
-        .assert_op => |a| try used.put(a.condition, {}),
-        .ref => |r| try used.put(r, {}),
-        .literal_int, .literal_bigint, .literal_bool, .literal_bytes, .property_read, .nop => {},
     }
 }
 
 /// Return true if this value kind has observable side effects.
+/// F-003: every ANFValue variant is enumerated explicitly (no `else`) so
+/// adding a new variant fails at Zig compile time here instead of silently
+/// defaulting to "pure" — which would let DCE delete an effectful binding.
 pub fn hasSideEffect(v: types.ANFValue) bool {
     return switch (v) {
         .assert, .update_prop, .check_preimage, .deserialize_state,
-        .add_output, .add_raw_output, .@"if", .loop, .call, .method_call,
+        .add_output, .add_raw_output, .add_data_output, .@"if", .loop, .call, .method_call,
+        // raw_script bytes are opaque — DCE must never eliminate them, even
+        // when the binding is unreferenced.
+        .raw_script,
         => true,
-        .assert_op, .if_expr, .for_loop, .builtin_call => true,
-        else => false,
+        // Issue #109 (@embedAlways): a load_prop injected to force a readonly
+        // field into the deployed locking script carries `preserve = true`, so
+        // DCE must keep it even though nothing references it. Ordinary
+        // load_props (preserve = false) remain freely eliminable.
+        .load_prop => |lp| lp.preserve,
+        .load_param,
+        .load_const,
+        .bin_op,
+        .unary_op,
+        .get_state_script,
+        .array_literal,
+        => false,
     };
 }
 

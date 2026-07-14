@@ -19,20 +19,68 @@ import type {
   StackMethod,
   StackOp,
 } from '../ir/index.js';
+import { UnknownANFKindError } from 'runar-ir-schema';
 import { emitVerifySLHDSA } from './slh-dsa-codegen.js';
+import { emitVerifyWOTS } from './wots-codegen.js';
+import { emitVerifyRabinSig } from './rabin-codegen.js';
 import {
   emitEcAdd, emitEcMul, emitEcMulGen, emitEcNegate,
   emitEcOnCurve, emitEcModReduce, emitEcEncodeCompressed,
   emitEcMakePoint, emitEcPointX, emitEcPointY,
 } from './ec-codegen.js';
+import { emitCheckPreimageBindingRaw } from './oppushtx-codegen.js';
+import {
+  emitBn254FieldAdd, emitBn254FieldSub, emitBn254FieldMul,
+  emitBn254FieldInv, emitBn254FieldNeg,
+  emitBn254G1Add, emitBn254G1ScalarMul, emitBn254G1Negate, emitBn254G1OnCurve,
+} from './bn254-codegen.js';
 import { emitSha256Compress, emitSha256Finalize } from './sha256-codegen.js';
 import { emitBlake3Compress, emitBlake3Hash } from './blake3-codegen.js';
+import {
+  emitBBFieldAdd, emitBBFieldSub, emitBBFieldMul, emitBBFieldInv,
+  emitBBExt4Mul0, emitBBExt4Mul1, emitBBExt4Mul2, emitBBExt4Mul3,
+  emitBBExt4Inv0, emitBBExt4Inv1, emitBBExt4Inv2, emitBBExt4Inv3,
+} from './babybear-codegen.js';
+import {
+  emitKBFieldAdd, emitKBFieldSub, emitKBFieldMul, emitKBFieldInv,
+  emitKBExt4Mul0, emitKBExt4Mul1, emitKBExt4Mul2, emitKBExt4Mul3,
+  emitKBExt4Inv0, emitKBExt4Inv1, emitKBExt4Inv2, emitKBExt4Inv3,
+} from './koalabear-codegen.js';
+import { emitMerkleRootSha256, emitMerkleRootHash256 } from './merkle-codegen.js';
+import { emitPoseidon2KBPermute, emitPoseidon2KBCompress } from './poseidon2-koalabear-codegen.js';
+import { emitPoseidon2MerkleRoot } from './poseidon2-merkle-codegen.js';
+import {
+  emitP256Add, emitP256Mul, emitP256MulGen, emitP256Negate, emitP256OnCurve,
+  emitP256EncodeCompressed, emitVerifyECDSA_P256,
+  emitP384Add, emitP384Mul, emitP384MulGen, emitP384Negate, emitP384OnCurve,
+  emitP384EncodeCompressed, emitVerifyECDSA_P384,
+} from './p256-p384-codegen.js';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const MAX_STACK_DEPTH = 800;
+
+/**
+ * Local hex-to-Uint8Array helper. Avoids a runar-testing dependency
+ * (runar-testing depends on runar-compiler, so the reverse direction
+ * would create a cycle).
+ */
+function decodeHexBytes(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) {
+    throw new Error(`raw_script bytes must have even hex length, got ${hex.length}`);
+  }
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const b = parseInt(hex.substr(i * 2, 2), 16);
+    if (Number.isNaN(b)) {
+      throw new Error(`raw_script bytes contain non-hex character near offset ${i * 2}`);
+    }
+    out[i] = b;
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Builtin function → opcode mapping
@@ -196,6 +244,11 @@ class StackMap {
     this.slots.push(this.slots[this.slots.length - 1]!);
   }
 
+  /** Debug string of the slot names (bottom -> top) for error messages. */
+  debugSlots(): string {
+    return this.slots.join(', ');
+  }
+
   /** Get the set of all named (non-null) slot values. */
   namedSlots(): Set<string> {
     const names = new Set<string>();
@@ -223,14 +276,59 @@ class StackMap {
 function computeLastUses(bindings: ANFBinding[]): Map<string, number> {
   const lastUse = new Map<string, number>();
 
+  // Pre-scan: map each array_literal binding to its element refs. Used to
+  // propagate last-use across the array indirection (the array binding is
+  // pure metadata in the stack-lowerer — see lowerArrayLiteral — so its
+  // elements must remain live until the array's consumer, not until the
+  // array_literal binding itself).
+  const arrayElems = new Map<string, string[]>();
+  for (const b of bindings) {
+    if (b.value.kind === 'array_literal') {
+      arrayElems.set(b.name, [...b.value.elements]);
+    }
+  }
+
   for (let i = 0; i < bindings.length; i++) {
     const refs = collectRefs(bindings[i]!.value);
+    // If this binding is itself an array_literal, do NOT advance its
+    // elements' last-use to here — defer to the array's consumer.
+    if (bindings[i]!.value.kind === 'array_literal') {
+      continue;
+    }
     for (const ref of refs) {
       lastUse.set(ref, i);
+      const elems = arrayElems.get(ref);
+      if (elems) {
+        for (const e of elems) {
+          lastUse.set(e, i);
+        }
+      }
     }
   }
 
   return lastUse;
+}
+
+/**
+ * Collect every binding name defined anywhere in a binding sequence,
+ * recursing into nested if-branches and loop bodies. Used by lowerLoop to
+ * distinguish loop-internal (re)definitions from true outer-scope refs.
+ */
+function collectDeepBindingNames(bindings: ANFBinding[]): Set<string> {
+  const names = new Set<string>();
+  const walk = (bs: ANFBinding[]): void => {
+    for (const b of bs) {
+      names.add(b.name);
+      if (b.value.kind === 'if') {
+        walk(b.value.then);
+        walk(b.value.else);
+      } else if (b.value.kind === 'loop') {
+        walk(b.value.body);
+      }
+    }
+  };
+  walk(bindings);
+  return names;
 }
 
 function collectRefs(value: ANFValue): string[] {
@@ -256,6 +354,9 @@ function collectRefs(value: ANFValue): string[] {
       if (value.preimage) refs.push(value.preimage);
       break;
     case 'add_raw_output':
+      refs.push(value.satoshis, value.scriptBytes);
+      break;
+    case 'add_data_output':
       refs.push(value.satoshis, value.scriptBytes);
       break;
     case 'bin_op':
@@ -299,6 +400,14 @@ function collectRefs(value: ANFValue): string[] {
     case 'array_literal':
       refs.push(...value.elements);
       break;
+    case 'raw_script':
+      // No operand refs — the raw byte span has no SSA inputs visible to
+      // the optimizer. Stack effect is declared via in_arity / out_arity.
+      break;
+    default: {
+      const unknown = value as { kind: string };
+      throw new UnknownANFKindError(unknown.kind, 'stack-lower.collectRefs');
+    }
   }
 
   return refs;
@@ -326,6 +435,18 @@ class LoweringContext {
   private currentSourceLoc: { file: string; line: number; column: number } | undefined;
   /** Tracks the number of elements in array literal bindings for checkMultiSig. */
   private arrayLengths: Map<string, number> = new Map();
+  /** Tracks the element refs of array literal bindings for checkMultiSig. */
+  private arrayElements: Map<string, string[]> = new Map();
+  /** Tracks constant values by binding name (for compile-time constant extraction). */
+  private constValues: Map<string, bigint | string | boolean> = new Map();
+
+  /**
+   * Method params whose names collide with a mutable property. Maps the param
+   * name to the reserved stack-slot name its witness value lives under, so
+   * `lowerLoadParam` reads the param and not the same-named deserialized
+   * property slot (issue #130). Empty for the common no-collision case.
+   */
+  private readonly renamedParams: Map<string, string> = new Map();
 
   constructor(
     params: string[],
@@ -337,6 +458,28 @@ class LoweringContext {
     this.stackMap = new StackMap(params);
     this._properties = properties;
     this.privateMethods = privateMethods;
+
+    // Issue #130 (stack layer): a method param whose name collides with a
+    // MUTABLE property gets a duplicate stackMap slot once `deserialize_state`
+    // pushes that property under the same name. Name lookups resolve to the
+    // shallowest match (the deserialized property), so `load_param` would read
+    // the stale on-chain state instead of the witness value. Rename the
+    // colliding param's slot to a reserved, collision-proof name up front and
+    // remember the mapping so `lowerLoadParam` targets the real param slot.
+    // Only mutable properties are deserialized onto the stack, so readonly
+    // shadows (handled purely by ANF resolution) never enter this map, and
+    // non-colliding contracts get an empty map — byte-identical output.
+    const mutablePropNames = new Set(
+      properties.filter(p => !p.readonly).map(p => p.name),
+    );
+    for (const name of params) {
+      if (mutablePropNames.has(name)) {
+        const renamed = `__param_${name}`;
+        this.stackMap.renameAtDepth(this.stackMap.findDepth(name), renamed);
+        this.renamedParams.set(name, renamed);
+      }
+    }
+
     this.trackDepth();
   }
 
@@ -379,80 +522,111 @@ class LoweringContext {
    * Leaves stack:  [..., script, varint_bytes]
    *
    * Bitcoin varint format:
-   *   - len < 253:    1 byte (unsigned)
-   *   - len >= 253:   0xfd + 2 bytes unsigned LE
+   *   - len < 0xfd:        1 byte (len itself)
+   *   - len <= 0xffff:     0xfd + 2 bytes LE                (3 bytes)
+   *   - len <= 0xffffffff: 0xfe + 4 bytes LE                (5 bytes)
+   *   - otherwise:         0xff + 8 bytes LE                (9 bytes)
    *
-   * OP_NUM2BIN uses sign-magnitude encoding, so values 128-255 need 2 bytes
-   * to avoid the sign bit ambiguity. To produce a correct 1-byte unsigned
-   * varint, we use OP_NUM2BIN 2 to get a 2-byte sign-magnitude result and
-   * then SPLIT to extract only the low byte.
+   * We must support all four shapes; emitting a 3-byte varint for a script
+   * whose length exceeds 0xffff produces a truncated value that no longer
+   * matches what the BSV node uses for hashOutputs, breaking the
+   * state-continuation hash equality assertion downstream.
    *
-   * Similarly, for 2-byte unsigned LE varints, values >= 32768 would need
-   * 3 bytes in sign-magnitude. We use OP_NUM2BIN 4 and SPLIT to extract
-   * the low 2 bytes.
+   * OP_NUM2BIN uses sign-magnitude encoding so the high-bit values need an
+   * extra sign byte; we generate one extra byte and then SPLIT off the
+   * unsigned low bytes.
    */
   private emitVarintEncoding(): void {
     // Stack: [..., script, len]
-    this.emitOp({ op: 'dup' }); // [script, len, len]
-    this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: 253n }); // [script, len, len, 253]
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_LESSTHAN' }); // [script, len, isSmall]
-    this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null);
 
+    // [..., len] -> [..., low_n_bytes]: NUM2BIN(n+1) then SPLIT(n) DROP.
+    const emitNumToLowBytes = (nBytes: bigint): void => {
+      this.emitOp({ op: 'push', value: nBytes + 1n });
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.stackMap.push(null);
+      this.emitOp({ op: 'push', value: nBytes });
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.stackMap.push(null);
+      this.stackMap.push(null);
+      this.emitOp({ op: 'drop' });
+      this.stackMap.pop();
+    };
+
+    // [..., script, low_bytes] -> [..., script, prefix||low_bytes].
+    const emitPrefix = (prefixByte: number): void => {
+      this.emitOp({ op: 'push', value: new Uint8Array([prefixByte]) });
+      this.stackMap.push(null);
+      this.emitOp({ op: 'swap' });
+      this.stackMap.swap();
+      this.stackMap.pop();
+      this.stackMap.pop();
+      this.emitOp({ op: 'opcode', code: 'OP_CAT' });
+      this.stackMap.push(null);
+    };
+
+    // IF len < 253: 1-byte varint.
+    this.emitOp({ op: 'dup' });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'push', value: 253n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_LESSTHAN' });
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_IF' });
-    this.stackMap.pop(); // pop condition
-
-    // Then: 1-byte varint (len < 253)
-    // Use NUM2BIN 2 to avoid sign-magnitude issue for values 128-252,
-    // then take only the first (low) byte via SPLIT.
-    this.emitOp({ op: 'push', value: 2n });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' }); // [script, len_2bytes]
     this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: 1n }); // [script, len_2bytes, 1]
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [script, lowByte, highByte]
-    this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null); // lowByte
-    this.stackMap.push(null); // highByte
-    this.emitOp({ op: 'drop' }); // [script, lowByte]
-    this.stackMap.pop();
-
+    const smAt1Byte = this.stackMap.clone();
+    emitNumToLowBytes(1n);
     this.emitOp({ op: 'opcode', code: 'OP_ELSE' });
+    this.stackMap = smAt1Byte.clone();
 
-    // Else: 0xfd + 2-byte LE varint (len >= 253)
-    // Use NUM2BIN 4 to avoid sign-magnitude issue for values >= 32768,
-    // then take only the first 2 (low) bytes via SPLIT.
-    this.emitOp({ op: 'push', value: 4n });
+    // ELSE-IF len <= 0xffff: 0xfd + 2-byte LE.
+    this.emitOp({ op: 'dup' });
     this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' }); // [script, len_4bytes]
+    this.emitOp({ op: 'push', value: 0x10000n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_LESSTHAN' });
     this.stackMap.pop();
     this.stackMap.pop();
     this.stackMap.push(null);
-    this.emitOp({ op: 'push', value: 2n }); // [script, len_4bytes, 2]
-    this.stackMap.push(null);
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [script, low2bytes, high2bytes]
+    this.emitOp({ op: 'opcode', code: 'OP_IF' });
     this.stackMap.pop();
-    this.stackMap.pop();
-    this.stackMap.push(null); // low2bytes
-    this.stackMap.push(null); // high2bytes
-    this.emitOp({ op: 'drop' }); // [script, low2bytes]
-    this.stackMap.pop();
-    this.emitOp({ op: 'push', value: new Uint8Array([0xfd]) });
-    this.stackMap.push(null);
-    this.emitOp({ op: 'swap' });
-    this.stackMap.swap();
-    this.stackMap.pop();
-    this.stackMap.pop();
-    this.emitOp({ op: 'opcode', code: 'OP_CAT' });
-    this.stackMap.push(null);
+    const smAt3Byte = this.stackMap.clone();
+    emitNumToLowBytes(2n);
+    emitPrefix(0xfd);
+    this.emitOp({ op: 'opcode', code: 'OP_ELSE' });
+    this.stackMap = smAt3Byte.clone();
 
+    // ELSE-IF len <= 0xffffffff: 0xfe + 4-byte LE.
+    this.emitOp({ op: 'dup' });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'push', value: 0x100000000n });
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_LESSTHAN' });
+    this.stackMap.pop();
+    this.stackMap.pop();
+    this.stackMap.push(null);
+    this.emitOp({ op: 'opcode', code: 'OP_IF' });
+    this.stackMap.pop();
+    const smAt5Byte = this.stackMap.clone();
+    emitNumToLowBytes(4n);
+    emitPrefix(0xfe);
+    this.emitOp({ op: 'opcode', code: 'OP_ELSE' });
+    this.stackMap = smAt5Byte.clone();
+
+    // ELSE: 0xff + 8-byte LE. (Practically unreachable on BSV but kept for
+    // spec completeness so we never silently truncate.)
+    emitNumToLowBytes(8n);
+    emitPrefix(0xff);
+
+    this.emitOp({ op: 'opcode', code: 'OP_ENDIF' });
+    this.emitOp({ op: 'opcode', code: 'OP_ENDIF' });
     this.emitOp({ op: 'opcode', code: 'OP_ENDIF' });
     // --- Stack: [..., script, varint] ---
   }
@@ -787,6 +961,57 @@ class LoweringContext {
   }
 
   /**
+   * Drain branch-private residue from below TOS at the end of a branch body,
+   * so that both branches converge to a layout the parent stack model can
+   * faithfully describe before OP_ENDIF (issue #36).
+   *
+   * A slot is residue when its name is NOT in `preIfNames` (the snapshot of
+   * the parent's named slots taken before the branch ran). This catches both:
+   *   1. Anonymous slots (`null`-named) — pushed by intrinsics like `substr`,
+   *      which use OP_SPLIT and leave a residue half on the stack.
+   *   2. Named branch-local slots — bindings introduced inside the branch
+   *      that lingered past their last-use (e.g. dead-code load_const
+   *      intermediates the constant-folder didn't eliminate).
+   *
+   * Slots whose name was already in `preIfNames` are kept — including
+   * duplicates created by reassigning an outer-scope local from inside the
+   * branch (those stale duplicates are cleaned up by the post-ENDIF logic in
+   * `lowerIf`, not here). The TOS slot is also kept regardless: it's the
+   * branch's result value or the latest reassignment.
+   *
+   * Process deepest-first so removing a deeper slot doesn't shift a shallower
+   * slot's depth-from-top.
+   */
+  drainBranchPrivateResidue(preIfNames: Set<string>): void {
+    const drainDepths: number[] = [];
+    for (let d = 1; d < this.stackMap.depth; d++) {
+      const name = this.stackMap.peekAtDepth(d);
+      if (name === null) {
+        drainDepths.push(d);
+      } else if (!preIfNames.has(name)) {
+        drainDepths.push(d);
+      }
+    }
+    if (drainDepths.length === 0) return;
+    drainDepths.sort((a, b) => b - a);
+    for (const depth of drainDepths) {
+      if (depth === 1) {
+        this.emitOp({ op: 'nip' });
+        this.stackMap.removeAtDepth(1);
+      } else {
+        this.emitOp({ op: 'push', value: BigInt(depth) });
+        this.stackMap.push(null);
+        this.emitOp({ op: 'roll', depth });
+        this.stackMap.pop();
+        const rolled = this.stackMap.removeAtDepth(depth);
+        this.stackMap.push(rolled);
+        this.emitOp({ op: 'drop' });
+        this.stackMap.pop();
+      }
+    }
+  }
+
+  /**
    * Lower a sequence of ANF bindings.
    *
    * When `terminalAssert` is true, the final assert in the sequence omits
@@ -875,7 +1100,7 @@ class LoweringContext {
         this.lowerIf(name, value.cond, value.then, value.else, bindingIndex, lastUses);
         break;
       case 'loop':
-        this.lowerLoop(name, value.count, value.body, value.iterVar);
+        this.lowerLoop(name, value.count, value.body, value.iterVar, value.start, value.step, bindingIndex, lastUses);
         break;
       case 'assert':
         this.lowerAssert(value.value, bindingIndex, lastUses);
@@ -887,7 +1112,7 @@ class LoweringContext {
         this.lowerGetStateScript(name);
         break;
       case 'check_preimage':
-        this.lowerCheckPreimage(name, value.preimage, bindingIndex, lastUses);
+        this.lowerCheckPreimage(name, value.preimage, value.sighashFlag, bindingIndex, lastUses);
         break;
       case 'deserialize_state':
         this.lowerDeserializeState(value.preimage, bindingIndex, lastUses);
@@ -898,16 +1123,93 @@ class LoweringContext {
       case 'add_raw_output':
         this.lowerAddRawOutput(name, value.satoshis, value.scriptBytes, bindingIndex, lastUses);
         break;
-      case 'array_literal':
-        this.lowerArrayLiteral(name, value.elements, bindingIndex, lastUses);
+      case 'add_data_output':
+        // Wire shape matches add_raw_output: amount(8LE) + varint(scriptLen) + scriptBytes.
+        // The distinction lives in the continuation-hash composition (ANF lowering).
+        this.lowerAddRawOutput(name, value.satoshis, value.scriptBytes, bindingIndex, lastUses);
         break;
+      case 'array_literal':
+        this.lowerArrayLiteral(name, value.elements);
+        break;
+      case 'raw_script':
+        this.lowerRawScript(name, value.bytes, value.in_arity, value.out_arity);
+        break;
+      default: {
+        const unknown = value as { kind: string };
+        throw new UnknownANFKindError(unknown.kind, 'stack-lower.lowerBinding');
+      }
     }
+  }
+
+  /**
+   * Lower a raw_script ANF node to a single opaque raw_bytes StackOp.
+   *
+   * The bytes pass through verbatim — the emit pass writes them as-is,
+   * and the peephole optimizer must not bridge across them. Stack-tracker
+   * bookkeeping consumes `in_arity` items and pushes `out_arity` items
+   * named after the binding so downstream PICK/ROLL/DROP refer to the
+   * correct logical slot.
+   */
+  private lowerRawScript(
+    bindingName: string,
+    bytesHex: string,
+    inArity: number,
+    outArity: number,
+  ): void {
+    if (this.stackMap.depth < inArity) {
+      throw new Error(
+        `raw_script binding '${bindingName}' requires ${inArity} stack items but only ${this.stackMap.depth} are present`,
+      );
+    }
+    const bytes = decodeHexBytes(bytesHex);
+    this.emitOp({ op: 'raw_bytes', bytes, in_arity: inArity, out_arity: outArity });
+    for (let i = 0; i < inArity; i++) {
+      this.stackMap.pop();
+    }
+    for (let i = 0; i < outArity; i++) {
+      const slotName = outArity === 1 ? bindingName : `${bindingName}.${i}`;
+      this.stackMap.push(slotName);
+    }
+    this.trackDepth();
   }
 
   /** Whether `ref` is used after `currentIndex`. */
   private isLastUse(ref: string, currentIndex: number, lastUses: Map<string, number>): boolean {
     const last = lastUses.get(ref);
     return last === undefined || last <= currentIndex;
+  }
+
+  /**
+   * Consume-vs-copy decision for one operand of a multi-operand ANF value.
+   *
+   * `operands` is the FULL operand-ref list of the value (including `ref`
+   * itself). The load may consume (ROLL / move) the ref only when this
+   * binding is the ref's last use AND the ref occurs exactly once in the
+   * operand list. A ref that is read at more than one operand position of
+   * the same value must be copied (PICK / DUP) at EVERY position: each
+   * operand position needs its own stack slot, and a consume-mode load of a
+   * ref that is already on top of the stack is a no-op (see `bringToTop`),
+   * so two consume-mode loads of the same ref would leave a single slot for
+   * an opcode that pops one item per operand (e.g. `t := x + x` underflowing
+   * OP_ADD), or — when the ref sits below other live slots — silently pair
+   * the opcode with the wrong slot. The original value then simply stays on
+   * the stack, exactly like any ref whose last use is a later binding.
+   *
+   * Unreachable from the frontend (pass 04 gives every operand a fresh
+   * temp); reachable via `compileFromANF` / CLI `--ir` hand-written ANF.
+   */
+  private operandConsume(
+    ref: string,
+    operands: readonly string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): boolean {
+    if (!this.isLastUse(ref, bindingIndex, lastUses)) return false;
+    let occurrences = 0;
+    for (const o of operands) {
+      if (o === ref) occurrences++;
+    }
+    return occurrences <= 1;
   }
 
   // -----------------------------------------------------------------------
@@ -920,19 +1222,27 @@ class LoweringContext {
     bindingIndex: number,
     lastUses: Map<string, number>,
   ): void {
-    // The parameter is already on the stack under its original name.
-    // We alias it by bringing it to the top.
-    if (this.stackMap.has(paramName)) {
+    // The parameter is already on the stack under its original name — or, for
+    // a param that shadows a mutable property, under a reserved renamed slot
+    // (issue #130) so it is not confused with the deserialized property slot.
+    const slotName = this.renamedParams.get(paramName) ?? paramName;
+    if (this.stackMap.has(slotName)) {
       const isLast = this.isLastUse(paramName, bindingIndex, lastUses);
-      this.bringToTop(paramName, isLast);
+      this.bringToTop(slotName, isLast);
       // Rename the top-of-stack entry to the binding name
       this.stackMap.pop();
       this.stackMap.push(bindingName);
     } else {
-      // Parameter not found - should not happen in well-formed ANF.
-      // Emit a push of zero as a fallback.
-      this.emitOp({ op: 'push', value: 0n });
-      this.stackMap.push(bindingName);
+      // Parameter no longer on the stack — a compiler invariant violation
+      // (historically caused by unrolled loops consuming outer refs; see
+      // lowerLoop). Silently emitting OP_0 here produced scripts that
+      // compiled, passed the env-based interpreter, and then failed on
+      // chain — fail loudly instead.
+      throw new Error(
+        `Stack lowering: method parameter '${paramName}' is not on the stack ` +
+          `at a post-consumption reference (stack: [${this.stackMap.debugSlots()}]). ` +
+          `Refusing to emit a silent OP_0 placeholder.`,
+      );
     }
   }
 
@@ -951,10 +1261,33 @@ class LoweringContext {
     } else {
       // Property value will be provided at deployment time; emit a placeholder.
       // The emitter records byte offsets so the SDK can splice in real values.
-      const paramIndex = this._properties.findIndex(p => p.name === propName);
+      // Find the constructor param index: count only properties without initializers,
+      // since initialized properties are excluded from the constructor.
+      const ctorProps = this._properties.filter(p => p.initialValue === undefined);
+      const paramIndex = ctorProps.findIndex(p => p.name === propName);
+      // #119 tail (H1): a property that reaches the placeholder fallback with
+      // no matching constructor slot (paramIndex === -1) has no deploy-time
+      // bytes of its own. The previous behaviour coerced it onto slot 0,
+      // silently splicing an UNRELATED constructor argument's placeholder into
+      // the locking script — a silent-wrong-code path. Fail loudly instead.
+      // (A real constructor-param property — readonly or a mutable state field
+      // whose initial value is spliced at deploy — has paramIndex >= 0 and is
+      // unaffected.)
+      if (paramIndex < 0) {
+        const loc = this.currentSourceLoc
+          ? ` at ${this.currentSourceLoc.file}:${this.currentSourceLoc.line}:${this.currentSourceLoc.column}`
+          : '';
+        throw new Error(
+          `Stack lowering: property '${propName}'${loc} is neither on the stack, ` +
+            `initialized, nor a constructor parameter, so it has no deploy-time ` +
+            `slot. Refusing to emit a placeholder for an unrelated constructor ` +
+            `argument (slot 0). Known constructor-param properties: ` +
+            `[${ctorProps.map(p => p.name).join(', ')}].`,
+        );
+      }
       this.emitOp({
         op: 'placeholder',
-        paramIndex: paramIndex >= 0 ? paramIndex : 0,
+        paramIndex,
         paramName: propName,
       });
     }
@@ -970,6 +1303,18 @@ class LoweringContext {
     // Handle @ref: aliases (ANF variable aliasing)
     if (typeof value === 'string' && value.startsWith('@ref:')) {
       const refName = value.slice(5);
+      // Special case: aliasing an array_literal (metadata-only binding,
+      // not present in the stack-map). Copy the array metadata under the
+      // new binding name and emit no stack moves.
+      const refElems = this.arrayElements.get(refName);
+      if (refElems !== undefined) {
+        this.arrayElements.set(bindingName, [...refElems]);
+        const refLen = this.arrayLengths.get(refName);
+        if (refLen !== undefined) {
+          this.arrayLengths.set(bindingName, refLen);
+        }
+        return;
+      }
       if (this.stackMap.has(refName)) {
         // Only consume (ROLL) if the ref target is a local binding in the
         // current scope. Outer-scope refs must be copied (PICK) so that the
@@ -981,9 +1326,14 @@ class LoweringContext {
         this.stackMap.pop();
         this.stackMap.push(bindingName);
       } else {
-        // Referenced value not on stack -- push a placeholder
-        this.emitOp({ op: 'push', value: 0n });
-        this.stackMap.push(bindingName);
+        // Referenced value no longer on the stack — a compiler invariant
+        // violation (see lowerLoadParam for the loop-consumption history).
+        // Fail loudly instead of silently emitting OP_0.
+        throw new Error(
+          `Stack lowering: value '${refName}' referenced by '${bindingName}' is not ` +
+            `on the stack (stack: [${this.stackMap.debugSlots()}]). ` +
+            `Refusing to emit a silent OP_0 placeholder.`,
+        );
       }
       return;
     }
@@ -997,6 +1347,13 @@ class LoweringContext {
     }
     this.pushValue(value);
     this.stackMap.push(bindingName);
+    // Track constant values for compile-time extraction (e.g., Merkle depth)
+    this.constValues.set(bindingName, value);
+  }
+
+  /** Look up a compile-time constant value by binding name. Returns null if not a constant. */
+  private getConstantValue(bindingName: string): bigint | string | boolean | null {
+    return this.constValues.get(bindingName) ?? null;
   }
 
   private pushValue(value: string | bigint | boolean): void {
@@ -1020,12 +1377,12 @@ class LoweringContext {
     resultType?: string,
   ): void {
     // Get left operand to stack first
-    const leftIsLast = this.isLastUse(left, bindingIndex, lastUses);
-    this.bringToTop(left, leftIsLast);
+    const leftConsume = this.operandConsume(left, [left, right], bindingIndex, lastUses);
+    this.bringToTop(left, leftConsume);
 
     // Get right operand to stack
-    const rightIsLast = this.isLastUse(right, bindingIndex, lastUses);
-    this.bringToTop(right, rightIsLast);
+    const rightConsume = this.operandConsume(right, [left, right], bindingIndex, lastUses);
+    this.bringToTop(right, rightConsume);
 
     // Pop both operands (the opcode consumes them)
     this.stackMap.pop();
@@ -1185,6 +1542,69 @@ class LoweringContext {
       return;
     }
 
+    // P-256 and P-384 EC builtins
+    if (func === 'p256Add' || func === 'p256Mul' || func === 'p256MulGen' ||
+        func === 'p256Negate' || func === 'p256OnCurve' || func === 'p256EncodeCompressed' ||
+        func === 'p384Add' || func === 'p384Mul' || func === 'p384MulGen' ||
+        func === 'p384Negate' || func === 'p384OnCurve' || func === 'p384EncodeCompressed') {
+      this.lowerNistEcBuiltin(bindingName, func, args, bindingIndex, lastUses);
+      return;
+    }
+    if (func === 'verifyECDSA_P256' || func === 'verifyECDSA_P384') {
+      this.lowerVerifyECDSA(bindingName, func, args, bindingIndex, lastUses);
+      return;
+    }
+
+    // BN254 builtins
+    if (func === 'bn254FieldAdd' || func === 'bn254FieldSub' ||
+        func === 'bn254FieldMul' || func === 'bn254FieldInv' ||
+        func === 'bn254FieldNeg' || func === 'bn254G1Add' ||
+        func === 'bn254G1ScalarMul' || func === 'bn254G1Negate' ||
+        func === 'bn254G1OnCurve') {
+      this.lowerBN254Builtin(bindingName, func, args, bindingIndex, lastUses);
+      return;
+    }
+
+    // Baby Bear field arithmetic builtins
+    if (func === 'bbFieldAdd' || func === 'bbFieldSub' ||
+        func === 'bbFieldMul' || func === 'bbFieldInv' ||
+        func === 'bbExt4Mul0' || func === 'bbExt4Mul1' ||
+        func === 'bbExt4Mul2' || func === 'bbExt4Mul3' ||
+        func === 'bbExt4Inv0' || func === 'bbExt4Inv1' ||
+        func === 'bbExt4Inv2' || func === 'bbExt4Inv3') {
+      this.lowerBBFieldBuiltin(bindingName, func, args, bindingIndex, lastUses);
+      return;
+    }
+
+    // KoalaBear field arithmetic builtins
+    if (func === 'kbFieldAdd' || func === 'kbFieldSub' ||
+        func === 'kbFieldMul' || func === 'kbFieldInv' ||
+        func === 'kbExt4Mul0' || func === 'kbExt4Mul1' ||
+        func === 'kbExt4Mul2' || func === 'kbExt4Mul3' ||
+        func === 'kbExt4Inv0' || func === 'kbExt4Inv1' ||
+        func === 'kbExt4Inv2' || func === 'kbExt4Inv3') {
+      this.lowerKBFieldBuiltin(bindingName, func, args, bindingIndex, lastUses);
+      return;
+    }
+
+    // KoalaBear Poseidon2 builtins
+    if (func === 'poseidon2KBPermute' || func === 'poseidon2KBCompress') {
+      this.lowerKBPoseidon2Builtin(bindingName, func, args, bindingIndex, lastUses);
+      return;
+    }
+
+    // KoalaBear Poseidon2 Merkle proof verification
+    if (func === 'poseidon2MerkleRoot') {
+      this.lowerPoseidon2MerkleRoot(bindingName, args, bindingIndex, lastUses);
+      return;
+    }
+
+    // Merkle proof verification builtins
+    if (func === 'merkleRootSha256' || func === 'merkleRootHash256') {
+      this.lowerMerkleRoot(bindingName, func, args, bindingIndex, lastUses);
+      return;
+    }
+
     if (func === 'reverseBytes') {
       this.lowerReverseBytes(bindingName, args, bindingIndex, lastUses);
       return;
@@ -1291,8 +1711,8 @@ class LoweringContext {
 
     // General builtin call: push args in order, then emit opcode(s)
     for (const arg of args) {
-      const isLast = this.isLastUse(arg, bindingIndex, lastUses);
-      this.bringToTop(arg, isLast);
+      const consume = this.operandConsume(arg, args, bindingIndex, lastUses);
+      this.bringToTop(arg, consume);
     }
 
     // Pop all args
@@ -1327,44 +1747,45 @@ class LoweringContext {
   }
 
   /**
-   * Lower an array literal to stack. Each element is brought to the top
-   * in order. The binding name represents the array as a whole on the stack.
-   * The element count is recorded in `arrayLengths` so that consumers
-   * (like checkMultiSig) can emit the count push.
+   * Lower an array literal — a metadata-only operation.
+   *
+   * Array literals in Rúnar today only feed into `checkMultiSig`. Pre-laying
+   * the elements onto the runtime stack here would desync the stack-map from
+   * the runtime stack (the map can only model one slot per binding, but an
+   * array binding spans N runtime slots). Instead we record the element refs
+   * and the length and emit nothing — `lowerCheckMultiSig` will pull each
+   * element to the top at the use site, producing a layout the stack-map can
+   * faithfully describe.
+   *
+   * NOTE: this means `bindingName` never appears in the stack-map. Last-use
+   * analysis for the array's element refs is patched in `computeLastUses` so
+   * the elements stay live past this binding through to `checkMultiSig`.
    */
   private lowerArrayLiteral(
     bindingName: string,
     elements: string[],
-    bindingIndex: number,
-    lastUses: Map<string, number>,
   ): void {
-    // Bring each element to the top in order
-    for (const elem of elements) {
-      const isLast = this.isLastUse(elem, bindingIndex, lastUses);
-      this.bringToTop(elem, isLast);
-    }
-
-    // Pop all elements from the stack map (they're consumed into the array)
-    for (let i = 0; i < elements.length; i++) {
-      this.stackMap.pop();
-    }
-
-    // Push the array binding name — represents the N elements now on stack
-    this.stackMap.push(bindingName);
-    // Record the array length for checkMultiSig
     this.arrayLengths.set(bindingName, elements.length);
-    this.trackDepth();
+    this.arrayElements.set(bindingName, [...elements]);
   }
 
   /**
-   * Lower checkMultiSig([sig1, sig2, ...], [pk1, pk2, ...]) to Bitcoin Script.
+   * Lower checkMultiSig([sig1, ..., sigN], [pk1, ..., pkM]) to Bitcoin Script.
    *
-   * OP_CHECKMULTISIG expects the stack layout:
-   *   OP_0 <sig1> <sig2> ... <nSigs> <pk1> <pk2> ... <nPKs> OP_CHECKMULTISIG
+   * OP_CHECKMULTISIG expects the stack (bottom -> top):
+   *   <dummy=OP_0> <sig1> <sig2> ... <sigN> <N> <pk1> <pk2> ... <pkM> <M>
    *
-   * The args[0] is the sigs array binding, args[1] is the pubkeys array binding.
-   * Each was lowered as an array_literal, so the individual elements are already
-   * on the stack. We need to insert the OP_0 dummy, counts, and the opcode.
+   * OP_CHECKMULTISIG then pops M, then M pubkeys (top first => pkM..pk1),
+   * then N, then N sigs (top first => sigN..sig1), then the dummy, then
+   * pushes the result.
+   *
+   * `args[0]` and `args[1]` are bindings produced by `array_literal`. Those
+   * bindings are NOT physical stack slots (see `lowerArrayLiteral`); their
+   * element refs live on the stack-map as individual named bindings. We pull
+   * each element to TOS via `bringToTop` in the order required by the layout
+   * above. Last-use for each element is determined relative to THIS binding
+   * (the checkMultiSig site) — `computeLastUses` patches lastUses for array
+   * elements so they survive past their owning `array_literal` binding.
    */
   private lowerCheckMultiSig(
     bindingName: string,
@@ -1378,32 +1799,46 @@ class LoweringContext {
 
     const sigsRef = args[0]!;
     const pksRef = args[1]!;
-    const nSigs = this.arrayLengths.get(sigsRef) ?? 1;
-    const nPKs = this.arrayLengths.get(pksRef) ?? 1;
+    const sigElems = this.arrayElements.get(sigsRef);
+    const pkElems = this.arrayElements.get(pksRef);
+    if (!sigElems || !pkElems) {
+      throw new Error(
+        `checkMultiSig: array_literal metadata missing (sigs='${sigsRef}', pks='${pksRef}')`,
+      );
+    }
 
-    // Push OP_0 dummy (required by Bitcoin's OP_CHECKMULTISIG bug)
+    // Dummy OP_0 — required by the historical OP_CHECKMULTISIG off-by-one
+    // (consumed from below the sigs).
     this.emitOp({ op: 'push', value: 0n });
     this.stackMap.push(null);
 
-    // Bring sigs array to top (the individual elements are treated as one item)
-    const sigsLast = this.isLastUse(sigsRef, bindingIndex, lastUses);
-    this.bringToTop(sigsRef, sigsLast);
+    // A ref repeated across the combined element list (e.g. the same pubkey
+    // twice) must be copied at every position — see operandConsume.
+    const msigOperands = [...sigElems, ...pkElems];
 
-    // Push nSigs count
-    this.emitOp({ op: 'push', value: BigInt(nSigs) });
+    // Bring each sig element to TOS in declaration order (sig1, sig2, ...).
+    for (const sig of sigElems) {
+      const consume = this.operandConsume(sig, msigOperands, bindingIndex, lastUses);
+      this.bringToTop(sig, consume);
+    }
+
+    // Push nSigs.
+    this.emitOp({ op: 'push', value: BigInt(sigElems.length) });
     this.stackMap.push(null);
 
-    // Bring pubkeys array to top
-    const pksLast = this.isLastUse(pksRef, bindingIndex, lastUses);
-    this.bringToTop(pksRef, pksLast);
+    // Bring each pubkey element to TOS in declaration order (pk1, pk2, ...).
+    for (const pk of pkElems) {
+      const consume = this.operandConsume(pk, msigOperands, bindingIndex, lastUses);
+      this.bringToTop(pk, consume);
+    }
 
-    // Push nPKs count
-    this.emitOp({ op: 'push', value: BigInt(nPKs) });
+    // Push nPKs.
+    this.emitOp({ op: 'push', value: BigInt(pkElems.length) });
     this.stackMap.push(null);
 
-    // Pop everything: OP_0 + sigs + nSigs + pks + nPKs = 2 + nSigs + nPKs + 2 items
-    // But on our stack map they're: null(OP_0), sigsRef, null(nSigs), pksRef, null(nPKs)
-    for (let i = 0; i < 5; i++) {
+    // OP_CHECKMULTISIG consumes: dummy + N sigs + nSigs + M pks + nPKs.
+    const consumed = 1 + sigElems.length + 1 + pkElems.length + 1;
+    for (let i = 0; i < consumed; i++) {
       this.stackMap.pop();
     }
 
@@ -1468,8 +1903,8 @@ class LoweringContext {
       if (i < method.params.length) {
         const arg = args[i]!;
         const paramName = method.params[i]!.name;
-        const isLast = this.isLastUse(arg, bindingIndex, lastUses);
-        this.bringToTop(arg, isLast);
+        const consume = this.operandConsume(arg, args, bindingIndex, lastUses);
+        this.bringToTop(arg, consume);
         this.stackMap.pop();
 
         // If paramName already exists on the stack, temporarily rename
@@ -1538,6 +1973,8 @@ class LoweringContext {
     thenCtx._insideBranch = true;
     thenCtx.lowerBindings(thenBindings, terminalAssert);
 
+    thenCtx.drainBranchPrivateResidue(preIfNames);
+
     if (terminalAssert && thenCtx.stackMap.depth > 1) {
       const excess = thenCtx.stackMap.depth - 1;
       for (let i = 0; i < excess; i++) {
@@ -1552,6 +1989,8 @@ class LoweringContext {
     elseCtx.outerProtectedRefs = protectedRefs;
     elseCtx._insideBranch = true;
     elseCtx.lowerBindings(elseBindings, terminalAssert);
+
+    elseCtx.drainBranchPrivateResidue(preIfNames);
 
     if (terminalAssert && elseCtx.stackMap.depth > 1) {
       const excess = elseCtx.stackMap.depth - 1;
@@ -1633,16 +2072,25 @@ class LoweringContext {
       }
     }
 
-    // Phase 3: single depth-balance check after ALL drops.
-    // Push placeholder only if one branch is still deeper than the other.
-    if (thenCtx.stackMap.depth > elseCtx.stackMap.depth) {
-      // When the then-branch reassigned a local variable (if-without-else),
-      // push a COPY of that variable in the else-branch instead of a generic
-      // placeholder. This ensures the else-branch preserves the correct value
-      // when post-ENDIF stale removal (NIP) removes the old entry.
-      const thenTop = thenCtx.stackMap.peekAtDepth(0);
-      if (elseBindings.length === 0 && thenTop && elseCtx.stackMap.has(thenTop)) {
-        const varDepth = elseCtx.stackMap.findDepth(thenTop);
+    // Phase 3: depth-balance reconciliation after ALL drops.
+    //
+    // Compensate the FULL depth difference between the branches — NOT just a
+    // single item. A conditional write of N state fields leaves N result
+    // values on the then-branch, so the (empty) else-branch must preserve N
+    // old values. Issue #99 Bug 1: the previous single-shot check only
+    // balanced a 1-item difference, leaving N>=2 conditional writes
+    // imbalanced by (N-1) and the update branch unspendable.
+    //
+    // For each missing slot, when the then-branch reassigned a variable
+    // (if-without-else), push a COPY of that same-named (old) value in the
+    // else-branch so the preserved value is correct; otherwise push a generic
+    // placeholder. Process the then-branch's result slots from deepest to
+    // top so the preserved copies land in the same order.
+    while (thenCtx.stackMap.depth > elseCtx.stackMap.depth) {
+      const resultDepth = thenCtx.stackMap.depth - elseCtx.stackMap.depth - 1;
+      const thenName = thenCtx.stackMap.peekAtDepth(resultDepth);
+      if (elseBindings.length === 0 && thenName && elseCtx.stackMap.has(thenName)) {
+        const varDepth = elseCtx.stackMap.findDepth(thenName);
         if (varDepth === 0) {
           elseCtx.emitOp({ op: 'dup' });
         } else {
@@ -1651,14 +2099,32 @@ class LoweringContext {
           elseCtx.emitOp({ op: 'pick', depth: varDepth });
           elseCtx.stackMap.pop();
         }
-        elseCtx.stackMap.push(thenTop);
+        elseCtx.stackMap.push(thenName);
       } else {
         elseCtx.emitOp({ op: 'push', value: new Uint8Array(0) });
         elseCtx.stackMap.push(null);
       }
-    } else if (elseCtx.stackMap.depth > thenCtx.stackMap.depth) {
+    }
+    while (elseCtx.stackMap.depth > thenCtx.stackMap.depth) {
       thenCtx.emitOp({ op: 'push', value: new Uint8Array(0) });
       thenCtx.stackMap.push(null);
+    }
+
+    // Layer B — branch-balance invariant (#99 Bug 1 guard).
+    // After reconciliation the two arms of an OP_IF/OP_ELSE MUST leave the
+    // stack at identical depth; otherwise the code after OP_ENDIF (which is
+    // generated against a single assumed depth) is only correct for whichever
+    // branch the spender does not take, producing a silently-unspendable
+    // script. The Bitcoin Script VM does not enforce branch balance, so this
+    // check is the compiler's responsibility. A failure here is a codegen bug,
+    // never a user error — fail loudly at compile time instead of on-chain.
+    if (thenCtx.stackMap.depth !== elseCtx.stackMap.depth) {
+      throw new Error(
+        `Internal codegen error: conditional in method emitted stack-imbalanced ` +
+        `branches (then depth ${thenCtx.stackMap.depth} != else depth ${elseCtx.stackMap.depth}). ` +
+        `This would produce an unspendable script (see GitHub issue #99). ` +
+        `binding='${bindingName}'.`,
+      );
     }
 
     const thenOps = thenCtx.result.ops;
@@ -1681,7 +2147,38 @@ class LoweringContext {
     }
 
     // The if expression may produce a result value on top.
-    if (thenCtx.stackMap.depth > this.stackMap.depth) {
+    if (elseBindings.length === 0 &&
+        thenCtx.stackMap.depth > this.stackMap.depth &&
+        thenCtx.stackMap.depth - this.stackMap.depth >= 2) {
+      // #99 Bug 1: a conditional write of N>=2 state fields leaves N result
+      // values on top (new values if taken, preserved old values if skipped).
+      // Record the N results in their on-stack order, then physically remove
+      // the N stale old property values that now sit beneath the result block.
+      const resultCount = thenCtx.stackMap.depth - this.stackMap.depth;
+      for (let i = resultCount - 1; i >= 0; i--) {
+        this.stackMap.push(thenCtx.stackMap.peekAtDepth(i) ?? bindingName);
+      }
+      const resultNames: (string | null)[] = [];
+      for (let i = 0; i < resultCount; i++) {
+        resultNames.push(this.stackMap.peekAtDepth(i));
+      }
+      for (const name of resultNames) {
+        if (name === null) continue;
+        for (let d = resultCount; d < this.stackMap.depth; d++) {
+          if (this.stackMap.peekAtDepth(d) === name) {
+            this.emitOp({ op: 'push', value: BigInt(d) });
+            this.stackMap.push(null);
+            this.emitOp({ op: 'roll', depth: d + 1 });
+            this.stackMap.pop();
+            const rolled = this.stackMap.removeAtDepth(d);
+            this.stackMap.push(rolled);
+            this.emitOp({ op: 'drop' });
+            this.stackMap.pop();
+            break;
+          }
+        }
+      }
+    } else if (thenCtx.stackMap.depth > this.stackMap.depth) {
       // Branches increased depth — check if both updated the same property.
       const thenTop = thenCtx.stackMap.peekAtDepth(0);
       const elseTop = elseCtx.stackMap.depth > 0 ? elseCtx.stackMap.peekAtDepth(0) : null;
@@ -1763,23 +2260,30 @@ class LoweringContext {
     count: number,
     body: ANFBinding[],
     _iterVar: string,
+    start: bigint,
+    step: 1 | -1,
+    loopBindingIndex?: number,
+    enclosingLastUses?: Map<string, number>,
   ): void {
-    // Collect outer-scope names referenced in the loop body.
-    // These must not be consumed in non-final iterations.
+    // Names (re)defined anywhere inside the loop body, nested branches
+    // included. A name the body itself binds is NOT an outer ref —
+    // reassigned locals (e.g. `off = off + ...` inside an if) flow through
+    // lowerIf's branch-reassignment reconciliation, not through protection
+    // here.
+    const deepBodyBindingNames = collectDeepBindingNames(body);
     const bodyBindingNames = new Set(body.map(b => b.name));
+
+    // Collect ALL outer-scope refs used anywhere in the body — including
+    // refs that only occur inside nested if-branches (collectRefs recurses).
+    // The previous top-level-only scan missed nested references: a const
+    // defined before the loop and referenced only inside an if-branch was
+    // consumed by the first iteration, making iteration 2 fail with
+    // "Value 'X' not found on stack".
     const outerRefs = new Set<string>();
     for (const b of body) {
-      if (b.value.kind === 'load_param' && b.value.name !== _iterVar) {
-        outerRefs.add(b.value.name);
-      }
-      // Also protect @ref: targets from outer scope (not redefined in body)
-      if (b.value.kind === 'load_const') {
-        const v = b.value.value;
-        if (typeof v === 'string' && v.startsWith('@ref:')) {
-          const refName = v.slice(5);
-          if (!bodyBindingNames.has(refName)) {
-            outerRefs.add(refName);
-          }
+      for (const ref of collectRefs(b.value)) {
+        if (ref !== _iterVar && !deepBodyBindingNames.has(ref)) {
+          outerRefs.add(ref);
         }
       }
     }
@@ -1791,16 +2295,32 @@ class LoweringContext {
 
     // Loops are unrolled at compile time. Repeat the body `count` times.
     for (let i = 0; i < count; i++) {
-      // Push the iteration index as a constant (in case the loop body uses it)
-      this.emitOp({ op: 'push', value: BigInt(i) });
+      // Push the iteration variable value (in case the loop body uses it).
+      // Iteration `i` binds `start + i*step` (issue #121); zero-start
+      // counting-up loops (start=0, step=1) reduce to `BigInt(i)`, preserving
+      // the historical byte-for-byte lowering.
+      this.emitOp({ op: 'push', value: start + BigInt(i) * BigInt(step) });
       this.stackMap.push(_iterVar);
 
       const lastUses = computeLastUses(body);
 
-      // In non-final iterations, prevent outer-scope refs from being
-      // consumed by setting their last-use beyond any body binding index.
-      if (i < count - 1) {
-        for (const refName of outerRefs) {
+      // Prevent outer-scope refs from being consumed by setting their
+      // last-use beyond any body binding index:
+      //  - in non-final iterations: always (the next iteration re-reads them);
+      //  - in the FINAL iteration: when the enclosing scope still references
+      //    them AFTER the loop. Previously the final iteration consumed
+      //    every outer ref at its last body use, so a method param (or
+      //    const) referenced after the loop was gone from the stack and was
+      //    silently lowered to an OP_0/empty push — compilation succeeded,
+      //    the env-based interpreter passed, but the emitted Script failed
+      //    at runtime (silent interpreter <-> Script divergence).
+      const isFinalIteration = i === count - 1;
+      for (const refName of outerRefs) {
+        const usedAfterLoop =
+          enclosingLastUses !== undefined &&
+          loopBindingIndex !== undefined &&
+          (enclosingLastUses.get(refName) ?? -1) > loopBindingIndex;
+        if (!isFinalIteration || usedAfterLoop) {
           lastUses.set(refName, body.length);
         }
       }
@@ -1919,8 +2439,9 @@ class LoweringContext {
         this.stackMap.push(null);
       }
 
-      // Convert numeric/boolean values to fixed-width bytes via OP_NUM2BIN
-      if (prop.type === 'bigint') {
+      // Convert numeric/boolean values to fixed-width bytes via OP_NUM2BIN.
+      // RabinSig / RabinPubKey are bigint aliases and share the 8-byte layout.
+      if (prop.type === 'bigint' || prop.type === 'RabinSig' || prop.type === 'RabinPubKey') {
         this.emitOp({ op: 'push', value: 8n });
         this.stackMap.push(null);
         this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -1935,7 +2456,9 @@ class LoweringContext {
         // Prepend push-data length prefix (matching SDK format)
         this.emitPushDataEncode();
       }
-      // For other byte types (PubKey, Sig, Sha256, etc.), no conversion needed
+      // For other byte types (PubKey, Sig, Sha256, Ripemd160, Addr, Point,
+      // P256Point, P384Point, SigHashPreimage), no conversion needed — they
+      // are already fixed-width byte strings.
 
       if (!first) {
         // Concatenate with previous
@@ -1972,8 +2495,9 @@ class LoweringContext {
     const stateBytesRef = args[1]!;
 
     // Bring stateBytes to stack first.
-    const stateLast = this.isLastUse(stateBytesRef, bindingIndex, lastUses);
-    this.bringToTop(stateBytesRef, stateLast);
+    const stateConsume = this.operandConsume(
+      stateBytesRef, [preimageRef, stateBytesRef], bindingIndex, lastUses);
+    this.bringToTop(stateBytesRef, stateConsume);
 
     // Extract amount from preimage for the continuation output.
     // We still need the amount from the current UTXO. Extract from preimage:
@@ -1981,8 +2505,9 @@ class LoweringContext {
     // Since the varint+scriptCode length varies, use end-relative:
     // Last 44 bytes = nSeq(4) + hashOutputs(32) + nLocktime(4) + sighashType(4).
     // Amount(8) is right before that.
-    const preLast = this.isLastUse(preimageRef, bindingIndex, lastUses);
-    this.bringToTop(preimageRef, preLast);
+    const preConsume = this.operandConsume(
+      preimageRef, [preimageRef, stateBytesRef], bindingIndex, lastUses);
+    this.bringToTop(preimageRef, preConsume);
 
     // Extract amount: last 52 bytes, take 8 bytes at offset 0.
     this.emitOp({ op: 'opcode', code: 'OP_SIZE' });
@@ -2090,15 +2615,17 @@ class LoweringContext {
     const stateBytesRef = args[1]!;
     const newAmountRef = args[2]!;
 
+    const csoOperands = [preimageRef, stateBytesRef, newAmountRef];
+
     // Consume preimage ref (no longer needed — we use _codePart and _newAmount).
-    const preLast = this.isLastUse(preimageRef, bindingIndex, lastUses);
-    this.bringToTop(preimageRef, preLast);
+    const preConsume = this.operandConsume(preimageRef, csoOperands, bindingIndex, lastUses);
+    this.bringToTop(preimageRef, preConsume);
     this.emitOp({ op: 'drop' });
     this.stackMap.pop();
 
     // Step 1: Convert _newAmount to 8-byte LE and save to altstack.
-    const amountLast = this.isLastUse(newAmountRef, bindingIndex, lastUses);
-    this.bringToTop(newAmountRef, amountLast);
+    const amountConsume = this.operandConsume(newAmountRef, csoOperands, bindingIndex, lastUses);
+    this.bringToTop(newAmountRef, amountConsume);
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -2108,8 +2635,8 @@ class LoweringContext {
     this.stackMap.pop();
 
     // Step 2: Bring stateBytes to stack.
-    const stateLast = this.isLastUse(stateBytesRef, bindingIndex, lastUses);
-    this.bringToTop(stateBytesRef, stateLast);
+    const stateConsume = this.operandConsume(stateBytesRef, csoOperands, bindingIndex, lastUses);
+    this.bringToTop(stateBytesRef, stateConsume);
 
     // Step 3: Bring _codePart to top (PICK — never consume, reused across outputs)
     this.bringToTop('_codePart', false);
@@ -2181,8 +2708,8 @@ class LoweringContext {
     this.stackMap.push(null);
 
     // Push the 20-byte PKH
-    const pkhLast = this.isLastUse(pkhRef, bindingIndex, lastUses);
-    this.bringToTop(pkhRef, pkhLast);
+    const pkhConsume = this.operandConsume(pkhRef, [pkhRef, amountRef], bindingIndex, lastUses);
+    this.bringToTop(pkhRef, pkhConsume);
     // CAT: prefix || pkh
     this.emitOp({ op: 'opcode', code: 'OP_CAT' });
     this.stackMap.pop(); this.stackMap.pop();
@@ -2198,8 +2725,8 @@ class LoweringContext {
     // --- Stack: [..., 0x1976a914{pkh}88ac] ---
 
     // Step 2: Prepend amount as 8-byte LE.
-    const amountLast = this.isLastUse(amountRef, bindingIndex, lastUses);
-    this.bringToTop(amountRef, amountLast);
+    const amountConsume = this.operandConsume(amountRef, [pkhRef, amountRef], bindingIndex, lastUses);
+    this.bringToTop(amountRef, amountConsume);
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -2232,6 +2759,7 @@ class LoweringContext {
     // codePart from the preimage. This is simpler and works with OP_CODESEPARATOR.
 
     const stateProps = this._properties.filter(p => !p.readonly);
+    const outputOperands = [satoshis, ...stateValues];
 
     // Step 1: Bring _codePart to top (PICK — never consume, reused across outputs)
     this.bringToTop('_codePart', false);
@@ -2251,11 +2779,12 @@ class LoweringContext {
       const valueRef = stateValues[i]!;
       const prop = stateProps[i]!;
 
-      const isLast = this.isLastUse(valueRef, bindingIndex, lastUses);
-      this.bringToTop(valueRef, isLast);
+      const consume = this.operandConsume(valueRef, outputOperands, bindingIndex, lastUses);
+      this.bringToTop(valueRef, consume);
 
-      // Convert numeric/boolean values to fixed-width bytes
-      if (prop.type === 'bigint') {
+      // Convert numeric/boolean values to fixed-width bytes.
+      // RabinSig / RabinPubKey are bigint aliases and share the 8-byte layout.
+      if (prop.type === 'bigint' || prop.type === 'RabinSig' || prop.type === 'RabinPubKey') {
         this.emitOp({ op: 'push', value: 8n });
         this.stackMap.push(null);
         this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -2269,7 +2798,8 @@ class LoweringContext {
         // Prepend push-data length prefix (matching SDK format)
         this.emitPushDataEncode();
       }
-      // Other byte types used as-is
+      // Other byte types (PubKey, Sig, Sha256, Ripemd160, Addr, Point,
+      // P256Point, P384Point, SigHashPreimage) used as-is.
 
       // Concatenate with accumulator
       this.stackMap.pop();
@@ -2295,8 +2825,8 @@ class LoweringContext {
     // --- Stack: [..., varint+script] ---
 
     // Step 6: Prepend satoshis as 8-byte LE.
-    const isLastSatoshis = this.isLastUse(satoshis, bindingIndex, lastUses);
-    this.bringToTop(satoshis, isLastSatoshis);
+    const satoshisConsume = this.operandConsume(satoshis, outputOperands, bindingIndex, lastUses);
+    this.bringToTop(satoshis, satoshisConsume);
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -2329,8 +2859,9 @@ class LoweringContext {
     lastUses: Map<string, number>,
   ): void {
     // Step 1: Bring scriptBytes to top
-    const scriptIsLast = this.isLastUse(scriptBytes, bindingIndex, lastUses);
-    this.bringToTop(scriptBytes, scriptIsLast);
+    const scriptConsume = this.operandConsume(
+      scriptBytes, [satoshis, scriptBytes], bindingIndex, lastUses);
+    this.bringToTop(scriptBytes, scriptConsume);
 
     // Step 2: Compute varint prefix for script length
     this.emitOp({ op: 'opcode', code: 'OP_SIZE' }); // [script, len]
@@ -2347,8 +2878,9 @@ class LoweringContext {
     this.stackMap.push(null);
 
     // Step 4: Prepend satoshis as 8-byte LE
-    const satIsLast = this.isLastUse(satoshis, bindingIndex, lastUses);
-    this.bringToTop(satoshis, satIsLast);
+    const satConsume = this.operandConsume(
+      satoshis, [satoshis, scriptBytes], bindingIndex, lastUses);
+    this.bringToTop(satoshis, satConsume);
     this.emitOp({ op: 'push', value: 8n });
     this.stackMap.push(null);
     this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
@@ -2391,11 +2923,20 @@ class LoweringContext {
     for (const prop of stateProps) {
       switch (prop.type) {
         case 'bigint': propSizes.push(8); break;
+        // RabinSig / RabinPubKey are bigint aliases — same 8-byte layout.
+        case 'RabinSig':
+        case 'RabinPubKey': propSizes.push(8); break;
         case 'boolean': propSizes.push(1); break;
         case 'PubKey': propSizes.push(33); break;
         case 'Addr': propSizes.push(20); break;
+        // Ripemd160 is 20 bytes (same underlying shape as Addr).
+        case 'Ripemd160': propSizes.push(20); break;
         case 'Sha256': propSizes.push(32); break;
         case 'Point': propSizes.push(64); break;
+        // P-256 point: x[32] || y[32] = 64 bytes (same shape as Point).
+        case 'P256Point': propSizes.push(64); break;
+        // P-384 point: x[48] || y[48] = 96 bytes.
+        case 'P384Point': propSizes.push(96); break;
         case 'ByteString': propSizes.push(-1); hasVariableLength = true; break;
         default:
           throw new Error(`deserialize_state: unsupported type '${prop.type}' for '${prop.name}'`);
@@ -2474,61 +3015,106 @@ class LoweringContext {
       this.emitOp({ op: 'drop' });
       this.stackMap.pop();
     } else {
-      // Variable-length path: ByteString fields present.
-      // We need _codePart to compute the state offset at runtime.
+      // Variable-length path: ByteString fields present. We need _codePart
+      // to compute the state offset at runtime.
       //
-      // After steps 1-3, we have varint+scriptCode on the stack.
-      // Strip the varint prefix:
-      //   Read first byte; if < 0xfd, varint was 1 byte (already consumed).
-      //   Otherwise strip 2 more bytes for 0xfd case.
-      // Stack: [varint+scriptCode]
+      // After steps 1-3 we have [varint || scriptCode] on the stack and
+      // need to strip the BIP-143 scriptCode varint prefix:
+      //   length < 0xfd:        1 byte
+      //   length <= 0xffff:     0xfd + 2 bytes LE  (3 bytes)
+      //   length <= 0xffffffff: 0xfe + 4 bytes LE  (5 bytes)
+      //   otherwise:            0xff + 8 bytes LE  (9 bytes)
+      //
+      // We must support all four shapes; stripping only 1- and 3-byte
+      // varints corrupts state extraction for scripts whose scriptCode
+      // exceeds 65,535 bytes (e.g. embedded BN254 verifiers) and
+      // surfaces as `Invalid OP_SPLIT range` on regtest.
       this.emitOp({ op: 'push', value: 1n });
       this.stackMap.push(null);
-      this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [firstByte, rest]
+      this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
       this.stackMap.pop(); this.stackMap.pop();
       this.stackMap.push(null); // firstByte
       this.stackMap.push(null); // rest
       this.emitOp({ op: 'swap' }); // [rest, firstByte]
       this.stackMap.swap();
-      this.emitOp({ op: 'dup' }); // [rest, firstByte, firstByte]
-      this.stackMap.dup();
-      // Zero-pad before BIN2NUM to prevent sign-bit misinterpretation.
-      // Without padding, 0xfd (253) has bit 7 set → BIN2NUM gives -125.
+      // Zero-pad firstByte before BIN2NUM so 0xfd/0xfe/0xff aren't read
+      // as negative script numbers.
       this.emitOp({ op: 'push', value: new Uint8Array([0]) });
       this.stackMap.push(null);
       this.emitOp({ op: 'opcode', code: 'OP_CAT' });
       this.stackMap.pop(); this.stackMap.pop();
       this.stackMap.push(null);
-      this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' }); // [rest, firstByte, firstByteNum]
-      this.emitOp({ op: 'push', value: 253n }); // [rest, firstByte, firstByteNum, 253]
+      this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
+      // Stack: [..., rest, fb_num]
+
+      // emitDropMoreVarintBytes drops `n` more varint bytes from the top
+      // of stack `rest`. [..., rest] -> [..., rest_minus_n].
+      const emitDropMoreVarintBytes = (n: bigint): void => {
+        this.emitOp({ op: 'push', value: n });
+        this.stackMap.push(null);
+        this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
+        this.stackMap.pop(); this.stackMap.pop();
+        this.stackMap.push(null); this.stackMap.push(null);
+        this.emitOp({ op: 'nip' });
+        this.stackMap.pop(); this.stackMap.pop();
+        this.stackMap.push(null);
+      };
+
+      // IF fb_num < 253: 1-byte varint, drop fb_num.
+      this.emitOp({ op: 'dup' });
+      this.stackMap.dup();
+      this.emitOp({ op: 'push', value: 253n });
       this.stackMap.push(null);
-      this.emitOp({ op: 'opcode', code: 'OP_LESSTHAN' }); // [rest, firstByte, isSmall]
+      this.emitOp({ op: 'opcode', code: 'OP_LESSTHAN' });
       this.stackMap.pop(); this.stackMap.pop();
       this.stackMap.push(null);
-
       this.emitOp({ op: 'opcode', code: 'OP_IF' });
-      this.stackMap.pop(); // pop condition
-      const smAtVarintIf = this.stackMap.clone();
-
-      // Then: varint was 1 byte, already consumed. Drop the firstByte.
-      this.emitOp({ op: 'drop' }); // [rest=scriptCode]
       this.stackMap.pop();
-
+      const smAt1ByteIf = this.stackMap.clone();
+      this.emitOp({ op: 'drop' });
+      this.stackMap.pop();
       this.emitOp({ op: 'opcode', code: 'OP_ELSE' });
-      this.stackMap = smAtVarintIf.clone();
-
-      // Else: varint starts with 0xfd, need to strip 2 more bytes from rest.
-      this.emitOp({ op: 'drop' }); // [rest] — drop firstByte
+      this.stackMap = smAt1ByteIf.clone();
+      // ELSE: fb_num >= 253. Check 0xfe (5-byte varint) next.
+      this.emitOp({ op: 'dup' });
+      this.stackMap.dup();
+      this.emitOp({ op: 'push', value: 254n });
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_NUMEQUAL' });
+      this.stackMap.pop(); this.stackMap.pop();
+      this.stackMap.push(null);
+      this.emitOp({ op: 'opcode', code: 'OP_IF' });
       this.stackMap.pop();
-      this.emitOp({ op: 'push', value: 2n });
+      const smAtFEIf = this.stackMap.clone();
+      // THEN: 5-byte varint (0xfe + 4 bytes LE).
+      this.emitOp({ op: 'drop' });
+      this.stackMap.pop();
+      emitDropMoreVarintBytes(4n);
+      this.emitOp({ op: 'opcode', code: 'OP_ELSE' });
+      this.stackMap = smAtFEIf.clone();
+      // ELSE: fb_num != 254. Check 0xff (9-byte varint) next.
+      this.emitOp({ op: 'dup' });
+      this.stackMap.dup();
+      this.emitOp({ op: 'push', value: 255n });
       this.stackMap.push(null);
-      this.emitOp({ op: 'opcode', code: 'OP_SPLIT' }); // [2bytesLen, scriptCode]
-      this.stackMap.pop(); this.stackMap.pop();
-      this.stackMap.push(null); this.stackMap.push(null);
-      this.emitOp({ op: 'nip' }); // [scriptCode]
+      this.emitOp({ op: 'opcode', code: 'OP_NUMEQUAL' });
       this.stackMap.pop(); this.stackMap.pop();
       this.stackMap.push(null);
-
+      this.emitOp({ op: 'opcode', code: 'OP_IF' });
+      this.stackMap.pop();
+      const smAtFFIf = this.stackMap.clone();
+      // THEN: 9-byte varint (0xff + 8 bytes LE).
+      this.emitOp({ op: 'drop' });
+      this.stackMap.pop();
+      emitDropMoreVarintBytes(8n);
+      this.emitOp({ op: 'opcode', code: 'OP_ELSE' });
+      this.stackMap = smAtFFIf.clone();
+      // ELSE: fb_num must be 253 (0xfd) — 3-byte varint.
+      this.emitOp({ op: 'drop' });
+      this.stackMap.pop();
+      emitDropMoreVarintBytes(2n);
+      this.emitOp({ op: 'opcode', code: 'OP_ENDIF' });
+      this.emitOp({ op: 'opcode', code: 'OP_ENDIF' });
       this.emitOp({ op: 'opcode', code: 'OP_ENDIF' });
       // --- Stack: [..., scriptCode] ---
 
@@ -2571,7 +3157,7 @@ class LoweringContext {
           this.emitPushDataDecode(); // [..., data, remaining]
           this.emitOp({ op: 'drop' }); // drop remaining (should be empty for single field)
           this.stackMap.pop();
-        } else if (prop.type === 'bigint' || prop.type === 'boolean') {
+        } else if (prop.type === 'bigint' || prop.type === 'boolean' || prop.type === 'RabinSig' || prop.type === 'RabinPubKey') {
           this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
         }
         // Other byte types need no conversion
@@ -2603,7 +3189,7 @@ class LoweringContext {
               // Swap to bring property bytes on top
               this.emitOp({ op: 'swap' });
               this.stackMap.swap();
-              if (prop.type === 'bigint' || prop.type === 'boolean') {
+              if (prop.type === 'bigint' || prop.type === 'boolean' || prop.type === 'RabinSig' || prop.type === 'RabinPubKey') {
                 this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
               }
               // Swap back so rest is on top for next iteration
@@ -2620,7 +3206,7 @@ class LoweringContext {
               this.emitPushDataDecode(); // [..., data, remaining]
               this.emitOp({ op: 'drop' }); // drop remaining (should be empty)
               this.stackMap.pop();
-            } else if (prop.type === 'bigint' || prop.type === 'boolean') {
+            } else if (prop.type === 'bigint' || prop.type === 'boolean' || prop.type === 'RabinSig' || prop.type === 'RabinPubKey') {
               this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
             }
             this.stackMap.pop();
@@ -2640,7 +3226,7 @@ class LoweringContext {
   private splitFixedStateFields(stateProps: ANFProperty[], propSizes: number[]): void {
     if (stateProps.length === 1) {
       const prop = stateProps[0]!;
-      if (prop.type === 'bigint' || prop.type === 'boolean') {
+      if (prop.type === 'bigint' || prop.type === 'boolean' || prop.type === 'RabinSig' || prop.type === 'RabinPubKey') {
         this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
       }
       this.stackMap.pop();
@@ -2660,7 +3246,7 @@ class LoweringContext {
           this.stackMap.push(null);
           this.emitOp({ op: 'swap' });
           this.stackMap.swap();
-          if (prop.type === 'bigint' || prop.type === 'boolean') {
+          if (prop.type === 'bigint' || prop.type === 'boolean' || prop.type === 'RabinSig' || prop.type === 'RabinPubKey') {
             this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
           }
           this.emitOp({ op: 'swap' });
@@ -2670,7 +3256,7 @@ class LoweringContext {
           this.stackMap.push(prop.name);
           this.stackMap.push(null);
         } else {
-          if (prop.type === 'bigint' || prop.type === 'boolean') {
+          if (prop.type === 'bigint' || prop.type === 'boolean' || prop.type === 'RabinSig' || prop.type === 'RabinPubKey') {
             this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
           }
           this.stackMap.pop();
@@ -2683,55 +3269,44 @@ class LoweringContext {
   private lowerCheckPreimage(
     bindingName: string,
     preimage: string,
+    sighashFlag: number | undefined,
     bindingIndex: number,
     lastUses: Map<string, number>,
   ): void {
-    // OP_PUSH_TX: verify the sighash preimage matches the current spending
-    // transaction.  See https://wiki.bitcoinsv.io/index.php/OP_PUSH_TX
+    // OP_PUSH_TX: verify the pushed BIP-143 sighash preimage is bound to the
+    // current spending transaction. See https://wiki.bitcoinsv.io/index.php/OP_PUSH_TX
     //
-    // The unlocking script pushes <_opPushTxSig> <preimage>.
-    // The SDK computes the BIP-143 sighash and signs with private key = 1
-    // (public key = secp256k1 generator G, compressed).
-    // The go-sdk's ECDSA library handles DER encoding, low-S normalization,
-    // and all edge cases correctly.
+    // The signature is DERIVED FROM THE PREIMAGE ON CHAIN (Optimal OP_PUSH_TX):
+    //   z    = hash256(preimage)
+    //   s    = (z + r)·k⁻¹ mod n      (fixed nonce k, privkey d=1 ⇒ pubkey = G)
+    // OP_CHECKSIG(sig, G) then passes iff hash256(preimage) equals the node's
+    // real tx sighash — i.e. iff the pushed preimage IS the spending tx's
+    // preimage. This closes BUG-100: a spender can no longer present a preimage
+    // decoupled from the transaction they actually broadcast. The unlocking
+    // script therefore pushes ONLY <preimage> (no witness signature).
     //
-    // Locking script sequence:
-    //   [bring preimage to top]     -- via PICK (non-consuming copy)
-    //   [bring _opPushTxSig to top] -- via ROLL (consuming)
-    //   <G>                         -- push compressed generator point
-    //   OP_CHECKSIGVERIFY           -- verify sig and remove from stack
-    //   -- preimage remains on stack for field extractors
+    // See emitCheckPreimageBinding (oppushtx-codegen.ts) for the construction,
+    // validated end-to-end against the BSV Script interpreter.
 
-    // Step 0: Emit OP_CODESEPARATOR so that the scriptCode in the BIP-143
-    // preimage is only the code after this point. This reduces preimage size
-    // for large scripts and is required for scripts > ~32KB.
+    // Emit OP_CODESEPARATOR so the scriptCode in the BIP-143 preimage is only
+    // the code after this point (smaller preimage; required for large scripts).
     this.emitOp({ op: 'opcode', code: 'OP_CODESEPARATOR' });
 
-    // Step 1: Bring preimage to top.
+    // Bring the preimage to the top (kept for field extractors below).
     const isLast = this.isLastUse(preimage, bindingIndex, lastUses);
     this.bringToTop(preimage, isLast);
 
-    // Step 2: Bring the implicit _opPushTxSig to top (consuming).
-    this.bringToTop('_opPushTxSig', true);
+    // Derive + verify the signature on-chain (single opaque raw_bytes blob).
+    // For the default ALL|FORKID (sighashFlag undefined) the blob is
+    // byte-identical to the pinned cross-tier constant; issue #123 lets a
+    // method declare a different mode, which only changes the appended sighash
+    // flag byte (TS-reference tier only until the 6-tier port lands). Net stack
+    // effect is zero: the preimage is consumed internally as a copy and left on
+    // top; OP_CHECKSIGVERIFY aborts the script unless the binding holds.
+    emitCheckPreimageBindingRaw((op) => this.emitOp(op), sighashFlag);
 
-    // Step 3: Push compressed secp256k1 generator point G (33 bytes).
-    const G = new Uint8Array([
-      0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB,
-      0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
-      0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28,
-      0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17,
-      0x98,
-    ]);
-    this.emitOp({ op: 'push', value: G });
-    this.stackMap.push(null); // G on stack
-
-    // Step 4: OP_CHECKSIGVERIFY — verify and remove sig + pubkey.
-    this.emitOp({ op: 'opcode', code: 'OP_CHECKSIGVERIFY' });
-    this.stackMap.pop(); // G consumed
-    this.stackMap.pop(); // _opPushTxSig consumed
-
-    // The preimage remains on top. Rename to binding name
-    // so field extractors can reference it.
+    // The preimage remains on top. Rename to the binding name so field
+    // extractors can reference it.
     this.stackMap.pop();
     this.stackMap.push(bindingName);
 
@@ -3141,11 +3716,11 @@ class LoweringContext {
     if (args.length < 2) throw new Error(`${func} requires 2 arguments`);
     const [a, b] = args as [string, string];
 
-    const aIsLast = this.isLastUse(a, bindingIndex, lastUses);
-    this.bringToTop(a, aIsLast);
+    const aConsume = this.operandConsume(a, args, bindingIndex, lastUses);
+    this.bringToTop(a, aConsume);
 
-    const bIsLast = this.isLastUse(b, bindingIndex, lastUses);
-    this.bringToTop(b, bIsLast);
+    const bConsume = this.operandConsume(b, args, bindingIndex, lastUses);
+    this.bringToTop(b, bConsume);
 
     // Stack: ... a b
     // DUP b, check non-zero, then divide/mod
@@ -3178,11 +3753,11 @@ class LoweringContext {
     if (args.length < 3) throw new Error('clamp requires 3 arguments');
     const [val, lo, hi] = args as [string, string, string];
 
-    const valIsLast = this.isLastUse(val, bindingIndex, lastUses);
-    this.bringToTop(val, valIsLast);
+    const valConsume = this.operandConsume(val, args, bindingIndex, lastUses);
+    this.bringToTop(val, valConsume);
 
-    const loIsLast = this.isLastUse(lo, bindingIndex, lastUses);
-    this.bringToTop(lo, loIsLast);
+    const loConsume = this.operandConsume(lo, args, bindingIndex, lastUses);
+    this.bringToTop(lo, loConsume);
 
     // Stack: ... val lo → OP_MAX → max(val, lo)
     this.stackMap.pop();
@@ -3190,8 +3765,8 @@ class LoweringContext {
     this.emitOp({ op: 'opcode', code: 'OP_MAX' });
     this.stackMap.push(null); // intermediate
 
-    const hiIsLast = this.isLastUse(hi, bindingIndex, lastUses);
-    this.bringToTop(hi, hiIsLast);
+    const hiConsume = this.operandConsume(hi, args, bindingIndex, lastUses);
+    this.bringToTop(hi, hiConsume);
 
     // Stack: ... max(val,lo) hi → OP_MIN → min(max(val,lo), hi)
     this.stackMap.pop();
@@ -3216,11 +3791,11 @@ class LoweringContext {
     if (args.length < 2) throw new Error('pow requires 2 arguments');
     const [base, exp] = args as [string, string];
 
-    const baseIsLast = this.isLastUse(base, bindingIndex, lastUses);
-    this.bringToTop(base, baseIsLast);
+    const baseConsume = this.operandConsume(base, args, bindingIndex, lastUses);
+    this.bringToTop(base, baseConsume);
 
-    const expIsLast = this.isLastUse(exp, bindingIndex, lastUses);
-    this.bringToTop(exp, expIsLast);
+    const expConsume = this.operandConsume(exp, args, bindingIndex, lastUses);
+    this.bringToTop(exp, expConsume);
 
     this.stackMap.pop(); // exp
     this.stackMap.pop(); // base
@@ -3299,18 +3874,18 @@ class LoweringContext {
     if (args.length < 3) throw new Error('mulDiv requires 3 arguments');
     const [a, b, c] = args as [string, string, string];
 
-    const aIsLast = this.isLastUse(a, bindingIndex, lastUses);
-    this.bringToTop(a, aIsLast);
-    const bIsLast = this.isLastUse(b, bindingIndex, lastUses);
-    this.bringToTop(b, bIsLast);
+    const aConsume = this.operandConsume(a, args, bindingIndex, lastUses);
+    this.bringToTop(a, aConsume);
+    const bConsume = this.operandConsume(b, args, bindingIndex, lastUses);
+    this.bringToTop(b, bConsume);
 
     this.stackMap.pop();
     this.stackMap.pop();
     this.emitOp({ op: 'opcode', code: 'OP_MUL' });
     this.stackMap.push(null);
 
-    const cIsLast = this.isLastUse(c, bindingIndex, lastUses);
-    this.bringToTop(c, cIsLast);
+    const cConsume = this.operandConsume(c, args, bindingIndex, lastUses);
+    this.bringToTop(c, cConsume);
 
     this.stackMap.pop();
     this.stackMap.pop();
@@ -3333,10 +3908,10 @@ class LoweringContext {
     if (args.length < 2) throw new Error('percentOf requires 2 arguments');
     const [amount, bps] = args as [string, string];
 
-    const amountIsLast = this.isLastUse(amount, bindingIndex, lastUses);
-    this.bringToTop(amount, amountIsLast);
-    const bpsIsLast = this.isLastUse(bps, bindingIndex, lastUses);
-    this.bringToTop(bps, bpsIsLast);
+    const amountConsume = this.operandConsume(amount, args, bindingIndex, lastUses);
+    this.bringToTop(amount, amountConsume);
+    const bpsConsume = this.operandConsume(bps, args, bindingIndex, lastUses);
+    this.bringToTop(bps, bpsConsume);
 
     this.stackMap.pop();
     this.stackMap.pop();
@@ -3426,10 +4001,10 @@ class LoweringContext {
     if (args.length < 2) throw new Error('gcd requires 2 arguments');
     const [a, b] = args as [string, string];
 
-    const aIsLast = this.isLastUse(a, bindingIndex, lastUses);
-    this.bringToTop(a, aIsLast);
-    const bIsLast = this.isLastUse(b, bindingIndex, lastUses);
-    this.bringToTop(b, bIsLast);
+    const aConsume = this.operandConsume(a, args, bindingIndex, lastUses);
+    this.bringToTop(a, aConsume);
+    const bConsume = this.operandConsume(b, args, bindingIndex, lastUses);
+    this.bringToTop(b, bConsume);
 
     this.stackMap.pop();
     this.stackMap.pop();
@@ -3485,10 +4060,10 @@ class LoweringContext {
     if (args.length < 2) throw new Error('divmod requires 2 arguments');
     const [a, b] = args as [string, string];
 
-    const aIsLast = this.isLastUse(a, bindingIndex, lastUses);
-    this.bringToTop(a, aIsLast);
-    const bIsLast = this.isLastUse(b, bindingIndex, lastUses);
-    this.bringToTop(b, bIsLast);
+    const aConsume = this.operandConsume(a, args, bindingIndex, lastUses);
+    this.bringToTop(a, aConsume);
+    const bConsume = this.operandConsume(b, args, bindingIndex, lastUses);
+    this.bringToTop(b, bConsume);
 
     this.stackMap.pop();
     this.stackMap.pop();
@@ -3639,12 +4214,12 @@ class LoweringContext {
     const [data, len] = args as [string, string];
 
     // Push data onto the stack
-    const dataIsLast = this.isLastUse(data, bindingIndex, lastUses);
-    this.bringToTop(data, dataIsLast);
+    const dataConsume = this.operandConsume(data, args, bindingIndex, lastUses);
+    this.bringToTop(data, dataConsume);
 
     // Push len onto the stack
-    const lenIsLast = this.isLastUse(len, bindingIndex, lastUses);
-    this.bringToTop(len, lenIsLast);
+    const lenConsume = this.operandConsume(len, args, bindingIndex, lastUses);
+    this.bringToTop(len, lenConsume);
 
     // Stack: <data> <len>
     this.stackMap.pop(); // len
@@ -3671,18 +4246,10 @@ class LoweringContext {
    * Lower verifyRabinSig(msg, sig, padding, pubKey) to Script.
    *
    * Rabin signature verification checks: (sig^2 + padding) mod pubKey == SHA256(msg)
+   * The 10-opcode emission delegates to rabin-codegen.ts.
    *
-   * Stack before: <msg(3)> <sig(2)> <padding(1)> <pubKey(0)>
-   * Script:
-   *   OP_SWAP                     -- msg sig pubKey padding
-   *   OP_ROT                      -- msg pubKey padding sig  (sig on top for squaring)
-   *   OP_DUP OP_MUL               -- msg pubKey padding sig^2
-   *   OP_ADD                      -- msg pubKey (sig^2+padding)
-   *   OP_SWAP                     -- msg (sig^2+padding) pubKey
-   *   OP_MOD                      -- msg ((sig^2+padding) mod pubKey)
-   *   OP_SWAP                     -- ((sig^2+padding) mod pubKey) msg
-   *   OP_SHA256                   -- ((sig^2+padding) mod pubKey) SHA256(msg)
-   *   OP_EQUAL                    -- result
+   * Stack before (bottom→top): msg sig padding pubKey
+   * Stack after: <boolean>
    */
   private lowerVerifyRabinSig(
     bindingName: string,
@@ -3696,131 +4263,21 @@ class LoweringContext {
 
     // Bring all 4 args to the top: msg, sig, padding, pubKey
     for (const arg of args) {
-      const isLast = this.isLastUse(arg, bindingIndex, lastUses);
-      this.bringToTop(arg, isLast);
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
 
     // Pop all 4 args from stack map
-    for (let i = 0; i < 4; i++) {
-      this.stackMap.pop();
-    }
+    for (let i = 0; i < 4; i++) this.stackMap.pop();
 
-    // Stack bottom->top: msg(3) sig(2) padding(1) pubKey(0)
-    // Compute: (sig^2 + padding) mod pubKey == SHA256(msg)
+    emitVerifyRabinSig((op) => this.emitOp(op));
 
-    // Rearrange so sig is on top for squaring
-    this.emitOp({ op: 'opcode', code: 'OP_SWAP' });  // msg sig pubKey padding
-    this.emitOp({ op: 'opcode', code: 'OP_ROT' });   // msg pubKey padding sig
-
-    // sig^2
-    this.emitOp({ op: 'opcode', code: 'OP_DUP' });
-    this.emitOp({ op: 'opcode', code: 'OP_MUL' });   // msg pubKey padding sig^2
-
-    // sig^2 + padding
-    this.emitOp({ op: 'opcode', code: 'OP_ADD' });   // msg pubKey (sig^2+padding)
-
-    // (sig^2 + padding) mod pubKey
-    this.emitOp({ op: 'opcode', code: 'OP_SWAP' });  // msg (sig^2+padding) pubKey
-    this.emitOp({ op: 'opcode', code: 'OP_MOD' });   // msg ((sig^2+padding) mod pubKey)
-
-    // SHA256(msg) and compare
-    this.emitOp({ op: 'opcode', code: 'OP_SWAP' });  // ((sig^2+padding) mod pubKey) msg
-    this.emitOp({ op: 'opcode', code: 'OP_SHA256' });
-    this.emitOp({ op: 'opcode', code: 'OP_EQUAL' });
-
-    // Result is on top
     this.stackMap.push(bindingName);
     this.trackDepth();
   }
 
-  // -------------------------------------------------------------------------
-  // WOTS+ verification (post-quantum hash-based signature)
-  // w=16, n=32 (SHA-256), len1=64, len2=3, len=67
-  // Input:  <msg> <sig> <pubkey>
-  // Output: <boolean>
-  //
-  // Canonical stack between chains: sig_rem(0) csum(1) endpt_acc(2)
-  // Alt stack: pubkey only (plus balanced temp saves inside chain processing)
-  // -------------------------------------------------------------------------
-
-  /**
-   * Emit one WOTS+ chain with RFC 8391 tweakable hashing.
-   * Input:  pubSeed(bottom) sig(1) csum(2) endpt(3) digit(top)
-   * Output: pubSeed(bottom) sigRest(1) newCsum(2) newEndpt(top)
-   * Alt stack pushes/pops are balanced (4 push, 4 pop).
-   *
-   * F(pubSeed, chainIdx, stepIdx, X) = SHA-256(pubSeed || byte(chainIdx) || byte(stepIdx) || X)
-   */
-  private emitWOTSOneChain(chainIndex: number): void {
-    // Entry stack: pubSeed(bottom) sig csum endpt digit(top)
-    // Save steps_copy = 15 - digit to alt (for checksum accumulation later)
-    this.emitOp({ op: 'opcode', code: 'OP_DUP' });
-    this.emitOp({ op: 'push', value: 15n });
-    this.emitOp({ op: 'swap' });
-    this.emitOp({ op: 'opcode', code: 'OP_SUB' });
-    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' }); // push#1: steps_copy
-    // main: pubSeed sig csum endpt digit
-
-    // Save endpt, csum to alt. Leave pubSeed+sig+digit on main.
-    this.emitOp({ op: 'swap' });
-    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' }); // push#2: endpt
-    this.emitOp({ op: 'swap' });
-    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' }); // push#3: csum
-    // main: pubSeed sig digit
-
-    // Split 32B sig element
-    this.emitOp({ op: 'swap' });                            // pubSeed digit sig
-    this.emitOp({ op: 'push', value: 32n });
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });       // pubSeed digit sigElem sigRest
-    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' }); // push#4: sigRest
-    this.emitOp({ op: 'swap' });                            // pubSeed sigElem digit
-
-    // Hash loop: skip first `digit` iterations, then apply F for the rest.
-    // When digit > 0: decrement (skip). When digit == 0: hash at step j.
-    // Stack at loop entry: pubSeed(depth2) sigElem(depth1) digit(depth0=top)
-    for (let j = 0; j < 15; j++) {
-      const adrsBytes = new Uint8Array([chainIndex, j]);
-      this.emitOp({ op: 'opcode', code: 'OP_DUP' });
-      this.emitOp({ op: 'opcode', code: 'OP_0NOTEQUAL' });
-      this.emitOp({
-        op: 'if',
-        then: [
-          { op: 'opcode', code: 'OP_1SUB' },                // skip: digit--
-        ],
-        else: [
-          { op: 'swap' },                                    // pubSeed digit X
-          { op: 'push', value: 2n },
-          { op: 'opcode', code: 'OP_PICK' },                // copy pubSeed from depth 2
-          { op: 'push', value: adrsBytes },                  // push ADRS [chainIndex, j]
-          { op: 'opcode', code: 'OP_CAT' },                 // pubSeed || adrs
-          { op: 'swap' },                                    // bring X to top
-          { op: 'opcode', code: 'OP_CAT' },                 // pubSeed || adrs || X
-          { op: 'opcode', code: 'OP_SHA256' },              // F result
-          { op: 'swap' },                                    // pubSeed new_X digit(=0)
-        ],
-      });
-    }
-    this.emitOp({ op: 'drop' }); // drop digit (now 0)
-    // main: pubSeed endpoint
-
-    // Restore from alt (LIFO): sigRest, csum, endpt_acc, steps_copy
-    this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // pop#4: sigRest
-    this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // pop#3: csum
-    this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // pop#2: endpt_acc
-    this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // pop#1: steps_copy
-    // main b→t: pubSeed endpoint sigRest csum endpt_acc steps_copy
-
-    // csum += steps_copy
-    this.emitOp({ op: 'opcode', code: 'OP_ROT' });
-    this.emitOp({ op: 'opcode', code: 'OP_ADD' });
-
-    // Concat endpoint to endpt_acc
-    this.emitOp({ op: 'swap' });
-    this.emitOp({ op: 'push', value: 3n });
-    this.emitOp({ op: 'opcode', code: 'OP_ROLL' });
-    this.emitOp({ op: 'opcode', code: 'OP_CAT' });
-    // pubSeed sigRest newCsum newEndptAcc
-  }
+  // =========================================================================
+  // WOTS+ verification — delegates to wots-codegen.ts
+  // =========================================================================
 
   private lowerVerifyWOTS(
     bindingName: string,
@@ -3831,147 +4288,12 @@ class LoweringContext {
     if (args.length < 3) {
       throw new Error('verifyWOTS requires 3 arguments: msg, sig, pubkey');
     }
-
-    // Bring args to top: msg, sig, pubkey
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 3; i++) this.stackMap.pop();
-    // main: msg(0) sig(1) pubkey(2)  (pubkey is 64 bytes: pubSeed||pkRoot)
 
-    // Split 64-byte pubkey into pubSeed(32) and pkRoot(32)
-    this.emitOp({ op: 'push', value: 32n });
-    this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });         // msg sig pubSeed pkRoot
-    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });   // pkRoot → alt
-
-    // Rearrange: put pubSeed at bottom, hash msg
-    // main: msg sig pubSeed
-    this.emitOp({ op: 'opcode', code: 'OP_ROT' });           // sig pubSeed msg
-    this.emitOp({ op: 'opcode', code: 'OP_ROT' });           // pubSeed msg sig
-    this.emitOp({ op: 'swap' });                               // pubSeed sig msg
-    this.emitOp({ op: 'opcode', code: 'OP_SHA256' });        // pubSeed sig msgHash
-
-    // Canonical layout: pubSeed(bottom) sig csum=0 endptAcc=empty hashRem(top)
-    this.emitOp({ op: 'swap' });                // pubSeed msgHash sig
-    this.emitOp({ op: 'push', value: 0n });     // pubSeed msgHash sig 0
-    this.emitOp({ op: 'opcode', code: 'OP_0' }); // pubSeed msgHash sig 0 empty
-    this.emitOp({ op: 'push', value: 3n });
-    this.emitOp({ op: 'opcode', code: 'OP_ROLL' }); // pubSeed sig 0 empty msgHash
-
-    // Process 32 bytes → 64 message chains
-    // Chain indices: byteIdx*2 for high nibble, byteIdx*2+1 for low nibble
-    for (let byteIdx = 0; byteIdx < 32; byteIdx++) {
-      // main: pubSeed sig csum endptAcc hashRem
-      if (byteIdx < 31) {
-        this.emitOp({ op: 'push', value: 1n });
-        this.emitOp({ op: 'opcode', code: 'OP_SPLIT' });
-        this.emitOp({ op: 'swap' });
-      }
-      // Convert 1-byte string to unsigned integer.
-      this.emitOp({ op: 'push', value: 0n });
-      this.emitOp({ op: 'push', value: 1n });
-      this.emitOp({ op: 'opcode', code: 'OP_NUM2BIN' });
-      this.emitOp({ op: 'opcode', code: 'OP_CAT' });
-      this.emitOp({ op: 'opcode', code: 'OP_BIN2NUM' });
-      this.emitOp({ op: 'opcode', code: 'OP_DUP' });
-      this.emitOp({ op: 'push', value: 16n });
-      this.emitOp({ op: 'opcode', code: 'OP_DIV' });  // high
-      this.emitOp({ op: 'swap' });
-      this.emitOp({ op: 'push', value: 16n });
-      this.emitOp({ op: 'opcode', code: 'OP_MOD' });  // low
-
-      // Save low (and hashRest if present) to alt
-      if (byteIdx < 31) {
-        this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' }); // low → alt
-        this.emitOp({ op: 'swap' });
-        this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' }); // hashRest → alt
-      } else {
-        this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' }); // low → alt
-      }
-      // main: pubSeed sig csum endptAcc high
-
-      this.emitWOTSOneChain(byteIdx * 2); // chain index for high nibble
-
-      // Retrieve low from alt (and hashRest)
-      if (byteIdx < 31) {
-        this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // hashRest
-        this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // low
-        this.emitOp({ op: 'swap' });
-        this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' }); // hashRest → alt
-      } else {
-        this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // low
-      }
-      // main: pubSeed sigRest csum endptAcc low
-
-      this.emitWOTSOneChain(byteIdx * 2 + 1); // chain index for low nibble
-
-      if (byteIdx < 31) {
-        this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // hashRest
-      }
-    }
-
-    // main: pubSeed sigRest(96B) totalCsum endptAcc  |  alt: pkRoot
-
-    // Compute 3 checksum digits
-    this.emitOp({ op: 'swap' }); // pubSeed sigRest endptAcc totalCsum
-
-    // d66 = csum % 16
-    this.emitOp({ op: 'opcode', code: 'OP_DUP' });
-    this.emitOp({ op: 'push', value: 16n });
-    this.emitOp({ op: 'opcode', code: 'OP_MOD' });
-    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
-
-    // d65 = (csum/16) % 16
-    this.emitOp({ op: 'opcode', code: 'OP_DUP' });
-    this.emitOp({ op: 'push', value: 16n });
-    this.emitOp({ op: 'opcode', code: 'OP_DIV' });
-    this.emitOp({ op: 'push', value: 16n });
-    this.emitOp({ op: 'opcode', code: 'OP_MOD' });
-    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
-
-    // d64 = (csum/256) % 16
-    this.emitOp({ op: 'push', value: 256n });
-    this.emitOp({ op: 'opcode', code: 'OP_DIV' });
-    this.emitOp({ op: 'push', value: 16n });
-    this.emitOp({ op: 'opcode', code: 'OP_MOD' });
-    this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' });
-    // main: pubSeed sigRest endptAcc  |  alt: pkRoot, d66, d65, d64
-
-    // Process 3 checksum chains (indices 64, 65, 66)
-    for (let ci = 0; ci < 3; ci++) {
-      // main: pubSeed sigRest endptAcc
-      // Set up: pubSeed sigRest dummyCsum=0 endptAcc digit
-      this.emitOp({ op: 'opcode', code: 'OP_TOALTSTACK' }); // endptAcc → alt (temp)
-      this.emitOp({ op: 'push', value: 0n });                // pubSeed sigRest 0
-      this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // pubSeed sigRest 0 endptAcc
-      this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // pubSeed sigRest 0 endptAcc digit
-
-      this.emitWOTSOneChain(64 + ci);
-      // main: pubSeed sigRest dummyCsum newEndptAcc
-
-      // Drop dummy csum
-      this.emitOp({ op: 'swap' }); // pubSeed sigRest newEndptAcc dummyCsum
-      this.emitOp({ op: 'drop' }); // pubSeed sigRest newEndptAcc
-    }
-
-    // main: pubSeed sigRest(empty) endptAcc  |  alt: pkRoot
-    this.emitOp({ op: 'swap' });
-    this.emitOp({ op: 'drop' }); // drop empty sigRest
-    // main: pubSeed endptAcc
-
-    // Hash concatenated endpoints → computed pkRoot
-    this.emitOp({ op: 'opcode', code: 'OP_SHA256' });
-    // main: pubSeed computedPkRoot
-
-    // Compare to pkRoot from alt
-    this.emitOp({ op: 'opcode', code: 'OP_FROMALTSTACK' }); // pkRoot
-    this.emitOp({ op: 'opcode', code: 'OP_EQUAL' });
-    // main: pubSeed bool
-
-    // Clean up pubSeed
-    this.emitOp({ op: 'swap' });
-    this.emitOp({ op: 'drop' }); // drop pubSeed
-    // main: bool
+    emitVerifyWOTS((op) => this.emitOp(op));
 
     this.stackMap.push(bindingName);
     this.trackDepth();
@@ -3991,7 +4313,7 @@ class LoweringContext {
       throw new Error('sha256Compress requires 2 arguments: state, block');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 2; i++) this.stackMap.pop();
 
@@ -4011,7 +4333,7 @@ class LoweringContext {
       throw new Error('sha256Finalize requires 3 arguments: state, remaining, msgBitLen');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 3; i++) this.stackMap.pop();
 
@@ -4035,7 +4357,7 @@ class LoweringContext {
       throw new Error('blake3Compress requires 2 arguments: chainingValue, block');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 2; i++) this.stackMap.pop();
 
@@ -4055,7 +4377,7 @@ class LoweringContext {
       throw new Error('blake3Hash requires 1 argument: message');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     this.stackMap.pop();
 
@@ -4080,7 +4402,7 @@ class LoweringContext {
       throw new Error('verifySLHDSA requires 3 arguments: msg, sig, pubkey');
     }
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < 3; i++) this.stackMap.pop();
 
@@ -4103,7 +4425,7 @@ class LoweringContext {
   ): void {
     // Bring all args to stack top
     for (const arg of args) {
-      this.bringToTop(arg, this.isLastUse(arg, bindingIndex, lastUses));
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
     }
     for (let i = 0; i < args.length; i++) this.stackMap.pop();
 
@@ -4121,6 +4443,332 @@ class LoweringContext {
       case 'ecPointX':           emitEcPointX(emitFn); break;
       case 'ecPointY':           emitEcPointY(emitFn); break;
       default: throw new Error(`Unknown EC builtin: ${func}`);
+    }
+
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  // =========================================================================
+  // P-256 and P-384 EC builtins — delegates to p256-p384-codegen.ts
+  // =========================================================================
+
+  private lowerNistEcBuiltin(
+    bindingName: string,
+    func: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    // Bring all args to stack top
+    for (const arg of args) {
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
+    }
+    for (let i = 0; i < args.length; i++) this.stackMap.pop();
+
+    const emitFn = (op: StackOp) => this.emitOp(op);
+
+    switch (func) {
+      case 'p256Add':              emitP256Add(emitFn); break;
+      case 'p256Mul':              emitP256Mul(emitFn); break;
+      case 'p256MulGen':           emitP256MulGen(emitFn); break;
+      case 'p256Negate':           emitP256Negate(emitFn); break;
+      case 'p256OnCurve':          emitP256OnCurve(emitFn); break;
+      case 'p256EncodeCompressed': emitP256EncodeCompressed(emitFn); break;
+      case 'p384Add':              emitP384Add(emitFn); break;
+      case 'p384Mul':              emitP384Mul(emitFn); break;
+      case 'p384MulGen':           emitP384MulGen(emitFn); break;
+      case 'p384Negate':           emitP384Negate(emitFn); break;
+      case 'p384OnCurve':          emitP384OnCurve(emitFn); break;
+      case 'p384EncodeCompressed': emitP384EncodeCompressed(emitFn); break;
+      default: throw new Error(`Unknown NIST EC builtin: ${func}`);
+    }
+
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  private lowerVerifyECDSA(
+    bindingName: string,
+    func: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    if (args.length < 3) throw new Error(`${func} requires 3 arguments: msg, sig, pubkey`);
+    const [msg, sig, pubkey] = args as [string, string, string];
+    this.bringToTop(msg, this.operandConsume(msg, args, bindingIndex, lastUses));
+    this.bringToTop(sig, this.operandConsume(sig, args, bindingIndex, lastUses));
+    this.bringToTop(pubkey, this.operandConsume(pubkey, args, bindingIndex, lastUses));
+    this.stackMap.pop(); // pubkey
+    this.stackMap.pop(); // sig
+    this.stackMap.pop(); // msg
+    const emitFn = (op: StackOp) => this.emitOp(op);
+    if (func === 'verifyECDSA_P256') emitVerifyECDSA_P256(emitFn);
+    else emitVerifyECDSA_P384(emitFn);
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  // =========================================================================
+  // BN254 field + G1 — delegates to bn254-codegen.ts
+  // =========================================================================
+
+  private lowerBN254Builtin(
+    bindingName: string,
+    func: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    // Bring all args to stack top
+    for (const arg of args) {
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
+    }
+    for (let i = 0; i < args.length; i++) this.stackMap.pop();
+
+    const emitFn = (op: StackOp) => this.emitOp(op);
+
+    switch (func) {
+      case 'bn254FieldAdd':    emitBn254FieldAdd(emitFn); break;
+      case 'bn254FieldSub':    emitBn254FieldSub(emitFn); break;
+      case 'bn254FieldMul':    emitBn254FieldMul(emitFn); break;
+      case 'bn254FieldInv':    emitBn254FieldInv(emitFn); break;
+      case 'bn254FieldNeg':    emitBn254FieldNeg(emitFn); break;
+      case 'bn254G1Add':       emitBn254G1Add(emitFn); break;
+      case 'bn254G1ScalarMul': emitBn254G1ScalarMul(emitFn); break;
+      case 'bn254G1Negate':    emitBn254G1Negate(emitFn); break;
+      case 'bn254G1OnCurve':   emitBn254G1OnCurve(emitFn); break;
+      default: throw new Error(`Unknown BN254 builtin: ${func}`);
+    }
+
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  // =========================================================================
+  // Baby Bear field arithmetic — delegates to babybear-codegen.ts
+  // =========================================================================
+
+  private lowerBBFieldBuiltin(
+    bindingName: string,
+    func: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    // Bring all args to stack top
+    for (const arg of args) {
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
+    }
+    for (let i = 0; i < args.length; i++) this.stackMap.pop();
+
+    const emitFn = (op: StackOp) => this.emitOp(op);
+
+    switch (func) {
+      case 'bbFieldAdd': emitBBFieldAdd(emitFn); break;
+      case 'bbFieldSub': emitBBFieldSub(emitFn); break;
+      case 'bbFieldMul': emitBBFieldMul(emitFn); break;
+      case 'bbFieldInv': emitBBFieldInv(emitFn); break;
+      case 'bbExt4Mul0': emitBBExt4Mul0(emitFn); break;
+      case 'bbExt4Mul1': emitBBExt4Mul1(emitFn); break;
+      case 'bbExt4Mul2': emitBBExt4Mul2(emitFn); break;
+      case 'bbExt4Mul3': emitBBExt4Mul3(emitFn); break;
+      case 'bbExt4Inv0': emitBBExt4Inv0(emitFn); break;
+      case 'bbExt4Inv1': emitBBExt4Inv1(emitFn); break;
+      case 'bbExt4Inv2': emitBBExt4Inv2(emitFn); break;
+      case 'bbExt4Inv3': emitBBExt4Inv3(emitFn); break;
+      default: throw new Error(`Unknown Baby Bear builtin: ${func}`);
+    }
+
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  // =========================================================================
+  // KoalaBear field arithmetic — delegates to koalabear-codegen.ts
+  // =========================================================================
+
+  private lowerKBFieldBuiltin(
+    bindingName: string,
+    func: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    // Bring all args to stack top
+    for (const arg of args) {
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
+    }
+    for (let i = 0; i < args.length; i++) this.stackMap.pop();
+
+    const emitFn = (op: StackOp) => this.emitOp(op);
+
+    switch (func) {
+      case 'kbFieldAdd': emitKBFieldAdd(emitFn); break;
+      case 'kbFieldSub': emitKBFieldSub(emitFn); break;
+      case 'kbFieldMul': emitKBFieldMul(emitFn); break;
+      case 'kbFieldInv': emitKBFieldInv(emitFn); break;
+      case 'kbExt4Mul0': emitKBExt4Mul0(emitFn); break;
+      case 'kbExt4Mul1': emitKBExt4Mul1(emitFn); break;
+      case 'kbExt4Mul2': emitKBExt4Mul2(emitFn); break;
+      case 'kbExt4Mul3': emitKBExt4Mul3(emitFn); break;
+      case 'kbExt4Inv0': emitKBExt4Inv0(emitFn); break;
+      case 'kbExt4Inv1': emitKBExt4Inv1(emitFn); break;
+      case 'kbExt4Inv2': emitKBExt4Inv2(emitFn); break;
+      case 'kbExt4Inv3': emitKBExt4Inv3(emitFn); break;
+      default: throw new Error(`Unknown KoalaBear builtin: ${func}`);
+    }
+
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  // =========================================================================
+  // KoalaBear Poseidon2 builtins — delegates to poseidon2-koalabear-codegen.ts
+  // =========================================================================
+
+  private lowerKBPoseidon2Builtin(
+    bindingName: string,
+    func: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    // poseidon2KBPermute(s0, s1, ..., s15): 16 args → 16-element result
+    // poseidon2KBCompress(s0, s1, ..., s15): 16 args → 8-element result
+    // For our stack lowering purposes the codegen functions handle the
+    // internal stack manipulation; we just bring all args to top then call.
+    const expectedArgs = 16;
+    if (args.length !== expectedArgs) {
+      throw new Error(`${func} requires exactly ${expectedArgs} arguments, got ${args.length}`);
+    }
+
+    for (const arg of args) {
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
+    }
+    for (let i = 0; i < args.length; i++) this.stackMap.pop();
+
+    const emitFn = (op: StackOp) => this.emitOp(op);
+
+    switch (func) {
+      case 'poseidon2KBPermute': emitPoseidon2KBPermute(emitFn); break;
+      case 'poseidon2KBCompress': emitPoseidon2KBCompress(emitFn); break;
+      default: throw new Error(`Unknown KoalaBear Poseidon2 builtin: ${func}`);
+    }
+
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  // =========================================================================
+  // Poseidon2 Merkle proof verification — delegates to poseidon2-merkle-codegen.ts
+  // =========================================================================
+
+  private lowerPoseidon2MerkleRoot(
+    bindingName: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    // poseidon2MerkleRoot(leaf0..7, proof, index, depth)
+    // args: [leaf0..leaf7 (8 elems), proof (8*depth elems), index, depth]
+    // For simplicity we model this as: args = [leaf, proof, index, depth]
+    // where leaf is a conceptual name for all 8 leaf elements.
+    // The actual calling convention expects exactly 4 args at the ANF level.
+    if (args.length !== 4) {
+      throw new Error(`poseidon2MerkleRoot requires exactly 4 arguments (leaf, proof, index, depth)`);
+    }
+
+    // Extract depth constant from ANF binding
+    const depthArg = args[3]!;
+    const depthValue = this.getConstantValue(depthArg);
+    if (depthValue === null || typeof depthValue !== 'bigint') {
+      throw new Error(
+        `poseidon2MerkleRoot: depth (4th argument) must be a compile-time constant integer literal. ` +
+        `Got a runtime value for '${depthArg}'.`,
+      );
+    }
+    const depth = Number(depthValue);
+    if (depth < 1 || depth > 32) {
+      throw new Error(`poseidon2MerkleRoot: depth must be between 1 and 32, got ${depth}`);
+    }
+
+    // Remove depth value from the real stack FIRST (consumed at compile time).
+    if (this.stackMap.has(depthArg)) {
+      this.bringToTop(depthArg, true);
+      this.emitOp({ op: 'drop' });
+      this.stackMap.pop();
+    }
+
+    // Bring leaf, proof, index to stack top
+    for (let i = 0; i < 3; i++) {
+      const arg = args[i]!;
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
+    }
+    for (let i = 0; i < 3; i++) this.stackMap.pop();
+
+    const emitFn = (op: StackOp) => this.emitOp(op);
+    emitPoseidon2MerkleRoot(emitFn, depth);
+
+    this.stackMap.push(bindingName);
+    this.trackDepth();
+  }
+
+  // =========================================================================
+  // Merkle proof verification — delegates to merkle-codegen.ts
+  // =========================================================================
+
+  private lowerMerkleRoot(
+    bindingName: string,
+    func: string,
+    args: string[],
+    bindingIndex: number,
+    lastUses: Map<string, number>,
+  ): void {
+    // args: [leaf, proof, index, depth]
+    // depth must be a compile-time constant
+    if (args.length !== 4) {
+      throw new Error(`${func} requires exactly 4 arguments (leaf, proof, index, depth)`);
+    }
+
+    // Extract depth constant from ANF binding
+    const depthArg = args[3]!;
+    const depthValue = this.getConstantValue(depthArg);
+    if (depthValue === null || typeof depthValue !== 'bigint') {
+      throw new Error(
+        `${func}: depth (4th argument) must be a compile-time constant integer literal. ` +
+        `Got a runtime value for '${depthArg}'.`,
+      );
+    }
+    const depth = Number(depthValue);
+    if (depth < 1 || depth > 64) {
+      throw new Error(`${func}: depth must be between 1 and 64, got ${depth}`);
+    }
+
+    // Remove depth value from the real stack FIRST (it's consumed at compile time).
+    // Must happen before bringing the 3 runtime args to top, otherwise the stackMap
+    // and real stack get out of sync.
+    if (this.stackMap.has(depthArg)) {
+      this.bringToTop(depthArg, true);
+      this.emitOp({ op: 'drop' });
+      this.stackMap.pop();
+    }
+
+    // Now bring leaf, proof, index to stack top for the codegen
+    for (let i = 0; i < 3; i++) {
+      const arg = args[i]!;
+      this.bringToTop(arg, this.operandConsume(arg, args, bindingIndex, lastUses));
+    }
+    // Pop the 3 args — the codegen consumes them and produces 1 result
+    for (let i = 0; i < 3; i++) this.stackMap.pop();
+
+    const emitFn = (op: StackOp) => this.emitOp(op);
+
+    if (func === 'merkleRootSha256') {
+      emitMerkleRootSha256(emitFn, depth);
+    } else {
+      emitMerkleRootHash256(emitFn, depth);
     }
 
     this.stackMap.push(bindingName);
@@ -4192,12 +4840,12 @@ class LoweringContext {
     const [data, start, length] = args as [string, string, string];
 
     // Push data
-    const dataIsLast = this.isLastUse(data, bindingIndex, lastUses);
-    this.bringToTop(data, dataIsLast);
+    const dataConsume = this.operandConsume(data, args, bindingIndex, lastUses);
+    this.bringToTop(data, dataConsume);
 
     // Push start offset
-    const startIsLast = this.isLastUse(start, bindingIndex, lastUses);
-    this.bringToTop(start, startIsLast);
+    const startConsume = this.operandConsume(start, args, bindingIndex, lastUses);
+    this.bringToTop(start, startConsume);
 
     // Split at start: [left, right]
     this.stackMap.pop(); // start consumed
@@ -4213,8 +4861,8 @@ class LoweringContext {
     this.stackMap.push(rightPart);
 
     // Push length
-    const lenIsLast = this.isLastUse(length, bindingIndex, lastUses);
-    this.bringToTop(length, lenIsLast);
+    const lenConsume = this.operandConsume(length, args, bindingIndex, lastUses);
+    this.bringToTop(length, lenConsume);
 
     // Split at length: [result, remainder]
     this.stackMap.pop(); // length consumed
@@ -4260,12 +4908,12 @@ class LoweringContext {
     const [obj, index] = args as [string, string];
 
     // Push the data (ByteString) onto the stack
-    const objIsLast = this.isLastUse(obj, bindingIndex, lastUses);
-    this.bringToTop(obj, objIsLast);
+    const objConsume = this.operandConsume(obj, args, bindingIndex, lastUses);
+    this.bringToTop(obj, objConsume);
 
     // Push the index onto the stack
-    const indexIsLast = this.isLastUse(index, bindingIndex, lastUses);
-    this.bringToTop(index, indexIsLast);
+    const indexConsume = this.operandConsume(index, args, bindingIndex, lastUses);
+    this.bringToTop(index, indexConsume);
 
     // OP_SPLIT at index: stack = [..., left, right]
     this.stackMap.pop();  // index consumed
@@ -4363,9 +5011,47 @@ export function lowerToStack(program: ANFProgram): StackProgram {
  * before all declared parameters and we must account for it in the
  * stack map.
  */
-function methodUsesCheckPreimage(bindings: ANFBinding[]): boolean {
+function methodUsesCheckPreimage(
+  bindings: ANFBinding[],
+  privateMethods?: Map<string, ANFMethod>,
+  seen: Set<string> = new Set(),
+): boolean {
   for (const b of bindings) {
     if (b.value.kind === 'check_preimage') return true;
+    if (b.value.kind === 'if') {
+      if (methodUsesCheckPreimage(b.value.then, privateMethods, seen)) return true;
+      if (methodUsesCheckPreimage(b.value.else, privateMethods, seen)) return true;
+    }
+    if (b.value.kind === 'loop') {
+      if (methodUsesCheckPreimage(b.value.body, privateMethods, seen)) return true;
+    }
+    if (b.value.kind === 'method_call' && privateMethods) {
+      const target = privateMethods.get(b.value.method);
+      if (target && !seen.has(target.name)) {
+        const nextSeen = new Set(seen);
+        nextSeen.add(target.name);
+        if (methodUsesCheckPreimage(target.body, privateMethods, nextSeen)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a method READS a mutable variable-length (ByteString) state field's
+ * value (via load_prop). Issue #100: such a terminal method needs `_codePart`
+ * for the preimage-relative state offset. Narrowed to the live var-length read
+ * so methods that only read readonly fields (baked into the locking script) or
+ * fixed-size fields keep their original terminal codegen.
+ */
+function methodReadsVarLenState(bindings: ANFBinding[], varLenProps: Set<string>): boolean {
+  for (const b of bindings) {
+    if (b.value.kind === 'load_prop' && varLenProps.has(b.value.name)) return true;
+    if (b.value.kind === 'if') {
+      if (methodReadsVarLenState(b.value.then, varLenProps) ||
+          methodReadsVarLenState(b.value.else, varLenProps)) return true;
+    }
+    if (b.value.kind === 'loop' && methodReadsVarLenState(b.value.body, varLenProps)) return true;
   }
   return false;
 }
@@ -4393,17 +5079,21 @@ function lowerMethod(
 
   // If the method uses checkPreimage, the unlocking script pushes implicit
   // params before all declared parameters (OP_PUSH_TX pattern).
-  // _codePart: full code script (locking script minus state) as ByteString
-  // _opPushTxSig: ECDSA signature for OP_PUSH_TX verification
-  // These are inserted at the base of the stack so they can be consumed later.
-  if (methodUsesCheckPreimage(method.body)) {
-    paramNames.unshift('_opPushTxSig');
-    // _codePart is needed when the method has add_output or add_raw_output
-    // (it provides the code script for continuation output construction),
-    // or when deserializing variable-length (ByteString) state fields.
-    if (methodUsesCodePart(method.body)) {
-      paramNames.unshift('_codePart');
-    }
+  // _codePart: full code script (locking script minus state) as ByteString.
+  // (BUG-100 fix: the OP_PUSH_TX signature is now derived on-chain from the
+  // preimage — see lowerCheckPreimage — so NO _opPushTxSig witness item is
+  // pushed. The unlocking script provides only the preimage.)
+  // _codePart is needed for continuation builders (add_output/add_raw_output)
+  // OR when the method reads variable-length (ByteString) mutable state — the
+  // deserialization needs it for the preimage-relative offset (issue #100).
+  const varLenProps = new Set(
+    properties.filter(p => !p.readonly && p.type === 'ByteString').map(p => p.name),
+  );
+  const usesCodePart =
+    methodUsesCheckPreimage(method.body, privateMethods) &&
+    (methodUsesCodePart(method.body) || methodReadsVarLenState(method.body, varLenProps));
+  if (methodUsesCheckPreimage(method.body, privateMethods) && usesCodePart) {
+    paramNames.unshift('_codePart');
   }
 
   const ctx = new LoweringContext(paramNames, properties, privateMethods);
@@ -4411,10 +5101,21 @@ function lowerMethod(
   // its value on the stack (Bitcoin Script requires a truthy top-of-stack).
   ctx.lowerBindings(method.body, method.isPublic);
 
-  // Clean up excess stack items left by deserialize_state.
-  // Only needed for stateful methods that deserialize state from the preimage.
-  const hasDeserializeState = method.body.some(b => b.value.kind === 'deserialize_state');
-  if (method.isPublic && hasDeserializeState) {
+  // Clean up excess stack items below the top-of-stack boolean.
+  //
+  // Bitcoin Script's CLEANSTACK rule requires exactly one item on the stack
+  // at end-of-script. Excess items can come from `deserialize_state` (stateful
+  // methods reading mutable fields), from readonly-field-binding patterns in
+  // the method body (force-embedding readonly fields by referencing them),
+  // or from any other mid-method binding whose value isn't consumed by an
+  // assert. The previous gate of `hasDeserializeState` missed the readonly-
+  // only path, causing all-readonly terminal methods to emit a script that
+  // failed CLEANSTACK on mainnet — "Script did not clean its stack".
+  //
+  // `cleanupExcessStack()` is idempotent (no-op when `stackMap.depth === 1`),
+  // so running it unconditionally for public methods is safe — it adds
+  // appropriate `OP_NIP` opcodes only when the stack genuinely needs cleanup.
+  if (method.isPublic) {
     ctx.cleanupExcessStack();
   }
 
@@ -4431,5 +5132,6 @@ function lowerMethod(
     name: method.name,
     ops,
     maxStackDepth,
+    usesCodePart,
   };
 }

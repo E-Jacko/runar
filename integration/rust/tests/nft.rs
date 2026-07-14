@@ -2,6 +2,12 @@
 //!
 //! Both methods require a Sig parameter (checkSig), so spending requires raw
 //! transaction construction. We test compile + deploy via the SDK.
+//!
+//! **Gating**: all on-chain tests are gated with
+//! `#[cfg_attr(not(feature = "regtest"), ignore)]`. They require a local Bitcoin
+//! regtest node (see `integration/rust/README.md`). Run with:
+//!     cargo test --features regtest
+//! Tests without the gate (pure compile/script-size checks) run by default.
 
 use crate::helpers::*;
 use runar_lang::sdk::{CallOptions, DeployOptions, RunarContract, SdkValue};
@@ -12,16 +18,13 @@ fn hex_encode_str(s: &str) -> String {
 }
 
 #[test]
-#[ignore]
 fn test_nft_compile() {
-    skip_if_no_node();
-
     let artifact = compile_contract("examples/ts/token-nft/NFTExample.runar.ts");
     assert_eq!(artifact.contract_name, "SimpleNFT");
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_nft_deploy() {
     skip_if_no_node();
 
@@ -45,6 +48,7 @@ fn test_nft_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
@@ -52,7 +56,7 @@ fn test_nft_deploy() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_nft_deploy_different_owners() {
     skip_if_no_node();
 
@@ -75,6 +79,7 @@ fn test_nft_deploy_different_owners() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy 1 failed");
 
@@ -87,6 +92,7 @@ fn test_nft_deploy_different_owners() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy 2 failed");
 
@@ -94,7 +100,7 @@ fn test_nft_deploy_different_owners() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_nft_deploy_long_metadata() {
     skip_if_no_node();
 
@@ -118,13 +124,14 @@ fn test_nft_deploy_long_metadata() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!deploy_txid.is_empty());
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_nft_transfer() {
     skip_if_no_node();
 
@@ -148,6 +155,7 @@ fn test_nft_transfer() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -165,7 +173,7 @@ fn test_nft_transfer() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_nft_burn() {
     skip_if_no_node();
 
@@ -187,6 +195,7 @@ fn test_nft_burn() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -204,7 +213,7 @@ fn test_nft_burn() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_nft_wrong_owner_rejected() {
     skip_if_no_node();
 
@@ -228,6 +237,7 @@ fn test_nft_wrong_owner_rejected() {
         .deploy(&mut provider, &*signer_a, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

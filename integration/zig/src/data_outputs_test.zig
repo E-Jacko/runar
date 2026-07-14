@@ -1,0 +1,73 @@
+const std = @import("std");
+const runar = @import("runar");
+const helpers = @import("helpers.zig");
+const compile = @import("compile.zig");
+
+// ---------------------------------------------------------------------------
+// data_outputs integration: compile + (when regtest is up) deploy and call a
+// stateful contract whose method calls `self.addDataOutput(...)`. Mirrors the
+// Go `data_outputs_test.go` and TS `data-outputs.test.ts` regtest covers.
+// ---------------------------------------------------------------------------
+
+test "DataOutput_Compile" {
+    const allocator = std.testing.allocator;
+
+    var artifact = try compile.compileContract(
+        allocator,
+        "examples/zig/add-data-output/DataOutputTest.runar.zig",
+    );
+    defer artifact.deinit();
+
+    try std.testing.expectEqualStrings("DataOutputTest", artifact.contract_name);
+    try std.testing.expect(artifact.isStateful());
+    std.log.info("DataOutputTest compiled: {d} bytes", .{artifact.script.len / 2});
+}
+
+test "DataOutput_Deploy_Publish" {
+    const allocator = std.testing.allocator;
+
+    helpers.requireNodeAvailable(allocator);
+
+    // Integration-only 1-sat data-output variant (see contract file header):
+    // the CI regtest node (acceptnonstdtxn=0, PR #49) rejects 0-sat OP_RETURN
+    // as dust. The conformance-linked example contract stays at 0; the
+    // DataOutput_Compile test above still exercises it for parity coverage.
+    var artifact = try compile.compileContract(
+        allocator,
+        "integration/zig/contracts/DataOutputTestLive.runar.zig",
+    );
+    defer artifact.deinit();
+
+    var contract = try runar.RunarContract.init(allocator, &artifact, &[_]runar.StateValue{
+        .{ .int = 0 },
+    });
+    defer contract.deinit();
+
+    var wallet = try helpers.newWallet(allocator);
+    defer wallet.deinit();
+    const fund_txid = try helpers.fundWallet(allocator, &wallet, 1.0);
+    defer allocator.free(fund_txid);
+
+    var rpc_provider = helpers.RPCProvider.init(allocator);
+    var local_signer = try wallet.localSigner();
+
+    const deploy_txid = try contract.deploy(rpc_provider.provider(), local_signer.signer(), .{ .satoshis = 5000 });
+    defer allocator.free(deploy_txid);
+    std.log.info("DataOutputTest deployed: {s}", .{deploy_txid});
+
+    // Payload: OP_RETURN "hi" -- the data output the contract emits.
+    // The contract just relays the bytes verbatim into the data output.
+    const payload = "6a026869";
+
+    const call_txid = try contract.call(
+        "publish",
+        &[_]runar.StateValue{.{ .bytes = payload }},
+        rpc_provider.provider(),
+        local_signer.signer(),
+        .{ .new_state = &[_]runar.StateValue{.{ .int = 1 }} },
+    );
+    defer allocator.free(call_txid);
+
+    try std.testing.expectEqual(@as(usize, 64), call_txid.len);
+    std.log.info("DataOutputTest publish TX: {s}", .{call_txid});
+}

@@ -76,6 +76,8 @@ module RunarCompiler
       "OP_EQUALVERIFY"         => 0x88,
       "OP_1ADD"                => 0x8b,
       "OP_1SUB"                => 0x8c,
+      "OP_2MUL"                => 0x8d, # Chronicle: multiply by 2
+      "OP_2DIV"                => 0x8e, # Chronicle: divide by 2
       "OP_NEGATE"              => 0x8f,
       "OP_ABS"                 => 0x90,
       "OP_NOT"                 => 0x91,
@@ -109,6 +111,11 @@ module RunarCompiler
       "OP_CHECKSIGVERIFY"      => 0xad,
       "OP_CHECKMULTISIG"       => 0xae,
       "OP_CHECKMULTISIGVERIFY" => 0xaf,
+      "OP_SUBSTR"              => 0xb3, # Chronicle: substring
+      "OP_LEFT"                => 0xb4, # Chronicle: left N chars
+      "OP_RIGHT"               => 0xb5, # Chronicle: right N chars
+      "OP_LSHIFTNUM"           => 0xb6, # Chronicle: numeric left-shift
+      "OP_RSHIFTNUM"           => 0xb7, # Chronicle: numeric right-shift
     }.freeze
 
     # ------------------------------------------------------------------
@@ -137,14 +144,39 @@ module RunarCompiler
     # EmitResult
     # ------------------------------------------------------------------
 
+    # Records the byte offset of a codeSepIndex placeholder (OP_0) in the
+    # emitted script.  The SDK replaces it with the adjusted
+    # codeSeparatorIndex at deployment time.
+    CodeSepIndexSlot = Struct.new(:byte_offset, :code_sep_index, keyword_init: true) do
+      def initialize(byte_offset: 0, code_sep_index: 0)
+        super
+      end
+    end
+
+    # ------------------------------------------------------------------
+    # RawScriptSpan
+    # ------------------------------------------------------------------
+
+    # Records a byte range produced by a raw_script ANF node. The bytes are
+    # emitted verbatim by emit_raw_bytes; the static analyzer reads these
+    # spans so it can skip the contents (which are opaque, peephole-barrier-
+    # protected, and not guaranteed to form a well-formed opcode stream).
+    RawScriptSpan = Struct.new(:offset, :length, :in_arity, :out_arity, keyword_init: true) do
+      def initialize(offset: 0, length: 0, in_arity: 0, out_arity: 0)
+        super
+      end
+    end
+
     # Holds the outputs of the emission pass.
     EmitResult = Struct.new(
       :script_hex,
       :script_asm,
       :source_map,
       :constructor_slots,
+      :code_sep_index_slots,
       :code_separator_index,
       :code_separator_indices,
+      :raw_script_spans,
       keyword_init: true
     ) do
       def initialize(
@@ -152,8 +184,10 @@ module RunarCompiler
         script_asm: "",
         source_map: [],
         constructor_slots: [],
+        code_sep_index_slots: [],
         code_separator_index: -1,
-        code_separator_indices: []
+        code_separator_indices: [],
+        raw_script_spans: []
       )
         super
       end
@@ -333,13 +367,35 @@ module RunarCompiler
       [hex_str].pack("H*")
     end
 
+    # Encode raw bytes as a Bitcoin Script push-data operation and return the
+    # result as a hex string. Used by the frontend asm() array-body encoder
+    # (push('<hex>') elements).
+    #
+    # @param data [String] binary string of data bytes
+    # @return [String] hex-encoded push-data operation
+    def self.encode_push_bytes_hex(data)
+      bytes_to_hex(encode_push_data(data))
+    end
+
+    # Return the single-byte encoding of a named BSV opcode (e.g. "OP_DUP"),
+    # or nil if the name is unknown. Used by the frontend asm() array-body
+    # encoder.
+    #
+    # @param name [String] opcode name
+    # @return [Integer, nil]
+    def self.opcode_byte(name)
+      OPCODES[name]
+    end
+
     # ------------------------------------------------------------------
     # Emit context (internal)
     # ------------------------------------------------------------------
 
     # @api private
     class EmitContext
-      attr_reader :source_map, :constructor_slots, :code_separator_index, :code_separator_indices
+      attr_reader :source_map, :constructor_slots, :code_sep_index_slots,
+                  :code_separator_index, :code_separator_indices,
+                  :raw_script_spans
 
       def initialize
         @hex_parts = []
@@ -349,8 +405,10 @@ module RunarCompiler
         @source_map = []
         @pending_source_loc = nil
         @constructor_slots = []
+        @code_sep_index_slots = []
         @code_separator_index = -1
         @code_separator_indices = []
+        @raw_script_spans = []
       end
 
       def set_source_loc(loc)
@@ -389,6 +447,45 @@ module RunarCompiler
         @constructor_slots << ConstructorSlot.new(
           param_index: param_index,
           byte_offset: byte_offset
+        )
+      end
+
+      def emit_code_sep_index_placeholder(code_sep_idx)
+        byte_offset = @byte_length
+        record_source_mapping
+        advance_opcode_index
+        append_hex("00") # OP_0 placeholder byte
+        append_asm("OP_0")
+        @code_sep_index_slots << CodeSepIndexSlot.new(
+          byte_offset: byte_offset,
+          code_sep_index: code_sep_idx
+        )
+      end
+
+      # Write a verbatim byte span emitted by a raw_bytes StackOp.
+      #
+      # No re-encoding takes place -- the bytes go out as supplied. The ASM
+      # column shows `<raw N bytes>` so the human-readable disassembly is
+      # honest about the opacity. A RawScriptSpan capturing the span's
+      # offset, length, and declared stack-effect arities is recorded so the
+      # static analyzer can treat the span as one opaque stack-effect step.
+      #
+      # @param bytes [String] binary string of opcode bytes
+      # @param in_arity [Integer]
+      # @param out_arity [Integer]
+      def emit_raw_bytes(bytes, in_arity, out_arity)
+        return if bytes.nil? || bytes.bytesize.zero?
+
+        offset = @byte_length
+        record_source_mapping
+        advance_opcode_index
+        append_hex(Codegen.bytes_to_hex(bytes))
+        append_asm("<raw #{bytes.bytesize} bytes>")
+        @raw_script_spans << RawScriptSpan.new(
+          offset: offset,
+          length: bytes.bytesize,
+          in_arity: in_arity,
+          out_arity: out_arity
         )
       end
 
@@ -465,9 +562,17 @@ module RunarCompiler
         emit_if(op[:then] || [], op[:else_ops] || [], ctx)
       when "placeholder"
         ctx.emit_placeholder(op[:param_index] || 0)
+      when "raw_bytes"
+        # Opaque opcode-byte span from a raw_script ANF node. Written
+        # verbatim with no re-encoding; the declared arities are recorded
+        # into the artifact's rawScriptSpans so the analyzer can treat the
+        # span as one opaque stack-effect step.
+        ctx.emit_raw_bytes(op[:raw_bytes], op[:in_arity] || 0, op[:out_arity] || 0)
       when "push_codesep_index"
-        idx = ctx.code_separator_index >= 0 ? ctx.code_separator_index : 0
-        ctx.emit_push({ kind: "bigint", big_int: idx })
+        # Emit an OP_0 placeholder that the SDK will replace with the
+        # adjusted codeSeparatorIndex at runtime.
+        code_sep_idx = ctx.code_separator_index >= 0 ? ctx.code_separator_index : 0
+        ctx.emit_code_sep_index_placeholder(code_sep_idx)
       else
         raise ArgumentError, "unknown stack op: #{op[:op]}"
       end
@@ -552,7 +657,8 @@ module RunarCompiler
           script_hex: "",
           script_asm: "",
           source_map: [],
-          constructor_slots: []
+          constructor_slots: [],
+          code_sep_index_slots: []
         )
       end
 
@@ -569,8 +675,10 @@ module RunarCompiler
         script_asm: ctx.get_asm,
         source_map: ctx.source_map,
         constructor_slots: ctx.constructor_slots,
+        code_sep_index_slots: ctx.code_sep_index_slots,
         code_separator_index: ctx.code_separator_index,
-        code_separator_indices: ctx.code_separator_indices
+        code_separator_indices: ctx.code_separator_indices,
+        raw_script_spans: ctx.raw_script_spans
       )
     end
 
@@ -588,8 +696,10 @@ module RunarCompiler
         script_asm: ctx.get_asm,
         source_map: ctx.source_map,
         constructor_slots: ctx.constructor_slots,
+        code_sep_index_slots: ctx.code_sep_index_slots,
         code_separator_index: ctx.code_separator_index,
-        code_separator_indices: ctx.code_separator_indices
+        code_separator_indices: ctx.code_separator_indices,
+        raw_script_spans: ctx.raw_script_spans
       )
     end
   end

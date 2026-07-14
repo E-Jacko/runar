@@ -303,15 +303,28 @@ module RunarCompiler
       def self.const_to_anf_value(cv)
         tag, val = cv
         v = IR::ANFValue.new(kind: "load_const")
-        v.raw_value = JSON.generate(val)
 
         case tag
         when "int"
+          # Mirror _make_load_const_int: oversize bigints get the canonical
+          # JS BigInt `"...n"` decimal-string discriminator so cross-tier
+          # JSON consumers (Go encoding/json) round-trip without precision
+          # loss. Without this, fold-collapsed 256-bit values (e.g. an
+          # `EC_N - 1` constant from the optimizer) would be silently
+          # truncated by the consumer.
+          v.raw_value = if val.is_a?(Integer) &&
+                           (val > INT64_MAX_LOAD_CONST || val < INT64_MIN_LOAD_CONST)
+                          JSON.generate("#{val}n")
+                        else
+                          JSON.generate(val)
+                        end
           v.const_big_int = val
           v.const_int = val
         when "bool"
+          v.raw_value = JSON.generate(val)
           v.const_bool = val
         when "str"
+          v.raw_value = JSON.generate(val)
           v.const_string = val
         end
 
@@ -346,6 +359,22 @@ module RunarCompiler
       # -----------------------------------------------------------------
       # Fold a single value
       # -----------------------------------------------------------------
+
+      # Kinds that fall through fold_value unchanged. Listing them
+      # explicitly lets us raise UnknownANFKindError on any kind that
+      # isn't a known fold case, so a forgotten dispatch-site update fails
+      # loudly instead of silently corrupting downstream passes.
+      FOLD_VALUE_PASSTHROUGH_KINDS = %w[
+        assert
+        update_prop
+        check_preimage
+        deserialize_state
+        add_output
+        add_raw_output
+        add_data_output
+        array_literal
+        get_state_script
+      ].freeze
 
       def self.fold_value(value, env)
         kind = value.kind
@@ -433,11 +462,24 @@ module RunarCompiler
           new_v.count = value.count
           new_v.body = folded_body
           new_v.iter_var = value.iter_var
+          new_v.start = value.start
+          new_v.step = value.step
           return new_v
         end
 
-        # Terminal / side-effecting kinds pass through
-        value
+        if kind == "raw_script"
+          # Opaque byte span -- never folded. Bytes are byte-canonical and
+          # the peephole optimizer treats it as a hard barrier.
+          return value
+        end
+
+        # Terminal / side-effecting kinds pass through.  Anything not in
+        # the explicit allowlist is a forgotten dispatch-site update:
+        # fail loudly so the regression is caught at the first binding
+        # instead of leaking an unhandled variant into Stack IR / hex.
+        return value if FOLD_VALUE_PASSTHROUGH_KINDS.include?(kind)
+
+        raise ::RunarCompiler::IR::UnknownANFKindError.new(kind, "constant-fold.foldValue")
       end
       private_class_method :fold_value
 
@@ -447,12 +489,26 @@ module RunarCompiler
 
       SIDE_EFFECT_KINDS = %w[
         assert update_prop check_preimage deserialize_state
-        add_output if loop call method_call
+        add_output add_raw_output add_data_output
+        if loop call method_call raw_script
+      ].freeze
+
+      # Kinds known to have no observable side effects.  Listed explicitly
+      # so an unknown kind raises UnknownANFKindError instead of silently
+      # being treated as side-effect-free (which would cause DCE to drop
+      # a new side-effecting variant).
+      SIDE_EFFECT_FREE_KINDS = %w[
+        load_param load_prop load_const get_state_script
+        bin_op unary_op array_literal
       ].freeze
 
       # Return true if this value kind has observable side effects.
       def self.has_side_effect(value)
-        SIDE_EFFECT_KINDS.include?(value.kind)
+        kind = value.kind
+        return true  if SIDE_EFFECT_KINDS.include?(kind)
+        return false if SIDE_EFFECT_FREE_KINDS.include?(kind)
+
+        raise ::RunarCompiler::IR::UnknownANFKindError.new(kind, "constant-fold.hasSideEffect")
       end
 
       # -----------------------------------------------------------------
@@ -460,33 +516,54 @@ module RunarCompiler
       # -----------------------------------------------------------------
 
       # Walk an ANFValue and collect all binding name references.
+      #
+      # Uses an explicit kind dispatch so an unknown variant raises
+      # UnknownANFKindError instead of silently contributing zero refs
+      # (which would cause DCE to drop a live binding).
       def self.collect_refs_from_value(value, used)
-        if value.kind == "load_param"
-          return
-        end
-
-        if value.kind == "load_const"
+        case value.kind
+        when "load_param", "load_prop", "get_state_script"
+          # No refs.
+        when "load_const"
           if value.const_string && value.const_string.start_with?("@ref:")
             used.add(value.const_string[5..])
           end
-          return
+        when "bin_op"
+          used.add(value.left)  if value.left
+          used.add(value.right) if value.right
+        when "unary_op"
+          used.add(value.operand) if value.operand
+        when "call"
+          value.args&.each { |a| used.add(a) }
+        when "method_call"
+          used.add(value.object) if value.object
+          value.args&.each { |a| used.add(a) }
+        when "if"
+          used.add(value.cond) if value.cond
+          value.then&.each  { |b| collect_refs_from_value(b.value, used) }
+          value.else_&.each { |b| collect_refs_from_value(b.value, used) }
+        when "loop"
+          value.body&.each { |b| collect_refs_from_value(b.value, used) }
+        when "assert", "update_prop"
+          used.add(value.value_ref) if value.value_ref
+        when "check_preimage", "deserialize_state"
+          used.add(value.preimage) if value.preimage
+        when "add_output"
+          used.add(value.satoshis) if value.satoshis
+          value.state_values&.each { |sv| used.add(sv) }
+          used.add(value.preimage) if value.preimage
+        when "add_raw_output", "add_data_output"
+          used.add(value.satoshis)     if value.satoshis
+          used.add(value.script_bytes) if value.script_bytes
+        when "array_literal"
+          value.elements&.each { |e| used.add(e) }
+        when "raw_script"
+          # Opaque: no SSA operand refs.
+        else
+          # Exhaustiveness guard.  A silent no-op would let DCE drop a
+          # live binding because its refs go uncollected.
+          raise ::RunarCompiler::IR::UnknownANFKindError.new(value.kind, "constant-fold.collectRefsFromValue")
         end
-
-        return if value.kind == "load_prop" || value.kind == "get_state_script"
-
-        used.add(value.left)         if value.left
-        used.add(value.right)        if value.right
-        used.add(value.operand)      if value.operand
-        used.add(value.cond)         if value.cond
-        used.add(value.value_ref)    if value.value_ref
-        used.add(value.object)       if value.object
-        used.add(value.satoshis)     if value.satoshis
-        used.add(value.preimage)     if value.preimage
-        value.args&.each         { |a| used.add(a) }
-        value.state_values&.each { |sv| used.add(sv) }
-        value.then&.each  { |b| collect_refs_from_value(b.value, used) }
-        value.else_&.each { |b| collect_refs_from_value(b.value, used) }
-        value.body&.each  { |b| collect_refs_from_value(b.value, used) }
       end
 
       # -----------------------------------------------------------------
@@ -500,7 +577,12 @@ module RunarCompiler
           name: method.name,
           params: method.params.dup,
           body: folded_body,
-          is_public: method.is_public
+          is_public: method.is_public,
+          # Issue #123: preserve the declared @sighash mode across folding so
+          # the artifact assembler can still stamp the ABI sigHashType. (The
+          # per-node check_preimage sighash_flag survives via fold_value's
+          # passthrough of the same object.)
+          sighash_type: method.sighash_type
         )
       end
       private_class_method :fold_method
@@ -517,7 +599,8 @@ module RunarCompiler
         IR::ANFProgram.new(
           contract_name: program.contract_name,
           properties: program.properties.dup,
-          methods: program.methods.map { |m| fold_method(m) }
+          methods: program.methods.map { |m| fold_method(m) },
+          parent_class: program.parent_class
         )
       end
     end

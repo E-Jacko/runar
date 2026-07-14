@@ -26,21 +26,42 @@ module RunarCompiler
     # Program structure
     # -------------------------------------------------------------------
 
-    ANFProgram = Struct.new(:contract_name, :properties, :methods, keyword_init: true) do
-      def initialize(contract_name: "", properties: [], methods: [])
-        super(contract_name: contract_name, properties: properties, methods: methods)
+    # +parent_class+ is the base class the source contract extends
+    # ("SmartContract" | "StatefulSmartContract" | "UnsafeSmartContract"). It is
+    # an in-memory carrier ONLY -- it is never written into the emitted ANF IR
+    # JSON that the conformance suite compares cross-tier (see
+    # +_serialize_anf_program+ in compiler.rb, which omits it). The artifact
+    # assembler copies it to the top-level artifact field so SDKs can gate the
+    # issue-#42/#44 terminal sighash subscript trim on the authoritative parent
+    # class (a StatefulSmartContract with zero mutable fields still needs the
+    # trim even though stateFields is empty).
+    ANFProgram = Struct.new(:contract_name, :properties, :methods, :parent_class, keyword_init: true) do
+      def initialize(contract_name: "", properties: [], methods: [], parent_class: "")
+        super(contract_name: contract_name, properties: properties, methods: methods, parent_class: parent_class)
       end
     end
 
-    ANFProperty = Struct.new(:name, :type, :readonly, :initial_value, keyword_init: true) do
-      def initialize(name: "", type: "", readonly: false, initial_value: nil)
-        super(name: name, type: type, readonly: readonly, initial_value: initial_value)
+    # +synthetic_array_chain+ propagates the +PropertyNode#synthetic_array_chain+
+    # marker from the AST into the ANF IR so the artifact assembler can
+    # iteratively re-group expanded +FixedArray<T, N>+ leaves back into a
+    # logical +FixedArray+ state field.  Each entry is a Hash with keys
+    # +:base+, +:index+, +:length+ (outermost first).  +nil+ on user-written
+    # scalar properties.
+    ANFProperty = Struct.new(:name, :type, :readonly, :initial_value, :synthetic_array_chain, keyword_init: true) do
+      def initialize(name: "", type: "", readonly: false, initial_value: nil, synthetic_array_chain: nil)
+        super(name: name, type: type, readonly: readonly, initial_value: initial_value, synthetic_array_chain: synthetic_array_chain)
       end
     end
 
-    ANFMethod = Struct.new(:name, :params, :body, :is_public, keyword_init: true) do
-      def initialize(name: "", params: [], body: [], is_public: false)
-        super(name: name, params: params, body: body, is_public: is_public)
+    # +sighash_type+ carries the declared +@sighash+ mode (issue #123) from the
+    # AST MethodNode so the artifact assembler can stamp a non-default mode into
+    # the ABI +sigHashType+. Like +ANFProgram#parent_class+ it is an in-memory
+    # carrier ONLY — it is never written into the emitted ANF IR JSON that the
+    # conformance suite compares cross-tier (the ANF carries the mode instead on
+    # the +check_preimage+ node's +sighash_flag+; see +_serialize_anf_program+).
+    ANFMethod = Struct.new(:name, :params, :body, :is_public, :sighash_type, keyword_init: true) do
+      def initialize(name: "", params: [], body: [], is_public: false, sighash_type: nil)
+        super(name: name, params: params, body: body, is_public: is_public, sighash_type: sighash_type)
       end
     end
 
@@ -101,17 +122,41 @@ module RunarCompiler
                     :count,
                     :iter_var,
                     :body,
+                    # Iterator start value (Integer) and step direction
+                    # (+1 / -1) for non-zero-start & countdown loops (#121).
+                    # On iteration +i+ the iterator holds +start + i*step+.
+                    # Zero-start counting-up loops carry start=0, step=1,
+                    # reproducing the historical i = 0..count-1 lowering.
+                    :start,
+                    :step,
                     # -- assert, update_prop (value ref), check_preimage ---
                     :value_ref,
                     # -- check_preimage, deserialize_state -----------------
                     :preimage,
+                    # -- check_preimage: BIP-143 sighash flag the on-chain
+                    #    OP_PUSH_TX binding appends to the derived signature
+                    #    (issue #123). nil = default ALL|FORKID (0x41),
+                    #    byte-identical to the pinned cross-tier binding blob.
+                    :sighash_flag,
                     # -- add_output ----------------------------------------
                     :satoshis,
                     :state_values,
                     # -- add_raw_output ------------------------------------
                     :script_bytes,
                     # -- array_literal -------------------------------------
-                    :elements
+                    :elements,
+                    # -- raw_script: opaque opcode-byte span with declared
+                    #    stack arity (emitted by the asm() intrinsic).
+                    :bytes,
+                    :in_arity,
+                    :out_arity,
+                    # -- assert (auto-injected stateful-continuation marker) --
+                    # +true+ only on the compiler-emitted
+                    # +hash256(continuationOutputs) === extractOutputHash(txPreimage)+
+                    # assert. Off-chain SDK interpreters skip this assert via a
+                    # direct marker lookup instead of structural / taint
+                    # heuristics that misfire on developer covenant asserts.
+                    :is_auto_injected_state_check
 
       def initialize(kind: "", **_opts)
         @kind = kind
@@ -136,12 +181,19 @@ module RunarCompiler
         @count = nil
         @iter_var = nil
         @body = nil
+        @start = nil
+        @step = nil
         @value_ref = nil
         @preimage = nil
+        @sighash_flag = nil
         @satoshis = nil
         @state_values = nil
         @script_bytes = nil
         @elements = nil
+        @bytes = nil
+        @in_arity = nil
+        @out_arity = nil
+        @is_auto_injected_state_check = false
       end
     end
 
@@ -196,6 +248,24 @@ module RunarCompiler
     end
     private_class_method :_decode_value
 
+    # True if +s+ is a JS-style decimal BigInt literal: optional leading
+    # +-+, one or more ASCII digits, and a REQUIRED trailing +n+ marker.
+    # Mirrors the discriminator used by compilers/go/ir/types.go and
+    # compilers/python/runar_compiler/ir/types.py. The trailing +n+ is the
+    # discriminator that separates a decimal-encoded BigInt from a hex-
+    # encoded ByteString literal (which never carries the suffix), so a
+    # hex string like "3030" is not mis-decoded as the integer 3030.
+    def self.decimal_bigint_literal?(s)
+      return false unless s.is_a?(String)
+      return false if s.length < 2 || s[-1] != "n"
+
+      start = s[0] == "-" ? 1 : 0
+      body = s[start..-2]
+      return false if body.empty?
+
+      body.each_char.all? { |c| c >= "0" && c <= "9" }
+    end
+
     def self._decode_const_value(v, method_name, binding_name)
       if v.raw_value.nil?
         raise ArgumentError,
@@ -211,8 +281,18 @@ module RunarCompiler
         return
       end
 
-      # String (hex-encoded bytes)
+      # String. Either a JS-style oversize BigInt literal ('123...n' with the
+      # canonical 'n' suffix) or a hex-encoded ByteString literal. The 'n'
+      # suffix is the discriminator -- without it the two cases are
+      # indistinguishable when the literal is all-digit (e.g. '3030' is
+      # both a valid decimal integer AND a valid hex bytestring).
       if raw.is_a?(String)
+        if decimal_bigint_literal?(raw)
+          int_val = raw[0..-2].to_i
+          v.const_big_int = int_val
+          v.const_int = int_val
+          return
+        end
         v.const_string = raw
         return
       end
@@ -252,11 +332,22 @@ module RunarCompiler
       v.cond        = d["cond"]
       v.count       = d["count"]
       v.iter_var    = d["iterVar"]
+      # Loop start/step (#121). start is serialized as a JS-style "Nn" bigint
+      # string; decode it to a Ruby Integer so stack lowering / the interpreter
+      # can compute start + i*step. step is a plain integer (+1 / -1).
+      v.start       = _decode_loop_start(d["start"]) if d.key?("start")
+      v.step        = d["step"]
       v.preimage    = d["preimage"]
+      # Issue #123: non-default sighash flag for a check_preimage node.
+      v.sighash_flag = d["sighashFlag"]
       v.satoshis    = d["satoshis"]
       v.state_values = d["stateValues"]
       v.script_bytes = d["scriptBytes"]
       v.elements    = d["elements"]
+      v.bytes       = d["bytes"]
+      v.in_arity    = d["in_arity"]
+      v.out_arity   = d["out_arity"]
+      v.is_auto_injected_state_check = d["isAutoInjectedStateCheck"] == true
 
       # Nested bindings
       if d.key?("then") && !d["then"].nil?
@@ -272,6 +363,20 @@ module RunarCompiler
       v
     end
     private_class_method :_anf_value_from_hash
+
+    # Decode a loop `start` field (#121). Accepts a JS-style "Nn" bigint
+    # string (the canonical serialization), a plain JSON integer, or nil
+    # (older payloads with no start → zero-start counting-up loop).
+    def self._decode_loop_start(raw)
+      return 0 if raw.nil?
+      return raw if raw.is_a?(Integer)
+      if raw.is_a?(String)
+        return raw[0..-2].to_i if decimal_bigint_literal?(raw)
+        return raw.to_i if raw.match?(/\A-?\d+\z/)
+      end
+      0
+    end
+    private_class_method :_decode_loop_start
 
     def self._anf_binding_from_hash(d)
       ANFBinding.new(

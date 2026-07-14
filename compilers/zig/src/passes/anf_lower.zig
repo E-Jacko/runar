@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const types = @import("../ir/types.zig");
+const sighash_directive = @import("../frontend/sighash_directive.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -53,6 +54,23 @@ pub fn lowerToANF(allocator: Allocator, contract: ContractNode) LowerError!ANFPr
     const properties = try lowerProperties(allocator, contract);
     const methods = try lowerMethods(allocator, contract);
 
+    // Post-pass: lift update_prop from if-else branches into flat conditionals.
+    // This prevents phantom stack entries in stack lowering for patterns like
+    // position dispatch (different properties updated in different branches).
+    // Mirrors the TS reference compiler's liftBranchUpdateProps
+    // (packages/runar-compiler/src/passes/04-anf-lower.ts).
+    for (methods) |*m| {
+        const old_bindings = m.bindings;
+        const lifted = try liftBranchUpdateProps(allocator, old_bindings);
+        // Release the outer slice from `lowerMethods`. Inner ANFBinding entries
+        // that survived (those that did not match the lift pattern) are
+        // copied by value into `lifted`, so the strings/sub-slices they
+        // reference remain valid and are NOT freed here.
+        if (old_bindings.len > 0) allocator.free(old_bindings);
+        m.bindings = lifted;
+        m.body = lifted;
+    }
+
     return ANFProgram{
         .contract_name = contract.name,
         .parent_class = contract.parent_class,
@@ -68,7 +86,8 @@ pub fn lowerToANF(allocator: Allocator, contract: ContractNode) LowerError!ANFPr
 fn isByteType(t: RunarType) bool {
     return switch (t) {
         .byte_string, .pub_key, .sig, .sha256, .ripemd160, .addr,
-        .sig_hash_preimage, .rabin_sig, .rabin_pub_key, .point => true,
+        .sig_hash_preimage, .rabin_sig, .rabin_pub_key, .point,
+        .p256_point, .p384_point => true,
         else => false,
     };
 }
@@ -83,6 +102,10 @@ fn isByteReturningFunction(name: []const u8) bool {
         .{ "ecMulGen", {} },     .{ "ecNegate", {} },     .{ "ecMakePoint", {} },
         .{ "ecEncodeCompressed", {} },
         .{ "blake3Compress", {} }, .{ "blake3Hash", {} },
+        .{ "p256Add", {} },      .{ "p256Mul", {} },      .{ "p256MulGen", {} },
+        .{ "p256Negate", {} },   .{ "p256EncodeCompressed", {} },
+        .{ "p384Add", {} },      .{ "p384Mul", {} },      .{ "p384MulGen", {} },
+        .{ "p384Negate", {} },   .{ "p384EncodeCompressed", {} },
     });
     return funcs.get(name) != null;
 }
@@ -96,7 +119,18 @@ fn isByteTypedExpr(expr: Expression, ctx: *const LowerCtx) bool {
             for (ctx.contract.properties) |p| {
                 if (std.mem.eql(u8, p.name, name) and isByteType(p.type_info)) return true;
             }
-            // Check local byte vars
+            // Check method-scoped byte-typed names. `local_byte_vars` is
+            // populated once per method/constructor (in `lowerMethods` /
+            // `lowerStatefulPublicMethod`) with the CURRENT method's params
+            // (and auto-injected continuation params) plus byte-typed locals,
+            // and is shared into if/else/loop sub-contexts via `subContext`.
+            // Restricting the param-type lookup to this map (instead of walking
+            // ALL methods' params) fixes issue #34: a param name shared across
+            // methods (e.g. one method's `x` colliding with another method's
+            // `x: ByteString`) no longer poisons byte-type analysis, so
+            // `1n + x` emits OP_ADD instead of OP_CAT. Mirrors the TS reference
+            // `getParamType` reading only `methodParamTypes`
+            // (packages/runar-compiler/src/passes/04-anf-lower.ts).
             if (ctx.local_byte_vars.get(name) != null) return true;
             return false;
         },
@@ -107,6 +141,10 @@ fn isByteTypedExpr(expr: Expression, ctx: *const LowerCtx) bool {
             return false;
         },
         .call => |c| {
+            // Expression-form asm<ByteString>({...}) yields a byte value.
+            if (std.mem.eql(u8, c.callee, "asm")) {
+                return std.mem.eql(u8, c.asm_return_type, "ByteString");
+            }
             if (isByteReturningFunction(c.callee)) return true;
             if (c.callee.len >= 7 and std.mem.startsWith(u8, c.callee, "extract")) return true;
             return false;
@@ -137,6 +175,7 @@ fn lowerProperties(allocator: Allocator, contract: ContractNode) LowerError![]AN
             .type_name = types.runarTypeToString(prop.type_info),
             .type_info = prop.type_info,
             .readonly = prop.readonly,
+            .synthetic_array_chain = prop.synthetic_array_chain,
         };
         // Only emit initialValue for properties that have defaults AND are NOT
         // constructor params. This matches the TS compiler: properties with
@@ -157,12 +196,21 @@ fn lowerProperties(allocator: Allocator, contract: ContractNode) LowerError![]AN
 fn extractLiteralValue(expr: Expression) ?ConstValue {
     switch (expr) {
         .literal_int => |v| return .{ .integer = v },
+        .literal_bigint => |s| return .{ .big_integer = s },
         .literal_bool => |v| return .{ .boolean = v },
         .literal_bytes => |v| return .{ .string = v },
         .unary_op => |uop| {
             if (uop.op == .negate) {
                 switch (uop.operand) {
                     .literal_int => |v| return .{ .integer = -v },
+                    // Negate of a literal_bigint is preserved as a
+                    // prefixed-`-` decimal so the value remains a single
+                    // canonical text token through ANF / JSON / codegen.
+                    // Producing `-` + bigint text avoids any per-tier
+                    // ambiguity around two's-complement vs sign-magnitude.
+                    // Allocation-free: we'd need an allocator to prepend the
+                    // `-`, so leave this path to the lowerExprToRef pipeline
+                    // (which emits load_const(0) and a unary-op binding).
                     else => {},
                 }
             }
@@ -199,6 +247,16 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
         });
     }
 
+    // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+    // must survive DCE into the locking script. A readonly field no method
+    // references lowers to no load_prop, so no constructor slot is emitted and
+    // the field's deploy-time bytes vanish. We inject a preserved load_prop
+    // for each such field into the FIRST public method's body — it keeps the
+    // field's constructor-slot placeholder in the deployed script, and stack
+    // lowering threads the pushed value through and NIPs it at method end.
+    // One slot in the deployed script suffices; every spending branch shares it.
+    var embed_injected = false;
+
     // Lower each method
     for (contract.methods) |method| {
         var method_ctx = LowerCtx.init(allocator, contract);
@@ -210,24 +268,70 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
             if (isByteType(param.type_info)) method_ctx.markByteTyped(param.name);
         }
 
+        // Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+        // flag for any checkPreimage (auto-injected below, or a manual call) in
+        // this method, and rides on the ANF method as a carrier the artifact
+        // assembler copies to ABIMethod.sighash_type (omitted for the default).
+        var method_sighash: ?i32 = null;
+        if (method.sighash_type) |st| {
+            if (st != sighash_directive.SIGHASH_DEFAULT) {
+                method_ctx.sighash_flag = st;
+                method_sighash = st;
+            }
+        }
+
         if (contract.parent_class == .stateful_smart_contract and method.is_public) {
-            try lowerStatefulPublicMethod(allocator, &method_ctx, method, contract);
+            try lowerStatefulPublicMethod(allocator, &method_ctx, method, contract, &embed_injected);
         } else {
+            // Issue #109: stateless public methods (and stateless contracts'
+            // spending entry points) are lowered here — inject @embedAlways
+            // preservation into the first PUBLIC one before its body.
+            if (!embed_injected and method.is_public) {
+                if (try emitEmbedAlwaysPreservation(&method_ctx, contract)) embed_injected = true;
+            }
             try lowerStatements(&method_ctx, method.body);
             const bindings = try method_ctx.bindings.toOwnedSlice(allocator);
+            // Private methods can also call the intent intrinsics; append
+            // any auto-injected witness params to their ABI. (Private methods
+            // are inlined into public bodies via inlinePrivateMethodCall —
+            // that path reuses the caller's context so the auto-injection
+            // registers at the public method's ABI augmentation step. The
+            // private's own ABI is still informative for non-inlined callees.)
+            // Fast path: when no intrinsics auto-injected anything, borrow
+            // the parser-owned slice unchanged to avoid an extra allocation
+            // (matches the pre-Phase-13 behaviour expected by callers that
+            // do not own the returned ANFProgram's params slice).
+            var params_out: []ParamNode = method.params;
+            if (method_ctx.auto_injected_params.items.len > 0) {
+                var nonpub_params: std.ArrayListUnmanaged(ParamNode) = .empty;
+                for (method.params) |p| try nonpub_params.append(allocator, p);
+                for (method_ctx.auto_injected_params.items) |p| {
+                    try nonpub_params.append(allocator, p);
+                }
+                params_out = try nonpub_params.toOwnedSlice(allocator);
+            }
             try result.append(allocator, ANFMethod{
                 .name = method.name,
                 .is_public = method.is_public,
-                .params = method.params,
+                .params = params_out,
                 .bindings = bindings,
                 .body = bindings,
+                .sighash_type = method_sighash,
             });
         }
 
         if (contract.parent_class == .stateful_smart_contract and method.is_public) {
-            // Build augmented params
-            const needs_change_output = methodMutatesState(method, contract) or methodHasAddOutput(method);
-            const needs_new_amount = methodMutatesState(method, contract) and !methodHasAddOutput(method);
+            // Build augmented params.
+            // Methods that use addOutput, addDataOutput, or mutate state need hashOutputs
+            // verification (i.e. change output support).
+            const has_data_output = methodHasAddDataOutput(method, contract);
+            const needs_change_output = methodMutatesState(method, contract) or methodHasAddOutput(method, contract) or has_data_output;
+            // Single-output continuation needs _newAmount to allow changing the UTXO
+            // satoshis. Multi-output (addOutput) methods specify amounts explicitly.
+            // Methods that emit only data outputs (no addOutput) still run the
+            // single-output continuation path for their state continuation, so they
+            // also need _newAmount.
+            const needs_new_amount = (methodMutatesState(method, contract) or has_data_output) and !methodHasAddOutput(method, contract);
 
             var aug_params: std.ArrayListUnmanaged(ParamNode) = .empty;
             for (method.params) |param| {
@@ -244,6 +348,19 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
             }
             try aug_params.append(allocator, .{ .name = "txPreimage", .type_info = .sig_hash_preimage, .type_name = "SigHashPreimage" });
 
+            // Intent-covenant intrinsic auto-injected witness params (BSVM
+            // Phase 13). extractPrevOutputScript adds `_prevOutScript_<i>`
+            // (one per distinct literal index referenced in the method);
+            // requireOutputP2PKH adds a single `_serialisedOutputs`. Order
+            // follows insertion order via auto_injected_params. Appended
+            // AFTER txPreimage so unlocking scripts push them adjacent to
+            // the preimage (matches existing _changePKH / _changeAmount /
+            // _newAmount convention of trailing the user args before the
+            // preimage anchor).
+            for (method_ctx.auto_injected_params.items) |p| {
+                try aug_params.append(allocator, p);
+            }
+
             const bindings = try method_ctx.bindings.toOwnedSlice(allocator);
             try result.append(allocator, ANFMethod{
                 .name = method.name,
@@ -251,6 +368,7 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
                 .params = try aug_params.toOwnedSlice(allocator),
                 .bindings = bindings,
                 .body = bindings,
+                .sighash_type = method_sighash,
             });
         }
     }
@@ -259,18 +377,17 @@ fn lowerMethods(allocator: Allocator, contract: ContractNode) LowerError![]ANFMe
 }
 
 fn lowerConstructorBody(ctx: *LowerCtx, ctor: ConstructorNode) LowerError!void {
-    // Lower super() call if there are super args
-    if (ctor.super_args.len > 0) {
-        var arg_refs: std.ArrayListUnmanaged([]const u8) = .empty;
-        for (ctor.super_args) |arg| {
-            const ref = try lowerExprToRef(ctx, arg);
-            try arg_refs.append(ctx.allocator, ref);
-        }
-        _ = try ctx.emit(.{ .call = .{
-            .func = "super",
-            .args = try arg_refs.toOwnedSlice(ctx.allocator),
-        } });
+    // Always lower super() call — even with zero args, the call must appear in the
+    // constructor body to match the TypeScript reference compiler output.
+    var arg_refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (ctor.super_args) |arg| {
+        const ref = try lowerExprToRef(ctx, arg);
+        try arg_refs.append(ctx.allocator, ref);
     }
+    _ = try ctx.emit(.{ .call = .{
+        .func = "super",
+        .args = try arg_refs.toOwnedSlice(ctx.allocator),
+    } });
 
     // Lower constructor assignments: this.x = param
     for (ctor.assignments) |assign| {
@@ -282,14 +399,45 @@ fn lowerConstructorBody(ctx: *LowerCtx, ctor: ConstructorNode) LowerError!void {
     }
 }
 
+/// Issue #109: emit a DCE-surviving preservation `load_prop` for each
+/// `@embedAlways` readonly field into the given (public) method context.
+/// Returns true when at least one field was injected (so the caller marks the
+/// one-shot injection done). The load_prop carries `preserve = true`, so
+/// `dce.hasSideEffect` keeps it even though nothing references it; stack
+/// lowering then emits the field's constructor-slot placeholder and NIPs the
+/// unused value off the stack at method end. The field's bytes therefore remain
+/// in the deployed locking script for downstream recovery.
+///
+/// The TypeScript reference achieves the same via a `load_prop` + `@ref` alias
+/// relying on a single-pass DCE. The Zig `ec_optimizer` runs a fixpoint DCE
+/// that would strip such an unreferenced alias chain, so the Zig tier marks the
+/// injected load_prop directly. The observable output is byte-identical.
+fn emitEmbedAlwaysPreservation(ctx: *LowerCtx, contract: ContractNode) LowerError!bool {
+    var injected = false;
+    for (contract.properties) |prop| {
+        if (prop.readonly and prop.embed_always) {
+            _ = try ctx.emit(.{ .load_prop = .{ .name = prop.name, .preserve = true } });
+            injected = true;
+        }
+    }
+    return injected;
+}
+
 fn lowerStatefulPublicMethod(
     allocator: Allocator,
     ctx: *LowerCtx,
     method: MethodNode,
     contract: ContractNode,
+    embed_injected: *bool,
 ) LowerError!void {
-    const needs_change_output = methodMutatesState(method, contract) or methodHasAddOutput(method);
-    const needs_new_amount = methodMutatesState(method, contract) and !methodHasAddOutput(method);
+    // Methods that use addOutput, addDataOutput, or mutate state need hashOutputs
+    // verification (change output support).
+    const has_data_output = methodHasAddDataOutput(method, contract);
+    const needs_change_output = methodMutatesState(method, contract) or methodHasAddOutput(method, contract) or has_data_output;
+    // Single-output continuation needs _newAmount. Methods that emit only data
+    // outputs (no addOutput) still run the single-output continuation path, so
+    // they also need _newAmount.
+    const needs_new_amount = (methodMutatesState(method, contract) or has_data_output) and !methodHasAddOutput(method, contract);
 
     // Register implicit parameters
     if (needs_change_output) {
@@ -303,10 +451,40 @@ fn lowerStatefulPublicMethod(
     ctx.addParam("txPreimage");
     ctx.markByteTyped("txPreimage");
 
-    // Inject checkPreimage(txPreimage)
+    // Issue #123: the declared per-method sighash mode (default ALL|FORKID).
+    // Drives BOTH the OP_PUSH_TX binding flag (so the derived sig re-computes
+    // the tx sighash under this mode) AND the runtime preimage-type assert.
+    const sighash_mode: i32 = method.sighash_type orelse sighash_directive.SIGHASH_DEFAULT;
+    const is_default_sighash = sighash_mode == sighash_directive.SIGHASH_DEFAULT;
+
+    // Inject checkPreimage(txPreimage). Omit the sighash flag for the default so
+    // the ANF (and pinned binding blob) is byte-identical to every existing
+    // contract.
     const preimage_ref = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
-    const check_result = try ctx.emit(.{ .check_preimage = .{ .preimage = preimage_ref } });
+    const check_result = try ctx.emit(.{ .check_preimage = .{
+        .preimage = preimage_ref,
+        .sighash_flag = if (is_default_sighash) 0 else sighash_mode,
+    } });
     _ = try ctx.emit(.{ .assert = .{ .value = check_result } });
+
+    // GAP-302 / #123: pin the sighash type to the declared mode. Without this
+    // check the spend could use a DIFFERENT sighash flag than declared that
+    // zeroes out preimage fields the contract (or its continuation) relies on
+    // (hashOutputs / hashPrevouts / hashSequence). The value defaults to 0x41
+    // (SIGHASH_ALL|FORKID) so existing contracts emit byte-identical ANF.
+    const sig_hash_preimage_ref = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
+    const sig_hash_type_ref = try ctx.emit(.{ .call = .{
+        .func = "extractSigHashType",
+        .args = try ctx.allocSlice(&.{sig_hash_preimage_ref}),
+    } });
+    const expected_sig_hash_ref = try ctx.emit(makeLoadConstInt(sighash_mode));
+    const sig_hash_ok_ref = try ctx.emit(.{ .bin_op = .{
+        .op = "===",
+        .left = sig_hash_type_ref,
+        .right = expected_sig_hash_ref,
+        .result_type = null,
+    } });
+    _ = try ctx.emit(.{ .assert = .{ .value = sig_hash_ok_ref } });
 
     // Deserialize state if there are mutable properties
     const has_mutable_state = for (contract.properties) |p| {
@@ -318,29 +496,87 @@ fn lowerStatefulPublicMethod(
         _ = try ctx.emit(.{ .deserialize_state = .{ .preimage = preimage_ref3 } });
     }
 
+    // Issue #109: preserve @embedAlways fields at the first user-statement
+    // position (after the checkPreimage/deserialize preamble), mirroring where
+    // a `const _bind = this.field;` idiom would sit.
+    if (!embed_injected.*) {
+        if (try emitEmbedAlwaysPreservation(ctx, contract)) embed_injected.* = true;
+    }
+
     // Lower the developer's method body
     try lowerStatements(ctx, method.body);
 
-    // Determine state continuation type
+    // Determine state continuation type.
+    //
+    // === Continuation-hash construction ===
+    //
+    // The auto-injected continuation assertion verifies that the spending
+    // transaction's hashOutputs field matches a compiler-constructed hash
+    // over the outputs this method declares. Outputs are concatenated in
+    // the following order before hashing with hash256:
+    //
+    //   1. state outputs   (from this.addOutput / this.addRawOutput)
+    //   2. data outputs    (from this.addDataOutput)
+    //   3. change output   (P2PKH to _changePKH, value = _changeAmount)
+    //
+    // For the "single-output" fast path (no addOutput used, but state is
+    // mutated OR data outputs were declared), the state output is computed
+    // on the fly from (preimage, stateScript, _newAmount). Data outputs may
+    // still be declared in this mode and are inserted BETWEEN the single
+    // state output and the change output.
     const add_output_refs = ctx.getAddOutputRefs();
+    const add_data_output_refs = ctx.getAddDataOutputRefs();
     _ = allocator;
 
-    if (add_output_refs.len > 0 or methodMutatesState(method, contract)) {
-        // Build P2PKH change output
+    if (add_output_refs.len > 0 or add_data_output_refs.len > 0 or methodMutatesState(method, contract)) {
+        // Build the P2PKH change output for hashOutputs verification.
+        //
+        // Issue #116: the SDK's buildCallTransaction OMITS the change output when
+        // `change <= 0` (an exact-cover call) and passes `_changeAmount = 0`.
+        // Gate the change segment on `_changeAmount != 0` at runtime so the hashed
+        // output set matches the SDK at the exact-zero boundary — the segment is
+        // the P2PKH change output when non-zero, and empty bytes (cat with empty
+        // is a no-op) when zero, reproducing the omission. For any change > 0 the
+        // hashed bytes are unchanged; only the emitted script gains the guard.
         const change_pkh_ref = try ctx.emit(.{ .load_param = .{ .name = "_changePKH" } });
         const change_amount_ref = try ctx.emit(.{ .load_param = .{ .name = "_changeAmount" } });
-        const change_output_ref = try ctx.emit(.{ .call = .{
-            .func = "buildChangeOutput",
-            .args = try ctx.allocSlice(&.{ change_pkh_ref, change_amount_ref }),
+        const zero_ref = try ctx.emit(makeLoadConstInt(0));
+        const change_nonzero_ref = try ctx.emit(.{ .bin_op = .{
+            .op = "!==",
+            .left = change_amount_ref,
+            .right = zero_ref,
         } });
+        var change_then_ctx = ctx.subContext();
+        _ = try change_then_ctx.emit(.{ .call = .{
+            .func = "buildChangeOutput",
+            .args = try change_then_ctx.allocSlice(&.{ change_pkh_ref, change_amount_ref }),
+        } });
+        ctx.syncCounter(&change_then_ctx);
+        var change_else_ctx = ctx.subContext();
+        _ = try change_else_ctx.emit(makeLoadConstString(change_else_ctx.allocator, ""));
+        ctx.syncCounter(&change_else_ctx);
+        const change_if = try ctx.allocator.create(types.ANFIf);
+        change_if.* = .{
+            .cond = change_nonzero_ref,
+            .then = try change_then_ctx.bindings.toOwnedSlice(ctx.allocator),
+            .@"else" = try change_else_ctx.bindings.toOwnedSlice(ctx.allocator),
+        };
+        const change_output_ref = try ctx.emit(.{ .@"if" = change_if });
 
         if (add_output_refs.len > 0) {
-            // Multi-output: concat all outputs + change, hash, verify
+            // Multi-output: concat all state outputs, then all data outputs,
+            // then change output, then hash, verify.
             var accumulated: []const u8 = add_output_refs[0];
             for (add_output_refs[1..]) |aor| {
                 accumulated = try ctx.emit(.{ .call = .{
                     .func = "cat",
                     .args = try ctx.allocSlice(&.{ accumulated, aor }),
+                } });
+            }
+            for (add_data_output_refs) |dref| {
+                accumulated = try ctx.emit(.{ .call = .{
+                    .func = "cat",
+                    .args = try ctx.allocSlice(&.{ accumulated, dref }),
                 } });
             }
             accumulated = try ctx.emit(.{ .call = .{
@@ -362,9 +598,11 @@ fn lowerStatefulPublicMethod(
                 .right = output_hash_ref,
                 .result_type = "bytes",
             } });
-            _ = try ctx.emit(.{ .assert = .{ .value = eq_ref } });
+            _ = try ctx.emit(.{ .assert = .{ .value = eq_ref, .is_auto_injected_state_check = true } });
         } else {
-            // Single-output continuation
+            // Single-output continuation: build raw state output bytes, then
+            // splice in declared data outputs, then concat with change,
+            // then hash.
             const state_script_ref = try ctx.emit(.{ .get_state_script = {} });
             const preimage_ref2 = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
             const new_amount_ref = try ctx.emit(.{ .load_param = .{ .name = "_newAmount" } });
@@ -372,9 +610,16 @@ fn lowerStatefulPublicMethod(
                 .func = "computeStateOutput",
                 .args = try ctx.allocSlice(&.{ preimage_ref2, state_script_ref, new_amount_ref }),
             } });
+            var accumulated: []const u8 = contract_output_ref;
+            for (add_data_output_refs) |dref| {
+                accumulated = try ctx.emit(.{ .call = .{
+                    .func = "cat",
+                    .args = try ctx.allocSlice(&.{ accumulated, dref }),
+                } });
+            }
             const all_outputs = try ctx.emit(.{ .call = .{
                 .func = "cat",
-                .args = try ctx.allocSlice(&.{ contract_output_ref, change_output_ref }),
+                .args = try ctx.allocSlice(&.{ accumulated, change_output_ref }),
             } });
             const hash_ref = try ctx.emit(.{ .call = .{
                 .func = "hash256",
@@ -391,7 +636,7 @@ fn lowerStatefulPublicMethod(
                 .right = output_hash_ref,
                 .result_type = "bytes",
             } });
-            _ = try ctx.emit(.{ .assert = .{ .value = eq_ref } });
+            _ = try ctx.emit(.{ .assert = .{ .value = eq_ref, .is_auto_injected_state_check = true } });
         }
     }
 }
@@ -410,8 +655,33 @@ const LowerCtx = struct {
     local_aliases: std.StringHashMapUnmanaged([]const u8),
     local_byte_vars: std.StringHashMapUnmanaged(void),
     add_output_refs: std.ArrayListUnmanaged([]const u8),
+    /// Tracks addDataOutput binding refs — data outputs are included in the
+    /// continuation hash AFTER state outputs and BEFORE the change output.
+    add_data_output_refs: std.ArrayListUnmanaged([]const u8),
+    /// Param substitution stack used when inlining a private method's body
+    /// directly into this context. While the inlined body lowers, identifier
+    /// references to that param resolve to the caller's arg ref instead of
+    /// emitting load_param. Stacked so nested inlines compose correctly.
+    /// Mirrors TS / Go reference compilers' paramAliasStack.
+    param_alias_stack: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
     /// Current source location — set before lowering each statement, stamped on bindings.
     current_source_loc: ?types.SourceLocation = null,
+    /// Intent sub-covenant intrinsics (BSVM Phase 13). Auto-injected witness
+    /// params needed by extractPrevOutputScript (`_prevOutScript_<i>`) and
+    /// requireOutputP2PKH (`_serialisedOutputs`). Insertion-order list +
+    /// dedup set; appended to the method's ABI params list AFTER txPreimage.
+    /// Mirrors Go's methodScopeT (compilers/go/frontend/anf_lower.go).
+    auto_injected_params: std.ArrayListUnmanaged(ParamNode),
+    auto_injected_set: std.StringHashMapUnmanaged(void),
+    /// requireOutputP2PKH emits its hashOutputs(preimage) check at most once
+    /// per method — flipped on the first call.
+    did_emit_hash_outputs_check: bool = false,
+    /// Issue #123: the declared non-default `@sighash` flag for the method
+    /// being lowered, so a MANUAL checkPreimage(pre) call binds under the same
+    /// mode as the method's declared sighash. Null = default ALL|FORKID,
+    /// keeping the pinned binding blob unchanged. Propagated into sub-contexts
+    /// so a manual call inside an if/for body picks it up.
+    sighash_flag: ?i32 = null,
 
     fn init(allocator: Allocator, contract: ContractNode) LowerCtx {
         return .{
@@ -424,6 +694,10 @@ const LowerCtx = struct {
             .local_aliases = .empty,
             .local_byte_vars = .empty,
             .add_output_refs = .empty,
+            .add_data_output_refs = .empty,
+            .param_alias_stack = .empty,
+            .auto_injected_params = .empty,
+            .auto_injected_set = .empty,
         };
     }
 
@@ -471,12 +745,59 @@ const LowerCtx = struct {
         return self.local_aliases.get(local_name);
     }
 
+    fn pushParamAlias(self: *LowerCtx, name: []const u8, alias_ref: []const u8) void {
+        const gop = self.param_alias_stack.getOrPut(self.allocator, name) catch return;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+        }
+        gop.value_ptr.append(self.allocator, alias_ref) catch {};
+    }
+
+    fn popParamAlias(self: *LowerCtx, name: []const u8) void {
+        if (self.param_alias_stack.getPtr(name)) |list_ptr| {
+            if (list_ptr.items.len > 0) {
+                _ = list_ptr.pop();
+            }
+            if (list_ptr.items.len == 0) {
+                list_ptr.deinit(self.allocator);
+                _ = self.param_alias_stack.remove(name);
+            }
+        }
+    }
+
+    fn getParamAlias(self: *const LowerCtx, name: []const u8) ?[]const u8 {
+        if (self.param_alias_stack.get(name)) |list| {
+            if (list.items.len == 0) return null;
+            return list.items[list.items.len - 1];
+        }
+        return null;
+    }
+
+    /// True iff `name` is a private method that (transitively) emits state or
+    /// data outputs. Triggers ANF-level inlining so the helper's add_output /
+    /// add_data_output refs register on the caller's continuation hash.
+    fn shouldInlinePrivate(self: *const LowerCtx, name: []const u8) bool {
+        const m = lookupPrivateMethod(self.contract, name) orelse return false;
+        return methodHasAddOutput(m, self.contract) or methodHasAddDataOutput(m, self.contract);
+    }
+
     fn addOutputRef(self: *LowerCtx, ref: []const u8) void {
         self.add_output_refs.append(self.allocator, ref) catch {};
     }
 
     fn getAddOutputRefs(self: *const LowerCtx) []const []const u8 {
         return self.add_output_refs.items;
+    }
+
+    /// Track an addDataOutput binding ref — kept separate from state output
+    /// refs so the continuation-hash composition can concatenate data
+    /// outputs after state outputs and before the change output.
+    fn addDataOutputRef(self: *LowerCtx, ref: []const u8) void {
+        self.add_data_output_refs.append(self.allocator, ref) catch {};
+    }
+
+    fn getAddDataOutputRefs(self: *const LowerCtx) []const []const u8 {
+        return self.add_data_output_refs.items;
     }
 
     fn isProperty(self: *const LowerCtx, name: []const u8) bool {
@@ -489,6 +810,8 @@ const LowerCtx = struct {
     fn subContext(self: *LowerCtx) LowerCtx {
         var sub = LowerCtx.init(self.allocator, self.contract);
         sub.counter = self.counter;
+        // #123: nested manual checkPreimage inherits the method's mode.
+        sub.sighash_flag = self.sighash_flag;
         // Copy local names
         var local_it = self.local_names.iterator();
         while (local_it.next()) |entry| {
@@ -524,6 +847,27 @@ const LowerCtx = struct {
         self.local_aliases.deinit(self.allocator);
         self.local_byte_vars.deinit(self.allocator);
         self.add_output_refs.deinit(self.allocator);
+        self.add_data_output_refs.deinit(self.allocator);
+        var alias_it = self.param_alias_stack.iterator();
+        while (alias_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.param_alias_stack.deinit(self.allocator);
+        self.auto_injected_params.deinit(self.allocator);
+        self.auto_injected_set.deinit(self.allocator);
+    }
+
+    /// Record an intent-intrinsic-injected witness param. Idempotent — a
+    /// repeat call with the same name is a no-op. Insertion order is
+    /// preserved so the ABI augmentation appends them in source order.
+    fn recordAutoInjectedParam(self: *LowerCtx, name: []const u8, type_info: RunarType, type_name: []const u8) void {
+        if (self.auto_injected_set.contains(name)) return;
+        self.auto_injected_set.put(self.allocator, name, {}) catch return;
+        self.auto_injected_params.append(self.allocator, .{
+            .name = name,
+            .type_info = type_info,
+            .type_name = type_name,
+        }) catch {};
     }
 
     /// Allocate a slice of string refs on the arena allocator.
@@ -647,9 +991,23 @@ fn lowerIfStatementFull(ctx: *LowerCtx, condition: Expression, then_body: []cons
     }
     ctx.syncCounter(&else_ctx);
 
-    // Propagate addOutput refs
-    const then_has_outputs = then_ctx.getAddOutputRefs().len > 0;
-    const else_has_outputs = else_ctx.getAddOutputRefs().len > 0;
+    // 2026-04-30 audit finding F2: when a branch contains output
+    // intrinsics, append a cat-chain inside each branch so the
+    // branch's terminal value is the concat of its output bytes
+    // (state then data, in declaration order). Balances runtime
+    // stack effects across branches and lets the parent's
+    // continuation hash see one ref per if representing the chosen
+    // branch's full output set.
+    const branch_has_state_output = then_ctx.getAddOutputRefs().len > 0
+        or else_ctx.getAddOutputRefs().len > 0;
+    const branch_has_outputs = branch_has_state_output
+        or then_ctx.getAddDataOutputRefs().len > 0
+        or else_ctx.getAddDataOutputRefs().len > 0;
+
+    if (branch_has_outputs) {
+        _ = try appendBranchOutputConcat(&then_ctx);
+        _ = try appendBranchOutputConcat(&else_ctx);
+    }
 
     const if_val = try ctx.allocator.create(types.ANFIf);
     if_val.* = .{
@@ -659,8 +1017,24 @@ fn lowerIfStatementFull(ctx: *LowerCtx, condition: Expression, then_body: []cons
     };
     const if_name = try ctx.emit(.{ .@"if" = if_val });
 
-    if (then_has_outputs or else_has_outputs) {
-        ctx.addOutputRef(if_name);
+    if (branch_has_outputs) {
+        // Register the if's value once with the parent's continuation
+        // tracker. CRITICAL: pick the right tracker. If either branch
+        // produces a STATE output, the parent must take the
+        // multi-output continuation path, so we register as a state
+        // output ref. If neither branch produces a state output and
+        // at least one branch produces a data output, we register as
+        // a DATA output ref so the parent keeps its single-output
+        // `computeStateOutput` continuation and the data-output
+        // bytes splice in BETWEEN the state output and the change
+        // output. Without this, a branch with only `addDataOutput`
+        // was incorrectly forced onto the multi-output path,
+        // dropping the canonical state continuation.
+        if (branch_has_state_output) {
+            ctx.addOutputRef(if_name);
+        } else {
+            ctx.addDataOutputRef(if_name);
+        }
     }
 
     // Alias detection: if both branches end by reassigning same local variable
@@ -678,11 +1052,21 @@ fn lowerIfStatementWithElse(ctx: *LowerCtx, condition: Expression, then_body: []
 }
 
 fn lowerForStatement(ctx: *LowerCtx, for_s: types.ForStmt) LowerError!void {
-    const count: u32 = blk: {
-        const diff = for_s.bound - for_s.init_value;
-        if (diff < 0) break :blk 0;
-        break :blk @intCast(diff);
-    };
+    // Resolve the loop's compile-time shape: start value, step direction, and
+    // iteration count (issue #121). The loop is unrolled `count` times; on
+    // iteration `i` the iterator holds `start + i*step`. Zero-start counting-up
+    // loops (start=0, step=1) reproduce the historical `i = 0..count-1`
+    // lowering byte-for-byte. Non-zero starts and countdowns (`step = -1`) are
+    // now supported — the C-style parsers record the raw operator direction
+    // (`descending`) and inclusivity (`inclusive`); range parsers fold any
+    // inclusive endpoint into `bound` and stay ascending.
+    const start: i64 = for_s.init_value;
+    const step: i8 = if (for_s.descending) -1 else 1;
+
+    // count = number of iterations before the condition first turns false.
+    const base: i64 = if (for_s.descending) start - for_s.bound else for_s.bound - start;
+    const raw: i64 = base + (if (for_s.inclusive) @as(i64, 1) else 0);
+    const count: u32 = if (raw > 0) @intCast(raw) else 0;
 
     // Lower body
     var body_ctx = ctx.subContext();
@@ -694,6 +1078,8 @@ fn lowerForStatement(ctx: *LowerCtx, for_s: types.ForStmt) LowerError!void {
         .count = count,
         .body = try body_ctx.bindings.toOwnedSlice(ctx.allocator),
         .iter_var = for_s.var_name,
+        .start = start,
+        .step = step,
     };
     _ = try ctx.emit(.{ .loop = loop_val });
 }
@@ -707,6 +1093,9 @@ fn lowerExprToRef(ctx: *LowerCtx, expr: Expression) LowerError![]const u8 {
         .literal_int => |v| {
             return try ctx.emit(makeLoadConstInt(v));
         },
+        .literal_bigint => |s| {
+            return try ctx.emit(makeLoadConstBigInt(s));
+        },
         .literal_bool => |v| {
             return try ctx.emit(makeLoadConstBool(v));
         },
@@ -717,7 +1106,15 @@ fn lowerExprToRef(ctx: *LowerCtx, expr: Expression) LowerError![]const u8 {
             return try lowerIdentifier(ctx, name);
         },
         .property_access => |pa| {
-            // this.txPreimage in StatefulSmartContract -> load_param
+            // Explicit `this.x`: a real contract property always wins, even when
+            // a method param shares the name (issue #130). Zig registers declared
+            // method params via addParam, so without this isProperty-first check
+            // `this.balance` (with a `balance` param) would lower to load_param.
+            if (ctx.isProperty(pa.property)) {
+                return try ctx.emit(.{ .load_prop = .{ .name = pa.property } });
+            }
+            // this.txPreimage in StatefulSmartContract -> load_param (an implicit
+            // injected param, not a stored property).
             if (ctx.isParam(pa.property)) {
                 return try ctx.emit(.{ .load_param = .{ .name = pa.property } });
             }
@@ -814,6 +1211,13 @@ fn lowerIdentifier(ctx: *LowerCtx, name: []const u8) LowerError![]const u8 {
         return try ctx.emit(makeLoadConstString(ctx.allocator, "@this"));
     }
 
+    // Param alias takes precedence over normal param lookup. Set when a
+    // private method's body is being inlined into this context — the
+    // private's param names map to the caller's arg refs.
+    if (ctx.getParamAlias(name)) |alias| {
+        return alias;
+    }
+
     // Check if it's a registered parameter
     if (ctx.isParam(name)) {
         return try ctx.emit(.{ .load_param = .{ .name = name } });
@@ -857,6 +1261,41 @@ fn lowerCallExpr(ctx: *LowerCtx, c: *const types.CallExpr) LowerError![]const u8
         } });
     }
 
+    // asm({...}) compiler intrinsic — the parser has already normalised the
+    // object-literal argument into three positional args
+    // (body, in_arity, out_arity). Lower to a single opaque raw_script ANF
+    // binding; the hex body passes through unchanged. Diagnostics for
+    // malformed args were already pushed by the validator — here we
+    // defensively coerce missing values to safe defaults.
+    if (std.mem.eql(u8, c.callee, "asm")) {
+        var body_hex: []const u8 = "";
+        var in_arity: i32 = 0;
+        var out_arity: i32 = 1;
+        if (c.args.len >= 1) {
+            switch (c.args[0]) {
+                .literal_bytes => |bs| body_hex = bs,
+                else => {},
+            }
+        }
+        if (c.args.len >= 2) {
+            switch (c.args[1]) {
+                .literal_int => |i| in_arity = @intCast(i),
+                else => {},
+            }
+        }
+        if (c.args.len >= 3) {
+            switch (c.args[2]) {
+                .literal_int => |i| out_arity = @intCast(i),
+                else => {},
+            }
+        }
+        return try ctx.emit(.{ .raw_script = .{
+            .bytes = body_hex,
+            .in_arity = in_arity,
+            .out_arity = out_arity,
+        } });
+    }
+
     // assert(expr)
     if (std.mem.eql(u8, c.callee, "assert")) {
         if (c.args.len >= 1) {
@@ -871,14 +1310,181 @@ fn lowerCallExpr(ctx: *LowerCtx, c: *const types.CallExpr) LowerError![]const u8
     if (std.mem.eql(u8, c.callee, "checkPreimage")) {
         if (c.args.len >= 1) {
             const preimage_ref = try lowerExprToRef(ctx, c.args[0]);
-            return try ctx.emit(.{ .check_preimage = .{ .preimage = preimage_ref } });
+            // Issue #123: honour the method's declared @sighash on manual calls.
+            return try ctx.emit(.{ .check_preimage = .{
+                .preimage = preimage_ref,
+                .sighash_flag = ctx.sighash_flag orelse 0,
+            } });
         }
+    }
+
+    // extractPrevOutputScript(inputIndex_literal, expectedScriptHash) -> ByteString.
+    // extractPrevOutputScript(inputIndex_literal, expectedScriptPrefixHash, prefixLen_literal) -> ByteString.
+    //
+    // Witness-bridge sugar (BSVM Phase 13). Auto-injects a hidden method
+    // parameter named `_prevOutScript_<inputIndex>` (one per distinct index
+    // in the method body), emits a hash assertion, and returns the witness
+    // ref for caller substring extraction.
+    //
+    // 2-arg form: hash256(witness) === expectedScriptHash. Pins the full
+    //   prev-output script byte-for-byte.
+    // 3-arg form: hash256(substr(witness, 0, prefixLen)) ===
+    //   expectedScriptPrefixHash. Pins the policy prefix only, leaving the
+    //   pushdata tail free to vary (BSVM Mode 3 step-in intent templates).
+    if (std.mem.eql(u8, c.callee, "extractPrevOutputScript")) {
+        if (c.args.len != 2 and c.args.len != 3) {
+            return try ctx.emit(makeLoadConstString(ctx.allocator, ""));
+        }
+        const idx: i64 = switch (c.args[0]) {
+            .literal_int => |v| v,
+            else => return try ctx.emit(makeLoadConstString(ctx.allocator, "")),
+        };
+        const param_name = try std.fmt.allocPrint(ctx.allocator, "_prevOutScript_{d}", .{idx});
+        ctx.recordAutoInjectedParam(param_name, .byte_string, "ByteString");
+        ctx.addParam(param_name);
+        const witness_ref = try ctx.emit(.{ .load_param = .{ .name = param_name } });
+        const expected_hash_ref = try lowerExprToRef(ctx, c.args[1]);
+
+        // Determine which bytes to hash: full witness (2-arg) or prefix (3-arg).
+        // The substr happens at script-execution time; the literal prefixLen
+        // is baked into the emitted Stack-IR.
+        var bytes_to_hash_ref: []const u8 = witness_ref;
+        if (c.args.len == 3) {
+            const prefix_len: i64 = switch (c.args[2]) {
+                .literal_int => |v| v,
+                else => return try ctx.emit(makeLoadConstString(ctx.allocator, "")),
+            };
+            const zero_ref = try ctx.emit(makeLoadConstInt(0));
+            const prefix_len_ref = try ctx.emit(makeLoadConstInt(prefix_len));
+            bytes_to_hash_ref = try ctx.emit(.{ .call = .{
+                .func = "substr",
+                .args = try ctx.allocSlice(&.{ witness_ref, zero_ref, prefix_len_ref }),
+            } });
+        }
+
+        const actual_hash_ref = try ctx.emit(.{ .call = .{
+            .func = "hash256",
+            .args = try ctx.allocSlice(&.{bytes_to_hash_ref}),
+        } });
+        const eq_ref = try ctx.emit(.{ .bin_op = .{
+            .op = "===",
+            .left = actual_hash_ref,
+            .right = expected_hash_ref,
+            .result_type = "bytes",
+        } });
+        _ = try ctx.emit(.{ .assert = .{ .value = eq_ref } });
+        return witness_ref;
+    }
+
+    // requireOutputP2PKH(outputIndex_literal, pubkeyHash, amount) -> void.
+    // Asserts that the tx's output at outputIndex is a standard P2PKH paying
+    // `amount` satoshis to `pubkeyHash`. Auto-injects `_serialisedOutputs`
+    // (once per method) and emits hash256(serialisedOutputs) ==
+    // extractOutputHash(txPreimage) the first time the intrinsic is called
+    // in a method body. Subsequent calls in the same method skip the
+    // hashOutputs check (already established) and emit only the per-output
+    // substring assertion.
+    //
+    // v1 assumes all outputs in the serialised set are exactly 34 bytes
+    // (8-byte LE amount ‖ 0x19 length ‖ 25-byte P2PKH script). Byte offset
+    // of output i is i*34.
+    if (std.mem.eql(u8, c.callee, "requireOutputP2PKH")) {
+        if (c.args.len != 3) {
+            return try ctx.emit(makeLoadConstString(ctx.allocator, ""));
+        }
+        const idx: i64 = switch (c.args[0]) {
+            .literal_int => |v| v,
+            else => return try ctx.emit(makeLoadConstString(ctx.allocator, "")),
+        };
+
+        ctx.recordAutoInjectedParam("_serialisedOutputs", .byte_string, "ByteString");
+        ctx.addParam("_serialisedOutputs");
+
+        // Emit the hashOutputs(preimage) check exactly once per method.
+        if (!ctx.did_emit_hash_outputs_check) {
+            ctx.did_emit_hash_outputs_check = true;
+            const serialised_ref0 = try ctx.emit(.{ .load_param = .{ .name = "_serialisedOutputs" } });
+            const actual_out_hash_ref = try ctx.emit(.{ .call = .{
+                .func = "hash256",
+                .args = try ctx.allocSlice(&.{serialised_ref0}),
+            } });
+            const preimage_ref = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
+            const expected_out_hash_ref = try ctx.emit(.{ .call = .{
+                .func = "extractOutputHash",
+                .args = try ctx.allocSlice(&.{preimage_ref}),
+            } });
+            const hash_eq_ref = try ctx.emit(.{ .bin_op = .{
+                .op = "===",
+                .left = actual_out_hash_ref,
+                .right = expected_out_hash_ref,
+                .result_type = "bytes",
+            } });
+            _ = try ctx.emit(.{ .assert = .{ .value = hash_eq_ref } });
+        }
+
+        // Lower the user-supplied args (pubkeyHash, amount).
+        const pubkey_hash_ref = try lowerExprToRef(ctx, c.args[1]);
+        const amount_ref = try lowerExprToRef(ctx, c.args[2]);
+
+        // Construct expected P2PKH output bytes:
+        //   <amount: 8-byte LE> ‖ 0x19 0x76 0xa9 0x14 ‖ <pubkeyHash: 20 bytes> ‖ 0x88 0xac
+        const eight_ref = try ctx.emit(makeLoadConstInt(8));
+        const amount_bytes_ref = try ctx.emit(.{ .call = .{
+            .func = "num2bin",
+            .args = try ctx.allocSlice(&.{ amount_ref, eight_ref }),
+        } });
+        // 0x19 0x76 0xa9 0x14 — script length byte + OP_DUP OP_HASH160 OP_PUSH20
+        const prefix_ref = try ctx.emit(makeLoadConstString(ctx.allocator, "1976a914"));
+        // 0x88 0xac — OP_EQUALVERIFY OP_CHECKSIG
+        const suffix_ref = try ctx.emit(makeLoadConstString(ctx.allocator, "88ac"));
+        const cat1_ref = try ctx.emit(.{ .call = .{
+            .func = "cat",
+            .args = try ctx.allocSlice(&.{ amount_bytes_ref, prefix_ref }),
+        } });
+        const cat2_ref = try ctx.emit(.{ .call = .{
+            .func = "cat",
+            .args = try ctx.allocSlice(&.{ cat1_ref, pubkey_hash_ref }),
+        } });
+        const expected_output_ref = try ctx.emit(.{ .call = .{
+            .func = "cat",
+            .args = try ctx.allocSlice(&.{ cat2_ref, suffix_ref }),
+        } });
+
+        // Substring extract at idx*34 length 34, assert equal.
+        const serialised_ref = try ctx.emit(.{ .load_param = .{ .name = "_serialisedOutputs" } });
+        const offset_ref = try ctx.emit(makeLoadConstInt(idx * 34));
+        const length_ref = try ctx.emit(makeLoadConstInt(34));
+        const extracted_ref = try ctx.emit(.{ .call = .{
+            .func = "substr",
+            .args = try ctx.allocSlice(&.{ serialised_ref, offset_ref, length_ref }),
+        } });
+        const out_eq_ref = try ctx.emit(.{ .bin_op = .{
+            .op = "===",
+            .left = extracted_ref,
+            .right = expected_output_ref,
+            .result_type = "bytes",
+        } });
+        return try ctx.emit(.{ .assert = .{ .value = out_eq_ref } });
+    }
+
+    // currentBlockHeight() -> bigint. Pure source-level desugar to
+    // extractLocktime(this.txPreimage). Only valid in StatefulSmartContract
+    // methods (typecheck enforces). No new ANF kind or stack codegen needed.
+    if (std.mem.eql(u8, c.callee, "currentBlockHeight")) {
+        const preimage_ref = try ctx.emit(.{ .load_param = .{ .name = "txPreimage" } });
+        return try ctx.emit(.{ .call = .{
+            .func = "extractLocktime",
+            .args = try ctx.allocSlice(&.{preimage_ref}),
+        } });
     }
 
     // Check if callee is a contract method (private helper) — emit method_call with @this
     for (ctx.contract.methods) |method| {
         if (std.mem.eql(u8, method.name, c.callee)) {
             const arg_refs = try lowerArgs(ctx, c.args);
+            if (ctx.shouldInlinePrivate(c.callee)) {
+                return try inlinePrivateMethodCall(ctx, c.callee, arg_refs);
+            }
             const this_ref = try ctx.emit(makeLoadConstString(ctx.allocator, "@this"));
             return try ctx.emit(.{ .method_call = .{
                 .object = this_ref,
@@ -927,6 +1533,21 @@ fn lowerMethodCallExpr(ctx: *LowerCtx, mc: *const types.MethodCall) LowerError![
         }
     }
 
+    // this.addDataOutput(satoshis, scriptBytes) — wire shape identical to
+    // addRawOutput, but included in the continuation hash AFTER state
+    // outputs and BEFORE the change output (tracked separately).
+    if ((is_self or is_stateful_ctx) and std.mem.eql(u8, mc.method, "addDataOutput")) {
+        const arg_refs = try lowerArgs(ctx, mc.args);
+        if (arg_refs.len >= 2) {
+            const ref = try ctx.emit(.{ .add_data_output = .{
+                .satoshis = arg_refs[0],
+                .script_bytes = arg_refs[1],
+            } });
+            ctx.addDataOutputRef(ref);
+            return ref;
+        }
+    }
+
     // this.getStateScript()
     if ((is_self or is_stateful_ctx) and std.mem.eql(u8, mc.method, "getStateScript")) {
         return try ctx.emit(.{ .get_state_script = {} });
@@ -947,6 +1568,9 @@ fn lowerMethodCallExpr(ctx: *LowerCtx, mc: *const types.MethodCall) LowerError![
     // this.method(...) -> method_call
     if (is_self) {
         const arg_refs = try lowerArgs(ctx, mc.args);
+        if (ctx.shouldInlinePrivate(mc.method)) {
+            return try inlinePrivateMethodCall(ctx, mc.method, arg_refs);
+        }
         const this_ref = try ctx.emit(makeLoadConstString(ctx.allocator, "@this"));
         return try ctx.emit(.{ .method_call = .{
             .object = this_ref,
@@ -963,6 +1587,56 @@ fn lowerMethodCallExpr(ctx: *LowerCtx, mc: *const types.MethodCall) LowerError![
         .method = mc.method,
         .args = arg_refs,
     } });
+}
+
+// Inline a private method's body directly into the caller's context. Used
+// when the private has continuation-relevant side effects (addOutput /
+// addRawOutput / addDataOutput) so that its emitted ANF nodes register
+// their output refs on the caller's continuation hash.
+//
+// The caller's arg refs are mapped onto the private's parameter names via
+// pushParamAlias. While the body lowers, identifier references to those
+// param names resolve to the caller's ref via lowerIdentifier's alias check.
+//
+// Recursion across private helpers is forbidden by validation, so this
+// always terminates.
+fn inlinePrivateMethodCall(ctx: *LowerCtx, method_name: []const u8, arg_refs: []const []const u8) LowerError![]const u8 {
+    const method = lookupPrivateMethod(ctx.contract, method_name) orelse {
+        const this_ref = try ctx.emit(makeLoadConstString(ctx.allocator, "@this"));
+        return try ctx.emit(.{ .method_call = .{
+            .object = this_ref,
+            .method = method_name,
+            .args = arg_refs,
+        } });
+    };
+
+    // Bind caller arg refs to the private's parameter names.
+    var aliased_params: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer aliased_params.deinit(ctx.allocator);
+    const n = @min(method.params.len, arg_refs.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const param_name = method.params[i].name;
+        ctx.pushParamAlias(param_name, arg_refs[i]);
+        aliased_params.append(ctx.allocator, param_name) catch {};
+    }
+
+    const start_index = ctx.bindings.items.len;
+    try lowerStatements(ctx, method.body);
+    const end_index = ctx.bindings.items.len;
+
+    // Pop aliases in reverse order so nested inlines compose correctly.
+    var j: usize = aliased_params.items.len;
+    while (j > 0) {
+        j -= 1;
+        ctx.popParamAlias(aliased_params.items[j]);
+    }
+
+    if (end_index > start_index) {
+        return ctx.bindings.items[end_index - 1].name;
+    }
+    // Empty body — emit a placeholder so the caller has a ref.
+    return try ctx.emit(makeLoadConstString(ctx.allocator, "@void"));
 }
 
 fn lowerTernaryExpr(ctx: *LowerCtx, t: *const types.Ternary) LowerError![]const u8 {
@@ -1080,6 +1754,16 @@ fn makeLoadConstInt(val: i64) ANFValue {
     return .{ .load_const = .{ .value = .{ .integer = val } } };
 }
 
+/// Wrap an oversize decimal-text integer literal (already validated by the
+/// frontend parser as ASCII digits with optional leading `-`, no `n`
+/// suffix) in a `load_const` ANF node. Mirrors Go's `makeLoadConstInt` and
+/// Python's `_make_load_const_int` for the overflow path. The text is held
+/// by reference: the parser owns the backing buffer (its arena outlives
+/// ANF lowering), so we don't dupe here.
+fn makeLoadConstBigInt(decimal: []const u8) ANFValue {
+    return .{ .load_const = .{ .value = .{ .big_integer = decimal } } };
+}
+
 fn makeLoadConstBool(val: bool) ANFValue {
     return .{ .load_const = .{ .value = .{ .boolean = val } } };
 }
@@ -1087,6 +1771,34 @@ fn makeLoadConstBool(val: bool) ANFValue {
 fn makeLoadConstString(allocator: Allocator, val: []const u8) ANFValue {
     _ = allocator;
     return .{ .load_const = .{ .value = .{ .string = val } } };
+}
+
+/// Concatenate a branch's output refs (state then data, in
+/// declaration order) into a single bytes-ref appended to the
+/// branch's bindings. If the branch has no outputs, emits an empty
+/// `load_const` so the branch still leaves one item on the stack —
+/// required to balance the if's branch shapes when the OTHER branch
+/// has outputs. 2026-04-30 audit finding F2 fix.
+fn appendBranchOutputConcat(branch_ctx: *LowerCtx) LowerError![]const u8 {
+    const state_refs = branch_ctx.getAddOutputRefs();
+    const data_refs = branch_ctx.getAddDataOutputRefs();
+    const total = state_refs.len + data_refs.len;
+    if (total == 0) {
+        return try branch_ctx.emit(makeLoadConstString(branch_ctx.allocator, ""));
+    }
+    var all_refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer all_refs.deinit(branch_ctx.allocator);
+    try all_refs.appendSlice(branch_ctx.allocator, state_refs);
+    try all_refs.appendSlice(branch_ctx.allocator, data_refs);
+    if (all_refs.items.len == 1) return all_refs.items[0];
+    var accumulated = all_refs.items[0];
+    for (all_refs.items[1..]) |next_ref| {
+        const args = try branch_ctx.allocator.alloc([]const u8, 2);
+        args[0] = accumulated;
+        args[1] = next_ref;
+        accumulated = try branch_ctx.emit(.{ .call = .{ .func = "cat", .args = args } });
+    }
+    return accumulated;
 }
 
 /// Create an "@ref:NAME" string for local variable aliasing.
@@ -1106,11 +1818,32 @@ fn isReadonlyProperty(properties: []const PropertyNode, name: []const u8) bool {
 }
 
 // ============================================================================
-// State mutation analysis
+// State mutation + intrinsic-call analysis (recursive across private calls)
 // ============================================================================
+//
+// Mirrors `packages/runar-compiler/src/passes/side-effect-summary.ts` —
+// side effects detected here include those reachable transitively through
+// private-method calls, not just direct ones in the public method body.
+// This is the F1+F3 fix from the 2026-04-30 TS compiler audit. Without
+// recursion, a public method that delegates state mutation or an
+// addOutput / addDataOutput intrinsic to a private helper would be
+// silently classified as terminal — the ABI would omit `_changePKH`,
+// `_changeAmount`, `_newAmount`, and the deployed locking script would
+// carry no `hashOutputs` continuation.
+
+fn lookupPrivateMethod(contract: ContractNode, name: []const u8) ?MethodNode {
+    for (contract.methods) |m| {
+        if (!m.is_public and std.mem.eql(u8, m.name, name)) return m;
+    }
+    return null;
+}
+
+// Maximum depth for the private-call recursion. Validation should
+// reject recursion in private methods, so this only triggers under
+// pathological inputs that bypass the validator.
+const MAX_PRIVATE_CALL_DEPTH: u32 = 64;
 
 fn methodMutatesState(method: MethodNode, contract: ContractNode) bool {
-    // Collect mutable property names
     var has_mutable = false;
     for (contract.properties) |p| {
         if (!p.readonly) {
@@ -1120,39 +1853,45 @@ fn methodMutatesState(method: MethodNode, contract: ContractNode) bool {
     }
     if (!has_mutable) return false;
 
-    return bodyMutatesState(method.body, contract);
+    return bodyMutatesStateRec(method.body, contract, 0);
 }
 
-fn bodyMutatesState(stmts: []const Statement, contract: ContractNode) bool {
+fn bodyMutatesStateRec(stmts: []const Statement, contract: ContractNode, depth: u32) bool {
+    if (depth > MAX_PRIVATE_CALL_DEPTH) return false;
     for (stmts) |stmt| {
-        if (stmtMutatesState(stmt, contract)) return true;
+        if (stmtMutatesStateRec(stmt, contract, depth)) return true;
     }
     return false;
 }
 
-fn stmtMutatesState(stmt: Statement, contract: ContractNode) bool {
+fn stmtMutatesStateRec(stmt: Statement, contract: ContractNode, depth: u32) bool {
     switch (stmt) {
         .assign => |assign| {
-            // Check if target is a mutable property
             for (contract.properties) |p| {
                 if (!p.readonly and std.mem.eql(u8, p.name, assign.target)) return true;
             }
             return false;
         },
-        .expr_stmt => |expr| return exprMutatesState(expr, contract),
+        .expr_stmt => |expr| return exprMutatesStateRec(expr, contract, depth),
         .if_stmt => |if_s| {
-            if (bodyMutatesState(if_s.then_body, contract)) return true;
+            if (bodyMutatesStateRec(if_s.then_body, contract, depth)) return true;
             if (if_s.else_body) |eb| {
-                if (bodyMutatesState(eb, contract)) return true;
+                if (bodyMutatesStateRec(eb, contract, depth)) return true;
             }
             return false;
         },
-        .for_stmt => |for_s| return bodyMutatesState(for_s.body, contract),
+        .for_stmt => |for_s| return bodyMutatesStateRec(for_s.body, contract, depth),
+        .return_stmt => |maybe_expr| {
+            if (maybe_expr) |expr| {
+                return exprMutatesStateRec(expr, contract, depth);
+            }
+            return false;
+        },
         else => return false,
     }
 }
 
-fn exprMutatesState(expr: Expression, contract: ContractNode) bool {
+fn exprMutatesStateRec(expr: Expression, contract: ContractNode, depth: u32) bool {
     switch (expr) {
         .increment => |inc| {
             switch (inc.operand) {
@@ -1174,48 +1913,119 @@ fn exprMutatesState(expr: Expression, contract: ContractNode) bool {
                 else => {},
             }
         },
+        .call => |call| {
+            // Bareword call: callee is the function name. Recurse into
+            // a private helper if the name matches one.
+            if (lookupPrivateMethod(contract, call.callee)) |target| {
+                if (bodyMutatesStateRec(target.body, contract, depth + 1)) return true;
+            }
+            for (call.args) |arg| {
+                if (exprMutatesStateRec(arg, contract, depth)) return true;
+            }
+        },
+        .method_call => |mc| {
+            // this.X / self.X — recurse into the helper.
+            if (lookupPrivateMethod(contract, mc.method)) |target| {
+                if (bodyMutatesStateRec(target.body, contract, depth + 1)) return true;
+            }
+            for (mc.args) |arg| {
+                if (exprMutatesStateRec(arg, contract, depth)) return true;
+            }
+        },
         else => {},
     }
     return false;
 }
 
 // ============================================================================
-// addOutput detection
+// addOutput / addDataOutput detection (recursive across private calls)
 // ============================================================================
+//
+// Like methodMutatesState, recurses into private-method bodies so a public
+// method that delegates an addOutput / addDataOutput intrinsic to a
+// private helper is correctly classified.
 
-fn methodHasAddOutput(method: MethodNode) bool {
-    return bodyHasAddOutput(method.body, method.params);
+fn methodHasAddOutput(method: MethodNode, contract: ContractNode) bool {
+    return bodyHasIntrinsicCallRec(method.body, method.params, contract, &STATE_OUTPUT_METHODS, 0);
 }
 
-fn bodyHasAddOutput(stmts: []const Statement, params: []const ParamNode) bool {
+/// Return true when a method body contains at least one this.addDataOutput call.
+fn methodHasAddDataOutput(method: MethodNode, contract: ContractNode) bool {
+    return bodyHasIntrinsicCallRec(method.body, method.params, contract, &DATA_OUTPUT_METHODS, 0);
+}
+
+const STATE_OUTPUT_METHODS = [_][]const u8{ "addOutput", "addRawOutput" };
+const DATA_OUTPUT_METHODS = [_][]const u8{"addDataOutput"};
+
+fn bodyHasIntrinsicCallRec(
+    stmts: []const Statement,
+    params: []const ParamNode,
+    contract: ContractNode,
+    names: []const []const u8,
+    depth: u32,
+) bool {
+    if (depth > MAX_PRIVATE_CALL_DEPTH) return false;
     for (stmts) |stmt| {
-        if (stmtHasAddOutput(stmt, params)) return true;
+        if (stmtHasIntrinsicCallRec(stmt, params, contract, names, depth)) return true;
     }
     return false;
 }
 
-fn stmtHasAddOutput(stmt: Statement, params: []const ParamNode) bool {
+fn stmtHasIntrinsicCallRec(
+    stmt: Statement,
+    params: []const ParamNode,
+    contract: ContractNode,
+    names: []const []const u8,
+    depth: u32,
+) bool {
     switch (stmt) {
-        .expr_stmt => |expr| return exprHasAddOutput(expr, params),
+        .expr_stmt => |expr| return exprHasIntrinsicCallRec(expr, params, contract, names, depth),
         .if_stmt => |if_s| {
-            if (bodyHasAddOutput(if_s.then_body, params)) return true;
+            if (bodyHasIntrinsicCallRec(if_s.then_body, params, contract, names, depth)) return true;
             if (if_s.else_body) |eb| {
-                if (bodyHasAddOutput(eb, params)) return true;
+                if (bodyHasIntrinsicCallRec(eb, params, contract, names, depth)) return true;
             }
             return false;
         },
-        .for_stmt => |for_s| return bodyHasAddOutput(for_s.body, params),
+        .for_stmt => |for_s| return bodyHasIntrinsicCallRec(for_s.body, params, contract, names, depth),
+        // Ruby's parse_ruby promotes a private method's trailing
+        // expression-statement to a return-statement for implicit-return
+        // semantics. Walk the return value the same way.
+        .return_stmt => |maybe_expr| {
+            if (maybe_expr) |expr| {
+                return exprHasIntrinsicCallRec(expr, params, contract, names, depth);
+            }
+            return false;
+        },
         else => return false,
     }
 }
 
-fn exprHasAddOutput(expr: Expression, params: []const ParamNode) bool {
+fn exprHasIntrinsicCallRec(
+    expr: Expression,
+    params: []const ParamNode,
+    contract: ContractNode,
+    names: []const []const u8,
+    depth: u32,
+) bool {
     switch (expr) {
         .method_call => |mc| {
-            if (std.mem.eql(u8, mc.object, "this") or paramIsStatefulContext(params, mc.object)) {
-                if (std.mem.eql(u8, mc.method, "addOutput") or std.mem.eql(u8, mc.method, "addRawOutput")) {
-                    return true;
+            if (std.mem.eql(u8, mc.object, "this") or std.mem.eql(u8, mc.object, "self") or paramIsStatefulContext(params, mc.object)) {
+                // Direct intrinsic match.
+                for (names) |n| {
+                    if (std.mem.eql(u8, mc.method, n)) return true;
                 }
+                // Recurse into private helper if this is a method call
+                // on `this` / `self` / stateful-context.
+                if (lookupPrivateMethod(contract, mc.method)) |target| {
+                    if (bodyHasIntrinsicCallRec(target.body, target.params, contract, names, depth + 1)) return true;
+                }
+            }
+        },
+        .call => |call| {
+            // Bareword identifier call on a private helper.
+            if (lookupPrivateMethod(contract, call.callee)) |target| {
+                if (bodyHasIntrinsicCallRec(target.body, target.params, contract, names, depth + 1)) return true;
             }
         },
         else => {},
@@ -1249,6 +2059,546 @@ fn branchEndsWithReturn(stmts: []const Statement) bool {
         },
         else => return false,
     }
+}
+
+// ============================================================================
+// liftBranchUpdateProps — flatten if-else chains that write properties
+// ============================================================================
+//
+// Mirrors the TypeScript reference compiler's liftBranchUpdateProps
+// (packages/runar-compiler/src/passes/04-anf-lower.ts) and Go/Rust/Ruby ports.
+//
+// Transforms if-else chains where each branch ends with update_prop into
+// flat conditional assignments. This is critical for stateful contracts
+// because Bitcoin Script requires ALL state fields to be explicitly on the
+// stack after method execution — nested update_props leave phantom stack
+// entries in stack lowering.
+//
+// Before:
+//   if (pos === 0) { this.c0 = turn; }
+//   else if (pos === 1) { this.c1 = turn; }
+//   else { assert(false); }
+//
+// After:
+//   this.c0 = (pos === 0)           ? turn : this.c0;
+//   this.c1 = (!cond0 && pos === 1) ? turn : this.c1;
+
+const UpdateBranch = struct {
+    cond_setup_bindings: []const ANFBinding,
+    cond_ref: ?[]const u8, // null for final else
+    prop_name: []const u8,
+    value_bindings: []const ANFBinding,
+    value_ref: []const u8,
+};
+
+/// Find the max temp index (e.g. "t47" → 47) in a binding tree.
+fn maxTempIndex(bindings: []const ANFBinding) i64 {
+    var max: i64 = -1;
+    for (bindings) |b| {
+        if (b.name.len > 1 and b.name[0] == 't') {
+            var n: i64 = 0;
+            var valid = true;
+            for (b.name[1..]) |ch| {
+                if (ch >= '0' and ch <= '9') {
+                    n = n * 10 + (ch - '0');
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid and n > max) max = n;
+        }
+        switch (b.value) {
+            .@"if" => |ifv| {
+                const t = maxTempIndex(ifv.then);
+                if (t > max) max = t;
+                const e = maxTempIndex(ifv.@"else");
+                if (e > max) max = e;
+            },
+            .loop => |lp| {
+                const t = maxTempIndex(lp.body);
+                if (t > max) max = t;
+            },
+            else => {},
+        }
+    }
+    return max;
+}
+
+/// Check if a binding value is side-effect-free (safe to hoist).
+/// F-003: every ANFValue variant is enumerated explicitly (no `else`) so
+/// adding a new variant fails at Zig compile time here instead of silently
+/// defaulting to "not pure" — which would conservatively block hoisting but
+/// hide the missed dispatch update.
+fn isSideEffectFree(v: ANFValue) bool {
+    return switch (v) {
+        .load_prop, .load_param, .load_const, .bin_op, .unary_op => true,
+        .call,
+        .method_call,
+        .@"if",
+        .loop,
+        .assert,
+        .update_prop,
+        .get_state_script,
+        .check_preimage,
+        .deserialize_state,
+        .add_output,
+        .add_raw_output,
+        .add_data_output,
+        .array_literal,
+        .raw_script,
+        => false,
+    };
+}
+
+fn allBindingsSideEffectFree(bindings: []const ANFBinding) bool {
+    for (bindings) |b| {
+        if (!isSideEffectFree(b.value)) return false;
+    }
+    return true;
+}
+
+/// Extract the update_prop target from a branch's last binding.
+/// Returns null if the branch doesn't end with a simple update_prop.
+const BranchUpdate = struct {
+    prop_name: []const u8,
+    value_bindings: []const ANFBinding,
+    value_ref: []const u8,
+};
+
+fn extractBranchUpdate(bindings: []const ANFBinding) ?BranchUpdate {
+    if (bindings.len == 0) return null;
+    const last = bindings[bindings.len - 1];
+    switch (last.value) {
+        .update_prop => |up| {
+            const value_bindings = bindings[0 .. bindings.len - 1];
+            if (!allBindingsSideEffectFree(value_bindings)) return null;
+            return .{
+                .prop_name = up.name,
+                .value_bindings = value_bindings,
+                .value_ref = up.value,
+            };
+        },
+        else => return null,
+    }
+}
+
+/// Check if an else branch is just `assert(false)` — unreachable dead code.
+fn isAssertFalseElse(bindings: []const ANFBinding) bool {
+    if (bindings.len == 0) return false;
+    const last = bindings[bindings.len - 1];
+    const assert_ref = switch (last.value) {
+        .assert => |a| a.value,
+        else => return false,
+    };
+    for (bindings) |b| {
+        if (std.mem.eql(u8, b.name, assert_ref)) {
+            switch (b.value) {
+                .load_const => |lc| switch (lc.value) {
+                    .boolean => |bv| return !bv,
+                    else => return false,
+                },
+                else => return false,
+            }
+        }
+    }
+    return false;
+}
+
+/// Recursively collect update branches from a nested if-else chain.
+/// Returns null if the chain cannot be flattened.
+fn collectUpdateBranches(
+    allocator: Allocator,
+    if_cond: []const u8,
+    then_bindings: []const ANFBinding,
+    else_bindings: []const ANFBinding,
+) LowerError!?[]UpdateBranch {
+    const then_update = extractBranchUpdate(then_bindings) orelse return null;
+
+    var branches: std.ArrayListUnmanaged(UpdateBranch) = .empty;
+    try branches.append(allocator, .{
+        .cond_setup_bindings = &.{},
+        .cond_ref = if_cond,
+        .prop_name = then_update.prop_name,
+        .value_bindings = then_update.value_bindings,
+        .value_ref = then_update.value_ref,
+    });
+
+    if (else_bindings.len == 0) {
+        branches.deinit(allocator);
+        return null;
+    }
+
+    // Check if else is another if (else-if chain)
+    const last_else = else_bindings[else_bindings.len - 1];
+    switch (last_else.value) {
+        .@"if" => |inner_if| {
+            const cond_setup = else_bindings[0 .. else_bindings.len - 1];
+            if (!allBindingsSideEffectFree(cond_setup)) {
+                branches.deinit(allocator);
+                return null;
+            }
+
+            const inner_maybe = try collectUpdateBranches(
+                allocator,
+                inner_if.cond,
+                inner_if.then,
+                inner_if.@"else",
+            );
+            const inner = inner_maybe orelse {
+                branches.deinit(allocator);
+                return null;
+            };
+
+            // Prepend condition setup to first inner branch
+            const merged = try allocator.alloc(ANFBinding, cond_setup.len + inner[0].cond_setup_bindings.len);
+            @memcpy(merged[0..cond_setup.len], cond_setup);
+            @memcpy(merged[cond_setup.len..], inner[0].cond_setup_bindings);
+            inner[0].cond_setup_bindings = merged;
+
+            try branches.appendSlice(allocator, inner);
+            return try branches.toOwnedSlice(allocator);
+        },
+        else => {},
+    }
+
+    // Otherwise, else branch should end with update_prop (final else)
+    if (extractBranchUpdate(else_bindings)) |eu| {
+        try branches.append(allocator, .{
+            .cond_setup_bindings = &.{},
+            .cond_ref = null,
+            .prop_name = eu.prop_name,
+            .value_bindings = eu.value_bindings,
+            .value_ref = eu.value_ref,
+        });
+        return try branches.toOwnedSlice(allocator);
+    }
+
+    // Handle unreachable else: assert(false)
+    if (isAssertFalseElse(else_bindings)) {
+        return try branches.toOwnedSlice(allocator);
+    }
+
+    branches.deinit(allocator);
+    return null;
+}
+
+/// Remap temp references in an ANF value according to a name mapping.
+fn remapValueRefs(
+    allocator: Allocator,
+    value: ANFValue,
+    name_map: *const std.StringHashMapUnmanaged([]const u8),
+) LowerError!ANFValue {
+    const r = struct {
+        fn f(nm: *const std.StringHashMapUnmanaged([]const u8), s: []const u8) []const u8 {
+            if (nm.get(s)) |mapped| return mapped;
+            return s;
+        }
+    }.f;
+
+    switch (value) {
+        .load_param, .load_prop, .get_state_script => return value,
+        .load_const => |lc| {
+            switch (lc.value) {
+                .string => |s| {
+                    if (s.len > 5 and std.mem.startsWith(u8, s, "@ref:")) {
+                        const target = s[5..];
+                        if (name_map.get(target)) |mapped| {
+                            const new_s = try std.fmt.allocPrint(allocator, "@ref:{s}", .{mapped});
+                            return .{ .load_const = .{ .value = .{ .string = new_s } } };
+                        }
+                    }
+                },
+                else => {},
+            }
+            return value;
+        },
+        .bin_op => |bop| {
+            return .{ .bin_op = .{
+                .op = bop.op,
+                .left = r(name_map, bop.left),
+                .right = r(name_map, bop.right),
+                .result_type = bop.result_type,
+            } };
+        },
+        .unary_op => |uop| {
+            return .{ .unary_op = .{
+                .op = uop.op,
+                .operand = r(name_map, uop.operand),
+                .result_type = uop.result_type,
+            } };
+        },
+        .call => |c| {
+            const new_args = try allocator.alloc([]const u8, c.args.len);
+            for (c.args, 0..) |a, i| new_args[i] = r(name_map, a);
+            return .{ .call = .{ .func = c.func, .args = new_args } };
+        },
+        .method_call => |mc| {
+            const new_args = try allocator.alloc([]const u8, mc.args.len);
+            for (mc.args, 0..) |a, i| new_args[i] = r(name_map, a);
+            return .{ .method_call = .{
+                .object = r(name_map, mc.object),
+                .method = mc.method,
+                .args = new_args,
+            } };
+        },
+        .assert => |a| {
+            return .{ .assert = .{ .value = r(name_map, a.value) } };
+        },
+        .update_prop => |up| {
+            return .{ .update_prop = .{ .name = up.name, .value = r(name_map, up.value) } };
+        },
+        .check_preimage => |cp| {
+            return .{ .check_preimage = .{ .preimage = r(name_map, cp.preimage) } };
+        },
+        .deserialize_state => |ds| {
+            return .{ .deserialize_state = .{ .preimage = r(name_map, ds.preimage) } };
+        },
+        .add_output => |ao| {
+            const new_sv = try allocator.alloc([]const u8, ao.state_values.len);
+            for (ao.state_values, 0..) |s, i| new_sv[i] = r(name_map, s);
+            const new_sr = try allocator.alloc([]const u8, ao.state_refs.len);
+            for (ao.state_refs, 0..) |s, i| new_sr[i] = r(name_map, s);
+            return .{ .add_output = .{
+                .satoshis = r(name_map, ao.satoshis),
+                .state_values = new_sv,
+                .preimage = if (ao.preimage.len > 0) r(name_map, ao.preimage) else ao.preimage,
+                .state_refs = new_sr,
+            } };
+        },
+        .add_raw_output => |aro| {
+            return .{ .add_raw_output = .{
+                .satoshis = r(name_map, aro.satoshis),
+                .script_bytes = if (aro.script_bytes.len > 0) r(name_map, aro.script_bytes) else aro.script_bytes,
+            } };
+        },
+        .add_data_output => |ado| {
+            return .{ .add_data_output = .{
+                .satoshis = r(name_map, ado.satoshis),
+                .script_bytes = if (ado.script_bytes.len > 0) r(name_map, ado.script_bytes) else ado.script_bytes,
+            } };
+        },
+        .@"if" => |ifv| {
+            const new_if = try allocator.create(types.ANFIf);
+            new_if.* = .{
+                .cond = r(name_map, ifv.cond),
+                .then = ifv.then,
+                .@"else" = ifv.@"else",
+            };
+            return .{ .@"if" = new_if };
+        },
+        // F-003: explicit per-variant arms (no `else`) so adding a new
+        // ANFValue variant fails at Zig compile time here instead of silently
+        // skipping the rename and corrupting downstream IR. Mirrors the
+        // `UnknownANFKindError` default in TS
+        // `passes/04-anf-lower.ts#remapValueRefs`.
+        .loop => return value,
+        .array_literal => |al| {
+            const new_elems = try allocator.alloc([]const u8, al.elements.len);
+            for (al.elements, 0..) |e, i| new_elems[i] = r(name_map, e);
+            return .{ .array_literal = .{ .elements = new_elems } };
+        },
+        .raw_script => return value,
+    }
+}
+
+/// Transform if-bindings whose branches all end with update_prop into
+/// flat conditional assignments.
+fn liftBranchUpdateProps(
+    allocator: Allocator,
+    bindings: []const ANFBinding,
+) LowerError![]ANFBinding {
+    var next_idx: i64 = maxTempIndex(bindings) + 1;
+    const FreshCtx = struct {
+        allocator: Allocator,
+        next_idx: *i64,
+        fn fresh(self: @This()) LowerError![]const u8 {
+            const name = try std.fmt.allocPrint(self.allocator, "t{d}", .{self.next_idx.*});
+            self.next_idx.* += 1;
+            return name;
+        }
+    };
+    const fctx = FreshCtx{ .allocator = allocator, .next_idx = &next_idx };
+
+    var result: std.ArrayListUnmanaged(ANFBinding) = .empty;
+
+    for (bindings) |binding| {
+        const if_val = switch (binding.value) {
+            .@"if" => |v| v,
+            else => {
+                try result.append(allocator, binding);
+                continue;
+            },
+        };
+
+        const branches_maybe = try collectUpdateBranches(
+            allocator,
+            if_val.cond,
+            if_val.then,
+            if_val.@"else",
+        );
+        const branches = branches_maybe orelse {
+            try result.append(allocator, binding);
+            continue;
+        };
+        if (branches.len < 2) {
+            try result.append(allocator, binding);
+            continue;
+        }
+
+        // --- Transform: flatten into conditional assignments ---
+
+        // 1. Hoist condition setup bindings with fresh names.
+        var name_map: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer name_map.deinit(allocator);
+
+        var cond_refs: std.ArrayListUnmanaged(?[]const u8) = .empty;
+        defer cond_refs.deinit(allocator);
+
+        for (branches) |branch| {
+            for (branch.cond_setup_bindings) |csb| {
+                const new_name = try fctx.fresh();
+                try name_map.put(allocator, csb.name, new_name);
+                const remapped = try remapValueRefs(allocator, csb.value, &name_map);
+                try result.append(allocator, .{
+                    .name = new_name,
+                    .value = remapped,
+                });
+            }
+            if (branch.cond_ref) |cr| {
+                const mapped: []const u8 = if (name_map.get(cr)) |m| m else cr;
+                try cond_refs.append(allocator, mapped);
+            } else {
+                try cond_refs.append(allocator, null);
+            }
+        }
+
+        // 2. Compute effective condition for each branch.
+        var effective_conds: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer effective_conds.deinit(allocator);
+
+        var negated_conds: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer negated_conds.deinit(allocator);
+
+        for (branches, 0..) |_, i| {
+            if (i == 0) {
+                try effective_conds.append(allocator, cond_refs.items[0].?);
+                continue;
+            }
+
+            // Negate any prior conditions not yet negated.
+            var j: usize = negated_conds.items.len;
+            while (j < i) : (j += 1) {
+                const cr = cond_refs.items[j] orelse continue;
+                const neg_name = try fctx.fresh();
+                try result.append(allocator, .{
+                    .name = neg_name,
+                    .value = .{ .unary_op = .{ .op = "!", .operand = cr } },
+                });
+                try negated_conds.append(allocator, neg_name);
+            }
+
+            // AND all negated conditions together.
+            var and_ref: []const u8 = negated_conds.items[0];
+            const limit = if (negated_conds.items.len < i) negated_conds.items.len else i;
+            var k: usize = 1;
+            while (k < limit) : (k += 1) {
+                const and_name = try fctx.fresh();
+                try result.append(allocator, .{
+                    .name = and_name,
+                    .value = .{ .bin_op = .{
+                        .op = "&&",
+                        .left = and_ref,
+                        .right = negated_conds.items[k],
+                        .result_type = null,
+                    } },
+                });
+                and_ref = and_name;
+            }
+
+            if (cond_refs.items[i]) |cr| {
+                // Middle branch: AND with own condition.
+                const final_name = try fctx.fresh();
+                try result.append(allocator, .{
+                    .name = final_name,
+                    .value = .{ .bin_op = .{
+                        .op = "&&",
+                        .left = and_ref,
+                        .right = cr,
+                        .result_type = null,
+                    } },
+                });
+                try effective_conds.append(allocator, final_name);
+            } else {
+                // Final else: just the AND of negations.
+                try effective_conds.append(allocator, and_ref);
+            }
+        }
+
+        // 3. For each branch, emit: load_old, conditional if-expression, update_prop.
+        for (branches, 0..) |branch, i| {
+            // Load old property value.
+            const old_prop_ref = try fctx.fresh();
+            try result.append(allocator, .{
+                .name = old_prop_ref,
+                .value = .{ .load_prop = .{ .name = branch.prop_name } },
+            });
+
+            // Remap value bindings for the then-branch.
+            var branch_map: std.StringHashMapUnmanaged([]const u8) = .empty;
+            defer branch_map.deinit(allocator);
+            var map_it = name_map.iterator();
+            while (map_it.next()) |entry| {
+                try branch_map.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+            }
+
+            var then_bindings: std.ArrayListUnmanaged(ANFBinding) = .empty;
+            for (branch.value_bindings) |vb| {
+                const new_name = try fctx.fresh();
+                try branch_map.put(allocator, vb.name, new_name);
+                const remapped = try remapValueRefs(allocator, vb.value, &branch_map);
+                try then_bindings.append(allocator, .{
+                    .name = new_name,
+                    .value = remapped,
+                });
+            }
+
+            // Else branch: keep old property value.
+            const keep_name = try fctx.fresh();
+            var else_bindings_list: std.ArrayListUnmanaged(ANFBinding) = .empty;
+            try else_bindings_list.append(allocator, .{
+                .name = keep_name,
+                .value = .{ .load_const = .{ .value = .{
+                    .string = try std.fmt.allocPrint(allocator, "@ref:{s}", .{old_prop_ref}),
+                } } },
+            });
+
+            // Emit conditional if-expression.
+            const cond_if_ref = try fctx.fresh();
+            const new_if = try allocator.create(types.ANFIf);
+            new_if.* = .{
+                .cond = effective_conds.items[i],
+                .then = try then_bindings.toOwnedSlice(allocator),
+                .@"else" = try else_bindings_list.toOwnedSlice(allocator),
+            };
+            try result.append(allocator, .{
+                .name = cond_if_ref,
+                .value = .{ .@"if" = new_if },
+            });
+
+            // Emit update_prop.
+            const update_name = try fctx.fresh();
+            try result.append(allocator, .{
+                .name = update_name,
+                .value = .{ .update_prop = .{
+                    .name = branch.prop_name,
+                    .value = cond_if_ref,
+                } },
+            });
+        }
+    }
+
+    return try result.toOwnedSlice(allocator);
 }
 
 // ============================================================================
@@ -1426,6 +2776,46 @@ test "lower property access" {
     switch (ctx.bindings.items[0].value) {
         .load_prop => |lp| try std.testing.expectEqualStrings("pubKeyHash", lp.name),
         else => return error.TestExpectedEqual,
+    }
+}
+
+test "explicit this.x resolves to load_prop even when x is a registered param (#130)" {
+    const allocator = std.testing.allocator;
+
+    const props = try allocator.alloc(PropertyNode, 1);
+    defer allocator.free(props);
+    props[0] = .{ .name = "balance", .type_info = .bigint, .readonly = false };
+
+    var ctx = LowerCtx.init(allocator, .{
+        .name = "ShadowRepro",
+        .parent_class = .stateful_smart_contract,
+        .properties = props,
+        .constructor = .{ .params = &.{}, .super_args = &.{}, .assignments = &.{} },
+        .methods = &.{},
+    });
+    defer {
+        for (ctx.bindings.items) |b| allocator.free(b.name);
+        ctx.bindings.deinit(allocator);
+        ctx.param_names.deinit(allocator);
+    }
+
+    // A method param named `balance` shadows the mutable property `balance`.
+    ctx.addParam("balance");
+
+    // Bare identifier `balance` -> load_param (the witness value).
+    const id_ref = try lowerIdentifier(&ctx, "balance");
+    _ = id_ref;
+    switch (ctx.bindings.items[0].value) {
+        .load_param => |lp| try std.testing.expectEqualStrings("balance", lp.name),
+        else => return error.TestExpectedLoadParam,
+    }
+
+    // Explicit `this.balance` -> load_prop (the property always wins).
+    const prop_ref = try lowerExprToRef(&ctx, .{ .property_access = .{ .object = "this", .property = "balance" } });
+    _ = prop_ref;
+    switch (ctx.bindings.items[1].value) {
+        .load_prop => |lp| try std.testing.expectEqualStrings("balance", lp.name),
+        else => return error.TestExpectedLoadProp,
     }
 }
 
@@ -1667,6 +3057,100 @@ test "P2PKH contract full lowering" {
     }
 }
 
+test "stateful contract injects checkPreimage at public method entry" {
+    // GAP-m6: a public method of a StatefulSmartContract must have the
+    // compiler auto-inject `checkPreimage(txPreimage)` as the first three
+    // bindings: load_param("txPreimage") -> check_preimage -> assert.
+    const allocator = std.testing.allocator;
+
+    // contract Counter extends StatefulSmartContract {
+    //   count: bigint;                       // mutable state
+    //   constructor(count: bigint) { super(count); }
+    //   public touch() { assert(1); }
+    // }
+    const props = try allocator.alloc(PropertyNode, 1);
+    defer allocator.free(props);
+    props[0] = .{ .name = "count", .type_info = .bigint, .readonly = false };
+
+    const ctor_params = try allocator.alloc(ParamNode, 1);
+    defer allocator.free(ctor_params);
+    ctor_params[0] = .{ .name = "count", .type_info = .bigint, .type_name = "bigint" };
+
+    const ctor_assignments = try allocator.alloc(types.AssignmentNode, 1);
+    defer allocator.free(ctor_assignments);
+    ctor_assignments[0] = .{ .target = "count", .value = .{ .identifier = "count" } };
+
+    // Method body: assert(1) — a trivial public spend path. The body content
+    // is irrelevant; what matters is that checkPreimage is injected ahead of it.
+    const assert_args = try allocator.alloc(Expression, 1);
+    defer allocator.free(assert_args);
+    assert_args[0] = .{ .literal_int = 1 };
+    const assert_call = try allocator.create(types.CallExpr);
+    defer allocator.destroy(assert_call);
+    assert_call.* = .{ .callee = "assert", .args = assert_args };
+
+    const body = try allocator.alloc(Statement, 1);
+    defer allocator.free(body);
+    body[0] = .{ .expr_stmt = .{ .call = assert_call } };
+
+    const methods = try allocator.alloc(MethodNode, 1);
+    defer allocator.free(methods);
+    methods[0] = .{ .name = "touch", .is_public = true, .params = &.{}, .body = body };
+
+    const contract = ContractNode{
+        .name = "Counter",
+        .parent_class = .stateful_smart_contract,
+        .properties = props,
+        .constructor = .{ .params = ctor_params, .super_args = &.{}, .assignments = ctor_assignments },
+        .methods = methods,
+    };
+
+    const program = try lowerToANF(allocator, contract);
+    defer {
+        for (program.methods) |m| {
+            for (m.bindings) |b| {
+                if (b.name.len >= 2 and b.name[0] == 't') allocator.free(b.name);
+                switch (b.value) {
+                    .call => |c| if (c.args.len > 0) allocator.free(c.args),
+                    else => {},
+                }
+            }
+            if (m.bindings.len > 0) allocator.free(m.bindings);
+        }
+        // The public stateful method (`touch`, index 1) has an augmented
+        // params slice freshly allocated by lowerMethods (original params +
+        // implicit txPreimage / change-output params). The constructor's
+        // params alias `contract.constructor.params` and must not be freed here.
+        allocator.free(program.methods[1].params);
+        allocator.free(program.methods);
+        allocator.free(program.properties);
+    }
+
+    // methods = [constructor, touch]
+    try std.testing.expectEqual(@as(usize, 2), program.methods.len);
+    try std.testing.expectEqualStrings("touch", program.methods[1].name);
+    try std.testing.expect(program.methods[1].is_public);
+
+    const touch_bindings = program.methods[1].bindings;
+    try std.testing.expect(touch_bindings.len >= 3);
+
+    // Binding 0: load_param("txPreimage")
+    switch (touch_bindings[0].value) {
+        .load_param => |lp| try std.testing.expectEqualStrings("txPreimage", lp.name),
+        else => return error.TestExpectedEqual,
+    }
+    // Binding 1: check_preimage over that param
+    switch (touch_bindings[1].value) {
+        .check_preimage => |cp| try std.testing.expectEqualStrings(touch_bindings[0].name, cp.preimage),
+        else => return error.TestExpectedEqual,
+    }
+    // Binding 2: assert over the check_preimage result
+    switch (touch_bindings[2].value) {
+        .assert => |a| try std.testing.expectEqualStrings(touch_bindings[1].name, a.value),
+        else => return error.TestExpectedEqual,
+    }
+}
+
 test "sub_context shares counter" {
     const allocator = std.testing.allocator;
     var ctx = LowerCtx.init(allocator, .{
@@ -1787,4 +3271,94 @@ test "lower properties with initial values" {
     try std.testing.expectEqualStrings("owner", result[1].name);
     try std.testing.expect(result[1].readonly);
     try std.testing.expect(result[1].initial_value == null);
+}
+
+// -- #121: lowerForStatement resolves the compile-time loop shape (start / step
+// / count) for non-zero-start and countdown loops. Uses an arena so all
+// allocations are freed together.
+
+/// Find method "m"'s loop node and return it (or null).
+fn findLoweredLoop(program: ANFProgram) ?types.ANFLoop {
+    for (program.methods) |m| {
+        if (!std.mem.eql(u8, m.name, "m")) continue;
+        for (m.bindings) |b| {
+            switch (b.value) {
+                .loop => |lp| return lp.*,
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
+fn lowerContractWithLoop(alloc: Allocator, for_stmt: types.ForStmt) LowerError!ANFProgram {
+    const props = try alloc.alloc(PropertyNode, 1);
+    props[0] = .{ .name = "x", .type_info = .bigint, .readonly = true };
+
+    const ctor_params = try alloc.alloc(ParamNode, 1);
+    ctor_params[0] = .{ .name = "x", .type_info = .bigint, .type_name = "bigint" };
+    const ctor_assignments = try alloc.alloc(types.AssignmentNode, 1);
+    ctor_assignments[0] = .{ .target = "x", .value = .{ .identifier = "x" } };
+
+    const body = try alloc.alloc(Statement, 2);
+    body[0] = .{ .for_stmt = for_stmt };
+    body[1] = .{ .assert_stmt = .{ .condition = .{ .literal_bool = true } } };
+
+    const methods = try alloc.alloc(MethodNode, 1);
+    methods[0] = .{ .name = "m", .is_public = true, .params = &.{}, .body = body };
+
+    return lowerToANF(alloc, .{
+        .name = "C",
+        .parent_class = .smart_contract,
+        .properties = props,
+        .constructor = .{ .params = ctor_params, .super_args = &.{}, .assignments = ctor_assignments },
+        .methods = methods,
+    });
+}
+
+test "lowering supports a countdown loop (#121)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // for (let i = 3; i > 0; i--)  -> start 3, step -1, count 3
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 3, .bound = 0, .descending = true, .body = &.{} };
+    const program = try lowerContractWithLoop(arena.allocator(), for_stmt);
+    const lp = findLoweredLoop(program) orelse return error.TestExpectedLoop;
+    try std.testing.expectEqual(@as(u32, 3), lp.count);
+    try std.testing.expectEqual(@as(i64, 3), lp.start);
+    try std.testing.expectEqual(@as(i8, -1), lp.step);
+}
+
+test "lowering supports a non-zero-start loop (#121)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // for (let i = 1; i <= 3; i++)  -> start 1, step +1, count 3
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 1, .bound = 3, .inclusive = true, .body = &.{} };
+    const program = try lowerContractWithLoop(arena.allocator(), for_stmt);
+    const lp = findLoweredLoop(program) orelse return error.TestExpectedLoop;
+    try std.testing.expectEqual(@as(u32, 3), lp.count);
+    try std.testing.expectEqual(@as(i64, 1), lp.start);
+    try std.testing.expectEqual(@as(i8, 1), lp.step);
+}
+
+test "lowering still accepts a zero-start counting-up loop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // for (let i = 0; i < 4; i++)
+    const for_stmt = types.ForStmt{ .var_name = "i", .init_value = 0, .bound = 4, .body = &.{} };
+    const program = try lowerContractWithLoop(arena.allocator(), for_stmt);
+    // Find method "m" and confirm it lowered a loop with count 4.
+    var found_loop = false;
+    for (program.methods) |m| {
+        if (!std.mem.eql(u8, m.name, "m")) continue;
+        for (m.bindings) |b| {
+            switch (b.value) {
+                .loop => |lp| {
+                    found_loop = true;
+                    try std.testing.expectEqual(@as(u32, 4), lp.count);
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found_loop);
 }

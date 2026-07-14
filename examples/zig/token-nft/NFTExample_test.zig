@@ -2,7 +2,7 @@ const std = @import("std");
 
 const root = @import("../examples_test.zig");
 const runar = @import("runar");
-const NFTExample = @import("NFTExample.runar.zig").NFTExample;
+const NFTExample = @import("NFTExample.runar.zig").SimpleNFT;
 
 const contract_source = @embedFile("NFTExample.runar.zig");
 
@@ -10,7 +10,7 @@ test "compile-check NFTExample.runar.zig" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "NFTExample.runar.zig", .data = contract_source });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "NFTExample.runar.zig", .data = contract_source });
 
     const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "NFTExample.runar.zig" });
     defer allocator.free(path);

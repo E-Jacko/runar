@@ -27,6 +27,8 @@
 //! - snake_case identifiers -> camelCase in AST
 //! - Move builtins mapped: `check_sig` -> `checkSig`, `hash160` -> `hash160`, etc.
 
+use num_bigint::BigInt;
+use num_traits::{Num, ToPrimitive};
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -51,6 +53,7 @@ pub fn parse_move(source: &str, file_name: Option<&str>) -> ParseResult {
     ParseResult {
         contract,
         errors,
+        source_size_err: None,
     }
 }
 
@@ -92,6 +95,7 @@ fn map_builtin_name(name: &str) -> String {
         "bin2num" => "bin2num".to_string(),
         "add_output" => "addOutput".to_string(),
         "add_raw_output" => "addRawOutput".to_string(),
+        "add_data_output" => "addDataOutput".to_string(),
         "tx_preimage" => "txPreimage".to_string(),
         "bool_cast" => "bool".to_string(),
         "verify_wots" => "verifyWOTS".to_string(),
@@ -106,6 +110,24 @@ fn map_builtin_name(name: &str) -> String {
         "to_byte_string" => "toByteString".to_string(),
         "int_2_str" | "int2str" => "int2str".to_string(),
         "reverse_bytes" => "reverseBytes".to_string(),
+        "p256_add" => "p256Add".to_string(),
+        "p256_mul" => "p256Mul".to_string(),
+        "p256_mul_gen" => "p256MulGen".to_string(),
+        "p256_negate" => "p256Negate".to_string(),
+        "p256_on_curve" => "p256OnCurve".to_string(),
+        "p256_encode_compressed" => "p256EncodeCompressed".to_string(),
+        "verify_ecdsa_p256" => "verifyECDSA_P256".to_string(),
+        "p384_add" => "p384Add".to_string(),
+        "p384_mul" => "p384Mul".to_string(),
+        "p384_mul_gen" => "p384MulGen".to_string(),
+        "p384_negate" => "p384Negate".to_string(),
+        "p384_on_curve" => "p384OnCurve".to_string(),
+        "p384_encode_compressed" => "p384EncodeCompressed".to_string(),
+        "verify_ecdsa_p384" => "verifyECDSA_P384".to_string(),
+        // Pre-camelCased forms also accepted (matches the canonical TS Move
+        // parser, whose regex preserves the literal `_P` boundary).
+        "verifyECDSA_P256" => "verifyECDSA_P256".to_string(),
+        "verifyECDSA_P384" => "verifyECDSA_P384".to_string(),
         _ => snake_to_camel(name),
     }
 }
@@ -149,7 +171,7 @@ enum Token {
 
     // Identifiers and literals
     Ident(String),
-    NumberLit(i128),
+    NumberLit(BigInt),
     StringLit(String),
 
     // Operators
@@ -164,6 +186,8 @@ enum Token {
     Le,
     Gt,
     Ge,
+    Shl,        // <<
+    Shr,        // >>
     And,        // &&
     Or,         // ||
     Amp,        // &
@@ -250,6 +274,16 @@ fn tokenize(source: &str) -> Vec<Token> {
         }
         if ch == '>' && i + 1 < len && chars[i + 1] == '=' {
             tokens.push(Token::Ge);
+            i += 2;
+            continue;
+        }
+        if ch == '<' && i + 1 < len && chars[i + 1] == '<' {
+            tokens.push(Token::Shl);
+            i += 2;
+            continue;
+        }
+        if ch == '>' && i + 1 < len && chars[i + 1] == '>' {
+            tokens.push(Token::Shr);
             i += 2;
             continue;
         }
@@ -378,7 +412,8 @@ fn tokenize(source: &str) -> Vec<Token> {
                 .iter()
                 .filter(|c| **c != '_' && **c != 'n')
                 .collect();
-            let val = num_str.parse::<i128>().unwrap_or(0);
+            let val = <BigInt as Num>::from_str_radix(&num_str, 10)
+                .unwrap_or_else(|_| BigInt::from(0));
             tokens.push(Token::NumberLit(val));
             continue;
         }
@@ -466,6 +501,27 @@ impl<'a> MoveParser<'a> {
         t
     }
 
+    /// Close a generic-argument list. Accepts either a plain `>` or splits
+    /// a `>>` shift token in place into two `>` so an enclosing close can
+    /// consume the remaining half.
+    fn consume_generic_close(&mut self) {
+        match self.peek() {
+            Token::Gt => {
+                self.advance();
+            }
+            Token::Shr => {
+                // Replace the current `>>` with a single `>` without
+                // advancing — the outer close will then consume it.
+                if let Some(slot) = self.tokens.get_mut(self.pos) {
+                    *slot = Token::Gt;
+                }
+            }
+            _ => {
+                self.expect(&Token::Gt);
+            }
+        }
+    }
+
     fn expect(&mut self, expected: &Token) -> bool {
         if self.peek() == expected {
             self.advance();
@@ -504,11 +560,20 @@ impl<'a> MoveParser<'a> {
     // -----------------------------------------------------------------------
 
     fn parse_module(&mut self) -> Option<ContractNode> {
+        // `unsafe module Name { ... }` marks an UnsafeSmartContract — the
+        // asm-escape-hatch base class. Plain `module Name { ... }` infers
+        // SmartContract / StatefulSmartContract structurally as before.
+        let mut is_unsafe = false;
+
         // Skip until 'module'
         while *self.peek() != Token::Module && *self.peek() != Token::Eof {
             // Also allow struct at top level without module wrapper
             if *self.peek() == Token::Struct || *self.peek() == Token::Resource || *self.peek() == Token::Public {
-                return self.parse_top_level_without_module();
+                return self.parse_top_level_without_module(is_unsafe);
+            }
+            // `unsafe` immediately before `module` marks an UnsafeSmartContract.
+            if matches!(self.peek(), Token::Ident(n) if n == "unsafe") {
+                is_unsafe = true;
             }
             self.advance();
         }
@@ -519,7 +584,7 @@ impl<'a> MoveParser<'a> {
         }
 
         self.advance(); // consume 'module'
-        let _module_name = self.expect_ident();
+        let module_name = self.expect_ident();
 
         // Optional :: address
         if *self.peek() == Token::ColonColon {
@@ -529,20 +594,24 @@ impl<'a> MoveParser<'a> {
 
         self.expect(&Token::LBrace);
 
-        let result = self.parse_module_body();
+        let result = self.parse_module_body(is_unsafe, Some(module_name));
 
         self.expect(&Token::RBrace);
 
         result
     }
 
-    fn parse_top_level_without_module(&mut self) -> Option<ContractNode> {
-        self.parse_module_body()
+    fn parse_top_level_without_module(&mut self, is_unsafe: bool) -> Option<ContractNode> {
+        self.parse_module_body(is_unsafe, None)
     }
 
-    fn parse_module_body(&mut self) -> Option<ContractNode> {
+    fn parse_module_body(&mut self, is_unsafe: bool, module_name: Option<String>) -> Option<ContractNode> {
         let mut contract_name: Option<String> = None;
-        let mut parent_class = "SmartContract".to_string();
+        let mut parent_class = if is_unsafe {
+            "UnsafeSmartContract".to_string()
+        } else {
+            "SmartContract".to_string()
+        };
         let mut properties: Vec<PropertyNode> = Vec::new();
         let mut methods: Vec<MethodNode> = Vec::new();
         let mut is_resource = false;
@@ -576,15 +645,24 @@ impl<'a> MoveParser<'a> {
                         let (name, pc, props) = self.parse_struct();
                         contract_name = Some(name.clone());
                         self.struct_name = name;
-                        parent_class = pc;
+                        if !is_unsafe {
+                            parent_class = pc;
+                        }
                         properties = props;
+                    } else {
+                        self.errors.push(Diagnostic::error(format!(
+                            "Expected 'struct' after 'resource', got {:?}",
+                            self.peek()
+                        ), None));
                     }
                 }
                 Token::Struct => {
                     let (name, pc, props) = self.parse_struct();
                     contract_name = Some(name.clone());
                     self.struct_name = name;
-                    parent_class = pc;
+                    if !is_unsafe {
+                        parent_class = pc;
+                    }
                     properties = props;
                 }
                 Token::Public => {
@@ -612,20 +690,44 @@ impl<'a> MoveParser<'a> {
         let contract_name = match contract_name {
             Some(n) => n,
             None => {
-                self.errors
-                    .push(Diagnostic::error("No 'struct' declaration found in module", None));
-                return None;
+                // `unsafe module Name { ... }` legitimately has no `struct`
+                // (no state). Fall back to the module name as the contract name.
+                if is_unsafe {
+                    if let Some(n) = module_name {
+                        self.struct_name = n.clone();
+                        n
+                    } else {
+                        self.errors
+                            .push(Diagnostic::error("No 'struct' declaration found in module", None));
+                        return None;
+                    }
+                } else {
+                    self.errors
+                        .push(Diagnostic::error("No 'struct' declaration found in module", None));
+                    return None;
+                }
             }
         };
 
-        // If struct was marked as "resource" or has mutable fields, it's stateful
-        let has_mutable = properties.iter().any(|p| !p.readonly);
-        if is_resource || has_mutable {
-            parent_class = "StatefulSmartContract".to_string();
+        // If struct was marked as "resource" or has mutable fields, it's
+        // stateful — UNLESS the module is marked `unsafe`, in which case it
+        // stays an UnsafeSmartContract regardless of structural shape.
+        if !is_unsafe {
+            if is_resource {
+                parent_class = "StatefulSmartContract".to_string();
+            } else {
+                let has_mutable = properties.iter().any(|p| !p.readonly);
+                if has_mutable {
+                    parent_class = "StatefulSmartContract".to_string();
+                }
+            }
         }
 
-        // Determine readonly based on parent class
-        let is_stateless = parent_class == "SmartContract";
+        // Determine readonly based on parent class. SmartContract and the
+        // asm-escape-hatch UnsafeSmartContract both make every property
+        // readonly.
+        let is_stateless =
+            parent_class == "SmartContract" || parent_class == "UnsafeSmartContract";
         if is_stateless {
             for prop in &mut properties {
                 prop.readonly = true;
@@ -709,6 +811,8 @@ impl<'a> MoveParser<'a> {
             readonly,
             initializer,
             source_location: self.loc(),
+            synthetic_array_chain: None,
+            embed_always: false,
         }
     }
 
@@ -728,21 +832,23 @@ impl<'a> MoveParser<'a> {
         let name = self.expect_ident();
         let mapped = map_type_name(&name);
 
-        // Check for FixedArray<T, N>
+        // Check for FixedArray<T, N>. The lexer eagerly forms `>>` as a
+        // shift token, so we split it back into two `>` when closing a
+        // nested generic argument list (see consume_generic_close).
         if mapped == "FixedArray" || name == "FixedArray" {
             if *self.peek() == Token::Lt {
                 self.advance();
                 let element = self.parse_type();
                 self.expect(&Token::Comma);
                 let length = match self.advance() {
-                    Token::NumberLit(n) => n as usize,
+                    Token::NumberLit(n) => n.to_usize().unwrap_or(0),
                     _ => {
                         self.errors
                             .push(Diagnostic::error("FixedArray requires numeric length", None));
                         0
                     }
                 };
-                self.expect(&Token::Gt);
+                self.consume_generic_close();
                 return TypeNode::FixedArray {
                     element: Box::new(element),
                     length,
@@ -771,12 +877,32 @@ impl<'a> MoveParser<'a> {
         self.expect(&Token::RParen);
 
         // Optional return type
+        let mut has_return_type = false;
         if *self.peek() == Token::Colon {
             self.advance();
             let _ret_type = self.parse_type();
+            has_return_type = true;
         }
 
-        let body = self.parse_block();
+        let mut body = self.parse_block();
+
+        // Move allows an implicit return of the final expression when the
+        // function declares a return type. Convert the trailing expression
+        // statement into an explicit return statement so the type checker
+        // can infer the method's return type.
+        if has_return_type {
+            if let Some(last) = body.pop() {
+                match last {
+                    Statement::ExpressionStatement { expression, source_location } => {
+                        body.push(Statement::ReturnStatement {
+                            value: Some(expression),
+                            source_location,
+                        });
+                    }
+                    other => body.push(other),
+                }
+            }
+        }
 
         MethodNode {
             name,
@@ -784,6 +910,7 @@ impl<'a> MoveParser<'a> {
             body,
             visibility,
             source_location: self.loc(),
+            sighash_type: None,
         }
     }
 
@@ -833,7 +960,7 @@ impl<'a> MoveParser<'a> {
             }
         }
         self.expect(&Token::RBrace);
-        stmts
+        fold_move_while_as_for(stmts)
     }
 
     fn parse_statement(&mut self) -> Option<Statement> {
@@ -970,13 +1097,14 @@ impl<'a> MoveParser<'a> {
                 op,
                 operand: Box::new(self.convert_self_to_this(*operand)),
             },
-            Expression::CallExpr { callee, args } => {
+            Expression::CallExpr { callee, args, .. } => {
                 let new_callee = self.convert_self_to_this(*callee);
                 let new_args: Vec<Expression> =
                     args.into_iter().map(|a| self.convert_self_to_this(a)).collect();
                 Expression::CallExpr {
                     callee: Box::new(new_callee),
                     args: new_args,
+                    asm_return_type: None,
                 }
             }
             Expression::TernaryExpr {
@@ -991,6 +1119,12 @@ impl<'a> MoveParser<'a> {
             Expression::IndexAccess { object, index } => Expression::IndexAccess {
                 object: Box::new(self.convert_self_to_this(*object)),
                 index: Box::new(self.convert_self_to_this(*index)),
+            },
+            Expression::ArrayLiteral { elements } => Expression::ArrayLiteral {
+                elements: elements
+                    .into_iter()
+                    .map(|e| self.convert_self_to_this(e))
+                    .collect(),
             },
             Expression::IncrementExpr { operand, prefix } => Expression::IncrementExpr {
                 operand: Box::new(self.convert_self_to_this(*operand)),
@@ -1061,6 +1195,7 @@ impl<'a> MoveParser<'a> {
                     name: "assert".to_string(),
                 }),
                 args: vec![expr],
+                asm_return_type: None,
             },
             source_location: self.loc(),
         }
@@ -1088,6 +1223,7 @@ impl<'a> MoveParser<'a> {
                     left: Box::new(left),
                     right: Box::new(right),
                 }],
+                asm_return_type: None,
             },
             source_location: self.loc(),
         }
@@ -1155,12 +1291,12 @@ impl<'a> MoveParser<'a> {
                 name: "_w".to_string(),
                 var_type: None,
                 mutable: true,
-                init: Expression::BigIntLiteral { value: 0 },
+                init: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             }),
             condition,
             update: Box::new(Statement::ExpressionStatement {
-                expression: Expression::BigIntLiteral { value: 0 },
+                expression: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             }),
             body,
@@ -1312,12 +1448,12 @@ impl<'a> MoveParser<'a> {
     }
 
     fn parse_comparison(&mut self) -> Expression {
-        let mut left = self.parse_additive();
+        let mut left = self.parse_shift();
         loop {
             match self.peek() {
                 Token::Lt => {
                     self.advance();
-                    let right = self.parse_additive();
+                    let right = self.parse_shift();
                     left = Expression::BinaryExpr {
                         op: BinaryOp::Lt,
                         left: Box::new(left),
@@ -1326,7 +1462,7 @@ impl<'a> MoveParser<'a> {
                 }
                 Token::Le => {
                     self.advance();
-                    let right = self.parse_additive();
+                    let right = self.parse_shift();
                     left = Expression::BinaryExpr {
                         op: BinaryOp::Le,
                         left: Box::new(left),
@@ -1335,7 +1471,7 @@ impl<'a> MoveParser<'a> {
                 }
                 Token::Gt => {
                     self.advance();
-                    let right = self.parse_additive();
+                    let right = self.parse_shift();
                     left = Expression::BinaryExpr {
                         op: BinaryOp::Gt,
                         left: Box::new(left),
@@ -1344,9 +1480,37 @@ impl<'a> MoveParser<'a> {
                 }
                 Token::Ge => {
                     self.advance();
-                    let right = self.parse_additive();
+                    let right = self.parse_shift();
                     left = Expression::BinaryExpr {
                         op: BinaryOp::Ge,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    };
+                }
+                _ => break,
+            }
+        }
+        left
+    }
+
+    fn parse_shift(&mut self) -> Expression {
+        let mut left = self.parse_additive();
+        loop {
+            match self.peek() {
+                Token::Shl => {
+                    self.advance();
+                    let right = self.parse_additive();
+                    left = Expression::BinaryExpr {
+                        op: BinaryOp::Shl,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    };
+                }
+                Token::Shr => {
+                    self.advance();
+                    let right = self.parse_additive();
+                    left = Expression::BinaryExpr {
+                        op: BinaryOp::Shr,
                         left: Box::new(left),
                         right: Box::new(right),
                     };
@@ -1502,9 +1666,23 @@ impl<'a> MoveParser<'a> {
                     }
                     self.expect(&Token::RParen);
 
+                    // Free helper functions in Move take `contract: &Self` as
+                    // the first argument. The parser drops `contract` from
+                    // parameter lists on the definition side, so strip a
+                    // matching `contract`/`self` identifier as the first
+                    // argument at call sites too.
+                    if let Expression::Identifier { .. } = &expr {
+                        if let Some(Expression::Identifier { name }) = args.first() {
+                            if name == "contract" || name == "self" {
+                                args.remove(0);
+                            }
+                        }
+                    }
+
                     expr = Expression::CallExpr {
                         callee: Box::new(expr),
                         args,
+                        asm_return_type: None,
                     };
                 }
                 Token::LBracket => {
@@ -1549,10 +1727,23 @@ impl<'a> MoveParser<'a> {
                 self.expect(&Token::RParen);
                 expr
             }
+            Token::LBracket => {
+                // Array literal: [a, b, c]
+                let mut elements: Vec<Expression> = Vec::new();
+                while !matches!(self.peek(), Token::RBracket | Token::Eof) {
+                    elements.push(self.parse_expression());
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    self.advance();
+                }
+                self.expect(&Token::RBracket);
+                Expression::ArrayLiteral { elements }
+            }
             other => {
                 self.errors
                     .push(Diagnostic::error(format!("Unexpected token in expression: {:?}", other), None));
-                Expression::BigIntLiteral { value: 0 }
+                Expression::BigIntLiteral { value: BigInt::from(0) }
             }
         }
     }
@@ -1592,6 +1783,7 @@ fn build_constructor(properties: &[PropertyNode], file: &str) -> MethodNode {
                 name: "super".to_string(),
             }),
             args: super_args,
+            asm_return_type: None,
         },
         source_location: SourceLocation {
             file: file.to_string(),
@@ -1627,7 +1819,88 @@ fn build_constructor(properties: &[PropertyNode], file: &str) -> MethodNode {
             line: 1,
             column: 0,
         },
+        sighash_type: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pattern folding: `let i = K; while (i < N) { ...; i = i + S; }` → ForStatement
+// ---------------------------------------------------------------------------
+
+/// Fold the canonical Move bounded-loop pattern
+/// ```ignore
+/// let i: Int = K;
+/// while (i < N) { ...; i = i + S; }
+/// ```
+/// into a single ForStatement whose init/condition/update match TypeScript's
+/// native `for (let i = 0n; i < N; i++)`, so downstream ANF lowering produces
+/// identical bounded-loop IR across all formats.
+fn fold_move_while_as_for(stmts: Vec<Statement>) -> Vec<Statement> {
+    let mut out: Vec<Statement> = Vec::with_capacity(stmts.len());
+    let mut i = 0;
+    while i < stmts.len() {
+        if i + 1 < stmts.len() {
+            if let (Statement::VariableDecl { name: decl_name, var_type, init: decl_init, source_location: decl_loc, .. },
+                    Statement::ForStatement { init, condition, body, source_location: for_loc, .. }) =
+                (&stmts[i], &stmts[i + 1])
+            {
+                // The while→for stub uses `_w` as init name.
+                let is_while_stub = matches!(
+                    init.as_ref(),
+                    Statement::VariableDecl { name, .. } if name == "_w"
+                );
+                if is_while_stub {
+                    let iter_name = decl_name.clone();
+                    // Condition: iter_name <cmp> bound
+                    if let Expression::BinaryExpr { left, .. } = condition {
+                        if let Expression::Identifier { name: left_name } = left.as_ref() {
+                            if left_name == &iter_name && !body.is_empty() {
+                                // Last body stmt: iter_name = iter_name + K
+                                if let Statement::Assignment { target, value, .. } = &body[body.len() - 1] {
+                                    if let Expression::Identifier { name: tgt_name } = target {
+                                        if let Expression::BinaryExpr { op: BinaryOp::Add, left: bl, .. } = value {
+                                            if let Expression::Identifier { name: bl_name } = bl.as_ref() {
+                                                if tgt_name == &iter_name && bl_name == &iter_name {
+                                                    let trimmed: Vec<Statement> = body[..body.len() - 1].to_vec();
+                                                    let new_for = Statement::ForStatement {
+                                                        init: Box::new(Statement::VariableDecl {
+                                                            name: iter_name.clone(),
+                                                            var_type: var_type.clone(),
+                                                            mutable: true,
+                                                            init: decl_init.clone(),
+                                                            source_location: decl_loc.clone(),
+                                                        }),
+                                                        condition: condition.clone(),
+                                                        update: Box::new(Statement::ExpressionStatement {
+                                                            expression: Expression::IncrementExpr {
+                                                                operand: Box::new(Expression::Identifier {
+                                                                    name: iter_name.clone(),
+                                                                }),
+                                                                prefix: false,
+                                                            },
+                                                            source_location: for_loc.clone(),
+                                                        }),
+                                                        body: trimmed,
+                                                        source_location: for_loc.clone(),
+                                                    };
+                                                    out.push(new_for);
+                                                    i += 2;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.push(stmts[i].clone());
+        i += 1;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1728,7 +2001,7 @@ module test {
 
         // Should be assert(self.x === y)
         if let Statement::ExpressionStatement { expression, .. } = &body[0] {
-            if let Expression::CallExpr { callee, args } = expression {
+            if let Expression::CallExpr { callee, args, .. } = expression {
                 if let Expression::Identifier { name } = callee.as_ref() {
                     assert_eq!(name, "assert");
                 }

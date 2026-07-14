@@ -143,6 +143,21 @@ RSpec.describe 'Runar::SDK types' do
         expect(param.type).to eq('Ripemd160')
       end
 
+      it 'defaults parent_class to empty string when parentClass is absent' do
+        expect(artifact.parent_class).to eq('')
+      end
+
+      it 'parses parentClass when present (issue #44 trim gate)' do
+        # A StatefulSmartContract with ZERO mutable fields has empty stateFields
+        # yet still injects checkPreimage at entry; parentClass is the
+        # authoritative signal for the terminal sighash subscript trim.
+        hash_with_parent = MINIMAL_ARTIFACT_HASH.dup
+        hash_with_parent['parentClass'] = 'StatefulSmartContract'
+        art = described_class.from_hash(hash_with_parent)
+        expect(art.parent_class).to eq('StatefulSmartContract')
+        expect(art.state_fields).to eq([])
+      end
+
       it 'parses ABI methods' do
         expect(artifact.abi.methods.length).to eq(1)
         method = artifact.abi.methods.first
@@ -242,6 +257,37 @@ RSpec.describe 'Runar::SDK types' do
         it 'parses code separator index' do
           expect(artifact.code_separator_index).to eq(42)
           expect(artifact.code_separator_indices).to eq([42])
+        end
+      end
+
+      context 'with a FixedArray state field' do
+        let(:fa_hash) do
+          MINIMAL_ARTIFACT_HASH.merge(
+            'stateFields' => [
+              {
+                'name' => 'board',
+                'type' => 'FixedArray<bigint, 3>',
+                'index' => 0,
+                'initialValue' => [0, 0, 0],
+                'fixedArray' => {
+                  'elementType' => 'bigint',
+                  'length' => 3,
+                  'syntheticNames' => %w[board__0 board__1 board__2]
+                }
+              }
+            ]
+          )
+        end
+
+        subject(:artifact) { described_class.from_hash(fa_hash) }
+
+        it 'parses the fixedArray annotation into the SDK StateField' do
+          field = artifact.state_fields.first
+          expect(field.type).to eq('FixedArray<bigint, 3>')
+          expect(field.fixed_array).to be_a(Hash)
+          expect(field.fixed_array[:element_type]).to eq('bigint')
+          expect(field.fixed_array[:length]).to eq(3)
+          expect(field.fixed_array[:synthetic_names]).to eq(%w[board__0 board__1 board__2])
         end
       end
     end

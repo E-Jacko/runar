@@ -269,6 +269,22 @@ def _ec_field_mul(t: ECTracker, a_name: str, b_name: str, result_name: str) -> N
     _ec_field_mod(t, "_fmul_prod", result_name)
 
 
+def _ec_field_mul_const(t: ECTracker, a_name: str, c: int, result_name: str) -> None:
+    """Compute (a * c) mod p where c is a small constant."""
+    t.to_top(a_name)
+
+    def _fmc_body(e: Callable[["StackOp"], None]) -> None:
+        if c == 2:
+            # Use OP_2MUL (single opcode, no push needed)
+            e(_make_stack_op(op="opcode", code="OP_2MUL"))
+        else:
+            e(_make_stack_op(op="push", value=_big_int_push(c)))
+            e(_make_stack_op(op="opcode", code="OP_MUL"))
+
+    t.raw_block([a_name], "_fmc_prod", _fmc_body)
+    _ec_field_mod(t, "_fmc_prod", result_name)
+
+
 def _ec_field_sqr(t: ECTracker, a_name: str, result_name: str) -> None:
     """Compute (a * a) mod p."""
     t.copy_to_top(a_name, "_fsqr_copy")
@@ -500,8 +516,7 @@ def _ec_jacobian_double(t: ECTracker) -> None:
     t.copy_to_top("_B", "_B_save")
     _ec_field_sqr(t, "_D", "_D2")
     t.copy_to_top("_B", "_B1")
-    t.push_int("_two1", 2)
-    _ec_field_mul(t, "_B1", "_two1", "_2B")
+    _ec_field_mul_const(t, "_B1", 2, "_2B")
     _ec_field_sub(t, "_D2", "_2B", "_nx")
 
     # ny = D*(B - nx) - C
@@ -512,8 +527,7 @@ def _ec_jacobian_double(t: ECTracker) -> None:
 
     # nz = 2 * Y * Z
     _ec_field_mul(t, "_jy_save", "_jz_save", "_yz")
-    t.push_int("_two2", 2)
-    _ec_field_mul(t, "_yz", "_two2", "_nz")
+    _ec_field_mul_const(t, "_yz", 2, "_nz")
 
     # Clean up leftovers: _B and old jz (only copied, never consumed)
     t.to_top("_B")
@@ -608,8 +622,7 @@ def _ec_build_jacobian_add_affine_inline(e: Callable, t: ECTracker) -> None:
     # X3 = R^2 - H3 - 2*U1H2
     _ec_field_sqr(it, "_R", "_R2")
     _ec_field_sub(it, "_R2", "_H3", "_x3_tmp")
-    it.push_int("_two", 2)
-    _ec_field_mul(it, "_U1H2", "_two", "_2U1H2")
+    _ec_field_mul_const(it, "_U1H2", 2, "_2U1H2")
     _ec_field_sub(it, "_x3_tmp", "_2U1H2", "_X3")
 
     # Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
@@ -683,12 +696,15 @@ def emit_ec_mul(emit: Callable) -> None:
         # Double accumulator
         _ec_jacobian_double(t)
 
-        # Extract bit: (k >> bit) & 1, using OP_DIV for right-shift
+        # Extract bit: (k >> bit) & 1, using OP_RSHIFTNUM / OP_2DIV
         t.copy_to_top("_k", "_k_copy")
-        if bit > 0:
-            divisor = 1 << bit
-            t.push_big_int("_div", divisor)
-            t.raw_block(["_k_copy", "_div"], "_shifted", lambda e: e(_make_stack_op(op="opcode", code="OP_DIV")))
+        if bit == 1:
+            # Single-bit shift: OP_2DIV (no push needed)
+            t.raw_block(["_k_copy"], "_shifted", lambda e: e(_make_stack_op(op="opcode", code="OP_2DIV")))
+        elif bit > 1:
+            # Multi-bit shift: push shift amount, OP_RSHIFTNUM
+            t.push_int("_shift", bit)
+            t.raw_block(["_k_copy", "_shift"], "_shifted", lambda e: e(_make_stack_op(op="opcode", code="OP_RSHIFTNUM")))
         else:
             t.rename("_shifted")
         t.push_int("_two", 2)
@@ -753,6 +769,23 @@ def emit_ec_on_curve(emit: Callable) -> None:
     t = ECTracker(["_pt"], emit)
     _ec_decompose_point(t, "_pt", "_x", "_y")
 
+    # GAP-301: coordinate canonicity. ``_ec_decompose_point`` BIN2NUMs each
+    # coordinate as an unsigned value that may be >= p; the field arithmetic
+    # below would silently reduce it mod p, so a non-canonical encoding of a
+    # valid point would pass. Reject it: require x < p AND y < p (coordinates
+    # are unsigned, so the 0 <= lower bound holds by construction). Combined
+    # with the curve equation at the end via OP_BOOLAND so ecOnCurve still
+    # returns a boolean.
+    t.copy_to_top("_x", "_x_lt")
+    _ec_push_field_p(t, "_p_for_x")
+    t.raw_block(["_x_lt", "_p_for_x"], "_x_canon", lambda e: e(_make_stack_op(op="opcode", code="OP_LESSTHAN")))
+    t.copy_to_top("_y", "_y_lt")
+    _ec_push_field_p(t, "_p_for_y")
+    t.raw_block(["_y_lt", "_p_for_y"], "_y_canon", lambda e: e(_make_stack_op(op="opcode", code="OP_LESSTHAN")))
+    t.to_top("_x_canon")
+    t.to_top("_y_canon")
+    t.raw_block(["_x_canon", "_y_canon"], "_canon", lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
+
     # lhs = y^2
     _ec_field_sqr(t, "_y", "_y2")
 
@@ -763,10 +796,15 @@ def emit_ec_on_curve(emit: Callable) -> None:
     t.push_int("_seven", 7)
     _ec_field_add(t, "_x3", "_seven", "_rhs")
 
-    # Compare
+    # Compare curve equation
     t.to_top("_y2")
     t.to_top("_rhs")
-    t.raw_block(["_y2", "_rhs"], "_result", lambda e: e(_make_stack_op(op="opcode", code="OP_EQUAL")))
+    t.raw_block(["_y2", "_rhs"], "_curve_eq", lambda e: e(_make_stack_op(op="opcode", code="OP_EQUAL")))
+
+    # on-curve = canonical AND curve-equation
+    t.to_top("_canon")
+    t.to_top("_curve_eq")
+    t.raw_block(["_canon", "_curve_eq"], "_result", lambda e: e(_make_stack_op(op="opcode", code="OP_BOOLAND")))
 
 
 def emit_ec_mod_reduce(emit: Callable) -> None:

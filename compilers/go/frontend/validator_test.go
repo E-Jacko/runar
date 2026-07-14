@@ -1032,10 +1032,14 @@ func TestValidate_EmptyPublicMethodBody_Error(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test V11: validate — identifier for-loop bound (treated as possibly const) accepted
+// Test V11: validate — identifier for-loop bound rejected (cleanly, no panic)
 // ---------------------------------------------------------------------------
+//
+// A bare identifier loop bound (`const N`) cannot be unrolled into fixed
+// Bitcoin Script. The reference TS compiler rejects it with a graceful
+// diagnostic; the validator must do the same so anf-lower never panics.
 
-func TestValidate_ForLoopIdentifierBound_OK(t *testing.T) {
+func TestValidate_ForLoopIdentifierBound_Rejected(t *testing.T) {
 	contract := &ContractNode{
 		Name:        "IdentBound",
 		ParentClass: "SmartContract",
@@ -1068,11 +1072,15 @@ func TestValidate_ForLoopIdentifierBound_OK(t *testing.T) {
 
 	result := Validate(contract)
 
-	// Identifier bound should not produce a "constant bound" error
+	// Identifier bound must be rejected with a compile-time-constant diagnostic.
+	found := false
 	for _, e := range result.Errors {
-		if strings.Contains(e.Message,"constant") || strings.Contains(e.Message,"bound") {
-			t.Errorf("expected identifier for-loop bound to be accepted (treated as const), but got error: %s", e.Message)
+		if strings.Contains(e.Message, "constant") || strings.Contains(e.Message, "bound") {
+			found = true
 		}
+	}
+	if !found {
+		t.Errorf("expected identifier for-loop bound to be rejected with a compile-time-constant diagnostic, got: %v", result.Errors)
 	}
 }
 
@@ -1509,5 +1517,350 @@ func TestValidate_EmptyContractName(t *testing.T) {
 	result := Validate(contract)
 	if len(result.Errors) == 0 {
 		t.Fatal("expected error for empty contract name")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #126: contract must have at least one public method
+// ---------------------------------------------------------------------------
+
+func hasValidationError(result *ValidationResult, substr string) bool {
+	for _, e := range result.Errors {
+		if strings.Contains(e.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestValidate_NoPublicMethods_Error(t *testing.T) {
+	source := `
+import { SmartContract, assert, PubKey, Sig, checkSig } from 'runar-lang';
+
+class Locked extends SmartContract {
+  readonly pk: PubKey;
+
+  constructor(pk: PubKey) {
+    super(pk);
+    this.pk = pk;
+  }
+
+  unlock(sig: Sig): void {
+    assert(checkSig(sig, this.pk));
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if !hasValidationError(result, "no public methods") {
+		t.Errorf("expected 'no public methods' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+func TestValidate_NoMethodsAtAll_Error(t *testing.T) {
+	source := `
+import { SmartContract } from 'runar-lang';
+
+class Empty extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if !hasValidationError(result, "no public methods") {
+		t.Errorf("expected 'no public methods' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+func TestValidate_HasPublicMethod_NoError(t *testing.T) {
+	source := `
+import { SmartContract, assert, PubKey, Sig, Addr, hash160, checkSig } from 'runar-lang';
+
+class P2PKH extends SmartContract {
+  readonly pubKeyHash: Addr;
+
+  constructor(pubKeyHash: Addr) {
+    super(pubKeyHash);
+    this.pubKeyHash = pubKeyHash;
+  }
+
+  public unlock(sig: Sig, pubKey: PubKey): void {
+    assert(hash160(pubKey) === this.pubKeyHash);
+    assert(checkSig(sig, pubKey));
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasValidationError(result, "no public methods") {
+		t.Errorf("did not expect 'no public methods' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #121: accept non-zero-start and countdown for-loops (was #127 reject)
+// ---------------------------------------------------------------------------
+
+func TestValidate_ForLoopNonZeroStart_NoError(t *testing.T) {
+	source := `
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 1n; i <= 3n; i++) {
+      sum = sum + i;
+    }
+    assert(sum > 0n);
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasValidationError(result, "must start at 0") {
+		t.Errorf("did not expect 'must start at 0' error (issue #121), got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+func TestValidate_ForLoopCountdown_NoError(t *testing.T) {
+	source := `
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 3n; i > 0n; i--) {
+      sum = sum + i;
+    }
+    assert(sum > 0n);
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasValidationError(result, "countdown") {
+		t.Errorf("did not expect 'countdown' error (issue #121), got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+func TestValidate_ForLoopZeroStartCountingUp_NoError(t *testing.T) {
+	source := `
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 0n; i <= 3n; i++) {
+      sum = sum + i;
+    }
+    assert(sum > 0n);
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasValidationError(result, "must start at 0") {
+		t.Errorf("did not expect 'must start at 0' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+	if hasValidationError(result, "countdown") {
+		t.Errorf("did not expect 'countdown' error, got: %s", strings.Join(result.ErrorStrings(), "; "))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// H2 (#131): locktime soundness warning.
+//
+// A public method that reads extractLocktime(preimage) — directly or
+// transitively through a private helper — only enforces a timelock if the
+// covenant ALSO asserts the spending tx is non-final
+// (extractSequence(preimage) < 0xffffffff). Otherwise a hand-built
+// all-final-sequence tx bypasses the locktime gate. The validator emits an
+// advisory WARNING (non-fatal) when the guard is missing.
+// ---------------------------------------------------------------------------
+
+const locktimeWarningNeedle = "does not assert extractSequence"
+
+func hasLocktimeWarning(result *ValidationResult) bool {
+	for _, w := range result.Warnings {
+		if strings.Contains(w.Message, locktimeWarningNeedle) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestValidate_H2_LocktimeWithoutSequenceGuard_Warns(t *testing.T) {
+	source := `
+import { StatefulSmartContract, assert, extractLocktime } from 'runar-lang';
+
+class TimeLock extends StatefulSmartContract {
+  count: bigint;
+  readonly deadline: bigint;
+  constructor(count: bigint, deadline: bigint) {
+    super(count, deadline);
+    this.count = count;
+    this.deadline = deadline;
+  }
+  public unlock(): void {
+    assert(extractLocktime(this.txPreimage) >= this.deadline);
+    this.count++;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if !hasLocktimeWarning(result) {
+		t.Fatalf("expected a locktime-soundness warning, got warnings: %v", result.WarningStrings())
+	}
+	// The warning names the method, points at the fix, and is a warning.
+	var found *Diagnostic
+	for i := range result.Warnings {
+		if strings.Contains(result.Warnings[i].Message, locktimeWarningNeedle) {
+			found = &result.Warnings[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("expected to find the locktime warning diagnostic")
+	}
+	if found.Severity != SeverityWarning {
+		t.Errorf("expected severity warning, got: %v", found.Severity)
+	}
+	if !strings.Contains(found.Message, "unlock") {
+		t.Errorf("expected warning to name the method 'unlock', got: %s", found.Message)
+	}
+	if !strings.Contains(found.Message, "0xffffffff") {
+		t.Errorf("expected warning to mention 0xffffffff, got: %s", found.Message)
+	}
+}
+
+func TestValidate_H2_LocktimeWithSequenceGuard_NoWarn(t *testing.T) {
+	source := `
+import { StatefulSmartContract, assert, extractLocktime, extractSequence } from 'runar-lang';
+
+class TimeLock extends StatefulSmartContract {
+  count: bigint;
+  readonly deadline: bigint;
+  constructor(count: bigint, deadline: bigint) {
+    super(count, deadline);
+    this.count = count;
+    this.deadline = deadline;
+  }
+  public unlock(): void {
+    assert(extractSequence(this.txPreimage) < 0xffffffffn);
+    assert(extractLocktime(this.txPreimage) >= this.deadline);
+    this.count++;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasLocktimeWarning(result) {
+		t.Errorf("did not expect a locktime warning when extractSequence guard is present, got: %v", result.WarningStrings())
+	}
+}
+
+func TestValidate_H2_NoLocktimeRead_NoWarn(t *testing.T) {
+	source := `
+import { StatefulSmartContract } from 'runar-lang';
+
+class Counter extends StatefulSmartContract {
+  count: bigint;
+  constructor(count: bigint) {
+    super(count);
+    this.count = count;
+  }
+  public increment(): void {
+    this.count++;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasLocktimeWarning(result) {
+		t.Errorf("did not expect a locktime warning for a method that never reads locktime, got: %v", result.WarningStrings())
+	}
+}
+
+func TestValidate_H2_SequenceGuardViaPrivateHelper_NoWarn(t *testing.T) {
+	source := `
+import { StatefulSmartContract, assert, extractLocktime, extractSequence } from 'runar-lang';
+
+class TimeLock extends StatefulSmartContract {
+  count: bigint;
+  readonly deadline: bigint;
+  constructor(count: bigint, deadline: bigint) {
+    super(count, deadline);
+    this.count = count;
+    this.deadline = deadline;
+  }
+  private requireNonFinal(): void {
+    assert(extractSequence(this.txPreimage) < 0xffffffffn);
+  }
+  public unlock(): void {
+    this.requireNonFinal();
+    assert(extractLocktime(this.txPreimage) >= this.deadline);
+    this.count++;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if hasLocktimeWarning(result) {
+		t.Errorf("did not expect a locktime warning when guard is supplied via a private helper, got: %v", result.WarningStrings())
+	}
+}
+
+func TestValidate_H2_LocktimeReadInPrivateHelper_NoGuard_Warns(t *testing.T) {
+	source := `
+import { StatefulSmartContract, assert, extractLocktime } from 'runar-lang';
+
+class TimeLock extends StatefulSmartContract {
+  count: bigint;
+  readonly deadline: bigint;
+  constructor(count: bigint, deadline: bigint) {
+    super(count, deadline);
+    this.count = count;
+    this.deadline = deadline;
+  }
+  private checkDeadline(): void {
+    assert(extractLocktime(this.txPreimage) >= this.deadline);
+  }
+  public unlock(): void {
+    this.checkDeadline();
+    this.count++;
+  }
+}
+`
+	contract := mustParseTS(t, source)
+	result := Validate(contract)
+	if !hasLocktimeWarning(result) {
+		t.Errorf("expected a locktime warning when the read is in a private helper and no guard exists, got: %v", result.WarningStrings())
 	}
 }

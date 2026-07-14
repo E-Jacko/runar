@@ -24,6 +24,41 @@ pub struct CallTxOptions {
     pub contract_outputs: Option<Vec<ContractOutput>>,
     /// Additional contract inputs with their own unlocking scripts (for merge).
     pub additional_contract_inputs: Option<Vec<AdditionalContractInput>>,
+    /// Data outputs declared via `this.addDataOutput(...)` in the method
+    /// body. Emitted between the contract (state) outputs and the change
+    /// output, in declaration order — matching the order the compiler's
+    /// auto-injected continuation-hash check expects.
+    pub data_outputs: Option<Vec<ContractOutput>>,
+    /// Override the call tx's nLockTime. `None` → defaults to `0` (legacy).
+    /// `Some(N)` writes `N` as little-endian `u32` in the locktime field.
+    /// Required for contracts that assert `extractLocktime(preimage) >= deadline`.
+    pub locktime: Option<u32>,
+    /// Override the nSequence written onto every input (issue #131). `None` →
+    /// `0xfffffffe` when a non-zero locktime is set (so nLockTime is
+    /// consensus-enforced), else `0xffffffff` (final, legacy).
+    pub sequence: Option<u32>,
+}
+
+/// Resolve the nSequence for a call tx's inputs (issue #131).
+///
+/// An all-`0xffffffff` input set makes nLockTime a consensus no-op, so a
+/// locktime-gated method would be script-enforced (via extractLocktime) yet
+/// NOT consensus-enforced. When a non-zero locktime is set we therefore default
+/// every input to `0xfffffffe` (non-final, enforceable). Explicit `sequence`
+/// always wins; with no/zero locktime we keep the legacy `0xffffffff`.
+///
+/// Shared by `build_call_transaction_ext` and the terminal-path tx builder so
+/// both sites stay byte-consistent.
+pub fn resolve_input_sequence(locktime: Option<u32>, sequence: Option<u32>) -> u32 {
+    if let Some(s) = sequence {
+        return s;
+    }
+    if let Some(lt) = locktime {
+        if lt != 0 {
+            return 0xffff_fffe;
+        }
+    }
+    0xffff_ffff
 }
 
 /// Build a raw transaction that spends a contract UTXO (method call).
@@ -101,7 +136,15 @@ pub fn build_call_transaction_ext(
         vec![]
     };
 
-    let contract_output_sats: i64 = contract_outputs.iter().map(|o| o.satoshis).sum();
+    let data_outputs: Vec<ContractOutput> = if let Some(dos) = options.and_then(|o| o.data_outputs.as_ref()) {
+        dos.iter().map(|co| ContractOutput { script: co.script.clone(), satoshis: co.satoshis }).collect()
+    } else {
+        vec![]
+    };
+
+    let contract_output_sats: i64 =
+        contract_outputs.iter().map(|o| o.satoshis).sum::<i64>()
+            + data_outputs.iter().map(|o| o.satoshis).sum::<i64>();
 
     // Estimate fee using actual script sizes
     let unlock_byte_len = unlocking_script.len() / 2;
@@ -119,6 +162,10 @@ pub fn build_call_transaction_ext(
         let co_byte_len = co.script.len() / 2;
         outputs_size += 8 + varint_byte_size(co_byte_len) + co_byte_len as i64;
     }
+    for do_ in &data_outputs {
+        let do_byte_len = do_.script.len() / 2;
+        outputs_size += 8 + varint_byte_size(do_byte_len) + do_byte_len as i64;
+    }
     let has_change_target = change_address.is_some() || change_script.is_some();
     if has_change_target {
         outputs_size += 34; // P2PKH change
@@ -128,6 +175,16 @@ pub fn build_call_transaction_ext(
     let fee = (estimated_size * rate + 999) / 1000;
 
     let change = total_input - contract_output_sats - fee;
+
+    // Sequence (issue #131): an all-0xffffffff input set makes nLockTime a
+    // consensus no-op. When a non-zero locktime is set, default every input to
+    // 0xfffffffe (non-final) so the locktime is actually enforced. Explicit
+    // options.sequence always wins.
+    let input_sequence = resolve_input_sequence(
+        options.and_then(|o| o.locktime),
+        options.and_then(|o| o.sequence),
+    );
+    let sequence_hex = to_little_endian_32(input_sequence);
 
     // Build raw transaction
     let mut tx = String::new();
@@ -143,7 +200,7 @@ pub fn build_call_transaction_ext(
     tx.push_str(&to_little_endian_32(current_utxo.output_index));
     tx.push_str(&encode_varint(unlock_byte_len as u64));
     tx.push_str(unlocking_script);
-    tx.push_str("ffffffff");
+    tx.push_str(&sequence_hex);
 
     // Additional contract inputs (with their own unlocking scripts)
     for ci in extra_contract_inputs {
@@ -152,7 +209,7 @@ pub fn build_call_transaction_ext(
         let ci_byte_len = ci.unlocking_script.len() / 2;
         tx.push_str(&encode_varint(ci_byte_len as u64));
         tx.push_str(&ci.unlocking_script);
-        tx.push_str("ffffffff");
+        tx.push_str(&sequence_hex);
     }
 
     // P2PKH funding inputs (unsigned)
@@ -160,11 +217,11 @@ pub fn build_call_transaction_ext(
         tx.push_str(&reverse_hex(&utxo.txid));
         tx.push_str(&to_little_endian_32(utxo.output_index));
         tx.push_str("00"); // empty scriptSig
-        tx.push_str("ffffffff");
+        tx.push_str(&sequence_hex);
     }
 
     // Output count
-    let mut num_outputs = contract_outputs.len() as u64;
+    let mut num_outputs = (contract_outputs.len() + data_outputs.len()) as u64;
     if change > 0 && has_change_target {
         num_outputs += 1;
     }
@@ -175,6 +232,14 @@ pub fn build_call_transaction_ext(
         tx.push_str(&to_little_endian_64(co.satoshis));
         tx.push_str(&encode_varint((co.script.len() / 2) as u64));
         tx.push_str(&co.script);
+    }
+
+    // Data outputs (from this.addDataOutput in method body). Emitted after
+    // state outputs and before change to match the continuation hash.
+    for do_ in &data_outputs {
+        tx.push_str(&to_little_endian_64(do_.satoshis));
+        tx.push_str(&encode_varint((do_.script.len() / 2) as u64));
+        tx.push_str(&do_.script);
     }
 
     // Change output
@@ -191,8 +256,13 @@ pub fn build_call_transaction_ext(
         tx.push_str(&actual_change_script);
     }
 
-    // Locktime
-    tx.push_str(&to_little_endian_32(0));
+    // Locktime: default `0` (legacy behavior); overridable via
+    // `CallTxOptions.locktime`. Contracts asserting
+    // `extractLocktime(preimage) >= deadline` (e.g. auction `close`/`claim`)
+    // require this override; the previously hardcoded `0` caused NULLFAIL
+    // on every terminal call with a non-zero deadline.
+    let locktime_value = options.and_then(|o| o.locktime).unwrap_or(0);
+    tx.push_str(&to_little_endian_32(locktime_value));
 
     let change_amount = if change > 0 { change } else { 0 };
     (tx, all_utxos.len(), change_amount)
@@ -203,6 +273,41 @@ fn varint_byte_size(n: usize) -> i64 {
     else if n <= 0xffff { 3 }
     else if n <= 0xffff_ffff { 5 }
     else { 9 }
+}
+
+/// Estimate the fee for a method call transaction.
+///
+/// Mirrors `estimateCallFee` in the TypeScript SDK: uses the actual
+/// unlocking-script byte length (with correct varint prefix size) and the
+/// actual locking-script byte length for the new contract output, plus
+/// `num_funding_inputs` P2PKH funding inputs and a single P2PKH change
+/// output. Fee rate is in sat/KB (default 100, i.e. 0.1 sat/byte).
+pub fn estimate_call_fee(
+    locking_script_byte_len: usize,
+    unlocking_script_byte_len: usize,
+    num_funding_inputs: usize,
+    fee_rate: Option<i64>,
+) -> i64 {
+    const P2PKH_INPUT_SIZE: i64 = 148;
+    const P2PKH_OUTPUT_SIZE: i64 = 34;
+    const TX_OVERHEAD: i64 = 10;
+
+    let rate = fee_rate.filter(|&r| r > 0).unwrap_or(100);
+    let contract_input_size = 32 + 4
+        + varint_byte_size(unlocking_script_byte_len)
+        + unlocking_script_byte_len as i64
+        + 4;
+    let funding_inputs_size = num_funding_inputs as i64 * P2PKH_INPUT_SIZE;
+    let contract_output_size = 8
+        + varint_byte_size(locking_script_byte_len)
+        + locking_script_byte_len as i64;
+    let change_output_size = P2PKH_OUTPUT_SIZE;
+    let tx_size = TX_OVERHEAD
+        + contract_input_size
+        + funding_inputs_size
+        + contract_output_size
+        + change_output_size;
+    (tx_size * rate + 999) / 1000
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +446,44 @@ mod tests {
     }
 
     #[test]
+    fn locktime_override_appears_in_tx() {
+        // Issue #40: a caller-supplied non-zero locktime must appear in the
+        // built call tx's nLockTime field (contracts asserting
+        // `extractLocktime(preimage) >= deadline`).
+        let utxo = make_utxo(100_000, 0);
+        let options = CallTxOptions {
+            contract_outputs: None,
+            additional_contract_inputs: None,
+            data_outputs: None,
+            locktime: Some(800_000),
+            sequence: None,
+        };
+        let (tx_hex, _, _) = build_call_transaction_ext(
+            &utxo, "51", None, None, None, None, None, None, Some(&options),
+        );
+        let parsed = parse_tx_hex(&tx_hex);
+        assert_eq!(parsed.locktime, 800_000);
+    }
+
+    #[test]
+    fn locktime_default_is_zero() {
+        // Default (unset) must still write 0 — back-compatible.
+        let utxo = make_utxo(100_000, 0);
+        let options = CallTxOptions {
+            contract_outputs: None,
+            additional_contract_inputs: None,
+            data_outputs: None,
+            locktime: None,
+            sequence: None,
+        };
+        let (tx_hex, _, _) = build_call_transaction_ext(
+            &utxo, "51", None, None, None, None, None, None, Some(&options),
+        );
+        let parsed = parse_tx_hex(&tx_hex);
+        assert_eq!(parsed.locktime, 0);
+    }
+
+    #[test]
     fn valid_hex_output() {
         let utxo = make_utxo(100_000, 0);
         let (tx_hex, _, _) = build_call_transaction(&utxo, "51", None, None, None, None, None, None);
@@ -368,6 +511,61 @@ mod tests {
         for input in &parsed.inputs {
             assert_eq!(input.sequence, 0xffff_ffff);
         }
+    }
+
+    #[test]
+    fn nonzero_locktime_defaults_inputs_to_non_final_sequence() {
+        // Issue #131: a non-zero locktime with no explicit sequence must set
+        // every input to 0xfffffffe so consensus enforces nLockTime.
+        let utxo = make_utxo(100_000, 0);
+        let additional = vec![make_utxo(50_000, 1)];
+        let change_script = format!("76a914{}88ac", "ff".repeat(20));
+        let options = CallTxOptions {
+            contract_outputs: None,
+            additional_contract_inputs: None,
+            data_outputs: None,
+            locktime: Some(800_000),
+            sequence: None,
+        };
+        let (tx_hex, _, _) = build_call_transaction_ext(
+            &utxo, "51", None, None, Some("changeaddr"), Some(&change_script),
+            Some(&additional), None, Some(&options),
+        );
+        let parsed = parse_tx_hex(&tx_hex);
+        assert!(!parsed.inputs.is_empty());
+        for input in &parsed.inputs {
+            assert_eq!(input.sequence, 0xffff_fffe);
+        }
+        assert_eq!(parsed.locktime, 800_000);
+    }
+
+    #[test]
+    fn explicit_sequence_overrides_locktime_default() {
+        // Issue #131: an explicit sequence always wins, even with a locktime.
+        let utxo = make_utxo(100_000, 0);
+        let options = CallTxOptions {
+            contract_outputs: None,
+            additional_contract_inputs: None,
+            data_outputs: None,
+            locktime: Some(800_000),
+            sequence: Some(0xdead_beef),
+        };
+        let (tx_hex, _, _) = build_call_transaction_ext(
+            &utxo, "51", None, None, None, None, None, None, Some(&options),
+        );
+        let parsed = parse_tx_hex(&tx_hex);
+        assert_eq!(parsed.inputs[0].sequence, 0xdead_beef);
+    }
+
+    #[test]
+    fn resolve_input_sequence_matches_ts_defaults() {
+        // No locktime -> final. Zero locktime -> final. Non-zero locktime ->
+        // non-final. Explicit sequence always wins.
+        assert_eq!(resolve_input_sequence(None, None), 0xffff_ffff);
+        assert_eq!(resolve_input_sequence(Some(0), None), 0xffff_ffff);
+        assert_eq!(resolve_input_sequence(Some(1), None), 0xffff_fffe);
+        assert_eq!(resolve_input_sequence(Some(800_000), Some(7)), 7);
+        assert_eq!(resolve_input_sequence(None, Some(7)), 7);
     }
 
     #[test]
@@ -492,6 +690,59 @@ mod tests {
         );
         let parsed = parse_tx_hex(&tx_hex);
         assert_eq!(parsed.output_count, 0);
+    }
+
+    #[test]
+    fn estimate_call_fee_matches_hand_calculation() {
+        // locking_script=1 byte, unlocking_script=1 byte, 0 funding inputs, default rate.
+        //   input0 = 32 + 4 + 1 (varint) + 1 + 4 = 42
+        //   funding = 0
+        //   contract output = 8 + 1 + 1 = 10
+        //   change output = 34
+        //   tx overhead = 10
+        //   total = 96, fee = ceil(96 * 100 / 1000) = 10
+        assert_eq!(estimate_call_fee(1, 1, 0, None), 10);
+    }
+
+    #[test]
+    fn estimate_call_fee_honors_mock_provider_rate() {
+        // Pull the fee rate from a MockProvider and feed it to estimate_call_fee.
+        // Confirms the function plugs into the same provider.get_fee_rate() flow
+        // the higher-level build-call path uses.
+        use crate::sdk::provider::{MockProvider, Provider};
+
+        let mut mp = MockProvider::new("testnet");
+        mp.set_fee_rate(500); // 500 sat/KB
+        let rate = mp.get_fee_rate().expect("mock provider has a fee rate");
+
+        // Same shape as above but with a larger locking script (25-byte P2PKH).
+        //   input0 = 32 + 4 + 1 + 1 + 4 = 42
+        //   contract output = 8 + 1 + 25 = 34
+        //   change output = 34
+        //   tx overhead = 10
+        //   total = 120, fee = ceil(120 * 500 / 1000) = 60
+        let fee = estimate_call_fee(25, 1, 0, Some(rate));
+        assert_eq!(fee, 60);
+    }
+
+    #[test]
+    fn estimate_call_fee_funding_inputs_grow_fee() {
+        let base = estimate_call_fee(1, 1, 0, None);
+        let with_funding = estimate_call_fee(1, 1, 2, None);
+        // 2 extra P2PKH inputs add 2 * 148 = 296 bytes; at 100 sat/KB that's
+        // ceil(296 * 100 / 1000) ≈ 30 extra sats. Check direction + bound.
+        assert!(with_funding > base);
+        assert!(with_funding - base >= 29 && with_funding - base <= 31);
+    }
+
+    #[test]
+    fn estimate_call_fee_defaults_to_100_sat_per_kb() {
+        let with_default = estimate_call_fee(1, 1, 0, None);
+        let with_explicit = estimate_call_fee(1, 1, 0, Some(100));
+        assert_eq!(with_default, with_explicit);
+        // Non-positive rate should also fall back to 100.
+        assert_eq!(estimate_call_fee(1, 1, 0, Some(0)), with_default);
+        assert_eq!(estimate_call_fee(1, 1, 0, Some(-1)), with_default);
     }
 
     #[test]

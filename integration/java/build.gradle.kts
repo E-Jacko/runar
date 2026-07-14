@@ -1,0 +1,102 @@
+import java.time.Duration
+
+// Rúnar Java integration tests (M13).
+//
+// End-to-end tests that deploy compiled contracts to a running Bitcoin SV
+// regtest node (or Teranode) and exercise the runar-java SDK's deploy /
+// call / broadcast path with real ECDSA signatures.
+//
+// Tests are gated behind the -Drunar.integration=true system property so
+// a plain `gradle test` invocation inside CI does not attempt to reach a
+// node that is not running. Enable explicitly with:
+//
+//     cd integration/java
+//     gradle test -Drunar.integration=true
+//
+// Or via the shared driver:
+//
+//     ./integration/run-all.sh           # runs every language, including java
+//
+// Backend selection:
+//
+//     BSV_BACKEND=svnode    gradle test    # default (bitcoind regtest, port 18332)
+//     BSV_BACKEND=teranode  gradle test    # Teranode Docker Compose stack (port 19292)
+
+plugins {
+    java
+}
+
+group = "build.runar.integration"
+version = "1.0.0-rc.1"
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation("build.runar:runar-java:1.0.0-rc.1")
+
+    testImplementation(platform("org.junit:junit-bom:5.10.2"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+tasks.named<Test>("test") {
+    useJUnitPlatform()
+
+    // Long-running (multi-minute) tests: broadcasting SPHINCS+ ~200 KB
+    // scripts can take several minutes per tx on a loaded runner.
+    timeout.set(Duration.ofMinutes(30))
+
+    // Surface JUnit output so flaky nodes are debuggable from CI logs.
+    testLogging {
+        events("passed", "skipped", "failed", "standardError")
+        showStandardStreams = true
+        showExceptions = true
+        showCauses = true
+        showStackTraces = true
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
+
+    // Per-test wall-clock duration. Gradle's testLogging events do not print
+    // durations on their own; this listener reports each test's elapsed time
+    // in a single line so CI logs are scannable per the integration suite's
+    // shared format conventions.
+    addTestListener(object : org.gradle.api.tasks.testing.TestListener {
+        override fun beforeSuite(suite: org.gradle.api.tasks.testing.TestDescriptor) {}
+        override fun afterSuite(
+            suite: org.gradle.api.tasks.testing.TestDescriptor,
+            result: org.gradle.api.tasks.testing.TestResult,
+        ) {}
+        override fun beforeTest(test: org.gradle.api.tasks.testing.TestDescriptor) {}
+        override fun afterTest(
+            test: org.gradle.api.tasks.testing.TestDescriptor,
+            result: org.gradle.api.tasks.testing.TestResult,
+        ) {
+            val ms = result.endTime - result.startTime
+            val cls = test.className ?: "?"
+            val name = test.name
+            println("[runar-integration] test duration: $cls.$name ${ms} ms (${result.resultType})")
+        }
+    })
+
+    // Forward the gating property so `@EnabledIfSystemProperty` is
+    // honoured inside the forked test JVM.
+    systemProperty(
+        "runar.integration",
+        System.getProperty("runar.integration", "false")
+    )
+
+    // Forward node-config env vars (mirror of the Python / Go / Rust
+    // suites: RPC_URL / RPC_USER / RPC_PASS override the backend-specific
+    // defaults below; BSV_BACKEND selects svnode vs teranode).
+    listOf("BSV_BACKEND", "NODE_TYPE", "RPC_URL", "RPC_USER", "RPC_PASS").forEach { key ->
+        System.getenv(key)?.let { environment(key, it) }
+    }
+}

@@ -71,6 +71,15 @@ pub fn parseGo(allocator: Allocator, source: []const u8, file_name: []const u8) 
     return parser.parse();
 }
 
+/// True if every byte in `s` is an ASCII digit (0-9).
+fn isAllAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Token Types
 // ============================================================================
@@ -385,6 +394,7 @@ fn mapGoType(name: []const u8) RunarType {
     const map = std.StaticStringMap(RunarType).initComptime(.{
         .{ "Int", .bigint },
         .{ "Bigint", .bigint },
+        .{ "BigintBig", .bigint },
         .{ "int64", .bigint },
         .{ "int", .bigint },
         .{ "Bool", .boolean },
@@ -393,12 +403,15 @@ fn mapGoType(name: []const u8) RunarType {
         .{ "PubKey", .pub_key },
         .{ "Sig", .sig },
         .{ "Sha256", .sha256 },
+        .{ "Sha256Digest", .sha256 },
         .{ "Ripemd160", .ripemd160 },
         .{ "Addr", .addr },
         .{ "SigHashPreimage", .sig_hash_preimage },
         .{ "RabinSig", .rabin_sig },
         .{ "RabinPubKey", .rabin_pub_key },
         .{ "Point", .point },
+        .{ "P256Point", .p256_point },
+        .{ "P384Point", .p384_point },
         .{ "SigHashType", .unknown },
     });
     return map.get(name) orelse .unknown;
@@ -411,6 +424,7 @@ fn mapGoBuiltin(name: []const u8) []const u8 {
         .{ "Hash160", "hash160" },
         .{ "Hash256", "hash256" },
         .{ "Sha256", "sha256" },
+        .{ "Sha256Hash", "sha256" },
         .{ "Ripemd160", "ripemd160" },
         .{ "CheckSig", "checkSig" },
         .{ "CheckMultiSig", "checkMultiSig" },
@@ -435,6 +449,7 @@ fn mapGoBuiltin(name: []const u8) []const u8 {
         .{ "ExtractOutpoint", "extractOutpoint" },
         .{ "AddOutput", "addOutput" },
         .{ "AddRawOutput", "addRawOutput" },
+        .{ "AddDataOutput", "addDataOutput" },
         .{ "GetStateScript", "getStateScript" },
         .{ "Safediv", "safediv" },
         .{ "Safemod", "safemod" },
@@ -462,6 +477,20 @@ fn mapGoBuiltin(name: []const u8) []const u8 {
         .{ "EcMakePoint", "ecMakePoint" },
         .{ "EcPointX", "ecPointX" },
         .{ "EcPointY", "ecPointY" },
+        .{ "VerifyECDSAP256", "verifyECDSA_P256" },
+        .{ "P256Add", "p256Add" },
+        .{ "P256Mul", "p256Mul" },
+        .{ "P256MulGen", "p256MulGen" },
+        .{ "P256Negate", "p256Negate" },
+        .{ "P256OnCurve", "p256OnCurve" },
+        .{ "P256EncodeCompressed", "p256EncodeCompressed" },
+        .{ "VerifyECDSAP384", "verifyECDSA_P384" },
+        .{ "P384Add", "p384Add" },
+        .{ "P384Mul", "p384Mul" },
+        .{ "P384MulGen", "p384MulGen" },
+        .{ "P384Negate", "p384Negate" },
+        .{ "P384OnCurve", "p384OnCurve" },
+        .{ "P384EncodeCompressed", "p384EncodeCompressed" },
         .{ "Sha256Compress", "sha256Compress" },
         .{ "Sha256Finalize", "sha256Finalize" },
         .{ "Blake3Compress", "blake3Compress" },
@@ -488,12 +517,86 @@ fn mapGoBuiltin(name: []const u8) []const u8 {
     return map.get(name) orelse name;
 }
 
+/// Map a Go builtin name, falling back to camelCase conversion for names
+/// without an explicit override. This mirrors the TS/Go/Rust/Python Go parsers
+/// which all fall back to camelCase (e.g. `BbFieldAdd` -> `bbFieldAdd`,
+/// `MerkleRootSha256` -> `merkleRootSha256`).
+fn mapGoBuiltinCamel(allocator: Allocator, name: []const u8) []const u8 {
+    const mapped = mapGoBuiltin(name);
+    // If the static map had no override it returns the input unchanged. In
+    // that case, apply the default camelCase conversion so unknown runar.*
+    // builtins match the Runar naming convention used by other compilers.
+    if (std.mem.eql(u8, mapped, name)) {
+        return goToCamelCase(allocator, name);
+    }
+    return mapped;
+}
+
+/// Decode Go string escape sequences (\n, \t, \r, \0, \\, \", \xNN) from the
+/// raw text of a Go string literal, then hex-encode the resulting bytes. Used
+/// so that `runar.ByteString("\x00\x6a")` in source becomes a ByteString
+/// literal with hex value `"006a"`.
+fn decodeGoEscapesAndHex(allocator: Allocator, raw: []const u8) ![]const u8 {
+    var decoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer decoded.deinit(allocator);
+    var i: usize = 0;
+    while (i < raw.len) {
+        const c = raw[i];
+        if (c == '\\' and i + 1 < raw.len) {
+            const nx = raw[i + 1];
+            switch (nx) {
+                'n' => { try decoded.append(allocator, '\n'); i += 2; },
+                't' => { try decoded.append(allocator, '\t'); i += 2; },
+                'r' => { try decoded.append(allocator, '\r'); i += 2; },
+                '0' => { try decoded.append(allocator, 0); i += 2; },
+                '\\' => { try decoded.append(allocator, '\\'); i += 2; },
+                '"' => { try decoded.append(allocator, '"'); i += 2; },
+                'x' => {
+                    if (i + 3 < raw.len) {
+                        const h1 = raw[i + 2];
+                        const h2 = raw[i + 3];
+                        const isHex = std.ascii.isHex(h1) and std.ascii.isHex(h2);
+                        if (isHex) {
+                            const hex_pair = [_]u8{ h1, h2 };
+                            const b = try std.fmt.parseInt(u8, &hex_pair, 16);
+                            try decoded.append(allocator, b);
+                            i += 4;
+                        } else {
+                            try decoded.append(allocator, c);
+                            i += 1;
+                        }
+                    } else {
+                        try decoded.append(allocator, c);
+                        i += 1;
+                    }
+                },
+                else => {
+                    try decoded.append(allocator, nx);
+                    i += 2;
+                },
+            }
+        } else {
+            try decoded.append(allocator, c);
+            i += 1;
+        }
+    }
+    // Hex-encode the decoded bytes.
+    const hex = try allocator.alloc(u8, decoded.items.len * 2);
+    const digits = "0123456789abcdef";
+    for (decoded.items, 0..) |b, idx| {
+        hex[idx * 2] = digits[(b >> 4) & 0xf];
+        hex[idx * 2 + 1] = digits[b & 0xf];
+    }
+    return hex;
+}
+
 /// Check if a Go type name is a type conversion (not a function call).
 /// e.g., runar.Int(0), runar.Bigint(x), runar.Bool(true) are type casts.
 fn isTypeConversion(name: []const u8) bool {
     const convs = std.StaticStringMap(void).initComptime(.{
         .{ "Int", {} },
         .{ "Bigint", {} },
+        .{ "BigintBig", {} },
         .{ "Bool", {} },
     });
     return convs.has(name);
@@ -759,6 +862,9 @@ const Parser = struct {
                     } else if (std.mem.eql(u8, parent_name, "StatefulSmartContract")) {
                         parent_class = .stateful_smart_contract;
                         found_parent = true;
+                    } else if (std.mem.eql(u8, parent_name, "UnsafeSmartContract")) {
+                        parent_class = .unsafe_smart_contract;
+                        found_parent = true;
                     }
                 }
                 continue;
@@ -773,8 +879,10 @@ const Parser = struct {
             const field_name_tok = self.bump();
             const field_name = goToCamelCase(self.allocator, field_name_tok.text);
 
-            // Parse type
-            const type_info = self.parseGoType();
+            // Parse type — captures FixedArray shape so `expand_fixed_arrays.zig`
+            // can see the property after typecheck. Mirrors parse_zig.zig and
+            // parse_python.zig.
+            const parsed_type = self.parseGoFieldType();
 
             // Check for struct tag
             var is_readonly = false;
@@ -785,13 +893,16 @@ const Parser = struct {
                 }
             }
 
-            // For SmartContract, all properties are readonly
-            const readonly = if (parent_class == .smart_contract) true else is_readonly;
+            // For SmartContract (and UnsafeSmartContract), all properties are readonly
+            const readonly = if (parent_class == .smart_contract or parent_class == .unsafe_smart_contract) true else is_readonly;
 
             properties.append(self.allocator, .{
                 .name = field_name,
-                .type_info = type_info,
+                .type_info = parsed_type.type_info,
                 .readonly = readonly,
+                .fixed_array_length = parsed_type.fixed_array_length,
+                .fixed_array_element = parsed_type.fixed_array_element,
+                .fixed_array_nested_length = parsed_type.fixed_array_nested_length,
             }) catch {};
         }
 
@@ -829,6 +940,63 @@ const Parser = struct {
 
     // ---- Go Type parsing ----
 
+    const ParsedGoType = struct {
+        type_info: RunarType,
+        fixed_array_length: u32 = 0,
+        fixed_array_element: RunarType = .unknown,
+        fixed_array_nested_length: u32 = 0,
+    };
+
+    /// Parse a Go field type, capturing FixedArray shape on outer + nested
+    /// `[N]T` arrays. Mirrors `parseFieldTypeNode` in parse_zig.zig.
+    fn parseGoFieldType(self: *Parser) ParsedGoType {
+        // Fixed-length array: [N]T (recursive for [M][N]T)
+        if (self.current.kind == .lbracket) {
+            _ = self.bump(); // consume '['
+            if (self.current.kind == .rbracket) {
+                // []byte -> ByteString
+                _ = self.bump(); // consume ']'
+                if (self.checkIdent("byte")) {
+                    _ = self.bump();
+                    return .{ .type_info = .byte_string };
+                }
+                return .{ .type_info = .unknown };
+            }
+            if (self.current.kind != .number) {
+                self.addError("FixedArray length must be a positive integer literal");
+                while (self.current.kind != .rbracket and self.current.kind != .eof) _ = self.bump();
+                if (self.current.kind == .rbracket) _ = self.bump();
+                return .{ .type_info = .unknown };
+            }
+            const size_tok = self.bump();
+            const size = std.fmt.parseInt(u32, size_tok.text, 10) catch 0;
+            _ = self.expect(.rbracket);
+            const inner = self.parseGoFieldType();
+            // Outer FixedArray: track its length and element type. If the
+            // element is itself a FixedArray, fold its length into
+            // fixed_array_nested_length so expand_fixed_arrays sees the full
+            // shape (matches parse_zig / parse_python behaviour).
+            //
+            // Note: when the element is a nested FixedArray, fixed_array_element
+            // stays as `.fixed_array` (NOT the inner element type), matching
+            // parse_zig.zig's `typeNodeToRunarType` behaviour. expand_fixed_arrays
+            // checks `element == .fixed_array && nested_length > 0` to know it
+            // needs to recursively expand into a 2-D synthetic grid.
+            var nested: u32 = 0;
+            if (inner.type_info == .fixed_array) {
+                nested = inner.fixed_array_length;
+            }
+            return .{
+                .type_info = .fixed_array,
+                .fixed_array_length = size,
+                .fixed_array_element = inner.type_info,
+                .fixed_array_nested_length = nested,
+            };
+        }
+
+        return .{ .type_info = self.parseGoType() };
+    }
+
     fn parseGoType(self: *Parser) RunarType {
         // runar.TypeName
         if (self.checkIdent("runar") and self.tokenizer.peek() == '.') {
@@ -851,7 +1019,7 @@ const Parser = struct {
                     return .byte_string;
                 }
             } else {
-                // Fixed-length array: [N]Type -- skip for now
+                // Fixed-length array nested via parseGoType (legacy path) -- skip
                 while (self.current.kind != .rbracket and self.current.kind != .eof) _ = self.bump();
                 if (self.current.kind == .rbracket) _ = self.bump();
                 if (self.current.kind == .ident) _ = self.bump();
@@ -982,10 +1150,23 @@ const Parser = struct {
 
                         _ = self.bump(); // consume the next ident
 
-                        // If the token after is a type indicator (runar., another ident for type, [, *)
-                        // then the first ident was a name
-                        if (self.current.kind == .ident or
-                            (self.current.kind == .ident and std.mem.eql(u8, self.current.text, "runar")) or
+                        // After consuming `, name`, decide whether `name` is a fresh
+                        // parameter name (more names follow before the type) or actually
+                        // the parameter type (e.g. `a, T` shorthand is invalid Go but the
+                        // common shape is `name1, name2, ..., nameN Type`).
+                        //
+                        // Cases that mean `name` was another *parameter name*:
+                        //   - next is `,`     → another `, name` group follows
+                        //   - next is `ident` → a type token (runar/T/...) — name had
+                        //     no inline type, and the type for this whole run is what we
+                        //     are looking at right now. So `name` was a name.
+                        //   - next is `[` `*` `.` → array/pointer/qualified type
+                        //
+                        // Case that means `name` was actually the type (we should stop):
+                        //   - next is `)` → end of params, and the previous name's type
+                        //     was inlined as `name1 Type`. Restore.
+                        if (self.current.kind == .comma or
+                            self.current.kind == .ident or
                             self.current.kind == .lbracket or
                             self.current.kind == .star or
                             self.current.kind == .dot)
@@ -1142,6 +1323,8 @@ const Parser = struct {
         var var_name: []const u8 = "_i";
         var init_value: i64 = 0;
         var bound: i64 = 0;
+        var descending: bool = false;
+        var inclusive: bool = false;
 
         // Check if we have an initializer (look for :=)
         // Parse: varname := expr
@@ -1177,6 +1360,9 @@ const Parser = struct {
                     if (cond_expr) |expr| {
                         switch (expr) {
                             .binary_op => |bop| {
+                                descending = bop.op == .gt or bop.op == .gte;
+                                // Issue #121: record inclusivity (`<=`/`>=`).
+                                inclusive = bop.op == .lte or bop.op == .gte;
                                 switch (bop.right) {
                                     .literal_int => |v| {
                                         bound = v;
@@ -1213,7 +1399,7 @@ const Parser = struct {
         }
 
         const body = self.parseBlock();
-        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .body = body } };
+        return .{ .for_stmt = .{ .var_name = var_name, .init_value = init_value, .bound = bound, .descending = descending, .inclusive = inclusive, .body = body } };
     }
 
     fn parseReturnStmt(self: *Parser) ?Statement {
@@ -1293,6 +1479,19 @@ const Parser = struct {
             },
             .identifier => |id| {
                 return .{ .assign = .{ .target = id, .value = value } };
+            },
+            .index_access => |ia| {
+                // `c.Board[i] = v` — extract the base property name and
+                // attach the IndexAccess so `expand_fixed_arrays.zig` can
+                // rewrite it into direct (literal index) or dispatch
+                // (runtime index) form. Mirrors parse_zig.zig's
+                // `extractAssignTarget` + `index_target` handling.
+                const base = switch (ia.object) {
+                    .property_access => |pa| pa.property,
+                    .identifier => |id| id,
+                    else => "unknown",
+                };
+                return .{ .assign = .{ .target = base, .value = value, .index_target = ia } };
             },
             else => {
                 return .{ .assign = .{ .target = "unknown", .value = value } };
@@ -1474,6 +1673,14 @@ const Parser = struct {
             uop.* = .{ .op = .bitnot, .operand = o };
             return .{ .unary_op = uop };
         }
+        if (self.current.kind == .caret) {
+            // Go uses ^ as unary XOR (bitwise NOT)
+            _ = self.bump();
+            const o = self.parseUnary() orelse return null;
+            const uop = self.allocator.create(UnaryOp) catch return null;
+            uop.* = .{ .op = .bitnot, .operand = o };
+            return .{ .unary_op = uop };
+        }
         return self.parsePostfix();
     }
 
@@ -1498,12 +1705,24 @@ const Parser = struct {
                         .identifier => |id| {
                             // runar.FuncName(args) -> check for type conversion or builtin call
                             if (std.mem.eql(u8, id, "runar")) {
-                                // Check for type conversions: runar.Int(0), runar.Bigint(x), runar.Bool(true)
+                                // Check for type conversions: runar.Int(0), runar.Bigint(x), runar.BigintBig(x), runar.Bool(true)
                                 if (isTypeConversion(member) and args.len == 1) {
                                     expr = args[0];
+                                } else if (std.mem.eql(u8, member, "ByteString") and args.len == 1) {
+                                    // runar.ByteString("literal") -> literal_bytes (hex-encoded);
+                                    // runar.ByteString(variable) -> unwrap.
+                                    switch (args[0]) {
+                                        .literal_bytes => |raw| {
+                                            const hex = decodeGoEscapesAndHex(self.allocator, raw) catch raw;
+                                            expr = .{ .literal_bytes = hex };
+                                        },
+                                        else => {
+                                            expr = args[0];
+                                        },
+                                    }
                                 } else {
                                     // Builtin call: runar.CheckSig(sig, pk) -> checkSig(sig, pk)
-                                    const builtin_name = mapGoBuiltin(member);
+                                    const builtin_name = mapGoBuiltinCamel(self.allocator, member);
                                     const call = self.allocator.create(CallExpr) catch return null;
                                     call.* = .{ .callee = builtin_name, .args = args };
                                     expr = .{ .call = call };
@@ -1536,7 +1755,7 @@ const Parser = struct {
                                 expr = .{ .property_access = .{ .object = "this", .property = goToCamelCase(self.allocator, member) } };
                             } else if (std.mem.eql(u8, id, "runar")) {
                                 // runar.SomeConstant -> identifier
-                                expr = .{ .identifier = mapGoBuiltin(member) };
+                                expr = .{ .identifier = mapGoBuiltinCamel(self.allocator, member) };
                             } else {
                                 expr = .{ .property_access = .{ .object = id, .property = goToCamelCase(self.allocator, member) } };
                             }
@@ -1575,20 +1794,39 @@ const Parser = struct {
         return switch (self.current.kind) {
             .number => blk: {
                 const tok = self.bump();
-                var stripped_buf: [64]u8 = undefined;
+                // Buffer sized for 256-bit decimal literals (78 digits) with
+                // headroom; oversize tokens are rejected rather than silently
+                // truncated so byte-level cross-tier parity is preserved.
+                var stripped_buf: [160]u8 = undefined;
                 var stripped_len: usize = 0;
+                var overflow = false;
                 for (tok.text) |ch| {
-                    if (ch != '_' and stripped_len < stripped_buf.len) {
-                        stripped_buf[stripped_len] = ch;
-                        stripped_len += 1;
+                    if (ch == '_') continue;
+                    if (stripped_len >= stripped_buf.len) {
+                        overflow = true;
+                        break;
                     }
+                    stripped_buf[stripped_len] = ch;
+                    stripped_len += 1;
+                }
+                if (overflow) {
+                    self.addErrorFmt("integer literal too long: '{s}'", .{tok.text});
+                    break :blk null;
                 }
                 const stripped = stripped_buf[0..stripped_len];
-                const val = std.fmt.parseInt(i64, stripped, 0) catch {
+                if (std.fmt.parseInt(i64, stripped, 0)) |val| {
+                    break :blk Expression{ .literal_int = val };
+                } else |_| {
+                    // Oversize decimal literal — carry the canonical decimal
+                    // text on a `literal_bigint` node so codegen emits the
+                    // correct push bytes (matches TS / Go / Python).
+                    if (isAllAsciiDigits(stripped)) {
+                        const decimal = self.allocator.dupe(u8, stripped) catch break :blk null;
+                        break :blk Expression{ .literal_bigint = decimal };
+                    }
                     self.addErrorFmt("invalid integer: '{s}'", .{tok.text});
                     break :blk null;
-                };
-                break :blk Expression{ .literal_int = val };
+                }
             },
             .string_literal => blk: {
                 const tok = self.bump();
@@ -1638,6 +1876,18 @@ const Parser = struct {
 
     fn parseArrayLiteral(self: *Parser) ?Expression {
         _ = self.expect(.lbracket);
+        // Go composite literal form: `[N]T{a, b, c}` or `[N][M]T{...}`.
+        // The `[N]T` shape is parsed and discarded — the array literal AST node
+        // tracks elements only; the field's type already records the FixedArray
+        // shape, so expand_fixed_arrays has everything it needs.
+        if (self.current.kind == .number) {
+            _ = self.bump(); // consume N
+            _ = self.expect(.rbracket);
+            // Element type: `[M]T`, `runar.X`, or plain ident
+            self.skipCompositeLiteralType();
+            return self.parseCompositeLiteralBody();
+        }
+        // Fallback: legacy JS-style `[a, b, c]` literal.
         var elements: std.ArrayListUnmanaged(Expression) = .empty;
         while (self.current.kind != .rbracket and self.current.kind != .eof) {
             const elem = self.parseExpression() orelse break;
@@ -1648,6 +1898,51 @@ const Parser = struct {
         }
         _ = self.expect(.rbracket);
         return .{ .array_literal = elements.items };
+    }
+
+    /// Parse the `{...}` body of a Go composite literal. Each element may be
+    /// a regular expression OR a nested implicit composite literal `{ ... }`
+    /// when the outer element type is itself a composite type (e.g. the inner
+    /// `{0, 0}` of `[2][2]int{{0,0}, {0,0}}`).
+    fn parseCompositeLiteralBody(self: *Parser) ?Expression {
+        _ = self.expect(.lbrace);
+        var elements: std.ArrayListUnmanaged(Expression) = .empty;
+        while (self.current.kind != .rbrace and self.current.kind != .eof) {
+            const elem: ?Expression = if (self.current.kind == .lbrace)
+                self.parseCompositeLiteralBody()
+            else
+                self.parseExpression();
+            if (elem) |e| {
+                elements.append(self.allocator, e) catch {};
+            } else break;
+            if (self.current.kind == .comma) {
+                _ = self.bump();
+            } else break;
+        }
+        _ = self.expect(.rbrace);
+        return .{ .array_literal = elements.items };
+    }
+
+    /// Skip the element type in a Go composite literal: `[M]T` (recursive),
+    /// `runar.X`, or plain ident. Stops just before `{`.
+    fn skipCompositeLiteralType(self: *Parser) void {
+        while (true) {
+            if (self.current.kind == .lbracket) {
+                _ = self.bump();
+                if (self.current.kind == .number) _ = self.bump();
+                _ = self.expect(.rbracket);
+                continue;
+            }
+            if (self.current.kind == .ident) {
+                _ = self.bump();
+                if (self.current.kind == .dot) {
+                    _ = self.bump();
+                    if (self.current.kind == .ident) _ = self.bump();
+                }
+                return;
+            }
+            return;
+        }
     }
 
     // ---- Helpers ----
@@ -1944,6 +2239,108 @@ test "parse BoundedLoop contract (Go)" {
     try std.testing.expectEqual(@as(usize, 1), c.methods.len);
     // Body: short var decl + for loop + assert = 3 statements
     try std.testing.expectEqual(@as(usize, 3), c.methods[0].body.len);
+}
+
+test "parse BigintBig property and param (Go)" {
+    // runar.BigintBig is the big.Int-backed alias for the bigint primitive on
+    // the Go mock side. The DSL parser must map it to the same bigint type so
+    // arithmetic against runar.Bigint typechecks cleanly.
+    const source =
+        \\package contract
+        \\
+        \\import "runar"
+        \\
+        \\type BigMath struct {
+        \\  runar.SmartContract
+        \\  Target runar.BigintBig `runar:"readonly"`
+        \\}
+        \\
+        \\func (c *BigMath) Check(a runar.Bigint, b runar.BigintBig) {
+        \\  runar.Assert(a + b == c.Target)
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseGo(arena.allocator(), source, "BigMath.runar.go");
+    for (r.errors) |err| std.debug.print("ERROR: {s}\n", .{err});
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expect(r.contract != null);
+    const c = r.contract.?;
+    // Target property must map to bigint.
+    try std.testing.expectEqual(RunarType.bigint, c.properties[0].type_info);
+    // Method param b runar.BigintBig must also map to bigint.
+    try std.testing.expectEqual(@as(usize, 1), c.methods.len);
+    try std.testing.expectEqual(RunarType.bigint, c.methods[0].params[1].type_info);
+}
+
+test "parse ByteString literal and variable (Go)" {
+    // runar.ByteString("\x00\x6a") emits literal_bytes with hex "006a".
+    // runar.ByteString(data) is a no-op type conversion.
+    const source =
+        \\package contract
+        \\
+        \\import "runar"
+        \\
+        \\type LitDemo struct {
+        \\  runar.SmartContract
+        \\  Expected runar.ByteString `runar:"readonly"`
+        \\}
+        \\
+        \\func (c *LitDemo) Check(data runar.ByteString) {
+        \\  runar.Assert(runar.ByteString("\x00\x6a") == c.Expected)
+        \\  runar.Assert(runar.ByteString(data) == c.Expected)
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = parseGo(arena.allocator(), source, "LitDemo.runar.go");
+    for (r.errors) |err| std.debug.print("ERROR: {s}\n", .{err});
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expect(r.contract != null);
+    const c = r.contract.?;
+    try std.testing.expectEqual(@as(usize, 1), c.methods.len);
+
+    // Body: [assert_stmt(literal), assert_stmt(variable)].
+    try std.testing.expectEqual(@as(usize, 2), c.methods[0].body.len);
+
+    // Walk the first assert's expression and find a literal_bytes == "006a".
+    const Finder = struct {
+        fn find(expr: types.Expression) ?[]const u8 {
+            return switch (expr) {
+                .literal_bytes => |v| v,
+                .binary_op => |bop| find(bop.left) orelse find(bop.right),
+                .call => |call| blk: {
+                    for (call.args) |a| if (find(a)) |v| break :blk v;
+                    break :blk null;
+                },
+                else => null,
+            };
+        }
+        fn findIdent(expr: types.Expression, name: []const u8) bool {
+            return switch (expr) {
+                .identifier => |s| std.mem.eql(u8, s, name),
+                .binary_op => |bop| findIdent(bop.left, name) or findIdent(bop.right, name),
+                .call => |call| blk: {
+                    // Reject a wrapping `byteString(...)` call — that means
+                    // the unwrap didn't happen.
+                    if (std.mem.eql(u8, call.callee, "byteString")) break :blk false;
+                    for (call.args) |a| if (findIdent(a, name)) break :blk true;
+                    break :blk false;
+                },
+                else => false,
+            };
+        }
+    };
+
+    const stmt_0 = c.methods[0].body[0];
+    try std.testing.expect(stmt_0 == .expr_stmt);
+    const lit = Finder.find(stmt_0.expr_stmt);
+    try std.testing.expect(lit != null);
+    try std.testing.expectEqualStrings("006a", lit.?);
+
+    const stmt_1 = c.methods[0].body[1];
+    try std.testing.expect(stmt_1 == .expr_stmt);
+    try std.testing.expect(Finder.findIdent(stmt_1.expr_stmt, "data"));
 }
 
 test "parse IfElse contract (Go)" {

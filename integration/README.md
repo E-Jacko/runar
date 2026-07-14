@@ -1,6 +1,6 @@
 # Integration Tests
 
-End-to-end integration tests that deploy and spend Runar contracts on a real Bitcoin node. Tests are organized by language — each suite uses its own compiler and SDK for deployment/calling.
+End-to-end integration tests that deploy and spend Runar contracts on a real Bitcoin node. Tests are organized by language (Go, TypeScript, Rust, Python, Ruby, Zig) — each suite uses its own compiler and SDK for deployment/calling.
 
 Two node backends are supported:
 
@@ -85,23 +85,42 @@ pnpm integration:all:run
 
 ## Contracts Tested
 
-| Contract | Type | Go | TS | Rust | Python | Key Feature |
-|----------|------|----|----|------|--------|-------------|
-| P2PKH | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | ECDSA checkSig |
-| Escrow | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Multi-method, multi-signer |
-| Counter | Stateful | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | OP_PUSH_TX, state transitions |
-| MathDemo | Stateful | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | Built-in math functions |
-| FungibleToken | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | PubKey + balance state |
-| SimpleNFT | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Token transfer + burn |
-| Auction | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Bidding + locktime |
-| CovenantVault | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Covenant rules (SigHashPreimage) |
-| OraclePriceFeed | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Rabin signatures |
-| FunctionPatterns | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Private methods, composition |
-| PostQuantumWallet | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | WOTS+ (19KB script) |
-| SPHINCSWallet | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | SLH-DSA (188KB script) |
-| SchnorrZKP | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | EC operations, ZKP (877KB) |
-| ConvergenceProof | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | EC point arithmetic |
-| EC Isolation | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | ecOnCurve, ecMulGen, ecAdd, ecNegate |
+| Contract | Type | Go | TS | Rust | Python | Ruby | Zig | Java | Key Feature |
+|----------|------|----|----|------|--------|------|-----|------|-------------|
+| P2PKH | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | ECDSA checkSig |
+| Escrow | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Multi-method, multi-signer |
+| Counter | Stateful | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | OP_PUSH_TX, state transitions |
+| MathDemo | Stateful | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | Deploy + Call | Built-in math functions |
+| FungibleToken | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | PubKey + balance state |
+| SimpleNFT | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Token transfer + burn |
+| Auction | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Bidding + locktime |
+| CovenantVault | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Covenant rules (SigHashPreimage) |
+| OraclePriceFeed | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Rabin signatures |
+| FunctionPatterns | Stateful | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Private methods, composition |
+| PostQuantumWallet | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Compile + Deploy [†] | WOTS+ (19KB script) |
+| SPHINCSWallet | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Compile + Deploy [†] | SLH-DSA (188KB script) |
+| SchnorrZKP | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | EC operations, ZKP (877KB) |
+| ConvergenceProof | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | EC point arithmetic |
+| EC Isolation | Stateless | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | Deploy + Spend | ecOnCurve, ecMulGen, ecAdd, ecNegate |
+
+[†] **Java post-quantum spend coverage is intentionally
+deferred.** The compile + deploy + Java-surface parity tests are
+exhaustive for what they cover (the contract artifact itself, including
+the 188 KB SLH-DSA script, is bit-for-bit
+identical to the TS-sourced artifact). The on-chain Bitcoin Script
+verification of these post-quantum primitives is fully exercised by the **Go / Python
+/ Ruby / Zig / Rust / TS** spend tests in the same row — those SDKs ship
+their own SLH-DSA / WOTS+ keygen + sign and round-trip an
+actual spend through the regtest VM. A Java spend would require either
+(a) a Java-side SLH-DSA / WOTS+ keygen+sign implementation (BouncyCastle
+ships SPHINCS+, but its parameter sets are the round-3 candidate, not
+FIPS 205 SLH-DSA — direct substitution would diverge from the Bitcoin
+Script verifier the Rúnar codegen targets), or (b) shelling out to one
+of the other SDKs to generate signature bytes the Java test then embeds
+into a tx. Both are real options; neither is on the roadmap until a
+clearer Java post-quantum signing story lands. Track this against the
+Java SDK rather than the integration suite — the suite's existing
+deploy-only rows truthfully describe the current scope.
 
 ## Node Setup Details
 

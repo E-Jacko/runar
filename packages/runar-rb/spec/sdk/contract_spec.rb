@@ -334,6 +334,206 @@ RSpec.describe Runar::SDK::RunarContract do
   end
 
   # ---------------------------------------------------------------------------
+  # Deploy -> Call chain with MockProvider + MockSigner (stateful counter).
+  #
+  # Mirrors the TypeScript contract-lifecycle.test.ts pattern: deploy a stateful
+  # contract, retrieve the deploy UTXO, build + broadcast a call tx against it,
+  # and assert new state reflects the expected increment.
+  # ---------------------------------------------------------------------------
+
+  describe '#call after deploy' do
+    let(:provider) { mock_provider }
+    let(:signer)   { mock_signer }
+    let(:contract) { described_class.new(stateful_anf_artifact, [5]) }
+
+    before do
+      # Fund the signer address with a large P2PKH UTXO for deploy + call fees.
+      provider.add_utxo(
+        SAMPLE_ADDRESS,
+        make_utxo('ee' * 32, 1_000_000, script: '76a914' + SAMPLE_ADDRESS + '88ac')
+      )
+      contract.connect(provider, signer)
+    end
+
+    it 'broadcasts a call transaction after deploy and updates state' do
+      # Deploy: broadcasts 1 tx, tracks deploy UTXO.
+      deploy_txid, deploy_tx = contract.deploy
+      expect(deploy_txid).to be_a(String)
+      expect(deploy_tx).to be_a(Runar::SDK::Transaction)
+      expect(provider.get_broadcasted_txs.length).to eq(1)
+
+      # Retrieve the deploy UTXO: #get_utxo should track the contract UTXO.
+      deploy_utxo = contract.get_utxo
+      expect(deploy_utxo).not_to be_nil
+      expect(deploy_utxo.txid).to eq(deploy_txid)
+      expect(deploy_utxo.output_index).to eq(0)
+      expect(deploy_utxo.satoshis).to eq(10_000)
+
+      # Fund the call so the call builder has change-source UTXOs as well.
+      provider.add_utxo(
+        SAMPLE_ADDRESS,
+        make_utxo('ff' * 32, 1_000_000, script: '76a914' + SAMPLE_ADDRESS + '88ac')
+      )
+
+      # Call increment(): builds + broadcasts a call tx spending the deploy UTXO.
+      call_txid, call_tx = contract.call('increment', [])
+      expect(call_txid).to be_a(String)
+      expect(call_txid).not_to be_empty
+      expect(call_txid).not_to eq(deploy_txid)
+      expect(call_tx).to be_a(Runar::SDK::Transaction)
+
+      # Provider broadcast count: deploy + call = 2.
+      expect(provider.get_broadcasted_txs.length).to eq(2)
+
+      # State: ANF interpreter increments 'count' from 5 -> 6.
+      expect(contract.get_state).to eq('count' => 6)
+
+      # UTXO tracking: #get_utxo now points at the new (post-call) contract UTXO.
+      new_utxo = contract.get_utxo
+      expect(new_utxo).not_to be_nil
+      expect(new_utxo.txid).to eq(call_txid)
+      expect(new_utxo.txid).not_to eq(deploy_txid)
+    end
+
+    # #131: a stateful call with a future locktime must produce non-final
+    # input sequences (0xfffffffe) so consensus actually enforces nLockTime.
+    it 'threads a future locktime into non-final input sequences (#131)' do
+      contract.deploy
+      provider.add_utxo(
+        SAMPLE_ADDRESS,
+        make_utxo('ff' * 32, 1_000_000, script: '76a914' + SAMPLE_ADDRESS + '88ac')
+      )
+
+      contract.call('increment', [], nil, nil,
+                    Runar::SDK::CallOptions.new(locktime: 800_000))
+      call_tx_hex = provider.get_broadcasted_txs.last
+
+      # locktime written LE at the tail.
+      expect(call_tx_hex).to end_with('00350c00')
+
+      # Every input sequence must be 0xfffffffe (LE hex "feffffff").
+      pos = 8
+      count, ic = Runar::SDK.read_varint_hex(call_tx_hex, pos)
+      pos += ic
+      count.times do
+        pos += 72 # prev txid (64) + output index (8)
+        script_len, sl = Runar::SDK.read_varint_hex(call_tx_hex, pos)
+        pos += sl + script_len * 2
+        expect(call_tx_hex[pos, 8]).to eq('feffffff')
+        pos += 8
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # funding_signer — sign funding inputs with a distinct key (issue #134)
+  # ---------------------------------------------------------------------------
+
+  describe 'funding_signer (#134)' do
+    METHOD_PUB  = "02#{'aa' * 32}"
+    FUNDING_PUB = "02#{'bb' * 32}"
+    METHOD_ADDR = ('aa' * 20)
+
+    let(:method_signer)  { Runar::SDK::MockSigner.new(pub_key_hex: METHOD_PUB, address: METHOD_ADDR) }
+    let(:funding_signer) { Runar::SDK::MockSigner.new(pub_key_hex: FUNDING_PUB, address: 'bb' * 20) }
+    let(:provider)       { mock_provider }
+
+    before do
+      provider.add_utxo(METHOD_ADDR,
+                        make_utxo('ee' * 32, 1_000_000, script: "76a914#{METHOD_ADDR}88ac"))
+    end
+
+    it 'deploy signs funding inputs with funding_signer, pushing its pubkey' do
+      contract = described_class.new(stateful_anf_artifact, [5])
+      contract.deploy(provider, method_signer,
+                      Runar::SDK::DeployOptions.new(satoshis: 1_000, funding_signer: funding_signer))
+      deploy_tx = provider.get_broadcasted_txs.last
+      expect(deploy_tx).to include(FUNDING_PUB)
+      expect(deploy_tx).not_to include(METHOD_PUB)
+    end
+
+    it 'deploy defaults to the connected signer when funding_signer is unset' do
+      contract = described_class.new(stateful_anf_artifact, [5])
+      contract.deploy(provider, method_signer, Runar::SDK::DeployOptions.new(satoshis: 1_000))
+      deploy_tx = provider.get_broadcasted_txs.last
+      expect(deploy_tx).to include(METHOD_PUB)
+    end
+
+    it 'call signs funding inputs with funding_signer, pushing its pubkey' do
+      contract = described_class.new(stateful_anf_artifact, [5])
+      contract.connect(provider, method_signer)
+      contract.instance_variable_set(
+        :@current_utxo,
+        Runar::SDK::Utxo.new(txid: 'cc' * 32, output_index: 0,
+                             satoshis: 10_000, script: contract.get_locking_script)
+      )
+      contract.call('increment', [], nil, nil,
+                    Runar::SDK::CallOptions.new(funding_signer: funding_signer))
+      call_tx = provider.get_broadcasted_txs.last
+      expect(call_tx).to include(FUNDING_PUB)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # #call funding selection (issue #133)
+  # ---------------------------------------------------------------------------
+
+  describe '#call funding selection (#133)' do
+    let(:provider) { mock_provider }
+    let(:signer)   { mock_signer }
+    let(:contract) { described_class.new(stateful_anf_artifact, [5]) }
+
+    def input_count(tx_hex)
+      count, = Runar::SDK.read_varint_hex(tx_hex, 8)
+      count
+    end
+
+    # Give the contract a deployed UTXO directly (no deploy noise) so the
+    # provider's funding set contains only the coins each test adds.
+    def deploy_manually(satoshis = 10_000)
+      contract.connect(provider, signer)
+      contract.instance_variable_set(
+        :@current_utxo,
+        Runar::SDK::Utxo.new(txid: 'cc' * 32, output_index: 0,
+                             satoshis: satoshis, script: contract.get_locking_script)
+      )
+    end
+
+    def fund(address_utxos)
+      address_utxos.each { |txid, sats| provider.add_utxo(SAMPLE_ADDRESS, make_utxo(txid, sats, script: '76a914' + SAMPLE_ADDRESS + '88ac')) }
+    end
+
+    it 'selects the smallest-sufficient funding, not all wallet UTXOs' do
+      deploy_manually
+      fund([['a0' * 32, 100_000], ['a1' * 32, 100_000], ['a2' * 32, 100_000]])
+      contract.call('increment', [])
+      call_tx = provider.get_broadcasted_txs.last
+      # 1 contract input + 1 funding input = 2 (NOT 4).
+      expect(input_count(call_tx)).to eq(2)
+    end
+
+    it 'raises clearly when max_funding_inputs cannot cover outputs + fee' do
+      deploy_manually
+      # Continuation value 16k against a 10k contract input needs ~6k of
+      # funding; with 3k coins that is 2 inputs. Cap at 1 => must raise.
+      fund([['b0' * 32, 3_000], ['b1' * 32, 3_000], ['b2' * 32, 3_000]])
+      expect do
+        contract.call('increment', [], nil, nil,
+                      Runar::SDK::CallOptions.new(satoshis: 16_000, max_funding_inputs: 1))
+      end.to raise_error(/max_funding_inputs/)
+    end
+
+    it 'honors a max_funding_inputs cap that is sufficient' do
+      deploy_manually
+      fund([['c0' * 32, 3_000], ['c1' * 32, 3_000], ['c2' * 32, 3_000]])
+      expect do
+        contract.call('increment', [], nil, nil,
+                      Runar::SDK::CallOptions.new(satoshis: 16_000, max_funding_inputs: 3))
+      end.not_to raise_error
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # get_state / set_state
   # ---------------------------------------------------------------------------
 
@@ -392,6 +592,33 @@ RSpec.describe Runar::SDK::RunarContract do
     it 'raises ArgumentError for an out-of-range output index' do
       expect { described_class.from_txid(artifact, tx.txid, 5, provider) }
         .to raise_error(ArgumentError, /out of range/)
+    end
+
+    # #119: from_txid must recover the REAL constructor args baked into the
+    # deployed script, not 0 placeholders.
+    it 'restores the real constructor args from the deployed script (#119)' do
+      contract = described_class.from_txid(artifact, tx.txid, 0, provider)
+      restored = contract.instance_variable_get(:@constructor_args)
+      expect(restored).to eq([SAMPLE_PKH])
+      expect(restored).not_to eq([0])
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # from_utxo — restore real constructor args (issue #119)
+  # ---------------------------------------------------------------------------
+
+  describe '.from_utxo restores constructor args (#119)' do
+    let(:artifact) { stateless_artifact }
+    let(:script)   { described_class.new(artifact, [SAMPLE_PKH]).get_locking_script }
+
+    it 'recovers the baked-in pubKeyHash instead of a 0 placeholder' do
+      utxo = Runar::SDK::Utxo.new(
+        txid: 'ab' * 32, output_index: 0, satoshis: 10_000, script: script
+      )
+      contract = described_class.from_utxo(artifact, utxo)
+      restored = contract.instance_variable_get(:@constructor_args)
+      expect(restored).to eq([SAMPLE_PKH])
     end
   end
 
@@ -461,6 +688,89 @@ RSpec.describe Runar::SDK::RunarContract do
       _prepared = no_anf_contract.prepare_call('increment', [])
       # Without ANF, state is not mutated by the interpreter.
       expect(no_anf_contract.get_state['count']).to eq(10)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # ANF data outputs (this.addDataOutput) — extraction must run regardless of
+  # whether the caller supplied an explicit new_state. Data outputs are part
+  # of method-body behaviour (not state) and the on-chain continuation hash
+  # check fails at spend time if they're missing from the spending tx.
+  #
+  # Regression: integration/ruby/spec/data_outputs_spec.rb
+  # Reference:  packages/runar-go/sdk_contract.go (always runs ANF interp).
+  # ---------------------------------------------------------------------------
+
+  describe 'ANF data output extraction' do
+    # Stateful contract whose emit() bumps `counter` and emits a single
+    # this.addDataOutput(0n, payload). The payload binding is t_script
+    # (load_const hex string) and the satoshis binding is t_sats
+    # (load_const 0). The payload value is the bytes that will appear as
+    # the data output's full script.
+    let(:emit_payload_hex) { '6a04deadbeef' } # OP_RETURN <4-byte push>
+    let(:data_emitter_artifact_json) do
+      JSON.generate(
+        version:            '1.0',
+        compilerVersion:    '0.1.0',
+        contractName:       'DataEmitter',
+        abi:                {
+          constructor: { params: [{ name: 'counter', type: 'bigint' }] },
+          methods:     [{ name: 'emit', params: [], isPublic: true }]
+        },
+        script:             'aabbcc',
+        asm:                '',
+        stateFields:        [{ name: 'counter', type: 'bigint', index: 0 }],
+        constructorSlots:   [],
+        codeSeparatorIndex: 0,
+        anf:                {
+          'properties' => [{ 'name' => 'counter', 'type' => 'bigint', 'readonly' => false }],
+          'methods'    => [
+            {
+              'name'     => 'emit',
+              'isPublic' => true,
+              'params'   => [],
+              'body'     => [
+                { 'name' => 't_sats',   'value' => { 'kind' => 'load_const', 'value' => 0 } },
+                { 'name' => 't_script', 'value' => { 'kind' => 'load_const', 'value' => emit_payload_hex } },
+                { 'name' => 't_emit',   'value' => { 'kind' => 'add_data_output', 'satoshis' => 't_sats', 'scriptBytes' => 't_script' } },
+                { 'name' => 't_prop',   'value' => { 'kind' => 'load_prop', 'name' => 'counter' } },
+                { 'name' => 't_one',    'value' => { 'kind' => 'load_const', 'value' => 1 } },
+                { 'name' => 't_sum',    'value' => { 'kind' => 'bin_op', 'op' => '+', 'left' => 't_prop', 'right' => 't_one' } },
+                { 'name' => 't_upd',    'value' => { 'kind' => 'update_prop', 'name' => 'counter', 'value' => 't_sum' } }
+              ]
+            }
+          ]
+        }
+      )
+    end
+
+    let(:data_emitter_artifact) { Runar::SDK::RunarArtifact.from_json(data_emitter_artifact_json) }
+    let(:provider) { mock_provider }
+    let(:signer)   { mock_signer }
+    let(:contract) { described_class.new(data_emitter_artifact, [0]) }
+
+    before do
+      provider.add_utxo(
+        SAMPLE_ADDRESS,
+        make_utxo('11' * 32, 1_000_000, script: '76a914' + SAMPLE_ADDRESS + '88ac')
+      )
+      contract.connect(provider, signer)
+      contract.deploy
+    end
+
+    it 'extracts data outputs from ANF when new_state is nil' do
+      prepared = contract.prepare_call('emit', [])
+      expect(prepared.tx_hex).to include(emit_payload_hex)
+    end
+
+    # Bug regression: when the caller pre-computes new_state, the SDK used to
+    # short-circuit the ANF interpreter pass entirely, so addDataOutput
+    # payloads were never extracted and the spending tx omitted the data
+    # output — which made the on-chain continuation hash check fail.
+    it 'extracts data outputs from ANF even when new_state is supplied' do
+      opts = Runar::SDK::CallOptions.new(new_state: { 'counter' => 1 })
+      prepared = contract.prepare_call('emit', [], nil, nil, opts)
+      expect(prepared.tx_hex).to include(emit_payload_hex)
     end
   end
 end

@@ -1,0 +1,478 @@
+{
+  "script": "76009c637576ab76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad69768254947f778101419d7601687f7782012c947f758258947f75820129947f7701217f81587a5879ad567978a06952798258947f77547f7581009f69577a527a75567a527a75557a557a00787c9c9163041976a9147b7e0288ac7e7c58807c7e67007b7577687b7b58807e5279547a7c7558806b5379016a7e7c7e827602fd009f635280517f756776030000019f635380527f7501fd7c7e67760500000000019f635580547f7501fe7c7e675980587f7501ff7c7e6868687c7e6c7c7e7c7eaa7c820128947f7701207f75877767519d76ab76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad69768254947f778101419d7601687f7782012c947f758258947f75820129947f7701217f81537a00ad7b8258947f77547f758100a2777768",
+  "scriptSize": 1794,
+  "findings": [
+    {
+      "severity": "info",
+      "code": "CODESEPARATOR_PRESENT",
+      "message": "OP_CODESEPARATOR found — expected for stateful contracts, unusual otherwise",
+      "offset": 6,
+      "opcode": "OP_CODESEPARATOR"
+    },
+    {
+      "severity": "info",
+      "code": "CODESEPARATOR_PRESENT",
+      "message": "OP_CODESEPARATOR found — expected for stateful contracts, unusual otherwise",
+      "offset": 977,
+      "opcode": "OP_CODESEPARATOR"
+    }
+  ],
+  "paths": [
+    {
+      "id": 0,
+      "description": "IF[false] at 3 -> IF[false] at 847 -> IF[false] at 897 -> IF[false] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 1,
+      "description": "IF[true] at 3 -> IF[false] at 847 -> IF[false] at 897 -> IF[false] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -3
+    },
+    {
+      "id": 2,
+      "description": "IF[false] at 3 -> IF[true] at 847 -> IF[false] at 897 -> IF[false] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 3,
+      "description": "IF[true] at 3 -> IF[true] at 847 -> IF[false] at 897 -> IF[false] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -3
+    },
+    {
+      "id": 4,
+      "description": "IF[false] at 3 -> IF[false] at 847 -> IF[true] at 897 -> IF[false] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        false,
+        false,
+        true,
+        false,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 5,
+      "description": "IF[true] at 3 -> IF[false] at 847 -> IF[true] at 897 -> IF[false] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        true,
+        false,
+        true,
+        false,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -5
+    },
+    {
+      "id": 6,
+      "description": "IF[false] at 3 -> IF[true] at 847 -> IF[true] at 897 -> IF[false] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        false,
+        true,
+        true,
+        false,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 7,
+      "description": "IF[true] at 3 -> IF[true] at 847 -> IF[true] at 897 -> IF[false] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        true,
+        true,
+        true,
+        false,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -5
+    },
+    {
+      "id": 8,
+      "description": "IF[false] at 3 -> IF[false] at 847 -> IF[false] at 897 -> IF[true] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        false,
+        false,
+        false,
+        true,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 9,
+      "description": "IF[true] at 3 -> IF[false] at 847 -> IF[false] at 897 -> IF[true] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        true,
+        false,
+        false,
+        true,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -4
+    },
+    {
+      "id": 10,
+      "description": "IF[false] at 3 -> IF[true] at 847 -> IF[false] at 897 -> IF[true] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        false,
+        true,
+        false,
+        true,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 11,
+      "description": "IF[true] at 3 -> IF[true] at 847 -> IF[false] at 897 -> IF[true] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        true,
+        true,
+        false,
+        true,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -4
+    },
+    {
+      "id": 12,
+      "description": "IF[false] at 3 -> IF[false] at 847 -> IF[true] at 897 -> IF[true] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        false,
+        false,
+        true,
+        true,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 13,
+      "description": "IF[true] at 3 -> IF[false] at 847 -> IF[true] at 897 -> IF[true] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        true,
+        false,
+        true,
+        true,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -5
+    },
+    {
+      "id": 14,
+      "description": "IF[false] at 3 -> IF[true] at 847 -> IF[true] at 897 -> IF[true] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        false,
+        true,
+        true,
+        true,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 15,
+      "description": "IF[true] at 3 -> IF[true] at 847 -> IF[true] at 897 -> IF[true] at 910 -> IF[false] at 929",
+      "branchChoices": [
+        true,
+        true,
+        true,
+        true,
+        false
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -5
+    },
+    {
+      "id": 16,
+      "description": "IF[false] at 3 -> IF[false] at 847 -> IF[false] at 897 -> IF[false] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        false,
+        false,
+        false,
+        false,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 17,
+      "description": "IF[true] at 3 -> IF[false] at 847 -> IF[false] at 897 -> IF[false] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        true,
+        false,
+        false,
+        false,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -3
+    },
+    {
+      "id": 18,
+      "description": "IF[false] at 3 -> IF[true] at 847 -> IF[false] at 897 -> IF[false] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        false,
+        true,
+        false,
+        false,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 19,
+      "description": "IF[true] at 3 -> IF[true] at 847 -> IF[false] at 897 -> IF[false] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        true,
+        true,
+        false,
+        false,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -3
+    },
+    {
+      "id": 20,
+      "description": "IF[false] at 3 -> IF[false] at 847 -> IF[true] at 897 -> IF[false] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        false,
+        false,
+        true,
+        false,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 21,
+      "description": "IF[true] at 3 -> IF[false] at 847 -> IF[true] at 897 -> IF[false] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        true,
+        false,
+        true,
+        false,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -5
+    },
+    {
+      "id": 22,
+      "description": "IF[false] at 3 -> IF[true] at 847 -> IF[true] at 897 -> IF[false] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        false,
+        true,
+        true,
+        false,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 23,
+      "description": "IF[true] at 3 -> IF[true] at 847 -> IF[true] at 897 -> IF[false] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        true,
+        true,
+        true,
+        false,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -5
+    },
+    {
+      "id": 24,
+      "description": "IF[false] at 3 -> IF[false] at 847 -> IF[false] at 897 -> IF[true] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        false,
+        false,
+        false,
+        true,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 25,
+      "description": "IF[true] at 3 -> IF[false] at 847 -> IF[false] at 897 -> IF[true] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        true,
+        false,
+        false,
+        true,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -4
+    },
+    {
+      "id": 26,
+      "description": "IF[false] at 3 -> IF[true] at 847 -> IF[false] at 897 -> IF[true] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        false,
+        true,
+        false,
+        true,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 27,
+      "description": "IF[true] at 3 -> IF[true] at 847 -> IF[false] at 897 -> IF[true] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        true,
+        true,
+        false,
+        true,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -4
+    },
+    {
+      "id": 28,
+      "description": "IF[false] at 3 -> IF[false] at 847 -> IF[true] at 897 -> IF[true] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        false,
+        false,
+        true,
+        true,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 29,
+      "description": "IF[true] at 3 -> IF[false] at 847 -> IF[true] at 897 -> IF[true] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        true,
+        false,
+        true,
+        true,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -5
+    },
+    {
+      "id": 30,
+      "description": "IF[false] at 3 -> IF[true] at 847 -> IF[true] at 897 -> IF[true] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        false,
+        true,
+        true,
+        true,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -1
+    },
+    {
+      "id": 31,
+      "description": "IF[true] at 3 -> IF[true] at 847 -> IF[true] at 897 -> IF[true] at 910 -> IF[true] at 929",
+      "branchChoices": [
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "reachable": true,
+      "hasCheckSig": true,
+      "stackDepthAtEnd": -5
+    }
+  ],
+  "summary": {
+    "totalPaths": 32,
+    "reachablePaths": 32,
+    "pathsWithCheckSig": 32,
+    "pathsWithoutCheckSig": 0,
+    "maxStackDepth": 0,
+    "scriptSizeBytes": 1794
+  }
+}

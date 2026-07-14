@@ -2,7 +2,35 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use super::anf_interpreter::ANFProgram;
+use super::signer::Signer;
+
+/// A shared signer used to sign the P2PKH funding (and terminal fee) inputs of
+/// a deploy/call tx (issue #134). A thin `Arc<dyn Signer>` newtype so the option
+/// structs keep deriving `Debug`/`Clone`/`Default` even though `Signer` is not
+/// `Debug`. Deref to `&dyn Signer` at the sign sites.
+#[derive(Clone)]
+pub struct FundingSigner(pub Arc<dyn Signer>);
+
+impl FundingSigner {
+    /// Borrow the inner signer as a trait object.
+    pub fn as_signer(&self) -> &dyn Signer {
+        self.0.as_ref()
+    }
+}
+
+impl std::fmt::Debug for FundingSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FundingSigner(<signer>)")
+    }
+}
+
+impl<S: Signer + 'static> From<Arc<S>> for FundingSigner {
+    fn from(s: Arc<S>) -> Self {
+        FundingSigner(s)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Transaction types
@@ -52,10 +80,15 @@ pub struct Utxo {
 // ---------------------------------------------------------------------------
 
 /// Options for deploying a contract.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeployOptions {
     pub satoshis: i64,
     pub change_address: Option<String>,
+    /// Signer for the P2PKH funding inputs (issue #134). When the funding UTXOs
+    /// are owned by a different key than the connected deploy signer, set this
+    /// so the funding inputs are signed by their real owner. `None` → the
+    /// connected signer (zero behaviour change).
+    pub funding_signer: Option<FundingSigner>,
 }
 
 /// Options for calling a contract method.
@@ -86,6 +119,58 @@ pub struct CallOptions {
     /// The fee comes from the contract balance. The contract is considered
     /// fully spent after this call (currentUtxo becomes None).
     pub terminal_outputs: Option<Vec<TerminalOutput>>,
+    /// Optional explicit override for data outputs emitted via
+    /// `this.addDataOutput(...)` in the method body. When `None`, the SDK
+    /// resolves data outputs automatically by running the ANF interpreter
+    /// on the method body (the common case). Pass a non-empty `Vec` to
+    /// bypass the interpreter.
+    pub data_outputs: Option<Vec<ContractDataOutput>>,
+    /// Override the call tx's nLockTime field. Defaults to `None` → SDK uses
+    /// `0` (legacy behavior, preserves existing contracts). Set to `Some(height)`
+    /// for contracts that assert `extractLocktime(preimage) >= deadline`
+    /// (e.g., auction `close`/`claim` methods). Threaded through to both the
+    /// non-terminal (`build_call_transaction_ext`) and terminal call-tx
+    /// build sites.
+    pub locktime: Option<u32>,
+    /// Override the nSequence written onto EVERY input of the call tx (issue
+    /// #131). Zero-config defaults: when `locktime` is set and non-zero,
+    /// sequence defaults to `0xfffffffe` (non-final, so consensus actually
+    /// enforces nLockTime); otherwise it stays `0xffffffff` (final, legacy).
+    /// Set explicitly only for RBF or custom relative-locktime scenarios.
+    /// Threaded through the non-terminal and terminal call-tx build sites.
+    pub sequence: Option<u32>,
+    /// Cap the number of P2PKH funding inputs added to a non-terminal call tx
+    /// (issue #133). Funding is chosen by smallest-sufficient, largest-first
+    /// selection (the same `select_utxos` strategy deploy uses). If covering
+    /// the outputs + fee would need more than this many inputs, the call
+    /// returns an error rather than silently sweeping the wallet. `None` → no
+    /// cap.
+    pub max_funding_inputs: Option<usize>,
+    /// Signer for the P2PKH funding (and terminal fee) inputs (issue #134).
+    /// When the funding/fee UTXOs are owned by a different key than the
+    /// connected method signer, set this so those inputs are signed by their
+    /// real owner. The method's own `Sig` args are still signed by the
+    /// connected signer. `None` → the connected signer (zero behaviour change).
+    pub funding_signer: Option<FundingSigner>,
+    /// A single plain P2PKH UTXO added to a TERMINAL call tx purely to pay the
+    /// miner fee (issue #118). A true terminal method pays out the full contract
+    /// balance, so fee would be 0 and ARC rejects; the covenant asserts its exact
+    /// output set, so no change output can absorb a fee. The fee input is added
+    /// BEFORE the OP_PUSH_TX preimage is computed (so hashPrevouts covers it) and
+    /// is consumed entirely as fee — no change output is created. Signed with
+    /// `funding_signer` ?? the connected signer. The covenant's output
+    /// assertions are untouched — only the input side grows.
+    pub fee_utxo: Option<Utxo>,
+}
+
+/// A data output entry — hex-encoded script + satoshis — for the
+/// `CallOptions::data_outputs` fallback API. Same shape as
+/// `calling::ContractOutput` but kept in this module so callers can
+/// construct options without importing from `calling`.
+#[derive(Debug, Clone)]
+pub struct ContractDataOutput {
+    pub script: String,
+    pub satoshis: i64,
 }
 
 /// Specification for an exact output in a terminal method call.
@@ -112,12 +197,20 @@ pub struct OutputSpec {
 pub struct RunarArtifact {
     pub version: String,
     pub contract_name: String,
+    /// Base class the source contract extends. Authoritative stateful signal
+    /// for the issue-#42/#44 terminal sighash subscript trim: a
+    /// StatefulSmartContract with zero mutable fields still needs the trim
+    /// even though `state_fields` is empty. Older artifacts omit it.
+    #[serde(default)]
+    pub parent_class: Option<String>,
     pub abi: Abi,
     pub script: String,
     #[serde(default)]
     pub state_fields: Option<Vec<StateField>>,
     #[serde(default)]
     pub constructor_slots: Option<Vec<ConstructorSlot>>,
+    #[serde(default)]
+    pub code_sep_index_slots: Option<Vec<CodeSepIndexSlot>>,
     #[serde(default, rename = "codeSeparatorIndex")]
     pub code_separator_index: Option<usize>,
     #[serde(default, rename = "codeSeparatorIndices")]
@@ -148,18 +241,45 @@ pub struct AbiMethod {
     pub is_public: bool,
     #[serde(default)]
     pub is_terminal: Option<bool>,
+    /// Unlocking script is prefixed with `_codePart` (issue #100).
+    #[serde(default)]
+    pub uses_code_part: Option<bool>,
+    /// Issue #123: the BIP-143 sighash type this method's preimage/covenant is
+    /// built under (from a `@sighash` directive), e.g. `0x43` for SINGLE|FORKID.
+    /// Absent = default `ALL|FORKID` (0x41); the SDK falls back to 0x41.
+    #[serde(default)]
+    pub sig_hash_type: Option<i64>,
 }
 
 /// A parameter in the ABI.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct AbiParam {
     pub name: String,
     #[serde(rename = "type")]
     pub param_type: String,
+    /// Metadata for expanded FixedArray params. Never set today because
+    /// FixedArray is not a legal method/constructor param type, but the
+    /// field exists for forward compatibility with auto-generated
+    /// constructors that may propagate markers.
+    #[serde(default)]
+    pub fixed_array: Option<FixedArrayInfo>,
+}
+
+/// FixedArray metadata on a state field or ABI param. Present only for
+/// state fields that represent an expanded (possibly nested) FixedArray.
+/// `synthetic_names` is the flat leaf list in declaration order; the SDK
+/// uses it to flatten/unflatten nested Vec/array values.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixedArrayInfo {
+    pub element_type: String,
+    pub length: usize,
+    pub synthetic_names: Vec<String>,
 }
 
 /// A state field definition.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StateField {
     pub name: String,
@@ -172,6 +292,13 @@ pub struct StateField {
     /// (e.g. `"0n"`, `"1000n"`).
     #[serde(default)]
     pub initial_value: Option<serde_json::Value>,
+    /// Metadata for expanded FixedArray state fields. When present, the
+    /// field represents a (possibly nested) array; `fixed_array.length`
+    /// and `fixed_array.element_type` describe the outer shape, and
+    /// `fixed_array.synthetic_names` enumerates the flattened leaf
+    /// property names in declaration order.
+    #[serde(default)]
+    pub fixed_array: Option<FixedArrayInfo>,
 }
 
 /// A constructor slot mapping parameter index to byte offset in the script.
@@ -180,6 +307,17 @@ pub struct StateField {
 pub struct ConstructorSlot {
     pub param_index: usize,
     pub byte_offset: usize,
+}
+
+/// A codeSepIndex slot describing where a codeSeparatorIndex placeholder
+/// (OP_0) resides in the template script. The SDK substitutes these at
+/// deployment time with the adjusted codeSeparatorIndex value that accounts
+/// for constructor arg expansion.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeSepIndexSlot {
+    pub byte_offset: usize,
+    pub code_sep_index: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +339,19 @@ pub enum SdkValue {
     /// Pass this as an arg to `call()` for params of type `Sig` or `PubKey` —
     /// the SDK will compute the real value from the signer.
     Auto,
+    /// Producer-side marker for the deliberately-empty branch of an
+    /// OR-CHECKSIG method (issue #106). Encodes as `OP_0` (a single `0x00`
+    /// byte, i.e. an empty signature push) and is SKIPPED by the auto-sig
+    /// signing pass — no signature is ever computed for this slot. Pass it for
+    /// the non-matching `checkSig(sig, pk)` branch so BIP146 NULLFAIL is
+    /// satisfied (the failing CHECKSIG sees an empty sig and returns false
+    /// instead of aborting). Coexists with `Auto` at the same call:
+    /// `[Auto, EmptySig]` signs only the Auto slot.
+    EmptySig,
+    /// A (possibly nested) array of values. Used for FixedArray state
+    /// fields. The SDK flattens this into positional scalar slots keyed
+    /// by `fixed_array.synthetic_names` when serializing state.
+    Array(Vec<SdkValue>),
 }
 
 impl SdkValue {
@@ -439,6 +590,15 @@ mod tests {
     }
 
     #[test]
+    fn sdk_value_empty_sig() {
+        // Issue #106: EmptySig is a distinct unit variant from Auto/Bytes.
+        let v = SdkValue::EmptySig;
+        assert_eq!(v, SdkValue::EmptySig);
+        assert_ne!(SdkValue::EmptySig, SdkValue::Auto);
+        assert_ne!(SdkValue::EmptySig, SdkValue::Bytes(String::new()));
+    }
+
+    #[test]
     #[should_panic(expected = "non-numeric")]
     fn sdk_value_as_int_panics_on_bool() {
         SdkValue::Bool(true).as_int();
@@ -472,6 +632,7 @@ mod tests {
         let opts = DeployOptions {
             satoshis: 1000,
             change_address: Some("maddr".to_string()),
+            funding_signer: None,
         };
         assert_eq!(opts.satoshis, 1000);
         assert_eq!(opts.change_address.as_deref(), Some("maddr"));
@@ -516,9 +677,15 @@ pub struct PreparedCall {
     pub(crate) resolved_args: Vec<SdkValue>,
     pub(crate) method_selector_hex: String,
     pub(crate) is_stateful: bool,
+    /// True when the contract extends StatefulSmartContract (from artifact
+    /// `parent_class`), independent of whether it has mutable state fields.
+    /// Gates the issue-#42/#44 terminal sighash subscript trim.
+    pub(crate) parent_stateful: bool,
     pub(crate) is_terminal: bool,
     pub(crate) needs_op_push_tx: bool,
     pub(crate) method_needs_change: bool,
+    /// Unlocking script is prefixed with `_codePart` (issue #100).
+    pub(crate) method_uses_code_part: bool,
     pub(crate) change_pkh_hex: String,
     pub(crate) change_amount: i64,
     pub(crate) method_needs_new_amount: bool,
@@ -530,6 +697,10 @@ pub struct PreparedCall {
     pub(crate) has_multi_output: bool,
     pub(crate) contract_outputs: Vec<ContractOutputEntry>,
     pub(crate) code_sep_idx: i64,
+    /// Pre-resolved intent-intrinsic witness hex (PUSHDATA-encoded
+    /// `_prevOutScript_*` followed by `_serialisedOutputs`, ABI order).
+    /// Empty when the method has no auto-injected intent params.
+    pub(crate) intent_witness_hex: String,
 }
 
 /// A contract output entry stored in PreparedCall (script + satoshis).

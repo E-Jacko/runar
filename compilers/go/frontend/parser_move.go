@@ -81,6 +81,8 @@ const (
 	moveTokPercentEq // %=
 	moveTokQuestion  // ?
 	moveTokArrow     // ->
+	moveTokShl       // <<
+	moveTokShr       // >>
 )
 
 type moveToken struct {
@@ -195,7 +197,9 @@ func (p *moveParser) tokenize(source string) []moveToken {
 		// Numbers
 		if ch >= '0' && ch <= '9' {
 			start := i
+			isHex := false
 			if ch == '0' && i+1 < len(source) && (source[i+1] == 'x' || source[i+1] == 'X') {
+				isHex = true
 				i += 2
 				col += 2
 				for i < len(source) && moveIsHexDigit(source[i]) {
@@ -209,12 +213,20 @@ func (p *moveParser) tokenize(source string) []moveToken {
 				}
 			}
 			// Skip trailing 'u8', 'u64', etc.
-			if i < len(source) && source[i] == 'u' {
+			if !isHex && i < len(source) && source[i] == 'u' {
 				i++
 				col++
 				for i < len(source) && source[i] >= '0' && source[i] <= '9' {
 					i++
 					col++
+				}
+			}
+			// Hex literals with even digit count → ByteString; otherwise a numeric literal.
+			if isHex {
+				hexDigits := source[start+2 : i]
+				if len(hexDigits) > 0 && len(hexDigits)%2 == 0 {
+					tokens = append(tokens, moveToken{kind: moveTokString, value: hexDigits, line: line, col: startCol})
+					continue
 				}
 			}
 			tokens = append(tokens, moveToken{kind: moveTokNumber, value: source[start:i], line: line, col: startCol})
@@ -275,6 +287,10 @@ func (p *moveParser) tokenize(source string) []moveToken {
 				twoKind = moveTokPercentEq
 			case "->":
 				twoKind = moveTokArrow
+			case "<<":
+				twoKind = moveTokShl
+			case ">>":
+				twoKind = moveTokShr
 			default:
 				found = false
 			}
@@ -478,6 +494,55 @@ var moveBuiltinMap = map[string]string{
 	"len":             "len",
 	"pack":            "pack",
 	"unpack":          "unpack",
+	// Post-quantum signature verification (FIPS 205 SLH-DSA parameter sets).
+	// Both snake_case and pre-camelCased forms are accepted.
+	"verify_wots":              "verifyWOTS",
+	"verifyWots":               "verifyWOTS",
+	"verifyWOTS":               "verifyWOTS",
+	"verify_slhdsa_sha2_128s":  "verifySLHDSA_SHA2_128s",
+	"verify_slh_dsa_sha2_128s": "verifySLHDSA_SHA2_128s",
+	"verifySlhdsaSha2128s":     "verifySLHDSA_SHA2_128s",
+	"verifySlhDsaSha2128s":     "verifySLHDSA_SHA2_128s",
+	"verify_slhdsa_sha2_128f":  "verifySLHDSA_SHA2_128f",
+	"verify_slh_dsa_sha2_128f": "verifySLHDSA_SHA2_128f",
+	"verifySlhdsaSha2128f":     "verifySLHDSA_SHA2_128f",
+	"verifySlhDsaSha2128f":     "verifySLHDSA_SHA2_128f",
+	"verify_slhdsa_sha2_192s":  "verifySLHDSA_SHA2_192s",
+	"verify_slh_dsa_sha2_192s": "verifySLHDSA_SHA2_192s",
+	"verifySlhdsaSha2192s":     "verifySLHDSA_SHA2_192s",
+	"verifySlhDsaSha2192s":     "verifySLHDSA_SHA2_192s",
+	"verify_slhdsa_sha2_192f":  "verifySLHDSA_SHA2_192f",
+	"verify_slh_dsa_sha2_192f": "verifySLHDSA_SHA2_192f",
+	"verifySlhdsaSha2192f":     "verifySLHDSA_SHA2_192f",
+	"verifySlhDsaSha2192f":     "verifySLHDSA_SHA2_192f",
+	"verify_slhdsa_sha2_256s":  "verifySLHDSA_SHA2_256s",
+	"verify_slh_dsa_sha2_256s": "verifySLHDSA_SHA2_256s",
+	"verifySlhdsaSha2256s":     "verifySLHDSA_SHA2_256s",
+	"verifySlhDsaSha2256s":     "verifySLHDSA_SHA2_256s",
+	"verify_slhdsa_sha2_256f":  "verifySLHDSA_SHA2_256f",
+	"verify_slh_dsa_sha2_256f": "verifySLHDSA_SHA2_256f",
+	"verifySlhdsaSha2256f":     "verifySLHDSA_SHA2_256f",
+	"verifySlhDsaSha2256f":     "verifySLHDSA_SHA2_256f",
+	// P-256 EC builtins
+	"p256_add":               "p256Add",
+	"p256_mul":               "p256Mul",
+	"p256_mul_gen":           "p256MulGen",
+	"p256_negate":            "p256Negate",
+	"p256_on_curve":          "p256OnCurve",
+	"p256_encode_compressed": "p256EncodeCompressed",
+	"verify_ecdsa_p256":      "verifyECDSA_P256",
+	// P-384 EC builtins
+	"p384_add":               "p384Add",
+	"p384_mul":               "p384Mul",
+	"p384_mul_gen":           "p384MulGen",
+	"p384_negate":            "p384Negate",
+	"p384_on_curve":          "p384OnCurve",
+	"p384_encode_compressed": "p384EncodeCompressed",
+	"verify_ecdsa_p384":      "verifyECDSA_P384",
+	// Pre-camelCased forms also accepted (matches the canonical TS Move parser,
+	// whose regex preserves the literal `_P` boundary).
+	"verifyECDSA_P256":        "verifyECDSA_P256",
+	"verifyECDSA_P384":        "verifyECDSA_P384",
 }
 
 func moveMapBuiltin(name string) string {
@@ -520,6 +585,11 @@ func (p *moveParser) parseModule() (*ContractNode, error) {
 		p.skipUseDecl()
 	}
 
+	// `unsafe module Name { ... }` marks an UnsafeSmartContract — the
+	// asm-escape-hatch base class. Plain `module Name { ... }` infers
+	// SmartContract / StatefulSmartContract structurally as before.
+	isUnsafe := p.matchIdent("unsafe")
+
 	// module Name { ... }
 	if !p.matchIdent("module") {
 		return nil, fmt.Errorf("expected 'module' keyword")
@@ -534,6 +604,9 @@ func (p *moveParser) parseModule() (*ContractNode, error) {
 	var properties []PropertyNode
 	var methods []MethodNode
 	parentClass := "SmartContract" // default
+	if isUnsafe {
+		parentClass = "UnsafeSmartContract"
+	}
 
 	for !p.check(moveTokRBrace) && !p.check(moveTokEOF) {
 		// Skip use declarations inside the module
@@ -547,7 +620,9 @@ func (p *moveParser) parseModule() (*ContractNode, error) {
 			isStateful := p.checkIdent("resource")
 			if isStateful {
 				p.advance() // skip "resource"
-				parentClass = "StatefulSmartContract"
+				if !isUnsafe {
+					parentClass = "StatefulSmartContract"
+				}
 			}
 			props := p.parseMoveStruct()
 			properties = append(properties, props...)
@@ -556,7 +631,10 @@ func (p *moveParser) parseModule() (*ContractNode, error) {
 
 		// public fun or fun
 		if p.checkIdent("public") || p.checkIdent("fun") {
-			method := p.parseMoveFunction()
+			method, hasMutRecv := p.parseMoveFunction()
+			if hasMutRecv && !isUnsafe {
+				parentClass = "StatefulSmartContract"
+			}
 			methods = append(methods, method)
 			continue
 		}
@@ -615,12 +693,17 @@ func (p *moveParser) parseMoveStruct() []PropertyNode {
 
 		p.expect(moveTokColon)
 
-		typeName := p.parseMoveTypeName()
-		typeNode := moveMapType(typeName)
+		// Fields marked `&mut T` become mutable properties on the contract.
+		// Plain `T` or `&T` are readonly.
+		readonly := true
+		if p.check(moveTokAmp) {
+			p.advance()
+			if p.matchIdent("mut") {
+				readonly = false
+			}
+		}
 
-		// Determine readonly: by default all fields in a Move resource are mutable
-		// But if the module uses SmartContract parent, fields should be readonly
-		readonly := true // default to readonly; will be overridden for StatefulSmartContract later
+		typeNode := p.parseMoveTypeNode()
 
 		// Optional initializer: = value
 		var initializer Expression
@@ -667,9 +750,22 @@ func (p *moveParser) parseMoveTypeName() string {
 		for depth > 0 && !p.check(moveTokEOF) {
 			if p.check(moveTokLt) {
 				depth++
+				p.advance()
+				continue
 			}
 			if p.check(moveTokGt) {
 				depth--
+				p.advance()
+				continue
+			}
+			if p.check(moveTokShr) {
+				// `>>` closes two nested generic argument lists at once.
+				depth -= 2
+				if depth < 0 {
+					depth = 0
+				}
+				p.advance()
+				continue
 			}
 			p.advance()
 		}
@@ -678,11 +774,108 @@ func (p *moveParser) parseMoveTypeName() string {
 	return name
 }
 
+// parseMoveTypeNode parses a Move-style type into a TypeNode, including
+// nested `FixedArray<T, N>` generics. The Move lexer eagerly forms `>>`
+// as a shift token, so when a generic argument list close encounters
+// `>>` we split it in place into two `>` tokens.
+func (p *moveParser) parseMoveTypeNode() TypeNode {
+	// Handle & references
+	if p.match(moveTokAmp) {
+		if p.matchIdent("mut") {
+			// &mut Type
+		}
+	}
+
+	nameTok := p.expect(moveTokIdent)
+	name := nameTok.value
+
+	// Handle path types: module::Type
+	for p.match(moveTokColonColon) {
+		nextTok := p.expect(moveTokIdent)
+		name = nextTok.value
+	}
+
+	// FixedArray<T, N> — nestable. Closes split `>>` shift tokens.
+	if name == "FixedArray" && p.check(moveTokLt) {
+		p.advance() // <
+		inner := p.parseMoveTypeNode()
+		p.expect(moveTokComma)
+		lenTok := p.expect(moveTokNumber)
+		length := 0
+		if bi := new(big.Int); bi != nil {
+			if _, ok := bi.SetString(lenTok.value, 0); ok && bi.IsInt64() && bi.Sign() >= 0 {
+				length = int(bi.Int64())
+			} else {
+				p.addError(fmt.Sprintf("FixedArray length must be a non-negative integer literal, got %q", lenTok.value))
+			}
+		}
+		p.consumeMoveGenericClose()
+		return FixedArrayType{Element: inner, Length: length}
+	}
+
+	// vector<T> => ByteString (legacy behaviour preserved)
+	if name == "vector" && p.check(moveTokLt) {
+		p.advance() // <
+		// Skip the inner type entirely — we don't model dynamic-length vectors.
+		p.parseMoveTypeNode()
+		p.consumeMoveGenericClose()
+		return PrimitiveType{Name: "ByteString"}
+	}
+
+	// Generic types we don't model: skip the arg list balancing nested generics.
+	if p.match(moveTokLt) {
+		depth := 1
+		for depth > 0 && !p.check(moveTokEOF) {
+			if p.check(moveTokLt) {
+				depth++
+				p.advance()
+				continue
+			}
+			if p.check(moveTokGt) {
+				depth--
+				p.advance()
+				continue
+			}
+			if p.check(moveTokShr) {
+				depth -= 2
+				if depth < 0 {
+					depth = 0
+				}
+				p.advance()
+				continue
+			}
+			p.advance()
+		}
+	}
+
+	return moveMapType(name)
+}
+
+// consumeMoveGenericClose closes a generic-argument list. Accepts either
+// a plain `>` or splits a `>>` shift token in place into two `>` so that
+// an enclosing generic close can consume the second half.
+func (p *moveParser) consumeMoveGenericClose() {
+	if p.check(moveTokGt) {
+		p.advance()
+		return
+	}
+	if p.check(moveTokShr) {
+		// Mutate the current `>>` into `>` in place — the next close will
+		// consume the remaining `>`.
+		tok := &p.tokens[p.pos]
+		tok.kind = moveTokGt
+		tok.value = ">"
+		tok.col++
+		return
+	}
+	p.expect(moveTokGt)
+}
+
 // ---------------------------------------------------------------------------
 // Function parsing
 // ---------------------------------------------------------------------------
 
-func (p *moveParser) parseMoveFunction() MethodNode {
+func (p *moveParser) parseMoveFunction() (MethodNode, bool) {
 	loc := p.loc()
 	visibility := "private"
 
@@ -703,14 +896,28 @@ func (p *moveParser) parseMoveFunction() MethodNode {
 	nameTok := p.expect(moveTokIdent)
 	name := snakeToCamel(nameTok.value)
 
-	params := p.parseMoveParams()
+	params, hasMutRecv := p.parseMoveParams()
 
 	// Optional return type: : Type
+	hasReturnType := false
 	if p.match(moveTokColon) {
-		p.parseMoveTypeName() // skip return type
+		p.parseMoveTypeName() // skip return type name
+		hasReturnType = true
 	}
 
 	body := p.parseMoveBlock()
+
+	// Move allows an implicit return of the final expression when the function
+	// declares a return type. Convert the trailing expression statement into
+	// an explicit return so downstream type inference can see it.
+	if hasReturnType && len(body) > 0 {
+		if last, ok := body[len(body)-1].(ExpressionStmt); ok {
+			body[len(body)-1] = ReturnStmt{
+				Value:          last.Expr,
+				SourceLocation: last.SourceLocation,
+			}
+		}
+	}
 
 	return MethodNode{
 		Name:           name,
@@ -718,12 +925,13 @@ func (p *moveParser) parseMoveFunction() MethodNode {
 		Body:           body,
 		Visibility:     visibility,
 		SourceLocation: loc,
-	}
+	}, hasMutRecv
 }
 
-func (p *moveParser) parseMoveParams() []ParamNode {
+func (p *moveParser) parseMoveParams() ([]ParamNode, bool) {
 	p.expect(moveTokLParen)
 	var params []ParamNode
+	hasMutRecv := false
 
 	for !p.check(moveTokRParen) && !p.check(moveTokEOF) {
 		// Skip &self, self, &mut self, contract: &ContractName
@@ -737,14 +945,12 @@ func (p *moveParser) parseMoveParams() []ParamNode {
 
 		// Check for & prefix
 		isRef := false
-		isMut := false
 		if p.check(moveTokAmp) {
 			isRef = true
 			p.advance()
 			if p.matchIdent("mut") {
-				isMut = true
+				hasMutRecv = true
 			}
-			_ = isMut
 		}
 
 		nameTok := p.expect(moveTokIdent)
@@ -756,7 +962,7 @@ func (p *moveParser) parseMoveParams() []ParamNode {
 		if p.check(moveTokAmp) {
 			p.advance()
 			if p.matchIdent("mut") {
-				// &mut Type
+				hasMutRecv = true
 			}
 		}
 
@@ -785,7 +991,7 @@ func (p *moveParser) parseMoveParams() []ParamNode {
 	}
 
 	p.expect(moveTokRParen)
-	return params
+	return params, hasMutRecv
 }
 
 // ---------------------------------------------------------------------------
@@ -796,13 +1002,84 @@ func (p *moveParser) parseMoveBlock() []Statement {
 	p.expect(moveTokLBrace)
 	var stmts []Statement
 	for !p.check(moveTokRBrace) && !p.check(moveTokEOF) {
+		// Move permits stray semicolons as empty-statement terminators after a
+		// block-valued expression (e.g. `};` after an if/while body). Skip them
+		// so they don't break parsing.
+		if p.match(moveTokSemicolon) {
+			continue
+		}
 		stmt := p.parseMoveStatement()
 		if stmt != nil {
 			stmts = append(stmts, stmt)
 		}
 	}
 	p.expect(moveTokRBrace)
-	return stmts
+	return foldMoveWhileAsFor(stmts)
+}
+
+// foldMoveWhileAsFor folds the canonical Move bounded-loop pattern
+//
+//	let i: Int = K;
+//	while (i < N) { ...; i = i + S; }
+//
+// into a single ForStmt whose init/condition/update match what TypeScript's
+// native for-loop would produce, so downstream ANF lowering emits identical
+// bounded-loop IR across all formats.
+func foldMoveWhileAsFor(stmts []Statement) []Statement {
+	if len(stmts) == 0 {
+		return stmts
+	}
+	out := make([]Statement, 0, len(stmts))
+	for i := 0; i < len(stmts); i++ {
+		s := stmts[i]
+		if i+1 < len(stmts) {
+			if decl, ok := s.(VariableDeclStmt); ok {
+				if forStmt, ok2 := stmts[i+1].(ForStmt); ok2 {
+					if initDecl, ok3 := interface{}(forStmt.Init).(VariableDeclStmt); ok3 && initDecl.Name == "_w" {
+						iterName := decl.Name
+						cond, condOk := forStmt.Condition.(BinaryExpr)
+						if condOk {
+							if leftId, lok := cond.Left.(Identifier); lok && leftId.Name == iterName {
+								if len(forStmt.Body) > 0 {
+									last := forStmt.Body[len(forStmt.Body)-1]
+									if assign, aok := last.(AssignmentStmt); aok {
+										if tgtId, tok := assign.Target.(Identifier); tok && tgtId.Name == iterName {
+											if rhs, rok := assign.Value.(BinaryExpr); rok && rhs.Op == "+" {
+												if lId, lidOk := rhs.Left.(Identifier); lidOk && lId.Name == iterName {
+													trimmed := forStmt.Body[:len(forStmt.Body)-1]
+													newFor := ForStmt{
+														Init: VariableDeclStmt{
+															Name:           iterName,
+															Type:           decl.Type,
+															Mutable:        true,
+															Init:           decl.Init,
+															SourceLocation: decl.SourceLocation,
+														},
+														Condition: cond,
+														Update: ExpressionStmt{
+															Expr:           IncrementExpr{Operand: Identifier{Name: iterName}, Prefix: false},
+															SourceLocation: forStmt.SourceLocation,
+														},
+														Body:           trimmed,
+														SourceLocation: forStmt.SourceLocation,
+													}
+													out = append(out, newFor)
+													i++ // skip consumed while
+													continue
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,20 +1382,36 @@ func (p *moveParser) parseMoveEquality() Expression {
 }
 
 func (p *moveParser) parseMoveComparison() Expression {
-	left := p.parseMoveAdditive()
+	left := p.parseMoveShift()
 	for {
 		if p.match(moveTokLt) {
-			right := p.parseMoveAdditive()
+			right := p.parseMoveShift()
 			left = BinaryExpr{Op: "<", Left: left, Right: right}
 		} else if p.match(moveTokLtEq) {
-			right := p.parseMoveAdditive()
+			right := p.parseMoveShift()
 			left = BinaryExpr{Op: "<=", Left: left, Right: right}
 		} else if p.match(moveTokGt) {
-			right := p.parseMoveAdditive()
+			right := p.parseMoveShift()
 			left = BinaryExpr{Op: ">", Left: left, Right: right}
 		} else if p.match(moveTokGtEq) {
-			right := p.parseMoveAdditive()
+			right := p.parseMoveShift()
 			left = BinaryExpr{Op: ">=", Left: left, Right: right}
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+func (p *moveParser) parseMoveShift() Expression {
+	left := p.parseMoveAdditive()
+	for {
+		if p.match(moveTokShl) {
+			right := p.parseMoveAdditive()
+			left = BinaryExpr{Op: "<<", Left: left, Right: right}
+		} else if p.match(moveTokShr) {
+			right := p.parseMoveAdditive()
+			left = BinaryExpr{Op: ">>", Left: left, Right: right}
 		} else {
 			break
 		}
@@ -1286,6 +1579,16 @@ func (p *moveParser) parseMovePrimary() Expression {
 		// Function call
 		if p.check(moveTokLParen) {
 			args := p.parseMoveCallArgs()
+			// Free helper functions in Move take `contract: &Self` as the first
+			// argument. The parser drops `contract` from helper parameter lists
+			// on the definition side, so strip a matching `contract`/`self` at
+			// call sites as well. The anf lowering pass then routes the resulting
+			// bare-identifier call through the private-method inlining path.
+			if len(args) > 0 {
+				if id, ok := args[0].(Identifier); ok && (id.Name == "contract" || id.Name == "self") {
+					args = args[1:]
+				}
+			}
 			return CallExpr{Callee: Identifier{Name: mappedName}, Args: args}
 		}
 
@@ -1297,11 +1600,30 @@ func (p *moveParser) parseMovePrimary() Expression {
 		p.expect(moveTokRParen)
 		return expr
 
+	case moveTokLBracket:
+		// Array literal: [a, b, c]
+		return p.parseMoveArrayLiteral()
+
 	default:
 		p.addError(fmt.Sprintf("line %d: unexpected token %q", tok.line, tok.value))
 		p.advance()
 		return BigIntLiteral{Value: big.NewInt(0)}
 	}
+}
+
+// parseMoveArrayLiteral handles bare [a, b, c] array-literal expressions.
+func (p *moveParser) parseMoveArrayLiteral() Expression {
+	p.expect(moveTokLBracket)
+	var elements []Expression
+	for !p.check(moveTokRBracket) && !p.check(moveTokEOF) {
+		elem := p.parseMoveExpression()
+		elements = append(elements, elem)
+		if !p.match(moveTokComma) {
+			break
+		}
+	}
+	p.expect(moveTokRBracket)
+	return ArrayLiteralExpr{Elements: elements}
 }
 
 func (p *moveParser) parseMoveCallArgs() []Expression {

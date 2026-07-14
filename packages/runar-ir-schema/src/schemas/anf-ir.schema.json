@@ -70,7 +70,18 @@
       "additionalProperties": false,
       "properties": {
         "name": { "type": "string", "minLength": 1 },
-        "value": { "$ref": "#/$defs/ANFValue" }
+        "value": { "$ref": "#/$defs/ANFValue" },
+        "sourceLoc": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Debug-only: source location of the originating AST node. Not part of conformance.",
+          "required": ["file", "line", "column"],
+          "properties": {
+            "file": { "type": "string" },
+            "line": { "type": "integer", "minimum": 0 },
+            "column": { "type": "integer", "minimum": 0 }
+          }
+        }
       }
     },
     "ANFValue": {
@@ -88,7 +99,12 @@
         { "$ref": "#/$defs/UpdateProp" },
         { "$ref": "#/$defs/GetStateScript" },
         { "$ref": "#/$defs/CheckPreimage" },
-        { "$ref": "#/$defs/AddOutput" }
+        { "$ref": "#/$defs/DeserializeState" },
+        { "$ref": "#/$defs/AddOutput" },
+        { "$ref": "#/$defs/AddRawOutput" },
+        { "$ref": "#/$defs/AddDataOutput" },
+        { "$ref": "#/$defs/ArrayLiteral" },
+        { "$ref": "#/$defs/RawScript" }
       ]
     },
     "LoadParam": {
@@ -133,7 +149,11 @@
         "op": { "type": "string", "minLength": 1 },
         "left": { "type": "string", "minLength": 1 },
         "right": { "type": "string", "minLength": 1 },
-        "result_type": { "type": "string", "minLength": 1 }
+        "result_type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Operand type hint: 'bytes' for ByteString/PubKey/Sig/Sha256 etc., omitted for numeric"
+        }
       }
     },
     "UnaryOp": {
@@ -143,7 +163,12 @@
       "properties": {
         "kind": { "const": "unary_op" },
         "op": { "type": "string", "minLength": 1 },
-        "operand": { "type": "string", "minLength": 1 }
+        "operand": { "type": "string", "minLength": 1 },
+        "result_type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Operand type hint: 'bytes' for ByteString, omitted for numeric"
+        }
       }
     },
     "Call": {
@@ -192,7 +217,7 @@
     },
     "Loop": {
       "type": "object",
-      "required": ["kind", "count", "body", "iterVar"],
+      "required": ["kind", "count", "body", "iterVar", "start", "step"],
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "loop" },
@@ -201,7 +226,14 @@
           "type": "array",
           "items": { "$ref": "#/$defs/ANFBinding" }
         },
-        "iterVar": { "type": "string", "minLength": 1 }
+        "iterVar": { "type": "string", "minLength": 1 },
+        "start": {
+          "oneOf": [
+            { "type": "integer" },
+            { "type": "string" }
+          ]
+        },
+        "step": { "type": "integer", "enum": [1, -1] }
       }
     },
     "Assert": {
@@ -210,7 +242,8 @@
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "assert" },
-        "value": { "type": "string", "minLength": 1 }
+        "value": { "type": "string", "minLength": 1 },
+        "isAutoInjectedStateCheck": { "type": "boolean" }
       }
     },
     "UpdateProp": {
@@ -240,9 +273,22 @@
         "preimage": { "type": "string", "minLength": 1 }
       }
     },
+    "DeserializeState": {
+      "type": "object",
+      "required": ["kind", "preimage"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "deserialize_state" },
+        "preimage": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Reference to a temp name holding the verified preimage"
+        }
+      }
+    },
     "AddOutput": {
       "type": "object",
-      "required": ["kind", "satoshis", "stateValues"],
+      "required": ["kind", "satoshis", "stateValues", "preimage"],
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "add_output" },
@@ -250,7 +296,56 @@
         "stateValues": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
+        },
+        "preimage": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Reference to a temp holding the verified preimage (for codePart extraction)"
         }
+      }
+    },
+    "AddRawOutput": {
+      "type": "object",
+      "required": ["kind", "satoshis", "scriptBytes"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "add_raw_output" },
+        "satoshis": { "type": "string", "minLength": 1 },
+        "scriptBytes": { "type": "string", "minLength": 1 }
+      }
+    },
+    "AddDataOutput": {
+      "type": "object",
+      "required": ["kind", "satoshis", "scriptBytes"],
+      "additionalProperties": false,
+      "description": "Additional transaction output emitted by a stateful method. Included in the auto-computed continuation hash after state outputs and before the change output. Wire format matches add_raw_output: amount(8LE) + varint(scriptLen) + scriptBytes.",
+      "properties": {
+        "kind": { "const": "add_data_output" },
+        "satoshis": { "type": "string", "minLength": 1 },
+        "scriptBytes": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ArrayLiteral": {
+      "type": "object",
+      "required": ["kind", "elements"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "array_literal" },
+        "elements": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "RawScript": {
+      "type": "object",
+      "required": ["kind", "bytes", "in_arity", "out_arity"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "raw_script" },
+        "bytes": { "type": "string", "pattern": "^([0-9a-fA-F]{2})*$" },
+        "in_arity": { "type": "integer", "minimum": 0 },
+        "out_arity": { "type": "integer", "minimum": 0 }
       }
     }
   }

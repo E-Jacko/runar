@@ -3,6 +3,8 @@
 //! These types mirror the TypeScript `runar-ast.ts` definitions. They represent
 //! the parsed contract structure before ANF lowering.
 
+use num_bigint::BigInt;
+
 // ---------------------------------------------------------------------------
 // Source locations
 // ---------------------------------------------------------------------------
@@ -34,6 +36,8 @@ pub enum PrimitiveTypeName {
     RabinSig,
     RabinPubKey,
     Point,
+    P256Point,
+    P384Point,
     Void,
 }
 
@@ -53,6 +57,8 @@ impl PrimitiveTypeName {
             "RabinSig" => Some(PrimitiveTypeName::RabinSig),
             "RabinPubKey" => Some(PrimitiveTypeName::RabinPubKey),
             "Point" => Some(PrimitiveTypeName::Point),
+            "P256Point" => Some(PrimitiveTypeName::P256Point),
+            "P384Point" => Some(PrimitiveTypeName::P384Point),
             "void" => Some(PrimitiveTypeName::Void),
             _ => None,
         }
@@ -73,6 +79,8 @@ impl PrimitiveTypeName {
             PrimitiveTypeName::RabinSig => "RabinSig",
             PrimitiveTypeName::RabinPubKey => "RabinPubKey",
             PrimitiveTypeName::Point => "Point",
+            PrimitiveTypeName::P256Point => "P256Point",
+            PrimitiveTypeName::P384Point => "P384Point",
             PrimitiveTypeName::Void => "void",
         }
     }
@@ -104,6 +112,15 @@ pub struct ContractNode {
     pub source_file: String,
 }
 
+/// One level of the synthetic-array chain attached to expanded leaf
+/// properties. Mirrors the TS `__syntheticArrayChain` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticArrayLevel {
+    pub base: String,
+    pub index: usize,
+    pub length: usize,
+}
+
 /// A contract property declaration.
 #[derive(Debug, Clone)]
 pub struct PropertyNode {
@@ -111,7 +128,19 @@ pub struct PropertyNode {
     pub prop_type: TypeNode,
     pub readonly: bool,
     pub initializer: Option<Expression>,
+    /// Issue #109: set by the parser when a `/** @embedAlways */` (or
+    /// `// @embedAlways`) comment directive immediately precedes a readonly
+    /// field. Opts the field OUT of dead-code elimination so its deploy-time
+    /// bytes survive into the on-chain locking script (a constructor slot).
+    /// Comment-directive form (not a decorator) keeps it portable across
+    /// surface formats. Only meaningful on readonly fields.
+    pub embed_always: bool,
     pub source_location: SourceLocation,
+    /// Non-empty for synthetic scalar leaves produced by the
+    /// expand-fixed-arrays pass. Outermost level first. Used by the
+    /// assembler to re-group these back into a single (possibly nested)
+    /// FixedArray ABI/state entry.
+    pub synthetic_array_chain: Option<Vec<SyntheticArrayLevel>>,
 }
 
 /// A method (constructor or named method).
@@ -121,6 +150,13 @@ pub struct MethodNode {
     pub params: Vec<ParamNode>,
     pub body: Vec<Statement>,
     pub visibility: Visibility,
+    /// Issue #123: the BIP-143 sighash type declared via a
+    /// `/** @sighash <FLAGS> */` directive on a public method (e.g. `0x43`
+    /// for SINGLE|FORKID). `None` = the default `ALL|FORKID` (0x41),
+    /// byte-identical to the historically-pinned mode. Drives the
+    /// auto-injected preimage-type assert, the OP_PUSH_TX binding flag, the
+    /// ABI `sigHashType`, and the SDK-side preimage/signature construction.
+    pub sighash_type: Option<i64>,
     pub source_location: SourceLocation,
 }
 
@@ -267,6 +303,11 @@ pub enum Expression {
     CallExpr {
         callee: Box<Expression>,
         args: Vec<Expression>,
+        /// Set only for the expression form `asm<T>({...})` of the asm
+        /// compiler intrinsic. Carries the captured primitive return type
+        /// ("bigint", "boolean", or "ByteString"); `None` for the statement
+        /// form and for every non-asm call.
+        asm_return_type: Option<String>,
     },
     MemberExpr {
         object: Box<Expression>,
@@ -276,7 +317,14 @@ pub enum Expression {
         name: String,
     },
     BigIntLiteral {
-        value: i128,
+        /// Arbitrary-precision integer literal.
+        ///
+        /// Widened from `i128` so 256-bit constants (e.g. the secp256k1 group
+        /// order used in schnorr-zkp's s-bound assert) round-trip losslessly
+        /// from the SWC parser's `num_bigint::BigInt` token through ANF /
+        /// Stack IR and into the final push-encoded Bitcoin Script bytes.
+        /// Mirrors Go's `*big.Int`-backed `BigIntLit` AST node.
+        value: BigInt,
     },
     BoolLiteral {
         value: bool,

@@ -9,6 +9,8 @@
 require "json"
 require "set"
 require_relative "types"
+require_relative "unknown_anf_kind_error"
+require_relative "input_limits"
 
 module RunarCompiler
   module IR
@@ -35,8 +37,16 @@ module RunarCompiler
       deserialize_state
       add_output
       add_raw_output
+      add_data_output
       array_literal
+      raw_script
     ]).freeze
+
+    # Return true if +s+ contains only hex digits (0-9, a-f, A-F).
+    # An empty string is considered valid hex.
+    def self._hex_string?(s)
+      s.match?(/\A[0-9a-fA-F]*\z/)
+    end
 
     # -------------------------------------------------------------------
     # Public API
@@ -46,7 +56,18 @@ module RunarCompiler
     #
     # Parses the JSON, decodes typed constant values, and validates the
     # structure. Raises +ArgumentError+ on any error.
+    #
+    # Rejects oversized (>MAX_IR_BYTES) or deeply-nested (>MAX_IR_NESTING)
+    # payloads with the typed IR::InputLimits::IRSizeExceededError /
+    # IR::InputLimits::IRNestingExceededError BEFORE JSON.parse runs.
+    # BUG-008 follow-up.
     def self.load_ir(source)
+      # DoS-bound guards run before JSON.parse so a malicious payload
+      # cannot exhaust memory (size) or the Ruby fiber stack (nesting)
+      # inside the deserializer.
+      InputLimits.assert_ir_bytes_under_limit(source)
+      InputLimits.assert_ir_nesting_under_limit(source)
+
       begin
         d = JSON.parse(source)
       rescue JSON::ParserError => e
@@ -168,6 +189,27 @@ module RunarCompiler
           end
           if binding.value.body
             errors.concat(_validate_bindings(binding.value.body, method_name))
+          end
+        end
+
+        if kind == "raw_script"
+          body = binding.value.bytes || ""
+          if body.length.odd?
+            errors << "method #{method_name} binding #{binding.name} " \
+                      "raw_script bytes have odd hex length #{body.length}"
+          elsif !_hex_string?(body)
+            errors << "method #{method_name} binding #{binding.name} " \
+                      "raw_script bytes contain non-hex characters"
+          end
+          in_arity = binding.value.in_arity || 0
+          if in_arity < 0
+            errors << "method #{method_name} binding #{binding.name} " \
+                      "raw_script has negative in_arity #{in_arity}"
+          end
+          out_arity = binding.value.out_arity || 0
+          if out_arity < 0
+            errors << "method #{method_name} binding #{binding.name} " \
+                      "raw_script has negative out_arity #{out_arity}"
           end
         end
       end

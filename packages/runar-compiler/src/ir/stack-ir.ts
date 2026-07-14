@@ -18,6 +18,8 @@ export interface StackMethod {
   name: string;
   ops: StackOp[];
   maxStackDepth: number;
+  /** True if the unlocking script is prefixed with `_codePart` (issue #100). */
+  usesCodePart?: boolean;
 }
 
 /** Optional source location for debug source maps. */
@@ -109,6 +111,23 @@ export interface PushCodeSepIndexOp {
   sourceLoc?: StackSourceLoc;
 }
 
+/**
+ * Opaque raw byte span produced by lowering a `raw_script` ANF node.
+ *
+ * Emitted verbatim by the emit pass. Treated as a hard barrier by every
+ * windowed optimizer (peephole) — rules must never bridge across an
+ * adjacent `raw_bytes`. Stack effect is declared via `in_arity` /
+ * `out_arity`; the analyzer reads these to keep depth tracking sound
+ * without inspecting the contents.
+ */
+export interface RawBytesOp {
+  op: 'raw_bytes';
+  bytes: Uint8Array;
+  in_arity: number;
+  out_arity: number;
+  sourceLoc?: StackSourceLoc;
+}
+
 export type StackOp =
   | PushOp
   | DupOp
@@ -123,4 +142,5 @@ export type StackOp =
   | RotOp
   | TuckOp
   | PlaceholderOp
-  | PushCodeSepIndexOp;
+  | PushCodeSepIndexOp
+  | RawBytesOp;

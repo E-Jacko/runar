@@ -23,6 +23,7 @@ export class TestSmartContract {
   private readonly artifact: RunarArtifact;
   readonly constructorArgs: unknown[];
   private readonly lockingScript: Uint8Array;
+  private readonly lockingScriptHex: string;
   private vmOptions: VMOptions;
 
   private constructor(
@@ -32,7 +33,11 @@ export class TestSmartContract {
   ) {
     this.artifact = artifact;
     this.constructorArgs = constructorArgs;
-    this.lockingScript = hexToBytes(artifact.script);
+    this.lockingScriptHex = bakeConstructorArgsIntoScript(
+      artifact,
+      constructorArgs,
+    );
+    this.lockingScript = hexToBytes(this.lockingScriptHex);
     this.vmOptions = vmOptions;
   }
 
@@ -75,10 +80,10 @@ export class TestSmartContract {
   }
 
   /**
-   * Get the locking script as a hex string.
+   * Get the locking script as a hex string (with constructor args baked in).
    */
   getLockingScriptHex(): string {
-    return this.artifact.script;
+    return this.lockingScriptHex;
   }
 
   /**
@@ -141,6 +146,172 @@ export class TestSmartContract {
   getContractName(): string {
     return this.artifact.contractName;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Constructor arg baking
+// ---------------------------------------------------------------------------
+
+/**
+ * Apply the artifact's `constructorSlots` AND `codeSepIndexSlots`
+ * substitutions so the locking script carries the real constructor values
+ * and adjusted codeSeparatorIndex values instead of OP_0 placeholders
+ * (mirrors runar-sdk's `RunarContract.buildCodeScript` exactly).
+ *
+ * Previously `fromArtifact` stored `constructorArgs` but executed the raw
+ * placeholder script, so any comparison against a baked readonly value
+ * failed with `OP_EQUALVERIFY failed` and no hint as to why. The first fix
+ * baked `constructorSlots` only; `codeSepIndexSlots` (emitted for stateful
+ * contracts with variable-length state fields) were still left as OP_0,
+ * diverging from the deployed script bytes.
+ *
+ * - No `constructorSlots` and no `codeSepIndexSlots`: the raw script is
+ *   returned unchanged. Passing non-empty args is fine when the ABI
+ *   declares constructor params — unreferenced readonly properties are
+ *   eliminated by the compiler and simply have no placeholder to fill.
+ * - `constructorSlots` present: every slot's `paramIndex` must resolve to a
+ *   provided arg, and the arg count must match the ABI constructor's param
+ *   count; otherwise this throws instead of silently running placeholders.
+ * - `codeSepIndexSlots` present: each OP_0 placeholder is replaced with the
+ *   adjusted codeSeparatorIndex (template index shifted by constructor-arg
+ *   expansion and earlier codeSepIndex slot expansions), exactly as the
+ *   SDK does at deploy time.
+ */
+function bakeConstructorArgsIntoScript(
+  artifact: RunarArtifact,
+  constructorArgs: unknown[],
+): string {
+  const slots = artifact.constructorSlots;
+  const hasConstructorSlots = !!slots && slots.length > 0;
+  const hasCodeSepSlots =
+    !!artifact.codeSepIndexSlots && artifact.codeSepIndexSlots.length > 0;
+  if (!hasConstructorSlots && !hasCodeSepSlots) {
+    return artifact.script;
+  }
+
+  const abiParams = artifact.abi.constructor?.params ?? [];
+  if (hasConstructorSlots && constructorArgs.length !== abiParams.length) {
+    throw new Error(
+      `TestSmartContract.fromArtifact: contract '${artifact.contractName}' ` +
+        `expects ${abiParams.length} constructor arg(s) ` +
+        `(${abiParams.map((p) => p.name).join(', ')}), got ${constructorArgs.length}`,
+    );
+  }
+
+  type Substitution = { byteOffset: number; encoded: string };
+  const subs: Substitution[] = [];
+
+  if (hasConstructorSlots) {
+    for (const slot of slots!) {
+      const value = constructorArgs[slot.paramIndex];
+      if (value === undefined) {
+        const paramName = abiParams[slot.paramIndex]?.name ?? `#${slot.paramIndex}`;
+        throw new Error(
+          `TestSmartContract.fromArtifact: missing constructor arg '${paramName}' ` +
+            `(paramIndex ${slot.paramIndex}) required by a constructorSlot of ` +
+            `contract '${artifact.contractName}'`,
+        );
+      }
+      subs.push({
+        byteOffset: slot.byteOffset,
+        encoded: encodeConstructorValueHex(value),
+      });
+    }
+  }
+
+  if (hasCodeSepSlots) {
+    for (const rs of resolvedCodeSepSlotValues(artifact, constructorArgs)) {
+      subs.push({
+        byteOffset: rs.templateByteOffset,
+        encoded: encodeConstructorValueHex(BigInt(rs.adjustedValue)),
+      });
+    }
+  }
+
+  // Substitute in descending byte-offset order so earlier splices don't
+  // invalidate later offsets.
+  subs.sort((a, b) => b.byteOffset - a.byteOffset);
+  let script = artifact.script;
+  for (const sub of subs) {
+    const hexOffset = sub.byteOffset * 2;
+    // Replace the 1-byte OP_0 placeholder (2 hex chars) with the encoded push.
+    script = script.slice(0, hexOffset) + sub.encoded + script.slice(hexOffset + 2);
+  }
+  return script;
+}
+
+/**
+ * Resolve the adjusted codeSep index values for all codeSepIndex slots,
+ * processing them in ascending template byte-offset order so that each
+ * slot's value correctly accounts for earlier slots' expansions.
+ *
+ * Mirror of runar-sdk `RunarContract._resolvedCodeSepSlotValues` — a pure
+ * function of (artifact, constructorArgs). `encodeConstructorValueHex`
+ * encodes bigints identically to the SDK's `encodeScriptNumber`
+ * (OP_0 / OP_1..OP_16 / OP_1NEGATE / sign-magnitude LE push), so the
+ * computed shifts are byte-exact.
+ */
+function resolvedCodeSepSlotValues(
+  artifact: RunarArtifact,
+  constructorArgs: unknown[],
+): Array<{ templateByteOffset: number; adjustedValue: number }> {
+  if (!artifact.codeSepIndexSlots || artifact.codeSepIndexSlots.length === 0) {
+    return [];
+  }
+  // Sort by template byte offset ascending (left-to-right in the script)
+  const sorted = [...artifact.codeSepIndexSlots].sort(
+    (a, b) => a.byteOffset - b.byteOffset,
+  );
+  const result: Array<{ templateByteOffset: number; adjustedValue: number }> = [];
+  for (const slot of sorted) {
+    // Compute the fully-adjusted codeSep index: constructor expansion +
+    // expansion from earlier codeSepIndex slots that precede this slot's
+    // codeSepIndex.
+    let shift = 0;
+    if (artifact.constructorSlots) {
+      for (const cs of artifact.constructorSlots) {
+        if (cs.byteOffset < slot.codeSepIndex) {
+          const encoded = encodeConstructorValueHex(constructorArgs[cs.paramIndex]);
+          shift += encoded.length / 2 - 1;
+        }
+      }
+    }
+    for (const prev of result) {
+      if (prev.templateByteOffset < slot.codeSepIndex) {
+        const prevEncoded = encodeConstructorValueHex(BigInt(prev.adjustedValue));
+        shift += prevEncoded.length / 2 - 1;
+      }
+    }
+    result.push({
+      templateByteOffset: slot.byteOffset,
+      adjustedValue: slot.codeSepIndex + shift,
+    });
+  }
+  return result;
+}
+
+/**
+ * Encode a constructor value as a Bitcoin Script push element (hex).
+ * Mirrors runar-sdk's `encodeArg`.
+ */
+function encodeConstructorValueHex(value: unknown): string {
+  if (typeof value === 'bigint' || typeof value === 'number') {
+    const n = typeof value === 'bigint' ? value : BigInt(value);
+    if (n === 0n) return '00'; // OP_0
+    if (n >= 1n && n <= 16n) return (0x50 + Number(n)).toString(16); // OP_1..OP_16
+    if (n === -1n) return '4f'; // OP_1NEGATE
+    return bytesToHex(encodePushData(encodeScriptNumber(n)));
+  }
+  if (typeof value === 'boolean') {
+    return value ? '51' : '00';
+  }
+  if (typeof value === 'string') {
+    // Hex-encoded data (ByteString / PubKey / Sha256 / ...)
+    return bytesToHex(encodePushData(hexToBytes(value)));
+  }
+  throw new Error(
+    `TestSmartContract.fromArtifact: unsupported constructor arg type '${typeof value}'`,
+  );
 }
 
 // ---------------------------------------------------------------------------

@@ -19,10 +19,19 @@
 //! - Local variables are tracked via localNames set
 //! - Properties are checked against the contract
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 
 use super::ast::*;
-use crate::ir::{ANFBinding, ANFMethod, ANFParam, ANFProgram, ANFProperty, ANFValue, SourceLocation};
+use super::sighash_directive::SIGHASH_DEFAULT;
+use super::side_effect_summary::{
+    compute_side_effect_summary, ContinuationShape, SideEffectSummary,
+};
+use crate::ir::{ANFBinding, ANFMethod, ANFParam, ANFProgram, ANFProperty, ANFSyntheticArrayLevel, ANFValue, SourceLocation};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -44,6 +53,7 @@ pub fn lower_to_anf(contract: &ContractNode) -> ANFProgram {
         contract_name: contract.name.clone(),
         properties,
         methods,
+        parent_class: contract.parent_class.clone(),
     }
 }
 
@@ -60,6 +70,16 @@ fn lower_properties(contract: &ContractNode) -> Vec<ANFProperty> {
             prop_type: type_node_to_string(&prop.prop_type),
             readonly: prop.readonly,
             initial_value: prop.initializer.as_ref().and_then(extract_literal_value),
+            synthetic_array_chain: prop.synthetic_array_chain.as_ref().map(|chain| {
+                chain
+                    .iter()
+                    .map(|level| ANFSyntheticArrayLevel {
+                        base: level.base.clone(),
+                        index: level.index,
+                        length: level.length,
+                    })
+                    .collect()
+            }),
         })
         .collect()
 }
@@ -67,19 +87,51 @@ fn lower_properties(contract: &ContractNode) -> Vec<ANFProperty> {
 /// Convert an i128 to a serde_json::Value. Values within i64 range use
 /// Number; larger values fall back to a JSON number via string parsing so
 /// precision is preserved in the IR.
-fn i128_to_json(v: i128) -> serde_json::Value {
-    if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
-        serde_json::Value::Number(serde_json::Number::from(v as i64))
+
+/// Serialise a `num_bigint::BigInt` to a `serde_json::Value` for IR-JSON.
+///
+/// Values within `i64` range serialise as JSON numbers. Larger values
+/// serialise as a JS-style decimal `BigInt` literal — the decimal digits
+/// followed by a literal `n` suffix, quoted as a JSON string. The `n`
+/// suffix is the cross-tier discriminator that distinguishes a decimal
+/// `BigInt` from a hex-encoded `ByteString` literal (both are JSON
+/// strings made of ASCII digits in the all-decimal case, e.g. `"3030"`
+/// is both a valid decimal and a valid hex bytestring).
+///
+/// Mirrors:
+///   - Go: `compilers/go/frontend/anf_lower.go::makeLoadConstInt`
+///   - Python: `compilers/python/runar_compiler/frontend/anf_lower.py::_make_load_const_int`
+///   - TS: `conformance/runner/runner.ts` BigInt canonicalisation
+fn bigint_to_json(v: &num_bigint::BigInt) -> serde_json::Value {
+    use num_traits::ToPrimitive;
+    if let Some(i) = v.to_i64() {
+        serde_json::Value::Number(serde_json::Number::from(i))
     } else {
-        // serde_json can parse arbitrarily large integer strings into Number
-        let s = v.to_string();
-        serde_json::from_str(&s).unwrap_or_else(|_| serde_json::Value::Number(serde_json::Number::from(0)))
+        serde_json::Value::String(format!("{}n", v))
     }
+}
+
+/// Mirrors `flattenAddOutputArgs` in `04-anf-lower.ts`: when
+/// `this.addOutput` is called as `this.addOutput(satoshis, .{ v1, v2, ... })`
+/// (the surface form Zig / Move tuple syntax produce), unwrap the trailing
+/// array literal so each element becomes an individual state value.
+fn flatten_add_output_args(args: &[Expression]) -> Vec<Expression> {
+    if args.len() == 2 {
+        if let Expression::ArrayLiteral { elements } = &args[1] {
+            let mut out = Vec::with_capacity(1 + elements.len());
+            out.push(args[0].clone());
+            for el in elements {
+                out.push(el.clone());
+            }
+            return out;
+        }
+    }
+    args.to_vec()
 }
 
 fn extract_literal_value(expr: &Expression) -> Option<serde_json::Value> {
     match expr {
-        Expression::BigIntLiteral { value } => Some(i128_to_json(*value)),
+        Expression::BigIntLiteral { value } => Some(bigint_to_json(value)),
         Expression::BoolLiteral { value } => Some(serde_json::Value::Bool(*value)),
         Expression::ByteStringLiteral { value } => {
             Some(serde_json::Value::String(value.clone()))
@@ -89,7 +141,7 @@ fn extract_literal_value(expr: &Expression) -> Option<serde_json::Value> {
             operand,
         } => {
             if let Expression::BigIntLiteral { value } = operand.as_ref() {
-                Some(i128_to_json(-*value))
+                Some(bigint_to_json(&(-value)))
             } else {
                 None
             }
@@ -105,43 +157,107 @@ fn extract_literal_value(expr: &Expression) -> Option<serde_json::Value> {
 fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
     let mut result = Vec::new();
 
+    // Single source of truth for "does this method (transitively) mutate
+    // state, emit outputs, or use the preimage?" Shared across the
+    // lowering pass so every public method's auto-injection sees
+    // private-helper effects, not just direct ones.
+    let side_effects = compute_side_effect_summary(contract);
+
+    // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+    // must survive DCE into the locking script. A readonly field no method
+    // references lowers to no `load_prop`, so no constructor slot is emitted
+    // and the field's deploy-time bytes vanish. We inject a `load_prop` + a
+    // `@ref:` alias (the exact shape `const _bind = this.field;` produces) into
+    // the first public method's body — the alias keeps the `load_prop` alive
+    // through dead-binding DCE, and stack lowering threads the pushed value
+    // through and NIPs it at method end. One slot in the deployed script
+    // suffices; every spending branch shares it.
+    let embed_fields: Vec<&PropertyNode> = contract
+        .properties
+        .iter()
+        .filter(|p| p.readonly && p.embed_always)
+        .collect();
+    let mut embed_injected = false;
+
     // Lower constructor (the TS reference includes the constructor in output)
-    let mut ctor_ctx = LoweringContext::new(contract);
+    let mut ctor_ctx = LoweringContext::with_effects(contract, Some(side_effects.clone()));
+    for p in &contract.constructor.params {
+        ctor_ctx.register_param_type(&p.name, &type_node_to_string(&p.param_type));
+    }
     lower_statements(&contract.constructor.body, &mut ctor_ctx);
     result.push(ANFMethod {
         name: "constructor".to_string(),
         params: lower_params(&contract.constructor.params),
         body: ctor_ctx.bindings,
         is_public: false,
+        sighash_type: None,
     });
 
     // Lower each method (including private methods as separate entries)
     for method in &contract.methods {
-        let mut method_ctx = LoweringContext::new(contract);
+        let mut method_ctx = LoweringContext::with_effects(contract, Some(side_effects.clone()));
+        // Issue #123: a non-default @sighash mode drives the OP_PUSH_TX binding
+        // flag for any checkPreimage (auto-injected below, or a manual call) in
+        // this method. Default ALL|FORKID leaves the flag `None` so the pinned
+        // binding blob is unchanged.
+        if let Some(v) = method.sighash_type {
+            if v != SIGHASH_DEFAULT {
+                method_ctx.sighash_flag = Some(v);
+            }
+        }
+        // Register THIS method's declared params for method-scoped byte-type
+        // analysis (issue #34). Auto-injected continuation params register
+        // their types below, next to their add_param calls.
+        for p in &method.params {
+            method_ctx.register_param_type(&p.name, &type_node_to_string(&p.param_type));
+        }
+
+        // Register the declared param NAMES so a bare identifier resolves to
+        // `load_param` before falling through to `load_prop` (issue #130).
+        // Without this, a param whose name collides with a mutable state
+        // property lowered to the stale deserialized property value instead of
+        // the witness param. Explicit `this.x` is unaffected: it checks
+        // is_property before is_param (see PropertyAccess / lower_member_expr).
+        for p in &method.params {
+            method_ctx.add_param(&p.name);
+        }
 
         if contract.parent_class == "StatefulSmartContract"
             && method.visibility == Visibility::Public
         {
-            // Determine if this method verifies hashOutputs (needs change output support).
-            // Methods that use addOutput or mutate state need hashOutputs verification.
-            // Non-mutating methods (like close/destroy) don't verify outputs.
-            let needs_change_output =
-                method_mutates_state(method, contract) || method_has_add_output(method);
-
-            // Single-output continuation needs _newAmount to allow changing the UTXO satoshis.
-            // Methods with addOutput don't need it (they build outputs explicitly).
-            let needs_new_amount =
-                method_mutates_state(method, contract) && !method_has_add_output(method);
+            // Continuation requirements come from the side-effect
+            // summary, which walks the private-method call graph. A
+            // public method that calls a private helper which mutates
+            // state or emits an output must therefore inject the same
+            // continuation params as if the public body did so
+            // directly.
+            let eff = side_effects
+                .get(&method.name)
+                .copied()
+                .unwrap_or_default();
+            let shape = ContinuationShape::for_effects(&eff);
+            let needs_change_output = shape.needs_change;
+            let needs_new_amount = shape.needs_new_amount;
 
             // Register implicit parameters
             if needs_change_output {
                 method_ctx.add_param("_changePKH");
+                method_ctx.register_param_type("_changePKH", "Ripemd160");
                 method_ctx.add_param("_changeAmount");
+                method_ctx.register_param_type("_changeAmount", "bigint");
             }
             if needs_new_amount {
                 method_ctx.add_param("_newAmount");
+                method_ctx.register_param_type("_newAmount", "bigint");
             }
             method_ctx.add_param("txPreimage");
+            method_ctx.register_param_type("txPreimage", "SigHashPreimage");
+
+            // Issue #123: the declared per-method sighash mode (default
+            // ALL|FORKID). Drives BOTH the OP_PUSH_TX binding flag (so the
+            // derived sig re-computes the tx sighash under this mode) AND the
+            // runtime preimage-type assert.
+            let sighash_mode = method.sighash_type.unwrap_or(SIGHASH_DEFAULT);
 
             // Inject checkPreimage(txPreimage) at the start
             let preimage_ref = method_ctx.emit(ANFValue::LoadParam {
@@ -149,9 +265,41 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
             });
             let check_result = method_ctx.emit(ANFValue::CheckPreimage {
                 preimage: preimage_ref,
+                // Omit for the default so the ANF (and pinned binding blob) is
+                // byte-identical; `sighash_flag` is None unless non-default.
+                sighash_flag: method_ctx.sighash_flag,
             });
             method_ctx.emit(ANFValue::Assert {
                 value: check_result,
+                is_auto_injected_state_check: false,
+            });
+
+            // GAP-302 / #123: pin the sighash type to the declared mode. The
+            // auto-injected covenant verifies a real tx preimage, but without
+            // this check the spend could use a DIFFERENT sighash flag than
+            // declared that zeroes out preimage fields the contract (or its
+            // continuation) relies on (hashOutputs / hashPrevouts /
+            // hashSequence). The value defaults to 0x41 (ALL|FORKID) so existing
+            // contracts emit byte-identical ANF.
+            let sig_hash_preimage_ref = method_ctx.emit(ANFValue::LoadParam {
+                name: "txPreimage".to_string(),
+            });
+            let sig_hash_type_ref = method_ctx.emit(ANFValue::Call {
+                func: "extractSigHashType".to_string(),
+                args: vec![sig_hash_preimage_ref],
+            });
+            let expected_sig_hash_ref = method_ctx.emit(ANFValue::LoadConst {
+                value: bigint_to_json(&BigInt::from(sighash_mode)),
+            });
+            let sig_hash_ok_ref = method_ctx.emit(ANFValue::BinOp {
+                op: "===".to_string(),
+                left: sig_hash_type_ref,
+                right: expected_sig_hash_ref,
+                result_type: None,
+            });
+            method_ctx.emit(ANFValue::Assert {
+                value: sig_hash_ok_ref,
+                is_auto_injected_state_check: false,
             });
 
             // Deserialize mutable state from the preimage's scriptCode.
@@ -167,31 +315,102 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 });
             }
 
+            // Issue #109: preserve @embedAlways fields at the first
+            // user-statement position (after the checkPreimage/deserialize
+            // preamble), mirroring where a `const _bind = this.field;` idiom
+            // would sit.
+            if !embed_injected && !embed_fields.is_empty() {
+                emit_embed_always_preservation(&mut method_ctx, &embed_fields);
+                embed_injected = true;
+            }
+
             // Lower the developer's method body
             lower_statements(&method.body, &mut method_ctx);
 
-            // Determine state continuation type
+            // Determine state continuation type.
+            //
+            // === Continuation-hash construction ===
+            //
+            // The auto-injected continuation assertion verifies that the spending
+            // transaction's hashOutputs field matches a compiler-constructed hash
+            // over the outputs this method declares. Outputs are concatenated in
+            // the following order before hashing with hash256:
+            //
+            //   1. state outputs   (from this.addOutput / this.addRawOutput,
+            //                       tracked via add_output_refs)
+            //   2. data outputs    (from this.addDataOutput, tracked via
+            //                       add_data_output_refs)
+            //   3. change output   (P2PKH to _changePKH, value = _changeAmount)
+            //
+            // For the "single-output" fast path (no addOutput used, but state
+            // is mutated), the state output is computed on the fly from
+            // (preimage, stateScript, _newAmount). Data outputs may still be
+            // declared in this mode and are inserted BETWEEN the single state
+            // output and the change output.
             let add_output_refs = method_ctx.add_output_refs.clone();
-            if !add_output_refs.is_empty() || method_mutates_state(method, contract) {
-                // Build the P2PKH change output for hashOutputs verification
+            let add_data_output_refs = method_ctx.add_data_output_refs.clone();
+            // Gate the continuation assertion on the same shape used
+            // for param injection. Both must agree or the deployed
+            // locking script will not match the auto-injected
+            // parameter list.
+            if needs_change_output {
+                // Build the P2PKH change output for hashOutputs verification.
+                //
+                // Issue #116: the SDK's build_call_transaction OMITS the change
+                // output when `change <= 0` (an exact-cover call) and passes
+                // `_changeAmount = 0`. Gate the change segment on
+                // `_changeAmount != 0` at runtime so the hashed output set
+                // matches the SDK at the exact-zero boundary — the segment is
+                // the P2PKH change output when non-zero, and empty bytes (cat
+                // with empty is a no-op) when zero, reproducing the omission.
+                // For any change > 0 the hashed bytes are unchanged; only the
+                // emitted script gains the guard.
                 let change_pkh_ref = method_ctx.emit(ANFValue::LoadParam {
                     name: "_changePKH".to_string(),
                 });
                 let change_amount_ref = method_ctx.emit(ANFValue::LoadParam {
                     name: "_changeAmount".to_string(),
                 });
-                let change_output_ref = method_ctx.emit(ANFValue::Call {
+                let zero_ref = method_ctx.emit(ANFValue::LoadConst {
+                    value: bigint_to_json(&BigInt::from(0)),
+                });
+                let change_nonzero_ref = method_ctx.emit(ANFValue::BinOp {
+                    op: "!==".to_string(),
+                    left: change_amount_ref.clone(),
+                    right: zero_ref,
+                    result_type: None,
+                });
+                let mut change_then_ctx = method_ctx.sub_context();
+                change_then_ctx.emit(ANFValue::Call {
                     func: "buildChangeOutput".to_string(),
                     args: vec![change_pkh_ref, change_amount_ref],
                 });
+                method_ctx.sync_counter(&change_then_ctx);
+                let mut change_else_ctx = method_ctx.sub_context();
+                change_else_ctx.emit(ANFValue::LoadConst {
+                    value: serde_json::Value::String(String::new()),
+                });
+                method_ctx.sync_counter(&change_else_ctx);
+                let change_output_ref = method_ctx.emit(ANFValue::If {
+                    cond: change_nonzero_ref,
+                    then: change_then_ctx.bindings,
+                    else_branch: change_else_ctx.bindings,
+                });
 
                 if !add_output_refs.is_empty() {
-                    // Multi-output continuation: concat all outputs + change output, hash
+                    // Multi-output continuation: concat all state outputs, then
+                    // all data outputs, then change output, then hash.
                     let mut accumulated = add_output_refs[0].clone();
                     for i in 1..add_output_refs.len() {
                         accumulated = method_ctx.emit(ANFValue::Call {
                             func: "cat".to_string(),
                             args: vec![accumulated, add_output_refs[i].clone()],
+                        });
+                    }
+                    for data_ref in &add_data_output_refs {
+                        accumulated = method_ctx.emit(ANFValue::Call {
+                            func: "cat".to_string(),
+                            args: vec![accumulated, data_ref.clone()],
                         });
                     }
                     accumulated = method_ctx.emit(ANFValue::Call {
@@ -215,9 +434,11 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                         right: output_hash_ref,
                         result_type: Some("bytes".to_string()),
                     });
-                    method_ctx.emit(ANFValue::Assert { value: eq_ref });
+                    method_ctx.emit(ANFValue::Assert { value: eq_ref, is_auto_injected_state_check: true });
                 } else {
-                    // Single-output continuation: build raw output bytes, concat with change, hash
+                    // Single-output continuation: build raw state output bytes,
+                    // then splice in any declared data outputs, then concat
+                    // with change, then hash.
                     let state_script_ref = method_ctx.emit(ANFValue::GetStateScript {});
                     let preimage_ref2 = method_ctx.emit(ANFValue::LoadParam {
                         name: "txPreimage".to_string(),
@@ -229,9 +450,16 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                         func: "computeStateOutput".to_string(),
                         args: vec![preimage_ref2.clone(), state_script_ref, new_amount_ref],
                     });
+                    let mut accumulated = contract_output_ref;
+                    for data_ref in &add_data_output_refs {
+                        accumulated = method_ctx.emit(ANFValue::Call {
+                            func: "cat".to_string(),
+                            args: vec![accumulated, data_ref.clone()],
+                        });
+                    }
                     let all_outputs = method_ctx.emit(ANFValue::Call {
                         func: "cat".to_string(),
-                        args: vec![contract_output_ref, change_output_ref],
+                        args: vec![accumulated, change_output_ref],
                     });
                     let hash_ref = method_ctx.emit(ANFValue::Call {
                         func: "hash256".to_string(),
@@ -250,7 +478,7 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                         right: output_hash_ref,
                         result_type: Some("bytes".to_string()),
                     });
-                    method_ctx.emit(ANFValue::Assert { value: eq_ref });
+                    method_ctx.emit(ANFValue::Assert { value: eq_ref, is_auto_injected_state_check: true });
                 }
             }
 
@@ -277,24 +505,82 @@ fn lower_methods(contract: &ContractNode) -> Vec<ANFMethod> {
                 param_type: "SigHashPreimage".to_string(),
             });
 
+            // Intent-covenant intrinsic auto-injected witness params:
+            // extractPrevOutputScript adds `_prevOutScript_<inputIndex>`
+            // (one per distinct literal index referenced in the method);
+            // requireOutputP2PKH adds a single `_serialisedOutputs`. Order
+            // follows insertion order via method_scope.auto_injected_params.
+            // Appended AFTER txPreimage so unlocking scripts push them
+            // adjacent to the preimage (matches existing _changePKH /
+            // _changeAmount / _newAmount convention of trailing the user
+            // args before the preimage anchor).
+            for p in method_ctx.method_scope.borrow().auto_injected_params.iter() {
+                augmented_params.push(p.clone());
+            }
+
             result.push(ANFMethod {
                 name: method.name.clone(),
                 params: augmented_params,
                 body: method_ctx.bindings,
                 is_public: true,
+                sighash_type: method.sighash_type,
             });
         } else {
+            // Issue #109: stateless public methods (and stateless contracts'
+            // spending entry points) are lowered here — inject @embedAlways
+            // preservation into the first PUBLIC one before its body.
+            if !embed_injected
+                && !embed_fields.is_empty()
+                && method.visibility == Visibility::Public
+            {
+                emit_embed_always_preservation(&mut method_ctx, &embed_fields);
+                embed_injected = true;
+            }
             lower_statements(&method.body, &mut method_ctx);
+            // Private methods can also call the intent intrinsics; surface
+            // their auto-injected witness params on the private method's
+            // own ABI. (Private methods are typically inlined into public
+            // bodies via inline_private_method_call — that path reuses the
+            // public's method_scope, so the auto-injection registers at
+            // the public method's ABI augmentation step above.)
+            let mut augmented = lower_params(&method.params);
+            for p in method_ctx.method_scope.borrow().auto_injected_params.iter() {
+                augmented.push(p.clone());
+            }
             result.push(ANFMethod {
                 name: method.name.clone(),
-                params: lower_params(&method.params),
+                params: augmented,
                 body: method_ctx.bindings,
                 is_public: method.visibility == Visibility::Public,
+                sighash_type: method.sighash_type,
             });
         }
     }
 
     result
+}
+
+/// Issue #109: emit the DCE-surviving preservation pair for each
+/// `@embedAlways` readonly field into the given (public) method context.
+///
+/// Reproduces exactly what a hand-written `const _bind = this.field;` lowers
+/// to: a `load_prop` followed by a `load_const("@ref:<t>")` alias. The alias
+/// marks the `load_prop` as referenced (see `collect_refs_from_value` in
+/// `frontend/dce.rs`), so dead-binding DCE keeps it; stack lowering then emits
+/// the field's constructor-slot placeholder and NIPs the unused value off the
+/// stack at method end, so the field's bytes remain in the deployed script.
+fn emit_embed_always_preservation(ctx: &mut LoweringContext, fields: &[&PropertyNode]) {
+    for field in fields {
+        let load_ref = ctx.emit(ANFValue::LoadProp {
+            name: field.name.clone(),
+        });
+        ctx.emit_named(
+            &format!("__embedAlways_{}", field.name),
+            ANFValue::LoadConst {
+                value: serde_json::Value::String(format!("@ref:{}", load_ref)),
+            },
+        );
+    }
 }
 
 fn lower_params(params: &[ParamNode]) -> Vec<ANFParam> {
@@ -317,25 +603,101 @@ fn lower_params(params: &[ParamNode]) -> Vec<ANFParam> {
 // - Properties are checked against the contract
 // ---------------------------------------------------------------------------
 
+/// Per-method bookkeeping shared by the parent lowering context and any
+/// sub-contexts spawned for nested blocks (if/else, ternary). The ABI
+/// augmentation pass — after lowering a method body — reads
+/// `auto_injected_params` to append witness params to the final ABI list.
+///
+/// Mirrors Go's `methodScopeT` (compilers/go/frontend/anf_lower.go). Used by
+/// the intent-covenant intrinsics extractPrevOutputScript and
+/// requireOutputP2PKH; currentBlockHeight is a pure desugar with no
+/// auto-injected param.
+#[derive(Default)]
+struct MethodScope {
+    /// Append-only, insertion-order list of auto-injected witness params.
+    auto_injected_params: Vec<ANFParam>,
+    /// Dedup set for `auto_injected_params`.
+    auto_injected_set: HashSet<String>,
+    /// requireOutputP2PKH emits its `hash256(serialisedOutputs) ==
+    /// extractOutputHash(txPreimage)` check at most once per method body.
+    did_emit_hash_outputs_check: bool,
+}
+
+impl MethodScope {
+    /// Record a witness param needed by an intrinsic call. Idempotent —
+    /// the second call with the same name is a no-op.
+    fn record_auto_injected_param(&mut self, name: &str, ty: &str) {
+        if self.auto_injected_set.contains(name) {
+            return;
+        }
+        self.auto_injected_set.insert(name.to_string());
+        self.auto_injected_params.push(ANFParam {
+            name: name.to_string(),
+            param_type: ty.to_string(),
+        });
+    }
+}
+
 struct LoweringContext<'a> {
     bindings: Vec<ANFBinding>,
     counter: usize,
     contract: &'a ContractNode,
     param_names: HashSet<String>,
     local_names: HashSet<String>,
+    /// Refs for state outputs (this.addOutput / this.addRawOutput). These
+    /// appear first in the continuation-hash composition.
     add_output_refs: Vec<String>,
+    /// Refs for data outputs (this.addDataOutput). These appear after state
+    /// outputs and before the change output in the continuation-hash
+    /// composition. Wire shape is identical to add_raw_output.
+    add_data_output_refs: Vec<String>,
     /// Maps local variable names to their current ANF binding name.
     /// Updated after if-statements that reassign locals in both branches.
     local_aliases: HashMap<String, String>,
     /// Tracks local variables known to be byte-typed.
     local_byte_vars: HashSet<String>,
+    /// Maps the CURRENT method's (or constructor's) parameter names to their
+    /// declared type strings. Populated once per method/constructor before
+    /// lowering its body and shared into if/else sub-contexts. Method-scoped
+    /// so a local named `x` in one method cannot falsely match a same-named
+    /// parameter of a DIFFERENT method during byte-type analysis (issue #34).
+    param_types: HashMap<String, String>,
     /// Current source location for debug source maps. Set from each AST statement's
     /// source_location and propagated to emitted ANF bindings.
     current_source_loc: Option<SourceLocation>,
+    /// Param substitution stack used when inlining a private method's
+    /// body directly into this context. When the inlined body
+    /// references that param, the lowered identifier resolves to the
+    /// aliased ref instead of emitting load_param. Stacked so nested
+    /// inlines compose correctly.
+    param_alias_stack: HashMap<String, Vec<String>>,
+    /// Side-effect summary shared with auto-injection decisions. Used
+    /// at lowering time to decide whether a private call should be
+    /// inlined (so that helper's add_output / add_data_output ANF
+    /// nodes register on the caller's continuation hash) or remain a
+    /// method_call for stack lowering to inline later.
+    side_effects: Option<SideEffectSummary>,
+    /// Per-method state shared with all sub-contexts. Tracks auto-injected
+    /// witness parameters needed by intent-covenant intrinsics
+    /// (extractPrevOutputScript, requireOutputP2PKH) regardless of whether
+    /// the intrinsic is called from the method's top-level body or from
+    /// inside a nested block (if/else, ternary). Shared via Rc<RefCell<>>
+    /// so sub-contexts mutate the same scope the parent reads from.
+    method_scope: Rc<RefCell<MethodScope>>,
+    /// Issue #123: the declared non-default `@sighash` flag for the method
+    /// being lowered, so a MANUAL `checkPreimage(pre)` call (stateless /
+    /// explicit) AND the auto-injected covenant bind under the same mode as the
+    /// method's declared sighash. `None` = default ALL|FORKID, keeping the
+    /// pinned binding blob unchanged.
+    sighash_flag: Option<i64>,
 }
 
 impl<'a> LoweringContext<'a> {
     fn new(contract: &'a ContractNode) -> Self {
+        Self::with_effects(contract, None)
+    }
+
+    fn with_effects(contract: &'a ContractNode, side_effects: Option<SideEffectSummary>) -> Self {
         LoweringContext {
             bindings: Vec::new(),
             counter: 0,
@@ -343,10 +705,77 @@ impl<'a> LoweringContext<'a> {
             param_names: HashSet::new(),
             local_names: HashSet::new(),
             add_output_refs: Vec::new(),
+            add_data_output_refs: Vec::new(),
             local_aliases: HashMap::new(),
             local_byte_vars: HashSet::new(),
+            param_types: HashMap::new(),
             current_source_loc: None,
+            param_alias_stack: HashMap::new(),
+            side_effects,
+            method_scope: Rc::new(RefCell::new(MethodScope::default())),
+            sighash_flag: None,
         }
+    }
+
+    /// Push an alias frame for the named param. Subsequent identifier
+    /// lookups for `name` resolve to `alias_ref` until the matching
+    /// pop. Stacked so nested inlines compose: pop returns the
+    /// previous frame.
+    fn push_param_alias(&mut self, name: &str, alias_ref: &str) {
+        self.param_alias_stack
+            .entry(name.to_string())
+            .or_default()
+            .push(alias_ref.to_string());
+    }
+
+    fn pop_param_alias(&mut self, name: &str) {
+        let key = name.to_string();
+        if let Some(stack) = self.param_alias_stack.get_mut(&key) {
+            stack.pop();
+            if stack.is_empty() {
+                self.param_alias_stack.remove(&key);
+            }
+        }
+    }
+
+    fn get_param_alias(&self, name: &str) -> Option<&String> {
+        self.param_alias_stack
+            .get(name)
+            .and_then(|s| s.last())
+    }
+
+    /// Returns true if a call to `name` should be ANF-inlined rather
+    /// than emitted as a method_call. True iff `name` is a private
+    /// method that (transitively) emits state outputs (addOutput /
+    /// addRawOutput) or data outputs (addDataOutput). Those refs MUST
+    /// appear in the caller's binding stream so they participate in
+    /// the continuation hash.
+    ///
+    /// Mutation-only private helpers (no output intrinsics) are
+    /// intentionally NOT inlined — state mutation flows through state
+    /// continuity (the continuation hash reads state via
+    /// `get_state_script` after all mutations apply). Keeping the
+    /// existing `method_call` + stack-lowering inlining path for
+    /// those preserves byte-equality with the pre-fix corpus.
+    fn should_inline_private(&self, name: &str) -> bool {
+        let summary = match self.side_effects.as_ref() {
+            Some(s) => s,
+            None => return false,
+        };
+        if !self.is_private_method(name) {
+            return false;
+        }
+        match summary.get(name) {
+            Some(eff) => eff.has_state_output || eff.has_data_output,
+            None => false,
+        }
+    }
+
+    /// Look up a private method by name.
+    fn get_private_method(&self, name: &str) -> Option<&MethodNode> {
+        self.contract.methods.iter().find(|m| {
+            m.name == name && !matches!(m.visibility, Visibility::Public)
+        })
     }
 
     /// Generate a fresh temporary name.
@@ -381,6 +810,13 @@ impl<'a> LoweringContext<'a> {
         self.param_names.insert(name.to_string());
     }
 
+    /// Register the declared type of a parameter belonging to the CURRENT
+    /// method/constructor scope. Read back by `get_param_type` for byte-type
+    /// analysis. Auto-injected continuation params register here too.
+    fn register_param_type(&mut self, name: &str, ty: &str) {
+        self.param_types.insert(name.to_string(), ty.to_string());
+    }
+
     fn is_param(&self, name: &str) -> bool {
         self.param_names.contains(name)
     }
@@ -409,16 +845,39 @@ impl<'a> LoweringContext<'a> {
         self.contract.properties.iter().any(|p| p.name == name)
     }
 
+    /// Report whether `name` is a private (non-public) method on the contract.
+    /// Used to route bare-identifier calls (e.g. Move's `require_owner(sig)`
+    /// after `contract` stripping) through the method_call inlining path.
+    fn is_private_method(&self, name: &str) -> bool {
+        self.contract.methods.iter().any(|m| {
+            m.name == name
+                && m.name != "constructor"
+                && !matches!(m.visibility, Visibility::Public)
+        })
+    }
+
     /// Create a sub-context for nested blocks (if/else, loops).
     /// The counter continues from the parent. Local names, param names, and aliases are shared.
     fn sub_context(&self) -> LoweringContext<'a> {
-        let mut sub = LoweringContext::new(self.contract);
+        let mut sub = LoweringContext::with_effects(self.contract, self.side_effects.clone());
         sub.counter = self.counter;
         sub.param_names = self.param_names.clone();
         sub.local_names = self.local_names.clone();
         sub.local_aliases = self.local_aliases.clone();
         sub.local_byte_vars = self.local_byte_vars.clone();
+        // Share the current method's parameter types so byte-type analysis
+        // inside nested blocks resolves params against the SAME method scope
+        // the parent reads from (issue #34).
+        sub.param_types = self.param_types.clone();
         sub.current_source_loc = self.current_source_loc.clone();
+        sub.param_alias_stack = self.param_alias_stack.clone();
+        // Share the per-method scope so intrinsic auto-injection from
+        // inside a nested block (if/else, ternary) registers on the
+        // parent method's ABI augmentation pass.
+        sub.method_scope = Rc::clone(&self.method_scope);
+        // Issue #123: a manual checkPreimage inside a nested block must bind
+        // under the method's declared @sighash mode.
+        sub.sighash_flag = self.sighash_flag;
         // Note: add_output_refs is NOT propagated to sub-contexts
         // because addOutput calls in sub-blocks should flow up to
         // the parent context via explicit tracking.
@@ -525,10 +984,11 @@ fn lower_statement(stmt: &Statement, ctx: &mut LoweringContext) {
         Statement::ForStatement {
             init,
             condition,
+            update,
             body,
             ..
         } => {
-            lower_for_statement(init, condition, body, ctx);
+            lower_for_statement(init, condition, update, body, ctx);
         }
         Statement::ExpressionStatement { expression, .. } => {
             lower_expr_to_ref(expression, ctx);
@@ -622,6 +1082,24 @@ fn lower_if_statement(
     }
     ctx.sync_counter(&else_ctx);
 
+    // 2026-04-30 audit finding F2: when a branch contains output
+    // intrinsics, append a cat-chain inside each branch so the
+    // branch's terminal value is the concat of its output bytes
+    // (state then data, in declaration order). This balances the
+    // runtime stack effect across branches and lets the parent's
+    // continuation hash see one ref per if representing the chosen
+    // branch's full output set.
+    let branch_has_state_output =
+        !then_ctx.add_output_refs.is_empty() || !else_ctx.add_output_refs.is_empty();
+    let branch_has_outputs = branch_has_state_output
+        || !then_ctx.add_data_output_refs.is_empty()
+        || !else_ctx.add_data_output_refs.is_empty();
+
+    if branch_has_outputs {
+        append_branch_output_concat(&mut then_ctx);
+        append_branch_output_concat(&mut else_ctx);
+    }
+
     let then_bindings = then_ctx.bindings;
     let else_bindings = else_ctx.bindings;
 
@@ -637,20 +1115,30 @@ fn lower_if_statement(
         _ => None,
     };
 
-    // Propagate addOutput refs from sub-contexts: when either branch produces
-    // addOutput calls, the if-expression result represents each addOutput
-    // (only one branch executes at runtime).
-    let then_has_outputs = !then_ctx.add_output_refs.is_empty();
-    let else_has_outputs = !else_ctx.add_output_refs.is_empty();
-
     let if_name = ctx.emit(ANFValue::If {
         cond: cond_ref,
         then: then_bindings,
         else_branch: else_bindings,
     });
 
-    if then_has_outputs || else_has_outputs {
-        ctx.add_output_refs.push(if_name.clone());
+    if branch_has_outputs {
+        // Register the if's value once with the parent's continuation
+        // tracker. CRITICAL: pick the right tracker. If either branch
+        // produces a STATE output (addOutput / addRawOutput), the
+        // parent must take the multi-output continuation path, so we
+        // register as a state output ref. If neither branch produces
+        // a state output and at least one branch produces a data
+        // output, we register as a DATA output ref so the parent
+        // keeps its single-output `computeStateOutput` continuation
+        // and the data-output bytes splice in BETWEEN the state
+        // output and the change output. Without this, a branch with
+        // only `addDataOutput` was incorrectly forced onto the
+        // multi-output path, dropping the canonical state continuation.
+        if branch_has_state_output {
+            ctx.add_output_refs.push(if_name.clone());
+        } else {
+            ctx.add_data_output_refs.push(if_name.clone());
+        }
     }
 
     if let Some(local_name) = alias_local {
@@ -658,14 +1146,44 @@ fn lower_if_statement(
     }
 }
 
+/// Concatenate a branch's output refs (state then data, in declaration
+/// order) into a single bytes-ref appended to the branch's bindings.
+/// If the branch has no outputs, emits an empty `LoadConst` so the
+/// branch still leaves one item on the stack — required to balance
+/// the if's branch shapes when the OTHER branch has outputs.
+/// 2026-04-30 audit finding F2 fix.
+fn append_branch_output_concat(branch_ctx: &mut LoweringContext) -> String {
+    let mut all_refs = branch_ctx.add_output_refs.clone();
+    all_refs.extend(branch_ctx.add_data_output_refs.iter().cloned());
+    if all_refs.is_empty() {
+        return branch_ctx.emit(ANFValue::LoadConst {
+            value: serde_json::Value::String(String::new()),
+        });
+    }
+    if all_refs.len() == 1 {
+        return all_refs[0].clone();
+    }
+    let mut accumulated = all_refs[0].clone();
+    for next in &all_refs[1..] {
+        accumulated = branch_ctx.emit(ANFValue::Call {
+            func: "cat".to_string(),
+            args: vec![accumulated, next.clone()],
+        });
+    }
+    accumulated
+}
+
 fn lower_for_statement(
     init: &Statement,
     condition: &Expression,
+    update: &Statement,
     body: &[Statement],
     ctx: &mut LoweringContext,
 ) {
-    // Extract the loop count from the for-statement.
-    let count = extract_loop_count(init, condition);
+    // Resolve the loop's compile-time shape: start value, step direction, and
+    // iteration count. Rúnar requires bounded loops, so all three must be
+    // statically determinable (issue #121).
+    let (start, step, count) = extract_loop_shape(init, condition, update);
 
     // Extract the iterator variable name
     let iter_var = if let Statement::VariableDecl { name, .. } = init {
@@ -683,46 +1201,97 @@ fn lower_for_statement(
         count,
         body: body_ctx.bindings,
         iter_var,
+        start: bigint_to_json(&start),
+        step,
     });
 }
 
-/// Extract a compile-time loop count from a for statement.
-fn extract_loop_count(init: &Statement, condition: &Expression) -> usize {
-    let start_val = if let Statement::VariableDecl { init: init_expr, .. } = init {
-        extract_bigint_value(init_expr)
-    } else {
-        None
+/// Resolve a for-statement's compile-time loop shape (issue #121).
+///
+/// Supports counting-up and counting-down loops:
+///   for (let i = 0n; i < 10n; i++)     -> start 0,  step +1, count 10
+///   for (let i = 1n; i <= 3n; i++)     -> start 1,  step +1, count 3
+///   for (let i = 3n; i > 0n; i--)      -> start 3,  step -1, count 3
+///   for (let i = 3n; i >= 1n; i--)     -> start 3,  step -1, count 3
+///
+/// The loop is unrolled `count` times; on iteration `i` the iterator holds
+/// `start + i * step`. Start and bound must be compile-time integer literals.
+///
+/// This path is a hard guard for callers that skip validation; the normal
+/// pipeline rejects unresolvable shapes in the validate pass first.
+fn extract_loop_shape(
+    init: &Statement,
+    condition: &Expression,
+    update: &Statement,
+) -> (num_bigint::BigInt, i64, usize) {
+    let start = match init {
+        Statement::VariableDecl { init: init_expr, .. } => extract_bigint_value(init_expr),
+        _ => None,
+    };
+    let start = match start {
+        Some(s) => BigInt::from(s),
+        None => panic!(
+            "Cannot determine loop start at compile time. For-loop iterators must start at an integer literal."
+        ),
     };
 
-    if let Expression::BinaryExpr { op, right, .. } = condition {
-        let bound_val = extract_bigint_value(right);
+    let (op, bound) = match condition {
+        Expression::BinaryExpr { op, right, .. } => match extract_bigint_value(right) {
+            Some(b) => (op, BigInt::from(b)),
+            None => panic!(
+                "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+            ),
+        },
+        _ => panic!(
+            "Cannot determine loop bound at compile time. For-loop bounds must be integer literals."
+        ),
+    };
 
-        if let (Some(start), Some(bound)) = (start_val, bound_val) {
-            match op {
-                BinaryOp::Lt => return (bound - start).max(0) as usize,
-                BinaryOp::Le => return (bound - start + 1).max(0) as usize,
-                BinaryOp::Gt => return (start - bound).max(0) as usize,
-                BinaryOp::Ge => return (start - bound + 1).max(0) as usize,
-                _ => {}
-            }
+    let step = extract_loop_step(condition, update);
+
+    // Count = number of iterations before the condition first turns false.
+    let count: BigInt = if step == 1 {
+        match op {
+            BinaryOp::Lt => &bound - &start,
+            BinaryOp::Le => &bound - &start + 1,
+            _ => panic!("For loop counting up (i++) must use '<' or '<=' (got '{:?}').", op),
         }
+    } else {
+        match op {
+            BinaryOp::Gt => &start - &bound,
+            BinaryOp::Ge => &start - &bound + 1,
+            _ => panic!("For loop counting down (i--) must use '>' or '>=' (got '{:?}').", op),
+        }
+    };
 
-        // If we can at least get the bound, assume start = 0
-        if let Some(bound) = bound_val {
-            match op {
-                BinaryOp::Lt => return bound as usize,
-                BinaryOp::Le => return (bound + 1) as usize,
-                _ => {}
-            }
+    let count = count.to_i64().unwrap_or(0).max(0) as usize;
+    (start, step, count)
+}
+
+/// Determine the iterator step direction (+1 / -1) from the for-statement's
+/// update clause, falling back to the condition direction. Only unit steps are
+/// supported; a non-unit update (e.g. `i += 2`) is out of the loop model.
+fn extract_loop_step(condition: &Expression, update: &Statement) -> i64 {
+    if let Statement::ExpressionStatement { expression, .. } = update {
+        match expression {
+            Expression::IncrementExpr { .. } => return 1,
+            Expression::DecrementExpr { .. } => return -1,
+            _ => {}
         }
     }
-
-    0
+    // Fall back to the comparison direction for other unit-step spellings
+    // (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
+    if let Expression::BinaryExpr { op, .. } = condition {
+        if *op == BinaryOp::Gt || *op == BinaryOp::Ge {
+            return -1;
+        }
+    }
+    1
 }
 
 fn extract_bigint_value(expr: &Expression) -> Option<i128> {
     match expr {
-        Expression::BigIntLiteral { value } => Some(*value),
+        Expression::BigIntLiteral { value } => value.to_i128(),
         Expression::UnaryExpr { op, operand } if *op == UnaryOp::Neg => {
             extract_bigint_value(operand).map(|v| -v)
         }
@@ -741,7 +1310,7 @@ fn extract_bigint_value(expr: &Expression) -> Option<i128> {
 fn lower_expr_to_ref(expr: &Expression, ctx: &mut LoweringContext) -> String {
     match expr {
         Expression::BigIntLiteral { value } => ctx.emit(ANFValue::LoadConst {
-            value: i128_to_json(*value),
+            value: bigint_to_json(value),
         }),
 
         Expression::BoolLiteral { value } => ctx.emit(ANFValue::LoadConst {
@@ -755,7 +1324,17 @@ fn lower_expr_to_ref(expr: &Expression, ctx: &mut LoweringContext) -> String {
         Expression::Identifier { name } => lower_identifier(name, ctx),
 
         Expression::PropertyAccess { property } => {
-            // this.txPreimage in StatefulSmartContract -> load_param (it's an implicit param, not a stored property)
+            // Explicit `this.x`: a real contract property always wins, even when
+            // a method param shares the name (issue #130). Now that declared
+            // params are registered, the is_param branch below must not shadow a
+            // stored property.
+            if ctx.is_property(property) {
+                return ctx.emit(ANFValue::LoadProp {
+                    name: property.clone(),
+                });
+            }
+            // this.txPreimage in StatefulSmartContract -> load_param (it's an
+            // implicit injected param, not a stored property).
             if ctx.is_param(property) {
                 return ctx.emit(ANFValue::LoadParam {
                     name: property.clone(),
@@ -773,7 +1352,7 @@ fn lower_expr_to_ref(expr: &Expression, ctx: &mut LoweringContext) -> String {
 
         Expression::UnaryExpr { op, operand } => lower_unary_expr(op, operand, ctx),
 
-        Expression::CallExpr { callee, args } => lower_call_expr(callee, args, ctx),
+        Expression::CallExpr { callee, args, .. } => lower_call_expr(callee, args, ctx),
 
         Expression::TernaryExpr {
             condition,
@@ -818,6 +1397,13 @@ fn lower_identifier(name: &str, ctx: &mut LoweringContext) -> String {
         });
     }
 
+    // Param alias takes precedence over normal param lookup. Set when
+    // a private method's body is being inlined into this context —
+    // the private's param names map to the caller's arg refs.
+    if let Some(alias) = ctx.get_param_alias(name) {
+        return alias.clone();
+    }
+
     // Check if it's a registered parameter (e.g. txPreimage for StatefulSmartContract)
     if ctx.is_param(name) {
         return ctx.emit(ANFValue::LoadParam {
@@ -856,6 +1442,15 @@ fn lower_member_expr(
     // this.x -> load_prop (or load_param for implicit params like txPreimage)
     if let Expression::Identifier { name } = object {
         if name == "this" {
+            // Explicit `this.x`: a real contract property always wins, even
+            // when a method param shares the name (issue #130). Only fall
+            // through to load_param for implicit injected params (txPreimage)
+            // that are NOT stored properties.
+            if ctx.is_property(property) {
+                return ctx.emit(ANFValue::LoadProp {
+                    name: property.to_string(),
+                });
+            }
             if ctx.is_param(property) {
                 return ctx.emit(ANFValue::LoadParam {
                     name: property.to_string(),
@@ -970,12 +1565,12 @@ fn lower_call_expr(
         if name == "assert" {
             if !args.is_empty() {
                 let value_ref = lower_expr_to_ref(&args[0], ctx);
-                return ctx.emit(ANFValue::Assert { value: value_ref });
+                return ctx.emit(ANFValue::Assert { value: value_ref, is_auto_injected_state_check: false });
             }
             let false_ref = ctx.emit(ANFValue::LoadConst {
                 value: serde_json::Value::Bool(false),
             });
-            return ctx.emit(ANFValue::Assert { value: false_ref });
+            return ctx.emit(ANFValue::Assert { value: false_ref, is_auto_injected_state_check: false });
         }
     }
 
@@ -986,15 +1581,266 @@ fn lower_call_expr(
                 let preimage_ref = lower_expr_to_ref(&args[0], ctx);
                 return ctx.emit(ANFValue::CheckPreimage {
                     preimage: preimage_ref,
+                    // Issue #123: honour the method's declared @sighash on
+                    // manual checkPreimage calls (None = default ALL|FORKID).
+                    sighash_flag: ctx.sighash_flag,
                 });
             }
         }
     }
 
-    // this.addOutput(satoshis, val1, val2, ...) -> special node (via PropertyAccess)
+    // extractPrevOutputScript(inputIndex_literal, expectedScriptHash) -> ByteString
+    // extractPrevOutputScript(inputIndex_literal, expectedScriptPrefixHash, prefixLen_literal) -> ByteString
+    //
+    // Witness-bridge sugar (BSVM Phase 13). Auto-injects a hidden method
+    // parameter named `_prevOutScript_<inputIndex>` (one per distinct index
+    // in the method body), emits a hash assertion, and returns the witness
+    // ref for caller substring extraction.
+    //
+    // 2-arg form: hash256(witness) === expectedScriptHash. Pins the full
+    //   prev-output script byte-for-byte.
+    // 3-arg form: hash256(substr(witness, 0, prefixLen)) ===
+    //   expectedScriptPrefixHash. Pins the policy prefix only, leaving the
+    //   pushdata tail free to vary. Required for intent-template matching
+    //   (BSVM Mode 3 permissionless step-in).
+    if let Expression::Identifier { name } = callee {
+        if name == "extractPrevOutputScript" {
+            if args.len() != 2 && args.len() != 3 {
+                return ctx.emit(ANFValue::LoadConst {
+                    value: serde_json::Value::String(String::new()),
+                });
+            }
+            let idx = match &args[0] {
+                Expression::BigIntLiteral { value } => match value.to_i128() {
+                    Some(v) => v,
+                    None => {
+                        return ctx.emit(ANFValue::LoadConst {
+                            value: serde_json::Value::String(String::new()),
+                        });
+                    }
+                },
+                _ => {
+                    return ctx.emit(ANFValue::LoadConst {
+                        value: serde_json::Value::String(String::new()),
+                    });
+                }
+            };
+            let param_name = format!("_prevOutScript_{}", idx);
+            ctx.method_scope
+                .borrow_mut()
+                .record_auto_injected_param(&param_name, "ByteString");
+            ctx.add_param(&param_name);
+            let witness_ref = ctx.emit(ANFValue::LoadParam {
+                name: param_name.clone(),
+            });
+            let expected_hash_ref = lower_expr_to_ref(&args[1], ctx);
+
+            // Determine which bytes to hash: full witness (2-arg) or prefix
+            // (3-arg). The substr happens at script-execution time; the
+            // literal prefixLen is baked into the emitted Stack-IR.
+            let bytes_to_hash_ref = if args.len() == 3 {
+                let prefix_len = match &args[2] {
+                    Expression::BigIntLiteral { value } => match value.to_i128() {
+                        Some(v) => v,
+                        None => {
+                            return ctx.emit(ANFValue::LoadConst {
+                                value: serde_json::Value::String(String::new()),
+                            });
+                        }
+                    },
+                    _ => {
+                        return ctx.emit(ANFValue::LoadConst {
+                            value: serde_json::Value::String(String::new()),
+                        });
+                    }
+                };
+                let zero_ref = ctx.emit(ANFValue::LoadConst {
+                    value: serde_json::Value::Number(serde_json::Number::from(0i64)),
+                });
+                let prefix_len_ref = ctx.emit(ANFValue::LoadConst {
+                    value: serde_json::Value::Number(
+                        serde_json::Number::from(prefix_len as i64),
+                    ),
+                });
+                ctx.emit(ANFValue::Call {
+                    func: "substr".to_string(),
+                    args: vec![witness_ref.clone(), zero_ref, prefix_len_ref],
+                })
+            } else {
+                witness_ref.clone()
+            };
+
+            let actual_hash_ref = ctx.emit(ANFValue::Call {
+                func: "hash256".to_string(),
+                args: vec![bytes_to_hash_ref],
+            });
+            let eq_ref = ctx.emit(ANFValue::BinOp {
+                op: "===".to_string(),
+                left: actual_hash_ref,
+                right: expected_hash_ref,
+                result_type: Some("bytes".to_string()),
+            });
+            ctx.emit(ANFValue::Assert { value: eq_ref, is_auto_injected_state_check: false });
+            return witness_ref;
+        }
+    }
+
+    // requireOutputP2PKH(outputIndex_literal, pubkeyHash, amount) -> void.
+    // Asserts that the tx's output at outputIndex is a standard P2PKH paying
+    // `amount` satoshis to `pubkeyHash`. Auto-injects `_serialisedOutputs`
+    // (once per method) and emits hash256(serialisedOutputs) ==
+    // extractOutputHash(txPreimage) the first time the intrinsic is called
+    // in a method body. Subsequent calls in the same method skip the
+    // hashOutputs check (already established) and emit only the per-output
+    // substring assertion.
+    //
+    // v1 assumes all outputs in the serialised set are exactly 34 bytes
+    // (8-byte LE amount ‖ 0x19 length ‖ 25-byte P2PKH script). Byte offset
+    // of output i is i*34.
+    if let Expression::Identifier { name } = callee {
+        if name == "requireOutputP2PKH" {
+            if args.len() != 3 {
+                return ctx.emit(ANFValue::LoadConst {
+                    value: serde_json::Value::String(String::new()),
+                });
+            }
+            let idx = match &args[0] {
+                Expression::BigIntLiteral { value } => match value.to_i128() {
+                    Some(v) => v,
+                    None => {
+                        return ctx.emit(ANFValue::LoadConst {
+                            value: serde_json::Value::String(String::new()),
+                        });
+                    }
+                },
+                _ => {
+                    return ctx.emit(ANFValue::LoadConst {
+                        value: serde_json::Value::String(String::new()),
+                    });
+                }
+            };
+
+            ctx.method_scope
+                .borrow_mut()
+                .record_auto_injected_param("_serialisedOutputs", "ByteString");
+            ctx.add_param("_serialisedOutputs");
+
+            // Emit the hashOutputs(preimage) check exactly once per method.
+            let need_hash_check = {
+                let mut scope = ctx.method_scope.borrow_mut();
+                if !scope.did_emit_hash_outputs_check {
+                    scope.did_emit_hash_outputs_check = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if need_hash_check {
+                let serialised_ref = ctx.emit(ANFValue::LoadParam {
+                    name: "_serialisedOutputs".to_string(),
+                });
+                let actual_out_hash_ref = ctx.emit(ANFValue::Call {
+                    func: "hash256".to_string(),
+                    args: vec![serialised_ref],
+                });
+                let preimage_ref = ctx.emit(ANFValue::LoadParam {
+                    name: "txPreimage".to_string(),
+                });
+                let expected_out_hash_ref = ctx.emit(ANFValue::Call {
+                    func: "extractOutputHash".to_string(),
+                    args: vec![preimage_ref],
+                });
+                let hash_eq_ref = ctx.emit(ANFValue::BinOp {
+                    op: "===".to_string(),
+                    left: actual_out_hash_ref,
+                    right: expected_out_hash_ref,
+                    result_type: Some("bytes".to_string()),
+                });
+                ctx.emit(ANFValue::Assert { value: hash_eq_ref, is_auto_injected_state_check: false });
+            }
+
+            // Lower the user-supplied args (pubkeyHash, amount).
+            let pubkey_hash_ref = lower_expr_to_ref(&args[1], ctx);
+            let amount_ref = lower_expr_to_ref(&args[2], ctx);
+
+            // Construct expected P2PKH output bytes:
+            //   <amount: 8-byte LE> ‖ 0x19 0x76 0xa9 0x14 ‖ <pubkeyHash: 20 bytes> ‖ 0x88 0xac
+            let eight_ref = ctx.emit(ANFValue::LoadConst {
+                value: serde_json::Value::Number(serde_json::Number::from(8i64)),
+            });
+            let amount_bytes_ref = ctx.emit(ANFValue::Call {
+                func: "num2bin".to_string(),
+                args: vec![amount_ref, eight_ref],
+            });
+            // 0x19 0x76 0xa9 0x14 — script length byte + OP_DUP OP_HASH160 OP_PUSH20
+            let prefix_ref = ctx.emit(ANFValue::LoadConst {
+                value: serde_json::Value::String("1976a914".to_string()),
+            });
+            // 0x88 0xac — OP_EQUALVERIFY OP_CHECKSIG
+            let suffix_ref = ctx.emit(ANFValue::LoadConst {
+                value: serde_json::Value::String("88ac".to_string()),
+            });
+            let cat1_ref = ctx.emit(ANFValue::Call {
+                func: "cat".to_string(),
+                args: vec![amount_bytes_ref, prefix_ref],
+            });
+            let cat2_ref = ctx.emit(ANFValue::Call {
+                func: "cat".to_string(),
+                args: vec![cat1_ref, pubkey_hash_ref],
+            });
+            let expected_output_ref = ctx.emit(ANFValue::Call {
+                func: "cat".to_string(),
+                args: vec![cat2_ref, suffix_ref],
+            });
+
+            // Substring extract at idx*34 length 34, assert equal.
+            let serialised_ref = ctx.emit(ANFValue::LoadParam {
+                name: "_serialisedOutputs".to_string(),
+            });
+            let offset_ref = ctx.emit(ANFValue::LoadConst {
+                value: serde_json::Value::Number(serde_json::Number::from((idx as i64) * 34)),
+            });
+            let length_ref = ctx.emit(ANFValue::LoadConst {
+                value: serde_json::Value::Number(serde_json::Number::from(34i64)),
+            });
+            let extracted_ref = ctx.emit(ANFValue::Call {
+                func: "substr".to_string(),
+                args: vec![serialised_ref, offset_ref, length_ref],
+            });
+            let out_eq_ref = ctx.emit(ANFValue::BinOp {
+                op: "===".to_string(),
+                left: extracted_ref,
+                right: expected_output_ref,
+                result_type: Some("bytes".to_string()),
+            });
+            return ctx.emit(ANFValue::Assert { value: out_eq_ref, is_auto_injected_state_check: false });
+        }
+    }
+
+    // currentBlockHeight() -> bigint. Pure source-level desugar to
+    // extractLocktime(this.txPreimage). Only valid in StatefulSmartContract
+    // methods (typecheck enforces). No new ANF kind or stack codegen needed.
+    if let Expression::Identifier { name } = callee {
+        if name == "currentBlockHeight" {
+            let preimage_ref = ctx.emit(ANFValue::LoadParam {
+                name: "txPreimage".to_string(),
+            });
+            return ctx.emit(ANFValue::Call {
+                func: "extractLocktime".to_string(),
+                args: vec![preimage_ref],
+            });
+        }
+    }
+
+    // this.addOutput(satoshis, val1, val2, ...) -> special node.
+    // Mirrors flattenAddOutputArgs in 04-anf-lower.ts: when addOutput is
+    // called as `this.addOutput(satoshis, .{ v1, v2, ... })` (the surface
+    // form Zig / Move tuple syntax produce), unwrap the trailing array
+    // literal so each element becomes an individual state value.
     if let Expression::PropertyAccess { property } = callee {
         if property == "addOutput" {
-            let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+            let flat_args = flatten_add_output_args(args);
+            let arg_refs: Vec<String> = flat_args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
             let satoshis = arg_refs.first().cloned().unwrap_or_default();
             let state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
             let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values, preimage: String::new() });
@@ -1006,7 +1852,8 @@ fn lower_call_expr(
     if let Expression::MemberExpr { object, property } = callee {
         if let Expression::Identifier { name } = object.as_ref() {
             if name == "this" && property == "addOutput" {
-                let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+                let flat_args = flatten_add_output_args(args);
+                let arg_refs: Vec<String> = flat_args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
                 let satoshis = arg_refs.first().cloned().unwrap_or_default();
                 let state_values = if arg_refs.len() > 1 { arg_refs[1..].to_vec() } else { Vec::new() };
                 let r = ctx.emit(ANFValue::AddOutput { satoshis, state_values, preimage: String::new() });
@@ -1041,6 +1888,34 @@ fn lower_call_expr(
         }
     }
 
+    // this.addDataOutput(satoshis, scriptBytes) -> special node (via PropertyAccess).
+    // Same wire shape as addRawOutput, but tracked separately so that the
+    // continuation-hash composition can place data outputs AFTER state outputs
+    // and BEFORE the change output.
+    if let Expression::PropertyAccess { property } = callee {
+        if property == "addDataOutput" {
+            let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+            let satoshis = arg_refs.first().cloned().unwrap_or_default();
+            let script_bytes = if arg_refs.len() > 1 { arg_refs[1].clone() } else { String::new() };
+            let r = ctx.emit(ANFValue::AddDataOutput { satoshis, script_bytes });
+            ctx.add_data_output_refs.push(r.clone());
+            return r;
+        }
+    }
+    // this.addDataOutput(satoshis, scriptBytes) -> special node (via MemberExpr with this)
+    if let Expression::MemberExpr { object, property } = callee {
+        if let Expression::Identifier { name } = object.as_ref() {
+            if name == "this" && property == "addDataOutput" {
+                let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+                let satoshis = arg_refs.first().cloned().unwrap_or_default();
+                let script_bytes = if arg_refs.len() > 1 { arg_refs[1].clone() } else { String::new() };
+                let r = ctx.emit(ANFValue::AddDataOutput { satoshis, script_bytes });
+                ctx.add_data_output_refs.push(r.clone());
+                return r;
+            }
+        }
+    }
+
     // this.getStateScript() -> special node (via PropertyAccess)
     if let Expression::PropertyAccess { property } = callee {
         if property == "getStateScript" {
@@ -1056,9 +1931,14 @@ fn lower_call_expr(
         }
     }
 
-    // this.method(...) -> method_call (via PropertyAccess)
+    // this.method(...) -> method_call (via PropertyAccess), or inlined
+    // if the target is a private method with continuation-relevant
+    // side effects.
     if let Expression::PropertyAccess { property } = callee {
         let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+        if ctx.should_inline_private(property) {
+            return inline_private_method_call(property, &arg_refs, ctx);
+        }
         let this_ref = ctx.emit(ANFValue::LoadConst {
             value: serde_json::Value::String("@this".to_string()),
         });
@@ -1075,6 +1955,9 @@ fn lower_call_expr(
             if name == "this" {
                 let arg_refs: Vec<String> =
                     args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+                if ctx.should_inline_private(property) {
+                    return inline_private_method_call(property, &arg_refs, ctx);
+                }
                 let this_ref = ctx.emit(ANFValue::LoadConst {
                     value: serde_json::Value::String("@this".to_string()),
                 });
@@ -1087,9 +1970,56 @@ fn lower_call_expr(
         }
     }
 
+    // asm({...}) compiler intrinsic — the parser has already normalised the
+    // object-literal argument into three positional args
+    // (body, in_arity, out_arity). Lower it to a single opaque raw_script ANF
+    // binding; the hex body passes through unchanged. Diagnostics for
+    // malformed args were already pushed by the validator — here we
+    // defensively coerce missing values to safe defaults.
+    if let Expression::Identifier { name } = callee {
+        if name == "asm" {
+            let mut bytes = String::new();
+            let mut in_arity: usize = 0;
+            let mut out_arity: usize = 1;
+            if let Some(Expression::ByteStringLiteral { value }) = args.get(0) {
+                bytes = value.clone();
+            }
+            if let Some(Expression::BigIntLiteral { value }) = args.get(1) {
+                in_arity = value.to_usize().unwrap_or(0);
+            }
+            if let Some(Expression::BigIntLiteral { value }) = args.get(2) {
+                out_arity = value.to_usize().unwrap_or(1);
+            }
+            return ctx.emit(ANFValue::RawScript {
+                bytes,
+                in_arity,
+                out_arity,
+            });
+        }
+    }
+
     // Direct function call: sha256(x), checkSig(sig, pk), etc.
     if let Expression::Identifier { name } = callee {
         let arg_refs: Vec<String> = args.iter().map(|a| lower_expr_to_ref(a, ctx)).collect();
+        // Bare identifier calls that match a private method on the contract
+        // (e.g. Move's `require_owner(contract, sig)` which the parser strips
+        // to `requireOwner(sig)`) must be routed through the same inlining path
+        // as `this.requireOwner(sig)` so downstream stack lowering can inline
+        // the body. This keeps .runar.move, .runar.go, and .runar.ts lowering
+        // in sync.
+        if ctx.is_private_method(name) {
+            if ctx.should_inline_private(name) {
+                return inline_private_method_call(name, &arg_refs, ctx);
+            }
+            let this_ref = ctx.emit(ANFValue::LoadConst {
+                value: serde_json::Value::String("@this".to_string()),
+            });
+            return ctx.emit(ANFValue::MethodCall {
+                object: this_ref,
+                method: name.clone(),
+                args: arg_refs,
+            });
+        }
         return ctx.emit(ANFValue::Call {
             func: name.clone(),
             args: arg_refs,
@@ -1228,7 +2158,7 @@ fn lower_decrement_expr(
 /// Byte-typed primitive names -- values that are already byte sequences.
 const BYTE_TYPES: &[&str] = &[
     "ByteString", "PubKey", "Sig", "Sha256", "Ripemd160", "Addr", "SigHashPreimage",
-    "RabinSig", "RabinPubKey", "Point",
+    "RabinSig", "RabinPubKey", "Point", "P256Point", "P384Point",
 ];
 
 /// Builtin functions that return byte-typed values.
@@ -1237,6 +2167,8 @@ const BYTE_RETURNING_FUNCTIONS: &[&str] = &[
     "reverseBytes", "substr", "left", "right",
     "ecAdd", "ecMul", "ecMulGen", "ecNegate", "ecMakePoint", "ecEncodeCompressed",
     "sha256Compress", "sha256Finalize", "blake3Compress", "blake3Hash",
+    "p256Add", "p256Mul", "p256MulGen", "p256Negate", "p256EncodeCompressed",
+    "p384Add", "p384Mul", "p384MulGen", "p384Negate", "p384EncodeCompressed",
 ];
 
 /// Determine whether an expression is byte-typed (ByteString, PubKey, Sig, etc.).
@@ -1285,8 +2217,16 @@ fn is_byte_typed_expr(expr: &Expression, ctx: &LoweringContext) -> bool {
             false
         }
 
-        Expression::CallExpr { callee, .. } => {
+        Expression::CallExpr {
+            callee,
+            asm_return_type,
+            ..
+        } => {
             if let Expression::Identifier { name } = callee.as_ref() {
+                // Expression-form asm<ByteString>({...}) yields a byte value.
+                if name == "asm" {
+                    return asm_return_type.as_deref() == Some("ByteString");
+                }
                 if BYTE_RETURNING_FUNCTIONS.contains(&name.as_str()) {
                     return true;
                 }
@@ -1298,23 +2238,12 @@ fn is_byte_typed_expr(expr: &Expression, ctx: &LoweringContext) -> bool {
     }
 }
 
-/// Look up the type of a method parameter by name across all contract methods.
+/// Look up the type of a parameter by name within the CURRENT method scope.
+/// Method-scoped (issue #34): reads only the params registered for the method
+/// (or constructor) currently being lowered, so a local in one method cannot
+/// falsely match a same-named parameter of a different method.
 fn get_param_type(name: &str, ctx: &LoweringContext) -> Option<String> {
-    // Check constructor params
-    for p in &ctx.contract.constructor.params {
-        if p.name == name {
-            return Some(type_node_to_string(&p.param_type));
-        }
-    }
-    // Check method params
-    for method in &ctx.contract.methods {
-        for p in &method.params {
-            if p.name == name {
-                return Some(type_node_to_string(&p.param_type));
-            }
-        }
-    }
-    None
+    ctx.param_types.get(name).cloned()
 }
 
 /// Look up the type of a contract property by name.
@@ -1342,127 +2271,82 @@ fn type_node_to_string(node: &TypeNode) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// State mutation analysis for StatefulSmartContract
+// inline_private_method_call — ANF-level inlining of private helpers
 // ---------------------------------------------------------------------------
 
-/// Determine whether a method mutates any mutable (non-readonly) property.
-/// Conservative: if ANY code path can mutate state, returns true.
-fn method_mutates_state(method: &MethodNode, contract: &ContractNode) -> bool {
-    let mutable_prop_names: HashSet<String> = contract
-        .properties
-        .iter()
-        .filter(|p| !p.readonly)
-        .map(|p| p.name.clone())
-        .collect();
-    if mutable_prop_names.is_empty() {
-        return false;
+/// Lower a private method's body directly into the caller's context.
+///
+/// Used when the private has continuation-relevant side effects (state
+/// mutation, addOutput, addRawOutput, addDataOutput) so the helper's
+/// emitted ANF nodes register output refs on the caller. Caller's arg
+/// refs are mapped onto the private's parameter names via
+/// `push_param_alias`. While the private's body lowers, any
+/// identifier expression matching one of those param names resolves
+/// to the caller's ref. The aliases are popped afterwards so
+/// subsequent lowering in the caller's body sees its own scope.
+///
+/// Recursion across private helpers is forbidden by validation, so
+/// this always terminates. Nested inlining (private A calls private
+/// B) works naturally: when we lower A's body and hit the call to B,
+/// the same dispatch path runs and inlines B too.
+fn inline_private_method_call(
+    method_name: &str,
+    arg_refs: &[String],
+    ctx: &mut LoweringContext,
+) -> String {
+    // Snapshot the method body + param names before mutating the
+    // context (Rust's borrow checker won't let us hold a &MethodNode
+    // and mutate ctx simultaneously).
+    let (params, body): (Vec<String>, Vec<Statement>) = match ctx.get_private_method(method_name) {
+        Some(m) => (m.params.iter().map(|p| p.name.clone()).collect(), m.body.clone()),
+        None => {
+            // Should not happen — caller checked should_inline_private,
+            // which requires the method to exist. Fall back to a
+            // method_call so the stack lowering pass surfaces a clear
+            // error.
+            let this_ref = ctx.emit(ANFValue::LoadConst {
+                value: serde_json::Value::String("@this".to_string()),
+            });
+            return ctx.emit(ANFValue::MethodCall {
+                object: this_ref,
+                method: method_name.to_string(),
+                args: arg_refs.to_vec(),
+            });
+        }
+    };
+
+    // Bind caller arg refs to the private's parameter names.
+    let mut aliased: Vec<String> = Vec::new();
+    for (i, param_name) in params.iter().enumerate() {
+        if i >= arg_refs.len() {
+            break;
+        }
+        ctx.push_param_alias(param_name, &arg_refs[i]);
+        aliased.push(param_name.clone());
     }
-    body_mutates_state(&method.body, &mutable_prop_names)
-}
 
-fn body_mutates_state(stmts: &[Statement], mutable_props: &HashSet<String>) -> bool {
-    for stmt in stmts {
-        if stmt_mutates_state(stmt, mutable_props) {
-            return true;
-        }
+    let start_index = ctx.bindings.len();
+    lower_statements(&body, ctx);
+    let end_index = ctx.bindings.len();
+
+    // Pop aliases in reverse order so nested inlines compose
+    // correctly.
+    for name in aliased.iter().rev() {
+        ctx.pop_param_alias(name);
     }
-    false
-}
 
-fn stmt_mutates_state(stmt: &Statement, mutable_props: &HashSet<String>) -> bool {
-    match stmt {
-        Statement::Assignment { target, .. } => {
-            if let Expression::PropertyAccess { property } = target {
-                if mutable_props.contains(property) {
-                    return true;
-                }
-            }
-            false
-        }
-        Statement::ExpressionStatement { expression, .. } => {
-            expr_mutates_state(expression, mutable_props)
-        }
-        Statement::IfStatement {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            body_mutates_state(then_branch, mutable_props)
-                || else_branch
-                    .as_ref()
-                    .map_or(false, |e| body_mutates_state(e, mutable_props))
-        }
-        Statement::ForStatement { body, .. } => body_mutates_state(body, mutable_props),
-        _ => false,
+    // Method's "return value" is the last binding emitted by the
+    // body. Void methods (e.g., a private helper that just calls
+    // addOutput) still produce a binding which the caller
+    // expression-statement path will discard.
+    if end_index > start_index {
+        return ctx.bindings[end_index - 1].name.clone();
     }
-}
-
-fn expr_mutates_state(expr: &Expression, mutable_props: &HashSet<String>) -> bool {
-    match expr {
-        Expression::IncrementExpr { operand, .. } | Expression::DecrementExpr { operand, .. } => {
-            if let Expression::PropertyAccess { property } = operand.as_ref() {
-                if mutable_props.contains(property) {
-                    return true;
-                }
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// addOutput detection for determining change output necessity
-// ---------------------------------------------------------------------------
-
-/// Check if a method body contains any this.addOutput() calls.
-fn method_has_add_output(method: &MethodNode) -> bool {
-    body_has_add_output(&method.body)
-}
-
-fn body_has_add_output(stmts: &[Statement]) -> bool {
-    for stmt in stmts {
-        if stmt_has_add_output(stmt) {
-            return true;
-        }
-    }
-    false
-}
-
-fn stmt_has_add_output(stmt: &Statement) -> bool {
-    match stmt {
-        Statement::ExpressionStatement { expression, .. } => expr_has_add_output(expression),
-        Statement::IfStatement {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            body_has_add_output(then_branch)
-                || else_branch
-                    .as_ref()
-                    .map_or(false, |e| body_has_add_output(e))
-        }
-        Statement::ForStatement { body, .. } => body_has_add_output(body),
-        _ => false,
-    }
-}
-
-fn expr_has_add_output(expr: &Expression) -> bool {
-    if let Expression::CallExpr { callee, .. } = expr {
-        if let Expression::PropertyAccess { property } = callee.as_ref() {
-            if property == "addOutput" || property == "addRawOutput" {
-                return true;
-            }
-        }
-        if let Expression::MemberExpr { object, property } = callee.as_ref() {
-            if let Expression::Identifier { name } = object.as_ref() {
-                if name == "this" && (property == "addOutput" || property == "addRawOutput") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    // Empty body — emit a load_const placeholder so the caller has
+    // a ref.
+    ctx.emit(ANFValue::LoadConst {
+        value: serde_json::Value::String("@void".to_string()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,7 +2438,7 @@ fn is_assert_false_else(bindings: &[ANFBinding]) -> bool {
         return false;
     }
     let last = &bindings[bindings.len() - 1];
-    if let ANFValue::Assert { value: assert_ref } = &last.value {
+    if let ANFValue::Assert { value: assert_ref, .. } = &last.value {
         // Find the binding that assert_ref references
         for b in bindings {
             if b.name == *assert_ref {
@@ -1630,9 +2514,12 @@ fn collect_update_branches(
 fn remap_value_refs(value: &ANFValue, map: &HashMap<String, String>) -> ANFValue {
     let r = |s: &str| -> String { map.get(s).cloned().unwrap_or_else(|| s.to_string()) };
     match value {
-        ANFValue::LoadParam { .. } | ANFValue::LoadProp { .. } | ANFValue::GetStateScript {} => {
-            value.clone()
-        }
+        // raw_script carries an opaque byte span with no SSA operand refs —
+        // nothing to remap.
+        ANFValue::LoadParam { .. }
+        | ANFValue::LoadProp { .. }
+        | ANFValue::GetStateScript {}
+        | ANFValue::RawScript { .. } => value.clone(),
         ANFValue::LoadConst { value: v } => {
             if let Some(s) = v.as_str() {
                 if s.starts_with("@ref:") {
@@ -1666,13 +2553,14 @@ fn remap_value_refs(value: &ANFValue, map: &HashMap<String, String>) -> ANFValue
             method: method.clone(),
             args: args.iter().map(|a| r(a)).collect(),
         },
-        ANFValue::Assert { value: v } => ANFValue::Assert { value: r(v) },
+        ANFValue::Assert { value: v, is_auto_injected_state_check } => ANFValue::Assert { value: r(v), is_auto_injected_state_check: *is_auto_injected_state_check },
         ANFValue::UpdateProp { name, value: v } => ANFValue::UpdateProp {
             name: name.clone(),
             value: r(v),
         },
-        ANFValue::CheckPreimage { preimage } => ANFValue::CheckPreimage {
+        ANFValue::CheckPreimage { preimage, sighash_flag } => ANFValue::CheckPreimage {
             preimage: r(preimage),
+            sighash_flag: *sighash_flag,
         },
         ANFValue::DeserializeState { preimage } => ANFValue::DeserializeState {
             preimage: r(preimage),
@@ -1686,6 +2574,10 @@ fn remap_value_refs(value: &ANFValue, map: &HashMap<String, String>) -> ANFValue
             satoshis: r(satoshis),
             script_bytes: r(script_bytes),
         },
+        ANFValue::AddDataOutput { satoshis, script_bytes } => ANFValue::AddDataOutput {
+            satoshis: r(satoshis),
+            script_bytes: r(script_bytes),
+        },
         ANFValue::ArrayLiteral { elements } => ANFValue::ArrayLiteral {
             elements: elements.iter().map(|e| r(e)).collect(),
         },
@@ -1694,10 +2586,12 @@ fn remap_value_refs(value: &ANFValue, map: &HashMap<String, String>) -> ANFValue
             then: then.clone(),
             else_branch: else_branch.clone(),
         },
-        ANFValue::Loop { count, body, iter_var } => ANFValue::Loop {
+        ANFValue::Loop { count, body, iter_var, start, step } => ANFValue::Loop {
             count: *count,
             body: body.clone(),
             iter_var: iter_var.clone(),
+            start: start.clone(),
+            step: *step,
         },
     }
 }
@@ -2346,5 +3240,205 @@ class Counter extends StatefulSmartContract {
             "stateful method should have '_changeAmount' as an implicit param, got: {:?}",
             param_names
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ternary expression lowers to an ANFValue::If node (T-5)
+    // Mirrors the Java peer test (StackLowerTest#ternaryLowersToIfOpStructural)
+    // and the Go peer (anf_lower_test.go TestANFLower_Ternary). Localized
+    // regression detection — otherwise covered only by the cross-tier golden
+    // harness.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ternary_lowers_to_if() {
+        let source = r#"
+import { SmartContract, assert } from 'runar-lang';
+
+class TernaryDemo extends SmartContract {
+  readonly limit: bigint;
+
+  constructor(limit: bigint) {
+    super(limit);
+    this.limit = limit;
+  }
+
+  public check(flag: boolean): void {
+    const result: bigint = flag ? this.limit + 1n : this.limit - 1n;
+    assert(result > 0n);
+  }
+}
+"#;
+        let contract = must_lower_to_anf(source);
+        let program = lower_to_anf(&contract);
+
+        let check = program
+            .methods
+            .iter()
+            .find(|m| m.name == "check")
+            .expect("could not find 'check' method");
+
+        let if_binding = check
+            .body
+            .iter()
+            .find(|b| matches!(b.value, ANFValue::If { .. }));
+
+        let if_value = if_binding
+            .map(|b| &b.value)
+            .expect("expected ternary to lower to an ANFValue::If binding");
+
+        if let ANFValue::If { then, else_branch, .. } = if_value {
+            assert!(!then.is_empty(), "ternary `then` branch should not be empty");
+            assert!(
+                !else_branch.is_empty(),
+                "ternary `else` branch should not be empty"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #121: extract_loop_shape — non-zero start and countdown support
+    // -----------------------------------------------------------------------
+
+    /// Parse only (no validate) so the anf-lower loop-shape path is exercised.
+    fn parse_only(source: &str) -> ContractNode {
+        let result = parse_source(source, Some("test.runar.ts"));
+        assert!(result.errors.is_empty(), "parse errors: {:?}", result.errors);
+        result.contract.expect("expected a contract from parse")
+    }
+
+    /// Find the first `loop` node anywhere in a lowered program.
+    fn find_loop(anf: &ANFProgram) -> (usize, serde_json::Value, i64) {
+        fn walk(bindings: &[ANFBinding]) -> Option<(usize, serde_json::Value, i64)> {
+            for b in bindings {
+                match &b.value {
+                    ANFValue::Loop { count, start, step, .. } => {
+                        return Some((*count, start.clone(), *step));
+                    }
+                    ANFValue::If { then, else_branch, .. } => {
+                        if let Some(r) = walk(then).or_else(|| walk(else_branch)) {
+                            return Some(r);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        for m in &anf.methods {
+            if let Some(r) = walk(&m.body) {
+                return r;
+            }
+        }
+        panic!("no loop node found");
+    }
+
+    #[test]
+    fn test_extract_loop_shape_non_zero_start() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class NonZeroStart extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 1n; i < 3n; i++) {
+            sum = sum + i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_only(source);
+        let anf = lower_to_anf(&contract);
+        let (count, start, step) = find_loop(&anf);
+        assert_eq!(count, 2);
+        assert_eq!(start, serde_json::json!(1));
+        assert_eq!(step, 1);
+    }
+
+    #[test]
+    fn test_extract_loop_shape_countdown() {
+        let source = r#"
+import { SmartContract } from 'runar-lang';
+
+class Countdown extends SmartContract {
+    readonly n: bigint;
+
+    constructor(n: bigint) {
+        super(n);
+        this.n = n;
+    }
+
+    public run(v: bigint) {
+        let sum = 0n;
+        for (let i = 3n; i > 0n; i--) {
+            sum = sum + i;
+        }
+        assert(sum === v);
+    }
+}
+"#;
+        let contract = parse_only(source);
+        let anf = lower_to_anf(&contract);
+        let (count, start, step) = find_loop(&anf);
+        assert_eq!(count, 3);
+        assert_eq!(start, serde_json::json!(3));
+        assert_eq!(step, -1);
+    }
+
+    // -----------------------------------------------------------------------
+    // #130: a method param whose name shadows a property resolves to the param
+    // for bare identifiers, while explicit `this.x` still resolves to the
+    // property.
+    // -----------------------------------------------------------------------
+
+    /// Count `load_param` / `load_prop` bindings referencing `name` anywhere in
+    /// a method body (recursing into if/loop bodies).
+    fn count_loads(bindings: &[ANFBinding], kind_is_param: bool, name: &str) -> usize {
+        let mut n = 0;
+        for b in bindings {
+            match &b.value {
+                ANFValue::LoadParam { name: pn } if kind_is_param && pn == name => n += 1,
+                ANFValue::LoadProp { name: pn } if !kind_is_param && pn == name => n += 1,
+                ANFValue::If { then, else_branch, .. } => {
+                    n += count_loads(then, kind_is_param, name);
+                    n += count_loads(else_branch, kind_is_param, name);
+                }
+                ANFValue::Loop { body, .. } => {
+                    n += count_loads(body, kind_is_param, name);
+                }
+                _ => {}
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn test_param_shadowing_property_resolves_both_directions() {
+        let source = r#"
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+    readonly x: bigint;
+    constructor(x: bigint) { super(x); this.x = x; }
+    public m(x: bigint) {
+        assert(x === this.x);
+    }
+}
+"#;
+        let contract = parse_only(source);
+        let anf = lower_to_anf(&contract);
+        let m = anf.methods.iter().find(|m| m.name == "m").expect("method m");
+        // bare `x` -> load_param (the witness value), not the property.
+        assert_eq!(count_loads(&m.body, true, "x"), 1, "expected one load_param x");
+        // explicit `this.x` -> load_prop (the stored property).
+        assert_eq!(count_loads(&m.body, false, "x"), 1, "expected one load_prop x");
     }
 }

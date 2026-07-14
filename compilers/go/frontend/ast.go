@@ -60,6 +60,17 @@ type ContractNode struct {
 	SourceFile  string
 }
 
+// SyntheticArrayLevel is one level of the synthetic FixedArray nesting
+// chain attached by the expand-fixed-arrays pass to each scalar leaf
+// property that came from an expanded FixedArray declaration. The
+// outermost entry (index 0) is the user-declared property name; the
+// last entry is the innermost.
+type SyntheticArrayLevel struct {
+	Base   string
+	Index  int
+	Length int
+}
+
 // PropertyNode represents a contract property declaration.
 type PropertyNode struct {
 	Name           string
@@ -67,6 +78,25 @@ type PropertyNode struct {
 	Readonly       bool
 	Initializer    Expression // may be nil — literal default value
 	SourceLocation SourceLocation
+
+	// EmbedAlways is set by the parser when a `/** @embedAlways */` (or
+	// `// @embedAlways`) comment directive immediately precedes a readonly
+	// field (issue #109). It opts the field OUT of dead-code elimination: a
+	// readonly field no method references is normally stripped from the
+	// locking script (its load_prop is dead, so no constructor slot is
+	// emitted), silently removing deploy-time metadata an author intends to
+	// recover from the on-chain script later. When set, ANF lowering forces
+	// the field into the script (a constructor slot) so its bytes survive.
+	// Comment-directive form (not a decorator) keeps it portable across the
+	// surface formats. Only meaningful on readonly fields.
+	EmbedAlways bool
+
+	// SyntheticArrayChain records the full nesting of FixedArray levels
+	// that produced a given scalar leaf property. Only populated by the
+	// expand-fixed-arrays pass; a nil chain means the property is
+	// either user-written or was not expanded from a FixedArray.
+	// The outermost level (index 0) is the user-declared property name.
+	SyntheticArrayChain []SyntheticArrayLevel
 }
 
 // MethodNode represents a contract method or constructor.
@@ -76,6 +106,14 @@ type MethodNode struct {
 	Body           []Statement
 	Visibility     string // "public" or "private"
 	SourceLocation SourceLocation
+
+	// SighashType is the BIP-143 sighash type declared via a
+	// `/** @sighash <FLAGS> */` directive on a public method (issue #123),
+	// e.g. 0x43 for SINGLE|FORKID. Nil = no directive = the default
+	// ALL|FORKID (0x41), byte-identical to the historically-pinned mode.
+	// Drives the auto-injected preimage-type assert, the OP_PUSH_TX binding
+	// flag, the ABI sigHashType, and the SDK-side preimage construction.
+	SighashType *int
 }
 
 // ParamNode represents a method parameter.
@@ -180,6 +218,12 @@ func (UnaryExpr) exprMarker() {}
 type CallExpr struct {
 	Callee Expression
 	Args   []Expression
+
+	// AsmReturnType is set only for the expression form `asm<T>({...})` of
+	// the asm compiler intrinsic. It carries the captured primitive return
+	// type ("bigint", "boolean", or "ByteString"); empty for the statement
+	// form and for every non-asm call.
+	AsmReturnType string
 }
 
 func (CallExpr) exprMarker() {}
@@ -285,6 +329,8 @@ var primitiveTypeNames = map[string]bool{
 	"RabinPubKey":    true,
 	"void":           true,
 	"Point":          true,
+	"P256Point":      true,
+	"P384Point":      true,
 }
 
 // IsPrimitiveType returns true if the name is a recognized Rúnar primitive type.

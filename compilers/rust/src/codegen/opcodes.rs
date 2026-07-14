@@ -4,6 +4,7 @@
 //! opcodes that were disabled in BTC but re-enabled in BSV (OP_CAT, OP_SPLIT,
 //! OP_MUL, OP_DIV, OP_MOD, OP_LSHIFT, OP_RSHIFT, OP_AND, OP_OR, OP_XOR).
 
+use num_bigint::BigInt;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -84,6 +85,8 @@ pub static OPCODES: LazyLock<HashMap<&'static str, u8>> = LazyLock::new(|| {
     // Arithmetic
     m.insert("OP_1ADD", 0x8b);
     m.insert("OP_1SUB", 0x8c);
+    m.insert("OP_2MUL", 0x8d);
+    m.insert("OP_2DIV", 0x8e);
     m.insert("OP_NEGATE", 0x8f);
     m.insert("OP_ABS", 0x90);
     m.insert("OP_NOT", 0x91);
@@ -120,10 +123,103 @@ pub static OPCODES: LazyLock<HashMap<&'static str, u8>> = LazyLock::new(|| {
     m.insert("OP_CHECKMULTISIG", 0xae);
     m.insert("OP_CHECKMULTISIGVERIFY", 0xaf);
 
+    // Chronicle opcodes
+    m.insert("OP_SUBSTR", 0xb3);
+    m.insert("OP_LEFT", 0xb4);
+    m.insert("OP_RIGHT", 0xb5);
+    m.insert("OP_LSHIFTNUM", 0xb6);
+    m.insert("OP_RSHIFTNUM", 0xb7);
+
     m
 });
 
 /// Look up an opcode byte by name. Returns `None` if unknown.
 pub fn opcode_byte(name: &str) -> Option<u8> {
     OPCODES.get(name).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_critical_opcode_bytes() {
+        let map = &*OPCODES;
+        // Flow control
+        assert_eq!(map.get("OP_IF"), Some(&0x63u8));
+        assert_eq!(map.get("OP_ELSE"), Some(&0x67u8));
+        assert_eq!(map.get("OP_ENDIF"), Some(&0x68u8));
+        assert_eq!(map.get("OP_VERIFY"), Some(&0x69u8));
+        assert_eq!(map.get("OP_RETURN"), Some(&0x6au8));
+
+        // Stack
+        assert_eq!(map.get("OP_TOALTSTACK"), Some(&0x6bu8));
+        assert_eq!(map.get("OP_FROMALTSTACK"), Some(&0x6cu8));
+        assert_eq!(map.get("OP_DROP"), Some(&0x75u8));
+        assert_eq!(map.get("OP_DUP"), Some(&0x76u8));
+        assert_eq!(map.get("OP_NIP"), Some(&0x77u8));
+        assert_eq!(map.get("OP_OVER"), Some(&0x78u8));
+        assert_eq!(map.get("OP_PICK"), Some(&0x79u8));
+        assert_eq!(map.get("OP_ROLL"), Some(&0x7au8));
+        assert_eq!(map.get("OP_ROT"), Some(&0x7bu8));
+        assert_eq!(map.get("OP_SWAP"), Some(&0x7cu8));
+
+        // Splice
+        assert_eq!(map.get("OP_CAT"), Some(&0x7eu8));
+        assert_eq!(map.get("OP_SPLIT"), Some(&0x7fu8));
+        assert_eq!(map.get("OP_SIZE"), Some(&0x82u8));
+
+        // Bitwise
+        assert_eq!(map.get("OP_INVERT"), Some(&0x83u8));
+        assert_eq!(map.get("OP_AND"), Some(&0x84u8));
+        assert_eq!(map.get("OP_OR"), Some(&0x85u8));
+        assert_eq!(map.get("OP_XOR"), Some(&0x86u8));
+        assert_eq!(map.get("OP_EQUAL"), Some(&0x87u8));
+        assert_eq!(map.get("OP_EQUALVERIFY"), Some(&0x88u8));
+
+        // Arithmetic
+        assert_eq!(map.get("OP_NOT"), Some(&0x91u8));
+        assert_eq!(map.get("OP_ADD"), Some(&0x93u8));
+        assert_eq!(map.get("OP_SUB"), Some(&0x94u8));
+        assert_eq!(map.get("OP_MUL"), Some(&0x95u8));
+        assert_eq!(map.get("OP_DIV"), Some(&0x96u8));
+        assert_eq!(map.get("OP_MOD"), Some(&0x97u8));
+        assert_eq!(map.get("OP_LSHIFT"), Some(&0x98u8));
+        assert_eq!(map.get("OP_RSHIFT"), Some(&0x99u8));
+        assert_eq!(map.get("OP_NUMEQUAL"), Some(&0x9cu8));
+        assert_eq!(map.get("OP_NUMEQUALVERIFY"), Some(&0x9du8));
+        assert_eq!(map.get("OP_LESSTHAN"), Some(&0x9fu8));
+        assert_eq!(map.get("OP_GREATERTHAN"), Some(&0xa0u8));
+
+        // Crypto
+        assert_eq!(map.get("OP_RIPEMD160"), Some(&0xa6u8));
+        assert_eq!(map.get("OP_SHA256"), Some(&0xa8u8));
+        assert_eq!(map.get("OP_HASH160"), Some(&0xa9u8));
+        assert_eq!(map.get("OP_HASH256"), Some(&0xaau8));
+        assert_eq!(map.get("OP_CODESEPARATOR"), Some(&0xabu8));
+        assert_eq!(map.get("OP_CHECKSIG"), Some(&0xacu8));
+        assert_eq!(map.get("OP_CHECKSIGVERIFY"), Some(&0xadu8));
+        assert_eq!(map.get("OP_CHECKMULTISIG"), Some(&0xaeu8));
+
+        // Constants
+        assert_eq!(map.get("OP_0"), Some(&0x00u8));
+        assert_eq!(map.get("OP_FALSE"), Some(&0x00u8));
+        assert_eq!(map.get("OP_1NEGATE"), Some(&0x4fu8));
+        assert_eq!(map.get("OP_1"), Some(&0x51u8));
+        assert_eq!(map.get("OP_TRUE"), Some(&0x51u8));
+    }
+
+    #[test]
+    fn test_push_number_opcodes_sequential() {
+        let map = &*OPCODES;
+        for i in 1u8..=16 {
+            let name = format!("OP_{i}");
+            let expected = 0x50 + i;
+            assert_eq!(
+                map.get(name.as_str()),
+                Some(&expected),
+                "{name} should be 0x{expected:02x}"
+            );
+        }
+    }
 }

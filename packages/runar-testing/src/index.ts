@@ -27,7 +27,55 @@ export {
   arbStatelessContract,
   arbArithmeticContract,
   arbCryptoContract,
+  arbGeneratedContract,
+  arbGeneratedStatefulContract,
+  renderTypeScript,
+  renderGo,
+  renderRust,
+  renderPython,
+  renderZig,
+  renderRuby,
+  RENDERERS,
+  FORMAT_EXTENSIONS,
+  toSnakeCase,
+  toPascalCase,
 } from './fuzzer/index.js';
+export type {
+  GeneratorConfig,
+  GeneratedContract,
+  GeneratedProperty,
+  GeneratedMethod,
+  GeneratedParam,
+  RenderFormat,
+  RuinarType,
+  Expr,
+  Stmt,
+} from './fuzzer/index.js';
+
+// Differential-execution oracle (source-vs-script)
+export {
+  buildWitness,
+  runDifferentialExecution,
+  runTriModalExecution,
+  runFoldEquivalence,
+  runStatelessSigned,
+  runStatefulSpend,
+  testKey,
+} from './oracle/index.js';
+export type {
+  WitnessArg,
+  DiffExecOptions,
+  DiffExecResult,
+  TriModalExecResult,
+  FoldEqOptions,
+  FoldEqResult,
+  FoldEqDivergence,
+  RealExecResult,
+  SignMarker,
+  StatelessArg,
+  StatelessSignedOptions,
+  StatefulSpendOptions,
+} from './oracle/index.js';
 
 // Test helpers
 export {
@@ -77,6 +125,9 @@ export {
 } from './crypto/rabin.js';
 export type { RabinKeyPair } from './crypto/rabin.js';
 
+// Test-environment helpers (CI gate for slow tests)
+export { IS_CI, runSlowTests } from './test-env.js';
+
 // Post-quantum crypto primitives
 export { wotsKeygen, wotsSign, wotsVerify, WOTS_PARAMS } from './crypto/wots.js';
 export type { WOTSKeyPair } from './crypto/wots.js';
@@ -86,6 +137,22 @@ export {
   SLH_SHA2_256s, SLH_SHA2_256f, ALL_SHA2_PARAMS,
 } from './crypto/slh-dsa.js';
 export type { SLHParams, SLHKeyPair } from './crypto/slh-dsa.js';
+
+// Analyzer
+export {
+  analyzeScript,
+  parseScript,
+  getStackEffect,
+  analyzeStackLinear,
+  collapseRawScriptSpans,
+  isRawSpan,
+  RAW_SPAN_OPCODE,
+} from './analyzer/index.js';
+export type {
+  AnalysisResult, AnalysisFinding, AnalysisSummary, AnalyzeOptions,
+  ExecutionPath, FindingSeverity, FindingCode, RawScriptSpan,
+} from './analyzer/index.js';
+export type { ParsedOpcode } from './analyzer/index.js';
 
 // Mock preimage helpers (standalone BIP-143 preimage building for stateful contracts)
 export {

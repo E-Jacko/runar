@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,14 +13,39 @@ import (
 	"github.com/icellan/runar/compilers/go/ir"
 )
 
+// buildTimestamp returns the artifact build time as an RFC 3339 string. When
+// SOURCE_DATE_EPOCH is set (the reproducible-builds standard, a Unix seconds
+// value), that instant is used so byte-identical inputs yield byte-identical
+// artifacts across machines and runs; otherwise the current wall-clock time.
+func buildTimestamp() string {
+	if s := os.Getenv("SOURCE_DATE_EPOCH"); s != "" {
+		if sec, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return time.Unix(sec, 0).UTC().Format(time.RFC3339)
+		}
+	}
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
 // ---------------------------------------------------------------------------
 // Artifact types — mirrors the TypeScript RunarArtifact schema
 // ---------------------------------------------------------------------------
 
+// ABIFixedArray describes the fixed-array shape of a grouped ABI
+// parameter or state field. `ElementType` is the immediate child type
+// (possibly itself a nested `FixedArray<...>` string); `SyntheticNames`
+// is the flat leaf list in declaration order so the SDK can walk
+// linearly when flattening or regrouping array values.
+type ABIFixedArray struct {
+	ElementType    string   `json:"elementType"`
+	Length         int      `json:"length"`
+	SyntheticNames []string `json:"syntheticNames"`
+}
+
 // ABIParam describes a parameter in the ABI.
 type ABIParam struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name       string         `json:"name"`
+	Type       string         `json:"type"`
+	FixedArray *ABIFixedArray `json:"fixedArray,omitempty"`
 }
 
 // ABIConstructor describes the constructor ABI.
@@ -33,6 +59,13 @@ type ABIMethod struct {
 	Params     []ABIParam `json:"params"`
 	IsPublic   bool       `json:"isPublic"`
 	IsTerminal *bool      `json:"isTerminal,omitempty"`
+	// UsesCodePart: unlocking script is prefixed with _codePart (issue #100).
+	UsesCodePart *bool `json:"usesCodePart,omitempty"`
+	// SigHashType: the BIP-143 sighash type this method's preimage/covenant is
+	// built under (from a `@sighash` directive, issue #123), e.g. 0x43 for
+	// SINGLE|FORKID. Absent = default ALL|FORKID (0x41); the SDK falls back to
+	// 0x41 so existing artifacts are unchanged.
+	SigHashType *int `json:"sigHashType,omitempty"`
 }
 
 // ABI describes the contract's public interface.
@@ -43,14 +76,18 @@ type ABI struct {
 
 // StateField describes a stateful contract field.
 type StateField struct {
-	Name         string      `json:"name"`
-	Type         string      `json:"type"`
-	Index        int         `json:"index"`
-	InitialValue interface{} `json:"initialValue,omitempty"`
+	Name         string         `json:"name"`
+	Type         string         `json:"type"`
+	Index        int            `json:"index"`
+	InitialValue interface{}    `json:"initialValue,omitempty"`
+	FixedArray   *ABIFixedArray `json:"fixedArray,omitempty"`
 }
 
 // ConstructorSlot records a constructor parameter placeholder in the compiled script.
 type ConstructorSlot = codegen.ConstructorSlot
+
+// CodeSepIndexSlot records a codeSepIndex placeholder in the compiled script.
+type CodeSepIndexSlot = codegen.CodeSepIndexSlot
 
 // SourceMapping is re-exported from codegen.
 type SourceMapping = codegen.SourceMapping
@@ -66,27 +103,51 @@ type IRDebug struct {
 	Stack []codegen.StackMethod `json:"stack,omitempty"`
 }
 
+// Groth16WAMeta records metadata about a witness-assisted Groth16 verifier
+// artifact produced by `runarc groth16-wa`. It lets downstream consumers
+// sanity-check that the baked-in VK matches what they expect without having
+// to re-derive anything from the script bytes.
+type Groth16WAMeta struct {
+	// NumPubInputs is the number of public inputs the Groth16 circuit was
+	// parameterised with. Matches `vk.numPubInputs` from the input JSON.
+	NumPubInputs int `json:"numPubInputs"`
+
+	// VKDigest is the SHA-256 hex of the RAW bytes of the source VK JSON
+	// file (not a canonical form). It is a pure reproducibility marker:
+	// if two artifacts have the same VKDigest, they were compiled from
+	// byte-identical VK files. It is NOT a cryptographic commitment to
+	// the VK semantics and should not be used for anything load-bearing.
+	VKDigest string `json:"vkDigest"`
+}
+
 // Artifact is the final compiled output of a Rúnar compiler.
 type Artifact struct {
 	Version                string            `json:"version"`
 	CompilerVersion        string            `json:"compilerVersion"`
 	ContractName           string            `json:"contractName"`
+	ParentClass            string            `json:"parentClass,omitempty"`
 	ABI                    ABI               `json:"abi"`
 	Script                 string            `json:"script"`
 	ASM                    string            `json:"asm"`
 	StateFields            []StateField      `json:"stateFields,omitempty"`
-	ConstructorSlots       []ConstructorSlot `json:"constructorSlots,omitempty"`
-	CodeSeparatorIndex     *int              `json:"codeSeparatorIndex,omitempty"`
+	ConstructorSlots       []ConstructorSlot  `json:"constructorSlots,omitempty"`
+	CodeSepIndexSlots      []CodeSepIndexSlot `json:"codeSepIndexSlots,omitempty"`
+	CodeSeparatorIndex     *int               `json:"codeSeparatorIndex,omitempty"`
 	CodeSeparatorIndices   []int             `json:"codeSeparatorIndices,omitempty"`
 	BuildTimestamp         string            `json:"buildTimestamp"`
 	ANF                    *ir.ANFProgram    `json:"anf,omitempty"`
 	SourceMapData          *SourceMap        `json:"sourceMap,omitempty"`
 	IR                     *IRDebug          `json:"ir,omitempty"`
+
+	// Groth16WA is populated only for artifacts produced by the
+	// `runarc groth16-wa` backend. Nil for normal Rúnar contract
+	// compilations. See Groth16WAMeta for field semantics.
+	Groth16WA *Groth16WAMeta `json:"groth16WA,omitempty"`
 }
 
 const (
-	schemaVersion   = "runar-v0.4.4"
-	compilerVersion = "0.4.4-go"
+	schemaVersion   = "runar-v1.0.0-rc.1"
+	compilerVersion = "1.0.0-rc.1-go"
 )
 
 // ---------------------------------------------------------------------------
@@ -100,7 +161,7 @@ func CompileFromIR(irPath string, opts ...CompileOptions) (*Artifact, error) {
 		return nil, fmt.Errorf("loading IR: %w", err)
 	}
 
-	return CompileFromProgram(program, opts...)
+	return CompileFromProgram(program, disableFoldForIRInput(opts)...)
 }
 
 // CompileFromIRBytes compiles from raw ANF IR JSON bytes.
@@ -110,7 +171,24 @@ func CompileFromIRBytes(data []byte, opts ...CompileOptions) (*Artifact, error) 
 		return nil, fmt.Errorf("loading IR: %w", err)
 	}
 
-	return CompileFromProgram(program, opts...)
+	return CompileFromProgram(program, disableFoldForIRInput(opts)...)
+}
+
+// disableFoldForIRInput forces the ANF constant-folding pass off when the
+// compiler is fed already-lowered ANF IR (the `--ir` path). The ANF fold is a
+// source-pipeline optimization; re-running it on pre-lowered IR rewrites
+// `bin_op`s to constants but leaves the now-dead operand bindings in place
+// (FoldConstants intentionally does no dead-binding elimination — see
+// frontend/constant_fold.go:574), which the stack-lowering then emits as
+// wasteful push+drop sequences. The result diverges from both the fold-OFF
+// goldens and the Zig tier, whose `compileFromIR` never folds IR input
+// (compilers/zig/src/main.zig:226). Forcing fold off here makes the IR path
+// byte-identical to the goldens across all tiers. Constant folding is still
+// exercised on the source path (CompileFromSource).
+func disableFoldForIRInput(opts []CompileOptions) []CompileOptions {
+	o := mergeOptions(opts)
+	o.DisableConstantFolding = true
+	return []CompileOptions{o}
 }
 
 // CompileFromProgram compiles a parsed ANF program to a Rúnar artifact.
@@ -118,18 +196,42 @@ func CompileFromProgram(program *ir.ANFProgram, opts ...CompileOptions) (*Artifa
 	o := mergeOptions(opts)
 
 	// Bake constructor args into ANF properties.
-	applyConstructorArgs(program, o.ConstructorArgs)
+	if errs := applyConstructorArgs(program, o.ConstructorArgs); len(errs) > 0 {
+		return nil, fmt.Errorf("applyConstructorArgs: %s", strings.Join(errs, "; "))
+	}
 
 	// Pass 4.25: Constant folding (on by default)
 	if !o.DisableConstantFolding {
 		program = frontend.FoldConstants(program)
 	}
 
-	// EC optimization — algebraic simplification of EC calls
+	// EC optimization — algebraic simplification of EC calls.
+	// Delegates internally to frontend/dce.go for dead-binding cleanup
+	// after any EC rewrite (see eliminateDeadBindings in anf_optimize.go).
 	program = frontend.OptimizeEC(program)
 
+	// Mode 3: when CompileOptions.Groth16WAVKey is set, load the SP1
+	// vk.json and build the codegen.Groth16Config that the stack-lowering
+	// preamble emitter will consume. The compiler package can import
+	// bn254witness (which already imports codegen for the NAF table); the
+	// codegen package cannot, so the loading happens here.
+	var lowerOpts codegen.LowerToStackOptions
+	if o.Groth16WAVKey != "" {
+		cfg, err := loadGroth16WAConfig(o.Groth16WAVKey)
+		if err != nil {
+			return nil, fmt.Errorf("loading Groth16WAVKey %q: %w", o.Groth16WAVKey, err)
+		}
+		lowerOpts.Groth16WAConfig = &cfg
+	}
+	// SP1 FRI verifier param tuple override. nil falls back to
+	// codegen.DefaultSP1FriParams() (the validated PoC tuple). Use
+	// `compiler.SP1FriPreset(name)` for the canonical presets.
+	if o.SP1FriParams != nil {
+		lowerOpts.SP1FriParams = o.SP1FriParams
+	}
+
 	// Pass 5: Stack lowering
-	stackMethods, err := codegen.LowerToStack(program)
+	stackMethods, err := codegen.LowerToStack(program, lowerOpts)
 	if err != nil {
 		return nil, fmt.Errorf("stack lowering: %w", err)
 	}
@@ -145,37 +247,72 @@ func CompileFromProgram(program *ir.ANFProgram, opts ...CompileOptions) (*Artifa
 		return nil, fmt.Errorf("emit: %w", err)
 	}
 
-	artifact := assembleArtifact(program, emitResult.ScriptHex, emitResult.ScriptAsm, emitResult.ConstructorSlots, emitResult.CodeSeparatorIndex, emitResult.CodeSeparatorIndices, emitResult.SourceMap, stackMethods, o)
+	artifact := assembleArtifact(program, emitResult.ScriptHex, emitResult.ScriptAsm, emitResult.ConstructorSlots, emitResult.CodeSepIndexSlots, emitResult.CodeSeparatorIndex, emitResult.CodeSeparatorIndices, emitResult.SourceMap, stackMethods, o)
 	return artifact, nil
 }
 
 // assembleArtifact builds the final output artifact from the compilation products.
-func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, constructorSlots []ConstructorSlot, codeSeparatorIndex int, codeSeparatorIndices []int, sourceMap []codegen.SourceMapping, stackMethods []codegen.StackMethod, opts CompileOptions) *Artifact {
+func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, constructorSlots []ConstructorSlot, codeSepIndexSlots []CodeSepIndexSlot, codeSeparatorIndex int, codeSeparatorIndices []int, sourceMap []codegen.SourceMapping, stackMethods []codegen.StackMethod, opts CompileOptions) *Artifact {
+	// ---------------------------------------------------------------------
 	// Build ABI
+	// ---------------------------------------------------------------------
 	// Build constructor params, excluding properties with initializers
 	// (properties with default values are not constructor parameters).
-	var constructorParams []ABIParam
-	for _, prop := range program.Properties {
-		if prop.InitialValue == nil {
-			constructorParams = append(constructorParams, ABIParam{Name: prop.Name, Type: prop.Type})
+	// Run the entries through the iterative synthetic-array regrouper so
+	// that expanded FixedArray siblings collapse back into a single
+	// logical parameter for the user-facing ABI.
+	var ctorEntries []regroupEntry
+	for i, prop := range program.Properties {
+		if prop.InitialValue != nil {
+			continue
 		}
+		ctorEntries = append(ctorEntries, regroupEntry{
+			name:  prop.Name,
+			typ:   prop.Type,
+			chain: append([]ir.ANFSyntheticArrayLevel(nil), prop.SyntheticArrayChain...),
+			index: i,
+		})
+	}
+	regroupedCtor := regroupSyntheticRuns(ctorEntries)
+	var constructorParams []ABIParam
+	for _, e := range regroupedCtor {
+		p := ABIParam{Name: e.name, Type: e.typ}
+		if e.fixedArray != nil {
+			p.FixedArray = e.fixedArray
+		}
+		constructorParams = append(constructorParams, p)
 	}
 
 	// Build state fields for stateful contracts.
 	// Index = property position (matching constructor arg order), not sequential mutable index.
-	var stateFields []StateField
+	var stateEntries []regroupEntry
 	for i, prop := range program.Properties {
-		if !prop.Readonly {
-			sf := StateField{
-				Name:  prop.Name,
-				Type:  prop.Type,
-				Index: i,
-			}
-			if prop.InitialValue != nil {
-				sf.InitialValue = prop.InitialValue
-			}
-			stateFields = append(stateFields, sf)
+		if prop.Readonly {
+			continue
 		}
+		stateEntries = append(stateEntries, regroupEntry{
+			name:         prop.Name,
+			typ:          prop.Type,
+			chain:        append([]ir.ANFSyntheticArrayLevel(nil), prop.SyntheticArrayChain...),
+			initialValue: prop.InitialValue,
+			index:        i,
+		})
+	}
+	regroupedState := regroupSyntheticRuns(stateEntries)
+	var stateFields []StateField
+	for _, e := range regroupedState {
+		sf := StateField{
+			Name:  e.name,
+			Type:  e.typ,
+			Index: e.index,
+		}
+		if e.initialValue != nil {
+			sf.InitialValue = e.initialValue
+		}
+		if e.fixedArray != nil {
+			sf.FixedArray = e.fixedArray
+		}
+		stateFields = append(stateFields, sf)
 	}
 
 	isStateful := len(stateFields) > 0
@@ -194,6 +331,13 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 			Params:   params,
 			IsPublic: method.IsPublic,
 		}
+		// Issue #123: carry a non-default @sighash mode into the ABI so the SDK
+		// builds the BIP-143 preimage under the same flags the covenant expects.
+		// Omitted for the default (0x41) → existing artifacts are byte-identical.
+		if method.IsPublic && method.SigHashType != nil && *method.SigHashType != frontend.SighashDefault {
+			v := *method.SigHashType
+			m.SigHashType = &v
+		}
 		// For stateful contracts, mark public methods without _changePKH as terminal
 		if isStateful && method.IsPublic {
 			hasChange := false
@@ -206,6 +350,16 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 			if !hasChange {
 				t := true
 				m.IsTerminal = &t
+			}
+		}
+		// Propagate the authoritative _codePart decision from stack-lowering
+		// into the ABI so the SDK supplies _codePart for terminal var-length
+		// reads (issue #100).
+		for i := range stackMethods {
+			if stackMethods[i].Name == method.Name && stackMethods[i].UsesCodePart {
+				u := true
+				m.UsesCodePart = &u
+				break
 			}
 		}
 		methods = append(methods, m)
@@ -227,6 +381,7 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 		Version:         schemaVersion,
 		CompilerVersion: compilerVersion,
 		ContractName:    program.ContractName,
+		ParentClass:     program.ParentClass,
 		ABI: ABI{
 			Constructor: ABIConstructor{Params: constructorParams},
 			Methods:     methods,
@@ -235,9 +390,10 @@ func assembleArtifact(program *ir.ANFProgram, scriptHex, scriptAsm string, const
 		ASM:                  scriptAsm,
 		StateFields:          stateFields,
 		ConstructorSlots:     constructorSlots,
+		CodeSepIndexSlots:   codeSepIndexSlots,
 		CodeSeparatorIndex:   csIndex,
 		CodeSeparatorIndices: csIndices,
-		BuildTimestamp:       time.Now().UTC().Format(time.RFC3339),
+		BuildTimestamp:       buildTimestamp(),
 	}
 
 	// Always include ANF IR for stateful contracts — the SDK uses it
@@ -290,11 +446,64 @@ func CompileFromSource(sourcePath string, opts ...CompileOptions) (*Artifact, er
 		return nil, fmt.Errorf("type check errors:\n  %s", strings.Join(tcResult.ErrorStrings(), "\n  "))
 	}
 
+	// Pass 3b: Expand FixedArray properties into scalar siblings.
+	// Runs after typecheck and before ANF lowering; downstream passes
+	// see only scalar properties and direct-access / dispatch-chain
+	// expressions, so no further FixedArray plumbing is required in
+	// ANF, stack, or emit.
+	expandResult := frontend.ExpandFixedArrays(parseResult.Contract)
+	if len(expandResult.Errors) > 0 {
+		return nil, fmt.Errorf("expand-fixed-arrays errors:\n  %s", strings.Join(diagStrings(expandResult.Errors), "\n  "))
+	}
+	expandedContract := expandResult.Contract
+
 	// Pass 4: ANF lowering
-	program := frontend.LowerToANF(parseResult.Contract)
+	program := frontend.LowerToANF(expandedContract)
 
 	// Feed into existing compilation pipeline (passes 4.25+)
 	return CompileFromProgram(program, opts...)
+}
+
+// ParseAndValidateOnlyResult is the result of `ParseAndValidateOnly`. `Err`
+// is non-nil iff the parser or validator emitted any error-severity
+// diagnostics.
+type ParseAndValidateOnlyResult struct {
+	Err error
+}
+
+// ParseAndValidateOnly runs Pass 1 (parse, dispatched by file extension) and
+// Pass 2 (validate) and returns. Used by the conformance runner's
+// `--parser-only` mode to assert universal frontend coverage without paying
+// for typecheck / ANF / stack / emit.
+func ParseAndValidateOnly(source []byte, sourcePath string) ParseAndValidateOnlyResult {
+	parseResult := frontend.ParseSource(source, sourcePath)
+	if len(parseResult.Errors) > 0 {
+		return ParseAndValidateOnlyResult{
+			Err: fmt.Errorf("parse errors:\n  %s", strings.Join(parseResult.ErrorStrings(), "\n  ")),
+		}
+	}
+	if parseResult.Contract == nil {
+		return ParseAndValidateOnlyResult{
+			Err: fmt.Errorf("no contract found in %s", sourcePath),
+		}
+	}
+	validResult := frontend.Validate(parseResult.Contract)
+	if len(validResult.Errors) > 0 {
+		return ParseAndValidateOnlyResult{
+			Err: fmt.Errorf("validation errors:\n  %s", strings.Join(validResult.ErrorStrings(), "\n  ")),
+		}
+	}
+	return ParseAndValidateOnlyResult{Err: nil}
+}
+
+// diagStrings renders a diagnostic slice as a list of error messages for
+// `fmt.Errorf` consumption.
+func diagStrings(diags []frontend.Diagnostic) []string {
+	out := make([]string, len(diags))
+	for i, d := range diags {
+		out[i] = d.Message
+	}
+	return out
 }
 
 // CompileSourceToIR runs passes 1-4 on a .runar.ts source file and returns the ANF program.
@@ -322,7 +531,12 @@ func CompileSourceToIR(sourcePath string, opts ...CompileOptions) (*ir.ANFProgra
 		return nil, fmt.Errorf("type check errors:\n  %s", strings.Join(tcResult.ErrorStrings(), "\n  "))
 	}
 
-	program := frontend.LowerToANF(parseResult.Contract)
+	expandResult := frontend.ExpandFixedArrays(parseResult.Contract)
+	if len(expandResult.Errors) > 0 {
+		return nil, fmt.Errorf("expand-fixed-arrays errors:\n  %s", strings.Join(diagStrings(expandResult.Errors), "\n  "))
+	}
+
+	program := frontend.LowerToANF(expandResult.Contract)
 
 	o := mergeOptions(opts)
 	// Pass 4.25: Constant folding (on by default)
@@ -442,11 +656,25 @@ func CompileFromSourceWithResult(sourcePath string, opts ...CompileOptions) *Com
 		return result
 	}
 
+	// Pass 3b: Expand FixedArray properties.
+	expandResult := frontend.ExpandFixedArrays(result.Contract)
+	result.Diagnostics = append(result.Diagnostics, expandResult.Errors...)
+	if hasErrors(result.Diagnostics) {
+		return result
+	}
+	result.Contract = expandResult.Contract
+
 	// Pass 4: ANF lowering
 	result.ANF = frontend.LowerToANF(result.Contract)
 
 	// Bake constructor args into ANF properties.
-	applyConstructorArgs(result.ANF, o.ConstructorArgs)
+	if errs := applyConstructorArgs(result.ANF, o.ConstructorArgs); len(errs) > 0 {
+		for _, msg := range errs {
+			result.Diagnostics = append(result.Diagnostics, frontend.MakeDiagnostic(
+				msg, frontend.SeverityError, nil))
+		}
+		return result
+	}
 
 	// Pass 4.25: Constant folding (on by default)
 	if !o.DisableConstantFolding {
@@ -455,6 +683,12 @@ func CompileFromSourceWithResult(sourcePath string, opts ...CompileOptions) *Com
 
 	// Pass 4.5: EC optimization
 	result.ANF = frontend.OptimizeEC(result.ANF)
+
+	// Issue #109: warn when DCE strips an un-annotated readonly field. Computed
+	// from the post-lowering ANF (the surviving load_prop set), mirroring the TS
+	// reference's collectReferencedProps(optimizedAnf) placement.
+	result.Diagnostics = append(result.Diagnostics,
+		frontend.CollectEmbedAlwaysDCEWarnings(result.Contract, result.ANF)...)
 
 	// Pass 5: Stack lowering (recover from panics)
 	var stackMethods []codegen.StackMethod
@@ -469,7 +703,11 @@ func CompileFromSourceWithResult(sourcePath string, opts ...CompileOptions) *Com
 			}
 		}()
 		var stackErr error
-		stackMethods, stackErr = codegen.LowerToStack(result.ANF)
+		var lowerOpts codegen.LowerToStackOptions
+		if o.SP1FriParams != nil {
+			lowerOpts.SP1FriParams = o.SP1FriParams
+		}
+		stackMethods, stackErr = codegen.LowerToStack(result.ANF, lowerOpts)
 		if stackErr != nil {
 			result.Diagnostics = append(result.Diagnostics, frontend.MakeDiagnostic(
 				fmt.Sprintf("stack lowering: %s", stackErr),
@@ -509,7 +747,7 @@ func CompileFromSourceWithResult(sourcePath string, opts ...CompileOptions) *Com
 			return
 		}
 
-		artifact := assembleArtifact(result.ANF, emitResult.ScriptHex, emitResult.ScriptAsm, emitResult.ConstructorSlots, emitResult.CodeSeparatorIndex, emitResult.CodeSeparatorIndices, emitResult.SourceMap, stackMethods, o)
+		artifact := assembleArtifact(result.ANF, emitResult.ScriptHex, emitResult.ScriptAsm, emitResult.ConstructorSlots, emitResult.CodeSepIndexSlots, emitResult.CodeSeparatorIndex, emitResult.CodeSeparatorIndices, emitResult.SourceMap, stackMethods, o)
 		result.Artifact = artifact
 		result.ScriptHex = emitResult.ScriptHex
 		result.ScriptAsm = emitResult.ScriptAsm
@@ -573,11 +811,25 @@ func CompileFromSourceStrWithResult(source string, fileName string, opts ...Comp
 		return result
 	}
 
+	// Pass 3b: Expand FixedArray properties.
+	expandResult := frontend.ExpandFixedArrays(result.Contract)
+	result.Diagnostics = append(result.Diagnostics, expandResult.Errors...)
+	if hasErrors(result.Diagnostics) {
+		return result
+	}
+	result.Contract = expandResult.Contract
+
 	// Pass 4: ANF lowering
 	result.ANF = frontend.LowerToANF(result.Contract)
 
 	// Bake constructor args into ANF properties.
-	applyConstructorArgs(result.ANF, o.ConstructorArgs)
+	if errs := applyConstructorArgs(result.ANF, o.ConstructorArgs); len(errs) > 0 {
+		for _, msg := range errs {
+			result.Diagnostics = append(result.Diagnostics, frontend.MakeDiagnostic(
+				msg, frontend.SeverityError, nil))
+		}
+		return result
+	}
 
 	// Pass 4.25: Constant folding (on by default)
 	if !o.DisableConstantFolding {
@@ -586,6 +838,12 @@ func CompileFromSourceStrWithResult(source string, fileName string, opts ...Comp
 
 	// Pass 4.5: EC optimization
 	result.ANF = frontend.OptimizeEC(result.ANF)
+
+	// Issue #109: warn when DCE strips an un-annotated readonly field. Computed
+	// from the post-lowering ANF (the surviving load_prop set), mirroring the TS
+	// reference's collectReferencedProps(optimizedAnf) placement.
+	result.Diagnostics = append(result.Diagnostics,
+		frontend.CollectEmbedAlwaysDCEWarnings(result.Contract, result.ANF)...)
 
 	// Pass 5: Stack lowering (recover from panics)
 	var stackMethods []codegen.StackMethod
@@ -600,7 +858,11 @@ func CompileFromSourceStrWithResult(source string, fileName string, opts ...Comp
 			}
 		}()
 		var stackErr error
-		stackMethods, stackErr = codegen.LowerToStack(result.ANF)
+		var lowerOpts codegen.LowerToStackOptions
+		if o.SP1FriParams != nil {
+			lowerOpts.SP1FriParams = o.SP1FriParams
+		}
+		stackMethods, stackErr = codegen.LowerToStack(result.ANF, lowerOpts)
 		if stackErr != nil {
 			result.Diagnostics = append(result.Diagnostics, frontend.MakeDiagnostic(
 				fmt.Sprintf("stack lowering: %s", stackErr),
@@ -640,7 +902,7 @@ func CompileFromSourceStrWithResult(source string, fileName string, opts ...Comp
 			return
 		}
 
-		artifact := assembleArtifact(result.ANF, emitResult.ScriptHex, emitResult.ScriptAsm, emitResult.ConstructorSlots, emitResult.CodeSeparatorIndex, emitResult.CodeSeparatorIndices, emitResult.SourceMap, stackMethods, o)
+		artifact := assembleArtifact(result.ANF, emitResult.ScriptHex, emitResult.ScriptAsm, emitResult.ConstructorSlots, emitResult.CodeSepIndexSlots, emitResult.CodeSeparatorIndex, emitResult.CodeSeparatorIndices, emitResult.SourceMap, stackMethods, o)
 		result.Artifact = artifact
 		result.ScriptHex = emitResult.ScriptHex
 		result.ScriptAsm = emitResult.ScriptAsm

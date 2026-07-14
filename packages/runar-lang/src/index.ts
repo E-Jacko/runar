@@ -32,9 +32,12 @@ export {
   SigHashPreimage,
   OpCodeType,
   Point,
+  P256Point,
+  P384Point,
   SigHash,
   // Pure types (no runtime value):
   type ByteString,
+  type Sha256Digest,
   type SigHashType,
   type RabinSig,
   type RabinPubKey,
@@ -48,6 +51,7 @@ export {
 export {
   // Crypto
   sha256,
+  Sha256Hash,
   ripemd160,
   hash160,
   hash256,
@@ -100,7 +104,7 @@ export {
   // BLAKE3
   blake3Compress,
   blake3Hash,
-  // Elliptic curve operations
+  // Elliptic curve operations (secp256k1)
   ecAdd,
   ecMul,
   ecMulGen,
@@ -111,6 +115,64 @@ export {
   ecMakePoint,
   ecPointX,
   ecPointY,
+  // Elliptic curve operations (P-256 / secp256r1)
+  p256Add,
+  p256Mul,
+  p256MulGen,
+  p256Negate,
+  p256OnCurve,
+  p256EncodeCompressed,
+  verifyECDSA_P256,
+  // Elliptic curve operations (P-384 / secp384r1)
+  p384Add,
+  p384Mul,
+  p384MulGen,
+  p384Negate,
+  p384OnCurve,
+  p384EncodeCompressed,
+  verifyECDSA_P384,
+  // Baby Bear field arithmetic
+  bbFieldAdd,
+  bbFieldSub,
+  bbFieldMul,
+  bbFieldInv,
+  // Baby Bear quartic extension field
+  bbExt4Mul0,
+  bbExt4Mul1,
+  bbExt4Mul2,
+  bbExt4Mul3,
+  bbExt4Inv0,
+  bbExt4Inv1,
+  bbExt4Inv2,
+  bbExt4Inv3,
+  // KoalaBear field arithmetic
+  kbFieldAdd,
+  kbFieldSub,
+  kbFieldMul,
+  kbFieldInv,
+  // KoalaBear quartic extension field
+  kbExt4Mul0,
+  kbExt4Mul1,
+  kbExt4Mul2,
+  kbExt4Mul3,
+  kbExt4Inv0,
+  kbExt4Inv1,
+  kbExt4Inv2,
+  kbExt4Inv3,
+  // BN254 field arithmetic
+  bn254FieldAdd,
+  bn254FieldSub,
+  bn254FieldMul,
+  bn254FieldInv,
+  bn254FieldNeg,
+  // BN254 G1 curve operations
+  bn254G1Add,
+  bn254G1ScalarMul,
+  bn254G1Negate,
+  bn254G1OnCurve,
+  // Merkle proof verification
+  merkleRootSha256,
+  merkleRootHash256,
 } from './builtins.js';
 
 // ---------------------------------------------------------------------------
@@ -137,6 +199,10 @@ export {
   extractOutputs,
   extractLocktime,
   extractSigHashType,
+  // Intent sub-covenant intrinsics (BSVM Phase 13)
+  extractPrevOutputScript,
+  requireOutputP2PKH,
+  currentBlockHeight,
 } from './preimage.js';
 
 // ---------------------------------------------------------------------------
@@ -317,4 +383,162 @@ export abstract class StatefulSmartContract extends SmartContract {
       'StatefulSmartContract.addRawOutput() cannot be called at runtime — compile this contract.',
     );
   }
+
+  /**
+   * Register an additional transaction output that is NOT a state continuation.
+   *
+   * Each call adds one output to the transaction with the caller-specified
+   * satoshi amount and script bytes. Unlike `addOutput`, the output is not
+   * derived from the contract's current state; unlike `addRawOutput`, it is
+   * explicitly positioned in the continuation-hash composition AFTER state
+   * outputs and BEFORE the change output.
+   *
+   * Typical use: emit an OP_RETURN with a data-availability payload or any
+   * arbitrary third-party output alongside the contract's state continuation.
+   *
+   * ```ts
+   * this.count = this.count + 1n;
+   * this.addDataOutput(0n, toByteString('6a0568656c6c6f')); // OP_RETURN "hello"
+   * ```
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  protected addDataOutput(_satoshis: bigint, _scriptBytes: ByteString): void {
+    throw new Error(
+      'StatefulSmartContract.addDataOutput() cannot be called at runtime — compile this contract.',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// UnsafeSmartContract base class
+// ---------------------------------------------------------------------------
+
+/**
+ * Escape-hatch base class for contracts that need to embed raw Bitcoin
+ * Script bytes via the {@link asm} primitive.
+ *
+ * Structurally identical to {@link SmartContract} — same constructor /
+ * super interface, same readonly property rules, no auto-injected
+ * preimage check. The only difference is that the compiler permits
+ * `asm({...})` calls inside its methods. Contracts that don't need
+ * `asm` should keep extending `SmartContract` (or
+ * {@link StatefulSmartContract}) so the language subset stays
+ * statically enforced.
+ *
+ * ```ts
+ * import { UnsafeSmartContract, asm } from 'runar-lang';
+ *
+ * class Anyone extends UnsafeSmartContract {
+ *   constructor() { super(); }
+ *
+ *   public unlock() {
+ *     // OP_1 — anyone-can-spend, written as raw script.
+ *     asm({ body: '51', in_arity: 0, out_arity: 1 });
+ *   }
+ * }
+ * ```
+ *
+ * Author guidance: `asm` skips the type checker for the bytes it emits
+ * and is opaque to the EC algebraic / peephole optimizers. Use it only
+ * for genuinely uncovered patterns; prefer regular Rúnar built-ins
+ * everywhere else.
+ */
+export abstract class UnsafeSmartContract {
+  /**
+   * Constructor arguments are the contract's compile-time parameters.
+   * They become embedded in the locking script.
+   *
+   * Subclasses MUST call `super(...)` forwarding all constructor args so
+   * the compiler can track them.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  constructor(..._args: unknown[]) {
+    // Intentionally empty — the compiler extracts constructor parameters
+    // from the TypeScript AST. No runtime bookkeeping is needed.
+  }
+
+  /**
+   * Generate the locking script for the current contract state.
+   *
+   * Mirrors {@link SmartContract.getStateScript}; exposed here so
+   * unsafe contracts can still build state-continuation outputs by
+   * hand when they wrap them in `asm`.
+   */
+  protected getStateScript(): ByteString {
+    throw new Error(
+      'UnsafeSmartContract.getStateScript() cannot be called at runtime — compile this contract.',
+    );
+  }
+
+  /**
+   * Build a standard P2PKH output script for the given address.
+   *
+   * Mirrors {@link SmartContract.buildP2PKH}.
+   */
+  protected buildP2PKH(_addr: Addr): ByteString {
+    throw new Error(
+      'UnsafeSmartContract.buildP2PKH() cannot be called at runtime — compile this contract.',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// asm — opaque raw-script escape hatch (UnsafeSmartContract only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Structured argument for the {@link asm} compiler intrinsic.
+ *
+ * The compiler intercepts `asm({...})` calls at parse time and lowers
+ * them to a `raw_script` ANF node. The runtime stub below only exists
+ * so the TypeScript checker accepts the source — calling `asm` from
+ * regular JS / TS code throws.
+ */
+export interface AsmArgs {
+  /**
+   * Even-length hex string of the raw Bitcoin Script opcode bytes to
+   * embed verbatim. The compiler does not re-encode or validate the
+   * semantics of these bytes — it only checks that the string is
+   * valid hex with an even length.
+   */
+  body: string;
+
+  /**
+   * Number of stack items the embedded bytes consume on entry.
+   * Defaults to `0`.
+   */
+  in_arity?: number;
+
+  /**
+   * Number of stack items the embedded bytes leave on exit. Defaults
+   * to `1` so that the common "this is the terminal value of a public
+   * method" case works without ceremony.
+   */
+  out_arity?: number;
+}
+
+/**
+ * Embed a raw Bitcoin Script byte sequence in a contract method.
+ *
+ * Only callable from inside a contract that extends
+ * {@link UnsafeSmartContract}. The compiler enforces this — a
+ * `SmartContract` or `StatefulSmartContract` that calls `asm` will
+ * fail validation.
+ *
+ * v0 only supports the string-literal `body` form:
+ *
+ * ```ts
+ * asm({ body: '76a90088ac', in_arity: 1, out_arity: 0 });
+ * ```
+ *
+ * Phase 3 follow-ups (NOT shipped today):
+ *  - Array-form body: `asm({ body: [OP_DUP, push(...)] })`
+ *  - Typed expression form: `const x: bigint = asm<bigint>({...})`
+ *  - Multi-output asm with arity > 1 returning a tuple.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export function asm(_args: AsmArgs): void {
+  throw new Error(
+    'asm() cannot be called at runtime — compile this contract with the Rúnar compiler.',
+  );
 }

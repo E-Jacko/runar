@@ -12,11 +12,6 @@ import { TestContract } from '../index.js';
 
 // ---- helpers ----------------------------------------------------------------
 
-function bigintToHex32(n: bigint): string {
-  return n.toString(16).padStart(64, '0');
-}
-void bigintToHex32; // TODO: will be used by upcoming EC cross-verify tests
-
 /** Construct a 64-byte Rúnar Point hex from a @bsv/sdk Point. */
 function bsvPointToHex(p: BsvPoint): string {
   return p.getX().toHex(32) + p.getY().toHex(32);
@@ -41,8 +36,6 @@ const G_BSV = new BsvPoint(
 
 const G_HEX = bsvPointToHex(G_BSV);
 const EC_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141n;
-const EC_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2Fn; // eslint-disable-line
-void EC_P; // TODO: will be used by upcoming EC cross-verify tests
 
 // ---- contracts used across tests --------------------------------------------
 
@@ -178,6 +171,39 @@ describe('EC cross-verification against @bsv/sdk', () => {
     it('invalid point is not on curve', () => {
       // Flip last byte of y coordinate
       const badHex = bsvPointToHex(G_BSV).slice(0, -2) + 'ff';
+      const c = TestContract.fromSource(EC_ONCURVE, { pt: badHex });
+      expect(c.call('check').success).toBe(false);
+    });
+
+    it('rejects a non-canonical coordinate encoding (x ≥ p) — GAP-301', () => {
+      // Find a small k whose point (k, y) is on-curve, then present x = k + p
+      // (≥ p). The field arithmetic reduces it back to k, so a curve-equation-
+      // only check would ACCEPT this non-canonical encoding; the hardened
+      // ecOnCurve must reject it because x is not canonically reduced.
+      const P = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fn;
+      const modpow = (b: bigint, e: bigint, m: bigint): bigint => {
+        let r = 1n;
+        b %= m;
+        while (e > 0n) {
+          if (e & 1n) r = (r * b) % m;
+          b = (b * b) % m;
+          e >>= 1n;
+        }
+        return r;
+      };
+      const toHex32 = (v: bigint) => v.toString(16).padStart(64, '0');
+      let found: { xnc: bigint; y: bigint } | null = null;
+      for (let k = 0n; k < 256n; k++) {
+        const rhs = (k * k * k + 7n) % P;
+        const y = modpow(rhs, (P + 1n) / 4n, P); // secp256k1 p ≡ 3 (mod 4)
+        if ((y * y) % P === rhs) {
+          found = { xnc: k + P, y };
+          break;
+        }
+      }
+      expect(found).not.toBeNull();
+      const badHex = toHex32(found!.xnc) + toHex32(found!.y);
+      expect(badHex.length).toBe(128); // x = k + p still fits in 32 bytes
       const c = TestContract.fromSource(EC_ONCURVE, { pt: badHex });
       expect(c.call('check').success).toBe(false);
     });

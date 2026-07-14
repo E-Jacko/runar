@@ -168,8 +168,25 @@ _SPECIAL_NAMES: dict[str, str] = {
     "ec_make_point": "ecMakePoint",
     "ec_point_x": "ecPointX",
     "ec_point_y": "ecPointY",
+    # P-256 (NIST secp256r1)
+    "p256_add":               "p256Add",
+    "p256_mul":               "p256Mul",
+    "p256_mul_gen":           "p256MulGen",
+    "p256_negate":            "p256Negate",
+    "p256_on_curve":          "p256OnCurve",
+    "p256_encode_compressed": "p256EncodeCompressed",
+    "verify_ecdsa_p256":      "verifyECDSA_P256",
+    # P-384 (NIST secp384r1)
+    "p384_add":               "p384Add",
+    "p384_mul":               "p384Mul",
+    "p384_mul_gen":           "p384MulGen",
+    "p384_negate":            "p384Negate",
+    "p384_on_curve":          "p384OnCurve",
+    "p384_encode_compressed": "p384EncodeCompressed",
+    "verify_ecdsa_p384":      "verifyECDSA_P384",
     "add_output": "addOutput",
     "add_raw_output": "addRawOutput",
+    "add_data_output": "addDataOutput",
     "get_state_script": "getStateScript",
     "extract_locktime": "extractLocktime",
     "extract_output_hash": "extractOutputHash",
@@ -253,11 +270,14 @@ _TYPE_MAP: dict[str, str] = {
     "Sig": "Sig",
     "Addr": "Addr",
     "Sha256": "Sha256",
+    "Sha256Digest": "Sha256",
     "Ripemd160": "Ripemd160",
     "SigHashPreimage": "SigHashPreimage",
     "RabinSig": "RabinSig",
     "RabinPubKey": "RabinPubKey",
     "Point": "Point",
+    "P256Point": "P256Point",
+    "P384Point": "P384Point",
 }
 
 
@@ -731,7 +751,11 @@ class _RbParser:
 
         self._skip_newlines()
 
-        if parent_class not in ("SmartContract", "StatefulSmartContract"):
+        if parent_class not in (
+            "SmartContract",
+            "StatefulSmartContract",
+            "UnsafeSmartContract",
+        ):
             self._errors.append(
                 f"{self._file}:{first_part.line}: unknown parent class: {parent_class}"
             )
@@ -809,7 +833,7 @@ class _RbParser:
         # Rewrite bare calls to declared methods and intrinsics as this.method().
         # In Ruby, bare calls like `add_output(...)` are equivalent to
         # `self.add_output(...)` / `this.addOutput(...)`.
-        _INTRINSIC_METHODS = {"addOutput", "addRawOutput", "getStateScript"}
+        _INTRINSIC_METHODS = {"addOutput", "addRawOutput", "addDataOutput", "getStateScript"}
         method_names = {m.name for m in methods} | _INTRINSIC_METHODS
         for method in methods:
             _rewrite_bare_method_calls(method.body, method_names)
@@ -905,8 +929,9 @@ class _RbParser:
                 self._expect(TOK_COLON, ":")
                 initializer = self._parse_primary()
 
-        # In stateless contracts, all properties are always readonly
-        if parent_class == "SmartContract":
+        # In stateless contracts (SmartContract and UnsafeSmartContract),
+        # all properties are always readonly.
+        if parent_class in ("SmartContract", "UnsafeSmartContract"):
             is_readonly = True
 
         # Skip rest of line
@@ -1125,17 +1150,27 @@ class _RbParser:
         condition = self._parse_expression()
         self._skip_newlines()
 
+        # Variables declared inside an if/elsif/else branch are scoped to
+        # that branch. Snapshot+restore ``_declared_locals`` so a sibling
+        # branch (or sibling top-level if-without-else block) can
+        # re-declare the same local without it being treated as an
+        # assignment to an out-of-scope variable. Mirrors the canonical
+        # TS / Python lexical-scope semantics.
+        locals_before_then = set(self._declared_locals)
         then_stmts = self._parse_statements()
+        self._declared_locals = set(locals_before_then)
 
         else_stmts: list[Statement] | None = None
 
         if self._peek().kind == TOK_ELSIF:
             elif_loc = self._loc()
             else_stmts = [self._parse_elsif_statement(elif_loc)]
+            self._declared_locals = set(locals_before_then)
         elif self._peek().kind == TOK_ELSE:
             self._advance()  # 'else'
             self._skip_newlines()
             else_stmts = self._parse_statements()
+            self._declared_locals = set(locals_before_then)
 
         self._expect(TOK_END, "end")
 
@@ -1151,17 +1186,22 @@ class _RbParser:
         condition = self._parse_expression()
         self._skip_newlines()
 
+        # Same scope discipline as ``_parse_if_statement``.
+        locals_before_then = set(self._declared_locals)
         then_stmts = self._parse_statements()
+        self._declared_locals = set(locals_before_then)
 
         else_stmts: list[Statement] | None = None
 
         if self._peek().kind == TOK_ELSIF:
             elif_loc = self._loc()
             else_stmts = [self._parse_elsif_statement(elif_loc)]
+            self._declared_locals = set(locals_before_then)
         elif self._peek().kind == TOK_ELSE:
             self._advance()  # 'else'
             self._skip_newlines()
             else_stmts = self._parse_statements()
+            self._declared_locals = set(locals_before_then)
 
         # Note: the outer ``end`` is consumed by the parent ``_parse_if_statement``.
         # ``elsif`` branches do not consume their own ``end``.
@@ -1282,13 +1322,21 @@ class _RbParser:
         )
 
     def _parse_ivar_statement(self, loc: SourceLocation) -> Statement:
-        """Parse ``@var = expr``, ``@var += expr``, or ``@var`` as expression."""
+        """Parse ``@var = expr``, ``@var[i] = expr``, ``@var += expr``, or ``@var`` as expression."""
         ivar_tok = self._advance()  # ivar token
         raw_name = ivar_tok.value
         prop_name = _snake_to_camel(raw_name)
         target: Expression = PropertyAccessExpr(property=prop_name)
 
-        # Simple assignment: @var = expr
+        # Consume index-access postfixes on the LHS so
+        # ``@var[i] = expr`` is recognised as an assignment statement.
+        while self._peek().kind == TOK_LBRACKET:
+            self._advance()  # '['
+            index = self._parse_expression()
+            self._expect(TOK_RBRACKET, "]")
+            target = IndexAccessExpr(object=target, index=index)
+
+        # Simple assignment: @var = expr | @var[i] = expr
         if self._match(TOK_ASSIGN):
             value = self._parse_expression()
             return AssignmentStmt(target=target, value=value, source_location=loc)

@@ -1,0 +1,661 @@
+package runar
+
+// Signed-broadcast wire protocol for overlay apps. Byte-compatible with the
+// TypeScript reference implementation in `packages/runar-sdk/src/envelope.ts`.
+//
+// Three primitives:
+//   - CanonicalJSON: RFC 8785 / JCS serialization (sorted keys, no whitespace,
+//     ES Number.prototype.toString equivalents). Must produce byte-identical
+//     output to every other Runar SDK tier for the same input.
+//   - SignEnvelope: bind data + nonce + expiresAt into a canonical-JSON
+//     payload, sha256 it, and sign the digest via a caller-supplied callback.
+//   - VerifyEnvelope: six-reason rejection ladder mirroring the TS impl.
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"sort"
+	"strconv"
+	"time"
+	"unicode/utf16"
+
+	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+)
+
+// ---------------------------------------------------------------------------
+// CanonicalJSON
+// ---------------------------------------------------------------------------
+
+// CanonicalJSON serializes value to RFC 8785 / JCS canonical JSON. Sorted
+// object keys (UTF-16 code-unit order), no whitespace, ES-style number
+// formatting. Returns an error for unsupported inputs (NaN, +Inf, -Inf,
+// channels, functions, circular references).
+func CanonicalJSON(value any) (string, error) {
+	var out []byte
+	out, err := canonicalAppend(out, value, make(map[uintptr]bool))
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func canonicalAppend(out []byte, value any, seen map[uintptr]bool) ([]byte, error) {
+	if value == nil {
+		return append(out, "null"...), nil
+	}
+	switch v := value.(type) {
+	case bool:
+		if v {
+			return append(out, "true"...), nil
+		}
+		return append(out, "false"...), nil
+	case string:
+		return appendJSONString(out, v)
+	case int:
+		return strconv.AppendInt(out, int64(v), 10), nil
+	case int8:
+		return strconv.AppendInt(out, int64(v), 10), nil
+	case int16:
+		return strconv.AppendInt(out, int64(v), 10), nil
+	case int32:
+		return strconv.AppendInt(out, int64(v), 10), nil
+	case int64:
+		return strconv.AppendInt(out, v, 10), nil
+	case uint:
+		return strconv.AppendUint(out, uint64(v), 10), nil
+	case uint8:
+		return strconv.AppendUint(out, uint64(v), 10), nil
+	case uint16:
+		return strconv.AppendUint(out, uint64(v), 10), nil
+	case uint32:
+		return strconv.AppendUint(out, uint64(v), 10), nil
+	case uint64:
+		return strconv.AppendUint(out, v, 10), nil
+	case float32:
+		return appendFloat(out, float64(v))
+	case float64:
+		return appendFloat(out, v)
+	case json.Number:
+		return append(out, v.String()...), nil
+	case []any:
+		out = append(out, '[')
+		for i, e := range v {
+			if i > 0 {
+				out = append(out, ',')
+			}
+			var err error
+			out, err = canonicalAppend(out, e, seen)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return append(out, ']'), nil
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			return utf16Less(keys[i], keys[j])
+		})
+		out = append(out, '{')
+		first := true
+		for _, k := range keys {
+			elem, ok := v[k]
+			if !ok {
+				continue
+			}
+			// ES JSON.stringify omits keys whose value is undefined; we
+			// don't have undefined in Go, so emit nil as null (per JSON spec).
+			if !first {
+				out = append(out, ',')
+			}
+			first = false
+			var err error
+			out, err = appendJSONString(out, k)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ':')
+			out, err = canonicalAppend(out, elem, seen)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return append(out, '}'), nil
+	}
+	return nil, fmt.Errorf("canonical JSON: unsupported type %T", value)
+}
+
+// appendFloat formats f matching ES Number.prototype.toString. Rejects NaN/Inf.
+// Integer-valued floats within safe-integer range serialize without a decimal point
+// (e.g. 42 not 42.0), matching the JS spec.
+func appendFloat(out []byte, f float64) ([]byte, error) {
+	if f != f { // NaN
+		return nil, fmt.Errorf("canonical JSON: NaN not supported")
+	}
+	if f > 1e308 || f < -1e308 {
+		return nil, fmt.Errorf("canonical JSON: Infinity not supported")
+	}
+	if f == 0 {
+		return append(out, '0'), nil
+	}
+	if f == float64(int64(f)) && f >= -9007199254740992 && f <= 9007199254740992 {
+		return strconv.AppendInt(out, int64(f), 10), nil
+	}
+	// ECMA-262 §6.1.6.1.13 Number::toString. strconv.FormatFloat 'g' diverges
+	// from JS for the 1e21 transition and emits "1e+21" with implicit lowercase
+	// while ES emits "1e+21" plus or "1e-300" without an extra .0 — and a few
+	// other edge cases. Re-derive (digits, k) from Go's shortest-roundtrip
+	// surface form and re-emit per the spec rules (audit D5).
+	return appendEcma262Double(out, f), nil
+}
+
+// appendEcma262Double formats a finite, non-zero, positive-or-negative double
+// per ECMA-262 §6.1.6.1.13 Number::toString. Output is byte-identical to JS
+// `String(x)` / `JSON.stringify(x)` for any finite x. Mirrors the TS reference
+// in packages/runar-ir-schema/src/canonical-json.ts (via JSON.stringify) and
+// the Rust/Python/Zig/Ruby/Java ports of the same algorithm.
+func appendEcma262Double(out []byte, x float64) []byte {
+	if x < 0 {
+		out = append(out, '-')
+		return appendEcma262Double(out, -x)
+	}
+	// Go's 'g'/-1 prints the shortest round-trip decimal string (Ryu-style).
+	// For values like 1e21 it emits "1e+21"; for 1.5e10 it emits "1.5e+10";
+	// for 0.5 it emits "0.5". We re-derive (digits, k) from the formatted
+	// string and re-emit per the ECMA rules so the output is independent of
+	// Go's chosen surface form.
+	s := strconv.FormatFloat(x, 'g', -1, 64)
+	// Split into mantissa and explicit exponent.
+	ePos := -1
+	for i := 0; i < len(s); i++ {
+		if s[i] == 'e' || s[i] == 'E' {
+			ePos = i
+			break
+		}
+	}
+	mantissa := s
+	expPart := 0
+	if ePos >= 0 {
+		mantissa = s[:ePos]
+		e, err := strconv.Atoi(s[ePos+1:])
+		if err == nil {
+			expPart = e
+		}
+	}
+	// Split mantissa into integer and fractional parts.
+	intPart := mantissa
+	fracPart := ""
+	for i := 0; i < len(mantissa); i++ {
+		if mantissa[i] == '.' {
+			intPart = mantissa[:i]
+			fracPart = mantissa[i+1:]
+			break
+		}
+	}
+	// Collect digits, strip leading and trailing zeros to land on the
+	// significant digit string. leading_zeros shift k down; trailing zeros
+	// are absorbed into k via the int-part length.
+	rawDigits := intPart + fracPart
+	leadingZeros := 0
+	for leadingZeros < len(rawDigits) && rawDigits[leadingZeros] == '0' {
+		leadingZeros++
+	}
+	trimmed := rawDigits[leadingZeros:]
+	end := len(trimmed)
+	for end > 0 && trimmed[end-1] == '0' {
+		end--
+	}
+	digits := trimmed[:end]
+	if len(digits) == 0 {
+		return append(out, '0')
+	}
+	k := len(intPart) - leadingZeros + expPart
+	sLen := len(digits)
+	// ECMA-262 §6.1.6.1.13.
+	if k >= sLen && k <= 21 {
+		out = append(out, digits...)
+		for i := 0; i < k-sLen; i++ {
+			out = append(out, '0')
+		}
+		return out
+	}
+	if k > 0 && k <= 21 {
+		out = append(out, digits[:k]...)
+		out = append(out, '.')
+		out = append(out, digits[k:]...)
+		return out
+	}
+	if k > -6 && k <= 0 {
+		out = append(out, '0', '.')
+		for i := 0; i < -k; i++ {
+			out = append(out, '0')
+		}
+		out = append(out, digits...)
+		return out
+	}
+	// Scientific notation.
+	exp := k - 1
+	if sLen == 1 {
+		out = append(out, digits...)
+	} else {
+		out = append(out, digits[0])
+		out = append(out, '.')
+		out = append(out, digits[1:]...)
+	}
+	if exp < 0 {
+		out = append(out, 'e', '-')
+		out = strconv.AppendInt(out, int64(-exp), 10)
+	} else {
+		out = append(out, 'e', '+')
+		out = strconv.AppendInt(out, int64(exp), 10)
+	}
+	return out
+}
+
+// utf16Less compares two strings by UTF-16 code-unit order, matching
+// JavaScript's default Array.prototype.sort() lexicographic comparison.
+func utf16Less(a, b string) bool {
+	au := utf16.Encode([]rune(a))
+	bu := utf16.Encode([]rune(b))
+	n := len(au)
+	if len(bu) < n {
+		n = len(bu)
+	}
+	for i := 0; i < n; i++ {
+		if au[i] != bu[i] {
+			return au[i] < bu[i]
+		}
+	}
+	return len(au) < len(bu)
+}
+
+// appendJSONString escapes s per ES JSON.stringify rules. Note: ES does NOT
+// escape U+002F '/' by default in modern engines, and DOES \u-escape
+// U+0000–U+001F. Backslash and quote are escaped with their short forms.
+//
+// Returns an error if s contains a lone surrogate (U+D800..U+DFFF) — RFC
+// 8785 §3.2.2.2 / audit D6 requires rejection. Go's `for ... range` over
+// strings silently folds invalid UTF-8 to utf8.RuneError (U+FFFD), so we
+// walk the bytes manually to detect the surrogate pattern verbatim
+// regardless of how the caller constructed the string.
+func appendJSONString(out []byte, s string) ([]byte, error) {
+	out = append(out, '"')
+	i := 0
+	for i < len(s) {
+		// Detect the 3-byte UTF-8-encoded-surrogate pattern
+		// (0xED, 0xA0..0xBF, 0x80..0xBF) and reject — that range is
+		// reserved for paired surrogates in UTF-16 and is illegal as
+		// scalar UTF-8.
+		if i+2 < len(s) && s[i] == 0xED && s[i+1] >= 0xA0 && s[i+1] <= 0xBF &&
+			s[i+2] >= 0x80 && s[i+2] <= 0xBF {
+			cp := (uint32(s[i]&0x0F) << 12) | (uint32(s[i+1]&0x3F) << 6) | uint32(s[i+2]&0x3F)
+			return nil, fmt.Errorf("canonical JSON: lone surrogate U+%04X in string", cp)
+		}
+		r, size := decodeRune(s[i:])
+		// decodeRune returns utf8.RuneError for malformed sequences; treat
+		// any such case as a hard rejection rather than silently folding
+		// to U+FFFD (which is exactly what the audit D6 vector catches).
+		if r == 0xFFFD && size == 1 && s[i] != 0xEF {
+			return nil, fmt.Errorf("canonical JSON: malformed UTF-8 at byte %d", i)
+		}
+		switch r {
+		case '"':
+			out = append(out, '\\', '"')
+		case '\\':
+			out = append(out, '\\', '\\')
+		case '\b':
+			out = append(out, '\\', 'b')
+		case '\f':
+			out = append(out, '\\', 'f')
+		case '\n':
+			out = append(out, '\\', 'n')
+		case '\r':
+			out = append(out, '\\', 'r')
+		case '\t':
+			out = append(out, '\\', 't')
+		default:
+			if r < 0x20 {
+				out = append(out, '\\', 'u')
+				const hexd = "0123456789abcdef"
+				out = append(out, '0', '0', hexd[(r>>4)&0xf], hexd[r&0xf])
+			} else if r < 0x80 {
+				out = append(out, byte(r))
+			} else {
+				// UTF-8 encoding for the rune
+				var buf [4]byte
+				n := utf8EncodeRune(buf[:], r)
+				out = append(out, buf[:n]...)
+			}
+		}
+		i += size
+	}
+	return append(out, '"'), nil
+}
+
+// decodeRune is a minimal UTF-8 decoder that preserves illegal-sequence
+// signalling — we deliberately do not import "unicode/utf8" so that the
+// CESU-8 / WTF-8 surrogate range above can be caught before falling back
+// here. Returns (rune, byteSize). For invalid sequences returns
+// (0xFFFD, 1) so the caller can advance and report.
+func decodeRune(s string) (rune, int) {
+	if len(s) == 0 {
+		return 0xFFFD, 0
+	}
+	b0 := s[0]
+	if b0 < 0x80 {
+		return rune(b0), 1
+	}
+	if b0 < 0xC2 {
+		return 0xFFFD, 1
+	}
+	if b0 < 0xE0 {
+		if len(s) < 2 || s[1]&0xC0 != 0x80 {
+			return 0xFFFD, 1
+		}
+		return rune(b0&0x1F)<<6 | rune(s[1]&0x3F), 2
+	}
+	if b0 < 0xF0 {
+		if len(s) < 3 || s[1]&0xC0 != 0x80 || s[2]&0xC0 != 0x80 {
+			return 0xFFFD, 1
+		}
+		return rune(b0&0x0F)<<12 | rune(s[1]&0x3F)<<6 | rune(s[2]&0x3F), 3
+	}
+	if b0 < 0xF8 {
+		if len(s) < 4 || s[1]&0xC0 != 0x80 || s[2]&0xC0 != 0x80 || s[3]&0xC0 != 0x80 {
+			return 0xFFFD, 1
+		}
+		return rune(b0&0x07)<<18 | rune(s[1]&0x3F)<<12 | rune(s[2]&0x3F)<<6 | rune(s[3]&0x3F), 4
+	}
+	return 0xFFFD, 1
+}
+
+func utf8EncodeRune(p []byte, r rune) int {
+	switch {
+	case r < 0x80:
+		p[0] = byte(r)
+		return 1
+	case r < 0x800:
+		p[0] = 0xC0 | byte(r>>6)
+		p[1] = 0x80 | byte(r&0x3F)
+		return 2
+	case r < 0x10000:
+		p[0] = 0xE0 | byte(r>>12)
+		p[1] = 0x80 | byte((r>>6)&0x3F)
+		p[2] = 0x80 | byte(r&0x3F)
+		return 3
+	default:
+		p[0] = 0xF0 | byte(r>>18)
+		p[1] = 0x80 | byte((r>>12)&0x3F)
+		p[2] = 0x80 | byte((r>>6)&0x3F)
+		p[3] = 0x80 | byte(r&0x3F)
+		return 4
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Envelope types
+// ---------------------------------------------------------------------------
+
+// SignedEnvelope is the wire format for a signed broadcast payload.
+type SignedEnvelope struct {
+	// Payload is the canonical JSON of {...data, nonce, expiresAt}.
+	Payload string `json:"payload"`
+	// Sig is the DER-hex of the ECDSA signature over sha256(Payload).
+	Sig string `json:"sig"`
+	// Pubkey is the 66-char hex of the signer's compressed secp256k1 pubkey.
+	Pubkey string `json:"pubkey"`
+	// Nonce is the wall-clock millisecond timestamp at signing.
+	Nonce int64 `json:"nonce"`
+	// ExpiresAt is Nonce + TtlMs.
+	ExpiresAt int64 `json:"expiresAt"`
+}
+
+// EnvelopeSigner is the minimal surface needed by SignEnvelope. Implementers
+// receive a 32-byte sha256 digest and return a DER-encoded ECDSA signature.
+type EnvelopeSigner interface {
+	// SignHash signs digest (raw ECDSA, no re-hashing) and returns DER bytes.
+	SignHash(digest []byte) ([]byte, error)
+	// PublicKey returns the 66-char hex of the compressed secp256k1 pubkey.
+	PublicKey() (string, error)
+}
+
+// SignEnvelopeOpts captures the input to SignEnvelope.
+type SignEnvelopeOpts struct {
+	Data   map[string]any
+	Signer EnvelopeSigner
+	// TtlMs is the lifetime in milliseconds. Defaults to 30_000 when zero.
+	TtlMs int64
+	// NowMs is the timestamp to embed as nonce. Defaults to time.Now() when
+	// zero. Exposed for deterministic testing.
+	NowMs int64
+}
+
+// SignEnvelope produces a signed envelope around data.
+func SignEnvelope(opts SignEnvelopeOpts) (SignedEnvelope, error) {
+	ttl := opts.TtlMs
+	if ttl == 0 {
+		ttl = 30_000
+	}
+	nonce := opts.NowMs
+	if nonce == 0 {
+		nonce = time.Now().UnixMilli()
+	}
+	expiresAt := nonce + ttl
+
+	merged := make(map[string]any, len(opts.Data)+2)
+	for k, v := range opts.Data {
+		merged[k] = v
+	}
+	merged["nonce"] = nonce
+	merged["expiresAt"] = expiresAt
+
+	payload, err := CanonicalJSON(merged)
+	if err != nil {
+		return SignedEnvelope{}, fmt.Errorf("canonical json: %w", err)
+	}
+
+	digest := sha256.Sum256([]byte(payload))
+	sigBytes, err := opts.Signer.SignHash(digest[:])
+	if err != nil {
+		return SignedEnvelope{}, fmt.Errorf("sign: %w", err)
+	}
+	pubkey, err := opts.Signer.PublicKey()
+	if err != nil {
+		return SignedEnvelope{}, fmt.Errorf("pubkey: %w", err)
+	}
+
+	return SignedEnvelope{
+		Payload:   payload,
+		Sig:       hex.EncodeToString(sigBytes),
+		Pubkey:    pubkey,
+		Nonce:     nonce,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+// VerifyEnvelopeReason enumerates the ordered rejection causes.
+type VerifyEnvelopeReason string
+
+const (
+	ReasonMissingFields   VerifyEnvelopeReason = "missing-fields"
+	ReasonExpired         VerifyEnvelopeReason = "expired"
+	ReasonBadJSON         VerifyEnvelopeReason = "bad-json"
+	ReasonEnvelopeMismatch VerifyEnvelopeReason = "envelope-mismatch"
+	ReasonBadSig          VerifyEnvelopeReason = "bad-sig"
+	ReasonPubkeyNotAllowed VerifyEnvelopeReason = "pubkey-not-allowed"
+	// ReasonTooLarge mirrors the TS 'too-large' reason. Returned BEFORE
+	// any JSON parse / ECDSA verify work when an envelope string field
+	// exceeds its InputLimits cap (DoS-bound).
+	ReasonTooLarge VerifyEnvelopeReason = "too-large"
+)
+
+// Envelope DoS-bound caps. Mirror InputLimits.{MAX_IR_BYTES, MAX_STRING_BYTES}
+// from the TS schema package. Public so callers and tests can reference
+// them directly.
+const (
+	MaxEnvelopePayloadBytes = MaxScriptBytes * 4 // 16 MiB — matches MAX_IR_BYTES
+	MaxEnvelopeFieldBytes   = MaxScriptBytes     // 4 MiB — matches MAX_STRING_BYTES
+)
+
+// VerifyEnvelopeOpts captures the input to VerifyEnvelope.
+type VerifyEnvelopeOpts struct {
+	Envelope     SignedEnvelope
+	ExpectedKeys []string // optional pubkey allowlist (66-char hex)
+	ClockSkewMs  int64    // defaults to 5_000 when zero
+	NowMs        int64    // override Now() for deterministic tests; zero = wall clock
+}
+
+// VerifyEnvelopeResult mirrors the TypeScript shape. Data is populated
+// when JSON parsing succeeded, so callers can apply app-specific checks
+// even on later-stage rejections.
+type VerifyEnvelopeResult struct {
+	OK     bool
+	Reason VerifyEnvelopeReason
+	Data   map[string]any
+}
+
+// VerifyEnvelope mirrors the six-reason rejection ladder of the TS impl.
+func VerifyEnvelope(opts VerifyEnvelopeOpts) VerifyEnvelopeResult {
+	env := opts.Envelope
+	clockSkew := opts.ClockSkewMs
+	if clockSkew == 0 {
+		clockSkew = 5_000
+	}
+	now := opts.NowMs
+	if now == 0 {
+		now = time.Now().UnixMilli()
+	}
+
+	// 0. DoS-bound size guard. Reject envelopes whose string fields exceed
+	//    their InputLimits cap BEFORE running JSON parse, hashing, or
+	//    ECDSA verify — those operations are linear in input size and a
+	//    pathological 100 MB payload would otherwise pin the goroutine.
+	//    Mirrors the TS 'too-large' rejection at sdk/envelope.ts:104.
+	if len(env.Payload) > MaxEnvelopePayloadBytes {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonTooLarge}
+	}
+	if len(env.Sig) > MaxEnvelopeFieldBytes {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonTooLarge}
+	}
+	if len(env.Pubkey) > MaxEnvelopeFieldBytes {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonTooLarge}
+	}
+
+	// 1. Field presence + types.
+	if env.Payload == "" || env.Sig == "" || env.Pubkey == "" || env.Nonce == 0 || env.ExpiresAt == 0 {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonMissingFields}
+	}
+
+	// 2. Expiry.
+	if env.ExpiresAt < now-clockSkew {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonExpired}
+	}
+
+	// 3. Parse payload.
+	var parsed map[string]any
+	dec := json.NewDecoder(stringReader(env.Payload))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err != nil || parsed == nil {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonBadJSON}
+	}
+
+	// 4. Inner-payload nonce/expiresAt must match outer fields.
+	innerNonce, innerExpiresAt, ok := readNonceExpiresAt(parsed)
+	if !ok || innerNonce != env.Nonce || innerExpiresAt != env.ExpiresAt {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonEnvelopeMismatch, Data: parsed}
+	}
+
+	// 5. ECDSA verify.
+	digest := sha256.Sum256([]byte(env.Payload))
+	sigBytes, err := hex.DecodeString(env.Sig)
+	if err != nil {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonBadSig, Data: parsed}
+	}
+	pkBytes, err := hex.DecodeString(env.Pubkey)
+	if err != nil {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonBadSig, Data: parsed}
+	}
+	pubKey, err := ec.ParsePubKey(pkBytes)
+	if err != nil {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonBadSig, Data: parsed}
+	}
+	sig, err := ec.FromDER(sigBytes)
+	if err != nil {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonBadSig, Data: parsed}
+	}
+	if !sig.Verify(digest[:], pubKey) {
+		return VerifyEnvelopeResult{OK: false, Reason: ReasonBadSig, Data: parsed}
+	}
+
+	// 6. Allowlist.
+	if len(opts.ExpectedKeys) > 0 {
+		found := false
+		for _, k := range opts.ExpectedKeys {
+			if k == env.Pubkey {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return VerifyEnvelopeResult{OK: false, Reason: ReasonPubkeyNotAllowed, Data: parsed}
+		}
+	}
+
+	return VerifyEnvelopeResult{OK: true, Data: parsed}
+}
+
+// readNonceExpiresAt extracts nonce + expiresAt from a parsed payload that
+// used json.Number (json.NewDecoder().UseNumber()) to preserve precision.
+func readNonceExpiresAt(parsed map[string]any) (int64, int64, bool) {
+	nonceRaw, ok1 := parsed["nonce"]
+	expiresAtRaw, ok2 := parsed["expiresAt"]
+	if !ok1 || !ok2 {
+		return 0, 0, false
+	}
+	nonce, ok1 := envelopeToInt64(nonceRaw)
+	expiresAt, ok2 := envelopeToInt64(expiresAtRaw)
+	if !ok1 || !ok2 {
+		return 0, 0, false
+	}
+	return nonce, expiresAt, true
+}
+
+func envelopeToInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return i, true
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case float64:
+		return int64(n), true
+	}
+	return 0, false
+}
+
+// stringReader avoids importing strings just for one Reader.
+type stringReaderImpl struct {
+	s   string
+	pos int
+}
+
+func stringReader(s string) *stringReaderImpl { return &stringReaderImpl{s: s} }
+
+func (r *stringReaderImpl) Read(p []byte) (int, error) {
+	if r.pos >= len(r.s) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.s[r.pos:])
+	r.pos += n
+	return n, nil
+}

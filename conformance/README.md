@@ -2,7 +2,9 @@
 
 **Cross-compiler conformance test suite ensuring all Rúnar compilers produce identical output.**
 
-The conformance suite is the enforcement mechanism for Rúnar's multi-compiler strategy. It contains golden-file test cases (source + expected IR + expected script), a test runner, and a differential fuzzer. Every Rúnar compiler -- TypeScript, Go, Rust, and Python -- must pass the full suite.
+The conformance suite is the enforcement mechanism for Rúnar's multi-compiler strategy. It contains golden-file test cases (source + expected IR + expected script), a test runner, and a differential fuzzer. Every Rúnar compiler -- TypeScript, Go, Rust, Python, Zig, Ruby, and Java -- must pass the full suite *for the tiers each fixture lists in its `compilers` allowlist*.
+
+Most fixtures run on every tier. A small number opt out of one or more tiers — see [Per-fixture compiler allowlist](#per-fixture-compiler-allowlist) below.
 
 ---
 
@@ -27,6 +29,8 @@ tests/
 |   +-- basic-p2pkh.runar.go      # Source contract (Go)
 |   +-- basic-p2pkh.runar.rs      # Source contract (Rust)
 |   +-- basic-p2pkh.runar.py      # Source contract (Python)
+|   +-- basic-p2pkh.runar.zig     # Source contract (Zig)
+|   +-- basic-p2pkh.runar.rb      # Source contract (Ruby)
 |   +-- basic-p2pkh.runar.json    # Reference artifact (JSON AST, not tested by runner)
 |   +-- expected-ir.json          # Expected ANF IR (canonical JSON)
 |   +-- expected-script.hex       # Expected compiled script (hex string)
@@ -94,7 +98,62 @@ tests/
 +-- token-nft/
 ```
 
-> **Note:** Most test directories also contain multi-format source variants (`.runar.sol`, `.runar.move`, `.runar.go`, `.runar.rs`, `.runar.py`). All format variants must produce the same ANF IR and script output. The post-quantum and ec-primitives tests currently only have `.runar.ts` sources. Several test directories also include `.runar.json` (JSON AST) files; these are reference artifacts for tooling and are **not** tested by the conformance runner.
+> **Note:** Most test directories also contain multi-format source variants (`.runar.sol`, `.runar.move`, `.runar.go`, `.runar.rs`, `.runar.py`, `.runar.zig`, `.runar.rb`, `.runar.java`). All format variants must produce the same ANF IR and script output for every compiler tier the fixture targets. Sources live under `examples/<format>/<case>/` and `source.json` references them by relative path. Several test directories also include `.runar.json` (JSON AST) files; these are reference artifacts for tooling and are **not** tested by the conformance runner.
+
+### Per-fixture compiler allowlist
+
+`source.json` may carry an optional `"compilers"` field that restricts which compilers run against that fixture. **When the field is absent, the contract is implicit: every tier (TypeScript, Go, Rust, Python, Zig, Ruby, Java) must produce byte-identical IR + script output.** When present, only the listed tiers are exercised — both the IR-stage and hex-stage golden checks honour the allowlist (see `runner/runner.ts` and `runner/source-parity.ts`).
+
+Allowlists are reserved for fixtures whose underlying Stack-IR primitives are intentionally not yet implemented in every tier. They are not a place to hide ordinary cross-compiler bugs — the lone supported reasons are documented below.
+
+Every `source.json` carrying a `compilers` allowlist must ALSO carry a non-empty `compilersJustification` string explaining WHY the listed tiers are scoped (e.g. `"Codegen for {primitive} is Go-only by project policy — see CLAUDE.md"` or `"Java Stack-IR pass for {feature} is deferred — see HANDOFF"`). The `allowlist-audit.test.ts` test fails if any allowlist is missing its rationale.
+
+The parser layer is tier-agnostic: the conformance runner's `discoverFormats()` asserts that every fixture ships all nine `*.runar.{ts,sol,move,go,rs,py,zig,rb,java}` source files (referenced from `source.json`'s `sources` map) regardless of the `compilers` allowlist. A fixture may opt OUT of a single format at the parser layer by listing it in `source.json`'s `parserSkip` array along with a non-empty `parserSkipReason` string — that escape hatch exists for genuinely blocked ports (e.g. a Move-syntax limitation for a complex contract). Lazy multi-format opt-outs are not allowed; if you find yourself reaching for `parserSkip` for more than one format, port the contract instead.
+
+#### Per-tier universal parser coverage
+
+The runner's `--parser-only` mode (CI step "Run all-tier parser-only coverage") **runs every available compiler's `--parse-only` entry point against every fixture × every declared format**, ignoring the per-fixture `compilers` allowlist. The allowlist scopes Stack-IR / hex parity ONLY — the parser layer is universal, so all 7 tiers (TypeScript, Go, Rust, Python, Zig, Ruby, Java) MUST accept all 9 formats for every fixture. Each compiler exposes `--parse-only` (Java additionally accepts `parseOnly: true` in its JSON-RPC daemon) which runs Pass 1 (parse) + Pass 2 (validate) and exits zero with `parser ok` on success or non-zero with diagnostics on failure. A non-zero exit fails the CI job.
+
+Run locally:
+
+```bash
+cd conformance && npx tsx runner/index.ts --parser-only
+```
+
+#### Audited allowlists
+
+The complete set of fixtures with a `compilers` allowlist is enumerated and pinned by `runner/__tests__/allowlist-audit.test.ts`. That test fails if a new allowlist appears (or an existing one drifts) without being approved here, so the set cannot silently expand. Adding a new allowlisted fixture requires **both**:
+
+1. Adding the fixture's expected allowlist to `APPROVED_ALLOWLISTS` in `runner/__tests__/allowlist-audit.test.ts`.
+2. Adding a row to the table below with a one-line rationale (and the matching `compilersJustification` string in the fixture's `source.json`).
+
+##### Go-only crypto family
+
+These fixtures exercise the Baby Bear / KoalaBear / Poseidon2 / BN254-witness / FRI / Merkle / FiatShamir-KB Stack-IR codegen modules, which currently ship in the Go compiler only (Mode-3 STARK / FRI verification flows). See CLAUDE.md ("Go-only crypto codegen modules").
+
+| Fixture | Allowlist | Rationale |
+|---|---|---|
+| `babybear` | `["go"]` | BabyBear prime-field arithmetic; Stack-IR codegen ships in Go only. |
+| `babybear-ext4` | `["go"]` | BabyBear Ext4 extension-field operations; Stack-IR codegen ships in Go only. |
+| `merkle-proof` | `["go"]` | SHA-256 Merkle-root verification using the Go-only Merkle codegen helpers. |
+
+##### EVM/STARK proof-system primitives (Go-only by project policy)
+
+Hybrid contracts whose method bodies call EVM/STARK primitives also fall under the Go-only scope above (see CLAUDE.md "EVM/STARK proof-system primitives are Go-only by project policy"). Their parsers are still exercised by every tier via the all-tier `--parser-only` matrix, but the IR + hex golden checks run only against the Go codegen.
+
+| Fixture | Allowlist | Rationale |
+|---|---|---|
+| `state-covenant` | `["go"]` | Uses `bbFieldMul` (BabyBear field) and `merkleRootSha256` (4-deep Merkle proof). Both are EVM/STARK primitives — Go is the canonical reference; partial ports in TS/Rust/Python/Zig/Ruby exist for historical reasons but are not conformance targets, and Java is not exempt due to a deferred port — it is exempt because the entire family is Go-only. |
+
+(The former `schnorr-zkp` oversize-bigint exemption is gone: every tier now carries the 256-bit secp256k1 group order through parse → ANF → codegen as a decimal-string-backed `BigIntLiteral`, so `schnorr-zkp` runs across all 7 tiers with no allowlist.)
+
+### Fold-ON allowlist (`conformance/fold-on-allowlist.json`)
+
+CI runs the multi-format conformance suite **twice**: once with `--disable-constant-folding` passed to every compiler (matching the byte-stable goldens checked into each fixture) and once with `RUNAR_DISABLE_CONSTANT_FOLDING=0` so every compiler runs its end-user default (folding ON). The second run enforces cross-tier hex + ANF parity across all 7 tiers but skips the golden-file comparison (because the goldens were stamped fold-OFF).
+
+A fixture (or a specific format variant of a fixture) that is known to fail the fold-ON cross-tier check must be listed in `conformance/fold-on-allowlist.json` with a per-entry `reason` (and ideally a `tracking` ref). The runner refuses to load entries that lack a non-empty `reason` — there is no "bare list" mode. The fold-OFF run is unaffected, so allowlisting only relaxes the dual-mode parity check, not the canonical golden coverage.
+
+The allowlist is currently **empty** (`"skip": []`): there are no fold-ON exemptions, so every fixture is enforced across all 7 tiers under both fold modes. If a fold-ON-only divergence is ever introduced, add an entry here (with a `reason`) and to `conformance/fold-on-allowlist.json` in the same commit.
 
 ### File Roles
 
@@ -135,8 +194,11 @@ pnpm run test:markdown
 # Filter to a specific test
 pnpm run test:filter -- arithmetic
 
-# Test all input format variants (.ts, .sol, .move, .go, .rs, .py)
+# Test all input format variants (.ts, .sol, .move, .go, .rs, .py, .zig, .rb)
 pnpm test -- --multi-format
+
+# Run cross-SDK locking-script conformance (all 6 SDK tools)
+pnpm run sdk-output
 ```
 
 The runner compiles each test case with the TypeScript reference compiler and compares the output against the golden files.
@@ -222,6 +284,47 @@ pnpm run fuzz -- --num 5000 --seed 42
 pnpm run fuzz:property
 ```
 
+### IR-based Fuzzing (Richer Grammar, All 7 Compilers)
+
+The legacy fuzzer (above) emits a single `.runar.ts` source and feeds it to every compiler. A newer IR-based generator produces a language-neutral contract description (`GeneratedContract`) and can render it either as shared TypeScript or as each compiler's native source (`.runar.go`, `.runar.rs`, `.runar.py`, `.runar.zig`, `.runar.rb`, `.runar.java`). The IR generator covers multiple property types (`bigint`, `boolean`, `ByteString`, `PubKey`, `Sig`), stateful contracts, multiple methods, built-in calls (`hash160`, `sha256`, `abs`, `min`, `max`, etc.), and `if/else` bodies.
+
+```bash
+# Run the IR generator, compare compiled hex across all 7 compilers
+pnpm run fuzz:ir -- --num 100 --seed 1
+
+# Render each compiler's native source format (stresses the frontends too)
+pnpm run fuzz:ir:native
+
+# Mix stateful contracts into the sample
+pnpm run fuzz:ir:stateful
+```
+
+Failing cases are written to `conformance/fuzz-findings-ir/<timestamp>/` with one `source-<compiler>.txt` and one `output-<compiler>.txt` per compiler plus a `finding.json` describing the mismatch.
+
+### Script-Level Static Analysis
+
+Compiled scripts can be checked independently of the compiler via `runar analyze`:
+
+```bash
+# Hex string
+runar analyze 76a90088ac
+
+# .hex file
+runar analyze conformance/tests/basic-p2pkh/expected-script.hex
+
+# Artifact JSON (reads the "script" field)
+runar analyze artifacts/Counter.json
+
+# Stdin
+cat script.hex | runar analyze -
+
+# JSON output / filter by severity
+runar analyze 76a90088ac --json
+runar analyze 76a90088ac --severity warning
+```
+
+The analyzer enumerates spending paths, runs symbolic stack analysis along each, and reports findings: stack underflow, unreachable code after `OP_RETURN`, unbalanced `OP_IF/OP_ENDIF`, branches that leave inconsistent stack depths, paths with no signature check or no verification at all (would allow anyone to spend), dropped `OP_CHECKSIG` results, `OP_CODESEPARATOR` presence, inefficient `OP_PUSHDATA` encodings, and oversized scripts.
+
 ---
 
 ## Golden File Management
@@ -241,34 +344,166 @@ pnpm run update-golden
 
 Golden file updates should always be reviewed carefully. An unexpected change in a golden file indicates either a compiler bug or an unintended spec change.
 
+### Golden-regeneration integrity gate (issue #122)
+
+Goldens are **self-produced** by the very implementation under test — `pnpm run update-golden` writes whatever the compilers currently emit. That is a structural hazard: a PR can silently regenerate a golden to match a *buggy* new output, and the suite then validates the corrupt bytes against itself and ships green ("corrupt scripts validated by self-consistent tests"). The gate closes that hole. It does **not** replace the golden comparison — it adds an admission check so that *changing* a golden requires an **independent** cross-check, not just the compiler's own say-so.
+
+**What it guards.** Any file in the PR's changed set (three-dot diff against the merge-base) matching one of the self-produced golden/vector families:
+
+- `conformance/tests/**/expected-script.hex`
+- `conformance/tests/**/expected-ir.json`
+- `conformance/runtime-vectors/*.json` (official-KAT hash vectors)
+- `conformance/sdk-output/tests/**/expected-*.hex`
+- `conformance/analyzer/**/expected-analyzer-report.json`
+- `conformance/source-map/**/expected-source-map.json`
+- `packages/decompiler/coverage-baseline.json`
+
+(The authoritative matcher list lives in `GOLDEN_MATCHERS` in `conformance/scripts/check-golden-provenance.mjs` — extend it there when a new golden family is added.) Pure **deletions** are ignored (removing a golden is not a regeneration risk); non-golden changes are a no-op.
+
+**How a golden change is justified.** For **each** changed golden, the gate requires **one** of:
+
+- **(A) Scoped cross-check co-change** — for a fixture golden `conformance/tests/<fixture>/expected-{script.hex,ir.json}`, the same PR also modifies that fixture's independent execution oracle `conformance/witnesses/<fixture>.json`. The differential-execution oracle (`witnesses/differential.test.ts`) re-runs the declared spends through a *second* engine (ANF interpreter + `@bsv/sdk` ScriptVM), so the fixture's new bytes get an accept/reject check that does not come from the compiler that produced them. This is the ergonomic happy-path for a legitimate codegen change.
+- **(B) Provenance allowlist entry** — an entry in `conformance/golden-provenance-allowlist.json` (works for **any** golden, including runtime-vectors, sdk-output, analyzer, source-map, and crypto-exempt fixtures with no witness):
+
+  ```json
+  {
+    "path": "conformance/tests/arithmetic/expected-script.hex",
+    "sha256": "<sha256 of the NEW file bytes>",
+    "verified-against": "official-KAT | second-implementation | differential-oracle | intentional-spec-change",
+    "reason": "why the new bytes are correct + which independent oracle confirmed them",
+    "reviewer": "gh:your-handle"
+  }
+  ```
+
+  The entry is **content-pinned**: `sha256` must equal the current bytes of the golden. Because the pin is content-addressed, an entry can only ever justify the *one* value it was reviewed for — a later, *different* regeneration of the same file fails the gate again and forces a fresh, re-reviewed entry. This is what prevents a stale exemption from silently authorizing future silent regenerations. `verified-against` records the class of independent oracle; `reason` and `reviewer` make the sign-off explicit and reviewable in the allowlist diff.
+
+**Running it.**
+
+```bash
+# Auto-detect the changed set vs the merge-base (CI mode); base defaults to
+# origin/main, override with --base <ref> or $GOLDEN_GATE_BASE.
+node conformance/scripts/check-golden-provenance.mjs --base origin/main
+
+# Print the sha256 of every changed golden (to fill in an allowlist entry).
+node conformance/scripts/check-golden-provenance.mjs --print-hashes --base origin/main
+
+# Prove both directions still work (reject-without-justification / pass-with).
+node conformance/scripts/check-golden-provenance.mjs --self-test
+```
+
+**CI wiring.** The `golden-provenance-gate` job in `.github/workflows/ci.yml` runs on `pull_request` (no `continue-on-error`), checks out with `fetch-depth: 0`, and passes the PR base commit SHA via `$GOLDEN_GATE_BASE` (through `env:`, never interpolated into a shell command). It runs the checker in auto-detect mode and then `--self-test` so the gate cannot rot into a silent no-op. The script is dependency-light (Node built-ins + `git`; no `pnpm install`).
+
 ---
 
-## Current Test Cases (25)
+## Current Test Cases
+
+The suite currently contains **64 fixtures** under `tests/` — that directory is the authoritative list (`find tests -name source.json | wc -l`). The table below describes the most commonly referenced ones. Tier scoping (which compilers run a fixture) is governed solely by the [Per-fixture compiler allowlist](#per-fixture-compiler-allowlist) above — do not infer it from this table.
 
 | Test | Exercises | Has Script Golden |
 |---|---|---|
+| `add-data-output` | `this.addDataOutput(satoshis, bytes)` intrinsic | Yes |
+| `add-raw-output` | `this.addRawOutput(satoshis, scriptBytes)` intrinsic | Yes |
 | `arithmetic` | Binary arithmetic operations (+, -, *, /, %) | Yes |
 | `auction` | Stateful auction with bidding and closing | Yes |
+| `babybear` | BabyBear prime-field arithmetic | Yes |
+| `babybear-ext4` | BabyBear Ext4 extension-field operations | Yes |
 | `basic-p2pkh` | Property loading, hash160, checkSig, assert | Yes |
+| `bitwise-ops` | Bitwise operators (&, \|, ^, ~, <<, >>) on bigint + ByteString | Yes |
+| `blake3` | BLAKE3 compression + full-hash builtins | Yes |
 | `boolean-logic` | Logical operators (&&, \|\|, !), short-circuit lowering | Yes |
 | `bounded-loop` | Loop unrolling in ANF IR | Yes |
 | `convergence-proof` | Convergence proof patterns | Yes |
 | `covenant-vault` | Covenant spending constraints | Yes |
+| `cross-covenant` | Cross-contract covenant validation | Yes |
 | `ec-demo` | EC point operation demos | Yes |
 | `ec-primitives` | EC point operations (ecAdd, ecMul, ecMulGen, etc.) | Yes |
+| `ec-unit` | Fine-grained EC unit tests | Yes |
 | `escrow` | Multi-party escrow with multiple spending paths | Yes |
 | `function-patterns` | Private helper methods and function call patterns | Yes |
+| `go-dsl-bytestring-literal` | `.runar.go` DSL `ByteString` literal grammar | Yes |
 | `if-else` | Conditional branches in ANF IR | Yes |
+| `if-without-else` | if-only conditionals | Yes |
 | `math-demo` | Built-in math functions (abs, min, max, sqrt, pow, etc.) | Yes |
+| `merkle-proof` | Merkle-root verification | Yes |
 | `multi-method` | Method dispatch table generation | Yes |
 | `oracle-price` | Rabin signature oracle price feed | Yes |
+| `p256-primitives` | NIST P-256 EC primitives | Yes |
+| `p256-wallet` | P-256 wallet contract | Yes |
+| `p384-primitives` | NIST P-384 EC primitives | Yes |
+| `p384-wallet` | P-384 wallet contract | Yes |
 | `post-quantum-slhdsa` | SLH-DSA (SPHINCS+) signature verification | Yes |
 | `post-quantum-wallet` | WOTS+ wallet contract | Yes |
 | `post-quantum-wots` | WOTS+ hash chain signature verification | Yes |
 | `property-initializers` | Default values on contract properties | Yes |
 | `schnorr-zkp` | Schnorr zero-knowledge proof (EC ops) | Yes |
 | `sphincs-wallet` | SLH-DSA wallet contract | Yes |
+| `state-covenant` | Stateful covenant constraints | Yes |
 | `stateful` | State updates, checkPreimage, getStateScript | Yes |
+| `stateful-bytestring` | Stateful ByteString mutations | Yes |
 | `stateful-counter` | Stateful counter with increment | Yes |
 | `token-ft` | Fungible token with split/merge | Yes |
 | `token-nft` | NFT with transfer/burn | Yes |
+
+### Script execution oracle
+
+`script_execution_test.go` compiles each contract to its **fold-ON deployed
+bytes** (the compiler default), builds a valid spend witness, and executes the
+unlocking+locking scripts through the go-sdk Bitcoin Script interpreter. Every
+contract family also ships adversarial **near-miss** witnesses (wrong key,
+wrong state, tampered signature, off-curve point) that MUST fail. Gated in CI
+by the `Script Execution Oracle` job. This is the only oracle that executes
+fold-ON bytes against a script engine with per-contract witnesses.
+
+### SDK-output conformance (46 fixtures, 7 SDKs)
+
+`sdk-output/tests/` contains 46 fixtures (one `input.json` + one
+`expected-locking.hex` per directory). The runner in `sdk-output/runner/sdk-runner.ts`
+compiles each fixture through all seven SDK tools in `sdk-output/tools/` (TypeScript,
+Go, Python, Ruby, Rust, Zig, Java) and asserts byte-identical locking-script hex
+across every SDK. Invoke with `pnpm run sdk-output`.
+
+Coverage gate: `sdk-runner.ts` runs `--audit` before each suite execution
+(and exposes the same audit standalone via `npx tsx conformance/sdk-output/runner/sdk-runner.ts --audit`).
+The audit fails CI on any compiler-conformance fixture (`conformance/tests/`)
+that is absent from `sdk-output/tests/` AND not listed in
+`conformance/sdk-output/coverage-allowlist.json`. The allowlist is the only
+approved way to opt a fixture out of SDK-output coverage; every entry carries
+a one-line rationale and is checked for staleness on each audit run.
+
+### Cross-tier BIP-143 sighash interop (GAP-003)
+
+`sdk-bip143/` is the cross-tier gate for **BIP-143 transaction sighash
+preimage construction** — proving the seven SDKs build the *same* preimage
+bytes for the same spend, independent of any node. (Before this, BIP-143
+deploy/call sighash was only tested per-tier against a regtest node; two tiers
+could diverge on a consensus-irrelevant byte, or skip a scenario, and still
+ship green.)
+
+- `sdk-bip143/generate-fixtures.ts` — TypeScript reference generator. TS owns
+  the de-facto golden BIP-143 path (`@bsv/sdk` `TransactionSignature.format`,
+  the exact code `runar-sdk`'s LocalSigner / oppushtx use). It hand-builds an
+  unsigned raw tx per scenario, computes the full preimage, and signs
+  `sha256d(preimage)` with a fixed test key (priv=1, RFC-6979 + low-S — same
+  convention as `sdk-envelope/` signing vectors, so the DER signature is
+  byte-reproducible). Run `npx tsx sdk-bip143/generate-fixtures.ts` to
+  regenerate; `--check` re-derives and fails on drift without rewriting (the
+  CI drift guard).
+- `sdk-bip143/fixtures.json` — frozen fixture. Two scenarios:
+  `p2pkh_spend` (stateless, SIGHASH_ALL|FORKID) and `counter_call` (the
+  stateful OP_PUSH_TX path, using the compiled `Counter` contract as the
+  subscript + a stateful-continuation + OP_RETURN output shape). Each scenario
+  carries everything a consumer needs to recompute the preimage:
+  `{ unsignedTxHex, inputIndex, prevScriptHex, prevValueSats, sighashFlags }`
+  plus expected `{ preimageHex, digestHex, sigHex, pubkeyHex }`.
+- Per-tier replay tests load the fixture, **independently recompute** the
+  BIP-143 preimage from the tx + prevout, assert byte-equality with
+  `preimageHex` (the core node-free check), assert `sha256d(preimage)` equals
+  `digestHex`, and verify the TS-produced `sigHex` against `pubkeyHex` over
+  their own digest. They live beside each tier's `envelope_interop` peer:
+  Go `packages/runar-go/sdk_bip143_interop_test.go`,
+  Rust `packages/runar-rs/tests/bip143_interop.rs`,
+  Python `packages/runar-py/tests/test_bip143_interop.py`,
+  Ruby `packages/runar-rb/spec/runar/sdk/bip143_interop_spec.rb`,
+  Zig `packages/runar-zig/src/sdk_bip143_interop_test.zig`,
+  Java `packages/runar-java/src/test/java/runar/lang/sdk/Bip143InteropTest.java`.
+  All seven tiers (TS reference + six consumers) are green and byte-identical.

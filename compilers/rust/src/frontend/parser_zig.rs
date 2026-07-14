@@ -43,6 +43,8 @@
 //! - `.{ ... }` -> ArrayLiteral
 //! - Compound assignment desugaring (`+=`, `-=`, etc.)
 
+use num_bigint::BigInt;
+use num_traits::{Num, ToPrimitive};
 use super::ast::{
     BinaryOp, ContractNode, Expression, MethodNode, ParamNode, PrimitiveTypeName, PropertyNode,
     SourceLocation, Statement, TypeNode, UnaryOp, Visibility,
@@ -71,7 +73,7 @@ pub fn parse_zig(source: &str, file_name: Option<&str>) -> ParseResult {
         .map(|msg| Diagnostic::error(msg, None))
         .collect();
 
-    ParseResult { contract, errors }
+    ParseResult { contract, errors, source_size_err: None }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,12 +93,15 @@ fn map_zig_type(name: &str) -> &str {
         "PubKey" => "PubKey",
         "Sig" => "Sig",
         "Sha256" => "Sha256",
+        "Sha256Digest" => "Sha256",
         "Ripemd160" => "Ripemd160",
         "Addr" => "Addr",
         "SigHashPreimage" => "SigHashPreimage",
         "RabinSig" => "RabinSig",
         "RabinPubKey" => "RabinPubKey",
         "Point" => "Point",
+        "P256Point" => "P256Point",
+        "P384Point" => "P384Point",
         _ => name,
     }
 }
@@ -133,7 +138,7 @@ enum Token {
 
     // Identifiers and literals
     Ident(String),
-    NumberLit(i128),
+    NumberLit(BigInt),
     StringLit(String),
 
     // Operators
@@ -313,9 +318,11 @@ fn tokenize(source: &str) -> Vec<Token> {
                 }
             }
             let val = if num_str.starts_with("0x") || num_str.starts_with("0X") {
-                i128::from_str_radix(&num_str[2..], 16).unwrap_or(0)
+                <BigInt as Num>::from_str_radix(&num_str[2..], 16)
+                    .unwrap_or_else(|_| BigInt::from(0))
             } else {
-                num_str.parse::<i128>().unwrap_or(0)
+                <BigInt as Num>::from_str_radix(&num_str, 10)
+                    .unwrap_or_else(|_| BigInt::from(0))
             };
             tokens.push(Token::NumberLit(val));
             continue;
@@ -590,22 +597,46 @@ impl<'a> ZigParser<'a> {
         self.expect(&Token::RBrace); // }
         self.match_tok(&Token::Semicolon); // optional ;
 
-        // Post-process: set readonly for SmartContract properties and
-        // properties without initializers.
-        for prop in &mut properties {
-            if parent_class == "SmartContract" || prop.initializer.is_none() {
-                prop.readonly = true;
-            }
+        // Collect set of property names mutated in any method body so we can
+        // mark them as non-readonly in stateful contracts (matches TS rule).
+        let mut mutated: HashSet<String> = HashSet::new();
+        for m in &methods {
+            collect_mutated_properties(&m.body, &mut mutated);
         }
 
         // Auto-generate constructor if not provided
         let constructor = constructor.unwrap_or_else(|| build_constructor(&properties, self.file));
+
+        // Post-process:
+        // - SmartContract: all properties readonly.
+        // - StatefulSmartContract: readonly iff explicitly marked, OR has no
+        //   initializer AND is not mutated in any method body.
+        // - Strip `initializer` for properties that are also constructor
+        //   params (the constructor param overrides the default; the Zig
+        //   compiler reference omits `initialValue` in this case).
+        let ctor_param_names: HashSet<String> = constructor
+            .params
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        for prop in &mut properties {
+            let had_initializer = prop.initializer.is_some();
+            if ctor_param_names.contains(&prop.name) {
+                prop.initializer = None;
+            }
+            if parent_class == "SmartContract" || parent_class == "UnsafeSmartContract" {
+                prop.readonly = true;
+            } else if !prop.readonly && !had_initializer && !mutated.contains(&prop.name) {
+                prop.readonly = true;
+            }
+        }
 
         // Rewrite bare method calls to this.method() style
         let mut method_names: HashSet<String> =
             methods.iter().map(|m| m.name.clone()).collect();
         method_names.insert("addOutput".to_string());
         method_names.insert("addRawOutput".to_string());
+        method_names.insert("addDataOutput".to_string());
         method_names.insert("getStateScript".to_string());
         let mut final_methods = methods;
         for method in &mut final_methods {
@@ -637,6 +668,8 @@ impl<'a> ZigParser<'a> {
             let name = self.expect_ident();
             if name == "StatefulSmartContract" {
                 parent = "StatefulSmartContract".to_string();
+            } else if name == "UnsafeSmartContract" {
+                parent = "UnsafeSmartContract".to_string();
             }
         }
 
@@ -669,6 +702,8 @@ impl<'a> ZigParser<'a> {
             readonly: is_readonly,
             initializer,
             source_location: self.loc(),
+            synthetic_array_chain: None,
+            embed_always: false,
         })
     }
 
@@ -682,7 +717,7 @@ impl<'a> ZigParser<'a> {
         if *self.peek() == Token::LBracket {
             self.advance(); // [
             let length = match self.advance() {
-                Token::NumberLit(n) => n as usize,
+                Token::NumberLit(n) => n.to_usize().unwrap_or(0),
                 _ => {
                     self.errors.push("Expected array length".to_string());
                     0
@@ -814,6 +849,7 @@ impl<'a> ZigParser<'a> {
                 body,
                 visibility: Visibility::Public,
                 source_location: self.loc(),
+                sighash_type: None,
             });
         }
 
@@ -831,6 +867,7 @@ impl<'a> ZigParser<'a> {
                 Visibility::Private
             },
             source_location: self.loc(),
+            sighash_type: None,
         })
     }
 
@@ -853,11 +890,15 @@ impl<'a> ZigParser<'a> {
             if is_receiver {
                 receiver_name = Some(param_name);
             } else if raw_name == "StatefulContext" {
-                stateful_ctx_names.insert(param_name.clone());
-                params.push(ParamNode {
-                    name: param_name,
-                    param_type: type_node,
-                });
+                // Zig stateful contracts thread an explicit StatefulContext
+                // parameter through every state-mutating method body
+                // (e.g. `ctx.txPreimage`, `ctx.addOutput(...)`). The compiler
+                // re-injects this context when lowering, so the parameter is
+                // dropped from the canonical IR — matching the Zig compiler's
+                // own parse_zig.zig behavior. Recording the binding name lets
+                // later passes rewrite `ctx.txPreimage` -> `this.txPreimage`
+                // and `ctx.addOutput(...)` -> `this.addOutput(...)`.
+                stateful_ctx_names.insert(param_name);
             } else {
                 params.push(ParamNode {
                     name: param_name,
@@ -952,6 +993,7 @@ impl<'a> ZigParser<'a> {
                     name: "super".to_string(),
                 }),
                 args: super_args,
+                asm_return_type: None,
             },
             source_location: self.loc(),
         }
@@ -1222,7 +1264,7 @@ impl<'a> ZigParser<'a> {
         } else {
             // No continue expression -- synthesize a no-op
             update = Statement::ExpressionStatement {
-                expression: Expression::BigIntLiteral { value: 0 },
+                expression: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             };
         }
@@ -1236,7 +1278,7 @@ impl<'a> ZigParser<'a> {
                 name: "__while_no_init".to_string(),
                 var_type: None,
                 mutable: true,
-                init: Expression::BigIntLiteral { value: 0 },
+                init: Expression::BigIntLiteral { value: BigInt::from(0) },
                 source_location: self.loc(),
             }),
             condition,
@@ -1577,6 +1619,28 @@ impl<'a> ZigParser<'a> {
     }
 
     fn parse_primary(&mut self) -> Expression {
+        // Slice-literal: &.{ ... } -> array literal. Zig coerces an
+        // anonymous tuple to `[]const T` via this leading-`&` form
+        // (e.g. `&.{ sig1, sig2 }` for runar.checkMultiSig). The `&`
+        // carries no Rúnar semantics. `&` is otherwise a binary
+        // bitwise-and consumed at expression level and cannot appear
+        // at primary position.
+        if *self.peek() == Token::BitAnd
+            && *self.peek_at(1) == Token::Dot
+            && *self.peek_at(2) == Token::LBrace
+        {
+            self.advance(); // &
+            self.advance(); // .
+            self.advance(); // {
+            let mut elements = Vec::new();
+            while *self.peek() != Token::RBrace && *self.peek() != Token::Eof {
+                elements.push(self.parse_expression());
+                self.match_tok(&Token::Comma);
+            }
+            self.expect(&Token::RBrace);
+            return Expression::ArrayLiteral { elements };
+        }
+
         // Anonymous struct literal: .{ ... }
         if *self.peek() == Token::Dot && *self.peek_at(1) == Token::LBrace {
             self.advance(); // .
@@ -1672,7 +1736,7 @@ impl<'a> ZigParser<'a> {
 
         // Fallback
         self.advance();
-        Expression::BigIntLiteral { value: 0 }
+        Expression::BigIntLiteral { value: BigInt::from(0) }
     }
 
     fn parse_at_builtin(&mut self, name: &str) -> Expression {
@@ -1749,6 +1813,7 @@ impl<'a> ZigParser<'a> {
                             name: name.to_string(),
                         }),
                         args,
+                        asm_return_type: None,
                     }
                 } else {
                     self.errors
@@ -1776,6 +1841,7 @@ impl<'a> ZigParser<'a> {
                     expr = Expression::CallExpr {
                         callee: Box::new(expr),
                         args,
+                        asm_return_type: None,
                     };
                 }
                 Token::Dot => {
@@ -1796,6 +1862,7 @@ impl<'a> ZigParser<'a> {
                                 || prop == "getStateScript"
                                 || prop == "addOutput"
                                 || prop == "addRawOutput"
+                                || prop == "addDataOutput"
                             {
                                 expr = Expression::PropertyAccess { property: prop };
                                 continue;
@@ -1856,6 +1923,7 @@ fn build_constructor(properties: &[PropertyNode], file: &str) -> MethodNode {
                 name: "super".to_string(),
             }),
             args: super_args,
+            asm_return_type: None,
         },
         source_location: SourceLocation {
             file: file.to_string(),
@@ -1891,6 +1959,7 @@ fn build_constructor(properties: &[PropertyNode], file: &str) -> MethodNode {
             line: 1,
             column: 0,
         },
+        sighash_type: None,
     }
 }
 
@@ -1931,7 +2000,7 @@ fn rewrite_bare_method_calls(stmts: &mut [Statement], method_names: &HashSet<Str
 
 fn rewrite_expr(expr: &mut Expression, method_names: &HashSet<String>) {
     match expr {
-        Expression::CallExpr { callee, args } => {
+        Expression::CallExpr { callee, args, .. } => {
             for arg in args.iter_mut() {
                 rewrite_expr(arg, method_names);
             }
@@ -2018,6 +2087,109 @@ fn rewrite_stmt(stmt: &mut Statement, method_names: &HashSet<String>) {
             rewrite_stmt(update.as_mut(), method_names);
             rewrite_bare_method_calls(body, method_names);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mutation detection: walk method bodies to find `this.<prop> = …` writes.
+// ---------------------------------------------------------------------------
+
+fn collect_mutated_properties(body: &[Statement], out: &mut HashSet<String>) {
+    for stmt in body {
+        collect_mutated_in_stmt(stmt, out);
+    }
+}
+
+fn collect_mutated_in_stmt(stmt: &Statement, out: &mut HashSet<String>) {
+    match stmt {
+        Statement::Assignment { target, value, .. } => {
+            if let Expression::PropertyAccess { property } = target {
+                out.insert(property.clone());
+            }
+            collect_mutated_in_expr(target, out);
+            collect_mutated_in_expr(value, out);
+        }
+        Statement::VariableDecl { init, .. } => {
+            collect_mutated_in_expr(init, out);
+        }
+        Statement::ExpressionStatement { expression, .. } => {
+            collect_mutated_in_expr(expression, out);
+        }
+        Statement::ReturnStatement { value, .. } => {
+            if let Some(v) = value {
+                collect_mutated_in_expr(v, out);
+            }
+        }
+        Statement::IfStatement {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_mutated_in_expr(condition, out);
+            collect_mutated_properties(then_branch, out);
+            if let Some(els) = else_branch {
+                collect_mutated_properties(els, out);
+            }
+        }
+        Statement::ForStatement {
+            init,
+            condition,
+            update,
+            body,
+            ..
+        } => {
+            collect_mutated_in_stmt(init, out);
+            collect_mutated_in_expr(condition, out);
+            collect_mutated_in_stmt(update, out);
+            collect_mutated_properties(body, out);
+        }
+    }
+}
+
+fn collect_mutated_in_expr(expr: &Expression, out: &mut HashSet<String>) {
+    match expr {
+        Expression::BinaryExpr { left, right, .. } => {
+            collect_mutated_in_expr(left, out);
+            collect_mutated_in_expr(right, out);
+        }
+        Expression::UnaryExpr { operand, .. } => {
+            collect_mutated_in_expr(operand, out);
+        }
+        Expression::CallExpr { callee, args, .. } => {
+            collect_mutated_in_expr(callee, out);
+            for a in args {
+                collect_mutated_in_expr(a, out);
+            }
+        }
+        Expression::MemberExpr { object, .. } => {
+            collect_mutated_in_expr(object, out);
+        }
+        Expression::TernaryExpr {
+            condition,
+            consequent,
+            alternate,
+        } => {
+            collect_mutated_in_expr(condition, out);
+            collect_mutated_in_expr(consequent, out);
+            collect_mutated_in_expr(alternate, out);
+        }
+        Expression::IndexAccess { object, index } => {
+            collect_mutated_in_expr(object, out);
+            collect_mutated_in_expr(index, out);
+        }
+        Expression::IncrementExpr { operand, .. } | Expression::DecrementExpr { operand, .. } => {
+            if let Expression::PropertyAccess { property } = operand.as_ref() {
+                out.insert(property.clone());
+            }
+            collect_mutated_in_expr(operand, out);
+        }
+        Expression::ArrayLiteral { elements } => {
+            for e in elements {
+                collect_mutated_in_expr(e, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2120,9 +2292,13 @@ pub const Counter = struct {
         assert_eq!(contract.parent_class, "StatefulSmartContract");
         assert_eq!(contract.properties.len(), 1);
         assert_eq!(contract.properties[0].name, "count");
-        // count has initializer = 0 and is mutable in stateful -> not readonly
+        // count is mutated in increment/decrement -> not readonly even after
+        // the initializer is stripped below.
         assert!(!contract.properties[0].readonly);
-        assert!(contract.properties[0].initializer.is_some());
+        // `count: i64 = 0` collides with `pub fn init(count: i64)`: the ctor
+        // param always overrides the default so the parser strips the
+        // initializer to match the Zig compiler reference IR.
+        assert!(contract.properties[0].initializer.is_none());
         assert_eq!(contract.methods.len(), 2);
         assert_eq!(contract.methods[0].name, "increment");
         assert_eq!(contract.methods[1].name, "decrement");

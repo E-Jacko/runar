@@ -18,6 +18,7 @@ import {
   Hash,
   BigNumber,
 } from '@bsv/sdk';
+import { encodeArg } from 'runar-sdk';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,6 +45,20 @@ export interface StatefulPreimageParams {
   version?: number;
   locktime?: number;
   sequence?: number;
+  /**
+   * Outpoint of the input being spent (72 hex chars: 32-byte txid +
+   * 4-byte LE vout). Defaults to the first entry of `prevouts` when that
+   * is given, otherwise to 36 zero bytes (legacy behaviour).
+   */
+  outpoint?: string;
+  /**
+   * All input outpoints of the spending transaction, in input order
+   * (each 72 hex chars). When given,
+   * `hashPrevouts = hash256(concat(prevouts))`, enabling multi-input
+   * covenant tests (`extractHashPrevouts` / companion-input checks).
+   * Defaults to `[outpoint]` (single-input, legacy behaviour).
+   */
+  prevouts?: string[];
 }
 
 export interface StatefulPreimageResult {
@@ -67,6 +82,10 @@ export interface StatefulPreimageResult {
 
 /** SIGHASH_ALL | SIGHASH_FORKID */
 const SIGHASH_ALL_FORKID = 0x41;
+
+/** 32 zero bytes — BIP-143 fills zeroed digest fields (hashPrevouts /
+ *  hashSequence / hashOutputs) with this under the relaxed sighash flags. */
+const ZERO32 = '00'.repeat(32);
 
 /** secp256k1 curve order N. */
 const CURVE_ORDER = new BigNumber(
@@ -245,23 +264,16 @@ function encodeVarint(n: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Constructor arg encoding
-// ---------------------------------------------------------------------------
-
-function encodeConstructorArg(value: bigint | boolean | string): string {
-  if (typeof value === 'bigint') return encodeNum2Bin(value, 8);
-  if (typeof value === 'boolean') return value ? '01' : '00';
-  // Hex string for ByteString/PubKey/etc.
-  return String(value);
-}
-
-// ---------------------------------------------------------------------------
 // Code part building
 // ---------------------------------------------------------------------------
 
 /**
  * Build the code part of the locking script by substituting constructor args
  * into the artifact's script at the specified byte offsets.
+ *
+ * Args are encoded with the SDK's `encodeArg` (minimal script-number /
+ * push-data encodings) so the code part — and anything hashed from it — is
+ * byte-identical to the script `RunarContract` deploys.
  */
 function buildCodePart(
   artifact: RunarArtifact,
@@ -278,7 +290,7 @@ function buildCodePart(
       if (!paramName) continue;
       const value = constructorArgs[paramName];
       if (value === undefined) continue;
-      const encoded = encodeConstructorArg(value);
+      const encoded = encodeArg(value);
       const hexOffset = slot.byteOffset * 2;
       // Replace the OP_0 placeholder (2 hex chars) with the encoded value
       script = script.slice(0, hexOffset) + encoded + script.slice(hexOffset + 2);
@@ -361,7 +373,29 @@ export function buildStatefulPreimage(
     version = 1,
     locktime = 0,
     sequence = 0xffffffff,
+    outpoint,
+    prevouts,
   } = params;
+
+  // Validate outpoint / prevouts overrides (72 hex chars = 36 bytes each).
+  const OUTPOINT_RE = /^[0-9a-fA-F]{72}$/;
+  if (outpoint !== undefined && !OUTPOINT_RE.test(outpoint)) {
+    throw new Error(
+      `buildStatefulPreimage: outpoint must be 72 hex chars (32-byte txid + 4-byte LE vout), got ${outpoint.length} chars`,
+    );
+  }
+  if (prevouts !== undefined) {
+    if (prevouts.length === 0) {
+      throw new Error('buildStatefulPreimage: prevouts must not be empty');
+    }
+    for (const [idx, po] of prevouts.entries()) {
+      if (!OUTPOINT_RE.test(po)) {
+        throw new Error(
+          `buildStatefulPreimage: prevouts[${idx}] must be 72 hex chars (32-byte txid + 4-byte LE vout), got ${po.length} chars`,
+        );
+      }
+    }
+  }
 
   // Build code part and full locking script
   const codePart = buildCodePart(artifact, constructorArgs);
@@ -370,6 +404,13 @@ export function buildStatefulPreimage(
     stateFields.length > 0
       ? codePart + '6a' + serializeState(stateFields, state)
       : codePart;
+
+  // Issue #123: resolve the method's declared @sighash mode (default 0x41).
+  // methodIndex indexes the public-methods list.
+  const publicMethods = (artifact.abi?.methods ?? []).filter((m) => m.isPublic);
+  const sigHashType = publicMethods[methodIndex]?.sigHashType ?? SIGHASH_ALL_FORKID;
+  const base = sigHashType & 0x1f;
+  const acp = (sigHashType & 0x80) !== 0;
 
   // Determine OP_CODESEPARATOR offset for the scriptCode
   let codeSepIndex: number | undefined;
@@ -403,7 +444,27 @@ export function buildStatefulPreimage(
     outputs.push(rawOut);
   }
 
-  const hashOutputsHex = computeHashOutputs(outputs);
+  // BIP-143 hashOutputs by sighash base:
+  //   ALL    -> hash256(all outputs)
+  //   SINGLE -> hash256(the single output at THIS input's index), or 32 zero
+  //             bytes when inputIndex >= outputs.length. It must NOT digest the
+  //             whole output set — under SINGLE every other output is
+  //             attacker-controllable, so hashing them all would diverge from
+  //             the real BIP-143 sighash and make the mock validate spends the
+  //             chain rejects. The mock spends a single input at index 0.
+  //   NONE   -> 32 zero bytes (no outputs committed)
+  const inputIndex = 0;
+  let hashOutputsHex: string;
+  if (base === 0x02 /* NONE */) {
+    hashOutputsHex = ZERO32;
+  } else if (base === 0x03 /* SINGLE */) {
+    hashOutputsHex =
+      inputIndex < outputs.length
+        ? bytesToHex(hash256(hexToBytes(outputs[inputIndex]!)))
+        : ZERO32;
+  } else {
+    hashOutputsHex = computeHashOutputs(outputs);
+  }
 
   // Build BIP-143 preimage manually
   //
@@ -421,14 +482,27 @@ export function buildStatefulPreimage(
 
   const nVersion = uint32LE(version);
 
-  // Dummy outpoint: 32 zero bytes (txid) + 00000000 (vout 0)
-  const dummyOutpoint = '00'.repeat(32) + '00000000';
+  // Outpoint of the input being spent. Default: first prevout when given,
+  // otherwise 32 zero bytes (txid) + 00000000 (vout 0) — legacy behaviour.
+  const spentOutpoint = (
+    outpoint ?? prevouts?.[0] ?? '00'.repeat(32) + '00000000'
+  ).toLowerCase();
 
-  // hashPrevouts = hash256(outpoint)
-  const hashPrevouts = bytesToHex(hash256(hexToBytes(dummyOutpoint)));
+  // hashPrevouts = hash256(concat(all input outpoints)).
+  // Default (single input): hash256(spent outpoint).
+  // Issue #123: ANYONECANPAY zeroes hashPrevouts (only this input is signed).
+  const prevoutsHex = prevouts
+    ? prevouts.join('').toLowerCase()
+    : spentOutpoint;
+  const hashPrevouts = acp ? ZERO32 : bytesToHex(hash256(hexToBytes(prevoutsHex)));
 
-  // hashSequence = hash256(sequence as 4-byte LE)
-  const hashSequence = bytesToHex(hash256(hexToBytes(uint32LE(sequence))));
+  // hashSequence = hash256(sequence as 4-byte LE).
+  // Issue #123: zeroed under anything but pure SIGHASH_ALL (NONE / SINGLE /
+  // ANYONECANPAY all clear it).
+  const hashSequenceSound = base === 0x01 /* ALL */ && !acp;
+  const hashSequence = hashSequenceSound
+    ? bytesToHex(hash256(hexToBytes(uint32LE(sequence))))
+    : ZERO32;
 
   // scriptCode with varint length prefix
   const scriptCodeBytes = scriptCode.length / 2;
@@ -443,14 +517,14 @@ export function buildStatefulPreimage(
   // nLocktime (4 bytes LE)
   const nLocktime = uint32LE(locktime);
 
-  // sighashType (4 bytes LE)
-  const sighashType = uint32LE(SIGHASH_ALL_FORKID);
+  // sighashType (4 bytes LE) — the method's declared @sighash mode (issue #123).
+  const sighashType = uint32LE(sigHashType);
 
   const preimageHex =
     nVersion +
     hashPrevouts +
     hashSequence +
-    dummyOutpoint +
+    spentOutpoint +
     scriptCodePrefixed +
     amountHex +
     nSequence +
@@ -474,7 +548,7 @@ export function buildStatefulPreimage(
 
   const derHex = signature.toDER('hex') as string;
   const signatureHex =
-    derHex + SIGHASH_ALL_FORKID.toString(16).padStart(2, '0');
+    derHex + (sigHashType & 0xff).toString(16).padStart(2, '0');
 
   return {
     preimageHex,

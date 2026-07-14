@@ -19,6 +19,24 @@ from runar_compiler.ir.types import (
     ANFProgram,
     ANFValue,
 )
+from runar_compiler.ir.unknown_anf_kind_error import UnknownANFKindError
+
+
+# Kinds that fall through ``_fold_value`` unchanged. Listing them explicitly
+# lets us raise UnknownANFKindError on any kind that isn't a known fold case,
+# so a forgotten dispatch-site update fails loudly instead of silently
+# corrupting downstream passes.
+_FOLD_VALUE_PASSTHROUGH_KINDS: frozenset[str] = frozenset({
+    "assert",
+    "update_prop",
+    "check_preimage",
+    "deserialize_state",
+    "add_output",
+    "add_raw_output",
+    "add_data_output",
+    "array_literal",
+    "get_state_script",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +51,21 @@ from runar_compiler.ir.types import (
 ConstValue = tuple[str, Any]
 
 ConstEnv = dict[str, ConstValue]
+
+
+# ---------------------------------------------------------------------------
+# Integer division helper
+# ---------------------------------------------------------------------------
+
+def _trunc_div(a: int, b: int) -> int | None:
+    """Integer division with truncation toward zero (matches Bitcoin Script OP_DIV)."""
+    if b == 0:
+        return None
+    # Python's // floors toward negative infinity; we need truncation toward zero
+    q = abs(a) // abs(b)
+    if (a < 0) != (b < 0):
+        q = -q
+    return q
 
 
 # ---------------------------------------------------------------------------
@@ -51,15 +84,16 @@ def _eval_bin_op(op: str, left: ConstValue, right: ConstValue) -> ConstValue | N
         if op == "*":
             return ("int", a * b)
         if op == "/":
-            if b == 0:
+            q = _trunc_div(a, b)
+            if q is None:
                 return None
-            # Truncated division (toward zero), matching JS BigInt semantics
-            return ("int", int(a / b))
+            return ("int", q)
         if op == "%":
-            if b == 0:
+            q = _trunc_div(a, b)
+            if q is None:
                 return None
             # Remainder matching JS BigInt (sign follows dividend)
-            return ("int", a - int(a / b) * b)
+            return ("int", a - q * b)
         if op == "===":
             return ("bool", a == b)
         if op == "!==":
@@ -182,15 +216,21 @@ def _eval_builtin_call(func_name: str, args: list[ConstValue]) -> ConstValue | N
         return ("int", max(int_args[0], int_args[1]))
 
     if func_name == "safediv":
-        if len(int_args) != 2 or int_args[1] == 0:
+        if len(int_args) != 2:
             return None
-        return ("int", int(int_args[0] / int_args[1]))
+        q = _trunc_div(int_args[0], int_args[1])
+        if q is None:
+            return None
+        return ("int", q)
 
     if func_name == "safemod":
-        if len(int_args) != 2 or int_args[1] == 0:
+        if len(int_args) != 2:
             return None
         a, b = int_args[0], int_args[1]
-        return ("int", a - int(a / b) * b)
+        q = _trunc_div(a, b)
+        if q is None:
+            return None
+        return ("int", a - q * b)
 
     if func_name == "clamp":
         if len(int_args) != 3:
@@ -221,16 +261,22 @@ def _eval_builtin_call(func_name: str, args: list[ConstValue]) -> ConstValue | N
         return ("int", result)
 
     if func_name == "mulDiv":
-        if len(int_args) != 3 or int_args[2] == 0:
+        if len(int_args) != 3:
             return None
         tmp = int_args[0] * int_args[1]
-        return ("int", int(tmp / int_args[2]))
+        q = _trunc_div(tmp, int_args[2])
+        if q is None:
+            return None
+        return ("int", q)
 
     if func_name == "percentOf":
         if len(int_args) != 2:
             return None
         tmp = int_args[0] * int_args[1]
-        return ("int", int(tmp / 10000))
+        q = _trunc_div(tmp, 10000)
+        if q is None:
+            return None
+        return ("int", q)
 
     if func_name == "sqrt":
         if len(int_args) != 1:
@@ -257,9 +303,12 @@ def _eval_builtin_call(func_name: str, args: list[ConstValue]) -> ConstValue | N
         return ("int", a)
 
     if func_name == "divmod":
-        if len(int_args) != 2 or int_args[1] == 0:
+        if len(int_args) != 2:
             return None
-        return ("int", int(int_args[0] / int_args[1]))
+        q = _trunc_div(int_args[0], int_args[1])
+        if q is None:
+            return None
+        return ("int", q)
 
     if func_name == "log2":
         if len(int_args) != 1:
@@ -453,10 +502,22 @@ def _fold_value(value: ANFValue, env: ConstEnv) -> ANFValue:
             count=value.count,
             body=folded_body,
             iter_var=value.iter_var,
+            start=value.start,
+            step=value.step,
         )
 
-    # Terminal / side-effecting kinds pass through
-    return value
+    if kind == "raw_script":
+        # Opaque byte span -- never folded. Bytes are byte-canonical and the
+        # peephole optimizer treats it as a hard barrier.
+        return value
+
+    # Terminal / side-effecting kinds pass through.  Anything not in the
+    # explicit allowlist is a forgotten dispatch-site update: fail loudly
+    # so the regression is caught at the first binding instead of leaking
+    # an unhandled variant into Stack IR / hex.
+    if kind in _FOLD_VALUE_PASSTHROUGH_KINDS:
+        return value
+    raise UnknownANFKindError(kind, "constant-fold.foldValue")
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +532,8 @@ def _fold_method(method: ANFMethod) -> ANFMethod:
         params=list(method.params),
         body=folded_body,
         is_public=method.is_public,
+        # Issue #123: preserve the declared @sighash type through folding.
+        sighash_type=method.sighash_type,
     )
 
 
@@ -485,4 +548,5 @@ def fold_constants(program: ANFProgram) -> ANFProgram:
         contract_name=program.contract_name,
         properties=list(program.properties),
         methods=[_fold_method(m) for m in program.methods],
+        parent_class=program.parent_class,
     )

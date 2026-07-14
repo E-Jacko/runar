@@ -32,7 +32,10 @@ export type PrimitiveTypeName =
   | 'SigHashPreimage'
   | 'RabinSig'
   | 'RabinPubKey'
-  | 'Point';
+  | 'Point'
+  | 'P256Point'
+  | 'P384Point'
+  | 'void';
 
 export interface PrimitiveTypeNode {
   kind: 'primitive_type';
@@ -59,7 +62,7 @@ export type TypeNode = PrimitiveTypeNode | FixedArrayTypeNode | CustomTypeNode;
 export interface ContractNode {
   kind: 'contract';
   name: string;
-  parentClass: 'SmartContract' | 'StatefulSmartContract';
+  parentClass: 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract';
   properties: PropertyNode[];
   constructor: MethodNode;
   methods: MethodNode[];
@@ -72,7 +75,46 @@ export interface PropertyNode {
   type: TypeNode;
   readonly: boolean;
   initializer?: Expression;
+  /**
+   * Set by the parser when a `/** @embedAlways *\/` (or `// @embedAlways`)
+   * comment directive immediately precedes a readonly field declaration
+   * (issue #109). It opts the field OUT of dead-code elimination: a
+   * readonly field no method references is normally stripped from the
+   * locking script (its `load_prop` is dead, so no constructor slot is
+   * emitted), silently removing deploy-time metadata an author intends to
+   * recover from the on-chain script later. When set, the compiler forces
+   * the field into the script (a constructor slot) so its bytes survive.
+   * Comment-directive form (not a decorator) keeps it portable across all
+   * nine surface formats. Only meaningful on readonly fields.
+   */
+  embedAlways?: boolean;
   sourceLocation: SourceLocation;
+  /**
+   * Set by the compiler's `expand-fixed-arrays` pass on every scalar
+   * sibling produced from a `FixedArray<T, N>` property expansion. The
+   * chain records the full nesting of FixedArray levels this scalar
+   * came from: element `[0]` is the OUTERMOST level (the user-declared
+   * property name), and the last element is the INNERMOST. For a flat
+   * `FixedArray<bigint, 9>` property `Board`, each leaf has a
+   * one-element chain `[{base: "Board", index: i, length: 9}]`. For
+   * a nested `FixedArray<FixedArray<bigint, 2>, 2>` property `Grid`,
+   * leaf `Grid__0__1` has chain
+   * `[{base: "Grid", index: 0, length: 2}, {base: "Grid__0", index: 1, length: 2}]`.
+   *
+   * Downstream passes use this marker to re-group the expanded siblings
+   * back into a nested FixedArray entry on the ABI / state-field list
+   * via an iterative, innermost-first pass.
+   *
+   * Only compiler-synthesised properties carry this marker — a
+   * hand-written contract with literal `foo__0 / foo__1` property
+   * names will NOT have it set, so the regrouper leaves those as
+   * independent scalars.
+   */
+  __syntheticArrayChain?: ReadonlyArray<{
+    base: string;
+    index: number;
+    length: number;
+  }>;
 }
 
 export interface MethodNode {
@@ -81,6 +123,11 @@ export interface MethodNode {
   params: ParamNode[];
   body: Statement[];
   visibility: 'public' | 'private';
+  /**
+   * Issue #123: BIP-143 sighash type from a `/** @sighash <FLAGS> *\/` directive
+   * on a public method. Absent = default `ALL|FORKID` (0x41).
+   */
+  sighashType?: number;
   sourceLocation: SourceLocation;
 }
 
@@ -98,6 +145,7 @@ export interface VariableDeclStatement {
   kind: 'variable_decl';
   name: string;
   type?: TypeNode;
+  mutable: boolean; // const = false, let = true
   init: Expression;
   sourceLocation: SourceLocation;
 }
@@ -177,44 +225,64 @@ export interface BinaryExpr {
   op: BinaryOp;
   left: Expression;
   right: Expression;
+  sourceLocation?: SourceLocation;
 }
 
 export interface UnaryExpr {
   kind: 'unary_expr';
   op: UnaryOp;
   operand: Expression;
+  sourceLocation?: SourceLocation;
 }
 
 export interface CallExpr {
   kind: 'call_expr';
   callee: Expression;
   args: Expression[];
+  sourceLocation?: SourceLocation;
+  /**
+   * Only set on the synthetic `call_expr` that the parser emits for the
+   * expression-form `asm<T>({...})` intrinsic. `T` must be one of the
+   * primitive value types (`bigint`, `boolean`, `ByteString`); other
+   * type arguments are rejected by the parser.
+   *
+   * When set, the typechecker treats the call as producing a value of
+   * this type instead of `void`, and the validator skips the
+   * "terminal-truthy asm" check for mid-method occurrences (since the
+   * value is consumed by a let-binding).
+   */
+  asmReturnType?: PrimitiveTypeName;
 }
 
 export interface MemberExpr {
   kind: 'member_expr';
   object: Expression;
   property: string;
+  sourceLocation?: SourceLocation;
 }
 
 export interface Identifier {
   kind: 'identifier';
   name: string;
+  sourceLocation?: SourceLocation;
 }
 
 export interface BigIntLiteral {
   kind: 'bigint_literal';
   value: bigint;
+  sourceLocation?: SourceLocation;
 }
 
 export interface BoolLiteral {
   kind: 'bool_literal';
   value: boolean;
+  sourceLocation?: SourceLocation;
 }
 
 export interface ByteStringLiteral {
   kind: 'bytestring_literal';
   value: string; // hex-encoded
+  sourceLocation?: SourceLocation;
 }
 
 export interface TernaryExpr {
@@ -222,34 +290,40 @@ export interface TernaryExpr {
   condition: Expression;
   consequent: Expression;
   alternate: Expression;
+  sourceLocation?: SourceLocation;
 }
 
 export interface PropertyAccessExpr {
   kind: 'property_access';
   property: string; // `this.x` → property = "x"
+  sourceLocation?: SourceLocation;
 }
 
 export interface IndexAccessExpr {
   kind: 'index_access';
   object: Expression;
   index: Expression;
+  sourceLocation?: SourceLocation;
 }
 
 export interface IncrementExpr {
   kind: 'increment_expr';
   operand: Expression;
   prefix: boolean;
+  sourceLocation?: SourceLocation;
 }
 
 export interface DecrementExpr {
   kind: 'decrement_expr';
   operand: Expression;
   prefix: boolean;
+  sourceLocation?: SourceLocation;
 }
 
 export interface ArrayLiteralExpr {
   kind: 'array_literal';
   elements: Expression[];
+  sourceLocation?: SourceLocation;
 }
 
 export type Expression =

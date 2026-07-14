@@ -1,4 +1,10 @@
 //! MathDemo integration test — stateful contract exercising built-in math functions.
+//!
+//! **Gating**: all on-chain tests are gated with
+//! `#[cfg_attr(not(feature = "regtest"), ignore)]`. They require a local Bitcoin
+//! regtest node (see `integration/rust/README.md`). Run with:
+//!     cargo test --features regtest
+//! Tests without the gate (pure compile/script-size checks) run by default.
 
 use crate::helpers::*;
 use runar_lang::sdk::{CallOptions, DeployOptions, RunarContract, SdkValue};
@@ -14,7 +20,7 @@ fn wrong_state(value: i64) -> Option<CallOptions> {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_deploy() {
     skip_if_no_node();
 
@@ -27,13 +33,14 @@ fn test_math_deploy() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
     assert!(!txid.is_empty());
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_divide_by() {
     skip_if_no_node();
 
@@ -46,6 +53,7 @@ fn test_math_divide_by() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -63,7 +71,7 @@ fn test_math_divide_by() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_divide_then_clamp() {
     skip_if_no_node();
 
@@ -76,6 +84,7 @@ fn test_math_divide_then_clamp() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -103,7 +112,7 @@ fn test_math_divide_then_clamp() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_square_root() {
     skip_if_no_node();
 
@@ -116,6 +125,7 @@ fn test_math_square_root() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -133,7 +143,7 @@ fn test_math_square_root() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_exponentiate() {
     skip_if_no_node();
 
@@ -146,6 +156,7 @@ fn test_math_exponentiate() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -163,7 +174,7 @@ fn test_math_exponentiate() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_reduce_gcd() {
     skip_if_no_node();
 
@@ -176,6 +187,7 @@ fn test_math_reduce_gcd() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -193,7 +205,7 @@ fn test_math_reduce_gcd() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_compute_log2() {
     skip_if_no_node();
 
@@ -206,6 +218,7 @@ fn test_math_compute_log2() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -223,7 +236,7 @@ fn test_math_compute_log2() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_scale_by_ratio() {
     skip_if_no_node();
 
@@ -236,6 +249,7 @@ fn test_math_scale_by_ratio() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -253,7 +267,7 @@ fn test_math_scale_by_ratio() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_divide_by_zero() {
     skip_if_no_node();
 
@@ -266,6 +280,7 @@ fn test_math_divide_by_zero() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -280,7 +295,7 @@ fn test_math_divide_by_zero() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_wrong_state() {
     skip_if_no_node();
 
@@ -293,6 +308,7 @@ fn test_math_wrong_state() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -308,7 +324,7 @@ fn test_math_wrong_state() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_normalize() {
     skip_if_no_node();
 
@@ -321,6 +337,7 @@ fn test_math_normalize() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 
@@ -338,7 +355,7 @@ fn test_math_normalize() {
 }
 
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "regtest"), ignore)]
 fn test_math_chain_operations() {
     skip_if_no_node();
 
@@ -351,6 +368,7 @@ fn test_math_chain_operations() {
         .deploy(&mut provider, &*signer, &DeployOptions {
             satoshis: 5000,
             change_address: None,
+            ..Default::default()
         })
         .expect("deploy failed");
 

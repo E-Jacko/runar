@@ -9,29 +9,38 @@ const parse_go = @import("passes/parse_go.zig");
 const parse_rust = @import("passes/parse_rust.zig");
 const parse_python = @import("passes/parse_python.zig");
 const parse_ruby = @import("passes/parse_ruby.zig");
+const parse_java = @import("passes/parse_java.zig");
 const validate_pass = @import("passes/validate.zig");
 const typecheck_pass = @import("passes/typecheck.zig");
+const expand_fixed_arrays = @import("passes/expand_fixed_arrays.zig");
 const anf_lower = @import("passes/anf_lower.zig");
 const constant_fold = @import("passes/constant_fold.zig");
 const ec_optimizer = @import("passes/ec_optimizer.zig");
 const stack_lower = @import("passes/stack_lower.zig");
 const peephole = @import("passes/peephole.zig");
 const emit = @import("codegen/emit.zig");
+const input_limits = @import("frontend/input_limits.zig");
+const embed_always_warn = @import("passes/embed_always_warn.zig");
 
 const CompileOptions = struct {
     emit_ir: bool = false,
     hex_only: bool = false,
     disable_constant_folding: bool = false,
+    parse_only: bool = false,
+    emit_source_map_path: ?[]const u8 = null,
 };
 
 const ParseOptionsError = error{
     UnknownFlag,
     UnsupportedFlag,
+    MissingFlagValue,
 };
 
 fn parseCompileOptions(args: []const []const u8, allow_disable_constant_folding: bool) ParseOptionsError!CompileOptions {
     var opts = CompileOptions{};
-    for (args) |arg| {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--emit-ir")) {
             opts.emit_ir = true;
             continue;
@@ -45,18 +54,38 @@ fn parseCompileOptions(args: []const []const u8, allow_disable_constant_folding:
             opts.disable_constant_folding = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--parse-only")) {
+            opts.parse_only = true;
+            continue;
+        }
+        // --emit-source-map <PATH> writes the artifact's sourceMap field as
+        // canonical {"mappings":[...]} JSON to the specified path.
+        if (std.mem.eql(u8, arg, "--emit-source-map")) {
+            if (i + 1 >= args.len) return error.MissingFlagValue;
+            i += 1;
+            opts.emit_source_map_path = args[i];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--emit-source-map=")) {
+            opts.emit_source_map_path = arg["--emit-source-map=".len..];
+            continue;
+        }
         return error.UnknownFlag;
     }
     return opts;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer args_list.deinit(allocator);
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    while (args_iter.next()) |arg| {
+        try args_list.append(allocator, arg);
+    }
+    const args = args_list.items;
 
     if (args.len < 2) {
         printUsage();
@@ -75,11 +104,12 @@ pub fn main() !void {
             const message = switch (err) {
                 error.UnknownFlag => "error: unknown compile-ir flag\n",
                 error.UnsupportedFlag => "error: --disable-constant-folding is only valid for source compilation\n",
+                error.MissingFlagValue => "error: --emit-source-map requires a path argument\n",
             };
             std.debug.print("{s}", .{message});
             std.process.exit(1);
         };
-        compileFromIR(allocator, args[2], opts) catch |err| {
+        compileFromIR(allocator, io, args[2], opts) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -94,11 +124,12 @@ pub fn main() !void {
             const message = switch (err) {
                 error.UnknownFlag => "error: unknown compile flag\n",
                 error.UnsupportedFlag => "error: unsupported compile flag\n",
+                error.MissingFlagValue => "error: --emit-source-map requires a path argument\n",
             };
             std.debug.print("{s}", .{message});
             std.process.exit(1);
         };
-        compileFromSource(allocator, args[2], opts) catch |err| {
+        compileFromSource(allocator, io, args[2], opts) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -120,15 +151,16 @@ pub fn main() !void {
             const message = switch (err) {
                 error.UnknownFlag => "error: unknown source flag\n",
                 error.UnsupportedFlag => "error: unsupported source flag\n",
+                error.MissingFlagValue => "error: --emit-source-map requires a path argument\n",
             };
             std.debug.print("{s}", .{message});
             std.process.exit(1);
         };
         const format = detectFormat(file_path);
         const result = if (format == .anf_json)
-            compileFromIR(allocator, file_path, opts)
+            compileFromIR(allocator, io, file_path, opts)
         else
-            compileFromSource(allocator, file_path, opts);
+            compileFromSource(allocator, io, file_path, opts);
         result catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             std.process.exit(1);
@@ -141,7 +173,7 @@ pub fn main() !void {
     std.process.exit(1);
 }
 
-const FileFormat = enum { runar_zig, runar_ts, runar_sol, runar_move, runar_go, runar_rs, runar_py, runar_rb, anf_json, unknown };
+const FileFormat = enum { runar_zig, runar_ts, runar_sol, runar_move, runar_go, runar_rs, runar_py, runar_rb, runar_java, anf_json, unknown };
 
 fn detectFormat(path: []const u8) FileFormat {
     if (std.mem.endsWith(u8, path, ".runar.zig")) return .runar_zig;
@@ -152,6 +184,7 @@ fn detectFormat(path: []const u8) FileFormat {
     if (std.mem.endsWith(u8, path, ".runar.rs")) return .runar_rs;
     if (std.mem.endsWith(u8, path, ".runar.py")) return .runar_py;
     if (std.mem.endsWith(u8, path, ".runar.rb")) return .runar_rb;
+    if (std.mem.endsWith(u8, path, ".runar.java")) return .runar_java;
     if (std.mem.endsWith(u8, path, ".json")) return .anf_json;
     return .unknown;
 }
@@ -171,16 +204,29 @@ fn printUsage() void {
         \\  --hex                     Output script hex only (no artifact JSON)
         \\  --disable-constant-folding  Skip constant folding pass
         \\
-        \\Formats: .runar.zig, .runar.ts, .runar.sol, .runar.move, .runar.go, .runar.rs, .runar.py, .runar.rb, .json
+        \\Formats: .runar.zig, .runar.ts, .runar.sol, .runar.move, .runar.go, .runar.rs, .runar.py, .runar.rb, .runar.java, .json
         \\
     , .{});
 }
 
+fn writeStdout(io: std.Io, data: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try w.interface.writeAll(data);
+    try w.interface.flush();
+}
+
+fn writeStdoutLn(io: std.Io, data: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try w.interface.writeAll(data);
+    try w.interface.writeAll("\n");
+    try w.interface.flush();
+}
+
 /// Compile from ANF IR JSON (passes 5-6 only)
-fn compileFromIR(allocator: std.mem.Allocator, path: []const u8, opts: CompileOptions) !void {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const source = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+fn compileFromIR(allocator: std.mem.Allocator, io: std.Io, path: []const u8, opts: CompileOptions) !void {
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(source);
 
     const program = try json_parser.parseANFProgram(allocator, source);
@@ -189,8 +235,7 @@ fn compileFromIR(allocator: std.mem.Allocator, path: []const u8, opts: CompileOp
     if (opts.emit_ir) {
         const canonical = try json_parser.serializeCanonicalJSON(allocator, program);
         defer allocator.free(canonical);
-        const stdout = std.fs.File.stdout();
-        try stdout.writeAll(canonical);
+        try writeStdout(io, canonical);
         return;
     }
 
@@ -204,35 +249,48 @@ fn compileFromIR(allocator: std.mem.Allocator, path: []const u8, opts: CompileOp
         .constructor_params = stack_program.constructor_params,
     };
 
+    // --hex: output the dispatch-table locking script (same bytes that
+    // appear in the artifact's "script" field), matching compileFromSource
+    // and the Go/Rust/Python/Ruby compilers. Per-method hex is not a valid
+    // locking script on its own for multi-method contracts.
     if (opts.hex_only) {
-        const stdout = std.fs.File.stdout();
-        for (optimized_stack_program.methods) |method| {
-            const hex = try emit.emitMethodScript(allocator, method.instructions);
-            defer allocator.free(hex);
-            try stdout.writeAll(hex);
-            try stdout.writeAll("\n");
-        }
+        const artifact = try emit.emitArtifact(allocator, optimized_stack_program, program);
+        defer allocator.free(artifact);
+        const marker = "\"script\":\"";
+        const idx = std.mem.indexOf(u8, artifact, marker) orelse return error.MissingHex;
+        const after = idx + marker.len;
+        const end = std.mem.indexOfPos(u8, artifact, after, "\"") orelse return error.MissingHex;
+        const hex = artifact[after..end];
+        try writeStdoutLn(io, hex);
         return;
     }
 
     const artifact = try emit.emitArtifact(allocator, optimized_stack_program, program);
     defer allocator.free(artifact);
-    const stdout = std.fs.File.stdout();
-    try stdout.writeAll(artifact);
-    try stdout.writeAll("\n");
+    try writeStdoutLn(io, artifact);
 }
 
 /// Full pipeline: source -> parse -> validate -> typecheck -> ANF -> stack -> emit
-fn compileFromSource(allocator: std.mem.Allocator, path: []const u8, opts: CompileOptions) !void {
+fn compileFromSource(allocator: std.mem.Allocator, io: std.Io, path: []const u8, opts: CompileOptions) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const work_allocator = arena.allocator();
 
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const source = try file.readToEndAlloc(work_allocator, 1 * 1024 * 1024);
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, work_allocator, .limited(1 * 1024 * 1024));
 
     const format = detectFormat(path);
+
+    // Pass 0.5: Fail-closed guard for the `@sighash` (#123) / `@embedAlways`
+    // (#109) comment directives. The `.runar.ts` surface parser honours them
+    // (matching the TS reference); the eight non-TS surface parsers ignore
+    // comments, so they must reject a directive rather than silently drop it.
+    // `.runar.ts` is exempt.
+    if (format != .runar_ts) {
+        if (input_limits.unsupportedDirectiveError(source)) |msg| {
+            std.debug.print("  parse error: {s}\n", .{msg});
+            return error.ParseFailed;
+        }
+    }
 
     // Pass 1: Parse (dispatch by format, extract contract or fail)
     const contract: types.ContractNode = switch (format) {
@@ -300,6 +358,14 @@ fn compileFromSource(allocator: std.mem.Allocator, path: []const u8, opts: Compi
             }
             break :blk r.contract orelse return error.ParseFailed;
         },
+        .runar_java => blk: {
+            const r = parse_java.parseJava(work_allocator, source, path);
+            if (r.errors.len > 0) {
+                for (r.errors) |err| std.debug.print("  parse error: {s}\n", .{err});
+                return error.ParseFailed;
+            }
+            break :blk r.contract orelse return error.ParseFailed;
+        },
         else => {
             std.debug.print("error: unsupported format for {s}\n", .{path});
             return error.UnsupportedFormat;
@@ -317,6 +383,13 @@ fn compileFromSource(allocator: std.mem.Allocator, path: []const u8, opts: Compi
     }
     for (val_result.warnings) |diag| std.debug.print("  warning: {s}\n", .{diag.message});
 
+    // --parse-only: emit "parser ok" and stop after parse + validate. Used by
+    // the conformance runner's --parser-only universal-frontend coverage check.
+    if (opts.parse_only) {
+        try writeStdoutLn(io, "parser ok");
+        return;
+    }
+
     // Pass 3: Typecheck
     const tc_result = try typecheck_pass.typeCheck(work_allocator, contract);
     if (tc_result.errors.len > 0) {
@@ -324,8 +397,17 @@ fn compileFromSource(allocator: std.mem.Allocator, path: []const u8, opts: Compi
         return error.TypeCheckFailed;
     }
 
+    // Pass 3b: Expand FixedArray properties into scalar siblings + dispatch
+    // chains. No-op when the contract has no FixedArray properties.
+    const expanded = try expand_fixed_arrays.expand(work_allocator, contract);
+    if (expanded.errors.len > 0) {
+        for (expanded.errors) |diag| std.debug.print("  fixed-array error: {s}\n", .{diag.message});
+        return error.ValidationFailed;
+    }
+    const expanded_contract = expanded.contract;
+
     // Pass 4: ANF Lower
-    var program = try anf_lower.lowerToANF(work_allocator, contract);
+    var program = try anf_lower.lowerToANF(work_allocator, expanded_contract);
 
     // Pass 4.25: Constant Fold
     if (!opts.disable_constant_folding) {
@@ -340,11 +422,18 @@ fn compileFromSource(allocator: std.mem.Allocator, path: []const u8, opts: Compi
     // only referenced at inlining call sites in other methods).
     program = try ec_optimizer.optimize(work_allocator, program);
 
+    // Issue #109: warn when DCE strips an un-annotated readonly field. Computed
+    // from the post-optimizer ANF (the surviving load_prop set), mirroring the
+    // TS reference's collectReferencedProps(optimizedAnf) placement.
+    {
+        const dce_warnings = try embed_always_warn.collectDceWarnings(work_allocator, expanded_contract, &program);
+        for (dce_warnings) |diag| std.debug.print("  warning: {s}\n", .{diag.message});
+    }
+
     // --emit-ir: output canonical ANF IR JSON and stop
     if (opts.emit_ir) {
         const canonical = try json_parser.serializeCanonicalJSON(work_allocator, program);
-        const stdout = std.fs.File.stdout();
-        try stdout.writeAll(canonical);
+        try writeStdout(io, canonical);
         return;
     }
 
@@ -359,28 +448,211 @@ fn compileFromSource(allocator: std.mem.Allocator, path: []const u8, opts: Compi
         .constructor_params = stack_program.constructor_params,
     };
 
-    // --hex: output hex script only
+    // --hex: output hex script only. Produces the full dispatch-table
+    // locking script (same bytes that appear in the artifact's "script"
+    // field), so downstream tools can compare byte-for-byte across
+    // compilers without parsing JSON.
     if (opts.hex_only) {
-        const stdout = std.fs.File.stdout();
-        for (optimized_stack_program.methods) |method| {
-            const hex = try emit.emitMethodScript(work_allocator, method.instructions);
-            try stdout.writeAll(hex);
-            try stdout.writeAll("\n");
-        }
+        const artifact = try emit.emitArtifact(work_allocator, optimized_stack_program, program);
+        const marker = "\"script\":\"";
+        const idx = std.mem.indexOf(u8, artifact, marker) orelse return error.MissingHex;
+        const after = idx + marker.len;
+        const end = std.mem.indexOfPos(u8, artifact, after, "\"") orelse return error.MissingHex;
+        const hex = artifact[after..end];
+        try writeStdoutLn(io, hex);
         return;
     }
 
     // Pass 6: Emit full artifact
     const artifact = try emit.emitArtifact(work_allocator, optimized_stack_program, program);
 
-    const stdout = std.fs.File.stdout();
-    try stdout.writeAll(artifact);
-    try stdout.writeAll("\n");
+    // --emit-source-map: extract the artifact's sourceMap object (or emit
+    // the empty {"mappings":[]} wrapper if absent) and write it to PATH.
+    if (opts.emit_source_map_path) |sm_path| {
+        try writeSourceMapToPath(work_allocator, io, artifact, sm_path, path);
+    }
+
+    try writeStdoutLn(io, artifact);
 
     std.debug.print("Compiled: {s}\n", .{path});
+}
+
+/// GAP-011: source-map sourceFile values must be repo-relative (POSIX) so
+/// goldens stay stable across worktree paths and developer machines. Walk
+/// up from `src_path` looking for pnpm-workspace.yaml (the canonical repo
+/// root marker); fall back to the basename if no marker is found. Returns
+/// allocator-owned bytes.
+///
+/// Only handles absolute paths — relative paths are returned unchanged
+/// (the runner always invokes the compiler with an absolute --source).
+fn repoRelativeFileName(allocator: std.mem.Allocator, io: std.Io, src_path: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsolute(src_path)) {
+        return try allocator.dupe(u8, src_path);
+    }
+
+    var dir_opt: ?[]const u8 = std.fs.path.dirname(src_path);
+    while (dir_opt) |dir| {
+        const marker = try std.fs.path.join(allocator, &.{ dir, "pnpm-workspace.yaml" });
+        defer allocator.free(marker);
+        const exists = blk: {
+            const f = std.Io.Dir.cwd().openFile(io, marker, .{}) catch break :blk false;
+            f.close(io);
+            break :blk true;
+        };
+        if (exists) {
+            // dir is the repo root — strip it from src_path plus the leading sep.
+            if (src_path.len > dir.len + 1 and std.mem.startsWith(u8, src_path, dir) and src_path[dir.len] == std.fs.path.sep) {
+                const rel = src_path[dir.len + 1 ..];
+                // Normalize to POSIX separators.
+                const out = try allocator.dupe(u8, rel);
+                for (out) |*c| {
+                    if (c.* == std.fs.path.sep_windows) c.* = '/';
+                }
+                return out;
+            }
+            break;
+        }
+        dir_opt = std.fs.path.dirname(dir);
+    }
+    return try allocator.dupe(u8, std.fs.path.basename(src_path));
+}
+
+/// Extract the `"sourceMap":{...}` substring from the emitted artifact JSON
+/// (or fall back to the empty `{"mappings":[]}` wrapper) and write it to
+/// `sm_path`. Replaces the absolute sourceFile string (path passed via
+/// `src_path`) with its repo-relative POSIX form to keep goldens stable
+/// across worktree paths.
+fn writeSourceMapToPath(allocator: std.mem.Allocator, io: std.Io, artifact_json: []const u8, sm_path: []const u8, src_path: []const u8) !void {
+    const marker = "\"sourceMap\":";
+    var payload_raw: []const u8 = "{\"mappings\":[]}";
+    if (std.mem.indexOf(u8, artifact_json, marker)) |idx| {
+        const after = idx + marker.len;
+        if (after < artifact_json.len and artifact_json[after] == '{') {
+            // Walk to the matching close brace, respecting string literals.
+            var depth: i32 = 0;
+            var p: usize = after;
+            var in_string = false;
+            var escape = false;
+            while (p < artifact_json.len) : (p += 1) {
+                const c = artifact_json[p];
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (in_string) {
+                    if (c == '\\') { escape = true; continue; }
+                    if (c == '"') { in_string = false; continue; }
+                    continue;
+                }
+                if (c == '"') { in_string = true; continue; }
+                if (c == '{') depth += 1;
+                if (c == '}') {
+                    depth -= 1;
+                    if (depth == 0) { p += 1; break; }
+                }
+            }
+            payload_raw = artifact_json[after..p];
+        }
+    }
+
+    // GAP-011: rewrite each `"sourceFile":"<abs>"` to its repo-relative form.
+    // All mappings in a single compile share the same sourceFile, so a simple
+    // string replace is sound.
+    const rel_name = try repoRelativeFileName(allocator, io, src_path);
+    defer allocator.free(rel_name);
+
+    const needle = try std.fmt.allocPrint(allocator, "\"sourceFile\":\"{s}\"", .{src_path});
+    defer allocator.free(needle);
+    const replacement = try std.fmt.allocPrint(allocator, "\"sourceFile\":\"{s}\"", .{rel_name});
+    defer allocator.free(replacement);
+
+    const size = std.mem.replacementSize(u8, payload_raw, needle, replacement);
+    const payload = try allocator.alloc(u8, size);
+    defer allocator.free(payload);
+    _ = std.mem.replace(u8, payload_raw, needle, replacement, payload);
+
+    var file = try std.Io.Dir.cwd().createFile(io, sm_path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(io, &buf);
+    try w.interface.writeAll(payload);
+    try w.interface.writeAll("\n");
+    try w.interface.flush();
 }
 
 const UnsupportedFormat = error{UnsupportedFormat};
 const ParseFailed = error{ParseFailed};
 const ValidationFailed = error{ValidationFailed};
 const TypeCheckFailed = error{TypeCheckFailed};
+
+// ---------------------------------------------------------------------------
+// Tests — CLI flag plumbing
+// ---------------------------------------------------------------------------
+//
+// GAP-015 (audits/cross-language-completeness-20260510.md, Section 4 / B8):
+// the `--parse-only` flag is plumbed end-to-end through compileFromSource,
+// but it had no dedicated unit test. The flag is the wire used by
+// `conformance/runner/runner.ts`'s `--parser-only` universal-frontend
+// coverage check, so a silent regression here breaks the all-tier
+// parser-only matrix in CI. The tests below pin the CLI flag parsing wire.
+
+test "parseCompileOptions: --parse-only sets parse_only=true" {
+    const args = [_][]const u8{"--parse-only"};
+    const opts = try parseCompileOptions(args[0..], true);
+    try std.testing.expect(opts.parse_only);
+    // Other flags must remain at their defaults.
+    try std.testing.expect(!opts.emit_ir);
+    try std.testing.expect(!opts.hex_only);
+    try std.testing.expect(!opts.disable_constant_folding);
+}
+
+test "parseCompileOptions: default has parse_only=false" {
+    const args = [_][]const u8{};
+    const opts = try parseCompileOptions(args[0..], true);
+    try std.testing.expect(!opts.parse_only);
+}
+
+test "parseCompileOptions: --parse-only combines with other flags" {
+    // The conformance runner pairs --parse-only with no other flags, but
+    // nothing in the parser prevents combinations. Pin that --parse-only
+    // is composable with --disable-constant-folding (a no-op pairing,
+    // since parse-only stops before the optimizer runs, but the parser
+    // must still accept it without error).
+    const args = [_][]const u8{ "--parse-only", "--disable-constant-folding" };
+    const opts = try parseCompileOptions(args[0..], true);
+    try std.testing.expect(opts.parse_only);
+    try std.testing.expect(opts.disable_constant_folding);
+}
+
+test "parseCompileOptions: unknown flag rejected" {
+    const args = [_][]const u8{"--parse-onlyy"}; // typo
+    try std.testing.expectError(error.UnknownFlag, parseCompileOptions(args[0..], true));
+}
+
+test "parseCompileOptions: --parse-only accepted in compile-ir mode" {
+    // The IR consumer mode (allow_disable_constant_folding=false in main.zig
+    // when parsing args[3..] for the `compile-ir` subcommand) must still
+    // accept --parse-only — even though parse-only on IR input is a no-op
+    // shape, the flag must not be rejected as "unknown".
+    const args = [_][]const u8{"--parse-only"};
+    const opts = try parseCompileOptions(args[0..], false);
+    try std.testing.expect(opts.parse_only);
+}
+
+test "parseCompileOptions: --disable-constant-folding rejected when not allowed" {
+    // Mirror of the compile-ir guardrail: when the caller passes
+    // allow_disable_constant_folding=false, the parser must reject the flag
+    // with UnsupportedFlag (not silently accept). This keeps the IR mode's
+    // optimizer-state semantics deterministic.
+    const args = [_][]const u8{"--disable-constant-folding"};
+    try std.testing.expectError(error.UnsupportedFlag, parseCompileOptions(args[0..], false));
+}
+
+test "CompileOptions.parse_only field default is false" {
+    // Regression guard: if a future refactor changes the default value
+    // of parse_only on CompileOptions, the conformance runner's expectation
+    // ("plain compile must emit hex / IR, not 'parser ok'") would silently
+    // break.
+    const opts: CompileOptions = .{};
+    try std.testing.expect(!opts.parse_only);
+}

@@ -18,32 +18,53 @@ from runar_compiler.frontend.anf_lower import lower_to_anf
 from conftest import conformance_dir
 
 
-def _read_source(test_name: str, ext: str) -> str:
-    """Read a conformance test source file."""
+def _resolve_source(test_name: str, ext: str):
+    """Resolve a conformance test source file path.
+
+    Tries the legacy in-tree layout (conformance/tests/<name>/<name><ext>)
+    first, then falls back to source.json indirection used by post-migration
+    fixtures that point into examples/.
+    """
     source_dir = conformance_dir() / test_name
-    # Source files are named like: basic-p2pkh.runar.ts
+    if not source_dir.is_dir():
+        return None
     for f in source_dir.iterdir():
         if f.name.endswith(ext):
-            return f.read_text(encoding="utf-8")
-    raise FileNotFoundError(f"No {ext} file in {source_dir}")
+            return f
+    manifest_path = source_dir / "source.json"
+    if not manifest_path.exists():
+        return None
+    import json
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ref = manifest.get("sources", {}).get(ext)
+    if ref is None:
+        return None
+    resolved = (source_dir / ref).resolve()
+    return resolved if resolved.exists() else None
+
+
+def _read_source(test_name: str, ext: str) -> str:
+    """Read a conformance test source file."""
+    resolved = _resolve_source(test_name, ext)
+    if resolved is None:
+        raise FileNotFoundError(f"No {ext} file in conformance/tests/{test_name}")
+    return resolved.read_text(encoding="utf-8")
 
 
 def _source_path(test_name: str, ext: str) -> str:
     """Get path to a conformance test source file."""
-    source_dir = conformance_dir() / test_name
-    for f in source_dir.iterdir():
-        if f.name.endswith(ext):
-            return str(f)
-    raise FileNotFoundError(f"No {ext} file in {source_dir}")
+    resolved = _resolve_source(test_name, ext)
+    if resolved is None:
+        raise FileNotFoundError(f"No {ext} file in conformance/tests/{test_name}")
+    return str(resolved)
 
 
 def _file_name(test_name: str, ext: str) -> str:
     """Get the file name for a conformance test source."""
-    source_dir = conformance_dir() / test_name
-    for f in source_dir.iterdir():
-        if f.name.endswith(ext):
-            return f.name
-    raise FileNotFoundError(f"No {ext} file in {source_dir}")
+    resolved = _resolve_source(test_name, ext)
+    if resolved is None:
+        raise FileNotFoundError(f"No {ext} file in conformance/tests/{test_name}")
+    return resolved.name
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +349,176 @@ class LoopBad extends SmartContract {
         assert len(valid_result.errors) > 0
         assert any("constant" in e.message.lower() or "bound" in e.message.lower() for e in valid_result.errors), (
             f"expected error about non-constant loop bound, got: {valid_result.errors}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Contract must have at least one public method (issue #120 / PR #126)
+    # -----------------------------------------------------------------------
+
+    def test_validate_no_public_methods_all_private(self):
+        """A contract whose methods all lack `public` has no spending entry
+        point and must be rejected."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class Locked extends SmartContract {
+  readonly pk: PubKey;
+
+  constructor(pk: PubKey) {
+    super(pk);
+    this.pk = pk;
+  }
+
+  unlock(sig: Sig): void {
+    assert(checkSig(sig, this.pk));
+  }
+}
+"""
+        result = parse_source(source, "Locked.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert any("no public methods" in e.message.lower() for e in valid_result.errors), (
+            f"expected error about no public methods, got: {valid_result.errors}"
+        )
+
+    def test_validate_no_methods_at_all(self):
+        """A contract with no methods at all must be rejected."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class Empty extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+}
+"""
+        result = parse_source(source, "Empty.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert any("no public methods" in e.message.lower() for e in valid_result.errors), (
+            f"expected error about no public methods, got: {valid_result.errors}"
+        )
+
+    def test_validate_public_method_present_ok(self):
+        """A contract with at least one public method is not flagged."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class Ok extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public check(): void {
+    assert(this.x > 0n);
+  }
+}
+"""
+        result = parse_source(source, "Ok.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert not any("no public methods" in e.message.lower() for e in valid_result.errors), (
+            f"unexpected no-public-methods error, got: {valid_result.errors}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Unsupported loop shapes: non-zero start, countdown (issue #121 / PR #127)
+    # -----------------------------------------------------------------------
+
+    def test_validate_for_loop_nonzero_start(self):
+        """A for loop with a non-zero literal start value is accepted (issue #121)."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 1n; i <= 3n; i++) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert not any("must start at 0" in e.message.lower() for e in valid_result.errors), (
+            f"non-zero start must no longer be rejected, got: {valid_result.errors}"
+        )
+
+    def test_validate_for_loop_countdown(self):
+        """A countdown for loop is accepted (issue #121)."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 3n; i > 0n; i--) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert not any("countdown" in e.message.lower() for e in valid_result.errors), (
+            f"countdown loops must no longer be rejected, got: {valid_result.errors}"
+        )
+
+    def test_validate_for_loop_zero_start_ok(self):
+        """A zero-start counting-up for loop is accepted."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+
+  constructor(x: bigint) {
+    super(x);
+    this.x = x;
+  }
+
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 0n; i <= 3n; i++) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        valid_result = validate(result.contract)
+        assert not any("must start at 0" in e.message.lower() for e in valid_result.errors), (
+            f"unexpected non-zero-start error, got: {valid_result.errors}"
+        )
+        assert not any("countdown" in e.message.lower() for e in valid_result.errors), (
+            f"unexpected countdown error, got: {valid_result.errors}"
         )
 
     def test_validate_void_property_type(self):
@@ -973,6 +1164,47 @@ class TestANFLowering:
         kinds = [b.value.kind for b in check.body]
         assert "if" in kinds
 
+    def test_anf_lower_ternary(self):
+        """T-5: ternary expression lowers to an `if` ANF binding.
+
+        Mirrors the Java peer test (StackLowerTest#ternaryLowersToIfOpStructural)
+        and the Go/Rust peers. Localized regression detection — otherwise covered
+        only by the cross-tier golden harness.
+        """
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class TernaryDemo extends SmartContract {
+  readonly limit: bigint;
+
+  constructor(limit: bigint) {
+    super(limit);
+    this.limit = limit;
+  }
+
+  public check(flag: boolean): void {
+    const result: bigint = flag ? this.limit + 1n : this.limit - 1n;
+    assert(result > 0n);
+  }
+}
+"""
+        result = parse_source(source, "TernaryDemo.runar.ts")
+        assert result.contract is not None
+        validate(result.contract)
+        type_check(result.contract)
+
+        program = lower_to_anf(result.contract)
+        check = [m for m in program.methods if m.name == "check"][0]
+
+        if_bindings = [b for b in check.body if b.value.kind == "if"]
+        assert if_bindings, (
+            f"expected ternary to lower to `if` ANF node; got kinds: "
+            f"{[b.value.kind for b in check.body]}"
+        )
+        if_val = if_bindings[0].value
+        assert if_val.then, "ternary `then` branch should not be empty"
+        assert if_val.else_, "ternary `else` branch should not be empty"
+
     def test_anf_lower_binding_details(self):
         """Verify specific binding details for P2PKH: hash160 has 1 arg, checkSig has 2 args,
         and the === bin_op has result_type 'bytes'. Mirrors Go TestANFLower_P2PKH_BindingDetails."""
@@ -1039,6 +1271,118 @@ class LoopContract extends SmartContract {
             f"expected at least one binding with kind='loop' in sum method, "
             f"got kinds: {[b.value.kind for b in sum_method.body]}"
         )
+
+    def test_anf_lower_nonzero_start_loop(self):
+        """A non-zero-start loop lowers with start=1, step=+1, count=3 (issue #121)."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 1n; i <= 3n; i++) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        program = lower_to_anf(result.contract)
+        m_method = next((m for m in program.methods if m.name == "m"), None)
+        assert m_method is not None
+        loop_bindings = [b for b in m_method.body if b.value.kind == "loop"]
+        assert len(loop_bindings) == 1
+        loop = loop_bindings[0].value
+        assert loop.start == 1
+        assert loop.step == 1
+        assert loop.count == 3
+
+    def test_anf_lower_countdown_loop(self):
+        """A countdown loop lowers with start=3, step=-1, count=3 (issue #121)."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 3n; i > 0n; i--) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        program = lower_to_anf(result.contract)
+        m_method = next((m for m in program.methods if m.name == "m"), None)
+        assert m_method is not None
+        loop_bindings = [b for b in m_method.body if b.value.kind == "loop"]
+        assert len(loop_bindings) == 1
+        loop = loop_bindings[0].value
+        assert loop.start == 3
+        assert loop.step == -1
+        assert loop.count == 3
+
+    def test_anf_lower_inclusive_countdown_loop(self):
+        """An inclusive countdown loop lowers with start=3, step=-1, count=3 (issue #121)."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 3n; i >= 1n; i--) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        program = lower_to_anf(result.contract)
+        m_method = next((m for m in program.methods if m.name == "m"), None)
+        assert m_method is not None
+        loop_bindings = [b for b in m_method.body if b.value.kind == "loop"]
+        assert len(loop_bindings) == 1
+        loop = loop_bindings[0].value
+        assert loop.start == 3
+        assert loop.step == -1
+        assert loop.count == 3
+
+    def test_anf_lower_zero_start_loop_count(self):
+        """A zero-start counting-up loop still lowers with start=0, step=+1, count=4."""
+        source = """
+import { SmartContract, assert } from 'runar-lang';
+
+class C extends SmartContract {
+  readonly x: bigint;
+  constructor(x: bigint) { super(x); this.x = x; }
+  public m(): void {
+    let sum: bigint = 0n;
+    for (let i: bigint = 0n; i <= 3n; i++) { sum = sum + i; }
+    assert(sum > 0n);
+  }
+}
+"""
+        result = parse_source(source, "C.runar.ts")
+        assert result.contract is not None
+
+        program = lower_to_anf(result.contract)
+        m_method = next((m for m in program.methods if m.name == "m"), None)
+        assert m_method is not None
+        loop_bindings = [b for b in m_method.body if b.value.kind == "loop"]
+        assert len(loop_bindings) == 1
+        loop = loop_bindings[0].value
+        assert loop.start == 0
+        assert loop.step == 1
+        assert loop.count == 4
 
     def test_anf_lower_stateful(self):
         """A StatefulSmartContract's public method should have implicit params after ANF lowering.
@@ -1331,6 +1675,184 @@ class Counter extends StatefulSmartContract {
         assert len(add_output_bindings) == 0, (
             f"read-only method should not have add_output bindings, got: {add_output_bindings}"
         )
+
+    def test_anf_lower_add_data_output(self):
+        """this.addDataOutput(sats, scriptBytes) lowers to add_data_output bindings."""
+        source = """
+import { StatefulSmartContract } from 'runar-lang';
+
+class Counter extends StatefulSmartContract {
+  count: bigint;
+
+  constructor(count: bigint) {
+    super(count);
+    this.count = count;
+  }
+
+  public bump(payload: ByteString): void {
+    this.count = this.count + 1n;
+    this.addDataOutput(0n, payload);
+  }
+}
+"""
+        result = parse_source(source, "Counter.runar.ts")
+        assert result.contract is not None
+        validate(result.contract)
+        type_check(result.contract)
+        program = lower_to_anf(result.contract)
+
+        bump = next((m for m in program.methods if m.name == "bump"), None)
+        assert bump is not None
+
+        data_outputs = [b for b in bump.body if b.value.kind == "add_data_output"]
+        assert len(data_outputs) == 1, (
+            f"expected 1 add_data_output, got {len(data_outputs)}"
+        )
+        # satoshis and scriptBytes refs populated
+        assert data_outputs[0].value.satoshis is not None
+        assert data_outputs[0].value.script_bytes is not None
+
+    def test_anf_lower_add_data_output_continuation_hash_multi(self):
+        """With addOutput state outputs and addDataOutput, the continuation hash
+        concatenates state outputs first, then data outputs, then change."""
+        source = """
+import { StatefulSmartContract } from 'runar-lang';
+
+class FT extends StatefulSmartContract {
+  owner: PubKey;
+  balance: bigint;
+  constructor(owner: PubKey, balance: bigint) {
+    super(owner, balance);
+    this.owner = owner;
+    this.balance = balance;
+  }
+  public transfer(to: PubKey, amount: bigint, sats: bigint, note: ByteString): void {
+    this.addOutput(sats, to, amount);
+    this.addOutput(sats, this.owner, this.balance - amount);
+    this.addDataOutput(0n, note);
+  }
+}
+"""
+        result = parse_source(source, "FT.runar.ts")
+        assert result.contract is not None
+        validate(result.contract)
+        type_check(result.contract)
+        program = lower_to_anf(result.contract)
+
+        transfer = next((m for m in program.methods if m.name == "transfer"), None)
+        assert transfer is not None
+
+        state_refs = [b.name for b in transfer.body if b.value.kind == "add_output"]
+        data_refs = [b.name for b in transfer.body if b.value.kind == "add_data_output"]
+        assert len(state_refs) == 2
+        assert len(data_refs) == 1
+
+        # Issue #116: the change output is gated behind a runtime
+        # `if (_changeAmount != 0)`; buildChangeOutput now lives inside the
+        # if-then branch, and the top-level continuation cats with the if
+        # node's result ref.
+        change_if = next(
+            (b for b in transfer.body if b.value.kind == "if"),
+            None,
+        )
+        assert change_if is not None
+        change_builder = next(
+            (b for b in (change_if.value.then or [])
+             if b.value.kind == "call" and b.value.func == "buildChangeOutput"),
+            None,
+        )
+        assert change_builder is not None
+
+        cats = [b for b in transfer.body
+                if b.value.kind == "call" and b.value.func == "cat"]
+        assert len(cats) >= 3
+        # First cat: state[0] + state[1]
+        assert cats[0].value.args == [state_refs[0], state_refs[1]]
+        # Second cat: prev + data[0]
+        assert cats[1].value.args[1] == data_refs[0]
+        # Third cat: prev + change (the gated if node's result)
+        assert cats[2].value.args[1] == change_if.name
+
+    def test_anf_lower_add_data_output_single_continuation(self):
+        """addDataOutput works with the single-output state continuation path.
+        _newAmount must be injected so the state output value can be adjusted."""
+        source = """
+import { StatefulSmartContract } from 'runar-lang';
+
+class Counter extends StatefulSmartContract {
+  count: bigint;
+  constructor(count: bigint) {
+    super(count);
+    this.count = count;
+  }
+  public bump(payload: ByteString): void {
+    this.count = this.count + 1n;
+    this.addDataOutput(0n, payload);
+  }
+}
+"""
+        result = parse_source(source, "Counter.runar.ts")
+        assert result.contract is not None
+        validate(result.contract)
+        type_check(result.contract)
+        program = lower_to_anf(result.contract)
+
+        bump = next((m for m in program.methods if m.name == "bump"), None)
+        assert bump is not None
+
+        # Uses computeStateOutput (single-output path), not multi-output addOutput
+        assert len([b for b in bump.body if b.value.kind == "add_output"]) == 0
+        data_refs = [b.name for b in bump.body if b.value.kind == "add_data_output"]
+        assert len(data_refs) == 1
+
+        compute = next(
+            (b for b in bump.body
+             if b.value.kind == "call" and b.value.func == "computeStateOutput"),
+            None,
+        )
+        assert compute is not None
+
+        # Continuation hash must cat: stateOut + dataOut, then +change
+        cats = [b for b in bump.body
+                if b.value.kind == "call" and b.value.func == "cat"]
+        assert len(cats) >= 2
+        assert data_refs[0] in cats[0].value.args
+
+        param_names = {p.name for p in bump.params}
+        assert "_newAmount" in param_names
+
+    def test_anf_lower_add_data_output_non_mutating(self):
+        """A method that emits only a data output (no state mutation) still
+        runs the single-output continuation path and gets all implicit params."""
+        source = """
+import { StatefulSmartContract } from 'runar-lang';
+
+class Counter extends StatefulSmartContract {
+  count: bigint;
+  constructor(count: bigint) {
+    super(count);
+    this.count = count;
+  }
+  public ping(payload: ByteString): void {
+    this.addDataOutput(0n, payload);
+  }
+}
+"""
+        result = parse_source(source, "Counter.runar.ts")
+        assert result.contract is not None
+        validate(result.contract)
+        type_check(result.contract)
+        program = lower_to_anf(result.contract)
+
+        ping = next((m for m in program.methods if m.name == "ping"), None)
+        assert ping is not None
+
+        assert len([b for b in ping.body if b.value.kind == "add_data_output"]) == 1
+
+        param_names = {p.name for p in ping.params}
+        assert "_changePKH" in param_names
+        assert "_changeAmount" in param_names
+        assert "_newAmount" in param_names
 
 
 # ---------------------------------------------------------------------------
@@ -1800,9 +2322,14 @@ class LiteralLoop extends SmartContract {
             f"expected no errors for literal loop bound, got: {vr.errors}"
         )
 
-    # V11: identifier loop bound accepted
-    def test_v11_identifier_loop_bound_accepted(self):
-        """for(let i=0n;i<N;i++) where N is identifier → no errors."""
+    # V11: identifier loop bound rejected (cleanly, no crash)
+    def test_v11_identifier_loop_bound_rejected(self):
+        """for(let i=0n;i<N;i++) where N is identifier → rejected at validator.
+
+        A bare identifier bound cannot be unrolled into fixed Bitcoin Script;
+        the reference TS compiler rejects it gracefully. The validator must do
+        the same so anf-lower's _extract_loop_shape never raises.
+        """
         source = """
 import { SmartContract, assert } from 'runar-lang';
 
@@ -1826,9 +2353,9 @@ class IdentLoop extends SmartContract {
         result = parse_source(source, "IdentLoop.runar.ts")
         assert result.contract is not None
         vr = validate(result.contract)
-        assert len(vr.errors) == 0, (
-            f"expected no errors for identifier loop bound, got: {vr.errors}"
-        )
+        assert any(
+            "constant" in e.message or "bound" in e.message for e in vr.errors
+        ), f"expected a compile-time-constant loop-bound error, got: {vr.errors}"
 
     # V12: constructor missing super() rejected
     def test_v12_constructor_missing_super_rejected(self):

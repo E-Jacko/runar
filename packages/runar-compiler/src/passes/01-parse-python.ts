@@ -381,8 +381,19 @@ function tokenize(source: string): Token[] {
 
 /** Convert snake_case to camelCase. Single words pass through unchanged. */
 function snakeToCamel(name: string): string {
+  // Preserve dunder names (__init__, __foo__) unchanged
+  if (name.startsWith('__') && name.endsWith('__') && name.length >= 4) {
+    return name;
+  }
+
   // Strip trailing underscore (e.g. assert_ -> assert)
   let n = name.endsWith('_') && name !== '_' ? name.slice(0, -1) : name;
+
+  // Strip leading single underscore for private methods (Python convention:
+  // _helper -> helper). Matches Go/Python/Zig/Ruby parser behavior.
+  if (n.startsWith('_') && !n.startsWith('__')) {
+    n = n.slice(1);
+  }
 
   return n.replace(/_([a-z0-9])/g, (_, ch: string) => ch.toUpperCase());
 }
@@ -424,9 +435,27 @@ function mapBuiltinName(name: string): string {
     'ec_make_point': 'ecMakePoint',
     'ec_point_x': 'ecPointX',
     'ec_point_y': 'ecPointY',
+    // P-256 / secp256r1
+    'p256_add': 'p256Add',
+    'p256_mul': 'p256Mul',
+    'p256_mul_gen': 'p256MulGen',
+    'p256_negate': 'p256Negate',
+    'p256_on_curve': 'p256OnCurve',
+    'p256_encode_compressed': 'p256EncodeCompressed',
+    'verify_ecdsa_p256': 'verifyECDSA_P256',
+    // P-384 / secp384r1
+    'verify_ecdsa_p384': 'verifyECDSA_P384',
+    'bb_field_add': 'bbFieldAdd',
+    'bb_field_sub': 'bbFieldSub',
+    'bb_field_mul': 'bbFieldMul',
+    'bb_field_inv': 'bbFieldInv',
+    'merkle_root_sha256': 'merkleRootSha256',
+    'merkle_root_hash256': 'merkleRootHash256',
     'mul_div': 'mulDiv',
     'percent_of': 'percentOf',
     'add_output': 'addOutput',
+    'add_raw_output': 'addRawOutput',
+    'add_data_output': 'addDataOutput',
     'get_state_script': 'getStateScript',
   };
   const special = SPECIAL[name];
@@ -446,25 +475,30 @@ function mapBuiltinName(name: string): string {
 /** Map Python type names to Rúnar AST types. */
 function mapPyType(name: string): string {
   switch (name) {
-    case 'Bigint': case 'int': return 'bigint';
-    case 'bool': return 'boolean';
+    case 'Bigint': case 'int': case 'Int': return 'bigint';
+    case 'bool': case 'Bool': return 'boolean';
     case 'ByteString': case 'bytes': return 'ByteString';
     case 'PubKey': return 'PubKey';
     case 'Sig': return 'Sig';
     case 'Addr': return 'Addr';
-    case 'Sha256': return 'Sha256';
+    case 'Sha256':
+    case 'Sha256Digest':
+      return 'Sha256';
     case 'Ripemd160': return 'Ripemd160';
     case 'SigHashPreimage': return 'SigHashPreimage';
     case 'RabinSig': return 'RabinSig';
     case 'RabinPubKey': return 'RabinPubKey';
     case 'Point': return 'Point';
+    case 'P256Point': return 'P256Point';
+    case 'P384Point': return 'P384Point';
     default: return name;
   }
 }
 
 const PRIMITIVE_TYPES = new Set<string>([
   'bigint', 'boolean', 'ByteString', 'PubKey', 'Sig', 'Sha256',
-  'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey', 'Point', 'void',
+  'Ripemd160', 'Addr', 'SigHashPreimage', 'RabinSig', 'RabinPubKey',
+  'Point', 'P256Point', 'P384Point', 'void',
 ]);
 
 function makePrimitiveOrCustom(name: string): TypeNode {
@@ -601,7 +635,11 @@ class PyParser {
     this.expect('INDENT');
     this.skipNewlines();
 
-    if (parentClass !== 'SmartContract' && parentClass !== 'StatefulSmartContract') {
+    if (
+      parentClass !== 'SmartContract' &&
+      parentClass !== 'StatefulSmartContract' &&
+      parentClass !== 'UnsafeSmartContract'
+    ) {
       this.errors.push(makeDiagnostic(
         `Unknown parent class: ${parentClass}`,
         'error',
@@ -664,7 +702,7 @@ class PyParser {
     return {
       kind: 'contract',
       name: contractName,
-      parentClass: parentClass as 'SmartContract' | 'StatefulSmartContract',
+      parentClass: parentClass as 'SmartContract' | 'StatefulSmartContract' | 'UnsafeSmartContract',
       properties,
       constructor,
       methods,
@@ -698,8 +736,9 @@ class PyParser {
       typeNode = this.parseType();
     }
 
-    // In stateless contracts, all properties are readonly
-    if (parentClass === 'SmartContract') {
+    // In stateless contracts (SmartContract and UnsafeSmartContract),
+    // all properties are automatically readonly.
+    if (parentClass === 'SmartContract' || parentClass === 'UnsafeSmartContract') {
       isReadonly = true;
     }
 

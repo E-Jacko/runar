@@ -17,6 +17,8 @@ import type {
   RabinPubKey,
   RabinSig,
   Point,
+  P256Point,
+  P384Point,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -38,6 +40,16 @@ function compilerStub(name: string): never {
  * Compiles to: `OP_SHA256`
  */
 export function sha256(_data: ByteString): Sha256 {
+  return compilerStub('sha256');
+}
+
+/**
+ * Alias for `sha256`. Provides an explicitly-named spelling so cross-format
+ * contract sources that reference the `Sha256Hash` identifier (resolved by
+ * every parser to the `sha256` builtin) have a matching export on the TS
+ * side too. Compiles to `OP_SHA256`.
+ */
+export function Sha256Hash(_data: ByteString): Sha256 {
   return compilerStub('sha256');
 }
 
@@ -70,6 +82,13 @@ export function hash256(_data: ByteString): Sha256 {
  * Takes a 32-byte intermediate state and a 64-byte message block,
  * returns the 32-byte updated state.
  * Compiled to inlined SHA-256 compression opcodes (~3000 ops).
+ *
+ * SECURITY — this exposes SHA-256's internal state, i.e. the length-extension
+ * primitive. Do NOT build a keyed MAC as `sha256(key || msg)`: an attacker who
+ * knows `sha256(key || msg)` and `len(key || msg)` can compute
+ * `sha256(key || msg || pad || suffix)` with `sha256Compress`/`sha256Finalize`
+ * without knowing `key`. Use HMAC (or BLAKE3, which is length-extension
+ * resistant) for authentication.
  */
 export function sha256Compress(_state: ByteString, _block: ByteString): ByteString {
   return compilerStub('sha256Compress');
@@ -509,6 +528,14 @@ export function ecNegate(_p: Point): Point {
 
 /**
  * Check if a point lies on the secp256k1 curve: y² ≡ x³ + 7 (mod p).
+ *
+ * SECURITY — this checks only the curve equation, NOT coordinate canonicity.
+ * A coordinate in `[p, 2²⁵⁶)` is reduced mod p by the field arithmetic, so a
+ * non-canonical encoding of a valid point passes `ecOnCurve` while having
+ * different raw bytes than its canonical form. If you gate an attacker-supplied
+ * `Point` and later hash or compare its RAW bytes (rather than the reduced
+ * point), also assert each coordinate is canonical (0 ≤ x, y < `EC_P`) with
+ * `within(...)` to close the malleability surface.
  */
 export function ecOnCurve(_p: Point): boolean {
   return compilerStub('ecOnCurve');
@@ -549,4 +576,468 @@ export function ecPointX(_p: Point): bigint {
  */
 export function ecPointY(_p: Point): bigint {
   return compilerStub('ecPointY');
+}
+
+// ---------------------------------------------------------------------------
+// Elliptic curve point operations (P-256 / NIST P-256 / secp256r1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Add two P-256 curve points.
+ * Compiled to inlined affine point addition using modular arithmetic opcodes.
+ */
+export function p256Add(_a: P256Point, _b: P256Point): P256Point {
+  return compilerStub('p256Add');
+}
+
+/**
+ * Scalar multiplication of a P-256 point by an integer.
+ * Compiled to double-and-add using Jacobian coordinates.
+ */
+export function p256Mul(_p: P256Point, _k: bigint): P256Point {
+  return compilerStub('p256Mul');
+}
+
+/**
+ * Scalar multiplication of the P-256 generator point by an integer.
+ * Equivalent to `p256Mul(P256_G, k)` but the generator is hardcoded.
+ */
+export function p256MulGen(_k: bigint): P256Point {
+  return compilerStub('p256MulGen');
+}
+
+/**
+ * Negate a P-256 curve point: returns (x, p - y).
+ */
+export function p256Negate(_p: P256Point): P256Point {
+  return compilerStub('p256Negate');
+}
+
+/**
+ * Check if a point lies on the P-256 curve: y² ≡ x³ - 3x + b (mod p).
+ */
+export function p256OnCurve(_p: P256Point): boolean {
+  return compilerStub('p256OnCurve');
+}
+
+/**
+ * Encode a P-256 point as a 33-byte compressed public key (02/03 prefix + x).
+ */
+export function p256EncodeCompressed(_p: P256Point): ByteString {
+  return compilerStub('p256EncodeCompressed');
+}
+
+/**
+ * Verify an ECDSA signature over P-256 (secp256r1).
+ *
+ * @param msg    - Raw message bytes; SHA-256 hashed internally (same as verifyWOTS).
+ * @param sig    - 64-byte raw signature (r[32] || s[32]).
+ * @param pubkey - 33-byte compressed P-256 public key.
+ */
+export function verifyECDSA_P256(_msg: ByteString, _sig: ByteString, _pubkey: ByteString): boolean {
+  return compilerStub('verifyECDSA_P256');
+}
+
+// ---------------------------------------------------------------------------
+// Elliptic curve point operations (P-384 / NIST P-384 / secp384r1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Add two P-384 curve points.
+ * Compiled to inlined affine point addition using modular arithmetic opcodes.
+ */
+export function p384Add(_a: P384Point, _b: P384Point): P384Point {
+  return compilerStub('p384Add');
+}
+
+/**
+ * Scalar multiplication of a P-384 point by an integer.
+ * Compiled to double-and-add using Jacobian coordinates.
+ */
+export function p384Mul(_p: P384Point, _k: bigint): P384Point {
+  return compilerStub('p384Mul');
+}
+
+/**
+ * Scalar multiplication of the P-384 generator point by an integer.
+ * Equivalent to `p384Mul(P384_G, k)` but the generator is hardcoded.
+ */
+export function p384MulGen(_k: bigint): P384Point {
+  return compilerStub('p384MulGen');
+}
+
+/**
+ * Negate a P-384 curve point: returns (x, p - y).
+ */
+export function p384Negate(_p: P384Point): P384Point {
+  return compilerStub('p384Negate');
+}
+
+/**
+ * Check if a point lies on the P-384 curve: y² ≡ x³ - 3x + b (mod p).
+ */
+export function p384OnCurve(_p: P384Point): boolean {
+  return compilerStub('p384OnCurve');
+}
+
+/**
+ * Encode a P-384 point as a 49-byte compressed public key (02/03 prefix + x).
+ */
+export function p384EncodeCompressed(_p: P384Point): ByteString {
+  return compilerStub('p384EncodeCompressed');
+}
+
+/**
+ * Verify an ECDSA signature over P-384 (secp384r1).
+ *
+ * @param msg    - Raw message bytes; SHA-256 hashed internally (same as verifyWOTS).
+ * @param sig    - 96-byte raw signature (r[48] || s[48]).
+ * @param pubkey - 49-byte compressed P-384 public key.
+ */
+export function verifyECDSA_P384(_msg: ByteString, _sig: ByteString, _pubkey: ByteString): boolean {
+  return compilerStub('verifyECDSA_P384');
+}
+
+// ---------------------------------------------------------------------------
+// Baby Bear field arithmetic (p = 2^31 - 2^27 + 1 = 2013265921)
+// ---------------------------------------------------------------------------
+
+/**
+ * Baby Bear field addition: (a + b) mod p.
+ * Used by SP1 STARK FRI verification.
+ * Compiles to: `OP_ADD <p> OP_MOD`
+ */
+export function bbFieldAdd(_a: bigint, _b: bigint): bigint {
+  return compilerStub('bbFieldAdd');
+}
+
+/**
+ * Baby Bear field subtraction: (a - b + p) mod p.
+ * Used by SP1 STARK FRI verification.
+ */
+export function bbFieldSub(_a: bigint, _b: bigint): bigint {
+  return compilerStub('bbFieldSub');
+}
+
+/**
+ * Baby Bear field multiplication: (a * b) mod p.
+ * Used by SP1 STARK FRI verification.
+ * Products are at most ~2^62, within BSV script number limits.
+ */
+export function bbFieldMul(_a: bigint, _b: bigint): bigint {
+  return compilerStub('bbFieldMul');
+}
+
+/**
+ * Baby Bear field multiplicative inverse: a^(p-2) mod p.
+ * Uses Fermat's little theorem. ~30 squarings + ~27 multiplies.
+ * Used by SP1 STARK FRI verification.
+ */
+export function bbFieldInv(_a: bigint): bigint {
+  return compilerStub('bbFieldInv');
+}
+
+// ---------------------------------------------------------------------------
+// Baby Bear quartic extension field (degree-4 over BabyBear, W = 11)
+// ---------------------------------------------------------------------------
+// The extension is F[X]/(X^4 - 11) where F is the Baby Bear base field.
+// Elements are (a0, a1, a2, a3) with each component a base field element.
+// SP1/Plonky3 uses this for FRI challenge sampling and DEEP quotient evaluation.
+//
+// Extension addition/subtraction are component-wise — use bbFieldAdd/bbFieldSub.
+// These builtins handle multiplication and inverse which involve cross-terms.
+// Each function returns one component of the result (index 0-3).
+// ---------------------------------------------------------------------------
+
+/**
+ * Component 0 of Baby Bear quartic extension multiplication.
+ * r0 = a0*b0 + 11*(a1*b3 + a2*b2 + a3*b1) mod p
+ */
+export function bbExt4Mul0(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint, _b0: bigint, _b1: bigint, _b2: bigint, _b3: bigint): bigint {
+  return compilerStub('bbExt4Mul0');
+}
+
+/**
+ * Component 1 of Baby Bear quartic extension multiplication.
+ * r1 = a0*b1 + a1*b0 + 11*(a2*b3 + a3*b2) mod p
+ */
+export function bbExt4Mul1(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint, _b0: bigint, _b1: bigint, _b2: bigint, _b3: bigint): bigint {
+  return compilerStub('bbExt4Mul1');
+}
+
+/**
+ * Component 2 of Baby Bear quartic extension multiplication.
+ * r2 = a0*b2 + a1*b1 + a2*b0 + 11*(a3*b3) mod p
+ */
+export function bbExt4Mul2(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint, _b0: bigint, _b1: bigint, _b2: bigint, _b3: bigint): bigint {
+  return compilerStub('bbExt4Mul2');
+}
+
+/**
+ * Component 3 of Baby Bear quartic extension multiplication.
+ * r3 = a0*b3 + a1*b2 + a2*b1 + a3*b0 mod p
+ */
+export function bbExt4Mul3(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint, _b0: bigint, _b1: bigint, _b2: bigint, _b3: bigint): bigint {
+  return compilerStub('bbExt4Mul3');
+}
+
+/**
+ * Component 0 of Baby Bear quartic extension inverse.
+ * Uses tower-of-quadratic-extensions algorithm.
+ */
+export function bbExt4Inv0(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint): bigint {
+  return compilerStub('bbExt4Inv0');
+}
+
+/**
+ * Component 1 of Baby Bear quartic extension inverse.
+ */
+export function bbExt4Inv1(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint): bigint {
+  return compilerStub('bbExt4Inv1');
+}
+
+/**
+ * Component 2 of Baby Bear quartic extension inverse.
+ */
+export function bbExt4Inv2(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint): bigint {
+  return compilerStub('bbExt4Inv2');
+}
+
+/**
+ * Component 3 of Baby Bear quartic extension inverse.
+ */
+export function bbExt4Inv3(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint): bigint {
+  return compilerStub('bbExt4Inv3');
+}
+
+// ---------------------------------------------------------------------------
+// KoalaBear field arithmetic (p = 2^31 - 2^24 + 1 = 2,130,706,433)
+// ---------------------------------------------------------------------------
+// The KoalaBear prime field, used by SP1 v6 STARK proofs (StackedBasefold).
+// Identical structure to BabyBear but different prime (0x7f000001 vs 0x78000001).
+// Extension field uses irreducible x^4 - 3 (W=3, vs BabyBear's W=11).
+// ---------------------------------------------------------------------------
+
+/**
+ * KoalaBear field addition: (a + b) mod p.
+ * Used by SP1 v6 StackedBasefold verification.
+ * Compiles to: `OP_ADD <p> OP_MOD`
+ */
+export function kbFieldAdd(_a: bigint, _b: bigint): bigint {
+  return compilerStub('kbFieldAdd');
+}
+
+/**
+ * KoalaBear field subtraction: (a - b + p) mod p.
+ * Used by SP1 v6 StackedBasefold verification.
+ */
+export function kbFieldSub(_a: bigint, _b: bigint): bigint {
+  return compilerStub('kbFieldSub');
+}
+
+/**
+ * KoalaBear field multiplication: (a * b) mod p.
+ * Used by SP1 v6 StackedBasefold verification.
+ * Products are at most ~2^62, within BSV script number limits.
+ */
+export function kbFieldMul(_a: bigint, _b: bigint): bigint {
+  return compilerStub('kbFieldMul');
+}
+
+/**
+ * KoalaBear field multiplicative inverse: a^(p-2) mod p.
+ * Uses Fermat's little theorem. ~30 squarings + ~29 multiplies.
+ * Used by SP1 v6 StackedBasefold verification.
+ */
+export function kbFieldInv(_a: bigint): bigint {
+  return compilerStub('kbFieldInv');
+}
+
+// ---------------------------------------------------------------------------
+// KoalaBear quartic extension field (degree-4 over KoalaBear, W = 3)
+// ---------------------------------------------------------------------------
+// The extension is F[X]/(X^4 - 3) where F is the KoalaBear base field.
+// Elements are (a0, a1, a2, a3) with each component a base field element.
+// SP1 v6 uses this for Basefold challenge sampling and evaluation.
+//
+// Extension addition/subtraction are component-wise — use kbFieldAdd/kbFieldSub.
+// These builtins handle multiplication and inverse which involve cross-terms.
+// Each function returns one component of the result (index 0-3).
+// ---------------------------------------------------------------------------
+
+/**
+ * Component 0 of KoalaBear quartic extension multiplication.
+ * r0 = a0*b0 + 3*(a1*b3 + a2*b2 + a3*b1) mod p
+ */
+export function kbExt4Mul0(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint, _b0: bigint, _b1: bigint, _b2: bigint, _b3: bigint): bigint {
+  return compilerStub('kbExt4Mul0');
+}
+
+/**
+ * Component 1 of KoalaBear quartic extension multiplication.
+ * r1 = a0*b1 + a1*b0 + 3*(a2*b3 + a3*b2) mod p
+ */
+export function kbExt4Mul1(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint, _b0: bigint, _b1: bigint, _b2: bigint, _b3: bigint): bigint {
+  return compilerStub('kbExt4Mul1');
+}
+
+/**
+ * Component 2 of KoalaBear quartic extension multiplication.
+ * r2 = a0*b2 + a1*b1 + a2*b0 + 3*(a3*b3) mod p
+ */
+export function kbExt4Mul2(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint, _b0: bigint, _b1: bigint, _b2: bigint, _b3: bigint): bigint {
+  return compilerStub('kbExt4Mul2');
+}
+
+/**
+ * Component 3 of KoalaBear quartic extension multiplication.
+ * r3 = a0*b3 + a1*b2 + a2*b1 + a3*b0 mod p
+ */
+export function kbExt4Mul3(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint, _b0: bigint, _b1: bigint, _b2: bigint, _b3: bigint): bigint {
+  return compilerStub('kbExt4Mul3');
+}
+
+/**
+ * Component 0 of KoalaBear quartic extension inverse.
+ * Uses tower-of-quadratic-extensions algorithm.
+ */
+export function kbExt4Inv0(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint): bigint {
+  return compilerStub('kbExt4Inv0');
+}
+
+/**
+ * Component 1 of KoalaBear quartic extension inverse.
+ */
+export function kbExt4Inv1(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint): bigint {
+  return compilerStub('kbExt4Inv1');
+}
+
+/**
+ * Component 2 of KoalaBear quartic extension inverse.
+ */
+export function kbExt4Inv2(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint): bigint {
+  return compilerStub('kbExt4Inv2');
+}
+
+/**
+ * Component 3 of KoalaBear quartic extension inverse.
+ */
+export function kbExt4Inv3(_a0: bigint, _a1: bigint, _a2: bigint, _a3: bigint): bigint {
+  return compilerStub('kbExt4Inv3');
+}
+
+// ---------------------------------------------------------------------------
+// BN254 field arithmetic (p = 21888242871839275222246405745257275088696311157297823662689037894645226208583)
+// ---------------------------------------------------------------------------
+// The BN254 (alt_bn128) prime field, used for Groth16 SNARK verification.
+// 254-bit prime, requires multi-limb script arithmetic.
+// ---------------------------------------------------------------------------
+
+/**
+ * BN254 field addition: (a + b) mod p.
+ */
+export function bn254FieldAdd(_a: bigint, _b: bigint): bigint {
+  return compilerStub('bn254FieldAdd');
+}
+
+/**
+ * BN254 field subtraction: (a - b + p) mod p.
+ */
+export function bn254FieldSub(_a: bigint, _b: bigint): bigint {
+  return compilerStub('bn254FieldSub');
+}
+
+/**
+ * BN254 field multiplication: (a * b) mod p.
+ */
+export function bn254FieldMul(_a: bigint, _b: bigint): bigint {
+  return compilerStub('bn254FieldMul');
+}
+
+/**
+ * BN254 field multiplicative inverse: a^(p-2) mod p.
+ */
+export function bn254FieldInv(_a: bigint): bigint {
+  return compilerStub('bn254FieldInv');
+}
+
+/**
+ * BN254 field negation: (p - a) mod p.
+ */
+export function bn254FieldNeg(_a: bigint): bigint {
+  return compilerStub('bn254FieldNeg');
+}
+
+// ---------------------------------------------------------------------------
+// BN254 G1 curve operations (y^2 = x^3 + 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * BN254 G1 point addition.
+ */
+export function bn254G1Add(_p1: Point, _p2: Point): Point {
+  return compilerStub('bn254G1Add');
+}
+
+/**
+ * BN254 G1 scalar multiplication.
+ */
+export function bn254G1ScalarMul(_p: Point, _s: bigint): Point {
+  return compilerStub('bn254G1ScalarMul');
+}
+
+/**
+ * BN254 G1 point negation: (x, p-y).
+ */
+export function bn254G1Negate(_p: Point): Point {
+  return compilerStub('bn254G1Negate');
+}
+
+/**
+ * BN254 G1 on-curve check: y^2 == x^3 + 3 mod p.
+ */
+export function bn254G1OnCurve(_p: Point): boolean {
+  return compilerStub('bn254G1OnCurve') as unknown as boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Merkle proof verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute Merkle root from a leaf and authentication path using SHA-256.
+ *
+ * @param _leaf  - 32-byte leaf hash
+ * @param _proof - Concatenated 32-byte sibling hashes (depth * 32 bytes)
+ * @param _index - Leaf position (determines left/right at each level)
+ * @param _depth - Number of levels (MUST be a compile-time constant)
+ * @returns The computed 32-byte Merkle root
+ */
+export function merkleRootSha256(
+  _leaf: ByteString,
+  _proof: ByteString,
+  _index: bigint,
+  _depth: bigint,
+): ByteString {
+  return compilerStub('merkleRootSha256');
+}
+
+/**
+ * Compute Merkle root from a leaf and authentication path using Hash256 (double SHA-256).
+ * Same as merkleRootSha256 but uses OP_HASH256 instead of OP_SHA256.
+ * Standard Bitcoin Merkle tree format.
+ *
+ * @param _leaf  - 32-byte leaf hash
+ * @param _proof - Concatenated 32-byte sibling hashes (depth * 32 bytes)
+ * @param _index - Leaf position (determines left/right at each level)
+ * @param _depth - Number of levels (MUST be a compile-time constant)
+ * @returns The computed 32-byte Merkle root
+ */
+export function merkleRootHash256(
+  _leaf: ByteString,
+  _proof: ByteString,
+  _index: bigint,
+  _depth: bigint,
+): ByteString {
+  return compilerStub('merkleRootHash256');
 }

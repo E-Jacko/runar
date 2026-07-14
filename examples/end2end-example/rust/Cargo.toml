@@ -1,0 +1,15 @@
+[package]
+name = "runar-end2end-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+runar = { package = "runar-lang", path = "../../../packages/runar-rs" }
+
+[dev-dependencies]
+num-bigint = "0.4"
+
+[[test]]
+name = "price_bet"
+path = "PriceBet_test.rs"

@@ -15,19 +15,32 @@ export type {
 } from './types.js';
 
 // Providers
-export { WhatsOnChainProvider, MockProvider, RPCProvider, WalletProvider } from './providers/index.js';
-export type { Provider, RPCProviderOptions, WalletProviderOptions } from './providers/index.js';
+export { WhatsOnChainProvider, MockProvider, RPCProvider, WalletProvider, GorillaPoolProvider } from './providers/index.js';
+export type { Provider, RPCProviderOptions, WalletProviderOptions, InscriptionInfo, InscriptionDetail } from './providers/index.js';
 
 // Signers
-export { LocalSigner, ExternalSigner, WalletSigner } from './signers/index.js';
+export { LocalSigner, MockSigner, ExternalSigner, WalletSigner } from './signers/index.js';
 export type { Signer, SignCallback, WalletSignerOptions } from './signers/index.js';
 
 // Contract
-export { RunarContract } from './contract.js';
+export { RunarContract, encodeArg, encodePushData, encodeScriptNumber, EMPTY_SIG, isEmptySig } from './contract.js';
+
+// Cross-artifact transaction assembly (N different-artifact covenant inputs in one tx)
+export { assembleMultiContractCall, dryRunMultiContractInput } from './multi-contract.js';
+export type {
+  MultiContractCallInput,
+  MultiContractCallOutput,
+  AssembleMultiContractCallOptions,
+  AssembledMultiContractCall,
+} from './multi-contract.js';
+
+// Typed SDK errors
+export { ScriptSizeExceededError, assertScriptHexUnderLimit } from './errors.js';
 
 // Transaction building
 export { buildDeployTransaction, selectUtxos, estimateDeployFee } from './deployment.js';
-export { buildCallTransaction, estimateCallFee } from './calling.js';
+export { buildCallTransaction, estimateCallFee, estimateFeeForArtifact } from './calling.js';
+export type { EstimateFeeForArtifactOpts } from './calling.js';
 
 // State management
 export {
@@ -41,13 +54,64 @@ export {
 export { computeOpPushTx } from './oppushtx.js';
 
 // Script utilities
-export { buildP2PKHScript, extractConstructorArgs, matchesArtifact } from './script-utils.js';
+export { buildP2PKHScript, extractConstructorArgs, matchesArtifact, pubkeyToPKH } from './script-utils.js';
+
+// Verification-descriptor resolution (value-dependent half of the artifact's
+// constructorSlots/stateFields/templateDigest descriptors)
+export {
+  resolveSlotLayout,
+  computeTemplateHash,
+  buildResolvedCodeHex,
+  resolveStateLayout,
+} from './slot-layout.js';
+export type {
+  ResolvedSlot,
+  ResolvedSlotLayout,
+  ResolvedSlotEncoding,
+  ResolvedStateLayout,
+} from './slot-layout.js';
+
+// Signed-envelope wire protocol for overlay apps
+export { canonicalJson, signEnvelope, verifyEnvelope } from './envelope.js';
+export type {
+  SignedEnvelope,
+  SignEnvelopeOpts,
+  EnvelopeSigner,
+  VerifyEnvelopeOpts,
+  VerifyEnvelopeResult,
+  VerifyEnvelopeReason,
+} from './envelope.js';
 
 // Token management
 export { TokenWallet } from './tokens.js';
 
+// Ordinals (1sat inscriptions, BSV-20/BSV-21 tokens)
+export type { Inscription, EnvelopeBounds } from './ordinals/index.js';
+export {
+  buildInscriptionEnvelope,
+  parseInscriptionEnvelope,
+  findInscriptionEnvelope,
+  stripInscriptionEnvelope,
+  BSV20,
+  BSV21,
+} from './ordinals/index.js';
+export type {
+  BSV20DeployParams,
+  BSV20MintParams,
+  BSV20TransferParams,
+  BSV21DeployMintParams,
+  BSV21TransferParams,
+} from './ordinals/index.js';
+
 // ANF interpreter (auto-compute state transitions)
-export { computeNewState } from './anf-interpreter.js';
+export {
+  computeNewState,
+  computeNewStateAndDataOutputs,
+  executeStrict,
+  executeOnChainAuthoritative,
+  AssertionFailureError,
+} from './anf-interpreter.js';
+export type { DataOutputEntry, RawOutputEntry, ExecutionResult, OnChainCryptoContext } from './anf-interpreter.js';
 
 // Re-export artifact types from runar-ir-schema for convenience
 export type {
@@ -57,6 +121,9 @@ export type {
   ABIParam,
   ABIConstructor,
   StateField,
+  ConstructorSlot,
+  TemplateDigest,
+  TemplateDigestPiece,
   SourceMap,
   SourceMapping,
 } from 'runar-ir-schema';

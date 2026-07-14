@@ -6,6 +6,7 @@
 //! Point representation: 64 bytes (x[32] || y[32], big-endian unsigned).
 //! Internal arithmetic uses Jacobian coordinates for scalar multiplication.
 
+use num_bigint::BigInt;
 use super::stack::{PushValue, StackOp};
 
 // ===========================================================================
@@ -81,7 +82,7 @@ impl<'a> ECTracker<'a> {
     }
 
     fn push_int(&mut self, n: &str, v: i128) {
-        (self.e)(StackOp::Push(PushValue::Int(v)));
+        (self.e)(StackOp::Push(PushValue::Int(BigInt::from(v))));
         self.nm.push(n.to_string());
     }
 
@@ -143,7 +144,7 @@ impl<'a> ECTracker<'a> {
             self.rot();
             return;
         }
-        (self.e)(StackOp::Push(PushValue::Int(d as i128)));
+        (self.e)(StackOp::Push(PushValue::Int(BigInt::from(d as i128))));
         self.nm.push(String::new());
         (self.e)(StackOp::Opcode("OP_ROLL".into()));
         self.nm.pop(); // pop the push
@@ -161,7 +162,7 @@ impl<'a> ECTracker<'a> {
             self.over(n);
             return;
         }
-        (self.e)(StackOp::Push(PushValue::Int(d as i128)));
+        (self.e)(StackOp::Push(PushValue::Int(BigInt::from(d as i128))));
         self.nm.push(String::new());
         (self.e)(StackOp::Opcode("OP_PICK".into()));
         self.nm.pop(); // pop the push
@@ -308,6 +309,21 @@ fn field_mul(t: &mut ECTracker, a_name: &str, b_name: &str, result_name: &str) {
     field_mod(t, "_fmul_prod", result_name);
 }
 
+/// fieldMulConst: (a * c) mod p where c is a small constant.
+fn field_mul_const(t: &mut ECTracker, a_name: &str, c: i128, result_name: &str) {
+    t.to_top(a_name);
+    t.raw_block(&[a_name], Some("_fmc_prod"), |e| {
+        if c == 2 {
+            // Use OP_2MUL (single opcode, no push needed)
+            e(StackOp::Opcode("OP_2MUL".into()));
+        } else {
+            e(StackOp::Push(PushValue::Int(BigInt::from(c))));
+            e(StackOp::Opcode("OP_MUL".into()));
+        }
+    });
+    field_mod(t, "_fmc_prod", result_name);
+}
+
 /// fieldSqr: (a * a) mod p.
 fn field_sqr(t: &mut ECTracker, a_name: &str, result_name: &str) {
     t.copy_to_top(a_name, "_fsqr_copy");
@@ -362,7 +378,7 @@ fn decompose_point(t: &mut ECTracker, point_name: &str, x_name: &str, y_name: &s
     t.to_top(point_name);
     // OP_SPLIT at 32 produces x_bytes (bottom) and y_bytes (top)
     t.raw_block(&[point_name], None, |e| {
-        e(StackOp::Push(PushValue::Int(32)));
+        e(StackOp::Push(PushValue::Int(BigInt::from(32))));
         e(StackOp::Opcode("OP_SPLIT".into()));
     });
     // Manually track the two new items
@@ -398,10 +414,10 @@ fn compose_point(t: &mut ECTracker, x_name: &str, y_name: &str, result_name: &st
     // Use NUM2BIN(33) to accommodate the sign byte, then drop the last byte
     t.to_top(x_name);
     t.raw_block(&[x_name], Some("_cp_xb"), |e| {
-        e(StackOp::Push(PushValue::Int(33)));
+        e(StackOp::Push(PushValue::Int(BigInt::from(33))));
         e(StackOp::Opcode("OP_NUM2BIN".into()));
         // Drop the sign byte (last byte) — split at 32, keep left
-        e(StackOp::Push(PushValue::Int(32)));
+        e(StackOp::Push(PushValue::Int(BigInt::from(32))));
         e(StackOp::Opcode("OP_SPLIT".into()));
         e(StackOp::Drop);
         emit_reverse_32(e);
@@ -410,9 +426,9 @@ fn compose_point(t: &mut ECTracker, x_name: &str, y_name: &str, result_name: &st
     // Convert y to 32-byte big-endian
     t.to_top(y_name);
     t.raw_block(&[y_name], Some("_cp_yb"), |e| {
-        e(StackOp::Push(PushValue::Int(33)));
+        e(StackOp::Push(PushValue::Int(BigInt::from(33))));
         e(StackOp::Opcode("OP_NUM2BIN".into()));
-        e(StackOp::Push(PushValue::Int(32)));
+        e(StackOp::Push(PushValue::Int(BigInt::from(32))));
         e(StackOp::Opcode("OP_SPLIT".into()));
         e(StackOp::Drop);
         emit_reverse_32(e);
@@ -428,14 +444,14 @@ fn compose_point(t: &mut ECTracker, x_name: &str, y_name: &str, result_name: &st
 
 /// Emit inline byte reversal for a 32-byte value on TOS.
 /// After: reversed 32-byte value on TOS.
-fn emit_reverse_32(e: &mut dyn FnMut(StackOp)) {
+pub fn emit_reverse_32(e: &mut dyn FnMut(StackOp)) {
     // Push empty accumulator, swap with data
     e(StackOp::Opcode("OP_0".into()));
     e(StackOp::Swap);
     // 32 iterations: peel first byte, prepend to accumulator
     for _i in 0..32 {
         // Stack: [accum, remaining]
-        e(StackOp::Push(PushValue::Int(1)));
+        e(StackOp::Push(PushValue::Int(BigInt::from(1))));
         e(StackOp::Opcode("OP_SPLIT".into()));
         // Stack: [accum, byte0, rest]
         e(StackOp::Rot);
@@ -533,8 +549,7 @@ fn jacobian_double(t: &mut ECTracker) {
     t.copy_to_top("_B", "_B_save");
     field_sqr(t, "_D", "_D2");
     t.copy_to_top("_B", "_B1");
-    t.push_int("_two1", 2);
-    field_mul(t, "_B1", "_two1", "_2B");
+    field_mul_const(t, "_B1", 2, "_2B");
     field_sub(t, "_D2", "_2B", "_nx");
 
     // ny = D*(B - nx) - C
@@ -545,8 +560,7 @@ fn jacobian_double(t: &mut ECTracker) {
 
     // nz = 2 * Y * Z
     field_mul(t, "_jy_save", "_jz_save", "_yz");
-    t.push_int("_two2", 2);
-    field_mul(t, "_yz", "_two2", "_nz");
+    field_mul_const(t, "_yz", 2, "_nz");
 
     // Clean up leftovers: _B (used via _B_save/_B1) and old jz (only copied, never consumed)
     t.to_top("_B"); t.drop();
@@ -634,8 +648,7 @@ fn build_jacobian_add_affine_inline(e: &mut dyn FnMut(StackOp), t: &ECTracker) {
     // X3 = R^2 - H3 - 2*U1H2
     field_sqr(&mut it, "_R", "_R2");
     field_sub(&mut it, "_R2", "_H3", "_x3_tmp");
-    it.push_int("_two", 2);
-    field_mul(&mut it, "_U1H2", "_two", "_2U1H2");
+    field_mul_const(&mut it, "_U1H2", 2, "_2U1H2");
     field_sub(&mut it, "_x3_tmp", "_2U1H2", "_X3");
 
     // Y3 = R_for_y3*(U1H2_for_y3 - X3) - jy_for_y3*H3_for_y3
@@ -700,19 +713,18 @@ pub fn emit_ec_mul(emit: &mut dyn FnMut(StackOp)) {
         // Double accumulator
         jacobian_double(&mut t);
 
-        // Extract bit: (k >> bit) & 1, using OP_DIV for right-shift
+        // Extract bit: (k >> bit) & 1, using OP_RSHIFTNUM / OP_2DIV
         t.copy_to_top("_k", "_k_copy");
-        if bit > 0 {
-            // divisor = 1 << bit — use Int for small values (matches TS OP_1..OP_16),
-            // script-number-encoded bytes for larger values that exceed i128.
-            if bit <= 126 {
-                t.push_int("_div", 1i128 << bit);
-            } else {
-                let divisor_bytes = script_number_pow2(bit);
-                t.push_bytes("_div", divisor_bytes);
-            }
-            t.raw_block(&["_k_copy", "_div"], Some("_shifted"), |e| {
-                e(StackOp::Opcode("OP_DIV".into()));
+        if bit == 1 {
+            // Single-bit shift: OP_2DIV (no push needed)
+            t.raw_block(&["_k_copy"], Some("_shifted"), |e| {
+                e(StackOp::Opcode("OP_2DIV".into()));
+            });
+        } else if bit > 1 {
+            // Multi-bit shift: push shift amount, OP_RSHIFTNUM
+            t.push_int("_shift", bit as i128);
+            t.raw_block(&["_k_copy", "_shift"], Some("_shifted"), |e| {
+                e(StackOp::Opcode("OP_RSHIFTNUM".into()));
             });
         } else {
             t.rename("_shifted");
@@ -778,6 +790,28 @@ pub fn emit_ec_on_curve(emit: &mut dyn FnMut(StackOp)) {
     let mut t = ECTracker::new(&["_pt"], emit);
     decompose_point(&mut t, "_pt", "_x", "_y");
 
+    // GAP-301: coordinate canonicity. `decompose_point` BIN2NUMs each coordinate
+    // as an unsigned value that may be >= p; the field arithmetic below would
+    // silently reduce it mod p, so a non-canonical encoding of a valid point
+    // would pass. Reject it: require x < p AND y < p (coordinates are unsigned,
+    // so the 0 <= lower bound holds by construction). Combined with the curve
+    // equation at the end via OP_BOOLAND so ecOnCurve still returns a boolean.
+    t.copy_to_top("_x", "_x_lt");
+    push_field_p(&mut t, "_p_for_x");
+    t.raw_block(&["_x_lt", "_p_for_x"], Some("_x_canon"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.copy_to_top("_y", "_y_lt");
+    push_field_p(&mut t, "_p_for_y");
+    t.raw_block(&["_y_lt", "_p_for_y"], Some("_y_canon"), |e| {
+        e(StackOp::Opcode("OP_LESSTHAN".into()));
+    });
+    t.to_top("_x_canon");
+    t.to_top("_y_canon");
+    t.raw_block(&["_x_canon", "_y_canon"], Some("_canon"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
+    });
+
     // lhs = y^2
     field_sqr(&mut t, "_y", "_y2");
 
@@ -788,11 +822,18 @@ pub fn emit_ec_on_curve(emit: &mut dyn FnMut(StackOp)) {
     t.push_int("_seven", 7);
     field_add(&mut t, "_x3", "_seven", "_rhs");
 
-    // Compare
+    // Compare curve equation
     t.to_top("_y2");
     t.to_top("_rhs");
-    t.raw_block(&["_y2", "_rhs"], Some("_result"), |e| {
+    t.raw_block(&["_y2", "_rhs"], Some("_curve_eq"), |e| {
         e(StackOp::Opcode("OP_EQUAL".into()));
+    });
+
+    // on-curve = canonical AND curve-equation
+    t.to_top("_canon");
+    t.to_top("_curve_eq");
+    t.raw_block(&["_canon", "_curve_eq"], Some("_result"), |e| {
+        e(StackOp::Opcode("OP_BOOLAND".into()));
     });
 }
 
@@ -815,16 +856,16 @@ pub fn emit_ec_mod_reduce(emit: &mut dyn FnMut(StackOp)) {
 /// Stack out: [compressed (33 bytes)]
 pub fn emit_ec_encode_compressed(emit: &mut dyn FnMut(StackOp)) {
     // Split at 32: [x_bytes, y_bytes]
-    emit(StackOp::Push(PushValue::Int(32)));
+    emit(StackOp::Push(PushValue::Int(BigInt::from(32))));
     emit(StackOp::Opcode("OP_SPLIT".into()));
     // Get last byte of y for parity
     emit(StackOp::Opcode("OP_SIZE".into()));
-    emit(StackOp::Push(PushValue::Int(1)));
+    emit(StackOp::Push(PushValue::Int(BigInt::from(1))));
     emit(StackOp::Opcode("OP_SUB".into()));
     emit(StackOp::Opcode("OP_SPLIT".into()));
     // Stack: [x_bytes, y_prefix, last_byte]
     emit(StackOp::Opcode("OP_BIN2NUM".into()));
-    emit(StackOp::Push(PushValue::Int(2)));
+    emit(StackOp::Push(PushValue::Int(BigInt::from(2))));
     emit(StackOp::Opcode("OP_MOD".into()));
     // Stack: [x_bytes, y_prefix, parity]
     emit(StackOp::Swap);
@@ -844,18 +885,18 @@ pub fn emit_ec_encode_compressed(emit: &mut dyn FnMut(StackOp)) {
 /// Stack out: [point_bytes (64 bytes)]
 pub fn emit_ec_make_point(emit: &mut dyn FnMut(StackOp)) {
     // Convert y to 32 bytes big-endian (NUM2BIN(33) to handle sign byte, then take first 32)
-    emit(StackOp::Push(PushValue::Int(33)));
+    emit(StackOp::Push(PushValue::Int(BigInt::from(33))));
     emit(StackOp::Opcode("OP_NUM2BIN".into()));
-    emit(StackOp::Push(PushValue::Int(32)));
+    emit(StackOp::Push(PushValue::Int(BigInt::from(32))));
     emit(StackOp::Opcode("OP_SPLIT".into()));
     emit(StackOp::Drop);
     emit_reverse_32(emit);
     // Stack: [x_num, y_be]
     emit(StackOp::Swap);
     // Stack: [y_be, x_num]
-    emit(StackOp::Push(PushValue::Int(33)));
+    emit(StackOp::Push(PushValue::Int(BigInt::from(33))));
     emit(StackOp::Opcode("OP_NUM2BIN".into()));
-    emit(StackOp::Push(PushValue::Int(32)));
+    emit(StackOp::Push(PushValue::Int(BigInt::from(32))));
     emit(StackOp::Opcode("OP_SPLIT".into()));
     emit(StackOp::Drop);
     emit_reverse_32(emit);
@@ -869,7 +910,7 @@ pub fn emit_ec_make_point(emit: &mut dyn FnMut(StackOp)) {
 /// Stack in: [point (64 bytes)]
 /// Stack out: [x as bigint]
 pub fn emit_ec_point_x(emit: &mut dyn FnMut(StackOp)) {
-    emit(StackOp::Push(PushValue::Int(32)));
+    emit(StackOp::Push(PushValue::Int(BigInt::from(32))));
     emit(StackOp::Opcode("OP_SPLIT".into()));
     emit(StackOp::Drop);
     emit_reverse_32(emit);
@@ -883,7 +924,7 @@ pub fn emit_ec_point_x(emit: &mut dyn FnMut(StackOp)) {
 /// Stack in: [point (64 bytes)]
 /// Stack out: [y as bigint]
 pub fn emit_ec_point_y(emit: &mut dyn FnMut(StackOp)) {
-    emit(StackOp::Push(PushValue::Int(32)));
+    emit(StackOp::Push(PushValue::Int(BigInt::from(32))));
     emit(StackOp::Opcode("OP_SPLIT".into()));
     emit(StackOp::Swap);
     emit(StackOp::Drop);
@@ -894,30 +935,3 @@ pub fn emit_ec_point_y(emit: &mut dyn FnMut(StackOp)) {
     emit(StackOp::Opcode("OP_BIN2NUM".into()));
 }
 
-// ===========================================================================
-// Utility: encode 1 << n as a Bitcoin script number
-// ===========================================================================
-
-/// Encode (1 << n) as a Bitcoin Script number (little-endian sign-magnitude).
-/// This matches what the TS emitter produces for `PushValue::Int(bigint)`.
-/// Used for the scalar bit extraction divisor in ecMul where shift amounts
-/// can exceed i128 range.
-fn script_number_pow2(n: usize) -> Vec<u8> {
-    // Script number for 2^n:
-    // - The value 2^n has bit n set and all other bits zero.
-    // - In little-endian: byte index = n/8, bit within byte = n%8.
-    // - Need (n/8)+1 bytes minimum.
-    // - If the highest bit of the last byte is set (bit 7), we need an
-    //   extra 0x00 byte for the sign (positive).
-    let byte_idx = n / 8;
-    let bit_pos = n % 8;
-    let min_len = byte_idx + 1;
-    let needs_sign_byte = bit_pos == 7;
-    let total_len = if needs_sign_byte { min_len + 1 } else { min_len };
-
-    let mut bytes = vec![0u8; total_len];
-    bytes[byte_idx] = 1 << bit_pos;
-    // If bit_pos == 7, the high bit of the last data byte is set,
-    // and we've already added a 0x00 sign byte at the end.
-    bytes
-}

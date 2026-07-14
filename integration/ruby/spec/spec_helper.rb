@@ -98,6 +98,9 @@ module IntegrationHelpers
   # @param blocks [Integer] number of blocks to mine
   def mine(blocks)
     rpc_call('generate', blocks)
+  rescue
+    addr = rpc_call('getnewaddress')
+    rpc_call('generatetoaddress', blocks, addr)
   end
 
   # Import an address and send coins to it, then mine a block.
@@ -161,11 +164,13 @@ module IntegrationHelpers
   # Wallet / Signer creation
   # ---------------------------------------------------------------------------
 
-  # Create a random wallet hash with priv_key_hex, pub_key_hex, pub_key_hash.
+  # Create a deterministic wallet hash with priv_key_hex, pub_key_hex, pub_key_hash.
   #
   # @return [Hash] with keys :priv_key_hex, :pub_key_hex, :pub_key_hash
   def create_wallet
-    priv_hex = SecureRandom.hex(32)
+    @@wallet_counter ||= (Process.pid || 1) * 1000
+    @@wallet_counter += 1
+    priv_hex = @@wallet_counter.to_s(16).rjust(64, '0')
     local    = Runar::SDK::LocalSigner.new(priv_hex)
     pub_hex  = local.get_public_key
     pkh      = hash160([pub_hex].pack('H*'))
@@ -257,6 +262,32 @@ module IntegrationHelpers
   # Provider helper
   # ---------------------------------------------------------------------------
 
+  # Patch ``provider#broadcast`` so each call logs the raw tx size in bytes
+  # to STDERR before delegating to the SDK implementation. The SDK gem
+  # itself is left untouched — this wrapper lives only in the integration
+  # suite to give CI logs a uniform per-broadcast tx-size line.
+  #
+  # @param provider [Runar::SDK::RPCProvider]
+  # @return [Runar::SDK::RPCProvider] same instance, with broadcast patched
+  def instrument_broadcast(provider)
+    provider.singleton_class.class_eval do
+      alias_method :__runar_broadcast_orig, :broadcast unless method_defined?(:__runar_broadcast_orig)
+      define_method(:broadcast) do |tx, *rest, **kw|
+        tx_hex = if tx.respond_to?(:to_hex)
+                   tx.to_hex
+                 elsif tx.is_a?(String)
+                   tx
+                 else
+                   ''
+                 end
+        size_bytes = tx_hex.length / 2
+        warn "[runar-integration] tx broadcast: #{size_bytes} bytes"
+        __runar_broadcast_orig(tx, *rest, **kw)
+      end
+    end
+    provider
+  end
+
   # Create an RPCProvider configured for regtest.
   #
   # Uses the RPC_URL, RPC_USER, and RPC_PASS environment variables (with
@@ -265,12 +296,13 @@ module IntegrationHelpers
   # @return [Runar::SDK::RPCProvider]
   def create_provider
     uri = URI.parse(RPC_URL)
-    Runar::SDK::RPCProvider.regtest(
+    provider = Runar::SDK::RPCProvider.regtest(
       host: uri.host,
       port: uri.port,
       username: RPC_USER,
       password: RPC_PASS
     )
+    instrument_broadcast(provider)
   end
 
   # ---------------------------------------------------------------------------
@@ -527,15 +559,13 @@ RSpec.configure do |config|
 
   config.before(:suite) do
     unless IntegrationHelpers.node_available?
-      warn 'BSV regtest node not available — all integration tests will be skipped'
+      raise 'BSV regtest node not available. Integration tests require a live node. ' \
+            'Start with: cd integration && ./regtest.sh start'
     end
-  end
-
-  config.around(:each) do |example|
-    if IntegrationHelpers.node_available?
-      example.run
-    else
-      skip 'BSV regtest node not available'
-    end
+    info = IntegrationHelpers.rpc_call('getblockchaininfo')
+    raise "SAFETY: Connected to #{info['chain']}, not regtest!" unless info['chain'] == 'regtest'
+    # Ensure at least 101 blocks exist for coinbase maturity
+    count = IntegrationHelpers.rpc_call('getblockcount') rescue 0
+    IntegrationHelpers.mine(101 - count) if count < 101
   end
 end

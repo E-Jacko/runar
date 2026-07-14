@@ -336,8 +336,24 @@ fn emitDivOpcode(t: *ECTracker) !void {
     try t.emitOpcode("OP_DIV");
 }
 
+fn emit2DivOpcode(t: *ECTracker) !void {
+    try t.emitOpcode("OP_2DIV");
+}
+
+fn emitRshiftnumOpcode(t: *ECTracker) !void {
+    try t.emitOpcode("OP_RSHIFTNUM");
+}
+
 fn emitModOpcode(t: *ECTracker) !void {
     try t.emitOpcode("OP_MOD");
+}
+
+fn emitLessThanOpcode(t: *ECTracker) !void {
+    try t.emitOpcode("OP_LESSTHAN");
+}
+
+fn emitBoolAndOpcode(t: *ECTracker) !void {
+    try t.emitOpcode("OP_BOOLAND");
 }
 
 fn emitFieldModSequence(t: *ECTracker) !void {
@@ -470,6 +486,22 @@ fn fieldMul(t: *ECTracker, a_name: []const u8, b_name: []const u8, result_name: 
     try fieldMod(t, "_fmul_prod", result_name);
 }
 
+fn emit2MulOpcode(t: *ECTracker) !void {
+    try t.emitOpcode("OP_2MUL");
+}
+
+fn fieldMulConst(t: *ECTracker, a_name: []const u8, c: i64, result_name: []const u8) !void {
+    try t.toTop(a_name);
+    if (c == 2) {
+        // Use OP_2MUL (single opcode, no push needed)
+        try t.rawBlock(1, "_fmc_prod", emit2MulOpcode);
+    } else {
+        try t.pushInt("_fmc_c", c);
+        try t.rawBlock(2, "_fmc_prod", emitMulOpcode);
+    }
+    try fieldMod(t, "_fmc_prod", result_name);
+}
+
 fn fieldSqr(t: *ECTracker, a_name: []const u8, result_name: []const u8) !void {
     try t.copyToTop(a_name, "_fsqr_copy");
     try fieldMul(t, a_name, "_fsqr_copy", result_name);
@@ -594,8 +626,7 @@ fn jacobianDouble(t: *ECTracker) !void {
     try t.copyToTop("_B", "_B_save");
     try fieldSqr(t, "_D", "_D2");
     try t.copyToTop("_B", "_B1");
-    try t.pushInt("_two1", 2);
-    try fieldMul(t, "_B1", "_two1", "_2B");
+    try fieldMulConst(t, "_B1", 2, "_2B");
     try fieldSub(t, "_D2", "_2B", "_nx");
 
     try t.copyToTop("_nx", "_nx_copy");
@@ -604,8 +635,7 @@ fn jacobianDouble(t: *ECTracker) !void {
     try fieldSub(t, "_D_B_nx", "_C", "_ny");
 
     try fieldMul(t, "_jy_save", "_jz_save", "_yz");
-    try t.pushInt("_two2", 2);
-    try fieldMul(t, "_yz", "_two2", "_nz");
+    try fieldMulConst(t, "_yz", 2, "_nz");
 
     try t.toTop("_B");
     try t.drop();
@@ -666,8 +696,7 @@ fn buildJacobianAddAffineInline(allocator: Allocator, base_names: []const ?[]con
 
     try fieldSqr(&inner, "_R", "_R2");
     try fieldSub(&inner, "_R2", "_H3", "_x3_tmp");
-    try inner.pushInt("_two", 2);
-    try fieldMul(&inner, "_U1H2", "_two", "_2U1H2");
+    try fieldMulConst(&inner, "_U1H2", 2, "_2U1H2");
     try fieldSub(&inner, "_x3_tmp", "_2U1H2", "_X3");
 
     try inner.copyToTop("_X3", "_X3_c");
@@ -712,9 +741,13 @@ fn emitEcMul(t: *ECTracker, point_name: []const u8, scalar_name: []const u8) !vo
         try jacobianDouble(t);
 
         try t.copyToTop("_k", "_k_copy");
-        if (bit > 0) {
-            try pushPow2Divisor(t, "_div", @intCast(bit));
-            try t.rawBlock(2, "_shifted", emitDivOpcode);
+        if (bit == 1) {
+            // Single-bit shift: OP_2DIV (no push needed)
+            try t.rawBlock(1, "_shifted", emit2DivOpcode);
+        } else if (bit > 1) {
+            // Multi-bit shift: push shift amount, OP_RSHIFTNUM
+            try t.pushInt("_shift", @as(i64, bit));
+            try t.rawBlock(2, "_shifted", emitRshiftnumOpcode);
         } else {
             t.renameTop("_shifted");
         }
@@ -763,6 +796,23 @@ fn emitEcNegate(t: *ECTracker) !void {
 
 fn emitEcOnCurve(t: *ECTracker) !void {
     try decomposePoint(t, "_pt", "_x", "_y");
+
+    // GAP-301: coordinate canonicity. `decomposePoint` BIN2NUMs each coordinate
+    // as an unsigned value that may be >= p; the field arithmetic below would
+    // silently reduce it mod p, so a non-canonical encoding of a valid point
+    // would pass. Reject it: require x < p AND y < p (coordinates are unsigned,
+    // so the 0 <= lower bound holds by construction). Combined with the curve
+    // equation at the end via OP_BOOLAND so ecOnCurve still returns a boolean.
+    try t.copyToTop("_x", "_x_lt");
+    try pushFieldPNum(t, "_p_for_x");
+    try t.rawBlock(2, "_x_canon", emitLessThanOpcode);
+    try t.copyToTop("_y", "_y_lt");
+    try pushFieldPNum(t, "_p_for_y");
+    try t.rawBlock(2, "_y_canon", emitLessThanOpcode);
+    try t.toTop("_x_canon");
+    try t.toTop("_y_canon");
+    try t.rawBlock(2, "_canon", emitBoolAndOpcode);
+
     try fieldSqr(t, "_y", "_y2");
 
     try t.copyToTop("_x", "_x_copy");
@@ -773,7 +823,11 @@ fn emitEcOnCurve(t: *ECTracker) !void {
 
     try t.toTop("_y2");
     try t.toTop("_rhs");
-    try t.rawBlock(2, "_result", emitEqualOpcode);
+    try t.rawBlock(2, "_curve_eq", emitEqualOpcode);
+
+    try t.toTop("_canon");
+    try t.toTop("_curve_eq");
+    try t.rawBlock(2, "_result", emitBoolAndOpcode);
 }
 
 fn containsOpcode(ops: []const StackOp, opcode: []const u8) bool {
@@ -815,6 +869,43 @@ test "ec add helper emits affine split and compose flow" {
     try std.testing.expectEqualStrings("OP_CAT", bundle.ops[bundle.ops.len - 1].opcode);
 }
 
+// ---------------------------------------------------------------------------
+// T-11: Op-count goldens for the Zig EC helper bundles.
+//
+// The structural tests above check load-bearing opcodes (OP_SPLIT, OP_CAT,
+// 257 OP_IF branches in ec_mul, ...) but not the total op-count. These
+// goldens pin the Zig helper's pre-stack-lowering bundle size so a
+// regression in `buildBuiltinOps` surfaces here as a localized failure
+// rather than only as a cross-tier hex mismatch from the golden harness.
+//
+// The counts diverge from the Python/Java peers because the Zig tier
+// represents control flow at the helper level as a single `.@"if"` op
+// (containing nested `.then` / `.else` slices), whereas Python/Java
+// flatten if-bodies into separate ops. Final compiled hex is byte-
+// identical (enforced by the conformance harness).
+// ---------------------------------------------------------------------------
+
+test "ec helper op-count goldens" {
+    const cases = .{
+        .{ registry.CryptoBuiltin.ec_add, "ecAdd", @as(usize, 8068) },
+        .{ registry.CryptoBuiltin.ec_mul, "ecMul", @as(usize, 59707) },
+        .{ registry.CryptoBuiltin.ec_mul_gen, "ecMulGen", @as(usize, 59709) },
+        .{ registry.CryptoBuiltin.ec_negate, "ecNegate", @as(usize, 945) },
+        .{ registry.CryptoBuiltin.ec_on_curve, "ecOnCurve", @as(usize, 530) },
+    };
+    inline for (cases) |c| {
+        var bundle = try buildBuiltinOps(std.testing.allocator, c[0]);
+        defer bundle.deinit();
+        if (bundle.ops.len != c[2]) {
+            std.debug.print(
+                "{s}: op-count drift — got {d}, want {d}\n",
+                .{ c[1], bundle.ops.len, c[2] },
+            );
+        }
+        try std.testing.expectEqual(c[2], bundle.ops.len);
+    }
+}
+
 test "ec mul helper emits 257 conditional additions" {
     var bundle = try buildBuiltinOps(std.testing.allocator, .ec_mul);
     defer bundle.deinit();
@@ -837,12 +928,15 @@ test "ec mul gen helper seeds the generator point" {
     try std.testing.expect(containsOpcode(bundle.ops, "OP_SPLIT"));
 }
 
-test "ec on curve helper ends in equality" {
+test "ec on curve helper ends in canonicity-anded equality" {
     var bundle = try buildBuiltinOps(std.testing.allocator, .ec_on_curve);
     defer bundle.deinit();
 
+    // GAP-301: ecOnCurve now returns (x < p) AND (y < p) AND curve-equation,
+    // so the final op is the OP_BOOLAND that folds canonicity into the result.
     try std.testing.expect(bundle.ops.len > 0);
-    try std.testing.expectEqualStrings("OP_EQUAL", bundle.ops[bundle.ops.len - 1].opcode);
+    try std.testing.expectEqualStrings("OP_BOOLAND", bundle.ops[bundle.ops.len - 1].opcode);
+    try std.testing.expect(containsOpcode(bundle.ops, "OP_LESSTHAN"));
 }
 
 test "ec negate helper uses field-prime script number bytes" {

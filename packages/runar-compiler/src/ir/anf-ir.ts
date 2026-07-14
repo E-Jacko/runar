@@ -110,11 +110,27 @@ export interface Loop {
   count: number;
   body: ANFBinding[];
   iterVar: string;
+  // Iterator start value and step direction (issue #121). The loop is unrolled
+  // `count` times; on iteration `i` (0-based) the iterator variable holds
+  // `start + i * step`. Zero-start counting-up loops carry `start = 0n` and
+  // `step = 1`, which reproduces the historical `i = 0..count-1` lowering
+  // byte-for-byte. Countdown loops carry `step = -1`.
+  start: bigint;
+  step: 1 | -1;
 }
 
 export interface Assert {
   kind: 'assert';
   value: string; // reference to a temp name
+  // Optional marker: set to `true` only on the auto-injected
+  // `hash256(continuationOutputs) === extractOutputHash(txPreimage)` assert
+  // emitted by the StatefulSmartContract lowering (04-anf-lower.ts).
+  // Off-chain SDK interpreters use this to skip the equality check
+  // (which has no way to hold without script-bytes-aware codegen) without
+  // resorting to positional or structural heuristics that misfire on
+  // developer-written covenant asserts whose IR shape is identical.
+  // Absent => developer code.
+  isAutoInjectedStateCheck?: boolean;
 }
 
 export interface UpdateProp {
@@ -130,6 +146,14 @@ export interface GetStateScript {
 export interface CheckPreimage {
   kind: 'check_preimage';
   preimage: string; // reference to a temp name
+  /**
+   * Issue #123: BIP-143 sighash flag the on-chain OP_PUSH_TX binding appends to
+   * the derived signature (so the node re-derives the tx sighash under this
+   * flag). Absent = default `ALL|FORKID` (0x41), byte-identical to the pinned
+   * cross-tier binding blob. Only set for a method that declares a non-default
+   * `@sighash` mode, keeping golden ANF unchanged for every existing contract.
+   */
+  sighashFlag?: number;
 }
 
 export interface DeserializeState {
@@ -150,9 +174,47 @@ export interface AddRawOutput {
   scriptBytes: string;   // reference to a temp holding ByteString script
 }
 
+/**
+ * AddDataOutput — records an additional transaction output that is NOT a
+ * state continuation. The output is included in the auto-computed
+ * continuation hash (hashOutputs) in declaration order, after state
+ * outputs and before the change output. The emit shape is identical to
+ * `add_raw_output`: amount(8LE) + varint(scriptLen) + scriptBytes.
+ *
+ * Distinguished from `add_raw_output` only at the continuation-hash
+ * composition stage: `add_data_output` refs are concatenated AFTER all
+ * `add_output` (state) refs and BEFORE the change output.
+ */
+export interface AddDataOutput {
+  kind: 'add_data_output';
+  satoshis: string;      // reference to a temp holding satoshis bigint
+  scriptBytes: string;   // reference to a temp holding ByteString script
+}
+
 export interface ArrayLiteral {
   kind: 'array_literal';
   elements: string[];    // references to temp names
+}
+
+/**
+ * RawScript — an opaque opcode-byte span with declared stack arity.
+ *
+ * Bytes are emitted verbatim during stack lowering and Bitcoin Script emit;
+ * no re-encoding takes place. The compiler treats this node as a hard
+ * barrier: the EC algebraic optimizer, the peephole optimizer, and the
+ * static analyzer all leave it untouched, and dead-code elimination
+ * treats it as side-effecting.
+ *
+ * Used by the `asm({...})` surface syntax and by the decompiler when a
+ * span of bytes can't be lifted to higher-level Rúnar source. Keeping
+ * the IR byte-canonical (not mnemonic-based) makes cross-compiler
+ * conformance trivial.
+ */
+export interface RawScript {
+  kind: 'raw_script';
+  bytes: string;     // hex string of the verbatim opcode bytes
+  in_arity: number;  // stack elements consumed
+  out_arity: number; // stack elements produced
 }
 
 export type ANFValue =
@@ -172,4 +234,6 @@ export type ANFValue =
   | DeserializeState
   | AddOutput
   | AddRawOutput
-  | ArrayLiteral;
+  | AddDataOutput
+  | ArrayLiteral
+  | RawScript;

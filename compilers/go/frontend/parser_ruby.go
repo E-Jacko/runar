@@ -498,9 +498,28 @@ var rbSpecialNames = map[string]string{
 	"ec_point_x":           "ecPointX",
 	"ec_point_y":           "ecPointY",
 
+	// P-256 EC builtins
+	"p256_add":               "p256Add",
+	"p256_mul":               "p256Mul",
+	"p256_mul_gen":           "p256MulGen",
+	"p256_negate":            "p256Negate",
+	"p256_on_curve":          "p256OnCurve",
+	"p256_encode_compressed": "p256EncodeCompressed",
+	"verify_ecdsa_p256":      "verifyECDSA_P256",
+
+	// P-384 EC builtins
+	"p384_add":               "p384Add",
+	"p384_mul":               "p384Mul",
+	"p384_mul_gen":           "p384MulGen",
+	"p384_negate":            "p384Negate",
+	"p384_on_curve":          "p384OnCurve",
+	"p384_encode_compressed": "p384EncodeCompressed",
+	"verify_ecdsa_p384":      "verifyECDSA_P384",
+
 	// Intrinsics
-	"add_output":     "addOutput",
-	"add_raw_output": "addRawOutput",
+	"add_output":      "addOutput",
+	"add_raw_output":  "addRawOutput",
+	"add_data_output": "addDataOutput",
 	"get_state_script": "getStateScript",
 
 	// SHA-256 partial verification
@@ -600,7 +619,7 @@ func rbMapType(name string) string {
 		return "Sig"
 	case "Addr":
 		return "Addr"
-	case "Sha256":
+	case "Sha256", "Sha256Digest":
 		return "Sha256"
 	case "Ripemd160":
 		return "Ripemd160"
@@ -612,6 +631,10 @@ func rbMapType(name string) string {
 		return "RabinPubKey"
 	case "Point":
 		return "Point"
+	case "P256Point":
+		return "P256Point"
+	case "P384Point":
+		return "P384Point"
 	default:
 		return name
 	}
@@ -743,7 +766,7 @@ func (p *rbParser) parseContract() (*ContractNode, error) {
 		parentClass = classPart.value
 	}
 
-	if parentClass != "SmartContract" && parentClass != "StatefulSmartContract" {
+	if parentClass != "SmartContract" && parentClass != "StatefulSmartContract" && parentClass != "UnsafeSmartContract" {
 		return nil, fmt.Errorf("unknown parent class: %s", parentClass)
 	}
 
@@ -842,6 +865,7 @@ func (p *rbParser) parseContract() (*ContractNode, error) {
 	// Intrinsic methods that must also be rewritten to property_access style.
 	methodNames["addOutput"] = true
 	methodNames["addRawOutput"] = true
+	methodNames["addDataOutput"] = true
 	methodNames["getStateScript"] = true
 	for i := range methods {
 		rewriteBareMethodCallsGo(methods[i].Body, methodNames)
@@ -964,8 +988,9 @@ func (p *rbParser) parseProp(parentClass string) *PropertyNode {
 		}
 	}
 
-	// In stateless contracts, all properties are readonly
-	if parentClass == "SmartContract" {
+	// In stateless contracts (SmartContract and UnsafeSmartContract), all
+	// properties are readonly.
+	if parentClass == "SmartContract" || parentClass == "UnsafeSmartContract" {
 		isReadonly = true
 	}
 
@@ -1220,17 +1245,26 @@ func (p *rbParser) parseIfStatement(loc SourceLocation) Statement {
 	p.match(rbTokNewline)
 	p.skipNewlines()
 
+	// Variables declared inside an if/elsif/else branch are scoped to that
+	// branch. Snapshot+restore declaredLocals so a sibling branch (or a
+	// sibling top-level if-without-else block) can re-declare the same
+	// local without it being treated as an assignment to an out-of-scope
+	// variable. Mirrors the canonical TS / Python lexical-scope semantics.
+	localsBeforeThen := copyStringSet(p.declaredLocals)
 	thenBranch := p.parseStatements()
+	p.declaredLocals = copyStringSet(localsBeforeThen)
 
 	var elseBranch []Statement
 
 	if p.check(rbTokElsif) {
 		elifLoc := p.loc()
 		elseBranch = []Statement{p.parseElsifStatement(elifLoc)}
+		p.declaredLocals = copyStringSet(localsBeforeThen)
 	} else if p.check(rbTokElse) {
 		p.advance() // 'else'
 		p.skipNewlines()
 		elseBranch = p.parseStatements()
+		p.declaredLocals = copyStringSet(localsBeforeThen)
 	}
 
 	p.expect(rbTokEnd)
@@ -1248,17 +1282,22 @@ func (p *rbParser) parseElsifStatement(loc SourceLocation) Statement {
 	condition := p.parseExpression()
 	p.skipNewlines()
 
+	// Same scope discipline as parseIfStatement.
+	localsBeforeThen := copyStringSet(p.declaredLocals)
 	thenBranch := p.parseStatements()
+	p.declaredLocals = copyStringSet(localsBeforeThen)
 
 	var elseBranch []Statement
 
 	if p.check(rbTokElsif) {
 		elifLoc := p.loc()
 		elseBranch = []Statement{p.parseElsifStatement(elifLoc)}
+		p.declaredLocals = copyStringSet(localsBeforeThen)
 	} else if p.check(rbTokElse) {
 		p.advance() // 'else'
 		p.skipNewlines()
 		elseBranch = p.parseStatements()
+		p.declaredLocals = copyStringSet(localsBeforeThen)
 	}
 
 	// Note: the outer `end` is consumed by the parent parseIfStatement
@@ -1391,9 +1430,21 @@ func (p *rbParser) parseIvarStatement(loc SourceLocation) Statement {
 	ivarTok := p.advance() // ivar token
 	rawName := ivarTok.value
 	propName := rbConvertName(rawName)
-	target := PropertyAccessExpr{Property: propName}
+	var target Expression = PropertyAccessExpr{Property: propName}
 
-	// Simple assignment: @var = expr
+	// Consume index-access postfixes on the LHS of an assignment, so
+	// that `@var[i] = expr` is recognised as an assignment rather than
+	// being split into an orphaned index read and a rogue rhs.
+	for p.check(rbTokLBracket) {
+		p.advance()
+		index := p.parseExpression()
+		if !p.match(rbTokRBracket) {
+			break
+		}
+		target = IndexAccessExpr{Object: target, Index: index}
+	}
+
+	// Simple assignment: @var = expr | @var[i] = expr
 	if p.match(rbTokAssign) {
 		value := p.parseExpression()
 		return AssignmentStmt{Target: target, Value: value, SourceLocation: loc}
@@ -1417,8 +1468,7 @@ func (p *rbParser) parseIvarStatement(loc SourceLocation) Statement {
 	}
 
 	// Expression statement (e.g. @var.method(...))
-	var expr Expression = target
-	expr = p.parsePostfixFrom(expr)
+	expr := p.parsePostfixFrom(target)
 
 	return ExpressionStmt{Expr: expr, SourceLocation: loc}
 }

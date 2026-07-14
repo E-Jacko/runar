@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import { Transaction, LockingScript, UnlockingScript } from '@bsv/sdk';
+import type { RunarArtifact } from 'runar-ir-schema';
 import type { UTXO } from './types.js';
 import { buildP2PKHScript } from './script-utils.js';
 
@@ -33,9 +34,23 @@ export function buildCallTransaction(
     contractOutputs?: Array<{ script: string; satoshis: number }>;
     /** Additional contract inputs with their own unlocking scripts (for merge). */
     additionalContractInputs?: Array<{ utxo: UTXO; unlockingScript: string }>;
+    /** Data outputs declared via `this.addDataOutput(...)` in the method
+     * body. Emitted between contract (state) outputs and the change output,
+     * in declaration order — matching the compile-time continuation-hash
+     * layout. */
+    dataOutputs?: Array<{ script: string; satoshis: number }>;
+    /** Override the call tx's nLockTime. Unset → defaults to 0 (legacy).
+     * Set to a non-zero value for contracts that assert
+     * `extractLocktime(preimage) >= deadline` (e.g. auction close/claim). */
+    locktime?: number;
+    /** Override the nSequence written onto every input (issue #131). Unset →
+     * 0xfffffffe when a non-zero locktime is set (so nLockTime is consensus-
+     * enforced), else 0xffffffff (final, legacy). */
+    sequence?: number;
   },
 ): { tx: Transaction; inputCount: number; changeAmount: number } {
   const extraContractInputs = options?.additionalContractInputs ?? [];
+  const dataOutputs = options?.dataOutputs ?? [];
   const allUtxos = [currentUtxo, ...extraContractInputs.map((i) => i.utxo), ...(additionalUtxos ?? [])];
 
   const totalInput = allUtxos.reduce((sum, u) => sum + u.satoshis, 0);
@@ -47,7 +62,9 @@ export function buildCallTransaction(
       ? [{ script: newLockingScript, satoshis: newSatoshis ?? currentUtxo.satoshis }]
       : []);
 
-  const contractOutputSats = contractOutputs.reduce((sum, o) => sum + o.satoshis, 0);
+  const contractOutputSats =
+    contractOutputs.reduce((sum, o) => sum + o.satoshis, 0)
+    + dataOutputs.reduce((sum, o) => sum + o.satoshis, 0);
 
   // Estimate fee using actual script sizes
   const input0Size = 32 + 4 + varIntByteSize(unlockingScript.length / 2) +
@@ -65,6 +82,9 @@ export function buildCallTransaction(
   for (const co of contractOutputs) {
     outputsSize += 8 + varIntByteSize(co.script.length / 2) + co.script.length / 2;
   }
+  for (const do_ of dataOutputs) {
+    outputsSize += 8 + varIntByteSize(do_.script.length / 2) + do_.script.length / 2;
+  }
   if (changeAddress || changeScript) {
     outputsSize += 34; // P2PKH change
   }
@@ -76,12 +96,22 @@ export function buildCallTransaction(
   // Build Transaction object
   const tx = new Transaction();
 
+  // Locktime: default 0 (legacy); overridable via options.locktime for
+  // contracts asserting `extractLocktime(preimage) >= deadline`.
+  tx.lockTime = options?.locktime ?? 0;
+
+  // Sequence (issue #131): an all-0xffffffff input set makes nLockTime a
+  // consensus no-op. When a non-zero locktime is set, default every input to
+  // 0xfffffffe (non-final) so the locktime is actually enforced. Explicit
+  // options.sequence always wins.
+  const inputSequence = resolveInputSequence(options?.locktime, options?.sequence);
+
   // Input 0: primary contract UTXO with unlocking script
   tx.addInput({
     sourceTXID: currentUtxo.txid,
     sourceOutputIndex: currentUtxo.outputIndex,
     unlockingScript: UnlockingScript.fromHex(unlockingScript),
-    sequence: 0xffffffff,
+    sequence: inputSequence,
   });
 
   // Additional contract inputs (with their own unlocking scripts)
@@ -90,7 +120,7 @@ export function buildCallTransaction(
       sourceTXID: ci.utxo.txid,
       sourceOutputIndex: ci.utxo.outputIndex,
       unlockingScript: UnlockingScript.fromHex(ci.unlockingScript),
-      sequence: 0xffffffff,
+      sequence: inputSequence,
     });
   }
 
@@ -101,7 +131,7 @@ export function buildCallTransaction(
         sourceTXID: utxo.txid,
         sourceOutputIndex: utxo.outputIndex,
         unlockingScript: new UnlockingScript(),
-        sequence: 0xffffffff,
+        sequence: inputSequence,
       });
     }
   }
@@ -111,6 +141,15 @@ export function buildCallTransaction(
     tx.addOutput({
       satoshis: co.satoshis,
       lockingScript: LockingScript.fromHex(co.script),
+    });
+  }
+
+  // Data outputs (from this.addDataOutput in method body). Emitted after
+  // state outputs and before change to match the continuation hash.
+  for (const do_ of dataOutputs) {
+    tx.addOutput({
+      satoshis: do_.satoshis,
+      lockingScript: LockingScript.fromHex(do_.script),
     });
   }
 
@@ -125,6 +164,27 @@ export function buildCallTransaction(
   }
 
   return { tx, inputCount: allUtxos.length, changeAmount: change > 0 ? change : 0 };
+}
+
+/**
+ * Resolve the nSequence for a call tx's inputs (issue #131).
+ *
+ * An all-0xffffffff input set makes nLockTime a consensus no-op, so a
+ * locktime-gated method would be script-enforced (via extractLocktime) yet
+ * NOT consensus-enforced. When a non-zero locktime is set we therefore default
+ * every input to 0xfffffffe (non-final, enforceable). Explicit `sequence`
+ * always wins; with no/zero locktime we keep the legacy 0xffffffff.
+ *
+ * Shared by `buildCallTransaction` and the terminal-path tx builder so both
+ * sites stay byte-consistent.
+ */
+export function resolveInputSequence(
+  locktime: number | undefined,
+  sequence: number | undefined,
+): number {
+  if (sequence !== undefined) return sequence;
+  if (locktime !== undefined && locktime !== 0) return 0xfffffffe;
+  return 0xffffffff;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +210,32 @@ export function estimateCallFee(
   const changeOutputSize = P2PKH_OUTPUT_SIZE;
   const txSize = TX_OVERHEAD + contractInputSize + fundingInputsSize + contractOutputSize + changeOutputSize;
   return Math.ceil(txSize * feeRate / 1000);
+}
+
+export interface EstimateFeeForArtifactOpts {
+  /** Sat/byte. Default 0.1. */
+  feeRate?: number;
+  /** Number of continuation outputs. Default 1. */
+  outputCount?: number;
+  /** Unlocking-script byte length. Default: ceil(artifact.script.length / 4). */
+  unlockingScriptLen?: number;
+}
+
+/**
+ * Estimate the fee for a single call against a deployed contract built
+ * from the given artifact. Wraps {@link estimateCallFee} with defaults
+ * derived from the artifact and accepts `feeRate` in sat/byte (vs the
+ * sat/kilobyte unit `estimateCallFee` itself takes).
+ */
+export function estimateFeeForArtifact(
+  artifact: RunarArtifact,
+  opts: EstimateFeeForArtifactOpts = {},
+): number {
+  const satPerByte = opts.feeRate ?? 0.1;
+  const outputs = opts.outputCount ?? 1;
+  const lockingLen = artifact.script.length / 2;
+  const unlockingLen = opts.unlockingScriptLen ?? Math.ceil(artifact.script.length / 4);
+  return estimateCallFee(lockingLen, unlockingLen, outputs, satPerByte * 1000);
 }
 
 // ---------------------------------------------------------------------------

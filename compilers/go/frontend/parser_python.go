@@ -195,10 +195,10 @@ func (p *pyParser) tokenizeRaw(source string) []pyToken {
 			quote := ch
 			// Check for triple-quote
 			if i+2 < len(source) && source[i+1] == quote && source[i+2] == quote {
-				// Triple-quoted string
+				// Triple-quoted string — always a docstring in Rúnar.
+				// Skip it without emitting a token.
 				i += 3
 				col += 3
-				start := i
 				for i+2 < len(source) {
 					if source[i] == quote && source[i+1] == quote && source[i+2] == quote {
 						break
@@ -211,12 +211,10 @@ func (p *pyParser) tokenizeRaw(source string) []pyToken {
 					}
 					i++
 				}
-				val := source[start:i]
 				if i+2 < len(source) {
 					i += 3
 					col += 3
 				}
-				tokens = append(tokens, pyToken{kind: pyTokString, value: val, line: line, col: startCol})
 				continue
 			}
 			i++
@@ -548,8 +546,28 @@ var pySpecialNames = map[string]string{
 	"ec_point_x":           "ecPointX",
 	"ec_point_y":           "ecPointY",
 
+	// P-256 EC builtins
+	"p256_add":               "p256Add",
+	"p256_mul":               "p256Mul",
+	"p256_mul_gen":           "p256MulGen",
+	"p256_negate":            "p256Negate",
+	"p256_on_curve":          "p256OnCurve",
+	"p256_encode_compressed": "p256EncodeCompressed",
+	"verify_ecdsa_p256":      "verifyECDSA_P256",
+
+	// P-384 EC builtins
+	"p384_add":               "p384Add",
+	"p384_mul":               "p384Mul",
+	"p384_mul_gen":           "p384MulGen",
+	"p384_negate":            "p384Negate",
+	"p384_on_curve":          "p384OnCurve",
+	"p384_encode_compressed": "p384EncodeCompressed",
+	"verify_ecdsa_p384":      "verifyECDSA_P384",
+
 	// Intrinsics
 	"add_output":       "addOutput",
+	"add_raw_output":   "addRawOutput",
+	"add_data_output":  "addDataOutput",
 	"get_state_script": "getStateScript",
 
 	// Transaction intrinsics
@@ -718,6 +736,8 @@ func parsePyType(name string) TypeNode {
 		return PrimitiveType{Name: "bigint"}
 	case "bool":
 		return PrimitiveType{Name: "boolean"}
+	case "Bool":
+		return PrimitiveType{Name: "boolean"}
 	case "bytes":
 		return PrimitiveType{Name: "ByteString"}
 	case "ByteString":
@@ -726,7 +746,7 @@ func parsePyType(name string) TypeNode {
 		return PrimitiveType{Name: "PubKey"}
 	case "Sig":
 		return PrimitiveType{Name: "Sig"}
-	case "Sha256":
+	case "Sha256", "Sha256Digest":
 		return PrimitiveType{Name: "Sha256"}
 	case "Ripemd160":
 		return PrimitiveType{Name: "Ripemd160"}
@@ -740,6 +760,10 @@ func parsePyType(name string) TypeNode {
 		return PrimitiveType{Name: "RabinPubKey"}
 	case "Point":
 		return PrimitiveType{Name: "Point"}
+	case "P256Point":
+		return PrimitiveType{Name: "P256Point"}
+	case "P384Point":
+		return PrimitiveType{Name: "P384Point"}
 	case "bigint":
 		return PrimitiveType{Name: "bigint"}
 	case "boolean":
@@ -847,7 +871,7 @@ func (p *pyParser) parseContract() (*ContractNode, error) {
 		p.expect(pyTokRParen)
 	}
 
-	if parentClass != "SmartContract" && parentClass != "StatefulSmartContract" {
+	if parentClass != "SmartContract" && parentClass != "StatefulSmartContract" && parentClass != "UnsafeSmartContract" {
 		return nil, fmt.Errorf("unknown parent class: %s", parentClass)
 	}
 
@@ -995,8 +1019,9 @@ func (p *pyParser) parsePyProperty(parentClass string) *PropertyNode {
 	if p.checkIdent("Readonly") {
 		isReadonly = true
 	}
-	// In SmartContract, all properties are automatically readonly
-	if parentClass == "SmartContract" {
+	// In SmartContract (and UnsafeSmartContract), all properties are
+	// automatically readonly.
+	if parentClass == "SmartContract" || parentClass == "UnsafeSmartContract" {
 		isReadonly = true
 	}
 
@@ -1803,11 +1828,10 @@ func (p *pyParser) parsePyArrayLiteral() Expression {
 		}
 	}
 	p.expect(pyTokRBracket)
-	// Represent as a call to FixedArray constructor (same pattern as other parsers)
-	return CallExpr{
-		Callee: Identifier{Name: "FixedArray"},
-		Args:   elements,
-	}
+	// Emit a dedicated ArrayLiteralExpr so downstream passes (typecheck,
+	// ANF-lowering for checkMultiSig) see the same array_literal node shape
+	// used by every other format parser.
+	return ArrayLiteralExpr{Elements: elements}
 }
 
 func (p *pyParser) parsePyCallArgs() []Expression {

@@ -114,11 +114,24 @@ export interface Loop {
   count: number;
   body: ANFBinding[];
   iterVar: string;
+  // Iterator start value and step direction (issue #121). The loop is unrolled
+  // `count` times; on iteration `i` (0-based) the iterator variable holds
+  // `start + i * step`. Zero-start counting-up loops carry `start = 0n` and
+  // `step = 1`, reproducing the historical `i = 0..count-1` lowering exactly.
+  // Countdown loops carry `step = -1`.
+  start: bigint;
+  step: 1 | -1;
 }
 
 export interface Assert {
   kind: 'assert';
   value: string; // reference to a temp name
+  // Optional marker: set to `true` only on the auto-injected
+  // `hash256(continuationOutputs) === extractOutputHash(txPreimage)` assert
+  // emitted by the StatefulSmartContract lowering. Off-chain SDK
+  // interpreters use it to skip the equality check without resorting to
+  // structural heuristics. Absent => developer code.
+  isAutoInjectedStateCheck?: boolean;
 }
 
 export interface UpdateProp {
@@ -154,9 +167,40 @@ export interface AddRawOutput {
   scriptBytes: string;   // reference to a temp holding ByteString script
 }
 
+/**
+ * AddDataOutput — records an additional transaction output that is NOT a
+ * state continuation. The output is included in the auto-computed
+ * continuation hash (hashOutputs) in declaration order, after state
+ * outputs and before the change output. The emit shape is identical to
+ * `add_raw_output`: amount(8LE) + varint(scriptLen) + scriptBytes.
+ *
+ * Distinguished from `add_raw_output` only at the continuation-hash
+ * composition stage: `add_data_output` refs are concatenated AFTER all
+ * `add_output` (state) refs and BEFORE the change output.
+ */
+export interface AddDataOutput {
+  kind: 'add_data_output';
+  satoshis: string;      // reference to a temp holding satoshis bigint
+  scriptBytes: string;   // reference to a temp holding ByteString script
+}
+
 export interface ArrayLiteral {
   kind: 'array_literal';
   elements: string[];    // references to temp names
+}
+
+/**
+ * RawScript — an opaque opcode-byte span with declared stack arity.
+ *
+ * Mirrors the definition in `packages/runar-compiler/src/ir/anf-ir.ts`.
+ * The IR stores resolved bytes (not mnemonics) so cross-compiler
+ * conformance reduces to byte equality.
+ */
+export interface RawScript {
+  kind: 'raw_script';
+  bytes: string;     // hex string of the verbatim opcode bytes
+  in_arity: number;  // stack elements consumed
+  out_arity: number; // stack elements produced
 }
 
 export type ANFValue =
@@ -176,4 +220,6 @@ export type ANFValue =
   | DeserializeState
   | AddOutput
   | AddRawOutput
-  | ArrayLiteral;
+  | AddDataOutput
+  | ArrayLiteral
+  | RawScript;

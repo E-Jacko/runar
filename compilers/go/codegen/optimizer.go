@@ -88,7 +88,19 @@ func applyOnePass(ops []StackOp) ([]StackOp, bool) {
 	return result, changed
 }
 
+// isRawBytes reports whether an op is an opaque raw_bytes span emitted by a
+// raw_script ANF node. raw_bytes is a hard peephole barrier — no optimization
+// window may span or rewrite across it, because the bytes are opaque and not
+// guaranteed to form a well-formed opcode stream.
+func isRawBytes(op StackOp) bool {
+	return op.Op == "raw_bytes"
+}
+
 func matchWindow2(a, b StackOp) ([]StackOp, bool) {
+	if isRawBytes(a) || isRawBytes(b) {
+		return nil, false
+	}
+
 	// PUSH x, DROP -> remove both (dead value elimination)
 	if a.Op == "push" && b.Op == "drop" {
 		return nil, true
@@ -170,12 +182,12 @@ func matchWindow2(a, b StackOp) ([]StackOp, bool) {
 	}
 
 	// PUSH(0n) + Roll{depth:0} -> remove both (roll 0 is a no-op)
-	if isPushBigInt(a, 0) && b.Op == "roll" {
+	if isPushBigInt(a, 0) && b.Op == "roll" && b.Depth == 0 {
 		return nil, true
 	}
 
 	// PUSH(1n) + Roll{depth:1} -> SWAP
-	if isPushBigInt(a, 1) && b.Op == "roll" {
+	if isPushBigInt(a, 1) && b.Op == "roll" && b.Depth == 1 {
 		return []StackOp{{Op: "swap"}}, true
 	}
 
@@ -185,12 +197,12 @@ func matchWindow2(a, b StackOp) ([]StackOp, bool) {
 	}
 
 	// PUSH(0n) + Pick{depth:0} -> DUP
-	if isPushBigInt(a, 0) && b.Op == "pick" {
+	if isPushBigInt(a, 0) && b.Op == "pick" && b.Depth == 0 {
 		return []StackOp{{Op: "dup"}}, true
 	}
 
 	// PUSH(1n) + Pick{depth:1} -> OVER
-	if isPushBigInt(a, 1) && b.Op == "pick" {
+	if isPushBigInt(a, 1) && b.Op == "pick" && b.Depth == 1 {
 		return []StackOp{{Op: "over"}}, true
 	}
 
@@ -227,6 +239,10 @@ func makePushBigInt(n *big.Int) StackOp {
 }
 
 func matchWindow3(a, b, c StackOp) ([]StackOp, bool) {
+	if isRawBytes(a) || isRawBytes(b) || isRawBytes(c) {
+		return nil, false
+	}
+
 	aVal := pushBigIntValue(a)
 	bVal := pushBigIntValue(b)
 
@@ -248,10 +264,22 @@ func matchWindow3(a, b, c StackOp) ([]StackOp, bool) {
 		}
 	}
 
+	// OVER + OVER + OP_ADD -> DUP + OP_2MUL (2x of TOS-1)
+	// Wait, OVER OVER gives copies of TOS-1 and TOS-1, not TOS and TOS-1.
+	// Actually OVER OVER = [a, b, a, b] which is OP_2DUP (already handled).
+
+	// ROT + ROT + DROP -> NIP + SWAP
+	// [a, b, c] -> ROT -> [b, c, a] -> ROT -> [c, a, b] -> DROP -> [c, a]
+	// = NIP -> [a, c] -> SWAP -> [c, a]  -- same 2 ops, no savings.
+
 	return nil, false
 }
 
 func matchWindow4(a, b, c, d StackOp) ([]StackOp, bool) {
+	if isRawBytes(a) || isRawBytes(b) || isRawBytes(c) || isRawBytes(d) {
+		return nil, false
+	}
+
 	aVal := pushBigIntValue(a)
 	cVal := pushBigIntValue(c)
 

@@ -1,13 +1,12 @@
 PATH
   remote: ../../packages/runar-rb
   specs:
-    runar-lang (0.4.4)
+    runar-lang (1.0.0.pre.rc.1)
 
 GEM
   remote: https://rubygems.org/
   specs:
     base64 (0.3.0)
-    bsv-sdk (0.2.1)
     diff-lcs (1.6.2)
     rspec (3.13.2)
       rspec-core (~> 3.13.0)
@@ -29,7 +28,6 @@ PLATFORMS
 
 DEPENDENCIES
   base64
-  bsv-sdk
   rspec (~> 3.12)
   runar-lang!
 

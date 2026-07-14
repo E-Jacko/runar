@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "../../../examples/ts/stateful-wots-gate/StatefulWOTSGate.runar.ts",
+    ".runar.sol": "../../../examples/sol/stateful-wots-gate/StatefulWOTSGate.runar.sol",
+    ".runar.move": "../../../examples/move/stateful-wots-gate/StatefulWOTSGate.runar.move",
+    ".runar.go": "../../../examples/go/stateful-wots-gate/StatefulWOTSGate.runar.go",
+    ".runar.rs": "../../../examples/rust/stateful-wots-gate/StatefulWOTSGate.runar.rs",
+    ".runar.py": "../../../examples/python/stateful-wots-gate/StatefulWOTSGate.runar.py",
+    ".runar.zig": "../../../examples/zig/stateful-wots-gate/StatefulWOTSGate.runar.zig",
+    ".runar.rb": "../../../examples/ruby/stateful-wots-gate/StatefulWOTSGate.runar.rb",
+    ".runar.java": "../../../examples/java/src/main/java/runar/examples/stateful-wots-gate/StatefulWOTSGate.runar.java"
+  }
+}

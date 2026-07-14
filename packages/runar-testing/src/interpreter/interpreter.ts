@@ -9,7 +9,7 @@
  * We import types from runar-ir-schema (the Rúnar AST definitions).
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, createVerify, createPublicKey } from 'node:crypto';
 import { wotsVerify as wotsVerifyImpl } from '../crypto/wots.js';
 import {
   slhVerify as slhVerifyImpl,
@@ -129,6 +129,12 @@ export class RunarInterpreter {
     sequence: 0xfffffffen,
   };
   private _mockPreimageBytes: Record<string, Uint8Array> = {};
+  // Witness bytes for auto-injected intent-intrinsic params, keyed by the
+  // ANF-level synthetic name (`_prevOutScript_<idx>`, `_serialisedOutputs`).
+  // Tests populate these via TestContract.setPrevOutScript / .setSerialisedOutputs;
+  // the AST interpreter consults this map when evaluating the desugar of
+  // extractPrevOutputScript / requireOutputP2PKH (see evalCallExpr).
+  private _witnessBytes: Record<string, Uint8Array> = {};
 
   /**
    * @param properties - Contract constructor properties (name -> value).
@@ -143,6 +149,14 @@ export class RunarInterpreter {
   setContract(contract: ContractNode): void { this._contract = contract; }
   setMockPreimage(overrides: Record<string, bigint>): void { Object.assign(this._mockPreimage, overrides); }
   setMockPreimageBytes(overrides: Record<string, Uint8Array>): void { Object.assign(this._mockPreimageBytes, overrides); }
+  setPrevOutScript(inputIndex: bigint | number, bytes: Uint8Array): void {
+    const idx = typeof inputIndex === 'bigint' ? inputIndex.toString() : String(inputIndex);
+    this._witnessBytes[`_prevOutScript_${idx}`] = bytes;
+  }
+  setSerialisedOutputs(bytes: Uint8Array): void {
+    this._witnessBytes['_serialisedOutputs'] = bytes;
+  }
+  setWitnessBytes(overrides: Record<string, Uint8Array>): void { Object.assign(this._witnessBytes, overrides); }
   resetOutputs(): void { this._outputs = []; }
   getOutputs(): { satoshis: RunarValue; stateValues: Record<string, RunarValue> }[] { return [...this._outputs]; }
   getState(): Record<string, RunarValue> {
@@ -580,6 +594,14 @@ export class RunarInterpreter {
         return { kind: 'void' };
       }
 
+      if (methodName === 'addDataOutput') {
+        const evaluatedArgs = argExprs.map(a => this.evalExpr(a, env, methods));
+        const satoshis = evaluatedArgs[0]!;
+        const scriptBytes = evaluatedArgs[1]!;
+        this._outputs.push({ satoshis, stateValues: { _dataScript: scriptBytes } });
+        return { kind: 'void' };
+      }
+
       if (methodName === 'getStateScript') {
         return { kind: 'bytes', value: new Uint8Array(0) };
       }
@@ -956,6 +978,90 @@ export class RunarInterpreter {
       case 'extractLocktime':
         return { kind: 'bigint', value: this._mockPreimage.locktime ?? 0n };
 
+      // ---------------------------------------------------------------
+      // Intent-covenant intrinsics (BSVM Phase 13). These desugar at
+      // ANF-lowering time to (load_param + hash256/substr/cat/num2bin
+      // + assert) chains; the AST interpreter must replay the same
+      // semantics directly so contracts can be exercised end-to-end
+      // without going through the stack VM.
+      // ---------------------------------------------------------------
+      case 'extractPrevOutputScript': {
+        // 2-arg form: extractPrevOutputScript(inputIndex_lit, expectedScriptHash)
+        // 3-arg form: extractPrevOutputScript(inputIndex_lit, expectedPrefixHash, prefixLen_lit)
+        const idx = this.toBigInt(args[0]!);
+        const witnessName = `_prevOutScript_${idx.toString()}`;
+        const witness = this._witnessBytes[witnessName];
+        if (witness === undefined) {
+          throw new Error(
+            `extractPrevOutputScript(${idx}) requires witness bytes. ` +
+            `Call TestContract.setPrevOutScript(${idx}n, bytes) before invoking the method.`,
+          );
+        }
+        const expectedHash = this.toBytes(args[1]!);
+        let bytesToHash: Uint8Array;
+        if (args.length === 3) {
+          const prefixLen = Number(this.toBigInt(args[2]!));
+          bytesToHash = witness.slice(0, prefixLen);
+        } else {
+          bytesToHash = witness;
+        }
+        const sha1 = createHash('sha256').update(bytesToHash).digest();
+        const actualHash = new Uint8Array(createHash('sha256').update(sha1).digest());
+        if (!bytesEqual(actualHash, expectedHash)) {
+          throw new AssertionError(
+            `extractPrevOutputScript(${idx}): hash256(witness) !== expectedHash`,
+          );
+        }
+        return { kind: 'bytes', value: witness };
+      }
+
+      case 'requireOutputP2PKH': {
+        // requireOutputP2PKH(outputIndex_lit, pubkeyHash, amount): asserts
+        // serialised-outputs witness hashes to extractOutputHash(preimage),
+        // and that the 34-byte slice at idx*34 equals the canonical P2PKH
+        // output bytes (LE-8 amount ‖ 1976a914 ‖ pkh ‖ 88ac).
+        const idx = this.toBigInt(args[0]!);
+        const pubkeyHash = this.toBytes(args[1]!);
+        const amount = this.toBigInt(args[2]!);
+        const serialised = this._witnessBytes['_serialisedOutputs'];
+        if (serialised === undefined) {
+          throw new Error(
+            'requireOutputP2PKH requires serialised-outputs witness bytes. ' +
+            'Call TestContract.setSerialisedOutputs(bytes) before invoking the method.',
+          );
+        }
+        // hash256(serialised) === extractOutputHash(preimage)
+        const sOnce = createHash('sha256').update(serialised).digest();
+        const sTwice = new Uint8Array(createHash('sha256').update(sOnce).digest());
+        const expectedOutHash = this._mockPreimageBytes['outputHash'] ?? new Uint8Array(32);
+        if (!bytesEqual(sTwice, expectedOutHash)) {
+          throw new AssertionError(
+            'requireOutputP2PKH: hash256(serialisedOutputs) !== preimage.hashOutputs',
+          );
+        }
+        // Build expected P2PKH output: 8-byte LE amount ‖ 1976a914 ‖ pkh ‖ 88ac
+        const amountLE = new Uint8Array(8);
+        let a = amount;
+        for (let i = 0; i < 8; i++) { amountLE[i] = Number(a & 0xffn); a >>= 8n; }
+        const expected = new Uint8Array(8 + 4 + 20 + 2);
+        expected.set(amountLE, 0);
+        expected.set([0x19, 0x76, 0xa9, 0x14], 8);
+        expected.set(pubkeyHash, 12);
+        expected.set([0x88, 0xac], 32);
+        const offset = Number(idx * 34n);
+        const slice = serialised.slice(offset, offset + 34);
+        if (!bytesEqual(slice, expected)) {
+          throw new AssertionError(
+            `requireOutputP2PKH(${idx}): output bytes mismatch`,
+          );
+        }
+        return { kind: 'void' };
+      }
+
+      case 'currentBlockHeight':
+        // Source-level sugar for extractLocktime(this.txPreimage).
+        return { kind: 'bigint', value: this._mockPreimage.locktime ?? 0n };
+
       case 'extractAmount':
         return { kind: 'bigint', value: this._mockPreimage.amount ?? 10000n };
 
@@ -1034,6 +1140,43 @@ export class RunarInterpreter {
         return { kind: 'bigint', value: ecPointYImpl(pt) };
       }
 
+      // P-256 ECDSA verification — real implementation using Node.js crypto
+      case 'verifyECDSA_P256': {
+        const msg = this.toBytes(args[0]!);
+        const rawSig = this.toBytes(args[1]!); // 64-byte r||s
+        const compressedPub = this.toBytes(args[2]!); // 33-byte compressed
+        return { kind: 'boolean', value: verifyECDSA_P256_impl(msg, rawSig, compressedPub) };
+      }
+
+      // P-384 ECDSA verification — real implementation using Node.js crypto
+      case 'verifyECDSA_P384': {
+        const msg = this.toBytes(args[0]!);
+        const rawSig = this.toBytes(args[1]!); // 96-byte r||s
+        const compressedPub = this.toBytes(args[2]!); // 49-byte compressed
+        return { kind: 'boolean', value: verifyECDSA_P384_impl(msg, rawSig, compressedPub) };
+      }
+
+      // P-256 / P-384 curve operations (mocked — return zero bytes)
+      case 'p256Add':
+      case 'p256Mul':
+      case 'p256MulGen':
+      case 'p256Negate':
+      case 'p384Add':
+      case 'p384Mul':
+      case 'p384MulGen':
+      case 'p384Negate':
+        return { kind: 'bytes', value: new Uint8Array(64) };
+
+      case 'p256OnCurve':
+      case 'p384OnCurve':
+        return { kind: 'boolean', value: true };
+
+      case 'p256EncodeCompressed':
+        return { kind: 'bytes', value: new Uint8Array(33) };
+
+      case 'p384EncodeCompressed':
+        return { kind: 'bytes', value: new Uint8Array(49) };
+
       case 'blake3Compress': {
         const cv = this.toBytes(args[0]!);
         const block = this.toBytes(args[1]!);
@@ -1042,10 +1185,125 @@ export class RunarInterpreter {
 
       case 'blake3Hash': {
         const msg = this.toBytes(args[0]!);
-        // Zero-pad to 64 bytes, use IV as chaining value
+        // Standard BLAKE3 single block: zero-pad to 64 bytes, IV as chaining
+        // value, real message length as block_len (correct for 0..64 bytes).
         const padded = new Uint8Array(64);
         padded.set(msg.subarray(0, 64));
-        return { kind: 'bytes', value: blake3CompressImpl(BLAKE3_IV_BYTES, padded) };
+        return { kind: 'bytes', value: blake3CompressImpl(BLAKE3_IV_BYTES, padded, Math.min(msg.length, 64)) };
+      }
+
+      // Baby Bear field arithmetic (p = 2013265921)
+      case 'bbFieldAdd': {
+        const a = this.toBigInt(args[0]!);
+        const b = this.toBigInt(args[1]!);
+        return { kind: 'bigint', value: (a + b) % 2013265921n };
+      }
+      case 'bbFieldSub': {
+        const a = this.toBigInt(args[0]!);
+        const b = this.toBigInt(args[1]!);
+        return { kind: 'bigint', value: ((a - b) % 2013265921n + 2013265921n) % 2013265921n };
+      }
+      case 'bbFieldMul': {
+        const a = this.toBigInt(args[0]!);
+        const b = this.toBigInt(args[1]!);
+        return { kind: 'bigint', value: (a * b) % 2013265921n };
+      }
+      case 'bbFieldInv': {
+        const a = this.toBigInt(args[0]!);
+        const p = 2013265921n;
+        let result = 1n, base = ((a % p) + p) % p, exp = p - 2n;
+        while (exp > 0n) {
+          if (exp & 1n) result = (result * base) % p;
+          base = (base * base) % p;
+          exp >>= 1n;
+        }
+        return { kind: 'bigint', value: result };
+      }
+
+      // Baby Bear quartic extension field (W = 11)
+      case 'bbExt4Mul0': case 'bbExt4Mul1': case 'bbExt4Mul2': case 'bbExt4Mul3': {
+        const p = 2013265921n;
+        const W = 11n;
+        const a0 = this.toBigInt(args[0]!), a1 = this.toBigInt(args[1]!);
+        const a2 = this.toBigInt(args[2]!), a3 = this.toBigInt(args[3]!);
+        const b0 = this.toBigInt(args[4]!), b1 = this.toBigInt(args[5]!);
+        const b2 = this.toBigInt(args[6]!), b3 = this.toBigInt(args[7]!);
+        const fm = (x: bigint, y: bigint) => (x * y) % p;
+        const fa = (x: bigint, y: bigint) => (x + y) % p;
+        const r0 = fa(fm(a0, b0), fm(W, fa(fa(fm(a1, b3), fm(a2, b2)), fm(a3, b1))));
+        const r1 = fa(fa(fm(a0, b1), fm(a1, b0)), fm(W, fa(fm(a2, b3), fm(a3, b2))));
+        const r2 = fa(fa(fa(fm(a0, b2), fm(a1, b1)), fm(a2, b0)), fm(W, fm(a3, b3)));
+        const r3 = fa(fa(fa(fm(a0, b3), fm(a1, b2)), fm(a2, b1)), fm(a3, b0));
+        const components = [r0, r1, r2, r3];
+        const idx = parseInt(funcName.slice(-1));
+        return { kind: 'bigint', value: components[idx]! };
+      }
+      case 'bbExt4Inv0': case 'bbExt4Inv1': case 'bbExt4Inv2': case 'bbExt4Inv3': {
+        const p = 2013265921n;
+        const W = 11n;
+        const a0 = this.toBigInt(args[0]!), a1 = this.toBigInt(args[1]!);
+        const a2 = this.toBigInt(args[2]!), a3 = this.toBigInt(args[3]!);
+        const fm = (x: bigint, y: bigint) => (x * y) % p;
+        const fa = (x: bigint, y: bigint) => (x + y) % p;
+        const fs = (x: bigint, y: bigint) => ((x - y) % p + p) % p;
+        const finv = (a: bigint): bigint => {
+          let result = 1n, base = ((a % p) + p) % p, exp = p - 2n;
+          while (exp > 0n) {
+            if (exp & 1n) result = (result * base) % p;
+            base = (base * base) % p;
+            exp >>= 1n;
+          }
+          return result;
+        };
+        // Tower of quadratic extensions
+        const norm0 = fs(fa(fm(a0, a0), fm(W, fm(a2, a2))), fm(2n * W % p, fm(a1, a3)));
+        const norm1 = fs(fs(fm(2n, fm(a0, a2)), fm(a1, a1)), fm(W, fm(a3, a3)));
+        const det = fs(fm(norm0, norm0), fm(W, fm(norm1, norm1)));
+        const scalar = finv(det);
+        const invN0 = fm(norm0, scalar);
+        const invN1 = fm(fs(0n, norm1), scalar); // -norm1 * scalar
+        // quad_mul for even part: (a0, a2) * (invN0, invN1)
+        const even0 = fa(fm(a0, invN0), fm(W, fm(a2, invN1)));
+        const even1 = fa(fm(a0, invN1), fm(a2, invN0));
+        // quad_mul for odd part: (a1, a3) * (invN0, invN1), then negate
+        // odd0 = a1*invN0 + W*a3*invN1, odd1 = a1*invN1 + a3*invN0
+        // r1 = -odd0, r3 = -odd1  (from: result = even - odd*X)
+        const odd0 = fa(fm(a1, invN0), fm(W, fm(a3, invN1)));
+        const odd1 = fa(fm(a1, invN1), fm(a3, invN0));
+        const r1 = fs(0n, odd0); // negate
+        const r3 = fs(0n, odd1); // negate
+        const components = [even0, r1, even1, r3];
+        const idx = parseInt(funcName.slice(-1));
+        return { kind: 'bigint', value: components[idx]! };
+      }
+
+      // Merkle proof verification
+      case 'merkleRootSha256':
+      case 'merkleRootHash256': {
+        const leaf = this.toBytes(args[0]!);
+        const proof = this.toBytes(args[1]!);
+        const index = this.toBigInt(args[2]!);
+        const depth = Number(this.toBigInt(args[3]!));
+        const useSha256 = funcName === 'merkleRootSha256';
+
+        let current = leaf;
+        for (let i = 0; i < depth; i++) {
+          const sibling = proof.subarray(i * 32, (i + 1) * 32);
+          const bit = (index >> BigInt(i)) & 1n;
+          const preimage = new Uint8Array(64);
+          if (bit === 1n) {
+            preimage.set(sibling, 0);
+            preimage.set(current, 32);
+          } else {
+            preimage.set(current, 0);
+            preimage.set(sibling, 32);
+          }
+          const h1 = createHash('sha256').update(preimage).digest();
+          current = useSha256
+            ? new Uint8Array(h1)
+            : new Uint8Array(createHash('sha256').update(h1).digest());
+        }
+        return { kind: 'bytes', value: current };
       }
 
       default: {
@@ -1203,6 +1461,169 @@ function decodeScriptNumberLocal(bytes: Uint8Array): bigint {
 }
 
 // ---------------------------------------------------------------------------
+// P-256 ECDSA verification helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Verify a P-256 ECDSA signature using Node.js crypto.
+ *
+ * @param msg - The raw message bytes that were signed (hashed internally by the
+ *   P-256 codegen as SHA-256 before calling OP_CHECKSIG equivalent)
+ * @param rawSig - 64-byte raw r||s signature
+ * @param compressedPub - 33-byte compressed P-256 public key
+ */
+function verifyECDSA_P256_impl(
+  msg: Uint8Array,
+  rawSig: Uint8Array,
+  compressedPub: Uint8Array,
+): boolean {
+  try {
+    // Convert raw r||s (64 bytes) to DER for Node.js verify()
+    const r = rawSig.subarray(0, 32);
+    const s = rawSig.subarray(32, 64);
+
+    function encodeDERInt(bytes: Uint8Array): Uint8Array {
+      let start = 0;
+      while (start < bytes.length - 1 && bytes[start] === 0) start++;
+      const trimmed = bytes.subarray(start);
+      if ((trimmed[0]! & 0x80) !== 0) {
+        const padded = new Uint8Array(trimmed.length + 1);
+        padded.set(trimmed, 1);
+        return padded;
+      }
+      return trimmed;
+    }
+
+    const rDER = encodeDERInt(r);
+    const sDER = encodeDERInt(s);
+    const seqLen = 2 + rDER.length + 2 + sDER.length;
+    const der = new Uint8Array(2 + seqLen);
+    let off = 0;
+    der[off++] = 0x30;
+    der[off++] = seqLen;
+    der[off++] = 0x02;
+    der[off++] = rDER.length;
+    der.set(rDER, off); off += rDER.length;
+    der[off++] = 0x02;
+    der[off++] = sDER.length;
+    der.set(sDER, off);
+
+    // Build SPKI DER for the compressed P-256 key (33 bytes).
+    // SEQUENCE { SEQUENCE { OID id-ecPublicKey, OID prime256v1 },
+    //            BIT STRING { 0x00, compressedKey[33] } }
+    // Outer length = 19 (alg) + 2 (BIT STRING header) + 1 (unused bits) + 33 = 57 = 0x39
+    // BIT STRING length = 1 (unused) + 33 = 34 = 0x22
+    const spkiPrefix = new Uint8Array([
+      0x30, 0x39, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
+      0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
+      0x22, 0x00,
+    ]);
+    const spki = new Uint8Array(spkiPrefix.length + compressedPub.length);
+    spki.set(spkiPrefix);
+    spki.set(compressedPub, spkiPrefix.length);
+
+    const pubKeyObj = createPublicKey({ key: Buffer.from(spki), format: 'der', type: 'spki' });
+    const verifier = createVerify('SHA256');
+    verifier.update(Buffer.from(msg));
+    return verifier.verify(pubKeyObj, Buffer.from(der));
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P-384 ECDSA verification helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Verify a P-384 ECDSA signature using Node.js crypto.
+ *
+ * @param msg - The raw message bytes that were signed (hashed internally by the
+ *   P-384 codegen as SHA-256 before verification — matching P-256 behaviour)
+ * @param rawSig - 96-byte raw r||s signature
+ * @param compressedPub - 49-byte compressed P-384 public key (02/03 + x[48])
+ */
+function verifyECDSA_P384_impl(
+  msg: Uint8Array,
+  rawSig: Uint8Array,
+  compressedPub: Uint8Array,
+): boolean {
+  try {
+    // Convert raw r||s (96 bytes) to DER for Node.js verify()
+    const r = rawSig.subarray(0, 48);
+    const s = rawSig.subarray(48, 96);
+
+    function encodeDERInt(bytes: Uint8Array): Uint8Array {
+      let start = 0;
+      while (start < bytes.length - 1 && bytes[start] === 0) start++;
+      const trimmed = bytes.subarray(start);
+      if ((trimmed[0]! & 0x80) !== 0) {
+        const padded = new Uint8Array(trimmed.length + 1);
+        padded.set(trimmed, 1);
+        return padded;
+      }
+      return trimmed;
+    }
+
+    const rDER = encodeDERInt(r);
+    const sDER = encodeDERInt(s);
+    const seqLen = 2 + rDER.length + 2 + sDER.length;
+    // For P-384 signatures the full DER SEQUENCE length often exceeds 127
+    // bytes, which requires the long-form ASN.1 length encoding (0x81 <len>).
+    let der: Uint8Array;
+    if (seqLen < 128) {
+      der = new Uint8Array(2 + seqLen);
+      let off = 0;
+      der[off++] = 0x30;
+      der[off++] = seqLen;
+      der[off++] = 0x02;
+      der[off++] = rDER.length;
+      der.set(rDER, off); off += rDER.length;
+      der[off++] = 0x02;
+      der[off++] = sDER.length;
+      der.set(sDER, off);
+    } else {
+      der = new Uint8Array(3 + seqLen);
+      let off = 0;
+      der[off++] = 0x30;
+      der[off++] = 0x81;
+      der[off++] = seqLen;
+      der[off++] = 0x02;
+      der[off++] = rDER.length;
+      der.set(rDER, off); off += rDER.length;
+      der[off++] = 0x02;
+      der[off++] = sDER.length;
+      der.set(sDER, off);
+    }
+
+    // Build SPKI DER for the compressed P-384 key (49 bytes).
+    // SEQUENCE { SEQUENCE { OID id-ecPublicKey (06 07 2a 86 48 ce 3d 02 01),
+    //                       OID secp384r1      (06 05 2b 81 04 00 22) },
+    //            BIT STRING { 0x00 (unused), compressedKey[49] } }
+    // AlgorithmIdentifier inner length = 9 + 7 = 16 = 0x10
+    // BIT STRING content length = 1 (unused) + 49 = 50 = 0x32
+    // Outer length = 2 (AlgId SEQ header) + 16 (AlgId content) + 2 (BIT STRING header) + 50 = 70 = 0x46
+    const spkiPrefix = new Uint8Array([
+      0x30, 0x46,
+      0x30, 0x10,
+      0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+      0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22,
+      0x03, 0x32, 0x00,
+    ]);
+    const spki = new Uint8Array(spkiPrefix.length + compressedPub.length);
+    spki.set(spkiPrefix);
+    spki.set(compressedPub, spkiPrefix.length);
+
+    const pubKeyObj = createPublicKey({ key: Buffer.from(spki), format: 'der', type: 'spki' });
+    const verifier = createVerify('SHA256');
+    verifier.update(Buffer.from(msg));
+    return verifier.verify(pubKeyObj, Buffer.from(der));
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
 
@@ -1333,6 +1754,10 @@ function ecNegateImpl(pt: Uint8Array): Uint8Array {
 
 function ecOnCurveImpl(pt: Uint8Array): boolean {
   const [x, y] = ecDecodePoint(pt);
+  // GAP-301: reject non-canonical coordinate encodings (x ≥ p or y ≥ p) to
+  // match the compiled script, which range-checks the coordinates before the
+  // field arithmetic reduces them mod p.
+  if (x >= EC_P || y >= EC_P) return false;
   const lhs = ecMod(y * y, EC_P);
   const rhs = ecMod(x * x * x + 7n, EC_P);
   return lhs === rhs;
@@ -1376,10 +1801,11 @@ const BLAKE3_IV_WORDS = [
 
 const BLAKE3_IV_BYTES = new Uint8Array(32);
 for (let i = 0; i < 8; i++) {
-  BLAKE3_IV_BYTES[i * 4] = (BLAKE3_IV_WORDS[i]! >>> 24) & 0xff;
-  BLAKE3_IV_BYTES[i * 4 + 1] = (BLAKE3_IV_WORDS[i]! >>> 16) & 0xff;
-  BLAKE3_IV_BYTES[i * 4 + 2] = (BLAKE3_IV_WORDS[i]! >>> 8) & 0xff;
-  BLAKE3_IV_BYTES[i * 4 + 3] = BLAKE3_IV_WORDS[i]! & 0xff;
+  // Little-endian (standard BLAKE3): the CV/IV words are LE-encoded bytes.
+  BLAKE3_IV_BYTES[i * 4] = BLAKE3_IV_WORDS[i]! & 0xff;
+  BLAKE3_IV_BYTES[i * 4 + 1] = (BLAKE3_IV_WORDS[i]! >>> 8) & 0xff;
+  BLAKE3_IV_BYTES[i * 4 + 2] = (BLAKE3_IV_WORDS[i]! >>> 16) & 0xff;
+  BLAKE3_IV_BYTES[i * 4 + 3] = (BLAKE3_IV_WORDS[i]! >>> 24) & 0xff;
 }
 
 const BLAKE3_MSG_PERM = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
@@ -1417,22 +1843,22 @@ function blake3Round(s: number[], m: number[]): void {
  * BLAKE3 single-block compression. Matches the on-chain codegen which
  * hardcodes blockLen=64, counter=0, flags=11 (CHUNK_START|CHUNK_END|ROOT).
  */
-function blake3CompressImpl(cv: Uint8Array, block: Uint8Array): Uint8Array {
-  // Parse chaining value as 8 big-endian u32 words
+function blake3CompressImpl(cv: Uint8Array, block: Uint8Array, blockLen = 64): Uint8Array {
+  // Parse chaining value as 8 little-endian u32 words (standard BLAKE3)
   const h: number[] = [];
   for (let i = 0; i < 8; i++) {
     h.push(
-      ((cv[i * 4]! << 24) | (cv[i * 4 + 1]! << 16) |
-       (cv[i * 4 + 2]! << 8) | cv[i * 4 + 3]!) >>> 0,
+      (cv[i * 4]! | (cv[i * 4 + 1]! << 8) |
+       (cv[i * 4 + 2]! << 16) | (cv[i * 4 + 3]! << 24)) >>> 0,
     );
   }
 
-  // Parse block as 16 big-endian u32 words
+  // Parse block as 16 little-endian u32 words
   const m: number[] = [];
   for (let i = 0; i < 16; i++) {
     m.push(
-      ((block[i * 4]! << 24) | (block[i * 4 + 1]! << 16) |
-       (block[i * 4 + 2]! << 8) | block[i * 4 + 3]!) >>> 0,
+      (block[i * 4]! | (block[i * 4 + 1]! << 8) |
+       (block[i * 4 + 2]! << 16) | (block[i * 4 + 3]! << 24)) >>> 0,
     );
   }
 
@@ -1441,10 +1867,10 @@ function blake3CompressImpl(cv: Uint8Array, block: Uint8Array): Uint8Array {
     h[0]!, h[1]!, h[2]!, h[3]!,
     h[4]!, h[5]!, h[6]!, h[7]!,
     BLAKE3_IV_WORDS[0]!, BLAKE3_IV_WORDS[1]!, BLAKE3_IV_WORDS[2]!, BLAKE3_IV_WORDS[3]!,
-    0,  // counter low
-    0,  // counter high
-    64, // blockLen
-    11, // flags = CHUNK_START | CHUNK_END | ROOT
+    0,          // counter low
+    0,          // counter high
+    blockLen,   // blockLen (real message length for blake3Hash; 64 for full-block compress)
+    11,         // flags = CHUNK_START | CHUNK_END | ROOT
   ];
 
   // 7 rounds with message permutation between rounds
@@ -1454,14 +1880,14 @@ function blake3CompressImpl(cv: Uint8Array, block: Uint8Array): Uint8Array {
     if (r < 6) msg = BLAKE3_MSG_PERM.map(i => msg[i]!);
   }
 
-  // Output: XOR first 8 with last 8, encode as big-endian bytes
+  // Output: XOR first 8 with last 8, encode as little-endian bytes (standard BLAKE3)
   const out = new Uint8Array(32);
   for (let i = 0; i < 8; i++) {
     const w = (state[i]! ^ state[i + 8]!) >>> 0;
-    out[i * 4] = (w >>> 24) & 0xff;
-    out[i * 4 + 1] = (w >>> 16) & 0xff;
-    out[i * 4 + 2] = (w >>> 8) & 0xff;
-    out[i * 4 + 3] = w & 0xff;
+    out[i * 4] = w & 0xff;
+    out[i * 4 + 1] = (w >>> 8) & 0xff;
+    out[i * 4 + 2] = (w >>> 16) & 0xff;
+    out[i * 4 + 3] = (w >>> 24) & 0xff;
   }
   return out;
 }

@@ -31,6 +31,11 @@ import type {
   BinOp,
   ANFUnaryOp,
 } from '../ir/index.js';
+import { computeSideEffectSummary, continuationShape } from './side-effect-summary.js';
+import type { SideEffectSummary } from './side-effect-summary.js';
+import { SIGHASH_DEFAULT } from './sighash-directive.js';
+import type { MethodNode, PropertyNode } from '../ir/runar-ast.js';
+import { UnknownANFKindError } from 'runar-ir-schema';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -104,8 +109,26 @@ function extractLiteralValue(expr: Expression): string | bigint | boolean | unde
 function lowerMethods(contract: ContractNode): ANFMethod[] {
   const result: ANFMethod[] = [];
 
+  // Single source of truth for "does this method (transitively) mutate
+  // state, emit outputs, or use the preimage?" Shared with the artifact
+  // assembler so ABI declarations cannot drift from ANF auto-injection.
+  const sideEffects = computeSideEffectSummary(contract);
+
+  // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+  // must survive DCE into the locking script. A readonly field no method
+  // references lowers to no `load_prop`, so no constructor slot is emitted
+  // and the field's deploy-time bytes vanish. We inject a `load_prop` + a
+  // `@ref:` alias (the exact shape the `const _bind = this.field;` idiom
+  // produces) into the first public method's body — the alias keeps the
+  // `load_prop` alive through dead-binding DCE, and stack lowering threads
+  // the pushed value through and cleans it up (OP_NIP) at method end. One
+  // slot in the deployed script suffices; every spending branch shares it.
+  const embedFields = contract.properties.filter(p => p.readonly && p.embedAlways);
+  let embedInjected = false;
+
   // Lower constructor
-  const ctorCtx = new LoweringContext(contract);
+  const ctorCtx = new LoweringContext(contract, sideEffects);
+  ctorCtx.setMethodParamTypes(contract.constructor.params);
   lowerStatements(contract.constructor.body, ctorCtx);
   result.push({
     name: 'constructor',
@@ -116,31 +139,77 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
 
   // Lower each method
   for (const method of contract.methods) {
-    const methodCtx = new LoweringContext(contract);
+    const methodCtx = new LoweringContext(contract, sideEffects);
+    methodCtx.setMethodParamTypes(method.params);
+    // Issue #123: non-default @sighash mode drives the OP_PUSH_TX binding flag
+    // for any checkPreimage (auto-injected below, or a manual call) in this method.
+    if (method.sighashType !== undefined && method.sighashType !== SIGHASH_DEFAULT) {
+      methodCtx.sighashFlag = method.sighashType;
+    }
+
+    // Register the declared param NAMES so a bare identifier resolves to
+    // `load_param` before falling through to `load_prop` (issue #130). Without
+    // this, a param whose name collides with a mutable state property lowered
+    // to the stale deserialized property value instead of the witness param.
+    // Explicit `this.x` is unaffected: it lowers via lowerMemberExpr, which
+    // always emits `load_prop` regardless of param registration.
+    for (const p of method.params) {
+      methodCtx.addParam(p.name);
+    }
 
     if (contract.parentClass === 'StatefulSmartContract' && method.visibility === 'public') {
-      // Determine if this method verifies hashOutputs (needs change output support).
-      // Methods that use addOutput or mutate state need hashOutputs verification.
-      // Non-mutating methods (like close/destroy) don't verify outputs.
-      const needsChangeOutput = methodMutatesState(method, contract) || methodHasAddOutput(method);
+      // Continuation requirements come from the side-effect summary,
+      // which walks the private-method call graph. A public method that
+      // calls a private helper which mutates state or emits an output
+      // must therefore inject the same continuation params as if the
+      // public body did so directly.
+      const effects = sideEffects.get(method.name) ?? { mutatesState: false, hasStateOutput: false, hasDataOutput: false, usesPreimage: false };
+      const shape = continuationShape(effects);
+      const needsChangeOutput = shape.needsChange;
 
-      // Register implicit parameters
+      // Register implicit parameters (with types, so the method-scoped
+      // type table — issue #34 — knows them for byte-type analysis).
       if (needsChangeOutput) {
-        methodCtx.addParam('_changePKH');
-        methodCtx.addParam('_changeAmount');
+        methodCtx.addParam('_changePKH', 'Ripemd160');
+        methodCtx.addParam('_changeAmount', 'bigint');
       }
       // Single-output continuation needs _newAmount to allow changing the UTXO satoshis.
       // Multi-output (addOutput) methods already specify amounts explicitly per output.
-      const needsNewAmount = methodMutatesState(method, contract) && !methodHasAddOutput(method);
+      // Methods that emit only data outputs (no addOutput) still run the single-output
+      // continuation path for their state continuation, so they also need _newAmount.
+      const needsNewAmount = shape.needsNewAmount;
       if (needsNewAmount) {
-        methodCtx.addParam('_newAmount');
+        methodCtx.addParam('_newAmount', 'bigint');
       }
-      methodCtx.addParam('txPreimage');
+      methodCtx.addParam('txPreimage', 'SigHashPreimage');
+
+      // Issue #123: the declared per-method sighash mode (default ALL|FORKID).
+      // Drives BOTH the OP_PUSH_TX binding flag (so the derived sig re-computes
+      // the tx sighash under this mode) AND the runtime preimage-type assert.
+      const sighashMode = method.sighashType ?? SIGHASH_DEFAULT;
+      const isDefaultSighash = sighashMode === SIGHASH_DEFAULT;
 
       // Inject checkPreimage(txPreimage) at the start
       const preimageRef = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
-      const checkResult = methodCtx.emit({ kind: 'check_preimage', preimage: preimageRef });
+      const checkResult = methodCtx.emit({
+        kind: 'check_preimage',
+        preimage: preimageRef,
+        // Omit for the default so the ANF (and pinned binding blob) is unchanged.
+        ...(isDefaultSighash ? {} : { sighashFlag: sighashMode }),
+      });
       methodCtx.emit({ kind: 'assert', value: checkResult });
+
+      // GAP-302 / #123: pin the sighash type to the declared mode. The
+      // auto-injected covenant verifies a real tx preimage, but without this
+      // check the spend could use a DIFFERENT sighash flag than declared that
+      // zeroes out preimage fields the contract (or its continuation) relies on
+      // (hashOutputs / hashPrevouts / hashSequence). The value defaults to 0x41
+      // (SIGHASH_ALL|FORKID) so existing contracts emit byte-identical ANF.
+      const sigHashPreimageRef = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
+      const sigHashTypeRef = methodCtx.emit({ kind: 'call', func: 'extractSigHashType', args: [sigHashPreimageRef] });
+      const expectedSigHashRef = methodCtx.emit({ kind: 'load_const', value: BigInt(sighashMode) });
+      const sigHashOkRef = methodCtx.emit({ kind: 'bin_op', op: '===', left: sigHashTypeRef, right: expectedSigHashRef });
+      methodCtx.emit({ kind: 'assert', value: sigHashOkRef });
 
       // Deserialize mutable state from the preimage's scriptCode.
       const stateProps = contract.properties.filter(p => p.kind === 'property' && !p.readonly);
@@ -149,41 +218,118 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
         methodCtx.emit({ kind: 'deserialize_state', preimage: preimageRef3 });
       }
 
+      // Issue #109: preserve @embedAlways fields at the first user-statement
+      // position (after the checkPreimage/deserialize preamble), mirroring
+      // where a `const _bind = this.field;` idiom would sit.
+      if (!embedInjected && embedFields.length > 0) {
+        emitEmbedAlwaysPreservation(methodCtx, embedFields);
+        embedInjected = true;
+      }
+
       // Lower the developer's method body
       lowerStatements(method.body, methodCtx);
 
-      // Determine state continuation type
+      // Determine state continuation type.
+      //
+      // === Continuation-hash construction (reference for other compilers) ===
+      //
+      // The auto-injected continuation assertion verifies that the spending
+      // transaction's hashOutputs field matches a compiler-constructed hash
+      // over the outputs this method declares. Outputs are concatenated in
+      // the following order before hashing with hash256:
+      //
+      //   1. state outputs       (from this.addOutput / this.addRawOutput,
+      //                           tracked via addOutputRef)
+      //   2. data outputs        (from this.addDataOutput, tracked via
+      //                           addDataOutputRef) — NEW
+      //   3. change output       (P2PKH to _changePKH, value = _changeAmount)
+      //
+      // For the "single-output" fast path (no addOutput used, but state is
+      // mutated), the state output is computed on the fly from
+      // (preimage, stateScript, _newAmount) instead of coming from
+      // addOutputRefs. Data outputs may still be declared in this mode and
+      // are inserted BETWEEN the single state output and the change output.
+      //
+      // If no state output and no data output is present, the legacy
+      // single-output path applies (no data-output insertion needed).
       const addOutputRefs = methodCtx.getAddOutputRefs();
-      if (addOutputRefs.length > 0 || methodMutatesState(method, contract)) {
-        // Build the P2PKH change output for hashOutputs verification
+      const addDataOutputRefs = methodCtx.getAddDataOutputRefs();
+      // Gate the continuation assertion on the same shape used for
+      // param injection. Both must agree or the deployed locking
+      // script will not match the ABI's declared parameter list.
+      //
+      // Private-helper outputs ARE seen here: a public method that
+      // delegates `addOutput` / `addRawOutput` / `addDataOutput` to a
+      // private helper has that helper inlined into its binding stream
+      // at ANF time (driven by `computeSideEffectSummary` above and
+      // `inlinePrivateMethodCall`), so the helper's `add_output` /
+      // `add_data_output` ANF nodes register on this context's
+      // `addOutputRefs` / `addDataOutputRefs` lists before the
+      // continuation hash is built. The continuation therefore commits
+      // to the full runtime output set. Locked in by the all-tier
+      // `private-helper-outputs` conformance fixture (its `partition`
+      // and `log` methods route outputs through private helpers).
+      if (needsChangeOutput) {
+        // Build the P2PKH change output for hashOutputs verification.
+        //
+        // Issue #116: the SDK's buildCallTransaction OMITS the change output
+        // when `change <= 0` (an exact-cover call) and passes `_changeAmount =
+        // 0`. Gate the change segment on `_changeAmount != 0` at runtime so the
+        // hashed output set matches the SDK at the exact-zero boundary — the
+        // segment is the P2PKH change output when non-zero, and empty bytes
+        // (cat with empty is a no-op) when zero, reproducing the omission. For
+        // any change > 0 the hashed bytes are unchanged; only the emitted
+        // script gains the guard.
         const changePKHRef = methodCtx.emit({ kind: 'load_param', name: '_changePKH' });
         const changeAmountRef = methodCtx.emit({ kind: 'load_param', name: '_changeAmount' });
-        const changeOutputRef = methodCtx.emit({ kind: 'call', func: 'buildChangeOutput', args: [changePKHRef, changeAmountRef] });
+        const zeroRef = methodCtx.emit({ kind: 'load_const', value: 0n });
+        const changeNonZeroRef = methodCtx.emit({ kind: 'bin_op', op: '!==', left: changeAmountRef, right: zeroRef });
+        const changeThenCtx = methodCtx.subContext();
+        changeThenCtx.emit({ kind: 'call', func: 'buildChangeOutput', args: [changePKHRef, changeAmountRef] });
+        methodCtx.syncCounter(changeThenCtx);
+        const changeElseCtx = methodCtx.subContext();
+        changeElseCtx.emit({ kind: 'load_const', value: '' });
+        methodCtx.syncCounter(changeElseCtx);
+        const changeOutputRef = methodCtx.emit({
+          kind: 'if',
+          cond: changeNonZeroRef,
+          then: changeThenCtx.bindings,
+          else: changeElseCtx.bindings,
+        });
 
         if (addOutputRefs.length > 0) {
-          // Multi-output continuation: concat all outputs + change output, hash
+          // Multi-output continuation: concat all state outputs, then all
+          // data outputs, then change output, then hash.
           let accumulated = addOutputRefs[0]!;
           for (let i = 1; i < addOutputRefs.length; i++) {
             accumulated = methodCtx.emit({ kind: 'call', func: 'cat', args: [accumulated, addOutputRefs[i]!] });
+          }
+          for (const dataRef of addDataOutputRefs) {
+            accumulated = methodCtx.emit({ kind: 'call', func: 'cat', args: [accumulated, dataRef] });
           }
           accumulated = methodCtx.emit({ kind: 'call', func: 'cat', args: [accumulated, changeOutputRef] });
           const hashRef = methodCtx.emit({ kind: 'call', func: 'hash256', args: [accumulated] });
           const preimageRef2 = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
           const outputHashRef = methodCtx.emit({ kind: 'call', func: 'extractOutputHash', args: [preimageRef2] });
           const eqRef = methodCtx.emit({ kind: 'bin_op', op: '===', left: hashRef, right: outputHashRef, result_type: 'bytes' });
-          methodCtx.emit({ kind: 'assert', value: eqRef });
+          methodCtx.emit({ kind: 'assert', value: eqRef, isAutoInjectedStateCheck: true });
         } else {
-          // Single-output continuation: build raw output bytes, concat with change, hash
+          // Single-output continuation: build raw output bytes, then splice in
+          // any declared data outputs, then concat with change, then hash.
           const stateScriptRef = methodCtx.emit({ kind: 'get_state_script' });
           const preimageRef2 = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
           const newAmountRef = methodCtx.emit({ kind: 'load_param', name: '_newAmount' });
           const contractOutputRef = methodCtx.emit({ kind: 'call', func: 'computeStateOutput', args: [preimageRef2, stateScriptRef, newAmountRef] });
-          const allOutputs = methodCtx.emit({ kind: 'call', func: 'cat', args: [contractOutputRef, changeOutputRef] });
+          let accumulated = contractOutputRef;
+          for (const dataRef of addDataOutputRefs) {
+            accumulated = methodCtx.emit({ kind: 'call', func: 'cat', args: [accumulated, dataRef] });
+          }
+          const allOutputs = methodCtx.emit({ kind: 'call', func: 'cat', args: [accumulated, changeOutputRef] });
           const hashRef = methodCtx.emit({ kind: 'call', func: 'hash256', args: [allOutputs] });
           const preimageRef4 = methodCtx.emit({ kind: 'load_param', name: 'txPreimage' });
           const outputHashRef = methodCtx.emit({ kind: 'call', func: 'extractOutputHash', args: [preimageRef4] });
           const eqRef = methodCtx.emit({ kind: 'bin_op', op: '===', left: hashRef, right: outputHashRef, result_type: 'bytes' });
-          methodCtx.emit({ kind: 'assert', value: eqRef });
+          methodCtx.emit({ kind: 'assert', value: eqRef, isAutoInjectedStateCheck: true });
         }
       }
 
@@ -204,17 +350,47 @@ function lowerMethods(contract: ContractNode): ANFMethod[] {
         { kind: 'param', name: 'txPreimage', type: { kind: 'primitive_type', name: 'SigHashPreimage' } },
       );
 
+      // Intent-covenant intrinsic auto-injected witness params:
+      // extractPrevOutputScript adds `_prevOutScript_<inputIndex>` (one per
+      // distinct literal index referenced in the method); requireOutputP2PKH
+      // adds a single `_serialisedOutputs`. Order follows insertion order
+      // via methodScope.autoInjectedParams. Appended AFTER txPreimage so
+      // unlocking scripts push them adjacent to the preimage (matches the
+      // existing _changePKH / _changeAmount / _newAmount convention of
+      // trailing the user args before the preimage anchor).
+      const finalParams = lowerParams(augmentedParams);
+      for (const p of methodCtx.methodScope.autoInjectedParams) {
+        finalParams.push(p);
+      }
+
       result.push({
         name: method.name,
-        params: lowerParams(augmentedParams),
+        params: finalParams,
         body: methodCtx.bindings,
         isPublic: true,
       });
     } else {
+      // Issue #109: stateless public methods (and stateless contracts'
+      // spending entry points) are lowered here — inject @embedAlways
+      // preservation into the first PUBLIC one before its body.
+      if (!embedInjected && embedFields.length > 0 && method.visibility === 'public') {
+        emitEmbedAlwaysPreservation(methodCtx, embedFields);
+        embedInjected = true;
+      }
       lowerStatements(method.body, methodCtx);
+      // Private methods can also call the intent intrinsics; capture
+      // their auto-injected witness params. Public callers that inline
+      // this private pick them up via the shared methodScope (see
+      // inlinePrivateMethodCall), so the auto-injection registers at
+      // the public method's ABI augmentation step above. The private's
+      // own ABI is still informative for non-inlined callees.
+      const params = lowerParams(method.params);
+      for (const p of methodCtx.methodScope.autoInjectedParams) {
+        params.push(p);
+      }
       result.push({
         name: method.name,
-        params: lowerParams(method.params),
+        params,
         body: methodCtx.bindings,
         isPublic: method.visibility === 'public',
       });
@@ -231,26 +407,116 @@ function lowerParams(params: ParamNode[]): ANFParam[] {
   }));
 }
 
+/**
+ * Issue #109: emit the DCE-surviving preservation pair for each
+ * `@embedAlways` readonly field, into the given (public) method context.
+ *
+ * Reproduces exactly what a hand-written `const _bind = this.field;` lowers
+ * to: a `load_prop` followed by a `load_const("@ref:<t>")` alias. The alias
+ * marks the `load_prop` as referenced (see `collectRefsFromValue` in
+ * `optimizer/dce.ts`), so dead-binding DCE keeps it; stack lowering then
+ * emits the field's constructor-slot placeholder and NIPs the unused value
+ * off the stack at method end. The field's bytes therefore remain in the
+ * deployed locking script for downstream recovery.
+ */
+function emitEmbedAlwaysPreservation(ctx: LoweringContext, fields: PropertyNode[]): void {
+  for (const field of fields) {
+    const loadRef = ctx.emit({ kind: 'load_prop', name: field.name });
+    ctx.emitNamed(`__embedAlways_${field.name}`, {
+      kind: 'load_const',
+      value: `@ref:${loadRef}`,
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Lowering context: manages temp variable generation
 // ---------------------------------------------------------------------------
+
+/**
+ * Per-method bookkeeping shared by a public method's top-level
+ * LoweringContext and every sub-context it spawns (if/else, ternary,
+ * inlined private bodies). Tracks the witness parameters that the
+ * intent-covenant intrinsics (extractPrevOutputScript,
+ * requireOutputP2PKH) auto-inject into the method's ABI regardless of
+ * which nested scope the intrinsic call lives in. Mirrors Go's
+ * methodScopeT.
+ */
+class MethodScope {
+  /** Append-only, insertion order. */
+  readonly autoInjectedParams: ANFParam[] = [];
+  /** Dedup set keyed by param name. */
+  private readonly autoInjectedSet: Set<string> = new Set();
+  /**
+   * Idempotency flag: requireOutputP2PKH emits its
+   * `hash256(_serialisedOutputs) === extractOutputHash(txPreimage)`
+   * check at most once per method body, even if called multiple times.
+   */
+  didEmitHashOutputsCheck = false;
+
+  /** Idempotent — second call with the same name is a no-op. */
+  recordAutoInjectedParam(name: string, type: string): void {
+    if (this.autoInjectedSet.has(name)) return;
+    this.autoInjectedSet.add(name);
+    this.autoInjectedParams.push({ name, type });
+  }
+}
 
 class LoweringContext {
   bindings: ANFBinding[] = [];
   private counter = 0;
   private readonly contract: ContractNode;
   private readonly paramNames: Set<string> = new Set();
+  /**
+   * Param types for the CURRENT method being lowered, keyed by name.
+   * Method-scoped (not contract-scoped) so a parameter named `x` in one
+   * method does not bleed into the byte-type analysis of a different
+   * method's same-named local. See issue #34.
+   */
+  private readonly methodParamTypes: Map<string, string> = new Map();
   private readonly localNames: Set<string> = new Set();
   private readonly localByteVars: Set<string> = new Set();
   private readonly _addOutputRefs: string[] = [];
+  private readonly _addDataOutputRefs: string[] = [];
+  /**
+   * Per-method state shared with all sub-contexts via the same object
+   * reference, so an auto-injection that fires inside an if-branch
+   * still registers on the parent method's ABI augmentation list.
+   */
+  methodScope: MethodScope = new MethodScope();
+  /**
+   * Issue #123: the declared non-default `@sighash` flag for the method being
+   * lowered, so a MANUAL `checkPreimage(pre)` call (stateless / explicit) binds
+   * under the same mode as the method's declared sighash. `undefined` = default
+   * ALL|FORKID, keeping the pinned binding blob unchanged.
+   */
+  sighashFlag: number | undefined;
   /** Maps local variable names to their current ANF binding name.
    *  Updated after if-statements that reassign locals in both branches. */
   private readonly localAliases: Map<string, string> = new Map();
+  /**
+   * Param substitution stack used when inlining a private method's body
+   * directly into this context. Entry on top is the active alias for
+   * the named param. When the inlined body references that param, the
+   * lowered identifier resolves to the aliased ref instead of emitting
+   * a `load_param`. Stacked so nested inlines compose correctly.
+   */
+  private readonly paramAliasStack: Map<string, string[]> = new Map();
+  /**
+   * Side-effect summary shared with the assembler. Used at lowering time
+   * to decide whether a `this.privateHelper(...)` call should inline its
+   * body into the caller's context (so that the helper's
+   * `add_output`/`add_data_output` ANF nodes register output refs on the
+   * caller's continuation hash) or remain a `method_call` for stack
+   * lowering to inline later.
+   */
+  private readonly sideEffects: SideEffectSummary | null;
   /** Debug: source location to attach to emitted ANF bindings. */
   currentSourceLoc: { file: string; line: number; column: number } | undefined;
 
-  constructor(contract: ContractNode) {
+  constructor(contract: ContractNode, sideEffects: SideEffectSummary | null = null) {
     this.contract = contract;
+    this.sideEffects = sideEffects;
   }
 
   /** Generate a fresh temporary name. */
@@ -274,9 +540,21 @@ class LoweringContext {
     this.bindings.push(binding);
   }
 
-  /** Record a parameter name so we know to use load_param for it. */
-  addParam(name: string): void {
+  /** Record a parameter name so we know to use load_param for it.
+   *  Optionally records the param's type in the method-scoped type table. */
+  addParam(name: string, type?: string): void {
     this.paramNames.add(name);
+    if (type !== undefined) this.methodParamTypes.set(name, type);
+  }
+
+  /** Record the current method's parameter types in the method-scoped table.
+   *  Must be called once per method/constructor before lowering its body so
+   *  `getParamType` only sees THIS method's params (issue #34). */
+  setMethodParamTypes(params: ParamNode[]): void {
+    this.methodParamTypes.clear();
+    for (const p of params) {
+      this.methodParamTypes.set(p.name, typeNodeToString(p.type));
+    }
   }
 
   /** Record a local variable name so we know it's a local ref. */
@@ -321,6 +599,64 @@ class LoweringContext {
     return this.contract.methods.some(m => m.name === name && m.visibility === 'private');
   }
 
+  /** Look up a private method by name. */
+  getPrivateMethod(name: string): MethodNode | undefined {
+    return this.contract.methods.find(m => m.name === name && m.visibility === 'private');
+  }
+
+  /**
+   * Whether a call to `name` should be ANF-inlined rather than emitted
+   * as a `method_call`. True iff `name` is a private method that
+   * (transitively) emits state outputs (`addOutput` / `addRawOutput`)
+   * or data outputs (`addDataOutput`). Those refs MUST appear in the
+   * caller's binding stream so they participate in the continuation
+   * hash; without ANF-level inlining they would live in a sibling
+   * ANF method and the public method's continuation hash would miss
+   * them.
+   *
+   * Mutation-only private helpers (no output intrinsics) are
+   * intentionally NOT inlined here — state mutation flows through
+   * state continuity (the continuation hash reads state via
+   * `get_state_script` after all mutations apply), not through
+   * output refs. Keeping the existing `method_call` + stack-lowering
+   * inlining path for those preserves byte-equality with the
+   * pre-fix corpus on contracts that mix state-mutating helpers
+   * with public methods that already mutate state directly (e.g.
+   * TicTacToe).
+   */
+  shouldInlinePrivate(name: string): boolean {
+    if (!this.sideEffects) return false;
+    const method = this.getPrivateMethod(name);
+    if (!method) return false;
+    const effects = this.sideEffects.get(name);
+    if (!effects) return false;
+    return effects.hasStateOutput || effects.hasDataOutput;
+  }
+
+  /**
+   * Push a param alias frame. Subsequent identifier lookups for `name`
+   * will resolve to `aliasRef` until the matching pop. Stacked so
+   * nested inlines compose: pop returns the previous frame.
+   */
+  pushParamAlias(name: string, aliasRef: string): void {
+    const stack = this.paramAliasStack.get(name) ?? [];
+    stack.push(aliasRef);
+    this.paramAliasStack.set(name, stack);
+  }
+
+  popParamAlias(name: string): void {
+    const stack = this.paramAliasStack.get(name);
+    if (!stack || stack.length === 0) return;
+    stack.pop();
+    if (stack.length === 0) this.paramAliasStack.delete(name);
+  }
+
+  getParamAlias(name: string): string | undefined {
+    const stack = this.paramAliasStack.get(name);
+    if (!stack || stack.length === 0) return undefined;
+    return stack[stack.length - 1];
+  }
+
   /** Track an addOutput binding ref for multi-output continuation. */
   addOutputRef(ref: string): void {
     this._addOutputRefs.push(ref);
@@ -331,17 +667,24 @@ class LoweringContext {
     return this._addOutputRefs;
   }
 
+  /** Track an addDataOutput binding ref — distinct from state outputs. */
+  addDataOutputRef(ref: string): void {
+    this._addDataOutputRefs.push(ref);
+  }
+
+  /** Get all addDataOutput refs collected during lowering. */
+  getAddDataOutputRefs(): string[] {
+    return this._addDataOutputRefs;
+  }
+
   /** Look up the type of a method parameter by name. Returns the type string or null. */
   getParamType(name: string): string | null {
-    // Search all methods' params for a matching name
-    for (const method of [this.contract.constructor, ...this.contract.methods]) {
-      for (const p of method.params) {
-        if (p.name === name) {
-          return typeNodeToString(p.type);
-        }
-      }
-    }
-    return null;
+    // Restricted to the CURRENT method's parameters (issue #34). A cross-method
+    // lookup poisoned the byte-type analysis when two methods shared a parameter
+    // name (e.g. one method's local `x: bigint` collided with another method's
+    // `x: ByteString` parameter), which flipped `result_type` to 'bytes' and
+    // made stack lowering emit OP_CAT for an integer add.
+    return this.methodParamTypes.get(name) ?? null;
   }
 
   isStatefulContextParam(name: string): boolean {
@@ -364,9 +707,13 @@ class LoweringContext {
     sub.counter = this.counter;
     // Share the parameter, local name sets, and aliases
     for (const p of this.paramNames) sub.paramNames.add(p);
+    for (const [k, v] of this.methodParamTypes) sub.methodParamTypes.set(k, v);
     for (const l of this.localNames) sub.localNames.add(l);
     for (const b of this.localByteVars) sub.localByteVars.add(b);
     for (const [k, v] of this.localAliases) sub.localAliases.set(k, v);
+    // Share the method scope so auto-injection from intrinsics called
+    // inside the nested block bubbles up to the parent's ABI list.
+    sub.methodScope = this.methodScope;
     return sub;
   }
 
@@ -513,6 +860,34 @@ function lowerIfStatement(
   }
   ctx.syncCounter(elseCtx);
 
+  // 2026-04-30 audit finding F2: when a branch contains output
+  // intrinsics (addOutput / addRawOutput / addDataOutput), the
+  // current implementation registered a single `ifName` as the
+  // parent's addOutputRef regardless of how many outputs each branch
+  // produced. That collapsed cardinality and ordering, and for
+  // branches that mixed kinds it left the runtime stack
+  // unbalanced (different number of bindings between then and
+  // else). The fix: at the END of each branch with output refs,
+  // append a cat-chain that concatenates that branch's outputs
+  // (state then data, in declaration order) into a single
+  // bytes-ref. Each branch then leaves exactly one item on the
+  // stack — the concat — and the if-expression's value is the
+  // concat of whichever branch ran. The parent's continuation hash
+  // sees a single addOutputRef whose runtime value already contains
+  // the correctly-ordered output bytes for the chosen branch.
+  const thenOutputRefs = thenCtx.getAddOutputRefs();
+  const elseOutputRefs = elseCtx.getAddOutputRefs();
+  const thenDataRefs = thenCtx.getAddDataOutputRefs();
+  const elseDataRefs = elseCtx.getAddDataOutputRefs();
+  const branchHasOutputs =
+    thenOutputRefs.length > 0 || elseOutputRefs.length > 0
+    || thenDataRefs.length > 0 || elseDataRefs.length > 0;
+
+  if (branchHasOutputs) {
+    appendBranchOutputConcat(thenCtx);
+    appendBranchOutputConcat(elseCtx);
+  }
+
   const ifName = ctx.emit({
     kind: 'if',
     cond: condRef,
@@ -520,14 +895,31 @@ function lowerIfStatement(
     else: elseCtx.bindings,
   });
 
-  // Propagate addOutput refs from sub-contexts: when both branches produce
-  // the same number of addOutput calls, the if-expression result represents
-  // each addOutput (only one branch executes at runtime).
-  const thenOutputRefs = thenCtx.getAddOutputRefs();
-  const elseOutputRefs = elseCtx.getAddOutputRefs();
-  if (thenOutputRefs.length > 0 || elseOutputRefs.length > 0) {
-    // Use the if-expression result as the addOutput ref since only one branch executes
-    ctx.addOutputRef(ifName);
+  if (branchHasOutputs) {
+    // Register the if's value once with the parent's continuation
+    // tracker. Both state and data bytes from the chosen branch are
+    // already concatenated into this single ref in declaration order.
+    //
+    // CRITICAL: pick the right tracker. If either branch produces a
+    // STATE output (addOutput / addRawOutput), the parent must take
+    // the multi-output continuation path, so we register as a state
+    // output ref. If neither branch produces a state output and at
+    // least one branch produces a data output, we register as a DATA
+    // output ref so the parent keeps its single-output
+    // `computeStateOutput` continuation and the data-output bytes
+    // splice in BETWEEN the state output and the change output.
+    //
+    // Without this distinction, a stateful method whose branch
+    // contains only `addDataOutput` was forced onto the multi-output
+    // path — silently dropping the canonical state continuation and
+    // producing an incorrect hashOutputs commitment.
+    const branchHasStateOutput =
+      thenOutputRefs.length > 0 || elseOutputRefs.length > 0;
+    if (branchHasStateOutput) {
+      ctx.addOutputRef(ifName);
+    } else {
+      ctx.addDataOutputRef(ifName);
+    }
   }
 
   // If both branches end by reassigning the same local variable,
@@ -542,13 +934,42 @@ function lowerIfStatement(
   }
 }
 
+/**
+ * Concatenate a branch's collected output refs (state then data, in
+ * declaration order) into a single bytes-ref appended to the
+ * branch's bindings. If the branch has no outputs, emits an empty
+ * `load_const` so the branch still leaves one item on the stack —
+ * required to balance the if's branch shapes.
+ *
+ * Returns the name of the resulting binding (always a binding in
+ * `branchCtx.bindings`).
+ */
+function appendBranchOutputConcat(branchCtx: LoweringContext): string {
+  const allRefs = [
+    ...branchCtx.getAddOutputRefs(),
+    ...branchCtx.getAddDataOutputRefs(),
+  ];
+  if (allRefs.length === 0) {
+    return branchCtx.emit({ kind: 'load_const', value: '' });
+  }
+  if (allRefs.length === 1) {
+    return allRefs[0]!;
+  }
+  let accumulated = allRefs[0]!;
+  for (let i = 1; i < allRefs.length; i++) {
+    accumulated = branchCtx.emit({ kind: 'call', func: 'cat', args: [accumulated, allRefs[i]!] });
+  }
+  return accumulated;
+}
+
 function lowerForStatement(
   stmt: Extract<Statement, { kind: 'for_statement' }>,
   ctx: LoweringContext,
 ): void {
-  // Extract the loop count from the for-statement.
-  // Rúnar requires bounded loops, so we try to determine the count statically.
-  const count = extractLoopCount(stmt);
+  // Resolve the loop's compile-time shape: start value, step direction, and
+  // iteration count. Rúnar requires bounded loops, so all three must be
+  // statically determinable (issue #121).
+  const { start, step, count } = extractLoopShape(stmt);
 
   // Lower body into sub-context
   const bodyCtx = ctx.subContext();
@@ -560,46 +981,88 @@ function lowerForStatement(
     count,
     body: bodyCtx.bindings,
     iterVar: stmt.init.name,
+    start,
+    step,
   });
 }
 
 /**
- * Extract a compile-time loop count from a for statement.
+ * Resolve a for-statement's compile-time loop shape (issue #121).
  *
- * Supports patterns like:
- *   for (let i = 0n; i < 10n; i++)
- *   for (let i: bigint = 0n; i < N; i++)
+ * Supports counting-up and counting-down loops:
+ *   for (let i = 0n; i < 10n; i++)     -> start 0,  step +1, count 10
+ *   for (let i = 1n; i <= 3n; i++)     -> start 1,  step +1, count 3
+ *   for (let i = 3n; i > 0n; i--)      -> start 3,  step -1, count 3
+ *   for (let i = 3n; i >= 1n; i--)     -> start 3,  step -1, count 3
  *
- * Returns the count (number of iterations). Falls back to 0 if
- * the pattern is not recognized.
+ * The loop is unrolled `count` times; on iteration `i` the iterator holds
+ * `start + i * step`. Start and bound must be compile-time integer literals.
  */
-function extractLoopCount(
+function extractLoopShape(
   stmt: Extract<Statement, { kind: 'for_statement' }>,
-): number {
-  // Try to extract start value
-  const startVal = extractBigIntValue(stmt.init.init);
+): { start: bigint; step: 1 | -1; count: number } {
+  const start = extractBigIntValue(stmt.init.init);
+  if (start === null) {
+    throw new Error(
+      'Cannot determine loop start at compile time. For-loop iterators must start at an integer literal.',
+    );
+  }
 
-  // Try to extract the bound from the condition
-  if (stmt.condition.kind === 'binary_expr') {
-    const boundVal = extractBigIntValue(stmt.condition.right);
+  if (stmt.condition.kind !== 'binary_expr') {
+    throw new Error('Cannot determine loop bound at compile time. For-loop bounds must be integer literals.');
+  }
+  const op = stmt.condition.op;
+  const bound = extractBigIntValue(stmt.condition.right);
+  if (bound === null) {
+    throw new Error('Cannot determine loop bound at compile time. For-loop bounds must be integer literals.');
+  }
 
-    if (startVal !== null && boundVal !== null) {
-      const op = stmt.condition.op;
-      if (op === '<') return Math.max(0, Number(boundVal - startVal));
-      if (op === '<=') return Math.max(0, Number(boundVal - startVal + 1n));
-      if (op === '>') return Math.max(0, Number(startVal - boundVal));
-      if (op === '>=') return Math.max(0, Number(startVal - boundVal + 1n));
+  const step = extractLoopStep(stmt);
+
+  // Count = number of iterations before the condition first turns false.
+  let count: bigint;
+  if (step === 1) {
+    if (op === '<') count = bound - start;
+    else if (op === '<=') count = bound - start + 1n;
+    else {
+      throw new Error(
+        `For loop counting up (i${'++'}) must use '<' or '<=' (got '${op}').`,
+      );
     }
-
-    // If we can at least get the bound, assume start = 0
-    if (boundVal !== null) {
-      const op = stmt.condition.op;
-      if (op === '<') return Number(boundVal);
-      if (op === '<=') return Number(boundVal) + 1;
+  } else {
+    if (op === '>') count = start - bound;
+    else if (op === '>=') count = start - bound + 1n;
+    else {
+      throw new Error(
+        `For loop counting down (i--) must use '>' or '>=' (got '${op}').`,
+      );
     }
   }
 
-  throw new Error('Cannot determine loop bound at compile time. For-loop bounds must be integer literals.');
+  return { start, step, count: Math.max(0, Number(count)) };
+}
+
+/**
+ * Determine the iterator step direction (+1 / -1) from the for-statement's
+ * update clause, falling back to the condition direction. Only unit steps are
+ * supported; a non-unit update (e.g. `i += 2`) is out of the loop model.
+ */
+function extractLoopStep(
+  stmt: Extract<Statement, { kind: 'for_statement' }>,
+): 1 | -1 {
+  const update = stmt.update;
+  if (update.kind === 'expression_statement') {
+    const e = update.expression;
+    if (e.kind === 'increment_expr') return 1;
+    if (e.kind === 'decrement_expr') return -1;
+  }
+  // Fall back to the comparison direction for other unit-step spellings
+  // (e.g. `i = i + 1n`): `<`/`<=` counts up, `>`/`>=` counts down.
+  if (stmt.condition.kind === 'binary_expr') {
+    const op = stmt.condition.op;
+    if (op === '>' || op === '>=') return -1;
+  }
+  return 1;
 }
 
 function extractBigIntValue(expr: Expression): bigint | null {
@@ -660,7 +1123,14 @@ function lowerExprToRef(expr: Expression, ctx: LoweringContext): string {
       return lowerIdentifier(expr, ctx);
 
     case 'property_access':
-      // this.txPreimage in StatefulSmartContract -> load_param (it's an implicit param, not a stored property)
+      // Explicit `this.x`: a real contract property always wins, even when a
+      // method param shares the name (issue #130). Now that declared params are
+      // registered, the isParam branch below must not shadow a stored property.
+      if (ctx.isProperty(expr.property)) {
+        return ctx.emit({ kind: 'load_prop', name: expr.property });
+      }
+      // this.txPreimage in StatefulSmartContract -> load_param (it's an
+      // implicit injected param, not a stored property).
       if (ctx.isParam(expr.property)) {
         return ctx.emit({ kind: 'load_param', name: expr.property });
       }
@@ -707,6 +1177,14 @@ function lowerIdentifier(
   // 'this' is not a value in ANF -- it's handled at the member level
   if (name === 'this') {
     return ctx.emit({ kind: 'load_const', value: '@this' });
+  }
+
+  // Param alias takes precedence over normal param lookup. Set when a
+  // private method's body is being inlined into this context — the
+  // private's param names map to the caller's arg refs.
+  const aliased = ctx.getParamAlias(name);
+  if (aliased !== undefined) {
+    return aliased;
   }
 
   // Check if it's a parameter
@@ -835,8 +1313,165 @@ function lowerCallExpr(
   if (callee.kind === 'identifier' && callee.name === 'checkPreimage') {
     if (expr.args.length >= 1) {
       const preimageRef = lowerExprToRef(expr.args[0]!, ctx);
-      return ctx.emit({ kind: 'check_preimage', preimage: preimageRef });
+      return ctx.emit({
+        kind: 'check_preimage',
+        preimage: preimageRef,
+        // Issue #123: honour the method's declared @sighash on manual calls.
+        ...(ctx.sighashFlag !== undefined ? { sighashFlag: ctx.sighashFlag } : {}),
+      });
     }
+  }
+
+  // extractPrevOutputScript(inputIndex_literal, expectedScriptHash) -> ByteString.
+  // extractPrevOutputScript(inputIndex_literal, expectedScriptPrefixHash, prefixLen_literal) -> ByteString.
+  //
+  // Witness-bridge sugar (BSVM Phase 13). Auto-injects a hidden method
+  // parameter named `_prevOutScript_<inputIndex>` (one per distinct index
+  // in the method body), emits a hash assertion, and returns the witness
+  // ref for caller substring extraction.
+  //
+  // 2-arg form: hash256(witness) === expectedScriptHash. Pins the full
+  //   prev-output script byte-for-byte.
+  // 3-arg form (Crit-2): hash256(substr(witness, 0, prefixLen)) ===
+  //   expectedScriptPrefixHash. Pins the policy prefix only, leaving the
+  //   pushdata tail free to vary. Required for the intent-template
+  //   matching use case where each successor intent UTXO has a unique
+  //   tail (BSVM Mode 3 permissionless step-in).
+  if (callee.kind === 'identifier' && callee.name === 'extractPrevOutputScript') {
+    if (expr.args.length !== 2 && expr.args.length !== 3) {
+      return ctx.emit({ kind: 'load_const', value: '' });
+    }
+    const idxArg = expr.args[0]!;
+    if (idxArg.kind !== 'bigint_literal') {
+      // typecheck has already emitted the diagnostic; emit a placeholder
+      // so lowering doesn't crash.
+      return ctx.emit({ kind: 'load_const', value: '' });
+    }
+    const idx = idxArg.value;
+    const paramName = `_prevOutScript_${idx.toString()}`;
+    ctx.methodScope.recordAutoInjectedParam(paramName, 'ByteString');
+    ctx.addParam(paramName);
+    const witnessRef = ctx.emit({ kind: 'load_param', name: paramName });
+    const expectedHashRef = lowerExprToRef(expr.args[1]!, ctx);
+
+    // Determine which bytes to hash: full witness (2-arg) or
+    // prefix (3-arg). The substr happens at script-execution time;
+    // the literal prefixLen is baked into the emitted Stack-IR.
+    let bytesToHashRef: string;
+    if (expr.args.length === 3) {
+      const prefixLenArg = expr.args[2]!;
+      if (prefixLenArg.kind !== 'bigint_literal') {
+        // typecheck has already emitted the diagnostic; emit a placeholder.
+        return ctx.emit({ kind: 'load_const', value: '' });
+      }
+      const zeroRef = ctx.emit({ kind: 'load_const', value: 0n });
+      const prefixLenRef = ctx.emit({ kind: 'load_const', value: prefixLenArg.value });
+      bytesToHashRef = ctx.emit({
+        kind: 'call', func: 'substr',
+        args: [witnessRef, zeroRef, prefixLenRef],
+      });
+    } else {
+      bytesToHashRef = witnessRef;
+    }
+
+    const actualHashRef = ctx.emit({ kind: 'call', func: 'hash256', args: [bytesToHashRef] });
+    const eqRef = ctx.emit({
+      kind: 'bin_op', op: '===',
+      left: actualHashRef, right: expectedHashRef,
+      result_type: 'bytes',
+    });
+    ctx.emit({ kind: 'assert', value: eqRef });
+    return witnessRef;
+  }
+
+  // requireOutputP2PKH(outputIndex_literal, pubkeyHash, amount) -> void.
+  // Asserts that the tx's output at outputIndex is a standard P2PKH paying
+  // `amount` satoshis to `pubkeyHash`. Auto-injects `_serialisedOutputs`
+  // (once per method) and emits hash256(serialisedOutputs) ==
+  // extractOutputHash(txPreimage) the first time the intrinsic is called
+  // in a method body. Subsequent calls in the same method skip the
+  // hashOutputs check (already established) and emit only the per-output
+  // substring assertion.
+  //
+  // v1 assumes all outputs in the serialised set are exactly 34 bytes
+  // (8-byte LE amount ‖ 0x19 length ‖ 25-byte P2PKH script). Byte offset
+  // of output i is i*34. If the method also calls this.addDataOutput(...)
+  // the assumption breaks (variable-length OP_RETURN) — typecheck
+  // rejects that mix; see checkMethod in 03-typecheck.ts (Crit-3).
+  if (callee.kind === 'identifier' && callee.name === 'requireOutputP2PKH') {
+    if (expr.args.length !== 3) {
+      return ctx.emit({ kind: 'load_const', value: '' });
+    }
+    const idxArg = expr.args[0]!;
+    if (idxArg.kind !== 'bigint_literal') {
+      return ctx.emit({ kind: 'load_const', value: '' });
+    }
+    const idx = idxArg.value;
+
+    ctx.methodScope.recordAutoInjectedParam('_serialisedOutputs', 'ByteString');
+    ctx.addParam('_serialisedOutputs');
+
+    // Emit the hashOutputs(preimage) check exactly once per method.
+    if (!ctx.methodScope.didEmitHashOutputsCheck) {
+      ctx.methodScope.didEmitHashOutputsCheck = true;
+      const serialisedRef = ctx.emit({ kind: 'load_param', name: '_serialisedOutputs' });
+      const actualOutHashRef = ctx.emit({ kind: 'call', func: 'hash256', args: [serialisedRef] });
+      const preimageRef = ctx.emit({ kind: 'load_param', name: 'txPreimage' });
+      const expectedOutHashRef = ctx.emit({ kind: 'call', func: 'extractOutputHash', args: [preimageRef] });
+      const hashEqRef = ctx.emit({
+        kind: 'bin_op', op: '===',
+        left: actualOutHashRef, right: expectedOutHashRef,
+        result_type: 'bytes',
+      });
+      ctx.emit({ kind: 'assert', value: hashEqRef });
+    }
+
+    // Lower the user-supplied args (pubkeyHash, amount).
+    const pubkeyHashRef = lowerExprToRef(expr.args[1]!, ctx);
+    const amountRef = lowerExprToRef(expr.args[2]!, ctx);
+
+    // Construct expected P2PKH output bytes:
+    //   <amount: 8-byte LE> ‖ 0x19 0x76 0xa9 0x14 ‖ <pubkeyHash: 20 bytes> ‖ 0x88 0xac
+    const eightRef = ctx.emit({ kind: 'load_const', value: 8n });
+    const amountBytesRef = ctx.emit({ kind: 'call', func: 'num2bin', args: [amountRef, eightRef] });
+    // 0x19 0x76 0xa9 0x14 — script length byte + OP_DUP OP_HASH160 OP_PUSH20
+    const prefixRef = ctx.emit({ kind: 'load_const', value: '1976a914' });
+    // 0x88 0xac — OP_EQUALVERIFY OP_CHECKSIG
+    const suffixRef = ctx.emit({ kind: 'load_const', value: '88ac' });
+    const cat1Ref = ctx.emit({ kind: 'call', func: 'cat', args: [amountBytesRef, prefixRef] });
+    const cat2Ref = ctx.emit({ kind: 'call', func: 'cat', args: [cat1Ref, pubkeyHashRef] });
+    const expectedOutputRef = ctx.emit({ kind: 'call', func: 'cat', args: [cat2Ref, suffixRef] });
+
+    // Substring extract at idx*34 length 34, assert equal.
+    const serialisedRef2 = ctx.emit({ kind: 'load_param', name: '_serialisedOutputs' });
+    const offsetRef = ctx.emit({ kind: 'load_const', value: idx * 34n });
+    const lengthRef = ctx.emit({ kind: 'load_const', value: 34n });
+    const extractedRef = ctx.emit({ kind: 'call', func: 'substr', args: [serialisedRef2, offsetRef, lengthRef] });
+    const outEqRef = ctx.emit({
+      kind: 'bin_op', op: '===',
+      left: extractedRef, right: expectedOutputRef,
+      result_type: 'bytes',
+    });
+    return ctx.emit({ kind: 'assert', value: outEqRef });
+  }
+
+  // currentBlockHeight() -> bigint. Pure source-level desugar to
+  // extractLocktime(this.txPreimage). Only valid in StatefulSmartContract
+  // methods (typecheck enforces). No new ANF kind or stack codegen needed.
+  if (callee.kind === 'identifier' && callee.name === 'currentBlockHeight') {
+    const preimageRef = ctx.emit({ kind: 'load_param', name: 'txPreimage' });
+    return ctx.emit({ kind: 'call', func: 'extractLocktime', args: [preimageRef] });
+  }
+
+  // asm({ body, in_arity?, out_arity? }) — parser has already normalised
+  // the object-literal argument into three positional args
+  // (body: bytestring_literal, in_arity: bigint_literal, out_arity:
+  // bigint_literal). Lower directly to a raw_script ANF binding so the
+  // bytes pass through stack-lower / emit verbatim. Phase-3 follow-ups
+  // (array-body form, generic-expression form, multi-output) will reuse
+  // this same ANF node with different parser shapes.
+  if (callee.kind === 'identifier' && callee.name === 'asm') {
+    return lowerAsmCall(expr, ctx);
   }
 
   // this.addOutput(satoshis, val1, val2, ...) -> special node
@@ -856,6 +1491,18 @@ function lowerCallExpr(
     const scriptBytes = argRefs[1]!;
     const ref = ctx.emit({ kind: 'add_raw_output', satoshis, scriptBytes });
     ctx.addOutputRef(ref);
+    return ref;
+  }
+
+  // this.addDataOutput(satoshis, scriptBytes) -> special node. Like
+  // addRawOutput in wire shape, but included in the continuation hash
+  // AFTER state outputs and BEFORE the change output.
+  if (callee.kind === 'property_access' && callee.property === 'addDataOutput') {
+    const argRefs = expr.args.map(arg => lowerExprToRef(arg, ctx));
+    const satoshis = argRefs[0]!;
+    const scriptBytes = argRefs[1]!;
+    const ref = ctx.emit({ kind: 'add_data_output', satoshis, scriptBytes });
+    ctx.addDataOutputRef(ref);
     return ref;
   }
 
@@ -891,13 +1538,28 @@ function lowerCallExpr(
   if (callee.kind === 'member_expr' &&
       callee.object.kind === 'identifier' &&
       (callee.object.name === 'this' || ctx.isStatefulContextParam(callee.object.name)) &&
+      callee.property === 'addDataOutput') {
+    const argRefs = expr.args.map(arg => lowerExprToRef(arg, ctx));
+    const satoshis = argRefs[0]!;
+    const scriptBytes = argRefs[1]!;
+    const ref = ctx.emit({ kind: 'add_data_output', satoshis, scriptBytes });
+    ctx.addDataOutputRef(ref);
+    return ref;
+  }
+  if (callee.kind === 'member_expr' &&
+      callee.object.kind === 'identifier' &&
+      (callee.object.name === 'this' || ctx.isStatefulContextParam(callee.object.name)) &&
       callee.property === 'getStateScript') {
     return ctx.emit({ kind: 'get_state_script' });
   }
 
-  // this.method(...) -> method_call
+  // this.method(...) -> method_call (or inlined if the target is a
+  // private method with continuation-relevant side effects).
   if (callee.kind === 'property_access') {
     const argRefs = expr.args.map(arg => lowerExprToRef(arg, ctx));
+    if (ctx.shouldInlinePrivate(callee.property)) {
+      return inlinePrivateMethodCall(callee.property, argRefs, ctx);
+    }
     return ctx.emit({
       kind: 'method_call',
       object: ctx.emit({ kind: 'load_const', value: '@this' }),
@@ -909,6 +1571,9 @@ function lowerCallExpr(
       callee.object.kind === 'identifier' &&
       callee.object.name === 'this') {
     const argRefs = expr.args.map(arg => lowerExprToRef(arg, ctx));
+    if (ctx.shouldInlinePrivate(callee.property)) {
+      return inlinePrivateMethodCall(callee.property, argRefs, ctx);
+    }
     return ctx.emit({
       kind: 'method_call',
       object: ctx.emit({ kind: 'load_const', value: '@this' }),
@@ -925,7 +1590,10 @@ function lowerCallExpr(
     const argRefs = expr.args.map(arg => lowerExprToRef(arg, ctx));
     const isPrivateMethod = ctx.isPrivateMethod(callee.name);
     if (isPrivateMethod) {
-      const thisRef = ctx.emit({ kind: 'load_const', value: 'this' });
+      if (ctx.shouldInlinePrivate(callee.name)) {
+        return inlinePrivateMethodCall(callee.name, argRefs, ctx);
+      }
+      const thisRef = ctx.emit({ kind: 'load_const', value: '@this' });
       return ctx.emit({ kind: 'method_call', object: thisRef, method: callee.name, args: argRefs });
     }
     return ctx.emit({ kind: 'call', func: callee.name, args: argRefs });
@@ -941,11 +1609,111 @@ function isStatefulContextParam(param: ParamNode): boolean {
   return param.type.kind === 'custom_type' && param.type.name === 'StatefulContext';
 }
 
+/**
+ * Inline a private method's body directly into the caller's context.
+ *
+ * Used when the private has continuation-relevant side effects (state
+ * mutation, addOutput, addRawOutput, addDataOutput) so that the
+ * helper's emitted ANF nodes register output refs on the caller. This
+ * is what makes the public method's continuation hash include outputs
+ * declared in private helpers — without it, the helper's
+ * `add_output`/`add_data_output` refs live in a sibling ANF method and
+ * the public's `addOutputRefs`/`addDataOutputRefs` lists miss them, so
+ * the runtime hashOutputs check would diverge from actual outputs.
+ *
+ * Caller's arg refs are mapped onto the private's parameter names via
+ * `pushParamAlias`. While the private's body lowers, any identifier
+ * expression matching one of those param names resolves to the
+ * caller's ref (see `lowerIdentifier`). The aliases are popped
+ * afterwards so subsequent lowering in the caller's body sees its own
+ * scope.
+ *
+ * Recursion across private helpers is forbidden by validation, so this
+ * always terminates. Nested inlining (private A calls private B) works
+ * naturally: when we lower A's body and hit the call to B, the same
+ * `lowerCallExpr` path runs and inlines B too.
+ */
+function inlinePrivateMethodCall(
+  methodName: string,
+  argRefs: string[],
+  ctx: LoweringContext,
+): string {
+  const method = ctx.getPrivateMethod(methodName);
+  if (!method) {
+    // Should not happen — caller checked shouldInlinePrivate which
+    // requires the method to exist. Fall back to a method_call so the
+    // stack lowering pass surfaces a clear error.
+    const thisRef = ctx.emit({ kind: 'load_const', value: '@this' });
+    return ctx.emit({ kind: 'method_call', object: thisRef, method: methodName, args: argRefs });
+  }
+
+  // Bind caller arg refs to the private's parameter names.
+  const aliasedParams: string[] = [];
+  for (let i = 0; i < method.params.length && i < argRefs.length; i++) {
+    const paramName = method.params[i]!.name;
+    ctx.pushParamAlias(paramName, argRefs[i]!);
+    aliasedParams.push(paramName);
+  }
+
+  const startIndex = ctx.bindings.length;
+  lowerStatements(method.body, ctx);
+  const endIndex = ctx.bindings.length;
+
+  // Pop aliases in reverse order so nested inlines compose correctly.
+  for (let i = aliasedParams.length - 1; i >= 0; i--) {
+    ctx.popParamAlias(aliasedParams[i]!);
+  }
+
+  // Method's "return value" is the last binding emitted by the body.
+  // Void methods (e.g., a private helper that just calls addOutput)
+  // still produce a binding (the addOutput result) which the caller
+  // expression-statement path will discard.
+  if (endIndex > startIndex) {
+    return ctx.bindings[endIndex - 1]!.name;
+  }
+  // Empty body — emit a load_const placeholder so the caller has a ref.
+  return ctx.emit({ kind: 'load_const', value: '@void' });
+}
+
 function flattenAddOutputArgs(args: Expression[]): Expression[] {
   if (args.length === 2 && args[1]?.kind === 'array_literal') {
     return [args[0]!, ...args[1].elements];
   }
   return args;
+}
+
+/**
+ * Lower an asm({...}) call (already parser-normalised to three
+ * positional args (body, in_arity, out_arity)) into a single
+ * `raw_script` ANF binding. The hex body passes through unchanged
+ * — stack-lower decodes it and emits a `raw_bytes` StackOp, which the
+ * emit pass writes verbatim. The peephole optimizer treats it as a
+ * hard barrier, so adjacent bindings never fold across it.
+ *
+ * Diagnostics for malformed args (wrong arity, non-literal arities,
+ * odd-length / non-hex body) have already been pushed by 02-validate;
+ * here we defensively coerce missing values to safe defaults so a
+ * downstream pass error doesn't mask the earlier validator error.
+ */
+function lowerAsmCall(
+  expr: Extract<Expression, { kind: 'call_expr' }>,
+  ctx: LoweringContext,
+): string {
+  const [bodyArg, inArityArg, outArityArg] = expr.args;
+
+  const bytes =
+    bodyArg && bodyArg.kind === 'bytestring_literal' ? bodyArg.value : '';
+  const inArity =
+    inArityArg && inArityArg.kind === 'bigint_literal' ? Number(inArityArg.value) : 0;
+  const outArity =
+    outArityArg && outArityArg.kind === 'bigint_literal' ? Number(outArityArg.value) : 1;
+
+  return ctx.emit({
+    kind: 'raw_script',
+    bytes,
+    in_arity: inArity,
+    out_arity: outArity,
+  });
 }
 
 function lowerTernaryExpr(
@@ -1031,6 +1799,7 @@ function lowerDecrementExpr(
 /** Byte-typed primitive names — values that are already byte sequences. */
 const BYTE_TYPES = new Set([
   'ByteString', 'PubKey', 'Sig', 'Sha256', 'Ripemd160', 'Addr', 'SigHashPreimage', 'Point',
+  'P256Point', 'P384Point',
 ]);
 
 /** Builtin functions that return byte-typed values. */
@@ -1038,6 +1807,8 @@ const BYTE_RETURNING_FUNCTIONS = new Set([
   'sha256', 'ripemd160', 'hash160', 'hash256', 'cat', 'num2bin', 'int2str',
   'reverseBytes', 'substr', 'left', 'right',
   'ecAdd', 'ecMul', 'ecMulGen', 'ecNegate', 'ecMakePoint', 'ecEncodeCompressed',
+  'p256Add', 'p256Mul', 'p256MulGen', 'p256Negate', 'p256EncodeCompressed',
+  'p384Add', 'p384Mul', 'p384MulGen', 'p384Negate', 'p384EncodeCompressed',
   'extractOutpoint', 'extractHashPrevouts', 'extractHashSequence', 'extractOutputHash',
   'extractVersion', 'extractLocktime', 'extractSigHashType',
   'blake3Compress', 'blake3Hash',
@@ -1104,101 +1875,6 @@ function typeNodeToString(node: TypeNode): string {
     case 'custom_type':
       return node.name;
   }
-}
-
-// ---------------------------------------------------------------------------
-// State mutation analysis for StatefulSmartContract
-// ---------------------------------------------------------------------------
-
-/**
- * Determine whether a method mutates any mutable (non-readonly) property.
- * Conservative: if ANY code path can mutate state, returns true.
- */
-function methodMutatesState(
-  method: { body: Statement[] },
-  contract: ContractNode,
-): boolean {
-  const mutablePropNames = new Set(
-    contract.properties.filter(p => !p.readonly).map(p => p.name),
-  );
-  if (mutablePropNames.size === 0) return false;
-  return bodyMutatesState(method.body, mutablePropNames);
-}
-
-function bodyMutatesState(stmts: Statement[], mutableProps: Set<string>): boolean {
-  for (const stmt of stmts) {
-    if (stmtMutatesState(stmt, mutableProps)) return true;
-  }
-  return false;
-}
-
-function stmtMutatesState(stmt: Statement, mutableProps: Set<string>): boolean {
-  switch (stmt.kind) {
-    case 'assignment':
-      if (stmt.target.kind === 'property_access' && mutableProps.has(stmt.target.property)) {
-        return true;
-      }
-      return false;
-    case 'expression_statement':
-      return exprMutatesState(stmt.expression, mutableProps);
-    case 'if_statement':
-      return bodyMutatesState(stmt.then, mutableProps) ||
-             (stmt.else ? bodyMutatesState(stmt.else, mutableProps) : false);
-    case 'for_statement':
-      return stmtMutatesState(stmt.update, mutableProps) ||
-             bodyMutatesState(stmt.body, mutableProps);
-    default:
-      return false;
-  }
-}
-
-function exprMutatesState(expr: Expression, mutableProps: Set<string>): boolean {
-  if (expr.kind === 'increment_expr' || expr.kind === 'decrement_expr') {
-    if (expr.operand.kind === 'property_access' && mutableProps.has(expr.operand.property)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function methodHasAddOutput(method: { body: Statement[] }): boolean {
-  return bodyHasAddOutput(method.body);
-}
-
-function bodyHasAddOutput(stmts: Statement[]): boolean {
-  for (const stmt of stmts) {
-    if (stmtHasAddOutput(stmt)) return true;
-  }
-  return false;
-}
-
-function stmtHasAddOutput(stmt: Statement): boolean {
-  switch (stmt.kind) {
-    case 'expression_statement':
-      return exprHasAddOutput(stmt.expression);
-    case 'if_statement':
-      return bodyHasAddOutput(stmt.then) ||
-             (stmt.else ? bodyHasAddOutput(stmt.else) : false);
-    case 'for_statement':
-      return bodyHasAddOutput(stmt.body);
-    default:
-      return false;
-  }
-}
-
-function exprHasAddOutput(expr: Expression): boolean {
-  if (expr.kind === 'call_expr') {
-    const callee = expr.callee;
-    if (callee.kind === 'property_access' &&
-        (callee.property === 'addOutput' || callee.property === 'addRawOutput')) {
-      return true;
-    }
-    if (callee.kind === 'member_expr' &&
-        (callee.property === 'addOutput' || callee.property === 'addRawOutput')) {
-      return true;
-    }
-  }
-  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1355,8 +2031,12 @@ function maxTempIndex(bindings: ANFBinding[]): number {
 
 /**
  * Remap temp references in an ANF value according to a name mapping.
+ *
+ * Exported for the F-003 regression test in `__tests__/unknown-anf-kind.test.ts`
+ * which drives the dispatch with a synthetic ANF kind to verify it throws
+ * `UnknownANFKindError` instead of silently dropping the binding.
  */
-function remapValueRefs(value: ANFValue, map: Record<string, string>): ANFValue {
+export function remapValueRefs(value: ANFValue, map: Record<string, string>): ANFValue {
   const r = (ref: string) => map[ref] || ref;
   switch (value.kind) {
     case 'load_param':
@@ -1391,12 +2071,21 @@ function remapValueRefs(value: ANFValue, map: Record<string, string>): ANFValue 
       return { ...value, satoshis: r(value.satoshis), stateValues: value.stateValues.map(r), preimage: r(value.preimage) };
     case 'add_raw_output':
       return { ...value, satoshis: r(value.satoshis), scriptBytes: r(value.scriptBytes) };
+    case 'add_data_output':
+      return { ...value, satoshis: r(value.satoshis), scriptBytes: r(value.scriptBytes) };
     case 'if':
       return { ...value, cond: r(value.cond) };
     case 'loop':
       return value;
-    default:
+    case 'array_literal':
+      return { ...value, elements: value.elements.map(r) };
+    case 'raw_script':
+      // Opaque byte span — no SSA inputs to remap.
       return value;
+    default: {
+      const unknown = value as { kind: string };
+      throw new UnknownANFKindError(unknown.kind, 'anf-lower.remapValueRefs');
+    }
   }
 }
 

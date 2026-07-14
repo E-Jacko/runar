@@ -1,0 +1,43 @@
+{
+  "artifact": {
+    "version": "runar-v1.0.0-rc.1",
+    "compilerVersion": "1.0.0-rc.1",
+    "contractName": "BoundedLoop",
+    "parentClass": "SmartContract",
+    "abi": {
+      "constructor": {
+        "params": [
+          {
+            "name": "expectedSum",
+            "type": "bigint"
+          }
+        ]
+      },
+      "methods": [
+        {
+          "name": "verify",
+          "params": [
+            {
+              "name": "start",
+              "type": "bigint"
+            }
+          ],
+          "isPublic": true
+        }
+      ]
+    },
+    "script": "000052797b7c937c935152797b7c937c935252797b7c937c935352797b7c937c93547b7b7c937c93009c",
+    "constructorSlots": [
+      {
+        "paramIndex": 0,
+        "byteOffset": 40
+      }
+    ]
+  },
+  "constructorArgs": [
+    {
+      "type": "bigint",
+      "value": "25"
+    }
+  ]
+}

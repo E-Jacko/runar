@@ -1,0 +1,89 @@
+package runar.compiler.frontend;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import org.junit.jupiter.api.Test;
+import runar.compiler.frontend.ParserDispatch.ParseException;
+import runar.compiler.ir.ast.ContractNode;
+import runar.compiler.ir.ast.MethodNode;
+
+/** Issue #123 — {@code @sighash} directive parsing on the .runar.ts surface. */
+class SighashParseTest {
+
+    private static MethodNode methodByName(String src, String name) throws ParseException {
+        ContractNode c = ParserDispatch.parse(src, "X.runar.ts");
+        for (MethodNode m : c.methods()) {
+            if (m.name().equals(name)) {
+                return m;
+            }
+        }
+        throw new IllegalStateException("method not found: " + name);
+    }
+
+    @Test
+    void setsSighashTypeFromJsdocDirective() throws Exception {
+        String src =
+            "class C extends StatefulSmartContract {\n"
+            + "  n: bigint;\n"
+            + "  constructor(n: bigint) { super(n); this.n = n; }\n"
+            + "  /** @sighash SINGLE|FORKID */\n"
+            + "  public bump(): void { this.n = this.n + 1n; }\n"
+            + "}\n";
+        assertEquals(0x43, methodByName(src, "bump").sighashType());
+    }
+
+    @Test
+    void leavesSighashTypeNullWhenNoDirective() throws Exception {
+        String src =
+            "class C extends StatefulSmartContract {\n"
+            + "  n: bigint;\n"
+            + "  constructor(n: bigint) { super(n); this.n = n; }\n"
+            + "  public bump(): void { this.n = this.n + 1n; }\n"
+            + "}\n";
+        assertNull(methodByName(src, "bump").sighashType());
+    }
+
+    @Test
+    void acceptsLineCommentDirective() throws Exception {
+        String src =
+            "class C extends StatefulSmartContract {\n"
+            + "  n: bigint;\n"
+            + "  constructor(n: bigint) { super(n); this.n = n; }\n"
+            + "  // @sighash NONE|FORKID\n"
+            + "  public wipe(): void { this.n = 0n; }\n"
+            + "}\n";
+        assertEquals(0x42, methodByName(src, "wipe").sighashType());
+    }
+
+    @Test
+    void reportsErrorForBadFlagCombo() {
+        String src =
+            "class C extends StatefulSmartContract {\n"
+            + "  n: bigint;\n"
+            + "  constructor(n: bigint) { super(n); this.n = n; }\n"
+            + "  /** @sighash ALL|NONE|FORKID */\n"
+            + "  public bump(): void { this.n = this.n + 1n; }\n"
+            + "}\n";
+        ParseException ex = assertThrows(ParseException.class,
+            () -> ParserDispatch.parse(src, "X.runar.ts"));
+        assertTrue(ex.getMessage().contains("cannot combine base types"), ex.getMessage());
+    }
+
+    @Test
+    void reportsErrorForSighashOnPrivateMethod() {
+        String src =
+            "class C extends StatefulSmartContract {\n"
+            + "  n: bigint;\n"
+            + "  constructor(n: bigint) { super(n); this.n = n; }\n"
+            + "  /** @sighash SINGLE|FORKID */\n"
+            + "  private helper(): bigint { return 1n; }\n"
+            + "  public bump(): void { this.n = this.n + 1n; }\n"
+            + "}\n";
+        ParseException ex = assertThrows(ParseException.class,
+            () -> ParserDispatch.parse(src, "X.runar.ts"));
+        assertTrue(ex.getMessage().contains("non-public method"), ex.getMessage());
+    }
+}

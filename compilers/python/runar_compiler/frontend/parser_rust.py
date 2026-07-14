@@ -10,6 +10,7 @@ from runar_compiler.frontend.ast_nodes import (
     ContractNode, PropertyNode, MethodNode, ParamNode, SourceLocation,
     PrimitiveType, FixedArrayType, CustomType, TypeNode,
     BigIntLiteral, BoolLiteral, ByteStringLiteral, Identifier,
+    ArrayLiteralExpr,
     PropertyAccessExpr, MemberExpr, BinaryExpr, UnaryExpr, CallExpr,
     TernaryExpr, IndexAccessExpr, IncrementExpr, DecrementExpr,
     VariableDeclStmt, AssignmentStmt, ExpressionStmt, IfStmt, ForStmt,
@@ -81,6 +82,7 @@ TOK_ASSERT_MACRO = 65
 TOK_ASSERT_EQ_MACRO = 66
 TOK_LSHIFT = 67
 TOK_RSHIFT = 68
+TOK_DOTDOT = 69
 
 
 class Token:
@@ -109,6 +111,22 @@ _SPECIAL_BUILTINS: dict[str, str] = {
     "bin_2_num": "bin2num",
     "int_2_str": "int2str",
     "to_byte_string": "toByteString",
+    # P-256 (NIST secp256r1)
+    "p256_add":               "p256Add",
+    "p256_mul":               "p256Mul",
+    "p256_mul_gen":           "p256MulGen",
+    "p256_negate":            "p256Negate",
+    "p256_on_curve":          "p256OnCurve",
+    "p256_encode_compressed": "p256EncodeCompressed",
+    "verify_ecdsa_p256":      "verifyECDSA_P256",
+    # P-384 (NIST secp384r1)
+    "p384_add":               "p384Add",
+    "p384_mul":               "p384Mul",
+    "p384_mul_gen":           "p384MulGen",
+    "p384_negate":            "p384Negate",
+    "p384_on_curve":          "p384OnCurve",
+    "p384_encode_compressed": "p384EncodeCompressed",
+    "verify_ecdsa_p384":      "verifyECDSA_P384",
 }
 
 
@@ -141,7 +159,8 @@ def _map_rust_builtin(name: str) -> str:
         "extractHashPrevouts", "extractHashSequence", "extractOutpoint",
         "extractInputIndex", "extractScriptCode", "extractAmount",
         "extractSequence", "extractOutputs", "extractSigHashType",
-        "addOutput", "reverseBytes", "toByteString",
+        "addOutput", "addRawOutput", "addDataOutput",
+        "reverseBytes", "toByteString",
     }
     if camel in _KNOWN:
         return camel
@@ -168,12 +187,15 @@ _TYPE_MAP: dict[str, str] = {
     "PubKey": "PubKey",
     "Sig": "Sig",
     "Sha256": "Sha256",
+    "Sha256Digest": "Sha256",
     "Ripemd160": "Ripemd160",
     "Addr": "Addr",
     "SigHashPreimage": "SigHashPreimage",
     "RabinSig": "RabinSig",
     "RabinPubKey": "RabinPubKey",
     "Point": "Point",
+    "P256Point": "P256Point",
+    "P384Point": "P384Point",
 }
 
 
@@ -286,6 +308,7 @@ def _tokenize(source: str) -> list[Token]:
                 "-=": TOK_MINUSEQ,
                 "<<": TOK_LSHIFT,
                 ">>": TOK_RSHIFT,
+                "..": TOK_DOTDOT,
             }.get(two)
             if two_kind is not None:
                 tokens.append(Token(two_kind, two, l, c))
@@ -335,6 +358,25 @@ def _tokenize(source: str) -> list[Token]:
                 pos += 1
                 col += 1
             val = chars[start:pos]
+            tokens.append(Token(TOK_HEX_STRING, val, l, c))
+            continue
+
+        # Double-quoted string literal — treated as hex ByteString like in TS/Sol/Move
+        if ch == '"':
+            pos += 1
+            col += 1
+            start = pos
+            while pos < n and chars[pos] != '"':
+                if chars[pos] == "\n":
+                    line += 1
+                    col = 1
+                else:
+                    col += 1
+                pos += 1
+            val = chars[start:pos]
+            if pos < n:
+                pos += 1  # skip closing quote
+                col += 1
             tokens.append(Token(TOK_HEX_STRING, val, l, c))
             continue
 
@@ -525,9 +567,15 @@ class _RustParser:
             if self.check(TOK_HASH_BRACKET):
                 attr = self.parse_attribute()
 
-                if attr in ("runar::contract", "runar::stateful_contract"):
+                if attr in (
+                    "runar::contract",
+                    "runar::stateful_contract",
+                    "runar::unsafe_contract",
+                ):
                     if attr == "runar::stateful_contract":
                         parent_class = "StatefulSmartContract"
+                    elif attr == "runar::unsafe_contract":
+                        parent_class = "UnsafeSmartContract"
 
                     # Parse struct
                     if self.check(TOK_PUB):
@@ -549,6 +597,10 @@ class _RustParser:
                             if field_attr == "readonly":
                                 readonly = True
 
+                        # Skip optional `pub` visibility modifier
+                        if self.check(TOK_PUB):
+                            self.advance()
+
                         field_loc = self.loc()
                         field_tok = self.peek()
                         if field_tok.kind == TOK_IDENT:
@@ -558,42 +610,34 @@ class _RustParser:
                             field_type = self.parse_rust_type()
                             self.match_tok(TOK_COMMA)
 
-                            properties.append(PropertyNode(
-                                name=_snake_to_camel(field_name),
-                                type=field_type,
-                                readonly=readonly,
-                                source_location=field_loc,
-                            ))
+                            # Skip txPreimage — implicit stateful param, not a contract property
+                            camel_name = _snake_to_camel(field_name)
+                            if camel_name != "txPreimage":
+                                properties.append(PropertyNode(
+                                    name=camel_name,
+                                    type=field_type,
+                                    readonly=readonly,
+                                    source_location=field_loc,
+                                ))
                         else:
                             self.advance()
 
                     self.expect(TOK_RBRACE)
 
                 elif attr.startswith("runar::methods"):
-                    # Parse impl block
-                    if self.check(TOK_IMPL):
-                        self.advance()
-                    # Skip type name
-                    if self.peek().kind == TOK_IDENT:
-                        self.advance()
-                    self.expect(TOK_LBRACE)
-
-                    while not self.check(TOK_RBRACE) and not self.check(TOK_EOF):
-                        # Check for #[public] attribute
-                        visibility = "private"
-                        if self.check(TOK_HASH_BRACKET):
-                            method_attr = self.parse_attribute()
-                            if method_attr == "public":
-                                visibility = "public"
-                        if self.check(TOK_PUB):
-                            self.advance()
-                            visibility = "public"
-                        methods.append(self.parse_function(visibility))
-
-                    self.expect(TOK_RBRACE)
+                    # #[runar::methods] is no longer supported — bare `impl`
+                    # blocks are discovered directly. Emit a migration
+                    # diagnostic; the `impl` branch below still parses the block.
+                    self.add_error(
+                        "#[runar::methods] is no longer supported — write a bare "
+                        "'impl ContractName { ... }' block instead"
+                    )
+                    continue
                 else:
                     # Unknown attribute, skip
                     continue
+            elif self.check(TOK_IMPL):
+                methods.extend(self.parse_impl_block())
             else:
                 self.advance()
 
@@ -672,6 +716,42 @@ class _RustParser:
             methods=methods,
             source_file=self.file_name,
         )
+
+    # -- Impl block parsing --------------------------------------------------
+
+    def parse_impl_block(self) -> list[MethodNode]:
+        """Parse a bare ``impl ContractName { ... }`` block, returning its methods.
+
+        The type name is consumed and discarded (unrelated ``impl`` blocks merge
+        the same way they did under the old ``#[runar::methods]`` gate).
+        ``pub fn`` marks a public spending entry point; bare ``fn`` is a private
+        helper.
+        """
+        methods: list[MethodNode] = []
+        self.expect(TOK_IMPL)
+        # Skip the type name.
+        if self.peek().kind == TOK_IDENT:
+            self.advance()
+        self.expect(TOK_LBRACE)
+
+        while not self.check(TOK_RBRACE) and not self.check(TOK_EOF):
+            # #[public] is no longer supported — `pub fn` marks public methods.
+            while self.check(TOK_HASH_BRACKET):
+                method_attr = self.parse_attribute()
+                if method_attr == "public":
+                    self.add_error(
+                        "#[public] is no longer supported — use 'pub fn' "
+                        "for public methods"
+                    )
+
+            visibility = "private"
+            if self.check(TOK_PUB):
+                self.advance()
+                visibility = "public"
+            methods.append(self.parse_function(visibility))
+
+        self.expect(TOK_RBRACE)
+        return methods
 
     # -- Function parsing ----------------------------------------------------
 
@@ -870,11 +950,8 @@ class _RustParser:
             self.expect(TOK_IN)
             start_expr = self.parse_expression()
 
-            # Expect .. range operator (two dots)
-            if self.check(TOK_DOT):
-                self.advance()
-                if self.check(TOK_DOT):
-                    self.advance()
+            # Expect .. range operator (single DotDot token)
+            self.expect(TOK_DOTDOT)
 
             end_expr = self.parse_expression()
 
@@ -1111,6 +1188,16 @@ class _RustParser:
                     if self.check(TOK_COMMA):
                         self.advance()
                 self.expect(TOK_RPAREN)
+                # `.clone()` is a Rust borrow-checker artifact — in Runar,
+                # values are copied by default, so strip it and keep the
+                # receiver expression unchanged.
+                if (
+                    not args
+                    and isinstance(expr, MemberExpr)
+                    and expr.property == "clone"
+                ):
+                    expr = expr.object
+                    continue
                 expr = CallExpr(callee=expr, args=args)
 
             # Member access: expr.field
@@ -1207,7 +1294,7 @@ class _RustParser:
             if not self.match_tok(TOK_COMMA):
                 break
         self.expect(TOK_RBRACKET)
-        return CallExpr(callee=Identifier(name="FixedArray"), args=elements)
+        return ArrayLiteralExpr(elements=elements)
 
 
 # ---------------------------------------------------------------------------

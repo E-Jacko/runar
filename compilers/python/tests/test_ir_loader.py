@@ -144,7 +144,8 @@ class TestLoadIR_UnknownKind:
         with pytest.raises(ValueError) as exc_info:
             load_ir(ir_json)
 
-        assert exc_info.value is not None
+        assert "unknown" in str(exc_info.value).lower() or "kind" in str(exc_info.value).lower(), \
+            f"expected error about unknown kind, got: {exc_info.value}"
 
 
 # ---------------------------------------------------------------------------

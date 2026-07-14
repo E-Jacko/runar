@@ -38,6 +38,14 @@ class ANFProgram:
     contract_name: str = ""
     properties: list[ANFProperty] = field(default_factory=list)
     methods: list[ANFMethod] = field(default_factory=list)
+    # Base class the source contract extends. In-memory carrier ONLY: it is
+    # excluded from the emitted ANF IR JSON (see _IR_EXCLUDED_FIELDS in
+    # __main__.py) so it never affects cross-tier conformance parity. The
+    # artifact assembler copies it to the top-level artifact field so SDKs can
+    # gate the issue-#42/#44 terminal sighash subscript trim on the parent
+    # class (a StatefulSmartContract with zero mutable fields still needs the
+    # trim even though state_fields is empty).
+    parent_class: str = ""
 
 
 @dataclass
@@ -47,7 +55,10 @@ class ANFProperty:
     name: str = ""
     type: str = ""
     readonly: bool = False
-    initial_value: str | int | bool | None = None  # string | number | bool
+    initial_value: Any = None  # string | number | bool | list (nested for arrays)
+    # Flat list of {base, index, length} dicts, outermost first.
+    # Populated for synthetic scalar leaves minted by ``expand_fixed_arrays``.
+    synthetic_array_chain: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -58,6 +69,11 @@ class ANFMethod:
     params: list[ANFParam] = field(default_factory=list)
     body: list[ANFBinding] = field(default_factory=list)
     is_public: bool = False
+    # Issue #123: BIP-143 sighash type declared via @sighash on the source
+    # method (e.g. 0x43 for SINGLE|FORKID). ``None`` = default ALL|FORKID.
+    # Carried onto the ABI method descriptor so the SDK builds the matching
+    # preimage.
+    sighash_type: int | None = None
 
 
 @dataclass
@@ -137,22 +153,48 @@ class ANFValue:
     count: int | None = None
     iter_var: str | None = None
     body: list[ANFBinding] | None = None
+    # Iterator start value and step direction (issue #121). The loop is
+    # unrolled ``count`` times; on iteration ``i`` (0-based) the iterator
+    # variable holds ``start + i * step``. Zero-start counting-up loops carry
+    # ``start = 0`` and ``step = 1``, reproducing the historical
+    # ``i = 0..count-1`` lowering byte-for-byte. Countdown loops carry
+    # ``step = -1``.
+    start: int | None = None
+    step: int | None = None
 
     # -- assert, update_prop (value ref), check_preimage -------------------
     value_ref: str | None = None
 
+    # -- assert (auto-injected stateful-continuation marker) ---------------
+    # ``True`` only on the compiler-emitted
+    # ``hash256(continuationOutputs) === extractOutputHash(txPreimage)``
+    # assert in 04-anf-lower. Off-chain SDK interpreters skip this assert
+    # without resorting to structural / taint heuristics that misfire on
+    # developer-written covenant asserts whose IR shape is identical.
+    is_auto_injected_state_check: bool = False
+
     # -- check_preimage, deserialize_state ---------------------------------
     preimage: str | None = None
+    # -- check_preimage: issue #123 BIP-143 sighash flag the on-chain
+    #    OP_PUSH_TX binding appends to the derived signature. ``None`` = default
+    #    ALL|FORKID (0x41), byte-identical to the pinned cross-tier binding
+    #    blob. Only set for a method that declares a non-default @sighash mode.
+    sighash_flag: int | None = None
 
     # -- add_output --------------------------------------------------------
     satoshis: str | None = None
     state_values: list[str] | None = None
 
-    # -- add_raw_output ----------------------------------------------------
+    # -- add_raw_output, add_data_output -----------------------------------
     script_bytes: str | None = None
 
     # -- array_literal -----------------------------------------------------
     elements: list[str] | None = None
+
+    # -- raw_script: opaque opcode-byte span with declared stack arity -----
+    bytes: str | None = None
+    in_arity: int | None = None
+    out_arity: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +247,20 @@ def _decode_value(v: ANFValue, method_name: str, binding_name: str) -> None:
             pass
 
 
+def _is_decimal_bigint_literal(s: str) -> bool:
+    """True if ``s`` is a JS-style decimal BigInt literal: optional ``-``,
+    one or more ASCII digits, and a required trailing ``n``. Mirrors the
+    discriminator used by the Go IR decoder (compilers/go/ir/types.go).
+    """
+    if len(s) < 2 or s[-1] != "n":
+        return False
+    start = 1 if s[0] == "-" else 0
+    body = s[start:-1]
+    if not body:
+        return False
+    return all("0" <= c <= "9" for c in body)
+
+
 def _decode_const_value(
     v: ANFValue, method_name: str, binding_name: str
 ) -> None:
@@ -220,8 +276,17 @@ def _decode_const_value(
         v.const_bool = raw
         return
 
-    # String (hex-encoded bytes)
+    # String. Either a JS-style oversize BigInt literal ('123...n' with the
+    # canonical 'n' suffix) or a hex-encoded ByteString literal. The 'n'
+    # suffix is the discriminator — without it the two cases are
+    # indistinguishable when the literal is all-digit (e.g. '3030' is
+    # both a valid decimal integer AND a valid hex bytestring).
     if isinstance(raw, str):
+        if _is_decimal_bigint_literal(raw):
+            int_val = int(raw[:-1])
+            v.const_big_int = int_val
+            v.const_int = int_val
+            return
         v.const_string = raw
         return
 
@@ -260,11 +325,26 @@ def _anf_value_from_dict(d: dict[str, Any]) -> ANFValue:
     v.cond = d.get("cond")
     v.count = d.get("count")
     v.iter_var = d.get("iterVar")
+    # Loop start/step (issue #121). Accept both the JS-style bigint literal
+    # string ("0n") and a plain JSON integer for ``start``; ``step`` is always
+    # a small integer (1 or -1).
+    _start = d.get("start")
+    if isinstance(_start, str) and _start.endswith("n"):
+        v.start = int(_start[:-1])
+    elif _start is not None:
+        v.start = int(_start)
+    if d.get("step") is not None:
+        v.step = int(d.get("step"))
     v.preimage = d.get("preimage")
+    v.sighash_flag = d.get("sighashFlag")
     v.satoshis = d.get("satoshis")
     v.state_values = d.get("stateValues")
     v.script_bytes = d.get("scriptBytes")
     v.elements = d.get("elements")
+    v.bytes = d.get("bytes")
+    v.in_arity = d.get("in_arity")
+    v.out_arity = d.get("out_arity")
+    v.is_auto_injected_state_check = bool(d.get("isAutoInjectedStateCheck", False))
 
     # Nested bindings
     if "then" in d and d["then"] is not None:
@@ -297,6 +377,7 @@ def _anf_property_from_dict(d: dict[str, Any]) -> ANFProperty:
         type=d.get("type", ""),
         readonly=d.get("readonly", False),
         initial_value=d.get("initialValue"),
+        synthetic_array_chain=list(d.get("__syntheticArrayChain", [])),
     )
 
 
@@ -307,6 +388,7 @@ def _anf_method_from_dict(d: dict[str, Any]) -> ANFMethod:
         params=[_anf_param_from_dict(p) for p in d.get("params", [])],
         body=[_anf_binding_from_dict(b) for b in d.get("body", [])],
         is_public=d.get("isPublic", False),
+        sighash_type=d.get("sigHashType"),
     )
 
 

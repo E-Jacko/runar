@@ -7,8 +7,30 @@
  * while skipping on-chain-only operations like `check_preimage`,
  * `deserialize_state`, `get_state_script`, `add_output`, and `add_raw_output`.
  *
- * This enables the SDK to auto-compute `newState` for stateful contract
- * calls, so callers don't need to duplicate contract logic.
+ * Three execution modes:
+ *
+ *  1. **Lenient** (`computeNewState`, `computeNewStateAndDataOutputs`) —
+ *     skips `assert` predicates so the SDK can pre-compute the post-state
+ *     even when arguments wouldn't actually pass the on-chain script. This
+ *     is the canonical use: auto-deriving `newState` for the next call.
+ *  2. **Strict** (`executeStrict`) — evaluates every `assert` predicate and
+ *     throws `AssertionFailureError` (carrying the contract method + ANF
+ *     binding name of the failing predicate) on the first false assert. Use
+ *     for "will this call go through?" / "would the asserts hold" smoke
+ *     tests off-chain before paying broadcast fees. Crypto built-ins
+ *     (`checkSig`, `checkMultiSig`, `checkPreimage`) still mock-return
+ *     `true` — only explicit `assert(...)` predicates are enforced.
+ *  3. **On-chain authoritative** (`executeOnChainAuthoritative`) — strict
+ *     assert enforcement PLUS real ECDSA / SHA-256 preimage verification
+ *     against a caller-supplied `sighash`. The signature shape requires the
+ *     caller to provide the sighash up front, so it is impossible to invoke
+ *     this mode accidentally without the cryptographic inputs. Use this to
+ *     validate the exact transaction the caller intends to broadcast: a
+ *     `checkSig(sig, pk)` only passes if the supplied DER signature
+ *     verifies against the supplied compressed public key over the
+ *     supplied sighash, and `checkPreimage(preimage)` only passes if
+ *     `SHA256(SHA256(preimage)) === sighash` (the canonical BIP-143
+ *     `OP_PUSH_TX` semantic).
  */
 
 import type {
@@ -16,7 +38,14 @@ import type {
   ANFBinding,
   ANFValue,
 } from 'runar-ir-schema';
-import { Hash, Utils } from '@bsv/sdk';
+import { Hash, Utils, PublicKey, Signature, BigNumber } from '@bsv/sdk';
+// `verify` from @bsv/sdk's ECDSA module performs raw ECDSA verification
+// against an already-hashed digest. We use this rather than
+// `pubKey.verify(...)` (which internally sha256s its first arg) so the
+// `sighash` passed by the caller is treated as the actual ECDSA digest,
+// matching the on-chain CHECKSIG semantic where ECDSA verifies against
+// the BIP-143 sighash directly with no extra hashing.
+import { verify as ecdsaVerifyRaw } from '@bsv/sdk/primitives/ECDSA';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -29,14 +58,190 @@ import { Hash, Utils } from '@bsv/sdk';
  * @param methodName  The method to execute (must be a public method).
  * @param currentState  Current contract state (property name → value).
  * @param args        Method arguments (param name → value).
+ * @param constructorArgs  Constructor arg values (declaration order) for readonly fields.
  * @returns The updated state (merged with currentState).
  */
+export interface DataOutputEntry {
+  satoshis: bigint | number;
+  script: string;
+}
+
+/**
+ * Raw outputs produced by `this.addRawOutput(satoshis, scriptBytes)` in the
+ * method body. `script` is the **caller-supplied** locking-script bytes
+ * (hex-encoded), in contrast to `DataOutputEntry.script`, which is the hex
+ * payload that becomes part of an `OP_RETURN` data output. The simulator
+ * cannot introspect these bytes — it surfaces them so a caller building
+ * the broadcast transaction off-chain can splice them in at the correct
+ * position. Entries appear in declaration order, after the state output
+ * and after `dataOutputs`.
+ */
+export interface RawOutputEntry {
+  satoshis: bigint | number;
+  script: string;
+}
+
+/**
+ * The full result envelope produced by
+ * {@link computeNewStateAndDataOutputs}, {@link executeStrict}, and
+ * {@link executeOnChainAuthoritative}. All three modes return the same
+ * shape; mode-specific behaviour only changes whether asserts and crypto
+ * primitives are enforced or mocked, not what fields are populated.
+ */
+export interface ExecutionResult {
+  state: Record<string, unknown>;
+  dataOutputs: DataOutputEntry[];
+  rawOutputs: RawOutputEntry[];
+}
+
 export function computeNewState(
   anf: ANFProgram,
   methodName: string,
   currentState: Record<string, unknown>,
   args: Record<string, unknown>,
+  constructorArgs: unknown[] = [],
 ): Record<string, unknown> {
+  return computeNewStateAndDataOutputs(
+    anf, methodName, currentState, args, constructorArgs,
+  ).state;
+}
+
+/**
+ * Like {@link computeNewState} but also returns data outputs resolved
+ * from `this.addDataOutput(...)` and raw outputs resolved from
+ * `this.addRawOutput(...)` in the method body. Entries appear in
+ * declaration order and are what `buildCallTransaction` should emit
+ * between state outputs and the change output so the on-chain
+ * continuation-hash check passes.
+ */
+export function computeNewStateAndDataOutputs(
+  anf: ANFProgram,
+  methodName: string,
+  currentState: Record<string, unknown>,
+  args: Record<string, unknown>,
+  constructorArgs: unknown[] = [],
+): ExecutionResult {
+  return runMethod(anf, methodName, currentState, args, constructorArgs, null);
+}
+
+/**
+ * Thrown by {@link executeStrict} on the first failing `assert` predicate.
+ * Carries enough context to point a developer at the exact ANF binding
+ * that aborted: the method being executed and the binding name (e.g.
+ * `assertPositive` from the source `assert(amount > 0)`).
+ */
+export class AssertionFailureError extends Error {
+  readonly methodName: string;
+  readonly bindingName: string;
+  constructor(methodName: string, bindingName: string) {
+    super(
+      `assert failed in ${methodName}: binding '${bindingName}' evaluated to false`,
+    );
+    this.name = 'AssertionFailureError';
+    this.methodName = methodName;
+    this.bindingName = bindingName;
+  }
+}
+
+/**
+ * Strict-mode counterpart to {@link computeNewStateAndDataOutputs}: walks
+ * the same ANF body but throws {@link AssertionFailureError} on the first
+ * `assert(predicate)` whose predicate evaluates to a falsy value. Use this
+ * before broadcasting a transaction to surface guard failures off-chain
+ * instead of relying on a node rejection. Crypto built-ins (`checkSig`,
+ * `checkMultiSig`, `checkPreimage`) still mock-return `true` — strict mode
+ * only enforces explicit `assert(...)` predicates.
+ */
+export function executeStrict(
+  anf: ANFProgram,
+  methodName: string,
+  currentState: Record<string, unknown>,
+  args: Record<string, unknown>,
+  constructorArgs: unknown[] = [],
+): ExecutionResult {
+  return runMethod(anf, methodName, currentState, args, constructorArgs, {
+    methodName,
+  });
+}
+
+/**
+ * Required cryptographic context for {@link executeOnChainAuthoritative}.
+ *
+ * `sighash` is the 32-byte BIP-143 sighash digest the on-chain VM would
+ * verify signatures against (and that the caller would have signed with
+ * `LocalSigner.sign(...)` before broadcasting). The interpreter:
+ *
+ *  - verifies `checkSig(sig, pk)` by parsing `pk` as a compressed/uncompressed
+ *    secp256k1 point, parsing `sig` as DER (with optional trailing sighash byte
+ *    stripped), and calling `pubKey.verify(sighash, signature)` — a real
+ *    ECDSA verification. Any mismatch returns `false`, which then trips the
+ *    enclosing `assert(...)` and throws.
+ *  - verifies `checkMultiSig(sigs, pks)` by iterating signatures left-to-right
+ *    and consuming pubkeys greedily, mirroring Bitcoin's `OP_CHECKMULTISIG`.
+ *  - verifies `checkPreimage(preimage)` by computing `hash256(preimage)`
+ *    (i.e. `SHA256(SHA256(preimage))`) and comparing it to `sighash`
+ *    byte-for-byte — the on-chain `OP_PUSH_TX` semantic.
+ */
+export interface OnChainCryptoContext {
+  /** 32-byte BIP-143 sighash, as a hex string or `Uint8Array`. */
+  sighash: string | Uint8Array;
+}
+
+/**
+ * Like {@link executeStrict} but also performs real cryptographic
+ * verification of `checkSig`, `checkMultiSig`, and `checkPreimage` against
+ * the supplied `sighash`. Throws {@link AssertionFailureError} when any
+ * `assert(...)` (including the implicit one wrapping a failed crypto
+ * built-in) fires.
+ *
+ * The `ctx` parameter is mandatory and carries the sighash, so it is
+ * impossible to call this entry point accidentally without supplying the
+ * cryptographic inputs the verification needs.
+ */
+export function executeOnChainAuthoritative(
+  anf: ANFProgram,
+  methodName: string,
+  currentState: Record<string, unknown>,
+  args: Record<string, unknown>,
+  constructorArgs: unknown[],
+  ctx: OnChainCryptoContext,
+): ExecutionResult {
+  const sighash = normalizeSighash(ctx.sighash);
+  return runMethod(anf, methodName, currentState, args, constructorArgs, {
+    methodName,
+    realCrypto: { sighash },
+  });
+}
+
+interface StrictCtx {
+  methodName: string;
+  /** When set, crypto built-ins verify against this 32-byte sighash. */
+  realCrypto?: { sighash: number[] };
+}
+
+function normalizeSighash(sighash: string | Uint8Array): number[] {
+  let bytes: number[];
+  if (typeof sighash === 'string') {
+    bytes = Utils.toArray(sighash, 'hex');
+  } else {
+    bytes = Array.from(sighash);
+  }
+  if (bytes.length !== 32) {
+    throw new Error(
+      `executeOnChainAuthoritative: sighash must be exactly 32 bytes, got ${bytes.length}`,
+    );
+  }
+  return bytes;
+}
+
+function runMethod(
+  anf: ANFProgram,
+  methodName: string,
+  currentState: Record<string, unknown>,
+  args: Record<string, unknown>,
+  constructorArgs: unknown[],
+  strict: StrictCtx | null,
+): ExecutionResult {
   // Find the method in ANF
   const method = anf.methods.find(
     (m) => m.name === methodName && m.isPublic,
@@ -50,9 +255,24 @@ export function computeNewState(
   // Initialize the environment with property values and method params
   const env: Record<string, unknown> = {};
 
-  // Load properties
+  // Load properties: mutable fields from currentState, readonly fields
+  // from constructorArgs (matched by constructor param index, which excludes
+  // initialized properties).
+  // Build the constructor param index: position among non-initialized properties.
+  const ctorParamNames = anf.properties
+    .filter((p: { initialValue?: unknown }) => p.initialValue === undefined)
+    .map((p: { name: string }) => p.name);
   for (const prop of anf.properties) {
-    env[prop.name] = currentState[prop.name] ?? prop.initialValue;
+    if (prop.name in currentState) {
+      env[prop.name] = currentState[prop.name];
+    } else if (prop.initialValue !== undefined) {
+      env[prop.name] = prop.initialValue;
+    } else {
+      const ctorIdx = ctorParamNames.indexOf(prop.name);
+      if (ctorIdx >= 0 && ctorIdx < constructorArgs.length) {
+        env[prop.name] = constructorArgs[ctorIdx];
+      }
+    }
   }
 
   // Load method params (skip implicit ones injected by the compiler)
@@ -66,13 +286,19 @@ export function computeNewState(
     }
   }
 
-  // Track state mutations
+  // Track state mutations, data outputs, and raw outputs.
+  // `rawOutputs` holds entries from `add_raw_output` ANF kinds, which the
+  // simulator does NOT introspect (the script is caller-supplied). They
+  // are surfaced in the result envelope so an off-chain transaction
+  // builder can splice them in at the correct index.
   const stateDelta: Record<string, unknown> = {};
+  const dataOutputs: DataOutputEntry[] = [];
+  const rawOutputs: RawOutputEntry[] = [];
 
   // Walk bindings
-  evalBindings(method.body, env, stateDelta, anf);
+  evalBindings(method.body, env, stateDelta, dataOutputs, rawOutputs, anf, strict);
 
-  return { ...currentState, ...stateDelta };
+  return { state: { ...currentState, ...stateDelta }, dataOutputs, rawOutputs };
 }
 
 // ---------------------------------------------------------------------------
@@ -83,10 +309,15 @@ function evalBindings(
   bindings: ANFBinding[],
   env: Record<string, unknown>,
   stateDelta: Record<string, unknown>,
+  dataOutputs: DataOutputEntry[],
+  rawOutputs: RawOutputEntry[],
   anf?: ANFProgram,
+  strict: StrictCtx | null = null,
 ): void {
   for (const binding of bindings) {
-    const val = evalValue(binding.value, env, stateDelta, anf);
+    const val = evalValue(
+      binding.value, env, stateDelta, dataOutputs, rawOutputs, anf, strict, binding.name,
+    );
     env[binding.name] = val;
   }
 }
@@ -95,7 +326,11 @@ function evalValue(
   value: ANFValue,
   env: Record<string, unknown>,
   stateDelta: Record<string, unknown>,
+  dataOutputs: DataOutputEntry[],
+  rawOutputs: RawOutputEntry[],
   anf?: ANFProgram,
+  strict: StrictCtx | null = null,
+  bindingName: string = '<anonymous>',
 ): unknown {
   switch (value.kind) {
     case 'load_param':
@@ -124,8 +359,22 @@ function evalValue(
     case 'unary_op':
       return evalUnaryOp(value.op, env[value.operand], value.result_type);
 
-    case 'call':
-      return evalCall(value.func, value.args.map((a) => env[a]));
+    case 'call': {
+      // Strict mode: a `call(assert, x)` lowering path must enforce the
+      // predicate the same way the dedicated `assert` ANF node does.
+      if (strict && value.func === 'assert') {
+        const arg = env[value.args[0] ?? ''];
+        if (!isTruthy(arg)) {
+          throw new AssertionFailureError(strict.methodName, bindingName);
+        }
+        return undefined;
+      }
+      return evalCall(
+        value.func,
+        value.args.map((a) => env[a]),
+        strict?.realCrypto,
+      );
+    }
 
     case 'method_call':
       return evalMethodCall(
@@ -133,6 +382,8 @@ function evalValue(
         value.method,
         value.args.map((a: string) => env[a]),
         stateDelta,
+        dataOutputs,
+        rawOutputs,
         anf,
       );
 
@@ -141,7 +392,7 @@ function evalValue(
       const branch = isTruthy(cond) ? value.then : value.else;
       // Create a child env for the branch
       const childEnv = { ...env };
-      evalBindings(branch, childEnv, stateDelta, anf);
+      evalBindings(branch, childEnv, stateDelta, dataOutputs, rawOutputs, anf, strict);
       // Copy any new bindings back (the last binding is typically the branch result)
       Object.assign(env, childEnv);
       // Return the last binding's value from the branch
@@ -153,11 +404,15 @@ function evalValue(
 
     case 'loop': {
       const { count, body, iterVar } = value;
+      // Iteration `i` binds `iterVar = start + i*step` (issue #121). Older ANF
+      // payloads without start/step describe zero-start counting-up loops.
+      const start = (value as { start?: bigint }).start ?? 0n;
+      const step = BigInt((value as { step?: number }).step ?? 1);
       let lastVal: unknown;
       for (let i = 0; i < count; i++) {
-        env[iterVar] = BigInt(i);
+        env[iterVar] = start + BigInt(i) * step;
         const loopEnv = { ...env };
-        evalBindings(body, loopEnv, stateDelta, anf);
+        evalBindings(body, loopEnv, stateDelta, dataOutputs, rawOutputs, anf, strict);
         // Copy loop bindings back
         Object.assign(env, loopEnv);
         if (body.length > 0) {
@@ -168,7 +423,24 @@ function evalValue(
     }
 
     case 'assert': {
-      // In simulation, we skip asserts (the on-chain script handles enforcement)
+      if (strict) {
+        // Marker-based skip: the auto-injected stateful-continuation
+        // `assert(hash256(_) === extractOutputHash(_))` carries
+        // `isAutoInjectedStateCheck: true` (set in
+        // `packages/runar-compiler/src/passes/04-anf-lower.ts`). The
+        // on-chain VM is authoritative for that check; off-chain we
+        // have no realistic continuation hash. Developer-written
+        // covenant asserts with the identical IR shape carry no
+        // marker and ARE enforced (see BUG-002).
+        if ((value as { isAutoInjectedStateCheck?: boolean }).isAutoInjectedStateCheck === true) {
+          return undefined;
+        }
+        const predicate = env[value.value];
+        if (!isTruthy(predicate)) {
+          throw new AssertionFailureError(strict.methodName, bindingName);
+        }
+      }
+      // Lenient: skip asserts (the on-chain script handles enforcement)
       return undefined;
     }
 
@@ -195,11 +467,37 @@ function evalValue(
       return undefined;
     }
 
-    // On-chain-only operations — skip in simulation
+    case 'add_data_output': {
+      // Resolve the two arg refs from env and record the data output.
+      const sats = toBigInt(env[value.satoshis]);
+      const script = env[value.scriptBytes];
+      dataOutputs.push({
+        satoshis: sats,
+        script: typeof script === 'string' ? script : '',
+      });
+      return undefined;
+    }
+
+    case 'add_raw_output': {
+      // `addRawOutput(satoshis, scriptBytes)`. The simulator does not
+      // introspect the script bytes (they're caller-supplied raw locking
+      // script); it simply forwards them in the result envelope so an
+      // off-chain transaction builder can emit the output at the correct
+      // index. Crypto built-ins remain mocked even in strict mode.
+      const sats = toBigInt(env[value.satoshis]);
+      const script = env[value.scriptBytes];
+      rawOutputs.push({
+        satoshis: sats,
+        script: typeof script === 'string' ? script : '',
+      });
+      return undefined;
+    }
+
+    // On-chain-only operations — skip in simulation. These ANF kinds are
+    // markers consumed by the codegen, not by the off-chain interpreter.
     case 'check_preimage':
     case 'deserialize_state':
     case 'get_state_script':
-    case 'add_raw_output':
       return undefined;
 
     default:
@@ -289,12 +587,25 @@ function evalUnaryOp(op: string, operand: unknown, resultType?: string): unknown
 // Built-in function calls
 // ---------------------------------------------------------------------------
 
-function evalCall(func: string, args: unknown[]): unknown {
+function evalCall(
+  func: string,
+  args: unknown[],
+  realCrypto?: { sighash: number[] },
+): unknown {
   switch (func) {
-    // Crypto — mock
-    case 'checkSig': return true;
-    case 'checkMultiSig': return true;
-    case 'checkPreimage': return true;
+    // Crypto — mocked unless real-crypto context is present.
+    case 'checkSig': {
+      if (!realCrypto) return true;
+      return verifyEcdsa(args[0], args[1], realCrypto.sighash);
+    }
+    case 'checkMultiSig': {
+      if (!realCrypto) return true;
+      return verifyMultiSig(args[0], args[1], realCrypto.sighash);
+    }
+    case 'checkPreimage': {
+      if (!realCrypto) return true;
+      return verifyPreimage(args[0], realCrypto.sighash);
+    }
 
     // Crypto — real hashes
     case 'sha256': return hashFn('sha256', args[0]);
@@ -411,6 +722,8 @@ function evalCall(func: string, args: unknown[]): unknown {
     case 'extractOutputHash':
     case 'extractAmount':
       return '00'.repeat(32);
+    case 'extractLocktime':
+      return 0n;
 
     default:
       return undefined;
@@ -422,6 +735,8 @@ function evalMethodCall(
   methodName: string,
   args: unknown[],
   stateDelta: Record<string, unknown>,
+  dataOutputs: DataOutputEntry[],
+  rawOutputs: RawOutputEntry[],
   anf?: ANFProgram,
 ): unknown {
   // Private method calls appear in the ANF with their bodies available
@@ -446,7 +761,7 @@ function evalMethodCall(
 
       // Execute the method body — pass real stateDelta so update_prop
       // mutations in private methods are captured
-      evalBindings(method.body, methodEnv, stateDelta, anf);
+      evalBindings(method.body, methodEnv, stateDelta, dataOutputs, rawOutputs, anf);
 
       // Propagate property changes back to the caller's env
       for (const prop of anf.properties) {
@@ -548,6 +863,103 @@ function num2binHex(n: bigint, byteLen: number): string {
   bytes.length = byteLen;
 
   return bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ---------------------------------------------------------------------------
+// Real ECDSA / preimage verification (used by executeOnChainAuthoritative)
+// ---------------------------------------------------------------------------
+
+function toByteArray(v: unknown): number[] | null {
+  if (typeof v === 'string') {
+    if (v.length % 2 !== 0) return null;
+    if (!/^[0-9a-fA-F]*$/.test(v)) return null;
+    return Utils.toArray(v, 'hex');
+  }
+  if (v instanceof Uint8Array) return Array.from(v);
+  if (Array.isArray(v)) return v as number[];
+  return null;
+}
+
+function parseDerSignatureMaybeWithSighashByte(bytes: number[]): InstanceType<typeof Signature> | null {
+  if (bytes.length < 8 || bytes[0] !== 0x30) return null;
+  const declared = bytes[1]!;
+  const expected = declared + 2;
+  let pure: number[];
+  if (bytes.length === expected) {
+    pure = bytes;
+  } else if (bytes.length === expected + 1) {
+    // Drop trailing sighash type byte (e.g. 0x41 SIGHASH_ALL|FORKID).
+    pure = bytes.slice(0, expected);
+  } else {
+    pure = bytes;
+  }
+  try {
+    return Signature.fromDER(pure);
+  } catch {
+    return null;
+  }
+}
+
+function verifyEcdsa(
+  sigVal: unknown,
+  pkVal: unknown,
+  sighash: number[],
+): boolean {
+  const sigBytes = toByteArray(sigVal);
+  const pkBytes = toByteArray(pkVal);
+  if (!sigBytes || !pkBytes) return false;
+  try {
+    const pubKey = PublicKey.fromDER(pkBytes);
+    const sig = parseDerSignatureMaybeWithSighashByte(sigBytes);
+    if (!sig) return false;
+    // Raw ECDSA verify: treat `sighash` as the message digest directly,
+    // matching the on-chain CHECKSIG semantic (and the cross-tier real-
+    // crypto fixture convention). `pubKey.verify(msg, sig)` would re-hash
+    // `msg` with sha256 internally, which makes the TS verification
+    // disagree with every other SDK that simply ECDSA-verifies the
+    // supplied 32-byte digest.
+    const msgBN = new BigNumber(sighash);
+    return ecdsaVerifyRaw(msgBN, sig, pubKey);
+  } catch {
+    return false;
+  }
+}
+
+function verifyMultiSig(
+  sigsVal: unknown,
+  pksVal: unknown,
+  sighash: number[],
+): boolean {
+  if (!Array.isArray(sigsVal) || !Array.isArray(pksVal)) return false;
+  if (sigsVal.length > pksVal.length) return false;
+  let pkIdx = 0;
+  for (const sig of sigsVal) {
+    let matched = false;
+    while (pkIdx < pksVal.length) {
+      const ok = verifyEcdsa(sig, pksVal[pkIdx], sighash);
+      pkIdx++;
+      if (ok) { matched = true; break; }
+    }
+    if (!matched) return false;
+  }
+  return true;
+}
+
+/**
+ * BIP-143 / OP_PUSH_TX semantic: the on-chain check is
+ * `hash256(preimage) === sighash`. We replicate that: the supplied preimage
+ * is the serialised BIP-143 message; its double-SHA-256 must equal the
+ * sighash the caller provided to {@link executeOnChainAuthoritative}.
+ */
+function verifyPreimage(preimageVal: unknown, sighash: number[]): boolean {
+  const preBytes = toByteArray(preimageVal);
+  if (!preBytes) return false;
+  const computed = Hash.hash256(preBytes);
+  if (computed.length !== sighash.length) return false;
+  for (let i = 0; i < sighash.length; i++) {
+    if (computed[i] !== sighash[i]) return false;
+  }
+  return true;
 }
 
 function bin2numBigInt(hex: string): bigint {

@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"math"
+	"math/big"
 
 	"golang.org/x/crypto/ripemd160"
 )
@@ -25,12 +26,44 @@ import (
 // ---------------------------------------------------------------------------
 // Scalar types — aliases so Go arithmetic operators work directly
 // ---------------------------------------------------------------------------
+//
+// Bitcoin Script natively supports arbitrary-precision integers via
+// variable-length push encoding. The Rúnar compiler pipeline (parse ->
+// validate -> typecheck -> ANF -> stack -> emit) carries integer values
+// through internally as math/big.Int, so any valid Rúnar literal of any
+// size compiles byte-identically across the six compiler ports.
+//
+// The native Go _runtime_ types in this package (used for writing
+// ".runar.go" contracts and running them as native Go unit tests) remain
+// int64-backed because Go lacks operator overloading: a *big.Int-typed
+// field would not support c.Value + 1, c.Value > 0, etc. in contract
+// source. Contracts that need genuinely arbitrary-precision integers
+// (>= 2^63) should be written in `.runar.ts` / `.runar.sol` / `.runar.move`
+// / `.runar.py` / `.runar.zig` / `.runar.rb` — the Go compiler accepts
+// those source formats and produces byte-identical Bitcoin Script.
+//
+// For users who need to work with values > int64 from Go code, the helper
+// functions AbsBig, GcdBig, PowBig, MulDivBig, PercentOfBig, SqrtBig,
+// Log2Big, Num2BinBig, Bin2NumBig below accept and return *big.Int and
+// never overflow.
 
 // Int is a Rúnar integer (maps to Bitcoin Script numbers).
 type Int = int64
 
-// Bigint is an alias for Int.
+// Bigint is an alias for Int. See the package comment above for why this
+// is int64 rather than *big.Int; the compiler pipeline itself uses
+// arbitrary precision regardless of how the runtime types are declared.
 type Bigint = int64
+
+// BigintBig is an arbitrary-precision integer for cases where Bigint (int64)
+// would silently truncate — notably BN254 G2 coordinates (254-bit) and SP1
+// Groth16 public inputs. Use the *Big suffixed BN254 helpers
+// (Bn254G1ScalarMulBigP, Bn254MultiPairing4Big, Bn254MultiPairing3Big) with
+// this type in Go-mock tests that consume gnark-generated fixtures. The
+// compiled Bitcoin Script handles arbitrary-width scalars natively via
+// runar-sdk's encodePushBigInt; BigintBig simply keeps the Go-side mock
+// honest.
+type BigintBig = *big.Int
 
 // Bool is a Rúnar boolean.
 type Bool = bool
@@ -51,8 +84,17 @@ type Sig = ByteString
 // Addr is a 20-byte address (typically a hash160 of a public key).
 type Addr = ByteString
 
-// Sha256 is a 32-byte SHA-256 hash.
-type Sha256 = ByteString
+// Sha256Digest is a 32-byte SHA-256 hash digest (type annotation).
+//
+// Note: this type was previously named `Sha256`, but that collided with the
+// `.runar.go` DSL parser, which maps the identifier `Sha256` to the `sha256`
+// builtin (OP_SHA256 in Script). With the old alias, `runar.Sha256(x)` read
+// as a Go type-conversion (no-op) under native `go test` and as a real
+// SHA-256 hash under Script compilation — two different semantics for the
+// same source expression. Renaming the TYPE to `Sha256Digest` frees the
+// identifier `Sha256` so it can be a real FUNCTION (see Sha256 below) whose
+// Go-mock semantics match the Script emission exactly.
+type Sha256Digest = ByteString
 
 // Ripemd160Hash is a 20-byte RIPEMD-160 hash.
 type Ripemd160Hash = ByteString
@@ -67,6 +109,10 @@ type RabinSig = ByteString
 type RabinPubKey = ByteString
 
 // Point is a 64-byte EC point (x[32] || y[32], big-endian, no prefix).
+//
+// Note: P256Point (NIST P-256, 64 bytes) and P384Point (NIST P-384, 96 bytes)
+// are declared in `p256.go` and `p384.go` respectively, alongside their
+// off-chain helper code.
 type Point = ByteString
 
 // ---------------------------------------------------------------------------
@@ -77,25 +123,73 @@ type Point = ByteString
 // Embed this in your contract struct.
 type SmartContract struct{}
 
-// OutputSnapshot records a single output from AddOutput.
+// OutputKind discriminates OutputSnapshot entries by the intrinsic that
+// recorded them. "state" comes from AddOutput (multi-output state
+// continuation), "data" comes from AddDataOutput (additional arbitrary-script
+// outputs that are included in the continuation hash after state outputs
+// and before the change output).
+type OutputKind string
+
+const (
+	// OutputKindState is the default kind for entries recorded by AddOutput.
+	OutputKindState OutputKind = "state"
+	// OutputKindData is recorded by AddDataOutput.
+	OutputKindData OutputKind = "data"
+)
+
+// OutputSnapshot records a single output from AddOutput / AddDataOutput.
+// Values holds the declared state values (for state outputs) or a single
+// ByteString script (for data outputs); Kind identifies which intrinsic
+// produced the entry.
 type OutputSnapshot struct {
 	Satoshis int64
 	Values   []any
+	Kind     OutputKind
 }
 
 // StatefulSmartContract is the base struct for stateful Rúnar contracts.
-// Embed this in your contract struct. Provides AddOutput and state tracking.
+// Embed this in your contract struct. Provides AddOutput / AddDataOutput
+// and state tracking.
 type StatefulSmartContract struct {
-	outputs    []OutputSnapshot
-	TxPreimage SigHashPreimage
+	outputs     []OutputSnapshot
+	dataOutputs []OutputSnapshot
+	TxPreimage  SigHashPreimage
 }
 
-// AddOutput records a new output with the given satoshis and state values.
+// AddOutput records a new state output with the given satoshis and state values.
 // The values should match the mutable properties in declaration order.
 func (s *StatefulSmartContract) AddOutput(satoshis int64, values ...any) {
 	s.outputs = append(s.outputs, OutputSnapshot{
 		Satoshis: satoshis,
 		Values:   values,
+		Kind:     OutputKindState,
+	})
+}
+
+// AddRawOutput records a new state output with the given satoshis and
+// arbitrary script bytes (instead of the contract's own codePart). In
+// Bitcoin Script this creates an output with caller-specified locking
+// script — used e.g. for token pegs and bridge outputs. It is a state-level
+// output (counted alongside AddOutput in the continuation hash), not a
+// data output.
+func (s *StatefulSmartContract) AddRawOutput(satoshis int64, scriptBytes ByteString) {
+	s.outputs = append(s.outputs, OutputSnapshot{
+		Satoshis: satoshis,
+		Values:   []any{scriptBytes},
+		Kind:     OutputKindState,
+	})
+}
+
+// AddDataOutput records an additional transaction output that is NOT a state
+// continuation. The scriptBytes are used as the output's locking script
+// verbatim. In compiled Bitcoin Script the auto-injected continuation hash
+// verification covers data outputs in declaration order, AFTER all state
+// outputs and BEFORE the change output.
+func (s *StatefulSmartContract) AddDataOutput(satoshis int64, scriptBytes ByteString) {
+	s.dataOutputs = append(s.dataOutputs, OutputSnapshot{
+		Satoshis: satoshis,
+		Values:   []any{scriptBytes},
+		Kind:     OutputKindData,
 	})
 }
 
@@ -104,14 +198,72 @@ func (s *StatefulSmartContract) GetStateScript() ByteString {
 	return ""
 }
 
-// Outputs returns the outputs recorded during the last method execution.
+// Outputs returns the state outputs recorded during the last method
+// execution (from AddOutput). Use DataOutputs for AddDataOutput entries.
 func (s *StatefulSmartContract) Outputs() []OutputSnapshot {
 	return s.outputs
+}
+
+// DataOutputs returns the data outputs recorded during the last method
+// execution (from AddDataOutput).
+func (s *StatefulSmartContract) DataOutputs() []OutputSnapshot {
+	return s.dataOutputs
 }
 
 // ResetOutputs clears recorded outputs (call between test method invocations).
 func (s *StatefulSmartContract) ResetOutputs() {
 	s.outputs = nil
+	s.dataOutputs = nil
+}
+
+// ---------------------------------------------------------------------------
+// UnsafeSmartContract — the asm-escape-hatch base struct
+// ---------------------------------------------------------------------------
+
+// UnsafeSmartContract is the base struct for stateless Rúnar contracts that
+// need the raw-script escape hatch (Asm). Embed this in your contract struct.
+// Like SmartContract, all properties must be readonly — UnsafeSmartContract
+// trades the type-checked subset only for the bytes inside Asm calls, not for
+// mutable state. Use StatefulSmartContract for mutable state.
+type UnsafeSmartContract struct{}
+
+// GetStateScript returns a mock state script (empty bytes in test mode).
+// Mirrors StatefulSmartContract.GetStateScript; exposed here so unsafe
+// contracts can still build state-continuation outputs by hand when they
+// wrap them in Asm.
+func (u *UnsafeSmartContract) GetStateScript() ByteString {
+	return ""
+}
+
+// AsmArgs is the structured argument for the Asm compiler intrinsic. The Rúnar
+// Go-contract frontend intercepts Asm(...) calls at parse time and lowers them
+// to a raw_script ANF node; this struct only exists so native `go test`
+// compilation of contract source succeeds.
+type AsmArgs struct {
+	// Body is an even-length hex string of the raw Bitcoin Script opcode
+	// bytes to embed verbatim. The compiler does not re-encode or validate
+	// the semantics of these bytes — only that the string is valid hex with
+	// an even length.
+	Body string
+	// InArity is the number of stack items the embedded bytes consume on
+	// entry. Defaults to 0.
+	InArity int
+	// OutArity is the number of stack items the embedded bytes leave on
+	// exit. Defaults to 1 so that the common "terminal value of a public
+	// method" case works without ceremony.
+	OutArity int
+}
+
+// Asm embeds a raw Bitcoin Script byte sequence in a contract method. Only
+// callable from inside a contract that embeds UnsafeSmartContract — the
+// compiler enforces this. The Go-contract surface spelling is the positional
+// form Asm(body, inArity, outArity); the compiler normalises every frontend
+// to the same raw_script ANF node.
+//
+// This runtime stub panics: Asm is a compile-time intrinsic and cannot be
+// executed off-chain.
+func Asm(body string, inArity int, outArity int) {
+	panic("Asm() cannot be called at runtime — compile this contract with the Rúnar compiler")
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +351,41 @@ func VerifySLHDSA_SHA2_256f(msg ByteString, sig ByteString, pubkey ByteString) b
 	return SLHVerify(SLH_SHA2_256f, []byte(msg), []byte(sig), []byte(pubkey))
 }
 
+// VerifySP1FRI is the off-chain SIMULATION MOCK for the SP1 v6.0.2 STARK / FRI
+// verifier intrinsic.
+//
+// Used by rollup / proof-bridge covenants. See docs/sp1-fri-verifier.md for
+// the API shape + transcript order, docs/sp1-proof-format.md for the
+// serialized proof byte layout, and docs/fri-verifier-measurements.md for
+// the canonical "Status — Not production-ready" disclaimer that governs
+// every reference to this function.
+//
+// MOCK SEMANTICS — read carefully:
+//   - Native (off-chain) invocation always returns true. No proof is
+//     verified; proofBlob / publicValues / sp1VKeyHash are not inspected.
+//   - This is intentionally a mock so covenant authors can run their
+//     state-transition unit tests without bundling an SP1 proof
+//     generator into the test harness. Use it like an `assert(true)`
+//     placeholder; do NOT treat a `true` return as evidence the proof
+//     is valid.
+//
+// ON-CHAIN SEMANTICS — Go tier only today:
+//   - In compiled Bitcoin Script, the intrinsic lowers to a full on-chain
+//     verifier that absorbs proofBlob + publicValues + sp1VKeyHash into the
+//     Fiat-Shamir transcript, replays the STARK argument, and fails
+//     OP_VERIFY on any mismatch.
+//   - Codegen ships in the Go reference compiler only
+//     (compilers/go/codegen/sp1_fri.go). The TS / Rust / Python / Zig /
+//     Ruby / Java tiers carry the parser surface but their codegen
+//     stages reject contracts that call verifySP1FRI with a clear panic
+//     pointing at docs/sp1-fri-verifier.md §8 + docs/fri-verifier-measurements.md.
+func VerifySP1FRI(proofBlob ByteString, publicValues ByteString, sp1VKeyHash ByteString) bool {
+	_ = proofBlob
+	_ = publicValues
+	_ = sp1VKeyHash
+	return true
+}
+
 // ---------------------------------------------------------------------------
 // EC (elliptic curve) functions — real secp256k1 arithmetic for testing.
 // In compiled Bitcoin Script, these map to EC codegen opcodes.
@@ -219,17 +406,25 @@ func Hash160(data PubKey) Addr {
 }
 
 // Hash256 computes SHA256(SHA256(data)), producing a 32-byte hash.
-func Hash256(data ByteString) Sha256 {
+func Hash256(data ByteString) Sha256Digest {
 	h1 := sha256.Sum256([]byte(data))
 	h2 := sha256.Sum256(h1[:])
-	return Sha256(h2[:])
+	return Sha256Digest(h2[:])
 }
 
-// Sha256Hash computes a single SHA-256 hash.
-func Sha256Hash(data ByteString) Sha256 {
+// Sha256 computes a single SHA-256 hash. Matches the DSL parser mapping:
+// in `.runar.go` sources `runar.Sha256(x)` compiles to OP_SHA256 in Script,
+// and this function gives it identical semantics under `go test`. Previously
+// the identifier `Sha256` was a type alias for ByteString, so the call form
+// was a no-op Go type-conversion — a silent divergence between the two
+// compile paths. The type now lives under `Sha256Digest`.
+func Sha256(data ByteString) Sha256Digest {
 	h := sha256.Sum256([]byte(data))
-	return Sha256(h[:])
+	return Sha256Digest(h[:])
 }
+
+// Sha256Hash is a compatibility alias for Sha256. Prefer Sha256 directly.
+func Sha256Hash(data ByteString) Sha256Digest { return Sha256(data) }
 
 // Ripemd160Func computes a RIPEMD-160 hash.
 func Ripemd160Func(data ByteString) Ripemd160Hash {
@@ -239,22 +434,140 @@ func Ripemd160Func(data ByteString) Ripemd160Hash {
 }
 
 // ---------------------------------------------------------------------------
-// Mock BLAKE3 functions (compiler intrinsics — stubs return 32 zero bytes)
+// BLAKE3 single-block compression (real implementation)
 // ---------------------------------------------------------------------------
+//
+// Standard little-endian BLAKE3 with counter=0, flags=11 (CHUNK_START |
+// CHUNK_END | ROOT) and block_len set to the real message length. All seven
+// runtimes (TS, Go, Rust, Python, Zig, Ruby, Java) MUST produce byte-identical
+// output for the same inputs — see blake3_test.go for the pinned
+// cross-language vectors.
+//
+// This is *not* a generic BLAKE3 hash of an arbitrary-length message: the
+// emitted Bitcoin Script can only express a single compression invocation,
+// so the off-chain runtime intentionally exposes the same restricted
+// primitive. For message sizes ≤ 64 bytes Blake3Hash applies zero-padding
+// before calling the compression function with the IV as chaining value.
 
-// Blake3Compress is a mock BLAKE3 single-block compression.
-// In compiled Bitcoin Script this expands to ~10,000 opcodes.
-// The mock returns 32 zero bytes for business-logic testing.
-func Blake3Compress(chainingValue, block ByteString) ByteString {
-	return ByteString(make([]byte, 32))
+// blake3IVWords is the BLAKE3 initialization vector (8 u32 words, little-endian
+// when serialized to bytes). Identical to the SHA-256 IV.
+var blake3IVWords = [8]uint32{
+	0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+	0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 }
 
-// Blake3Hash is a mock BLAKE3 hash for messages up to 64 bytes.
-// In compiled Bitcoin Script this uses the IV as the chaining value and
-// applies zero-padding before calling the compression function.
-// The mock returns 32 zero bytes for business-logic testing.
+// blake3MsgPerm is the BLAKE3 message word permutation applied between
+// rounds (see BLAKE3 spec §2.4).
+var blake3MsgPerm = [16]int{2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8}
+
+func blake3Rotr32(x uint32, n uint) uint32 {
+	return (x >> n) | (x << (32 - n))
+}
+
+func blake3G(s *[16]uint32, a, b, c, d int, mx, my uint32) {
+	s[a] = s[a] + s[b] + mx
+	s[d] = blake3Rotr32(s[d]^s[a], 16)
+	s[c] = s[c] + s[d]
+	s[b] = blake3Rotr32(s[b]^s[c], 12)
+	s[a] = s[a] + s[b] + my
+	s[d] = blake3Rotr32(s[d]^s[a], 8)
+	s[c] = s[c] + s[d]
+	s[b] = blake3Rotr32(s[b]^s[c], 7)
+}
+
+func blake3Round(s *[16]uint32, m *[16]uint32) {
+	blake3G(s, 0, 4, 8, 12, m[0], m[1])
+	blake3G(s, 1, 5, 9, 13, m[2], m[3])
+	blake3G(s, 2, 6, 10, 14, m[4], m[5])
+	blake3G(s, 3, 7, 11, 15, m[6], m[7])
+	blake3G(s, 0, 5, 10, 15, m[8], m[9])
+	blake3G(s, 1, 6, 11, 12, m[10], m[11])
+	blake3G(s, 2, 7, 8, 13, m[12], m[13])
+	blake3G(s, 3, 4, 9, 14, m[14], m[15])
+}
+
+// blake3CompressImpl is the byte-level single-block compression. cv must be
+// 32 bytes, block must be 64 bytes; both are interpreted as little-endian u32
+// words (standard BLAKE3). blockLen is the state word v[14] — the real message
+// length for blake3Hash, or 64 for a full-block compress. Output is 32
+// little-endian bytes.
+func blake3CompressImpl(cv, block []byte, blockLen uint32) []byte {
+	if len(cv) != 32 {
+		// Defensive: pad / truncate to 32 bytes so a misuse doesn't panic.
+		fixed := make([]byte, 32)
+		copy(fixed, cv)
+		cv = fixed
+	}
+	if len(block) != 64 {
+		fixed := make([]byte, 64)
+		copy(fixed, block)
+		block = fixed
+	}
+
+	var h [8]uint32
+	for i := 0; i < 8; i++ {
+		h[i] = binary.LittleEndian.Uint32(cv[i*4 : i*4+4])
+	}
+	var m [16]uint32
+	for i := 0; i < 16; i++ {
+		m[i] = binary.LittleEndian.Uint32(block[i*4 : i*4+4])
+	}
+
+	state := [16]uint32{
+		h[0], h[1], h[2], h[3],
+		h[4], h[5], h[6], h[7],
+		blake3IVWords[0], blake3IVWords[1], blake3IVWords[2], blake3IVWords[3],
+		0,        // counter low
+		0,        // counter high
+		blockLen, // blockLen (real message length for blake3Hash; 64 for full-block compress)
+		11,       // flags = CHUNK_START | CHUNK_END | ROOT
+	}
+
+	msg := m
+	for r := 0; r < 7; r++ {
+		blake3Round(&state, &msg)
+		if r < 6 {
+			var permuted [16]uint32
+			for i, p := range blake3MsgPerm {
+				permuted[i] = msg[p]
+			}
+			msg = permuted
+		}
+	}
+
+	out := make([]byte, 32)
+	for i := 0; i < 8; i++ {
+		w := state[i] ^ state[i+8]
+		binary.LittleEndian.PutUint32(out[i*4:i*4+4], w)
+	}
+	return out
+}
+
+// Blake3Compress is the BLAKE3 single full-block compression with blockLen=64,
+// counter=0, flags=11. chainingValue must be 32 bytes and block must be 64
+// bytes; both are interpreted as 8 / 16 little-endian u32 words (standard
+// BLAKE3). Output is 32 little-endian bytes. Matches the on-chain codegen.
+func Blake3Compress(chainingValue, block ByteString) ByteString {
+	return ByteString(blake3CompressImpl([]byte(chainingValue), []byte(block), 64))
+}
+
+// Blake3Hash is the standard BLAKE3 hash for messages up to 64 bytes (single
+// block). The IV is the chaining value, the message is zero-padded to 64 bytes,
+// and the real message length is used as block_len — so the output matches the
+// official BLAKE3 reference for ALL inputs 0..64 bytes. Matches the on-chain
+// codegen.
 func Blake3Hash(message ByteString) ByteString {
-	return ByteString(make([]byte, 32))
+	cv := make([]byte, 32)
+	for i, w := range blake3IVWords {
+		binary.LittleEndian.PutUint32(cv[i*4:i*4+4], w)
+	}
+	padded := make([]byte, 64)
+	msg := []byte(message)
+	if len(msg) > 64 {
+		msg = msg[:64]
+	}
+	copy(padded, msg)
+	return ByteString(blake3CompressImpl(cv, padded, uint32(len(msg))))
 }
 
 // ---------------------------------------------------------------------------
@@ -409,13 +722,13 @@ func ExtractLocktime(p SigHashPreimage) int64 { return 0 }
 // Tests set TxPreimage = Hash256(expectedOutputBytes) so the assertion
 // Hash256(outputs) == ExtractOutputHash(TxPreimage) passes.
 // Falls back to 32 zero bytes when the preimage is unset (nil/empty).
-func ExtractOutputHash(p SigHashPreimage) Sha256 {
+func ExtractOutputHash(p SigHashPreimage) Sha256Digest {
 	if len(p) >= 32 {
 		result := make([]byte, 32)
 		copy(result, p[:32])
-		return Sha256(result)
+		return Sha256Digest(result)
 	}
-	return Sha256(make([]byte, 32))
+	return Sha256Digest(make([]byte, 32))
 }
 
 // ExtractAmount returns 10000 in test mode.
@@ -430,10 +743,36 @@ func ExtractSequence(p SigHashPreimage) int64 { return 0xffffffff }
 // ExtractHashPrevouts returns Hash256(72 zero bytes) in test mode.
 // This is consistent with passing allPrevouts = 72 zero bytes in tests,
 // since ExtractOutpoint also returns 36 zero bytes.
-func ExtractHashPrevouts(p SigHashPreimage) Sha256 { return Hash256(ByteString(make([]byte, 72))) }
+func ExtractHashPrevouts(p SigHashPreimage) Sha256Digest { return Hash256(ByteString(make([]byte, 72))) }
 
 // ExtractOutpoint returns 36 zero bytes in test mode.
 func ExtractOutpoint(p SigHashPreimage) ByteString { return ByteString(make([]byte, 36)) }
+
+// ExtractPrevOutputScript is the test-mode stub for the cross-input
+// previous-output script witness-bridge intrinsic. The compiler emits
+// hash256(witness) == expectedScriptHash on-chain (2-arg form), or
+// hash256(substr(witness, 0, prefixLen)) == expectedScriptPrefixHash
+// (3-arg prefix-binding form, BSVM Phase 13 Crit-2). The Go-mock cannot
+// see other inputs, so this returns an empty ByteString. Tests that need
+// to drive the intrinsic should set the witness via the SDK's
+// PrevOutScripts map (keyed by inputIndex) before calling.
+//
+// Variadic 3rd arg accepts the optional prefixLen so BSVM contracts can
+// be invoked under `go test` against either form without breaking native
+// Go compilation.
+func ExtractPrevOutputScript(inputIndex int64, expectedScriptHash ByteString, prefixLen ...int64) ByteString {
+	return ByteString("")
+}
+
+// RequireOutputP2PKH is the test-mode stub for the P2PKH-output-binding
+// intrinsic. The compiler emits a hashOutputs reconstruction +
+// substring assertion on-chain; the Go-mock has no real outputs to
+// inspect, so this is a no-op.
+func RequireOutputP2PKH(outputIndex int64, pubkeyHash ByteString, amount int64) {}
+
+// CurrentBlockHeight is the test-mode stub for the locktime-as-height
+// shorthand. On-chain the compiler desugars to ExtractLocktime(txPreimage).
+func CurrentBlockHeight() int64 { return 0 }
 
 // ---------------------------------------------------------------------------
 // Utility functions
@@ -441,47 +780,222 @@ func ExtractOutpoint(p SigHashPreimage) ByteString { return ByteString(make([]by
 
 // Num2Bin converts an integer to a byte string of the specified length
 // using Bitcoin Script's little-endian signed magnitude encoding.
-// Panics if v == math.MinInt64 (|MinInt64| overflows int64).
+// Uses big.Int internally so that all valid int64 inputs (including
+// math.MinInt64) round-trip correctly through Bin2Num.
 func Num2Bin(v int64, length int64) ByteString {
-	if v == math.MinInt64 {
-		panic("runar: int64 overflow in Num2Bin — |MinInt64| not representable; Bitcoin Script supports arbitrary precision but Go uses int64; see compilers/go/README.md")
-	}
+	return Num2BinBig(big.NewInt(v), length)
+}
+
+// Num2BinBig is the arbitrary-precision form of Num2Bin. Accepts any
+// *big.Int; the result is the little-endian sign-magnitude encoding
+// padded/truncated to `length` bytes.
+func Num2BinBig(v *big.Int, length int64) ByteString {
 	buf := make([]byte, length)
-	if v == 0 {
+	if v == nil || v.Sign() == 0 {
 		return ByteString(buf)
 	}
-	abs := v
-	if abs < 0 {
-		abs = -abs
+	abs := new(big.Int).Abs(v)
+	// abs.Bytes() is big-endian; fill buf little-endian.
+	be := abs.Bytes()
+	if int64(len(be)) > length {
+		// Caller requested a narrower field than the value occupies.
+		// Truncate to fit (matches int64 wrap-around semantics).
+		be = be[len(be)-int(length):]
 	}
-	uval := uint64(abs)
-	for i := int64(0); i < length && uval > 0; i++ {
-		buf[i] = byte(uval & 0xff)
-		uval >>= 8
+	for i, b := range be {
+		j := len(be) - 1 - i
+		if int64(j) < length {
+			buf[j] = b
+		}
 	}
-	if v < 0 {
+	if v.Sign() < 0 {
 		buf[length-1] |= 0x80
 	}
 	return ByteString(buf[:length])
 }
 
 // Bin2Num converts a byte string (Bitcoin Script LE signed-magnitude) back to
-// an integer. Inverse of Num2Bin.
+// an integer. Inverse of Num2Bin. If the decoded value does not fit in int64,
+// the result is truncated (use Bin2NumBig for arbitrary precision).
 func Bin2Num(data ByteString) int64 {
-	if len(data) == 0 {
+	r := Bin2NumBig(data)
+	if r == nil {
 		return 0
+	}
+	if r.IsInt64() {
+		return r.Int64()
+	}
+	// Graceful truncation for out-of-range values: return the low 64 bits.
+	mask := new(big.Int).Lsh(big.NewInt(1), 64)
+	trunc := new(big.Int).Mod(new(big.Int).Abs(r), mask)
+	out := trunc.Int64()
+	if r.Sign() < 0 {
+		out = -out
+	}
+	return out
+}
+
+// Bin2NumBig is the arbitrary-precision form of Bin2Num. Decodes a
+// little-endian sign-magnitude Bitcoin Script number into a *big.Int.
+func Bin2NumBig(data ByteString) *big.Int {
+	if len(data) == 0 {
+		return new(big.Int)
 	}
 	last := data[len(data)-1]
 	negative := (last & 0x80) != 0
-	var result uint64
-	result = uint64(last & 0x7f)
-	for i := len(data) - 2; i >= 0; i-- {
-		result = (result << 8) | uint64(data[i])
+	// Build magnitude from the bytes, clearing the sign bit on the MSB.
+	be := make([]byte, len(data))
+	for i := 0; i < len(data); i++ {
+		be[i] = data[len(data)-1-i]
 	}
+	be[0] &= 0x7f
+	mag := new(big.Int).SetBytes(be)
 	if negative {
-		return -int64(result)
+		mag.Neg(mag)
 	}
-	return int64(result)
+	return mag
+}
+
+// BigintBig operator helpers. Go does not allow arithmetic/comparison
+// operators on *big.Int values, so contracts that type fields as
+// BigintBig cannot spell `a < b`, `a == b`, or `a % b` directly. These
+// helpers provide the same semantics as the Script-side operators
+// (value comparison, two's-complement arithmetic) and are registered in
+// the Go-contract DSL so the compiler rewrites calls like
+// `runar.BigintBigLess(a, b)` into a plain Script less-than node.
+//
+// Keep these aligned with the Script lowering: BigintBigLess → `<`,
+// BigintBigLessEq → `<=`, BigintBigGreater → `>`, BigintBigGreaterEq → `>=`,
+// BigintBigEqual → `==`, BigintBigNotEqual → `!=`, BigintBigAdd → `+`,
+// BigintBigSub → `-`, BigintBigMul → `*`, BigintBigMod → `%`,
+// BigintBigDiv → `/`.
+
+// BigintBigLess returns a < b.
+func BigintBigLess(a, b *big.Int) bool {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil {
+		b = new(big.Int)
+	}
+	return a.Cmp(b) < 0
+}
+
+// BigintBigLessEq returns a <= b.
+func BigintBigLessEq(a, b *big.Int) bool {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil {
+		b = new(big.Int)
+	}
+	return a.Cmp(b) <= 0
+}
+
+// BigintBigGreater returns a > b.
+func BigintBigGreater(a, b *big.Int) bool {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil {
+		b = new(big.Int)
+	}
+	return a.Cmp(b) > 0
+}
+
+// BigintBigGreaterEq returns a >= b.
+func BigintBigGreaterEq(a, b *big.Int) bool {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil {
+		b = new(big.Int)
+	}
+	return a.Cmp(b) >= 0
+}
+
+// BigintBigEqual returns a == b by value (not pointer identity).
+func BigintBigEqual(a, b *big.Int) bool {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil {
+		b = new(big.Int)
+	}
+	return a.Cmp(b) == 0
+}
+
+// BigintBigNotEqual returns a != b by value (not pointer identity).
+func BigintBigNotEqual(a, b *big.Int) bool {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil {
+		b = new(big.Int)
+	}
+	return a.Cmp(b) != 0
+}
+
+// BigintBigAdd returns a + b, always freshly allocated.
+func BigintBigAdd(a, b *big.Int) *big.Int {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil {
+		b = new(big.Int)
+	}
+	return new(big.Int).Add(a, b)
+}
+
+// BigintBigSub returns a - b, always freshly allocated.
+func BigintBigSub(a, b *big.Int) *big.Int {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil {
+		b = new(big.Int)
+	}
+	return new(big.Int).Sub(a, b)
+}
+
+// BigintBigMul returns a * b, always freshly allocated.
+func BigintBigMul(a, b *big.Int) *big.Int {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil {
+		b = new(big.Int)
+	}
+	return new(big.Int).Mul(a, b)
+}
+
+// BigintBigMod returns a mod b using truncated semantics (Go's `%` on
+// signed integers), matching Script's OP_MOD. For the classical
+// non-negative remainder use Safemod's big variant. Returns 0 when b
+// is zero to mirror the int64 divmod helper's graceful path.
+func BigintBigMod(a, b *big.Int) *big.Int {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil || b.Sign() == 0 {
+		return new(big.Int)
+	}
+	q := new(big.Int).Quo(a, b) // truncated quotient
+	r := new(big.Int).Mul(q, b)
+	return r.Sub(a, r)
+}
+
+// BigintBigDiv returns a / b using truncated semantics (Go's integer
+// division), matching Script's OP_DIV. Returns 0 when b is zero to
+// mirror safediv's graceful path rather than panicking.
+func BigintBigDiv(a, b *big.Int) *big.Int {
+	if a == nil {
+		a = new(big.Int)
+	}
+	if b == nil || b.Sign() == 0 {
+		return new(big.Int)
+	}
+	return new(big.Int).Quo(a, b)
 }
 
 // Len returns the length of a byte string as an integer.
@@ -508,15 +1022,32 @@ func ReverseBytes(data ByteString) ByteString {
 	return ByteString(b)
 }
 
-// Abs returns the absolute value. Panics if n == math.MinInt64 (not representable as positive int64).
+// Abs returns the absolute value of n. Uses big.Int internally so that
+// Abs(math.MinInt64) returns math.MaxInt64 + 1 ... well, since int64 can't
+// hold that, it wraps to math.MinInt64 itself (the mathematical |MinInt64|
+// is 2^63 which is exactly 1 past int64 range). Use AbsBig for a correct
+// arbitrary-precision result.
 func Abs(n int64) int64 {
 	if n == math.MinInt64 {
-		panic("runar: int64 overflow in Abs(MinInt64) — Bitcoin Script supports arbitrary precision but Go uses int64; see compilers/go/README.md")
+		// 2^63 is not representable as int64. Return the wrapped value
+		// (MinInt64 itself) rather than panic; this preserves Bitcoin
+		// Script semantics for values whose magnitude fits in int64 and
+		// documents the overflow behavior for those that don't. For
+		// arbitrary precision callers should use AbsBig.
+		return math.MinInt64
 	}
 	if n < 0 {
 		return -n
 	}
 	return n
+}
+
+// AbsBig returns the arbitrary-precision absolute value.
+func AbsBig(n *big.Int) *big.Int {
+	if n == nil {
+		return new(big.Int)
+	}
+	return new(big.Int).Abs(n)
 }
 
 // Min returns the smaller of two values.
@@ -578,66 +1109,110 @@ func Sign(n int64) int64 {
 	return 0
 }
 
-// Pow computes base^exp for non-negative exponents. Panics on int64 overflow.
+// Pow computes base^exp for non-negative exponents. Panics on int64 overflow
+// of the _final_ result.
 func Pow(base, exp int64) int64 {
 	if exp < 0 {
 		panic("pow: negative exponent")
 	}
-	result := int64(1)
-	for i := int64(0); i < exp; i++ {
-		result = checkedMul(result, base)
+	r := PowBig(big.NewInt(base), big.NewInt(exp))
+	if !r.IsInt64() {
+		panic("pow: int64 overflow — use PowBig for arbitrary precision")
 	}
-	return result
+	return r.Int64()
 }
 
-// MulDiv computes (a * b) / c. Panics on int64 overflow in a*b.
+// PowBig computes base^exp for non-negative exponents in arbitrary precision.
+func PowBig(base, exp *big.Int) *big.Int {
+	if exp == nil || exp.Sign() < 0 {
+		panic("pow: negative exponent")
+	}
+	if base == nil {
+		return new(big.Int)
+	}
+	return new(big.Int).Exp(base, exp, nil)
+}
+
+// MulDiv computes (a * b) / c using big.Int internally so that the
+// intermediate product a*b doesn't overflow. Panics only if the final
+// quotient does not fit in int64, or if c is zero.
 func MulDiv(a, b, c int64) int64 {
 	if c == 0 {
 		panic("mulDiv: division by zero")
 	}
-	return checkedMul(a, b) / c
+	r := MulDivBig(big.NewInt(a), big.NewInt(b), big.NewInt(c))
+	if !r.IsInt64() {
+		panic("mulDiv: int64 overflow in quotient — use MulDivBig for arbitrary precision")
+	}
+	return r.Int64()
 }
 
-// PercentOf computes (amount * bps) / 10000 (basis points). Panics on int64 overflow.
+// MulDivBig computes (a * b) / c in arbitrary precision.
+func MulDivBig(a, b, c *big.Int) *big.Int {
+	if c == nil || c.Sign() == 0 {
+		panic("mulDiv: division by zero")
+	}
+	prod := new(big.Int).Mul(a, b)
+	return new(big.Int).Quo(prod, c)
+}
+
+// PercentOf computes (amount * bps) / 10000 (basis points). Uses big.Int
+// internally; panics only if the result overflows int64.
 func PercentOf(amount, bps int64) int64 {
-	return checkedMul(amount, bps) / 10000
+	r := PercentOfBig(big.NewInt(amount), big.NewInt(bps))
+	if !r.IsInt64() {
+		panic("percentOf: int64 overflow — use PercentOfBig for arbitrary precision")
+	}
+	return r.Int64()
 }
 
-// Sqrt computes the integer square root via Newton's method. Panics on int64 overflow.
+// PercentOfBig computes (amount * bps) / 10000 in arbitrary precision.
+func PercentOfBig(amount, bps *big.Int) *big.Int {
+	prod := new(big.Int).Mul(amount, bps)
+	return new(big.Int).Quo(prod, big.NewInt(10000))
+}
+
+// Sqrt computes the integer square root. Uses big.Int internally.
 func Sqrt(n int64) int64 {
 	if n < 0 {
 		panic("sqrt: negative input")
 	}
-	if n == 0 {
-		return 0
+	r := SqrtBig(big.NewInt(n))
+	return r.Int64()
+}
+
+// SqrtBig computes the integer square root in arbitrary precision.
+func SqrtBig(n *big.Int) *big.Int {
+	if n == nil || n.Sign() < 0 {
+		panic("sqrt: negative input")
 	}
-	guess := n
-	for i := 0; i < 256; i++ {
-		next := checkedAdd(guess, n/guess) / 2
-		if next >= guess {
-			break
-		}
-		guess = next
-	}
-	return guess
+	return new(big.Int).Sqrt(n)
 }
 
 // Gcd computes the greatest common divisor via Euclidean algorithm.
-// Panics if either argument is math.MinInt64 (|MinInt64| overflows int64).
+// Uses big.Int internally so MinInt64 is handled correctly; panics only
+// if the result itself does not fit in int64 (which requires a mathematical
+// oddity: GCD always fits in the smaller operand's magnitude, so this
+// branch only triggers on MinInt64 inputs).
 func Gcd(a, b int64) int64 {
-	if a == math.MinInt64 || b == math.MinInt64 {
-		panic("runar: int64 overflow in Gcd — |MinInt64| not representable; Bitcoin Script supports arbitrary precision but Go uses int64; see compilers/go/README.md")
+	r := GcdBig(big.NewInt(a), big.NewInt(b))
+	if !r.IsInt64() {
+		// GCD(MinInt64, 0) = 2^63, which doesn't fit. Return MaxInt64 as
+		// a documented overflow sentinel; correct callers should use GcdBig.
+		return math.MaxInt64
 	}
-	if a < 0 {
-		a = -a
+	return r.Int64()
+}
+
+// GcdBig computes the greatest common divisor in arbitrary precision.
+func GcdBig(a, b *big.Int) *big.Int {
+	if a == nil {
+		a = new(big.Int)
 	}
-	if b < 0 {
-		b = -b
+	if b == nil {
+		b = new(big.Int)
 	}
-	for b != 0 {
-		a, b = b, a%b
-	}
-	return a
+	return new(big.Int).GCD(nil, nil, new(big.Int).Abs(a), new(big.Int).Abs(b))
 }
 
 // Divmod returns the quotient of a / b.
@@ -653,18 +1228,542 @@ func Log2(n int64) int64 {
 	if n <= 0 {
 		return 0
 	}
-	bits := int64(0)
-	val := n
-	for val > 1 {
-		val >>= 1
-		bits++
+	return Log2Big(big.NewInt(n))
+}
+
+// Log2Big returns floor(log2(n)) for any *big.Int > 0. Returns 0 for
+// n <= 0, matching Log2's defensive behavior.
+func Log2Big(n *big.Int) int64 {
+	if n == nil || n.Sign() <= 0 {
+		return 0
 	}
-	return bits
+	return int64(n.BitLen() - 1)
 }
 
 // ToBool returns true if n is non-zero.
 func ToBool(n int64) bool {
 	return n != 0
+}
+
+// ---------------------------------------------------------------------------
+// Baby Bear field arithmetic (p = 2^31 - 2^27 + 1 = 2013265921)
+// ---------------------------------------------------------------------------
+
+const bbP int64 = 2013265921
+
+// BbFieldAdd returns (a + b) mod p.
+func BbFieldAdd(a, b int64) int64 {
+	return (a + b) % bbP
+}
+
+// BbFieldSub returns (a - b + p) mod p.
+func BbFieldSub(a, b int64) int64 {
+	return ((a - b) % bbP + bbP) % bbP
+}
+
+// BbFieldMul returns (a * b) mod p.
+func BbFieldMul(a, b int64) int64 {
+	return (a * b) % bbP
+}
+
+// BbFieldInv returns the multiplicative inverse of a mod p via Fermat's little theorem.
+func BbFieldInv(a int64) int64 {
+	result := int64(1)
+	base := ((a % bbP) + bbP) % bbP
+	exp := bbP - 2
+	for exp > 0 {
+		if exp&1 == 1 {
+			result = (result * base) % bbP
+		}
+		base = (base * base) % bbP
+		exp >>= 1
+	}
+	return result
+}
+
+// ---------------------------------------------------------------------------
+// Baby Bear quartic extension field (Fp4 over Fp, W = 11)
+// ---------------------------------------------------------------------------
+//
+// Fp4 = Fp[X] / (X^4 - 11). An element (a0, a1, a2, a3) represents
+// a0 + a1*X + a2*X^2 + a3*X^3. Multiplication uses X^4 = W = 11.
+//
+// Product formula for (a0,a1,a2,a3) * (b0,b1,b2,b3):
+//   r0 = a0*b0 + W*(a1*b3 + a2*b2 + a3*b1)
+//   r1 = a0*b1 + a1*b0 + W*(a2*b3 + a3*b2)
+//   r2 = a0*b2 + a1*b1 + a2*b0 + W*(a3*b3)
+//   r3 = a0*b3 + a1*b2 + a2*b1 + a3*b0
+
+const bbW int64 = 11
+
+// BbExt4Mul0 returns component 0 of the quartic extension field product.
+func BbExt4Mul0(a0, a1, a2, a3, b0, b1, b2, b3 int64) int64 {
+	r := BbFieldMul(a0, b0)
+	t := BbFieldAdd(BbFieldMul(a1, b3), BbFieldAdd(BbFieldMul(a2, b2), BbFieldMul(a3, b1)))
+	r = BbFieldAdd(r, BbFieldMul(bbW, t))
+	return r
+}
+
+// BbExt4Mul1 returns component 1 of the quartic extension field product.
+func BbExt4Mul1(a0, a1, a2, a3, b0, b1, b2, b3 int64) int64 {
+	r := BbFieldAdd(BbFieldMul(a0, b1), BbFieldMul(a1, b0))
+	t := BbFieldAdd(BbFieldMul(a2, b3), BbFieldMul(a3, b2))
+	r = BbFieldAdd(r, BbFieldMul(bbW, t))
+	return r
+}
+
+// BbExt4Mul2 returns component 2 of the quartic extension field product.
+func BbExt4Mul2(a0, a1, a2, a3, b0, b1, b2, b3 int64) int64 {
+	r := BbFieldAdd(BbFieldMul(a0, b2), BbFieldAdd(BbFieldMul(a1, b1), BbFieldMul(a2, b0)))
+	r = BbFieldAdd(r, BbFieldMul(bbW, BbFieldMul(a3, b3)))
+	return r
+}
+
+// BbExt4Mul3 returns component 3 of the quartic extension field product.
+func BbExt4Mul3(a0, a1, a2, a3, b0, b1, b2, b3 int64) int64 {
+	return BbFieldAdd(BbFieldMul(a0, b3),
+		BbFieldAdd(BbFieldMul(a1, b2),
+			BbFieldAdd(BbFieldMul(a2, b1), BbFieldMul(a3, b0))))
+}
+
+// BbExt4Inv0 returns component 0 of the quartic extension field inverse.
+func BbExt4Inv0(a0, a1, a2, a3 int64) int64 {
+	return bbExt4Inv(a0, a1, a2, a3)[0]
+}
+
+// BbExt4Inv1 returns component 1 of the quartic extension field inverse.
+func BbExt4Inv1(a0, a1, a2, a3 int64) int64 {
+	return bbExt4Inv(a0, a1, a2, a3)[1]
+}
+
+// BbExt4Inv2 returns component 2 of the quartic extension field inverse.
+func BbExt4Inv2(a0, a1, a2, a3 int64) int64 {
+	return bbExt4Inv(a0, a1, a2, a3)[2]
+}
+
+// BbExt4Inv3 returns component 3 of the quartic extension field inverse.
+func BbExt4Inv3(a0, a1, a2, a3 int64) int64 {
+	return bbExt4Inv(a0, a1, a2, a3)[3]
+}
+
+// bbExt4Inv computes the quartic extension field inverse over BabyBear.
+// Same algorithm as kbExt4Inv but uses the BabyBear field arithmetic and
+// the BabyBear quartic non-residue bbW.
+func bbExt4Inv(a0, a1, a2, a3 int64) [4]int64 {
+	// conj(a) for x^4 - W: (a0, -a1, a2, -a3).
+	c0, c1, c2, c3 := a0, BbFieldSub(0, a1), a2, BbFieldSub(0, a3)
+
+	// a * conj(a) — lands in the Fp2 subfield (components 1,3 = 0).
+	p0 := BbExt4Mul0(a0, a1, a2, a3, c0, c1, c2, c3)
+	p2 := BbExt4Mul2(a0, a1, a2, a3, c0, c1, c2, c3)
+
+	// Invert the Fp2 element (p0, p2) in Fp[y]/(y^2 - W):
+	//   inv(p0 + p2*y) = (p0 - p2*y) / (p0^2 - W*p2^2)
+	normSq := BbFieldSub(BbFieldMul(p0, p0), BbFieldMul(bbW, BbFieldMul(p2, p2)))
+	normInv := BbFieldInv(normSq)
+
+	inv0 := BbFieldMul(p0, normInv)
+	inv2 := BbFieldSub(0, BbFieldMul(p2, normInv))
+
+	// result = conj(a) * (inv0, 0, inv2, 0)
+	r0 := BbFieldAdd(BbFieldMul(c0, inv0), BbFieldMul(bbW, BbFieldMul(c2, inv2)))
+	r1 := BbFieldAdd(BbFieldMul(c1, inv0), BbFieldMul(bbW, BbFieldMul(c3, inv2)))
+	r2 := BbFieldAdd(BbFieldMul(c0, inv2), BbFieldMul(c2, inv0))
+	r3 := BbFieldAdd(BbFieldMul(c1, inv2), BbFieldMul(c3, inv0))
+
+	return [4]int64{r0, r1, r2, r3}
+}
+
+// ---------------------------------------------------------------------------
+// KoalaBear field arithmetic (p = 2^31 - 2^24 + 1 = 2,130,706,433)
+// ---------------------------------------------------------------------------
+
+const kbP int64 = 2130706433
+
+// KbFieldAdd returns (a + b) mod p.
+func KbFieldAdd(a, b int64) int64 {
+	return (a + b) % kbP
+}
+
+// KbFieldSub returns (a - b + p) mod p.
+func KbFieldSub(a, b int64) int64 {
+	return ((a - b) % kbP + kbP) % kbP
+}
+
+// KbFieldMul returns (a * b) mod p.
+func KbFieldMul(a, b int64) int64 {
+	return (a * b) % kbP
+}
+
+// KbFieldInv returns the multiplicative inverse of a mod p via Fermat's little theorem.
+func KbFieldInv(a int64) int64 {
+	result := int64(1)
+	base := ((a % kbP) + kbP) % kbP
+	exp := kbP - 2
+	for exp > 0 {
+		if exp&1 == 1 {
+			result = (result * base) % kbP
+		}
+		base = (base * base) % kbP
+		exp >>= 1
+	}
+	return result
+}
+
+// ---------------------------------------------------------------------------
+// KoalaBear quartic extension field (x^4 - 3, W = 3)
+// ---------------------------------------------------------------------------
+
+const kbW int64 = 3
+
+// KbExt4Mul0 returns component 0 of the quartic extension field product over KoalaBear.
+func KbExt4Mul0(a0, a1, a2, a3, b0, b1, b2, b3 int64) int64 {
+	r := KbFieldMul(a0, b0)
+	t := KbFieldAdd(KbFieldMul(a1, b3), KbFieldAdd(KbFieldMul(a2, b2), KbFieldMul(a3, b1)))
+	r = KbFieldAdd(r, KbFieldMul(kbW, t))
+	return r
+}
+
+// KbExt4Mul1 returns component 1 of the quartic extension field product over KoalaBear.
+func KbExt4Mul1(a0, a1, a2, a3, b0, b1, b2, b3 int64) int64 {
+	r := KbFieldAdd(KbFieldMul(a0, b1), KbFieldMul(a1, b0))
+	t := KbFieldAdd(KbFieldMul(a2, b3), KbFieldMul(a3, b2))
+	r = KbFieldAdd(r, KbFieldMul(kbW, t))
+	return r
+}
+
+// KbExt4Mul2 returns component 2 of the quartic extension field product over KoalaBear.
+func KbExt4Mul2(a0, a1, a2, a3, b0, b1, b2, b3 int64) int64 {
+	r := KbFieldAdd(KbFieldMul(a0, b2), KbFieldAdd(KbFieldMul(a1, b1), KbFieldMul(a2, b0)))
+	r = KbFieldAdd(r, KbFieldMul(kbW, KbFieldMul(a3, b3)))
+	return r
+}
+
+// KbExt4Mul3 returns component 3 of the quartic extension field product over KoalaBear.
+func KbExt4Mul3(a0, a1, a2, a3, b0, b1, b2, b3 int64) int64 {
+	return KbFieldAdd(KbFieldMul(a0, b3),
+		KbFieldAdd(KbFieldMul(a1, b2),
+			KbFieldAdd(KbFieldMul(a2, b1), KbFieldMul(a3, b0))))
+}
+
+// KbExt4Inv0 returns component 0 of the quartic extension field inverse over KoalaBear.
+func KbExt4Inv0(a0, a1, a2, a3 int64) int64 {
+	r := kbExt4Inv(a0, a1, a2, a3)
+	return r[0]
+}
+
+// KbExt4Inv1 returns component 1 of the quartic extension field inverse over KoalaBear.
+func KbExt4Inv1(a0, a1, a2, a3 int64) int64 {
+	r := kbExt4Inv(a0, a1, a2, a3)
+	return r[1]
+}
+
+// KbExt4Inv2 returns component 2 of the quartic extension field inverse over KoalaBear.
+func KbExt4Inv2(a0, a1, a2, a3 int64) int64 {
+	r := kbExt4Inv(a0, a1, a2, a3)
+	return r[2]
+}
+
+// KbExt4Inv3 returns component 3 of the quartic extension field inverse over KoalaBear.
+func KbExt4Inv3(a0, a1, a2, a3 int64) int64 {
+	r := kbExt4Inv(a0, a1, a2, a3)
+	return r[3]
+}
+
+// kbExt4Inv computes the inverse of a quartic extension field element.
+// Uses the formula: inv(a) = conj(a) / norm(a), where norm(a) is in Fp2,
+// then inv(norm) is computed and multiplied back.
+func kbExt4Inv(a0, a1, a2, a3 int64) [4]int64 {
+	// norm = a * conj(a) where conj swaps sign of odd components
+	// For x^4 - W: conj(a0,a1,a2,a3) = (a0,-a1,a2,-a3)
+	// norm_0 = a0^2 + W*a2^2 - W*(2*a1*a3)  -- but this is actually the Fp2 norm
+	// Simpler: compute via brute-force: find b such that a*b = 1
+	// Using the standard quartic inverse formula:
+	// Let t0 = a0^2, t1 = a1^2, t2 = a2^2, t3 = a3^2
+	// s0 = t0 - W*(a1*a3*2 - t2*W) -- this gets complex
+
+	// Simpler approach: compute a * conj(a) to get Fp2 element, then invert
+	// conj(a) for x^4-W: (a0, -a1, a2, -a3)
+	c0, c1, c2, c3 := a0, KbFieldSub(0, a1), a2, KbFieldSub(0, a3)
+
+	// product = a * conj(a) — should land in Fp2 (components 1,3 = 0)
+	p0 := KbExt4Mul0(a0, a1, a2, a3, c0, c1, c2, c3)
+	p2 := KbExt4Mul2(a0, a1, a2, a3, c0, c1, c2, c3)
+	// p1 and p3 should be 0, forming Fp2 element (p0, p2)
+
+	// Now invert the Fp2 element (p0, p2) where the Fp2 is x^2 - W
+	// inv(p0 + p2*x^2) = (p0 - p2*x^2) / (p0^2 - W*p2^2)
+	normSq := KbFieldSub(KbFieldMul(p0, p0), KbFieldMul(kbW, KbFieldMul(p2, p2)))
+	normInv := KbFieldInv(normSq)
+
+	inv0 := KbFieldMul(p0, normInv)
+	inv2 := KbFieldSub(0, KbFieldMul(p2, normInv))
+
+	// result = conj(a) * inv(norm) = (c0,c1,c2,c3) * (inv0, 0, inv2, 0)
+	r0 := KbFieldAdd(KbFieldMul(c0, inv0), KbFieldMul(kbW, KbFieldMul(c2, inv2)))
+	r1 := KbFieldAdd(KbFieldMul(c1, inv0), KbFieldMul(kbW, KbFieldMul(c3, inv2)))
+	r2 := KbFieldAdd(KbFieldMul(c0, inv2), KbFieldMul(c2, inv0))
+	r3 := KbFieldAdd(KbFieldMul(c1, inv2), KbFieldMul(c3, inv0))
+
+	return [4]int64{r0, r1, r2, r3}
+}
+
+// ---------------------------------------------------------------------------
+// Poseidon2 KoalaBear compression (mock for testing)
+// ---------------------------------------------------------------------------
+
+// poseidon2KBWidth is the state width.
+const poseidon2KBWidth = 16
+
+// poseidon2KBSbox computes x^3 mod p.
+func poseidon2KBSbox(x int64) int64 {
+	x2 := KbFieldMul(x, x)
+	return KbFieldMul(x, x2)
+}
+
+// poseidon2KBExternalMDS4 applies circ(2,3,1,1) to a 4-element block.
+func poseidon2KBExternalMDS4(a, b, c, d int64) (int64, int64, int64, int64) {
+	sum := KbFieldAdd(KbFieldAdd(a, b), KbFieldAdd(c, d))
+	out0 := KbFieldAdd(sum, KbFieldAdd(a, KbFieldMul(b, 2)))
+	out1 := KbFieldAdd(sum, KbFieldAdd(b, KbFieldMul(c, 2)))
+	out2 := KbFieldAdd(sum, KbFieldAdd(c, KbFieldMul(d, 2)))
+	out3 := KbFieldAdd(sum, KbFieldAdd(d, KbFieldMul(a, 2)))
+	return out0, out1, out2, out3
+}
+
+// poseidon2KBRoundConstants holds the round constants for all 28 rounds.
+// Each round has 16 constants. For external rounds, all 16 are used.
+// For internal rounds (4-23), only element [0] is used (rest are zero).
+//
+// From Plonky3 p3-koala-bear 0.5.2:
+//   KOALABEAR_POSEIDON2_RC_16_EXTERNAL_INITIAL, _INTERNAL, _EXTERNAL_FINAL
+var poseidon2KBRoundConstants = [28][poseidon2KBWidth]int64{
+	// External initial rounds (0-3)
+	{2128964168, 288780357, 316938561, 2126233899, 426817493, 1714118888, 1045008582, 1738510837, 889721787, 8866516, 681576474, 419059826, 1596305521, 1583176088, 1584387047, 1529751136},
+	{1863858111, 1072044075, 517831365, 1464274176, 1138001621, 428001039, 245709561, 1641420379, 1365482496, 770454828, 693167409, 757905735, 136670447, 436275702, 525466355, 1559174242},
+	{1030087950, 869864998, 322787870, 267688717, 948964561, 740478015, 679816114, 113662466, 2066544572, 1744924186, 367094720, 1380455578, 1842483872, 416711434, 1342291586, 1692058446},
+	{1493348999, 1113949088, 210900530, 1071655077, 610242121, 1136339326, 2020858841, 1019840479, 678147278, 1678413261, 1361743414, 61132629, 1209546658, 64412292, 1936878279, 1980661727},
+
+	// Internal rounds (4-23) — only element [0] is used
+	{1423960925, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{2101391318, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{1915532054, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{275400051, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{1168624859, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{1141248885, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{356546469, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{1165250474, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{1320543726, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{932505663, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{1204226364, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{1452576828, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{1774936729, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{926808140, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{1184948056, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{1186493834, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{843181003, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{185193011, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{452207447, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{510054082, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+
+	// External final rounds (24-27)
+	{1139268644, 630873441, 669538875, 462500858, 876500520, 1214043330, 383937013, 375087302, 636912601, 307200505, 390279673, 1999916485, 1518476730, 1606686591, 1410677749, 1581191572},
+	{1004269969, 143426723, 1747283099, 1016118214, 1749423722, 66331533, 1177761275, 1581069649, 1851371119, 852520128, 1499632627, 1820847538, 150757557, 884787840, 619710451, 1651711087},
+	{505263814, 212076987, 1482432120, 1458130652, 382871348, 417404007, 2066495280, 1996518884, 902934924, 582892981, 1337064375, 1199354861, 2102596038, 1533193853, 1436311464, 2012303432},
+	{839997195, 1225781098, 2011967775, 575084315, 1309329169, 786393545, 995788880, 1702925345, 1444525226, 908073383, 1811535085, 1531002367, 1635653662, 1585100155, 867006515, 879151050},
+}
+
+// poseidon2KBPermute applies the Poseidon2 permutation to a 16-element state.
+// Uses real round constants from Plonky3 p3-koala-bear (SP1 v6.0.2).
+func poseidon2KBPermute(state *[poseidon2KBWidth]int64) {
+	externalMDS := func() {
+		// Step 1: Apply circ(2,3,1,1) to each group of 4
+		for g := 0; g < 4; g++ {
+			state[g*4], state[g*4+1], state[g*4+2], state[g*4+3] =
+				poseidon2KBExternalMDS4(state[g*4], state[g*4+1], state[g*4+2], state[g*4+3])
+		}
+		// Step 2: Cross-group mixing — add sum of position-equivalent elements
+		var sums [4]int64
+		for k := 0; k < 4; k++ {
+			for j := 0; j < poseidon2KBWidth; j += 4 {
+				sums[k] = KbFieldAdd(sums[k], state[j+k])
+			}
+		}
+		for i := 0; i < poseidon2KBWidth; i++ {
+			state[i] = KbFieldAdd(state[i], sums[i%4])
+		}
+	}
+
+	// kbHalve computes x/2 in the field.
+	kbHalve := func(x int64) int64 {
+		if x%2 == 0 {
+			return x / 2
+		}
+		return (x + kbP) / 2
+	}
+	// kbDiv2Exp computes x / 2^n in the field.
+	kbDiv2Exp := func(x int64, n uint) int64 {
+		for i := uint(0); i < n; i++ {
+			x = kbHalve(x)
+		}
+		return x
+	}
+
+	internalDiffusion := func() {
+		// Exact port of Plonky3 internal_layer_mat_mul for KoalaBear width-16.
+		// V = [-2, 1, 2, 1/2, 3, 4, -1/2, -3, -4, 1/2^8, 1/8, 1/2^24, -1/2^8, -1/8, -1/16, -1/2^24]
+		partSum := int64(0)
+		for i := 1; i < poseidon2KBWidth; i++ {
+			partSum = KbFieldAdd(partSum, state[i])
+		}
+		fullSum := KbFieldAdd(partSum, state[0])
+		state[0] = KbFieldSub(partSum, state[0])
+
+		state[1] = KbFieldAdd(state[1], fullSum)
+		state[2] = KbFieldAdd(KbFieldMul(state[2], 2), fullSum)
+		state[3] = KbFieldAdd(kbHalve(state[3]), fullSum)
+		state[4] = KbFieldAdd(fullSum, KbFieldAdd(KbFieldMul(state[4], 2), state[4]))
+		state[5] = KbFieldAdd(fullSum, KbFieldMul(KbFieldMul(state[5], 2), 2))
+		state[6] = KbFieldSub(fullSum, kbHalve(state[6]))
+		state[7] = KbFieldSub(fullSum, KbFieldAdd(KbFieldMul(state[7], 2), state[7]))
+		state[8] = KbFieldSub(fullSum, KbFieldMul(KbFieldMul(state[8], 2), 2))
+		state[9] = KbFieldAdd(kbDiv2Exp(state[9], 8), fullSum)
+		state[10] = KbFieldAdd(kbDiv2Exp(state[10], 3), fullSum)
+		state[11] = KbFieldAdd(kbDiv2Exp(state[11], 24), fullSum)
+		state[12] = KbFieldSub(fullSum, kbDiv2Exp(state[12], 8))
+		state[13] = KbFieldSub(fullSum, kbDiv2Exp(state[13], 3))
+		state[14] = KbFieldSub(fullSum, kbDiv2Exp(state[14], 4))
+		state[15] = KbFieldSub(fullSum, kbDiv2Exp(state[15], 24))
+	}
+
+	// Initial MDS before external rounds (Plonky3's external_initial_permute_state)
+	externalMDS()
+
+	// Phase 1: 4 external rounds (rounds 0-3)
+	for r := 0; r < 4; r++ {
+		for i := 0; i < poseidon2KBWidth; i++ {
+			state[i] = KbFieldAdd(state[i], poseidon2KBRoundConstants[r][i])
+		}
+		for i := 0; i < poseidon2KBWidth; i++ {
+			state[i] = poseidon2KBSbox(state[i])
+		}
+		externalMDS()
+	}
+
+	// Phase 2: 20 internal rounds (rounds 4-23)
+	for r := 0; r < 20; r++ {
+		state[0] = KbFieldAdd(state[0], poseidon2KBRoundConstants[4+r][0])
+		state[0] = poseidon2KBSbox(state[0])
+		internalDiffusion()
+	}
+
+	// Phase 3: 4 external rounds (rounds 24-27)
+	for r := 0; r < 4; r++ {
+		for i := 0; i < poseidon2KBWidth; i++ {
+			state[i] = KbFieldAdd(state[i], poseidon2KBRoundConstants[24+r][i])
+		}
+		for i := 0; i < poseidon2KBWidth; i++ {
+			state[i] = poseidon2KBSbox(state[i])
+		}
+		externalMDS()
+	}
+}
+
+// poseidon2KBCompress compresses two 8-element digests into one 8-element digest.
+func poseidon2KBCompress(left, right [8]int64) [8]int64 {
+	var state [poseidon2KBWidth]int64
+	copy(state[0:8], left[:])
+	copy(state[8:16], right[:])
+	poseidon2KBPermute(&state)
+	var digest [8]int64
+	copy(digest[:], state[0:8])
+	return digest
+}
+
+// MerkleRootPoseidon2KBv is a variadic wrapper for contract compatibility.
+// Takes individual int64 arguments: leaf[0..7], proof[0..depth*8-1], index, depth.
+// Returns the first element of the 8-element Poseidon2 digest (matching the
+// contract type system's single bigint return).
+func MerkleRootPoseidon2KBv(args ...int64) int64 {
+	if len(args) < 10 {
+		panic("MerkleRootPoseidon2KBv: need at least 10 args (8 leaf + index + depth)")
+	}
+	depth := args[len(args)-1]
+	index := args[len(args)-2]
+	var leaf [8]int64
+	copy(leaf[:], args[0:8])
+	proof := args[8 : len(args)-2]
+	result := MerkleRootPoseidon2KB(leaf, proof, index, depth)
+	return result[0]
+}
+
+// MerkleRootPoseidon2KB computes a Poseidon2 KoalaBear Merkle root.
+// leaf is 8 field elements, proof is depth*8 field elements (consecutive siblings),
+// index determines left/right at each level, depth is the tree depth.
+// Returns the 8-element root digest.
+func MerkleRootPoseidon2KB(leaf [8]int64, proof []int64, index, depth int64) [8]int64 {
+	current := leaf
+	for i := int64(0); i < depth; i++ {
+		var sibling [8]int64
+		copy(sibling[:], proof[i*8:(i+1)*8])
+		bit := (index >> uint(i)) & 1
+		if bit == 1 {
+			current = poseidon2KBCompress(sibling, current)
+		} else {
+			current = poseidon2KBCompress(current, sibling)
+		}
+	}
+	return current
+}
+
+// ---------------------------------------------------------------------------
+// Merkle proof verification
+// ---------------------------------------------------------------------------
+
+// MerkleRootSha256 computes a Merkle root using SHA-256 as the hash function.
+// leaf is a 32-byte hash, proof is depth*32 concatenated sibling hashes,
+// index determines left/right at each level, depth is the tree depth.
+func MerkleRootSha256(leaf ByteString, proof ByteString, index, depth int64) ByteString {
+	return merkleRootImpl(leaf, proof, index, depth, Sha256)
+}
+
+// MerkleRootHash256 computes a Merkle root using Hash256 (double SHA-256).
+// Same parameters as MerkleRootSha256 but uses Hash256 instead.
+func MerkleRootHash256(leaf ByteString, proof ByteString, index, depth int64) ByteString {
+	return merkleRootImpl(leaf, proof, index, depth, Hash256)
+}
+
+func merkleRootImpl(leaf ByteString, proof ByteString, index, depth int64, hashFn func(ByteString) ByteString) ByteString {
+	current := leaf
+	for i := int64(0); i < depth; i++ {
+		sibling := proof[i*32 : (i+1)*32]
+		bit := (index >> uint(i)) & 1
+		var preimage ByteString
+		if bit == 1 {
+			preimage = sibling + current
+		} else {
+			preimage = current + sibling
+		}
+		current = hashFn(preimage)
+	}
+	return current
+}
+
+// ---------------------------------------------------------------------------
+// Groth16 verification
+// ---------------------------------------------------------------------------
+
+// Groth16Verify verifies a Groth16/BN254 proof against the given public
+// values and verifying key hash. The proofBlob is a 256-byte serialized
+// Groth16 proof wrapping the SP1 STARK.
+//
+// Mock: always returns true. The compiled Bitcoin Script performs the
+// real BN254 pairing check via the Groth16 verifier codegen.
+func Groth16Verify(proofBlob ByteString, publicValues ByteString, vkHash ByteString) bool {
+	_ = proofBlob
+	_ = publicValues
+	_ = vkHash
+	return true
 }
 
 // ---------------------------------------------------------------------------

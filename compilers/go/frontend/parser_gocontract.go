@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"encoding/hex"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -10,6 +11,11 @@ import (
 	"strings"
 	"unicode"
 )
+
+// bytesToHex returns the lowercase hex encoding of b.
+func bytesToHex(b []byte) string {
+	return hex.EncodeToString(b)
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -90,6 +96,9 @@ func (p *goContractParser) extractContract() *ContractNode {
 							found = true
 						case "StatefulSmartContract":
 							parentClass = "StatefulSmartContract"
+							found = true
+						case "UnsafeSmartContract":
+							parentClass = "UnsafeSmartContract"
 							found = true
 						}
 					}
@@ -335,17 +344,21 @@ func mapGoType(name string) TypeNode {
 	typeMap := map[string]string{
 		"Int":             "bigint",
 		"Bigint":          "bigint",
+		"BigintBig":       "bigint",
 		"Bool":            "boolean",
 		"ByteString":      "ByteString",
 		"PubKey":          "PubKey",
 		"Sig":             "Sig",
 		"Sha256":          "Sha256",
+		"Sha256Digest":    "Sha256",
 		"Ripemd160":       "Ripemd160",
 		"Addr":            "Addr",
 		"SigHashPreimage": "SigHashPreimage",
 		"RabinSig":        "RabinSig",
 		"RabinPubKey":     "RabinPubKey",
 		"Point":           "Point",
+		"P256Point":       "P256Point",
+		"P384Point":       "P384Point",
 	}
 	if mapped, ok := typeMap[name]; ok {
 		if IsPrimitiveType(mapped) {
@@ -472,8 +485,17 @@ func (p *goContractParser) convertStatement(stmt ast.Stmt) Statement {
 		thenBlock := p.extractStatements(s.Body)
 		var elseBlock []Statement
 		if s.Else != nil {
-			if block, ok := s.Else.(*ast.BlockStmt); ok {
-				elseBlock = p.extractStatements(block)
+			switch e := s.Else.(type) {
+			case *ast.BlockStmt:
+				elseBlock = p.extractStatements(e)
+			case *ast.IfStmt:
+				// `else if` — Go's parser represents this as an
+				// IfStmt nested directly in the Else field (no
+				// enclosing block). Treat the nested IfStmt as a
+				// single statement in the else block.
+				if inner := p.convertStatement(e); inner != nil {
+					elseBlock = []Statement{inner}
+				}
 			}
 		}
 		return IfStmt{
@@ -579,12 +601,35 @@ func (p *goContractParser) convertExpression(expr ast.Expr) Expression {
 		return MemberExpr{Object: obj, Property: goFieldToCamel(e.Sel.Name)}
 
 	case *ast.CallExpr:
-		// Handle type conversions: runar.Int(0), runar.Bigint(x) -> inner value
+		// Handle type conversions: runar.Int(0), runar.Bigint(x), runar.BigintBig(x) -> inner value
 		if sel, ok := e.Fun.(*ast.SelectorExpr); ok {
 			if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "runar" {
 				typeName := sel.Sel.Name
-				if (typeName == "Int" || typeName == "Bigint" || typeName == "Bool") && len(e.Args) == 1 {
+				if (typeName == "Int" || typeName == "Bigint" || typeName == "BigintBig" || typeName == "Bool") && len(e.Args) == 1 {
 					return p.convertExpression(e.Args[0])
+				}
+				// runar.ByteString("literal") -> ByteStringLiteral with hex-encoded bytes
+				// runar.ByteString(variable) -> unwrap (type conversion no-op)
+				if typeName == "ByteString" && len(e.Args) == 1 {
+					if lit, ok := e.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						raw, err := strconv.Unquote(lit.Value)
+						if err == nil {
+							return ByteStringLiteral{Value: bytesToHex([]byte(raw))}
+						}
+					}
+					return p.convertExpression(e.Args[0])
+				}
+				// BigintBig operator helpers: Go disallows `a < b` / `a == b` /
+				// `a % b` on *big.Int, so DSL contracts reach for helper
+				// functions. Rewrite those calls into the equivalent Rúnar
+				// BinaryExpr so they lower to the same Script opcodes as plain
+				// int64 operators.
+				if op, ok := bigintBigOpFor(typeName); ok && len(e.Args) == 2 {
+					left := p.convertExpression(e.Args[0])
+					right := p.convertExpression(e.Args[1])
+					if left != nil && right != nil {
+						return BinaryExpr{Op: op, Left: left, Right: right}
+					}
 				}
 			}
 		}
@@ -634,6 +679,24 @@ func (p *goContractParser) convertExpression(expr ast.Expr) Expression {
 		obj := p.convertExpression(e.X)
 		idx := p.convertExpression(e.Index)
 		return IndexAccessExpr{Object: obj, Index: idx}
+
+	case *ast.CompositeLit:
+		// Array composite literal: `[9]runar.Bigint{0, 0, ...}` or the
+		// elided-length variant `[...]T{...}`. Only array-shaped
+		// composites are supported; struct composites are not valid
+		// Rúnar expressions.
+		if _, ok := e.Type.(*ast.ArrayType); ok || e.Type == nil {
+			elements := make([]Expression, 0, len(e.Elts))
+			for _, elt := range e.Elts {
+				ex := p.convertExpression(elt)
+				if ex == nil {
+					return nil
+				}
+				elements = append(elements, ex)
+			}
+			return ArrayLiteralExpr{Elements: elements}
+		}
+		return nil
 	}
 
 	return nil
@@ -673,8 +736,44 @@ func mapGoOp(op token.Token) string {
 		return "|"
 	case token.XOR:
 		return "^"
+	case token.SHL:
+		return "<<"
+	case token.SHR:
+		return ">>"
 	}
 	return "+"
+}
+
+// bigintBigOpFor returns the Rúnar binary-operator string that the named
+// BigintBig helper rewrites to (e.g. `BigintBigLess` → `<`). The second
+// return is false for unrecognised names. The set mirrors the helpers
+// defined in `packages/runar-go/runar.go`.
+func bigintBigOpFor(name string) (string, bool) {
+	switch name {
+	case "BigintBigLess":
+		return "<", true
+	case "BigintBigLessEq":
+		return "<=", true
+	case "BigintBigGreater":
+		return ">", true
+	case "BigintBigGreaterEq":
+		return ">=", true
+	case "BigintBigEqual":
+		return "===", true
+	case "BigintBigNotEqual":
+		return "!==", true
+	case "BigintBigAdd":
+		return "+", true
+	case "BigintBigSub":
+		return "-", true
+	case "BigintBigMul":
+		return "*", true
+	case "BigintBigMod":
+		return "%", true
+	case "BigintBigDiv":
+		return "/", true
+	}
+	return "", false
 }
 
 func mapGoBuiltin(name string) string {
@@ -683,6 +782,7 @@ func mapGoBuiltin(name string) string {
 		"Hash160":           "hash160",
 		"Hash256":           "hash256",
 		"Sha256":            "sha256",
+		"Sha256Hash":        "sha256",
 		"Ripemd160":         "ripemd160",
 		"CheckSig":          "checkSig",
 		"CheckMultiSig":     "checkMultiSig",
@@ -695,15 +795,25 @@ func mapGoBuiltin(name string) string {
 		"VerifySLHDSA_SHA2_192f":  "verifySLHDSA_SHA2_192f",
 		"VerifySLHDSA_SHA2_256s":  "verifySLHDSA_SHA2_256s",
 		"VerifySLHDSA_SHA2_256f":  "verifySLHDSA_SHA2_256f",
+		"VerifySP1FRI":           "verifySP1FRI",
+		"VerifyECDSAP256":         "verifyECDSA_P256",
+		"VerifyECDSAP384":         "verifyECDSA_P384",
 		"Num2Bin":           "num2bin",
 		"Bin2Num":           "bin2num",
+		"Bin2NumBig":        "bin2num",
+		"Num2BinBig":        "num2bin",
 		"Cat":               "cat",
 		"Substr":            "substr",
 		"Len":               "len",
 		"ReverseBytes":      "reverseBytes",
 		"ExtractLocktime":   "extractLocktime",
 		"ExtractOutputHash": "extractOutputHash",
+		"ExtractPrevOutputScript": "extractPrevOutputScript",
+		"RequireOutputP2PKH":      "requireOutputP2PKH",
+		"CurrentBlockHeight":      "currentBlockHeight",
 		"AddOutput":         "addOutput",
+		"AddRawOutput":      "addRawOutput",
+		"AddDataOutput":     "addDataOutput",
 		"GetStateScript":    "getStateScript",
 		"Safediv":           "safediv",
 		"Safemod":           "safemod",
@@ -717,6 +827,25 @@ func mapGoBuiltin(name string) string {
 		"Divmod":            "divmod",
 		"Log2":              "log2",
 		"ToBool":            "bool",
+		// BN254 contract-compatible wrappers (Point/Bigint types)
+		"Bn254G1AddP":       "bn254G1Add",
+		"Bn254G1ScalarMulP": "bn254G1ScalarMul",
+		"Bn254G1NegateP":    "bn254G1Negate",
+		"Bn254G1OnCurveP":   "bn254G1OnCurve",
+		"Bn254FieldNegP":    "bn254FieldNeg",
+		// *Big variants — compile to the same Script builtins. The Go-mock
+		// runtime runs real gnark-crypto pairing instead of returning true,
+		// so contracts that type fields as BigintBig get real soundness
+		// coverage under `go test`.
+		"Bn254G1AddBigP":        "bn254G1Add",
+		"Bn254G1ScalarMulBigP":  "bn254G1ScalarMul",
+		"Bn254G1NegateBigP":     "bn254G1Negate",
+		"Bn254G1OnCurveBigP":    "bn254G1OnCurve",
+		"Bn254FieldNegBigP":     "bn254FieldNeg",
+		"Bn254MultiPairing4Big": "bn254MultiPairing4",
+		"Bn254MultiPairing3Big": "bn254MultiPairing3",
+		// Poseidon2 Merkle variadic wrapper (individual args instead of arrays)
+		"MerkleRootPoseidon2KBv": "merkleRootPoseidon2KB",
 	}
 	if mapped, ok := builtinMap[name]; ok {
 		return mapped

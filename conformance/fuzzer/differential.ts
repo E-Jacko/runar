@@ -1,8 +1,8 @@
 import fc from 'fast-check';
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -11,43 +11,40 @@ const __dirname = dirname(__filename);
 // Types
 // ---------------------------------------------------------------------------
 
+export type CompilerName = 'ts' | 'go' | 'rust' | 'python' | 'zig' | 'ruby' | 'java';
+
 export interface DifferentialResult {
   programSource: string;
-  tsIR: string;
-  goIR?: string;
-  rustIR?: string;
+  tsOutput?: string;
+  goOutput?: string;
+  rustOutput?: string;
+  pythonOutput?: string;
+  zigOutput?: string;
+  rubyOutput?: string;
+  javaOutput?: string;
   match: boolean;
   mismatchDetails?: string;
 }
 
 export interface FuzzerOptions {
   seed?: number;
-  compilers?: ('ts' | 'go' | 'rust')[];
+  compilers?: CompilerName[];
   verbose?: boolean;
+  /** Compare final hex script instead of IR. */
+  compareHex?: boolean;
+  /** Directory to save failing cases. */
+  findingsDir?: string;
 }
 
 // ---------------------------------------------------------------------------
 // Program generators
 // ---------------------------------------------------------------------------
 
-/**
- * Generate a random Rúnar type. Weighted towards common types (bigint, boolean)
- * since they exercise the most code paths in the compiler.
- */
-const runarType = fc.oneof(
-  { weight: 5, arbitrary: fc.constant('bigint') },
-  { weight: 3, arbitrary: fc.constant('boolean') },
-  { weight: 1, arbitrary: fc.constant('ByteString') },
-  { weight: 1, arbitrary: fc.constant('PubKey') },
-);
-
-/** Generate a valid Rúnar identifier (lowercase, underscore-prefixed to avoid collisions). */
 const runarIdentifier = fc.stringOf(
   fc.constantFrom('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'),
   { minLength: 1, maxLength: 4 },
 ).map((s) => `_${s}`);
 
-/** Generate a bigint literal appropriate for Rúnar. */
 const runarBigintLiteral = fc.oneof(
   fc.constant('0n'),
   fc.constant('1n'),
@@ -55,10 +52,8 @@ const runarBigintLiteral = fc.oneof(
   fc.integer({ min: -100, max: -1 }).map((n) => `${n}n`),
 );
 
-/** Generate a boolean literal. */
 const runarBoolLiteral = fc.oneof(fc.constant('true'), fc.constant('false'));
 
-/** Generate a simple expression that produces a bigint. */
 const bigintExpr: fc.Arbitrary<string> = fc.oneof(
   runarBigintLiteral,
   fc.tuple(runarBigintLiteral, fc.constantFrom('+', '-', '*'), runarBigintLiteral).map(
@@ -66,7 +61,6 @@ const bigintExpr: fc.Arbitrary<string> = fc.oneof(
   ),
 );
 
-/** Generate a simple expression that produces a boolean. */
 const boolExpr: fc.Arbitrary<string> = fc.oneof(
   runarBoolLiteral,
   fc.tuple(runarBigintLiteral, fc.constantFrom('===', '!==', '<', '>', '<=', '>='), runarBigintLiteral).map(
@@ -79,7 +73,6 @@ const boolExpr: fc.Arbitrary<string> = fc.oneof(
   ).map(([a, op, b]) => `(${a} ${op} ${b})`),
 );
 
-/** Generate a property declaration. */
 interface PropDef {
   name: string;
   type: string;
@@ -88,18 +81,16 @@ interface PropDef {
 
 const propDef: fc.Arbitrary<PropDef> = fc.record({
   name: runarIdentifier,
-  type: fc.constant('bigint'),  // Keep props simple for fuzzing
+  type: fc.constant('bigint'),
   readonly: fc.boolean(),
 });
 
-/** Assemble a complete Rúnar contract source from generated pieces. */
 function assembleContract(
   contractName: string,
   props: PropDef[],
   bodyStatements: string[],
   params: Array<{ name: string; type: string }>,
 ): string {
-  // Deduplicate property names
   const uniqueProps: PropDef[] = [];
   const seenNames = new Set<string>();
   for (const p of props) {
@@ -109,21 +100,17 @@ function assembleContract(
     }
   }
 
-  const importItems = ['SmartContract', 'assert'];
   const lines: string[] = [];
-
-  lines.push(`import { ${importItems.join(', ')} } from 'runar-lang';`);
+  lines.push(`import { SmartContract, assert } from 'runar-lang';`);
   lines.push('');
   lines.push(`class ${contractName} extends SmartContract {`);
 
-  // Properties
   for (const p of uniqueProps) {
     const prefix = p.readonly ? 'readonly ' : '';
     lines.push(`  ${prefix}${p.name}: ${p.type};`);
   }
   lines.push('');
 
-  // Constructor
   const ctorParams = uniqueProps.map((p) => `${p.name}: ${p.type}`).join(', ');
   const superArgs = uniqueProps.map((p) => p.name).join(', ');
   lines.push(`  constructor(${ctorParams}) {`);
@@ -134,36 +121,25 @@ function assembleContract(
   lines.push('  }');
   lines.push('');
 
-  // Public method
   const methodParams = params.map((p) => `${p.name}: ${p.type}`).join(', ');
   lines.push(`  public verify(${methodParams}): void {`);
   for (const stmt of bodyStatements) {
     lines.push(`    ${stmt}`);
   }
   lines.push('  }');
-
   lines.push('}');
   return lines.join('\n');
 }
 
-/**
- * Generate a complete random Rúnar contract source that is syntactically
- * valid and exercises a variety of language features.
- */
 const runarContractArb: fc.Arbitrary<string> = fc
   .tuple(
-    // 0-3 properties
     fc.array(propDef, { minLength: 1, maxLength: 3 }),
-    // 1-3 method parameters (always bigint for simplicity)
     fc.array(runarIdentifier, { minLength: 1, maxLength: 3 }),
-    // 1-4 body statements (culminating in an assert)
     fc.array(
       fc.oneof(
-        // Variable declaration with arithmetic
         fc.tuple(runarIdentifier, bigintExpr).map(
           ([name, expr]) => `const ${name}_v: bigint = ${expr};`,
         ),
-        // If-else with simple body
         fc.tuple(boolExpr, bigintExpr, bigintExpr).map(
           ([cond, thenExpr, elseExpr]) =>
             `let _ifr: bigint = ${cond} ? ${thenExpr} : ${elseExpr};`,
@@ -171,75 +147,210 @@ const runarContractArb: fc.Arbitrary<string> = fc
       ),
       { minLength: 0, maxLength: 3 },
     ),
-    // Final assert expression
     boolExpr,
   )
   .map(([props, paramNames, bodyStmts, assertExpr]) => {
-    // Deduplicate param names
     const uniqueParamNames = [...new Set(paramNames)];
     const params = uniqueParamNames.map((n) => ({ name: n, type: 'bigint' }));
-
     const statements = [...bodyStmts, `assert(${assertExpr});`];
     return assembleContract('FuzzContract', props, statements, params);
   });
 
 // ---------------------------------------------------------------------------
-// Compiler invocation (for fuzzer)
+// Compiler invocation (using execFileSync for safety)
 // ---------------------------------------------------------------------------
 
-function compileTsSource(source: string, tmpDir: string): string | null {
+const ROOT = resolve(__dirname, '../..');
+
+function runCompilerProcess(
+  cmd: string,
+  args: string[],
+  options: { cwd?: string; timeout?: number } = {},
+): string | null {
+  try {
+    return execFileSync(cmd, args, {
+      timeout: options.timeout ?? 15_000,
+      encoding: 'utf-8',
+      cwd: options.cwd ?? ROOT,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function compileTsSource(source: string, tmpDir: string, hex: boolean = false): string | null {
   const tmpFile = join(tmpDir, 'fuzz-test.runar.ts');
   writeFileSync(tmpFile, source, 'utf-8');
-  try {
-    const output = execSync(
-      `npx tsx ${resolve(__dirname, '../../packages/runar-cli/src/bin.ts')} compile --ir "${tmpFile}"`,
-      { timeout: 15_000, encoding: 'utf-8', cwd: resolve(__dirname, '../..') },
-    ).trim();
-    return output;
-  } catch {
-    return null;
-  }
+  const args = ['--import', 'tsx', resolve(ROOT, 'packages/runar-cli/src/bin.ts'), 'compile'];
+  if (!hex) args.push('--ir');
+  args.push('--disable-constant-folding', tmpFile);
+  return runCompilerProcess('node', args);
 }
 
-function compileGoSource(source: string, tmpDir: string): string | null {
-  try {
-    execSync('which runar-go', { stdio: 'pipe' });
-  } catch {
-    return null;
-  }
+function compileGoSource(source: string, tmpDir: string, hex: boolean = false): string | null {
+  const goBinary = findGoBinary();
+  if (!goBinary) return null;
   const tmpFile = join(tmpDir, 'fuzz-test-go.runar.ts');
   writeFileSync(tmpFile, source, 'utf-8');
-  try {
-    const output = execSync(
-      `runar-go --source "${tmpFile}" --emit-ir`,
-      { timeout: 15_000, encoding: 'utf-8' },
-    ).trim();
-    return output;
-  } catch {
-    return null;
-  }
+  const flag = hex ? '--hex' : '--emit-ir';
+  return runCompilerProcess(goBinary, ['--source', tmpFile, flag, '--disable-constant-folding']);
 }
 
-function compileRustSource(source: string, tmpDir: string): string | null {
-  try {
-    execSync('which runar-rust', { stdio: 'pipe' });
-  } catch {
-    return null;
-  }
+function compileRustSource(source: string, tmpDir: string, hex: boolean = false): string | null {
+  const rustBinary = findRustBinary();
+  if (!rustBinary) return null;
   const tmpFile = join(tmpDir, 'fuzz-test-rust.runar.ts');
   writeFileSync(tmpFile, source, 'utf-8');
+  const flag = hex ? '--hex' : '--emit-ir';
+  return runCompilerProcess(rustBinary, ['--source', tmpFile, flag, '--disable-constant-folding']);
+}
+
+function compilePythonSource(source: string, tmpDir: string, hex: boolean = false): string | null {
+  const tmpFile = join(tmpDir, 'fuzz-test-python.runar.ts');
+  writeFileSync(tmpFile, source, 'utf-8');
+  const flag = hex ? '--hex' : '--emit-ir';
+  return runCompilerProcess('python3', ['-m', 'runar_compiler', '--source', tmpFile, flag, '--disable-constant-folding'], {
+    cwd: resolve(ROOT, 'compilers/python'),
+  });
+}
+
+function compileZigSource(source: string, tmpDir: string, hex: boolean = false): string | null {
+  const zigBinary = findZigBinary();
+  if (!zigBinary) return null;
+  const tmpFile = join(tmpDir, 'fuzz-test-zig.runar.ts');
+  writeFileSync(tmpFile, source, 'utf-8');
+  const flag = hex ? '--hex' : '--emit-ir';
+  return runCompilerProcess(zigBinary, ['--source', tmpFile, flag, '--disable-constant-folding']);
+}
+
+function compileRubySource(source: string, tmpDir: string, hex: boolean = false): string | null {
+  const rubyScript = findRubyBinary();
+  if (!rubyScript) return null;
+  const tmpFile = join(tmpDir, 'fuzz-test-ruby.runar.ts');
+  writeFileSync(tmpFile, source, 'utf-8');
+  const flag = hex ? '--hex' : '--emit-ir';
+  return runCompilerProcess('ruby', [rubyScript, '--source', tmpFile, flag, '--disable-constant-folding']);
+}
+
+let _javaSkipWarned = false;
+/**
+ * The Java compiler parses all 9 .runar.* formats just like the other 6
+ * compilers, but the legacy string-based fuzzer in this file only emits
+ * .runar.ts source directly — there is no structured AST it could re-render
+ * as Java. We therefore skip Java in this harness and direct users to the
+ * IR-differential harness in `ir-differential.ts`, which has a structured
+ * generator and renders every compiler's native source (.runar.java
+ * included) from a shared `GeneratedContract`.
+ */
+function compileJavaSource(_source: string, _tmpDir: string, _hex: boolean = false): string | null {
+  const javaJar = findJavaBinary();
+  if (javaJar && !_javaSkipWarned) {
+    _javaSkipWarned = true;
+    console.warn(
+      'note: Java compiler is available but the legacy fuzzer only renders .runar.ts ' +
+      '(no structured AST -> Java renderer); use `npx tsx conformance/fuzzer/index.ts ' +
+      '--ir --render native` to include Java.',
+    );
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Binary discovery
+// ---------------------------------------------------------------------------
+
+function findGoBinary(): string | null {
+  const candidates = [
+    resolve(ROOT, 'compilers/go/runar-go'),
+  ];
+  for (const c of candidates) {
+    try {
+      execFileSync(c, ['--help'], { stdio: 'pipe', timeout: 5000 });
+      return c;
+    } catch { /* continue */ }
+  }
+  return null;
+}
+
+function findRustBinary(): string | null {
+  const candidates = [
+    resolve(ROOT, 'compilers/rust/target/release/runar-compiler-rust'),
+  ];
+  for (const c of candidates) {
+    try {
+      execFileSync(c, ['--help'], { stdio: 'pipe', timeout: 5000 });
+      return c;
+    } catch { /* continue */ }
+  }
+  return null;
+}
+
+function findZigBinary(): string | null {
+  const candidates = [
+    resolve(ROOT, 'compilers/zig/zig-out/bin/runar-zig'),
+  ];
+  for (const c of candidates) {
+    try {
+      execFileSync(c, ['--help'], { stdio: 'pipe', timeout: 5000 });
+      return c;
+    } catch { /* continue */ }
+  }
+  return null;
+}
+
+function findRubyBinary(): string | null {
+  const rubyScript = resolve(ROOT, 'compilers/ruby/bin/runar-compiler-ruby');
   try {
-    const output = execSync(
-      `runar-rust --source "${tmpFile}" --hex`,
-      { timeout: 15_000, encoding: 'utf-8' },
-    ).trim();
-    return output;
+    execFileSync('ruby', ['--version'], { stdio: 'pipe', timeout: 5000 });
+    if (existsSync(rubyScript)) return rubyScript;
+  } catch { /* no ruby */ }
+  return null;
+}
+
+/**
+ * Mirrors the Java-binary discovery in `conformance/runner/runner.ts` so the
+ * legacy fuzzer can at least tell whether `java -jar <runar-java.jar>` would
+ * be reachable, even though this harness has no Java AST renderer (see
+ * `compileJavaSource` above) and therefore cannot drive the Java compiler.
+ */
+function findJavaBinary(): string | null {
+  const libsDir = resolve(ROOT, 'compilers/java/build/libs');
+  if (!existsSync(libsDir)) return null;
+  try {
+    execFileSync('java', ['-version'], { stdio: 'pipe', timeout: 5000 });
   } catch {
     return null;
   }
+  const preferred = join(libsDir, 'runar-java.jar');
+  if (existsSync(preferred)) return preferred;
+  try {
+    const entries = readdirSync(libsDir);
+    for (const entry of entries) {
+      if (entry.startsWith('runar-java-compiler-') && entry.endsWith('.jar')) {
+        return join(libsDir, entry);
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
 }
 
-/** Canonicalize JSON for comparison by sorting keys and normalizing whitespace. */
+// ---------------------------------------------------------------------------
+// Compiler dispatch
+// ---------------------------------------------------------------------------
+
+type CompileFn = (source: string, tmpDir: string, hex?: boolean) => string | null;
+
+const COMPILER_MAP: Record<CompilerName, CompileFn> = {
+  ts: compileTsSource,
+  go: compileGoSource,
+  rust: compileRustSource,
+  python: compilePythonSource,
+  zig: compileZigSource,
+  ruby: compileRubySource,
+  java: compileJavaSource,
+};
+
 function canonicalize(json: string): string {
   try {
     return JSON.stringify(JSON.parse(json), Object.keys(JSON.parse(json)).sort(), 2);
@@ -249,23 +360,44 @@ function canonicalize(json: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Failing case persistence
+// ---------------------------------------------------------------------------
+
+function saveFinding(
+  findingsDir: string,
+  source: string,
+  outputs: Array<{ name: string; output: string }>,
+  mismatchDetails: string,
+): void {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const dir = join(findingsDir, timestamp);
+  mkdirSync(dir, { recursive: true });
+
+  writeFileSync(join(dir, 'source.runar.ts'), source, 'utf-8');
+
+  for (const { name, output } of outputs) {
+    writeFileSync(join(dir, `${name}-output.txt`), output, 'utf-8');
+  }
+
+  writeFileSync(
+    join(dir, 'finding.json'),
+    JSON.stringify({ timestamp, mismatchDetails }, null, 2),
+    'utf-8',
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Differential fuzzing harness
 // ---------------------------------------------------------------------------
 
-/**
- * Run differential fuzzing: generate random valid Rúnar programs, compile
- * through all available compilers, and check that the IR output is identical.
- *
- * @param numPrograms - Number of random programs to generate and test.
- * @param options - Configuration for the fuzzing run.
- * @returns Array of results, one per generated program.
- */
 export async function runDifferentialFuzzing(
   numPrograms: number,
   options?: FuzzerOptions,
 ): Promise<DifferentialResult[]> {
-  const compilers = options?.compilers ?? ['ts', 'go', 'rust'];
+  const compilers = options?.compilers ?? ['ts', 'go', 'rust', 'python', 'zig', 'ruby'];
   const verbose = options?.verbose ?? false;
+  const compareHex = options?.compareHex ?? false;
+  const findingsDir = options?.findingsDir ?? join(__dirname, '..', 'fuzz-findings');
 
   const tmpDir = join(__dirname, '..', '.tmp', 'fuzz');
   if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
@@ -273,7 +405,6 @@ export async function runDifferentialFuzzing(
   const results: DifferentialResult[] = [];
   let mismatchCount = 0;
 
-  // Use fast-check's sample to generate programs deterministically
   const programs = fc.sample(runarContractArb, {
     numRuns: numPrograms,
     seed: options?.seed,
@@ -287,26 +418,16 @@ export async function runDifferentialFuzzing(
       console.log(source);
     }
 
-    // Compile with each requested compiler
-    let tsIR: string | null = null;
-    let goIR: string | null = null;
-    let rustIR: string | null = null;
+    const outputs: Array<{ name: CompilerName; output: string }> = [];
 
-    if (compilers.includes('ts')) {
-      tsIR = compileTsSource(source, tmpDir);
+    for (const compiler of compilers) {
+      const compileFn = COMPILER_MAP[compiler];
+      const output = compileFn(source, tmpDir, compareHex);
+      if (output !== null) {
+        const normalized = compareHex ? output.toLowerCase() : canonicalize(output);
+        outputs.push({ name: compiler, output: normalized });
+      }
     }
-    if (compilers.includes('go')) {
-      goIR = compileGoSource(source, tmpDir);
-    }
-    if (compilers.includes('rust')) {
-      rustIR = compileRustSource(source, tmpDir);
-    }
-
-    // Compare outputs
-    const outputs: Array<{ name: string; ir: string }> = [];
-    if (tsIR !== null) outputs.push({ name: 'ts', ir: canonicalize(tsIR) });
-    if (goIR !== null) outputs.push({ name: 'go', ir: canonicalize(goIR) });
-    if (rustIR !== null) outputs.push({ name: 'rust', ir: canonicalize(rustIR) });
 
     let match = true;
     let mismatchDetails: string | undefined;
@@ -315,9 +436,9 @@ export async function runDifferentialFuzzing(
       const reference = outputs[0]!;
       for (let j = 1; j < outputs.length; j++) {
         const other = outputs[j]!;
-        if (reference.ir !== other.ir) {
+        if (reference.output !== other.output) {
           match = false;
-          mismatchDetails = `IR mismatch between ${reference.name} and ${other.name}`;
+          mismatchDetails = `Output mismatch between ${reference.name} and ${other.name}`;
           break;
         }
       }
@@ -328,63 +449,58 @@ export async function runDifferentialFuzzing(
       if (verbose) {
         console.log(`  MISMATCH: ${mismatchDetails}`);
       }
+      saveFinding(findingsDir, source, outputs, mismatchDetails!);
     } else if (verbose) {
       const compiledWith = outputs.map((o) => o.name).join(', ');
       console.log(`  OK (compiled with: ${compiledWith})`);
     }
 
-    results.push({
+    const result: DifferentialResult = {
       programSource: source,
-      tsIR: tsIR ?? '',
-      goIR: goIR ?? undefined,
-      rustIR: rustIR ?? undefined,
       match,
       mismatchDetails,
-    });
+    };
+
+    for (const o of outputs) {
+      const key = `${o.name}Output` as keyof DifferentialResult;
+      (result as Record<string, unknown>)[key] = o.output;
+    }
+
+    results.push(result);
   }
 
-  // Summary
   console.log('');
   console.log(`Differential fuzzing complete: ${programs.length} programs, ${mismatchCount} mismatches`);
 
   return results;
 }
 
-/**
- * Run property-based differential testing using fast-check's test runner.
- * This integrates with fast-check's shrinking to find minimal failing inputs.
- */
 export async function runPropertyBasedDifferential(options?: FuzzerOptions): Promise<void> {
   const tmpDir = join(__dirname, '..', '.tmp', 'fuzz');
   if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
 
-  const compilers = options?.compilers ?? ['ts', 'go', 'rust'];
+  const compilers = options?.compilers ?? ['ts', 'go', 'rust', 'python', 'zig', 'ruby'];
+  const compareHex = options?.compareHex ?? false;
 
   fc.assert(
     fc.property(runarContractArb, (source: string) => {
-      const outputs: Array<{ name: string; ir: string }> = [];
+      const outputs: Array<{ name: string; output: string }> = [];
 
-      if (compilers.includes('ts')) {
-        const ir = compileTsSource(source, tmpDir);
-        if (ir !== null) outputs.push({ name: 'ts', ir: canonicalize(ir) });
-      }
-      if (compilers.includes('go')) {
-        const ir = compileGoSource(source, tmpDir);
-        if (ir !== null) outputs.push({ name: 'go', ir: canonicalize(ir) });
-      }
-      if (compilers.includes('rust')) {
-        const ir = compileRustSource(source, tmpDir);
-        if (ir !== null) outputs.push({ name: 'rust', ir: canonicalize(ir) });
+      for (const compiler of compilers) {
+        const compileFn = COMPILER_MAP[compiler];
+        const output = compileFn(source, tmpDir, compareHex);
+        if (output !== null) {
+          const normalized = compareHex ? output.toLowerCase() : canonicalize(output);
+          outputs.push({ name: compiler, output: normalized });
+        }
       }
 
-      // If fewer than 2 compilers succeeded, skip this test case
       if (outputs.length < 2) return true;
 
-      // All outputs must be identical
-      const reference = outputs[0]!.ir;
+      const reference = outputs[0]!.output;
       for (let i = 1; i < outputs.length; i++) {
-        if (outputs[i]!.ir !== reference) {
-          return false; // fast-check will shrink this
+        if (outputs[i]!.output !== reference) {
+          return false;
         }
       }
       return true;
@@ -397,5 +513,4 @@ export async function runPropertyBasedDifferential(options?: FuzzerOptions): Pro
   );
 }
 
-/** Export the program generator so external tools can reuse it. */
 export { runarContractArb };

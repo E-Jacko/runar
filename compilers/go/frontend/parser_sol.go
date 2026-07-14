@@ -41,6 +41,7 @@ const (
 	solTokEOF solTokenKind = iota
 	solTokIdent
 	solTokNumber
+	solTokHexString
 	solTokString
 	solTokLBrace    // {
 	solTokRBrace    // }
@@ -80,6 +81,8 @@ const (
 	solTokPercentEq // %=
 	solTokQuestion  // ?
 	solTokHat       // ^
+	solTokShl       // <<
+	solTokShr       // >>
 )
 
 type solToken struct {
@@ -195,17 +198,20 @@ func (p *solParser) tokenize(source string) []solToken {
 		if ch >= '0' && ch <= '9' {
 			start := i
 			if ch == '0' && i+1 < len(source) && (source[i+1] == 'x' || source[i+1] == 'X') {
+				// Hex byte string literal: 0x... -> ByteString
 				i += 2
 				col += 2
+				hexStart := i
 				for i < len(source) && isHexDigit(source[i]) {
 					i++
 					col++
 				}
-			} else {
-				for i < len(source) && source[i] >= '0' && source[i] <= '9' {
-					i++
-					col++
-				}
+				tokens = append(tokens, solToken{kind: solTokHexString, value: source[hexStart:i], line: line, col: startCol})
+				continue
+			}
+			for i < len(source) && source[i] >= '0' && source[i] <= '9' {
+				i++
+				col++
 			}
 			// Skip trailing 'n' for bigint literals
 			if i < len(source) && source[i] == 'n' {
@@ -259,6 +265,10 @@ func (p *solParser) tokenize(source string) []solToken {
 				twoKind = solTokSlashEq
 			case "%=":
 				twoKind = solTokPercentEq
+			case "<<":
+				twoKind = solTokShl
+			case ">>":
+				twoKind = solTokShr
 			default:
 				found = false
 			}
@@ -454,7 +464,7 @@ func (p *solParser) parseContract() (*ContractNode, error) {
 		parentClass = parentTok.value
 	}
 
-	if parentClass != "SmartContract" && parentClass != "StatefulSmartContract" {
+	if parentClass != "SmartContract" && parentClass != "StatefulSmartContract" && parentClass != "UnsafeSmartContract" {
 		return nil, fmt.Errorf("unknown parent class: %s", parentClass)
 	}
 
@@ -525,6 +535,29 @@ func (p *solParser) parseContract() (*ContractNode, error) {
 		}
 	}
 
+	// Resolve bare property references and bare method calls in method bodies
+	// (Solidity allows referencing state variables and other contract methods
+	// without the `this.` prefix).
+	propNameSet := make(map[string]bool, len(properties))
+	for _, prop := range properties {
+		propNameSet[prop.Name] = true
+	}
+	methodNameSet := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		methodNameSet[m.Name] = true
+	}
+	for i := range methods {
+		paramSet := make(map[string]bool, len(methods[i].Params))
+		for _, param := range methods[i].Params {
+			paramSet[param.Name] = true
+		}
+		newBody := make([]Statement, len(methods[i].Body))
+		for j, stmt := range methods[i].Body {
+			newBody[j] = solRewriteStmtBareProps(stmt, propNameSet, paramSet, methodNameSet)
+		}
+		methods[i].Body = newBody
+	}
+
 	return &ContractNode{
 		Name:        contractName,
 		ParentClass: parentClass,
@@ -549,6 +582,7 @@ func (p *solParser) parseSolProperty() *PropertyNode {
 		return nil
 	}
 	typeName := typeTok.value
+	propType := p.parseSolFixedArraySuffix(parseSolType(typeName))
 
 	// Check for immutable keyword
 	isReadonly := false
@@ -571,7 +605,7 @@ func (p *solParser) parseSolProperty() *PropertyNode {
 
 	return &PropertyNode{
 		Name:           propName,
-		Type:           parseSolType(typeName),
+		Type:           propType,
 		Readonly:       isReadonly,
 		Initializer:    initializer,
 		SourceLocation: loc,
@@ -595,6 +629,30 @@ func parseSolType(name string) TypeNode {
 		}
 		return CustomType{Name: name}
 	}
+}
+
+// parseSolFixedArraySuffix consumes any number of trailing `[N]` brackets
+// after a base type name and wraps the result as nested FixedArrayType.
+// Per Solidity declaration convention `T[A][B]` reads as outer B of
+// inner A of T — i.e. each `[L]` wraps the current type as
+// FixedArray<previous, L>, matching the TS reference parser.
+func (p *solParser) parseSolFixedArraySuffix(base TypeNode) TypeNode {
+	result := base
+	for p.check(solTokLBracket) {
+		p.advance() // [
+		lenTok := p.expect(solTokNumber)
+		length := 0
+		if bi := new(big.Int); bi != nil {
+			if _, ok := bi.SetString(lenTok.value, 0); ok && bi.IsInt64() && bi.Sign() >= 0 {
+				length = int(bi.Int64())
+			} else {
+				p.addError(fmt.Sprintf("FixedArray length must be a non-negative integer literal, got %q", lenTok.value))
+			}
+		}
+		p.expect(solTokRBracket)
+		result = FixedArrayType{Element: result, Length: length}
+	}
+	return result
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +755,156 @@ func solRenameIdentifiersInStmt(stmt Statement, renameMap map[string]string) Sta
 	default:
 		return stmt
 	}
+}
+
+// solRewriteExprBareProps recursively rewrites bare Identifier(name) references
+// to PropertyAccessExpr when name matches a property of the contract, and bare
+// CallExpr(Identifier(name), ...) calls to this.method() when name matches a
+// contract method (and is not a built-in function or local variable).
+func solRewriteExprBareProps(
+	expr Expression,
+	propNames map[string]bool,
+	paramNames map[string]bool,
+	methodNames map[string]bool,
+) Expression {
+	if expr == nil {
+		return nil
+	}
+	switch e := expr.(type) {
+	case Identifier:
+		if propNames[e.Name] && !paramNames[e.Name] {
+			return PropertyAccessExpr{Property: e.Name}
+		}
+		return e
+	case CallExpr:
+		// Rewrite bare contract-method calls: foo(args) -> this.foo(args)
+		if ident, ok := e.Callee.(Identifier); ok {
+			if methodNames[ident.Name] && !paramNames[ident.Name] && !propNames[ident.Name] {
+				newArgs := make([]Expression, len(e.Args))
+				for i, a := range e.Args {
+					newArgs[i] = solRewriteExprBareProps(a, propNames, paramNames, methodNames)
+				}
+				return CallExpr{
+					Callee: MemberExpr{Object: Identifier{Name: "this"}, Property: ident.Name},
+					Args:   newArgs,
+				}
+			}
+		}
+		newCallee := solRewriteExprBareProps(e.Callee, propNames, paramNames, methodNames)
+		newArgs := make([]Expression, len(e.Args))
+		for i, a := range e.Args {
+			newArgs[i] = solRewriteExprBareProps(a, propNames, paramNames, methodNames)
+		}
+		return CallExpr{Callee: newCallee, Args: newArgs}
+	case BinaryExpr:
+		e.Left = solRewriteExprBareProps(e.Left, propNames, paramNames, methodNames)
+		e.Right = solRewriteExprBareProps(e.Right, propNames, paramNames, methodNames)
+		return e
+	case UnaryExpr:
+		e.Operand = solRewriteExprBareProps(e.Operand, propNames, paramNames, methodNames)
+		return e
+	case MemberExpr:
+		e.Object = solRewriteExprBareProps(e.Object, propNames, paramNames, methodNames)
+		return e
+	case TernaryExpr:
+		e.Condition = solRewriteExprBareProps(e.Condition, propNames, paramNames, methodNames)
+		e.Consequent = solRewriteExprBareProps(e.Consequent, propNames, paramNames, methodNames)
+		e.Alternate = solRewriteExprBareProps(e.Alternate, propNames, paramNames, methodNames)
+		return e
+	case IndexAccessExpr:
+		e.Object = solRewriteExprBareProps(e.Object, propNames, paramNames, methodNames)
+		e.Index = solRewriteExprBareProps(e.Index, propNames, paramNames, methodNames)
+		return e
+	case IncrementExpr:
+		e.Operand = solRewriteExprBareProps(e.Operand, propNames, paramNames, methodNames)
+		return e
+	case DecrementExpr:
+		e.Operand = solRewriteExprBareProps(e.Operand, propNames, paramNames, methodNames)
+		return e
+	default:
+		return expr
+	}
+}
+
+// solRewriteStmtBareProps recursively rewrites bare property/method references
+// inside a statement, while tracking newly-declared local variables that
+// should shadow property names.
+func solRewriteStmtBareProps(
+	stmt Statement,
+	propNames map[string]bool,
+	paramNames map[string]bool,
+	methodNames map[string]bool,
+) Statement {
+	rwExpr := func(e Expression) Expression {
+		return solRewriteExprBareProps(e, propNames, paramNames, methodNames)
+	}
+	switch s := stmt.(type) {
+	case ExpressionStmt:
+		s.Expr = rwExpr(s.Expr)
+		return s
+	case AssignmentStmt:
+		s.Target = rwExpr(s.Target)
+		s.Value = rwExpr(s.Value)
+		return s
+	case VariableDeclStmt:
+		// Rewrite the initializer in the *current* scope (the new local does
+		// not shadow until after the declaration), then add the new local to
+		// the visible param/local set for subsequent statements.
+		if s.Init != nil {
+			s.Init = rwExpr(s.Init)
+		}
+		paramNames[s.Name] = true
+		return s
+	case IfStmt:
+		s.Condition = rwExpr(s.Condition)
+		thenLocals := copyStringSet(paramNames)
+		newThen := make([]Statement, len(s.Then))
+		for i, st := range s.Then {
+			newThen[i] = solRewriteStmtBareProps(st, propNames, thenLocals, methodNames)
+		}
+		s.Then = newThen
+		if s.Else != nil {
+			elseLocals := copyStringSet(paramNames)
+			newElse := make([]Statement, len(s.Else))
+			for i, st := range s.Else {
+				newElse[i] = solRewriteStmtBareProps(st, propNames, elseLocals, methodNames)
+			}
+			s.Else = newElse
+		}
+		return s
+	case ForStmt:
+		// The loop's init declaration is a VariableDeclStmt (Init field).
+		bodyLocals := copyStringSet(paramNames)
+		if s.Init.Init != nil {
+			s.Init.Init = solRewriteExprBareProps(s.Init.Init, propNames, bodyLocals, methodNames)
+		}
+		bodyLocals[s.Init.Name] = true
+		s.Condition = solRewriteExprBareProps(s.Condition, propNames, bodyLocals, methodNames)
+		if s.Update != nil {
+			s.Update = solRewriteStmtBareProps(s.Update, propNames, bodyLocals, methodNames)
+		}
+		newBody := make([]Statement, len(s.Body))
+		for i, st := range s.Body {
+			newBody[i] = solRewriteStmtBareProps(st, propNames, bodyLocals, methodNames)
+		}
+		s.Body = newBody
+		return s
+	case ReturnStmt:
+		if s.Value != nil {
+			s.Value = rwExpr(s.Value)
+		}
+		return s
+	default:
+		return stmt
+	}
+}
+
+func copyStringSet(in map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // solRenameIdentifiersInExpr recursively renames identifiers in an expression.
@@ -803,6 +1011,7 @@ func (p *solParser) parseSolParams() []ParamNode {
 	for !p.check(solTokRParen) && !p.check(solTokEOF) {
 		typeTok := p.expect(solTokIdent)
 		typeName := typeTok.value
+		paramType := p.parseSolFixedArraySuffix(parseSolType(typeName))
 
 		// Skip memory/storage/calldata qualifiers
 		for p.checkIdent("memory") || p.checkIdent("storage") || p.checkIdent("calldata") {
@@ -816,7 +1025,7 @@ func (p *solParser) parseSolParams() []ParamNode {
 
 		params = append(params, ParamNode{
 			Name: cleanName,
-			Type: parseSolType(typeName),
+			Type: paramType,
 		})
 
 		if !p.match(solTokComma) {
@@ -869,6 +1078,12 @@ func (p *solParser) parseSolStatement() Statement {
 	// return ...;
 	if p.checkIdent("return") {
 		return p.parseSolReturn(loc)
+	}
+
+	// let Type name = expr; (TypeScript-style local declaration)
+	if p.checkIdent("let") {
+		p.advance() // consume 'let'
+		return p.parseSolVarDecl(loc)
 	}
 
 	// Variable declarations: Type name = expr;
@@ -1150,20 +1365,36 @@ func (p *solParser) parseSolEquality() Expression {
 }
 
 func (p *solParser) parseSolComparison() Expression {
-	left := p.parseSolAdditive()
+	left := p.parseSolShift()
 	for {
 		if p.match(solTokLt) {
-			right := p.parseSolAdditive()
+			right := p.parseSolShift()
 			left = BinaryExpr{Op: "<", Left: left, Right: right}
 		} else if p.match(solTokLtEq) {
-			right := p.parseSolAdditive()
+			right := p.parseSolShift()
 			left = BinaryExpr{Op: "<=", Left: left, Right: right}
 		} else if p.match(solTokGt) {
-			right := p.parseSolAdditive()
+			right := p.parseSolShift()
 			left = BinaryExpr{Op: ">", Left: left, Right: right}
 		} else if p.match(solTokGtEq) {
-			right := p.parseSolAdditive()
+			right := p.parseSolShift()
 			left = BinaryExpr{Op: ">=", Left: left, Right: right}
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+func (p *solParser) parseSolShift() Expression {
+	left := p.parseSolAdditive()
+	for {
+		if p.match(solTokShl) {
+			right := p.parseSolAdditive()
+			left = BinaryExpr{Op: "<<", Left: left, Right: right}
+		} else if p.match(solTokShr) {
+			right := p.parseSolAdditive()
+			left = BinaryExpr{Op: ">>", Left: left, Right: right}
 		} else {
 			break
 		}
@@ -1283,6 +1514,9 @@ func (p *solParser) parseSolPrimary() Expression {
 	case solTokNumber:
 		p.advance()
 		return parseSolNumber(tok.value)
+	case solTokHexString:
+		p.advance()
+		return ByteStringLiteral{Value: tok.value}
 	case solTokString:
 		p.advance()
 		return ByteStringLiteral{Value: tok.value}
@@ -1313,11 +1547,29 @@ func (p *solParser) parseSolPrimary() Expression {
 		expr := p.parseSolExpression()
 		p.expect(solTokRParen)
 		return expr
+	case solTokLBracket:
+		// Array literal: [a, b, c]
+		return p.parseSolArrayLiteral()
 	default:
 		p.addError(fmt.Sprintf("line %d: unexpected token %q", tok.line, tok.value))
 		p.advance()
 		return BigIntLiteral{Value: big.NewInt(0)}
 	}
+}
+
+// parseSolArrayLiteral handles bare [a, b, c] array-literal expressions.
+func (p *solParser) parseSolArrayLiteral() Expression {
+	p.expect(solTokLBracket)
+	var elements []Expression
+	for !p.check(solTokRBracket) && !p.check(solTokEOF) {
+		elem := p.parseSolExpression()
+		elements = append(elements, elem)
+		if !p.match(solTokComma) {
+			break
+		}
+	}
+	p.expect(solTokRBracket)
+	return ArrayLiteralExpr{Elements: elements}
 }
 
 func (p *solParser) parseSolCallArgs() []Expression {

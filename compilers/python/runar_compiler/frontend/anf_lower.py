@@ -11,6 +11,7 @@ names (``t0``, ``t1``, ...).
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from runar_compiler.frontend.ast_nodes import (
     ArrayLiteralExpr,
@@ -51,6 +52,12 @@ from runar_compiler.ir.types import (
     ANFValue,
     SourceLocation,
 )
+from runar_compiler.frontend.side_effect_summary import (
+    MethodEffects,
+    compute_side_effect_summary,
+    continuation_shape_for,
+)
+from runar_compiler.frontend.sighash_directive import SIGHASH_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -65,10 +72,19 @@ def lower_to_anf(contract: ContractNode) -> ANFProgram:
     properties = _lower_properties(contract)
     methods = _lower_methods(contract)
 
+    # Post-pass: lift update_prop from if-else branches into flat conditionals.
+    # Mirrors the TS reference compiler's liftBranchUpdateProps
+    # (04-anf-lower.ts) and the Go port (anf_lower.go). This prevents phantom
+    # stack entries in stack lowering for patterns like position dispatch,
+    # where different properties get updated in different branches.
+    for method in methods:
+        method.body = _lift_branch_update_props(method.body)
+
     return ANFProgram(
         contract_name=contract.name,
         properties=properties,
         methods=methods,
+        parent_class=contract.parent_class,
     )
 
 
@@ -87,6 +103,8 @@ _BYTE_TYPES: frozenset[str] = frozenset({
     "RabinSig",
     "RabinPubKey",
     "Point",
+    "P256Point",
+    "P384Point",
 })
 
 _BYTE_RETURNING_FUNCTIONS: frozenset[str] = frozenset({
@@ -111,6 +129,18 @@ _BYTE_RETURNING_FUNCTIONS: frozenset[str] = frozenset({
     "ecEncodeCompressed",
     "blake3Compress",
     "blake3Hash",
+    # P-256 point-returning functions
+    "p256Add",
+    "p256Mul",
+    "p256MulGen",
+    "p256Negate",
+    "p256EncodeCompressed",
+    # P-384 point-returning functions
+    "p384Add",
+    "p384Mul",
+    "p384MulGen",
+    "p384Negate",
+    "p384EncodeCompressed",
 })
 
 
@@ -148,6 +178,9 @@ def _is_byte_typed_expr(expr: Expression | None, ctx: _LowerCtx) -> bool:
 
     if isinstance(expr, CallExpr):
         if isinstance(expr.callee, Identifier):
+            # Expression-form asm<ByteString>({...}) yields a byte value.
+            if expr.callee.name == "asm":
+                return expr.asm_return_type == "ByteString"
             if expr.callee.name in _BYTE_RETURNING_FUNCTIONS:
                 return True
             if len(expr.callee.name) >= 7 and expr.callee.name[:7] == "extract":
@@ -171,8 +204,27 @@ def _lower_properties(contract: ContractNode) -> list[ANFProperty]:
         )
         if prop.initializer is not None:
             anf_prop.initial_value = _extract_literal_value(prop.initializer)
+        # Propagate synthetic FixedArray chain (set by expand_fixed_arrays)
+        # so the artifact assembler can iteratively re-group synthetic runs.
+        chain = getattr(prop, "synthetic_array_chain", None)
+        if chain:
+            anf_prop.synthetic_array_chain = [
+                {"base": c.base, "index": c.index, "length": c.length}
+                for c in chain
+            ]
         result.append(anf_prop)
     return result
+
+
+def _flatten_add_output_args(args: list[Expression]) -> list[Expression]:
+    """Mirror flattenAddOutputArgs in 04-anf-lower.ts: when this.addOutput is
+    called as ``this.addOutput(satoshis, .{ v1, v2, ... })`` (the surface
+    form Zig / Move tuple syntax produce), unwrap the trailing array
+    literal so each element becomes an individual state value.
+    """
+    if len(args) == 2 and isinstance(args[1], ArrayLiteralExpr):
+        return [args[0], *args[1].elements]
+    return args
 
 
 def _extract_literal_value(expr: Expression) -> str | int | bool | None:
@@ -196,8 +248,28 @@ def _extract_literal_value(expr: Expression) -> str | int | bool | None:
 def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
     result: list[ANFMethod] = []
 
+    # Single source of truth for "does this method (transitively)
+    # mutate state, emit outputs, or use the preimage?" Shared across
+    # the lowering pass so every public method's auto-injection sees
+    # private-helper effects, not just direct ones.
+    side_effects = compute_side_effect_summary(contract)
+
+    # Issue #109: readonly fields carrying a ``/** @embedAlways */`` directive
+    # must survive DCE into the locking script. A readonly field no method
+    # references lowers to no ``load_prop``, so no constructor slot is emitted
+    # and the field's deploy-time bytes vanish. We inject a ``load_prop`` + a
+    # ``@ref:`` alias (the exact shape ``const _bind = this.field;`` produces)
+    # into the first public method's body — the alias keeps the ``load_prop``
+    # alive through dead-binding DCE, and stack lowering threads the pushed
+    # value through and cleans it up (OP_NIP) at method end. One slot in the
+    # deployed script suffices; every spending branch shares it.
+    embed_fields = [p for p in contract.properties if p.readonly and p.embed_always]
+    embed_injected = False
+
     # Lower constructor
-    ctor_ctx = _LowerCtx(contract)
+    ctor_ctx = _LowerCtx(contract, side_effects)
+    for p in contract.constructor.params:
+        ctor_ctx.register_param_type(p.name, _type_node_to_string(p.type))
     ctor_ctx.lower_statements(contract.constructor.body)
     result.append(ANFMethod(
         name="constructor",
@@ -208,32 +280,78 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
 
     # Lower each method
     for method in contract.methods:
-        method_ctx = _LowerCtx(contract)
+        method_ctx = _LowerCtx(contract, side_effects)
+        # Issue #123: non-default @sighash mode drives the OP_PUSH_TX binding
+        # flag for any checkPreimage (auto-injected below, or a manual call) in
+        # this method.
+        if method.sighash_type is not None and method.sighash_type != SIGHASH_DEFAULT:
+            method_ctx.sighash_flag = method.sighash_type
+        for p in method.params:
+            method_ctx.register_param_type(p.name, _type_node_to_string(p.type))
+
+        # Register the declared param NAMES so a bare identifier resolves to
+        # ``load_param`` before falling through to ``load_prop`` (issue #130).
+        # Without this, a param whose name collides with a mutable state
+        # property lowered to the stale deserialized property value instead of
+        # the witness param. Explicit ``this.x`` is unaffected: it lowers via
+        # the property_access / member paths, which prefer a real property.
+        for p in method.params:
+            method_ctx.add_param(p.name)
 
         if contract.parent_class == "StatefulSmartContract" and method.visibility == "public":
-            # Determine if this method verifies hashOutputs (needs change output support).
-            # Methods that use addOutput or mutate state need hashOutputs verification.
-            # Non-mutating methods (like close/destroy) don't verify outputs.
-            needs_change_output = (
-                _method_mutates_state(method, contract)
-                or _method_has_add_output(method)
-            )
+            # Continuation requirements come from the side-effect
+            # summary, which walks the private-method call graph. A
+            # public method that calls a private helper which mutates
+            # state or emits an output must therefore inject the same
+            # continuation params as if the public body did so directly.
+            eff = side_effects.get(method.name, MethodEffects())
+            shape = continuation_shape_for(eff)
+            needs_change_output = shape.needs_change
+            needs_new_amount = shape.needs_new_amount
 
             # Register implicit parameters
             if needs_change_output:
                 method_ctx.add_param("_changePKH")
                 method_ctx.add_param("_changeAmount")
-            # Single-output continuation needs _newAmount to allow changing the UTXO satoshis.
-            # Multi-output (addOutput) methods already specify amounts explicitly per output.
-            needs_new_amount = _method_mutates_state(method, contract) and not _method_has_add_output(method)
+                method_ctx.register_param_type("_changePKH", "Ripemd160")
+                method_ctx.register_param_type("_changeAmount", "bigint")
             if needs_new_amount:
                 method_ctx.add_param("_newAmount")
+                method_ctx.register_param_type("_newAmount", "bigint")
             method_ctx.add_param("txPreimage")
+            method_ctx.register_param_type("txPreimage", "SigHashPreimage")
+
+            # Issue #123: the declared per-method sighash mode (default
+            # ALL|FORKID). Drives BOTH the OP_PUSH_TX binding flag (so the
+            # derived sig re-computes the tx sighash under this mode) AND the
+            # runtime preimage-type assert.
+            sighash_mode = method.sighash_type if method.sighash_type is not None else SIGHASH_DEFAULT
+            is_default_sighash = sighash_mode == SIGHASH_DEFAULT
 
             # Inject checkPreimage(txPreimage) at the start
             preimage_ref = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
-            check_result = method_ctx.emit(ANFValue(kind="check_preimage", preimage=preimage_ref))
+            check_pre_value = ANFValue(kind="check_preimage", preimage=preimage_ref)
+            # Omit for the default so the ANF (and pinned binding blob) is unchanged.
+            if not is_default_sighash:
+                check_pre_value.sighash_flag = sighash_mode
+            check_result = method_ctx.emit(check_pre_value)
             method_ctx.emit(_make_assert(check_result))
+
+            # GAP-302 / #123: pin the sighash type to the declared mode. The
+            # auto-injected covenant verifies a real tx preimage, but without
+            # this check the spend could use a DIFFERENT sighash flag than
+            # declared that zeroes out preimage fields the contract (or its
+            # continuation) relies on (hashOutputs / hashPrevouts / hashSequence).
+            # The value defaults to 0x41 (SIGHASH_ALL|FORKID) so existing
+            # contracts emit byte-identical ANF.
+            sig_hash_preimage_ref = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
+            sig_hash_type_ref = method_ctx.emit(_make_call("extractSigHashType", [sig_hash_preimage_ref]))
+            expected_sig_hash_ref = method_ctx.emit(_make_load_const_int(sighash_mode))
+            sig_hash_ok_ref = method_ctx.emit(ANFValue(
+                kind="bin_op", op="===",
+                left=sig_hash_type_ref, right=expected_sig_hash_ref,
+            ))
+            method_ctx.emit(_make_assert(sig_hash_ok_ref))
 
             # Deserialize mutable state from the preimage's scriptCode
             has_state_prop = any(not p.readonly for p in contract.properties)
@@ -241,22 +359,76 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                 preimage_ref3 = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
                 method_ctx.emit(ANFValue(kind="deserialize_state", preimage=preimage_ref3))
 
+            # Issue #109: preserve @embedAlways fields at the first user-statement
+            # position (after the checkPreimage/deserialize preamble), mirroring
+            # where a ``const _bind = this.field;`` idiom would sit.
+            if not embed_injected and embed_fields:
+                _emit_embed_always_preservation(method_ctx, embed_fields)
+                embed_injected = True
+
             # Lower the developer's method body
             method_ctx.lower_statements(method.body)
 
-            # Determine state continuation type
+            # Determine state continuation type.
+            #
+            # === Continuation-hash construction ===
+            #
+            # Outputs are concatenated in the following order before hashing
+            # with hash256:
+            #   1. state outputs  (addOutput / addRawOutput, via addOutputRef)
+            #   2. data outputs   (addDataOutput, via addDataOutputRef)
+            #   3. change output  (P2PKH to _changePKH, value = _changeAmount)
+            #
+            # For the "single-output" fast path (no addOutput, but state mutates
+            # or a data output is emitted), the state output is computed on the
+            # fly from (preimage, stateScript, _newAmount); data outputs are
+            # inserted BETWEEN the single state output and the change output.
             add_output_refs = method_ctx.get_add_output_refs()
-            if add_output_refs or _method_mutates_state(method, contract):
-                # Build the P2PKH change output for hashOutputs verification
+            add_data_output_refs = method_ctx.get_add_data_output_refs()
+            # Gate the continuation assertion on the same shape used
+            # for param injection. Both must agree or the deployed
+            # locking script will not match the auto-injected parameter
+            # list.
+            if needs_change_output:
+                # Build the P2PKH change output for hashOutputs verification.
+                #
+                # Issue #116: the SDK's build_call_transaction OMITS the change
+                # output when ``change <= 0`` (an exact-cover call) and passes
+                # ``_changeAmount = 0``. Gate the change segment on
+                # ``_changeAmount != 0`` at runtime so the hashed output set
+                # matches the SDK at the exact-zero boundary -- the segment is
+                # the P2PKH change output when non-zero, and empty bytes (cat
+                # with empty is a no-op) when zero, reproducing the omission.
+                # For any change > 0 the hashed bytes are unchanged; only the
+                # emitted script gains the guard.
                 change_pkh_ref = method_ctx.emit(ANFValue(kind="load_param", name="_changePKH"))
                 change_amount_ref = method_ctx.emit(ANFValue(kind="load_param", name="_changeAmount"))
-                change_output_ref = method_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+                zero_ref = method_ctx.emit(_make_load_const_int(0))
+                change_non_zero_ref = method_ctx.emit(ANFValue(
+                    kind="bin_op", op="!==",
+                    left=change_amount_ref, right=zero_ref,
+                ))
+                change_then_ctx = method_ctx.sub_context()
+                change_then_ctx.emit(_make_call("buildChangeOutput", [change_pkh_ref, change_amount_ref]))
+                method_ctx.sync_counter(change_then_ctx)
+                change_else_ctx = method_ctx.sub_context()
+                change_else_ctx.emit(_make_load_const_string(""))
+                method_ctx.sync_counter(change_else_ctx)
+                change_output_ref = method_ctx.emit(ANFValue(
+                    kind="if",
+                    cond=change_non_zero_ref,
+                    then=change_then_ctx.bindings,
+                    else_=change_else_ctx.bindings,
+                ))
 
                 if add_output_refs:
-                    # Multi-output continuation: concat all outputs + change output, hash
+                    # Multi-output continuation: concat all state outputs, then
+                    # all data outputs, then change output, then hash.
                     accumulated = add_output_refs[0]
                     for i in range(1, len(add_output_refs)):
                         accumulated = method_ctx.emit(_make_call("cat", [accumulated, add_output_refs[i]]))
+                    for data_ref in add_data_output_refs:
+                        accumulated = method_ctx.emit(_make_call("cat", [accumulated, data_ref]))
                     accumulated = method_ctx.emit(_make_call("cat", [accumulated, change_output_ref]))
                     hash_ref = method_ctx.emit(_make_call("hash256", [accumulated]))
                     preimage_ref2 = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
@@ -266,14 +438,19 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                         left=hash_ref, right=output_hash_ref,
                         result_type="bytes",
                     ))
-                    method_ctx.emit(_make_assert(eq_ref))
+                    method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
                 else:
-                    # Single-output continuation: build raw output bytes, concat with change, hash
+                    # Single-output continuation: build raw output bytes, then
+                    # splice in any declared data outputs, then concat with
+                    # change, then hash.
                     state_script_ref = method_ctx.emit(ANFValue(kind="get_state_script"))
                     preimage_ref2 = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
                     new_amount_ref = method_ctx.emit(ANFValue(kind="load_param", name="_newAmount"))
                     contract_output_ref = method_ctx.emit(_make_call("computeStateOutput", [preimage_ref2, state_script_ref, new_amount_ref]))
-                    all_outputs = method_ctx.emit(_make_call("cat", [contract_output_ref, change_output_ref]))
+                    accumulated = contract_output_ref
+                    for data_ref in add_data_output_refs:
+                        accumulated = method_ctx.emit(_make_call("cat", [accumulated, data_ref]))
+                    all_outputs = method_ctx.emit(_make_call("cat", [accumulated, change_output_ref]))
                     hash_ref = method_ctx.emit(_make_call("hash256", [all_outputs]))
                     preimage_ref4 = method_ctx.emit(ANFValue(kind="load_param", name="txPreimage"))
                     output_hash_ref = method_ctx.emit(_make_call("extractOutputHash", [preimage_ref4]))
@@ -282,7 +459,7 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                         left=hash_ref, right=output_hash_ref,
                         result_type="bytes",
                     ))
-                    method_ctx.emit(_make_assert(eq_ref))
+                    method_ctx.emit(_make_auto_injected_state_check_assert(eq_ref))
 
             # Build augmented params list for ABI
             augmented_params = _lower_params(method.params)
@@ -295,19 +472,43 @@ def _lower_methods(contract: ContractNode) -> list[ANFMethod]:
                 augmented_params.append(ANFParam(name="_newAmount", type="bigint"))
             augmented_params.append(ANFParam(name="txPreimage", type="SigHashPreimage"))
 
+            # Intent-covenant intrinsic auto-injected witness params:
+            # extractPrevOutputScript adds `_prevOutScript_<inputIndex>`
+            # (one per distinct literal index referenced in the method);
+            # requireOutputP2PKH adds a single `_serialisedOutputs`. Order
+            # follows insertion order via method_scope.auto_injected_params.
+            # Appended AFTER txPreimage so unlocking scripts push them
+            # adjacent to the preimage (matches existing _changePKH /
+            # _changeAmount / _newAmount convention of trailing the user
+            # args before the preimage anchor).
+            augmented_params += list(method_ctx.method_scope.auto_injected_params)
+
             result.append(ANFMethod(
                 name=method.name,
                 params=augmented_params,
                 body=method_ctx.bindings,
                 is_public=True,
+                sighash_type=method.sighash_type,
             ))
         else:
+            # Issue #109: stateless public methods (and stateless contracts'
+            # spending entry points) are lowered here — inject @embedAlways
+            # preservation into the first PUBLIC one before its body.
+            if not embed_injected and embed_fields and method.visibility == "public":
+                _emit_embed_always_preservation(method_ctx, embed_fields)
+                embed_injected = True
             method_ctx.lower_statements(method.body)
+            # Private methods can also call the intent intrinsics; capture
+            # their auto-injected witness params so a public method that
+            # inlines this private picks them up via the shared method_scope.
+            augmented = _lower_params(method.params)
+            augmented += list(method_ctx.method_scope.auto_injected_params)
             result.append(ANFMethod(
                 name=method.name,
-                params=_lower_params(method.params),
+                params=augmented,
                 body=method_ctx.bindings,
                 is_public=method.visibility == "public",
+                sighash_type=method.sighash_type,
             ))
 
     return result
@@ -320,9 +521,56 @@ def _lower_params(params: list) -> list[ANFParam]:
     ]
 
 
+def _emit_embed_always_preservation(ctx: "_LowerCtx", fields: list) -> None:
+    """Issue #109: emit the DCE-surviving preservation pair for each
+    ``@embedAlways`` readonly field, into the given (public) method context.
+
+    Reproduces exactly what a hand-written ``const _bind = this.field;`` lowers
+    to: a ``load_prop`` followed by a ``load_const("@ref:<t>")`` alias. The alias
+    marks the ``load_prop`` as referenced (see ``collect_refs`` in the DCE pass),
+    so dead-binding DCE keeps it; stack lowering then emits the field's
+    constructor-slot placeholder and NIPs the unused value off the stack at
+    method end. The field's bytes therefore remain in the deployed locking
+    script for downstream recovery.
+    """
+    for field in fields:
+        load_ref = ctx.emit(ANFValue(kind="load_prop", name=field.name))
+        ctx.emit_named(
+            f"__embedAlways_{field.name}",
+            _make_load_const_string(f"@ref:{load_ref}"),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Lowering context
 # ---------------------------------------------------------------------------
+
+class _MethodScope:
+    """Per-method bookkeeping shared by parent and sub-contexts.
+
+    Tracks auto-injected witness parameters needed by intent-covenant
+    intrinsics (``extractPrevOutputScript``, ``requireOutputP2PKH``)
+    regardless of whether the intrinsic is called from the method's
+    top-level body or from inside a nested block (if/else, ternary).
+    Mirrors the Go ``methodScopeT`` struct.
+    """
+
+    def __init__(self) -> None:
+        # Append-only list of auto-injected params (insertion order).
+        self.auto_injected_params: list[ANFParam] = []
+        # Set of names already recorded (dedup).
+        self.auto_injected_set: set[str] = set()
+        # requireOutputP2PKH emits its hashOutputs(preimage) check at
+        # most ONCE per method body.
+        self.did_emit_hash_outputs_check: bool = False
+
+    def record_auto_injected_param(self, name: str, typ: str) -> None:
+        """Idempotent: second call with the same name is a no-op."""
+        if name in self.auto_injected_set:
+            return
+        self.auto_injected_set.add(name)
+        self.auto_injected_params.append(ANFParam(name=name, type=typ))
+
 
 class _LowerCtx:
     """Manages temp variable generation and binding emission.
@@ -330,16 +578,100 @@ class _LowerCtx:
     Mirrors the Go ``lowerCtx`` struct exactly.
     """
 
-    def __init__(self, contract: ContractNode) -> None:
+    def __init__(
+        self,
+        contract: ContractNode,
+        side_effects: dict[str, MethodEffects] | None = None,
+        method_scope: _MethodScope | None = None,
+    ) -> None:
         self.bindings: list[ANFBinding] = []
         self._counter: int = 0
         self._contract: ContractNode = contract
         self._local_names: set[str] = set()
         self._param_names: set[str] = set()
+        # Issue #123: the declared non-default @sighash flag for the method being
+        # lowered, so a MANUAL ``checkPreimage(pre)`` call (stateless / explicit)
+        # binds under the same mode as the method's declared sighash. ``None`` =
+        # default ALL|FORKID, keeping the pinned binding blob unchanged.
+        self.sighash_flag: int | None = None
+        # Method-scoped parameter type table. Populated once per
+        # method/constructor (and for auto-injected continuation params)
+        # before its body is lowered. Mirrors the TS reference's
+        # per-method getParamType: a local named ``x`` in one method must
+        # NOT pick up a same-named parameter (e.g. ``x: ByteString``) of a
+        # DIFFERENT method, which would poison byte-type analysis and emit
+        # OP_CAT where OP_ADD is correct. Shared by reference into
+        # sub-contexts so if/else blocks see the same scope.
+        self._param_types: dict[str, str] = {}
         self._add_output_refs: list[str] = []
+        self._add_data_output_refs: list[str] = []
         self._local_aliases: dict[str, str] = {}
         self._local_byte_vars: set[str] = set()
         self.current_source_loc: SourceLocation | None = None
+        # Param substitution stack used when inlining a private method's
+        # body into this context. When the inlined body references that
+        # param, the lowered identifier resolves to the aliased ref
+        # instead of emitting load_param. Stacked so nested inlines
+        # compose correctly.
+        self._param_alias_stack: dict[str, list[str]] = {}
+        # Side-effect summary shared with auto-injection decisions. Used
+        # at lowering time to decide whether a private call should be
+        # inlined (so that helper's add_output / add_data_output ANF
+        # nodes register on the caller's continuation hash) or remain a
+        # method_call for stack lowering to inline later.
+        self._side_effects: dict[str, MethodEffects] | None = side_effects
+        # Per-method scope shared by parent and sub-contexts. Tracks
+        # auto-injected witness params for intent-covenant intrinsics.
+        # Always non-None so sub-contexts inherit the same scope and
+        # auto-injection registers regardless of nesting depth.
+        self.method_scope: _MethodScope = method_scope if method_scope is not None else _MethodScope()
+
+    def push_param_alias(self, name: str, alias_ref: str) -> None:
+        self._param_alias_stack.setdefault(name, []).append(alias_ref)
+
+    def pop_param_alias(self, name: str) -> None:
+        stack = self._param_alias_stack.get(name)
+        if not stack:
+            return
+        stack.pop()
+        if not stack:
+            self._param_alias_stack.pop(name, None)
+
+    def get_param_alias(self, name: str) -> str | None:
+        stack = self._param_alias_stack.get(name)
+        if not stack:
+            return None
+        return stack[-1]
+
+    def should_inline_private(self, name: str) -> bool:
+        """Whether a call to ``name`` should be ANF-inlined rather than
+        emitted as a method_call. True iff ``name`` is a private method
+        that (transitively) emits state outputs (addOutput /
+        addRawOutput) or data outputs (addDataOutput). Those refs MUST
+        appear in the caller's binding stream so they participate in
+        the continuation hash.
+
+        Mutation-only private helpers are intentionally NOT inlined —
+        state mutation flows through state continuity (the
+        continuation hash reads state via get_state_script after all
+        mutations apply). Keeping the existing method_call +
+        stack-lowering inlining path for those preserves byte-equality
+        with the pre-fix corpus.
+        """
+        if self._side_effects is None:
+            return False
+        if not self._is_private_method(name):
+            return False
+        eff = self._side_effects.get(name)
+        if eff is None:
+            return False
+        return eff.has_state_output or eff.has_data_output
+
+    def get_private_method(self, name: str) -> MethodNode | None:
+        for m in self._contract.methods:
+            if m.name == name and m.visibility != "public":
+                return m
+        return None
 
     def fresh_temp(self) -> str:
         name = f"t{self._counter}"
@@ -369,6 +701,11 @@ class _LowerCtx:
     def add_param(self, name: str) -> None:
         self._param_names.add(name)
 
+    def register_param_type(self, name: str, type_str: str | None) -> None:
+        """Record the type of a parameter for the CURRENT method scope."""
+        if type_str is not None:
+            self._param_types[name] = type_str
+
     def is_param(self, name: str) -> bool:
         return name in self._param_names
 
@@ -384,18 +721,32 @@ class _LowerCtx:
     def get_add_output_refs(self) -> list[str]:
         return self._add_output_refs
 
+    def add_data_output_ref(self, ref: str) -> None:
+        """Track an addDataOutput binding ref -- distinct from state outputs."""
+        self._add_data_output_refs.append(ref)
+
+    def get_add_data_output_refs(self) -> list[str]:
+        """Get all addDataOutput refs collected during lowering."""
+        return self._add_data_output_refs
+
     def is_property(self, name: str) -> bool:
         return any(p.name == name for p in self._contract.properties)
 
+    def _is_private_method(self, name: str) -> bool:
+        """Whether ``name`` is a private (non-public) method on the contract.
+        Used to route bare-identifier calls through the method_call inlining
+        path so Move's free-function helpers match TypeScript's ``this.foo()``
+        lowering."""
+        for m in self._contract.methods:
+            if m.name == name and m.name != "constructor" and m.visibility != "public":
+                return True
+        return False
+
     def get_param_type(self, name: str) -> str | None:
-        for p in self._contract.constructor.params:
-            if p.name == name:
-                return _type_node_to_string(p.type)
-        for method in self._contract.methods:
-            for p in method.params:
-                if p.name == name:
-                    return _type_node_to_string(p.type)
-        return None
+        # Method-scoped: read ONLY the current method's parameter types.
+        # Searching all methods would let a local in one method falsely
+        # match a same-named param of a different method (issue #34).
+        return self._param_types.get(name)
 
     def get_property_type(self, name: str) -> str | None:
         for p in self._contract.properties:
@@ -407,12 +758,20 @@ class _LowerCtx:
         """Create a sub-context for nested blocks (if/else, loops).
 
         The counter continues from the parent. Local names and param names
-        are shared (copied).
+        are shared (copied). The method_scope is *shared by reference* so
+        auto-injection from intent intrinsics registers on the parent
+        method's ABI augmentation regardless of nesting depth.
         """
-        sub = _LowerCtx(self._contract)
+        sub = _LowerCtx(self._contract, side_effects=self._side_effects, method_scope=self.method_scope)
         sub._counter = self._counter
         sub._local_names = set(self._local_names)
         sub._param_names = set(self._param_names)
+        # Issue #123: a manual checkPreimage() inside a nested block must bind
+        # under the same declared @sighash mode as the enclosing method.
+        sub.sighash_flag = self.sighash_flag
+        # Share the method-scoped param-type table by reference so if/else
+        # sub-contexts resolve parameter types against the same method.
+        sub._param_types = self._param_types
         sub._local_aliases = dict(self._local_aliases)
         sub._local_byte_vars = set(self._local_byte_vars)
         return sub
@@ -517,11 +876,24 @@ class _LowerCtx:
             else_ctx.lower_statements(stmt.else_)
         self.sync_counter(else_ctx)
 
-        # Propagate addOutput refs from sub-contexts: when either branch produces
-        # addOutput calls, the if-expression result represents each addOutput
-        # (only one branch executes at runtime).
-        then_has_outputs = bool(then_ctx.get_add_output_refs())
-        else_has_outputs = bool(else_ctx.get_add_output_refs())
+        # 2026-04-30 audit finding F2: when a branch contains output
+        # intrinsics, append a cat-chain inside each branch so the
+        # branch's terminal value is the concat of its output bytes
+        # (state then data, in declaration order). Balances runtime
+        # stack effects across branches and lets the parent's
+        # continuation hash see one ref per if representing the
+        # chosen branch's full output set.
+        branch_has_state_output = bool(
+            then_ctx.get_add_output_refs() or else_ctx.get_add_output_refs()
+        )
+        branch_has_outputs = (
+            branch_has_state_output
+            or bool(then_ctx.get_add_data_output_refs() or else_ctx.get_add_data_output_refs())
+        )
+
+        if branch_has_outputs:
+            _append_branch_output_concat(then_ctx)
+            _append_branch_output_concat(else_ctx)
 
         if_name = self.emit(ANFValue(
             kind="if",
@@ -530,8 +902,24 @@ class _LowerCtx:
             else_=else_ctx.bindings,
         ))
 
-        if then_has_outputs or else_has_outputs:
-            self.add_output_ref(if_name)
+        if branch_has_outputs:
+            # Register the if's value once with the parent's continuation
+            # tracker. CRITICAL: pick the right tracker. If either
+            # branch produces a STATE output, the parent must take the
+            # multi-output continuation path, so we register as a
+            # state output ref. If neither branch produces a state
+            # output and at least one branch produces a data output,
+            # we register as a DATA output ref so the parent keeps
+            # its single-output `computeStateOutput` continuation
+            # and the data-output bytes splice in BETWEEN the state
+            # output and the change output. Without this, a branch
+            # with only `addDataOutput` was incorrectly forced onto
+            # the multi-output path, dropping the canonical state
+            # continuation.
+            if branch_has_state_output:
+                self.add_output_ref(if_name)
+            else:
+                self.add_data_output_ref(if_name)
 
         # If both branches end by reassigning the same local variable,
         # alias that variable to the if-expression result
@@ -542,7 +930,10 @@ class _LowerCtx:
                 self.set_local_alias(then_last.name, if_name)
 
     def _lower_for_statement(self, stmt: ForStmt) -> None:
-        count = _extract_loop_count(stmt)
+        # Resolve the loop's compile-time shape: start value, step direction,
+        # and iteration count. Rúnar requires bounded loops, so all three must
+        # be statically determinable (issue #121).
+        start, step, count = _extract_loop_shape(stmt)
 
         # Lower body into sub-context
         body_ctx = self.sub_context()
@@ -554,6 +945,8 @@ class _LowerCtx:
             count=count,
             body=body_ctx.bindings,
             iter_var=stmt.init.name if stmt.init else "",
+            start=start,
+            step=step,
         ))
 
     # -------------------------------------------------------------------
@@ -577,7 +970,14 @@ class _LowerCtx:
             return self._lower_identifier(expr)
 
         if isinstance(expr, PropertyAccessExpr):
-            # this.txPreimage in StatefulSmartContract -> load_param
+            # Explicit ``this.x``: a real contract property always wins, even
+            # when a method param shares the name (issue #130). Now that
+            # declared params are registered, the is_param branch below must not
+            # shadow a stored property.
+            if self.is_property(expr.property):
+                return self.emit(ANFValue(kind="load_prop", name=expr.property))
+            # this.txPreimage in StatefulSmartContract -> load_param (implicit
+            # injected param, not a stored property).
             if self.is_param(expr.property):
                 return self.emit(ANFValue(kind="load_param", name=expr.property))
             # this.x -> load_prop
@@ -650,6 +1050,14 @@ class _LowerCtx:
         if name == "this":
             return self.emit(_make_load_const_string("@this"))
 
+        # Param alias takes precedence over normal param lookup. Set
+        # when a private method's body is being inlined into this
+        # context — the private's param names map to the caller's arg
+        # refs.
+        alias = self.get_param_alias(name)
+        if alias is not None:
+            return alias
+
         # Check if it's a registered parameter (e.g. txPreimage)
         if self.is_param(name):
             return self.emit(ANFValue(kind="load_param", name=name))
@@ -715,11 +1123,148 @@ class _LowerCtx:
         if isinstance(callee, Identifier) and callee.name == "checkPreimage":
             if len(e.args) >= 1:
                 preimage_ref = self.lower_expr_to_ref(e.args[0])
-                return self.emit(ANFValue(kind="check_preimage", preimage=preimage_ref))
+                cp = ANFValue(kind="check_preimage", preimage=preimage_ref)
+                # Issue #123: honour the method's declared @sighash on manual calls.
+                if self.sighash_flag is not None:
+                    cp.sighash_flag = self.sighash_flag
+                return self.emit(cp)
 
-        # this.addOutput(satoshis, val1, val2, ...) via PropertyAccessExpr
+        # extractPrevOutputScript(inputIndex_literal, expectedScriptHash) -> ByteString.
+        # extractPrevOutputScript(inputIndex_literal, expectedScriptPrefixHash, prefixLen_literal) -> ByteString.
+        #
+        # Witness-bridge sugar (BSVM Phase 13). Auto-injects a hidden method
+        # parameter named `_prevOutScript_<inputIndex>` (one per distinct index
+        # in the method body), emits a hash assertion, and returns the witness
+        # ref for caller substring extraction.
+        #
+        # 2-arg form: hash256(witness) === expectedScriptHash. Pins the full
+        #   prev-output script byte-for-byte. Use when the prev-output is a
+        #   single fixed-shape contract.
+        # 3-arg form: hash256(substr(witness, 0, prefixLen)) ===
+        #   expectedScriptPrefixHash. Pins the policy prefix only, leaving the
+        #   pushdata tail free to vary. Required for the intent-template
+        #   matching use case where each successor intent UTXO has a unique
+        #   tail (BSVM Mode 3 permissionless step-in).
+        if isinstance(callee, Identifier) and callee.name == "extractPrevOutputScript":
+            if len(e.args) != 2 and len(e.args) != 3:
+                return self.emit(_make_load_const_string(""))
+            idx_lit = e.args[0]
+            if not isinstance(idx_lit, BigIntLiteral):
+                return self.emit(_make_load_const_string(""))
+            idx = idx_lit.value
+            param_name = f"_prevOutScript_{idx}"
+            self.method_scope.record_auto_injected_param(param_name, "ByteString")
+            self.add_param(param_name)
+            self.register_param_type(param_name, "ByteString")
+            witness_ref = self.emit(ANFValue(kind="load_param", name=param_name))
+            expected_hash_ref = self.lower_expr_to_ref(e.args[1])
+
+            # Determine which bytes to hash: full witness (2-arg) or
+            # prefix (3-arg). The substr happens at script-execution time;
+            # the literal prefixLen is baked into the emitted Stack-IR.
+            if len(e.args) == 3:
+                prefix_len_lit = e.args[2]
+                if not isinstance(prefix_len_lit, BigIntLiteral):
+                    return self.emit(_make_load_const_string(""))
+                zero_ref = self.emit(_make_load_const_int(0))
+                prefix_len_ref = self.emit(_make_load_const_int(prefix_len_lit.value))
+                bytes_to_hash_ref = self.emit(
+                    _make_call("substr", [witness_ref, zero_ref, prefix_len_ref])
+                )
+            else:
+                bytes_to_hash_ref = witness_ref
+
+            actual_hash_ref = self.emit(_make_call("hash256", [bytes_to_hash_ref]))
+            eq_ref = self.emit(ANFValue(
+                kind="bin_op", op="===",
+                left=actual_hash_ref, right=expected_hash_ref,
+                result_type="bytes",
+            ))
+            self.emit(_make_assert(eq_ref))
+            return witness_ref
+
+        # requireOutputP2PKH(outputIndex_literal, pubkeyHash, amount) -> void.
+        # Asserts that the tx's output at outputIndex is a standard P2PKH
+        # paying `amount` satoshis to `pubkeyHash`. Auto-injects
+        # `_serialisedOutputs` (once per method) and emits
+        # hash256(serialisedOutputs) == extractOutputHash(txPreimage) the
+        # first time the intrinsic is called in a method body. Subsequent
+        # calls in the same method skip the hashOutputs check (already
+        # established) and emit only the per-output substring assertion.
+        #
+        # v1 assumes all outputs in the serialised set are exactly 34 bytes
+        # (8-byte LE amount || 0x19 length || 25-byte P2PKH script). Byte
+        # offset of output i is i*34.
+        if isinstance(callee, Identifier) and callee.name == "requireOutputP2PKH":
+            if len(e.args) != 3:
+                return self.emit(_make_load_const_string(""))
+            idx_lit = e.args[0]
+            if not isinstance(idx_lit, BigIntLiteral):
+                return self.emit(_make_load_const_string(""))
+            idx = idx_lit.value
+
+            self.method_scope.record_auto_injected_param("_serialisedOutputs", "ByteString")
+            self.add_param("_serialisedOutputs")
+            self.register_param_type("_serialisedOutputs", "ByteString")
+
+            # Emit the hashOutputs(preimage) check exactly once per method.
+            if not self.method_scope.did_emit_hash_outputs_check:
+                self.method_scope.did_emit_hash_outputs_check = True
+                serialised_ref = self.emit(ANFValue(kind="load_param", name="_serialisedOutputs"))
+                actual_out_hash_ref = self.emit(_make_call("hash256", [serialised_ref]))
+                preimage_ref = self.emit(ANFValue(kind="load_param", name="txPreimage"))
+                expected_out_hash_ref = self.emit(_make_call("extractOutputHash", [preimage_ref]))
+                hash_eq_ref = self.emit(ANFValue(
+                    kind="bin_op", op="===",
+                    left=actual_out_hash_ref, right=expected_out_hash_ref,
+                    result_type="bytes",
+                ))
+                self.emit(_make_assert(hash_eq_ref))
+
+            # Lower the user-supplied args (pubkeyHash, amount).
+            pubkey_hash_ref = self.lower_expr_to_ref(e.args[1])
+            amount_ref = self.lower_expr_to_ref(e.args[2])
+
+            # Construct expected P2PKH output bytes:
+            #   <amount: 8-byte LE> || 0x19 0x76 0xa9 0x14
+            #     || <pubkeyHash: 20 bytes> || 0x88 0xac
+            eight_ref = self.emit(_make_load_const_int(8))
+            amount_bytes_ref = self.emit(_make_call("num2bin", [amount_ref, eight_ref]))
+            # 0x19 0x76 0xa9 0x14 -- script length byte + OP_DUP OP_HASH160 OP_PUSH20
+            prefix_ref = self.emit(_make_load_const_string("1976a914"))
+            # 0x88 0xac -- OP_EQUALVERIFY OP_CHECKSIG
+            suffix_ref = self.emit(_make_load_const_string("88ac"))
+            cat1_ref = self.emit(_make_call("cat", [amount_bytes_ref, prefix_ref]))
+            cat2_ref = self.emit(_make_call("cat", [cat1_ref, pubkey_hash_ref]))
+            expected_output_ref = self.emit(_make_call("cat", [cat2_ref, suffix_ref]))
+
+            # Substring extract at idx*34 length 34, assert equal.
+            serialised_ref2 = self.emit(ANFValue(kind="load_param", name="_serialisedOutputs"))
+            offset_ref = self.emit(_make_load_const_int(idx * 34))
+            length_ref = self.emit(_make_load_const_int(34))
+            extracted_ref = self.emit(_make_call("substr", [serialised_ref2, offset_ref, length_ref]))
+            out_eq_ref = self.emit(ANFValue(
+                kind="bin_op", op="===",
+                left=extracted_ref, right=expected_output_ref,
+                result_type="bytes",
+            ))
+            return self.emit(_make_assert(out_eq_ref))
+
+        # currentBlockHeight() -> bigint. Pure source-level desugar to
+        # extractLocktime(this.txPreimage). Only valid in StatefulSmartContract
+        # methods (typecheck enforces). No new ANF kind or stack codegen needed.
+        if isinstance(callee, Identifier) and callee.name == "currentBlockHeight":
+            preimage_ref = self.emit(ANFValue(kind="load_param", name="txPreimage"))
+            return self.emit(_make_call("extractLocktime", [preimage_ref]))
+
+        # this.addOutput(satoshis, val1, val2, ...) via PropertyAccessExpr.
+        # Mirrors flattenAddOutputArgs in 04-anf-lower.ts: when addOutput is
+        # called as `this.addOutput(satoshis, .{ v1, v2, ... })` (the surface
+        # form Zig / Move tuple syntax produce), unwrap the trailing array
+        # literal so each element becomes an individual state value.
         if isinstance(callee, PropertyAccessExpr) and callee.property == "addOutput":
-            arg_refs = self._lower_args(e.args)
+            flat_args = _flatten_add_output_args(e.args)
+            arg_refs = self._lower_args(flat_args)
             satoshis = arg_refs[0]
             state_values = arg_refs[1:]
             ref = self.emit(ANFValue(kind="add_output", satoshis=satoshis, state_values=state_values, preimage=""))
@@ -733,6 +1278,17 @@ class _LowerCtx:
             script_bytes_ref = arg_refs[1]
             ref = self.emit(ANFValue(kind="add_raw_output", satoshis=satoshis, script_bytes=script_bytes_ref))
             self.add_output_ref(ref)
+            return ref
+
+        # this.addDataOutput(satoshis, scriptBytes) via PropertyAccessExpr. Like
+        # addRawOutput in wire shape, but included in the continuation hash
+        # AFTER state outputs and BEFORE the change output.
+        if isinstance(callee, PropertyAccessExpr) and callee.property == "addDataOutput":
+            arg_refs = self._lower_args(e.args)
+            satoshis = arg_refs[0]
+            script_bytes_ref = arg_refs[1]
+            ref = self.emit(ANFValue(kind="add_data_output", satoshis=satoshis, script_bytes=script_bytes_ref))
+            self.add_data_output_ref(ref)
             return ref
 
         # this.addOutput(satoshis, val1, val2, ...) via MemberExpr
@@ -763,6 +1319,20 @@ class _LowerCtx:
                 self.add_output_ref(ref)
                 return ref
 
+        # this.addDataOutput(satoshis, scriptBytes) via MemberExpr
+        if isinstance(callee, MemberExpr):
+            if (
+                isinstance(callee.object, Identifier)
+                and callee.object.name == "this"
+                and callee.property == "addDataOutput"
+            ):
+                arg_refs = self._lower_args(e.args)
+                satoshis = arg_refs[0]
+                script_bytes_ref = arg_refs[1]
+                ref = self.emit(ANFValue(kind="add_data_output", satoshis=satoshis, script_bytes=script_bytes_ref))
+                self.add_data_output_ref(ref)
+                return ref
+
         # this.getStateScript() via PropertyAccessExpr
         if isinstance(callee, PropertyAccessExpr) and callee.property == "getStateScript":
             return self.emit(ANFValue(kind="get_state_script"))
@@ -776,9 +1346,13 @@ class _LowerCtx:
             ):
                 return self.emit(ANFValue(kind="get_state_script"))
 
-        # this.method(...) via PropertyAccessExpr
+        # this.method(...) via PropertyAccessExpr (or inlined if the
+        # target is a private method with continuation-relevant side
+        # effects).
         if isinstance(callee, PropertyAccessExpr):
             arg_refs = self._lower_args(e.args)
+            if self.should_inline_private(callee.property):
+                return self._inline_private_method_call(callee.property, arg_refs)
             this_ref = self.emit(_make_load_const_string("@this"))
             return self.emit(ANFValue(
                 kind="method_call", object=this_ref,
@@ -789,15 +1363,54 @@ class _LowerCtx:
         if isinstance(callee, MemberExpr):
             if isinstance(callee.object, Identifier) and callee.object.name == "this":
                 arg_refs = self._lower_args(e.args)
+                if self.should_inline_private(callee.property):
+                    return self._inline_private_method_call(callee.property, arg_refs)
                 this_ref = self.emit(_make_load_const_string("@this"))
                 return self.emit(ANFValue(
                     kind="method_call", object=this_ref,
                     method=callee.property, args=arg_refs,
                 ))
 
+        # asm({...}) compiler intrinsic -- the parser has already normalised
+        # the object-literal argument into three positional args
+        # (body, in_arity, out_arity). Lower it to a single opaque raw_script
+        # ANF binding; the hex body passes through unchanged. Diagnostics for
+        # malformed args were already pushed by the validator -- here we
+        # defensively coerce missing values to safe defaults.
+        if isinstance(callee, Identifier) and callee.name == "asm":
+            bytes_hex = ""
+            in_arity = 0
+            out_arity = 1
+            if len(e.args) >= 1 and isinstance(e.args[0], ByteStringLiteral):
+                bytes_hex = e.args[0].value
+            if len(e.args) >= 2 and isinstance(e.args[1], BigIntLiteral):
+                in_arity = e.args[1].value
+            if len(e.args) >= 3 and isinstance(e.args[2], BigIntLiteral):
+                out_arity = e.args[2].value
+            return self.emit(ANFValue(
+                kind="raw_script",
+                bytes=bytes_hex,
+                in_arity=in_arity,
+                out_arity=out_arity,
+            ))
+
         # Direct function call: sha256(x), checkSig(sig, pk), etc.
         if isinstance(callee, Identifier):
             arg_refs = self._lower_args(e.args)
+            # Bare identifier calls that match a private method on the contract
+            # (e.g. Move's `require_owner(contract, sig)` which the parser
+            # strips to `requireOwner(sig)`) must be routed through the same
+            # inlining path as `this.requireOwner(sig)` so downstream stack
+            # lowering can inline the body. Keeps .runar.move in sync with
+            # .runar.ts across all formats.
+            if self._is_private_method(callee.name):
+                if self.should_inline_private(callee.name):
+                    return self._inline_private_method_call(callee.name, arg_refs)
+                this_ref = self.emit(_make_load_const_string("@this"))
+                return self.emit(ANFValue(
+                    kind="method_call", object=this_ref,
+                    method=callee.name, args=arg_refs,
+                ))
             return self.emit(_make_call(callee.name, arg_refs))
 
         # General call
@@ -810,6 +1423,49 @@ class _LowerCtx:
 
     def _lower_args(self, args: list[Expression]) -> list[str]:
         return [self.lower_expr_to_ref(arg) for arg in args]
+
+    def _inline_private_method_call(self, method_name: str, arg_refs: list[str]) -> str:
+        """Lower a private method's body directly into this context.
+
+        Used when the private has continuation-relevant side effects
+        (state mutation, addOutput, addRawOutput, addDataOutput) so the
+        helper's emitted ANF nodes register output refs on the caller.
+        Arg refs are mapped onto the private's parameter names via
+        push_param_alias. While the private's body lowers, any
+        identifier expression matching one of those param names
+        resolves to the caller's ref. The aliases are popped afterwards
+        so subsequent lowering in the caller's body sees its own scope.
+
+        Recursion across private helpers is forbidden by validation, so
+        this always terminates. Nested inlining (private A calls
+        private B) works naturally.
+        """
+        method = self.get_private_method(method_name)
+        if method is None:
+            # Should not happen — caller checked should_inline_private.
+            this_ref = self.emit(_make_load_const_string("@this"))
+            return self.emit(ANFValue(
+                kind="method_call", object=this_ref,
+                method=method_name, args=arg_refs,
+            ))
+
+        aliased: list[str] = []
+        for i, param in enumerate(method.params):
+            if i >= len(arg_refs):
+                break
+            self.push_param_alias(param.name, arg_refs[i])
+            aliased.append(param.name)
+
+        start_index = len(self.bindings)
+        self.lower_statements(method.body)
+        end_index = len(self.bindings)
+
+        for name in reversed(aliased):
+            self.pop_param_alias(name)
+
+        if end_index > start_index:
+            return self.bindings[end_index - 1].name
+        return self.emit(_make_load_const_string("@void"))
 
     def _lower_ternary_expr(self, e: TernaryExpr) -> str:
         cond_ref = self.lower_expr_to_ref(e.condition)
@@ -865,7 +1521,19 @@ class _LowerCtx:
 # ---------------------------------------------------------------------------
 
 def _make_load_const_int(val: int) -> ANFValue:
-    raw = json.dumps(val)
+    # JSON numbers in JavaScript are IEEE-754 doubles (~53 bits of integer
+    # precision). Cross-tier IR consumers (Go, Rust) round-trip JSON numbers
+    # through encoding/json which silently degrades values above 2^53 into
+    # scientific notation. Emit values that exceed the int64 range as a
+    # quoted decimal string with the canonical JS BigInt `n` suffix so
+    # 256-bit constants (e.g. the secp256k1 group order used in
+    # schnorr-zkp's s-bound assert) survive the JSON round-trip losslessly
+    # AND so consuming IR decoders can distinguish a decimal-encoded big
+    # integer from a hex-encoded ByteString literal.
+    if val.bit_length() > 63 or val < -(1 << 63):
+        raw = json.dumps(f"{val}n")
+    else:
+        raw = json.dumps(val)
     return ANFValue(
         kind="load_const",
         raw_value=raw,
@@ -900,12 +1568,49 @@ def _make_call(func_name: str, args: list[str]) -> ANFValue:
     )
 
 
+def _append_branch_output_concat(branch_ctx: "_LowerCtx") -> str:
+    """Concatenate a branch's output refs (state then data, in
+    declaration order) into a single bytes-ref appended to the
+    branch's bindings. If the branch has no outputs, emits an empty
+    ``load_const`` so the branch still leaves one item on the stack —
+    required to balance the if's branch shapes when the OTHER branch
+    has outputs. 2026-04-30 audit finding F2 fix."""
+    all_refs = list(branch_ctx.get_add_output_refs())
+    all_refs.extend(branch_ctx.get_add_data_output_refs())
+    if not all_refs:
+        return branch_ctx.emit(_make_load_const_string(""))
+    if len(all_refs) == 1:
+        return all_refs[0]
+    accumulated = all_refs[0]
+    for ref in all_refs[1:]:
+        accumulated = branch_ctx.emit(_make_call("cat", [accumulated, ref]))
+    return accumulated
+
+
 def _make_assert(value_ref: str) -> ANFValue:
     raw = json.dumps(value_ref)
     return ANFValue(
         kind="assert",
         raw_value=raw,
         value_ref=value_ref,
+    )
+
+
+def _make_auto_injected_state_check_assert(value_ref: str) -> ANFValue:
+    """Build the auto-injected stateful-continuation hash-equality assert.
+
+    Carries ``is_auto_injected_state_check=True`` so off-chain SDK
+    interpreters can skip the equality check via a direct marker lookup
+    instead of structural / taint heuristics that misfire on developer
+    code with identical IR shape (covenant rules, e.g.
+    ``examples/rust/covenant-vault``).
+    """
+    raw = json.dumps(value_ref)
+    return ANFValue(
+        kind="assert",
+        raw_value=raw,
+        value_ref=value_ref,
+        is_auto_injected_state_check=True,
     )
 
 
@@ -1017,36 +1722,131 @@ def _expr_has_add_output(expr: Expression | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# addDataOutput detection (distinct from state outputs)
+# ---------------------------------------------------------------------------
+
+def _method_has_add_data_output(method) -> bool:
+    """Check if a method body contains any this.addDataOutput() calls."""
+    return _body_has_add_data_output(method.body)
+
+
+def _body_has_add_data_output(stmts: list[Statement]) -> bool:
+    return any(_stmt_has_add_data_output(stmt) for stmt in stmts)
+
+
+def _stmt_has_add_data_output(stmt: Statement) -> bool:
+    if isinstance(stmt, ExpressionStmt):
+        return _expr_has_add_data_output(stmt.expr)
+    if isinstance(stmt, IfStmt):
+        if _body_has_add_data_output(stmt.then):
+            return True
+        if stmt.else_ and _body_has_add_data_output(stmt.else_):
+            return True
+        return False
+    if isinstance(stmt, ForStmt):
+        return _body_has_add_data_output(stmt.body)
+    return False
+
+
+def _expr_has_add_data_output(expr: Expression | None) -> bool:
+    if expr is None:
+        return False
+    if isinstance(expr, CallExpr):
+        callee = expr.callee
+        if isinstance(callee, PropertyAccessExpr) and callee.property == "addDataOutput":
+            return True
+        if isinstance(callee, MemberExpr):
+            if (
+                isinstance(callee.object, Identifier)
+                and callee.object.name == "this"
+                and callee.property == "addDataOutput"
+            ):
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Loop count extraction
 # ---------------------------------------------------------------------------
 
-def _extract_loop_count(stmt: ForStmt) -> int:
-    start_val = _extract_bigint_value(stmt.init.init if stmt.init else None)
+def _extract_loop_shape(stmt: ForStmt) -> tuple[int, int, int]:
+    """Resolve a for-statement's compile-time loop shape (issue #121).
 
+    Supports counting-up and counting-down loops::
+
+        for (let i = 0n; i < 10n; i++)     -> start 0,  step +1, count 10
+        for (let i = 1n; i <= 3n; i++)     -> start 1,  step +1, count 3
+        for (let i = 3n; i > 0n; i--)      -> start 3,  step -1, count 3
+        for (let i = 3n; i >= 1n; i--)     -> start 3,  step -1, count 3
+
+    The loop is unrolled ``count`` times; on iteration ``i`` the iterator holds
+    ``start + i * step``. Start and bound must be compile-time integer literals.
+
+    Returns ``(start, step, count)``.
+    """
+    start = _extract_bigint_value(stmt.init.init if stmt.init else None)
+    if start is None:
+        raise ValueError(
+            "Cannot determine loop start at compile time. For-loop iterators "
+            "must start at an integer literal."
+        )
+
+    if not isinstance(stmt.condition, BinaryExpr):
+        raise ValueError(
+            "Cannot determine loop bound at compile time. For-loop bounds must "
+            "be integer literals."
+        )
+    op = stmt.condition.op
+    bound = _extract_bigint_value(stmt.condition.right)
+    if bound is None:
+        raise ValueError(
+            "Cannot determine loop bound at compile time. For-loop bounds must "
+            "be integer literals."
+        )
+
+    step = _extract_loop_step(stmt)
+
+    # Count = number of iterations before the condition first turns false.
+    if step == 1:
+        if op == "<":
+            count = bound - start
+        elif op == "<=":
+            count = bound - start + 1
+        else:
+            raise ValueError(
+                f"For loop counting up (i++) must use '<' or '<=' (got '{op}')."
+            )
+    else:
+        if op == ">":
+            count = start - bound
+        elif op == ">=":
+            count = start - bound + 1
+        else:
+            raise ValueError(
+                f"For loop counting down (i--) must use '>' or '>=' (got '{op}')."
+            )
+
+    return start, step, max(0, count)
+
+
+def _extract_loop_step(stmt: ForStmt) -> int:
+    """Determine the iterator step direction (+1 / -1) from the for-statement's
+    update clause, falling back to the condition direction. Only unit steps are
+    supported; a non-unit update (e.g. ``i += 2``) is out of the loop model.
+    """
+    update = stmt.update
+    if isinstance(update, ExpressionStmt):
+        e = update.expr
+        if isinstance(e, IncrementExpr):
+            return 1
+        if isinstance(e, DecrementExpr):
+            return -1
+    # Fall back to the comparison direction for other unit-step spellings
+    # (e.g. ``i = i + 1n``): ``<``/``<=`` counts up, ``>``/``>=`` counts down.
     if isinstance(stmt.condition, BinaryExpr):
-        bound_val = _extract_bigint_value(stmt.condition.right)
-
-        if start_val is not None and bound_val is not None:
-            start = start_val
-            bound = bound_val
-            op = stmt.condition.op
-            if op == "<":
-                return max(0, bound - start)
-            if op == "<=":
-                return max(0, bound - start + 1)
-            if op == ">":
-                return max(0, start - bound)
-            if op == ">=":
-                return max(0, start - bound + 1)
-
-        if bound_val is not None:
-            op = stmt.condition.op
-            if op == "<":
-                return bound_val
-            if op == "<=":
-                return bound_val + 1
-
-    return 0
+        if stmt.condition.op in (">", ">="):
+            return -1
+    return 1
 
 
 def _extract_bigint_value(expr: Expression | None) -> int | None:
@@ -1089,3 +1889,414 @@ def _type_node_to_string(node: TypeNode | None) -> str:
     if isinstance(node, CustomType):
         return node.name
     return "<unknown>"
+
+
+# ---------------------------------------------------------------------------
+# Post-ANF pass: lift update_prop from if-else branches
+# ---------------------------------------------------------------------------
+#
+# Mirrors the TypeScript reference compiler's ``liftBranchUpdateProps`` (see
+# packages/runar-compiler/src/passes/04-anf-lower.ts) and the Go port
+# (compilers/go/frontend/anf_lower.go).
+#
+# Transforms if-else chains where each branch ends with ``update_prop`` into
+# flat conditional assignments. This prevents phantom stack entries in stack
+# lowering for patterns like position dispatch where each branch updates a
+# different property.
+#
+# Before:
+#   if (pos === 0) { this.c0 = turn; }
+#   else if (pos === 1) { this.c1 = turn; }
+#   else { this.c4 = turn; }
+#
+# After:
+#   this.c0 = (pos === 0) ? turn : this.c0;
+#   this.c1 = (!cond0 && pos === 1) ? turn : this.c1;
+#   this.c4 = (!cond0 && !cond1) ? turn : this.c4;
+
+
+@dataclass
+class _UpdateBranch:
+    """A single branch of a flattened if-else update-prop chain."""
+
+    cond_setup_bindings: list[ANFBinding]
+    cond_ref: str | None  # None for the final else
+    prop_name: str
+    value_bindings: list[ANFBinding]
+    value_ref: str
+
+
+def _max_temp_index(bindings: list[ANFBinding]) -> int:
+    """Find the maximum temp index (e.g. t47 -> 47) in a binding tree."""
+    max_idx = -1
+    for b in bindings:
+        if b.name.startswith("t") and len(b.name) > 1 and b.name[1:].isdigit():
+            n = int(b.name[1:])
+            if n > max_idx:
+                max_idx = n
+        if b.value.kind == "if":
+            if b.value.then is not None:
+                t = _max_temp_index(b.value.then)
+                if t > max_idx:
+                    max_idx = t
+            if b.value.else_ is not None:
+                e = _max_temp_index(b.value.else_)
+                if e > max_idx:
+                    max_idx = e
+        elif b.value.kind == "loop":
+            if b.value.body is not None:
+                l = _max_temp_index(b.value.body)
+                if l > max_idx:
+                    max_idx = l
+    return max_idx
+
+
+def _is_side_effect_free(v: ANFValue) -> bool:
+    return v.kind in ("load_prop", "load_param", "load_const", "bin_op", "unary_op")
+
+
+def _all_bindings_side_effect_free(bindings: list[ANFBinding]) -> bool:
+    return all(_is_side_effect_free(b.value) for b in bindings)
+
+
+def _extract_branch_update(
+    bindings: list[ANFBinding],
+) -> tuple[str, list[ANFBinding], str] | None:
+    """If *bindings* ends with ``update_prop``, return (prop_name, value_bindings, value_ref)."""
+    if not bindings:
+        return None
+    last = bindings[-1]
+    if last.value.kind != "update_prop":
+        return None
+    value_bindings = bindings[:-1]
+    if not _all_bindings_side_effect_free(value_bindings):
+        return None
+    return last.value.name or "", value_bindings, last.value.value_ref or ""
+
+
+def _is_assert_false_else(bindings: list[ANFBinding]) -> bool:
+    """Check if an else branch is just ``assert(false)`` -- unreachable dead code."""
+    if not bindings:
+        return False
+    last = bindings[-1]
+    if last.value.kind != "assert":
+        return False
+    assert_ref = last.value.value_ref
+    for b in bindings:
+        if (
+            b.name == assert_ref
+            and b.value.kind == "load_const"
+            and b.value.const_bool is False
+        ):
+            return True
+    return False
+
+
+def _collect_update_branches(
+    if_cond: str,
+    then_bindings: list[ANFBinding],
+    else_bindings: list[ANFBinding],
+) -> list[_UpdateBranch] | None:
+    """Recursively collect branches from a nested if-else chain where every
+    branch ends with exactly one ``update_prop``."""
+    then_update = _extract_branch_update(then_bindings)
+    if then_update is None:
+        return None
+    prop_name, val_bindings, val_ref = then_update
+
+    branches: list[_UpdateBranch] = [
+        _UpdateBranch(
+            cond_setup_bindings=[],
+            cond_ref=if_cond,
+            prop_name=prop_name,
+            value_bindings=val_bindings,
+            value_ref=val_ref,
+        )
+    ]
+
+    if not else_bindings:
+        return None
+
+    # Check if else is another if (else-if chain)
+    last_else = else_bindings[-1]
+    if last_else.value.kind == "if":
+        cond_setup = else_bindings[:-1]
+        if not _all_bindings_side_effect_free(cond_setup):
+            return None
+
+        inner_branches = _collect_update_branches(
+            last_else.value.cond or "",
+            last_else.value.then or [],
+            last_else.value.else_ or [],
+        )
+        if inner_branches is None:
+            return None
+
+        # Prepend condition setup to first inner branch
+        inner_branches[0].cond_setup_bindings = (
+            list(cond_setup) + inner_branches[0].cond_setup_bindings
+        )
+        branches.extend(inner_branches)
+        return branches
+
+    # Otherwise, else branch should end with update_prop (final else)
+    else_update = _extract_branch_update(else_bindings)
+    if else_update is not None:
+        e_prop_name, e_val_bindings, e_val_ref = else_update
+        branches.append(
+            _UpdateBranch(
+                cond_setup_bindings=[],
+                cond_ref=None,
+                prop_name=e_prop_name,
+                value_bindings=e_val_bindings,
+                value_ref=e_val_ref,
+            )
+        )
+        return branches
+
+    # Handle unreachable else: assert(false) as the final else is dead code.
+    # Each preceding branch's condition fully guards its update; the else
+    # path never executes.
+    if _is_assert_false_else(else_bindings):
+        return branches
+
+    return None
+
+
+def _remap_value_refs(value: ANFValue, name_map: dict[str, str]) -> ANFValue:
+    """Return a copy of *value* with temp references remapped via *name_map*."""
+    def r(s: str | None) -> str | None:
+        if s is None:
+            return None
+        return name_map.get(s, s)
+
+    new_v = ANFValue(kind=value.kind)
+    new_v.name = value.name
+    new_v.raw_value = value.raw_value
+    new_v.const_string = value.const_string
+    new_v.const_big_int = value.const_big_int
+    new_v.const_bool = value.const_bool
+    new_v.const_int = value.const_int
+    new_v.op = value.op
+    new_v.left = r(value.left)
+    new_v.right = r(value.right)
+    new_v.result_type = value.result_type
+    new_v.operand = r(value.operand)
+    new_v.func = value.func
+    new_v.args = [r(a) or "" for a in value.args] if value.args is not None else None
+    new_v.object = r(value.object)
+    new_v.method = value.method
+    new_v.cond = r(value.cond)
+    new_v.then = value.then
+    new_v.else_ = value.else_
+    new_v.count = value.count
+    new_v.iter_var = value.iter_var
+    new_v.start = value.start
+    new_v.step = value.step
+    new_v.body = value.body
+    new_v.value_ref = r(value.value_ref)
+    new_v.preimage = r(value.preimage)
+    new_v.satoshis = r(value.satoshis)
+    new_v.state_values = (
+        [r(s) or "" for s in value.state_values] if value.state_values is not None else None
+    )
+    new_v.script_bytes = r(value.script_bytes)
+    new_v.elements = (
+        [r(e) or "" for e in value.elements] if value.elements is not None else None
+    )
+
+    # Special-case load_const "@ref:..." strings: also remap and refresh raw_value
+    if value.kind == "load_const" and value.const_string is not None:
+        s = value.const_string
+        if s.startswith("@ref:"):
+            target = s[5:]
+            mapped = name_map.get(target)
+            if mapped is not None:
+                new_ref = "@ref:" + mapped
+                new_v.const_string = new_ref
+                new_v.raw_value = json.dumps(new_ref)
+
+    # Refresh raw_value for kinds that store the value reference there
+    if value.kind in ("assert", "update_prop") and new_v.value_ref is not None:
+        new_v.raw_value = json.dumps(new_v.value_ref)
+
+    return new_v
+
+
+def _lift_branch_update_props(bindings: list[ANFBinding]) -> list[ANFBinding]:
+    """Transform if-bindings whose branches all end with ``update_prop`` into
+    flat conditional assignments."""
+    next_idx = _max_temp_index(bindings) + 1
+
+    def fresh() -> str:
+        nonlocal next_idx
+        name = f"t{next_idx}"
+        next_idx += 1
+        return name
+
+    result: list[ANFBinding] = []
+
+    for binding in bindings:
+        if binding.value.kind != "if":
+            # Recurse into nested if-bindings (loops etc. are not transformed)
+            result.append(binding)
+            continue
+
+        if_val = binding.value
+        branches = _collect_update_branches(
+            if_val.cond or "",
+            if_val.then or [],
+            if_val.else_ or [],
+        )
+
+        if branches is None or len(branches) < 2:
+            result.append(binding)
+            continue
+
+        # --- Transform: flatten into conditional assignments ---
+
+        # 1. Hoist condition setup bindings with fresh names
+        name_map: dict[str, str] = {}
+        cond_refs: list[str | None] = []
+
+        for branch in branches:
+            for csb in branch.cond_setup_bindings:
+                new_name = fresh()
+                name_map[csb.name] = new_name
+                result.append(ANFBinding(
+                    name=new_name,
+                    value=_remap_value_refs(csb.value, name_map),
+                ))
+            if branch.cond_ref is not None:
+                cond_refs.append(name_map.get(branch.cond_ref, branch.cond_ref))
+            else:
+                cond_refs.append(None)
+
+        # 2. Compute effective condition for each branch
+        #    Branch 0: cond0
+        #    Branch k>0: !cond0 && !cond1 && ... && !cond(k-1) && cond_k
+        #    Final else: !cond0 && !cond1 && ... && !cond(N-2)
+        effective_conds: list[str] = []
+        negated_conds: list[str] = []
+
+        for i in range(len(branches)):
+            if i == 0:
+                assert cond_refs[0] is not None
+                effective_conds.append(cond_refs[0])
+                continue
+
+            # Negate any prior conditions not yet negated
+            for j in range(len(negated_conds), i):
+                if cond_refs[j] is None:
+                    continue
+                neg_name = fresh()
+                result.append(ANFBinding(
+                    name=neg_name,
+                    value=ANFValue(
+                        kind="unary_op",
+                        op="!",
+                        operand=cond_refs[j],
+                    ),
+                ))
+                negated_conds.append(neg_name)
+
+            # AND all negated conditions together
+            and_ref = negated_conds[0]
+            limit = min(i, len(negated_conds))
+            for j in range(1, limit):
+                and_name = fresh()
+                result.append(ANFBinding(
+                    name=and_name,
+                    value=ANFValue(
+                        kind="bin_op",
+                        op="&&",
+                        left=and_ref,
+                        right=negated_conds[j],
+                    ),
+                ))
+                and_ref = and_name
+
+            if cond_refs[i] is not None:
+                # Middle branch: AND with own condition
+                final_name = fresh()
+                result.append(ANFBinding(
+                    name=final_name,
+                    value=ANFValue(
+                        kind="bin_op",
+                        op="&&",
+                        left=and_ref,
+                        right=cond_refs[i],
+                    ),
+                ))
+                effective_conds.append(final_name)
+            else:
+                # Final else: just the AND of negations
+                effective_conds.append(and_ref)
+
+        # 3. For each branch, emit: load_old, conditional if-expression, update_prop
+        for i, branch in enumerate(branches):
+            # Load old property value
+            old_prop_ref = fresh()
+            result.append(ANFBinding(
+                name=old_prop_ref,
+                value=ANFValue(kind="load_prop", name=branch.prop_name),
+            ))
+
+            # Remap value bindings for the then-branch
+            branch_map = dict(name_map)
+            then_bindings: list[ANFBinding] = []
+            for vb in branch.value_bindings:
+                new_name = fresh()
+                branch_map[vb.name] = new_name
+                then_bindings.append(ANFBinding(
+                    name=new_name,
+                    value=_remap_value_refs(vb.value, branch_map),
+                ))
+
+            # The branch's value_ref also needs remapping (it points into value_bindings)
+            mapped_value_ref = branch_map.get(branch.value_ref, branch.value_ref)
+
+            # Else branch: keep old property value
+            keep_name = fresh()
+            ref_str = "@ref:" + old_prop_ref
+            else_bindings: list[ANFBinding] = [
+                ANFBinding(
+                    name=keep_name,
+                    value=ANFValue(
+                        kind="load_const",
+                        raw_value=json.dumps(ref_str),
+                        const_string=ref_str,
+                    ),
+                ),
+            ]
+
+            # Emit conditional if-expression
+            # Note: mapped_value_ref is computed above for symmetry with TS/Go,
+            # but the standard ANF invariant is that the last binding in
+            # value_bindings produces the value the original update_prop
+            # referenced, so it is already the last binding in then_bindings.
+            _ = mapped_value_ref  # reserved for invariant checks in tests
+            cond_if_ref = fresh()
+            result.append(ANFBinding(
+                name=cond_if_ref,
+                value=ANFValue(
+                    kind="if",
+                    cond=effective_conds[i],
+                    then=then_bindings,
+                    else_=else_bindings,
+                ),
+            ))
+
+            # Emit update_prop pointing at the if-expression
+            update_name = fresh()
+            result.append(ANFBinding(
+                name=update_name,
+                value=ANFValue(
+                    kind="update_prop",
+                    name=branch.prop_name,
+                    raw_value=json.dumps(cond_if_ref),
+                    value_ref=cond_if_ref,
+                ),
+            ))
+
+    return result

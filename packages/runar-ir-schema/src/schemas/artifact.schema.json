@@ -17,7 +17,7 @@
   "properties": {
     "version": {
       "type": "string",
-      "pattern": "^runar-v\\d+\\.\\d+\\.\\d+$"
+      "pattern": "^runar-v\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?$"
     },
     "compilerVersion": {
       "type": "string",
@@ -26,6 +26,11 @@
     "contractName": {
       "type": "string",
       "minLength": 1
+    },
+    "parentClass": {
+      "type": "string",
+      "enum": ["SmartContract", "StatefulSmartContract", "UnsafeSmartContract"],
+      "description": "Base class the contract extends; authoritative stateful signal for the terminal sighash subscript trim (a StatefulSmartContract with zero mutable fields still needs the trim)."
     },
     "abi": { "$ref": "#/$defs/ABI" },
     "script": {
@@ -52,9 +57,42 @@
         }
       }
     },
+    "anf": {
+      "$ref": "anf-ir.schema.json",
+      "description": "ANF IR for SDK state computation (always included for stateful contracts)"
+    },
     "stateFields": {
       "type": "array",
       "items": { "$ref": "#/$defs/StateField" }
+    },
+    "constructorSlots": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ConstructorSlot" },
+      "description": "Byte offsets of constructor parameter placeholders in the script"
+    },
+    "templateDigest": {
+      "$ref": "#/$defs/TemplateDigest",
+      "description": "Recipe for recomputing the slot-excised template identity hash"
+    },
+    "codeSepIndexSlots": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/CodeSepIndexSlot" },
+      "description": "Byte offsets of codeSepIndex placeholders in the script"
+    },
+    "codeSeparatorIndex": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Byte offset of OP_CODESEPARATOR in the locking script (for BIP-143 sighash)"
+    },
+    "codeSeparatorIndices": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 0 },
+      "description": "Per-method OP_CODESEPARATOR byte offsets (index 0 = first public method, etc.)"
+    },
+    "rawScriptSpans": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/RawScriptSpan" },
+      "description": "Byte ranges produced by raw_script ANF nodes (opaque to the static analyzer)"
     },
     "buildTimestamp": {
       "type": "string",
@@ -96,7 +134,15 @@
           "type": "array",
           "items": { "$ref": "#/$defs/ABIParam" }
         },
-        "isPublic": { "type": "boolean" }
+        "isPublic": { "type": "boolean" },
+        "isTerminal": {
+          "type": "boolean",
+          "description": "True for stateful contract methods that don't mutate state (no continuation output)."
+        },
+        "usesCodePart": {
+          "type": "boolean",
+          "description": "True if the unlocking script is prefixed with _codePart (continuation builders or terminal var-length-state readers — issue #100)."
+        }
       }
     },
     "ABIParam": {
@@ -105,7 +151,21 @@
       "additionalProperties": false,
       "properties": {
         "name": { "type": "string", "minLength": 1 },
-        "type": { "type": "string", "minLength": 1 }
+        "type": { "type": "string", "minLength": 1 },
+        "fixedArray": { "$ref": "#/$defs/FixedArrayInfo" }
+      }
+    },
+    "FixedArrayInfo": {
+      "type": "object",
+      "required": ["elementType", "length", "syntheticNames"],
+      "additionalProperties": false,
+      "properties": {
+        "elementType": { "type": "string", "minLength": 1 },
+        "length": { "type": "integer", "minimum": 1 },
+        "syntheticNames": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
       }
     },
     "SourceMap": {
@@ -130,6 +190,18 @@
         "column": { "type": "integer", "minimum": 0 }
       }
     },
+    "StateFieldInitialValue": {
+      "description": "Compile-time default value. Scalar fields use string|integer|boolean; grouped FixedArray fields use a (possibly nested) array of element values.",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "integer" },
+        { "type": "boolean" },
+        {
+          "type": "array",
+          "items": { "$ref": "#/$defs/StateFieldInitialValue" }
+        }
+      ]
+    },
     "StateField": {
       "type": "object",
       "required": ["name", "type", "index"],
@@ -137,7 +209,138 @@
       "properties": {
         "name": { "type": "string", "minLength": 1 },
         "type": { "type": "string", "minLength": 1 },
-        "index": { "type": "integer", "minimum": 0 }
+        "index": { "type": "integer", "minimum": 0 },
+        "initialValue": { "$ref": "#/$defs/StateFieldInitialValue" },
+        "fixedArray": { "$ref": "#/$defs/FixedArrayInfo" },
+        "encoding": {
+          "type": "string",
+          "enum": ["num2bin-le8", "bool1", "raw", "pushdata"],
+          "description": "Wire encoding of the serialized field in the OP_RETURN state tail"
+        },
+        "byteOffset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset from the byte AFTER the OP_RETURN separator (omitted when a preceding field is variable-length)"
+        },
+        "byteLength": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Serialized length in bytes (omitted for variable-length fields)"
+        },
+        "tailOffset": {
+          "type": "integer",
+          "maximum": -1,
+          "description": "NEGATIVE byte offset from the END of the locking script (omitted when this or any following field is variable-length)"
+        }
+      }
+    },
+    "ConstructorSlot": {
+      "type": "object",
+      "required": ["paramIndex", "byteOffset"],
+      "additionalProperties": false,
+      "properties": {
+        "paramIndex": { "type": "integer", "minimum": 0 },
+        "byteOffset": { "type": "integer", "minimum": 0 },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Constructor parameter name (matches abi.constructor.params[paramIndex].name)"
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "ABI type of the parameter (e.g. PubKey, bigint, ByteString)"
+        },
+        "valueEncoding": {
+          "type": "string",
+          "enum": ["data", "scriptnum", "bool"],
+          "description": "How the deploy-time value is encoded when spliced into the slot"
+        },
+        "fixedValueByteLength": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "For fixed-size data types only: baked value length in bytes (PubKey 33, Sha256 32, Addr/Ripemd160 20, Point 64)"
+        },
+        "fixedPushHeaderBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "For fixed-size data types only: push-header length in bytes preceding the value"
+        }
+      }
+    },
+    "TemplateDigestPiece": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string", "enum": ["code", "slot"] },
+        "slot": {
+          "type": "string",
+          "minLength": 1,
+          "description": "For kind 'slot': the excised slot's constructor param name"
+        },
+        "byteOffset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For kind 'slot': the slot's TEMPLATE byte offset"
+        }
+      }
+    },
+    "TemplateDigest": {
+      "type": "object",
+      "required": ["algorithm", "pieces"],
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": { "type": "string", "enum": ["hash256-excised-slots"] },
+        "pieces": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TemplateDigestPiece" }
+        }
+      },
+      "description": "hash256 over the resolved code part with every constructor slot's VALUE bytes removed (push headers stay in the hashed template)"
+    },
+    "CodeSepIndexSlot": {
+      "type": "object",
+      "required": ["byteOffset", "codeSepIndex"],
+      "additionalProperties": false,
+      "properties": {
+        "byteOffset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset of the OP_0 placeholder in the template script"
+        },
+        "codeSepIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The template-relative codeSeparatorIndex value this placeholder represents"
+        }
+      }
+    },
+    "RawScriptSpan": {
+      "type": "object",
+      "required": ["offset", "length", "inArity", "outArity"],
+      "additionalProperties": false,
+      "properties": {
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset of the span start in the locking script"
+        },
+        "length": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total length of the span in bytes"
+        },
+        "inArity": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of stack values consumed before the span executes"
+        },
+        "outArity": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of stack values left on the stack after the span executes"
+        }
       }
     }
   }

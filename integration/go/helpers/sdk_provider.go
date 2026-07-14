@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	runar "github.com/icellan/runar/packages/runar-go"
@@ -61,6 +62,39 @@ func (p *RPCProvider) Broadcast(tx *transaction.Transaction) (string, error) {
 	return txid, nil
 }
 
+// BatchRPCProvider is like RPCProvider but skips mining after each broadcast.
+// Call MineAll() when ready to confirm all pending transactions at once.
+type BatchRPCProvider struct {
+	RPCProvider
+	pendingCount int
+}
+
+// NewBatchRPCProvider creates a provider that batches broadcasts without mining.
+func NewBatchRPCProvider() *BatchRPCProvider {
+	return &BatchRPCProvider{RPCProvider: RPCProvider{network: "regtest"}}
+}
+
+func (p *BatchRPCProvider) Broadcast(tx *transaction.Transaction) (string, error) {
+	rawTx := tx.Hex()
+	txid, err := SendRawTransaction(rawTx)
+	if err != nil {
+		return "", err
+	}
+	p.pendingCount++
+	return txid, nil
+}
+
+// MineAll mines a single block to confirm all pending transactions.
+func (p *BatchRPCProvider) MineAll() error {
+	if p.pendingCount > 0 {
+		if err := Mine(1); err != nil {
+			return err
+		}
+		p.pendingCount = 0
+	}
+	return nil
+}
+
 func (p *RPCProvider) GetUtxos(address string) ([]runar.UTXO, error) {
 	result, err := RPCCall("listunspent", 0, 9999999, []string{address})
 	if err != nil {
@@ -80,7 +114,7 @@ func (p *RPCProvider) GetUtxos(address string) ([]runar.UTXO, error) {
 		utxos = append(utxos, runar.UTXO{
 			Txid:        txid,
 			OutputIndex: int(vout),
-			Satoshis:    int64(amount * 1e8),
+			Satoshis:    int64(math.Round(amount * 1e8)),
 			Script:      scriptPubKey,
 		})
 	}
@@ -102,6 +136,14 @@ func (p *RPCProvider) GetRawTransaction(txid string) (string, error) {
 	}
 	rawHex, _ := raw["hex"].(string)
 	return rawHex, nil
+}
+
+// GetRawTransactionVerbose returns the verbose getrawtransaction map so
+// covenant.RunarBroadcastClient (via its ConfirmationSource interface)
+// can read confirmation counts without pulling in the helpers package
+// itself. Mirrors pkg/bsvclient.RPCProvider's method of the same name.
+func (p *RPCProvider) GetRawTransactionVerbose(txid string) (map[string]interface{}, error) {
+	return GetRawTransaction(txid)
 }
 
 func (p *RPCProvider) GetFeeRate() (int64, error) {

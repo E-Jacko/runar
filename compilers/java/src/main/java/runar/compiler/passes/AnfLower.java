@@ -1,0 +1,2072 @@
+package runar.compiler.passes;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import runar.compiler.ir.anf.AddDataOutput;
+import runar.compiler.ir.anf.AddOutput;
+import runar.compiler.ir.anf.AddRawOutput;
+import runar.compiler.ir.anf.AnfBinding;
+import runar.compiler.ir.anf.AnfMethod;
+import runar.compiler.ir.anf.AnfParam;
+import runar.compiler.ir.anf.AnfProgram;
+import runar.compiler.ir.anf.AnfProperty;
+import runar.compiler.ir.anf.AnfValue;
+import runar.compiler.ir.anf.ArrayLiteral;
+import runar.compiler.ir.anf.Assert;
+import runar.compiler.ir.anf.BigIntConst;
+import runar.compiler.ir.anf.BinOp;
+import runar.compiler.ir.anf.BoolConst;
+import runar.compiler.ir.anf.BytesConst;
+import runar.compiler.ir.anf.Call;
+import runar.compiler.ir.anf.CheckPreimage;
+import runar.compiler.ir.anf.ConstValue;
+import runar.compiler.ir.anf.DeserializeState;
+import runar.compiler.ir.anf.GetStateScript;
+import runar.compiler.ir.anf.If;
+import runar.compiler.ir.anf.LoadConst;
+import runar.compiler.ir.anf.LoadParam;
+import runar.compiler.ir.anf.LoadProp;
+import runar.compiler.ir.anf.Loop;
+import runar.compiler.ir.anf.MethodCall;
+import runar.compiler.ir.anf.RawScript;
+import runar.compiler.ir.anf.UnaryOp;
+import runar.compiler.ir.anf.UpdateProp;
+import runar.compiler.ir.UnknownAnfKindError;
+import runar.compiler.ir.ast.ArrayLiteralExpr;
+import runar.compiler.ir.ast.AssignmentStatement;
+import runar.compiler.ir.ast.BigIntLiteral;
+import runar.compiler.ir.ast.BinaryExpr;
+import runar.compiler.ir.ast.BoolLiteral;
+import runar.compiler.ir.ast.ByteStringLiteral;
+import runar.compiler.ir.ast.CallExpr;
+import runar.compiler.ir.ast.ContractNode;
+import runar.compiler.ir.ast.CustomType;
+import runar.compiler.ir.ast.DecrementExpr;
+import runar.compiler.ir.ast.Expression;
+import runar.compiler.ir.ast.ExpressionStatement;
+import runar.compiler.ir.ast.FixedArrayType;
+import runar.compiler.ir.ast.ForStatement;
+import runar.compiler.ir.ast.Identifier;
+import runar.compiler.ir.ast.IfStatement;
+import runar.compiler.ir.ast.IncrementExpr;
+import runar.compiler.ir.ast.IndexAccessExpr;
+import runar.compiler.ir.ast.MemberExpr;
+import runar.compiler.ir.ast.MethodNode;
+import runar.compiler.ir.ast.ParamNode;
+import runar.compiler.ir.ast.ParentClass;
+import runar.compiler.ir.ast.PrimitiveType;
+import runar.compiler.ir.ast.PropertyAccessExpr;
+import runar.compiler.ir.ast.PropertyNode;
+import runar.compiler.ir.ast.ReturnStatement;
+import runar.compiler.ir.ast.Statement;
+import runar.compiler.ir.ast.TernaryExpr;
+import runar.compiler.ir.ast.TypeNode;
+import runar.compiler.ir.ast.UnaryExpr;
+import runar.compiler.ir.ast.VariableDeclStatement;
+import runar.compiler.ir.ast.Visibility;
+
+/**
+ * AST &rarr; ANF lowering for the Rúnar Java compiler.
+ *
+ * <p>Direct port of {@code compilers/python/runar_compiler/frontend/anf_lower.py}
+ * and {@code packages/runar-compiler/src/passes/04-anf-lower.ts}. Every
+ * expression is flattened into a sequence of let-bindings with fresh temp
+ * names ({@code t0}, {@code t1}, &hellip;) scoped per method.
+ *
+ * <p>Byte-identical canonical JSON parity with the other compilers is the
+ * conformance boundary for this pass.
+ */
+public final class AnfLower {
+
+    private AnfLower() {}
+
+    // ------------------------------------------------------------------
+    // Byte-typed expression detection (mirrors Python _BYTE_TYPES / TS
+    // BYTE_TYPES). Used to decide whether === / !== / + / &amp; / | / ^
+    // bindings carry the {@code result_type: "bytes"} annotation.
+    // ------------------------------------------------------------------
+
+    private static final Set<String> BYTE_TYPES = Set.of(
+        "ByteString", "PubKey", "Sig", "Sha256", "Ripemd160", "Addr",
+        "SigHashPreimage", "RabinSig", "RabinPubKey",
+        "Point", "P256Point", "P384Point"
+    );
+
+    private static final Set<String> BYTE_RETURNING_FUNCTIONS = Set.of(
+        "sha256", "ripemd160", "hash160", "hash256",
+        "cat", "substr", "num2bin", "reverseBytes", "left", "right",
+        "int2str", "toByteString", "pack",
+        "ecAdd", "ecMul", "ecMulGen", "ecNegate", "ecMakePoint", "ecEncodeCompressed",
+        "blake3Compress", "blake3Hash",
+        "p256Add", "p256Mul", "p256MulGen", "p256Negate", "p256EncodeCompressed",
+        "p384Add", "p384Mul", "p384MulGen", "p384Negate", "p384EncodeCompressed"
+    );
+
+    // ------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------
+
+    /** Lower a (validated, type-checked) contract AST to ANF IR. */
+    public static AnfProgram run(ContractNode contract) {
+        List<AnfProperty> properties = lowerProperties(contract);
+        List<AnfMethod> methods = lowerMethods(contract);
+
+        // Post-pass: lift update_prop from if-else branches into flat
+        // conditional assignments. Mirrors the TS reference compiler's
+        // liftBranchUpdateProps. Prevents phantom stack entries in stack
+        // lowering for position-dispatch patterns.
+        List<AnfMethod> lifted = new ArrayList<>(methods.size());
+        for (AnfMethod m : methods) {
+            List<AnfBinding> newBody = liftBranchUpdateProps(m.body());
+            lifted.add(new AnfMethod(m.name(), m.params(), newBody, m.isPublic()));
+        }
+
+        return new AnfProgram(contract.name(), properties, lifted);
+    }
+
+    // ------------------------------------------------------------------
+    // Properties
+    // ------------------------------------------------------------------
+
+    private static List<AnfProperty> lowerProperties(ContractNode contract) {
+        List<AnfProperty> out = new ArrayList<>(contract.properties().size());
+        for (PropertyNode p : contract.properties()) {
+            ConstValue init = p.initializer() != null ? extractLiteralValue(p.initializer()) : null;
+            out.add(new AnfProperty(p.name(), typeToString(p.type()), p.readonly(), init));
+        }
+        return out;
+    }
+
+    private static ConstValue extractLiteralValue(Expression e) {
+        if (e instanceof BigIntLiteral bi) return new BigIntConst(bi.value());
+        if (e instanceof BoolLiteral b) return new BoolConst(b.value());
+        if (e instanceof ByteStringLiteral bs) return new BytesConst(bs.value());
+        if (e instanceof UnaryExpr u
+            && u.op() == Expression.UnaryOp.NEG
+            && u.operand() instanceof BigIntLiteral bil) {
+            return new BigIntConst(bil.value().negate());
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------------
+    // Methods
+    // ------------------------------------------------------------------
+
+    private static List<AnfMethod> lowerMethods(ContractNode contract) {
+        List<AnfMethod> out = new ArrayList<>();
+
+        // Constructor
+        if (contract.constructor() != null) {
+            LowerCtx ctx = new LowerCtx(contract);
+            for (ParamNode p : contract.constructor().params()) {
+                ctx.registerParamType(p.name(), typeToString(p.type()));
+            }
+            ctx.lowerStatements(contract.constructor().body());
+            out.add(new AnfMethod(
+                "constructor",
+                lowerParams(contract.constructor().params()),
+                ctx.bindings,
+                false
+            ));
+        }
+
+        // Issue #109: readonly fields carrying a `/** @embedAlways */` directive
+        // must survive DCE into the locking script. A readonly field no method
+        // references lowers to no `load_prop`, so no constructor slot is emitted
+        // and the field's deploy-time bytes vanish. We inject a `load_prop` + a
+        // `@ref:` alias (the exact shape `const _bind = this.field;` produces)
+        // into the first public method's body — the alias keeps the `load_prop`
+        // alive through dead-binding DCE, and stack lowering threads the pushed
+        // value through and cleans it up (OP_NIP) at method end.
+        List<PropertyNode> embedFields = new ArrayList<>();
+        for (PropertyNode p : contract.properties()) {
+            if (p.readonly() && p.embedAlways()) {
+                embedFields.add(p);
+            }
+        }
+        boolean embedInjected = false;
+
+        // Methods
+        for (MethodNode method : contract.methods()) {
+            LowerCtx ctx = new LowerCtx(contract);
+            for (ParamNode p : method.params()) {
+                ctx.registerParamType(p.name(), typeToString(p.type()));
+            }
+
+            // Register the declared param NAMES so a bare identifier resolves
+            // to `load_param` before falling through to `load_prop` (issue
+            // #130). Without this, a param whose name collides with a mutable
+            // state property lowered to the stale deserialized property value
+            // instead of the witness param. Explicit `this.x` is unaffected: it
+            // lowers via lowerMemberExpr (always load_prop) and the reordered
+            // property_access branch (isProperty checked before isParam).
+            for (ParamNode p : method.params()) {
+                ctx.addParam(p.name());
+            }
+
+            // Issue #123: a non-default @sighash mode drives the OP_PUSH_TX
+            // binding flag for any checkPreimage (auto-injected below, or a
+            // manual call) in this method.
+            int sighashMode = method.sighashType() != null
+                ? method.sighashType() : SighashDirective.SIGHASH_DEFAULT;
+            boolean isDefaultSighash = sighashMode == SighashDirective.SIGHASH_DEFAULT;
+            if (!isDefaultSighash) {
+                ctx.sighashFlag = sighashMode;
+            }
+
+            boolean isStatefulPublic = contract.parentClass() == ParentClass.STATEFUL_SMART_CONTRACT
+                && method.visibility() == Visibility.PUBLIC;
+
+            if (isStatefulPublic) {
+                boolean hasDataOutput = methodHasAddDataOutput(method, contract);
+                boolean hasAddOutput = methodHasAddOutput(method, contract);
+                boolean mutates = methodMutatesState(method, contract);
+                boolean needsChange = mutates || hasAddOutput || hasDataOutput;
+                boolean needsNewAmount = (mutates || hasDataOutput) && !hasAddOutput;
+
+                if (needsChange) {
+                    ctx.addParam("_changePKH");
+                    ctx.addParam("_changeAmount");
+                    ctx.registerParamType("_changePKH", "Ripemd160");
+                    ctx.registerParamType("_changeAmount", "bigint");
+                }
+                if (needsNewAmount) {
+                    ctx.addParam("_newAmount");
+                    ctx.registerParamType("_newAmount", "bigint");
+                }
+                ctx.addParam("txPreimage");
+                ctx.registerParamType("txPreimage", "SigHashPreimage");
+
+                // checkPreimage(txPreimage) at the start. Issue #123: a
+                // non-default @sighash mode changes only the appended OP_PUSH_TX
+                // binding flag byte (omit for the default so the ANF + pinned
+                // binding blob stay byte-identical for every existing contract).
+                String preimageRef = ctx.emit(new LoadParam("txPreimage"));
+                String checkResult = ctx.emit(
+                    new CheckPreimage(preimageRef, isDefaultSighash ? null : sighashMode));
+                ctx.emit(new Assert(checkResult));
+
+                // GAP-302 / #123: pin the sighash type to the declared mode
+                // (default SIGHASH_ALL|FORKID, 0x41). Without this the spend
+                // could use a DIFFERENT sighash flag than declared that zeroes
+                // out preimage fields the contract (or its continuation) relies
+                // on (hashOutputs / hashPrevouts / hashSequence). The default
+                // 0x41 keeps existing contracts byte-identical.
+                String sigHashPreimageRef = ctx.emit(new LoadParam("txPreimage"));
+                String sigHashTypeRef = ctx.emit(new Call("extractSigHashType", List.of(sigHashPreimageRef)));
+                String expectedSigHashRef = ctx.emit(makeLoadConstInt(BigInteger.valueOf(sighashMode)));
+                String sigHashOkRef = ctx.emit(new BinOp("===", sigHashTypeRef, expectedSigHashRef, null));
+                ctx.emit(new Assert(sigHashOkRef));
+
+                // Deserialize mutable state from the preimage's scriptCode
+                boolean hasStateProp = false;
+                for (PropertyNode p : contract.properties()) {
+                    if (!p.readonly()) { hasStateProp = true; break; }
+                }
+                if (hasStateProp) {
+                    String preimageRef3 = ctx.emit(new LoadParam("txPreimage"));
+                    ctx.emit(new DeserializeState(preimageRef3));
+                }
+
+                // Issue #109: preserve @embedAlways fields at the first
+                // user-statement position (after the checkPreimage/deserialize
+                // preamble), mirroring where a `const _bind = this.field;` would sit.
+                if (!embedInjected && !embedFields.isEmpty()) {
+                    emitEmbedAlwaysPreservation(ctx, embedFields);
+                    embedInjected = true;
+                }
+
+                // Developer's method body
+                ctx.lowerStatements(method.body());
+
+                // Continuation-hash construction
+                List<String> addOutputRefs = ctx.addOutputRefs;
+                List<String> addDataOutputRefs = ctx.addDataOutputRefs;
+                if (!addOutputRefs.isEmpty() || !addDataOutputRefs.isEmpty() || mutates) {
+                    // Build the P2PKH change output for hashOutputs verification.
+                    //
+                    // Issue #116: the SDK's buildCallTransaction OMITS the change
+                    // output when `change <= 0` (an exact-cover call) and passes
+                    // `_changeAmount = 0`. Gate the change segment on
+                    // `_changeAmount != 0` at runtime so the hashed output set
+                    // matches the SDK at the exact-zero boundary — the segment is
+                    // the P2PKH change output when non-zero, and empty bytes (cat
+                    // with empty is a no-op) when zero, reproducing the omission.
+                    // For any change > 0 the hashed bytes are unchanged; only the
+                    // emitted script gains the guard.
+                    String changePkhRef = ctx.emit(new LoadParam("_changePKH"));
+                    String changeAmountRef = ctx.emit(new LoadParam("_changeAmount"));
+                    String zeroRef = ctx.emit(makeLoadConstInt(BigInteger.ZERO));
+                    String changeNonZeroRef = ctx.emit(new BinOp("!==", changeAmountRef, zeroRef, null));
+                    LowerCtx changeThenCtx = ctx.subContext();
+                    changeThenCtx.emit(new Call("buildChangeOutput", List.of(changePkhRef, changeAmountRef)));
+                    ctx.syncCounter(changeThenCtx);
+                    LowerCtx changeElseCtx = ctx.subContext();
+                    changeElseCtx.emit(makeLoadConstString(""));
+                    ctx.syncCounter(changeElseCtx);
+                    String changeOutputRef = ctx.emit(new If(
+                        changeNonZeroRef, changeThenCtx.bindings, changeElseCtx.bindings));
+
+                    if (!addOutputRefs.isEmpty()) {
+                        String accumulated = addOutputRefs.get(0);
+                        for (int i = 1; i < addOutputRefs.size(); i++) {
+                            accumulated = ctx.emit(new Call("cat", List.of(accumulated, addOutputRefs.get(i))));
+                        }
+                        for (String dref : addDataOutputRefs) {
+                            accumulated = ctx.emit(new Call("cat", List.of(accumulated, dref)));
+                        }
+                        accumulated = ctx.emit(new Call("cat", List.of(accumulated, changeOutputRef)));
+                        String hashRef = ctx.emit(new Call("hash256", List.of(accumulated)));
+                        String preimageRef2 = ctx.emit(new LoadParam("txPreimage"));
+                        String outputHashRef = ctx.emit(new Call("extractOutputHash", List.of(preimageRef2)));
+                        String eqRef = ctx.emit(new BinOp("===", hashRef, outputHashRef, "bytes"));
+                        ctx.emit(new Assert(eqRef, true));
+                    } else {
+                        String stateScriptRef = ctx.emit(new GetStateScript());
+                        String preimageRef2 = ctx.emit(new LoadParam("txPreimage"));
+                        String newAmountRef = ctx.emit(new LoadParam("_newAmount"));
+                        String contractOutputRef = ctx.emit(new Call("computeStateOutput", List.of(preimageRef2, stateScriptRef, newAmountRef)));
+                        String accumulated = contractOutputRef;
+                        for (String dref : addDataOutputRefs) {
+                            accumulated = ctx.emit(new Call("cat", List.of(accumulated, dref)));
+                        }
+                        String allOutputs = ctx.emit(new Call("cat", List.of(accumulated, changeOutputRef)));
+                        String hashRef = ctx.emit(new Call("hash256", List.of(allOutputs)));
+                        String preimageRef4 = ctx.emit(new LoadParam("txPreimage"));
+                        String outputHashRef = ctx.emit(new Call("extractOutputHash", List.of(preimageRef4)));
+                        String eqRef = ctx.emit(new BinOp("===", hashRef, outputHashRef, "bytes"));
+                        ctx.emit(new Assert(eqRef, true));
+                    }
+                }
+
+                List<AnfParam> augmented = new ArrayList<>(lowerParams(method.params()));
+                if (needsChange) {
+                    augmented.add(new AnfParam("_changePKH", "Ripemd160"));
+                    augmented.add(new AnfParam("_changeAmount", "bigint"));
+                }
+                if (needsNewAmount) {
+                    augmented.add(new AnfParam("_newAmount", "bigint"));
+                }
+                augmented.add(new AnfParam("txPreimage", "SigHashPreimage"));
+
+                // Intent-covenant intrinsic auto-injected witness params:
+                // extractPrevOutputScript adds `_prevOutScript_<inputIndex>`
+                // (one per distinct literal index referenced in the method);
+                // requireOutputP2PKH adds a single `_serialisedOutputs`.
+                // Appended AFTER txPreimage so unlocking scripts push them
+                // adjacent to the preimage. Mirrors Go reference compiler.
+                augmented.addAll(ctx.methodScope.autoInjectedParams);
+
+                out.add(new AnfMethod(method.name(), augmented, ctx.bindings, true));
+            } else {
+                // Issue #109: stateless public methods (and non-stateful
+                // spending entry points) are lowered here — inject @embedAlways
+                // preservation into the first PUBLIC one before its body.
+                if (!embedInjected && !embedFields.isEmpty()
+                        && method.visibility() == Visibility.PUBLIC) {
+                    emitEmbedAlwaysPreservation(ctx, embedFields);
+                    embedInjected = true;
+                }
+                ctx.lowerStatements(method.body());
+                List<AnfParam> privAugmented = new ArrayList<>(lowerParams(method.params()));
+                // Private methods can also call the intent intrinsics; capture
+                // their auto-injected witness params on the private's own ABI.
+                // (When the private is inlined into a public via
+                // inlinePrivateMethodCall the public reuses the same
+                // methodScope and the auto-injection is also visible there.)
+                privAugmented.addAll(ctx.methodScope.autoInjectedParams);
+                out.add(new AnfMethod(
+                    method.name(),
+                    privAugmented,
+                    ctx.bindings,
+                    method.visibility() == Visibility.PUBLIC
+                ));
+            }
+        }
+
+        return out;
+    }
+
+    private static List<AnfParam> lowerParams(List<ParamNode> params) {
+        List<AnfParam> out = new ArrayList<>(params.size());
+        for (ParamNode p : params) {
+            out.add(new AnfParam(p.name(), typeToString(p.type())));
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // Lowering context
+    // ------------------------------------------------------------------
+
+    /**
+     * Per-method bookkeeping shared by a public method's top-level
+     * lowering context and all of its sub-contexts (if/else branches,
+     * ternaries, inlined privates). Tracks the auto-injected witness
+     * parameters needed by the intent-covenant intrinsics
+     * ({@code extractPrevOutputScript}, {@code requireOutputP2PKH})
+     * regardless of whether the intrinsic appears in the method's
+     * top-level body or in a nested block.
+     *
+     * <p>Mirrors {@code methodScopeT} in
+     * {@code compilers/go/frontend/anf_lower.go}.
+     */
+    private static final class MethodScope {
+        final List<AnfParam> autoInjectedParams = new ArrayList<>();
+        final Set<String> autoInjectedSet = new HashSet<>();
+        boolean didEmitHashOutputsCheck = false;
+
+        void recordAutoInjectedParam(String name, String type) {
+            if (autoInjectedSet.add(name)) {
+                autoInjectedParams.add(new AnfParam(name, type));
+            }
+        }
+    }
+
+    private static final class LowerCtx {
+        final List<AnfBinding> bindings = new ArrayList<>();
+        int counter = 0;
+        final ContractNode contract;
+        final Set<String> localNames = new HashSet<>();
+        final Set<String> paramNames = new HashSet<>();
+        final List<String> addOutputRefs = new ArrayList<>();
+        final List<String> addDataOutputRefs = new ArrayList<>();
+        final Map<String, String> localAliases = new HashMap<>();
+        final Set<String> localByteVars = new HashSet<>();
+        // GAP-002: source location of the AST statement currently being
+        // lowered. Stamped onto every AnfBinding the helpers below emit so
+        // the artifact's sourceMap survives all the way to Emit.
+        runar.compiler.ir.ast.SourceLocation currentSourceLoc = null;
+        // Param substitution stack used when inlining a private method's body
+        // directly into this context. While the inlined body lowers, identifier
+        // references to that param resolve to the caller's arg ref instead of
+        // emitting load_param. Stacked so nested inlines compose correctly.
+        // Mirrors the TS / Go reference compilers' paramAliasStack.
+        final Map<String, List<String>> paramAliasStack = new HashMap<>();
+        // Shared per-method bookkeeping for intent-covenant intrinsics; the
+        // *same* instance is reused by every sub-context so a nested
+        // {@code extractPrevOutputScript} / {@code requireOutputP2PKH} call
+        // registers its auto-injected param on the public method's ABI.
+        MethodScope methodScope = new MethodScope();
+        // Issue #34: param-type lookup must be scoped to the CURRENT method's
+        // parameters only. Searching every method's params makes a local named
+        // `x` in one method falsely match a same-named `x: ByteString` param of
+        // a *different* method, poisoning byte-type analysis (e.g. `1n + x`
+        // wrongly emitted as OP_CAT instead of OP_ADD). This map is populated
+        // once per method/constructor before its body lowers and shared into
+        // every sub-context (if/else branches, ternaries). Mirrors the
+        // method-scoped param-type tracking in the TS reference compiler.
+        Map<String, String> methodParamTypes = new HashMap<>();
+        // Issue #123: the declared non-default @sighash flag for the method
+        // being lowered, so a MANUAL checkPreimage(pre) call binds under the
+        // same mode as the method's declared sighash. null = default ALL|FORKID.
+        Integer sighashFlag = null;
+
+        LowerCtx(ContractNode contract) {
+            this.contract = contract;
+        }
+
+        /** Register a parameter's type in the current method's scope. */
+        void registerParamType(String name, String type) {
+            methodParamTypes.put(name, type);
+        }
+
+        void pushParamAlias(String name, String aliasRef) {
+            paramAliasStack.computeIfAbsent(name, k -> new ArrayList<>()).add(aliasRef);
+        }
+
+        void popParamAlias(String name) {
+            List<String> stack = paramAliasStack.get(name);
+            if (stack == null || stack.isEmpty()) return;
+            stack.remove(stack.size() - 1);
+            if (stack.isEmpty()) paramAliasStack.remove(name);
+        }
+
+        String getParamAlias(String name) {
+            List<String> stack = paramAliasStack.get(name);
+            if (stack == null || stack.isEmpty()) return null;
+            return stack.get(stack.size() - 1);
+        }
+
+        MethodNode getPrivateMethod(String name) {
+            for (MethodNode m : contract.methods()) {
+                if (m.name().equals(name) && !m.name().equals("constructor")
+                    && m.visibility() != Visibility.PUBLIC) {
+                    return m;
+                }
+            }
+            return null;
+        }
+
+        // Return true iff `name` is a private method that (transitively)
+        // emits state outputs (addOutput / addRawOutput) or data outputs
+        // (addDataOutput). Those refs MUST appear in the caller's binding
+        // stream so they participate in the continuation hash; without
+        // ANF-level inlining they would live in a sibling ANF method and
+        // the public method's continuation hash would miss them.
+        //
+        // Mutation-only private helpers (no output intrinsics) are
+        // intentionally NOT inlined — state mutation flows through state
+        // continuity, not through output refs. Mirrors TS/Go/Rust/Python
+        // reference compilers' shouldInlinePrivate.
+        boolean shouldInlinePrivate(String name) {
+            MethodNode m = getPrivateMethod(name);
+            if (m == null) return false;
+            return methodHasAddOutput(m, contract) || methodHasAddDataOutput(m, contract);
+        }
+
+        // Inline a private method's body directly into this context. Used
+        // when the callee has continuation-relevant side effects (addOutput
+        // / addRawOutput / addDataOutput) so that its emitted ANF nodes
+        // register their output refs on the caller's continuation hash.
+        //
+        // The caller's arg refs are mapped onto the private's parameter
+        // names via pushParamAlias. While the body lowers, identifier
+        // references to those param names resolve to the caller's ref via
+        // lowerIdentifier's alias check.
+        //
+        // Recursion across private helpers is forbidden by validation, so
+        // this always terminates. Nested inlining (private A calls private
+        // B with side effects) is handled naturally — the same dispatch
+        // path triggers inlining for B.
+        String inlinePrivateMethodCall(String methodName, List<String> argRefs) {
+            MethodNode method = getPrivateMethod(methodName);
+            if (method == null) {
+                // Defensive: caller already checked shouldInlinePrivate.
+                String thisRef = emit(makeLoadConstString("@this"));
+                return emit(new MethodCall(thisRef, methodName, argRefs));
+            }
+
+            List<String> aliasedParams = new ArrayList<>();
+            int n = Math.min(method.params().size(), argRefs.size());
+            for (int i = 0; i < n; i++) {
+                String paramName = method.params().get(i).name();
+                pushParamAlias(paramName, argRefs.get(i));
+                aliasedParams.add(paramName);
+            }
+
+            int startIndex = bindings.size();
+            lowerStatements(method.body());
+            int endIndex = bindings.size();
+
+            for (int i = aliasedParams.size() - 1; i >= 0; i--) {
+                popParamAlias(aliasedParams.get(i));
+            }
+
+            if (endIndex > startIndex) {
+                return bindings.get(endIndex - 1).name();
+            }
+            // Empty body — emit a placeholder so the caller has a ref.
+            return emit(makeLoadConstString("@void"));
+        }
+
+        String freshTemp() {
+            String name = "t" + counter++;
+            return name;
+        }
+
+        String emit(AnfValue value) {
+            String name = freshTemp();
+            bindings.add(new AnfBinding(name, value, currentSourceLoc));
+            return name;
+        }
+
+        void emitNamed(String name, AnfValue value) {
+            bindings.add(new AnfBinding(name, value, currentSourceLoc));
+        }
+
+        void addLocal(String name) { localNames.add(name); }
+        boolean isLocal(String name) { return localNames.contains(name); }
+        void addParam(String name) { paramNames.add(name); }
+        boolean isParam(String name) { return paramNames.contains(name); }
+
+        void setLocalAlias(String local, String ref) {
+            localAliases.put(local, ref);
+        }
+
+        String getLocalAlias(String local) {
+            return localAliases.get(local);
+        }
+
+        boolean isProperty(String name) {
+            for (PropertyNode p : contract.properties()) {
+                if (p.name().equals(name)) return true;
+            }
+            return false;
+        }
+
+        boolean isPrivateMethod(String name) {
+            for (MethodNode m : contract.methods()) {
+                if (m.name().equals(name) && !m.name().equals("constructor")
+                    && m.visibility() != Visibility.PUBLIC) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        String getParamType(String name) {
+            // Issue #34: scoped to the CURRENT method's params only. See
+            // methodParamTypes field comment.
+            return methodParamTypes.get(name);
+        }
+
+        String getPropertyType(String name) {
+            for (PropertyNode p : contract.properties()) {
+                if (p.name().equals(name)) return typeToString(p.type());
+            }
+            return null;
+        }
+
+        LowerCtx subContext() {
+            LowerCtx sub = new LowerCtx(contract);
+            sub.counter = this.counter;
+            sub.localNames.addAll(this.localNames);
+            sub.paramNames.addAll(this.paramNames);
+            sub.localAliases.putAll(this.localAliases);
+            sub.localByteVars.addAll(this.localByteVars);
+            // Share the methodScope so intent-covenant intrinsics emitted
+            // inside if/else branches or ternaries register their
+            // auto-injected witness params on the parent method's ABI.
+            sub.methodScope = this.methodScope;
+            // Issue #34: share the current method's param-type map so byte-type
+            // analysis inside if/else / ternary sub-contexts resolves params
+            // against THIS method's ABI, not every method's.
+            sub.methodParamTypes = this.methodParamTypes;
+            // Issue #123: propagate the method's declared @sighash flag so a
+            // manual checkPreimage() inside an if/else / ternary / inlined
+            // branch binds under the same mode instead of the default.
+            sub.sighashFlag = this.sighashFlag;
+            // GAP-002: inherit the outer statement's source location so
+            // bindings emitted inside an if/else / loop branch are still
+            // mapped back to the originating AST statement.
+            sub.currentSourceLoc = this.currentSourceLoc;
+            return sub;
+        }
+
+        void syncCounter(LowerCtx sub) {
+            if (sub.counter > this.counter) {
+                this.counter = sub.counter;
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Statement lowering
+        // -----------------------------------------------------------
+
+        void lowerStatements(List<Statement> stmts) {
+            for (int i = 0; i < stmts.size(); i++) {
+                Statement stmt = stmts.get(i);
+                // Early-return nesting: if an if-statement's then-block ends
+                // with return and no else-branch, the remaining statements
+                // logically belong in the else-branch.
+                if (stmt instanceof IfStatement is
+                    && is.elseBody() == null
+                    && i + 1 < stmts.size()
+                    && branchEndsWithReturn(is.thenBody())) {
+                    List<Statement> remaining = stmts.subList(i + 1, stmts.size());
+                    IfStatement modified = new IfStatement(
+                        is.condition(), is.thenBody(), new ArrayList<>(remaining), is.sourceLocation()
+                    );
+                    lowerStatement(modified);
+                    return;
+                }
+                lowerStatement(stmt);
+            }
+        }
+
+        void lowerStatement(Statement stmt) {
+            // GAP-002: pick up the statement's source location so every
+            // AnfBinding emitted during the lowering of this statement
+            // carries it forward.
+            runar.compiler.ir.ast.SourceLocation prevLoc = currentSourceLoc;
+            try {
+                if (stmt.sourceLocation() != null) {
+                    currentSourceLoc = stmt.sourceLocation();
+                }
+                if (stmt instanceof VariableDeclStatement v) {
+                    lowerVariableDecl(v);
+                } else if (stmt instanceof AssignmentStatement a) {
+                    lowerAssignment(a);
+                } else if (stmt instanceof IfStatement i) {
+                    lowerIfStatement(i);
+                } else if (stmt instanceof ForStatement f) {
+                    lowerForStatement(f);
+                } else if (stmt instanceof ExpressionStatement e) {
+                    lowerExprToRef(e.expression());
+                } else if (stmt instanceof ReturnStatement r) {
+                    if (r.value() != null) {
+                        String ref = lowerExprToRef(r.value());
+                        // If the returned ref is not the name of the last emitted
+                        // binding, emit an explicit load so the return value is
+                        // the last (top-of-stack) binding.
+                        if (!bindings.isEmpty() && !bindings.get(bindings.size() - 1).name().equals(ref)) {
+                            emit(makeLoadConstString("@ref:" + ref));
+                        }
+                    }
+                }
+            } finally {
+                currentSourceLoc = prevLoc;
+            }
+        }
+
+        void lowerVariableDecl(VariableDeclStatement stmt) {
+            String valueRef = lowerExprToRef(stmt.init());
+            addLocal(stmt.name());
+            if (isByteTypedExpr(stmt.init())) {
+                localByteVars.add(stmt.name());
+            }
+            emitNamed(stmt.name(), makeLoadConstString("@ref:" + valueRef));
+        }
+
+        void lowerAssignment(AssignmentStatement stmt) {
+            String valueRef = lowerExprToRef(stmt.value());
+            if (stmt.target() instanceof PropertyAccessExpr pa) {
+                emit(new UpdateProp(pa.property(), valueRef));
+                return;
+            }
+            if (stmt.target() instanceof Identifier id) {
+                emitNamed(id.name(), makeLoadConstString("@ref:" + valueRef));
+                return;
+            }
+            // Fallback
+            lowerExprToRef(stmt.target());
+        }
+
+        void lowerIfStatement(IfStatement stmt) {
+            String condRef = lowerExprToRef(stmt.condition());
+
+            LowerCtx thenCtx = subContext();
+            thenCtx.lowerStatements(stmt.thenBody());
+            syncCounter(thenCtx);
+
+            LowerCtx elseCtx = subContext();
+            if (stmt.elseBody() != null) {
+                elseCtx.lowerStatements(stmt.elseBody());
+            }
+            syncCounter(elseCtx);
+
+            // 2026-04-30 audit finding F2: when a branch contains
+            // output intrinsics, append a cat-chain inside each
+            // branch so the branch's terminal value is the concat of
+            // its output bytes (state then data, in declaration
+            // order). Balances runtime stack effects across branches
+            // and lets the parent's continuation hash see one ref
+            // per if representing the chosen branch's full output
+            // set.
+            boolean branchHasStateOutput = !thenCtx.addOutputRefs.isEmpty()
+                || !elseCtx.addOutputRefs.isEmpty();
+            boolean branchHasOutputs = branchHasStateOutput
+                || !thenCtx.addDataOutputRefs.isEmpty()
+                || !elseCtx.addDataOutputRefs.isEmpty();
+
+            if (branchHasOutputs) {
+                appendBranchOutputConcat(thenCtx);
+                appendBranchOutputConcat(elseCtx);
+            }
+
+            String ifName = emit(new If(condRef, thenCtx.bindings, elseCtx.bindings));
+
+            if (branchHasOutputs) {
+                // Register the if's value once with the parent's
+                // continuation tracker. CRITICAL: pick the right
+                // tracker. If either branch produces a STATE output,
+                // the parent must take the multi-output continuation
+                // path, so we register as a state output ref. If
+                // neither branch produces a state output and at least
+                // one branch produces a data output, we register as a
+                // DATA output ref so the parent keeps its
+                // single-output `computeStateOutput` continuation and
+                // the data-output bytes splice in BETWEEN the state
+                // output and the change output. Without this, a
+                // branch with only `addDataOutput` was incorrectly
+                // forced onto the multi-output path, dropping the
+                // canonical state continuation.
+                if (branchHasStateOutput) {
+                    addOutputRefs.add(ifName);
+                } else {
+                    addDataOutputRefs.add(ifName);
+                }
+            }
+
+            // If both branches end by reassigning the same local variable,
+            // alias that variable to the if-expression result
+            if (!thenCtx.bindings.isEmpty() && !elseCtx.bindings.isEmpty()) {
+                AnfBinding thenLast = thenCtx.bindings.get(thenCtx.bindings.size() - 1);
+                AnfBinding elseLast = elseCtx.bindings.get(elseCtx.bindings.size() - 1);
+                if (thenLast.name().equals(elseLast.name()) && isLocal(thenLast.name())) {
+                    setLocalAlias(thenLast.name(), ifName);
+                }
+            }
+        }
+
+        /**
+         * Concatenate a branch's output refs (state then data, in
+         * declaration order) into a single bytes-ref appended to the
+         * branch's bindings. If the branch has no outputs, emits an
+         * empty {@code load_const} so the branch still leaves one
+         * item on the stack — required to balance the if's branch
+         * shapes when the OTHER branch has outputs. 2026-04-30 audit
+         * finding F2 fix.
+         */
+        String appendBranchOutputConcat(LowerCtx branchCtx) {
+            List<String> allRefs = new ArrayList<>(branchCtx.addOutputRefs);
+            allRefs.addAll(branchCtx.addDataOutputRefs);
+            if (allRefs.isEmpty()) {
+                return branchCtx.emit(makeLoadConstString(""));
+            }
+            if (allRefs.size() == 1) return allRefs.get(0);
+            String accumulated = allRefs.get(0);
+            for (int i = 1; i < allRefs.size(); i++) {
+                accumulated = branchCtx.emit(new Call("cat", List.of(accumulated, allRefs.get(i))));
+            }
+            return accumulated;
+        }
+
+        void lowerForStatement(ForStatement stmt) {
+            // Resolve the loop's compile-time shape: start value, step
+            // direction, and iteration count. Rúnar requires bounded loops, so
+            // all three must be statically determinable (issue #121).
+            LoopShape shape = extractLoopShape(stmt);
+
+            LowerCtx bodyCtx = subContext();
+            bodyCtx.lowerStatements(stmt.body());
+            syncCounter(bodyCtx);
+
+            String iterVar = stmt.init() != null ? stmt.init().name() : "";
+            emit(new Loop(shape.count, bodyCtx.bindings, iterVar, shape.start, shape.step));
+        }
+
+        // -----------------------------------------------------------
+        // Expression lowering
+        // -----------------------------------------------------------
+
+        String lowerExprToRef(Expression expr) {
+            if (expr == null) {
+                return emit(makeLoadConstInt(BigInteger.ZERO));
+            }
+            if (expr instanceof BigIntLiteral bi) {
+                return emit(makeLoadConstInt(bi.value()));
+            }
+            if (expr instanceof BoolLiteral b) {
+                return emit(makeLoadConstBool(b.value()));
+            }
+            if (expr instanceof ByteStringLiteral bs) {
+                return emit(makeLoadConstString(bs.value()));
+            }
+            if (expr instanceof Identifier id) {
+                return lowerIdentifier(id);
+            }
+            if (expr instanceof PropertyAccessExpr pa) {
+                // Explicit `this.x`: a real contract property always wins, even
+                // when a method param shares the name (issue #130). Now that
+                // declared params are registered, the isParam branch below must
+                // not shadow a stored property. The isParam branch is only for
+                // the implicit injected `this.txPreimage` member.
+                if (isProperty(pa.property())) {
+                    return emit(new LoadProp(pa.property()));
+                }
+                if (isParam(pa.property())) {
+                    return emit(new LoadParam(pa.property()));
+                }
+                return emit(new LoadProp(pa.property()));
+            }
+            if (expr instanceof MemberExpr me) {
+                return lowerMemberExpr(me);
+            }
+            if (expr instanceof BinaryExpr be) {
+                String leftRef = lowerExprToRef(be.left());
+                String rightRef = lowerExprToRef(be.right());
+                String resultType = null;
+                String opCanonical = be.op().canonical();
+                if ((opCanonical.equals("===") || opCanonical.equals("!=="))
+                    && (isByteTypedExpr(be.left()) || isByteTypedExpr(be.right()))) {
+                    resultType = "bytes";
+                }
+                if (opCanonical.equals("+")
+                    && (isByteTypedExpr(be.left()) || isByteTypedExpr(be.right()))) {
+                    resultType = "bytes";
+                }
+                if ((opCanonical.equals("&") || opCanonical.equals("|") || opCanonical.equals("^"))
+                    && (isByteTypedExpr(be.left()) || isByteTypedExpr(be.right()))) {
+                    resultType = "bytes";
+                }
+                return emit(new BinOp(opCanonical, leftRef, rightRef, resultType));
+            }
+            if (expr instanceof UnaryExpr ue) {
+                String operandRef = lowerExprToRef(ue.operand());
+                String opCanonical = ue.op().canonical();
+                String resultType = null;
+                if (opCanonical.equals("~") && isByteTypedExpr(ue.operand())) {
+                    resultType = "bytes";
+                }
+                return emit(new UnaryOp(opCanonical, operandRef, resultType));
+            }
+            if (expr instanceof CallExpr ce) {
+                return lowerCallExpr(ce);
+            }
+            if (expr instanceof TernaryExpr te) {
+                return lowerTernaryExpr(te);
+            }
+            if (expr instanceof IndexAccessExpr ia) {
+                String objRef = lowerExprToRef(ia.object());
+                String indexRef = lowerExprToRef(ia.index());
+                return emit(new Call("__array_access", List.of(objRef, indexRef)));
+            }
+            if (expr instanceof IncrementExpr ie) {
+                return lowerIncrementExpr(ie);
+            }
+            if (expr instanceof DecrementExpr de) {
+                return lowerDecrementExpr(de);
+            }
+            if (expr instanceof ArrayLiteralExpr al) {
+                List<String> elementRefs = new ArrayList<>(al.elements().size());
+                for (Expression el : al.elements()) {
+                    elementRefs.add(lowerExprToRef(el));
+                }
+                return emit(new ArrayLiteral(elementRefs));
+            }
+            return emit(makeLoadConstInt(BigInteger.ZERO));
+        }
+
+        private String lowerIdentifier(Identifier id) {
+            String name = id.name();
+
+            if ("this".equals(name)) {
+                return emit(makeLoadConstString("@this"));
+            }
+
+            // Param alias takes precedence over normal param lookup. Set when a
+            // private method's body is being inlined into this context — the
+            // private's param names map to the caller's arg refs.
+            String paramAlias = getParamAlias(name);
+            if (paramAlias != null) {
+                return paramAlias;
+            }
+
+            if (isParam(name)) {
+                return emit(new LoadParam(name));
+            }
+
+            if (isLocal(name)) {
+                String alias = getLocalAlias(name);
+                if (alias != null) return alias;
+                return name;
+            }
+
+            if (isProperty(name)) {
+                return emit(new LoadProp(name));
+            }
+
+            return emit(new LoadParam(name));
+        }
+
+        private String lowerMemberExpr(MemberExpr e) {
+            if (e.object() instanceof Identifier id && "this".equals(id.name())) {
+                return emit(new LoadProp(e.property()));
+            }
+            if (e.object() instanceof Identifier id2 && "SigHash".equals(id2.name())) {
+                BigInteger val = switch (e.property()) {
+                    case "ALL" -> BigInteger.valueOf(0x01);
+                    case "NONE" -> BigInteger.valueOf(0x02);
+                    case "SINGLE" -> BigInteger.valueOf(0x03);
+                    case "FORKID" -> BigInteger.valueOf(0x40);
+                    case "ANYONECANPAY" -> BigInteger.valueOf(0x80);
+                    default -> null;
+                };
+                if (val != null) {
+                    return emit(makeLoadConstInt(val));
+                }
+            }
+            String objRef = lowerExprToRef(e.object());
+            return emit(new MethodCall(objRef, e.property(), List.of()));
+        }
+
+        private String lowerCallExpr(CallExpr e) {
+            Expression callee = e.callee();
+
+            // asm({...}) compiler intrinsic — the parser has already
+            // normalised the object-literal argument into three positional
+            // args (body, in_arity, out_arity). Lower to a single opaque
+            // raw_script ANF binding. Diagnostics for malformed args were
+            // already pushed by the validator; we defensively coerce
+            // missing values to safe defaults here.
+            if (callee instanceof Identifier asmId && "asm".equals(asmId.name())) {
+                return lowerAsmCall(e);
+            }
+
+            // super(...) call
+            boolean isSuper = (callee instanceof Identifier sid && "super".equals(sid.name()))
+                || (callee instanceof MemberExpr msm
+                    && msm.object() instanceof Identifier sid2
+                    && "super".equals(sid2.name()));
+            if (isSuper) {
+                List<String> argRefs = lowerArgs(e.args());
+                return emit(new Call("super", argRefs));
+            }
+
+            // assert / assertThat
+            if (callee instanceof Identifier id
+                && ("assert".equals(id.name()) || "assertThat".equals(id.name()))) {
+                if (!e.args().isEmpty()) {
+                    String valueRef = lowerExprToRef(e.args().get(0));
+                    return emit(new Assert(valueRef));
+                }
+                String falseRef = emit(makeLoadConstBool(false));
+                return emit(new Assert(falseRef));
+            }
+
+            // checkPreimage(preimage)
+            if (callee instanceof Identifier id2 && "checkPreimage".equals(id2.name())) {
+                if (!e.args().isEmpty()) {
+                    String preimageRef = lowerExprToRef(e.args().get(0));
+                    // Issue #123: honour the method's declared @sighash on manual calls.
+                    return emit(new CheckPreimage(preimageRef, sighashFlag));
+                }
+            }
+
+            // extractPrevOutputScript(inputIndex_literal, expectedScriptHash)
+            // -> ByteString. Witness-bridge sugar (BSVM Phase 13). Auto-injects
+            // a hidden method parameter `_prevOutScript_<inputIndex>` (one per
+            // distinct index in the method body), emits
+            // hash256(witness) === expectedScriptHash, and returns the witness
+            // ref for caller substring extraction.
+            //
+            // 2-arg form: hash256(witness) === expectedScriptHash. Pins the
+            //   full prev-output script byte-for-byte.
+            // 3-arg form (Crit-2): hash256(substr(witness, 0, prefixLen)) ===
+            //   expectedScriptPrefixHash. Pins the policy prefix only,
+            //   leaving the pushdata tail free to vary. Required for the
+            //   intent-template matching use case where each successor
+            //   intent UTXO has a unique tail (BSVM Mode 3 permissionless
+            //   step-in).
+            if (callee instanceof Identifier epoId
+                && "extractPrevOutputScript".equals(epoId.name())) {
+                if (e.args().size() != 2 && e.args().size() != 3) {
+                    return emit(makeLoadConstString(""));
+                }
+                if (!(e.args().get(0) instanceof BigIntLiteral idxLit)) {
+                    return emit(makeLoadConstString(""));
+                }
+                long idx = idxLit.value().longValueExact();
+                String paramName = "_prevOutScript_" + idx;
+                methodScope.recordAutoInjectedParam(paramName, "ByteString");
+                addParam(paramName);
+                String witnessRef = emit(new LoadParam(paramName));
+                String expectedHashRef = lowerExprToRef(e.args().get(1));
+
+                // Determine which bytes to hash: full witness (2-arg) or
+                // prefix (3-arg). The substr happens at script-execution
+                // time; the literal prefixLen is baked into the emitted
+                // Stack-IR.
+                String bytesToHashRef;
+                if (e.args().size() == 3) {
+                    if (!(e.args().get(2) instanceof BigIntLiteral prefixLenLit)) {
+                        return emit(makeLoadConstString(""));
+                    }
+                    String zeroRef = emit(makeLoadConstInt(BigInteger.ZERO));
+                    String prefixLenRef = emit(makeLoadConstInt(prefixLenLit.value()));
+                    bytesToHashRef = emit(new Call(
+                        "substr", List.of(witnessRef, zeroRef, prefixLenRef)));
+                } else {
+                    bytesToHashRef = witnessRef;
+                }
+
+                String actualHashRef = emit(new Call("hash256", List.of(bytesToHashRef)));
+                String eqRef = emit(new BinOp("===", actualHashRef, expectedHashRef, "bytes"));
+                emit(new Assert(eqRef));
+                return witnessRef;
+            }
+
+            // requireOutputP2PKH(outputIndex_literal, pubkeyHash, amount)
+            // -> void. Asserts that the tx's output at outputIndex is a
+            // standard P2PKH paying `amount` satoshis to `pubkeyHash`.
+            // Auto-injects `_serialisedOutputs` (once per method) and emits
+            // hash256(serialisedOutputs) == extractOutputHash(txPreimage) the
+            // first time the intrinsic is called; subsequent calls in the
+            // same method emit only the per-output substring assertion.
+            //
+            // v1 assumes all outputs in the serialised set are exactly 34
+            // bytes (8-byte LE amount ‖ 0x19 length ‖ 25-byte P2PKH script).
+            if (callee instanceof Identifier ropId
+                && "requireOutputP2PKH".equals(ropId.name())) {
+                if (e.args().size() != 3) {
+                    return emit(makeLoadConstString(""));
+                }
+                if (!(e.args().get(0) instanceof BigIntLiteral idxLit)) {
+                    return emit(makeLoadConstString(""));
+                }
+                long idx = idxLit.value().longValueExact();
+
+                methodScope.recordAutoInjectedParam("_serialisedOutputs", "ByteString");
+                addParam("_serialisedOutputs");
+
+                // Emit the hashOutputs(preimage) check exactly once per method.
+                if (!methodScope.didEmitHashOutputsCheck) {
+                    methodScope.didEmitHashOutputsCheck = true;
+                    String serialisedRef = emit(new LoadParam("_serialisedOutputs"));
+                    String actualOutHashRef = emit(new Call("hash256", List.of(serialisedRef)));
+                    String preimageRef = emit(new LoadParam("txPreimage"));
+                    String expectedOutHashRef = emit(new Call("extractOutputHash", List.of(preimageRef)));
+                    String hashEqRef = emit(new BinOp("===", actualOutHashRef, expectedOutHashRef, "bytes"));
+                    emit(new Assert(hashEqRef));
+                }
+
+                // Lower the user-supplied args (pubkeyHash, amount).
+                String pubkeyHashRef = lowerExprToRef(e.args().get(1));
+                String amountRef = lowerExprToRef(e.args().get(2));
+
+                // Construct expected P2PKH output bytes:
+                //   <amount: 8-byte LE> ‖ 0x19 0x76 0xa9 0x14 ‖
+                //   <pubkeyHash: 20 bytes> ‖ 0x88 0xac
+                String eightRef = emit(makeLoadConstInt(BigInteger.valueOf(8)));
+                String amountBytesRef = emit(new Call("num2bin", List.of(amountRef, eightRef)));
+                // 0x19 0x76 0xa9 0x14 — script length byte + OP_DUP OP_HASH160 OP_PUSH20
+                String prefixRef = emit(makeLoadConstString("1976a914"));
+                // 0x88 0xac — OP_EQUALVERIFY OP_CHECKSIG
+                String suffixRef = emit(makeLoadConstString("88ac"));
+                String cat1Ref = emit(new Call("cat", List.of(amountBytesRef, prefixRef)));
+                String cat2Ref = emit(new Call("cat", List.of(cat1Ref, pubkeyHashRef)));
+                String expectedOutputRef = emit(new Call("cat", List.of(cat2Ref, suffixRef)));
+
+                // Substring extract at idx*34 length 34, assert equal.
+                String serialisedRef2 = emit(new LoadParam("_serialisedOutputs"));
+                String offsetRef = emit(makeLoadConstInt(BigInteger.valueOf(idx * 34L)));
+                String lengthRef = emit(makeLoadConstInt(BigInteger.valueOf(34)));
+                String extractedRef = emit(new Call("substr", List.of(serialisedRef2, offsetRef, lengthRef)));
+                String outEqRef = emit(new BinOp("===", extractedRef, expectedOutputRef, "bytes"));
+                return emit(new Assert(outEqRef));
+            }
+
+            // currentBlockHeight() -> bigint. Pure source-level desugar to
+            // extractLocktime(txPreimage). Only valid in StatefulSmartContract
+            // methods (typecheck enforces). No new ANF kind needed.
+            if (callee instanceof Identifier cbhId
+                && "currentBlockHeight".equals(cbhId.name())) {
+                String preimageRef = emit(new LoadParam("txPreimage"));
+                return emit(new Call("extractLocktime", List.of(preimageRef)));
+            }
+
+            // this.addOutput(satoshis, val1, val2, ...)
+            if (isThisPropCall(callee, "addOutput")) {
+                List<Expression> flatArgs = flattenAddOutputArgs(e.args());
+                List<String> argRefs = lowerArgs(flatArgs);
+                String satoshis = argRefs.get(0);
+                List<String> stateValues = argRefs.subList(1, argRefs.size());
+                String ref = emit(new AddOutput(satoshis, new ArrayList<>(stateValues), ""));
+                addOutputRefs.add(ref);
+                return ref;
+            }
+
+            // this.addRawOutput(satoshis, scriptBytes)
+            if (isThisPropCall(callee, "addRawOutput")) {
+                List<String> argRefs = lowerArgs(e.args());
+                String satoshis = argRefs.get(0);
+                String scriptBytesRef = argRefs.get(1);
+                String ref = emit(new AddRawOutput(satoshis, scriptBytesRef));
+                addOutputRefs.add(ref);
+                return ref;
+            }
+
+            // this.addDataOutput(satoshis, scriptBytes)
+            if (isThisPropCall(callee, "addDataOutput")) {
+                List<String> argRefs = lowerArgs(e.args());
+                String satoshis = argRefs.get(0);
+                String scriptBytesRef = argRefs.get(1);
+                String ref = emit(new AddDataOutput(satoshis, scriptBytesRef));
+                addDataOutputRefs.add(ref);
+                return ref;
+            }
+
+            // this.getStateScript()
+            if (isThisPropCall(callee, "getStateScript")) {
+                return emit(new GetStateScript());
+            }
+
+            // this.method(...) via PropertyAccessExpr
+            if (callee instanceof PropertyAccessExpr pa) {
+                List<String> argRefs = lowerArgs(e.args());
+                if (shouldInlinePrivate(pa.property())) {
+                    return inlinePrivateMethodCall(pa.property(), argRefs);
+                }
+                String thisRef = emit(makeLoadConstString("@this"));
+                return emit(new MethodCall(thisRef, pa.property(), argRefs));
+            }
+
+            // this.method(...) via MemberExpr
+            if (callee instanceof MemberExpr me
+                && me.object() instanceof Identifier oid
+                && "this".equals(oid.name())) {
+                List<String> argRefs = lowerArgs(e.args());
+                if (shouldInlinePrivate(me.property())) {
+                    return inlinePrivateMethodCall(me.property(), argRefs);
+                }
+                String thisRef = emit(makeLoadConstString("@this"));
+                return emit(new MethodCall(thisRef, me.property(), argRefs));
+            }
+
+            // Java-specific: a.equals(b) on a ByteString-subtyped receiver
+            // lowers to the same === bin_op the other compilers' `===`
+            // operator produces. Mirrors the design resolution in
+            // docs/java-tier-plan.md: "the validator coerces a.equals(b)
+            // to the == AST node for ByteString-subtyped values".
+            if (callee instanceof MemberExpr meq
+                && meq.property().equals("equals")
+                && e.args().size() == 1) {
+                Expression receiver = meq.object();
+                Expression other = e.args().get(0);
+                boolean leftBytes = isByteTypedExpr(receiver);
+                boolean rightBytes = isByteTypedExpr(other);
+                if (leftBytes || rightBytes) {
+                    String leftRef = lowerExprToRef(receiver);
+                    String rightRef = lowerExprToRef(other);
+                    return emit(new BinOp("===", leftRef, rightRef, "bytes"));
+                }
+            }
+
+            // Bare identifier calls
+            if (callee instanceof Identifier id3) {
+                List<String> argRefs = lowerArgs(e.args());
+                if (isPrivateMethod(id3.name())) {
+                    if (shouldInlinePrivate(id3.name())) {
+                        return inlinePrivateMethodCall(id3.name(), argRefs);
+                    }
+                    String thisRef = emit(makeLoadConstString("@this"));
+                    return emit(new MethodCall(thisRef, id3.name(), argRefs));
+                }
+                return emit(new Call(id3.name(), argRefs));
+            }
+
+            // General call: foo.bar(args) where foo is not `this`
+            String calleeRef = lowerExprToRef(callee);
+            List<String> argRefs = lowerArgs(e.args());
+            return emit(new MethodCall(calleeRef, "call", argRefs));
+        }
+
+        /**
+         * Lower an asm({...}) call to a single opaque raw_script ANF
+         * binding. The parser has already normalised the object-literal
+         * argument into three positional args
+         * {@code (body, in_arity, out_arity)} where body is a
+         * ByteStringLiteral hex and the arities are BigIntLiterals;
+         * malformed shapes are tolerated here so the validator's
+         * diagnostics are the ones surfaced.
+         */
+        private String lowerAsmCall(CallExpr e) {
+            String bytes = "";
+            int inArity = 0;
+            int outArity = 1;
+            List<Expression> args = e.args();
+            if (args.size() >= 1 && args.get(0) instanceof ByteStringLiteral bs) {
+                bytes = bs.value();
+            }
+            if (args.size() >= 2 && args.get(1) instanceof BigIntLiteral bi) {
+                inArity = bi.value().intValueExact();
+            }
+            if (args.size() >= 3 && args.get(2) instanceof BigIntLiteral bi2) {
+                outArity = bi2.value().intValueExact();
+            }
+            return emit(new RawScript(bytes, inArity, outArity));
+        }
+
+        private static boolean isThisPropCall(Expression callee, String name) {
+            if (callee instanceof PropertyAccessExpr pa && pa.property().equals(name)) {
+                return true;
+            }
+            if (callee instanceof MemberExpr me
+                && me.object() instanceof Identifier id
+                && "this".equals(id.name())
+                && me.property().equals(name)) {
+                return true;
+            }
+            return false;
+        }
+
+        private List<String> lowerArgs(List<Expression> args) {
+            List<String> out = new ArrayList<>(args.size());
+            for (Expression arg : args) {
+                out.add(lowerExprToRef(arg));
+            }
+            return out;
+        }
+
+        private String lowerTernaryExpr(TernaryExpr e) {
+            String condRef = lowerExprToRef(e.condition());
+
+            LowerCtx thenCtx = subContext();
+            thenCtx.lowerExprToRef(e.consequent());
+            syncCounter(thenCtx);
+
+            LowerCtx elseCtx = subContext();
+            elseCtx.lowerExprToRef(e.alternate());
+            syncCounter(elseCtx);
+
+            return emit(new If(condRef, thenCtx.bindings, elseCtx.bindings));
+        }
+
+        private String lowerIncrementExpr(IncrementExpr e) {
+            String operandRef = lowerExprToRef(e.operand());
+            String oneRef = emit(makeLoadConstInt(BigInteger.ONE));
+            String result = emit(new BinOp("+", operandRef, oneRef, null));
+
+            if (e.operand() instanceof Identifier id) {
+                emitNamed(id.name(), makeLoadConstString("@ref:" + result));
+            }
+            if (e.operand() instanceof PropertyAccessExpr pa) {
+                emit(new UpdateProp(pa.property(), result));
+            }
+            return e.prefix() ? result : operandRef;
+        }
+
+        private String lowerDecrementExpr(DecrementExpr e) {
+            String operandRef = lowerExprToRef(e.operand());
+            String oneRef = emit(makeLoadConstInt(BigInteger.ONE));
+            String result = emit(new BinOp("-", operandRef, oneRef, null));
+
+            if (e.operand() instanceof Identifier id) {
+                emitNamed(id.name(), makeLoadConstString("@ref:" + result));
+            }
+            if (e.operand() instanceof PropertyAccessExpr pa) {
+                emit(new UpdateProp(pa.property(), result));
+            }
+            return e.prefix() ? result : operandRef;
+        }
+
+        // -----------------------------------------------------------
+        // Byte-typed expression detection (uses the lower context for
+        // local-variable typing information).
+        // -----------------------------------------------------------
+
+        private boolean isByteTypedExpr(Expression expr) {
+            if (expr == null) return false;
+            if (expr instanceof ByteStringLiteral) return true;
+            if (expr instanceof Identifier id) {
+                String t = getParamType(id.name());
+                if (t != null && BYTE_TYPES.contains(t)) return true;
+                t = getPropertyType(id.name());
+                if (t != null && BYTE_TYPES.contains(t)) return true;
+                if (localByteVars.contains(id.name())) return true;
+                return false;
+            }
+            if (expr instanceof PropertyAccessExpr pa) {
+                String t = getPropertyType(pa.property());
+                return t != null && BYTE_TYPES.contains(t);
+            }
+            if (expr instanceof MemberExpr me
+                && me.object() instanceof Identifier id2
+                && "this".equals(id2.name())) {
+                String t = getPropertyType(me.property());
+                return t != null && BYTE_TYPES.contains(t);
+            }
+            if (expr instanceof CallExpr ce) {
+                if (ce.callee() instanceof Identifier cid) {
+                    // Expression-form asm<ByteString>({...}) yields a byte value.
+                    if ("asm".equals(cid.name())) {
+                        return "ByteString".equals(ce.asmReturnType());
+                    }
+                    if (BYTE_RETURNING_FUNCTIONS.contains(cid.name())) return true;
+                    if (cid.name().length() >= 7
+                        && cid.name().substring(0, 7).equals("extract")) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            return false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // AnfValue constructors
+    // ------------------------------------------------------------------
+
+    private static AnfValue makeLoadConstInt(BigInteger v) {
+        return new LoadConst(new BigIntConst(v));
+    }
+
+    private static AnfValue makeLoadConstBool(boolean v) {
+        return new LoadConst(new BoolConst(v));
+    }
+
+    private static AnfValue makeLoadConstString(String v) {
+        // BytesConst serialises as a bare string via ConstValue.raw(); we
+        // piggy-back on that mechanism for sentinel strings like
+        // "@ref:t5" / "@this".
+        return new LoadConst(new BytesConst(v));
+    }
+
+    /**
+     * Issue #109: emit the DCE-surviving preservation pair for each
+     * {@code @embedAlways} readonly field, into the given (public) method
+     * context. Reproduces exactly what a hand-written {@code const _bind =
+     * this.field;} lowers to: a {@code load_prop} followed by a
+     * {@code load_const("@ref:<t>")} alias. The alias marks the {@code load_prop}
+     * as referenced, so dead-binding DCE keeps it; stack lowering then emits the
+     * field's constructor-slot placeholder and NIPs the unused value off the
+     * stack at method end. The field's bytes therefore remain in the deployed
+     * locking script for downstream recovery.
+     */
+    private static void emitEmbedAlwaysPreservation(LowerCtx ctx, List<PropertyNode> fields) {
+        for (PropertyNode field : fields) {
+            String loadRef = ctx.emit(new LoadProp(field.name()));
+            ctx.emitNamed("__embedAlways_" + field.name(), makeLoadConstString("@ref:" + loadRef));
+        }
+    }
+
+    private static List<Expression> flattenAddOutputArgs(List<Expression> args) {
+        if (args.size() == 2 && args.get(1) instanceof ArrayLiteralExpr al) {
+            List<Expression> out = new ArrayList<>(1 + al.elements().size());
+            out.add(args.get(0));
+            out.addAll(al.elements());
+            return out;
+        }
+        return args;
+    }
+
+    // ------------------------------------------------------------------
+    // State mutation analysis
+    // ------------------------------------------------------------------
+
+    // Walks the private-method call graph so a public method that
+    // delegates state mutation, addOutput / addRawOutput, or
+    // addDataOutput to a private helper is correctly classified.
+    // 2026-04-30 audit fix for findings F1 (Critical) and F3 (High).
+
+    // Package-visible so SighashValidate (issue #123) can reuse the same
+    // transitive continuation-shape predicates the ANF lowering uses.
+    static MethodNode lookupPrivateMethod(ContractNode contract, String name) {
+        if (name == null) return null;
+        for (MethodNode m : contract.methods()) {
+            if (name.equals(m.name()) && m.visibility() != Visibility.PUBLIC) return m;
+        }
+        return null;
+    }
+
+    private static String calleeName(Expression callee) {
+        if (callee instanceof PropertyAccessExpr pa) return pa.property();
+        if (callee instanceof MemberExpr me) return me.property();
+        if (callee instanceof Identifier id) return id.name();
+        return null;
+    }
+
+    static boolean methodMutatesState(MethodNode method, ContractNode contract) {
+        Set<String> mutable = new HashSet<>();
+        for (PropertyNode p : contract.properties()) {
+            if (!p.readonly()) mutable.add(p.name());
+        }
+        if (mutable.isEmpty()) return false;
+        return bodyMutatesState(method.body(), mutable, contract, new HashSet<>());
+    }
+
+    private static boolean bodyMutatesState(
+            List<Statement> stmts, Set<String> mutable, ContractNode contract, Set<String> seen) {
+        for (Statement s : stmts) {
+            if (stmtMutatesState(s, mutable, contract, seen)) return true;
+        }
+        return false;
+    }
+
+    private static boolean stmtMutatesState(
+            Statement stmt, Set<String> mutable, ContractNode contract, Set<String> seen) {
+        if (stmt instanceof AssignmentStatement a) {
+            return a.target() instanceof PropertyAccessExpr pa && mutable.contains(pa.property());
+        }
+        if (stmt instanceof ExpressionStatement es) {
+            return exprMutatesState(es.expression(), mutable, contract, seen);
+        }
+        if (stmt instanceof IfStatement i) {
+            if (bodyMutatesState(i.thenBody(), mutable, contract, seen)) return true;
+            return i.elseBody() != null && bodyMutatesState(i.elseBody(), mutable, contract, seen);
+        }
+        if (stmt instanceof ForStatement f) {
+            if (f.update() != null && stmtMutatesState(f.update(), mutable, contract, seen)) return true;
+            return bodyMutatesState(f.body(), mutable, contract, seen);
+        }
+        // Ruby's RbParser promotes a private method's trailing
+        // ExpressionStatement to a ReturnStatement for implicit-return
+        // semantics. Walk the return value the same way.
+        if (stmt instanceof ReturnStatement r && r.value() != null) {
+            return exprMutatesState(r.value(), mutable, contract, seen);
+        }
+        return false;
+    }
+
+    private static boolean exprMutatesState(
+            Expression expr, Set<String> mutable, ContractNode contract, Set<String> seen) {
+        if (expr == null) return false;
+        if (expr instanceof IncrementExpr ie
+            && ie.operand() instanceof PropertyAccessExpr pa) {
+            return mutable.contains(pa.property());
+        }
+        if (expr instanceof DecrementExpr de
+            && de.operand() instanceof PropertyAccessExpr pa) {
+            return mutable.contains(pa.property());
+        }
+        if (expr instanceof CallExpr c) {
+            String name = calleeName(c.callee());
+            MethodNode target = lookupPrivateMethod(contract, name);
+            if (target != null && !seen.contains(target.name())) {
+                Set<String> nextSeen = new HashSet<>(seen);
+                nextSeen.add(target.name());
+                if (bodyMutatesState(target.body(), mutable, contract, nextSeen)) return true;
+            }
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // addOutput / addDataOutput detection (recursive across private calls)
+    // ------------------------------------------------------------------
+
+    static boolean methodHasAddOutput(MethodNode m, ContractNode contract) {
+        return bodyHasAddOutput(m.body(), contract, new HashSet<>());
+    }
+
+    private static boolean bodyHasAddOutput(List<Statement> stmts, ContractNode contract, Set<String> seen) {
+        for (Statement s : stmts) if (stmtHasAddOutput(s, contract, seen)) return true;
+        return false;
+    }
+
+    private static boolean stmtHasAddOutput(Statement s, ContractNode contract, Set<String> seen) {
+        if (s instanceof ExpressionStatement es) return exprHasAddOutput(es.expression(), contract, seen);
+        if (s instanceof IfStatement i) {
+            if (bodyHasAddOutput(i.thenBody(), contract, seen)) return true;
+            return i.elseBody() != null && bodyHasAddOutput(i.elseBody(), contract, seen);
+        }
+        if (s instanceof ForStatement f) return bodyHasAddOutput(f.body(), contract, seen);
+        // Ruby's RbParser promotes a private method's trailing
+        // ExpressionStatement to a ReturnStatement; walk the return value.
+        if (s instanceof ReturnStatement r && r.value() != null) {
+            return exprHasAddOutput(r.value(), contract, seen);
+        }
+        return false;
+    }
+
+    private static boolean exprHasAddOutput(Expression e, ContractNode contract, Set<String> seen) {
+        if (e == null) return false;
+        if (e instanceof CallExpr c) {
+            if (c.callee() instanceof PropertyAccessExpr pa
+                && (pa.property().equals("addOutput") || pa.property().equals("addRawOutput"))) {
+                return true;
+            }
+            if (c.callee() instanceof MemberExpr me
+                && me.object() instanceof Identifier id
+                && "this".equals(id.name())
+                && (me.property().equals("addOutput") || me.property().equals("addRawOutput"))) {
+                return true;
+            }
+            String name = calleeName(c.callee());
+            MethodNode target = lookupPrivateMethod(contract, name);
+            if (target != null && !seen.contains(target.name())) {
+                Set<String> nextSeen = new HashSet<>(seen);
+                nextSeen.add(target.name());
+                if (bodyHasAddOutput(target.body(), contract, nextSeen)) return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean methodHasAddDataOutput(MethodNode m, ContractNode contract) {
+        return bodyHasAddDataOutput(m.body(), contract, new HashSet<>());
+    }
+
+    private static boolean bodyHasAddDataOutput(List<Statement> stmts, ContractNode contract, Set<String> seen) {
+        for (Statement s : stmts) if (stmtHasAddDataOutput(s, contract, seen)) return true;
+        return false;
+    }
+
+    private static boolean stmtHasAddDataOutput(Statement s, ContractNode contract, Set<String> seen) {
+        if (s instanceof ExpressionStatement es) return exprHasAddDataOutput(es.expression(), contract, seen);
+        if (s instanceof IfStatement i) {
+            if (bodyHasAddDataOutput(i.thenBody(), contract, seen)) return true;
+            return i.elseBody() != null && bodyHasAddDataOutput(i.elseBody(), contract, seen);
+        }
+        if (s instanceof ForStatement f) return bodyHasAddDataOutput(f.body(), contract, seen);
+        if (s instanceof ReturnStatement r && r.value() != null) {
+            return exprHasAddDataOutput(r.value(), contract, seen);
+        }
+        return false;
+    }
+
+    private static boolean exprHasAddDataOutput(Expression e, ContractNode contract, Set<String> seen) {
+        if (e == null) return false;
+        if (e instanceof CallExpr c) {
+            if (c.callee() instanceof PropertyAccessExpr pa
+                && pa.property().equals("addDataOutput")) {
+                return true;
+            }
+            if (c.callee() instanceof MemberExpr me
+                && me.object() instanceof Identifier id
+                && "this".equals(id.name())
+                && me.property().equals("addDataOutput")) {
+                return true;
+            }
+            String name = calleeName(c.callee());
+            MethodNode target = lookupPrivateMethod(contract, name);
+            if (target != null && !seen.contains(target.name())) {
+                Set<String> nextSeen = new HashSet<>(seen);
+                nextSeen.add(target.name());
+                if (bodyHasAddDataOutput(target.body(), contract, nextSeen)) return true;
+            }
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Loop count extraction
+    // ------------------------------------------------------------------
+
+    /** Compile-time loop shape resolved from a for-statement (issue #121). */
+    private record LoopShape(BigInteger start, int step, int count) {}
+
+    /**
+     * Resolve a for-statement's compile-time loop shape (issue #121).
+     *
+     * <p>Supports counting-up and counting-down loops:
+     * <pre>
+     *   for (i = 0; i &lt; 10; i++)   -&gt; start 0, step +1, count 10
+     *   for (i = 1; i &lt;= 3; i++)   -&gt; start 1, step +1, count 3
+     *   for (i = 3; i &gt; 0; i--)    -&gt; start 3, step -1, count 3
+     *   for (i = 3; i &gt;= 1; i--)   -&gt; start 3, step -1, count 3
+     * </pre>
+     *
+     * <p>The loop is unrolled {@code count} times; on iteration {@code i} the
+     * iterator holds {@code start + i * step}. Start and bound must be
+     * compile-time integer literals.
+     */
+    private static LoopShape extractLoopShape(ForStatement stmt) {
+        BigInteger start = stmt.init() != null ? extractBigintValue(stmt.init().init()) : null;
+        if (start == null) {
+            throw new IllegalStateException(
+                "Cannot determine loop start at compile time. For-loop iterators must start at "
+                    + "an integer literal.");
+        }
+
+        if (!(stmt.condition() instanceof BinaryExpr be)) {
+            throw new IllegalStateException(
+                "Cannot determine loop bound at compile time. For-loop bounds must be integer "
+                    + "literals.");
+        }
+        String op = be.op().canonical();
+        BigInteger bound = extractBigintValue(be.right());
+        if (bound == null) {
+            throw new IllegalStateException(
+                "Cannot determine loop bound at compile time. For-loop bounds must be integer "
+                    + "literals.");
+        }
+
+        int step = extractLoopStep(stmt);
+
+        // Count = number of iterations before the condition first turns false.
+        BigInteger count;
+        if (step == 1) {
+            if (op.equals("<")) {
+                count = bound.subtract(start);
+            } else if (op.equals("<=")) {
+                count = bound.subtract(start).add(BigInteger.ONE);
+            } else {
+                throw new IllegalStateException(
+                    "For loop counting up (i++) must use '<' or '<=' (got '" + op + "').");
+            }
+        } else {
+            if (op.equals(">")) {
+                count = start.subtract(bound);
+            } else if (op.equals(">=")) {
+                count = start.subtract(bound).add(BigInteger.ONE);
+            } else {
+                throw new IllegalStateException(
+                    "For loop counting down (i--) must use '>' or '>=' (got '" + op + "').");
+            }
+        }
+
+        int c = count.signum() <= 0 ? 0 : count.intValueExact();
+        return new LoopShape(start, step, c);
+    }
+
+    /**
+     * Determine the iterator step direction (+1 / -1) from the for-statement's
+     * update clause, falling back to the condition direction (issue #121). Only
+     * unit steps are supported; a non-unit update (e.g. {@code i += 2}) is out
+     * of the loop model.
+     */
+    private static int extractLoopStep(ForStatement stmt) {
+        Statement update = stmt.update();
+        if (update instanceof ExpressionStatement es) {
+            Expression e = es.expression();
+            if (e instanceof IncrementExpr) return 1;
+            if (e instanceof DecrementExpr) return -1;
+        }
+        // Fall back to the comparison direction for other unit-step spellings
+        // (e.g. `i = i + 1`): `<`/`<=` counts up, `>`/`>=` counts down.
+        if (stmt.condition() instanceof BinaryExpr be) {
+            String op = be.op().canonical();
+            if (op.equals(">") || op.equals(">=")) return -1;
+        }
+        return 1;
+    }
+
+    private static BigInteger extractBigintValue(Expression expr) {
+        if (expr == null) return null;
+        if (expr instanceof BigIntLiteral bi) return bi.value();
+        if (expr instanceof UnaryExpr u && u.op() == Expression.UnaryOp.NEG) {
+            BigInteger inner = extractBigintValue(u.operand());
+            if (inner != null) return inner.negate();
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    private static boolean branchEndsWithReturn(List<Statement> stmts) {
+        if (stmts.isEmpty()) return false;
+        Statement last = stmts.get(stmts.size() - 1);
+        if (last instanceof ReturnStatement) return true;
+        if (last instanceof IfStatement i && i.elseBody() != null) {
+            return branchEndsWithReturn(i.thenBody()) && branchEndsWithReturn(i.elseBody());
+        }
+        return false;
+    }
+
+    private static String typeToString(TypeNode t) {
+        if (t == null) return "<unknown>";
+        if (t instanceof PrimitiveType p) return p.name().canonical();
+        if (t instanceof FixedArrayType fa) return typeToString(fa.element()) + "[]";
+        if (t instanceof CustomType c) return c.name();
+        return "<unknown>";
+    }
+
+    // ==================================================================
+    // Post-ANF pass: lift update_prop from if-else branches
+    // ==================================================================
+    //
+    // Transforms if-else chains where each branch ends with ``update_prop``
+    // into flat conditional assignments. Mirrors the TS and Python
+    // references.
+    // ==================================================================
+
+    private static final class UpdateBranch {
+        final List<AnfBinding> condSetupBindings;
+        final String condRef; // null for final else
+        final String propName;
+        final List<AnfBinding> valueBindings;
+        final String valueRef;
+
+        UpdateBranch(List<AnfBinding> csb, String cr, String pn, List<AnfBinding> vb, String vr) {
+            this.condSetupBindings = csb;
+            this.condRef = cr;
+            this.propName = pn;
+            this.valueBindings = vb;
+            this.valueRef = vr;
+        }
+    }
+
+    private static int maxTempIndex(List<AnfBinding> bindings) {
+        int max = -1;
+        for (AnfBinding b : bindings) {
+            String n = b.name();
+            if (n.startsWith("t") && n.length() > 1) {
+                try {
+                    int v = Integer.parseInt(n.substring(1));
+                    if (v > max) max = v;
+                } catch (NumberFormatException ignored) {
+                    // not a t<N> temp name
+                }
+            }
+            if (b.value() instanceof If ifv) {
+                int t = maxTempIndex(ifv.thenBranch());
+                if (t > max) max = t;
+                int e = maxTempIndex(ifv.elseBranch());
+                if (e > max) max = e;
+            } else if (b.value() instanceof Loop lp) {
+                int l = maxTempIndex(lp.body());
+                if (l > max) max = l;
+            }
+        }
+        return max;
+    }
+
+    private static boolean isSideEffectFree(AnfValue v) {
+        return v instanceof LoadProp
+            || v instanceof LoadParam
+            || v instanceof LoadConst
+            || v instanceof BinOp
+            || v instanceof UnaryOp;
+    }
+
+    private static boolean allBindingsSideEffectFree(List<AnfBinding> bindings) {
+        for (AnfBinding b : bindings) {
+            if (!isSideEffectFree(b.value())) return false;
+        }
+        return true;
+    }
+
+    private record BranchUpdate(String propName, List<AnfBinding> valueBindings, String valueRef) {}
+
+    private static BranchUpdate extractBranchUpdate(List<AnfBinding> bindings) {
+        if (bindings.isEmpty()) return null;
+        AnfBinding last = bindings.get(bindings.size() - 1);
+        if (!(last.value() instanceof UpdateProp up)) return null;
+        List<AnfBinding> valueBindings = new ArrayList<>(bindings.subList(0, bindings.size() - 1));
+        if (!allBindingsSideEffectFree(valueBindings)) return null;
+        return new BranchUpdate(up.name(), valueBindings, up.value());
+    }
+
+    private static boolean isAssertFalseElse(List<AnfBinding> bindings) {
+        if (bindings.isEmpty()) return false;
+        AnfBinding last = bindings.get(bindings.size() - 1);
+        if (!(last.value() instanceof Assert a)) return false;
+        String assertRef = a.value();
+        for (AnfBinding b : bindings) {
+            if (b.name().equals(assertRef)
+                && b.value() instanceof LoadConst lc
+                && lc.value() instanceof BoolConst bc
+                && !bc.value()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<UpdateBranch> collectUpdateBranches(
+        String ifCond, List<AnfBinding> thenBindings, List<AnfBinding> elseBindings) {
+        BranchUpdate thenUpdate = extractBranchUpdate(thenBindings);
+        if (thenUpdate == null) return null;
+
+        List<UpdateBranch> branches = new ArrayList<>();
+        branches.add(new UpdateBranch(
+            new ArrayList<>(), ifCond, thenUpdate.propName(),
+            thenUpdate.valueBindings(), thenUpdate.valueRef()
+        ));
+
+        if (elseBindings.isEmpty()) return null;
+
+        AnfBinding lastElse = elseBindings.get(elseBindings.size() - 1);
+        if (lastElse.value() instanceof If innerIf) {
+            List<AnfBinding> condSetup = new ArrayList<>(elseBindings.subList(0, elseBindings.size() - 1));
+            if (!allBindingsSideEffectFree(condSetup)) return null;
+
+            List<UpdateBranch> inner = collectUpdateBranches(
+                innerIf.cond(), innerIf.thenBranch(), innerIf.elseBranch()
+            );
+            if (inner == null) return null;
+
+            // Prepend condition setup to first inner branch
+            List<AnfBinding> newSetup = new ArrayList<>(condSetup);
+            newSetup.addAll(inner.get(0).condSetupBindings);
+            UpdateBranch first = inner.get(0);
+            inner.set(0, new UpdateBranch(newSetup, first.condRef, first.propName,
+                first.valueBindings, first.valueRef));
+            branches.addAll(inner);
+            return branches;
+        }
+
+        BranchUpdate elseUpdate = extractBranchUpdate(elseBindings);
+        if (elseUpdate != null) {
+            branches.add(new UpdateBranch(
+                new ArrayList<>(), null, elseUpdate.propName(),
+                elseUpdate.valueBindings(), elseUpdate.valueRef()
+            ));
+            return branches;
+        }
+
+        if (isAssertFalseElse(elseBindings)) {
+            return branches;
+        }
+
+        return null;
+    }
+
+    // Map temp refs inside an AnfValue.
+    // Package-private so the F-003 regression test
+    // (UnknownAnfKindTest) can drive this dispatcher directly.
+    static AnfValue remapValueRefs(AnfValue value, Map<String, String> nameMap) {
+        if (value instanceof LoadProp) return value;
+        if (value instanceof LoadParam) return value;
+        if (value instanceof GetStateScript) return value;
+        if (value instanceof LoadConst lc) {
+            if (lc.value() instanceof BytesConst bc && bc.hex().startsWith("@ref:")) {
+                String target = bc.hex().substring(5);
+                String mapped = nameMap.get(target);
+                if (mapped != null) {
+                    return new LoadConst(new BytesConst("@ref:" + mapped));
+                }
+            }
+            return value;
+        }
+        if (value instanceof BinOp bo) {
+            return new BinOp(bo.op(),
+                mapOr(bo.left(), nameMap), mapOr(bo.right(), nameMap), bo.resultType());
+        }
+        if (value instanceof UnaryOp uo) {
+            return new UnaryOp(uo.op(), mapOr(uo.operand(), nameMap), uo.resultType());
+        }
+        if (value instanceof Call c) {
+            List<String> args = new ArrayList<>(c.args().size());
+            for (String a : c.args()) args.add(mapOr(a, nameMap));
+            return new Call(c.func(), args);
+        }
+        if (value instanceof MethodCall mc) {
+            List<String> args = new ArrayList<>(mc.args().size());
+            for (String a : mc.args()) args.add(mapOr(a, nameMap));
+            return new MethodCall(mapOr(mc.object(), nameMap), mc.method(), args);
+        }
+        if (value instanceof If ifv) {
+            return new If(mapOr(ifv.cond(), nameMap), ifv.thenBranch(), ifv.elseBranch());
+        }
+        if (value instanceof Loop lp) {
+            return new Loop(lp.count(), lp.body(), lp.iterVar(), lp.start(), lp.step());
+        }
+        if (value instanceof Assert asv) {
+            return new Assert(mapOr(asv.value(), nameMap));
+        }
+        if (value instanceof UpdateProp up) {
+            return new UpdateProp(up.name(), mapOr(up.value(), nameMap));
+        }
+        if (value instanceof CheckPreimage cp) {
+            return new CheckPreimage(mapOr(cp.preimage(), nameMap), cp.sighashFlag());
+        }
+        if (value instanceof DeserializeState ds) {
+            return new DeserializeState(mapOr(ds.preimage(), nameMap));
+        }
+        if (value instanceof AddOutput ao) {
+            List<String> sv = new ArrayList<>(ao.stateValues().size());
+            for (String s : ao.stateValues()) sv.add(mapOr(s, nameMap));
+            return new AddOutput(mapOr(ao.satoshis(), nameMap), sv, mapOr(ao.preimage(), nameMap));
+        }
+        if (value instanceof AddRawOutput ar) {
+            return new AddRawOutput(mapOr(ar.satoshis(), nameMap), mapOr(ar.scriptBytes(), nameMap));
+        }
+        if (value instanceof AddDataOutput ad) {
+            return new AddDataOutput(mapOr(ad.satoshis(), nameMap), mapOr(ad.scriptBytes(), nameMap));
+        }
+        if (value instanceof ArrayLiteral al) {
+            List<String> els = new ArrayList<>(al.elements().size());
+            for (String e : al.elements()) els.add(mapOr(e, nameMap));
+            return new ArrayLiteral(els);
+        }
+        if (value instanceof RawScript) {
+            // Opaque byte span — no SSA operand refs to remap.
+            return value;
+        }
+        // Exhaustiveness guard. If a new ANFValue variant is added without
+        // wiring it through this dispatch, fail loudly so the regression is
+        // caught at the first call site instead of corrupting downstream IR.
+        throw new UnknownAnfKindError(value.kind(), "anf-lower.remapValueRefs");
+    }
+
+    private static String mapOr(String s, Map<String, String> nameMap) {
+        if (s == null) return null;
+        return nameMap.getOrDefault(s, s);
+    }
+
+    static List<AnfBinding> liftBranchUpdateProps(List<AnfBinding> bindings) {
+        final int[] nextIdx = { maxTempIndex(bindings) + 1 };
+        List<AnfBinding> result = new ArrayList<>();
+
+        for (AnfBinding binding : bindings) {
+            if (!(binding.value() instanceof If ifv)) {
+                result.add(binding);
+                continue;
+            }
+
+            List<UpdateBranch> branches = collectUpdateBranches(
+                ifv.cond(), ifv.thenBranch(), ifv.elseBranch()
+            );
+
+            if (branches == null || branches.size() < 2) {
+                result.add(binding);
+                continue;
+            }
+
+            // Transform: flatten into conditional assignments.
+            Map<String, String> nameMap = new LinkedHashMap<>();
+            List<String> condRefs = new ArrayList<>();
+
+            for (UpdateBranch branch : branches) {
+                for (AnfBinding csb : branch.condSetupBindings) {
+                    String newName = "t" + (nextIdx[0]++);
+                    nameMap.put(csb.name(), newName);
+                    result.add(new AnfBinding(newName, remapValueRefs(csb.value(), nameMap), null));
+                }
+                if (branch.condRef != null) {
+                    condRefs.add(nameMap.getOrDefault(branch.condRef, branch.condRef));
+                } else {
+                    condRefs.add(null);
+                }
+            }
+
+            // Compute effective condition for each branch.
+            List<String> effectiveConds = new ArrayList<>();
+            List<String> negatedConds = new ArrayList<>();
+            for (int i = 0; i < branches.size(); i++) {
+                if (i == 0) {
+                    effectiveConds.add(condRefs.get(0));
+                    continue;
+                }
+                for (int j = negatedConds.size(); j < i; j++) {
+                    if (condRefs.get(j) == null) continue;
+                    String negName = "t" + (nextIdx[0]++);
+                    result.add(new AnfBinding(negName,
+                        new UnaryOp("!", condRefs.get(j), null), null));
+                    negatedConds.add(negName);
+                }
+                String andRef = negatedConds.get(0);
+                int limit = Math.min(i, negatedConds.size());
+                for (int j = 1; j < limit; j++) {
+                    String andName = "t" + (nextIdx[0]++);
+                    result.add(new AnfBinding(andName,
+                        new BinOp("&&", andRef, negatedConds.get(j), null), null));
+                    andRef = andName;
+                }
+                if (condRefs.get(i) != null) {
+                    String finalName = "t" + (nextIdx[0]++);
+                    result.add(new AnfBinding(finalName,
+                        new BinOp("&&", andRef, condRefs.get(i), null), null));
+                    effectiveConds.add(finalName);
+                } else {
+                    effectiveConds.add(andRef);
+                }
+            }
+
+            // Emit load_old, conditional if-expression, update_prop per branch.
+            for (int i = 0; i < branches.size(); i++) {
+                UpdateBranch branch = branches.get(i);
+
+                String oldPropRef = "t" + (nextIdx[0]++);
+                result.add(new AnfBinding(oldPropRef, new LoadProp(branch.propName), null));
+
+                Map<String, String> branchMap = new LinkedHashMap<>(nameMap);
+                List<AnfBinding> thenBindings = new ArrayList<>();
+                for (AnfBinding vb : branch.valueBindings) {
+                    String newName = "t" + (nextIdx[0]++);
+                    branchMap.put(vb.name(), newName);
+                    thenBindings.add(new AnfBinding(newName, remapValueRefs(vb.value(), branchMap), null));
+                }
+
+                String keepName = "t" + (nextIdx[0]++);
+                List<AnfBinding> elseBindings = new ArrayList<>();
+                elseBindings.add(new AnfBinding(keepName,
+                    new LoadConst(new BytesConst("@ref:" + oldPropRef)), null));
+
+                String condIfRef = "t" + (nextIdx[0]++);
+                result.add(new AnfBinding(condIfRef,
+                    new If(effectiveConds.get(i), thenBindings, elseBindings), null));
+
+                String updateName = "t" + (nextIdx[0]++);
+                result.add(new AnfBinding(updateName,
+                    new UpdateProp(branch.propName, condIfRef), null));
+            }
+        }
+
+        return result;
+    }
+}

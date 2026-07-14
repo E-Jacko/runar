@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sync/atomic"
@@ -14,8 +15,11 @@ import (
 var rpcID uint64
 
 // rpcClient uses a longer timeout than http.DefaultClient to handle
-// slow operations like mining 10001 blocks for Genesis activation.
-var rpcClient = &http.Client{Timeout: 10 * time.Minute}
+// slow operations like mining 10001 blocks for Genesis activation and
+// broadcasting multi-hundred-KB Groth16 WA transactions (the Script
+// verifier on regtest can spend 10+ minutes on a single ~900 KB tx
+// when the CI runner is under memory pressure).
+var rpcClient = &http.Client{Timeout: 30 * time.Minute}
 
 // NodeType returns the node type from the NODE_TYPE env var ("svnode" or "teranode").
 func NodeType() string {
@@ -156,6 +160,7 @@ func SendToAddress(addr string, btcAmount float64) (string, error) {
 
 // SendRawTransaction broadcasts a raw transaction hex.
 func SendRawTransaction(txHex string) (string, error) {
+	fmt.Fprintf(os.Stderr, "[runar-integration] tx broadcast: %d bytes\n", len(txHex)/2)
 	result, err := RPCCall("sendrawtransaction", txHex)
 	if err != nil {
 		return "", err
@@ -175,6 +180,46 @@ func GetRawTransaction(txid string) (map[string]interface{}, error) {
 	var tx map[string]interface{}
 	json.Unmarshal(result, &tx)
 	return tx, nil
+}
+
+// GetTxOut returns UTXO info for a given (txid, vout) via the node's UTXO
+// set, or nil if the output is spent (or its transaction was never mined).
+// Unlike GetRawTransaction, this only reflects confirmed chain state, so it's
+// the right check for "did this spend ever actually get mined" — SV Node
+// accepts non-final transactions (future nLockTime + non-final nSequence)
+// into the mempool for relay but excludes them from block templates, so
+// sendrawtransaction succeeding is NOT evidence a spend is consensus-final.
+func GetTxOut(txid string, vout int) (map[string]interface{}, error) {
+	result, err := RPCCall("gettxout", txid, vout)
+	if err != nil {
+		return nil, err
+	}
+	if string(result) == "null" {
+		return nil, nil
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(result, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// EnsureRegtest verifies that the connected Bitcoin node is running on regtest.
+// Calls log.Fatalf if the node is unreachable or reports a different network,
+// preventing accidental transactions on mainnet or testnet.
+func EnsureRegtest() {
+	result, err := RPCCall("getblockchaininfo")
+	if err != nil {
+		log.Fatalf("SAFETY: cannot reach Bitcoin node: %v", err)
+	}
+	var info map[string]interface{}
+	if err := json.Unmarshal(result, &info); err != nil {
+		log.Fatalf("SAFETY: cannot parse getblockchaininfo: %v", err)
+	}
+	chain, _ := info["chain"].(string)
+	if chain != "regtest" {
+		log.Fatalf("SAFETY: Connected to %q network, not regtest! Refusing to run integration tests.", chain)
+	}
 }
 
 // IsNodeAvailable checks if the regtest node is reachable.

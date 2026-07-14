@@ -1,0 +1,184 @@
+{
+  "_doc": "Fixtures still routed OUT of the in-process differential oracle because their spend needs a cryptographic witness that the plain oracle cannot synthesise from bare args. Post-mortem remediation #1 gave the oracle REAL secp256k1: every stateless/stateful ECDSA-checkSig / checkMultiSig fixture that could be given a real signature was MOVED to conformance/witnesses/real-crypto/ (executed for real on @bsv/sdk Spend) and removed from this list. What REMAINS here is genuinely out of reach for the current TS real-crypto harness. The free-text `reason` is for humans; the machine-checked truth of each entry's claim lives in its `coveredBy` field (see coverage-claims.test.ts) — membership in this list is NOT itself treated as coverage. See conformance/witnesses/README.md.",
+  "exempt": [
+    {
+      "fixture": "all-readonly-cleanstack",
+      "reason": "zero-mutable-field StatefulSmartContract (issue #44): RunarContract.prepareCall derives isStateful from stateFields.length>0, which is false here, so it exposes the auto-injected SigHashPreimage as a REQUIRED user arg and the standard call([null]) continuation path does not apply — the tx-context preimage cannot be supplied via the SDK call() harness. FOLLOW-UP: drive it via a hand-built preimage in the TS harness.",
+      "coveredBy": {
+        "kind": "integration",
+        "path": "integration/rust/tests/all_readonly_cleanstack.rs",
+        "note": "real deploy + terminal claim() spend on a live regtest node (accept-only; gated behind `cargo test --features regtest`); proves the parentClass sighash-trim fix, not a full accept/reject differential."
+      }
+    },
+    {
+      "fixture": "blake3",
+      "reason": "BLAKE3 hash-preimage (blake3Compress/blake3Hash) — not a secp256k1 signature",
+      "coveredBy": {
+        "kind": "go-family-exec",
+        "family": "blake3",
+        "marker": "TestBlake3Compress_",
+        "note": "script_execution_test.go also has func TestBlake3Hash_* real-execution tests; both run inline blake3Compress/blake3Hash contracts through the real Go BSV SDK Spend, not the literal 'blake3' fixture file."
+      }
+    },
+    {
+      "fixture": "convergence-proof",
+      "reason": "secp256k1 EC ops (ecAdd/ecMulGen/ecNegate) — EC point witness, not a checkSig",
+      "coveredBy": { "kind": "codegen-golden", "family": "ec" }
+    },
+    {
+      "fixture": "covenant-vault",
+      "reason": "stateless SmartContract mixing checkSig + checkPreimage + extractOutputHash — needs a hand-built SigHashPreimage arg bound to a specific expected output; the stateless single-input signed harness cannot synthesise it. FOLLOW-UP candidate for the TS real-crypto harness.",
+      "coveredBy": {
+        "kind": "integration",
+        "path": "integration/go/covenant_vault_test.go",
+        "note": "real deploy + spend on a live regtest node: TestCovenantVault_ValidSpend (accept) and TestCovenantVault_WrongOutput_Rejected (reject) — both against examples/ts/covenant-vault/CovenantVault.runar.ts, the exact .runar.ts source this fixture resolves to."
+      }
+    },
+    {
+      "fixture": "cross-covenant",
+      "reason": "hash256 preimage verification — hash-preimage witness, not a checkSig. NOTE: hash256 is a base builtin (no dedicated codegen module; see packages/runar-compiler/src/passes/04-anf-lower.ts), unlike the special-cased sha256Compress/sha256Finalize family, so this exemption's justification is weaker than the others in this file — it likely COULD be witnessed by the plain oracle (pick any bytes, compute hash256 locally, no real signature needed) but nobody has written that spec yet.",
+      "coveredBy": {
+        "kind": "codegen-golden",
+        "family": "hash256",
+        "note": "byte-golden only (expected-script.hex); no dedicated per-family codegen module exists for hash256 since it is a base builtin, not a special-cased primitive like sha256Compress/Finalize."
+      }
+    },
+    {
+      "fixture": "ec-demo",
+      "reason": "secp256k1 EC primitives — EC point witness",
+      "coveredBy": { "kind": "codegen-golden", "family": "ec" }
+    },
+    {
+      "fixture": "ec-primitives",
+      "reason": "secp256k1 EC primitives — EC point witness",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "ec-primitives",
+        "note": "compileRúnar(\"ec-primitives\", ...) is executed by ~16 TestECPrimitives_* functions in script_execution_test.go, including _Fail variants (reject)."
+      }
+    },
+    {
+      "fixture": "ec-unit",
+      "reason": "secp256k1 EC primitives — EC point witness",
+      "coveredBy": { "kind": "codegen-golden", "family": "ec" }
+    },
+    {
+      "fixture": "oracle-price",
+      "reason": "Rabin signature (verifyRabinSig) + ECDSA checkSig — Rabin witness is not secp256k1; real signatures required",
+      "coveredBy": { "kind": "codegen-golden", "family": "rabin" }
+    },
+    {
+      "fixture": "p256-primitives",
+      "reason": "NIST P-256 EC primitives — non-secp256k1 EC witness",
+      "coveredBy": { "kind": "codegen-golden", "family": "p256" }
+    },
+    {
+      "fixture": "p256-wallet",
+      "reason": "NIST P-256 signature verification + ECDSA checkSig — non-secp256k1 signature; real signatures required",
+      "coveredBy": { "kind": "codegen-golden", "family": "p256" }
+    },
+    {
+      "fixture": "p384-primitives",
+      "reason": "NIST P-384 EC primitives — non-secp256k1 EC witness",
+      "coveredBy": { "kind": "codegen-golden", "family": "p384" }
+    },
+    {
+      "fixture": "p384-wallet",
+      "reason": "NIST P-384 signature verification + ECDSA checkSig — non-secp256k1 signature; real signatures required",
+      "coveredBy": { "kind": "codegen-golden", "family": "p384" }
+    },
+    {
+      "fixture": "post-quantum-slhdsa",
+      "reason": "SLH-DSA-SHA2-128s verification — huge PQ witness",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-slhdsa",
+        "note": "compileRúnar(\"post-quantum-slhdsa\", ...) is executed by TestSLHDSA_ScriptExecution (accept) and _TamperedSig / _WrongMessage (reject) in script_execution_test.go."
+      }
+    },
+    {
+      "fixture": "post-quantum-slhdsa-128f",
+      "reason": "SLH-DSA-SHA2-128f verification — huge PQ witness; only the -128s parameter set (fixture \"post-quantum-slhdsa\") is actually executed in Go",
+      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+    },
+    {
+      "fixture": "post-quantum-slhdsa-192f",
+      "reason": "SLH-DSA-SHA2-192f verification — huge PQ witness; only the -128s parameter set (fixture \"post-quantum-slhdsa\") is actually executed in Go",
+      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+    },
+    {
+      "fixture": "post-quantum-slhdsa-192s",
+      "reason": "SLH-DSA-SHA2-192s verification — huge PQ witness; only the -128s parameter set (fixture \"post-quantum-slhdsa\") is actually executed in Go",
+      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+    },
+    {
+      "fixture": "post-quantum-slhdsa-256f",
+      "reason": "SLH-DSA-SHA2-256f verification — huge PQ witness; only the -128s parameter set (fixture \"post-quantum-slhdsa\") is actually executed in Go",
+      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+    },
+    {
+      "fixture": "post-quantum-slhdsa-256s",
+      "reason": "SLH-DSA-SHA2-256s verification — huge PQ witness; only the -128s parameter set (fixture \"post-quantum-slhdsa\") is actually executed in Go",
+      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+    },
+    {
+      "fixture": "post-quantum-wallet",
+      "reason": "WOTS+ verification + ECDSA checkSig — WOTS+ one-time witness; real signatures required",
+      "coveredBy": { "kind": "codegen-golden", "family": "wots" }
+    },
+    {
+      "fixture": "post-quantum-wots",
+      "reason": "WOTS+ one-time signature verification — WOTS+ witness",
+      "coveredBy": {
+        "kind": "go-script-exec",
+        "fixture": "post-quantum-wots",
+        "note": "compileRúnar(\"post-quantum-wots\", ...) is executed by TestWOTS_ScriptExecution (accept) and _TamperedSig / _WrongMessage (reject) in script_execution_test.go."
+      }
+    },
+    {
+      "fixture": "schnorr-zkp",
+      "reason": "secp256k1 EC + hash256 Schnorr proof — EC/hash witness, not an ECDSA checkSig",
+      "coveredBy": { "kind": "codegen-golden", "family": "ec" }
+    },
+    {
+      "fixture": "sha256-compress",
+      "reason": "SHA-256 compression preimage (sha256Compress) — hash-preimage witness",
+      "coveredBy": {
+        "kind": "go-family-exec",
+        "family": "sha256",
+        "marker": "TestSha256Compress_",
+        "note": "script_execution_test.go runs an inline sha256Compress contract (not the literal 'sha256-compress' fixture file) through the real Go BSV SDK Spend, including a rejects-wrong-hash case."
+      }
+    },
+    {
+      "fixture": "sha256-finalize",
+      "reason": "SHA-256 finalize preimage (sha256Finalize) — hash-preimage witness",
+      "coveredBy": {
+        "kind": "go-family-exec",
+        "family": "sha256",
+        "marker": "TestSha256Finalize_",
+        "note": "script_execution_test.go runs an inline sha256Finalize contract (not the literal 'sha256-finalize' fixture file) through the real Go BSV SDK Spend, including a rejects-wrong-hash case."
+      }
+    },
+    {
+      "fixture": "sphincs-wallet",
+      "reason": "SLH-DSA (SPHINCS+) verification + ECDSA checkSig — huge PQ witness; real signatures required",
+      "coveredBy": { "kind": "codegen-golden", "family": "slh-dsa" }
+    },
+    {
+      "fixture": "merkle-proof",
+      "reason": "SHA-256 Merkle root verification (Go-only proof-system primitive, compilers:[go]) — no TS codegen",
+      "coveredBy": { "kind": "go-only-nocodegen" }
+    },
+    {
+      "fixture": "state-covenant",
+      "reason": "hash256 + SHA-256 Merkle covenant (Go-only, compilers:[go]) + stateful preimage — no TS codegen",
+      "coveredBy": { "kind": "go-only-nocodegen" }
+    },
+    {
+      "fixture": "stateful-wots-gate",
+      "reason": "WOTS+ verification gate + checkPreimage — WOTS+ one-time witness + tx context; real PQ signature required",
+      "coveredBy": { "kind": "codegen-golden", "family": "wots" }
+    }
+  ]
+}

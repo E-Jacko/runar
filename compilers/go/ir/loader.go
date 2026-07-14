@@ -9,31 +9,35 @@ import (
 
 // LoadIR reads an ANF IR JSON file from disk, deserialises it, validates it,
 // and decodes constant values into their typed Go representations.
+//
+// Rejects oversized (>MaxIRBytes) or deeply-nested (>MaxIRNesting) payloads
+// with typed IRSizeExceededError / IRNestingExceededError before json.Unmarshal
+// runs.
 func LoadIR(path string) (*ANFProgram, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading IR file: %w", err)
 	}
 
-	var program ANFProgram
-	if err := json.Unmarshal(data, &program); err != nil {
-		return nil, fmt.Errorf("invalid IR JSON: %w", err)
-	}
-
-	// Decode typed constant values from raw JSON
-	if err := DecodeConstants(&program); err != nil {
-		return nil, fmt.Errorf("decoding constants: %w", err)
-	}
-
-	if err := ValidateIR(&program); err != nil {
-		return nil, err
-	}
-
-	return &program, nil
+	return LoadIRFromBytes(data)
 }
 
 // LoadIRFromBytes is like LoadIR but accepts raw JSON bytes directly.
+//
+// Rejects oversized (>MaxIRBytes) or deeply-nested (>MaxIRNesting) payloads
+// with typed IRSizeExceededError / IRNestingExceededError before json.Unmarshal
+// runs.
 func LoadIRFromBytes(data []byte) (*ANFProgram, error) {
+	// DoS-bound guards run before json.Unmarshal so a malicious payload
+	// cannot exhaust memory (size) or the goroutine stack (nesting)
+	// inside the stdlib decoder.
+	if err := assertIRBytesUnderLimit(data); err != nil {
+		return nil, err
+	}
+	if err := assertIRNestingUnderLimit(data); err != nil {
+		return nil, err
+	}
+
 	var program ANFProgram
 	if err := json.Unmarshal(data, &program); err != nil {
 		return nil, fmt.Errorf("invalid IR JSON: %w", err)
@@ -108,7 +112,9 @@ var knownKinds = map[string]bool{
 	"deserialize_state": true,
 	"add_output":        true,
 	"add_raw_output":    true,
+	"add_data_output":   true,
 	"array_literal":     true,
+	"raw_script":        true,
 }
 
 func validateBindings(bindings []ANFBinding, methodName string) error {
@@ -144,6 +150,36 @@ func validateBindings(bindings []ANFBinding, methodName string) error {
 				return err
 			}
 		}
+		if kind == "raw_script" {
+			body := binding.Value.Bytes
+			if len(body)%2 != 0 {
+				return fmt.Errorf("IR validation: method %s binding %s raw_script bytes have odd hex length %d", methodName, binding.Name, len(body))
+			}
+			if !isHexString(body) {
+				return fmt.Errorf("IR validation: method %s binding %s raw_script bytes contain non-hex characters", methodName, binding.Name)
+			}
+			if binding.Value.InArity < 0 {
+				return fmt.Errorf("IR validation: method %s binding %s raw_script has negative in_arity %d", methodName, binding.Name, binding.Value.InArity)
+			}
+			if binding.Value.OutArity < 0 {
+				return fmt.Errorf("IR validation: method %s binding %s raw_script has negative out_arity %d", methodName, binding.Name, binding.Value.OutArity)
+			}
+		}
 	}
 	return nil
+}
+
+// isHexString reports whether s contains only hex digits (0-9, a-f, A-F).
+// An empty string is considered valid hex.
+func isHexString(s string) bool {
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }

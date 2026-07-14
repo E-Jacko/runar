@@ -74,6 +74,7 @@ module RunarCompiler
     GO_TYPE_MAP = {
       "Int"             => "bigint",
       "Bigint"          => "bigint",
+      "BigintBig"       => "bigint",
       "Bool"            => "boolean",
       "bool"            => "boolean",
       "int"             => "bigint",
@@ -81,6 +82,7 @@ module RunarCompiler
       "PubKey"          => "PubKey",
       "Sig"             => "Sig",
       "Sha256"          => "Sha256",
+      "Sha256Digest"    => "Sha256",
       "Ripemd160"       => "Ripemd160",
       "Addr"            => "Addr",
       "SigHashPreimage" => "SigHashPreimage",
@@ -112,7 +114,7 @@ module RunarCompiler
       # Assertions
       "Assert" => "assert",
       # Hashing
-      "Hash160" => "hash160", "Hash256" => "hash256", "Sha256" => "sha256", "Ripemd160" => "ripemd160",
+      "Hash160" => "hash160", "Hash256" => "hash256", "Sha256" => "sha256", "Sha256Hash" => "sha256", "Ripemd160" => "ripemd160",
       # Signature verification
       "CheckSig" => "checkSig", "CheckMultiSig" => "checkMultiSig",
       "CheckPreimage" => "checkPreimage", "VerifyRabinSig" => "verifyRabinSig",
@@ -124,6 +126,9 @@ module RunarCompiler
       "VerifySLHDSA_SHA2_192f" => "verifySLHDSA_SHA2_192f",
       "VerifySLHDSA_SHA2_256s" => "verifySLHDSA_SHA2_256s",
       "VerifySLHDSA_SHA2_256f" => "verifySLHDSA_SHA2_256f",
+      # NIST EC curves
+      "VerifyECDSAP256" => "verifyECDSA_P256",
+      "VerifyECDSAP384" => "verifyECDSA_P384",
       # Byte operations
       "Num2Bin" => "num2bin", "Bin2Num" => "bin2num", "Int2Str" => "int2str",
       "Cat" => "cat", "Substr" => "substr", "Split" => "split",
@@ -144,8 +149,13 @@ module RunarCompiler
       "ExtractOutputHash" => "extractOutputHash",
       "ExtractAmount" => "extractAmount",
       "ExtractLocktime" => "extractLocktime",
+      # Intent sub-covenant intrinsics (BSVM Phase 13)
+      "ExtractPrevOutputScript" => "extractPrevOutputScript",
+      "RequireOutputP2PKH" => "requireOutputP2PKH",
+      "CurrentBlockHeight" => "currentBlockHeight",
       # Output construction
       "AddOutput" => "addOutput", "AddRawOutput" => "addRawOutput",
+      "AddDataOutput" => "addDataOutput",
       "GetStateScript" => "getStateScript",
       # Math builtins
       "Abs" => "abs", "Min" => "min", "Max" => "max", "Within" => "within",
@@ -163,7 +173,7 @@ module RunarCompiler
 
     # Known type names used for type cast detection.
     GO_CAST_TYPES = %w[
-      Int Bigint Bool ByteString PubKey Sig Sha256
+      Int Bigint BigintBig Bool ByteString PubKey Sig Sha256
       Ripemd160 Addr SigHashPreimage RabinSig RabinPubKey Point
     ].to_set.freeze
 
@@ -174,6 +184,43 @@ module RunarCompiler
       return name if name.empty?
 
       name[0].downcase + name[1..]
+    end
+
+    # Decode Go string escape sequences (\n, \t, \r, \0, \\, \", \xNN) from the
+    # raw text of a Go string literal.
+    def self.go_decode_string_escapes(raw)
+      out = String.new(encoding: Encoding::ASCII_8BIT)
+      i = 0
+      n = raw.length
+      while i < n
+        c = raw[i]
+        if c == "\\" && i + 1 < n
+          nx = raw[i + 1]
+          case nx
+          when "n" then out << "\n".b; i += 2
+          when "t" then out << "\t".b; i += 2
+          when "r" then out << "\r".b; i += 2
+          when "0" then out << "\x00".b; i += 2
+          when "\\" then out << "\\".b; i += 2
+          when '"' then out << '"'.b; i += 2
+          when "x"
+            if i + 3 < n && raw[i + 2].match?(/[0-9a-fA-F]/) && raw[i + 3].match?(/[0-9a-fA-F]/)
+              out << raw[(i + 2)..(i + 3)].to_i(16).chr
+              i += 4
+            else
+              out << c.b
+              i += 1
+            end
+          else
+            out << nx.b
+            i += 2
+          end
+        else
+          out << c.b
+          i += 1
+        end
+      end
+      out
     end
 
     def self.go_map_type(name)
@@ -631,12 +678,14 @@ module RunarCompiler
         while !check(TOK_RBRACE) && !check(TOK_EOF)
           prop_loc = loc
 
-          # Check for embedded type: runar.SmartContract / runar.StatefulSmartContract
+          # Check for embedded type:
+          # runar.SmartContract / runar.StatefulSmartContract / runar.UnsafeSmartContract
           if check_ident("runar") && peek_next.kind == TOK_DOT
             advance # skip 'runar'
             advance # skip '.'
             embed_name = expect(TOK_IDENT).value
             parent_class = "StatefulSmartContract" if embed_name == "StatefulSmartContract"
+            parent_class = "UnsafeSmartContract" if embed_name == "UnsafeSmartContract"
             next
           end
 
@@ -1211,6 +1260,22 @@ module RunarCompiler
         expr
       end
 
+      # Nested composite literal body: `{elem, elem, ...}` or `{ {..}, {..} }`.
+      def parse_go_brace_literal
+        expect(TOK_LBRACE)
+        elements = []
+        while !check(TOK_RBRACE) && !check(TOK_EOF)
+          elements << if check(TOK_LBRACE)
+            parse_go_brace_literal
+          else
+            parse_expression
+          end
+          match_tok(TOK_COMMA)
+        end
+        expect(TOK_RBRACE)
+        ArrayLiteralExpr.new(elements: elements)
+      end
+
       def parse_primary
         tok = peek
 
@@ -1255,16 +1320,54 @@ module RunarCompiler
           return expr
         end
 
-        # Array literal: [expr, expr, ...]
+        # Go composite literal for arrays: [N]Type{elements} or
+        # [N][M]Type{{...},{...}}. Also accept the plain bracket-list form
+        # `[a, b, c]` for compatibility. Both lower to an ArrayLiteralExpr so
+        # downstream passes (typecheck, ANF-lowering for +checkMultiSig+) see
+        # the same array_literal node shape used by every other format parser.
         if tok.kind == TOK_LBRACKET
-          advance
+          saved = @pos
+          advance # skip '['
+          # Look ahead to decide between Go composite literal (`[N]...{...}`)
+          # and the legacy bracket-list form (`[a, b, c]`).
+          if check(TOK_NUMBER) && peek_next.kind == TOK_RBRACKET
+            advance # number
+            advance # ']'
+            # Consume any additional leading `[M]` dimensions.
+            while check(TOK_LBRACKET) && peek_next.kind == TOK_NUMBER &&
+                  @pos + 2 < @tokens.length && @tokens[@pos + 2].kind == TOK_RBRACKET
+              advance # '['
+              advance # number
+              advance # ']'
+            end
+            # Consume the element type: `runar.Sig`, `bool`, etc.
+            if check_ident("runar") && peek_next.kind == TOK_DOT
+              advance # runar
+              advance # .
+              advance if check(TOK_IDENT) # type name
+            elsif check(TOK_IDENT)
+              advance # type name
+            end
+            # Now expect `{` -- composite literal body.
+            if check(TOK_LBRACE)
+              return parse_go_brace_literal
+            end
+            # Not a composite literal after all -- roll back.
+            @pos = saved
+            advance # re-skip '['
+          end
           elements = []
           while !check(TOK_RBRACKET) && !check(TOK_EOF)
             elements << parse_expression
             match_tok(TOK_COMMA)
           end
           expect(TOK_RBRACKET)
-          return CallExpr.new(callee: Identifier.new(name: "FixedArray"), args: elements)
+          return ArrayLiteralExpr.new(elements: elements)
+        end
+
+        # Nested composite literal body: `{elem, elem, ...}`.
+        if tok.kind == TOK_LBRACE
+          return parse_go_brace_literal
         end
 
         # Identifier -- handles runar.X, receiver.Field, plain idents
@@ -1275,6 +1378,17 @@ module RunarCompiler
           if tok.value == "runar" && check(TOK_DOT)
             advance # skip '.'
             member_name = expect(TOK_IDENT).value
+
+            # Special-case runar.ByteString("literal") -> ByteStringLiteral
+            # with hex-encoded raw bytes. Any other arg form (e.g. a variable)
+            # falls through to the generic type-cast unwrap below.
+            if member_name == "ByteString" && check(TOK_LPAREN) && @tokens[@pos + 1]&.kind == TOK_STRING && @tokens[@pos + 2]&.kind == TOK_RPAREN
+              advance # consume '('
+              str_tok = advance # consume string
+              advance # consume ')'
+              hex_str = Frontend.go_decode_string_escapes(str_tok.value).bytes.map { |b| format("%02x", b) }.join
+              return ByteStringLiteral.new(value: hex_str)
+            end
 
             # Check for type cast: runar.Bigint(expr), runar.Bool(expr), etc.
             if GO_CAST_TYPES.include?(member_name) && check(TOK_LPAREN)

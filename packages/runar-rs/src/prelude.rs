@@ -7,7 +7,7 @@
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
 // Re-export macros so `use runar::prelude::*` gets them too.
-pub use runar_lang_macros::{contract, methods, public, stateful_contract};
+pub use runar_lang_macros::{contract, stateful_contract, unsafe_contract};
 
 // ---------------------------------------------------------------------------
 // Scalar types — type aliases so Rust arithmetic operators work directly
@@ -37,6 +37,14 @@ pub type ByteString = Vec<u8>;
 
 /// A 32-byte SHA-256 hash.
 pub type Sha256 = Vec<u8>;
+
+/// A 32-byte SHA-256 hash digest. Alias of [`Sha256`] for cross-language
+/// parity with Go, where the identifier `Sha256` must name a function
+/// (mapped to OP_SHA256 in Script) and the TYPE is exposed as
+/// `Sha256Digest` to avoid the type-vs-call ambiguity. Rust doesn't suffer
+/// from the same ambiguity (the function is `sha256` in snake_case), so
+/// both names remain available here and `Sha256` stays canonical.
+pub type Sha256Digest = Sha256;
 
 /// A 20-byte RIPEMD-160 hash.
 pub type Ripemd160 = Vec<u8>;
@@ -155,6 +163,18 @@ pub use crate::ec::{
 
 pub use crate::wots::{wots_keygen, wots_sign, WotsKeyPair};
 
+// ---------------------------------------------------------------------------
+// P-256 (NIST P-256 / secp256r1) off-chain helpers for testing
+// ---------------------------------------------------------------------------
+
+pub use crate::p256::{p256_keygen, p256_sign, verify_ecdsa_p256, P256KeyPair};
+
+// ---------------------------------------------------------------------------
+// P-384 (NIST P-384 / secp384r1) off-chain helpers for testing
+// ---------------------------------------------------------------------------
+
+pub use crate::p384::{p384_keygen, p384_sign, verify_ecdsa_p384, P384KeyPair};
+
 pub use crate::slh_dsa::{
     slh_keygen, slh_sign, slh_verify, SlhKeyPair, SlhParams,
     SLH_SHA2_128S, SLH_SHA2_128F, SLH_SHA2_192S, SLH_SHA2_192F,
@@ -194,6 +214,14 @@ pub fn sha256(data: &[u8]) -> Sha256 {
     Sha256Hasher::digest(data).to_vec()
 }
 
+/// Alias for `sha256`. Provides the PascalCase / explicitly-named spelling
+/// so cross-format contract sources that use the `Sha256Hash` identifier
+/// (resolved by every parser back to the `sha256` builtin) have a matching
+/// runtime function on the Rust side too.
+pub fn sha256_hash(data: &[u8]) -> Sha256 {
+    sha256(data)
+}
+
 /// Single RIPEMD-160 hash.
 pub fn ripemd160(data: &[u8]) -> Ripemd160 {
     let mut hasher = ripemd::Ripemd160::new();
@@ -202,22 +230,144 @@ pub fn ripemd160(data: &[u8]) -> Ripemd160 {
 }
 
 // ---------------------------------------------------------------------------
-// Mock BLAKE3 functions (compiler intrinsics — stubs return 32 zero bytes)
+// BLAKE3 single-block compression (real implementation)
 // ---------------------------------------------------------------------------
+//
+// Matches the Rúnar codegen which hardcodes blockLen=64, counter=0,
+// flags=11 (CHUNK_START | CHUNK_END | ROOT). All seven runtimes (TS, Go,
+// Rust, Python, Zig, Ruby, Java) MUST produce byte-identical output for the
+// same inputs — the cross-language test vectors are pinned in
+// `packages/runar-py/tests/test_blake3.py` and mirrored in this crate's
+// unit tests below.
+//
+// This is *not* a generic BLAKE3 hash of an arbitrary-length message: the
+// emitted Bitcoin Script can only express a single compression invocation,
+// so the off-chain runtime intentionally exposes the same restricted
+// primitive. For message sizes ≤ 64 bytes `blake3_hash` applies zero-padding
+// before calling the compression function with the IV as chaining value.
 
-/// Mock BLAKE3 single-block compression.
-/// In compiled Bitcoin Script this expands to ~10,000 opcodes.
-/// The mock returns 32 zero bytes for business-logic testing.
-pub fn blake3_compress(_chaining_value: &[u8], _block: &[u8]) -> ByteString {
-    vec![0u8; 32]
+/// BLAKE3 initialization vector (8 u32 words, little-endian when serialized).
+const BLAKE3_IV_WORDS: [u32; 8] = [
+    0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a,
+    0x510e_527f, 0x9b05_688c, 0x1f83_d9ab, 0x5be0_cd19,
+];
+
+/// BLAKE3 message word permutation between rounds.
+const BLAKE3_MSG_PERM: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+
+#[inline]
+fn blake3_rotr32(x: u32, n: u32) -> u32 {
+    (x >> n) | (x << (32 - n))
 }
 
-/// Mock BLAKE3 hash for messages up to 64 bytes.
-/// In compiled Bitcoin Script this uses the IV as the chaining value and
-/// applies zero-padding before calling the compression function.
-/// The mock returns 32 zero bytes for business-logic testing.
-pub fn blake3_hash(_message: &[u8]) -> ByteString {
-    vec![0u8; 32]
+#[inline]
+fn blake3_g(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+    s[a] = s[a].wrapping_add(s[b]).wrapping_add(mx);
+    s[d] = blake3_rotr32(s[d] ^ s[a], 16);
+    s[c] = s[c].wrapping_add(s[d]);
+    s[b] = blake3_rotr32(s[b] ^ s[c], 12);
+    s[a] = s[a].wrapping_add(s[b]).wrapping_add(my);
+    s[d] = blake3_rotr32(s[d] ^ s[a], 8);
+    s[c] = s[c].wrapping_add(s[d]);
+    s[b] = blake3_rotr32(s[b] ^ s[c], 7);
+}
+
+fn blake3_round(s: &mut [u32; 16], m: &[u32; 16]) {
+    blake3_g(s, 0, 4, 8, 12, m[0], m[1]);
+    blake3_g(s, 1, 5, 9, 13, m[2], m[3]);
+    blake3_g(s, 2, 6, 10, 14, m[4], m[5]);
+    blake3_g(s, 3, 7, 11, 15, m[6], m[7]);
+    blake3_g(s, 0, 5, 10, 15, m[8], m[9]);
+    blake3_g(s, 1, 6, 11, 12, m[10], m[11]);
+    blake3_g(s, 2, 7, 8, 13, m[12], m[13]);
+    blake3_g(s, 3, 4, 9, 14, m[14], m[15]);
+}
+
+fn blake3_iv_bytes() -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, w) in BLAKE3_IV_WORDS.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    out
+}
+
+fn blake3_compress_impl(cv: &[u8], block: &[u8], block_len: u32) -> [u8; 32] {
+    // Defensive: pad / truncate to the canonical sizes so a misuse doesn't
+    // panic. Production code should always pass exactly 32 / 64 bytes.
+    let mut cv_buf = [0u8; 32];
+    let n = cv.len().min(32);
+    cv_buf[..n].copy_from_slice(&cv[..n]);
+
+    let mut blk_buf = [0u8; 64];
+    let n = block.len().min(64);
+    blk_buf[..n].copy_from_slice(&block[..n]);
+
+    let mut h = [0u32; 8];
+    for i in 0..8 {
+        h[i] = u32::from_le_bytes([
+            cv_buf[i * 4],
+            cv_buf[i * 4 + 1],
+            cv_buf[i * 4 + 2],
+            cv_buf[i * 4 + 3],
+        ]);
+    }
+    let mut m = [0u32; 16];
+    for i in 0..16 {
+        m[i] = u32::from_le_bytes([
+            blk_buf[i * 4],
+            blk_buf[i * 4 + 1],
+            blk_buf[i * 4 + 2],
+            blk_buf[i * 4 + 3],
+        ]);
+    }
+
+    let mut state: [u32; 16] = [
+        h[0], h[1], h[2], h[3],
+        h[4], h[5], h[6], h[7],
+        BLAKE3_IV_WORDS[0], BLAKE3_IV_WORDS[1], BLAKE3_IV_WORDS[2], BLAKE3_IV_WORDS[3],
+        0,         // counter low
+        0,         // counter high
+        block_len, // blockLen (real message length for blake3Hash; 64 for full-block compress)
+        11,        // flags = CHUNK_START | CHUNK_END | ROOT
+    ];
+
+    let mut msg = m;
+    for r in 0..7 {
+        blake3_round(&mut state, &msg);
+        if r < 6 {
+            let mut permuted = [0u32; 16];
+            for (i, &p) in BLAKE3_MSG_PERM.iter().enumerate() {
+                permuted[i] = msg[p];
+            }
+            msg = permuted;
+        }
+    }
+
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        let w = state[i] ^ state[i + 8];
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    out
+}
+
+/// BLAKE3 single-block compression with hardcoded blockLen=64, counter=0,
+/// flags=11. `chaining_value` should be 32 bytes and `block` 64 bytes; both
+/// are interpreted as 8 / 16 little-endian u32 words (standard BLAKE3). Output
+/// is 32 little-endian bytes. Matches the on-chain codegen.
+pub fn blake3_compress(chaining_value: &[u8], block: &[u8]) -> ByteString {
+    blake3_compress_impl(chaining_value, block, 64).to_vec()
+}
+
+/// BLAKE3 hash for messages up to 64 bytes. Equivalent to
+/// `blake3_compress(IV, zero_pad(message, 64))` with the real message length as
+/// block_len. Matches the on-chain codegen.
+pub fn blake3_hash(message: &[u8]) -> ByteString {
+    let cv = blake3_iv_bytes();
+    let mut padded = [0u8; 64];
+    let n = message.len().min(64);
+    padded[..n].copy_from_slice(&message[..n]);
+    blake3_compress_impl(&cv, &padded, n as u32).to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +552,86 @@ pub fn get_state_script<T>(_contract: &T) -> ByteString {
 }
 
 // ---------------------------------------------------------------------------
+// Intent sub-covenant intrinsics (BSVM Phase 13)
+//
+// Witness-bridge wrappers that compile down to standard primitives +
+// auto-injected method params on-chain. The runtime stubs here exist only so
+// native `cargo test` compilation of contract source succeeds — they have no
+// real behaviour off-chain. See docs/cross-covenant-pattern.md.
+// ---------------------------------------------------------------------------
+
+/// Test-mode stub for the cross-input previous-output script witness-bridge
+/// intrinsic (2-arg full-hash form). The compiler emits
+/// `hash256(witness) == expected_script_hash` on-chain; the Rust mock cannot
+/// see other inputs, so this returns an empty ByteString. `input_index` MUST
+/// be an integer literal in source — the Rúnar typechecker rejects non-literal
+/// indices.
+pub fn extract_prev_output_script(_input_index: i64, _expected_script_hash: ByteString) -> ByteString {
+    Vec::new()
+}
+
+/// Test-mode stub for the 3-arg prefix-hash form of
+/// `extract_prev_output_script`. The compiler emits
+/// `hash256(substr(witness, 0, prefix_len)) == expected_script_prefix_hash`
+/// on-chain. Both `input_index` and `prefix_len` MUST be integer literals
+/// in source — the Rúnar typechecker rejects non-literal values. Used for
+/// intent-template matching where each successor UTXO has a unique pushdata
+/// tail (BSVM Mode 3 permissionless step-in). Returns an empty ByteString
+/// off-chain.
+pub fn extract_prev_output_script_prefix(
+    _input_index: i64,
+    _expected_script_prefix_hash: ByteString,
+    _prefix_len: i64,
+) -> ByteString {
+    Vec::new()
+}
+
+/// Test-mode stub for the P2PKH-output-binding intrinsic. The compiler emits
+/// a hashOutputs reconstruction plus a substring assertion on-chain; the
+/// Rust mock has no real outputs to inspect, so this is a no-op.
+/// `output_index` MUST be an integer literal in source.
+pub fn require_output_p2pkh(_output_index: i64, _pubkey_hash: ByteString, _amount: i64) {}
+
+/// Test-mode stub for the locktime-as-height shorthand. On-chain the
+/// compiler desugars to `extract_locktime(tx_preimage)`. Returns 0 off-chain.
+pub fn current_block_height() -> i64 {
+    0
+}
+
+// ---------------------------------------------------------------------------
+// asm — the raw-script escape hatch (UnsafeSmartContract only)
+// ---------------------------------------------------------------------------
+
+/// Structured argument for the `asm` compiler intrinsic. The Rúnar Rust-DSL
+/// frontend intercepts `asm(...)` calls at parse time and lowers them to a
+/// `raw_script` ANF node; this struct only exists so native `cargo test`
+/// compilation of contract source succeeds.
+#[derive(Debug, Clone)]
+pub struct AsmArgs {
+    /// An even-length hex string of the raw Bitcoin Script opcode bytes to
+    /// embed verbatim. The compiler does not re-encode or validate the
+    /// semantics of these bytes — only that the string is valid hex with an
+    /// even length.
+    pub body: String,
+    /// The number of stack items the embedded bytes consume on entry.
+    pub in_arity: i64,
+    /// The number of stack items the embedded bytes leave on exit.
+    pub out_arity: i64,
+}
+
+/// Embeds a raw Bitcoin Script byte sequence in a contract method. Only
+/// callable from inside a contract marked `#[runar::unsafe_contract]` — the
+/// Rúnar compiler enforces this. The Rust-DSL surface spelling is the
+/// positional form `asm(body, in_arity, out_arity)`; the compiler normalises
+/// every frontend to the same `raw_script` ANF node.
+///
+/// This runtime stub panics: `asm` is a compile-time intrinsic and cannot be
+/// executed off-chain.
+pub fn asm(_body: &str, _in_arity: i64, _out_arity: i64) {
+    panic!("asm() cannot be called at runtime — compile this contract with the Rúnar compiler");
+}
+
+// ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
 
@@ -563,6 +793,194 @@ pub fn log2(n: Int) -> Int {
 /// Boolean cast — returns true if n is non-zero.
 pub fn bool_cast(n: Int) -> bool {
     n != 0
+}
+
+/// Boolean cast — returns true if n is non-zero. Alias of `bool_cast` so that
+/// Rúnar contracts calling the `bool` builtin compile as native Rust. The name
+/// `bool` lives in the value namespace and does not collide with the primitive
+/// `bool` type in the type namespace.
+pub fn bool(n: Int) -> bool {
+    bool_cast(n)
+}
+
+/// Absolute value.
+pub fn abs(n: Int) -> Int {
+    if n < 0 { -n } else { n }
+}
+
+/// Smaller of two values.
+pub fn min(a: Int, b: Int) -> Int {
+    if a < b { a } else { b }
+}
+
+/// Larger of two values.
+pub fn max(a: Int, b: Int) -> Int {
+    if a > b { a } else { b }
+}
+
+/// Half-open range check: `lo <= value && value < hi` (min inclusive, max
+/// exclusive), matching Bitcoin Script's OP_WITHIN.
+pub fn within(value: Int, lo: Int, hi: Int) -> bool {
+    value >= lo && value < hi
+}
+
+// ---------------------------------------------------------------------------
+// Baby Bear field arithmetic (p = 2^31 - 2^27 + 1 = 2013265921)
+// ---------------------------------------------------------------------------
+
+const BB_P: i64 = 2013265921;
+
+/// Baby Bear field addition: (a + b) mod p.
+pub fn bb_field_add(a: i64, b: i64) -> i64 {
+    (a + b) % BB_P
+}
+
+/// Baby Bear field subtraction: (a - b + p) mod p.
+pub fn bb_field_sub(a: i64, b: i64) -> i64 {
+    ((a - b) % BB_P + BB_P) % BB_P
+}
+
+/// Baby Bear field multiplication: (a * b) mod p.
+pub fn bb_field_mul(a: i64, b: i64) -> i64 {
+    (a * b) % BB_P
+}
+
+/// Baby Bear field inverse via Fermat's little theorem: a^(p-2) mod p.
+pub fn bb_field_inv(a: i64) -> i64 {
+    let mut result: i64 = 1;
+    let mut base = ((a % BB_P) + BB_P) % BB_P;
+    let mut exp = BB_P - 2;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = (result * base) % BB_P;
+        }
+        base = (base * base) % BB_P;
+        exp >>= 1;
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Baby Bear quartic extension field (x^4 - W, W = 11)
+// ---------------------------------------------------------------------------
+//
+// Mirrors packages/runar-go/runar.go BbExt4Mul{0..3}/BbExt4Inv{0..3} and
+// the compiler codegen used by the `babybear-ext4` conformance fixture.
+
+const BB_EXT4_W: i64 = 11;
+
+pub fn bb_ext4_mul0(
+    a0: i64, a1: i64, a2: i64, a3: i64,
+    b0: i64, b1: i64, b2: i64, b3: i64,
+) -> i64 {
+    let r = bb_field_mul(a0, b0);
+    let t = bb_field_add(bb_field_mul(a1, b3),
+        bb_field_add(bb_field_mul(a2, b2), bb_field_mul(a3, b1)));
+    bb_field_add(r, bb_field_mul(BB_EXT4_W, t))
+}
+
+pub fn bb_ext4_mul1(
+    a0: i64, a1: i64, a2: i64, a3: i64,
+    b0: i64, b1: i64, b2: i64, b3: i64,
+) -> i64 {
+    let r = bb_field_add(bb_field_mul(a0, b1), bb_field_mul(a1, b0));
+    let t = bb_field_add(bb_field_mul(a2, b3), bb_field_mul(a3, b2));
+    bb_field_add(r, bb_field_mul(BB_EXT4_W, t))
+}
+
+pub fn bb_ext4_mul2(
+    a0: i64, a1: i64, a2: i64, a3: i64,
+    b0: i64, b1: i64, b2: i64, b3: i64,
+) -> i64 {
+    let r = bb_field_add(bb_field_mul(a0, b2),
+        bb_field_add(bb_field_mul(a1, b1), bb_field_mul(a2, b0)));
+    bb_field_add(r, bb_field_mul(BB_EXT4_W, bb_field_mul(a3, b3)))
+}
+
+pub fn bb_ext4_mul3(
+    a0: i64, a1: i64, a2: i64, a3: i64,
+    b0: i64, b1: i64, b2: i64, b3: i64,
+) -> i64 {
+    bb_field_add(
+        bb_field_mul(a0, b3),
+        bb_field_add(
+            bb_field_mul(a1, b2),
+            bb_field_add(bb_field_mul(a2, b1), bb_field_mul(a3, b0)),
+        ),
+    )
+}
+
+fn bb_ext4_inv_all(a0: i64, a1: i64, a2: i64, a3: i64) -> (i64, i64, i64, i64) {
+    let (c0, c1, c2, c3) = (a0, bb_field_sub(0, a1), a2, bb_field_sub(0, a3));
+    let p0 = bb_ext4_mul0(a0, a1, a2, a3, c0, c1, c2, c3);
+    let p2 = bb_ext4_mul2(a0, a1, a2, a3, c0, c1, c2, c3);
+    let norm_sq = bb_field_sub(bb_field_mul(p0, p0),
+        bb_field_mul(BB_EXT4_W, bb_field_mul(p2, p2)));
+    let norm_inv = bb_field_inv(norm_sq);
+    let inv0 = bb_field_mul(p0, norm_inv);
+    let inv2 = bb_field_sub(0, bb_field_mul(p2, norm_inv));
+    (
+        bb_field_add(bb_field_mul(c0, inv0), bb_field_mul(BB_EXT4_W, bb_field_mul(c2, inv2))),
+        bb_field_add(bb_field_mul(c1, inv0), bb_field_mul(BB_EXT4_W, bb_field_mul(c3, inv2))),
+        bb_field_add(bb_field_mul(c0, inv2), bb_field_mul(c2, inv0)),
+        bb_field_add(bb_field_mul(c1, inv2), bb_field_mul(c3, inv0)),
+    )
+}
+
+pub fn bb_ext4_inv0(a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    bb_ext4_inv_all(a0, a1, a2, a3).0
+}
+pub fn bb_ext4_inv1(a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    bb_ext4_inv_all(a0, a1, a2, a3).1
+}
+pub fn bb_ext4_inv2(a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    bb_ext4_inv_all(a0, a1, a2, a3).2
+}
+pub fn bb_ext4_inv3(a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    bb_ext4_inv_all(a0, a1, a2, a3).3
+}
+
+// ---------------------------------------------------------------------------
+// Merkle proof verification
+// ---------------------------------------------------------------------------
+
+/// Compute a Merkle root using SHA-256 as the hash function.
+///
+/// `leaf` is a 32-byte hash, `proof` is `depth * 32` concatenated sibling
+/// hashes, `index` determines left/right at each level.
+pub fn merkle_root_sha256(leaf: &[u8], proof: &[u8], index: i64, depth: i64) -> ByteString {
+    merkle_root_impl(leaf, proof, index, depth, sha256)
+}
+
+/// Compute a Merkle root using Hash256 (double SHA-256) as the hash function.
+pub fn merkle_root_hash256(leaf: &[u8], proof: &[u8], index: i64, depth: i64) -> ByteString {
+    merkle_root_impl(leaf, proof, index, depth, hash256)
+}
+
+fn merkle_root_impl(
+    leaf: &[u8],
+    proof: &[u8],
+    index: i64,
+    depth: i64,
+    hash_fn: fn(&[u8]) -> ByteString,
+) -> ByteString {
+    let mut current = leaf.to_vec();
+    for i in 0..depth {
+        let start = (i as usize) * 32;
+        let sibling = &proof[start..start + 32];
+        let bit = (index >> i) & 1;
+        let preimage = if bit == 1 {
+            let mut p = sibling.to_vec();
+            p.extend_from_slice(&current);
+            p
+        } else {
+            let mut p = current.clone();
+            p.extend_from_slice(sibling);
+            p
+        };
+        current = hash_fn(&preimage);
+    }
+    current
 }
 
 // ---------------------------------------------------------------------------
@@ -901,5 +1319,73 @@ mod tests {
             let hashed = sha256(msg.as_bytes());
             assert_eq!(finalized, hashed, "mismatch for {:?}", msg);
         }
+    }
+
+    // -- BLAKE3 single-block compression -------------------------------------
+    //
+    // The expected hex strings below are the official BLAKE3 reference digests
+    // (standard little-endian BLAKE3, single block, real message length as
+    // block_len — see BUG-101). They are pinned in
+    // `conformance/runtime-vectors/hashes.json` and mirrored by every other
+    // tier. Any divergence is a cross-compiler regression.
+
+    #[test]
+    fn test_blake3_hash_matches_cross_language_reference() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"", "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"),
+            (b"abc", "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"),
+            (b"hello world", "d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24"),
+        ];
+        for (msg, expected) in cases {
+            let got = blake3_hash(msg);
+            assert_eq!(
+                hex_encode(&got),
+                *expected,
+                "blake3_hash({:?}) mismatch",
+                msg,
+            );
+        }
+    }
+
+    #[test]
+    fn test_blake3_compress_not_zero_stub() {
+        // Guards against regression back to the all-zero stub.
+        let out = blake3_compress(&[0u8; 32], &[0u8; 64]);
+        assert_eq!(out.len(), 32);
+        assert_ne!(out, vec![0u8; 32], "blake3_compress(0,0) returned zero stub");
+    }
+
+    #[test]
+    fn test_blake3_hash_equivalent_to_compression_with_iv() {
+        // For a full 64-byte message, blake3_hash(msg) == blake3_compress(IV, msg):
+        // both use block_len=64 and the IV as chaining value. (For messages
+        // shorter than 64 bytes the two now differ — blake3_hash uses the real
+        // message length as block_len, blake3_compress the constant 64 — which is
+        // the BUG-101 fix that makes blake3_hash match standard BLAKE3.)
+        let cv = blake3_iv_bytes();
+        let msg: Vec<u8> = (0u8..64).collect();
+        let direct = blake3_compress(&cv, &msg);
+        let via_hash = blake3_hash(&msg);
+        assert_eq!(direct, via_hash, "64-byte block mismatch");
+
+        // Sanity: a short message diverges because block_len differs.
+        let short = b"abc";
+        let mut padded = vec![0u8; 64];
+        padded[..short.len()].copy_from_slice(short);
+        assert_ne!(
+            blake3_compress(&cv, &padded),
+            blake3_hash(short),
+            "short message must differ: block_len 64 vs real length"
+        );
+    }
+
+    #[test]
+    fn test_blake3_compress_determinism() {
+        let cv: Vec<u8> = (0u8..32).collect();
+        let block: Vec<u8> = (0u8..64).collect();
+        let a = blake3_compress(&cv, &block);
+        let b = blake3_compress(&cv, &block);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
     }
 }
