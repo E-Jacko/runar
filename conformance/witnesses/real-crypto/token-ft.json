@@ -3,7 +3,57 @@
   "kind": "stateful",
   "note": "FungibleToken send(): real checkSig(owner) then a single continuation output carrying the transferred balance to the new owner. Real checkPreimage continuation.",
   "spends": [
-    { "method": "send", "args": [null, {"$pubkey":"bob"}, "1n"], "constructorArgs": [{"$pubkey":"alice"}, "10n", "0n", "01"], "signerKey": "alice", "satoshis": 1, "expect": "accept", "note": "owner sends full balance (10) to bob" },
-    { "method": "send", "args": [null, {"$pubkey":"bob"}, "1n"], "constructorArgs": [{"$pubkey":"bob"}, "10n", "0n", "01"], "signerKey": "alice", "satoshis": 1, "cryptoNearMiss": true, "expect": "reject", "note": "wrong signer: owner=bob signed by alice" }
+    {
+      "method": "send",
+      "args": [
+        null,
+        {
+          "$pubkey": "bob"
+        },
+        "1n"
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "alice"
+        },
+        "10n",
+        "0n",
+        "01"
+      ],
+      "signerKey": "alice",
+      "satoshis": 1,
+      "expect": "accept",
+      "note": "owner sends full balance (10) to bob",
+      "expectedState": {
+        "owner": {
+          "$pubkey": "bob"
+        },
+        "balance": "10n",
+        "mergeBalance": "0n"
+      }
+    },
+    {
+      "method": "send",
+      "args": [
+        null,
+        {
+          "$pubkey": "bob"
+        },
+        "1n"
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "bob"
+        },
+        "10n",
+        "0n",
+        "01"
+      ],
+      "signerKey": "alice",
+      "satoshis": 1,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "wrong signer: owner=bob signed by alice"
+    }
   ]
 }

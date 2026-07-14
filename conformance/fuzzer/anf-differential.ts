@@ -950,6 +950,25 @@ export interface AnfDifferentialReport {
   durationMs: number;
 }
 
+/**
+ * Decide whether a requested tier that produced no output (`hex === null`) is a
+ * FAILURE or a SKIP. A tier whose binary is genuinely unavailable
+ * (`available === false`) FAILS the run by default — silently dropping it means
+ * cross-tier divergences involving that tier go untested (audit #18); only an
+ * EXPLICIT `skipMissingTiers === true` (e.g. local dev without every toolchain)
+ * downgrades it to a skip. If the binary IS available (or availability is
+ * unknown), null output means the tier ran and rejected the program = a failure.
+ */
+export function classifyUnavailableTier(
+  available: boolean | undefined,
+  skipMissingTiers: boolean | undefined,
+): 'failed' | 'skipped' {
+  if (available === false) {
+    return skipMissingTiers === true ? 'skipped' : 'failed';
+  }
+  return 'failed';
+}
+
 export async function runAnfDifferential(
   opts: AnfDifferentialOptions,
 ): Promise<AnfDifferentialReport> {
@@ -1036,14 +1055,10 @@ export async function runAnfDifferential(
       }
 
       if (hex === null) {
-        // Distinguish "no binary" (skip) from "binary present, rejected"
-        // (failure). perTierAvailable tells us the difference.
-        if (perTierAvailable[tier] === false) {
-          if (!opts.skipMissingTiers && opts.skipMissingTiers !== undefined) {
-            failed.push(tier);
-          } else {
-            skipped.push(tier);
-          }
+        // Distinguish "no binary" from "binary present, rejected" (always a
+        // failure). perTierAvailable tells us the difference.
+        if (classifyUnavailableTier(perTierAvailable[tier], opts.skipMissingTiers) === 'skipped') {
+          skipped.push(tier);
         } else {
           failed.push(tier);
         }

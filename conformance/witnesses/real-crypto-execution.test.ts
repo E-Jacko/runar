@@ -59,6 +59,16 @@ interface SpendSpec {
   lockTime?: number;
   satoshis?: number;
   tamperOutput?: boolean;
+  /** Independent, hand-authored expected continuation state after an accepted
+   *  stateful spend (audit #4). Property → scalar ("1n" | true | "0x.."). The
+   *  on-chain state decoded from the call tx MUST equal this — accept/reject
+   *  cannot catch a state-transition miscompile that is self-consistent between
+   *  the SDK-built output and the covenant. Required for every stateful accept
+   *  spend unless `noStateCheck` is set. */
+  expectedState?: Record<string, unknown>;
+  /** Opt out of the state-value check (justify in `note`) — only for a stateful
+   *  accept whose continuation genuinely carries no decodable state. */
+  noStateCheck?: boolean;
   // both
   cryptoNearMiss?: boolean;
 }
@@ -142,6 +152,24 @@ function resolveStatefulArgs(raw: unknown[]): unknown[] {
 
 const specFiles = readdirSync(SPEC_DIR).filter((f) => f.endsWith('.json'));
 
+/** A crypto near-miss reject must be rejected BY THE SCRIPT GUARD on the real
+ *  Spend engine, not by a harness/SDK error before the engine ran — otherwise a
+ *  reject that fails for an unrelated SDK reason silently passes and the guard it
+ *  was meant to exercise stops being tested (audit #12). */
+function assertNearMissReachedEngine(
+  fixture: string,
+  s: SpendSpec,
+  r: { reachedEngine?: boolean; vmError?: string },
+): void {
+  if (s.expect !== 'reject' || !s.cryptoNearMiss) return;
+  expect(
+    r.reachedEngine,
+    `${fixture}.${s.method}: crypto near-miss reject must reach the Spend engine ` +
+      `(reachedEngine=${r.reachedEngine}, vmErr=${r.vmError}) — a false here means it failed ` +
+      `at the SDK/harness before the script guard ran (audit #12)`,
+  ).toBe(true);
+}
+
 describe('real-crypto execution (source vs real @bsv/sdk Spend, fold-ON)', () => {
   for (const specFile of specFiles) {
     const spec: Spec = JSON.parse(readFileSync(join(SPEC_DIR, specFile), 'utf-8'));
@@ -173,6 +201,7 @@ describe('real-crypto execution (source vs real @bsv/sdk Spend, fold-ON)', () =>
                 `interpreter=${r.interpreterAccepted} vm=${r.vmAccepted} interpErr=${r.interpreterError}`,
               ).toBe(r.vmAccepted);
             }
+            assertNearMissReachedEngine(spec.fixture, s, r);
           } else {
             const r = await runStatefulSpend({
               source,
@@ -186,6 +215,33 @@ describe('real-crypto execution (source vs real @bsv/sdk Spend, fold-ON)', () =>
               tamperOutput: s.tamperOutput,
             });
             expect(r.vmAccepted, `real Spend: vmErr=${r.vmError}`).toBe(s.expect === 'accept');
+            assertNearMissReachedEngine(spec.fixture, s, r);
+            // Independent state-VALUE check (audit #4): accept/reject is blind to
+            // an ANF state-transition miscompile that produces the same wrong
+            // state in both the SDK-built output and the covenant. Decode the
+            // on-chain continuation state and compare to a hand-authored value.
+            if (s.expect === 'accept' && !s.tamperOutput) {
+              if (s.expectedState !== undefined) {
+                const want: Record<string, unknown> = {};
+                for (const [k, v] of Object.entries(s.expectedState)) {
+                  const p = placeholder(v);
+                  if (p?.tag === 'pubkey') want[k] = testKey(p.key).pubKey;
+                  else if (p?.tag === 'pkh') want[k] = testKey(p.key).pubKeyHash;
+                  else want[k] = scalar(v);
+                }
+                expect(
+                  r.continuationState,
+                  `${spec.fixture}.${s.method}: on-chain continuation state must equal the ` +
+                    `hand-authored expectation (audit #4)`,
+                ).toEqual(want);
+              } else if (!s.noStateCheck) {
+                throw new Error(
+                  `${spec.fixture}: stateful accept spend "${s.method}" must declare ` +
+                    `"expectedState" (independent state-value check, audit #4) or set ` +
+                    `"noStateCheck": true with a reason in "note"`,
+                );
+              }
+            }
           }
         });
       }

@@ -3,8 +3,69 @@
   "kind": "stateful",
   "note": "SimpleNFT: transfer()/burn() gated by real checkSig(owner). Real checkPreimage continuation + a transfer output.",
   "spends": [
-    { "method": "burn", "args": [null], "constructorArgs": [{"$pubkey":"alice"}, "01", "02"], "signerKey": "alice", "expect": "accept", "note": "owner burn: real checkSig(alice)" },
-    { "method": "burn", "args": [null], "constructorArgs": [{"$pubkey":"bob"}, "01", "02"], "signerKey": "alice", "cryptoNearMiss": true, "expect": "reject", "note": "wrong signer: owner=bob signed by alice" },
-    { "method": "transfer", "args": [null, {"$pubkey":"bob"}, "1n"], "constructorArgs": [{"$pubkey":"alice"}, "01", "02"], "signerKey": "alice", "satoshis": 1, "expect": "accept", "note": "owner transfer to bob, 1 sat output" }
+    {
+      "method": "burn",
+      "args": [
+        null
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "alice"
+        },
+        "01",
+        "02"
+      ],
+      "signerKey": "alice",
+      "expect": "accept",
+      "note": "owner burn: real checkSig(alice)",
+      "expectedState": {
+        "owner": {
+          "$pubkey": "alice"
+        }
+      }
+    },
+    {
+      "method": "burn",
+      "args": [
+        null
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "bob"
+        },
+        "01",
+        "02"
+      ],
+      "signerKey": "alice",
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "wrong signer: owner=bob signed by alice"
+    },
+    {
+      "method": "transfer",
+      "args": [
+        null,
+        {
+          "$pubkey": "bob"
+        },
+        "1n"
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "alice"
+        },
+        "01",
+        "02"
+      ],
+      "signerKey": "alice",
+      "satoshis": 1,
+      "expect": "accept",
+      "note": "owner transfer to bob, 1 sat output",
+      "expectedState": {
+        "owner": {
+          "$pubkey": "bob"
+        }
+      }
+    }
   ]
 }

@@ -3,9 +3,103 @@
   "kind": "stateful",
   "note": "Auction: bid()/close() verify real checkSig plus extractLocktime(preimage) vs deadline. The call tx nLockTime is threaded via CallOptions.locktime so the on-chain extractLocktime binding is real. Real checkPreimage continuation.",
   "spends": [
-    { "method": "close", "args": [null], "constructorArgs": [{"$pubkey":"alice"}, {"$pubkey":"alice"}, "1n", "1000n"], "signerKey": "alice", "lockTime": 2000, "expect": "accept", "note": "auctioneer sig + locktime 2000 >= deadline 1000" },
-    { "method": "close", "args": [null], "constructorArgs": [{"$pubkey":"bob"}, {"$pubkey":"alice"}, "1n", "1000n"], "signerKey": "alice", "lockTime": 2000, "cryptoNearMiss": true, "expect": "reject", "note": "wrong signer: auctioneer=bob signed by alice" },
-    { "method": "close", "args": [null], "constructorArgs": [{"$pubkey":"alice"}, {"$pubkey":"alice"}, "1n", "3000n"], "signerKey": "alice", "lockTime": 2000, "cryptoNearMiss": true, "expect": "reject", "note": "locktime 2000 < deadline 3000 -> close forbidden" },
-    { "method": "bid", "args": [null, {"$pubkey":"alice"}, "100n"], "constructorArgs": [{"$pubkey":"alice"}, {"$pubkey":"alice"}, "1n", "1000n"], "signerKey": "alice", "lockTime": 500, "expect": "accept", "note": "bidder sig + bid 100>1 + locktime 500 < deadline 1000" }
+    {
+      "method": "close",
+      "args": [
+        null
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "alice"
+        },
+        {
+          "$pubkey": "alice"
+        },
+        "1n",
+        "1000n"
+      ],
+      "signerKey": "alice",
+      "lockTime": 2000,
+      "expect": "accept",
+      "note": "auctioneer sig + locktime 2000 >= deadline 1000",
+      "expectedState": {
+        "highestBidder": {
+          "$pubkey": "alice"
+        },
+        "highestBid": "1n"
+      }
+    },
+    {
+      "method": "close",
+      "args": [
+        null
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "bob"
+        },
+        {
+          "$pubkey": "alice"
+        },
+        "1n",
+        "1000n"
+      ],
+      "signerKey": "alice",
+      "lockTime": 2000,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "wrong signer: auctioneer=bob signed by alice"
+    },
+    {
+      "method": "close",
+      "args": [
+        null
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "alice"
+        },
+        {
+          "$pubkey": "alice"
+        },
+        "1n",
+        "3000n"
+      ],
+      "signerKey": "alice",
+      "lockTime": 2000,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "locktime 2000 < deadline 3000 -> close forbidden"
+    },
+    {
+      "method": "bid",
+      "args": [
+        null,
+        {
+          "$pubkey": "alice"
+        },
+        "100n"
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "alice"
+        },
+        {
+          "$pubkey": "alice"
+        },
+        "1n",
+        "1000n"
+      ],
+      "signerKey": "alice",
+      "lockTime": 500,
+      "expect": "accept",
+      "note": "bidder sig + bid 100>1 + locktime 500 < deadline 1000",
+      "expectedState": {
+        "highestBidder": {
+          "$pubkey": "alice"
+        },
+        "highestBid": "100n"
+      }
+    }
   ]
 }

@@ -3,10 +3,35 @@
   "kind": "stateful",
   "signerKey": "alice",
   "note": "BUG-100 class: Counter increment/decrement with real checkPreimage continuation.",
-  "constructorArgs": ["5n"],
+  "constructorArgs": [
+    "5n"
+  ],
   "spends": [
-    { "method": "increment", "args": [], "expect": "accept", "note": "count 5->6" },
-    { "method": "increment", "args": [], "tamperOutput": true, "cryptoNearMiss": true, "expect": "reject", "note": "tampered continuation output" },
-    { "method": "decrement", "args": [], "expect": "accept", "note": "count 5->4 (guarded count>0)" }
+    {
+      "method": "increment",
+      "args": [],
+      "expect": "accept",
+      "note": "count 5->6",
+      "expectedState": {
+        "count": "6n"
+      }
+    },
+    {
+      "method": "increment",
+      "args": [],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output"
+    },
+    {
+      "method": "decrement",
+      "args": [],
+      "expect": "accept",
+      "note": "count 5->4 (guarded count>0)",
+      "expectedState": {
+        "count": "4n"
+      }
+    }
   ]
 }
