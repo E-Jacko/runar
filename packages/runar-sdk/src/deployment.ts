@@ -92,13 +92,20 @@ function varIntByteSize(n: number): number {
  * @param numInputs              - Number of P2PKH inputs.
  * @param lockingScriptByteLen   - Byte length of the contract locking script.
  * @param feeRate                - Fee rate in satoshis per KB (default: 100).
+ * @param extraInputBytes        - Serialized byte size of any NON-P2PKH inputs
+ *   that this fee must also cover (e.g. a contract/covenant input being spent
+ *   in the same tx). Defaults to 0 — pure-deploy and funding-only selection
+ *   are unaffected. Used by `prepareCall` so funding coin-selection sizes the
+ *   fee against the real contract-input unlock bytes (which can be tens of KB
+ *   for a MERGE that embeds both parent txs) instead of ignoring them.
  */
 export function estimateDeployFee(
   numInputs: number,
   lockingScriptByteLen: number,
   feeRate: number = 100,
+  extraInputBytes: number = 0,
 ): number {
-  const inputsSize = numInputs * P2PKH_INPUT_SIZE;
+  const inputsSize = numInputs * P2PKH_INPUT_SIZE + extraInputBytes;
   const contractOutputSize =
     8 + varIntByteSize(lockingScriptByteLen) + lockingScriptByteLen;
   const changeOutputSize = P2PKH_OUTPUT_SIZE;
@@ -116,6 +123,7 @@ export function selectUtxos(
   targetSatoshis: number,
   lockingScriptByteLen: number,
   feeRate: number = 100,
+  extraInputBytes: number = 0,
 ): UTXO[] {
   const sorted = [...utxos].sort((a, b) => b.satoshis - a.satoshis);
   const selected: UTXO[] = [];
@@ -125,7 +133,10 @@ export function selectUtxos(
     selected.push(utxo);
     total += utxo.satoshis;
 
-    const fee = estimateDeployFee(selected.length, lockingScriptByteLen, feeRate);
+    // extraInputBytes carries the serialized size of any non-P2PKH inputs the
+    // same tx spends (the contract/covenant input) so the fee — and therefore
+    // the amount of funding we must select — is not under-provisioned.
+    const fee = estimateDeployFee(selected.length, lockingScriptByteLen, feeRate, extraInputBytes);
     if (total >= targetSatoshis + fee) {
       return selected;
     }
