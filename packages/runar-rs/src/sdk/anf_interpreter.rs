@@ -728,6 +728,13 @@ fn run_method(
     let mut data_outputs: Vec<DataOutputEntry> = Vec::new();
     let mut raw_outputs: Vec<RawOutputEntry> = Vec::new();
 
+    // Per-binding raw stack bytes for byte-array-op results (& | ^ << >> ~).
+    // Keyed by binding name; lets a chained op read the real (possibly
+    // non-minimal) length of a prior op's result instead of re-minimizing its
+    // numeric value. `env` stays pure (decoded `Val`s) so state serialization
+    // is unaffected. Mirrors the TS SDK interpreter's `scriptBytes` map.
+    let mut script_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+
     // Walk bindings — strict-mode assert failures bubble up through `?`.
     eval_bindings(
         &method.body,
@@ -737,6 +744,7 @@ fn run_method(
         &mut raw_outputs,
         anf,
         strict,
+        &mut script_bytes,
     )?;
 
     // Merge delta into current_state
@@ -759,6 +767,7 @@ fn eval_bindings(
     raw_outputs: &mut Vec<RawOutputEntry>,
     anf: &ANFProgram,
     strict: Option<&StrictCtx>,
+    script_bytes: &mut HashMap<String, Vec<u8>>,
 ) -> Result<(), AssertionFailureError> {
     for binding in bindings {
         let val = eval_value(
@@ -770,6 +779,7 @@ fn eval_bindings(
             anf,
             strict,
             &binding.name,
+            script_bytes,
         )?;
         env.insert(binding.name.clone(), val);
     }
@@ -785,6 +795,7 @@ fn eval_value(
     anf: &ANFProgram,
     strict: Option<&StrictCtx>,
     binding_name: &str,
+    script_bytes: &mut HashMap<String, Vec<u8>>,
 ) -> Result<Val, AssertionFailureError> {
     let kind = match value.get("kind").and_then(|k| k.as_str()) {
         Some(k) => k,
@@ -820,13 +831,58 @@ fn eval_value(
             let result_type = value.get("resultType").and_then(|v| v.as_str()).unwrap_or("");
             let left = env.get(&left_name).cloned().unwrap_or(Val::Undefined);
             let right = env.get(&right_name).cloned().unwrap_or(Val::Undefined);
-            // A byte-array bitwise/shift op that aborts on-chain (length
-            // mismatch or negative shift) fails the spend; surface it through
-            // the interpreter's rejection channel just like a false assert.
-            eval_bin_op(&op, &left, &right, result_type).map_err(|_| AssertionFailureError {
-                method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
-                binding_name: binding_name.to_string(),
-            })?
+
+            // Numeric byte-array ops (& | ^ << >>) thread the operands' real
+            // stack bytes so chained expressions match the deployed script: a
+            // shift/bitwise result can be non-minimal (e.g. `2 << 8` -> [0x00]),
+            // and the next length-sensitive op must see that real length.
+            // ByteString ops (result_type "bytes" / Bytes operands) fall through
+            // to eval_bin_op, which keeps the minimal-operand path for the rest.
+            let is_numeric_byte_op = matches!(op.as_str(), "&" | "|" | "^" | "<<" | ">>")
+                && result_type != "bytes"
+                && !left.is_bytes()
+                && !right.is_bytes();
+            if is_numeric_byte_op {
+                let ab = script_bytes
+                    .get(&left_name)
+                    .cloned()
+                    .unwrap_or_else(|| encode_script_num(left.to_i64()));
+                let rb = if op == "<<" || op == ">>" {
+                    // Shift count is read as a number on-chain — only `ab`'s
+                    // length matters.
+                    script_num_shift_bytes(&op, &ab, right.to_i64())
+                } else {
+                    let bb = script_bytes
+                        .get(&right_name)
+                        .cloned()
+                        .unwrap_or_else(|| encode_script_num(right.to_i64()));
+                    script_num_bitwise_bytes(&op, &ab, &bb)
+                };
+                match rb {
+                    Ok(bytes) => {
+                        let decoded = decode_script_num(&bytes);
+                        script_bytes.insert(binding_name.to_string(), bytes);
+                        Val::Int(decoded)
+                    }
+                    // A byte-array op that aborts on-chain (length mismatch or
+                    // negative shift) fails the spend; surface it through the
+                    // interpreter's rejection channel just like a false assert.
+                    Err(_) => {
+                        return Err(AssertionFailureError {
+                            method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                            binding_name: binding_name.to_string(),
+                        });
+                    }
+                }
+            } else {
+                // A byte-array bitwise/shift op that aborts on-chain (length
+                // mismatch or negative shift) fails the spend; surface it through
+                // the interpreter's rejection channel just like a false assert.
+                eval_bin_op(&op, &left, &right, result_type).map_err(|_| AssertionFailureError {
+                    method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                    binding_name: binding_name.to_string(),
+                })?
+            }
         }
 
         "unary_op" => {
@@ -834,7 +890,21 @@ fn eval_value(
             let operand_name = str_field(value, "operand");
             let result_type = value.get("resultType").and_then(|v| v.as_str()).unwrap_or("");
             let operand = env.get(&operand_name).cloned().unwrap_or(Val::Undefined);
-            eval_unary_op(&op, &operand, result_type)
+            // OP_INVERT threads the operand's real stack bytes so `~(2<<8)`
+            // inverts the non-minimal [0x00] the shift left (-> -127), not the
+            // minimal empty encoding of 0 (-> 0). Mirrors the bin_op threading.
+            if op == "~" && result_type != "bytes" && !operand.is_bytes() {
+                let ab = script_bytes
+                    .get(&operand_name)
+                    .cloned()
+                    .unwrap_or_else(|| encode_script_num(operand.to_i64()));
+                let rb = script_num_invert_bytes(&ab);
+                let decoded = decode_script_num(&rb);
+                script_bytes.insert(binding_name.to_string(), rb);
+                Val::Int(decoded)
+            } else {
+                eval_unary_op(&op, &operand, result_type)
+            }
         }
 
         "call" => {
@@ -883,7 +953,11 @@ fn eval_value(
                         child_env.insert(param.name.clone(), arg_val.clone());
                     }
                 }
-                eval_bindings(&method.body, &mut child_env, state_delta, data_outputs, raw_outputs, anf, strict)?;
+                // A private method has its own binding-name scope, so its
+                // byte-array-op results get a fresh side map (mirrors the TS
+                // reference, which calls evalBindings with a default `{}`).
+                let mut child_script_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+                eval_bindings(&method.body, &mut child_env, state_delta, data_outputs, raw_outputs, anf, strict, &mut child_script_bytes)?;
                 // Copy property updates back to caller env
                 for prop in &anf.properties {
                     if let Some(v) = child_env.get(&prop.name) {
@@ -911,7 +985,7 @@ fn eval_value(
                     .collect();
                 // Create child env for the branch
                 let mut child_env = env.clone();
-                eval_bindings(&bindings, &mut child_env, state_delta, data_outputs, raw_outputs, anf, strict)?;
+                eval_bindings(&bindings, &mut child_env, state_delta, data_outputs, raw_outputs, anf, strict, script_bytes)?;
                 // Copy new bindings back
                 for (k, v) in &child_env {
                     env.insert(k.clone(), v.clone());
@@ -944,7 +1018,7 @@ fn eval_value(
                 for i in 0..count {
                     env.insert(iter_var.clone(), Val::Int(start + i * step));
                     let mut loop_env = env.clone();
-                    eval_bindings(&bindings, &mut loop_env, state_delta, data_outputs, raw_outputs, anf, strict)?;
+                    eval_bindings(&bindings, &mut loop_env, state_delta, data_outputs, raw_outputs, anf, strict, script_bytes)?;
                     // Copy loop bindings back
                     for (k, v) in &loop_env {
                         env.insert(k.clone(), v.clone());
@@ -1088,15 +1162,29 @@ fn decode_script_num(bytes: &[u8]) -> i64 {
     bin2num_i64(&bytes_to_hex(bytes))
 }
 
-/// OP_AND / OP_OR / OP_XOR on two script-number-valued `i64`s. `Err(())` on a
-/// length mismatch, exactly like the on-chain opcodes.
-fn script_num_bitwise(op: &str, a: i64, b: i64) -> Result<i64, ()> {
-    let av = encode_script_num(a);
-    let bv = encode_script_num(b);
+// The *_bytes helpers below operate on RAW stack bytes (the exact byte array a
+// value would occupy on the deployed script's stack), NOT a value's minimal
+// encoding. This matters for CHAINED expressions: a shift/bitwise RESULT can be
+// a NON-minimal byte array (e.g. `2 << 8` leaves a 1-byte 0x00, whose minimal
+// encoding is empty). When that result feeds a length-sensitive `& | ^` (or
+// another shift), the deployed script sees the real length, so the interpreter
+// threads the real bytes too (see the `script_bytes` side map in `eval_value`).
+// Deriving the minimal encoding of the numeric value per-op instead would abort
+// where the chain spends (and spend where the chain aborts) — a funds-relevant
+// divergence. Mirrors packages/runar-sdk/src/anf-interpreter.ts scriptNumber*Bytes.
+
+/// OP_AND / OP_OR / OP_XOR on raw stack bytes. `Err` (carrying the same message
+/// the deployed opcode fails with) on a length mismatch.
+fn script_num_bitwise_bytes(op: &str, av: &[u8], bv: &[u8]) -> Result<Vec<u8>, String> {
     if av.len() != bv.len() {
-        return Err(());
+        let name = match op {
+            "&" => "OP_AND",
+            "|" => "OP_OR",
+            _ => "OP_XOR",
+        };
+        return Err(format!("{}: operands must be same length", name));
     }
-    let result: Vec<u8> = av
+    Ok(av
         .iter()
         .zip(bv.iter())
         .map(|(x, y)| match op {
@@ -1104,32 +1192,33 @@ fn script_num_bitwise(op: &str, a: i64, b: i64) -> Result<i64, ()> {
             "|" => x | y,
             _ => x ^ y, // "^"
         })
-        .collect();
-    Ok(decode_script_num(&result))
+        .collect())
 }
 
-/// OP_INVERT: flip every bit of the operand's minimal script-number bytes.
-fn script_num_invert(a: i64) -> i64 {
-    let av = encode_script_num(a);
-    let result: Vec<u8> = av.iter().map(|b| !b).collect();
-    decode_script_num(&result)
+/// OP_INVERT: flip every bit of the operand's raw stack bytes (length-preserving).
+fn script_num_invert_bytes(av: &[u8]) -> Vec<u8> {
+    av.iter().map(|b| !b).collect()
 }
 
-/// OP_LSHIFT / OP_RSHIFT: shift the operand's bytes as a big-endian bit string,
-/// preserving byte length (LSHIFT masks off overflow MSBs). `Err(())` on a
-/// negative shift, like the on-chain opcodes. Uses `BigUint` so the shift math
-/// is exact for the full script-number range (matches the TS BigInt reference).
-fn script_num_shift(op: &str, a: i64, shift: i64) -> Result<i64, ()> {
+/// OP_LSHIFT / OP_RSHIFT on raw stack bytes as a big-endian bit string,
+/// preserving byte length (LSHIFT masks off overflow MSBs). `shift` is the
+/// numeric shift count (read as a number on-chain, so only `val`'s bytes are
+/// length-significant). `Err` on a negative shift. Uses `BigUint` so the shift
+/// math is exact for the full script-number range (matches the TS BigInt ref).
+fn script_num_shift_bytes(op: &str, val: &[u8], shift: i64) -> Result<Vec<u8>, String> {
     if shift < 0 {
-        return Err(());
+        return Err(if op == "<<" {
+            "OP_LSHIFT: negative shift".to_string()
+        } else {
+            "OP_RSHIFT: negative shift".to_string()
+        });
     }
-    let val = encode_script_num(a);
     let n = shift as usize;
     if val.is_empty() || n == 0 {
-        return Ok(decode_script_num(&val));
+        return Ok(val.to_vec());
     }
     let mut num = num_bigint::BigUint::from(0u32);
-    for &byte in &val {
+    for &byte in val {
         num = (num << 8usize) | num_bigint::BigUint::from(byte);
     }
     if op == "<<" {
@@ -1145,7 +1234,33 @@ fn script_num_shift(op: &str, a: i64, shift: i64) -> Result<i64, ()> {
         result[i] = (&num & &ff).to_bytes_le().first().copied().unwrap_or(0);
         num >>= 8usize;
     }
-    Ok(decode_script_num(&result))
+    Ok(result)
+}
+
+// i64 -> i64 wrappers (minimal operands) — used by the single-op fall-through
+// in `eval_bin_op` / `eval_unary_op`. The interpreter's chained path uses the
+// *_bytes helpers directly so it can thread non-minimal intermediates via the
+// `script_bytes` side map.
+
+/// OP_AND / OP_OR / OP_XOR on two script-number-valued `i64`s. `Err(())` on a
+/// length mismatch, exactly like the on-chain opcodes.
+fn script_num_bitwise(op: &str, a: i64, b: i64) -> Result<i64, ()> {
+    let bytes = script_num_bitwise_bytes(op, &encode_script_num(a), &encode_script_num(b))
+        .map_err(|_| ())?;
+    Ok(decode_script_num(&bytes))
+}
+
+/// OP_INVERT: flip every bit of the operand's minimal script-number bytes.
+fn script_num_invert(a: i64) -> i64 {
+    decode_script_num(&script_num_invert_bytes(&encode_script_num(a)))
+}
+
+/// OP_LSHIFT / OP_RSHIFT: shift the operand's minimal bytes as a big-endian bit
+/// string, preserving byte length (LSHIFT masks off overflow MSBs). `Err(())` on
+/// a negative shift, like the on-chain opcodes.
+fn script_num_shift(op: &str, a: i64, shift: i64) -> Result<i64, ()> {
+    let bytes = script_num_shift_bytes(op, &encode_script_num(a), shift).map_err(|_| ())?;
+    Ok(decode_script_num(&bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -1838,6 +1953,105 @@ mod tests {
         assert_eq!(bin("&", 255, 1), Err(()));
         assert_eq!(bin("|", 7, 0), Err(()));
         assert_eq!(bin("<<", 5, -1), Err(()));
+    }
+
+    // --- CHAINED byte-array semantics (issue: shift/bitwise result is a
+    // fixed-length, possibly NON-minimal byte array on-chain; a following
+    // length-sensitive op must see those real bytes, not the re-minimized
+    // numeric value). These pin the funds-relevant divergences the byte-
+    // threading fix closes. Mirrors the TS SDK anf-interpreter fix. ---
+
+    fn b(name: &str, value: serde_json::Value) -> ANFBinding {
+        ANFBinding { name: name.to_string(), value }
+    }
+
+    /// Build a single-method contract with `body`, run it in lenient mode over
+    /// a `count = 0` starting state, and return the merged state (or the abort
+    /// error). The body is expected to `update_prop count = <expr result>`.
+    fn run_expr(body: Vec<ANFBinding>) -> Result<HashMap<String, SdkValue>, String> {
+        let anf = make_anf(vec![ANFMethod {
+            name: "run".to_string(),
+            params: vec![],
+            is_public: true,
+            body,
+        }]);
+        let mut state = HashMap::new();
+        state.insert("count".to_string(), SdkValue::Int(0));
+        compute_new_state(&anf, "run", &state, &HashMap::new(), &[])
+    }
+
+    /// `(2 << 8) | 5`: on-chain OP_LSHIFT leaves [0x00], and
+    /// OP_OR([0x00],[0x05]) = [0x05] -> 5. The buggy path re-minimized 0 to
+    /// empty, so OP_OR saw a length mismatch and aborted. Must return 5.
+    #[test]
+    fn test_chained_shift_then_or_returns_5() {
+        let result = run_expr(vec![
+            b("a", serde_json::json!({ "kind": "load_const", "value": 2 })),
+            b("bb", serde_json::json!({ "kind": "load_const", "value": 8 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": "<<", "left": "a", "right": "bb" })),
+            b("c", serde_json::json!({ "kind": "load_const", "value": 5 })),
+            b("r", serde_json::json!({ "kind": "bin_op", "op": "|", "left": "sh", "right": "c" })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "r" })),
+        ])
+        .expect("(2<<8)|5 must not abort");
+        assert_eq!(result.get("count"), Some(&SdkValue::Int(5)));
+    }
+
+    /// `(1 << 8) & 0`: on-chain OP_AND([0x00], []) is a length mismatch -> the
+    /// spend aborts. The buggy path computed `0 & 0 = 0` and returned 0
+    /// (funds-loss). Must abort.
+    #[test]
+    fn test_chained_shift_then_and_zero_aborts() {
+        let result = run_expr(vec![
+            b("a", serde_json::json!({ "kind": "load_const", "value": 1 })),
+            b("bb", serde_json::json!({ "kind": "load_const", "value": 8 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": "<<", "left": "a", "right": "bb" })),
+            b("z", serde_json::json!({ "kind": "load_const", "value": 0 })),
+            b("r", serde_json::json!({ "kind": "bin_op", "op": "&", "left": "sh", "right": "z" })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "r" })),
+        ]);
+        assert!(result.is_err(), "((1<<8)&0) must abort, got {:?}", result);
+    }
+
+    /// The byte helper carries the on-chain OP_AND "same length" diagnostic
+    /// that makes the abort above a length-mismatch, not a value miscompute.
+    #[test]
+    fn test_bitwise_bytes_same_length_message() {
+        let err = script_num_bitwise_bytes("&", &[0x00], &[]).unwrap_err();
+        assert!(err.contains("same length"), "unexpected message: {}", err);
+    }
+
+    /// `~(2 << 8)`: OP_INVERT([0x00]) = [0xff] -> -127. The buggy path inverted
+    /// the minimal empty encoding of 0 -> 0.
+    #[test]
+    fn test_chained_shift_then_invert_returns_neg127() {
+        let result = run_expr(vec![
+            b("a", serde_json::json!({ "kind": "load_const", "value": 2 })),
+            b("bb", serde_json::json!({ "kind": "load_const", "value": 8 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": "<<", "left": "a", "right": "bb" })),
+            b("r", serde_json::json!({ "kind": "unary_op", "op": "~", "operand": "sh" })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "r" })),
+        ])
+        .expect("~(2<<8) must not abort");
+        assert_eq!(result.get("count"), Some(&SdkValue::Int(-127)));
+    }
+
+    /// `(256 << 8) & 256`: OP_LSHIFT([0x00,0x01],8) = [0x01,0x00] (len 2), and
+    /// OP_AND([0x01,0x00],[0x00,0x01]) = [0x00,0x00] -> 0. The buggy path
+    /// re-minimized the shift result to 1 ([0x01], len 1) and aborted on the
+    /// length mismatch with 256's 2-byte encoding. Must return 0.
+    #[test]
+    fn test_chained_two_byte_shift_then_and_returns_0() {
+        let result = run_expr(vec![
+            b("a", serde_json::json!({ "kind": "load_const", "value": 256 })),
+            b("bb", serde_json::json!({ "kind": "load_const", "value": 8 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": "<<", "left": "a", "right": "bb" })),
+            b("c", serde_json::json!({ "kind": "load_const", "value": 256 })),
+            b("r", serde_json::json!({ "kind": "bin_op", "op": "&", "left": "sh", "right": "c" })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "r" })),
+        ])
+        .expect("(256<<8)&256 must not abort");
+        assert_eq!(result.get("count"), Some(&SdkValue::Int(0)));
     }
 
     #[test]

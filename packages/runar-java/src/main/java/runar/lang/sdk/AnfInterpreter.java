@@ -532,7 +532,12 @@ public final class AnfInterpreter {
         WitnessContext witness,
         String methodName
     ) {
-        evalBindings(anf, bindings, env, stateDelta, dataOutputs, rawOutputs, strict, realCrypto, witness, methodName, new java.util.HashSet<>());
+        // A fresh per-method-body side map for raw byte-array-op results
+        // (& | ^ << >> ~). Private method calls route through this overload,
+        // so each private method gets its own map — matching the TS/Go/Python
+        // references, which pass no scriptBytes across the private-method
+        // boundary.
+        evalBindings(anf, bindings, env, stateDelta, dataOutputs, rawOutputs, strict, realCrypto, witness, methodName, new java.util.HashSet<>(), new HashMap<>());
     }
 
     /**
@@ -555,12 +560,18 @@ public final class AnfInterpreter {
         OnChainCryptoContext realCrypto,
         WitnessContext witness,
         String methodName,
-        java.util.Set<String> continuationTaint
+        java.util.Set<String> continuationTaint,
+        // Per-binding raw stack bytes for byte-array-op results (& | ^ << >> ~).
+        // Keyed by binding name; lets a chained op read the real (possibly
+        // non-minimal) length of a prior op's result instead of re-minimising
+        // its numeric value. `env` stays pure (decoded values) so state
+        // serialization is unaffected.
+        Map<String, byte[]> scriptBytes
     ) {
         for (Map<String, Object> binding : bindings) {
             String bindingName = (String) binding.get("name");
             Map<String, Object> valueNode = asObject(binding.get("value"));
-            Object val = evalValue(anf, valueNode, env, stateDelta, dataOutputs, rawOutputs, strict, realCrypto, witness, methodName, bindingName, continuationTaint);
+            Object val = evalValue(anf, valueNode, env, stateDelta, dataOutputs, rawOutputs, strict, realCrypto, witness, methodName, bindingName, continuationTaint, scriptBytes);
             env.put(bindingName, val);
             if (isContinuationOrigin(valueNode) || refsTainted(valueNode, continuationTaint)) {
                 continuationTaint.add(bindingName);
@@ -632,7 +643,8 @@ public final class AnfInterpreter {
         WitnessContext witness,
         String methodName,
         String bindingName,
-        java.util.Set<String> continuationTaint
+        java.util.Set<String> continuationTaint,
+        Map<String, byte[]> scriptBytes
     ) {
         String kind = String.valueOf(value.getOrDefault("kind", ""));
 
@@ -650,15 +662,63 @@ public final class AnfInterpreter {
             }
             case "bin_op": {
                 String op = (String) value.get("op");
-                Object left = env.get((String) value.get("left"));
-                Object right = env.get((String) value.get("right"));
+                String leftRef = (String) value.get("left");
+                String rightRef = (String) value.get("right");
+                Object left = env.get(leftRef);
+                Object right = env.get(rightRef);
                 String resultType = (String) value.get("result_type");
+                // Numeric byte-array ops (& | ^ << >>) thread the operands' real
+                // stack bytes so chained expressions match the deployed script:
+                // a shift/bitwise result can be non-minimal (e.g. `2 << 8`
+                // leaves a 1-byte 0x00, whereas the minimal encoding of 0 is
+                // empty), and the next length-sensitive op must see that real
+                // length. An operand's bytes are the side-map entry if present,
+                // else the minimal encoding of its numeric value. ByteString
+                // ops (result_type 'bytes' / string operands) fall through to
+                // evalBinOp's minimal-operand path.
+                boolean isNumericByteOp =
+                    ("&".equals(op) || "|".equals(op) || "^".equals(op)
+                        || "<<".equals(op) || ">>".equals(op))
+                    && !"bytes".equals(resultType)
+                    && !(left instanceof String)
+                    && !(right instanceof String);
+                if (isNumericByteOp) {
+                    byte[] ab = scriptBytes.containsKey(leftRef)
+                        ? scriptBytes.get(leftRef)
+                        : MockCrypto.encodeScriptNumber(toBigInt(left));
+                    byte[] rb;
+                    if ("<<".equals(op) || ">>".equals(op)) {
+                        // Shift count is read as a number on-chain — only `ab`'s
+                        // length is significant, so the count operand's bytes
+                        // are never consulted.
+                        rb = scriptNumberShiftBytes(op, ab, toBigInt(right));
+                    } else {
+                        byte[] bb = scriptBytes.containsKey(rightRef)
+                            ? scriptBytes.get(rightRef)
+                            : MockCrypto.encodeScriptNumber(toBigInt(right));
+                        rb = scriptNumberBitwiseBytes(op, ab, bb);
+                    }
+                    scriptBytes.put(bindingName, rb);
+                    return MockCrypto.decodeScriptNumber(rb);
+                }
                 return evalBinOp(op, left, right, resultType);
             }
             case "unary_op": {
                 String op = (String) value.get("op");
-                Object operand = env.get((String) value.get("operand"));
+                String operandRef = (String) value.get("operand");
+                Object operand = env.get(operandRef);
                 String resultType = (String) value.get("result_type");
+                // OP_INVERT threads the operand's real stack bytes too
+                // (length-preserving): `~(2 << 8)` inverts the 1-byte 0x00 to
+                // 0xff (= -127 decoded), not the minimal encoding of 0.
+                if ("~".equals(op) && !"bytes".equals(resultType) && !(operand instanceof String)) {
+                    byte[] ab = scriptBytes.containsKey(operandRef)
+                        ? scriptBytes.get(operandRef)
+                        : MockCrypto.encodeScriptNumber(toBigInt(operand));
+                    byte[] rb = scriptNumberInvertBytes(ab);
+                    scriptBytes.put(bindingName, rb);
+                    return MockCrypto.decodeScriptNumber(rb);
+                }
                 return evalUnaryOp(op, operand, resultType);
             }
             case "call": {
@@ -690,7 +750,7 @@ public final class AnfInterpreter {
                     ? listOfObjects(value.get("then"))
                     : listOfObjects(value.get("else"));
                 Map<String, Object> childEnv = new LinkedHashMap<>(env);
-                evalBindings(anf, branch, childEnv, stateDelta, dataOutputs, rawOutputs, strict, realCrypto, witness, methodName, continuationTaint);
+                evalBindings(anf, branch, childEnv, stateDelta, dataOutputs, rawOutputs, strict, realCrypto, witness, methodName, continuationTaint, scriptBytes);
                 env.putAll(childEnv);
                 if (!branch.isEmpty()) {
                     return childEnv.get((String) branch.get(branch.size() - 1).get("name"));
@@ -712,7 +772,7 @@ public final class AnfInterpreter {
                 for (long i = 0; i < count; i++) {
                     env.put(iterVar, start.add(step.multiply(BigInteger.valueOf(i))));
                     Map<String, Object> loopEnv = new LinkedHashMap<>(env);
-                    evalBindings(anf, body, loopEnv, stateDelta, dataOutputs, rawOutputs, strict, realCrypto, witness, methodName, continuationTaint);
+                    evalBindings(anf, body, loopEnv, stateDelta, dataOutputs, rawOutputs, strict, realCrypto, witness, methodName, continuationTaint, scriptBytes);
                     env.putAll(loopEnv);
                     if (!body.isEmpty()) {
                         lastVal = loopEnv.get((String) body.get(body.size() - 1).get("name"));
@@ -939,11 +999,20 @@ public final class AnfInterpreter {
     // packages/runar-testing/src/vm/utils.ts scriptNumber*. Callers convert
     // BigInteger -> minimal bytes -> byte op -> BigInteger.
 
-    /** OP_AND/OP_OR/OP_XOR on two script-number-valued BigIntegers. Aborts on
-     *  length mismatch, exactly like the on-chain opcodes. */
-    static BigInteger scriptNumberBitwise(String op, BigInteger a, BigInteger b) {
-        byte[] av = MockCrypto.encodeScriptNumber(a);
-        byte[] bv = MockCrypto.encodeScriptNumber(b);
+    // The *Bytes helpers operate on RAW stack bytes (the exact byte array a
+    // value occupies on the deployed script's stack), NOT a value's minimal
+    // encoding. This matters for CHAINED expressions: a shift/bitwise RESULT can
+    // be a non-minimal byte array (e.g. `2 << 8` leaves a 1-byte 0x00), and
+    // feeding it to a length-sensitive `& | ^`/shift must see that real length
+    // to agree with the deployed script. The interpreter threads these bytes via
+    // a per-binding side map (see the `bin_op`/`unary_op` cases in evalValue);
+    // values from other sources (literals, arithmetic) are minimal on-chain. The
+    // BigInteger wrappers below re-encode operands to their minimal bytes and are
+    // used by the single-op truth-table tests only.
+
+    /** OP_AND/OP_OR/OP_XOR on raw stack bytes. Aborts (throws) on a length
+     *  mismatch, exactly like the on-chain opcodes. */
+    static byte[] scriptNumberBitwiseBytes(String op, byte[] av, byte[] bv) {
         if (av.length != bv.length) {
             String name = "&".equals(op) ? "OP_AND" : "|".equals(op) ? "OP_OR" : "OP_XOR";
             throw new InterpreterException(name + ": operands must be same length");
@@ -955,32 +1024,37 @@ public final class AnfInterpreter {
             int r = "&".equals(op) ? (x & y) : "|".equals(op) ? (x | y) : (x ^ y);
             result[i] = (byte) r;
         }
-        return MockCrypto.decodeScriptNumber(result);
+        return result;
     }
 
-    /** OP_INVERT: flip every bit of the operand's minimal script-number bytes. */
-    static BigInteger scriptNumberInvert(BigInteger a) {
-        byte[] av = MockCrypto.encodeScriptNumber(a);
+    /** OP_INVERT: flip every bit of the operand's raw stack bytes (length-preserving). */
+    static byte[] scriptNumberInvertBytes(byte[] av) {
         byte[] result = new byte[av.length];
         for (int i = 0; i < av.length; i++) {
             result[i] = (byte) (~av[i] & 0xff);
         }
-        return MockCrypto.decodeScriptNumber(result);
+        return result;
     }
 
-    /** OP_LSHIFT/OP_RSHIFT: shift the operand's bytes as a big-endian bit string,
-     *  preserving byte length (LSHIFT masks off overflow MSBs). Negative shifts
-     *  abort like the opcodes. */
-    static BigInteger scriptNumberShift(String op, BigInteger a, BigInteger shift) {
+    /** OP_LSHIFT/OP_RSHIFT on raw stack bytes as a big-endian bit string,
+     *  preserving byte length (LSHIFT masks off overflow MSBs). {@code shift} is
+     *  the numeric shift count (read as a number on-chain, so only {@code val}'s
+     *  bytes are length-significant). Negative shifts abort like the opcodes. */
+    static byte[] scriptNumberShiftBytes(String op, byte[] val, BigInteger shift) {
         if (shift.signum() < 0) {
             throw new InterpreterException(
                 ("<<".equals(op) ? "OP_LSHIFT" : "OP_RSHIFT") + ": negative shift");
         }
-        byte[] val = MockCrypto.encodeScriptNumber(a);
-        int n = shift.intValueExact();
-        if (val.length == 0 || n == 0) {
-            return MockCrypto.decodeScriptNumber(val);
+        if (val.length == 0 || shift.signum() == 0) {
+            return val.clone();
         }
+        int bitLen = val.length * 8;
+        // A shift count >= bitLen zeroes every significant bit (LSHIFT masks the
+        // overflow MSBs; RSHIFT drops all bits), so clamp huge counts to bitLen
+        // rather than overflowing int in intValueExact() — matching the
+        // arbitrary-precision tiers, which never abort on a large count.
+        int n = shift.compareTo(BigInteger.valueOf(bitLen)) >= 0
+            ? bitLen : shift.intValueExact();
         // Interpret the (little-endian) script-number bytes as a big-endian bit
         // string: val[0] is the most-significant byte of `num`.
         BigInteger num = BigInteger.ZERO;
@@ -988,17 +1062,36 @@ public final class AnfInterpreter {
             num = num.shiftLeft(8).or(BigInteger.valueOf(val[i] & 0xff));
         }
         if ("<<".equals(op)) {
-            int bitLen = val.length * 8;
             num = num.shiftLeft(n).and(BigInteger.ONE.shiftLeft(bitLen).subtract(BigInteger.ONE));
         } else {
             num = num.shiftRight(n);
         }
         byte[] result = new byte[val.length];
         for (int i = val.length - 1; i >= 0; i--) {
-            result[i] = (byte) num.and(BigInteger.valueOf(0xff)).intValueExact();
+            result[i] = (byte) num.and(BigInteger.valueOf(0xff)).intValue();
             num = num.shiftRight(8);
         }
-        return MockCrypto.decodeScriptNumber(result);
+        return result;
+    }
+
+    /** OP_AND/OP_OR/OP_XOR on two script-number-valued BigIntegers (minimal
+     *  operands). Aborts on length mismatch, exactly like the on-chain opcodes. */
+    static BigInteger scriptNumberBitwise(String op, BigInteger a, BigInteger b) {
+        return MockCrypto.decodeScriptNumber(scriptNumberBitwiseBytes(
+            op, MockCrypto.encodeScriptNumber(a), MockCrypto.encodeScriptNumber(b)));
+    }
+
+    /** OP_INVERT on a script-number-valued BigInteger (minimal operand). */
+    static BigInteger scriptNumberInvert(BigInteger a) {
+        return MockCrypto.decodeScriptNumber(
+            scriptNumberInvertBytes(MockCrypto.encodeScriptNumber(a)));
+    }
+
+    /** OP_LSHIFT/OP_RSHIFT on a script-number-valued BigInteger (minimal
+     *  operand). Preserves byte length; negative shifts abort like the opcodes. */
+    static BigInteger scriptNumberShift(String op, BigInteger a, BigInteger shift) {
+        return MockCrypto.decodeScriptNumber(
+            scriptNumberShiftBytes(op, MockCrypto.encodeScriptNumber(a), shift));
     }
 
     // ------------------------------------------------------------------

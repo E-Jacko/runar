@@ -162,6 +162,22 @@ function arbArithExpr(bigintVars: string[], depth: number): fc.Arbitrary<string>
         arbArithExpr(bigintVars, depth - 1),
       )
       .map(([l, op, r]) => `(${l} ${op} ${r})`),
+    // Chained byte-ops: a shift RESULT (fixed-length, possibly NON-minimal on
+    // chain — e.g. `2 << 8` leaves a 1-byte 0x00) feeding a length-sensitive
+    // `& | ^`. This is the exact shape whose interpreter-vs-script divergence
+    // audit #10 (chained byte-op length) fixed — the interpreter now threads the
+    // real stack bytes so both engines agree (compute together, or abort together
+    // on length mismatch). A dedicated arm keeps the execution-fuzz corpus
+    // sampling this shape reliably; the generic oneof rarely nests a shift under
+    // a bitwise at the small fixed-seed corpus the PR CI gate uses.
+    fc
+      .tuple(
+        arbArithExpr(bigintVars, depth - 1),
+        arbSmallShiftLiteral(),
+        fc.constantFrom('&' as const, '|' as const, '^' as const),
+        arbArithExpr(bigintVars, depth - 1),
+      )
+      .map(([l, k, op, r]) => `(((${l}) << ${k}) ${op} (${r}))`),
   );
 }
 

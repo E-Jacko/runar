@@ -98,3 +98,59 @@ describe('ANF interpreter: script-number bitwise/shift semantics (regression anc
     expect(() => binOp('<<', 5n, -1n)).toThrow(/negative shift/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Chained byte-array ops — threading the real (possibly non-minimal) stack
+// bytes of an intermediate through the next length-sensitive op. Before the
+// side-map fix the interpreter re-minimised each op's numeric result, so a
+// shift result feeding `& | ^` diverged from the deployed script (see the
+// runar-testing chained test + spec/opcodes.md).
+// ---------------------------------------------------------------------------
+
+// result = (a << 8) <op> b
+function makeChainedShiftThen(op: string): ANFProgram {
+  return makeANF({
+    properties: [{ name: 'result', type: 'bigint', readonly: false }],
+    methods: [{
+      name: 'compute',
+      params: [
+        { name: 'a', type: 'bigint' },
+        { name: 'b', type: 'bigint' },
+      ],
+      body: [
+        { name: 't0', value: { kind: 'load_param', name: 'a' } },
+        { name: 'k', value: { kind: 'load_const', value: 8n } },
+        { name: 't1', value: { kind: 'bin_op', op: '<<', left: 't0', right: 'k' } },
+        { name: 't2', value: { kind: 'load_param', name: 'b' } },
+        { name: 't3', value: { kind: 'bin_op', op, left: 't1', right: 't2' } },
+        { name: 't4', value: { kind: 'update_prop', name: 'result', value: 't3' } },
+      ],
+      isPublic: true,
+    }],
+  });
+}
+
+function chainedShiftThen(op: string, a: bigint, b: bigint): unknown {
+  return computeNewState(makeChainedShiftThen(op), 'compute', { result: 0n }, { a, b }).result;
+}
+
+describe('ANF interpreter: chained byte-array ops thread the real stack length', () => {
+  it('(2<<8)|5 derives state 5 — the 1-byte 0x00 OR 0x05, not a length-mismatch abort', () => {
+    // Pre-fix this THREW (OP_OR: same length) because (2<<8) re-minimised to the
+    // empty encoding of 0; on-chain OP_LSHIFT leaves a 1-byte 0x00 -> OR 0x05 = 5.
+    expect(chainedShiftThen('|', 2n, 5n)).toBe(5n);
+  });
+
+  it('((1<<8)&0) aborts (length mismatch) — matching the deployed OP_AND', () => {
+    // Pre-fix this returned 0 (0 & 0), so the SDK derived a state the chain can
+    // never produce (OP_AND([0x00],[]) aborts). It must abort here too.
+    expect(() => chainedShiftThen('&', 1n, 0n)).toThrow(/same length/);
+  });
+
+  it('(2<<8)&256 succeeds — both operands are 2 bytes on-chain', () => {
+    // (2<<8) -> [0x00] is 1 byte; 256 -> [0x00,0x01] is 2 bytes: mismatch -> abort.
+    expect(() => chainedShiftThen('&', 2n, 256n)).toThrow(/same length/);
+    // (256<<8) -> [0x00,0x00] (2 bytes) AND 256 -> [0x00,0x01] (2 bytes) = [0x00,0x00] = 0.
+    expect(chainedShiftThen('&', 256n, 256n)).toBe(0n);
+  });
+});

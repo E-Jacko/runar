@@ -13,6 +13,7 @@ package runar
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 )
 
@@ -151,5 +152,159 @@ func TestExecuteStrict_ShiftBitwise_AbortSurfacesAsError(t *testing.T) {
 	}
 	if _, ok := err.(*ScriptOpcodeError); !ok {
 		t.Fatalf("expected *ScriptOpcodeError, got %T (%v)", err, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CHAINED byte-op semantics (issue: shift/bitwise results are fixed-length,
+// possibly NON-minimal byte arrays on-chain; a chained length-sensitive op
+// must see that real length, not the re-minimised numeric value).
+//
+// A single op on minimal operands was already correct (truth-table tests
+// above). These pin the interpreter's per-binding side-map threading so a
+// shift/bitwise RESULT feeding another `& | ^ << >> ~` matches the deployed
+// script. Mirrors the TS reference (packages/runar-sdk/src/anf-interpreter.ts
+// `scriptBytes` side map + packages/runar-testing/src/vm/utils.ts
+// scriptNumber*Bytes helpers).
+// ---------------------------------------------------------------------------
+
+// sbConst builds a load_const binding whose value is the decimal string `val`.
+func sbConst(name, val string) ANFBinding {
+	return ANFBinding{Name: name, Value: map[string]interface{}{"kind": "load_const", "value": val}}
+}
+
+// sbBin builds a numeric bin_op binding (result_type "bigint").
+func sbBin(name, op, left, right string) ANFBinding {
+	return ANFBinding{Name: name, Value: map[string]interface{}{
+		"kind": "bin_op", "op": op, "left": left, "right": right, "result_type": "bigint",
+	}}
+}
+
+// sbUn builds a numeric unary_op binding (result_type "bigint").
+func sbUn(name, op, operand string) ANFBinding {
+	return ANFBinding{Name: name, Value: map[string]interface{}{
+		"kind": "unary_op", "op": op, "operand": operand, "result_type": "bigint",
+	}}
+}
+
+// sbUpd builds an update_prop binding writing binding `val` to property `prop`.
+func sbUpd(name, prop, val string) ANFBinding {
+	return ANFBinding{Name: name, Value: map[string]interface{}{
+		"kind": "update_prop", "name": prop, "value": val,
+	}}
+}
+
+// sbProgram wraps a method body around a single mutable property "out".
+func sbProgram(body []ANFBinding) *ANFProgram {
+	return &ANFProgram{
+		ContractName: "Chained",
+		Properties:   []ANFProperty{{Name: "out", Type: "bigint", Readonly: false}},
+		Methods: []ANFMethod{{
+			Name: "run", IsPublic: true, Params: []ANFParam{}, Body: body,
+		}},
+	}
+}
+
+// TestAnfInterpreter_ChainedByteOps_Values pins the value results of chained
+// shift/bitwise expressions where an intermediate is a non-minimal byte array.
+func TestAnfInterpreter_ChainedByteOps_Values(t *testing.T) {
+	cases := []struct {
+		name string
+		body []ANFBinding
+		want int64
+	}{
+		{
+			// (2<<8)|5: 2<<8 leaves the 1-byte [0x00]; OP_OR([0x00],[0x05])=
+			// [0x05] => 5. A re-minimising interpreter would OR empty|[0x05]
+			// and abort on the length mismatch.
+			name: "(2<<8)|5 == 5",
+			body: []ANFBinding{
+				sbConst("t0", "2"),
+				sbConst("t1", "8"),
+				sbBin("t2", "<<", "t0", "t1"),
+				sbConst("t3", "5"),
+				sbBin("t4", "|", "t2", "t3"),
+				sbUpd("t5", "out", "t4"),
+			},
+			want: 5,
+		},
+		{
+			// ~(2<<8): invert the 1-byte [0x00] -> [0xff] => -127 decoded.
+			name: "~(2<<8) == -127",
+			body: []ANFBinding{
+				sbConst("t0", "2"),
+				sbConst("t1", "8"),
+				sbBin("t2", "<<", "t0", "t1"),
+				sbUn("t3", "~", "t2"),
+				sbUpd("t4", "out", "t3"),
+			},
+			want: -127,
+		},
+		{
+			// (256<<8)&256: 256<<8 within 2 bytes = [0x01,0x00] (=1); AND with
+			// encode(256)=[0x00,0x01] => [0x00,0x00] => 0. Both 2 bytes, so no
+			// abort — but the numeric values (1 & 256) would give 0 too here;
+			// the point is the byte path agrees and does NOT abort.
+			name: "(256<<8)&256 == 0",
+			body: []ANFBinding{
+				sbConst("t0", "256"),
+				sbConst("t1", "8"),
+				sbBin("t2", "<<", "t0", "t1"),
+				sbConst("t3", "256"),
+				sbBin("t4", "&", "t2", "t3"),
+				sbUpd("t5", "out", "t4"),
+			},
+			want: 0,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			state, err := ComputeNewState(
+				sbProgram(c.body), "run",
+				map[string]interface{}{"out": big.NewInt(0)},
+				map[string]interface{}{}, nil,
+			)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got, ok := state["out"].(*big.Int)
+			if !ok {
+				t.Fatalf("expected *big.Int state[out], got %T (%v)", state["out"], state["out"])
+			}
+			if got.Cmp(bi(c.want)) != 0 {
+				t.Errorf("%s = %s, want %d", c.name, got, c.want)
+			}
+		})
+	}
+}
+
+// TestAnfInterpreter_ChainedByteOps_Abort pins the funds-loss case: on-chain
+// `(1<<8)&0` is OP_AND([0x00], []) — a length mismatch that ABORTS. A buggy
+// interpreter that re-minimises the shift result to 0 would compute `0 & 0 =
+// 0` and report the spend as valid off-chain while the chain rejects it.
+func TestAnfInterpreter_ChainedByteOps_Abort(t *testing.T) {
+	body := []ANFBinding{
+		sbConst("t0", "1"),
+		sbConst("t1", "8"),
+		sbBin("t2", "<<", "t0", "t1"),
+		sbConst("t3", "0"),
+		sbBin("t4", "&", "t2", "t3"),
+		sbUpd("t5", "out", "t4"),
+	}
+	_, err := ComputeNewState(
+		sbProgram(body), "run",
+		map[string]interface{}{"out": big.NewInt(0)},
+		map[string]interface{}{}, nil,
+	)
+	if err == nil {
+		t.Fatalf("expected an ABORT error for (1<<8)&0 length mismatch, got nil")
+	}
+	se, ok := err.(*ScriptOpcodeError)
+	if !ok {
+		t.Fatalf("expected *ScriptOpcodeError, got %T (%v)", err, err)
+	}
+	if se.Opcode != "OP_AND" || !strings.Contains(se.Message, "same length") {
+		t.Errorf("expected OP_AND same-length abort, got %q: %q", se.Opcode, se.Message)
 	}
 }

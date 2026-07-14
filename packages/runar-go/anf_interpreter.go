@@ -503,8 +503,14 @@ func runMethod(
 		}
 	}()
 
-	// Walk bindings
-	anfEvalBindings(anf, method.Body, env, stateDelta, &dataOutputs, &rawOutputs, strict, fixture)
+	// Walk bindings. `scriptBytes` is the per-binding side map of raw stack
+	// bytes for byte-array-op results (& | ^ << >> ~), keyed by binding name;
+	// it lets a chained op read the real (possibly non-minimal) length of a
+	// prior op's result instead of re-minimizing its numeric value. `env`
+	// stays pure (decoded *big.Int values) so state serialization is
+	// unaffected. See anfEvalValue's bin_op/unary_op cases.
+	scriptBytes := make(map[string][]byte)
+	anfEvalBindings(anf, method.Body, env, stateDelta, &dataOutputs, &rawOutputs, strict, fixture, scriptBytes)
 
 	// Merge delta into current state
 	result := make(map[string]interface{})
@@ -530,9 +536,13 @@ func anfEvalBindings(
 	rawOutputs *[]ContractOutput,
 	strict *strictCtx,
 	fixture *InterpreterFixture,
+	// scriptBytes carries raw stack bytes for byte-array-op results (& | ^
+	// << >> ~) keyed by binding name, so a chained op reads a prior op's real
+	// (possibly non-minimal) length instead of re-minimizing its value.
+	scriptBytes map[string][]byte,
 ) {
 	for _, binding := range bindings {
-		val := anfEvalValue(anf, binding.Value, env, stateDelta, dataOutputs, rawOutputs, strict, fixture, binding.Name)
+		val := anfEvalValue(anf, binding.Value, env, stateDelta, dataOutputs, rawOutputs, strict, fixture, binding.Name, scriptBytes)
 		env[binding.Name] = val
 	}
 }
@@ -547,6 +557,7 @@ func anfEvalValue(
 	strict *strictCtx,
 	fixture *InterpreterFixture,
 	bindingName string,
+	scriptBytes map[string][]byte,
 ) interface{} {
 	kind, _ := value["kind"].(string)
 
@@ -572,12 +583,52 @@ func anfEvalValue(
 		leftName, _ := value["left"].(string)
 		rightName, _ := value["right"].(string)
 		resultType, _ := value["result_type"].(string)
+		// Numeric byte-array ops (& | ^ << >>) thread the operands' real stack
+		// bytes so chained expressions match the deployed script: a shift/
+		// bitwise result can be non-minimal (e.g. `2 << 8` leaves a 1-byte
+		// 0x00), and the next length-sensitive op must see that. An operand's
+		// bytes are the side-map entry if present, else the minimal encoding
+		// of its numeric value. ByteString ops (result_type 'bytes' / hex
+		// operands) fall through to anfEvalBinOp's minimal-operand path.
+		if anfIsNumericByteOp(op, resultType, env[leftName], env[rightName]) {
+			ab, ok := scriptBytes[leftName]
+			if !ok {
+				ab = anfScriptNumEncode(anfToBigInt(env[leftName]))
+			}
+			var rb []byte
+			if op == "<<" || op == ">>" {
+				// Shift count is read as a number on-chain — only `ab`'s
+				// length is significant, so the count operand's bytes are
+				// never consulted.
+				rb = anfScriptNumShiftBytes(op, ab, anfToBigInt(env[rightName]))
+			} else {
+				bb, okr := scriptBytes[rightName]
+				if !okr {
+					bb = anfScriptNumEncode(anfToBigInt(env[rightName]))
+				}
+				rb = anfScriptNumBitwiseBytes(op, ab, bb)
+			}
+			scriptBytes[bindingName] = rb
+			return anfBin2numBigInt(hex.EncodeToString(rb))
+		}
 		return anfEvalBinOp(op, env[leftName], env[rightName], resultType)
 
 	case "unary_op":
 		op, _ := value["op"].(string)
 		operandName, _ := value["operand"].(string)
 		resultType, _ := value["result_type"].(string)
+		// OP_INVERT threads the operand's real stack bytes too (length-
+		// preserving), so `~(2 << 8)` inverts the 1-byte 0x00 to 0xff (=-127
+		// decoded), not the minimal encoding of 0.
+		if op == "~" && resultType != "bytes" && !isHexString(env[operandName]) {
+			ab, ok := scriptBytes[operandName]
+			if !ok {
+				ab = anfScriptNumEncode(anfToBigInt(env[operandName]))
+			}
+			rb := anfScriptNumInvertBytes(ab)
+			scriptBytes[bindingName] = rb
+			return anfBin2numBigInt(hex.EncodeToString(rb))
+		}
 		return anfEvalUnaryOp(op, env[operandName], resultType)
 
 	case "call":
@@ -635,8 +686,11 @@ func anfEvalValue(
 							callEnv[param.Name] = argVals[j]
 						}
 					}
-					// Evaluate method body
-					anfEvalBindings(anf, m.Body, callEnv, stateDelta, dataOutputs, rawOutputs, strict, fixture)
+					// Evaluate method body. A private method is a fresh stack
+					// frame, so it starts with an empty side map (matching the
+					// TS reference, which passes no scriptBytes across the
+					// method-call boundary).
+					anfEvalBindings(anf, m.Body, callEnv, stateDelta, dataOutputs, rawOutputs, strict, fixture, make(map[string][]byte))
 					// Copy updated property values back to caller env
 					for _, prop := range anf.Properties {
 						if v, ok := callEnv[prop.Name]; ok {
@@ -667,7 +721,7 @@ func anfEvalValue(
 		for k, v := range env {
 			childEnv[k] = v
 		}
-		anfEvalBindings(anf, branch, childEnv, stateDelta, dataOutputs, rawOutputs, strict, fixture)
+		anfEvalBindings(anf, branch, childEnv, stateDelta, dataOutputs, rawOutputs, strict, fixture, scriptBytes)
 		// Copy new bindings back
 		for k, v := range childEnv {
 			env[k] = v
@@ -699,7 +753,7 @@ func anfEvalValue(
 			for k, v := range env {
 				loopEnv[k] = v
 			}
-			anfEvalBindings(anf, body, loopEnv, stateDelta, dataOutputs, rawOutputs, strict, fixture)
+			anfEvalBindings(anf, body, loopEnv, stateDelta, dataOutputs, rawOutputs, strict, fixture, scriptBytes)
 			for k, v := range loopEnv {
 				env[k] = v
 			}
@@ -1712,12 +1766,43 @@ func scriptOpcodeName(op string) string {
 	return op
 }
 
-// anfScriptNumBitwise implements OP_AND/OP_OR/OP_XOR on two script-number-
-// valued bigints. Panics with *ScriptOpcodeError on operand length
-// mismatch, exactly like the on-chain opcodes.
-func anfScriptNumBitwise(op string, a, b *big.Int) *big.Int {
-	av := anfScriptNumEncode(a)
-	bv := anfScriptNumEncode(b)
+// anfIsNumericByteOp reports whether a `bin_op` should evaluate through the
+// byte-threading path rather than anfEvalBinOp's minimal-operand path. It is
+// true exactly when the operator is one of the byte-array ops (& | ^ << >>)
+// AND the operands are numeric (not a ByteString: result_type is not 'bytes'
+// and the operands are not both hex strings). This mirrors the routing
+// anfEvalBinOp already uses to distinguish numeric from ByteString bitwise
+// ops, so the byte-threading path replaces exactly the single-op
+// anfScriptNumBitwise/anfScriptNumShift calls without changing the
+// numeric-vs-bytes classification.
+func anfIsNumericByteOp(op, resultType string, left, right interface{}) bool {
+	switch op {
+	case "&", "|", "^", "<<", ">>":
+	default:
+		return false
+	}
+	if resultType == "bytes" {
+		return false
+	}
+	if isHexString(left) && isHexString(right) {
+		return false
+	}
+	return true
+}
+
+// The *Bytes helpers operate on RAW stack bytes (the exact byte array a value
+// would occupy on the deployed script's stack), NOT a value's minimal
+// encoding. This matters for CHAINED expressions: a shift/bitwise result can
+// be a non-minimal byte array (e.g. `2 << 8` leaves a 1-byte 0x00), and
+// feeding it to a length-sensitive `& | ^`/shift must see that real length to
+// agree with the deployed script. The interpreter threads these bytes via a
+// per-binding side map (see anfEvalValue); values from other sources are
+// minimal on-chain, so their bytes come from anfScriptNumEncode.
+
+// anfScriptNumBitwiseBytes implements OP_AND/OP_OR/OP_XOR on raw stack bytes.
+// Panics with *ScriptOpcodeError on operand length mismatch, exactly like the
+// on-chain opcodes.
+func anfScriptNumBitwiseBytes(op string, av, bv []byte) []byte {
 	if len(av) != len(bv) {
 		panic(&ScriptOpcodeError{Opcode: scriptOpcodeName(op), Message: "operands must be same length"})
 	}
@@ -1732,32 +1817,33 @@ func anfScriptNumBitwise(op string, a, b *big.Int) *big.Int {
 			out[i] = av[i] ^ bv[i]
 		}
 	}
-	return anfBin2numBigInt(hex.EncodeToString(out))
+	return out
 }
 
-// anfScriptNumInvert implements OP_INVERT: flip every bit of the operand's
-// minimal script-number bytes.
-func anfScriptNumInvert(a *big.Int) *big.Int {
-	av := anfScriptNumEncode(a)
+// anfScriptNumInvertBytes implements OP_INVERT: flip every bit of the raw
+// stack bytes (length-preserving).
+func anfScriptNumInvertBytes(av []byte) []byte {
 	out := make([]byte, len(av))
 	for i := range av {
 		out[i] = ^av[i]
 	}
-	return anfBin2numBigInt(hex.EncodeToString(out))
+	return out
 }
 
-// anfScriptNumShift implements OP_LSHIFT/OP_RSHIFT: shift the operand's
-// bytes as a big-endian bit string, preserving byte length (LSHIFT masks
-// off overflow MSBs). Panics with *ScriptOpcodeError on a negative shift
-// count, exactly like the on-chain opcodes.
-func anfScriptNumShift(op string, a, shift *big.Int) *big.Int {
+// anfScriptNumShiftBytes implements OP_LSHIFT/OP_RSHIFT on raw stack bytes as
+// a big-endian bit string, preserving byte length (LSHIFT masks off overflow
+// MSBs). `shift` is the numeric shift count — read as a number on-chain, so
+// only `val`'s bytes are length-significant. Panics with *ScriptOpcodeError on
+// a negative shift count, exactly like the on-chain opcodes.
+func anfScriptNumShiftBytes(op string, val []byte, shift *big.Int) []byte {
 	if shift.Sign() < 0 {
 		panic(&ScriptOpcodeError{Opcode: scriptOpcodeName(op), Message: "negative shift"})
 	}
-	val := anfScriptNumEncode(a)
 	n := shift.Int64()
 	if len(val) == 0 || n == 0 {
-		return anfBin2numBigInt(hex.EncodeToString(val))
+		out := make([]byte, len(val))
+		copy(out, val)
+		return out
 	}
 
 	num := new(big.Int)
@@ -1780,6 +1866,32 @@ func anfScriptNumShift(op string, a, shift *big.Int) *big.Int {
 		out[i] = byte(new(big.Int).And(num, big.NewInt(0xff)).Int64())
 		num.Rsh(num, 8)
 	}
+	return out
+}
+
+// anfScriptNumBitwise implements OP_AND/OP_OR/OP_XOR on two script-number-
+// valued bigints (minimal operands). Panics with *ScriptOpcodeError on
+// operand length mismatch, exactly like the on-chain opcodes. Used by
+// anfEvalBinOp's single-op path; the interpreter's chained path uses
+// anfScriptNumBitwiseBytes directly so it can thread non-minimal intermediates.
+func anfScriptNumBitwise(op string, a, b *big.Int) *big.Int {
+	out := anfScriptNumBitwiseBytes(op, anfScriptNumEncode(a), anfScriptNumEncode(b))
+	return anfBin2numBigInt(hex.EncodeToString(out))
+}
+
+// anfScriptNumInvert implements OP_INVERT: flip every bit of the operand's
+// minimal script-number bytes.
+func anfScriptNumInvert(a *big.Int) *big.Int {
+	out := anfScriptNumInvertBytes(anfScriptNumEncode(a))
+	return anfBin2numBigInt(hex.EncodeToString(out))
+}
+
+// anfScriptNumShift implements OP_LSHIFT/OP_RSHIFT: shift the operand's
+// minimal bytes as a big-endian bit string, preserving byte length (LSHIFT
+// masks off overflow MSBs). Panics with *ScriptOpcodeError on a negative shift
+// count, exactly like the on-chain opcodes.
+func anfScriptNumShift(op string, a, shift *big.Int) *big.Int {
+	out := anfScriptNumShiftBytes(op, anfScriptNumEncode(a), shift)
 	return anfBin2numBigInt(hex.EncodeToString(out))
 }
 

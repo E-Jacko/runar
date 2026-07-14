@@ -29,9 +29,11 @@ import type {
 } from 'runar-ir-schema';
 import {
   hexToBytes,
-  scriptNumberBitwise,
-  scriptNumberInvert,
-  scriptNumberShift,
+  encodeScriptNumber,
+  decodeScriptNumber,
+  scriptNumberBitwiseBytes,
+  scriptNumberInvertBytes,
+  scriptNumberShiftBytes,
 } from '../vm/utils.js';
 
 // ---------------------------------------------------------------------------
@@ -39,7 +41,15 @@ import {
 // ---------------------------------------------------------------------------
 
 export type RunarValue =
-  | { kind: 'bigint'; value: bigint }
+  // `scriptBytes`, when present, is the EXACT byte array this value would occupy
+  // on the deployed script's stack. It is set ONLY by the byte-array ops
+  // (`<< >> & | ^ ~`), whose results can be non-minimal (e.g. `2 << 8` leaves a
+  // 1-byte 0x00). A subsequent length-sensitive `& | ^`/shift must see that real
+  // length to agree with the deployed script, so those ops thread `scriptBytes`.
+  // Absent means "derive the minimal encoding of `value`" — correct for values
+  // from every other source (literals, arithmetic, loads), which are minimal
+  // on-chain. Never read `scriptBytes` for non-byte ops; only `value` matters there.
+  | { kind: 'bigint'; value: bigint; scriptBytes?: Uint8Array }
   | { kind: 'boolean'; value: boolean }
   | { kind: 'bytes'; value: Uint8Array }
   | { kind: 'void' };
@@ -490,16 +500,27 @@ export class RunarInterpreter {
           return { kind: 'bigint', value: left.value % right.value };
         }
         // Bitwise/shift are byte-array Script ops (OP_AND/OP_OR/OP_XOR/
-        // OP_LSHIFT/OP_RSHIFT operate on the operands' script-number bytes, not
-        // their numeric value), so match the deployed script exactly rather
-        // than using native bigint semantics. See vm/utils scriptNumber* + spec.
+        // OP_LSHIFT/OP_RSHIFT operate on the operands' stack BYTES, not their
+        // numeric value). Thread the exact stack bytes so chained expressions
+        // agree with the deployed script byte-for-byte (a shift/bitwise result
+        // can be non-minimal, and feeds the next op's length check). Operands
+        // from other sources are minimal on-chain -> derive minimal bytes.
         case '&':
         case '|':
-        case '^':
-          return { kind: 'bigint', value: scriptNumberBitwise(op, left.value, right.value) };
+        case '^': {
+          const ab = left.scriptBytes ?? encodeScriptNumber(left.value);
+          const bb = right.scriptBytes ?? encodeScriptNumber(right.value);
+          const rb = scriptNumberBitwiseBytes(op, ab, bb);
+          return { kind: 'bigint', value: decodeScriptNumber(rb), scriptBytes: rb };
+        }
         case '<<':
-        case '>>':
-          return { kind: 'bigint', value: scriptNumberShift(op, left.value, right.value) };
+        case '>>': {
+          // The shift count is read as a number on-chain, so only the left
+          // operand's bytes are length-significant.
+          const ab = left.scriptBytes ?? encodeScriptNumber(left.value);
+          const rb = scriptNumberShiftBytes(op, ab, right.value);
+          return { kind: 'bigint', value: decodeScriptNumber(rb), scriptBytes: rb };
+        }
         case '===': return { kind: 'boolean', value: left.value === right.value };
         case '!==': return { kind: 'boolean', value: left.value !== right.value };
         case '<': return { kind: 'boolean', value: left.value < right.value };
@@ -563,9 +584,12 @@ export class RunarInterpreter {
         if (operand.kind !== 'bigint') {
           throw new Error(`Cannot bitwise-not ${operand.kind}`);
         }
-        // OP_INVERT flips the bits of the operand's script-number bytes, not
-        // the numeric two's-complement ~n. Match the deployed script.
-        return { kind: 'bigint', value: scriptNumberInvert(operand.value) };
+        // OP_INVERT flips the bits of the operand's stack bytes (length-
+        // preserving), not the numeric two's-complement ~n. Thread the exact
+        // bytes so a chained invert of a non-minimal intermediate stays faithful.
+        const ab = operand.scriptBytes ?? encodeScriptNumber(operand.value);
+        const rb = scriptNumberInvertBytes(ab);
+        return { kind: 'bigint', value: decodeScriptNumber(rb), scriptBytes: rb };
       }
     }
   }

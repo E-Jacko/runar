@@ -314,10 +314,15 @@ function evalBindings(
   rawOutputs: RawOutputEntry[],
   anf?: ANFProgram,
   strict: StrictCtx | null = null,
+  // Per-binding raw stack bytes for byte-array-op results (& | ^ << >> ~). Keyed
+  // by binding name; lets a chained op read the real (possibly non-minimal)
+  // length of a prior op's result instead of re-minimizing its numeric value.
+  // `env` stays pure (decoded values) so state serialization is unaffected.
+  scriptBytes: Record<string, number[]> = {},
 ): void {
   for (const binding of bindings) {
     const val = evalValue(
-      binding.value, env, stateDelta, dataOutputs, rawOutputs, anf, strict, binding.name,
+      binding.value, env, stateDelta, dataOutputs, rawOutputs, anf, strict, binding.name, scriptBytes,
     );
     env[binding.name] = val;
   }
@@ -332,6 +337,7 @@ function evalValue(
   anf?: ANFProgram,
   strict: StrictCtx | null = null,
   bindingName: string = '<anonymous>',
+  scriptBytes: Record<string, number[]> = {},
 ): unknown {
   switch (value.kind) {
     case 'load_param':
@@ -349,16 +355,48 @@ function evalValue(
       return v;
     }
 
-    case 'bin_op':
+    case 'bin_op': {
+      // Numeric byte-array ops (& | ^ << >>) thread the operands' real stack
+      // bytes so chained expressions match the deployed script (a shift/bitwise
+      // result can be non-minimal; the next length-sensitive op must see that).
+      // ByteString ops (result_type 'bytes' / string operands) fall through to
+      // evalBinOp, which keeps the minimal-operand path for everything else.
+      const isNumericByteOp =
+        (value.op === '&' || value.op === '|' || value.op === '^' ||
+          value.op === '<<' || value.op === '>>') &&
+        value.result_type !== 'bytes' &&
+        typeof env[value.left] !== 'string' &&
+        typeof env[value.right] !== 'string';
+      if (isNumericByteOp) {
+        const ab = scriptBytes[value.left] ?? minimalScriptNumberBytes(toBigInt(env[value.left]));
+        let rb: number[];
+        if (value.op === '<<' || value.op === '>>') {
+          // Shift count is read as a number on-chain — only `ab`'s length matters.
+          rb = scriptNumberShiftBytes(value.op, ab, toBigInt(env[value.right]));
+        } else {
+          const bb = scriptBytes[value.right] ?? minimalScriptNumberBytes(toBigInt(env[value.right]));
+          rb = scriptNumberBitwiseBytes(value.op as '&' | '|' | '^', ab, bb);
+        }
+        scriptBytes[bindingName] = rb;
+        return decodeScriptNumber(Utils.toHex(rb));
+      }
       return evalBinOp(
         value.op,
         env[value.left],
         env[value.right],
         value.result_type,
       );
+    }
 
-    case 'unary_op':
+    case 'unary_op': {
+      if (value.op === '~' && value.result_type !== 'bytes' && typeof env[value.operand] !== 'string') {
+        const ab = scriptBytes[value.operand] ?? minimalScriptNumberBytes(toBigInt(env[value.operand]));
+        const rb = scriptNumberInvertBytes(ab);
+        scriptBytes[bindingName] = rb;
+        return decodeScriptNumber(Utils.toHex(rb));
+      }
       return evalUnaryOp(value.op, env[value.operand], value.result_type);
+    }
 
     case 'call': {
       // Strict mode: a `call(assert, x)` lowering path must enforce the
@@ -393,7 +431,7 @@ function evalValue(
       const branch = isTruthy(cond) ? value.then : value.else;
       // Create a child env for the branch
       const childEnv = { ...env };
-      evalBindings(branch, childEnv, stateDelta, dataOutputs, rawOutputs, anf, strict);
+      evalBindings(branch, childEnv, stateDelta, dataOutputs, rawOutputs, anf, strict, scriptBytes);
       // Copy any new bindings back (the last binding is typically the branch result)
       Object.assign(env, childEnv);
       // Return the last binding's value from the branch
@@ -413,7 +451,7 @@ function evalValue(
       for (let i = 0; i < count; i++) {
         env[iterVar] = start + BigInt(i) * step;
         const loopEnv = { ...env };
-        evalBindings(body, loopEnv, stateDelta, dataOutputs, rawOutputs, anf, strict);
+        evalBindings(body, loopEnv, stateDelta, dataOutputs, rawOutputs, anf, strict, scriptBytes);
         // Copy loop bindings back
         Object.assign(env, loopEnv);
         if (body.length > 0) {
@@ -546,11 +584,16 @@ function minimalScriptNumberBytes(n: bigint): number[] {
   return bytes;
 }
 
-/** OP_AND/OP_OR/OP_XOR on two script-number-valued bigints. Throws on length
- *  mismatch, exactly like the on-chain opcodes. */
-function scriptNumberBitwise(op: '&' | '|' | '^', a: bigint, b: bigint): bigint {
-  const av = minimalScriptNumberBytes(a);
-  const bv = minimalScriptNumberBytes(b);
+// The *Bytes helpers operate on RAW stack bytes (the exact byte array a value
+// would occupy on the deployed script's stack), NOT a value's minimal encoding.
+// This matters for CHAINED expressions: a shift/bitwise RESULT can be a
+// non-minimal byte array (e.g. `2 << 8` leaves a 1-byte 0x00), and feeding it to
+// a length-sensitive `& | ^`/shift must see that real length to agree with the
+// deployed script. The interpreter threads these bytes via a per-binding side
+// map (see `evalBindings`); values from other sources are minimal on-chain.
+
+/** OP_AND/OP_OR/OP_XOR on raw stack bytes. Throws on length mismatch. */
+function scriptNumberBitwiseBytes(op: '&' | '|' | '^', av: number[], bv: number[]): number[] {
   if (av.length !== bv.length) {
     const name = op === '&' ? 'OP_AND' : op === '|' ? 'OP_OR' : 'OP_XOR';
     throw new Error(`${name}: operands must be same length`);
@@ -561,26 +604,23 @@ function scriptNumberBitwise(op: '&' | '|' | '^', a: bigint, b: bigint): bigint 
     const y = bv[i]!;
     result[i] = op === '&' ? x & y : op === '|' ? x | y : x ^ y;
   }
-  return decodeScriptNumber(Utils.toHex(result));
+  return result;
 }
 
-/** OP_INVERT: flip every bit of the operand's minimal script-number bytes. */
-function scriptNumberInvert(a: bigint): bigint {
-  const av = minimalScriptNumberBytes(a);
-  const result = av.map((b) => ~b & 0xff);
-  return decodeScriptNumber(Utils.toHex(result));
+/** OP_INVERT: flip every bit of the operand's raw stack bytes (length-preserving). */
+function scriptNumberInvertBytes(av: number[]): number[] {
+  return av.map((b) => ~b & 0xff);
 }
 
-/** OP_LSHIFT/OP_RSHIFT: shift the operand's bytes as a big-endian bit string,
- *  preserving byte length (LSHIFT masks off overflow MSBs). `shift` is the
- *  script-number shift count; negative shifts fail like the opcodes. */
-function scriptNumberShift(op: '<<' | '>>', a: bigint, shift: bigint): bigint {
+/** OP_LSHIFT/OP_RSHIFT on raw stack bytes as a big-endian bit string, preserving
+ *  byte length. `shift` is the numeric shift count (read as a number on-chain,
+ *  so only `val`'s bytes are length-significant). Negative shifts fail. */
+function scriptNumberShiftBytes(op: '<<' | '>>', val: number[], shift: bigint): number[] {
   if (shift < 0n) {
     throw new Error(op === '<<' ? 'OP_LSHIFT: negative shift' : 'OP_RSHIFT: negative shift');
   }
-  const val = minimalScriptNumberBytes(a);
   const n = Number(shift);
-  if (val.length === 0 || n === 0) return decodeScriptNumber(Utils.toHex(val));
+  if (val.length === 0 || n === 0) return val.slice();
   let num = 0n;
   for (let i = 0; i < val.length; i++) num = (num << 8n) | BigInt(val[i]!);
   if (op === '<<') {
@@ -594,7 +634,22 @@ function scriptNumberShift(op: '<<' | '>>', a: bigint, shift: bigint): bigint {
     result[i] = Number(num & 0xffn);
     num >>= 8n;
   }
-  return decodeScriptNumber(Utils.toHex(result));
+  return result;
+}
+
+// bigint -> bigint wrappers (minimal operands) — used by the single-op
+// truth-table tests. The interpreter uses the *Bytes helpers directly so it can
+// thread non-minimal chained intermediates via the side map.
+function scriptNumberBitwise(op: '&' | '|' | '^', a: bigint, b: bigint): bigint {
+  return decodeScriptNumber(Utils.toHex(scriptNumberBitwiseBytes(op, minimalScriptNumberBytes(a), minimalScriptNumberBytes(b))));
+}
+
+function scriptNumberInvert(a: bigint): bigint {
+  return decodeScriptNumber(Utils.toHex(scriptNumberInvertBytes(minimalScriptNumberBytes(a))));
+}
+
+function scriptNumberShift(op: '<<' | '>>', a: bigint, shift: bigint): bigint {
+  return decodeScriptNumber(Utils.toHex(scriptNumberShiftBytes(op, minimalScriptNumberBytes(a), shift)));
 }
 
 // ---------------------------------------------------------------------------
