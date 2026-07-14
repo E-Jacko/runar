@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { Hash, Utils } from '@bsv/sdk';
-import { buildP2PKHScript } from '../script-utils.js';
+import { buildP2PKHScript, extractConstructorArgs } from '../script-utils.js';
 
 // ---------------------------------------------------------------------------
 // buildP2PKHScript — single consolidated P2PKH script builder
@@ -70,5 +70,61 @@ describe('buildP2PKHScript', () => {
     const hash160 = Utils.toHex(Hash.hash160(Utils.toArray(pubKey, 'hex')));
 
     expect(buildP2PKHScript(pubKey)).toBe(buildP2PKHScript(hash160));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractConstructorArgs — repeated constructor-slot references
+// ---------------------------------------------------------------------------
+
+describe('extractConstructorArgs with repeated slot references', () => {
+  // A param referenced N times in the contract body emits N constructor
+  // slots. Every occurrence's encoded width shifts the offsets of everything
+  // after it, so the extractor must account for ALL occurrences — not just
+  // the first per param. Regression for a bug where slots were deduplicated
+  // by paramIndex BEFORE the offset walk, mis-reading every later slot
+  // whenever an earlier repeated value encoded wider than its 1-byte
+  // template placeholder.
+  //
+  // Template: ab <00> 7c <00> 7c <00> ac
+  //   offset 1: alpha (paramIndex 0)
+  //   offset 3: alpha again (paramIndex 0 — second reference)
+  //   offset 5: beta  (paramIndex 1)
+  // Resolved with alpha = 500n (scriptnum push `02f401`, 3 bytes) and
+  // beta = 7n (OP_7, 1 byte):
+  //   ab 02f401 7c 02f401 7c 57 ac
+  const artifact = {
+    script: 'ab' + '00' + '7c' + '00' + '7c' + '00' + 'ac',
+    constructorSlots: [
+      { paramIndex: 0, byteOffset: 1, name: 'alpha', type: 'bigint' },
+      { paramIndex: 0, byteOffset: 3, name: 'alpha', type: 'bigint' },
+      { paramIndex: 1, byteOffset: 5, name: 'beta', type: 'bigint' },
+    ],
+    abi: {
+      constructor: {
+        params: [
+          { name: 'alpha', type: 'bigint' },
+          { name: 'beta', type: 'bigint' },
+        ],
+      },
+    },
+  };
+
+  it('reads slots AFTER a repeated wide value at the correct offsets', () => {
+    const resolved = 'ab' + '02f401' + '7c' + '02f401' + '7c' + '57' + 'ac';
+    const args = extractConstructorArgs(artifact as never, resolved);
+    expect(args.alpha).toBe(500n);
+    // Before the fix, the second alpha occurrence's +2 byte shift was
+    // dropped, so beta was read from inside the second alpha push and
+    // decoded as 124n instead of 7n.
+    expect(args.beta).toBe(7n);
+  });
+
+  it('still extracts correctly when the repeated value fits its placeholder width', () => {
+    // alpha = 5n → OP_5 (1 byte, same width as the placeholder: zero shift).
+    const resolved = 'ab' + '55' + '7c' + '55' + '7c' + '57' + 'ac';
+    const args = extractConstructorArgs(artifact as never, resolved);
+    expect(args.alpha).toBe(5n);
+    expect(args.beta).toBe(7n);
   });
 });
