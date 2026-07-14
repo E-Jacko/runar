@@ -99,6 +99,16 @@ function arbNonZeroDivisorLiteral(): fc.Arbitrary<string> {
 }
 
 /**
+ * Non-negative bounded shift count (0..16). OP_LSHIFT/OP_RSHIFT abort on a
+ * negative shift, so the RHS of a generated shift is always a small
+ * non-negative literal — the shift then reaches the execution oracle with a
+ * defined result (interpreter and script share the byte-array shift semantics).
+ */
+function arbSmallShiftLiteral(): fc.Arbitrary<string> {
+  return fc.integer({ min: 0, max: 16 }).map((n) => `${n}n`);
+}
+
+/**
  * Generate a random arithmetic expression using available bigint variables.
  */
 function arbArithExpr(bigintVars: string[], depth: number): fc.Arbitrary<string> {
@@ -133,6 +143,41 @@ function arbArithExpr(bigintVars: string[], depth: number): fc.Arbitrary<string>
         arbNonZeroDivisorLiteral(),
       )
       .map(([l, op, r]) => `(${l} ${op} ${r})`),
+    // Shifts (bounded non-negative literal count) and bitwise ops. These lower
+    // to byte-array Script opcodes (OP_LSHIFT/OP_RSHIFT/OP_AND/OP_OR/OP_XOR);
+    // the interpreter now models the same byte semantics, so they reach the
+    // execution oracle in agreement — a length-mismatch `& | ^` aborts on BOTH
+    // the interpreter and the script (audit #10 / the shift-bitwise fix).
+    fc
+      .tuple(
+        arbArithExpr(bigintVars, depth - 1),
+        fc.constantFrom('<<' as const, '>>' as const),
+        arbSmallShiftLiteral(),
+      )
+      .map(([l, op, r]) => `(${l} ${op} ${r})`),
+    fc
+      .tuple(
+        arbArithExpr(bigintVars, depth - 1),
+        fc.constantFrom('&' as const, '|' as const, '^' as const),
+        arbArithExpr(bigintVars, depth - 1),
+      )
+      .map(([l, op, r]) => `(${l} ${op} ${r})`),
+    // Chained byte-ops: a shift RESULT (fixed-length, possibly NON-minimal on
+    // chain — e.g. `2 << 8` leaves a 1-byte 0x00) feeding a length-sensitive
+    // `& | ^`. This is the exact shape whose interpreter-vs-script divergence
+    // audit #10 (chained byte-op length) fixed — the interpreter now threads the
+    // real stack bytes so both engines agree (compute together, or abort together
+    // on length mismatch). A dedicated arm keeps the execution-fuzz corpus
+    // sampling this shape reliably; the generic oneof rarely nests a shift under
+    // a bitwise at the small fixed-seed corpus the PR CI gate uses.
+    fc
+      .tuple(
+        arbArithExpr(bigintVars, depth - 1),
+        arbSmallShiftLiteral(),
+        fc.constantFrom('&' as const, '|' as const, '^' as const),
+        arbArithExpr(bigintVars, depth - 1),
+      )
+      .map(([l, k, op, r]) => `(((${l}) << ${k}) ${op} (${r}))`),
   );
 }
 

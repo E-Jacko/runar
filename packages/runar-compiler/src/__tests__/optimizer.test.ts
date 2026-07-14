@@ -148,35 +148,27 @@ describe('Optimizer: Constant Folding', () => {
       }
     });
 
-    it('folds left shift', () => {
+    it('does NOT fold shifts (OP_LSHIFT/OP_RSHIFT are byte-array ops)', () => {
+      // Bitcoin Script's OP_LSHIFT/OP_RSHIFT operate on the operands' raw
+      // script-number bytes, preserving byte length — 255 << 1 is 254 on-chain,
+      // not 510. Folding with native bigint would bake a wrong constant into
+      // the deployed script, so the folder must leave these as bin_ops for the
+      // runtime opcode (and the interpreter models the same byte semantics).
       const program = makeProgram([
         makeMethod('m', [
-          b('t0', { kind: 'load_const', value: 1n }),
-          b('t1', { kind: 'load_const', value: 3n }),
+          b('t0', { kind: 'load_const', value: 255n }),
+          b('t1', { kind: 'load_const', value: 1n }),
           b('t2', { kind: 'bin_op', op: '<<', left: 't0', right: 't1' }),
+          b('t3', { kind: 'bin_op', op: '>>', left: 't0', right: 't1' }),
         ]),
       ]);
       const folded = foldConstants(program);
-      expect(folded.methods[0]!.body[2]!.value).toEqual({ kind: 'load_const', value: 8n });
-    });
-
-    it('folds right shift for non-negative operands', () => {
-      const program = makeProgram([
-        makeMethod('m', [
-          b('t0', { kind: 'load_const', value: 16n }),
-          b('t1', { kind: 'load_const', value: 2n }),
-          b('t2', { kind: 'bin_op', op: '>>', left: 't0', right: 't1' }),
-        ]),
-      ]);
-      const folded = foldConstants(program);
-      expect(folded.methods[0]!.body[2]!.value).toEqual({ kind: 'load_const', value: 4n });
+      expect(folded.methods[0]!.body[2]!.value.kind).toBe('bin_op');
+      expect(folded.methods[0]!.body[3]!.value.kind).toBe('bin_op');
     });
 
     it('does not fold right shift with negative left operand (Fix #17)', () => {
-      // JavaScript >> is arithmetic (sign-extending) but Bitcoin Script's
-      // OP_RSHIFT is logical. The constant folder must NOT fold this case
-      // because JS (-8n >> 1n) == -4n but Bitcoin OP_RSHIFT gives a
-      // different (logical shift) result.
+      // Subsumed by the rule above, but kept as an explicit regression anchor.
       const program = makeProgram([
         makeMethod('m', [
           b('t0', { kind: 'load_const', value: -8n }),
@@ -185,11 +177,13 @@ describe('Optimizer: Constant Folding', () => {
         ]),
       ]);
       const folded = foldConstants(program);
-      // Should NOT be folded — must remain a bin_op for runtime evaluation
       expect(folded.methods[0]!.body[2]!.value.kind).toBe('bin_op');
     });
 
-    it('folds bitwise operators', () => {
+    it('does NOT fold bitwise operators (OP_AND/OP_OR/OP_XOR are byte-array ops)', () => {
+      // These require equal-length operand bytes and operate bytewise — the
+      // numeric fold (e.g. 255 & 1 == 1) disagrees with the on-chain result
+      // (255 & 1 ABORTS on a length mismatch). Never fold; emit the opcode.
       const program = makeProgram([
         makeMethod('m', [
           b('t0', { kind: 'load_const', value: 0b1100n }),
@@ -200,9 +194,9 @@ describe('Optimizer: Constant Folding', () => {
         ]),
       ]);
       const folded = foldConstants(program);
-      expect(folded.methods[0]!.body[2]!.value).toEqual({ kind: 'load_const', value: 0b1000n });
-      expect(folded.methods[0]!.body[3]!.value).toEqual({ kind: 'load_const', value: 0b1110n });
-      expect(folded.methods[0]!.body[4]!.value).toEqual({ kind: 'load_const', value: 0b0110n });
+      expect(folded.methods[0]!.body[2]!.value.kind).toBe('bin_op');
+      expect(folded.methods[0]!.body[3]!.value.kind).toBe('bin_op');
+      expect(folded.methods[0]!.body[4]!.value.kind).toBe('bin_op');
     });
   });
 
@@ -332,15 +326,17 @@ describe('Optimizer: Constant Folding', () => {
       expect(folded.methods[0]!.body[1]!.value).toEqual({ kind: 'load_const', value: -42n });
     });
 
-    it('folds bitwise complement', () => {
+    it('does NOT fold bitwise complement (OP_INVERT is a byte-array op)', () => {
+      // OP_INVERT flips the operand's script-number bytes, not native ~n
+      // (~5 is -122 on-chain, not -6). Never fold; emit the opcode.
       const program = makeProgram([
         makeMethod('m', [
-          b('t0', { kind: 'load_const', value: 0n }),
+          b('t0', { kind: 'load_const', value: 5n }),
           b('t1', { kind: 'unary_op', op: '~', operand: 't0' }),
         ]),
       ]);
       const folded = foldConstants(program);
-      expect(folded.methods[0]!.body[1]!.value).toEqual({ kind: 'load_const', value: -1n });
+      expect(folded.methods[0]!.body[1]!.value.kind).toBe('unary_op');
     });
 
     it('folds ! on bigint (zero -> true)', () => {

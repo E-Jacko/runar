@@ -451,12 +451,153 @@ RSpec.describe 'Runar::SDK::ANFInterpreter' do
     end
 
     it 'applies bitwise not' do
-      expect(mod.eval_unary_op('~', 0)).to eq(-1)
+      # OP_INVERT flips the operand's minimal script-number BYTES. 0 encodes to
+      # the empty byte string, so ~0 is 0 (not native Ruby -1). See the
+      # script-number byte-semantics block below.
+      expect(mod.eval_unary_op('~', 0)).to eq(0)
     end
 
     it 'applies bitwise not to bytes when result_type is bytes' do
       # ~0x00 = 0xff; ~0xff = 0x00
       expect(mod.eval_unary_op('~', '00ff', 'bytes')).to eq('ff00')
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Script-number byte semantics for & | ^ ~ << >>
+  #
+  # These ops lower to OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT, which
+  # operate on the operands' MINIMAL script-number BYTES, not their numeric
+  # value. The interpreter must agree with the deployed script byte-for-byte:
+  # AND/OR/XOR abort on unequal operand lengths, shifts preserve byte length and
+  # abort on negative counts, and INVERT flips each byte of the minimal
+  # encoding. Mirrors packages/runar-testing/src/vm/utils.ts scriptNumber*.
+  # ---------------------------------------------------------------------------
+
+  describe 'script-number byte semantics' do
+    it 'left-shifts on the byte string, not the numeric value' do
+      expect(mod.eval_bin_op('<<', 255, 1)).to eq(254) # NOT 510
+      expect(mod.eval_bin_op('<<', 256, 1)).to eq(512)
+      expect(mod.eval_bin_op('<<', 5, 3)).to eq(40)
+    end
+
+    it 'right-shifts on the byte string, not the numeric value' do
+      expect(mod.eval_bin_op('>>', 32, 3)).to eq(4)
+      expect(mod.eval_bin_op('>>', 255, 1)).to eq(-127)
+    end
+
+    it 'inverts the minimal script-number bytes' do
+      expect(mod.eval_unary_op('~', 5)).to eq(-122) # NOT -6
+      expect(mod.eval_unary_op('~', 255)).to eq(-32512)
+      expect(mod.eval_unary_op('~', 0)).to eq(0)
+    end
+
+    it 'AND/OR/XOR operate bytewise on equal-length operands' do
+      expect(mod.eval_bin_op('&', 5, 3)).to eq(1)
+      expect(mod.eval_bin_op('&', -1, 5)).to eq(1) # NOT 5
+    end
+
+    it 'aborts AND/OR when operand byte-lengths differ' do
+      expect { mod.eval_bin_op('&', 255, 1) }.to raise_error(/OP_AND: operands must be same length/)
+      expect { mod.eval_bin_op('|', 7, 0) }.to raise_error(/OP_OR: operands must be same length/)
+    end
+
+    it 'aborts on a negative shift count' do
+      expect { mod.eval_bin_op('<<', 5, -1) }.to raise_error(/OP_LSHIFT: negative shift/)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Chained script-number byte semantics (funds-relevant side-map threading)
+  #
+  # A single byte-array op on minimal operands is already correct. A CHAINED
+  # expression diverges: a shift/bitwise RESULT is a fixed-length, possibly
+  # NON-minimal byte array on-chain (e.g. `2 << 8` leaves a 1-byte 0x00, whose
+  # minimal encoding of 0 is empty). Feeding that result to a length-sensitive
+  # `& | ^`/shift makes a naive interpreter (which re-minimises the numeric
+  # result) decide the byte length WRONG. The interpreter threads the real
+  # stack bytes of each op's result through a per-binding side-map so a chained
+  # op reads the deployed length, not a re-minimised one. Mirrors the TS
+  # anf-interpreter scriptBytes threading.
+  # ---------------------------------------------------------------------------
+
+  describe 'chained script-number byte semantics' do
+    # Build an ANF fixture computing `(a <shift_op> amount) <bitwise_op> other`
+    # in two chained bin_op bindings — the shift result feeds the bitwise op.
+    def chained_shift_bitwise_anf(shift_op, amount, bitwise_op, other)
+      {
+        'contractName' => 'Chained',
+        'properties' => [{ 'name' => 'result', 'type' => 'bigint', 'readonly' => false }],
+        'methods' => [
+          { 'name' => 'constructor', 'params' => [], 'body' => [], 'isPublic' => false },
+          {
+            'name' => 'compute',
+            'params' => [{ 'name' => 'a', 'type' => 'bigint' }],
+            'body' => [
+              { 'name' => 't0', 'value' => { 'kind' => 'load_param', 'name' => 'a' } },
+              { 'name' => 't1', 'value' => { 'kind' => 'load_const', 'value' => amount } },
+              { 'name' => 't2', 'value' => { 'kind' => 'bin_op', 'op' => shift_op, 'left' => 't0', 'right' => 't1' } },
+              { 'name' => 't3', 'value' => { 'kind' => 'load_const', 'value' => other } },
+              { 'name' => 't4', 'value' => { 'kind' => 'bin_op', 'op' => bitwise_op, 'left' => 't2', 'right' => 't3' } },
+              { 'name' => 't5', 'value' => { 'kind' => 'update_prop', 'name' => 'result', 'value' => 't4' } },
+            ],
+            'isPublic' => true,
+          },
+        ],
+      }
+    end
+
+    # Build an ANF fixture computing `~(a <shift_op> amount)` — the shift result
+    # feeds a chained unary invert.
+    def chained_shift_invert_anf(shift_op, amount)
+      {
+        'contractName' => 'ChainedInvert',
+        'properties' => [{ 'name' => 'result', 'type' => 'bigint', 'readonly' => false }],
+        'methods' => [
+          { 'name' => 'constructor', 'params' => [], 'body' => [], 'isPublic' => false },
+          {
+            'name' => 'compute',
+            'params' => [{ 'name' => 'a', 'type' => 'bigint' }],
+            'body' => [
+              { 'name' => 't0', 'value' => { 'kind' => 'load_param', 'name' => 'a' } },
+              { 'name' => 't1', 'value' => { 'kind' => 'load_const', 'value' => amount } },
+              { 'name' => 't2', 'value' => { 'kind' => 'bin_op', 'op' => shift_op, 'left' => 't0', 'right' => 't1' } },
+              { 'name' => 't3', 'value' => { 'kind' => 'unary_op', 'op' => '~', 'operand' => 't2' } },
+              { 'name' => 't4', 'value' => { 'kind' => 'update_prop', 'name' => 'result', 'value' => 't3' } },
+            ],
+            'isPublic' => true,
+          },
+        ],
+      }
+    end
+
+    it 'threads shift-result bytes into OR: (2<<8)|5 == 5 (on-chain), not an abort' do
+      # On-chain: OP_OR([0x00],[0x05]) == [0x05] == 5. A naive re-minimise of
+      # (2<<8)=0 to the empty encoding would length-mismatch and abort.
+      new_state = mod.compute_new_state(chained_shift_bitwise_anf('<<', 8, '|', 5), 'compute', { 'result' => 0 }, { 'a' => 2 })
+      expect(new_state['result']).to eq(5)
+    end
+
+    it 'threads shift-result bytes into AND: ((1<<8)&0) aborts on length mismatch' do
+      # On-chain: OP_AND([0x00],[]) length-mismatches and aborts. A naive
+      # re-minimise (0 & 0 = 0) would silently spend — a funds-loss divergence.
+      expect do
+        mod.compute_new_state(chained_shift_bitwise_anf('<<', 8, '&', 0), 'compute', { 'result' => 0 }, { 'a' => 1 })
+      end.to raise_error(/OP_AND: operands must be same length/)
+    end
+
+    it 'threads shift-result bytes into INVERT: ~(2<<8) == -127' do
+      # On-chain: OP_INVERT([0x00]) == [0xff] == -127 (little-endian sign-mag).
+      # A naive re-minimise (~0 == 0) would give 0.
+      new_state = mod.compute_new_state(chained_shift_invert_anf('<<', 8), 'compute', { 'result' => 0 }, { 'a' => 2 })
+      expect(new_state['result']).to eq(-127)
+    end
+
+    it 'threads a 2-byte shift result into AND: (256<<8)&256 == 0' do
+      # (256<<8) on-chain is [0x01,0x00] (len 2); minimal 256 is [0x00,0x01]
+      # (len 2); AND is [0x00,0x00] == 0. Lengths match so this spends to 0.
+      new_state = mod.compute_new_state(chained_shift_bitwise_anf('<<', 8, '&', 256), 'compute', { 'result' => 0 }, { 'a' => 256 })
+      expect(new_state['result']).to eq(0)
     end
   end
 

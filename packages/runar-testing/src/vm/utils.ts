@@ -72,6 +72,109 @@ export function decodeScriptNumber(bytes: Uint8Array): bigint {
 }
 
 // ---------------------------------------------------------------------------
+// Script-number bitwise / shift semantics (byte-array ops, NOT numeric)
+// ---------------------------------------------------------------------------
+//
+// OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT operate on the RAW BYTES of
+// the operands' minimal script-number encoding, not on their numeric value
+// (spec/opcodes.md). AND/OR/XOR require equal-length operands and fail
+// otherwise; shifts treat the byte array as a big-endian bit string and
+// preserve its length. These helpers reproduce EXACTLY what ScriptVM's opcode
+// handlers do, so the interpreter (which models values as bigint) agrees with
+// the deployed script byte-for-byte. A differential fuzz test pins the two
+// together. Callers convert bigint -> minimal bytes -> byte op -> bigint.
+
+// The *Bytes helpers below operate on RAW stack bytes (the exact byte array a
+// value would occupy on the deployed script's stack), NOT on a value's minimal
+// encoding. This matters for CHAINED expressions: OP_LSHIFT/OP_RSHIFT preserve
+// their operand's byte-length and OP_AND/OP_OR/OP_XOR preserve the common
+// length, so a shift/bitwise RESULT can be a NON-minimal byte array (e.g.
+// `2 << 8` leaves a 1-byte 0x00, not the empty encoding of 0). When that result
+// feeds a length-sensitive `& | ^` (or another shift), the deployed script sees
+// the real length, so the interpreter must thread the real bytes too. Deriving
+// the minimal encoding of the numeric value per-op instead would abort where the
+// chain spends (and spend where the chain aborts) — a funds-relevant divergence.
+// The interpreter carries these bytes on shift/bitwise/invert results and passes
+// minimal encoding only for values from other sources (literals, arithmetic).
+
+/** OP_AND/OP_OR/OP_XOR on raw stack bytes. Throws on length mismatch, exactly
+ *  like the on-chain opcodes. */
+export function scriptNumberBitwiseBytes(
+  op: '&' | '|' | '^',
+  av: Uint8Array,
+  bv: Uint8Array,
+): Uint8Array {
+  if (av.length !== bv.length) {
+    const name = op === '&' ? 'OP_AND' : op === '|' ? 'OP_OR' : 'OP_XOR';
+    throw new Error(`${name}: operands must be same length`);
+  }
+  const result = new Uint8Array(av.length);
+  for (let i = 0; i < av.length; i++) {
+    const x = av[i]!;
+    const y = bv[i]!;
+    result[i] = op === '&' ? x & y : op === '|' ? x | y : x ^ y;
+  }
+  return result;
+}
+
+/** OP_INVERT: flip every bit of the operand's raw stack bytes (length-preserving). */
+export function scriptNumberInvertBytes(av: Uint8Array): Uint8Array {
+  const result = new Uint8Array(av.length);
+  for (let i = 0; i < av.length; i++) result[i] = ~av[i]! & 0xff;
+  return result;
+}
+
+/** OP_LSHIFT/OP_RSHIFT on raw stack bytes as a big-endian bit string, preserving
+ *  byte length (LSHIFT masks off overflow MSBs). `shift` is the numeric shift
+ *  count; the count operand is read as a number on-chain, so only `val`'s bytes
+ *  are length-significant. Negative shifts fail like the opcodes. */
+export function scriptNumberShiftBytes(
+  op: '<<' | '>>',
+  val: Uint8Array,
+  shift: bigint,
+): Uint8Array {
+  if (shift < 0n) {
+    throw new Error(op === '<<' ? 'OP_LSHIFT: negative shift' : 'OP_RSHIFT: negative shift');
+  }
+  const n = Number(shift);
+  if (val.length === 0 || n === 0) return new Uint8Array(val);
+  let num = 0n;
+  for (let i = 0; i < val.length; i++) num = (num << 8n) | BigInt(val[i]!);
+  if (op === '<<') {
+    const bitLen = BigInt(val.length * 8);
+    num = (num << BigInt(n)) & ((1n << bitLen) - 1n);
+  } else {
+    num >>= BigInt(n);
+  }
+  const result = new Uint8Array(val.length);
+  for (let i = val.length - 1; i >= 0; i--) {
+    result[i] = Number(num & 0xffn);
+    num >>= 8n;
+  }
+  return result;
+}
+
+// bigint -> bigint convenience wrappers: encode each operand to its MINIMAL
+// bytes, run the byte op, decode. Correct for a SINGLE op on freshly-minimal
+// operands (what the per-tier truth-table tests pin); the interpreter uses the
+// *Bytes helpers directly so it can thread non-minimal chained intermediates.
+
+/** OP_AND/OP_OR/OP_XOR on two script-number-valued bigints (minimal operands). */
+export function scriptNumberBitwise(op: '&' | '|' | '^', a: bigint, b: bigint): bigint {
+  return decodeScriptNumber(scriptNumberBitwiseBytes(op, encodeScriptNumber(a), encodeScriptNumber(b)));
+}
+
+/** OP_INVERT on a script-number-valued bigint (minimal operand). */
+export function scriptNumberInvert(a: bigint): bigint {
+  return decodeScriptNumber(scriptNumberInvertBytes(encodeScriptNumber(a)));
+}
+
+/** OP_LSHIFT/OP_RSHIFT on a script-number-valued bigint (minimal operand). */
+export function scriptNumberShift(op: '<<' | '>>', a: bigint, shift: bigint): bigint {
+  return decodeScriptNumber(scriptNumberShiftBytes(op, encodeScriptNumber(a), shift));
+}
+
+// ---------------------------------------------------------------------------
 // Stack element truthiness
 // ---------------------------------------------------------------------------
 

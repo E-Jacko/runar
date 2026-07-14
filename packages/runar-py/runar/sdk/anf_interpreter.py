@@ -614,15 +614,25 @@ def _eval_bindings(
     intent: Optional[_IntentCtx] = None,
     state_outputs: Optional[List[dict]] = None,
     continuation_taint: Optional[set] = None,
+    # Per-binding raw stack bytes for byte-array-op results (& | ^ << >> ~).
+    # Keyed by binding name; lets a chained op read the real (possibly
+    # non-minimal) length of a prior op's result instead of re-minimising its
+    # numeric value. ``env`` stays pure (decoded ints) so state serialization
+    # is unaffected. Threaded through nested if/loop branches (shared map);
+    # private-method bodies get a fresh map (see ``_eval_method_call``).
+    script_bytes: Optional[Dict[str, bytes]] = None,
 ) -> None:
     if continuation_taint is None:
         continuation_taint = set()
+    if script_bytes is None:
+        script_bytes = {}
     for binding in bindings:
         val = _eval_value(
             binding['value'], env, state_delta, data_outputs, raw_outputs, anf,
             strict=strict, binding_name=binding['name'],
             intent=intent, state_outputs=state_outputs,
             continuation_taint=continuation_taint,
+            script_bytes=script_bytes,
         )
         env[binding['name']] = val
         # Track lineage through ``computeStateOutput`` -- the synthetic call
@@ -721,9 +731,12 @@ def _eval_value(
     intent: Optional[_IntentCtx] = None,
     state_outputs: Optional[List[dict]] = None,
     continuation_taint: Optional[set] = None,
+    script_bytes: Optional[Dict[str, bytes]] = None,
 ) -> Any:
     if continuation_taint is None:
         continuation_taint = set()
+    if script_bytes is None:
+        script_bytes = {}
     kind = value.get('kind', '')
 
     if kind == 'load_param':
@@ -753,19 +766,57 @@ def _eval_value(
         return v
 
     if kind == 'bin_op':
-        return _eval_bin_op(
-            value['op'],
-            env.get(value['left']),
-            env.get(value['right']),
-            value.get('result_type'),
+        # Numeric byte-array ops (& | ^ << >>) thread the operands' real stack
+        # bytes so chained expressions match the deployed script (a shift/bitwise
+        # result can be non-minimal; the next length-sensitive op must see that).
+        # ByteString ops (result_type 'bytes' / string operands) fall through to
+        # `_eval_bin_op`, which keeps the minimal-operand path for everything else.
+        op = value['op']
+        left_ref = value['left']
+        right_ref = value['right']
+        left_val = env.get(left_ref)
+        right_val = env.get(right_ref)
+        is_numeric_byte_op = (
+            op in ('&', '|', '^', '<<', '>>')
+            and value.get('result_type') != 'bytes'
+            and not isinstance(left_val, str)
+            and not isinstance(right_val, str)
         )
+        if is_numeric_byte_op:
+            ab = (
+                script_bytes[left_ref] if left_ref in script_bytes
+                else _snum_encode(_to_int(left_val))
+            )
+            if op in ('<<', '>>'):
+                # Shift count is read as a number on-chain -- only `ab`'s length matters.
+                rb = _script_number_shift_bytes(op, ab, _to_int(right_val))
+            else:
+                bb = (
+                    script_bytes[right_ref] if right_ref in script_bytes
+                    else _snum_encode(_to_int(right_val))
+                )
+                rb = _script_number_bitwise_bytes(op, ab, bb)
+            script_bytes[binding_name] = rb
+            return _bin2num_int(rb.hex())
+        return _eval_bin_op(op, left_val, right_val, value.get('result_type'))
 
     if kind == 'unary_op':
-        return _eval_unary_op(
-            value['op'],
-            env.get(value['operand']),
-            value.get('result_type'),
-        )
+        op = value['op']
+        operand_ref = value['operand']
+        operand_val = env.get(operand_ref)
+        if (
+            op == '~'
+            and value.get('result_type') != 'bytes'
+            and not isinstance(operand_val, str)
+        ):
+            ab = (
+                script_bytes[operand_ref] if operand_ref in script_bytes
+                else _snum_encode(_to_int(operand_val))
+            )
+            rb = _script_number_invert_bytes(ab)
+            script_bytes[binding_name] = rb
+            return _bin2num_int(rb.hex())
+        return _eval_unary_op(op, operand_val, value.get('result_type'))
 
     if kind == 'call':
         call_args = [env.get(a) for a in value.get('args', [])]
@@ -801,7 +852,7 @@ def _eval_value(
         child_env = dict(env)
         _eval_bindings(
             branch, child_env, state_delta, data_outputs, raw_outputs, anf, strict,
-            intent, state_outputs, continuation_taint,
+            intent, state_outputs, continuation_taint, script_bytes,
         )
         env.update(child_env)
         if branch:
@@ -824,7 +875,7 @@ def _eval_value(
             loop_env = dict(env)
             _eval_bindings(
                 body, loop_env, state_delta, data_outputs, raw_outputs, anf, strict,
-                intent, state_outputs, continuation_taint,
+                intent, state_outputs, continuation_taint, script_bytes,
             )
             env.update(loop_env)
             if body:
@@ -963,16 +1014,14 @@ def _eval_bin_op(op: str, left: Any, right: Any, result_type: Optional[str] = No
         return _is_truthy(left) and _is_truthy(right)
     if op in ('||', 'or'):
         return _is_truthy(left) or _is_truthy(right)
-    if op == '&':
-        return l & r
-    if op == '|':
-        return l | r
-    if op == '^':
-        return l ^ r
-    if op == '<<':
-        return l << r
-    if op == '>>':
-        return l >> r
+    # Bitwise/shift on ints are byte-array Script ops: OP_AND/OP_OR/OP_XOR/
+    # OP_LSHIFT/OP_RSHIFT operate on the operands' script-number bytes, not
+    # their numeric value, so match the deployed script exactly (see the
+    # _script_number_* helpers) instead of using native int semantics.
+    if op in ('&', '|', '^'):
+        return _script_number_bitwise(op, l, r)
+    if op in ('<<', '>>'):
+        return _script_number_shift(op, l, r)
     return 0
 
 
@@ -1014,7 +1063,9 @@ def _eval_unary_op(op: str, operand: Any, result_type: Optional[str] = None) -> 
     if op in ('!', 'not'):
         return not _is_truthy(operand)
     if op == '~':
-        return ~val
+        # OP_INVERT flips the operand's script-number bytes, not native ~n
+        # (~5 is -122 on-chain, not -6). Match the deployed script.
+        return _script_number_invert(val)
     return val
 
 
@@ -1361,6 +1412,122 @@ def _bin2num_int(hex_str: str) -> int:
         result = (result << 8) | result_bytes[i]
 
     return -result if negative else result
+
+
+# ---------------------------------------------------------------------------
+# Script-number bitwise / shift semantics (byte-array ops, NOT numeric)
+# ---------------------------------------------------------------------------
+#
+# OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT operate on the RAW BYTES of
+# the operands' minimal script-number encoding, not on their numeric value
+# (spec/opcodes.md). AND/OR/XOR require equal-length operands and abort
+# otherwise; shifts treat the byte array as a big-endian bit string and
+# preserve its length. These reproduce exactly what the deployed script does,
+# so the interpreter (which models values as int) agrees with on-chain
+# execution byte-for-byte. Ported from the TS reference
+# packages/runar-testing/src/vm/utils.ts (scriptNumber* helpers); decode reuses
+# the tier's existing minimal script-number decoder (`_bin2num_int`).
+
+def _snum_encode(n: int) -> bytes:
+    """Minimal Bitcoin script-number bytes (little-endian sign-magnitude).
+
+    0 encodes to the empty byte string, matching OP_0 / an empty stack element.
+    """
+    if n == 0:
+        return b''
+    negative = n < 0
+    val = -n if negative else n
+    out = bytearray()
+    while val > 0:
+        out.append(val & 0xFF)
+        val >>= 8
+    # If the high bit of the last byte is set we need an extra sign byte.
+    if out[-1] & 0x80:
+        out.append(0x80 if negative else 0x00)
+    elif negative:
+        out[-1] |= 0x80
+    return bytes(out)
+
+
+# The *_bytes helpers operate on RAW stack bytes (the exact byte array a value
+# would occupy on the deployed script's stack), NOT a value's minimal encoding.
+# This matters for CHAINED expressions: a shift/bitwise RESULT can be a
+# non-minimal byte array (e.g. `2 << 8` leaves a 1-byte 0x00, whereas the minimal
+# encoding of 0 is empty). Feeding it to a length-sensitive `& | ^`/shift must
+# see that real length to agree with the deployed script. The interpreter threads
+# these bytes via a per-binding side map (see `_eval_bindings`); values from other
+# sources (literals, arithmetic) are minimal on-chain. Deriving the minimal
+# encoding of the numeric value per-op instead would abort where the chain spends
+# (and spend where the chain aborts) -- a funds-relevant divergence.
+
+def _script_number_bitwise_bytes(op: str, av: bytes, bv: bytes) -> bytes:
+    """OP_AND/OP_OR/OP_XOR on raw stack bytes. Raises ValueError (execution
+    abort) on a length mismatch, exactly like the on-chain opcodes."""
+    if len(av) != len(bv):
+        name = {'&': 'OP_AND', '|': 'OP_OR', '^': 'OP_XOR'}[op]
+        raise ValueError(f'{name}: operands must be same length')
+    if op == '&':
+        return bytes(x & y for x, y in zip(av, bv))
+    if op == '|':
+        return bytes(x | y for x, y in zip(av, bv))
+    return bytes(x ^ y for x, y in zip(av, bv))
+
+
+def _script_number_invert_bytes(av: bytes) -> bytes:
+    """OP_INVERT: flip every bit of the operand's raw stack bytes
+    (length-preserving)."""
+    return bytes((~x) & 0xFF for x in av)
+
+
+def _script_number_shift_bytes(op: str, val: bytes, shift: int) -> bytes:
+    """OP_LSHIFT/OP_RSHIFT on raw stack bytes as a big-endian bit string,
+    preserving byte length (LSHIFT masks off overflow MSBs). ``shift`` is the
+    numeric shift count -- read as a number on-chain, so only ``val``'s bytes are
+    length-significant. Raises ValueError (execution abort) on a negative shift,
+    like the opcodes."""
+    if shift < 0:
+        raise ValueError(
+            'OP_LSHIFT: negative shift' if op == '<<' else 'OP_RSHIFT: negative shift'
+        )
+    n = int(shift)
+    if len(val) == 0 or n == 0:
+        return bytes(val)
+    num = int.from_bytes(val, 'big')
+    if op == '<<':
+        num = (num << n) & ((1 << (len(val) * 8)) - 1)
+    else:
+        num >>= n
+    return num.to_bytes(len(val), 'big')
+
+
+# bigint -> bigint wrappers (minimal operands) -- used by the single-op truth-table
+# tests. The interpreter uses the *_bytes helpers directly so it can thread
+# non-minimal chained intermediates via the side map (see `_eval_value`).
+
+def _script_number_bitwise(op: str, a: int, b: int) -> int:
+    """OP_AND/OP_OR/OP_XOR on two script-number ints.
+
+    Raises ValueError (execution abort) on a length mismatch, exactly like the
+    on-chain opcodes.
+    """
+    result = _script_number_bitwise_bytes(op, _snum_encode(a), _snum_encode(b))
+    return _bin2num_int(result.hex())
+
+
+def _script_number_invert(a: int) -> int:
+    """OP_INVERT: flip every bit of the operand's minimal script-number bytes."""
+    return _bin2num_int(_script_number_invert_bytes(_snum_encode(a)).hex())
+
+
+def _script_number_shift(op: str, a: int, shift: int) -> int:
+    """OP_LSHIFT/OP_RSHIFT: shift the operand's bytes as a big-endian bit string,
+    preserving byte length (LSHIFT masks off overflow MSBs).
+
+    Raises ValueError (execution abort) on a negative shift, like the opcodes.
+    """
+    return _bin2num_int(
+        _script_number_shift_bytes(op, _snum_encode(a), shift).hex()
+    )
 
 
 # ---------------------------------------------------------------------------

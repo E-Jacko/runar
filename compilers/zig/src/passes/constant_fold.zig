@@ -92,21 +92,13 @@ fn evalBinOp(op: []const u8, left: ConstValue, right: ConstValue) ?ConstValue {
             .op_gt => .{ .boolean = a > b },
             .op_lte => .{ .boolean = a <= b },
             .op_gte => .{ .boolean = a >= b },
-            .op_bit_and => .{ .integer = a & b },
-            .op_bit_or => .{ .integer = a | b },
-            .op_bit_xor => .{ .integer = a ^ b },
-            .op_shl => blk: {
-                if (a < 0) break :blk null; // BSV shifts are logical
-                if (b < 0 or b > 128) break :blk null;
-                const shift: u7 = @intCast(@as(i128, @min(b, 127)));
-                break :blk .{ .integer = a << shift };
-            },
-            .op_shr => blk: {
-                if (a < 0) break :blk null; // BSV shifts are logical
-                if (b < 0 or b > 128) break :blk null;
-                const shift: u7 = @intCast(@as(i128, @min(b, 127)));
-                break :blk .{ .integer = a >> shift };
-            },
+            // OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT operate on the operands'
+            // raw script-number BYTES, not their numeric value — native
+            // folding diverges from the deployed script (e.g. 255 << 1 is 254
+            // on-chain, not 510; 255 & 1 aborts). Never fold; emit the opcode
+            // so the interpreter's byte-array semantics govern. Matches TS
+            // constant-fold + vm/utils scriptNumber*.
+            .op_bit_and, .op_bit_or, .op_bit_xor, .op_shl, .op_shr => null,
             .op_logical_and, .op_logical_or => null,
         };
     }
@@ -168,7 +160,10 @@ fn evalUnaryOp(op: []const u8, operand: ConstValue) ?ConstValue {
         const n = operand.integer;
         return switch (tag) {
             .op_negate => .{ .integer = -%n },
-            .op_bitwise_not => .{ .integer = ~n },
+            // OP_INVERT flips the operand's script-number bytes, not native
+            // ~n (~5 == -122, ~0 == 0). Never fold; emit the opcode so the
+            // interpreter's byte-array semantics govern. Matches TS.
+            .op_bitwise_not => null,
             .op_logical_not => .{ .boolean = n == 0 },
         };
     }
@@ -741,7 +736,12 @@ test "fold less-than: 3 < 5 = true" {
 
 // --- Binary operations: bitwise ---
 
-test "fold bitwise and: 0xff & 0x0f = 0x0f" {
+// Bitwise/shift ops are NEVER folded: they operate on the operands' minimal
+// script-number bytes at runtime, not their numeric value. Folding is skipped
+// so codegen emits OP_AND/OP_LSHIFT etc. (Previously these tests asserted the
+// native-integer fold results 0x0f and 256, which disagreed with the deployed
+// script — see the byte-array truth table in sdk_anf_interpreter.zig.)
+test "no-fold bitwise and: & left for the opcode (byte semantics)" {
     const allocator = testing.allocator;
     var env = ConstEnv.init(allocator);
     defer env.deinit();
@@ -753,10 +753,10 @@ test "fold bitwise and: 0xff & 0x0f = 0x0f" {
     };
     const result = try foldBindings(allocator, &bindings, &env);
     defer allocator.free(result);
-    try expectConst(.{ .integer = 0x0f }, result[2]);
+    try testing.expect(anfValueToConst(result[2].value) == null);
 }
 
-test "fold left shift: 1 << 8 = 256" {
+test "no-fold left shift: << left for the opcode (byte semantics)" {
     const allocator = testing.allocator;
     var env = ConstEnv.init(allocator);
     defer env.deinit();
@@ -768,7 +768,7 @@ test "fold left shift: 1 << 8 = 256" {
     };
     const result = try foldBindings(allocator, &bindings, &env);
     defer allocator.free(result);
-    try expectConst(.{ .integer = 256 }, result[2]);
+    try testing.expect(anfValueToConst(result[2].value) == null);
 }
 
 test "fold shift with negative left operand: skipped" {
@@ -879,7 +879,10 @@ test "fold unary not on int: !0 = true" {
     try expectConst(.{ .boolean = true }, result[1]);
 }
 
-test "fold unary bitnot: ~0 = -1" {
+// OP_INVERT flips the operand's minimal script-number bytes, so ~0 is 0
+// (encode(0) is empty; inverting nothing yields 0), NOT native -1. Never fold;
+// leave the node so codegen emits OP_INVERT. (Previously asserted -1.)
+test "no-fold unary bitnot: ~ left for the opcode (byte semantics)" {
     const allocator = testing.allocator;
     var env = ConstEnv.init(allocator);
     defer env.deinit();
@@ -890,7 +893,7 @@ test "fold unary bitnot: ~0 = -1" {
     };
     const result = try foldBindings(allocator, &bindings, &env);
     defer allocator.free(result);
-    try expectConst(.{ .integer = -1 }, result[1]);
+    try testing.expect(anfValueToConst(result[1].value) == null);
 }
 
 // --- Builtin calls ---

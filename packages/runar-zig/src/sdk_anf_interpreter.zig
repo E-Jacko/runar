@@ -168,6 +168,12 @@ pub const StrictError = error{
     /// not bind it via `MockEnv.setPrevOutScript` / `setSerialisedOutputs`.
     /// Mirrors the TS interpreter's "requires witness bytes" error.
     MissingWitness,
+    /// A bigint `& | ^` was applied to operands whose minimal script-number
+    /// encodings differ in length, or a `<< >>` used a negative shift count.
+    /// On-chain OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT abort the script in
+    /// exactly these cases; the interpreter surfaces the same failure so
+    /// off-chain simulation agrees with the deployed script byte-for-byte.
+    ScriptNumberError,
 };
 
 /// Context for strict-mode evaluation. Carries the public method name being
@@ -190,6 +196,19 @@ const StrictCtx = struct {
 const EvalCtx = struct {
     strict: ?*StrictCtx = null,
     mock_env: ?*const MockEnv = null,
+    /// Per-binding raw stack bytes for numeric byte-array-op results
+    /// (`& | ^ << >> ~`). Keyed by the producing binding's name; lets a
+    /// CHAINED op read the real (possibly NON-minimal) byte length of a prior
+    /// op's result instead of re-minimizing its numeric value. A shift/bitwise
+    /// result can be non-minimal on-chain (e.g. `2 << 8` leaves a 1-byte
+    /// `0x00`, not the empty encoding of 0); feeding it to a length-sensitive
+    /// `& | ^`/shift must see that real length to agree with the deployed
+    /// script byte-for-byte. `env` stays pure (decoded i64 values) so state
+    /// serialization is unaffected. Mirrors the `scriptBytes` side-map in
+    /// packages/runar-sdk/src/anf-interpreter.ts. Backed by the interpretation
+    /// arena (freed at arena.deinit); a FRESH map is used per private-method
+    /// body (see evalMethodCall), matching the TS reference.
+    script_bytes: *std.StringHashMap([]const u8),
 };
 
 /// Real-crypto context for `executeOnChainAuthoritative`. The 32-byte
@@ -603,7 +622,10 @@ fn runMethod(
     // mock-returning true.
     var strict_ctx_storage: StrictCtx = .{ .method_name = method_name, .real_crypto = real_crypto };
     const strict_ctx_ptr: ?*StrictCtx = if (strict) &strict_ctx_storage else null;
-    const eval_ctx: EvalCtx = .{ .strict = strict_ctx_ptr, .mock_env = mock_env };
+    // Side map for numeric byte-array-op results (see EvalCtx.script_bytes).
+    // Arena-backed — freed with everything else at arena.deinit.
+    var script_bytes_map = std.StringHashMap([]const u8).init(arena_alloc);
+    const eval_ctx: EvalCtx = .{ .strict = strict_ctx_ptr, .mock_env = mock_env, .script_bytes = &script_bytes_map };
     evalBindings(arena_alloc, meth.body, &env, &state_delta, &data_outputs_arena, &raw_outputs_arena, anf, eval_ctx) catch |err| {
         // On strict-mode AssertionFailure, populate the caller-supplied
         // out_failure_info (if any) so the driver can emit a structured
@@ -673,10 +695,10 @@ fn evalBindings(
     raw_outputs: *std.ArrayList(DataOutputEntry),
     anf: *const ANFProgram,
     eval_ctx: EvalCtx,
-) error{ OutOfMemory, AssertionFailure, MissingWitness }!void {
+) error{ OutOfMemory, AssertionFailure, MissingWitness, ScriptNumberError }!void {
     for (bindings) |binding| {
         if (eval_ctx.strict) |ctx| ctx.last_binding_name = binding.name;
-        const val = try evalNode(allocator, binding.value, env, state_delta, data_outputs, raw_outputs, anf, eval_ctx);
+        const val = try evalNode(allocator, binding.value, binding.name, env, state_delta, data_outputs, raw_outputs, anf, eval_ctx);
         try env.put(binding.name, val);
     }
 }
@@ -684,13 +706,17 @@ fn evalBindings(
 fn evalNode(
     allocator: std.mem.Allocator,
     node: ANFNode,
+    // Name of the binding this node's result is stored under. Used as the key
+    // for the byte-array-op side map (see EvalCtx.script_bytes) so a chained
+    // op can look up this result's raw stack bytes by the operand ref.
+    binding_name: []const u8,
     env: *std.StringHashMap(ANFValue),
     state_delta: *std.StringHashMap(ANFValue),
     data_outputs: *std.ArrayList(DataOutputEntry),
     raw_outputs: *std.ArrayList(DataOutputEntry),
     anf: *const ANFProgram,
     eval_ctx: EvalCtx,
-) error{ OutOfMemory, AssertionFailure, MissingWitness }!ANFValue {
+) error{ OutOfMemory, AssertionFailure, MissingWitness, ScriptNumberError }!ANFValue {
     const strict_ctx = eval_ctx.strict;
     switch (node) {
         .load_param => |lp| {
@@ -739,10 +765,45 @@ fn evalNode(
         .bin_op => |bo| {
             const left = env.get(bo.left) orelse anf_none;
             const right = env.get(bo.right) orelse anf_none;
-            return evalBinOp(allocator, bo.op, left, right, bo.result_type);
+            // Numeric byte-array ops (& | ^ << >>) thread the operands' real
+            // stack bytes so CHAINED expressions match the deployed script (a
+            // shift/bitwise result can be non-minimal; the next length-sensitive
+            // op must see that). ByteString ops (result_type 'bytes' / bytes
+            // operands) fall through to evalBinOp's minimal-operand path, which
+            // stays byte-identical for a SINGLE op on minimal operands.
+            if (isNumericByteOp(bo.op, bo.result_type, left, right)) {
+                const op_byte = bo.op[0]; // '&' '|' '^' '<' (<<) '>' (>>)
+                // Left raw bytes: prior byte-op result from the side map, else
+                // this value's minimal script-number encoding.
+                const ab: []const u8 = eval_ctx.script_bytes.get(bo.left) orelse
+                    try minimalBytesArena(allocator, toInt(left));
+                const rb: []const u8 = blk: {
+                    if (op_byte == '<' or op_byte == '>') {
+                        // Shift count is read as a number on-chain — only `ab`'s
+                        // length matters, so the count never enters the side map.
+                        break :blk try shiftBytes(allocator, op_byte, ab, toInt(right));
+                    }
+                    const bb: []const u8 = eval_ctx.script_bytes.get(bo.right) orelse
+                        try minimalBytesArena(allocator, toInt(right));
+                    break :blk try bitwiseBytes(allocator, op_byte, ab, bb);
+                };
+                try eval_ctx.script_bytes.put(binding_name, rb);
+                return .{ .int = scriptNumDecode(rb) };
+            }
+            return try evalBinOp(allocator, bo.op, left, right, bo.result_type);
         },
         .unary_op => |uo| {
             const operand = env.get(uo.operand) orelse anf_none;
+            // Numeric OP_INVERT threads raw stack bytes for chained expressions,
+            // same as the bitwise/shift ops above. Bytes-typed `~` and other
+            // unary ops use evalUnaryOp's minimal/native path (unchanged).
+            if (std.mem.eql(u8, uo.op, "~") and !std.mem.eql(u8, uo.result_type, "bytes") and operand != .bytes) {
+                const ab: []const u8 = eval_ctx.script_bytes.get(uo.operand) orelse
+                    try minimalBytesArena(allocator, toInt(operand));
+                const rb = try invertBytes(allocator, ab);
+                try eval_ctx.script_bytes.put(binding_name, rb);
+                return .{ .int = scriptNumDecode(rb) };
+            }
             return evalUnaryOp(allocator, uo.op, operand, uo.result_type);
         },
         .call => |c| {
@@ -888,10 +949,206 @@ fn evalNode(
 }
 
 // ---------------------------------------------------------------------------
+// Script-number bitwise / shift semantics (byte-array ops, NOT numeric)
+// ---------------------------------------------------------------------------
+//
+// `& | ^ ~ << >>` on bigint compile to OP_AND/OP_OR/OP_XOR/OP_INVERT/
+// OP_LSHIFT/OP_RSHIFT, which operate on the RAW BYTES of each operand's
+// minimal script-number encoding, not on its numeric value. AND/OR/XOR require
+// equal-length operands (abort otherwise); shifts treat the bytes as a
+// big-endian bit string and preserve length (LSHIFT masks off overflow MSBs).
+// These helpers reproduce what the deployed script does, so the i64-valued
+// interpreter agrees with it byte-for-byte. Mirrors
+// packages/runar-testing/src/vm/utils.ts scriptNumber*.
+
+/// Encode an i64 as minimal little-endian sign-magnitude bytes; 0 -> empty.
+/// Writes into `buf` (needs 9 bytes for the full i64 range) and returns the
+/// used sub-slice.
+fn scriptNumEncode(n: i64, buf: *[9]u8) []u8 {
+    if (n == 0) return buf[0..0];
+    const negative = n < 0;
+    // Magnitude via i128 so i64's most-negative value doesn't overflow.
+    var abs: u64 = if (negative) @intCast(-@as(i128, n)) else @intCast(n);
+    var len: usize = 0;
+    while (abs > 0) : (len += 1) {
+        buf[len] = @intCast(abs & 0xff);
+        abs >>= 8;
+    }
+    const last = buf[len - 1];
+    if (last & 0x80 != 0) {
+        buf[len] = if (negative) 0x80 else 0x00;
+        len += 1;
+    } else if (negative) {
+        buf[len - 1] = last | 0x80;
+    }
+    return buf[0..len];
+}
+
+/// Decode minimal little-endian sign-magnitude bytes to i64; empty -> 0.
+/// Accumulates in u128 so a 9-byte encoding (e.g. i64's most-negative value)
+/// never overflows a u64 shift.
+fn scriptNumDecode(bytes: []const u8) i64 {
+    if (bytes.len == 0) return 0;
+    var result: u128 = 0;
+    for (bytes, 0..) |b, i| {
+        result |= @as(u128, b) << @intCast(8 * i);
+    }
+    const last = bytes[bytes.len - 1];
+    if (last & 0x80 != 0) {
+        // Clear the sign bit (MSB of the last byte) and negate.
+        result &= ~(@as(u128, 0x80) << @intCast(8 * (bytes.len - 1)));
+        return @intCast(-@as(i128, @intCast(result)));
+    }
+    return @intCast(result);
+}
+
+/// OP_AND/OP_OR/OP_XOR. `op` is '&' | '|' | '^'. Aborts on length mismatch,
+/// exactly like the on-chain opcodes.
+fn scriptNumBitwise(op: u8, a: i64, b: i64) error{ScriptNumberError}!i64 {
+    var abuf: [9]u8 = undefined;
+    var bbuf: [9]u8 = undefined;
+    const av = scriptNumEncode(a, &abuf);
+    const bv = scriptNumEncode(b, &bbuf);
+    if (av.len != bv.len) return error.ScriptNumberError;
+    var rbuf: [9]u8 = undefined;
+    for (av, 0..) |x, i| {
+        const y = bv[i];
+        rbuf[i] = switch (op) {
+            '&' => x & y,
+            '|' => x | y,
+            else => x ^ y,
+        };
+    }
+    return scriptNumDecode(rbuf[0..av.len]);
+}
+
+/// OP_INVERT: flip every bit of the operand's minimal script-number bytes.
+fn scriptNumInvert(a: i64) i64 {
+    var abuf: [9]u8 = undefined;
+    const av = scriptNumEncode(a, &abuf);
+    var rbuf: [9]u8 = undefined;
+    for (av, 0..) |x, i| rbuf[i] = ~x;
+    return scriptNumDecode(rbuf[0..av.len]);
+}
+
+/// OP_LSHIFT/OP_RSHIFT. `op` is '<' (<<) | '>' (>>). Shifts the operand's bytes
+/// as a big-endian bit string, preserving byte length (LSHIFT masks off the
+/// overflow MSBs). A negative shift count aborts, like the opcodes.
+fn scriptNumShift(op: u8, a: i64, shift: i64) error{ScriptNumberError}!i64 {
+    if (shift < 0) return error.ScriptNumberError;
+    var abuf: [9]u8 = undefined;
+    const val = scriptNumEncode(a, &abuf);
+    const n: usize = @intCast(shift);
+    if (val.len == 0 or n == 0) return scriptNumDecode(val);
+    var num: u128 = 0;
+    for (val) |byte| num = (num << 8) | @as(u128, byte);
+    if (op == '<') {
+        num = std.math.shl(u128, num, n);
+        const bit_len: usize = val.len * 8;
+        const mask: u128 = std.math.shl(u128, @as(u128, 1), bit_len) -% 1;
+        num &= mask;
+    } else {
+        num = std.math.shr(u128, num, n);
+    }
+    var rbuf: [9]u8 = undefined;
+    var idx: usize = val.len;
+    while (idx > 0) {
+        idx -= 1;
+        rbuf[idx] = @intCast(num & 0xff);
+        num = std.math.shr(u128, num, 8);
+    }
+    return scriptNumDecode(rbuf[0..val.len]);
+}
+
+// ---------------------------------------------------------------------------
+// Raw-byte script-number ops (chained byte-array-op threading)
+// ---------------------------------------------------------------------------
+//
+// The scriptNum* helpers above take an i64 and re-derive its MINIMAL bytes per
+// op — correct for a SINGLE op on freshly-minimal operands (what evalBinOp /
+// evalUnaryOp and the truth-table test pin). The helpers below instead operate
+// on RAW stack bytes supplied by the caller, so a CHAINED expression can thread
+// a prior op's actual (possibly non-minimal) result bytes via the side map (see
+// EvalCtx.script_bytes / the .bin_op + .unary_op arms of evalNode). All three
+// allocate their result on the caller's (arena) allocator. Mirrors the
+// scriptNumber*Bytes helpers in packages/runar-sdk/src/anf-interpreter.ts.
+
+/// Whether a bin_op should thread raw stack bytes: a numeric (non-bytes)
+/// `& | ^ << >>`. ByteString operands / result fall through to evalBinOp,
+/// matching the TS SDK's `typeof !== 'string'` guard on both operands.
+fn isNumericByteOp(op: []const u8, result_type: []const u8, left: ANFValue, right: ANFValue) bool {
+    if (std.mem.eql(u8, result_type, "bytes")) return false;
+    if (left == .bytes or right == .bytes) return false;
+    return std.mem.eql(u8, op, "&") or std.mem.eql(u8, op, "|") or
+        std.mem.eql(u8, op, "^") or std.mem.eql(u8, op, "<<") or
+        std.mem.eql(u8, op, ">>");
+}
+
+/// Minimal little-endian sign-magnitude bytes of an i64, duped onto `allocator`.
+fn minimalBytesArena(allocator: std.mem.Allocator, n: i64) error{OutOfMemory}![]u8 {
+    var buf: [9]u8 = undefined;
+    return allocator.dupe(u8, scriptNumEncode(n, &buf));
+}
+
+/// Raw-byte OP_AND/OP_OR/OP_XOR. `op` is '&' | '|' | '^'. Aborts on length
+/// mismatch (exactly like the on-chain opcodes). Result allocated on `allocator`.
+fn bitwiseBytes(allocator: std.mem.Allocator, op: u8, av: []const u8, bv: []const u8) error{ ScriptNumberError, OutOfMemory }![]u8 {
+    if (av.len != bv.len) return error.ScriptNumberError;
+    const result = try allocator.alloc(u8, av.len);
+    for (av, 0..) |x, i| {
+        result[i] = switch (op) {
+            '&' => x & bv[i],
+            '|' => x | bv[i],
+            else => x ^ bv[i],
+        };
+    }
+    return result;
+}
+
+/// Raw-byte OP_INVERT: flip every bit, length-preserving. Result allocated.
+fn invertBytes(allocator: std.mem.Allocator, av: []const u8) error{OutOfMemory}![]u8 {
+    const result = try allocator.alloc(u8, av.len);
+    for (av, 0..) |x, i| result[i] = ~x;
+    return result;
+}
+
+/// Raw-byte OP_LSHIFT/OP_RSHIFT. `op` is '<' (<<) | '>' (>>). Treats `val` as a
+/// big-endian bit string, preserving byte length (LSHIFT masks off overflow
+/// MSBs). Negative shift aborts. Result allocated on `allocator`. `val` is at
+/// most 9 bytes (minimal i64 encoding) and byte ops preserve length, so the
+/// u128 accumulator never overflows.
+fn shiftBytes(allocator: std.mem.Allocator, op: u8, val: []const u8, shift: i64) error{ ScriptNumberError, OutOfMemory }![]u8 {
+    if (shift < 0) return error.ScriptNumberError;
+    const result = try allocator.alloc(u8, val.len);
+    const n: usize = @intCast(shift);
+    if (val.len == 0 or n == 0) {
+        @memcpy(result, val);
+        return result;
+    }
+    var num: u128 = 0;
+    for (val) |byte| num = (num << 8) | @as(u128, byte);
+    if (op == '<') {
+        num = std.math.shl(u128, num, n);
+        const bit_len: usize = val.len * 8;
+        const mask: u128 = std.math.shl(u128, @as(u128, 1), bit_len) -% 1;
+        num &= mask;
+    } else {
+        num = std.math.shr(u128, num, n);
+    }
+    var idx: usize = val.len;
+    while (idx > 0) {
+        idx -= 1;
+        result[idx] = @intCast(num & 0xff);
+        num = std.math.shr(u128, num, 8);
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Binary operations
 // ---------------------------------------------------------------------------
 
-fn evalBinOp(allocator: std.mem.Allocator, op: []const u8, left: ANFValue, right: ANFValue, result_type: []const u8) ANFValue {
+fn evalBinOp(allocator: std.mem.Allocator, op: []const u8, left: ANFValue, right: ANFValue, result_type: []const u8) error{ScriptNumberError}!ANFValue {
     // Bytes operations
     if (std.mem.eql(u8, result_type, "bytes") or (left == .bytes and right == .bytes)) {
         return evalBytesBinOp(allocator, op, left, right);
@@ -913,17 +1170,12 @@ fn evalBinOp(allocator: std.mem.Allocator, op: []const u8, left: ANFValue, right
     if (std.mem.eql(u8, op, ">=")) return .{ .boolean = l >= r };
     if (std.mem.eql(u8, op, "&&")) return .{ .boolean = isTruthy(left) and isTruthy(right) };
     if (std.mem.eql(u8, op, "||")) return .{ .boolean = isTruthy(left) or isTruthy(right) };
-    if (std.mem.eql(u8, op, "&")) return .{ .int = l & r };
-    if (std.mem.eql(u8, op, "|")) return .{ .int = l | r };
-    if (std.mem.eql(u8, op, "^")) return .{ .int = l ^ r };
-    if (std.mem.eql(u8, op, "<<")) {
-        if (r >= 0 and r < 64) return .{ .int = l << @intCast(r) };
-        return .{ .int = 0 };
-    }
-    if (std.mem.eql(u8, op, ">>")) {
-        if (r >= 0 and r < 64) return .{ .int = l >> @intCast(r) };
-        return .{ .int = 0 };
-    }
+    // Bitwise / shift: byte-array script-number semantics (see scriptNum*).
+    if (std.mem.eql(u8, op, "&")) return .{ .int = try scriptNumBitwise('&', l, r) };
+    if (std.mem.eql(u8, op, "|")) return .{ .int = try scriptNumBitwise('|', l, r) };
+    if (std.mem.eql(u8, op, "^")) return .{ .int = try scriptNumBitwise('^', l, r) };
+    if (std.mem.eql(u8, op, "<<")) return .{ .int = try scriptNumShift('<', l, r) };
+    if (std.mem.eql(u8, op, ">>")) return .{ .int = try scriptNumShift('>', l, r) };
 
     return .{ .int = 0 };
 }
@@ -989,7 +1241,8 @@ fn evalUnaryOp(allocator: std.mem.Allocator, op: []const u8, operand: ANFValue, 
 
     if (std.mem.eql(u8, op, "-")) return .{ .int = -%val };
     if (std.mem.eql(u8, op, "!")) return .{ .boolean = !isTruthy(operand) };
-    if (std.mem.eql(u8, op, "~")) return .{ .int = ~val };
+    // OP_INVERT flips the operand's minimal script-number bytes, not native ~n.
+    if (std.mem.eql(u8, op, "~")) return .{ .int = scriptNumInvert(val) };
 
     return .{ .int = val };
 }
@@ -1306,7 +1559,7 @@ fn evalMethodCall(
     raw_outputs: *std.ArrayList(DataOutputEntry),
     anf: *const ANFProgram,
     eval_ctx: EvalCtx,
-) error{ OutOfMemory, AssertionFailure, MissingWitness }!ANFValue {
+) error{ OutOfMemory, AssertionFailure, MissingWitness, ScriptNumberError }!ANFValue {
     // Find the private method
     for (anf.methods) |*m| {
         if (!m.is_public and std.mem.eql(u8, m.name, method_name)) {
@@ -1328,9 +1581,20 @@ fn evalMethodCall(
                 }
             }
 
-            // Execute the method body — propagate eval_ctx so nested
-            // private-method asserts (and MockEnv overrides) also apply.
-            try evalBindings(allocator, m.body, &method_env, state_delta, data_outputs, raw_outputs, anf, eval_ctx);
+            // Execute the method body — propagate strict + MockEnv so nested
+            // private-method asserts (and overrides) also apply, but with a
+            // FRESH byte-op side map: the method's binding names are scoped to
+            // its own body, so its byte-op results must not collide with (or
+            // leak into) the caller's side map. Mirrors the TS reference, which
+            // recurses into a private method with a default-empty scriptBytes.
+            var method_script_bytes = std.StringHashMap([]const u8).init(allocator);
+            defer method_script_bytes.deinit();
+            const method_ctx: EvalCtx = .{
+                .strict = eval_ctx.strict,
+                .mock_env = eval_ctx.mock_env,
+                .script_bytes = &method_script_bytes,
+            };
+            try evalBindings(allocator, m.body, &method_env, state_delta, data_outputs, raw_outputs, anf, method_ctx);
 
             // Propagate property changes back
             for (anf.properties) |prop| {
@@ -2122,13 +2386,146 @@ test "computeNewState returns error for unknown method" {
 
 test "evalBinOp bytes concatenation" {
     const allocator = std.testing.allocator;
-    const result = evalBinOp(allocator, "+", .{ .bytes = "aabb" }, .{ .bytes = "ccdd" }, "bytes");
+    const result = try evalBinOp(allocator, "+", .{ .bytes = "aabb" }, .{ .bytes = "ccdd" }, "bytes");
     switch (result) {
         .bytes => |b| {
             try std.testing.expectEqualStrings("aabbccdd", b);
             allocator.free(b);
         },
         else => return error.TestUnexpectedResult,
+    }
+}
+
+test "bigint bitwise/shift use script-number byte semantics (truth table)" {
+    const H = struct {
+        // Evaluate a bigint binary op through the interpreter, returning the
+        // i64 result (or propagating the on-chain ABORT as error).
+        fn bin(op: []const u8, a: i64, b: i64) !i64 {
+            const r = try evalBinOp(std.testing.allocator, op, .{ .int = a }, .{ .int = b }, "int");
+            return switch (r) {
+                .int => |v| v,
+                else => error.TestUnexpectedResult,
+            };
+        }
+        fn un(op: []const u8, a: i64) i64 {
+            const r = evalUnaryOp(std.testing.allocator, op, .{ .int = a }, "int");
+            return switch (r) {
+                .int => |v| v,
+                else => 0,
+            };
+        }
+    };
+
+    // Shifts operate on the minimal script-number BYTES, not the numeric value.
+    try std.testing.expectEqual(@as(i64, 254), try H.bin("<<", 255, 1)); // NOT 510
+    try std.testing.expectEqual(@as(i64, 512), try H.bin("<<", 256, 1));
+    try std.testing.expectEqual(@as(i64, 40), try H.bin("<<", 5, 3));
+    try std.testing.expectEqual(@as(i64, 4), try H.bin(">>", 32, 3));
+    try std.testing.expectEqual(@as(i64, -127), try H.bin(">>", 255, 1));
+
+    // Bitwise NOT flips the operand's script-number bytes.
+    try std.testing.expectEqual(@as(i64, -122), H.un("~", 5)); // NOT -6
+    try std.testing.expectEqual(@as(i64, -32512), H.un("~", 255));
+    try std.testing.expectEqual(@as(i64, 0), H.un("~", 0)); // encode(0) is empty
+
+    // AND/OR/XOR require equal-length operands.
+    try std.testing.expectEqual(@as(i64, 1), try H.bin("&", 5, 3));
+    try std.testing.expectEqual(@as(i64, 1), try H.bin("&", -1, 5)); // NOT 5
+
+    // Length mismatch / negative shift ABORT, exactly like the opcodes.
+    try std.testing.expectError(error.ScriptNumberError, H.bin("&", 255, 1));
+    try std.testing.expectError(error.ScriptNumberError, H.bin("|", 7, 0));
+    try std.testing.expectError(error.ScriptNumberError, H.bin("<<", 5, -1));
+}
+
+test "chained bigint byte-ops thread raw stack bytes through the interpreter" {
+    // A shift/bitwise RESULT is a fixed-length, possibly NON-minimal byte array
+    // on-chain (`2 << 8` leaves a 1-byte `0x00`; minimal encoding of 0 is
+    // empty). Feeding that result to a length-sensitive `& | ^`/shift/`~` must
+    // see the REAL length, or the interpreter diverges from the deployed script
+    // — a funds-relevant bug. These run through the full interpreter (evalNode +
+    // the byte-op side map), unlike the single-op truth-table test above which
+    // pins evalBinOp/evalUnaryOp directly.
+    const allocator = std.testing.allocator;
+
+    const H = struct {
+        // Run a single public method whose body stores the chained result into
+        // the mutable `result` property; return `result` (or propagate the
+        // on-chain ScriptNumberError abort).
+        fn run(a: std.mem.Allocator, body: []ANFBinding) !i64 {
+            var props = [_]ANFProperty{
+                .{ .name = "result", .type_name = "int", .readonly = false },
+            };
+            var methods = [_]ANFMethod{
+                .{ .name = "run", .params = &.{}, .body = body, .is_public = true },
+            };
+            const anf = ANFProgram{
+                .contract_name = "Chain",
+                .properties = &props,
+                .methods = &methods,
+            };
+            var cs = std.StringHashMap(ANFValue).init(a);
+            defer cs.deinit();
+            try cs.put("result", .{ .int = 0 });
+            var args = std.StringHashMap(ANFValue).init(a);
+            defer args.deinit();
+            var ns = try computeNewState(a, &anf, "run", cs, args, &.{});
+            defer ns.deinit();
+            return ns.get("result").?.int;
+        }
+    };
+
+    // (2 << 8) | 5 == 5   — on-chain OP_OR([0x00],[0x05]) = [0x05].
+    // Buggy re-minimize path: OP_OR of empty-encoded-0 vs [0x05] length mismatch → abort.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "c2", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "c8", .value = .{ .load_const = .{ .value = .{ .int = 8 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = "<<", .left = "c2", .right = "c8", .result_type = "int" } } },
+            .{ .name = "c5", .value = .{ .load_const = .{ .value = .{ .int = 5 } } } },
+            .{ .name = "orr", .value = .{ .bin_op = .{ .op = "|", .left = "sh", .right = "c5", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "orr" } } },
+        };
+        try std.testing.expectEqual(@as(i64, 5), try H.run(allocator, &body));
+    }
+
+    // ~(2 << 8) == -127  — on-chain OP_INVERT([0x00]) = [0xff] = -127.
+    // Buggy re-minimize path: ~0 with empty encoding → 0.
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "c2", .value = .{ .load_const = .{ .value = .{ .int = 2 } } } },
+            .{ .name = "c8", .value = .{ .load_const = .{ .value = .{ .int = 8 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = "<<", .left = "c2", .right = "c8", .result_type = "int" } } },
+            .{ .name = "inv", .value = .{ .unary_op = .{ .op = "~", .operand = "sh", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "inv" } } },
+        };
+        try std.testing.expectEqual(@as(i64, -127), try H.run(allocator, &body));
+    }
+
+    // (256 << 8) & 256 == 0  — both operands are 2-byte; OP_AND -> [0x00,0x00].
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "c256", .value = .{ .load_const = .{ .value = .{ .int = 256 } } } },
+            .{ .name = "c8", .value = .{ .load_const = .{ .value = .{ .int = 8 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = "<<", .left = "c256", .right = "c8", .result_type = "int" } } },
+            .{ .name = "andd", .value = .{ .bin_op = .{ .op = "&", .left = "sh", .right = "c256", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "andd" } } },
+        };
+        try std.testing.expectEqual(@as(i64, 0), try H.run(allocator, &body));
+    }
+
+    // ((1 << 8) & 0) ABORTS — on-chain OP_AND([0x00],[]) length mismatch.
+    // The buggy re-minimize path computed 0 & 0 == 0 (a funds-loss spend).
+    {
+        var body = [_]ANFBinding{
+            .{ .name = "c1", .value = .{ .load_const = .{ .value = .{ .int = 1 } } } },
+            .{ .name = "c8", .value = .{ .load_const = .{ .value = .{ .int = 8 } } } },
+            .{ .name = "sh", .value = .{ .bin_op = .{ .op = "<<", .left = "c1", .right = "c8", .result_type = "int" } } },
+            .{ .name = "c0", .value = .{ .load_const = .{ .value = .{ .int = 0 } } } },
+            .{ .name = "andd", .value = .{ .bin_op = .{ .op = "&", .left = "sh", .right = "c0", .result_type = "int" } } },
+            .{ .name = "u", .value = .{ .update_prop = .{ .name = "result", .value = "andd" } } },
+        };
+        try std.testing.expectError(error.ScriptNumberError, H.run(allocator, &body));
     }
 }
 

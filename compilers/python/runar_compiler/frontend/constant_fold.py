@@ -106,24 +106,15 @@ def _eval_bin_op(op: str, left: ConstValue, right: ConstValue) -> ConstValue | N
             return ("bool", a <= b)
         if op == ">=":
             return ("bool", a >= b)
-        if op == "&":
-            return ("int", a & b)
-        if op == "|":
-            return ("int", a | b)
-        if op == "^":
-            return ("int", a ^ b)
-        if op == "<<":
-            if a < 0:
-                return None  # skip for negative left operand (BSV shifts are logical)
-            if b < 0 or b > 128:
-                return None
-            return ("int", a << b)
-        if op == ">>":
-            if a < 0:
-                return None  # skip for negative left operand (BSV shifts are logical)
-            if b < 0 or b > 128:
-                return None
-            return ("int", a >> b)
+        # OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT operate on the operands' raw
+        # script-number BYTES, not their numeric value -- native int folding
+        # produces results that differ from the deployed script (e.g. 255 << 1
+        # is 254 on-chain, not 510; 255 & 1 aborts). Never fold them; emit the
+        # opcode so runtime byte-array semantics govern. (See the SDK ANF
+        # interpreter's _script_number_* helpers, which model the same
+        # semantics for the interpreter.)
+        if op in ("&", "|", "^", "<<", ">>"):
+            return None
         return None
 
     # Boolean operations
@@ -180,8 +171,11 @@ def _eval_unary_op(op: str, operand: ConstValue) -> ConstValue | None:
         n: int = operand[1]
         if op == "-":
             return ("int", -n)
+        # OP_INVERT flips the operand's script-number bytes, not native ~n
+        # (~5 is -122 on-chain, not -6). Never fold; emit the opcode so runtime
+        # byte-array semantics govern.
         if op == "~":
-            return ("int", ~n)
+            return None
         if op == "!":
             return ("bool", n == 0)
         return None

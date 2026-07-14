@@ -311,6 +311,13 @@ module Runar
         # Thread real-crypto context through the evaluator. nil in lenient
         # and strict modes; an OnChainCryptoContext in on-chain mode.
         Thread.current[:runar_real_crypto] = real_crypto_ctx
+        # Per-binding raw stack bytes for byte-array-op results (& | ^ << >> ~),
+        # keyed by binding name. Lets a chained op read the real (possibly
+        # non-minimal) length of a prior op's result instead of re-minimising its
+        # numeric value. One fresh map per top-level method invocation; env stays
+        # pure (decoded values) so state serialization is unaffected. Mirrors the
+        # TS anf-interpreter's threaded +scriptBytes+ side-map.
+        Thread.current[:runar_script_bytes] = {}
 
         # Build constructor param index: position among non-initialized properties.
         # Properties with initialValue are excluded from the constructor, so
@@ -360,6 +367,7 @@ module Runar
         Thread.current[:runar_max_loop_iterations] = nil
         Thread.current[:runar_strict_method] = nil
         Thread.current[:runar_real_crypto] = nil
+        Thread.current[:runar_script_bytes] = nil
       end
 
       # Walk a list of ANF bindings, updating env with each result.
@@ -431,19 +439,47 @@ module Runar
           v.is_a?(String) && v.start_with?('@ref:') ? env[v[5..]] : v
 
         when 'bin_op'
-          eval_bin_op(
-            value['op'],
-            env[value['left']],
-            env[value['right']],
-            value['result_type']
-          )
+          op        = value['op']
+          left_val  = env[value['left']]
+          right_val = env[value['right']]
+          # Numeric byte-array ops (& | ^ << >>) thread the operands' real stack
+          # bytes through the per-binding side-map so chained expressions match
+          # the deployed script: a shift/bitwise result can be non-minimal, and
+          # the next length-sensitive op must see that real length. ByteString
+          # ops (result_type 'bytes' / string operands) fall through to
+          # #eval_bin_op, which keeps the minimal-operand path for everything else.
+          if numeric_byte_op?(op, value['result_type'], left_val, right_val)
+            sbytes = (Thread.current[:runar_script_bytes] ||= {})
+            # Operand bytes = the raw bytes registered by a prior byte-op (keyed
+            # by ref name) if present, else the value's minimal encoding.
+            ab = sbytes[value['left']] || encode_scriptnum_bytes(to_int(left_val))
+            rb = if op == '<<' || op == '>>'
+                   # Shift count is read as a number on-chain — only ab's length matters.
+                   scriptnum_shift_bytes(op, ab, to_int(right_val))
+                 else
+                   bb = sbytes[value['right']] || encode_scriptnum_bytes(to_int(right_val))
+                   scriptnum_bitwise_bytes(op, ab, bb)
+                 end
+            sbytes[binding_name] = rb if binding_name
+            decode_scriptnum_bytes(rb)
+          else
+            eval_bin_op(op, left_val, right_val, value['result_type'])
+          end
 
         when 'unary_op'
-          eval_unary_op(
-            value['op'],
-            env[value['operand']],
-            value['result_type']
-          )
+          op          = value['op']
+          operand_val = env[value['operand']]
+          # OP_INVERT threads the operand's real stack bytes too, so chained
+          # ~(shift/bitwise result) preserves the deployed byte length.
+          if op == '~' && value['result_type'] != 'bytes' && !operand_val.is_a?(String)
+            sbytes = (Thread.current[:runar_script_bytes] ||= {})
+            ab = sbytes[value['operand']] || encode_scriptnum_bytes(to_int(operand_val))
+            rb = scriptnum_invert_bytes(ab)
+            sbytes[binding_name] = rb if binding_name
+            decode_scriptnum_bytes(rb)
+          else
+            eval_unary_op(op, operand_val, value['result_type'])
+          end
 
         when 'call'
           call_args = Array(value['args']).map { |a| env[a] }
@@ -647,11 +683,13 @@ module Runar
         when '>=' then l >= r
         when '&&', 'and' then is_truthy(left) && is_truthy(right)
         when '||', 'or'  then is_truthy(left) || is_truthy(right)
-        when '&'  then l & r
-        when '|'  then l | r
-        when '^'  then l ^ r
-        when '<<' then l << r
-        when '>>' then l >> r
+        # OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT operate on the operands'
+        # minimal script-number BYTES, not their numeric value. Native integer
+        # ops disagree with the deployed script (e.g. 255 << 1 is 254 on-chain,
+        # not 510; 255 & 1 aborts). Delegate to the byte-array helpers so the
+        # simulator matches the on-chain semantics byte-for-byte.
+        when '&', '|', '^' then scriptnum_bitwise(op, l, r)
+        when '<<', '>>'    then scriptnum_shift(op, l, r)
         else 0
         end
       end
@@ -716,7 +754,10 @@ module Runar
         case op
         when '-'      then -val
         when '!', 'not' then !is_truthy(operand)
-        when '~'      then ~val
+        # OP_INVERT flips every bit of the operand's minimal script-number
+        # bytes, not native Ruby ~val (e.g. ~5 is -122 on-chain, not -6; ~0 is
+        # 0 because 0 encodes to the empty byte string).
+        when '~'      then scriptnum_invert(val)
         else val
         end
       end
@@ -968,10 +1009,17 @@ module Runar
         # caller's frame after we return.
         saved_index = Thread.current[:runar_method_body_index]
         Thread.current[:runar_method_body_index] = {} if saved_index
+        # Private methods have their own binding namespace, so they get a fresh
+        # byte-op side-map (binding names like +t0+ can collide with the
+        # caller's). Mirrors the TS +evalMethodCall+, which calls +evalBindings+
+        # without threading the parent +scriptBytes+.
+        saved_script_bytes = Thread.current[:runar_script_bytes]
+        Thread.current[:runar_script_bytes] = {}
         begin
           eval_bindings(body, new_env, child_delta, data_outputs, raw_outputs, anf)
         ensure
           Thread.current[:runar_method_body_index] = saved_index
+          Thread.current[:runar_script_bytes] = saved_script_bytes
         end
 
         # Propagate state mutations back to the caller environment.
@@ -1211,6 +1259,182 @@ module Runar
         result_bytes.each_with_index { |b, i| result |= b << (8 * i) }
 
         negative ? -result : result
+      end
+
+      # ---------------------------------------------------------------------------
+      # Script-number bitwise / shift semantics (byte-array ops, NOT numeric)
+      #
+      # OP_AND/OP_OR/OP_XOR/OP_INVERT/OP_LSHIFT/OP_RSHIFT operate on the RAW BYTES
+      # of the operands' minimal script-number encoding, not on their numeric
+      # value. AND/OR/XOR require equal-length operands and abort otherwise;
+      # shifts treat the byte array as a big-endian bit string, preserve its
+      # length, and abort on a negative count. These helpers reproduce exactly
+      # what the on-chain opcodes do so the interpreter (which models values as
+      # integers) agrees with the deployed script byte-for-byte. Mirrors
+      # packages/runar-testing/src/vm/utils.ts scriptNumber{Bitwise,Invert,Shift}.
+      # ---------------------------------------------------------------------------
+
+      # Encode an integer as minimal little-endian sign-magnitude bytes (Bitcoin
+      # script-number format). 0 → []. Matches encode_script_number in the
+      # compiler codegen and the TS vm/utils encodeScriptNumber.
+      #
+      # @param n [Integer]
+      # @return [Array<Integer>] minimal byte values
+      def encode_scriptnum_bytes(n)
+        return [] if n == 0
+
+        negative = n < 0
+        abs_n    = n.abs
+        bytes    = []
+        while abs_n > 0
+          bytes << (abs_n & 0xff)
+          abs_n >>= 8
+        end
+        if (bytes.last & 0x80) != 0
+          bytes << (negative ? 0x80 : 0x00)
+        elsif negative
+          bytes[-1] |= 0x80
+        end
+        bytes
+      end
+
+      # Decode minimal little-endian sign-magnitude bytes back to an integer.
+      # [] → 0. Reuses the existing #bin2num_int decoder.
+      #
+      # @param bytes [Array<Integer>]
+      # @return [Integer]
+      def decode_scriptnum_bytes(bytes)
+        return 0 if bytes.empty?
+
+        bin2num_int(bytes.map { |b| format('%02x', b) }.join)
+      end
+
+      # Whether a +bin_op+ is a NUMERIC byte-array op (& | ^ << >>) — i.e. one
+      # whose operands are script numbers rather than ByteStrings. Mirrors the TS
+      # +isNumericByteOp+ guard: the op is one of the byte-array ops, the result
+      # is not a ByteString, and neither operand is a (hex) string. Only these
+      # thread the raw-stack-byte side-map; ByteString ops keep their own path.
+      #
+      # @param op          [String]
+      # @param result_type [String, nil]
+      # @param left        [Object]
+      # @param right       [Object]
+      # @return [Boolean]
+      def numeric_byte_op?(op, result_type, left, right)
+        %w[& | ^ << >>].include?(op) &&
+          result_type != 'bytes' &&
+          !left.is_a?(String) &&
+          !right.is_a?(String)
+      end
+
+      # ---------------------------------------------------------------------------
+      # Raw-stack-byte helpers (thread non-minimal chained intermediates)
+      #
+      # The +*_bytes+ helpers operate on RAW stack bytes — the exact byte array a
+      # value would occupy on the deployed script's stack — NOT a value's minimal
+      # encoding. This matters for CHAINED expressions: a shift/bitwise RESULT can
+      # be a non-minimal byte array (e.g. +2 << 8+ leaves a 1-byte +0x00+, not the
+      # empty encoding of 0), and feeding it to a length-sensitive +& | ^+/shift
+      # must see that real length to agree with the deployed script. #eval_value
+      # threads these bytes via a per-binding side-map (Thread.current
+      # +:runar_script_bytes+); values from other sources (literals, arithmetic)
+      # are minimal on-chain, so their bytes are re-derived via
+      # #encode_scriptnum_bytes. Mirrors the TS anf-interpreter scriptNumber*Bytes.
+      # ---------------------------------------------------------------------------
+
+      # OP_AND/OP_OR/OP_XOR on two raw byte arrays. Aborts on a length mismatch,
+      # exactly like the on-chain opcodes.
+      #
+      # @param op [String] '&', '|', or '^'
+      # @param av [Array<Integer>] raw stack bytes of the left operand
+      # @param bv [Array<Integer>] raw stack bytes of the right operand
+      # @return [Array<Integer>] result bytes (same length as the operands)
+      def scriptnum_bitwise_bytes(op, av, bv)
+        if av.length != bv.length
+          name = op == '&' ? 'OP_AND' : op == '|' ? 'OP_OR' : 'OP_XOR'
+          raise "#{name}: operands must be same length"
+        end
+        av.each_index.map do |i|
+          case op
+          when '&' then av[i] & bv[i]
+          when '|' then av[i] | bv[i]
+          else av[i] ^ bv[i]
+          end
+        end
+      end
+
+      # OP_INVERT: flip every bit of the operand's raw stack bytes
+      # (length-preserving).
+      #
+      # @param av [Array<Integer>] raw stack bytes
+      # @return [Array<Integer>] inverted bytes
+      def scriptnum_invert_bytes(av)
+        av.map { |x| (~x) & 0xff }
+      end
+
+      # OP_LSHIFT/OP_RSHIFT on raw stack bytes as a big-endian bit string,
+      # preserving byte length (LSHIFT masks off overflow MSBs). +shift+ is the
+      # numeric shift count (read as a number on-chain, so only +val+'s bytes are
+      # length-significant). Aborts on a negative shift count.
+      #
+      # @param op    [String] '<<' or '>>'
+      # @param val   [Array<Integer>] raw stack bytes to shift
+      # @param shift [Integer]
+      # @return [Array<Integer>] shifted bytes (same length as +val+)
+      def scriptnum_shift_bytes(op, val, shift)
+        if shift < 0
+          raise(op == '<<' ? 'OP_LSHIFT: negative shift' : 'OP_RSHIFT: negative shift')
+        end
+
+        n = shift.to_i
+        return val.dup if val.empty? || n == 0
+
+        num = 0
+        val.each { |byte| num = (num << 8) | byte }
+        if op == '<<'
+          bit_len = val.length * 8
+          num = (num << n) & ((1 << bit_len) - 1)
+        else
+          num >>= n
+        end
+        result = Array.new(val.length, 0)
+        (val.length - 1).downto(0) do |i|
+          result[i] = num & 0xff
+          num >>= 8
+        end
+        result
+      end
+
+      # OP_AND/OP_OR/OP_XOR on two script-number-valued integers (minimal
+      # operands). Aborts on a length mismatch, exactly like the on-chain
+      # opcodes. Used for the single-op path (values fresh from minimal
+      # encoding); the chained path calls #scriptnum_bitwise_bytes directly.
+      #
+      # @param op [String] '&', '|', or '^'
+      # @return [Integer]
+      def scriptnum_bitwise(op, a, b)
+        decode_scriptnum_bytes(
+          scriptnum_bitwise_bytes(op, encode_scriptnum_bytes(a), encode_scriptnum_bytes(b)),
+        )
+      end
+
+      # OP_INVERT on a script-number-valued integer (minimal operand).
+      #
+      # @param a [Integer]
+      # @return [Integer]
+      def scriptnum_invert(a)
+        decode_scriptnum_bytes(scriptnum_invert_bytes(encode_scriptnum_bytes(a)))
+      end
+
+      # OP_LSHIFT/OP_RSHIFT on a script-number-valued integer (minimal operand).
+      # Aborts on a negative shift count.
+      #
+      # @param op    [String] '<<' or '>>'
+      # @param a     [Integer]
+      # @param shift [Integer]
+      # @return [Integer]
+      def scriptnum_shift(op, a, shift)
+        decode_scriptnum_bytes(scriptnum_shift_bytes(op, encode_scriptnum_bytes(a), shift))
       end
 
       # ---------------------------------------------------------------------------

@@ -54,17 +54,14 @@ module RunarCompiler
           when ">"   then return ["bool", a > b]
           when "<="  then return ["bool", a <= b]
           when ">="  then return ["bool", a >= b]
-          when "&"   then return ["int", a & b]
-          when "|"   then return ["int", a | b]
-          when "^"   then return ["int", a ^ b]
-          when "<<"
-            return nil if a < 0   # skip for negative left operand (BSV shifts are logical)
-            return nil if b < 0 || b > 128
-            return ["int", a << b]
-          when ">>"
-            return nil if a < 0   # skip for negative left operand (BSV shifts are logical)
-            return nil if b < 0 || b > 128
-            return ["int", a >> b]
+          # OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT operate on the operands' raw
+          # script-number BYTES, not their numeric value — native integer
+          # folding produces results that differ from the deployed script (e.g.
+          # 255 << 1 is 254 on-chain, not 510; 255 & 1 aborts). Never fold them;
+          # return nil so codegen emits the opcode and runtime byte-array
+          # semantics govern. (Matches constant-fold.ts + the ANF interpreter's
+          # scriptnum_* helpers.)
+          when "&", "|", "^", "<<", ">>" then return nil
           else
             return nil
           end
@@ -134,7 +131,10 @@ module RunarCompiler
           n = operand[1]
           case op
           when "-" then return ["int", -n]
-          when "~" then return ["int", ~n]
+          # OP_INVERT flips the operand's script-number bytes, not native ~n.
+          # Never fold; return nil so codegen emits the opcode. (Matches
+          # constant-fold.ts + the ANF interpreter's scriptnum_invert helper.)
+          when "~" then return nil
           when "!" then return ["bool", n == 0]
           else
             return nil
