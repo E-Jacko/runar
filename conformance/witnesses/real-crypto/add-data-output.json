@@ -3,9 +3,30 @@
   "kind": "stateful",
   "signerKey": "alice",
   "note": "publish(): checkPreimage + addDataOutput continuation. Real tx-context preimage synthesised by the SDK call path.",
-  "constructorArgs": ["0n"],
+  "constructorArgs": [
+    "0n"
+  ],
   "spends": [
-    { "method": "publish", "args": ["0xdeadbeef"], "expect": "accept", "note": "count 0->1 + data output" },
-    { "method": "publish", "args": ["0xdeadbeef"], "tamperOutput": true, "cryptoNearMiss": true, "expect": "reject", "note": "tampered continuation output" }
+    {
+      "method": "publish",
+      "args": [
+        "0xdeadbeef"
+      ],
+      "expect": "accept",
+      "note": "count 0->1 + data output",
+      "expectedState": {
+        "count": "1n"
+      }
+    },
+    {
+      "method": "publish",
+      "args": [
+        "0xdeadbeef"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output"
+    }
   ]
 }

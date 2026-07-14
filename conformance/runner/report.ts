@@ -27,6 +27,7 @@ export interface TestResult {
     python?: number;
     zig?: number;
     ruby?: number;
+    java?: number;
   };
 }
 
@@ -48,14 +49,29 @@ export function generateReport(results: ConformanceResult[]): ConformanceReport 
 
   const testResults: TestResult[] = results.map((r) => {
     const hasErrors = r.errors.length > 0;
-    const tsOk = r.tsCompiler.success;
-    const allCompilersSkipped = !tsOk && !r.goCompiler?.success && !r.rustCompiler?.success && !r.pythonCompiler?.success && !r.zigCompiler?.success && !r.rubyCompiler?.success;
+
+    // A tier that produced NO result (undefined) was not run for this fixture
+    // (allowlisted out, or its binary was unavailable) — distinct from a tier
+    // that ran and FAILED (a defined result with success=false). A fixture is
+    // genuinely "skipped" only when nothing was evaluated at all. TS always has
+    // a result, so treat its source-not-found stub as "not run" too. Java is
+    // included here — the old check omitted it entirely.
+    const notRun = (c?: { success: boolean }) => c === undefined;
+    const tsNotRun = !r.tsCompiler.success && /not found/i.test(r.tsCompiler.error ?? '');
+    const allCompilersSkipped =
+      tsNotRun &&
+      notRun(r.goCompiler) && notRun(r.rustCompiler) && notRun(r.pythonCompiler) &&
+      notRun(r.zigCompiler) && notRun(r.rubyCompiler) && notRun(r.javaCompiler);
 
     let status: TestResult['status'];
-    if (allCompilersSkipped) {
-      status = 'skip';
-    } else if (hasErrors || !r.irMatch || !r.scriptMatch) {
+    if (hasErrors || !r.irMatch || !r.scriptMatch) {
+      // A real mismatch or error is ALWAYS a failure — it must never be masked
+      // as a skip (which drops it from report.failed and passes CI). The old
+      // code checked all-skipped FIRST, so a fixture where every tier failed
+      // (all success=false) was reported 'skip' and hidden (audit #17).
       status = 'fail';
+    } else if (allCompilersSkipped) {
+      status = 'skip';
     } else {
       status = 'pass';
     }
@@ -73,6 +89,7 @@ export function generateReport(results: ConformanceResult[]): ConformanceReport 
         python: r.pythonCompiler?.durationMs,
         zig: r.zigCompiler?.durationMs,
         ruby: r.rubyCompiler?.durationMs,
+        java: r.javaCompiler?.durationMs,
       },
     };
   });

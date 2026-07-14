@@ -3,9 +3,81 @@
   "kind": "stateful",
   "note": "Stateful contract whose every public method is gated by a private requireOwner() -> real checkSig(owner). owner is set to the signer's pubkey for accept, to a different key for the wrong-signer near-miss. Real checkPreimage continuation.",
   "spends": [
-    { "method": "deposit", "args": [null, "50n"], "constructorArgs": [{"$pubkey":"alice"}, "100n"], "signerKey": "alice", "expect": "accept", "note": "owner==signer, deposit 50 -> balance 150" },
-    { "method": "deposit", "args": [null, "50n"], "constructorArgs": [{"$pubkey":"bob"}, "100n"], "signerKey": "alice", "cryptoNearMiss": true, "expect": "reject", "note": "wrong signer: owner=bob, signed by alice -> checkSig fails" },
-    { "method": "withdraw", "args": [null, "10n", "100n"], "constructorArgs": [{"$pubkey":"alice"}, "100n"], "signerKey": "alice", "expect": "accept", "note": "owner-gated withdraw: fee=percentOf(10,100)=0, total 10 <= 100" },
-    { "method": "scale", "args": [null, "3n", "2n"], "constructorArgs": [{"$pubkey":"alice"}, "100n"], "signerKey": "alice", "expect": "accept", "note": "owner-gated scale: balance=mulDiv(100,3,2)=150" }
+    {
+      "method": "deposit",
+      "args": [
+        null,
+        "50n"
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "alice"
+        },
+        "100n"
+      ],
+      "signerKey": "alice",
+      "expect": "accept",
+      "note": "owner==signer, deposit 50 -> balance 150",
+      "expectedState": {
+        "balance": "150n"
+      }
+    },
+    {
+      "method": "deposit",
+      "args": [
+        null,
+        "50n"
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "bob"
+        },
+        "100n"
+      ],
+      "signerKey": "alice",
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "wrong signer: owner=bob, signed by alice -> checkSig fails"
+    },
+    {
+      "method": "withdraw",
+      "args": [
+        null,
+        "10n",
+        "100n"
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "alice"
+        },
+        "100n"
+      ],
+      "signerKey": "alice",
+      "expect": "accept",
+      "note": "owner-gated withdraw: fee=percentOf(10,100)=0, total 10 <= 100",
+      "expectedState": {
+        "balance": "90n"
+      }
+    },
+    {
+      "method": "scale",
+      "args": [
+        null,
+        "3n",
+        "2n"
+      ],
+      "constructorArgs": [
+        {
+          "$pubkey": "alice"
+        },
+        "100n"
+      ],
+      "signerKey": "alice",
+      "expect": "accept",
+      "note": "owner-gated scale: balance=mulDiv(100,3,2)=150",
+      "expectedState": {
+        "balance": "150n"
+      }
+    }
   ]
 }

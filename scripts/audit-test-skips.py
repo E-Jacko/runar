@@ -356,53 +356,61 @@ def main() -> int:
     sites = discover_skip_sites()
     rows = parse_inventory(INVENTORY_PATH)
 
-    doc_pairs: dict[tuple[str, int], InventoryRow] = {}
-    doc_paths_by_path: dict[str, list[InventoryRow]] = {}
-    for row in rows:
-        for site in row.sites:
-            doc_pairs[site] = row
-            doc_paths_by_path.setdefault(site[0], []).append(row)
-
-    site_pairs: set[tuple[str, int]] = {(s.path, s.line) for s in sites}
-
-    orphans: list[SkipSite] = []
-    for site in sites:
-        key = (site.path, site.line)
-        if key in doc_pairs:
-            continue
-        # Test-name fallback.
-        name = enclosing_test_name(site.path, site.line)
-        if name:
-            same_file_rows = doc_paths_by_path.get(site.path, [])
-            if any(name in r.test_cell or name in r.rationale_cell for r in same_file_rows):
-                continue
-        orphans.append(site)
-
-    stales: list[tuple[InventoryRow, str, int]] = []
+    # Match live skips to documented sites WITHOUT depending on exact line
+    # numbers. A skip that merely MOVED (line drift) must not read as both an
+    # orphan (its new line is undocumented) AND a stale row (its old line is
+    # empty) — the failure mode that broke this gate repeatedly on unrelated
+    # insertions. Per file: take exact-line matches first, then pair the
+    # remainder by skip snippet with CONSUMPTION, so a genuinely ADDED skip
+    # (unpaired live) is an orphan and a genuinely REMOVED skip (unpaired doc
+    # site) is stale — line drift alone is forgiven (audit #15/#49).
+    live_by_file: dict[str, list[SkipSite]] = {}
+    for s in sites:
+        live_by_file.setdefault(s.path, []).append(s)
+    doc_by_file: dict[str, list[tuple[InventoryRow, int]]] = {}
     for row in rows:
         for path, line in row.sites:
-            full = REPO_ROOT / path
-            if not full.exists():
-                stales.append((row, path, line))
-                continue
-            try:
-                lines_in_file = full.read_text(encoding="utf-8", errors="replace").splitlines()
-            except (OSError, UnicodeDecodeError):
-                continue
-            if (path, line) in site_pairs:
-                continue
-            # Forgive line drift if the same file has at least one live
-            # skip and the doc test name still matches that skip.
-            siblings = [s for s in sites if s.path == path]
-            if siblings:
-                cell_text = row.test_cell + " " + row.rationale_cell
-                if any(s.snippet and any(tok in cell_text for tok in re.split(r"\s+", s.snippet) if len(tok) > 3) for s in siblings):
-                    # Loose match: the cited file still has a live skip,
-                    # and the rationale references some token from the
-                    # snippet. Keep this looser check disabled for now —
-                    # report as stale so the doc gets refreshed.
-                    pass
-            stales.append((row, path, line))
+            doc_by_file.setdefault(path, []).append((row, line))
+
+    def snippet_matches_row(snippet: str, row: InventoryRow) -> bool:
+        # A drifted skip keeps its message; pair it to a row that references it —
+        # require >=2 distinctive tokens (len>=2, so short subjects like "SLH"/
+        # "DSA" survive) of the skip snippet to appear in the row's cells so
+        # unrelated messages don't cross-match. This only decides how a DRIFTED
+        # (or added/removed) skip pairs to a row; exact-line matches are handled
+        # first, and counts still catch genuine adds (orphan) / removes (stale).
+        cell = row.test_cell + " " + row.rationale_cell
+        toks = [t for t in re.split(r"[^A-Za-z0-9_+]+", snippet) if len(t) >= 2]
+        hits = sum(1 for t in toks if t in cell)
+        return hits >= 2 or (len(toks) == 1 and toks and toks[0] in cell)
+
+    orphans: list[SkipSite] = []
+    stales: list[tuple[InventoryRow, str, int]] = []
+    for f in set(live_by_file) | set(doc_by_file):
+        live = live_by_file.get(f, [])
+        docs = doc_by_file.get(f, [])
+        live_lines = {s.line for s in live}
+        doc_lines = {line for _, line in docs}
+        rem_live = [s for s in live if s.line not in doc_lines]  # drifted or added
+        rem_docs = [(row, line) for row, line in docs if line not in live_lines]  # drifted or removed
+        used = [False] * len(rem_docs)
+        for s in rem_live:
+            paired = False
+            for i, (row, _line) in enumerate(rem_docs):
+                if used[i] or not s.snippet:
+                    continue
+                if snippet_matches_row(s.snippet, row):
+                    used[i] = True
+                    paired = True
+                    break
+            if not paired:
+                orphans.append(s)  # a live skip nothing documents = ADDED
+        for i, (row, line) in enumerate(rem_docs):
+            if not used[i]:
+                stales.append((row, f, line))  # a doc site with no live skip = REMOVED
+
+    orphans.sort(key=lambda s: (s.path, s.line))
+    stales.sort(key=lambda t: (t[0].line_in_md, t[2]))
 
     rc = 0
     if orphans:

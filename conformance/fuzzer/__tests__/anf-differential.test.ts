@@ -1,5 +1,22 @@
 import { describe, it, expect } from 'vitest';
-import { classifyTierResults } from '../anf-differential.js';
+import { classifyTierResults, classifyUnavailableTier } from '../anf-differential.js';
+
+describe('classifyUnavailableTier (finding #18 — requested tier silently dropped)', () => {
+  it('DEFAULT: a requested tier with no binary FAILS (not silently skipped)', () => {
+    // skipMissingTiers unset — the CI gates never pass it, so the old default
+    // silently skipped a missing tier, hiding cross-tier divergences.
+    expect(classifyUnavailableTier(false, undefined)).toBe('failed');
+    expect(classifyUnavailableTier(false, false)).toBe('failed');
+  });
+  it('only an EXPLICIT skipMissingTiers:true downgrades a missing tier to a skip', () => {
+    expect(classifyUnavailableTier(false, true)).toBe('skipped');
+  });
+  it('an AVAILABLE tier that produced null = ran-and-rejected = failure', () => {
+    expect(classifyUnavailableTier(true, undefined)).toBe('failed');
+    expect(classifyUnavailableTier(true, true)).toBe('failed');
+    expect(classifyUnavailableTier(undefined, true)).toBe('failed');
+  });
+});
 
 // Finding #16 — the ANF differential harness's own docstring (anf-differential.ts
 // header) promises it "fails the job on ... any compiler crash that doesn't

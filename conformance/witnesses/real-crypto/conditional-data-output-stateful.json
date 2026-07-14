@@ -3,10 +3,44 @@
   "kind": "stateful",
   "signerKey": "alice",
   "note": "pay(flag,payload): checkPreimage + a conditional data output. Both flag branches must produce a spendable continuation.",
-  "constructorArgs": ["0n"],
+  "constructorArgs": [
+    "0n"
+  ],
   "spends": [
-    { "method": "pay", "args": [true, "0xdead"], "expect": "accept", "note": "flag true: emits data output" },
-    { "method": "pay", "args": [false, "0xdead"], "expect": "accept", "note": "flag false: no data output" },
-    { "method": "pay", "args": [true, "0xdead"], "tamperOutput": true, "cryptoNearMiss": true, "expect": "reject", "note": "tampered continuation output" }
+    {
+      "method": "pay",
+      "args": [
+        true,
+        "0xdead"
+      ],
+      "expect": "accept",
+      "note": "flag true: emits data output",
+      "expectedState": {
+        "amount": "1n"
+      }
+    },
+    {
+      "method": "pay",
+      "args": [
+        false,
+        "0xdead"
+      ],
+      "expect": "accept",
+      "note": "flag false: no data output",
+      "expectedState": {
+        "amount": "1n"
+      }
+    },
+    {
+      "method": "pay",
+      "args": [
+        true,
+        "0xdead"
+      ],
+      "tamperOutput": true,
+      "cryptoNearMiss": true,
+      "expect": "reject",
+      "note": "tampered continuation output"
+    }
   ]
 }

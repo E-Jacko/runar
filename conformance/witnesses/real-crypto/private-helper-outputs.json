@@ -11,7 +11,10 @@
       "method": "commit",
       "args": [],
       "expect": "accept",
-      "note": "private bump(): counter 0->1"
+      "note": "private bump(): counter 0->1",
+      "expectedState": {
+        "counter": "1n"
+      }
     },
     {
       "method": "log",
@@ -19,7 +22,10 @@
         "0xdead"
       ],
       "expect": "accept",
-      "note": "private record(): data output"
+      "note": "private record(): data output",
+      "expectedState": {
+        "counter": "0n"
+      }
     },
     {
       "method": "partition",
@@ -29,7 +35,10 @@
       ],
       "expect": "accept",
       "note": "private forkOutput(): extra output",
-      "satoshis": 500
+      "satoshis": 500,
+      "expectedState": {
+        "counter": "7n"
+      }
     },
     {
       "method": "commit",
