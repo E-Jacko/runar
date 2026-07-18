@@ -278,6 +278,7 @@ fi
 echo "[differential] diffing Lean vs external reports..."
 python3 - "$LEAN_REPORT" "$EXT_REPORT" <<'PYEOF'
 import json
+import re
 import sys
 
 lean_path, ext_path = sys.argv[1], sys.argv[2]
@@ -312,6 +313,28 @@ KNOWN_PYTHON_BITCOINLIB_MISMATCHES = {
     "ec-unit": "script too large",
 }
 
+# Benign opcode-LABEL divergences surfaced by the finding-#25 opcode
+# comparison below. These are NOT opcode-POSITION divergences: both engines
+# fail at the SAME opcode position for the SAME reason, but name the failing
+# opcode from different vocabularies because the Lean Stack VM models a
+# composite opcode via its primitive micro-ops. Keyed on
+# (fixture, lean_opcode, external_opcode) so the allowlist is exact — any
+# OTHER opcode pair on the same fixture, or any opcode-diff on any other
+# fixture, still fails the differential.
+#
+#   * arithmetic: the locking script's first opcode is OP_2DUP (0x6e).
+#     python-bitcoinlib names the source opcode OP_2DUP; the Lean Stack VM
+#     implements OP_2DUP as `applyOver; applyOver` (OP_2DUP ≡ OP_OVER OP_OVER,
+#     see RunarVerification/Stack/Eval.lean:472-475), so the first applyOver
+#     on the empty stack reports "OP_OVER: <2 elements". Both engines fail at
+#     byte 0 needing 2 stack items with 0 present — same failure position and
+#     reason, different opcode label. NOT a real divergence.
+KNOWN_OPCODE_VOCAB_DIVERGENCES = {
+    ("arithmetic", "OP_OVER", "OP_2DUP"),
+}
+
+_OPCODE_RE = re.compile(r"OP_[A-Z0-9_]+")
+
 lean_map = {f["name"]: f for f in lean.get("fixtures", [])}
 ext_map = {f["name"]: f for f in ext.get("fixtures", [])}
 
@@ -324,6 +347,22 @@ def category(tag):
     if tag is None:
         return None
     return tag.split(":", 1)[0]
+
+def extract_opcode(tag):
+    """Finding #25: extract the failing opcode from an 'unsupported' error
+    tag. Both engines encode the failing opcode as an 'OP_X' token:
+      * Lean:  'unsupported:OP_DUP: empty stack'
+      * python-bitcoinlib: 'unsupported:MissingOpArgumentsError:EvalScript:
+        missing arguments for OP_DUP; need 1 items, but only 0 on stack'
+    Returns the FIRST OP_ token, normalized (stripped + uppercased), or None
+    when the tag carries no clean OP_ token (e.g. Lean's
+    'unsupported:stack underflow' or python-bitcoinlib's 'script too large').
+    A None return means "no reliable opcode" and the caller falls back to
+    category-only comparison — never a new mismatch."""
+    if tag is None:
+        return None
+    m = _OPCODE_RE.search(tag)
+    return m.group(0).strip().upper() if m else None
 
 def describe(r):
     return "success" if r["success"] else category(r["error"])
@@ -374,6 +413,33 @@ for name in names:
             else:
                 mismatches.append((name, "error-category-diff", lr, er))
                 continue
+        elif lc == "unsupported":
+            # Finding #25: expected-script.hex is a LOCKING script run
+            # against an EMPTY stack, so nearly every fixture fails at its
+            # first witness pop and BOTH engines land in category
+            # "unsupported". Category-only comparison then collapses a REAL
+            # opcode-position divergence (Lean fails at OP_DUP, the reference
+            # at OP_HASH160 — an opcode-table / semantics mismatch) into a
+            # vacuous "both unsupported" pass. Both sides encode the failing
+            # opcode as "OP_X", so compare that too.
+            lop = extract_opcode(lr["error"])
+            eop = extract_opcode(er["error"])
+            # Fail-safe: only compare when BOTH sides cleanly yield an OP_
+            # token. If either extraction is None, fall back to category-only
+            # (NO new mismatch).
+            if lop is not None and eop is not None and lop != eop:
+                if documented_bsv_divergence(name, er):
+                    # Known BSV-vs-BTC divergence stays allowlisted.
+                    allowlisted.append((name, f"{lc}:{lop}", f"{ec}:{eop}"))
+                elif (name, lop, eop) in KNOWN_OPCODE_VOCAB_DIVERGENCES:
+                    # Benign opcode-LABEL divergence (documented above):
+                    # same failure position + reason, different vocabulary.
+                    allowlisted.append((name, f"{lc}:{lop}", f"{ec}:{eop}"))
+                else:
+                    # A genuine opcode-position divergence: the whole point
+                    # of the harness. Fail loudly.
+                    mismatches.append((name, "opcode-position-diff", lr, er))
+                    continue
     matches += 1
 
 print(f"[differential] matched {matches}/{len(names)} fixtures (incl. {len(allowlisted)} allowlisted)")

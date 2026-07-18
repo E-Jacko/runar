@@ -1,0 +1,118 @@
+# Workflow safety note (re: workflow injection):
+#   * No GitHub event inputs (issue.title, pr.body, head_ref, etc.) are
+#     interpolated into shell commands anywhere in this file. The only shell
+#     inputs are STALE_COUNT / REGEN_EXIT, produced by the pipelineGolden
+#     binary in this repo, never by user-controlled GitHub data; both are
+#     routed through env: and quoted on use.
+name: Runar Verification (regen — anti-paste crypto byte-anchor check)
+
+# Finding #6 — the anti-paste / anti-stale backstop for the crypto byte
+# anchors in tests/PipelineGolden.lean.
+#
+# The default-mode per-PR gate (ci.yml → "Verify byte-exact regression gate")
+# gates the crypto fixtures via stored Lean `compileHex` constants
+# (`cryptoAxiomPendingExpected`) and now FAILS LOUD when the INERT-anchor set
+# (unpopulated ∪ stale-vs-golden) drifts from the declared `cryptoAnchorGaps`
+# inventory. But a constant that byte-equals the golden passes that gate
+# whether it was independently RE-COMPUTED by Lean or simply PASTED from
+# expected-script.hex — the per-PR gate cannot tell the difference without
+# re-running Lean's pipeline. This workflow closes that hole.
+#
+# `RUNAR_VERIFICATION_REGEN=1` LIVE-compiles every cryptoAxiomPending fixture
+# through the Lean pipeline and compares the live hex against the stored
+# constant:
+#   * fresh       — live hex == stored constant (a genuine independent recompute)
+#   * stale       — live hex != stored constant (a PASTED or DRIFTED constant) → FAIL
+#   * unpopulated — no stored constant yet (expected for the SLH-DSA *f/*s gaps)
+# It also writes the regenerated constants to an artifact so a maintainer can
+# review + populate `cryptoAxiomPendingExpected` from a genuine recompute
+# (NOT by pasting the emitter's golden).
+#
+# Trigger: workflow_dispatch ONLY. This is intentional: today several stored
+# constants are stale/unpopulated (tracked in `cryptoAnchorGaps`), so a live
+# regen surfaces them — a routinely-failing *scheduled* job trains people to
+# ignore CI, which is why the sibling full-mode workflow dropped its schedule.
+# Add a schedule once the tracked crypto constants have been regenerated
+# offline and this workflow runs green.
+#
+# Runtime: the large SLH-DSA / EC / P-384 fixtures live-compile in tens of
+# minutes each (multi-MB hex; the bottleneck is Lean evaluating 10^5+ Stack
+# ops), so an unsharded sweep can exceed the 6h cap. The binary streams
+# per-fixture timing to stderr and this workflow uploads the partial regen
+# snippet with `if: always()`, so a timeout-truncated run is still useful.
+#
+# This workflow does NOT gate PR merges.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runar-verification-regen:
+    name: Runar Verification (regen anti-paste, cryptoAxiomPending)
+    runs-on: ubuntu-latest
+    # 6h cap — same headroom as the full-mode workflow; the multi-MB SLH-DSA
+    # and P-384 fixtures dominate the runtime.
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install elan
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | bash -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Cache elan and Lake build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            runar-verification/.lake/build
+          key: runar-verification-regen-${{ runner.os }}-${{ hashFiles('runar-verification/lean-toolchain', 'runar-verification/lakefile.lean', 'runar-verification/lake-manifest.json') }}
+          restore-keys: |
+            runar-verification-regen-${{ runner.os }}-
+            runar-verification-full-${{ runner.os }}-
+            runar-verification-${{ runner.os }}-
+      - name: Build (lean lib + pipelineGolden exe)
+        working-directory: runar-verification
+        run: lake build && lake build pipelineGolden
+      - name: Run PipelineGolden in regen mode (RUNAR_VERIFICATION_REGEN=1)
+        id: regen-run
+        working-directory: runar-verification
+        env:
+          RUNAR_VERIFICATION_REGEN: '1'
+          # Persist the regenerated constants outside the checkout so the
+          # artifact upload below can pick them up.
+          RUNAR_VERIFICATION_REGEN_DIR: ${{ runner.temp }}/runar-verification-regen
+        # The binary exits nonzero when any stored constant is stale
+        # (live hex != stored constant) — i.e. a pasted or drifted constant.
+        # Progress streams to the log; the regen snippet + per-fixture live hex
+        # are uploaded below regardless of pass/fail.
+        run: |
+          set -o pipefail
+          ulimit -s 65520 2>/dev/null || true
+          ./.lake/build/bin/pipelineGolden 2>&1 | tee "${RUNNER_TEMP}/regen.out"
+      - name: Emit regen summary
+        if: always()
+        run: |
+          {
+            printf '## Rúnar Lean 4 Verification — regen (anti-paste) mode\n\n'
+            printf 'Live-recompiles every cryptoAxiomPending fixture and compares the live\n'
+            printf 'hex against the stored `cryptoAxiomPendingExpected` constant. A **stale**\n'
+            printf 'line means the stored constant was PASTED or has DRIFTED from what Lean\n'
+            printf 'actually produces — regenerate it from the live hex in the artifact.\n\n'
+            printf '```\n'
+            grep -E '^\s*\[(fresh|stale|unpopulated)\]' "${RUNNER_TEMP}/regen.out" || true
+            grep -E '^REGEN FAIL:' "${RUNNER_TEMP}/regen.out" || true
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload regenerated constants + live hex
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipelineGolden-regen
+          path: |
+            ${{ runner.temp }}/runar-verification-regen
+            ${{ runner.temp }}/regen.out
+          if-no-files-found: warn
+          retention-days: 30
