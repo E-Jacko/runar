@@ -30,9 +30,16 @@ import java.util.Map;
  * {@code "RUNAR_CANON_ERR:<message>"} to stdout and exits 3; any other failure
  * exits 1.
  *
- * <p>Run via: {@code gradle -q runCanonicalise} (stdin piped in).
+ * <p>Run via: {@code gradle -q runCanonicalise} (stdin piped in). A batched
+ * peer, {@link CanonicaliseBatchShim} ({@code gradle -q runCanonicaliseBatch}),
+ * processes a whole corpus in ONE JVM by calling {@link #process(String)} per
+ * request line — used by the deterministic Java PR gate.
  */
 public final class CanonicaliseShim {
+
+    /** Prefix stdout carries on a typed canonicalJson rejection. Mirrors the
+     *  {@code REJECT_PREFIX} the TS differential driver keys on. */
+    static final String REJECT_PREFIX = "RUNAR_CANON_ERR:";
 
     private CanonicaliseShim() {
     }
@@ -47,6 +54,32 @@ public final class CanonicaliseShim {
             return;
         }
 
+        String out;
+        try {
+            out = process(raw);
+        } catch (RequestError e) {
+            System.err.println(e.getMessage());
+            System.exit(1);
+            return;
+        }
+
+        System.out.print(out);
+        System.out.flush();
+        if (out.startsWith(REJECT_PREFIX)) {
+            System.exit(3);
+        }
+    }
+
+    /**
+     * Parse one request and return the canonical bytes, or a
+     * {@link #REJECT_PREFIX}-tagged message on a typed canonicalJson rejection.
+     *
+     * <p>Throws {@link RequestError} for a malformed request (bad JSON / unknown
+     * mode) — a protocol-level error, kept distinct from a canonicalJson
+     * rejection so the single-shot {@link #main} can preserve its exit-code
+     * contract (1 for a bad request, 3 for a rejection).
+     */
+    static String process(String raw) throws RequestError {
         Object input;
         try {
             @SuppressWarnings("unchecked")
@@ -62,24 +95,26 @@ public final class CanonicaliseShim {
                 obj.put(key, utf16UnitsToString(units));
                 input = obj;
             } else {
-                System.err.println("unknown mode " + mode);
-                System.exit(1);
-                return;
+                throw new RequestError("unknown mode " + mode);
             }
+        } catch (RequestError e) {
+            throw e;
         } catch (Exception e) {
-            System.err.println("parse request: " + e.getMessage());
-            System.exit(1);
-            return;
+            throw new RequestError("parse request: " + e.getMessage());
         }
 
         try {
-            String out = Envelope.canonicalJson(input);
-            System.out.print(out);
-            System.out.flush();
+            return Envelope.canonicalJson(input);
         } catch (RuntimeException e) {
-            System.out.print("RUNAR_CANON_ERR:" + e.getMessage());
-            System.out.flush();
-            System.exit(3);
+            return REJECT_PREFIX + e.getMessage();
+        }
+    }
+
+    /** Malformed-request marker: a protocol error, NOT a canonicalJson
+     *  rejection. */
+    static final class RequestError extends Exception {
+        RequestError(String message) {
+            super(message);
         }
     }
 

@@ -41,6 +41,19 @@ tasks.register<JavaExec>("runCanonicalise") {
     standardInput = System.`in`
 }
 
+// Batched peer of `runCanonicalise`: newline-delimited requests in, one
+// response line out per request, all in ONE JVM. Used by the deterministic
+// Java canonicalJson PR gate (conformance/fuzzer/canonical-java-gate.ts) so a
+// whole fixed corpus is byte-compared against the TS reference without paying a
+// JVM cold-start per case.
+tasks.register<JavaExec>("runCanonicaliseBatch") {
+    description = "Batch canonicalJson CLI shim (newline-delimited requests -> newline-delimited responses, one JVM)."
+    group = "application"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("runar.lang.sdk.CanonicaliseBatchShim")
+    standardInput = System.`in`
+}
+
 repositories {
     mavenCentral()
 }

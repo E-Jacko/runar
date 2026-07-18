@@ -389,10 +389,15 @@ jobs:
   # `--canonicalise` CLI shim.
   #
   # Triggers: same as the ANF job. On `pull_request` it runs a FIXED-seed,
-  # modest-count gate over the six fast tiers (Java's per-invocation gradle
-  # JVM cold-start is too slow for a PR gate, so Java is covered nightly).
-  # Schedule / push / workflow_dispatch run all 7 tiers with a run_id-seeded
-  # corpus for rotating coverage.
+  # modest-count RANDOMIZED gate over the six fast tiers. The Java shim forks a
+  # JVM per case (`gradle -q runCanonicalise`), which is too slow / flake-prone
+  # for a per-case PR gate — so on PRs Java is instead covered by a DETERMINISTIC
+  # batch gate (the "Canonical Java gate" step below): it replays the identical
+  # fixed-seed corpus through the Java shim's one-JVM batch entrypoint
+  # (`gradle -q runCanonicaliseBatch`) and byte-compares every case against the
+  # TS reference, so a Java canonicalJson divergence STILL fails the PR gate.
+  # Schedule / push / workflow_dispatch additionally run the RANDOMIZED fuzz over
+  # all 7 tiers (Java included) with a run_id-seeded corpus for rotating coverage.
   # ---------------------------------------------------------------------------
   fuzz-canonical:
     name: canonicalJson differential (7 SDK tiers x N random JSON values)
@@ -455,6 +460,22 @@ jobs:
             --seed 20020602 \
             --compilers ts,go,rust,python,zig,ruby \
             --output /tmp/canonical-fuzz-pr.json
+
+      # ----- PR gate (Java): deterministic, one-JVM batch. The randomized fuzz
+      # ----- above excludes Java because its shim forks a JVM per case; this
+      # ----- gate instead replays the SAME fixed-seed corpus through the Java
+      # ----- batch shim (one JVM) and byte-compares every case against the TS
+      # ----- reference, so a Java-only canonicalJson divergence still fails the
+      # ----- PR gate. `--num 256` spans the tricky surface (float boundaries,
+      # ----- UTF-16 key ordering, lone-surrogate rejection, nesting).
+      - name: Canonical Java gate (PR gate — deterministic, one-JVM batch)
+        if: github.event_name == 'pull_request'
+        working-directory: conformance
+        run: |
+          set -euo pipefail
+          node_modules/.bin/tsx fuzzer/canonical-java-gate.ts \
+            --seed 20020602 \
+            --num 256
 
       # ----- Schedule / push / dispatch: all 7 tiers, run_id-seeded corpus.
       - name: Resolve canonical fuzz parameters
