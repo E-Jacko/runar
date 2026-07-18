@@ -1,0 +1,252 @@
+{
+  "_doc": [
+    "Known, pre-existing violations of the independent source-anchor oracle",
+    "(independent-oracle.ts#checkSourceAnchors), keyed by (fixture, tier).",
+    "",
+    "Why this exists:",
+    "  checkSourceAnchors re-reads each mapping's claimed (line, column)",
+    "  against the REAL source file on disk (independent of the source-map",
+    "  generator and of the committed golden) and flags positions that are",
+    "  out of bounds, point at whitespace/comments, or split a token in",
+    "  half. It surfaced real, pre-existing bugs in several tiers' source",
+    "  location tracking that the byte-identity + structural checks in",
+    "  run.ts never could, because both of those are graded against the",
+    "  generator's own output (audit finding #22).",
+    "",
+    "  Fixing those generators is out of scope for the change that added",
+    "  this oracle (conformance/source-map/ only, no compiler edits). This",
+    "  file pins the CURRENT violation signature per (fixture, tier) so the",
+    "  independent check can still gate on REGRESSIONS (any drift in",
+    "  violationCount / trackedCount / totalCount fails until the allowlist",
+    "  is deliberately updated) without permanently blocking the suite on",
+    "  known, already-diagnosed issues.",
+    "",
+    "Contract for entries:",
+    "  - Each entry MUST carry a non-empty `reason` (enforced by",
+    "    loadKnownIssues — no bare lists).",
+    "  - `violationCount` / `trackedCount` / `totalCount` are the exact",
+    "    values from checkSourceAnchors' AnchorReport for that (fixture,",
+    "    tier) pair against the committed expected-source-map.json golden.",
+    "    All three are pinned (not just violationCount) so a tier that",
+    "    regresses from 'partially tracked with N violations' to 'fully",
+    "    untracked' (as already happened to the Java tier) is still caught",
+    "    even though its violation *count* wouldn't otherwise change —",
+    "    checkSourceAnchors treats untracked (line=0) mappings as neither",
+    "    pass nor violation, only as a trackedCount deficit.",
+    "  - A (fixture, tier) pair with NO entry here is expected to be fully",
+    "    clean (0 violations, every mapping position-tracked). Any drift",
+    "    (new violations, or a pair regressing from clean) fails the gate.",
+    "  - Entries are removed (not zeroed out) once the underlying generator",
+    "    bug is fixed, so a clean pair goes back to being unconditionally",
+    "    enforced rather than silently pinned at violationCount: 0."
+  ],
+  "knownIssues": [
+    {
+      "fixture": "basic-p2pkh",
+      "tier": "go",
+      "violationCount": 4,
+      "trackedCount": 4,
+      "totalCount": 4,
+      "reason": "Go source-location column is consistently one character past the true token start (e.g. col=2 lands on the 2nd char of a tab-indented `runar.Assert(...)` instead of col=1) — a systematic off-by-one, not a golden mismatch. Found by the independent source-anchor oracle; fixing compilers/go's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "basic-p2pkh",
+      "tier": "rs",
+      "violationCount": 5,
+      "trackedCount": 5,
+      "totalCount": 5,
+      "reason": "Rust source-location column is consistently one character past the true token start (e.g. col=9 lands on the 2nd char of `assert!(...)` instead of col=8). Found by the independent source-anchor oracle; fixing compilers/rust's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "basic-p2pkh",
+      "tier": "rb",
+      "violationCount": 5,
+      "trackedCount": 5,
+      "totalCount": 5,
+      "reason": "Ruby source-location column is consistently one character past the true token start (e.g. col=5 lands on the 2nd char of `assert hash160(...)` instead of col=4). Found by the independent source-anchor oracle; fixing compilers/ruby's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "basic-p2pkh",
+      "tier": "java",
+      "violationCount": 0,
+      "trackedCount": 0,
+      "totalCount": 4,
+      "reason": "Every mapping carries line=0/column=0 (0/4 mappings are position-tracked) — the Java frontend's source-map plumbing does not thread any real AST position through for this fixture, it only emits the structurally-valid-but-degenerate default location. Found by the independent source-anchor oracle; fixing compilers/java's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "stateful-counter",
+      "tier": "go",
+      "violationCount": 4,
+      "trackedCount": 8,
+      "totalCount": 8,
+      "reason": "Go source-location column off-by-one (see basic-p2pkh/go) on 4 of the 8 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/go's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "stateful-counter",
+      "tier": "rs",
+      "violationCount": 212,
+      "trackedCount": 212,
+      "totalCount": 212,
+      "reason": "Rust source-location column off-by-one (see basic-p2pkh/rs) on all 212 tracked mappings — the compiler-injected checkPreimage / state-continuation opcodes for this stateful contract inherit the same bug. Found by the independent source-anchor oracle; fixing compilers/rust's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "stateful-counter",
+      "tier": "zig",
+      "violationCount": 6,
+      "trackedCount": 260,
+      "totalCount": 260,
+      "reason": "Zig source-location column lands correctly when it anchors to a method's parameter-list token (see basic-p2pkh/zig, which is clean) but splits a token mid-word for 6 of the 260 tracked mappings in this fixture. Found by the independent source-anchor oracle; fixing compilers/zig's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "stateful-counter",
+      "tier": "rb",
+      "violationCount": 4,
+      "trackedCount": 10,
+      "totalCount": 10,
+      "reason": "Ruby source-location column off-by-one (see basic-p2pkh/rb) on 4 of the 10 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/ruby's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "stateful-counter",
+      "tier": "java",
+      "violationCount": 0,
+      "trackedCount": 0,
+      "totalCount": 10,
+      "reason": "Every mapping carries line=0/column=0 (0/10 mappings are position-tracked). Found by the independent source-anchor oracle; fixing compilers/java's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "escrow",
+      "tier": "go",
+      "violationCount": 8,
+      "trackedCount": 8,
+      "totalCount": 8,
+      "reason": "Go source-location column off-by-one (see basic-p2pkh/go) on all 8 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/go's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "escrow",
+      "tier": "rs",
+      "violationCount": 14,
+      "trackedCount": 14,
+      "totalCount": 14,
+      "reason": "Rust source-location column off-by-one (see basic-p2pkh/rs) on all 14 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/rust's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "escrow",
+      "tier": "rb",
+      "violationCount": 10,
+      "trackedCount": 10,
+      "totalCount": 10,
+      "reason": "Ruby source-location column off-by-one (see basic-p2pkh/rb) on all 10 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/ruby's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "escrow",
+      "tier": "java",
+      "violationCount": 0,
+      "trackedCount": 0,
+      "totalCount": 6,
+      "reason": "Every mapping carries line=0/column=0 (0/6 mappings are position-tracked). Found by the independent source-anchor oracle; fixing compilers/java's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "arithmetic",
+      "tier": "go",
+      "violationCount": 27,
+      "trackedCount": 27,
+      "totalCount": 27,
+      "reason": "Go source-location column off-by-one (see basic-p2pkh/go) on all 27 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/go's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "arithmetic",
+      "tier": "rs",
+      "violationCount": 28,
+      "trackedCount": 28,
+      "totalCount": 28,
+      "reason": "Rust source-location column off-by-one (see basic-p2pkh/rs) on all 28 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/rust's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "arithmetic",
+      "tier": "zig",
+      "violationCount": 26,
+      "trackedCount": 28,
+      "totalCount": 28,
+      "reason": "Zig source-location column splits a token mid-word for 26 of the 28 tracked mappings in this computation-dense fixture (see stateful-counter/zig for the same pattern). Found by the independent source-anchor oracle; fixing compilers/zig's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "arithmetic",
+      "tier": "rb",
+      "violationCount": 28,
+      "trackedCount": 28,
+      "totalCount": 28,
+      "reason": "Ruby source-location column off-by-one (see basic-p2pkh/rb) on all 28 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/ruby's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "arithmetic",
+      "tier": "java",
+      "violationCount": 0,
+      "trackedCount": 0,
+      "totalCount": 27,
+      "reason": "Every mapping carries line=0/column=0 (0/27 mappings are position-tracked). Found by the independent source-anchor oracle; fixing compilers/java's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "if-else",
+      "tier": "go",
+      "violationCount": 10,
+      "trackedCount": 10,
+      "totalCount": 10,
+      "reason": "Go source-location column off-by-one (see basic-p2pkh/go) on all 10 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/go's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "if-else",
+      "tier": "rs",
+      "violationCount": 14,
+      "trackedCount": 14,
+      "totalCount": 14,
+      "reason": "Rust source-location column off-by-one (see basic-p2pkh/rs) on all 14 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/rust's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "if-else",
+      "tier": "zig",
+      "violationCount": 5,
+      "trackedCount": 7,
+      "totalCount": 7,
+      "reason": "Zig source-location column splits a token mid-word for 5 of the 7 tracked mappings in this fixture (see stateful-counter/zig for the same pattern). Found by the independent source-anchor oracle; fixing compilers/zig's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "if-else",
+      "tier": "rb",
+      "violationCount": 11,
+      "trackedCount": 11,
+      "totalCount": 11,
+      "reason": "Ruby source-location column off-by-one (see basic-p2pkh/rb) on all 11 tracked mappings for this fixture. Found by the independent source-anchor oracle; fixing compilers/ruby's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    },
+    {
+      "fixture": "if-else",
+      "tier": "java",
+      "violationCount": 0,
+      "trackedCount": 0,
+      "totalCount": 8,
+      "reason": "Every mapping carries line=0/column=0 (0/8 mappings are position-tracked). Found by the independent source-anchor oracle; fixing compilers/java's location tracking is out of scope for this change.",
+      "tracking": "audit finding #22"
+    }
+  ]
+}

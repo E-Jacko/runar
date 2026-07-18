@@ -21,6 +21,21 @@
  *      - `opcodeIndex` values are in `[0, opcodeCount)`.
  *      - `sourceFile` is a non-empty string.
  *
+ *  3. The emitted mappings satisfy the INDEPENDENT source-anchor oracle
+ *     (`independent-oracle.ts#checkSourceAnchors`, audit finding #22).
+ *     Checks 1 and 2 are both graded against the generator's own output —
+ *     a generator that consistently emits a wrong (line, column) passes
+ *     both forever, because the golden was produced by the same generator
+ *     and the structural check never opens the source file. Check 3 closes
+ *     that gap: it re-reads the REAL `.runar.*` source file on disk (not
+ *     the golden, not any compiler pass) and verifies each tracked mapping
+ *     lands on an in-bounds, non-whitespace, non-comment position that
+ *     does not split a token in half. Known, pre-existing violations
+ *     (compiler bugs out of scope for this runner) are pinned in
+ *     `conformance/source-map/anchor-known-issues.json` with a required
+ *     `reason`; any NEW violation, or drift in an already-recorded one,
+ *     fails the gate.
+ *
  * The line/column numbers are deliberately tier-specific (each tier
  * compiles its own surface syntax — `.runar.ts` for TypeScript,
  * `.runar.go` for Go, etc.) so the goldens differ by design.
@@ -36,6 +51,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, basename, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkSourceAnchors, evaluateAgainstKnownIssues, loadKnownIssues } from './independent-oracle.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..', '..');
@@ -375,6 +391,8 @@ interface Outcome {
   byteIdentical?: boolean;
   structural: 'ok' | 'fail' | 'skip';
   structuralReasons?: string[];
+  anchor?: 'ok' | 'fail';
+  anchorReason?: string;
   notes?: string;
 }
 
@@ -383,6 +401,8 @@ function main() {
   const update = args.includes('--update');
   const tierFilter = args.find(a => a.startsWith('--tier='))?.slice('--tier='.length);
   const fixtureFilter = args.find(a => a.startsWith('--fixture='))?.slice('--fixture='.length);
+
+  const knownIssues = loadKnownIssues(join(__dirname, 'anchor-known-issues.json')).knownIssues;
 
   const outcomes: Outcome[] = [];
   let failed = 0;
@@ -420,6 +440,12 @@ function main() {
       const opcodeCount = hexRes.hex ? approximateOpcodeCount(hexRes.hex) : Number.MAX_SAFE_INTEGER;
       const structural = checkStructural(sm, opcodeCount);
 
+      // Independent source-anchor oracle (audit finding #22) — re-reads the
+      // REAL source file, never the golden. See the module doc comment in
+      // independent-oracle.ts for why this is generator-independent.
+      const anchorReport = checkSourceAnchors(sm, REPO_ROOT);
+      const anchorEval = evaluateAgainstKnownIssues(fixture, tier.name, anchorReport, knownIssues);
+
       // Golden comparison (byte-identical) or update.
       let byteIdentical: boolean | undefined;
       if (update) {
@@ -428,27 +454,38 @@ function main() {
       } else {
         const golden = readGolden(goldenPath);
         if (golden == null) {
-          outcomes.push({ fixture, tier: tier.name, byteIdentical: false, structural: structural.ok ? 'ok' : 'fail', structuralReasons: structural.reasons, notes: 'golden missing — run with --update' });
+          outcomes.push({
+            fixture, tier: tier.name, byteIdentical: false,
+            structural: structural.ok ? 'ok' : 'fail', structuralReasons: structural.reasons,
+            anchor: anchorEval.ok ? 'ok' : 'fail', anchorReason: anchorEval.reason,
+            notes: 'golden missing — run with --update',
+          });
           failed++;
           continue;
         }
         byteIdentical = golden === emitted;
       }
 
-      if (!byteIdentical || !structural.ok) failed++;
-      outcomes.push({ fixture, tier: tier.name, byteIdentical, structural: structural.ok ? 'ok' : 'fail', structuralReasons: structural.reasons });
+      if (!byteIdentical || !structural.ok || !anchorEval.ok) failed++;
+      outcomes.push({
+        fixture, tier: tier.name, byteIdentical,
+        structural: structural.ok ? 'ok' : 'fail', structuralReasons: structural.reasons,
+        anchor: anchorEval.ok ? 'ok' : 'fail', anchorReason: anchorEval.reason,
+      });
     }
   }
 
   // Summary table.
   console.log('');
-  console.log(`fixture                       tier   byte-id   structural   notes`);
-  console.log(`${'-'.repeat(85)}`);
+  console.log(`fixture                       tier   byte-id   structural   anchor   notes`);
+  console.log(`${'-'.repeat(100)}`);
   for (const o of outcomes) {
     const byte = o.byteIdentical === undefined ? '-' : (o.byteIdentical ? 'OK' : 'DIFF');
     const struct = o.structural === 'ok' ? 'OK' : o.structural === 'fail' ? 'FAIL' : 'SKIP';
-    const notes = o.notes ?? (o.structuralReasons?.length ? o.structuralReasons.slice(0, 2).join(' / ') : '');
-    console.log(`${o.fixture.padEnd(28)}  ${o.tier.padEnd(5)} ${byte.padEnd(8)} ${struct.padEnd(12)} ${notes}`);
+    const anchor = o.anchor === undefined ? '-' : (o.anchor === 'ok' ? 'OK' : 'FAIL');
+    const anchorNote = o.anchor === 'fail' ? o.anchorReason : undefined;
+    const notes = o.notes ?? anchorNote ?? (o.structuralReasons?.length ? o.structuralReasons.slice(0, 2).join(' / ') : '');
+    console.log(`${o.fixture.padEnd(28)}  ${o.tier.padEnd(5)} ${byte.padEnd(8)} ${struct.padEnd(12)} ${anchor.padEnd(8)} ${notes}`);
   }
   console.log('');
   console.log(`Total: ${outcomes.length}, failed: ${failed}`);
